@@ -1,0 +1,19 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- iOS SF Symbol "trash" style - slightly bolder -->
+    <!-- Lid/Handle -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M10,2.5h4c0.4,0 0.75,0.35 0.75,0.75V4h4.75v1.2H4.5V4h4.75V3.25c0,-0.4 0.35,-0.75 0.75,-0.75z"/>
+    <!-- Body outline (bolder) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M6,6h12l-1,13.5c-0.05,0.55 -0.5,1 -1.1,1H8.1c-0.6,0 -1.05,-0.45 -1.1,-1L6,6zM7.2,7.4l0.7,12h8.2l0.7,-12H7.2z"/>
+    <!-- 3 Internal vertical lines (bolder) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M9,9h1v8h-1zM11.5,9h1v8h-1zM14,9h1v8h-1z"/>
+</vector>
