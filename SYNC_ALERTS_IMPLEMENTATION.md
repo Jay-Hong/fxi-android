@@ -1,8 +1,9 @@
 # 다중 기기 알림 동기화 구현 가이드
 
-> **목적**: A 기기에서 알림 설정 변경 시 B 기기에서 자동 동기화
-> **스코프**: MVP (서버 + Android)
-> **상태**: ✅ MVP 완료 (Android + 서버), 실기기 검증 대기
+> **목적**: A 기기에서 알림 설정 변경 시 B 기기에서 동기화
+> **스코프**: MVP (서버 + Android + iOS)
+> **상태**: ✅ MVP 완료
+> **동기화 정책**: Eventual Consistency (best-effort push + 포그라운드 복귀 시 동기화)
 > **삭제 시점**: 구현 완료 및 검증 후
 
 ---
@@ -12,14 +13,18 @@
 ```
 A 기기: 알림 추가/수정/삭제 API 호출
     ↓
-서버: CRUD 성공 → 해당 user_id의 모든 device_token에 사일런트 푸시
+서버: CRUD 성공 → 해당 user_id의 모든 device_token에 사일런트 푸시 (best-effort)
     ↓
-B 기기: FCM 수신 → AlertEventBus.emit(RefreshNeeded) → 목록 새로고침
+B 기기:
+  - Android: FCM 수신 시 즉시 새로고침
+  - iOS: 백그라운드에서 수신 → 플래그 저장 → 포그라운드 복귀 시 동기화
+         (포그라운드 실시간 동기화는 플랫폼 제한으로 미보장)
 ```
 
 **핵심 원칙:**
 - data-only 푸시 (사용자 알림 배너 표시 안됨)
 - CRUD 실패 전파 방지 (동기화 실패해도 CRUD 응답 성공)
+- **Eventual Consistency**: 실시간 동기화 미보장, 포그라운드 복귀 시 동기화 보장
 - MVP에서는 자기 기기 제외(exclude) 로직 생략
 
 ---
@@ -240,13 +245,27 @@ async def notify_user_devices_sync(db: Session, user_id: str):
 
 ---
 
-## 5. 주의사항
+## 5. 플랫폼별 동작
 
-### ⚠️ 백그라운드/종료 상태 제한
+### Android: 실시간 동기화 ✅
 
-> **중요**: `sync_alerts`는 data-only 푸시이므로 앱이 백그라운드/종료 상태일 때 즉시 반영이 **항상 보장되지 않음**.
-> Doze 모드, 앱 대기 버킷, OEM 정책 등의 영향을 받음.
-> 단, 앱 포그라운드 복귀 시 `refreshOnForeground()`가 동기화를 보완함.
+- data-only 푸시 수신 시 `onMessageReceived()` 즉시 호출
+- 포그라운드/백그라운드 모두 정상 동작
+
+### iOS: Eventual Consistency (포그라운드 복귀 시 동기화) ⚠️
+
+> **플랫폼 제한**: iOS는 data-only 푸시(`apns-push-type: background`)를 포그라운드에서 `didReceiveRemoteNotification`으로 전달하지 않는 경우가 있음.
+> 백그라운드에서는 수신되나, 포그라운드 실시간 동기화는 **미보장**.
+
+**iOS 동기화 전략:**
+
+1. **백그라운드 수신 시**: `pendingSyncAlerts` 플래그 설정
+2. **포그라운드 복귀 시**: 플래그 확인 → `loadSettings()` 호출 (30초 디바운스 우회)
+3. **화면 진입 시**: `loadSettingsIfNeeded()` 호출
+
+**구현 위치:**
+- `AppDelegate.swift`: `didReceiveRemoteNotification`에서 플래그 설정
+- `FXiApp.swift`: `willEnterForegroundNotification`에서 플래그 확인 후 동기화
 
 ### ⚠️ 응답 지연
 
@@ -278,9 +297,10 @@ async def notify_user_devices_sync(db: Session, user_id: str):
 
 | # | 기준 | 확인 방법 |
 |---|------|----------|
-| 1 | A기기 CRUD 성공 + B기기 foreground 자동 갱신 | 1~3초 내 목록 반영 |
-| 2 | 동기화 푸시 실패해도 API는 200/정상 응답 | FCM 오류 시에도 CRUD 성공 |
-| 3 | 동기화용 사용자 배너 0건 | 알림 센터에 sync_alerts 관련 배너 없음 |
+| 1 | Android: A기기 CRUD → B기기 즉시 반영 | 1~3초 내 목록 갱신 |
+| 2 | iOS: A기기 CRUD → B기기 포그라운드 복귀 시 반영 | 백그라운드 다녀온 후 동기화 |
+| 3 | 동기화 푸시 실패해도 API는 200/정상 응답 | FCM 오류 시에도 CRUD 성공 |
+| 4 | 동기화용 사용자 배너 0건 | 알림 센터에 sync_alerts 관련 배너 없음 |
 
 ---
 
@@ -289,8 +309,8 @@ async def notify_user_devices_sync(db: Session, user_id: str):
 | 항목 | 설명 |
 |------|------|
 | 자기 기기 제외 | X-Device-Token 헤더로 요청 기기 제외 |
-| iOS 구현 | 동일 패턴 적용 |
-| Background 처리 | 앱 종료 상태에서의 동기화 보장 |
+| ✅ 새로고침 버튼 | 알림 섹션에 수동 새로고침 액션 추가 완료 |
+| 버전 체크 API | 전체 리스트 대신 변경 여부만 확인 (서버 부하 절감) |
 
 ---
 

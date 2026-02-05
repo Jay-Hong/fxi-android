@@ -25,10 +25,12 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.foundation.ScrollState
@@ -73,6 +75,8 @@ fun AlertSection(
     isPermissionDenied: Boolean,
     canAddMore: Boolean,
     remainingCount: Int,
+    isRefreshing: Boolean,
+    canRefresh: Boolean,
     scrollState: ScrollState? = null,
     onToggle: (AlertSetting) -> Unit,
     onDelete: (AlertSetting) -> Unit,
@@ -81,12 +85,28 @@ fun AlertSection(
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit,
     onRetry: () -> Unit,
+    onRefresh: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val settings = alertState.settings.filter { it.currency == currency.code }
+    val settings = alertState.settings
+        .filter { it.currency == currency.code }
+        .distinctBy { it.id }
     val activeCount = settings.count { it.isEnabled }
     var isExpanded by remember { mutableStateOf(true) }
     val coroutineScope = rememberCoroutineScope()
+
+    // 토글 로직 추출 (헤더 영역 + chevron 공유)
+    val toggleExpanded = {
+        val willExpand = !isExpanded
+        isExpanded = willExpand
+        // 펼칠 때 스크롤과 애니메이션 동시 시작
+        if (willExpand && scrollState != null) {
+            coroutineScope.launch {
+                val estimatedHeight = 500 + (settings.size * 80)
+                scrollState.animateScrollTo(scrollState.value + estimatedHeight)
+            }
+        }
+    }
 
     Column(
         modifier = modifier
@@ -95,72 +115,97 @@ fun AlertSection(
             .background(CardBackground)
             .padding(vertical = 12.dp)
     ) {
-        // Header
+        // Header: 토글 영역과 액션 버튼 분리
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable {
-                    val willExpand = !isExpanded
-                    isExpanded = willExpand
-                    // 펼칠 때 스크롤과 애니메이션 동시 시작
-                    if (willExpand && scrollState != null) {
-                        coroutineScope.launch {
-                            val estimatedHeight = 500 + (settings.size * 80)
-                            scrollState.animateScrollTo(scrollState.value + estimatedHeight)
-                        }
-                    }
-                }
                 .padding(horizontal = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(
-                imageVector = Icons.Default.Notifications,
-                contentDescription = null,
-                tint = SecondaryText,  // iOS와 동일: secondaryText
-                modifier = Modifier.size(16.dp)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = "환율 알림",
-                color = PrimaryText,
-                fontSize = 17.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-
-            // 활성화된 알림 개수 뱃지 (iOS와 동일: 원형, 흰색 숫자)
-            if (activeCount > 0) {
+            // 왼쪽: 토글 영역 (클릭 → 접기/펼치기)
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable { toggleExpanded() },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Notifications,
+                    contentDescription = null,
+                    tint = SecondaryText,
+                    modifier = Modifier.size(16.dp)
+                )
                 Spacer(modifier = Modifier.width(8.dp))
-                Box(
-                    modifier = Modifier
-                        .size(18.dp)
-                        .clip(CircleShape)
-                        .background(Primary),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "$activeCount",
-                        color = Color.White,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Medium,
-                        style = TextStyle(
-                            lineHeightStyle = LineHeightStyle(
-                                alignment = LineHeightStyle.Alignment.Center,
-                                trim = LineHeightStyle.Trim.Both
-                            ),
-                            platformStyle = PlatformTextStyle(includeFontPadding = false)
+                Text(
+                    text = "환율 알림",
+                    color = PrimaryText,
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                // 활성화된 알림 개수 뱃지
+                if (activeCount > 0) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .size(18.dp)
+                            .clip(CircleShape)
+                            .background(Primary),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "$activeCount",
+                            color = Color.White,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Medium,
+                            style = TextStyle(
+                                lineHeightStyle = LineHeightStyle(
+                                    alignment = LineHeightStyle.Alignment.Center,
+                                    trim = LineHeightStyle.Trim.Both
+                                ),
+                                platformStyle = PlatformTextStyle(includeFontPadding = false)
+                            )
                         )
+                    }
+                }
+            }
+
+            // 오른쪽: 새로고침 버튼 (독립 클릭)
+            IconButton(
+                onClick = onRefresh,
+                enabled = canRefresh && !isRefreshing,
+                modifier = Modifier.size(32.dp)
+            ) {
+                if (isRefreshing) {
+                    CircularProgressIndicator(
+                        color = Primary,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(16.dp)
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "새로고침",
+                        tint = if (canRefresh) SecondaryText else SecondaryText.copy(alpha = 0.3f),
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.width(12.dp))
 
-            Icon(
-                imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                contentDescription = if (isExpanded) "접기" else "펼치기",
-                tint = SecondaryText,
-                modifier = Modifier.size(16.dp)
-            )
+            // 접기/펼치기 버튼 (chevron 클릭 가능)
+            IconButton(
+                onClick = { toggleExpanded() },
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    contentDescription = if (isExpanded) "접기" else "펼치기",
+                    tint = SecondaryText,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
         }
 
         // Content (빠른 애니메이션 150ms)

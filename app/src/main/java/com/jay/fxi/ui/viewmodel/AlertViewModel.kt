@@ -13,6 +13,7 @@ import androidx.lifecycle.viewModelScope
 import com.jay.fxi.data.local.CacheService
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
+import com.jay.fxi.data.repository.AlertNotFoundException
 import com.jay.fxi.data.repository.AlertRepository
 import com.jay.fxi.domain.model.Bank
 import com.jay.fxi.domain.model.AlertCondition
@@ -25,6 +26,8 @@ import com.jay.fxi.service.PushNotificationManager
 import com.jay.fxi.subscription.SubscriptionManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -60,6 +63,36 @@ class AlertViewModel @Inject constructor(
     private var lastRefreshAt: Long = 0L
     private val refreshDebounceMs = 30_000L
     private var needsRefresh = false  // iOS 패리티: 로딩 중 새로고침 요청 대기
+    private var isLoadingSettings = false
+
+    // ============ 수동 새로고침 상태 ============
+
+    private val _isRefreshing = MutableStateFlow(false)
+    val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
+
+    private val _canManualRefresh = MutableStateFlow(true)
+    val canManualRefresh: StateFlow<Boolean> = _canManualRefresh.asStateFlow()
+
+    // 쿨다운/백오프 상태
+    private var nextManualRefreshAllowedAt: Long = 0L
+    private var consecutiveFailures: Int = 0
+    private val baseCooldownMs = 3_000L  // 3초
+
+    // 수동 요청 체인 추적 (큐잉 재시도 컨텍스트 유지)
+    private var manualOrigin = false
+
+    // 쿨다운 타이머 Job (취소 가능하게 관리)
+    private var cooldownJob: Job? = null
+
+    private fun getNextCooldownMs(): Long {
+        // 연속 실패 시 백오프: 5s → 10s → 20s (최대)
+        return when (consecutiveFailures) {
+            0 -> baseCooldownMs
+            1 -> 5_000L
+            2 -> 10_000L
+            else -> 20_000L
+        }
+    }
 
     val canAddMore: Boolean
         get() = _state.value.settings.size < MAX_COUNT
@@ -145,39 +178,110 @@ class AlertViewModel @Inject constructor(
      * AlertEvent.RefreshNeeded 등 외부 이벤트용
      */
     private fun requestRefresh() {
-        if (_state.value is AlertState.Loading) {
+        if (isLoadingSettings) {
             needsRefresh = true
         } else {
             loadSettings()
         }
     }
 
-    fun loadSettings() {
-        if (_state.value is AlertState.Loading) return
-        // 레이스 컨디션 방지: 코루틴 시작 전 즉시 Loading 상태로 전환
-        _state.value = AlertState.Loading
+    fun loadSettings(isManualRefresh: Boolean = false) {
+        if (isLoadingSettings) {
+            needsRefresh = true
+            // 연타 시에도 스피너 유지 + 수동 컨텍스트 기록
+            if (isManualRefresh) {
+                manualOrigin = true
+                _isRefreshing.value = true
+            }
+            return
+        }
+
+        // 새 요청 시작 시 수동 컨텍스트 설정
+        if (isManualRefresh) {
+            manualOrigin = true
+        }
+
+        val hadLoadedState = _state.value is AlertState.Loaded
+        isLoadingSettings = true
+
+        // 수동 새로고침일 때만 isRefreshing 활성화
+        if (isManualRefresh) {
+            _isRefreshing.value = true
+        }
+
+        // 이미 목록이 보이는 상태에서는 로딩 UI로 전환하지 않아 스크롤 점프를 방지한다.
+        if (!hadLoadedState) {
+            _state.value = AlertState.Loading
+        }
+
         viewModelScope.launch {
             var shouldRegisterPush = false
-            repository.getSettings().fold(
-                onSuccess = { settings ->
-                    _state.value = AlertState.Loaded(alertSettings = settings.sortedByCreatedAt())
-                    lastRefreshAt = System.currentTimeMillis()
-                    shouldRegisterPush = settings.isNotEmpty() && checkNotificationPermission()
-                },
-                onFailure = { e ->
-                    _state.value = AlertState.Error(e.message ?: "알 수 없는 오류")
+            var shouldRetry = false
+            var isSuccess = false
+            try {
+                repository.getSettings().fold(
+                    onSuccess = { settings ->
+                        _state.value = AlertState.Loaded(alertSettings = settings.sortedByCreatedAt())
+                        lastRefreshAt = System.currentTimeMillis()
+                        shouldRegisterPush = settings.isNotEmpty() && checkNotificationPermission()
+                        isSuccess = true
+                    },
+                    onFailure = { e ->
+                        // 기존 목록이 있으면 유지하고, 최초 로드 실패일 때만 에러 화면 표시
+                        if (!hadLoadedState) {
+                            _state.value = AlertState.Error(e.message ?: "알 수 없는 오류")
+                        }
+                    }
+                )
+                if (shouldRegisterPush) {
+                    pushNotificationManager.shouldRegisterForPush = true
+                    pushNotificationManager.registerIfNeeded(subscriptionManager.isPremium.value)
                 }
-            )
-            if (shouldRegisterPush) {
-                pushNotificationManager.shouldRegisterForPush = true
-                pushNotificationManager.registerIfNeeded(subscriptionManager.isPremium.value)
-            }
-            // iOS 패리티: 로딩 중 대기한 새로고침 요청 1회 재시도
-            if (needsRefresh) {
+
+                // iOS 패리티: 로딩 중 대기한 새로고침 요청 1회 재시도
+                shouldRetry = needsRefresh
+            } finally {
                 needsRefresh = false
-                loadSettings()
+                isLoadingSettings = false
+                // 재시도 예정이면 스피너 유지 (큐잉 UX 버그 수정)
+                if (!shouldRetry) {
+                    _isRefreshing.value = false
+                }
             }
+
+            // 수동 요청 체인이면 쿨다운/백오프 업데이트 (체인 종료 시에만)
+            if (manualOrigin && !shouldRetry) {
+                if (isSuccess) {
+                    consecutiveFailures = 0
+                } else {
+                    consecutiveFailures++
+                }
+                // 성공/실패 모두에서 다음 허용 시각 갱신 (실패 백오프 동작 보장)
+                val cooldownMs = getNextCooldownMs()
+                nextManualRefreshAllowedAt = System.currentTimeMillis() + cooldownMs
+                manualOrigin = false  // 체인 종료, 컨텍스트 리셋
+
+                // 버튼 비활성화 → 쿨다운 후 자동 복구
+                _canManualRefresh.value = false
+                cooldownJob?.cancel()  // 이전 타이머 취소
+                cooldownJob = viewModelScope.launch {
+                    delay(cooldownMs)
+                    _canManualRefresh.value = true
+                }
+            }
+
+            if (shouldRetry) loadSettings()  // manualOrigin 유지됨 (재시도 컨텍스트 전달)
         }
+    }
+
+    /**
+     * 수동 새로고침 (UI에서 호출)
+     */
+    fun refreshNow() {
+        // 2중 안전장치: canManualRefresh + 시간 기반 체크 (타이머 누락/상태 불일치 방어)
+        if (!_canManualRefresh.value) return
+        if (System.currentTimeMillis() < nextManualRefreshAllowedAt) return
+        loadSettings(isManualRefresh = true)
     }
 
     fun loadSettingsIfNeeded() {
@@ -194,6 +298,11 @@ class AlertViewModel @Inject constructor(
      * - loaded 상태: 30초 디바운싱 적용
      */
     fun refreshOnForeground() {
+        if (isLoadingSettings) {
+            // iOS 패리티: 로딩 완료 후 1회 재시도
+            needsRefresh = true
+            return
+        }
         when (_state.value) {
             is AlertState.Loading -> {
                 // iOS 패리티: 로딩 완료 후 1회 재시도
@@ -246,9 +355,16 @@ class AlertViewModel @Inject constructor(
             )
             repository.createSetting(request).fold(
                 onSuccess = { created ->
-                    val current = _state.value.settings.toMutableList()
-                    current.add(0, created)
-                    _state.value = AlertState.Loaded(alertSettings = current)
+                    val loaded = _state.value as? AlertState.Loaded
+                    if (loaded != null) {
+                        // sync_alerts 경쟁 상황에서도 ID 기준 upsert로 중복 표시 방지
+                        val merged = loaded.alertSettings
+                            .filterNot { it.id == created.id } + created
+                        _state.value = AlertState.Loaded(alertSettings = merged.sortedByCreatedAt())
+                    } else {
+                        // 로딩/에러 상태에서는 서버 정본으로 재동기화
+                        requestRefresh()
+                    }
                     onSuccess()
                 },
                 onFailure = { e ->
@@ -275,6 +391,10 @@ class AlertViewModel @Inject constructor(
         }
     }
 
+    /**
+     * 알림 설정 토글
+     * - Note: 404는 "다른 기기에서 삭제됨"으로 처리 (로컬 제거 + 동기화)
+     */
     fun toggleSetting(setting: AlertSetting, onError: (String) -> Unit = {}) {
         val newEnabled = !setting.isEnabled
         updateSettingLocally(setting.id) {
@@ -291,6 +411,12 @@ class AlertViewModel @Inject constructor(
                     replaceSettingLocally(updated)
                 },
                 onFailure = { e ->
+                    // 404: 다른 기기에서 삭제됨 → 로컬 제거 + 동기화
+                    if (e is AlertNotFoundException) {
+                        removeSettingLocally(setting.id)
+                        loadSettings() // 백그라운드 동기화
+                        return@fold
+                    }
                     // Rollback
                     updateSettingLocally(setting.id) {
                         it.isEnabled = setting.isEnabled
@@ -302,6 +428,10 @@ class AlertViewModel @Inject constructor(
         }
     }
 
+    /**
+     * 알림 설정 수정
+     * - Note: 404는 "다른 기기에서 삭제됨"으로 처리 (로컬 제거 + 동기화)
+     */
     fun updateSetting(
         id: Int,
         bank: String,
@@ -342,7 +472,14 @@ class AlertViewModel @Inject constructor(
                     onSuccess()
                 },
                 onFailure = { e ->
-                    onError(e.message ?: "수정 실패")
+                    // 404: 다른 기기에서 삭제됨 → 로컬 제거 + 동기화
+                    if (e is AlertNotFoundException) {
+                        removeSettingLocally(id)
+                        loadSettings() // 백그라운드 동기화
+                        onError("다른 기기에서 삭제되었습니다")
+                    } else {
+                        onError(e.message ?: "수정 실패")
+                    }
                 }
             )
             _isOperationInProgress.value = false
@@ -372,6 +509,26 @@ class AlertViewModel @Inject constructor(
         _state.value = AlertState.Idle
         lastRefreshAt = 0L
         needsRefresh = false
+        isLoadingSettings = false
+        resetManualRefreshState()
+    }
+
+    /**
+     * 수동 새로고침 상태 초기화 (reset/로그아웃/onCleared에서 호출)
+     */
+    private fun resetManualRefreshState() {
+        manualOrigin = false
+        consecutiveFailures = 0
+        nextManualRefreshAllowedAt = 0L
+        _canManualRefresh.value = true
+        _isRefreshing.value = false
+        cooldownJob?.cancel()
+        cooldownJob = null
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        resetManualRefreshState()
     }
 
     /**
@@ -420,6 +577,15 @@ class AlertViewModel @Inject constructor(
             if (setting.id == newSetting.id) newSetting else setting
         }
         _state.value = AlertState.Loaded(alertSettings = updated)
+    }
+
+    /**
+     * 로컬에서 설정 제거 (다른 기기에서 삭제된 경우)
+     */
+    private fun removeSettingLocally(id: Int) {
+        val loaded = _state.value as? AlertState.Loaded ?: return
+        val filtered = loaded.settings.filterNot { it.id == id }
+        _state.value = AlertState.Loaded(alertSettings = filtered)
     }
 
     fun hasDuplicate(

@@ -89,6 +89,8 @@ fun CurrencyTabContent(
     val alertState by alertViewModel.state.collectAsStateWithLifecycle()
     val hasPermission by alertViewModel.hasNotificationPermission.collectAsStateWithLifecycle()
     val isPermissionDenied by alertViewModel.isPermissionDenied.collectAsStateWithLifecycle()
+    val isRefreshing by alertViewModel.isRefreshing.collectAsStateWithLifecycle()
+    val canRefresh by alertViewModel.canManualRefresh.collectAsStateWithLifecycle()
     var showAddSheet by remember { mutableStateOf(false) }
     var editSetting by remember { mutableStateOf<com.jay.fxi.domain.model.AlertSetting?>(null) }
     var initialBank by remember { mutableStateOf<Bank?>(null) }
@@ -472,6 +474,8 @@ fun CurrencyTabContent(
                     isPermissionDenied = isPermissionDenied,
                     canAddMore = alertViewModel.canAddMore,
                     remainingCount = alertViewModel.remainingCount,
+                    isRefreshing = isRefreshing,
+                    canRefresh = canRefresh,
                     scrollState = scrollState,
                     onToggle = { setting -> alertViewModel.toggleSetting(setting) },
                     onDelete = { setting -> alertViewModel.deleteSetting(setting) },
@@ -499,7 +503,8 @@ fun CurrencyTabContent(
                         }
                         context.startActivity(intent)
                     },
-                    onRetry = { alertViewModel.loadSettings() }
+                    onRetry = { alertViewModel.loadSettings() },
+                    onRefresh = { alertViewModel.refreshNow() }
                 )
             }
         }

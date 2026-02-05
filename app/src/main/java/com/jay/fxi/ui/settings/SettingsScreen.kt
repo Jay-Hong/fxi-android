@@ -127,6 +127,7 @@ fun SettingsScreen(
     val activity = context as? Activity
 
     var deleteConfirmStep by remember { mutableIntStateOf(0) }
+    var showLogoutConfirm by remember { mutableStateOf(false) }
     var currentPage by remember { mutableStateOf(SettingsPage.Main) }
 
     ModalBottomSheet(
@@ -165,7 +166,11 @@ fun SettingsScreen(
                     SettingsPage.ProfileDetail -> ProfileDetailScreen(
                         userInfo = userInfo,
                         onBack = { currentPage = SettingsPage.Main },
-                        onSignOut = onSignOut,
+                        onSignOut = if (onSignOut != null) {
+                            { if (!isDeleting) showLogoutConfirm = true }
+                        } else {
+                            null
+                        },
                         isDeleting = isDeleting,
                         deletionStep = deletionStep,
                         errorMessage = errorMessage,
@@ -185,6 +190,31 @@ fun SettingsScreen(
                 }
             }
         }
+    }
+
+    // 로그아웃 확인 다이얼로그
+    if (showLogoutConfirm) {
+        AlertDialog(
+            onDismissRequest = { showLogoutConfirm = false },
+            title = { Text("로그아웃", color = PrimaryText) },
+            text = { Text("정말 로그아웃하시겠습니까?", color = SecondaryText) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showLogoutConfirm = false
+                        onSignOut?.invoke()
+                    }
+                ) {
+                    Text("로그아웃", color = StatusError, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLogoutConfirm = false }) {
+                    Text("취소", color = SecondaryText)
+                }
+            },
+            containerColor = CardBackground
+        )
     }
 
     // 1차 확인 다이얼로그

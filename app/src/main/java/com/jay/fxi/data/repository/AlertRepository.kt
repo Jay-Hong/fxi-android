@@ -48,12 +48,12 @@ class AlertRepository @Inject constructor(
         return try {
             Result.success(block())
         } catch (e: HttpException) {
-            val message = when (e.code()) {
-                401, 403 -> "인증 오류"
-                503 -> "구독 확인 중"
-                else -> "서버 오류 (${e.code()})"
+            when (e.code()) {
+                404 -> Result.failure(AlertNotFoundException("다른 기기에서 삭제됨"))
+                401, 403 -> Result.failure(AlertRepositoryException("인증 오류"))
+                503 -> Result.failure(AlertRepositoryException("구독 확인 중"))
+                else -> Result.failure(AlertRepositoryException("서버 오류 (${e.code()})"))
             }
-            Result.failure(AlertRepositoryException(message))
         } catch (e: IOException) {
             Result.failure(AlertRepositoryException("네트워크 오류"))
         } catch (e: Exception) {
@@ -62,4 +62,7 @@ class AlertRepository @Inject constructor(
     }
 }
 
-class AlertRepositoryException(message: String) : Exception(message)
+open class AlertRepositoryException(message: String) : Exception(message)
+
+/** 404: 다른 기기에서 이미 삭제된 경우 */
+class AlertNotFoundException(message: String) : AlertRepositoryException(message)
