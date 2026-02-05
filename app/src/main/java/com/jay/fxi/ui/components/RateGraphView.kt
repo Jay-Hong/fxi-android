@@ -28,6 +28,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.GraphBucket
 import com.jay.fxi.domain.model.GraphSource
+import com.jay.fxi.ui.theme.LocalRateLayoutMetrics
+import com.jay.fxi.ui.theme.RateLayoutMetrics
 import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.ui.theme.color
 import kotlin.math.pow
@@ -44,18 +46,19 @@ import kotlinx.datetime.toLocalDateTime
  * - 다중 소스: 각 소스별 close 라인
  * - 시간 기반 X축 (4시간 간격, 00시는 M/d)
  * - Y축 오른쪽, 소수점 1자리
+ *
+ * @param metrics 레이아웃 메트릭스 (phone/tablet 적응형)
  */
 @Composable
 fun RateGraphView(
     graphData: Map<GraphSource, List<GraphBucket>>,
     selectedSources: Set<GraphSource>,
     isLoading: Boolean,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
-    val graphHeight = 170.dp
-
     Box(
-        modifier = modifier.height(graphHeight),
+        modifier = modifier.height(metrics.graphHeight),
         contentAlignment = Alignment.Center
     ) {
         when {
@@ -97,6 +100,7 @@ fun RateGraphView(
                 RateGraphCanvas(
                     graphData = graphData,
                     selectedSources = selectedSources,
+                    verticalPadding = metrics.graphVerticalPadding,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -154,6 +158,7 @@ private data class SourcePaths(
 private fun RateGraphCanvas(
     graphData: Map<GraphSource, List<GraphBucket>>,
     selectedSources: Set<GraphSource>,
+    verticalPadding: androidx.compose.ui.unit.Dp,
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
@@ -171,7 +176,7 @@ private fun RateGraphCanvas(
     val leftPad = with(density) { 8.dp.toPx() }
     val rightPad = with(density) { 40.dp.toPx() }
     val bottomPad = with(density) { 16.dp.toPx() }
-    val innerPad = with(density) { 12.dp.toPx() }  // inner plot padding top+bottom
+    val innerPad = with(density) { verticalPadding.toPx() }  // inner plot padding top+bottom
     val gridStroke = with(density) { 0.5.dp.toPx() }
     val lineStroke = with(density) { 1.5.dp.toPx() }
     val yLabelGap = with(density) { 4.dp.toPx() }
@@ -379,15 +384,17 @@ private fun computeYTicks(
         return listOf(YTick(value = yMin, label = "%.1f".format(yMin)))
     }
 
-    val minSpacing = labelHeightPx * 1.6f
+    // iOS Swift Charts와 유사하게 6-7개 눈금 목표
+    val minSpacing = labelHeightPx * 1.3f  // 1.6 → 1.3: 더 촘촘하게
     val maxTicks = (kotlin.math.floor(plotHeightPx / minSpacing.toDouble()).toInt() + 1)
-        .coerceAtLeast(2)
-    val targetTicks = maxTicks.coerceIn(4, 5)
+        .coerceAtLeast(4)
+    val targetTicks = maxTicks.coerceIn(5, 8)  // 4-5 → 5-8: iOS와 유사하게
 
     var step = niceStep((yMax - yMin) / (targetTicks - 1))
     var ticks = buildYTicks(yMin, yMax, step)
 
-    while (ticks.size > maxTicks) {
+    // 너무 많은 경우에만 step 증가 (iOS는 관대함)
+    while (ticks.size > maxTicks + 2) {
         step = nextNiceStep(step)
         ticks = buildYTicks(yMin, yMax, step)
     }
@@ -412,10 +419,11 @@ private fun niceStep(rawStep: Double): Double {
     val exponent = kotlin.math.floor(kotlin.math.log10(rawStep))
     val scale = 10.0.pow(exponent)
     val base = rawStep / scale
+    // iOS Swift Charts처럼 step=2.0을 더 선호하도록 조정
+    // 2.5 제거: base <= 3.0까지 2.0 사용
     val niceBase = if (base <= 1.0) 1.0
-        else if (base <= 2.0) 2.0
-        else if (base <= 2.5) 2.5
-        else if (base <= 5.0) 5.0
+        else if (base <= 3.0) 2.0  // 2.0, 2.5 → 2.0 통합 (iOS 스타일)
+        else if (base <= 6.0) 5.0  // 5.0 범위 확장
         else 10.0
     return niceBase * scale
 }

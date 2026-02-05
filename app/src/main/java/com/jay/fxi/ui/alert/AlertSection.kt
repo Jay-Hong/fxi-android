@@ -59,8 +59,10 @@ import com.jay.fxi.domain.model.SupportedCurrency
 import com.jay.fxi.ui.theme.Background
 import com.jay.fxi.ui.theme.CardBackground
 import com.jay.fxi.ui.theme.InputBackground
+import com.jay.fxi.ui.theme.LocalRateLayoutMetrics
 import com.jay.fxi.ui.theme.Primary
 import com.jay.fxi.ui.theme.PrimaryText
+import com.jay.fxi.ui.theme.RateLayoutMetrics
 import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.ui.theme.StatusConnecting
 import com.jay.fxi.ui.theme.StatusError
@@ -86,7 +88,8 @@ fun AlertSection(
     onOpenSettings: () -> Unit,
     onRetry: () -> Unit,
     onRefresh: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
     val settings = alertState.settings
         .filter { it.currency == currency.code }
@@ -113,13 +116,13 @@ fun AlertSection(
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(CardBackground)
-            .padding(vertical = 12.dp)
+            .padding(vertical = metrics.sectionPadding)
     ) {
         // Header: 토글 영역과 액션 버튼 분리
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp),
+                .padding(horizontal = metrics.horizontalPadding),
             verticalAlignment = Alignment.CenterVertically
         ) {
             // 왼쪽: 토글 영역 (클릭 → 접기/펼치기)
@@ -139,7 +142,7 @@ fun AlertSection(
                 Text(
                     text = "환율 알림",
                     color = PrimaryText,
-                    fontSize = 17.sp,
+                    fontSize = metrics.sectionTitleFontSize,
                     fontWeight = FontWeight.SemiBold
                 )
 
@@ -320,10 +323,11 @@ fun AlertSection(
 
 @Composable
 private fun EmptyStateView() {
+    val metrics = LocalRateLayoutMetrics.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 16.dp),
+            .padding(vertical = metrics.sectionPadding),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
@@ -349,11 +353,12 @@ private fun PermissionPromptView(
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
+    val metrics = LocalRateLayoutMetrics.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp)
-            .padding(top = 16.dp, bottom = 8.dp),
+            .padding(horizontal = metrics.horizontalPadding)
+            .padding(top = metrics.sectionPadding, bottom = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
@@ -419,11 +424,12 @@ private fun PermissionWarningBanner(
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
+    val metrics = LocalRateLayoutMetrics.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp)
-            .padding(top = 12.dp)
+            .padding(horizontal = metrics.horizontalPadding)
+            .padding(top = metrics.sectionPadding)
             .clip(RoundedCornerShape(8.dp))
             .background(StatusConnecting.copy(alpha = 0.15f))
             .clickable {
@@ -474,6 +480,7 @@ private fun AlertListView(
     onDelete: (AlertSetting) -> Unit,
     onEdit: (AlertSetting) -> Unit
 ) {
+    val metrics = LocalRateLayoutMetrics.current
     Column(
         modifier = Modifier.padding(top = 8.dp)
     ) {
@@ -488,7 +495,7 @@ private fun AlertListView(
             // Divider between items (iOS와 동일)
             if (index < settings.lastIndex) {
                 HorizontalDivider(
-                    modifier = Modifier.padding(start = 12.dp),
+                    modifier = Modifier.padding(start = metrics.horizontalPadding),
                     color = SecondaryText.copy(alpha = 0.1f),
                     thickness = 0.5.dp
                 )
@@ -509,13 +516,14 @@ private fun AddAlertButton(
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
+    val metrics = LocalRateLayoutMetrics.current
     if (canAddMore) {
         // Add button (iOS와 동일: 아웃라인 스타일)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp)
-                .padding(top = 12.dp, bottom = 4.dp)
+                .padding(horizontal = metrics.horizontalPadding)
+                .padding(top = metrics.sectionPadding, bottom = 4.dp)
                 .clip(RoundedCornerShape(8.dp))
                 .background(InputBackground)
                 .clickable {
@@ -558,8 +566,8 @@ private fun AddAlertButton(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp)
-                .padding(top = 12.dp, bottom = 4.dp),
+                .padding(horizontal = metrics.horizontalPadding)
+                .padding(top = metrics.sectionPadding, bottom = 4.dp),
             horizontalArrangement = Arrangement.Center,
             verticalAlignment = Alignment.CenterVertically
         ) {

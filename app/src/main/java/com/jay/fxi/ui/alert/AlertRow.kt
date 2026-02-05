@@ -37,10 +37,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.AlertCondition
 import com.jay.fxi.domain.model.AlertSetting
+import com.jay.fxi.ui.theme.LocalRateLayoutMetrics
 import com.jay.fxi.ui.theme.NegativeColor
 import com.jay.fxi.ui.theme.PositiveColor
 import com.jay.fxi.ui.theme.Primary
 import com.jay.fxi.ui.theme.PrimaryText
+import com.jay.fxi.ui.theme.RateLayoutMetrics
 import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.ui.theme.StatusConnecting
 import com.jay.fxi.ui.theme.StatusError
@@ -50,7 +52,8 @@ fun AlertRow(
     setting: AlertSetting,
     onToggle: () -> Unit,
     onDelete: () -> Unit,
-    onTap: () -> Unit
+    onTap: () -> Unit,
+    metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
     var showDeleteDialog by remember { mutableStateOf(false) }
 
@@ -68,13 +71,13 @@ fun AlertRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onTap)
-            .padding(horizontal = 12.dp, vertical = 2.dp),
+            .padding(horizontal = metrics.horizontalPadding, vertical = metrics.alertRowVerticalPadding),
         verticalAlignment = Alignment.CenterVertically
     ) {
         // Bank name + triggered badge
         Column(
             modifier = Modifier
-                .width(90.dp)
+                .width(metrics.alertBankNameWidth)
                 .alpha(contentAlpha)
         ) {
             Text(

@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.Image
 import androidx.compose.material3.Text
@@ -37,15 +36,16 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.material3.LocalTextStyle
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.ExchangeRate
+import com.jay.fxi.ui.theme.LocalRateLayoutMetrics
 import com.jay.fxi.ui.theme.NegativeColor
 import com.jay.fxi.ui.theme.NeutralColor
 import com.jay.fxi.ui.theme.PositiveColor
+import com.jay.fxi.ui.theme.RateLayoutMetrics
 import com.jay.fxi.ui.theme.ReferenceBorder
 import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.ui.theme.color
@@ -61,6 +61,8 @@ import kotlin.math.abs
  * 환율 바 차트 항목 (iOS RateBarView와 동일한 레이아웃)
  *
  * 레이아웃: [---바(아이콘+환율)---][차이값/은행명]...[타임스탬프]
+ *
+ * @param metrics 레이아웃 메트릭스 (phone/tablet 적응형)
  */
 @Composable
 fun RateBarView(
@@ -68,7 +70,8 @@ fun RateBarView(
     referenceRate: ExchangeRate?,
     minRate: Double,
     maxRate: Double,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
     val bank = rate.bankType ?: return
     val isReference = bank.isReference
@@ -156,7 +159,7 @@ fun RateBarView(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .height(46.dp),
+            .height(metrics.barHeight),
         verticalAlignment = Alignment.CenterVertically
     ) {
         // 바 + 차이값 영역
@@ -164,11 +167,12 @@ fun RateBarView(
             modifier = Modifier.weight(1f),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 바 (아이콘 + 환율 포함)
+            // 바 (아이콘 + 환율 포함) - minBarWidth 보장
             Row(
                 modifier = Modifier
                     .fillMaxWidth(animatedBarWidth)
-                    .height(42.dp)
+                    .widthIn(min = metrics.minBarWidth)
+                    .height(metrics.barHeight)
                     .scale(animatedScale)
                     .clip(RoundedCornerShape(6.dp))
                     .background(bank.color)
@@ -176,7 +180,7 @@ fun RateBarView(
                         if (isReference) Modifier.border(2.dp, ReferenceBorder, RoundedCornerShape(6.dp))
                         else Modifier
                     )
-                    .padding(start = 5.dp),
+                    .padding(start = metrics.barInnerStartPadding),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 // 은행 아이콘
@@ -184,7 +188,7 @@ fun RateBarView(
                     painter = painterResource(id = bank.iconRes),
                     contentDescription = bank.displayName,
                     modifier = Modifier
-                        .size(30.dp)
+                        .size(metrics.bankIconSize)
                         .clip(RoundedCornerShape(6.dp))
                 )
 
@@ -194,10 +198,10 @@ fun RateBarView(
                 Text(
                     text = formatRateValue(animatedRate.toDouble()),
                     color = Color.White,
-                    fontSize = 17.sp,
+                    fontSize = metrics.rateValueFontSize,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
-                    modifier = Modifier.padding(end = 10.dp),
+                    modifier = Modifier.padding(end = metrics.barInnerEndPadding),
                     style = LocalTextStyle.current.copy(
                         shadow = Shadow(
                             color = Color.Black.copy(alpha = 0.8f),
@@ -208,18 +212,18 @@ fun RateBarView(
                 )
             }
 
-            Spacer(modifier = Modifier.width(1.dp))
+            Spacer(modifier = Modifier.width(metrics.barToDiffSpacing))
 
             // 차이값 섹션
             Box(
-                modifier = Modifier.widthIn(min = 55.dp),
+                modifier = Modifier.widthIn(min = metrics.diffMinWidth),
                 contentAlignment = Alignment.Center
             ) {
                 if (showDirection) {
                     Text(
                         text = directionSymbol,
                         color = directionColor,
-                        fontSize = 15.sp,
+                        fontSize = metrics.diffFontSize,
                         fontWeight = FontWeight.Bold
                     )
                 } else if (isReference) {
@@ -234,7 +238,7 @@ fun RateBarView(
                     Text(
                         text = formatDifference(animatedDiff.toDouble()),
                         color = diffColor,
-                        fontSize = 15.sp,
+                        fontSize = metrics.diffFontSize,
                         fontWeight = FontWeight.Bold,
                         letterSpacing = (-0.3).sp
                     )
@@ -242,27 +246,27 @@ fun RateBarView(
             }
         }
 
-        Spacer(modifier = Modifier.width(4.dp))
+        Spacer(modifier = Modifier.width(metrics.barTimestampSpacing))
 
         // 타임스탬프 (오른쪽 끝 고정, iOS spacing: 1)
         Column(
-            modifier = Modifier.width(46.dp),
+            modifier = Modifier.width(metrics.timestampWidth),
             horizontalAlignment = Alignment.End,
             verticalArrangement = Arrangement.spacedBy(1.dp)
         ) {
             Text(
                 text = dateStr,
                 color = SecondaryText,
-                fontSize = 11.sp,
+                fontSize = metrics.timestampFontSize,
                 fontWeight = FontWeight.Medium,
-                lineHeight = 13.sp,
+                lineHeight = (metrics.timestampFontSize.value + 2).sp,
                 textAlign = TextAlign.End
             )
             Text(
                 text = timeStr,
                 color = SecondaryText,
-                fontSize = 11.sp,
-                lineHeight = 13.sp,
+                fontSize = metrics.timestampFontSize,
+                lineHeight = (metrics.timestampFontSize.value + 2).sp,
                 textAlign = TextAlign.End
             )
         }
@@ -270,7 +274,8 @@ fun RateBarView(
 }
 
 /**
- * 바 너비 계산 (웹/iOS 버전과 동일한 로직)
+ * 바 너비 계산 (iOS 버전과 동일한 로직)
+ * 환율 범위에 따라 바의 최소~최대 너비 비율 결정
  */
 private fun calculateBarWidth(rate: Double, minRate: Double, maxRate: Double): Float {
     val rateRange = maxRate - minRate
@@ -278,14 +283,15 @@ private fun calculateBarWidth(rate: Double, minRate: Double, maxRate: Double): F
 
     val normalized = ((rate - minRate) / rateRange).toFloat()
 
+    // iOS와 동일한 범위 (35%~80%)
     return when {
-        rateRange >= 4 -> 0.48f + normalized * 0.30f   // 48% ~ 78%
-        rateRange >= 3 -> 0.50f + normalized * 0.28f   // 50% ~ 78%
-        rateRange >= 2 -> 0.53f + normalized * 0.25f   // 53% ~ 78%
-        rateRange >= 1 -> 0.57f + normalized * 0.21f   // 57% ~ 78%
-        rateRange >= 0.6 -> 0.62f + normalized * 0.15f // 62% ~ 77%
-        rateRange > 0.3 -> 0.67f + normalized * 0.10f  // 67% ~ 77%
-        else -> 0.72f + normalized * 0.04f              // 72% ~ 76%
+        rateRange >= 4 -> 0.35f + normalized * 0.45f   // 35% ~ 80%
+        rateRange >= 3 -> 0.40f + normalized * 0.40f   // 40% ~ 80%
+        rateRange >= 2 -> 0.45f + normalized * 0.35f   // 45% ~ 80%
+        rateRange >= 1 -> 0.50f + normalized * 0.30f   // 50% ~ 80%
+        rateRange >= 0.6 -> 0.55f + normalized * 0.25f // 55% ~ 80%
+        rateRange > 0.3 -> 0.60f + normalized * 0.18f  // 60% ~ 78%
+        else -> 0.65f + normalized * 0.12f              // 65% ~ 77%
     }
 }
 

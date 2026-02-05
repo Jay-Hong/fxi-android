@@ -5,6 +5,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -22,6 +23,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.ChevronRight
@@ -60,8 +62,10 @@ import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.ui.settings.SettingsScreen
 import com.jay.fxi.ui.theme.Background
 import com.jay.fxi.ui.theme.CardBackground
+import com.jay.fxi.ui.theme.LocalRateLayoutMetrics
 import com.jay.fxi.ui.theme.Primary
 import com.jay.fxi.ui.theme.PrimaryText
+import com.jay.fxi.ui.theme.RateLayoutMetrics
 import com.jay.fxi.ui.theme.SecondaryText
 import kotlinx.coroutines.delay
 
@@ -98,13 +102,15 @@ fun LockedPreviewScreen(
         }
     }
 
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .background(Background)
             .windowInsetsPadding(WindowInsets.statusBars)
     ) {
-        Column(modifier = Modifier.fillMaxSize()) {
+        val metrics = RateLayoutMetrics.fromWidth(maxWidth)
+        CompositionLocalProvider(LocalRateLayoutMetrics provides metrics) {
+            Column(modifier = Modifier.fillMaxSize()) {
             // 상단 배너
             SampleBannerWithCTA(onPrimaryAction = onPrimaryAction)
 
@@ -189,6 +195,7 @@ fun LockedPreviewScreen(
                     tint = Color(0xFFFFA500).copy(alpha = 0.7f)
                 )
             }
+        }
         }
     }
 
