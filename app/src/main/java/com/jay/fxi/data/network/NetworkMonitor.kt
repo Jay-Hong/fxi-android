@@ -69,11 +69,7 @@ class NetworkMonitor @Inject constructor(
             network: Network,
             networkCapabilities: NetworkCapabilities
         ) {
-            val connected = networkCapabilities.hasCapability(
-                NetworkCapabilities.NET_CAPABILITY_INTERNET
-            ) && networkCapabilities.hasCapability(
-                NetworkCapabilities.NET_CAPABILITY_VALIDATED
-            )
+            val connected = isNetworkUsable(networkCapabilities)
             _isConnected.value = connected
             _connectionType.value = if (connected) {
                 getConnectionType(networkCapabilities)
@@ -98,8 +94,7 @@ class NetworkMonitor @Inject constructor(
     fun checkCurrentConnectivity(): Boolean {
         val network = connectivityManager.activeNetwork ?: return false
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
-        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        return isNetworkUsable(capabilities)
     }
 
     /**
@@ -122,5 +117,21 @@ class NetworkMonitor @Inject constructor(
             capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> ConnectionType.ETHERNET
             else -> ConnectionType.UNKNOWN
         }
+    }
+
+    /**
+     * 네트워크 사용 가능 여부 판단
+     *
+     * VALIDATED가 없더라도 일부 환경(기업/학교망, 보안 DNS 등)에서는 실제 인터넷이 가능함.
+     * 캡티브 포털인 경우는 제외.
+     */
+    private fun isNetworkUsable(capabilities: NetworkCapabilities): Boolean {
+        if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+            return false
+        }
+        if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+            return true
+        }
+        return !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL)
     }
 }

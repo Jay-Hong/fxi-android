@@ -164,7 +164,7 @@ class WebSocketService @Inject constructor(
         }
 
         // 네트워크 없으면 실패
-        if (!networkMonitor.checkCurrentConnectivity()) {
+        if (!networkMonitor.isConnected.value) {
             _connectionState.value = ConnectionState.Failed("네트워크 연결 없음")
             return
         }
@@ -196,7 +196,7 @@ class WebSocketService @Inject constructor(
         cleanup()
 
         // 네트워크 없으면 즉시 실패
-        if (!networkMonitor.checkCurrentConnectivity()) {
+        if (!networkMonitor.isConnected.value) {
             _connectionState.value = ConnectionState.Failed("네트워크 연결 없음")
             return
         }
@@ -215,7 +215,7 @@ class WebSocketService @Inject constructor(
                 delay(delay)
                 if (isActive && !isIntentionalDisconnect) {
                     // 재연결 전 네트워크 다시 확인
-                    if (networkMonitor.checkCurrentConnectivity()) {
+                    if (networkMonitor.isConnected.value) {
                         connect()
                     } else {
                         _connectionState.value = ConnectionState.Failed("네트워크 연결 없음")
