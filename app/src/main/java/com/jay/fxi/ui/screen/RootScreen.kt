@@ -129,7 +129,7 @@ fun RootScreen(
         AuthState.SignedOut -> {
             if (showPreview) {
                 LockedPreviewScreen(
-                    primaryActionLabel = "로그인하고 구독하기",
+                    subscriptionManager = subscriptionManager,
                     onPrimaryAction = { showPreview = false },
                     onClose = { showPreview = false }
                 )
@@ -156,7 +156,7 @@ fun RootScreen(
                 // (iOS .sheet() 동작과 동일 — 시뮬레이션이 Paywall 표시 중에도 유지됨)
                 Box(modifier = Modifier.fillMaxSize()) {
                     LockedPreviewScreen(
-                        primaryActionLabel = "프리미엄 구독하기",
+                        subscriptionManager = subscriptionManager,
                         onPrimaryAction = { showPaywall = true },
                         userInfo = userInfo,
                         onSignOut = { authViewModel.signOut() },
@@ -180,6 +180,7 @@ fun RootScreen(
                                     )
                             )
                             PaywallScreen(
+                                subscriptionManager = subscriptionManager,
                                 onClose = { showPaywall = false }
                             )
                         }

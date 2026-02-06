@@ -88,13 +88,13 @@ private fun BannerContent(
             .border(1.dp, BannerBorder, RoundedCornerShape(16.dp))
             .padding(horizontal = 14.dp, vertical = 10.dp)
     ) {
-        // 앱 아이콘
+        // 앱 아이콘 (iOS 40×40, cornerRadius 9 파리티)
         Image(
             painter = painterResource(id = R.drawable.ic_splash_icon),
             contentDescription = "FXi",
             modifier = Modifier
-                .size(36.dp)
-                .clip(RoundedCornerShape(8.dp))
+                .size(40.dp)
+                .clip(RoundedCornerShape(9.dp))
                 .background(Color.White)
         )
 
@@ -121,13 +121,13 @@ private fun BannerContent(
 
         Spacer(modifier = Modifier.width(6.dp))
 
-        // 닫기 버튼 (IconButton 대신 직접 clickable → 48dp 최소 사이즈 회피)
+        // 닫기 버튼 (iOS 24pt 파리티, IconButton 대신 직접 clickable → 48dp 최소 사이즈 회피)
         Icon(
             imageVector = Icons.Default.Close,
             contentDescription = "닫기",
-            tint = Color.White.copy(alpha = 0.4f),
+            tint = Color.White.copy(alpha = 0.5f),
             modifier = Modifier
-                .size(20.dp)
+                .size(24.dp)
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,

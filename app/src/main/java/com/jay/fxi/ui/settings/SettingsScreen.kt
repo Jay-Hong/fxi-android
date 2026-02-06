@@ -1220,10 +1220,10 @@ private fun PrivacyPolicyScreen(onBack: () -> Unit) {
                                 view: android.webkit.WebView?,
                                 request: android.webkit.WebResourceRequest?
                             ): Boolean {
-                                val url = request?.url?.toString() ?: return false
-                                if (url.contains("fxfxi.blogspot.com")) return false
-                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                                return true
+                                // 개인정보처리방침: 기본적으로 WebView 내부 처리.
+                                // 단, intent:// / market:// 등은 기기에서 외부 앱을 강제로 띄울 수 있어 차단한다.
+                                val scheme = request?.url?.scheme
+                                return scheme != null && scheme !in setOf("http", "https", "about", "data", "file")
                             }
                         }
                         loadUrl(PRIVACY_POLICY_URL)

@@ -40,7 +40,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
@@ -50,7 +52,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import com.jay.fxi.R
 import androidx.compose.ui.text.font.FontWeight
@@ -67,6 +68,7 @@ import com.jay.fxi.ui.theme.Primary
 import com.jay.fxi.ui.theme.PrimaryText
 import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.ui.theme.StatusError
+import com.jay.fxi.ui.subscription.PrivacyPolicyOverlay
 import kotlin.math.sin
 
 private data class LoginParticle(
@@ -158,6 +160,7 @@ fun LoginScreen(
 
     val context = LocalContext.current
     val activity = context as? Activity
+    var showPrivacyPolicy by remember { mutableStateOf(false) }
 
     LaunchedEffect(authState) {
         if (authState is AuthState.SignedIn) {
@@ -364,7 +367,6 @@ fun LoginScreen(
 
                 // 개인정보처리방침 동의 문구
                 Spacer(modifier = Modifier.height(8.dp))
-                val uriHandler = LocalUriHandler.current
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.Center,
@@ -375,12 +377,22 @@ fun LoginScreen(
                         text = "개인정보처리방침",
                         color = Primary,
                         fontSize = 12.sp,
-                        modifier = Modifier.clickable {
-                            uriHandler.openUri("https://fxfxi.blogspot.com/2026/01/blog-post.html")
-                        }
+                        modifier = Modifier.clickable { showPrivacyPolicy = true }
                     )
                     Text(text = "에 동의합니다", color = SecondaryText, fontSize = 12.sp)
                 }
+            }
+        }
+
+        // 개인정보처리방침 (In-app WebView 오버레이)
+        if (showPrivacyPolicy) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Background)
+                    .windowInsetsPadding(WindowInsets.statusBars)
+            ) {
+                PrivacyPolicyOverlay(onBack = { showPrivacyPolicy = false })
             }
         }
     }

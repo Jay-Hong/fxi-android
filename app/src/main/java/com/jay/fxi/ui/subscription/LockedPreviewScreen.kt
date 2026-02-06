@@ -26,9 +26,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.CardGiftcard
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.WorkspacePremium
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -48,17 +49,21 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.jay.fxi.subscription.SubscriptionManager
 import com.jay.fxi.domain.model.GraphSource
 import com.jay.fxi.domain.model.SupportedCurrency
 import com.jay.fxi.domain.model.UserInfo
@@ -89,7 +94,7 @@ private sealed class AlertSheetState {
 
 @Composable
 fun LockedPreviewScreen(
-    primaryActionLabel: String,
+    subscriptionManager: SubscriptionManager,
     onPrimaryAction: () -> Unit,
     onClose: (() -> Unit)? = null,
     userInfo: UserInfo? = null,
@@ -104,6 +109,16 @@ fun LockedPreviewScreen(
     var alertSheetState by remember { mutableStateOf<AlertSheetState?>(null) }
     var isFloatingCTAHighlighted by remember { mutableStateOf(false) }
     var ctaHighlightTriggerCount by remember { mutableIntStateOf(0) }
+
+    // ── SubscriptionManager 연동 (iOS 파리티) ──
+    val trialDurationText by subscriptionManager.trialDurationText.collectAsStateWithLifecycle()
+    val showGiftIcon = trialDurationText != null
+    val primaryCTATitle = if (trialDurationText != null) "첫 구독자 $trialDurationText 무료" else "프리미엄 구독하기"
+
+    // offerings preload (iOS onAppear에서 loadOfferings 호출과 동일)
+    LaunchedEffect(Unit) {
+        subscriptionManager.loadOfferings()
+    }
 
     // ── ViewModel 데이터 ──
 
@@ -250,8 +265,9 @@ fun LockedPreviewScreen(
                 // 플로팅 CTA
                 FloatingCTA(
                     label = if (isFloatingCTAHighlighted) "방금 예시 알림, 실제로 받아보기"
-                    else primaryActionLabel,
+                    else primaryCTATitle,
                     isHighlighted = isFloatingCTAHighlighted,
+                    showGiftIcon = showGiftIcon,
                     onClick = onPrimaryAction,
                     modifier = Modifier.align(Alignment.BottomCenter)
                 )
@@ -315,10 +331,17 @@ fun LockedPreviewScreen(
 
 // MARK: - 플로팅 CTA
 
+/** iOS ctaGoldGradient 동일: Yellow → Orange 대각선 그라데이션 */
+private val GoldColor = Color(0xFFF5A623)
+private val GoldGradient = Brush.linearGradient(
+    colors = listOf(Color(0xFFFFD700), Color(0xFFFFA500))
+)
+
 @Composable
 private fun FloatingCTA(
     label: String,
     isHighlighted: Boolean,
+    showGiftIcon: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -340,25 +363,39 @@ private fun FloatingCTA(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth()
         ) {
+            // 아이콘: 체험 자격 → CardGiftcard, 기본 → WorkspacePremium (iOS crown.fill/gift.fill 대응)
             Icon(
-                imageVector = Icons.Default.Star,
+                imageVector = if (showGiftIcon) Icons.Default.CardGiftcard else Icons.Default.WorkspacePremium,
                 contentDescription = null,
                 modifier = Modifier.size(18.dp),
-                tint = Color(0xFFFFA500)
+                tint = if (isHighlighted) Color(0xFFFFA500) else GoldColor
             )
             Spacer(modifier = Modifier.width(10.dp))
-            Text(
-                text = label,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = Color(0xFFFFA500)
-            )
+            // 텍스트: 강조 시 orange, 기본 시 gold gradient (iOS foregroundStyle 파리티)
+            if (isHighlighted) {
+                Text(
+                    text = label,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFFFFA500)
+                )
+            } else {
+                Text(
+                    text = label,
+                    style = TextStyle(
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        brush = GoldGradient
+                    )
+                )
+            }
             Spacer(modifier = Modifier.weight(1f))
             Icon(
                 imageVector = Icons.Default.ChevronRight,
                 contentDescription = null,
                 modifier = Modifier.size(14.dp),
-                tint = Color(0xFFFFA500).copy(alpha = 0.7f)
+                tint = if (isHighlighted) Color(0xFFFFA500).copy(alpha = 0.7f)
+                else GoldColor.copy(alpha = 0.7f)
             )
         }
     }
