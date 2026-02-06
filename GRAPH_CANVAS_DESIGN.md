@@ -61,7 +61,7 @@ Graph height: 170dp (현재 Android 고정값 유지, 필요시 추후 가변화
 - Label placement: chartBottom 바로 아래 (iOS `AxisValueLabel(anchor: .top)` = 레이블 상단이 축선에 정렬, 텍스트는 아래로)
 
 ## Y-Axis (Right)
-- Tick 수: **가변** (화면 높이에 따라 4~5개 목표, 공간이 부족하면 더 적게)
+- Tick 수: iOS 출력과 유사하게 **낮은 개수 중심(대략 3~4개)**으로 유지 (기기 높이에 크게 의존하지 않음)
 - Label format: 소수점 1자리 (`"%.1f"`)
 - 위치: chartRight 우측에 4dp 간격
 - Font: 11sp, `fontFeatureSettings = "tnum"` (tabular/monospaced digits, iOS `.caption2` + `.monospacedDigit()` 매칭)
@@ -70,20 +70,18 @@ Graph height: 170dp (현재 Android 고정값 유지, 필요시 추후 가변화
 - 최상단/최하단 tick(=yMax/yMin)은 그리드/레이블 **렌더링에서 제외**하여 상단/하단 불필요한 축선이 생기지 않게 함
 
 ### Y-Axis Tick Algorithm (Nice Numbers)
-1. **최대 라벨 개수 산정**  
-   - `labelHeight = measure("0000.0")`  
-   - `minSpacing = labelHeight * 1.6`  
-   - `maxTicks = floor(plotHeight / minSpacing) + 1` (최소 2)  
-   - `targetTicks = clamp(maxTicks, 4..5)` (공간 부족 시 4보다 작아질 수 있음)
-2. **nice step 계산**  
-   - `rawStep = (yMax - yMin) / (targetTicks - 1)`  
-   - `niceStep ∈ {1, 2, 2.5, 5, 10} × 10^n`  
+목표: "Swift Charts 내부 구현 복제"가 아니라, 현재 iOS 출력 패턴을 안정적으로 재현.
+1. **고정 tick count 힌트**  
+   - `desiredCountHint = 4`
+2. **nice step 계산 (표준 1/2/5/10 × 10^n)**  
+   - `rawStep = (yMax - yMin) / desiredCountHint`
+   - `niceStep ∈ {1, 2, 5, 10} × 10^n`
+   - 선택은 기하평균 임계값 기반 (d3-array의 tickStep과 유사한 방식)
 3. **niceMin / niceMax**  
    - `niceMin = floor(yMin / niceStep) * niceStep`  
    - `niceMax = ceil(yMax / niceStep) * niceStep`  
 4. **tick 생성**  
-   - `ticks = niceMin..niceMax step niceStep`  
-   - tick 수가 `maxTicks`를 초과하면 step을 한 단계 키움(2→2.5→5→10→10^n)
+   - `ticks = niceMin..niceMax step niceStep`
 
 ## Rendering Order
 1. **clipRect** 적용 (차트 영역 내부로 제한)

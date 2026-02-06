@@ -210,9 +210,7 @@ private fun RateGraphCanvas(
 
         // Compute ticks
         val xTicks = computeXTicks(layout.xMin, layout.xMax, chartState.lastDataTs)
-        val sampleLabel = "0000.0"
-        val labelHeight = textMeasurer.measure(sampleLabel, labelStyle).size.height.toFloat()
-        val yTicks = computeYTicks(layout.yMin, layout.yMax, layout.chartHeight, labelHeight)
+        val yTicks = computeYTicks(layout.yMin, layout.yMax)
 
         // Compute paths
         val sourcePaths = computeSourcePaths(
@@ -376,68 +374,106 @@ private fun computeXTicks(xMin: Int, xMax: Int, lastDataTs: Int): List<XTick> {
 
 private fun computeYTicks(
     yMin: Double,
-    yMax: Double,
-    plotHeightPx: Float,
-    labelHeightPx: Float
+    yMax: Double
 ): List<YTick> {
-    if (yMax <= yMin || plotHeightPx <= 0f) {
+    if (yMax <= yMin) {
         return listOf(YTick(value = yMin, label = "%.1f".format(yMin)))
     }
 
-    // iOS Swift Charts와 유사하게 6-7개 눈금 목표
-    val minSpacing = labelHeightPx * 1.3f  // 1.6 → 1.3: 더 촘촘하게
-    val maxTicks = (kotlin.math.floor(plotHeightPx / minSpacing.toDouble()).toInt() + 1)
-        .coerceAtLeast(4)
-    val targetTicks = maxTicks.coerceIn(5, 8)  // 4-5 → 5-8: iOS와 유사하게
+    // iOS는 AxisMarks(values:)를 지정하지 않고 Swift Charts의 자동 tick을 사용한다.
+    // Swift Charts 내부 구현은 비공개지만, 현재 iOS 출력 패턴(폰/태블릿 동일, 3~4개 중심, 1/2/5/10 nice step)에
+    // 맞추기 위해 Android는 "height 기반 tick 밀도"를 제거하고 작은 고정 count 힌트를 사용한다.
+    val desiredCountHint = 4
+    val span = yMax - yMin
+    val rawStep = span / desiredCountHint.toDouble()
+    var step = d3LikeNiceStep(rawStep)
 
-    var step = niceStep((yMax - yMin) / (targetTicks - 1))
-    var ticks = buildYTicks(yMin, yMax, step)
-
-    // 너무 많은 경우에만 step 증가 (iOS는 관대함)
-    while (ticks.size > maxTicks + 2) {
-        step = nextNiceStep(step)
-        ticks = buildYTicks(yMin, yMax, step)
+    // Our renderer intentionally skips the boundary ticks (min/max) to avoid extra axis lines.
+    // So we must cap the number of *interior* labels, not total tick count.
+    val maxInteriorTickCount = 5
+    var interiorTickCount = interiorTickCountForNiceStep(yMin, yMax, step)
+    while (interiorTickCount > maxInteriorTickCount) {
+        step = next12510Step(step)
+        interiorTickCount = interiorTickCountForNiceStep(yMin, yMax, step)
     }
 
-    return ticks
+    return buildYTicks(yMin, yMax, step)
 }
 
 private fun buildYTicks(yMin: Double, yMax: Double, step: Double): List<YTick> {
-    val start = kotlin.math.floor(yMin / step) * step
-    val end = kotlin.math.ceil(yMax / step) * step
+    if (step <= 0.0) {
+        return listOf(YTick(value = yMin, label = "%.1f".format(yMin)))
+    }
+
+    // Using integer indices avoids accumulating floating point error by repeatedly adding step.
+    val startIndex = kotlin.math.floor(yMin / step).toLong()
+    val endIndex = kotlin.math.ceil(yMax / step).toLong()
     val ticks = mutableListOf<YTick>()
-    var value = start
-    while (value <= end + 1e-9) {
+    var i = startIndex
+    while (i <= endIndex) {
+        val value = i.toDouble() * step
         ticks.add(YTick(value = value, label = "%.1f".format(value)))
-        value += step
+        i += 1
     }
     return ticks
 }
 
-private fun niceStep(rawStep: Double): Double {
-    if (rawStep <= 0.0) return 1.0
-    val exponent = kotlin.math.floor(kotlin.math.log10(rawStep))
-    val scale = 10.0.pow(exponent)
-    val base = rawStep / scale
-    // iOS Swift Charts처럼 step=2.0을 더 선호하도록 조정
-    // 2.5 제거: base <= 3.0까지 2.0 사용
-    val niceBase = if (base <= 1.0) 1.0
-        else if (base <= 3.0) 2.0  // 2.0, 2.5 → 2.0 통합 (iOS 스타일)
-        else if (base <= 6.0) 5.0  // 5.0 범위 확장
-        else 10.0
-    return niceBase * scale
+private fun interiorTickCountForNiceStep(yMin: Double, yMax: Double, step: Double): Int {
+    if (step <= 0.0 || yMax <= yMin) return 0
+    val span = yMax - yMin
+    val eps = span * 1e-9
+    val startIndex = kotlin.math.floor(yMin / step).toLong()
+    val endIndex = kotlin.math.ceil(yMax / step).toLong()
+    var count = 0
+    var i = startIndex
+    while (i <= endIndex) {
+        val value = i.toDouble() * step
+        if (value > yMin + eps && value < yMax - eps) count += 1
+        i += 1
+    }
+    return count
 }
 
-private fun nextNiceStep(step: Double): Double {
+private fun next12510Step(step: Double): Double {
     if (step <= 0.0) return 1.0
     val exponent = kotlin.math.floor(kotlin.math.log10(step))
     val scale = 10.0.pow(exponent)
     val base = step / scale
-    return if (base <= 1.0) 2.0 * scale
-        else if (base <= 2.0) 2.5 * scale
-        else if (base <= 2.5) 5.0 * scale
-        else if (base <= 5.0) 10.0 * scale
-        else 10.0.pow(exponent + 1)
+
+    val nextBase = when {
+        base <= 1.0 -> 2.0
+        base <= 2.0 -> 5.0
+        base <= 5.0 -> 10.0
+        else -> 10.0
+    }
+
+    return nextBase * scale
+}
+
+/**
+ * Standard "nice numbers" step selection similar to d3-array tickStep().
+ *
+ * This does NOT claim Swift Charts uses d3. We use it because it matches the current iOS output:
+ * step ∈ {1,2,5,10} × 10^n chosen by geometric-mean thresholds.
+ */
+private fun d3LikeNiceStep(rawStep: Double): Double {
+    if (rawStep <= 0.0) return 1.0
+    val exponent = kotlin.math.floor(kotlin.math.log10(rawStep))
+    val scale = 10.0.pow(exponent)
+    val error = rawStep / scale
+
+    val sqrt2 = kotlin.math.sqrt(2.0)
+    val sqrt10 = kotlin.math.sqrt(10.0)
+    val sqrt50 = kotlin.math.sqrt(50.0)
+
+    val base = when {
+        error >= sqrt50 -> 10.0
+        error >= sqrt10 -> 5.0
+        error >= sqrt2 -> 2.0
+        else -> 1.0
+    }
+
+    return base * scale
 }
 
 private fun computeSourcePaths(
