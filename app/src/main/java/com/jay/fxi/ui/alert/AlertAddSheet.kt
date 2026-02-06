@@ -793,7 +793,8 @@ private fun sanitizeThresholdInput(input: String): String? {
     val parts = withoutCommas.split(".")
     if (parts.size == 2 && parts[1].length > 2) return null
 
-    return cleaned
+    // 붙여넣기 등으로 들어온 콤마는 허용하되 표기에서는 제거
+    return withoutCommas
 }
 
 private fun roundToTens(value: Double): Double {
@@ -802,6 +803,8 @@ private fun roundToTens(value: Double): Double {
 
 private fun formatThreshold(value: Double): String {
     return NumberFormat.getNumberInstance(Locale.KOREA).apply {
+        // iOS와 표기 통일: 천단위 구분자(,) 제거
+        isGroupingUsed = false
         minimumFractionDigits = 2
         maximumFractionDigits = 2
     }.format(value)
@@ -810,6 +813,8 @@ private fun formatThreshold(value: Double): String {
 /** iOS와 동일: 설정 가능 범위는 소수점 없이 표시 */
 private fun formatRangeValue(value: Double): String {
     return NumberFormat.getNumberInstance(Locale.KOREA).apply {
+        // iOS와 표기 통일: 천단위 구분자(,) 제거
+        isGroupingUsed = false
         minimumFractionDigits = 0
         maximumFractionDigits = 0
     }.format(value)

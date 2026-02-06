@@ -297,6 +297,8 @@ private fun calculateBarWidth(rate: Double, minRate: Double, maxRate: Double): F
 
 private fun formatRateValue(rate: Double): String {
     return NumberFormat.getNumberInstance(Locale.KOREA).apply {
+        // iOS와 표기 통일: 천단위 구분자(,) 제거
+        isGroupingUsed = false
         minimumFractionDigits = 2
         maximumFractionDigits = 2
     }.format(rate)
@@ -305,6 +307,8 @@ private fun formatRateValue(rate: Double): String {
 private fun formatDifference(difference: Double): String {
     val sign = if (difference >= 0) "+" else ""
     return "$sign${NumberFormat.getNumberInstance(Locale.KOREA).apply {
+        // iOS와 표기 통일: 천단위 구분자(,) 제거
+        isGroupingUsed = false
         minimumFractionDigits = 2
         maximumFractionDigits = 2
     }.format(difference)}"

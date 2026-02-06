@@ -32,7 +32,7 @@ data class AlertSetting(
     val currencyType: SupportedCurrency? get() = SupportedCurrency.fromCode(currency)
 
     /**
-     * 포맷된 임계값 (예: "1,400.00")
+     * 포맷된 임계값 (예: "1400.00")
      */
     val formattedThreshold: String
         get() = ExchangeRate.formatRate(threshold, currency)
@@ -40,7 +40,7 @@ data class AlertSetting(
             .replace(" (100엔)", "")
 
     /**
-     * 조건 텍스트 (예: "1,400.00원 이하")
+     * 조건 텍스트 (예: "1400.00원 이하")
      */
     val conditionText: String
         get() {

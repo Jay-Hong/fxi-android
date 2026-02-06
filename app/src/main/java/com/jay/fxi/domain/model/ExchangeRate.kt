@@ -50,6 +50,8 @@ data class ExchangeRate(
          */
         private fun createNumberFormatter(): NumberFormat =
             NumberFormat.getNumberInstance(Locale.KOREA).apply {
+                // iOS와 표기 통일: 천단위 구분자(,) 제거
+                isGroupingUsed = false
                 minimumFractionDigits = 2
                 maximumFractionDigits = 2
             }
