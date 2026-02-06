@@ -2,6 +2,8 @@ package com.jay.fxi.ui.screen
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -148,18 +150,41 @@ fun RootScreen(
                     graphViewModel = graphViewModel,
                     alertViewModel = alertViewModel
                 )
-            } else if (showPaywall) {
-                PaywallScreen(
-                    onClose = { showPaywall = false }
-                )
             } else {
                 val userInfo = (authState as? AuthState.SignedIn)?.user
-                LockedPreviewScreen(
-                    primaryActionLabel = "프리미엄 구독하기",
-                    onPrimaryAction = { showPaywall = true },
-                    userInfo = userInfo,
-                    onSignOut = { authViewModel.signOut() }
-                )
+                // Box overlay: LockedPreviewScreen stays in composition while Paywall is shown
+                // (iOS .sheet() 동작과 동일 — 시뮬레이션이 Paywall 표시 중에도 유지됨)
+                Box(modifier = Modifier.fillMaxSize()) {
+                    LockedPreviewScreen(
+                        primaryActionLabel = "프리미엄 구독하기",
+                        onPrimaryAction = { showPaywall = true },
+                        userInfo = userInfo,
+                        onSignOut = { authViewModel.signOut() },
+                        isPaywallVisible = showPaywall
+                    )
+                    if (showPaywall) {
+                        // PaywallScreen이 overlay로 올라간 상태에서도, 빈 영역 탭이
+                        // 아래 LockedPreviewScreen으로 전달되지 않도록 터치를 흡수한다.
+                        //
+                        // Note: PaywallScreen의 인터랙션(스크롤/버튼)을 방해하지 않도록
+                        // 흡수 레이어는 PaywallScreen "뒤"에 둔다.
+                        val interactionSource = remember { MutableInteractionSource() }
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clickable(
+                                        interactionSource = interactionSource,
+                                        indication = null,
+                                        onClick = {}
+                                    )
+                            )
+                            PaywallScreen(
+                                onClose = { showPaywall = false }
+                            )
+                        }
+                    }
+                }
             }
         }
     }

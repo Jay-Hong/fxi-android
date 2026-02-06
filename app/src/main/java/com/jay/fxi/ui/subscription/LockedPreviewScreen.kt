@@ -1,5 +1,6 @@
 package com.jay.fxi.ui.subscription
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -23,23 +24,23 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Star
-import androidx.compose.foundation.Image
 import androidx.compose.material3.AlertDialog
-import androidx.compose.ui.graphics.ColorFilter
-import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -48,17 +49,24 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.jay.fxi.domain.model.GraphSource
 import com.jay.fxi.domain.model.SupportedCurrency
-import com.jay.fxi.domain.model.sortedByBank
+import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.domain.model.referenceRate
+import com.jay.fxi.domain.model.sortedByBank
 import com.jay.fxi.ui.components.RateBarView
 import com.jay.fxi.ui.components.RateGraphView
 import com.jay.fxi.ui.components.SourceToggleRow
-import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.ui.settings.SettingsScreen
 import com.jay.fxi.ui.theme.Background
 import com.jay.fxi.ui.theme.CardBackground
@@ -73,27 +81,108 @@ private object LockedPreviewState {
     var hasShownWelcomeThisSession = false
 }
 
+/** 알림 추가/수정 시트 상태 */
+private sealed class AlertSheetState {
+    data object Add : AlertSheetState()
+    data class Edit(val setting: SampleAlertSetting) : AlertSheetState()
+}
+
 @Composable
 fun LockedPreviewScreen(
     primaryActionLabel: String,
     onPrimaryAction: () -> Unit,
     onClose: (() -> Unit)? = null,
     userInfo: UserInfo? = null,
-    onSignOut: (() -> Unit)? = null
+    onSignOut: (() -> Unit)? = null,
+    isPaywallVisible: Boolean = false
 ) {
-    val sampleRates = remember { SampleData.sampleRates(SupportedCurrency.USD_KRW) }
-    val graphData = remember { SampleData.sampleGraphData(SupportedCurrency.USD_KRW) }
+    val viewModel = remember { SamplePreviewViewModel() }
     val scrollState = rememberScrollState()
 
-    var selectedSources by remember { mutableStateOf(GraphSource.entries.toSet()) }
     var showSettings by remember { mutableStateOf(false) }
     var showWelcomeAlert by remember { mutableStateOf(false) }
+    var alertSheetState by remember { mutableStateOf<AlertSheetState?>(null) }
+    var isFloatingCTAHighlighted by remember { mutableStateOf(false) }
+    var ctaHighlightTriggerCount by remember { mutableIntStateOf(0) }
 
-    val minRate = remember(sampleRates) { sampleRates.minOf { it.rate } }
-    val maxRate = remember(sampleRates) { sampleRates.maxOf { it.rate } }
-    val referenceRate = remember(sampleRates) { sampleRates.referenceRate(SupportedCurrency.USD_KRW.code) }
+    // ── ViewModel 데이터 ──
 
-    // 환영 팝업 (세션당 1회)
+    val sampleRates = viewModel.rates
+    val graphData = viewModel.graphData
+    val selectedSources = viewModel.selectedSources
+
+    val minRate = remember(sampleRates) {
+        if (sampleRates.isEmpty()) 0.0 else sampleRates.minOf { it.rate }
+    }
+    val maxRate = remember(sampleRates) {
+        if (sampleRates.isEmpty()) 0.0 else sampleRates.maxOf { it.rate }
+    }
+    val referenceRate = remember(sampleRates) {
+        sampleRates.referenceRate(SupportedCurrency.USD_KRW.code)
+    }
+
+    // ── 햅틱 피드백 ──
+
+    val hapticFeedback = LocalHapticFeedback.current
+    SideEffect {
+        viewModel.onHapticFeedback = {
+            hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+        }
+    }
+
+    // ── Lifecycle: start / stop ──
+
+    DisposableEffect(Unit) {
+        viewModel.start()
+        onDispose { viewModel.stop() }
+    }
+
+    // ── Background / Foreground 감지 ──
+
+    var isInForeground by remember { mutableStateOf(true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> isInForeground = true
+                Lifecycle.Event.ON_PAUSE -> isInForeground = false
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // ── 통합 시뮬레이션 pause/resume (iOS updateSimulationState 동일) ──
+
+    val shouldPause = showSettings || alertSheetState != null || isPaywallVisible || !isInForeground
+    LaunchedEffect(shouldPause) {
+        if (shouldPause) {
+            viewModel.pause()
+        } else {
+            viewModel.resume()
+        }
+    }
+
+    // ── CTA 강조: 배너 표시 시 활성화 ──
+
+    LaunchedEffect(viewModel.showAlertBanner) {
+        if (viewModel.showAlertBanner) {
+            isFloatingCTAHighlighted = true
+            ctaHighlightTriggerCount++
+        }
+    }
+
+    // CTA 강조 10초 후 복귀 (새 트리거 시 타이머 리셋)
+    LaunchedEffect(ctaHighlightTriggerCount) {
+        if (ctaHighlightTriggerCount > 0) {
+            delay(10_000)
+            isFloatingCTAHighlighted = false
+        }
+    }
+
+    // ── 환영 팝업 (세션당 1회) ──
+
     LaunchedEffect(Unit) {
         if (!LockedPreviewState.hasShownWelcomeThisSession) {
             delay(500)
@@ -101,6 +190,8 @@ fun LockedPreviewScreen(
             showWelcomeAlert = true
         }
     }
+
+    // ── UI ──
 
     BoxWithConstraints(
         modifier = Modifier
@@ -110,93 +201,91 @@ fun LockedPreviewScreen(
     ) {
         val metrics = RateLayoutMetrics.fromWidth(maxWidth)
         CompositionLocalProvider(LocalRateLayoutMetrics provides metrics) {
-            Column(modifier = Modifier.fillMaxSize()) {
-            // 상단 배너
-            SampleBannerWithCTA(onPrimaryAction = onPrimaryAction)
+            Box(modifier = Modifier.fillMaxSize()) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    // 상단 배너
+                    SampleBannerWithCTA(onPrimaryAction = onPrimaryAction)
 
-            // 탭 선택기
-            LockedTabPicker(
-                onSettingsClick = { showSettings = true },
-                onLockedTabClick = onPrimaryAction
-            )
+                    // 탭 선택기
+                    LockedTabPicker(
+                        onSettingsClick = { showSettings = true },
+                        onLockedTabClick = onPrimaryAction
+                    )
 
-            // 스크롤 콘텐츠
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(scrollState)
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                // 그래프 섹션 (Card)
-                SampleGraphSection(
-                    graphData = graphData,
-                    selectedSources = selectedSources,
-                    onToggleSource = { source ->
-                        val next = selectedSources.toMutableSet()
-                        if (next.contains(source)) {
-                            if (next.size > 1) next.remove(source)
-                        } else {
-                            next.add(source)
-                        }
-                        selectedSources = next
+                    // 스크롤 콘텐츠
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .verticalScroll(scrollState)
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        // 그래프 섹션 (Card)
+                        SampleGraphSection(
+                            graphData = graphData,
+                            selectedSources = selectedSources,
+                            onToggleSource = { source -> viewModel.toggleSource(source) }
+                        )
+
+                        // 환율 섹션 (Card)
+                        SampleRatesSection(
+                            sampleRates = sampleRates,
+                            referenceRate = referenceRate,
+                            minRate = minRate,
+                            maxRate = maxRate
+                        )
+
+                        // 알림 설정 섹션 (Card)
+                        SampleAlertSection(
+                            viewModel = viewModel,
+                            onAddTap = { alertSheetState = AlertSheetState.Add },
+                            onEditTap = { setting -> alertSheetState = AlertSheetState.Edit(setting) }
+                        )
+
+                        // 플로팅 CTA 공간 확보
+                        Spacer(modifier = Modifier.height(100.dp))
                     }
+                }
+
+                // 플로팅 CTA
+                FloatingCTA(
+                    label = if (isFloatingCTAHighlighted) "방금 예시 알림, 실제로 받아보기"
+                    else primaryActionLabel,
+                    isHighlighted = isFloatingCTAHighlighted,
+                    onClick = onPrimaryAction,
+                    modifier = Modifier.align(Alignment.BottomCenter)
                 )
 
-                // 환율 섹션 (Card)
-                SampleRatesSection(
-                    sampleRates = sampleRates,
-                    referenceRate = referenceRate,
-                    minRate = minRate,
-                    maxRate = maxRate
-                )
-
-                // 플로팅 CTA 공간 확보
-                Spacer(modifier = Modifier.height(100.dp))
-            }
-        }
-
-        // 플로팅 CTA
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .windowInsetsPadding(WindowInsets.navigationBars)
-                .padding(horizontal = 24.dp)
-                .padding(bottom = 8.dp)
-                .clip(RoundedCornerShape(50))
-                .background(CardBackground.copy(alpha = 0.95f))
-                .border(1.dp, Color(0xFFFFA500).copy(alpha = 0.5f), RoundedCornerShape(50))
-                .clickable { onPrimaryAction() }
-                .padding(horizontal = 20.dp, vertical = 14.dp)
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Star,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp),
-                    tint = Color(0xFFFFA500)
-                )
-                Spacer(modifier = Modifier.width(10.dp))
-                Text(
-                    text = primaryActionLabel,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFFFFA500)
-                )
-                Spacer(modifier = Modifier.weight(1f))
-                Icon(
-                    imageVector = Icons.Default.ChevronRight,
-                    contentDescription = null,
-                    modifier = Modifier.size(14.dp),
-                    tint = Color(0xFFFFA500).copy(alpha = 0.7f)
+                // 알림 트리거 배너 (상단 오버레이)
+                SampleAlertTriggerBanner(
+                    visible = viewModel.showAlertBanner,
+                    alert = viewModel.triggeredAlert,
+                    currentRate = viewModel.triggeredCurrentRate,
+                    onDismiss = { viewModel.dismissAlertBanner() },
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 8.dp)
                 )
             }
         }
+    }
+
+    // 알림 추가/수정 시트
+    when (val state = alertSheetState) {
+        is AlertSheetState.Add -> {
+            SampleAlertAddSheet(
+                viewModel = viewModel,
+                onDismiss = { alertSheetState = null }
+            )
         }
+        is AlertSheetState.Edit -> {
+            SampleAlertAddSheet(
+                viewModel = viewModel,
+                editSetting = state.setting,
+                onDismiss = { alertSheetState = null }
+            )
+        }
+        null -> {}
     }
 
     // 환영 팝업
@@ -221,6 +310,57 @@ fun LockedPreviewScreen(
             showRatingOption = false,
             onDismiss = { showSettings = false }
         )
+    }
+}
+
+// MARK: - 플로팅 CTA
+
+@Composable
+private fun FloatingCTA(
+    label: String,
+    isHighlighted: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val borderAlpha = if (isHighlighted) 0.8f else 0.5f
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .windowInsetsPadding(WindowInsets.navigationBars)
+            .padding(horizontal = 24.dp)
+            .padding(bottom = 8.dp)
+            .clip(RoundedCornerShape(50))
+            .background(CardBackground.copy(alpha = 0.95f))
+            .border(1.dp, Color(0xFFFFA500).copy(alpha = borderAlpha), RoundedCornerShape(50))
+            .clickable { onClick() }
+            .padding(horizontal = 20.dp, vertical = 14.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(
+                imageVector = Icons.Default.Star,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+                tint = Color(0xFFFFA500)
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Text(
+                text = label,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFFFFA500)
+            )
+            Spacer(modifier = Modifier.weight(1f))
+            Icon(
+                imageVector = Icons.Default.ChevronRight,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = Color(0xFFFFA500).copy(alpha = 0.7f)
+            )
+        }
     }
 }
 
@@ -320,7 +460,6 @@ private fun LockedTabPicker(
             modifier = Modifier.weight(1f)
         )
 
-        // iOS: SettingsButton().frame(width: 36, height: 36).padding(.leading, 12)
         IconButton(
             onClick = onSettingsClick,
             modifier = Modifier
@@ -366,7 +505,6 @@ private fun LockedCurrencyTab(
             )
         }
         Spacer(modifier = Modifier.height(4.dp))
-        // 투명 indicator (높이 맞춤)
         Box(modifier = Modifier.height(2.dp))
     }
 }
@@ -456,25 +594,27 @@ private fun SampleRatesSection(
     sampleRates: List<com.jay.fxi.domain.model.ExchangeRate>,
     referenceRate: com.jay.fxi.domain.model.ExchangeRate?,
     minRate: Double,
-    maxRate: Double
+    maxRate: Double,
+    metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(CardBackground)
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         // 헤더
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = metrics.horizontalPadding)
+                .padding(top = metrics.sectionPadding, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
                 text = "은행별 환율",
                 color = PrimaryText,
-                fontSize = 16.sp,
+                fontSize = metrics.sectionTitleFontSize,
                 fontWeight = FontWeight.SemiBold
             )
             Spacer(modifier = Modifier.weight(1f))
@@ -496,14 +636,22 @@ private fun SampleRatesSection(
             }
         }
 
-        // 환율 바 리스트
-        sampleRates.sortedByBank().forEach { rate ->
-            RateBarView(
-                rate = rate,
-                referenceRate = referenceRate,
-                minRate = minRate,
-                maxRate = maxRate
-            )
+        // 환율 바 리스트 (메인 CurrencyTabContent와 동일 간격)
+        Column(
+            modifier = Modifier.padding(
+                horizontal = metrics.horizontalPadding,
+                vertical = metrics.sectionPadding
+            ),
+            verticalArrangement = Arrangement.spacedBy(metrics.rowSpacing)
+        ) {
+            sampleRates.sortedByBank().forEach { rate ->
+                RateBarView(
+                    rate = rate,
+                    referenceRate = referenceRate,
+                    minRate = minRate,
+                    maxRate = maxRate
+                )
+            }
         }
     }
 }

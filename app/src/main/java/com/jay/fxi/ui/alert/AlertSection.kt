@@ -533,7 +533,7 @@ private fun AddAlertButton(
                         onAdd()
                     }
                 }
-                .padding(vertical = 12.dp),
+                .padding(vertical = 8.dp),
             horizontalArrangement = Arrangement.Center,
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -541,13 +541,13 @@ private fun AddAlertButton(
                 imageVector = Icons.Filled.AddCircle,
                 contentDescription = null,
                 tint = Primary,
-                modifier = Modifier.size(18.dp)
+                modifier = Modifier.size(16.dp)
             )
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(6.dp))
             Text(
                 text = "알림 추가",
                 color = Primary,
-                fontSize = 14.sp,
+                fontSize = 13.sp,
                 fontWeight = FontWeight.Medium
             )
 
