@@ -19,7 +19,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -37,6 +39,13 @@ class SubscriptionManager @Inject constructor(
 
     private val _isLoadingInitial = MutableStateFlow(true)
     val isLoadingInitial: StateFlow<Boolean> = _isLoadingInitial.asStateFlow()
+
+    /** sign-out 이후 늦게 도착한 customerInfo 업데이트로 premium이 되살아나는 것을 방지 */
+    private val isAuthActive = AtomicBoolean(false)
+
+    /** auth session(generation). 늦게 도착한 콜백이 현재 세션이 아니면 무시한다. */
+    private val authSession = AtomicLong(0)
+    private val authUid = AtomicReference<String?>(null)
 
     // ── Offerings State (iOS SubscriptionManager 파리티) ──
 
@@ -75,6 +84,7 @@ class SubscriptionManager @Inject constructor(
     init {
         if (isRevenueCatConfigured()) {
             Purchases.sharedInstance.updatedCustomerInfoListener = UpdatedCustomerInfoListener { info ->
+                if (!isAuthActive.get()) return@UpdatedCustomerInfoListener
                 _isPremium.value = info.entitlements[ENTITLEMENT_PREMIUM]?.isActive == true
             }
         } else {
@@ -82,14 +92,34 @@ class SubscriptionManager @Inject constructor(
         }
     }
 
-    suspend fun onAuthCompleted() {
+    /**
+     * 인증 완료 후 구독 상태를 확정한다.
+     * @param customerInfo logIn() 콜백에서 이미 받은 CustomerInfo. null이면 서버에서 재조회.
+     * @param session beginAuthSession()으로 받은 세션 토큰. 현재 세션이 아니면 no-op.
+     */
+    suspend fun onAuthCompleted(customerInfo: CustomerInfo? = null, session: Long? = null) {
         if (!isRevenueCatConfigured()) {
             _isLoadingInitial.value = false
             return
         }
 
+        val expectedSession = session
+        if (expectedSession != null && expectedSession != authSession.get()) {
+            Log.d(TAG, "Ignore stale onAuthCompleted(session=$expectedSession, current=${authSession.get()})")
+            return
+        }
+        if (!isAuthActive.get()) {
+            Log.d(TAG, "Ignore onAuthCompleted while signed out")
+            return
+        }
+
         try {
-            val info = Purchases.sharedInstance.getCustomerInfoSuspend()
+            val info = customerInfo ?: Purchases.sharedInstance.getCustomerInfoSuspend()
+
+            // onAuthCompleted 도중 sign-out / 다른 계정 로그인 등이 발생하면 결과를 버린다.
+            if (expectedSession != null && expectedSession != authSession.get()) return
+            if (!isAuthActive.get()) return
+
             _isPremium.value = info.entitlements[ENTITLEMENT_PREMIUM]?.isActive == true
 
             if (_isPremium.value) {
@@ -98,11 +128,39 @@ class SubscriptionManager @Inject constructor(
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load subscription", e)
         } finally {
-            _isLoadingInitial.value = false
+            if (expectedSession == null || expectedSession == authSession.get()) {
+                _isLoadingInitial.value = false
+            }
         }
     }
 
+    /**
+     * RevenueCat logIn()을 호출하기 전에 세션을 시작한다.
+     * - 이 세션 토큰을 logIn 콜백에서 onAuthCompleted로 전달해야 late callback race를 막을 수 있다.
+     */
+    fun beginAuthSession(uid: String): Long {
+        if (!isRevenueCatConfigured()) return 0L
+
+        val existingUid = authUid.get()
+        if (isAuthActive.get() && existingUid == uid) {
+            return authSession.get()
+        }
+
+        val session = authSession.incrementAndGet()
+        authUid.set(uid)
+        isAuthActive.set(true)
+
+        // 계정 전환/재로그인 시 이전 상태가 잠깐 남지 않도록 로딩 상태로 전환
+        _isPremium.value = false
+        _isLoadingInitial.value = true
+
+        return session
+    }
+
     fun onAuthSignedOut() {
+        authSession.incrementAndGet() // in-flight 콜백 무효화
+        authUid.set(null)
+        isAuthActive.set(false)
         _isPremium.value = false
         _isLoadingInitial.value = true
 
@@ -197,6 +255,35 @@ class SubscriptionManager @Inject constructor(
             return
         }
     }
+
+    // ── Debug: Google Play ↔ RevenueCat 강제 동기화 (디버깅/테스트용) ──
+
+    /** Google Play 상태를 RevenueCat에 강제 동기화 */
+    suspend fun forceSyncPurchases() {
+        if (!isRevenueCatConfigured()) return
+        try {
+            val info = syncPurchasesSuspend()
+            _isPremium.value = info.entitlements[ENTITLEMENT_PREMIUM]?.isActive == true
+            Log.d(TAG, "Force sync result: isPremium=${_isPremium.value}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Force sync failed", e)
+        }
+    }
+
+    private suspend fun syncPurchasesSuspend(): CustomerInfo =
+        suspendCancellableCoroutine { cont ->
+            Purchases.sharedInstance.syncPurchases(
+                object : com.revenuecat.purchases.interfaces.SyncPurchasesCallback {
+                    override fun onSuccess(customerInfo: CustomerInfo) {
+                        cont.resume(customerInfo)
+                    }
+
+                    override fun onError(error: PurchasesError) {
+                        cont.resumeWithException(PurchasesException(error))
+                    }
+                }
+            )
+        }
 
     // ── Helpers ──
 

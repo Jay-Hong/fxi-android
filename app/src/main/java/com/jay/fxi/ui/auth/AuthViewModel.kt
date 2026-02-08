@@ -58,24 +58,25 @@ class AuthViewModel @Inject constructor(
             val user = firebaseAuth.currentUser
             if (user != null) {
                 if (BuildConfig.REVENUECAT_API_KEY.isNotBlank()) {
+                    val session = subscriptionManager.beginAuthSession(user.uid)
                     try {
                         Purchases.sharedInstance.logIn(
                             user.uid,
                             object : LogInCallback {
                                 override fun onReceived(customerInfo: com.revenuecat.purchases.CustomerInfo, created: Boolean) {
                                     Log.d(TAG, "RevenueCat login success, created=$created")
-                                    viewModelScope.launch { subscriptionManager.onAuthCompleted() }
+                                    viewModelScope.launch { subscriptionManager.onAuthCompleted(customerInfo, session) }
                                 }
 
                                 override fun onError(error: PurchasesError) {
                                     Log.e(TAG, "RevenueCat login failed: $error")
-                                    viewModelScope.launch { subscriptionManager.onAuthCompleted() }
+                                    viewModelScope.launch { subscriptionManager.onAuthCompleted(session = session) }
                                 }
                             }
                         )
                     } catch (e: Exception) {
                         Log.e(TAG, "RevenueCat login failed", e)
-                        subscriptionManager.onAuthCompleted()
+                        subscriptionManager.onAuthCompleted(session = session)
                     }
                 } else {
                     subscriptionManager.onAuthCompleted()
