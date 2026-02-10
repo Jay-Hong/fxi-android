@@ -65,7 +65,7 @@ data class RateLayoutMetrics(
             timestampFontSize = 11.sp,
             timestampWidth = 46.dp,
             barTimestampSpacing = 6.dp,
-            minBarWidth = 140.dp,
+            minBarWidth = 130.dp,
             diffMinWidth = 55.dp,
             barInnerStartPadding = 6.dp,    // 바 내부 왼쪽 패딩
             barInnerEndPadding = 12.dp,     // 바 내부 오른쪽 패딩 (10→12: 여유 증가)

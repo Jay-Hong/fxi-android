@@ -170,8 +170,10 @@ fun RateBarView(
             // 바 (아이콘 + 환율 포함) - minBarWidth 보장
             Row(
                 modifier = Modifier
-                    .fillMaxWidth(animatedBarWidth)
+                    // NOTE: Modifier order matters. `fillMaxWidth(fraction)` can lock maxWidth to a smaller
+                    // value, causing `widthIn(min=...)` to be ignored. Keep min constraint on the outside.
                     .widthIn(min = metrics.minBarWidth)
+                    .fillMaxWidth(animatedBarWidth)
                     .height(metrics.barHeight)
                     .scale(animatedScale)
                     .clip(RoundedCornerShape(6.dp))
