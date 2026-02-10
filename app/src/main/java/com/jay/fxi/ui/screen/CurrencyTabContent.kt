@@ -501,14 +501,38 @@ fun CurrencyTabContent(
                                     showAddSheet = true
                                 }
                             },
-                            onRequestPermission = {
-                                pendingShowAddSheet = true
+                            onRequestPermissionForAdd = {
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    // 권한 승인 후 add sheet 자동 오픈 (iOS와 동일)
+                                    pendingShowAddSheet = true
                                     alertViewModel.markPermissionRequested()
                                     permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                } else {
+                                    // Android 12 이하: POST_NOTIFICATIONS 런타임 권한 없음 → 시스템 설정으로 이동
+                                    val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                                        putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                                    }
+                                    context.startActivity(intent)
+                                }
+                            },
+                            onRequestPermissionForBanner = {
+                                // 어떤 경로로든 stale pending 플래그가 남아있을 수 있으므로,
+                                // 배너(권한만 켜기)에서는 add sheet 자동 오픈을 강제로 막는다.
+                                pendingShowAddSheet = false
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    // 배너는 "권한만 켜기" 의도: 권한 승인 후 add sheet 자동 오픈 금지
+                                    alertViewModel.markPermissionRequested()
+                                    permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                } else {
+                                    // Android 12 이하: 시스템 설정으로 이동
+                                    val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                                        putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                                    }
+                                    context.startActivity(intent)
                                 }
                             },
                             onOpenSettings = {
+                                // 설정 이동은 add sheet 자동 오픈과 무관해야 한다.
                                 pendingShowAddSheet = false
                                 val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
                                     putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)

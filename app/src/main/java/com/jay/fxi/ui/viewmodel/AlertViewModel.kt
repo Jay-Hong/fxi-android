@@ -124,8 +124,8 @@ class AlertViewModel @Inject constructor(
             pushNotificationManager.shouldRegisterForPush = false
         }
 
-        // 권한 복구 시 토큰 재등록
-        if (!previous && current && _state.value.settings.isNotEmpty()) {
+        // 권한 복구 시 토큰 재등록 (capability 등록: 알림 설정 유무와 무관)
+        if (!previous && current) {
             viewModelScope.launch {
                 pushNotificationManager.shouldRegisterForPush = true
                 pushNotificationManager.registerIfNeeded(subscriptionManager.isPremium.value)
@@ -223,7 +223,7 @@ class AlertViewModel @Inject constructor(
                     onSuccess = { settings ->
                         _state.value = AlertState.Loaded(alertSettings = settings.sortedByCreatedAt())
                         lastRefreshAt = System.currentTimeMillis()
-                        shouldRegisterPush = settings.isNotEmpty() && checkNotificationPermission()
+                        shouldRegisterPush = checkNotificationPermission()
                         isSuccess = true
                     },
                     onFailure = { e ->

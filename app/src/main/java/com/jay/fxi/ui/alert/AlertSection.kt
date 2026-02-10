@@ -84,7 +84,19 @@ fun AlertSection(
     onDelete: (AlertSetting) -> Unit,
     onEdit: (AlertSetting) -> Unit,
     onAdd: () -> Unit,
-    onRequestPermission: () -> Unit,
+    /**
+     * 권한 요청 (의도: 권한 승인 후 바로 "알림 추가" 흐름으로 이어짐)
+     * - iOS: permissionPromptView / addAlertButton 둘 다 승인 후 add sheet 오픈
+     * - Android 13+: 런타임 권한 승인 콜백에서 add sheet 오픈
+     * - Android 12 이하: 설정 화면으로 보내고, 돌아오면 사용자가 다시 "알림 추가"를 탭해야 함
+     */
+    onRequestPermissionForAdd: () -> Unit,
+    /**
+     * 권한 요청 (의도: 권한만 켜기)
+     * - "알림을 받을 수 없습니다" 배너에서 사용
+     * - 권한 승인 후 add sheet를 자동으로 열지 않음 (iOS와 동일)
+     */
+    onRequestPermissionForBanner: () -> Unit,
     onOpenSettings: () -> Unit,
     onRetry: () -> Unit,
     onRefresh: () -> Unit,
@@ -273,7 +285,7 @@ fun AlertSection(
                         // Permission prompt view (iOS와 동일: 아이콘 + 리치 텍스트)
                         PermissionPromptView(
                             isPermissionDenied = isPermissionDenied,
-                            onRequestPermission = onRequestPermission,
+                            onRequestPermissionForAdd = onRequestPermissionForAdd,
                             onOpenSettings = onOpenSettings
                         )
                     }
@@ -283,7 +295,7 @@ fun AlertSection(
                         if (!hasPermission && settings.isNotEmpty()) {
                             PermissionWarningBanner(
                                 isPermissionDenied = isPermissionDenied,
-                                onRequestPermission = onRequestPermission,
+                                onRequestPermissionForBanner = onRequestPermissionForBanner,
                                 onOpenSettings = onOpenSettings
                             )
                         }
@@ -308,7 +320,7 @@ fun AlertSection(
                             hasPermission = hasPermission,
                             isPermissionDenied = isPermissionDenied,
                             onAdd = onAdd,
-                            onRequestPermission = onRequestPermission,
+                            onRequestPermissionForAdd = onRequestPermissionForAdd,
                             onOpenSettings = onOpenSettings
                         )
                     }
@@ -350,7 +362,7 @@ private fun EmptyStateView() {
 @Composable
 private fun PermissionPromptView(
     isPermissionDenied: Boolean,
-    onRequestPermission: () -> Unit,
+    onRequestPermissionForAdd: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val metrics = LocalRateLayoutMetrics.current
@@ -393,7 +405,7 @@ private fun PermissionPromptView(
                 .clip(RoundedCornerShape(8.dp))
                 .background(Primary)
                 .clickable {
-                    if (isPermissionDenied) onOpenSettings() else onRequestPermission()
+                    if (isPermissionDenied) onOpenSettings() else onRequestPermissionForAdd()
                 }
                 .padding(vertical = 12.dp),
             horizontalArrangement = Arrangement.Center,
@@ -421,7 +433,7 @@ private fun PermissionPromptView(
 @Composable
 private fun PermissionWarningBanner(
     isPermissionDenied: Boolean,
-    onRequestPermission: () -> Unit,
+    onRequestPermissionForBanner: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val metrics = LocalRateLayoutMetrics.current
@@ -433,7 +445,7 @@ private fun PermissionWarningBanner(
             .clip(RoundedCornerShape(8.dp))
             .background(StatusConnecting.copy(alpha = 0.15f))
             .clickable {
-                if (isPermissionDenied) onOpenSettings() else onRequestPermission()
+                if (isPermissionDenied) onOpenSettings() else onRequestPermissionForBanner()
             }
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -513,7 +525,7 @@ private fun AddAlertButton(
     hasPermission: Boolean,
     isPermissionDenied: Boolean,
     onAdd: () -> Unit,
-    onRequestPermission: () -> Unit,
+    onRequestPermissionForAdd: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val metrics = LocalRateLayoutMetrics.current
@@ -528,7 +540,7 @@ private fun AddAlertButton(
                 .background(InputBackground)
                 .clickable {
                     if (!hasPermission) {
-                        if (isPermissionDenied) onOpenSettings() else onRequestPermission()
+                        if (isPermissionDenied) onOpenSettings() else onRequestPermissionForAdd()
                     } else {
                         onAdd()
                     }

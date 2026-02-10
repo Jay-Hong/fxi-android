@@ -37,19 +37,23 @@ class PushNotificationManager @Inject constructor(
 
     /**
      * FCM 토큰 갱신 시 호출 (FXiMessagingService.onNewToken)
+     *
+     * old token cleanup과 new token registration을 분리:
+     * - 이전 토큰 해제: auth만 확인 (FCM이 무효화한 토큰은 서버에서 정리)
+     * - 새 토큰 등록: 3중 가드 (auth + premium + shouldRegisterForPush)
      */
     suspend fun onNewToken(token: String, isPremium: Boolean) {
         withContext(Dispatchers.IO) {
             val oldToken = savedToken
             savedToken = token
 
-            if (auth.currentUser == null || !isPremium || !shouldRegisterForPush) return@withContext
-
-            // 이전 토큰 해제
-            if (oldToken != null && oldToken != token) {
+            // 이전 토큰 해제 — auth만 확인 (FCM 토큰 회전 = 이전 토큰 무효)
+            if (auth.currentUser != null && oldToken != null && oldToken != token) {
                 try {
                     val response = apiService.unregisterDevice(oldToken)
-                    if (!response.isSuccessful) {
+                    if (response.isSuccessful) {
+                        Log.d(TAG, "Old token unregistered")
+                    } else {
                         Log.w(TAG, "Old token unregister failed: ${response.code()}")
                     }
                 } catch (e: Exception) {
@@ -57,7 +61,9 @@ class PushNotificationManager @Inject constructor(
                 }
             }
 
-            // 새 토큰 등록
+            // 새 토큰 등록 — 3중 가드
+            if (auth.currentUser == null || !isPremium || !shouldRegisterForPush) return@withContext
+
             try {
                 val response = apiService.registerDevice(
                     DeviceRequest(deviceToken = token, platform = PLATFORM_ANDROID)
