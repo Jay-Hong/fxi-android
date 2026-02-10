@@ -1,21 +1,23 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# FXi release minify notes:
+# - Keep rules should be minimal and targeted.
+# - Most libraries (Firebase/OkHttp/Retrofit/RevenueCat/etc.) ship consumer ProGuard rules.
+# - Overly broad `-keep` rules reduce shrinking/obfuscation and can increase binary size.
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# --- Attributes needed for reflection/annotations (Retrofit, DI metadata, etc.) ---
+-keepattributes *Annotation*
+-keepattributes Signature,InnerClasses,EnclosingMethod
+-keepattributes RuntimeVisibleAnnotations,RuntimeVisibleParameterAnnotations,AnnotationDefault
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# --- Kotlinx Serialization (app models) ---
+# The generated `$$serializer` classes must remain.
+-keep,includedescriptorclasses class com.jay.fxi.**$$serializer { *; }
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Some serializers are referenced via `serializer(...)` and companions.
+-keepclassmembers class com.jay.fxi.** {
+    *** Companion;
+    kotlinx.serialization.KSerializer serializer(...);
+}
+
+# --- Crashlytics: keep source/line info for readable stack traces ---
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
