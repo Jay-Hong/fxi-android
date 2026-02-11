@@ -266,7 +266,7 @@ class SamplePreviewViewModel {
     private fun processNextTrigger() {
         if (showAlertBanner || pendingTriggers.isEmpty()) return
 
-        val trigger = pendingTriggers.removeFirst()
+        val trigger = pendingTriggers.removeAt(0)
         val alert = alertSettings.firstOrNull { it.id == trigger.alertId }
         if (alert == null) {
             processNextTrigger()
