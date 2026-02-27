@@ -57,6 +57,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -377,7 +378,10 @@ private fun FloatingCTA(
                     text = label,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFFFFA500)
+                    color = Color(0xFFFFA500),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    softWrap = false
                 )
             } else {
                 Text(
@@ -386,7 +390,10 @@ private fun FloatingCTA(
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold,
                         brush = GoldGradient
-                    )
+                    ),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    softWrap = false
                 )
             }
             Spacer(modifier = Modifier.weight(1f))
@@ -412,7 +419,6 @@ private fun SampleBannerWithCTA(onPrimaryAction: () -> Unit) {
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // 오렌지 dot
         Box(
             modifier = Modifier
                 .size(6.dp)
@@ -424,25 +430,30 @@ private fun SampleBannerWithCTA(onPrimaryAction: () -> Unit) {
             text = "예시 화면",
             color = PrimaryText,
             fontSize = 14.sp,
-            fontWeight = FontWeight.Medium
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            softWrap = false
         )
         Spacer(modifier = Modifier.width(4.dp))
-        Text(
-            text = "•",
-            color = SecondaryText,
-            fontSize = 14.sp
-        )
+        Text(text = "•", color = SecondaryText, fontSize = 14.sp)
         Spacer(modifier = Modifier.width(4.dp))
         Text(
             text = "가상 데이터입니다",
             color = SecondaryText,
-            fontSize = 12.sp
+            fontSize = 12.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            softWrap = false
         )
         Spacer(modifier = Modifier.weight(1f))
         Text(
             text = "실제 환율 보기 →",
             color = Color(0xFFFFA500).copy(alpha = 0.8f),
             fontSize = 12.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            softWrap = false,
             modifier = Modifier.clickable { onPrimaryAction() }
         )
     }

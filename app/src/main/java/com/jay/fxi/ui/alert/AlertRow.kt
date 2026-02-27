@@ -33,6 +33,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.AlertCondition
@@ -84,7 +85,10 @@ fun AlertRow(
                 text = setting.bankType?.displayName ?: setting.bank,
                 color = PrimaryText,
                 fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                softWrap = false
             )
             if (setting.triggered) {
                 Text(
@@ -107,7 +111,10 @@ fun AlertRow(
                 text = setting.formattedThreshold,
                 color = PrimaryText,
                 fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                softWrap = false
             )
             Spacer(modifier = Modifier.width(4.dp))
             Text(
@@ -119,7 +126,10 @@ fun AlertRow(
             Text(
                 text = setting.condition.displayText,
                 color = conditionColor,
-                fontSize = 14.sp
+                fontSize = 14.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                softWrap = false
             )
         }
 

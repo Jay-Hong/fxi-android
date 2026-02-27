@@ -511,12 +511,6 @@ private fun ThresholdInputSection(
                     singleLine = true,
                     cursorBrush = SolidColor(Primary)
                 )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "원",
-                    color = SecondaryText,
-                    fontSize = 20.sp
-                )
             }
 
             // Condition toggle (iOS 스타일 - 테두리 있음)
@@ -651,7 +645,8 @@ private fun EnableToggleSection(
                 Text(
                     text = "알림이 발송되어 비활성화됨",
                     color = StatusConnecting,
-                    fontSize = 12.sp
+                    fontSize = 12.sp,
+                    lineHeight = 15.sp
                 )
             }
         }

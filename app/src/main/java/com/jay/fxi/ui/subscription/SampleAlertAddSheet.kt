@@ -316,6 +316,7 @@ private fun SampleModeBanner() {
             Text(
                 text = "알림은 샘플 환율 변동으로 목표에 도달할 때 표시됩니다",
                 fontSize = 12.sp,
+                lineHeight = 15.sp,
                 color = SecondaryText
             )
         }
@@ -536,12 +537,6 @@ private fun SampleThresholdInputSection(
                     singleLine = true,
                     cursorBrush = SolidColor(Primary)
                 )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "원",
-                    color = SecondaryText,
-                    fontSize = 20.sp
-                )
             }
 
             SampleConditionToggleButton(
@@ -662,7 +657,8 @@ private fun SampleEnableToggleSection(
                 Text(
                     text = "알림이 발송되어 비활성화됨",
                     color = StatusConnecting,
-                    fontSize = 12.sp
+                    fontSize = 12.sp,
+                    lineHeight = 15.sp
                 )
             }
         }

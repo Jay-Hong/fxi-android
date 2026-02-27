@@ -576,7 +576,8 @@ private fun AppInfoScreen(onBack: () -> Unit) {
                         Text(
                             text = "주요은행 환율비교 및 환율알림",
                             color = SecondaryText,
-                            fontSize = 15.sp
+                            fontSize = 15.sp,
+                            lineHeight = 18.sp
                         )
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -591,7 +592,8 @@ private fun AppInfoScreen(onBack: () -> Unit) {
                             Text(
                                 text = "인터넷전문은행 제외",
                                 color = SecondaryText.copy(alpha = 0.7f),
-                                fontSize = 12.sp
+                                fontSize = 12.sp,
+                                lineHeight = 15.sp
                             )
                         }
                     }
@@ -658,7 +660,8 @@ private fun AppInfoScreen(onBack: () -> Unit) {
                             Text(
                                 text = "국민, 하나, 신한, 우리, 기업, 농협, SC제일, 부산, 씨티",
                                 color = SecondaryText,
-                                fontSize = 12.sp
+                                fontSize = 12.sp,
+                                lineHeight = 15.sp
                             )
                         }
                     }
@@ -1357,9 +1360,9 @@ private fun ProfileCard(userInfo: UserInfo, onClick: () -> Unit) {
                 text = userInfo.displayName ?: "사용자",
                 color = PrimaryText,
                 fontSize = 16.sp,
+                lineHeight = 16.sp,
                 fontWeight = FontWeight.SemiBold
             )
-            Spacer(modifier = Modifier.height(3.dp))
             // 프로바이더 아이콘 + 라벨
             ProviderLabel(provider = userInfo.provider)
         }

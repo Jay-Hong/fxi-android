@@ -50,6 +50,7 @@ import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.LineHeightStyle
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jay.fxi.R
@@ -330,7 +331,10 @@ private fun SampleAlertRow(
                 text = setting.bank.displayName,
                 color = PrimaryText,
                 fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                softWrap = false
             )
             if (setting.triggered) {
                 Text(
@@ -353,7 +357,10 @@ private fun SampleAlertRow(
                 text = setting.formattedThreshold,
                 color = PrimaryText,
                 fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                softWrap = false
             )
             Spacer(modifier = Modifier.width(4.dp))
             Text(
@@ -365,7 +372,10 @@ private fun SampleAlertRow(
             Text(
                 text = setting.condition.displayText,
                 color = conditionColor,
-                fontSize = 14.sp
+                fontSize = 14.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                softWrap = false
             )
         }
 
