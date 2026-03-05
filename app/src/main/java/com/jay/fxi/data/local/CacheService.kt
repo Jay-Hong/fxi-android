@@ -1,6 +1,7 @@
 package com.jay.fxi.data.local
 
 import android.content.Context
+import android.util.Log
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
@@ -41,6 +42,7 @@ class CacheService @Inject constructor(
     private val json: Json
 ) {
     companion object {
+        private const val TAG = "CacheService"
         private val KEY_RATES = stringPreferencesKey("rates")
         private val KEY_RATES_TIMESTAMP = longPreferencesKey("rates_timestamp")
 
@@ -141,7 +143,12 @@ class CacheService @Inject constructor(
                 }
 
                 val content = file.readText()
-                json.decodeFromString<Map<String, List<GraphBucket>>>(content)
+                try {
+                    json.decodeFromString<Map<String, List<GraphBucket>>>(content)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to deserialize graph cache: currency=$currency", e)
+                    null
+                }
             } catch (e: Exception) {
                 null
             }
@@ -182,8 +189,12 @@ class CacheService @Inject constructor(
                     }
 
                     val content = file.readText()
-                    val data = json.decodeFromString<Map<String, List<GraphBucket>>>(content)
-                    result[currency.code] = data
+                    try {
+                        val data = json.decodeFromString<Map<String, List<GraphBucket>>>(content)
+                        result[currency.code] = data
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to deserialize graph cache: currency=${currency.code}", e)
+                    }
                 } catch (e: Exception) {
                     // 개별 로드 실패 무시
                 }

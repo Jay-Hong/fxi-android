@@ -17,6 +17,7 @@ import com.jay.fxi.R
 import com.jay.fxi.data.local.CacheService
 import com.jay.fxi.data.remote.FXiApiService
 import com.jay.fxi.service.PushNotificationManager
+import com.jay.fxi.util.await
 import com.revenuecat.purchases.Purchases
 import com.revenuecat.purchases.PurchasesError
 import com.revenuecat.purchases.interfaces.ReceiveCustomerInfoCallback
@@ -25,11 +26,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.Locale
 import javax.inject.Inject
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 enum class DeletionStep {
     REAUTH, SERVER_DELETE, REVENUECAT_LOGOUT, FIREBASE_DELETE, LOCAL_CLEANUP
@@ -232,12 +230,6 @@ class SettingsViewModel @Inject constructor(
 
         user.startActivityForReauthenticateWithProvider(activity, provider.build()).await()
     }
-
-    private suspend fun <T> com.google.android.gms.tasks.Task<T>.await(): T =
-        suspendCancellableCoroutine { cont ->
-            addOnSuccessListener { result -> cont.resume(result) }
-            addOnFailureListener { exception -> cont.resumeWithException(exception) }
-        }
 
     companion object {
         private const val TAG = "Settings"

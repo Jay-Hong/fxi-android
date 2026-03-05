@@ -285,9 +285,9 @@ class WebSocketService @Inject constructor(
         pongTimeoutJob?.cancel()
         pongTimeoutJob = null
 
-        // Plain text "pong" 방어 처리 (서버가 JSON 대신 텍스트로 보낼 경우)
-        if (text == "pong" || text == WebSocketMessageType.PONG) {
-            Log.d(TAG, "Pong received (plain text)")
+        // Fast-path: pong은 JSON 파싱 없이 문자열 검사로 즉시 처리
+        if (isPongMessage(text)) {
+            Log.d(TAG, "Pong received (fast-path)")
             return
         }
 
@@ -314,6 +314,11 @@ class WebSocketService @Inject constructor(
         } catch (e: Exception) {
             Log.e(TAG, "parseMessage() 실패: ${e.message}")
         }
+    }
+
+    private fun isPongMessage(rawText: String): Boolean {
+        val text = rawText.trim()
+        return text.equals(WebSocketMessageType.PONG, ignoreCase = true)
     }
 
     // ============ Ping/Pong ============

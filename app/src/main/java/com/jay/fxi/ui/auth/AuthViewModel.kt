@@ -8,7 +8,6 @@ import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialException
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.google.android.gms.tasks.Task
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.android.libraries.identity.googleid.GoogleIdTokenParsingException
@@ -22,6 +21,7 @@ import com.jay.fxi.domain.model.AuthState
 import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.service.PushNotificationManager
 import com.jay.fxi.subscription.SubscriptionManager
+import com.jay.fxi.util.await
 import com.revenuecat.purchases.Purchases
 import com.revenuecat.purchases.PurchasesError
 import com.revenuecat.purchases.interfaces.LogInCallback
@@ -31,11 +31,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.Locale
 import javax.inject.Inject
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 @HiltViewModel
 class AuthViewModel @Inject constructor(
@@ -220,12 +217,6 @@ class AuthViewModel @Inject constructor(
             else -> "로그인 중 문제가 발생했습니다"
         }
     }
-
-    private suspend fun <T> Task<T>.await(): T =
-        suspendCancellableCoroutine { cont ->
-            addOnSuccessListener { result -> cont.resume(result) }
-            addOnFailureListener { exception -> cont.resumeWithException(exception) }
-        }
 
     companion object {
         private const val TAG = "Auth"
