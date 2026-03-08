@@ -259,18 +259,26 @@ class WebSocketService @Inject constructor(
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-            Log.d(TAG, "onClosing() - code=$code, reason=$reason")
+            Log.d(TAG, "onClosing() - ${classifyCloseCode(code)} code=$code, reason=$reason")
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            Log.d(TAG, "onClosed() - code=$code, reason=$reason")
+            Log.d(TAG, "onClosed() - ${classifyCloseCode(code)} code=$code, reason=$reason")
             scope.launch {
                 handleConnectionError()
             }
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            Log.e(TAG, "onFailure() - ${t.message}")
+            val errorType = when (t) {
+                is java.net.UnknownHostException -> "DNS_RESOLVE"
+                is java.net.ConnectException -> "CONNECTION_REFUSED"
+                is java.net.SocketTimeoutException -> "TIMEOUT"
+                is javax.net.ssl.SSLException -> "SSL"
+                else -> t.javaClass.simpleName
+            }
+            val httpCode = response?.code?.let { " http=$it" } ?: ""
+            Log.e(TAG, "onFailure() - type=$errorType$httpCode, ${t.message}")
             scope.launch {
                 handleConnectionError()
             }
@@ -319,6 +327,17 @@ class WebSocketService @Inject constructor(
     private fun isPongMessage(rawText: String): Boolean {
         val text = rawText.trim()
         return text.equals(WebSocketMessageType.PONG, ignoreCase = true)
+    }
+
+    private fun classifyCloseCode(code: Int): String = when (code) {
+        1000 -> "NORMAL"
+        1001 -> "GOING_AWAY"
+        1002 -> "PROTOCOL_ERROR"
+        1003 -> "UNSUPPORTED"
+        1006 -> "ABNORMAL"
+        1011 -> "SERVER_ERROR"
+        1012 -> "SERVICE_RESTART"
+        else -> "CODE_$code"
     }
 
     // ============ Ping/Pong ============

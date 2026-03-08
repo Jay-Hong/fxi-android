@@ -12,6 +12,7 @@ import com.jay.fxi.domain.model.MutableGraphCache
 import com.jay.fxi.domain.model.SupportedCurrency
 import com.jay.fxi.domain.repository.ExchangeRateRepository
 import com.jay.fxi.util.GraphConfig
+import android.util.Log
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -349,8 +350,13 @@ class GraphViewModel @Inject constructor(
                     markGraphUpdated()
                 }
                 .onFailure { error ->
-                    // 실패 시 로그만 (기존 캐시 유지)
-                    android.util.Log.e("GraphViewModel", "fetchFullGraphData 실패: ${error.message}")
+                    val hasCache = cacheMutex.withLock {
+                        graphCache[currency]?.isNotEmpty() == true
+                    }
+                    val isActiveCurrency = currency == _activeCurrency.value.code
+                    Log.e(TAG, "fetchFullGraphData 실패: currency=$currency, " +
+                        "isActiveCurrency=$isActiveCurrency, hasCache=$hasCache, " +
+                        "error=${error.javaClass.simpleName}: ${error.message}")
                 }
         } finally {
             val stillLoading = stateMutex.withLock {
@@ -382,5 +388,9 @@ class GraphViewModel @Inject constructor(
         super.onCleared()
         webSocketService.onGraphBucketsReceived = null
         periodicRefreshJob?.cancel()
+    }
+
+    companion object {
+        private const val TAG = "GraphViewModel"
     }
 }

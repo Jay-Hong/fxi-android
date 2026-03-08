@@ -221,7 +221,10 @@ class AlertViewModel @Inject constructor(
             try {
                 repository.getSettings().fold(
                     onSuccess = { settings ->
-                        _state.value = AlertState.Loaded(alertSettings = settings.sortedByCreatedAt())
+                        val newState = AlertState.Loaded(alertSettings = settings.sortedByCreatedAt())
+                        if (_state.value != newState) {
+                            _state.value = newState
+                        }
                         lastRefreshAt = System.currentTimeMillis()
                         shouldRegisterPush = checkNotificationPermission()
                         isSuccess = true
