@@ -38,6 +38,9 @@ coil = "2.7.0"
 googleCredentials = "1.5.0"
 googleIdIdentity = "1.1.1"
 
+# Reorderable (drag-and-drop)
+reorderable = "2.5.1"
+
 # Splash Screen
 splashscreen = "1.0.1"
 
@@ -98,6 +101,9 @@ coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coi
 google-credentials = { group = "androidx.credentials", name = "credentials", version.ref = "googleCredentials" }
 google-credentials-play-services = { group = "androidx.credentials", name = "credentials-play-services-auth", version.ref = "googleCredentials" }
 google-id-identity = { group = "com.google.android.libraries.identity.googleid", name = "googleid", version.ref = "googleIdIdentity" }
+
+# Reorderable (drag-and-drop)
+reorderable = { group = "sh.calvin.reorderable", name = "reorderable", version.ref = "reorderable" }
 
 # Splash Screen
 androidx-splashscreen = { group = "androidx.core", name = "core-splashscreen", version.ref = "splashscreen" }

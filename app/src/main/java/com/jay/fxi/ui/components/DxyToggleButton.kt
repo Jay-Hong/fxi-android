@@ -3,11 +3,8 @@ package com.jay.fxi.ui.components
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -24,42 +21,19 @@ import com.jay.fxi.ui.theme.PrimaryText
 import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.ui.theme.color
 
-/**
- * 그래프 소스 토글 버튼 행 (iOS SourceToggleButton과 동일한 스타일)
- */
 @Composable
-fun SourceToggleRow(
-    selectedSources: Set<GraphSource>,
-    onToggle: (GraphSource) -> Unit,
+fun DxyToggleButton(
+    isSelected: Boolean,
+    onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Row(
-        modifier = modifier.padding(end = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        GraphSource.realtimeSources.forEach { source ->
-            SourceToggleButton(
-                source = source,
-                isSelected = source in selectedSources,
-                onClick = { onToggle(source) }
-            )
-        }
-    }
-}
-
-@Composable
-private fun SourceToggleButton(
-    source: GraphSource,
-    isSelected: Boolean,
-    onClick: () -> Unit
-) {
+    val source = GraphSource.DXY
     val backgroundColor = if (isSelected) source.color.copy(alpha = 0.15f) else InputBackground
     val borderColor = if (isSelected) source.color.copy(alpha = 0.5f) else Color.Transparent
     val textColor = if (isSelected) PrimaryText else SecondaryText
 
     Box(
-        modifier = Modifier
+        modifier = modifier
             .clip(RoundedCornerShape(4.dp))
             .background(backgroundColor)
             .border(1.dp, borderColor, RoundedCornerShape(4.dp))

@@ -1,6 +1,5 @@
 package com.jay.fxi.ui.theme
 
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.unit.Dp
@@ -14,7 +13,7 @@ import androidx.compose.ui.unit.sp
  * 사용법:
  * ```
  * BoxWithConstraints {
- *     val metrics = RateLayoutMetrics.fromWidth(maxWidth)
+ *     val metrics = RateLayoutMetrics.fromWindow(maxWidth, maxHeight)
  *     RateBarView(metrics = metrics, ...)
  * }
  * ```
@@ -46,6 +45,10 @@ data class RateLayoutMetrics(
     val sectionSpacing: Dp,
     val sectionPadding: Dp,
 
+    // MARK: - Rates Section
+    val ratesHeaderBottomSpacing: Dp,
+    val ratesSectionBottomPadding: Dp,
+
     // MARK: - Alert Section
     val alertBankNameWidth: Dp,
     val alertRowVerticalPadding: Dp
@@ -54,8 +57,8 @@ data class RateLayoutMetrics(
         /** Phone 메트릭스 (< 600dp) - iOS regular/large 기준 */
         val Phone = RateLayoutMetrics(
             // Graph
-            graphHeight = 170.dp,
-            graphVerticalPadding = 8.dp,
+            graphHeight = 190.dp,
+            graphVerticalPadding = 14.dp,
 
             // Rate Bar
             barHeight = 42.dp,
@@ -78,6 +81,10 @@ data class RateLayoutMetrics(
             sectionSpacing = 12.dp,
             sectionPadding = 12.dp,
 
+            // Rates Section
+            ratesHeaderBottomSpacing = 16.dp,
+            ratesSectionBottomPadding = 20.dp,
+
             // Alert Section
             alertBankNameWidth = 80.dp,
             alertRowVerticalPadding = 2.dp
@@ -86,7 +93,7 @@ data class RateLayoutMetrics(
         /** Tablet 메트릭스 (≥ 600dp) - SM-T505N 10.4" 테블릿 최적화 */
         val Tablet = RateLayoutMetrics(
             // Graph
-            graphHeight = 180.dp,
+            graphHeight = 200.dp,
             graphVerticalPadding = 16.dp,  // iOS와 동일하게 유지
 
             // Rate Bar - 바 높이 증가, 폰트 더 축소
@@ -110,6 +117,10 @@ data class RateLayoutMetrics(
             sectionSpacing = 14.dp,
             sectionPadding = 12.dp,        // 14 → 12: 줄임
 
+            // Rates Section
+            ratesHeaderBottomSpacing = 10.dp,
+            ratesSectionBottomPadding = 16.dp,
+
             // Alert Section
             alertBankNameWidth = 85.dp,    // 90 → 85: 폰트 축소에 맞춤
             alertRowVerticalPadding = 1.dp
@@ -119,11 +130,23 @@ data class RateLayoutMetrics(
         private val TABLET_BREAKPOINT = 600.dp
 
         /**
-         * 실제 윈도우 폭 기준으로 메트릭스 선택 (split-screen 대응)
-         * BoxWithConstraints의 maxWidth 사용 권장
+         * 실제 윈도우 크기 기준으로 메트릭스 선택 (split-screen 대응)
          */
+        fun fromWindow(width: Dp, height: Dp): RateLayoutMetrics {
+            val base = if (width >= TABLET_BREAKPOINT) Tablet else Phone
+            val heightMultiplier = when {
+                width >= TABLET_BREAKPOINT -> 1f
+                height < 700.dp -> 0.92f
+                height < 820.dp -> 1.0f
+                else -> 1.1f
+            }
+            return base.copy(
+                graphHeight = (base.graphHeight.value * heightMultiplier).dp
+            )
+        }
+
         fun fromWidth(width: Dp): RateLayoutMetrics {
-            return if (width >= TABLET_BREAKPOINT) Tablet else Phone
+            return fromWindow(width, 844.dp)
         }
     }
 }

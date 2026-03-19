@@ -5,10 +5,15 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.jay.fxi.domain.model.AlertCondition
 import com.jay.fxi.domain.model.Bank
+import com.jay.fxi.domain.model.BankDisplayConfig
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.GraphBucket
+import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSource
+import com.jay.fxi.domain.model.GraphSourceData
+import com.jay.fxi.domain.model.RatesDisplayState
 import com.jay.fxi.domain.model.SupportedCurrency
+import com.jay.fxi.domain.model.displayState
 import kotlin.math.max
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -36,10 +41,13 @@ class SamplePreviewViewModel {
 
     // ── Published State (Compose) ──
 
-    var rates by mutableStateOf<List<ExchangeRate>>(emptyList())
+    var selectedCurrency by mutableStateOf(SupportedCurrency.USD_KRW)
         private set
 
-    var graphData by mutableStateOf<Map<GraphSource, List<GraphBucket>>>(emptyMap())
+    private var allRates by mutableStateOf<List<ExchangeRate>>(emptyList())
+        private set
+
+    private var allGraphData by mutableStateOf<Map<SupportedCurrency, Map<GraphPeriod, GraphSourceData>>>(emptyMap())
         private set
 
     var alertSettings by mutableStateOf<List<SampleAlertSetting>>(emptyList())
@@ -54,8 +62,26 @@ class SamplePreviewViewModel {
     var triggeredCurrentRate by mutableStateOf<Double?>(null)
         private set
 
-    var selectedSources by mutableStateOf(GraphSource.entries.toSet())
+    var activePeriod by mutableStateOf(GraphPeriod.ONE_DAY)
         private set
+
+    var selectedSources by mutableStateOf(GraphSource.realtimeSources.toSet())
+        private set
+
+    var dxyVisible by mutableStateOf(false)
+        private set
+
+    val rates: List<ExchangeRate>
+        get() = allRates.filter { it.currency == selectedCurrency.code }
+
+    val graphDataByPeriod: Map<GraphPeriod, GraphSourceData>
+        get() = allGraphData[selectedCurrency].orEmpty()
+
+    val graphData: GraphSourceData
+        get() = graphDataByPeriod[activePeriod].orEmpty()
+
+    val filteredAlertSettings: List<SampleAlertSetting>
+        get() = alertSettings.filter { it.currency == selectedCurrency }
 
     // ── Computed Properties ──
 
@@ -64,6 +90,9 @@ class SamplePreviewViewModel {
 
     val remainingAlertCount: Int
         get() = max(0, SampleAlertConfig.MAX_COUNT - alertSettings.size)
+
+    val currentCurrencyAlertCount: Int
+        get() = filteredAlertSettings.size
 
     // ── Private State ──
 
@@ -84,8 +113,10 @@ class SamplePreviewViewModel {
     // ── 초기화 (iOS init 동일) ──
 
     init {
-        rates = SampleData.initialRates(SupportedCurrency.USD_KRW)
-        graphData = SampleData.generateGraph(SupportedCurrency.USD_KRW)
+        allRates = SampleData.initialRatesAll()
+        allGraphData = SupportedCurrency.entries.associateWith { currency ->
+            SampleData.generateAllPeriods(currency)
+        }
 
         val investingRate = rates.firstOrNull { it.bank == Bank.INVESTING.code }?.rate ?: 0.0
         val kbRate = rates.firstOrNull { it.bank == Bank.KB.code }?.rate ?: 0.0
@@ -108,6 +139,17 @@ class SamplePreviewViewModel {
                 threshold = hanaRate + 0.10
             )
         )
+    }
+
+    fun displayState(config: BankDisplayConfig): RatesDisplayState {
+        return allRates.displayState(selectedCurrency, config)
+    }
+
+    fun displayState(
+        currency: SupportedCurrency,
+        config: BankDisplayConfig
+    ): RatesDisplayState {
+        return allRates.displayState(currency, config)
     }
 
     // ── Lifecycle ──
@@ -166,9 +208,9 @@ class SamplePreviewViewModel {
                 delay(4000)
                 if (!isActive) break
 
-                val result = SampleData.randomize(rates)
-                rates = result.rates
-                checkAlertTriggers(result.changedBanks)
+                val result = SampleData.randomizeAll(allRates)
+                allRates = result.rates
+                checkAlertTriggers(result.changedBanksByCurrency)
             }
         }
     }
@@ -184,6 +226,7 @@ class SamplePreviewViewModel {
         if (!canAddAlert) return
         alertSettings = alertSettings + SampleAlertSetting(
             bank = bank,
+            currency = selectedCurrency,
             condition = condition,
             threshold = threshold,
             isEnabled = isEnabled
@@ -234,16 +277,19 @@ class SamplePreviewViewModel {
 
     // ── Alert Trigger Simulation ──
 
-    private fun checkAlertTriggers(changedBanks: Set<Bank>) {
+    private fun checkAlertTriggers(changedBanksByCurrency: Map<SupportedCurrency, Set<Bank>>) {
         val triggered = mutableListOf<PendingTrigger>()
         val updatedSettings = alertSettings.toMutableList()
 
         for (i in updatedSettings.indices) {
             val alert = updatedSettings[i]
             if (!alert.isEnabled || alert.triggered) continue
+            val changedBanks = changedBanksByCurrency[alert.currency].orEmpty()
             if (alert.bank !in changedBanks) continue
 
-            val rate = rates.firstOrNull { it.bank == alert.bank.code }?.rate ?: continue
+            val rate = allRates.firstOrNull {
+                it.currency == alert.currency.code && it.bank == alert.bank.code
+            }?.rate ?: continue
 
             val shouldTrigger = when (alert.condition) {
                 AlertCondition.BELOW -> rate <= alert.threshold
@@ -312,6 +358,9 @@ class SamplePreviewViewModel {
     // ── Graph Helpers ──
 
     fun toggleSource(source: GraphSource) {
+        if (activePeriod != GraphPeriod.ONE_DAY) return
+        if (source !in GraphSource.realtimeSources) return
+
         if (source in selectedSources) {
             if (selectedSources.size > 1) {
                 selectedSources = selectedSources - source
@@ -319,5 +368,54 @@ class SamplePreviewViewModel {
         } else {
             selectedSources = selectedSources + source
         }
+    }
+
+    fun selectCurrency(currency: SupportedCurrency) {
+        if (selectedCurrency == currency) return
+        selectedCurrency = currency
+        activePeriod = GraphPeriod.ONE_DAY
+        selectedSources = GraphSource.realtimeSources.toSet()
+        dxyVisible = false
+    }
+
+    fun selectPeriod(period: GraphPeriod) {
+        activePeriod = period
+        if (period != GraphPeriod.ONE_DAY) {
+            selectedSources = GraphSource.realtimeSources.toSet()
+        }
+        if (!hasDxyData(selectedCurrency)) {
+            dxyVisible = false
+        }
+    }
+
+    fun hasDxyData(currency: SupportedCurrency = selectedCurrency): Boolean {
+        return allGraphData[currency]
+            ?.get(activePeriod)
+            ?.containsKey(GraphSource.DXY.code) == true &&
+            currency == SupportedCurrency.USD_KRW
+    }
+
+    fun toggleDxy() {
+        if (!hasDxyData(selectedCurrency)) return
+        dxyVisible = !dxyVisible
+    }
+
+    fun latestRateFor(source: GraphSource): Double? {
+        val bank = when (source) {
+            GraphSource.INVESTING -> Bank.INVESTING
+            GraphSource.KB -> Bank.KB
+            GraphSource.HANA -> Bank.HANA
+            GraphSource.REFERENCE -> Bank.INVESTING
+            GraphSource.DXY -> null
+        }
+        return bank?.let { target -> rates.firstOrNull { it.bank == target.code }?.rate }
+    }
+
+    fun latestDxyRate(currency: SupportedCurrency = selectedCurrency): Double? {
+        return allGraphData[currency]
+            ?.get(activePeriod)
+            ?.get(GraphSource.DXY.code)
+            ?.lastOrNull()
+            ?.close
     }
 }

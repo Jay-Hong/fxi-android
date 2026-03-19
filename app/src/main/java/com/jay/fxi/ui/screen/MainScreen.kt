@@ -22,6 +22,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.material3.IconButton
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.res.painterResource
+import androidx.compose.animation.core.tween
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -53,6 +54,7 @@ import com.jay.fxi.ui.theme.Primary
 import com.jay.fxi.ui.theme.PrimaryText
 import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.ui.viewmodel.AlertViewModel
+import com.jay.fxi.ui.viewmodel.BankPreferenceViewModel
 import com.jay.fxi.ui.viewmodel.ExchangeRateViewModel
 import com.jay.fxi.ui.viewmodel.GraphViewModel
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -72,7 +74,8 @@ fun MainScreen(
     authViewModel: AuthViewModel,
     exchangeRateViewModel: ExchangeRateViewModel = hiltViewModel(),
     graphViewModel: GraphViewModel = hiltViewModel(),
-    alertViewModel: AlertViewModel = hiltViewModel()
+    alertViewModel: AlertViewModel = hiltViewModel(),
+    bankPreferenceViewModel: BankPreferenceViewModel = hiltViewModel()
 ) {
     val appState by exchangeRateViewModel.appState.collectAsStateWithLifecycle()
     val connectionState by exchangeRateViewModel.connectionState.collectAsStateWithLifecycle()
@@ -81,6 +84,8 @@ fun MainScreen(
     val authState by authViewModel.authState.collectAsStateWithLifecycle()
 
     var showSettings by remember { mutableStateOf(false) }
+    var selectedCurrency by remember { mutableStateOf(activeCurrency) }
+    var tabTargetPage by remember { mutableStateOf<Int?>(null) }
 
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -127,25 +132,59 @@ fun MainScreen(
         }
     }
 
-    // 스와이프로 페이지 변경 → ViewModel 동기화
+    // 외부에서 활성 통화가 바뀌면 UI 선택 상태도 동일하게 맞춘다.
+    LaunchedEffect(activeCurrency) {
+        if (activeCurrency != selectedCurrency) {
+            selectedCurrency = activeCurrency
+            val targetPage = currencies.indexOf(activeCurrency)
+            if (targetPage >= 0 && targetPage != pagerState.settledPage) {
+                tabTargetPage = targetPage
+            }
+        }
+    }
+
+    // currentPage는 스와이프가 절반을 넘으면 다음 페이지로 바뀐다.
+    // iOS TabView(selection:) 체감과 맞추기 위해 탭 강조 상태도 이 시점에 함께 갱신한다.
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.currentPage }
             .distinctUntilChanged()
             .collect { page ->
-                val currency = currencies[page]
-                if (currency != activeCurrency) {
-                    graphViewModel.setActiveCurrency(currency)
+                if (tabTargetPage != null) return@collect
+                val currency = currencies.getOrNull(page) ?: return@collect
+                if (currency != selectedCurrency) {
+                    selectedCurrency = currency
                 }
             }
     }
 
-    // ViewModel에서 통화 변경 → Pager 동기화
-    LaunchedEffect(activeCurrency) {
-        val targetPage = currencies.indexOf(activeCurrency)
-        if (targetPage >= 0 && targetPage != pagerState.currentPage) {
-            pagerState.animateScrollToPage(targetPage)
+    // 탭 클릭으로 시작한 페이지 전환은 목표 페이지까지 중간 상태에 흔들리지 않고 끝까지 보낸다.
+    LaunchedEffect(tabTargetPage) {
+        val targetPage = tabTargetPage ?: return@LaunchedEffect
+        try {
+            if (targetPage != pagerState.settledPage || pagerState.currentPageOffsetFraction != 0f) {
+                pagerState.animateScrollToPage(
+                    page = targetPage,
+                    animationSpec = tween(durationMillis = 400)
+                )
+            }
+        } finally {
+            if (tabTargetPage == targetPage) {
+                tabTargetPage = null
+                val settledCurrency = currencies.getOrNull(pagerState.settledPage)
+                    ?: currencies.getOrNull(pagerState.currentPage)
+                if (settledCurrency != null && settledCurrency != selectedCurrency) {
+                    selectedCurrency = settledCurrency
+                }
+            }
         }
-        graphViewModel.loadGraph(activeCurrency)
+    }
+
+    // 선택 상태가 바뀌면 ViewModel을 함께 동기화한다.
+    LaunchedEffect(selectedCurrency) {
+        if (selectedCurrency != activeCurrency) {
+            graphViewModel.setActiveCurrency(selectedCurrency)
+        }
+        graphViewModel.loadGraph(selectedCurrency)
     }
 
     Column(
@@ -165,11 +204,14 @@ fun MainScreen(
 
         // 통화 탭 선택기 + 설정 버튼 (iOS currencyTabPicker 구조)
         CurrencyTabRow(
-            selectedCurrency = activeCurrency,
+            selectedCurrency = selectedCurrency,
             onCurrencySelected = { currency ->
-                scope.launch {
+                if (currency != selectedCurrency) {
+                    selectedCurrency = currency
                     val targetPage = currencies.indexOf(currency)
-                    pagerState.animateScrollToPage(targetPage)
+                    if (targetPage >= 0) {
+                        tabTargetPage = targetPage
+                    }
                 }
             },
             onSettingsClick = { showSettings = true }
@@ -193,6 +235,7 @@ fun MainScreen(
                         rates = state.currentRates,
                         graphViewModel = graphViewModel,
                         alertViewModel = alertViewModel,
+                        bankPreferenceViewModel = bankPreferenceViewModel,
                         isPremium = isPremium,
                         lastUpdated = lastUpdated
                     )
@@ -210,6 +253,7 @@ fun MainScreen(
                             rates = rates,
                             graphViewModel = graphViewModel,
                             alertViewModel = alertViewModel,
+                            bankPreferenceViewModel = bankPreferenceViewModel,
                             isPremium = isPremium,
                             lastUpdated = lastUpdated
                         )

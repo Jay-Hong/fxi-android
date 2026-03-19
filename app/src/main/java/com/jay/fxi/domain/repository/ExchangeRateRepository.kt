@@ -1,7 +1,8 @@
 package com.jay.fxi.domain.repository
 
 import com.jay.fxi.domain.model.RatesResult
-import com.jay.fxi.domain.model.GraphBucket
+import com.jay.fxi.domain.model.GraphDataResult
+import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.SupportedCurrency
 
 /**
@@ -17,16 +18,24 @@ interface ExchangeRateRepository {
     suspend fun getRates(): Result<RatesResult>
 
     /**
-     * 통화별 24시간 그래프 데이터 조회
+     * 통화별 그래프 데이터 조회
      * @param currency 통화쌍
-     * @return 소스별 그래프 버킷 맵 (source -> buckets)
+     * @param period 그래프 기간
+     * @return 그래프 응답 도메인 모델
      */
-    suspend fun getGraph(currency: SupportedCurrency): Result<Map<String, List<GraphBucket>>>
+    suspend fun getGraph(
+        currency: SupportedCurrency,
+        period: GraphPeriod = GraphPeriod.ONE_DAY
+    ): Result<GraphDataResult>
 
     /**
-     * 통화별 24시간 그래프 데이터 조회 (문자열 버전)
+     * 통화별 그래프 데이터 조회 (문자열 버전)
      * @param currency 통화쌍 코드 (예: "usd-krw")
-     * @return 소스별 그래프 버킷 맵 (source -> buckets)
+     * @param period 그래프 기간
+     * @return 그래프 응답 도메인 모델
      */
-    suspend fun getGraph(currency: String): Result<Map<String, List<GraphBucket>>>
+    suspend fun getGraph(
+        currency: String,
+        period: GraphPeriod = GraphPeriod.ONE_DAY
+    ): Result<GraphDataResult>
 }

@@ -36,8 +36,8 @@ android {
         applicationId = "com.jay.fxi"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "1.0.8"
+        versionCode = 10
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -113,6 +113,9 @@ dependencies {
 
     // Subscriptions
     implementation(libs.revenuecat)
+
+    // Reorderable (drag-and-drop)
+    implementation(libs.reorderable)
 
     // Splash Screen
     implementation(libs.androidx.splashscreen)

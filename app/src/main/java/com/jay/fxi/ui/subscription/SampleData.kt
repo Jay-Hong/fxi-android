@@ -3,7 +3,9 @@ package com.jay.fxi.ui.subscription
 import com.jay.fxi.domain.model.Bank
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.GraphBucket
+import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSource
+import com.jay.fxi.domain.model.GraphSourceData
 import com.jay.fxi.domain.model.SupportedCurrency
 import kotlin.math.abs
 import kotlin.math.cos
@@ -63,35 +65,66 @@ object SampleData {
         }
     }
 
+    fun initialRatesAll(): List<ExchangeRate> =
+        SupportedCurrency.entries.flatMap { currency -> initialRates(currency) }
+
     /**
      * 24시간 샘플 그래프 생성 (iOS SampleGraphData.generate 동일)
      */
     fun generateGraph(
         currency: SupportedCurrency = SupportedCurrency.USD_KRW
-    ): Map<GraphSource, List<GraphBucket>> {
+    ): GraphSourceData {
+        return generatePeriodGraph(currency, GraphPeriod.ONE_DAY)
+    }
+
+    fun generateAllPeriods(
+        currency: SupportedCurrency = SupportedCurrency.USD_KRW
+    ): Map<GraphPeriod, GraphSourceData> {
+        return GraphPeriod.entries.associateWith { period ->
+            generatePeriodGraph(currency, period)
+        }
+    }
+
+    fun generatePeriodGraph(
+        currency: SupportedCurrency,
+        period: GraphPeriod
+    ): GraphSourceData {
         val baseRate = graphBaseRate(currency)
         val now = Clock.System.now()
-        val bucketCount = 144
-        val bucketDuration = 600L // 10분 (초)
+        val (bucketCount, bucketDuration) = when (period) {
+            GraphPeriod.ONE_DAY -> 144 to 600L
+            GraphPeriod.ONE_WEEK -> 168 to 3_600L
+            GraphPeriod.THREE_MONTHS -> 92 to 86_400L
+            GraphPeriod.ONE_YEAR -> 52 to 7 * 86_400L
+        }
 
         // 시간대별 변동성 (시장 움직임 + 캔들 스프레드에서 공유)
         val volatility = generateMarketVolatility(bucketCount)
         // 공통 시장 움직임 (동일 volatility 주입)
         val marketMovement = generateMarketMovement(bucketCount, baseRate, volatility)
 
-        return GraphSource.entries.associateWith { source ->
+        val rateSources = when (period) {
+            GraphPeriod.ONE_DAY -> GraphSource.realtimeSources
+            else -> listOf(GraphSource.REFERENCE)
+        }
+
+        val rateData = rateSources.associate { source ->
             val sourceOffset = when (source) {
                 GraphSource.INVESTING -> 0.0
                 GraphSource.KB -> 0.20
                 GraphSource.HANA -> 0.40
+                GraphSource.REFERENCE -> 0.0
+                else -> 0.0
             }
             val sensitivity = when (source) {
                 GraphSource.INVESTING -> 1.0
                 GraphSource.KB -> 0.85
                 GraphSource.HANA -> 0.90
+                GraphSource.REFERENCE -> 1.0
+                else -> 1.0
             }
 
-            (0 until bucketCount).map { i ->
+            val buckets = (0 until bucketCount).map { i ->
                 val bucketTs = (now.epochSeconds - (bucketCount - 1 - i) * bucketDuration).toInt()
                 val marketRate = marketMovement[i]
                 val deviation = (marketRate - baseRate) * sensitivity
@@ -110,7 +143,41 @@ object SampleData {
                     close = close
                 )
             }
+            source.code to buckets
         }
+
+        if (currency != SupportedCurrency.USD_KRW) {
+            return rateData
+        }
+
+        // DXY는 환율과 양의 상관관계 (USD 강세 → 환율↑ & DXY↑)
+        // 단기(1일): ~0.4, 장기(1주~1년): ~0.6 (KRW은 DXY 바스켓에 미포함, EM 고유 요인 존재)
+        val dxyBase = 103.4
+        val correlation = when (period) {
+            GraphPeriod.ONE_DAY -> 0.8
+            GraphPeriod.ONE_WEEK -> 0.8
+            else -> 0.8
+        }
+        // DXY 자체 독립 움직임 (환율과 무관한 EUR/JPY 등 영향)
+        val dxyOwnVolatility = generateMarketVolatility(bucketCount)
+        val dxyOwnMovement = generateMarketMovement(bucketCount, dxyBase, dxyOwnVolatility.map { it * 0.12 })
+        val dxyData = (0 until bucketCount).map { i ->
+            val bucketTs = (now.epochSeconds - (bucketCount - 1 - i) * bucketDuration).toInt()
+            // 환율 연동 성분 + DXY 독립 성분
+            val rateDeviation = (marketMovement[i] - baseRate) / baseRate
+            val correlatedPart = dxyBase * (1.0 + rateDeviation * correlation)
+            val ownPart = dxyOwnMovement[i] - dxyBase
+            val close = correlatedPart + ownPart * (1.0 - correlation)
+            val spread = if (period == GraphPeriod.ONE_DAY) 0.06 else 0.12
+            GraphBucket(
+                bucketTs = bucketTs,
+                max = close + Random.nextDouble(spread * 0.3, spread),
+                min = close - Random.nextDouble(spread * 0.3, spread),
+                close = close
+            )
+        }
+
+        return rateData + mapOf(GraphSource.DXY.code to dxyData)
     }
 
     // ── 기존 호출부 호환 래퍼 ──
@@ -121,7 +188,7 @@ object SampleData {
 
     fun sampleGraphData(
         currency: SupportedCurrency = SupportedCurrency.USD_KRW
-    ): Map<GraphSource, List<GraphBucket>> = generateGraph(currency)
+    ): GraphSourceData = generateGraph(currency)
 
     // ══════════════════════════════════════════
     // 환율 랜덤화 (iOS SampleExchangeData.randomize 동일)
@@ -130,6 +197,11 @@ object SampleData {
     data class RandomizeResult(
         val rates: List<ExchangeRate>,
         val changedBanks: Set<Bank>
+    )
+
+    data class RandomizeAllResult(
+        val rates: List<ExchangeRate>,
+        val changedBanksByCurrency: Map<SupportedCurrency, Set<Bank>>
     )
 
     /**
@@ -211,6 +283,23 @@ object SampleData {
         }
 
         return RandomizeResult(newRates, banksToChange)
+    }
+
+    fun randomizeAll(rates: List<ExchangeRate>): RandomizeAllResult {
+        val updatedRates = mutableListOf<ExchangeRate>()
+        val changedBanksByCurrency = mutableMapOf<SupportedCurrency, Set<Bank>>()
+
+        SupportedCurrency.entries.forEach { currency ->
+            val currentRates = rates.filter { it.currency == currency.code }
+            val result = randomize(currentRates)
+            updatedRates += result.rates
+            changedBanksByCurrency[currency] = result.changedBanks
+        }
+
+        return RandomizeAllResult(
+            rates = updatedRates,
+            changedBanksByCurrency = changedBanksByCurrency
+        )
     }
 
     // ── 튜닝 파라미터 (iOS Tuning enum 동일) ──

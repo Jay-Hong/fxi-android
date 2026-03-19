@@ -26,7 +26,8 @@ interface FXiApiService {
 
     @GET("api/graph/{currency}")
     suspend fun getGraph(
-        @Path("currency") currency: String
+        @Path("currency") currency: String,
+        @Query("range") range: String? = null
     ): GraphResponse
 
     @POST("api/register-device")

@@ -5,7 +5,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -80,7 +79,7 @@ fun SampleAlertSection(
     metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
     var isExpanded by remember { mutableStateOf(true) }
-    val settings = viewModel.alertSettings
+    val settings = viewModel.filteredAlertSettings
     val activeCount = settings.count { it.isEnabled }
 
     Column(
@@ -178,18 +177,22 @@ private fun SectionHeader(
 
             Spacer(modifier = Modifier.width(6.dp))
 
-            // "예시" 뱃지 (캡슐형 — iOS .clipShape(Capsule()) 동일)
+            // "예시" 뱃지 (캡슐형)
             Text(
                 text = "예시",
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Medium,
+                fontSize = 9.sp,
+                fontWeight = FontWeight.SemiBold,
                 color = Color(0xFFFFA500),
+                lineHeight = 9.sp,
+                style = TextStyle(
+                    platformStyle = PlatformTextStyle(includeFontPadding = false)
+                ),
                 modifier = Modifier
                     .background(
                         Color(0xFFFFA500).copy(alpha = 0.15f),
                         RoundedCornerShape(percent = 50)
                     )
-                    .padding(horizontal = 5.dp, vertical = 0.dp)
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
             )
         }
 
@@ -241,8 +244,6 @@ private fun SectionContent(
             onAddTap = onAddTap,
             metrics = metrics
         )
-
-        AlertInfoBanner(isEmpty = settings.isEmpty(), metrics = metrics)
     }
 }
 
@@ -508,52 +509,3 @@ private fun AddAlertButton(
     }
 }
 
-@Composable
-private fun AlertInfoBanner(isEmpty: Boolean, metrics: RateLayoutMetrics) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = metrics.horizontalPadding)
-            .padding(top = 8.dp)
-            .border(1.dp, Color(0xFFFFA500).copy(alpha = 0.3f), RoundedCornerShape(8.dp))
-            .padding(horizontal = 10.dp, vertical = 8.dp)
-    ) {
-        Text(
-            text = "\uD83D\uDCA1", // 💡
-            fontSize = 14.sp
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
-            if (isEmpty) {
-                Text(
-                    text = "은행별 환율 알림을 설정해보세요",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = PrimaryText,
-                    lineHeight = 14.sp
-                )
-                Text(
-                    text = "목표 환율 도달 시 알림이 표시됩니다",
-                    fontSize = 11.sp,
-                    color = SecondaryText,
-                    lineHeight = 13.sp
-                )
-            } else {
-                Text(
-                    text = "알림 대기 중",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = PrimaryText,
-                    lineHeight = 14.sp
-                )
-                Text(
-                    text = "조건을 만족하면 상단에 알림이 표시됩니다",
-                    fontSize = 11.sp,
-                    color = SecondaryText,
-                    lineHeight = 13.sp
-                )
-            }
-        }
-    }
-}

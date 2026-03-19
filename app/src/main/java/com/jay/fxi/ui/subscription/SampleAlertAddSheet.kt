@@ -127,7 +127,7 @@ fun SampleAlertAddSheet(
     }
     val isInRange = thresholdValue != null && validRange != null &&
         thresholdValue >= validRange.first && thresholdValue <= validRange.second
-    val isDuplicate = thresholdValue != null && viewModel.alertSettings.any { setting ->
+    val isDuplicate = thresholdValue != null && viewModel.filteredAlertSettings.any { setting ->
         if (editSetting != null && setting.id == editSetting.id) return@any false
         setting.bank == selectedBank &&
             setting.condition == condition &&
@@ -296,25 +296,25 @@ private fun SampleModeBanner() {
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
-            .background(Color(0xFFFFA500).copy(alpha = 0.1f))
+            .background(Primary.copy(alpha = 0.1f))
             .padding(12.dp)
     ) {
         Icon(
-            imageVector = Icons.Default.AutoAwesome,
+            imageVector = Icons.Default.Notifications,
             contentDescription = null,
-            tint = Color(0xFFFFA500),
+            tint = Primary,
             modifier = Modifier.size(18.dp)
         )
         Spacer(modifier = Modifier.width(10.dp))
         Column {
             Text(
-                text = "예시 알림 모드",
+                text = "푸시 알림 지원",
                 fontSize = 14.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = PrimaryText
             )
             Text(
-                text = "알림은 샘플 환율 변동으로 목표에 도달할 때 표시됩니다",
+                text = "구독 시 앱이 꺼져 있어도 설정한 환율에 도달하면 알림을 받을 수 있습니다",
                 fontSize = 12.sp,
                 lineHeight = 15.sp,
                 color = SecondaryText

@@ -1,12 +1,21 @@
 # Canvas Graph Design (Android)
 
+> 상태: 초기 1일 그래프 Canvas 전환 설계 문서.
+> 현재 구현은 기간별 그래프(1일/1주/3달/1년), USD/KRW DXY 오버레이, Live Tail까지 확장되었음.
+> 최신 동작 기준은 `RateGraphView.kt`와 `CLAUDE.md`를 우선 참고.
+
 ## Goal
-Build a 24-hour rate chart in Jetpack Compose Canvas that matches iOS Swift Charts as closely as possible. The chart must support a true min~max band for single-source mode and time-based X-axis formatting identical to iOS.
+Build the baseline 1-day rate chart in Jetpack Compose Canvas to match iOS Swift Charts as closely as possible. The chart must support a true min~max band for single-source mode and time-based X-axis formatting identical to iOS.
 
 ## Scope
 - Replace the current `RateGraphView` (Vico-based) with a Canvas-based implementation.
 - Keep data loading, caching, source toggles, and fullscreen state unchanged.
 - No zoom/scroll/marker interactions in this phase.
+
+## Out Of Scope In This Doc
+- Period-specific axis formatting for 1w/3m/1y
+- DXY dual-axis rendering and left-axis labels
+- Live Tail rendering rules
 
 ## Non-Goals
 - Advanced interactions (pinch zoom, crosshair, marker tooltips)

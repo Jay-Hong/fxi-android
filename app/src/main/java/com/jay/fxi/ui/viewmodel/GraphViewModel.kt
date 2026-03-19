@@ -1,5 +1,6 @@
 package com.jay.fxi.ui.viewmodel
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.jay.fxi.data.local.CacheService
@@ -7,34 +8,33 @@ import com.jay.fxi.data.remote.WebSocketService
 import com.jay.fxi.data.remote.dto.WebSocketGraphBucket
 import com.jay.fxi.data.remote.dto.WebSocketGraphBuckets
 import com.jay.fxi.domain.model.GraphBucket
+import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSource
+import com.jay.fxi.domain.model.GraphSourceData
 import com.jay.fxi.domain.model.MutableGraphCache
+import com.jay.fxi.domain.model.MutablePeriodGraphCache
 import com.jay.fxi.domain.model.SupportedCurrency
 import com.jay.fxi.domain.repository.ExchangeRateRepository
 import com.jay.fxi.util.GraphConfig
-import android.util.Log
 import dagger.hilt.android.lifecycle.HiltViewModel
+import javax.inject.Inject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import javax.inject.Inject
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.datetime.Clock
 
 /**
  * 그래프 데이터 ViewModel
  *
- * 주요 기능:
- * - REST API로 그래프 데이터 로드
- * - WebSocket 실시간 버킷 업데이트
- * - 갭 감지 및 REST 복구
- * - 메모리 + 디스크 캐시
- * - 주기적 갭 체크 (5분)
+ * 1d는 WebSocket 실시간 + REST 갭 복구를 사용하고,
+ * 1w/3m/1y는 기간별 REST + 캐시 freshness로 관리한다.
  */
 @HiltViewModel
 class GraphViewModel @Inject constructor(
@@ -46,17 +46,29 @@ class GraphViewModel @Inject constructor(
     // ============ 상태 ============
 
     /**
-     * 그래프 캐시: [currency: [source: [GraphBucket]]]
-     * Mutex로 동시 접근 보호 (Default 스레드 업데이트 + UI 읽기)
+     * 1d 캐시: [currency: [source: [GraphBucket]]]
      */
     private val graphCache: MutableGraphCache = mutableMapOf()
+
+    /**
+     * 장기 구간 캐시: [period: [currency: [source: [GraphBucket]]]]
+     */
+    private val periodCache: MutablePeriodGraphCache = mutableMapOf()
+
     private val cacheMutex = Mutex()
+    private val stateMutex = Mutex()
 
     private val _activeCurrency = MutableStateFlow(SupportedCurrency.USD_KRW)
     val activeCurrency: StateFlow<SupportedCurrency> = _activeCurrency.asStateFlow()
 
-    private val _selectedSources = MutableStateFlow(GraphSource.entries.toSet())
+    private val _activePeriod = MutableStateFlow(GraphPeriod.ONE_DAY)
+    val activePeriod: StateFlow<GraphPeriod> = _activePeriod.asStateFlow()
+
+    private val _selectedSources = MutableStateFlow(GraphSource.realtimeSources.toSet())
     val selectedSources: StateFlow<Set<GraphSource>> = _selectedSources.asStateFlow()
+
+    private val _dxyVisible = MutableStateFlow(false)
+    val dxyVisible: StateFlow<Boolean> = _dxyVisible.asStateFlow()
 
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
@@ -70,45 +82,48 @@ class GraphViewModel @Inject constructor(
     private val _isRatesFullscreen = MutableStateFlow(false)
     val isRatesFullscreen: StateFlow<Boolean> = _isRatesFullscreen.asStateFlow()
 
-    fun setGraphFullscreen(value: Boolean) { _isGraphFullscreen.value = value }
-    fun setRatesFullscreen(value: Boolean) { _isRatesFullscreen.value = value }
+    fun setGraphFullscreen(value: Boolean) {
+        _isGraphFullscreen.value = value
+    }
 
-    /**
-     * 서비스 활성화 상태 (구독자만 true)
-     */
+    fun setRatesFullscreen(value: Boolean) {
+        _isRatesFullscreen.value = value
+    }
+
     private var isActive = false
+    private var periodicRefreshJob: Job? = null
 
     /**
-     * 상태 변수 보호용 Mutex (inFlightCurrencies, currenciesNeedingRefresh)
-     */
-    private val stateMutex = Mutex()
-
-    /**
-     * 갭으로 인해 REST 복구가 필요한 통화들
-     * stateMutex로 보호
+     * 1d 강제 새로고침이 필요한 통화
      */
     private val currenciesNeedingRefresh = mutableSetOf<String>()
 
     /**
-     * 현재 REST 요청 중인 통화 (중복 방지)
-     * stateMutex로 보호
+     * 중복 요청 방지 키
+     * - 1d: "1d:usd-krw"
+     * - 장기: "1w:usd-krw"
      */
-    private val inFlightCurrencies = mutableSetOf<String>()
+    private val inFlightKeys = mutableSetOf<String>()
 
     /**
-     * 통화별 마지막 REST 호출 시간 (쿨다운 관리)
+     * 1d 쿨다운 관리
      */
     private val lastFullFetchTimeMap = mutableMapOf<String, Long>()
 
-    private var periodicRefreshJob: Job? = null
+    /**
+     * 장기 구간 freshness
+     * key = "{period}:{currency}"
+     */
+    private val periodCacheFreshnessAt = mutableMapOf<String, Long>()
 
     init {
-        // 앱 시작 시 디스크 캐시 로드
         viewModelScope.launch {
             val diskCache = cacheService.loadAllGraphData()
             cacheMutex.withLock {
                 diskCache.forEach { (currency, sourceData) ->
-                    graphCache[currency] = sourceData.mapValues { it.value.toMutableList() }.toMutableMap()
+                    graphCache[currency] = sourceData
+                        .mapValues { (_, buckets) -> buckets.toMutableList() }
+                        .toMutableMap()
                 }
             }
             if (diskCache.isNotEmpty()) {
@@ -121,47 +136,55 @@ class GraphViewModel @Inject constructor(
 
     // ============ Public API ============
 
-    /**
-     * 서비스 활성화 (구독자 전용)
-     */
     fun start() {
         if (isActive) return
         isActive = true
         setupPeriodicRefresh()
     }
 
-    /**
-     * 서비스 비활성화
-     */
     fun stop() {
         isActive = false
         periodicRefreshJob?.cancel()
         periodicRefreshJob = null
     }
 
-    /**
-     * 활성 통화 변경
-     */
     fun setActiveCurrency(currency: SupportedCurrency) {
         _activeCurrency.value = currency
 
-        // 갭 플래그가 있으면 REST 복구
         viewModelScope.launch {
-            val needsRefresh = stateMutex.withLock {
-                currenciesNeedingRefresh.remove(currency.code)
+            val shouldForceRefresh = stateMutex.withLock {
+                if (_activePeriod.value == GraphPeriod.ONE_DAY) {
+                    currenciesNeedingRefresh.remove(currency.code)
+                } else {
+                    false
+                }
             }
-            if (needsRefresh) {
-                loadGraph(currency)
+            if (shouldForceRefresh) {
+                loadGraphForUserSelection(currency, forceRefresh = true)
             }
         }
     }
 
-    /**
-     * 그래프 소스 토글
-     */
+    fun setActivePeriod(period: GraphPeriod) {
+        val previousPeriod = _activePeriod.value
+        _activePeriod.value = period
+        if (previousPeriod != period) {
+            viewModelScope.launch {
+                val hasCachedData = cacheMutex.withLock {
+                    hasCachedDataUnsafe(_activeCurrency.value.code, period)
+                }
+                if (!hasCachedData) {
+                    _isLoading.value = true
+                }
+            }
+        }
+    }
+
     fun toggleSource(source: GraphSource) {
+        if (source !in GraphSource.realtimeSources) return
+
         val current = _selectedSources.value.toMutableSet()
-        if (current.contains(source)) {
+        if (source in current) {
             if (current.size > 1) {
                 current.remove(source)
             }
@@ -171,59 +194,75 @@ class GraphViewModel @Inject constructor(
         _selectedSources.value = current
     }
 
-    /**
-     * 그래프 데이터 로드
-     */
-    suspend fun loadGraph(currency: SupportedCurrency) {
-        if (!isActive) return
-
-        val currencyCode = currency.code
-
-        // 캐시 유효성 검사 (실제 버킷 시간 기준)
-        val shouldSkip = cacheMutex.withLock {
-            val cached = graphCache[currencyCode]
-            if (cached != null && cacheService.hasValidCache(cached)) {
-                // 마지막 버킷이 15분 이내면 스킵 (WebSocket으로 실시간 업데이트 중)
-                val lastBucketTs = getLastBucketTimestampUnsafe(currencyCode, GraphSource.INVESTING.code)
-                if (lastBucketTs != null) {
-                    val elapsed = System.currentTimeMillis() - (lastBucketTs * 1000L)
-                    elapsed < GraphConfig.GAP_THRESHOLD_SEC * 1000L
-                } else false
-            } else false
-        }
-        if (shouldSkip) return
-
-        // 쿨다운 체크 (2분, 통화별)
-        val lastFetch = stateMutex.withLock {
-            lastFullFetchTimeMap[currencyCode] ?: 0L
-        }
-        val cooldownElapsed = System.currentTimeMillis() - lastFetch
-        if (cooldownElapsed < GraphConfig.FULL_FETCH_COOLDOWN_SEC * 1000L) {
-            return
-        }
-
-        fetchFullGraphData(currencyCode)
+    fun toggleDxy() {
+        _dxyVisible.update { !it }
     }
 
-    /**
-     * 특정 통화의 그래프 포인트 조회 (UI용)
-     * Note: suspend 함수로 변경하여 Mutex 사용
-     */
+    suspend fun loadGraph(currency: SupportedCurrency) {
+        loadGraphForUserSelection(currency)
+    }
+
+    suspend fun loadGraphForUserSelection(
+        currency: SupportedCurrency,
+        period: GraphPeriod = _activePeriod.value,
+        forceRefresh: Boolean = false
+    ) {
+        if (!isActive) return
+        if (period == GraphPeriod.ONE_DAY) {
+            loadRealtimeGraph(currency.code, forceRefresh)
+        } else {
+            loadPeriodGraph(currency.code, period, forceRefresh)
+        }
+    }
+
     suspend fun getGraphBuckets(currency: String, source: GraphSource): List<GraphBucket> {
         return cacheMutex.withLock {
-            graphCache[currency]?.get(source.code)?.toList() ?: emptyList()
+            when (_activePeriod.value) {
+                GraphPeriod.ONE_DAY -> graphCache[currency]?.get(source.code)?.toList() ?: emptyList()
+                else -> periodCache[_activePeriod.value.code]
+                    ?.get(currency)
+                    ?.get(source.code)
+                    ?.toList()
+                    ?: emptyList()
+            }
         }
     }
 
-    /**
-     * 캐시를 디스크에 저장 (백그라운드 진입 시)
-     */
+    fun latestDxyRate(): Double? {
+        val oneDayDxy = graphCache[SupportedCurrency.USD_KRW.code]
+            ?.get(GraphSource.DXY.code)
+            ?.maxByOrNull { it.bucketTs }
+            ?.close
+        if (oneDayDxy != null) return oneDayDxy
+
+        val period = _activePeriod.value
+        if (period == GraphPeriod.ONE_DAY) return null
+        if (!isPeriodGraphFresh(SupportedCurrency.USD_KRW, period)) return null
+
+        return periodCache[period.code]
+            ?.get(SupportedCurrency.USD_KRW.code)
+            ?.get(GraphSource.DXY.code)
+            ?.maxByOrNull { it.bucketTs }
+            ?.close
+    }
+
+    fun isPeriodGraphFresh(
+        currency: SupportedCurrency,
+        period: GraphPeriod = _activePeriod.value
+    ): Boolean {
+        if (period == GraphPeriod.ONE_DAY) return true
+
+        val cacheKey = periodCacheKey(period, currency.code)
+        val freshnessMs = periodCacheFreshnessAt[cacheKey] ?: return false
+        val hasData = periodCache[period.code]?.containsKey(currency.code) == true
+        return hasData && (System.currentTimeMillis() - freshnessMs) < GraphConfig.cacheTtlMs(period)
+    }
+
     fun saveCache() {
         viewModelScope.launch {
             val snapshot = cacheMutex.withLock {
-                // 스냅샷 생성 (깊은 복사)
                 graphCache.mapValues { (_, sourceMap) ->
-                    sourceMap.mapValues { it.value.toList() }
+                    sourceMap.mapValues { (_, buckets) -> buckets.toList() }
                 }
             }
             cacheService.saveAllGraphData(snapshot)
@@ -239,36 +278,28 @@ class GraphViewModel @Inject constructor(
     }
 
     private fun handleWebSocketBuckets(buckets: WebSocketGraphBuckets) {
-        // 캐시 정렬/삭제 작업이 Main에서 수행되면 UI 버벅임 가능
-        // Dispatchers.Default에서 처리
         viewModelScope.launch(Dispatchers.Default) {
-            // REST 복구가 필요한 통화 수집 (중복 제거)
             val currenciesToFetch = mutableSetOf<String>()
-            // 갭 플래그 설정이 필요한 통화 수집
-            val currenciesToFlag = mutableListOf<String>()
+            val currenciesToFlag = mutableSetOf<String>()
             var didUpdate = false
 
             cacheMutex.withLock {
                 for ((currency, sources) in buckets) {
                     for ((source, bucket) in sources) {
-                        // 갭 감지
                         val lastTs = getLastBucketTimestampUnsafe(currency, source)
                         if (lastTs != null) {
                             val gap = bucket.bucketTs - lastTs
-                            if (gap >= GraphConfig.GAP_THRESHOLD_SEC) {
+                            if (gap >= GraphConfig.gapThresholdSec(GraphPeriod.ONE_DAY)) {
                                 if (currency == _activeCurrency.value.code) {
-                                    // 활성 통화 → REST 복구 예약
-                                    currenciesToFetch.add(currency)
+                                    currenciesToFetch += currency
                                 } else {
-                                    // 비활성 통화 → 플래그 예약
-                                    currenciesToFlag.add(currency)
+                                    currenciesToFlag += currency
                                 }
                                 continue
                             }
                         }
 
-                        // 버킷 추가 (Mutex 내부에서 호출)
-                        updateGraphCacheUnsafe(bucket, currency, source)
+                        updateRealtimeGraphCacheUnsafe(bucket, currency, source)
                         didUpdate = true
                     }
                 }
@@ -278,92 +309,196 @@ class GraphViewModel @Inject constructor(
                 markGraphUpdated()
             }
 
-            // 갭 플래그 설정 (stateMutex 보호)
             if (currenciesToFlag.isNotEmpty()) {
                 stateMutex.withLock {
                     currenciesNeedingRefresh.addAll(currenciesToFlag)
                 }
             }
 
-            // REST 복구 실행
-            for (currency in currenciesToFetch) {
-                fetchFullGraphData(currency)
+            currenciesToFetch.forEach { currency ->
+                fetchRealtimeGraphData(currency, silent = true)
             }
         }
     }
 
-    /**
-     * 캐시 업데이트 (Mutex 내부에서 호출 - Unsafe)
-     */
-    private fun updateGraphCacheUnsafe(wsBucket: WebSocketGraphBucket, currency: String, source: String) {
-        val bucket = wsBucket.toGraphBucket()
+    private suspend fun loadRealtimeGraph(currency: String, forceRefresh: Boolean) {
+        val shouldSkip = cacheMutex.withLock {
+            val cached = graphCache[currency]
+            if (cached != null && cacheService.hasValidCache(cached)) {
+                val lastBucketTs = getLastBucketTimestampUnsafe(currency, GraphSource.INVESTING.code)
+                if (lastBucketTs != null) {
+                    val elapsed = System.currentTimeMillis() - (lastBucketTs * 1_000L)
+                    !forceRefresh && elapsed < GraphConfig.gapThresholdSec(GraphPeriod.ONE_DAY) * 1_000L
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        if (shouldSkip) return
 
+        if (!forceRefresh) {
+            val lastFetch = stateMutex.withLock {
+                lastFullFetchTimeMap[currency] ?: 0L
+            }
+            if (System.currentTimeMillis() - lastFetch < GraphConfig.FULL_FETCH_COOLDOWN_SEC * 1_000L) {
+                return
+            }
+        }
+
+        fetchRealtimeGraphData(currency, silent = false)
+    }
+
+    private suspend fun loadPeriodGraph(
+        currency: String,
+        period: GraphPeriod,
+        forceRefresh: Boolean
+    ) {
+        val cacheKey = periodCacheKey(period, currency)
+
+        if (!forceRefresh) {
+            val hasFreshMemoryCache = cacheMutex.withLock {
+                val freshnessMs = periodCacheFreshnessAt[cacheKey]
+                val cached = periodCache[period.code]?.get(currency)
+                cached != null &&
+                    freshnessMs != null &&
+                    (System.currentTimeMillis() - freshnessMs) < GraphConfig.cacheTtlMs(period)
+            }
+            if (hasFreshMemoryCache) {
+                _isLoading.value = false
+                return
+            }
+        }
+
+        val diskEntry = cacheService.loadPeriodGraphData(currency, period)
+        if (!forceRefresh && diskEntry != null) {
+            cacheMutex.withLock {
+                periodCache.getOrPut(period.code) { mutableMapOf() }[currency] = diskEntry.sources
+                periodCacheFreshnessAt[cacheKey] = diskEntry.freshnessDate.toEpochMilliseconds()
+            }
+            _isLoading.value = false
+            markGraphUpdated()
+            return
+        }
+
+        fetchPeriodGraphData(currency, period)
+    }
+
+    private fun updateRealtimeGraphCacheUnsafe(
+        wsBucket: WebSocketGraphBucket,
+        currency: String,
+        source: String
+    ) {
+        val bucket = wsBucket.toGraphBucket()
         val sourceMap = graphCache.getOrPut(currency) { mutableMapOf() }
         val buckets = sourceMap.getOrPut(source) { mutableListOf() }
 
-        // 중복 제거 후 추가
         buckets.removeAll { it.bucketTs == bucket.bucketTs }
         buckets.add(bucket)
-
-        // 정렬 및 개수 제한
         buckets.sortBy { it.bucketTs }
+
         while (buckets.size > GraphConfig.MAX_BUCKETS) {
             buckets.removeAt(0)
         }
     }
 
-    /**
-     * 마지막 버킷 타임스탬프 조회 (Mutex 내부에서 호출 - Unsafe)
-     */
     private fun getLastBucketTimestampUnsafe(currency: String, source: String): Int? {
         return graphCache[currency]?.get(source)?.maxByOrNull { it.bucketTs }?.bucketTs
     }
 
-    private suspend fun fetchFullGraphData(currency: String) {
-        // 중복 요청 방지 (stateMutex 보호)
+    private suspend fun fetchRealtimeGraphData(currency: String, silent: Boolean) {
+        val key = periodCacheKey(GraphPeriod.ONE_DAY, currency)
         val alreadyInFlight = stateMutex.withLock {
-            if (inFlightCurrencies.contains(currency)) {
+            if (key in inFlightKeys) {
                 true
             } else {
-                inFlightCurrencies.add(currency)
+                inFlightKeys += key
                 false
             }
         }
         if (alreadyInFlight) return
 
-        // MutableStateFlow는 thread-safe이므로 withContext(Main) 불필요
-        _isLoading.value = true
+        if (!silent) {
+            _isLoading.value = true
+        }
 
         try {
-            repository.getGraph(currency)
-                .onSuccess { sourceData ->
-                    // 메모리 캐시 업데이트 (cacheMutex 보호)
+            repository.getGraph(currency, GraphPeriod.ONE_DAY)
+                .onSuccess { result ->
                     cacheMutex.withLock {
-                        graphCache[currency] = sourceData.mapValues { it.value.toMutableList() }.toMutableMap()
+                        graphCache[currency] = result.sources
+                            .mapValues { (_, buckets) -> buckets.toMutableList() }
+                            .toMutableMap()
                     }
                     stateMutex.withLock {
                         lastFullFetchTimeMap[currency] = System.currentTimeMillis()
+                        currenciesNeedingRefresh.remove(currency)
                     }
 
-                    // 디스크 캐시 저장
-                    cacheService.saveGraphData(sourceData, currency)
+                    cacheService.saveGraphData(
+                        data = result.sources,
+                        currency = currency,
+                        period = GraphPeriod.ONE_DAY
+                    )
                     markGraphUpdated()
                 }
                 .onFailure { error ->
-                    val hasCache = cacheMutex.withLock {
-                        graphCache[currency]?.isNotEmpty() == true
-                    }
-                    val isActiveCurrency = currency == _activeCurrency.value.code
-                    Log.e(TAG, "fetchFullGraphData 실패: currency=$currency, " +
-                        "isActiveCurrency=$isActiveCurrency, hasCache=$hasCache, " +
-                        "error=${error.javaClass.simpleName}: ${error.message}")
+                    val hasCache = cacheMutex.withLock { graphCache[currency]?.isNotEmpty() == true }
+                    Log.e(
+                        TAG,
+                        "fetchRealtimeGraphData failed: currency=$currency, hasCache=$hasCache, error=${error.message}"
+                    )
                 }
         } finally {
-            val stillLoading = stateMutex.withLock {
-                inFlightCurrencies.remove(currency)
-                inFlightCurrencies.isNotEmpty()
+            stateMutex.withLock {
+                inFlightKeys.remove(key)
             }
-            _isLoading.value = stillLoading
+            _isLoading.value = false
+        }
+    }
+
+    private suspend fun fetchPeriodGraphData(currency: String, period: GraphPeriod) {
+        val key = periodCacheKey(period, currency)
+        val alreadyInFlight = stateMutex.withLock {
+            if (key in inFlightKeys) {
+                true
+            } else {
+                inFlightKeys += key
+                false
+            }
+        }
+        if (alreadyInFlight) return
+
+        _isLoading.value = true
+
+        try {
+            repository.getGraph(currency, period)
+                .onSuccess { result ->
+                    val freshnessDate = result.asOf ?: Clock.System.now()
+                    cacheMutex.withLock {
+                        periodCache.getOrPut(period.code) { mutableMapOf() }[currency] = result.sources
+                        periodCacheFreshnessAt[key] = freshnessDate.toEpochMilliseconds()
+                    }
+                    cacheService.savePeriodGraphData(
+                        data = result.sources,
+                        currency = currency,
+                        period = period,
+                        freshnessDate = freshnessDate
+                    )
+                    markGraphUpdated()
+                }
+                .onFailure { error ->
+                    Log.e(
+                        TAG,
+                        "fetchPeriodGraphData failed: currency=$currency, period=${period.code}, error=${error.message}"
+                    )
+                }
+        } finally {
+            stateMutex.withLock {
+                inFlightKeys.remove(key)
+            }
+            _isLoading.value = false
         }
     }
 
@@ -371,13 +506,24 @@ class GraphViewModel @Inject constructor(
         periodicRefreshJob?.cancel()
         periodicRefreshJob = viewModelScope.launch {
             while (isActive) {
-                delay(GraphConfig.REFRESH_INTERVAL_SEC * 1000L)
-                if (isActive) {
-                    // 활성 통화만 갭 체크
-                    loadGraph(_activeCurrency.value)
+                delay(GraphConfig.REFRESH_INTERVAL_SEC * 1_000L)
+                if (isActive && _activePeriod.value == GraphPeriod.ONE_DAY) {
+                    loadRealtimeGraph(_activeCurrency.value.code, forceRefresh = false)
                 }
             }
         }
+    }
+
+    private fun hasCachedDataUnsafe(currency: String, period: GraphPeriod): Boolean {
+        return if (period == GraphPeriod.ONE_DAY) {
+            graphCache[currency] != null
+        } else {
+            periodCache[period.code]?.get(currency) != null
+        }
+    }
+
+    private fun periodCacheKey(period: GraphPeriod, currency: String): String {
+        return "${period.code}:$currency"
     }
 
     private fun markGraphUpdated() {

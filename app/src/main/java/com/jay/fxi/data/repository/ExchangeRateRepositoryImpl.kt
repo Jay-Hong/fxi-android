@@ -1,8 +1,9 @@
 package com.jay.fxi.data.repository
 
 import com.jay.fxi.data.remote.FXiApiService
+import com.jay.fxi.domain.model.GraphDataResult
+import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.RatesResult
-import com.jay.fxi.domain.model.GraphBucket
 import com.jay.fxi.domain.model.SupportedCurrency
 import com.jay.fxi.domain.repository.ExchangeRateRepository
 import javax.inject.Inject
@@ -22,14 +23,23 @@ class ExchangeRateRepositoryImpl @Inject constructor(
         }
     }
 
-    override suspend fun getGraph(currency: SupportedCurrency): Result<Map<String, List<GraphBucket>>> {
-        return getGraph(currency.code)
+    override suspend fun getGraph(
+        currency: SupportedCurrency,
+        period: GraphPeriod
+    ): Result<GraphDataResult> {
+        return getGraph(currency.code, period)
     }
 
-    override suspend fun getGraph(currency: String): Result<Map<String, List<GraphBucket>>> {
+    override suspend fun getGraph(
+        currency: String,
+        period: GraphPeriod
+    ): Result<GraphDataResult> {
         return runCatching {
-            val response = apiService.getGraph(currency)
-            response.toGraphBuckets()
+            val response = apiService.getGraph(
+                currency = currency,
+                range = period.code.takeUnless { period == GraphPeriod.ONE_DAY }
+            )
+            response.toGraphDataResult()
         }
     }
 }

@@ -6,11 +6,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.TrendingUp
+import androidx.compose.material.icons.automirrored.filled.TrendingUp
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -27,32 +27,30 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.GraphBucket
+import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSource
 import com.jay.fxi.ui.theme.LocalRateLayoutMetrics
 import com.jay.fxi.ui.theme.RateLayoutMetrics
 import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.ui.theme.color
+import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
+import kotlin.math.log10
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.sqrt
 import kotlinx.datetime.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toInstant
 import kotlinx.datetime.toLocalDateTime
 
-/**
- * 환율 그래프 뷰 (Canvas 기반, iOS RateGraphView와 동일)
- *
- * - 24시간 환율 그래프
- * - 단일 소스: min~max 밴드 + close 라인
- * - 다중 소스: 각 소스별 close 라인
- * - 시간 기반 X축 (4시간 간격, 00시는 M/d)
- * - Y축 오른쪽, 소수점 1자리
- *
- * @param metrics 레이아웃 메트릭스 (phone/tablet 적응형)
- */
 @Composable
 fun RateGraphView(
-    graphData: Map<GraphSource, List<GraphBucket>>,
-    selectedSources: Set<GraphSource>,
+    rateGraphData: Map<GraphSource, List<GraphBucket>>,
+    dxyGraphData: List<GraphBucket>,
+    period: GraphPeriod,
     isLoading: Boolean,
     modifier: Modifier = Modifier,
     metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
@@ -62,44 +60,36 @@ fun RateGraphView(
         contentAlignment = Alignment.Center
     ) {
         when {
-            isLoading && graphData.isEmpty() -> {
+            isLoading && rateGraphData.isEmpty() && dxyGraphData.isEmpty() -> {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    CircularProgressIndicator(
-                        color = SecondaryText,
-                        strokeWidth = 2.dp
-                    )
-                    Text(
-                        text = "그래프 로딩 중...",
-                        color = SecondaryText,
-                        fontSize = 12.sp
-                    )
+                    CircularProgressIndicator(color = SecondaryText, strokeWidth = 2.dp)
+                    Text(text = "그래프 로딩 중...", color = SecondaryText, fontSize = 12.sp)
                 }
             }
-            graphData.isEmpty() || graphData.values.all { it.isEmpty() } -> {
+
+            rateGraphData.isEmpty() && dxyGraphData.isEmpty() -> {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Default.TrendingUp,
+                        imageVector = Icons.AutoMirrored.Filled.TrendingUp,
                         contentDescription = null,
                         tint = SecondaryText,
                         modifier = Modifier.height(28.dp)
                     )
-                    Text(
-                        text = "그래프 데이터가 없습니다",
-                        color = SecondaryText,
-                        fontSize = 12.sp
-                    )
+                    Text(text = "그래프 데이터가 없습니다", color = SecondaryText, fontSize = 12.sp)
                 }
             }
+
             else -> {
                 RateGraphCanvas(
-                    graphData = graphData,
-                    selectedSources = selectedSources,
+                    rateGraphData = rateGraphData,
+                    dxyGraphData = dxyGraphData,
+                    period = period,
                     verticalPadding = metrics.graphVerticalPadding,
                     modifier = Modifier.fillMaxSize()
                 )
@@ -107,8 +97,6 @@ fun RateGraphView(
         }
     }
 }
-
-// ============ Data classes for pre-computed chart data ============
 
 private data class ChartLayout(
     val chartLeft: Float,
@@ -120,23 +108,35 @@ private data class ChartLayout(
     val yMin: Double,
     val yMax: Double
 ) {
-    val chartWidth: Float get() = chartRight - chartLeft
-    val chartHeight: Float get() = chartBottom - chartTop
-
     fun mapX(ts: Int): Float {
         if (xMax == xMin) return chartLeft
-        return chartLeft + (ts - xMin).toFloat() / (xMax - xMin) * chartWidth
+        return chartLeft + (ts - xMin).toFloat() / (xMax - xMin) * (chartRight - chartLeft)
     }
 
     fun mapY(value: Double): Float {
-        if (yMax == yMin) return chartTop + chartHeight / 2
-        return chartBottom - ((value - yMin) / (yMax - yMin) * chartHeight).toFloat()
+        if (yMax == yMin) return chartTop + (chartBottom - chartTop) / 2f
+        return chartBottom - ((value - yMin) / (yMax - yMin) * (chartBottom - chartTop)).toFloat()
     }
 }
 
+private data class ChartState(
+    val xMin: Int,
+    val xMax: Int,
+    val yMin: Double,
+    val yMax: Double,
+    val rateRangeMin: Double,
+    val rateRangeMax: Double,
+    val lastDataTs: Int,
+    val hasDxy: Boolean,
+    val dxyMin: Double?,
+    val dxyMax: Double?,
+    val isDxyFlat: Boolean,
+    val flatDxyValue: Double?
+)
+
 private data class XTick(
     val ts: Int,
-    val label: String?,  // null = grid only, no label
+    val label: String?,
     val showLabel: Boolean,
     val isMidnight: Boolean = false
 )
@@ -146,273 +146,347 @@ private data class YTick(
     val label: String
 )
 
-private data class SourcePaths(
-    val source: GraphSource,
-    val closePath: Path,
-    val bandPath: Path?  // non-null only for single source
+private data class DxyLabel(
+    val value: Double,
+    val label: String
 )
 
-// ============ Canvas composable ============
+private data class SourcePath(
+    val source: GraphSource,
+    val path: Path,
+    val bandPath: Path? = null
+)
 
 @Composable
 private fun RateGraphCanvas(
-    graphData: Map<GraphSource, List<GraphBucket>>,
-    selectedSources: Set<GraphSource>,
+    rateGraphData: Map<GraphSource, List<GraphBucket>>,
+    dxyGraphData: List<GraphBucket>,
+    period: GraphPeriod,
     verticalPadding: androidx.compose.ui.unit.Dp,
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
     val textMeasurer = rememberTextMeasurer()
-
     val labelStyle = remember {
-        TextStyle(
-            fontSize = 11.sp,
-            color = SecondaryText,
-            fontFeatureSettings = "tnum"
-        )
+        TextStyle(fontSize = 11.sp, color = SecondaryText, fontFeatureSettings = "tnum")
+    }
+    val dxyLabelStyle = remember {
+        TextStyle(fontSize = 10.sp, color = GraphSource.DXY.color.copy(alpha = 0.85f), fontFeatureSettings = "tnum")
     }
 
-    // Padding in px
-    val leftPad = with(density) { 8.dp.toPx() }
-    val rightPad = with(density) { 40.dp.toPx() }
-    val bottomPad = with(density) { 16.dp.toPx() }
-    val innerPad = with(density) { verticalPadding.toPx() }  // inner plot padding top+bottom
-    val gridStroke = with(density) { 0.5.dp.toPx() }
-    val lineStroke = with(density) { 1.5.dp.toPx() }
-    val yLabelGap = with(density) { 4.dp.toPx() }
-    val xLabelGap = with(density) { 1.dp.toPx() }
-
-    val gridColor = SecondaryText.copy(alpha = 0.3f)
-    val midnightGridColor = SecondaryText.copy(alpha = 0.4f)
-
-    // Pre-compute all chart data
-    val chartState = remember(graphData, selectedSources) {
-        computeChartState(graphData, selectedSources)
-    }
-
-    if (chartState == null) return
+    val chartState = remember(rateGraphData, dxyGraphData, period) {
+        computeChartState(rateGraphData, dxyGraphData, period)
+    } ?: return
 
     Canvas(modifier = modifier) {
-        val canvasWidth = size.width
-        val canvasHeight = size.height
+        val leftPad = with(density) { if (chartState.hasDxy) 34.dp.toPx() else 8.dp.toPx() }
+        val rightPad = with(density) { 40.dp.toPx() }
+        val bottomPad = with(density) { 16.dp.toPx() }
+        val innerPad = with(density) { verticalPadding.toPx() }
+        val gridStroke = with(density) { 0.5.dp.toPx() }
+        val yLabelGap = with(density) { 4.dp.toPx() }
 
-        // Layout
         val layout = ChartLayout(
             chartLeft = leftPad,
             chartTop = innerPad,
-            chartRight = canvasWidth - rightPad,
-            chartBottom = canvasHeight - bottomPad - innerPad,
+            chartRight = size.width - rightPad,
+            chartBottom = size.height - bottomPad - innerPad,
             xMin = chartState.xMin,
             xMax = chartState.xMax,
             yMin = chartState.yMin,
             yMax = chartState.yMax
         )
 
-        // Compute ticks
-        val xTicks = computeXTicks(layout.xMin, layout.xMax, chartState.lastDataTs)
+        val xTicks = computeXTicks(period, layout.xMin, layout.xMax, chartState.lastDataTs)
         val yTicks = computeYTicks(layout.yMin, layout.yMax)
+        val sourcePaths = computeRatePaths(rateGraphData, layout, period, chartState.hasDxy)
+        val dxyPath = if (chartState.hasDxy && chartState.dxyMin != null && chartState.dxyMax != null) {
+            computeDxyPath(dxyGraphData, layout, chartState.rateRangeMin, chartState.rateRangeMax, chartState.dxyMin, chartState.dxyMax)
+        } else {
+            null
+        }
 
-        // Compute paths
-        val sourcePaths = computeSourcePaths(
-            graphData, selectedSources, layout, selectedSources.size == 1
-        )
+        val gridColor = SecondaryText.copy(alpha = 0.3f)
+        val midnightGridColor = SecondaryText.copy(alpha = 0.4f)
 
-        // === Render ===
-
-        // 1. Grid lines (can extend to label area, draw before clip)
-        // Horizontal grid + Y labels (skip min/max ticks to avoid extra axis lines)
         val yTickEpsilon = (layout.yMax - layout.yMin) * 1e-9
         for (tick in yTicks) {
             if (tick.value <= layout.yMin + yTickEpsilon) continue
             if (tick.value >= layout.yMax - yTickEpsilon) continue
             val y = layout.mapY(tick.value)
-            // Grid line
             drawLine(
                 color = gridColor,
                 start = Offset(layout.chartLeft, y),
                 end = Offset(layout.chartRight, y),
                 strokeWidth = gridStroke
             )
-            // Y label (right of chart)
             val textResult = textMeasurer.measure(tick.label, labelStyle)
             drawText(
                 textLayoutResult = textResult,
-                topLeft = Offset(
-                    layout.chartRight + yLabelGap,
-                    y - textResult.size.height / 2f
-                )
+                topLeft = Offset(layout.chartRight + yLabelGap, y - textResult.size.height / 2f)
             )
         }
 
-        // Vertical grid + X labels
         for (tick in xTicks) {
             val x = layout.mapX(tick.ts)
-            // Grid line (always, thicker for midnight/date boundary)
+            if (x < layout.chartLeft || x > layout.chartRight) continue
             drawLine(
                 color = if (tick.isMidnight) midnightGridColor else gridColor,
                 start = Offset(x, layout.chartTop),
                 end = Offset(x, layout.chartBottom),
                 strokeWidth = if (tick.isMidnight) gridStroke * 2f else gridStroke
             )
-            // X label (below chart, only if showLabel)
             if (tick.showLabel && tick.label != null) {
                 val textResult = textMeasurer.measure(tick.label, labelStyle)
                 drawText(
                     textLayoutResult = textResult,
-                    topLeft = Offset(
-                        x - textResult.size.width / 2f,
-                        layout.chartBottom + innerPad + xLabelGap
-                    )
+                    topLeft = Offset(x - textResult.size.width / 2f, layout.chartBottom + innerPad + with(density) { 1.dp.toPx() })
                 )
             }
         }
 
-        // 2. Clip to chart area for band + lines
+        if (chartState.hasDxy && chartState.dxyMin != null && chartState.dxyMax != null) {
+            if (chartState.isDxyFlat && chartState.flatDxyValue != null) {
+                val y = layout.mapY(
+                    normalizeDxyValue(
+                        chartState.flatDxyValue,
+                        chartState.rateRangeMin,
+                        chartState.rateRangeMax,
+                        chartState.dxyMin,
+                        chartState.dxyMax
+                    )
+                )
+                val textResult = textMeasurer.measure(formatDxyValue(chartState.flatDxyValue), dxyLabelStyle)
+                drawText(
+                    textLayoutResult = textResult,
+                    topLeft = Offset(0f, y - textResult.size.height / 2f)
+                )
+            } else {
+                for (label in generateDxyLabels(chartState.dxyMin, chartState.dxyMax)) {
+                    val normalized = normalizeDxyValue(
+                        label.value,
+                        chartState.rateRangeMin,
+                        chartState.rateRangeMax,
+                        chartState.dxyMin,
+                        chartState.dxyMax
+                    )
+                    val y = layout.mapY(normalized)
+                    val textResult = textMeasurer.measure(label.label, dxyLabelStyle)
+                    drawText(
+                        textLayoutResult = textResult,
+                        topLeft = Offset(0f, y - textResult.size.height / 2f)
+                    )
+                }
+            }
+        }
+
         clipRect(
             left = layout.chartLeft,
             top = layout.chartTop,
             right = layout.chartRight,
             bottom = layout.chartBottom
         ) {
-            // 3. Band (single source)
-            for (sp in sourcePaths) {
-                if (sp.bandPath != null) {
-                    drawPath(
-                        path = sp.bandPath,
-                        color = sp.source.color.copy(alpha = 0.35f)
-                    )
+            sourcePaths.forEach { sourcePath ->
+                sourcePath.bandPath?.let { band ->
+                    drawPath(path = band, color = sourcePath.source.color.copy(alpha = 0.35f))
                 }
             }
 
-            // 4. Close lines
-            for (sp in sourcePaths) {
+            sourcePaths.forEach { sourcePath ->
                 drawPath(
-                    path = sp.closePath,
-                    color = sp.source.color,
-                    style = Stroke(width = lineStroke, cap = StrokeCap.Round)
+                    path = sourcePath.path,
+                    color = sourcePath.source.color,
+                    style = Stroke(
+                        width = if (sourcePath.source == GraphSource.INVESTING || sourcePath.source == GraphSource.REFERENCE) 1.3.dp.toPx() else 1.dp.toPx(),
+                        cap = StrokeCap.Round
+                    )
+                )
+            }
+
+            if (dxyPath != null) {
+                drawPath(
+                    path = dxyPath,
+                    color = GraphSource.DXY.color.copy(alpha = 0.75f),
+                    style = Stroke(width = 1.dp.toPx(), cap = StrokeCap.Round)
                 )
             }
         }
     }
 }
 
-// ============ Data computation (pure functions) ============
-
-private data class ChartState(
-    val xMin: Int,
-    val xMax: Int,
-    val yMin: Double,
-    val yMax: Double,
-    val lastDataTs: Int
-)
-
 private fun computeChartState(
-    graphData: Map<GraphSource, List<GraphBucket>>,
-    selectedSources: Set<GraphSource>
+    rateGraphData: Map<GraphSource, List<GraphBucket>>,
+    dxyGraphData: List<GraphBucket>,
+    period: GraphPeriod
 ): ChartState? {
-    val allBuckets = selectedSources.flatMap { source ->
-        graphData[source] ?: emptyList()
-    }
+    val rateBuckets = rateGraphData.values.flatten()
+    val allBuckets = if (rateBuckets.isNotEmpty()) rateBuckets + dxyGraphData else dxyGraphData
     if (allBuckets.isEmpty()) return null
 
     val allTs = allBuckets.map { it.bucketTs }
     val xMin = allTs.min()
     val lastDataTs = allTs.max()
-    val xMax = lastDataTs + 1800  // 30-minute trailing buffer
+    val xMax = lastDataTs + trailingBufferSec(period)
 
-    // Y domain: close values only (iOS yAxisRange)
-    val allCloses = allBuckets.map { it.close }
-    val minClose = allCloses.min()
-    val maxClose = allCloses.max()
-    val range = maxClose - minClose
-    val margin5pct = range * 0.05
-    val rangeMin = minClose - margin5pct
-    val rangeMax = maxClose + margin5pct
-    val yMin = rangeMin - 0.8
-    val yMax = rangeMax + 0.8
+    val rateCloses = rateBuckets.map { it.close }
+    val fallbackCloses = dxyGraphData.map { it.close }
+    val targetCloses = if (rateCloses.isNotEmpty()) rateCloses else fallbackCloses
+    val minClose = targetCloses.min()
+    val maxClose = targetCloses.max()
+    val margin = (maxClose - minClose) * 0.05
+    val paddedMin = minClose - margin
+    val paddedMax = maxClose + margin
+    val yDomainMargin = 0.8
 
-    return ChartState(xMin, xMax, yMin, yMax, lastDataTs)
+    val hasDxy = dxyGraphData.isNotEmpty()
+    val dxyCloses = dxyGraphData.map { it.close }
+    val rawDxyMin = dxyCloses.minOrNull()
+    val rawDxyMax = dxyCloses.maxOrNull()
+    val dxyMargin = if (rawDxyMin != null && rawDxyMax != null) (rawDxyMax - rawDxyMin) * 0.05 else 0.0
+    val dxyMin = rawDxyMin?.let { it - dxyMargin }
+    val dxyMax = rawDxyMax?.let { it + dxyMargin }
+    val flatValue = dxyCloses.firstOrNull()?.let { first ->
+        val roundedFirst = (first * 100).roundToNearestStep(1.0) / 100.0
+        if (dxyCloses.all { abs(((it * 100).roundToNearestStep(1.0) / 100.0) - roundedFirst) < 0.0001 }) {
+            roundedFirst
+        } else {
+            null
+        }
+    }
+
+    return ChartState(
+        xMin = xMin,
+        xMax = xMax,
+        yMin = paddedMin - yDomainMargin,
+        yMax = paddedMax + yDomainMargin,
+        rateRangeMin = paddedMin,
+        rateRangeMax = paddedMax,
+        lastDataTs = lastDataTs,
+        hasDxy = hasDxy,
+        dxyMin = dxyMin,
+        dxyMax = dxyMax,
+        isDxyFlat = flatValue != null,
+        flatDxyValue = flatValue
+    )
 }
 
-private fun computeXTicks(xMin: Int, xMax: Int, lastDataTs: Int): List<XTick> {
+private fun computeXTicks(
+    period: GraphPeriod,
+    xMin: Int,
+    xMax: Int,
+    lastDataTs: Int
+): List<XTick> {
     val kst = TimeZone.of("Asia/Seoul")
-    val ticks = mutableListOf<XTick>()
-
-    // Find first 3-hour tick >= xMin
-    val startDt = Instant.fromEpochSeconds(xMin.toLong()).toLocalDateTime(kst)
-    val hourAligned = (startDt.hour / 3) * 3
-    // Build first tick datetime
-    val tickDt = kotlinx.datetime.LocalDateTime(
-        startDt.year, startDt.monthNumber, startDt.dayOfMonth,
-        hourAligned, 0, 0
-    )
-    val tickInstant = tickDt.toInstant(kst)
-    var tickTs = tickInstant.epochSeconds.toInt()
-
-    // If tickTs < xMin, advance to next 3-hour mark
-    if (tickTs < xMin) {
-        tickTs += 3 * 3600
-    }
-
-    while (tickTs <= xMax) {
-        val dt = Instant.fromEpochSeconds(tickTs.toLong()).toLocalDateTime(kst)
-        val label = if (dt.hour == 0) {
-            "${dt.monthNumber}/${dt.dayOfMonth}"
-        } else {
-            "%02d".format(dt.hour)
+    return when (period) {
+        GraphPeriod.ONE_DAY -> {
+            val ticks = mutableListOf<XTick>()
+            val startDt = Instant.fromEpochSeconds(xMin.toLong()).toLocalDateTime(kst)
+            val hourAligned = (startDt.hour / 3) * 3
+            val tickDt = kotlinx.datetime.LocalDateTime(
+                startDt.year, startDt.monthNumber, startDt.dayOfMonth, hourAligned, 0, 0
+            )
+            var tickTs = tickDt.toInstant(kst).epochSeconds.toInt()
+            if (tickTs < xMin) tickTs += 3 * 3600
+            while (tickTs <= xMax) {
+                val dt = Instant.fromEpochSeconds(tickTs.toLong()).toLocalDateTime(kst)
+                ticks += XTick(
+                    ts = tickTs,
+                    label = if (dt.hour == 0) "${dt.monthNumber}/${dt.dayOfMonth}" else "%02d".format(dt.hour),
+                    showLabel = tickTs <= lastDataTs && (lastDataTs - tickTs) >= 600,
+                    isMidnight = dt.hour == 0
+                )
+                tickTs += 3 * 3600
+            }
+            ticks
         }
 
-        // Label visibility rules (iOS shouldDisplayXAxisLabel)
-        val showLabel = tickTs <= lastDataTs && (lastDataTs - tickTs) >= 600
-
-        ticks.add(XTick(ts = tickTs, label = label, showLabel = showLabel, isMidnight = dt.hour == 0))
-        tickTs += 3 * 3600
+        GraphPeriod.ONE_WEEK -> generateDayTicks(xMin, xMax, lastDataTs, 1)
+        GraphPeriod.THREE_MONTHS -> generateDayTicks(xMin, xMax, lastDataTs, 14)
+        GraphPeriod.ONE_YEAR -> generateMonthTicks(xMin, xMax, lastDataTs)
     }
+}
 
+private fun generateDayTicks(
+    xMin: Int,
+    xMax: Int,
+    lastDataTs: Int,
+    intervalDays: Int
+): List<XTick> {
+    val kst = TimeZone.of("Asia/Seoul")
+    val ticks = mutableListOf<XTick>()
+    val startDt = Instant.fromEpochSeconds(xMin.toLong()).toLocalDateTime(kst)
+    val startOfDay = kotlinx.datetime.LocalDateTime(
+        startDt.year, startDt.monthNumber, startDt.dayOfMonth, 0, 0, 0
+    ).toInstant(kst)
+    var tickTs = startOfDay.epochSeconds.toInt()
+    while (tickTs <= xMax) {
+        val dt = Instant.fromEpochSeconds(tickTs.toLong()).toLocalDateTime(kst)
+        val isFirstTick = tickTs == startOfDay.epochSeconds.toInt()
+        ticks += XTick(
+            ts = tickTs,
+            label = "${dt.monthNumber}/${dt.dayOfMonth}",
+            showLabel = !isFirstTick && tickTs <= lastDataTs &&
+                (lastDataTs - tickTs) >= if (intervalDays == 1) 6 * 3600 else 3 * 86_400,
+            isMidnight = true
+        )
+        tickTs += intervalDays * 86_400
+    }
     return ticks
 }
 
-private fun computeYTicks(
-    yMin: Double,
-    yMax: Double
-): List<YTick> {
-    if (yMax <= yMin) {
-        return listOf(YTick(value = yMin, label = "%.1f".format(yMin)))
+private fun generateMonthTicks(
+    xMin: Int,
+    xMax: Int,
+    lastDataTs: Int
+): List<XTick> {
+    val kst = TimeZone.of("Asia/Seoul")
+    val ticks = mutableListOf<XTick>()
+    val startDt = Instant.fromEpochSeconds(xMin.toLong()).toLocalDateTime(kst)
+    val alignedMonth = if (startDt.monthNumber % 2 == 0) startDt.monthNumber else max(1, startDt.monthNumber - 1)
+    var current = kotlinx.datetime.LocalDateTime(startDt.year, alignedMonth, 1, 0, 0, 0).toInstant(kst)
+    val firstTs = current.epochSeconds.toInt()
+    while (current.epochSeconds.toInt() <= xMax) {
+        val dt = current.toLocalDateTime(kst)
+        val tickTs = current.epochSeconds.toInt()
+        ticks += XTick(
+            ts = tickTs,
+            label = "${dt.monthNumber}월",
+            showLabel = tickTs != firstTs && tickTs <= lastDataTs && (lastDataTs - tickTs) >= 10 * 86_400,
+            isMidnight = true
+        )
+        val nextMonth = dt.monthNumber + 2
+        val nextYear = dt.year + (nextMonth - 1) / 12
+        val normalizedMonth = ((nextMonth - 1) % 12) + 1
+        current = kotlinx.datetime.LocalDateTime(nextYear, normalizedMonth, 1, 0, 0, 0).toInstant(kst)
     }
+    return ticks
+}
 
-    // iOS는 AxisMarks(values:)를 지정하지 않고 Swift Charts의 자동 tick을 사용한다.
-    // Swift Charts 내부 구현은 비공개지만, 현재 iOS 출력 패턴(폰/태블릿 동일, 3~4개 중심, 1/2/5/10 nice step)에
-    // 맞추기 위해 Android는 "height 기반 tick 밀도"를 제거하고 작은 고정 count 힌트를 사용한다.
+private fun computeYTicks(yMin: Double, yMax: Double): List<YTick> {
+    if (yMax <= yMin) return listOf(YTick(yMin, "%.1f".format(yMin)))
+
     val desiredCountHint = 4
     val span = yMax - yMin
-    val rawStep = span / desiredCountHint.toDouble()
+    val rawStep = span / desiredCountHint
     var step = d3LikeNiceStep(rawStep)
-
-    // Our renderer intentionally skips the boundary ticks (min/max) to avoid extra axis lines.
-    // So we must cap the number of *interior* labels, not total tick count.
     val maxInteriorTickCount = 5
     var interiorTickCount = interiorTickCountForNiceStep(yMin, yMax, step)
     while (interiorTickCount > maxInteriorTickCount) {
         step = next12510Step(step)
         interiorTickCount = interiorTickCountForNiceStep(yMin, yMax, step)
     }
-
     return buildYTicks(yMin, yMax, step)
 }
 
 private fun buildYTicks(yMin: Double, yMax: Double, step: Double): List<YTick> {
-    if (step <= 0.0) {
-        return listOf(YTick(value = yMin, label = "%.1f".format(yMin)))
-    }
-
-    // Using integer indices avoids accumulating floating point error by repeatedly adding step.
-    val startIndex = kotlin.math.floor(yMin / step).toLong()
-    val endIndex = kotlin.math.ceil(yMax / step).toLong()
+    if (step <= 0.0) return listOf(YTick(yMin, "%.1f".format(yMin)))
+    val startIndex = floor(yMin / step).toLong()
+    val endIndex = ceil(yMax / step).toLong()
     val ticks = mutableListOf<YTick>()
     var i = startIndex
     while (i <= endIndex) {
         val value = i.toDouble() * step
-        ticks.add(YTick(value = value, label = "%.1f".format(value)))
+        ticks += YTick(value, "%.1f".format(value))
         i += 1
     }
     return ticks
@@ -422,8 +496,8 @@ private fun interiorTickCountForNiceStep(yMin: Double, yMax: Double, step: Doubl
     if (step <= 0.0 || yMax <= yMin) return 0
     val span = yMax - yMin
     val eps = span * 1e-9
-    val startIndex = kotlin.math.floor(yMin / step).toLong()
-    val endIndex = kotlin.math.ceil(yMax / step).toLong()
+    val startIndex = floor(yMin / step).toLong()
+    val endIndex = ceil(yMax / step).toLong()
     var count = 0
     var i = startIndex
     while (i <= endIndex) {
@@ -434,86 +508,148 @@ private fun interiorTickCountForNiceStep(yMin: Double, yMax: Double, step: Doubl
     return count
 }
 
+private fun d3LikeNiceStep(rawStep: Double): Double {
+    if (rawStep <= 0.0) return 1.0
+    val exponent = floor(log10(rawStep))
+    val scale = 10.0.pow(exponent)
+    val error = rawStep / scale
+    val base = when {
+        error >= sqrt(50.0) -> 10.0
+        error >= sqrt(10.0) -> 5.0
+        error >= sqrt(2.0) -> 2.0
+        else -> 1.0
+    }
+    return base * scale
+}
+
 private fun next12510Step(step: Double): Double {
     if (step <= 0.0) return 1.0
-    val exponent = kotlin.math.floor(kotlin.math.log10(step))
+    val exponent = floor(log10(step))
     val scale = 10.0.pow(exponent)
     val base = step / scale
-
     val nextBase = when {
         base <= 1.0 -> 2.0
         base <= 2.0 -> 5.0
         base <= 5.0 -> 10.0
         else -> 10.0
     }
-
     return nextBase * scale
 }
 
-/**
- * Standard "nice numbers" step selection similar to d3-array tickStep().
- *
- * This does NOT claim Swift Charts uses d3. We use it because it matches the current iOS output:
- * step ∈ {1,2,5,10} × 10^n chosen by geometric-mean thresholds.
- */
-private fun d3LikeNiceStep(rawStep: Double): Double {
-    if (rawStep <= 0.0) return 1.0
-    val exponent = kotlin.math.floor(kotlin.math.log10(rawStep))
-    val scale = 10.0.pow(exponent)
-    val error = rawStep / scale
-
-    val sqrt2 = kotlin.math.sqrt(2.0)
-    val sqrt10 = kotlin.math.sqrt(10.0)
-    val sqrt50 = kotlin.math.sqrt(50.0)
-
-    val base = when {
-        error >= sqrt50 -> 10.0
-        error >= sqrt10 -> 5.0
-        error >= sqrt2 -> 2.0
-        else -> 1.0
-    }
-
-    return base * scale
-}
-
-private fun computeSourcePaths(
-    graphData: Map<GraphSource, List<GraphBucket>>,
-    selectedSources: Set<GraphSource>,
+private fun computeRatePaths(
+    rateGraphData: Map<GraphSource, List<GraphBucket>>,
     layout: ChartLayout,
-    isSingleSource: Boolean
-): List<SourcePaths> {
-    return selectedSources.sortedBy { it.ordinal }.mapNotNull { source ->
-        val buckets = graphData[source]?.sortedBy { it.bucketTs } ?: return@mapNotNull null
+    period: GraphPeriod,
+    hasDxy: Boolean
+): List<SourcePath> {
+    val isSingleSource = period == GraphPeriod.ONE_DAY && rateGraphData.size == 1 && !hasDxy
+    return rateGraphData.keys.sortedBy { it.ordinal }.mapNotNull { source ->
+        val buckets = rateGraphData[source]?.sortedBy { it.bucketTs } ?: return@mapNotNull null
         if (buckets.isEmpty()) return@mapNotNull null
 
-        // Close line path
-        val closePath = Path().apply {
-            buckets.forEachIndexed { i, bucket ->
+        val path = Path().apply {
+            buckets.forEachIndexed { index, bucket ->
                 val x = layout.mapX(bucket.bucketTs)
                 val y = layout.mapY(bucket.close)
-                if (i == 0) moveTo(x, y) else lineTo(x, y)
+                if (index == 0) moveTo(x, y) else lineTo(x, y)
             }
         }
 
-        // Band path (single source only)
         val bandPath = if (isSingleSource) {
             Path().apply {
-                // Max line: left to right
-                buckets.forEachIndexed { i, bucket ->
+                buckets.forEachIndexed { index, bucket ->
                     val x = layout.mapX(bucket.bucketTs)
                     val y = layout.mapY(bucket.max)
-                    if (i == 0) moveTo(x, y) else lineTo(x, y)
+                    if (index == 0) moveTo(x, y) else lineTo(x, y)
                 }
-                // Min line: right to left
-                buckets.reversed().forEach { bucket ->
+                buckets.asReversed().forEach { bucket ->
                     val x = layout.mapX(bucket.bucketTs)
                     val y = layout.mapY(bucket.min)
                     lineTo(x, y)
                 }
                 close()
             }
-        } else null
-
-        SourcePaths(source = source, closePath = closePath, bandPath = bandPath)
+        } else {
+            null
+        }
+        SourcePath(source = source, path = path, bandPath = bandPath)
     }
 }
+
+private fun computeDxyPath(
+    dxyBuckets: List<GraphBucket>,
+    layout: ChartLayout,
+    rateRangeMin: Double,
+    rateRangeMax: Double,
+    dxyMin: Double,
+    dxyMax: Double
+): Path? {
+    val sorted = dxyBuckets.sortedBy { it.bucketTs }
+    if (sorted.isEmpty()) return null
+
+    return Path().apply {
+        sorted.forEachIndexed { index, bucket ->
+            val x = layout.mapX(bucket.bucketTs)
+            val normalized = normalizeDxyValue(bucket.close, rateRangeMin, rateRangeMax, dxyMin, dxyMax)
+            val y = layout.mapY(normalized)
+            if (index == 0) moveTo(x, y) else lineTo(x, y)
+        }
+    }
+}
+
+private fun normalizeDxyValue(
+    dxyValue: Double,
+    rateMin: Double,
+    rateMax: Double,
+    dxyMin: Double,
+    dxyMax: Double
+): Double {
+    val dxySpan = dxyMax - dxyMin
+    val rateSpan = rateMax - rateMin
+    if (dxySpan <= 0.0 || rateSpan <= 0.0) return rateMin
+    return rateMin + (dxyValue - dxyMin) / dxySpan * rateSpan
+}
+
+private fun generateDxyLabels(dxyMin: Double, dxyMax: Double): List<DxyLabel> {
+    val span = dxyMax - dxyMin
+    if (span <= 0.0) return emptyList()
+    val rawStep = span / 4.0
+    val step = when {
+        rawStep < 0.08 -> 0.05
+        rawStep < 0.15 -> 0.1
+        rawStep < 0.35 -> 0.2
+        rawStep < 0.75 -> 0.5
+        rawStep < 1.5 -> 1.0
+        else -> 2.0
+    }
+    val format = if (step < 0.1) "%.2f" else "%.1f"
+    val inset = span * 0.05
+    val start = ceil((dxyMin + inset) / step) * step
+    val end = floor((dxyMax - inset) / step) * step
+    val labels = mutableListOf<DxyLabel>()
+    var value = start
+    var previous: String? = null
+    while (value <= end + step * 0.01) {
+        val normalized = (value / step).roundToNearestStep(1.0) * step
+        val text = String.format(format, normalized)
+        if (text != previous) {
+            labels += DxyLabel(normalized, text)
+            previous = text
+        }
+        value += step
+    }
+    return labels
+}
+
+private fun formatDxyValue(value: Double): String {
+    return if (abs(value % 0.1) > 0.001) "%.2f".format(value) else "%.1f".format(value)
+}
+
+private fun trailingBufferSec(period: GraphPeriod): Int = when (period) {
+    GraphPeriod.ONE_DAY -> 2_400
+    GraphPeriod.ONE_WEEK -> 3_600
+    GraphPeriod.THREE_MONTHS -> 86_400
+    GraphPeriod.ONE_YEAR -> 86_400 * 3
+}
+
+private fun Double.roundToNearestStep(step: Double): Double = if (step == 0.0) this else kotlin.math.round(this / step) * step

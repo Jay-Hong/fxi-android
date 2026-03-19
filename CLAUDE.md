@@ -2,7 +2,7 @@
 
 > **목적**: Android 앱 구현 가이드 (iOS MVP 기반)
 > **Phase**: 1 - Android App 개발
-> **최종 수정**: 2026-01-26
+> **최종 수정**: 2026-03-19
 
 ---
 
@@ -16,12 +16,13 @@
 ### 핵심 기능
 
 1. **실시간 환율 비교**: WebSocket으로 10초마다 업데이트
-2. **24시간 그래프**: 통화별 환율 추이 시각화
-3. **은행별 비교 바 차트**: 기준 환율 대비 차이 표시
-4. **오프라인 지원**: 캐시된 데이터로 오프라인 동작
-5. **환율 알림**: 목표 환율 도달 시 푸시 알림 (1-shot 알림, 최대 30개)
-6. **소셜 로그인**: Google Sign-In + Apple Sign-In (Firebase Auth OAuth, 웹 플로우)
-7. **프리미엄 구독**: RevenueCat 연동 (월간/연간, 무료 체험 지원)
+2. **기간별 그래프**: 1일/1주/3달/1년 환율 추이 시각화
+3. **USD/KRW 달러지수(DXY) 그래프**: 달러 탭에서 환율과 함께 제공
+4. **은행별 비교 바 차트**: 순서/표시 커스터마이징, 동적 기준 환율 지원
+5. **오프라인 지원**: 캐시된 데이터로 오프라인 동작
+6. **환율 알림**: 목표 환율 도달 시 푸시 알림 (1-shot 알림, 최대 30개)
+7. **소셜 로그인**: Google Sign-In + Apple Sign-In (Firebase Auth OAuth, 웹 플로우)
+8. **프리미엄 구독**: RevenueCat 연동 (월간/연간, 무료 체험 지원)
 
 > **Apple Sign-In**: Android에는 Apple 공식 SDK가 없어 **OAuth 웹 플로우**로 지원 예정.
 > Firebase Auth의 `OAuthProvider("apple.com")`을 사용하면 Android에서도 Apple 로그인 연동 가능.
@@ -42,7 +43,7 @@
 | **네트워크** | Retrofit + OkHttp | WebSocket 포함 |
 | **직렬화** | Kotlinx Serialization | |
 | **로컬 저장** | DataStore + File | |
-| **차트** | Vico | Compose 네이티브, 최신 |
+| **차트** | Compose Canvas | 기간별 축 포맷, DXY 오버레이, Live Tail 지원 |
 
 ### Firebase & 외부 서비스
 
@@ -70,7 +71,7 @@
 | @Environment DI | Hilt @Inject |
 | async/await | suspend + Coroutines |
 | Combine | Flow / StateFlow |
-| Swift Charts | Vico |
+| Swift Charts | Compose Canvas |
 | URLSession WebSocket | OkHttp WebSocketListener |
 | UserDefaults | DataStore Preferences |
 | FileManager | Context.filesDir |
@@ -89,8 +90,8 @@
 ├─────────────────────────────────────────────┤
 │                                             │
 │  ┌─────────────────────────────────────┐   │
-│  │      24시간 환율 그래프              │   │
-│  │      (Vico - 소스 토글)              │   │
+│  │  기간별 환율 그래프 + DXY(USD)       │   │
+│  │  (1일/1주/3달/1년, 소스 토글)        │   │
 │  └─────────────────────────────────────┘   │
 │                                             │
 │  ┌─────────────────────────────────────┐   │
@@ -118,83 +119,108 @@ app/
 │   │   ├── MainActivity.kt             # Single Activity
 │   │   │
 │   │   ├── data/
-│   │   │   ├── api/
+│   │   │   ├── local/
+│   │   │   │   ├── BankPreferenceManager.kt  # 은행 순서/표시 설정 (DataStore)
+│   │   │   │   └── CacheService.kt           # 기간별 그래프 캐시 (versioned JSON)
+│   │   │   │
+│   │   │   ├── network/
+│   │   │   │   └── NetworkMonitor.kt
+│   │   │   │
+│   │   │   ├── remote/
 │   │   │   │   ├── FXiApiService.kt    # Retrofit REST API
 │   │   │   │   ├── WebSocketService.kt # OkHttp WebSocket
 │   │   │   │   └── dto/                # API DTO (Response/Request)
 │   │   │   │
-│   │   │   ├── local/
-│   │   │   │   ├── RatesCache.kt       # DataStore (환율)
-│   │   │   │   ├── GraphCache.kt       # File-based JSON (그래프)
-│   │   │   │   └── PreferencesManager.kt
-│   │   │   │
-│   │   │   ├── repository/
-│   │   │   │   ├── RatesRepository.kt
-│   │   │   │   ├── GraphRepository.kt
-│   │   │   │   ├── AlertRepository.kt
-│   │   │   │   └── AuthRepository.kt
-│   │   │   │
-│   │   │   └── model/                  # Domain models
-│   │   │       ├── ExchangeRate.kt
-│   │   │       ├── GraphBucket.kt
-│   │   │       ├── AlertSetting.kt
-│   │   │       └── AppState.kt
+│   │   │   └── repository/
+│   │   │       ├── ExchangeRateRepositoryImpl.kt
+│   │   │       └── AlertRepository.kt
 │   │   │
 │   │   ├── domain/
-│   │   │   └── usecase/                # Optional: Use cases
+│   │   │   ├── model/
+│   │   │   │   ├── ExchangeRate.kt
+│   │   │   │   ├── GraphBucket.kt      # + GraphPoint, PeriodGraphCacheEntry, 타입 앨리어스
+│   │   │   │   ├── GraphPeriod.kt      # 기간 enum (1d/1w/3m/1y)
+│   │   │   │   ├── GraphSource.kt      # 소스 enum (+ REFERENCE, DXY)
+│   │   │   │   ├── BankPreference.kt   # BankDisplayConfig, RatesDisplayState
+│   │   │   │   ├── Bank.kt
+│   │   │   │   ├── SupportedCurrency.kt
+│   │   │   │   ├── AlertSetting.kt
+│   │   │   │   ├── AppState.kt
+│   │   │   │   └── RatesResult.kt
+│   │   │   │
+│   │   │   └── repository/
+│   │   │       └── ExchangeRateRepository.kt
 │   │   │
 │   │   ├── ui/
-│   │   │   ├── navigation/
-│   │   │   │   └── FXiNavGraph.kt
-│   │   │   │
 │   │   │   ├── theme/
 │   │   │   │   ├── Color.kt
+│   │   │   │   ├── ColorExtensions.kt
+│   │   │   │   ├── RateLayoutMetrics.kt
 │   │   │   │   ├── Theme.kt
 │   │   │   │   └── Type.kt
 │   │   │   │
-│   │   │   ├── main/
-│   │   │   │   ├── MainViewModel.kt
-│   │   │   │   └── MainScreen.kt       # 탭 + 환율 리스트
+│   │   │   ├── screen/
+│   │   │   │   ├── MainScreen.kt       # 탭 + 환율 리스트
+│   │   │   │   ├── CurrencyTabContent.kt  # 통화별 탭 (그래프 + 바차트 + 알림)
+│   │   │   │   └── RootScreen.kt       # 인증/구독 분기, Paywall 오버레이
 │   │   │   │
-│   │   │   ├── currency/
-│   │   │   │   ├── CurrencyTabViewModel.kt
-│   │   │   │   └── CurrencyTabScreen.kt
+│   │   │   ├── viewmodel/
+│   │   │   │   ├── ExchangeRateViewModel.kt
+│   │   │   │   ├── GraphViewModel.kt   # 기간별 캐시, DXY, freshness
+│   │   │   │   ├── AlertViewModel.kt
+│   │   │   │   └── BankPreferenceViewModel.kt  # 은행 순서/표시 ViewModel
 │   │   │   │
-│   │   │   ├── graph/
-│   │   │   │   ├── GraphViewModel.kt
-│   │   │   │   └── RateGraphView.kt    # Compose + Vico
+│   │   │   ├── components/             # 공용 컴포넌트
+│   │   │   │   ├── RateGraphView.kt    # Compose Canvas 차트
+│   │   │   │   ├── RateBarView.kt
+│   │   │   │   ├── SourceToggleRow.kt  # 1d 전용 소스 토글
+│   │   │   │   ├── PeriodTabBar.kt     # 기간 선택 탭 (pill 스타일)
+│   │   │   │   ├── DxyToggleButton.kt  # DXY 토글 (USD/KRW 전용)
+│   │   │   │   ├── BankCustomizeSheet.kt  # 은행 순서 드래그 정렬 시트
+│   │   │   │   ├── BankIcon.kt
+│   │   │   │   ├── IOSStyleToggle.kt
+│   │   │   │   └── StatusComponents.kt
 │   │   │   │
 │   │   │   ├── alert/
-│   │   │   │   ├── AlertViewModel.kt
 │   │   │   │   ├── AlertSection.kt
-│   │   │   │   └── AlertAddSheet.kt
+│   │   │   │   ├── AlertAddSheet.kt
+│   │   │   │   └── AlertRow.kt
 │   │   │   │
 │   │   │   ├── auth/
 │   │   │   │   ├── AuthViewModel.kt
 │   │   │   │   └── LoginScreen.kt
 │   │   │   │
 │   │   │   ├── subscription/
-│   │   │   │   ├── SubscriptionViewModel.kt
 │   │   │   │   ├── PaywallScreen.kt
-│   │   │   │   └── LockedPreviewScreen.kt
+│   │   │   │   ├── LockedPreviewScreen.kt
+│   │   │   │   ├── SamplePreviewViewModel.kt
+│   │   │   │   ├── SampleData.kt
+│   │   │   │   ├── SampleAlertSetting.kt
+│   │   │   │   ├── SampleAlertSection.kt
+│   │   │   │   ├── SampleAlertAddSheet.kt
+│   │   │   │   └── SampleAlertTriggerBanner.kt
 │   │   │   │
-│   │   │   ├── settings/
-│   │   │   │   └── SettingsScreen.kt
-│   │   │   │
-│   │   │   └── components/             # 공용 컴포넌트
-│   │   │       ├── BankIcon.kt
-│   │   │       ├── RateBarView.kt
-│   │   │       ├── StatusBanner.kt
-│   │   │       └── LoadingView.kt
+│   │   │   └── settings/
+│   │   │       ├── SettingsScreen.kt
+│   │   │       └── SettingsViewModel.kt
 │   │   │
 │   │   ├── service/
 │   │   │   ├── FXiMessagingService.kt  # FCM Service
-│   │   │   └── NetworkMonitor.kt
+│   │   │   ├── PushNotificationManager.kt
+│   │   │   └── AlertEventBus.kt
 │   │   │
-│   │   └── di/
-│   │       ├── AppModule.kt
-│   │       ├── NetworkModule.kt
-│   │       └── RepositoryModule.kt
+│   │   ├── subscription/
+│   │   │   └── SubscriptionManager.kt
+│   │   │
+│   │   ├── di/
+│   │   │   ├── AuthModule.kt
+│   │   │   ├── NetworkModule.kt
+│   │   │   └── RepositoryModule.kt
+│   │   │
+│   │   └── util/
+│   │       ├── Constants.kt            # ApiConfig, WebSocketConfig, GraphConfig, AlertConfig, AppColors
+│   │       ├── InstantSerializer.kt
+│   │       └── TaskExtensions.kt
 │   │
 │   ├── res/
 │   │   ├── drawable/                   # 은행 아이콘
@@ -249,27 +275,34 @@ Response:
 }
 ```
 
-#### 그래프 데이터 조회 (24시간)
+#### 그래프 데이터 조회 (기간별)
 
 ```http
 GET /api/graph/{currency}
+GET /api/graph/{currency}?range=1w
+GET /api/graph/{currency}?range=3m
+GET /api/graph/{currency}?range=1y
 
 Parameters: currency = usd-krw | jpy-krw | eur-krw
 
 Response:
 {
   "pair": "usd-krw",
+  "period": "1d",
+  "bucket_size": "10m",
   "sources": {
     "investing": [[1733380800, 1407.8, 1407.2, 1407.5], ...],  // [timestamp, max, min, close]
     "kb": [[1733380800, 1409.5, 1409.0, 1409.2], ...],
-    "hana": [[1733380800, 1409.0, 1408.5, 1408.8], ...]
+    "hana": [[1733380800, 1409.0, 1408.5, 1408.8], ...],
+    "dxy": [[1733380800, 103.8, 103.6, 103.7], ...]
   },
   "as_of": "2025-12-05T14:30:00+09:00"
 }
 
-※ 10분 버킷 단위 (24시간 = 144개 버킷)
+※ `range` 생략 시 `1d`
+※ `1d`: 10분 버킷, 실시간 소스(`investing`, `kb`, `hana`) 중심
+※ `1w/3m/1y`: `reference` 중심 장기 그래프, USD/KRW는 `dxy` 포함 가능
 ※ REST는 배열 형식 [ts, max, min, close]
-※ 소스: investing, kb, hana 3개만
 ```
 
 #### 알림 설정 API
@@ -421,6 +454,28 @@ data class GraphBucket(
     }
 }
 
+// 그래프 캐시 타입 앨리어스
+typealias GraphCache = Map<String, Map<String, List<GraphBucket>>>
+typealias MutableGraphCache = MutableMap<String, MutableMap<String, MutableList<GraphBucket>>>
+typealias GraphSourceData = Map<String, List<GraphBucket>>
+typealias PeriodGraphCache = Map<String, Map<String, GraphSourceData>>
+typealias MutablePeriodGraphCache = MutableMap<String, MutableMap<String, GraphSourceData>>
+
+// 장기 구간 디스크 캐시 엔트리
+@Serializable
+data class PeriodGraphCacheEntry(
+    val sources: GraphSourceData,
+    val freshnessDate: Instant
+)
+
+// 그래프 REST 응답의 도메인 모델
+data class GraphDataResult(
+    val period: GraphPeriod,
+    val bucketSize: String,
+    val sources: GraphSourceData,
+    val asOf: Instant?
+)
+
 // 알림 설정
 @Serializable
 data class AlertSetting(
@@ -524,6 +579,20 @@ enum class SupportedCurrency(val code: String, val displayName: String, val tabT
     }
 }
 
+// 그래프 기간
+enum class GraphPeriod(val code: String, val displayName: String) {
+    ONE_DAY("1d", "1일"),
+    ONE_WEEK("1w", "1주"),
+    THREE_MONTHS("3m", "3달"),
+    ONE_YEAR("1y", "1년");
+
+    val isRealtime: Boolean get() = this == ONE_DAY
+
+    companion object {
+        fun fromCode(code: String?): GraphPeriod? = entries.find { it.code == code }
+    }
+}
+
 // 은행
 enum class Bank(
     val code: String,
@@ -554,12 +623,13 @@ enum class Bank(
 enum class GraphSource(val code: String, val displayName: String, val colorHex: Long) {
     INVESTING("investing", "인베스팅", 0xFF9DB6D8),
     KB("kb", "국민은행", 0xFFFFB200),
-    HANA("hana", "하나은행", 0xFF00A7A0);
-
-    val color: Color get() = Color(colorHex)
+    HANA("hana", "하나은행", 0xFF00A7A0),
+    REFERENCE("reference", "인베스팅", 0xFF9DB6D8),  // 장기 구간용 (백엔드가 investing→reference로 반환)
+    DXY("dxy", "달러지수", 0xFFE06060);              // USD/KRW 전용
 
     companion object {
         fun fromCode(code: String): GraphSource? = entries.find { it.code == code }
+        val realtimeSources: List<GraphSource> = listOf(INVESTING, KB, HANA)
     }
 }
 ```
@@ -579,10 +649,26 @@ object WebSocketConfig {
 
 object GraphConfig {
     const val MAX_BUCKETS = 144                // 24시간 × 6 (10분 버킷)
-    const val GAP_THRESHOLD_SEC = 900          // 15분 (갭 감지 임계값)
+    const val GAP_THRESHOLD_SEC = 900          // 15분 (1d 갭 감지 기본값)
     const val BUCKET_DURATION_SEC = 600        // 10분
     const val REFRESH_INTERVAL_SEC = 300       // 5분마다 갭 체크
     const val FULL_FETCH_COOLDOWN_SEC = 120    // REST 풀 로드 최소 간격 (2분)
+
+    // 기간별 갭 감지 임계값
+    fun gapThresholdSec(period: GraphPeriod): Int = when (period) {
+        GraphPeriod.ONE_DAY -> 900              // 15분
+        GraphPeriod.ONE_WEEK -> 7_200           // 2시간
+        GraphPeriod.THREE_MONTHS -> 86_400      // 1일
+        GraphPeriod.ONE_YEAR -> 86_400          // 1일
+    }
+
+    // 기간별 디스크 캐시 TTL
+    fun cacheTtlMs(period: GraphPeriod): Long = when (period) {
+        GraphPeriod.ONE_DAY -> 86_400_000L      // 24시간
+        GraphPeriod.ONE_WEEK -> 3_600_000L      // 1시간
+        GraphPeriod.THREE_MONTHS -> 21_600_000L // 6시간
+        GraphPeriod.ONE_YEAR -> 86_400_000L     // 24시간
+    }
 }
 
 object AlertConfig {
@@ -765,13 +851,15 @@ private fun observeAppLifecycle() {
 
 ## 그래프 데이터 관리
 
-### 캐시 유효성 검사 (`hasValidCache`)
+### 캐시 유효성 검사 (`hasValidCache`, 1d 전용)
 
-- 모든 그래프 소스(investing, kb, hana)가 **144개 이상**
+- 모든 실시간 소스(investing, kb, hana)가 **144개 이상**
 - 버킷 간 **15분 이상 갭(중간 누락)이 없어야** 유효
 - 백엔드가 항상 3소스를 제공한다는 전제
 
 ### 갭 감지 및 복구 전략
+
+**1d (실시간)**:
 
 | 상황 | 동작 |
 |------|------|
@@ -781,6 +869,15 @@ private fun observeAppLifecycle() {
 | 캐시 무효 (개수/연속성) | 120초 쿨다운 존중하며 REST 시도 |
 | **캐시 유효 + 15분 이상 오래됨** | **120초 쿨다운 존중하며 REST 시도** |
 | 캐시 유효 + 15분 이내 | 스킵 (WebSocket으로 실시간 업데이트) |
+
+**1w/3m/1y (장기)**:
+
+| 상황 | 동작 |
+|------|------|
+| 캐시 없음 | REST 로드 |
+| 캐시 있음 + TTL 만료 | 즉시 표시 → 백그라운드 REST 갱신 |
+| 캐시 있음 + TTL 유효 | 캐시 사용 (REST 요청 없음) |
+| 갭 임계값 | 1w: 2시간, 3m/1y: 1일 (`GraphConfig.gapThresholdSec(period)`) |
 
 ### 주기적 갭 체크 (5분마다)
 
@@ -798,36 +895,35 @@ private fun setupPeriodicRefresh() {
 }
 ```
 
-### 디스크 캐시 TTL (24시간)
+### 디스크 캐시 TTL (기간별)
 
-```kotlin
-// GraphCache.kt - 디스크 캐시 로드 시 TTL 체크
-fun loadGraphData(currency: String): Map<String, List<GraphBucket>>? {
-    val file = File(context.filesDir, "graph_cache_$currency.json")
+파일명 규칙:
 
-    // TTL 체크 (24시간)
-    val lastModified = file.lastModified()
-    if (System.currentTimeMillis() - lastModified > 24 * 60 * 60 * 1000L) {
-        return null  // 캐시 만료
-    }
+- `1d`: `graph_cache_v1_{currency}.json`
+- `1w/3m/1y`: `graph_cache_v1_{currency}_{period}.json`
+- legacy `graph_cache_{currency}.json`은 읽은 뒤 v1로 승격 가능
 
-    // ... 파싱 로직
-}
-```
+TTL (`GraphConfig.cacheTtlMs(period)`):
+
+| 기간 | TTL | 비고 |
+|------|-----|------|
+| 1d | 24시간 | WebSocket 실시간 보완 |
+| 1w | 1시간 | 자주 갱신 |
+| 3m | 6시간 | |
+| 1y | 24시간 | |
 
 ### 캐시 구조
 
 ```kotlin
-// 그래프 캐시 타입: Map<currency, Map<source, List<GraphBucket>>>
-typealias GraphCache = Map<String, Map<String, List<GraphBucket>>>
-
-// 메모리 캐시 (GraphRepository)
-private val graphCache = mutableMapOf<String, MutableMap<String, MutableList<GraphBucket>>>()
+// 메모리 캐시
+// - 1d: 통화별 실시간 버킷
+// - 기간 그래프: "{period}_{currency}" 키 기반 period cache
 
 // 디스크 캐시 (File-based JSON)
-// filesDir/graph_cache_usd-krw.json
-// filesDir/graph_cache_jpy-krw.json
-// filesDir/graph_cache_eur-krw.json
+// filesDir/graph_cache_v1_usd-krw.json
+// filesDir/graph_cache_v1_usd-krw_1w.json
+// filesDir/graph_cache_v1_usd-krw_3m.json
+// filesDir/graph_cache_v1_usd-krw_1y.json
 ```
 
 ---
@@ -1113,7 +1209,7 @@ Purchases.configure(
 ```
 🔒 FXi 서버 (비구독자 차단)
 ├─ WebSocket 연결 (실시간 환율)
-├─ Graph REST API (24시간 그래프)
+├─ Graph REST API (기간별 그래프)
 ├─ Alert Settings API (알림 CRUD)
 └─ FCM 토큰 서버 등록 (푸시 알림)
 
@@ -1128,7 +1224,7 @@ Purchases.configure(
 | 영역 | 가드 위치 | 조건 |
 |------|----------|------|
 | WebSocket 연결 | `WebSocketService.isActive` | `start()` 호출 시에만 `true` |
-| Graph API | `GraphRepository.isActive` | `start()` 호출 시에만 `true` |
+| Graph API | `GraphViewModel` 내부 활성 가드 | `start()` 호출 시에만 활성 |
 | Alert API | MainScreen에서만 로드 | `isPremium` 체크 |
 | 토큰 서버 등록 | `FXiMessagingService` | `Auth + isPremium + shouldRegisterForPush` |
 
@@ -1152,63 +1248,42 @@ Purchases.configure(
 
 ### FCM Service
 
-> **Note**: 아래 코드의 일부 타입은 실제 구현 시 정의 필요 (placeholder 표시)
-
 ```kotlin
+@AndroidEntryPoint
 class FXiMessagingService : FirebaseMessagingService() {
+
+    @Inject lateinit var pushNotificationManager: PushNotificationManager
+    @Inject lateinit var subscriptionManager: SubscriptionManager
+    @Inject lateinit var alertEventBus: AlertEventBus
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun onNewToken(token: String) {
         super.onNewToken(token)
-
-        CoroutineScope(Dispatchers.IO).launch {
-            val prefs = PreferencesManager(applicationContext)  // TODO: 구현 필요
-            val oldToken = prefs.getFcmToken()
-            prefs.setFcmToken(token)
-
-            // 서버 등록 조건: 로그인 + 프리미엄 + shouldRegisterForPush (3중 가드)
-            val auth = Firebase.auth.currentUser
-            // TODO: FirebaseMessagingService에서는 Hilt EntryPoint로 SubscriptionManager 주입
-            val isPremium = subscriptionManager.isPremium.value
-            val shouldRegister = prefs.shouldRegisterForPush()
-
-            if (auth != null && isPremium && shouldRegister) {
-                // 이전 토큰 해제
-                if (oldToken != null && oldToken != token) {
-                    DeviceRepository.unregisterDevice(oldToken)  // TODO: DeviceRepository 구현 필요
-                }
-                // 새 토큰 등록
-                DeviceRepository.registerDevice(token)
-            }
+        serviceScope.launch {
+            pushNotificationManager.onNewToken(token, subscriptionManager.isPremium.value)
         }
     }
 
     override fun onMessageReceived(message: RemoteMessage) {
         super.onMessageReceived(message)
-
-        val data = message.data
-        if (data["type"] == "rate_alert") {
-            val settingId = data["setting_id"]?.toIntOrNull()
-            if (settingId != null) {
-                // 특정 알림 상태 업데이트
-                // TODO: EventBus 대신 Flow/SharedFlow 또는 LocalBroadcast 사용 권장
-                EventBus.post(AlertTriggeredEvent(settingId))
-            } else {
-                // 전체 새로고침
-                EventBus.post(AlertSettingsNeedsRefreshEvent)
+        when (message.data["type"]) {
+            "rate_alert" -> {
+                val settingId = message.data["setting_id"]?.toIntOrNull()
+                if (settingId != null) {
+                    alertEventBus.emit(AlertEvent.SettingTriggered(settingId))
+                } else {
+                    alertEventBus.emit(AlertEvent.RefreshNeeded)
+                }
+                showRateAlertNotification(message)
+            }
+            "sync_alerts" -> {
+                // 다중 기기 동기화: 사일런트 새로고침 (알림 표시 없음)
+                alertEventBus.emit(AlertEvent.RefreshNeeded)
             }
         }
-
-        // 알림 표시
-        showNotification(message)  // TODO: NotificationManager로 알림 표시 구현
     }
 }
-
-// TODO: 아래 타입들은 실제 구현 시 정의 필요
-// - PreferencesManager: DataStore 기반 설정 관리
-// - DeviceRepository: FCM 토큰 서버 등록/해제 API 호출
-// - EventBus: 이벤트 버스 (또는 Flow/SharedFlow로 대체)
-// - AlertTriggeredEvent, AlertSettingsNeedsRefreshEvent: 이벤트 클래스
-// - subscriptionManager: Hilt EntryPoint로 주입
 ```
 
 ---
@@ -1241,73 +1316,23 @@ fun formatRate(rate: Double, currency: String): String {
 
 ---
 
-## 차트 구현 (Vico)
+## 차트 구현 (Compose Canvas)
 
-> **라이브러리**: Vico (Compose 네이티브, 최신)
-> **대안**: MPAndroidChart (legacy, View 기반)
-
-### GraphPoint 모델 (구현 필요)
-
-```kotlin
-/**
- * 그래프 표시용 포인트 (GraphBucket에서 변환)
- */
-data class GraphPoint(
-    val timestamp: Long,       // Unix timestamp (초)
-    val date: Instant,         // 시간
-    val source: GraphSource,   // 소스 (investing, kb, hana)
-    val max: Double,
-    val min: Double,
-    val close: Double
-)
-
-// GraphBucket → GraphPoint 변환
-fun GraphBucket.toGraphPoint(source: GraphSource) = GraphPoint(
-    timestamp = bucketTs.toLong(),
-    date = Instant.fromEpochSeconds(bucketTs.toLong()),
-    source = source,
-    max = max,
-    min = min,
-    close = close
-)
-```
+> **구현 위치**: `ui/components/RateGraphView.kt`
 
 ### 차트 모드
 
-- **1개 소스 선택**: Band Chart (close 라인 + max/min 밴드)
-- **2개 이상 선택**: Line Chart (각 소스별 close 비교)
+- **1일 + 단일 소스**: close 라인 + min/max band
+- **1일 + 다중 소스**: 실시간 소스 비교 라인
+- **1주/3달/1년**: `reference` 중심 기간 그래프
+- **USD/KRW**: 필요 시 `dxy` 오버레이와 좌측 축 동시 표시
 
-```kotlin
-@Composable
-fun RateChart(
-    points: List<GraphPoint>,
-    selectedSources: Set<GraphSource>,
-    modifier: Modifier = Modifier
-) {
-    val isSingleSource = selectedSources.size == 1
+### 주요 규칙
 
-    if (isSingleSource) {
-        // 밴드 차트 (min-max 영역 + close 라인)
-        Chart(
-            chart = lineChart(
-                lines = listOf(
-                    lineSpec(lineColor = selectedSources.first().color)
-                )
-            ),
-            // + 영역 표시 로직
-        )
-    } else {
-        // 멀티 라인 차트
-        Chart(
-            chart = lineChart(
-                lines = selectedSources.map { source ->
-                    lineSpec(lineColor = source.color)
-                }
-            )
-        )
-    }
-}
-```
+- 기간별 X축 포맷 분기: `1d`, `1w`, `3m`, `1y`
+- `1d`만 소스 토글 허용, 장기 구간은 `reference` 중심
+- Live Tail은 렌더 단계에서 최신 환율/DXY 값을 우측 끝에 덧붙여 표현
+- DXY는 별도 스케일을 사용하되 환율 차트에 정규화 오버레이
 
 ### X축 레이블
 

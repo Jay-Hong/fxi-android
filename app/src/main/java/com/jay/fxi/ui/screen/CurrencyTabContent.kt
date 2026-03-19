@@ -9,8 +9,12 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -23,6 +27,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.OpenInFull
+import androidx.compose.material.icons.filled.Tune
 import android.Manifest
 import android.content.Intent
 import android.os.Build
@@ -51,14 +56,19 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.jay.fxi.domain.model.Bank
+import com.jay.fxi.domain.model.displayState
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.GraphBucket
+import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSource
 import com.jay.fxi.domain.model.SupportedCurrency
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
 import com.jay.fxi.ui.alert.AlertAddSheet
 import com.jay.fxi.ui.alert.AlertSection
+import com.jay.fxi.ui.components.BankCustomizeSheet
+import com.jay.fxi.ui.components.DxyToggleButton
+import com.jay.fxi.ui.components.PeriodTabBar
 import com.jay.fxi.ui.components.RateBarView
 import com.jay.fxi.ui.components.RateGraphView
 import com.jay.fxi.ui.components.SourceToggleRow
@@ -69,7 +79,9 @@ import com.jay.fxi.ui.theme.PrimaryText
 import com.jay.fxi.ui.theme.RateLayoutMetrics
 import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.ui.viewmodel.AlertViewModel
+import com.jay.fxi.ui.viewmodel.BankPreferenceViewModel
 import com.jay.fxi.ui.viewmodel.GraphViewModel
+import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
@@ -87,6 +99,7 @@ fun CurrencyTabContent(
     rates: List<ExchangeRate>,
     graphViewModel: GraphViewModel,
     alertViewModel: AlertViewModel,
+    bankPreferenceViewModel: BankPreferenceViewModel,
     isPremium: Boolean,
     lastUpdated: Instant? = null
 ) {
@@ -99,6 +112,7 @@ fun CurrencyTabContent(
     var editSetting by remember { mutableStateOf<com.jay.fxi.domain.model.AlertSetting?>(null) }
     var initialBank by remember { mutableStateOf<Bank?>(null) }
     var isSaving by remember { mutableStateOf(false) }
+    var showBankCustomizeSheet by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     val context = LocalContext.current
@@ -134,41 +148,72 @@ fun CurrencyTabContent(
     }
 
     val selectedSources by graphViewModel.selectedSources.collectAsStateWithLifecycle()
+    val activePeriod by graphViewModel.activePeriod.collectAsStateWithLifecycle()
+    val dxyVisible by graphViewModel.dxyVisible.collectAsStateWithLifecycle()
     val graphVersion by graphViewModel.graphVersion.collectAsStateWithLifecycle()
     val isLoading by graphViewModel.isLoading.collectAsStateWithLifecycle()
     val isGraphFullscreen by graphViewModel.isGraphFullscreen.collectAsStateWithLifecycle()
     val isRatesFullscreen by graphViewModel.isRatesFullscreen.collectAsStateWithLifecycle()
+    val bankDisplayConfig by bankPreferenceViewModel.displayConfig.collectAsStateWithLifecycle()
+    val orderedBanks by bankPreferenceViewModel.orderedBanks.collectAsStateWithLifecycle()
 
     // 현재 통화의 환율만 필터링
     val filteredRates = remember(rates, currency) {
         rates.filter { it.currency == currency.code }
-            .sortedBy { it.bankType?.ordinal ?: Int.MAX_VALUE }
     }
 
-    // 기준 환율 (Investing)
-    val referenceRate = remember(filteredRates) {
-        filteredRates.find { it.bankType?.isReference == true }
+    val ratesDisplayState = remember(filteredRates, currency, bankDisplayConfig) {
+        filteredRates.displayState(currency, bankDisplayConfig)
     }
-
-    // 환율 범위 계산
-    val rateRange = remember(filteredRates) {
-        if (filteredRates.isEmpty()) null
-        else filteredRates.map { it.rate }.let { r -> r.min() to r.max() }
-    }
+    val displayedRates = ratesDisplayState.rates
+    val referenceRate = ratesDisplayState.referenceRate
+    val rateRange = ratesDisplayState.range
 
     // 그래프 데이터
-    val graphData by produceState<Map<GraphSource, List<GraphBucket>>>(
-        initialValue = emptyMap(),
-        key1 = currency,
-        key2 = selectedSources,
-        key3 = graphVersion
+    val rawGraphData by produceState<Map<GraphSource, List<GraphBucket>>>(
+        initialValue = emptyMap<GraphSource, List<GraphBucket>>(),
+        currency,
+        activePeriod,
+        selectedSources,
+        dxyVisible,
+        graphVersion
     ) {
         val data = mutableMapOf<GraphSource, List<GraphBucket>>()
-        for (source in selectedSources) {
+        val sources: Set<GraphSource> = when (activePeriod) {
+            GraphPeriod.ONE_DAY -> selectedSources
+            else -> setOf(GraphSource.REFERENCE)
+        } + if (currency == SupportedCurrency.USD_KRW && dxyVisible) {
+            setOf(GraphSource.DXY)
+        } else {
+            emptySet()
+        }
+
+        for (source in sources) {
             val buckets = graphViewModel.getGraphBuckets(currency.code, source)
             data[source] = buckets
         }
         value = data
+    }
+
+    val graphPayload = remember(
+        rawGraphData,
+        filteredRates,
+        currency,
+        selectedSources,
+        activePeriod,
+        dxyVisible,
+        graphVersion
+    ) {
+        buildGraphPayload(
+            rawGraphData = rawGraphData,
+            filteredRates = filteredRates,
+            currency = currency,
+            selectedSources = selectedSources,
+            activePeriod = activePeriod,
+            dxyVisible = dxyVisible,
+            latestDxyRate = graphViewModel.latestDxyRate(),
+            hasFreshPeriodCache = graphViewModel.isPeriodGraphFresh(currency, activePeriod)
+        )
     }
 
     // 업데이트 시간 포맷
@@ -182,7 +227,7 @@ fun CurrencyTabContent(
 
     // 실제 윈도우 폭 기준으로 메트릭스 선택 (split-screen 대응)
     BoxWithConstraints {
-        val metrics = RateLayoutMetrics.fromWidth(maxWidth)
+        val metrics = RateLayoutMetrics.fromWindow(maxWidth, maxHeight)
 
         CompositionLocalProvider(LocalRateLayoutMetrics provides metrics) {
             when {
@@ -195,26 +240,28 @@ fun CurrencyTabContent(
                             .padding(horizontal = metrics.horizontalPadding)
                             .padding(top = 8.dp, bottom = 16.dp)
                     ) {
-                        // 헤더
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(bottom = 8.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                text = "24시간 추이",
-                                color = PrimaryText,
-                                fontSize = metrics.sectionTitleFontSize,
-                                fontWeight = FontWeight.SemiBold
-                            )
+                            if (currency == SupportedCurrency.USD_KRW) {
+                                DxyToggleButton(
+                                    isSelected = dxyVisible,
+                                    onClick = { graphViewModel.toggleDxy() }
+                                )
+                            }
 
                             Spacer(modifier = Modifier.weight(1f))
 
-                            SourceToggleRow(
-                                selectedSources = selectedSources,
-                                onToggle = { source -> graphViewModel.toggleSource(source) }
-                            )
+                            if (activePeriod == GraphPeriod.ONE_DAY) {
+                                SourceToggleRow(
+                                    selectedSources = selectedSources,
+                                    onToggle = { source -> graphViewModel.toggleSource(source) }
+                                )
+                                Spacer(modifier = Modifier.weight(1f))
+                            }
 
                             Icon(
                                 imageVector = Icons.Default.Cancel,
@@ -229,7 +276,8 @@ fun CurrencyTabContent(
                         // 그래프 (남은 공간 전체)
                         Box(
                             modifier = Modifier
-                                .fillMaxSize()
+                                .weight(1f)
+                                .fillMaxWidth()
                                 .clip(RoundedCornerShape(12.dp))
                                 .background(CardBackground)
                                 .pointerInput(Unit) {
@@ -240,12 +288,22 @@ fun CurrencyTabContent(
                                 .padding(metrics.sectionPadding)
                         ) {
                             RateGraphView(
-                                graphData = graphData,
-                                selectedSources = selectedSources,
+                                rateGraphData = graphPayload.rateGraphData,
+                                dxyGraphData = graphPayload.dxyGraphData,
+                                period = activePeriod,
                                 isLoading = isLoading,
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
+
+                        PeriodTabBar(
+                            activePeriod = activePeriod,
+                            onSelectPeriod = { period ->
+                                graphViewModel.setActivePeriod(period)
+                                scope.launch { graphViewModel.loadGraphForUserSelection(currency, period) }
+                            },
+                            modifier = Modifier.padding(top = 20.dp)
+                        )
                     }
                 }
 
@@ -254,8 +312,9 @@ fun CurrencyTabContent(
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
+                            .windowInsetsPadding(WindowInsets.navigationBars)
                             .padding(horizontal = metrics.horizontalPadding)
-                            .padding(top = 8.dp, bottom = 16.dp)
+                            .padding(top = 8.dp, bottom = 12.dp)
                     ) {
                         // 헤더
                         Row(
@@ -270,6 +329,23 @@ fun CurrencyTabContent(
                                 fontSize = metrics.sectionTitleFontSize,
                                 fontWeight = FontWeight.SemiBold
                             )
+
+                            Box(
+                                modifier = Modifier
+                                    .padding(start = 8.dp)
+                                    .size(28.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(InputBackground)
+                                    .clickable { showBankCustomizeSheet = true },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Tune,
+                                    contentDescription = "은행 설정",
+                                    tint = SecondaryText,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
 
                             Spacer(modifier = Modifier.weight(1f))
 
@@ -320,7 +396,7 @@ fun CurrencyTabContent(
                                     ),
                                 verticalArrangement = Arrangement.spacedBy(metrics.rowSpacing)
                             ) {
-                                filteredRates.forEach { rate ->
+                                displayedRates.forEach { rate ->
                                     RateBarView(
                                         rate = rate,
                                         referenceRate = referenceRate,
@@ -357,24 +433,26 @@ fun CurrencyTabContent(
                                 }
                                 .padding(metrics.sectionPadding)
                         ) {
-                            // 헤더: "24시간 추이" + 소스 토글 + 확대 버튼
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(
-                                    text = "24시간 추이",
-                                    color = PrimaryText,
-                                    fontSize = metrics.sectionTitleFontSize,
-                                    fontWeight = FontWeight.SemiBold
-                                )
+                                if (currency == SupportedCurrency.USD_KRW) {
+                                    DxyToggleButton(
+                                        isSelected = dxyVisible,
+                                        onClick = { graphViewModel.toggleDxy() }
+                                    )
+                                }
 
                                 Spacer(modifier = Modifier.weight(1f))
 
-                                SourceToggleRow(
-                                    selectedSources = selectedSources,
-                                    onToggle = { source -> graphViewModel.toggleSource(source) }
-                                )
+                                if (activePeriod == GraphPeriod.ONE_DAY) {
+                                    SourceToggleRow(
+                                        selectedSources = selectedSources,
+                                        onToggle = { source -> graphViewModel.toggleSource(source) }
+                                    )
+                                    Spacer(modifier = Modifier.weight(1f))
+                                }
 
                                 Box(
                                     modifier = Modifier
@@ -393,14 +471,27 @@ fun CurrencyTabContent(
                                 }
                             }
 
+                            Spacer(modifier = Modifier.height(4.dp))
+
                             // 그래프
                             RateGraphView(
-                                graphData = graphData,
-                                selectedSources = selectedSources,
+                                rateGraphData = graphPayload.rateGraphData,
+                                dxyGraphData = graphPayload.dxyGraphData,
+                                period = activePeriod,
                                 isLoading = isLoading,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(vertical = metrics.sectionPadding)
+                                    .padding(top = metrics.sectionPadding, bottom = 12.dp)
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            PeriodTabBar(
+                                activePeriod = activePeriod,
+                                onSelectPeriod = { period ->
+                                    graphViewModel.setActivePeriod(period)
+                                    scope.launch { graphViewModel.loadGraphForUserSelection(currency, period) }
+                                }
                             )
                         }
 
@@ -415,13 +506,13 @@ fun CurrencyTabContent(
                                         onDoubleTap = { graphViewModel.setRatesFullscreen(true) }
                                     )
                                 }
-                                .padding(vertical = metrics.sectionPadding)
+                                .padding(top = metrics.sectionPadding)
                         ) {
                             // 헤더: "은행별 환율" + 업데이트 시간 + 확대 버튼
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = metrics.horizontalPadding, vertical = 0.dp),
+                                    .padding(horizontal = metrics.horizontalPadding),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
@@ -430,6 +521,23 @@ fun CurrencyTabContent(
                                     fontSize = metrics.sectionTitleFontSize,
                                     fontWeight = FontWeight.SemiBold
                                 )
+
+                                Box(
+                                    modifier = Modifier
+                                        .padding(start = 8.dp)
+                                        .size(26.dp)
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(InputBackground)
+                                        .clickable { showBankCustomizeSheet = true },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Tune,
+                                        contentDescription = "은행 설정",
+                                        tint = SecondaryText,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
 
                                 Spacer(modifier = Modifier.weight(1f))
 
@@ -459,15 +567,17 @@ fun CurrencyTabContent(
                                 }
                             }
 
+                            Spacer(modifier = Modifier.height(metrics.ratesHeaderBottomSpacing))
+
                             // 환율 바 리스트
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(horizontal = metrics.horizontalPadding)
-                                    .padding(top = metrics.rowSpacing, bottom = 8.dp),
+                                    .padding(bottom = metrics.ratesSectionBottomPadding),
                                 verticalArrangement = Arrangement.spacedBy(metrics.rowSpacing)
                             ) {
-                                filteredRates.forEach { rate ->
+                                displayedRates.forEach { rate ->
                                     RateBarView(
                                         rate = rate,
                                         referenceRate = referenceRate,
@@ -637,4 +747,88 @@ fun CurrencyTabContent(
             }
         )
     }
+
+    if (showBankCustomizeSheet) {
+        BankCustomizeSheet(
+            orderedBanks = orderedBanks,
+            onApply = { items ->
+                bankPreferenceViewModel.apply(items)
+                showBankCustomizeSheet = false
+            },
+            onDismiss = { showBankCustomizeSheet = false }
+        )
+    }
+}
+
+private data class GraphPayload(
+    val rateGraphData: Map<GraphSource, List<GraphBucket>>,
+    val dxyGraphData: List<GraphBucket>
+)
+
+private fun buildGraphPayload(
+    rawGraphData: Map<GraphSource, List<GraphBucket>>,
+    filteredRates: List<ExchangeRate>,
+    currency: SupportedCurrency,
+    selectedSources: Set<GraphSource>,
+    activePeriod: GraphPeriod,
+    dxyVisible: Boolean,
+    latestDxyRate: Double?,
+    hasFreshPeriodCache: Boolean
+): GraphPayload {
+    val tailTimestamp = filteredRates.maxOfOrNull { it.timestamp.epochSeconds.toInt() }
+        ?: Clock.System.now().epochSeconds.toInt()
+
+    val rateGraphData = rawGraphData
+        .filterKeys { it != GraphSource.DXY }
+        .toMutableMap()
+
+    val dxyGraphData = rawGraphData[GraphSource.DXY].orEmpty()
+
+    if (activePeriod == GraphPeriod.ONE_DAY) {
+        selectedSources.forEach { source ->
+            val liveRate = filteredRates.firstOrNull { it.bank == source.code }?.rate ?: return@forEach
+            val existing = rateGraphData[source].orEmpty()
+            rateGraphData[source] = appendLiveTail(existing, tailTimestamp, liveRate)
+        }
+    } else {
+        val referenceRate = filteredRates.firstOrNull { it.bank == Bank.INVESTING.code }?.rate
+        if (referenceRate != null && hasFreshPeriodCache) {
+            val existing = rateGraphData[GraphSource.REFERENCE].orEmpty()
+            rateGraphData[GraphSource.REFERENCE] = appendLiveTail(existing, tailTimestamp, referenceRate)
+        }
+    }
+
+    val finalDxyGraphData = if (
+        currency == SupportedCurrency.USD_KRW &&
+        dxyVisible &&
+        latestDxyRate != null &&
+        (activePeriod == GraphPeriod.ONE_DAY || hasFreshPeriodCache)
+    ) {
+        appendLiveTail(dxyGraphData, tailTimestamp, latestDxyRate)
+    } else {
+        dxyGraphData
+    }
+
+    return GraphPayload(
+        rateGraphData = rateGraphData.filterValues { it.isNotEmpty() },
+        dxyGraphData = finalDxyGraphData
+    )
+}
+
+private fun appendLiveTail(
+    buckets: List<GraphBucket>,
+    tailTimestamp: Int,
+    close: Double
+): List<GraphBucket> {
+    if (buckets.isEmpty()) return buckets
+
+    val lastBucket = buckets.last()
+    if (tailTimestamp <= lastBucket.bucketTs) return buckets
+
+    return buckets + GraphBucket(
+        bucketTs = tailTimestamp,
+        max = close,
+        min = close,
+        close = close
+    )
 }

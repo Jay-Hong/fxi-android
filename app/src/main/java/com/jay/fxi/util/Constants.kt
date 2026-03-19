@@ -1,5 +1,7 @@
 package com.jay.fxi.util
 
+import com.jay.fxi.domain.model.GraphPeriod
+
 /**
  * API Configuration
  */
@@ -28,6 +30,20 @@ object GraphConfig {
     const val BUCKET_DURATION_SEC = 600        // 10분
     const val REFRESH_INTERVAL_SEC = 300       // 5분마다 갭 체크
     const val FULL_FETCH_COOLDOWN_SEC = 120    // REST 풀 로드 최소 간격 (2분)
+
+    fun gapThresholdSec(period: GraphPeriod): Int = when (period) {
+        GraphPeriod.ONE_DAY -> 900
+        GraphPeriod.ONE_WEEK -> 7_200
+        GraphPeriod.THREE_MONTHS -> 86_400
+        GraphPeriod.ONE_YEAR -> 86_400
+    }
+
+    fun cacheTtlMs(period: GraphPeriod): Long = when (period) {
+        GraphPeriod.ONE_DAY -> 86_400_000L
+        GraphPeriod.ONE_WEEK -> 3_600_000L
+        GraphPeriod.THREE_MONTHS -> 21_600_000L
+        GraphPeriod.ONE_YEAR -> 86_400_000L
+    }
 }
 
 /**

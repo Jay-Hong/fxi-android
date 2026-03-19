@@ -74,7 +74,7 @@ fun RateBarView(
     metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
     val bank = rate.bankType ?: return
-    val isReference = bank.isReference
+    val isReference = referenceRate?.bank == rate.bank
 
     // 바 너비 계산 + 애니메이션
     val targetBarWidth = remember(rate.rate, minRate, maxRate) {
