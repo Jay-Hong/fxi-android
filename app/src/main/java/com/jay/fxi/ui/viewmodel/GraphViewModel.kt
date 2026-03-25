@@ -64,7 +64,7 @@ class GraphViewModel @Inject constructor(
     private val _activePeriod = MutableStateFlow(GraphPeriod.ONE_DAY)
     val activePeriod: StateFlow<GraphPeriod> = _activePeriod.asStateFlow()
 
-    private val _selectedSources = MutableStateFlow(GraphSource.realtimeSources.toSet())
+    private val _selectedSources = MutableStateFlow(setOf(GraphSource.INVESTING))
     val selectedSources: StateFlow<Set<GraphSource>> = _selectedSources.asStateFlow()
 
     private val _dxyVisible = MutableStateFlow(false)

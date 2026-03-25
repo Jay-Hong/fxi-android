@@ -65,7 +65,7 @@ class SamplePreviewViewModel {
     var activePeriod by mutableStateOf(GraphPeriod.ONE_DAY)
         private set
 
-    var selectedSources by mutableStateOf(GraphSource.realtimeSources.toSet())
+    var selectedSources by mutableStateOf(setOf(GraphSource.INVESTING))
         private set
 
     var dxyVisible by mutableStateOf(false)
@@ -374,15 +374,11 @@ class SamplePreviewViewModel {
         if (selectedCurrency == currency) return
         selectedCurrency = currency
         activePeriod = GraphPeriod.ONE_DAY
-        selectedSources = GraphSource.realtimeSources.toSet()
         dxyVisible = false
     }
 
     fun selectPeriod(period: GraphPeriod) {
         activePeriod = period
-        if (period != GraphPeriod.ONE_DAY) {
-            selectedSources = GraphSource.realtimeSources.toSet()
-        }
         if (!hasDxyData(selectedCurrency)) {
             dxyVisible = false
         }
