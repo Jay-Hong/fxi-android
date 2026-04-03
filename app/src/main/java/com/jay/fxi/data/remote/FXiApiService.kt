@@ -6,6 +6,7 @@ import com.jay.fxi.data.remote.dto.DeviceRequest
 import com.jay.fxi.data.remote.dto.GraphResponse
 import com.jay.fxi.data.remote.dto.NotificationSettingsResponse
 import com.jay.fxi.domain.model.AlertSetting
+import com.jay.fxi.domain.model.NewsResponse
 import com.jay.fxi.domain.model.RatesResult
 import retrofit2.Response
 import retrofit2.http.Body
@@ -59,6 +60,15 @@ interface FXiApiService {
 
     @DELETE("api/notification-settings/{id}")
     suspend fun deleteNotificationSetting(@Path("id") id: Int): Response<Unit>
+
+    /**
+     * 뉴스 조회 (인증 불필요, 비구독자 서버 요청 차단 정책의 예외)
+     */
+    @GET("api/news")
+    suspend fun getNews(
+        @Query("limit") limit: Int = 50,
+        @Query("hours") hours: Double = 24.0
+    ): NewsResponse
 
     /**
      * 계정 삭제 (비구독자 서버 요청 차단 정책의 예외)

@@ -47,6 +47,17 @@ object GraphConfig {
 }
 
 /**
+ * News Configuration
+ */
+object NewsConfig {
+    const val SUBSCRIBER_COOLDOWN_MS = 60_000L        // 구독자 쿨다운 60초
+    const val NON_SUBSCRIBER_COOLDOWN_MS = 300_000L   // 비구독자 쿨다운 5분
+    const val POLLING_INTERVAL_SHORT_MS = 120_000L    // adaptive: 새 기사 있을 때 2분
+    const val POLLING_INTERVAL_LONG_MS = 300_000L     // adaptive: 변화 없을 때 5분
+    const val TIME_REFRESH_INTERVAL_MS = 60_000L      // 상대 시간 갱신 주기 60초
+}
+
+/**
  * Alert Configuration
  */
 object AlertConfig {

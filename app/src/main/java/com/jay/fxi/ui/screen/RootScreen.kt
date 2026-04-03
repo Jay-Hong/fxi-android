@@ -52,6 +52,7 @@ import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.ui.viewmodel.AlertViewModel
 import com.jay.fxi.ui.viewmodel.ExchangeRateViewModel
 import com.jay.fxi.ui.viewmodel.GraphViewModel
+import com.jay.fxi.ui.viewmodel.NewsViewModel
 
 @Composable
 fun RootScreen(
@@ -63,7 +64,8 @@ fun RootScreen(
     authViewModel: AuthViewModel = hiltViewModel(),
     exchangeRateViewModel: ExchangeRateViewModel = hiltViewModel(),
     graphViewModel: GraphViewModel = hiltViewModel(),
-    alertViewModel: AlertViewModel = hiltViewModel()
+    alertViewModel: AlertViewModel = hiltViewModel(),
+    newsViewModel: NewsViewModel = hiltViewModel()
 ) {
     val authState by authViewModel.authState.collectAsStateWithLifecycle()
     val isPremium by subscriptionManager.isPremium.collectAsStateWithLifecycle()
@@ -105,6 +107,7 @@ fun RootScreen(
             exchangeRateViewModel.stop()
             graphViewModel.stop()
             alertViewModel.reset()
+            newsViewModel.reset()
             pushNotificationManager.unregisterDeviceFromServer()
         }
         previousAuthState.value = authState
@@ -117,6 +120,7 @@ fun RootScreen(
             exchangeRateViewModel.stop()
             graphViewModel.stop()
             alertViewModel.reset()
+            newsViewModel.reset()
             pushNotificationManager.unregisterDeviceFromServer()
         }
         previousPremiumState.value = isPremium

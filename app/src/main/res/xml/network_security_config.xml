@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 기본: cleartext 차단 (HTTPS 강제) -->
+    <base-config cleartextTrafficPermitted="false" />
+
+    <!-- KB 뉴스 이미지 도메인: http://newsimage.einfomax.co.kr 허용 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">newsimage.einfomax.co.kr</domain>
+    </domain-config>
+</network-security-config>

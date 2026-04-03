@@ -80,6 +80,7 @@ import com.jay.fxi.domain.model.BankPreferenceItem
 import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSource
 import com.jay.fxi.domain.model.SupportedCurrency
+import com.jay.fxi.domain.model.TabSelection
 import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.ui.components.BankCustomizeSheet
 import com.jay.fxi.ui.components.DxyToggleButton
@@ -87,6 +88,8 @@ import com.jay.fxi.ui.components.PeriodTabBar
 import com.jay.fxi.ui.components.RateBarView
 import com.jay.fxi.ui.components.RateGraphView
 import com.jay.fxi.ui.components.SourceToggleRow
+import com.jay.fxi.ui.screen.NewsDetailOverlay
+import com.jay.fxi.ui.screen.NewsTabContent
 import com.jay.fxi.ui.settings.SettingsScreen
 import com.jay.fxi.ui.theme.Background
 import com.jay.fxi.ui.theme.CardBackground
@@ -97,6 +100,7 @@ import com.jay.fxi.ui.theme.PrimaryText
 import com.jay.fxi.ui.theme.RateLayoutMetrics
 import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.ui.viewmodel.BankPreferenceViewModel
+import com.jay.fxi.ui.viewmodel.NewsViewModel
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.datetime.Clock
@@ -120,15 +124,27 @@ fun LockedPreviewScreen(
     userInfo: UserInfo? = null,
     onSignOut: (() -> Unit)? = null,
     isPaywallVisible: Boolean = false,
-    bankPreferenceViewModel: BankPreferenceViewModel = hiltViewModel()
+    bankPreferenceViewModel: BankPreferenceViewModel = hiltViewModel(),
+    newsViewModel: NewsViewModel = hiltViewModel()
 ) {
     val viewModel = remember { SamplePreviewViewModel() }
     val scope = rememberCoroutineScope()
     val currencies = SupportedCurrency.entries
+    val totalPages = currencies.size + 1  // 통화 3 + 뉴스 1
+    val newsPageIndex = currencies.size    // 3
+
+    // 화면 레벨 TabSelection (SamplePreviewViewModel.selectedCurrency와 별도 관리)
+    var selectedTab by remember { mutableStateOf<TabSelection>(TabSelection.Currency(SupportedCurrency.USD_KRW)) }
+
+    // News state
+    val newsItems by newsViewModel.newsItems.collectAsStateWithLifecycle()
+    val newsIsLoading by newsViewModel.isLoading.collectAsStateWithLifecycle()
+    val newsError by newsViewModel.error.collectAsStateWithLifecycle()
+    val newsRefreshTrigger by newsViewModel.refreshTrigger.collectAsStateWithLifecycle()
 
     val pagerState = rememberPagerState(
         initialPage = 0,
-        pageCount = { currencies.size }
+        pageCount = { totalPages }
     )
     var tabTargetPage by remember { mutableStateOf<Int?>(null) }
 
@@ -138,9 +154,17 @@ fun LockedPreviewScreen(
             .distinctUntilChanged()
             .collect { page ->
                 if (tabTargetPage != null) return@collect
-                val currency = currencies.getOrNull(page) ?: return@collect
-                if (currency != viewModel.selectedCurrency) {
-                    viewModel.selectCurrency(currency)
+                val newTab = if (page == newsPageIndex) {
+                    TabSelection.News
+                } else {
+                    val currency = currencies.getOrNull(page) ?: return@collect
+                    if (currency != viewModel.selectedCurrency) {
+                        viewModel.selectCurrency(currency)
+                    }
+                    TabSelection.Currency(currency)
+                }
+                if (newTab != selectedTab) {
+                    selectedTab = newTab
                 }
             }
     }
@@ -159,8 +183,22 @@ fun LockedPreviewScreen(
         }
     }
 
+    // News 탭 라이프사이클
+    LaunchedEffect(selectedTab) {
+        when (selectedTab) {
+            is TabSelection.News -> newsViewModel.onTabAppear(isPremium = false)
+            is TabSelection.Currency -> newsViewModel.onTabDisappear()
+        }
+    }
+
+    // 뉴스 VM 정리
+    DisposableEffect(Unit) {
+        onDispose { newsViewModel.onTabDisappear() }
+    }
+
     var showSettings by remember { mutableStateOf(false) }
     var showBankCustomize by remember { mutableStateOf(false) }
+    var newsDetailUrl by remember { mutableStateOf<String?>(null) }
     var showWelcomeAlert by remember { mutableStateOf(false) }
     var alertSheetState by remember { mutableStateOf<AlertSheetState?>(null) }
     var isFloatingCTAHighlighted by remember { mutableStateOf(false) }
@@ -182,7 +220,7 @@ fun LockedPreviewScreen(
 
     // ── ViewModel 데이터 ──
 
-    val selectedCurrency = viewModel.selectedCurrency
+    val selectedCurrency = selectedTab.currencyValue ?: viewModel.selectedCurrency
     val sampleRates = viewModel.rates
     val graphData = viewModel.graphData
     val selectedSources = viewModel.selectedSources
@@ -313,11 +351,17 @@ fun LockedPreviewScreen(
                             SampleBannerWithCTA(onPrimaryAction = onPrimaryAction)
 
                             LockedTabPicker(
-                                selectedCurrency = selectedCurrency,
-                                onCurrencySelected = { currency ->
-                                    if (currency != selectedCurrency) {
-                                        viewModel.selectCurrency(currency)
-                                        val targetPage = currencies.indexOf(currency)
+                                selectedTab = selectedTab,
+                                onTabSelected = { tab ->
+                                    if (tab != selectedTab) {
+                                        selectedTab = tab
+                                        if (tab is TabSelection.Currency) {
+                                            viewModel.selectCurrency(tab.currency)
+                                        }
+                                        val targetPage = when (tab) {
+                                            is TabSelection.Currency -> currencies.indexOf(tab.currency)
+                                            is TabSelection.News -> newsPageIndex
+                                        }
                                         if (targetPage >= 0) {
                                             tabTargetPage = targetPage
                                         }
@@ -329,54 +373,66 @@ fun LockedPreviewScreen(
                             HorizontalPager(
                                 state = pagerState,
                                 modifier = Modifier.fillMaxSize(),
-                                key = { currencies[it].code }
+                                key = { if (it == newsPageIndex) "news" else currencies[it].code }
                             ) { page ->
-                                val pageCurrency = currencies[page]
-                                val pageRates = viewModel.rates
-                                val pageDisplayState = remember(pageRates, pageCurrency, bankDisplayConfig) {
-                                    viewModel.displayState(pageCurrency, bankDisplayConfig)
-                                }
-                                val pageGraphData = viewModel.graphData
-                                val pageGraphPayload = remember(
-                                    pageGraphData, pageCurrency,
-                                    selectedSources, activePeriod, dxyVisible
-                                ) {
-                                    buildSampleGraphPayload(
-                                        rawGraphData = pageGraphData,
-                                        currency = pageCurrency,
-                                        selectedSources = selectedSources,
-                                        activePeriod = activePeriod,
-                                        dxyVisible = dxyVisible
+                                if (page == newsPageIndex) {
+                                    NewsTabContent(
+                                        newsItems = newsItems,
+                                        isLoading = newsIsLoading,
+                                        error = newsError,
+                                        refreshTrigger = newsRefreshTrigger,
+                                        isPremium = false,
+                                        onRetry = { newsViewModel.retry(isPremium = false) },
+                                        onDetailOpen = { url -> newsDetailUrl = url }
                                     )
-                                }
+                                } else {
+                                    val pageCurrency = currencies[page]
+                                    val pageRates = viewModel.rates
+                                    val pageDisplayState = remember(pageRates, pageCurrency, bankDisplayConfig) {
+                                        viewModel.displayState(pageCurrency, bankDisplayConfig)
+                                    }
+                                    val pageGraphData = viewModel.graphData
+                                    val pageGraphPayload = remember(
+                                        pageGraphData, pageCurrency,
+                                        selectedSources, activePeriod, dxyVisible
+                                    ) {
+                                        buildSampleGraphPayload(
+                                            rawGraphData = pageGraphData,
+                                            currency = pageCurrency,
+                                            selectedSources = selectedSources,
+                                            activePeriod = activePeriod,
+                                            dxyVisible = dxyVisible
+                                        )
+                                    }
 
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .verticalScroll(rememberScrollState())
-                                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(16.dp)
-                                ) {
-                                    SampleGraphSection(
-                                        viewModel = viewModel,
-                                        currency = pageCurrency,
-                                        graphPayload = pageGraphPayload,
-                                        onFullscreenTap = { isGraphFullscreen = true }
-                                    )
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .verticalScroll(rememberScrollState())
+                                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                                    ) {
+                                        SampleGraphSection(
+                                            viewModel = viewModel,
+                                            currency = pageCurrency,
+                                            graphPayload = pageGraphPayload,
+                                            onFullscreenTap = { isGraphFullscreen = true }
+                                        )
 
-                                    SampleRatesSection(
-                                        displayState = pageDisplayState,
-                                        onCustomize = { showBankCustomize = true },
-                                        onFullscreenTap = { isRatesFullscreen = true }
-                                    )
+                                        SampleRatesSection(
+                                            displayState = pageDisplayState,
+                                            onCustomize = { showBankCustomize = true },
+                                            onFullscreenTap = { isRatesFullscreen = true }
+                                        )
 
-                                    SampleAlertSection(
-                                        viewModel = viewModel,
-                                        onAddTap = { alertSheetState = AlertSheetState.Add },
-                                        onEditTap = { setting -> alertSheetState = AlertSheetState.Edit(setting) }
-                                    )
+                                        SampleAlertSection(
+                                            viewModel = viewModel,
+                                            onAddTap = { alertSheetState = AlertSheetState.Add },
+                                            onEditTap = { setting -> alertSheetState = AlertSheetState.Edit(setting) }
+                                        )
 
-                                    Spacer(modifier = Modifier.height(100.dp))
+                                        Spacer(modifier = Modifier.height(100.dp))
+                                    }
                                 }
                             }
                         }
@@ -456,6 +512,14 @@ fun LockedPreviewScreen(
             onSignOut = onSignOut,
             showRatingOption = false,
             onDismiss = { showSettings = false }
+        )
+    }
+
+    // 뉴스 상세 풀스크린 오버레이 (탭 바 포함 전체 화면 덮음)
+    newsDetailUrl?.let { url ->
+        NewsDetailOverlay(
+            url = url,
+            onDismiss = { newsDetailUrl = null }
         )
     }
 }
@@ -815,12 +879,12 @@ private fun SampleBannerWithCTA(onPrimaryAction: () -> Unit) {
     }
 }
 
-// MARK: - 탭 선택기 (iOS LockedTabPicker)
+// MARK: - 탭 선택기 (iOS LockedTabPicker + News)
 
 @Composable
 private fun LockedTabPicker(
-    selectedCurrency: SupportedCurrency,
-    onCurrencySelected: (SupportedCurrency) -> Unit,
+    selectedTab: TabSelection,
+    onTabSelected: (TabSelection) -> Unit,
     onSettingsClick: () -> Unit,
 ) {
     Row(
@@ -832,13 +896,22 @@ private fun LockedTabPicker(
         verticalAlignment = Alignment.CenterVertically
     ) {
         SupportedCurrency.entries.forEach { currency ->
-            PreviewCurrencyTab(
-                currency = currency,
-                isSelected = currency == selectedCurrency,
-                onClick = { onCurrencySelected(currency) },
+            val isSelected = selectedTab is TabSelection.Currency && selectedTab.currency == currency
+            PreviewTab(
+                label = currency.tabTitle,
+                isSelected = isSelected,
+                onClick = { onTabSelected(TabSelection.Currency(currency)) },
                 modifier = Modifier.weight(1f)
             )
         }
+
+        // 뉴스 탭
+        PreviewTab(
+            label = "뉴스",
+            isSelected = selectedTab is TabSelection.News,
+            onClick = { onTabSelected(TabSelection.News) },
+            modifier = Modifier.weight(1f)
+        )
 
         IconButton(
             onClick = onSettingsClick,
@@ -857,8 +930,8 @@ private fun LockedTabPicker(
 }
 
 @Composable
-private fun PreviewCurrencyTab(
-    currency: SupportedCurrency,
+private fun PreviewTab(
+    label: String,
     isSelected: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
@@ -867,17 +940,12 @@ private fun PreviewCurrencyTab(
         modifier = modifier.clickable { onClick() },
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
-        ) {
-            Text(
-                text = currency.tabTitle,
-                color = if (isSelected) PrimaryText else SecondaryText,
-                fontSize = 14.sp,
-                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
-            )
-        }
+        Text(
+            text = label,
+            color = if (isSelected) PrimaryText else SecondaryText,
+            fontSize = 14.sp,
+            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
+        )
         Spacer(modifier = Modifier.height(4.dp))
         Box(
             modifier = Modifier

@@ -13,6 +13,7 @@ import com.jay.fxi.domain.model.GraphBucket
 import com.jay.fxi.domain.model.GraphCache
 import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSourceData
+import com.jay.fxi.domain.model.NewsItem
 import com.jay.fxi.domain.model.PeriodGraphCacheEntry
 import com.jay.fxi.domain.model.SupportedCurrency
 import com.jay.fxi.util.GraphConfig
@@ -54,6 +55,7 @@ class CacheService @Inject constructor(
         private const val GRAPH_FILE_SUFFIX = ".json"
 
         private const val KEY_LAST_BANK_PREFIX = "last_bank_"
+        private const val NEWS_CACHE_FILE = "news_cache.json"
     }
 
     // ============ 환율 캐시 (DataStore) ============
@@ -109,6 +111,30 @@ class CacheService @Inject constructor(
         val key = stringPreferencesKey("$KEY_LAST_BANK_PREFIX$currency")
         val preferences = context.dataStore.data.first()
         return preferences[key]
+    }
+
+    // ============ 뉴스 캐시 (File) ============
+
+    suspend fun saveNewsCache(items: List<NewsItem>) {
+        withContext(Dispatchers.IO) {
+            try {
+                File(context.filesDir, NEWS_CACHE_FILE).writeText(json.encodeToString(items))
+            } catch (_: Exception) {
+                // 저장 실패 무시
+            }
+        }
+    }
+
+    suspend fun loadNewsCache(): List<NewsItem>? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val file = File(context.filesDir, NEWS_CACHE_FILE)
+                if (!file.exists()) return@withContext null
+                json.decodeFromString<List<NewsItem>>(file.readText())
+            } catch (_: Exception) {
+                null
+            }
+        }
     }
 
     // ============ 그래프 캐시 (File) ============

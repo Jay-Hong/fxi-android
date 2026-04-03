@@ -44,6 +44,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.jay.fxi.domain.model.AppState
 import com.jay.fxi.domain.model.AuthState
 import com.jay.fxi.domain.model.SupportedCurrency
+import com.jay.fxi.domain.model.TabSelection
 import com.jay.fxi.ui.auth.AuthViewModel
 import com.jay.fxi.ui.settings.SettingsScreen
 import com.jay.fxi.ui.components.ConnectionStatusBanner
@@ -57,6 +58,7 @@ import com.jay.fxi.ui.viewmodel.AlertViewModel
 import com.jay.fxi.ui.viewmodel.BankPreferenceViewModel
 import com.jay.fxi.ui.viewmodel.ExchangeRateViewModel
 import com.jay.fxi.ui.viewmodel.GraphViewModel
+import com.jay.fxi.ui.viewmodel.NewsViewModel
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
@@ -64,7 +66,7 @@ import kotlinx.coroutines.launch
  * 메인 화면
  *
  * iOS ContentView와 동일한 역할:
- * - 통화 탭 선택기 (탭 터치 + 스와이프)
+ * - 통화 탭 선택기 (탭 터치 + 스와이프) + 뉴스 탭
  * - AppState에 따른 화면 분기
  * - 연결 상태 배너
  */
@@ -75,7 +77,8 @@ fun MainScreen(
     exchangeRateViewModel: ExchangeRateViewModel = hiltViewModel(),
     graphViewModel: GraphViewModel = hiltViewModel(),
     alertViewModel: AlertViewModel = hiltViewModel(),
-    bankPreferenceViewModel: BankPreferenceViewModel = hiltViewModel()
+    bankPreferenceViewModel: BankPreferenceViewModel = hiltViewModel(),
+    newsViewModel: NewsViewModel = hiltViewModel()
 ) {
     val appState by exchangeRateViewModel.appState.collectAsStateWithLifecycle()
     val connectionState by exchangeRateViewModel.connectionState.collectAsStateWithLifecycle()
@@ -83,17 +86,29 @@ fun MainScreen(
     val activeCurrency by graphViewModel.activeCurrency.collectAsStateWithLifecycle()
     val authState by authViewModel.authState.collectAsStateWithLifecycle()
 
+    // News state
+    val newsItems by newsViewModel.newsItems.collectAsStateWithLifecycle()
+    val newsIsLoading by newsViewModel.isLoading.collectAsStateWithLifecycle()
+    val newsError by newsViewModel.error.collectAsStateWithLifecycle()
+    val newsRefreshTrigger by newsViewModel.refreshTrigger.collectAsStateWithLifecycle()
+
     var showSettings by remember { mutableStateOf(false) }
-    var selectedCurrency by remember { mutableStateOf(activeCurrency) }
+    var newsDetailUrl by remember { mutableStateOf<String?>(null) }
+
+    // TabSelection 기반 탭 관리
+    val currencies = SupportedCurrency.entries
+    val totalPages = currencies.size + 1 // 통화 3 + 뉴스 1
+    val newsPageIndex = currencies.size   // 3
+
+    var selectedTab by remember { mutableStateOf<TabSelection>(TabSelection.Currency(activeCurrency)) }
     var tabTargetPage by remember { mutableStateOf<Int?>(null) }
 
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
-    val currencies = SupportedCurrency.entries
 
     val pagerState = rememberPagerState(
         initialPage = currencies.indexOf(activeCurrency).coerceAtLeast(0),
-        pageCount = { currencies.size }
+        pageCount = { totalPages }
     )
 
     // 서비스 시작/종료 (MainScreen 생명주기와 동기화)
@@ -104,6 +119,7 @@ fun MainScreen(
         onDispose {
             graphViewModel.stop()
             exchangeRateViewModel.stop()
+            newsViewModel.onTabDisappear()
         }
     }
 
@@ -121,6 +137,7 @@ fun MainScreen(
                     if (sawStop) {
                         sawStop = false
                         alertViewModel.refreshOnForeground()
+                        newsViewModel.onForegroundResume(isPremium)
                     }
                 }
                 else -> {}
@@ -134,8 +151,9 @@ fun MainScreen(
 
     // 외부에서 활성 통화가 바뀌면 UI 선택 상태도 동일하게 맞춘다.
     LaunchedEffect(activeCurrency) {
-        if (activeCurrency != selectedCurrency) {
-            selectedCurrency = activeCurrency
+        val currentCurrency = selectedTab.currencyValue
+        if (currentCurrency != null && activeCurrency != currentCurrency) {
+            selectedTab = TabSelection.Currency(activeCurrency)
             val targetPage = currencies.indexOf(activeCurrency)
             if (targetPage >= 0 && targetPage != pagerState.settledPage) {
                 tabTargetPage = targetPage
@@ -144,15 +162,18 @@ fun MainScreen(
     }
 
     // currentPage는 스와이프가 절반을 넘으면 다음 페이지로 바뀐다.
-    // iOS TabView(selection:) 체감과 맞추기 위해 탭 강조 상태도 이 시점에 함께 갱신한다.
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.currentPage }
             .distinctUntilChanged()
             .collect { page ->
                 if (tabTargetPage != null) return@collect
-                val currency = currencies.getOrNull(page) ?: return@collect
-                if (currency != selectedCurrency) {
-                    selectedCurrency = currency
+                val newTab = if (page == newsPageIndex) {
+                    TabSelection.News
+                } else {
+                    currencies.getOrNull(page)?.let { TabSelection.Currency(it) } ?: return@collect
+                }
+                if (newTab != selectedTab) {
+                    selectedTab = newTab
                 }
             }
     }
@@ -170,21 +191,35 @@ fun MainScreen(
         } finally {
             if (tabTargetPage == targetPage) {
                 tabTargetPage = null
-                val settledCurrency = currencies.getOrNull(pagerState.settledPage)
-                    ?: currencies.getOrNull(pagerState.currentPage)
-                if (settledCurrency != null && settledCurrency != selectedCurrency) {
-                    selectedCurrency = settledCurrency
+                val settledTab = if (pagerState.settledPage == newsPageIndex) {
+                    TabSelection.News
+                } else {
+                    currencies.getOrNull(pagerState.settledPage)
+                        ?.let { TabSelection.Currency(it) }
+                        ?: currencies.getOrNull(pagerState.currentPage)
+                            ?.let { TabSelection.Currency(it) }
+                }
+                if (settledTab != null && settledTab != selectedTab) {
+                    selectedTab = settledTab
                 }
             }
         }
     }
 
     // 선택 상태가 바뀌면 ViewModel을 함께 동기화한다.
-    LaunchedEffect(selectedCurrency) {
-        if (selectedCurrency != activeCurrency) {
-            graphViewModel.setActiveCurrency(selectedCurrency)
+    LaunchedEffect(selectedTab) {
+        when (val tab = selectedTab) {
+            is TabSelection.Currency -> {
+                newsViewModel.onTabDisappear()
+                if (tab.currency != activeCurrency) {
+                    graphViewModel.setActiveCurrency(tab.currency)
+                }
+                graphViewModel.loadGraph(tab.currency)
+            }
+            is TabSelection.News -> {
+                newsViewModel.onTabAppear(isPremium)
+            }
         }
-        graphViewModel.loadGraph(selectedCurrency)
     }
 
     Column(
@@ -202,13 +237,16 @@ fun MainScreen(
             onReconnect = { exchangeRateViewModel.refresh() }
         )
 
-        // 통화 탭 선택기 + 설정 버튼 (iOS currencyTabPicker 구조)
-        CurrencyTabRow(
-            selectedCurrency = selectedCurrency,
-            onCurrencySelected = { currency ->
-                if (currency != selectedCurrency) {
-                    selectedCurrency = currency
-                    val targetPage = currencies.indexOf(currency)
+        // 통화 탭 선택기 + 뉴스 탭 + 설정 버튼
+        TabRow(
+            selectedTab = selectedTab,
+            onTabSelected = { tab ->
+                if (tab != selectedTab) {
+                    selectedTab = tab
+                    val targetPage = when (tab) {
+                        is TabSelection.Currency -> currencies.indexOf(tab.currency)
+                        is TabSelection.News -> newsPageIndex
+                    }
                     if (targetPage >= 0) {
                         tabTargetPage = targetPage
                     }
@@ -218,39 +256,33 @@ fun MainScreen(
         )
 
         // 콘텐츠 영역 (스와이프 가능)
-        when (val state = appState) {
-            is AppState.Loading -> {
-                Box(modifier = Modifier.fillMaxSize().weight(1f)) {
-                    LoadingView()
-                }
-            }
-            is AppState.Connected -> {
-                HorizontalPager(
-                    state = pagerState,
-                    modifier = Modifier.fillMaxSize().weight(1f),
-                    key = { currencies[it].code }
-                ) { page ->
-                    CurrencyTabContent(
-                        currency = currencies[page],
-                        rates = state.currentRates,
-                        graphViewModel = graphViewModel,
-                        alertViewModel = alertViewModel,
-                        bankPreferenceViewModel = bankPreferenceViewModel,
-                        isPremium = isPremium,
-                        lastUpdated = lastUpdated
-                    )
-                }
-            }
-            is AppState.Offline -> {
-                state.cachedRates?.let { rates ->
-                    HorizontalPager(
-                        state = pagerState,
-                        modifier = Modifier.fillMaxSize().weight(1f),
-                        key = { currencies[it].code }
-                    ) { page ->
+        // 뉴스 탭은 환율 API와 독립 — HorizontalPager를 항상 렌더링하고
+        // 환율 상태(Loading/Error)는 통화 페이지 내부에서 분기
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier.fillMaxSize().weight(1f),
+            key = { if (it == newsPageIndex) "news" else currencies[it].code }
+        ) { page ->
+            if (page == newsPageIndex) {
+                NewsTabContent(
+                    newsItems = newsItems,
+                    isLoading = newsIsLoading,
+                    error = newsError,
+                    refreshTrigger = newsRefreshTrigger,
+                    isPremium = isPremium,
+                    onRetry = { newsViewModel.retry(isPremium) },
+                    onDetailOpen = { url -> newsDetailUrl = url }
+                )
+            } else {
+                // 통화 페이지: AppState에 따라 분기
+                when (val state = appState) {
+                    is AppState.Loading -> {
+                        LoadingView()
+                    }
+                    is AppState.Connected -> {
                         CurrencyTabContent(
                             currency = currencies[page],
-                            rates = rates,
+                            rates = state.currentRates,
                             graphViewModel = graphViewModel,
                             alertViewModel = alertViewModel,
                             bankPreferenceViewModel = bankPreferenceViewModel,
@@ -258,20 +290,32 @@ fun MainScreen(
                             lastUpdated = lastUpdated
                         )
                     }
-                } ?: Box(modifier = Modifier.fillMaxSize().weight(1f)) {
-                    ErrorView(message = "캐시된 데이터가 없습니다")
-                }
-            }
-            is AppState.Error -> {
-                Box(modifier = Modifier.fillMaxSize().weight(1f)) {
-                    ErrorView(
-                        message = state.message,
-                        onRetry = {
-                            scope.launch {
-                                exchangeRateViewModel.refresh()
-                            }
+                    is AppState.Offline -> {
+                        val rates = state.cachedRates
+                        if (rates != null) {
+                            CurrencyTabContent(
+                                currency = currencies[page],
+                                rates = rates,
+                                graphViewModel = graphViewModel,
+                                alertViewModel = alertViewModel,
+                                bankPreferenceViewModel = bankPreferenceViewModel,
+                                isPremium = isPremium,
+                                lastUpdated = lastUpdated
+                            )
+                        } else {
+                            ErrorView(message = "캐시된 데이터가 없습니다")
                         }
-                    )
+                    }
+                    is AppState.Error -> {
+                        ErrorView(
+                            message = state.message,
+                            onRetry = {
+                                scope.launch {
+                                    exchangeRateViewModel.refresh()
+                                }
+                            }
+                        )
+                    }
                 }
             }
         }
@@ -288,16 +332,23 @@ fun MainScreen(
             )
         }
     }
+
+    // 뉴스 상세 풀스크린 오버레이 (탭 바 포함 전체 화면 덮음, iOS fullScreenCover 패리티)
+    newsDetailUrl?.let { url ->
+        NewsDetailOverlay(
+            url = url,
+            onDismiss = { newsDetailUrl = null }
+        )
+    }
 }
 
 /**
- * 통화 탭 선택기 + 설정 버튼 (iOS currencyTabPicker 완전 재현)
- * iOS: HStack(alignment: .center, spacing: 0) + .padding(.horizontal, 12) + .padding(.top, 4)
+ * 탭 선택기 (통화 3개 + 뉴스 + 설정 버튼)
  */
 @Composable
-private fun CurrencyTabRow(
-    selectedCurrency: SupportedCurrency,
-    onCurrencySelected: (SupportedCurrency) -> Unit,
+private fun TabRow(
+    selectedTab: TabSelection,
+    onTabSelected: (TabSelection) -> Unit,
     onSettingsClick: () -> Unit
 ) {
     val currencies = SupportedCurrency.entries
@@ -310,16 +361,17 @@ private fun CurrencyTabRow(
             .padding(top = 4.dp),
         verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
     ) {
+        // 통화 탭
         currencies.forEach { currency ->
-            val isSelected = currency == selectedCurrency
+            val isSelected = selectedTab is TabSelection.Currency && selectedTab.currency == currency
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .clickable { onCurrencySelected(currency) },
+                    .clickable { onTabSelected(TabSelection.Currency(currency)) },
                 horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = currency.displayName,
+                    text = currency.tabTitle,
                     fontSize = 14.sp,
                     color = if (isSelected) PrimaryText else SecondaryText,
                     fontWeight = if (isSelected) androidx.compose.ui.text.font.FontWeight.SemiBold else androidx.compose.ui.text.font.FontWeight.Normal
@@ -334,7 +386,30 @@ private fun CurrencyTabRow(
             }
         }
 
-        // iOS: SettingsButton().frame(width: 36, height: 36).padding(.leading, 12)
+        // 뉴스 탭
+        val isNewsSelected = selectedTab is TabSelection.News
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .clickable { onTabSelected(TabSelection.News) },
+            horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "뉴스",
+                fontSize = 14.sp,
+                color = if (isNewsSelected) PrimaryText else SecondaryText,
+                fontWeight = if (isNewsSelected) androidx.compose.ui.text.font.FontWeight.SemiBold else androidx.compose.ui.text.font.FontWeight.Normal
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(2.dp)
+                    .background(if (isNewsSelected) Primary else androidx.compose.ui.graphics.Color.Transparent)
+            )
+        }
+
+        // 설정 버튼
         IconButton(
             onClick = onSettingsClick,
             modifier = Modifier
