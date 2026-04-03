@@ -2,7 +2,7 @@
 
 > **목적**: Android 앱 구현 가이드 (iOS MVP 기반)
 > **Phase**: 1 - Android App 개발
-> **최종 수정**: 2026-03-19
+> **최종 수정**: 2026-04-03
 
 ---
 
@@ -21,8 +21,9 @@
 4. **은행별 비교 바 차트**: 순서/표시 커스터마이징, 동적 기준 환율 지원
 5. **오프라인 지원**: 캐시된 데이터로 오프라인 동작
 6. **환율 알림**: 목표 환율 도달 시 푸시 알림 (1-shot 알림, 최대 30개)
-7. **소셜 로그인**: Google Sign-In + Apple Sign-In (Firebase Auth OAuth, 웹 플로우)
-8. **프리미엄 구독**: RevenueCat 연동 (월간/연간, 무료 체험 지원)
+7. **뉴스**: 실시간 환율 뉴스 리스트 + 인앱 WebView 상세 (인증 불필요, 비구독자도 공개 기사 열람 가능)
+8. **소셜 로그인**: Google Sign-In + Apple Sign-In (Firebase Auth OAuth, 웹 플로우)
+9. **프리미엄 구독**: RevenueCat 연동 (월간/연간, 무료 체험 지원)
 
 > **Apple Sign-In**: Android에는 Apple 공식 SDK가 없어 **OAuth 웹 플로우**로 지원 예정.
 > Firebase Auth의 `OAuthProvider("apple.com")`을 사용하면 Android에서도 Apple 로그인 연동 가능.
@@ -86,7 +87,7 @@
 
 ```
 ┌─────────────────────────────────────────────┐
-│  [달러]  [엔화]  [유로]  ← 상단 탭 선택기    │
+│  [달러]  [엔화]  [유로]  [뉴스]  ← 상단 탭    │
 ├─────────────────────────────────────────────┤
 │                                             │
 │  ┌─────────────────────────────────────┐   │
@@ -133,7 +134,8 @@ app/
 │   │   │   │
 │   │   │   └── repository/
 │   │   │       ├── ExchangeRateRepositoryImpl.kt
-│   │   │       └── AlertRepository.kt
+│   │   │       ├── AlertRepository.kt
+│   │   │       └── NewsRepositoryImpl.kt
 │   │   │
 │   │   ├── domain/
 │   │   │   ├── model/
@@ -146,10 +148,14 @@ app/
 │   │   │   │   ├── SupportedCurrency.kt
 │   │   │   │   ├── AlertSetting.kt
 │   │   │   │   ├── AppState.kt
-│   │   │   │   └── RatesResult.kt
+│   │   │   │   ├── RatesResult.kt
+│   │   │   │   ├── TabSelection.kt         # 탭 상태 (Currency | News)
+│   │   │   │   ├── NewsItem.kt             # 뉴스 모델 + NewsResponse
+│   │   │   │   └── NewsContentType.kt      # external_link | report_pdf
 │   │   │   │
 │   │   │   └── repository/
-│   │   │       └── ExchangeRateRepository.kt
+│   │   │       ├── ExchangeRateRepository.kt
+│   │   │       └── NewsRepository.kt
 │   │   │
 │   │   ├── ui/
 │   │   │   ├── theme/
@@ -160,15 +166,18 @@ app/
 │   │   │   │   └── Type.kt
 │   │   │   │
 │   │   │   ├── screen/
-│   │   │   │   ├── MainScreen.kt       # 탭 + 환율 리스트
+│   │   │   │   ├── MainScreen.kt       # 탭 + 환율 리스트 + 뉴스
 │   │   │   │   ├── CurrencyTabContent.kt  # 통화별 탭 (그래프 + 바차트 + 알림)
-│   │   │   │   └── RootScreen.kt       # 인증/구독 분기, Paywall 오버레이
+│   │   │   │   ├── RootScreen.kt       # 인증/구독 분기, Paywall 오버레이
+│   │   │   │   ├── NewsTabContent.kt   # 뉴스 리스트 (4번째 탭)
+│   │   │   │   └── NewsDetailOverlay.kt # 풀스크린 WebView 오버레이
 │   │   │   │
 │   │   │   ├── viewmodel/
 │   │   │   │   ├── ExchangeRateViewModel.kt
 │   │   │   │   ├── GraphViewModel.kt   # 기간별 캐시, DXY, freshness
 │   │   │   │   ├── AlertViewModel.kt
-│   │   │   │   └── BankPreferenceViewModel.kt  # 은행 순서/표시 ViewModel
+│   │   │   │   ├── BankPreferenceViewModel.kt  # 은행 순서/표시 ViewModel
+│   │   │   │   └── NewsViewModel.kt    # 뉴스 (cooldown, adaptive polling, ticker)
 │   │   │   │
 │   │   │   ├── components/             # 공용 컴포넌트
 │   │   │   │   ├── RateGraphView.kt    # Compose Canvas 차트
@@ -179,7 +188,8 @@ app/
 │   │   │   │   ├── BankCustomizeSheet.kt  # 은행 순서 드래그 정렬 시트
 │   │   │   │   ├── BankIcon.kt
 │   │   │   │   ├── IOSStyleToggle.kt
-│   │   │   │   └── StatusComponents.kt
+│   │   │   │   ├── StatusComponents.kt
+│   │   │   │   └── NewsRow.kt          # 뉴스 리스트 셀
 │   │   │   │
 │   │   │   ├── alert/
 │   │   │   │   ├── AlertSection.kt
@@ -227,6 +237,8 @@ app/
 │   │   ├── values/
 │   │   │   ├── colors.xml
 │   │   │   └── strings.xml
+│   │   ├── xml/
+│   │   │   └── network_security_config.xml  # KB 이미지 HTTP 허용
 │   │   └── ...
 │   │
 │   └── AndroidManifest.xml
@@ -334,6 +346,26 @@ Authorization: Bearer {firebase_id_token}
 DELETE /api/notification-settings/{id}
 Authorization: Bearer {firebase_id_token}
 ```
+
+#### 뉴스 조회 API (인증 불필요)
+
+```http
+GET /api/news?limit=50&hours=24.0
+
+Response:
+{
+  "news": [
+    {"id": "...", "title": "...", "link": "...", "source": "einfomax", "content_type": "external_link", "published_at": "..."}
+  ],
+  "metadata": {"returned_count": 50, "window_hours": 24.0, "responded_at": "..."}
+}
+```
+
+> 상세 스펙: `../exchange-rate/NEWS_API_SPEC.md`
+> content_type: `external_link` (인앱 WebView), `report_pdf` (외부 브라우저)
+> 비구독자 필터링: `news.einfomax.co.kr` 공개, `fx.kbstar.com`/`rreport.einfomax.co.kr` 프리미엄
+>
+> **KB 호스트 예외 처리 (`fx.kbstar.com`)**: 앱 배너/공유 버튼 숨김 (JS 주입), 이미지 HTTP 허용 (`network_security_config.xml` + `mixedContentMode`)
 
 #### 기기 등록 API
 
@@ -1203,6 +1235,7 @@ Purchases.configure(
 ## 비구독자 서버 요청 정책
 
 > **핵심 원칙**: 비구독자(LockedPreviewScreen)는 FXi 서버에 어떤 요청도 하지 않습니다.
+> **예외**: `GET /api/news`는 인증 불필요 공개 API로, 비구독자도 요청 허용.
 
 ### 정책 범위
 
@@ -1212,6 +1245,9 @@ Purchases.configure(
 ├─ Graph REST API (기간별 그래프)
 ├─ Alert Settings API (알림 CRUD)
 └─ FCM 토큰 서버 등록 (푸시 알림)
+
+✅ FXi 서버 (비구독자 예외 허용)
+└─ GET /api/news (뉴스 조회, 인증 불필요)
 
 ✅ 외부 서비스 (비구독자도 허용)
 ├─ Firebase Auth (로그인/로그아웃)
@@ -1582,5 +1618,5 @@ fun calculateBarWidth(rate: Double, minRate: Double, maxRate: Double): Float {
 
 ---
 
-**최종 수정**: 2026-01-26
-**Phase**: 1 - Android MVP 개발 시작
+**최종 수정**: 2026-04-03
+**Phase**: 1 - Android MVP (v1.2.0 뉴스 서비스 추가)
