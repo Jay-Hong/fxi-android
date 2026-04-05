@@ -240,37 +240,50 @@ fun CurrencyTabContent(
                             .padding(horizontal = metrics.horizontalPadding)
                             .padding(top = 8.dp, bottom = 16.dp)
                     ) {
-                        Row(
+                        Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(bottom = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                                .padding(bottom = 8.dp)
                         ) {
-                            if (currency == SupportedCurrency.USD_KRW) {
-                                DxyToggleButton(
-                                    isSelected = dxyVisible,
-                                    onClick = { graphViewModel.toggleDxy() }
-                                )
-                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (currency == SupportedCurrency.USD_KRW) {
+                                    DxyToggleButton(
+                                        isSelected = dxyVisible,
+                                        onClick = { graphViewModel.toggleDxy() }
+                                    )
+                                }
 
-                            Spacer(modifier = Modifier.weight(1f))
-
-                            if (activePeriod == GraphPeriod.ONE_DAY) {
-                                SourceToggleRow(
-                                    selectedSources = selectedSources,
-                                    onToggle = { source -> graphViewModel.toggleSource(source) }
-                                )
                                 Spacer(modifier = Modifier.weight(1f))
+
+                                if (activePeriod == GraphPeriod.ONE_DAY) {
+                                    SourceToggleRow(
+                                        selectedSources = selectedSources,
+                                        onToggle = { source -> graphViewModel.toggleSource(source) }
+                                    )
+                                    Spacer(modifier = Modifier.weight(1f))
+                                }
+
+                                Icon(
+                                    imageVector = Icons.Default.Cancel,
+                                    contentDescription = "축소",
+                                    tint = SecondaryText,
+                                    modifier = Modifier
+                                        .size(22.dp)
+                                        .clickable { graphViewModel.setGraphFullscreen(false) }
+                                )
                             }
 
-                            Icon(
-                                imageVector = Icons.Default.Cancel,
-                                contentDescription = "축소",
-                                tint = SecondaryText,
-                                modifier = Modifier
-                                    .size(22.dp)
-                                    .clickable { graphViewModel.setGraphFullscreen(false) }
-                            )
+                            if (activePeriod != GraphPeriod.ONE_DAY) {
+                                Text(
+                                    text = currency.displayName,
+                                    color = SecondaryText,
+                                    fontSize = 11.sp,
+                                    modifier = Modifier.align(Alignment.Center)
+                                )
+                            }
                         }
 
                         // 그래프 (남은 공간 전체)
@@ -433,40 +446,51 @@ fun CurrencyTabContent(
                                 }
                                 .padding(metrics.sectionPadding)
                         ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                if (currency == SupportedCurrency.USD_KRW) {
-                                    DxyToggleButton(
-                                        isSelected = dxyVisible,
-                                        onClick = { graphViewModel.toggleDxy() }
-                                    )
-                                }
-
-                                Spacer(modifier = Modifier.weight(1f))
-
-                                if (activePeriod == GraphPeriod.ONE_DAY) {
-                                    SourceToggleRow(
-                                        selectedSources = selectedSources,
-                                        onToggle = { source -> graphViewModel.toggleSource(source) }
-                                    )
-                                    Spacer(modifier = Modifier.weight(1f))
-                                }
-
-                                Box(
-                                    modifier = Modifier
-                                        .size(26.dp)
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(InputBackground)
-                                        .clickable { graphViewModel.setGraphFullscreen(true) },
-                                    contentAlignment = Alignment.Center
+                            Box(modifier = Modifier.fillMaxWidth()) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.OpenInFull,
-                                        contentDescription = "전체 화면",
-                                        tint = SecondaryText,
-                                        modifier = Modifier.size(14.dp).rotate(90f)
+                                    if (currency == SupportedCurrency.USD_KRW) {
+                                        DxyToggleButton(
+                                            isSelected = dxyVisible,
+                                            onClick = { graphViewModel.toggleDxy() }
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.weight(1f))
+
+                                    if (activePeriod == GraphPeriod.ONE_DAY) {
+                                        SourceToggleRow(
+                                            selectedSources = selectedSources,
+                                            onToggle = { source -> graphViewModel.toggleSource(source) }
+                                        )
+                                        Spacer(modifier = Modifier.weight(1f))
+                                    }
+
+                                    Box(
+                                        modifier = Modifier
+                                            .size(26.dp)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(InputBackground)
+                                            .clickable { graphViewModel.setGraphFullscreen(true) },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.OpenInFull,
+                                            contentDescription = "전체 화면",
+                                            tint = SecondaryText,
+                                            modifier = Modifier.size(14.dp).rotate(90f)
+                                        )
+                                    }
+                                }
+
+                                if (activePeriod != GraphPeriod.ONE_DAY) {
+                                    Text(
+                                        text = currency.displayName,
+                                        color = SecondaryText,
+                                        fontSize = 11.sp,
+                                        modifier = Modifier.align(Alignment.Center)
                                     )
                                 }
                             }

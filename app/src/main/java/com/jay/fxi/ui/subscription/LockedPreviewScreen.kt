@@ -544,37 +544,50 @@ private fun SampleFullscreenGraphView(
             .windowInsetsPadding(WindowInsets.navigationBars)
             .padding(top = 8.dp, bottom = 12.dp)
     ) {
-        Row(
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .padding(horizontal = 16.dp, vertical = 8.dp)
         ) {
-            if (viewModel.hasDxyData(currency)) {
-                DxyToggleButton(
-                    isSelected = viewModel.dxyVisible,
-                    onClick = { viewModel.toggleDxy() }
-                )
-            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (viewModel.hasDxyData(currency)) {
+                    DxyToggleButton(
+                        isSelected = viewModel.dxyVisible,
+                        onClick = { viewModel.toggleDxy() }
+                    )
+                }
 
-            Spacer(modifier = Modifier.weight(1f))
-
-            if (viewModel.activePeriod == GraphPeriod.ONE_DAY) {
-                SourceToggleRow(
-                    selectedSources = viewModel.selectedSources,
-                    onToggle = { source -> viewModel.toggleSource(source) }
-                )
                 Spacer(modifier = Modifier.weight(1f))
+
+                if (viewModel.activePeriod == GraphPeriod.ONE_DAY) {
+                    SourceToggleRow(
+                        selectedSources = viewModel.selectedSources,
+                        onToggle = { source -> viewModel.toggleSource(source) }
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+
+                Icon(
+                    imageVector = Icons.Default.Cancel,
+                    contentDescription = "닫기",
+                    tint = SecondaryText,
+                    modifier = Modifier
+                        .size(22.dp)
+                        .clickable { onClose() }
+                )
             }
 
-            Icon(
-                imageVector = Icons.Default.Cancel,
-                contentDescription = "닫기",
-                tint = SecondaryText,
-                modifier = Modifier
-                    .size(22.dp)
-                    .clickable { onClose() }
-            )
+            if (viewModel.activePeriod != GraphPeriod.ONE_DAY) {
+                Text(
+                    text = currency.displayName,
+                    color = SecondaryText,
+                    fontSize = 11.sp,
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
         }
 
         Box(
@@ -980,40 +993,51 @@ private fun SampleGraphSection(
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            if (viewModel.hasDxyData(currency)) {
-                DxyToggleButton(
-                    isSelected = viewModel.dxyVisible,
-                    onClick = { viewModel.toggleDxy() }
-                )
-            }
-
-            Spacer(modifier = Modifier.weight(1f))
-
-            if (viewModel.activePeriod == GraphPeriod.ONE_DAY) {
-                SourceToggleRow(
-                    selectedSources = viewModel.selectedSources,
-                    onToggle = { source -> viewModel.toggleSource(source) }
-                )
-                Spacer(modifier = Modifier.weight(1f))
-            }
-
-            Box(
-                modifier = Modifier
-                    .size(26.dp)
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(InputBackground)
-                    .clickable { onFullscreenTap() },
-                contentAlignment = Alignment.Center
+        Box(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Default.OpenInFull,
-                    contentDescription = "전체 화면",
-                    tint = SecondaryText,
-                    modifier = Modifier.size(14.dp).rotate(90f)
+                if (viewModel.hasDxyData(currency)) {
+                    DxyToggleButton(
+                        isSelected = viewModel.dxyVisible,
+                        onClick = { viewModel.toggleDxy() }
+                    )
+                }
+
+                Spacer(modifier = Modifier.weight(1f))
+
+                if (viewModel.activePeriod == GraphPeriod.ONE_DAY) {
+                    SourceToggleRow(
+                        selectedSources = viewModel.selectedSources,
+                        onToggle = { source -> viewModel.toggleSource(source) }
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+
+                Box(
+                    modifier = Modifier
+                        .size(26.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(InputBackground)
+                        .clickable { onFullscreenTap() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.OpenInFull,
+                        contentDescription = "전체 화면",
+                        tint = SecondaryText,
+                        modifier = Modifier.size(14.dp).rotate(90f)
+                    )
+                }
+            }
+
+            if (viewModel.activePeriod != GraphPeriod.ONE_DAY) {
+                Text(
+                    text = currency.displayName,
+                    color = SecondaryText,
+                    fontSize = 11.sp,
+                    modifier = Modifier.align(Alignment.Center)
                 )
             }
         }
