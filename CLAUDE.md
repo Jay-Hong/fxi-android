@@ -366,6 +366,11 @@ Response:
 > 비구독자 필터링: `news.einfomax.co.kr` 공개, `fx.kbstar.com`/`rreport.einfomax.co.kr` 프리미엄
 >
 > **KB 호스트 예외 처리 (`fx.kbstar.com`)**: 앱 배너/공유 버튼 숨김 (JS 주입), 이미지 HTTP 허용 (`network_security_config.xml` + `mixedContentMode`)
+>
+> **새 뉴스 도착 동작 (NewsTabContent)**:
+> - 상단 근처(`firstVisibleItemIndex == 0 && offset < 120dp`)면 `animateScrollToItem(0)`
+> - 아래 읽는 중이면 "새 뉴스" 배너 표시 (탭 시 상단 이동)
+> - 뉴스 탭 비가시(`pagerState.settledPage != newsPageIndex`) 또는 상세 오버레이 열림 시 보류, 조건 해제 시 재평가
 
 #### 기기 등록 API
 

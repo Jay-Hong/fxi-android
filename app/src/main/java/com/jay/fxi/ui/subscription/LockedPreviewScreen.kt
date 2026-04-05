@@ -382,6 +382,8 @@ fun LockedPreviewScreen(
                                         error = newsError,
                                         refreshTrigger = newsRefreshTrigger,
                                         isPremium = false,
+                                        isTabVisible = pagerState.settledPage == newsPageIndex,
+                                        isDetailOpen = newsDetailUrl != null,
                                         onRetry = { newsViewModel.retry(isPremium = false) },
                                         onDetailOpen = { url -> newsDetailUrl = url }
                                     )

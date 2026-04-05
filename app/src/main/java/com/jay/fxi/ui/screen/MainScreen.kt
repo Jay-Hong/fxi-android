@@ -270,6 +270,8 @@ fun MainScreen(
                     error = newsError,
                     refreshTrigger = newsRefreshTrigger,
                     isPremium = isPremium,
+                    isTabVisible = pagerState.settledPage == newsPageIndex,
+                    isDetailOpen = newsDetailUrl != null,
                     onRetry = { newsViewModel.retry(isPremium) },
                     onDetailOpen = { url -> newsDetailUrl = url }
                 )
