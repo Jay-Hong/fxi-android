@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
@@ -178,6 +179,17 @@ fun NewsTabContent(
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = WindowInsets.navigationBars.asPaddingValues()
                 ) {
+                    // 비구독자 안내 배너 (리스트 최상단)
+                    if (!isPremium) {
+                        item(key = "non_premium_banner") {
+                            NonPremiumNoticeBanner()
+                            HorizontalDivider(
+                                color = SecondaryText.copy(alpha = 0.15f),
+                                modifier = Modifier.padding(horizontal = 20.dp)
+                            )
+                        }
+                    }
+
                     items(visibleItems, key = { it.id }) { item ->
                         NewsRow(
                             item = item,
@@ -236,5 +248,29 @@ private fun NewItemsBanner(
         )
         Spacer(modifier = Modifier.width(6.dp))
         Text(text = "새 뉴스", color = Color.White, fontSize = 12.sp)
+    }
+}
+
+@Composable
+private fun NonPremiumNoticeBanner() {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 10.dp)
+    ) {
+        Text(
+            text = "구독 시 최신 뉴스·아침 보고서 전체 보기",
+            color = PrimaryText,
+            fontSize = 13.sp,
+            lineHeight = 16.sp,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.Medium
+        )
+        Spacer(modifier = Modifier.height(1.dp))
+        Text(
+            text = "일부 콘텐츠는 구독자에게만 제공됩니다",
+            color = SecondaryText,
+            fontSize = 11.sp,
+            lineHeight = 14.sp
+        )
     }
 }
