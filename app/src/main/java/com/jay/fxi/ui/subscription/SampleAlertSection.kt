@@ -22,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddCircle
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Notifications
@@ -105,6 +106,7 @@ fun SampleAlertSection(
         ) {
             SectionContent(
                 settings = settings,
+                activeCount = activeCount,
                 viewModel = viewModel,
                 onAddTap = onAddTap,
                 onEditTap = onEditTap,
@@ -215,6 +217,7 @@ private fun SectionHeader(
 @Composable
 private fun SectionContent(
     settings: List<SampleAlertSetting>,
+    activeCount: Int,
     viewModel: SamplePreviewViewModel,
     onAddTap: () -> Unit,
     onEditTap: (SampleAlertSetting) -> Unit,
@@ -230,6 +233,10 @@ private fun SectionContent(
         if (settings.isEmpty()) {
             EmptyStateView(metrics)
         } else {
+            // 모든 알림이 비활성 상태일 때만 안내 노출 (빈 목록은 EmptyStateView가 처리)
+            if (activeCount == 0) {
+                DisabledHintView(metrics)
+            }
             AlertListView(
                 settings = settings,
                 viewModel = viewModel,
@@ -243,6 +250,38 @@ private fun SectionContent(
             remainingCount = viewModel.remainingAlertCount,
             onAddTap = onAddTap,
             metrics = metrics
+        )
+    }
+}
+
+@Composable
+private fun DisabledHintView(metrics: RateLayoutMetrics) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = metrics.horizontalPadding)
+            .padding(top = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = Icons.Outlined.Info,
+            contentDescription = null,
+            tint = Color(0xFFFFA500),
+            modifier = Modifier.size(12.dp)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = "기본 예시 알림은 꺼져 있습니다. 토글을 켜서 체험해보세요.",
+            fontSize = 12.sp,
+            lineHeight = 14.sp,
+            color = SecondaryText,
+            style = TextStyle(
+                platformStyle = PlatformTextStyle(includeFontPadding = false),
+                lineHeightStyle = LineHeightStyle(
+                    alignment = LineHeightStyle.Alignment.Center,
+                    trim = LineHeightStyle.Trim.Both
+                )
+            )
         )
     }
 }

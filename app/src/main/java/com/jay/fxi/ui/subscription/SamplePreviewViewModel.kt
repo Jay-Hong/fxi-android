@@ -122,21 +122,25 @@ class SamplePreviewViewModel {
         val kbRate = rates.firstOrNull { it.bank == Bank.KB.code }?.rate ?: 0.0
         val hanaRate = rates.firstOrNull { it.bank == Bank.HANA.code }?.rate ?: 0.0
 
+        // 기본 샘플 알림은 비활성화 상태로 시작 (뜬금없는 트리거 방지 + 능동적 체험 유도)
         alertSettings = listOf(
             SampleAlertSetting(
                 bank = Bank.INVESTING,
                 condition = AlertCondition.ABOVE,
-                threshold = investingRate + 0.15
+                threshold = investingRate + 0.15,
+                isEnabled = false
             ),
             SampleAlertSetting(
                 bank = Bank.KB,
                 condition = AlertCondition.BELOW,
-                threshold = kbRate - 0.20
+                threshold = kbRate - 0.20,
+                isEnabled = false
             ),
             SampleAlertSetting(
                 bank = Bank.HANA,
                 condition = AlertCondition.ABOVE,
-                threshold = hanaRate + 0.10
+                threshold = hanaRate + 0.10,
+                isEnabled = false
             )
         )
     }

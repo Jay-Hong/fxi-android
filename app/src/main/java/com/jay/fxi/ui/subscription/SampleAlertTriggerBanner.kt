@@ -31,7 +31,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -67,6 +70,15 @@ fun SampleAlertTriggerBanner(
 
 private val BannerBackground = Color(0xFF363638)
 private val BannerBorder = Color.White.copy(alpha = 0.15f)
+
+/** 줄간격 최소화: fontPadding 제거 + lineHeight 양끝 trim */
+private val TightLineHeightStyle = TextStyle(
+    platformStyle = PlatformTextStyle(includeFontPadding = false),
+    lineHeightStyle = LineHeightStyle(
+        alignment = LineHeightStyle.Alignment.Center,
+        trim = LineHeightStyle.Trim.Both
+    )
+)
 
 @Composable
 private fun BannerContent(
@@ -104,25 +116,54 @@ private fun BannerContent(
         // 알림 내용
         Column(
             modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(0.dp)
+            verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
+            // 배너 상단 예시 배지
+            Text(
+                text = "예시 알림",
+                fontSize = 9.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFFFFA500),
+                lineHeight = 9.sp,
+                modifier = Modifier
+                    .background(
+                        Color(0xFFFFA500).copy(alpha = 0.2f),
+                        RoundedCornerShape(percent = 50)
+                    )
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            )
             Text(
                 text = title,
                 fontSize = 13.sp,
+                lineHeight = 13.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = Color.White,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                softWrap = false
+                softWrap = false,
+                style = TightLineHeightStyle
             )
             Text(
                 text = body,
                 fontSize = 13.sp,
+                lineHeight = 13.sp,
                 fontWeight = FontWeight.Normal,
                 color = Color.White.copy(alpha = 0.9f),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                softWrap = false
+                softWrap = false,
+                style = TightLineHeightStyle
+            )
+            // 체험용 안내 캡션
+            Text(
+                text = "실제 푸시가 아닌 앱 내 체험용 미리보기",
+                fontSize = 10.sp,
+                lineHeight = 10.sp,
+                fontWeight = FontWeight.Normal,
+                color = Color.White.copy(alpha = 0.6f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = TightLineHeightStyle
             )
         }
 
