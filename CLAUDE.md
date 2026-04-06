@@ -350,7 +350,7 @@ Authorization: Bearer {firebase_id_token}
 #### 뉴스 조회 API (인증 불필요)
 
 ```http
-GET /api/news?limit=50&hours=24.0
+GET /api/news?limit=100&hours=24.0
 
 Response:
 {

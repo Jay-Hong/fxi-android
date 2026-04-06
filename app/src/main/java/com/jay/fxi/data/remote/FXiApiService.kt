@@ -66,7 +66,7 @@ interface FXiApiService {
      */
     @GET("api/news")
     suspend fun getNews(
-        @Query("limit") limit: Int = 50,
+        @Query("limit") limit: Int = 100,
         @Query("hours") hours: Double = 24.0
     ): NewsResponse
 
