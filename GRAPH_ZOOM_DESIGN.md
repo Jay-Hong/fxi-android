@@ -148,25 +148,46 @@ iOS v2.5가 1d만 줌 활성인 이유는 Swift Charts의 제약에서 파생된
 - Pinch로 완전 줌아웃 → default 자동 복귀 + follow 자동 on
 - 기본 보기 1-finger 드래그 → 통화 탭 스와이프 유지 (Pager 전달)
 
-**알려진 한계**: 더블탭 토글, follow-latest 명시 인디케이터, fullscreen 제스처 정책은 M3 범위.
+**알려진 한계 (M2 시점)**: 더블탭 토글과 fullscreen 제스처 정책이 미구현 상태였음 — 둘 다 M3에서 해결 (아래 M3 섹션 참조). Follow-latest 명시 인디케이터는 M3 검토 결과 iOS parity 기준 불필요로 결론.
 
-### M3 — 더블탭 + Follow-latest 명시 + Fullscreen 정책 (v2.2 parity 완성)
+### M3 — 더블탭 + Follow-latest 명시 + Fullscreen 정책 (v2.2 parity) (완료)
 
-**목표**: iOS v2.2 단계까지 기능 일치.
+**목표였던 것**: iOS v2.2 단계까지 기능 일치.
 
-**작업**:
-- **더블탭 줌 토글**: 6h window + reset
-  - `detectTapGestures(onDoubleTap = ...)` 또는 수동 double tap 감지
-  - plot bounds guard: Canvas size 내부 좌표만 처리
-  - 줌 안 된 상태 + 탭 → 탭 위치 중심 6h 줌인
-  - 줌 상태 + 탭 → reset
-- **Follow-latest 명시화**
-  - `pocIsFollowingLatest: Boolean` state
-  - 제스처 ended 시 reevaluate (raw upperBound가 lastTs 근처면 follow=true)
+**완료 내역** (세부 커밋 해시는 §11 작업 이력 참조):
+
+- **더블탭 줌 토글 — manual 감지** ([RateGraphView.kt](app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt))
+  - `awaitEachGesture` 내부에서 tap 자격(`maxPointers == 1` + `maxTravel < touchSlop` + `duration < longPressTimeout` + pinch 미발생 + plot 영역 내부) 판정.
+  - `detectTapGestures`를 별도 `pointerInput` chain으로 얹는 접근은 배제. 줌 상태의 PAN 경로에서 1-finger 이벤트가 consume되므로 `detectTapGestures`(default `requireUnconsumed = true`) 가 이벤트를 못 보고 reset 더블탭이 작동하지 않기 때문.
+  - `ViewConfiguration` 표준값(`touchSlop`, `longPressTimeoutMillis`, `doubleTapTimeoutMillis`, `doubleTapMinTimeMillis`) 사용.
+  - 줌 OFF + 더블탭 → `currentResolvedVisibleDomain ?: (currentDataBounds.start..(lastDataTs + trailingBufferSec(period)))` baseline 기반으로 탭 fraction → tapTimeSec → 6h window → `clampVisibleDomain`. distance(raw.endInclusive, lastDataTs) < 600s이면 follow on.
+  - 줌 ON + 더블탭 → `pocVisibleDomain = null` + follow on (reset).
+  - 단일 탭 복구: PAN 경로가 줌 상태에서 `pocIsFollowingLatest = false` + raw sync 같은 side-effect를 남기는데, 단일 탭이면 gesture 시작 시점의 `preGestureDomain`/`preGestureFollow` 스냅샷을 복구 → 의도치 않은 follow 중단 방지.
+  - Plot bounds guard: `downPosition.x in plotLeft..(plotLeft + plotWidth)` + `downPosition.y in plotTopPx..plotBottomPx`. x축 라벨/Y축 숫자 영역 탭은 자격 탈락.
+- **구현 중 발견·수정한 edge case 2건** (역사 기록):
+  1. **더블탭 timeout 기준을 `downTimeMs`로 저장**: 초기 구현에서 `pocLastTapTimeMs = downTimeMs`로 기록하고 `sinceLast = (tap2 down) - (tap1 down)`로 비교. Android `GestureDetector.DOUBLE_TAP_TIMEOUT` 관례는 "첫 탭의 up → 두 번째 탭의 down" 간격이라, down 기준 저장 시 첫 탭이 길었던 만큼 허용 window가 단축돼 느린 더블탭이 놓쳐질 수 있음. 해결: `pocLastTapTimeMs = lastUpTimeMs` (up 시점 저장).
+  2. **non-tap gesture가 lastTap 후보를 무효화하지 않음**: `wasTap == false`로 종료된 gesture(실패 pan, pinch, long press, plot 밖 짧은 탭, pager pass-through)에서 `pocLastTapTimeMs`를 그대로 두면, `tap1(plot 안) → 실패 pan → tap2(plot 안)` 시퀀스에서 tap1과 tap2가 잘못 묶여 false-positive double tap이 발생. 해결: `wasTap == false`인 모든 종료에서 `pocLastTapTimeMs = 0L` 리셋. Android `GestureDetector`와 동일 semantic.
+- **Follow-latest 명시화** — M1에서 이미 `pocIsFollowingLatest: Boolean` state 도입, M2에서 gesture-end 재평가(`unzoomedLen * 99%` full-unzoom 릴리스 + `distance(raw.upperBound, lastTs) < 600s`)가 완료돼 있어 M3 범위에서 추가 구현 없음. iOS도 인디케이터/아이콘 없이 자동 재평가만 사용하므로 parity 유지.
 - **Fullscreen 정책 정리** ([CurrencyTabContent.kt](app/src/main/java/com/jay/fxi/ui/screen/CurrencyTabContent.kt))
-  - Wrapper 더블탭 → fullscreen 진입 **제거** (새 더블탭 정책과 충돌)
-  - Fullscreen 진입은 [OpenInFull 아이콘 버튼](app/src/main/java/com/jay/fxi/ui/screen/CurrencyTabContent.kt) 유지
-  - Fullscreen 내부 제스처 — v1.0 문서 §7 이식 (iOS 패턴과 같음)
+  - Normal mode 그래프 wrapper의 `detectTapGestures(onDoubleTap = setGraphFullscreen(true))` **제거**. 그래프 내부 더블탭 = 줌인/리셋, 그래프 "주변"(label/여백) 더블탭 = fullscreen 진입이 되어 같은 제스처가 위치에 따라 의미가 달라지는 혼란 발생. iOS도 동일 이유로 제거함. 진입은 `OpenInFull` 아이콘 clickable로 단일화.
+  - Fullscreen mode 그래프 wrapper의 `detectTapGestures(onDoubleTap = setGraphFullscreen(false))` **제거**. wrapper `detectTapGestures`가 outer에서 event를 consume해 RateGraphView 내부 M3-a 더블탭 줌이 먹통이 되는 역회귀가 발생. 종료는 `Cancel` 아이콘 clickable로 단일화.
+  - **Rates 섹션** 더블탭 (진입/나가기)은 M3-b 범위 밖으로 유지 — rates 영역에는 내부 더블탭 제스처가 없어 wrapper와 충돌할 대상이 없기 때문.
+
+**기기 검증 통과** (Jay 수동, 2026-04-15 후속):
+
+- 기본 보기 2-finger pinch (떨림 없음), finger-centered anchor 유지 (M2 회귀)
+- 기본 보기 plot 안 더블탭 → 6h 줌인, 탭 위치 중심
+- 줌 상태 더블탭 → default 복귀 + follow 자동 on
+- 느린 더블탭 (첫 탭 100ms+ 지속) → 정상 double tap (edge case 1 fix 확인)
+- tap → 빠른 pan → tap 시퀀스 → 각각 독립 single tap (edge case 2 fix 확인)
+- 그래프 주변(라벨/여백) 더블탭 → fullscreen 진입 안 됨 (원래 버그 해소)
+- OpenInFull 아이콘 → fullscreen 정상 진입
+- Cancel 아이콘 → fullscreen 정상 나가기
+- Fullscreen 안 더블탭 → 줌인/리셋 동작 (wrapper 가로채기 없음)
+- Rates 섹션 더블탭 → rates fullscreen 진입/나가기 정상 (범위 밖 회귀)
+- 기본 보기 1-finger 드래그 → 통화 탭 스와이프 (Pager arbitration 회귀)
+
+**알려진 한계**: fullscreen mode의 단일 탭 종료 affordance는 iOS에 있지만 Android에는 없음. §9 iOS divergence 항목 참조.
 
 ### M4 — DXY 정합성 + 30분 보조 grid (v2.3/v2.4 parity)
 
@@ -405,6 +426,24 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
 | plotFrame 갱신 트리거 보강 | iOS에도 후순위 | post-parity |
 | 예시화면 follow-latest 자동 슬라이드 | iOS에 부재 (SampleData 정적) | 공용 composable 구조라 Android에서도 동일 한계 |
 | xTicks 15m/10m 세분화 | 30m까지만 계획 | post-parity |
+| **Graph fullscreen 단일 탭 종료 (iOS divergence)** | **의도적 divergence** | **post-parity 후보** |
+
+### iOS divergence — Graph fullscreen 단일 탭 종료 (M3-b)
+
+**무엇이 다른가**:
+
+- iOS: `RateGraphView` fullscreen overlay에 `.onTapGesture {}` (단일 탭) + `.xmark.circle.fill` 버튼 두 종료 경로. UIKit recognizer chain의 double-tap-to-fail 메커니즘으로 단일 탭과 내부 더블탭 zoom이 자연스럽게 공존.
+- Android: `Cancel` 아이콘 clickable 단일 종료 경로. wrapper `detectTapGestures` 완전 제거.
+
+**왜 다른가**:
+
+1. Compose에서 `detectTapGestures`를 outer로 chain하면 event를 consume하여 `RateGraphView` 내부의 M3-a manual double-tap zoom이 작동하지 않는 역회귀가 발생 (M3-b 초기 테스트에서 확인).
+2. iOS와 동일한 "단일 탭 종료 + 더블탭 zoom" 공존을 위해선 `RateGraphView`에 `onSingleTap: (() -> Unit)?` 콜백 파라미터를 추가하고 manual tap 감지 내부에서 단일 탭 분기를 외부로 라우팅해야 함 → API 확장 + 테스트 부담.
+3. 사용자 의도가 "확대 버튼만 남기고 wrapper 더블탭 제거" 방향이었고, ETC 원칙(복잡도 대비 실익)으로 평가 시 Android는 단순 정책이 합리적이라 판단.
+
+**언제 재검토**:
+
+단일 탭 fullscreen 종료 affordance가 UX 요구사항으로 돌아오면 (예: Cancel 아이콘 도달성 문제 보고) `RateGraphView` onSingleTap 콜백 확장 방향으로 재검토. 현재는 Cancel 아이콘이 우상단에 명확히 배치돼 있어 실익 없음.
 
 ---
 
@@ -431,6 +470,12 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
             구현 중 버그 4건 발견·수정 (stale capture / trailing buffer baseline /
             clamp mid-gesture null / frozen baseline per-frame zoom)
             기기 검증 5종 통과 후 커밋 6b111cb
+2026-04-15  M3 구현 (graph manual double-tap zoom + wrapper fullscreen 정책 정리)
+            M3-a: awaitEachGesture 내부 manual tap 감지 + 더블탭 6h 토글.
+                  edge case 2건(lastUpTimeMs 저장 기준 / non-tap lastTap 리셋) 수정
+            M3-b: CurrencyTabContent.kt wrapper detectTapGestures 2건 제거 +
+                  iOS divergence 주석 (fullscreen 단일 탭 종료는 의도적으로 미채택)
+            기기 검증 11종 통과 후 커밋 ef2de3c / 38064aa
 ```
 
 git 커밋 (Android):
@@ -440,4 +485,7 @@ git 커밋 (Android):
 - `4814d98` — refactor(android): M1 상태 모델 전환 + computeChartState 분해
 - `37cae1b` — docs(android): M1 이력 보정 + current HEAD 표기 규칙 적용
 - `6b111cb` — feat(android): M2 graph zoom — finger-centered pinch + 1-finger pan + pager arbitration
-- **current HEAD** — docs(android): M2 완료 이력 반영 (§4 M2 + §6 Pager arbitration + §11 타임라인/커밋)
+- `424501b` — docs(android): M2 완료 이력 반영 (§4 M2 + §6 Pager arbitration + §11)
+- `ef2de3c` — feat(android): M3-a graph manual double-tap zoom (awaitEachGesture 내부 감지)
+- `38064aa` — refactor(android): M3-b graph wrapper 더블탭 fullscreen 제거 + iOS divergence 주석
+- **current HEAD** — docs(android): M3 완료 이력 반영 (§4 M3 + §9 iOS divergence + §11)
