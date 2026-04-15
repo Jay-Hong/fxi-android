@@ -1,6 +1,9 @@
 package com.jay.fxi.ui.components
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,7 +15,11 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -20,6 +27,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
@@ -174,11 +182,64 @@ private fun RateGraphCanvas(
         TextStyle(fontSize = 10.sp, color = GraphSource.DXY.color.copy(alpha = 0.85f), fontFeatureSettings = "tnum")
     }
 
-    val chartState = remember(rateGraphData, dxyGraphData, period) {
-        computeChartState(rateGraphData, dxyGraphData, period)
+    // MARK: - PoC: Graph zoom (1d period only)
+    // See GRAPH_ZOOM_DESIGN.md §4. Scope: pinch-to-zoom only, anchored to right edge.
+    // Excluded from PoC v1: pan, reset gesture, isInteracting lock, fling.
+    var pocVisibleLengthSec by remember { mutableStateOf<Long?>(null) }
+
+    // 기간 변경 시 줌 리셋 (설계서 §3)
+    LaunchedEffect(period) {
+        pocVisibleLengthSec = null
+    }
+
+    // 전체 데이터의 시간 폭 (초)
+    val totalLengthSec = remember(rateGraphData, dxyGraphData) {
+        val all = rateGraphData.values.flatten() + dxyGraphData
+        if (all.isEmpty()) 86_400L
+        else (all.maxOf { it.bucketTs } - all.minOf { it.bucketTs }).toLong().coerceAtLeast(1L)
+    }
+
+    // 줌 상태의 visible window (1d만, 오른쪽 edge 앵커)
+    val pocVisibleWindow: IntRange? = remember(pocVisibleLengthSec, rateGraphData, dxyGraphData, period) {
+        if (period != GraphPeriod.ONE_DAY) return@remember null
+        val visLen = pocVisibleLengthSec ?: return@remember null
+        val all = rateGraphData.values.flatten() + dxyGraphData
+        val lastTs = all.maxOfOrNull { it.bucketTs } ?: return@remember null
+        val start = (lastTs - visLen).toInt()
+        start..lastTs
+    }
+
+    val chartState = remember(rateGraphData, dxyGraphData, period, pocVisibleWindow) {
+        computeChartState(rateGraphData, dxyGraphData, period, pocVisibleWindow)
     } ?: return
 
-    Canvas(modifier = modifier) {
+    Canvas(
+        // PoC: HorizontalPager와의 제스처 공존을 위해 detectTransformGestures 대신
+        // awaitEachGesture 수동 루프를 사용. 2+ 포인터에서만 consume하여
+        // 1-손가락 드래그는 Pager로 그대로 전파. (G1 검증 목적)
+        modifier = modifier.pointerInput(period, totalLengthSec) {
+            if (period != GraphPeriod.ONE_DAY) return@pointerInput
+            awaitEachGesture {
+                awaitFirstDown(requireUnconsumed = false)
+                do {
+                    val event = awaitPointerEvent()
+                    val activePointers = event.changes.count { it.pressed }
+                    if (activePointers >= 2) {
+                        val zoomChange = event.calculateZoom()
+                        if (zoomChange != 1f) {
+                            val current = pocVisibleLengthSec ?: totalLengthSec
+                            val newLength = (current / zoomChange).toLong()
+                                .coerceIn(3_600L, totalLengthSec)
+                            pocVisibleLengthSec =
+                                if (newLength >= totalLengthSec) null else newLength
+                            // 2+ finger pinch만 consume — 1-finger pan은 Pager로 pass through
+                            event.changes.forEach { it.consume() }
+                        }
+                    }
+                } while (event.changes.any { it.pressed })
+            }
+        }
+    ) {
         val leftPad = with(density) { if (chartState.hasDxy) 34.dp.toPx() else 8.dp.toPx() }
         val rightPad = with(density) { 40.dp.toPx() }
         val bottomPad = with(density) { 16.dp.toPx() }
@@ -317,20 +378,33 @@ private fun RateGraphCanvas(
 private fun computeChartState(
     rateGraphData: Map<GraphSource, List<GraphBucket>>,
     dxyGraphData: List<GraphBucket>,
-    period: GraphPeriod
+    period: GraphPeriod,
+    visibleWindow: IntRange? = null  // PoC: 1d 줌 상태에서만 non-null
 ): ChartState? {
     val rateBuckets = rateGraphData.values.flatten()
     val allBuckets = if (rateBuckets.isNotEmpty()) rateBuckets + dxyGraphData else dxyGraphData
     if (allBuckets.isEmpty()) return null
 
-    val allTs = allBuckets.map { it.bucketTs }
-    val xMin = allTs.min()
-    val lastDataTs = allTs.max()
-    val xMax = lastDataTs + trailingBufferSec(period)
+    // PoC: visible window이 설정되면 y-range 계산용 버킷을 필터링
+    val visibleRateBuckets = visibleWindow?.let { w ->
+        rateBuckets.filter { it.bucketTs in w }.ifEmpty { rateBuckets }
+    } ?: rateBuckets
+    val visibleDxyBuckets = visibleWindow?.let { w ->
+        dxyGraphData.filter { it.bucketTs in w }.ifEmpty { dxyGraphData }
+    } ?: dxyGraphData
 
-    val rateCloses = rateBuckets.map { it.close }
-    val fallbackCloses = dxyGraphData.map { it.close }
+    val allTs = allBuckets.map { it.bucketTs }
+    val fullXMin = allTs.min()
+    val lastDataTs = allTs.max()
+
+    // x축 범위: visible window 설정 시 그 범위로, 아니면 전체 + trailing buffer
+    val xMin = visibleWindow?.first ?: fullXMin
+    val xMax = visibleWindow?.last ?: (lastDataTs + trailingBufferSec(period))
+
+    val rateCloses = visibleRateBuckets.map { it.close }
+    val fallbackCloses = visibleDxyBuckets.map { it.close }
     val targetCloses = if (rateCloses.isNotEmpty()) rateCloses else fallbackCloses
+    if (targetCloses.isEmpty()) return null
     val minClose = targetCloses.min()
     val maxClose = targetCloses.max()
     val margin = (maxClose - minClose) * 0.05
@@ -338,8 +412,8 @@ private fun computeChartState(
     val paddedMax = maxClose + margin
     val yDomainMargin = 0.8
 
-    val hasDxy = dxyGraphData.isNotEmpty()
-    val dxyCloses = dxyGraphData.map { it.close }
+    val hasDxy = visibleDxyBuckets.isNotEmpty()
+    val dxyCloses = visibleDxyBuckets.map { it.close }
     val rawDxyMin = dxyCloses.minOrNull()
     val rawDxyMax = dxyCloses.maxOrNull()
     val dxyMargin = if (rawDxyMin != null && rawDxyMax != null) (rawDxyMax - rawDxyMin) * 0.05 else 0.0
