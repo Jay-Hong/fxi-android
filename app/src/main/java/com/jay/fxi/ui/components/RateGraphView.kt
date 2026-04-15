@@ -27,6 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.input.pointer.pointerInput
@@ -153,7 +154,9 @@ private data class XTick(
     val ts: Int,
     val label: String?,
     val showLabel: Boolean,
-    val isMidnight: Boolean = false
+    val isMidnight: Boolean = false,
+    // M4-c: 30분 보조 grid (visible <= 2.5h일 때만 추가). 라벨 없이 dashed line만 그림.
+    val isHalfHour: Boolean = false
 )
 
 private data class YTick(
@@ -615,9 +618,28 @@ private fun RateGraphCanvas(
             )
         }
 
+        // M4-c: 30분 보조 grid의 dashed line effect (강한 줌 시 정각 tick 사이 보조선).
+        val halfHourDashEffect = PathEffect.dashPathEffect(
+            floatArrayOf(with(density) { 3.dp.toPx() }, with(density) { 3.dp.toPx() }),
+            0f
+        )
+        // 30분 보조 grid 색상 — 정각 grid(alpha 0.3)보다 명확히 흐려야 시각 위계 유지.
+        // Color.copy(alpha)는 곱셈이 아닌 교체이므로 0.3보다 작은 절대값을 직접 지정.
+        val halfHourGridColor = SecondaryText.copy(alpha = 0.18f)
         for (tick in xTicks) {
             val x = layout.mapX(tick.ts)
             if (x < layout.chartLeft || x > layout.chartRight) continue
+            if (tick.isHalfHour) {
+                // 30분 grid: dashed, 라벨 없음, 정각 tick보다 흐림
+                drawLine(
+                    color = halfHourGridColor,
+                    start = Offset(x, layout.chartTop),
+                    end = Offset(x, layout.chartBottom),
+                    strokeWidth = gridStroke,
+                    pathEffect = halfHourDashEffect
+                )
+                continue
+            }
             drawLine(
                 color = if (tick.isMidnight) midnightGridColor else gridColor,
                 start = Offset(x, layout.chartTop),
@@ -926,31 +948,97 @@ private fun computeXTicks(
     val kst = TimeZone.of("Asia/Seoul")
     return when (period) {
         GraphPeriod.ONE_DAY -> {
-            val ticks = mutableListOf<XTick>()
-            val startDt = Instant.fromEpochSeconds(xMin.toLong()).toLocalDateTime(kst)
-            val hourAligned = (startDt.hour / 3) * 3
-            val tickDt = kotlinx.datetime.LocalDateTime(
-                startDt.year, startDt.monthNumber, startDt.dayOfMonth, hourAligned, 0, 0
-            )
-            var tickTs = tickDt.toInstant(kst).epochSeconds.toInt()
-            if (tickTs < xMin) tickTs += 3 * 3600
-            while (tickTs <= xMax) {
-                val dt = Instant.fromEpochSeconds(tickTs.toLong()).toLocalDateTime(kst)
-                ticks += XTick(
-                    ts = tickTs,
-                    label = if (dt.hour == 0) "${dt.monthNumber}/${dt.dayOfMonth}" else "%02d".format(dt.hour),
-                    showLabel = tickTs <= lastDataTs && (lastDataTs - tickTs) >= 600,
-                    isMidnight = dt.hour == 0
-                )
-                tickTs += 3 * 3600
+            // M4-c: visible length 기반 adaptive hour interval + 강한 줌(≤ 2.5h)에서 30분 보조 grid.
+            // 정각 tick과 30분 grid는 서로 다른 함수에서 별도 생성한 뒤 merge sorted (한 루프에 섞으면
+            // 중복/누락 위험).
+            val visibleLengthSec = (xMax - xMin).coerceAtLeast(1)
+            val hourInterval = adaptiveHourIntervalOneDay(visibleLengthSec)
+            val hourTicks = generateHourTicksOneDay(xMin, xMax, hourInterval, lastDataTs, kst)
+            if (visibleLengthSec <= 2 * 3600 + 1800) {
+                val halfHourGrids = generateHalfHourGridsOneDay(xMin, xMax, kst)
+                (hourTicks + halfHourGrids).sortedBy { it.ts }
+            } else {
+                hourTicks
             }
-            ticks
         }
 
         GraphPeriod.ONE_WEEK -> generateDayTicks(xMin, xMax, lastDataTs, 1)
         GraphPeriod.THREE_MONTHS -> generateDayTicks(xMin, xMax, lastDataTs, 14)
         GraphPeriod.ONE_YEAR -> generateMonthTicks(xMin, xMax, lastDataTs)
     }
+}
+
+/// M4-c: visible length 기반 1d adaptive hour interval. iOS pocAdaptiveHourInterval 등가.
+/// - 12h 초과 → 3시간
+/// - 6h 초과 → 1시간
+/// - 그 외 → 1시간 (30min은 정수 시간 alignment가 필요해 1h로 clamp; 30분 grid는 별도 함수에서 생성)
+///
+/// ⚠️ 정수 나눗셈으로 hours를 계산하면 12h ~ 12h59m 구간이 hours == 12로 truncate되어
+/// "> 12" false가 되고 iOS Double semantic 대비 임계점이 어긋남. 초 단위로 직접 비교.
+private fun adaptiveHourIntervalOneDay(visibleLengthSec: Int): Int {
+    return when {
+        visibleLengthSec > 12 * 3600 -> 3
+        visibleLengthSec > 6 * 3600 -> 1
+        else -> 1
+    }
+}
+
+/// M4-c: ONE_DAY 정각 tick 생성 (hourInterval 단위로 정렬). 기존 ONE_DAY 분기에서
+/// 하드코딩됐던 3시간 로직을 hourInterval 변수화하여 추출.
+private fun generateHourTicksOneDay(
+    xMin: Int,
+    xMax: Int,
+    hourInterval: Int,
+    lastDataTs: Int,
+    kst: TimeZone
+): List<XTick> {
+    val ticks = mutableListOf<XTick>()
+    val startDt = Instant.fromEpochSeconds(xMin.toLong()).toLocalDateTime(kst)
+    val hourAligned = (startDt.hour / hourInterval) * hourInterval
+    val tickDt = kotlinx.datetime.LocalDateTime(
+        startDt.year, startDt.monthNumber, startDt.dayOfMonth, hourAligned, 0, 0
+    )
+    var tickTs = tickDt.toInstant(kst).epochSeconds.toInt()
+    if (tickTs < xMin) tickTs += hourInterval * 3600
+    while (tickTs <= xMax) {
+        val dt = Instant.fromEpochSeconds(tickTs.toLong()).toLocalDateTime(kst)
+        ticks += XTick(
+            ts = tickTs,
+            label = if (dt.hour == 0) "${dt.monthNumber}/${dt.dayOfMonth}" else "%02d".format(dt.hour),
+            showLabel = tickTs <= lastDataTs && (lastDataTs - tickTs) >= 600,
+            isMidnight = dt.hour == 0
+        )
+        tickTs += hourInterval * 3600
+    }
+    return ticks
+}
+
+/// M4-c: ONE_DAY 30분 보조 grid 생성. minute==30 위치만 반환. 정각 tick과 중복 없도록
+/// 항상 30분 단위만 생성. iOS generateHalfHourGrids 등가.
+private fun generateHalfHourGridsOneDay(
+    xMin: Int,
+    xMax: Int,
+    kst: TimeZone
+): List<XTick> {
+    val ticks = mutableListOf<XTick>()
+    val startDt = Instant.fromEpochSeconds(xMin.toLong()).toLocalDateTime(kst)
+    // 가장 가까운 :30 시점부터 시작
+    val firstHalfDt = kotlinx.datetime.LocalDateTime(
+        startDt.year, startDt.monthNumber, startDt.dayOfMonth, startDt.hour, 30, 0
+    )
+    var tickTs = firstHalfDt.toInstant(kst).epochSeconds.toInt()
+    if (tickTs < xMin) tickTs += 3600
+    while (tickTs <= xMax) {
+        ticks += XTick(
+            ts = tickTs,
+            label = null,
+            showLabel = false,
+            isMidnight = false,
+            isHalfHour = true
+        )
+        tickTs += 3600
+    }
+    return ticks
 }
 
 private fun generateDayTicks(
