@@ -189,26 +189,63 @@ iOS v2.5가 1d만 줌 활성인 이유는 Swift Charts의 제약에서 파생된
 
 **알려진 한계**: fullscreen mode의 단일 탭 종료 affordance는 iOS에 있지만 Android에는 없음. §9 iOS divergence 항목 참조.
 
-### M4 — DXY 정합성 + 30분 보조 grid (v2.3/v2.4 parity)
+### M4 — DXY 정합성 + Gesture y-lock + 30분 보조 grid (v2.3/v2.4 parity) (완료)
 
-**목표**: 폴리시 단계.
+**목표였던 것**: 폴리시 단계 — DXY 시각 결손 제거 + gesture 중 라벨 안정 + adaptive xTicks.
 
-**작업**:
-- **DXY 경계 보간** (v2.3)
-  - `interpolateDxyBoundaryPoint` 등가 — visible 양 경계에 interpolated 가상 `GraphBucket` 삽입
-  - 수직 상승 아티팩트 없음 (visible 밖 원본 버킷은 절대 렌더하지 않음)
-- **DXY 라벨 0개 fallback** (v2.3)
-  - 현재 `generateDxyLabels`는 `inset = span * 0.05` 보수적 로직이라 iOS보다 덜 민감하지만, parity 위해 추가 fallback 점검
-- **Gesture y-lock** (v2.3)
-  - Pan/pinch began에서 현재 yRange/dxyRange 캡처
-  - ended에서 `Animatable` 또는 직접 해제
-  - DXY 정규화 매핑 고정 → 애니메이션/보간 중 선 진동 방지
-- **Rate 전체 렌더 + clipping** — 이미 `clipRect`로 자연 존재, skip
-- **Adaptive xTicks + 30분 보조 grid** (v2.4)
-  - `pocAdaptiveHourInterval` 등가 (1h/3h)
-  - `generateHalfHourGrids` 등가 — minute == 30 위치만
-  - `XTick`에 `isHalfHour: Boolean` 필드 + Canvas draw 시 `PathEffect.dashPathEffect` 점선
-  - `isMidnight` 조건에 `minute == 0` 명시화 (M4 이전엔 tautological)
+**완료 내역** (세부 커밋 해시는 §11 작업 이력 참조):
+
+- **M4-a: DXY 경계 보간** (`interpolateDxyBoundary` helper + `ChartState.dxyDisplayBuckets`)
+  - 1d 줌 상태에서 visible 양 경계에 linear interpolated 가상 `GraphBucket` prepend/append. iOS `interpolateDxyBoundaryPoint` 등가
+  - data 범위 밖이면 null (extrapolation 안 함), 정확히 버킷에 걸리면 null (이미 visible 포함)
+  - `computeChartState`에서 visible domain 줌 시점에만 보간, default view에서는 dxyGraphData 그대로 (회귀 0)
+  - `computeDxyPath` 호출부를 `dxyGraphData` → `chartState.dxyDisplayBuckets`로 변경
+  - 정규화 기준(`dxyMin`/`dxyMax`)에 boundary 값이 포함되므로 visible 직후 다음 버킷이 visible dxyMin/dxyMax 밖이라도 path가 chartTop/chartBottom으로 shoot되는 v1.x 수직 아티팩트 제거. 이전엔 `clipRect`로 시각만 잘려 변동 큰 줌 구간에서 잠재적으로 노출 가능했음 (단순 parity가 아니라 **잠재 결함의 구조적 fix**)
+- **M4-a: DXY 라벨 0개 fallback** (`generateDxyLabels`)
+  - 줌이 깊어 (dxyMin, dxyMax)가 step 경계 사이에 끼면 `start > end`가 되어 빈 배열 반환 → 라벨 표시 완전 결손되는 케이스 처리
+  - `labels.isEmpty()` 시 mid 값 단일 라벨 (`%.2f` 정밀도) push. iOS 동일 패턴
+- **M4-c: Adaptive xTicks** (1d 종속, `adaptiveHourIntervalOneDay` + `generateHourTicksOneDay`)
+  - visible length > 12h → 3시간, > 6h → 1시간, 그 외 → 1시간 (30min은 정수 alignment 필요해 clamp)
+  - 이전엔 1d 분기가 항상 3시간 하드코딩 → 줌인 시에도 라벨 간격이 변하지 않아 sparse했음
+- **M4-c: 30분 보조 grid** (`generateHalfHourGridsOneDay` + `XTick.isHalfHour`)
+  - visible length ≤ 9000s (2.5h)일 때만 활성. minute==30 위치만 별도 함수에서 생성 후 정각 tick과 merge sorted (한 루프에 섞으면 중복/누락 위험)
+  - Canvas draw에서 `isHalfHour` 분기 — `PathEffect.dashPathEffect`로 3dp 점선, 라벨 그리지 않음, alpha 0.18 (정각 0.3보다 명확히 흐림)
+- **M4-b: Gesture y-lock** (`GestureYLock` data class + `pocGestureYLock` state + `computeChartState(yLock)` 분기)
+  - pinch/pan began에서 yRange/dxyRange를 통째 snapshot, gesture-end에서 release. iOS `pocGestureYLock` 등가
+  - lock 동안 `effectiveY*`/`effectiveDxy*`가 lock 값 사용 — visible 데이터 갱신으로 인한 매 프레임 라벨 값 변동 차단
+  - **사용자 체감 보고로 도입 결정**: M4-c 완료 후 jitter 평가 단계에서 "Y축 라벨이 빠르게 훅훅 변함" 확인 → skip 옵션 기각, 진행
+  - `dxyDisplayBuckets`은 lock과 무관하게 visible 기반으로 매 프레임 갱신 — line은 신선한 데이터로 그리되 정규화 기준만 lock
+  - `currentChartState by rememberUpdatedState(chartState)` — gesture coroutine에서 mutation 전 pre-gesture chartState 접근 (M2 fix-1 패턴)
+
+**구현 중 발견·수정한 결함 4건** (역사 기록 — 모두 코덱스 리뷰 + 직접 트레이스로 발견):
+
+1. **M4-a-1 raw filter base 결함**: 초기 구현은 `visibleDxyBuckets`의 `ifEmpty { full }` fallback을 base로 사용 → "between buckets" 줌 시나리오 (visible window가 두 인접 dxy bucket 사이에 끼임)에서 raw filter는 empty이지만 boundary는 양쪽에서 성공해야 하는데, base에 fallback이 적용돼 있으면 "전체 데이터 + boundary"가 mix되어 의미 없는 line 추가됨. raw filter를 base로 쓰고 최종 `withBoundaries`가 비었을 때만 fallback하도록 수정 (iOS 패턴 일치)
+2. **M4-c adaptive interval 정수 나눗셈 임계점 결함**: `visibleLengthSec / 3600` 정수 truncate로 12h ~ 12h59m 구간이 hours==12로 ">12" false → iOS Double semantic(12.0001부터 즉시 3h) 대비 임계점 어긋남. 초 단위 직접 비교(`> 12 * 3600`)로 수정
+3. **M4-c 30분 grid alpha 정반대 결함**: 주석은 "정각보다 흐리게"라고 적었으나 코드는 `gridColor.copy(alpha = 0.5f)` — `Color.copy(alpha)`는 곱셈이 아닌 교체이므로 보조선 alpha = 0.5 > 정각 0.3 → 정반대. `SecondaryText.copy(alpha = 0.18f)` 직접 지정으로 수정 (정각 60% 가시성)
+4. **DISCARDED cleanup leak (M4-b 도입 시 발견된 M3-a 누락 + M4-b lock leak 결합)**: `pressedPointers == 1` 분기에서 `gestureMode == PINCH` 인 경우 `gestureMode = DISCARDED`로 전환되는데, gesture-end cleanup 분기 조건이 `PINCH || PAN`만 포함하고 DISCARDED는 빠져 있어 cleanup 전체가 skip. 누설되는 state 3종:
+   - `pocGestureYLock` (M4-b 도입으로 새로 추가) — 라벨이 lock 값에 frozen
+   - `pocVisibleDomain` full-unzoom 자동 release (M2-fix-4) — 거의 풀줌아웃 상태에서 default 복귀 안 함
+   - `pocIsFollowingLatest` 재평가 (M2-fix-4) — follow 자동 reactivation 안 됨, 새 데이터 들어와도 그래프 슬라이드 안 함
+   - 후자 2건은 M2-fix-4 도입 시점에 이미 누락된 상태였고 (DISCARDED는 M2 GestureMode FSM 도입과 함께 만들어졌으나 cleanup 분기 영향이 검토되지 않았음), M4-b yLock leak이 새로 추가되며 코덱스 리뷰가 발견. 같은 fix(분기 조건에 DISCARDED 포함)로 3건 모두 잡힘
+   - **새 discipline**: GestureMode enum의 모든 종료 상태에 대해 cleanup 영향을 매트릭스로 확인. (UNDETERMINED → cleanup 불필요, PINCH/PAN/DISCARDED → cleanup 필수, PASS_THROUGH → cleanup 불필요)
+
+**기기 검증 통과** (Jay 수동, 2026-04-15~16):
+
+- 1d default view DXY 선이 plot 좌우 경계까지 자연스럽게 닿음
+- 깊은 줌에서 DXY 라벨 fallback 작동 (mid 값 단일 라벨)
+- "between buckets" 줌 시나리오에서 의미 없는 mix line 없음
+- 12h 초과 즉시 3h 라벨 전환 (이전엔 13h 도달 전까지 1h 유지)
+- 강한 줌 (≤ 2.5h)에서 30분 dashed line 정각 라인보다 명확히 흐림
+- Pinch 중 rate/dxy 라벨 안정 (lock 효과)
+- Pan 중 라벨 안정
+- 정상 release vs DISCARDED 경로 release 모두 동일하게 정상 cleanup
+- 풀줌아웃 자동 release 작동
+- M2/M3 회귀 모두 정상 (pinch/pan/더블탭/통화 탭 스와이프)
+
+**알려진 한계 (M4 시점, 의도적 divergence)**:
+
+- DXY 라벨 `inset = span * 0.05` 유지 (iOS는 inset 없음). Android는 라벨이 plot 가장자리에 너무 가까이 붙는 것을 막는 보수적 정책으로 의도적 divergence. §9 참조
+- y-lock 동안 visible 데이터의 새 max/min이 lock 범위 초과하면 line이 chart 경계 잠시 벗어나 잘림. iOS와 동일 trade-off, 라벨 안정성이 더 큰 가치라 수용
 
 ### M5 — 더블탭 애니메이션 (v2.5 실험, **옵션**)
 
@@ -427,6 +464,8 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
 | 예시화면 follow-latest 자동 슬라이드 | iOS에 부재 (SampleData 정적) | 공용 composable 구조라 Android에서도 동일 한계 |
 | xTicks 15m/10m 세분화 | 30m까지만 계획 | post-parity |
 | **Graph fullscreen 단일 탭 종료 (iOS divergence)** | **의도적 divergence** | **post-parity 후보** |
+| **DXY 라벨 inset 정책 (iOS divergence)** | **의도적 divergence** | **유지** |
+| **y-lock 동안 line이 chart 경계 잠시 벗어남** | **수용된 trade-off (iOS와 동일)** | **유지** |
 
 ### iOS divergence — Graph fullscreen 단일 탭 종료 (M3-b)
 
@@ -444,6 +483,42 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
 **언제 재검토**:
 
 단일 탭 fullscreen 종료 affordance가 UX 요구사항으로 돌아오면 (예: Cancel 아이콘 도달성 문제 보고) `RateGraphView` onSingleTap 콜백 확장 방향으로 재검토. 현재는 Cancel 아이콘이 우상단에 명확히 배치돼 있어 실익 없음.
+
+### iOS divergence — DXY 라벨 inset 정책 (M4-a)
+
+**무엇이 다른가**:
+
+- iOS: `generateDxyAxisLabels`가 inset 없이 range 전체에서 step 정렬 라벨 생성. 라벨이 plot 위/아래 가장자리에 매우 가까이 붙을 수 있음
+- Android: `generateDxyLabels`가 `inset = span * 0.05` 적용하여 range의 위/아래 5% 영역에는 라벨 생성 안 함. 가장자리에서 한 칸 안쪽부터 라벨이 시작됨
+
+**왜 다른가**:
+
+Android는 dp 기반 polish 환경에서 라벨이 plot 가장자리에 너무 가까이 붙으면 시각적으로 답답해 보인다는 보수적 디자인 판단. 라벨 0개 fallback도 어차피 추가했으므로(M4-a) 줌이 매우 깊을 때도 라벨이 완전히 사라지진 않음. iOS는 Swift Charts의 axis label clipping 처리에 의존해 가장자리 라벨도 자연스럽게 그릴 수 있어 inset이 불필요.
+
+**언제 재검토**:
+
+DXY 라벨 inset 때문에 "줌인 시 의미 있는 값이 인접해 있는데 라벨이 안 보인다"는 사용자 보고가 들어오면 inset 값을 줄이거나 제거. 현재는 안정적으로 동작.
+
+### iOS divergence — y-lock 동안 line이 chart 경계 잠시 벗어남 (M4-b)
+
+**무엇이 다른가**:
+
+이건 사실 **divergence가 아니라 iOS와 동일한 의도된 trade-off**. 그래도 명시 기록.
+
+- pinch/pan 동안 `pocGestureYLock`이 yRange/dxyRange를 freeze
+- 정규화는 lock 값으로 수행하되, 표시되는 데이터(`dxyDisplayBuckets`, rate buckets)는 visible 기반으로 매 프레임 갱신
+- visible 데이터의 max/min이 lock 범위를 초과하면 정규화된 line 값이 `[rateRangeMin, rateRangeMax]` 밖으로 나감 → Canvas `clipRect`로 chart 경계에서 잘림
+- 시각: line 끝이 chart 위/아래로 잠시 사라졌다가 gesture 종료 시 lock release되며 자연 위치로 복귀
+
+**왜 수용하나**:
+
+대안은 두 가지였음:
+1. lock 안 함 → 사용자 체감 보고 "Y축 라벨이 빠르게 훅훅 변함" (M4-c 완료 후 jitter 평가에서 확인)
+2. lock + line도 동시에 freeze → line이 visible 데이터와 시각적으로 어긋나 더 이상함
+
+iOS는 동일 trade-off를 채택하여 v2.3에서 도입했고, 사용자가 라벨 안정성을 line 잘림보다 더 가치 있게 여긴다는 검증이 끝남. Android도 동일 결정.
+
+pinch는 점진적이라 한 프레임의 line vs lock 편차가 작아 line 끝이 잠시 잘리는 정도이며, 거슬리는 수준은 아님.
 
 ---
 
@@ -476,6 +551,16 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
             M3-b: CurrencyTabContent.kt wrapper detectTapGestures 2건 제거 +
                   iOS divergence 주석 (fullscreen 단일 탭 종료는 의도적으로 미채택)
             기기 검증 11종 통과 후 커밋 ef2de3c / 38064aa
+2026-04-15  M4 구현 (DXY 정합성 + adaptive xTicks/30분 grid + gesture y-lock)
+            M4-a: DXY 경계 보간 + 라벨 0개 fallback. 구현 중 raw filter base 결함
+                  (visible empty 시 ifEmpty fallback 누설) 자기 검증 + 코덱스 리뷰로 발견
+            M4-c: adaptive hour interval (1d 종속) + 30분 dashed grid. 정수 나눗셈
+                  임계점 결함 + grid alpha 정반대 결함 코덱스 리뷰로 발견
+            M4-b: gesture y-lock — 사용자 체감 "Y축 라벨이 훅훅 변함" 보고로 진행
+                  결정. 구현 중 DISCARDED cleanup leak (M4-b yLock + M2-fix-4
+                  full-unzoom/follow-latest 누락 3종) 코덱스 리뷰로 발견. 같은
+                  fix(분기 조건에 DISCARDED 포함)로 모두 해결
+            기기 검증 통과 후 커밋 db7be63 / 0d7cd24 / 2497c8c
 ```
 
 git 커밋 (Android):
@@ -488,4 +573,8 @@ git 커밋 (Android):
 - `424501b` — docs(android): M2 완료 이력 반영 (§4 M2 + §6 Pager arbitration + §11)
 - `ef2de3c` — feat(android): M3-a graph manual double-tap zoom (awaitEachGesture 내부 감지)
 - `38064aa` — refactor(android): M3-b graph wrapper 더블탭 fullscreen 제거 + iOS divergence 주석
-- **current HEAD** — docs(android): M3 완료 이력 반영 (§4 M3 + §9 iOS divergence + §11)
+- `107ad8f` — docs(android): M3 완료 이력 반영 (§4 M3 + §9 iOS divergence + §11)
+- `db7be63` — feat(android): M4-a DXY 경계 보간 + 라벨 0개 fallback (v2.3 parity)
+- `0d7cd24` — feat(android): M4-c adaptive xTicks + 30분 보조 grid (v2.4 parity)
+- `2497c8c` — feat(android): M4-b gesture y-lock + DISCARDED cleanup leak fix (v2.3 parity)
+- **current HEAD** — docs(android): M4 완료 이력 반영 (§4 M4 + §9 DXY inset/y-lock divergence + §11)
