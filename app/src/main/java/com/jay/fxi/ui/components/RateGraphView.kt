@@ -1,5 +1,8 @@
 package com.jay.fxi.ui.components
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -16,10 +19,12 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -52,6 +57,8 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sqrt
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.datetime.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toInstant
@@ -239,8 +246,16 @@ private fun RateGraphCanvas(
     // (사용자 체감 "Y축 라벨이 빠르게 훅훅 변함") 차단. iOS pocGestureYLock 등가.
     var pocGestureYLock: GestureYLock? by remember { mutableStateOf(null) }
 
-    // 기간 변경 시 줌/follow/lock 상태 리셋 (설계서 §4 M1/M2/M3/M4)
+    // M5: 더블탭 줌 애니메이션 관리 — pocVisibleDomain을 0.25s에 걸쳐 점진적으로
+    // 보간하는 coroutine job. iOS withAnimation(.easeOut(0.25)) 등가.
+    // 새 더블탭/pinch/pan/period change/dispose 시 cancel.
+    var pocAnimationJob: Job? by remember { mutableStateOf(null) }
+    val animationScope = rememberCoroutineScope()
+
+    // 기간 변경 시 줌/follow/lock/animation 상태 리셋 (설계서 §4 M1/M2/M3/M4/M5)
     LaunchedEffect(period) {
+        pocAnimationJob?.cancel()
+        pocAnimationJob = null
         pocVisibleDomain = null
         pocIsFollowingLatest = true
         pocPinchBaselineDomain = null
@@ -248,6 +263,13 @@ private fun RateGraphCanvas(
         pocPanBaselineDomain = null
         pocLastTapTimeMs = 0L
         pocGestureYLock = null
+    }
+
+    // M5: composable dispose 시 진행 중인 애니메이션 job 정리
+    DisposableEffect(Unit) {
+        onDispose {
+            pocAnimationJob?.cancel()
+        }
     }
 
     // 전체 데이터의 시간 폭 (초)
@@ -369,6 +391,10 @@ private fun RateGraphCanvas(
                             // === Pinch (finger-centered) ===
                             if (gestureMode != GestureMode.PINCH) {
                                 // Pinch began: baseline + anchor 캡처
+                                // M5: 진행 중인 더블탭 애니메이션/지연 lock release 취소
+                                // (애니메이션 중 사용자가 새 pinch 시작하면 즉시 양도)
+                                pocAnimationJob?.cancel()
+                                pocAnimationJob = null
                                 // M2 fix-2: fallback은 computeChartState의 default xMax와 일치 (trailing buffer 포함).
                                 val baseline: ClosedRange<Long>? =
                                     currentResolvedVisibleDomain
@@ -456,6 +482,9 @@ private fun RateGraphCanvas(
 
                             if (gestureMode == GestureMode.UNDETERMINED) {
                                 // Pan began: baseline 캡처 (M2 fix: 최신 resolved 사용)
+                                // M5: 진행 중인 더블탭 애니메이션/지연 lock release 취소
+                                pocAnimationJob?.cancel()
+                                pocAnimationJob = null
                                 val baseline: ClosedRange<Long>? = currentResolvedVisibleDomain
                                 if (baseline == null) {
                                     gestureMode = GestureMode.PASS_THROUGH
@@ -536,28 +565,92 @@ private fun RateGraphCanvas(
 
                     if (isDoubleTap) {
                         // === 더블탭 처리 (iOS pocHandleDoubleTap 등가) ===
-                        if (preGestureDomain != null) {
-                            // 줌 상태 → reset
-                            pocVisibleDomain = null
-                            pocIsFollowingLatest = true
-                        } else {
-                            // 기본 보기 → 탭 위치 중심 6h window 줌인
-                            val bounds = currentDataBounds
-                            val lastTs = currentLastDataTs
-                            if (bounds != null && lastTs != null) {
-                                val baselineStart = bounds.start
-                                val baselineEnd = lastTs + trailingBufferSec(period)
-                                val baselineLen = baselineEnd - baselineStart
+                        // M5: 즉시 set 대신 0.25s easeOut 애니메이션. iOS withAnimation 등가.
+                        // 진행 중인 애니메이션이 있으면 먼저 cancel (chaining: 새 from은 last animated value).
+                        pocAnimationJob?.cancel()
+                        pocAnimationJob = null
+                        // M5 fix: 진행 중인 zoom in 애니메이션의 lock이 살아있을 수 있으므로 release.
+                        // 그러지 않으면 빠른 연속 더블탭(zoom in 직후 reset)에서 첫 zoom in의 lock이
+                        // reset 애니메이션 동안 누설되어 라벨이 stale 값에 frozen됨.
+                        // (reset 분기는 yLock을 사용하지 않으므로 자체적으로 release하지 않음)
+                        pocGestureYLock = null
+
+                        val bounds = currentDataBounds
+                        val lastTs = currentLastDataTs
+                        if (bounds != null && lastTs != null) {
+                            val defaultStart = bounds.start
+                            val defaultEnd = lastTs + trailingBufferSec(period)
+                            // 현재 effective from (애니메이션 도중 다시 더블탭한 경우 last animated value)
+                            val fromDomain = pocVisibleDomain ?: (defaultStart..defaultEnd)
+
+                            if (preGestureDomain != null) {
+                                // === 줌 상태 → reset (default view로 복귀) ===
+                                // iOS는 reset에 yLock을 사용하지 않음 (도메인 expand는 자연스럽게).
+                                val toStart = defaultStart
+                                val toEnd = defaultEnd
+                                pocAnimationJob = animationScope.launch {
+                                    animateDomainTransition(
+                                        fromStart = fromDomain.start,
+                                        fromEnd = fromDomain.endInclusive,
+                                        toStart = toStart,
+                                        toEnd = toEnd
+                                    ) { s, e ->
+                                        pocVisibleDomain = s..e
+                                        pocIsFollowingLatest = false  // 애니메이션 중 freeze
+                                    }
+                                    // 애니메이션 정상 종료 → null + follow on (default view 복귀)
+                                    pocVisibleDomain = null
+                                    pocIsFollowingLatest = true
+                                    pocAnimationJob = null
+                                }
+                            } else {
+                                // === 기본 보기 → 탭 위치 중심 6h window 줌인 ===
+                                val baselineLen = defaultEnd - defaultStart
                                 val fraction = ((downPosition.x - plotLeft) / plotWidth).coerceIn(0f, 1f)
-                                val tapTimeSec = baselineStart + (baselineLen * fraction).toLong()
+                                val tapTimeSec = defaultStart + (baselineLen * fraction).toLong()
                                 // iOS GraphConfig.doubleTapZoomWindow = 6h
                                 val halfWindow = 6L * 3600L / 2L
                                 val proposed = (tapTimeSec - halfWindow)..(tapTimeSec + halfWindow)
-                                val clamped = clampVisibleDomain(proposed, baselineStart, baselineEnd)
-                                pocVisibleDomain = clamped
-                                // follow-latest 재평가 (bucketDuration 600s 이내면 follow on)
-                                val distance = abs(clamped.endInclusive - lastTs)
-                                pocIsFollowingLatest = distance < 600L
+                                val clamped = clampVisibleDomain(proposed, defaultStart, defaultEnd)
+
+                                // M5: zoom in은 yLock 사용 (iOS 패턴) — 애니메이션 중 visible 데이터
+                                // shrink로 인한 yRange 떨림 차단. 현재 chartState 기준으로 snapshot.
+                                val csBefore = currentChartState
+                                pocGestureYLock = GestureYLock(
+                                    rateRangeMin = csBefore.rateRangeMin,
+                                    rateRangeMax = csBefore.rateRangeMax,
+                                    yMin = csBefore.yMin,
+                                    yMax = csBefore.yMax,
+                                    dxyMin = csBefore.dxyMin,
+                                    dxyMax = csBefore.dxyMax,
+                                    isDxyFlat = csBefore.isDxyFlat,
+                                    flatDxyValue = csBefore.flatDxyValue
+                                )
+
+                                pocAnimationJob = animationScope.launch {
+                                    animateDomainTransition(
+                                        fromStart = fromDomain.start,
+                                        fromEnd = fromDomain.endInclusive,
+                                        toStart = clamped.start,
+                                        toEnd = clamped.endInclusive
+                                    ) { s, e ->
+                                        pocVisibleDomain = s..e
+                                        pocIsFollowingLatest = false  // 애니메이션 중 freeze
+                                    }
+                                    // 애니메이션 정상 종료 → 최종 target으로 settle + follow 재평가
+                                    pocVisibleDomain = clamped
+                                    val distance = abs(clamped.endInclusive - lastTs)
+                                    pocIsFollowingLatest = distance < 600L
+                                    // M5 divergence (iOS Task 0.26s 미채택): yLock을 즉시 release.
+                                    // iOS는 0.26s 지연 후 release하여 settle 프레임이 lock으로 그려진 뒤
+                                    // 자연 yRange로 전환되는 polish를 추가했지만, Android에서 동일 패턴을
+                                    // 안전하게 구현하려면 "지연 release window 동안 새 pinch/pan이 시작되면
+                                    // stale lock 값을 snapshot하는" 위험을 막기 위해 자연 chartState 파생을
+                                    // 별도로 두거나 computeChartState를 두 번 계산해야 함. ETC 원칙에 따라
+                                    // 즉시 release를 채택. §9 divergence 노트 참조.
+                                    pocGestureYLock = null
+                                    pocAnimationJob = null
+                                }
                             }
                         }
                         pocLastTapTimeMs = 0L  // 소비됨, 리셋
@@ -792,6 +885,33 @@ private fun RateGraphCanvas(
 /// PASS_THROUGH: 1 pointer + not zoomed (pager에 양보)
 /// DISCARDED: pinch → 1 pointer 전환 후 나머지 gesture 무시
 private enum class GestureMode { UNDETERMINED, PINCH, PAN, PASS_THROUGH, DISCARDED }
+
+/// M5: 더블탭 줌 애니메이션 — pocVisibleDomain을 fromDomain → toDomain으로 0.25s 보간.
+/// iOS withAnimation(.easeOut(0.25)) 등가. 매 프레임 onFrame을 호출하여 caller가
+/// state 갱신을 책임지게 함 (Animatable<Float> progress + linear interpolation).
+///
+/// 취소: Job.cancel() 시 Animatable.animateTo가 CancellationException으로 종료됨.
+/// caller는 launch { try { ... } catch (CancellationException) { rethrow } } 패턴으로
+/// 호출하여 cancel 시 onSettled 후속 처리를 건너뛴다.
+private suspend fun animateDomainTransition(
+    fromStart: Long,
+    fromEnd: Long,
+    toStart: Long,
+    toEnd: Long,
+    durationMs: Int = 250,
+    onFrame: (start: Long, end: Long) -> Unit
+) {
+    val anim = Animatable(0f)
+    anim.animateTo(
+        targetValue = 1f,
+        animationSpec = tween(durationMillis = durationMs, easing = LinearOutSlowInEasing)
+    ) {
+        val t = value.coerceIn(0f, 1f)
+        val newStart = fromStart + ((toStart - fromStart) * t).toLong()
+        val newEnd = fromEnd + ((toEnd - fromEnd) * t).toLong()
+        onFrame(newStart, newEnd)
+    }
+}
 
 /// M2 fix-3: visible domain clamp (경계 + 길이).
 /// - minBoundary/maxBoundary: 허용 가능한 좌우 경계. maxBoundary는 default view의 xMax와 일치해야
