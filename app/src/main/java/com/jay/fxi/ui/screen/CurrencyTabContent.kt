@@ -287,17 +287,23 @@ fun CurrencyTabContent(
                         }
 
                         // 그래프 (남은 공간 전체)
+                        // M3-b: fullscreen 종료는 Cancel 아이콘으로만 수행.
+                        // [iOS divergence — 의도적]
+                        //   iOS는 fullscreen 안에서 단일 탭 종료 + 더블탭 줌을 UIKit recognizer chain
+                        //   (double-tap-to-fail)으로 공존시킨다. Compose에서 동일 패턴을 구현하려면
+                        //   RateGraphView에 onSingleTap 콜백 파라미터를 추가하고 manual tap 감지 내부에서
+                        //   단일 탭 분기를 외부로 전달해야 하므로 API 확장 + 테스트 부담이 크다.
+                        //   과거 구현은 wrapper에 detectTapGestures(onDoubleTap = exit)를 두었으나,
+                        //   wrapper가 outer에서 event를 consume해 RateGraphView 내부 M3-a 더블탭 줌이
+                        //   먹통이 되는 역회귀가 발생했다.
+                        //   ETC 원칙에 따라 iOS parity 대신 "Cancel 아이콘 단일 종료" 정책을 의도적으로 채택.
+                        //   향후 단일 탭 종료 affordance가 꼭 필요해지면 RateGraphView 콜백 확장으로 재검토.
                         Box(
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(12.dp))
                                 .background(CardBackground)
-                                .pointerInput(Unit) {
-                                    detectTapGestures(
-                                        onDoubleTap = { graphViewModel.setGraphFullscreen(false) }
-                                    )
-                                }
                                 .padding(metrics.sectionPadding)
                         ) {
                             RateGraphView(
@@ -434,16 +440,16 @@ fun CurrencyTabContent(
                         verticalArrangement = Arrangement.spacedBy(metrics.sectionSpacing)
                     ) {
                         // 그래프 섹션
+                        // M3-b: wrapper의 "그래프 주변 더블탭 → fullscreen 진입" 제거.
+                        // 이유: M3-a에서 RateGraphView 내부에 manual double-tap zoom 토글이 들어가면서,
+                        // 그래프 내부 더블탭은 줌인/리셋, 그래프 "주변"(label 영역 등) 더블탭은 fullscreen 진입이
+                        // 되어 같은 제스처의 의미가 위치에 따라 달라지는 혼란이 발생했다. iOS도 동일 문제를
+                        // 겪고 wrapper 더블탭 진입을 제거했다. fullscreen 진입은 아래 OpenInFull 아이콘으로만 수행.
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(12.dp))
                                 .background(CardBackground)
-                                .pointerInput(Unit) {
-                                    detectTapGestures(
-                                        onDoubleTap = { graphViewModel.setGraphFullscreen(true) }
-                                    )
-                                }
                                 .padding(metrics.sectionPadding)
                         ) {
                             Box(modifier = Modifier.fillMaxWidth()) {
