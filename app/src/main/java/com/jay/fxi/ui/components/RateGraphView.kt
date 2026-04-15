@@ -204,13 +204,18 @@ private fun RateGraphCanvas(
     // pan: began에서 baseline 캡처 + changed에서 translation 기반 이동
     var pocPanBaselineDomain: ClosedRange<Long>? by remember { mutableStateOf(null) }
 
-    // 기간 변경 시 줌/follow 상태 리셋 (설계서 §4 M1/M2)
+    // M3-a: 더블탭 감지용 last tap 레코드 (0L = 없음)
+    var pocLastTapTimeMs: Long by remember { mutableStateOf(0L) }
+    var pocLastTapPosition: Offset by remember { mutableStateOf(Offset.Zero) }
+
+    // 기간 변경 시 줌/follow 상태 리셋 (설계서 §4 M1/M2/M3)
     LaunchedEffect(period) {
         pocVisibleDomain = null
         pocIsFollowingLatest = true
         pocPinchBaselineDomain = null
         pocPinchAnchorTimeSec = null
         pocPanBaselineDomain = null
+        pocLastTapTimeMs = 0L
     }
 
     // 전체 데이터의 시간 폭 (초)
@@ -258,6 +263,8 @@ private fun RateGraphCanvas(
     val currentDataBounds by rememberUpdatedState(dataBounds)
     val currentResolvedVisibleDomain by rememberUpdatedState(resolvedVisibleDomain)
     val currentHasDxy by rememberUpdatedState(chartState.hasDxy)
+    // M3-a: plot y 경계 계산에 필요 (회전 등으로 값 변경 시 stale 방지)
+    val currentVerticalPadding by rememberUpdatedState(verticalPadding)
 
     Canvas(
         // M2: finger-centered pinch + 1-finger pan (zoomed only) + pager arbitration (G1).
@@ -282,6 +289,9 @@ private fun RateGraphCanvas(
                 val gestureRightPad = 40.dp.toPx()
                 val plotLeft = gestureLeftPad
                 val plotWidth = (size.width - gestureLeftPad - gestureRightPad).coerceAtLeast(1f)
+                // M3-a: plot y 경계 (Canvas draw block과 동일 공식)
+                val plotTopPx = currentVerticalPadding.toPx()
+                val plotBottomPx = size.height - 16.dp.toPx() - plotTopPx
 
                 // Pan 활성 여부 — 줌된 상태에서만 1-finger consume
                 var gestureMode: GestureMode = GestureMode.UNDETERMINED
@@ -291,10 +301,34 @@ private fun RateGraphCanvas(
                 // 계산하면 누적이 되지 않고 baseline 근처에서 맴돌아 실질 줌이 발생하지 않는다.
                 var pinchCumZoom: Float = 1f
 
+                // M3-a: tap 감지용 gesture-local 추적 + 복구용 pre-gesture snapshot.
+                // detectTapGestures를 chain 하면 pan 경로에서 consume된 이벤트를 못 봐
+                // 줌 상태 더블탭이 작동 안 함 → awaitEachGesture 내부에서 수동 감지.
+                val downTimeMs: Long = firstDown.uptimeMillis
+                val downPosition: Offset = firstDown.position
+                var maxPointers: Int = 1
+                var maxTravel: Float = 0f
+                var lastUpTimeMs: Long = downTimeMs
+                val preGestureDomain: ClosedRange<Long>? = pocVisibleDomain
+                val preGestureFollow: Boolean = pocIsFollowingLatest
+
                 do {
                     val event = awaitPointerEvent()
                     val pressedPointers = event.changes.count { it.pressed }
-                    if (pressedPointers == 0) break
+                    // M3-a: tap 추적 — 모든 pointer가 뗐을 때 마지막 up 시점 기록
+                    if (pressedPointers == 0) {
+                        event.changes.firstOrNull()?.let { ch ->
+                            lastUpTimeMs = ch.uptimeMillis
+                        }
+                        break
+                    }
+                    if (pressedPointers > maxPointers) maxPointers = pressedPointers
+                    event.changes.firstOrNull()?.let { ch ->
+                        val dx = ch.position.x - downPosition.x
+                        val dy = ch.position.y - downPosition.y
+                        val dist = sqrt(dx * dx + dy * dy)
+                        if (dist > maxTravel) maxTravel = dist
+                    }
 
                     when {
                         pressedPointers >= 2 -> {
@@ -412,6 +446,88 @@ private fun RateGraphCanvas(
                         }
                     }
                 } while (event.changes.any { it.pressed })
+
+                // === M3-a: Tap 판정 (pinch/pan end 처리보다 우선) ===
+                // "Tap"의 정의:
+                //   - 최대 1 pointer만 눌렸고
+                //   - 이동 거리가 touchSlop 미만 (pan 아님)
+                //   - 지속 시간이 longPressTimeout 미만 (long press 아님)
+                //   - pinch가 한 번도 발생하지 않음
+                //   - 다운 위치가 plot 영역 내부 (x축 라벨/Y축 숫자 영역 제외)
+                val tapSlopPx = viewConfiguration.touchSlop
+                val longPressTimeoutMs = viewConfiguration.longPressTimeoutMillis
+                val tapDurationMs = lastUpTimeMs - downTimeMs
+                val inPlotX = downPosition.x in plotLeft..(plotLeft + plotWidth)
+                val inPlotY = downPosition.y in plotTopPx..plotBottomPx
+                val wasTap = maxPointers == 1 &&
+                    maxTravel < tapSlopPx &&
+                    tapDurationMs in 0..longPressTimeoutMs &&
+                    gestureMode != GestureMode.PINCH &&
+                    inPlotX && inPlotY
+
+                if (wasTap) {
+                    val doubleTapTimeoutMs = viewConfiguration.doubleTapTimeoutMillis
+                    val doubleTapMinTimeMs = viewConfiguration.doubleTapMinTimeMillis
+                    val sinceLast = downTimeMs - pocLastTapTimeMs
+                    val lastDx = downPosition.x - pocLastTapPosition.x
+                    val lastDy = downPosition.y - pocLastTapPosition.y
+                    val distFromLast = sqrt(lastDx * lastDx + lastDy * lastDy)
+                    val isDoubleTap = pocLastTapTimeMs > 0L &&
+                        sinceLast in doubleTapMinTimeMs..doubleTapTimeoutMs &&
+                        distFromLast < tapSlopPx * 2f
+
+                    if (isDoubleTap) {
+                        // === 더블탭 처리 (iOS pocHandleDoubleTap 등가) ===
+                        if (preGestureDomain != null) {
+                            // 줌 상태 → reset
+                            pocVisibleDomain = null
+                            pocIsFollowingLatest = true
+                        } else {
+                            // 기본 보기 → 탭 위치 중심 6h window 줌인
+                            val bounds = currentDataBounds
+                            val lastTs = currentLastDataTs
+                            if (bounds != null && lastTs != null) {
+                                val baselineStart = bounds.start
+                                val baselineEnd = lastTs + trailingBufferSec(period)
+                                val baselineLen = baselineEnd - baselineStart
+                                val fraction = ((downPosition.x - plotLeft) / plotWidth).coerceIn(0f, 1f)
+                                val tapTimeSec = baselineStart + (baselineLen * fraction).toLong()
+                                // iOS GraphConfig.doubleTapZoomWindow = 6h
+                                val halfWindow = 6L * 3600L / 2L
+                                val proposed = (tapTimeSec - halfWindow)..(tapTimeSec + halfWindow)
+                                val clamped = clampVisibleDomain(proposed, baselineStart, baselineEnd)
+                                pocVisibleDomain = clamped
+                                // follow-latest 재평가 (bucketDuration 600s 이내면 follow on)
+                                val distance = abs(clamped.endInclusive - lastTs)
+                                pocIsFollowingLatest = distance < 600L
+                            }
+                        }
+                        pocLastTapTimeMs = 0L  // 소비됨, 리셋
+                    } else {
+                        // 단일 탭 → pre-gesture 상태 복구 후 lastTap 기록
+                        // (줌 상태에서는 PAN 경로가 pocIsFollowingLatest=false + baseline 쓴 상태라
+                        //  복구하지 않으면 의도치 않은 follow 중단이 남는다)
+                        pocVisibleDomain = preGestureDomain
+                        pocIsFollowingLatest = preGestureFollow
+                        // M3-a fix: double tap timeout 기준은 "첫 탭의 up → 두 번째 탭의 down" 간격
+                        // (Android GestureDetector.DOUBLE_TAP_TIMEOUT 관례). down 기준으로 저장하면
+                        // 첫 탭이 길었던 만큼 허용 window가 단축돼 느린 더블탭을 놓친다.
+                        pocLastTapTimeMs = lastUpTimeMs
+                        pocLastTapPosition = downPosition
+                    }
+                    // tap 처리했으므로 pinch/pan 정리만 하고 full-unzoom 판정은 스킵
+                    pocPinchBaselineDomain = null
+                    pocPinchAnchorTimeSec = null
+                    pocPanBaselineDomain = null
+                    return@awaitEachGesture
+                }
+
+                // M3-a fix: wasTap == false로 종료된 모든 gesture는 이전 single tap 후보를 리셋.
+                // 이유: plot 안 tap1 → plot 밖 짧은 tap/실패 pan/pinch/long press → plot 안 tap2 시퀀스에서
+                // tap1과 tap2가 잘못 묶여 false-positive double tap이 발생하는 것을 방지.
+                // (Android GestureDetector와 동일한 semantic — 어떤 non-tap gesture도 pending state 취소)
+                pocLastTapTimeMs = 0L
+                pocLastTapPosition = Offset.Zero
 
                 // === Gesture ended: full-unzoom 릴리스 + follow-latest 재평가 ===
                 if (gestureMode == GestureMode.PINCH || gestureMode == GestureMode.PAN) {
