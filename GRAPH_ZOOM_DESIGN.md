@@ -96,24 +96,31 @@ iOS v2.5가 1d만 줌 활성인 이유는 Swift Charts의 제약에서 파생된
 
 ## 4. 포팅 마일스톤 (M1~M5)
 
-### M1 — 문서 정렬 + 상태 모델 전환 + `computeChartState` 정리
+### M1 — 문서 정렬 + 상태 모델 전환 + `computeChartState` 정리 (완료)
 
 **목표**: 기능 변화 없음. parity 작업을 위한 인프라 재편.
 
-**작업**:
-- [x] 본 문서(`GRAPH_ZOOM_DESIGN.md`) v1.0 → v2.0 재작성 (현재)
-- [ ] 상태 모델 전환
-  - `pocVisibleLengthSec: Long?` → `pocVisibleDomain: ClosedRange<Long>?` (free window, 양 경계 모두 제어)
-  - `pocIsFollowingLatest: Boolean`
-  - `resolvedVisibleDomain`: `derivedStateOf { ... }` — follow 반영 파생
-  - 기존 PoC 동작 유지: right-edge anchor는 follow 상태의 자연 결과로 나옴
-- [ ] `computeChartState` 함수 분해
-  - `computeYRange(visibleRateBuckets)` pure function 분리
-  - `computeDxyRange(visibleDxyBuckets, yRange)` pure function 분리 (yRange 정합성 패딩)
-  - 나머지 `computeXTicks`, `computeRatePaths`, `computeDxyPath`는 **이미 분리됨** (baseline 상태)
-- [ ] 빌드 + 리그레션 없음 확인 (PoC 동작 동일)
+**완료 내역** (세부 커밋 해시는 §11 작업 이력 참조):
 
-**커밋 전략**: 문서 1커밋 + 코드 1(~2)커밋
+- **PoC baseline 고정** (`8a53808`) — dirty 상태(기존 pinch PoC + v1.0 설계)를 커밋으로 명시
+- **v2.0 문서 재작성** (`05ee913`) — v1.0 Android 단독 설계 초안을 iOS v2.5 parity 로드맵으로 개편. 1d only 원칙 확정, M1~M5 마일스톤 정의, 공용 composable 이점 명시
+- **상태 모델 전환** (`4814d98`):
+  - `pocVisibleLengthSec: Long?` → `pocVisibleDomain: ClosedRange<Long>?` (raw, 양 경계 모두 제어)
+  - `pocIsFollowingLatest: Boolean` (default true) 신규
+  - `resolvedVisibleDomain: ClosedRange<Long>?` derived — follow 모드 반영된 실제 표시 domain (chart 렌더/필터/gesture baseline single source of truth)
+  - `lastDataTs: Long?` 별도 캡처 — follow-latest anchor
+  - 기존 right-edge anchor 동작은 follow=true 기본값의 자연 결과로 유지
+- **`computeChartState` 함수 분해** (`4814d98`):
+  - `computeYRange(visibleRate, visibleDxy) → YRange?` pure function 분리
+  - `computeDxyRange(visibleDxy) → DxyRangeInfo?` pure function 분리
+  - `computeChartState`는 thin orchestrator (visible filter → yRange → dxyRange → 조립)
+  - 시그니처: `visibleWindow: IntRange?` → `visibleDomain: ClosedRange<Long>?`
+  - 기존 분리 유지: `computeXTicks`, `computeRatePaths`, `computeDxyPath`
+- **M1 이력 보정** (본 섹션의 이력 서술형 전환 포함) — §11 git 커밋 섹션에 `current HEAD` 표기 규칙 적용, 기존 체크박스를 완료 서술로 대체. self-reference 역설 회피를 위해 본 섹션 본문에서는 amend 대상 커밋 해시 참조 제거
+- **빌드 통과**: `./gradlew assembleDebug` → BUILD SUCCESSFUL (23s)
+- **기기 리그레션 확인**: Jay 수동 검증 완료. 기존 PoC pinch zoom 동작 동일 (right-edge anchor 유지)
+
+**알려진 한계**: M1 범위상 right-edge anchor 유지 → 사용자가 과거 쪽으로 줌인 불가. M2의 finger-centered pinch + 1-finger pan에서 해결.
 
 ### M2 — Pinch/Pan + Pager arbitration (G1 검증)
 
@@ -367,4 +374,6 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
 git 커밋 (Android):
 
 - `8a53808` — feat(android): graph zoom PoC baseline (v1.0 design + pinch-only 1d PoC)
-- **current HEAD** (이후 M1 docs commit으로 갱신)
+- `05ee913` — docs(android): GRAPH_ZOOM_DESIGN.md v2.0 — iOS v2.5 parity 로드맵 개편
+- `4814d98` — refactor(android): M1 상태 모델 전환 + computeChartState 분해
+- **current HEAD** — docs(android): M1 이력 보정 + current HEAD 표기 규칙 적용
