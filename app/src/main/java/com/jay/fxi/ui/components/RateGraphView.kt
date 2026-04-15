@@ -141,7 +141,12 @@ private data class ChartState(
     val dxyMin: Double?,
     val dxyMax: Double?,
     val isDxyFlat: Boolean,
-    val flatDxyValue: Double?
+    val flatDxyValue: Double?,
+    // M4-a: DXY path 그리기에 사용할 visible-filtered + 양 경계 interpolated 버킷.
+    // 1d default view에서는 전체 dxyGraphData와 동일, 1d zoom 상태에서는
+    // 시간 visible 안의 버킷만 + 양 경계에 linear-interpolated 가상 버킷 prepend/append.
+    // iOS visibleDxyPoints 등가 (computeDxyPath는 이 리스트를 그대로 그림).
+    val dxyDisplayBuckets: List<GraphBucket>
 )
 
 private data class XTick(
@@ -580,7 +585,11 @@ private fun RateGraphCanvas(
         val yTicks = computeYTicks(layout.yMin, layout.yMax)
         val sourcePaths = computeRatePaths(rateGraphData, layout, period, chartState.hasDxy)
         val dxyPath = if (chartState.hasDxy && chartState.dxyMin != null && chartState.dxyMax != null) {
-            computeDxyPath(dxyGraphData, layout, chartState.rateRangeMin, chartState.rateRangeMax, chartState.dxyMin, chartState.dxyMax)
+            // M4-a: chartState.dxyDisplayBuckets 사용 (visible-filtered + 양 경계 interpolated).
+            // 이전엔 dxyGraphData 전체를 넘기고 clipRect로 시각만 잘라, 변동성 큰 줌 구간에서
+            // 다음 out-of-visible 버킷이 visible dxyMin/dxyMax 밖일 때 line이 chartTop/chartBottom로
+            // shoot되는 v1.x 수직 아티팩트가 잠재. 보간 boundary 버킷을 사용하므로 더 이상 발생 안 함.
+            computeDxyPath(chartState.dxyDisplayBuckets, layout, chartState.rateRangeMin, chartState.rateRangeMax, chartState.dxyMin, chartState.dxyMax)
         } else {
             null
         }
@@ -800,7 +809,7 @@ private fun computeDxyRange(visibleDxyBuckets: List<GraphBucket>): DxyRangeInfo?
 }
 
 /// M1 결과: computeChartState는 thin orchestrator.
-/// visible 필터 → computeYRange → computeDxyRange → ChartState 조립.
+/// visible 필터 → DXY 경계 보간(M4-a) → computeYRange → computeDxyRange → ChartState 조립.
 /// visibleDomain: M1 이후 ClosedRange<Long>(epoch 초 Long 단위). null이면 전체 data 기반.
 private fun computeChartState(
     rateGraphData: Map<GraphSource, List<GraphBucket>>,
@@ -812,14 +821,11 @@ private fun computeChartState(
     val allBuckets = if (rateBuckets.isNotEmpty()) rateBuckets + dxyGraphData else dxyGraphData
     if (allBuckets.isEmpty()) return null
 
-    // visible domain 설정 시 버킷 필터링 (y/dxy range 계산용).
+    // visible domain 설정 시 rate 버킷 필터링 (y range 계산용).
     // 필터 결과 empty면 전체 fallback (iOS와 동일 정책).
     val visibleRateBuckets = visibleDomain?.let { d ->
         rateBuckets.filter { it.bucketTs.toLong() in d }.ifEmpty { rateBuckets }
     } ?: rateBuckets
-    val visibleDxyBuckets = visibleDomain?.let { d ->
-        dxyGraphData.filter { it.bucketTs.toLong() in d }.ifEmpty { dxyGraphData }
-    } ?: dxyGraphData
 
     val allTs = allBuckets.map { it.bucketTs }
     val fullXMin = allTs.min()
@@ -829,8 +835,32 @@ private fun computeChartState(
     val xMin = visibleDomain?.start?.toInt() ?: fullXMin
     val xMax = visibleDomain?.endInclusive?.toInt() ?: (lastDataTs + trailingBufferSec(period))
 
-    val yRange = computeYRange(visibleRateBuckets, visibleDxyBuckets) ?: return null
-    val dxyRangeInfo = computeDxyRange(visibleDxyBuckets)
+    // M4-a: DXY display 버킷 산출 — visible 필터 결과에 양 경계 interpolated 가상 포인트
+    // prepend/append. 1d default view에서는 전체 dxyGraphData를 그대로 사용 (zoom 아닐 땐
+    // 보간 불필요). iOS visibleDxyPoints 등가 (RateGraphView.swift L251-264).
+    //
+    // ⚠️ 중요: rate처럼 ifEmpty { full } fallback을 base에 미리 적용하면 안 된다.
+    // "between buckets" 줌 시나리오 (visible window가 두 인접 dxy bucket 사이에 끼임)에서
+    // raw filter는 empty이지만 boundary interpolation은 양쪽에서 성공해야 한다. base에
+    // fallback이 적용돼 있으면 "전체 데이터 + boundary"가 mix되어 의미 없는 line이 추가됨.
+    // → raw filter를 base로 쓰고, 최종 withBoundaries가 비었을 때만 fallback.
+    //
+    // 이 augmented 리스트는 dxyRange/yRange fallback 계산과 path 그리기 모두에 사용된다 →
+    // 정규화 기준에 boundary 값이 포함되므로 visible 직후 다음 버킷이 visible dxyMin/dxyMax
+    // 밖이라도 path가 chartTop/chartBottom으로 "shoot"되는 v1.x 수직 아티팩트가 사라진다.
+    val dxyDisplayBuckets: List<GraphBucket> = if (visibleDomain != null && dxyGraphData.isNotEmpty()) {
+        val sortedAllDxy = dxyGraphData.sortedBy { it.bucketTs }
+        val rawVisibleSorted = sortedAllDxy.filter { it.bucketTs.toLong() in visibleDomain }
+        val left = interpolateDxyBoundary(xMin.toLong(), sortedAllDxy)
+        val right = interpolateDxyBoundary(xMax.toLong(), sortedAllDxy)
+        val withBoundaries = listOfNotNull(left) + rawVisibleSorted + listOfNotNull(right)
+        withBoundaries.ifEmpty { dxyGraphData }
+    } else {
+        dxyGraphData
+    }
+
+    val yRange = computeYRange(visibleRateBuckets, dxyDisplayBuckets) ?: return null
+    val dxyRangeInfo = computeDxyRange(dxyDisplayBuckets)
 
     return ChartState(
         xMin = xMin,
@@ -844,7 +874,46 @@ private fun computeChartState(
         dxyMin = dxyRangeInfo?.dxyMin,
         dxyMax = dxyRangeInfo?.dxyMax,
         isDxyFlat = dxyRangeInfo?.isFlat ?: false,
-        flatDxyValue = dxyRangeInfo?.flatValue
+        flatDxyValue = dxyRangeInfo?.flatValue,
+        dxyDisplayBuckets = dxyDisplayBuckets
+    )
+}
+
+/// M4-a: visible 경계(boundarySec)에 해당하는 interpolated DXY 버킷 생성.
+/// - sortedDxy: bucketTs 오름차순 정렬된 전체 DXY 버킷
+/// - 경계가 data 범위 밖이면 null (extrapolation 안 함)
+/// - 경계가 정확히 한 버킷의 timestamp와 일치하면 null (이미 visible에 포함)
+/// - 그 외: 경계를 감싸는 두 인접 버킷의 close 값으로 linear interpolation
+///
+/// iOS interpolateDxyBoundaryPoint 등가. 가상 GraphBucket의 max/min/close는 모두
+/// interpolated value로 동일 (밴드 그리지 않음).
+private fun interpolateDxyBoundary(
+    boundarySec: Long,
+    sortedDxy: List<GraphBucket>
+): GraphBucket? {
+    if (sortedDxy.isEmpty()) return null
+    val firstTs = sortedDxy.first().bucketTs.toLong()
+    val lastTs = sortedDxy.last().bucketTs.toLong()
+    // 경계가 data 범위 밖이면 보간 불가 (extrapolation 방지)
+    if (boundarySec < firstTs || boundarySec > lastTs) return null
+
+    // 경계 뒤의 첫 버킷 (>= boundary)
+    val after = sortedDxy.firstOrNull { it.bucketTs.toLong() >= boundarySec } ?: return null
+    // 경계가 정확히 버킷에 걸리면 이미 visible에 포함 — 보간 불필요
+    if (after.bucketTs.toLong() == boundarySec) return null
+    // 경계 앞의 마지막 버킷 (< boundary)
+    val before = sortedDxy.lastOrNull { it.bucketTs.toLong() < boundarySec } ?: return null
+
+    val totalSpan = (after.bucketTs - before.bucketTs).toDouble()
+    if (totalSpan <= 0.0) return null
+    val ratio = (boundarySec - before.bucketTs) / totalSpan
+    val interpolatedClose = before.close + (after.close - before.close) * ratio
+
+    return GraphBucket(
+        bucketTs = boundarySec.toInt(),
+        max = interpolatedClose,
+        min = interpolatedClose,
+        close = interpolatedClose
     )
 }
 
@@ -1101,6 +1170,8 @@ private fun generateDxyLabels(dxyMin: Double, dxyMax: Double): List<DxyLabel> {
         else -> 2.0
     }
     val format = if (step < 0.1) "%.2f" else "%.1f"
+    // inset 0.05 * span은 의도적 divergence (iOS는 inset 없음).
+    // Android는 라벨이 plot 가장자리에 너무 가까이 붙는 것을 막는 보수적 정책 유지.
     val inset = span * 0.05
     val start = ceil((dxyMin + inset) / step) * step
     val end = floor((dxyMax - inset) / step) * step
@@ -1116,6 +1187,16 @@ private fun generateDxyLabels(dxyMin: Double, dxyMax: Double): List<DxyLabel> {
         }
         value += step
     }
+
+    // M4-a: 줌이 깊어 (dxyMin, dxyMax)가 step 경계 사이에 끼면 start > end가 되어
+    // labels가 빈 배열이 되는 케이스 — DXY 라벨 표시가 완전히 사라지는 시각 결손 발생.
+    // 해결: range 중앙값을 단일 라벨로 fallback (%.2f 정밀도). step round 시 range 밖으로
+    // 빠지는 버그를 피하려고 mid를 value에 직접 넣음 (iOS와 동일 패턴).
+    if (labels.isEmpty()) {
+        val mid = (dxyMin + dxyMax) / 2.0
+        labels += DxyLabel(mid, "%.2f".format(mid))
+    }
+
     return labels
 }
 
