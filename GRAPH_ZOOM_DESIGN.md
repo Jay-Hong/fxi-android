@@ -1,279 +1,370 @@
-# 그래프 핀치 줌/팬 추가 — 권장 설계안 v1.0 (Android)
+# Android 그래프 줌/팬 — iOS v2.5 parity 포팅 로드맵 v2.0 (Android)
 
-> **상태**: 확정 (v1.0, 2026-04-11)
-> **플랫폼**: Android (Jetpack Compose Canvas 자체 구현). 공통 UX 목표는 iOS와 동일, 플랫폼 구현 경로는 다름. iOS 설계는 `../ios/GRAPH_ZOOM_DESIGN.md` 참조.
-> **스코프**: [app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt](app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt) (본화면/예시화면 공용)
-> **목적**: 현재 전체화면 토글만 가능한 환율 그래프에 손동작 확대/축소 + 좌우 이동 기능 추가
-> **구현 여부**: 본 문서는 설계만 다룸. 착수 시점은 별도 지시.
+> **상태**: 계획 확정 (2026-04-14) — PoC v1.0 baseline 커밋 직후
+> **플랫폼**: Android (Jetpack Compose Canvas 자체 구현).
+> **크로스 플랫폼 기준**: iOS v2.5 (`../ios/GRAPH_ZOOM_DESIGN.md`) 완전 parity 목표.
+> **스코프**: [app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt](app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt) (본화면 + 예시화면 공용 composable)
+> **이전 문서**: v1.0은 2026-04-11 Android 단독 설계 초안. PoC 구현이 baseline으로 커밋된 시점(`8a53808`)에 **본 문서가 이를 대체**.
 
 ---
 
-## 0. 공통 UX 목표 (iOS와 동일)
+## 0. 버전 이력 요약
 
-- 핀치 줌으로 visible 구간 확대/축소
-- 팬(드래그)으로 좌우 이동
-- 더블탭으로 기본 보기 리셋
-- 1d / 1w / 3m / 1y 모든 기간에서 동일 인터랙션
-- DXY 이중 Y축 그래프에서도 정합성 유지
-- 기간 변경 시 줌 리셋
-
-> **iOS와 차이**: iOS는 Swift Charts의 `chartScrollableAxes` 같은 네이티브 스크롤 API가 있어 "경로 A(네이티브) vs 경로 B(수동)" 선택지가 존재하지만, Android는 Compose Canvas 수동 렌더링이라 **수동 경로 단일**. iOS의 경로 B에 해당.
+| 버전 | 시점 | 내용 |
+|---|---|---|
+| v1.0 | 2026-04-11 | Android 단독 설계 초안 (Android 고유 목표 + "모든 기간 인터랙션") |
+| **v2.0** | **2026-04-14** | **iOS v2.5 parity 로드맵으로 전면 개편.** 1d only 원칙 확정. M1~M5 마일스톤 정의. PoC v1 baseline은 커밋 `8a53808`로 고정. |
 
 ---
 
 ## 1. 목표 / 비목표
 
-**목표**
-- 위 §0의 공통 UX 목표 전부
-- [LockedPreviewScreen.kt](app/src/main/java/com/jay/fxi/ui/subscription/LockedPreviewScreen.kt)의 예시 화면에도 **자동 반영** (공용 composable이라 별도 작업 불필요)
+### 목표
 
-**비목표**
-- 전체화면 모드 유지(오히려 정리 대상, §7)
-- 핀치 줌 중심점을 손가락 위치에 정확히 고정(1차는 중앙 기준 OK)
+- **iOS v2.5 완전 기능 parity** — 양 플랫폼 사용자가 같은 UX 경험
+- **1d period 한정** 인터랙션 (핀치/팬/더블탭/follow-latest)
+- Android 공용 composable 구조 활용 — 본화면 + LockedPreviewScreen 동시 반영 (iOS의 `SampleGraphView` 복제 불필요)
+- HorizontalPager와 제스처 공존 (iOS의 `TabView(.page)` 등가 문제 해결)
+- Canvas 수동 렌더링의 장점 활용 — iOS Swift Charts의 일부 고유 이슈(chartXScale 자동 보간, identity diff) 회피
+
+### 비목표 (parity 후보)
+
+- **1w/3m/1y 줌/팬** — 1d bucketSize(10m)가 줌의 유일한 실용 가치 구간. 1h/1d bucket 기간은 효용 작음. **post-parity 확장 후보**로만 메모
 - Y축 방향 줌
-- rotation 제스처 (`detectTransformGestures`가 자동 포함하지만 무시)
+- Fling/관성 (iOS에 없고 Android도 우선순위 낮음)
+- Rotation 제스처 (detectTransformGestures 부작용 무시)
+
+### 1d only 원칙 (고정)
+
+iOS v2.5가 1d만 줌 활성인 이유는 Swift Charts의 제약에서 파생된 결정이 아니라 **bucketSize 실용 가치** 때문. Android도 동일 이유로 1d에만 적용. 이 원칙을 깨면 문서/상태 모델/제스처 정책이 period-agnostic으로 복잡해지며 parity 작업이 "확장 설계 분기"로 변질. **parity 완료 전까지 이 원칙을 번복하지 않음**.
 
 ---
 
-## 2. 상태 모델
+## 2. 현재 상태 (PoC v1 baseline, 커밋 `8a53808`)
+
+### 구현됨
+
+- Canvas 기반 수동 렌더링 (`ChartLayout.mapX/mapY`, `drawLine/drawPath/drawText`)
+- 4개 period (1d/1w/3m/1y) 정적 그래프
+- Rate 선 (소스별) + DXY 선 + 단일 소스 min/max 밴드
+- X축 tick (1d는 3h 고정, 자정 굵은 선)
+- Y축 D3-like nice step
+- **DXY visible 기반 정규화** + 좌측 라벨 컬럼
+- Flat DXY 단일 라벨
+- **clipRect** 기반 plot 내부 clipping — **iOS v2.3의 `chartPlotStyle { plot.clipped() }` 등가가 원래부터 존재** (Canvas 특성상 자연)
+- HorizontalPager 충돌 회피: `awaitEachGesture` 수동 루프로 **2+ pointer pinch만 consume**
+
+### v1 한계 (parity 대상)
+
+- Pinch: **right-edge anchor** (finger-centered 아님)
+- 1-finger pan **없음**
+- 더블탭 줌 토글 **없음**
+- Follow-latest 암시적 (항상 우측 edge) — 명시 플래그 없음
+- `pocVisibleLengthSec` + 파생 `pocVisibleWindow: IntRange?` — **raw/resolved domain 분리 없음**
+- Plot bounds guard **없음** (`plot.contains` 등가)
+- Gesture y-lock **없음**
+- DXY 경계 보간 **없음**
+- DXY 라벨 0개 fallback **없음**
+- Adaptive xTicks **없음** (1d 고정 3h)
+- 30분 보조 grid **없음**
+- 더블탭 애니메이션 **없음**
+- `CurrencyTabContent.kt`의 wrapper 더블탭 → fullscreen 진입 **정리 안 됨** (iOS v2.2에서 제거한 정책 충돌)
+
+---
+
+## 3. iOS v2.5 ↔ Android v1 gap (기능 매핑)
+
+| 기능 | iOS v2.5 | Android v1 | 포팅 필요 | 플랫폼 차이 |
+|---|---|---|---|---|
+| 2-finger pinch | finger-centered | right-edge anchor | 개선 | centroid 기반 |
+| 1-finger pan (zoomed only) | ✅ | ❌ | 필요 | Pager 공존 체크 |
+| 더블탭 줌 토글 (6h + reset) | ✅ | ❌ | 필요 | - |
+| plot bounds guard | `plot.contains` | ❌ | 필요 | Canvas size 기반 |
+| Follow-latest | 명시 flag + resolved domain | 암시적 (항상) | 명시화 | pan 추가 후 필요 |
+| Adaptive xTicks | 1h/3h | 1d 고정 3h | 필요 | - |
+| **30분 보조 grid (v2.4)** | 점선 dashed | ❌ | 필요 | `PathEffect.dashPathEffect` |
+| **Gesture y-lock (v2.3)** | ✅ | ❌ | 필요 | - |
+| Rate 전체 렌더 + clipping | v2.3에서 추가 | **v1부터 존재** | - | **Canvas 자연 속성** |
+| DXY visible-only 정규화 | ✅ | ✅ | - | - |
+| **DXY 경계 보간 (v2.3)** | ✅ | ❌ | 필요 (보수적) | - |
+| **DXY 라벨 0개 fallback** | ✅ | inset 기반 fallback 필요 | 필요 | - |
+| **더블탭 애니메이션 (v2.5)** | 타협형 (X/Y 시차) | ❌ | 실험 | `Animatable` + coroutine |
+| **Fullscreen 정책 (v2.2)** | wrapper 더블탭 제거 | 미정 | 필요 | `CurrencyTabContent.kt` |
+| HorizontalPager 충돌 | N/A | 2+ pointer consume | - | 이미 해결 |
+
+---
+
+## 4. 포팅 마일스톤 (M1~M5)
+
+### M1 — 문서 정렬 + 상태 모델 전환 + `computeChartState` 정리
+
+**목표**: 기능 변화 없음. parity 작업을 위한 인프라 재편.
+
+**작업**:
+- [x] 본 문서(`GRAPH_ZOOM_DESIGN.md`) v1.0 → v2.0 재작성 (현재)
+- [ ] 상태 모델 전환
+  - `pocVisibleLengthSec: Long?` → `pocVisibleDomain: ClosedRange<Long>?` (free window, 양 경계 모두 제어)
+  - `pocIsFollowingLatest: Boolean`
+  - `resolvedVisibleDomain`: `derivedStateOf { ... }` — follow 반영 파생
+  - 기존 PoC 동작 유지: right-edge anchor는 follow 상태의 자연 결과로 나옴
+- [ ] `computeChartState` 함수 분해
+  - `computeYRange(visibleRateBuckets)` pure function 분리
+  - `computeDxyRange(visibleDxyBuckets, yRange)` pure function 분리 (yRange 정합성 패딩)
+  - 나머지 `computeXTicks`, `computeRatePaths`, `computeDxyPath`는 **이미 분리됨** (baseline 상태)
+- [ ] 빌드 + 리그레션 없음 확인 (PoC 동작 동일)
+
+**커밋 전략**: 문서 1커밋 + 코드 1(~2)커밋
+
+### M2 — Pinch/Pan + Pager arbitration (G1 검증)
+
+**목표**: 핵심 제스처 완성 + HorizontalPager 공존 전략 최종 확정.
+
+**작업**:
+- Finger-centered pinch — centroid 기반 anchor time 계산
+- 1-finger pan (**`pocIsZoomedOrPanned` 상태에서만** consume, 그 외 Pager로 pass through)
+- Pager 충돌 검증 (G1 게이트)
+  - iOS의 `UIPanGestureRecognizer.isEnabled` 토글과 등가 동작
+  - 실패 시 fallback: v1.0 문서 §4의 "2-finger만 허용" 전략 유지
+
+**성공 기준**:
+- 기본 보기에서 통화 스와이프 정상 (Pager 양보)
+- 줌된 상태에서 1-finger pan 정상
+- 핀치 anchor가 손가락 위치 부근
+
+### M3 — 더블탭 + Follow-latest 명시 + Fullscreen 정책 (v2.2 parity 완성)
+
+**목표**: iOS v2.2 단계까지 기능 일치.
+
+**작업**:
+- **더블탭 줌 토글**: 6h window + reset
+  - `detectTapGestures(onDoubleTap = ...)` 또는 수동 double tap 감지
+  - plot bounds guard: Canvas size 내부 좌표만 처리
+  - 줌 안 된 상태 + 탭 → 탭 위치 중심 6h 줌인
+  - 줌 상태 + 탭 → reset
+- **Follow-latest 명시화**
+  - `pocIsFollowingLatest: Boolean` state
+  - 제스처 ended 시 reevaluate (raw upperBound가 lastTs 근처면 follow=true)
+- **Fullscreen 정책 정리** ([CurrencyTabContent.kt](app/src/main/java/com/jay/fxi/ui/screen/CurrencyTabContent.kt))
+  - Wrapper 더블탭 → fullscreen 진입 **제거** (새 더블탭 정책과 충돌)
+  - Fullscreen 진입은 [OpenInFull 아이콘 버튼](app/src/main/java/com/jay/fxi/ui/screen/CurrencyTabContent.kt) 유지
+  - Fullscreen 내부 제스처 — v1.0 문서 §7 이식 (iOS 패턴과 같음)
+
+### M4 — DXY 정합성 + 30분 보조 grid (v2.3/v2.4 parity)
+
+**목표**: 폴리시 단계.
+
+**작업**:
+- **DXY 경계 보간** (v2.3)
+  - `interpolateDxyBoundaryPoint` 등가 — visible 양 경계에 interpolated 가상 `GraphBucket` 삽입
+  - 수직 상승 아티팩트 없음 (visible 밖 원본 버킷은 절대 렌더하지 않음)
+- **DXY 라벨 0개 fallback** (v2.3)
+  - 현재 `generateDxyLabels`는 `inset = span * 0.05` 보수적 로직이라 iOS보다 덜 민감하지만, parity 위해 추가 fallback 점검
+- **Gesture y-lock** (v2.3)
+  - Pan/pinch began에서 현재 yRange/dxyRange 캡처
+  - ended에서 `Animatable` 또는 직접 해제
+  - DXY 정규화 매핑 고정 → 애니메이션/보간 중 선 진동 방지
+- **Rate 전체 렌더 + clipping** — 이미 `clipRect`로 자연 존재, skip
+- **Adaptive xTicks + 30분 보조 grid** (v2.4)
+  - `pocAdaptiveHourInterval` 등가 (1h/3h)
+  - `generateHalfHourGrids` 등가 — minute == 30 위치만
+  - `XTick`에 `isHalfHour: Boolean` 필드 + Canvas draw 시 `PathEffect.dashPathEffect` 점선
+  - `isMidnight` 조건에 `minute == 0` 명시화 (M4 이전엔 tautological)
+
+### M5 — 더블탭 애니메이션 (v2.5 실험, **옵션**)
+
+**목표**: iOS v2.5 타협형 parity **또는 더 깔끔한 해결**.
+
+**배경**:
+- iOS v2.5는 더블탭 줌인/리셋에 `withAnimation(.easeOut(0.25))` + follow 재평가 in-block + yLock 지연 해제를 적용했지만, **X/Y 축 시차** + **DXY 미세 진동 일부 잔존**으로 **타협형**으로 기록.
+- 원인 추정: Swift Charts의 chartXScale 보간이 chartYScale과 독립적으로 타이밍 어긋남.
+
+**Android 가설**:
+- Canvas 수동 렌더링은 **state 변화를 한 프레임에 정직하게 반영** → chartXScale/chartYScale 독립 보간 개념 자체가 없음
+- `Animatable<Long>` 두 개(visibleLength, scrollAnchor)로 **완전 동기 보간** 가능할 수 있음
+- 성공 시 **iOS보다 깔끔한 결과**
+
+**작업** (M4 완료 후 착수 판단):
+- `Animatable<Long>` 2개로 visibleDomain 상태 보간
+- Coroutine `Job`으로 cancel 경로 관리 (iOS Task 등가)
+- `DisposableEffect { onDispose { job?.cancel() } }` — iOS `onDisappear` 등가
+- **실패 시 원상 복귀** (순수 실험)
+- 결과가 iOS 타협형보다 나으면 iOS 문서에 역참조 메모
+
+**의사결정**: M1~M4 완료 + 기기 검증 후에만 M5 착수 여부 재판단.
+
+---
+
+## 5. 상태 모델 상세 (M1 이후)
+
+### View state (composable `remember`)
 
 ```kotlin
-// RateGraphView composable 내부
-var visibleLength by remember { mutableStateOf<Long?>(null) }   // null = 전체 폭(기본 보기), 단위: 초
-var scrollAnchor by remember { mutableStateOf<Long?>(null) }    // null = 기본 위치, 단위: epoch 초
-var isInteracting by remember { mutableStateOf(false) }         // 핀치/팬 제스처 진행 중
+// Raw user input (single source of truth)
+var pocVisibleDomain by remember { mutableStateOf<ClosedRange<Long>?>(null) }
+    // null = 기본 보기 (전체 + right-edge natural follow)
+    // non-null = 사용자가 명시적으로 설정한 visible window (초)
+
+var pocIsFollowingLatest by remember { mutableStateOf(true) }
+    // 기본 true — 새 데이터가 들어오면 자동 슬라이드
+
+// Gesture baselines (제스처 .began에서 캡처)
+var pocPinchBaselineDomain: ClosedRange<Long>? by remember { mutableStateOf(null) }
+var pocPinchAnchorTimeSec: Long? by remember { mutableStateOf(null) }
+var pocPinchAnchorFraction: Float by remember { mutableStateOf(0.5f) }
+var pocPanBaselineDomain: ClosedRange<Long>? by remember { mutableStateOf(null) }
+
+// Gesture y-lock (M4에서 추가)
+var pocGestureYLock: GestureYLock? by remember { mutableStateOf(null) }
+
+// M5 애니메이션 release task (옵션)
+var pocGestureYLockReleaseJob: Job? by remember { mutableStateOf(null) }
 ```
 
-### 파생 규칙 (computed)
+### 파생 state
 
 ```kotlin
-val isZoomedOrPanned: Boolean by remember {
+val pocIsZoomedOrPanned: Boolean by remember {
+    derivedStateOf { pocVisibleDomain != null }
+}
+
+val resolvedVisibleDomain: ClosedRange<Long>? by remember(
+    pocVisibleDomain, pocIsFollowingLatest, lastDataTs
+) {
     derivedStateOf {
-        (visibleLength != null && visibleLength!! < totalLength) ||
-        (scrollAnchor != null && abs(scrollAnchor!! - defaultAnchor) > epsilon)
+        val raw = pocVisibleDomain ?: return@derivedStateOf null
+        if (pocIsFollowingLatest && lastDataTs != null) {
+            val length = raw.endInclusive - raw.start
+            (lastDataTs - length)..lastDataTs
+        } else raw
     }
 }
 ```
 
-- 기본 보기 복귀 시 자동으로 false
-- 잠금 판단에 이 파생값만 사용 (raw state 직접 참조 금지)
+### 계산 단위 (pure function)
 
-### 저장 정책 (1차)
+모두 `remember(resolvedVisibleDomain, data, ...)` 키로 통일 — **한 프레임 정합성 보장**.
 
-- **A안 (composable 로컬 `remember`)** 채택: 통화/기간 변경 시 줌 리셋
-- 장점: 단순, "줌은 일시적 탐색" 멘탈 모델과 일치
-- 향후 줌 보존 요구 발생 시 [GraphViewModel.kt](app/src/main/java/com/jay/fxi/ui/viewmodel/GraphViewModel.kt)로 승격
-
----
-
-## 3. 줌 한계
-
-### 공식
-
-```
-minVisibleLength = max(N × bucketSize, labelCollisionMin)
-```
-
-- [GraphPeriod.kt](app/src/main/java/com/jay/fxi/domain/model/GraphPeriod.kt) enum에 `val minVisibleLength: Duration` / `val maxVisibleLength: Duration` property 추가 → 매직 넘버 한 곳 집중
-
-### bucketSize 확정값
-
-> **확정일**: 2026-04-11
-> **출처**: `../exchange-rate/app/main.py:1278-1283` `BUCKET_SIZE_LABELS` dict
-> **iOS 문서와 동일값** — 두 플랫폼 UX 일치 보장
-
-| period | bucketSize (확정) | 1차 minVisible (PoC 확정) | maxVisible |
-|---|---|---|---|
-| 1d | 10m | 1h (= 6 buckets) | 24h |
-| 1w | 1h | 6h (= 6 buckets) | 7d |
-| 3m | **1d** | 3d (= 3 buckets) | ~90d |
-| 1y | **1d** | 7d (= 7 buckets) | 365d |
-
-### 🔎 3m·1y 특이점
-
-**3m과 1y는 둘 다 1일 버킷**입니다. 의미:
-
-- 3m 뷰에서 1주일 단위로 줌인해도 일 단위 해상도가 최대. 10분/시간 단위 디테일은 **존재하지 않음** (서버가 안 내려줌)
-- 1y도 동일. 1년 365개 데이터 포인트가 전부
-- 따라서 3m/1y의 minVisible를 너무 작게 잡으면 "줌인은 되는데 볼 게 없는" UX가 됨 → 최소 3d/7d 정도가 현실적 하한
-- UX 상 "1d 해상도 안내" 문구를 장기 뷰에서 보조 표시하는 것도 고려 대상 (PoC 이후 판단)
-
-### ⚠️ minVisible 확정은 PoC 이후
-
-bucketSize는 확정됐지만 `minVisible` 수치는 여전히 **1차 가설**. 값은 PoC 단계(특히 G3/G5)에서 다음을 보고 최종 확정:
-
-1. 핀치 감도와 자연스러운 체감
-2. X축 레이블 충돌 임계
-3. 장기 뷰에서 "볼 게 없는" 구간 여부
-4. iOS와 수치 일치 (크로스 플랫폼 UX 일관성)
-
-### 기간 변경 시 정책
-
-- 줌 리셋 (`visibleLength = null`, `scrollAnchor = null`)
+- `visibleRateBuckets(data, domain)` — filter만
+- `visibleDxyBuckets(data, domain)` — filter만
+- `computeYRange(visibleRate)` — 패딩 포함 (M1)
+- `computeDxyRange(visibleDxy, yRange)` — yRange 정합성 (M1)
+- `computeXTicks(visibleLength, domain, period)` — adaptive (M4)
+- `computeRatePaths(layout, buckets)` — 이미 분리
+- `computeDxyPath(layout, buckets, ranges)` — 이미 분리
+- `interpolateDxyBoundaryPoint(boundary, allDxy)` — M4 신규
 
 ---
 
-## 4. 구현 경로 — Compose Canvas + `detectTransformGestures`
+## 6. Pager arbitration 전략 (G1)
 
-### 적용할 modifier
+### 현재 (baseline) — 2+ pointer consume
 
 ```kotlin
-Modifier
-    .pointerInput(Unit) {
-        detectTransformGestures(
-            panZoomLock = false,
-        ) { _, pan, zoom, _ /* rotation, 무시 */ ->
-            isInteracting = true
-            // 줌 배율 → visibleLength 갱신 (minVisible..maxVisible 클램프)
-            val newLength = ((visibleLength ?: totalLength) / zoom).toLong()
-                .coerceIn(minVisibleLength, maxVisibleLength)
-            visibleLength = if (newLength == totalLength) null else newLength
-
-            // 팬 → scrollAnchor 갱신 (양 끝 clamp)
-            val newAnchor = /* pan.x를 visible domain 단위로 환산 후 시프트 */
-            scrollAnchor = newAnchor
+awaitEachGesture {
+    awaitFirstDown(requireUnconsumed = false)
+    do {
+        val event = awaitPointerEvent()
+        if (event.changes.count { it.pressed } >= 2) {
+            // pinch만 consume
         }
-    }
-    .pointerInput(Unit) {
-        detectTapGestures(
-            onDoubleTap = {
-                // 기본 보기 리셋
-                visibleLength = null
-                scrollAnchor = null
-                isInteracting = false
-            }
-        )
-    }
+    } while (event.changes.any { it.pressed })
+}
 ```
 
-### PoC 검증 게이트 (본 구현 착수 전 통과 필수)
+### M2 목표 — 1-finger pan 조건부 consume
 
-| ID | 항목 | 통과 기준 |
-|---|---|---|
-| **G1** | HorizontalPager 수평 스와이프와의 gesture arbitration | 그래프 위에서 핀치/팬 동작 중 [MainScreen.kt:261](app/src/main/java/com/jay/fxi/ui/screen/MainScreen.kt#L261) HorizontalPager 스와이프가 의도대로 회피되거나 명확히 분리되는가 |
-| **G2** | Visible domain 연쇄 재계산 정합성 | 확대 후 xMin/xMax, yMin/yMax, dxyMin/dxyMax, tick 생성이 **한 프레임 안에 일관되게** 갱신되는가 (※ 이 그래프의 가장 큰 잠재 디버깅 포인트) |
-| **G3** | 핀치 줌 보간 | 줌 배율 변경이 부드럽게 보간, jitter 없음 |
-| **G4** | WebSocket/주기 갱신 영향 격리 | 줌인 상태에서 새 데이터 도착 시 사용자 visible domain이 흔들리지 않음 (§6 잠금 동작 검증) |
-| **G5** | 관성/fling 필요 여부 판정 | 관성 없이 손을 떼면 UX가 어색한지. 어색하면 `Animatable` + `splineBasedDecay`로 fling 추가 필요 — 이 판단 자체가 PoC의 산출물 |
+- 1-finger 드래그가 발생할 때 **`pocIsZoomedOrPanned`가 true이면 consume** (pan 처리)
+- false이면 consume 하지 않음 → Pager로 전파 (통화 스와이프)
+- 이는 iOS의 `UIPanGestureRecognizer.isEnabled = pocIsZoomedOrPanned` 토글과 **개념적 등가**
 
-### HorizontalPager 충돌 해결 전략 (G1 대응)
+### Fallback 전략 (v1.0 문서 §4 계승)
 
-iOS의 `TabView(.page)`와 동일한 문제. Android는 다음 순으로 시도:
-
-1. **`awaitPointerEventScope` 내에서 제스처를 먼저 잡고 `consume`** — 그래프 영역 포인터 이벤트를 Pager로 전파 차단. 한 손가락 탭(단일 탭 등)은 통과시킴.
-2. **두 손가락 팬만 허용** — 한 손가락 드래그는 Pager에 양보. iOS 경로 B와 동일 전략. UX 희생 있음.
-3. **확대 모드 토글 버튼** — 토글 ON일 때만 그래프가 제스처를 잡음. 가장 확실하지만 UX 손실 가장 큼.
-
-1번이 실패하면 2번, 2번도 애매하면 3번으로 fallback.
+G1 실패 시:
+1. 1-finger pan 포기 → 2-finger pan(핀치 후 두 손가락 drag)
+2. 확대 모드 토글 버튼 — 가장 확실하지만 UX 손실
 
 ---
 
-## 5. 좌표계 재계산 지점
+## 7. 검증 체크리스트 (마일스톤별)
 
-Canvas 기반이라 매 프레임 전체 재계산이므로 **수정점은 "visible domain을 반영한 필터/계산 함수로 입력만 바꾸면" 된다**. iOS보다 수정 위치 수는 적지만 연쇄 재계산 정합성은 같은 부담.
+### M1 리그레션 체크
 
-| 위치 | 현재 동작 | 수정 내용 |
-|---|---|---|
-| [RateGraphView.kt:161](app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt#L161) `RateGraphCanvas` | 전체 ratePoints 기반 렌더 | visibleDomain 내 포인트만 집계하여 xMin/xMax/yMin/yMax 재산출 |
-| [RateGraphView.kt:373](app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt#L373) `computeXTicks` | period 기반 고정 간격 | visibleLength에 반비례하는 동적 간격 (예: 6h 미만 → 1h, 2h 미만 → 30m) |
-| [RateGraphView.kt:579](app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt#L579) `computeDxyPath` | 전체 DXY 포인트 | visibleDomain 필터 적용 |
-| [RateGraphView.kt:600](app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt#L600) `normalizeDxyValue` | 전체 dxyRange 기반 | visible 구간 dxyRange 기반으로 재계산 |
-| DXY 좌측 Y축 레이블 (RateGraphView.kt 내 overlay 영역) | 전체 dxyRange 기반 step | 재계산된 dxyRange 기반 step 자동 갱신 |
+- 기존 PoC pinch zoom 여전히 작동
+- 기간 전환 시 리셋 동작
+- yRange 재계산 정합성 (기존과 동일)
 
-### 연쇄 재계산 정합성 — 핵심 리스크
+### M2 제스처 체크
 
-Canvas 좌표계가 한 벌이라 overlay/proxy 분리 이슈는 없지만, **visible domain이 바뀔 때마다 위 5개 계산이 하나도 어긋나지 않고 한 프레임에 갱신**되어야 함. 어긋나면 DXY 라벨이 선과 미묘하게 엇나가거나, tick이 엉뚱한 위치에 찍힘. 전부 **동일한 `visibleDomain` 값을 입력으로 받는 pure function**으로 정리하고, Compose `remember(visibleDomain, data)` 키에 일관되게 물리는 것이 방어책.
+- 기본 보기 + 좌우 스와이프 → Pager 페이지 전환
+- 줌 상태 + 좌우 드래그 → 그래프 pan
+- 핀치 anchor ≈ 손가락 위치
+- 통화 3개 (달러/엔/유로) 모두 정상
+
+### M3 v2.2 parity 체크
+
+- 더블탭 줌인 (탭 위치 중심 6h)
+- 더블탭 reset
+- plot 밖 더블탭 → no-op
+- Follow-latest: 우측 edge 근처 pan 해제 시 자동 follow 재진입
+- 과거 pan → follow freeze
+- Fullscreen 버튼으로 진입 / 버튼으로 해제 / wrapper 더블탭 무효
+
+### M4 v2.3/v2.4 parity 체크
+
+- 강한 줌(≤ 2.5h)에서 30분 보조 grid 점선
+- DXY 선 plot 경계까지 이어짐 (경계 보간 효과)
+- Pan/pinch 중 DXY 진동 없음 (y-lock 효과)
+
+### M5 v2.5 실험 체크 (옵션)
+
+- 더블탭 줌인/리셋 애니메이션 자연스러움
+- Swift Charts 타협(X/Y 시차, DXY 미세 진동)이 Android에서는 어떤 양상인지 비교 기록
 
 ---
 
-## 6. 데이터 수집 vs 표시 동기화 분리
+## 8. 공용 composable 이점 (iOS 대비)
 
-### 용어 분리 (iOS와 동일 원칙)
+iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**이 별도 존재. 양쪽 동기화에 추가 작업 필요했음 (v2.2~v2.5 각 마일스톤마다 복사).
 
-- **데이터 수집 (줌 중에도 계속 동작)**
-  - WebSocket 수신
-  - [GraphViewModel](app/src/main/java/com/jay/fxi/ui/viewmodel/GraphViewModel.kt) 주기 갱신
-  - 캐시 업데이트
-  - Live tail 합성
-  - **절대 멈추지 않는다**
+**Android는 [RateGraphView.kt](app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt) 단일 composable을 LockedPreviewScreen에서 재사용**. 한 번의 수정으로 본화면 + 예시화면 자동 반영. 포팅 작업량이 iOS 대비 **~1.5배 절약**됨.
 
-- **표시 동기화 (잠금 대상)**
-  - 새 데이터가 들어와도 차트 visible domain을 우측으로 자동 확장하지 않음
-  - 사용자가 보고 있는 구간은 그대로 유지
+단, [LockedPreviewScreen.kt](app/src/main/java/com/jay/fxi/ui/subscription/LockedPreviewScreen.kt) 내부 HorizontalPager도 Pager arbitration 대상이라 G1 검증은 **양쪽 화면에서 수행**.
 
-### 잠금 조건
+---
 
-```kotlin
-val freezeDomain = isInteracting || isZoomedOrPanned
+## 9. 알려진 한계 / post-parity 후보
+
+| 항목 | 상태 | 우선순위 |
+|---|---|---|
+| 1w/3m/1y 줌/팬 | parity에서 제외 | post-parity 후보. bucketSize가 1h~1d라 효용 작음 |
+| plotFrame 갱신 트리거 보강 | iOS에도 후순위 | post-parity |
+| 예시화면 follow-latest 자동 슬라이드 | iOS에 부재 (SampleData 정적) | 공용 composable 구조라 Android에서도 동일 한계 |
+| xTicks 15m/10m 세분화 | 30m까지만 계획 | post-parity |
+
+---
+
+## 10. 참고 자료
+
+- iOS 기준 문서: [`../ios/GRAPH_ZOOM_DESIGN.md`](../ios/GRAPH_ZOOM_DESIGN.md) v2.5
+- Compose Gestures: https://developer.android.com/develop/ui/compose/touch-input/pointer-input/multi-touch
+- HorizontalPager gesture 공존: https://developer.android.com/develop/ui/compose/layouts/pager
+- Compose Animatable: https://developer.android.com/jetpack/compose/animation/value-based
+
+---
+
+## 11. 작업 이력
+
+```
+2026-04-11  v1.0 Android 단독 설계 초안
+            "모든 기간 동일 인터랙션" 전제 (후에 1d only로 정정)
+2026-04-14  PoC v1 구현 (pinch-only, 1d only, right-edge anchor)
+            커밋 8a53808 — "graph zoom PoC baseline"로 dirty 상태 고정
+2026-04-14  v2.0 문서 재작성
+            iOS v2.5 parity 로드맵으로 전면 개편
+            1d only 원칙 확정, M1~M5 마일스톤 정의
 ```
 
-### 해제 시 동작
+git 커밋 (Android):
 
-사용자가 기본 보기로 복귀하는 순간 (`visibleLength = null`, `scrollAnchor = null`) 그동안 수집·합성된 최신 데이터가 즉시 반영. 누락 없음.
-
-### 구현 힌트
-
-Live tail append 자체는 막지 않되, 도메인 계산 함수가 `freezeDomain == true`일 때는 사용자의 `visibleLength`/`scrollAnchor`를 기준으로만 도메인을 산출. Live tail 데이터는 단지 "그 도메인 안에 들어와 있으면 그려질 뿐".
-
----
-
-## 7. 제스처 정리 범위
-
-| 위치 | 현재 동작 | 변경 |
-|---|---|---|
-| [CurrencyTabContent.kt:444](app/src/main/java/com/jay/fxi/ui/screen/CurrencyTabContent.kt#L444) 일반 모드 그래프 섹션 더블탭 | `setGraphFullscreen(true)` — 전체화면 **열기** | **삭제** (핀치/팬과 의도 충돌) |
-| [CurrencyTabContent.kt:476](app/src/main/java/com/jay/fxi/ui/screen/CurrencyTabContent.kt#L476) `OpenInFull` 아이콘 `clickable` | `setGraphFullscreen(true)` — 전체화면 **열기** | **유지** — 전체화면 진입은 이 버튼으로 일원화 |
-| [CurrencyTabContent.kt:298](app/src/main/java/com/jay/fxi/ui/screen/CurrencyTabContent.kt#L298) 전체화면 모드 내부 Box 더블탭 | `setGraphFullscreen(false)` — 전체화면 **닫기** | **용도 변경**: 핀치/팬 상태를 기본 보기로 리셋 (일반 모드에도 동일 적용) |
-| [CurrencyTabContent.kt:275](app/src/main/java/com/jay/fxi/ui/screen/CurrencyTabContent.kt#L275) 전체화면 모드 내부 `Cancel` 아이콘 `clickable` | `setGraphFullscreen(false)` — 전체화면 **닫기** | **유지** (전체화면 닫기 버튼) |
-| [GraphViewModel.kt:85](app/src/main/java/com/jay/fxi/ui/viewmodel/GraphViewModel.kt#L85) `setGraphFullscreen` | fullscreen 상태 토글 | 유지 (전체화면 기능 자체는 존속) |
-
----
-
-## 8. LockedPreviewScreen 동기화
-
-- [LockedPreviewScreen.kt:607](app/src/main/java/com/jay/fxi/ui/subscription/LockedPreviewScreen.kt#L607), [:1048](app/src/main/java/com/jay/fxi/ui/subscription/LockedPreviewScreen.kt#L1048)에서 **같은 `RateGraphView` composable을 재사용**하므로 **별도 작업 불필요**.
-- iOS는 `SampleGraphView.swift`라는 복제 파일이 있어 양쪽 동기화가 필요하지만, Android는 **공용 composable 구조 덕분에 한 번의 수정으로 본화면/예시화면 동시 반영**. 설계상 장점.
-- 단, [LockedPreviewScreen.kt:373](app/src/main/java/com/jay/fxi/ui/subscription/LockedPreviewScreen.kt#L373) 내부 HorizontalPager와의 G1 충돌도 동일하게 발생하므로 PoC는 **본화면과 예시화면 둘 다에서 검증** 필요.
-
----
-
-## 9. 향후 검토
-
-캐시 bucketSize 영속화 같은 플랫폼 공통 주제는 iOS 문서 `../ios/GRAPH_ZOOM_DESIGN.md` §9에 기록. Android에서도 같은 결정 사항이 적용되지만, **결정 시점에 양쪽 문서를 함께 갱신**.
-
----
-
-## 10. 미해결 리스크
-
-| # | 리스크 | 대응 |
-|---|---|---|
-| R1 | HorizontalPager 수평 스와이프와 `detectTransformGestures` 충돌 | PoC G1, 3단계 fallback 전략 (§4) |
-| R2 | visible domain 연쇄 재계산 정합성 (xMin/xMax/yMin/yMax/dxyMin/dxyMax/tick) | PoC G2, `remember(visibleDomain)` 키 통일 |
-| R3 | 줌 중 WebSocket 갱신이 도메인 흔듦 | `freezeDomain` 잠금 + PoC G4 |
-| R4 | 1d 외 bucketSize 미검증 | §3 선행 작업 (iOS와 공유) |
-| R5 | 관성/fling 필요 여부 미정 | PoC G5 산출물 |
-| R6 | `detectTransformGestures`의 rotation 파라미터 오동작 시 UX 이상 | 테스트 단계에서 rotation 값 무시 명시 |
-| R7 | LockedPreviewScreen 내부 HorizontalPager (§8)에서도 G1 재발 가능 | PoC 시 양쪽 화면 검증 |
-
----
-
-## 11. 작업 순서
-
-1. **백엔드 bucketSize 확정** (선행, iOS와 공유): `../exchange-rate/` 코드 또는 라이브 응답으로 period별 값 확정 + §3 표 업데이트
-2. **PoC 브랜치**: §4 최소 구현 + G1~G5 검증 (반나절~1일)
-3. **G1 결과에 따라 충돌 해결 전략 확정** (1번/2번/3번 중 하나)
-4. **G5 결과에 따라 fling 구현 여부 확정**
-5. **본 구현**: §5 재계산 지점 전부 반영
-6. **제스처 정리**: §7 — 더블탭 용도 변경, 전체화면 진입 동선 정리
-7. **본화면/LockedPreviewScreen 양쪽에서 수동 검증**
-8. **iOS와 UX 일치 확인** (핀치 감도, minVisible 값 등)
-
----
-
-## 부록 A. 참고 자료
-
-- Compose Gestures: `detectTransformGestures`
-  https://developer.android.com/develop/ui/compose/touch-input/pointer-input/multi-touch
-- Compose HorizontalPager gesture 공존 패턴
-  https://developer.android.com/develop/ui/compose/layouts/pager
-- Jay's Compose Canvas 그래프 현행 구현: [RateGraphView.kt](app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt)
+- `8a53808` — feat(android): graph zoom PoC baseline (v1.0 design + pinch-only 1d PoC)
+- **current HEAD** (이후 M1 docs commit으로 갱신)
