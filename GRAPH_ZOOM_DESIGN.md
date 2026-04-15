@@ -247,27 +247,44 @@ iOS v2.5가 1d만 줌 활성인 이유는 Swift Charts의 제약에서 파생된
 - DXY 라벨 `inset = span * 0.05` 유지 (iOS는 inset 없음). Android는 라벨이 plot 가장자리에 너무 가까이 붙는 것을 막는 보수적 정책으로 의도적 divergence. §9 참조
 - y-lock 동안 visible 데이터의 새 max/min이 lock 범위 초과하면 line이 chart 경계 잠시 벗어나 잘림. iOS와 동일 trade-off, 라벨 안정성이 더 큰 가치라 수용
 
-### M5 — 더블탭 애니메이션 (v2.5 실험, **옵션**)
+### M5 — 더블탭 애니메이션 (v2.5 실험적 parity) (완료)
 
-**목표**: iOS v2.5 타협형 parity **또는 더 깔끔한 해결**.
+**목표였던 것**: iOS v2.5 타협형 parity 또는 더 깔끔한 해결.
 
-**배경**:
-- iOS v2.5는 더블탭 줌인/리셋에 `withAnimation(.easeOut(0.25))` + follow 재평가 in-block + yLock 지연 해제를 적용했지만, **X/Y 축 시차** + **DXY 미세 진동 일부 잔존**으로 **타협형**으로 기록.
-- 원인 추정: Swift Charts의 chartXScale 보간이 chartYScale과 독립적으로 타이밍 어긋남.
+**완료 내역** (세부 커밋 해시는 §11 작업 이력 참조):
 
-**Android 가설**:
-- Canvas 수동 렌더링은 **state 변화를 한 프레임에 정직하게 반영** → chartXScale/chartYScale 독립 보간 개념 자체가 없음
-- `Animatable<Long>` 두 개(visibleLength, scrollAnchor)로 **완전 동기 보간** 가능할 수 있음
-- 성공 시 **iOS보다 깔끔한 결과**
+- **Animation infra**:
+  - `pocAnimationJob: Job?` remembered state — 진행 중 애니메이션 관리
+  - `animationScope = rememberCoroutineScope()` — composable scope의 coroutine launcher
+  - `DisposableEffect { onDispose { pocAnimationJob?.cancel() } }` — composable dispose 시 정리
+  - `LaunchedEffect(period)`에 job cancel 추가 — 기간 변경 시 정리
+  - `animateDomainTransition(fromStart, fromEnd, toStart, toEnd, durationMs, onFrame)` file-bottom private suspend helper — `Animatable<Float>`로 progress 0→1 보간, 매 frame onFrame 콜백에서 caller가 (start, end)를 받아 state 갱신
+- **Easing/duration**: iOS `.easeOut(duration: 0.25)` 등가로 Compose의 `LinearOutSlowInEasing` + 250ms `tween`. iOS Swift `.easeOut`은 quadratic, Compose `LinearOutSlowInEasing`은 cubic-ish 곡선이라 미세 차이는 있으나 시각적으로 유사
+- **더블탭 분기 재구성** (iOS `pocHandleDoubleTap` 등가):
+  - **Reset 케이스** (`preGestureDomain != null`): yLock 미사용 (iOS 동일 패턴 — reset은 도메인 expand라 자연스럽게 yRange 확장됨). animation으로 from(현재 pocVisibleDomain) → to(default) 보간 후 `pocVisibleDomain = null` + `follow on`
+  - **Zoom in 케이스** (`preGestureDomain == null`): yLock snapshot → animation으로 default → 6h target 보간 → settle to clamped + follow 재평가 → yLock 즉시 release
+  - **Chaining**: 새 더블탭 진입 시 진행 중 animation cancel. 새 from = 마지막 animated value (자연스러운 인계)
+- **Cancel 경로**:
+  - 새 더블탭 진입 시 — 진행 중 애니메이션 cancel + lock release (빠른 연속 시나리오 fix, 아래 결함 1 참조)
+  - Pinch/pan begin 시 — 진행 중 애니메이션 cancel (새 gesture가 자체 lock snapshot)
+  - LaunchedEffect(period) period 변경 시 — cancel + 모든 state reset
+  - DisposableEffect onDispose composable dispose 시 — cancel
 
-**작업** (M4 완료 후 착수 판단):
-- `Animatable<Long>` 2개로 visibleDomain 상태 보간
-- Coroutine `Job`으로 cancel 경로 관리 (iOS Task 등가)
-- `DisposableEffect { onDispose { job?.cancel() } }` — iOS `onDisappear` 등가
-- **실패 시 원상 복귀** (순수 실험)
-- 결과가 iOS 타협형보다 나으면 iOS 문서에 역참조 메모
+**구현 중 발견·수정한 결함 1건** (자기 검증으로 발견):
 
-**의사결정**: M1~M4 완료 + 기기 검증 후에만 M5 착수 여부 재판단.
+1. **빠른 연속 더블탭 (zoom in 직후 reset) lock leak**: 첫 zoom in이 yLock을 set한 상태에서 사용자가 즉시 다시 더블탭(reset)하면, 더블탭 진입부에서 `pocAnimationJob.cancel()`만 했을 뿐 yLock은 release하지 않아 reset 분기로 stale lock 누설. Reset 분기는 자체 yLock 사용/release 안 하므로 lock이 reset 애니메이션 동안 그대로 유지되고 reset 종료 후에도 frozen. 더블탭 진입부 직후 `pocGestureYLock = null` 명시 추가로 해결.
+
+**기기 검증 결과** (Jay 수동, 2026-04-16):
+
+- 기능적 14항목 통과 (1, 2, 5~14 정상 동작)
+- **잔존 시각 차이 2건** (이번 M5 범위에서 **수용된 trade-off**, 명백한 결함 아님):
+  - **줌인 애니메이션 중 라벨 안정**: yLock 효과로 라벨 값 자체의 급변은 억제되지만, 사용자 관찰 결과 chart 변형(visible domain 24h → 6h morph)과 함께 라벨이 같이 움직이는 듯한 시각 인상이 일부 남음. 사용자 평가 "크게 이상하진 않음". 코드 정적 분석으로 lock은 값 수준에서 작동(`effectiveYMin/Max = yLock.yMin/Max`)하지만, X축 morph가 dramatic해서 시각 인지에서 chart 전체 transformation으로 묶여 인식되는 것으로 추정. 더 나은 해법은 §9 post-M5 후보 참조
+  - **부드러움 자체는 iOS Swift Charts 대비 살짝 부자연스러움**: Compose Canvas는 매 프레임 chartState recomputation (visible filter, computeYRange/DxyRange, dxyDisplayBuckets boundary 보간, computeDxyPath, computeRatePaths) + software path drawing. iOS Swift Charts는 GPU 가속 implicit 보간. 플랫폼 inherent 차이로 수용. 저비용 polish 후보(easing 곡선 변경, duration 미세 조정, computeChartState 비용 최적화)는 §9 참조
+
+**iOS divergence (의도적, M5 시점)**:
+
+- yLock 지연 release 미채택 (iOS는 0.26s Task로 settle 후 release): Compose에서 동일 패턴 안전 구현하려면 자연 chartState 파생 state 별도로 두거나 computeChartState를 두 번 계산해야 함 → ETC 원칙에 따라 즉시 release 채택. 자세한 근거는 §9 노트 참조
+- Animation 중 pinch handoff 시 stale lock snapshot 이어받음: iOS도 같은 패턴(`pocHandlePinchBegan`이 `data.yRange` = locked 값 읽음). 의도적 visual continuity trade-off로 수용. renderDomainOverride 패턴 refactor가 더 나은 해법이지만 큰 refactor라 post-M5 후보. §9 노트 참조
 
 ---
 
@@ -466,6 +483,10 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
 | **Graph fullscreen 단일 탭 종료 (iOS divergence)** | **의도적 divergence** | **post-parity 후보** |
 | **DXY 라벨 inset 정책 (iOS divergence)** | **의도적 divergence** | **유지** |
 | **y-lock 동안 line이 chart 경계 잠시 벗어남** | **수용된 trade-off (iOS와 동일)** | **유지** |
+| **M5 yLock 지연 release 미채택 (iOS divergence)** | **의도적 divergence** | **post-M5 polish 후보** |
+| **M5 animation→pinch handoff stale lock (iOS와 동일 패턴)** | **수용된 trade-off** | **post-M5 polish 후보** |
+| **M5 zoom-in 시각 동조감 (chart morph)** | **시각 인상, 코드 정적으론 lock 작동** | **post-M5 polish 후보** |
+| **M5 부드러움 iOS 대비 살짝 부자연** | **Compose Canvas inherent** | **저비용 polish (easing/duration/recompute) 후보** |
 
 ### iOS divergence — Graph fullscreen 단일 탭 종료 (M3-b)
 
@@ -520,6 +541,99 @@ iOS는 동일 trade-off를 채택하여 v2.3에서 도입했고, 사용자가 �
 
 pinch는 점진적이라 한 프레임의 line vs lock 편차가 작아 line 끝이 잠시 잘리는 정도이며, 거슬리는 수준은 아님.
 
+### iOS divergence — M5 yLock 지연 release 미채택 (M5)
+
+**무엇이 다른가**:
+
+- iOS: `pocHandleDoubleTap` zoom in 케이스에서 `withAnimation { setVisibleDomain }` 직후 `pocGestureYLockReleaseTask = Task { sleep(0.26s); withAnimation { yLock = nil } }`로 yLock을 0.26s 지연 release. 애니메이션(0.25s) 끝난 뒤 살짝 대기 후 lock 해제하여 settle 프레임이 lock 값으로 그려진 뒤 자연 yRange로 부드럽게 전환되는 polish
+- Android: 애니메이션 종료 즉시 `pocGestureYLock = null`. 지연 없음
+
+**왜 다른가**:
+
+iOS의 0.26s 지연은 settle 후 부드러운 yRange 전환을 위한 polish. Compose Canvas에서 동일 패턴 안전 구현하려면 "지연 release window 동안 새 pinch/pan이 시작되면 stale lock 값을 snapshot하는" 위험을 막아야 하는데, 이를 위한 정공법은:
+
+1. 자연(unlocked) chartState를 별도 derived state로 유지하여 gesture begin 시 그 값에서 snapshot
+2. 또는 computeChartState를 매번 yLock=null로 별도 호출
+
+둘 다 인프라 추가가 필요. ETC 원칙(M5는 polish 단계, 추가 복잡도 비례 이익 작음)에 따라 즉시 release 채택. iOS의 settle 후 yRange 전환 polish는 일부 손실하지만 정확성/단순성 우선.
+
+**언제 재검토**:
+
+post-M5 polish 단계에서 `renderDomainOverride` 패턴(아래 항목 참조)으로 visual/logical 분리하는 큰 refactor와 함께 재검토. 그 시점에는 자연 chartState 파생도 자연스럽게 따라옴.
+
+### M5 trade-off — Animation→pinch handoff stale lock snapshot (iOS와 동일 패턴)
+
+**무엇인가**:
+
+Animation 도중 사용자가 pinch/pan을 시작하면, 새 gesture의 yLock snapshot이 `currentChartState`(여전히 직전 애니메이션의 lock 값이 적용된 상태)에서 읽혀 stale lock을 이어받음. iOS `pocHandlePinchBegan`도 같은 패턴 — `data.yRange`가 lock 적용 값을 반환하므로 동일 결과.
+
+**왜 수용하나**:
+
+- iOS와 동일 동작이라 parity 관점에서 OK
+- 스칼라 분석상 사용자가 보고 있는 라벨 값을 그대로 이어받는 visual continuity 효과 (대안: pinch begin 시 fresh natural로 snapshot → 한 번 jump가 발생)
+- Edge case (250ms 애니메이션 동안 pinch 시작 시나리오) 빈도 낮음
+
+**언제 재검토**:
+
+`renderDomainOverride` 패턴(아래) refactor 시 자연스럽게 해소됨.
+
+### post-M5 polish 후보 — `renderDomainOverride` 패턴 (logical/visual 분리)
+
+iOS는 Swift Charts의 `withAnimation` 메커니즘으로 logical state(`pocVisibleDomain`)를 즉시 target 값으로 commit하고 visual interpolation은 Swift Charts가 implicit로 처리. Android는 현재 Animatable callback에서 매 프레임 `pocVisibleDomain`을 progressive하게 write하므로 logical state == visual intermediate가 되어 다음 차이가 발생:
+
+1. Pinch baseline이 intermediate (iOS는 target)
+2. yLock snapshot stale 위험 (위 항목)
+3. 더블탭 결과를 즉시 상태 머신으로 commit하는 iOS 패턴과 비교해 이질감
+
+**대안 패턴**:
+
+```kotlin
+var pocVisibleDomain by remember { mutableStateOf(...) }  // logical (즉시 target commit)
+var renderDomainOverride: ClosedRange<Long>? by remember { mutableStateOf(null) }  // visual interpolation
+
+// chartState는 effectiveDomain = renderDomainOverride ?: pocVisibleDomain 사용
+// 더블탭: pocVisibleDomain = target (logical) + animate renderDomainOverride from→target
+// 애니메이션 끝: renderDomainOverride = null (logical로 fall through)
+// pinch begin: cancel animation + clear override (logical state는 이미 target)
+// pinch baseline = pocVisibleDomain (target, not intermediate)
+```
+
+**왜 지금 안 했나**:
+
+- M5 범위는 polish — visual/logical 분리는 큰 refactor (chartState 파생, gesture handler 모두 영향)
+- ETC: 변경 범위 대비 이익이 polish 단계에서 비례하지 않음
+- 현재 구현은 iOS-equivalent로 ship 가능 (parity 목표 달성)
+
+**언제 진행**:
+
+post-M5 polish 단계에서 위 trade-off 3건이 사용자 체감으로 명확한 불편으로 보고되면 진행. 현재는 "크게 이상하진 않음" 수준이라 보류.
+
+### M5 부드러움 — Compose Canvas inherent 차이
+
+**무엇인가**:
+
+iOS Swift Charts 대비 Android Compose Canvas의 더블탭 애니메이션이 살짝 부자연스러움. 사용자 평가 "iOS는 부드러운 반면, android는 비교적 살짝 부자연스럽다는 느낌".
+
+**원인 추정**:
+
+- Compose Canvas는 매 프레임 `chartState` recomputation: visible filter, computeYRange, computeDxyRange, dxyDisplayBuckets boundary 보간, computeDxyPath, computeRatePaths, computeXTicks 등
+- 60fps에서 매 프레임 ~16ms 예산. 위 작업이 무거우면 frame drop 가능
+- iOS Swift Charts는 GPU 가속 implicit 보간 (CPU 부담 거의 없음)
+- Compose Canvas는 software path drawing (CPU 의존)
+
+**저비용 polish 후보** (post-M5):
+
+- Easing 곡선 변경: `LinearOutSlowInEasing` → `FastOutSlowInEasing` (Material 표준) 또는 cubic-bezier 직접 정의
+- Animation duration 미세 조정: 250ms → 200ms 또는 300ms로 시도
+- `computeChartState` 비용 최적화:
+  - dxyDisplayBuckets 산출을 visible domain 변경에만 dependent하도록 memoize
+  - computeDxyRange를 dxyDisplayBuckets identity 기반으로 캐시
+  - Path 재구성 비용 측정 후 partial update 가능성 검토
+
+**왜 지금 안 했나**:
+
+위 polish는 측정 기반(profiler로 frame time 확인) + 시각 비교가 필요한 실험 단계. M5 범위는 기능 구현이고, 측정/비교 polish는 별도 작업. 현재 결과는 "기능 정상, 부드러움 약간 부족" 수준이라 ship 후 사용자 피드백 보고 결정.
+
 ---
 
 ## 10. 참고 자료
@@ -561,6 +675,14 @@ pinch는 점진적이라 한 프레임의 line vs lock 편차가 작아 line 끝
                   full-unzoom/follow-latest 누락 3종) 코덱스 리뷰로 발견. 같은
                   fix(분기 조건에 DISCARDED 포함)로 모두 해결
             기기 검증 통과 후 커밋 db7be63 / 0d7cd24 / 2497c8c
+2026-04-16  M5 구현 (더블탭 애니메이션, v2.5 실험적 parity)
+            Animatable<Float> + 매 프레임 pocVisibleDomain 보간 + zoom in 케이스 yLock.
+            구현 중 빠른 연속 더블탭 lock leak 자기 검증으로 발견·수정.
+            기기 검증 14항목 통과. 잔존 시각 차이 2건(zoom-in 시각 동조감, 부드러움)은
+            iOS divergence/inherent 차이로 수용. iOS divergence 2건(yLock 지연 release
+            미채택, animation→pinch handoff stale lock) + post-M5 polish 후보 (renderDomainOverride
+            패턴, easing/duration/recompute 최적화) 모두 §9에 기록
+            커밋 bff1676
 ```
 
 git 커밋 (Android):
@@ -577,4 +699,6 @@ git 커밋 (Android):
 - `db7be63` — feat(android): M4-a DXY 경계 보간 + 라벨 0개 fallback (v2.3 parity)
 - `0d7cd24` — feat(android): M4-c adaptive xTicks + 30분 보조 grid (v2.4 parity)
 - `2497c8c` — feat(android): M4-b gesture y-lock + DISCARDED cleanup leak fix (v2.3 parity)
-- **current HEAD** — docs(android): M4 완료 이력 반영 (§4 M4 + §9 DXY inset/y-lock divergence + §11)
+- `c8fa7c3` — docs(android): M4 완료 이력 반영 (§4 M4 + §9 DXY inset/y-lock divergence + §11)
+- `bff1676` — feat(android): M5 더블탭 줌 애니메이션 (v2.5 실험적 parity)
+- **current HEAD** — docs(android): M5 완료 이력 반영 (§4 M5 + §9 M5 divergence/polish 후보 + §11)
