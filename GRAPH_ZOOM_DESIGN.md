@@ -122,21 +122,33 @@ iOS v2.5가 1d만 줌 활성인 이유는 Swift Charts의 제약에서 파생된
 
 **알려진 한계**: M1 범위상 right-edge anchor 유지 → 사용자가 과거 쪽으로 줌인 불가. M2의 finger-centered pinch + 1-finger pan에서 해결.
 
-### M2 — Pinch/Pan + Pager arbitration (G1 검증)
+### M2 — Pinch/Pan + Pager arbitration (G1 검증) (완료)
 
-**목표**: 핵심 제스처 완성 + HorizontalPager 공존 전략 최종 확정.
+**목표였던 것**: 핵심 제스처 완성 + HorizontalPager 공존 전략 최종 확정.
 
-**작업**:
-- Finger-centered pinch — centroid 기반 anchor time 계산
-- 1-finger pan (**`pocIsZoomedOrPanned` 상태에서만** consume, 그 외 Pager로 pass through)
-- Pager 충돌 검증 (G1 게이트)
-  - iOS의 `UIPanGestureRecognizer.isEnabled` 토글과 등가 동작
-  - 실패 시 fallback: v1.0 문서 §4의 "2-finger만 허용" 전략 유지
+**완료 내역** (세부 커밋 해시는 §11 작업 이력 참조):
 
-**성공 기준**:
-- 기본 보기에서 통화 스와이프 정상 (Pager 양보)
-- 줌된 상태에서 1-finger pan 정상
-- 핀치 anchor가 손가락 위치 부근
+- **Finger-centered pinch** — `calculateCentroid(useCurrent = true)`로 plot 내 fraction 계산, baseline 시작점 기준 anchor time 고정. iOS v2.2의 centroid-anchored pinch와 개념적 등가
+- **1-finger pan (조건부 consume)** — `pocVisibleDomain != null`(줌 상태)일 때만 consume, 그 외는 `PASS_THROUGH`로 HorizontalPager에 양보. iOS의 `UIPanGestureRecognizer.isEnabled = pocIsZoomedOrPanned` 토글과 등가
+- **GestureMode FSM** — `UNDETERMINED → PINCH/PAN/PASS_THROUGH/DISCARDED`. pinch 도중 1-finger 전환은 DISCARDED로 차단하여 의도치 않은 pan 시작 방지. 기본 보기에서 1-finger 발생 시 PASS_THROUGH로 Pager 전달
+- **Gesture-end follow-latest 재평가** — `unzoomedLen = totalLength + trailingBufferSec(period)` 기준으로 `rawLen >= 99%` 이면 `pocVisibleDomain = null` + follow on, 그 외는 최신 근접(< 600s) 여부로 follow 판정
+
+**구현 중 발견·수정한 버그 4건** (역사 기록):
+
+1. **`pointerInput` stale capture** — `pointerInput(period, totalLengthSec)` key 안에 없는 `lastDataTs`/`dataBounds`/`resolvedVisibleDomain`/`chartState.hasDxy`가 로컬 `val remember`로 캡처돼, pointerInput coroutine 생애 동안 첫 composition 시점 값에 고정. 해결: `rememberUpdatedState` 4종으로 감싸 최신 state 참조 (iOS UIKit gesture recognizer의 action block 패턴과 등가). key 확장은 제스처 도중 cancel 위험이 있어 배제
+2. **Pinch baseline의 trailing buffer 누락** — 기본 보기 시 pinch baseline fallback이 `dataBounds`(minTs..maxTs)였으나, 실제 default 표시 domain은 `fullXMin..(lastDataTs + trailingBufferSec(period))`. 길이 차이 = 2400초(40분). Pinch 시작 첫 프레임에 오른쪽 40분 영역이 사라지는 점프 발생. 해결: baseline fallback을 `bounds.start..(bounds.endInclusive + trailingBufferSec(period))` 로 맞춰 default view의 xMax와 정확히 일치
+3. **`clampVisibleDomain` mid-gesture null 반환으로 인한 화면 떨림** — 이전 helper(`setVisibleDomainClamped`)는 `clampedLen >= totalLength * 99%` 이면 null 반환하여 "전체 복귀"로 해석. baseline이 trailing buffer 포함(`totalLength + 2400`)으로 확장된 상태에서는 per-frame pinch 시 proposedLen이 자주 threshold를 넘나들어 null ↔ 직전값 플리커 발생. 사용자 관찰 "화면만 흔들린다"의 직접 원인. 해결: `clampVisibleDomain`으로 재설계 — non-null 반환, 명시적 `minBoundary/maxBoundary` 파라미터, 전체 복귀 판정은 gesture-end로 이동
+4. **Frozen baseline + per-frame zoomChange = 누적 상실** — `pocPinchBaselineDomain`을 gesture 시작 시 1회 캡처하고 매 프레임 `baselineLen / perFrameZoom`으로 계산했으나, `PointerEvent.calculateZoom()`은 이벤트 간 증분 배율이라 이 방식은 가장 최근 delta만 반영. 사용자 관찰 "반복 시도해야 아주 조금씩 확대" 증상의 원인. 해결: `awaitEachGesture` scope에 `var pinchCumZoom: Float` gesture-local 변수 도입, 매 프레임 `pinchCumZoom *= zoomChange` 누적, `newLength = baselineLen / pinchCumZoom`로 계산
+
+**기기 검증 5종 통과** (Jay 수동, 2026-04-15):
+
+- 기본 보기 2-finger pinch → 손가락 중심 기준 부드러운 줌, 떨림/플리커 없음
+- 오른쪽 40분 영역 → pinch 시작 시 점프 없음 (baseline이 default view와 동일)
+- 줌 상태 1-finger pan → 과거/미래 양방향 이동
+- Pinch로 완전 줌아웃 → default 자동 복귀 + follow 자동 on
+- 기본 보기 1-finger 드래그 → 통화 탭 스와이프 유지 (Pager 전달)
+
+**알려진 한계**: 더블탭 토글, follow-latest 명시 인디케이터, fullscreen 제스처 정책은 M3 범위.
 
 ### M3 — 더블탭 + Follow-latest 명시 + Fullscreen 정책 (v2.2 parity 완성)
 
@@ -264,7 +276,9 @@ val resolvedVisibleDomain: ClosedRange<Long>? by remember(
 
 ## 6. Pager arbitration 전략 (G1)
 
-### 현재 (baseline) — 2+ pointer consume
+### v1 PoC baseline — 2+ pointer only consume
+
+M1 이전 PoC 단계의 단순 정책. 1-finger 드래그는 항상 Pager로 양보되고 2+ pointer만 pinch로 인식.
 
 ```kotlin
 awaitEachGesture {
@@ -278,17 +292,61 @@ awaitEachGesture {
 }
 ```
 
-### M2 목표 — 1-finger pan 조건부 consume
+### M2 이후 (현재 구현) — GestureMode FSM 기반 조건부 consume
 
-- 1-finger 드래그가 발생할 때 **`pocIsZoomedOrPanned`가 true이면 consume** (pan 처리)
-- false이면 consume 하지 않음 → Pager로 전파 (통화 스와이프)
-- 이는 iOS의 `UIPanGestureRecognizer.isEnabled = pocIsZoomedOrPanned` 토글과 **개념적 등가**
+`awaitEachGesture` 안에서 gesture-local `GestureMode` FSM을 유지하며 pointer 수와 줌 상태에 따라 분기한다. iOS의 `UIPanGestureRecognizer.isEnabled = pocIsZoomedOrPanned` 토글과 **개념적 등가**.
+
+```kotlin
+enum class GestureMode { UNDETERMINED, PINCH, PAN, PASS_THROUGH, DISCARDED }
+
+awaitEachGesture {
+    awaitFirstDown(requireUnconsumed = false)
+    var gestureMode = GestureMode.UNDETERMINED
+    var pinchCumZoom = 1f  // 누적 배율 (calculateZoom은 per-frame 증분)
+    do {
+        val event = awaitPointerEvent()
+        val pressedPointers = event.changes.count { it.pressed }
+        when {
+            pressedPointers >= 2 -> {
+                // pinch: baseline + finger-centered anchor 캡처 후 pinchCumZoom 누적
+                // baseline fallback은 lastDataTs + trailingBufferSec(period) 포함
+                // consume 필수
+            }
+            pressedPointers == 1 -> when (gestureMode) {
+                PINCH -> gestureMode = DISCARDED        // pinch → 1-finger 전환 차단
+                DISCARDED -> { /* 무시 */ }
+                UNDETERMINED -> {
+                    if (pocVisibleDomain != null) {
+                        // 줌 상태: pan baseline 캡처, consume
+                        gestureMode = PAN
+                    } else {
+                        // 기본 보기: Pager에 양보
+                        gestureMode = PASS_THROUGH  // consume 안 함
+                    }
+                }
+                PAN -> { /* translation 기반 이동, consume */ }
+                PASS_THROUGH -> { /* 계속 양보 */ }
+            }
+        }
+    } while (event.changes.any { it.pressed })
+    // gesture ended: unzoomedLen 기준 full-unzoom 릴리스 또는 distance 기반 follow 재평가
+}
+```
+
+**설계 근거**:
+
+- `UNDETERMINED → PASS_THROUGH` 는 **첫 이벤트에서 consume 하지 않음**이 핵심. Compose HorizontalPager는 child가 consume 하지 않은 드래그를 자연스럽게 획득하므로, 명시적 "양보" 제스처 없이도 스와이프가 동작
+- `DISCARDED`는 "pinch 중 한 손가락을 떼면 남은 gesture cycle 동안 pan 시작 금지" 용도. 의도치 않은 pan 시작 방지
+- rememberUpdatedState로 감싼 `currentLastDataTs`/`currentDataBounds`/`currentResolvedVisibleDomain`/`currentHasDxy`를 pointerInput 내부에서 참조 — pointerInput의 key를 `(period, totalLengthSec)`로 유지한 채 새 데이터/state 변경을 반영
 
 ### Fallback 전략 (v1.0 문서 §4 계승)
 
-G1 실패 시:
+G1 실패 시에 대비해 남겨둔 대안:
+
 1. 1-finger pan 포기 → 2-finger pan(핀치 후 두 손가락 drag)
 2. 확대 모드 토글 버튼 — 가장 확실하지만 UX 손실
+
+M2 기기 검증 5종 통과로 G1 게이트는 통과됐으며, 위 fallback은 폴백 옵션으로 유지.
 
 ---
 
@@ -369,6 +427,10 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
 2026-04-14  v2.0 문서 재작성
             iOS v2.5 parity 로드맵으로 전면 개편
             1d only 원칙 확정, M1~M5 마일스톤 정의
+2026-04-15  M2 구현 (finger-centered pinch + 1-finger pan + pager arbitration)
+            구현 중 버그 4건 발견·수정 (stale capture / trailing buffer baseline /
+            clamp mid-gesture null / frozen baseline per-frame zoom)
+            기기 검증 5종 통과 후 커밋 6b111cb
 ```
 
 git 커밋 (Android):
@@ -376,4 +438,6 @@ git 커밋 (Android):
 - `8a53808` — feat(android): graph zoom PoC baseline (v1.0 design + pinch-only 1d PoC)
 - `05ee913` — docs(android): GRAPH_ZOOM_DESIGN.md v2.0 — iOS v2.5 parity 로드맵 개편
 - `4814d98` — refactor(android): M1 상태 모델 전환 + computeChartState 분해
-- **current HEAD** — docs(android): M1 이력 보정 + current HEAD 표기 규칙 적용
+- `37cae1b` — docs(android): M1 이력 보정 + current HEAD 표기 규칙 적용
+- `6b111cb` — feat(android): M2 graph zoom — finger-centered pinch + 1-finger pan + pager arbitration
+- **current HEAD** — docs(android): M2 완료 이력 반영 (§4 M2 + §6 Pager arbitration + §11 타임라인/커밋)
