@@ -159,6 +159,24 @@ private data class XTick(
     val isHalfHour: Boolean = false
 )
 
+/// M4-b: gesture y-lock snapshot — pinch/pan began 시점에 yRange/dxyRange 통째 캡처.
+/// computeChartState가 lock을 받으면 visible 데이터 기반 재계산을 우회하고 lock 값을 사용,
+/// 결과적으로 라벨/정규화 기준이 gesture 동안 고정됨. iOS pocGestureYLock 등가.
+///
+/// 알려진 트레이드오프: lock 동안 visible 데이터의 새 max/min이 lock 범위를 초과하면
+/// 정규화된 line이 chart 경계를 잠시 벗어나 잘릴 수 있음. pinch는 점진적이라 한 프레임의
+/// deviation은 작아 실용적으로 거슬리지 않으며, 라벨 안정성이 더 큰 가치.
+private data class GestureYLock(
+    val rateRangeMin: Double,
+    val rateRangeMax: Double,
+    val yMin: Double,
+    val yMax: Double,
+    val dxyMin: Double?,
+    val dxyMax: Double?,
+    val isDxyFlat: Boolean,
+    val flatDxyValue: Double?
+)
+
 private data class YTick(
     val value: Double,
     val label: String
@@ -216,7 +234,12 @@ private fun RateGraphCanvas(
     var pocLastTapTimeMs: Long by remember { mutableStateOf(0L) }
     var pocLastTapPosition: Offset by remember { mutableStateOf(Offset.Zero) }
 
-    // 기간 변경 시 줌/follow 상태 리셋 (설계서 §4 M1/M2/M3)
+    // M4-b: gesture y-lock — pinch/pan began 시점에 yRange/dxyRange snapshot,
+    // gesture ended 시 release. visible 데이터 갱신으로 인한 매 프레임 라벨 값 변동
+    // (사용자 체감 "Y축 라벨이 빠르게 훅훅 변함") 차단. iOS pocGestureYLock 등가.
+    var pocGestureYLock: GestureYLock? by remember { mutableStateOf(null) }
+
+    // 기간 변경 시 줌/follow/lock 상태 리셋 (설계서 §4 M1/M2/M3/M4)
     LaunchedEffect(period) {
         pocVisibleDomain = null
         pocIsFollowingLatest = true
@@ -224,6 +247,7 @@ private fun RateGraphCanvas(
         pocPinchAnchorTimeSec = null
         pocPanBaselineDomain = null
         pocLastTapTimeMs = 0L
+        pocGestureYLock = null
     }
 
     // 전체 데이터의 시간 폭 (초)
@@ -260,8 +284,8 @@ private fun RateGraphCanvas(
         } else raw
     }
 
-    val chartState = remember(rateGraphData, dxyGraphData, period, resolvedVisibleDomain) {
-        computeChartState(rateGraphData, dxyGraphData, period, resolvedVisibleDomain)
+    val chartState = remember(rateGraphData, dxyGraphData, period, resolvedVisibleDomain, pocGestureYLock) {
+        computeChartState(rateGraphData, dxyGraphData, period, resolvedVisibleDomain, pocGestureYLock)
     } ?: return
 
     // M2 fix: pointerInput(period, totalLengthSec)는 제스처 도중 재시작 방지를 위해 key를 최소화하므로,
@@ -273,6 +297,8 @@ private fun RateGraphCanvas(
     val currentHasDxy by rememberUpdatedState(chartState.hasDxy)
     // M3-a: plot y 경계 계산에 필요 (회전 등으로 값 변경 시 stale 방지)
     val currentVerticalPadding by rememberUpdatedState(verticalPadding)
+    // M4-b: pinch/pan began 시점에 yRange/dxyRange snapshot을 위해 최신 chartState 참조
+    val currentChartState by rememberUpdatedState(chartState)
 
     Canvas(
         // M2: finger-centered pinch + 1-finger pan (zoomed only) + pager arbitration (G1).
@@ -354,6 +380,18 @@ private fun RateGraphCanvas(
                                     event.changes.forEach { it.consume() }
                                     continue
                                 }
+                                // M4-b: yRange/dxyRange snapshot (mutation 전 chartState에서)
+                                val csBefore = currentChartState
+                                pocGestureYLock = GestureYLock(
+                                    rateRangeMin = csBefore.rateRangeMin,
+                                    rateRangeMax = csBefore.rateRangeMax,
+                                    yMin = csBefore.yMin,
+                                    yMax = csBefore.yMax,
+                                    dxyMin = csBefore.dxyMin,
+                                    dxyMax = csBefore.dxyMax,
+                                    isDxyFlat = csBefore.isDxyFlat,
+                                    flatDxyValue = csBefore.flatDxyValue
+                                )
                                 pocVisibleDomain = baseline  // raw sync (follow off 대비)
                                 pocIsFollowingLatest = false  // freeze during gesture
                                 pocPinchBaselineDomain = baseline
@@ -423,6 +461,18 @@ private fun RateGraphCanvas(
                                     gestureMode = GestureMode.PASS_THROUGH
                                     continue
                                 }
+                                // M4-b: yRange/dxyRange snapshot (mutation 전 chartState에서)
+                                val csBefore = currentChartState
+                                pocGestureYLock = GestureYLock(
+                                    rateRangeMin = csBefore.rateRangeMin,
+                                    rateRangeMax = csBefore.rateRangeMax,
+                                    yMin = csBefore.yMin,
+                                    yMax = csBefore.yMax,
+                                    dxyMin = csBefore.dxyMin,
+                                    dxyMax = csBefore.dxyMax,
+                                    isDxyFlat = csBefore.isDxyFlat,
+                                    flatDxyValue = csBefore.flatDxyValue
+                                )
                                 pocVisibleDomain = baseline  // raw sync
                                 pocIsFollowingLatest = false  // freeze
                                 pocPanBaselineDomain = baseline
@@ -523,10 +573,12 @@ private fun RateGraphCanvas(
                         pocLastTapTimeMs = lastUpTimeMs
                         pocLastTapPosition = downPosition
                     }
-                    // tap 처리했으므로 pinch/pan 정리만 하고 full-unzoom 판정은 스킵
+                    // tap 처리했으므로 pinch/pan 정리만 하고 full-unzoom 판정은 스킵.
+                    // M4-b: PAN 경로를 잠시 거쳤다면 yLock이 설정됐을 수 있으므로 cleanup.
                     pocPinchBaselineDomain = null
                     pocPinchAnchorTimeSec = null
                     pocPanBaselineDomain = null
+                    pocGestureYLock = null
                     return@awaitEachGesture
                 }
 
@@ -537,11 +589,20 @@ private fun RateGraphCanvas(
                 pocLastTapTimeMs = 0L
                 pocLastTapPosition = Offset.Zero
 
-                // === Gesture ended: full-unzoom 릴리스 + follow-latest 재평가 ===
-                if (gestureMode == GestureMode.PINCH || gestureMode == GestureMode.PAN) {
+                // === Gesture ended: full-unzoom 릴리스 + follow-latest 재평가 + yLock release ===
+                // DISCARDED도 포함: pinch → 1-finger 전환 후 release한 경우. PINCH 단계에서
+                // pocGestureYLock/pocVisibleDomain/pocIsFollowingLatest를 이미 mutate한 상태이므로
+                // PINCH/PAN과 동일하게 정리해야 lock leak 및 follow-latest leak이 발생하지 않음.
+                // (M3-a 단계에서 누락됐던 follow-latest/full-unzoom leak이 M4-b yLock leak과 합쳐져
+                //  코덱스 리뷰로 발견)
+                if (gestureMode == GestureMode.PINCH ||
+                    gestureMode == GestureMode.PAN ||
+                    gestureMode == GestureMode.DISCARDED
+                ) {
                     pocPinchBaselineDomain = null
                     pocPinchAnchorTimeSec = null
                     pocPanBaselineDomain = null
+                    pocGestureYLock = null  // M4-b: gesture 종료 시 lock release → yRange 자연 재계산
                     val raw = pocVisibleDomain
                     val latest = currentLastDataTs
                     val bounds = currentDataBounds
@@ -833,11 +894,15 @@ private fun computeDxyRange(visibleDxyBuckets: List<GraphBucket>): DxyRangeInfo?
 /// M1 결과: computeChartState는 thin orchestrator.
 /// visible 필터 → DXY 경계 보간(M4-a) → computeYRange → computeDxyRange → ChartState 조립.
 /// visibleDomain: M1 이후 ClosedRange<Long>(epoch 초 Long 단위). null이면 전체 data 기반.
+/// yLock: M4-b — 제공되면 yRange/dxyRange를 lock 값으로 강제 (gesture 중 라벨 안정화).
+///        dxyDisplayBuckets은 lock과 무관하게 visible 기반으로 산출 (line은 신선한 데이터로 그리되,
+///        정규화 기준만 lock).
 private fun computeChartState(
     rateGraphData: Map<GraphSource, List<GraphBucket>>,
     dxyGraphData: List<GraphBucket>,
     period: GraphPeriod,
-    visibleDomain: ClosedRange<Long>? = null  // 1d 줌 상태에서만 non-null
+    visibleDomain: ClosedRange<Long>? = null,  // 1d 줌 상태에서만 non-null
+    yLock: GestureYLock? = null
 ): ChartState? {
     val rateBuckets = rateGraphData.values.flatten()
     val allBuckets = if (rateBuckets.isNotEmpty()) rateBuckets + dxyGraphData else dxyGraphData
@@ -881,22 +946,43 @@ private fun computeChartState(
         dxyGraphData
     }
 
-    val yRange = computeYRange(visibleRateBuckets, dxyDisplayBuckets) ?: return null
-    val dxyRangeInfo = computeDxyRange(dxyDisplayBuckets)
+    val computedYRange = computeYRange(visibleRateBuckets, dxyDisplayBuckets) ?: return null
+    val computedDxyRangeInfo = computeDxyRange(dxyDisplayBuckets)
+
+    // M4-b: yLock 적용 — gesture 동안 yRange/dxyRange를 lock 값으로 강제.
+    // dxyDisplayBuckets는 lock과 무관하게 visible 기반으로 산출 (line은 신선한 데이터로
+    // 그리되 정규화 기준만 lock). 이렇게 해야 panning 중에도 line은 자연스럽게 흐르고
+    // 라벨만 안정.
+    val effectiveYMin = yLock?.yMin ?: computedYRange.domainMin
+    val effectiveYMax = yLock?.yMax ?: computedYRange.domainMax
+    val effectiveRateMin = yLock?.rateRangeMin ?: computedYRange.paddedMin
+    val effectiveRateMax = yLock?.rateRangeMax ?: computedYRange.paddedMax
+
+    // dxy lock은 lock에 dxy 정보가 있을 때만 적용. lock에 dxy가 없는데 현재 hasDxy면
+    // 일반적으로 발생하지 않지만(같은 데이터 셋), 안전을 위해 computed로 fallback.
+    val effectiveHasDxy = if (yLock != null) {
+        yLock.dxyMin != null && yLock.dxyMax != null
+    } else {
+        computedDxyRangeInfo != null
+    }
+    val effectiveDxyMin = yLock?.dxyMin ?: computedDxyRangeInfo?.dxyMin
+    val effectiveDxyMax = yLock?.dxyMax ?: computedDxyRangeInfo?.dxyMax
+    val effectiveIsDxyFlat = yLock?.isDxyFlat ?: (computedDxyRangeInfo?.isFlat ?: false)
+    val effectiveFlatDxyValue = yLock?.flatDxyValue ?: computedDxyRangeInfo?.flatValue
 
     return ChartState(
         xMin = xMin,
         xMax = xMax,
-        yMin = yRange.domainMin,
-        yMax = yRange.domainMax,
-        rateRangeMin = yRange.paddedMin,
-        rateRangeMax = yRange.paddedMax,
+        yMin = effectiveYMin,
+        yMax = effectiveYMax,
+        rateRangeMin = effectiveRateMin,
+        rateRangeMax = effectiveRateMax,
         lastDataTs = lastDataTs,
-        hasDxy = dxyRangeInfo != null,
-        dxyMin = dxyRangeInfo?.dxyMin,
-        dxyMax = dxyRangeInfo?.dxyMax,
-        isDxyFlat = dxyRangeInfo?.isFlat ?: false,
-        flatDxyValue = dxyRangeInfo?.flatValue,
+        hasDxy = effectiveHasDxy,
+        dxyMin = effectiveDxyMin,
+        dxyMax = effectiveDxyMax,
+        isDxyFlat = effectiveIsDxyFlat,
+        flatDxyValue = effectiveFlatDxyValue,
         dxyDisplayBuckets = dxyDisplayBuckets
     )
 }
