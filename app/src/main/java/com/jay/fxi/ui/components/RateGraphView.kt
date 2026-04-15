@@ -3,6 +3,7 @@ package com.jay.fxi.ui.components
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -19,6 +20,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -194,10 +196,21 @@ private fun RateGraphCanvas(
     var pocVisibleDomain by remember { mutableStateOf<ClosedRange<Long>?>(null) }
     var pocIsFollowingLatest by remember { mutableStateOf(true) }
 
-    // 기간 변경 시 줌/follow 상태 리셋 (설계서 §4 M1)
+    // M2: Gesture baseline (iOS pocHandlePinch/PanBegan 등가)
+    // pinch: began에서 한 번 캡처 + changed에서 finger-centered 계산용
+    var pocPinchBaselineDomain: ClosedRange<Long>? by remember { mutableStateOf(null) }
+    var pocPinchAnchorTimeSec: Long? by remember { mutableStateOf(null) }
+    var pocPinchAnchorFraction: Float by remember { mutableStateOf(0.5f) }
+    // pan: began에서 baseline 캡처 + changed에서 translation 기반 이동
+    var pocPanBaselineDomain: ClosedRange<Long>? by remember { mutableStateOf(null) }
+
+    // 기간 변경 시 줌/follow 상태 리셋 (설계서 §4 M1/M2)
     LaunchedEffect(period) {
         pocVisibleDomain = null
         pocIsFollowingLatest = true
+        pocPinchBaselineDomain = null
+        pocPinchAnchorTimeSec = null
+        pocPanBaselineDomain = null
     }
 
     // 전체 데이터의 시간 폭 (초)
@@ -211,6 +224,13 @@ private fun RateGraphCanvas(
     val lastDataTs: Long? = remember(rateGraphData, dxyGraphData) {
         val all = rateGraphData.values.flatten() + dxyGraphData
         all.maxOfOrNull { it.bucketTs }?.toLong()
+    }
+
+    // M2: 데이터 전체 경계 (setVisibleDomain clamp에 필요)
+    val dataBounds: ClosedRange<Long>? = remember(rateGraphData, dxyGraphData) {
+        val all = rateGraphData.values.flatten() + dxyGraphData
+        if (all.isEmpty()) null
+        else all.minOf { it.bucketTs }.toLong()..all.maxOf { it.bucketTs }.toLong()
     }
 
     // 파생: follow 모드 반영된 실제 표시 domain.
@@ -231,39 +251,194 @@ private fun RateGraphCanvas(
         computeChartState(rateGraphData, dxyGraphData, period, resolvedVisibleDomain)
     } ?: return
 
+    // M2 fix: pointerInput(period, totalLengthSec)는 제스처 도중 재시작 방지를 위해 key를 최소화하므로,
+    // coroutine 내부에서 참조하는 파생 state를 rememberUpdatedState로 감싸 최신 값 읽기를 보장한다.
+    // (iOS UIKit gesture recognizer가 action block에서 최신 state를 참조하는 패턴과 등가)
+    val currentLastDataTs by rememberUpdatedState(lastDataTs)
+    val currentDataBounds by rememberUpdatedState(dataBounds)
+    val currentResolvedVisibleDomain by rememberUpdatedState(resolvedVisibleDomain)
+    val currentHasDxy by rememberUpdatedState(chartState.hasDxy)
+
     Canvas(
-        // HorizontalPager와의 제스처 공존을 위해 detectTransformGestures 대신
-        // awaitEachGesture 수동 루프를 사용. 2+ 포인터에서만 consume하여
-        // 1-손가락 드래그는 Pager로 그대로 전파. (G1 전략)
-        // M1: state 모델 전환 — pocVisibleDomain(ClosedRange<Long>) + follow flag 기반.
-        // 기존 right-edge anchor 동작은 follow=true 상태의 자연 결과로 유지됨.
-        modifier = modifier.pointerInput(period, totalLengthSec, lastDataTs) {
+        // M2: finger-centered pinch + 1-finger pan (zoomed only) + pager arbitration (G1).
+        // 전략:
+        //   - 2+ pointer → pinch (centroid 기반 anchor), 항상 consume
+        //   - 1 pointer + zoomed → pan, consume (pager에 전파 차단)
+        //   - 1 pointer + not zoomed → pass through (pager swipe 정상)
+        //   - gesture ended → follow-latest 재평가
+        // iOS의 UIPanGestureRecognizer.isEnabled = pocIsZoomedOrPanned 토글과 등가.
+        modifier = modifier.pointerInput(period, totalLengthSec) {
             if (period != GraphPeriod.ONE_DAY) return@pointerInput
             awaitEachGesture {
-                awaitFirstDown(requireUnconsumed = false)
+                val firstDown = awaitFirstDown(requireUnconsumed = false)
+                // Gesture 시작 시 baseline 초기화 (이전 state 잔재 제거)
+                pocPinchBaselineDomain = null
+                pocPinchAnchorTimeSec = null
+                pocPanBaselineDomain = null
+
+                // plot 좌표 캐시 (hasDxy 변화 드물어 gesture 시작 시점 값 사용).
+                // M2 fix: currentHasDxy는 rememberUpdatedState로 감싼 최신 값.
+                val gestureLeftPad = if (currentHasDxy) 34.dp.toPx() else 8.dp.toPx()
+                val gestureRightPad = 40.dp.toPx()
+                val plotLeft = gestureLeftPad
+                val plotWidth = (size.width - gestureLeftPad - gestureRightPad).coerceAtLeast(1f)
+
+                // Pan 활성 여부 — 줌된 상태에서만 1-finger consume
+                var gestureMode: GestureMode = GestureMode.UNDETERMINED
+                var panReferencePoint: Offset = firstDown.position
+                // M2 fix-3: pinch 누적 배율 (gesture-local).
+                // calculateZoom()은 per-frame 증분이므로, baselineLen/perFrameZoom으로
+                // 계산하면 누적이 되지 않고 baseline 근처에서 맴돌아 실질 줌이 발생하지 않는다.
+                var pinchCumZoom: Float = 1f
+
                 do {
                     val event = awaitPointerEvent()
-                    val activePointers = event.changes.count { it.pressed }
-                    if (activePointers >= 2) {
-                        val zoomChange = event.calculateZoom()
-                        if (zoomChange != 1f) {
-                            val rawLen = pocVisibleDomain?.let { it.endInclusive - it.start }
-                                ?: totalLengthSec
-                            val newLength = (rawLen / zoomChange).toLong()
-                                .coerceIn(3_600L, totalLengthSec)
-                            pocVisibleDomain = if (newLength >= totalLengthSec) {
-                                null
-                            } else {
-                                // M1 유지: right-edge anchor (follow=true 기본).
-                                // M2에서 finger-centered로 개선 예정.
-                                val lastTs = lastDataTs ?: 0L
-                                (lastTs - newLength)..lastTs
+                    val pressedPointers = event.changes.count { it.pressed }
+                    if (pressedPointers == 0) break
+
+                    when {
+                        pressedPointers >= 2 -> {
+                            // === Pinch (finger-centered) ===
+                            if (gestureMode != GestureMode.PINCH) {
+                                // Pinch began: baseline + anchor 캡처
+                                // M2 fix-2: fallback은 computeChartState의 default xMax와 일치 (trailing buffer 포함).
+                                val baseline: ClosedRange<Long>? =
+                                    currentResolvedVisibleDomain
+                                        ?: currentDataBounds?.let {
+                                            it.start..(it.endInclusive + trailingBufferSec(period))
+                                        }
+                                if (baseline == null) {
+                                    gestureMode = GestureMode.PINCH
+                                    event.changes.forEach { it.consume() }
+                                    continue
+                                }
+                                pocVisibleDomain = baseline  // raw sync (follow off 대비)
+                                pocIsFollowingLatest = false  // freeze during gesture
+                                pocPinchBaselineDomain = baseline
+                                pinchCumZoom = 1f  // M2 fix-3: 누적 배율 리셋
+
+                                val centroid = event.calculateCentroid(useCurrent = true)
+                                val xInPlot = (centroid.x - plotLeft).coerceIn(0f, plotWidth)
+                                val fraction = (xInPlot / plotWidth).coerceIn(0f, 1f)
+                                pocPinchAnchorFraction = fraction
+
+                                val baselineLen = baseline.endInclusive - baseline.start
+                                pocPinchAnchorTimeSec =
+                                    baseline.start + (baselineLen * fraction).toLong()
+
+                                gestureMode = GestureMode.PINCH
                             }
-                            // 2+ finger pinch만 consume — 1-finger drag는 Pager로 pass through
+
+                            val zoomChange = event.calculateZoom()
+                            if (zoomChange != 1f) {
+                                // M2 fix-3: 누적 배율 적용. calculateZoom()은 per-frame 증분.
+                                pinchCumZoom = (pinchCumZoom * zoomChange).coerceIn(0.01f, 100f)
+                                val baseline = pocPinchBaselineDomain
+                                val anchor = pocPinchAnchorTimeSec
+                                val bounds = currentDataBounds
+                                val lastTs = currentLastDataTs
+                                if (baseline != null && anchor != null && bounds != null && lastTs != null) {
+                                    val baselineLen = baseline.endInclusive - baseline.start
+                                    val rawNewLen = (baselineLen / pinchCumZoom).toLong()
+                                    val fraction = pocPinchAnchorFraction
+                                    val newStart = anchor - (rawNewLen * fraction).toLong()
+                                    val newEnd = anchor + (rawNewLen * (1f - fraction)).toLong()
+                                    val minBoundary = bounds.start
+                                    val maxBoundary = lastTs + trailingBufferSec(period)
+                                    pocVisibleDomain = clampVisibleDomain(
+                                        newStart..newEnd,
+                                        minBoundary,
+                                        maxBoundary
+                                    )
+                                }
+                            }
                             event.changes.forEach { it.consume() }
+                        }
+
+                        pressedPointers == 1 -> {
+                            // === 1-finger pan (zoomed state only) ===
+                            if (gestureMode == GestureMode.PINCH) {
+                                // Pinch → 1-finger 전환: pinch 종료, pan 시작 금지
+                                gestureMode = GestureMode.DISCARDED
+                                continue
+                            }
+                            if (gestureMode == GestureMode.DISCARDED) {
+                                // pinch 여파라 이번 gesture cycle은 pan 무시
+                                continue
+                            }
+
+                            val isZoomed = pocVisibleDomain != null
+                            if (!isZoomed) {
+                                // 기본 보기에서 1-finger는 pager에 양보 — consume 안 함
+                                gestureMode = GestureMode.PASS_THROUGH
+                                continue
+                            }
+
+                            if (gestureMode == GestureMode.UNDETERMINED) {
+                                // Pan began: baseline 캡처 (M2 fix: 최신 resolved 사용)
+                                val baseline: ClosedRange<Long>? = currentResolvedVisibleDomain
+                                if (baseline == null) {
+                                    gestureMode = GestureMode.PASS_THROUGH
+                                    continue
+                                }
+                                pocVisibleDomain = baseline  // raw sync
+                                pocIsFollowingLatest = false  // freeze
+                                pocPanBaselineDomain = baseline
+                                panReferencePoint = event.changes.first().position
+                                gestureMode = GestureMode.PAN
+                                // 첫 프레임은 consume만 하고 이동 계산은 다음 프레임부터
+                                event.changes.forEach { it.consume() }
+                            } else if (gestureMode == GestureMode.PAN) {
+                                val baseline = pocPanBaselineDomain
+                                val bounds = currentDataBounds
+                                val lastTs = currentLastDataTs
+                                if (baseline != null && bounds != null && lastTs != null) {
+                                    val current = event.changes.first().position
+                                    val translationX = current.x - panReferencePoint.x
+                                    val baselineLen = baseline.endInclusive - baseline.start
+                                    val timeDelta = (-translationX * baselineLen / plotWidth).toLong()
+                                    val newStart = baseline.start + timeDelta
+                                    val newEnd = baseline.endInclusive + timeDelta
+                                    val minBoundary = bounds.start
+                                    val maxBoundary = lastTs + trailingBufferSec(period)
+                                    pocVisibleDomain = clampVisibleDomain(
+                                        newStart..newEnd,
+                                        minBoundary,
+                                        maxBoundary
+                                    )
+                                }
+                                event.changes.forEach { it.consume() }
+                            }
                         }
                     }
                 } while (event.changes.any { it.pressed })
+
+                // === Gesture ended: full-unzoom 릴리스 + follow-latest 재평가 ===
+                if (gestureMode == GestureMode.PINCH || gestureMode == GestureMode.PAN) {
+                    pocPinchBaselineDomain = null
+                    pocPinchAnchorTimeSec = null
+                    pocPanBaselineDomain = null
+                    val raw = pocVisibleDomain
+                    val latest = currentLastDataTs
+                    val bounds = currentDataBounds
+                    if (raw != null && latest != null && bounds != null) {
+                        val rawLen = raw.endInclusive - raw.start
+                        // M2 fix-4: default view 길이 기준(= totalLength + trailingBuffer).
+                        // totalLength 기준으로 판정하면 경계가 어긋나 의도치 않은 null 복귀 발생.
+                        val unzoomedLen =
+                            (bounds.endInclusive - bounds.start) + trailingBufferSec(period).toLong()
+                        if (rawLen >= unzoomedLen * 99L / 100L) {
+                            // 사실상 전체 보기 → default(null) + follow on
+                            pocVisibleDomain = null
+                            pocIsFollowingLatest = true
+                        } else {
+                            // 줌 유지 상태 → 최신 근접 여부로 follow 판정
+                            val distance = kotlin.math.abs(raw.endInclusive - latest)
+                            // iOS pocFollowThreshold 등가: bucketDuration(600s)
+                            pocIsFollowingLatest = distance < 600L
+                        }
+                    }
+                }
             }
         }
     ) {
@@ -400,6 +575,46 @@ private fun RateGraphCanvas(
             }
         }
     }
+}
+
+/// M2: Gesture 모드 — awaitEachGesture 루프 내 pointer count 전환을 추적.
+/// UNDETERMINED: 첫 down 직후 (pinch/pan 결정 전)
+/// PINCH: 2+ pointer 활성, finger-centered zoom 중
+/// PAN: 1 pointer + zoomed 상태에서 pan 중
+/// PASS_THROUGH: 1 pointer + not zoomed (pager에 양보)
+/// DISCARDED: pinch → 1 pointer 전환 후 나머지 gesture 무시
+private enum class GestureMode { UNDETERMINED, PINCH, PAN, PASS_THROUGH, DISCARDED }
+
+/// M2 fix-3: visible domain clamp (경계 + 길이).
+/// - minBoundary/maxBoundary: 허용 가능한 좌우 경계. maxBoundary는 default view의 xMax와 일치해야
+///   하므로 caller는 `lastDataTs + trailingBufferSec(period)`를 넘겨야 한다.
+/// - minLength: 최소 zoom 길이 (1h).
+/// - 항상 non-null range 반환. "전체 복귀(null)" 판정은 caller의 gesture-end 단계에서만 수행한다.
+///   (이전 구현은 프레임 중간에 null 반환 → 떨림/플리커 발생. 사용자 관찰로 확인됨.)
+private fun clampVisibleDomain(
+    proposed: ClosedRange<Long>,
+    minBoundary: Long,
+    maxBoundary: Long,
+    minLength: Long = 3_600L
+): ClosedRange<Long> {
+    val maxLen = (maxBoundary - minBoundary).coerceAtLeast(minLength)
+    val proposedLen = (proposed.endInclusive - proposed.start).coerceAtLeast(1L)
+    val clampedLen = proposedLen.coerceIn(minLength, maxLen)
+
+    val center = proposed.start + proposedLen / 2
+    var start = center - clampedLen / 2
+    var end = start + clampedLen
+
+    if (start < minBoundary) {
+        start = minBoundary
+        end = start + clampedLen
+    }
+    if (end > maxBoundary) {
+        end = maxBoundary
+        start = end - clampedLen
+    }
+    if (start < minBoundary) start = minBoundary
+    return start..end
 }
 
 /// M1 결과: yRange 계산 순수 함수 분리.
