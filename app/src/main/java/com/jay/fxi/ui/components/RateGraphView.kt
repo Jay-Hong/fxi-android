@@ -182,14 +182,22 @@ private fun RateGraphCanvas(
         TextStyle(fontSize = 10.sp, color = GraphSource.DXY.color.copy(alpha = 0.85f), fontFeatureSettings = "tnum")
     }
 
-    // MARK: - PoC: Graph zoom (1d period only)
-    // See GRAPH_ZOOM_DESIGN.md §4. Scope: pinch-to-zoom only, anchored to right edge.
-    // Excluded from PoC v1: pan, reset gesture, isInteracting lock, fling.
-    var pocVisibleLengthSec by remember { mutableStateOf<Long?>(null) }
+    // MARK: - Graph zoom state (1d period only)
+    // See GRAPH_ZOOM_DESIGN.md §5. M1 상태 모델 전환 후 구조:
+    //   - pocVisibleDomain: 사용자 raw 입력 (free window, ClosedRange<Long>, 단위 초 epoch)
+    //     null = 기본 보기 (전체 + 자연 follow-latest)
+    //     non-null = 명시적 visible window
+    //   - pocIsFollowingLatest: 기본 true. 제스처 중 freeze, 제스처 ended 후 reevaluate (M2+)
+    //   - resolvedVisibleDomain: follow 반영된 파생 domain (chart 렌더 + 필터 single source)
+    // Scope (parity baseline): pinch-to-zoom only, 내부적으로 right-edge anchor.
+    // M2부터 finger-centered pinch + 1-finger pan 추가 예정.
+    var pocVisibleDomain by remember { mutableStateOf<ClosedRange<Long>?>(null) }
+    var pocIsFollowingLatest by remember { mutableStateOf(true) }
 
-    // 기간 변경 시 줌 리셋 (설계서 §3)
+    // 기간 변경 시 줌/follow 상태 리셋 (설계서 §4 M1)
     LaunchedEffect(period) {
-        pocVisibleLengthSec = null
+        pocVisibleDomain = null
+        pocIsFollowingLatest = true
     }
 
     // 전체 데이터의 시간 폭 (초)
@@ -199,25 +207,37 @@ private fun RateGraphCanvas(
         else (all.maxOf { it.bucketTs } - all.minOf { it.bucketTs }).toLong().coerceAtLeast(1L)
     }
 
-    // 줌 상태의 visible window (1d만, 오른쪽 edge 앵커)
-    val pocVisibleWindow: IntRange? = remember(pocVisibleLengthSec, rateGraphData, dxyGraphData, period) {
-        if (period != GraphPeriod.ONE_DAY) return@remember null
-        val visLen = pocVisibleLengthSec ?: return@remember null
+    // 최신 데이터 시점 (follow-latest anchor)
+    val lastDataTs: Long? = remember(rateGraphData, dxyGraphData) {
         val all = rateGraphData.values.flatten() + dxyGraphData
-        val lastTs = all.maxOfOrNull { it.bucketTs } ?: return@remember null
-        val start = (lastTs - visLen).toInt()
-        start..lastTs
+        all.maxOfOrNull { it.bucketTs }?.toLong()
     }
 
-    val chartState = remember(rateGraphData, dxyGraphData, period, pocVisibleWindow) {
-        computeChartState(rateGraphData, dxyGraphData, period, pocVisibleWindow)
+    // 파생: follow 모드 반영된 실제 표시 domain.
+    // chart 렌더, visible 필터, gesture baseline 전부의 single source of truth.
+    // 원칙: raw pocVisibleDomain 직접 참조 금지, 이 파생값을 사용.
+    val resolvedVisibleDomain: ClosedRange<Long>? = remember(
+        pocVisibleDomain, pocIsFollowingLatest, lastDataTs, period
+    ) {
+        if (period != GraphPeriod.ONE_DAY) return@remember null
+        val raw = pocVisibleDomain ?: return@remember null
+        if (pocIsFollowingLatest && lastDataTs != null) {
+            val length = raw.endInclusive - raw.start
+            (lastDataTs - length)..lastDataTs
+        } else raw
+    }
+
+    val chartState = remember(rateGraphData, dxyGraphData, period, resolvedVisibleDomain) {
+        computeChartState(rateGraphData, dxyGraphData, period, resolvedVisibleDomain)
     } ?: return
 
     Canvas(
-        // PoC: HorizontalPager와의 제스처 공존을 위해 detectTransformGestures 대신
+        // HorizontalPager와의 제스처 공존을 위해 detectTransformGestures 대신
         // awaitEachGesture 수동 루프를 사용. 2+ 포인터에서만 consume하여
-        // 1-손가락 드래그는 Pager로 그대로 전파. (G1 검증 목적)
-        modifier = modifier.pointerInput(period, totalLengthSec) {
+        // 1-손가락 드래그는 Pager로 그대로 전파. (G1 전략)
+        // M1: state 모델 전환 — pocVisibleDomain(ClosedRange<Long>) + follow flag 기반.
+        // 기존 right-edge anchor 동작은 follow=true 상태의 자연 결과로 유지됨.
+        modifier = modifier.pointerInput(period, totalLengthSec, lastDataTs) {
             if (period != GraphPeriod.ONE_DAY) return@pointerInput
             awaitEachGesture {
                 awaitFirstDown(requireUnconsumed = false)
@@ -227,12 +247,19 @@ private fun RateGraphCanvas(
                     if (activePointers >= 2) {
                         val zoomChange = event.calculateZoom()
                         if (zoomChange != 1f) {
-                            val current = pocVisibleLengthSec ?: totalLengthSec
-                            val newLength = (current / zoomChange).toLong()
+                            val rawLen = pocVisibleDomain?.let { it.endInclusive - it.start }
+                                ?: totalLengthSec
+                            val newLength = (rawLen / zoomChange).toLong()
                                 .coerceIn(3_600L, totalLengthSec)
-                            pocVisibleLengthSec =
-                                if (newLength >= totalLengthSec) null else newLength
-                            // 2+ finger pinch만 consume — 1-finger pan은 Pager로 pass through
+                            pocVisibleDomain = if (newLength >= totalLengthSec) {
+                                null
+                            } else {
+                                // M1 유지: right-edge anchor (follow=true 기본).
+                                // M2에서 finger-centered로 개선 예정.
+                                val lastTs = lastDataTs ?: 0L
+                                (lastTs - newLength)..lastTs
+                            }
+                            // 2+ finger pinch만 consume — 1-finger drag는 Pager로 pass through
                             event.changes.forEach { it.consume() }
                         }
                     }
@@ -375,32 +402,20 @@ private fun RateGraphCanvas(
     }
 }
 
-private fun computeChartState(
-    rateGraphData: Map<GraphSource, List<GraphBucket>>,
-    dxyGraphData: List<GraphBucket>,
-    period: GraphPeriod,
-    visibleWindow: IntRange? = null  // PoC: 1d 줌 상태에서만 non-null
-): ChartState? {
-    val rateBuckets = rateGraphData.values.flatten()
-    val allBuckets = if (rateBuckets.isNotEmpty()) rateBuckets + dxyGraphData else dxyGraphData
-    if (allBuckets.isEmpty()) return null
+/// M1 결과: yRange 계산 순수 함수 분리.
+/// visible rate/dxy 버킷을 받아 파생값(패딩 포함 min/max) 반환.
+/// fallback: rate 버킷이 비면 dxy 버킷의 close를 사용.
+private data class YRange(
+    val paddedMin: Double,  // rateRangeMin (DXY 정규화 기준)
+    val paddedMax: Double,  // rateRangeMax
+    val domainMin: Double,  // yMin (y축 domain, 추가 margin 포함)
+    val domainMax: Double   // yMax
+)
 
-    // PoC: visible window이 설정되면 y-range 계산용 버킷을 필터링
-    val visibleRateBuckets = visibleWindow?.let { w ->
-        rateBuckets.filter { it.bucketTs in w }.ifEmpty { rateBuckets }
-    } ?: rateBuckets
-    val visibleDxyBuckets = visibleWindow?.let { w ->
-        dxyGraphData.filter { it.bucketTs in w }.ifEmpty { dxyGraphData }
-    } ?: dxyGraphData
-
-    val allTs = allBuckets.map { it.bucketTs }
-    val fullXMin = allTs.min()
-    val lastDataTs = allTs.max()
-
-    // x축 범위: visible window 설정 시 그 범위로, 아니면 전체 + trailing buffer
-    val xMin = visibleWindow?.first ?: fullXMin
-    val xMax = visibleWindow?.last ?: (lastDataTs + trailingBufferSec(period))
-
+private fun computeYRange(
+    visibleRateBuckets: List<GraphBucket>,
+    visibleDxyBuckets: List<GraphBucket>
+): YRange? {
     val rateCloses = visibleRateBuckets.map { it.close }
     val fallbackCloses = visibleDxyBuckets.map { it.close }
     val targetCloses = if (rateCloses.isNotEmpty()) rateCloses else fallbackCloses
@@ -411,14 +426,32 @@ private fun computeChartState(
     val paddedMin = minClose - margin
     val paddedMax = maxClose + margin
     val yDomainMargin = 0.8
+    return YRange(
+        paddedMin = paddedMin,
+        paddedMax = paddedMax,
+        domainMin = paddedMin - yDomainMargin,
+        domainMax = paddedMax + yDomainMargin
+    )
+}
 
-    val hasDxy = visibleDxyBuckets.isNotEmpty()
+/// M1 결과: dxyRange 계산 순수 함수 분리.
+/// visible dxy 버킷에서 min/max/flat 판정 반환. 빈 입력이면 null.
+/// M4에서 yRange 정합성 패딩(iOS v2.3)까지 확장 예정.
+private data class DxyRangeInfo(
+    val dxyMin: Double,
+    val dxyMax: Double,
+    val isFlat: Boolean,
+    val flatValue: Double?
+)
+
+private fun computeDxyRange(visibleDxyBuckets: List<GraphBucket>): DxyRangeInfo? {
+    if (visibleDxyBuckets.isEmpty()) return null
     val dxyCloses = visibleDxyBuckets.map { it.close }
-    val rawDxyMin = dxyCloses.minOrNull()
-    val rawDxyMax = dxyCloses.maxOrNull()
-    val dxyMargin = if (rawDxyMin != null && rawDxyMax != null) (rawDxyMax - rawDxyMin) * 0.05 else 0.0
-    val dxyMin = rawDxyMin?.let { it - dxyMargin }
-    val dxyMax = rawDxyMax?.let { it + dxyMargin }
+    val rawDxyMin = dxyCloses.min()
+    val rawDxyMax = dxyCloses.max()
+    val dxyMargin = (rawDxyMax - rawDxyMin) * 0.05
+    val dxyMin = rawDxyMin - dxyMargin
+    val dxyMax = rawDxyMax + dxyMargin
     val flatValue = dxyCloses.firstOrNull()?.let { first ->
         val roundedFirst = (first * 100).roundToNearestStep(1.0) / 100.0
         if (dxyCloses.all { abs(((it * 100).roundToNearestStep(1.0) / 100.0) - roundedFirst) < 0.0001 }) {
@@ -427,20 +460,60 @@ private fun computeChartState(
             null
         }
     }
+    return DxyRangeInfo(
+        dxyMin = dxyMin,
+        dxyMax = dxyMax,
+        isFlat = flatValue != null,
+        flatValue = flatValue
+    )
+}
+
+/// M1 결과: computeChartState는 thin orchestrator.
+/// visible 필터 → computeYRange → computeDxyRange → ChartState 조립.
+/// visibleDomain: M1 이후 ClosedRange<Long>(epoch 초 Long 단위). null이면 전체 data 기반.
+private fun computeChartState(
+    rateGraphData: Map<GraphSource, List<GraphBucket>>,
+    dxyGraphData: List<GraphBucket>,
+    period: GraphPeriod,
+    visibleDomain: ClosedRange<Long>? = null  // 1d 줌 상태에서만 non-null
+): ChartState? {
+    val rateBuckets = rateGraphData.values.flatten()
+    val allBuckets = if (rateBuckets.isNotEmpty()) rateBuckets + dxyGraphData else dxyGraphData
+    if (allBuckets.isEmpty()) return null
+
+    // visible domain 설정 시 버킷 필터링 (y/dxy range 계산용).
+    // 필터 결과 empty면 전체 fallback (iOS와 동일 정책).
+    val visibleRateBuckets = visibleDomain?.let { d ->
+        rateBuckets.filter { it.bucketTs.toLong() in d }.ifEmpty { rateBuckets }
+    } ?: rateBuckets
+    val visibleDxyBuckets = visibleDomain?.let { d ->
+        dxyGraphData.filter { it.bucketTs.toLong() in d }.ifEmpty { dxyGraphData }
+    } ?: dxyGraphData
+
+    val allTs = allBuckets.map { it.bucketTs }
+    val fullXMin = allTs.min()
+    val lastDataTs = allTs.max()
+
+    // x축 범위: visible domain 설정 시 그 범위로, 아니면 전체 + trailing buffer
+    val xMin = visibleDomain?.start?.toInt() ?: fullXMin
+    val xMax = visibleDomain?.endInclusive?.toInt() ?: (lastDataTs + trailingBufferSec(period))
+
+    val yRange = computeYRange(visibleRateBuckets, visibleDxyBuckets) ?: return null
+    val dxyRangeInfo = computeDxyRange(visibleDxyBuckets)
 
     return ChartState(
         xMin = xMin,
         xMax = xMax,
-        yMin = paddedMin - yDomainMargin,
-        yMax = paddedMax + yDomainMargin,
-        rateRangeMin = paddedMin,
-        rateRangeMax = paddedMax,
+        yMin = yRange.domainMin,
+        yMax = yRange.domainMax,
+        rateRangeMin = yRange.paddedMin,
+        rateRangeMax = yRange.paddedMax,
         lastDataTs = lastDataTs,
-        hasDxy = hasDxy,
-        dxyMin = dxyMin,
-        dxyMax = dxyMax,
-        isDxyFlat = flatValue != null,
-        flatDxyValue = flatValue
+        hasDxy = dxyRangeInfo != null,
+        dxyMin = dxyRangeInfo?.dxyMin,
+        dxyMax = dxyRangeInfo?.dxyMax,
+        isDxyFlat = dxyRangeInfo?.isFlat ?: false,
+        flatDxyValue = dxyRangeInfo?.flatValue
     )
 }
 
