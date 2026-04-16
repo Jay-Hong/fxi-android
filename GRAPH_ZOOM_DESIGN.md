@@ -774,24 +774,25 @@ iOS Swift Charts 대비 Android Compose Canvas의 더블탭 애니메이션이 �
                움직임을 흡수 못해 실패율 10-20%. AOSP DOUBLE_TAP_SLOP_IN_DIPS 관례
                적용으로 획기적 감소
             커밋 1862f89 / 1dae300 / b597246 / 93679ee
-2026-04-16  M5 post-polish 5번째: DXY 라벨 inset 제거 — iOS align
+2026-04-16  M5 post-polish 후속: DXY 라벨 inset 제거 — iOS align
+            (§9 divergence 해소로 분류, §4 8건 체계엔 미포함)
             사용자 실기기 스크린샷 비교(Android 3 라벨 / iOS 5 라벨) 로 M4-a 당시
             의도적 divergence였던 `inset = span * 0.05` 유지 가치 재평가. "가장자리
             답답함 방지" 근거보다 "DXY 해상도 부족" 손실이 커서 철회 결정.
             generateDxyLabels에서 inset 제거, range 전체에서 step 정렬 (iOS와 동일).
             §9 divergence 노트를 "유지 → 해소"로 업데이트
             커밋 1446a16
-2026-04-16  M5 post-polish 6/7번째: rotation 시 줌 상태 보존 + loading flash 제거
+2026-04-16  M5 post-polish 5번째 / 6번째: rotation 시 줌 상태 보존 + loading flash 제거
             사용자 피드백: "iOS는 가로/세로 전환 시 줌 유지 + 자연스러운 전환,
             Android는 줌 리셋 + '환율 정보 로딩중' 텍스트/spinner 노출".
             두 이슈를 iOS parity 관점에서 해소.
-            6) rotation 줌 보존 (feat): pocVisibleDomain/pocIsFollowingLatest를
+            5) rotation 줌 보존 (feat): pocVisibleDomain/pocIsFollowingLatest를
                rememberSaveable(period, ...)로 전환. ClosedRange<Long>? 직렬화를
                위한 VisibleDomainSaver(listSaver) 추가. LaunchedEffect(period)
                reset 블록에서 두 상태 리셋 라인 제거 — saveable inputs가 period
                변경 시 기본값 재초기화를 이미 처리하므로 중복 리셋 제거가 복원
                된 값을 파괴하는 것을 차단. iOS @State와 semantic 일치
-            7) loading flash 제거 (fix): stop()/reset() 의미 분리 + loadInitialRates
+            6) loading flash 제거 (fix): stop()/reset() 의미 분리 + loadInitialRates
                silent 분기. MainScreen onDispose는 stop()(transport-only), RootScreen
                로그아웃/premium 해제는 reset()(UI 초기화 포함)으로 배선. 이미
                Connected/Offline 상태에서 loadInitialRates()가 호출되면 Loading
