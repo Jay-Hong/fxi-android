@@ -111,14 +111,20 @@ fun MainScreen(
         pageCount = { totalPages }
     )
 
-    // 서비스 시작/종료 (MainScreen 생명주기와 동기화)
+    // 서비스 시작은 MainScreen 진입 시, 종료는 session scope(RootScreen의
+    // logout/premium 해제 LaunchedEffect에서 reset() 호출)에서만 수행.
+    // MainScreen 단순 dispose(회전 등)에서는 stop을 호출하지 않아 WebSocket/
+    // connectionState가 유지되도록 함. 앱 종료 cleanup은 ViewModel.onCleared
+    // 에서 처리.
+    //
+    // 왜: rotation 시 onDispose에서 stop() 호출 → connectionState Connecting
+    // 전환 → ConnectionStatusBanner expand/shrink → 아래 콘텐츠 reflow로 화면
+    // 출렁임 (iOS 대비 divergence). stop을 session scope로 올려 해소.
     DisposableEffect(Unit) {
         graphViewModel.start()
         exchangeRateViewModel.start()
         alertViewModel.loadSettingsIfNeeded()
         onDispose {
-            graphViewModel.stop()
-            exchangeRateViewModel.stop()
             newsViewModel.onTabDisappear()
         }
     }

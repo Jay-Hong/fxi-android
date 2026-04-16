@@ -143,7 +143,10 @@ class ExchangeRateViewModel @Inject constructor(
 
     override fun onCleared() {
         super.onCleared()
-        // ViewModel 소멸 시 WebSocket 콜백 정리
+        // ViewModel 소멸 시 WebSocket 연결 및 콜백 정리.
+        // 서비스 lifecycle이 MainScreen이 아닌 session scope로 이동했으므로
+        // 앱 종료/프로세스 kill 시의 transport cleanup은 여기서 보장.
+        webSocketService.stop()
         webSocketService.onRatesReceived = null
     }
 }
