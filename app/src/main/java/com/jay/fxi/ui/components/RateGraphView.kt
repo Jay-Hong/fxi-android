@@ -1,7 +1,10 @@
 package com.jay.fxi.ui.components
 
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -21,6 +24,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -321,6 +325,64 @@ private fun RateGraphCanvas(
     val currentVerticalPadding by rememberUpdatedState(verticalPadding)
     // M4-b: pinch/pan began 시점에 yRange/dxyRange snapshot을 위해 최신 chartState 참조
     val currentChartState by rememberUpdatedState(chartState)
+
+    // yLock release 시에만 yRange/rateRange/dxyRange를 0.25s easeOut으로 보간.
+    // iOS의 withAnimation(.easeOut(0.25)) { pocGestureYLock = nil } 등가.
+    // 다른 변화(lock 진입, 데이터 갱신)는 snap() 으로 즉시 반영.
+    //
+    // 원리: 직전 frame에 lock이 set이었고 이번 frame에 null이면 lockJustReleased = true.
+    // 이때만 tween(250). 그 외는 snap(). animateFloatAsState는 animSpec이 NEW target과
+    // 함께 쓰일 때만 적용되므로, in-flight animation은 interrupt 받지 않고 계속 진행.
+    //
+    // 보간 대상: yMin/yMax (grid + rate line), rateRangeMin/Max (DXY normalizer numerator),
+    // dxyMin/Max (DXY normalizer denominator). 모두 같은 spec으로 병렬 보간하여 축/rate/DXY가
+    // 동기화된 transition으로 움직임.
+    //
+    // DXY 라벨 VALUE는 chartState.dxyMin/Max (natural, settled) 기준으로 생성 — lock overlay
+    // 해제 시 "true state는 natural, 위치만 interpolate" semantic. 라벨이 transition 중 step
+    // 경계를 넘어 flicker 하는 것보다 natural 값으로 고정하고 위치만 보간하는 쪽이 자연스러움.
+    val prevLocked = remember { mutableStateOf(false) }
+    val lockJustReleased = prevLocked.value && pocGestureYLock == null
+    // composition 본문에서 MutableState를 바로 write하는 건 Compose anti-pattern이라
+    // SideEffect로 commit 후 update. 다음 recomposition에서 갱신된 prevLocked 값이 읽힘.
+    SideEffect {
+        prevLocked.value = pocGestureYLock != null
+    }
+    val yRangeAnimSpec: AnimationSpec<Float> = if (lockJustReleased) {
+        tween(durationMillis = 250, easing = LinearOutSlowInEasing)
+    } else {
+        snap()
+    }
+    val animatedYMin by animateFloatAsState(
+        targetValue = chartState.yMin.toFloat(),
+        animationSpec = yRangeAnimSpec,
+        label = "yMin"
+    )
+    val animatedYMax by animateFloatAsState(
+        targetValue = chartState.yMax.toFloat(),
+        animationSpec = yRangeAnimSpec,
+        label = "yMax"
+    )
+    val animatedRateRangeMin by animateFloatAsState(
+        targetValue = chartState.rateRangeMin.toFloat(),
+        animationSpec = yRangeAnimSpec,
+        label = "rateRangeMin"
+    )
+    val animatedRateRangeMax by animateFloatAsState(
+        targetValue = chartState.rateRangeMax.toFloat(),
+        animationSpec = yRangeAnimSpec,
+        label = "rateRangeMax"
+    )
+    val animatedDxyMin by animateFloatAsState(
+        targetValue = (chartState.dxyMin ?: 0.0).toFloat(),
+        animationSpec = yRangeAnimSpec,
+        label = "dxyMin"
+    )
+    val animatedDxyMax by animateFloatAsState(
+        targetValue = (chartState.dxyMax ?: 0.0).toFloat(),
+        animationSpec = yRangeAnimSpec,
+        label = "dxyMax"
+    )
 
     Canvas(
         // M2: finger-centered pinch + 1-finger pan (zoomed only) + pager arbitration (G1).
@@ -730,6 +792,14 @@ private fun RateGraphCanvas(
         val gridStroke = with(density) { 0.5.dp.toPx() }
         val yLabelGap = with(density) { 4.dp.toPx() }
 
+        // yLock release 시 보간된 y 관련 값. 평상시(lock 진입 / 데이터 갱신)는 snap이라 즉시 반영.
+        val effYMin = animatedYMin.toDouble()
+        val effYMax = animatedYMax.toDouble()
+        val effRateRangeMin = animatedRateRangeMin.toDouble()
+        val effRateRangeMax = animatedRateRangeMax.toDouble()
+        val effDxyMin = if (chartState.dxyMin != null) animatedDxyMin.toDouble() else null
+        val effDxyMax = if (chartState.dxyMax != null) animatedDxyMax.toDouble() else null
+
         val layout = ChartLayout(
             chartLeft = leftPad,
             chartTop = innerPad,
@@ -737,19 +807,18 @@ private fun RateGraphCanvas(
             chartBottom = size.height - bottomPad - innerPad,
             xMin = chartState.xMin,
             xMax = chartState.xMax,
-            yMin = chartState.yMin,
-            yMax = chartState.yMax
+            yMin = effYMin,
+            yMax = effYMax
         )
 
         val xTicks = computeXTicks(period, layout.xMin, layout.xMax, chartState.lastDataTs)
         val yTicks = computeYTicks(layout.yMin, layout.yMax)
         val sourcePaths = computeRatePaths(rateGraphData, layout, period, chartState.hasDxy)
-        val dxyPath = if (chartState.hasDxy && chartState.dxyMin != null && chartState.dxyMax != null) {
+        val dxyPath = if (chartState.hasDxy && effDxyMin != null && effDxyMax != null) {
             // M4-a: chartState.dxyDisplayBuckets 사용 (visible-filtered + 양 경계 interpolated).
-            // 이전엔 dxyGraphData 전체를 넘기고 clipRect로 시각만 잘라, 변동성 큰 줌 구간에서
-            // 다음 out-of-visible 버킷이 visible dxyMin/dxyMax 밖일 때 line이 chartTop/chartBottom로
-            // shoot되는 v1.x 수직 아티팩트가 잠재. 보간 boundary 버킷을 사용하므로 더 이상 발생 안 함.
-            computeDxyPath(chartState.dxyDisplayBuckets, layout, chartState.rateRangeMin, chartState.rateRangeMax, chartState.dxyMin, chartState.dxyMax)
+            // 정규화 파라미터는 lock release 시 보간된 값(effRateRange*, effDxy*) 사용 →
+            // DXY line이 rate line/grid와 동기화된 transition으로 움직임.
+            computeDxyPath(chartState.dxyDisplayBuckets, layout, effRateRangeMin, effRateRangeMax, effDxyMin, effDxyMax)
         } else {
             null
         }
@@ -812,15 +881,17 @@ private fun RateGraphCanvas(
             }
         }
 
-        if (chartState.hasDxy && chartState.dxyMin != null && chartState.dxyMax != null) {
+        if (chartState.hasDxy && effDxyMin != null && effDxyMax != null) {
             if (chartState.isDxyFlat && chartState.flatDxyValue != null) {
+                // flat 라벨 값은 chartState.flatDxyValue (natural, settled) 사용,
+                // 위치 계산은 animated 정규화 파라미터로.
                 val y = layout.mapY(
                     normalizeDxyValue(
                         chartState.flatDxyValue,
-                        chartState.rateRangeMin,
-                        chartState.rateRangeMax,
-                        chartState.dxyMin,
-                        chartState.dxyMax
+                        effRateRangeMin,
+                        effRateRangeMax,
+                        effDxyMin,
+                        effDxyMax
                     )
                 )
                 val textResult = textMeasurer.measure(formatDxyValue(chartState.flatDxyValue), dxyLabelStyle)
@@ -829,13 +900,15 @@ private fun RateGraphCanvas(
                     topLeft = Offset(0f, y - textResult.size.height / 2f)
                 )
             } else {
-                for (label in generateDxyLabels(chartState.dxyMin, chartState.dxyMax)) {
+                // 라벨 VALUE 세트는 chartState.dxyMin/Max (settled) 기준으로 생성 — transition 중
+                // step 경계 flicker 방지. 각 라벨의 y 위치만 animated 정규화로 계산.
+                for (label in generateDxyLabels(chartState.dxyMin!!, chartState.dxyMax!!)) {
                     val normalized = normalizeDxyValue(
                         label.value,
-                        chartState.rateRangeMin,
-                        chartState.rateRangeMax,
-                        chartState.dxyMin,
-                        chartState.dxyMax
+                        effRateRangeMin,
+                        effRateRangeMax,
+                        effDxyMin,
+                        effDxyMax
                     )
                     val y = layout.mapY(normalized)
                     val textResult = textMeasurer.measure(label.label, dxyLabelStyle)
