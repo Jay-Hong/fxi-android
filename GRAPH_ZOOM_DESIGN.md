@@ -866,4 +866,6 @@ git 커밋 (Android):
 - `cd468aa` — fix(android): rotation 시 연결 배너 flicker 제거 — 서비스 lifecycle을 session scope로 이동
 - `a7ec05e` — perf(android): rotation 시 REST 재호출 생략 — start() idempotency 가드
 - `a3be016` — perf(android): initial load in-flight 중 회전 시 REST 중복 launch 차단
-- **current HEAD** — docs(android): M5 post-polish 7·8번 반영 — 배너 flicker 제거 + rotation refetch skip 해소 (§4 + §9 + §11)
+- `f1a0192` — docs(android): M5 post-polish 7·8번 반영 — 배너 flicker 제거 + rotation refetch skip 해소 (§4 + §9 + §11)
+- `c17a8d7` — docs(android): §11 작업 이력 numbering을 §4와 일관되게 정비
+- **current HEAD** — docs(android): §11 current HEAD 마커 동기화 (c17a8d7 반영)
