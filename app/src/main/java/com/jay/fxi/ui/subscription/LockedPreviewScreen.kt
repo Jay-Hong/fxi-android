@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
@@ -56,7 +55,6 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -597,13 +595,11 @@ private fun SampleFullscreenGraphView(
                 .padding(horizontal = 16.dp)
                 .clip(RoundedCornerShape(12.dp))
                 .background(CardBackground)
-                .pointerInput(Unit) {
-                    detectTapGestures(
-                        onDoubleTap = { onClose() }
-                    )
-                }
                 .padding(12.dp)
         ) {
+            // Note: outer detectTapGestures(onDoubleTap = onClose) 제거.
+            // Live(CurrencyTabContent) M3-b 정책 — fullscreen 종료는 Cancel 아이콘만,
+            // 그래프 내부 더블탭은 RateGraphView 내부 6h zoom 토글에 양보.
             RateGraphView(
                 rateGraphData = graphPayload.rateGraphData,
                 dxyGraphData = graphPayload.dxyGraphData,
@@ -692,18 +688,14 @@ private fun SampleFullscreenRatesView(
             )
         }
 
+        // Note: outer detectTapGestures(onDoubleTap = onClose) 제거 (sample/live 정책 통일).
         Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp)
                 .clip(RoundedCornerShape(12.dp))
-                .background(CardBackground)
-                .pointerInput(Unit) {
-                    detectTapGestures(
-                        onDoubleTap = { onClose() }
-                    )
-                },
+                .background(CardBackground),
             contentAlignment = Alignment.Center
         ) {
             Column(
@@ -980,16 +972,15 @@ private fun SampleGraphSection(
     graphPayload: SampleGraphPayload,
     onFullscreenTap: () -> Unit
 ) {
+    // Note: outer detectTapGestures(onDoubleTap = onFullscreenTap) 제거.
+    // 이유: 섹션 전체 영역의 double-tap wrapper가 RateGraphView 내부 M3-a 더블탭 zoom을
+    // 가로채서 6h zoom 대신 fullscreen 진입으로 동작하던 M3-b 정책 전파 누락 해소.
+    // fullscreen 진입은 OpenInFull 아이콘 전용 (Live와 동일 정책).
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(CardBackground)
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onDoubleTap = { onFullscreenTap() }
-                )
-            }
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
@@ -1105,16 +1096,12 @@ private fun SampleRatesSection(
     onFullscreenTap: () -> Unit,
     metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
+    // Note: outer detectTapGestures(onDoubleTap = onFullscreenTap) 제거 (Live와 정책 통일).
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(CardBackground)
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onDoubleTap = { onFullscreenTap() }
-                )
-            }
     ) {
         // 헤더
         Row(
