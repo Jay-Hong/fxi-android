@@ -50,8 +50,17 @@ class ExchangeRateViewModel @Inject constructor(
     /**
      * 서비스 시작 및 초기 데이터 로드
      * ContentView 진입 시 호출 (구독자 전용)
+     *
+     * 회전 등 MainScreen 재진입 시 중복 REST 요청 방지 가드.
+     * WebSocket이 이미 연결 중이고 사용 가능한 데이터를 보유한 경우,
+     * 실시간 stream으로 이미 업데이트되고 있으므로 REST 초기 로드 생략.
+     * cold start / reset 후 재진입 / 연결 끊김 상태에서는 기존 경로로 fetch.
      */
     fun start() {
+        val hasUsableData = _appState.value is AppState.Connected ||
+            _appState.value is AppState.Offline
+        if (hasUsableData && connectionState.value == ConnectionState.Connected) return
+
         viewModelScope.launch {
             loadInitialRates()
         }
