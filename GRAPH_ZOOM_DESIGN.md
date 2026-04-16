@@ -288,7 +288,7 @@ iOS v2.5가 1d만 줌 활성인 이유는 Swift Charts의 제약에서 파생된
 
 ### M5 post-polish 수정 (사용자 피드백 기반)
 
-M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 6건을 후속 fix/perf 커밋으로 반영 (세부 커밋 해시는 §11 작업 이력 참조). 모두 post-M5 polish 범위.
+M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 8건을 후속 fix/perf 커밋으로 반영 (세부 커밋 해시는 §11 작업 이력 참조). 모두 post-M5 polish 범위.
 
 1. **Gesture clamp에서 trailing buffer 제거** (`fix`)
    - 증상: 최대 줌 상태에서 pan 최우측 시 chart 우측 ~66%가 빈 공간. iOS엔 없는 geometry 버그
@@ -325,6 +325,19 @@ M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 6�
      - `loadInitialRates()`: 진입 시 `hasExistingData = _appState is Connected || _appState is Offline` 판정. 기존 데이터 있으면 Loading 플래시 생략 후 silent refresh. fetch 실패 시 기존 상태 그대로 유지하고 WebSocket만 재시작 (기존 Connected 화면 + 네트워크 복구 대기)
      - `RootScreen`: 로그아웃/premium 해제 경로에서 `exchangeRateViewModel.stop()` → `reset()`로 배선 교체. `MainScreen.kt:121` onDispose는 `stop()` 유지 (회전 시 transport만 정리)
    - iOS 비교: iOS `ExchangeRateViewModel.stop()`도 `webSocketService.stop()`만 수행. Android의 "UI reset까지 포함된 stop"은 Android 고유의 과잉 설계였음. 이번 수정으로 iOS와 semantic 일치
+7. **회전 시 연결 배너 flicker 제거 — 서비스 lifecycle을 session scope로 이동** (`fix`)
+   - 증상: 회전 시 상단 연결 상태 배너가 잠깐 나타났다 사라지며 아래 콘텐츠가 "내려갔다 올라오는" 출렁임. 6번 loading flash 제거 후에도 잔존
+   - 원인 체인: `MainScreen` DisposableEffect onDispose가 회전에서도 발동 → `exchangeRateViewModel.stop()`/`graphViewModel.stop()` 호출 → `webSocketService.stop()` → `connectionState=Disconnected` → Activity 재생성 → `start()` → `Connecting` → `Connected`. `ConnectionStatusBanner`가 `connectionState != Connected` 구간에 `AnimatedVisibility(expandVertically/shrinkVertically)`로 표시되며 아래 콘텐츠 reflow
+   - 수정: `MainScreen.DisposableEffect.onDispose`에서 `stop()` 호출 두 개 제거 (`newsViewModel.onTabDisappear()`는 탭 라이프사이클 용도라 유지). `ExchangeRateViewModel.onCleared()`에 `webSocketService.stop()` 추가 — 앱 종료 시의 transport cleanup을 ViewModel 소멸 시점에서 보장
+   - 아키텍처 관점: 서비스(WebSocket/periodic refresh) lifecycle이 **MainScreen composable scope → session scope(RootScreen auth/premium)** 로 의도적으로 이동. 회전으로 MainScreen이 dispose돼도 ViewModel이 생존하므로 서비스 유지. 세션 teardown은 RootScreen의 logout/premium 해제 `LaunchedEffect`가 `reset()` 호출로 이미 커버하고 있어 구조 변경 없이 적용 가능
+   - 이전 6번(loading flash)이 UI state 보존이었다면 이번은 **transport state까지 보존**. iOS의 SwiftUI @State 생존 + WebSocket 연결 유지 동작과 완결적 parity
+8. **회전 시 REST 재호출 생략 — `start()` idempotency 가드 + in-flight 추적** (`perf`)
+   - 증상: 7번 수정 후에도 `MainScreen` 재진입 시 `exchangeRateViewModel.start()` → `loadInitialRates()` → REST `/api/rates` 1회 호출 잔존. WebSocket이 이미 실시간 stream 제공 중이라 중복 요청
+   - 1차 수정 (a7ec05e, steady-state만): `start()`에 `hasUsableData && connectionState == Connected` 가드 추가. Connected 상태 + appState가 Connected/Offline이면 `loadInitialRates()` launch 생략. cold start / reset 후 / 연결 끊김에서는 기존 fetch 경로 유지
+     - `connectionState` 단독이 아닌 `hasUsableData` 곱조건으로 둔 이유: WS 연결 수립 ≠ 첫 메시지 수신. 연결만 살아있고 UI 데이터가 비어있는 이상 상태를 방어 (코덱스 리뷰 반영)
+   - 2차 보강 (a3be016, in-flight edge case): 1차 가드는 cold start 진행 중(REST 300~500ms) 회전 시 여전히 중복 launch. `initialLoadJob: Job?` 필드로 in-flight 추적, `launchInitialLoadIfNotActive()` 헬퍼 추출, `invokeOnCompletion`으로 stale reference 정리. `reset()`/`onCleared()`에서 명시적 cancel 추가 — 로그아웃/구독 해지 직후 늦은 응답이 state를 덮는 race를 **실무적으로** 차단 (cooperative cancellation 한계상 이론적 window는 극미량 남음)
+   - 효과: 회전 시 REST 0회. WebSocket은 이미 7번 수정으로 연결 유지 중이라 실시간 rates stream 정상. iOS parity 완결
+   - 한계: 위 cooperative cancellation window는 generation token 패턴까지 가야 완전 차단이지만 over-engineering 영역이라 불채택
 
 **기기 검증 통과** (Jay 수동, 2026-04-16 후속):
 
@@ -334,6 +347,8 @@ M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 6�
 - 4번: 몸 움직이며 더블탭해도 실패율 "획기적 감소"
 - 5번: pan/pinch로 줌한 상태에서 가로↔세로 전환 시 줌 window 그대로 보존
 - 6번: 회전 시 "환율 정보 로딩중" 텍스트/spinner 더 이상 노출 안 됨
+- 7번: 회전 시 상단 연결 상태 배너 flicker 및 콘텐츠 reflow 없음
+- 8번: 회전 시 REST `/api/rates` 재호출 0회 (WebSocket stream 유효 유지)
 - 회귀: M2/M3/M4/M5 기존 기능 모두 정상
 
 ---
@@ -538,7 +553,7 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
 | **M5 zoom-in 시각 동조감 (chart morph)** | **시각 인상, 코드 정적으론 lock 작동** | **post-M5 polish 후보** |
 | **M5 부드러움 iOS 대비 살짝 부자연** | **M5 post-polish에서 일부 개선** (`computeRatePaths` visible 필터 + yLock release easeOut) | **추가 polish 시 검토: easing 곡선, duration 미세 조정, chartState memoization** |
 | **M5 post-polish: zoomed 상태 tap이 PAN-init 경로 경유** | **잔존 tap miss 가능성 (distance slop 수정 외 축)** | **일상 사용에서 거슬리면 PAN-init 지연 발동(slop 감지 후 commit) 패턴 검토** |
-| **회전 시 REST `loadInitialRates()` 재호출** | **UX는 §4 M5 post-polish 6번에서 해소, 네트워크 요청 자체는 잔존** | **별도 후속 최적화 — freshness 기준(WebSocket 연결 상태 / `lastUpdated` 경과) 도입, iOS 실제 동작 비교 선행** |
+| ~~**회전 시 REST `loadInitialRates()` 재호출**~~ | ~~UX는 §4 M5 post-polish 6번에서 해소, 네트워크 요청 자체는 잔존~~ → **§4 M5 post-polish 8번에서 해소** (a7ec05e + a3be016, hasUsableData && Connected + initialLoadJob in-flight 추적) | ~~별도 최적화~~ **완료** |
 
 ### iOS divergence — Graph fullscreen 단일 탭 종료 (M3-b)
 
@@ -786,6 +801,37 @@ iOS Swift Charts 대비 Android Compose Canvas의 더블탭 애니메이션이 �
             '환율 정보 로딩중' 플래시 미노출 확인)
             잔존 과제: 회전 시 REST `loadInitialRates()` 재호출 자체는 남음 —
             §9 polish 후보에 "rotation refetch skip" 항목 추가
+2026-04-16  M5 post-polish 7번째: 회전 시 연결 배너 flicker 제거
+            사용자 피드백: "화면 회전 시 전체 화면이 내려갔다 올라오는 현상 반복,
+            상단 연결 정보 배너가 나왔다 들어가면서 생기는 현상". 6번(loading flash)
+            제거 후에도 connectionState Disconnected→Connecting→Connected 전환이
+            ConnectionStatusBanner의 AnimatedVisibility expand/shrink를 유발하여
+            아래 콘텐츠 reflow가 계속됨.
+            원인: MainScreen DisposableEffect onDispose가 회전에서도 발동하여
+            webSocketService.stop()까지 호출. 6번은 UI state만 보존했고 transport
+            자체는 stop→start 사이클이 유지됨.
+            수정 (아키텍처 변경): 서비스 lifecycle을 MainScreen composable scope →
+            session scope(RootScreen auth/premium)로 의도적 이동. onDispose에서
+            stop 호출 두 개 제거, onCleared에 webSocketService.stop 추가.
+            세션 teardown은 기존 RootScreen의 reset() 호출로 이미 커버.
+            7번으로 iOS SwiftUI @State 생존 + WebSocket 연결 유지 parity 완결.
+            커밋 cd468aa (기기 검증 통과: 배너 flicker 미노출 + 콘텐츠 reflow 없음)
+2026-04-16  M5 post-polish 8번째: 회전 시 REST 재호출 생략 (2단계 보강)
+            7번으로 WebSocket transport는 유지되지만 ExchangeRateViewModel.start()
+            가 매 MainScreen 재진입마다 loadInitialRates()를 launch하여 REST 1회
+            잔존. §9 polish 후보였던 "rotation refetch skip" 본격 해소.
+            1차 (a7ec05e, steady-state): start()에 hasUsableData && Connected skip
+            가드 추가. 코덱스 리뷰 반영으로 connectionState 단독이 아닌 곱조건 —
+            WS 연결 수립 ≠ 첫 메시지 수신 edge case 방어.
+            2차 (a3be016, in-flight): cold start REST 진행 중 회전 edge case를
+            initialLoadJob: Job? in-flight 추적으로 차단. launchInitialLoadIfNotActive
+            private helper로 추출, invokeOnCompletion으로 stale reference 정리.
+            reset()/onCleared() 명시적 cancel로 logout/구독해지 직후 late response
+            race 실무적 차단(cooperative cancellation 한계상 이론적 window 극미량
+            잔존, generation token 패턴은 over-engineering이라 불채택).
+            효과: 회전 시 REST 0회 확인. iOS parity 완결.
+            커밋 a7ec05e + a3be016 (기기 검증 통과: REST 0회 확인, 회귀 없음)
+            §9 polish 후보에서 strikethrough 및 "완료" 표기
 ```
 
 git 커밋 (Android):
@@ -815,4 +861,8 @@ git 커밋 (Android):
 - `1c220d3` — feat(android): graph 줌/follow 상태 rotation 보존
 - `ce4d1ee` — fix(android): rotation 시 '환율 정보 로딩중' 플래시 제거
 - `2f42d20` — docs(android): rotation 보존 + loading flash 제거 이력 반영 (§4 M5 post-polish + §11)
-- **current HEAD** — docs(android): M5 post-polish 5·6번 기기 검증 통과 표기 + §9에 rotation refetch skip 후보 추가
+- `758a644` — docs(android): M5 post-polish 5·6번 기기 검증 통과 표기 + §9에 rotation refetch skip 후보 추가
+- `cd468aa` — fix(android): rotation 시 연결 배너 flicker 제거 — 서비스 lifecycle을 session scope로 이동
+- `a7ec05e` — perf(android): rotation 시 REST 재호출 생략 — start() idempotency 가드
+- `a3be016` — perf(android): initial load in-flight 중 회전 시 REST 중복 launch 차단
+- **current HEAD** — docs(android): M5 post-polish 7·8번 반영 — 배너 flicker 제거 + rotation refetch skip 해소 (§4 + §9 + §11)
