@@ -4,6 +4,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -60,6 +61,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
@@ -688,14 +690,18 @@ private fun SampleFullscreenRatesView(
             )
         }
 
-        // Note: outer detectTapGestures(onDoubleTap = onClose) 제거 (sample/live 정책 통일).
         Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp)
                 .clip(RoundedCornerShape(12.dp))
-                .background(CardBackground),
+                .background(CardBackground)
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onDoubleTap = { onClose() }
+                    )
+                },
             contentAlignment = Alignment.Center
         ) {
             Column(
@@ -1096,12 +1102,16 @@ private fun SampleRatesSection(
     onFullscreenTap: () -> Unit,
     metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
-    // Note: outer detectTapGestures(onDoubleTap = onFullscreenTap) 제거 (Live와 정책 통일).
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(CardBackground)
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onDoubleTap = { onFullscreenTap() }
+                )
+            }
     ) {
         // 헤더
         Row(
