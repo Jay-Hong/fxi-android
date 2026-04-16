@@ -9,6 +9,7 @@ import com.jay.fxi.domain.model.ConnectionState
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.repository.ExchangeRateRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -41,6 +42,13 @@ class ExchangeRateViewModel @Inject constructor(
     private val _lastUpdated = MutableStateFlow<Instant?>(null)
     val lastUpdated: StateFlow<Instant?> = _lastUpdated.asStateFlow()
 
+    /**
+     * 진행 중인 초기 로드 작업.
+     * in-flight 중 start()/refresh() 재호출 시 중복 launch 방지 + reset()/onCleared()
+     * 에서 명시적 cancel로 late response가 state를 덮는 race를 차단.
+     */
+    private var initialLoadJob: Job? = null
+
     init {
         setupWebSocketCallbacks()
     }
@@ -55,15 +63,13 @@ class ExchangeRateViewModel @Inject constructor(
      * WebSocket이 이미 연결 중이고 사용 가능한 데이터를 보유한 경우,
      * 실시간 stream으로 이미 업데이트되고 있으므로 REST 초기 로드 생략.
      * cold start / reset 후 재진입 / 연결 끊김 상태에서는 기존 경로로 fetch.
+     * initial load 진행 중 회전 시에는 initialLoadJob가 in-flight라 중복 launch 차단.
      */
     fun start() {
         val hasUsableData = _appState.value is AppState.Connected ||
             _appState.value is AppState.Offline
         if (hasUsableData && connectionState.value == ConnectionState.Connected) return
-
-        viewModelScope.launch {
-            loadInitialRates()
-        }
+        launchInitialLoadIfNotActive()
     }
 
     /**
@@ -76,10 +82,15 @@ class ExchangeRateViewModel @Inject constructor(
     }
 
     /**
-     * 세션 완전 teardown (transport 정리 + UI state 초기화).
+     * 세션 완전 teardown (transport 정리 + UI state 초기화 + in-flight 취소).
      * 로그아웃 또는 구독 해지 시 RootScreen에서 호출.
+     *
+     * initialLoadJob cancel은 로그아웃 직후 늦게 도착한 응답이 Loading으로
+     * 초기화된 state를 덮어 Connected로 되돌리는 race 방지.
      */
     fun reset() {
+        initialLoadJob?.cancel()
+        initialLoadJob = null
         stop()
         _appState.value = AppState.Loading
         _lastUpdated.value = null
@@ -87,14 +98,26 @@ class ExchangeRateViewModel @Inject constructor(
 
     /**
      * 수동 새로고침
+     * in-flight 중 재호출 시 중복 launch 차단.
      */
     fun refresh() {
-        viewModelScope.launch {
-            loadInitialRates()
-        }
+        launchInitialLoadIfNotActive()
     }
 
     // ============ Private Methods ============
+
+    /**
+     * initialLoadJob이 in-flight가 아닐 때만 loadInitialRates를 새로 launch.
+     * completion 시 invokeOnCompletion으로 self-reference면 null 정리 (stale reference 방지).
+     */
+    private fun launchInitialLoadIfNotActive() {
+        if (initialLoadJob?.isActive == true) return
+        val job = viewModelScope.launch { loadInitialRates() }
+        initialLoadJob = job
+        job.invokeOnCompletion {
+            if (initialLoadJob === job) initialLoadJob = null
+        }
+    }
 
     private fun setupWebSocketCallbacks() {
         webSocketService.onRatesReceived = { rates ->
@@ -155,6 +178,10 @@ class ExchangeRateViewModel @Inject constructor(
         // ViewModel 소멸 시 WebSocket 연결 및 콜백 정리.
         // 서비스 lifecycle이 MainScreen이 아닌 session scope로 이동했으므로
         // 앱 종료/프로세스 kill 시의 transport cleanup은 여기서 보장.
+        // initialLoadJob cancel은 viewModelScope 취소로 이미 커버되지만 명시적
+        // cleanup 의도를 drive하여 discipline 일관성 유지.
+        initialLoadJob?.cancel()
+        initialLoadJob = null
         webSocketService.stop()
         webSocketService.onRatesReceived = null
     }
