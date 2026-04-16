@@ -515,7 +515,7 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
 | 예시화면 follow-latest 자동 슬라이드 | iOS에 부재 (SampleData 정적) | 공용 composable 구조라 Android에서도 동일 한계 |
 | xTicks 15m/10m 세분화 | 30m까지만 계획 | post-parity |
 | **Graph fullscreen 단일 탭 종료 (iOS divergence)** | **의도적 divergence** | **post-parity 후보** |
-| **DXY 라벨 inset 정책 (iOS divergence)** | **의도적 divergence** | **유지** |
+| ~~DXY 라벨 inset 정책 (iOS divergence)~~ | ~~의도적 divergence~~ → **M5 post-polish에서 iOS align** (1446a16) | ~~유지~~ **해소** |
 | **y-lock 동안 line이 chart 경계 잠시 벗어남** | **수용된 trade-off (iOS와 동일)** | **유지** |
 | **M5 yLock 지연 release 미채택 (iOS divergence)** | **의도적 divergence** | **post-M5 polish 후보** |
 | **M5 animation→pinch handoff stale lock (iOS와 동일 패턴)** | **수용된 trade-off** | **post-M5 polish 후보** |
@@ -540,20 +540,20 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
 
 단일 탭 fullscreen 종료 affordance가 UX 요구사항으로 돌아오면 (예: Cancel 아이콘 도달성 문제 보고) `RateGraphView` onSingleTap 콜백 확장 방향으로 재검토. 현재는 Cancel 아이콘이 우상단에 명확히 배치돼 있어 실익 없음.
 
-### iOS divergence — DXY 라벨 inset 정책 (M4-a)
+### ~~iOS divergence — DXY 라벨 inset 정책~~ (M4-a → M5 post-polish 후속에서 해소)
 
-**무엇이 다른가**:
+**상태**: 사용자 실기기 스크린샷 비교로 Android 3개 / iOS 5개 DXY 라벨 차이 확인 후 iOS align으로 결정. `generateDxyLabels` 의 `inset = span * 0.05` 제거 (커밋 `1446a16`). Android 도 iOS `generateDxyAxisLabels` 와 동일하게 range 전체에서 step 정렬.
 
-- iOS: `generateDxyAxisLabels`가 inset 없이 range 전체에서 step 정렬 라벨 생성. 라벨이 plot 위/아래 가장자리에 매우 가까이 붙을 수 있음
-- Android: `generateDxyLabels`가 `inset = span * 0.05` 적용하여 range의 위/아래 5% 영역에는 라벨 생성 안 함. 가장자리에서 한 칸 안쪽부터 라벨이 시작됨
+**당시 divergence 유지 근거와 철회 이유**:
 
-**왜 다른가**:
+- 당시(M4-a) 근거: "dp 기반 polish 환경에서 라벨이 plot 가장자리에 너무 가까이 붙으면 시각적으로 답답해 보인다"
+- 실기기 비교 결과: iOS 5 라벨 표시가 DXY 변화 폭 해석에 더 명확. "답답함" 우려보다 "해상도 부족" 손실이 큼
+- 철회: divergence 유지 가치 < 비용 → iOS align 채택
 
-Android는 dp 기반 polish 환경에서 라벨이 plot 가장자리에 너무 가까이 붙으면 시각적으로 답답해 보인다는 보수적 디자인 판단. 라벨 0개 fallback도 어차피 추가했으므로(M4-a) 줌이 매우 깊을 때도 라벨이 완전히 사라지진 않음. iOS는 Swift Charts의 axis label clipping 처리에 의존해 가장자리 라벨도 자연스럽게 그릴 수 있어 inset이 불필요.
+**남은 원칙**:
 
-**언제 재검토**:
-
-DXY 라벨 inset 때문에 "줌인 시 의미 있는 값이 인접해 있는데 라벨이 안 보인다"는 사용자 보고가 들어오면 inset 값을 줄이거나 제거. 현재는 안정적으로 동작.
+- 라벨 0개 fallback (mid 값 single) 은 그대로 유지 — inset 제거해도 깊은 줌에서 `start > end` 가능한 case 방어
+- 최종 라벨 개수는 실제 `dxyMin`/`dxyMax` 와 rounding 에 따라 결정 — iOS 도 동일 (data-dependent)
 
 ### iOS divergence — y-lock 동안 line이 chart 경계 잠시 벗어남 (M4-b)
 
@@ -742,6 +742,13 @@ iOS Swift Charts 대비 Android Compose Canvas의 더블탭 애니메이션이 �
                움직임을 흡수 못해 실패율 10-20%. AOSP DOUBLE_TAP_SLOP_IN_DIPS 관례
                적용으로 획기적 감소
             커밋 1862f89 / 1dae300 / b597246 / 93679ee
+2026-04-16  M5 post-polish 5번째: DXY 라벨 inset 제거 — iOS align
+            사용자 실기기 스크린샷 비교(Android 3 라벨 / iOS 5 라벨) 로 M4-a 당시
+            의도적 divergence였던 `inset = span * 0.05` 유지 가치 재평가. "가장자리
+            답답함 방지" 근거보다 "DXY 해상도 부족" 손실이 커서 철회 결정.
+            generateDxyLabels에서 inset 제거, range 전체에서 step 정렬 (iOS와 동일).
+            §9 divergence 노트를 "유지 → 해소"로 업데이트
+            커밋 1446a16
 ```
 
 git 커밋 (Android):
@@ -765,4 +772,6 @@ git 커밋 (Android):
 - `1dae300` — perf(android): computeRatePaths visible 필터 — pan 끊김 개선
 - `b597246` — perf(android): yLock release 시 yRange 전환을 easeOut 250ms로 부드럽게
 - `93679ee` — fix(android): double-tap 위치 slop을 AOSP 표준 100dp로
-- **current HEAD** — docs(android): M5 post-polish 4종 이력 반영 (§4 M5 post-polish + §9 + §11)
+- `c431bf2` — docs(android): M5 post-polish 4종 이력 반영 (§4 M5 post-polish + §9 + §11)
+- `1446a16` — fix(android): DXY 라벨 inset 제거 — iOS 라벨 생성 규칙과 align
+- **current HEAD** — docs(android): DXY 라벨 inset divergence 해소 반영 (§9 + §11)
