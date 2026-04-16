@@ -288,7 +288,7 @@ iOS v2.5가 1d만 줌 활성인 이유는 Swift Charts의 제약에서 파생된
 
 ### M5 post-polish 수정 (사용자 피드백 기반)
 
-M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 4건을 후속 fix/perf 커밋으로 반영 (세부 커밋 해시는 §11 작업 이력 참조). 모두 post-M5 polish 범위.
+M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 6건을 후속 fix/perf 커밋으로 반영 (세부 커밋 해시는 §11 작업 이력 참조). 모두 post-M5 polish 범위.
 
 1. **Gesture clamp에서 trailing buffer 제거** (`fix`)
    - 증상: 최대 줌 상태에서 pan 최우측 시 chart 우측 ~66%가 빈 공간. iOS엔 없는 geometry 버그
@@ -311,6 +311,20 @@ M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 4�
    - 수정: `distFromLast < 100.dp.toPx()`. Compose `ViewConfiguration`은 `doubleTapSlop`을 직접 노출하지 않아 `100.dp.toPx()` 로 동일 계산 (AOSP 방식과 일치)
    - 자기 비판: M3-a 최초 구현 시 `tapSlopPx * 2`를 직관으로 설정, 플랫폼 표준 상수와 대조 생략. 반복 지적받은 "API/상수 인용 시 플랫폼 문서 대조 필수" 규율의 재발. 새 discipline: 수치 상수를 직관 설정 금지, 플랫폼 표준 또는 근거 있는 실측에 연동
    - 한계: 이번 수정은 distance axis 개선만 확증됨. `wasTap`의 다른 조건(`maxTravel`, `duration`, plot bounds)이나 zoomed 상태 PAN-init 경로의 간섭 가능성은 조사되지 않음. 잔존 miss가 일상 사용에서 거슬리면 추가 조사 필요
+5. **회전 시 줌 상태 보존** (`feat`)
+   - 증상: iOS는 가로/세로 전환 후 줌이 유지되지만 Android는 기본 보기로 리셋
+   - 원인: iOS는 `@State private var viewModel`이 SwiftUI에 의해 configuration change에서도 생존. Android는 Activity recreate + composable dispose로 `remember` value가 소실되어 `pocVisibleDomain`/`pocIsFollowingLatest`가 초기값으로 돌아감
+   - 수정: 두 상태를 `rememberSaveable(period, stateSaver = VisibleDomainSaver)` / `rememberSaveable(period) { ... }`로 전환. `ClosedRange<Long>?` 직렬화를 위한 `VisibleDomainSaver`(listSaver, null→emptyList) 추가. `LaunchedEffect(period)` reset 블록에서 두 상태 리셋 라인 제거 — saveable inputs(`period`)가 period 변경 시 기본값 재초기화를 이미 처리하므로 중복 리셋이 복원된 값을 파괴하는 것을 차단
+   - 설계 의도: rotation (inputs 동일) → saver 복원 / period 변경 (inputs 변화) → default 재생성. 분기 로직 불필요
+6. **회전 시 '환율 정보 로딩중' 플래시 제거** (`fix`)
+   - 증상: iOS는 rotation이 자연스럽게 전환되지만 Android는 "환율 정보 로딩중" 텍스트 + spinner가 순간적으로 보임
+   - 원인: `MainScreen` DisposableEffect onDispose가 rotation에서도 발동 → `exchangeRateViewModel.stop()` 호출 → `stop()`이 transport 정리 외에 `_appState.value = AppState.Loading` 까지 수행. 이후 Activity 재생성 → 새 DisposableEffect → `start()` → `loadInitialRates()`의 진입 라인이 다시 `_appState.value = AppState.Loading` 을 덮어쓰고 REST fetch. 두 지점 모두에서 Loading 플래시가 찍힘
+   - 수정 (2곳 + 호출부):
+     - `ExchangeRateViewModel.stop()`: `webSocketService.stop()`만 남김 (transport-only). UI state 유지 → Activity 재생성 후에도 이전 Connected 화면 그대로 표시
+     - `ExchangeRateViewModel.reset()` 신설: `stop()` + `_appState`/`_lastUpdated` 초기화. 진짜 세션 teardown(로그아웃/구독 해지)에서만 호출
+     - `loadInitialRates()`: 진입 시 `hasExistingData = _appState is Connected || _appState is Offline` 판정. 기존 데이터 있으면 Loading 플래시 생략 후 silent refresh. fetch 실패 시 기존 상태 그대로 유지하고 WebSocket만 재시작 (기존 Connected 화면 + 네트워크 복구 대기)
+     - `RootScreen`: 로그아웃/premium 해제 경로에서 `exchangeRateViewModel.stop()` → `reset()`로 배선 교체. `MainScreen.kt:121` onDispose는 `stop()` 유지 (회전 시 transport만 정리)
+   - iOS 비교: iOS `ExchangeRateViewModel.stop()`도 `webSocketService.stop()`만 수행. Android의 "UI reset까지 포함된 stop"은 Android 고유의 과잉 설계였음. 이번 수정으로 iOS와 semantic 일치
 
 **기기 검증 통과** (Jay 수동, 2026-04-16 후속):
 
@@ -749,6 +763,23 @@ iOS Swift Charts 대비 Android Compose Canvas의 더블탭 애니메이션이 �
             generateDxyLabels에서 inset 제거, range 전체에서 step 정렬 (iOS와 동일).
             §9 divergence 노트를 "유지 → 해소"로 업데이트
             커밋 1446a16
+2026-04-16  M5 post-polish 6/7번째: rotation 시 줌 상태 보존 + loading flash 제거
+            사용자 피드백: "iOS는 가로/세로 전환 시 줌 유지 + 자연스러운 전환,
+            Android는 줌 리셋 + '환율 정보 로딩중' 텍스트/spinner 노출".
+            두 이슈를 iOS parity 관점에서 해소.
+            6) rotation 줌 보존 (feat): pocVisibleDomain/pocIsFollowingLatest를
+               rememberSaveable(period, ...)로 전환. ClosedRange<Long>? 직렬화를
+               위한 VisibleDomainSaver(listSaver) 추가. LaunchedEffect(period)
+               reset 블록에서 두 상태 리셋 라인 제거 — saveable inputs가 period
+               변경 시 기본값 재초기화를 이미 처리하므로 중복 리셋 제거가 복원
+               된 값을 파괴하는 것을 차단. iOS @State와 semantic 일치
+            7) loading flash 제거 (fix): stop()/reset() 의미 분리 + loadInitialRates
+               silent 분기. MainScreen onDispose는 stop()(transport-only), RootScreen
+               로그아웃/premium 해제는 reset()(UI 초기화 포함)으로 배선. 이미
+               Connected/Offline 상태에서 loadInitialRates()가 호출되면 Loading
+               플래시 생략하고 silent refresh, 실패 시 기존 상태 유지. iOS
+               ExchangeRateViewModel.stop()의 transport-only semantic과 align
+            커밋 1c220d3 / ce4d1ee (기기 검증 대기)
 ```
 
 git 커밋 (Android):
@@ -774,4 +805,7 @@ git 커밋 (Android):
 - `93679ee` — fix(android): double-tap 위치 slop을 AOSP 표준 100dp로
 - `c431bf2` — docs(android): M5 post-polish 4종 이력 반영 (§4 M5 post-polish + §9 + §11)
 - `1446a16` — fix(android): DXY 라벨 inset 제거 — iOS 라벨 생성 규칙과 align
-- **current HEAD** — docs(android): DXY 라벨 inset divergence 해소 반영 (§9 + §11)
+- `d54b619` — docs(android): DXY 라벨 inset divergence 해소 반영 (§9 + §11)
+- `1c220d3` — feat(android): graph 줌/follow 상태 rotation 보존
+- `ce4d1ee` — fix(android): rotation 시 '환율 정보 로딩중' 플래시 제거
+- **current HEAD** — docs(android): rotation 보존 + loading flash 제거 이력 반영 (§4 M5 post-polish + §11)
