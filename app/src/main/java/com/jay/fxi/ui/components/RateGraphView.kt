@@ -30,6 +30,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -230,8 +232,15 @@ private fun RateGraphCanvas(
     //   - resolvedVisibleDomain: follow 반영된 파생 domain (chart 렌더 + 필터 single source)
     // Scope (parity baseline): pinch-to-zoom only, 내부적으로 right-edge anchor.
     // M2부터 finger-centered pinch + 1-finger pan 추가 예정.
-    var pocVisibleDomain by remember { mutableStateOf<ClosedRange<Long>?>(null) }
-    var pocIsFollowingLatest by remember { mutableStateOf(true) }
+    // 회전 등 configuration change에서 사용자 줌/follow 상태 유지 (iOS @State 등가).
+    // inputs에 period를 포함하므로:
+    //   - 회전 (period 동일): saved value 복원 → 줌 상태 보존
+    //   - period 변경 (1d → 1w 등): inputs 변화 감지 → init 재실행 → default reset
+    // 따로 "회전인지 period 변경인지" 분기 로직 불필요.
+    var pocVisibleDomain by rememberSaveable(period, stateSaver = VisibleDomainSaver) {
+        mutableStateOf<ClosedRange<Long>?>(null)
+    }
+    var pocIsFollowingLatest by rememberSaveable(period) { mutableStateOf(true) }
 
     // M2: Gesture baseline (iOS pocHandlePinch/PanBegan 등가)
     // pinch: began에서 한 번 캡처 + changed에서 finger-centered 계산용
@@ -256,12 +265,12 @@ private fun RateGraphCanvas(
     var pocAnimationJob: Job? by remember { mutableStateOf(null) }
     val animationScope = rememberCoroutineScope()
 
-    // 기간 변경 시 줌/follow/lock/animation 상태 리셋 (설계서 §4 M1/M2/M3/M4/M5)
+    // 기간 변경 시 ephemeral state / animation / lock 리셋 (설계서 §4 M1/M2/M3/M4/M5).
+    // pocVisibleDomain / pocIsFollowingLatest 는 rememberSaveable(period, ...) 가 자동 reset하므로
+    // 여기서 다시 null/true 할당하면 회전 시 복원된 값을 파괴. 해당 두 라인 의도적으로 제외.
     LaunchedEffect(period) {
         pocAnimationJob?.cancel()
         pocAnimationJob = null
-        pocVisibleDomain = null
-        pocIsFollowingLatest = true
         pocPinchBaselineDomain = null
         pocPinchAnchorTimeSec = null
         pocPanBaselineDomain = null
@@ -969,6 +978,18 @@ private fun RateGraphCanvas(
 /// PASS_THROUGH: 1 pointer + not zoomed (pager에 양보)
 /// DISCARDED: pinch → 1 pointer 전환 후 나머지 gesture 무시
 private enum class GestureMode { UNDETERMINED, PINCH, PAN, PASS_THROUGH, DISCARDED }
+
+/// Configuration change (회전 등) 시 pocVisibleDomain 을 보존하기 위한 Saver.
+/// ClosedRange<Long>? 은 직접 Saveable 이 아니라 Long 두 개의 list 로 직렬화.
+/// null (default view) 은 emptyList 로 저장.
+private val VisibleDomainSaver = listSaver<ClosedRange<Long>?, Long>(
+    save = { range ->
+        if (range == null) emptyList() else listOf(range.start, range.endInclusive)
+    },
+    restore = { list ->
+        if (list.isEmpty()) null else list[0]..list[1]
+    }
+)
 
 /// M5: 더블탭 줌 애니메이션 — pocVisibleDomain을 fromDomain → toDomain으로 0.25s 보간.
 /// iOS withAnimation(.easeOut(0.25)) 등가. 매 프레임 onFrame을 호출하여 caller가
