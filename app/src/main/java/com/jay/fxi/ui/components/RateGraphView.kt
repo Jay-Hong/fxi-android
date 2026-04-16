@@ -450,7 +450,7 @@ private fun RateGraphCanvas(
                                     val newStart = anchor - (rawNewLen * fraction).toLong()
                                     val newEnd = anchor + (rawNewLen * (1f - fraction)).toLong()
                                     val minBoundary = bounds.start
-                                    val maxBoundary = lastTs + trailingBufferSec(period)
+                                    val maxBoundary = lastTs
                                     pocVisibleDomain = clampVisibleDomain(
                                         newStart..newEnd,
                                         minBoundary,
@@ -521,7 +521,7 @@ private fun RateGraphCanvas(
                                     val newStart = baseline.start + timeDelta
                                     val newEnd = baseline.endInclusive + timeDelta
                                     val minBoundary = bounds.start
-                                    val maxBoundary = lastTs + trailingBufferSec(period)
+                                    val maxBoundary = lastTs
                                     pocVisibleDomain = clampVisibleDomain(
                                         newStart..newEnd,
                                         minBoundary,
@@ -611,7 +611,9 @@ private fun RateGraphCanvas(
                                 // iOS GraphConfig.doubleTapZoomWindow = 6h
                                 val halfWindow = 6L * 3600L / 2L
                                 val proposed = (tapTimeSec - halfWindow)..(tapTimeSec + halfWindow)
-                                val clamped = clampVisibleDomain(proposed, defaultStart, defaultEnd)
+                                // gesture clamp right boundary = lastTs (trailing buffer 제외).
+                                // defaultEnd(trailing 포함)는 visual baseline/fraction 계산에만 사용.
+                                val clamped = clampVisibleDomain(proposed, defaultStart, lastTs)
 
                                 // M5: zoom in은 yLock 사용 (iOS 패턴) — 애니메이션 중 visible 데이터
                                 // shrink로 인한 yRange 떨림 차단. 현재 chartState 기준으로 snapshot.
@@ -701,10 +703,11 @@ private fun RateGraphCanvas(
                     val bounds = currentDataBounds
                     if (raw != null && latest != null && bounds != null) {
                         val rawLen = raw.endInclusive - raw.start
-                        // M2 fix-4: default view 길이 기준(= totalLength + trailingBuffer).
-                        // totalLength 기준으로 판정하면 경계가 어긋나 의도치 않은 null 복귀 발생.
+                        // gesture clamp right boundary가 lastDataTs (trailing 제외)이므로
+                        // zoom out 시 최대 domain length = dataBounds span.
+                        // 이에 맞춰 full-unzoom 판정 기준도 dataBounds span (trailing 제외)으로 변경.
                         val unzoomedLen =
-                            (bounds.endInclusive - bounds.start) + trailingBufferSec(period).toLong()
+                            (bounds.endInclusive - bounds.start)
                         if (rawLen >= unzoomedLen * 99L / 100L) {
                             // 사실상 전체 보기 → default(null) + follow on
                             pocVisibleDomain = null
@@ -914,8 +917,10 @@ private suspend fun animateDomainTransition(
 }
 
 /// M2 fix-3: visible domain clamp (경계 + 길이).
-/// - minBoundary/maxBoundary: 허용 가능한 좌우 경계. maxBoundary는 default view의 xMax와 일치해야
-///   하므로 caller는 `lastDataTs + trailingBufferSec(period)`를 넘겨야 한다.
+/// - minBoundary/maxBoundary: 허용 가능한 좌우 경계.
+///   gesture clamp (pinch/pan/double-tap)에서는 maxBoundary = `lastDataTs` (trailing buffer 제외)
+///   를 넘겨야 한다. default view rendering의 xMax는 별도로 trailing buffer를 포함 (computeChartState).
+///   이 분리가 iOS setVisibleDomain의 latestAnchor / xDomain.upperBound 분리와 등가.
 /// - minLength: 최소 zoom 길이 (1h).
 /// - 항상 non-null range 반환. "전체 복귀(null)" 판정은 caller의 gesture-end 단계에서만 수행한다.
 ///   (이전 구현은 프레임 중간에 null 반환 → 떨림/플리커 발생. 사용자 관찰로 확인됨.)
