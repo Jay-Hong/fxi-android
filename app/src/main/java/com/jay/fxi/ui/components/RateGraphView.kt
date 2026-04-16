@@ -1390,8 +1390,24 @@ private fun computeRatePaths(
 ): List<SourcePath> {
     val isSingleSource = period == GraphPeriod.ONE_DAY && rateGraphData.size == 1 && !hasDxy
     return rateGraphData.keys.sortedBy { it.ordinal }.mapNotNull { source ->
-        val buckets = rateGraphData[source]?.sortedBy { it.bucketTs } ?: return@mapNotNull null
-        if (buckets.isEmpty()) return@mapNotNull null
+        val allBuckets = rateGraphData[source]?.sortedBy { it.bucketTs } ?: return@mapNotNull null
+        if (allBuckets.isEmpty()) return@mapNotNull null
+
+        // visible range + ±1 bucket 마진으로 필터.
+        // 이전엔 전체 bucket으로 path 생성 후 clipRect로 시각만 잘랐으나, 줌 상태에서
+        // 145 buckets × 3 sources = 435 lineTo 호출이 매 프레임 반복되어 frame drop 유발
+        // (사용자 관찰 "pan 시 선이 툭툭 재정렬"). visible + margin으로 줄이면 max zoom(1h)
+        // 기준 ~8 buckets/source로 18x 감소. margin은 index 기반 ±1 bucket이라 bucket
+        // 간격(gap 포함)에 무관하게 edge segment가 chart 경계까지 확실히 이어짐.
+        val firstIdx = allBuckets.indexOfFirst { it.bucketTs >= layout.xMin }
+        val lastIdx = allBuckets.indexOfLast { it.bucketTs <= layout.xMax }
+        val startIdx = if (firstIdx > 0) firstIdx - 1 else 0
+        val endIdx = if (lastIdx >= 0 && lastIdx < allBuckets.lastIndex) lastIdx + 1 else allBuckets.lastIndex
+        val buckets = if (firstIdx < 0 && lastIdx < 0) {
+            allBuckets  // visible range에 bucket이 하나도 없으면 fallback (전체)
+        } else {
+            allBuckets.subList(startIdx, (endIdx + 1).coerceAtMost(allBuckets.size))
+        }
 
         val path = Path().apply {
             buckets.forEachIndexed { index, bucket ->
