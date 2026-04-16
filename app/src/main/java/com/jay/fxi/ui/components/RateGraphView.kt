@@ -1566,11 +1566,11 @@ private fun generateDxyLabels(dxyMin: Double, dxyMax: Double): List<DxyLabel> {
         else -> 2.0
     }
     val format = if (step < 0.1) "%.2f" else "%.1f"
-    // inset 0.05 * span은 의도적 divergence (iOS는 inset 없음).
-    // Android는 라벨이 plot 가장자리에 너무 가까이 붙는 것을 막는 보수적 정책 유지.
-    val inset = span * 0.05
-    val start = ceil((dxyMin + inset) / step) * step
-    val end = floor((dxyMax - inset) / step) * step
+    // iOS generateDxyAxisLabels와 동일하게 inset 없이 range 전체에서 step 정렬.
+    // (이전엔 Android 전용으로 `inset = span * 0.05` 적용했으나 사용자 체감 비교 결과
+    // iOS 5-label이 DXY 변화 폭 해석에 더 명확 — divergence 철회. §9 참조)
+    val start = ceil(dxyMin / step) * step
+    val end = floor(dxyMax / step) * step
     val labels = mutableListOf<DxyLabel>()
     var value = start
     var previous: String? = null
