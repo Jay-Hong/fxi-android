@@ -122,6 +122,7 @@ app/
 │   │   ├── data/
 │   │   │   ├── local/
 │   │   │   │   ├── BankPreferenceManager.kt  # 은행 순서/표시 설정 (DataStore)
+│   │   │   │   ├── GraphPreferenceManager.kt # 그래프 토글 영속화 (DataStore)
 │   │   │   │   └── CacheService.kt           # 기간별 그래프 캐시 (versioned JSON)
 │   │   │   │
 │   │   │   ├── network/

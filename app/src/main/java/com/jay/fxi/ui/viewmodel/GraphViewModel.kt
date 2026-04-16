@@ -4,6 +4,7 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.jay.fxi.data.local.CacheService
+import com.jay.fxi.data.local.GraphPreferenceManager
 import com.jay.fxi.data.remote.WebSocketService
 import com.jay.fxi.data.remote.dto.WebSocketGraphBucket
 import com.jay.fxi.data.remote.dto.WebSocketGraphBuckets
@@ -40,7 +41,8 @@ import kotlinx.datetime.Clock
 class GraphViewModel @Inject constructor(
     private val repository: ExchangeRateRepository,
     private val webSocketService: WebSocketService,
-    private val cacheService: CacheService
+    private val cacheService: CacheService,
+    private val graphPreferenceManager: GraphPreferenceManager
 ) : ViewModel() {
 
     // ============ 상태 ============
@@ -64,11 +66,8 @@ class GraphViewModel @Inject constructor(
     private val _activePeriod = MutableStateFlow(GraphPeriod.ONE_DAY)
     val activePeriod: StateFlow<GraphPeriod> = _activePeriod.asStateFlow()
 
-    private val _selectedSources = MutableStateFlow(setOf(GraphSource.INVESTING))
-    val selectedSources: StateFlow<Set<GraphSource>> = _selectedSources.asStateFlow()
-
-    private val _dxyVisible = MutableStateFlow(false)
-    val dxyVisible: StateFlow<Boolean> = _dxyVisible.asStateFlow()
+    val selectedSources: StateFlow<Set<GraphSource>> = graphPreferenceManager.selectedSources
+    val dxyVisible: StateFlow<Boolean> = graphPreferenceManager.dxyVisible
 
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
@@ -181,21 +180,11 @@ class GraphViewModel @Inject constructor(
     }
 
     fun toggleSource(source: GraphSource) {
-        if (source !in GraphSource.realtimeSources) return
-
-        val current = _selectedSources.value.toMutableSet()
-        if (source in current) {
-            if (current.size > 1) {
-                current.remove(source)
-            }
-        } else {
-            current.add(source)
-        }
-        _selectedSources.value = current
+        graphPreferenceManager.toggleSource(source)
     }
 
     fun toggleDxy() {
-        _dxyVisible.update { !it }
+        graphPreferenceManager.toggleDxy()
     }
 
     suspend fun loadGraph(currency: SupportedCurrency) {
