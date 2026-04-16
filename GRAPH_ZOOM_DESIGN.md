@@ -286,6 +286,40 @@ iOS v2.5가 1d만 줌 활성인 이유는 Swift Charts의 제약에서 파생된
 - yLock 지연 release 미채택 (iOS는 0.26s Task로 settle 후 release): Compose에서 동일 패턴 안전 구현하려면 자연 chartState 파생 state 별도로 두거나 computeChartState를 두 번 계산해야 함 → ETC 원칙에 따라 즉시 release 채택. 자세한 근거는 §9 노트 참조
 - Animation 중 pinch handoff 시 stale lock snapshot 이어받음: iOS도 같은 패턴(`pocHandlePinchBegan`이 `data.yRange` = locked 값 읽음). 의도적 visual continuity trade-off로 수용. renderDomainOverride 패턴 refactor가 더 나은 해법이지만 큰 refactor라 post-M5 후보. §9 노트 참조
 
+### M5 post-polish 수정 (사용자 피드백 기반)
+
+M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 4건을 후속 fix/perf 커밋으로 반영 (세부 커밋 해시는 §11 작업 이력 참조). 모두 post-M5 polish 범위.
+
+1. **Gesture clamp에서 trailing buffer 제거** (`fix`)
+   - 증상: 최대 줌 상태에서 pan 최우측 시 chart 우측 ~66%가 빈 공간. iOS엔 없는 geometry 버그
+   - 원인: pinch/pan/double-tap clamp의 `maxBoundary`가 `lastDataTs + trailingBufferSec(period)` (= 40min 포함). default view(24h)에서는 2.8%라 미미했지만 max zoom(1h)에서는 40min/60min = 66.7%
+   - 디버그 로그로 원인 확정 (`pocVisibleDomain = 1776301020..1776304620, lastDataTs = 1776302238` → 39.7min 뒤까지 visible)
+   - iOS 비교: `setVisibleDomain`의 rightBoundary = `latestAnchor`(trailing 없음). chart rendering domain(`xDomain`)에만 trailing 포함. 즉 iOS는 render domain과 gesture clamp를 분리, Android는 혼용
+   - 수정: gesture clamp `maxBoundary` 에서 trailing 제외. default view rendering domain의 trailing은 유지. 파급으로 gesture-end full-unzoom 판정의 `unzoomedLen`도 `dataBounds span` 기준으로 정렬 (안 그러면 full unzoom release 못 trigger)
+2. **`computeRatePaths` visible 필터 (perf)**
+   - 증상: pan 시 선이 툭툭 끊어지면서 재정렬되는 듯한 느낌. frame drop 의심
+   - 원인: `computeRatePaths`가 줌 상태에서도 전체 bucket (3 sources × 145 = 435 `Path.lineTo`)로 path 재구성 후 `clipRect`로 시각만 자름. 매 프레임 재구성 비용이 16ms budget 초과로 frame drop
+   - 수정: visible range + **index 기반 ±1 bucket 마진** 필터 추가. 하드코딩 상수(예: 600s) 는 bucket gap 있는 데이터에서 edge segment 잘림 위험이라 index 기반 사용. 간격 무관하게 edge segment가 chart 경계까지 이어짐. max zoom 1h 기준 435 → ~24 lineTo (18× 감소). default view는 전체가 visible이라 필터 통과 — 회귀 0
+3. **yLock release 시 yRange easeOut 전환** (`perf`)
+   - 증상: pinch/pan 손 뗀 직후 Y축 라벨과 line이 한 프레임에 "뚝" 변경. iOS는 부드러운 애니메이션, Android는 즉시 snap
+   - 원인: iOS는 Swift Charts의 `withAnimation(.easeOut(0.25)) { pocGestureYLock = nil }` 으로 yRange 전환을 implicit 보간. Android Compose Canvas는 implicit animation 없어 즉시 snap
+   - 수정: 직전 frame 대비 `pocGestureYLock`이 set→null로 전환된 시점만 감지(`lockJustReleased`). 해당 순간에 `animSpec = tween(250, LinearOutSlowInEasing)`, 그 외는 `snap()`으로 lock 진입/데이터 갱신 등 다른 변화는 즉시 반영 (iOS `withAnimation` scope 의미와 동일). 보간 대상 6개 값 (yMin/Max, rateRangeMin/Max, dxyMin/Max)을 같은 spec으로 병렬 보간하여 축/rate/DXY가 동기화된 transition으로 이동. DXY 라벨 VALUE는 `chartState.dxyMin/Max` (natural settled) 기준 생성, 위치만 animated 정규화로 계산 ("lock overlay 해제 시 true state는 natural, 위치만 interpolate" semantic)
+   - 자기 비판 fix 1건: 초기 구현은 composition 본문에서 `MutableState`를 read 후 바로 write — Compose anti-pattern이라 `SideEffect`로 commit 후 update로 수정 (코덱스 지적)
+4. **Double-tap 위치 slop을 AOSP 표준 100dp로** (`fix`)
+   - 증상: "더블탭이 둔하게 먹힘, 10-20% 실패율. 몸 움직이며 시도할수록 실패 빈도 증가". 화면 반응 아예 없음 — 두 번째 tap이 `isDoubleTap` 조건에서 탈락하여 독립 single tap 2개로 분해
+   - 원인: `distFromLast < tapSlopPx * 2f` 조건이 과도하게 tight. `touchSlop ≈ 24dp`, `× 2 = ~40dp` 수준 — AOSP `DOUBLE_TAP_SLOP_IN_DIPS = 100dp` 표준의 절반 이하. 사용자의 자연스러운 손/몸 움직임으로 인한 두 탭 위치 편차(50-90px)를 흡수 못함
+   - 수정: `distFromLast < 100.dp.toPx()`. Compose `ViewConfiguration`은 `doubleTapSlop`을 직접 노출하지 않아 `100.dp.toPx()` 로 동일 계산 (AOSP 방식과 일치)
+   - 자기 비판: M3-a 최초 구현 시 `tapSlopPx * 2`를 직관으로 설정, 플랫폼 표준 상수와 대조 생략. 반복 지적받은 "API/상수 인용 시 플랫폼 문서 대조 필수" 규율의 재발. 새 discipline: 수치 상수를 직관 설정 금지, 플랫폼 표준 또는 근거 있는 실측에 연동
+   - 한계: 이번 수정은 distance axis 개선만 확증됨. `wasTap`의 다른 조건(`maxTravel`, `duration`, plot bounds)이나 zoomed 상태 PAN-init 경로의 간섭 가능성은 조사되지 않음. 잔존 miss가 일상 사용에서 거슬리면 추가 조사 필요
+
+**기기 검증 통과** (Jay 수동, 2026-04-16 후속):
+
+- 1번: max zoom + pan 최우측 시 chart 우측 끝까지 데이터 채워짐 (빈공간 제거)
+- 2번: pan 시 선이 눈에 띄게 부드러워짐 (frame drop 감소)
+- 3번: pinch/pan 손 뗀 직후 Y축 라벨/DXY 라벨 smooth transition
+- 4번: 몸 움직이며 더블탭해도 실패율 "획기적 감소"
+- 회귀: M2/M3/M4/M5 기존 기능 모두 정상
+
 ---
 
 ## 5. 상태 모델 상세 (M1 이후)
@@ -486,7 +520,8 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
 | **M5 yLock 지연 release 미채택 (iOS divergence)** | **의도적 divergence** | **post-M5 polish 후보** |
 | **M5 animation→pinch handoff stale lock (iOS와 동일 패턴)** | **수용된 trade-off** | **post-M5 polish 후보** |
 | **M5 zoom-in 시각 동조감 (chart morph)** | **시각 인상, 코드 정적으론 lock 작동** | **post-M5 polish 후보** |
-| **M5 부드러움 iOS 대비 살짝 부자연** | **Compose Canvas inherent** | **저비용 polish (easing/duration/recompute) 후보** |
+| **M5 부드러움 iOS 대비 살짝 부자연** | **M5 post-polish에서 일부 개선** (`computeRatePaths` visible 필터 + yLock release easeOut) | **추가 polish 시 검토: easing 곡선, duration 미세 조정, chartState memoization** |
+| **M5 post-polish: zoomed 상태 tap이 PAN-init 경로 경유** | **잔존 tap miss 가능성 (distance slop 수정 외 축)** | **일상 사용에서 거슬리면 PAN-init 지연 발동(slop 감지 후 commit) 패턴 검토** |
 
 ### iOS divergence — Graph fullscreen 단일 탭 종료 (M3-b)
 
@@ -608,11 +643,22 @@ var renderDomainOverride: ClosedRange<Long>? by remember { mutableStateOf(null) 
 
 post-M5 polish 단계에서 위 trade-off 3건이 사용자 체감으로 명확한 불편으로 보고되면 진행. 현재는 "크게 이상하진 않음" 수준이라 보류.
 
-### M5 부드러움 — Compose Canvas inherent 차이
+### M5 부드러움 — Compose Canvas inherent 차이 (M5 post-polish에서 일부 개선)
 
 **무엇인가**:
 
 iOS Swift Charts 대비 Android Compose Canvas의 더블탭 애니메이션이 살짝 부자연스러움. 사용자 평가 "iOS는 부드러운 반면, android는 비교적 살짝 부자연스럽다는 느낌".
+
+**M5 post-polish로 적용된 개선** (§4 M5 post-polish 수정 항목 2, 3 참조):
+
+- `computeRatePaths` visible 필터로 매 프레임 path 재구성 비용 18× 감소 → pan 중 frame drop 감소 → 선이 더 부드럽게 따라옴
+- yLock release 시 yRange 전환을 easeOut 250ms 보간 → gesture 손 뗀 직후 Y축 라벨/line이 "뚝" 대신 부드럽게 이동
+
+남은 잠재 개선 (필요 시 추가 polish 후보):
+
+- Easing 곡선 변경 실험 (`LinearOutSlowInEasing` → `FastOutSlowInEasing` 등)
+- Animation duration 미세 조정 (250ms → 200 또는 300)
+- `computeChartState` 비용 최적화 (dxyDisplayBuckets memoization 등)
 
 **원인 추정**:
 
@@ -683,6 +729,19 @@ iOS Swift Charts 대비 Android Compose Canvas의 더블탭 애니메이션이 �
             미채택, animation→pinch handoff stale lock) + post-M5 polish 후보 (renderDomainOverride
             패턴, easing/duration/recompute 최적화) 모두 §9에 기록
             커밋 bff1676
+2026-04-16  M5 post-polish 4종 (사용자 실기기 피드백 기반)
+            1) gesture clamp에서 trailing buffer 제거: 줌 + pan 최우측 시 우측 빈공간
+               버그 수정. 디버그 로그로 원인 확정 (visible end가 lastDataTs + 40min
+               까지 허용). iOS setVisibleDomain의 rightBoundary = latestAnchor와 정렬
+            2) computeRatePaths visible 필터 (index 기반 ±1 bucket 마진): 전체 bucket
+               path 재구성 비용 18× 감소 → pan smoothness 개선
+            3) yLock release easeOut 250ms: gesture 손 뗀 직후 yRange snap을 animated
+               전환으로. 보간 대상 6개 값(yMin/Max, rateRangeMin/Max, dxyMin/Max) 병렬.
+               자기 비판 fix 1건: composition 본문 MutableState write → SideEffect 패턴
+            4) double-tap 위치 slop 100dp (AOSP 표준): tapSlopPx * 2 (~40dp)는 손/몸
+               움직임을 흡수 못해 실패율 10-20%. AOSP DOUBLE_TAP_SLOP_IN_DIPS 관례
+               적용으로 획기적 감소
+            커밋 1862f89 / 1dae300 / b597246 / 93679ee
 ```
 
 git 커밋 (Android):
@@ -701,4 +760,9 @@ git 커밋 (Android):
 - `2497c8c` — feat(android): M4-b gesture y-lock + DISCARDED cleanup leak fix (v2.3 parity)
 - `c8fa7c3` — docs(android): M4 완료 이력 반영 (§4 M4 + §9 DXY inset/y-lock divergence + §11)
 - `bff1676` — feat(android): M5 더블탭 줌 애니메이션 (v2.5 실험적 parity)
-- **current HEAD** — docs(android): M5 완료 이력 반영 (§4 M5 + §9 M5 divergence/polish 후보 + §11)
+- `3293bc7` — docs(android): M5 완료 이력 반영 (§4 M5 + §9 M5 divergence/polish 후보 + §11)
+- `1862f89` — fix(android): gesture clamp에서 trailing buffer 제거 — 줌 상태 우측 빈공간 버그 수정
+- `1dae300` — perf(android): computeRatePaths visible 필터 — pan 끊김 개선
+- `b597246` — perf(android): yLock release 시 yRange 전환을 easeOut 250ms로 부드럽게
+- `93679ee` — fix(android): double-tap 위치 slop을 AOSP 표준 100dp로
+- **current HEAD** — docs(android): M5 post-polish 4종 이력 반영 (§4 M5 post-polish + §9 + §11)
