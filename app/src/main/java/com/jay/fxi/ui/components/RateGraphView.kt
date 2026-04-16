@@ -617,13 +617,21 @@ private fun RateGraphCanvas(
                 if (wasTap) {
                     val doubleTapTimeoutMs = viewConfiguration.doubleTapTimeoutMillis
                     val doubleTapMinTimeMs = viewConfiguration.doubleTapMinTimeMillis
+                    // Double-tap 위치 slop은 Android 플랫폼 표준에 맞춰 100dp 기반으로.
+                    // 이전 tapSlopPx * 2 (~40dp) 는 자연스러운 손/몸 흔들림으로 인한 두 탭
+                    // 위치 편차를 흡수 못해 실패율 증가 (사용자 보고로 재현 확인).
+                    // AOSP ViewConfiguration의 DOUBLE_TAP_SLOP_IN_DIPS가 100dp 고정 상수이며
+                    // getScaledDoubleTapSlop()는 100dp × density의 device-specific px 반환.
+                    // Compose ViewConfiguration은 해당 값을 직접 노출하지 않으므로 100.dp.toPx()
+                    // 로 동일 계산.
+                    val doubleTapSlopPx = 100.dp.toPx()
                     val sinceLast = downTimeMs - pocLastTapTimeMs
                     val lastDx = downPosition.x - pocLastTapPosition.x
                     val lastDy = downPosition.y - pocLastTapPosition.y
                     val distFromLast = sqrt(lastDx * lastDx + lastDy * lastDy)
                     val isDoubleTap = pocLastTapTimeMs > 0L &&
                         sinceLast in doubleTapMinTimeMs..doubleTapTimeoutMs &&
-                        distFromLast < tapSlopPx * 2f
+                        distFromLast < doubleTapSlopPx
 
                     if (isDoubleTap) {
                         // === 더블탭 처리 (iOS pocHandleDoubleTap 등가) ===
