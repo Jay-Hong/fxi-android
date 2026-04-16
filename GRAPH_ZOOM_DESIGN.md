@@ -288,7 +288,7 @@ iOS v2.5가 1d만 줌 활성인 이유는 Swift Charts의 제약에서 파생된
 
 ### M5 post-polish 수정 (사용자 피드백 기반)
 
-M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 8건을 후속 fix/perf 커밋으로 반영 (세부 커밋 해시는 §11 작업 이력 참조). 모두 post-M5 polish 범위.
+M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 9건을 후속 fix/perf 커밋으로 반영 (세부 커밋 해시는 §11 작업 이력 참조). 모두 post-M5 polish 범위.
 
 1. **Gesture clamp에서 trailing buffer 제거** (`fix`)
    - 증상: 최대 줌 상태에서 pan 최우측 시 chart 우측 ~66%가 빈 공간. iOS엔 없는 geometry 버그
@@ -338,6 +338,17 @@ M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 8�
    - 2차 보강 (a3be016, in-flight edge case): 1차 가드는 cold start 진행 중(REST 300~500ms) 회전 시 여전히 중복 launch. `initialLoadJob: Job?` 필드로 in-flight 추적, `launchInitialLoadIfNotActive()` 헬퍼 추출, `invokeOnCompletion`으로 stale reference 정리. `reset()`/`onCleared()`에서 명시적 cancel 추가 — 로그아웃/구독 해지 직후 늦은 응답이 state를 덮는 race를 **실무적으로** 차단 (cooperative cancellation 한계상 이론적 window는 극미량 남음)
    - 효과: 회전 시 REST 0회. WebSocket은 이미 7번 수정으로 연결 유지 중이라 실시간 rates stream 정상. iOS parity 완결
    - 한계: 위 cooperative cancellation window는 generation token 패턴까지 가야 완전 차단이지만 over-engineering 영역이라 불채택
+9. **Sample shell에 M3-b fullscreen gesture policy 전파 — 그래프 outer double-tap wrapper 제거** (`fix`)
+   - 증상: 예시(LockedPreview) 화면에서 그래프 섹션을 더블탭하면 RateGraphView 내부 6h zoom이 아니라 **fullscreen 전환**이 발동. 섹션 전체 영역 어디서 더블탭해도 fullscreen 진입
+   - 원인: M3-b 작업 당시 Live(CurrencyTabContent)에서만 outer `detectTapGestures(onDoubleTap = ...)` wrapper를 제거했고 Sample shell(LockedPreviewScreen)에는 전파 누락. 섹션 전체 영역의 outer double-tap wrapper가 RateGraphView 내부 M3-a 더블탭 zoom 이벤트를 consume
+   - 수정: Sample의 **그래프** 관련 outer wrapper 2곳 제거
+     - `SampleGraphSection` ([LockedPreviewScreen.kt:988]): `onDoubleTap = onFullscreenTap()` 제거 → RateGraphView 내부 6h zoom 복귀
+     - `SampleFullscreenGraphView` ([LockedPreviewScreen.kt:600]): `onDoubleTap = onClose()` 제거 → fullscreen 내부에서도 double-tap = 내부 zoom (Cancel 아이콘으로만 종료, Live와 동일)
+   - **rates 섹션 wrapper는 원복 (Live와 parity)**: 초기 시도(2819fc7)에서 4곳 모두 제거했으나 재조사 결과 Live의 `CurrencyTabContent`에도 rates section에 동일 wrapper가 존재함 ([CurrencyTabContent.kt:534-536, 399-401](app/src/main/java/com/jay/fxi/ui/screen/CurrencyTabContent.kt#L534-L536)) → Sample의 rates wrapper 2곳(`SampleRatesSection`, `SampleFullscreenRatesView`)은 7ef8633에서 복구
+   - Live/Sample 통일 정책 (결과):
+     - Graph: 진입/종료 아이콘 전용, 섹션 더블탭은 RateGraphView 내부 6h zoom
+     - Rates: 진입/종료 아이콘 + 섹션 더블탭 모두 지원
+   - 자기 검증 반성: Phase 2 초기 판단 시 Live의 rates wrapper 실존 여부를 Read 없이 "없음"으로 단정 → feedback pattern 4(원인 확정 전 해결책 금지) 위반. Live 실제 코드 확인 후 2819fc7의 rates 2곳 제거를 7ef8633으로 자가 교정
 
 **기기 검증 통과** (Jay 수동, 2026-04-16 후속):
 
@@ -349,6 +360,7 @@ M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 8�
 - 6번: 회전 시 "환율 정보 로딩중" 텍스트/spinner 더 이상 노출 안 됨
 - 7번: 회전 시 상단 연결 상태 배너 flicker 및 콘텐츠 reflow 없음
 - 8번: 회전 시 REST `/api/rates` 재호출 0회 (WebSocket stream 유효 유지)
+- 9번: Sample 그래프 섹션 더블탭 = 탭 위치 중심 6h zoom (toggle) / fullscreen 진입·종료 아이콘 정상 / Sample rates 섹션 더블탭 fullscreen 진입·종료 유지 (Live와 parity)
 - 회귀: M2/M3/M4/M5 기존 기능 모두 정상
 
 ---
@@ -833,6 +845,24 @@ iOS Swift Charts 대비 Android Compose Canvas의 더블탭 애니메이션이 �
             효과: 회전 시 REST 0회 확인. iOS parity 완결.
             커밋 a7ec05e + a3be016 (기기 검증 통과: REST 0회 확인, 회귀 없음)
             §9 polish 후보에서 strikethrough 및 "완료" 표기
+2026-04-16  M5 post-polish 9번째: Sample shell에 M3-b fullscreen gesture policy 전파
+            사용자 피드백: "LockedPreview 그래프 더블탭이 6h zoom이 아니라 전체
+            화면으로 전환된다. 섹션 빈 곳 더블탭도 동일". Live는 이미 M3-b에서
+            outer detectTapGestures를 제거해 RateGraphView 내부 M3-a 더블탭 zoom이
+            도달하도록 했으나, Sample shell(LockedPreviewScreen)에는 전파 누락.
+            1차 (2819fc7): 4곳 outer wrapper 모두 제거 (graph 2곳 + rates 2곳).
+                초기 Phase 2 판단 — "Live rates에도 wrapper 없을 것"으로 Read 없이
+                단정. feedback pattern 4(원인 확정 전 해결책 금지) 위반.
+            2차 (7ef8633): Live CurrencyTabContent 재조사 결과 rates section 2곳에
+                double-tap fullscreen wrapper가 실존 확인 ([L534-536, 399-401]). Sample
+                의 rates wrapper 2곳 복구. 정책을 Live와 동일하게 재정립:
+                  - Graph: 아이콘 전용 진입/종료, 섹션 더블탭 = RateGraphView 내부
+                    6h zoom toggle
+                  - Rates: 아이콘 + 섹션 더블탭 모두 fullscreen 진입/종료
+            Net effect: Sample에서 그래프 관련 outer wrapper 2곳만 제거 (L600 /
+            L988), rates 2곳은 Live parity 위해 유지.
+            커밋 2819fc7 / 7ef8633 (기기 검증 통과: 그래프 6h zoom 복귀, 아이콘
+            경로 정상, rates 더블탭 fullscreen 유지, 회귀 없음)
 ```
 
 git 커밋 (Android):
@@ -868,4 +898,7 @@ git 커밋 (Android):
 - `a3be016` — perf(android): initial load in-flight 중 회전 시 REST 중복 launch 차단
 - `f1a0192` — docs(android): M5 post-polish 7·8번 반영 — 배너 flicker 제거 + rotation refetch skip 해소 (§4 + §9 + §11)
 - `c17a8d7` — docs(android): §11 작업 이력 numbering을 §4와 일관되게 정비
-- **current HEAD** — docs(android): §11 current HEAD 마커 동기화 (c17a8d7 반영)
+- `becf785` — docs(android): §11 current HEAD 마커 동기화 (c17a8d7 반영)
+- `2819fc7` — fix(android): LockedPreviewScreen sample shell에 M3-b fullscreen gesture policy 전파 (4곳 제거 — 초기 판단)
+- `7ef8633` — fix(android): LockedPreviewScreen rates 섹션 outer double-tap wrapper 원복 (Live parity 회복)
+- **current HEAD** — docs(android): M5 post-polish 9번째 반영 — Sample graph shell M3-b 전파 + rates wrapper 원복 경위 (§4 + §11)
