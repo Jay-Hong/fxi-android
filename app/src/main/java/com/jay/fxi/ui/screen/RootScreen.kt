@@ -104,7 +104,7 @@ fun RootScreen(
     LaunchedEffect(authState) {
         val previous = previousAuthState.value
         if (previous != null && previous !is AuthState.SignedOut && authState is AuthState.SignedOut) {
-            exchangeRateViewModel.stop()
+            exchangeRateViewModel.reset()
             graphViewModel.stop()
             alertViewModel.reset()
             newsViewModel.reset()
@@ -117,7 +117,7 @@ fun RootScreen(
     LaunchedEffect(isPremium) {
         val previous = previousPremiumState.value
         if (previous == true && !isPremium) {
-            exchangeRateViewModel.stop()
+            exchangeRateViewModel.reset()
             graphViewModel.stop()
             alertViewModel.reset()
             newsViewModel.reset()

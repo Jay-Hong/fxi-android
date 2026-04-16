@@ -58,11 +58,20 @@ class ExchangeRateViewModel @Inject constructor(
     }
 
     /**
-     * 서비스 종료
-     * 로그아웃 또는 구독 해지 시 호출
+     * transport 정리 (WebSocket만 끊고 UI state는 유지).
+     * MainScreen composable dispose 시 호출 — 회전 등 configuration change 포함.
+     * UI state 유지 덕분에 Activity 재생성 후 start()에서 flash 없이 이어짐.
      */
     fun stop() {
         webSocketService.stop()
+    }
+
+    /**
+     * 세션 완전 teardown (transport 정리 + UI state 초기화).
+     * 로그아웃 또는 구독 해지 시 RootScreen에서 호출.
+     */
+    fun reset() {
+        stop()
         _appState.value = AppState.Loading
         _lastUpdated.value = null
     }
@@ -95,7 +104,14 @@ class ExchangeRateViewModel @Inject constructor(
     }
 
     private suspend fun loadInitialRates() {
-        _appState.value = AppState.Loading
+        // 이미 데이터가 있는 상태(회전 후 재진입 등)에서는 Loading 플래시 생략,
+        // 백그라운드 refresh로 처리하여 iOS와 같은 자연스러운 전환 보장.
+        val hasExistingData = _appState.value is AppState.Connected ||
+            _appState.value is AppState.Offline
+
+        if (!hasExistingData) {
+            _appState.value = AppState.Loading
+        }
 
         repository.getRates()
             .onSuccess { result ->
@@ -107,16 +123,20 @@ class ExchangeRateViewModel @Inject constructor(
                 webSocketService.start()
             }
             .onFailure { error ->
-                // 캐시된 데이터로 오프라인 모드
-                val cachedRates = cacheService.loadCachedRates()
-                if (cachedRates != null) {
-                    _appState.value = AppState.Offline(cachedRates)
-                    _lastUpdated.value = cacheService.cachedRatesTimestamp()
-
-                    // 오프라인이어도 WebSocket 시작 (네트워크 복구 시 연결)
+                if (hasExistingData) {
+                    // 회전 후 fetch 실패: 기존 Connected/Offline 상태 그대로 유지,
+                    // WebSocket만 재시작해 네트워크 복구 시 자동 회복
                     webSocketService.start()
                 } else {
-                    _appState.value = AppState.Error(error.message ?: "알 수 없는 오류")
+                    // 콜드 스타트 fetch 실패: 캐시로 오프라인 fallback
+                    val cachedRates = cacheService.loadCachedRates()
+                    if (cachedRates != null) {
+                        _appState.value = AppState.Offline(cachedRates)
+                        _lastUpdated.value = cacheService.cachedRatesTimestamp()
+                        webSocketService.start()
+                    } else {
+                        _appState.value = AppState.Error(error.message ?: "알 수 없는 오류")
+                    }
                 }
             }
     }
