@@ -332,6 +332,8 @@ M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 6�
 - 2번: pan 시 선이 눈에 띄게 부드러워짐 (frame drop 감소)
 - 3번: pinch/pan 손 뗀 직후 Y축 라벨/DXY 라벨 smooth transition
 - 4번: 몸 움직이며 더블탭해도 실패율 "획기적 감소"
+- 5번: pan/pinch로 줌한 상태에서 가로↔세로 전환 시 줌 window 그대로 보존
+- 6번: 회전 시 "환율 정보 로딩중" 텍스트/spinner 더 이상 노출 안 됨
 - 회귀: M2/M3/M4/M5 기존 기능 모두 정상
 
 ---
@@ -536,6 +538,7 @@ iOS는 본화면 `RateGraphView` + 예시화면 `SampleGraphView` **복제본**�
 | **M5 zoom-in 시각 동조감 (chart morph)** | **시각 인상, 코드 정적으론 lock 작동** | **post-M5 polish 후보** |
 | **M5 부드러움 iOS 대비 살짝 부자연** | **M5 post-polish에서 일부 개선** (`computeRatePaths` visible 필터 + yLock release easeOut) | **추가 polish 시 검토: easing 곡선, duration 미세 조정, chartState memoization** |
 | **M5 post-polish: zoomed 상태 tap이 PAN-init 경로 경유** | **잔존 tap miss 가능성 (distance slop 수정 외 축)** | **일상 사용에서 거슬리면 PAN-init 지연 발동(slop 감지 후 commit) 패턴 검토** |
+| **회전 시 REST `loadInitialRates()` 재호출** | **UX는 §4 M5 post-polish 6번에서 해소, 네트워크 요청 자체는 잔존** | **별도 후속 최적화 — freshness 기준(WebSocket 연결 상태 / `lastUpdated` 경과) 도입, iOS 실제 동작 비교 선행** |
 
 ### iOS divergence — Graph fullscreen 단일 탭 종료 (M3-b)
 
@@ -779,7 +782,10 @@ iOS Swift Charts 대비 Android Compose Canvas의 더블탭 애니메이션이 �
                Connected/Offline 상태에서 loadInitialRates()가 호출되면 Loading
                플래시 생략하고 silent refresh, 실패 시 기존 상태 유지. iOS
                ExchangeRateViewModel.stop()의 transport-only semantic과 align
-            커밋 1c220d3 / ce4d1ee (기기 검증 대기)
+            커밋 1c220d3 / ce4d1ee (기기 검증 통과: 줌 window 보존 확인,
+            '환율 정보 로딩중' 플래시 미노출 확인)
+            잔존 과제: 회전 시 REST `loadInitialRates()` 재호출 자체는 남음 —
+            §9 polish 후보에 "rotation refetch skip" 항목 추가
 ```
 
 git 커밋 (Android):
@@ -808,4 +814,5 @@ git 커밋 (Android):
 - `d54b619` — docs(android): DXY 라벨 inset divergence 해소 반영 (§9 + §11)
 - `1c220d3` — feat(android): graph 줌/follow 상태 rotation 보존
 - `ce4d1ee` — fix(android): rotation 시 '환율 정보 로딩중' 플래시 제거
-- **current HEAD** — docs(android): rotation 보존 + loading flash 제거 이력 반영 (§4 M5 post-polish + §11)
+- `2f42d20` — docs(android): rotation 보존 + loading flash 제거 이력 반영 (§4 M5 post-polish + §11)
+- **current HEAD** — docs(android): M5 post-polish 5·6번 기기 검증 통과 표기 + §9에 rotation refetch skip 후보 추가
