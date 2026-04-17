@@ -63,10 +63,7 @@ fun AlertRow(
         AlertCondition.ABOVE -> PositiveColor
         AlertCondition.BELOW -> NegativeColor
     }
-    val conditionSymbol = when (setting.condition) {
-        AlertCondition.ABOVE -> "△"
-        AlertCondition.BELOW -> "▽"
-    }
+    val conditionSymbol = setting.condition.symbol
 
     Row(
         modifier = Modifier
@@ -120,7 +117,8 @@ fun AlertRow(
             Text(
                 text = conditionSymbol,
                 color = conditionColor,
-                fontSize = 14.sp
+                fontSize = metrics.alertConditionSymbolFontSize,
+                fontWeight = FontWeight.Black
             )
             Spacer(modifier = Modifier.width(2.dp))
             Text(

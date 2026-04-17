@@ -68,6 +68,7 @@ import com.jay.fxi.ui.components.BankIcon
 import com.jay.fxi.ui.theme.Background
 import com.jay.fxi.ui.theme.CardBackground
 import com.jay.fxi.ui.theme.InputBackground
+import com.jay.fxi.ui.theme.LocalRateLayoutMetrics
 import com.jay.fxi.ui.theme.NegativeColor
 import com.jay.fxi.ui.theme.PositiveColor
 import com.jay.fxi.ui.theme.Primary
@@ -527,14 +528,12 @@ private fun ConditionToggleButton(
     condition: AlertCondition,
     onClick: () -> Unit
 ) {
+    val metrics = LocalRateLayoutMetrics.current
     val conditionColor = when (condition) {
         AlertCondition.ABOVE -> PositiveColor
         AlertCondition.BELOW -> NegativeColor
     }
-    val symbol = when (condition) {
-        AlertCondition.ABOVE -> "△"
-        AlertCondition.BELOW -> "▽"
-    }
+    val symbol = condition.symbol
     val text = when (condition) {
         AlertCondition.ABOVE -> "이상"
         AlertCondition.BELOW -> "이하"
@@ -553,7 +552,8 @@ private fun ConditionToggleButton(
         Text(
             text = symbol,
             color = conditionColor,
-            fontSize = 20.sp
+            fontSize = metrics.alertConditionToggleFontSize,
+            fontWeight = FontWeight.Black
         )
         Text(
             text = text,

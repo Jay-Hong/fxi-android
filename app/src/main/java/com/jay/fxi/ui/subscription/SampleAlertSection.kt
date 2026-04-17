@@ -406,7 +406,8 @@ private fun SampleAlertRow(
             Text(
                 text = setting.conditionSymbol,
                 color = conditionColor,
-                fontSize = 14.sp
+                fontSize = metrics.alertConditionSymbolFontSize,
+                fontWeight = FontWeight.Black
             )
             Spacer(modifier = Modifier.width(2.dp))
             Text(

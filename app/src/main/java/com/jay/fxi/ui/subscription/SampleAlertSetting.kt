@@ -3,6 +3,7 @@ package com.jay.fxi.ui.subscription
 import com.jay.fxi.domain.model.AlertCondition
 import com.jay.fxi.domain.model.Bank
 import com.jay.fxi.domain.model.SupportedCurrency
+import com.jay.fxi.ui.alert.symbol
 import java.util.UUID
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
@@ -31,10 +32,7 @@ data class SampleAlertSetting(
 
     /** 조건 심볼 */
     val conditionSymbol: String
-        get() = when (condition) {
-            AlertCondition.ABOVE -> "△"
-            AlertCondition.BELOW -> "▽"
-        }
+        get() = condition.symbol
 
     /** 통화 한글명 */
     val currencyName: String

@@ -29,6 +29,7 @@ data class RateLayoutMetrics(
     val bankIconSize: Dp,
     val rateValueFontSize: TextUnit,
     val diffFontSize: TextUnit,
+    val directionFontSize: TextUnit,
     val timestampFontSize: TextUnit,
     val timestampWidth: Dp,
     val barTimestampSpacing: Dp,
@@ -51,7 +52,9 @@ data class RateLayoutMetrics(
 
     // MARK: - Alert Section
     val alertBankNameWidth: Dp,
-    val alertRowVerticalPadding: Dp
+    val alertRowVerticalPadding: Dp,
+    val alertConditionSymbolFontSize: TextUnit,
+    val alertConditionToggleFontSize: TextUnit
 ) {
     companion object {
         /** Phone 메트릭스 (< 600dp) - iOS regular/large 기준 */
@@ -65,6 +68,7 @@ data class RateLayoutMetrics(
             bankIconSize = 30.dp,
             rateValueFontSize = 17.sp,
             diffFontSize = 15.sp,
+            directionFontSize = 13.sp,
             timestampFontSize = 11.sp,
             timestampWidth = 46.dp,
             barTimestampSpacing = 6.dp,
@@ -87,7 +91,9 @@ data class RateLayoutMetrics(
 
             // Alert Section
             alertBankNameWidth = 80.dp,
-            alertRowVerticalPadding = 2.dp
+            alertRowVerticalPadding = 2.dp,
+            alertConditionSymbolFontSize = 11.sp,
+            alertConditionToggleFontSize = 14.sp
         )
 
         /** Tablet 메트릭스 (≥ 600dp) - SM-T505N 10.4" 테블릿 최적화 */
@@ -101,6 +107,7 @@ data class RateLayoutMetrics(
             bankIconSize = 34.dp,          // 아이콘 크기
             rateValueFontSize = 16.sp,     // 폰트 축소
             diffFontSize = 14.sp,          // 폰트 축소
+            directionFontSize = 12.sp,     // 화살표 전용 (Roboto ▲/▼ 글리프 시각 보정)
             timestampFontSize = 11.sp,     // 폰트 축소
             timestampWidth = 50.dp,        // 폰트 축소에 맞춤
             barTimestampSpacing = 8.dp,    // 간격
@@ -123,7 +130,9 @@ data class RateLayoutMetrics(
 
             // Alert Section
             alertBankNameWidth = 85.dp,    // 90 → 85: 폰트 축소에 맞춤
-            alertRowVerticalPadding = 1.dp
+            alertRowVerticalPadding = 1.dp,
+            alertConditionSymbolFontSize = 11.sp,
+            alertConditionToggleFontSize = 14.sp
         )
 
         /** Tablet 기준점 (600dp) */

@@ -225,7 +225,7 @@ fun RateBarView(
                     Text(
                         text = directionSymbol,
                         color = directionColor,
-                        fontSize = metrics.diffFontSize,
+                        fontSize = metrics.directionFontSize,
                         fontWeight = FontWeight.Bold
                     )
                 } else if (isReference) {
