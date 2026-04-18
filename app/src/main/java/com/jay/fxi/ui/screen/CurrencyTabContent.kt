@@ -164,13 +164,13 @@ fun CurrencyTabContent(
         rates.filter { it.currency == currency.code }
     }
 
-    // iOS v2.6 parity: follow-latest + 1d 기간에서 10초 주기 synthetic tick.
-    // broadcast가 뜸한 구간(주말/저변동)에도 graphPayload remember를 재평가시켜
-    // tailTimestamp(Clock.System.now()) 전진 → lastDataTs 전진 → 창 왼쪽 이동 보장.
-    // activePeriod 변경 시 LaunchedEffect가 자동 재기동 (기간 이탈은 early return).
+    // iOS v2.6 parity: follow + zoom + 1d 3조건 모두 true일 때만 10초 synthetic tick.
+    // isFollowActive는 RateGraphView에서 onFollowActiveChanged 콜백으로 전달받음.
+    // 상태 변경 시 LaunchedEffect가 자동 취소/재기동. 조건 이탈 시 tick 중단.
+    var isFollowActive by remember { mutableStateOf(false) }
     var followTick by remember { mutableStateOf(0) }
-    androidx.compose.runtime.LaunchedEffect(activePeriod) {
-        if (activePeriod != GraphPeriod.ONE_DAY) return@LaunchedEffect
+    androidx.compose.runtime.LaunchedEffect(isFollowActive) {
+        if (!isFollowActive) return@LaunchedEffect
         while (true) {
             kotlinx.coroutines.delay(10_000L)
             followTick = followTick.inc()
@@ -329,7 +329,8 @@ fun CurrencyTabContent(
                                 dxyGraphData = graphPayload.dxyGraphData,
                                 period = activePeriod,
                                 isLoading = isLoading,
-                                modifier = Modifier.fillMaxSize()
+                                modifier = Modifier.fillMaxSize(),
+                                onFollowActiveChanged = { isFollowActive = it }
                             )
                         }
 
@@ -529,7 +530,8 @@ fun CurrencyTabContent(
                                 isLoading = isLoading,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(top = metrics.sectionPadding, bottom = 12.dp)
+                                    .padding(top = metrics.sectionPadding, bottom = 12.dp),
+                                onFollowActiveChanged = { isFollowActive = it }
                             )
 
                             Spacer(modifier = Modifier.height(8.dp))

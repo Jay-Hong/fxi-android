@@ -77,7 +77,13 @@ fun RateGraphView(
     period: GraphPeriod,
     isLoading: Boolean,
     modifier: Modifier = Modifier,
-    metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
+    metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current,
+    /**
+     * iOS v2.6 parity gating. follow-latest + zoom + 1d가 모두 true인 구간에서만 true로 전달.
+     * 상위에서 이 신호를 받아 10초 synthetic tick을 gating하여 불필요한 recomposition 방지.
+     * null이면 아무 동작 없음 (기본 호출부는 무시 가능 — 예: LockedPreviewScreen).
+     */
+    onFollowActiveChanged: ((Boolean) -> Unit)? = null
 ) {
     Box(
         modifier = modifier.height(metrics.graphHeight),
@@ -241,6 +247,16 @@ private fun RateGraphCanvas(
         mutableStateOf<ClosedRange<Long>?>(null)
     }
     var pocIsFollowingLatest by rememberSaveable(period) { mutableStateOf(true) }
+
+    // iOS v2.6 parity: follow + zoom + 1d 3조건 모두 충족 시에만 상위에 "follow 활성" 신호.
+    // 상위(CurrencyTabContent)가 이 값을 gating하여 10초 synthetic tick을 돌릴지 결정.
+    // 이전엔 상위가 period == 1d만 보고 tick을 돌려 불필요한 invalidation이 컸음.
+    val isFollowActive = pocIsFollowingLatest &&
+        pocVisibleDomain != null &&
+        period == GraphPeriod.ONE_DAY
+    LaunchedEffect(isFollowActive) {
+        onFollowActiveChanged?.invoke(isFollowActive)
+    }
 
     // M2: Gesture baseline (iOS pocHandlePinch/PanBegan 등가)
     // pinch: began에서 한 번 캡처 + changed에서 finger-centered 계산용

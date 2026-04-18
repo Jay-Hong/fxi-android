@@ -496,8 +496,11 @@ data class IndicesPayload(
 // 없으면 graphViewModel.latestDxyRate() (graph bucket close) fallback.
 
 // follow-latest 10초 synthetic tick (iOS v2.6 parity, 2026-04-19 추가):
-//  - CurrencyTabContent에 followTick: Int @State + LaunchedEffect(activePeriod)로 10초 delay 루프
-//  - 1d 기간에서만 tick 동작, graphPayload remember 키에 포함
+//  - RateGraphView 내부 계산: isFollowActive = pocIsFollowingLatest && pocVisibleDomain != null && period == ONE_DAY
+//  - 상태 변경 시 RateGraphView가 onFollowActiveChanged 콜백으로 상위(CurrencyTabContent)에 전달
+//  - CurrencyTabContent가 isFollowActive를 @State로 보관, LaunchedEffect(isFollowActive) 10초 delay 루프
+//    조건 이탈 시 자동 취소 (불필요한 recomposition 방지, iOS .task(id:) gating과 등가)
+//  - followTick이 graphPayload remember 키에 포함 → buildGraphPayload 재평가 유도
 //  - buildGraphPayload의 tailTimestamp는 Clock.System.now() 기반 (이전엔 max rate timestamp)
 //  - 효과: broadcast 없는 주말/저변동 구간에도 창이 끊김 없이 왼쪽으로 이동 (10초 step 갱신)
 //  - 상세: ../ios/GRAPH_ZOOM_DESIGN.md v2.6 참조
