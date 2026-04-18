@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.jay.fxi.data.local.CacheService
 import com.jay.fxi.data.remote.WebSocketService
+import com.jay.fxi.data.remote.dto.DxyLiveTick
+import com.jay.fxi.data.remote.dto.IndicesPayload
 import com.jay.fxi.domain.model.AppState
 import com.jay.fxi.domain.model.ConnectionState
 import com.jay.fxi.domain.model.ExchangeRate
@@ -41,6 +43,13 @@ class ExchangeRateViewModel @Inject constructor(
 
     private val _lastUpdated = MutableStateFlow<Instant?>(null)
     val lastUpdated: StateFlow<Instant?> = _lastUpdated.asStateFlow()
+
+    /**
+     * DXY live tick (WebSocket indices.dxy, 10초 realtime).
+     * null이면 graphCache fallback 사용. iOS dxyLive와 parity.
+     */
+    private val _dxyLive = MutableStateFlow<DxyLiveTick?>(null)
+    val dxyLive: StateFlow<DxyLiveTick?> = _dxyLive.asStateFlow()
 
     /**
      * 진행 중인 초기 로드 작업.
@@ -94,6 +103,7 @@ class ExchangeRateViewModel @Inject constructor(
         stop()
         _appState.value = AppState.Loading
         _lastUpdated.value = null
+        _dxyLive.value = null
     }
 
     /**
@@ -122,6 +132,9 @@ class ExchangeRateViewModel @Inject constructor(
     private fun setupWebSocketCallbacks() {
         webSocketService.onRatesReceived = { rates ->
             handleRatesReceived(rates)
+        }
+        webSocketService.onIndicesReceived = { indices ->
+            _dxyLive.value = indices?.dxy
         }
     }
 
@@ -184,5 +197,6 @@ class ExchangeRateViewModel @Inject constructor(
         initialLoadJob = null
         webSocketService.stop()
         webSocketService.onRatesReceived = null
+        webSocketService.onIndicesReceived = null
     }
 }

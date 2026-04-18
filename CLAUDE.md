@@ -402,25 +402,32 @@ Response: 204 No Content
 
 #### 메시지 타입
 
-**수신 - 환율 데이터 (10초마다):**
+**수신 - 환율 데이터 (10초마다, 변경 시에만):**
 ```json
 {
   "type": "rates",
   "data": {
     "rates": [...],
+    "indices": {
+      "dxy": {"rate": 99.234, "timestamp": "2026-04-18T09:07:45.189537+09:00", "source": "investing"}
+    },
     "metadata": {...}
   },
   "graph_buckets": {
     "usd-krw": {
       "investing": {"bucket_ts": 1733380800, "max": 1407.8, "min": 1407.2, "close": 1407.5},
       "kb": {...},
-      "hana": {...}
+      "hana": {...},
+      "dxy": {"bucket_ts": ..., "max": ..., "min": ..., "close": ...}
     }
   }
 }
 ```
 
 > **중요**: WebSocket graph_buckets는 **객체 형식** (REST는 배열)
+> **`data.indices.dxy`** (2026-04-19 추가): 10초 해상도 DXY live tick. `ExchangeRateViewModel.dxyLive: StateFlow<DxyLiveTick?>`에 매핑. Kotlinx Serialization `ignoreUnknownKeys = true`로 구 서버 응답과 양방향 호환.
+> **두 DXY 경로 분리**: `data.indices.dxy` = live(10초), `graph_buckets.usd-krw.dxy` = bucket close(1분 갱신). `CurrencyTabContent.buildGraphPayload`에서 `dxyLive?.rate ?: graphViewModel.latestDxyRate()` 우선순위.
+> **Broadcast 트리거**: 서버는 `rates` 또는 `indices.dxy` 변화 어느 쪽이든 발화 (`build_rates_payload()` 전체 JSON 비교).
 
 **수신 - Pong:**
 ```json
@@ -435,8 +442,10 @@ ping
 
 #### 연결 동작
 
-- **초기 연결 시**: 서버가 즉시 캐시된 환율 데이터 전송 (graph_buckets 미포함)
-- **10초 브로드캐스트**: 모든 클라이언트에 rates + graph_buckets 전송
+- **초기 연결 시**: 서버가 즉시 캐시된 환율 데이터 전송
+  - `data.rates` + `data.metadata` + `data.indices.dxy` 포함 (`build_rates_payload()` 기반 Redis 캐시)
+  - `graph_buckets`는 미포함 (브로드캐스트 append 시점에 합쳐지므로 Redis 캐시에 기록되지 않음)
+- **10초 브로드캐스트**: 변경 시에만 전송 — rates 또는 indices.dxy 변화 어느 쪽이든 발화 → `data.rates` + `data.indices.dxy` + `graph_buckets`
 - **Ping/Pong**: 연결 상태 확인용
 
 ---
@@ -466,6 +475,32 @@ data class ExchangeRate(
         "$sign${String.format("%.2f", it)}"
     }
 }
+
+// DXY live tick (WebSocket indices.dxy, 10초 realtime, iOS DxyLiveTick parity)
+@Serializable
+data class DxyLiveTick(
+    val rate: Double,
+    @Serializable(with = InstantSerializer::class)
+    val timestamp: Instant,
+    val source: String   // "investing" | "yahoo"
+)
+
+@Serializable
+data class IndicesPayload(
+    val dxy: DxyLiveTick? = null
+)
+
+// ExchangeRateViewModel가 `dxyLive: StateFlow<DxyLiveTick?>` 보유.
+// WebSocketService.onIndicesReceived 콜백이 갱신. reset() 시 null 초기화.
+// 그래프 렌더 시 CurrencyTabContent.buildGraphPayload에서 dxyLive?.rate 우선,
+// 없으면 graphViewModel.latestDxyRate() (graph bucket close) fallback.
+
+// follow-latest 10초 synthetic tick (iOS v2.6 parity, 2026-04-19 추가):
+//  - CurrencyTabContent에 followTick: Int @State + LaunchedEffect(activePeriod)로 10초 delay 루프
+//  - 1d 기간에서만 tick 동작, graphPayload remember 키에 포함
+//  - buildGraphPayload의 tailTimestamp는 Clock.System.now() 기반 (이전엔 max rate timestamp)
+//  - 효과: broadcast 없는 주말/저변동 구간에도 창이 끊김 없이 왼쪽으로 이동 (10초 step 갱신)
+//  - 상세: ../ios/GRAPH_ZOOM_DESIGN.md v2.6 참조
 
 // 그래프 버킷
 @Serializable

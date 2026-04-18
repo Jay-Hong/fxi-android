@@ -83,6 +83,7 @@ fun MainScreen(
     val appState by exchangeRateViewModel.appState.collectAsStateWithLifecycle()
     val connectionState by exchangeRateViewModel.connectionState.collectAsStateWithLifecycle()
     val lastUpdated by exchangeRateViewModel.lastUpdated.collectAsStateWithLifecycle()
+    val dxyLive by exchangeRateViewModel.dxyLive.collectAsStateWithLifecycle()
     val activeCurrency by graphViewModel.activeCurrency.collectAsStateWithLifecycle()
     val authState by authViewModel.authState.collectAsStateWithLifecycle()
 
@@ -295,7 +296,8 @@ fun MainScreen(
                             alertViewModel = alertViewModel,
                             bankPreferenceViewModel = bankPreferenceViewModel,
                             isPremium = isPremium,
-                            lastUpdated = lastUpdated
+                            lastUpdated = lastUpdated,
+                            dxyLive = dxyLive
                         )
                     }
                     is AppState.Offline -> {
@@ -308,7 +310,8 @@ fun MainScreen(
                                 alertViewModel = alertViewModel,
                                 bankPreferenceViewModel = bankPreferenceViewModel,
                                 isPremium = isPremium,
-                                lastUpdated = lastUpdated
+                                lastUpdated = lastUpdated,
+                                dxyLive = dxyLive
                             )
                         } else {
                             ErrorView(message = "캐시된 데이터가 없습니다")

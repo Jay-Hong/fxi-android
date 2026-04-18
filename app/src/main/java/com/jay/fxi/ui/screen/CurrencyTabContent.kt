@@ -101,7 +101,9 @@ fun CurrencyTabContent(
     alertViewModel: AlertViewModel,
     bankPreferenceViewModel: BankPreferenceViewModel,
     isPremium: Boolean,
-    lastUpdated: Instant? = null
+    lastUpdated: Instant? = null,
+    /** WebSocket indices.dxy (10초 live). null이면 graphCache fallback. iOS dxyLive parity. */
+    dxyLive: com.jay.fxi.data.remote.dto.DxyLiveTick? = null
 ) {
     val alertState by alertViewModel.state.collectAsStateWithLifecycle()
     val hasPermission by alertViewModel.hasNotificationPermission.collectAsStateWithLifecycle()
@@ -162,6 +164,19 @@ fun CurrencyTabContent(
         rates.filter { it.currency == currency.code }
     }
 
+    // iOS v2.6 parity: follow-latest + 1d 기간에서 10초 주기 synthetic tick.
+    // broadcast가 뜸한 구간(주말/저변동)에도 graphPayload remember를 재평가시켜
+    // tailTimestamp(Clock.System.now()) 전진 → lastDataTs 전진 → 창 왼쪽 이동 보장.
+    // activePeriod 변경 시 LaunchedEffect가 자동 재기동 (기간 이탈은 early return).
+    var followTick by remember { mutableStateOf(0) }
+    androidx.compose.runtime.LaunchedEffect(activePeriod) {
+        if (activePeriod != GraphPeriod.ONE_DAY) return@LaunchedEffect
+        while (true) {
+            kotlinx.coroutines.delay(10_000L)
+            followTick = followTick.inc()
+        }
+    }
+
     val ratesDisplayState = remember(filteredRates, currency, bankDisplayConfig) {
         filteredRates.displayState(currency, bankDisplayConfig)
     }
@@ -202,7 +217,9 @@ fun CurrencyTabContent(
         selectedSources,
         activePeriod,
         dxyVisible,
-        graphVersion
+        graphVersion,
+        dxyLive,
+        followTick
     ) {
         buildGraphPayload(
             rawGraphData = rawGraphData,
@@ -211,7 +228,8 @@ fun CurrencyTabContent(
             selectedSources = selectedSources,
             activePeriod = activePeriod,
             dxyVisible = dxyVisible,
-            latestDxyRate = graphViewModel.latestDxyRate(),
+            // iOS parity: live tick(10초) 우선, 없으면 graphCache 마지막 버킷 close (1분 stale) fallback.
+            latestDxyRate = dxyLive?.rate ?: graphViewModel.latestDxyRate(),
             hasFreshPeriodCache = graphViewModel.isPeriodGraphFresh(currency, activePeriod)
         )
     }
@@ -805,8 +823,10 @@ private fun buildGraphPayload(
     latestDxyRate: Double?,
     hasFreshPeriodCache: Boolean
 ): GraphPayload {
-    val tailTimestamp = filteredRates.maxOfOrNull { it.timestamp.epochSeconds.toInt() }
-        ?: Clock.System.now().epochSeconds.toInt()
+    // iOS v2.6 parity: live tail x축 위치는 항상 "현재 시각"(Clock.System.now()).
+    // 이전에는 max(filteredRates.timestamp)를 써서 rates 정체 시 tail도 정지 → freeze.
+    // 이제 broadcast 유무와 무관하게 현재 시각으로 전진 (재렌더 트리거는 followTick 담당).
+    val tailTimestamp = Clock.System.now().epochSeconds.toInt()
 
     val rateGraphData = rawGraphData
         .filterKeys { it != GraphSource.DXY }

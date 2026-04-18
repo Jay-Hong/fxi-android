@@ -3,6 +3,8 @@ package com.jay.fxi.data.remote.dto
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.GraphBucket
 import com.jay.fxi.domain.model.RatesMetadata
+import com.jay.fxi.util.InstantSerializer
+import kotlinx.datetime.Instant
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -42,7 +44,29 @@ data class WebSocketRatesMessage(
 @Serializable
 data class RatesData(
     val rates: List<ExchangeRate>,
-    val metadata: RatesMetadata
+    val metadata: RatesMetadata,
+    /** WebSocket 전용, REST 응답에는 없음. 구 서버 응답에도 부재 가능해 optional. */
+    val indices: IndicesPayload? = null
+)
+
+/**
+ * WebSocket payload의 indices 섹션 (현재는 dxy만).
+ */
+@Serializable
+data class IndicesPayload(
+    val dxy: DxyLiveTick? = null
+)
+
+/**
+ * DXY realtime tick (investing 우선, yahoo 폴백).
+ * 10초 해상도 live 값. 기존 graph_buckets.dxy(분당 갱신)와 경로 분리.
+ */
+@Serializable
+data class DxyLiveTick(
+    val rate: Double,
+    @Serializable(with = InstantSerializer::class)
+    val timestamp: Instant,
+    val source: String   // "investing" | "yahoo"
 )
 
 /**

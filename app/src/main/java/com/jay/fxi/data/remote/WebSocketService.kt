@@ -5,6 +5,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.jay.fxi.data.network.NetworkMonitor
+import com.jay.fxi.data.remote.dto.IndicesPayload
 import com.jay.fxi.data.remote.dto.WebSocketGraphBuckets
 import com.jay.fxi.data.remote.dto.WebSocketMessageType
 import com.jay.fxi.data.remote.dto.WebSocketPing
@@ -100,6 +101,7 @@ class WebSocketService @Inject constructor(
 
     var onRatesReceived: ((List<ExchangeRate>) -> Unit)? = null
     var onGraphBucketsReceived: ((WebSocketGraphBuckets) -> Unit)? = null
+    var onIndicesReceived: ((IndicesPayload?) -> Unit)? = null
 
     init {
         // 앱 라이프사이클 관찰
@@ -308,6 +310,7 @@ class WebSocketService @Inject constructor(
                     kotlinx.coroutines.withContext(Dispatchers.Main) {
                         message.data?.let { data ->
                             onRatesReceived?.invoke(data.rates)
+                            onIndicesReceived?.invoke(data.indices)
                         }
                         message.graphBuckets?.let { buckets ->
                             onGraphBucketsReceived?.invoke(buckets)
