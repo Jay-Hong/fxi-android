@@ -1,10 +1,10 @@
-# Android 그래프 줌/팬 — iOS v2.5 parity 포팅 로드맵 v2.0 (Android)
+# Android 그래프 줌/팬 — iOS v2.6 parity 포팅 로드맵 v2.1 (Android)
 
-> **상태**: 계획 확정 (2026-04-14) — PoC v1.0 baseline 커밋 직후
+> **상태**: v2.5 핵심 M1~M5 포팅 완료(2026-04-14) → v2.6 확장(DXY live + followTick) Option A bridge로 반영 완료(2026-04-19).
 > **플랫폼**: Android (Jetpack Compose Canvas 자체 구현).
-> **크로스 플랫폼 기준**: iOS v2.5 (`../ios/GRAPH_ZOOM_DESIGN.md`) 완전 parity 목표.
-> **스코프**: [app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt](app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt) (본화면 + 예시화면 공용 composable)
-> **이전 문서**: v1.0은 2026-04-11 Android 단독 설계 초안. PoC 구현이 baseline으로 커밋된 시점(`8a53808`)에 **본 문서가 이를 대체**.
+> **크로스 플랫폼 기준**: iOS v2.6 (`../ios/GRAPH_ZOOM_DESIGN.md`) — 기능 + gating semantics parity. 구조는 Option A callback bridge (§4.6).
+> **스코프**: [app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt](app/src/main/java/com/jay/fxi/ui/components/RateGraphView.kt) (본화면 + 예시화면 공용 composable), [CurrencyTabContent.kt](app/src/main/java/com/jay/fxi/ui/screen/CurrencyTabContent.kt) (tick state + payload).
+> **이전 문서**: v1.0은 2026-04-11 Android 단독 설계 초안. PoC 구현이 baseline으로 커밋된 시점(`8a53808`)에 **v2.0 문서가 이를 대체**. v2.1은 iOS v2.6 parity 확장을 반영.
 
 ---
 
@@ -13,7 +13,8 @@
 | 버전 | 시점 | 내용 |
 |---|---|---|
 | v1.0 | 2026-04-11 | Android 단독 설계 초안 (Android 고유 목표 + "모든 기간 인터랙션") |
-| **v2.0** | **2026-04-14** | **iOS v2.5 parity 로드맵으로 전면 개편.** 1d only 원칙 확정. M1~M5 마일스톤 정의. PoC v1 baseline은 커밋 `8a53808`로 고정. |
+| v2.0 | 2026-04-14 | iOS v2.5 parity 로드맵으로 전면 개편. 1d only 원칙 확정. M1~M5 마일스톤 정의. PoC v1 baseline은 커밋 `8a53808`로 고정. |
+| **v2.1** | **2026-04-19** | **iOS v2.6 parity 확장 반영.** 서버 `data.indices.dxy` 수신 경로 추가(WebSocket DTO/Service/ViewModel/UI wiring) + follow-latest `followTick` synthetic tick 도입(Option A callback bridge). 기능+gating semantics parity 달성, 구조 통일은 Option B로 후속 유보. §4.6 참조. |
 
 ---
 
@@ -21,11 +22,15 @@
 
 ### 목표
 
-- **iOS v2.5 완전 기능 parity** — 양 플랫폼 사용자가 같은 UX 경험
-- **1d period 한정** 인터랙션 (핀치/팬/더블탭/follow-latest)
+- **iOS v2.6 기능 + gating semantics parity** — 양 플랫폼 사용자가 같은 UX 경험 (v2.5 핵심 M1~M5 + v2.6 DXY live/followTick 확장)
+- **1d period 한정** 인터랙션 (핀치/팬/더블탭/follow-latest/followTick)
 - Android 공용 composable 구조 활용 — 본화면 + LockedPreviewScreen 동시 반영 (iOS의 `SampleGraphView` 복제 불필요)
 - HorizontalPager와 제스처 공존 (iOS의 `TabView(.page)` 등가 문제 해결)
 - Canvas 수동 렌더링의 장점 활용 — iOS Swift Charts의 일부 고유 이슈(chartXScale 자동 보간, identity diff) 회피
+
+### 구조 parity는 명시적 trade-off
+
+iOS는 follow 상태 + synthetic tick + live tail 생성이 모두 `RateGraphView.swift`에 co-located. Android는 live tail 생성이 `CurrencyTabContent.kt`의 `buildGraphPayload()`에 있어 **callback bridge를 두어야 같은 gating semantics 달성**(Option A). 구조 통일(Option B)은 live tail 생성을 RateGraphView로 이동하는 추가 리팩토링이 필요해 비용 대비 가치 불균형으로 **후속 과제로 유보**. §4.6에서 현재 결정 명시.
 
 ### 비목표 (parity 후보)
 
@@ -72,29 +77,34 @@ iOS v2.5가 1d만 줌 활성인 이유는 Swift Charts의 제약에서 파생된
 
 ---
 
-## 3. iOS v2.5 ↔ Android v1 gap (기능 매핑)
+## 3. iOS v2.5/v2.6 ↔ Android gap (기능 매핑)
 
-| 기능 | iOS v2.5 | Android v1 | 포팅 필요 | 플랫폼 차이 |
+> 2026-04-19 기준. "v1" 표기는 본 문서 작성 당시 baseline. "현재" 표기는 v2.1 문서 갱신 시점 반영.
+
+| 기능 | iOS 기준 | Android v1 | Android 현재 | 플랫폼 차이 |
 |---|---|---|---|---|
-| 2-finger pinch | finger-centered | right-edge anchor | 개선 | centroid 기반 |
-| 1-finger pan (zoomed only) | ✅ | ❌ | 필요 | Pager 공존 체크 |
-| 더블탭 줌 토글 (6h + reset) | ✅ | ❌ | 필요 | - |
-| plot bounds guard | `plot.contains` | ❌ | 필요 | Canvas size 기반 |
-| Follow-latest | 명시 flag + resolved domain | 암시적 (항상) | 명시화 | pan 추가 후 필요 |
-| Adaptive xTicks | 1h/3h | 1d 고정 3h | 필요 | - |
-| **30분 보조 grid (v2.4)** | 점선 dashed | ❌ | 필요 | `PathEffect.dashPathEffect` |
-| **Gesture y-lock (v2.3)** | ✅ | ❌ | 필요 | - |
-| Rate 전체 렌더 + clipping | v2.3에서 추가 | **v1부터 존재** | - | **Canvas 자연 속성** |
-| DXY visible-only 정규화 | ✅ | ✅ | - | - |
-| **DXY 경계 보간 (v2.3)** | ✅ | ❌ | 필요 (보수적) | - |
-| **DXY 라벨 0개 fallback** | ✅ | inset 기반 fallback 필요 | 필요 | - |
-| **더블탭 애니메이션 (v2.5)** | 타협형 (X/Y 시차) | ❌ | 실험 | `Animatable` + coroutine |
-| **Fullscreen 정책 (v2.2)** | wrapper 더블탭 제거 | 미정 | 필요 | `CurrencyTabContent.kt` |
-| HorizontalPager 충돌 | N/A | 2+ pointer consume | - | 이미 해결 |
+| 2-finger pinch | v2.5 finger-centered | right-edge anchor | ✅ 완료 | centroid 기반 |
+| 1-finger pan (zoomed only) | v2.5 ✅ | ❌ | ✅ 완료 | Pager 공존 해결 |
+| 더블탭 줌 토글 (6h + reset) | v2.5 ✅ | ❌ | ✅ 완료 | - |
+| plot bounds guard | v2.5 `plot.contains` | ❌ | ✅ 완료 | Canvas size 기반 |
+| Follow-latest | v2.5 명시 flag + resolved domain | 암시적 (항상) | ✅ 완료 (명시 flag) | pan 추가 후 명시화 |
+| Adaptive xTicks | v2.5 1h/3h | 1d 고정 3h | ✅ 완료 | - |
+| 30분 보조 grid | v2.4 점선 dashed | ❌ | ✅ 완료 | `PathEffect.dashPathEffect` |
+| Gesture y-lock | v2.3 ✅ | ❌ | ✅ 완료 | - |
+| Rate 전체 렌더 + clipping | v2.3 | **v1부터 존재** | - | **Canvas 자연 속성** |
+| DXY visible-only 정규화 | v2.3 ✅ | ✅ | - | - |
+| DXY 경계 보간 | v2.3 ✅ | ❌ | ✅ 완료 (보수적) | - |
+| DXY 라벨 0개 fallback | v2.3 ✅ | inset 기반 fallback | ✅ 완료 | - |
+| 더블탭 애니메이션 | v2.5 타협형 (X/Y 시차) | ❌ | ✅ 완료 | `Animatable` + coroutine |
+| Fullscreen 정책 | v2.2 wrapper 더블탭 제거 | 미정 | ✅ 완료 | `CurrencyTabContent.kt` |
+| HorizontalPager 충돌 | N/A | 2+ pointer consume | ✅ 완료 (M2) | 이미 해결 |
+| **DXY live tick (indices.dxy)** | **v2.6 `dxyLive` @Observable** | **❌** | **✅ 완료 (v2.1 문서)** | **Kotlinx StateFlow + Serialization (ignoreUnknownKeys)** |
+| **followTick synthetic tick** | **v2.6 `.task(id:)` in RateGraphView** | **❌** | **✅ 완료 (Option A bridge)** | **RateGraphView → callback → CurrencyTabContent `LaunchedEffect`** |
+| **tailTimestamp 세멘틱** | **v2.6 `nowTs = Date()`** | `max(rate.timestamp)` | **✅ 완료 — `Clock.System.now()`** | 이전 max(data) 대비 broadcast 무관 전진 |
 
 ---
 
-## 4. 포팅 마일스톤 (M1~M5)
+## 4. 포팅 마일스톤 (M1~M5 + v2.6 parity 확장 §4.6)
 
 ### M1 — 문서 정렬 + 상태 모델 전환 + `computeChartState` 정리 (완료)
 
@@ -362,6 +372,54 @@ M5 완료 후 실기기 사용 피드백으로 발견된 기능/성능 이슈 9�
 - 8번: 회전 시 REST `/api/rates` 재호출 0회 (WebSocket stream 유효 유지)
 - 9번: Sample 그래프 섹션 더블탭 = 탭 위치 중심 6h zoom (toggle) / fullscreen 진입·종료 아이콘 정상 / Sample rates 섹션 더블탭 fullscreen 진입·종료 유지 (Live와 parity)
 - 회귀: M2/M3/M4/M5 기존 기능 모두 정상
+
+### 4.6 — v2.6 parity 확장: DXY live tick + followTick synthetic tick (완료, 2026-04-19)
+
+**범위**: iOS v2.6에서 추가된 두 축을 Android에 포팅.
+
+1. **DXY live tick** (`data.indices.dxy` 10초 WebSocket live)
+2. **followTick synthetic tick** (broadcast 뜸한 구간의 창 이동 보장)
+
+#### 4.6.1 DXY live tick 경로
+
+기존 Android는 DXY 그래프 끝점을 `graphViewModel.latestDxyRate()`(graph cache 마지막 bucket close, 1분 stale)에서만 가져왔음 → iOS v2.6과 비대칭. 이번 파이프라인을 추가:
+
+- **DTO**: `WebSocketMessage.kt`의 `RatesData`에 `indices: IndicesPayload? = null` 필드 추가. `IndicesPayload { dxy: DxyLiveTick? }`, `DxyLiveTick { rate, timestamp: Instant, source }` 신규. `@Serializable` + `ignoreUnknownKeys = true`로 구 서버 응답 양방향 호환.
+- **WebSocketService**: `onIndicesReceived: ((IndicesPayload?) -> Unit)?` 콜백 추가, `parseMessage`에서 `onRatesReceived` 직후 invoke.
+- **ExchangeRateViewModel**: `dxyLive: StateFlow<DxyLiveTick?>` 신규. `reset()`/`onCleared()`에서 null 초기화 + 콜백 null-out.
+- **UI wiring**: `MainScreen.kt`에서 `collectAsStateWithLifecycle` → `CurrencyTabContent`에 전달. `buildGraphPayload`의 `latestDxyRate = dxyLive?.rate ?: graphViewModel.latestDxyRate()`로 live-first fallback.
+
+#### 4.6.2 followTick synthetic tick (Option A callback bridge)
+
+**왜 필요한가**: Android도 `lastDataTs`가 그래프 데이터에서 계산되고 follow-latest anchor로 쓰이므로, broadcast 뜸한 구간(주말/저변동)에 `buildGraphPayload`가 재평가되지 않아 창이 freeze될 수 있음 (iOS v2.6 이전과 같은 구조적 한계).
+
+**동작**:
+
+- `RateGraphView` 내부에서 `isFollowActive = pocIsFollowingLatest && pocVisibleDomain != null && period == ONE_DAY` 계산. `LaunchedEffect(isFollowActive)`로 상위에 전달.
+- 상위 `CurrencyTabContent`가 `onFollowActiveChanged` 콜백으로 수신, `@State isFollowActive`에 저장. `LaunchedEffect(isFollowActive)`에서 조건 true일 때만 10초 `delay` 루프로 `followTick &+= 1`.
+- `graphPayload` remember key에 `followTick` + `dxyLive` 포함 → 재평가 유도.
+- `buildGraphPayload`의 `tailTimestamp`를 `max(filteredRates.timestamp)` → `Clock.System.now().epochSeconds.toInt()`로 변경 (iOS `nowTs` 세멘틱). 이전 세멘틱에서는 followTick 단독으로는 `appendLiveTail`의 `tailTimestamp > lastBucket.bucketTs` 조건 실패하여 무력이었음.
+
+#### 4.6.3 Option A 채택 근거 + Option B 후속 유보
+
+**구조 gap**: iOS는 follow 상태 + synthetic tick + live tail 생성이 모두 `RateGraphView.swift`에 co-located. Android는 `buildGraphPayload`가 `CurrencyTabContent.kt`에 있어 follow 상태와 물리적으로 분리.
+
+| 대안 | 방식 | 평가 |
+|---|---|---|
+| **Option A (채택)** | RateGraphView → callback bridge → CurrencyTabContent `LaunchedEffect` | 작은 차분. 기능 + gating parity 달성. 구조 통일은 X |
+| Option B (유보) | `buildGraphPayload` 로직을 RateGraphView 내부로 이동 | 큰 리팩토링. 구조 통일까지 달성. 비용 대비 가치 불균형 |
+| Option C (기각) | 현 상태 유지 + 문서로 parity 인정 | "기능은 됨" 수준. "깔끔한 parity" 표현과 괴리 |
+
+**결과**: Option A로 기능·gating parity 달성. Option B는 **"남은 부채"**로 본 문서에 기록(§9 post-parity 후보와 연동).
+
+#### 4.6.4 하위 호환성
+
+서버는 이미 `indices.dxy` 전송 중이나 Android 구 버전 앱은 Kotlinx Serialization `Json { ignoreUnknownKeys = true }`로 해당 필드를 무시하고 정상 동작 중. 따라서 이번 패치 배포 순서 리스크 0 (서버 선배포 완료 상태에서 앱만 출시하면 됨).
+
+#### 4.6.5 커밋
+
+- `964122e` feat(android): DXY live tick (indices.dxy) + follow-latest 10초 synthetic tick — iOS parity
+- `f37b94b` refactor(android): followTick gating을 iOS v2.6 수준으로 정밀화 (Option A callback bridge)
 
 ---
 
