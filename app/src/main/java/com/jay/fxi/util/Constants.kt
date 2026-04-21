@@ -31,6 +31,12 @@ object GraphConfig {
     const val REFRESH_INTERVAL_SEC = 300       // 5분마다 갭 체크
     const val FULL_FETCH_COOLDOWN_SEC = 120    // REST 풀 로드 최소 간격 (2분)
 
+    // Foreground resync (화면 off 후 복귀 시 stale 1d 그래프 복구)
+    const val BACKGROUND_RESYNC_THRESHOLD_MS = 60_000L    // 60초 이상 background 시 silent refresh
+    const val FOREGROUND_REFRESH_COOLDOWN_MS = 30_000L    // foreground refresh 전용 쿨다운
+    const val X_DOMAIN_ABNORMAL_SEC = 26L * 3600L         // 1d 그래프 x-domain이 26h 초과면 stale 판정
+    const val LAST_BUCKET_STALE_MS = 15L * 60L * 1000L    // 마지막 bucket 15분 이상 오래되면 stale
+
     fun gapThresholdSec(period: GraphPeriod): Int = when (period) {
         GraphPeriod.ONE_DAY -> 900
         GraphPeriod.ONE_WEEK -> 7_200

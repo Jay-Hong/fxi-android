@@ -132,17 +132,25 @@ fun MainScreen(
 
     // 라이프사이클 이벤트 처리: 캐시 저장 + 포그라운드 복귀 동기화
     // sawStop: 초기 attach 시 ON_RESUME 무시, ON_STOP 이후의 복귀만 처리
+    // backgroundEnteredAt: ON_STOP 시각 기록 → ON_RESUME에서 duration 계산하여 stale
+    // 1d 그래프 silent resync 트리거 (GraphViewModel.onForegroundResume).
     DisposableEffect(lifecycleOwner) {
         var sawStop = false
+        var backgroundEnteredAt: Long = 0L
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_STOP -> {
                     sawStop = true
+                    backgroundEnteredAt = System.currentTimeMillis()
                     graphViewModel.saveCache()
                 }
                 Lifecycle.Event.ON_RESUME -> {
                     if (sawStop) {
                         sawStop = false
+                        val duration = if (backgroundEnteredAt > 0L) {
+                            System.currentTimeMillis() - backgroundEnteredAt
+                        } else 0L
+                        graphViewModel.onForegroundResume(duration)
                         alertViewModel.refreshOnForeground()
                         newsViewModel.onForegroundResume(isPremium)
                     }

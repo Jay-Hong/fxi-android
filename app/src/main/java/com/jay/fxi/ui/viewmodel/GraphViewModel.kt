@@ -110,6 +110,12 @@ class GraphViewModel @Inject constructor(
     private val lastFullFetchTimeMap = mutableMapOf<String, Long>()
 
     /**
+     * Foreground 복귀 전용 쿨다운 (stale 1d 그래프 silent resync 용).
+     * 짧은 ON_STOP/ON_RESUME 연속 발생 시 중복 REST를 방어. stateMutex로 보호.
+     */
+    private var lastForegroundRefreshAt: Long = 0L
+
+    /**
      * 장기 구간 freshness
      * key = "{period}:{currency}"
      */
@@ -256,6 +262,65 @@ class GraphViewModel @Inject constructor(
             }
             cacheService.saveAllGraphData(snapshot)
         }
+    }
+
+    /**
+     * Foreground 복귀 시 stale 1d 그래프 silent resync.
+     *
+     * WebSocket graph_buckets는 마지막 bucket 1개만 보내므로, 화면 off 동안 놓친 이전
+     * bucket의 최종 close 값은 재연결만으로 복구되지 않는다. 이 API는 MainScreen의
+     * ON_RESUME에서 호출되어, 필요한 경우 REST로 전체 1d 그래프를 silent 재동기화한다.
+     *
+     * 조건 (1차 primary → 2차 cache-based 순):
+     *  1. backgroundDurationMs >= 60s  (cache 유무 무관)
+     *  2. (cache 존재 시) x-domain span > 26h OR 마지막 bucket 15분 이상 오래됨
+     *
+     * `fetchRealtimeGraphData(silent=true)`를 직접 호출해 로딩 UI 깜빡임을 피한다.
+     * `loadGraphForUserSelection()` / `loadRealtimeGraph()` 경로는 silent=false라 부적합.
+     */
+    fun onForegroundResume(backgroundDurationMs: Long) {
+        if (_activePeriod.value != GraphPeriod.ONE_DAY) return
+        viewModelScope.launch {
+            onForegroundResumeInternal(backgroundDurationMs)
+        }
+    }
+
+    private suspend fun onForegroundResumeInternal(backgroundDurationMs: Long) {
+        val duration = backgroundDurationMs.coerceAtLeast(0L)
+        val now = System.currentTimeMillis()
+
+        // foreground 전용 쿨다운 (짧은 ON_STOP/ON_RESUME 연속 방어)
+        val withinCooldown = stateMutex.withLock {
+            now - lastForegroundRefreshAt < GraphConfig.FOREGROUND_REFRESH_COOLDOWN_MS
+        }
+        if (withinCooldown) return
+
+        // 1차: duration 기반 primary 조건 (cache 유무와 무관)
+        var needsRefresh = duration >= GraphConfig.BACKGROUND_RESYNC_THRESHOLD_MS
+
+        // 2차: duration 미충족 시 cache-based 보조 검사
+        if (!needsRefresh) {
+            val currency = _activeCurrency.value.code
+            val allTs = cacheMutex.withLock {
+                graphCache[currency]?.values?.flatten()?.map { it.bucketTs.toLong() }
+            }
+            if (!allTs.isNullOrEmpty()) {
+                val maxTs = allTs.max()
+                val xSpanSec = (maxTs - allTs.min()).coerceAtLeast(0L)
+                val lastBucketAgeMs = ((now / 1000 - maxTs) * 1000).coerceAtLeast(0L)
+                if (xSpanSec > GraphConfig.X_DOMAIN_ABNORMAL_SEC ||
+                    lastBucketAgeMs > GraphConfig.LAST_BUCKET_STALE_MS) {
+                    needsRefresh = true
+                }
+            }
+        }
+
+        if (!needsRefresh) return
+
+        stateMutex.withLock {
+            lastForegroundRefreshAt = now
+        }
+        fetchRealtimeGraphData(_activeCurrency.value.code, silent = true)
     }
 
     // ============ Private Methods ============
