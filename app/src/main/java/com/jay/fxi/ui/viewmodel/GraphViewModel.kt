@@ -288,6 +288,8 @@ class GraphViewModel @Inject constructor(
     private suspend fun onForegroundResumeInternal(backgroundDurationMs: Long) {
         val duration = backgroundDurationMs.coerceAtLeast(0L)
         val now = System.currentTimeMillis()
+        // 시작 시점에 currency 캡처 — 검사와 fetch 간 탭 전환 race 방지.
+        val currency = _activeCurrency.value.code
 
         // foreground 전용 쿨다운 (짧은 ON_STOP/ON_RESUME 연속 방어)
         val withinCooldown = stateMutex.withLock {
@@ -300,7 +302,6 @@ class GraphViewModel @Inject constructor(
 
         // 2차: duration 미충족 시 cache-based 보조 검사
         if (!needsRefresh) {
-            val currency = _activeCurrency.value.code
             val allTs = cacheMutex.withLock {
                 graphCache[currency]?.values?.flatten()?.map { it.bucketTs.toLong() }
             }
@@ -320,7 +321,7 @@ class GraphViewModel @Inject constructor(
         stateMutex.withLock {
             lastForegroundRefreshAt = now
         }
-        fetchRealtimeGraphData(_activeCurrency.value.code, silent = true)
+        fetchRealtimeGraphData(currency, silent = true)
     }
 
     // ============ Private Methods ============
