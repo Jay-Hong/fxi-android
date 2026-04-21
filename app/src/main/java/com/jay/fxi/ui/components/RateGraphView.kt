@@ -121,7 +121,8 @@ fun RateGraphView(
                     dxyGraphData = dxyGraphData,
                     period = period,
                     verticalPadding = metrics.graphVerticalPadding,
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier.fillMaxSize(),
+                    onFollowActiveChanged = onFollowActiveChanged
                 )
             }
         }
@@ -218,7 +219,10 @@ private fun RateGraphCanvas(
     dxyGraphData: List<GraphBucket>,
     period: GraphPeriod,
     verticalPadding: androidx.compose.ui.unit.Dp,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /** public RateGraphView로부터 forwarding. 실제 follow state는 이 함수 내부에 있으므로
+     *  여기서 isFollowActive를 계산해 상위에 알림 (Option A bridge). f37b94b scope 오류 보정. */
+    onFollowActiveChanged: ((Boolean) -> Unit)? = null
 ) {
     val density = LocalDensity.current
     val textMeasurer = rememberTextMeasurer()
