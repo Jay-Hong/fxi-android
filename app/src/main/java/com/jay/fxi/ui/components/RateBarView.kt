@@ -277,13 +277,14 @@ fun RateBarView(
 
 /**
  * 바 너비 계산 (iOS 버전과 동일한 로직)
- * 환율 범위에 따라 바의 최소~최대 너비 비율 결정
+ * 환율 범위에 따라 바의 최소~최대 너비 비율 결정.
+ * displayRange 밖 값(robust 모드 outlier)은 [0, 1] clamp로 곡선 양 끝에 매달림.
  */
 private fun calculateBarWidth(rate: Double, minRate: Double, maxRate: Double): Float {
     val rateRange = maxRate - minRate
     if (rateRange == 0.0) return 0.75f
 
-    val normalized = ((rate - minRate) / rateRange).toFloat()
+    val normalized = ((rate - minRate) / rateRange).toFloat().coerceIn(0f, 1f)
 
     // iOS와 동일한 범위 (35%~80%)
     return when {

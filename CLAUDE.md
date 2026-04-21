@@ -18,7 +18,7 @@
 1. **실시간 환율 비교**: WebSocket으로 10초마다 업데이트
 2. **기간별 그래프**: 1일/1주/3달/1년 환율 추이 시각화
 3. **USD/KRW 달러지수(DXY) 그래프**: 달러 탭에서 환율과 함께 제공
-4. **은행별 비교 바 차트**: 순서/표시 커스터마이징, 동적 기준 환율 지원
+4. **은행별 비교 바 차트**: 순서/표시 커스터마이징, 동적 기준 환율 지원, 아웃라이어 완화 스케일
 5. **오프라인 지원**: 캐시된 데이터로 오프라인 동작
 6. **환율 알림**: 목표 환율 도달 시 푸시 알림 (1-shot 알림, 최대 30개)
 7. **뉴스**: 실시간 환율 뉴스 리스트 + 인앱 WebView 상세 (인증 불필요, 비구독자도 공개 기사 열람 가능)
@@ -145,6 +145,7 @@ app/
 │   │   │   │   ├── GraphPeriod.kt      # 기간 enum (1d/1w/3m/1y)
 │   │   │   │   ├── GraphSource.kt      # 소스 enum (+ REFERENCE, DXY)
 │   │   │   │   ├── BankPreference.kt   # BankDisplayConfig, RatesDisplayState
+│   │   │   │   ├── ScalePolicy.kt      # 바 차트 robust scale (IQR + Tukey fence)
 │   │   │   │   ├── Bank.kt
 │   │   │   │   ├── SupportedCurrency.kt
 │   │   │   │   ├── AlertSetting.kt
@@ -1566,27 +1567,54 @@ private suspend fun getAppleCredential(): AuthCredential {
 
 ## 바 너비 계산 로직
 
+### 스케일 정책 (domain/model/ScalePolicy.kt)
+
+아웃라이어 1개가 전체 스팬을 키워 나머지 은행들의 바 길이 구분을 눌러버리는 문제를 완화하기 위해 **robust display range**를 사용. iOS `Utils/ScalePolicy.swift`와 수학적으로 완전 동일.
+
+**활성화 조건 (순수 함수 `ScalePolicyCalculator.compute`)**:
+
+1. **Small-N fallback**: 가시 은행 수 `< DEFAULT_MIN_VISIBLE_FOR_ROBUST (=5)` → raw min/max 유지
+2. **IQR=0 엣지** (중앙 50%가 동일 호가): 중앙값 ± `fullSpan * 0.2` tolerance로 대체 처리 (raw로 clamp)
+3. **활성화 판정**: `fullSpan / IQR > DEFAULT_ACTIVATION_RATIO (=3.0)` 일 때 robust mode 진입
+4. **Tukey fence**: `fenceLow = Q1 - k·IQR`, `fenceHigh = Q3 + k·IQR` (k = `DEFAULT_FENCE_COEFFICIENT = 1.2`, 통계 관습 1.5보다 약간 엄격)
+5. **displayRange clamp**: `[max(rawMin, fenceLow), min(rawMax, fenceHigh)]`
+6. **Clip 확인**: `hasClippedRange = dispMin > rawMin || dispMax < rawMax` 일 때만 robust 유지. fence가 raw 범위 바깥이면 raw 폴백.
+
+**기준-스케일 분리**: 기준 은행(정렬 후 `orderedRates.firstOrNull()`)을 bulk에 강제 포함하지 않음. 기준이 outlier여도 막대 길이만 상대 조정되고 별도 마커는 표시하지 않음.
+
+**Hysteresis**: 현재 stateless 단일 임계. 실측 결과 경계 flapping 관찰 시 비대칭 threshold + 연속 tick 조건으로 확장 예정.
+
+### 바 너비 곡선 (RateBarView.calculateBarWidth)
+
 ```kotlin
 /**
- * 웹/iOS 버전과 동일한 바 너비 계산 로직
+ * 웹/iOS 버전과 동일한 바 너비 계산 로직.
+ * displayRange 밖 값(robust 모드 outlier)은 [0, 1] clamp로 곡선 양 끝에 매달림.
  */
 fun calculateBarWidth(rate: Double, minRate: Double, maxRate: Double): Float {
     val rateRange = maxRate - minRate
     if (rateRange == 0.0) return 0.75f
 
-    val normalized = (rate - minRate) / rateRange
+    val normalized = ((rate - minRate) / rateRange).toFloat().coerceIn(0f, 1f)
 
     return when {
-        rateRange >= 4 -> 0.35f + normalized.toFloat() * 0.45f   // 35% ~ 80%
-        rateRange >= 3 -> 0.40f + normalized.toFloat() * 0.40f   // 40% ~ 80%
-        rateRange >= 2 -> 0.45f + normalized.toFloat() * 0.35f   // 45% ~ 80%
-        rateRange >= 1 -> 0.50f + normalized.toFloat() * 0.30f   // 50% ~ 80%
-        rateRange >= 0.6 -> 0.55f + normalized.toFloat() * 0.25f // 55% ~ 80%
-        rateRange > 0.3 -> 0.60f + normalized.toFloat() * 0.18f  // 60% ~ 78%
-        else -> 0.65f + normalized.toFloat() * 0.12f             // 65% ~ 77%
+        rateRange >= 4 -> 0.35f + normalized * 0.45f   // 35% ~ 80%
+        rateRange >= 3 -> 0.40f + normalized * 0.40f   // 40% ~ 80%
+        rateRange >= 2 -> 0.45f + normalized * 0.35f   // 45% ~ 80%
+        rateRange >= 1 -> 0.50f + normalized * 0.30f   // 50% ~ 80%
+        rateRange >= 0.6 -> 0.55f + normalized * 0.25f // 55% ~ 80%
+        rateRange > 0.3 -> 0.60f + normalized * 0.18f  // 60% ~ 78%
+        else -> 0.65f + normalized * 0.12f             // 65% ~ 77%
     }
 }
 ```
+
+> `minRate`/`maxRate`는 `RatesDisplayState.range`(= `scale.displayRange`). robust 비활성 시 raw와 동일, 활성 시 clip된 bulk.
+
+### 테스트
+
+`app/src/test/java/com/jay/fxi/domain/model/ScalePolicyCalculatorTest.kt` — 5 케이스 회귀 방어:
+- small-N fallback, single high outlier, single low outlier, IQR=0 median tolerance, ratio 통과 but fence 바깥 (hasClippedRange=false)
 
 ---
 
