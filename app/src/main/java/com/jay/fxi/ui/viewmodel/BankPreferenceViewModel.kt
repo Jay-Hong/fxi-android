@@ -27,7 +27,11 @@ class BankPreferenceViewModel @Inject constructor(
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5_000),
-            initialValue = BankDisplayConfig(order = Bank.entries.toList())
+            initialValue = BankDisplayConfig(
+                order = bankPreferenceManager.orderedBanks.value.mapNotNull { item ->
+                    if (item.isVisible) item.bank else null
+                }
+            )
         )
 
     fun apply(items: List<BankPreferenceItem>) {

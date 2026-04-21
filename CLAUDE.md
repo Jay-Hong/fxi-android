@@ -2,7 +2,7 @@
 
 > **목적**: Android 앱 구현 가이드 (iOS MVP 기반)
 > **Phase**: 1 - Android App 개발
-> **최종 수정**: 2026-04-03
+> **최종 수정**: 2026-04-22
 
 ---
 
@@ -1562,6 +1562,22 @@ private suspend fun getAppleCredential(): AuthCredential {
 
 - Google Play Console에서 라이선스 테스트 계정 등록 필요
 - 테스트 구독은 빠르게 갱신됨 (월간 → 5분)
+
+---
+
+## 은행 순서 커스터마이징
+
+### 기본 표시 정책
+
+- **기본값**: 신규 설치/기본값 초기화 시 씨티은행은 숨김, 나머지 9개 visible
+- **사용자 토글**: `BankCustomizeSheet`에서 씨티은행을 토글로 다시 표시 가능
+- **기존 사용자 마이그레이션 없음**: `BankPreferenceItem`에 "의도적 설정 vs 과거 기본값" 구분 정보가 없어, 이미 저장된 사용자 설정은 존중
+
+### 구현 포인트
+
+- `BankPreferenceManager.defaultOrder`: `Bank.CITI`만 `isVisible = false`
+- `BankPreferenceManager.sanitize()` 누락 은행 복구: `defaultOrder` 기반으로 복구하여 손상/구버전 데이터에서도 정책 일관 유지
+- `BankPreferenceViewModel.displayConfig` `stateIn` 초기값: `Bank.entries` 전체가 아니라 현재 `orderedBanks.value`의 visible 목록 기반 (앱 cold start 초기 프레임에서 정책 일관 보장)
 
 ---
 

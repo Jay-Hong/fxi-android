@@ -115,9 +115,9 @@ class BankPreferenceManager @Inject constructor(
             BankPreferenceItem(bank = bank, isVisible = item.isVisible)
         }.toMutableList()
 
-        Bank.entries.forEach { bank ->
-            if (seen.add(bank.code)) {
-                sanitized += BankPreferenceItem(bank = bank, isVisible = true)
+        defaultOrder.forEach { defaultItem ->
+            if (seen.add(defaultItem.bankCode)) {
+                sanitized += defaultItem
             }
         }
 
@@ -130,7 +130,7 @@ class BankPreferenceManager @Inject constructor(
 
     companion object {
         val defaultOrder: List<BankPreferenceItem> = Bank.entries.map { bank ->
-            BankPreferenceItem(bank = bank, isVisible = true)
+            BankPreferenceItem(bank = bank, isVisible = bank != Bank.CITI)
         }
     }
 }
