@@ -3,6 +3,7 @@ package com.jay.fxi.di
 import com.google.android.gms.tasks.Tasks
 import com.google.firebase.auth.FirebaseAuth
 import com.jay.fxi.BuildConfig
+import com.jay.fxi.data.remote.ClientMetadataInterceptor
 import com.jay.fxi.data.remote.FXiApiService
 import com.jay.fxi.util.ApiConfig
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
@@ -55,6 +56,7 @@ object NetworkModule {
     @Singleton
     fun provideOkHttpClient(authInterceptor: Interceptor): OkHttpClient {
         return OkHttpClient.Builder()
+            .addInterceptor(ClientMetadataInterceptor())   // ADR-039 관측 헤더 (X-Client-*)
             .addInterceptor(authInterceptor)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)

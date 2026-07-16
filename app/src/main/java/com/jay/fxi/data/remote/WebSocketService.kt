@@ -78,6 +78,7 @@ class WebSocketService @Inject constructor(
 
     private var webSocket: WebSocket? = null
     private val client = OkHttpClient.Builder()
+        .addInterceptor(ClientMetadataInterceptor())   // ADR-039 관측 헤더 (WS handshake)
         .connectTimeout(WebSocketConfig.CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)  // WebSocket은 읽기 타임아웃 없음
         .writeTimeout(WebSocketConfig.CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
