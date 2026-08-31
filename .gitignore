@@ -12,7 +12,9 @@ local.properties
 .claude/
 
 # Firebase config (contains API keys)
-app/google-services.json
+# 실제 Firebase 설정과 GitHub Actions가 임시 생성하는 build-type fixture 모두 app 아래에서는 추적하지 않는다.
+# 커밋 가능한 비운영 정본은 ci/google-services.ci-fixture.json 하나뿐이다.
+app/**/google-services.json
 
 # Release keystore
 *.jks

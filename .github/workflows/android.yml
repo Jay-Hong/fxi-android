@@ -1,0 +1,92 @@
+name: Android CI
+
+# S0 — 이 리포의 첫 CI. hosted ubuntu-24.04 에서 JDK 17 을 명시 pin 한다.
+# tracked 파일에 host 절대경로(org.gradle.java.home 등)를 두지 않는 것이 전제이며,
+# clean checkout 에서 project-local 경로 수정 없이 아래 lane 이 모두 돌아야 한다.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+    paths-ignore: ['**.md']
+
+concurrency:
+  group: android-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # 계획 S0 DoD: hosted runner가 실제로 사용하는 Gradle/JVM을 evidence에 남긴다.
+      - name: Verify Gradle and JVM
+        run: ./gradlew --version
+
+      # production signing material 이 CI 에 새어 들어오지 않았음을, 그것을 쓸 수 있는
+      # 어떤 lane 보다 앞서 증명한다. (.gitignore 로 제외돼 있지만 규칙이 바뀌면 조용히 유입될 수 있다.)
+      # 위 --version 은 evidence 기록일 뿐 서명 산출물을 만들지 않는다.
+      - name: Assert no production signing material
+        run: |
+          for f in fxi-release.jks local.properties; do
+            if [ -e "$f" ]; then echo "::error::production 산출물이 CI checkout 에 존재: $f"; exit 1; fi
+          done
+          firebase_configs="$(find app -type f -name google-services.json -print)"
+          if [ -n "$firebase_configs" ]; then
+            echo "::error::Firebase 설정이 fixture 공급 전에 CI checkout 에 존재"
+            printf '%s\n' "$firebase_configs"
+            exit 1
+          fi
+
+      # Firebase 설정은 비운영 fixture 로 공급한다. 실제 project 자격이 아니며
+      # 컴파일·R8 검증에만 쓰인다(google-services 플러그인이 package_name 일치와
+      # oauth_client type 3 → R.string.default_web_client_id 생성을 요구한다).
+      # build-type 전용 경로만 사용하므로 release variant는 이 fixture를 볼 수 없다.
+      - name: Supply non-production google-services.json
+        run: |
+          mkdir -p app/src/debug app/src/ciMinified
+          cp ci/google-services.ci-fixture.json app/src/debug/google-services.json
+          cp ci/google-services.ci-fixture.json app/src/ciMinified/google-services.json
+
+      - name: Unit tests
+        run: ./gradlew testDebugUnitTest
+
+      - name: Lint
+        run: ./gradlew lintDebug
+
+      - name: Debug compile
+        run: ./gradlew assembleDebug
+
+      # 계획 S0 DoD 는 "기존 37 unit + 1 instrumented 테스트 무회귀" 를 요구한다.
+      # 실행에는 기기/에뮬레이터가 필요하므로 hosted lane 은 **컴파일 회귀**까지 책임진다
+      # (assembleDebug 는 androidTest 소스를 건드리지 않아 그대로 두면 조용히 썩는다).
+      - name: Instrumented test compile (no device execution)
+        run: ./gradlew assembleDebugAndroidTest
+
+      # R8 lane 을 S11 로 미루지 않는 이유: kotlinx-serialization + R8 은
+      # keep 규칙 누락으로 실제로 깨지는 조합이다(계획 §7 S0 각주).
+      # ciMinified 는 release 를 상속해 동일 minify 규칙을 태우되 debug 서명을 쓴다.
+      - name: R8 minified lane
+        run: ./gradlew assembleCiMinified
+
+      - name: Upload reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-ci-reports
+          path: |
+            app/build/reports/
+            app/build/test-results/
+          retention-days: 7
