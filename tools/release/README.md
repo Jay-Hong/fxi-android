@@ -44,9 +44,17 @@ the later evidence commit.
 
 ## Sealed S0-g baseline
 
-The durable device baseline is
-`evidence/android-v2/s0-g/release-admission/release-admission-31df3b9-r1/`,
+The current durable device baseline is
+`evidence/android-v2/s0-g/release-admission/release-admission-b477c22-r1/`,
 produced from clean source commit
-`31df3b94af5715cc19b2eb4fa6abfaf1180384f9`. It proves the exact four structural
-tests and the process-cold notification-intent OFF window; it does not arm a public
-artifact or broaden release authorization.
+`b477c22b597a1e5f5101e62cdd2b6a2cb8296c99`. The earlier
+`release-admission-31df3b9-r1` bundle remains historical evidence for the initial
+runner. The current baseline proves the exact four structural tests and the process-cold
+notification-intent OFF window; it does not arm a public artifact or broaden release
+authorization.
+
+Advancing `HEAD` with only the validated bundle and its documentation does not require
+another device run. Rerun when a later commit changes the bound runner, target/test source
+or build inputs, Firebase/admission fixture, or measurement/device contract. A
+validator-only change first revalidates the existing bundle; rerun only if the current
+validator cannot establish the required claims from that bundle.

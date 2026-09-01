@@ -131,14 +131,21 @@ Only a validated bundle's `run.json`, `preflight.json`, `postflight.json`, and
 commit. Raw UTP/instrumentation output must not be promoted because it can contain the ADB
 serial, device paths, and local absolute paths.
 
-The sealed S0-f launcher baseline is
-`evidence/android-v2/s0-f/launcher-smoke/launcher-smoke-8c18667-r2/`, produced from
-source commit `8c186678dd2e17ced4c7ea2249962cbdc8ee5be9`. The validator requires that
-recorded commit to exist, requires clean and identical source state at both ends, and
-re-hashes the bound runner/Firebase blobs from that commit. It deliberately does not
-require the recorded source commit to equal the current `HEAD`, because this separate
-evidence commit necessarily advances `HEAD`; reviewers must still confirm that the
-recorded commit is the intended implementation baseline.
+The current sealed S0-f launcher baseline is
+`evidence/android-v2/s0-f/launcher-smoke/launcher-smoke-b477c22-r1/`, produced from
+source commit `b477c22b597a1e5f5101e62cdd2b6a2cb8296c99`. The earlier
+`launcher-smoke-8c18667-r2` bundle remains historical evidence for the initial runner.
+The validator requires that recorded commit to exist, requires clean and identical source
+state at both ends, and re-hashes the bound runner/Firebase blobs from that commit. It
+deliberately does not require the recorded source commit to equal the current `HEAD`,
+because this separate evidence commit necessarily advances `HEAD`; reviewers must still
+confirm that the recorded commit is the intended implementation baseline.
+
+Advancing `HEAD` with only the validated bundle and its documentation does not require
+another device run. Rerun when a later commit changes the bound runner, target/test source
+or build inputs, Firebase fixture, or measurement/device contract. A validator-only change
+first revalidates the existing bundle; rerun only if the current validator cannot establish
+the required claims from that bundle.
 
 Promotion is allowed only when the checked-in validator says so. It requires
 `verdict=pass`, `exitCode=0`, the same clean source commit at both ends, byte-identical

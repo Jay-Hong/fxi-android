@@ -2,28 +2,29 @@
 
 ```
 Status                        : **SCOPE-FROZEN (2026-08-31)** — 범위·D-결정·슬라이스 경계·게이트 확정. 활성 미결정은 O1(비차단) 하나
-동결 source baseline       : exchange-rate `2cb6624` · ios `a36682f` · android `676f320` (채집 당시 tracked worktree clean; 본 문서 2개는 이 커밋으로 tracked 전환)
+동결 source baseline       : exchange-rate `2cb6624` · ios `a36682f` · android `676f320` (채집 당시 tracked worktree clean; 본 문서 2개는 docs 동결 커밋 `6cea639`에서 tracked 전환)
 동결 기준 장비             : Samsung SM-F711N / Android 15(API 35) / OPENED / 120Hz (D31)
-문서 identity              : **이 커밋**(docs 동결 커밋)이 확정한다 — 이후 개정은 개정 절차 기록과 함께
+문서 identity              : docs 동결 커밋 **`6cea639`**이 확정한다 — 이후 개정은 개정 절차 기록과 함께
 Document authorization        : GO — 문서 작성·보정 승인 (2026-08-30)
 Plan approval                 : **APPROVED (2026-08-31)** — 이 계획을 작업의 기준으로 채택. 범위 재논의 종료,
-                                개정은 위 개정 절차로만. **슬라이스 착수는 여전히 개별 GO**(§7 도입부 체인)
-Android implementation        : S0 착수 GO 수령 (2026-08-31) — 이 커밋 시점 산출물 0. S1 이후는 여전히 개별 GO
+                                개정은 아래 개정 절차로만. **슬라이스 착수는 여전히 개별 GO**(§7 도입부 체인)
+Android implementation        : **S0 COMPLETE (2026-09-01)** — 구현·hosted CI는 `b477c22` / run `33496421777` green;
+                                current-runner S0-f·S0-g 실기기 evidence도 `b477c22`에서 validator green. S1 착수 GO 대기
 Server implementation         : NOT STARTED — SV 슬라이스 착수 GO 대기. SV-1/SV-2는 공개 rollout 차단 조건
-Commit / push / deploy         : **docs 동결 커밋 1건 (이 커밋)** — 코드 commit 0 · push 0 · deploy 0
+S0 source / evidence / deploy  : source `b477c22`는 `origin/main` 반영 · current-runner evidence subject `b477c22` · deploy 0
 Public release arming          : NOT APPROVED (계약은 D24)
 Android public rollout        : BLOCKED by SV-1 / SV-2 production 배포·검증
 iOS common server gate        : SV-1 / SV-2
 Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 전달 신뢰성 hardening(DEFERRED) · SV-4 cross-device 계정삭제 hardening
 작성                          : 2026-08-29
-최종 보정                     : 2026-08-31
+최종 보정                     : 2026-09-01
 ```
 
 > **`Plan approval`은 구현 착수 승인이 아니다.** 계획을 기준으로 채택했을 뿐이고, 각 슬라이스 착수에는 별도 GO가 필요하다.
 >
 > **동결이 뜻하는 것.** 범위(§1)·결정(§5.1)·슬라이스 경계(§6·§7)·게이트(§10)는 확정이며 재논의 대상이 아니다.
-> 승인 상태와 구현 권한은 분리한다 — `Plan approval`은 APPROVED지만 구현은 열리지 않았고,
-> §7 도입부의 슬라이스별 GO 체인이 그대로 집행된다.
+> 승인 상태와 구현 권한은 분리한다 — `Plan approval`은 구현을 자동으로 열지 않는다.
+> S0는 별도 GO로 완료됐고, S1 이후에는 §7 도입부의 슬라이스별 GO 체인이 그대로 집행된다.
 >
 > **동결 후 변경은 두 종류뿐이다.**
 > 1. **사실 오류 정정·비의미 명확화** — 코드 대조로 틀린 것이 확인된 서술(파일:줄 좌표, 코드 동작 묘사, 오탈자)이나
@@ -42,6 +43,13 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > build CI의 재현성·상시 가용성은 GitHub-hosted Linux/JDK 17이 소유하도록 S0 runner와 DoD를 확정했다.
 > 함께 후속 문서에서 회수된 15분 후보값의 Android/서버 S5 이름 충돌을 제거하고, 구현 세부와 계획 개정의 경계를 명문화했다.
 > 제품 범위·D-결정·슬라이스 경계·release gate는 바꾸지 않았다.
+>
+> **동결 후 1번 비의미 상태 명확화 기록(2026-09-01).** 별도 GO로 수행한 S0 구현과 GitHub-hosted CI run
+> `33496421777`은 `b477c22`에서 green이다. 이후 `b477c22`가 두 실기기 runner의 임시 source/Gradle/staging 경로를
+> 바꾼 데 따른 current-runner 재봉인도 S0-f `launcher-smoke-b477c22-r1`과 S0-g
+> `release-admission-b477c22-r1`에서 각각 validator green이다. 기존 `8c18667`·`31df3b9` bundle은 역사 evidence로
+> 보존한다. 이 상태 갱신은 범위·D-결정·게이트·DoD·활성 미결정 O1을 바꾸지 않았고, S1 착수와 public
+> arming·rollout·deploy를 열지 않았다.
 
 ---
 
@@ -83,9 +91,9 @@ iOS v2.0.0(topic-only, 5탭, 무료 hourly 스냅샷, KRX 조건부 노출)과 *
 | `ios` | `a36682f` |
 | `android` | `676f320` |
 
-세 HEAD의 **source baseline은 문서 생성 전에 clean**이었다. 현재 서버·iOS는 clean이고 Android에는
-본 계획서 `ANDROID_V2_PLAN.md`와 후속 기록 `ANDROID_NOTIFICATION_RELIABILITY_FOLLOWUP.md`, 총 2개가
-untracked 상태다. 문서 추가가 기준 코드 SHA를 바꾸지는 않는다.
+세 HEAD의 **source baseline은 문서 생성 전에 clean**이었다. docs 동결 커밋 직전 Android에는
+본 계획서 `ANDROID_V2_PLAN.md`와 후속 기록 `ANDROID_NOTIFICATION_RELIABILITY_FOLLOWUP.md`, 총 2개만
+untracked였고, 두 문서는 `6cea639`에서 tracked로 전환됐다. 이 문서 추가는 기준 코드 SHA `676f320`을 바꾸지 않았다.
 
 경로 표기 규칙: `exchange-rate/...`는 서버 리포(`../exchange-rate`), `ios/...`는 iOS 리포(`../ios`),
 `android/...`는 현재 Android 리포를 뜻한다. 리포 prefix가 없는 `app/...` 서버 경로는 `exchange-rate/app/...`의 축약이다.
@@ -652,7 +660,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
 - topic ACK/error/lease/snapshot, free FX·Tether snapshot, Graph catalog/tab/in_progress/carry_in, 알림 3 family + FCM payload, HTTP status/Retry-After, 허용 source·asset·series ID, **KRX negative payload** fixture
 - 무료 오염 fixture: 허용 series ID로 위장한 KRX provenance, cross-tab series, futures rate group, duplicate key(first-wins), `in_progress` 주입
 - 테스트 하네스: coroutines-test, MockWebServer(응답 시퀀스 스크립팅), 주입 가능한 Clock
-- **CI 신설**(현재 Android CI 없음): **GitHub Actions hosted `ubuntu-24.04`**에서 unit contract test + lint +
+- **CI 신설**(동결 baseline 당시 Android CI 없음): **GitHub Actions hosted `ubuntu-24.04`**에서 unit contract test + lint +
   debug compile + **v2-ON minified(R8) lane**
   - production keystore/local.properties를 쓰지 않는 `ciMinified`(또는 동등 variant) + ephemeral/debug signing
   - ignored `google-services.json`은 CI secret에서 임시 공급하거나 비운영 Firebase project fixture 사용

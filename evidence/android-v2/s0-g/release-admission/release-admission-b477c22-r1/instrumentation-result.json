@@ -1,0 +1,30 @@
+{
+  "cases": [
+    {
+      "class": "com.jay.fxi.ExampleInstrumentedTest",
+      "method": "useAppContext"
+    },
+    {
+      "class": "com.jay.fxi.ReleaseAdmissionOffEntrypointTest",
+      "method": "freshActivityRecreationAndWarmNotificationIntentRemainUnavailable"
+    },
+    {
+      "class": "com.jay.fxi.ReleaseAdmissionOffEntrypointTest",
+      "method": "FCMCallbacksAndLocalEventBusHaveNoAppOwnedSideEffects"
+    },
+    {
+      "class": "com.jay.fxi.ReleaseAdmissionOffUiTest",
+      "method": "OFF_rendersOnlyUnavailableWithoutResolvingRuntimeProviders"
+    }
+  ],
+  "durationSeconds": 1.574,
+  "errors": 0,
+  "failures": 0,
+  "rawSha256": "b19f029027d8904dc16153a7082c169a316e2f6a351573e15909ca32a3dc52cf",
+  "runId": "release-admission-b477c22-r1",
+  "runnerComponent": "com.jay.fxi.test/androidx.test.runner.AndroidJUnitRunner",
+  "schemaVersion": 1,
+  "skipped": 0,
+  "task": "adb-am-instrument",
+  "tests": 4
+}
