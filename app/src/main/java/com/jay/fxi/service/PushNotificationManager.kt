@@ -11,6 +11,7 @@ import androidx.core.content.ContextCompat
 import com.google.android.gms.tasks.Tasks
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.messaging.FirebaseMessaging
+import com.jay.fxi.admission.ReleaseAdmission
 import com.jay.fxi.data.remote.FXiApiService
 import com.jay.fxi.data.remote.dto.DeviceRequest
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -32,8 +33,11 @@ class PushNotificationManager @Inject constructor(
         set(value) = prefs.edit().putString(KEY_FCM_TOKEN, value).apply()
 
     var shouldRegisterForPush: Boolean
-        get() = prefs.getBoolean(KEY_SHOULD_REGISTER, false)
-        set(value) = prefs.edit().putBoolean(KEY_SHOULD_REGISTER, value).apply()
+        get() = ReleaseAdmission.isOpen && prefs.getBoolean(KEY_SHOULD_REGISTER, false)
+        set(value) {
+            if (!ReleaseAdmission.isOpen) return
+            prefs.edit().putBoolean(KEY_SHOULD_REGISTER, value).apply()
+        }
 
     /**
      * FCM 토큰 갱신 시 호출 (FXiMessagingService.onNewToken)
@@ -43,6 +47,7 @@ class PushNotificationManager @Inject constructor(
      * - 새 토큰 등록: 3중 가드 (auth + premium + shouldRegisterForPush)
      */
     suspend fun onNewToken(token: String, isPremium: Boolean) {
+        if (!ReleaseAdmission.isOpen) return
         withContext(Dispatchers.IO) {
             val oldToken = savedToken
             savedToken = token
@@ -83,6 +88,7 @@ class PushNotificationManager @Inject constructor(
      * 3중 가드 확인 후 서버 등록
      */
     suspend fun registerIfNeeded(isPremium: Boolean) {
+        if (!ReleaseAdmission.isOpen) return
         withContext(Dispatchers.IO) {
             if (auth.currentUser == null || !isPremium || !shouldRegisterForPush) return@withContext
 
@@ -138,6 +144,7 @@ class PushNotificationManager @Inject constructor(
      * 서버에서 기기 등록 해제 (로그아웃 시)
      */
     suspend fun unregisterDeviceFromServer() {
+        if (!ReleaseAdmission.isOpen) return
         withContext(Dispatchers.IO) {
             val token = savedToken
             if (token != null) {
@@ -162,6 +169,7 @@ class PushNotificationManager @Inject constructor(
      * 알림 권한이 이미 승인된 상태면 shouldRegisterForPush 복원
      */
     suspend fun rehydratePushTokenIfNeeded(isPremium: Boolean) {
+        if (!ReleaseAdmission.isOpen) return
         // 알림 권한이 승인된 상태면 shouldRegisterForPush 복원
         if (hasNotificationPermission()) {
             shouldRegisterForPush = true

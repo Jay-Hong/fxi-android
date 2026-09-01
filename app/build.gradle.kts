@@ -1,3 +1,8 @@
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import java.io.File
+import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.util.Properties
 
 plugins {
@@ -11,6 +16,95 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
+private data class GoogleServicesIdentity(
+    val projectNumber: String,
+    val projectId: String,
+    val mobileSdkAppId: String,
+    val apiKeys: Set<String>,
+    val webClientIds: Set<String>
+)
+
+private fun JsonObject.requiredString(key: String, label: String): String {
+    val value = get(key)
+    check(value != null && value.isJsonPrimitive) { "$label must be a JSON primitive." }
+    return value.asString.also { parsed ->
+        check(parsed.isNotBlank()) { "$label must not be blank." }
+    }
+}
+
+private fun googleServicesIdentity(file: File, applicationId: String): GoogleServicesIdentity {
+    val document = runCatching {
+        file.bufferedReader().use { reader -> JsonParser().parse(reader) }
+    }.getOrNull()
+    check(document?.isJsonObject == true) {
+        "${file.name} must be a parseable JSON object."
+    }
+    val root = document.asJsonObject
+    val projectInfo = root.getAsJsonObject("project_info")
+    check(projectInfo != null) { "${file.name} must contain project_info." }
+
+    val clients = root.getAsJsonArray("client")
+    check(clients != null) { "${file.name} must contain a client array." }
+    val matchingClients = clients.mapNotNull { element ->
+        if (!element.isJsonObject) return@mapNotNull null
+        val client = element.asJsonObject
+        val packageName = client.getAsJsonObject("client_info")
+            ?.getAsJsonObject("android_client_info")
+            ?.get("package_name")
+            ?.takeIf { value -> value.isJsonPrimitive }
+            ?.asString
+        client.takeIf { packageName == applicationId }
+    }
+    check(matchingClients.size == 1) {
+        "${file.name} must contain exactly one client for the production applicationId."
+    }
+    val client = matchingClients.single()
+    val clientInfo = client.getAsJsonObject("client_info")
+    check(clientInfo != null) { "${file.name} production client must contain client_info." }
+
+    val apiKeys = client.getAsJsonArray("api_key")
+        ?.mapNotNull { element ->
+            element.takeIf { value -> value.isJsonObject }
+                ?.asJsonObject
+                ?.get("current_key")
+                ?.takeIf { value -> value.isJsonPrimitive }
+                ?.asString
+                ?.takeIf(String::isNotBlank)
+        }
+        ?.toSet()
+        .orEmpty()
+    check(apiKeys.isNotEmpty()) { "${file.name} production client must contain an API key." }
+
+    val webClientIds = client.getAsJsonArray("oauth_client")
+        ?.mapNotNull { element ->
+            val oauthClient = element.takeIf { value -> value.isJsonObject }?.asJsonObject
+                ?: return@mapNotNull null
+            val clientType = oauthClient.get("client_type")
+                ?.takeIf { value -> value.isJsonPrimitive }
+                ?.asString
+            oauthClient.get("client_id")
+                ?.takeIf { value -> clientType == "3" && value.isJsonPrimitive }
+                ?.asString
+                ?.takeIf(String::isNotBlank)
+        }
+        ?.toSet()
+        .orEmpty()
+    check(webClientIds.isNotEmpty()) {
+        "${file.name} production client must contain a type-3 web OAuth client."
+    }
+
+    return GoogleServicesIdentity(
+        projectNumber = projectInfo.requiredString("project_number", "project_info.project_number"),
+        projectId = projectInfo.requiredString("project_id", "project_info.project_id"),
+        mobileSdkAppId = clientInfo.requiredString(
+            "mobilesdk_app_id",
+            "client_info.mobilesdk_app_id"
+        ),
+        apiKeys = apiKeys,
+        webClientIds = webClientIds
+    )
+}
+
 // Load local.properties
 val localProperties = Properties().apply {
     val localPropertiesFile = rootProject.file("local.properties")
@@ -20,8 +114,55 @@ val localProperties = Properties().apply {
 }
 
 val releaseKeystoreFile = rootProject.file("fxi-release.jks")
-val hasReleaseKeystore = releaseKeystoreFile.exists() &&
-    localProperties.getProperty("KEYSTORE_PASSWORD", "").isNotBlank()
+val productionApplicationId = "com.jay.fxi"
+val productionGoogleServicesFile = project.file("google-services.json")
+val productionGoogleServicesPath = productionGoogleServicesFile.toPath().toAbsolutePath().normalize()
+val ciGoogleServicesFixtureFile = rootProject.file("ci/google-services.ci-fixture.json")
+// Use the pinned plugin's own resolver rather than duplicating its unusual no-flavor paths
+// (`src//release`, `src/release/`, `src/Release`, ...). The plugin selects the first regular
+// file, so public release must reject every normalized candidate except the project-root owner.
+val publicReleaseGoogleServicesCandidates =
+    com.google.gms.googleservices.GoogleServicesPlugin.getJsonFiles(
+        "release",
+        emptyList(),
+        project.projectDir
+    ).map { candidate -> candidate.toPath().toAbsolutePath().normalize() }.distinct()
+check(productionGoogleServicesPath in publicReleaseGoogleServicesCandidates) {
+    "google-services plugin no longer resolves app/google-services.json for release; " +
+        "review the D24 production Firebase owner before building."
+}
+val publicReleaseGoogleServicesShadows =
+    publicReleaseGoogleServicesCandidates.filterNot { candidate ->
+        candidate == productionGoogleServicesPath
+    }
+val hasCompleteReleaseSigning = releaseKeystoreFile.exists() &&
+    listOf("KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD").all { key ->
+        localProperties.getProperty(key, "").isNotBlank()
+    }
+
+// D24 keeps artifact bytes separate from build authorization. The release variant is
+// deterministically ON; this property only allows its tasks to execute after a separate GO.
+val publicReleaseBuildApprovalProperty = "fxi.publicReleaseBuildApproved"
+val persistedPublicReleaseApproval = providers.gradleProperty(publicReleaseBuildApprovalProperty).orNull
+val invocationPublicReleaseApproval = gradle.startParameter.projectProperties[
+    publicReleaseBuildApprovalProperty
+]
+check(persistedPublicReleaseApproval == null || invocationPublicReleaseApproval != null) {
+    "$publicReleaseBuildApprovalProperty must not be persisted in a Gradle properties file; " +
+        "supply it explicitly with -P for the approved invocation only."
+}
+val publicReleaseBuildApproved = invocationPublicReleaseApproval
+    ?.let { raw ->
+        when (raw) {
+            "true" -> true
+            "false" -> false
+            else -> error(
+                "-P$publicReleaseBuildApprovalProperty must be exactly true or false " +
+                    "(got '$raw')"
+            )
+        }
+    }
+    ?: false
 
 android {
     namespace = "com.jay.fxi"
@@ -32,18 +173,18 @@ android {
     // 서명 주체가 바뀌는 것을 빌드가 침묵으로 넘기면 안 되므로 release 는 unsigned 로 남긴다.
     // CI 의 R8 검증은 아래 `ciMinified` 가 debug 서명으로 담당한다.
     signingConfigs {
-        if (hasReleaseKeystore) {
+        if (hasCompleteReleaseSigning) {
             create("release") {
                 storeFile = releaseKeystoreFile
                 storePassword = localProperties.getProperty("KEYSTORE_PASSWORD", "")
-                keyAlias = localProperties.getProperty("KEY_ALIAS", "fxi")
+                keyAlias = localProperties.getProperty("KEY_ALIAS", "")
                 keyPassword = localProperties.getProperty("KEY_PASSWORD", "")
             }
         }
     }
 
     defaultConfig {
-        applicationId = "com.jay.fxi"
+        applicationId = productionApplicationId
         minSdk = 26
         targetSdk = 36
         versionCode = 15
@@ -59,12 +200,20 @@ android {
         )
         // False everywhere except the isolated benchmark source set/build type.
         buildConfigField("boolean", "BENCHMARK_NO_DATA_MODE", "false")
+        // D24 is fail-closed. Individual non-public verification variants may override
+        // this, but every new build type inherits OFF unless it opts in explicitly.
+        buildConfigField("boolean", "TOPIC_V2_RELEASE_ON", "false")
+        manifestPlaceholders["topicV2ReleaseOn"] = false
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
-            if (hasReleaseKeystore) {
+            // The public candidate is always compiled ON. Authorization never changes
+            // artifact bytes; it only permits this variant's tasks to execute.
+            buildConfigField("boolean", "TOPIC_V2_RELEASE_ON", "true")
+            manifestPlaceholders["topicV2ReleaseOn"] = true
+            if (hasCompleteReleaseSigning) {
                 signingConfig = signingConfigs.getByName("release")
             }
             proguardFiles(
@@ -80,6 +229,9 @@ android {
             initWith(getByName("release"))
             signingConfig = signingConfigs.getByName("debug")
             matchingFallbacks += listOf("release")
+            // S0-g's non-public ON/R8 lane. This is not a public-release arming action.
+            buildConfigField("boolean", "TOPIC_V2_RELEASE_ON", "true")
+            manifestPlaceholders["topicV2ReleaseOn"] = true
             // mapping 업로드는 Firebase 자격이 필요하다. CI lane 은 R8 통과만 검증한다.
             configure<com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsExtension> {
                 mappingFileUploadEnabled = false
@@ -97,6 +249,9 @@ android {
             // benchmark artifact. The D24 OFF gate remains the runtime admission owner.
             buildConfigField("String", "REVENUECAT_API_KEY", "\"\"")
             buildConfigField("boolean", "BENCHMARK_NO_DATA_MODE", "true")
+            // S0-f launcher smoke must not bypass D24. Functional ON journeys belong to S5.
+            buildConfigField("boolean", "TOPIC_V2_RELEASE_ON", "false")
+            manifestPlaceholders["topicV2ReleaseOn"] = false
             configure<com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsExtension> {
                 mappingFileUploadEnabled = false
             }
@@ -112,6 +267,117 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+}
+
+val verifyProductionGoogleServicesConfig = {
+    check(Files.isRegularFile(productionGoogleServicesPath, LinkOption.NOFOLLOW_LINKS)) {
+        "Public release requires a regular, non-symlink app/google-services.json; " +
+            "build-type CI fixtures are invalid."
+    }
+    val shadowingGoogleServicesFiles = publicReleaseGoogleServicesShadows.filter { candidate ->
+        Files.exists(candidate, LinkOption.NOFOLLOW_LINKS)
+    }
+    check(shadowingGoogleServicesFiles.isEmpty()) {
+        "Public release Firebase config is ambiguous: remove higher-priority source-set " +
+            "google-services.json files (${shadowingGoogleServicesFiles.joinToString { path ->
+                project.projectDir.toPath().toAbsolutePath().normalize().relativize(path).toString()
+            }})."
+    }
+    val productionIdentity = googleServicesIdentity(
+        productionGoogleServicesFile,
+        productionApplicationId
+    )
+    if (ciGoogleServicesFixtureFile.isFile) {
+        val ciIdentity = googleServicesIdentity(ciGoogleServicesFixtureFile, productionApplicationId)
+        val reusedIdentityFields = buildList {
+            if (productionIdentity.projectNumber == ciIdentity.projectNumber) add("project_number")
+            if (productionIdentity.projectId == ciIdentity.projectId) add("project_id")
+            if (productionIdentity.mobileSdkAppId == ciIdentity.mobileSdkAppId) {
+                add("mobilesdk_app_id")
+            }
+            if (productionIdentity.apiKeys.intersect(ciIdentity.apiKeys).isNotEmpty()) {
+                add("api_key.current_key")
+            }
+            if (productionIdentity.webClientIds.intersect(ciIdentity.webClientIds).isNotEmpty()) {
+                add("oauth_client[type=3].client_id")
+            }
+        }
+        check(reusedIdentityFields.isEmpty()) {
+            "Public release app/google-services.json must not reuse checked-in CI fixture " +
+                "identity fields (${reusedIdentityFields.joinToString()})."
+        }
+    }
+}
+
+val enforcePublicReleaseBuildApproval = {
+    check(publicReleaseBuildApproved) {
+        "Public release build is not approved. A separate arming/build GO must precede " +
+            "-P$publicReleaseBuildApprovalProperty=true."
+    }
+    verifyProductionGoogleServicesConfig()
+    check(hasCompleteReleaseSigning) {
+        "Public release requires fxi-release.jks and explicit KEYSTORE_PASSWORD, " +
+            "KEY_ALIAS, and KEY_PASSWORD values in local.properties."
+    }
+    check(localProperties.getProperty("REVENUECAT_API_KEY", "").isNotBlank()) {
+        "Public release requires an explicit REVENUECAT_API_KEY in local.properties."
+    }
+}
+
+val verifyPublicReleaseBuildApproved = tasks.register("verifyPublicReleaseBuildApproved") {
+    group = "verification"
+    description = "Fails unless public release build and production signing are approved."
+    doLast {
+        enforcePublicReleaseBuildApproval()
+    }
+}
+
+tasks.register("verifyProductionGoogleServicesConfig") {
+    group = "verification"
+    description = "Verifies the single production Firebase owner without arming release."
+    doLast {
+        verifyProductionGoogleServicesConfig()
+    }
+}
+
+val appProjectPath = project.path
+val isPublicReleaseBuildTaskName: (String) -> Boolean = { taskName ->
+    taskName.contains("release", ignoreCase = true) &&
+        !taskName.startsWith("uninstall", ignoreCase = true)
+}
+// `uninstallRelease` depends on `preReleaseBuild`, so excluding only the uninstall task name
+// still trips the build gate. Exempt only an invocation whose complete requested task set is
+// the exact recovery action; combined uninstall+build/package invocations remain gated.
+val releaseUninstallOnlyInvocation = gradle.startParameter.taskNames.isNotEmpty() &&
+    gradle.startParameter.taskNames.all { requestedTask ->
+        requestedTask.substringAfterLast(':').equals("uninstallRelease", ignoreCase = true)
+    }
+gradle.taskGraph.whenReady {
+    val publicReleaseTaskInGraph = !releaseUninstallOnlyInvocation && allTasks.any { task ->
+        task.project.path == appProjectPath &&
+            task.name != verifyPublicReleaseBuildApproved.name &&
+            isPublicReleaseBuildTaskName(task.name)
+    }
+    if (publicReleaseTaskInGraph) {
+        // Runs even when a task is UP-TO-DATE/FROM-CACHE or the verifier is excluded.
+        enforcePublicReleaseBuildApproval()
+    }
+}
+
+// Every task that touches the public `release` variant waits on the same authorization
+// gate. This includes low-level package/sign tasks, so invoking them directly cannot bypass
+// the lifecycle task. ciMinified and benchmark have distinct names and remain unaffected.
+if (!releaseUninstallOnlyInvocation) {
+    tasks.matching {
+        it.name != verifyPublicReleaseBuildApproved.name &&
+            isPublicReleaseBuildTaskName(it.name)
+    }.configureEach {
+        dependsOn(verifyPublicReleaseBuildApproved)
+        // `-x verifyPublicReleaseBuildApproved` must not turn task exclusion into arming.
+        doFirst {
+            enforcePublicReleaseBuildApproval()
+        }
     }
 }
 

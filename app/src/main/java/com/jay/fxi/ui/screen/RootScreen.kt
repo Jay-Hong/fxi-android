@@ -32,15 +32,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.jay.fxi.R
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.jay.fxi.R
+import com.jay.fxi.admission.ReleaseAdmission
 import com.jay.fxi.domain.model.AuthState
 import com.jay.fxi.service.AlertEvent
 import com.jay.fxi.service.AlertEventBus
 import com.jay.fxi.service.PushNotificationManager
 import com.jay.fxi.subscription.SubscriptionManager
-import kotlinx.coroutines.flow.StateFlow
 import com.jay.fxi.ui.auth.AuthViewModel
 import com.jay.fxi.ui.auth.LoginScreen
 import com.jay.fxi.ui.subscription.LockedPreviewScreen
@@ -53,9 +53,33 @@ import com.jay.fxi.ui.viewmodel.AlertViewModel
 import com.jay.fxi.ui.viewmodel.ExchangeRateViewModel
 import com.jay.fxi.ui.viewmodel.GraphViewModel
 import com.jay.fxi.ui.viewmodel.NewsViewModel
+import kotlinx.coroutines.flow.StateFlow
+import javax.inject.Provider
 
 @Composable
 fun RootScreen(
+    subscriptionManagerProvider: Provider<SubscriptionManager>,
+    pushNotificationManagerProvider: Provider<PushNotificationManager>,
+    pendingAlertEvent: StateFlow<AlertEvent?>? = null,
+    onPendingAlertEventConsumed: () -> Unit = {},
+    alertEventBusProvider: Provider<AlertEventBus>,
+) {
+    if (!ReleaseAdmission.isOpen) {
+        ReleaseUnavailableScreen()
+        return
+    }
+
+    ArmedRootScreen(
+        subscriptionManager = subscriptionManagerProvider.get(),
+        pushNotificationManager = pushNotificationManagerProvider.get(),
+        pendingAlertEvent = pendingAlertEvent,
+        onPendingAlertEventConsumed = onPendingAlertEventConsumed,
+        alertEventBus = alertEventBusProvider.get()
+    )
+}
+
+@Composable
+private fun ArmedRootScreen(
     subscriptionManager: SubscriptionManager,
     pushNotificationManager: PushNotificationManager,
     pendingAlertEvent: StateFlow<AlertEvent?>? = null,

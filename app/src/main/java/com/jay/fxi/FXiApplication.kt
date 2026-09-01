@@ -8,15 +8,24 @@ import android.media.RingtoneManager
 import android.os.Build
 import android.util.Log
 import com.google.firebase.FirebaseApp
-import com.jay.fxi.service.FXiMessagingService
 import com.google.firebase.crashlytics.FirebaseCrashlytics
+import com.jay.fxi.admission.ReleaseAdmission
+import com.jay.fxi.service.FXiMessagingService
 import com.revenuecat.purchases.LogLevel
 import com.revenuecat.purchases.Purchases
 import com.revenuecat.purchases.PurchasesConfiguration
 import dagger.hilt.android.HiltAndroidApp
 
-internal fun shouldEnableCrashlytics(debug: Boolean, benchmarkNoData: Boolean): Boolean =
-    !debug && !benchmarkNoData
+internal fun shouldStartAppOwnedServices(
+    releaseAdmissionOpen: Boolean,
+    benchmarkNoData: Boolean
+): Boolean = releaseAdmissionOpen && !benchmarkNoData
+
+internal fun shouldEnableCrashlytics(
+    debug: Boolean,
+    benchmarkNoData: Boolean,
+    releaseAdmissionOpen: Boolean
+): Boolean = !debug && shouldStartAppOwnedServices(releaseAdmissionOpen, benchmarkNoData)
 
 @HiltAndroidApp
 class FXiApplication : Application() {
@@ -24,24 +33,30 @@ class FXiApplication : Application() {
     override fun onCreate() {
         super.onCreate()
 
-        // 1-2. S0-f benchmark-only no-data surface must not start collectors. Its
-        // manifest also disables Analytics/Crashlytics/FCM auto-init; this guard is
-        // required because the explicit Crashlytics API overrides manifest metadata.
-        if (!BuildConfig.BENCHMARK_NO_DATA_MODE) {
-            FirebaseApp.initializeApp(this)
-            FirebaseCrashlytics.getInstance().apply {
-                setCrashlyticsCollectionEnabled(
-                    shouldEnableCrashlytics(
-                        debug = BuildConfig.DEBUG,
-                        benchmarkNoData = BuildConfig.BENCHMARK_NO_DATA_MODE
-                    )
-                )
-            }
-        } else {
-            Log.i(TAG, "Benchmark no-data mode: Firebase collectors remain disabled.")
+        val releaseAdmissionOpen = ReleaseAdmission.isOpen
+        val appOwnedServicesOpen = shouldStartAppOwnedServices(
+            releaseAdmissionOpen = releaseAdmissionOpen,
+            benchmarkNoData = BuildConfig.BENCHMARK_NO_DATA_MODE
+        )
+        if (!appOwnedServicesOpen) {
+            Log.i(TAG, "D24-OFF/no-data process: app-owned services remain disabled.")
+            return
         }
 
-        // 3. 알림 채널 생성
+        // Firebase's own provider/transport is outside the app data-plane zero assertion,
+        // but explicit collection is still opened only for an admitted application.
+        FirebaseApp.initializeApp(this)
+        FirebaseCrashlytics.getInstance().apply {
+            setCrashlyticsCollectionEnabled(
+                shouldEnableCrashlytics(
+                    debug = BuildConfig.DEBUG,
+                    benchmarkNoData = BuildConfig.BENCHMARK_NO_DATA_MODE,
+                    releaseAdmissionOpen = releaseAdmissionOpen
+                )
+            )
+        }
+
+        // App-owned local notification surface.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 FXiMessagingService.CHANNEL_RATE_ALERTS,
@@ -62,7 +77,7 @@ class FXiApplication : Application() {
             getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
         }
 
-        // 4. RevenueCat 초기화
+        // App-owned subscription transport.
         val revenueCatApiKey = BuildConfig.REVENUECAT_API_KEY
         if (revenueCatApiKey.isNotBlank()) {
             if (BuildConfig.DEBUG) {

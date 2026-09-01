@@ -1,7 +1,9 @@
 package com.jay.fxi.di
 
+import com.jay.fxi.admission.ReleaseAdmissionInterceptor
 import com.jay.fxi.data.remote.ClientMetadataInterceptor
 import okhttp3.Interceptor
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -16,6 +18,11 @@ class NetworkModuleClientMetadataTest {
     fun okHttpClient_wiresClientMetadataInterceptor() {
         val noopAuth = Interceptor { it.proceed(it.request()) }
         val client = NetworkModule.provideOkHttpClient(noopAuth)
+        assertEquals(
+            "D24 admission must be the first REST interceptor",
+            ReleaseAdmissionInterceptor::class,
+            client.interceptors.first()::class
+        )
         assertTrue(
             "provideOkHttpClient가 ClientMetadataInterceptor를 연결해야 함",
             client.interceptors.any { it is ClientMetadataInterceptor }

@@ -7,6 +7,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.jay.fxi.admission.ReleaseAdmission
 import com.jay.fxi.service.AlertEvent
 import com.jay.fxi.service.AlertEventBus
 import com.jay.fxi.service.FXiMessagingService
@@ -19,19 +20,20 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import javax.inject.Inject
+import javax.inject.Provider
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
     @Inject
-    lateinit var subscriptionManager: SubscriptionManager
+    lateinit var subscriptionManagerProvider: Provider<SubscriptionManager>
 
     @Inject
-    lateinit var pushNotificationManager: PushNotificationManager
+    lateinit var pushNotificationManagerProvider: Provider<PushNotificationManager>
 
     @Inject
-    lateinit var alertEventBus: AlertEventBus
+    lateinit var alertEventBusProvider: Provider<AlertEventBus>
 
-    // 콜드스타트 시 pending 이벤트 저장 (Compose 준비 후 처리)
+    // 새 Activity 인스턴스에서 pending 이벤트 저장 (Compose 준비 후 처리)
     private val _pendingAlertEvent = MutableStateFlow<AlertEvent?>(null)
     val pendingAlertEvent: StateFlow<AlertEvent?> = _pendingAlertEvent.asStateFlow()
 
@@ -43,19 +45,19 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
         )
 
-        // 알림 탭으로 앱 실행 시 pending 이벤트 저장 (신규 실행만, 회전/복원 제외)
-        if (savedInstanceState == null) {
+        // 알림 탭으로 새 Activity를 열 때 pending 이벤트 저장 (회전/복원 제외)
+        if (ReleaseAdmission.isOpen && savedInstanceState == null) {
             parsePendingAlertEvent(intent)
         }
 
         setContent {
             FXiTheme {
                 RootScreen(
-                    subscriptionManager = subscriptionManager,
-                    pushNotificationManager = pushNotificationManager,
+                    subscriptionManagerProvider = subscriptionManagerProvider,
+                    pushNotificationManagerProvider = pushNotificationManagerProvider,
                     pendingAlertEvent = pendingAlertEvent,
                     onPendingAlertEventConsumed = { _pendingAlertEvent.value = null },
-                    alertEventBus = alertEventBus
+                    alertEventBusProvider = alertEventBusProvider
                 )
             }
         }
@@ -63,12 +65,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        if (!ReleaseAdmission.isOpen) return
         // 앱이 이미 실행 중일 때 알림 탭 시 즉시 emit (구독자 준비됨)
         handleNotificationIntent(intent)
     }
 
     /**
-     * 콜드스타트 시 Intent에서 AlertEvent 파싱 (Compose 준비 후 처리)
+     * 새 Activity 생성 시 Intent에서 AlertEvent 파싱 (Compose 준비 후 처리)
      */
     private fun parsePendingAlertEvent(intent: Intent?) {
         val event = parseAlertEventFromIntent(intent) ?: return
@@ -81,7 +84,7 @@ class MainActivity : ComponentActivity() {
      */
     private fun handleNotificationIntent(intent: Intent?) {
         val event = parseAlertEventFromIntent(intent) ?: return
-        alertEventBus.emit(event)
+        alertEventBusProvider.get().emit(event)
         clearNotificationExtras(intent)
     }
 

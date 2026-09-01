@@ -43,12 +43,93 @@ jobs:
           for f in fxi-release.jks local.properties; do
             if [ -e "$f" ]; then echo "::error::production 산출물이 CI checkout 에 존재: $f"; exit 1; fi
           done
-          firebase_configs="$(find app -type f -name google-services.json -print)"
+          # Do not require -type f: a final-component symlink must be reported too.
+          firebase_configs="$(find app -name google-services.json -print)"
           if [ -n "$firebase_configs" ]; then
             echo "::error::Firebase 설정이 fixture 공급 전에 CI checkout 에 존재"
             printf '%s\n' "$firebase_configs"
             exit 1
           fi
+
+      # Exercise a low-level bundle producer directly. A missing Firebase config or signer
+      # could also make this command fail, so require the D24 authorization failure itself
+      # and prove that no AAB appeared.
+      - name: Assert public release tasks are fail-closed
+        run: |
+          mkdir -p build/reports/s0g
+          if find app/build/outputs/bundle/release -type f -name '*.aab' -print 2>/dev/null \
+            | grep -q .; then
+            echo "::error::clean checkout already contains a public AAB"
+            exit 1
+          fi
+          set +e
+          ./gradlew :app:packageReleaseBundle \
+            -x :app:verifyPublicReleaseBuildApproved --console=plain \
+            > build/reports/s0g/release-task-denial.txt 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::unapproved public release task succeeded"
+            exit 1
+          fi
+          grep -Fq "Public release build is not approved" \
+            build/reports/s0g/release-task-denial.txt
+          if find app/build/outputs/bundle/release -type f -name '*.aab' -print 2>/dev/null \
+            | grep -q .; then
+            echo "::error::unapproved public AAB was produced"
+            exit 1
+          fi
+          # Removal is a recovery action, not arming or artifact production.
+          ./gradlew :app:uninstallRelease --dry-run --console=plain
+
+      # Exercise the exact production Firebase owner checks without setting the public
+      # arming/build approval property or producing a release artifact.
+      - name: Assert production Firebase config is fail-closed
+        run: |
+          set -eu
+          report=build/reports/s0g/production-firebase-denial.txt
+          root=app/google-services.json
+          shadow=app/src/release/google-services.json
+          cleanup() {
+            rm -f "$root" "$shadow"
+            rmdir app/src/release 2>/dev/null || true
+          }
+          expect_denial() {
+            expected="$1"
+            set +e
+            ./gradlew :app:verifyProductionGoogleServicesConfig --console=plain \
+              > "$report" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ] || ! grep -Fq "$expected" "$report"; then
+              cat "$report"
+              echo "::error::production Firebase guard did not reject: $expected"
+              exit 1
+            fi
+          }
+          trap cleanup EXIT
+
+          expect_denial "requires a regular, non-symlink app/google-services.json"
+
+          ln -s ../ci/google-services.ci-fixture.json "$root"
+          expect_denial "requires a regular, non-symlink app/google-services.json"
+          rm -f "$root"
+
+          cp ci/google-services.ci-fixture.json "$root"
+          mkdir -p app/src/release
+          cp ci/google-services.ci-fixture.json "$shadow"
+          expect_denial "Firebase config is ambiguous"
+          rm -f "$shadow"
+          rmdir app/src/release
+
+          expect_denial "must not reuse checked-in CI fixture identity fields"
+
+          # Adding an inert field must not launder the same fake Firebase identity.
+          awk 'NR == 1 { print; print "  \"ignored_by_google_services\": true,"; next } \
+            { print }' ci/google-services.ci-fixture.json > "$root"
+          expect_denial "must not reuse checked-in CI fixture identity fields"
+          cleanup
+          trap - EXIT
 
       # Firebase 설정은 비운영 fixture 로 공급한다. 실제 project 자격이 아니며
       # 컴파일·R8 검증에만 쓰인다(google-services 플러그인이 package_name 일치와
@@ -63,8 +144,10 @@ jobs:
 
       # Pure-stdlib tests for the manual contract refresh tool. They do not
       # import the server or require the sibling Python repository.
-      - name: Contract generator utility tests
-        run: python3 -m unittest discover -s tools/contracts -p 'test_*.py'
+      - name: Pure-stdlib utility tests
+        run: |
+          python3 -m unittest discover -s tools/contracts -p 'test_*.py'
+          python3 -m unittest discover -s tools/release -p 'test_*.py'
 
       - name: Benchmark gate parser and evidence fixtures
         run: |
@@ -73,7 +156,8 @@ jobs:
             tools/performance/fixtures/gate-cases.json
 
       - name: Unit tests
-        run: ./gradlew testDebugUnitTest
+        run: |
+          ./gradlew testDebugUnitTest testCiMinifiedUnitTest testBenchmarkUnitTest
 
       - name: Lint
         run: ./gradlew lintDebug
@@ -112,12 +196,24 @@ jobs:
             --public-like-apk app/build/outputs/apk/ciMinified/app-ciMinified.apk \
             --dependency-report build/reports/s0f/profileinstaller.txt
 
+      - name: Verify packaged D24 admission matrix
+        run: |
+          AAPT2="$(find "$ANDROID_HOME/build-tools" -mindepth 2 -maxdepth 2 \
+            -type f -name aapt2 -print | sort -V | tail -1)"
+          test -x "$AAPT2"
+          python3 tools/release/verify_release_admission_artifacts.py \
+            --aapt2 "$AAPT2" \
+            --artifact debug=off=app/build/outputs/apk/debug/app-debug.apk \
+            --artifact ciMinified=on=app/build/outputs/apk/ciMinified/app-ciMinified.apk \
+            --artifact benchmark=off=app/build/outputs/apk/benchmark/app-benchmark.apk
+
       - name: Upload reports on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: android-ci-reports
           path: |
+            build/reports/
             app/build/reports/
             app/build/test-results/
           retention-days: 7

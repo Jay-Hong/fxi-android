@@ -6,9 +6,38 @@ import org.junit.Test
 
 class FirebaseCollectionPolicyTest {
     @Test
-    fun `Crashlytics is disabled for debug and benchmark no-data variants`() {
-        assertFalse(shouldEnableCrashlytics(debug = true, benchmarkNoData = false))
-        assertFalse(shouldEnableCrashlytics(debug = false, benchmarkNoData = true))
-        assertTrue(shouldEnableCrashlytics(debug = false, benchmarkNoData = false))
+    fun `app-owned startup and Crashlytics remain closed unless admission is open`() {
+        assertFalse(shouldStartAppOwnedServices(releaseAdmissionOpen = false, benchmarkNoData = false))
+        assertFalse(shouldStartAppOwnedServices(releaseAdmissionOpen = true, benchmarkNoData = true))
+        assertTrue(shouldStartAppOwnedServices(releaseAdmissionOpen = true, benchmarkNoData = false))
+
+        assertFalse(
+            shouldEnableCrashlytics(
+                debug = true,
+                benchmarkNoData = false,
+                releaseAdmissionOpen = true
+            )
+        )
+        assertFalse(
+            shouldEnableCrashlytics(
+                debug = false,
+                benchmarkNoData = true,
+                releaseAdmissionOpen = true
+            )
+        )
+        assertFalse(
+            shouldEnableCrashlytics(
+                debug = false,
+                benchmarkNoData = false,
+                releaseAdmissionOpen = false
+            )
+        )
+        assertTrue(
+            shouldEnableCrashlytics(
+                debug = false,
+                benchmarkNoData = false,
+                releaseAdmissionOpen = true
+            )
+        )
     }
 }

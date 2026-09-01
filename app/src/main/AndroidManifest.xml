@@ -18,6 +18,9 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.FXi">
         <meta-data
+            android:name="com.jay.fxi.TOPIC_V2_RELEASE_ON"
+            android:value="${topicV2ReleaseOn}" />
+        <meta-data
             android:name="com.google.firebase.messaging.default_notification_channel_id"
             android:value="rate_alerts" />
 

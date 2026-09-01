@@ -4,6 +4,8 @@ import android.util.Log
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
+import com.jay.fxi.admission.ReleaseAdmission
+import com.jay.fxi.admission.ReleaseAdmissionInterceptor
 import com.jay.fxi.data.network.NetworkMonitor
 import com.jay.fxi.data.remote.dto.IndicesPayload
 import com.jay.fxi.data.remote.dto.WebSocketGraphBuckets
@@ -35,6 +37,15 @@ import javax.inject.Singleton
 import kotlin.random.Random
 
 private const val TAG = "WebSocketService"
+
+internal fun buildWebSocketClient(): OkHttpClient = OkHttpClient.Builder()
+    // D24 must run before metadata, DNS, or socket work on the independent WS stack.
+    .addInterceptor(ReleaseAdmissionInterceptor())
+    .addInterceptor(ClientMetadataInterceptor())
+    .connectTimeout(WebSocketConfig.CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+    .readTimeout(0, TimeUnit.MILLISECONDS)
+    .writeTimeout(WebSocketConfig.CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+    .build()
 
 /**
  * WebSocket 서비스
@@ -77,12 +88,7 @@ class WebSocketService @Inject constructor(
     // ============ WebSocket ============
 
     private var webSocket: WebSocket? = null
-    private val client = OkHttpClient.Builder()
-        .addInterceptor(ClientMetadataInterceptor())   // ADR-039 관측 헤더 (WS handshake)
-        .connectTimeout(WebSocketConfig.CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)  // WebSocket은 읽기 타임아웃 없음
-        .writeTimeout(WebSocketConfig.CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        .build()
+    private val client = buildWebSocketClient()
 
     // ============ Ping/Pong ============
 
@@ -105,13 +111,15 @@ class WebSocketService @Inject constructor(
     var onIndicesReceived: ((IndicesPayload?) -> Unit)? = null
 
     init {
-        // 앱 라이프사이클 관찰
-        ProcessLifecycleOwner.get().lifecycle.addObserver(this)
+        if (ReleaseAdmission.isOpen) {
+            // 앱 라이프사이클 관찰
+            ProcessLifecycleOwner.get().lifecycle.addObserver(this)
 
-        // 네트워크 상태 변경 감지
-        scope.launch {
-            networkMonitor.isConnected.collect { isConnected ->
-                handleNetworkStateChange(isConnected)
+            // 네트워크 상태 변경 감지
+            scope.launch {
+                networkMonitor.isConnected.collect { isConnected ->
+                    handleNetworkStateChange(isConnected)
+                }
             }
         }
     }
@@ -123,6 +131,7 @@ class WebSocketService @Inject constructor(
      * 이미 활성 상태라도 Failed/Disconnected면 재연결 시도
      */
     fun start() {
+        if (!ReleaseAdmission.isOpen) return
         if (isActive) {
             // 이미 활성 상태지만 실패/끊김 상태면 재연결
             val state = _connectionState.value
@@ -153,6 +162,7 @@ class WebSocketService @Inject constructor(
     // ============ 연결 관리 ============
 
     private fun connect() {
+        if (!ReleaseAdmission.isOpen) return
         // 비활성 상태면 연결 차단
         if (!isActive) {
             Log.d(TAG, "connect() 차단 - isActive=false")
@@ -190,6 +200,7 @@ class WebSocketService @Inject constructor(
     }
 
     private fun reconnect() {
+        if (!ReleaseAdmission.isOpen) return
         // 비활성 상태 또는 의도적 종료 시 재연결 차단
         if (!isActive || isIntentionalDisconnect) {
             Log.d(TAG, "reconnect() 차단 - isActive=$isActive, intentional=$isIntentionalDisconnect")
