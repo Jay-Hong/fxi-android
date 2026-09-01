@@ -1,0 +1,4 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="com.jay.fxi.macrobenchmark.LauncherSmokeBenchmark" tests="1" failures="0" errors="0" skipped="0">
+  <testcase name="launcherSmoke" classname="com.jay.fxi.macrobenchmark.LauncherSmokeBenchmark" time="8.575" />
+</testsuite>

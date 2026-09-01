@@ -131,6 +131,15 @@ Only a validated bundle's `run.json`, `preflight.json`, `postflight.json`, and
 commit. Raw UTP/instrumentation output must not be promoted because it can contain the ADB
 serial, device paths, and local absolute paths.
 
+The sealed S0-f launcher baseline is
+`evidence/android-v2/s0-f/launcher-smoke/launcher-smoke-8c18667-r2/`, produced from
+source commit `8c186678dd2e17ced4c7ea2249962cbdc8ee5be9`. The validator requires that
+recorded commit to exist, requires clean and identical source state at both ends, and
+re-hashes the bound runner/Firebase blobs from that commit. It deliberately does not
+require the recorded source commit to equal the current `HEAD`, because this separate
+evidence commit necessarily advances `HEAD`; reviewers must still confirm that the
+recorded commit is the intended implementation baseline.
+
 Promotion is allowed only when the checked-in validator says so. It requires
 `verdict=pass`, `exitCode=0`, the same clean source commit at both ends, byte-identical
 pre/post APK and Firebase inputs, matching installed APK bytes, restored settings, removal
