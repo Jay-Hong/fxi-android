@@ -155,9 +155,7 @@ def run_debug_build(build_root: Path) -> int:
     original_gradle_home = Path(
         os.environ.get("GRADLE_USER_HOME", Path.home() / ".gradle")
     )
-    with tempfile.TemporaryDirectory(
-        prefix="release-gradle-home-", dir=physical.DEVICE_STATE_DIR
-    ) as temporary_home:
+    with physical.private_temporary_directory("release-gradle-home-") as temporary_home:
         gradle_home = Path(temporary_home)
         for reusable in ("caches", "wrapper", "jdks"):
             source = original_gradle_home / reusable
@@ -781,9 +779,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ReleaseEvidenceError("build Firebase input differs from canonical fixture")
         evidence["artifactsBefore"] = artifacts_before
 
-        staging_context = tempfile.TemporaryDirectory(
-            prefix="release-staging-", dir=physical.DEVICE_STATE_DIR
-        )
+        staging_context = physical.private_temporary_directory("release-staging-")
         staging_root = Path(staging_context.name)
         staging_root.chmod(0o700)
         staged_target = staging_root / "target-debug.apk"

@@ -1,8 +1,11 @@
+import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
+import device_release_admission
 from device_release_admission import (
     EXPECTED_CASES,
     ReleaseEvidenceError,
@@ -14,6 +17,7 @@ from device_release_admission import (
     parse_netstats_uid_history,
     parse_unavailable_ui_dump,
     physical,
+    run_debug_build,
 )
 
 
@@ -141,6 +145,28 @@ class InstrumentationCaptureTest(unittest.TestCase):
                         "release-admission-deadbee-r1",
                         Path(temporary) / "instrumentation-result.json",
                     )
+
+
+class ReleaseBuildTest(unittest.TestCase):
+    def test_debug_build_creates_private_state_parent_on_clean_host(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "missing" / "device-state"
+            completed = mock.Mock(returncode=0)
+            with (
+                mock.patch.object(physical, "DEVICE_STATE_DIR", state),
+                mock.patch.object(
+                    device_release_admission.subprocess,
+                    "run",
+                    return_value=completed,
+                ) as run,
+                mock.patch.dict(os.environ, {"ANDROID_HOME": "/fixture/android-sdk"}),
+            ):
+                self.assertEqual(0, run_debug_build(root))
+            self.assertTrue(state.is_dir())
+            self.assertEqual(0o700, state.stat().st_mode & 0o777)
+            self.assertIn(":app:assembleDebug", run.call_args.args[0])
+            self.assertIn(":app:assembleDebugAndroidTest", run.call_args.args[0])
 
 
 class NetstatsParserTest(unittest.TestCase):

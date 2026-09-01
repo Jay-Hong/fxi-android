@@ -166,6 +166,41 @@ serial-two unauthorized
                 with self.assertRaisesRegex(PreflightError, "secure global runner lock"):
                     acquire_run_lock()
 
+    def test_private_temporary_directory_creates_and_secures_a_missing_parent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp) / "missing" / "device-state"
+            with mock.patch.object(device_preflight, "DEVICE_STATE_DIR", state):
+                context = device_preflight.private_temporary_directory("probe-")
+                try:
+                    self.assertEqual(state, Path(context.name).parent)
+                    self.assertEqual(0o700, state.stat().st_mode & 0o777)
+                finally:
+                    context.cleanup()
+
+    def test_private_temporary_directory_rejects_a_symlink_parent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "target"
+            target.mkdir(mode=0o700)
+            state = root / "device-state"
+            state.symlink_to(target, target_is_directory=True)
+            with (
+                mock.patch.object(device_preflight, "DEVICE_STATE_DIR", state),
+                self.assertRaisesRegex(PreflightError, "private user-owned directory"),
+            ):
+                device_preflight.private_temporary_directory("probe-")
+
+    def test_private_temporary_directory_rejects_a_shared_parent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp) / "device-state"
+            state.mkdir(mode=0o700)
+            state.chmod(0o755)
+            with (
+                mock.patch.object(device_preflight, "DEVICE_STATE_DIR", state),
+                self.assertRaisesRegex(PreflightError, "private user-owned directory"),
+            ):
+                device_preflight.private_temporary_directory("probe-")
+
     def test_display_size_preserves_override_information(self):
         self.assertEqual(("1080x2640", None), parse_wm_size("Physical size: 1080x2640"))
         self.assertEqual(
@@ -368,6 +403,7 @@ INSTRUMENTATION_CODE: -1
     def test_build_removes_stale_outputs_and_forces_benchmark_tasks(self):
         with tempfile.TemporaryDirectory(dir=device_preflight.ROOT) as temp:
             root = Path(temp)
+            state = root / "missing" / "device-state"
             target = root / "target.apk"
             test = root / "test.apk"
             target.write_bytes(b"stale")
@@ -376,6 +412,7 @@ INSTRUMENTATION_CODE: -1
             with (
                 mock.patch.object(device_preflight, "TARGET_BENCHMARK_APK", target),
                 mock.patch.object(device_preflight, "TEST_BENCHMARK_APK", test),
+                mock.patch.object(device_preflight, "DEVICE_STATE_DIR", state),
                 mock.patch.object(
                     device_preflight.subprocess, "run", return_value=completed
                 ) as run,
@@ -383,6 +420,7 @@ INSTRUMENTATION_CODE: -1
                 self.assertEqual(0, run_benchmark_build())
             self.assertFalse(target.exists())
             self.assertFalse(test.exists())
+            self.assertTrue(state.is_dir())
         command = run.call_args.args[0]
         self.assertIn(":app:assembleBenchmark", command)
         self.assertIn(":macrobenchmark:assembleBenchmark", command)
@@ -410,12 +448,18 @@ INSTRUMENTATION_CODE: -1
             stdout=device_preflight.subprocess.PIPE,
             check=True,
         ).stdout
-        context, snapshot = materialize_commit_snapshot(head)
-        try:
-            self.assertEqual(expected, (snapshot / "settings.gradle.kts").read_bytes())
-            self.assertFalse((snapshot / ".git").exists())
-        finally:
-            context.cleanup()
+        with tempfile.TemporaryDirectory(dir=device_preflight.ROOT) as temp:
+            state = Path(temp) / "missing" / "device-state"
+            with mock.patch.object(device_preflight, "DEVICE_STATE_DIR", state):
+                context, snapshot = materialize_commit_snapshot(head)
+                try:
+                    self.assertEqual(
+                        expected, (snapshot / "settings.gradle.kts").read_bytes()
+                    )
+                    self.assertFalse((snapshot / ".git").exists())
+                    self.assertTrue(state.is_dir())
+                finally:
+                    context.cleanup()
 
     def test_staged_artifact_is_byte_identical_and_read_only(self):
         with tempfile.TemporaryDirectory(dir=device_preflight.ROOT) as temp:

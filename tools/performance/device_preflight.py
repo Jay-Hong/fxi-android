@@ -77,6 +77,33 @@ class PreflightError(RuntimeError):
     pass
 
 
+def ensure_private_state_directory(path: Path) -> None:
+    """Create and verify the private parent used by runner-owned temporary files."""
+    try:
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        directory_stat = path.lstat()
+    except OSError as error:
+        raise PreflightError("cannot prepare private device-state directory") from error
+    mode = stat.S_IMODE(directory_stat.st_mode)
+    if (
+        not stat.S_ISDIR(directory_stat.st_mode)
+        or directory_stat.st_uid != os.getuid()
+        or mode & 0o077
+    ):
+        raise PreflightError("device-state directory must be a private user-owned directory")
+
+
+def private_temporary_directory(
+    prefix: str,
+) -> tempfile.TemporaryDirectory[str]:
+    """Allocate a temporary directory after validating its persistent parent."""
+    ensure_private_state_directory(DEVICE_STATE_DIR)
+    try:
+        return tempfile.TemporaryDirectory(prefix=prefix, dir=DEVICE_STATE_DIR)
+    except OSError as error:
+        raise PreflightError("cannot create private runner temporary directory") from error
+
+
 def safe_failure(label: str, error: BaseException) -> str:
     """Return a non-secret cleanup error suitable for sanitized evidence."""
     if isinstance(error, PreflightError):
@@ -87,17 +114,7 @@ def safe_failure(label: str, error: BaseException) -> str:
 
 
 def acquire_run_lock() -> int:
-    try:
-        RUN_LOCK.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        directory_stat = RUN_LOCK.parent.lstat()
-    except OSError as error:
-        raise PreflightError(f"cannot prepare private device-state directory: {error}") from error
-    if (
-        not stat.S_ISDIR(directory_stat.st_mode)
-        or directory_stat.st_uid != os.getuid()
-        or stat.S_IMODE(directory_stat.st_mode) & 0o077
-    ):
-        raise PreflightError("device-state directory must be a private user-owned directory")
+    ensure_private_state_directory(RUN_LOCK.parent)
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(RUN_LOCK, flags, 0o600)
@@ -657,7 +674,7 @@ def materialize_commit_snapshot(
         raise PreflightError("cannot inspect the committed source tree")
     if any(line.startswith(("120000 ", "160000 ")) for line in tree.stdout.splitlines()):
         raise PreflightError("durable source snapshot does not allow symlinks or submodules")
-    context = tempfile.TemporaryDirectory(prefix="source-", dir=DEVICE_STATE_DIR)
+    context = private_temporary_directory("source-")
     destination = Path(context.name)
     destination.chmod(0o700)
     tar = shutil.which("tar")
@@ -739,7 +756,7 @@ def run_benchmark_build(
     original_gradle_home = Path(
         os.environ.get("GRADLE_USER_HOME", Path.home() / ".gradle")
     )
-    with tempfile.TemporaryDirectory(prefix="gradle-home-", dir=DEVICE_STATE_DIR) as temp:
+    with private_temporary_directory("gradle-home-") as temp:
         gradle_home = Path(temp)
         for reusable in ("caches", "wrapper", "jdks"):
             source = original_gradle_home / reusable
@@ -1157,10 +1174,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise PreflightError(
                     "benchmark Firebase build input differs from the checked-in fixture"
                 )
-            staging_context = tempfile.TemporaryDirectory(
-                prefix="artifacts-",
-                dir=DEVICE_STATE_DIR,
-            )
+            staging_context = private_temporary_directory("artifacts-")
             staging_root = Path(staging_context.name)
             staging_root.chmod(0o700)
             staged_target = staging_root / "target-benchmark.apk"
