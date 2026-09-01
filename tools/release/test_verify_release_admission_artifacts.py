@@ -1,7 +1,13 @@
 import unittest
 from pathlib import Path
 
-from verify_release_admission_artifacts import VerificationError, parse_artifact, parse_marker
+from verify_release_admission_artifacts import (
+    FIREBASE_AUTO_INIT_MARKERS,
+    VerificationError,
+    parse_artifact,
+    parse_marker,
+    verify_firebase_auto_init_off,
+)
 
 
 def manifest(value: str) -> str:
@@ -10,6 +16,21 @@ def manifest(value: str) -> str:
     A: http://schemas.android.com/apk/res/android:name(0x01010003)="com.jay.fxi.TOPIC_V2_RELEASE_ON"
     A: http://schemas.android.com/apk/res/android:value(0x01010024)={value}
 '''
+
+
+def firebase_manifest(value: str = "false") -> str:
+    lines = ["E: application"]
+    for marker in FIREBASE_AUTO_INIT_MARKERS:
+        lines.extend(
+            (
+                "  E: meta-data",
+                "    A: http://schemas.android.com/apk/res/android:name(0x01010003)="
+                f'"{marker}"',
+                "    A: http://schemas.android.com/apk/res/android:value(0x01010024)="
+                f"{value}",
+            )
+        )
+    return "\n".join(lines) + "\n"
 
 
 class ParseMarkerTest(unittest.TestCase):
@@ -42,6 +63,16 @@ class ParseMarkerTest(unittest.TestCase):
         for invalid in ("debug=false=x.apk", "debug=off", "=off=x.apk"):
             with self.subTest(spec=invalid), self.assertRaises(VerificationError):
                 parse_artifact(invalid)
+
+    def test_off_artifact_requires_all_three_firebase_markers_to_be_false(self):
+        verify_firebase_auto_init_off(firebase_manifest())
+        for invalid in (
+            firebase_manifest("true"),
+            firebase_manifest().replace(FIREBASE_AUTO_INIT_MARKERS[0], "missing", 1),
+            firebase_manifest() + firebase_manifest(),
+        ):
+            with self.subTest(payload=invalid), self.assertRaises(VerificationError):
+                verify_firebase_auto_init_off(invalid)
 
 
 if __name__ == "__main__":

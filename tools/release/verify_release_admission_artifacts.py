@@ -11,6 +11,11 @@ import sys
 
 
 MARKER = "com.jay.fxi.TOPIC_V2_RELEASE_ON"
+FIREBASE_AUTO_INIT_MARKERS = (
+    "firebase_analytics_collection_enabled",
+    "firebase_crashlytics_collection_enabled",
+    "firebase_messaging_auto_init_enabled",
+)
 BOOLEAN_VALUE = re.compile(r"android:value\(0x01010024\)=(true|false)\s*$")
 
 
@@ -18,12 +23,12 @@ class VerificationError(ValueError):
     pass
 
 
-def parse_marker(xmltree: str) -> bool:
+def parse_boolean_metadata(xmltree: str, name: str) -> bool:
     lines = xmltree.splitlines()
-    name_lines = [index for index, line in enumerate(lines) if MARKER in line]
+    name_lines = [index for index, line in enumerate(lines) if name in line]
     if len(name_lines) != 1:
         raise VerificationError(
-            f"expected exactly one {MARKER} marker, found {len(name_lines)}"
+            f"expected exactly one {name} marker, found {len(name_lines)}"
         )
 
     name_line = name_lines[0]
@@ -43,6 +48,16 @@ def parse_marker(xmltree: str) -> bool:
             "marker must have exactly one direct binary-boolean android:value attribute"
         )
     return values[0]
+
+
+def parse_marker(xmltree: str) -> bool:
+    return parse_boolean_metadata(xmltree, MARKER)
+
+
+def verify_firebase_auto_init_off(xmltree: str) -> None:
+    for marker in FIREBASE_AUTO_INIT_MARKERS:
+        if parse_boolean_metadata(xmltree, marker):
+            raise VerificationError(f"OFF artifact enables Firebase auto-init marker {marker}")
 
 
 def dump_manifest(aapt2: Path, apk: Path) -> str:
@@ -84,12 +99,15 @@ def main(argv: list[str] | None = None) -> int:
         if name in seen:
             raise VerificationError(f"duplicate artifact name: {name}")
         seen.add(name)
-        actual = parse_marker(dump_manifest(args.aapt2, apk))
+        xmltree = dump_manifest(args.aapt2, apk)
+        actual = parse_marker(xmltree)
         if actual != expected:
             raise VerificationError(
                 f"{name}: expected admission {'ON' if expected else 'OFF'}, "
                 f"packaged marker is {'ON' if actual else 'OFF'}"
             )
+        if not expected:
+            verify_firebase_auto_init_off(xmltree)
         print(f"{name}: admission {'ON' if actual else 'OFF'} ({apk})")
     return 0
 
