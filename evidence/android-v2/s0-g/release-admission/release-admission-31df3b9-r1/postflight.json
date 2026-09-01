@@ -1,0 +1,15 @@
+{
+  "device": {
+    "api": 35,
+    "fingerprint": "samsung/b2qksx/b2q:15/AP3A.240905.015.A2/F711NKSSEKZE1:user/release-keys",
+    "model": "SM-F711N",
+    "orientation": 0,
+    "overrideSize": null,
+    "physicalSize": "1080x2640",
+    "posture": "OPENED",
+    "viewportSize": "1080x2640",
+    "wakefulness": "Awake"
+  },
+  "observedAt": "2026-09-01T09:11:48.855909+00:00",
+  "runId": "release-admission-31df3b9-r1"
+}

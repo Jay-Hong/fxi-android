@@ -38,5 +38,15 @@ Only a validator-green four-file bundle may be promoted to
 `evidence/android-v2/s0-g/release-admission/<run-id>/`. Do not promote raw ADB,
 UIAutomator, logcat, Gradle, or netstats output; the runner records only strict
 sanitized claims and SHA-256 bindings. The transient UIAutomator hierarchy is read
-back from one run-id-owned device path and its removal is mandatory. The validator binds source files to the
-recorded clean commit, which intentionally need not equal the later evidence commit.
+back from one run-id-owned device path and its removal is mandatory. The validator
+binds source files to the recorded clean commit, which intentionally need not equal
+the later evidence commit.
+
+## Sealed S0-g baseline
+
+The durable device baseline is
+`evidence/android-v2/s0-g/release-admission/release-admission-31df3b9-r1/`,
+produced from clean source commit
+`31df3b94af5715cc19b2eb4fa6abfaf1180384f9`. It proves the exact four structural
+tests and the process-cold notification-intent OFF window; it does not arm a public
+artifact or broaden release authorization.

@@ -1,0 +1,213 @@
+{
+  "artifactVerificationReturnCode": 0,
+  "artifactsAfter": {
+    "androidTestApk": {
+      "path": "app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk",
+      "sha256": "fd38ad041c56d15cbb2def26caa22b2e214755fcc6f9c88f02f735c4d10e5001",
+      "size": 1001206
+    },
+    "artifactVerifier": {
+      "path": "tools/release/verify_release_admission_artifacts.py",
+      "sha256": "bbd35646b78f7e72cd98695b724e13e7da98cc1d35a5d842a49755f3836ed087",
+      "size": 3982
+    },
+    "canonicalFirebaseFixture": {
+      "path": "ci/google-services.ci-fixture.json",
+      "sha256": "fad52dabbe0466b9d120c17aa71a305eb79066dc89bed7103b9cdb7fde32554f",
+      "size": 800
+    },
+    "debugFirebaseInput": {
+      "path": "app/src/debug/google-services.json",
+      "sha256": "fad52dabbe0466b9d120c17aa71a305eb79066dc89bed7103b9cdb7fde32554f",
+      "size": 800
+    },
+    "debugManifest": {
+      "path": "app/src/debug/AndroidManifest.xml",
+      "sha256": "0cf64c24ab01529d9a9f1f47a741ced224cfc0f2a4c95b6f314bf141ffefc5ab",
+      "size": 761
+    },
+    "evidenceValidator": {
+      "path": "tools/release/release_admission_evidence.py",
+      "sha256": "4ec8812e52e686d28da6c64a5f9f045d15eee230b4e0809920787aa892051648",
+      "size": 18368
+    },
+    "runner": {
+      "path": "tools/release/device_release_admission.py",
+      "sha256": "34f42b8543184045bf565505cd3d62730a3ae063408051edb05725428aab9cd2",
+      "size": 37265
+    },
+    "targetDebugApk": {
+      "path": "app/build/outputs/apk/debug/app-debug.apk",
+      "sha256": "bb75583ae001f0e7d035fecdde4aa4f4d6d143f24a1c33e722dbe20412438af0",
+      "size": 28158105
+    }
+  },
+  "artifactsBefore": {
+    "androidTestApk": {
+      "path": "app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk",
+      "sha256": "fd38ad041c56d15cbb2def26caa22b2e214755fcc6f9c88f02f735c4d10e5001",
+      "size": 1001206
+    },
+    "artifactVerifier": {
+      "path": "tools/release/verify_release_admission_artifacts.py",
+      "sha256": "bbd35646b78f7e72cd98695b724e13e7da98cc1d35a5d842a49755f3836ed087",
+      "size": 3982
+    },
+    "canonicalFirebaseFixture": {
+      "path": "ci/google-services.ci-fixture.json",
+      "sha256": "fad52dabbe0466b9d120c17aa71a305eb79066dc89bed7103b9cdb7fde32554f",
+      "size": 800
+    },
+    "debugFirebaseInput": {
+      "path": "app/src/debug/google-services.json",
+      "sha256": "fad52dabbe0466b9d120c17aa71a305eb79066dc89bed7103b9cdb7fde32554f",
+      "size": 800
+    },
+    "debugManifest": {
+      "path": "app/src/debug/AndroidManifest.xml",
+      "sha256": "0cf64c24ab01529d9a9f1f47a741ced224cfc0f2a4c95b6f314bf141ffefc5ab",
+      "size": 761
+    },
+    "evidenceValidator": {
+      "path": "tools/release/release_admission_evidence.py",
+      "sha256": "4ec8812e52e686d28da6c64a5f9f045d15eee230b4e0809920787aa892051648",
+      "size": 18368
+    },
+    "runner": {
+      "path": "tools/release/device_release_admission.py",
+      "sha256": "34f42b8543184045bf565505cd3d62730a3ae063408051edb05725428aab9cd2",
+      "size": 37265
+    },
+    "targetDebugApk": {
+      "path": "app/build/outputs/apk/debug/app-debug.apk",
+      "sha256": "bb75583ae001f0e7d035fecdde4aa4f4d6d143f24a1c33e722dbe20412438af0",
+      "size": 28158105
+    }
+  },
+  "artifactsStable": true,
+  "buildReturnCode": 0,
+  "evidenceDirectory": "release-admission-31df3b9-r1",
+  "evidenceFiles": {
+    "instrumentation-result.json": {
+      "sha256": "f363b653c6057318a1b56fc80b4ebe96b0b3f5c99ffd843b2d9c79ee2cc25ab0",
+      "size": 925
+    },
+    "postflight.json": {
+      "sha256": "6723d44c08d397f8b86ec6ec1c720baa56b2fe82a4078d5b75be5abd968b08e3",
+      "size": 418
+    },
+    "preflight.json": {
+      "sha256": "d9b235095ea6d4d6b13760070e820f9287126752e264ce68f5aad682ef57eabd",
+      "size": 418
+    }
+  },
+  "exitCode": 0,
+  "finishedAt": "2026-09-01T09:11:50.002050+00:00",
+  "installedArtifacts": {
+    "androidTestApk": {
+      "matchesStagedArtifact": true,
+      "sha256": "fd38ad041c56d15cbb2def26caa22b2e214755fcc6f9c88f02f735c4d10e5001",
+      "size": 1001206
+    },
+    "targetDebugApk": {
+      "matchesStagedArtifact": true,
+      "sha256": "bb75583ae001f0e7d035fecdde4aa4f4d6d143f24a1c33e722dbe20412438af0",
+      "size": 28158105
+    }
+  },
+  "instrumentationResult": {
+    "path": "instrumentation-result.json",
+    "rawSha256": "c9502c2f57355f347faa52b55908e162ace8391c7b3e9079ea17d9c35ab6e70e",
+    "sha256": "f363b653c6057318a1b56fc80b4ebe96b0b3f5c99ffd843b2d9c79ee2cc25ab0",
+    "size": 925
+  },
+  "instrumentationReturnCode": 0,
+  "postflight": {
+    "api": 35,
+    "fingerprint": "samsung/b2qksx/b2q:15/AP3A.240905.015.A2/F711NKSSEKZE1:user/release-keys",
+    "model": "SM-F711N",
+    "orientation": 0,
+    "overrideSize": null,
+    "physicalSize": "1080x2640",
+    "posture": "OPENED",
+    "viewportSize": "1080x2640",
+    "wakefulness": "Awake"
+  },
+  "preflight": {
+    "api": 35,
+    "fingerprint": "samsung/b2qksx/b2q:15/AP3A.240905.015.A2/F711NKSSEKZE1:user/release-keys",
+    "model": "SM-F711N",
+    "orientation": 0,
+    "overrideSize": null,
+    "physicalSize": "1080x2640",
+    "posture": "OPENED",
+    "viewportSize": "1080x2640",
+    "wakefulness": "Awake"
+  },
+  "processCold": {
+    "appClickableNodeCount": 0,
+    "applicationGuardObserved": true,
+    "composeViewPresent": true,
+    "forceStopPidAbsent": true,
+    "forceStoppedAfterObservation": true,
+    "mainActivityResumed": true,
+    "notificationExtrasSupplied": true,
+    "observationSeconds": 5.0,
+    "pidAbsentAfterObservation": true,
+    "postStopPolls": 2,
+    "postStopSnapshotsStable": true,
+    "startStatusOk": true,
+    "temporaryUiDumpRemoved": true,
+    "trafficAfter": {
+      "forcedPoll": true,
+      "historyRows": 0,
+      "historyRxBytes": 0,
+      "historyTxBytes": 0,
+      "liveRows": 0,
+      "liveRxBytes": 0,
+      "liveTxBytes": 0
+    },
+    "trafficAfterFirstPoll": {
+      "forcedPoll": true,
+      "historyRows": 0,
+      "historyRxBytes": 0,
+      "historyTxBytes": 0,
+      "liveRows": 0,
+      "liveRxBytes": 0,
+      "liveTxBytes": 0
+    },
+    "trafficBefore": {
+      "forcedPoll": true,
+      "historyRows": 0,
+      "historyRxBytes": 0,
+      "historyTxBytes": 0,
+      "liveRows": 0,
+      "liveRxBytes": 0,
+      "liveTxBytes": 0
+    },
+    "trafficDelta": {
+      "historyRxBytes": 0,
+      "historyTxBytes": 0,
+      "liveRxBytes": 0,
+      "liveTxBytes": 0
+    },
+    "unavailableMessagePresent": true,
+    "unavailableTitlePresent": true
+  },
+  "runId": "release-admission-31df3b9-r1",
+  "schemaVersion": 1,
+  "serialRecorded": false,
+  "sourceAtEnd": {
+    "commit": "31df3b94af5715cc19b2eb4fa6abfaf1180384f9",
+    "worktreeClean": true
+  },
+  "sourceAtStart": {
+    "commit": "31df3b94af5715cc19b2eb4fa6abfaf1180384f9",
+    "worktreeClean": true
+  },
+  "startedAt": "2026-09-01T09:09:52.898686+00:00",
+  "temporaryPackagesRemoved": true,
+  "temporarySourceSnapshotRemoved": true,
+  "temporaryStagingRemoved": true,
+  "verdict": "pass"
+}
