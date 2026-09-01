@@ -21,3 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "FXi"
 include(":app")
+include(":macrobenchmark")

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application>
+        <!-- Build-type-only shell profiling admission. This node must never merge into
+             release/public artifacts. Functional fixture admission belongs to S5. -->
+        <profileable
+            android:shell="true"
+            tools:targetApi="29" />
+
+        <!-- S0-f admission is a no-data launcher surface, not the S5 Tether fixture.
+             The activity/action/data exist only in the benchmark source set. -->
+        <activity
+            android:name=".benchmark.BenchmarkSmokeActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:finishOnTaskLaunch="true"
+            android:theme="@style/Theme.FXi">
+            <intent-filter>
+                <action android:name="com.jay.fxi.action.BENCHMARK_SMOKE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data
+                    android:host="smoke"
+                    android:path="/launcher"
+                    android:scheme="fxi-benchmark" />
+            </intent-filter>
+        </activity>
+
+        <!-- The release-like benchmark process still creates FXiApplication. These
+             metadata flags plus BENCHMARK_NO_DATA_MODE keep Analytics, Crashlytics,
+             and FCM collection disabled. The local runner supplies only the checked-in
+             non-production Firebase fixture. -->
+        <meta-data
+            android:name="firebase_analytics_collection_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="firebase_crashlytics_collection_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="firebase_messaging_auto_init_enabled"
+            android:value="false" />
+    </application>
+</manifest>

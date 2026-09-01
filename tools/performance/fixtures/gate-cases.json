@@ -1,0 +1,119 @@
+{
+  "cases": [
+    {
+      "id": "s5-exact-boundary-pass",
+      "mode": "s5",
+      "runs": [
+        {"p95Ms": -0.2, "p99Ms": 8.33, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 8.33, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 8.2, "frameCount": 100}
+      ],
+      "expected": "pass"
+    },
+    {
+      "id": "s5-p95-epsilon-fail",
+      "mode": "s5",
+      "runs": [
+        {"p95Ms": 0.001, "p99Ms": 1.0, "frameCount": 100},
+        {"p95Ms": 0.001, "p99Ms": 1.0, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 1.0, "frameCount": 100}
+      ],
+      "expected": "fail"
+    },
+    {
+      "id": "s5-p99-epsilon-fail",
+      "mode": "s5",
+      "runs": [
+        {"p95Ms": 0.0, "p99Ms": 8.331, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 8.331, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 8.33, "frameCount": 100}
+      ],
+      "expected": "fail"
+    },
+    {
+      "id": "missing-p95",
+      "mode": "s5",
+      "runs": [
+        {"p99Ms": 1.0, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 1.0, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 1.0, "frameCount": 100}
+      ],
+      "expected": "invalid"
+    },
+    {
+      "id": "missing-p99",
+      "mode": "s5",
+      "runs": [
+        {"p95Ms": 0.0, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 1.0, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 1.0, "frameCount": 100}
+      ],
+      "expected": "invalid"
+    },
+    {
+      "id": "missing-frame-count",
+      "mode": "s5",
+      "runs": [
+        {"p95Ms": 0.0, "p99Ms": 1.0},
+        {"p95Ms": 0.0, "p99Ms": 1.0, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 1.0, "frameCount": 100}
+      ],
+      "expected": "invalid"
+    },
+    {
+      "id": "s11-floor-equality-pass",
+      "mode": "s11",
+      "b99": -3.0,
+      "runs": [
+        {"p95Ms": 0.0, "p99Ms": 0.0, "frameCount": 100},
+        {"p95Ms": -0.1, "p99Ms": 0.0, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": -0.1, "frameCount": 100}
+      ],
+      "expected": "pass"
+    },
+    {
+      "id": "s11-floor-epsilon-fail",
+      "mode": "s11",
+      "b99": -3.0,
+      "runs": [
+        {"p95Ms": 0.0, "p99Ms": 0.001, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 0.001, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 0.0, "frameCount": 100}
+      ],
+      "expected": "fail"
+    },
+    {
+      "id": "s11-interior-equality-pass",
+      "mode": "s11",
+      "b99": 2.0,
+      "runs": [
+        {"p95Ms": 0.0, "p99Ms": 4.0, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 4.0, "frameCount": 100},
+        {"p95Ms": -0.1, "p99Ms": 3.9, "frameCount": 100}
+      ],
+      "expected": "pass"
+    },
+    {
+      "id": "s11-cap-equality-pass",
+      "mode": "s11",
+      "b99": 7.0,
+      "runs": [
+        {"p95Ms": 0.0, "p99Ms": 8.33, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 8.33, "frameCount": 100},
+        {"p95Ms": -0.1, "p99Ms": 8.2, "frameCount": 100}
+      ],
+      "expected": "pass"
+    },
+    {
+      "id": "s11-cap-epsilon-fail",
+      "mode": "s11",
+      "b99": 7.0,
+      "runs": [
+        {"p95Ms": 0.0, "p99Ms": 8.331, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 8.331, "frameCount": 100},
+        {"p95Ms": 0.0, "p99Ms": 8.33, "frameCount": 100}
+      ],
+      "expected": "fail"
+    }
+  ]
+}

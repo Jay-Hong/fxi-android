@@ -56,14 +56,21 @@ jobs:
       # build-type 전용 경로만 사용하므로 release variant는 이 fixture를 볼 수 없다.
       - name: Supply non-production google-services.json
         run: |
-          mkdir -p app/src/debug app/src/ciMinified
+          mkdir -p app/src/debug app/src/ciMinified app/src/benchmark
           cp ci/google-services.ci-fixture.json app/src/debug/google-services.json
           cp ci/google-services.ci-fixture.json app/src/ciMinified/google-services.json
+          cp ci/google-services.ci-fixture.json app/src/benchmark/google-services.json
 
       # Pure-stdlib tests for the manual contract refresh tool. They do not
       # import the server or require the sibling Python repository.
       - name: Contract generator utility tests
         run: python3 -m unittest discover -s tools/contracts -p 'test_*.py'
+
+      - name: Benchmark gate parser and evidence fixtures
+        run: |
+          python3 -m unittest discover -s tools/performance -p 'test_*.py'
+          python3 tools/performance/benchmark_gate.py check-fixtures \
+            tools/performance/fixtures/gate-cases.json
 
       - name: Unit tests
         run: ./gradlew testDebugUnitTest
@@ -80,11 +87,30 @@ jobs:
       - name: Instrumented test compile (no device execution)
         run: ./gradlew assembleDebugAndroidTest
 
+      # S0-f builds both sides of the physical-device lane on hosted Linux. Hosted CI does
+      # not execute device tests; the local S0-f smoke enters only the benchmark no-data
+      # Activity. MainActivity/Root functional journeys still wait for S0-g/S5 admission.
+      - name: Macrobenchmark target and test APK compile (no device execution)
+        run: ./gradlew :app:assembleBenchmark :macrobenchmark:assembleBenchmark
+
       # R8 lane 을 S11 로 미루지 않는 이유: kotlinx-serialization + R8 은
       # keep 규칙 누락으로 실제로 깨지는 조합이다(계획 §7 S0 각주).
       # ciMinified 는 release 를 상속해 동일 minify 규칙을 태우되 debug 서명을 쓴다.
       - name: R8 minified lane
         run: ./gradlew assembleCiMinified
+
+      - name: Verify Macrobenchmark artifact wiring
+        run: |
+          mkdir -p build/reports/s0f
+          ./gradlew :app:dependencyInsight \
+            --configuration benchmarkRuntimeClasspath \
+            --dependency androidx.profileinstaller:profileinstaller \
+            --console=plain > build/reports/s0f/profileinstaller.txt
+          python3 tools/performance/verify_benchmark_artifacts.py \
+            --target-apk app/build/outputs/apk/benchmark/app-benchmark.apk \
+            --test-apk macrobenchmark/build/outputs/apk/benchmark/macrobenchmark-benchmark.apk \
+            --public-like-apk app/build/outputs/apk/ciMinified/app-ciMinified.apk \
+            --dependency-report build/reports/s0f/profileinstaller.txt
 
       - name: Upload reports on failure
         if: failure()

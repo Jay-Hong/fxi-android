@@ -15,18 +15,30 @@ import com.revenuecat.purchases.Purchases
 import com.revenuecat.purchases.PurchasesConfiguration
 import dagger.hilt.android.HiltAndroidApp
 
+internal fun shouldEnableCrashlytics(debug: Boolean, benchmarkNoData: Boolean): Boolean =
+    !debug && !benchmarkNoData
+
 @HiltAndroidApp
 class FXiApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
 
-        // 1. Firebase 초기화
-        FirebaseApp.initializeApp(this)
-
-        // 2. Crashlytics 설정
-        FirebaseCrashlytics.getInstance().apply {
-            setCrashlyticsCollectionEnabled(!BuildConfig.DEBUG)
+        // 1-2. S0-f benchmark-only no-data surface must not start collectors. Its
+        // manifest also disables Analytics/Crashlytics/FCM auto-init; this guard is
+        // required because the explicit Crashlytics API overrides manifest metadata.
+        if (!BuildConfig.BENCHMARK_NO_DATA_MODE) {
+            FirebaseApp.initializeApp(this)
+            FirebaseCrashlytics.getInstance().apply {
+                setCrashlyticsCollectionEnabled(
+                    shouldEnableCrashlytics(
+                        debug = BuildConfig.DEBUG,
+                        benchmarkNoData = BuildConfig.BENCHMARK_NO_DATA_MODE
+                    )
+                )
+            }
+        } else {
+            Log.i(TAG, "Benchmark no-data mode: Firebase collectors remain disabled.")
         }
 
         // 3. 알림 채널 생성

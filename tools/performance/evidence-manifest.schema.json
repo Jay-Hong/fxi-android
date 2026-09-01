@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxi.local/schemas/benchmark-evidence-v1.json",
+  "title": "FXi Android benchmark evidence manifest",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schemaVersion",
+    "gate",
+    "verdict",
+    "sourceCommit",
+    "libraries",
+    "measurementContract",
+    "artifacts",
+    "journeys"
+  ],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "gate": {"enum": ["S5", "S11"]},
+    "verdict": {"enum": ["pass", "fail"]},
+    "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "goldenManifestSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "approvedAt", "authority"],
+      "properties": {
+        "status": {"const": "approved"},
+        "approvedAt": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+        },
+        "authority": {"const": "user"}
+      }
+    },
+    "libraries": {
+      "const": {
+        "agp": "8.13.2",
+        "benchmark": "1.4.1",
+        "profileInstaller": "1.4.1",
+        "uiautomator": "2.4.0"
+      }
+    },
+    "measurementContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model", "fingerprint", "api", "posture", "display", "animationScale",
+        "lowPower", "charging", "batteryMin", "thermalRequired", "compilationMode",
+        "startupMode", "repeatIterations", "validRuns", "maxAttempts"
+      ]
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "targetBenchmarkApk", "macrobenchmarkTestApk", "fixturePayload", "parser",
+        "harnessResolvedGraph", "productionResolvedGraph", "r8RulesCanonicalManifest"
+      ]
+    },
+    "journeys": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["id", "medianP95Ms", "medianP99Ms", "frameCount", "verdict", "runs", "attempts"],
+        "properties": {
+          "runs": {"type": "array", "minItems": 3, "maxItems": 3},
+          "attempts": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "required": ["attemptId", "ordinal", "outcome"],
+              "properties": {
+                "attemptId": {"type": "string", "minLength": 1},
+                "ordinal": {"type": "integer", "minimum": 1, "maximum": 5},
+                "outcome": {"enum": ["valid", "invalid"]},
+                "reason": {"enum": ["environment-invalid", "result-malformed"]}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

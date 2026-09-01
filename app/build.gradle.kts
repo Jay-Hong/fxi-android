@@ -57,6 +57,8 @@ android {
             "REVENUECAT_API_KEY",
             "\"${localProperties.getProperty("REVENUECAT_API_KEY", "")}\""
         )
+        // False everywhere except the isolated benchmark source set/build type.
+        buildConfigField("boolean", "BENCHMARK_NO_DATA_MODE", "false")
     }
 
     buildTypes {
@@ -79,6 +81,22 @@ android {
             signingConfig = signingConfigs.getByName("debug")
             matchingFallbacks += listOf("release")
             // mapping 업로드는 Firebase 자격이 필요하다. CI lane 은 R8 통과만 검증한다.
+            configure<com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsExtension> {
+                mappingFileUploadEnabled = false
+            }
+        }
+        // S0-f: release-like target for the local physical-device Macrobenchmark lane.
+        // It keeps release applicationId/R8 rules and is deliberately non-debuggable, but
+        // uses ephemeral debug signing so production signing material is never required.
+        create("benchmark") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+            isDebuggable = false
+            matchingFallbacks += listOf("release")
+            // A developer's local RevenueCat key must never leak into the ephemeral
+            // benchmark artifact. The D24 OFF gate remains the runtime admission owner.
+            buildConfigField("String", "REVENUECAT_API_KEY", "\"\"")
+            buildConfigField("boolean", "BENCHMARK_NO_DATA_MODE", "true")
             configure<com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsExtension> {
                 mappingFileUploadEnabled = false
             }
@@ -169,6 +187,9 @@ dependencies {
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    // S0-f D31: the target benchmark APK must contain ProfileInstaller 1.4.1 as a
+    // real resolved dependency. A catalog pin alone does not satisfy the gate.
+    add("benchmarkImplementation", libs.androidx.profileinstaller)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
 }
