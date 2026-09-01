@@ -1,0 +1,18 @@
+{
+  "data": {
+    "asset": "usdt-krw",
+    "body": "[ 1390 ↑이상 도달 ]",
+    "condition": "above",
+    "is_repeat": "false",
+    "rate": "1392.2",
+    "setting_id": "102",
+    "source": "upbit",
+    "threshold": "1390.0",
+    "title": "📈 업비트  테더  1392.2",
+    "type": "source_rate_alert"
+  },
+  "notification": {
+    "body": "[ 1390 ↑이상 도달 ]",
+    "title": "📈 업비트  테더  1392.2"
+  }
+}

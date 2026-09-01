@@ -1,0 +1,18 @@
+{
+  "accepted_topics": [],
+  "active_subscriptions": [],
+  "operation": "subscribe",
+  "rejected_topics": [
+    {
+      "error": "premium_required",
+      "topic": "fx:usd-krw"
+    },
+    {
+      "error": "premium_required",
+      "topic": "krx:usd-krw-futures"
+    }
+  ],
+  "removed_topics": [],
+  "request_id": "premium-denied",
+  "type": "subscription_ack"
+}

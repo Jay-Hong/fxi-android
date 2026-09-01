@@ -1,0 +1,10 @@
+{
+  "detail": "period '2y' not free-available",
+  "error": "unsupported_period",
+  "free_periods": [
+    "1d",
+    "1w",
+    "3m",
+    "1y"
+  ]
+}

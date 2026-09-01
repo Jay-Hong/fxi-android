@@ -1,0 +1,18 @@
+{
+  "data": {
+    "bank": "hana",
+    "body": "[ 1390 ↑이상 도달 ]",
+    "condition": "above",
+    "currency": "usd-krw",
+    "is_repeat": "false",
+    "rate": "1391.2",
+    "setting_id": "101",
+    "threshold": "1390.0",
+    "title": "📈 하나은행  달러  1391.2",
+    "type": "rate_alert"
+  },
+  "notification": {
+    "body": "[ 1390 ↑이상 도달 ]",
+    "title": "📈 하나은행  달러  1391.2"
+  }
+}

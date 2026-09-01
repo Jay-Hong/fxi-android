@@ -1,0 +1,63 @@
+{
+  "data": {
+    "banks": [
+      {
+        "asset": "eur-krw",
+        "rate": 10.31,
+        "source": "kb",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "eur-krw",
+        "rate": 10.41,
+        "source": "hana",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "eur-krw",
+        "rate": 10.51,
+        "source": "shinhan",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "eur-krw",
+        "rate": 10.610000000000001,
+        "source": "woori",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "eur-krw",
+        "rate": 10.71,
+        "source": "ibk",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "eur-krw",
+        "rate": 10.81,
+        "source": "nh",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "eur-krw",
+        "rate": 10.91,
+        "source": "sc",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "eur-krw",
+        "rate": 11.01,
+        "source": "bs",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      }
+    ],
+    "reference": {
+      "asset": "eur-krw",
+      "rate": 10.31,
+      "source": "investing",
+      "timestamp": "2026-08-31T10:20:00+09:00"
+    }
+  },
+  "topic": "fx:eur-krw",
+  "type": "snapshot",
+  "version": 1
+}

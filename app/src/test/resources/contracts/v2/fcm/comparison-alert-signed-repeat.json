@@ -1,0 +1,26 @@
+{
+  "data": {
+    "body": "[ -5 ↓이하 도달]",
+    "diff_type": "signed",
+    "is_repeat": "true",
+    "left_asset": "usdt-krw",
+    "left_observed_at": "2026-08-31T01:20:00",
+    "left_rate": "1392.0",
+    "left_source": "upbit",
+    "operator": "lte",
+    "right_asset": "usd-krw-futures",
+    "right_observed_at": "2026-08-31T01:20:00",
+    "right_rate": "1397.5",
+    "right_source": "krx",
+    "setting_id": "106",
+    "spread": "-5.5",
+    "tab": "tether",
+    "threshold": "-5.0",
+    "title": "📊 업비트 - 달러선물  김프  -5.5 (-0.39%)",
+    "type": "comparison_alert"
+  },
+  "notification": {
+    "body": "[ -5 ↓이하 도달]",
+    "title": "📊 업비트 - 달러선물  김프  -5.5 (-0.39%)"
+  }
+}

@@ -1,0 +1,338 @@
+{
+  "as_of": "2026-08-31T09:30:00+09:00",
+  "generated_at": "2026-08-31T10:20:00+09:00",
+  "graph": {
+    "bucket_size": "10min",
+    "domain_end_at": "2026-08-31T09:30:00+09:00",
+    "domain_start_at": "2026-08-30T09:30:00+09:00",
+    "live_domain_mode": "rolling",
+    "range": {
+      "end": "2026-08-31",
+      "start": "2026-08-30"
+    },
+    "series": [
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.0,
+            "low": 1388.0,
+            "rate": 1388.0,
+            "source": "investing",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "investing.usd",
+        "label": "인베스팅",
+        "provenance": {
+          "actual_source": "investing",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.0,
+            "low": 1388.0,
+            "rate": 1388.0,
+            "source": "kb",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "kb.usd",
+        "label": "KB국민은행",
+        "provenance": {
+          "actual_source": "kb",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.1,
+            "low": 1388.1,
+            "rate": 1388.1,
+            "source": "hana",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "hana.usd",
+        "label": "하나은행",
+        "provenance": {
+          "actual_source": "hana",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.2,
+            "low": 1388.2,
+            "rate": 1388.2,
+            "source": "shinhan",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "shinhan.usd",
+        "label": "신한은행",
+        "provenance": {
+          "actual_source": "shinhan",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.3,
+            "low": 1388.3,
+            "rate": 1388.3,
+            "source": "woori",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "woori.usd",
+        "label": "우리은행",
+        "provenance": {
+          "actual_source": "woori",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.4,
+            "low": 1388.4,
+            "rate": 1388.4,
+            "source": "ibk",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "ibk.usd",
+        "label": "IBK기업은행",
+        "provenance": {
+          "actual_source": "ibk",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.5,
+            "low": 1388.5,
+            "rate": 1388.5,
+            "source": "nh",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "nh.usd",
+        "label": "NH농협은행",
+        "provenance": {
+          "actual_source": "nh",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.6,
+            "low": 1388.6,
+            "rate": 1388.6,
+            "source": "sc",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "sc.usd",
+        "label": "SC제일은행",
+        "provenance": {
+          "actual_source": "sc",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.7,
+            "low": 1388.7,
+            "rate": 1388.7,
+            "source": "bs",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "bs.usd",
+        "label": "부산은행",
+        "provenance": {
+          "actual_source": "bs",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "index",
+        "data": [
+          {
+            "high": 103.4,
+            "low": 103.4,
+            "rate": 103.4,
+            "source": "dxy",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 3,
+        "id": "dxy",
+        "label": "달러지수",
+        "provenance": {
+          "actual_source": "dxy",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "INDEX"
+      }
+    ]
+  },
+  "period": "1d",
+  "rate": {
+    "asset": "usd-krw",
+    "entries": [
+      {
+        "bank": "investing",
+        "currency": "usd-krw",
+        "rate": 1388.0,
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "bank": "kb",
+        "currency": "usd-krw",
+        "rate": 1388.0,
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "bank": "hana",
+        "currency": "usd-krw",
+        "rate": 1388.1,
+        "timestamp": "2026-08-31T09:20:01+09:00"
+      },
+      {
+        "bank": "shinhan",
+        "currency": "usd-krw",
+        "rate": 1388.2,
+        "timestamp": "2026-08-31T09:20:02+09:00"
+      },
+      {
+        "bank": "woori",
+        "currency": "usd-krw",
+        "rate": 1388.3,
+        "timestamp": "2026-08-31T09:20:03+09:00"
+      },
+      {
+        "bank": "ibk",
+        "currency": "usd-krw",
+        "rate": 1388.4,
+        "timestamp": "2026-08-31T09:20:04+09:00"
+      },
+      {
+        "bank": "nh",
+        "currency": "usd-krw",
+        "rate": 1388.5,
+        "timestamp": "2026-08-31T09:20:05+09:00"
+      },
+      {
+        "bank": "sc",
+        "currency": "usd-krw",
+        "rate": 1388.6,
+        "timestamp": "2026-08-31T09:20:06+09:00"
+      },
+      {
+        "bank": "bs",
+        "currency": "usd-krw",
+        "rate": 1388.7,
+        "timestamp": "2026-08-31T09:20:07+09:00"
+      }
+    ]
+  },
+  "refresh_not_before": "2026-08-31T10:31:00+09:00",
+  "tab": "usd"
+}

@@ -1,0 +1,10 @@
+{
+  "detail": "tab 'unknown' not found",
+  "error": "unknown_tab",
+  "known_tabs": [
+    "usd",
+    "jpy",
+    "eur",
+    "tether"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "logs": [
+    {
+      "bank": "hana",
+      "condition": "above",
+      "currency": "usd-krw",
+      "id": 501,
+      "rate": 1391.2,
+      "sent_at": "2026-08-31T10:00:00+09:00",
+      "setting_id": 101,
+      "threshold": 1390.0
+    }
+  ],
+  "total_count": 1
+}

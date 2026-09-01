@@ -1,0 +1,18 @@
+{
+  "data": {
+    "asset": "usd-krw-futures",
+    "body": "[ 1400 ↓이하 도달 ]",
+    "condition": "below",
+    "is_repeat": "true",
+    "rate": "1397.5",
+    "setting_id": "105",
+    "source": "krx",
+    "threshold": "1400.0",
+    "title": "📉 달러선물  1397.5",
+    "type": "source_rate_alert"
+  },
+  "notification": {
+    "body": "[ 1400 ↓이하 도달 ]",
+    "title": "📉 달러선물  1397.5"
+  }
+}

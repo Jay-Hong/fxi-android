@@ -1,0 +1,42 @@
+{
+  "accepted_topics": [
+    {
+      "lease_duration_seconds": 880,
+      "lease_id": "fixture-lease-0",
+      "topic": "fx:usd-krw"
+    },
+    {
+      "lease_duration_seconds": 880,
+      "lease_id": "fixture-lease-1",
+      "topic": "usdt:krw"
+    },
+    {
+      "lease_duration_seconds": 870,
+      "lease_id": "fixture-lease-2",
+      "topic": "krx:usd-krw-futures"
+    }
+  ],
+  "active_subscriptions": [
+    {
+      "lease_duration_seconds": 880,
+      "lease_id": "fixture-lease-0",
+      "topic": "fx:usd-krw"
+    },
+    {
+      "lease_duration_seconds": 870,
+      "lease_id": "fixture-lease-2",
+      "topic": "krx:usd-krw-futures"
+    },
+    {
+      "lease_duration_seconds": 880,
+      "lease_id": "fixture-lease-1",
+      "topic": "usdt:krw"
+    }
+  ],
+  "operation": "subscribe",
+  "rejected_topics": [],
+  "removed_topics": [],
+  "request_id": "enforce-all",
+  "request_id": "attacker-value",
+  "type": "subscription_ack"
+}

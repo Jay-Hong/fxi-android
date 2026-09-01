@@ -1,0 +1,8 @@
+{
+  "bank": "hana",
+  "condition": "above",
+  "currency": "usd-krw",
+  "is_enabled": true,
+  "repeat_interval_sec": null,
+  "threshold": 1390.0
+}

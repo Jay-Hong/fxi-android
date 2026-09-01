@@ -1,0 +1,2748 @@
+{
+  "fixtureAsOf": "2026-08-31T10:20:00+09:00",
+  "fixtures": [
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "derivedFrom": "free-usd-3m",
+      "family": "adversarial",
+      "id": "adversarial-allowed-id-krx-provenance",
+      "mediaType": "application/json",
+      "mutation": "set first point source=krx while preserving an allowed series id",
+      "origin": "adversarial",
+      "path": "adversarial/allowed-id-krx-provenance.json",
+      "producer": "deterministic mutation of checked valid fixture",
+      "runtimeReachability": "invalid-input",
+      "sha256": "5cd17071ad652fb085f97c8fe921d70bd7ae1a78e101b5e7871e296e2e6f33e5",
+      "source": {
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "derivedFrom": "free-usd-3m",
+      "family": "adversarial",
+      "id": "adversarial-cross-tab-series",
+      "mediaType": "application/json",
+      "mutation": "append one complete tether-only series to the usd tab",
+      "origin": "adversarial",
+      "path": "adversarial/cross-tab-series.json",
+      "producer": "deterministic mutation of checked valid fixture",
+      "runtimeReachability": "invalid-input",
+      "sha256": "09b0732e50d35d97fdd1c06d19021363fe01ff22e7f116a5d48c1e59638439eb",
+      "source": {
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "derivedFrom": "free-usd-3m",
+      "family": "adversarial",
+      "id": "adversarial-direct-krx-series",
+      "mediaType": "application/json",
+      "mutation": "append one complete krx.usd-krw-futures series to a free graph",
+      "origin": "adversarial",
+      "path": "adversarial/direct-krx-series.json",
+      "producer": "deterministic mutation of checked valid fixture",
+      "runtimeReachability": "invalid-input",
+      "sha256": "2c5f547be5608fe89aa15ce9e54c670548d64b197384a5d62689217293ad0108",
+      "source": {
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "derivedFrom": "topic-ack-enforce-all-granted",
+      "family": "adversarial",
+      "id": "adversarial-duplicate-key-first-wins",
+      "mediaType": "application/json",
+      "mutation": "insert exactly one second request_id member into the canonical ACK raw bytes; the frozen first-wins consumer policy is enforced when S1 replaces the wire decoder",
+      "origin": "adversarial",
+      "path": "adversarial/duplicate-key-first-wins.json",
+      "producer": "hand-authored raw bytes; JSON serializers cannot preserve duplicate keys",
+      "runtimeReachability": "invalid-input",
+      "sha256": "8cb2fe40431a07fdf32eec77f8b7c9ace59af4b56222c9631613e74e52c52fa5",
+      "source": {
+        "rawBytesRequired": true,
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "derivedFrom": "free-usd-3m",
+      "family": "adversarial",
+      "id": "adversarial-free-in-progress",
+      "mediaType": "application/json",
+      "mutation": "inject premium live-tail in_progress into a free snapshot",
+      "origin": "adversarial",
+      "path": "adversarial/free-in-progress.json",
+      "producer": "deterministic mutation of checked valid fixture",
+      "runtimeReachability": "invalid-input",
+      "sha256": "0bcef6b85d240e7550ba8da7825ce3157a9cb2bfca4d372dd062362b231c41ae",
+      "source": {
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "derivedFrom": "free-tether-3m",
+      "family": "adversarial",
+      "id": "adversarial-futures-rate-group",
+      "mediaType": "application/json",
+      "mutation": "inject removed usd_krw_futures group into the free tether rate block",
+      "origin": "adversarial",
+      "path": "adversarial/futures-rate-group.json",
+      "producer": "deterministic mutation of checked valid fixture",
+      "runtimeReachability": "invalid-input",
+      "sha256": "4ebc084d6d12b7135e6a2aeb58fb4d73be125977188bbbfe66b4b300ebd584ac",
+      "source": {
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-bank-create-once-request",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/bank-create-once-request.json",
+      "producer": "app.schemas.NotificationSettingRequest",
+      "runtimeReachability": "runtime",
+      "sha256": "eb01127fd4ec3ba91bae6d41e696ab396a0731b0dac2639ce16f4b5d150dc6a2",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-bank-create-repeat-request",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/bank-create-repeat-request.json",
+      "producer": "app.schemas.NotificationSettingRequest",
+      "runtimeReachability": "runtime",
+      "sha256": "7dcff089ffdc4851836f6c47c3b004b0491af1497b6ac2870662be4740f30ce9",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-bank-history-item",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/bank-history-item.json",
+      "producer": "app.schemas.NotificationLogResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "01a3c491fb32fc47d8730c16d75c50331b0b56b647936ddc0a87c7c77bca3679",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-bank-history-list",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/bank-history-list.json",
+      "producer": "app.schemas.NotificationLogsListResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "fe56c2beff3c6c220a6b03aeb97daf31d0dc2234d41d6580c7ac7be870963075",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-bank-setting-response",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/bank-setting-response.json",
+      "producer": "app.schemas.NotificationSettingResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "0f9ed3c1a318d482b84c2ce5e64284e439bd30205653f417fcc1380628e6e056",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-bank-settings-list",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/bank-settings-list.json",
+      "producer": "app.schemas.NotificationSettingsListResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "0726b317a5903d8f71f99d88b108ade347ea18b27a6bf2d47c4b4d89e96be5b4",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-bank-update-omitted",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/bank-update-omitted.json",
+      "producer": "app.schemas.NotificationSettingUpdateRequest.model_fields_set",
+      "runtimeReachability": "runtime",
+      "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "source": {
+        "fieldsSet": [],
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-bank-update-once-null",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/bank-update-once-null.json",
+      "producer": "app.schemas.NotificationSettingUpdateRequest.model_fields_set",
+      "runtimeReachability": "runtime",
+      "sha256": "d3f849909c94ad9be76d655ee2e64c9662dabfb6642ea980dbd660925e7e7fee",
+      "source": {
+        "fieldsSet": [
+          "repeat_interval_sec"
+        ],
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-bank-update-repeat",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/bank-update-repeat.json",
+      "producer": "app.schemas.NotificationSettingUpdateRequest.model_fields_set",
+      "runtimeReachability": "runtime",
+      "sha256": "26e603b68d619a03a73e6da83e8af10a5e5cd21023d7d9e8698b417a98e3aa46",
+      "source": {
+        "fieldsSet": [
+          "repeat_interval_sec"
+        ],
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-comparison-absolute-create-request",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/comparison-absolute-create-request.json",
+      "producer": "app.schemas.ComparisonAlertRequest",
+      "runtimeReachability": "runtime",
+      "sha256": "cc7640fdefb45aec19c55f58e431da63e4bb7b20cc63b79b1c710088a99aa91c",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-comparison-history-item",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/comparison-history-item.json",
+      "producer": "app.schemas.ComparisonNotificationLogResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "6b0bb4185aecfd0df53431a4529f6a73d58ecf6fed506320f6390fffa22b7d4e",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false,
+        "semanticValidator": "app.notifications.comparison_evaluator.spread_matches"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-comparison-history-list",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/comparison-history-list.json",
+      "producer": "app.schemas.ComparisonNotificationLogsListResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "90c9bedd5a7afe382c07d98eb5672c66895f5cdf5a531a5acdd3901b398fbf84",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false,
+        "semanticValidator": "app.notifications.comparison_evaluator.spread_matches"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-comparison-setting-response",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/comparison-setting-response.json",
+      "producer": "app.schemas.ComparisonAlertResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "301582d2b88a339a4b8b1817bc57131faa72d60ee5ab60f41f52f1b55e8b9082",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-comparison-settings-list",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/comparison-settings-list.json",
+      "producer": "app.schemas.ComparisonAlertsListResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "e2401c48803cf32378f4bfe44ec4475c3489cb5c89e5d2e5a50d7439e1af3a30",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-comparison-signed-create-request",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/comparison-signed-create-request.json",
+      "producer": "app.schemas.ComparisonAlertRequest",
+      "runtimeReachability": "runtime",
+      "sha256": "febe0bf0f24745007f7c94cfd5cd9367c5b2f8489c602f555fffd808a18c9013",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-comparison-update-omitted",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/comparison-update-omitted.json",
+      "producer": "app.schemas.ComparisonAlertUpdateRequest.model_fields_set",
+      "runtimeReachability": "runtime",
+      "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "source": {
+        "fieldsSet": [],
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-comparison-update-once-null",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/comparison-update-once-null.json",
+      "producer": "app.schemas.ComparisonAlertUpdateRequest.model_fields_set",
+      "runtimeReachability": "runtime",
+      "sha256": "d3f849909c94ad9be76d655ee2e64c9662dabfb6642ea980dbd660925e7e7fee",
+      "source": {
+        "fieldsSet": [
+          "repeat_interval_sec"
+        ],
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-comparison-update-repeat",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/comparison-update-repeat.json",
+      "producer": "app.schemas.ComparisonAlertUpdateRequest.model_fields_set",
+      "runtimeReachability": "runtime",
+      "sha256": "26e603b68d619a03a73e6da83e8af10a5e5cd21023d7d9e8698b417a98e3aa46",
+      "source": {
+        "fieldsSet": [
+          "repeat_interval_sec"
+        ],
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-source-create-once-request",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/source-create-once-request.json",
+      "producer": "app.schemas.SourceNotificationSettingRequest",
+      "runtimeReachability": "runtime",
+      "sha256": "3be4f86f1a8a808cf89348effb52365f806167ce2467a4169b959b03c593e487",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-source-create-repeat-request",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/source-create-repeat-request.json",
+      "producer": "app.schemas.SourceNotificationSettingRequest",
+      "runtimeReachability": "runtime",
+      "sha256": "64e136089a442c0a04d7aedc5dc1f7617496e5940b634a4eb9ba71dac2a97849",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-source-history-item",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/source-history-item.json",
+      "producer": "app.schemas.SourceNotificationLogResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "8e2e581f2e791a210a5f4f11d9aa05d7246e508f29a9791e6cde2eda8dbd077a",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-source-history-list",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/source-history-list.json",
+      "producer": "app.schemas.SourceNotificationLogsListResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "987121c2d901b8ed876a605ceb995414ed8611db90fa0bebe7ebaf0b9ec966cf",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-source-setting-response",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/source-setting-response.json",
+      "producer": "app.schemas.SourceNotificationSettingResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "5db24fb7859a1b15e06e27dc3ea3a9a167f23e7bf133a48e3081777e6831b85b",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-source-settings-list",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/source-settings-list.json",
+      "producer": "app.schemas.SourceNotificationSettingsListResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "1d18596343df3290d5dea6d87974bb792f417c8e6380d2ef2e43418aae3ce5a0",
+      "source": {
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-source-update-omitted",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/source-update-omitted.json",
+      "producer": "app.schemas.SourceNotificationSettingUpdateRequest.model_fields_set",
+      "runtimeReachability": "runtime",
+      "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "source": {
+        "fieldsSet": [],
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-source-update-once-null",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/source-update-once-null.json",
+      "producer": "app.schemas.SourceNotificationSettingUpdateRequest.model_fields_set",
+      "runtimeReachability": "runtime",
+      "sha256": "d3f849909c94ad9be76d655ee2e64c9662dabfb6642ea980dbd660925e7e7fee",
+      "source": {
+        "fieldsSet": [
+          "repeat_interval_sec"
+        ],
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "alerts",
+      "id": "alert-source-update-repeat",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "alerts/source-update-repeat.json",
+      "producer": "app.schemas.SourceNotificationSettingUpdateRequest.model_fields_set",
+      "runtimeReachability": "runtime",
+      "sha256": "26e603b68d619a03a73e6da83e8af10a5e5cd21023d7d9e8698b417a98e3aa46",
+      "source": {
+        "fieldsSet": [
+          "repeat_interval_sec"
+        ],
+        "module": "app/schemas.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "entitlements-active-krx-hidden",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "http/entitlements-active-krx-hidden.json",
+      "producer": "app.schemas.EntitlementsResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "ac1ca165e13144c471315a90a9f872623de7aca2b1af8bf3374cd8637b413e02",
+      "source": {
+        "http": {
+          "headers": {},
+          "method": "GET",
+          "path": "/api/entitlements",
+          "status": 200
+        },
+        "module": "app/schemas.py",
+        "route": "GET /api/entitlements",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "entitlements-active-krx-visible",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "http/entitlements-active-krx-visible.json",
+      "producer": "app.schemas.EntitlementsResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "231b8f3ccf7f09b14df8a5eefd86e3b9e5648c191d13e3d8d7d57853ebedfb30",
+      "source": {
+        "http": {
+          "headers": {},
+          "method": "GET",
+          "path": "/api/entitlements",
+          "status": 200
+        },
+        "module": "app/schemas.py",
+        "route": "GET /api/entitlements",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "inactive"
+      },
+      "family": "http",
+      "id": "entitlements-inactive",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "http/entitlements-inactive.json",
+      "producer": "app.schemas.EntitlementsResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "0b022531426665444ce27dd7910ddaee8d10cd86256ebb55365df4f4521481eb",
+      "source": {
+        "http": {
+          "headers": {},
+          "method": "GET",
+          "path": "/api/entitlements",
+          "status": 200
+        },
+        "module": "app/schemas.py",
+        "route": "GET /api/entitlements",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "pending"
+      },
+      "family": "http",
+      "id": "entitlements-pending",
+      "mediaType": "application/json",
+      "origin": "pydantic-schema",
+      "path": "http/entitlements-pending.json",
+      "producer": "app.schemas.EntitlementsResponse",
+      "runtimeReachability": "runtime",
+      "sha256": "f3e17cce631c56018c448ccee90dd42280d6bb3ef184c213f2716e16ed4c7382",
+      "source": {
+        "http": {
+          "headers": {},
+          "method": "GET",
+          "path": "/api/entitlements",
+          "status": 200
+        },
+        "module": "app/schemas.py",
+        "route": "GET /api/entitlements",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "fcm",
+      "id": "fcm-comparison-alert-absolute-once",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "fcm/comparison-alert-absolute-once.json",
+      "producer": "app.notifications.comparison_evaluator.ComparisonAlertEvaluator._build_payload + app.notifications.fcm._normalize_data_payload",
+      "runtimeReachability": "runtime",
+      "sha256": "e7f63f9e4b4b6162e5316a712cca346235b762cdda2c5af1367e8ba148a92606",
+      "source": {
+        "authoritativeRuntime": "app.notifications.comparison_evaluator",
+        "clientVisibleProjection": true,
+        "dataOnly": false,
+        "firebaseNetworkTraversed": false,
+        "firebaseSdkTransportCaptured": false,
+        "modules": [
+          "app/notifications/comparison_evaluator.py",
+          "app/notifications/fcm.py"
+        ],
+        "omittedTransportFields": [
+          "tokens",
+          "apns",
+          "android.priority",
+          "android.notification.sound"
+        ],
+        "projectionBoundary": "actual payload builder output plus actual _normalize_data_payload; equivalent to notification/data fields at send_fcm_multicast_sync before SDK send",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "fcm",
+      "id": "fcm-comparison-alert-signed-repeat",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "fcm/comparison-alert-signed-repeat.json",
+      "producer": "app.notifications.comparison_evaluator.ComparisonAlertEvaluator._build_payload + app.notifications.fcm._normalize_data_payload",
+      "runtimeReachability": "runtime",
+      "sha256": "376401d6dcfe997e9591a46518075e8744475c994c8e991dad97104efeca114b",
+      "source": {
+        "authoritativeRuntime": "app.notifications.comparison_evaluator",
+        "clientVisibleProjection": true,
+        "dataOnly": false,
+        "firebaseNetworkTraversed": false,
+        "firebaseSdkTransportCaptured": false,
+        "modules": [
+          "app/notifications/comparison_evaluator.py",
+          "app/notifications/fcm.py"
+        ],
+        "omittedTransportFields": [
+          "tokens",
+          "apns",
+          "android.priority",
+          "android.notification.sound"
+        ],
+        "projectionBoundary": "actual payload builder output plus actual _normalize_data_payload; equivalent to notification/data fields at send_fcm_multicast_sync before SDK send",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "fcm",
+      "id": "fcm-rate-alert-once",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "fcm/rate-alert-once.json",
+      "producer": "captured app.crud.process_rate_alerts + parity-checked app.notifications.alert_storage_backend.FxNotificationBackend.build_payload + app.notifications.fcm._normalize_data_payload",
+      "runtimeReachability": "runtime",
+      "sha256": "22fe56af6c75017b5e0fd3cc4e7cb05c8faf11a740ee7ca73754123e7c62e7db",
+      "source": {
+        "authoritativeRuntime": "app.crud.process_rate_alerts",
+        "clientVisibleProjection": true,
+        "dataOnly": false,
+        "dependencyPatches": [
+          "get_triggered_settings_for_rate",
+          "mark_setting_triggered",
+          "create_notification_log",
+          "emit_comparison_observation",
+          "init_firebase",
+          "send_fcm_multicast_sync",
+          "FX_ALERT_SHADOW_ENABLED",
+          "FX_ALERT_CUTOVER_CANARY_SETTING_IDS"
+        ],
+        "firebaseNetworkTraversed": false,
+        "firebaseSdkTransportCaptured": false,
+        "modules": [
+          "app/notifications/alert_storage_backend.py",
+          "app/crud.py",
+          "app/notifications/fcm.py"
+        ],
+        "omittedTransportFields": [
+          "tokens",
+          "apns",
+          "android.priority",
+          "android.notification.sound"
+        ],
+        "payloadSendBoundaryCaptured": true,
+        "projectionBoundary": "actual payload builder output plus actual _normalize_data_payload; equivalent to notification/data fields at send_fcm_multicast_sync before SDK send",
+        "routeTraversed": false,
+        "shadowParityChecked": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "fcm",
+      "id": "fcm-rate-alert-repeat",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "fcm/rate-alert-repeat.json",
+      "producer": "captured app.crud.process_rate_alerts + parity-checked app.notifications.alert_storage_backend.FxNotificationBackend.build_payload + app.notifications.fcm._normalize_data_payload",
+      "runtimeReachability": "runtime",
+      "sha256": "09c4e5ca83786ff4722143bf1c83ee31e2e2a1912aabeeeea3fa674b4a6638b6",
+      "source": {
+        "authoritativeRuntime": "app.crud.process_rate_alerts",
+        "clientVisibleProjection": true,
+        "dataOnly": false,
+        "dependencyPatches": [
+          "get_triggered_settings_for_rate",
+          "mark_setting_triggered",
+          "create_notification_log",
+          "emit_comparison_observation",
+          "init_firebase",
+          "send_fcm_multicast_sync",
+          "FX_ALERT_SHADOW_ENABLED",
+          "FX_ALERT_CUTOVER_CANARY_SETTING_IDS"
+        ],
+        "firebaseNetworkTraversed": false,
+        "firebaseSdkTransportCaptured": false,
+        "modules": [
+          "app/notifications/alert_storage_backend.py",
+          "app/crud.py",
+          "app/notifications/fcm.py"
+        ],
+        "omittedTransportFields": [
+          "tokens",
+          "apns",
+          "android.priority",
+          "android.notification.sound"
+        ],
+        "payloadSendBoundaryCaptured": true,
+        "projectionBoundary": "actual payload builder output plus actual _normalize_data_payload; equivalent to notification/data fields at send_fcm_multicast_sync before SDK send",
+        "routeTraversed": false,
+        "shadowParityChecked": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "fcm",
+      "id": "fcm-source-alert-once",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "fcm/source-alert-once.json",
+      "producer": "app.notifications.alert_storage_backend.SourceAlertBackend.build_payload + captured legacy app.crud.process_source_rate_alerts compatibility parity + app.notifications.fcm._normalize_data_payload",
+      "runtimeReachability": "runtime",
+      "sha256": "355d62a34c89c3c476d9137b98cefaefc72744ef09de7f66e83467106cccacba",
+      "source": {
+        "authoritativePayloadBuilderExecuted": true,
+        "authoritativeRuntime": "app.notifications.alert_evaluator.UsdtAlertEvaluator -> app.notifications.alert_storage_backend.SourceAlertBackend",
+        "clientVisibleProjection": true,
+        "dataOnly": false,
+        "dependencyPatches": [
+          "get_triggered_source_settings_for_rate",
+          "mark_source_setting_triggered",
+          "create_source_notification_log",
+          "init_firebase",
+          "send_fcm_multicast_sync"
+        ],
+        "firebaseNetworkTraversed": false,
+        "firebaseSdkTransportCaptured": false,
+        "legacyCompatibilityParityChecked": true,
+        "legacyPayloadSendBoundaryCaptured": true,
+        "modules": [
+          "app/notifications/alert_storage_backend.py",
+          "app/crud.py",
+          "app/notifications/fcm.py"
+        ],
+        "omittedTransportFields": [
+          "tokens",
+          "apns",
+          "android.priority",
+          "android.notification.sound"
+        ],
+        "projectionBoundary": "actual payload builder output plus actual _normalize_data_payload; equivalent to notification/data fields at send_fcm_multicast_sync before SDK send",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "fcm",
+      "id": "fcm-source-alert-repeat-krx",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "fcm/source-alert-repeat-krx.json",
+      "producer": "app.notifications.alert_storage_backend.SourceAlertBackend.build_payload + captured legacy app.crud.process_source_rate_alerts compatibility parity + app.notifications.fcm._normalize_data_payload",
+      "runtimeReachability": "runtime",
+      "sha256": "00d275fd26f538de81fff7b929d8de644439ef9e2c60b635e51a88b00f00fa2d",
+      "source": {
+        "authoritativePayloadBuilderExecuted": true,
+        "authoritativeRuntime": "app.notifications.alert_evaluator.KrxAlertEvaluator -> app.notifications.alert_storage_backend.SourceAlertBackend",
+        "clientVisibleProjection": true,
+        "dataOnly": false,
+        "dependencyPatches": [
+          "get_triggered_source_settings_for_rate",
+          "mark_source_setting_triggered",
+          "create_source_notification_log",
+          "init_firebase",
+          "send_fcm_multicast_sync"
+        ],
+        "firebaseNetworkTraversed": false,
+        "firebaseSdkTransportCaptured": false,
+        "legacyCompatibilityParityChecked": true,
+        "legacyPayloadSendBoundaryCaptured": true,
+        "modules": [
+          "app/notifications/alert_storage_backend.py",
+          "app/crud.py",
+          "app/notifications/fcm.py"
+        ],
+        "omittedTransportFields": [
+          "tokens",
+          "apns",
+          "android.priority",
+          "android.notification.sound"
+        ],
+        "projectionBoundary": "actual payload builder output plus actual _normalize_data_payload; equivalent to notification/data fields at send_fcm_multicast_sync before SDK send",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "fcm",
+      "id": "fcm-sync-alerts",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "fcm/sync-alerts.json",
+      "producer": "captured app.main.notify_user_devices_sync -> send_fcm_data_only args",
+      "runtimeReachability": "runtime",
+      "sha256": "c30050b0ed957fba85995f646c8e57e323facde045687f5f9c4f8f577b8edb0f",
+      "source": {
+        "clientVisibleProjection": true,
+        "dataOnly": true,
+        "dependencyPatches": [
+          "get_devices_by_user",
+          "send_fcm_data_only"
+        ],
+        "firebaseNetworkTraversed": false,
+        "firebaseSdkTransportCaptured": false,
+        "module": "app/main.py",
+        "notificationFieldPresent": false,
+        "payloadSendBoundaryCaptured": true,
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-eur-1d",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/eur-1d.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "252030110e2e877f744bcc48b2177ee8fce9912393dbec678ed9d9203789d3ae",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=eur&period=1d",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-eur-1w",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/eur-1w.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "edf55aee01ba2840065dc2e79cae550b86a2b7d689b14c8f9414296547ea07e2",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=eur&period=1w",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-eur-1y",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/eur-1y.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "7d9fb56ed3fb137acecb5d13982400e3bd74450bd08cd7fe252126d57c3b5c22",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=eur&period=1y",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-eur-3m",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/eur-3m.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "f79b153ded6c249d3c74757bccf8143afc0af1b23dbf11fc3cf90c412852f6f3",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=eur&period=3m",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-jpy-1d",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/jpy-1d.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "b500bc22d764621ec8372c3ef663175f5c8f5a32f0196468ea221176da0473ac",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=jpy&period=1d",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-jpy-1w",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/jpy-1w.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "f1b49ef170d9fc67f3e12b2a7bdc46bb6f6ebccca6298b25740905ddd589c02a",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=jpy&period=1w",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-jpy-1y",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/jpy-1y.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "ec73fc6e00125f1549327c2e6b226501d521a26eb6296e4300488e297bfba02a",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=jpy&period=1y",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-jpy-3m",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/jpy-3m.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "4a62332b281c43dd76d8fb05c0ca5762a25001c191a4d7f874cb6fcc4165c907",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=jpy&period=3m",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-tether-1d",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/tether-1d.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "3c69c9321016c4e6f204994388ab646410aa4f59b9f32b01f4f0bb034f81940e",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=tether&period=1d",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-tether-1w",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/tether-1w.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "a0991dff73ae607a0aeaa644310c0b03e007a28d0de81002d1a52dcffce87702",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=tether&period=1w",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-tether-1y",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/tether-1y.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "4529a7260a192ddcd61fa4c7a628e18d4e42be0ccd03d995726712f5fd73f677",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=tether&period=1y",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-tether-3m",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/tether-3m.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "fa4d4bc9f26aceb86465ff0d23845478608030ae28ff2c137e028b035e61bffc",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=tether&period=3m",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-usd-1d",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/usd-1d.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "b141a4f9e615f672f2b9f979a8032cec9ce96f3cec44d1febb2b79edcd126ad9",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=usd&period=1d",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-usd-1w",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/usd-1w.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "8b406f592ae02118fc92aa4d6816c1b0b66d6837d931afb2e5395050b2300231",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=usd&period=1w",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-usd-1y",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/usd-1y.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "22761d2419a8c589a3ddbbe4546c7a988a24a594edc9aaf8d6e198bab6b78636",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=usd&period=1y",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "free-snapshot",
+      "id": "free-usd-3m",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "free/usd-3m.json",
+      "producer": "app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "3904703492831e5474574d19964e6708681b6c005b4e2ca9a72aa6e8aeab3d8f",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_put"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=usd&period=3m",
+          "status": 200
+        },
+        "modules": [
+          "app/main.py",
+          "app/free_snapshot.py",
+          "app/graph_v2.py"
+        ],
+        "route": "GET /api/v2/free/snapshot",
+        "routeTraversed": true,
+        "seedOrigin": "app.free_snapshot.build_free_snapshot_payload + validate_snapshot_payload"
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "graph-v2",
+      "id": "graph-catalog-krx-hidden",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "graph/catalog-krx-hidden.json",
+      "producer": "app.graph_v2.build_catalog",
+      "runtimeReachability": "runtime",
+      "sha256": "3213c19e6d0ec185dfbae8d51ec2f62d4574d3e7f724d6b9aac6978286db9b3a",
+      "source": {
+        "module": "app/graph_v2.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "graph-v2",
+      "id": "graph-catalog-krx-visible",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "graph/catalog-krx-visible.json",
+      "producer": "app.graph_v2.build_catalog",
+      "runtimeReachability": "runtime",
+      "sha256": "b18f0798f972f44a6d45f3610f66e43dddc400cc9166d60c6d7fe90b474ebf62",
+      "source": {
+        "module": "app/graph_v2.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "graph-v2",
+      "id": "graph-tether-1w-krx-hidden",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "graph/tether-1w-krx-hidden.json",
+      "producer": "app.graph_v2.build_tab + attach_graph_v2_domain",
+      "runtimeReachability": "runtime",
+      "sha256": "dad13360e2076afb00b495b9c19048f6c3e2a78a06790d4cc65c7569e1b41a0d",
+      "source": {
+        "module": "app/graph_v2.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "graph-v2",
+      "id": "graph-usd-1d-krx-hidden",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "graph/usd-1d-krx-hidden.json",
+      "producer": "app.graph_v2_intraday.build_tab_1d_payload + build_tab_1d_in_progress + app.graph_v2.attach_graph_v2_domain",
+      "runtimeReachability": "runtime",
+      "sha256": "ca6d94629676c5e636624c6063e2339fb91d6a71130759c73466d7da052147d9",
+      "source": {
+        "modules": [
+          "app/graph_v2_intraday.py",
+          "app/graph_v2.py"
+        ],
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "graph-v2",
+      "id": "graph-usd-1d-krx-visible",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "graph/usd-1d-krx-visible.json",
+      "producer": "app.graph_v2_intraday.build_tab_1d_payload + build_tab_1d_in_progress + app.graph_v2.attach_graph_v2_domain",
+      "runtimeReachability": "runtime",
+      "sha256": "4a68ff61f35cccd2e71f799eeac3edaeddcb63523b9ee8281339a1c9bb57339d",
+      "source": {
+        "modules": [
+          "app/graph_v2_intraday.py",
+          "app/graph_v2.py"
+        ],
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "graph-v2",
+      "id": "graph-usd-3m-krx-hidden",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "graph/usd-3m-krx-hidden.json",
+      "producer": "app.graph_v2.build_tab + attach_graph_v2_domain",
+      "runtimeReachability": "runtime",
+      "sha256": "dbe88e81e8c590655342d84695f12da7161ab511dea672e11790d431a19293c8",
+      "source": {
+        "module": "app/graph_v2.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "graph-v2",
+      "id": "graph-usd-3m-krx-visible",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "graph/usd-3m-krx-visible.json",
+      "producer": "app.graph_v2.build_tab + attach_graph_v2_domain",
+      "runtimeReachability": "runtime",
+      "sha256": "beee6112424f09c73ef667d50d83abaa4a7d7050dc0d0271808e3b33af971b36",
+      "source": {
+        "module": "app/graph_v2.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "http",
+      "id": "http-auth-401",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/auth-401.json",
+      "producer": "ASGI route + app.main.verify_firebase_token missing-header branch",
+      "runtimeReachability": "runtime",
+      "sha256": "98fbcacfb7b69adf494798fe8290abedd77c1293843ad4c76d1daff2ad9c66c1",
+      "source": {
+        "dependencyPatches": [
+          "is_firebase_initialized",
+          "rest_auth_app"
+        ],
+        "http": {
+          "headers": {},
+          "method": "GET",
+          "path": "/api/entitlements",
+          "status": 401
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "http",
+      "id": "http-auth-infrastructure-503",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/auth-infrastructure-503.json",
+      "producer": "ASGI route + app.main.verify_firebase_token auth-app-unavailable branch",
+      "runtimeReachability": "runtime",
+      "sha256": "04eea8652ac9fbc95ddb6a5184952356ec66ddaec476bf9d3d6b2305e31979de",
+      "source": {
+        "dependencyPatches": [
+          "is_firebase_initialized",
+          "rest_auth_app"
+        ],
+        "http": {
+          "headers": {},
+          "method": "GET",
+          "path": "/api/entitlements",
+          "status": 503
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "http",
+      "id": "http-free-period-400",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/free-period-400.json",
+      "producer": "ASGI route + app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "6525011f5984535e5490c70436c2ce3aed5e454d30226e408e751381dad16a46",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token"
+        ],
+        "http": {
+          "headers": {},
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=usd&period=2y",
+          "status": 400
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "http",
+      "id": "http-free-snapshot-503",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/free-snapshot-503.json",
+      "producer": "ASGI route + app.main.get_v2_free_snapshot cold canonical branch",
+      "runtimeReachability": "runtime",
+      "sha256": "0bfff9a40a5fdd8a1e500af487194359795c8f1670d354bcab9de3df8b81b592",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "_free_snapshot_cache_get",
+          "_free_snapshot_local_get"
+        ],
+        "http": {
+          "headers": {},
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=usd&period=3m",
+          "status": 503
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "http",
+      "id": "http-free-tab-404",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/free-tab-404.json",
+      "producer": "ASGI route + app.main.get_v2_free_snapshot",
+      "runtimeReachability": "runtime",
+      "sha256": "8f8e2a2d27411646e71bc921b9ae442c7f6ebae9a2c7a9e723b56e208d44f204",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token"
+        ],
+        "http": {
+          "headers": {},
+          "method": "GET",
+          "path": "/api/v2/free/snapshot?tab=unknown&period=3m",
+          "status": 404
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "off",
+        "g3": "off",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "http-graph-period-400",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/graph-period-400.json",
+      "producer": "ASGI route + app.main.get_v2_graph_tab",
+      "runtimeReachability": "runtime",
+      "sha256": "40cd7efea22d31101379f66628749bbc10fb578d176491d3d4c0ebd8c8de0fc4",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "verify_premium_status",
+          "KRX_FUTURES_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_ENABLED"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "private, no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/graph/tab?tab=usd&period=2y",
+          "status": 400
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "off",
+        "g3": "off",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "http-graph-tab-404",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/graph-tab-404.json",
+      "producer": "ASGI route + app.main.get_v2_graph_tab",
+      "runtimeReachability": "runtime",
+      "sha256": "a98b8137af328a098b4444897ce6ef0905b32a0135ea984f9156bdfa642be2e2",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "verify_premium_status",
+          "KRX_FUTURES_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_ENABLED"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "private, no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/graph/tab?tab=unknown&period=3m",
+          "status": 404
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "off",
+        "g3": "off",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "http-krx-distribution-disabled-403",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/krx-distribution-disabled-403.json",
+      "producer": "ASGI route + app.entitlements.krx_alert_gate_error",
+      "runtimeReachability": "runtime",
+      "sha256": "00e08e3af9ea19e3f1fe2bcbc8d5b11c63f43de9f42626ba8fbb4bfc12be9ac9",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "verify_premium_status",
+          "KRX_FUTURES_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_ENABLED"
+        ],
+        "http": {
+          "headers": {},
+          "method": "POST",
+          "path": "/api/source-notification-settings",
+          "status": 403
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "http-krx-entitlement-required-403",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/krx-entitlement-required-403.json",
+      "producer": "ASGI route + app.entitlements.krx_alert_gate_error",
+      "runtimeReachability": "runtime",
+      "sha256": "c64dcd2875f6b433c4dabfa5eda2858d71aba9efebfe50b486f3a9ce43ef713c",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "verify_premium_status",
+          "KRX_FUTURES_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_ENABLED"
+        ],
+        "http": {
+          "headers": {},
+          "method": "POST",
+          "path": "/api/source-notification-settings",
+          "status": 403
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "inactive"
+      },
+      "family": "http",
+      "id": "http-premium-inactive-403",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/premium-inactive-403.json",
+      "producer": "ASGI route + app.main.require_premium(INACTIVE)",
+      "runtimeReachability": "runtime",
+      "sha256": "398c2bef92ca9fc0c64e346f055b10176d6a1a0a0ac1d99f0a8c55a38eb51cde",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "verify_premium_status"
+        ],
+        "http": {
+          "headers": {},
+          "method": "POST",
+          "path": "/api/notification-settings",
+          "status": 403
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "pending"
+      },
+      "family": "http",
+      "id": "http-premium-pending-503",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/premium-pending-503.json",
+      "producer": "ASGI route + app.main.require_premium(PENDING)",
+      "runtimeReachability": "runtime",
+      "sha256": "d38f8be48a429f368d41d6b5e67ae54b78edf45fca820e3eb5b5999475d5943a",
+      "source": {
+        "dependencyPatches": [
+          "verify_firebase_token",
+          "verify_premium_status"
+        ],
+        "http": {
+          "headers": {
+            "Retry-After": "5"
+          },
+          "method": "POST",
+          "path": "/api/notification-settings",
+          "status": 503
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "http",
+      "id": "http-proxy-429-html",
+      "mediaType": "text/html",
+      "origin": "external",
+      "path": "http/proxy-429.html",
+      "producer": "nginx limit_req boundary (representative non-JSON body)",
+      "runtimeReachability": "external",
+      "sha256": "21c922b8ac67dec64b2960ff36cbfff503d380274a5fc9686673f19893c74f5c",
+      "source": {
+        "bodyExact": false,
+        "http": {
+          "headers": {},
+          "method": "GET",
+          "path": "/api/rates",
+          "status": 429
+        },
+        "module": "nginx/conf.d/default.conf",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "http",
+      "id": "http-validation-422",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/validation-422.json",
+      "producer": "ASGI route + FastAPI NotificationSettingRequest validation",
+      "runtimeReachability": "runtime",
+      "sha256": "1199d514ae03b274bd32cf69d57857351d80e5bf530b8f125cd393cb0bc3f856",
+      "source": {
+        "dependencyPatches": [],
+        "http": {
+          "headers": {},
+          "method": "POST",
+          "path": "/api/notification-settings",
+          "status": 422
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "registry",
+      "id": "registry-allowed-identifiers",
+      "mediaType": "application/json",
+      "origin": "registry",
+      "path": "registry/allowed-identifiers.json",
+      "producer": "app.source_registry + app.graph_v2.build_catalog(krx_visible=True) + app.topic_policy",
+      "runtimeReachability": "runtime",
+      "sha256": "8977ccd2c750647cda050a5507f89b701a4adf1c8b2455eb75512ef4cec029b2",
+      "source": {
+        "authorizationScope": "entitled-superset",
+        "builderArguments": {
+          "krx_visible": true
+        },
+        "entitlementEvaluationTraversed": false,
+        "krxCapabilityCheckRequired": true,
+        "modules": [
+          "app/source_registry.py",
+          "app/graph_v2.py",
+          "app/graph_v2_intraday.py",
+          "app/topic_policy.py"
+        ],
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "enforce_authenticated_premium",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "topic",
+      "id": "topic-ack-enforce-all-granted",
+      "mediaType": "application/json",
+      "origin": "websocket-dispatcher",
+      "path": "topic/ack-enforce-all-granted.json",
+      "producer": "app.topic_dispatcher.handle_client_message",
+      "runtimeReachability": "runtime",
+      "sha256": "8dacca2c87f0697f65c0fb003fad08327c635a454ef53c9b4be5d43c28f84ccb",
+      "source": {
+        "dispatcherTraversed": true,
+        "module": "app/topic_dispatcher.py",
+        "route": "WS /ws",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "enforce_authenticated_premium",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "topic",
+      "id": "topic-ack-krx-denied",
+      "mediaType": "application/json",
+      "origin": "websocket-dispatcher",
+      "path": "topic/ack-krx-denied.json",
+      "producer": "app.topic_dispatcher.handle_client_message",
+      "runtimeReachability": "runtime",
+      "sha256": "a23ebd258da686765616eabef8fe9b48c22bf46c7b651b6607163c214375c7b7",
+      "source": {
+        "dispatcherTraversed": true,
+        "module": "app/topic_dispatcher.py",
+        "route": "WS /ws",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "enforce_authenticated_premium",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "topic",
+      "id": "topic-ack-lease-boundary-900",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "topic/ack-lease-boundary-900.json",
+      "producer": "app.topic_wire.build_subscription_ack",
+      "runtimeReachability": "configured",
+      "sha256": "fa78dee31bb370cc87be0ce3f7aeabd7989c624a52379bdec5ab9c507d37ab2a",
+      "source": {
+        "module": "app/topic_wire.py",
+        "note": "exact 900 is a buildable boundary; live elapsed time usually makes it smaller",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "enforce_authenticated_premium",
+        "g1": "not-applicable",
+        "g2": "on",
+        "g3": "on",
+        "premium": "inactive"
+      },
+      "family": "topic",
+      "id": "topic-ack-premium-denied",
+      "mediaType": "application/json",
+      "origin": "websocket-dispatcher",
+      "path": "topic/ack-premium-denied.json",
+      "producer": "app.topic_dispatcher.handle_client_message",
+      "runtimeReachability": "runtime",
+      "sha256": "ea6af919037ee6d37b2e85f614aef9a369933b9ea969050d3c02d6c1f16d20f9",
+      "source": {
+        "dispatcherTraversed": true,
+        "module": "app/topic_dispatcher.py",
+        "route": "WS /ws",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "compatibility",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "topic",
+      "id": "topic-ack-topics-disabled",
+      "mediaType": "application/json",
+      "origin": "websocket-dispatcher",
+      "path": "topic/ack-topics-disabled.json",
+      "producer": "app.topic_dispatcher.handle_client_message",
+      "runtimeReachability": "runtime",
+      "sha256": "1d06f708b9ad955d052538b824715ea1fedd778c6cc10cecdb1ffde64a5a06d4",
+      "source": {
+        "dispatcherTraversed": true,
+        "module": "app/topic_dispatcher.py",
+        "route": "WS /ws",
+        "routeTraversed": false,
+        "runtimeConfig": {
+          "TOPIC_DISPATCHER_ENABLED": false
+        }
+      }
+    },
+    {
+      "config": {
+        "authStage": "compatibility",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "topic",
+      "id": "topic-control-pong",
+      "mediaType": "application/json",
+      "origin": "websocket-dispatcher",
+      "path": "topic/pong.json",
+      "producer": "app.topic_dispatcher.handle_client_message('ping')",
+      "runtimeReachability": "runtime",
+      "sha256": "43bae1999ca35219c82e31e5af5eb5400b05f07ec33a7def62a91f5f0bfe45dd",
+      "source": {
+        "dispatcherTraversed": true,
+        "module": "app/topic_dispatcher.py",
+        "route": "WS /ws",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "topic",
+      "id": "topic-error-invalid-request",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "topic/error-invalid-request.json",
+      "producer": "app.topic_wire.build_subscription_error",
+      "runtimeReachability": "runtime",
+      "sha256": "2b2c97093aed464143929dc29acc592688917208230cf2351e37dec314e953f9",
+      "source": {
+        "module": "app/topic_wire.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "topic",
+      "id": "topic-error-invalid-token",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "topic/error-invalid-token.json",
+      "producer": "app.topic_wire.build_subscription_error",
+      "runtimeReachability": "runtime",
+      "sha256": "0905f8e7b1463db8dc631ba5b4914dfdf98edb67b0a812280da48f3f7c4bbbdd",
+      "source": {
+        "module": "app/topic_wire.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "topic",
+      "id": "topic-error-request-too-large",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "topic/error-request-too-large.json",
+      "producer": "app.topic_wire.build_subscription_error",
+      "runtimeReachability": "vocabulary-only",
+      "sha256": "d836b67d8c3d6bc1b6bece17935a2046c263fc6af119956447ebf98dcc8daa2f",
+      "source": {
+        "module": "app/topic_wire.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "topic",
+      "id": "topic-error-temporarily-unavailable",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "topic/error-temporarily-unavailable.json",
+      "producer": "app.topic_wire.build_subscription_error",
+      "runtimeReachability": "runtime",
+      "sha256": "c1e08b2029eb98fa74241610fe9f2f2b70e7f9b87ff997f16d6b6e0c1f22bcd8",
+      "source": {
+        "module": "app/topic_wire.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "topic",
+      "id": "topic-snapshot-dxy",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "topic/snapshot-dxy.json",
+      "producer": "app.dxy_topic_publisher.build_dxy_topic_payload",
+      "runtimeReachability": "runtime",
+      "sha256": "213029c29911acb41c357eafc9cf91a311cf95e09350fab5f2ecbb6bc05e1224",
+      "source": {
+        "module": "app/dxy_topic_publisher.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "topic",
+      "id": "topic-snapshot-fx-eur-krw",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "topic/snapshot-fx-eur-krw.json",
+      "producer": "app.fx_topic_payload.build_fx_tab_payload + publisher-compatible top-level topic injection",
+      "runtimeReachability": "runtime",
+      "sha256": "83787181158b62aceabf3d852633153ba964d19e945309d54999f179fa55e4b4",
+      "source": {
+        "assembly": "pure builder output followed by the exact top-level topic assignment used by both publisher and initial snapshot paths",
+        "modules": [
+          "app/fx_topic_payload.py",
+          "app/fx_topic_publisher.py",
+          "app/topic_initial_snapshot.py"
+        ],
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "topic",
+      "id": "topic-snapshot-fx-jpy-krw",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "topic/snapshot-fx-jpy-krw.json",
+      "producer": "app.fx_topic_payload.build_fx_tab_payload + publisher-compatible top-level topic injection",
+      "runtimeReachability": "runtime",
+      "sha256": "572e55726e2673ccacc102c468fba9c90810d6e96b86c9d917af67589af1cf28",
+      "source": {
+        "assembly": "pure builder output followed by the exact top-level topic assignment used by both publisher and initial snapshot paths",
+        "modules": [
+          "app/fx_topic_payload.py",
+          "app/fx_topic_publisher.py",
+          "app/topic_initial_snapshot.py"
+        ],
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "topic",
+      "id": "topic-snapshot-fx-usd-krw",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "topic/snapshot-fx-usd-krw.json",
+      "producer": "app.fx_topic_payload.build_fx_tab_payload + publisher-compatible top-level topic injection",
+      "runtimeReachability": "runtime",
+      "sha256": "27e1a9988c50de50eba834bc8ed74c0bc0e4a62596cee6f04819346e340c2273",
+      "source": {
+        "assembly": "pure builder output followed by the exact top-level topic assignment used by both publisher and initial snapshot paths",
+        "modules": [
+          "app/fx_topic_payload.py",
+          "app/fx_topic_publisher.py",
+          "app/topic_initial_snapshot.py"
+        ],
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "enforce_authenticated_premium",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "topic",
+      "id": "topic-snapshot-krx",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "topic/snapshot-krx.json",
+      "producer": "app.krx_topic_publisher.build_krx_topic_payload",
+      "runtimeReachability": "runtime",
+      "sha256": "f9a7ce9169704b1f0c74aa56bf0cb885bbd8910b81ef3880abca33dabaa24afc",
+      "source": {
+        "module": "app/krx_topic_publisher.py",
+        "routeTraversed": false
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "topic",
+      "id": "topic-snapshot-tether",
+      "mediaType": "application/json",
+      "origin": "builder",
+      "path": "topic/snapshot-tether.json",
+      "producer": "app.usdt_topic_payload.build_tether_tab_payload + publisher-compatible top-level topic injection",
+      "runtimeReachability": "runtime",
+      "sha256": "66d5fdeb4d57ccdd98015bac6179594bc4b0cf34ff687b407791bbf1776d57f6",
+      "source": {
+        "assembly": "pure builder output followed by the exact top-level topic assignment used by both publisher and initial snapshot paths",
+        "modules": [
+          "app/usdt_topic_payload.py",
+          "app/tether_topic_publisher.py",
+          "app/topic_initial_snapshot.py"
+        ],
+        "routeTraversed": false
+      }
+    }
+  ],
+  "schemaVersion": 1,
+  "server": {
+    "contractTreeDirty": false,
+    "dependencyLock": "requirements.lock.txt",
+    "dependencyLockSha256": "50b81c511f5ecde460c8f55838a0144c2fbba53b5b97d157443197d8a4886daf",
+    "repository": "exchange-rate",
+    "revision": "2cb6624a760c16a9d09a4ed66fe884d0051c4113"
+  }
+}

@@ -1,0 +1,156 @@
+{
+  "as_of": "2026-08-31T09:30:00+09:00",
+  "generated_at": "2026-08-31T10:20:00+09:00",
+  "graph": {
+    "bucket_size": "1d",
+    "domain_end_at": "2026-08-31T09:30:00+09:00",
+    "domain_start_at": "2026-06-02T00:00:00+09:00",
+    "live_domain_mode": "fixed_start",
+    "range": {
+      "end": "2026-08-31",
+      "start": "2026-06-02"
+    },
+    "series": [
+      {
+        "axis_group": "krw",
+        "carry_in": {
+          "observed_at": "2026-05-23T00:00:00+09:00",
+          "rate": 9.55
+        },
+        "data": [
+          {
+            "high": 10.25,
+            "low": 8.65,
+            "rate": 9.495,
+            "source": "investing",
+            "ts": "2026-07-17T00:00:00+09:00"
+          },
+          {
+            "high": 10.25,
+            "low": 8.65,
+            "rate": 9.452,
+            "source": "investing",
+            "ts": "2026-08-29T00:00:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "investing.jpy",
+        "label": "인베스팅",
+        "provenance": {
+          "actual_source": "investing",
+          "close_basis_mode": "single",
+          "coverage_days": 44,
+          "default_close_basis": "investing_observed_eod",
+          "default_source_method": "observed_rollup",
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "rollup_based",
+          "insufficient_history": true,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "carry_in": {
+          "observed_at": "2026-05-23T00:00:00+09:00",
+          "rate": 9.6
+        },
+        "data": [
+          {
+            "high": 10.3,
+            "low": 8.7,
+            "rate": 9.545,
+            "source": "hana",
+            "ts": "2026-07-17T00:00:00+09:00"
+          },
+          {
+            "high": 10.3,
+            "low": 8.7,
+            "rate": 9.502,
+            "source": "hana",
+            "ts": "2026-08-29T00:00:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "hana.jpy",
+        "label": "하나은행",
+        "provenance": {
+          "actual_source": "hana",
+          "close_basis_mode": "single",
+          "coverage_days": 44,
+          "default_close_basis": "hana_observed_eod",
+          "default_source_method": "observed_rollup",
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "external_historical",
+          "insufficient_history": true,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      }
+    ]
+  },
+  "period": "3m",
+  "rate": {
+    "asset": "jpy-krw",
+    "entries": [
+      {
+        "bank": "investing",
+        "currency": "jpy-krw",
+        "rate": 9.45,
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "bank": "kb",
+        "currency": "jpy-krw",
+        "rate": 9.45,
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "bank": "hana",
+        "currency": "jpy-krw",
+        "rate": 9.549999999999999,
+        "timestamp": "2026-08-31T09:20:01+09:00"
+      },
+      {
+        "bank": "shinhan",
+        "currency": "jpy-krw",
+        "rate": 9.649999999999999,
+        "timestamp": "2026-08-31T09:20:02+09:00"
+      },
+      {
+        "bank": "woori",
+        "currency": "jpy-krw",
+        "rate": 9.75,
+        "timestamp": "2026-08-31T09:20:03+09:00"
+      },
+      {
+        "bank": "ibk",
+        "currency": "jpy-krw",
+        "rate": 9.85,
+        "timestamp": "2026-08-31T09:20:04+09:00"
+      },
+      {
+        "bank": "nh",
+        "currency": "jpy-krw",
+        "rate": 9.95,
+        "timestamp": "2026-08-31T09:20:05+09:00"
+      },
+      {
+        "bank": "sc",
+        "currency": "jpy-krw",
+        "rate": 10.049999999999999,
+        "timestamp": "2026-08-31T09:20:06+09:00"
+      },
+      {
+        "bank": "bs",
+        "currency": "jpy-krw",
+        "rate": 10.149999999999999,
+        "timestamp": "2026-08-31T09:20:07+09:00"
+      }
+    ]
+  },
+  "refresh_not_before": "2026-08-31T10:31:00+09:00",
+  "tab": "jpy"
+}

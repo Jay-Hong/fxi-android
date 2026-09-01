@@ -1,0 +1,21 @@
+{
+  "accepted_topics": [
+    {
+      "lease_duration_seconds": 900,
+      "lease_id": "fixture-boundary-lease",
+      "topic": "fx:usd-krw"
+    }
+  ],
+  "active_subscriptions": [
+    {
+      "lease_duration_seconds": 900,
+      "lease_id": "fixture-boundary-lease",
+      "topic": "fx:usd-krw"
+    }
+  ],
+  "operation": "subscribe",
+  "rejected_topics": [],
+  "removed_topics": [],
+  "request_id": "lease-boundary",
+  "type": "subscription_ack"
+}

@@ -1,0 +1,24 @@
+{
+  "logs": [
+    {
+      "diff_type": "absolute",
+      "id": 503,
+      "is_repeat": false,
+      "left_asset": "usd-krw-futures",
+      "left_observed_at": null,
+      "left_rate": 1400.0,
+      "left_source": "krx",
+      "operator": "gte",
+      "right_asset": "usd-krw",
+      "right_observed_at": null,
+      "right_rate": 1390.0,
+      "right_source": "hana",
+      "sent_at": "2026-08-31T10:00:00+09:00",
+      "setting_id": 103,
+      "spread": 10.0,
+      "tab": "usd",
+      "threshold": 10.0
+    }
+  ],
+  "total_count": 1
+}

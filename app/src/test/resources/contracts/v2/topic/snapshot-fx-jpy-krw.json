@@ -1,0 +1,63 @@
+{
+  "data": {
+    "banks": [
+      {
+        "asset": "jpy-krw",
+        "rate": 9.45,
+        "source": "kb",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "jpy-krw",
+        "rate": 9.549999999999999,
+        "source": "hana",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "jpy-krw",
+        "rate": 9.649999999999999,
+        "source": "shinhan",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "jpy-krw",
+        "rate": 9.75,
+        "source": "woori",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "jpy-krw",
+        "rate": 9.85,
+        "source": "ibk",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "jpy-krw",
+        "rate": 9.95,
+        "source": "nh",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "jpy-krw",
+        "rate": 10.049999999999999,
+        "source": "sc",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "jpy-krw",
+        "rate": 10.149999999999999,
+        "source": "bs",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      }
+    ],
+    "reference": {
+      "asset": "jpy-krw",
+      "rate": 9.45,
+      "source": "investing",
+      "timestamp": "2026-08-31T10:20:00+09:00"
+    }
+  },
+  "topic": "fx:jpy-krw",
+  "type": "snapshot",
+  "version": 1
+}

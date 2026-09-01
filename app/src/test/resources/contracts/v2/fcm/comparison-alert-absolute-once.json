@@ -1,0 +1,26 @@
+{
+  "data": {
+    "body": "[ 8 ↑이상 도달]",
+    "diff_type": "absolute",
+    "is_repeat": "false",
+    "left_asset": "usd-krw-futures",
+    "left_observed_at": "2026-08-31T01:20:00",
+    "left_rate": "1397.5",
+    "left_source": "krx",
+    "operator": "gte",
+    "right_asset": "usd-krw",
+    "right_observed_at": "2026-08-31T01:20:00",
+    "right_rate": "1388.4",
+    "right_source": "hana",
+    "setting_id": "103",
+    "spread": "9.1",
+    "tab": "usd",
+    "threshold": "8.0",
+    "title": "📊 달러선물 ↔ 하나  차이  9.1",
+    "type": "comparison_alert"
+  },
+  "notification": {
+    "body": "[ 8 ↑이상 도달]",
+    "title": "📊 달러선물 ↔ 하나  차이  9.1"
+  }
+}

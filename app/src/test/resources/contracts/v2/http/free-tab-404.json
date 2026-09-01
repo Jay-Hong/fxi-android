@@ -1,0 +1,10 @@
+{
+  "detail": "tab 'unknown' is not free-available",
+  "error": "unknown_tab",
+  "free_tabs": [
+    "usd",
+    "jpy",
+    "eur",
+    "tether"
+  ]
+}

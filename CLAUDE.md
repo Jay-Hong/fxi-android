@@ -58,7 +58,7 @@
 ### 최소 요구사항
 
 - **minSdk**: 26 (Android 8.0)
-- **targetSdk**: 35 (Android 15, Google Play 정책)
+- **targetSdk**: 36 (Android v2.0.0 S0 기준)
 - **compileSdk**: 36 (AndroidX 라이브러리 호환)
 
 ---
@@ -289,7 +289,7 @@ Response:
 }
 ```
 
-#### 그래프 데이터 조회 (기간별)
+#### 그래프 데이터 조회 (legacy v1 — S3/S4 전환 전 현재 Android 소비)
 
 ```http
 GET /api/graph/{currency}
@@ -318,6 +318,10 @@ Response:
 ※ `1w/3m/1y`: `reference` 중심 장기 그래프, USD/KRW는 `dxy` 포함 가능
 ※ REST는 배열 형식 [ts, max, min, close]
 ```
+
+> v2 `GET /api/v2/graph/catalog|tab`의 1d entitled superset은 tether 11,
+> usd 11(KRX 포함), jpy 9, eur 9 series다. KRX 비노출 시 tether/usd는 각각
+> 10 series이며, 정확한 허용 범위는 서버 catalog에서 생성한 탭×기간 registry를 따른다.
 
 #### 알림 설정 API
 
@@ -928,11 +932,12 @@ private fun observeAppLifecycle() {
 
 ## 그래프 데이터 관리
 
-### 캐시 유효성 검사 (`hasValidCache`, 1d 전용)
+### 캐시 유효성 검사 (legacy v1 `hasValidCache`, 1d 전용)
 
 - 모든 실시간 소스(investing, kb, hana)가 **144개 이상**
 - 버킷 간 **15분 이상 갭(중간 누락)이 없어야** 유효
 - 백엔드가 항상 3소스를 제공한다는 전제
+- v2 tab/period registry에는 이 고정 3-source 조건을 적용하지 않는다
 
 ### 갭 감지 및 복구 전략
 

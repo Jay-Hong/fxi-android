@@ -1,0 +1,10 @@
+{
+  "asset": "usdt-krw",
+  "condition": "below",
+  "id": 502,
+  "sent_at": "2026-08-31T10:00:00+09:00",
+  "setting_id": 102,
+  "source": "upbit",
+  "threshold": 1385.0,
+  "triggered_rate": 1384.8
+}

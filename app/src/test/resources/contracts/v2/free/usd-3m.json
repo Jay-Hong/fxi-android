@@ -1,0 +1,184 @@
+{
+  "as_of": "2026-08-31T09:30:00+09:00",
+  "generated_at": "2026-08-31T10:20:00+09:00",
+  "graph": {
+    "bucket_size": "1d",
+    "domain_end_at": "2026-08-31T09:30:00+09:00",
+    "domain_start_at": "2026-06-02T00:00:00+09:00",
+    "live_domain_mode": "fixed_start",
+    "range": {
+      "end": "2026-08-31",
+      "start": "2026-06-02"
+    },
+    "series": [
+      {
+        "axis_group": "krw",
+        "carry_in": {
+          "observed_at": "2026-05-23T00:00:00+09:00",
+          "rate": 1388.1
+        },
+        "data": [
+          {
+            "high": 1388.8,
+            "low": 1387.2,
+            "rate": 1388.045,
+            "source": "investing",
+            "ts": "2026-07-17T00:00:00+09:00"
+          },
+          {
+            "high": 1388.8,
+            "low": 1387.2,
+            "rate": 1388.002,
+            "source": "investing",
+            "ts": "2026-08-29T00:00:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "investing.usd",
+        "label": "인베스팅",
+        "provenance": {
+          "actual_source": "investing",
+          "close_basis_mode": "single",
+          "coverage_days": 44,
+          "default_close_basis": "investing_observed_eod",
+          "default_source_method": "observed_rollup",
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "rollup_based",
+          "insufficient_history": true,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "carry_in": {
+          "observed_at": "2026-05-23T00:00:00+09:00",
+          "rate": 1389.1
+        },
+        "data": [
+          {
+            "high": 1389.8,
+            "low": 1388.2,
+            "rate": 1389.045,
+            "source": "hana",
+            "ts": "2026-07-17T00:00:00+09:00"
+          },
+          {
+            "high": 1389.8,
+            "low": 1388.2,
+            "rate": 1389.002,
+            "source": "hana",
+            "ts": "2026-08-29T00:00:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "hana.usd",
+        "label": "하나은행",
+        "provenance": {
+          "actual_source": "hana",
+          "close_basis_mode": "single",
+          "coverage_days": 44,
+          "default_close_basis": "hana_official_historical_backfill",
+          "default_source_method": "external_backfill",
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "external_historical",
+          "insufficient_history": true,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "index",
+        "carry_in": {
+          "observed_at": "2026-05-23T00:00:00+09:00",
+          "rate": 103.1
+        },
+        "data": [
+          {
+            "rate": 103.3,
+            "source": "investing",
+            "ts": "2026-08-29T00:00:00+09:00"
+          }
+        ],
+        "decimals": 3,
+        "id": "dxy",
+        "label": "달러지수",
+        "provenance": {
+          "actual_source": "market_index",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "rollup_based",
+          "insufficient_history": true,
+          "per_point_metadata": []
+        },
+        "unit": "INDEX"
+      }
+    ]
+  },
+  "period": "3m",
+  "rate": {
+    "asset": "usd-krw",
+    "entries": [
+      {
+        "bank": "investing",
+        "currency": "usd-krw",
+        "rate": 1388.0,
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "bank": "kb",
+        "currency": "usd-krw",
+        "rate": 1388.0,
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "bank": "hana",
+        "currency": "usd-krw",
+        "rate": 1388.1,
+        "timestamp": "2026-08-31T09:20:01+09:00"
+      },
+      {
+        "bank": "shinhan",
+        "currency": "usd-krw",
+        "rate": 1388.2,
+        "timestamp": "2026-08-31T09:20:02+09:00"
+      },
+      {
+        "bank": "woori",
+        "currency": "usd-krw",
+        "rate": 1388.3,
+        "timestamp": "2026-08-31T09:20:03+09:00"
+      },
+      {
+        "bank": "ibk",
+        "currency": "usd-krw",
+        "rate": 1388.4,
+        "timestamp": "2026-08-31T09:20:04+09:00"
+      },
+      {
+        "bank": "nh",
+        "currency": "usd-krw",
+        "rate": 1388.5,
+        "timestamp": "2026-08-31T09:20:05+09:00"
+      },
+      {
+        "bank": "sc",
+        "currency": "usd-krw",
+        "rate": 1388.6,
+        "timestamp": "2026-08-31T09:20:06+09:00"
+      },
+      {
+        "bank": "bs",
+        "currency": "usd-krw",
+        "rate": 1388.7,
+        "timestamp": "2026-08-31T09:20:07+09:00"
+      }
+    ]
+  },
+  "refresh_not_before": "2026-08-31T10:31:00+09:00",
+  "tab": "usd"
+}

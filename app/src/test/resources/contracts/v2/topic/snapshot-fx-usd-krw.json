@@ -1,0 +1,63 @@
+{
+  "data": {
+    "banks": [
+      {
+        "asset": "usd-krw",
+        "rate": 1388.1,
+        "source": "kb",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usd-krw",
+        "rate": 1388.1999999999998,
+        "source": "hana",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usd-krw",
+        "rate": 1388.3,
+        "source": "shinhan",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usd-krw",
+        "rate": 1388.3999999999999,
+        "source": "woori",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usd-krw",
+        "rate": 1388.5,
+        "source": "ibk",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usd-krw",
+        "rate": 1388.6,
+        "source": "nh",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usd-krw",
+        "rate": 1388.6999999999998,
+        "source": "sc",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usd-krw",
+        "rate": 1388.8,
+        "source": "bs",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      }
+    ],
+    "reference": {
+      "asset": "usd-krw",
+      "rate": 1388.1,
+      "source": "investing",
+      "timestamp": "2026-08-31T10:20:00+09:00"
+    }
+  },
+  "topic": "fx:usd-krw",
+  "type": "snapshot",
+  "version": 1
+}

@@ -1,0 +1,17 @@
+{
+  "detail": [
+    {
+      "input": {
+        "bank": "hana",
+        "condition": "above",
+        "currency": "usd-krw"
+      },
+      "loc": [
+        "body",
+        "threshold"
+      ],
+      "msg": "Field required",
+      "type": "missing"
+    }
+  ]
+}

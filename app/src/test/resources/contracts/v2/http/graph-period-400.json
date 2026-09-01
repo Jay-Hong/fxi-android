@@ -1,0 +1,13 @@
+{
+  "detail": "period '2y' is not in Graph API v2 MVP scope",
+  "error": "unsupported_period",
+  "fallback": {
+    "hint": "Use legacy /api/graph/{currency}?range={period} for 1d",
+    "type": "legacy_graph_api"
+  },
+  "supported_periods": [
+    "3m",
+    "1y",
+    "1w"
+  ]
+}

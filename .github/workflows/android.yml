@@ -60,6 +60,11 @@ jobs:
           cp ci/google-services.ci-fixture.json app/src/debug/google-services.json
           cp ci/google-services.ci-fixture.json app/src/ciMinified/google-services.json
 
+      # Pure-stdlib tests for the manual contract refresh tool. They do not
+      # import the server or require the sibling Python repository.
+      - name: Contract generator utility tests
+        run: python3 -m unittest discover -s tools/contracts -p 'test_*.py'
+
       - name: Unit tests
         run: ./gradlew testDebugUnitTest
 

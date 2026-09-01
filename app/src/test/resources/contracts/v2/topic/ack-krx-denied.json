@@ -1,0 +1,26 @@
+{
+  "accepted_topics": [
+    {
+      "lease_duration_seconds": 880,
+      "lease_id": "fixture-lease-0",
+      "topic": "usdt:krw"
+    }
+  ],
+  "active_subscriptions": [
+    {
+      "lease_duration_seconds": 880,
+      "lease_id": "fixture-lease-0",
+      "topic": "usdt:krw"
+    }
+  ],
+  "operation": "subscribe",
+  "rejected_topics": [
+    {
+      "error": "krx_entitlement_required",
+      "topic": "krx:usd-krw-futures"
+    }
+  ],
+  "removed_topics": [],
+  "request_id": "krx-denied",
+  "type": "subscription_ack"
+}

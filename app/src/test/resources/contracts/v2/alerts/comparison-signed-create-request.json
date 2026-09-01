@@ -1,0 +1,12 @@
+{
+  "diff_type": "signed",
+  "is_enabled": true,
+  "left_asset": "usdt-krw",
+  "left_source": "upbit",
+  "operator": "lte",
+  "repeat_interval_sec": 300,
+  "right_asset": "usd-krw-futures",
+  "right_source": "krx",
+  "tab": "tether",
+  "threshold": -5.0
+}

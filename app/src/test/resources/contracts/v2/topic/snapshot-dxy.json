@@ -1,0 +1,12 @@
+{
+  "data": {
+    "dxy": {
+      "rate": 103.4,
+      "source": "investing",
+      "timestamp": "2026-08-31T10:20:00+09:00"
+    }
+  },
+  "topic": "dxy:spot",
+  "type": "snapshot",
+  "version": 1
+}

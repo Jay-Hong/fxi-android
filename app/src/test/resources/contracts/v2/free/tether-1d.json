@@ -1,0 +1,335 @@
+{
+  "as_of": "2026-08-31T09:30:00+09:00",
+  "generated_at": "2026-08-31T10:20:00+09:00",
+  "graph": {
+    "bucket_size": "10min",
+    "domain_end_at": "2026-08-31T09:30:00+09:00",
+    "domain_start_at": "2026-08-30T09:30:00+09:00",
+    "live_domain_mode": "rolling",
+    "range": {
+      "end": "2026-08-31",
+      "start": "2026-08-30"
+    },
+    "series": [
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1392.0,
+            "low": 1392.0,
+            "rate": 1392.0,
+            "source": "upbit",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "upbit.usdt-krw",
+        "label": "업비트",
+        "provenance": {
+          "actual_source": "upbit",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1392.2,
+            "low": 1392.2,
+            "rate": 1392.2,
+            "source": "bithumb",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "bithumb.usdt-krw",
+        "label": "빗썸",
+        "provenance": {
+          "actual_source": "bithumb",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1392.4,
+            "low": 1392.4,
+            "rate": 1392.4,
+            "source": "coinone",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "coinone.usdt-krw",
+        "label": "코인원",
+        "provenance": {
+          "actual_source": "coinone",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1392.6,
+            "low": 1392.6,
+            "rate": 1392.6,
+            "source": "korbit",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "korbit.usdt-krw",
+        "label": "코빗",
+        "provenance": {
+          "actual_source": "korbit",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1392.8,
+            "low": 1392.8,
+            "rate": 1392.8,
+            "source": "gopax",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "gopax.usdt-krw",
+        "label": "고팍스",
+        "provenance": {
+          "actual_source": "gopax",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.0,
+            "low": 1388.0,
+            "rate": 1388.0,
+            "source": "investing",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "investing.usd",
+        "label": "인베스팅",
+        "provenance": {
+          "actual_source": "investing",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.0,
+            "low": 1388.0,
+            "rate": 1388.0,
+            "source": "kb",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "kb.usd",
+        "label": "KB국민은행",
+        "provenance": {
+          "actual_source": "kb",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 1388.1,
+            "low": 1388.1,
+            "rate": 1388.1,
+            "source": "hana",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "hana.usd",
+        "label": "하나은행",
+        "provenance": {
+          "actual_source": "hana",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "index",
+        "data": [
+          {
+            "high": 103.4,
+            "low": 103.4,
+            "rate": 103.4,
+            "source": "dxy",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 3,
+        "id": "dxy",
+        "label": "달러지수",
+        "provenance": {
+          "actual_source": "dxy",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "INDEX"
+      },
+      {
+        "axis_group": "index",
+        "data": [
+          {
+            "high": 103.7,
+            "low": 103.7,
+            "rate": 103.7,
+            "source": "dxy_futures",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 3,
+        "id": "dxy_futures",
+        "label": "달러지수 선물",
+        "provenance": {
+          "actual_source": "dxy_futures",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "INDEX"
+      }
+    ]
+  },
+  "period": "1d",
+  "rate": {
+    "kind": "source_grouped",
+    "primary_asset": "usdt-krw",
+    "usd_krw_banks": [
+      {
+        "asset": "usd-krw",
+        "rate": 1388.0,
+        "source": "kb",
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "asset": "usd-krw",
+        "rate": 1388.1,
+        "source": "hana",
+        "timestamp": "2026-08-31T09:20:01+09:00"
+      }
+    ],
+    "usd_krw_reference": {
+      "asset": "usd-krw",
+      "rate": 1388.0,
+      "source": "investing",
+      "timestamp": "2026-08-31T09:20:00+09:00"
+    },
+    "usdt_krw": [
+      {
+        "asset": "usdt-krw",
+        "rate": 1392.0,
+        "source": "upbit",
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "asset": "usdt-krw",
+        "rate": 1392.2,
+        "source": "bithumb",
+        "timestamp": "2026-08-31T09:20:01+09:00"
+      },
+      {
+        "asset": "usdt-krw",
+        "rate": 1392.4,
+        "source": "coinone",
+        "timestamp": "2026-08-31T09:20:02+09:00"
+      },
+      {
+        "asset": "usdt-krw",
+        "rate": 1392.6,
+        "source": "korbit",
+        "timestamp": "2026-08-31T09:20:03+09:00"
+      },
+      {
+        "asset": "usdt-krw",
+        "rate": 1392.8,
+        "source": "gopax",
+        "timestamp": "2026-08-31T09:20:04+09:00"
+      }
+    ]
+  },
+  "refresh_not_before": "2026-08-31T10:31:00+09:00",
+  "tab": "tether"
+}

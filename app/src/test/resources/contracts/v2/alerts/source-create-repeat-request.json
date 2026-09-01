@@ -1,0 +1,8 @@
+{
+  "asset": "usdt-krw",
+  "condition": "below",
+  "is_enabled": true,
+  "repeat_interval_sec": 300,
+  "source": "upbit",
+  "threshold": 1385.0
+}

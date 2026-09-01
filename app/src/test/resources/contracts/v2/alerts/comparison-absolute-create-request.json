@@ -1,0 +1,12 @@
+{
+  "diff_type": "absolute",
+  "is_enabled": true,
+  "left_asset": "usd-krw-futures",
+  "left_source": "krx",
+  "operator": "gte",
+  "repeat_interval_sec": null,
+  "right_asset": "usd-krw",
+  "right_source": "hana",
+  "tab": "usd",
+  "threshold": 10.0
+}

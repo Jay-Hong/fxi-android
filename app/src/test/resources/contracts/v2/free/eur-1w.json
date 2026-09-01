@@ -1,0 +1,164 @@
+{
+  "as_of": "2026-08-31T09:30:00+09:00",
+  "generated_at": "2026-08-31T10:20:00+09:00",
+  "graph": {
+    "bucket_size": "1h",
+    "domain_end_at": "2026-08-31T09:30:00+09:00",
+    "domain_start_at": "2026-08-24T00:00:00+09:00",
+    "live_domain_mode": "fixed_start",
+    "range": {
+      "end": "2026-08-31",
+      "start": "2026-08-24"
+    },
+    "series": [
+      {
+        "axis_group": "krw",
+        "carry_in": null,
+        "data": [
+          {
+            "high": 10.91,
+            "low": 9.71,
+            "rate": 10.48,
+            "source": "investing",
+            "ts": "2026-08-24T08:00:00+09:00"
+          },
+          {
+            "high": 10.91,
+            "low": 9.71,
+            "rate": 10.358,
+            "source": "investing",
+            "ts": "2026-08-29T10:00:00+09:00"
+          },
+          {
+            "high": 10.91,
+            "low": 9.71,
+            "rate": 10.312,
+            "source": "investing",
+            "ts": "2026-08-31T08:00:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "investing.eur",
+        "label": "인베스팅",
+        "provenance": {
+          "actual_source": "investing",
+          "close_basis_mode": "single",
+          "coverage_days": 8,
+          "default_close_basis": "investing_observed_eod",
+          "default_source_method": "observed_rollup",
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "rollup_based",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "carry_in": null,
+        "data": [
+          {
+            "high": 11.0,
+            "low": 9.8,
+            "rate": 10.57,
+            "source": "hana",
+            "ts": "2026-08-24T08:00:00+09:00"
+          },
+          {
+            "high": 11.0,
+            "low": 9.8,
+            "rate": 10.448,
+            "source": "hana",
+            "ts": "2026-08-29T10:00:00+09:00"
+          },
+          {
+            "high": 11.0,
+            "low": 9.8,
+            "rate": 10.402,
+            "source": "hana",
+            "ts": "2026-08-31T08:00:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "hana.eur",
+        "label": "하나은행",
+        "provenance": {
+          "actual_source": "hana",
+          "close_basis_mode": "single",
+          "coverage_days": 8,
+          "default_close_basis": "hana_observed_eod",
+          "default_source_method": "observed_rollup",
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "external_historical",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      }
+    ]
+  },
+  "period": "1w",
+  "rate": {
+    "asset": "eur-krw",
+    "entries": [
+      {
+        "bank": "investing",
+        "currency": "eur-krw",
+        "rate": 10.31,
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "bank": "kb",
+        "currency": "eur-krw",
+        "rate": 10.31,
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "bank": "hana",
+        "currency": "eur-krw",
+        "rate": 10.41,
+        "timestamp": "2026-08-31T09:20:01+09:00"
+      },
+      {
+        "bank": "shinhan",
+        "currency": "eur-krw",
+        "rate": 10.51,
+        "timestamp": "2026-08-31T09:20:02+09:00"
+      },
+      {
+        "bank": "woori",
+        "currency": "eur-krw",
+        "rate": 10.610000000000001,
+        "timestamp": "2026-08-31T09:20:03+09:00"
+      },
+      {
+        "bank": "ibk",
+        "currency": "eur-krw",
+        "rate": 10.71,
+        "timestamp": "2026-08-31T09:20:04+09:00"
+      },
+      {
+        "bank": "nh",
+        "currency": "eur-krw",
+        "rate": 10.81,
+        "timestamp": "2026-08-31T09:20:05+09:00"
+      },
+      {
+        "bank": "sc",
+        "currency": "eur-krw",
+        "rate": 10.91,
+        "timestamp": "2026-08-31T09:20:06+09:00"
+      },
+      {
+        "bank": "bs",
+        "currency": "eur-krw",
+        "rate": 11.01,
+        "timestamp": "2026-08-31T09:20:07+09:00"
+      }
+    ]
+  },
+  "refresh_not_before": "2026-08-31T10:31:00+09:00",
+  "tab": "eur"
+}

@@ -1,0 +1,312 @@
+{
+  "as_of": "2026-08-31T09:30:00+09:00",
+  "generated_at": "2026-08-31T10:20:00+09:00",
+  "graph": {
+    "bucket_size": "10min",
+    "domain_end_at": "2026-08-31T09:30:00+09:00",
+    "domain_start_at": "2026-08-30T09:30:00+09:00",
+    "live_domain_mode": "rolling",
+    "range": {
+      "end": "2026-08-31",
+      "start": "2026-08-30"
+    },
+    "series": [
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 10.31,
+            "low": 10.31,
+            "rate": 10.31,
+            "source": "investing",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "investing.eur",
+        "label": "인베스팅",
+        "provenance": {
+          "actual_source": "investing",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 10.31,
+            "low": 10.31,
+            "rate": 10.31,
+            "source": "kb",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "kb.eur",
+        "label": "KB국민은행",
+        "provenance": {
+          "actual_source": "kb",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 10.41,
+            "low": 10.41,
+            "rate": 10.41,
+            "source": "hana",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "hana.eur",
+        "label": "하나은행",
+        "provenance": {
+          "actual_source": "hana",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 10.51,
+            "low": 10.51,
+            "rate": 10.51,
+            "source": "shinhan",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "shinhan.eur",
+        "label": "신한은행",
+        "provenance": {
+          "actual_source": "shinhan",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 10.61,
+            "low": 10.61,
+            "rate": 10.61,
+            "source": "woori",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "woori.eur",
+        "label": "우리은행",
+        "provenance": {
+          "actual_source": "woori",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 10.71,
+            "low": 10.71,
+            "rate": 10.71,
+            "source": "ibk",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "ibk.eur",
+        "label": "IBK기업은행",
+        "provenance": {
+          "actual_source": "ibk",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 10.81,
+            "low": 10.81,
+            "rate": 10.81,
+            "source": "nh",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "nh.eur",
+        "label": "NH농협은행",
+        "provenance": {
+          "actual_source": "nh",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 10.91,
+            "low": 10.91,
+            "rate": 10.91,
+            "source": "sc",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "sc.eur",
+        "label": "SC제일은행",
+        "provenance": {
+          "actual_source": "sc",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      },
+      {
+        "axis_group": "krw",
+        "data": [
+          {
+            "high": 11.01,
+            "low": 11.01,
+            "rate": 11.01,
+            "source": "bs",
+            "ts": "2026-08-31T09:20:00+09:00"
+          }
+        ],
+        "decimals": 2,
+        "id": "bs.eur",
+        "label": "부산은행",
+        "provenance": {
+          "actual_source": "bs",
+          "close_basis_mode": "single",
+          "coverage_days": 1,
+          "fallback_after_days": null,
+          "fallback_source": null,
+          "history_policy": "realtime",
+          "insufficient_history": false,
+          "per_point_metadata": []
+        },
+        "unit": "KRW"
+      }
+    ]
+  },
+  "period": "1d",
+  "rate": {
+    "asset": "eur-krw",
+    "entries": [
+      {
+        "bank": "investing",
+        "currency": "eur-krw",
+        "rate": 10.31,
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "bank": "kb",
+        "currency": "eur-krw",
+        "rate": 10.31,
+        "timestamp": "2026-08-31T09:20:00+09:00"
+      },
+      {
+        "bank": "hana",
+        "currency": "eur-krw",
+        "rate": 10.41,
+        "timestamp": "2026-08-31T09:20:01+09:00"
+      },
+      {
+        "bank": "shinhan",
+        "currency": "eur-krw",
+        "rate": 10.51,
+        "timestamp": "2026-08-31T09:20:02+09:00"
+      },
+      {
+        "bank": "woori",
+        "currency": "eur-krw",
+        "rate": 10.610000000000001,
+        "timestamp": "2026-08-31T09:20:03+09:00"
+      },
+      {
+        "bank": "ibk",
+        "currency": "eur-krw",
+        "rate": 10.71,
+        "timestamp": "2026-08-31T09:20:04+09:00"
+      },
+      {
+        "bank": "nh",
+        "currency": "eur-krw",
+        "rate": 10.81,
+        "timestamp": "2026-08-31T09:20:05+09:00"
+      },
+      {
+        "bank": "sc",
+        "currency": "eur-krw",
+        "rate": 10.91,
+        "timestamp": "2026-08-31T09:20:06+09:00"
+      },
+      {
+        "bank": "bs",
+        "currency": "eur-krw",
+        "rate": 11.01,
+        "timestamp": "2026-08-31T09:20:07+09:00"
+      }
+    ]
+  },
+  "refresh_not_before": "2026-08-31T10:31:00+09:00",
+  "tab": "eur"
+}

@@ -1,0 +1,18 @@
+{
+  "accepted_topics": [],
+  "active_subscriptions": [],
+  "operation": "subscribe",
+  "rejected_topics": [
+    {
+      "error": "topics_disabled",
+      "topic": "fx:usd-krw"
+    },
+    {
+      "error": "topics_disabled",
+      "topic": "usdt:krw"
+    }
+  ],
+  "removed_topics": [],
+  "request_id": "topics-off",
+  "type": "subscription_ack"
+}

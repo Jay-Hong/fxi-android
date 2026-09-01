@@ -1,0 +1,18 @@
+{
+  "data": {
+    "bank": "kb",
+    "body": "[ 1380 ↓이하 도달 ]",
+    "condition": "below",
+    "currency": "usd-krw",
+    "is_repeat": "true",
+    "rate": "1379.8",
+    "setting_id": "104",
+    "threshold": "1380.0",
+    "title": "📉 국민은행  달러  1379.8",
+    "type": "rate_alert"
+  },
+  "notification": {
+    "body": "[ 1380 ↓이하 도달 ]",
+    "title": "📉 국민은행  달러  1379.8"
+  }
+}

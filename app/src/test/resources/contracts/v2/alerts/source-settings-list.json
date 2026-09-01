@@ -1,0 +1,19 @@
+{
+  "settings": [
+    {
+      "asset": "usdt-krw",
+      "condition": "below",
+      "created_at": "2026-08-31T10:00:00+09:00",
+      "id": 102,
+      "is_enabled": true,
+      "repeat_interval_sec": null,
+      "source": "upbit",
+      "threshold": 1385.0,
+      "triggered": false,
+      "triggered_at": null,
+      "updated_at": null,
+      "user_id": "fixture-user"
+    }
+  ],
+  "total_count": 1
+}

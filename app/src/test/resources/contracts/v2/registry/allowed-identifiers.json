@@ -1,0 +1,196 @@
+{
+  "graphSeriesIdsByTabPeriod": {
+    "eur": {
+      "1d": [
+        "investing.eur",
+        "kb.eur",
+        "hana.eur",
+        "shinhan.eur",
+        "woori.eur",
+        "ibk.eur",
+        "nh.eur",
+        "sc.eur",
+        "bs.eur"
+      ],
+      "1w": [
+        "investing.eur",
+        "hana.eur"
+      ],
+      "1y": [
+        "investing.eur",
+        "hana.eur"
+      ],
+      "3m": [
+        "investing.eur",
+        "hana.eur"
+      ]
+    },
+    "jpy": {
+      "1d": [
+        "investing.jpy",
+        "kb.jpy",
+        "hana.jpy",
+        "shinhan.jpy",
+        "woori.jpy",
+        "ibk.jpy",
+        "nh.jpy",
+        "sc.jpy",
+        "bs.jpy"
+      ],
+      "1w": [
+        "investing.jpy",
+        "hana.jpy"
+      ],
+      "1y": [
+        "investing.jpy",
+        "hana.jpy"
+      ],
+      "3m": [
+        "investing.jpy",
+        "hana.jpy"
+      ]
+    },
+    "tether": {
+      "1d": [
+        "upbit.usdt-krw",
+        "bithumb.usdt-krw",
+        "coinone.usdt-krw",
+        "korbit.usdt-krw",
+        "gopax.usdt-krw",
+        "krx.usd-krw-futures",
+        "investing.usd",
+        "kb.usd",
+        "hana.usd",
+        "dxy",
+        "dxy_futures"
+      ],
+      "1w": [
+        "bithumb.usdt-krw",
+        "krx.usd-krw-futures",
+        "investing.usd",
+        "hana.usd",
+        "dxy"
+      ],
+      "1y": [
+        "bithumb.usdt-krw",
+        "krx.usd-krw-futures",
+        "investing.usd",
+        "hana.usd",
+        "dxy"
+      ],
+      "3m": [
+        "bithumb.usdt-krw",
+        "krx.usd-krw-futures",
+        "investing.usd",
+        "hana.usd",
+        "dxy"
+      ]
+    },
+    "usd": {
+      "1d": [
+        "investing.usd",
+        "krx.usd-krw-futures",
+        "kb.usd",
+        "hana.usd",
+        "shinhan.usd",
+        "woori.usd",
+        "ibk.usd",
+        "nh.usd",
+        "sc.usd",
+        "bs.usd",
+        "dxy"
+      ],
+      "1w": [
+        "investing.usd",
+        "krx.usd-krw-futures",
+        "hana.usd",
+        "dxy"
+      ],
+      "1y": [
+        "investing.usd",
+        "krx.usd-krw-futures",
+        "hana.usd",
+        "dxy"
+      ],
+      "3m": [
+        "investing.usd",
+        "krx.usd-krw-futures",
+        "hana.usd",
+        "dxy"
+      ]
+    }
+  },
+  "sources": [
+    {
+      "asset": "usd-krw",
+      "category": "reference",
+      "phase1Enabled": true,
+      "sortOrder": 10,
+      "source": "investing"
+    },
+    {
+      "asset": "usd-krw",
+      "category": "reference",
+      "phase1Enabled": true,
+      "sortOrder": 20,
+      "source": "kb"
+    },
+    {
+      "asset": "usd-krw",
+      "category": "reference",
+      "phase1Enabled": true,
+      "sortOrder": 30,
+      "source": "hana"
+    },
+    {
+      "asset": "usd-krw-futures",
+      "category": "derivative",
+      "phase1Enabled": true,
+      "sortOrder": 40,
+      "source": "krx"
+    },
+    {
+      "asset": "usdt-krw",
+      "category": "exchange",
+      "phase1Enabled": true,
+      "sortOrder": 50,
+      "source": "upbit"
+    },
+    {
+      "asset": "usdt-krw",
+      "category": "exchange",
+      "phase1Enabled": true,
+      "sortOrder": 60,
+      "source": "bithumb"
+    },
+    {
+      "asset": "usdt-krw",
+      "category": "exchange",
+      "phase1Enabled": true,
+      "sortOrder": 70,
+      "source": "coinone"
+    },
+    {
+      "asset": "usdt-krw",
+      "category": "exchange",
+      "phase1Enabled": true,
+      "sortOrder": 80,
+      "source": "korbit"
+    },
+    {
+      "asset": "usdt-krw",
+      "category": "exchange",
+      "phase1Enabled": true,
+      "sortOrder": 90,
+      "source": "gopax"
+    }
+  ],
+  "topicIds": [
+    "dxy:spot",
+    "fx:eur-krw",
+    "fx:jpy-krw",
+    "fx:usd-krw",
+    "krx:usd-krw-futures",
+    "usdt:krw"
+  ]
+}

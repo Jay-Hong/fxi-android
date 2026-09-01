@@ -1,0 +1,14 @@
+{
+  "data": {
+    "usd_krw_futures": {
+      "asset": "usd-krw-futures",
+      "rate": 1397.5,
+      "rate_changed_at": "2026-08-31T10:20:00.001000+09:00",
+      "source": "krx",
+      "timestamp": "2026-08-31T10:20:00+09:00"
+    }
+  },
+  "topic": "krx:usd-krw-futures",
+  "type": "snapshot",
+  "version": 1
+}

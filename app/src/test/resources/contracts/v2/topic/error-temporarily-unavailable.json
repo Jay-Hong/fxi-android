@@ -1,0 +1,6 @@
+{
+  "error": "temporarily_unavailable",
+  "request_id": "error-temporarily_unavailable",
+  "retry_after_seconds": 5,
+  "type": "subscription_error"
+}
