@@ -16,6 +16,9 @@ import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.OAuthProvider
 import com.jay.fxi.BuildConfig
 import com.jay.fxi.R
+import com.jay.fxi.data.auth.AuthIdentityFence
+import com.jay.fxi.data.auth.AuthTokenProvider
+import com.jay.fxi.data.auth.AuthTransitionCoordinator
 import com.jay.fxi.domain.model.AuthProvider
 import com.jay.fxi.domain.model.AuthState
 import com.jay.fxi.domain.model.UserInfo
@@ -27,6 +30,7 @@ import com.revenuecat.purchases.PurchasesError
 import com.revenuecat.purchases.interfaces.LogInCallback
 import com.revenuecat.purchases.interfaces.ReceiveCustomerInfoCallback
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -37,6 +41,8 @@ import javax.inject.Inject
 @HiltViewModel
 class AuthViewModel @Inject constructor(
     private val auth: FirebaseAuth,
+    private val authTokenProvider: AuthTokenProvider,
+    private val authTransitionCoordinator: AuthTransitionCoordinator,
     private val subscriptionManager: SubscriptionManager,
     private val pushNotificationManager: PushNotificationManager
 ) : ViewModel() {
@@ -153,15 +159,20 @@ class AuthViewModel @Inject constructor(
                 if (credential is androidx.credentials.CustomCredential &&
                     credential.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
                 ) {
-                    val googleIdTokenCredential = GoogleIdTokenCredential.createFrom(credential.data)
+                    val googleIdTokenCredential =
+                        GoogleIdTokenCredential.createFrom(credential.data)
                     val firebaseCredential = GoogleAuthProvider.getCredential(
                         googleIdTokenCredential.idToken,
                         null
                     )
-                    auth.signInWithCredential(firebaseCredential).await()
+                    authTransitionCoordinator.withTrackedTransition {
+                        auth.signInWithCredential(firebaseCredential).await()
+                    }
                 } else {
                     _errorMessage.value = "지원하지 않는 로그인 방식입니다"
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
                 _errorMessage.value = mapAuthError(e)
             } finally {
@@ -175,16 +186,20 @@ class AuthViewModel @Inject constructor(
             _isLoading.value = true
             _errorMessage.value = null
             try {
-                val provider = OAuthProvider.newBuilder("apple.com")
-                provider.scopes = listOf("email", "name")
-                provider.addCustomParameter("locale", Locale.getDefault().language)
+                authTransitionCoordinator.withTrackedTransition {
+                    val provider = OAuthProvider.newBuilder("apple.com")
+                    provider.scopes = listOf("email", "name")
+                    provider.addCustomParameter("locale", Locale.getDefault().language)
 
-                val pending = auth.pendingAuthResult
-                if (pending != null) {
-                    pending.await()
-                } else {
-                    auth.startActivityForSignInWithProvider(activity, provider.build()).await()
+                    val pending = auth.pendingAuthResult
+                    if (pending != null) {
+                        pending.await()
+                    } else {
+                        auth.startActivityForSignInWithProvider(activity, provider.build()).await()
+                    }
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
                 _errorMessage.value = mapAuthError(e)
             } finally {
@@ -198,9 +213,16 @@ class AuthViewModel @Inject constructor(
     }
 
     fun signOut() {
+        val owner = authTokenProvider.currentIdentityFence() ?: return
         viewModelScope.launch {
-            pushNotificationManager.unregisterDeviceFromServer()
-            auth.signOut()
+            authTransitionCoordinator.withTransition {
+                ownerBoundSignOut(
+                    owner = owner,
+                    unregister = pushNotificationManager::unregisterDeviceFromServer,
+                    invalidate = authTokenProvider::invalidateCurrentSession,
+                    signOut = { auth.signOut() }
+                )
+            }
         }
     }
 
@@ -221,4 +243,16 @@ class AuthViewModel @Inject constructor(
     companion object {
         private const val TAG = "Auth"
     }
+}
+
+/** Orders the destructive sign-out boundary and treats generation invalidation as a CAS. */
+internal suspend fun ownerBoundSignOut(
+    owner: AuthIdentityFence,
+    unregister: suspend (AuthIdentityFence) -> Unit,
+    invalidate: (AuthIdentityFence) -> Boolean,
+    signOut: suspend () -> Unit
+) {
+    unregister(owner)
+    if (!invalidate(owner)) return
+    signOut()
 }

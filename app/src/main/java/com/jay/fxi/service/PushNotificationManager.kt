@@ -9,22 +9,24 @@ import android.util.Log
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.google.android.gms.tasks.Tasks
-import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.messaging.FirebaseMessaging
 import com.jay.fxi.admission.ReleaseAdmission
-import com.jay.fxi.data.remote.FXiApiService
+import com.jay.fxi.data.auth.AuthIdentityFence
+import com.jay.fxi.data.auth.AuthSnapshot
+import com.jay.fxi.data.remote.AuthenticatedApiClient
 import com.jay.fxi.data.remote.dto.DeviceRequest
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 @Singleton
 class PushNotificationManager @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val apiService: FXiApiService,
-    private val auth: FirebaseAuth
+    private val apiService: AuthenticatedApiClient
 ) {
     private val prefs = context.getSharedPreferences("push_prefs", Context.MODE_PRIVATE)
 
@@ -43,34 +45,45 @@ class PushNotificationManager @Inject constructor(
      * FCM 토큰 갱신 시 호출 (FXiMessagingService.onNewToken)
      *
      * old token cleanup과 new token registration을 분리:
-     * - 이전 토큰 해제: auth만 확인 (FCM이 무효화한 토큰은 서버에서 정리)
-     * - 새 토큰 등록: 3중 가드 (auth + premium + shouldRegisterForPush)
+     * - 이전 토큰 해제: captured auth owner만 사용 (FCM이 무효화한 토큰은 서버에서 정리)
+     * - 새 토큰 등록: 3중 가드 (captured auth owner + premium + shouldRegisterForPush)
      */
     suspend fun onNewToken(token: String, isPremium: Boolean) {
         if (!ReleaseAdmission.isOpen) return
+        val owner = captureOwnerOrNull()
         withContext(Dispatchers.IO) {
             val oldToken = savedToken
             savedToken = token
+            val snapshot = capturePushSnapshotOrNull(
+                owner = owner,
+                capture = apiService::captureSnapshot,
+                onFailure = { error ->
+                    Log.w(TAG, "Push auth snapshot unavailable: ${error.message}")
+                }
+            )
 
-            // 이전 토큰 해제 — auth만 확인 (FCM 토큰 회전 = 이전 토큰 무효)
-            if (auth.currentUser != null && oldToken != null && oldToken != token) {
+            // 이전 토큰 해제 — captured owner만 사용 (FCM 토큰 회전 = 이전 토큰 무효)
+            if (snapshot != null && oldToken != null && oldToken != token) {
                 try {
-                    val response = apiService.unregisterDevice(oldToken)
+                    val response = apiService.unregisterDevice(snapshot, oldToken)
                     if (response.isSuccessful) {
                         Log.d(TAG, "Old token unregistered")
                     } else {
                         Log.w(TAG, "Old token unregister failed: ${response.code()}")
                     }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (e: Exception) {
                     Log.w(TAG, "Old token unregister failed: ${e.message}")
                 }
             }
 
             // 새 토큰 등록 — 3중 가드
-            if (auth.currentUser == null || !isPremium || !shouldRegisterForPush) return@withContext
+            if (snapshot == null || !isPremium || !shouldRegisterForPush) return@withContext
 
             try {
                 val response = apiService.registerDevice(
+                    snapshot,
                     DeviceRequest(deviceToken = token, platform = PLATFORM_ANDROID)
                 )
                 if (response.isSuccessful) {
@@ -78,6 +91,8 @@ class PushNotificationManager @Inject constructor(
                 } else {
                     Log.e(TAG, "Device registration failed: ${response.code()}")
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
                 Log.e(TAG, "Device registration failed: ${e.message}")
             }
@@ -89,12 +104,20 @@ class PushNotificationManager @Inject constructor(
      */
     suspend fun registerIfNeeded(isPremium: Boolean) {
         if (!ReleaseAdmission.isOpen) return
+        val owner = captureOwnerOrNull() ?: return
+        registerIfNeeded(owner, isPremium)
+    }
+
+    suspend fun registerIfNeeded(owner: AuthIdentityFence, isPremium: Boolean) {
+        if (!ReleaseAdmission.isOpen) return
         withContext(Dispatchers.IO) {
-            if (auth.currentUser == null || !isPremium || !shouldRegisterForPush) return@withContext
+            if (!isPremium || !shouldRegisterForPush) return@withContext
 
             // 저장된 토큰이 있더라도 최신 토큰으로 갱신 시도 (토큰 회전/프로젝트 변경 복구)
             val latestToken = try {
                 Tasks.await(FirebaseMessaging.getInstance().token)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
                 Log.w(TAG, "FCM token refresh failed, fallback to saved token: ${e.message}")
                 null
@@ -112,14 +135,23 @@ class PushNotificationManager @Inject constructor(
                     return@withContext
                 }
             }
+            val snapshot = capturePushSnapshotOrNull(
+                owner = owner,
+                capture = apiService::captureSnapshot,
+                onFailure = { error ->
+                    Log.w(TAG, "Push auth snapshot unavailable: ${error.message}")
+                }
+            ) ?: return@withContext
 
             // 토큰이 바뀌면 이전 토큰 해제 (best-effort)
             if (!oldToken.isNullOrBlank() && oldToken != token) {
                 try {
-                    val response = apiService.unregisterDevice(oldToken)
+                    val response = apiService.unregisterDevice(snapshot, oldToken)
                     if (!response.isSuccessful) {
                         Log.w(TAG, "Old token unregister failed: ${response.code()}")
                     }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (e: Exception) {
                     Log.w(TAG, "Old token unregister failed: ${e.message}")
                 }
@@ -127,6 +159,7 @@ class PushNotificationManager @Inject constructor(
 
             try {
                 val response = apiService.registerDevice(
+                    snapshot,
                     DeviceRequest(deviceToken = token, platform = PLATFORM_ANDROID)
                 )
                 if (response.isSuccessful) {
@@ -134,6 +167,8 @@ class PushNotificationManager @Inject constructor(
                 } else {
                     Log.e(TAG, "Device registration failed: ${response.code()}")
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
                 Log.e(TAG, "Device registration failed: ${e.message}")
             }
@@ -143,25 +178,44 @@ class PushNotificationManager @Inject constructor(
     /**
      * 서버에서 기기 등록 해제 (로그아웃 시)
      */
-    suspend fun unregisterDeviceFromServer() {
+    suspend fun unregisterDeviceFromServer() =
+        unregisterDeviceFromServer(captureOwnerOrNull())
+
+    suspend fun unregisterDeviceFromServer(owner: AuthIdentityFence?) {
         if (!ReleaseAdmission.isOpen) return
         withContext(Dispatchers.IO) {
             val token = savedToken
-            if (token != null) {
+            if (token != null && owner != null) {
                 try {
-                    val response = apiService.unregisterDevice(token)
+                    val snapshot = apiService.captureSnapshot(owner)
+                    val response = apiService.unregisterDevice(snapshot, token)
                     if (response.isSuccessful) {
                         Log.d(TAG, "Device unregistered")
                     } else {
                         Log.w(TAG, "Device unregister failed: ${response.code()}")
                     }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (e: Exception) {
                     Log.w(TAG, "Device unregister failed: ${e.message}")
                 }
             }
-            savedToken = null
-            shouldRegisterForPush = false
+            clearLocalRegistrationState()
         }
+    }
+
+    /** Clears app-owned registration state without issuing an authenticated server mutation. */
+    fun clearLocalRegistrationState() {
+        prefs.edit()
+            .remove(KEY_FCM_TOKEN)
+            .putBoolean(KEY_SHOULD_REGISTER, false)
+            .apply()
+    }
+
+    private fun captureOwnerOrNull(): AuthIdentityFence? = try {
+        apiService.captureIdentityFence()
+    } catch (_: IOException) {
+        null
     }
 
     /**
@@ -206,5 +260,22 @@ class PushNotificationManager @Inject constructor(
         private const val PLATFORM_ANDROID = "android"
         private const val KEY_FCM_TOKEN = "fcm_token"
         private const val KEY_SHOULD_REGISTER = "should_register"
+    }
+}
+
+/** Push registration is best-effort for ordinary credential lookup failures. */
+internal suspend fun capturePushSnapshotOrNull(
+    owner: AuthIdentityFence?,
+    capture: suspend (AuthIdentityFence) -> AuthSnapshot,
+    onFailure: (Exception) -> Unit = {}
+): AuthSnapshot? {
+    if (owner == null) return null
+    return try {
+        capture(owner)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        onFailure(error)
+        null
     }
 }

@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.jay.fxi.di.StorageJson
 import com.jay.fxi.domain.model.Bank
 import com.jay.fxi.domain.model.BankDisplayConfig
 import com.jay.fxi.domain.model.BankPreferenceItem
@@ -30,7 +31,7 @@ private val Context.bankPreferenceDataStore: DataStore<Preferences> by preferenc
 @Singleton
 class BankPreferenceManager @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val json: Json
+    @StorageJson private val json: Json
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val orderedBanksKey = stringPreferencesKey("ordered_banks")

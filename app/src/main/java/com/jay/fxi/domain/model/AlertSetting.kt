@@ -26,7 +26,7 @@ data class AlertSetting(
     var updatedAt: Instant,
     @SerialName("triggered_at")
     @Serializable(with = InstantSerializer::class)
-    var triggeredAt: Instant? = null
+    var triggeredAt: Instant?
 ) {
     val bankType: Bank? get() = Bank.fromCode(bank)
     val currencyType: SupportedCurrency? get() = SupportedCurrency.fromCode(currency)

@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.jay.fxi.di.StorageJson
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.GraphBucket
 import com.jay.fxi.domain.model.GraphCache
@@ -43,7 +44,7 @@ private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(na
 @Singleton
 class CacheService @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val json: Json
+    @StorageJson private val json: Json
 ) {
     companion object {
         private const val TAG = "CacheService"

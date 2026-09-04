@@ -26,8 +26,9 @@ class ContractPayloadTest {
     }
     private val wireJson = Json {
         ignoreUnknownKeys = true
-        coerceInputValues = true
-        isLenient = true
+        coerceInputValues = false
+        isLenient = false
+        explicitNulls = true
     }
     private val decoder = TopicFrameDecoder(wireJson)
 

@@ -127,7 +127,6 @@ fun CurrencyTabContent(
     ) { granted ->
         alertViewModel.onPermissionResult(
             granted = granted,
-            isPremium = isPremium,
             pendingCreate = pendingCreate
         )
         pendingCreate = null
@@ -746,9 +745,9 @@ fun CurrencyTabContent(
                             condition = condition,
                             threshold = threshold,
                             isPremium = isPremium,
-                            onPermissionNeeded = {
+                            onPermissionNeeded = { intentOwner ->
                                 isSaving = false
-                                // 권한 승인 후 재시도할 생성 액션 저장
+                                // Preserve the original auth generation across the permission UI.
                                 pendingCreate = {
                                     isSaving = true
                                     alertViewModel.createSetting(
@@ -757,6 +756,7 @@ fun CurrencyTabContent(
                                         condition = condition,
                                         threshold = threshold,
                                         isPremium = isPremium,
+                                        owner = intentOwner,
                                         onPermissionNeeded = {},
                                         onSuccess = {
                                             isSaving = false

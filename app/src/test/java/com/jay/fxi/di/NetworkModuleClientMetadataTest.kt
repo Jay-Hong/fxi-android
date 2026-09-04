@@ -1,11 +1,24 @@
 package com.jay.fxi.di
 
 import com.jay.fxi.admission.ReleaseAdmissionInterceptor
+import com.jay.fxi.data.auth.AuthIdentity
+import com.jay.fxi.data.auth.AuthTokenProvider
+import com.jay.fxi.data.auth.AuthTokenSource
+import com.jay.fxi.data.remote.AuthSnapshotInterceptor
 import com.jay.fxi.data.remote.ClientMetadataInterceptor
-import okhttp3.Interceptor
+import com.jay.fxi.data.remote.FXiApiService
+import com.jay.fxi.data.remote.MutationOneShotInterceptor
+import okhttp3.Authenticator
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import retrofit2.http.DELETE
+import retrofit2.http.GET
+import retrofit2.http.PATCH
+import retrofit2.http.POST
+import retrofit2.http.PUT
 
 /**
  * ADR-039 REST 배선 잠금 — provideOkHttpClient가 ClientMetadataInterceptor를 실제로 연결하는지.
@@ -15,9 +28,16 @@ import org.junit.Test
 class NetworkModuleClientMetadataTest {
 
     @Test
-    fun okHttpClient_wiresClientMetadataInterceptor() {
-        val noopAuth = Interceptor { it.proceed(it.request()) }
-        val client = NetworkModule.provideOkHttpClient(noopAuth)
+    fun protectedClient_wiresAuthAndMutationPolicy_withoutChangingPublicReadPolicy() {
+        val provider = AuthTokenProvider(
+            object : AuthTokenSource {
+                override fun currentIdentity(): AuthIdentity? = null
+                override suspend fun fetchToken(identity: AuthIdentity, forceRefresh: Boolean) =
+                    error("not used")
+            }
+        )
+        val authInterceptor = AuthSnapshotInterceptor(provider)
+        val client = NetworkModule.provideProtectedOkHttpClient(authInterceptor)
         assertEquals(
             "D24 admission must be the first REST interceptor",
             ReleaseAdmissionInterceptor::class,
@@ -27,5 +47,66 @@ class NetworkModuleClientMetadataTest {
             "provideOkHttpClient가 ClientMetadataInterceptor를 연결해야 함",
             client.interceptors.any { it is ClientMetadataInterceptor }
         )
+        val authIndex = client.interceptors.indexOfFirst { it === authInterceptor }
+        val metadataIndex = client.interceptors.indexOfFirst { it is ClientMetadataInterceptor }
+        val mutationIndex = client.interceptors.indexOfFirst { it is MutationOneShotInterceptor }
+        assertTrue(
+            "protected client must wire the exact explicit-snapshot interceptor instance",
+            authIndex >= 0
+        )
+        assertTrue(
+            "auth binding must run after metadata and before mutation replay protection",
+            metadataIndex in 0 until authIndex && authIndex < mutationIndex
+        )
+        assertEquals(
+            "mutation one-shot guard must be closest to OkHttp retry/follow-up",
+            MutationOneShotInterceptor::class,
+            client.interceptors.last()::class
+        )
+        assertFalse(client.retryOnConnectionFailure)
+        assertFalse(client.followRedirects)
+        assertFalse(client.followSslRedirects)
+        assertSame(Authenticator.NONE, client.authenticator)
+        assertSame(Authenticator.NONE, client.proxyAuthenticator)
+
+        val publicClient = NetworkModule.providePublicOkHttpClient()
+        assertEquals(ReleaseAdmissionInterceptor::class, publicClient.interceptors.first()::class)
+        assertTrue(publicClient.interceptors.any { it is ClientMetadataInterceptor })
+        assertTrue(publicClient.retryOnConnectionFailure)
+        assertTrue(publicClient.followRedirects)
+        assertTrue(publicClient.followSslRedirects)
+        assertFalse(publicClient.interceptors.any { it is AuthSnapshotInterceptor })
+        assertFalse(publicClient.interceptors.any { it is MutationOneShotInterceptor })
+
+        val protectedRetrofit = NetworkModule.provideProtectedRetrofit(
+            client,
+            NetworkModule.provideWireJson()
+        )
+        assertSame(
+            "protected Retrofit must retain the hardened protected OkHttp client",
+            client,
+            protectedRetrofit.callFactory()
+        )
+    }
+
+    @Test
+    fun publicRetrofitSurface_remainsReadOnly() {
+        val mutationAnnotations = setOf(
+            POST::class.java,
+            PUT::class.java,
+            PATCH::class.java,
+            DELETE::class.java
+        )
+
+        FXiApiService::class.java.declaredMethods.forEach { method ->
+            assertTrue(
+                "${method.name} must remain an explicit read operation",
+                method.annotations.any { it.annotationClass.java == GET::class.java }
+            )
+            assertFalse(
+                "${method.name} must move to ProtectedRest before becoming a mutation",
+                method.annotations.any { it.annotationClass.java in mutationAnnotations }
+            )
+        }
     }
 }

@@ -12,6 +12,7 @@ import com.jay.fxi.data.remote.dto.WebSocketGraphBuckets
 import com.jay.fxi.data.remote.dto.WebSocketMessageType
 import com.jay.fxi.data.remote.dto.WebSocketPing
 import com.jay.fxi.data.remote.dto.WebSocketRatesMessage
+import com.jay.fxi.di.WireJson
 import com.jay.fxi.domain.model.ConnectionState
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.util.ApiConfig
@@ -63,7 +64,7 @@ internal fun buildWebSocketClient(): OkHttpClient = OkHttpClient.Builder()
 @Singleton
 class WebSocketService @Inject constructor(
     private val networkMonitor: NetworkMonitor,
-    private val json: Json
+    @WireJson private val json: Json
 ) : DefaultLifecycleObserver {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)

@@ -10,6 +10,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.local.CacheService
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
@@ -196,6 +197,8 @@ class AlertViewModel @Inject constructor(
             return
         }
 
+        val owner = repository.captureOwnerOrNull() ?: return
+
         // 새 요청 시작 시 수동 컨텍스트 설정
         if (isManualRefresh) {
             manualOrigin = true
@@ -219,7 +222,7 @@ class AlertViewModel @Inject constructor(
             var shouldRetry = false
             var isSuccess = false
             try {
-                repository.getSettings().fold(
+                repository.getSettings(owner).fold(
                     onSuccess = { settings ->
                         val newState = AlertState.Loaded(alertSettings = settings.sortedByCreatedAt())
                         if (_state.value != newState) {
@@ -238,7 +241,10 @@ class AlertViewModel @Inject constructor(
                 )
                 if (shouldRegisterPush) {
                     pushNotificationManager.shouldRegisterForPush = true
-                    pushNotificationManager.registerIfNeeded(subscriptionManager.isPremium.value)
+                    pushNotificationManager.registerIfNeeded(
+                        owner,
+                        subscriptionManager.isPremium.value
+                    )
                 }
 
                 // iOS 패리티: 로딩 중 대기한 새로고침 요청 1회 재시도
@@ -328,7 +334,8 @@ class AlertViewModel @Inject constructor(
         condition: AlertCondition,
         threshold: Double,
         isPremium: Boolean,
-        onPermissionNeeded: () -> Unit,
+        owner: AuthIdentityFence? = null,
+        onPermissionNeeded: (AuthIdentityFence) -> Unit,
         onSuccess: () -> Unit = {},
         onError: (String) -> Unit = {}
     ) {
@@ -337,59 +344,63 @@ class AlertViewModel @Inject constructor(
             return
         }
 
+        // Capture the intent owner before a permission prompt can suspend this action.
+        val intentOwner = owner ?: repository.captureOwnerOrNull() ?: run {
+            onError("인증 오류")
+            return
+        }
+
         // 첫 알림 생성 시 권한 확인
         if (!_hasNotificationPermission.value) {
-            onPermissionNeeded()
+            onPermissionNeeded(intentOwner)
             return
         }
 
         viewModelScope.launch {
             _isOperationInProgress.value = true
-            // 권한 승인됨 → 푸시 등록
-            pushNotificationManager.shouldRegisterForPush = true
-            pushNotificationManager.registerIfNeeded(isPremium)
+            try {
+                // 권한 승인됨 → 푸시 등록
+                pushNotificationManager.shouldRegisterForPush = true
+                pushNotificationManager.registerIfNeeded(intentOwner, isPremium)
 
-            val request = AlertSettingRequest(
-                bank = bank,
-                currency = currency,
-                condition = condition,
-                threshold = threshold,
-                isEnabled = true
-            )
-            repository.createSetting(request).fold(
-                onSuccess = { created ->
-                    val loaded = _state.value as? AlertState.Loaded
-                    if (loaded != null) {
-                        // sync_alerts 경쟁 상황에서도 ID 기준 upsert로 중복 표시 방지
-                        val merged = loaded.alertSettings
-                            .filterNot { it.id == created.id } + created
-                        _state.value = AlertState.Loaded(alertSettings = merged.sortedByCreatedAt())
-                    } else {
-                        // 로딩/에러 상태에서는 서버 정본으로 재동기화
-                        requestRefresh()
+                val request = AlertSettingRequest(
+                    bank = bank,
+                    currency = currency,
+                    condition = condition,
+                    threshold = threshold,
+                    isEnabled = true
+                )
+                repository.createSetting(intentOwner, request).fold(
+                    onSuccess = { created ->
+                        val loaded = _state.value as? AlertState.Loaded
+                        if (loaded != null) {
+                            // sync_alerts 경쟁 상황에서도 ID 기준 upsert로 중복 표시 방지
+                            val merged = loaded.alertSettings
+                                .filterNot { it.id == created.id } + created
+                            _state.value = AlertState.Loaded(alertSettings = merged.sortedByCreatedAt())
+                        } else {
+                            // 로딩/에러 상태에서는 서버 정본으로 재동기화
+                            requestRefresh()
+                        }
+                        onSuccess()
+                    },
+                    onFailure = { e ->
+                        onError(e.message ?: "생성 실패")
                     }
-                    onSuccess()
-                },
-                onFailure = { e ->
-                    onError(e.message ?: "생성 실패")
-                }
-            )
-            _isOperationInProgress.value = false
+                )
+            } finally {
+                _isOperationInProgress.value = false
+            }
         }
     }
 
     fun onPermissionResult(
         granted: Boolean,
-        isPremium: Boolean,
         pendingCreate: (() -> Unit)?
     ) {
         markPermissionRequested()
         refreshPermissionState()
         if (granted) {
-            viewModelScope.launch {
-                pushNotificationManager.shouldRegisterForPush = true
-                pushNotificationManager.registerIfNeeded(isPremium)
-            }
             pendingCreate?.invoke()
         }
     }
@@ -399,6 +410,10 @@ class AlertViewModel @Inject constructor(
      * - Note: 404는 "다른 기기에서 삭제됨"으로 처리 (로컬 제거 + 동기화)
      */
     fun toggleSetting(setting: AlertSetting, onError: (String) -> Unit = {}) {
+        val owner = repository.captureOwnerOrNull() ?: run {
+            onError("인증 오류")
+            return
+        }
         val newEnabled = !setting.isEnabled
         updateSettingLocally(setting.id) {
             it.isEnabled = newEnabled
@@ -408,7 +423,7 @@ class AlertViewModel @Inject constructor(
         viewModelScope.launch {
             // partial update: is_enabled만 전송
             val request = AlertSettingUpdateRequest(isEnabled = newEnabled)
-            repository.updateSettingPartial(setting.id, request).fold(
+            repository.updateSettingPartial(owner, setting.id, request).fold(
                 onSuccess = { updated ->
                     // 서버 응답 전체 객체로 교체
                     replaceSettingLocally(updated)
@@ -444,52 +459,62 @@ class AlertViewModel @Inject constructor(
         onSuccess: () -> Unit = {},
         onError: (String) -> Unit = {}
     ) {
+        val owner = repository.captureOwnerOrNull() ?: run {
+            onError("인증 오류")
+            return
+        }
         // 원본 설정 찾기
         val original = _state.value.settings.find { it.id == id }
 
         viewModelScope.launch {
             _isOperationInProgress.value = true
-
-            // partial update: 변경된 필드만 전송 (currency는 서버에서 미지원)
-            val request = if (original != null) {
-                AlertSettingUpdateRequest(
-                    bank = if (bank != original.bank) bank else null,
-                    condition = if (condition != original.condition) condition else null,
-                    threshold = if (kotlin.math.abs(threshold - original.threshold) >= 0.005) threshold else null,
-                    isEnabled = if (isEnabled != original.isEnabled) isEnabled else null
-                )
-            } else {
-                // 원본이 없으면 모든 필드 전송
-                AlertSettingUpdateRequest(
-                    bank = bank,
-                    condition = condition,
-                    threshold = threshold,
-                    isEnabled = isEnabled
-                )
-            }
-
-            repository.updateSettingPartial(id, request).fold(
-                onSuccess = { updated ->
-                    // 서버 응답의 전체 객체로 교체 (iOS와 동일)
-                    replaceSettingLocally(updated)
-                    onSuccess()
-                },
-                onFailure = { e ->
-                    // 404: 다른 기기에서 삭제됨 → 로컬 제거 + 동기화
-                    if (e is AlertNotFoundException) {
-                        removeSettingLocally(id)
-                        loadSettings() // 백그라운드 동기화
-                        onError("다른 기기에서 삭제되었습니다")
-                    } else {
-                        onError(e.message ?: "수정 실패")
-                    }
+            try {
+                // partial update: 변경된 필드만 전송 (currency는 서버에서 미지원)
+                val request = if (original != null) {
+                    AlertSettingUpdateRequest(
+                        bank = if (bank != original.bank) bank else null,
+                        condition = if (condition != original.condition) condition else null,
+                        threshold = if (kotlin.math.abs(threshold - original.threshold) >= 0.005) threshold else null,
+                        isEnabled = if (isEnabled != original.isEnabled) isEnabled else null
+                    )
+                } else {
+                    // 원본이 없으면 모든 필드 전송
+                    AlertSettingUpdateRequest(
+                        bank = bank,
+                        condition = condition,
+                        threshold = threshold,
+                        isEnabled = isEnabled
+                    )
                 }
-            )
-            _isOperationInProgress.value = false
+
+                repository.updateSettingPartial(owner, id, request).fold(
+                    onSuccess = { updated ->
+                        // 서버 응답의 전체 객체로 교체 (iOS와 동일)
+                        replaceSettingLocally(updated)
+                        onSuccess()
+                    },
+                    onFailure = { e ->
+                        // 404: 다른 기기에서 삭제됨 → 로컬 제거 + 동기화
+                        if (e is AlertNotFoundException) {
+                            removeSettingLocally(id)
+                            loadSettings() // 백그라운드 동기화
+                            onError("다른 기기에서 삭제되었습니다")
+                        } else {
+                            onError(e.message ?: "수정 실패")
+                        }
+                    }
+                )
+            } finally {
+                _isOperationInProgress.value = false
+            }
         }
     }
 
     fun deleteSetting(setting: AlertSetting, onError: (String) -> Unit = {}) {
+        val owner = repository.captureOwnerOrNull() ?: run {
+            onError("인증 오류")
+            return
+        }
         val current = _state.value.settings.toMutableList()
         val index = current.indexOfFirst { it.id == setting.id }
         if (index < 0) return
@@ -498,7 +523,7 @@ class AlertViewModel @Inject constructor(
         _state.value = AlertState.Loaded(alertSettings = current)
 
         viewModelScope.launch {
-            repository.deleteSetting(setting.id).onFailure { e ->
+            repository.deleteSetting(owner, setting.id).onFailure { e ->
                 // Rollback
                 val rollback = _state.value.settings.toMutableList()
                 rollback.add(index.coerceAtMost(rollback.size), setting)

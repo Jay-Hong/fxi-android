@@ -14,9 +14,9 @@ import kotlinx.serialization.Serializable
 @Serializable
 data class GraphResponse(
     val pair: String,
-    val period: String = GraphPeriod.ONE_DAY.code,
+    val period: String,
     @SerialName("bucket_size")
-    val bucketSize: String = "10m",
+    val bucketSize: String,
     val sources: Map<String, List<List<Double>>>,  // source -> [[ts, max, min, close], ...]
     @SerialName("as_of")
     val asOfRaw: String? = null

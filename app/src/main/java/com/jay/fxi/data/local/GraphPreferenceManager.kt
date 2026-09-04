@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.jay.fxi.di.StorageJson
 import com.jay.fxi.domain.model.GraphSource
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
@@ -34,7 +35,7 @@ private val Context.graphPreferenceDataStore: DataStore<Preferences> by preferen
 @Singleton
 class GraphPreferenceManager @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val json: Json
+    @StorageJson private val json: Json
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val selectedSourcesKey = stringPreferencesKey("selected_sources")
