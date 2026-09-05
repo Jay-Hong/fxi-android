@@ -17,7 +17,17 @@ internal enum class AuthenticatedEndpoint {
     NOTIFICATION_SETTINGS,
     UPDATE_NOTIFICATION_SETTING,
     DELETE_NOTIFICATION_SETTING,
-    DELETE_USER
+    DELETE_USER,
+
+    /**
+     * `GET /api/entitlements`.
+     *
+     * Carries no typed premium error body: every decided or pending answer is HTTP 200, and its
+     * only non-200 paths come from token verification. A 403 here is therefore
+     * [AuthenticatedFailureKind.UNKNOWN_AUTHORIZATION] by the default branch, which is what makes
+     * the reducer re-ask with `fresh_premium=true` instead of treating it as a rejection.
+     */
+    ENTITLEMENTS
 }
 
 enum class AuthenticatedFailureKind {

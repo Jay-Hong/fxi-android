@@ -1,19 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+   API 31+ backup / device-transfer rules.
+
+   D27: access epoch, capability epoch, cleanup markers and the pending-purge journal must never
+   cross devices. Restoring an epoch onto a different install points cleanup at a namespace that
+   never existed there, and restoring a `mayContain*Data` marker claims data that is not present.
+
+   The plan's DoD ultimately wants an allowlist ("allowlisted DataStore만 복원") rather than these
+   excludes. Converting the whole app to an allowlist changes restore behaviour for existing user
+   preferences, so it is a separate change; this file excludes the new control-plane store now.
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="file" path="datastore/fxi_access_epoch.preferences_pb" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="file" path="datastore/fxi_access_epoch.preferences_pb" />
     </device-transfer>
-    -->
 </data-extraction-rules>

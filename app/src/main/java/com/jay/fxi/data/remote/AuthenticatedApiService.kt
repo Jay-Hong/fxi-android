@@ -5,6 +5,7 @@ import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
 import com.jay.fxi.data.remote.dto.DeviceRequest
+import com.jay.fxi.data.remote.dto.EntitlementsResponse
 import com.jay.fxi.data.remote.dto.NotificationSettingsResponse
 import com.jay.fxi.domain.model.AlertSetting
 import javax.inject.Singleton
@@ -68,6 +69,16 @@ internal interface AuthenticatedApiService {
     @DELETE("api/user/me")
     suspend fun deleteUser(
         @Tag auth: AuthRequestTag
+    ): Response<ResponseBody>
+
+    /**
+     * [freshPremium] is omitted unless true so an ordinary query keeps the server's default
+     * availability cache; only a recovery query pays the cache-free cost.
+     */
+    @GET("api/entitlements")
+    suspend fun getEntitlements(
+        @Tag auth: AuthRequestTag,
+        @Query("fresh_premium") freshPremium: Boolean? = null
     ): Response<ResponseBody>
 }
 
@@ -154,4 +165,19 @@ class AuthenticatedApiClient internal constructor(
         transport.executeMutation(owner) { service.deleteUser(it) }
             .preserve(AuthenticatedEndpoint.DELETE_USER)
             .asUnit()
+
+    /**
+     * Reads the entitlement envelope.
+     *
+     * A read, so the transport's GET replay applies: a 401 is retried once against a forced token
+     * refresh before it reaches the caller as an authentication failure.
+     */
+    suspend fun getEntitlements(
+        owner: AuthSnapshot,
+        freshPremium: Boolean
+    ): AuthenticatedHttpResponse<EntitlementsResponse> = transport.executeRead(owner) {
+        service.getEntitlements(it, freshPremium.takeIf { requested -> requested })
+    }
+        .preserve(AuthenticatedEndpoint.ENTITLEMENTS)
+        .decodeSuccess(wireJson)
 }
