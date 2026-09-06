@@ -9,6 +9,7 @@ import com.jay.fxi.domain.model.GraphPeriod
 import kotlinx.datetime.Instant
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
@@ -294,6 +295,109 @@ class FreeSnapshotSanitizerTest {
         val malformed = series.with("data", JsonArray(listOf(point.with("low", JsonPrimitive(1401.0)))))
         assertThrows(FreeSnapshotValidationException::class.java) { sanitize(withSeries(F.snapshot(), listOf(malformed))) }
     }
+
+    /**
+     * The plan requires zero KRX strings on the free surface, and several admitted fields arrive as
+     * unbounded free text: a series `label` and `unit` render verbatim, while its `axis_group` and
+     * every `per_point_metadata` entry are not drawn today but are kept in the model and in the
+     * cache the plan admits only sanitized values to. A prefix test only caught the sequence at
+     * position zero, so a label of "USD KRX 선물" was admitted and drawn. A key like `usd_krx_rate`
+     * is dropped by the projection either way — but the scan *is* the admission policy, and missing
+     * it means a payload carrying KRX evidence was accepted where it should have been refused.
+     */
+    @Test
+    fun krxIsRefusedAnywhereInAString_notOnlyAtItsStart() {
+        // The rate block is scanned whole, so a mention anywhere inside it rejects the answer.
+        fun rejectsRate(what: String, key: String, value: JsonElement) {
+            assertThrows(
+                "admitted KRX in a rate entry $what",
+                FreeSnapshotValidationException::class.java
+            ) { sanitize(withRates(F.snapshot(), listOf(F.rate().with(key, value)))) }
+        }
+        rejectsRate("key", "usd_krx_rate", JsonPrimitive(1400.0))
+        rejectsRate("value", "note", JsonPrimitive("mirrors usd-krw-futures"))
+        // A populated contract field under a name that is not exactly `contract_code`. Left as an
+        // exact match, this passed on the side the wire is most likely to carry it on.
+        rejectsRate("contract field key", "usd_contract_code", JsonPrimitive("A75606"))
+
+        // …but the *name* alone is not the evidence — the value is. Today's builder omits the key
+        // entirely for a non-KRX row (`graph_v2.py:346`), so this is a tolerance rather than an
+        // observed payload: it is the reading the server's own free check takes
+        // (`free_snapshot.py:388`, `contract_code is not None`), and matching it is what keeps a
+        // future null from blanking a snapshot the server was right to serve. The one place the key
+        // rule is deliberately weaker than the render rule.
+        val withNullContract = F.rate().with("contract_code", JsonNull)
+        assertEquals(
+            listOf("investing"),
+            sanitize(withRates(F.snapshot(), listOf(withNullContract))).testRates.map { it.source }
+        )
+
+        // A series is dropped rather than fatal, so pair each offender with clean siblings: the
+        // survivors are compared by identity *and* content, and the offender is placed first, last
+        // and in the middle. Only ever putting it last leaves "returns everything up to the first
+        // bad one" indistinguishable from a correct drop.
+        fun dropsSeries(what: String, offender: JsonObject) {
+            val a = F.series("investing.usd")
+            val b = F.series("hana.usd")
+            listOf(
+                listOf(offender, a) to listOf("investing.usd"),
+                listOf(a, offender) to listOf("investing.usd"),
+                listOf(a, offender, b) to listOf("investing.usd", "hana.usd")
+            ).forEach { (wire, expected) ->
+                val kept = sanitize(withSeries(F.snapshot(), wire)).graph.series
+                assertEquals("admitted KRX in a series $what", expected, kept.map { it.seriesId })
+                // The survivors must be whole, not merely present.
+                kept.forEach { series ->
+                    assertEquals("Reference", series.label)
+                    assertEquals(1, series.points.size)
+                    assertEquals(1400.0, series.points.single().rate, 0.0)
+                }
+            }
+        }
+        val offender = F.series("dxy")
+        dropsSeries("label", offender.with("label", JsonPrimitive("USD KRX 선물")))
+        dropsSeries("unit", offender.with("unit", JsonPrimitive("KRW (KRX 정산)")))
+        dropsSeries("axis group", offender.with("axis_group", JsonPrimitive("krw-vs-krx")))
+        dropsSeries("per-point metadata", offender.withMetadata("close_basis", "source_krx_method"))
+        dropsSeries("provenance naming the contract field", offender.withMetadata("close_basis", "contract_code"))
+        // The contract field named in prose, with no "krx" anywhere to catch it instead.
+        dropsSeries("prose naming the contract field", offender.with("label", JsonPrimitive("선물 contract_code 기준")))
+
+        // Positive control: the same three series with no mention all survive, in order. `usd-krw`
+        // and an axis group of `krw` are one letter away and must not be caught by the rule.
+        assertEquals(
+            listOf("investing.usd", "dxy", "hana.usd"),
+            sanitize(withSeries(F.snapshot(), listOf(F.series("investing.usd"), offender, F.series("hana.usd"))))
+                .graph.series.map { it.seriesId }
+        )
+    }
+
+    /**
+     * The envelope's own strings are copied into the cache without passing through either scan —
+     * the rate check takes the rate block, the series check takes one series at a time.
+     */
+    @Test
+    fun krxInTheGraphEnvelopeIsRefused_thoughNothingRendersItYet() {
+        val wire = F.snapshot()
+        val graph = wire.getValue("graph") as JsonObject
+        fun rejects(key: String, value: JsonElement) {
+            assertThrows(
+                "admitted KRX in graph.$key",
+                FreeSnapshotValidationException::class.java
+            ) { sanitize(wire.with("graph", graph.with(key, value))) }
+        }
+        rejects("bucket_size", JsonPrimitive("10min KRX"))
+        rejects("live_domain_mode", JsonPrimitive("rolling-krx"))
+        rejects("range", (graph.getValue("range") as JsonObject).with("end", JsonPrimitive("2026-09-06 KRX")))
+        // Positive control: the untouched envelope is admitted.
+        assertEquals("10min", sanitize(wire).graph.bucketSize)
+    }
+
+    private fun JsonObject.withMetadata(vararg fields: String): JsonObject = with(
+        "provenance",
+        (getValue("provenance") as JsonObject)
+            .with("per_point_metadata", JsonArray(fields.map { JsonPrimitive(it) }))
+    )
 
     private fun sanitize(wire: JsonObject, tab: String = "usd") = sanitizer.sanitize(F.decode(wire), tab, GraphPeriod.ONE_DAY)
     private fun withRates(wire: JsonObject, entries: List<JsonElement>): JsonObject = wire.with("rate", (wire.getValue("rate") as JsonObject).with("entries", JsonArray(entries)))

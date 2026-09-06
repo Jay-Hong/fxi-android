@@ -103,6 +103,14 @@ class FreeSnapshotSanitizer @Inject constructor() {
         }
         if (!hasRates || series.none { it.points.isNotEmpty() }) invalid("Empty sanitized free snapshot")
         val graph = response.graph
+        // The envelope's own strings never passed through either scan above — the rate check takes
+        // the rate block and the series check takes one series at a time — yet all four are copied
+        // into the UID-scoped cache verbatim. The plan admits only sanitized values there, so a
+        // `bucket_size` of "KRX" has to be refused here even though nothing renders it today.
+        if (listOfNotNull(graph.bucketSize, graph.range.start, graph.range.end, graph.liveDomainMode)
+                .any { it.mentionsKrx() }) {
+            invalid("KRX content in free snapshot graph envelope")
+        }
         return FreeSnapshot(
             tab, period, response.asOf, response.generatedAt, response.refreshNotBefore, rate,
             FreeGraph(graph.bucketSize, series, graph.range.start, graph.range.end,
@@ -201,15 +209,39 @@ class FreeSnapshotSanitizer @Inject constructor() {
         }
         fun JsonObject.optionalPrice(key: String): Double? = this[key]?.takeUnless { it == JsonNull }?.let { price(key) }
 
+        /**
+         * Names no legitimate field or value carries.
+         *
+         * `contains`, not `startsWith`: the plan's requirement is zero KRX **strings** on the free
+         * surface, and several wire fields arrive as unbounded free text. A series `label` and
+         * `unit` render verbatim; its `axis_group` and every `per_point_metadata` entry are not
+         * drawn today but are kept in the model and in the cache the plan admits only sanitized
+         * values to. A prefix test admits "USD KRX 선물" as a label and `usd_krx_rate` as a key.
+         * Nothing legitimate contains either: the sources are bank and exchange names, the assets
+         * are `*-krw`, and the KRX provenance values (`krx_openapi_daily`, `krx_cf_close_1545`) are
+         * defined only for rows the free builder excludes.
+         */
+        fun String.namesKrx(): Boolean =
+            contains("krx", ignoreCase = true) || contains("usd-krw-futures", ignoreCase = true)
+
+        /** The rule for anything that renders: [namesKrx], plus the contract field named in prose. */
+        fun String.mentionsKrx(): Boolean =
+            trim().let { it.namesKrx() || it.contains("contract_code", ignoreCase = true) }
+
         fun JsonElement.hasKrxContent(): Boolean = when (this) {
             is JsonObject -> any { (key, value) ->
-                (key.equals("contract_code", ignoreCase = true) && value != JsonNull) ||
-                    key.startsWith("krx", ignoreCase = true) || value.hasKrxContent()
+                // A key naming the contract field is evidence of KRX only when it carries one.
+                // Today's builder omits the key entirely for a non-KRX row (`graph_v2.py:346`), so
+                // this null branch is a *tolerance* rather than a case anyone has observed — but it
+                // is the same reading the server's own free check takes (`free_snapshot.py:388`,
+                // `contract_code is not None`), and matching it is what keeps Android from blanking
+                // a snapshot the server was right to serve. The name still matches by substring —
+                // leaving it an exact match let `usd_contract_code` through.
+                (key.contains("contract_code", ignoreCase = true) && value != JsonNull) ||
+                    key.namesKrx() || value.hasKrxContent()
             }
             is JsonArray -> any { it.hasKrxContent() }
-            is JsonPrimitive -> isString && (content.trim().startsWith("krx", ignoreCase = true) ||
-                content.trim().equals("usd-krw-futures", ignoreCase = true) ||
-                content.trim().equals("contract_code", ignoreCase = true))
+            is JsonPrimitive -> isString && content.mentionsKrx()
         }
 
         inline fun <T> validOrNull(block: () -> T): T? = try {
