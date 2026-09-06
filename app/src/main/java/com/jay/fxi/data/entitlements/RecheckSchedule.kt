@@ -36,7 +36,7 @@ enum class QueryOrigin {
 class RecheckSchedule(
     private val scope: CoroutineScope,
     private val clock: RecheckClock,
-    private val onDue: suspend (RefreshIntent, QueryOrigin) -> Unit
+    private val onDue: suspend (intent: RefreshIntent, origin: QueryOrigin, bindingEpoch: Long) -> Unit
 ) {
     private val mutex = Mutex()
     private var pending: Job? = null
@@ -54,7 +54,7 @@ class RecheckSchedule(
      * Mode strength matters on a join: a `.forcePremium` retry that a later ordinary request
      * replaced would come back as `IF_STALE` and, per the D23 table, be unable to grant at all.
      */
-    suspend fun schedule(request: RecheckRequest) = mutex.withLock {
+    suspend fun schedule(request: RecheckRequest, bindingEpoch: Long) = mutex.withLock {
         pending?.cancel()
         consecutiveAttempts += 1
         val now = clock.elapsedMillis()
@@ -68,7 +68,9 @@ class RecheckSchedule(
             if (delayMillis > 0) delay(delayMillis)
             // Read at fire time, not launch time: a caller blocked by the floor in the meantime
             // may have upgraded the queued mode.
-            onDue(mutex.withLock { pendingIntent } ?: intent, QueryOrigin.SCHEDULED)
+            // The epoch belongs to the binding that armed THIS callback. Never read a replacement
+            // binding's epoch at fire time; the coordinator revalidates this captured value there.
+            onDue(mutex.withLock { pendingIntent } ?: intent, QueryOrigin.SCHEDULED, bindingEpoch)
         }
     }
 
@@ -79,12 +81,16 @@ class RecheckSchedule(
      * logout, UID change, typed rejection. Those are exactly the events after which an old
      * server-requested delay no longer describes anything.
      */
-    suspend fun cancel() = mutex.withLock {
+    suspend fun cancel(preserveServerFloor: Boolean = false) = mutex.withLock {
         pending?.cancel()
         pending = null
         pendingIntent = null
         consecutiveAttempts = 0
-        earliestAllowedAtMillis = null
+        // A settled outcome retires the floor with the request that earned it. An *identity*
+        // boundary does not: a `Retry-After` is a rate limit on this device and endpoint, and
+        // switching accounts is not something the server agreed to lift. Clearing it here let a
+        // sign-in one second after a 30s floor issue its first query immediately.
+        if (!preserveServerFloor) earliestAllowedAtMillis = null
     }
 
     /**
@@ -119,6 +125,35 @@ class RecheckSchedule(
     suspend fun upgradePendingIntent(intent: RefreshIntent) = mutex.withLock {
         if (pending?.isActive != true) return
         pendingIntent = strongest(pendingIntent, intent)
+    }
+
+    /**
+     * Holds a refused request until the floor lets it through.
+     *
+     * [upgradePendingIntent] alone only strengthens a retry that already exists. After an identity
+     * boundary there is none — the boundary cancels the pending retry and keeps only the floor — so
+     * the new binding's first query had nothing to fold into and was dropped, leaving that user on
+     * `NoGrant` with nothing scheduled to ask again. Arming one here is the difference between
+     * honouring the wait and losing the request.
+     */
+    suspend fun deferUntilFloor(intent: RefreshIntent, bindingEpoch: Long) {
+        val floor = mutex.withLock {
+            if (pending?.isActive == true) {
+                // This is a fold, not a reschedule: deadline and consecutiveAttempts stay put.
+                // With attempt 1 due at 30s, a fold at 29s still fires at 30s; schedule() would
+                // increment to attempt 2 and move it to 29s + 5s = 34s.
+                pendingIntent = strongest(pendingIntent, intent)
+                return
+            }
+            earliestAllowedAtMillis
+        } ?: return
+        schedule(
+            RecheckRequest(
+                intent,
+                minDelayMillis = (floor - clock.elapsedMillis()).coerceAtLeast(0L)
+            ),
+            bindingEpoch
+        )
     }
 
     fun recordQueryStarted() {

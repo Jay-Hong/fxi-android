@@ -7,6 +7,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -14,6 +15,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
+import kotlinx.coroutines.launch
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
@@ -35,6 +38,10 @@ class PremiumAccessCoordinatorTest {
         /** Parks the next load so a test can hold the coordinator's lock from the outside. */
         var blockNextLoadOn: CompletableDeferred<Unit>? = null
 
+        /** Parks the teardown/bind writes, to observe what a reader sees while they are running. */
+        var blockNextSignOutOn: CompletableDeferred<Unit>? = null
+        var blockNextBindOn: CompletableDeferred<Unit>? = null
+
         override suspend fun load(): AccessEpochRecord {
             if (failNextLoad) {
                 failNextLoad = false
@@ -46,10 +53,14 @@ class PremiumAccessCoordinatorTest {
             }
             return record
         }
-        override suspend fun bindOwner(uid: String) =
-            AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
-        override suspend fun signOut() =
-            AccessEpochTransitions.signOut(record, ids).also { record = it }
+        override suspend fun bindOwner(uid: String): AccessEpochRecord {
+            blockNextBindOn?.let { gate -> blockNextBindOn = null; gate.await() }
+            return AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
+        }
+        override suspend fun signOut(): AccessEpochRecord {
+            blockNextSignOutOn?.let { gate -> blockNextSignOutOn = null; gate.await() }
+            return AccessEpochTransitions.signOut(record, ids).also { record = it }
+        }
         override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean): AccessEpochRecord {
             if (failNextRotation) throw java.io.IOException("simulated persistence failure")
             return AccessEpochTransitions.rotate(record, rotateUser, rotateKrx, ids).also { record = it }
@@ -128,7 +139,7 @@ class PremiumAccessCoordinatorTest {
         coordinator.onOwnerChanged(OWNER)
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
-        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value)
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
 
         val inFlight = async { coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
         runCurrent()
@@ -136,14 +147,14 @@ class PremiumAccessCoordinatorTest {
 
         coordinator.onTopicRejected(TopicRejection.PREMIUM_REQUIRED)
         runCurrent()
-        assertEquals(PremiumAccessState.Rejected, coordinator.state.value)
+        assertEquals(PremiumAccessState.Rejected, coordinator.state.value.state)
         assertNotEquals("a grant rejection must rotate", fenceBefore, store.record.fence())
 
         release.complete(Unit)
         inFlight.await()
         advanceUntilIdle()
 
-        assertEquals(PremiumAccessState.Rejected, coordinator.state.value)
+        assertEquals(PremiumAccessState.Rejected, coordinator.state.value.state)
         processJob.cancel()
     }
 
@@ -168,7 +179,7 @@ class PremiumAccessCoordinatorTest {
 
         coordinator.onTopicRejected(TopicRejection.PREMIUM_REQUIRED)
         runCurrent()
-        assertEquals(PremiumAccessState.Rejected, coordinator.state.value)
+        assertEquals(PremiumAccessState.Rejected, coordinator.state.value.state)
         assertEquals("nothing was protected, so nothing rotated", fenceBefore, store.record.fence())
 
         release.complete(Unit)
@@ -178,7 +189,7 @@ class PremiumAccessCoordinatorTest {
         assertEquals(
             "an ACTIVE that left before the rejection must not grant",
             PremiumAccessState.Rejected,
-            coordinator.state.value
+            coordinator.state.value.state
         )
         processJob.cancel()
     }
@@ -199,7 +210,7 @@ class PremiumAccessCoordinatorTest {
         assertEquals(
             "user-b's entitlement must not grant user-a",
             PremiumAccessState.NoGrant,
-            coordinator.state.value
+            coordinator.state.value.state
         )
         processJob.cancel()
     }
@@ -213,7 +224,7 @@ class PremiumAccessCoordinatorTest {
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
 
-        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value)
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
         assertEquals(KrxCapabilityState.VISIBLE, coordinator.krx.value)
         processJob.cancel()
     }
@@ -242,7 +253,7 @@ class PremiumAccessCoordinatorTest {
         inFlight.await()
         advanceUntilIdle()
 
-        assertEquals(PremiumAccessState.NoGrant, coordinator.state.value)
+        assertEquals(PremiumAccessState.NoGrant, coordinator.state.value.state)
         processJob.cancel()
     }
 
@@ -268,7 +279,7 @@ class PremiumAccessCoordinatorTest {
         assertEquals(
             "an answer no live session confirms must not grant",
             PremiumAccessState.NoGrant,
-            coordinator.state.value
+            coordinator.state.value.state
         )
 
         // The credential comes back. The re-check that was armed must pick the grant up.
@@ -276,7 +287,7 @@ class PremiumAccessCoordinatorTest {
         advanceUntilIdle()
 
         assertTrue("no re-check was armed for an unconfirmable session", calls >= 2)
-        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value)
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
         processJob.cancel()
     }
 
@@ -347,7 +358,7 @@ class PremiumAccessCoordinatorTest {
         advanceUntilIdle()
 
         assertEquals("the cancelled request's latch blocked the next escalation", 2, calls)
-        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value)
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
         processJob.cancel()
     }
 
@@ -370,7 +381,7 @@ class PremiumAccessCoordinatorTest {
         coordinator.onOwnerChanged(OWNER)
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
-        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value)
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
 
         coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
         runCurrent()
@@ -378,7 +389,7 @@ class PremiumAccessCoordinatorTest {
         assertEquals(
             "a credential failure must not downgrade a grant",
             PremiumAccessState.PremiumConfirmed,
-            coordinator.state.value
+            coordinator.state.value.state
         )
         assertTrue("no re-check was armed", calls >= 2)
         processJob.cancel()
@@ -415,7 +426,7 @@ class PremiumAccessCoordinatorTest {
         advanceUntilIdle()
 
         assertEquals("the retry ran, but not strongly enough to grant", listOf(false, true), modes)
-        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value)
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
         processJob.cancel()
     }
 
@@ -441,7 +452,7 @@ class PremiumAccessCoordinatorTest {
         advanceUntilIdle()
 
         assertEquals("the second escalation was suppressed", 2, calls)
-        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value)
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
         processJob.cancel()
     }
 
@@ -472,7 +483,7 @@ class PremiumAccessCoordinatorTest {
         advanceUntilIdle()
 
         assertEquals("user-b never got to query", 2, calls)
-        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value)
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
 
         release.complete(Unit)
         stuck.await()
@@ -540,7 +551,7 @@ class PremiumAccessCoordinatorTest {
         coordinator.onOwnerChanged(OWNER)
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
-        assertEquals(PremiumAccessState.FreeConfirmed, coordinator.state.value)
+        assertEquals(PremiumAccessState.FreeConfirmed, coordinator.state.value.state)
 
         val fresh = async { coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
         runCurrent()
@@ -555,7 +566,7 @@ class PremiumAccessCoordinatorTest {
         assertEquals(
             "the fresh grant was discarded by a bump that no rejection caused",
             PremiumAccessState.PremiumConfirmed,
-            coordinator.state.value
+            coordinator.state.value.state
         )
         processJob.cancel()
     }
@@ -608,7 +619,7 @@ class PremiumAccessCoordinatorTest {
         advanceUntilIdle()
 
         assertEquals("the probe stopped inside its own window", 5, calls)
-        assertEquals(PremiumAccessState.FreeConfirmed, coordinator.state.value)
+        assertEquals(PremiumAccessState.FreeConfirmed, coordinator.state.value.state)
         processJob.cancel()
     }
 
@@ -630,7 +641,7 @@ class PremiumAccessCoordinatorTest {
         advanceUntilIdle()
 
         assertEquals("the goal was reached; later ticks must not re-query", 2, calls)
-        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value)
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
         processJob.cancel()
     }
 
@@ -651,7 +662,7 @@ class PremiumAccessCoordinatorTest {
         advanceUntilIdle()
 
         assertEquals("a local true must not keep re-asking past a typed rejection", 1, calls)
-        assertEquals(PremiumAccessState.Rejected, coordinator.state.value)
+        assertEquals(PremiumAccessState.Rejected, coordinator.state.value.state)
         processJob.cancel()
     }
 
@@ -949,7 +960,7 @@ class PremiumAccessCoordinatorTest {
         assertEquals(
             "state was published although the rotation never persisted",
             PremiumAccessState.PremiumConfirmed,
-            coordinator.state.value
+            coordinator.state.value.state
         )
         assertEquals(epochBefore, store.record.userAccessEpoch)
         processJob.cancel()
@@ -973,7 +984,7 @@ class PremiumAccessCoordinatorTest {
         assertNotEquals(epochWhileSignedIn, store.record.userAccessEpoch)
         assertEquals(epochWhileSignedIn, store.record.pendingPurges.single().userAccessEpoch)
         assertEquals(OWNER, store.record.pendingPurges.single().ownerUid)
-        assertEquals(PremiumAccessState.NoGrant, coordinator.state.value)
+        assertEquals(PremiumAccessState.NoGrant, coordinator.state.value.state)
         processJob.cancel()
     }
 
@@ -1069,9 +1080,268 @@ class PremiumAccessCoordinatorTest {
         advanceUntilIdle()
 
         assertEquals("the scheduled retry never ran", 2, calls)
-        assertEquals(PremiumAccessState.FreeConfirmed, coordinator.state.value)
-        assertFalse(coordinator.state.value.grantsPremiumRuntime)
+        assertEquals(PremiumAccessState.FreeConfirmed, coordinator.state.value.state)
+        assertFalse(coordinator.state.value.state.grantsPremiumRuntime)
         processJob.cancel()
+    }
+
+    /**
+     * Persist-before-observe is the rule for handing a grant out. Taking one away is the mirror:
+     * `store.signOut()` is disk I/O, and until it returns a reader still sees the old grant. A
+     * same-uid sign-in landing in that window matches on uid and opens the premium surface on a
+     * session that no longer exists.
+     */
+    @Test
+    fun signOut_revokesBeforeItPersists() = runTest {
+        val store = FakeStore(ids())
+        val coordinator = build(
+            store,
+            FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = false)) }
+        )
+        coordinator.onOwnerChanged(OWNER)
+        coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
+
+        val gate = CompletableDeferred<Unit>()
+        store.blockNextSignOutOn = gate
+        val teardown = launch { coordinator.onSignedOut() }
+        advanceUntilIdle()
+
+        assertEquals(
+            "the old grant stayed readable while the teardown was still writing",
+            PremiumAccessState.NoGrant,
+            coordinator.state.value.state
+        )
+        assertNull("the old owner stayed readable too", coordinator.state.value.uid)
+
+        gate.complete(Unit)
+        teardown.join()
+        processJob.cancel()
+    }
+
+    /** Same rule when the owner changes rather than leaves. */
+    @Test
+    fun ownerChange_revokesBeforeItPersists() = runTest {
+        val store = FakeStore(ids())
+        val coordinator = build(
+            store,
+            FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = false)) }
+        )
+        coordinator.onOwnerChanged(OWNER)
+        coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
+
+        val gate = CompletableDeferred<Unit>()
+        store.blockNextBindOn = gate
+        val rebind = launch { coordinator.onOwnerChanged("user-b") }
+        advanceUntilIdle()
+
+        assertEquals(
+            "the previous owner's grant stayed readable while the bind was still writing",
+            PremiumAccessState.NoGrant,
+            coordinator.state.value.state
+        )
+
+        gate.complete(Unit)
+        rebind.join()
+        processJob.cancel()
+    }
+
+    /**
+     * The published grant has to say which *session* it belongs to. A sign-out followed by a
+     * sign-in of the same user rotates only the auth generation, so a reader comparing uid alone
+     * cannot tell the torn-down session's grant from the new one's.
+     */
+    @Test
+    fun theGrantIsPublishedWithTheSessionItWasDecidedFor() = runTest {
+        val store = FakeStore(ids())
+        val source = FakeSource(
+            identity = EntitlementsIdentity(OWNER, 7L)
+        ) { answer(EntitlementsOutcome.StableActive(krxVisible = false), generation = 7L) }
+        val coordinator = build(store, source)
+
+        coordinator.onOwnerChanged(OWNER)
+        advanceUntilIdle()
+        assertEquals(
+            "the binding published no session",
+            7L,
+            coordinator.state.value.authGeneration
+        )
+
+        coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
+        assertEquals(
+            "the grant lost the session it was decided for",
+            7L,
+            coordinator.state.value.authGeneration
+        )
+        processJob.cancel()
+    }
+
+    /**
+     * An identity boundary keeps the server's floor and cancels the pending retry, so a new
+     * binding's first query is refused with nothing to fold into. Without a deferral it is simply
+     * dropped and that user stays on `NoGrant` with nothing scheduled to ask again.
+     */
+    @Test
+    fun aFirstQueryRefusedByAPreservedFloor_stillRunsWhenTheFloorLapses() = runTest {
+        val store = FakeStore(ids())
+        val firedAt = mutableListOf<Long>()
+        val modes = mutableListOf<Boolean>()
+        val source = FakeSource { fresh ->
+            firedAt += testScheduler.currentTime
+            modes += fresh
+            if (firedAt.size == 1) {
+                answer(EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 30L))
+            } else {
+                answer(EntitlementsOutcome.StableActive(krxVisible = false))
+            }
+        }
+        val coordinator = build(store, source)
+        try {
+            val firstBinding = coordinator.onOwnerChanged(OWNER)
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireGeneration = firstBinding)
+            advanceTimeBy(1_000L)
+            val liveBinding = coordinator.onOwnerChanged(OWNER)
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireGeneration = liveBinding)
+            advanceTimeBy(28_999L)
+            runCurrent()
+            assertEquals("the new binding queried inside the preserved floor", listOf(0L), firedAt)
+
+            advanceTimeBy(1L)
+            runCurrent()
+            assertEquals("the live deferred refresh missed its deadline", listOf(0L, 30_000L), firedAt)
+            assertEquals(listOf(true, true), modes)
+            assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun aQueuedLookupForARetiredGeneration_cannotReviveAPreservedFloor() = runTest {
+        val store = FakeStore(ids())
+        var fetches = 0
+        val source = FakeSource {
+            fetches += 1
+            if (fetches == 1) {
+                answer(EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 30L))
+            } else {
+                EntitlementsResult.Unauthenticated(
+                    EntitlementsOutcome.Indeterminate(IndeterminateReason.TRANSIENT)
+                )
+            }
+        }
+        val coordinator = build(store, source)
+        try {
+            val binding = coordinator.onOwnerChanged(OWNER)
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireGeneration = binding)
+            advanceTimeBy(1_000L)
+
+            // The binder queued this launch while binding N was alive; logout wins delivery.
+            val queuedLookup = launch {
+                coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireGeneration = binding)
+            }
+            source.identity = null
+            coordinator.onSignedOut()
+            runCurrent()
+            queuedLookup.join()
+            advanceTimeBy(30_000L)
+            runCurrent()
+            assertEquals("the stale lookup resurrected the cancelled timer", 1, fetches)
+            assertEquals(OwnedPremiumAccess(), coordinator.state.value)
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun aStaleProbeTick_cannotReviveAPreservedFloor() = runTest {
+        val store = FakeStore(ids())
+        var fetches = 0
+        val source = FakeSource {
+            fetches += 1
+            answer(EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 30L))
+        }
+        val coordinator = build(store, source)
+        try {
+            coordinator.onOwnerChanged(OWNER)
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+            advanceTimeBy(1_000L)
+            source.identity = null
+            coordinator.onSignedOut()
+            // The first binding owns probe epoch 1; sign-out has advanced it to 2.
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireProbeEpoch = 1L)
+            advanceTimeBy(30_000L)
+            runCurrent()
+            assertEquals("a retired probe revived the timer before its epoch check", 1, fetches)
+            assertEquals(OwnedPremiumAccess(), coordinator.state.value)
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun aStaleLookup_cannotUpgradeTheNewBindingsDeferredIntent() = runTest {
+        val store = FakeStore(ids())
+        val modes = mutableListOf<Boolean>()
+        val source = FakeSource { fresh ->
+            modes += fresh
+            if (modes.size == 1) {
+                answer(EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 30L))
+            } else {
+                answer(EntitlementsOutcome.StableInactive(krxVisible = false))
+            }
+        }
+        val coordinator = build(store, source)
+        try {
+            val oldBinding = coordinator.onOwnerChanged(OWNER)
+            coordinator.refresh(RefreshIntent.IF_STALE, requireGeneration = oldBinding)
+            advanceTimeBy(1_000L)
+            val newBinding = coordinator.onOwnerChanged(OWNER)
+            coordinator.refresh(RefreshIntent.IF_STALE, requireGeneration = newBinding)
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireGeneration = oldBinding)
+            advanceTimeBy(29_000L)
+            runCurrent()
+            assertEquals("stale work strengthened the live binding's retry", listOf(false, false), modes)
+            assertEquals(PremiumAccessState.FreeConfirmed, coordinator.state.value.state)
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun aScheduledCallbackForARetiredEpoch_cannotQueryOrRearm() = runTest {
+        val store = FakeStore(ids())
+        var fetches = 0
+        val source = FakeSource {
+            fetches += 1
+            answer(EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 30L))
+        }
+        val coordinator = build(store, source)
+        try {
+            coordinator.onOwnerChanged(OWNER) // first binding owns probe epoch 1
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+            advanceTimeBy(1_000L)
+            source.identity = null
+            coordinator.onSignedOut()
+            // Model a callback already delivered when cancellation arrives. SCHEDULED bypasses
+            // the floor, but must still validate the epoch captured when the timer was armed.
+            coordinator.refresh(
+                RefreshIntent.FORCE_PREMIUM,
+                origin = QueryOrigin.SCHEDULED,
+                requireProbeEpoch = 1L
+            )
+            advanceTimeBy(30_000L)
+            runCurrent()
+            assertEquals("scheduled origin bypassed the binding lifetime check", 1, fetches)
+            assertEquals(OwnedPremiumAccess(), coordinator.state.value)
+        } finally {
+            processJob.cancel()
+        }
     }
 
     private companion object {

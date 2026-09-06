@@ -1,5 +1,7 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AuthIdentityFence
+
 /**
  * D23 vocabulary: reducer inputs, sealed access state, and declared side effects.
  *
@@ -8,6 +10,42 @@ package com.jay.fxi.data.entitlements
  */
 
 /** Why a refresh was requested. The mode is part of the reducer input, not just transport. */
+/**
+ * An access decision together with the identity it belongs to.
+ *
+ * [uid] is null only before any owner has been bound, or after a sign-out. A consumer that reads
+ * this alongside a separate auth signal must compare the two: the flows move independently, and the
+ * window between them is exactly where a previous user's grant would otherwise be honoured.
+ */
+data class OwnedPremiumAccess(
+    val uid: String? = null,
+    /**
+     * The auth generation the decision was made under.
+     *
+     * The uid alone cannot tell one session from the next: a sign-out followed by a sign-in of the
+     * *same* user rotates this and nothing else. Without it a grant left over from the previous
+     * session matches the new one and opens the premium surface on an entitlement that was torn
+     * down — and no publishing order closes that on its own, because a reader can observe auth
+     * before the coordinator has even dequeued the identity event.
+     */
+    val authGeneration: Long? = null,
+    val state: PremiumAccessState = PremiumAccessState.NoGrant
+)
+
+/**
+ * Whether the server has confirmed premium for **exactly this session**.
+ *
+ * Bound to the generation as well as the uid. Checking the state alone let one account's grant
+ * authorise another account's push registration; checking the uid alone still let a *previous
+ * session of the same account* do it. Extracted so every entry point that can register a device
+ * shares one answer, and so the decision is testable without RevenueCat, Firebase or Android.
+ */
+fun OwnedPremiumAccess.confirmsPremiumFor(session: AuthIdentityFence?): Boolean =
+    session != null &&
+        uid == session.uid &&
+        authGeneration == session.authGeneration &&
+        state == PremiumAccessState.PremiumConfirmed
+
 enum class RefreshIntent {
     /** Ordinary foreground refresh. Client-side debounce applies. */
     IF_STALE,

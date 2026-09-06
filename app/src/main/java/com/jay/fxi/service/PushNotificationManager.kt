@@ -13,6 +13,9 @@ import com.google.firebase.messaging.FirebaseMessaging
 import com.jay.fxi.admission.ReleaseAdmission
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
+import com.jay.fxi.data.entitlements.OwnedPremiumAccess
+import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
+import com.jay.fxi.data.entitlements.confirmsPremiumFor
 import com.jay.fxi.data.remote.AuthenticatedApiClient
 import com.jay.fxi.data.remote.dto.DeviceRequest
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -26,8 +29,19 @@ import kotlinx.coroutines.withContext
 @Singleton
 class PushNotificationManager @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val apiService: AuthenticatedApiClient
+    private val apiService: AuthenticatedApiClient,
+    private val premiumAccessCoordinator: PremiumAccessCoordinator
 ) {
+    /**
+     * Whether the session we are about to register as may be registered.
+     *
+     * Asked next to the capture rather than handed in as a boolean. Callers used to decide for one
+     * identity while this class captured another a moment later, so a grant belonging to A could
+     * authorise a registration sent as B — the captured owner is the only identity the request can
+     * actually go out under, so it is the only one worth asking about.
+     */
+    private fun mayRegister(owner: AuthIdentityFence?): Boolean =
+        pushRegistrationAllowed(owner, premiumAccessCoordinator.state.value, shouldRegisterForPush)
     private val prefs = context.getSharedPreferences("push_prefs", Context.MODE_PRIVATE)
 
     private var savedToken: String?
@@ -48,7 +62,7 @@ class PushNotificationManager @Inject constructor(
      * - 이전 토큰 해제: captured auth owner만 사용 (FCM이 무효화한 토큰은 서버에서 정리)
      * - 새 토큰 등록: 3중 가드 (captured auth owner + premium + shouldRegisterForPush)
      */
-    suspend fun onNewToken(token: String, isPremium: Boolean) {
+    suspend fun onNewToken(token: String) {
         if (!ReleaseAdmission.isOpen) return
         val owner = captureOwnerOrNull()
         withContext(Dispatchers.IO) {
@@ -79,7 +93,7 @@ class PushNotificationManager @Inject constructor(
             }
 
             // 새 토큰 등록 — 3중 가드
-            if (snapshot == null || !isPremium || !shouldRegisterForPush) return@withContext
+            if (snapshot == null || !mayRegister(owner)) return@withContext
 
             try {
                 val response = apiService.registerDevice(
@@ -102,16 +116,16 @@ class PushNotificationManager @Inject constructor(
     /**
      * 3중 가드 확인 후 서버 등록
      */
-    suspend fun registerIfNeeded(isPremium: Boolean) {
+    suspend fun registerIfNeeded() {
         if (!ReleaseAdmission.isOpen) return
         val owner = captureOwnerOrNull() ?: return
-        registerIfNeeded(owner, isPremium)
+        registerIfNeeded(owner)
     }
 
-    suspend fun registerIfNeeded(owner: AuthIdentityFence, isPremium: Boolean) {
+    suspend fun registerIfNeeded(owner: AuthIdentityFence) {
         if (!ReleaseAdmission.isOpen) return
         withContext(Dispatchers.IO) {
-            if (!isPremium || !shouldRegisterForPush) return@withContext
+            if (!mayRegister(owner)) return@withContext
 
             // 저장된 토큰이 있더라도 최신 토큰으로 갱신 시도 (토큰 회전/프로젝트 변경 복구)
             val latestToken = try {
@@ -222,13 +236,13 @@ class PushNotificationManager @Inject constructor(
      * 프리미엄 전환 시 토큰 재등록 (SubscriptionManager.onAuthCompleted에서만 호출)
      * 알림 권한이 이미 승인된 상태면 shouldRegisterForPush 복원
      */
-    suspend fun rehydratePushTokenIfNeeded(isPremium: Boolean) {
+    suspend fun rehydratePushTokenIfNeeded() {
         if (!ReleaseAdmission.isOpen) return
         // 알림 권한이 승인된 상태면 shouldRegisterForPush 복원
         if (hasNotificationPermission()) {
             shouldRegisterForPush = true
         }
-        registerIfNeeded(isPremium)
+        registerIfNeeded()
     }
 
     /**
@@ -279,3 +293,18 @@ internal suspend fun capturePushSnapshotOrNull(
         null
     }
 }
+
+/**
+ * The push-registration gate, outside the Android class so it can be judged on the JVM.
+ *
+ * Same reason `capturePushSnapshotOrNull` lives out here. Two conditions: the user has actually
+ * asked for notifications, and the server has confirmed premium **for that exact session** — not
+ * merely for that uid, and not for whoever happened to be signed in when some caller made up its
+ * mind. A null owner needs no separate check; [confirmsPremiumFor] already refuses one, and a
+ * second guard for the same thing would be untestable in isolation.
+ */
+internal fun pushRegistrationAllowed(
+    owner: AuthIdentityFence?,
+    access: OwnedPremiumAccess,
+    shouldRegisterForPush: Boolean
+): Boolean = shouldRegisterForPush && access.confirmsPremiumFor(owner)

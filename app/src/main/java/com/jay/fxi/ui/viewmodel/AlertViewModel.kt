@@ -129,7 +129,7 @@ class AlertViewModel @Inject constructor(
         if (!previous && current) {
             viewModelScope.launch {
                 pushNotificationManager.shouldRegisterForPush = true
-                pushNotificationManager.registerIfNeeded(subscriptionManager.isPremium.value)
+                pushNotificationManager.registerIfNeeded()
             }
         }
     }
@@ -241,10 +241,7 @@ class AlertViewModel @Inject constructor(
                 )
                 if (shouldRegisterPush) {
                     pushNotificationManager.shouldRegisterForPush = true
-                    pushNotificationManager.registerIfNeeded(
-                        owner,
-                        subscriptionManager.isPremium.value
-                    )
+                    pushNotificationManager.registerIfNeeded(owner)
                 }
 
                 // iOS 패리티: 로딩 중 대기한 새로고침 요청 1회 재시도
@@ -361,7 +358,7 @@ class AlertViewModel @Inject constructor(
             try {
                 // 권한 승인됨 → 푸시 등록
                 pushNotificationManager.shouldRegisterForPush = true
-                pushNotificationManager.registerIfNeeded(intentOwner, isPremium)
+                pushNotificationManager.registerIfNeeded(intentOwner)
 
                 val request = AlertSettingRequest(
                     bank = bank,

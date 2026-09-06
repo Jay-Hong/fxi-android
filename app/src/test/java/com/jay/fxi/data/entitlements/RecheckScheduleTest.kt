@@ -1,12 +1,16 @@
 package com.jay.fxi.data.entitlements
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -37,12 +41,105 @@ class RecheckScheduleTest {
         val schedule = scheduleUnder(fired)
 
         // Attempt 1 has zero backoff; the server floor must still be honoured in full.
-        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 30_000L))
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 30_000L), bindingEpoch = 1L)
         advanceTimeBy(29_999L)
         assertTrue("fired before the server floor", fired.isEmpty())
 
         advanceUntilIdle()
         assertEquals(listOf(30_000L), fired)
+        processJob.cancel()
+    }
+
+    /**
+     * A settled outcome retires the floor with the request that earned it. An identity boundary
+     * does not — a `Retry-After` is a rate limit on this device and endpoint, and switching accounts
+     * is not something the server agreed to lift. Clearing it here let a sign-in one second after a
+     * 30s floor issue its first query immediately.
+     */
+    @Test
+    fun anIdentityBoundary_cancelsThePendingRetryButKeepsTheServerFloor() = runTest {
+        val fired = mutableListOf<Long>()
+        val schedule = scheduleUnder(fired)
+
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 30_000L), bindingEpoch = 1L)
+        advanceTimeBy(1_000L)
+        schedule.cancel(preserveServerFloor = true)
+
+        // The queued retry is gone…
+        advanceUntilIdle()
+        assertTrue("the pending retry survived the boundary", fired.isEmpty())
+
+        // …but the floor is not, so the next caller still waits it out.
+        assertTrue(
+            "a new sign-in issued its first query inside the server's floor",
+            !schedule.shouldQuery(RefreshIntent.FORCE_PREMIUM, QueryOrigin.CALLER)
+        )
+        processJob.cancel()
+    }
+
+    /** A settled outcome does retire it: the request that earned the floor is finished. */
+    @Test
+    fun aSettledOutcome_retiresTheServerFloorWithIt() = runTest {
+        val fired = mutableListOf<Long>()
+        val schedule = scheduleUnder(fired)
+
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 30_000L), bindingEpoch = 1L)
+        advanceTimeBy(1_000L)
+        schedule.cancel()
+
+        assertTrue(
+            "a settled outcome left a floor standing",
+            schedule.shouldQuery(RefreshIntent.FORCE_PREMIUM, QueryOrigin.CALLER)
+        )
+        processJob.cancel()
+    }
+
+    /**
+     * Honouring the wait must not mean losing the request.
+     *
+     * An identity boundary cancels the pending retry and keeps the floor, so the new binding's first
+     * query arrives with nothing to fold into — `upgradePendingIntent` does nothing without an
+     * active pending, and the query was simply dropped, leaving that user on `NoGrant` with nothing
+     * scheduled to ask again.
+     */
+    @Test
+    fun aRequestRefusedByAPreservedFloor_isArmedForWhenTheFloorLapses() = runTest {
+        val fired = mutableListOf<Long>()
+        val schedule = scheduleUnder(fired)
+
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 30_000L), bindingEpoch = 1L)
+        advanceTimeBy(1_000L)
+        schedule.cancel(preserveServerFloor = true)      // identity boundary
+
+        // The new binding's first query is refused by the floor that survived.
+        assertTrue(!schedule.shouldQuery(RefreshIntent.FORCE_PREMIUM, QueryOrigin.CALLER))
+        schedule.deferUntilFloor(RefreshIntent.FORCE_PREMIUM, bindingEpoch = 1L)
+
+        advanceTimeBy(28_999L)
+        assertTrue("fired inside the preserved floor", fired.isEmpty())
+
+        advanceUntilIdle()
+        assertEquals("the new owner's query was dropped rather than deferred", listOf(30_000L), fired)
+        processJob.cancel()
+    }
+
+    /** With a retry already armed, a refused request strengthens it rather than adding another. */
+    @Test
+    fun aRequestRefusedWhileARetryIsArmed_foldsIntoIt() = runTest {
+        val fired = mutableListOf<Long>()
+        val firedIntents = mutableListOf<RefreshIntent>()
+        val schedule = scheduleUnder(fired, firedIntents)
+
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 30_000L), bindingEpoch = 1L)
+        advanceTimeBy(1_000L)
+        schedule.deferUntilFloor(RefreshIntent.FORCE_PREMIUM, bindingEpoch = 1L)
+
+        advanceUntilIdle()
+        assertEquals("a second retry was armed alongside the first", listOf(30_000L), fired)
+        // Folding is only observable in *what* fires: the armed retry keeps its own timing but must
+        // come back strong enough to grant, which is the whole reason a refused request folds
+        // rather than being dropped.
+        assertEquals(listOf(RefreshIntent.FORCE_PREMIUM), firedIntents)
         processJob.cancel()
     }
 
@@ -52,9 +149,9 @@ class RecheckScheduleTest {
         val fired = mutableListOf<Long>()
         val schedule = scheduleUnder(fired)
 
-        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 60_000L))
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 60_000L), bindingEpoch = 1L)
         advanceTimeBy(1_000L)
-        schedule.schedule(RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 0L))
+        schedule.schedule(RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 0L), bindingEpoch = 1L)
 
         advanceTimeBy(58_999L)
         assertTrue("undercut the 60s floor at ${testScheduler.currentTime}", fired.isEmpty())
@@ -69,10 +166,10 @@ class RecheckScheduleTest {
         val fired = mutableListOf<Long>()
         val schedule = scheduleUnder(fired)
 
-        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 60_000L))
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 60_000L), bindingEpoch = 1L)
         schedule.cancel()
         // A settled outcome or an identity change invalidates the old server-requested delay.
-        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 0L))
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 0L), bindingEpoch = 1L)
         advanceUntilIdle()
 
         assertEquals(listOf(0L), fired)
@@ -85,7 +182,7 @@ class RecheckScheduleTest {
         val schedule = scheduleUnder(fired)
 
         repeat(3) {
-            schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 0L))
+            schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 0L), bindingEpoch = 1L)
             advanceUntilIdle()
         }
 
@@ -100,12 +197,12 @@ class RecheckScheduleTest {
     fun schedulingAgain_replacesTheSinglePendingRequery() = runTest {
         val intents = mutableListOf<RefreshIntent>()
         val schedule =
-            RecheckSchedule(testScope(), { testScheduler.currentTime }) { intent, _ ->
+            RecheckSchedule(testScope(), { testScheduler.currentTime }) { intent, _, _ ->
                 intents += intent
             }
 
-        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 0L))
-        schedule.schedule(RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 0L))
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 0L), bindingEpoch = 1L)
+        schedule.schedule(RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 0L), bindingEpoch = 1L)
         advanceUntilIdle()
 
         // One owner: the superseded request must not also fire.
@@ -118,7 +215,7 @@ class RecheckScheduleTest {
         val fired = mutableListOf<Long>()
         val schedule = scheduleUnder(fired)
 
-        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 60_000L))
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 60_000L), bindingEpoch = 1L)
         assertTrue(schedule.isArmed)
         schedule.cancel()
         advanceUntilIdle()
@@ -126,7 +223,7 @@ class RecheckScheduleTest {
         assertFalse(schedule.isArmed)
         assertTrue("a cancelled re-query must not fire", fired.isEmpty())
 
-        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 0L))
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 0L), bindingEpoch = 1L)
         advanceUntilIdle()
         assertEquals(1, fired.size)
         processJob.cancel()
@@ -135,7 +232,7 @@ class RecheckScheduleTest {
     @Test
     fun ifStale_isDebouncedForTenSeconds() = runTest {
         var now = 0L
-        val schedule = RecheckSchedule(testScope(), { now }) { _, _ -> }
+        val schedule = RecheckSchedule(testScope(), { now }) { _, _, _ -> }
 
         assertTrue(schedule.shouldQuery(RefreshIntent.IF_STALE, QueryOrigin.CALLER))
         schedule.recordQueryStarted()
@@ -155,7 +252,7 @@ class RecheckScheduleTest {
     @Test
     fun aScheduledRetry_isNotSuppressedByTheOrdinaryDebounce() = runTest {
         var now = 0L
-        val schedule = RecheckSchedule(testScope(), { now }) { _, _ -> }
+        val schedule = RecheckSchedule(testScope(), { now }) { _, _, _ -> }
         schedule.recordQueryStarted()
         now = 5_000L
 
@@ -174,9 +271,9 @@ class RecheckScheduleTest {
     @Test
     fun theAbsoluteFloor_alsoGatesADirectCallerQuery() = runTest {
         var now = 0L
-        val schedule = RecheckSchedule(testScope(), { now }) { _, _ -> }
+        val schedule = RecheckSchedule(testScope(), { now }) { _, _, _ -> }
 
-        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 60_000L))
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 60_000L), bindingEpoch = 1L)
         now = 1_000L
 
         // A Retry-After is a server rate limit; `.forcePremium` bypasses the client debounce and
@@ -194,10 +291,10 @@ class RecheckScheduleTest {
     fun joiningAWeakerRequest_doesNotWeakenTheQueuedMode() = runTest {
         val intents = mutableListOf<RefreshIntent>()
         val schedule =
-            RecheckSchedule(testScope(), { testScheduler.currentTime }) { intent, _ -> intents += intent }
+            RecheckSchedule(testScope(), { testScheduler.currentTime }) { intent, _, _ -> intents += intent }
 
-        schedule.schedule(RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 30_000L))
-        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 0L))
+        schedule.schedule(RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 30_000L), bindingEpoch = 1L)
+        schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 0L), bindingEpoch = 1L)
         advanceUntilIdle()
 
         // Running as IF_STALE would make the retry unable to grant at all, per the D23 table.
@@ -208,7 +305,7 @@ class RecheckScheduleTest {
     @Test
     fun forcedIntents_bypassTheDebounce() = runTest {
         var now = 0L
-        val schedule = RecheckSchedule(testScope(), { now }) { _, _ -> }
+        val schedule = RecheckSchedule(testScope(), { now }) { _, _, _ -> }
         schedule.recordQueryStarted()
         now = 1L
 
@@ -218,11 +315,100 @@ class RecheckScheduleTest {
         processJob.cancel()
     }
 
+    @Test
+    fun foldingAt29Seconds_differsFromReschedulingInDeadlineAndNextBackoff() = runTest {
+        val foldedTimes = mutableListOf<Long>()
+        val rescheduledTimes = mutableListOf<Long>()
+        val foldedIntents = mutableListOf<RefreshIntent>()
+        val rescheduledIntents = mutableListOf<RefreshIntent>()
+        val folded = scheduleUnder(foldedTimes, foldedIntents)
+        val rescheduled = scheduleUnder(rescheduledTimes, rescheduledIntents)
+        try {
+            val first = RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 30_000L)
+            folded.schedule(first, bindingEpoch = 1L)
+            rescheduled.schedule(first, bindingEpoch = 1L)
+            advanceTimeBy(29_000L)
+            assertFalse(folded.shouldQuery(RefreshIntent.FORCE_PREMIUM, QueryOrigin.CALLER))
+            assertFalse(rescheduled.shouldQuery(RefreshIntent.FORCE_PREMIUM, QueryOrigin.CALLER))
+
+            // deferUntilFloor folds into the active timer: attempts stays 1, due stays 30s.
+            folded.deferUntilFloor(RefreshIntent.FORCE_PREMIUM, bindingEpoch = 1L)
+            // A fresh schedule increments attempts to 2: max(1s remaining, 5s backoff) -> 34s.
+            rescheduled.schedule(
+                RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 1_000L),
+                bindingEpoch = 1L
+            )
+            advanceTimeBy(1_000L)
+            runCurrent()
+            assertEquals(listOf(30_000L), foldedTimes)
+            assertTrue(rescheduledTimes.isEmpty())
+
+            // Observe the attempt counts via the next retry's backoff, without exposing counters.
+            // Folded path: attempts 1 -> 2, 30s + 5s = 35s.
+            folded.schedule(RecheckRequest(RefreshIntent.FORCE_PREMIUM, 0L), bindingEpoch = 1L)
+            advanceTimeBy(4_000L)
+            runCurrent()
+            assertEquals(listOf(34_000L), rescheduledTimes)
+            // Rescheduled path: attempts 2 -> 3, 34s + 10s = 44s.
+            rescheduled.schedule(RecheckRequest(RefreshIntent.FORCE_PREMIUM, 0L), bindingEpoch = 1L)
+            advanceTimeBy(1_000L)
+            runCurrent()
+            assertEquals(listOf(30_000L, 35_000L), foldedTimes)
+            assertEquals(listOf(34_000L), rescheduledTimes)
+            advanceTimeBy(9_000L)
+            runCurrent()
+            assertEquals(listOf(34_000L, 44_000L), rescheduledTimes)
+            assertEquals(List(2) { RefreshIntent.FORCE_PREMIUM }, foldedIntents)
+            assertEquals(List(2) { RefreshIntent.FORCE_PREMIUM }, rescheduledIntents)
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun aDeferredCallback_keepsItsOriginalEpochWhenDeliveryOutlivesCancellation() = runTest {
+        val deliveredEpochs = mutableListOf<Long>()
+        val releaseOldDelivery = CompletableDeferred<Unit>()
+        var oldDeliveryStarted = false
+        val schedule = RecheckSchedule(testScope(), { testScheduler.currentTime }) { _, _, epoch ->
+            if (epoch == 2L) {
+                oldDeliveryStarted = true
+                // Model delivery that is already executing and cannot be recalled by cancel().
+                withContext(NonCancellable) { releaseOldDelivery.await() }
+            }
+            deliveredEpochs += epoch
+        }
+        try {
+            schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, 30_000L), bindingEpoch = 1L)
+            advanceTimeBy(1_000L)
+            schedule.cancel(preserveServerFloor = true)
+            schedule.deferUntilFloor(RefreshIntent.FORCE_PREMIUM, bindingEpoch = 2L)
+            advanceTimeBy(29_000L)
+            runCurrent()
+            assertTrue("the deferred callback never started", oldDeliveryStarted)
+
+            schedule.cancel(preserveServerFloor = true)
+            schedule.deferUntilFloor(RefreshIntent.FORCE_PREMIUM, bindingEpoch = 3L)
+            runCurrent()
+            assertEquals(listOf(3L), deliveredEpochs)
+            releaseOldDelivery.complete(Unit)
+            runCurrent()
+            assertEquals("old delivery adopted the replacement epoch", listOf(3L, 2L), deliveredEpochs)
+        } finally {
+            releaseOldDelivery.complete(Unit)
+            processJob.cancel()
+        }
+    }
+
     private fun TestScope.testScope(): CoroutineScope =
         CoroutineScope(processJob + StandardTestDispatcher(testScheduler))
 
-    private fun TestScope.scheduleUnder(fired: MutableList<Long>): RecheckSchedule =
-        RecheckSchedule(testScope(), { testScheduler.currentTime }) { _, _ ->
+    private fun TestScope.scheduleUnder(
+        fired: MutableList<Long>,
+        firedIntents: MutableList<RefreshIntent> = mutableListOf()
+    ): RecheckSchedule =
+        RecheckSchedule(testScope(), { testScheduler.currentTime }) { intent, _, _ ->
             fired += testScheduler.currentTime
+            firedIntents += intent
         }
 }

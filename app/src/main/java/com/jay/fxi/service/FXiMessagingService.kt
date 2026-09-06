@@ -33,10 +33,11 @@ class FXiMessagingService : FirebaseMessagingService() {
         super.onNewToken(token)
         Log.d(TAG, "New FCM token received")
         serviceScope.launch {
-            pushNotificationManagerProvider.get().onNewToken(
-                token,
-                subscriptionManagerProvider.get().isPremium.value
-            )
+            // A token rotation reaches this service whether or not any screen exists, so gating
+            // Root was never enough. No flag is passed at all now: the push manager decides against
+            // the identity it captures, which is the only one the registration can actually be sent
+            // as.
+            pushNotificationManagerProvider.get().onNewToken(token)
         }
     }
 

@@ -81,7 +81,7 @@ fun RateGraphView(
     /**
      * iOS v2.6 parity gating. follow-latest + zoom + 1d가 모두 true인 구간에서만 true로 전달.
      * 상위에서 이 신호를 받아 10초 synthetic tick을 gating하여 불필요한 recomposition 방지.
-     * null이면 아무 동작 없음 (기본 호출부는 무시 가능 — 예: LockedPreviewScreen).
+     * null이면 아무 동작 없음 (햅틱을 쓰지 않는 호출부).
      */
     onFollowActiveChanged: ((Boolean) -> Unit)? = null
 ) {

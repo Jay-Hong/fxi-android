@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
+import com.jay.fxi.data.entitlements.confirmsPremiumFor
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -39,6 +40,13 @@ class SubscriptionManager @Inject constructor(
      *
      * Forwarded as a signal only — the server stays the authority. This does not touch
      * [isPremium]; RevenueCat's own listener remains its only writer.
+     */
+    /**
+     * Whether the *server* has confirmed premium for [uid], right now.
+     *
+     * Owner-bound on purpose. Checking the state alone let one account's confirmed grant authorise
+     * another account's token registration whenever an auth callback for the second arrived before
+     * the first user's grant had been cleared.
      */
     fun onLocalPremiumSignal() {
         premiumAccessCoordinator.onLocalPremiumSignal()
@@ -134,9 +142,12 @@ class SubscriptionManager @Inject constructor(
 
             _isPremium.value = info.entitlements[ENTITLEMENT_PREMIUM]?.isActive == true
 
-            if (_isPremium.value) {
-                pushNotificationManager.rehydratePushTokenIfNeeded(_isPremium.value)
-            }
+            // The local flag is a *prompt* to try, never the authority. I7 makes RevenueCat a
+            // purchase signal; the plan puts FCM registration at zero while access is unconfirmed
+            // or refused. Whether a registration is allowed is decided against the identity that is
+            // actually captured, inside the push manager — deciding it here for a uid this class
+            // happens to be holding is what let one account's grant authorise another's device.
+            if (_isPremium.value) pushNotificationManager.rehydratePushTokenIfNeeded()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load subscription", e)
         } finally {
@@ -189,7 +200,7 @@ class SubscriptionManager @Inject constructor(
     /**
      * offerings를 로드한다. 이미 로딩 중이면 진행 중인 요청의 완료를 대기한다.
      * - 중복 호출 합침 (iOS의 offeringsTask 공유 패턴과 동일)
-     * - LockedPreviewScreen에서 preload, PaywallScreen에서 재사용
+     * - PaywallScreen 이 표시 직전에 사용
      */
     suspend fun loadOfferings(force: Boolean = false) {
         if (!isRevenueCatConfigured()) {

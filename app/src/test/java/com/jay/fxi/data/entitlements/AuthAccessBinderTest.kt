@@ -78,7 +78,9 @@ class AuthAccessBinderTest {
     private fun TestScope.build(
         calls: MutableList<Call>,
         purger: RecordingPurger = RecordingPurger(),
-        seedJournal: Boolean = false
+        seedJournal: Boolean = false,
+        /** `fresh_premium` flag of every query the binding issued, in order. */
+        fetches: MutableList<Boolean> = mutableListOf()
     ): AuthAccessBinder {
         val store = RecordingStore(calls)
         if (seedJournal) {
@@ -101,12 +103,24 @@ class AuthAccessBinderTest {
         val scope = CoroutineScope(processJob + StandardTestDispatcher(testScheduler))
         val coordinator = PremiumAccessCoordinator(
             source = object : EntitlementsSource {
-                override suspend fun fetch(freshPremium: Boolean): EntitlementsResult =
-                    EntitlementsResult.Unauthenticated(
-                        EntitlementsOutcome.Indeterminate(IndeterminateReason.TRANSIENT)
-                    )
+                // Terminal on purpose. Binding an owner now issues one `fresh_premium` query, and
+                // every `Indeterminate` reason schedules a recheck — so a transient answer would put
+                // the coordinator on a ladder that never ends and `advanceUntilIdle` would *hang*
+                // rather than fail. These tests are about the funnel, so the query answers once and
+                // stops. The identity is read from the store because that is what the binding just
+                // wrote; an answer for anyone else is discarded by the coordinator's own fence.
+                private fun boundIdentity() =
+                    EntitlementsIdentity(store.record.ownerUid.orEmpty(), 1L)
 
-                override suspend fun currentIdentity(): EntitlementsIdentity? = null
+                override suspend fun fetch(freshPremium: Boolean): EntitlementsResult {
+                    fetches += freshPremium
+                    return EntitlementsResult.Answered(
+                        identity = boundIdentity(),
+                        outcome = EntitlementsOutcome.StableInactive(krxVisible = false)
+                    )
+                }
+
+                override suspend fun currentIdentity(): EntitlementsIdentity = boundIdentity()
             },
             store = store,
             userPurger = purger,
@@ -224,6 +238,67 @@ class AuthAccessBinderTest {
 
         assertEquals(listOf("previous-owner"), purger.attempts)
         assertEquals("nobody signed in, so nothing may bind or tear down", emptyList<Call>(), calls)
+        processJob.cancel()
+    }
+
+    /**
+     * An existing subscriber who merely restores a login presses no purchase button, and
+     * `onOwnerChanged` asks the server nothing — it binds the owner and resets to NoGrant. D23 also
+     * says a cold-start grant can only come from a `fresh_premium` answer. Without a query here,
+     * that user sits on the free surface for the life of the process.
+     */
+    @Test
+    fun bindingAnOwner_asksTheServerOnceWithFreshPremium() = runTest {
+        val calls = mutableListOf<Call>()
+        val fetches = mutableListOf<Boolean>()
+        val binder = build(calls, fetches = fetches)
+        binder.start()
+
+        binder.onUidObserved("user-a")
+        advanceUntilIdle()
+
+        assertEquals("the restored login never reached the server", listOf(true), fetches)
+        processJob.cancel()
+    }
+
+    /** Firebase replays the current user, and a replay is not a new binding. */
+    @Test
+    fun aReplayedUid_doesNotReAskTheServer() = runTest {
+        val calls = mutableListOf<Call>()
+        val fetches = mutableListOf<Boolean>()
+        val binder = build(calls, fetches = fetches)
+        binder.start()
+
+        repeat(3) { binder.onUidObserved("user-a") }
+        advanceUntilIdle()
+
+        assertEquals(listOf(true), fetches)
+        processJob.cancel()
+    }
+
+    /**
+     * `launch` orders nothing against a sign-out that arrives while the query is still queued. An
+     * unpinned query would then start under the *next* generation, apply cleanly, and re-arm a
+     * recheck for a session that has ended.
+     */
+    @Test
+    fun aQueryQueuedBehindASignOut_doesNotRunUnderTheNextGeneration() = runTest {
+        val calls = mutableListOf<Call>()
+        val fetches = mutableListOf<Boolean>()
+        val binder = build(calls, fetches = fetches)
+        binder.start()
+
+        // Both events are consumed before either launched query gets to run.
+        binder.onUidObserved("user-a")
+        binder.onUidObserved(null)
+        advanceUntilIdle()
+
+        assertEquals(
+            "a query pinned to a binding ran after that binding was torn down",
+            emptyList<Boolean>(),
+            fetches
+        )
+        assertEquals(listOf(Call.OwnerChanged("user-a"), Call.SignedOut), calls)
         processJob.cancel()
     }
 }

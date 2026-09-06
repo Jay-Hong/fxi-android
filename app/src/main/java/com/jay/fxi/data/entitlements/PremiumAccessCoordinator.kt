@@ -36,8 +36,17 @@ class PremiumAccessCoordinator(
 ) {
     private val mutex = Mutex()
 
-    private val _state = MutableStateFlow<PremiumAccessState>(PremiumAccessState.NoGrant)
-    val state: StateFlow<PremiumAccessState> = _state.asStateFlow()
+    private val _state = MutableStateFlow(OwnedPremiumAccess())
+    /**
+     * The access decision **and the identity it was decided for**.
+     *
+     * A bare state cannot say whose it is, and Root reads auth and access from two different flows:
+     * during the gap between Firebase reporting a new user and this coordinator being told about
+     * them, a bare `PremiumConfirmed` left over from the previous user is what Root would branch on.
+     * Publishing the owner alongside lets a reader refuse a grant that is not its own instead of
+     * inferring it from timing.
+     */
+    val state: StateFlow<OwnedPremiumAccess> = _state.asStateFlow()
 
     private val _krx = MutableStateFlow(KrxCapabilityState.HIDDEN)
     val krx: StateFlow<KrxCapabilityState> = _krx.asStateFlow()
@@ -68,7 +77,7 @@ class PremiumAccessCoordinator(
     private var nextRequestToken: Long = 0L
 
     /**
-     * Lifetime fence for the propagation probe. Deliberately **not** [decisionGeneration].
+     * Lifetime fence for propagation probes and scheduled retries. **Not** [decisionGeneration].
      *
      * [decisionGeneration] is bumped by every authoritative loss *input*, and a stable
      * `premium_active=false` is exactly what the probe expects to receive while the server's
@@ -81,23 +90,31 @@ class PremiumAccessCoordinator(
     private var probeRunningForOwner: String? = null
 
     private val schedule =
-        RecheckSchedule(scope, clock) { intent, origin -> refresh(intent, origin) }
+        RecheckSchedule(scope, clock) { intent, origin, bindingEpoch ->
+            refresh(intent, origin, requireProbeEpoch = bindingEpoch)
+        }
 
     /**
      * Binds a signed-in owner and resumes any purge a previous process left journalled.
      *
      * Resuming first matters: the markers a resumed purge clears are inputs to the reducer.
      */
-    suspend fun onOwnerChanged(uid: String) = mutex.withLock {
+    suspend fun onOwnerChanged(uid: String): Long = mutex.withLock {
         decisionGeneration += 1
         cancelProbeLocked()
         clearForcePremiumLocked()
-        schedule.cancel()
+        // Same reason as sign-out: the previous owner's grant must stop being readable before the
+        // disk work, not after it.
+        _state.value = OwnedPremiumAccess(uid, source.currentIdentity()?.authGeneration, PremiumAccessState.NoGrant)
+        schedule.cancel(preserveServerFloor = true)
         store.bindOwner(uid)
-        _state.value = PremiumAccessState.NoGrant
         _krx.value = KrxCapabilityState.HIDDEN
         _lastEffects.value = emptyList()
         resumePendingPurgesLocked()
+        // Handed back so the caller can bind its follow-up query to *this* binding. A query queued
+        // behind a sign-out would otherwise start under the next generation and revive a session
+        // that is gone.
+        decisionGeneration
     }
 
     /**
@@ -111,9 +128,13 @@ class PremiumAccessCoordinator(
         decisionGeneration += 1
         cancelProbeLocked()
         clearForcePremiumLocked()
-        schedule.cancel()
+        // Publish the revocation *before* the store work, not after. Persist-before-observe is the
+        // rule for a grant; for taking one away it is backwards — `store.signOut()` is disk I/O, and
+        // until it returns a reader still sees the old grant. A same-uid sign-in landing in that
+        // window matches on uid and opens the premium surface on a session that no longer exists.
+        _state.value = OwnedPremiumAccess(null, null, PremiumAccessState.NoGrant)
+        schedule.cancel(preserveServerFloor = true)
         store.signOut()
-        _state.value = PremiumAccessState.NoGrant
         _krx.value = KrxCapabilityState.HIDDEN
         resumePendingPurgesLocked()
     }
@@ -166,7 +187,7 @@ class PremiumAccessCoordinator(
             PROBE_DELAY_MILLIS.forEachIndexed { index, nominal ->
                 delay(jitter.delayMillisFor(index, nominal))
                 if (mutex.withLock { probeEpoch != run.epoch }) return
-                when (_state.value) {
+                when (_state.value.state) {
                     // Goal reached, or the server said no in a way a local true cannot reopen.
                     PremiumAccessState.PremiumConfirmed, PremiumAccessState.Rejected -> return
                     // The epoch travels with the call: the check above only narrows the window,
@@ -200,8 +221,10 @@ class PremiumAccessCoordinator(
     suspend fun refresh(
         intent: RefreshIntent,
         origin: QueryOrigin = QueryOrigin.CALLER,
+        /** The [decisionGeneration] the caller believes it is still querying for, if it pinned one. */
+        requireGeneration: Long? = null,
         /**
-         * Probe ticks only: the [probeEpoch] the caller believes it still owns.
+         * Probe ticks and scheduled retries: the [probeEpoch] the caller believes it still owns.
          *
          * Checking it in the probe *before* calling here is not enough. A sign-out landing between
          * that check and this critical section makes [StartedQuery] capture the **post**-sign-out
@@ -211,16 +234,22 @@ class PremiumAccessCoordinator(
          */
         requireProbeEpoch: Long? = null
     ) {
-        if (!schedule.shouldQuery(intent, origin)) {
-            // Refused by the absolute floor. The wait is honoured, but a purchase or restore that
-            // arrived during it must still make the eventual retry strong enough to grant.
-            schedule.upgradePendingIntent(intent)
-            return
-        }
-
         var token: Long? = null
         val started: StartedQuery = mutex.withLock {
             if (requireProbeEpoch != null && probeEpoch != requireProbeEpoch) return
+            // The caller pinned this query to a binding. `launch` gives no ordering guarantee
+            // against a sign-out that ran while it was still queued, and by the time this body runs
+            // the generation it would otherwise capture is the *new* one — so an unauthorised query
+            // would apply cleanly and re-arm a recheck for a session that ended.
+            if (requireGeneration != null && decisionGeneration != requireGeneration) return
+            // Validate and defer under the same coordinator lock as identity teardown. A stale
+            // queued lookup must not revive the floor's timer before its lifetime check runs.
+            // Deferred callbacks carry this binding's probeEpoch back through the check above;
+            // unlike decisionGeneration, it survives a live probe's StableInactive answers.
+            if (!schedule.shouldQuery(intent, origin)) {
+                schedule.deferUntilFloor(intent, bindingEpoch = probeEpoch)
+                return
+            }
             val record = store.load()
             if (intent == RefreshIntent.FORCE_PREMIUM) {
                 // Owner-bound, not a global flag: an escalation still running for a signed-out
@@ -230,9 +259,9 @@ class PremiumAccessCoordinator(
                 forcePremiumToken = token
                 forcePremiumOwner = record.ownerUid
             }
+            schedule.recordQueryStarted()
             StartedQuery(record.fence(), decisionGeneration)
         }
-        schedule.recordQueryStarted()
 
         val result = try {
             source.fetch(freshPremium = intent.canGrantPremium)
@@ -292,8 +321,8 @@ class PremiumAccessCoordinator(
         //
         // Releasing between the two is the same window in a different place. A sign-out landing
         // there runs its own `schedule.cancel()` first, and this answer then re-arms the retry the
-        // teardown had just removed — and that scheduled callback re-enters [refresh] with no
-        // probe epoch to check, so no later guard stops it.
+        // teardown had just removed. Every armed callback also captures the current probe epoch
+        // and revalidates it in [refresh], covering teardown after this lock is released.
         //
         // Lock order is coordinator then schedule, and never the reverse: [RecheckSchedule] only
         // reaches back through its fire-time callback, which runs in its own coroutine after both
@@ -340,7 +369,8 @@ class PremiumAccessCoordinator(
                         ?: PremiumAccessReducer.DEFAULT_BACKOFF_FLOOR_MILLIS
                 )
             }
-            if (recheck == null) schedule.cancel() else schedule.schedule(recheck)
+            if (recheck == null) schedule.cancel()
+            else schedule.schedule(recheck, bindingEpoch = probeEpoch)
         }
     }
 
@@ -351,7 +381,7 @@ class PremiumAccessCoordinator(
         outcome: EntitlementsOutcome
     ): AccessDecision {
         val decision = PremiumAccessReducer.reduce(
-            current = record.toSnapshotFacts(_state.value, _krx.value),
+            current = record.toSnapshotFacts(_state.value.state, _krx.value),
             intent = intent,
             outcome = outcome
         )
@@ -363,7 +393,9 @@ class PremiumAccessCoordinator(
 
         if (outcome.isAuthoritativeLoss()) decisionGeneration += 1
 
-        _state.value = decision.state
+        // The generation was published when this owner was bound and does not move while they
+        // stay bound — an answer for anyone else never reaches here, `apply` refuses it first.
+        _state.value = OwnedPremiumAccess(record.ownerUid, _state.value.authGeneration, decision.state)
         _krx.value = decision.krx
         _lastEffects.value = decision.effects
 

@@ -84,7 +84,32 @@ class AuthAccessBinder(
         when {
             uid != null && uid != boundUid -> {
                 boundUid = uid
-                coordinator.onOwnerChanged(uid)
+                val boundGeneration = coordinator.onOwnerChanged(uid)
+                // `onOwnerChanged` binds the owner and resets to NoGrant; it asks the server
+                // nothing. D23 also says a cold-start grant can only come from a `fresh_premium`
+                // answer, so without a query here an existing subscriber who merely restores a
+                // login sits on the free surface forever — no purchase button is involved, so
+                // nothing else would ever ask. This is the one query, issued by the one funnel
+                // that already owns identity, rather than a second binding mechanism in Root.
+                // The default `CALLER` origin is right: `.forcePremium` already bypasses the
+                // client debounce, and the one thing still able to defer this is the server's own
+                // `Retry-After` floor — a device-wide rate limit that a new sign-in does not lift.
+                //
+                // Launched rather than awaited. This funnel is single-consumer, so awaiting a
+                // network call here would park every later identity event behind it — a sign-out
+                // queued behind a hanging query is the same ordering defect S2 step 1 was about.
+                // A query that outlives its identity cannot land: the coordinator fences late
+                // answers against its own generation.
+                // Pinned to the binding above. `launch` orders nothing against a sign-out that
+                // arrives while this is still queued, and an unpinned query would then start under
+                // the *next* generation — applying cleanly and re-arming a recheck for a session
+                // that has ended.
+                scope.launch {
+                    coordinator.refresh(
+                        RefreshIntent.FORCE_PREMIUM,
+                        requireGeneration = boundGeneration
+                    )
+                }
             }
             uid == null && boundUid != null -> {
                 boundUid = null

@@ -117,10 +117,9 @@ fun PaywallScreen(
         }
     }
 
-    // 구매 완료 → 프리미엄 전환 시 자동 닫기
-    LaunchedEffect(isPremium) {
-        if (isPremium) onClose()
-    }
+    // 자동 닫기는 여기서 하지 않는다. RevenueCat 의 로컬 active 는 구매 신호일 뿐 접근 권한이
+    // 아니어서(I7), 서버가 확인하지 않은 복원만으로도 이 화면이 열리자마자 닫혔다. 닫는 판정은
+    // 서버 확정 grant 를 보는 Root 한 곳이 소유한다.
 
     Box(
         modifier = Modifier
