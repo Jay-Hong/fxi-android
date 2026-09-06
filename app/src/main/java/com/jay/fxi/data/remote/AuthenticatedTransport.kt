@@ -193,7 +193,13 @@ internal class AuthenticatedTransport(
         if (!tokenProvider.isCurrent(snapshot)) {
             (response.body() as? Closeable)?.close()
             response.errorBody()?.close()
-            throw AuthIdentityChangedException()
+            // Refuse the answer, keep the rate limit. Closing the bodies is the refusal; the status
+            // and `Retry-After` describe the transport rather than the session, so carrying them
+            // out is what stops the caller re-requesting inside a window the server just closed.
+            throw AuthIdentityChangedException(
+                statusCode = response.code(),
+                retryAfter = response.headers()["Retry-After"]
+            )
         }
         return response
     }

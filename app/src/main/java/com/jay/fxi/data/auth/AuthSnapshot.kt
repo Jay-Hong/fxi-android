@@ -51,5 +51,16 @@ data class AuthIdentityFence internal constructor(
 open class AuthUnavailableException(message: String, cause: Throwable? = null) :
     IOException(message, cause)
 
-class AuthIdentityChangedException :
-    CancellationException("Authentication changed while acquiring or using a credential")
+class AuthIdentityChangedException(
+    /**
+     * Status of a response that had already arrived when the session moved, if one had.
+     *
+     * The body is still refused — it was authorised as somebody else. A rate limit is not: it is
+     * levied on the transport by address and endpoint, it outlives the credential that happened to
+     * carry it, and dropping it makes the next request arrive inside a window the server explicitly
+     * closed.
+     */
+    val statusCode: Int? = null,
+    /** `Retry-After` from that same response, verbatim and unparsed. */
+    val retryAfter: String? = null
+) : CancellationException("Authentication changed while acquiring or using a credential")

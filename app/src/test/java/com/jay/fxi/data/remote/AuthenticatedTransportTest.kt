@@ -160,6 +160,39 @@ class AuthenticatedTransportTest {
         }
     }
 
+    /**
+     * The body is refused because it was authorised as somebody else. A rate limit was not: it is
+     * levied on the transport by address and endpoint, it outlives the credential that carried it,
+     * and dropping it makes the next request land inside a window the server explicitly closed.
+     */
+    @Test
+    fun identityChangeWhileRequestIsInFlight_stillCarriesOutTheRateLimit() = runTest {
+        val source = FakeAuthTokenSource()
+        val transport = AuthenticatedTransport(
+            AuthTokenProvider(source, backgroundScope),
+            admitted = { true }
+        )
+        val snapshot = transport.captureSnapshot()
+
+        try {
+            transport.executeMutation<Unit>(snapshot) {
+                source.identity = AuthIdentity("user-a", 2)   // same uid, rotated session
+                val raw = okhttp3.Response.Builder()
+                    .code(429)
+                    .message("Too Many Requests")
+                    .protocol(okhttp3.Protocol.HTTP_1_1)
+                    .request(Request.Builder().url("https://example.invalid/x").build())
+                    .headers(mapOf("Retry-After" to "900").toHeaders())
+                    .build()
+                Response.error("".toResponseBody(null), raw)
+            }
+            fail("a response from a superseded session must be discarded")
+        } catch (error: AuthIdentityChangedException) {
+            assertEquals(429, error.statusCode)
+            assertEquals("900", error.retryAfter)
+        }
+    }
+
     @Test
     fun authInterceptorUsesCapturedSnapshot_andRedactsItsTag() {
         val source = FakeAuthTokenSource()
