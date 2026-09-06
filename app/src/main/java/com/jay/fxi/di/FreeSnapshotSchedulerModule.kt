@@ -5,6 +5,8 @@ import com.google.firebase.crashlytics.FirebaseCrashlytics
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.entitlements.AuthUidStream
 import com.jay.fxi.data.free.FreeSnapshotScheduler
+import com.jay.fxi.data.local.DataStoreFreeTabStore
+import com.jay.fxi.data.local.FreeTabStore
 import com.jay.fxi.domain.repository.FreeSnapshotFetching
 import dagger.Module
 import dagger.Provides
@@ -44,6 +46,10 @@ object FreeSnapshotSchedulerModule {
         // first fetch completes — never on the main thread.
         installId = lazy { installSeed(context) }::value
     )
+
+    @Provides
+    @Singleton
+    fun provideFreeTabStore(store: DataStoreFreeTabStore): FreeTabStore = store
 
     /**
      * A stable random value, drawn once per install.

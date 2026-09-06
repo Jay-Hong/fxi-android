@@ -27,6 +27,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.datetime.Instant
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -191,6 +192,55 @@ class FreeSnapshotSchedulerTest {
             val entry = f.scheduler.readState.value.entries.getValue(KEY)
             assertEquals(CURRENT_BASIS, entry.snapshot.asOf)
             assertEquals(FreeSnapshotFreshness.FRESH, entry.freshness)
+        } finally {
+            f.close()
+        }
+    }
+
+    /**
+     * The sign-out direction of the same rule, and the one the plan's DoD is actually about
+     * ("로그아웃 상태 API 호출 0"). The case below covers a surface that never had an identity;
+     * this covers one that had a live schedule and lost it.
+     *
+     * The credential session is left **stale on purpose**. The identity stream and
+     * `currentIdentityFence()` are different sources and the second lags, so there is a window in
+     * which the app is signed out and a usable fence for the departed user is still on hand. With
+     * the fence merely required to exist, that window mints a request from a signed-out app; it is
+     * matching the fence *to the current identity* that closes it. Written with the fence already
+     * null, this test passes no matter what the loop does — which is what it did on the first
+     * attempt, and no mutant noticed.
+     */
+    @Test
+    fun signingOutStopsEveryRequest_evenWhileTheCredentialSessionStillLags() = runTest {
+        val f = Fixture(this)
+        try {
+            f.fetcher.respond = always(CURRENT_BASIS, T0 + 1.hours)
+            f.startSignedIn()
+            testScheduler.runCurrent()
+            val whileSignedIn = f.fetcher.calls.size
+            assertTrue("nothing was scheduled to begin with", whileSignedIn > 0)
+
+            f.scheduler.onIdentityChanged(null)
+            testScheduler.runCurrent()
+            assertEquals(FreeSnapshotReadState(), f.scheduler.readState.value)
+            assertNotNull("the lag this test is about was not set up", f.fence)
+
+            // Re-activation is what the surface does on every foreground and every settled tab, so
+            // the loop is driven rather than merely left alone — an assertion that held only
+            // because no wake ever arrived would prove nothing.
+            f.scheduler.onActivated(TAB, PERIOD)
+            testScheduler.runCurrent()
+            // Past the refresh hint, the whole stale ladder and the 24h expiry wake.
+            testScheduler.advanceTimeBy(48.hours.inWholeMilliseconds)
+            testScheduler.runCurrent()
+            assertEquals("a request was made with no identity", whileSignedIn, f.fetcher.calls.size)
+
+            // Positive control: the machinery still works, so the count above is a refusal and not
+            // a loop that quietly stopped.
+            f.fence = AuthIdentityFence("u2", 1L)
+            f.scheduler.onIdentityChanged("u2")
+            testScheduler.runCurrent()
+            assertTrue("signing back in did not resume", f.fetcher.calls.size > whileSignedIn)
         } finally {
             f.close()
         }

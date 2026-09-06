@@ -11,15 +11,20 @@ class FreeSnapshotActivityCoordinator(
     private data class Active(val uid: String, val key: FreeSnapshotKey)
     private var active: Active? = null
 
+    /**
+     * [tab] is the server tab key, or null when the selection has none — 뉴스, and the moment
+     * before a restored selection has landed. A null tab is not a lesser form of activation: the
+     * plan requires zero snapshot traffic while 뉴스 is on screen, so it deactivates outright.
+     */
     fun update(
         uid: String,
-        tab: String,
+        tab: String?,
         period: GraphPeriod,
         isForeground: Boolean,
         isActive: Boolean
     ) {
         require(uid.isNotBlank())
-        val next = if (isForeground && isActive) Active(uid, FreeSnapshotKey(tab, period)) else null
+        val next = if (tab != null && isForeground && isActive) Active(uid, FreeSnapshotKey(tab, period)) else null
         if (next == active) return
         if (active != null && (next == null || active?.uid != next.uid)) onDeactivated()
         active = next

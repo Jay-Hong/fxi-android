@@ -8,13 +8,16 @@ import com.jay.fxi.data.free.FreeSnapshotFreshness
 import com.jay.fxi.data.free.FreeSnapshotKey
 import com.jay.fxi.data.free.FreeSnapshotReadState
 import com.jay.fxi.data.free.FreeSnapshotScheduler
+import com.jay.fxi.data.local.FreeTabStore
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.FreeGraph
 import com.jay.fxi.domain.model.FreeGraphPoint
 import com.jay.fxi.domain.model.FreeGraphSeries
 import com.jay.fxi.domain.model.FreeRate
 import com.jay.fxi.domain.model.FreeSnapshot
+import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphPeriod
+import com.jay.fxi.domain.model.SourceRate
 import com.jay.fxi.domain.repository.FreeSnapshotFetching
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
@@ -22,8 +25,10 @@ import kotlin.time.Duration.Companion.minutes
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
@@ -39,7 +44,7 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class FreeSnapshotViewModelTest {
-    private val key = FreeSnapshotUiState.DEFAULT_KEY
+    private val key = FreeSnapshotKey("usd", FreeSnapshotUiState.DEFAULT_PERIOD)
     private val basis = Instant.parse("2026-09-06T02:30:00Z")
 
     private fun snapshot(key: FreeSnapshotKey = this.key) = FreeSnapshot(
@@ -64,10 +69,31 @@ class FreeSnapshotViewModelTest {
         snapshot: FreeSnapshot = snapshot()
     ) = FreeSnapshotReadState(uid, mapOf(FreeSnapshotKey(snapshot.tab, snapshot.period) to FreeSnapshotEntry(snapshot, freshness)))
 
-    private fun withViewModel(block: suspend TestScope.(FreeSnapshotViewModel, MutableStateFlow<FreeSnapshotReadState>) -> Unit) = runTest {
+    /** Answers instantly unless a test hands it a gate, which is how the pre-restore state is seen. */
+    private class FakeTabStore(
+        private var stored: Pair<String, FreeTab>? = null,
+        private val gate: CompletableDeferred<Unit>? = null
+    ) : FreeTabStore {
+        val writes = mutableListOf<Pair<String, FreeTab>>()
+
+        override suspend fun lastTab(uid: String): FreeTab {
+            gate?.await()
+            return stored?.takeIf { it.first == uid }?.second ?: FreeTab.INITIAL
+        }
+
+        override suspend fun remember(uid: String, tab: FreeTab) {
+            stored = uid to tab
+            writes += uid to tab
+        }
+    }
+
+    private fun withViewModel(
+        tabStore: FreeTabStore = FakeTabStore(),
+        block: suspend TestScope.(FreeSnapshotViewModel, MutableStateFlow<FreeSnapshotReadState>) -> Unit
+    ) = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
         val reads = MutableStateFlow(FreeSnapshotReadState())
-        val vm = FreeSnapshotViewModel(reads, FreeSnapshotActivityCoordinator({ _, _ -> }, {}))
+        val vm = FreeSnapshotViewModel(reads, FreeSnapshotActivityCoordinator({ _, _ -> }, {}), tabStore)
         try {
             block(vm, reads)
         } finally {
@@ -82,7 +108,7 @@ class FreeSnapshotViewModelTest {
         vm.bind("u1")
         testScheduler.runCurrent()
         assertEquals(FreeSnapshotAvailability.AWAITING_SNAPSHOT, vm.uiState.value.availability)
-        assertTrue(vm.uiState.value.rates.isEmpty())
+        assertTrue(vm.uiState.value.rateSections.isEmpty())
         reads.value = FreeSnapshotReadState("u1")
         testScheduler.runCurrent()
         assertEquals(FreeSnapshotAvailability.AWAITING_SNAPSHOT, vm.uiState.value.availability)
@@ -92,16 +118,16 @@ class FreeSnapshotViewModelTest {
     fun ownerMismatchNeverRenders_andUidSwitchClearsSynchronously() = withViewModel { vm, reads ->
         reads.value = readState()
         vm.bind("u1")
-        assertFalse(vm.uiState.value.rates.isEmpty())
+        assertFalse(vm.uiState.value.rateSections.isEmpty())
         // Render-time fence closes the frame before the new UID's bind effect.
-        assertTrue(vm.uiState.value.forOwner("u2").rates.isEmpty())
+        assertTrue(vm.uiState.value.forOwner("u2").rateSections.isEmpty())
         vm.bind("u2")
-        assertTrue(vm.uiState.value.rates.isEmpty())
+        assertTrue(vm.uiState.value.rateSections.isEmpty())
         testScheduler.runCurrent()
         assertNull(vm.uiState.value.asOfLabel)
         reads.value = readState(uid = "u2")
         testScheduler.runCurrent()
-        assertFalse(vm.uiState.value.rates.isEmpty())
+        assertFalse(vm.uiState.value.rateSections.isEmpty())
         reads.value = readState(uid = "u1", freshness = FreeSnapshotFreshness.DELAYED)
         testScheduler.runCurrent()
         assertEquals(FreeSnapshotAvailability.AWAITING_SNAPSHOT, vm.uiState.value.availability)
@@ -112,12 +138,12 @@ class FreeSnapshotViewModelTest {
         reads.value = readState()
         vm.bind("u1")
         val other = key.copy(period = GraphPeriod.ONE_WEEK)
-        vm.bind("u1", other)
+        vm.selectPeriod(other.period)
         assertTrue(vm.uiState.value.charts.isEmpty())
         assertNull(vm.uiState.value.asOfLabel)
         reads.value = readState(snapshot = snapshot(other))
         testScheduler.runCurrent()
-        assertEquals(other, vm.uiState.value.key)
+        assertEquals(other, vm.uiState.value.dataKey)
         assertFalse(vm.uiState.value.charts.isEmpty())
     }
 
@@ -130,12 +156,12 @@ class FreeSnapshotViewModelTest {
         reads.value = readState(freshness = FreeSnapshotFreshness.DELAYED)
         testScheduler.runCurrent()
         assertEquals(FreeSnapshotAvailability.DELAYED, vm.uiState.value.availability)
-        assertEquals(fresh.rates, vm.uiState.value.rates)
+        assertEquals(fresh.rateSections, vm.uiState.value.rateSections)
         assertEquals(fresh.charts, vm.uiState.value.charts)
         reads.value = readState(freshness = FreeSnapshotFreshness.UNAVAILABLE)
         testScheduler.runCurrent()
         assertEquals(FreeSnapshotAvailability.UNAVAILABLE, vm.uiState.value.availability)
-        assertTrue(vm.uiState.value.rates.isEmpty())
+        assertTrue(vm.uiState.value.rateSections.isEmpty())
         assertTrue(vm.uiState.value.charts.isEmpty())
         assertEquals(fresh.asOfLabel, vm.uiState.value.asOfLabel)
     }
@@ -146,7 +172,7 @@ class FreeSnapshotViewModelTest {
         vm.bind("u1")
         assertEquals(FreeSnapshotAvailability.FRESH, vm.uiState.value.availability)
         assertTrue(vm.uiState.value.charts.isEmpty())
-        assertTrue(vm.uiState.value.rates.isEmpty())
+        assertTrue(vm.uiState.value.rateSections.isEmpty())
     }
 
     @Test
@@ -178,7 +204,7 @@ class FreeSnapshotViewModelTest {
             clock = { basis + testScheduler.currentTime.milliseconds },
             installId = { "test-install" }
         )
-        val vm = FreeSnapshotViewModel(scheduler)
+        val vm = FreeSnapshotViewModel(scheduler, FakeTabStore())
         try {
             scheduler.start()
             vm.bind("u1")
@@ -199,5 +225,117 @@ class FreeSnapshotViewModelTest {
             scope.cancel()
             Dispatchers.resetMain()
         }
+    }
+
+    /**
+     * `ANDROID_V2_PLAN.md:830` — the row opens where this UID left it, and on 달러 for anyone else.
+     * The owner is stored beside the value precisely so a second account cannot inherit the first
+     * one's tab.
+     */
+    @Test
+    fun theStoredTabIsRestoredForItsOwnerOnly() = withViewModel(FakeTabStore("u1" to FreeTab.TETHER)) { vm, _ ->
+        vm.bind("u1")
+        assertEquals(FreeTab.TETHER, vm.uiState.value.selectedTab)
+        assertEquals(FreeSnapshotKey("tether", FreeSnapshotUiState.DEFAULT_PERIOD), vm.uiState.value.dataKey)
+        vm.bind("u2")
+        assertEquals(FreeTab.USD, vm.uiState.value.selectedTab)
+    }
+
+    /**
+     * Publishing 달러 while the stored tab is still being read would activate 달러 on the way to
+     * 테더 — one wasted request against the free endpoint on every cold start. Nothing is selected,
+     * and so nothing is activated, until the answer lands.
+     */
+    @Test
+    fun noTabIsSelectedUntilTheStoreAnswers() {
+        val gate = CompletableDeferred<Unit>()
+        withViewModel(FakeTabStore("u1" to FreeTab.TETHER, gate)) { vm, _ ->
+            val bound = launch { vm.bind("u1") }
+            testScheduler.runCurrent()
+            assertNull(vm.uiState.value.selectedTab)
+            assertNull("a request was authorised before the selection was known", vm.uiState.value.dataKey)
+            gate.complete(Unit)
+            testScheduler.runCurrent()
+            assertEquals(FreeTab.TETHER, vm.uiState.value.selectedTab)
+            bound.join()
+        }
+    }
+
+    /**
+     * The surface's pager reports whatever page it is anchored on, and it is built before the
+     * restore lands. A report that arrived first must not become the selection, and above all must
+     * not be written to the store — that would destroy the tab being restored at that very moment.
+     */
+    @Test
+    fun aSelectionArrivingBeforeTheRestoreCannotSurviveIt() {
+        val gate = CompletableDeferred<Unit>()
+        val store = FakeTabStore("u1" to FreeTab.TETHER, gate)
+        withViewModel(store) { vm, _ ->
+            val bound = launch { vm.bind("u1") }
+            testScheduler.runCurrent()
+            vm.selectTab(FreeTab.USD)
+            testScheduler.runCurrent()
+            assertNull(vm.uiState.value.selectedTab)
+            assertTrue("a stray selection was persisted with no owner", store.writes.isEmpty())
+            gate.complete(Unit)
+            testScheduler.runCurrent()
+            assertEquals(FreeTab.TETHER, vm.uiState.value.selectedTab)
+            assertTrue(store.writes.isEmpty())
+            bound.join()
+        }
+    }
+
+    @Test
+    fun selectingATabPersistsIt_andNewsAuthorisesNothing() {
+        val store = FakeTabStore()
+        withViewModel(store) { vm, _ ->
+            vm.bind("u1")
+            vm.selectTab(FreeTab.NEWS)
+            testScheduler.runCurrent()
+            assertEquals(FreeTab.NEWS, vm.uiState.value.selectedTab)
+            assertNull("뉴스 is not snapshot data", vm.uiState.value.dataKey)
+            assertEquals(listOf("u1" to FreeTab.NEWS), store.writes)
+            // Reselecting the same tab is not a change and must not rewrite the store.
+            vm.selectTab(FreeTab.NEWS)
+            testScheduler.runCurrent()
+            assertEquals(1, store.writes.size)
+        }
+    }
+
+    /** Nothing is bound yet, so a selection has no owner to be stored against. */
+    @Test
+    fun selectionsBeforeBindAreIgnored() {
+        val store = FakeTabStore()
+        withViewModel(store) { vm, _ ->
+            vm.selectTab(FreeTab.EUR)
+            vm.selectPeriod(GraphPeriod.ONE_YEAR)
+            testScheduler.runCurrent()
+            assertNull(vm.uiState.value.selectedTab)
+            assertTrue(store.writes.isEmpty())
+        }
+    }
+
+    /**
+     * The tether tab's rate block is three groups, not a flat list with extras: exchanges, banks
+     * and one reference quote mean different things beside each other. Flattening them would put
+     * 업비트 and 하나은행 in one column under one heading.
+     */
+    @Test
+    fun tetherKeepsItsThreeGroupsApart_andDropsEmptyOnes() = withViewModel(FakeTabStore("u1" to FreeTab.TETHER)) { vm, reads ->
+        val tether = FreeSnapshotKey("tether", FreeSnapshotUiState.DEFAULT_PERIOD)
+        val grouped = snapshot(tether).copy(
+            rate = FreeRate.Grouped(
+                primaryAsset = "usdt-krw",
+                usdtKrw = listOf(SourceRate("upbit", "usdt-krw", 1401.0, basis)),
+                usdKrwBanks = listOf(ExchangeRate("usd-krw", "hana", 1400.0, basis)),
+                usdKrwReference = null
+            )
+        )
+        reads.value = readState(snapshot = grouped)
+        vm.bind("u1")
+        assertEquals(
+            listOf("거래소 USDT/KRW" to "업비트", "은행 USD/KRW" to "하나은행"),
+            vm.uiState.value.rateSections.map { it.title to it.rows.single().source }
+        )
     }
 }
