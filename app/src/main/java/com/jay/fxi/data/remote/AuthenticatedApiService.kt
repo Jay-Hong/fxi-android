@@ -6,6 +6,7 @@ import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
 import com.jay.fxi.data.remote.dto.DeviceRequest
 import com.jay.fxi.data.remote.dto.EntitlementsResponse
+import com.jay.fxi.data.remote.dto.FreeSnapshotResponse
 import com.jay.fxi.data.remote.dto.NotificationSettingsResponse
 import com.jay.fxi.domain.model.AlertSetting
 import javax.inject.Singleton
@@ -23,6 +24,13 @@ import retrofit2.http.Tag
 
 /** Protected REST surface. Every method requires a captured [AuthRequestTag]. */
 internal interface AuthenticatedApiService {
+    @GET("api/v2/free/snapshot")
+    suspend fun getFreeSnapshot(
+        @Tag auth: AuthRequestTag,
+        @Query("tab") tab: String,
+        @Query("period") period: String
+    ): Response<ResponseBody>
+
     @POST("api/register-device")
     suspend fun registerDevice(
         @Tag auth: AuthRequestTag,
@@ -89,6 +97,14 @@ class AuthenticatedApiClient internal constructor(
     private val transport: AuthenticatedTransport,
     private val wireJson: Json
 ) {
+    suspend fun getFreeSnapshot(
+        owner: AuthSnapshot,
+        tab: String,
+        period: String
+    ): AuthenticatedHttpResponse<FreeSnapshotResponse> = transport.executeRead(owner) {
+        service.getFreeSnapshot(it, tab, period)
+    }.preserve(AuthenticatedEndpoint.FREE_SNAPSHOT).decodeSuccess(wireJson)
+
     /** Captures the exact owner credential for a multi-step destructive flow. */
     suspend fun captureSnapshot(): AuthSnapshot = transport.captureSnapshot()
 

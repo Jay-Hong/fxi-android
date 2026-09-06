@@ -15,6 +15,7 @@ import com.revenuecat.purchases.LogLevel
 import com.revenuecat.purchases.Purchases
 import com.revenuecat.purchases.PurchasesConfiguration
 import com.jay.fxi.data.entitlements.AuthAccessBinder
+import com.jay.fxi.data.free.FreeSnapshotScheduler
 import dagger.hilt.android.HiltAndroidApp
 import javax.inject.Inject
 import javax.inject.Provider
@@ -41,6 +42,10 @@ class FXiApplication : Application() {
     @Inject
     lateinit var authAccessBinder: Provider<AuthAccessBinder>
 
+    /** A [Provider] for the same reason: it observes `FirebaseAuth`. */
+    @Inject
+    lateinit var freeSnapshotScheduler: Provider<FreeSnapshotScheduler>
+
     override fun onCreate() {
         super.onCreate()
 
@@ -61,6 +66,10 @@ class FXiApplication : Application() {
         // The single process-wide auth -> access-state funnel. Identity only: it binds the owner
         // and retries a journalled purge, and issues no entitlement query of its own.
         authAccessBinder.get().start()
+
+        // The single owner of every free-snapshot refresh. Starting it only binds identity and
+        // arms deadlines; nothing is fetched until a screen says which tab is on show.
+        freeSnapshotScheduler.get().start()
 
         FirebaseCrashlytics.getInstance().apply {
             setCrashlyticsCollectionEnabled(

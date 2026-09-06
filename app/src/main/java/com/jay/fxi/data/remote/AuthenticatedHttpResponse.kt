@@ -27,7 +27,10 @@ internal enum class AuthenticatedEndpoint {
      * [AuthenticatedFailureKind.UNKNOWN_AUTHORIZATION] by the default branch, which is what makes
      * the reducer re-ask with `fresh_premium=true` instead of treating it as a rejection.
      */
-    ENTITLEMENTS
+    ENTITLEMENTS,
+
+    /** Firebase-only hourly snapshot; premium-required errors are not a known policy here. */
+    FREE_SNAPSHOT
 }
 
 enum class AuthenticatedFailureKind {
