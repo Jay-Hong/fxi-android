@@ -2,6 +2,8 @@ package com.jay.fxi.data.entitlements
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -28,8 +30,9 @@ class PremiumAccessCoordinator(
     private val store: AccessEpochStore,
     private val userPurger: UserScopePurger,
     private val capabilityPurger: CapabilityScopePurger,
-    scope: CoroutineScope,
-    clock: RecheckClock
+    private val scope: CoroutineScope,
+    clock: RecheckClock,
+    private val jitter: ProbeJitter = ProbeJitter.Default
 ) {
     private val mutex = Mutex()
 
@@ -64,6 +67,19 @@ class PremiumAccessCoordinator(
     private var forcePremiumOwner: String? = null
     private var nextRequestToken: Long = 0L
 
+    /**
+     * Lifetime fence for the propagation probe. Deliberately **not** [decisionGeneration].
+     *
+     * [decisionGeneration] is bumped by every authoritative loss *input*, and a stable
+     * `premium_active=false` is exactly what the probe expects to receive while the server's
+     * view of a fresh purchase is still catching up. A probe fenced on it would die on its own
+     * first answer. This one moves only at an identity boundary.
+     */
+    private var probeEpoch: Long = 0L
+
+    /** The owner a probe is currently running for, or null. Single-flight, iOS parity. */
+    private var probeRunningForOwner: String? = null
+
     private val schedule =
         RecheckSchedule(scope, clock) { intent, origin -> refresh(intent, origin) }
 
@@ -74,6 +90,7 @@ class PremiumAccessCoordinator(
      */
     suspend fun onOwnerChanged(uid: String) = mutex.withLock {
         decisionGeneration += 1
+        cancelProbeLocked()
         clearForcePremiumLocked()
         schedule.cancel()
         store.bindOwner(uid)
@@ -92,6 +109,7 @@ class PremiumAccessCoordinator(
      */
     suspend fun onSignedOut() = mutex.withLock {
         decisionGeneration += 1
+        cancelProbeLocked()
         clearForcePremiumLocked()
         schedule.cancel()
         store.signOut()
@@ -100,12 +118,98 @@ class PremiumAccessCoordinator(
         resumePendingPurgesLocked()
     }
 
+    /**
+     * A local purchase or restore reported success.
+     *
+     * RevenueCat is a signal, never the authority: this starts a bounded re-query window and
+     * nothing else. `ANDROID_V2_PLAN.md` D23 `FreeConfirmed` row — "로컬 구매·복원 성공은 fresh
+     * 조회와 bounded propagation probe만 시작".
+     *
+     * Non-suspend so a billing callback on any thread can call it without a scope of its own.
+     */
+    fun onLocalPremiumSignal() {
+        scope.launch { runPropagationProbe() }
+    }
+
+    /**
+     * Re-asks for a fresh decision across the window the server's own caches take to catch up.
+     *
+     * Every tick goes through [refresh] with the default [QueryOrigin.CALLER], so
+     * [RecheckSchedule] keeps sole ownership of the rate limit: a tick landing inside a server
+     * `Retry-After` is refused and folded into the queued retry. Passing
+     * [QueryOrigin.SCHEDULED] here would walk straight past that floor.
+     *
+     * It does **not** stop on `FreeConfirmed` — that answer *is* the propagation window.
+     */
+    private suspend fun runPropagationProbe() {
+        // A **live credential**, not persisted ownership. The record keeps its uid across a
+        // sign-out so the purge journal can still name whose namespace it is cleaning, so
+        // `ownerUid != null` stays true for a signed-out process. Gating on it alone let a
+        // billing callback delivered after logout start querying: with no credential the
+        // transport throws, that classifies TRANSIENT, and the reducer arms a recheck — teardown
+        // undone by a retry ladder that outlives the probe window.
+        val run = mutex.withLock {
+            // Inside the lock, not before it. Read outside, a sign-out could complete between the
+            // read and the lock: the record keeps its uid, so the stale identity would still match
+            // and the probe would adopt the *post*-sign-out epoch as its own — passing every later
+            // fence. Both facts are then established under one critical section.
+            val live = source.currentIdentity() ?: return
+            val owner = store.load().ownerUid ?: return
+            if (owner != live.ownerUid) return
+            // A later signal joins the running budget rather than restarting it, so repeated
+            // billing callbacks cannot extend the window indefinitely.
+            if (probeRunningForOwner == owner) return
+            probeRunningForOwner = owner
+            ProbeRun(owner, probeEpoch)
+        }
+        try {
+            PROBE_DELAY_MILLIS.forEachIndexed { index, nominal ->
+                delay(jitter.delayMillisFor(index, nominal))
+                if (mutex.withLock { probeEpoch != run.epoch }) return
+                when (_state.value) {
+                    // Goal reached, or the server said no in a way a local true cannot reopen.
+                    PremiumAccessState.PremiumConfirmed, PremiumAccessState.Rejected -> return
+                    // The epoch travels with the call: the check above only narrows the window,
+                    // it does not close it.
+                    else -> refresh(RefreshIntent.FORCE_PREMIUM, requireProbeEpoch = run.epoch)
+                }
+            }
+        } finally {
+            // Same rule as the escalation latch: release only what is still mine, and survive
+            // cancellation long enough to do it.
+            withContext(NonCancellable) {
+                mutex.withLock {
+                    if (probeEpoch == run.epoch && probeRunningForOwner == run.owner) {
+                        probeRunningForOwner = null
+                    }
+                }
+            }
+        }
+    }
+
+    private fun cancelProbeLocked() {
+        probeEpoch += 1
+        probeRunningForOwner = null
+    }
+
+    private data class ProbeRun(val owner: String, val epoch: Long)
+
     /** Re-runs purges a previous process journalled but did not finish. */
     suspend fun resumePendingPurges() = mutex.withLock { resumePendingPurgesLocked() }
 
     suspend fun refresh(
         intent: RefreshIntent,
-        origin: QueryOrigin = QueryOrigin.CALLER
+        origin: QueryOrigin = QueryOrigin.CALLER,
+        /**
+         * Probe ticks only: the [probeEpoch] the caller believes it still owns.
+         *
+         * Checking it in the probe *before* calling here is not enough. A sign-out landing between
+         * that check and this critical section makes [StartedQuery] capture the **post**-sign-out
+         * generation and fence, so [apply]'s staleness checks are self-consistent, the answer is
+         * applied, and an `Unauthenticated` TRANSIENT arms a recheck — the retry ladder survives
+         * the teardown. The check has to happen where the state is captured.
+         */
+        requireProbeEpoch: Long? = null
     ) {
         if (!schedule.shouldQuery(intent, origin)) {
             // Refused by the absolute floor. The wait is honoured, but a purchase or restore that
@@ -116,6 +220,7 @@ class PremiumAccessCoordinator(
 
         var token: Long? = null
         val started: StartedQuery = mutex.withLock {
+            if (requireProbeEpoch != null && probeEpoch != requireProbeEpoch) return
             val record = store.load()
             if (intent == RefreshIntent.FORCE_PREMIUM) {
                 // Owner-bound, not a global flag: an escalation still running for a signed-out
@@ -183,8 +288,17 @@ class PremiumAccessCoordinator(
         answeredAs: EntitlementsIdentity?,
         started: StartedQuery
     ) {
-        // Null means the answer was held back rather than decided: see the auth-session check.
-        val decision: AccessDecision? = mutex.withLock {
+        // One lock hold for the whole thing: decide *and* act on the schedule.
+        //
+        // Releasing between the two is the same window in a different place. A sign-out landing
+        // there runs its own `schedule.cancel()` first, and this answer then re-arms the retry the
+        // teardown had just removed — and that scheduled callback re-enters [refresh] with no
+        // probe epoch to check, so no later guard stops it.
+        //
+        // Lock order is coordinator then schedule, and never the reverse: [RecheckSchedule] only
+        // reaches back through its fire-time callback, which runs in its own coroutine after both
+        // locks are released.
+        mutex.withLock {
             val record = store.load()
             // Four independent staleness checks, because each catches something the others miss:
             //  - generation: an authoritative loss or reset that rotated nothing,
@@ -193,7 +307,9 @@ class PremiumAccessCoordinator(
             //  - auth session: the same uid on a session the transport has since superseded.
             if (started.generation != decisionGeneration) return
             if (record.fence() != started.fence) return
-            if (answeredAs == null) {
+
+            // Null means the answer was held back rather than decided.
+            val decision: AccessDecision? = if (answeredAs == null) {
                 decideLocked(record, intent, outcome)
             } else {
                 if (answeredAs.ownerUid != record.ownerUid) return
@@ -209,28 +325,23 @@ class PremiumAccessCoordinator(
                     else -> null
                 }
             }
-        }
 
-        if (decision == null) {
-            // Held back, not decided. The answer stays out of the state, but the query is retried
-            // at its own strength so an eventual identity still reaches the same conclusion.
-            //
-            // The floor is the one the answer stated, falling back to the same default the reducer
-            // uses for an outcome it cannot settle. Zero re-queried immediately inside a window the
-            // server had explicitly asked us to wait out. (The schedule's own absolute floor from
-            // earlier answers is preserved separately, by its `maxOf`.)
-            schedule.schedule(
+            val recheck = if (decision != null) {
+                decision.recheck
+            } else {
+                // Held back, not decided. The answer stays out of the state, but the query is
+                // retried at its own strength so an eventual identity reaches the same conclusion.
+                // The floor is the one the answer stated, falling back to the same default the
+                // reducer uses for an outcome it cannot settle — zero would re-query immediately
+                // inside a window the server had explicitly asked us to wait out.
                 RecheckRequest(
                     intent,
                     minDelayMillis = outcome.statedRetryFloorMillis()
                         ?: PremiumAccessReducer.DEFAULT_BACKOFF_FLOOR_MILLIS
                 )
-            )
-            return
+            }
+            if (recheck == null) schedule.cancel() else schedule.schedule(recheck)
         }
-
-        val recheck = decision.recheck
-        if (recheck == null) schedule.cancel() else schedule.schedule(recheck)
     }
 
     /** Reduce, persist, publish. Callers must hold [mutex] — hence the `Locked` suffix. */
@@ -295,14 +406,47 @@ class PremiumAccessCoordinator(
                 currentKrxCapabilityEpoch = record.krxCapabilityEpoch,
                 pending = entry
             )
-            entry.scopes.map { scope ->
-                when (scope) {
+            entry.scopes.map { purgeScope ->
+                when (purgeScope) {
                     PurgeScope.USER -> userPurger.purgeUserScope(namespace)
                     PurgeScope.CAPABILITY -> capabilityPurger.purgeCapabilityScope(namespace)
                 }
             }.all { it == PurgeResult.Completed }
         }
         if (completed.isNotEmpty()) store.completePurges(completed)
+    }
+}
+
+/**
+ * Nominal sleep before each propagation-probe tick, in milliseconds.
+ *
+ * These are **delays, not offsets** — iOS `EntitlementsManager.swift`
+ * `premiumRejectionRetryDelaysSeconds` is consumed by a sleep per tick, so the nominal window is
+ * cumulative: 0s, 2s, 7s, 17s, 37s.
+ */
+private val PROBE_DELAY_MILLIS = longArrayOf(0L, 2_000L, 5_000L, 10_000L, 20_000L)
+
+/**
+ * How long a probe tick actually waits.
+ *
+ * Injected for the same reason [RecheckClock] is: the production spread is random, and a test
+ * that cannot pin it cannot assert when a tick fired.
+ */
+fun interface ProbeJitter {
+    fun delayMillisFor(index: Int, nominalMillis: Long): Long
+
+    companion object {
+        /**
+         * iOS parity: the first tick is spread over 0-1s and the rest by ±20%, so a fleet of
+         * clients finishing a purchase together does not re-query in lockstep.
+         */
+        val Default = ProbeJitter { index, nominal ->
+            if (index == 0) kotlin.random.Random.nextLong(0L, 1_001L)
+            else (nominal * (0.8 + kotlin.random.Random.nextDouble() * 0.4)).toLong()
+        }
+
+        /** Exact nominal delays, so tick times are assertable. */
+        val None = ProbeJitter { _, nominal -> nominal }
     }
 }
 

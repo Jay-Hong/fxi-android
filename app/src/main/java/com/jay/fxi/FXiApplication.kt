@@ -14,7 +14,10 @@ import com.jay.fxi.service.FXiMessagingService
 import com.revenuecat.purchases.LogLevel
 import com.revenuecat.purchases.Purchases
 import com.revenuecat.purchases.PurchasesConfiguration
+import com.jay.fxi.data.entitlements.AuthAccessBinder
 import dagger.hilt.android.HiltAndroidApp
+import javax.inject.Inject
+import javax.inject.Provider
 
 internal fun shouldStartAppOwnedServices(
     releaseAdmissionOpen: Boolean,
@@ -29,6 +32,14 @@ internal fun shouldEnableCrashlytics(
 
 @HiltAndroidApp
 class FXiApplication : Application() {
+
+    /**
+     * A [Provider], so the binder — and the `FirebaseAuth` it observes — is not constructed during
+     * member injection, which runs before the explicit [FirebaseApp.initializeApp] below. A
+     * non-admitted process never resolves it at all.
+     */
+    @Inject
+    lateinit var authAccessBinder: Provider<AuthAccessBinder>
 
     override fun onCreate() {
         super.onCreate()
@@ -46,6 +57,11 @@ class FXiApplication : Application() {
         // Firebase's own provider/transport is outside the app data-plane zero assertion,
         // but explicit collection is still opened only for an admitted application.
         FirebaseApp.initializeApp(this)
+
+        // The single process-wide auth -> access-state funnel. Identity only: it binds the owner
+        // and retries a journalled purge, and issues no entitlement query of its own.
+        authAccessBinder.get().start()
+
         FirebaseCrashlytics.getInstance().apply {
             setCrashlyticsCollectionEnabled(
                 shouldEnableCrashlytics(

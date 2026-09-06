@@ -190,6 +190,9 @@ fun PaywallScreen(
                             ) {
                                 isPurchasing = false
                                 val premium = customerInfo.entitlements["premium"]?.isActive == true
+                                // Signal only. The server decides; this just opens the re-query
+                                // window its caches may need. Non-suspend, so no scope is needed.
+                                if (premium) subscriptionManager.onLocalPremiumSignal()
                                 if (!premium) {
                                     errorMessage = "결제가 처리 중입니다. 잠시 후 앱을 다시 시작해주세요."
                                     showError = true
@@ -238,6 +241,9 @@ fun PaywallScreen(
                             override fun onReceived(customerInfo: com.revenuecat.purchases.CustomerInfo) {
                                 isPurchasing = false
                                 val premium = customerInfo.entitlements["premium"]?.isActive == true
+                                // A completed restore is not the same as "found an active
+                                // subscription" — only the active case is worth re-querying for.
+                                if (premium) subscriptionManager.onLocalPremiumSignal()
                                 if (!premium) {
                                     errorMessage = "복원할 구독이 없습니다"
                                     showError = true

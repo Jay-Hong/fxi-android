@@ -22,6 +22,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -29,8 +30,19 @@ import kotlin.coroutines.resumeWithException
 
 @Singleton
 class SubscriptionManager @Inject constructor(
-    private val pushNotificationManager: PushNotificationManager
+    private val pushNotificationManager: PushNotificationManager,
+    private val premiumAccessCoordinator: PremiumAccessCoordinator
 ) {
+
+    /**
+     * A local purchase or restore reported an **active** entitlement.
+     *
+     * Forwarded as a signal only — the server stays the authority. This does not touch
+     * [isPremium]; RevenueCat's own listener remains its only writer.
+     */
+    fun onLocalPremiumSignal() {
+        premiumAccessCoordinator.onLocalPremiumSignal()
+    }
 
     // ── 기존 State ──
 

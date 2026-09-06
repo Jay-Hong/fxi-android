@@ -1,7 +1,10 @@
 package com.jay.fxi.di
 
 import android.os.SystemClock
+import com.google.firebase.auth.FirebaseAuth
 import com.jay.fxi.data.entitlements.AccessEpochStore
+import com.jay.fxi.data.entitlements.AuthAccessBinder
+import com.jay.fxi.data.entitlements.AuthUidStream
 import com.jay.fxi.data.entitlements.CapabilityScopePurger
 import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore
 import com.jay.fxi.data.entitlements.AuthenticatedEntitlementsSource
@@ -23,11 +26,10 @@ import kotlinx.coroutines.SupervisorJob
 /**
  * D23 access-state graph.
  *
- * Nothing injects [PremiumAccessCoordinator] yet, and that is deliberate. The current premium
- * decision still flows from RevenueCat through `SubscriptionManager` into `RootScreen` and push
- * registration; moving those onto the server-confirmed entitlement changes the app's permission
- * boundary and is separate, reviewed work. This module makes the component constructible so that
- * change is a wiring step rather than a rewrite.
+ * [AuthAccessBinder] is the only production consumer, and it binds identity only. The current premium
+ * The premium *decision* still flows from RevenueCat through `SubscriptionManager` into
+ * `RootScreen` and push registration. Moving those onto the server-confirmed entitlement changes
+ * the app's permission boundary and is separate, reviewed work — S2 step 3.
  */
 @Module
 @InstallIn(SingletonComponent::class)
@@ -89,5 +91,28 @@ object EntitlementsModule {
         capabilityPurger = capabilityPurger,
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
         clock = clock
+    )
+
+    /**
+     * One `FirebaseAuth.AuthStateListener`, exposed as a callback stream.
+     *
+     * `FirebaseAuth` is a dependency-free singleton, so binding here introduces no cycle — the
+     * coordinator reaches Firebase the other way round, through the authenticated transport.
+     */
+    @Provides
+    @Singleton
+    fun provideAuthUidStream(auth: FirebaseAuth): AuthUidStream = AuthUidStream { emit ->
+        auth.addAuthStateListener { emit(it.currentUser?.uid) }
+    }
+
+    @Provides
+    @Singleton
+    fun provideAuthAccessBinder(
+        coordinator: PremiumAccessCoordinator,
+        uidStream: AuthUidStream
+    ): AuthAccessBinder = AuthAccessBinder(
+        coordinator = coordinator,
+        scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+        uidStream = uidStream
     )
 }

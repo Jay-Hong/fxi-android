@@ -70,8 +70,18 @@ class PremiumAccessCoordinatorTest {
         var identity: EntitlementsIdentity? = EntitlementsIdentity(OWNER, 1L),
         val onFetch: suspend (Boolean) -> EntitlementsResult
     ) : EntitlementsSource {
+        /** Parks the identity read, so a test can land a sign-out inside that window. */
+        var identityGate: CompletableDeferred<Unit>? = null
+
         override suspend fun fetch(freshPremium: Boolean) = onFetch(freshPremium)
-        override suspend fun currentIdentity() = identity
+        override suspend fun currentIdentity(): EntitlementsIdentity? {
+            // Snapshot *then* park. The race being modelled is a read that was live when it
+            // happened and stale by the time the caller acts on it — parking before the read
+            // would just return the new value and reproduce nothing.
+            val snapshot = identity
+            identityGate?.let { gate -> identityGate = null; gate.await() }
+            return snapshot
+        }
     }
 
     private fun answer(
@@ -91,7 +101,10 @@ class PremiumAccessCoordinatorTest {
         userPurger = purger,
         capabilityPurger = purger,
         scope = CoroutineScope(processJob + StandardTestDispatcher(testScheduler)),
-        clock = { testScheduler.currentTime }
+        clock = { testScheduler.currentTime },
+        // Exact nominal delays. Production spreads them; a test that cannot pin the spread
+        // cannot assert when a tick fired.
+        jitter = ProbeJitter.None
     )
 
     private fun ids(): EpochIdGenerator {
@@ -545,6 +558,377 @@ class PremiumAccessCoordinatorTest {
             coordinator.state.value
         )
         processJob.cancel()
+    }
+
+    // --- propagation probe ------------------------------------------------------------------------
+
+    /**
+     * `ANDROID_V2_PLAN.md` D23 `FreeConfirmed` row lists `[0,2,5,10,20]s`. iOS
+     * (`EntitlementsManager.swift`) consumes that list as a **sleep per tick**, so the window is
+     * cumulative. Reading it as absolute offsets would finish the whole probe inside 20s.
+     */
+    @Test
+    fun probeTicks_fireAtCumulativeDelays_notAbsoluteOffsets() = runTest {
+        val store = FakeStore(ids())
+        val firedAt = mutableListOf<Long>()
+        val source = FakeSource {
+            firedAt += testScheduler.currentTime
+            answer(EntitlementsOutcome.StableInactive(krxVisible = false))
+        }
+        val coordinator = build(store, source)
+        coordinator.onOwnerChanged(OWNER)
+        advanceUntilIdle()
+        firedAt.clear()
+
+        coordinator.onLocalPremiumSignal()
+        advanceUntilIdle()
+
+        assertEquals(listOf(0L, 2_000L, 7_000L, 17_000L, 37_000L), firedAt)
+        processJob.cancel()
+    }
+
+    /**
+     * The probe exists *for* the window in which the server still answers free. Stopping on
+     * `FreeConfirmed` would end it on the first answer it was written to survive.
+     */
+    @Test
+    fun probe_survivesFreeConfirmed_becauseThatIsThePropagationWindow() = runTest {
+        val store = FakeStore(ids())
+        var calls = 0
+        val source = FakeSource {
+            calls += 1
+            answer(EntitlementsOutcome.StableInactive(krxVisible = false))
+        }
+        val coordinator = build(store, source)
+        coordinator.onOwnerChanged(OWNER)
+        advanceUntilIdle()
+        calls = 0
+
+        coordinator.onLocalPremiumSignal()
+        advanceUntilIdle()
+
+        assertEquals("the probe stopped inside its own window", 5, calls)
+        assertEquals(PremiumAccessState.FreeConfirmed, coordinator.state.value)
+        processJob.cancel()
+    }
+
+    @Test
+    fun probe_stopsOnceThePurchaseIsConfirmed() = runTest {
+        val store = FakeStore(ids())
+        var calls = 0
+        val source = FakeSource {
+            calls += 1
+            if (calls >= 2) answer(EntitlementsOutcome.StableActive(krxVisible = false))
+            else answer(EntitlementsOutcome.StableInactive(krxVisible = false))
+        }
+        val coordinator = build(store, source)
+        coordinator.onOwnerChanged(OWNER)
+        advanceUntilIdle()
+        calls = 0
+
+        coordinator.onLocalPremiumSignal()
+        advanceUntilIdle()
+
+        assertEquals("the goal was reached; later ticks must not re-query", 2, calls)
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value)
+        processJob.cancel()
+    }
+
+    @Test
+    fun probe_stopsOnAnAuthoritativeRejection() = runTest {
+        val store = FakeStore(ids())
+        var calls = 0
+        val source = FakeSource {
+            calls += 1
+            answer(EntitlementsOutcome.PremiumRequired)
+        }
+        val coordinator = build(store, source)
+        coordinator.onOwnerChanged(OWNER)
+        advanceUntilIdle()
+        calls = 0
+
+        coordinator.onLocalPremiumSignal()
+        advanceUntilIdle()
+
+        assertEquals("a local true must not keep re-asking past a typed rejection", 1, calls)
+        assertEquals(PremiumAccessState.Rejected, coordinator.state.value)
+        processJob.cancel()
+    }
+
+    /**
+     * Regression guard for the one line that must never change: the probe calls `refresh` with the
+     * default CALLER origin. SCHEDULED returns true unconditionally in `shouldQuery`, so the probe
+     * would walk straight past a server `Retry-After`.
+     */
+    @Test
+    fun probeTick_respectsAServerRetryAfterFloor() = runTest {
+        val store = FakeStore(ids())
+        val firedAt = mutableListOf<Long>()
+        val source = FakeSource {
+            firedAt += testScheduler.currentTime
+            answer(EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 30))
+        }
+        val coordinator = build(store, source)
+        coordinator.onOwnerChanged(OWNER)
+        advanceUntilIdle()
+
+        coordinator.onLocalPremiumSignal()
+        testScheduler.advanceTimeBy(20_000)
+        testScheduler.runCurrent()
+
+        // One query at t=0 sets a 30s floor; the 2s and 7s and 17s ticks are all inside it.
+        assertEquals(listOf(0L), firedAt)
+        processJob.cancel()
+    }
+
+    @Test
+    fun probe_isAbandonedWhenTheOwnerChanges() = runTest {
+        val store = FakeStore(ids())
+        var calls = 0
+        val source = FakeSource {
+            calls += 1
+            answer(EntitlementsOutcome.StableInactive(krxVisible = false))
+        }
+        val coordinator = build(store, source)
+        coordinator.onOwnerChanged(OWNER)
+        advanceUntilIdle()
+
+        coordinator.onLocalPremiumSignal()
+        testScheduler.advanceTimeBy(3_000)
+        testScheduler.runCurrent()
+        val duringProbe = calls
+
+        coordinator.onOwnerChanged("user-b")
+        source.identity = EntitlementsIdentity("user-b", 1L)
+        advanceUntilIdle()
+
+        assertEquals("the departed owner's probe kept querying", duringProbe, calls)
+        processJob.cancel()
+    }
+
+    @Test
+    fun probe_isAbandonedOnSignOut() = runTest {
+        val store = FakeStore(ids())
+        var calls = 0
+        val source = FakeSource {
+            calls += 1
+            answer(EntitlementsOutcome.StableInactive(krxVisible = false))
+        }
+        val coordinator = build(store, source)
+        coordinator.onOwnerChanged(OWNER)
+        advanceUntilIdle()
+
+        coordinator.onLocalPremiumSignal()
+        testScheduler.advanceTimeBy(3_000)
+        testScheduler.runCurrent()
+        val duringProbe = calls
+
+        coordinator.onSignedOut()
+        advanceUntilIdle()
+
+        assertEquals("a signed-out user's probe kept querying", duringProbe, calls)
+        processJob.cancel()
+    }
+
+    /** iOS parity: a later billing callback joins the running budget instead of extending it. */
+    @Test
+    fun repeatedSignals_shareOneBudget() = runTest {
+        val store = FakeStore(ids())
+        var calls = 0
+        val source = FakeSource {
+            calls += 1
+            answer(EntitlementsOutcome.StableInactive(krxVisible = false))
+        }
+        val coordinator = build(store, source)
+        coordinator.onOwnerChanged(OWNER)
+        advanceUntilIdle()
+        calls = 0
+
+        coordinator.onLocalPremiumSignal()
+        testScheduler.advanceTimeBy(3_000)
+        testScheduler.runCurrent()
+        coordinator.onLocalPremiumSignal()
+        coordinator.onLocalPremiumSignal()
+        advanceUntilIdle()
+
+        assertEquals("a repeated signal restarted the window instead of joining it", 5, calls)
+        processJob.cancel()
+    }
+
+    /**
+     * A signal that arrives before any owner is bound is dropped, not queued.
+     *
+     * Reachable only in theory — the paywall sits behind the signed-in branch and the binder
+     * starts at process start — but the behaviour should be stated rather than discovered: a
+     * queued signal would later fire an escalation for whoever happened to sign in next.
+     */
+    @Test
+    fun aPremiumSignalWithNoBoundOwner_isDropped() = runTest {
+        val store = FakeStore(ids())
+        var calls = 0
+        val coordinator = build(store, FakeSource {
+            calls += 1
+            answer(EntitlementsOutcome.StableActive(krxVisible = false))
+        })
+
+        coordinator.onLocalPremiumSignal()
+        advanceUntilIdle()
+        assertEquals("no owner is bound, so there is nobody to query for", 0, calls)
+
+        // And it is not replayed when someone does sign in.
+        coordinator.onOwnerChanged(OWNER)
+        advanceUntilIdle()
+        assertEquals(0, calls)
+        processJob.cancel()
+    }
+
+    /**
+     * Regression: `store.signOut()` rotates the epochs but keeps `ownerUid`, so a probe gated on
+     * persisted ownership still started after a logout. With no credential the transport throws,
+     * which classifies TRANSIENT, which arms a recheck — a retry ladder that outlives the probe
+     * window and restarts work the teardown had just stopped.
+     */
+    @Test
+    fun aPremiumSignalDeliveredAfterSignOut_startsNothing() = runTest {
+        val store = FakeStore(ids())
+        var calls = 0
+        // The real post-logout chain: no credential -> IOException -> TRANSIENT -> a recheck.
+        val source = FakeSource {
+            calls += 1
+            EntitlementsResult.Unauthenticated(
+                EntitlementsOutcome.Indeterminate(IndeterminateReason.TRANSIENT)
+            )
+        }
+        val coordinator = build(store, source)
+        try {
+            coordinator.onOwnerChanged(OWNER)
+            advanceUntilIdle()
+
+            coordinator.onSignedOut()
+            source.identity = null
+            assertEquals("the record keeps its uid on purpose", OWNER, store.record.ownerUid)
+            calls = 0
+
+            coordinator.onLocalPremiumSignal()
+            // Bounded, not advanceUntilIdle(): the defect is an *unbounded* retry ladder, so an
+            // unbounded advance hangs instead of failing. 60 s spans the whole probe window.
+            testScheduler.advanceTimeBy(60_000)
+            testScheduler.runCurrent()
+
+            assertEquals("a signal after teardown restarted querying", 0, calls)
+        } finally {
+            // Must run even when the assertion above fails: runTest's own teardown drains the
+            // scheduler, so a leftover retry ladder would turn a red test into a hang.
+            processJob.cancel()
+        }
+    }
+
+    /**
+     * Regression: the identity read used to sit outside the coordinator lock. A sign-out landing
+     * in that window left the probe holding a stale-but-matching identity, and it then captured
+     * the *post*-sign-out epoch as its own — so every later fence passed.
+     */
+    @Test
+    fun aSignOutLandingDuringTheIdentityRead_stillStopsTheProbe() = runTest {
+        val store = FakeStore(ids())
+        var calls = 0
+        val source = FakeSource {
+            calls += 1
+            EntitlementsResult.Unauthenticated(
+                EntitlementsOutcome.Indeterminate(IndeterminateReason.TRANSIENT)
+            )
+        }
+        val coordinator = build(store, source)
+        try {
+            coordinator.onOwnerChanged(OWNER)
+            advanceUntilIdle()
+
+            val gate = CompletableDeferred<Unit>()
+            source.identityGate = gate
+            coordinator.onLocalPremiumSignal()
+            runCurrent()
+
+            // The sign-out happens while the probe is parked reading the identity.
+            val signOut = async { coordinator.onSignedOut() }
+            runCurrent()
+            source.identity = null
+            gate.complete(Unit)
+            signOut.await()
+
+            testScheduler.advanceTimeBy(60_000)
+            testScheduler.runCurrent()
+
+            assertEquals("the probe outran the sign-out", 0, calls)
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    /**
+     * The signal carries no identity, so a callback raised under one account and delivered after
+     * a switch runs for whoever is live. That is bounded and cannot leak a grant — the server
+     * answers per uid — but it is a decision, so it is stated rather than left to be discovered.
+     */
+    @Test
+    fun aPremiumSignalAfterAnAccountSwitch_runsForTheLiveOwner() = runTest {
+        val store = FakeStore(ids())
+        val seenAs = mutableListOf<String?>()
+        val source = FakeSource {
+            seenAs += store.record.ownerUid
+            answer(EntitlementsOutcome.StableActive(krxVisible = false), uid = "user-b")
+        }
+        val coordinator = build(store, source)
+        coordinator.onOwnerChanged(OWNER)
+        advanceUntilIdle()
+
+        coordinator.onOwnerChanged("user-b")
+        source.identity = EntitlementsIdentity("user-b", 1L)
+        advanceUntilIdle()
+        seenAs.clear()
+
+        // A callback raised while user-a was signed in, delivered now.
+        coordinator.onLocalPremiumSignal()
+        advanceUntilIdle()
+
+        assertEquals(listOf("user-b"), seenAs)
+        processJob.cancel()
+    }
+
+    /**
+     * Regression: the probe's own pre-tick epoch check narrows the window but cannot close it. A
+     * sign-out landing between that check and the critical section that builds `StartedQuery`
+     * makes the captured generation and fence *post*-sign-out, so every later staleness check
+     * agrees and a TRANSIENT answer arms a recheck. The epoch has to be re-checked where the
+     * state is captured, which is what `requireProbeEpoch` does.
+     */
+    @Test
+    fun aQueryCarryingAStaleProbeEpoch_neverStarts() = runTest {
+        val store = FakeStore(ids())
+        var calls = 0
+        val source = FakeSource {
+            calls += 1
+            answer(EntitlementsOutcome.StableActive(krxVisible = false))
+        }
+        val coordinator = build(store, source)
+        try {
+            coordinator.onOwnerChanged(OWNER)
+            advanceUntilIdle()
+            calls = 0
+
+            // An epoch no probe can still own — every sign-out and owner change advances it.
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireProbeEpoch = -1L)
+            advanceUntilIdle()
+            assertEquals("a superseded probe still reached the transport", 0, calls)
+
+            // Positive control through the real path: the probe passes its own live epoch, so a
+            // guard that simply blocked everything would fail here. Asserting a literal epoch
+            // instead would only re-encode the internal counter, which onOwnerChanged advances.
+            coordinator.onLocalPremiumSignal()
+            advanceUntilIdle()
+            assertEquals("the live epoch was refused too — the guard blocks everything", 1, calls)
+        } finally {
+            processJob.cancel()
+        }
     }
 
     // --- persistence ordering ----------------------------------------------------------------------
