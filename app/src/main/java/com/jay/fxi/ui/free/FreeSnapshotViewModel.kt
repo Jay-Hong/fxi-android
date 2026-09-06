@@ -5,6 +5,8 @@ import androidx.lifecycle.viewModelScope
 import com.jay.fxi.data.free.FreeSnapshotReadState
 import com.jay.fxi.data.free.FreeSnapshotScheduler
 import com.jay.fxi.data.local.FreeTabStore
+import com.jay.fxi.data.local.FreeVisibleSeriesStore
+import com.jay.fxi.domain.model.FreeSeriesVisibility
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphPeriod
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -19,17 +21,26 @@ import kotlinx.coroutines.launch
 class FreeSnapshotViewModel internal constructor(
     private val readState: StateFlow<FreeSnapshotReadState>,
     val activityCoordinator: FreeSnapshotActivityCoordinator,
-    private val tabStore: FreeTabStore
+    private val tabStore: FreeTabStore,
+    private val seriesStore: FreeVisibleSeriesStore
 ) : ViewModel() {
-    @Inject constructor(scheduler: FreeSnapshotScheduler, tabStore: FreeTabStore) : this(
+    @Inject constructor(
+        scheduler: FreeSnapshotScheduler,
+        tabStore: FreeTabStore,
+        seriesStore: FreeVisibleSeriesStore
+    ) : this(
         scheduler.readState,
         FreeSnapshotActivityCoordinator(scheduler::onActivated, scheduler::onDeactivated),
-        tabStore
+        tabStore,
+        seriesStore
     )
 
     private var uid: String? = null
     private var tab: FreeTab? = null
     private var period = FreeSnapshotUiState.DEFAULT_PERIOD
+
+    /** Only tabs chosen for. Absent means the tab's default; present-and-empty means all-off. */
+    private var storedSeries: Map<FreeTab, Set<String>> = emptyMap()
     private val _uiState = MutableStateFlow(FreeSnapshotUiState())
     val uiState: StateFlow<FreeSnapshotUiState> = _uiState.asStateFlow()
 
@@ -59,9 +70,16 @@ class FreeSnapshotViewModel internal constructor(
             // the only surface a free user has to fail to open at all.
             FreeTab.INITIAL
         }
+        // Read whole, once, so a tab switch afterwards needs no suspension of its own.
+        val series = try {
+            seriesStore.visibleSeries(uid)
+        } catch (_: IOException) {
+            emptyMap()
+        }
         this.uid = uid
         this.tab = restored
         this.period = FreeSnapshotUiState.DEFAULT_PERIOD
+        this.storedSeries = series
         publish()
     }
 
@@ -80,6 +98,29 @@ class FreeSnapshotViewModel internal constructor(
         }
     }
 
+    /**
+     * Show or hide one series on the selected tab.
+     *
+     * After the owner and data-tab checks, [FreeSeriesVisibility.toggle] always adds or removes the
+     * requested id. The result therefore differs from the current set and is persisted as an
+     * explicit choice.
+     */
+    fun toggleSeries(seriesId: String) {
+        val owner = uid ?: return
+        val selected = tab?.takeIf { it.isData } ?: return
+        val current = FreeSeriesVisibility.resolve(selected, storedSeries[selected])
+        val next = FreeSeriesVisibility.toggle(selected, current, seriesId)
+        storedSeries = storedSeries + (selected to next)
+        publish()
+        viewModelScope.launch {
+            try {
+                seriesStore.remember(owner, selected, next)
+            } catch (_: IOException) {
+                // Losing the choice is not worth taking the surface down for.
+            }
+        }
+    }
+
     fun selectPeriod(period: GraphPeriod) {
         if (uid == null || this.period == period) return
         this.period = period
@@ -90,7 +131,10 @@ class FreeSnapshotViewModel internal constructor(
     private fun publish() {
         val owner = uid ?: return
         val selected = tab ?: return
-        _uiState.value = FreeSnapshotUiState.from(owner, selected, period, readState.value)
+        _uiState.value = FreeSnapshotUiState.from(
+            owner, selected, period, readState.value,
+            FreeSeriesVisibility.resolve(selected, storedSeries[selected])
+        )
     }
 
     override fun onCleared() {

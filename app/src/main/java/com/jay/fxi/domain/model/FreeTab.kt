@@ -15,13 +15,34 @@ package com.jay.fxi.domain.model
 enum class FreeTab(
     val title: String,
     val serverTab: String?,
-    val currency: SupportedCurrency? = null
+    val currency: SupportedCurrency? = null,
+    /**
+     * What the graph shows before the user has chosen anything, matching iOS's
+     * `FreeCurrencyConfig` and `FreeTetherConfig` exactly.
+     *
+     * An id the selected period does not carry simply does not appear — `upbit.usdt-krw` has no
+     * long-period series, so the tether tab narrows to 빗썸+하나 there on its own. KRX is in none of
+     * them: the free tier does not disclose that it exists.
+     */
+    val defaultVisibleSeriesIds: Set<String> = emptySet()
 ) {
     NEWS("뉴스", null),
-    TETHER("테더", "tether"),
-    USD(SupportedCurrency.USD_KRW.tabTitle, "usd", SupportedCurrency.USD_KRW),
-    JPY(SupportedCurrency.JPY_KRW.tabTitle, "jpy", SupportedCurrency.JPY_KRW),
-    EUR(SupportedCurrency.EUR_KRW.tabTitle, "eur", SupportedCurrency.EUR_KRW);
+    TETHER(
+        "테더", "tether",
+        defaultVisibleSeriesIds = setOf("upbit.usdt-krw", "bithumb.usdt-krw", "hana.usd")
+    ),
+    USD(
+        SupportedCurrency.USD_KRW.tabTitle, "usd", SupportedCurrency.USD_KRW,
+        setOf("investing.usd", "kb.usd", "hana.usd", "dxy")
+    ),
+    JPY(
+        SupportedCurrency.JPY_KRW.tabTitle, "jpy", SupportedCurrency.JPY_KRW,
+        setOf("investing.jpy", "hana.jpy")
+    ),
+    EUR(
+        SupportedCurrency.EUR_KRW.tabTitle, "eur", SupportedCurrency.EUR_KRW,
+        setOf("investing.eur", "hana.eur")
+    );
 
     /** Whether the snapshot scheduler can be activated for this tab at all. */
     val isData: Boolean get() = serverTab != null

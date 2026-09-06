@@ -9,6 +9,7 @@ import com.jay.fxi.data.free.FreeSnapshotKey
 import com.jay.fxi.data.free.FreeSnapshotReadState
 import com.jay.fxi.data.free.FreeSnapshotScheduler
 import com.jay.fxi.data.local.FreeTabStore
+import com.jay.fxi.data.local.FreeVisibleSeriesStore
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.FreeGraph
 import com.jay.fxi.domain.model.FreeGraphPoint
@@ -55,7 +56,7 @@ class FreeSnapshotViewModelTest {
         refreshNotBefore = basis + 48.hours,
         rate = FreeRate.Flat("usd-krw", listOf(ExchangeRate("usd-krw", "kb", 1400.0, basis - 1.hours))),
         graph = FreeGraph(null, listOf(FreeGraphSeries(
-            seriesId = "usd_krw",
+            seriesId = "investing.usd",
             points = listOf(
                 FreeGraphPoint(basis - 2.hours, 1390.0, null, null),
                 FreeGraphPoint(basis, 1400.0, null, null)
@@ -87,13 +88,32 @@ class FreeSnapshotViewModelTest {
         }
     }
 
+    private class FakeSeriesStore(
+        private var stored: MutableMap<FreeTab, Set<String>> = mutableMapOf()
+    ) : FreeVisibleSeriesStore {
+        var owner: String? = null
+        val writes = mutableListOf<Pair<FreeTab, Set<String>>>()
+
+        override suspend fun visibleSeries(uid: String): Map<FreeTab, Set<String>> =
+            if (owner == null || owner == uid) stored.toMap() else emptyMap()
+
+        override suspend fun remember(uid: String, tab: FreeTab, seriesIds: Set<String>) {
+            owner = uid
+            stored[tab] = seriesIds
+            writes += tab to seriesIds
+        }
+    }
+
     private fun withViewModel(
         tabStore: FreeTabStore = FakeTabStore(),
+        seriesStore: FreeVisibleSeriesStore = FakeSeriesStore(),
         block: suspend TestScope.(FreeSnapshotViewModel, MutableStateFlow<FreeSnapshotReadState>) -> Unit
     ) = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
         val reads = MutableStateFlow(FreeSnapshotReadState())
-        val vm = FreeSnapshotViewModel(reads, FreeSnapshotActivityCoordinator({ _, _ -> }, {}), tabStore)
+        val vm = FreeSnapshotViewModel(
+            reads, FreeSnapshotActivityCoordinator({ _, _ -> }, {}), tabStore, seriesStore
+        )
         try {
             block(vm, reads)
         } finally {
@@ -204,7 +224,7 @@ class FreeSnapshotViewModelTest {
             clock = { basis + testScheduler.currentTime.milliseconds },
             installId = { "test-install" }
         )
-        val vm = FreeSnapshotViewModel(scheduler, FakeTabStore())
+        val vm = FreeSnapshotViewModel(scheduler, FakeTabStore(), FakeSeriesStore())
         try {
             scheduler.start()
             vm.bind("u1")
@@ -337,5 +357,87 @@ class FreeSnapshotViewModelTest {
             listOf("거래소 USDT/KRW" to "업비트", "은행 USD/KRW" to "하나은행"),
             vm.uiState.value.rateSections.map { it.title to it.rows.single().source }
         )
+    }
+
+    /**
+     * `ANDROID_V2_PLAN.md:826`. The defaults match iOS's `FreeCurrencyConfig`. Binding alone must
+     * not persist the resolved default; the first toggle persists the resulting selection,
+     * including an empty set when everything is off.
+     */
+    @Test
+    fun graphSeriesStartOnTheTabsDefault_andOnlyRealChangesArePersisted() {
+        val series = FakeSeriesStore()
+        withViewModel(seriesStore = series) { vm, reads ->
+            reads.value = readState()
+            vm.bind("u1")
+            assertEquals(
+                listOf("investing.usd" to true),
+                vm.uiState.value.seriesToggles.map { it.seriesId to it.visible }
+            )
+            assertFalse(vm.uiState.value.charts.isEmpty())
+            assertTrue("the default was written back as if it were a choice", series.writes.isEmpty())
+
+            // The default carries four ids; this answer only carries one of them, so hiding it
+            // empties the graph while the other three stay chosen.
+            vm.toggleSeries("investing.usd")
+            testScheduler.runCurrent()
+            assertTrue(vm.uiState.value.charts.isEmpty())
+            assertEquals(
+                listOf(FreeTab.USD to setOf("kb.usd", "hana.usd", "dxy")),
+                series.writes
+            )
+        }
+    }
+
+    /**
+     * All-off is a choice the plan permits, so it has to be storable *and* distinguishable from
+     * "never chosen" on the way back in — an empty set that read as absence would reopen on the
+     * default every launch.
+     */
+    @Test
+    fun turningEverySeriesOffIsStored_andSurvivesARebind() {
+        val series = FakeSeriesStore()
+        withViewModel(seriesStore = series) { vm, reads ->
+            reads.value = readState()
+            vm.bind("u1")
+            FreeTab.USD.defaultVisibleSeriesIds.forEach { vm.toggleSeries(it) }
+            testScheduler.runCurrent()
+            assertEquals(emptySet<String>(), series.writes.last().second)
+
+            vm.bind("u2")
+            vm.bind("u1")
+            reads.value = readState()
+            testScheduler.runCurrent()
+            assertEquals(
+                listOf("investing.usd" to false),
+                vm.uiState.value.seriesToggles.map { it.seriesId to it.visible }
+            )
+            assertTrue("all-off did not survive the rebind", vm.uiState.value.charts.isEmpty())
+        }
+    }
+
+    /** A toggle before anything is bound has no owner to be stored against. */
+    @Test
+    fun seriesTogglesBeforeBindAreIgnored() {
+        val series = FakeSeriesStore()
+        withViewModel(seriesStore = series) { vm, _ ->
+            vm.toggleSeries("investing.usd")
+            testScheduler.runCurrent()
+            assertTrue(series.writes.isEmpty())
+        }
+    }
+
+    /** 뉴스 has no graph, so there is nothing on it to show or hide. */
+    @Test
+    fun theNewsTabHasNoSeriesToToggle() {
+        val series = FakeSeriesStore()
+        withViewModel(seriesStore = series) { vm, _ ->
+            vm.bind("u1")
+            vm.selectTab(FreeTab.NEWS)
+            vm.toggleSeries("investing.usd")
+            testScheduler.runCurrent()
+            assertTrue(series.writes.isEmpty())
+            assertTrue(vm.uiState.value.seriesToggles.isEmpty())
+        }
     }
 }

@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -43,6 +45,7 @@ fun FreeSnapshotScreen(
     state: FreeSnapshotUiState,
     onSelectTab: (FreeTab) -> Unit,
     onSelectPeriod: (GraphPeriod) -> Unit,
+    onToggleSeries: (String) -> Unit,
     onSignOut: () -> Unit,
     onSubscribe: () -> Unit,
     userInfo: UserInfo? = null,
@@ -67,7 +70,7 @@ fun FreeSnapshotScreen(
         // overwriting the stored tab with one the user never chose. Waiting is what makes that
         // impossible, rather than a guard that has to stay ahead of the coroutine that races it.
         val selected = state.selectedTab ?: return@Column
-        FreeSnapshotTabs(selected, state, onSelectTab, onSelectPeriod, onSubscribe)
+        FreeSnapshotTabs(selected, state, onSelectTab, onSelectPeriod, onToggleSeries, onSubscribe)
     }
 }
 
@@ -77,6 +80,7 @@ private fun ColumnScope.FreeSnapshotTabs(
     state: FreeSnapshotUiState,
     onSelectTab: (FreeTab) -> Unit,
     onSelectPeriod: (GraphPeriod) -> Unit,
+    onToggleSeries: (String) -> Unit,
     onSubscribe: () -> Unit
 ) {
     val tabs = FreeTab.entries
@@ -122,17 +126,20 @@ private fun ColumnScope.FreeSnapshotTabs(
                 tab = tab,
                 state = if (tab == selected) state else FreeSnapshotUiState(uid = state.uid),
                 onSelectPeriod = onSelectPeriod,
+                onToggleSeries = onToggleSeries,
                 onSubscribe = onSubscribe
             )
         }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun FreeSnapshotTabContent(
     tab: FreeTab,
     state: FreeSnapshotUiState,
     onSelectPeriod: (GraphPeriod) -> Unit,
+    onToggleSeries: (String) -> Unit,
     onSubscribe: () -> Unit
 ) {
     val visible = state.availability == FreeSnapshotAvailability.FRESH ||
@@ -171,8 +178,32 @@ private fun FreeSnapshotTabContent(
         }
         if (visible) {
             item { Text("환율 추이", style = MaterialTheme.typography.titleMedium) }
+            if (state.seriesToggles.isNotEmpty()) {
+                item {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        state.seriesToggles.forEach { series ->
+                            FilterChip(
+                                selected = series.visible,
+                                onClick = { onToggleSeries(series.seriesId) },
+                                label = { Text(series.label) }
+                            )
+                        }
+                    }
+                }
+            }
             if (state.charts.isEmpty()) {
-                item { Text("표시할 그래프 데이터가 없습니다.") }
+                // All-off is a choice the plan permits, so it is stated rather than repaired.
+                // Series that are switched on but carry no points for this period are a data gap,
+                // not an empty selection — telling the user to pick something would be wrong there.
+                item {
+                    Text(
+                        if (state.seriesToggles.isEmpty() || state.seriesToggles.any { it.visible }) {
+                            "표시할 그래프 데이터가 없습니다."
+                        } else {
+                            "표시할 항목을 선택해 주세요."
+                        }
+                    )
+                }
             }
             state.charts.forEach { chart -> item { SnapshotChart(chart) } }
             if (state.rateSections.isEmpty()) {

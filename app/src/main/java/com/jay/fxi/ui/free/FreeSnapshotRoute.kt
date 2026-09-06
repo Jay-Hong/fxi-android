@@ -62,6 +62,7 @@ fun FreeSnapshotRoute(
         userInfo = userInfo?.takeIf { it.uid == uid },
         onSelectTab = viewModel::selectTab,
         onSelectPeriod = viewModel::selectPeriod,
+        onToggleSeries = viewModel::toggleSeries,
         onSignOut = onSignOut,
         onSubscribe = onSubscribe,
         modifier = modifier

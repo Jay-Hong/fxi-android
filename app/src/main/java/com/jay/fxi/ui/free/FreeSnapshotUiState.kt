@@ -30,10 +30,14 @@ data class FreeSnapshotRateRow(val source: String, val value: String)
  */
 data class FreeSnapshotRateSection(val title: String, val rows: List<FreeSnapshotRateRow>)
 
+/** One entry of the graph's series switch. Absent from the snapshot means absent from the row. */
+data class FreeSeriesToggle(val seriesId: String, val label: String, val visible: Boolean)
+
 /** Normalized coordinates keep chart calculation off the Compose path and JVM-testable. */
 data class FreeSnapshotChartPoint(val x: Float, val y: Float)
 
 data class FreeSnapshotChart(
+    val seriesId: String,
     val label: String,
     val points: List<FreeSnapshotChartPoint>,
     val minimum: String,
@@ -57,7 +61,9 @@ data class FreeSnapshotUiState(
     val availability: FreeSnapshotAvailability = FreeSnapshotAvailability.AWAITING_SNAPSHOT,
     val asOfLabel: String? = null,
     val rateSections: List<FreeSnapshotRateSection> = emptyList(),
-    val charts: List<FreeSnapshotChart> = emptyList()
+    val charts: List<FreeSnapshotChart> = emptyList(),
+    /** Every series this answer carries, whether drawn or not — the row has to offer both. */
+    val seriesToggles: List<FreeSeriesToggle> = emptyList()
 ) {
     /**
      * What the scheduler would be activated for.
@@ -79,7 +85,8 @@ data class FreeSnapshotUiState(
             uid: String,
             tab: FreeTab,
             period: GraphPeriod,
-            readState: FreeSnapshotReadState
+            readState: FreeSnapshotReadState,
+            visibleSeriesIds: Set<String>
         ): FreeSnapshotUiState {
             val empty = FreeSnapshotUiState(uid = uid, selectedTab = tab, period = period)
             // 뉴스 has no snapshot of its own, so there is nothing here that could be stale,
@@ -98,9 +105,16 @@ data class FreeSnapshotUiState(
             )
             // Expired values must not survive in the presentation state, including chart points.
             if (availability == FreeSnapshotAvailability.UNAVAILABLE) return state
+            val series = entry.snapshot.graph.series
             return state.copy(
                 rateSections = sections(entry.snapshot.rate),
-                charts = charts(entry.snapshot)
+                // All-off draws an empty graph. `ANDROID_V2_PLAN.md:826` allows it outright, and
+                // D18's "project one candidate rather than show nothing" is a rule for source
+                // lists, not for graphs — repopulating here would overrule a real choice.
+                charts = charts(entry.snapshot).filter { it.seriesId in visibleSeriesIds },
+                seriesToggles = series.map {
+                    FreeSeriesToggle(it.seriesId, it.label, it.seriesId in visibleSeriesIds)
+                }
             )
         }
 
@@ -139,6 +153,7 @@ data class FreeSnapshotUiState(
             val decimals = (series.decimals ?: 2).coerceIn(0, 8)
             val unit = series.unit?.let { " $it" }.orEmpty()
             FreeSnapshotChart(
+                seriesId = series.seriesId,
                 label = series.label,
                 points = points.sortedBy { it.timestamp }.map { point ->
                     FreeSnapshotChartPoint(

@@ -6,7 +6,9 @@ import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.entitlements.AuthUidStream
 import com.jay.fxi.data.free.FreeSnapshotScheduler
 import com.jay.fxi.data.local.DataStoreFreeTabStore
+import com.jay.fxi.data.local.DataStoreFreeVisibleSeriesStore
 import com.jay.fxi.data.local.FreeTabStore
+import com.jay.fxi.data.local.FreeVisibleSeriesStore
 import com.jay.fxi.domain.repository.FreeSnapshotFetching
 import dagger.Module
 import dagger.Provides
@@ -50,6 +52,12 @@ object FreeSnapshotSchedulerModule {
     @Provides
     @Singleton
     fun provideFreeTabStore(store: DataStoreFreeTabStore): FreeTabStore = store
+
+    @Provides
+    @Singleton
+    fun provideFreeVisibleSeriesStore(
+        store: DataStoreFreeVisibleSeriesStore
+    ): FreeVisibleSeriesStore = store
 
     /**
      * A stable random value, drawn once per install.
