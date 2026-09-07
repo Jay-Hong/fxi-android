@@ -199,11 +199,65 @@ class FreeSnapshotViewModelTest {
     fun chartUsesSnapshotTimeAndValues_withoutSyntheticLiveTail() = withViewModel { vm, reads ->
         reads.value = readState()
         vm.bind("u1")
-        assertEquals(listOf(FreeSnapshotChartPoint(0f, 1f), FreeSnapshotChartPoint(1f, 0f)), vm.uiState.value.charts.single().points)
+        // The chart carries the snapshot's own instants and values — no tail is invented past the
+        // last one, and nothing is normalised away before anyone can ask what time it was.
+        val chart = vm.uiState.value.charts.single()
+        assertEquals(listOf(basis - 2.hours, basis), chart.points.map { it.timestamp })
+        assertEquals(listOf(1390.0, 1400.0), chart.points.map { it.rate })
+        assertEquals(basis - 2.hours, chart.domain.start)
+        assertEquals(basis, chart.domain.end)
+        assertEquals(
+            listOf(FreeSnapshotChartPoint(0f, 1f), FreeSnapshotChartPoint(1f, 0f)),
+            FreeChartGeometry.normalize(chart.points, chart.domain)
+        )
+
         val single = snapshot().let { it.copy(graph = FreeGraph(null, listOf(it.graph.series.single().copy(points = it.graph.series.single().points.take(1))))) }
         reads.value = readState(snapshot = single)
         testScheduler.runCurrent()
-        assertEquals(listOf(FreeSnapshotChartPoint(0.5f, 0.5f)), vm.uiState.value.charts.single().points)
+        val one = vm.uiState.value.charts.single()
+        assertEquals(listOf(basis - 2.hours), one.points.map { it.timestamp })
+        assertEquals(
+            listOf(FreeSnapshotChartPoint(0.5f, 0.5f)),
+            FreeChartGeometry.normalize(one.points, one.domain)
+        )
+    }
+
+    /**
+     * Two series on one axis are drawn in one frame — and each still describes itself.
+     *
+     * Reading the caption off the shared frame reported numbers the series never reached: a line
+     * that moved between 1400 and 1401 was captioned, and read aloud by the screen reader, as
+     * 1390–1410. The frame is for drawing; the caption is a claim about this series.
+     */
+    @Test
+    fun aSeriesCaptionReportsItsOwnRange_notTheSharedAxis() = withViewModel { vm, reads ->
+        val flat = FreeGraphSeries(
+            seriesId = "hana.usd", label = "하나", axisGroup = "krw",
+            points = listOf(
+                FreeGraphPoint(basis - 2.hours, 1400.0, null, null),
+                FreeGraphPoint(basis, 1401.0, null, null)
+            )
+        )
+        val swingy = FreeGraphSeries(
+            seriesId = "investing.usd", label = "인베스팅", axisGroup = "krw",
+            points = listOf(
+                FreeGraphPoint(basis - 2.hours, 1390.0, null, null),
+                FreeGraphPoint(basis, 1410.0, null, null)
+            )
+        )
+        reads.value = readState(snapshot = snapshot().copy(graph = FreeGraph(null, listOf(swingy, flat))))
+        vm.bind("u1")
+
+        val charts = vm.uiState.value.charts.associateBy { it.seriesId }
+        assertEquals(setOf("investing.usd", "hana.usd"), charts.keys)
+        // One frame, so the two lines are comparable…
+        assertEquals(charts.getValue("hana.usd").domain, charts.getValue("investing.usd").domain)
+        assertEquals(1390.0, charts.getValue("hana.usd").domain.low, 0.0)
+        // …and each caption is still about its own series.
+        assertEquals("1400.00", charts.getValue("hana.usd").low)
+        assertEquals("1401.00", charts.getValue("hana.usd").high)
+        assertEquals("1390.00", charts.getValue("investing.usd").low)
+        assertEquals("1410.00", charts.getValue("investing.usd").high)
     }
 
     @Test

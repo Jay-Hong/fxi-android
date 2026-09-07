@@ -25,6 +25,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -249,18 +250,21 @@ private fun SnapshotChart(chart: FreeSnapshotChart) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(chart.label, style = MaterialTheme.typography.titleSmall)
-            Text("${chart.minimum} ~ ${chart.maximum}", style = MaterialTheme.typography.bodySmall)
+            Text("${chart.low} ~ ${chart.high}", style = MaterialTheme.typography.bodySmall)
+            // Normalised against the axis group's shared frame, not this series' own extremes, so
+            // two lines on one axis stay comparable.
+            val plotted = remember(chart) { FreeChartGeometry.normalize(chart.points, chart.domain) }
             Canvas(
                 Modifier.fillMaxWidth().height(140.dp).padding(4.dp).semantics {
-                    contentDescription = "${chart.label}, ${chart.start}부터 ${chart.end}, 최저 ${chart.minimum}, 최고 ${chart.maximum}"
+                    contentDescription = "${chart.label}, ${chart.start}부터 ${chart.end}, 최저 ${chart.low}, 최고 ${chart.high}"
                 }
             ) {
-                if (chart.points.size == 1) {
-                    val point = chart.points.single()
+                if (plotted.size == 1) {
+                    val point = plotted.single()
                     drawCircle(color, radius = 3.dp.toPx(), center = Offset(point.x * size.width, point.y * size.height))
                 } else {
                     val path = Path()
-                    chart.points.forEachIndexed { index, point ->
+                    plotted.forEachIndexed { index, point ->
                         val x = point.x * size.width
                         val y = point.y * size.height
                         if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)

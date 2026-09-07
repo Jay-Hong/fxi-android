@@ -5,6 +5,8 @@ import com.jay.fxi.data.free.FreeSnapshotKey
 import com.jay.fxi.data.free.FreeSnapshotReadState
 import com.jay.fxi.domain.model.Exchange
 import com.jay.fxi.domain.model.ExchangeRate
+import com.jay.fxi.domain.model.FreeGraphPoint
+import com.jay.fxi.domain.model.FreeGraphSeries
 import com.jay.fxi.domain.model.FreeRate
 import com.jay.fxi.domain.model.FreeSnapshot
 import com.jay.fxi.domain.model.FreeTab
@@ -33,15 +35,28 @@ data class FreeSnapshotRateSection(val title: String, val rows: List<FreeSnapsho
 /** One entry of the graph's series switch. Absent from the snapshot means absent from the row. */
 data class FreeSeriesToggle(val seriesId: String, val label: String, val visible: Boolean)
 
-/** Normalized coordinates keep chart calculation off the Compose path and JVM-testable. */
-data class FreeSnapshotChartPoint(val x: Float, val y: Float)
-
+/**
+ * One series, in its own units, plus the frame it shares with the others on its axis.
+ *
+ * The points are *not* normalized here. They used to be, each series against its own extremes,
+ * which made two series in one frame incomparable and left no way to express a zoom at all — the
+ * timestamps and the highs and lows were gone by the time anything could ask for them.
+ */
 data class FreeSnapshotChart(
     val seriesId: String,
     val label: String,
-    val points: List<FreeSnapshotChartPoint>,
-    val minimum: String,
-    val maximum: String,
+    val points: List<FreeGraphPoint>,
+    /** The frame it is drawn in: time shared with every series, value shared with its own axis. */
+    val domain: FreeChartDomain,
+    /**
+     * This series' own observed extremes.
+     *
+     * Not the frame's. A near-flat line sharing an axis with a volatile one is drawn against the
+     * volatile one's range, but saying so in its caption — and to a screen reader — would report
+     * numbers this series never reached.
+     */
+    val low: String,
+    val high: String,
     val start: String,
     val end: String
 )
@@ -79,7 +94,14 @@ data class FreeSnapshotUiState(
         if (this.uid == uid) this else FreeSnapshotUiState(uid = uid)
 
     companion object {
-        val DEFAULT_PERIOD = GraphPeriod.THREE_MONTHS
+        /**
+         * 1일, as on iOS and as on this app's own premium surface (`GraphViewModel.kt:66`).
+         *
+         * The free surface opened on 3달 while everything else opened on 1일 — an inconsistency
+         * rather than a decision; nothing recorded a reason for it. It also decided which period
+         * the scheduler fetches first, and 1일 is the only period that will carry zoom.
+         */
+        val DEFAULT_PERIOD = GraphPeriod.ONE_DAY
 
         internal fun from(
             uid: String,
@@ -111,7 +133,7 @@ data class FreeSnapshotUiState(
                 // All-off draws an empty graph. `ANDROID_V2_PLAN.md:826` allows it outright, and
                 // D18's "project one candidate rather than show nothing" is a rule for source
                 // lists, not for graphs — repopulating here would overrule a real choice.
-                charts = charts(entry.snapshot).filter { it.seriesId in visibleSeriesIds },
+                charts = charts(series, visibleSeriesIds),
                 seriesToggles = series.map {
                     FreeSeriesToggle(it.seriesId, it.label, it.seriesId in visibleSeriesIds)
                 }
@@ -141,31 +163,35 @@ data class FreeSnapshotUiState(
 
         private fun Instant.toJavaInstant() = java.time.Instant.ofEpochSecond(epochSeconds, nanosecondsOfSecond.toLong())
 
-        private fun charts(snapshot: FreeSnapshot): List<FreeSnapshotChart> = snapshot.graph.series.mapNotNull { series ->
-            val points = series.points
-            if (points.isEmpty()) return@mapNotNull null
-            val first = points.minOf { it.timestamp }
-            val last = points.maxOf { it.timestamp }
-            val duration = (last - first).inWholeMilliseconds.toDouble()
-            val minimum = points.minOf { it.rate }
-            val maximum = points.maxOf { it.rate }
-            val spread = maximum - minimum
-            val decimals = (series.decimals ?: 2).coerceIn(0, 8)
-            val unit = series.unit?.let { " $it" }.orEmpty()
-            FreeSnapshotChart(
-                seriesId = series.seriesId,
-                label = series.label,
-                points = points.sortedBy { it.timestamp }.map { point ->
-                    FreeSnapshotChartPoint(
-                        x = if (duration == 0.0) 0.5f else ((point.timestamp - first).inWholeMilliseconds / duration).toFloat(),
-                        y = if (spread == 0.0) 0.5f else (1.0 - (point.rate - minimum) / spread).toFloat()
-                    )
-                },
-                minimum = String.format(Locale.KOREA, "%.${decimals}f", minimum) + unit,
-                maximum = String.format(Locale.KOREA, "%.${decimals}f", maximum) + unit,
-                start = dateFormatter.format(first.toJavaInstant()),
-                end = dateFormatter.format(last.toJavaInstant())
-            )
+        /**
+         * One chart per drawn series, each carrying the frame shared by everything on its axis.
+         *
+         * Grouping by axis is what keeps a KRW rate near 1,400 and a dollar index near 99 from
+         * being forced onto one scale, which would flatten both.
+         */
+        private fun charts(
+            series: List<FreeGraphSeries>,
+            visibleSeriesIds: Set<String>
+        ): List<FreeSnapshotChart> {
+            val drawn = series.filter { it.seriesId in visibleSeriesIds && it.points.isNotEmpty() }
+            val frames = FreeChartGeometry.frames(drawn)
+            return drawn.mapNotNull { item ->
+                val frame = frames[item.axisGroup] ?: return@mapNotNull null
+                val own = FreeChartGeometry.extremesOf(item.points) ?: return@mapNotNull null
+                val decimals = (item.decimals ?: 2).coerceIn(0, 8)
+                val unit = item.unit?.let { " $it" }.orEmpty()
+                fun format(value: Double) = String.format(Locale.KOREA, "%.${decimals}f", value) + unit
+                FreeSnapshotChart(
+                    seriesId = item.seriesId,
+                    label = item.label,
+                    points = item.points.sortedBy { it.timestamp },
+                    domain = frame,
+                    low = format(own.start),
+                    high = format(own.endInclusive),
+                    start = dateFormatter.format(frame.start.toJavaInstant()),
+                    end = dateFormatter.format(frame.end.toJavaInstant())
+                )
+            }
         }
     }
 }
