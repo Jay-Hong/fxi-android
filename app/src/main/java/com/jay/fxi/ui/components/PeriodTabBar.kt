@@ -3,10 +3,11 @@ package com.jay.fxi.ui.components
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -15,6 +16,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -37,6 +39,9 @@ fun PeriodTabBar(
             .fillMaxWidth()
             .clip(RoundedCornerShape(999.dp))
             .background(TabBarBackground)
+            // Without this the four items announce their own selected state but not that they are
+            // one choice: a screen reader says "selected" without saying "of what".
+            .selectableGroup()
             .padding(4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -62,7 +67,13 @@ fun PeriodTabBar(
                     .weight(1f)
                     .clip(RoundedCornerShape(999.dp))
                     .background(bgColor)
-                    .clickable(enabled = !isActive) { onSelectPeriod(period) }
+                    // `selectable` rather than `clickable`: it is what tells a screen reader which
+                    // period is the chosen one. Disabling the active tab conveys "unavailable"
+                    // instead, which is the opposite of what is true. The guard keeps the original
+                    // behaviour of not re-asking for a period that is already showing.
+                    .selectable(selected = isActive, role = Role.Tab) {
+                        if (!isActive) onSelectPeriod(period)
+                    }
                     .padding(vertical = 2.dp),
             )
         }

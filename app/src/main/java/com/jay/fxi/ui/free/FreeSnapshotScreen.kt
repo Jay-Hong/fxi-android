@@ -54,6 +54,7 @@ import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.UserInfo
+import com.jay.fxi.ui.components.PeriodTabBar
 import com.jay.fxi.ui.graph.GraphChart
 import com.jay.fxi.ui.graph.GraphSeriesStyles
 import com.jay.fxi.ui.theme.Background
@@ -265,7 +266,7 @@ private fun FreeSnapshotTabContent(
         }
         // Outside `visible`: the four periods stay reachable while the selected one is expired or
         // has not arrived. Hiding them would strand the user on the one period they cannot see.
-        item { PeriodBar(state.period, onSelectPeriod) }
+        item { PeriodTabBar(state.period, onSelectPeriod) }
         if (visible) {
             item { Text("환율 추이", style = MaterialTheme.typography.titleMedium) }
             if (state.seriesToggles.isNotEmpty()) {
@@ -365,19 +366,6 @@ private fun GraphSurface(state: FreeSnapshotUiState, modifier: Modifier = Modifi
     )
 }
 
-@Composable
-private fun PeriodBar(selected: GraphPeriod, onSelect: (GraphPeriod) -> Unit) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        GraphPeriod.entries.forEach { period ->
-            FilterChip(
-                selected = period == selected,
-                onClick = { onSelect(period) },
-                label = { Text(period.displayName) }
-            )
-        }
-    }
-}
-
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SeriesToggles(toggles: List<FreeSeriesToggle>, onToggle: (String) -> Unit) {
@@ -435,7 +423,7 @@ private fun FreeGraphFullscreen(
             Text(tab.heading, style = MaterialTheme.typography.titleMedium)
             TextButton(onClick = onClose) { Text("닫기") }
         }
-        PeriodBar(state.period, onSelectPeriod)
+        PeriodTabBar(state.period, onSelectPeriod)
         if (state.seriesToggles.isNotEmpty()) SeriesToggles(state.seriesToggles, onToggleSeries)
 
         // A tap anywhere leaves, on every period — iOS does the same
