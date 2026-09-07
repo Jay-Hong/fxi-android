@@ -23,7 +23,6 @@ import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.GraphSource
 import com.jay.fxi.ui.theme.SecondaryText
@@ -65,18 +64,17 @@ fun GraphChart(
         )
     }
     val density = LocalDensity.current
-    val valueGutter = with(density) { 44.dp.toPx() }
-    val indexGutter = with(density) { if (plot.indexRange != null) 36.dp.toPx() else 0f }
-    val bottomGutter = with(density) { 16.dp.toPx() }
 
     Canvas(modifier.semantics { contentDescription = plot.describe() }) {
-        val area = Rect(
-            left = indexGutter,
-            top = with(density) { 6.dp.toPx() },
-            right = size.width - valueGutter,
-            bottom = size.height - bottomGutter
+        // Shared with the gestures rather than computed here: see `GraphPlotGeometry`.
+        val plotted = GraphPlotGeometry.area(
+            widthPx = size.width,
+            heightPx = size.height,
+            hasIndex = plot.indexRange != null,
+            density = density.density
         )
-        if (area.width <= 0f || area.height <= 0f) return@Canvas
+        if (plotted.isEmpty) return@Canvas
+        val area = Rect(plotted.left, plotted.top, plotted.right, plotted.bottom)
 
         drawGridlines(plot, area, measurer, axisStyle)
         // Bands first so no line is buried under a neighbour's shading.
