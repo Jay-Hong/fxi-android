@@ -11,6 +11,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.PointerEvent
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.dp
 import com.jay.fxi.domain.model.GraphPeriod
 
 /**
@@ -85,8 +86,28 @@ internal fun rememberGraphZoomGestures(
     return Modifier.pointerInput(period) {
         if (period != GraphPeriod.ONE_DAY) return@pointerInput
 
+        // Tap memory has to outlive the gesture: the second tap arrives as a separate
+        // `awaitEachGesture` pass, so nothing inside one pass could ever pair them up.
+        // Null, not 0: `uptimeMillis` counts from boot and **can be 0** — Compose's own test
+        // injector starts its clock there and advances from it (measured on this slice: first tap
+        // at 0, second at 100), so the first tap of a run lands exactly on a sentinel that a real
+        // value can equal, and is lost. Measured, not guessed: the first double tap written here
+        // failed for exactly that reason.
+        var previousTapUpAt: Long? = null
+        var previousTapAt = Offset.Zero
+        // Compose puts **no** distance limit on the second tap — `TapGestureDetector.kt`'s
+        // `awaitSecondDown` enforces the time window and nothing else — so the figure has to come
+        // from the platform: `android.view.ViewConfiguration.DOUBLE_TAP_SLOP`, 100dp. `touchSlop * 2`
+        // is the tempting guess and it is about 16dp, which rejects taps people mean as a pair.
+        // Flat 100dp, not the platform's own figure: the framework multiplies it by 1.5 on XLARGE
+        // layouts (`ViewConfiguration.java`), and this chart is the same size on every screen.
+        val doubleTapSlop = 100.dp.toPx()
+
         awaitEachGesture {
-            awaitFirstDown(requireUnconsumed = false)   // not consumed: it may still be the pager's
+            // Not required unconsumed: it may still be the pager's. A scrollable already in motion
+            // consumes the down in the Initial pass, and requiring it unconsumed would mean never
+            // returning for that touch at all.
+            val down = awaitFirstDown(requireUnconsumed = false)
 
             // Measured once per gesture. `hasIndex` is read off the plot the chart actually drew,
             // never off the toggle set — a series can be switched on and still have no range, and
@@ -129,6 +150,14 @@ internal fun rememberGraphZoomGestures(
             // per-frame values would leave the window circling its starting length.
             var cumulativeZoom = 1f
 
+            // What the tap test needs. `travel` is the distance from the down rather than a sum of
+            // per-frame steps — a finger that wanders out and comes back is not a tap, and a sum
+            // would also disqualify the jitter of a finger that never really left.
+            var maxPointers = 1
+            var travel = 0f
+            var lastEventAt = down.uptimeMillis
+            var terminalConsumed = false
+
             // The first `down` needs the same check as everything after it, and it is the one event
             // the loop below never sees: `awaitFirstDown` returns after the Main pass and the loop
             // starts by waiting for the *next* event. A scrollable that is already in motion
@@ -140,18 +169,52 @@ internal fun rememberGraphZoomGestures(
             }
 
             var event: PointerEvent
-            // The terminal gesture goes in a `finally` because the loop has two ways out that are
-            // not the `break`: an early return above, and `resetPointerInputHandler()` cancelling
-            // the coroutine (a density change, a key change, or this node being detached — which
-            // happens if the snapshot expires mid-pinch and the card leaves the list). Without it a
-            // `PinchBegan` with no `PinchEnded` leaves the whole padded frame in `visible`, which
-            // reads as "zoomed", and the next sideways swipe is eaten as a pan instead of turning
-            // the page.
+            // The terminal gesture goes in a `finally` because the loop has ways out that are not
+            // the `break`: an early return above, and `resetPointerInputHandler()` cancelling the
+            // coroutine outright — a density change, a view-configuration change, or the `period`
+            // key moving under it. Without it a `PinchBegan` with no `PinchEnded` leaves the whole
+            // padded frame in `visible`, `isFollowing` false, and a baseline with no finger on it —
+            // a gesture that never ended. Only part of that outlives the process: the saver keeps
+            // the window and the follow flag and nothing else (`GraphZoomStateSaver`), so the
+            // baseline dies with it while the window comes back.
+            //
+            // It is worth being exact about the damage, because an earlier version of this comment
+            // was not: the screen does **not** break. `GraphChart` clamps the stored window before
+            // anything reads it (`GraphZoomState.windowFor`), and a window covering the whole frame
+            // clamps to null, so the chart still draws everything and a sideways swipe still turns
+            // the page. What is wrong is that only that display-side clamp is keeping an unfinished
+            // gesture invisible, and the reducer's contract is that a finished gesture leaves
+            // nothing behind.
+            //
+            // Detaching the node is **not** one of those ways, though it looks like one: Compose
+            // calls `detachedListener` before `onDetach` (`Modifier.kt`), the listener drops the
+            // node from `HitPathTracker`, and that dispatches a synthetic cancel — which arrives
+            // as an ordinary event with no pointers pressed and leaves by the `break`. So a card
+            // that leaves the list mid-pinch is already handled; the cancellation path is the one
+            // no event announces.
             try {
             do {
                 event = awaitPointerEvent()
                 val pressed = event.changes.count { it.pressed }
-                if (pressed == 0) break
+                // Before the `break`, so the up that ends the touch is the one that gets recorded.
+                event.changes.firstOrNull()?.let { lastEventAt = it.uptimeMillis }
+                if (pressed > maxPointers) maxPointers = pressed
+                // Followed by id rather than by "whichever is pressed": the finger's own up carries
+                // the position it lifted from, and a flick whose only real movement is on the up
+                // would otherwise measure zero travel and pass for a tap.
+                event.changes.firstOrNull { it.id == down.id }?.let {
+                    val moved = (it.position - down.position).getDistance()
+                    if (moved > travel) travel = moved
+                }
+                if (pressed == 0) {
+                    // A system cancellation arrives here too, and it is not an up: Compose
+                    // synthesises `pressed = false` changes with `isInitiallyConsumed = true`
+                    // (`SuspendingPointerInputFilter.onCancelPointerInput`). Without this the touch
+                    // the system took away would be counted as a tap, and the next real tap would
+                    // pair with a finger the user never lifted.
+                    terminalConsumed = event.changes.any { it.isConsumed }
+                    break
+                }
 
                 if (pressed >= 2 && mode != Mode.PASS_THROUGH) {
                     if (mode != Mode.PINCH) {
@@ -180,7 +243,20 @@ internal fun rememberGraphZoomGestures(
                         Mode.PINCH -> mode = Mode.DISCARDED
                         Mode.DISCARDED, Mode.PASS_THROUGH -> Unit
                         Mode.UNDETERMINED ->
-                            if (current.isZoomed) {
+                            // Zoomed, and the finger has actually gone somewhere. The slop is what
+                            // makes the double tap reachable at all: iOS writes it as
+                            // `pan.require(toFail: doubleTap)` (`GestureOverlayView.swift:88`,
+                            // "줌된 상태에서 더블탭 reset이 1손가락 pan에 빨려가는 것 방지"), and a
+                            // UIKit tap recogniser fails on movement, so waiting for movement is
+                            // the same rule. Committing on the first frame instead would mean a
+                            // stationary finger on a zoomed chart began a pan — which clears
+                            // following — and the tap that was meant to reset the zoom never existed.
+                            // `>=`, matching Foundation exactly: `TouchSlopDetector` crosses at
+                            // `inDirection >= touchSlop` (`DragGestureDetector.kt`). With `>` the
+                            // frame that lands *on* the slop is one the pager crosses and we do
+                            // not — it consumes, we see it in Final, and the chart is locked out of
+                            // its own pan for the rest of the touch.
+                            if (current.isZoomed && travel >= viewConfiguration.touchSlop) {
                                 send(GraphGesture.PanBegan)
                                 panReference = event.pressedPosition() ?: return@awaitEachGesture
                                 mode = Mode.PAN
@@ -221,6 +297,41 @@ internal fun rememberGraphZoomGestures(
                 // the copied-from loop had `continue`s that made a `while` condition meaningful,
                 // and they are gone.
             } while (true)
+
+            // Only on the normal way out. Cancellation skips this — a touch the system took away is
+            // not a tap — and so do the two `return@awaitEachGesture` above, which are frames with
+            // no pressed pointer to have tapped with.
+            val tapped = mode == Mode.UNDETERMINED &&
+                !terminalConsumed &&
+                maxPointers == 1 &&
+                // Strictly the complement of the pan gate above, so no travel is both.
+                travel < viewConfiguration.touchSlop &&
+                lastEventAt - down.uptimeMillis < viewConfiguration.longPressTimeoutMillis &&
+                area.contains(down.position.x, down.position.y)
+            val previousUp = previousTapUpAt
+            val sinceLastTap = if (previousUp == null) null else down.uptimeMillis - previousUp
+            when {
+                // Anything that was not a tap breaks the chain, the way a drag between two taps
+                // stops UIKit counting them as a pair.
+                !tapped -> previousTapUpAt = null
+
+                sinceLastTap != null &&
+                    sinceLastTap >= viewConfiguration.doubleTapMinTimeMillis &&
+                    sinceLastTap <= viewConfiguration.doubleTapTimeoutMillis &&
+                    (down.position - previousTapAt).getDistance() <= doubleTapSlop -> {
+                    send(GraphGesture.DoubleTap(down.position.x))
+                    // A third tap starts a new pair rather than toggling again — `UITapGestureRecognizer`
+                    // with `numberOfTapsRequired = 2` behaves the same way.
+                    previousTapUpAt = null
+                }
+
+                else -> {
+                    // Measured from the up, matched against the next down: the interval UIKit and
+                    // Compose both use (`awaitSecondDown` takes `firstUp.uptimeMillis`).
+                    previousTapUpAt = lastEventAt
+                    previousTapAt = down.position
+                }
+            }
             } finally {
                 if (pinchStarted) send(GraphGesture.PinchEnded)
                 else if (mode == Mode.PAN) send(GraphGesture.PanEnded)

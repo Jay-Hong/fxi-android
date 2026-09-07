@@ -104,4 +104,69 @@ class GraphPlotGeometryTest {
         assertEquals(area.right - area.left, area.width, 0f)
         assertEquals(area.bottom - area.top, area.height, 0f)
     }
+
+    /**
+     * The gutters are not part of the plot, and a tap that lands on them is a tap on the labels.
+     *
+     * iOS lays its gesture overlay over the plot alone, so a finger on the axis is a finger on
+     * nothing; the double tap here has to reach the same conclusion from a rectangle. All four
+     * edges are checked because `contains` is four comparisons and any one of them can be the
+     * wrong way round without the other three noticing.
+     */
+    @Test
+    fun theGuttersAreOutsideThePlot() {
+        val area = GraphPlotGeometry.area(1000f, 600f, hasIndex = true, density = density)
+
+        assertTrue(area.contains(area.left + 1f, area.top + 1f))
+        assertTrue(area.contains(area.right - 1f, area.bottom - 1f))
+        // The index gutter on the left, the value gutter on the right, the top inset, the time
+        // labels underneath.
+        assertTrue(!area.contains(area.left - 1f, area.top + 1f))
+        assertTrue(!area.contains(area.right + 1f, area.top + 1f))
+        assertTrue(!area.contains(area.left + 1f, area.top - 1f))
+        assertTrue(!area.contains(area.left + 1f, area.bottom + 1f))
+    }
+
+    /** The edges belong to the plot: a finger exactly on the boundary drew on the last pixel. */
+    @Test
+    fun theEdgesOfThePlotAreInsideIt() {
+        val area = GraphPlotGeometry.area(1000f, 600f, hasIndex = false, density = density)
+        assertTrue(area.contains(area.left, area.top))
+        assertTrue(area.contains(area.right, area.bottom))
+    }
+
+    /**
+     * Exactly zero extent is the case the range check alone gets wrong.
+     *
+     * Inverted bounds fall out for free — `left..right` is empty — but at exactly its own margins
+     * the plot has `left == right`, and that is a singleton range containing a point. The Canvas
+     * draws nothing there, so a double tap must find nothing there either. Without the `isEmpty`
+     * guard this passes for the negative case and fails only here.
+     */
+    @Test
+    fun aPlotOfZeroExtentContainsNothingEither() {
+        // 36dp + 44dp of gutters at ×3 is 240px, so 240px of width leaves left == right == 108.
+        val flat = GraphPlotGeometry.area(240f, 600f, hasIndex = true, density = density)
+        assertEquals(flat.left, flat.right, 1e-3f)
+        assertTrue(flat.isEmpty)
+        assertTrue(!flat.contains(flat.left, (flat.top + flat.bottom) / 2f))
+    }
+
+    /**
+     * A chart with no plot takes no taps.
+     *
+     * `left..right` is an empty range once the two are inverted, so this falls out of Kotlin rather
+     * than out of a guard — which is exactly why it is worth pinning. Written the other way round
+     * (`x >= left && x <= right` against an inverted pair) it would answer true for nothing, and
+     * with `min`/`max` "helpfully" applied it would answer true for the whole gutter.
+     */
+    @Test
+    fun aChartWithNoPlotContainsNothing() {
+        val none = GraphPlotGeometry.area(200f, 600f, hasIndex = true, density = density)
+        assertTrue(none.isEmpty)
+        assertTrue(!none.contains(none.left, none.top))
+        assertTrue(!none.contains(100f, 300f))
+        assertTrue(!none.contains(0f, 0f))
+    }
+
 }

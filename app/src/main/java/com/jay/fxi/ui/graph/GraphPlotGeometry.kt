@@ -15,6 +15,20 @@ data class GraphPlotArea(val left: Float, val top: Float, val right: Float, val 
     val width: Float get() = right - left
     val height: Float get() = bottom - top
     val isEmpty: Boolean get() = width <= 0f || height <= 0f
+
+    /**
+     * Whether a finger landed on the lines rather than on a gutter.
+     *
+     * A tap in the value gutter is a tap on the axis labels, and iOS ignores it: the overlay that
+     * carries the recognisers is laid over the plot alone.
+     *
+     * The [isEmpty] guard is not redundant. Inverted bounds fall out for free — `left..right` is an
+     * empty range — but a chart laid out at *exactly* its own margins has `left == right`, and that
+     * is a singleton range that contains a point. Nothing is drawn on that line, so nothing should
+     * be tappable on it either.
+     */
+    fun contains(x: Float, y: Float): Boolean =
+        !isEmpty && x in left..right && y in top..bottom
 }
 
 object GraphPlotGeometry {

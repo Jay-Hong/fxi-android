@@ -462,9 +462,19 @@ private fun FreeGraphFullscreen(
         // (`GraphV2Section.swift:1692`, `:1708`), and zoom is no reason to withhold it. On 1일 iOS
         // routes the tap through a UIKit recognizer declared `require(toFail: doubleTap)`
         // (`GestureOverlayView.swift:99`), so the tap that starts a zoom never reaches dismissal.
-        // Whoever adds the double tap here must put both in ONE `detectTapGestures` — its `onTap`
-        // waits out the double-tap window when `onDoubleTap` is set, which is the same guarantee.
-        // A second, independent detector would give away the first half of every zoom.
+        // Nothing to arbitrate yet: this call passes no `onZoom`, so the chart attaches no gesture
+        // handler, and the double tap lives only on the inline card — which has no tap of its own,
+        // because fullscreen opens from the button above it. Slice 8 brings zoom in here and the
+        // conflict with it, and the shape of the answer is worth writing down now.
+        //
+        // These two are not parent and child: this modifier is handed down to `GraphChart`, which
+        // builds `modifier.then(gestures)`, so `clickable` and the zoom loop are two nodes in **one
+        // chain on the Canvas** — the outer one behaves like a parent, taking Main last. Deferring
+        // is not available to the inner one: it cannot delay delivery to the outer node, and a
+        // change it consumes cannot be un-consumed later. So slice 8 resolves it by **dropping this
+        // `clickable`** and letting the one loop report the dismissal itself, once the double-tap
+        // window has passed without a second tap. That loop already tells taps from pairs; iOS
+        // spells the same arrangement `singleTap.require(toFail: doubleTap)`.
         val interaction = remember { MutableInteractionSource() }
         GraphSurface(
             state,
