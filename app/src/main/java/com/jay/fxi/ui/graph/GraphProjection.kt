@@ -14,6 +14,15 @@ data class GraphPlot(
     val data: TimeFrame,
     /** What the x scale maps onto — padded, or the zoom window when there is one. */
     val display: TimeFrame,
+    /**
+     * The padded frame, kept even while zoomed.
+     *
+     * [display] stops being it the moment a zoom window exists, and the gestures need it anyway:
+     * it is what "zoomed all the way out" is measured against. Carried here rather than recomputed
+     * by the gesture code, so the two cannot answer differently — the same reason the plot
+     * rectangle has one owner.
+     */
+    val rendered: TimeFrame,
     /** The value axis the lines are drawn against. Null when nothing is visible. */
     val valueRange: ClosedFloatingPointRange<Double>?,
     /**
@@ -61,10 +70,11 @@ object GraphProjection {
         rightEdgeNow: Instant? = null
     ): GraphPlot? {
         val data = GraphFrame.resolve(prepared, rightEdgeNow) ?: return null
+        val rendered = GraphFrame.rendered(data, prepared.period)
         val display = visibleDomain
             ?.takeIf { it.start < it.endInclusive }
             ?.let { TimeFrame(it.start, it.endInclusive) }
-            ?: GraphFrame.rendered(data, prepared.period)
+            ?: rendered
 
         val visible = prepared.order.mapNotNull { prepared.bySeries[it] }.filter { it.seriesId in visibleIds }
         val rates = visible.filter { it.axisGroup != INDEX_AXIS }
@@ -103,6 +113,7 @@ object GraphProjection {
         return GraphPlot(
             data = data,
             display = display,
+            rendered = rendered,
             valueRange = valueRange,
             indexRange = ownIndexRange,
             // The raw union, deliberately not `composeAxisRange` — that always adds the axis

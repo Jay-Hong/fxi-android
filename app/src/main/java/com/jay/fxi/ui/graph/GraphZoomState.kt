@@ -1,5 +1,8 @@
 package com.jay.fxi.ui.graph
 
+import androidx.compose.runtime.saveable.Saver
+import com.jay.fxi.domain.model.GraphPeriod
+import androidx.compose.runtime.saveable.listSaver
 import kotlin.time.Duration
 import kotlinx.datetime.Instant
 
@@ -68,6 +71,59 @@ data class GraphZoomState(
         visible?.let { GraphZoomMath.resolvedDomain(it, latestAnchor, isFollowing) }
 }
 
+/**
+ * Enough of the zoom to put it back: the window's two instants and whether it was following.
+ *
+ * The gesture baselines are deliberately absent — a saved state is by definition one no finger is
+ * on. Epoch milliseconds rather than the objects themselves because `ClosedRange<Instant>` has no
+ * saver of its own and only primitives survive the trip.
+ */
+val GraphZoomStateSaver: Saver<GraphZoomState, Any> = listSaver<GraphZoomState, Any>(
+    save = { state ->
+        val window = state.visible
+        if (window == null) emptyList()
+        else listOf(
+            window.start.toEpochMilliseconds(),
+            window.endInclusive.toEpochMilliseconds(),
+            state.isFollowing
+        )
+    },
+    restore = { saved ->
+        if (saved.size < 3) GraphZoomState()
+        else GraphZoomState(
+            visible = Instant.fromEpochMilliseconds(saved[0] as Long)..
+                Instant.fromEpochMilliseconds(saved[1] as Long),
+            isFollowing = saved[2] as Boolean
+        )
+    }
+)
+
+/**
+ * The window to draw for one frame, or null for the whole chart.
+ *
+ * Pure because the interesting case cannot be reached through a gesture: a window restored from
+ * yesterday is dragged back into range by the reducer's own clamp the moment a finger touches it,
+ * so an on-device test of that path passes whether this exists or not — measured, not assumed. What
+ * it guards is the *untouched* chart, and that is a drawing property no pointer test can see.
+ *
+ * Two things happen here. Zoom belongs to 1일 alone, so any other period draws the whole frame
+ * (iOS guards the same way at `effectiveXDomain`). And the window is clamped against the frame that
+ * exists **now**: it survives process death but the day it framed does not, and a window left
+ * entirely outside today would otherwise draw gridlines with no lines in them — `plot.isEmpty` is
+ * false, because the lines come from the data frame, so not even the empty message appears.
+ */
+fun GraphZoomState.windowFor(frame: TimeFrame?, period: GraphPeriod): ClosedRange<Instant>? {
+    if (period != GraphPeriod.ONE_DAY || frame == null) return null
+    val requested = resolved(frame.end) ?: return null
+    val rendered = GraphFrame.rendered(frame, period)
+    return GraphZoomMath.clampVisibleDomain(
+        proposed = requested,
+        fullDomain = rendered.start..rendered.end,
+        latestAnchor = frame.end,
+        minLength = GraphZoomMath.minVisibleLength(period)
+    )
+}
+
 object GraphZoomReducer {
 
     /**
@@ -84,6 +140,10 @@ object GraphZoomReducer {
                     visible = baseline,
                     isFollowing = false,
                     pinchBaseline = baseline,
+                    // A second finger supersedes whatever one finger was doing. Left set, the pan's
+                    // baseline outlives the gesture that made it — `PinchEnded` clears only pinch
+                    // fields — and a finished gesture should leave nothing behind.
+                    panBaseline = null,
                     pinchAnchor = GraphZoomMath.locationToInstant(
                         gesture.locationX, context.plotLeft, context.plotWidth, baseline
                     )

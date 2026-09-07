@@ -24,28 +24,37 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.sp
+import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSource
 import com.jay.fxi.ui.theme.SecondaryText
-import kotlinx.datetime.Instant
 
 /**
  * One framed chart for every visible series.
  *
- * It holds no state. Everything that could be decided wrongly — which window, which axis, what is
- * folded onto what — was decided by [GraphProjection], which is testable on the JVM; this only
- * turns that into pixels. `visibleDomain` is the zoom window and is null until the zoom slice
- * lands, at which point this composable does not change.
+ * It holds no state of its own. Everything that could be decided wrongly — which window, which
+ * axis, what is folded onto what — was decided by [GraphProjection], which is testable on the JVM;
+ * this only turns that into pixels.
+ *
+ * The zoom is passed in and handed back ([zoom]/[onZoom]) rather than kept here, so that it can
+ * outlive this composable — the free screen replaces its content to go fullscreen, and a zoom that
+ * lived in the chart would be thrown away on the way there and back. Gestures are attached only
+ * when [onZoom] is given, and only on 1일.
  */
 @Composable
 fun GraphChart(
     prepared: PreparedGraph,
     visibleIds: Set<String>,
     modifier: Modifier = Modifier,
-    visibleDomain: ClosedRange<Instant>? = null,
+    zoom: GraphZoomState = GraphZoomState(),
+    onZoom: ((GraphZoomState) -> Unit)? = null,
     emptyMessage: String = "표시할 그래프 데이터가 없습니다."
 ) {
-    val plot = remember(prepared, visibleIds, visibleDomain) {
-        GraphProjection.plot(prepared, visibleIds, visibleDomain)
+    // The right edge the zoom follows, resolved the same way the projection resolves it — the
+    // unpadded end of the data window, not the padded frame the x scale maps onto.
+    val frame = remember(prepared) { GraphFrame.resolve(prepared) }
+    val window = remember(zoom, frame, prepared.period) { zoom.windowFor(frame, prepared.period) }
+    val plot = remember(prepared, visibleIds, window) {
+        GraphProjection.plot(prepared, visibleIds, window)
     }
     if (plot == null || plot.isEmpty) {
         Box(modifier, contentAlignment = Alignment.Center) {
@@ -64,8 +73,25 @@ fun GraphChart(
         )
     }
     val density = LocalDensity.current
+    // The gestures start from the window that is **on screen**, not the one that was stored. If the
+    // clamp above moved or dropped a restored window, handing the raw one to the reducer would make
+    // the first touch jump back to it — the drag would look dead and a pinch would anchor somewhere
+    // the user is not looking. Worse, a window the clamp dropped entirely would still read as
+    // `isZoomed`, so a one-finger drag would be eaten as a pan while the chart shows the whole day.
+    // Nothing needs writing back: the first gesture emits a fresh state and the stored one catches
+    // up.
+    val effectiveZoom = remember(zoom, window) {
+        if (window == null) GraphZoomState() else zoom.copy(visible = window)
+    }
+    val gestures = rememberGraphZoomGestures(
+        enabled = onZoom != null,
+        period = prepared.period,
+        plot = plot,
+        zoom = effectiveZoom,
+        onZoom = onZoom ?: {}
+    )
 
-    Canvas(modifier.semantics { contentDescription = plot.describe() }) {
+    Canvas(modifier.then(gestures).semantics { contentDescription = plot.describe() }) {
         // Shared with the gestures rather than computed here: see `GraphPlotGeometry`.
         val plotted = GraphPlotGeometry.area(
             widthPx = size.width,

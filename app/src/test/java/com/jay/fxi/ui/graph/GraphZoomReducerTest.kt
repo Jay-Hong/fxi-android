@@ -383,6 +383,184 @@ class GraphZoomReducerTest {
         assertEquals(following.visible!!.length, touched.pinchBaseline!!.length)
     }
 
+    /**
+     * A second finger supersedes the drag, and leaves nothing of it behind.
+     *
+     * `PinchEnded` clears only the pinch's own fields, so a pan whose baseline was still set when
+     * the pinch began would outlive the gesture that made it. Nothing reads it afterwards today —
+     * the next `PanBegan` overwrites it — but a finished gesture should leave no state at all, and
+     * "nothing reads it *today*" is the kind of thing that stops being true.
+     */
+    @Test
+    fun aPinchThatInterruptsAPanLeavesNoTraceOfEither() {
+        val zoomed = unzoomed().then(
+            GraphGesture.PinchBegan(500f), GraphGesture.PinchChanged(4f), GraphGesture.PinchEnded
+        )
+        val panning = zoomed.then(GraphGesture.PanBegan, GraphGesture.PanChanged(80f))
+        assertNotNull("this test needs a pan in flight", panning.panBaseline)
+
+        val interrupted = panning.then(GraphGesture.PinchBegan(400f))
+        assertNull("the pan's baseline survived the second finger", interrupted.panBaseline)
+
+        val finished = interrupted.then(GraphGesture.PinchChanged(2f), GraphGesture.PinchEnded)
+        assertNull(finished.pinchBaseline)
+        assertNull(finished.panBaseline)
+    }
+
+    // --- the window that gets drawn ----------------------------------------------------------
+
+    private val dayFrame = TimeFrame(midnight, dataEnd)
+
+    /**
+     * A window saved yesterday is pulled back onto today's chart before anything is drawn.
+     *
+     * Tested here rather than on the device on purpose: a gesture launders the window through the
+     * reducer's own clamp, so an on-device test of this passes with or without it — that mutant was
+     * run and survived. What breaks without this is the *untouched* chart, which draws gridlines
+     * and no lines at all, and does not even show the empty message because the lines come from the
+     * data frame rather than the window.
+     */
+    @Test
+    fun aWindowFromAnotherDayIsPulledOntoThisOne() {
+        val yesterday = GraphZoomState(
+            visible = (midnight - 30.hours)..(midnight - 24.hours),
+            isFollowing = false
+        )
+        val drawn = yesterday.windowFor(dayFrame, GraphPeriod.ONE_DAY)
+        assertNotNull("a six-hour window should survive, moved", drawn)
+        assertEquals("it should sit on the frame's leading edge", 6.hours, drawn!!.length)
+        assertTrue("still outside the frame", drawn.endInclusive > dayFrame.start)
+        assertTrue("pushed past the data", drawn.endInclusive <= dayFrame.end)
+    }
+
+    @Test
+    fun aWindowInsideTheFrameIsLeftAlone() {
+        val inside = GraphZoomState(
+            visible = (midnight + 3.hours)..(midnight + 9.hours),
+            isFollowing = false
+        )
+        assertEquals(inside.visible, inside.windowFor(dayFrame, GraphPeriod.ONE_DAY))
+    }
+
+    /**
+     * "Zoomed all the way out" is measured against the **padded** frame, not the data.
+     *
+     * A window covering exactly the day's data is 24h inside a 24h20m frame — 98.6%, so it is still
+     * a window. Measured against the unpadded data instead it would be 100% and collapse to "show
+     * everything", and the user's zoom would vanish the moment it reached the edges of the data.
+     */
+    @Test
+    fun theFullViewTestUsesThePaddedFrame() {
+        val wholeDay = GraphZoomState(visible = dayFrame.start..dayFrame.end, isFollowing = false)
+        val drawn = wholeDay.windowFor(dayFrame, GraphPeriod.ONE_DAY)
+        assertNotNull("a window covering the data collapsed to the whole chart", drawn)
+        assertEquals(24.hours, drawn!!.length)
+    }
+
+    /**
+     * …and the right-hand stop is the **data**, not the padding.
+     *
+     * Stopping at the padded edge would leave every window that reached the end sitting ten minutes
+     * past the newest point — never within a bucket of it — so following could never resume, which
+     * is the one way anyone gets back to a live chart.
+     */
+    @Test
+    fun theRightHandStopIsTheDataNotThePadding() {
+        val pastTheEnd = GraphZoomState(
+            visible = (dataEnd - 2.hours)..(dataEnd + 2.hours),
+            isFollowing = false
+        )
+        val drawn = pastTheEnd.windowFor(dayFrame, GraphPeriod.ONE_DAY)!!
+        assertEquals("the window ran past the last observation", dayFrame.end, drawn.endInclusive)
+        assertTrue(
+            "and so it could never start following again",
+            GraphZoomMath.shouldFollow(drawn.endInclusive, dayFrame.end, 10.minutes)
+        )
+    }
+
+    /** Zoom belongs to 1일; every other period draws the whole frame however stale the state is. */
+    @Test
+    fun noOtherPeriodDrawsAZoomWindow() {
+        val zoomed = GraphZoomState(visible = (midnight + 3.hours)..(midnight + 9.hours))
+        GraphPeriod.entries.filter { it != GraphPeriod.ONE_DAY }.forEach {
+            assertNull("$it drew a zoom window", zoomed.windowFor(dayFrame, it))
+        }
+    }
+
+    @Test
+    fun anUnzoomedStateAndAnAbsentFrameBothDrawEverything() {
+        assertNull(GraphZoomState().windowFor(dayFrame, GraphPeriod.ONE_DAY))
+        val zoomed = GraphZoomState(visible = (midnight + 3.hours)..(midnight + 9.hours))
+        assertNull(zoomed.windowFor(null, GraphPeriod.ONE_DAY))
+    }
+
+    // --- what survives being put away ------------------------------------------------------
+
+    /**
+     * The saver exists because going fullscreen removes the pager, and with it the chart.
+     *
+     * It deliberately keeps only the window and the follow flag. A gesture's baselines are not
+     * saved — state is only ever put away between touches, and restoring a half-finished pinch
+     * would leave a baseline that no finger corresponds to.
+     */
+    @Test
+    fun aZoomedWindowComesBackFromBeingSaved() {
+        val zoomed = unzoomed().then(
+            GraphGesture.PinchBegan(500f), GraphGesture.PinchChanged(4f), GraphGesture.PinchEnded
+        )
+        val restored = saveAndRestore(zoomed)
+        assertEquals(zoomed.visible, restored.visible)
+        assertEquals(zoomed.isFollowing, restored.isFollowing)
+        assertNull(restored.pinchBaseline)
+        assertNull(restored.panBaseline)
+    }
+
+    /**
+     * An unzoomed chart saves as *nothing at all*, which is how it comes back unzoomed.
+     *
+     * `listSaver` turns an empty list into null (`ListSaver.kt:44`), and a null is the framework's
+     * way of saying there is nothing to restore — `rememberSaveable` then keeps its initial value.
+     * Worth pinning: a saver that returned a three-element "empty" marker instead would work too,
+     * and someone tidying this up could switch to one without noticing the contract changed.
+     */
+    @Test
+    fun anUnzoomedChartSavesNothingAtAll() {
+        assertNull(save(GraphZoomState()))
+    }
+
+    /** A state put away mid-gesture keeps its window and drops the half-finished gesture. */
+    @Test
+    fun aStatePutAwayMidGestureComesBackWithoutTheGesture() {
+        val midGesture = unzoomed().then(GraphGesture.PinchBegan(500f), GraphGesture.PinchChanged(4f))
+        assertNotNull(midGesture.pinchBaseline)
+        val restored = saveAndRestore(midGesture)
+        assertEquals(midGesture.visible, restored.visible)
+        assertNull(restored.pinchBaseline)
+        assertNull(restored.pinchAnchor)
+    }
+
+    @Test
+    fun theFollowFlagSurvivesInBothPositions() {
+        val following = unzoomed().then(
+            GraphGesture.PinchBegan(1000f), GraphGesture.PinchChanged(8f), GraphGesture.PinchEnded
+        )
+        assertTrue(following.isFollowing)
+        assertTrue(saveAndRestore(following).isFollowing)
+
+        val parked = following.copy(isFollowing = false)
+        assertTrue(!saveAndRestore(parked).isFollowing)
+    }
+
+    private fun save(state: GraphZoomState): Any? {
+        val scope = object : androidx.compose.runtime.saveable.SaverScope {
+            override fun canBeSaved(value: Any) = true
+        }
+        return with(GraphZoomStateSaver) { scope.save(state) }
+    }
+
+    private fun saveAndRestore(state: GraphZoomState): GraphZoomState =
+        GraphZoomStateSaver.restore(save(state)!!)!!
+
     @Test
     fun anUnzoomedChartResolvesToNothingSoTheWholeFrameIsDrawn() {
         assertNull(unzoomed().resolved(dataEnd))

@@ -164,6 +164,12 @@ class GraphProjectionTest {
         assertEquals(full.data, zoomed.data)
         assertEquals(day0 + 20.days, zoomed.display.start)
         assertEquals(day0 + 30.days, zoomed.display.end)
+        // `display` stops being the padded frame the moment a window exists, but the gestures still
+        // need it — it is what "zoomed all the way out" is measured against. Carried, not recomputed.
+        assertEquals(full.display, zoomed.rendered)
+        assertEquals(full.rendered, zoomed.rendered)
+        assertTrue("padding must sit outside the data on both sides",
+            zoomed.rendered.start < zoomed.data.start && zoomed.rendered.end > zoomed.data.end)
         assertTrue("the full view drew no gridlines to compare against", full.xTicks.isNotEmpty())
         assertTrue(
             "full=${full.xTicks.size} zoomed=${zoomed.xTicks.size}",

@@ -57,6 +57,8 @@ import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.ui.components.PeriodTabBar
 import com.jay.fxi.ui.graph.GraphChart
 import com.jay.fxi.ui.graph.GraphSeriesStyles
+import com.jay.fxi.ui.graph.GraphZoomState
+import com.jay.fxi.ui.graph.GraphZoomStateSaver
 import com.jay.fxi.ui.theme.Background
 import com.jay.fxi.ui.theme.Primary
 import com.jay.fxi.ui.theme.PrimaryText
@@ -243,6 +245,24 @@ private fun FreeSnapshotTabContent(
 ) {
     val visible = state.availability == FreeSnapshotAvailability.FRESH ||
         state.availability == FreeSnapshotAvailability.DELAYED
+
+    // Held per page, inside the holder slice 5 put around each one: that makes the zoom this tab's
+    // own, and carries it across the fullscreen trip that removes the pager. iOS gets the same two
+    // properties from `.fullScreenCover` leaving the inline chart alive underneath.
+    var zoom by rememberSaveable(stateSaver = GraphZoomStateSaver) {
+        mutableStateOf(GraphZoomState())
+    }
+    // Changing period drops the window, as `resetZoom` does on iOS — but only on an actual change.
+    // Keyed on entering composition it would also fire on the way back from fullscreen and undo
+    // the very thing the holder just restored.
+    var zoomedPeriod by rememberSaveable { mutableStateOf(state.period.name) }
+    LaunchedEffect(state.period) {
+        if (zoomedPeriod != state.period.name) {
+            zoom = GraphZoomState()
+            zoomedPeriod = state.period.name
+        }
+    }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
         contentPadding = WindowInsets.navigationBars.asPaddingValues(),
@@ -281,7 +301,12 @@ private fun FreeSnapshotTabContent(
                         ) {
                             TextButton(onClick = onExpand) { Text("전체화면") }
                         }
-                        GraphSurface(state, Modifier.fillMaxWidth().height(220.dp).padding(12.dp))
+                        GraphSurface(
+                            state,
+                            Modifier.fillMaxWidth().height(220.dp).padding(12.dp),
+                            zoom = zoom,
+                            onZoom = { zoom = it }
+                        )
                     }
                 }
             }
@@ -345,7 +370,12 @@ private val FreeSnapshotAvailability.missingChartNotice: String?
  * from "this period has no data".
  */
 @Composable
-private fun GraphSurface(state: FreeSnapshotUiState, modifier: Modifier = Modifier) {
+private fun GraphSurface(
+    state: FreeSnapshotUiState,
+    modifier: Modifier = Modifier,
+    zoom: GraphZoomState = GraphZoomState(),
+    onZoom: ((GraphZoomState) -> Unit)? = null
+) {
     val graph = state.graph
     if (graph == null) {
         // Empty space here reads as a chart that broke rather than one that is not there yet.
@@ -358,6 +388,8 @@ private fun GraphSurface(state: FreeSnapshotUiState, modifier: Modifier = Modifi
         prepared = graph,
         visibleIds = state.visibleSeriesIds,
         modifier = modifier,
+        zoom = zoom,
+        onZoom = onZoom,
         emptyMessage = if (state.seriesToggles.isNotEmpty() && state.seriesToggles.none { it.visible }) {
             "표시할 항목을 선택해 주세요."
         } else {
