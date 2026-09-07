@@ -1,27 +1,32 @@
 package com.jay.fxi.ui.free
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.FilterChip
@@ -31,25 +36,30 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.SaveableStateHolder
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphPeriod
+import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.ui.graph.GraphChart
 import com.jay.fxi.ui.graph.GraphSeriesStyles
 import com.jay.fxi.ui.theme.Background
 import com.jay.fxi.ui.theme.Primary
 import com.jay.fxi.ui.theme.PrimaryText
 import com.jay.fxi.ui.theme.SecondaryText
-import com.jay.fxi.domain.model.UserInfo
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 
@@ -78,7 +88,41 @@ fun FreeSnapshotScreen(
     // `LocalContentColor` also defaults to black outside a `Surface`, so every `Text` that does not
     // name a colour — the heading, the basis time, the bank rows, the empty and expired notices —
     // was black. On the white background that was merely wrong; on the dark one it is invisible.
+    // Fullscreen is a branch, not a Dialog: it belongs to this surface's state and to the same
+    // view model, so the period chosen inside it is still chosen when it closes. Saved, so a
+    // rotation does not drop the user back out of it.
+    var fullscreen by rememberSaveable { mutableStateOf(false) }
+
+    // The flag belongs to the tab it was opened from, and only a tab with a graph can open it. If a
+    // restore ever lands on 뉴스 while it is set, drop it — otherwise the next data tab the user
+    // opens would arrive already in fullscreen, which they never asked for.
+    val selectedTab = state.selectedTab
+    LaunchedEffect(selectedTab) { if (selectedTab != null && !selectedTab.isData) fullscreen = false }
+
+    // iOS presents fullscreen *over* the free screen (`.fullScreenCover`), so the list underneath is
+    // still there when it closes. Replacing the content instead keeps the pager and its chart from
+    // drawing behind an opaque cover — but on its own it throws away where the user had scrolled to,
+    // and the 전체화면 button is far enough down the list to be worth coming back to.
+    //
+    // Held here, above the branch, and handed to each page rather than wrapped around the whole
+    // pager: a lazy layout keeps its items' state in a holder that **prunes every item that is not
+    // currently composed** whenever it is asked to save (`LazySaveableStateHolder.performSave`,
+    // foundation 1.7.2, and its KDoc says so outright). Wrapping the pager would therefore restore
+    // the page you left from and silently drop the other four — the news list you had scrolled
+    // included. Providing per page puts that state in this holder instead, where nothing prunes it.
+    val pageState = rememberSaveableStateHolder()
+
     Surface(color = Background, contentColor = PrimaryText, modifier = modifier.fillMaxSize()) {
+    if (fullscreen && selectedTab?.isData == true) {
+        FreeGraphFullscreen(
+            tab = selectedTab,
+            state = state,
+            onSelectPeriod = onSelectPeriod,
+            onToggleSeries = onToggleSeries,
+            onClose = { fullscreen = false }
+        )
+        return@Surface
+    }
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.statusBars)) {
         Row(
             Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 12.dp),
@@ -97,8 +141,9 @@ fun FreeSnapshotScreen(
         // still unknown, it anchors on 달러 and then *reports that back* as its settled page —
         // overwriting the stored tab with one the user never chose. Waiting is what makes that
         // impossible, rather than a guard that has to stay ahead of the coroutine that races it.
-        val selected = state.selectedTab ?: return@Column
-        FreeSnapshotTabs(selected, state, onSelectTab, onSelectPeriod, onToggleSeries, onSubscribe)
+        val selected = selectedTab ?: return@Column
+        FreeSnapshotTabs(selected, state, pageState, onSelectTab, onSelectPeriod, onToggleSeries,
+            onExpand = { fullscreen = true }, onSubscribe = onSubscribe)
     }
     }
 }
@@ -107,9 +152,11 @@ fun FreeSnapshotScreen(
 private fun ColumnScope.FreeSnapshotTabs(
     selected: FreeTab,
     state: FreeSnapshotUiState,
+    pageState: SaveableStateHolder,
     onSelectTab: (FreeTab) -> Unit,
     onSelectPeriod: (GraphPeriod) -> Unit,
     onToggleSeries: (String) -> Unit,
+    onExpand: () -> Unit,
     onSubscribe: () -> Unit
 ) {
     val tabs = FreeTab.entries
@@ -165,6 +212,7 @@ private fun ColumnScope.FreeSnapshotTabs(
         modifier = Modifier.fillMaxSize().weight(1f),
         key = { tabs[it].name }
     ) { page ->
+        pageState.SaveableStateProvider(tabs[page].name) {
         when (val tab = tabs[page]) {
             FreeTab.NEWS -> FreeNewsTab(isVisible = pagerState.settledPage == page)
             // Every data tab reads the state for the *selected* one. An off-screen page holds no
@@ -174,8 +222,10 @@ private fun ColumnScope.FreeSnapshotTabs(
                 state = if (tab == selected) state else FreeSnapshotUiState(uid = state.uid),
                 onSelectPeriod = onSelectPeriod,
                 onToggleSeries = onToggleSeries,
+                onExpand = onExpand,
                 onSubscribe = onSubscribe
             )
+        }
         }
     }
 }
@@ -187,6 +237,7 @@ private fun FreeSnapshotTabContent(
     state: FreeSnapshotUiState,
     onSelectPeriod: (GraphPeriod) -> Unit,
     onToggleSeries: (String) -> Unit,
+    onExpand: () -> Unit,
     onSubscribe: () -> Unit
 ) {
     val visible = state.availability == FreeSnapshotAvailability.FRESH ||
@@ -201,75 +252,35 @@ private fun FreeSnapshotTabContent(
                 Text(tab.heading, style = MaterialTheme.typography.headlineSmall)
                 state.asOfLabel?.let { Text("기준시각 $it", style = MaterialTheme.typography.bodySmall) }
                 when (state.availability) {
-                    FreeSnapshotAvailability.AWAITING_SNAPSHOT -> Text("아직 표시할 스냅샷이 없습니다.")
                     FreeSnapshotAvailability.FRESH -> FreshnessBadge("정상", delayed = false)
                     FreeSnapshotAvailability.DELAYED -> {
                         FreshnessBadge("지연", delayed = true)
                         Text("업데이트가 지연되어 마지막 스냅샷을 표시합니다.")
                     }
-                    FreeSnapshotAvailability.UNAVAILABLE -> Text("스냅샷이 만료되어 데이터를 표시할 수 없습니다.")
+                    FreeSnapshotAvailability.AWAITING_SNAPSHOT,
+                    FreeSnapshotAvailability.UNAVAILABLE ->
+                        state.availability.missingChartNotice?.let { Text(it) }
                 }
             }
         }
         // Outside `visible`: the four periods stay reachable while the selected one is expired or
         // has not arrived. Hiding them would strand the user on the one period they cannot see.
-        item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                GraphPeriod.entries.forEach { period ->
-                    FilterChip(
-                        selected = period == state.period,
-                        onClick = { onSelectPeriod(period) },
-                        label = { Text(period.displayName) }
-                    )
-                }
-            }
-        }
+        item { PeriodBar(state.period, onSelectPeriod) }
         if (visible) {
             item { Text("환율 추이", style = MaterialTheme.typography.titleMedium) }
             if (state.seriesToggles.isNotEmpty()) {
-                item {
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        state.seriesToggles.forEach { series ->
-                            FilterChip(
-                                selected = series.visible,
-                                onClick = { onToggleSeries(series.seriesId) },
-                                label = { Text(series.label) },
-                                // The line's own colour. Without it several lines in one frame are
-                                // unattributable — the per-series cards used to carry the name, and
-                                // merging them into one chart took that away.
-                                leadingIcon = {
-                                    Box(
-                                        Modifier
-                                            .size(10.dp)
-                                            .background(
-                                                Color(GraphSeriesStyles.of(series.seriesId, series.label).colorHex),
-                                                CircleShape
-                                            )
-                                    )
-                                }
-                            )
-                        }
-                    }
-                }
+                item { SeriesToggles(state.seriesToggles, onToggleSeries) }
             }
             item {
-                state.graph?.let { graph ->
-                    Card(Modifier.fillMaxWidth()) {
-                        GraphChart(
-                            prepared = graph,
-                            visibleIds = state.visibleSeriesIds,
-                            modifier = Modifier.fillMaxWidth().height(220.dp).padding(12.dp),
-                            // All-off is a choice the plan permits, so it is stated rather than
-                            // repaired. Series switched on but carrying no points for this period
-                            // are a data gap, not an empty selection.
-                            emptyMessage = if (state.seriesToggles.isNotEmpty() &&
-                                state.seriesToggles.none { it.visible }
-                            ) {
-                                "표시할 항목을 선택해 주세요."
-                            } else {
-                                "표시할 그래프 데이터가 없습니다."
-                            }
-                        )
+                Card(Modifier.fillMaxWidth()) {
+                    Column {
+                        Row(
+                            Modifier.fillMaxWidth().padding(end = 4.dp, top = 4.dp),
+                            horizontalArrangement = Arrangement.End
+                        ) {
+                            TextButton(onClick = onExpand) { Text("전체화면") }
+                        }
+                        GraphSurface(state, Modifier.fillMaxWidth().height(220.dp).padding(12.dp))
                     }
                 }
             }
@@ -307,5 +318,140 @@ private fun FreshnessBadge(label: String, delayed: Boolean) {
         shape = MaterialTheme.shapes.small
     ) {
         Text(label, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
+    }
+}
+
+/**
+ * What the screen says in place of a chart it cannot draw.
+ *
+ * Inline this only ever reaches the header, because the chart card is not built at all unless the
+ * snapshot is FRESH or DELAYED. Fullscreen keeps its chrome across a period change, so it can be
+ * holding the frame when the answer turns out to be missing or expired — and there the same
+ * sentence goes where the chart was, from here, so the two cannot come to disagree.
+ */
+private val FreeSnapshotAvailability.missingChartNotice: String?
+    get() = when (this) {
+        FreeSnapshotAvailability.AWAITING_SNAPSHOT -> "아직 표시할 스냅샷이 없습니다."
+        FreeSnapshotAvailability.UNAVAILABLE -> "스냅샷이 만료되어 데이터를 표시할 수 없습니다."
+        FreeSnapshotAvailability.FRESH, FreeSnapshotAvailability.DELAYED -> null
+    }
+
+/**
+ * The graph, filling whatever it is given.
+ *
+ * Shared by the card and the fullscreen view so the two cannot drift: the empty-state wording in
+ * particular has to say the same thing in both, and it distinguishes "you switched everything off"
+ * from "this period has no data".
+ */
+@Composable
+private fun GraphSurface(state: FreeSnapshotUiState, modifier: Modifier = Modifier) {
+    val graph = state.graph
+    if (graph == null) {
+        // Empty space here reads as a chart that broke rather than one that is not there yet.
+        Box(modifier, contentAlignment = Alignment.Center) {
+            state.availability.missingChartNotice?.let { Text(it, textAlign = TextAlign.Center) }
+        }
+        return
+    }
+    GraphChart(
+        prepared = graph,
+        visibleIds = state.visibleSeriesIds,
+        modifier = modifier,
+        emptyMessage = if (state.seriesToggles.isNotEmpty() && state.seriesToggles.none { it.visible }) {
+            "표시할 항목을 선택해 주세요."
+        } else {
+            "표시할 그래프 데이터가 없습니다."
+        }
+    )
+}
+
+@Composable
+private fun PeriodBar(selected: GraphPeriod, onSelect: (GraphPeriod) -> Unit) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        GraphPeriod.entries.forEach { period ->
+            FilterChip(
+                selected = period == selected,
+                onClick = { onSelect(period) },
+                label = { Text(period.displayName) }
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SeriesToggles(toggles: List<FreeSeriesToggle>, onToggle: (String) -> Unit) {
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        toggles.forEach { series ->
+            FilterChip(
+                selected = series.visible,
+                onClick = { onToggle(series.seriesId) },
+                label = { Text(series.label) },
+                // The line's own colour. Without it several lines in one frame are unattributable
+                // — the per-series cards used to carry the name, and merging them took that away.
+                leadingIcon = {
+                    Box(
+                        Modifier
+                            .size(10.dp)
+                            .background(
+                                Color(GraphSeriesStyles.of(series.seriesId, series.label).colorHex),
+                                CircleShape
+                            )
+                    )
+                }
+            )
+        }
+    }
+}
+
+/**
+ * The graph with the chrome that changes it, and nothing else.
+ *
+ * The period bar and the toggles come along because changing either is the reason to be here; they
+ * are bound to the same view model, so a period picked in fullscreen is still picked on the way
+ * out. Everything else — tabs, rates, the subscribe button — is covered.
+ */
+@Composable
+private fun FreeGraphFullscreen(
+    tab: FreeTab,
+    state: FreeSnapshotUiState,
+    onSelectPeriod: (GraphPeriod) -> Unit,
+    onToggleSeries: (String) -> Unit,
+    onClose: () -> Unit
+) {
+    BackHandler(onBack = onClose)
+    Column(
+        Modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(tab.heading, style = MaterialTheme.typography.titleMedium)
+            TextButton(onClick = onClose) { Text("닫기") }
+        }
+        PeriodBar(state.period, onSelectPeriod)
+        if (state.seriesToggles.isNotEmpty()) SeriesToggles(state.seriesToggles, onToggleSeries)
+
+        // A tap anywhere leaves, on every period — iOS does the same
+        // (`GraphV2Section.swift:1692`, `:1708`), and zoom is no reason to withhold it. On 1일 iOS
+        // routes the tap through a UIKit recognizer declared `require(toFail: doubleTap)`
+        // (`GestureOverlayView.swift:99`), so the tap that starts a zoom never reaches dismissal.
+        // Whoever adds the double tap here must put both in ONE `detectTapGestures` — its `onTap`
+        // waits out the double-tap window when `onDoubleTap` is set, which is the same guarantee.
+        // A second, independent detector would give away the first half of every zoom.
+        val interaction = remember { MutableInteractionSource() }
+        GraphSurface(
+            state,
+            Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .clickable(interactionSource = interaction, indication = null, onClick = onClose)
+        )
     }
 }
