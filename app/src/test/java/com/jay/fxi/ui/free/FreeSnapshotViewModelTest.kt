@@ -19,6 +19,7 @@ import com.jay.fxi.domain.model.FreeSnapshot
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.SourceRate
+import com.jay.fxi.ui.graph.LinePoint
 import com.jay.fxi.domain.repository.FreeSnapshotFetching
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
@@ -129,6 +130,7 @@ class FreeSnapshotViewModelTest {
         testScheduler.runCurrent()
         assertEquals(FreeSnapshotAvailability.AWAITING_SNAPSHOT, vm.uiState.value.availability)
         assertTrue(vm.uiState.value.rateSections.isEmpty())
+        assertNull(vm.uiState.value.graph)
         reads.value = FreeSnapshotReadState("u1")
         testScheduler.runCurrent()
         assertEquals(FreeSnapshotAvailability.AWAITING_SNAPSHOT, vm.uiState.value.availability)
@@ -159,12 +161,12 @@ class FreeSnapshotViewModelTest {
         vm.bind("u1")
         val other = key.copy(period = GraphPeriod.ONE_WEEK)
         vm.selectPeriod(other.period)
-        assertTrue(vm.uiState.value.charts.isEmpty())
+        assertNull("the previous period's graph was reused", vm.uiState.value.graph)
         assertNull(vm.uiState.value.asOfLabel)
         reads.value = readState(snapshot = snapshot(other))
         testScheduler.runCurrent()
         assertEquals(other, vm.uiState.value.dataKey)
-        assertFalse(vm.uiState.value.charts.isEmpty())
+        assertEquals(listOf("investing.usd"), vm.uiState.value.drawnSeriesIds)
     }
 
     @Test
@@ -177,12 +179,12 @@ class FreeSnapshotViewModelTest {
         testScheduler.runCurrent()
         assertEquals(FreeSnapshotAvailability.DELAYED, vm.uiState.value.availability)
         assertEquals(fresh.rateSections, vm.uiState.value.rateSections)
-        assertEquals(fresh.charts, vm.uiState.value.charts)
+        assertEquals(fresh.graph, vm.uiState.value.graph)
         reads.value = readState(freshness = FreeSnapshotFreshness.UNAVAILABLE)
         testScheduler.runCurrent()
         assertEquals(FreeSnapshotAvailability.UNAVAILABLE, vm.uiState.value.availability)
         assertTrue(vm.uiState.value.rateSections.isEmpty())
-        assertTrue(vm.uiState.value.charts.isEmpty())
+        assertNull(vm.uiState.value.graph)
         assertEquals(fresh.asOfLabel, vm.uiState.value.asOfLabel)
     }
 
@@ -191,7 +193,7 @@ class FreeSnapshotViewModelTest {
         reads.value = readState(snapshot = snapshot().copy(rate = FreeRate.Flat("usd-krw", emptyList()), graph = FreeGraph(null, emptyList())))
         vm.bind("u1")
         assertEquals(FreeSnapshotAvailability.FRESH, vm.uiState.value.availability)
-        assertTrue(vm.uiState.value.charts.isEmpty())
+        assertTrue(vm.uiState.value.drawnSeriesIds.isEmpty())
         assertTrue(vm.uiState.value.rateSections.isEmpty())
     }
 
@@ -199,65 +201,20 @@ class FreeSnapshotViewModelTest {
     fun chartUsesSnapshotTimeAndValues_withoutSyntheticLiveTail() = withViewModel { vm, reads ->
         reads.value = readState()
         vm.bind("u1")
-        // The chart carries the snapshot's own instants and values — no tail is invented past the
-        // last one, and nothing is normalised away before anyone can ask what time it was.
-        val chart = vm.uiState.value.charts.single()
-        assertEquals(listOf(basis - 2.hours, basis), chart.points.map { it.timestamp })
-        assertEquals(listOf(1390.0, 1400.0), chart.points.map { it.rate })
-        assertEquals(basis - 2.hours, chart.domain.start)
-        assertEquals(basis, chart.domain.end)
-        assertEquals(
-            listOf(FreeSnapshotChartPoint(0f, 1f), FreeSnapshotChartPoint(1f, 0f)),
-            FreeChartGeometry.normalize(chart.points, chart.domain)
-        )
+        // Nothing is invented *past* the last reading — 1일 never holds out to the right edge.
+        val points = vm.uiState.value.pointsOf("investing.usd")
+        assertEquals("a tail was invented past the last reading", basis, points.last().ts)
+        assertEquals(1400.0, points.last().rate, 0.0)
+        assertEquals(basis - 2.hours, points.first().ts)
+        // Between them there *is* a hold: the 1일 bucket is ten minutes, so two readings two hours
+        // apart are a gap, and a gap is held flat and then stepped rather than drawn through.
+        assertEquals(listOf(1390.0, 1390.0, 1400.0), points.map { it.rate })
+        assertEquals(basis - 10.minutes, points[1].ts)
 
         val single = snapshot().let { it.copy(graph = FreeGraph(null, listOf(it.graph.series.single().copy(points = it.graph.series.single().points.take(1))))) }
         reads.value = readState(snapshot = single)
         testScheduler.runCurrent()
-        val one = vm.uiState.value.charts.single()
-        assertEquals(listOf(basis - 2.hours), one.points.map { it.timestamp })
-        assertEquals(
-            listOf(FreeSnapshotChartPoint(0.5f, 0.5f)),
-            FreeChartGeometry.normalize(one.points, one.domain)
-        )
-    }
-
-    /**
-     * Two series on one axis are drawn in one frame — and each still describes itself.
-     *
-     * Reading the caption off the shared frame reported numbers the series never reached: a line
-     * that moved between 1400 and 1401 was captioned, and read aloud by the screen reader, as
-     * 1390–1410. The frame is for drawing; the caption is a claim about this series.
-     */
-    @Test
-    fun aSeriesCaptionReportsItsOwnRange_notTheSharedAxis() = withViewModel { vm, reads ->
-        val flat = FreeGraphSeries(
-            seriesId = "hana.usd", label = "하나", axisGroup = "krw",
-            points = listOf(
-                FreeGraphPoint(basis - 2.hours, 1400.0, null, null),
-                FreeGraphPoint(basis, 1401.0, null, null)
-            )
-        )
-        val swingy = FreeGraphSeries(
-            seriesId = "investing.usd", label = "인베스팅", axisGroup = "krw",
-            points = listOf(
-                FreeGraphPoint(basis - 2.hours, 1390.0, null, null),
-                FreeGraphPoint(basis, 1410.0, null, null)
-            )
-        )
-        reads.value = readState(snapshot = snapshot().copy(graph = FreeGraph(null, listOf(swingy, flat))))
-        vm.bind("u1")
-
-        val charts = vm.uiState.value.charts.associateBy { it.seriesId }
-        assertEquals(setOf("investing.usd", "hana.usd"), charts.keys)
-        // One frame, so the two lines are comparable…
-        assertEquals(charts.getValue("hana.usd").domain, charts.getValue("investing.usd").domain)
-        assertEquals(1390.0, charts.getValue("hana.usd").domain.low, 0.0)
-        // …and each caption is still about its own series.
-        assertEquals("1400.00", charts.getValue("hana.usd").low)
-        assertEquals("1401.00", charts.getValue("hana.usd").high)
-        assertEquals("1390.00", charts.getValue("investing.usd").low)
-        assertEquals("1410.00", charts.getValue("investing.usd").high)
+        assertEquals(listOf(basis - 2.hours), vm.uiState.value.pointsOf("investing.usd").map { it.ts })
     }
 
     @Test
@@ -292,7 +249,7 @@ class FreeSnapshotViewModelTest {
             testScheduler.advanceTimeBy(22.hours.inWholeMilliseconds)
             testScheduler.runCurrent()
             assertEquals(FreeSnapshotAvailability.UNAVAILABLE, vm.uiState.value.availability)
-            assertTrue(vm.uiState.value.charts.isEmpty())
+            assertTrue(vm.uiState.value.drawnSeriesIds.isEmpty())
             assertEquals(initialCalls, calls)
         } finally {
             vm.viewModelScope.cancel()
@@ -428,14 +385,14 @@ class FreeSnapshotViewModelTest {
                 listOf("investing.usd" to true),
                 vm.uiState.value.seriesToggles.map { it.seriesId to it.visible }
             )
-            assertFalse(vm.uiState.value.charts.isEmpty())
+            assertFalse(vm.uiState.value.drawnSeriesIds.isEmpty())
             assertTrue("the default was written back as if it were a choice", series.writes.isEmpty())
 
             // The default carries four ids; this answer only carries one of them, so hiding it
             // empties the graph while the other three stay chosen.
             vm.toggleSeries("investing.usd")
             testScheduler.runCurrent()
-            assertTrue(vm.uiState.value.charts.isEmpty())
+            assertTrue(vm.uiState.value.drawnSeriesIds.isEmpty())
             assertEquals(
                 listOf(FreeTab.USD to setOf("kb.usd", "hana.usd", "dxy")),
                 series.writes
@@ -466,7 +423,7 @@ class FreeSnapshotViewModelTest {
                 listOf("investing.usd" to false),
                 vm.uiState.value.seriesToggles.map { it.seriesId to it.visible }
             )
-            assertTrue("all-off did not survive the rebind", vm.uiState.value.charts.isEmpty())
+            assertTrue("all-off did not survive the rebind", vm.uiState.value.drawnSeriesIds.isEmpty())
         }
     }
 
@@ -495,3 +452,15 @@ class FreeSnapshotViewModelTest {
         }
     }
 }
+
+/**
+ * What the chart would draw, from the state alone.
+ *
+ * The view model no longer produces per-series cards — it produces the whole prepared graph plus
+ * the visible set, and the chart decides. These read that decision back without a Compose runtime.
+ */
+private val FreeSnapshotUiState.drawnSeriesIds: List<String>
+    get() = graph?.order.orEmpty().filter { it in visibleSeriesIds && graph?.bySeries?.get(it)?.linePoints?.isNotEmpty() == true }
+
+private fun FreeSnapshotUiState.pointsOf(seriesId: String): List<LinePoint> =
+    graph?.bySeries?.get(seriesId)?.linePoints.orEmpty()

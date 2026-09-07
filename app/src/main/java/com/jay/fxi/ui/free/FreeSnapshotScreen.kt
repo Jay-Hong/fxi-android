@@ -1,14 +1,22 @@
 package com.jay.fxi.ui.free
 
-import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -18,24 +26,29 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphPeriod
+import com.jay.fxi.ui.graph.GraphChart
+import com.jay.fxi.ui.graph.GraphSeriesStyles
+import com.jay.fxi.ui.theme.Background
+import com.jay.fxi.ui.theme.Primary
+import com.jay.fxi.ui.theme.PrimaryText
+import com.jay.fxi.ui.theme.SecondaryText
 import com.jay.fxi.domain.model.UserInfo
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
@@ -52,7 +65,21 @@ fun FreeSnapshotScreen(
     userInfo: UserInfo? = null,
     modifier: Modifier = Modifier
 ) {
-    Column(modifier.fillMaxSize()) {
+    // Edge-to-edge is on for the whole app, so a surface that insets nowhere is drawn under the
+    // clock and under the navigation bar. The premium surface pads the status bar the same way
+    // (`MainScreen.kt:244`); the bottom is handled as list padding so content still scrolls under
+    // the bar rather than stopping short of it.
+    // Two things, and painting only the first is worse than painting neither.
+    //
+    // The window theme is `Theme.Material.Light`, so a Compose surface that paints nothing shows
+    // white through — and this app is dark-only. Every other screen paints the app background
+    // itself (`SettingsScreen`, `MainScreen`, the splash); this one was the exception.
+    //
+    // `LocalContentColor` also defaults to black outside a `Surface`, so every `Text` that does not
+    // name a colour — the heading, the basis time, the bank rows, the empty and expired notices —
+    // was black. On the white background that was merely wrong; on the dark one it is invisible.
+    Surface(color = Background, contentColor = PrimaryText, modifier = modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.statusBars)) {
         Row(
             Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 12.dp),
             horizontalArrangement = Arrangement.SpaceBetween
@@ -72,6 +99,7 @@ fun FreeSnapshotScreen(
         // impossible, rather than a guard that has to stay ahead of the coroutine that races it.
         val selected = state.selectedTab ?: return@Column
         FreeSnapshotTabs(selected, state, onSelectTab, onSelectPeriod, onToggleSeries, onSubscribe)
+    }
     }
 }
 
@@ -105,13 +133,31 @@ private fun ColumnScope.FreeSnapshotTabs(
         if (pagerState.currentPage != selected.ordinal) pagerState.animateScrollToPage(selected.ordinal)
     }
 
-    ScrollableTabRow(selectedTabIndex = selected.ordinal, edgePadding = 12.dp) {
-        tabs.forEachIndexed { index, tab ->
-            Tab(
-                selected = index == selected.ordinal,
-                onClick = { onSelectTab(tab) },
-                text = { Text(tab.title) }
-            )
+    // Equal widths, not a scrolling row. Five two-character labels fit any phone, and letting the
+    // row scroll centred 달러 and pushed 뉴스 and 유로 half off their edges. Deliberately the same
+    // idiom as the premium tab row (`MainScreen.kt:368`) so the two surfaces do not drift apart.
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(top = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        tabs.forEach { tab ->
+            val isSelected = tab == selected
+            Column(
+                modifier = Modifier.weight(1f).clickable { onSelectTab(tab) },
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = tab.title,
+                    fontSize = 14.sp,
+                    color = if (isSelected) PrimaryText else SecondaryText,
+                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
+                )
+                Spacer(Modifier.height(4.dp))
+                Box(
+                    Modifier.fillMaxWidth().height(2.dp)
+                        .background(if (isSelected) Primary else Color.Transparent)
+                )
+            }
         }
     }
     HorizontalPager(
@@ -147,6 +193,7 @@ private fun FreeSnapshotTabContent(
         state.availability == FreeSnapshotAvailability.DELAYED
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
+        contentPadding = WindowInsets.navigationBars.asPaddingValues(),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         item {
@@ -186,27 +233,46 @@ private fun FreeSnapshotTabContent(
                             FilterChip(
                                 selected = series.visible,
                                 onClick = { onToggleSeries(series.seriesId) },
-                                label = { Text(series.label) }
+                                label = { Text(series.label) },
+                                // The line's own colour. Without it several lines in one frame are
+                                // unattributable — the per-series cards used to carry the name, and
+                                // merging them into one chart took that away.
+                                leadingIcon = {
+                                    Box(
+                                        Modifier
+                                            .size(10.dp)
+                                            .background(
+                                                Color(GraphSeriesStyles.of(series.seriesId, series.label).colorHex),
+                                                CircleShape
+                                            )
+                                    )
+                                }
                             )
                         }
                     }
                 }
             }
-            if (state.charts.isEmpty()) {
-                // All-off is a choice the plan permits, so it is stated rather than repaired.
-                // Series that are switched on but carry no points for this period are a data gap,
-                // not an empty selection — telling the user to pick something would be wrong there.
-                item {
-                    Text(
-                        if (state.seriesToggles.isEmpty() || state.seriesToggles.any { it.visible }) {
-                            "표시할 그래프 데이터가 없습니다."
-                        } else {
-                            "표시할 항목을 선택해 주세요."
-                        }
-                    )
+            item {
+                state.graph?.let { graph ->
+                    Card(Modifier.fillMaxWidth()) {
+                        GraphChart(
+                            prepared = graph,
+                            visibleIds = state.visibleSeriesIds,
+                            modifier = Modifier.fillMaxWidth().height(220.dp).padding(12.dp),
+                            // All-off is a choice the plan permits, so it is stated rather than
+                            // repaired. Series switched on but carrying no points for this period
+                            // are a data gap, not an empty selection.
+                            emptyMessage = if (state.seriesToggles.isNotEmpty() &&
+                                state.seriesToggles.none { it.visible }
+                            ) {
+                                "표시할 항목을 선택해 주세요."
+                            } else {
+                                "표시할 그래프 데이터가 없습니다."
+                            }
+                        )
+                    }
                 }
             }
-            state.charts.forEach { chart -> item { SnapshotChart(chart) } }
             if (state.rateSections.isEmpty()) {
                 item { Text("표시할 환율 데이터가 없습니다.") }
             }
@@ -241,41 +307,5 @@ private fun FreshnessBadge(label: String, delayed: Boolean) {
         shape = MaterialTheme.shapes.small
     ) {
         Text(label, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
-    }
-}
-
-@Composable
-private fun SnapshotChart(chart: FreeSnapshotChart) {
-    val color = MaterialTheme.colorScheme.primary
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(chart.label, style = MaterialTheme.typography.titleSmall)
-            Text("${chart.low} ~ ${chart.high}", style = MaterialTheme.typography.bodySmall)
-            // Normalised against the axis group's shared frame, not this series' own extremes, so
-            // two lines on one axis stay comparable.
-            val plotted = remember(chart) { FreeChartGeometry.normalize(chart.points, chart.domain) }
-            Canvas(
-                Modifier.fillMaxWidth().height(140.dp).padding(4.dp).semantics {
-                    contentDescription = "${chart.label}, ${chart.start}부터 ${chart.end}, 최저 ${chart.low}, 최고 ${chart.high}"
-                }
-            ) {
-                if (plotted.size == 1) {
-                    val point = plotted.single()
-                    drawCircle(color, radius = 3.dp.toPx(), center = Offset(point.x * size.width, point.y * size.height))
-                } else {
-                    val path = Path()
-                    plotted.forEachIndexed { index, point ->
-                        val x = point.x * size.width
-                        val y = point.y * size.height
-                        if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
-                    }
-                    drawPath(path, color, style = Stroke(width = 2.dp.toPx()))
-                }
-            }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(chart.start, style = MaterialTheme.typography.bodySmall)
-                Text(chart.end, style = MaterialTheme.typography.bodySmall)
-            }
-        }
     }
 }

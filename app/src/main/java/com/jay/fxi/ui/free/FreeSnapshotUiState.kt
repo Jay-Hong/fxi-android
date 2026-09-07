@@ -5,16 +5,16 @@ import com.jay.fxi.data.free.FreeSnapshotKey
 import com.jay.fxi.data.free.FreeSnapshotReadState
 import com.jay.fxi.domain.model.Exchange
 import com.jay.fxi.domain.model.ExchangeRate
-import com.jay.fxi.domain.model.FreeGraphPoint
-import com.jay.fxi.domain.model.FreeGraphSeries
 import com.jay.fxi.domain.model.FreeRate
 import com.jay.fxi.domain.model.FreeSnapshot
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphPeriod
+import com.jay.fxi.ui.graph.GraphPreparedBuilder
+import com.jay.fxi.ui.graph.GraphSeriesStyles
+import com.jay.fxi.ui.graph.PreparedGraph
 import com.jay.fxi.domain.model.SourceRate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
-import java.util.Locale
 import kotlinx.datetime.Instant
 
 /** Missing entries carry no request status: neither a spinner nor an error can be inferred. */
@@ -35,32 +35,6 @@ data class FreeSnapshotRateSection(val title: String, val rows: List<FreeSnapsho
 /** One entry of the graph's series switch. Absent from the snapshot means absent from the row. */
 data class FreeSeriesToggle(val seriesId: String, val label: String, val visible: Boolean)
 
-/**
- * One series, in its own units, plus the frame it shares with the others on its axis.
- *
- * The points are *not* normalized here. They used to be, each series against its own extremes,
- * which made two series in one frame incomparable and left no way to express a zoom at all — the
- * timestamps and the highs and lows were gone by the time anything could ask for them.
- */
-data class FreeSnapshotChart(
-    val seriesId: String,
-    val label: String,
-    val points: List<FreeGraphPoint>,
-    /** The frame it is drawn in: time shared with every series, value shared with its own axis. */
-    val domain: FreeChartDomain,
-    /**
-     * This series' own observed extremes.
-     *
-     * Not the frame's. A near-flat line sharing an axis with a volatile one is drawn against the
-     * volatile one's range, but saying so in its caption — and to a screen reader — would report
-     * numbers this series never reached.
-     */
-    val low: String,
-    val high: String,
-    val start: String,
-    val end: String
-)
-
 data class FreeSnapshotUiState(
     val uid: String? = null,
     /**
@@ -76,7 +50,10 @@ data class FreeSnapshotUiState(
     val availability: FreeSnapshotAvailability = FreeSnapshotAvailability.AWAITING_SNAPSHOT,
     val asOfLabel: String? = null,
     val rateSections: List<FreeSnapshotRateSection> = emptyList(),
-    val charts: List<FreeSnapshotChart> = emptyList(),
+    /** Draw-ready geometry for every series in the answer, hidden ones included. */
+    val graph: PreparedGraph? = null,
+    /** Which of them are drawn. The chart needs both: the frame spans all, the axes span these. */
+    val visibleSeriesIds: Set<String> = emptySet(),
     /** Every series this answer carries, whether drawn or not — the row has to offer both. */
     val seriesToggles: List<FreeSeriesToggle> = emptyList()
 ) {
@@ -127,15 +104,19 @@ data class FreeSnapshotUiState(
             )
             // Expired values must not survive in the presentation state, including chart points.
             if (availability == FreeSnapshotAvailability.UNAVAILABLE) return state
-            val series = entry.snapshot.graph.series
+            // Built over the whole answer, hidden series included: the time axis spans all of
+            // them, so filtering here would let a toggle slide the chart sideways. All-off then
+            // draws an empty frame, which `ANDROID_V2_PLAN.md:826` allows outright — D18's
+            // "project one candidate rather than show nothing" is a rule for source lists.
+            val graph = GraphPreparedBuilder.build(entry.snapshot.graph, period)
             return state.copy(
                 rateSections = sections(entry.snapshot.rate),
-                // All-off draws an empty graph. `ANDROID_V2_PLAN.md:826` allows it outright, and
-                // D18's "project one candidate rather than show nothing" is a rule for source
-                // lists, not for graphs — repopulating here would overrule a real choice.
-                charts = charts(series, visibleSeriesIds),
-                seriesToggles = series.map {
-                    FreeSeriesToggle(it.seriesId, it.label, it.seriesId in visibleSeriesIds)
+                graph = graph,
+                visibleSeriesIds = visibleSeriesIds,
+                seriesToggles = graph.order.mapNotNull { id ->
+                    graph.bySeries[id]?.let {
+                        FreeSeriesToggle(id, GraphSeriesStyles.of(id, it.label).label, id in visibleSeriesIds)
+                    }
                 }
             )
         }
@@ -163,35 +144,5 @@ data class FreeSnapshotUiState(
 
         private fun Instant.toJavaInstant() = java.time.Instant.ofEpochSecond(epochSeconds, nanosecondsOfSecond.toLong())
 
-        /**
-         * One chart per drawn series, each carrying the frame shared by everything on its axis.
-         *
-         * Grouping by axis is what keeps a KRW rate near 1,400 and a dollar index near 99 from
-         * being forced onto one scale, which would flatten both.
-         */
-        private fun charts(
-            series: List<FreeGraphSeries>,
-            visibleSeriesIds: Set<String>
-        ): List<FreeSnapshotChart> {
-            val drawn = series.filter { it.seriesId in visibleSeriesIds && it.points.isNotEmpty() }
-            val frames = FreeChartGeometry.frames(drawn)
-            return drawn.mapNotNull { item ->
-                val frame = frames[item.axisGroup] ?: return@mapNotNull null
-                val own = FreeChartGeometry.extremesOf(item.points) ?: return@mapNotNull null
-                val decimals = (item.decimals ?: 2).coerceIn(0, 8)
-                val unit = item.unit?.let { " $it" }.orEmpty()
-                fun format(value: Double) = String.format(Locale.KOREA, "%.${decimals}f", value) + unit
-                FreeSnapshotChart(
-                    seriesId = item.seriesId,
-                    label = item.label,
-                    points = item.points.sortedBy { it.timestamp },
-                    domain = frame,
-                    low = format(own.start),
-                    high = format(own.endInclusive),
-                    start = dateFormatter.format(frame.start.toJavaInstant()),
-                    end = dateFormatter.format(frame.end.toJavaInstant())
-                )
-            }
-        }
     }
 }
