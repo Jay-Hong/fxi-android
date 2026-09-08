@@ -8,6 +8,7 @@ import com.jay.fxi.domain.model.FreeGraphCarryIn
 import com.jay.fxi.domain.model.FreeGraph
 import com.jay.fxi.domain.model.FreeGraphPoint
 import com.jay.fxi.domain.model.FreeRate
+import com.jay.fxi.domain.model.RateSanity
 import com.jay.fxi.domain.model.FreeGraphSeries
 import com.jay.fxi.domain.model.SourceRate
 import com.jay.fxi.domain.model.GraphPeriod
@@ -204,7 +205,7 @@ class FreeSnapshotSanitizer @Inject constructor() {
         fun JsonObject.array(key: String): JsonArray = this[key] as? JsonArray ?: malformed()
         fun JsonObject.price(key: String): Double {
             val number = (this[key] as? JsonPrimitive)?.takeUnless { it.isString }?.doubleOrNull ?: malformed()
-            require(number.isFinite() && number > 0 && number < 1e9)
+            require(RateSanity.isPlausible(number))
             return number
         }
         fun JsonObject.optionalPrice(key: String): Double? = this[key]?.takeUnless { it == JsonNull }?.let { price(key) }

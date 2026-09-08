@@ -1,5 +1,8 @@
 package com.jay.fxi.data.remote.dto
 
+import com.jay.fxi.domain.model.RateSanity
+import com.jay.fxi.domain.model.TopicDollarIndex
+import com.jay.fxi.domain.model.TopicQuote
 import com.jay.fxi.domain.model.TopicRejectionReason
 import com.jay.fxi.domain.model.TopicWholeRequestFailure
 import com.jay.fxi.util.InstantSerializer
@@ -151,6 +154,27 @@ data class TopicSourceEntry(
 ) {
     val mergeAt: Instant get() = rateChangedAt ?: timestamp
 }
+
+/**
+ * The wire entry as the domain sees it — one price, one time — or nothing at all.
+ *
+ * Two jobs happen on this line, and I5 (`ANDROID_V2_PLAN.md:129`) is why they happen *here*.
+ *
+ * `rate_changed_at ?? timestamp` is decided once, so everything past this point holds a single
+ * instant and no consumer has to remember which of the two the server meant.
+ *
+ * And the value is checked, because strict wire decoding does not check values: `-1` is a valid
+ * JSON number and a valid `Double`. Past this line it would be a price — one that merges over a
+ * real quote as soon as its clock is newer. An implausible entry becomes `null` and the caller
+ * drops it rather than the frame: a topic snapshot is a list of independent quotes, and one bad
+ * source is not a reason to throw away the others.
+ */
+fun TopicSourceEntry.toQuote(): TopicQuote? =
+    if (RateSanity.isPlausible(rate)) TopicQuote(source, asset, rate, mergeAt) else null
+
+/** The index has no `rate_changed_at`; its `timestamp` is already the moment it changed. */
+fun DxySpotEntry.toDollarIndex(): TopicDollarIndex? =
+    if (RateSanity.isPlausible(rate)) TopicDollarIndex(rate, timestamp, source) else null
 
 @Serializable
 data class TetherTopicMessage(

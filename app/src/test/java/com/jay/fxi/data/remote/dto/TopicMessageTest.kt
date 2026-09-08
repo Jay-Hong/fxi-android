@@ -2,6 +2,9 @@ package com.jay.fxi.data.remote.dto
 
 import com.jay.fxi.domain.model.TopicRejectionReason
 import com.jay.fxi.domain.model.TopicWholeRequestFailure
+import com.jay.fxi.domain.model.RateSanity
+import com.jay.fxi.domain.model.TopicDollarIndex
+import com.jay.fxi.domain.model.TopicQuote
 import kotlinx.datetime.Instant
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -195,6 +198,90 @@ class TopicMessageTest {
         assertEquals(104.52, dxy.rate, 0.0)
         assertEquals("investing", dxy.source)
         assertEquals(Instant.parse("2026-08-21T05:30:00Z"), dxy.timestamp)
+    }
+
+    /**
+     * The boundary decides `rate_changed_at ?? timestamp`, once.
+     *
+     * `timestamp` for a Redis-served exchange entry can be a five-second `seen_at` bucket while
+     * `rate_changed_at` is the moment the price actually moved. Both reach this line and only one
+     * leaves it, so nothing downstream has to remember which the server meant — and nothing can
+     * order two quotes by the coarser of the two by accident.
+     */
+    @Test
+    fun `a quote leaves the boundary with one time`() {
+        val bucketed = TopicSourceEntry(
+            source = "upbit",
+            asset = "usdt-krw",
+            rate = 1485.0,
+            timestamp = Instant.parse("2026-05-12T06:00:00Z"),
+            rateChangedAt = Instant.parse("2026-05-12T06:00:03.123456Z")
+        )
+        assertEquals(
+            TopicQuote("upbit", "usdt-krw", 1485.0, Instant.parse("2026-05-12T06:00:03.123456Z")),
+            bucketed.toQuote()
+        )
+
+        // A bank entry carries no `rate_changed_at`; its `timestamp` is already precise.
+        val precise = TopicSourceEntry(
+            source = "kb",
+            asset = "usd-krw",
+            rate = 1400.0,
+            timestamp = Instant.parse("2026-05-12T06:00:00Z")
+        )
+        assertEquals(Instant.parse("2026-05-12T06:00:00Z"), precise.toQuote()!!.at)
+    }
+
+    /**
+     * A number that cannot be a price does not become one.
+     *
+     * I5 (`ANDROID_V2_PLAN.md:129`) puts value sanity at the domain conversion, because strict wire
+     * decoding has no reason to object: `-1` is a valid JSON number and a valid `Double`. Past this
+     * line it would be a quote, and the strictly-newer merge would let it over a real one the
+     * moment its clock was newer. Rejected one entry at a time — a topic snapshot is a list of
+     * independent quotes, and one bad source is not a reason to drop the others. Found by review.
+     */
+    @Test
+    fun `an implausible rate does not become a quote`() {
+        fun entry(rate: Double) = TopicSourceEntry(
+            source = "kb",
+            asset = "usd-krw",
+            rate = rate,
+            timestamp = Instant.parse("2026-05-12T06:00:00Z")
+        )
+
+        listOf(-1.0, 0.0, RateSanity.UPPER_BOUND, Double.NaN, Double.POSITIVE_INFINITY)
+            .forEach { assertNull("$it 가 통과했다", entry(it).toQuote()) }
+
+        // The bound is exclusive, so the number just under it is still a price.
+        assertEquals(
+            RateSanity.UPPER_BOUND - 1,
+            requireNotNull(entry(RateSanity.UPPER_BOUND - 1).toQuote()).rate,
+            0.0
+        )
+    }
+
+    /** The index answers to the same rule; an index of zero is not a reading. */
+    @Test
+    fun `an implausible index does not become a reading`() {
+        fun entry(rate: Double) =
+            DxySpotEntry(rate, Instant.parse("2026-08-21T05:30:00Z"), "investing")
+
+        listOf(-1.0, 0.0, Double.NaN).forEach { assertNull("$it 가 통과했다", entry(it).toDollarIndex()) }
+        assertEquals(104.52, requireNotNull(entry(104.52).toDollarIndex()).rate, 0.0)
+    }
+
+    /** The index keeps its supplier, which is not an asset. */
+    @Test
+    fun `the dollar index maps to its own slot`() {
+        assertEquals(
+            TopicDollarIndex(104.52, Instant.parse("2026-08-21T05:30:00Z"), "investing"),
+            DxySpotEntry(
+                rate = 104.52,
+                timestamp = Instant.parse("2026-08-21T05:30:00Z"),
+                source = "investing"
+            ).toDollarIndex()
+        )
     }
 
     @Test
