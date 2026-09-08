@@ -374,12 +374,16 @@ private fun GraphSurface(
     state: FreeSnapshotUiState,
     modifier: Modifier = Modifier,
     zoom: GraphZoomState = GraphZoomState(),
-    onZoom: ((GraphZoomState) -> Unit)? = null
+    onZoom: ((GraphZoomState) -> Unit)? = null,
+    onSingleTap: (() -> Unit)? = null
 ) {
     val graph = state.graph
     if (graph == null) {
         // Empty space here reads as a chart that broke rather than one that is not there yet.
-        Box(modifier, contentAlignment = Alignment.Center) {
+        Box(
+            modifier.then(if (onSingleTap == null) Modifier else Modifier.clickable(onClick = onSingleTap)),
+            contentAlignment = Alignment.Center
+        ) {
             state.availability.missingChartNotice?.let { Text(it, textAlign = TextAlign.Center) }
         }
         return
@@ -390,6 +394,7 @@ private fun GraphSurface(
         modifier = modifier,
         zoom = zoom,
         onZoom = onZoom,
+        onSingleTap = onSingleTap,
         emptyMessage = if (state.seriesToggles.isNotEmpty() && state.seriesToggles.none { it.visible }) {
             "표시할 항목을 선택해 주세요."
         } else {
@@ -440,6 +445,23 @@ private fun FreeGraphFullscreen(
     onClose: () -> Unit
 ) {
     BackHandler(onBack = onClose)
+    // Fullscreen owns its zoom, and owning it here is what makes it start unzoomed every time.
+    // `rememberSaveable` inside a composable that leaves the composition takes its entry with it,
+    // so closing throws the zoom away while a rotation keeps it — which is what iOS gets for free
+    // by presenting a **separate chart instance** over the inline one: fullscreen always opens at
+    // full extent, and the inline zoom underneath is untouched by the trip.
+    var zoom by rememberSaveable(stateSaver = GraphZoomStateSaver) {
+        mutableStateOf(GraphZoomState())
+    }
+    // Same rule the card uses: a period change is a different chart, so the window from the old one
+    // means nothing. Tracked by name because the effect must not fire on the way in.
+    var zoomedPeriod by rememberSaveable { mutableStateOf(state.period.name) }
+    LaunchedEffect(state.period) {
+        if (zoomedPeriod != state.period.name) {
+            zoom = GraphZoomState()
+            zoomedPeriod = state.period.name
+        }
+    }
     Column(
         Modifier
             .fillMaxSize()
@@ -458,30 +480,27 @@ private fun FreeGraphFullscreen(
         PeriodTabBar(state.period, onSelectPeriod)
         if (state.seriesToggles.isNotEmpty()) SeriesToggles(state.seriesToggles, onToggleSeries)
 
-        // A tap anywhere leaves, on every period — iOS does the same
-        // (`GraphV2Section.swift:1692`, `:1708`), and zoom is no reason to withhold it. On 1일 iOS
-        // routes the tap through a UIKit recognizer declared `require(toFail: doubleTap)`
-        // (`GestureOverlayView.swift:99`), so the tap that starts a zoom never reaches dismissal.
-        // Nothing to arbitrate yet: this call passes no `onZoom`, so the chart attaches no gesture
-        // handler, and the double tap lives only on the inline card — which has no tap of its own,
-        // because fullscreen opens from the button above it. Slice 8 brings zoom in here and the
-        // conflict with it, and the shape of the answer is worth writing down now.
+        // A tap anywhere leaves, on every period — but by two different mechanisms, because on 1일
+        // the same finger might be starting a zoom.
         //
-        // These two are not parent and child: this modifier is handed down to `GraphChart`, which
-        // builds `modifier.then(gestures)`, so `clickable` and the zoom loop are two nodes in **one
-        // chain on the Canvas** — the outer one behaves like a parent, taking Main last. Deferring
-        // is not available to the inner one: it cannot delay delivery to the outer node, and a
-        // change it consumes cannot be un-consumed later. So slice 8 resolves it by **dropping this
-        // `clickable`** and letting the one loop report the dismissal itself, once the double-tap
-        // window has passed without a second tap. That loop already tells taps from pairs; iOS
-        // spells the same arrangement `singleTap.require(toFail: doubleTap)`.
-        val interaction = remember { MutableInteractionSource() }
+        // iOS switches on exactly this: its SwiftUI dismissal tap is turned off on 1일 with
+        // `GestureMask(.subviews)` and the UIKit `singleTap.require(toFail: doubleTap)` takes over,
+        // while every other period keeps the SwiftUI tap because no gesture overlay is mounted
+        // (`GraphV2Section.swift`'s fullscreen view). The reason is recorded there as a measurement,
+        // not a preference: a tap recogniser that fires on the first tap turned a fullscreen
+        // double-tap zoom into a dismissal on iPadOS 17.
+        //
+        // Which mechanism runs is decided inside the chart, not here: a `clickable` put on this
+        // modifier and the zoom loop end up as two nodes in one chain on the Canvas, and the inner
+        // one cannot defer delivery to the outer one or un-consume what it took. Handing the chart the intent and letting it choose also covers
+        // the two states that draw a message instead of a chart — split across this call site, a
+        // fullscreen with no data was one early return away from having no way out but the button.
         GraphSurface(
             state,
-            Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .clickable(interactionSource = interaction, indication = null, onClick = onClose)
+            Modifier.fillMaxWidth().weight(1f),
+            zoom = zoom,
+            onZoom = { zoom = it },
+            onSingleTap = onClose
         )
     }
 }

@@ -8,10 +8,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerEvent
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.withTimeoutOrNull
 import com.jay.fxi.domain.model.GraphPeriod
 
 /**
@@ -56,6 +59,19 @@ private fun PointerEvent.midpointOfPressedX(area: GraphPlotArea): Float {
 private fun PointerEvent.pressedPosition(): Offset? = changes.firstOrNull { it.pressed }?.position
 
 /**
+ * The next finger down, or null if none arrives in time.
+ *
+ * An extension rather than an inline `withTimeoutOrNull`, because `AwaitPointerEventScope` is
+ * `@RestrictsSuspension`: a coroutine builder opened against the lambda receiver cannot call back
+ * into it, but one opened inside a function whose *extension* receiver it is can. Compose writes
+ * its own `awaitSecondDown` this way for the same reason (`TapGestureDetector.kt`).
+ */
+private suspend fun AwaitPointerEventScope.awaitNextDownWithin(
+    timeoutMillis: Long
+): PointerInputChange? =
+    withTimeoutOrNull(timeoutMillis) { awaitFirstDown(requireUnconsumed = false) }
+
+/**
  * Pointer handling for the free graph's zoom, on 1일 only.
  *
  * The arbitration rule is the whole point, and it is iOS's:
@@ -73,13 +89,23 @@ internal fun rememberGraphZoomGestures(
     period: GraphPeriod,
     plot: GraphPlot,
     zoom: GraphZoomState,
-    onZoom: (GraphZoomState) -> Unit
+    onZoom: (GraphZoomState) -> Unit,
+    /**
+     * What a lone tap means, or null if it means nothing.
+     *
+     * Fullscreen passes leaving; the inline card passes null, because a tap there is not an exit —
+     * fullscreen opens from a button. iOS draws the same line by handing `onSingleTap` to the
+     * gesture overlay only in fullscreen (`GraphV2Section.swift`), and the recogniser is not even
+     * registered when it is nil (`GestureOverlayView.swift`).
+     */
+    onSingleTap: (() -> Unit)? = null
 ): Modifier {
     // The loop outlives any single value it reads. Keyed on `period` alone below, it must not close
     // over a stale plot — the data refreshes hourly and the toggles move under it.
     val currentPlot by rememberUpdatedState(plot)
     val currentZoom by rememberUpdatedState(zoom)
     val emit by rememberUpdatedState(onZoom)
+    val dismiss by rememberUpdatedState(onSingleTap)
 
     if (!enabled) return Modifier
 
@@ -95,6 +121,9 @@ internal fun rememberGraphZoomGestures(
         // failed for exactly that reason.
         var previousTapUpAt: Long? = null
         var previousTapAt = Offset.Zero
+        // A tap has landed and is still waiting to find out whether it was half of a pair. Only
+        // meaningful when there is something for a lone tap to do.
+        var tapAwaitingItsPartner = false
         // Compose puts **no** distance limit on the second tap — `TapGestureDetector.kt`'s
         // `awaitSecondDown` enforces the time window and nothing else — so the figure has to come
         // from the platform: `android.view.ViewConfiguration.DOUBLE_TAP_SLOP`, 100dp. `touchSlop * 2`
@@ -107,7 +136,47 @@ internal fun rememberGraphZoomGestures(
             // Not required unconsumed: it may still be the pager's. A scrollable already in motion
             // consumes the down in the Initial pass, and requiring it unconsumed would mean never
             // returning for that touch at all.
-            val down = awaitFirstDown(requireUnconsumed = false)
+            //
+            // A lone tap has to outlive its own gesture before it can mean anything: it is a single
+            // tap only once the double-tap window closes with no second finger. So the wait for the
+            // next gesture *is* the wait, and when it times out the tap that was pending becomes
+            // the answer. This is `withTimeoutOrNull` around `awaitFirstDown`, which is what
+            // Compose's own double-tap detector does (`TapGestureDetector.kt`'s `awaitSecondDown`),
+            // and it is the same arrangement iOS spells `singleTap.require(toFail: doubleTap)`.
+            // Firing on the first tap instead is not a shortcut but a defect — iOS measured it on
+            // iPadOS 17, where a fullscreen double tap meant to zoom left fullscreen instead.
+            //
+            // The `dismiss != null` half is a cost guard, not a correctness one, and a mutation
+            // proved it: dropping it leaves behaviour identical, because the call it protects is a
+            // no-op on null and clearing a stale tap after the window is right in either case. It
+            // stays so the inline card, which can never leave, does not arm a 300ms wait after
+            // every tap it takes.
+            //
+            // Two consequences are deliberate rather than overlooked.
+            //
+            // Leaving is slower here than on the other periods, by the length of the window. iOS
+            // accepts the same asymmetry in the same place and says why: a quarter of a second is
+            // below notice for an action that closes a screen.
+            //
+            // A gesture that is not a tap swallows the pending dismissal instead of completing it —
+            // tap, then start a pan within the window, and nothing leaves. UIKit would leave, since
+            // the double tap has failed by then, and this is the one place the arrangement is
+            // deliberately not iOS: dismissing a screen out from under a finger that is mid-drag is
+            // worse than making the user tap again.
+            // Written out rather than `awaitNextDownWithin(...) ?: run { … }`, which does not
+            // compile: `run`'s lambda is one more layer between the restricted scope and
+            // `awaitFirstDown`, and the compiler refuses it. The shorter form is the one to reach
+            // for and the one that fails, so it is worth saying here.
+            var second: PointerInputChange? = null
+            if (dismiss != null && tapAwaitingItsPartner) {
+                tapAwaitingItsPartner = false
+                second = awaitNextDownWithin(viewConfiguration.doubleTapTimeoutMillis)
+                if (second == null) {
+                    previousTapUpAt = null
+                    dismiss?.invoke()
+                }
+            }
+            val down = second ?: awaitFirstDown(requireUnconsumed = false)
 
             // Measured once per gesture. `hasIndex` is read off the plot the chart actually drew,
             // never off the toggle set — a series can be switched on and still have no range, and
@@ -301,12 +370,22 @@ internal fun rememberGraphZoomGestures(
             // Only on the normal way out. Cancellation skips this — a touch the system took away is
             // not a tap — and so do the two `return@awaitEachGesture` above, which are frames with
             // no pressed pointer to have tapped with.
+            // Two questions, not one. Leaving is about the whole chart — the plain `clickable`
+            // that every other period gets covers the gutters too, and a dismissal that ignored
+            // them would make the same pixel behave differently depending on the period, which is
+            // the one thing this arrangement exists to avoid. Zooming is about the plot: a double
+            // tap on the rate labels has no instant to centre on.
             val tapped = mode == Mode.UNDETERMINED &&
                 !terminalConsumed &&
                 maxPointers == 1 &&
                 // Strictly the complement of the pan gate above, so no travel is both.
-                travel < viewConfiguration.touchSlop &&
-                lastEventAt - down.uptimeMillis < viewConfiguration.longPressTimeoutMillis &&
+                travel < viewConfiguration.touchSlop
+            // Duration separates the two as well. `clickable` has no time limit, so a finger held
+            // still and then lifted leaves on every other period; excluding it here would make the
+            // hold behave differently on 1일 alone. A zoom pair is the other way round — holding is
+            // not how anyone starts a double tap, and `UITapGestureRecognizer` rejects it too.
+            val brief = lastEventAt - down.uptimeMillis < viewConfiguration.longPressTimeoutMillis
+            val tappedThePlot = tapped && brief &&
                 area.contains(down.position.x, down.position.y)
             val previousUp = previousTapUpAt
             val sinceLastTap = if (previousUp == null) null else down.uptimeMillis - previousUp
@@ -315,7 +394,8 @@ internal fun rememberGraphZoomGestures(
                 // stops UIKit counting them as a pair.
                 !tapped -> previousTapUpAt = null
 
-                sinceLastTap != null &&
+                tappedThePlot &&
+                    sinceLastTap != null &&
                     sinceLastTap >= viewConfiguration.doubleTapMinTimeMillis &&
                     sinceLastTap <= viewConfiguration.doubleTapTimeoutMillis &&
                     (down.position - previousTapAt).getDistance() <= doubleTapSlop -> {
@@ -327,9 +407,14 @@ internal fun rememberGraphZoomGestures(
 
                 else -> {
                     // Measured from the up, matched against the next down: the interval UIKit and
-                    // Compose both use (`awaitSecondDown` takes `firstUp.uptimeMillis`).
-                    previousTapUpAt = lastEventAt
+                    // Compose both use (`awaitSecondDown` takes `firstUp.uptimeMillis`). Only a tap
+                    // on the plot can start a pair; one on a gutter still counts as a tap for the
+                    // purpose of leaving, and clears any pair in progress.
+                    previousTapUpAt = if (tappedThePlot) lastEventAt else null
                     previousTapAt = down.position
+                    // Set only where it is read, so the inline card does not carry a flag forever
+                    // that nothing will ever consume.
+                    tapAwaitingItsPartner = dismiss != null
                 }
             }
             } finally {

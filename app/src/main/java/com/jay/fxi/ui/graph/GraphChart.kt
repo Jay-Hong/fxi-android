@@ -1,6 +1,8 @@
 package com.jay.fxi.ui.graph
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Text
@@ -18,6 +20,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
@@ -40,6 +43,22 @@ import com.jay.fxi.ui.theme.SecondaryText
  * lived in the chart would be thrown away on the way there and back. Gestures are attached only
  * when [onZoom] is given, and only on 1일.
  */
+/**
+ * A plain dismissal tap, for the places the zoom loop does not reach.
+ *
+ * The loop owns the tap wherever it runs, because on 1일 the same finger might be opening a zoom
+ * and the answer has to wait out the double-tap window. Everywhere else — other periods, and the
+ * two empty states that draw a message instead of a chart — there is nothing to arbitrate with, and
+ * a tap should leave at once. Keeping both in this file is deliberate: split across the caller it
+ * was already one early return away from a fullscreen nobody could tap out of.
+ */
+@Composable
+private fun Modifier.dismissOnTap(onSingleTap: (() -> Unit)?): Modifier {
+    val interaction = remember { MutableInteractionSource() }
+    return if (onSingleTap == null) this
+    else clickable(interactionSource = interaction, indication = null, onClick = onSingleTap)
+}
+
 @Composable
 fun GraphChart(
     prepared: PreparedGraph,
@@ -47,6 +66,8 @@ fun GraphChart(
     modifier: Modifier = Modifier,
     zoom: GraphZoomState = GraphZoomState(),
     onZoom: ((GraphZoomState) -> Unit)? = null,
+    /** What a lone tap means here, or null if nothing. Fullscreen passes leaving; the card does not. */
+    onSingleTap: (() -> Unit)? = null,
     emptyMessage: String = "표시할 그래프 데이터가 없습니다."
 ) {
     // The right edge the zoom follows, resolved the same way the projection resolves it — the
@@ -57,7 +78,8 @@ fun GraphChart(
         GraphProjection.plot(prepared, visibleIds, window)
     }
     if (plot == null || plot.isEmpty) {
-        Box(modifier, contentAlignment = Alignment.Center) {
+        // No loop here at all, so the tap is unconditional — including on 1일.
+        Box(modifier.dismissOnTap(onSingleTap), contentAlignment = Alignment.Center) {
             Text(emptyMessage, color = SecondaryText, fontSize = 12.sp)
         }
         return
@@ -88,10 +110,25 @@ fun GraphChart(
         period = prepared.period,
         plot = plot,
         zoom = effectiveZoom,
-        onZoom = onZoom ?: {}
+        onZoom = onZoom ?: {},
+        onSingleTap = onSingleTap
     )
 
-    Canvas(modifier.then(gestures).semantics { contentDescription = plot.describe() }) {
+    // The loop reports the dismissal only where it actually runs: on 1일, and only when zoom is
+    // wired at all. Anywhere else it returns without reading a single event, so the tap needs its
+    // own node. Both halves of that condition matter — a caller that asked for a dismissal but no
+    // zoom would otherwise get neither, and a chart with no way out looks perfectly fine.
+    val loopOwnsTheTap = onZoom != null && prepared.period == GraphPeriod.ONE_DAY
+    // The loop answers fingers, not assistive technology: it reads raw pointer events and reports
+    // nothing to the semantics tree, while `clickable` contributes an activation action for free.
+    // Without this the one period that zooms would be the one period a screen reader cannot close,
+    // which is the sort of gap that only shows up when someone depends on it.
+    val dismissal = when {
+        !loopOwnsTheTap -> Modifier.dismissOnTap(onSingleTap)
+        onSingleTap == null -> Modifier
+        else -> Modifier.semantics { onClick(label = "닫기") { onSingleTap(); true } }
+    }
+    Canvas(modifier.then(dismissal).then(gestures).semantics { contentDescription = plot.describe() }) {
         // Shared with the gestures rather than computed here: see `GraphPlotGeometry`.
         val plotted = GraphPlotGeometry.area(
             widthPx = size.width,
