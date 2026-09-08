@@ -157,4 +157,48 @@ object GraphZoomMath {
     }
 
     internal val ClosedRange<Instant>.length: Duration get() = endInclusive - start
+
+    /**
+     * How narrow the value axis may get, in KRW.
+     *
+     * iOS calls it `tightenMinSpan` and fixes it at 2.0, with the arithmetic written down: it keeps
+     * a half-won blip under a quarter of the height, and leaves a 0.1 tick about nine points apart
+     * so the labels stay readable. Without a floor, a quiet hour reads as a mountain range.
+     */
+    const val TIGHTEN_MIN_SPAN = 2.0
+
+    /**
+     * The value axis for what is actually on screen, never narrower than [minSpan].
+     *
+     * The margin comes first and is **the same formula the unzoomed axis uses**
+     * (`GraphAxis.composeAxisRange`: `max(5% of the span, floor)` on each side). Tightening is not a
+     * licence to draw the extremes on the border — that is exactly as unreadable inside a zoom as
+     * outside one, and it is the mistake the first version of this function made.
+     *
+     * [minSpan] then bounds the **total** span, margin included, so the floor means what it says:
+     * a quiet window cannot be magnified past it. Both ends grow equally, so the line stays where
+     * the eye left it instead of sliding to an edge.
+     *
+     * Null when there is nothing in the window — a zoom into a gap has no values to scale to, and
+     * the caller falls back to the whole day rather than inventing a range.
+     */
+    fun tightenedYDomain(
+        values: List<Double>,
+        minSpan: Double = TIGHTEN_MIN_SPAN,
+        marginFloor: Double = GraphAxis.KRW_MARGIN_FLOOR
+    ): ClosedFloatingPointRange<Double>? {
+        if (values.isEmpty()) return null
+        val low = values.min()
+        val high = values.max()
+        val margin = maxOf((high - low) * 0.05, marginFloor)
+        var lower = low - margin
+        var upper = high + margin
+        val span = upper - lower
+        if (span < minSpan) {
+            val pad = (minSpan - span) / 2
+            lower -= pad
+            upper += pad
+        }
+        return lower..upper
+    }
 }
