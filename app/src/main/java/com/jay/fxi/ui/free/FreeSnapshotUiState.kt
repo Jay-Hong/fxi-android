@@ -10,7 +10,11 @@ import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.ui.graph.GraphPreparedBuilder
 import com.jay.fxi.ui.graph.GraphSeriesStyles
 import com.jay.fxi.ui.graph.PreparedGraph
+import com.jay.fxi.domain.model.RateRowList
+import com.jay.fxi.domain.model.RateRowPreference
+import com.jay.fxi.domain.model.RateRowRoster
 import com.jay.fxi.ui.rates.RateRowPresenter
+import com.jay.fxi.ui.rates.editableRosters
 import com.jay.fxi.ui.rates.RateRowsView
 import com.jay.fxi.ui.rates.asRateScales
 import java.time.ZoneId
@@ -35,6 +39,32 @@ enum class FreeSnapshotAvailability { AWAITING_SNAPSHOT, FRESH, DELAYED, UNAVAIL
  */
 typealias FreeSnapshotRateSection = RateRowsView
 
+/**
+ * One row as the editing sheet shows it.
+ *
+ * Hidden rows are here and nowhere else on the surface — a row you cannot see is exactly the row
+ * you open the sheet to turn back on.
+ */
+data class RateRowEditEntry(
+    val code: String,
+    val label: String,
+    val visible: Boolean,
+    /**
+     * Drawn only because hiding everything would have left the heading empty — D18's rescue.
+     *
+     * Shown as temporary rather than as a choice, and never written back: the user's own set still
+     * says hidden, which is what "원본은 바꾸지 않고" asks for.
+     */
+    val projected: Boolean = false
+)
+
+/** One list the user can rearrange, with everything that arrived for it. */
+data class RateRowEditor(
+    val list: RateRowList,
+    val title: String,
+    val entries: List<RateRowEditEntry>
+)
+
 /** One entry of the graph's series switch. Absent from the snapshot means absent from the row. */
 data class FreeSeriesToggle(val seriesId: String, val label: String, val visible: Boolean)
 
@@ -58,7 +88,9 @@ data class FreeSnapshotUiState(
     /** Which of them are drawn. The chart needs both: the frame spans all, the axes span these. */
     val visibleSeriesIds: Set<String> = emptySet(),
     /** Every series this answer carries, whether drawn or not — the row has to offer both. */
-    val seriesToggles: List<FreeSeriesToggle> = emptyList()
+    val seriesToggles: List<FreeSeriesToggle> = emptyList(),
+    /** The lists this tab lets the user rearrange. Empty on 뉴스 and before a snapshot lands. */
+    val rowEditors: List<RateRowEditor> = emptyList()
 ) {
     /**
      * What the scheduler would be activated for.
@@ -88,7 +120,8 @@ data class FreeSnapshotUiState(
             tab: FreeTab,
             period: GraphPeriod,
             readState: FreeSnapshotReadState,
-            visibleSeriesIds: Set<String>
+            visibleSeriesIds: Set<String>,
+            rowPreferences: Map<RateRowList, RateRowPreference> = emptyMap()
         ): FreeSnapshotUiState {
             val empty = FreeSnapshotUiState(uid = uid, selectedTab = tab, period = period)
             // 뉴스 has no snapshot of its own, so there is nothing here that could be stale,
@@ -113,7 +146,8 @@ data class FreeSnapshotUiState(
             // "project one candidate rather than show nothing" is a rule for source lists.
             val graph = GraphPreparedBuilder.build(entry.snapshot.graph, period)
             return state.copy(
-                rateSections = sections(entry.snapshot.rate),
+                rateSections = sections(entry.snapshot.rate, rowPreferences),
+                rowEditors = editors(entry.snapshot.rate, rowPreferences),
                 graph = graph,
                 visibleSeriesIds = visibleSeriesIds,
                 seriesToggles = graph.order.mapNotNull { id ->
@@ -130,8 +164,51 @@ data class FreeSnapshotUiState(
          * Each scale is presented on its own, which is the point: the tether tab's exchanges are
          * USDT/KRW and its two USD/KRW headings share one ruler with each other.
          */
-        private fun sections(rate: FreeRate): List<FreeSnapshotRateSection> =
-            rate.asRateScales().flatMap { RateRowPresenter.present(it) }.filter { it.rows.isNotEmpty() }
+        private fun sections(
+            rate: FreeRate,
+            preferences: Map<RateRowList, RateRowPreference>
+        ): List<FreeSnapshotRateSection> {
+            // A list the user can still open keeps its heading even when it draws nothing, because
+            // the heading is where the button that reopens the sheet lives. Drop it and someone who
+            // hid everything is left with a sentence and no way back.
+            //
+            // "Can still open" means the payload actually carried rows for it. A heading with
+            // nothing behind it and nothing to edit is noise, and that is the empty-answer case.
+            val openable = rate.editableRosters().filterValues { it.isNotEmpty() }.keys
+            return rate.asRateScales(preferences).flatMap { RateRowPresenter.present(it) }
+                .filter { it.rows.isNotEmpty() || it.list in openable }
+        }
+
+        /**
+         * What the sheet edits, built from the payload rather than from the sections.
+         *
+         * A hidden row is not in a section, so a sheet built from sections could never show it —
+         * and then nothing could ever be turned back on.
+         */
+        private fun editors(
+            rate: FreeRate,
+            preferences: Map<RateRowList, RateRowPreference>
+        ): List<RateRowEditor> = rate.editableRosters().mapNotNull { (list, quotes) ->
+            if (quotes.isEmpty()) return@mapNotNull null
+            val preference = preferences[list]
+            val hidden = RateRowRoster.hidden(list, preference)
+            val projected = RateRowRoster.effective(list, quotes.map { it.id }, preference).projected
+            val byCode = quotes.associateBy { it.id }
+            val entries = RateRowRoster.arrangement(list, quotes.map { it.id }, preference)
+                .mapNotNull { code ->
+                    byCode[code]?.let {
+                        RateRowEditEntry(code, it.label, code !in hidden, code == projected)
+                    }
+                }
+            RateRowEditor(list, list.editorTitle, entries)
+        }
+
+        /** What the sheet is called. The heading it edits, not the type's name. */
+        private val RateRowList.editorTitle: String
+            get() = when (this) {
+                RateRowList.FX_BANKS -> "은행 순서 설정"
+                RateRowList.TETHER_EXCHANGES -> "거래소 순서 설정"
+            }
 
         private val zone = ZoneId.of("Asia/Seoul")
         private val basisFormatter = DateTimeFormatter.ofPattern("yyyy.MM.dd HH:mm 'KST'").withZone(zone)

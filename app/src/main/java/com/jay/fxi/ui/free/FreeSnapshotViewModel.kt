@@ -6,9 +6,13 @@ import com.jay.fxi.data.free.FreeSnapshotReadState
 import com.jay.fxi.data.free.FreeSnapshotScheduler
 import com.jay.fxi.data.local.FreeTabStore
 import com.jay.fxi.data.local.FreeVisibleSeriesStore
+import com.jay.fxi.data.local.RateRowPreferenceStore
 import com.jay.fxi.domain.model.FreeSeriesVisibility
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphPeriod
+import com.jay.fxi.domain.model.RateRowList
+import com.jay.fxi.domain.model.RateRowPreference
+import com.jay.fxi.domain.model.RateRowRoster
 import dagger.hilt.android.lifecycle.HiltViewModel
 import java.io.IOException
 import javax.inject.Inject
@@ -22,17 +26,20 @@ class FreeSnapshotViewModel internal constructor(
     private val readState: StateFlow<FreeSnapshotReadState>,
     val activityCoordinator: FreeSnapshotActivityCoordinator,
     private val tabStore: FreeTabStore,
-    private val seriesStore: FreeVisibleSeriesStore
+    private val seriesStore: FreeVisibleSeriesStore,
+    private val rowStore: RateRowPreferenceStore
 ) : ViewModel() {
     @Inject constructor(
         scheduler: FreeSnapshotScheduler,
         tabStore: FreeTabStore,
-        seriesStore: FreeVisibleSeriesStore
+        seriesStore: FreeVisibleSeriesStore,
+        rowStore: RateRowPreferenceStore
     ) : this(
         scheduler.readState,
         FreeSnapshotActivityCoordinator(scheduler::onActivated, scheduler::onDeactivated),
         tabStore,
-        seriesStore
+        seriesStore,
+        rowStore
     )
 
     private var uid: String? = null
@@ -41,6 +48,9 @@ class FreeSnapshotViewModel internal constructor(
 
     /** Only tabs chosen for. Absent means the tab's default; present-and-empty means all-off. */
     private var storedSeries: Map<FreeTab, Set<String>> = emptyMap()
+
+    /** Only lists chosen for, and each axis of those independently. Absent means the defaults. */
+    private var storedRows: Map<RateRowList, RateRowPreference> = emptyMap()
     private val _uiState = MutableStateFlow(FreeSnapshotUiState())
     val uiState: StateFlow<FreeSnapshotUiState> = _uiState.asStateFlow()
 
@@ -76,10 +86,17 @@ class FreeSnapshotViewModel internal constructor(
         } catch (_: IOException) {
             emptyMap()
         }
+        // Same reason as the series: read whole, once, so no later interaction has to suspend.
+        val rows = try {
+            rowStore.preferences(uid)
+        } catch (_: IOException) {
+            emptyMap()
+        }
         this.uid = uid
         this.tab = restored
         this.period = FreeSnapshotUiState.DEFAULT_PERIOD
         this.storedSeries = series
+        this.storedRows = rows
         publish()
     }
 
@@ -121,6 +138,64 @@ class FreeSnapshotViewModel internal constructor(
         }
     }
 
+    /**
+     * Adopt what the sheet came back with, for one list.
+     *
+     * **Only the codes that arrived are the sheet's to speak for.** A payload that carried three
+     * banks says nothing about the seventh, so the seventh's stored place and visibility are kept
+     * rather than dropped — otherwise opening the sheet on a thin day and pressing 완료 would
+     * quietly forget every choice the user made about a source that happened to be absent.
+     *
+     * An axis the user has not touched stays absent. Recording the arrival order as though it were
+     * chosen would freeze the list and send every source the server adds later to the end.
+     */
+    fun applyRowPreference(
+        list: RateRowList,
+        seeded: List<String>,
+        order: List<String>,
+        hidden: Set<String>
+    ) {
+        val owner = uid ?: return
+        val arrived = order.toSet()
+        val stored = storedRows[list]
+        val defaults = RateRowRoster.hiddenByDefault(list)
+
+        // A code that did not arrive keeps its seat; the sheet's answer is poured into the rest.
+        //
+        // Seats are held by position, so a source that is off the air today comes back where its
+        // neighbours remember it. Everything the sheet showed — codes the stored order has never
+        // seen included — is poured into the seats left over, in the order the user arranged, and
+        // whatever does not fit follows at the end. An earlier version poured only the codes that
+        // already had a seat and appended the rest, which sent a new source the user had just
+        // dragged to the front straight back to the end. Found by review.
+        //
+        // Either way the codes that were on screen keep the order the user gave them.
+        val mergedOrder = stored?.order?.let { previous ->
+            val pouring = ArrayDeque(order)
+            previous.map { if (it in arrived) pouring.removeFirstOrNull() else it }
+                .filterNotNull() + pouring
+        } ?: order
+
+        val mergedHidden = (stored?.hidden ?: defaults).filterNot { it in arrived }.toSet() + hidden
+
+        val next = RateRowPreference(
+            // An order the user did not give is not recorded. Writing the arrival order down
+            // because they happened to hide something would freeze the list, and every source the
+            // server adds afterwards would land at the end for good.
+            order = if (order == seeded) stored?.order else mergedOrder,
+            hidden = mergedHidden
+        )
+        storedRows = storedRows + (list to next)
+        publish()
+        viewModelScope.launch {
+            try {
+                rowStore.remember(owner, list, next)
+            } catch (_: IOException) {
+                // Losing the choice is not worth taking the surface down for.
+            }
+        }
+    }
+
     fun selectPeriod(period: GraphPeriod) {
         if (uid == null || this.period == period) return
         this.period = period
@@ -133,7 +208,8 @@ class FreeSnapshotViewModel internal constructor(
         val selected = tab ?: return
         _uiState.value = FreeSnapshotUiState.from(
             owner, selected, period, readState.value,
-            FreeSeriesVisibility.resolve(selected, storedSeries[selected])
+            FreeSeriesVisibility.resolve(selected, storedSeries[selected]),
+            storedRows
         )
     }
 

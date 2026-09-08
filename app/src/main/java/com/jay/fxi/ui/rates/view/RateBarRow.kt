@@ -237,6 +237,8 @@ fun RateBarRow(
  * fails, so the shape is one the app has already chosen rather than a new one invented here. It is
  * owned by the row instead of borrowed from `BankIcon`, which is four lines of the same thing with
  * no tests and two paid callers — one more consumer is exactly the coupling the graph gate is about.
+ * The editing sheet is `internal` to this package and shares this one rather than growing a second
+ * copy: the mark a row wears and the mark its entry in the sheet wears have to be the same mark.
  *
  * **The mark carries the name.** Only the reference row prints its source, so without a description
  * here every other row reads out as a number with no owner — worse than the plain two-column list
@@ -244,7 +246,7 @@ fun RateBarRow(
  * the monogram's two letters while leaving the monogram itself on screen.
  */
 @Composable
-private fun RateRowGlyph(code: String, label: String, modifier: Modifier = Modifier) {
+internal fun RateRowGlyph(code: String, label: String, modifier: Modifier = Modifier) {
     val bank = Bank.fromCode(code)
     if (bank != null) {
         Image(

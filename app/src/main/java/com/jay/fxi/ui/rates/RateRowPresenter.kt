@@ -1,5 +1,6 @@
 package com.jay.fxi.ui.rates
 
+import com.jay.fxi.domain.model.RateRowList
 import com.jay.fxi.domain.model.ScalePolicyCalculator
 import kotlinx.datetime.Instant
 
@@ -34,7 +35,14 @@ data class RateQuoteGroup(
     val title: String,
     val asset: String,
     val quotes: List<RateQuote>,
-    val reference: RateReference = RateReference.FirstRow
+    val reference: RateReference = RateReference.FirstRow,
+    /**
+     * The roster this heading is, when it is one the user can rearrange.
+     *
+     * Carried through rather than matched on the title later: a heading and its editor have to be
+     * the same thing, and two places spelling the same Korean string is not the same thing.
+     */
+    val list: RateRowList? = null
 )
 
 /** What the group's differences are measured against. */
@@ -82,6 +90,8 @@ data class RateRow(
 data class RateRowsView(
     val title: String,
     val asset: String,
+    /** Null for a heading nobody arranges — the tether tab's USD/KRW context rows. */
+    val list: RateRowList? = null,
     val rows: List<RateRow>,
     /**
      * What the bars are drawn against — `ScalePolicy`'s display range, so one outlier cannot
@@ -138,6 +148,7 @@ object RateRowPresenter {
             RateRowsView(
                 title = group.title,
                 asset = group.asset,
+                list = group.list,
                 rows = group.quotes.map { quote -> quote.row(reference, ownsReference) },
                 domain = domain
             )

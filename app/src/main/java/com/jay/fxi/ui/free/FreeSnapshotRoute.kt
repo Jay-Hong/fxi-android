@@ -63,6 +63,7 @@ fun FreeSnapshotRoute(
         onSelectTab = viewModel::selectTab,
         onSelectPeriod = viewModel::selectPeriod,
         onToggleSeries = viewModel::toggleSeries,
+        onApplyRowPreference = viewModel::applyRowPreference,
         onSignOut = onSignOut,
         onSubscribe = onSubscribe,
         modifier = modifier

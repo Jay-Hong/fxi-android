@@ -103,6 +103,7 @@ class FreeFullscreenZoomTest {
                 onSelectTab = {},
                 onSelectPeriod = { state = uiState(it) },
                 onToggleSeries = {},
+                onApplyRowPreference = { _, _, _, _ -> },
                 onSignOut = {},
                 onSubscribe = {}
             )

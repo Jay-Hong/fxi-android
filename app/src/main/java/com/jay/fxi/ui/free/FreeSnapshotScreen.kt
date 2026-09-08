@@ -27,6 +27,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.runtime.CompositionLocalProvider
 import com.jay.fxi.ui.rates.view.RateBarRow
+import com.jay.fxi.ui.rates.view.RateRowCustomizeSheet
 import com.jay.fxi.ui.theme.LocalRateLayoutMetrics
 import com.jay.fxi.ui.theme.RateLayoutMetrics
 import androidx.compose.foundation.pager.HorizontalPager
@@ -59,6 +60,7 @@ import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.SupportedCurrency
 import com.jay.fxi.domain.model.GraphPeriod
+import com.jay.fxi.domain.model.RateRowList
 import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.ui.components.PeriodTabBar
 import com.jay.fxi.ui.graph.GraphChart
@@ -79,6 +81,7 @@ fun FreeSnapshotScreen(
     onSelectTab: (FreeTab) -> Unit,
     onSelectPeriod: (GraphPeriod) -> Unit,
     onToggleSeries: (String) -> Unit,
+    onApplyRowPreference: (RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onSignOut: () -> Unit,
     onSubscribe: () -> Unit,
     userInfo: UserInfo? = null,
@@ -152,7 +155,7 @@ fun FreeSnapshotScreen(
         // impossible, rather than a guard that has to stay ahead of the coroutine that races it.
         val selected = selectedTab ?: return@Column
         FreeSnapshotTabs(selected, state, pageState, onSelectTab, onSelectPeriod, onToggleSeries,
-            onExpand = { fullscreen = true }, onSubscribe = onSubscribe)
+            onApplyRowPreference, onExpand = { fullscreen = true }, onSubscribe = onSubscribe)
     }
     }
 }
@@ -165,6 +168,7 @@ private fun ColumnScope.FreeSnapshotTabs(
     onSelectTab: (FreeTab) -> Unit,
     onSelectPeriod: (GraphPeriod) -> Unit,
     onToggleSeries: (String) -> Unit,
+    onApplyRowPreference: (RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onExpand: () -> Unit,
     onSubscribe: () -> Unit
 ) {
@@ -231,6 +235,7 @@ private fun ColumnScope.FreeSnapshotTabs(
                 state = if (tab == selected) state else FreeSnapshotUiState(uid = state.uid),
                 onSelectPeriod = onSelectPeriod,
                 onToggleSeries = onToggleSeries,
+                onApplyRowPreference = onApplyRowPreference,
                 onExpand = onExpand,
                 onSubscribe = onSubscribe
             )
@@ -246,6 +251,7 @@ private fun FreeSnapshotTabContent(
     state: FreeSnapshotUiState,
     onSelectPeriod: (GraphPeriod) -> Unit,
     onToggleSeries: (String) -> Unit,
+    onApplyRowPreference: (RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onExpand: () -> Unit,
     onSubscribe: () -> Unit
 ) {
@@ -267,6 +273,20 @@ private fun FreeSnapshotTabContent(
             zoom = GraphZoomState()
             zoomedPeriod = state.period.name
         }
+    }
+
+    // Which list's sheet is open, if any. Held here rather than in the view model because it is a
+    // fact about this screen being on screen, not about the user's data.
+    var editing by rememberSaveable { mutableStateOf<RateRowList?>(null) }
+    state.rowEditors.firstOrNull { it.list == editing }?.let { editor ->
+        RateRowCustomizeSheet(
+            editor = editor,
+            onDismiss = { editing = null },
+            onApply = { seeded, order, hidden ->
+                onApplyRowPreference(editor.list, seeded, order, hidden)
+                editing = null
+            }
+        )
     }
 
     // The metrics are the *window's*, measured outside the list. Read from inside an item they
@@ -326,7 +346,29 @@ private fun FreeSnapshotTabContent(
                 item { Text("표시할 환율 데이터가 없습니다.") }
             }
             state.rateSections.forEach { section ->
-                item { Text(section.title, style = MaterialTheme.typography.titleMedium) }
+                item {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            section.title,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        // The way back. It sits on the heading rather than under the rows so that a
+                        // list with nothing left to draw still has it — that is the case where it
+                        // matters most.
+                        state.rowEditors.firstOrNull { it.list == section.list }?.let { editor ->
+                            TextButton(onClick = { editing = editor.list }) { Text("조정") }
+                        }
+                    }
+                }
+                if (section.rows.isEmpty()) {
+                    item {
+                        Text(
+                            "모두 숨겨져 있습니다. 조정에서 다시 켤 수 있습니다.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
                 section.rows.forEach { row ->
                     item(key = "${section.title}/${row.id}") {
                         RateBarRow(row, section.domain, metrics = rateMetrics)

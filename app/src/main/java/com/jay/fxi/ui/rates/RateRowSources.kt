@@ -5,6 +5,7 @@ import com.jay.fxi.domain.model.Exchange
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.FreeRate
 import com.jay.fxi.domain.model.RateRowList
+import com.jay.fxi.domain.model.RateRowPreference
 import com.jay.fxi.domain.model.RateRowRoster
 import com.jay.fxi.domain.model.SourceRate
 
@@ -26,30 +27,39 @@ import com.jay.fxi.domain.model.SourceRate
  * The free sanitizer already refuses a mismatch (`FreeSnapshotSanitizer.kt:134`) — this keeps the
  * guarantee for callers that do not come through it.
  */
-fun List<ExchangeRate>.asRateScale(title: String, asset: String): RateScale =
-    RateScale(listOf(rateGroup(title, asset, roster = RateRowList.FX_BANKS)))
+fun List<ExchangeRate>.asRateScale(
+    title: String,
+    asset: String,
+    preferences: Map<RateRowList, RateRowPreference>? = null
+): RateScale = RateScale(listOf(rateGroup(title, asset, roster = RateRowList.FX_BANKS, preferences = preferences)))
 
 private fun List<ExchangeRate>.rateGroup(
     title: String,
     asset: String,
     reference: RateReference = RateReference.FirstRow,
-    roster: RateRowList? = null
+    roster: RateRowList? = null,
+    preferences: Map<RateRowList, RateRowPreference>? = null
 ): RateQuoteGroup {
     require(all { it.currency == asset }) {
         "$title declares $asset but holds ${map { it.currency }.distinct()}"
     }
-    return RateQuoteGroup(title, asset, shownBy(roster) { it.bank }.map { it.quote() }, reference)
+    return RateQuoteGroup(
+        title, asset, shownBy(roster, preferences) { it.bank }.map { it.quote() }, reference, roster
+    )
 }
 
 private fun List<SourceRate>.sourceGroup(
     title: String,
     asset: String,
-    roster: RateRowList? = null
+    roster: RateRowList? = null,
+    preferences: Map<RateRowList, RateRowPreference>? = null
 ): RateQuoteGroup {
     require(all { it.asset == asset }) {
         "$title declares $asset but holds ${map { it.asset }.distinct()}"
     }
-    return RateQuoteGroup(title, asset, shownBy(roster) { it.source }.map { it.quote() })
+    return RateQuoteGroup(
+        title, asset, shownBy(roster, preferences) { it.source }.map { it.quote() }, list = roster
+    )
 }
 
 /**
@@ -64,7 +74,11 @@ private fun List<SourceRate>.sourceGroup(
  * A list with no roster keeps every row: the tether tab's two USD/KRW headings hold two banks and a
  * reference quote, and nothing about them is a preference yet.
  */
-private inline fun <T> List<T>.shownBy(roster: RateRowList?, code: (T) -> String): List<T> {
+private inline fun <T> List<T>.shownBy(
+    roster: RateRowList?,
+    preferences: Map<RateRowList, RateRowPreference>?,
+    code: (T) -> String
+): List<T> {
     if (roster == null) return this
     val codes = map(code)
     // A repeated code has no answer here: the roster speaks about codes, so two rows sharing one
@@ -75,8 +89,12 @@ private inline fun <T> List<T>.shownBy(roster: RateRowList?, code: (T) -> String
     require(codes.distinct().size == codes.size) {
         "duplicate codes in one list: ${codes.groupingBy { it }.eachCount().filterValues { it > 1 }.keys}"
     }
-    val shown = RateRowRoster.effective(roster, codes).toSet()
-    return filterIndexed { index, _ -> codes[index] in shown }
+    // Mapped rather than filtered: the roster answers with an *order*, not just a set, and a filter
+    // would keep the payload's order while claiming to honour the user's. The duplicate guard above
+    // is what makes this lookup safe — two rows sharing a code would both resolve to one of them.
+    val shown = RateRowRoster.effective(roster, codes, preferences?.get(roster)).codes
+    val byCode = mapIndexed { index, item -> codes[index] to item }.toMap()
+    return shown.mapNotNull { byCode[it] }
 }
 
 /**
@@ -86,12 +104,16 @@ private inline fun <T> List<T>.shownBy(roster: RateRowList?, code: (T) -> String
  * ruler with the reference quote supplying the banks' differences. An absent reference is normal,
  * and then the banks fall back to measuring against their own first row.
  */
-fun FreeRate.asRateScales(): List<RateScale> = when (this) {
-    is FreeRate.Flat -> listOf(entries.asRateScale("은행별 환율", asset))
+fun FreeRate.asRateScales(
+    preferences: Map<RateRowList, RateRowPreference>? = null
+): List<RateScale> = when (this) {
+    is FreeRate.Flat -> listOf(entries.asRateScale("은행별 환율", asset, preferences))
 
     is FreeRate.Grouped -> {
         val referenceQuote = usdKrwReference?.quote()
-        val exchanges = usdtKrw.sourceGroup("거래소 USDT/KRW", primaryAsset, RateRowList.TETHER_EXCHANGES)
+        val exchanges = usdtKrw.sourceGroup(
+            "거래소 USDT/KRW", primaryAsset, RateRowList.TETHER_EXCHANGES, preferences
+        )
         val banks = usdKrwBanks.rateGroup(
             title = "은행 USD/KRW",
             asset = USD_KRW,
@@ -100,6 +122,18 @@ fun FreeRate.asRateScales(): List<RateScale> = when (this) {
         val reference = listOfNotNull(usdKrwReference).rateGroup(USD_KRW_REFERENCE_TITLE, USD_KRW)
         listOf(RateScale(listOf(exchanges)), RateScale(listOf(banks, reference)))
     }
+}
+
+/**
+ * The lists in this payload a user can edit, with every quote that arrived — hidden ones included.
+ *
+ * The sheet cannot be built from what is on screen: a hidden row is not on screen, and it is
+ * exactly the row somebody opens the sheet to turn back on. The tether tab's two USD/KRW headings
+ * are absent here because they hold a fixed trio the server picks, not a list anyone arranges.
+ */
+fun FreeRate.editableRosters(): Map<RateRowList, List<RateQuote>> = when (this) {
+    is FreeRate.Flat -> mapOf(RateRowList.FX_BANKS to entries.map { it.quote() })
+    is FreeRate.Grouped -> mapOf(RateRowList.TETHER_EXCHANGES to usdtKrw.map { it.quote() })
 }
 
 /**

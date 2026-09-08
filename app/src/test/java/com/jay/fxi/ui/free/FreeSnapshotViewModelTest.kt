@@ -10,6 +10,7 @@ import com.jay.fxi.data.free.FreeSnapshotReadState
 import com.jay.fxi.data.free.FreeSnapshotScheduler
 import com.jay.fxi.data.local.FreeTabStore
 import com.jay.fxi.data.local.FreeVisibleSeriesStore
+import com.jay.fxi.data.local.RateRowPreferenceStore
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.FreeGraph
 import com.jay.fxi.domain.model.FreeGraphPoint
@@ -18,6 +19,8 @@ import com.jay.fxi.domain.model.FreeRate
 import com.jay.fxi.domain.model.FreeSnapshot
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphPeriod
+import com.jay.fxi.domain.model.RateRowList
+import com.jay.fxi.domain.model.RateRowPreference
 import com.jay.fxi.domain.model.SourceRate
 import com.jay.fxi.ui.graph.LinePoint
 import com.jay.fxi.domain.repository.FreeSnapshotFetching
@@ -105,15 +108,33 @@ class FreeSnapshotViewModelTest {
         }
     }
 
+    /** Same shape as the real one: a different owner sees nothing, and writing claims the file. */
+    private class FakeRowStore(
+        private val stored: MutableMap<RateRowList, RateRowPreference> = mutableMapOf()
+    ) : RateRowPreferenceStore {
+        var owner: String? = null
+        val writes = mutableListOf<Pair<RateRowList, RateRowPreference>>()
+
+        override suspend fun preferences(uid: String): Map<RateRowList, RateRowPreference> =
+            if (owner == null || owner == uid) stored.toMap() else emptyMap()
+
+        override suspend fun remember(uid: String, list: RateRowList, preference: RateRowPreference) {
+            owner = uid
+            stored[list] = preference
+            writes += list to preference
+        }
+    }
+
     private fun withViewModel(
         tabStore: FreeTabStore = FakeTabStore(),
         seriesStore: FreeVisibleSeriesStore = FakeSeriesStore(),
+        rowStore: RateRowPreferenceStore = FakeRowStore(),
         block: suspend TestScope.(FreeSnapshotViewModel, MutableStateFlow<FreeSnapshotReadState>) -> Unit
     ) = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
         val reads = MutableStateFlow(FreeSnapshotReadState())
         val vm = FreeSnapshotViewModel(
-            reads, FreeSnapshotActivityCoordinator({ _, _ -> }, {}), tabStore, seriesStore
+            reads, FreeSnapshotActivityCoordinator({ _, _ -> }, {}), tabStore, seriesStore, rowStore
         )
         try {
             block(vm, reads)
@@ -235,7 +256,7 @@ class FreeSnapshotViewModelTest {
             clock = { basis + testScheduler.currentTime.milliseconds },
             installId = { "test-install" }
         )
-        val vm = FreeSnapshotViewModel(scheduler, FakeTabStore(), FakeSeriesStore())
+        val vm = FreeSnapshotViewModel(scheduler, FakeTabStore(), FakeSeriesStore(), FakeRowStore())
         try {
             scheduler.start()
             vm.bind("u1")
@@ -373,6 +394,231 @@ class FreeSnapshotViewModelTest {
         // …and the hidden row is gone from the scale too, not merely from the list.
         assertTrue("씨티가 도메인에 남아 있다", vm.uiState.value.rateSections.single().domain!!.endInclusive < 1401.0)
     }
+
+    /**
+     * The sheet's answer reaches the screen and the store, and the order it did not change is not
+     * written down.
+     *
+     * Recording the arrival order because somebody hid one bank would freeze the list: every source
+     * the server added afterwards would land at the end for good. So the sheet returns what it was
+     * seeded with, and only a difference from that counts as an order.
+     */
+    @Test
+    fun hidingOneBankStoresTheHiddenSetAndNotAnOrder() {
+        val rows = FakeRowStore()
+        withViewModel(FakeTabStore("u1" to FreeTab.USD), rowStore = rows) { vm, reads ->
+            reads.value = readState(snapshot = fxSnapshot())
+            vm.bind("u1")
+            val seeded = listOf("investing", "kb", "hana")
+            vm.applyRowPreference(RateRowList.FX_BANKS, seeded, seeded, setOf("kb"))
+            testScheduler.runCurrent()
+
+            assertEquals(listOf("investing", "hana"), vm.uiState.value.rateSections.single().rows.map { it.id })
+            val written = rows.writes.single().second
+            assertNull("순서를 바꾸지 않았는데 순서가 기록됐다", written.order)
+            // The defaults become the user's own set the moment they have one — Citi has to stay in
+            // it or the next launch would show a bank they never asked for. Absent means defaults,
+            // and once the set exists the defaults no longer apply to it at all.
+            assertEquals(setOf("citi", "kb"), written.hidden)
+        }
+    }
+
+    /** Reordering is written down, because that one the user did ask for. */
+    @Test
+    fun reorderingIsStored() {
+        val rows = FakeRowStore()
+        withViewModel(FakeTabStore("u1" to FreeTab.USD), rowStore = rows) { vm, reads ->
+            reads.value = readState(snapshot = fxSnapshot())
+            vm.bind("u1")
+            vm.applyRowPreference(
+                RateRowList.FX_BANKS,
+                seeded = listOf("investing", "kb", "hana"),
+                order = listOf("hana", "investing", "kb"),
+                hidden = emptySet()
+            )
+            testScheduler.runCurrent()
+
+            assertEquals(listOf("hana", "investing", "kb"), vm.uiState.value.rateSections.single().rows.map { it.id })
+            assertEquals(listOf("hana", "investing", "kb"), rows.writes.single().second.order)
+        }
+    }
+
+    /**
+     * A source that did not arrive keeps the choice the user made about it.
+     *
+     * The sheet can only speak for what the payload carried. Treating its answer as the whole truth
+     * would mean that opening it on a thin day and pressing 완료 quietly forgot every choice about a
+     * source that happened to be absent — and the user would have no way to know.
+     */
+    @Test
+    fun aSourceThatDidNotArriveKeepsItsStoredChoice() {
+        val rows = FakeRowStore(
+            mutableMapOf(
+                RateRowList.FX_BANKS to RateRowPreference(
+                    order = listOf("sc", "investing", "bs", "kb", "hana"),
+                    hidden = setOf("bs", "citi")
+                )
+            )
+        )
+        withViewModel(FakeTabStore("u1" to FreeTab.USD), rowStore = rows) { vm, reads ->
+            reads.value = readState(snapshot = fxSnapshot())
+            vm.bind("u1")
+            // Only investing/kb/hana arrived. The sheet moves hana to the front and hides kb.
+            vm.applyRowPreference(
+                RateRowList.FX_BANKS,
+                seeded = listOf("investing", "kb", "hana"),
+                order = listOf("hana", "investing", "kb"),
+                hidden = setOf("kb")
+            )
+            testScheduler.runCurrent()
+
+            val written = rows.writes.single().second
+            // sc and bs keep their seats; the three that arrived fill the rest in their new order.
+            assertEquals(listOf("sc", "hana", "bs", "investing", "kb"), written.order)
+            // bs and citi were not on screen, so their hidden state is untouched; kb joins them.
+            assertEquals(setOf("bs", "citi", "kb"), written.hidden)
+        }
+    }
+
+    /**
+     * A source the stored order has never seen can be dragged anywhere, not just to the end.
+     *
+     * The first version filled the seats the stored list already had, so a code with no seat was
+     * appended however far the user had dragged it — investing moved to the front came back last.
+     * Found by review; the sheet's order is the whole truth about the codes it showed.
+     */
+    @Test
+    fun aNewSourceCanBeDraggedToTheFront() {
+        val rows = FakeRowStore(
+            mutableMapOf(RateRowList.FX_BANKS to RateRowPreference(order = listOf("kb", "hana")))
+        )
+        withViewModel(FakeTabStore("u1" to FreeTab.USD), rowStore = rows) { vm, reads ->
+            reads.value = readState(snapshot = fxSnapshot())
+            vm.bind("u1")
+            // investing has no stored seat, so the sheet opens on [kb, hana, investing].
+            val editor = vm.uiState.value.rowEditors.single()
+            assertEquals(listOf("kb", "hana", "investing"), editor.entries.map { it.code })
+
+            vm.applyRowPreference(
+                RateRowList.FX_BANKS,
+                seeded = listOf("kb", "hana", "investing"),
+                order = listOf("investing", "kb", "hana"),
+                hidden = emptySet()
+            )
+            testScheduler.runCurrent()
+
+            assertEquals(listOf("investing", "kb", "hana"), rows.writes.single().second.order)
+            assertEquals(
+                listOf("investing", "kb", "hana"),
+                vm.uiState.value.rateSections.single().rows.map { it.id }
+            )
+        }
+    }
+
+    /**
+     * Hiding everything still draws one row, and the sheet says that row is only borrowed.
+     *
+     * D18: the projection must not change what is stored. The store still says all three are
+     * hidden, and the editor marks the drawn one so the sheet can say why it is there.
+     */
+    @Test
+    fun hidingEverythingDrawsOneBorrowedRow() {
+        val rows = FakeRowStore()
+        withViewModel(FakeTabStore("u1" to FreeTab.USD), rowStore = rows) { vm, reads ->
+            reads.value = readState(snapshot = fxSnapshot())
+            vm.bind("u1")
+            vm.applyRowPreference(
+                RateRowList.FX_BANKS,
+                seeded = listOf("investing", "kb", "hana"),
+                order = listOf("investing", "kb", "hana"),
+                hidden = setOf("investing", "kb", "hana")
+            )
+            testScheduler.runCurrent()
+
+            assertEquals(listOf("investing"), vm.uiState.value.rateSections.single().rows.map { it.id })
+            assertEquals(setOf("citi", "investing", "kb", "hana"), rows.writes.single().second.hidden)
+            val editor = vm.uiState.value.rowEditors.single { it.list == RateRowList.FX_BANKS }
+            assertEquals(listOf(true, false, false), editor.entries.map { it.projected })
+            assertTrue("숨긴 행이 편집 목록에서 사라졌다", editor.entries.none { it.visible })
+        }
+    }
+
+    /**
+     * The heading survives an empty list, because it is where the way back lives.
+     *
+     * Everything hidden leaves one projected row here, so the emptier case is the section being
+     * dropped entirely — which would take the 조정 button with it.
+     */
+    @Test
+    fun anEditableHeadingSurvivesWithNothingToDraw() {
+        withViewModel(FakeTabStore("u1" to FreeTab.USD)) { vm, reads ->
+            // Citi alone: hidden by default, and not a rescue candidate either.
+            reads.value = readState(
+                snapshot = fxSnapshot(listOf(ExchangeRate("usd-krw", "citi", 1401.6, basis)))
+            )
+            vm.bind("u1")
+            val section = vm.uiState.value.rateSections.single()
+            assertTrue("행이 남아 있다", section.rows.isEmpty())
+            assertEquals(RateRowList.FX_BANKS, section.list)
+            assertEquals(1, vm.uiState.value.rowEditors.size)
+        }
+    }
+
+    /**
+     * A stored arrangement is in force from the first frame, not from the first edit.
+     *
+     * The whole point of the store. Everything else here writes and then reads its own memory, so
+     * without this the surface could ignore the file entirely and every other test would pass.
+     */
+    @Test
+    fun aStoredArrangementIsAppliedOnBind() {
+        val rows = FakeRowStore(
+            mutableMapOf(
+                RateRowList.FX_BANKS to RateRowPreference(
+                    order = listOf("hana", "investing", "kb"),
+                    hidden = setOf("kb")
+                )
+            )
+        )
+        withViewModel(FakeTabStore("u1" to FreeTab.USD), rowStore = rows) { vm, reads ->
+            reads.value = readState(snapshot = fxSnapshot())
+            vm.bind("u1")
+            assertEquals(
+                listOf("hana", "investing"),
+                vm.uiState.value.rateSections.single().rows.map { it.id }
+            )
+            // …and the sheet opens on the same arrangement, hidden row included.
+            val editor = vm.uiState.value.rowEditors.single()
+            assertEquals(listOf("hana", "investing", "kb"), editor.entries.map { it.code })
+            assertEquals(listOf(true, true, false), editor.entries.map { it.visible })
+            assertTrue("읽기만 했는데 기록됐다", rows.writes.isEmpty())
+        }
+    }
+
+    /** Another owner's stored arrangement is not read for this one. */
+    @Test
+    fun anotherOwnersArrangementIsNotRead() {
+        val rows = FakeRowStore(
+            mutableMapOf(RateRowList.FX_BANKS to RateRowPreference(hidden = setOf("investing")))
+        ).apply { owner = "someone-else" }
+        withViewModel(FakeTabStore("u1" to FreeTab.USD), rowStore = rows) { vm, reads ->
+            reads.value = readState(snapshot = fxSnapshot())
+            vm.bind("u1")
+            assertEquals(
+                listOf("investing", "kb", "hana"),
+                vm.uiState.value.rateSections.single().rows.map { it.id }
+            )
+        }
+    }
+
+    private fun fxSnapshot(
+        entries: List<ExchangeRate> = listOf(
+            ExchangeRate("usd-krw", "investing", 1398.8, basis),
+            ExchangeRate("usd-krw", "kb", 1399.0, basis),
+            ExchangeRate("usd-krw", "hana", 1398.4, basis)
+        )
+    ) = snapshot(FreeSnapshotKey("usd", FreeSnapshotUiState.DEFAULT_PERIOD))
+        .copy(rate = FreeRate.Flat("usd-krw", entries))
 
     /**
      * The tether tab's rate block is three groups, not a flat list with extras: exchanges, banks
