@@ -78,14 +78,15 @@ object GraphSeriesStyles {
     /** `investing.usd` and `bithumb.usdt-krw` both key on what precedes the first dot. */
     internal fun sourceOf(seriesId: String): String = seriesId.substringBefore('.')
 
-    /** Only 빗썸 reaches this: the other four exchanges have line overrides above. */
-    private val EXCHANGE_COLORS = mapOf(
-        "upbit" to 0xFF093687,
-        "bithumb" to 0xFFFF6D00,
-        "coinone" to 0xFF004CE4,
-        "korbit" to 0xFF000000,
-        "gopax" to 0xFF2C2B2A
-    )
+    /**
+     * The brand colours, owned by [Exchange] because a bar and a line are one identity.
+     *
+     * Only 빗썸 reaches this: the other four have line overrides above, because their brands are
+     * too dark to read as a 1dp stroke on a dark chart. That is a drawing decision layered over the
+     * identity, not a second identity.
+     */
+    private val EXCHANGE_COLORS: Map<String, Long> =
+        Exchange.entries.associate { it.code to it.colorHex }
 
     private const val DXY = "dxy"
     private const val DXY_FUTURES = "dxy_futures"

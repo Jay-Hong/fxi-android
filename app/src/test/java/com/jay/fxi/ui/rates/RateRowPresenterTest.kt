@@ -390,16 +390,24 @@ class RateRowPresenterTest {
      *
      * S1.5's DoD says the presenter must not depend on runtime or network. A comment saying so goes
      * stale the first time somebody reaches for a `Context`; the import list cannot.
+     *
+     * The row composable lives one directory down in `ui.rates.view`, and this scan does not
+     * recurse — so it stays off this list *and* is banned from being imported back up, which the
+     * directory boundary on its own would not prevent. What the scan cannot see is an indirect
+     * dependency or a fully-qualified reference; it is a fence, not a proof.
      */
     @Test
-    fun thePresenterImportsNothingFromThePlatform() {
+    fun thePresenterImportsNothingFromThePlatformOrItsOwnView() {
         val root = File("src/main/java/com/jay/fxi/ui/rates")
         val sources = root.listFiles { f: File -> f.name.endsWith(".kt") }?.toList().orEmpty()
-        assertTrue("presenter 소스를 못 찾았다: ${root.absolutePath}", sources.size >= 4)
-        val banned = listOf("import android.", "import androidx.", "import io.ktor", "import retrofit")
+        assertTrue("presenter 소스를 못 찾았다: ${root.absolutePath}", sources.size >= 5)
+        val banned = listOf(
+            "import android.", "import androidx.", "import io.ktor", "import retrofit",
+            "com.jay.fxi.ui.rates.view"
+        )
         sources.forEach { file ->
-            val offending = file.readLines().filter { line -> banned.any { line.trimStart().startsWith(it) } }
-            assertEquals("${file.name} 이 플랫폼을 끌어들였다: $offending", emptyList<String>(), offending)
+            val offending = file.readLines().filter { line -> banned.any { it in line } }
+            assertEquals("${file.name} 이 플랫폼이나 자기 뷰를 끌어들였다: $offending", emptyList<String>(), offending)
         }
     }
 }

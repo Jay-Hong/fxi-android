@@ -17,10 +17,17 @@ object RateBarAnimation {
     const val DURATION_MILLIS = 500
 
     /**
-     * Reduce Motion turns it off, and so does the first composition — animating a row into
-     * existence draws every bar growing out of nothing, which reads as a value climbing.
+     * Only the first composition is ours to suppress — animating a row into existence draws every
+     * bar growing out of nothing, which reads as a value climbing when nothing moved.
+     *
+     * D19's other half, Reduce Motion, is the platform's. Compose's window recomposer installs a
+     * `MotionDurationScale` that watches `Settings.Global.ANIMATOR_DURATION_SCALE` through a
+     * `ContentObserver` (`WindowRecomposer.android.kt`), so "Remove animations" makes every
+     * animation on the recomposer's clock finish instantly — and makes them move again the moment
+     * it is switched back. Reading the setting here as well was both redundant and worse: a value
+     * remembered per row never learns that the user changed their mind.
      */
-    fun animates(reduceMotion: Boolean, hasAppeared: Boolean): Boolean = !reduceMotion && hasAppeared
+    fun animates(hasAppeared: Boolean): Boolean = hasAppeared
 }
 
 /**

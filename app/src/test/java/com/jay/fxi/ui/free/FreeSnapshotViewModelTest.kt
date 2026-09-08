@@ -366,7 +366,7 @@ class FreeSnapshotViewModelTest {
         vm.bind("u1")
         assertEquals(
             listOf("거래소 USDT/KRW" to "업비트", "은행 USD/KRW" to "하나은행"),
-            vm.uiState.value.rateSections.map { it.title to it.rows.single().source }
+            vm.uiState.value.rateSections.map { it.title to it.rows.single().label }
         )
     }
 

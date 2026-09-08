@@ -24,6 +24,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.runtime.CompositionLocalProvider
+import com.jay.fxi.ui.rates.view.RateBarRow
+import com.jay.fxi.ui.theme.LocalRateLayoutMetrics
+import com.jay.fxi.ui.theme.RateLayoutMetrics
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
@@ -52,6 +57,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.FreeTab
+import com.jay.fxi.domain.model.SupportedCurrency
 import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.ui.components.PeriodTabBar
@@ -263,6 +269,12 @@ private fun FreeSnapshotTabContent(
         }
     }
 
+    // The metrics are the *window's*, measured outside the list. Read from inside an item they
+    // would be the content width — 40dp narrower here — and the phone/tablet threshold would move
+    // by that much, which is invisible until a device lands between the two.
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+    val rateMetrics = RateLayoutMetrics.fromWindow(maxWidth, maxHeight)
+    CompositionLocalProvider(LocalRateLayoutMetrics provides rateMetrics) {
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
         contentPadding = WindowInsets.navigationBars.asPaddingValues(),
@@ -315,12 +327,9 @@ private fun FreeSnapshotTabContent(
             }
             state.rateSections.forEach { section ->
                 item { Text(section.title, style = MaterialTheme.typography.titleMedium) }
-                section.rows.forEach { rate ->
-                    item {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(rate.source)
-                            Text(rate.value)
-                        }
+                section.rows.forEach { row ->
+                    item(key = "${section.title}/${row.id}") {
+                        RateBarRow(row, section.domain, metrics = rateMetrics)
                     }
                 }
             }
@@ -331,11 +340,23 @@ private fun FreeSnapshotTabContent(
             }
         }
     }
+    }
+    }
 }
 
-/** "달러 · USD/KRW" for a currency tab, the plain title otherwise. */
-private val FreeTab.heading: String
-    get() = currency?.let { "$title · ${it.displayName}" } ?: title
+/**
+ * "달러 · USD/KRW" for a currency tab, the plain title otherwise.
+ *
+ * The yen tab says what its figures are per. The rows print a bare number, matching iOS and the
+ * app's own paid rows, and 950 is meaningless without knowing whether it buys one yen or a
+ * hundred. The unit left the row, so it has to be somewhere — this is the only heading every
+ * figure below it belongs to.
+ */
+internal val FreeTab.heading: String
+    get() = currency?.let {
+        val unit = if (it == SupportedCurrency.JPY_KRW) " · 100엔당" else ""
+        "$title · ${it.displayName}$unit"
+    } ?: title
 
 @Composable
 private fun FreshnessBadge(label: String, delayed: Boolean) {

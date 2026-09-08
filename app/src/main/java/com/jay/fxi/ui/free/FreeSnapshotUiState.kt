@@ -3,8 +3,6 @@ package com.jay.fxi.ui.free
 import com.jay.fxi.data.free.FreeSnapshotFreshness
 import com.jay.fxi.data.free.FreeSnapshotKey
 import com.jay.fxi.data.free.FreeSnapshotReadState
-import com.jay.fxi.domain.model.Exchange
-import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.FreeRate
 import com.jay.fxi.domain.model.FreeSnapshot
 import com.jay.fxi.domain.model.FreeTab
@@ -12,7 +10,9 @@ import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.ui.graph.GraphPreparedBuilder
 import com.jay.fxi.ui.graph.GraphSeriesStyles
 import com.jay.fxi.ui.graph.PreparedGraph
-import com.jay.fxi.domain.model.SourceRate
+import com.jay.fxi.ui.rates.RateRowPresenter
+import com.jay.fxi.ui.rates.RateRowsView
+import com.jay.fxi.ui.rates.asRateScales
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlinx.datetime.Instant
@@ -20,17 +20,20 @@ import kotlinx.datetime.Instant
 /** Missing entries carry no request status: neither a spinner nor an error can be inferred. */
 enum class FreeSnapshotAvailability { AWAITING_SNAPSHOT, FRESH, DELAYED, UNAVAILABLE }
 
-data class FreeSnapshotRateRow(val source: String, val value: String)
-
 /**
- * A titled group of rows.
+ * A titled group of rows, as it will be drawn.
  *
- * The FX tabs have one group and the tether tab has three, which is the shape the server already
- * sends: `FreeRate.Grouped` is not a flat list with extras, it is exchanges, banks and a single
- * reference quote that mean different things beside each other. Flattening them would put 업비트
- * and 하나은행 in one column under one heading and lose what the tab is for.
+ * The FX tabs send one group and the tether tab sends three, which is the shape the server already
+ * has: `FreeRate.Grouped` is not a flat list with extras, it is exchanges, banks and a single
+ * reference quote that mean different things beside each other. Flattening them would put 업비트 and
+ * 하나은행 in one column under one heading and lose what the tab is for.
+ *
+ * The rows keep their numbers. An earlier shape carried `(source: String, value: String)`, which
+ * lost the value, the observation time and the source's identity somewhere between the snapshot and
+ * the Canvas — so the screen could only print two columns of text, and every decision
+ * `RateRowPresenter` makes had nowhere to land.
  */
-data class FreeSnapshotRateSection(val title: String, val rows: List<FreeSnapshotRateRow>)
+typealias FreeSnapshotRateSection = RateRowsView
 
 /** One entry of the graph's series switch. Absent from the snapshot means absent from the row. */
 data class FreeSeriesToggle(val seriesId: String, val label: String, val visible: Boolean)
@@ -121,22 +124,14 @@ data class FreeSnapshotUiState(
             )
         }
 
-        /** Empty groups are dropped rather than shown as headings with nothing under them. */
-        private fun sections(rate: FreeRate): List<FreeSnapshotRateSection> = when (rate) {
-            is FreeRate.Flat -> listOf(FreeSnapshotRateSection("은행별 환율", rate.entries.map { it.row() }))
-            is FreeRate.Grouped -> listOf(
-                FreeSnapshotRateSection("거래소 USDT/KRW", rate.usdtKrw.map { it.row() }),
-                FreeSnapshotRateSection("은행 USD/KRW", rate.usdKrwBanks.map { it.row() }),
-                FreeSnapshotRateSection("기준 USD/KRW", listOfNotNull(rate.usdKrwReference?.row()))
-            )
-        }.filter { it.rows.isNotEmpty() }
-
-        private fun ExchangeRate.row() = FreeSnapshotRateRow(bankType?.displayName ?: bank, formattedRate)
-
-        private fun SourceRate.row() = FreeSnapshotRateRow(
-            Exchange.fromCode(source)?.displayName ?: source,
-            ExchangeRate.formatRate(rate, asset)
-        )
+        /**
+         * Empty groups are dropped rather than shown as headings with nothing under them.
+         *
+         * Each scale is presented on its own, which is the point: the tether tab's exchanges are
+         * USDT/KRW and its two USD/KRW headings share one ruler with each other.
+         */
+        private fun sections(rate: FreeRate): List<FreeSnapshotRateSection> =
+            rate.asRateScales().flatMap { RateRowPresenter.present(it) }.filter { it.rows.isNotEmpty() }
 
         private val zone = ZoneId.of("Asia/Seoul")
         private val basisFormatter = DateTimeFormatter.ofPattern("yyyy.MM.dd HH:mm 'KST'").withZone(zone)

@@ -236,18 +236,18 @@ class RateBarPresentationTest {
     }
 
     /**
-     * Reduce Motion cannot reach the cue's memory.
+     * The only motion gate we own is the first composition.
      *
-     * iOS returns before updating its baseline while the setting is on, so the first cue after
-     * turning it off is measured against a value of unknown age. Here the flag is only an argument
-     * to [RateBarAnimation.animates] and no path through [RateCueTracker.accept] skips the update.
-     * Whether the wiring calls `accept` at all is the wiring's contract, checked where it is wired.
+     * Reduce Motion belongs to the platform: Compose's recomposer watches the animator duration
+     * scale and finishes animations instantly while it is zero, reactively. Reading it here as well
+     * would be a second, staler opinion — and the cue's memory must not depend on it either, which
+     * is why [RateCueTracker] cannot see it. iOS returns before updating its baseline while the
+     * setting is on, so its first cue afterwards is measured against a value of unknown age.
      */
     @Test
-    fun reduceMotionOnlyDecidesWhetherToAnimate() {
-        assertTrue(RateBarAnimation.animates(reduceMotion = false, hasAppeared = true))
-        assertTrue("Reduce Motion should snap", !RateBarAnimation.animates(reduceMotion = true, hasAppeared = true))
-        assertTrue("the first composition should snap", !RateBarAnimation.animates(reduceMotion = false, hasAppeared = false))
+    fun theOnlyMotionGateHereIsTheFirstComposition() {
+        assertTrue(RateBarAnimation.animates(hasAppeared = true))
+        assertTrue("the first composition should snap", !RateBarAnimation.animates(hasAppeared = false))
         assertEquals(500, RateBarAnimation.DURATION_MILLIS)
     }
 
