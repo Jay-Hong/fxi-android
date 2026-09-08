@@ -11,6 +11,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.MockResponse
@@ -34,16 +35,23 @@ import org.junit.Test
  */
 class TopicTransportTest {
 
-    private companion object { const val LOCAL = "http://localhost/ws" }
+    private companion object {
+        const val LOCAL = "http://localhost/ws"
+        const val NORMAL_CLOSURE = 1000
+    }
 
     private lateinit var server: MockWebServer
     private lateinit var client: OkHttpClient
     private lateinit var transport: TopicTransport
 
+    /** The server's end of the socket, kept only so [stop] can end it too. */
+    @Volatile private var peer: WebSocket? = null
+
     /** The server side of each test, installed before the socket is opened. */
     private fun serve(onText: (WebSocket, String) -> Unit) {
         server.enqueue(
             MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) { peer = webSocket }
                 override fun onMessage(webSocket: WebSocket, text: String) = onText(webSocket, text)
             })
         )
@@ -52,6 +60,7 @@ class TopicTransportTest {
 
     @Before
     fun start() {
+        peer = null
         server = MockWebServer()
         client = OkHttpClient.Builder()
             .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -61,13 +70,62 @@ class TopicTransportTest {
 
     @After
     fun stop() {
-        // A graceful close waits for the peer, which the server is about to stop being. Everything
-        // is torn down from this side first so the server's queue is not still holding a socket.
-        transport.close()
-        client.dispatcher.cancelAll()
-        client.connectionPool.evictAll()
-        client.dispatcher.executorService.shutdown()
-        server.shutdown()
+        // Teardown runs in two parts, and the second part always runs.
+        //
+        // `MockWebServer.shutdown()` gives each of its task queues five seconds to fall idle and
+        // then throws `IOException("Gave up waiting for queue to shut down")`. That is what failed
+        // `frames keep the order they arrived in` on CI at `24b0628` — in teardown, after its
+        // assertions had passed. A connection is served on such a queue (`MockWebServer.kt:468` in
+        // okhttp 4.12.0, `cancelable = false`), and for a web socket that task is a blocking read
+        // loop: the queue stays busy until the loop reads a close frame. The old teardown closed
+        // this end only and went straight to `shutdown()`, so whether that frame reached the
+        // server inside the five seconds was left unsequenced.
+        //
+        // **Not reproduced locally.** Closing or not closing each end, four combinations, all shut
+        // down in 0-2 ms here, so what delayed the frame on that CI run is not established. This
+        // closes a window rather than a diagnosed cause.
+        var failure: Throwable? = null
+        try {
+            awaitClosedHandshake()
+        } catch (waitFailed: Throwable) {
+            failure = waitFailed
+        }
+        try {
+            // Reached even when the wait above threw — otherwise one slow close would leak a
+            // client, a server and a socket into every test after it, and the run would fail
+            // somewhere with no relation to the cause. Found by review.
+            transport.cancel()
+            client.dispatcher.cancelAll()
+            client.connectionPool.evictAll()
+            client.dispatcher.executorService.shutdown()
+            server.shutdown()
+        } catch (cleanupFailed: Throwable) {
+            // The first failure is the one that explains the rest, so it stays the one thrown.
+            val first = failure
+            if (first == null) failure = cleanupFailed else first.addSuppressed(cleanupFailed)
+        }
+        failure?.let { throw it }
+    }
+
+    /**
+     * The server closes, this side answers, and teardown waits for the stream to end.
+     *
+     * Ending the socket from the server's side is what the read loop above is waiting to hear;
+     * `TopicTransport.onClosing` answers it. **What the wait proves depends on how the stream
+     * ended**: on `Closed` this side has written its close frame, because okhttp raises `onClosed`
+     * from `writeOneFrame` *after* `writeClose` (`RealWebSocket.kt:533-537`, 4.12.0). The stream
+     * also ends on `Failed` and on `cancel()`, and then the wait is a bound and nothing more —
+     * `TopicTransport` closes its outbox on all three. Nothing is asserted here, because each test
+     * body already asserts its own outcome and a second opinion in teardown would answer for a
+     * test that has already spoken. Found by review.
+     *
+     * `close()` and not `cancel()`: a server-side `RealWebSocket` has no `Call` behind it and
+     * `cancel()` throws `NullPointerException` where it stands.
+     */
+    private fun awaitClosedHandshake() {
+        val serverHalf = peer ?: return
+        serverHalf.close(NORMAL_CLOSURE, null)
+        runBlocking { withTimeout(5.seconds) { transport.events.collect { } } }
     }
 
     private fun dxyFrame(rate: Double) =
@@ -597,7 +655,7 @@ class TopicTransportTest {
             }
         }
 
-    private fun upgradeResponse() = okhttp3.Response.Builder()
+    private fun upgradeResponse() = Response.Builder()
         .request(Request.Builder().url(LOCAL).build())
         .protocol(okhttp3.Protocol.HTTP_1_1).code(101).message("").build()
 
