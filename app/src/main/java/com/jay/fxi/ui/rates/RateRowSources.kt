@@ -4,6 +4,8 @@ import com.jay.fxi.domain.model.Bank
 import com.jay.fxi.domain.model.Exchange
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.FreeRate
+import com.jay.fxi.domain.model.RateRowList
+import com.jay.fxi.domain.model.RateRowRoster
 import com.jay.fxi.domain.model.SourceRate
 
 /**
@@ -25,24 +27,56 @@ import com.jay.fxi.domain.model.SourceRate
  * guarantee for callers that do not come through it.
  */
 fun List<ExchangeRate>.asRateScale(title: String, asset: String): RateScale =
-    RateScale(listOf(rateGroup(title, asset)))
+    RateScale(listOf(rateGroup(title, asset, roster = RateRowList.FX_BANKS)))
 
 private fun List<ExchangeRate>.rateGroup(
     title: String,
     asset: String,
-    reference: RateReference = RateReference.FirstRow
+    reference: RateReference = RateReference.FirstRow,
+    roster: RateRowList? = null
 ): RateQuoteGroup {
     require(all { it.currency == asset }) {
         "$title declares $asset but holds ${map { it.currency }.distinct()}"
     }
-    return RateQuoteGroup(title, asset, map { it.quote() }, reference)
+    return RateQuoteGroup(title, asset, shownBy(roster) { it.bank }.map { it.quote() }, reference)
 }
 
-private fun List<SourceRate>.sourceGroup(title: String, asset: String): RateQuoteGroup {
+private fun List<SourceRate>.sourceGroup(
+    title: String,
+    asset: String,
+    roster: RateRowList? = null
+): RateQuoteGroup {
     require(all { it.asset == asset }) {
         "$title declares $asset but holds ${map { it.asset }.distinct()}"
     }
-    return RateQuoteGroup(title, asset, map { it.quote() })
+    return RateQuoteGroup(title, asset, shownBy(roster) { it.source }.map { it.quote() })
+}
+
+/**
+ * The roster's answer, applied before the group exists rather than after.
+ *
+ * Filtering a built group would leave an `External` reference pointing at a quote that is no longer
+ * on the scale, which `RateRowPresenter` refuses outright. `FirstRow` would survive it — it is a
+ * policy the presenter resolves over whatever list it is handed, not a hold on one quote — but
+ * there is no reason to let the two halves of "what is the reference" be decided at two different
+ * moments. Filtering first means both are decided over what remains.
+ *
+ * A list with no roster keeps every row: the tether tab's two USD/KRW headings hold two banks and a
+ * reference quote, and nothing about them is a preference yet.
+ */
+private inline fun <T> List<T>.shownBy(roster: RateRowList?, code: (T) -> String): List<T> {
+    if (roster == null) return this
+    val codes = map(code)
+    // A repeated code has no answer here: the roster speaks about codes, so two rows sharing one
+    // would both be kept or both dropped, and any attempt to map the roster's answer back onto rows
+    // silently picks one of them for both. The sanitizer guarantees they are distinct — it claims
+    // the first `(source, asset)` and refuses the rest (`FreeSnapshotSanitizer.kt:136`) — so this
+    // says so out loud rather than letting a caller that skipped it corrupt two rows into one.
+    require(codes.distinct().size == codes.size) {
+        "duplicate codes in one list: ${codes.groupingBy { it }.eachCount().filterValues { it > 1 }.keys}"
+    }
+    val shown = RateRowRoster.effective(roster, codes).toSet()
+    return filterIndexed { index, _ -> codes[index] in shown }
 }
 
 /**
@@ -57,7 +91,7 @@ fun FreeRate.asRateScales(): List<RateScale> = when (this) {
 
     is FreeRate.Grouped -> {
         val referenceQuote = usdKrwReference?.quote()
-        val exchanges = usdtKrw.sourceGroup("거래소 USDT/KRW", primaryAsset)
+        val exchanges = usdtKrw.sourceGroup("거래소 USDT/KRW", primaryAsset, RateRowList.TETHER_EXCHANGES)
         val banks = usdKrwBanks.rateGroup(
             title = "은행 USD/KRW",
             asset = USD_KRW,

@@ -2,6 +2,8 @@ package com.jay.fxi.ui.rates
 
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.FreeRate
+import com.jay.fxi.domain.model.RateRowList
+import com.jay.fxi.domain.model.RateRowRoster
 import com.jay.fxi.domain.model.ScalePolicyCalculator
 import com.jay.fxi.domain.model.SourceRate
 import kotlinx.datetime.Instant
@@ -62,18 +64,27 @@ class RateRowPresenterTest {
     private fun cases(): List<Case> {
         val tetherScales = tether.asRateScales()
         return listOf(
-            Case("무료 FX(달러)", freeFx.asRateScales().single(), 6),
+            // 씨티는 명부 기본값이 숨긴다 — 6행이 들어가 5행이 나온다.
+            Case("무료 FX(달러)", freeFx.asRateScales().single(), 5),
             Case("무료 테더 — 거래소", tetherScales[0], 5),
             Case("무료 테더 — USD/KRW 두 섹션", tetherScales[1], 3),
-            Case("유료 은행 목록", premium, 10)
+            // 유료 목록도 같은 명부를 지난다 — `BankPreferenceManager` v2 가 정하는 기본값이고,
+            // 두 표면이 다른 은행 집합을 보이면 그게 갈라진 것이다. 10행이 들어가 9행이 나온다.
+            Case("유료 은행 목록", premium, 9)
         )
     }
 
     // ---- the battery every case runs ----
 
-    /** Nothing the server sent disappears between the wire and the row. */
+    /**
+     * Nothing is lost between the group and the row, and the server's order survives.
+     *
+     * The projection upstream may have left a code out — that is the roster's decision and it is
+     * checked where the roster is. From the group onward every quote reaches a row in the order it
+     * was handed over.
+     */
     @Test
-    fun noQuoteIsLost() {
+    fun noQuoteIsLostAfterTheRoster() {
         cases().forEach { case ->
             val views = RateRowPresenter.present(case.scale)
             assertEquals(case.name, case.quotes, views.sumOf { it.rows.size })
@@ -255,9 +266,8 @@ class RateRowPresenterTest {
      * A code with no display name keeps the code, and keeps its row.
      *
      * The sanitizer decides what may be shown; by the time a quote is here, dropping it would take
-     * a real number off the screen with nothing left to notice the loss by. Citi is the live case —
-     * `FreeSnapshotSanitizer` admits it deliberately, and a filter that hides it belongs to the
-     * preference layer, not to a projection.
+     * a real number off the screen with nothing left to notice the loss by. A source this app has
+     * not been taught about is not the same thing as a source the user turned off.
      */
     @Test
     fun anUnknownCodeKeepsItsRowAndItsName() {
@@ -265,9 +275,78 @@ class RateRowPresenterTest {
         val rows = RateRowPresenter.present(withStranger.asRateScales().single()).single().rows
         assertEquals(listOf("kb", "nonghyup2"), rows.map { it.id })
         assertEquals("nonghyup2", rows.last().label)
-        // …and citi, which the sanitizer admits on purpose, survives the FX projection.
+    }
+
+    /**
+     * Two rows with one code is refused, not silently merged.
+     *
+     * The roster speaks about codes, so mapping its answer back onto rows picks one row for both
+     * and the other quote disappears — measured, kb=1399 beside kb=1401 came out as kb=1401 twice,
+     * moving the reference and the domain with it. The sanitizer claims the first `(source, asset)`
+     * and refuses the rest, so this cannot arrive from the wire; it is the caller that skipped the
+     * sanitizer this protects against. Found by review.
+     */
+    @Test
+    fun twoRowsSharingOneCodeAreRefused() {
+        val duplicated = FreeRate.Flat(
+            "usd-krw",
+            listOf(bank("kb", 1399.0), bank("kb", 1401.0), bank("hana", 1400.0))
+        )
+        val thrown = runCatching { duplicated.asRateScales() }.exceptionOrNull()
+        assertTrue("중복 코드가 통과했다: $thrown", thrown is IllegalArgumentException)
+    }
+
+    /**
+     * Each list consults the roster named for it, and no other.
+     *
+     * The fixtures below are synthetic — the sanitizer confines the tether tab's banks to kb/hana
+     * (`FreeSnapshotSanitizer.kt:180`) and its exchanges to the five, so Citi cannot arrive there.
+     * That is exactly why this needs saying: today the FX roster hides one code that no tether list
+     * can contain, so wiring the wrong roster in changes nothing and nothing notices. The day a
+     * second code is hidden — `kb`, say, which every tether section does carry — the mis-wiring
+     * would quietly empty a section instead.
+     */
+    @Test
+    fun eachListConsultsItsOwnRoster() {
+        val citiEverywhere = FreeRate.Grouped(
+            primaryAsset = "usdt-krw",
+            usdtKrw = listOf(exchange("upbit", 1402.0), SourceRate("citi", "usdt-krw", 1403.0, at)),
+            usdKrwBanks = listOf(bank("hana", 1398.4), bank("citi", 1401.6)),
+            usdKrwReference = bank("investing", 1398.8)
+        )
+        val scales = citiEverywhere.asRateScales()
+        assertEquals(
+            "거래소 목록이 FX 명부를 봤다",
+            listOf("upbit", "citi"),
+            RateRowPresenter.present(scales[0]).single().rows.map { it.id }
+        )
+        assertEquals(
+            "테더 은행 섹션이 FX 명부를 봤다",
+            listOf("hana", "citi"),
+            RateRowPresenter.present(scales[1]).first().rows.map { it.id }
+        )
+    }
+
+    /**
+     * Citi is absent because the roster hides it, not because the projection lost it.
+     *
+     * Naming the reason matters: the sanitizer admits Citi on purpose
+     * (`FreeSnapshotSanitizer.kt:178`), so if it ever vanishes for some other reason this test says
+     * which layer to look at. Turning it back on is the sheet's job when the sheet exists.
+     */
+    @Test
+    fun citiIsHiddenByTheRosterRatherThanDroppedByTheProjection() {
         val fx = RateRowPresenter.present(freeFx.asRateScales().single()).single()
-        assertTrue("씨티가 사라졌다", fx.rows.any { it.id == "citi" })
+        assertTrue("씨티가 보인다", fx.rows.none { it.id == "citi" })
+        assertTrue(
+            "명부가 씨티를 숨기는 주체가 아니다",
+            "citi" in RateRowRoster.hiddenByDefault(RateRowList.FX_BANKS)
+        )
+        // Everything else the payload carried is still there, in the order it arrived.
+        assertEquals(
+            listOf("investing", "kb", "hana", "shinhan", "woori"),
+            fx.rows.map { it.id }
+        )
     }
 
     /**

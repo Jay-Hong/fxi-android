@@ -347,6 +347,34 @@ class FreeSnapshotViewModelTest {
     }
 
     /**
+     * Citi does not reach the screen on a fresh install, and everything else does.
+     *
+     * `ANDROID_V2_PLAN.md:800` — "Citi는 신규 표시 기본에서 제외". The sanitizer admits Citi on
+     * purpose, so this is a default and not a ban; what it must not be is silent, which is why the
+     * assertion is here at the screen state rather than only in the projection's own tests.
+     */
+    @Test
+    fun citiIsNotShownOnAFreshInstall() = withViewModel(FakeTabStore("u1" to FreeTab.USD)) { vm, reads ->
+        val usd = FreeSnapshotKey("usd", FreeSnapshotUiState.DEFAULT_PERIOD)
+        val withCiti = snapshot(usd).copy(
+            rate = FreeRate.Flat(
+                "usd-krw",
+                listOf(
+                    ExchangeRate("usd-krw", "investing", 1398.8, basis),
+                    ExchangeRate("usd-krw", "kb", 1399.0, basis),
+                    ExchangeRate("usd-krw", "citi", 1401.6, basis)
+                )
+            )
+        )
+        reads.value = readState(snapshot = withCiti)
+        vm.bind("u1")
+        val rows = vm.uiState.value.rateSections.single().rows
+        assertEquals(listOf("investing", "kb"), rows.map { it.id })
+        // …and the hidden row is gone from the scale too, not merely from the list.
+        assertTrue("씨티가 도메인에 남아 있다", vm.uiState.value.rateSections.single().domain!!.endInclusive < 1401.0)
+    }
+
+    /**
      * The tether tab's rate block is three groups, not a flat list with extras: exchanges, banks
      * and one reference quote mean different things beside each other. Flattening them would put
      * 업비트 and 하나은행 in one column under one heading.
