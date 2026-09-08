@@ -1,5 +1,6 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.remote.dto.DxyTopicMessage
 import com.jay.fxi.data.remote.dto.FxTopicMessage
 import com.jay.fxi.data.remote.dto.KrxTopicMessage
 import com.jay.fxi.data.remote.dto.SubscriptionAck
@@ -16,6 +17,7 @@ sealed interface DecodedTopicFrame {
     data class Tether(val value: TetherTopicMessage) : DecodedTopicFrame
     data class Krx(val value: KrxTopicMessage) : DecodedTopicFrame
     data class Fx(val value: FxTopicMessage) : DecodedTopicFrame
+    data class Dxy(val value: DxyTopicMessage) : DecodedTopicFrame
     data class Unsupported(val type: String, val topic: String?) : DecodedTopicFrame
     data object NotTopic : DecodedTopicFrame
 }
@@ -31,8 +33,9 @@ class TopicFrameDecoder(private val json: Json) {
             TopicMessageType.SUBSCRIPTION_ERROR -> DecodedTopicFrame.RequestFailure(
                 json.decodeFromString<SubscriptionError>(text)
             )
-            TopicMessageType.SNAPSHOT,
-            TopicMessageType.UPDATE -> decodeDataFrame(envelope, text)
+            // Snapshot only. An `update` frame has no branch of its own and lands in the
+            // unsupported case below, which is D9's "remove from support and ignore".
+            TopicMessageType.SNAPSHOT -> decodeDataFrame(envelope, text)
             WebSocketMessageType.RATES,
             WebSocketMessageType.PONG -> DecodedTopicFrame.NotTopic
             else -> DecodedTopicFrame.Unsupported(envelope.type, envelope.topic)
@@ -43,6 +46,7 @@ class TopicFrameDecoder(private val json: Json) {
         when (val topic = envelope.topic) {
             "usdt:krw" -> DecodedTopicFrame.Tether(json.decodeFromString<TetherTopicMessage>(text))
             "krx:usd-krw-futures" -> DecodedTopicFrame.Krx(json.decodeFromString<KrxTopicMessage>(text))
+            "dxy:spot" -> DecodedTopicFrame.Dxy(json.decodeFromString<DxyTopicMessage>(text))
             null -> DecodedTopicFrame.Unsupported(envelope.type, null)
             else -> if (topic.startsWith("fx:")) {
                 DecodedTopicFrame.Fx(json.decodeFromString<FxTopicMessage>(text))

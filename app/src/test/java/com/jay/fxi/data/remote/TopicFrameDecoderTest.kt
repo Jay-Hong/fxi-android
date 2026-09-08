@@ -59,6 +59,50 @@ class TopicFrameDecoderTest {
         )
     }
 
+    /** The dollar index gets a branch of its own — it is not a `(source, asset)` topic. */
+    @Test
+    fun `the dollar index snapshot routes to its own frame`() {
+        val frame = decoder.decode(
+            """
+            {
+              "type":"snapshot","version":1,"topic":"dxy:spot",
+              "data":{"dxy":{
+                "rate":104.52,"timestamp":"2026-08-21T14:30:00+09:00","source":"investing"
+              }}
+            }
+            """.trimIndent()
+        )
+
+        assertTrue(frame is DecodedTopicFrame.Dxy)
+        assertEquals(104.52, (frame as DecodedTopicFrame.Dxy).value.data.dxy.rate, 0.0)
+    }
+
+    /**
+     * An `update` frame is ignored rather than decoded (D9).
+     *
+     * The server is snapshot-only. `update` used to share the snapshot branch, which meant a frame
+     * nobody sends had a live parsing path — and, for a known topic, would have reached the domain
+     * as though it were a snapshot. It now lands in the unsupported case, which is where the
+     * transport drops it.
+     */
+    @Test
+    fun `an update frame is unsupported rather than decoded`() {
+        assertEquals(
+            DecodedTopicFrame.Unsupported("update", "usdt:krw"),
+            decoder.decode(
+                """{"type":"update","version":1,"topic":"usdt:krw","data":{"usdt_krw":[]}}"""
+            )
+        )
+    }
+
+    /** …and a dollar-index snapshot with no index in it is malformed, not empty. */
+    @Test
+    fun `a dollar index snapshot without the index fails closed`() {
+        assertThrows(SerializationException::class.java) {
+            decoder.decode("""{"type":"snapshot","version":1,"topic":"dxy:spot","data":{}}""")
+        }
+    }
+
     @Test
     fun `known topic with malformed payload fails closed`() {
         assertThrows(SerializationException::class.java) {

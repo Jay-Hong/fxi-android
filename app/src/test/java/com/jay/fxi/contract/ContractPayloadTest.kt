@@ -70,10 +70,13 @@ class ContractPayloadTest {
         assertTrue(
             decoder.decode(corpus.text("topic-snapshot-krx")) is DecodedTopicFrame.Krx
         )
-        assertEquals(
-            DecodedTopicFrame.Unsupported("snapshot", "dxy:spot"),
-            decoder.decode(corpus.text("topic-snapshot-dxy"))
-        )
+        val dxy = decoder.decode(corpus.text("topic-snapshot-dxy"))
+        assertTrue(dxy is DecodedTopicFrame.Dxy)
+        // The captured payload, not the shape the guide describes: this golden came off
+        // `app.dxy_topic_publisher.build_dxy_topic_payload`, and it is what says the DTO reads the
+        // real thing rather than a faithful reading of prose.
+        assertEquals(103.4, (dxy as DecodedTopicFrame.Dxy).value.data.dxy.rate, 0.0)
+        assertEquals("investing", dxy.value.data.dxy.source)
         assertEquals(
             DecodedTopicFrame.NotTopic,
             decoder.decode(corpus.text("topic-control-pong"))

@@ -136,7 +136,65 @@ class TopicMessageTest {
             message.data.usdtKrw.single().mergeAt
         )
         assertNull(message.data.usdKrwReference)
-        assertNull(message.data.usdKrwFutures)
+    }
+
+    /**
+     * A futures group on the wire never reaches the tether domain.
+     *
+     * D8. ADR-038 D2 moved KRX to a topic of its own, and an older server can still send the key.
+     * `ignoreUnknownKeys` absorbs it only because nothing declares it — the field used to be
+     * declared, parsed and folded into `allEntries`, which put a KRX quote inside the tether domain
+     * on a build that has no entitlement check for one. Asserted through `allEntries` rather than
+     * through the absent field, because the absent field is exactly what cannot be named here.
+     */
+    @Test
+    fun `a futures group on the wire never reaches the tether domain`() {
+        val message = json.decodeFromString<TetherTopicMessage>(
+            """
+            {
+              "type":"snapshot","version":1,"topic":"usdt:krw",
+              "data":{
+                "usdt_krw":[{
+                  "source":"upbit","asset":"usdt-krw","rate":1485.0,
+                  "timestamp":"2026-05-12T06:00:00Z"
+                }],
+                "usd_krw_banks":[],
+                "usd_krw_futures":{
+                  "source":"krx","asset":"usd-krw-futures","rate":1380.0,
+                  "timestamp":"2026-05-12T06:00:00Z"
+                }
+              }
+            }
+            """.trimIndent()
+        )
+
+        assertEquals(listOf("upbit"), message.data.allEntries.map { it.source })
+    }
+
+    /**
+     * The dollar index decodes as itself, with no asset to key it by.
+     *
+     * `dxy:spot` is the one topic whose payload is not a list of `(source, asset)` entries, so it
+     * has no `allEntries` to join: folding it into that shape would invent an asset the server
+     * never sent. `source` says which supplier answered, not which instrument it is.
+     */
+    @Test
+    fun `the dollar index carries a supplier and no asset`() {
+        val message = json.decodeFromString<DxyTopicMessage>(
+            """
+            {
+              "type":"snapshot","version":1,"topic":"dxy:spot",
+              "data":{"dxy":{
+                "rate":104.52,"timestamp":"2026-08-21T14:30:00+09:00","source":"investing"
+              }}
+            }
+            """.trimIndent()
+        )
+
+        val dxy = message.data.dxy
+        assertEquals(104.52, dxy.rate, 0.0)
+        assertEquals("investing", dxy.source)
+        assertEquals(Instant.parse("2026-08-21T05:30:00Z"), dxy.timestamp)
     }
 
     @Test

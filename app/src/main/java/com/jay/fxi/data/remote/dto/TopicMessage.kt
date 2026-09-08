@@ -7,9 +7,15 @@ import kotlinx.datetime.Instant
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
+/**
+ * Frame types this client understands.
+ *
+ * `update` is deliberately absent (D9). The server is snapshot-only, and a declared `update` would
+ * be a second data path nobody sends and nothing tests — an `update` frame now falls through to
+ * the decoder's unsupported branch and is ignored, which is what the decision asks for.
+ */
 object TopicMessageType {
     const val SNAPSHOT = "snapshot"
-    const val UPDATE = "update"
     const val SUBSCRIPTION_ACK = "subscription_ack"
     const val SUBSCRIPTION_ERROR = "subscription_error"
 }
@@ -154,6 +160,15 @@ data class TetherTopicMessage(
     val data: TetherTopicData
 )
 
+/**
+ * The tether topic's groups — **futures is not one of them** (D8).
+ *
+ * `usd_krw_futures` used to ride along here and ADR-038 D2 moved KRX to a topic of its own. The key
+ * may still arrive from an older server, and declaring it is what would let it through: a field
+ * that is not declared is absorbed by `ignoreUnknownKeys` (`NetworkModule.kt`), while a declared
+ * one is parsed and, as it was, folded into [allEntries] — KRX in the tether domain, on a build
+ * that has no entitlement check for it yet. Removing the declaration is the enforcement.
+ */
 @Serializable
 data class TetherTopicData(
     @SerialName("usdt_krw")
@@ -161,16 +176,13 @@ data class TetherTopicData(
     @SerialName("usd_krw_banks")
     val usdKrwBanks: List<TopicSourceEntry>,
     @SerialName("usd_krw_reference")
-    val usdKrwReference: TopicSourceEntry? = null,
-    @SerialName("usd_krw_futures")
-    val usdKrwFutures: TopicSourceEntry? = null
+    val usdKrwReference: TopicSourceEntry? = null
 ) {
     val allEntries: List<TopicSourceEntry>
         get() = buildList {
             addAll(usdtKrw)
             addAll(usdKrwBanks)
             usdKrwReference?.let(::add)
-            usdKrwFutures?.let(::add)
         }
 }
 
@@ -190,6 +202,45 @@ data class KrxTopicData(
     val allEntries: List<TopicSourceEntry>
         get() = listOfNotNull(usdKrwFutures)
 }
+
+/**
+ * The dollar index, which is not a currency pair.
+ *
+ * Every other topic carries `(source, asset)` entries; DXY has no asset, and the identifier is the
+ * topic itself. `source` is whichever supplier answered — investing, cnbc or yahoo — so it says
+ * where the number came from rather than which instrument it is, and it must not be keyed like the
+ * others. The shape matches the legacy `rates.data.indices.dxy` block, but the type is its own: the
+ * legacy DTO goes with the legacy consumer it belongs to.
+ */
+@Serializable
+data class DxySpotEntry(
+    val rate: Double,
+    @Serializable(with = InstantSerializer::class)
+    val timestamp: Instant,
+    val source: String
+)
+
+@Serializable
+data class DxyTopicMessage(
+    val type: String,
+    val version: Int,
+    val topic: String,
+    val data: DxyTopicData
+)
+
+/**
+ * Required, not optional.
+ *
+ * The publisher refuses to build a payload it cannot normalise (`app/dxy_topic_publisher.py`
+ * raises rather than emitting an empty group), so a `dxy:spot` snapshot without the index is
+ * malformed rather than empty. Declaring it nullable would turn that into a silently absent
+ * reading; leaving it required makes the decoder fail and the transport isolate the frame, which
+ * is what D11 asks for.
+ */
+@Serializable
+data class DxyTopicData(
+    val dxy: DxySpotEntry
+)
 
 @Serializable
 data class FxTopicMessage(
