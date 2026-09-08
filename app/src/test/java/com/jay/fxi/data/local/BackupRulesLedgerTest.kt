@@ -36,8 +36,8 @@ class BackupRulesLedgerTest {
 
         // v1, with **no UID at all**. `ANDROID_V2_PLAN.md:804-805` requires that a backup restore
         // not attribute v1 bank preferences to another UID, and a file that never recorded one
-        // cannot help doing exactly that. Excluded here; the file itself goes with the legacy
-        // surface it belongs to.
+        // cannot help doing exactly that. Excluded here, and deleted outright on start — see
+        // `RetiredStores`, and `theRetiredStoresAreAlsoKeptOutOfBackup` below for why both.
         "fxi_bank_preferences" to false,
 
         // v1, no UID either, and the same shape of problem — but `ANDROID_V2_PLAN.md:1209` already
@@ -94,6 +94,23 @@ class BackupRulesLedgerTest {
 
     private fun excludedIn(xml: String) =
         EXCLUDE.findAll(xml).map { it.groupValues[1] }.toSortedSet()
+
+    /**
+     * Nothing this app deletes on start is also carried between devices.
+     *
+     * A store on both lists would be destroyed here and handed back by the next device transfer,
+     * which is a decision undone by a backup rule rather than by anyone. The reverse is not a rule
+     * — `fxi_access_epoch` must not travel and must certainly not be deleted — so this checks one
+     * direction only.
+     */
+    @Test
+    fun theRetiredStoresAreAlsoKeptOutOfBackup() {
+        RetiredStores.NAMES.forEach {
+            assertEquals(
+                "$it 를 시작할 때 지우면서 백업으로는 돌려받는다", false, expected[it]
+            )
+        }
+    }
 
     /**
      * The allowlist switch has not happened unnoticed.

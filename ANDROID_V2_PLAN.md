@@ -1218,6 +1218,13 @@ v1 store는 소유권 또는 shape가 v2 계약과 맞지 않으므로 **이관�
 - migration journal은 대상별 `detected → consumer_cutover → legacy_deleted`를 기록한다. 각 target의 새 저장소 commit과
   소비자 전환이 성공한 뒤에만 legacy를 삭제하며, crash 후 재실행은 delete/commit을 멱등하게 반복한다.
   journal·legacy cache·token·capability는 backup에서 제외해 marker만/legacy만 복원되는 조합을 만들지 않는다
+  - **예외 — `fxi_bank_preferences` 이 한 target에 한해 journal 전이를 요구하지 않는다.** 소비자 전환이 이미
+    끝났고(v2 row preference store), commit할 새 상태가 없으며(:801이 변환 이관을 금지하므로 "저장된 선호 없음"
+    이라는 부재 자체가 v2 기본값이라 쓰기가 0), 삭제는 파일 제거라 재실행이 멱등하고 거부는 성공으로 보고되지
+    않는다. `detected → consumer_cutover → legacy_deleted`가 순서 지을 것이 남아 있지 않다. `RetiredStores`가
+    이 경로를 맡는다. **이 예외는 여기서 끝난다** — "변환 없이 삭제"라는 성질만으로는 예외가 되지 않는다.
+    S3의 `rates`·`rates_timestamp`(:1206)도 decode/이관 없이 지우지만 그쪽은 cutover가 아직이고 :869가 성공한
+    cutover 뒤 journal 기록을 명시하므로, 그 target을 포함해 다른 모든 target의 journal·cutover 계약은 그대로다
 - backup **allowlist 파일**에는 UID-scoped last tab, bank/source order·visibility, free/premium graph visible+initialized,
   premium alert last-selected bank/source, 순수 UI section expansion만 둔다. 이 값들은 전용
   `BackupableUserIntentStore`(단일 별도 DataStore 파일)에 물리적으로 격리하며 UID key가 없으면 backup을 허용하지 않는다
