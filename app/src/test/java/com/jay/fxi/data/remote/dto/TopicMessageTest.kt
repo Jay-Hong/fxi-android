@@ -3,6 +3,7 @@ package com.jay.fxi.data.remote.dto
 import com.jay.fxi.domain.model.TopicRejectionReason
 import com.jay.fxi.domain.model.TopicWholeRequestFailure
 import com.jay.fxi.domain.model.RateSanity
+import com.jay.fxi.domain.model.TopicLeasePolicy
 import com.jay.fxi.domain.model.TopicDollarIndex
 import com.jay.fxi.domain.model.TopicQuote
 import kotlinx.datetime.Instant
@@ -71,7 +72,13 @@ class TopicMessageTest {
             SubscriptionAckTopic("a", leaseId = "L1"),
             SubscriptionAckTopic("a", leaseDurationSeconds = 60),
             SubscriptionAckTopic("a", leaseId = "", leaseDurationSeconds = 60),
-            SubscriptionAckTopic("a", leaseId = "L1", leaseDurationSeconds = -1)
+            SubscriptionAckTopic("a", leaseId = "L1", leaseDurationSeconds = -1),
+            // Past the ceiling, where converting to nanoseconds saturates and the duration the
+            // server sent can no longer be told from any larger one.
+            SubscriptionAckTopic(
+                "a", leaseId = "L1",
+                leaseDurationSeconds = TopicLeasePolicy.MAX_DURATION_SECONDS + 1
+            )
         )
 
         malformed.forEach { item ->

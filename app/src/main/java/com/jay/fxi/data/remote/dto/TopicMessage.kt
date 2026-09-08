@@ -1,6 +1,7 @@
 package com.jay.fxi.data.remote.dto
 
 import com.jay.fxi.domain.model.RateSanity
+import com.jay.fxi.domain.model.TopicLeasePolicy
 import com.jay.fxi.domain.model.TopicDollarIndex
 import com.jay.fxi.domain.model.TopicQuote
 import com.jay.fxi.domain.model.TopicRejectionReason
@@ -132,7 +133,10 @@ fun readTopicLeases(items: List<SubscriptionAckTopic>): TopicLeaseReadResult {
         val duration = item.leaseDurationSeconds
         when {
             leaseId == null && duration == null -> Unit
-            leaseId.isNullOrEmpty() || duration == null || duration < 0 -> {
+            // `isCountable` rather than `>= 0`: a duration past the ceiling saturates when it is
+            // converted to nanoseconds, so every larger lease reads as the same number and the one
+            // the server sent is gone. Out of contract, like a negative one.
+            leaseId.isNullOrEmpty() || duration == null || !TopicLeasePolicy.isCountable(duration) -> {
                 return TopicLeaseReadResult.Malformed
             }
             else -> leases += TopicLease(item.topic, leaseId, duration)
