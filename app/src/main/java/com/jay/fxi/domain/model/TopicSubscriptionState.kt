@@ -134,12 +134,24 @@ sealed interface TopicPurgeScope {
     data class Topics(val values: Set<String>) : TopicPurgeScope
 }
 
+/** Proof that the holder opened the request currently in flight. */
+@ConsistentCopyVisibility
+data class TopicRequestTicket internal constructor(private val serial: Long)
+
+/** Proof that the holder started the credential recovery currently in flight. */
+@ConsistentCopyVisibility
+data class TopicAuthRefreshTicket internal constructor(private val serial: Long)
+
 /** Mutable reducer for canonical topic facts. Every exposed snapshot is immutable. */
 class TopicSubscriptionStateStore {
     private val topics = linkedMapOf<String, TopicSubscriptionState>()
     private var controlState = TopicControlState.IDLE
     private var wholeFailure: TopicWholeRequestFailure? = null
     private var authResolution = TopicAuthResolution.RESOLVED
+    private var requestSerial = 0L
+    private var currentTicket: TopicRequestTicket? = null
+    private var authRefreshSerial = 0L
+    private var currentAuthTicket: TopicAuthRefreshTicket? = null
 
     val snapshot: TopicSubscriptionSnapshot
         get() = TopicSubscriptionSnapshot(
@@ -165,9 +177,54 @@ class TopicSubscriptionStateStore {
         }
     }
 
-    fun beginRequest() {
+    /**
+     * Opens a request, and hands back the only thing allowed to close it.
+     *
+     * The ticket exists because "is the state still `PENDING`?" is not a test of ownership: a
+     * replacement command is `PENDING` too, so a late ending from the command it replaced would
+     * close *its* request. Review demonstrated both halves of that — a released replacement and a
+     * failed one — and a cancelled command with no replacement leaving `PENDING` behind for good.
+     */
+    fun beginRequest(): TopicRequestTicket {
         controlState = TopicControlState.PENDING
         wholeFailure = null
+        return TopicRequestTicket(++requestSerial).also { currentTicket = it }
+    }
+
+    /**
+     * The command gave up without the server ever having said why.
+     *
+     * A spent budget and a send that never left are real endings, and neither of them is a
+     * `subscription_error`: there is no [TopicWholeRequestFailure] to record, and inventing one
+     * would put a server verdict in the store that no server gave. What must not survive is
+     * [TopicControlState.PENDING] — a request still reading as in flight after the only thing that
+     * could answer it has stopped.
+     *
+     * The **ticket** is what keeps this off the next command's request; the `PENDING` check only
+     * keeps it off a verdict that did arrive. Review demonstrated the difference: a replacement is
+     * `PENDING` too, so the state alone said nothing about whose request this was.
+     */
+    fun giveUpRequest(ticket: TopicRequestTicket) {
+        if (!claim(ticket)) return
+        if (controlState == TopicControlState.PENDING) {
+            controlState = TopicControlState.FAILED
+        }
+    }
+
+    /** The command stopped because nobody wants its topics any more — not a failure. */
+    fun releaseRequest(ticket: TopicRequestTicket) {
+        if (!claim(ticket)) return
+        if (controlState == TopicControlState.PENDING) {
+            controlState = TopicControlState.IDLE
+            wholeFailure = null
+        }
+    }
+
+    /** True once, for the holder of the open request; every later or foreign ending is ignored. */
+    private fun claim(ticket: TopicRequestTicket): Boolean {
+        if (currentTicket != ticket) return false
+        currentTicket = null
+        return true
     }
 
     fun applyAck(
@@ -207,8 +264,53 @@ class TopicSubscriptionStateStore {
         }
     }
 
-    fun beginAuthRefresh() {
+    /**
+     * Starts the one forced refresh a rejected credential is owed, and says who owns it.
+     *
+     * A ticket for the same reason the request has one: a command torn down beside its replacement
+     * must not end the replacement's recovery, and — the case review demonstrated — a command
+     * cancelled *during* its own refresh has to be able to end that recovery rather than leave
+     * `REFRESHING` standing with nothing behind it.
+     */
+    fun beginAuthRefresh(): TopicAuthRefreshTicket {
         authResolution = TopicAuthResolution.REFRESHING
+        return TopicAuthRefreshTicket(++authRefreshSerial).also { currentAuthTicket = it }
+    }
+
+    /**
+     * The forced refresh finished and produced a usable credential.
+     *
+     * `REFRESHING` says a refresh is *running*, so it has to end when the refresh does rather than
+     * when whatever follows is answered. Left to be cleared by the next acknowledgement, a replay
+     * that goes unanswered — or a budget that runs out — leaves the app reading as mid-recovery
+     * with nothing recovering. It says nothing about whether the new credential works: only an
+     * `invalid_token` for it, through [applyWholeFailure], says that. Found by review.
+     */
+    fun endAuthRefresh(ticket: TopicAuthRefreshTicket) {
+        if (!claimAuthRefresh(ticket)) return
+        if (authResolution == TopicAuthResolution.REFRESHING) {
+            authResolution = TopicAuthResolution.RESOLVED
+        }
+    }
+
+    /**
+     * The recovery stopped without producing anything, so the refusal that started it stands.
+     *
+     * Not [endAuthRefresh]: that one is for a refresh that handed back a usable credential, and
+     * treating an abandoned one the same way would report a recovery that never happened. The
+     * credential the server refused is still the last thing anybody knows. Found by review.
+     */
+    fun abandonAuthRefresh(ticket: TopicAuthRefreshTicket) {
+        if (!claimAuthRefresh(ticket)) return
+        if (authResolution == TopicAuthResolution.REFRESHING) {
+            authResolution = TopicAuthResolution.FAILED
+        }
+    }
+
+    private fun claimAuthRefresh(ticket: TopicAuthRefreshTicket): Boolean {
+        if (currentAuthTicket != ticket) return false
+        currentAuthTicket = null
+        return true
     }
 
     fun recordFrame(topic: String) {

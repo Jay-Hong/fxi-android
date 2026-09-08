@@ -90,6 +90,147 @@ class TopicSubscriptionStateTest {
         assertEquals(TopicRejectionReason.TOPICS_DISABLED, store.snapshot.stateFor(topic).rejection)
     }
 
+    /**
+     * A command that gave up leaves a failure, not a request that still reads as in flight.
+     *
+     * There is no `subscription_error` behind a spent budget, so there is no
+     * [TopicWholeRequestFailure] to record — but `PENDING` outliving the only thing that could
+     * answer it is worse than an unexplained failure.
+     */
+    @Test
+    fun `giving up closes a pending request without inventing a server verdict`() {
+        val store = TopicSubscriptionStateStore()
+        store.setDesired(true, topic)
+        store.giveUpRequest(store.beginRequest())
+
+        assertEquals(TopicControlState.FAILED, store.snapshot.controlState)
+        assertNull(store.snapshot.wholeFailure)
+    }
+
+    /** Stopping because nobody wants the topics is not a failure. */
+    @Test
+    fun `releasing a pending request leaves it idle`() {
+        val store = TopicSubscriptionStateStore()
+        store.setDesired(true, topic)
+        store.releaseRequest(store.beginRequest())
+
+        assertEquals(TopicControlState.IDLE, store.snapshot.controlState)
+    }
+
+    /**
+     * Neither ending writes over a verdict that did arrive.
+     *
+     * Both are guarded on `PENDING`, so a late call — from a command being torn down beside the
+     * one that replaced it — cannot turn an acknowledged subscription back into a failure, or a
+     * server's failure into an idle request.
+     */
+    @Test
+    fun `neither ending disturbs a request that was already answered`() {
+        val acknowledged = TopicSubscriptionStateStore()
+        acknowledged.setDesired(true, topic)
+        val answered = acknowledged.beginRequest()
+        acknowledged.applyAck(setOf(topic), emptyMap(), setOf(topic))
+        acknowledged.giveUpRequest(answered)
+        acknowledged.releaseRequest(answered)
+        assertEquals(TopicControlState.ACKNOWLEDGED, acknowledged.snapshot.controlState)
+
+        val failed = TopicSubscriptionStateStore()
+        failed.setDesired(true, topic)
+        val refused = failed.beginRequest()
+        failed.applyWholeFailure(TopicWholeRequestFailure.InvalidRequest)
+        failed.releaseRequest(refused)
+        assertEquals(TopicControlState.FAILED, failed.snapshot.controlState)
+        assertEquals(TopicWholeRequestFailure.InvalidRequest, failed.snapshot.wholeFailure)
+    }
+
+    /**
+     * A replacement's request survives the ending of the command it replaced.
+     *
+     * `PENDING` is not ownership — the replacement is `PENDING` too — so without the ticket a late
+     * ending from the outgoing command closed the incoming one's request. Both directions were
+     * demonstrated in review; both are checked here.
+     */
+    @Test
+    fun `an outgoing command cannot end its replacement's request`() {
+        val released = TopicSubscriptionStateStore()
+        val outgoing = released.beginRequest()
+        released.beginRequest()
+        released.releaseRequest(outgoing)
+        assertEquals(TopicControlState.PENDING, released.snapshot.controlState)
+
+        val failed = TopicSubscriptionStateStore()
+        val abandoned = failed.beginRequest()
+        failed.beginRequest()
+        failed.giveUpRequest(abandoned)
+        assertEquals(TopicControlState.PENDING, failed.snapshot.controlState)
+    }
+
+    /** A ticket is spent once, so a command cannot end the same request twice. */
+    @Test
+    fun `a ticket cannot be used twice`() {
+        val store = TopicSubscriptionStateStore()
+        val ticket = store.beginRequest()
+        store.releaseRequest(ticket)
+        val second = store.beginRequest()
+        store.giveUpRequest(ticket)
+
+        assertEquals(TopicControlState.PENDING, store.snapshot.controlState)
+        store.giveUpRequest(second)
+        assertEquals(TopicControlState.FAILED, store.snapshot.controlState)
+    }
+
+    /**
+     * A finished refresh stops reading as one that is still running.
+     *
+     * `REFRESHING` describes a fetch in progress. Left for the next acknowledgement to clear, a
+     * replay that is never answered leaves the app mid-recovery with nothing recovering.
+     */
+    @Test
+    fun `ending a refresh resolves it without claiming the new credential works`() {
+        val store = TopicSubscriptionStateStore()
+        store.applyWholeFailure(TopicWholeRequestFailure.InvalidToken)
+        store.endAuthRefresh(store.beginAuthRefresh())
+        assertEquals(TopicAuthResolution.RESOLVED, store.snapshot.authResolution)
+
+        // …and it only ends a refresh. A credential the server has just refused stays refused.
+        store.applyWholeFailure(TopicWholeRequestFailure.InvalidToken)
+        val stale = store.beginAuthRefresh()
+        store.applyWholeFailure(TopicWholeRequestFailure.InvalidToken)
+        store.endAuthRefresh(stale)
+        assertEquals(TopicAuthResolution.FAILED, store.snapshot.authResolution)
+    }
+
+    /**
+     * An abandoned recovery leaves the refusal that started it standing.
+     *
+     * `endAuthRefresh` is for one that produced a credential. Using it for a recovery that was
+     * cancelled would report a recovery that never happened; the token the server refused is still
+     * the last thing anybody knows about.
+     */
+    @Test
+    fun `abandoning a refresh returns to the refusal that started it`() {
+        val store = TopicSubscriptionStateStore()
+        store.applyWholeFailure(TopicWholeRequestFailure.InvalidToken)
+        store.abandonAuthRefresh(store.beginAuthRefresh())
+        assertEquals(TopicAuthResolution.FAILED, store.snapshot.authResolution)
+    }
+
+    /** Neither ending reaches a recovery somebody else started. */
+    @Test
+    fun `an outgoing command cannot end its replacement's recovery`() {
+        val ended = TopicSubscriptionStateStore()
+        val outgoing = ended.beginAuthRefresh()
+        ended.beginAuthRefresh()
+        ended.endAuthRefresh(outgoing)
+        assertEquals(TopicAuthResolution.REFRESHING, ended.snapshot.authResolution)
+
+        val abandoned = TopicSubscriptionStateStore()
+        val leaving = abandoned.beginAuthRefresh()
+        abandoned.beginAuthRefresh()
+        abandoned.abandonAuthRefresh(leaving)
+        assertEquals(TopicAuthResolution.REFRESHING, abandoned.snapshot.authResolution)
+    }
+
     @Test
     fun `revalidation is single-shot until a frame recovers it`() {
         val store = TopicSubscriptionStateStore()
