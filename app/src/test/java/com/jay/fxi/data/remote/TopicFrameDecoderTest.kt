@@ -103,6 +103,34 @@ class TopicFrameDecoderTest {
         }
     }
 
+    /**
+     * The keep-alive answer is its own frame, and the legacy payload is not it.
+     *
+     * A pong timeout waits for this. Sharing a case with `rates` — which the server pushes to
+     * everyone the instant they connect — would let a connection that answers nothing look like
+     * one that answers pings.
+     */
+    @Test
+    fun `the keep-alive answer is told apart from the legacy payload`() {
+        assertEquals(DecodedTopicFrame.Pong, decoder.decode("""{"type":"pong"}"""))
+        assertEquals(
+            DecodedTopicFrame.NotTopic,
+            decoder.decode("""{"type":"rates","data":{},"graph_buckets":{}}""")
+        )
+    }
+
+    /**
+     * There is no raw-text fast path for a pong (D10).
+     *
+     * The client sends raw `ping`; the server answers in JSON. A bare `pong` on the wire is not
+     * JSON, so it fails to decode like any other malformed frame and the transport isolates it —
+     * accepting it here would invent a keep-alive contract the server does not have.
+     */
+    @Test
+    fun `a raw text pong is not a pong`() {
+        assertThrows(SerializationException::class.java) { decoder.decode("pong") }
+    }
+
     @Test
     fun `known topic with malformed payload fails closed`() {
         assertThrows(SerializationException::class.java) {

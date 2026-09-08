@@ -19,6 +19,21 @@ sealed interface DecodedTopicFrame {
     data class Fx(val value: FxTopicMessage) : DecodedTopicFrame
     data class Dxy(val value: DxyTopicMessage) : DecodedTopicFrame
     data class Unsupported(val type: String, val topic: String?) : DecodedTopicFrame
+
+    /**
+     * The server's answer to a keep-alive.
+     *
+     * Its own case rather than [NotTopic], because the transport needs it: this is the evidence a
+     * pong timeout waits for. Folded in with the legacy `rates` frame, as it was, a connection
+     * that only ever received `rates` would look like one that was answering pings — and `rates`
+     * is what the server sends everyone the moment they connect.
+     *
+     * D10: the answer is **JSON**, `{"type":"pong"}`. There is no raw-text fast path; a bare
+     * `pong` is not JSON at all and fails to decode like any other malformed frame.
+     */
+    data object Pong : DecodedTopicFrame
+
+    /** A frame this decoder does not own — the legacy `rates` payload. */
     data object NotTopic : DecodedTopicFrame
 }
 
@@ -36,8 +51,8 @@ class TopicFrameDecoder(private val json: Json) {
             // Snapshot only. An `update` frame has no branch of its own and lands in the
             // unsupported case below, which is D9's "remove from support and ignore".
             TopicMessageType.SNAPSHOT -> decodeDataFrame(envelope, text)
-            WebSocketMessageType.RATES,
-            WebSocketMessageType.PONG -> DecodedTopicFrame.NotTopic
+            WebSocketMessageType.PONG -> DecodedTopicFrame.Pong
+            WebSocketMessageType.RATES -> DecodedTopicFrame.NotTopic
             else -> DecodedTopicFrame.Unsupported(envelope.type, envelope.topic)
         }
     }

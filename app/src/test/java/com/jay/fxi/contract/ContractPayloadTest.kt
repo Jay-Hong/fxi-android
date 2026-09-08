@@ -77,8 +77,10 @@ class ContractPayloadTest {
         // real thing rather than a faithful reading of prose.
         assertEquals(103.4, (dxy as DecodedTopicFrame.Dxy).value.data.dxy.rate, 0.0)
         assertEquals("investing", dxy.value.data.dxy.source)
+        // The keep-alive answer, told apart from the legacy `rates` frame: only one of them is
+        // evidence that a ping was answered, and the other arrives unbidden on every connection.
         assertEquals(
-            DecodedTopicFrame.NotTopic,
+            DecodedTopicFrame.Pong,
             decoder.decode(corpus.text("topic-control-pong"))
         )
     }
