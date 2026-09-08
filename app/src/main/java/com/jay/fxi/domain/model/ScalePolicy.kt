@@ -51,8 +51,20 @@ object ScalePolicyCalculator {
         rates: List<ExchangeRate>,
         activationRatio: Double = DEFAULT_ACTIVATION_RATIO,
         minVisibleForRobust: Int = DEFAULT_MIN_VISIBLE_FOR_ROBUST
+    ): ScalePolicy = computeValues(rates.map { it.rate }, activationRatio, minVisibleForRobust)
+
+    /**
+     * 값만 있는 목록에서 스케일 정책 계산 (거래소 시세처럼 `ExchangeRate` 가 아닌 탭용).
+     *
+     * iOS 도 같은 이유로 두 진입점을 둔다(`ScalePolicy.swift` 의 `compute(rates:)` / `compute(values:)`).
+     * 은행 목록 쪽은 값을 뽑아 이리로 넘기므로 두 표면이 다른 답을 낼 수 없다.
+     * 이름이 갈린 것은 JVM 에서 `List<ExchangeRate>` 와 `List<Double>` 의 시그니처가 같기 때문이다.
+     */
+    fun computeValues(
+        values: List<Double>,
+        activationRatio: Double = DEFAULT_ACTIVATION_RATIO,
+        minVisibleForRobust: Int = DEFAULT_MIN_VISIBLE_FOR_ROBUST
     ): ScalePolicy {
-        val values = rates.map { it.rate }
         val rawMin = values.minOrNull() ?: return ScalePolicy.empty
         val rawMax = values.maxOrNull() ?: return ScalePolicy.empty
         val rawRange = rawMin to rawMax
