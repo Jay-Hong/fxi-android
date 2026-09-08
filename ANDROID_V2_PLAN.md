@@ -50,6 +50,19 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > `release-admission-b477c22-r1`에서 각각 validator green이다. 기존 `8c18667`·`31df3b9` bundle은 역사 evidence로
 > 보존한다. 이 상태 갱신은 범위·D-결정·게이트·DoD·활성 미결정 O1을 바꾸지 않았고, S1 착수와 public
 > arming·rollout·deploy를 열지 않았다.
+>
+> **동결 후 2번 명시적 개정 기록(Claude·Codex 이중 합의, 사용자 위임 2026-09-08).** §7 S3의
+> "최초 send 시점 기준 절대 45초 delivery deadline"이 두 가지로 읽혔다 — (a) 시도별 앵커,
+> (b) 최초 송신부터 재시도 전체를 묶는 상한. §2.2의 "클라이언트 운용정책은 iOS 기준 SHA를
+> 출발점으로 삼는다"에 따라 **(a)로 확정**했다. 동결 SHA `a36682f`의 iOS는 송신 직전에 두
+> deadline을 새로 앵커하고 재시도에 이전 deadline을 넘기지 않으며
+> (`WebSocketService.swift:533-561`), `testNoResponseStopsAfterExactlyThreeAttemptsIncludingTheFirst`가
+> 최초 포함 3회를 기대한다. 전체 45초 상한을 도입할 제품 요구나 확인된 iOS 결함은 이번 대조에서
+> 찾지 못했다. 원문이 (a)만 뜻했다는 증명은 아니다 — "ACK가 와도 45초를 다시 시작하지 않는다"는
+> (b)도 만족하고, 새 `request_id`가 새 시간 앵커를 함의하지도 않으며, "3회 또는 45초 중 먼저"는
+> 그 자체로 모순 없는 정책이다. 그래서 위 "애매하면 2번으로 처리한다"에 따라 1번이 아니라 2번으로
+> 기록한다. 아래 §7 S3 본문과 DoD를 함께 고쳤고, 3회 시도 예산·슬라이스 경계·release gate는
+> 바꾸지 않았다.
 
 ---
 
@@ -836,8 +849,12 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
 - `TopicSessionCoordinator`: desired = `usdt:krw`, `fx:usd-krw`, `fx:jpy-krw`, `fx:eur-krw`, `dxy:spot`.
   KRX hook은 정의하되 desired/bootstrap 활성화는 S6이 소유한다
 - subscribe에 `request_id` + Firebase `id_token`, ack 상관, `active_subscriptions`를 최종 상태로 수렴(누적 금지)
-- 한 arbiter가 최초 send 시점 기준 **20초 ACK deadline + 절대 45초 delivery deadline**을 소유한다. send 실패·ACK 무응답·
-  `temporarily_unavailable`가 총 3회 시도 예산을 공유하고 매 시도 새 `request_id`; ACK가 와도 45초를 다시 시작하지 않는다.
+- 매 시도는 새 `request_id`를 쓴다. **실제 송신에 도달한 각 시도**가 송신 직전의 단조 시각을 기준으로
+  **20초 ACK deadline과 45초 delivery deadline**을 한 arbiter에 등록한다. ACK는 그 시도의 delivery deadline을
+  연장하지 않는다(= "절대"의 뜻). 재시도는 이전 arbiter를 폐기하고 **새 송신 시각에 두 deadline을 다시 앵커**한다.
+  재시도 가능한 송신 경로 실패·ACK 무응답·`temporarily_unavailable`는 최초 시도를 포함한 **총 3회 예산**을 공유하며,
+  송신 전 준비 단계(토큰 취득 등)의 재시도 가능한 실패도 같은 예산을 쓴다. 최초 송신부터 재시도 전체를 묶는
+  **별도의 45초 delivery deadline은 두지 않는다**(3회 횟수 상한과 기존 연결·권한·의도·lease 만료 종료 조건은 그대로).
   command 완료는 ACK, topic delivery 완료는 topic별 receive-generation 증가로 증명한다
 - 재연결 backoff는 **D3**: linear `2s × attempt ±20%`, 최대 5회, **30초 안정 후에만** attempt 초기화(수신 프레임으로 초기화 금지 — legacy `rates` 프레임 포함)
 - 재연결 후 desired set 일괄 재구독(jitter 0~2초). 앱 foreground/background, network change, premium access state/`userAccessEpoch`을
@@ -868,7 +885,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   legacy rate DTO/repository/VM을 삭제한다. 아직 S7 알림 편집기가 소비하는 `last_bank_*`는 이 단계에서 건드리지 않는다.
   S1에서 만든 journal은 성공한 cutover 뒤에만 rate target을 committed로 표시한다
 - **DoD**: premium 런타임에서 legacy rate API 호출 0 / REST↔WS 경합에서 오래된 값이 최신을 덮지 못함 /
-  3회 공유 budget·absolute 45초·lease-id hard-expiry·30초 안정 후 reconnect reset / server premium rejection 즉시 무료 전환 /
+  3회 공유 budget·시도별 absolute 45초(ACK 비연장)·lease-id hard-expiry·30초 안정 후 reconnect reset / server premium rejection 즉시 무료 전환 /
   최초 delivery watchdog과 persistent-silence owner의 중복 resubscribe 0 / KRX-only가 Tether delivery·freshness를 충족하지 않음 /
   offline cold start에서 정화된 last-known 복원→`refreshingCached/offline` 표시, 복원 seed가 delivery/freshness로 오인되지 않음 /
   live-wins·5초 write throttle·UID/epoch 전환 purge / Tether payload와 disk cache의 KRX 오염 폐기(D8)
@@ -1219,11 +1236,11 @@ v1 store는 소유권 또는 shape가 v2 계약과 맞지 않으므로 **이관�
   소비자 전환이 성공한 뒤에만 legacy를 삭제하며, crash 후 재실행은 delete/commit을 멱등하게 반복한다.
   journal·legacy cache·token·capability는 backup에서 제외해 marker만/legacy만 복원되는 조합을 만들지 않는다
   - **예외 — `fxi_bank_preferences` 이 한 target에 한해 journal 전이를 요구하지 않는다.** 소비자 전환이 이미
-    끝났고(v2 row preference store), commit할 새 상태가 없으며(:801이 변환 이관을 금지하므로 "저장된 선호 없음"
+    끝났고(v2 row preference store), commit할 새 상태가 없으며(:814가 변환 이관을 금지하므로 "저장된 선호 없음"
     이라는 부재 자체가 v2 기본값이라 쓰기가 0), 삭제는 파일 제거라 재실행이 멱등하고 거부는 성공으로 보고되지
     않는다. `detected → consumer_cutover → legacy_deleted`가 순서 지을 것이 남아 있지 않다. `RetiredStores`가
     이 경로를 맡는다. **이 예외는 여기서 끝난다** — "변환 없이 삭제"라는 성질만으로는 예외가 되지 않는다.
-    S3의 `rates`·`rates_timestamp`(:1206)도 decode/이관 없이 지우지만 그쪽은 cutover가 아직이고 :869가 성공한
+    S3의 `rates`·`rates_timestamp`(:1223)도 decode/이관 없이 지우지만 그쪽은 cutover가 아직이고 :886이 성공한
     cutover 뒤 journal 기록을 명시하므로, 그 target을 포함해 다른 모든 target의 journal·cutover 계약은 그대로다
 - backup **allowlist 파일**에는 UID-scoped last tab, bank/source order·visibility, free/premium graph visible+initialized,
   premium alert last-selected bank/source, 순수 UI section expansion만 둔다. 이 값들은 전용

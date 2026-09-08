@@ -12,12 +12,12 @@ import javax.inject.Singleton
 /**
  * Stores a v2 install must not keep, and the files that make them up.
  *
- * `ANDROID_V2_PLAN.md:801` is explicit about `fxi_bank_preferences`: its UID ownership and its
+ * `ANDROID_V2_PLAN.md:814` is explicit about `fxi_bank_preferences`: its UID ownership and its
  * backup-restore provenance cannot be established, so it is **not converted** — the v2 UID
  * defaults stand in for it and the legacy store is deleted. The defaults arrived with
  * `RateRowPreferenceStore`; deleting the file is the other half.
  *
- * Not attributing it to another UID is the point (`:804-805`). Excluding it from backup keeps it
+ * Not attributing it to another UID is the point (`:817-818`). Excluding it from backup keeps it
  * from arriving on a second device, and deleting it keeps the copy that is already on this one
  * from outliving the surface that wrote it. Neither alone is enough: an upgrading phone was never
  * restored onto, so an exclusion says nothing about the file it already has.
@@ -30,7 +30,7 @@ internal object RetiredStores {
      * A name is safe to list here only once nothing v2 reads it. `fxi_bank_preferences` is reached
      * through `BankPreferenceManager`, whose only consumer chain ends at `MainScreen`, which has no
      * caller — so nothing can write it back after a purge. The legacy files themselves belong to
-     * the slices that own their surfaces (`ANDROID_V2_PLAN.md:868`), and are left alone here.
+     * the slices that own their surfaces (`ANDROID_V2_PLAN.md:885`), and are left alone here.
      */
     val NAMES = listOf("fxi_bank_preferences")
 

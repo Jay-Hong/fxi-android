@@ -7,7 +7,7 @@ import org.junit.Test
 
 class FreeTabTest {
 
-    /** `ANDROID_V2_PLAN.md:830`, and iOS `TabSelection.ordered`. Two surfaces, one order. */
+    /** `ANDROID_V2_PLAN.md:843`, and iOS `TabSelection.ordered`. Two surfaces, one order. */
     @Test
     fun theRowIsNewsTetherDollarYenEuro_andOpensOnDollar() {
         assertEquals(

@@ -68,7 +68,7 @@ internal object RateRowPreferenceCodec {
      *
      * **Duplicates are dropped, first occurrence winning.** This is the boundary where disk becomes
      * data, and a file is not something this build wrote: it survives updates, and D27 makes this
-     * one travel between devices. `ANDROID_V2_PLAN.md:799` asks for exactly this — dedup with the
+     * one travel between devices. `ANDROID_V2_PLAN.md:812` asks for exactly this — dedup with the
      * relative order kept. Downstream reads the answer as a list of distinct codes: `arrangement`
      * keeps whatever the stored order holds, `effective` hands it to the rows, and the sheet uses
      * the code as a `LazyColumn` key — so a repeated code would draw one row twice and then throw

@@ -3,7 +3,7 @@ package com.jay.fxi.domain.model
 /**
  * The five tabs of the free surface, in display order.
  *
- * Order and opening selection are the plan's (`ANDROID_V2_PLAN.md:830`) and iOS's
+ * Order and opening selection are the plan's (`ANDROID_V2_PLAN.md:843`) and iOS's
  * `TabSelection.ordered`: 뉴스 → 테더 → 달러 → 엔화 → 유로, opening on 달러. The three currency
  * titles are read off [SupportedCurrency] rather than repeated here — iOS keeps one ordered list
  * for exactly this reason, and a title that drifts on one surface alone is a change no test would
