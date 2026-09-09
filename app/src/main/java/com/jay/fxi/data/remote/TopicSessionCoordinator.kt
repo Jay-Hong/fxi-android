@@ -17,6 +17,10 @@ import com.jay.fxi.domain.model.TopicRates
 import com.jay.fxi.domain.model.TopicReconnectPolicy
 import com.jay.fxi.domain.model.TopicPurgeScope
 import com.jay.fxi.domain.model.TopicRejectionReason
+import com.jay.fxi.domain.model.TopicSilenceArming
+import com.jay.fxi.domain.model.TopicSilenceDecision
+import com.jay.fxi.domain.model.TopicSilenceEvidence
+import com.jay.fxi.domain.model.TopicSilencePolicy
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -131,6 +135,22 @@ private sealed interface SessionInput {
     data class RenewalDue(val generation: Long) : SessionInput
 
     /**
+     * D14's window may have run out.
+     *
+     * Carries a **window** ticket rather than a generation: the window outlives the connection it
+     * was armed on, so filtering by generation would drop the events that matter most.
+     */
+    data class SilenceDue(val ticket: Long) : SessionInput
+
+    /**
+     * The connection's request channel is free again.
+     *
+     * A start that stood aside for another command is resumed from here rather than from a timer,
+     * so there is one thing that wakes it.
+     */
+    data class ControlLaneFree(val generation: Long) : SessionInput
+
+    /**
      * A lease's absolute deadline has arrived.
      *
      * Separate from [RenewalDue] because it is a different fact and has a different answer: one
@@ -227,6 +247,20 @@ class TopicSessionCoordinator(
         /** What the next renewal should ask for, as of the last acknowledgement. */
         var renewalScope: Set<String> = emptySet()
 
+        /**
+         * The command holding the request channel, if any.
+         *
+         * The store keeps **one** open request — [TopicSubscriptionStateStore.beginRequest] hands
+         * its ticket to the newest caller, and `applyAck` has no ticket guard at all — so a second
+         * command sending while one is unanswered writes over the first one's verdict. Held from
+         * registration, because the token wait and the retry cooldowns are inside the command.
+         */
+        var controlOwner: Long? = null
+
+        /** Starts that stood aside for [controlOwner], resumed when it lets go. */
+        var renewalDeferred = false
+        var revalidationDeferred = false
+
         var renewalTimer: Job? = null
         var expiryTimer: Job? = null
 
@@ -235,7 +269,10 @@ class TopicSessionCoordinator(
         var pongDueAtMillis: Long? = null
     }
 
-    private class RunningCommand(val command: TopicSubscribeCommand) {
+    private class RunningCommand(
+        val command: TopicSubscribeCommand,
+        val purpose: TopicCommandPurpose
+    ) {
         var job: Job? = null
     }
 
@@ -254,6 +291,28 @@ class TopicSessionCoordinator(
     private var reconnectAttempt = 0
     private var commandSerial = 0L
     private var stopped = false
+
+    /**
+     * D14's window, and the two facts that decide it. **Session-scoped, not per connection.**
+     *
+     * A window is evidence that this grant's data was flowing, and swapping sockets does not
+     * undo that — `TopicSilencePolicy` says they survive a plain reconnect and are cleared only by
+     * a purge. Putting them on [Connection] would drop them at every [end].
+     */
+    private var silenceArmedUntilMillis: Long? = null
+    private var silenceHandledWindowMillis: Long? = null
+    private var tetherDelivered = false
+    private var silenceTicket = 0L
+    private var silenceTimer: Job? = null
+
+    /**
+     * Whether the effort to get a first delivery is still under way.
+     *
+     * Not "is a command object alive": the ladder, the connect and the resubscribe spread are all
+     * part of the effort, and a silence answered during any of them would be answered twice. Set
+     * when an attempt starts, cleared when that connection's first-delivery command ends.
+     */
+    private var firstDeliveryOutstanding = false
 
     /**
      * The grant this session has been told it may not have, if it has been told.
@@ -347,6 +406,11 @@ class TopicSessionCoordinator(
                         if (enforceLeaseExpiry(live)) return
                         if (expired(live)) end(live, TopicDisconnectCause.UNEXPECTED)
                     }
+                    // Only after the lease question, and only on a connection that survived it:
+                    // the window is read from a clock that counts sleep while the timer waiting
+                    // for it is not, so coming back is where a window that ran out during the
+                    // sleep is noticed.
+                    if (connection != null) evaluateSilence()
                     reconsider(budgetIsFresh = true)
                 }
             }
@@ -377,6 +441,12 @@ class TopicSessionCoordinator(
                     // a user losing interest in a topic has not unseen its frames. A grant change
                     // has — those frames were another session's.
                     store.purge(TopicPurgeScope.All)
+                    // The window is evidence about the grant that is gone, so it goes with it —
+                    // the one place `TopicSilencePolicy` says clears these.
+                    silenceArmedUntilMillis = null
+                    silenceHandledWindowMillis = null
+                    tetherDelivered = false
+                    silenceTicket++
                 }
                 reconsider(budgetIsFresh = true)
             }
@@ -385,7 +455,11 @@ class TopicSessionCoordinator(
                 current(input.generation)?.let { onTransportEvent(it, input.event) }
 
             is SessionInput.CommandDone -> current(input.generation)?.let { live ->
-                live.commands.remove(input.commandId)
+                val done = live.commands.remove(input.commandId)
+                if (done?.purpose == TopicCommandPurpose.FIRST_DELIVERY) {
+                    firstDeliveryOutstanding = false
+                }
+                releaseControlLane(live, input.commandId)
                 // Deliberately nothing else. Re-sending `desired − confirmed` here would hand a
                 // terminal refusal or a spent budget a fresh one on the next lap, which is the
                 // ceiling those two exist to be. A new command needs a new reason: a reconnection,
@@ -438,6 +512,21 @@ class TopicSessionCoordinator(
             // it. Reproduced by review with a 181-second lease and a clock a second past it.
             is SessionInput.RenewalDue -> current(input.generation)?.let { live ->
                 if (!enforceLeaseExpiry(live)) startRenewal(live)
+            }
+
+            // The deadline first, here as everywhere else a start can come from. A window that
+            // ran out is not permission to ask on a subscription that also ran out.
+            is SessionInput.SilenceDue -> {
+                if (input.ticket != silenceTicket) return
+                val live = connection
+                if (live != null && enforceLeaseExpiry(live)) return
+                evaluateSilence()
+            }
+
+            is SessionInput.ControlLaneFree -> current(input.generation)?.let { live ->
+                if (enforceLeaseExpiry(live)) return@let
+                if (live.renewalDeferred) startRenewal(live)
+                if (live.revalidationDeferred) startRevalidation(live)
             }
 
             is SessionInput.LeaseExpiryDue ->
@@ -493,6 +582,7 @@ class TopicSessionCoordinator(
         if (!wanted()) {
             connection?.let { end(it, TopicDisconnectCause.DELIBERATE) }
             cancelReconnect()
+            firstDeliveryOutstanding = false
             return
         }
         if (connection != null) return
@@ -508,6 +598,7 @@ class TopicSessionCoordinator(
         val number = ++generation
         val firstAttempt = !everAttempted
         everAttempted = true
+        firstDeliveryOutstanding = true
         val transport = try {
             connect(number)
         } catch (refused: Throwable) {
@@ -654,6 +745,14 @@ class TopicSessionCoordinator(
         if (quotes.isEmpty()) return
         _rates.value = _rates.value.merge(quotes)
         store.recordFrame(topic)
+        recordDelivery(
+            if (topic == TopicCatalogue.TETHER) {
+                TopicSilenceEvidence.TETHER_DELIVERY
+            } else {
+                TopicSilenceEvidence.OTHER
+            },
+            clock.nowMillis()
+        )
     }
 
     private fun receiveIndex(live: Connection, message: DxyTopicMessage) {
@@ -668,7 +767,7 @@ class TopicSessionCoordinator(
     // ---- subscribing ----------------------------------------------------------------------
 
     private fun subscribe(live: Connection) {
-        if (live.commands.isNotEmpty()) return
+        if (live.commands.values.any { it.purpose == TopicCommandPurpose.FIRST_DELIVERY }) return
         desired.forEach { store.setDesired(true, it) }
         startCommand(live, TopicCommandPurpose.FIRST_DELIVERY) { desired }
     }
@@ -679,16 +778,17 @@ class TopicSessionCoordinator(
      * Narrowed to what is still wanted: a topic dropped from the desired set since the
      * acknowledgement is not one to re-authenticate. An empty result asks for nothing rather than
      * sending an empty subscribe.
-     *
-     * **One request is open at a time**, and today that is a property of when this runs rather
-     * than a rule enforced here: the renewal timer is armed by the very acknowledgement that ends
-     * the previous command's control phase, so nothing is waiting on the wire when this fires. The
-     * store keeps a single open request — [TopicSubscriptionStateStore.beginRequest] hands the
-     * ticket to the newest caller — so whichever slice next starts a command from somewhere else
-     * (D14's revalidation is the one ordered next) has to make that rule explicit instead.
      */
     private fun startRenewal(live: Connection) {
-        if (live.renewalScope.intersect(desired).isEmpty()) return
+        if (live.renewalScope.intersect(desired).isEmpty()) {
+            live.renewalDeferred = false
+            return
+        }
+        if (live.controlOwner != null) {
+            live.renewalDeferred = true
+            return
+        }
+        live.renewalDeferred = false
         // The session never reads the outcome, so the purpose looks unobservable from here — and
         // is not: the command asks the injected clock for its delivery window, and a renewal that
         // opened one would be visible as a wait no other part of a session makes. That is what
@@ -719,21 +819,34 @@ class TopicSessionCoordinator(
             credentials = boundTo(live.fence),
             clock = clock,
             encode = encode,
-            send = { text -> transport.send(text) },
+            // Refuses the send and asks the loop to enforce the expiry. Ending the connection
+            // from here would cancel this command's own coroutine, so the teardown stays with the
+            // loop — but the discovery must not stay here: without the message the socket lives on
+            // until the relative timer happens to wake, and this boundary is the one the three
+            // starters cannot cover, because the deadline can pass between the decision and the
+            // send. The handler checks the generation, so a dead connection cannot end a newer one.
+            send = { text ->
+                if (live.leases.expiredAt(clock.nowMillis()).isNotEmpty()) {
+                    post(SessionInput.LeaseExpiryDue(live.generation))
+                    false
+                } else {
+                    transport.send(text)
+                }
+            },
             newRequestId = newRequestId,
             jitter = jitter,
             scope = { if (current(live.generation) == null) emptySet() else topics() },
             onAcknowledged = { ack -> onAcknowledged(live, id, ack) }
         )
-        val running = RunningCommand(command)
+        val running = RunningCommand(command, purpose)
         live.commands[id] = running
+        live.controlOwner = id
         // `finally`, so a command that ends by cancellation is still taken off the connection. A
         // listener throwing `CancellationException` out of the acknowledgement callback used to
         // leave the entry behind for good: the socket stayed up, and every later control frame was
         // handed to a command whose unbounded inbox no longer had a reader. No test here catches
         // that — `an acknowledgement listener that throws leaves the session working` checks the
-        // session, not the leftover — so what stands behind this line is review's reproduction
-        // rather than a failing test. Found by review.
+        // session, not the leftover.
         running.job = scope.launch {
             try {
                 command.run()
@@ -780,6 +893,10 @@ class TopicSessionCoordinator(
         commandId: Long,
         ack: TopicCommandAcknowledgement
     ) {
+        // The server answered, so the request channel is free — before the delivery wait, which
+        // needs nothing another command wants.
+        releaseControlLane(live, commandId)
+
         // Settled **before** anyone outside is told, and against the grant this connection was
         // opened for rather than whatever is current: a listener that throws must not be able to
         // leave the session still asking under an account that has been refused. Found by review.
@@ -819,6 +936,10 @@ class TopicSessionCoordinator(
             jitter = leaseJitter()
         )
         live.renewalScope = update.renewalScope
+        // This answer is the current state of the leases, so what it schedules supersedes a
+        // renewal that stood aside for the channel — otherwise the release that follows sends one
+        // immediately, moments after the server granted a fresh lease.
+        live.renewalDeferred = false
 
         // Expiry first, the order iOS arms them in.
         //
@@ -873,6 +994,93 @@ class TopicSessionCoordinator(
         if (live.leases.expiredAt(clock.nowMillis()).isEmpty()) return false
         end(live, TopicDisconnectCause.UNEXPECTED)
         return true
+    }
+
+    // ---- silence (D14) -----------------------------------------------------------------------
+
+    /**
+     * One delivery, classified by the path it came in on.
+     *
+     * The classification is the caller's because the two sinks are different: `recordFrame` counts
+     * **socket** frames only, while this window is armed by a validated tether payload from either
+     * the socket or the REST bootstrap (`TopicSilencePolicy:78-80`, `:97-98`). Deriving one from
+     * the other would either lose the bootstrap or let it satisfy the first-delivery watchdog.
+     * The bootstrap has no client here yet; what this slice owes it is the parameter.
+     */
+    private fun recordDelivery(evidence: TopicSilenceEvidence, receivedAtMillis: Long) {
+        if (evidence == TopicSilenceEvidence.TETHER_DELIVERY) tetherDelivered = true
+        val arming = TopicSilencePolicy.armAfter(evidence, receivedAtMillis)
+        if (arming !is TopicSilenceArming.ArmAt) return
+        silenceArmedUntilMillis = arming.millis
+        armSilenceTimer(arming.millis)
+    }
+
+    /**
+     * Replaced on every delivery rather than watched by a poller.
+     *
+     * One coroutine per tether frame is the cost, next to decoding that same frame. The timer is a
+     * **session** field: `end` cancels everything in [Connection.timers], and a window that
+     * outlives its connection must not be cancelled with it.
+     */
+    private fun armSilenceTimer(deadlineMillis: Long) {
+        silenceTimer?.cancel()
+        val ticket = ++silenceTicket
+        val wait = (deadlineMillis - clock.nowMillis()).coerceAtLeast(0)
+        silenceTimer = after(wait.milliseconds) { post(SessionInput.SilenceDue(ticket)) }
+    }
+
+    /**
+     * Asks [TopicSilencePolicy] what this silence is worth, and records the answer as spent.
+     *
+     * With no connection the first-delivery effort owns the silence: either one is being made, or
+     * nothing is wanted and there is nothing to ask about. Either way this is not the owner.
+     */
+    private fun evaluateSilence() {
+        val live = connection
+        val decision = TopicSilencePolicy.decide(
+            nowMillis = clock.nowMillis(),
+            armedUntilMillis = silenceArmedUntilMillis,
+            handledWindowMillis = silenceHandledWindowMillis,
+            tetherDelivered = tetherDelivered,
+            deliveryState = store.snapshot.stateFor(TopicCatalogue.TETHER).deliveryState,
+            firstDeliveryOwnerActive = live == null || firstDeliveryOutstanding
+        )
+        if (decision.spendsWindow) silenceHandledWindowMillis = silenceArmedUntilMillis
+        if (decision is TopicSilenceDecision.Revalidate && live != null) {
+            store.markSuspect(TopicCatalogue.TETHER)
+            startRevalidation(live)
+        }
+    }
+
+    /** D14's quiet question: tether only, and only if the store agrees to start one. */
+    private fun startRevalidation(live: Connection) {
+        // Both direct and deferred starts pass here: a question that stood aside for the
+        // request channel is resumed from `ControlLaneFree`, and the credential can have failed
+        // while it waited.
+        if (store.snapshot.authResolution == TopicAuthResolution.FAILED) {
+            live.revalidationDeferred = false
+            return
+        }
+        if (TopicCatalogue.TETHER !in desired) {
+            live.revalidationDeferred = false
+            return
+        }
+        if (live.controlOwner != null) {
+            live.revalidationDeferred = true
+            return
+        }
+        live.revalidationDeferred = false
+        if (!store.beginRevalidation(TopicCatalogue.TETHER)) return
+        startCommand(live, TopicCommandPurpose.REVALIDATION) { setOf(TopicCatalogue.TETHER) }
+    }
+
+    /** Lets go of the request channel, and wakes whatever stood aside for it. */
+    private fun releaseControlLane(live: Connection, commandId: Long) {
+        if (live.controlOwner != commandId) return
+        live.controlOwner = null
+        if (live.renewalDeferred || live.revalidationDeferred) {
+            post(SessionInput.ControlLaneFree(live.generation))
+        }
     }
 
     /** The draw the lease policy wants: whole seconds, `0..60`, and only ever subtracted. */
@@ -939,6 +1147,8 @@ class TopicSessionCoordinator(
     private fun shutDown() {
         connection?.let { end(it, TopicDisconnectCause.DELIBERATE) }
         cancelReconnect()
+        silenceTimer?.cancel()
+        silenceTimer = null
     }
 
     private fun cancelReconnect() {

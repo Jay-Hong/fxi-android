@@ -14,6 +14,7 @@ import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.TestScope
@@ -127,8 +128,15 @@ class TopicSessionCoordinatorTest {
         }
         var credential = AuthSnapshot("u1", 1L, "token-1")
         var refreshed: AuthSnapshot? = null
+
+        /** Held to keep a command inside its token wait, which is where a deadline can pass. */
+        var credentialGate: CompletableDeferred<Unit>? = null
         val credentials = object : TopicCommandCredentials {
-            override suspend fun currentSnapshot() = credential
+            override suspend fun currentSnapshot(): AuthSnapshot {
+                credentialGate?.await()
+                return credential
+            }
+
             override suspend fun refreshAfterUnauthorized(rejected: AuthSnapshot) = refreshed
         }
         val acknowledgements = mutableListOf<TopicCommandAcknowledgement>()
@@ -227,6 +235,16 @@ class TopicSessionCoordinatorTest {
                     }
                 )
             ).replace("""{"request_id""", """{"type":"subscription_ack","request_id""")
+
+        fun fxFrame(rate: Double) =
+            """{"type":"snapshot","version":1,"topic":"$USD","data":{"banks":[
+               {"source":"kb","asset":"usd-krw","rate":$rate,
+                "timestamp":"2026-08-31T10:20:00+09:00"}]}}"""
+
+        /** A tether payload with no usable price — after D8 this is also the KRX-only shape. */
+        fun emptyTetherFrame() =
+            """{"type":"snapshot","version":1,"topic":"usdt:krw","data":{
+               "usdt_krw":[],"usd_krw_banks":[]}}"""
 
         fun subscriptionError(requestId: String, code: String) =
             """{"type":"subscription_error","request_id":"$requestId","error":"$code"}"""
@@ -1500,9 +1518,9 @@ class TopicSessionCoordinatorTest {
      * A renewal does not open a delivery window, and the clock is where that shows.
      *
      * The session itself cannot tell the purposes apart — it does not read the outcome — so the
-     * evidence is the wait the command asks for. Nothing else in a session sleeps between forty
-     * and fifty seconds: the keep-alive is thirty and ten, the connect timeout fifteen, the
-     * renewal and expiry timers minutes. The first delivery is answered by a frame here so that
+     * evidence is the wait the command asks for. The initial delivery's D14 sleep is recorded
+     * before `h.sleeps.clear()`, and no new delivery re-arms it during the observation below.
+     * The first delivery is answered by a frame here so that
      * the only delivery window on offer would be the renewal's own. Review's counter-example to
      * "there is no cheap observation point".
      */
@@ -1644,4 +1662,477 @@ class TopicSessionCoordinatorTest {
         assertTrue(h.coordinator.rates.value.quotes.isEmpty())
         h.cleanUp()
     }
+
+    // ---- silence (D14) -------------------------------------------------------------------------
+
+    /** Delivers, is acknowledged, and ends its first-delivery command — the state D14 starts from. */
+    private suspend fun TestScope.silenceReady(h: Harness) {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        // The frame first, so the acknowledgement finds nothing silent and the first-delivery
+        // command ends instead of holding its forty-five seconds.
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertEquals(1, h.requests.size)
+        assertEquals(TopicDeliveryState.HEALTHY, h.store.snapshot.stateFor(TETHER).deliveryState)
+    }
+
+    /**
+     * Forty-five seconds of tether silence is worth one quiet question, and only one.
+     *
+     * The window is armed by the delivery, so what is asserted is the instant it runs out: nothing
+     * before it, one revalidation of the tether topic after it, and nothing more from the same
+     * window afterwards.
+     */
+    @Test
+    fun `tether silence asks once`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        advanceTimeBy(44_000)
+        assertEquals("45초 전에 물었다", 1, h.requests.size)
+
+        advanceTimeBy(2_000)
+        assertEquals("침묵이 지났는데 묻지 않았다", 2, h.requests.size)
+        assertEquals(setOf(TETHER), h.requests[1].topics.toSet())
+        assertEquals(
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+
+        // Answered, so what follows cannot be that command retrying — it has nothing left to ask.
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(90_000)
+        assertEquals("같은 창으로 두 번 물었다", 2, h.requests.size)
+        assertEquals(1, h.store.snapshot.stateFor(TETHER).revalidationAttempt)
+        h.cleanUp()
+    }
+
+    /** A delivery moves the deadline; the frames that are not deliveries do not. */
+    @Test
+    fun `only a tether delivery moves the window`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        // Forty seconds in. None of these is a tether delivery: the FX frame is a delivery for
+        // another topic, the empty tether payload is the shape a KRX-only frame arrives as, and
+        // the index is not in this session's desired set at all.
+        advanceTimeBy(40_000)
+        h.wire.deliver(h.fxFrame(1390.0))
+        h.wire.deliver(h.emptyTetherFrame())
+        h.wire.deliver(h.dxyFrame(99.5))
+        advanceTimeBy(1)
+        assertEquals("FX 배달이 기록되지 않았다", 1L, h.store.snapshot.stateFor(USD).receiveGeneration)
+
+        advanceTimeBy(6_000)
+        assertEquals("배달이 아닌 프레임이 창을 밀었다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** A real delivery does move it, which is what makes the previous test discriminating. */
+    @Test
+    fun `a tether delivery re-arms the window`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        advanceTimeBy(40_000)
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+
+        advanceTimeBy(6_000)
+        assertEquals("배달이 창을 다시 무장하지 않았다", 1, h.requests.size)
+
+        advanceTimeBy(40_000)
+        assertEquals("다시 무장한 창이 만료되지 않았다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * While a first delivery is being worked on, the silence belongs to that owner.
+     *
+     * A reconnection is a fresh first-delivery effort — the ladder, the connect and the resubscribe
+     * spread are part of it — so a window running out inside it must not produce a second
+     * resubscribe. It is spent all the same, which the foreground return afterwards checks: an
+     * unspent window would ask the moment the effort ended.
+     */
+    @Test
+    fun `a window that runs out during a reconnection is held and spent`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        advanceTimeBy(20_000)
+        h.wire.drop()
+        advanceTimeBy(2_100)
+        h.wire.open()
+        advanceTimeBy(2_100)
+        assertEquals("재연결이 다시 구독하지 않았다", 2, h.requests.size)
+        // Acknowledged but not delivered: the effort is still under way for the whole delivery
+        // deadline, and the command has nothing left to retry with.
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
+        // The window from the first connection runs out while that effort is still running.
+        advanceTimeBy(25_000)
+        assertEquals("첫 배달 노력 중에 D14 가 끼어들었다", 2, h.requests.size)
+
+        // The effort ends with its delivery deadline, and the spent window must not fire after it.
+        advanceTimeBy(45_000)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        assertEquals("소진된 창이 다시 물었다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A renewal holding the request channel makes the question wait, not disappear.
+     *
+     * The store keeps one open request, so two commands sending at once write over each other's
+     * verdict. The question is asked when the channel is free — from the renewal's acknowledgement,
+     * which is the only thing that wakes it.
+     */
+    @Test
+    fun `a question deferred behind a renewal is asked when the channel frees`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        // 220 − 180 = 40 seconds of lead, so the renewal goes out before the silence runs out.
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 220L)))
+        advanceTimeBy(1)
+        assertEquals(1, h.requests.size)
+
+        advanceTimeBy(40_100)
+        assertEquals("갱신이 나가지 않았다", 2, h.requests.size)
+
+        advanceTimeBy(5_000)
+        assertEquals("갱신이 요청 채널을 쥔 동안 재검증이 나갔다", 2, h.requests.size)
+
+        h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "L2", 900L)))
+        advanceTimeBy(1)
+        assertEquals("채널이 비었는데 미뤄둔 질문이 사라졌다", 3, h.requests.size)
+        assertEquals(setOf(TETHER), h.requests[2].topics.toSet())
+        h.cleanUp()
+    }
+
+    /** A grant change takes the window with it — the next grant starts with nothing delivered. */
+    @Test
+    fun `a grant change clears the window`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        h.credential = AuthSnapshot("u2", 2L, "token-2")
+        h.coordinator.setAccess(true, fence(uid = "u2", generation = 2L))
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("새 grant 가 구독하지 않았다", 2, h.requests.size)
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
+        // The new grant has delivered nothing, so there is no window of its own. Asking here would
+        // mean the old grant's window survived the purge — the foreground return is what would
+        // read it.
+        advanceTimeBy(46_000)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        assertEquals("지워진 창이 물었다", 2, h.requests.size)
+        assertEquals(
+            TopicDeliveryState.NEVER_RECEIVED,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        h.cleanUp()
+    }
+
+    /** A lease that lapsed must stop D14 too — the rule is the connection's, not the renewal's. */
+    @Test
+    fun `silence does not ask on an expired lease`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
+        val first = h.wire
+        assertEquals(1, h.requests.size)
+
+        // The deadline passed while the timers slept; D14's window is the one that wakes first.
+        h.clockSkewMillis = 901_000
+        advanceTimeBy(45_100)
+
+        assertEquals("만료된 lease 위에서 재검증을 보냈다", 1, h.requests.size)
+        assertTrue("D14 가 만료를 집행하지 않았다", first.cancelled)
+        assertNotEquals(
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * Nothing goes out under a lease that lapsed while the command was waiting for a token.
+     *
+     * The three starters ask before they start; this is the boundary they cannot cover, because the
+     * deadline can pass after the decision and before the send. Held at the token so the gap is the
+     * subject rather than an accident of timing.
+     */
+    @Test
+    fun `a send is refused once the lease has lapsed`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
+        val subscribesBefore = h.wire.sent.count { it.startsWith("encoded-") }
+
+        // The renewal comes due at 720s and is held inside its token wait.
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        advanceTimeBy(720_100)
+        assertEquals("토큰을 기다리는데 송신했다", subscribesBefore, h.wire.sent.count { it.startsWith("encoded-") })
+
+        // The lease runs out while it waits, and only then is the token handed over.
+        h.clockSkewMillis = 901_000
+        gate.complete(Unit)
+        advanceTimeBy(1)
+
+        assertEquals(
+            "만료된 lease 위로 송신했다",
+            subscribesBefore, h.wire.sent.count { it.startsWith("encoded-") }
+        )
+        // The refusal is not the end of it: the loop is told, so the socket goes now rather than
+        // when the relative timer happens to wake.
+        assertTrue("송신 경계가 찾은 만료를 loop 에 알리지 않았다", h.wires.first().cancelled)
+        h.cleanUp()
+    }
+
+    /**
+     * A grant change takes the window with it, seen through a first-delivery effort that ends early.
+     *
+     * The effort normally runs the full delivery deadline, which is the same forty-five seconds as
+     * the window and hides the question. A listener throwing ends the command as soon as the
+     * acknowledgement is applied, so the leaked window — if it leaked — would be read by an owner
+     * that has already finished. Review's counterexample.
+     */
+    @Test
+    fun `a grant change clears the window, seen through an early-ending effort`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        h.credential = AuthSnapshot("u2", 2L, "token-2")
+        h.coordinator.setAccess(true, fence(uid = "u2", generation = 2L))
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals(2, h.requests.size)
+
+        h.acknowledgementFailure = kotlinx.coroutines.CancellationException("listener")
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertEquals(true, h.store.snapshot.stateFor(TETHER).confirmed)
+
+        // Past the old grant's deadline, with nobody owning a first delivery any more.
+        advanceTimeBy(60_000)
+        assertEquals("지워진 창이 새 grant 에서 물었다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A question that waited for the request channel is dropped if the lease went while it waited.
+     */
+    @Test
+    fun `a deferred question is dropped when the lease went while it waited`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        // Renewal at 40s, silence at 45s, the absolute deadline at 220s.
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 220L)))
+        advanceTimeBy(1)
+        val first = h.wire
+
+        advanceTimeBy(40_100)
+        assertEquals("갱신이 나가지 않았다", 2, h.requests.size)
+
+        advanceTimeBy(5_000)
+        assertEquals("갱신이 채널을 쥔 동안 재검증이 나갔다", 2, h.requests.size)
+        assertEquals(TopicDeliveryState.SUSPECT, h.store.snapshot.stateFor(TETHER).deliveryState)
+
+        // The deadline passes while the renewal is still spending its attempts.
+        h.clockSkewMillis = 181_000
+        advanceTimeBy(120_000)
+
+        assertNotEquals(
+            "만료된 연결 위에서 미뤄둔 질문이 되살아났다",
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        assertTrue("채널이 비었는데 만료를 집행하지 않았다", first.cancelled)
+        h.cleanUp()
+    }
+
+    /**
+     * A credential the server has refused is not retried by a timer.
+     *
+     * `authResolution` failing does not clear `confirmed` or the healthy reading, so every gate D14
+     * passes on the way to a question is still open — and the store's own policy says a failed
+     * credential is reopened by an authentication change or by the user, not by a clock
+     * (`TopicSubscriptionState.kt:105-108`).
+     */
+    @Test
+    fun `silence does not ask on a failed credential`() = runTest {
+        val h = Harness(this)
+        h.refreshed = null
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        // 220 − 180: the renewal goes out before the window runs out, and is refused.
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 220L)))
+        advanceTimeBy(1)
+
+        advanceTimeBy(40_100)
+        assertEquals(2, h.requests.size)
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals(TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+
+        advanceTimeBy(5_000)
+        assertEquals("인증이 깨졌는데 타이머가 다시 물었다", 2, h.requests.size)
+        assertNotEquals(
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * A renewal that stood aside is replaced by the schedule the next acknowledgement brings.
+     *
+     * Its answer granted a fresh lease, so the wait it computed is the current one; sending the
+     * renewal that was waiting for the channel would ask again moments after being answered.
+     */
+    @Test
+    fun `a new lease replaces a renewal that stood aside`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        // 240 − 180: the window runs out at 45s and the renewal comes due at 60s, so D14 has the
+        // channel when the renewal arrives.
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 240L)))
+        advanceTimeBy(1)
+
+        advanceTimeBy(45_100)
+        assertEquals("D14 가 묻지 않았다", 2, h.requests.size)
+
+        advanceTimeBy(15_000)
+        assertEquals("갱신이 채널을 기다리지 않았다", 2, h.requests.size)
+
+        // The question is answered with a fresh lease, which is the schedule that now stands.
+        h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "L2", 900L)))
+        advanceTimeBy(1)
+        assertEquals("새 lease 를 받자마자 미뤄둔 갱신이 나갔다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** The credential can fail while a question waits for the channel; the resume must see that. */
+    @Test
+    fun `a deferred question is dropped when the credential failed while it waited`() = runTest {
+        val h = Harness(this)
+        h.refreshed = null
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 220L)))
+        advanceTimeBy(1)
+
+        advanceTimeBy(40_100)
+        assertEquals("갱신이 나가지 않았다", 2, h.requests.size)
+
+        advanceTimeBy(5_000)
+        assertEquals("갱신이 채널을 쥔 동안 재검증이 나갔다", 2, h.requests.size)
+
+        // The renewal is refused for its credential, which ends it and frees the channel.
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals(TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+
+        assertEquals("인증이 깨졌는데 미뤄둔 질문이 나갔다", 2, h.requests.size)
+        assertNotEquals(
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * The same, on the path where nothing was ever sent after the deadline.
+     *
+     * A command parked on its token and then cancelled reaches neither an acknowledgement nor the
+     * send boundary, so neither of the other two ways of noticing an expiry runs — what stands
+     * between that and an unwanted revalidation is the resume's own check. The command that would
+     * follow is parked on a second token so that it cannot reach the send boundary either, which
+     * is what keeps the two answers apart. Review's path.
+     */
+    @Test
+    fun `a resume after a cancelled command does not revive the question on an expired lease`() =
+        runTest {
+            val h = Harness(this)
+            h.goLive()
+            advanceTimeBy(100)
+            h.wire.open()
+            advanceTimeBy(1)
+            h.wire.deliver(h.tetherFrame(1390.0))
+            advanceTimeBy(1)
+            h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 220L)))
+            advanceTimeBy(1)
+            val first = h.wire
+
+            // The renewal comes due at 40s and parks on its token, holding the request channel.
+            val parked = CompletableDeferred<Unit>()
+            h.credentialGate = parked
+            advanceTimeBy(40_100)
+            assertEquals("토큰을 기다리는데 요청을 등록했다", 1, h.requests.size)
+
+            // The window runs out at 45s and stands aside for that channel.
+            advanceTimeBy(5_000)
+            assertEquals(TopicDeliveryState.SUSPECT, h.store.snapshot.stateFor(TETHER).deliveryState)
+
+            // The lease deadline passes while it waits, and the wait ends by cancellation.
+            h.clockSkewMillis = 181_000
+            h.credentialGate = CompletableDeferred()
+            parked.completeExceptionally(kotlinx.coroutines.CancellationException("token"))
+            advanceTimeBy(1)
+
+            assertTrue("채널이 비었는데 만료를 집행하지 않았다", first.cancelled)
+            assertNotEquals(
+                "만료된 연결 위에서 미뤄둔 질문이 되살아났다",
+                TopicDeliveryState.REVALIDATING,
+                h.store.snapshot.stateFor(TETHER).deliveryState
+            )
+            h.cleanUp()
+        }
 }
