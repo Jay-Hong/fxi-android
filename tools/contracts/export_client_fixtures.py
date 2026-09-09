@@ -1780,6 +1780,29 @@ def add_registry_fixture(corpus: Corpus) -> None:
     )
 
 
+def verify_capture_headers(
+    name: str,
+    headers: Any,
+    *,
+    required: Iterable[str] = (),
+    forbidden: Iterable[str] = (),
+) -> None:
+    """Check a captured response's headers against both halves of its contract.
+
+    ``required`` is what the fixture must be able to show; a recorded header proves the
+    server sent it.  ``forbidden`` is the other half, and it cannot be checked anywhere
+    else: only the headers the capture *asks* for are written to the fixture, so an empty
+    recorded map is indistinguishable from a header that was never requested.  Absence has
+    to be asserted here, against the live response, or it is not asserted at all.
+    """
+    missing = [header for header in required if header not in headers]
+    if missing:
+        raise RuntimeError(f"HTTP route capture lost headers {name}: {sorted(missing)}")
+    gained = [header for header in forbidden if header in headers]
+    if gained:
+        raise RuntimeError(f"HTTP route capture gained headers {name}: {sorted(gained)}")
+
+
 def add_http_error_fixtures(corpus: Corpus) -> None:
     from fastapi.testclient import TestClient
 
@@ -1815,6 +1838,7 @@ def add_http_error_fixtures(corpus: Corpus) -> None:
         patches: Iterable[Any] = (),
         dependency_patches: Iterable[str] = (),
         contract_headers: Iterable[str] = (),
+        forbidden_headers: Iterable[str] = (),
         config_axes: dict[str, Any] | None = None,
         authorization: bool = True,
     ) -> None:
@@ -1836,14 +1860,16 @@ def add_http_error_fixtures(corpus: Corpus) -> None:
                 f"HTTP route capture failed {name}: expected {expected_status}, "
                 f"got {response.status_code} {response.text}"
             )
+        # Against the live response, before the allowlist narrows it — see
+        # `verify_capture_headers` for why absence cannot be checked after this point.
+        verify_capture_headers(
+            name, response.headers, required=contract_headers, forbidden=forbidden_headers
+        )
         selected_headers = {
             header: response.headers[header]
             for header in contract_headers
             if header in response.headers
         }
-        missing_headers = set(contract_headers) - set(selected_headers)
-        if missing_headers:
-            raise RuntimeError(f"HTTP route capture lost headers {name}: {missing_headers}")
         corpus.add_json(
             f"http-{name}",
             f"http/{name}.json",
@@ -1893,6 +1919,9 @@ def add_http_error_fixtures(corpus: Corpus) -> None:
                 patch.object(fcm, "rest_auth_app", return_value=None),
             ),
             dependency_patches=("is_firebase_initialized", "rest_auth_app"),
+            # The counterpart to premium-pending-503, which does carry `Retry-After: 5`.
+            # Both are 503; only one of them tells the client when to come back.
+            forbidden_headers=("Retry-After",),
         )
 
         def auth_patch():
