@@ -58,13 +58,36 @@ interface TopicCommandCredentials {
 }
 
 /**
- * Which delivery watchdog this command is, which decides what silence means afterwards.
+ * What this command is for, which decides both what it waits for and what its silence means.
  *
  * A first delivery that never arrives is worth one quiet revalidation; a revalidation that never
  * arrives is degraded. Carried on the command rather than inferred later, because by the time the
  * deadline fires the store no longer says which of the two started it.
  */
-enum class TopicCommandPurpose { FIRST_DELIVERY, REVALIDATION }
+enum class TopicCommandPurpose {
+    /** The connection's opening subscribe. Silence afterwards is worth one quiet revalidation. */
+    FIRST_DELIVERY,
+
+    /** D14's quiet question. Silence afterwards is degraded. */
+    REVALIDATION,
+
+    /**
+     * Re-authenticating a lease, which is answered by the acknowledgement and nothing else.
+     *
+     * **This one does not wait out the delivery deadline.** The other two ask "is anything
+     * arriving"; this one asks "may we still receive", and the server answering yes *is* the
+     * answer — prices continuing to arrive would not have made the lease valid, and prices not
+     * arriving would not make it invalid. Waiting anyway would keep the command alive on its
+     * connection for forty-five seconds after it had finished. Found by review, which also caught
+     * that reusing
+     * [FIRST_DELIVERY] here is not the same as iOS's ordinary command: iOS ends its arbiter at the
+     * acknowledgement, and this one would not.
+     */
+    LEASE_RENEWAL;
+
+    /** Whether the acknowledgement leaves anything still to be waited for. */
+    val watchesDelivery: Boolean get() = this != LEASE_RENEWAL
+}
 
 
 /**
@@ -94,8 +117,8 @@ sealed interface TopicCommandOutcome {
      *
      * [accepted] empty means every topic was refused — the reasons are in the store, and in the
      * acknowledgement that was handed over when it arrived. [silent] is the accepted topics that
-     * had still said nothing **and are still wanted**, which is what [purpose] decides the
-     * treatment of.
+     * had still said nothing **and are still wanted** — and it is empty whenever [purpose] did not
+     * watch delivery, because a set measured without waiting is not evidence of silence.
      */
     data class Acknowledged(
         val accepted: Set<String>,
@@ -487,8 +510,9 @@ class TopicSubscribeCommand(
         currentCoroutineContext().ensureActive()
 
         // The ACK narrows the watch and takes nothing off the clock: a topic that has already
-        // spoken is done, the rest are judged at the deadline this send set.
-        if (silentOf(pending, accepted).isNotEmpty()) {
+        // spoken is done, the rest are judged at the deadline this send set. A renewal watches
+        // nothing — see [TopicCommandPurpose.LEASE_RENEWAL].
+        if (purpose.watchesDelivery && silentOf(pending, accepted).isNotEmpty()) {
             awaitUntil(pending.deadlines.deliverByMillis)
         }
         // Narrowed by the scope as it is *now*: a topic dropped while the deadline ran is not
@@ -496,7 +520,14 @@ class TopicSubscribeCommand(
         val stillWanted = scope()
         return TopicCommandOutcome.Acknowledged(
             accepted = accepted,
-            silent = silentOf(pending, accepted) intersect stillWanted,
+            // A purpose that did not watch has nothing to report. The set would otherwise be a
+            // reading taken at the acknowledgement — every accepted topic that had not spoken in
+            // the few milliseconds since the send — and a caller treating it like a watchdog
+            // result would revalidate or degrade a topic that was never given its window. The
+            // caller branches on [purpose] too; this is the half that cannot be forgotten.
+            // Found by review.
+            silent = if (purpose.watchesDelivery) silentOf(pending, accepted) intersect stillWanted
+            else emptySet(),
             leases = answer.leases,
             purpose = purpose
         )

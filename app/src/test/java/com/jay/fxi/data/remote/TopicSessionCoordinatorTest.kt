@@ -6,9 +6,11 @@ import com.jay.fxi.data.remote.dto.SubscriptionAck
 import com.jay.fxi.data.remote.dto.SubscriptionAckTopic
 import com.jay.fxi.data.remote.dto.SubscriptionRejection
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
+import com.jay.fxi.domain.model.TopicControlState
 import com.jay.fxi.domain.model.TopicRejectionReason
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -112,9 +114,14 @@ class TopicSessionCoordinatorTest {
          */
         val scope = test.backgroundScope
         val store = TopicSubscriptionStateStore()
+        /** Every wait asked for, which is how a command's deadline windows are seen from here. */
+        val sleeps = mutableListOf<Duration>()
         val clock = object : TopicCommandClock {
             override fun nowMillis(): Long = scheduler.currentTime + clockSkewMillis
-            override suspend fun sleep(duration: Duration) = delay(duration)
+            override suspend fun sleep(duration: Duration) {
+                sleeps += duration
+                delay(duration)
+            }
         }
         var credential = AuthSnapshot("u1", 1L, "token-1")
         var refreshed: AuthSnapshot? = null
@@ -123,6 +130,9 @@ class TopicSessionCoordinatorTest {
             override suspend fun refreshAfterUnauthorized(rejected: AuthSnapshot) = refreshed
         }
         val acknowledgements = mutableListOf<TopicCommandAcknowledgement>()
+
+        /** Injected into the acknowledgement listener, to stand for one that misbehaves. */
+        var acknowledgementFailure: Throwable? = null
 
         val wires = mutableListOf<Wire>()
         var failNextConnect = false
@@ -158,7 +168,10 @@ class TopicSessionCoordinatorTest {
             newRequestId = { "r${requests.size + 1}" },
             jitter = { jitterUnit },
             onRejected = { rejected += it },
-            onAcknowledgement = { acknowledgements += it },
+            onAcknowledgement = {
+                acknowledgements += it
+                acknowledgementFailure?.let { failure -> throw failure }
+            },
             onUndecodable = { length, failure -> undecodable += length to failure },
             desired = setOf(TETHER, USD)
         )
@@ -194,6 +207,22 @@ class TopicSessionCoordinatorTest {
                     rejectedTopics = emptyList(),
                     removedTopics = emptyList(),
                     activeSubscriptions = listOf(SubscriptionAckTopic(topic, "lease-1", seconds))
+                )
+            ).replace("""{"request_id""", """{"type":"subscription_ack","request_id""")
+
+        /** An acknowledgement whose `active_subscriptions` each carry a lease. */
+        fun ackWithLeases(requestId: String, vararg leases: Triple<String, String, Long>) =
+            Json.encodeToString(
+                SubscriptionAck.serializer(),
+                SubscriptionAck(
+                    requestId = requestId,
+                    operation = "subscribe",
+                    acceptedTopics = leases.map { SubscriptionAckTopic(it.first) },
+                    rejectedTopics = emptyList(),
+                    removedTopics = emptyList(),
+                    activeSubscriptions = leases.map {
+                        SubscriptionAckTopic(it.first, it.second, it.third)
+                    }
                 )
             ).replace("""{"request_id""", """{"type":"subscription_ack","request_id""")
 
@@ -1198,6 +1227,304 @@ class TopicSessionCoordinatorTest {
 
         assertEquals(2, h.requests.size)
         assertNotEquals(h.requests[0].requestId, h.requests[1].requestId)
+        h.cleanUp()
+    }
+
+    // ---- leases -------------------------------------------------------------------------------
+
+    /**
+     * The renewal goes out ahead of the lease, asking for what that lease covered.
+     *
+     * `900 − 180 − 0`, from the **shortest** lease and with the draw only subtracting. The
+     * arithmetic is locked where it lives; what is checked here is that an acknowledgement's leases
+     * became a timer on this connection at all.
+     */
+    @Test
+    fun `a lease is renewed ahead of its expiry`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        // Only one of the two desired topics came back with a lease, which is what makes the
+        // renewal's scope worth asserting: it asks for what it holds, not for everything wanted.
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
+        assertEquals(1, h.requests.size)
+
+        advanceTimeBy(719_000)
+        assertEquals("갱신이 lead 보다 일찍 나갔다", 1, h.requests.size)
+
+        advanceTimeBy(2_000)
+        assertEquals("lead 가 지났는데 갱신하지 않았다", 2, h.requests.size)
+        assertEquals("lease 없는 topic 까지 재인증했다", setOf(TETHER), h.requests[1].topics.toSet())
+        h.cleanUp()
+    }
+
+    /**
+     * A renewal does not queue behind the delivery it is running beside.
+     *
+     * A lease of exactly the lead time clamps the wait to zero, so the renewal is sent while the
+     * first delivery still has forty-four seconds of its deadline left — which is the whole reason
+     * a connection holds more than one command. The store showing an open request again is the
+     * second half: that request belongs to the renewal, not to the command that was already
+     * acknowledged.
+     */
+    @Test
+    fun `a renewal runs beside a first delivery that is still waiting`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 180L), Triple(USD, "L2", 180L)))
+        advanceTimeBy(1)
+
+        assertEquals("즉시 갱신이 배달을 기다렸다", 2, h.requests.size)
+        assertEquals(setOf(TETHER, USD), h.requests[1].topics.toSet())
+        assertEquals(TopicControlState.PENDING, h.store.snapshot.controlState)
+        assertTrue("갱신이 연결을 끊었다", !h.wires.single().cancelled)
+
+        // The renewal's own answer, arriving while the first command still holds the connection.
+        // Both are listening; only one of them owns this `request_id`, and the leases it carries
+        // are what the next renewal is paced by — so a third request at the new lead proves the
+        // frame reached the command that asked for it.
+        h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "L3", 900L), Triple(USD, "L4", 900L)))
+        advanceTimeBy(719_000)
+        assertEquals("두 번째 갱신이 일찍 나갔다", 2, h.requests.size)
+
+        advanceTimeBy(2_000)
+        assertEquals("갱신의 ack 이 다음 갱신을 잡지 못했다", 3, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A lease the server declares already over is an expiry, not a renewal.
+     *
+     * Both come due at the same instant, and either one ends the connection: the expiry directly,
+     * and the renewal because its handler reads the deadline before starting anything — a lease
+     * that expires at the acknowledgement is already past it. iOS says the same, its zero-lease
+     * tests reaching the re-authentication only through an injected sleep that holds the expiry
+     * back.
+     */
+    @Test
+    fun `a zero lease is enforced as an expiry rather than a renewal`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.wire
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 0L)))
+        advanceTimeBy(1)
+
+        assertTrue("이미 끝난 lease 로 계속 받았다", first.cancelled)
+        assertEquals("만료된 lease 로 재인증을 보냈다", 1, h.requests.size)
+        assertEquals(false, h.store.snapshot.stateFor(TETHER).confirmed)
+
+        advanceTimeBy(2_100)
+        assertEquals("만료 뒤 다시 연결하지 않았다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A lease nobody renewed ends the connection when its deadline arrives, and not before.
+     *
+     * The renewal at the lead time went out and was never answered — which is the case this exists
+     * for. Afterwards the socket is gone, and an acknowledgement arriving on it confirms nothing.
+     */
+    @Test
+    fun `a lease nobody renewed ends the connection at its deadline`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.wire
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
+
+        advanceTimeBy(899_000)
+        assertTrue("마감 전에 끊었다", !first.cancelled)
+
+        advanceTimeBy(2_000)
+        assertTrue("절대 마감이 지났는데 계속 받았다", first.cancelled)
+
+        first.deliver(h.ackWithLeases("r9", Triple(TETHER, "L9", 900L)))
+        advanceTimeBy(1)
+        assertEquals(
+            "끝난 연결의 늦은 ack 이 구독을 확정했다",
+            false, h.store.snapshot.stateFor(TETHER).confirmed
+        )
+        h.cleanUp()
+    }
+
+    /** The soonest deadline governs, and the ones behind it do not each buy a reconnection. */
+    @Test
+    fun `the earliest lease decides the deadline and one reconnection follows`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L), Triple(USD, "L2", 901L)))
+        advanceTimeBy(1)
+
+        advanceTimeBy(900_100)
+        assertTrue("가장 이른 마감이 아무것도 하지 않았다", h.wires.first().cancelled)
+
+        advanceTimeBy(2_100)
+        assertEquals(2, h.wires.size)
+
+        advanceTimeBy(1_000)
+        assertEquals("두 번째 lease 가 두 번째 재연결을 샀다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * Coming back to the foreground is where a deadline the timers slept through is noticed.
+     *
+     * The waits are relative and the clock is not, so a device that suspended past the expiry has a
+     * timer that has not fired. The reconnection this raises goes through the ladder: `reconsider`
+     * is **not** called, or every client that slept through the same fifteen minutes would come
+     * back at one instant.
+     */
+    @Test
+    fun `coming back to the foreground enforces an expiry the timer slept through`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.wire
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
+
+        h.clockSkewMillis = 900_000
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+
+        assertTrue("전경 복귀가 만료를 집행하지 않았다", first.cancelled)
+        assertEquals("만료를 집행하고 곧바로 다시 연결했다", 1, h.wires.size)
+
+        advanceTimeBy(2_100)
+        assertEquals("사다리가 다시 연결하지 않았다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A renewal that wakes past the deadline it was meant to beat is an expiry.
+     *
+     * The wait is relative and the clock is not, so a device that suspended returns with the timer
+     * still owing a second and the deadline long gone. Sending the renewal then asks the server to
+     * re-grant a permission that had already lapsed — and it would, which is the whole reason the
+     * expiry is absolute. Found by review, reproduced with this fixture.
+     */
+    @Test
+    fun `a renewal that wakes past its deadline is enforced as an expiry`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        // A second over the lead: the renewal is due in one second, the deadline in 181.
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 181L)))
+        advanceTimeBy(1)
+        val first = h.wire
+
+        h.clockSkewMillis = 182_000
+        advanceTimeBy(1_100)
+
+        assertEquals("만료된 lease 로 재인증을 보냈다", 1, h.requests.size)
+        assertTrue("깨어난 갱신이 마감을 지나쳤다", first.cancelled)
+        h.cleanUp()
+    }
+
+    /** A new grant does not carry the subscription past the absolute deadline it replaces. */
+    @Test
+    fun `a grant arriving after the deadline does not extend it`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        // Under the lead, so the renewal goes at once and the deadline is fifteen seconds out.
+        // Short on purpose: the renewal's own twenty-second acknowledgement deadline is read off
+        // the same clock, so **one** jump big enough to pass a 181-second lease would make the
+        // answer late instead — the command's own rule, and a different test's subject. A longer
+        // lease can be arranged with two jumps, one before the send to move that deadline out and
+        // one after; this is the same case reached in one step. Review's point.
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 15L)))
+        advanceTimeBy(1)
+        val first = h.wire
+        assertEquals("lead 아래 lease 가 즉시 갱신하지 않았다", 2, h.requests.size)
+
+        // The deadline passes while the renewal is in flight, and the answer brings a new id.
+        h.clockSkewMillis = 16_000
+        first.deliver(h.ackWithLeases("r2", Triple(TETHER, "L3", 900L)))
+        advanceTimeBy(1)
+
+        assertTrue("새 grant 가 지나간 절대 마감을 이어받았다", first.cancelled)
+        h.cleanUp()
+    }
+
+    /**
+     * A listener that throws does not wedge the session.
+     *
+     * `CancellationException` especially: it ends the command's coroutine without going through
+     * any failure path, so what takes the command off its connection has to run either way. The
+     * leases are settled before the listener is called, which is why the renewal still comes.
+     */
+    @Test
+    fun `an acknowledgement listener that throws leaves the session working`() = runTest {
+        val h = Harness(this)
+        h.acknowledgementFailure = kotlinx.coroutines.CancellationException("listener")
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
+
+        assertEquals(1, h.acknowledgements.size)
+        assertTrue("리스너 예외가 소켓을 끊었다", !h.wire.cancelled)
+
+        advanceTimeBy(721_000)
+        assertEquals("리스너 예외가 갱신 타이머를 가져갔다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A renewal does not open a delivery window, and the clock is where that shows.
+     *
+     * The session itself cannot tell the purposes apart — it does not read the outcome — so the
+     * evidence is the wait the command asks for. Nothing else in a session sleeps between forty
+     * and fifty seconds: the keep-alive is thirty and ten, the connect timeout fifteen, the
+     * renewal and expiry timers minutes. The first delivery is answered by a frame here so that
+     * the only delivery window on offer would be the renewal's own. Review's counter-example to
+     * "there is no cheap observation point".
+     */
+    @Test
+    fun `a renewal does not open a delivery window`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 15L)))
+        advanceTimeBy(1)
+        assertEquals("lead 아래 lease 가 즉시 갱신하지 않았다", 2, h.requests.size)
+
+        h.sleeps.clear()
+        h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "L3", 900L)))
+        advanceTimeBy(1)
+
+        assertTrue(
+            "갱신이 배달 마감을 기다렸다: ${h.sleeps}",
+            h.sleeps.none { it >= 40.seconds && it <= 50.seconds }
+        )
         h.cleanUp()
     }
 }

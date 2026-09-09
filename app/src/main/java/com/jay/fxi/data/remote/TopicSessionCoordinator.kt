@@ -8,6 +8,9 @@ import com.jay.fxi.data.remote.dto.TopicSourceEntry
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
 import com.jay.fxi.data.remote.dto.toDollarIndex
 import com.jay.fxi.data.remote.dto.toQuote
+import com.jay.fxi.domain.model.TopicLeaseInput
+import com.jay.fxi.domain.model.TopicLeasePolicy
+import com.jay.fxi.domain.model.TopicLeaseRegistry
 import com.jay.fxi.domain.model.TopicQuote
 import com.jay.fxi.domain.model.TopicRates
 import com.jay.fxi.domain.model.TopicReconnectPolicy
@@ -15,6 +18,7 @@ import com.jay.fxi.domain.model.TopicPurgeScope
 import com.jay.fxi.domain.model.TopicRejectionReason
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -85,7 +89,14 @@ private sealed interface SessionInput {
 
     data class Transport(val generation: Long, val event: TopicTransportEvent) : SessionInput
 
-    data class CommandDone(val generation: Long, val outcome: TopicCommandOutcome) : SessionInput
+    /**
+     * A command is over, however it ended.
+     *
+     * Carries which one, because more than one can be running on a connection, and **not** the
+     * outcome: nothing here reads it yet, and it cannot be carried out of a `finally` that also
+     * runs for a cancellation. D14 is the slice that gives the outcome a reader.
+     */
+    data class CommandDone(val generation: Long, val commandId: Long) : SessionInput
 
     /**
      * A command stopped because the account moved out from under it.
@@ -114,6 +125,18 @@ private sealed interface SessionInput {
     data class StableFor(val generation: Long) : SessionInput
 
     data class SubscribeDue(val generation: Long) : SessionInput
+
+    /** The lease renewal's lead time has run out; the leases are due to be asked for again. */
+    data class RenewalDue(val generation: Long) : SessionInput
+
+    /**
+     * A lease's absolute deadline has arrived.
+     *
+     * Separate from [RenewalDue] because it is a different fact and has a different answer: one
+     * says "ask again in time", the other says "the permission is gone". A renewal that failed or
+     * never went out leaves this one to fire.
+     */
+    data class LeaseExpiryDue(val generation: Long) : SessionInput
 
     /**
      * A scheduled reconnection came due.
@@ -185,12 +208,34 @@ class TopicSessionCoordinator(
         var ended = false
         var pongAnswered = false
         val timers = mutableListOf<Job>()
-        var command: TopicSubscribeCommand? = null
-        var commandJob: Job? = null
+
+        /**
+         * Every command running on this socket, by id.
+         *
+         * More than one, because a lease with no more than the renewal's lead time left on it is
+         * due the moment it is acknowledged — while the first delivery is still waiting out its
+         * forty-five seconds. (A `duration 0` is not that case: the server has declared that one
+         * finished, and the expiry takes the connection.) Their answers are told apart by
+         * `request_id`, which the commands check themselves.
+         */
+        val commands = linkedMapOf<Long, RunningCommand>()
+
+        /** This connection's leases. Per connection, so ending one forgets them all. */
+        val leases = TopicLeaseRegistry()
+
+        /** What the next renewal should ask for, as of the last acknowledgement. */
+        var renewalScope: Set<String> = emptySet()
+
+        var renewalTimer: Job? = null
+        var expiryTimer: Job? = null
 
         /** Both absolute, on the injected clock, so a wait that overslept is still late. */
         var connectDueAtMillis = 0L
         var pongDueAtMillis: Long? = null
+    }
+
+    private class RunningCommand(val command: TopicSubscribeCommand) {
+        var job: Job? = null
     }
 
     private val inputs = Channel<SessionInput>(Channel.UNLIMITED)
@@ -206,6 +251,7 @@ class TopicSessionCoordinator(
     private var reconnectJob: Job? = null
     private var reconnectTicket = 0L
     private var reconnectAttempt = 0
+    private var commandSerial = 0L
     private var stopped = false
 
     /**
@@ -289,7 +335,17 @@ class TopicSessionCoordinator(
                     // coming back is where the difference shows — `reconsider` would otherwise
                     // see a live connection and return, keeping a socket whose pong was already
                     // overdue. Found by review.
-                    connection?.let { if (expired(it)) end(it, TopicDisconnectCause.UNEXPECTED) }
+                    connection?.let { live ->
+                        // Leases first, and **returning** if one had lapsed. `ANDROID_V2_PLAN.md`
+                        // says the expiry is forced before any ping or resubscribe, and iOS
+                        // returns from its foreground handler when it finds one
+                        // (`WebSocketService.swift` `willEnterForegroundNotification`). The
+                        // reconnection is already on its way — `enforceLeaseExpiry` ends the
+                        // connection, which schedules it on the ladder — and `reconsider` would
+                        // replace that spread with every returning client connecting at once.
+                        if (enforceLeaseExpiry(live)) return
+                        if (expired(live)) end(live, TopicDisconnectCause.UNEXPECTED)
+                    }
                     reconsider(budgetIsFresh = true)
                 }
             }
@@ -328,8 +384,7 @@ class TopicSessionCoordinator(
                 current(input.generation)?.let { onTransportEvent(it, input.event) }
 
             is SessionInput.CommandDone -> current(input.generation)?.let { live ->
-                live.command = null
-                live.commandJob = null
+                live.commands.remove(input.commandId)
                 // Deliberately nothing else. Re-sending `desired − confirmed` here would hand a
                 // terminal refusal or a spent budget a fresh one on the next lap, which is the
                 // ceiling those two exist to be. A new command needs a new reason: a reconnection,
@@ -339,9 +394,8 @@ class TopicSessionCoordinator(
             is SessionInput.CommandIdentityChanged -> current(input.generation)?.let { live ->
                 // Deliberate: the socket was opened for a grant that is no longer signed in, so
                 // there is nothing to reconnect *to* until an `Access` says who is. No ladder,
-                // and no new command.
-                live.command = null
-                live.commandJob = null
+                // and no new command. The commands are left for `end` to cancel: this connection
+                // may be running a renewal beside the one that threw.
                 identityLostFor = live.fence
                 end(live, TopicDisconnectCause.DELIBERATE)
                 cancelReconnect()
@@ -376,6 +430,17 @@ class TopicSessionCoordinator(
 
             is SessionInput.SubscribeDue ->
                 current(input.generation)?.let { live -> subscribe(live) }
+
+            // The deadline is checked first. A renewal timer that woke after the deadline it was
+            // meant to beat — the clock counts sleep and the wait does not — would otherwise send
+            // a subscribe for a permission that had already lapsed, and the answer would re-grant
+            // it. Reproduced by review with a 181-second lease and a clock a second past it.
+            is SessionInput.RenewalDue -> current(input.generation)?.let { live ->
+                if (!enforceLeaseExpiry(live)) startRenewal(live)
+            }
+
+            is SessionInput.LeaseExpiryDue ->
+                current(input.generation)?.let { live -> enforceLeaseExpiry(live) }
 
             is SessionInput.ReconnectDue -> {
                 if (input.ticket != reconnectTicket) return
@@ -498,8 +563,12 @@ class TopicSessionCoordinator(
 
     private fun onFrame(live: Connection, frame: DecodedTopicFrame) {
         when (frame) {
+            // Handed to every running command, because the coordinator does not know whose
+            // answer this is — each one checks the `request_id` against its own and ignores the
+            // rest. One place makes that judgment, and it is the place that sent the request.
             is DecodedTopicFrame.Acknowledgement,
-            is DecodedTopicFrame.RequestFailure -> live.command?.deliver(frame)
+            is DecodedTopicFrame.RequestFailure ->
+                live.commands.values.toList().forEach { it.command.deliver(frame) }
 
             is DecodedTopicFrame.Tether ->
                 receive(TopicCatalogue.TETHER, frame.value.data.allEntries)
@@ -562,15 +631,53 @@ class TopicSessionCoordinator(
     // ---- subscribing ----------------------------------------------------------------------
 
     private fun subscribe(live: Connection) {
-        if (live.command != null) return
+        if (live.commands.isNotEmpty()) return
         desired.forEach { store.setDesired(true, it) }
+        startCommand(live, TopicCommandPurpose.FIRST_DELIVERY) { desired }
+    }
 
+    /**
+     * The renewal this connection's leases are due for.
+     *
+     * Narrowed to what is still wanted: a topic dropped from the desired set since the
+     * acknowledgement is not one to re-authenticate. An empty result asks for nothing rather than
+     * sending an empty subscribe.
+     *
+     * **One request is open at a time**, and today that is a property of when this runs rather
+     * than a rule enforced here: the renewal timer is armed by the very acknowledgement that ends
+     * the previous command's control phase, so nothing is waiting on the wire when this fires. The
+     * store keeps a single open request — [TopicSubscriptionStateStore.beginRequest] hands the
+     * ticket to the newest caller — so whichever slice next starts a command from somewhere else
+     * (D14's revalidation is the one ordered next) has to make that rule explicit instead.
+     */
+    private fun startRenewal(live: Connection) {
+        if (live.renewalScope.intersect(desired).isEmpty()) return
+        // The session never reads the outcome, so the purpose looks unobservable from here — and
+        // is not: the command asks the injected clock for its delivery window, and a renewal that
+        // opened one would be visible as a wait no other part of a session makes. That is what
+        // `a renewal does not open a delivery window` holds. Found by review, after this comment
+        // had claimed the opposite.
+        startCommand(live, TopicCommandPurpose.LEASE_RENEWAL) { live.renewalScope intersect desired }
+    }
+
+    /**
+     * Starts one command on this connection and gives it back through the queue.
+     *
+     * A **new** command every time, deliberately: re-running one that failed would hand it the
+     * three attempts it has already spent, which is the ceiling those attempts exist to be.
+     */
+    private fun startCommand(
+        live: Connection,
+        purpose: TopicCommandPurpose,
+        topics: () -> Set<String>
+    ) {
+        val id = ++commandSerial
         // The transport is captured here rather than read from the field at send time. A command
         // that outlived its connection would otherwise write to whichever socket is current, which
         // is a subscribe sent on a connection that never asked for it. Found by review.
         val transport = live.transport
         val command = TopicSubscribeCommand(
-            purpose = TopicCommandPurpose.FIRST_DELIVERY,
+            purpose = purpose,
             store = store,
             credentials = boundTo(live.fence),
             clock = clock,
@@ -578,18 +685,26 @@ class TopicSessionCoordinator(
             send = { text -> transport.send(text) },
             newRequestId = newRequestId,
             jitter = jitter,
-            scope = { if (current(live.generation) == null) emptySet() else desired },
-            onAcknowledged = { ack -> onAcknowledged(live, ack) }
+            scope = { if (current(live.generation) == null) emptySet() else topics() },
+            onAcknowledged = { ack -> onAcknowledged(live, id, ack) }
         )
-        live.command = command
-        live.commandJob = scope.launch {
-            val outcome = try {
+        val running = RunningCommand(command)
+        live.commands[id] = running
+        // `finally`, so a command that ends by cancellation is still taken off the connection. A
+        // listener throwing `CancellationException` out of the acknowledgement callback used to
+        // leave the entry behind for good: the socket stayed up, and every later control frame was
+        // handed to a command whose unbounded inbox no longer had a reader. No test here catches
+        // that — `an acknowledgement listener that throws leaves the session working` checks the
+        // session, not the leftover — so what stands behind this line is review's reproduction
+        // rather than a failing test. Found by review.
+        running.job = scope.launch {
+            try {
                 command.run()
             } catch (moved: AuthIdentityChangedException) {
                 post(SessionInput.CommandIdentityChanged(live.generation))
-                return@launch
+            } finally {
+                post(SessionInput.CommandDone(live.generation, id))
             }
-            post(SessionInput.CommandDone(live.generation, outcome))
         }
     }
 
@@ -623,7 +738,11 @@ class TopicSessionCoordinator(
      * account should be shown prices it is not entitled to. `premium_required` also stops this
      * session asking again — the answer will not change while the grant does not.
      */
-    private fun onAcknowledged(live: Connection, ack: TopicCommandAcknowledgement) {
+    private fun onAcknowledged(
+        live: Connection,
+        commandId: Long,
+        ack: TopicCommandAcknowledgement
+    ) {
         // Settled **before** anyone outside is told, and against the grant this connection was
         // opened for rather than whatever is current: a listener that throws must not be able to
         // leave the session still asking under an account that has been refused. Found by review.
@@ -632,9 +751,95 @@ class TopicSessionCoordinator(
             end(live, TopicDisconnectCause.DELIBERATE)
             cancelReconnect()
         }
+        // Also before, and only while the connection is still standing: the leases belong to this
+        // socket, and re-arming timers on one that has just been ended would schedule work for a
+        // connection nobody is holding. A deadline that passed while this answer was in flight is
+        // enforced **instead of** applying it — a new grant must not carry a subscription past the
+        // absolute expiry of the one it replaces, which is what "hard" means. Found by review.
+        current(live.generation)?.let { still ->
+            if (!enforceLeaseExpiry(still)) applyLeases(still, ack)
+        }
+
         onAcknowledgement(ack)
         if (ack.rejected.isNotEmpty()) onRejected(ack.rejected)
     }
+
+    // ---- leases -----------------------------------------------------------------------------
+
+    /**
+     * One acknowledgement's leases, and the two timers they set.
+     *
+     * Both are re-armed on **every** acknowledgement, including one carrying no leases at all —
+     * that is the server saying there is nothing left to renew or to expire, and a timer from a
+     * previous answer left running would act on a set that no longer exists.
+     */
+    private fun applyLeases(live: Connection, ack: TopicCommandAcknowledgement) {
+        val update = live.leases.apply(
+            acknowledgedAtMillis = ack.acknowledgedAtMillis,
+            leases = ack.leases.map {
+                TopicLeaseInput(it.topic, it.leaseId, it.durationSeconds)
+            },
+            jitter = leaseJitter()
+        )
+        live.renewalScope = update.renewalScope
+
+        // Expiry first, the order iOS arms them in.
+        //
+        // A `duration 0` makes both come due at this instant, and the outcome is the expiry — by
+        // whichever of them is answered first, because each ends the connection: the expiry
+        // directly, and the renewal because its handler reads the deadline before it starts
+        // anything. iOS lands in the same place and says so — "실제 서비스는 즉시 만료를
+        // 집행하지만" — reaching the re-authentication only through an injected sleep that holds
+        // the expiry back. The immediate re-authentication is the answer for a lease that is
+        // *nearly* over, not for one the server has already declared finished.
+        //
+        // ⚠️ Under this session's one serial queue, swapping these two lines changes nothing
+        // observable — mutation says so. That is a property of how the two are dispatched here,
+        // not a guarantee to lean on: keep the order for the parity it states.
+        live.expiryTimer?.cancel()
+        live.expiryTimer = null
+        live.leases.earliestExpiryMillis()?.let { deadline ->
+            val wait = (deadline - clock.nowMillis()).coerceAtLeast(0)
+            live.expiryTimer =
+                after(wait.milliseconds) { post(SessionInput.LeaseExpiryDue(live.generation)) }
+        }
+
+        live.renewalTimer?.cancel()
+        live.renewalTimer = null
+        update.renewAfter?.let { wait ->
+            live.renewalTimer = after(wait) { post(SessionInput.RenewalDue(live.generation)) }
+        }
+    }
+
+    /**
+     * Lets go of every lease whose deadline has arrived, and takes the connection with them.
+     *
+     * The same judgment for both callers — the timer and the foreground return — because the
+     * timer's wait is relative and the deadline is not: an app suspended past the deadline has a
+     * timer that has not fired yet, and the return is where that is noticed.
+     *
+     * Ending the connection is what recovers: desired survives it, so the reconnection resubscribes
+     * and the server issues new leases. Several deadlines arriving together still end it once,
+     * because [end] is idempotent and the connection is gone after the first — which is also why
+     * this needs no equivalent of iOS's `leaseExpiryReconnectIssuedGeneration`.
+     *
+     * **One thing iOS does here is deliberately not copied.** It marks the expired topics degraded
+     * and publishes that snapshot (`WebSocketService.swift:1383-1384`) before reconnecting, so its
+     * listeners see the degradation for the moment it lasts. Writing the same thing here would be
+     * invisible: nothing publishes between the write and [end]'s `clearConnectionState`, which puts
+     * a still-wanted topic back to never-received. The write belongs with the observer, and the
+     * observer arrives with the screen that reads this store. Found by review, which measured the
+     * difference rather than accepting the parity argument for it.
+     */
+    private fun enforceLeaseExpiry(live: Connection): Boolean {
+        if (live.leases.expiredAt(clock.nowMillis()).isEmpty()) return false
+        end(live, TopicDisconnectCause.UNEXPECTED)
+        return true
+    }
+
+    /** The draw the lease policy wants: whole seconds, `0..60`, and only ever subtracted. */
+    private fun leaseJitter(): Long =
+        (jitter().coerceIn(0.0, 1.0) * TopicLeasePolicy.JITTER_UPPER_BOUND).toLong()
 
     // ---- keep-alive and endings -------------------------------------------------------------
 
@@ -662,7 +867,9 @@ class TopicSessionCoordinator(
     private fun end(live: Connection, cause: TopicDisconnectCause) {
         if (live.ended) return
         live.ended = true
-        live.commandJob?.cancel()
+        live.commands.values.forEach { it.job?.cancel() }
+        live.renewalTimer?.cancel()
+        live.expiryTimer?.cancel()
         live.timers.forEach(Job::cancel)
         live.transport.cancel()
         if (connection === live) connection = null

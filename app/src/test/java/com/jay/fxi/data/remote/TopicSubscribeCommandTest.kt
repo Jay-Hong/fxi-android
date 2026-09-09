@@ -298,6 +298,37 @@ class TopicSubscribeCommandTest {
         harness.cleanUp()
     }
 
+    /**
+     * A lease renewal is finished by the acknowledgement.
+     *
+     * Its question is "may we still receive", and the server answering it *is* the answer. The
+     * other two purposes ask whether anything is arriving and so wait out the delivery deadline —
+     * reusing one of them here would hold the session's control slot for forty-five seconds after
+     * the renewal was done. Found by review.
+     */
+    @Test
+    fun `a lease renewal ends at its acknowledgement`() = runTest {
+        val harness = Harness(this)
+        harness.build(TopicCommandPurpose.LEASE_RENEWAL)
+        val run = harness.start()
+        advanceTimeBy(100)
+        harness.command.deliver(harness.ack("r1", active = listOf(USD)))
+        advanceTimeBy(1)
+
+        val outcome = run.outcome as TopicCommandOutcome.Acknowledged
+        assertEquals(setOf(USD), outcome.accepted)
+        // The ACK instant itself, not a tick later: nothing is waited for after it.
+        assertEquals("갱신이 배달을 기다렸다", 100L, run.finishedAtMillis)
+        // USD has said nothing and its generation has not moved — `an acknowledgement alone does
+        // not satisfy the delivery watchdog` proves the same setup reports it silent for a first
+        // delivery. A renewal reports nothing because it never waited to find out.
+        assertEquals(
+            "기다리지도 않고 침묵을 보고했다",
+            emptySet<String>(), outcome.silent
+        )
+        harness.cleanUp()
+    }
+
     /** A revalidation says so in its answer, because silence means something different for it. */
     @Test
     fun `a revalidation reports its own purpose`() = runTest {
