@@ -805,7 +805,7 @@ class TopicSessionCoordinator(
         // No usable price, no delivery — whichever way the payload got that way. The narrow case
         // that decides it is a tether frame carrying only `usd_krw_futures`: D8 took that field
         // out of the DTO, so it is swallowed as an unknown key and what arrives here is
-        // indistinguishable from an empty snapshot. `ANDROID_V2_PLAN.md:889` says KRX must not
+        // indistinguishable from an empty snapshot. `ANDROID_V2_PLAN.md` D14 says KRX must not
         // satisfy tether delivery, and since the two cannot be told apart, neither counts.
         // Found by review.
         if (quotes.isEmpty()) return

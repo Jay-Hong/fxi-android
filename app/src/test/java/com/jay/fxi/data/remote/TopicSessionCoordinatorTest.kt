@@ -350,7 +350,7 @@ class TopicSessionCoordinatorTest {
      *
      * The narrow case is a tether frame carrying only `usd_krw_futures`: D8 removed that field
      * from the DTO so it is swallowed as an unknown key, which leaves a payload identical to an
-     * empty one — and `ANDROID_V2_PLAN.md:889` says KRX must not satisfy tether delivery. The two
+     * empty one — and `ANDROID_V2_PLAN.md` D14 says KRX must not satisfy tether delivery. The two
      * cannot be told apart here, so neither counts. Found by review.
      */
     @Test

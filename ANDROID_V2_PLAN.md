@@ -92,6 +92,28 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > restore 동작 변경을 분리한 것이다. 이 기록은 완료 선언이 아니고 미충족 작업의 후속 슬라이스 이관도
 > 승인하지 않는다 — 소유권은 §7·§9.1이 정한 그대로다. 범위·D-결정·슬라이스 경계·게이트·DoD·활성
 > 미결정 O1은 그대로이고, 어떤 슬라이스 착수나 public arming·rollout·deploy도 열지 않는다.
+>
+> **동결 후 4번 비의미 상태 명확화 기록(2026-09-10).** S3 REST bootstrap 착수 전 4방향 조사(서버·iOS·Android·
+> 본 문서)에서 세 서술이 코드와 어긋난 것이 확인돼 고쳤다. (1) D8의 삭제 지시는 **이미 수행됐고** 그 행의 인용
+> 좌표는 삭제 전 것이다 — 지시는 남기되 수행 사실과 '심볼 이름만 보고 재실행하지 말 것'을 덧붙였다.
+> (2) `dxy:spot`은 '현재 topic 계층에 없음'이 아니라 **세 슬라이스에 나눠 이미 land**했다(DTO·decoder S3a
+> `32f5994` / domain merge S3b `32446fc` / coordinator 수신 S3k-1 `4f50b64`). (3) REST bootstrap의 'typed 오류
+> 행렬 적용'은 바로 위 WS 행렬을 가리키는데, **REST는 일부 오류 문자열을 공유할 뿐 envelope·적용 범위·인증/권한
+> 표현이 달라 그 행렬을 그대로 적용할 수 없다** — 지시는 그대로 두고 이 endpoint의 실제 응답(503 세 종류 ·
+> 인증 전 endpoint 404 `topics_disabled` · retry 입력 부재 · `topic_unavailable`과 `unknown_topic`의 body 차이 ·
+> 인증/권한 코드 부재 · 스칼라 `topic`)을 사실로 덧붙였다. 함께 D14 항목에 빈 payload 처리의 iOS 이탈을 §2.2가
+> 요구하는 대로 기록했고, 코드 세 곳(`TopicSessionCoordinator.kt`·`TopicSilencePolicy.kt`·`TopicSessionCoordinatorTest.kt`)이
+> 인용하던 잘못된 좌표 `:889`를 실제 근거인 **D14**로 고쳤다. 범위·D-결정·슬라이스 경계·게이트·DoD·미결정은
+> 바꾸지 않았고, 어떤 슬라이스 착수도 열지 않는다. bootstrap의 UID/`userAccessEpoch` fence는 §7 S3의 확정
+> 계약이다. 발화 지점과 seam·fence 검사 배선은 이 커밋에서 구현하지 않는다. 이 기록은 계획서·인용 정정만
+> 담으며, `evaluateSilence`의 전제 주석 수정과 bootstrap 시험은 후속 작업이다.
+>
+> ⚠️ **함께 측정된 것: 코드 주석의 이 문서 줄-인용은 이미 계통적으로 낡았다.** 이 기록을 쓰기 전 상태
+> (Android `6895e64`의 문서)로 표본 대조한 결과 `:142`는 빈 줄, `:191`은 히스토리 표, `:813`은 FCM 콜백
+> 문단이었다 — 어느 것도 인용한 코드가 주장하는 내용이 아니다. `app/src`에 이런 인용이 30곳 이상 있고, 원인은
+> 이 기록이 아니라 동결 후 누적된 삽입이다(이 기록도 문서를 밀어 그 30곳을 한 번 더 어긋나게 한다).
+> **줄 번호 대신 D-번호·§ 절 이름 같은 안정 식별자로 인용할 것** — 이 기록에서 숫자를 쓰지 않는 이유이기도
+> 하다. 이번에 고친 세 곳은 그렇게 바꿨고, 나머지 일괄 정리는 별도 슬라이스로 둔다.
 
 ---
 
@@ -211,7 +233,7 @@ I1의 legacy rates=S3·legacy graph=S4, I8=S7~S9, I6=S11부터 회귀 금지다.
 | D5 | targetSdk **36**, versionName **2.0.0을 S0부터** (`X-Client-Version`이 versionName을 사용) | `android/data/remote/ClientMetadata.kt` |
 | D6 | 알림 상한 = **클라이언트 soft cap, family별 30** (은행 30 / source 30 / 비교+김프 합산 30). 서버 제한 **없음**. 초과 기존 row는 숨기지 않고 조회·편집·삭제 허용 | `ios/Utils/Constants.swift:294` + 3 VM 각각 적용 / 서버 grep 0건 |
 | D7 | **Citi**: 신규 생성 picker 제외. 기존 row는 현재 선택 은행을 라벨로 표시하고 조회·토글·threshold·repeat 편집·**picker에 있는 은행으로의 변경**·삭제를 허용한다. 편집 picker에도 Citi가 없으므로 저장 전 취소만 원상복구할 수 있고, 다른 은행으로 저장한 뒤에는 Citi로 되돌릴 수 없다. 현재가가 없어도 편집 가능하며, iOS에 없는 추가 경고 UI는 넣지 않는다 | `ios/Constants.swift:175 displayCases`, `AlertAddSheet.swift:124-136,302,412-418,744,751-758` |
-| D8 | `usd_krw_futures`는 **Android tether domain에 노출하지 않는다**. ⚠️ **`ignoreUnknownKeys`가 알아서 무시해 주지 않는다** — 현재 Android DTO가 이 키를 **이미 선언·병합**하고 있으므로 **코드 삭제가 필요**하다: `TetherTopicData.usdKrwFutures` 필드 제거 + `allEntries`의 `usdKrwFutures?.let(::add)` 삭제(+ `TopicMessageTest` 갱신), 그 뒤 남는 wire 키를 `ignoreUnknownKeys`가 흡수. '의도적 강화'의 대상은 iOS만이 아니라 **현재 Android 코드**이기도 하다 | `android/.../dto/TopicMessage.kt:165-166,173`(선언·병합 중) / `android/di/NetworkModule.kt:31` / iOS 동형: `TopicMessage.swift:71` |
+| D8 | `usd_krw_futures`는 **Android tether domain에 노출하지 않는다**. ⚠️ **`ignoreUnknownKeys`가 알아서 무시해 주지 않는다** — 현재 Android DTO가 이 키를 **이미 선언·병합**하고 있으므로 **코드 삭제가 필요**하다: `TetherTopicData.usdKrwFutures` 필드 제거 + `allEntries`의 `usdKrwFutures?.let(::add)` 삭제(+ `TopicMessageTest` 갱신), 그 뒤 남는 wire 키를 `ignoreUnknownKeys`가 흡수. '의도적 강화'의 대상은 iOS만이 아니라 **현재 Android 코드**이기도 하다. ✅ **이 삭제는 이미 수행됐다**(2026-09-10 코드 대조): `TopicMessage.kt`의 `TetherTopicData`는 `usdt_krw`/`usd_krw_banks`/`usd_krw_reference` 셋뿐이고 `allEntries`도 그 셋만 더한다. 아래 좌표 `:165-166,173`은 삭제 전 것이라 더는 유효하지 않다. 살아 있는 `usdKrwFutures`는 같은 파일 `KrxTopicData`의 정당한 필드이므로 **심볼 이름만 찾아 이 지시를 재실행하지 말 것** | `android/.../dto/TopicMessage.kt:165-166,173`(선언·병합 중) / `android/di/NetworkModule.kt:31` / iOS 동형: `TopicMessage.swift:71` |
 | D9 | `type:"update"`는 **지원 대상에서 제거**하고 무시(서버는 snapshot-only) | `android/TopicMessage.kt:12`, `TopicFrameDecoder.kt:34-35` |
 | D10 | keep-alive: 클라가 raw text `"ping"` 송신 → 서버는 **JSON** `{"type":"pong"}`. raw pong fast-path는 없다 | `app/topic_dispatcher.py:496-497` |
 | D11 | malformed frame은 **decoder가 실패**하고 **transport가 프레임 단위 격리**(store 미변경·로그·다음 프레임 계속). decoder 무시로 바꾸지 않는다 | `TopicFrameDecoderTest.kt:63` 회귀 계약 |
@@ -891,7 +913,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
 - lease: `max(0, shortestDuration−180−U(0,60))`에 갱신, `duration 0` = 즉시 재인증(연결·lease_id당 1회).
   `lease_id`/duration 한쪽 누락·음수·overflow는 control frame fail-closed(store 무변). 같은 `lease_id` ACK는 최초
   absolute hard-expiry를 연장하지 않으며 foreground 복귀 시 ping/resubscribe 전에 expiry를 강제한다
-- **`dxy:spot` DTO/decoder/store 신규**(현재 topic 계층에 없음), `type:"update"` 제거(D9), JSON pong(D10), malformed 프레임 격리(D11)
+- **`dxy:spot` DTO/decoder/store 신규**(작성 시점에는 topic 계층에 없었음 — ✅ 이후 세 슬라이스에 나눠 land: DTO와 decoder 분기는 S3a `32f5994` (`DxySpotEntry`·`DxyTopicMessage`·`DxyTopicData`, `TopicFrameDecoder`의 `dxy:spot` 분기), domain 값과 merge는 S3b `32446fc`(`TopicDollarIndex`와 그 `merge` overload), coordinator 수신은 S3k-1 `4f50b64`(`receiveIndex`)), `type:"update"` 제거(D9), JSON pong(D10), malformed 프레임 격리(D11)
 - 오류 행렬:
   - whole request `invalid_token` = token 강제 refresh 후 공유 예산 안 1회, `temporarily_unavailable` = body `retry_after_seconds` 하한,
     `invalid_request`/`request_too_large` = terminal programming error, 미지 request/error = 상태 무변·격리
@@ -899,6 +921,25 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
     `premium_required` = S1 공통 Rejected 전이, `krx_entitlement_required` = S6 hide+force refresh
   - topic body `retry_after_seconds`와 HTTP `Retry-After`는 서로 다른 typed source로 fixture를 둔다
 - REST bootstrap `/api/v2/topics/snapshot?topic=` — UID/`userAccessEpoch` fence + 시도당 10초 monotonic 예산, typed 오류 행렬 적용
+  - ⚠️ **REST는 WS와 일부 오류 문자열을 공유하지만, envelope·적용 범위·인증/권한 표현이 달라 WS 오류 행렬을
+    그대로 적용할 수 없다.** 위 행렬을 복사하지 말고 이 endpoint의 실제 응답으로 만든다. 아래는 `exchange-rate`
+    `52650f6`의 `get_v2_topic_snapshot`·`require_premium`·`verify_firebase_token`을 읽어 확인한 것이며, 줄 번호 대신
+    심볼로 적는다(그 파일은 자주 움직인다).
+    - `topic`은 **스칼라 필수 1개**(반복 시 마지막 값, 누락 422) → desired 5개는 **논리 호출 5회**. 401 replay가
+      하나를 둘로 만들 수 있어 HTTP 송신 수와 같지 않다
+    - `topics_disabled`: per-topic이 아니라 **인증 전 endpoint 전체** 404(dormant 분기가 `verify_firebase_token`
+      호출보다 앞선다 — 서버 주석이 '첫 실행문 계약'이라고 명시)
+    - `temporarily_unavailable`: 503, body `{"error":"temporarily_unavailable"}` — **`Retry-After`도
+      `retry_after_seconds`도 없다**(서버 주석:
+      분 단위 failover에 5초 재시도는 storm). 위 행렬의 원천 분리 규칙은 그대로 적용된다
+    - `topic_unavailable`: **404**, body `{"error","topic"}`. 지원 topic이지만 현재 payload가 없을 때
+      (예: `FX_TOPIC_ENABLED` off) — `unknown_topic`(body `error`+`detail`+`supported_topics`)과 **모양으로 구분된다**.
+      S6는 prior-grant KRX bootstrap의 404를 body의 `error` 값으로 판별한다(`unknown_topic`=revoke /
+      `topic_unavailable`=degraded). 두 응답 모두 L-1 fixture 대상
+    - premium: INACTIVE 403 `detail` / PENDING **503 + `Retry-After: 5`**. **인증 인프라 실패도 503 + `detail`**
+      (Firebase 미초기화·인증서 조회 실패) → **503은 세 종류**다
+    - REST에는 `invalid_token`·`premium_required`·`krx_entitlement_required`가 **없다**. KRX 미자격은 404
+      `unknown_topic` + `supported_topics`에서 제거(존재 은닉)
 - merge: `(source, asset)` 키, `mergeAt = rate_changed_at ?? timestamp`, **strictly-newer only**, 동일 시각은 기존 유지, 그룹 누락 ≠ 삭제
 - **topic last-known disk 계약**: 정화·domain 검증을 통과한 FX/Tether/DXY를 서로 다른
   `(uid,userAccessEpoch,topic-kind)` namespace에 저장하고, fresh server premium 승인 뒤 WS/bootstrap보다 먼저 복원한다.
@@ -908,6 +949,13 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   `(uid,userAccessEpoch,krxCapabilityEpoch)` 별도 namespace만 사용한다. 일반 tether/FX/DXY cache에 섞지 않는다.
 - 최초 delivery watchdog과 지속 staleness를 분리한다. 지속 정책은 D14(첫 유효 Tether delivery 뒤에만 45초
   silence owner arm, KRX-only/미수신은 미arm, FX 시간 만료 없음), legacy `rates` 무시(I1)
+  - **iOS 이탈(의도적, §2.2 기록).** iOS는 빈 tether payload에도 `markTetherFresh()`를 부른다
+    (iOS `a36682f`의 `ExchangeRateViewModel.applyTetherSnapshot`, '수신 자체가 생존 증거'). Android는 정화 후
+    **사용 가능한 가격이 하나도 없으면 배달로 세지 않는다**(`TopicSessionCoordinator.receive`의 `quotes.isEmpty()`
+    되돌림) — D8로 `usd_krw_futures`를 DTO에서 뺀 뒤 빈 스냅샷과 KRX-only payload가 구분 불가라, iOS를
+    그대로 옮기면 KRX-only 200이 tether 창을 무장시킨다. D14와 §7 S3 DoD(KRX-only가 Tether delivery·
+    freshness를 충족하지 않음)를 따르는 강화이며 새 정책이 아니다. '사용 가능한 가격 존재'와 '캐시 변경
+    발생'은 다른 검사다 — merge 결과가 불변이어도 유효한 가격이 있었으면 배달이다
 - **USD/JPY/EUR 현재가를 topic으로 전환하고 `/api/rates`·legacy WS 소비 제거**. S2의 premium unavailable shell을
   실제 premium Root destination으로 교체한다
 - rate consumer cutover와 같은 변경 세트에서 `fxi_cache`의 legacy `rates`·`rates_timestamp`를 제거하고

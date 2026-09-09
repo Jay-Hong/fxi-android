@@ -105,7 +105,7 @@ object TopicSilencePolicy {
      * This takes an **outcome**, not a payload, because counting quotes cannot answer the
      * question. Its caller decides, and the rule the session settled on is that a payload leaving
      * no usable price is not a delivery: after D8 an empty tether snapshot cannot be told apart
-     * from one carrying only `usd_krw_futures`, and `ANDROID_V2_PLAN.md:889` forbids the latter
+     * from one carrying only `usd_krw_futures`, and `ANDROID_V2_PLAN.md` D14 forbids the latter
      * satisfying tether delivery. An earlier draft of this comment said the opposite — that an
      * empty snapshot is a quiet market answering — and that reading would have let a KRX-only
      * frame arm this window. Found by review.
