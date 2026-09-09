@@ -12,6 +12,7 @@ import com.jay.fxi.domain.model.TopicLeaseInput
 import com.jay.fxi.domain.model.TopicLeasePolicy
 import com.jay.fxi.domain.model.TopicLeaseRegistry
 import com.jay.fxi.domain.model.TopicAuthResolution
+import com.jay.fxi.domain.model.TopicDeliveryState
 import com.jay.fxi.domain.model.TopicQuote
 import com.jay.fxi.domain.model.TopicRates
 import com.jay.fxi.domain.model.TopicReconnectPolicy
@@ -21,6 +22,7 @@ import com.jay.fxi.domain.model.TopicSilenceArming
 import com.jay.fxi.domain.model.TopicSilenceDecision
 import com.jay.fxi.domain.model.TopicSilenceEvidence
 import com.jay.fxi.domain.model.TopicSilencePolicy
+import com.jay.fxi.domain.model.TopicSubscriptionSnapshot
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -93,6 +95,20 @@ private sealed interface SessionInput {
     data class Access(val allowed: Boolean, val fence: TopicSessionFence?) : SessionInput
 
     data class Transport(val generation: Long, val event: TopicTransportEvent) : SessionInput
+
+    /**
+     * A command returned an outcome.
+     *
+     * Separate from [CommandDone], which is the bookkeeping and runs however the command ended: a
+     * cancelled one has no outcome, and saying so by simply not sending this is more honest than
+     * inventing one.
+     */
+    data class CommandFinished(
+        val generation: Long,
+        val commandId: Long,
+        val purpose: TopicCommandPurpose,
+        val outcome: TopicCommandOutcome
+    ) : SessionInput
 
     /**
      * A command is over, however it ended.
@@ -215,6 +231,14 @@ class TopicSessionCoordinator(
     private val onAcknowledgement: (TopicCommandAcknowledgement) -> Unit = {},
     /** A frame the decoder refused: its length and the exception's class name, and nothing else. */
     private val onUndecodable: (length: Int, failure: String) -> Unit = { _, _ -> },
+    /**
+     * The subscription state, whenever it changes.
+     *
+     * Sent from one place rather than paired with each write, and from the transitions a write can
+     * be undone inside of — an expiry marks a topic degraded and then tears the connection down,
+     * which puts it back to never-received in the same breath.
+     */
+    private val onTopicState: (TopicSubscriptionSnapshot) -> Unit = {},
     private val desired: Set<String> = TopicCatalogue.DESIRED
 ) {
     private class Connection(
@@ -256,6 +280,15 @@ class TopicSessionCoordinator(
          * registration, because the token wait and the retry cooldowns are inside the command.
          */
         var controlOwner: Long? = null
+
+        /**
+         * The revalidation whose result may still be applied.
+         *
+         * "Is one in progress" is not "is this the one that asked": a question answered by data
+         * lets a second episode begin, and the first one's result arrives after it. Found by
+         * review.
+         */
+        var revalidationOwner: Long? = null
 
         /** Starts that stood aside for [controlOwner], resumed when it lets go. */
         var renewalDeferred = false
@@ -313,6 +346,9 @@ class TopicSessionCoordinator(
      * when an attempt starts, cleared when that connection's first-delivery command ends.
      */
     private var firstDeliveryOutstanding = false
+
+    /** What the last publication said, so an unchanged snapshot is not sent again. */
+    private var publishedSnapshot: TopicSubscriptionSnapshot? = null
 
     /**
      * The grant this session has been told it may not have, if it has been told.
@@ -380,6 +416,11 @@ class TopicSessionCoordinator(
 
     private suspend fun handle(input: SessionInput) {
         if (stopped) return
+        dispatch(input)
+        publishIfChanged()
+    }
+
+    private suspend fun dispatch(input: SessionInput) {
         when (input) {
             is SessionInput.Foreground -> {
                 // Only a change. A platform that announces the same state twice must not be able
@@ -454,12 +495,31 @@ class TopicSessionCoordinator(
             is SessionInput.Transport ->
                 current(input.generation)?.let { onTransportEvent(it, input.event) }
 
+            is SessionInput.CommandFinished -> current(input.generation)?.let { live ->
+                if (
+                    input.purpose == TopicCommandPurpose.REVALIDATION &&
+                    live.revalidationOwner != input.commandId
+                ) return@let
+
+                applyOutcome(input.purpose, input.outcome)
+                if (live.revalidationOwner == input.commandId) {
+                    live.revalidationOwner = null
+                }
+            }
+
             is SessionInput.CommandDone -> current(input.generation)?.let { live ->
                 val done = live.commands.remove(input.commandId)
                 if (done?.purpose == TopicCommandPurpose.FIRST_DELIVERY) {
                     firstDeliveryOutstanding = false
                 }
                 releaseControlLane(live, input.commandId)
+                // A revalidation that ended without a result — cancelled, so no `CommandFinished`
+                // — would otherwise leave the topic revalidating for good, with its window already
+                // spent and nothing left to ask again. Found by review.
+                if (live.revalidationOwner == input.commandId) {
+                    live.revalidationOwner = null
+                    store.abortRevalidation(TopicCatalogue.TETHER)
+                }
                 // Deliberately nothing else. Re-sending `desired − confirmed` here would hand a
                 // terminal refusal or a spent budget a fresh one on the next lap, which is the
                 // ceiling those two exist to be. A new command needs a new reason: a reconnection,
@@ -790,8 +850,8 @@ class TopicSessionCoordinator(
         }
         live.renewalDeferred = false
         // The session never reads the outcome, so the purpose looks unobservable from here — and
-        // is not: the command asks the injected clock for its delivery window, and a renewal that
-        // opened one would be visible as a wait no other part of a session makes. That is what
+        // is not: the command asks the injected clock for its delivery window, and the test
+        // observes whether a renewal opens that window. That is what
         // `a renewal does not open a delivery window` holds. Found by review, after this comment
         // had claimed the opposite.
         startCommand(live, TopicCommandPurpose.LEASE_RENEWAL) { live.renewalScope intersect desired }
@@ -841,6 +901,9 @@ class TopicSessionCoordinator(
         val running = RunningCommand(command, purpose)
         live.commands[id] = running
         live.controlOwner = id
+        if (purpose == TopicCommandPurpose.REVALIDATION) {
+            live.revalidationOwner = id
+        }
         // `finally`, so a command that ends by cancellation is still taken off the connection. A
         // listener throwing `CancellationException` out of the acknowledgement callback used to
         // leave the entry behind for good: the socket stayed up, and every later control frame was
@@ -849,7 +912,7 @@ class TopicSessionCoordinator(
         // session, not the leftover.
         running.job = scope.launch {
             try {
-                command.run()
+                post(SessionInput.CommandFinished(live.generation, id, purpose, command.run()))
             } catch (moved: AuthIdentityChangedException) {
                 post(SessionInput.CommandIdentityChanged(live.generation))
             } finally {
@@ -913,6 +976,9 @@ class TopicSessionCoordinator(
         current(live.generation)?.let { still ->
             if (!enforceLeaseExpiry(still)) applyLeases(still, ack)
         }
+        // The acknowledgement's own store writes happen inside the command, not on the loop, so
+        // the turn-boundary publication would not carry them until something else arrives.
+        publishIfChanged()
 
         onAcknowledgement(ack)
         if (ack.rejected.isNotEmpty()) onRejected(ack.rejected)
@@ -981,18 +1047,21 @@ class TopicSessionCoordinator(
      * and the server issues new leases. Several deadlines arriving together still end it once,
      * because [end] is idempotent and the connection is gone after the first — which is also why
      * this needs no equivalent of iOS's `leaseExpiryReconnectIssuedGeneration`.
-     *
-     * **One thing iOS does here is deliberately not copied.** It marks the expired topics degraded
-     * and publishes that snapshot (`WebSocketService.swift:1383-1384`) before reconnecting, so its
-     * listeners see the degradation for the moment it lasts. Writing the same thing here would be
-     * invisible: nothing publishes between the write and [end]'s `clearConnectionState`, which puts
-     * a still-wanted topic back to never-received. The write belongs with the observer, and the
-     * observer arrives with the screen that reads this store. Found by review, which measured the
-     * difference rather than accepting the parity argument for it.
      */
     private fun enforceLeaseExpiry(live: Connection): Boolean {
-        if (live.leases.expiredAt(clock.nowMillis()).isEmpty()) return false
-        end(live, TopicDisconnectCause.UNEXPECTED)
+        val expired = live.leases.expiredAt(clock.nowMillis())
+        if (expired.isEmpty()) return false
+        // Written and published before the teardown, which puts a still-wanted topic back to
+        // never-received in the same turn. iOS does the same (`WebSocketService.swift:1383-1384`).
+        store.expire(expired)
+        // The teardown is owed whatever the observer does with the snapshot: this runs on a
+        // command's coroutine as well as on the loop, and a listener throwing there would leave
+        // the socket standing on a lease that has gone. Found by review.
+        try {
+            publishIfChanged()
+        } finally {
+            end(live, TopicDisconnectCause.UNEXPECTED)
+        }
         return true
     }
 
@@ -1072,6 +1141,39 @@ class TopicSessionCoordinator(
         live.revalidationDeferred = false
         if (!store.beginRevalidation(TopicCatalogue.TETHER)) return
         startCommand(live, TopicCommandPurpose.REVALIDATION) { setOf(TopicCatalogue.TETHER) }
+    }
+
+    /**
+     * What a finished revalidation means for the topic it asked about.
+     *
+     * Only a revalidation: a renewal reports no silence at all, and the first delivery's silence is
+     * the next slice's to route. Degrading needs the acknowledgement *and* the delivery deadline
+     * passing with nothing new — `TopicSilencePolicy` puts the second half on the request's own
+     * deadlines — so an ending with no answer at all is not a failure of the topic and is taken
+     * back instead.
+     *
+     * **The store is asked whether this is still that revalidation.** The outcome is computed at
+     * the instant the deadline passes and applied a turn later, and a frame whose input was queued
+     * before it is handled first: `recordFrame` puts the topic back to healthy, and applying a
+     * silence measured before that would degrade a topic that has just recovered.
+     */
+    private fun applyOutcome(purpose: TopicCommandPurpose, outcome: TopicCommandOutcome) {
+        if (purpose != TopicCommandPurpose.REVALIDATION) return
+        val topic = TopicCatalogue.TETHER
+        if (store.snapshot.stateFor(topic).deliveryState != TopicDeliveryState.REVALIDATING) return
+        if (outcome is TopicCommandOutcome.Acknowledged && topic in outcome.silent) {
+            store.markDegraded(topic)
+        } else {
+            store.abortRevalidation(topic)
+        }
+    }
+
+    /** One publication point, and only when the snapshot actually moved. */
+    private fun publishIfChanged() {
+        val next = store.snapshot
+        if (next == publishedSnapshot) return
+        publishedSnapshot = next
+        onTopicState(next)
     }
 
     /** Lets go of the request channel, and wakes whatever stood aside for it. */

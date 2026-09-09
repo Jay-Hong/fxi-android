@@ -10,6 +10,7 @@ import com.jay.fxi.domain.model.TopicAuthResolution
 import com.jay.fxi.domain.model.TopicControlState
 import com.jay.fxi.domain.model.TopicDeliveryState
 import com.jay.fxi.domain.model.TopicRejectionReason
+import com.jay.fxi.domain.model.TopicSubscriptionSnapshot
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
@@ -141,6 +142,18 @@ class TopicSessionCoordinatorTest {
         }
         val acknowledgements = mutableListOf<TopicCommandAcknowledgement>()
 
+        /** Every snapshot the session published, in order. */
+        val topicStates = mutableListOf<TopicSubscriptionSnapshot>()
+
+        /**
+         * Thrown by the state observer on the **degraded** snapshot, once.
+         *
+         * Narrow on purpose. A listener that throws at any snapshot throws at the first one the
+         * session publishes — the pending request, from inside the loop's own turn — and then what
+         * is being watched is the loop dying of its own exception rather than the path under test.
+         */
+        var topicStateFailure: Throwable? = null
+
         /** Injected into the acknowledgement listener, to stand for one that misbehaves. */
         var acknowledgementFailure: Throwable? = null
 
@@ -183,6 +196,15 @@ class TopicSessionCoordinatorTest {
                 acknowledgementFailure?.let { failure -> throw failure }
             },
             onUndecodable = { length, failure -> undecodable += length to failure },
+            onTopicState = {
+                topicStates += it
+                if (it.stateFor(TETHER).deliveryState == TopicDeliveryState.DEGRADED) {
+                    topicStateFailure?.let { failure ->
+                        topicStateFailure = null
+                        throw failure
+                    }
+                }
+            },
             desired = setOf(TETHER, USD)
         )
 
@@ -1818,6 +1840,13 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(1)
         assertEquals("채널이 비었는데 미뤄둔 질문이 사라졌다", 3, h.requests.size)
         assertEquals(setOf(TETHER), h.requests[2].topics.toSet())
+        // The renewal's own outcome lands right after, and it says nothing about delivery: a
+        // revalidation that has just begun must not be taken back by it.
+        assertEquals(
+            "갱신의 결과가 방금 시작한 재검증을 거뒀다",
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
         h.cleanUp()
     }
 
@@ -2135,4 +2164,272 @@ class TopicSessionCoordinatorTest {
             )
             h.cleanUp()
         }
+
+    // ---- outcomes and publication (D14 B) --------------------------------------------------------
+
+    /** Silence answered by an acknowledgement and then more silence is what degrades a topic. */
+    @Test
+    fun `a revalidation that stays silent degrades its topic`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+        advanceTimeBy(45_100)
+        assertEquals(2, h.requests.size)
+        assertEquals(
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertEquals(
+            "ACK 만으로 degraded 로 갔다",
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+
+        advanceTimeBy(45_100)
+        assertEquals(
+            "재검증 뒤에도 조용한데 degraded 가 아니다",
+            TopicDeliveryState.DEGRADED,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        assertEquals(TopicDeliveryState.DEGRADED, h.topicStates.last().stateFor(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    /** A revalidation that never got an answer is not the topic's failure. */
+    @Test
+    fun `a revalidation with no answer is taken back rather than degraded`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+        advanceTimeBy(45_100)
+        assertEquals(
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+
+        // No acknowledgement at all: three attempts, then the command stops.
+        advanceTimeBy(120_000)
+        assertNotEquals(
+            "응답 없는 재검증을 topic 의 실패로 올렸다",
+            TopicDeliveryState.DEGRADED,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        assertEquals(0, h.store.snapshot.stateFor(TETHER).revalidationAttempt)
+        h.cleanUp()
+    }
+
+    /** A topic that starts arriving again during its revalidation is healthy, not degraded. */
+    @Test
+    fun `a revalidation answered by a frame ends healthy`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+        advanceTimeBy(45_100)
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
+        // Five seconds in, so the window this delivery arms lands well after the revalidation's
+        // own delivery deadline — the outcome is applied inside that gap and nothing else is.
+        advanceTimeBy(5_000)
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        assertEquals(TopicDeliveryState.HEALTHY, h.store.snapshot.stateFor(TETHER).deliveryState)
+
+        advanceTimeBy(40_000)
+        assertEquals(
+            "회복한 topic 을 늦은 결과가 degraded 로 되돌렸다",
+            TopicDeliveryState.HEALTHY,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * The degradation an expiry writes is published before the teardown erases it.
+     *
+     * `end` puts a still-wanted topic back to never-received in the same turn, so a publication
+     * that only ran at the end of the turn would never carry the degraded reading — which is why
+     * the write was left out until there was an observer for it.
+     */
+    @Test
+    fun `an expiry publishes its degradation before the teardown`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
+
+        advanceTimeBy(900_200)
+
+        val states = h.topicStates.map { it.stateFor(TETHER).deliveryState }
+        val degradedAt = states.indexOf(TopicDeliveryState.DEGRADED)
+        val clearedAt = states.indexOfLast { it == TopicDeliveryState.NEVER_RECEIVED }
+        assertTrue("만료의 degraded 를 아무도 못 봤다: $states", degradedAt >= 0)
+        assertTrue("정리가 degraded 보다 먼저 발행됐다: $states", clearedAt > degradedAt)
+        h.cleanUp()
+    }
+
+    /**
+     * The acknowledgement's own store writes are published when they happen.
+     *
+     * They happen inside the command, not on the session's queue, so a publication that only ran at
+     * the end of each queued input would hold them until the next input arrives.
+     */
+    @Test
+    fun `an acknowledgement is published without waiting for its command to end`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
+        assertEquals(
+            "ACK 의 상태 변화가 명령이 끝날 때까지 발행되지 않았다",
+            true, h.topicStates.last().stateFor(TETHER).confirmed
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * An earlier revalidation's result must not reap a later, unrelated one.
+     *
+     * The first question is answered by a frame, so its own result says nothing is silent — but by
+     * the time that result is applied a *second* episode has begun, and "is a revalidation in
+     * progress" cannot tell the two apart. Review's path.
+     */
+    @Test
+    fun `a stale revalidation result does not reap the next one`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        advanceTimeBy(45_100)
+        assertEquals("첫 질문이 나가지 않았다", 2, h.requests.size)
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
+        // Answered by data: the first question's own result will carry no silence, and a new
+        // window is armed by that same frame.
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        assertEquals(TopicDeliveryState.HEALTHY, h.store.snapshot.stateFor(TETHER).deliveryState)
+
+        // The device slept: the new window is already past when the app comes back, so a second
+        // episode starts while the first command is still waiting out its delivery deadline.
+        advanceTimeBy(4_800)
+        h.clockSkewMillis = 41_000
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        assertEquals("두 번째 질문이 나가지 않았다", 3, h.requests.size)
+        assertEquals(
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+
+        // The first command's deadline now passes, and its result is about an episode that ended.
+        advanceTimeBy(45_000)
+        assertEquals(
+            "지난 질문의 결과가 새 질문을 거뒀다",
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        h.cleanUp()
+    }
+
+    /** A revalidation cancelled before it could answer is taken back, not left standing. */
+    @Test
+    fun `a cancelled revalidation is taken back`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+        advanceTimeBy(45_100)
+        assertEquals(
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+
+        // The listener throws, so the command ends with no outcome at all.
+        h.acknowledgementFailure = kotlinx.coroutines.CancellationException("listener")
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
+        assertNotEquals(
+            "결과 없이 끝난 재검증이 topic 을 재검증 중으로 남겼다",
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        assertEquals(0, h.store.snapshot.stateFor(TETHER).revalidationAttempt)
+        h.cleanUp()
+    }
+
+    /**
+     * The teardown an expiry owes does not depend on the observer behaving.
+     *
+     * An acknowledgement is where a command's own coroutine discovers an expiry, and the
+     * publication happens there too. A listener throwing takes that coroutine down with it, so the
+     * teardown has to be owed regardless of what the observer does with the snapshot.
+     *
+     * The throw is aimed at the degraded snapshot, which is the one an expiry writes. Aimed at any
+     * snapshot it lands on the pending request instead — inside the loop, before the command has
+     * even applied the acknowledgement — and then the socket closes for a different reason
+     * entirely. Found by review, which caught the earlier aim.
+     */
+    @Test
+    fun `an expiry found while acknowledging tears down even when the observer throws`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        // A lease long enough that the question near its end is a revalidation, not a renewal.
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
+        val first = h.wire
+
+        // Delivering every forty seconds keeps the window moving, so the only question comes near
+        // the deadline: a renewal cannot be the one that finds this, because its own
+        // acknowledgement deadline falls 160 seconds before the lease's.
+        repeat(18) { round ->
+            advanceTimeBy(40_000)
+            h.wire.deliver(h.tetherFrame(1390.0 + round))
+            advanceTimeBy(1)
+        }
+        // The renewal came due on the way. Answered with the **same** lease id, so it is a
+        // restatement and the absolute deadline stays where it was.
+        assertEquals(2, h.requests.size)
+        h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
+        repeat(3) { round ->
+            advanceTimeBy(40_000)
+            h.wire.deliver(h.tetherFrame(1500.0 + round))
+            advanceTimeBy(1)
+        }
+        assertEquals("배달이 창을 밀지 못했다", 2, h.requests.size)
+
+        advanceTimeBy(45_100)
+        assertEquals("마감 직전의 질문이 나가지 않았다", 3, h.requests.size)
+
+        // Past the lease, still inside that question's own twenty seconds, and with the relative
+        // timer not yet woken — so the answer is where the expiry is found.
+        advanceTimeBy(14_500)
+        h.clockSkewMillis = 600
+        h.topicStateFailure = kotlinx.coroutines.CancellationException("observer")
+        h.wire.deliver(h.ack("r3", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
+        // The intended point was reached: the degraded snapshot went out and took the throw.
+        assertTrue(
+            "만료의 degraded 스냅샷이 발행되지 않았다",
+            h.topicStates.any { it.stateFor(TETHER).deliveryState == TopicDeliveryState.DEGRADED }
+        )
+        assertNull("관측자가 던지지 않았다", h.topicStateFailure)
+        assertTrue("관측자가 던지자 소켓이 만료된 lease 위에 남았다", first.cancelled)
+        h.cleanUp()
+    }
 }
