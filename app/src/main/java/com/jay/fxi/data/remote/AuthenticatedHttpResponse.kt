@@ -30,7 +30,20 @@ internal enum class AuthenticatedEndpoint {
     ENTITLEMENTS,
 
     /** Firebase-only hourly snapshot; premium-required errors are not a known policy here. */
-    FREE_SNAPSHOT
+    FREE_SNAPSHOT,
+
+    /**
+     * `GET /api/v2/topics/snapshot`.
+     *
+     * Declares no known error body **on purpose**, like [ENTITLEMENTS]. This route answers 404
+     * with three different `error` strings and 503 with three different meanings, so its verdict
+     * is the body's `error`, not the status — and the 404 branch below is the inverse shape,
+     * requiring `error == null` and an exact `detail` literal. Reading this endpoint there would
+     * either invert that guard or need a new [AuthenticatedFailureKind], which every unrelated
+     * `when` over the enum would then have to grow. Classification lives in
+     * `AuthenticatedHttpFailure.toTopicSnapshotOutcome` instead.
+     */
+    TOPIC_SNAPSHOT
 }
 
 enum class AuthenticatedFailureKind {

@@ -10,6 +10,7 @@ import com.jay.fxi.data.remote.AuthenticatedTransport
 import com.jay.fxi.data.remote.ClientMetadataInterceptor
 import com.jay.fxi.data.remote.FXiApiService
 import com.jay.fxi.data.remote.MutationOneShotInterceptor
+import com.jay.fxi.data.remote.TopicFrameDecoder
 import com.jay.fxi.util.ApiConfig
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import dagger.Module
@@ -38,6 +39,16 @@ object NetworkModule {
         isLenient = false
         explicitNulls = true
     }
+
+    /**
+     * The topic frame decoder's first production binding — until now it existed only in tests.
+     *
+     * Bound to [WireJson] rather than a literal of its own: the socket and the REST twin decode the
+     * same DTOs, and two `Json` instances would be two leniency policies that drift apart.
+     */
+    @Provides
+    @Singleton
+    fun provideTopicFrameDecoder(@WireJson json: Json): TopicFrameDecoder = TopicFrameDecoder(json)
 
     @Provides
     @Singleton

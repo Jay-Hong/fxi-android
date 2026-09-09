@@ -31,6 +31,17 @@ internal interface AuthenticatedApiService {
         @Query("period") period: String
     ): Response<ResponseBody>
 
+    /**
+     * One topic per call: the server declares `topic` as a required scalar, answers 422 when it is
+     * absent, and keeps only the last value if it is repeated. A list here would silently ask for
+     * one topic and look like it asked for several.
+     */
+    @GET("api/v2/topics/snapshot")
+    suspend fun getTopicSnapshot(
+        @Tag auth: AuthRequestTag,
+        @Query("topic") topic: String
+    ): Response<ResponseBody>
+
     @POST("api/register-device")
     suspend fun registerDevice(
         @Tag auth: AuthRequestTag,
@@ -104,6 +115,21 @@ class AuthenticatedApiClient internal constructor(
     ): AuthenticatedHttpResponse<FreeSnapshotResponse> = transport.executeRead(owner) {
         service.getFreeSnapshot(it, tab, period)
     }.preserve(AuthenticatedEndpoint.FREE_SNAPSHOT).decodeSuccess(wireJson)
+
+    /**
+     * The bytes of one topic snapshot, undecoded.
+     *
+     * A read, so the transport's single 401 replay applies and one logical call can be two sends.
+     * Left undecoded here because the frame's concrete type is chosen at runtime from the envelope
+     * and `decodeSuccess` needs a reified one — and because the REST-side guards that follow
+     * (echo check, non-answer frames) are policy, not transport.
+     */
+    suspend fun getTopicSnapshot(
+        owner: AuthSnapshot,
+        topic: String
+    ): AuthenticatedHttpResponse<ByteArray> = transport.executeRead(owner) {
+        service.getTopicSnapshot(it, topic)
+    }.preserve(AuthenticatedEndpoint.TOPIC_SNAPSHOT)
 
     /** Captures the exact owner credential for a multi-step destructive flow. */
     suspend fun captureSnapshot(): AuthSnapshot = transport.captureSnapshot()
