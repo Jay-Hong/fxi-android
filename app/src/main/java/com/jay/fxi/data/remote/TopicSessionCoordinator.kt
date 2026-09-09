@@ -11,6 +11,7 @@ import com.jay.fxi.data.remote.dto.toQuote
 import com.jay.fxi.domain.model.TopicLeaseInput
 import com.jay.fxi.domain.model.TopicLeasePolicy
 import com.jay.fxi.domain.model.TopicLeaseRegistry
+import com.jay.fxi.domain.model.TopicAuthResolution
 import com.jay.fxi.domain.model.TopicQuote
 import com.jay.fxi.domain.model.TopicRates
 import com.jay.fxi.domain.model.TopicReconnectPolicy
@@ -571,10 +572,12 @@ class TopicSessionCoordinator(
                 live.commands.values.toList().forEach { it.command.deliver(frame) }
 
             is DecodedTopicFrame.Tether ->
-                receive(TopicCatalogue.TETHER, frame.value.data.allEntries)
+                receive(live, TopicCatalogue.TETHER, frame.value.data.allEntries)
 
-            is DecodedTopicFrame.Fx -> receive(frame.value.topic, frame.value.data.allEntries)
-            is DecodedTopicFrame.Dxy -> receiveIndex(frame.value)
+            is DecodedTopicFrame.Fx ->
+                receive(live, frame.value.topic, frame.value.data.allEntries)
+
+            is DecodedTopicFrame.Dxy -> receiveIndex(live, frame.value)
 
             // S6 owns turning KRX on. Until then a frame for it is not this session's, and
             // counting it would let an unentitled topic satisfy a watchdog.
@@ -597,6 +600,40 @@ class TopicSessionCoordinator(
     }
 
     /**
+     * Whether a data frame for [topic] may be applied at all.
+     *
+     * iOS asks the same three questions before it touches a topic's data
+     * (`WebSocketService.swift` `canAcceptTopicFrame`): is it wanted, was it refused, and did the
+     * credential fail. The two that were missing here let a topic the server had already refused,
+     * or one arriving after an `invalid_token`, count as delivery — the watchdog cannot tell that
+     * frame from a good one.
+     *
+     * The lease is the fourth, and it is **this side's own question**: an expiry the client has
+     * already reached is a permission it no longer believes in, whatever the socket keeps sending.
+     * It is not a new behaviour — [enforceLeaseExpiry] is the same enforcement the expiry timer,
+     * the foreground return, the renewal and the acknowledgement already reach; a frame is simply
+     * another thing that can arrive first. iOS enforces from its timer and its foreground return
+     * only, so this side notices the same fact sooner.
+     *
+     * **The two deadlines need not coincide.** The server filters expired leases before
+     * publishing (`app/topic_dispatcher.py:280`), but it floors the duration it puts on the wire
+     * (`:77`) while this side counts from when the acknowledgement is processed, and the deadline is
+     * read from a clock that counts sleep while the timer waiting for it is a relative wait that
+     * does not (`TopicRequestPolicy.kt:17-25`). Which side is ahead, and by how much, is not
+     * something measured here.
+     *
+     * The rejection read here is the store's, and an acknowledgement listing the topic as active
+     * clears it (`TopicSubscriptionState.kt:250`).
+     */
+    private fun accepts(live: Connection, topic: String): Boolean {
+        if (topic !in desired) return false
+        if (enforceLeaseExpiry(live)) return false
+        val snapshot = store.snapshot
+        if (snapshot.authResolution == TopicAuthResolution.FAILED) return false
+        return snapshot.stateFor(topic).rejection == null
+    }
+
+    /**
      * A data frame becomes prices and, if any of it survived, one unit of receive evidence.
      *
      * The order matters and there is nothing suspending in the middle of it: sanitise, merge,
@@ -605,8 +642,8 @@ class TopicSessionCoordinator(
      * that merged nothing because everything in it was older **is** a delivery: the socket
      * answered, which is all the generation counts.
      */
-    private fun receive(topic: String, entries: List<TopicSourceEntry>) {
-        if (topic !in desired) return
+    private fun receive(live: Connection, topic: String, entries: List<TopicSourceEntry>) {
+        if (!accepts(live, topic)) return
         val quotes: List<TopicQuote> = entries.mapNotNull { it.toQuote() }
         // No usable price, no delivery — whichever way the payload got that way. The narrow case
         // that decides it is a tether frame carrying only `usd_krw_futures`: D8 took that field
@@ -619,8 +656,8 @@ class TopicSessionCoordinator(
         store.recordFrame(topic)
     }
 
-    private fun receiveIndex(message: DxyTopicMessage) {
-        if (TopicCatalogue.DXY !in desired) return
+    private fun receiveIndex(live: Connection, message: DxyTopicMessage) {
+        if (!accepts(live, TopicCatalogue.DXY)) return
         // The index has one slot rather than a list, so "everything failed validation" and
         // "nothing arrived" are the same frame here: either way there is no reading to record.
         val index = message.data.dxy.toDollarIndex() ?: return
@@ -814,9 +851,10 @@ class TopicSessionCoordinator(
     /**
      * Lets go of every lease whose deadline has arrived, and takes the connection with them.
      *
-     * The same judgment for both callers — the timer and the foreground return — because the
-     * timer's wait is relative and the deadline is not: an app suspended past the deadline has a
-     * timer that has not fired yet, and the return is where that is noticed.
+     * The same judgment for every caller — the timer, the foreground return, a renewal coming due,
+     * an acknowledgement being applied, and a data frame arriving — because the timer's wait is
+     * relative and the deadline is not: an app suspended past the deadline has a timer that has
+     * not fired yet, and whichever of the others runs first is where that is noticed.
      *
      * Ending the connection is what recovers: desired survives it, so the reconnection resubscribes
      * and the server issues new leases. Several deadlines arriving together still end it once,

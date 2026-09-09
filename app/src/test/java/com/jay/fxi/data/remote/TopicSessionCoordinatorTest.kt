@@ -6,7 +6,9 @@ import com.jay.fxi.data.remote.dto.SubscriptionAck
 import com.jay.fxi.data.remote.dto.SubscriptionAckTopic
 import com.jay.fxi.data.remote.dto.SubscriptionRejection
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
+import com.jay.fxi.domain.model.TopicAuthResolution
 import com.jay.fxi.domain.model.TopicControlState
+import com.jay.fxi.domain.model.TopicDeliveryState
 import com.jay.fxi.domain.model.TopicRejectionReason
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import kotlin.time.Duration
@@ -1525,6 +1527,121 @@ class TopicSessionCoordinatorTest {
             "갱신이 배달 마감을 기다렸다: ${h.sleeps}",
             h.sleeps.none { it >= 40.seconds && it <= 50.seconds }
         )
+        h.cleanUp()
+    }
+
+    /**
+     * A frame that arrives after the deadline is not delivery evidence, and not a price either.
+     *
+     * The window is the same one the renewal and the foreground return already answer for: the
+     * timers are relative waits and the deadline is absolute, so a device that suspended past it
+     * comes back with the expiry still unfired. What is different here is that a *frame* can be
+     * what arrives first, and counting it would let a subscription the client has already declared
+     * over satisfy the very watchdog that exists to notice it going quiet. Found by review.
+     */
+    @Test
+    fun `a frame arriving after the deadline is not counted`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
+        val first = h.wire
+
+        // Still inside the lease: the same frame, on the same socket, is delivery.
+        h.clockSkewMillis = 899_000
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertEquals("만료 전 프레임을 버렸다", 1L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        assertEquals(
+            TopicDeliveryState.HEALTHY,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        assertTrue("만료 전인데 끊었다", !first.cancelled)
+
+        // Past it, with the timer still owing its wait.
+        h.clockSkewMillis = 901_000
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+
+        assertEquals(
+            "만료된 구독의 프레임이 수신 증거가 됐다",
+            1L, h.store.snapshot.stateFor(TETHER).receiveGeneration
+        )
+        assertEquals(
+            "만료된 구독의 값이 저장됐다",
+            1390.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0
+        )
+        assertTrue("만료를 집행하지 않았다", first.cancelled)
+        h.cleanUp()
+    }
+
+    /**
+     * A topic the server refused does not get to deliver.
+     *
+     * iOS asks this before touching a frame's data (`canAcceptTopicFrame`) and this side did not:
+     * a refused topic that kept arriving would satisfy its own delivery watchdog, and the refusal
+     * in the store would sit beside a `HEALTHY` reading of the same topic. `topic_unavailable`
+     * rather than `premium_required` because that one ends the connection, and what is under test
+     * is a connection that carries on.
+     */
+    @Test
+    fun `a refused topic's frame is not counted`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(
+            h.ack("r1", active = listOf(USD), rejections = mapOf(TETHER to "topic_unavailable"))
+        )
+        advanceTimeBy(1)
+        assertEquals(
+            TopicRejectionReason.TOPIC_UNAVAILABLE,
+            h.store.snapshot.stateFor(TETHER).rejection
+        )
+
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+
+        assertEquals(
+            "거절된 topic 의 프레임이 수신 증거가 됐다",
+            0L, h.store.snapshot.stateFor(TETHER).receiveGeneration
+        )
+        assertTrue("거절된 topic 의 값이 저장됐다", h.coordinator.rates.value.quotes.isEmpty())
+        assertTrue("거절 하나로 연결을 끊었다", !h.wire.cancelled)
+        h.cleanUp()
+    }
+
+    /**
+     * Nothing delivers on a credential the server has rejected.
+     *
+     * The other half of iOS's `canAcceptTopicFrame`. `invalid_token` with no replacement leaves the
+     * store's authentication verdict failed while the socket is still open — and a frame arriving
+     * then is data this session cannot claim it was entitled to.
+     */
+    @Test
+    fun `a frame after a failed authentication is not counted`() = runTest {
+        val h = Harness(this)
+        h.refreshed = null
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals(TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+
+        assertEquals(
+            "인증이 깨진 뒤의 프레임이 수신 증거가 됐다",
+            0L, h.store.snapshot.stateFor(TETHER).receiveGeneration
+        )
+        assertTrue(h.coordinator.rates.value.quotes.isEmpty())
         h.cleanUp()
     }
 }
