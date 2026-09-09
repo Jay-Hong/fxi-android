@@ -8,8 +8,24 @@ Status                        : **SCOPE-FROZEN (2026-08-31)** — 범위·D-결�
 Document authorization        : GO — 문서 작성·보정 승인 (2026-08-30)
 Plan approval                 : **APPROVED (2026-08-31)** — 이 계획을 작업의 기준으로 채택. 범위 재논의 종료,
                                 개정은 아래 개정 절차로만. **슬라이스 착수는 여전히 개별 GO**(§7 도입부 체인)
-Android implementation        : **S0 COMPLETE (2026-09-01)** — 구현·hosted CI는 `b477c22` / run `33496421777` green;
-                                current-runner S0-f·S0-g 실기기 evidence도 `b477c22`에서 validator green. S1 착수 GO 대기
+Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주요 구현 land · S3 진행 중 (2026-09-09)**.
+                                구현 커밋의 land는 슬라이스 완료가 아니다 — 아래 미충족 항목을 함께 읽을 것.
+                                S3는 a~k-1 land(`4f50b64`). 남은 S3 = k-2 lease · k-3 D14 침묵 ·
+                                REST bootstrap · topic last-known disk · FX cutover. 구독자 목적지는 아직
+                                `PremiumUnavailableScreen`이고 FX cutover가 그것을 치운다.
+                                S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
+                                실기기 evidence도 `b477c22`에서 validator green
+S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
+                                `AccessEffect.PushDelete`는 `lastEffects` 기록만 · backup XML은 exclude 둘뿐이고
+                                D27의 파일 단위 allowlist(+`domain="sharedpref"`)는 미구현.
+                                **유예 사유는 셋이 서로 다르다** — purge는 대상이 아직 legacy rate/graph store,
+                                PushDelete는 **서버 D21 순서 계약 미결**, backup은 기존 사용자 설정의 restore 동작
+                                변경을 분리한 것. 이 기록은 완료 선언도, 후속 슬라이스로의 이관 승인도 아니다
+S1.5 확인 필요                : presenter·순서/표시 설정·legacy bank store 삭제는 land. `RateSourceRegistry`와
+                                live/snapshot renderMode 등가까지 포함한 전체 DoD 충족은 미확인
+S2 미충족                     : D26 무료 알림 in-memory 미리보기 미구현 · 마지막 탭은 `(owner_uid, last_tab)` 한 쌍이라
+                                계정 간 혼입은 막지만 **§7 S2 DoD의 "UID별 마지막 탭 복원"은 미충족**
+                                (`FreeTabStore` KDoc은 의도적 선택이라 적지만, 그것이 DoD를 완화하지는 않는다)
 Server implementation         : NOT STARTED — SV 슬라이스 착수 GO 대기. SV-1/SV-2는 공개 rollout 차단 조건
 S0 source / evidence / deploy  : source `b477c22`는 `origin/main` 반영 · current-runner evidence subject `b477c22` · deploy 0
 Public release arming          : NOT APPROVED (계약은 D24)
@@ -17,7 +33,7 @@ Android public rollout        : BLOCKED by SV-1 / SV-2 production 배포·검증
 iOS common server gate        : SV-1 / SV-2
 Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 전달 신뢰성 hardening(DEFERRED) · SV-4 cross-device 계정삭제 hardening
 작성                          : 2026-08-29
-최종 보정                     : 2026-09-01
+최종 보정                     : 2026-09-09
 ```
 
 > **`Plan approval`은 구현 착수 승인이 아니다.** 계획을 기준으로 채택했을 뿐이고, 각 슬라이스 착수에는 별도 GO가 필요하다.
@@ -63,6 +79,19 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > 그 자체로 모순 없는 정책이다. 그래서 위 "애매하면 2번으로 처리한다"에 따라 1번이 아니라 2번으로
 > 기록한다. 아래 §7 S3 본문과 DoD를 함께 고쳤고, 3회 시도 예산·슬라이스 경계·release gate는
 > 바꾸지 않았다.
+
+>
+> **동결 후 3번 비의미 상태 명확화 기록(2026-09-09).** 머리말의 진행 상태가 "S0 COMPLETE · S1 착수 GO 대기"에
+> 멈춰 있어 현재 위치를 설명하지 못했다. S1·S1.5·S2의 구현이 land했고 S3는 a~k-1까지 `origin/main`에 있다.
+>
+> **구현 커밋의 land는 슬라이스 완료가 아니다.** 그래서 머리말은 land와 미충족을 나눠 적는다 — S1은 실제
+> purge·`AccessEffect.PushDelete` 실행·D27 파일 단위 allowlist가, S2는 D26 in-memory preview와 §7 S2 DoD의
+> "UID별 마지막 탭 복원"이 미충족이다. S1.5는 주요 구현이 land했으나 전체 DoD 충족은 미확인이다.
+> 코드에 적힌 세 유예 사유는 서로 다르므로 각각 적는다 — purge는 대상이 아직 legacy rate/graph store,
+> PushDelete는 **서버 D21 순서 계약 미결**(`PremiumAccessCoordinator.kt:17-24`), backup은 기존 사용자 설정의
+> restore 동작 변경을 분리한 것이다. 이 기록은 완료 선언이 아니고 미충족 작업의 후속 슬라이스 이관도
+> 승인하지 않는다 — 소유권은 §7·§9.1이 정한 그대로다. 범위·D-결정·슬라이스 경계·게이트·DoD·활성
+> 미결정 O1은 그대로이고, 어떤 슬라이스 착수나 public arming·rollout·deploy도 열지 않는다.
 
 ---
 
