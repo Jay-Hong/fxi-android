@@ -1290,16 +1290,33 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(1)
         // Only one of the two desired topics came back with a lease, which is what makes the
         // renewal's scope worth asserting: it asks for what it holds, not for everything wanted.
+        h.sleeps.clear()
         h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L)))
         advanceTimeBy(1)
         assertEquals(1, h.requests.size)
+        // Read here, before the acknowledgement that answers the handover can replace it: every
+        // acknowledgement re-schedules the renewal, so an assertion taken after the second one
+        // would pass on a version that had dropped the first one's leases. Found by review.
+        assertTrue(
+            "최초 ACK 가 갱신 타이머를 예약하지 않았다",
+            720.seconds in h.sleeps
+        )
+
+        // Nothing ever delivered, so the first-delivery watchdog hands its silence over at 45s.
+        // Answered here so it does not spend its own attempts on top of what is being measured —
+        // and answered with the **same** lease id, because an acknowledgement carrying no leases
+        // is the server saying there are none, which would take the renewal's schedule with it.
+        advanceTimeBy(45_200)
+        assertEquals(2, h.requests.size)
+        h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
 
         advanceTimeBy(719_000)
-        assertEquals("갱신이 lead 보다 일찍 나갔다", 1, h.requests.size)
+        assertEquals("갱신이 lead 보다 일찍 나갔다", 2, h.requests.size)
 
         advanceTimeBy(2_000)
-        assertEquals("lead 가 지났는데 갱신하지 않았다", 2, h.requests.size)
-        assertEquals("lease 없는 topic 까지 재인증했다", setOf(TETHER), h.requests[1].topics.toSet())
+        assertEquals("lead 가 지났는데 갱신하지 않았다", 3, h.requests.size)
+        assertEquals("lease 없는 topic 까지 재인증했다", setOf(TETHER), h.requests[2].topics.toSet())
         h.cleanUp()
     }
 
@@ -1331,12 +1348,27 @@ class TopicSessionCoordinatorTest {
         // Both are listening; only one of them owns this `request_id`, and the leases it carries
         // are what the next renewal is paced by — so a third request at the new lead proves the
         // frame reached the command that asked for it.
+        h.sleeps.clear()
         h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "L3", 900L), Triple(USD, "L4", 900L)))
+        advanceTimeBy(1)
+        // The same reading, and for the same reason: the third acknowledgement below re-schedules
+        // everything, so the request at the lead time alone no longer proves this one landed.
+        assertTrue(
+            "갱신 ACK 가 다음 갱신 타이머를 예약하지 않았다",
+            720.seconds in h.sleeps
+        )
+        // Still nothing delivered, so the first-delivery watchdog hands over at its own deadline.
+        // Answered with the same lease ids, which restates them rather than taking them away.
+        advanceTimeBy(45_100)
+        assertEquals(3, h.requests.size)
+        h.wire.deliver(h.ackWithLeases("r3", Triple(TETHER, "L3", 900L), Triple(USD, "L4", 900L)))
+        advanceTimeBy(1)
+
         advanceTimeBy(719_000)
-        assertEquals("두 번째 갱신이 일찍 나갔다", 2, h.requests.size)
+        assertEquals("두 번째 갱신이 일찍 나갔다", 3, h.requests.size)
 
         advanceTimeBy(2_000)
-        assertEquals("갱신의 ack 이 다음 갱신을 잡지 못했다", 3, h.requests.size)
+        assertEquals("갱신의 ack 이 다음 갱신을 잡지 못했다", 4, h.requests.size)
         h.cleanUp()
     }
 
@@ -1801,11 +1833,16 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(25_000)
         assertEquals("첫 배달 노력 중에 D14 가 끼어들었다", 2, h.requests.size)
 
-        // The effort ends with its delivery deadline, and the spent window must not fire after it.
-        advanceTimeBy(45_000)
+        // That effort ends with its own delivery deadline and hands its silence over — one
+        // question, from the watchdog that was waiting, not from the window that was spent.
+        advanceTimeBy(20_000)
+        assertEquals(3, h.requests.size)
+        h.wire.deliver(h.ack("r3", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
         h.coordinator.setForeground(true)
         advanceTimeBy(1)
-        assertEquals("소진된 창이 다시 물었다", 2, h.requests.size)
+        assertEquals("소진된 창이 다시 물었다", 3, h.requests.size)
         h.cleanUp()
     }
 
@@ -1865,17 +1902,19 @@ class TopicSessionCoordinatorTest {
         h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
         advanceTimeBy(1)
 
-        // The new grant has delivered nothing, so there is no window of its own. Asking here would
-        // mean the old grant's window survived the purge — the foreground return is what would
-        // read it.
+        // The new grant delivers nothing, so its own first-delivery watchdog asks once — and that
+        // is the only question it is owed.
+        advanceTimeBy(45_200)
+        assertEquals(3, h.requests.size)
+        h.wire.deliver(h.ack("r3", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
+        // Asking again here would mean the old grant's window survived the purge — the foreground
+        // return is what would read it.
         advanceTimeBy(46_000)
         h.coordinator.setForeground(true)
         advanceTimeBy(1)
-        assertEquals("지워진 창이 물었다", 2, h.requests.size)
-        assertEquals(
-            TopicDeliveryState.NEVER_RECEIVED,
-            h.store.snapshot.stateFor(TETHER).deliveryState
-        )
+        assertEquals("지워진 창이 물었다", 3, h.requests.size)
         h.cleanUp()
     }
 
@@ -2216,6 +2255,14 @@ class TopicSessionCoordinatorTest {
             h.store.snapshot.stateFor(TETHER).deliveryState
         )
         assertEquals(0, h.store.snapshot.stateFor(TETHER).revalidationAttempt)
+
+        // Taken back leaves the topic askable again — and the window that already asked must not
+        // ask a second time for the same silence. Nothing has delivered since, so it is the very
+        // same window.
+        val asked = h.requests.size
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        assertEquals("같은 창이 두 번째 질문을 냈다", asked, h.requests.size)
         h.cleanUp()
     }
 
@@ -2430,6 +2477,147 @@ class TopicSessionCoordinatorTest {
         )
         assertNull("관측자가 던지지 않았다", h.topicStateFailure)
         assertTrue("관측자가 던지자 소켓이 만료된 lease 위에 남았다", first.cancelled)
+        h.cleanUp()
+    }
+
+    /**
+     * A topic that never delivered is asked about once, by the watchdog that was waiting for it.
+     *
+     * The silence window is armed by a delivery, so a subscription that never produced one is held
+     * at `NEVER_DELIVERED` for ever — the question has to come from the first-delivery watchdog
+     * instead, and it is the same question, through the same door.
+     */
+    @Test
+    fun `a first delivery that never arrives hands its silence to one revalidation`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertEquals("ACK 만으로 다시 물었다", 1, h.requests.size)
+
+        advanceTimeBy(45_100)
+        assertEquals("최초 배달의 침묵이 아무것도 묻지 않았다", 2, h.requests.size)
+        assertEquals("tether 만 물어야 한다", setOf(TETHER), h.requests[1].topics.toSet())
+        assertEquals(
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+
+        // And only once: the window was never armed, so nothing else is waiting to ask.
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(90_000)
+        assertEquals("최초 배달과 침묵 소유자가 각각 물었다", 2, h.requests.size)
+        assertEquals(
+            "재검증 뒤에도 조용한데 degraded 가 아니다",
+            TopicDeliveryState.DEGRADED,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        h.cleanUp()
+    }
+
+    /** Another topic's silence is not tether's: only the tether question exists. */
+    @Test
+    fun `a first delivery silent only for another topic asks nothing`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(USD)))
+        advanceTimeBy(1)
+
+        advanceTimeBy(45_100)
+        assertEquals("tether 가 조용하지 않은데 물었다", 1, h.requests.size)
+        assertNotEquals(
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * Still not tether's, when tether was confirmed after the command that reports the silence.
+     *
+     * A command reports silence for **its own** accepted set, taken from the acknowledgement that
+     * answered it (`TopicSubscribeCommand.kt:480-481`), while `confirmed` in the store is
+     * overwritten by every later acknowledgement's whole-connection list
+     * (`TopicSubscriptionState.kt:248`). So the two disagree here: the first request was answered
+     * with USD alone, and a renewal's answer added tether afterwards. A handover widened to "any
+     * topic was silent" asks about tether in this state; the narrow one does not. Found by review,
+     * which refused the equivalence this was first recorded as.
+     */
+    @Test
+    fun `a silence for another topic asks nothing about a tether confirmed later`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+
+        // The first answer accepts USD only, and its lease renews at once — that is request two.
+        h.wire.deliver(h.ackWithLeases("r1", Triple(USD, "U1", 180L)))
+        advanceTimeBy(1)
+        assertEquals(2, h.requests.size)
+
+        // The renewal's own answer carries the whole connection, and tether is in this one.
+        h.wire.deliver(
+            h.ackWithLeases("r2", Triple(USD, "U2", 900L), Triple(TETHER, "T1", 900L))
+        )
+        advanceTimeBy(1)
+        assertTrue(
+            "후속 ACK 가 tether 를 confirmed 로 만들지 못했다",
+            h.store.snapshot.stateFor(TETHER).confirmed
+        )
+        assertEquals(
+            TopicDeliveryState.NEVER_RECEIVED,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+
+        advanceTimeBy(45_100)
+        assertEquals("USD 만 침묵인 최초 결과가 tether 를 재검증했다", 2, h.requests.size)
+        assertNotEquals(
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * A handover is a start, and a start does not happen on a permission that has lapsed.
+     *
+     * The watchdog's wait is relative and the lease's deadline is not, so a clock that moved
+     * without the scheduler — a device that slept — is where the two part. The credential is held
+     * from here on so the question cannot reach the send boundary and be refused *there* instead:
+     * what is under test is the entry point. Found by review, which reproduced the start.
+     */
+    @Test
+    fun `a first delivery hands nothing over on a lease that has lapsed`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.wire
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 900L)))
+        advanceTimeBy(1)
+        assertEquals(1, h.requests.size)
+
+        // Short of the watchdog's deadline, and then the clock alone moves past the lease.
+        advanceTimeBy(44_000)
+        h.credentialGate = CompletableDeferred()
+        h.clockSkewMillis = 900_000
+        advanceTimeBy(1_200)
+
+        assertTrue("만료된 lease 위에 소켓이 남았다", first.cancelled)
+        assertEquals(
+            "만료된 lease 위에서 재검증을 시작했다",
+            TopicDeliveryState.NEVER_RECEIVED,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        assertEquals("만료된 lease 로 질문을 보냈다", 1, h.requests.size)
         h.cleanUp()
     }
 }

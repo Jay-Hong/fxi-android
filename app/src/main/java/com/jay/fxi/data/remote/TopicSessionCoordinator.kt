@@ -495,13 +495,19 @@ class TopicSessionCoordinator(
             is SessionInput.Transport ->
                 current(input.generation)?.let { onTransportEvent(it, input.event) }
 
+            // The deadline first, as at every other place a start can come from. A first delivery
+            // hands its silence to the same revalidation D14 asks for, and this is the only one of
+            // the four ways in that had no check of its own — the question would have gone out on
+            // a connection whose permission had lapsed. It also keeps a revalidation's own result
+            // from writing degraded onto a grant that is already over. Found by review.
             is SessionInput.CommandFinished -> current(input.generation)?.let { live ->
+                if (enforceLeaseExpiry(live)) return@let
                 if (
                     input.purpose == TopicCommandPurpose.REVALIDATION &&
                     live.revalidationOwner != input.commandId
                 ) return@let
 
-                applyOutcome(input.purpose, input.outcome)
+                applyOutcome(live, input.purpose, input.outcome)
                 if (live.revalidationOwner == input.commandId) {
                     live.revalidationOwner = null
                 }
@@ -1144,27 +1150,44 @@ class TopicSessionCoordinator(
     }
 
     /**
-     * What a finished revalidation means for the topic it asked about.
+     * What a finished command means for the tether topic, by what it was asking.
      *
-     * Only a revalidation: a renewal reports no silence at all, and the first delivery's silence is
-     * the next slice's to route. Degrading needs the acknowledgement *and* the delivery deadline
-     * passing with nothing new — `TopicSilencePolicy` puts the second half on the request's own
-     * deadlines — so an ending with no answer at all is not a failure of the topic and is taken
-     * back instead.
+     * **A first delivery hands its silence over.** Its watchdog asked whether anything is arriving
+     * and forty-five seconds said no; that is worth the one quiet question, and it is the same
+     * question D14 asks — so it goes through the same door rather than a second one. Without this a
+     * topic that never delivered is never asked about at all: the window is only armed by a
+     * delivery, so `TopicSilencePolicy` holds it at `NEVER_DELIVERED` for ever.
      *
-     * **The store is asked whether this is still that revalidation.** The outcome is computed at
-     * the instant the deadline passes and applied a turn later, and a frame whose input was queued
-     * before it is handled first: `recordFrame` puts the topic back to healthy, and applying a
-     * silence measured before that would degrade a topic that has just recovered.
+     * **A revalidation is the one that can degrade.** Degrading needs the acknowledgement *and* the
+     * delivery deadline passing with nothing new — `TopicSilencePolicy` puts the second half on the
+     * request's own deadlines — so an ending with no answer at all is not a failure of the topic
+     * and is taken back instead. The store is asked whether this is still that revalidation: the
+     * outcome is computed at the instant the deadline passes and applied a turn later, and a frame
+     * whose input was queued before it is handled first, putting the topic back to healthy.
+     *
+     * **A renewal means nothing here.** It reports no silence at all, and reading its empty answer
+     * as one would take back a revalidation that has only just begun.
      */
-    private fun applyOutcome(purpose: TopicCommandPurpose, outcome: TopicCommandOutcome) {
-        if (purpose != TopicCommandPurpose.REVALIDATION) return
+    private fun applyOutcome(
+        live: Connection,
+        purpose: TopicCommandPurpose,
+        outcome: TopicCommandOutcome
+    ) {
         val topic = TopicCatalogue.TETHER
-        if (store.snapshot.stateFor(topic).deliveryState != TopicDeliveryState.REVALIDATING) return
-        if (outcome is TopicCommandOutcome.Acknowledged && topic in outcome.silent) {
-            store.markDegraded(topic)
-        } else {
-            store.abortRevalidation(topic)
+        val silent = (outcome as? TopicCommandOutcome.Acknowledged)?.silent.orEmpty()
+        when (purpose) {
+            TopicCommandPurpose.FIRST_DELIVERY -> if (topic in silent) startRevalidation(live)
+
+            TopicCommandPurpose.REVALIDATION -> {
+                if (
+                    store.snapshot.stateFor(topic).deliveryState != TopicDeliveryState.REVALIDATING
+                ) {
+                    return
+                }
+                if (topic in silent) store.markDegraded(topic) else store.abortRevalidation(topic)
+            }
+
+            TopicCommandPurpose.LEASE_RENEWAL -> Unit
         }
     }
 
