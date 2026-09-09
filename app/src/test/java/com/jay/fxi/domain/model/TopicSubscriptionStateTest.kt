@@ -231,6 +231,42 @@ class TopicSubscriptionStateTest {
         assertEquals(TopicAuthResolution.REFRESHING, abandoned.snapshot.authResolution)
     }
 
+    /**
+     * A purge forgets the frames too, which is what makes it different from losing interest.
+     *
+     * `setDesired(false)` keeps the receive generation on purpose — the same user turning a topic
+     * off has not unseen what it sent. A UID or epoch change has: those frames were another
+     * grant's, and leaving the count behind would let the next session's first-delivery watchdog
+     * be satisfied by them.
+     */
+    @Test
+    fun `purging forgets receive evidence, unlike no longer wanting a topic`() {
+        val store = TopicSubscriptionStateStore()
+        store.setDesired(true, topic)
+        store.recordFrame(topic)
+        store.setDesired(false, topic)
+        assertEquals(1L, store.snapshot.stateFor(topic).receiveGeneration)
+
+        store.purge(TopicPurgeScope.All)
+        assertEquals(0L, store.snapshot.stateFor(topic).receiveGeneration)
+        assertEquals(TopicControlState.IDLE, store.snapshot.controlState)
+        assertEquals(TopicAuthResolution.RESOLVED, store.snapshot.authResolution)
+    }
+
+    /** A scoped purge leaves the topics it was not asked about. */
+    @Test
+    fun `a scoped purge leaves the other topics alone`() {
+        val store = TopicSubscriptionStateStore()
+        store.setDesired(true, topic)
+        store.recordFrame(topic)
+        store.setDesired(true, "fx:jpy-krw")
+        store.recordFrame("fx:jpy-krw")
+
+        store.purge(TopicPurgeScope.Topics(setOf(topic)))
+        assertEquals(0L, store.snapshot.stateFor(topic).receiveGeneration)
+        assertEquals(1L, store.snapshot.stateFor("fx:jpy-krw").receiveGeneration)
+    }
+
     @Test
     fun `revalidation is single-shot until a frame recovers it`() {
         val store = TopicSubscriptionStateStore()
@@ -293,7 +329,7 @@ class TopicSubscriptionStateTest {
         )
         assertTrue(store.snapshot.manualRetryTopics.isEmpty())
 
-        store.startNewConnection()
+        store.clearConnectionState()
         assertNull(store.snapshot.stateFor(futureTopic).rejection)
         assertTrue(store.snapshot.stateFor(futureTopic).desired)
     }
@@ -379,7 +415,7 @@ class TopicSubscriptionStateTest {
         store.markSuspect(unavailable)
         assertTrue(store.beginRevalidation(unavailable))
 
-        store.startNewConnection()
+        store.clearConnectionState()
 
         val reset = store.snapshot.stateFor(unavailable)
         assertFalse(reset.confirmed)

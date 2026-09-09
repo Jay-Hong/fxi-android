@@ -439,7 +439,32 @@ class TopicSubscriptionStateStore {
         }
     }
 
-    fun startNewConnection() {
+    /**
+     * Forgets topics outright, receive evidence included.
+     *
+     * Stronger than [setDesired] with `false`, which keeps the generation because the same user
+     * losing interest in a topic has not unseen the frames it sent. A UID or `userAccessEpoch`
+     * change is the case this is for: the frames belonged to a grant that is gone, and counting
+     * them for the next one would let a new session's first-delivery watchdog be satisfied by
+     * somebody else's data. [TopicPurgeScope.All] also clears the control plane, because a
+     * pending request and an authentication verdict belong to the grant too.
+     */
+    fun purge(scope: TopicPurgeScope) {
+        when (scope) {
+            TopicPurgeScope.All -> {
+                topics.clear()
+                controlState = TopicControlState.IDLE
+                wholeFailure = null
+                authResolution = TopicAuthResolution.RESOLVED
+                currentTicket = null
+                currentAuthTicket = null
+            }
+
+            is TopicPurgeScope.Topics -> topics.keys.removeAll(scope.values)
+        }
+    }
+
+    fun clearConnectionState() {
         controlState = TopicControlState.IDLE
         wholeFailure = null
         authResolution = TopicAuthResolution.RESOLVED

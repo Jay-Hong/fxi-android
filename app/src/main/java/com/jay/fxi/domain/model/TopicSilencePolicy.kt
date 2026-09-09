@@ -102,10 +102,13 @@ object TopicSilencePolicy {
      * where it was. Returning a bare `null` for both cases invited the caller to store it and
      * throw the guard away. Found by review.
      *
-     * Emptiness is not the test. A tether snapshot with no entries in it is a real answer from a
-     * quiet market and arms the window like any other; a payload whose entries were all thrown out
-     * by validation is not an answer at all. The two are indistinguishable by the time they are a
-     * list of zero quotes, which is why this takes an outcome rather than a payload.
+     * This takes an **outcome**, not a payload, because counting quotes cannot answer the
+     * question. Its caller decides, and the rule the session settled on is that a payload leaving
+     * no usable price is not a delivery: after D8 an empty tether snapshot cannot be told apart
+     * from one carrying only `usd_krw_futures`, and `ANDROID_V2_PLAN.md:889` forbids the latter
+     * satisfying tether delivery. An earlier draft of this comment said the opposite — that an
+     * empty snapshot is a quiet market answering — and that reading would have let a KRX-only
+     * frame arm this window. Found by review.
      */
     fun armAfter(delivery: TopicSilenceEvidence, receivedAtMillis: Long): TopicSilenceArming = when {
         delivery != TopicSilenceEvidence.TETHER_DELIVERY -> TopicSilenceArming.Keep
