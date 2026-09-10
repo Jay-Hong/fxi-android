@@ -426,11 +426,25 @@ class TopicSessionCoordinator(
     private var grantEpoch = 0L
 
     /**
+     * The grant this session has already asked for, or `null` before it has asked for any.
+     *
+     * The counter **is** the reset: a grant whose authority ended raised it, so the next one
+     * cannot match a number spent on the one before. There is no clearing code, and nothing to
+     * forget to clear.
+     *
+     * `Long?` rather than `0L` is a readability choice, not a safety one — the two are
+     * observationally identical here, because a fence only becomes non-null through the branch
+     * that raises the counter, and [wanted] requires a non-null fence. It is written this way so
+     * the equivalence does not have to be re-derived to read the line.
+     */
+    private var fannedOutForGrant: Long? = null
+
+    /**
      * The REST bootstraps still out.
      *
      * Held for shutdown, which is the one moment the answers stop having anywhere to go. A grant
-     * change does not cancel them — [grantEpoch] refuses those answers instead — which leaves one
-     * request per change running to the end of its budget. Pruned on the loop, where the list is
+     * change does not cancel them — [grantEpoch] refuses those answers instead — which can leave
+     * multiple requests running to the end of their budgets. Pruned on the loop, where the list is
      * only ever touched.
      */
     private val bootstraps = mutableListOf<Job>()
@@ -578,6 +592,9 @@ class TopicSessionCoordinator(
                 if (online == input.value) return
                 online = input.value
                 reconsider(budgetIsFresh = input.value)
+                // A grant that arrived while the network was down is asked for here, and this is
+                // the only place it can be: `Access` already ran and found nothing to ask on.
+                fanOutBootstrap()
             }
 
             is SessionInput.Access -> {
@@ -623,6 +640,11 @@ class TopicSessionCoordinator(
                     silenceTicket++
                 }
                 reconsider(budgetIsFresh = true)
+                // After the socket is decided, because reading order should follow the session's:
+                // open the connection, then fill the screen while it negotiates. Nothing here
+                // depends on that order — `reconsider` changes none of [wanted]'s inputs — and no
+                // test tells the two placements apart.
+                fanOutBootstrap()
             }
 
             is SessionInput.BootstrapRequested -> startBootstrap(input.topic)
@@ -1223,6 +1245,30 @@ class TopicSessionCoordinator(
     }
 
     // ---- the REST bootstrap ------------------------------------------------------------------
+
+    /**
+     * Asks, once per grant, for everything this session consumes.
+     *
+     * **[wanted] is checked before the latch, and the order is the whole function.** A session
+     * that has an account but no network reaches here — access arrives before connectivity often
+     * enough — and burning the latch there would mean that grant is never asked for at all. So
+     * the gate comes first and the latch is spent only when the asking actually happens.
+     *
+     * **Every topic, every time, in one go.** No order, no lead, no stagger: [desired] is what
+     * this session consumes and the answer to "which of them do we need" is all of them. The
+     * coordinator has no tab input, while the current UI consumes DXY in the USD tab.
+     * L-4 must implement and verify S1 request ordering, single-flight, inactive-tab lazy loading
+     * and the actual request budget before runtime wiring. This fan-out does not establish them. It also
+     * keeps the request pattern independent of what the account holds: asking for fewer topics
+     * because a capability is missing would make the shape of the traffic a statement about the
+     * user's entitlements.
+     */
+    private fun fanOutBootstrap() {
+        if (!wanted()) return
+        if (fannedOutForGrant == grantEpoch) return
+        fannedOutForGrant = grantEpoch
+        desired.forEach(::startBootstrap)
+    }
 
     /**
      * Issues one bootstrap for the grant that is current **now**.

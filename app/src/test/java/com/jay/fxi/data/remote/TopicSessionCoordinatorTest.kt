@@ -3446,6 +3446,161 @@ class TopicSessionCoordinatorTest {
         h.cleanUp()
     }
 
+    // ---- the trigger (L-3c) ---------------------------------------------------------------------
+
+    /**
+     * A grant that becomes usable asks for everything this session consumes, once.
+     *
+     * The set is compared with the one this test constructed rather than a literal count, so a
+     * session that later consumes more topics does not turn this into a number to update.
+     */
+    @Test
+    fun `a grant that becomes usable asks for every desired topic once`() = runTest {
+        val consumed = TopicCatalogue.DESIRED
+        val h = Harness(this, desired = consumed)
+        h.goLive()
+        advanceTimeBy(100)
+
+        assertEquals("이 세션이 읽는 topic 전부를 묻지 않았다", consumed, h.bootstrapCalls.map { it.second }.toSet())
+        assertEquals("한 grant 에 두 번 물었다", consumed.size, h.bootstrapCalls.size)
+        assertEquals(setOf(fence().identity), h.bootstrapCalls.map { it.first }.toSet())
+        h.cleanUp()
+    }
+
+    /**
+     * A grant that arrives before the network is asked for when the network arrives.
+     *
+     * This is why the gate comes **before** the latch. Access lands first here — which is the
+     * ordinary order, since an account is known before connectivity is — and at that moment there
+     * is nothing to ask on. A latch spent at that point would mean this grant is never asked for.
+     */
+    @Test
+    fun `a grant that arrives before the network asks when the network arrives`() = runTest {
+        val h = Harness(this)
+        h.coordinator.start()
+        h.coordinator.setAccess(true, fence())
+        advanceTimeBy(100)
+        assertTrue("네트워크가 없는데 요청을 썼다", h.bootstrapCalls.isEmpty())
+
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+
+        assertEquals(setOf(TETHER, USD), h.bootstrapCalls.map { it.second }.toSet())
+        h.cleanUp()
+    }
+
+    /**
+     * And a grant that arrives on a live network is asked for at once.
+     *
+     * The mirror of the test above, and the reason there are two call sites: neither branch can
+     * make the other's case. `goLive()` is deliberately not used — it sets access before
+     * connectivity, which is the *other* order.
+     */
+    @Test
+    fun `a grant that arrives on a live network asks at once`() = runTest {
+        val h = Harness(this)
+        h.coordinator.start()
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        assertTrue("권한이 없는데 요청을 썼다", h.bootstrapCalls.isEmpty())
+
+        h.coordinator.setAccess(true, fence())
+        advanceTimeBy(100)
+
+        assertEquals(setOf(TETHER, USD), h.bootstrapCalls.map { it.second }.toSet())
+        h.cleanUp()
+    }
+
+    /** A network that flaps under one grant is still one grant, and is asked for once. */
+    @Test
+    fun `a network that flaps under one grant does not ask again`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val asked = h.bootstrapCalls.size
+
+        h.coordinator.setOnline(false)
+        advanceTimeBy(100)
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+
+        assertEquals("같은 grant 를 네트워크가 돌아올 때마다 다시 물었다", asked, h.bootstrapCalls.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A withdrawal that is granted again **is** a new grant to ask for.
+     *
+     * The fence is identical on both sides of this, so a latch keyed on the fence would decide
+     * the session has already asked. It is keyed on the counter, which the withdrawal raised.
+     */
+    @Test
+    fun `a withdrawal that is granted again asks once more`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val asked = h.bootstrapCalls.size
+
+        h.coordinator.setAccess(false, fence())
+        advanceTimeBy(100)
+        h.coordinator.setAccess(true, fence())
+        advanceTimeBy(100)
+
+        assertEquals(
+            "철회 뒤 다시 받은 권한을 새 grant 로 보지 않았다",
+            asked * 2,
+            h.bootstrapCalls.size
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * The latch belongs to the automatic fan-out, not to the public entry point.
+     *
+     * `requestBootstrap` hands the decision to its caller — the manual retry the FX cutover owes,
+     * and S6's capability flip. A latch reaching into it would swallow both silently.
+     */
+    @Test
+    fun `a manual request is not swallowed by the latch`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val asked = h.bootstrapCalls.size
+
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+
+        assertEquals(asked + 1, h.bootstrapCalls.size)
+        assertEquals(fence().identity to TETHER, h.bootstrapCalls.last())
+        h.cleanUp()
+    }
+
+    /**
+     * A reconnection is not a new grant.
+     *
+     * The ladder reopens sockets without issuing a new grant. Resetting or bypassing the grant
+     * latch during reconnection would issue extra bootstraps. This test observes bootstrap
+     * issues across a real reconnection.
+     */
+    @Test
+    fun `a reconnection under one grant does not ask again`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val asked = h.bootstrapCalls.size
+
+        h.wire.drop()
+        advanceTimeBy(2_100)
+        h.wire.open()
+        advanceTimeBy(2_100)
+        assertEquals("재연결이 일어나지 않아 이 시험이 아무것도 재지 않는다", 2, h.wires.size)
+
+        assertEquals("재연결마다 다시 물었다", asked, h.bootstrapCalls.size)
+        h.cleanUp()
+    }
+
     /** One refusal with the server's own evidence on it, built the way the transport builds one. */
     private fun refusal(code: Int, body: String, retryAfter: String? = null): TopicSnapshotOutcome {
         val headers = okhttp3.Headers.Builder().apply {
