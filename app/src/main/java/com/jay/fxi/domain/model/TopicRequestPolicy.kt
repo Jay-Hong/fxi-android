@@ -7,7 +7,7 @@ import kotlin.time.Duration.Companion.seconds
  * The two deadlines one send is judged by, both anchored at that send.
  *
  * Built from a single [sentAtMillis] on purpose: there is no way to give the two of them different
- * origins, and no way to move either one afterwards. That is what `ANDROID_V2_PLAN.md:852-858`
+ * origins, and no way to move either one afterwards. That is what `ANDROID_V2_PLAN.md §7 S3`
  * means by the delivery deadline being **absolute** — an ACK proves the command was heard, and
  * moves the question on to whether anything arrives, but it does not buy more time to arrive in.
  *
@@ -79,7 +79,7 @@ class TopicRequestDeadlines private constructor(val sentAtMillis: Long) {
 /**
  * How long one subscribe attempt is given, and how many attempts there are.
  *
- * `ANDROID_V2_PLAN.md:852-858`. Each attempt that reaches an actual send anchors its own pair of
+ * `ANDROID_V2_PLAN.md §7 S3`. Each attempt that reaches an actual send anchors its own pair of
  * deadlines at that send; a retry discards the previous pair rather than inheriting it. What the
  * attempts share is the count, not a clock.
  */

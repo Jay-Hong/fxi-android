@@ -142,7 +142,7 @@ data class FreeSnapshotUiState(
             if (availability == FreeSnapshotAvailability.UNAVAILABLE) return state
             // Built over the whole answer, hidden series included: the time axis spans all of
             // them, so filtering here would let a toggle slide the chart sideways. All-off then
-            // draws an empty frame, which `ANDROID_V2_PLAN.md:839` allows outright — D18's
+            // draws an empty frame, which `ANDROID_V2_PLAN.md §7 S2` allows outright — D18's
             // "project one candidate rather than show nothing" is a rule for source lists.
             val graph = GraphPreparedBuilder.build(entry.snapshot.graph, period)
             return state.copy(

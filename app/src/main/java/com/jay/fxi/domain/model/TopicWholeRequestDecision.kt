@@ -6,7 +6,7 @@ import kotlin.time.Duration.Companion.seconds
 /**
  * What to do about a `subscription_error` that failed the whole request.
  *
- * `ANDROID_V2_PLAN.md:866-871`, the whole-request half of the error matrix. A request can fail
+ * `ANDROID_V2_PLAN.md §7 S3`, the whole-request half of the error matrix. A request can fail
  * entirely, or it can succeed while some topics are refused, and those are different questions.
  * The per-topic half is only partly answered elsewhere — [TopicSubscriptionSnapshot.rejectionRetryTriggers]
  * says *when to try a refused topic again*, and is reused rather than restated. What a refusal

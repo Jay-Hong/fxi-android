@@ -235,7 +235,7 @@ class FreeSnapshotScheduler(
     /**
      * Start whatever is due.
      *
-     * `ANDROID_V2_PLAN.md:833` — only the selected data tab is active, its other three periods are
+     * `ANDROID_V2_PLAN.md §7 S2` — only the selected data tab is active, its other three periods are
      * warmed **sequentially**, and a warm-up earns a cooldown only on a real failure. Warming is
      * what makes a period switch a cache swap instead of a spinner.
      *
@@ -366,7 +366,7 @@ class FreeSnapshotScheduler(
 
         // Three outcomes, not two. A slot re-served at the same `as_of` still carries a *new*
         // `refresh_not_before` — the server derives it from its own serve-time clock — so the
-        // response is replaced even though the data is identical (`ANDROID_V2_PLAN.md:836`).
+        // response is replaced even though the data is identical (`ANDROID_V2_PLAN.md §7 S2`).
         // Only a genuinely older answer is dropped, so a late reply cannot rewind the screen.
         val applied = advanced || snapshot.asOf == previousAsOf
         if (applied) {

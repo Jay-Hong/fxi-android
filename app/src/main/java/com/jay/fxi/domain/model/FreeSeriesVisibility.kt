@@ -3,7 +3,7 @@ package com.jay.fxi.domain.model
 /**
  * Which graph series the free surface draws.
  *
- * Two rules, both from `ANDROID_V2_PLAN.md:839`:
+ * Two rules, both from `ANDROID_V2_PLAN.md §7 S2`:
  *
  * - **All-off is a choice.** D18's "project one candidate when the selection resolves to nothing"
  *   applies to source lists, not to graphs, so an empty set is drawn as an empty graph rather than

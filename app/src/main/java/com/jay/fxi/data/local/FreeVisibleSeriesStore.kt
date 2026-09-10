@@ -35,7 +35,7 @@ interface FreeVisibleSeriesStore {
 /**
  * A file of its own.
  *
- * `ANDROID_V2_PLAN.md:839` puts the free preference in a namespace separate from the premium one,
+ * `ANDROID_V2_PLAN.md §7 S2` puts the free preference in a namespace separate from the premium one,
  * and D27 wants backup-eligible user intent kept physically apart from control-plane state. This
  * holds neither entitlement nor capability data, so it is ordinary preference material.
  */

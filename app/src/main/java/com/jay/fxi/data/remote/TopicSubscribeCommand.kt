@@ -149,7 +149,7 @@ sealed interface TopicCommandOutcome {
  * One subscribe command: up to three attempts, and the delivery deadline of the one that was
  * answered.
  *
- * `ANDROID_V2_PLAN.md:850-859`. What lives here is a single command's lifetime — attempts, request
+ * `ANDROID_V2_PLAN.md §7 S3`. What lives here is a single command's lifetime — attempts, request
  * correlation, the two deadlines, and the shared budget. What deliberately does not is the socket,
  * reconnection, scheduling lease renewals, and the persistent-silence policy: those are ordered
  * against connection and account changes that only the session above can see.

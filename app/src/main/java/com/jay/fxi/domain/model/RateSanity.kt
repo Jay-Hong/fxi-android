@@ -3,7 +3,7 @@ package com.jay.fxi.domain.model
 /**
  * What counts as a number a price can be.
  *
- * `ANDROID_V2_PLAN.md:142` (I5) splits two jobs that look alike: the wire decoder fails when the
+ * `ANDROID_V2_PLAN.md` I5 splits two jobs that look alike: the wire decoder fails when the
  * shape breaks the contract, and **value sanity is checked where wire becomes domain**. A rate of
  * `-1` is valid JSON and a valid `Double`; nothing before this point has any reason to object, and
  * everything after it — bar widths, differences against a reference, the strictly-newer merge —

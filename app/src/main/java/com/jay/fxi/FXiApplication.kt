@@ -55,7 +55,7 @@ internal fun startAppOwnedServices(
     // deadlines; nothing is fetched until a screen says which tab is on show.
     startFreeSnapshots()
 
-    // Deletes the v1 stores this build has replaced (`ANDROID_V2_PLAN.md:814`). Nothing waits on it
+    // Deletes the v1 stores this build has replaced (`ANDROID_V2_PLAN.md §7 S1.5`). Nothing waits on it
     // and nothing v2 reads what it removes, so it goes last and answers to no one.
     purgeRetiredStores()
 }

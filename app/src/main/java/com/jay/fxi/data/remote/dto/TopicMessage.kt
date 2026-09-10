@@ -162,7 +162,7 @@ data class TopicSourceEntry(
 /**
  * The wire entry as the domain sees it — one price, one time — or nothing at all.
  *
- * Two jobs happen on this line, and I5 (`ANDROID_V2_PLAN.md:142`) is why they happen *here*.
+ * Two jobs happen on this line, and I5 (`ANDROID_V2_PLAN.md`) is why they happen *here*.
  *
  * `rate_changed_at ?? timestamp` is decided once, so everything past this point holds a single
  * instant and no consumer has to remember which of the two the server meant.

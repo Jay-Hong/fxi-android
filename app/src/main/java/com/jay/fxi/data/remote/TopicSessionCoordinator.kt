@@ -44,7 +44,7 @@ object TopicCatalogue {
     /**
      * The set a session asks for.
      *
-     * **KRX is deliberately absent.** `ANDROID_V2_PLAN.md:849-850` defines the hook here and gives
+     * **KRX is deliberately absent.** `ANDROID_V2_PLAN.md §7 S3` defines the hook here and gives
      * turning it on to S6, because a topic in this set is a topic this build would subscribe to
      * before it has an entitlement check to refuse it with.
      */
@@ -215,7 +215,7 @@ private sealed interface SessionInput {
 /**
  * The one owner of a topic session: the socket, what is subscribed on it, and when to open another.
  *
- * `ANDROID_V2_PLAN.md:848-864`, the coordinator axis. This slice owns the connection's lifetime,
+ * `ANDROID_V2_PLAN.md §7 S3`, the coordinator axis. This slice owns the connection's lifetime,
  * the desired set, D3's reconnection ladder, keep-alive, and routing frames into the stores. It
  * does **not** own lease renewal or the persistent-silence policy; both need this to exist first
  * and both are ordered against it, so they arrive next with the seams already here — the

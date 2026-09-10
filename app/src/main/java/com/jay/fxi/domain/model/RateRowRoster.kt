@@ -59,7 +59,7 @@ object RateRowRoster {
     /**
      * Codes a fresh install does not show. Everything else on the wire is shown.
      *
-     * Citi is the only one, by `ANDROID_V2_PLAN.md:813` — "Citi는 신규 표시 기본에서 제외". It is a
+     * Citi is the only one, by `ANDROID_V2_PLAN.md §7 S1.5` — "Citi는 신규 표시 기본에서 제외". It is a
      * default, not a ban: the sanitizer admits Citi deliberately (`FreeSnapshotSanitizer.kt:178`)
      * and the sheet can turn it back on.
      */

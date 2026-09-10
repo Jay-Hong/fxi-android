@@ -65,7 +65,7 @@ sealed interface TopicSilenceDecision {
 /**
  * When forty-five seconds of tether silence is worth asking about.
  *
- * D14 (`ANDROID_V2_PLAN.md:191`; `:880-881` places it inside S3). Silence is not an error — a
+ * D14 (`ANDROID_V2_PLAN.md` §5.1; §7 S3 places it inside S3). Silence is not an error — a
  * quiet market is quiet — so the answer to it is one quiet question, not a visible failure and not
  * a stream of resubscribes. Values are never hidden on account of it.
  *
