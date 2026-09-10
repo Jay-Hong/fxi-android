@@ -272,6 +272,51 @@ class TopicSessionCoordinator(
      * which puts it back to never-received in the same breath.
      */
     private val onTopicState: (TopicSubscriptionSnapshot) -> Unit = {},
+    /**
+     * A bootstrap answer that was **not** a snapshot, handed over with its evidence intact.
+     *
+     * This is a hand-off, not a recovery. Nothing here re-checks an entitlement, refreshes a
+     * token or honours a retry floor — it carries the server's own answer out of the session so
+     * that whoever owns those decisions can make them. Until something is attached, the effect of
+     * every non-delivery is exactly what it was: nothing.
+     *
+     * **What each outcome is, and why this session has no seat for it.**
+     *
+     * | outcome | why it stops here |
+     * |---|---|
+     * | `Dormant` | endpoint-wide, and answered *before* authentication. The only named slot,
+     *   `TopicRejectionReason.TOPICS_DISABLED`, is per-topic and reachable only through
+     *   `applyAck` — writing it would assert an acknowledgement that never happened |
+     * | `Unsupported` | [desired] is a copied `val`. `store.setDesired(false, …)` neither
+     *   removes the topic from that set nor stops [startBootstrap]; it also clears rejection,
+     *   which [accepts] reads. It is not a coordinator-level way to stop consuming a topic |
+     * | `Degraded` | `markDegraded` is reachable, but the value represents socket subscription
+     *   delivery/lease state, including expiry, rather than REST endpoint availability |
+     * | `TemporarilyUnavailable` | carries no retry input; this coordinator has no REST
+     *   retry policy, and must not invent a floor from the socket protocol |
+     * | `Refused` | an HTTP failure after the transport's conditional, at-most-once 401 replay.
+     *   A first-response 403, 429 or 5xx also lands here. The preserved status and headers
+     *   belong to the appropriate authentication, entitlement or retry owner |
+     * | `Malformed` | a server contract violation. `onUndecodable` is the socket decoder's seam
+     *   and takes a length and a class name, which is a different fact |
+     * | `TimedOut` / `Unreachable` | the store's "gave up without a verdict" is keyed to a
+     *   request ticket, and a ticket belongs to the socket's single control channel |
+     *
+     * **The owner identifies attribution, not authority for a deferred continuation.**
+     * This callback runs synchronously on the coordinator loop and must return promptly.
+     * [TopicSessionFence] contains no [grantEpoch]: owner equality cannot detect a same-fence
+     * withdrawal and re-grant, or a later refusal/identity-loss latch. Deferred side effects
+     * therefore require a separate revocation-aware ownership check, including live identity
+     * and access validation. That boundary must exist before runtime wiring; this callback
+     * does not implement it.
+     *
+     * **Do not log the outcome whole.** `Unsupported` is a data class, so its default
+     * `toString()` prints the server's supported-topic list — which, with a topic removed for
+     * this user, *is* an entitlement. `Malformed`'s reason may contain body excerpts from decoder errors.
+     */
+    private val onBootstrapUndelivered:
+        (owner: TopicSessionFence, topic: String, outcome: TopicSnapshotOutcome) -> Unit =
+        { _, _, _ -> },
     desired: Set<String> = TopicCatalogue.DESIRED
 ) {
     /**
@@ -588,20 +633,20 @@ class TopicSessionCoordinator(
                 // is a fence that arrives unchanged across a transition — an access withdrawal
                 // being the shape this session is handed.
                 if (input.grantEpoch != grantEpoch) return
+                // The grant this answer was issued under **is** the one held now: an equal epoch
+                // is exactly the statement that nothing ended it in between. So this is not a
+                // second reading of the fence, it is the first — and it is where the null goes,
+                // because a session with nobody signed in has raised the counter on its way out.
+                val owner = fence ?: return
                 // Two facts the counter cannot see, because neither arrives as a transition: the
                 // server refusing this grant on the socket, and the credential turning out to be
                 // somebody else's. The session has already stopped acting on the grant in both,
                 // and an answer that raced either of them must not be what puts the data back.
-                if (fence == refusedFor || fence == identityLostFor) return
+                if (owner == refusedFor || owner == identityLostFor) return
                 // No second `desired` check: the set is copied at construction and never changes,
                 // and the issue already refused anything outside it.
-                //
-                // Everything that is not a delivery is dropped here, and that is a deferral
-                // rather than a verdict that they do not matter. A `Refused` can carry a 401, a
-                // premium 403 or a `Retry-After`, and the plan answers those with token recovery
-                // and an entitlement re-check — none of which this seam owns. What it does owe
-                // them is not treating any of them as data, and nothing here does.
-                val delivered = input.outcome as? TopicSnapshotOutcome.Delivered ?: return
+                val delivered = input.outcome as? TopicSnapshotOutcome.Delivered
+                    ?: return onBootstrapUndelivered(owner, input.topic, input.outcome)
                 applyBootstrap(input.topic, delivered.frame)
             }
 

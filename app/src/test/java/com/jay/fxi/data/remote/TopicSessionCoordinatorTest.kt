@@ -27,9 +27,11 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.WebSocketListener
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -152,6 +154,9 @@ class TopicSessionCoordinatorTest {
         /** Every bootstrap that got past the gate — which a cancelled one does not. */
         val bootstrapFinished = mutableListOf<String>()
 
+        /** Every non-delivery handed over, with the grant the session named for it. */
+        val undelivered = mutableListOf<Triple<TopicSessionFence, String, TopicSnapshotOutcome>>()
+
         /**
          * What the REST twin answers, chosen by **issue** as well as topic.
          *
@@ -230,6 +235,9 @@ class TopicSessionCoordinatorTest {
                 acknowledgementFailure?.let { failure -> throw failure }
             },
             onUndecodable = { length, failure -> undecodable += length to failure },
+            onBootstrapUndelivered = { owner, topic, outcome ->
+                undelivered += Triple(owner, topic, outcome)
+            },
             onTopicState = {
                 topicStates += it
                 if (it.stateFor(TETHER).deliveryState == TopicDeliveryState.DEGRADED) {
@@ -3212,5 +3220,250 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(6_000)
         assertEquals("거절이 창을 밀었다", 2, h.requests.size)
         h.cleanUp()
+    }
+
+    // ---- the hand-off (L-3b) --------------------------------------------------------------------
+
+    /**
+     * An answer that is not a snapshot leaves the session with its evidence intact.
+     *
+     * The session has no seat for any of these — a dormant endpoint is answered before
+     * authentication, a hidden topic cannot be un-desired here, a refusal's premium meaning
+     * belongs to the layer that owns entitlements. What it can do is not swallow them. The
+     * outcome is compared by **identity**, so a path that rebuilt or re-cased it fails.
+     */
+    @Test
+    fun `an answer that is not a snapshot is handed over with its evidence`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val before = h.undelivered.size
+
+        h.bootstrapOutcome = { _, _ -> TopicSnapshotOutcome.Dormant }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+
+        val handed = h.undelivered.drop(before)
+        assertEquals("비배달이 인계되지 않았다", 1, handed.size)
+        assertEquals(fence(), handed.single().first)
+        assertEquals(TETHER, handed.single().second)
+        assertSame(TopicSnapshotOutcome.Dormant, handed.single().third)
+        assertTrue("거절이 가격이 됐다", h.coordinator.rates.value.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    /**
+     * The retry floor the server actually sent survives the crossing.
+     *
+     * This route answers 503 two ways and only one of them says when to come back. Dropping the
+     * header here would leave the layer that owns retries guessing, and guessing is how a
+     * five-second floor gets applied to a failover measured in minutes.
+     */
+    @Test
+    fun `a refusal keeps the retry floor the server sent`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val before = h.undelivered.size
+
+        val refused = refusal(503, """{"detail":"Subscription status pending. Retry later."}""", "5")
+        h.bootstrapOutcome = { _, _ -> refused }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+
+        val handed = h.undelivered.drop(before).single().third
+        assertTrue(handed is TopicSnapshotOutcome.Refused)
+        assertEquals(
+            "서버가 준 재시도 하한을 건너오며 잃었다",
+            "5",
+            (handed as TopicSnapshotOutcome.Refused).failure.retryAfter
+        )
+        assertEquals(503, handed.failure.statusCode)
+        h.cleanUp()
+    }
+
+    /**
+     * A grant that ended takes its answers with it — the hand-off included.
+     *
+     * The seam sits **after** the grant counter, deliberately. In front of it the session would
+     * be reporting answers that are no longer its own, which is the thing the counter exists to
+     * refuse; a listener acting on one would act for an account that is gone.
+     */
+    @Test
+    fun `an answer for a grant that has ended is not handed over`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val issued = h.bootstrapCalls.size
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        val before = h.undelivered.size
+
+        h.coordinator.setAccess(false, null)
+        h.coordinator.setAccess(true, fence())
+        advanceTimeBy(100)
+
+        h.bootstrapOutcome = { issue, _ ->
+            if (issue == issued) {
+                TopicSnapshotOutcome.Dormant
+            } else {
+                TopicSnapshotOutcome.Unreachable(java.io.IOException("이 시험의 대상이 아니다"))
+            }
+        }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue(
+            "끝난 grant 의 답을 밖으로 보고했다",
+            h.undelivered.drop(before).none { it.third === TopicSnapshotOutcome.Dormant }
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * And so does a grant the socket refused, which no counter can see.
+     *
+     * `premium_required` latches this session shut without changing the fence or withdrawing
+     * access. The seam sits after that check too — one guard short and the refusal would be
+     * reported as though the grant were still live.
+     */
+    @Test
+    fun `an answer for a grant the socket refused is not handed over`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        val before = h.undelivered.size
+
+        h.wire.deliver(
+            h.ack("r1", active = emptyList(), rejections = mapOf(TETHER to "premium_required"))
+        )
+        advanceTimeBy(1)
+
+        h.bootstrapOutcome = { _, _ -> TopicSnapshotOutcome.Dormant }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertEquals("거절된 grant 의 답을 밖으로 보고했다", before, h.undelivered.size)
+        h.cleanUp()
+    }
+
+    /** The other latch the counter cannot see gets the same treatment. */
+    @Test
+    fun `an answer for a grant whose credential moved is not handed over`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        val before = h.undelivered.size
+
+        h.credential = AuthSnapshot("u2", 1L, "token-2")
+        h.wire.open()
+        advanceTimeBy(10)
+
+        h.bootstrapOutcome = { _, _ -> TopicSnapshotOutcome.Dormant }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertEquals("신원이 사라진 grant 의 답을 밖으로 보고했다", before, h.undelivered.size)
+        h.cleanUp()
+    }
+
+    /** A delivery is data, not a report — the control that makes the rest discriminating. */
+    @Test
+    fun `a delivery is not handed over`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val before = h.undelivered.size
+
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.tetherFrame(1390.0)) }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+
+        assertEquals("배달을 비배달로 보고했다", before, h.undelivered.size)
+        assertEquals(1390.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+        h.cleanUp()
+    }
+
+    /**
+     * An identity change is not an answer, and is not reported as one.
+     *
+     * The transport raises it when the account the request was authorised for is no longer
+     * signed in. The session hears that from `Access`; inventing an outcome here would put a
+     * verdict the server never gave in front of whoever is listening. Nothing is staged as a
+     * grant change in this test on purpose — the counter must not be what refuses it.
+     */
+    @Test
+    fun `an identity change during a bootstrap hands nothing over`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val before = h.undelivered.size
+
+        h.bootstrapOutcome = { _, _ -> throw AuthIdentityChangedException() }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+
+        assertEquals("계정 변경을 답으로 지어내 보고했다", before, h.undelivered.size)
+        assertTrue(h.coordinator.rates.value.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    /**
+     * The grant named in the hand-off is **this session's**, not a constant.
+     *
+     * A consumer that defers work has to be able to say which account the answer was about, so a
+     * seam that always named the same grant would be worse than none. This session is deliberately
+     * not the default one the other tests use — and the topic is deliberately not the one every
+     * other test here asks for, because a seam that always named `usdt:krw` would pass those.
+     */
+    @Test
+    fun `the grant and topic handed over are this session's own`() = runTest {
+        val h = Harness(this)
+        val mine = fence(uid = "u9", generation = 4L, epoch = "epoch-9")
+        h.coordinator.start()
+        h.coordinator.setAccess(true, mine)
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        val before = h.undelivered.size
+
+        h.bootstrapOutcome = { _, _ -> TopicSnapshotOutcome.Dormant }
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(100)
+
+        val handed = h.undelivered.drop(before).single()
+        assertEquals(mine, handed.first)
+        assertNotEquals(fence(), handed.first)
+        assertEquals(USD, handed.second)
+        h.cleanUp()
+    }
+
+    /** One refusal with the server's own evidence on it, built the way the transport builds one. */
+    private fun refusal(code: Int, body: String, retryAfter: String? = null): TopicSnapshotOutcome {
+        val headers = okhttp3.Headers.Builder().apply {
+            retryAfter?.let { add("Retry-After", it) }
+        }.build()
+        val raw = Response.Builder()
+            .request(Request.Builder().url("https://example.invalid/api/v2/topics/snapshot").build())
+            .protocol(Protocol.HTTP_1_1)
+            .code(code)
+            .message("synthetic")
+            .headers(headers)
+            .build()
+        val response = retrofit2.Response.error<okhttp3.ResponseBody>(
+            body.toByteArray().toResponseBody(),
+            raw
+        )
+        return TopicSnapshotOutcome.Refused(
+            response.preserve(AuthenticatedEndpoint.TOPIC_SNAPSHOT).failure!!
+        )
     }
 }
