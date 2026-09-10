@@ -153,12 +153,17 @@ class TopicSessionCoordinatorTest {
         val bootstrapFinished = mutableListOf<String>()
 
         /**
-         * What the REST twin answers.
+         * What the REST twin answers, chosen by **issue** as well as topic.
          *
-         * Read **after** the gate, so a test can stage the answer while the request is held. The
-         * default is the answer a session with nothing staged should get: not a verdict.
+         * Read after the gate, so a test can stage the answer while the request is held — and
+         * keyed on the issue because topic alone cannot tell one request from another. A test that
+         * holds a request and then makes the session ask again gets two calls for the same topic,
+         * and with a topic-only fake both would answer identically: "the held answer leaked" and
+         * "the second request delivered" would be the same bytes on screen.
+         *
+         * The default is the answer a session with nothing staged should get: not a verdict.
          */
-        var bootstrapOutcome: (String) -> TopicSnapshotOutcome = {
+        var bootstrapOutcome: (issue: Int, topic: String) -> TopicSnapshotOutcome = { _, _ ->
             TopicSnapshotOutcome.Unreachable(java.io.IOException("nothing staged"))
         }
 
@@ -207,10 +212,13 @@ class TopicSessionCoordinatorTest {
             },
             credentials = credentials,
             bootstrap = { owner, topic ->
+                // Taken before the append and never re-read: the pair is non-suspending, and this
+                // harness runs on one serial test dispatcher, so no other issue can land between.
+                val issue = bootstrapCalls.size
                 bootstrapCalls += owner to topic
                 bootstrapGate?.await()
                 bootstrapFinished += topic
-                bootstrapOutcome(topic)
+                bootstrapOutcome(issue, topic)
             },
             store = store,
             encode = { request -> requests += request; "encoded-${request.requestId}" },
@@ -2665,10 +2673,11 @@ class TopicSessionCoordinatorTest {
         h.goLive()
         advanceTimeBy(100)
 
+        val issued = h.bootstrapCalls.size
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
 
-        assertEquals(listOf(fence().identity to TETHER), h.bootstrapCalls)
+        assertEquals(listOf(fence().identity to TETHER), h.bootstrapCalls.drop(issued))
         h.cleanUp()
     }
 
@@ -2692,11 +2701,17 @@ class TopicSessionCoordinatorTest {
         h.coordinator.setOnline(true)
         h.coordinator.requestBootstrap("krx:usd-krw-futures")
         advanceTimeBy(100)
-        assertTrue("이 빌드가 읽지 않는 topic 을 물었다", h.bootstrapCalls.isEmpty())
+        // 크기가 아니라 **이름**으로 잠근다. 자동 fan-out 이 붙으면 이 시점의 목록은 비어 있지
+        // 않게 되지만, 그때도 확인해야 하는 것은 여전히 "KRX 를 묻지 않았다" 하나다.
+        assertTrue(
+            "이 빌드가 읽지 않는 topic 을 물었다",
+            h.bootstrapCalls.none { it.second == "krx:usd-krw-futures" }
+        )
 
+        val issued = h.bootstrapCalls.size
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
-        assertEquals(listOf(fence().identity to TETHER), h.bootstrapCalls)
+        assertEquals(listOf(fence().identity to TETHER), h.bootstrapCalls.drop(issued))
         h.cleanUp()
     }
 
@@ -2716,21 +2731,31 @@ class TopicSessionCoordinatorTest {
         h.goLive()
         advanceTimeBy(100)
         h.bootstrapGate = CompletableDeferred()
+        val issued = h.bootstrapCalls.size
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
-        assertEquals(1, h.bootstrapCalls.size)
+        assertEquals(issued + 1, h.bootstrapCalls.size)
 
         h.coordinator.setAccess(false, null)
         h.coordinator.setAccess(true, fence())
         advanceTimeBy(100)
 
-        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        // 보류된 그 발행 하나만 값을 낸다 — 세션이 스스로 무엇을 더 묻게 되더라도 이 단정이
+        // 재는 것은 "보류됐던 답이 샜는가" 하나로 남는다. 그 값의 timestamp 는 **더 새것**이라,
+        // merge 의 strictly-newer 규칙 때문에 새면 도착 순서와 무관하게 이겨서 반드시 보인다.
+        h.bootstrapOutcome = { issue, _ ->
+            if (issue == issued) {
+                h.delivered(h.tetherFrame(1390.0, timestamp = "2026-08-31T10:25:00+09:00"))
+            } else {
+                TopicSnapshotOutcome.Unreachable(java.io.IOException("이 시험의 대상이 아니다"))
+            }
+        }
         h.bootstrapGate!!.complete(Unit)
         advanceTimeBy(100)
 
         assertTrue(
             "지난 grant 의 답이 새 세션에 적용됐다",
-            h.coordinator.rates.value.quotes.isEmpty()
+            h.coordinator.rates.value.quotes.values.none { it.rate == 1390.0 }
         )
         h.cleanUp()
     }
@@ -2750,20 +2775,30 @@ class TopicSessionCoordinatorTest {
         h.goLive()
         advanceTimeBy(100)
         h.bootstrapGate = CompletableDeferred()
+        val issued = h.bootstrapCalls.size
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
-        assertEquals(1, h.bootstrapCalls.size)
+        assertEquals(issued + 1, h.bootstrapCalls.size)
 
         h.coordinator.setAccess(false, fence())
         advanceTimeBy(100)
 
-        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        // 보류된 그 발행 하나만 값을 낸다 — 세션이 스스로 무엇을 더 묻게 되더라도 이 단정이
+        // 재는 것은 "보류됐던 답이 샜는가" 하나로 남는다. 그 값의 timestamp 는 **더 새것**이라,
+        // merge 의 strictly-newer 규칙 때문에 새면 도착 순서와 무관하게 이겨서 반드시 보인다.
+        h.bootstrapOutcome = { issue, _ ->
+            if (issue == issued) {
+                h.delivered(h.tetherFrame(1390.0, timestamp = "2026-08-31T10:25:00+09:00"))
+            } else {
+                TopicSnapshotOutcome.Unreachable(java.io.IOException("이 시험의 대상이 아니다"))
+            }
+        }
         h.bootstrapGate!!.complete(Unit)
         advanceTimeBy(100)
 
         assertTrue(
             "접근이 철회된 세션에 프리미엄 값이 들어왔다",
-            h.coordinator.rates.value.quotes.isEmpty()
+            h.coordinator.rates.value.quotes.values.none { it.rate == 1390.0 }
         )
         h.cleanUp()
     }
@@ -2781,6 +2816,7 @@ class TopicSessionCoordinatorTest {
         h.goLive()
         advanceTimeBy(100)
         h.bootstrapGate = CompletableDeferred()
+        val issued = h.bootstrapCalls.size
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
 
@@ -2788,13 +2824,22 @@ class TopicSessionCoordinatorTest {
         h.coordinator.setAccess(true, fence())
         advanceTimeBy(100)
 
-        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        // 보류된 그 발행 하나만 값을 낸다 — 세션이 스스로 무엇을 더 묻게 되더라도 이 단정이
+        // 재는 것은 "보류됐던 답이 샜는가" 하나로 남는다. 그 값의 timestamp 는 **더 새것**이라,
+        // merge 의 strictly-newer 규칙 때문에 새면 도착 순서와 무관하게 이겨서 반드시 보인다.
+        h.bootstrapOutcome = { issue, _ ->
+            if (issue == issued) {
+                h.delivered(h.tetherFrame(1390.0, timestamp = "2026-08-31T10:25:00+09:00"))
+            } else {
+                TopicSnapshotOutcome.Unreachable(java.io.IOException("이 시험의 대상이 아니다"))
+            }
+        }
         h.bootstrapGate!!.complete(Unit)
         advanceTimeBy(100)
 
         assertTrue(
             "철회를 왕복한 뒤 옛 답이 되살아났다",
-            h.coordinator.rates.value.quotes.isEmpty()
+            h.coordinator.rates.value.quotes.values.none { it.rate == 1390.0 }
         )
         h.cleanUp()
     }
@@ -2814,6 +2859,7 @@ class TopicSessionCoordinatorTest {
         h.goLive()
         advanceTimeBy(100)
 
+        val issued = h.bootstrapCalls.size
         caller.remove(TETHER)
         caller.add("krx:usd-krw-futures")
         h.coordinator.requestBootstrap(TETHER)
@@ -2823,7 +2869,7 @@ class TopicSessionCoordinatorTest {
         assertEquals(
             "호출자가 바꾼 집합이 세션의 desired 를 바꿨다",
             listOf(fence().identity to TETHER),
-            h.bootstrapCalls
+            h.bootstrapCalls.drop(issued)
         )
         h.cleanUp()
     }
@@ -2844,14 +2890,15 @@ class TopicSessionCoordinatorTest {
         h.wire.open()
         advanceTimeBy(1)
         h.bootstrapGate = CompletableDeferred()
+        val issued = h.bootstrapCalls.size
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
-        assertEquals(1, h.bootstrapCalls.size)
+        assertEquals(issued + 1, h.bootstrapCalls.size)
 
         h.wire.deliver(h.ack("r1", active = emptyList(), rejections = mapOf(TETHER to "premium_required")))
         advanceTimeBy(1)
 
-        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.tetherFrame(1390.0)) }
         h.bootstrapGate!!.complete(Unit)
         advanceTimeBy(100)
 
@@ -2878,15 +2925,16 @@ class TopicSessionCoordinatorTest {
         h.goLive()
         advanceTimeBy(100)
         h.bootstrapGate = CompletableDeferred()
+        val issued = h.bootstrapCalls.size
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
-        assertEquals(1, h.bootstrapCalls.size)
+        assertEquals(issued + 1, h.bootstrapCalls.size)
 
         h.credential = AuthSnapshot("u2", 1L, "token-2")
         h.wire.open()
         advanceTimeBy(10)
 
-        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.tetherFrame(1390.0)) }
         h.bootstrapGate!!.complete(Unit)
         advanceTimeBy(100)
 
@@ -2911,7 +2959,7 @@ class TopicSessionCoordinatorTest {
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
 
-        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.tetherFrame(1390.0)) }
         h.bootstrapGate!!.complete(Unit)
         advanceTimeBy(100)
 
@@ -2934,7 +2982,7 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(100)
         assertEquals("소켓이 열렸다 — 이 시험의 전제가 아니다", 1, h.wires.size)
 
-        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.tetherFrame(1390.0)) }
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
 
@@ -2963,7 +3011,7 @@ class TopicSessionCoordinatorTest {
         silenceReady(h)
 
         advanceTimeBy(40_000)
-        h.bootstrapOutcome = {
+        h.bootstrapOutcome = { _, _ ->
             h.delivered(h.tetherFrame(1391.0, timestamp = "2026-08-31T10:21:00+09:00"))
         }
         h.coordinator.requestBootstrap(TETHER)
@@ -2997,7 +3045,7 @@ class TopicSessionCoordinatorTest {
         silenceReady(h)
 
         advanceTimeBy(40_000)
-        h.bootstrapOutcome = { h.delivered(h.emptyTetherFrame()) }
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.emptyTetherFrame()) }
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
 
@@ -3019,7 +3067,7 @@ class TopicSessionCoordinatorTest {
         silenceReady(h)
 
         advanceTimeBy(40_000)
-        h.bootstrapOutcome = {
+        h.bootstrapOutcome = { _, _ ->
             h.delivered(h.tetherFrame(1234.0, timestamp = "2026-08-31T10:19:00+09:00"))
         }
         h.coordinator.requestBootstrap(TETHER)
@@ -3052,11 +3100,14 @@ class TopicSessionCoordinatorTest {
         h.goLive()
         advanceTimeBy(100)
 
+        val issued = h.bootstrapCalls.size
         h.coordinator.requestBootstrap(TETHER)
         h.coordinator.setAccess(true, fence(uid = "u2", generation = 2L, epoch = "epoch-2"))
         advanceTimeBy(100)
 
-        assertEquals(listOf(fence().identity to TETHER), h.bootstrapCalls)
+        // 이 시험이 낸 **첫** 발행만이 대상이다. 두 번째 grant 가 스스로 무엇을 묻든 그것은
+        // 다른 사실이고, 여기서 물은 것은 "이 요청이 새 grant 를 따라갔는가" 하나다.
+        assertEquals(fence().identity to TETHER, h.bootstrapCalls.drop(issued).first())
         h.cleanUp()
     }
 
@@ -3073,7 +3124,7 @@ class TopicSessionCoordinatorTest {
         silenceReady(h)
 
         advanceTimeBy(40_000)
-        h.bootstrapOutcome = { h.delivered(h.fxFrame(1390.0)) }
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.fxFrame(1390.0)) }
         h.coordinator.requestBootstrap(USD)
         advanceTimeBy(1)
         assertEquals("FX bootstrap 이 가격을 넣지 않았다", 2, h.coordinator.rates.value.quotes.size)
@@ -3090,16 +3141,22 @@ class TopicSessionCoordinatorTest {
         h.goLive()
         advanceTimeBy(100)
         h.bootstrapGate = CompletableDeferred()
+        val issued = h.bootstrapCalls.size
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
-        assertEquals(1, h.bootstrapCalls.size)
+        assertEquals(issued + 1, h.bootstrapCalls.size)
 
         h.coordinator.stop()
         advanceTimeBy(1)
+        val finishedBeforeRelease = h.bootstrapFinished.toList()
         h.bootstrapGate!!.complete(Unit)
         advanceTimeBy(100)
 
-        assertTrue("멈춘 세션이 요청을 끝까지 붙들었다", h.bootstrapFinished.isEmpty())
+        assertEquals(
+            "멈춘 세션이 요청을 끝까지 붙들었다",
+            finishedBeforeRelease,
+            h.bootstrapFinished.toList()
+        )
         h.cleanUp()
     }
 
@@ -3116,12 +3173,12 @@ class TopicSessionCoordinatorTest {
         h.goLive()
         advanceTimeBy(100)
 
-        h.bootstrapOutcome = { throw AuthIdentityChangedException() }
+        h.bootstrapOutcome = { _, _ -> throw AuthIdentityChangedException() }
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(100)
         assertTrue("계정이 바뀐 요청이 값을 남겼다", h.coordinator.rates.value.quotes.isEmpty())
 
-        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.tetherFrame(1390.0)) }
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(100)
         assertEquals(1390.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
@@ -3142,7 +3199,7 @@ class TopicSessionCoordinatorTest {
         silenceReady(h)
 
         advanceTimeBy(40_000)
-        h.bootstrapOutcome = { TopicSnapshotOutcome.Dormant }
+        h.bootstrapOutcome = { _, _ -> TopicSnapshotOutcome.Dormant }
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
 
