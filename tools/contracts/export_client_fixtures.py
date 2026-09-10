@@ -1837,6 +1837,7 @@ def add_http_error_fixtures(corpus: Corpus) -> None:
         request_json: dict[str, Any] | None = None,
         patches: Iterable[Any] = (),
         dependency_patches: Iterable[str] = (),
+        expected_error: str | None = None,
         contract_headers: Iterable[str] = (),
         forbidden_headers: Iterable[str] = (),
         config_axes: dict[str, Any] | None = None,
@@ -1860,6 +1861,17 @@ def add_http_error_fixtures(corpus: Corpus) -> None:
                 f"HTTP route capture failed {name}: expected {expected_status}, "
                 f"got {response.status_code} {response.text}"
             )
+        if expected_error is not None:
+            # A status alone is not the answer on routes that spend one code on several
+            # meanings: this endpoint answers 404 with three different `error` values, and a
+            # capture that checked only the status once recorded a dormant body under the name
+            # of a topic verdict. Found while writing these fixtures.
+            actual_error = response.json().get("error")
+            if actual_error != expected_error:
+                raise RuntimeError(
+                    f"HTTP route capture wrong error {name}: expected {expected_error!r}, "
+                    f"got {actual_error!r}"
+                )
         # Against the live response, before the allowlist narrows it — see
         # `verify_capture_headers` for why absence cannot be checked after this point.
         verify_capture_headers(
@@ -2046,6 +2058,213 @@ def add_http_error_fixtures(corpus: Corpus) -> None:
                 "_free_snapshot_cache_get",
                 "_free_snapshot_local_get",
             ),
+        )
+
+        # ── GET /api/v2/topics/snapshot — the WS snapshot's REST twin ──────────────────
+        #
+        # Captured through the route, not from a builder, because what these lock is what
+        # the *route* adds: the gate order, the status each refusal carries, and the two
+        # 404 bodies a client has to tell apart. The payload builder is patched so the
+        # only thing under test is the envelope the route wraps it in — which is nothing.
+        from app import entitlements, topic_initial_snapshot
+
+        def snapshot_patch(**kwargs):
+            return patch.object(
+                topic_initial_snapshot, "build_snapshot_observed", new=AsyncMock(**kwargs)
+            )
+
+        def premium_topic_patches(*extra):
+            # The dispatcher flag defaults to off, and the dormant branch runs before
+            # everything else — without this every one of these would capture a
+            # `topics_disabled` body under some other name.
+            #
+            # G2 and G3 default to off too, and `compute_krx_visible` is
+            # `premium and krx_gates_open() and has_entitlement(...)`: with the global
+            # gates shut, Python never evaluates the per-user term. Captured that way, a
+            # list without KRX would say only that distribution is off — a broken
+            # entitlement filter would look identical. Opening them is what puts the
+            # per-user judgment on the path these fixtures claim to exercise.
+            return (
+                patch.object(config, "TOPIC_DISPATCHER_ENABLED", True),
+                patch.object(config, "KRX_FUTURES_ENABLED", True),
+                patch.object(config, "KRX_CLIENT_DISTRIBUTION_ENABLED", True),
+                # The derived constant is fixed at import time and read by
+                # `supported_snapshot_topics()`, while `krx_gates_open()` reads the pair above.
+                # Setting only one of the two leaves a configuration no deployment can have —
+                # gates open, support closed — and every capture would record the axes of a run
+                # that did not happen. Found by review, twice: first the missing per-user path,
+                # then this half-set state in the captures that did not need KRX at all.
+                patch.object(config, "KRX_CLIENT_DISTRIBUTION_EFFECTIVE", True),
+                auth_patch(),
+                premium_patch(PremiumStatus.ACTIVE),
+                *extra,
+            )
+
+        def topic_axes(g1: str) -> dict[str, str]:
+            # What the run actually was, not what the defaults would say.
+            return topic_config("not-applicable", g1=g1, g2="on", g3="on")
+
+        # Dormant is answered before authentication, so it is captured without one: an
+        # auth patch here would hide the very ordering the fixture exists to record.
+        capture(
+            "topic-snapshot-topics-disabled-404",
+            "GET",
+            "/api/v2/topics/snapshot?topic=usdt%3Akrw",
+            404,
+            "ASGI route + app.main.get_v2_topic_snapshot dormant branch (pre-auth)",
+            patches=(patch.object(config, "TOPIC_DISPATCHER_ENABLED", False),),
+            dependency_patches=("TOPIC_DISPATCHER_ENABLED",),
+            authorization=False,
+            expected_error="topics_disabled",
+            contract_headers=("Cache-Control",),
+            config_axes=topic_config(
+                "not-applicable",
+                g1="not-applicable",
+                g2="not-applicable",
+                g3="not-applicable",
+                premium="not-applicable",
+            ),
+        )
+        capture(
+            "topic-snapshot-unknown-topic-404",
+            "GET",
+            "/api/v2/topics/snapshot?topic=weather%3Aseoul",
+            404,
+            "ASGI route + app.main.get_v2_topic_snapshot topic resolution",
+            patches=premium_topic_patches(),
+            dependency_patches=(
+                "TOPIC_DISPATCHER_ENABLED",
+                "KRX_FUTURES_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+                "verify_firebase_token",
+                "verify_premium_status",
+            ),
+            expected_error="unknown_topic",
+            contract_headers=("Cache-Control",),
+            config_axes=topic_axes("off"),
+        )
+        # ── per-user existence hiding, as a pair ─────────────────────────────────────
+        #
+        # Same request, same global gates, same premium. The only difference is whether the
+        # user holds the entitlement, and the *error code changes with it*: without it the
+        # topic is answered as one the server does not have, with it the topic is
+        # acknowledged and merely has nothing to serve. A filter that stopped consulting the
+        # user would make both of these say the same thing.
+        capture(
+            "topic-snapshot-krx-hidden-404",
+            "GET",
+            "/api/v2/topics/snapshot?topic=krx%3Ausd-krw-futures",
+            404,
+            "ASGI route + app.topic_initial_snapshot.visible_snapshot_topics_sync (no entitlement)",
+            patches=premium_topic_patches(),
+            dependency_patches=(
+                "TOPIC_DISPATCHER_ENABLED",
+                "KRX_FUTURES_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+                "verify_firebase_token",
+                "verify_premium_status",
+            ),
+            expected_error="unknown_topic",
+            contract_headers=("Cache-Control",),
+            config_axes=topic_axes("off"),
+        )
+        capture(
+            "topic-snapshot-krx-entitled-404",
+            "GET",
+            "/api/v2/topics/snapshot?topic=krx%3Ausd-krw-futures",
+            404,
+            "ASGI route + app.entitlements.has_entitlement(True) then empty-payload branch",
+            patches=premium_topic_patches(
+                patch.object(entitlements, "has_entitlement", return_value=True),
+                snapshot_patch(return_value=None),
+            ),
+            dependency_patches=(
+                "TOPIC_DISPATCHER_ENABLED",
+                "KRX_FUTURES_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+                "verify_firebase_token",
+                "verify_premium_status",
+                "has_entitlement",
+                "build_snapshot_observed",
+            ),
+            expected_error="topic_unavailable",
+            contract_headers=("Cache-Control",),
+            config_axes=topic_axes("on"),
+        )
+        capture(
+            "topic-snapshot-topic-unavailable-404",
+            "GET",
+            "/api/v2/topics/snapshot?topic=usdt%3Akrw",
+            404,
+            "ASGI route + app.main.get_v2_topic_snapshot empty-payload branch",
+            patches=premium_topic_patches(snapshot_patch(return_value=None)),
+            dependency_patches=(
+                "TOPIC_DISPATCHER_ENABLED",
+                "KRX_FUTURES_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+                "verify_firebase_token",
+                "verify_premium_status",
+                "build_snapshot_observed",
+            ),
+            expected_error="topic_unavailable",
+            contract_headers=("Cache-Control",),
+            config_axes=topic_axes("off"),
+        )
+        # The one 503 on this route that means the topic, and it carries no retry input at
+        # all. `forbidden_headers` is what proves that: an empty recorded header map would
+        # say nothing, because only requested headers are ever written.
+        capture(
+            "topic-snapshot-temporarily-unavailable-503",
+            "GET",
+            "/api/v2/topics/snapshot?topic=usdt%3Akrw",
+            503,
+            "ASGI route + app.main.get_v2_topic_snapshot snapshot-deadline branch",
+            patches=premium_topic_patches(
+                snapshot_patch(
+                    side_effect=topic_initial_snapshot.SnapshotDeadlineExceeded()
+                )
+            ),
+            dependency_patches=(
+                "TOPIC_DISPATCHER_ENABLED",
+                "KRX_FUTURES_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+                "verify_firebase_token",
+                "verify_premium_status",
+                "build_snapshot_observed",
+            ),
+            expected_error="temporarily_unavailable",
+            contract_headers=("Cache-Control",),
+            forbidden_headers=("Retry-After",),
+            config_axes=topic_axes("off"),
+        )
+        # The success case returns the builder's payload untouched. Feeding it the very
+        # bytes of the WS golden is the point: if the route ever wrapped, renamed or
+        # re-keyed anything, this fixture would stop matching that golden.
+        capture(
+            "topic-snapshot-tether-200",
+            "GET",
+            "/api/v2/topics/snapshot?topic=usdt%3Akrw",
+            200,
+            "ASGI route + app.main.get_v2_topic_snapshot with the WS tether golden as payload",
+            patches=premium_topic_patches(
+                snapshot_patch(return_value=corpus.body_json("topic-snapshot-tether"))
+            ),
+            dependency_patches=(
+                "TOPIC_DISPATCHER_ENABLED",
+                "KRX_FUTURES_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_ENABLED",
+                "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+                "verify_firebase_token",
+                "verify_premium_status",
+                "build_snapshot_observed",
+            ),
+            contract_headers=("Cache-Control",),
+            config_axes=topic_axes("off"),
         )
 
         capture(

@@ -1,0 +1,64 @@
+{
+  "data": {
+    "usd_krw_banks": [
+      {
+        "asset": "usd-krw",
+        "rate": 1388.3,
+        "source": "kb",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usd-krw",
+        "rate": 1388.4,
+        "source": "hana",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      }
+    ],
+    "usd_krw_reference": {
+      "asset": "usd-krw",
+      "rate": 1388.1,
+      "source": "investing",
+      "timestamp": "2026-08-31T10:20:00+09:00"
+    },
+    "usdt_krw": [
+      {
+        "asset": "usdt-krw",
+        "rate": 1392.0,
+        "rate_changed_at": "2026-08-31T10:20:00+09:00",
+        "source": "upbit",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usdt-krw",
+        "rate": 1392.1,
+        "rate_changed_at": "2026-08-31T10:20:00.001000+09:00",
+        "source": "bithumb",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usdt-krw",
+        "rate": 1392.2,
+        "rate_changed_at": "2026-08-31T10:20:00.002000+09:00",
+        "source": "coinone",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usdt-krw",
+        "rate": 1392.3,
+        "rate_changed_at": "2026-08-31T10:20:00.003000+09:00",
+        "source": "korbit",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      },
+      {
+        "asset": "usdt-krw",
+        "rate": 1392.4,
+        "rate_changed_at": "2026-08-31T10:20:00.004000+09:00",
+        "source": "gopax",
+        "timestamp": "2026-08-31T10:20:00+09:00"
+      }
+    ]
+  },
+  "topic": "usdt:krw",
+  "type": "snapshot",
+  "version": 1
+}

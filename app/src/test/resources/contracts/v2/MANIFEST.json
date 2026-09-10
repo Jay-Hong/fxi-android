@@ -2309,6 +2309,265 @@
     {
       "config": {
         "authStage": "not-applicable",
+        "g1": "on",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "http-topic-snapshot-krx-entitled-404",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/topic-snapshot-krx-entitled-404.json",
+      "producer": "ASGI route + app.entitlements.has_entitlement(True) then empty-payload branch",
+      "runtimeReachability": "runtime",
+      "sha256": "8d151ba5e47f7adad7af9ffd86342a69a07e282d757f874eacc041cf52222c1d",
+      "source": {
+        "dependencyPatches": [
+          "TOPIC_DISPATCHER_ENABLED",
+          "KRX_FUTURES_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+          "verify_firebase_token",
+          "verify_premium_status",
+          "has_entitlement",
+          "build_snapshot_observed"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/topics/snapshot?topic=krx%3Ausd-krw-futures",
+          "status": 404
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "http-topic-snapshot-krx-hidden-404",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/topic-snapshot-krx-hidden-404.json",
+      "producer": "ASGI route + app.topic_initial_snapshot.visible_snapshot_topics_sync (no entitlement)",
+      "runtimeReachability": "runtime",
+      "sha256": "a4e59c73eceae7de08c49e454781ee4d87575282747044b4af395bf4d00fded5",
+      "source": {
+        "dependencyPatches": [
+          "TOPIC_DISPATCHER_ENABLED",
+          "KRX_FUTURES_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+          "verify_firebase_token",
+          "verify_premium_status"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/topics/snapshot?topic=krx%3Ausd-krw-futures",
+          "status": 404
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "http-topic-snapshot-temporarily-unavailable-503",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/topic-snapshot-temporarily-unavailable-503.json",
+      "producer": "ASGI route + app.main.get_v2_topic_snapshot snapshot-deadline branch",
+      "runtimeReachability": "runtime",
+      "sha256": "b187c9dd08c0d8051d8105e43db70ec2abe454f78e833fcd67c6e2342ba587e0",
+      "source": {
+        "dependencyPatches": [
+          "TOPIC_DISPATCHER_ENABLED",
+          "KRX_FUTURES_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+          "verify_firebase_token",
+          "verify_premium_status",
+          "build_snapshot_observed"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/topics/snapshot?topic=usdt%3Akrw",
+          "status": 503
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "http-topic-snapshot-tether-200",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/topic-snapshot-tether-200.json",
+      "producer": "ASGI route + app.main.get_v2_topic_snapshot with the WS tether golden as payload",
+      "runtimeReachability": "runtime",
+      "sha256": "66d5fdeb4d57ccdd98015bac6179594bc4b0cf34ff687b407791bbf1776d57f6",
+      "source": {
+        "dependencyPatches": [
+          "TOPIC_DISPATCHER_ENABLED",
+          "KRX_FUTURES_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+          "verify_firebase_token",
+          "verify_premium_status",
+          "build_snapshot_observed"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/topics/snapshot?topic=usdt%3Akrw",
+          "status": 200
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "http-topic-snapshot-topic-unavailable-404",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/topic-snapshot-topic-unavailable-404.json",
+      "producer": "ASGI route + app.main.get_v2_topic_snapshot empty-payload branch",
+      "runtimeReachability": "runtime",
+      "sha256": "f59a2a5e81885647660bb4ad13d9d4957ca776326b9e248bbfe630c53e7bddb7",
+      "source": {
+        "dependencyPatches": [
+          "TOPIC_DISPATCHER_ENABLED",
+          "KRX_FUTURES_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+          "verify_firebase_token",
+          "verify_premium_status",
+          "build_snapshot_observed"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/topics/snapshot?topic=usdt%3Akrw",
+          "status": 404
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "not-applicable",
+        "g2": "not-applicable",
+        "g3": "not-applicable",
+        "premium": "not-applicable"
+      },
+      "family": "http",
+      "id": "http-topic-snapshot-topics-disabled-404",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/topic-snapshot-topics-disabled-404.json",
+      "producer": "ASGI route + app.main.get_v2_topic_snapshot dormant branch (pre-auth)",
+      "runtimeReachability": "runtime",
+      "sha256": "805420837dda2dd829518e3608a912e5589b9d62ac7d259ffa0610fd6a3e77e4",
+      "source": {
+        "dependencyPatches": [
+          "TOPIC_DISPATCHER_ENABLED"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/topics/snapshot?topic=usdt%3Akrw",
+          "status": 404
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
+        "g1": "off",
+        "g2": "on",
+        "g3": "on",
+        "premium": "active"
+      },
+      "family": "http",
+      "id": "http-topic-snapshot-unknown-topic-404",
+      "mediaType": "application/json",
+      "origin": "route",
+      "path": "http/topic-snapshot-unknown-topic-404.json",
+      "producer": "ASGI route + app.main.get_v2_topic_snapshot topic resolution",
+      "runtimeReachability": "runtime",
+      "sha256": "3b26ff0558ab854ee1f75193188c1e425dc20752a4e6202dbe59bc33e3149d0e",
+      "source": {
+        "dependencyPatches": [
+          "TOPIC_DISPATCHER_ENABLED",
+          "KRX_FUTURES_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_ENABLED",
+          "KRX_CLIENT_DISTRIBUTION_EFFECTIVE",
+          "verify_firebase_token",
+          "verify_premium_status"
+        ],
+        "http": {
+          "headers": {
+            "Cache-Control": "no-store"
+          },
+          "method": "GET",
+          "path": "/api/v2/topics/snapshot?topic=weather%3Aseoul",
+          "status": 404
+        },
+        "module": "app/main.py",
+        "routeTraversed": true
+      }
+    },
+    {
+      "config": {
+        "authStage": "not-applicable",
         "g1": "not-applicable",
         "g2": "not-applicable",
         "g3": "not-applicable",

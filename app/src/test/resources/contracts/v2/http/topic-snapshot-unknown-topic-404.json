@@ -1,0 +1,11 @@
+{
+  "detail": "topic 'weather:seoul' not supported",
+  "error": "unknown_topic",
+  "supported_topics": [
+    "fx:usd-krw",
+    "fx:jpy-krw",
+    "fx:eur-krw",
+    "usdt:krw",
+    "dxy:spot"
+  ]
+}

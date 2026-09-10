@@ -21,7 +21,7 @@ class ContractCorpusVerifierTest {
         assertEquals(1, corpus.manifest.schemaVersion)
         assertEquals("exchange-rate", corpus.manifest.server.repository)
         assertFalse(corpus.manifest.server.contractTreeDirty)
-        assertEquals(97, corpus.manifest.fixtures.size)
+        assertEquals(104, corpus.manifest.fixtures.size)
         assertEquals(16, corpus.manifest.fixtures.count { it.family == ContractFamily.FREE_SNAPSHOT })
         assertTrue(corpus.manifest.fixtures.any { it.origin == ContractOrigin.ROUTE })
         assertTrue(corpus.manifest.fixtures.any {
