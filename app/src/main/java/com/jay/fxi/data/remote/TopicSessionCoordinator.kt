@@ -94,6 +94,30 @@ private sealed interface SessionInput {
     /** Premium access, and the grant it belongs to. `null` fence means nobody is signed in. */
     data class Access(val allowed: Boolean, val fence: TopicSessionFence?) : SessionInput
 
+    /**
+     * Ask the REST twin for one topic's snapshot.
+     *
+     * Posted rather than started where it is asked for, so the grant it binds to is read on the
+     * loop. A caller reading `fence` from its own turn is reading it from a turn that may already
+     * be over — and the whole point of binding is that the request carries the grant it was
+     * decided under, not whichever one is current when the job happens to start.
+     */
+    data class BootstrapRequested(val topic: String) : SessionInput
+
+    /**
+     * One REST bootstrap finished.
+     *
+     * Carries the **grant epoch it was issued under**, and no instant. The loop reads the clock
+     * when it applies this, because that is when the answer became this session's; a stamp taken
+     * inside the job would be when the HTTP call returned, and a queue that ran late would then
+     * arm a window that had already partly elapsed.
+     */
+    data class BootstrapAnswered(
+        val grantEpoch: Long,
+        val topic: String,
+        val outcome: TopicSnapshotOutcome
+    ) : SessionInput
+
     data class Transport(val generation: Long, val event: TopicTransportEvent) : SessionInput
 
     /**
@@ -215,6 +239,15 @@ class TopicSessionCoordinator(
     /** Opens a socket. Given the generation only so a test can tell the attempts apart. */
     private val connect: (generation: Long) -> TopicTransport,
     private val credentials: TopicCommandCredentials,
+    /**
+     * One REST snapshot for one topic, bound to the grant it was asked for.
+     *
+     * Takes an [AuthIdentityFence] rather than a whole [TopicSessionFence] because that is all the
+     * transport can enforce: it re-checks uid and auth generation before the token is read and
+     * again once the response is in hand, and knows nothing of `userAccessEpoch`. The half it
+     * cannot see is refused here instead, by [SessionInput.BootstrapAnswered]'s epoch.
+     */
+    private val bootstrap: suspend (owner: AuthIdentityFence, topic: String) -> TopicSnapshotOutcome,
     private val store: TopicSubscriptionStateStore,
     private val encode: (TopicSubscribeRequest) -> String,
     private val newRequestId: () -> String,
@@ -239,8 +272,17 @@ class TopicSessionCoordinator(
      * which puts it back to never-received in the same breath.
      */
     private val onTopicState: (TopicSubscriptionSnapshot) -> Unit = {},
-    private val desired: Set<String> = TopicCatalogue.DESIRED
+    desired: Set<String> = TopicCatalogue.DESIRED
 ) {
+    /**
+     * Copied, so what this session consumes cannot change under it.
+     *
+     * `val` stops the field being re-assigned and says nothing about the set's contents: a caller
+     * that hands in a `mutableSetOf` still holds the same object. The copy is what lets the
+     * answer path trust the check the issue already made.
+     */
+    private val desired: Set<String> = desired.toSet()
+
     private class Connection(
         val generation: Long,
         val transport: TopicTransport,
@@ -326,6 +368,29 @@ class TopicSessionCoordinator(
     private var stopped = false
 
     /**
+     * Which grant's authority is current, counted rather than compared.
+     *
+     * The case a fence comparison cannot see is [setAccess] withdrawing access while handing
+     * back the **same** fence — a shape the public API permits and that nothing else here
+     * handles. What the entitlements layer will actually send is not settled: its reducer rotates
+     * the user epoch on an authoritative loss only when something protected existed, and this
+     * coordinator has no production caller yet. So this is a contract the session keeps, not a
+     * claim about `userAccessEpoch`. A number that only rises also cannot be re-entered, which is
+     * what makes a withdrawal that is granted again still refuse the older answer.
+     */
+    private var grantEpoch = 0L
+
+    /**
+     * The REST bootstraps still out.
+     *
+     * Held for shutdown, which is the one moment the answers stop having anywhere to go. A grant
+     * change does not cancel them — [grantEpoch] refuses those answers instead — which leaves one
+     * request per change running to the end of its budget. Pruned on the loop, where the list is
+     * only ever touched.
+     */
+    private val bootstraps = mutableListOf<Job>()
+
+    /**
      * D14's window, and the two facts that decide it. **Session-scoped, not per connection.**
      *
      * A window is evidence that this grant's data was flowing, and swapping sockets does not
@@ -406,6 +471,14 @@ class TopicSessionCoordinator(
     fun setAccess(allowed: Boolean, fence: TopicSessionFence?) =
         post(SessionInput.Access(allowed, fence))
 
+    /**
+     * Asks the REST twin for [topic] once.
+     *
+     * Deliberately not "and keep it fresh": one answer, decided by whoever calls this. Whether the
+     * session is in a state to ask at all is decided on the loop, not here.
+     */
+    fun requestBootstrap(topic: String) = post(SessionInput.BootstrapRequested(topic))
+
     fun stop() = post(SessionInput.Stop)
 
     private fun post(input: SessionInput) {
@@ -467,8 +540,23 @@ class TopicSessionCoordinator(
                 // backoff used to open a socket immediately. Found by review.
                 if (access == input.allowed && fence == input.fence) return
                 val moved = fence != input.fence
+                // An access withdrawal that hands back the same fence is invisible to a
+                // comparison of fences, and it is still the transition after which an answer
+                // authorised under that access is no longer this session's.
+                val withdrawn = access && !input.allowed
                 access = input.allowed
                 fence = input.fence
+                // Raised at **every** end of this grant's authority, which is a wider set than
+                // the purge below: the values already on screen survive a plain withdrawal, and
+                // an answer still in flight does not. Raised before the teardown so nothing
+                // between here and the end of this branch can issue under the old number.
+                //
+                // The bootstraps in flight are deliberately **not** cancelled. Cancelling and
+                // this counter are not alternatives — one frees a socket, the other refuses a
+                // late answer, and only the second is a correctness question. What not cancelling
+                // costs is real and bounded: a request whose grant is over runs to the end of its
+                // ten-second budget before anyone stops paying for it.
+                if (moved || withdrawn) grantEpoch++
                 if (moved) {
                     // A different grant is a different session. The socket was authenticated as
                     // the grant that is gone, so it goes with it — leaving it open would carry
@@ -490,6 +578,31 @@ class TopicSessionCoordinator(
                     silenceTicket++
                 }
                 reconsider(budgetIsFresh = true)
+            }
+
+            is SessionInput.BootstrapRequested -> startBootstrap(input.topic)
+
+            is SessionInput.BootstrapAnswered -> {
+                // The grant it was authorised under, against the one this session is on now. The
+                // transport already refused an answer whose account had moved; what it cannot see
+                // is a fence that arrives unchanged across a transition — an access withdrawal
+                // being the shape this session is handed.
+                if (input.grantEpoch != grantEpoch) return
+                // Two facts the counter cannot see, because neither arrives as a transition: the
+                // server refusing this grant on the socket, and the credential turning out to be
+                // somebody else's. The session has already stopped acting on the grant in both,
+                // and an answer that raced either of them must not be what puts the data back.
+                if (fence == refusedFor || fence == identityLostFor) return
+                // No second `desired` check: the set is copied at construction and never changes,
+                // and the issue already refused anything outside it.
+                //
+                // Everything that is not a delivery is dropped here, and that is a deferral
+                // rather than a verdict that they do not matter. A `Refused` can carry a 401, a
+                // premium 403 or a `Retry-After`, and the plan answers those with token recovery
+                // and an entitlement re-check — none of which this seam owns. What it does owe
+                // them is not treating any of them as data, and nothing here does.
+                val delivered = input.outcome as? TopicSnapshotOutcome.Delivered ?: return
+                applyBootstrap(input.topic, delivered.frame)
             }
 
             is SessionInput.Transport ->
@@ -811,14 +924,7 @@ class TopicSessionCoordinator(
         if (quotes.isEmpty()) return
         _rates.value = _rates.value.merge(quotes)
         store.recordFrame(topic)
-        recordDelivery(
-            if (topic == TopicCatalogue.TETHER) {
-                TopicSilenceEvidence.TETHER_DELIVERY
-            } else {
-                TopicSilenceEvidence.OTHER
-            },
-            clock.nowMillis()
-        )
+        recordDelivery(evidenceFor(topic), clock.nowMillis())
     }
 
     private fun receiveIndex(live: Connection, message: DxyTopicMessage) {
@@ -1071,7 +1177,120 @@ class TopicSessionCoordinator(
         return true
     }
 
+    // ---- the REST bootstrap ------------------------------------------------------------------
+
+    /**
+     * Issues one bootstrap for the grant that is current **now**.
+     *
+     * Both halves of the binding are taken here, on the loop, and both travel with the request.
+     * The identity goes to the transport, which refuses the token before the send and the answer
+     * after it if the account moved. The epoch comes back on the result, and refuses the one thing
+     * the transport has no way to object to.
+     *
+     * [wanted] is the gate rather than a fence being present: a session that is offline, that has
+     * been refused this grant, or whose credential turned out to be somebody else's should not be
+     * spending a request. [desired] is the other half — a topic this build does not consume has no
+     * reader for its answer.
+     */
+    private fun startBootstrap(topic: String) {
+        if (!wanted() || topic !in desired) return
+        val owner = fence?.identity ?: return
+        val epoch = grantEpoch
+        bootstraps.removeAll { it.isCompleted }
+        bootstraps += scope.launch {
+            val outcome = try {
+                bootstrap(owner, topic)
+            } catch (moved: AuthIdentityChangedException) {
+                // Not an answer about the topic: the account it was authorised for is not signed
+                // in any more. The session learns that from `Access`, and posting anything here
+                // would be this path inventing a verdict the server never gave.
+                return@launch
+            }
+            post(SessionInput.BootstrapAnswered(epoch, topic, outcome))
+        }
+    }
+
+    /**
+     * Lets go of every bootstrap still out. Idempotent, and safe with none.
+     *
+     * Shutdown only. The session's scope outlives [stop], so without this a request issued a
+     * moment before it would run to completion and answer into a closed queue.
+     */
+    private fun cancelBootstraps() {
+        bootstraps.forEach(Job::cancel)
+        bootstraps.clear()
+    }
+
+    /**
+     * A bootstrap answer becomes prices, and — for tether — one unit of delivery evidence.
+     *
+     * Deliberately **not** [receive]. That path is bound to a connection whose leases and
+     * rejections it re-reads, and this answer has neither: it is authorised by the route's own
+     * check, which is authentication, premium and the per-user KRX filter, so a 200 is a statement
+     * about this account made after whatever the socket was told. A session with no socket at all
+     * must be able to apply one, which is the case [accepts] cannot express.
+     *
+     * It is also deliberately not `recordFrame`. That counter is the socket's, and the
+     * first-delivery watchdog reads it — a REST answer satisfying it would let a session that
+     * never received a frame look like one that did. What a bootstrap does earn is D14's window,
+     * which `TopicSilencePolicy` arms from either path.
+     */
+    private fun applyBootstrap(topic: String, frame: DecodedTopicFrame) {
+        when (frame) {
+            is DecodedTopicFrame.Tether -> applyBootstrapEntries(topic, frame.value.data.allEntries)
+            is DecodedTopicFrame.Fx -> applyBootstrapEntries(topic, frame.value.data.allEntries)
+
+            // One slot rather than a list, so "everything failed validation" and "nothing arrived"
+            // are the same answer here — and it arms nothing either way, exactly as the socket's
+            // index path records no delivery.
+            is DecodedTopicFrame.Dxy -> frame.value.data.dxy.toDollarIndex()?.let {
+                _rates.value = _rates.value.merge(it)
+            }
+
+            // S6 owns KRX and `desired` cannot name it, so this is unreachable rather than
+            // ignored — but a `when` that stopped being exhaustive is not how it should be found.
+            is DecodedTopicFrame.Krx -> Unit
+
+            // The service refuses these before they can be an answer, because over one response a
+            // non-answer is a failure rather than something to skip.
+            is DecodedTopicFrame.Acknowledgement,
+            is DecodedTopicFrame.RequestFailure,
+            is DecodedTopicFrame.Unsupported,
+            DecodedTopicFrame.Pong,
+            DecodedTopicFrame.NotTopic -> Unit
+        }
+    }
+
+    /**
+     * The same order the socket's data path uses: sanitise, merge, then record.
+     *
+     * A payload leaving no usable price is not a delivery — after D8 an empty tether snapshot and
+     * one carrying only `usd_krw_futures` are the same bytes here, and D14 forbids the second
+     * satisfying tether delivery. A payload that merged **nothing because everything in it was
+     * older** is still a delivery: the server answered, and that is what the window measures.
+     */
+    private fun applyBootstrapEntries(topic: String, entries: List<TopicSourceEntry>) {
+        val quotes: List<TopicQuote> = entries.mapNotNull { it.toQuote() }
+        if (quotes.isEmpty()) return
+        _rates.value = _rates.value.merge(quotes)
+        recordDelivery(evidenceFor(topic), clock.nowMillis())
+    }
+
     // ---- silence (D14) -----------------------------------------------------------------------
+
+    /**
+     * Which evidence a delivered payload is, whichever path it arrived on.
+     *
+     * One rule in one place. Only tether arms D14's window — FX has no time-based expiry at all,
+     * and KRX is an optional group whose absence proves nothing — so a socket frame and a REST
+     * answer have to classify identically. Two copies of this were two chances for them to stop.
+     */
+    private fun evidenceFor(topic: String): TopicSilenceEvidence =
+        if (topic == TopicCatalogue.TETHER) {
+            TopicSilenceEvidence.TETHER_DELIVERY
+        } else {
+            TopicSilenceEvidence.OTHER
+        }
 
     /**
      * One delivery, classified by the path it came in on.
@@ -1080,7 +1299,8 @@ class TopicSessionCoordinator(
      * **socket** frames only, while this window is armed by a validated tether payload from either
      * the socket or the REST bootstrap (`TopicSilencePolicy:78-80`, `:97-98`). Deriving one from
      * the other would either lose the bootstrap or let it satisfy the first-delivery watchdog.
-     * The bootstrap has no client here yet; what this slice owes it is the parameter.
+     * Both callers exist now: [receive] for the socket, [applyBootstrapEntries] for the REST twin,
+     * and [evidenceFor] is the single rule they share.
      */
     private fun recordDelivery(evidence: TopicSilenceEvidence, receivedAtMillis: Long) {
         if (evidence == TopicSilenceEvidence.TETHER_DELIVERY) tetherDelivered = true
@@ -1272,6 +1492,7 @@ class TopicSessionCoordinator(
     private fun shutDown() {
         connection?.let { end(it, TopicDisconnectCause.DELIBERATE) }
         cancelReconnect()
+        cancelBootstraps()
         silenceTimer?.cancel()
         silenceTimer = null
     }

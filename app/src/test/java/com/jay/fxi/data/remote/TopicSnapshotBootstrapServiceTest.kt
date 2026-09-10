@@ -87,7 +87,7 @@ class TopicSnapshotBootstrapServiceTest {
     fun `a snapshot for the requested topic is delivered`() = runBlocking {
         server.enqueue(ok(TETHER_SNAPSHOT))
 
-        val outcome = service().bootstrap(TETHER)
+        val outcome = service().bootstrap(owner(), TETHER)
 
         assertTrue(outcome is TopicSnapshotOutcome.Delivered)
         assertTrue((outcome as TopicSnapshotOutcome.Delivered).frame is DecodedTopicFrame.Tether)
@@ -104,7 +104,7 @@ class TopicSnapshotBootstrapServiceTest {
     fun `the request names one topic exactly once`() = runBlocking {
         server.enqueue(ok(TETHER_SNAPSHOT))
 
-        service().bootstrap(TETHER)
+        service().bootstrap(owner(), TETHER)
 
         val recorded = server.takeRequest()
         val url = recorded.requestUrl!!
@@ -123,7 +123,7 @@ class TopicSnapshotBootstrapServiceTest {
     fun `a snapshot for another topic is refused`() = runBlocking {
         server.enqueue(ok(TETHER_SNAPSHOT))
 
-        val outcome = service().bootstrap(USD)
+        val outcome = service().bootstrap(owner(), USD)
 
         assertTrue("다른 topic 의 스냅샷을 받아들였다", outcome is TopicSnapshotOutcome.Malformed)
     }
@@ -147,7 +147,7 @@ class TopicSnapshotBootstrapServiceTest {
 
         notAnswers.forEach { body ->
             server.enqueue(ok(body))
-            val outcome = service().bootstrap(TETHER)
+            val outcome = service().bootstrap(owner(), TETHER)
             assertTrue("$body 을 배달로 받아들였다", outcome is TopicSnapshotOutcome.Malformed)
         }
     }
@@ -157,7 +157,7 @@ class TopicSnapshotBootstrapServiceTest {
     fun `an undecodable body is refused`() = runBlocking {
         server.enqueue(ok("{ this is not json"))
 
-        val outcome = service().bootstrap(TETHER)
+        val outcome = service().bootstrap(owner(), TETHER)
 
         assertTrue(outcome is TopicSnapshotOutcome.Malformed)
     }
@@ -175,9 +175,9 @@ class TopicSnapshotBootstrapServiceTest {
 
         assertEquals(
             TopicSnapshotOutcome.Unsupported(listOf(TETHER)),
-            service().bootstrap(KRX)
+            service().bootstrap(owner(), KRX)
         )
-        assertEquals(TopicSnapshotOutcome.TemporarilyUnavailable, service().bootstrap(TETHER))
+        assertEquals(TopicSnapshotOutcome.TemporarilyUnavailable, service().bootstrap(owner(), TETHER))
     }
 
     /**
@@ -189,13 +189,13 @@ class TopicSnapshotBootstrapServiceTest {
     @Test
     fun `one attempt is one send, and a stale credential adds exactly one more`() = runBlocking {
         server.enqueue(ok(TETHER_SNAPSHOT))
-        service().bootstrap(TETHER)
+        service().bootstrap(owner(), TETHER)
         assertEquals("정상 응답인데 두 번 보냈다", 1, server.requestCount)
         assertEquals(0, source.forceRefreshCount)
 
         server.enqueue(MockResponse().setResponseCode(401).setBody("""{"detail":"expired"}"""))
         server.enqueue(ok(TETHER_SNAPSHOT))
-        val outcome = service().bootstrap(TETHER)
+        val outcome = service().bootstrap(owner(), TETHER)
 
         assertTrue(outcome is TopicSnapshotOutcome.Delivered)
         assertEquals("401 재생이 한 번이 아니다", 3, server.requestCount)
@@ -221,7 +221,7 @@ class TopicSnapshotBootstrapServiceTest {
         )
         server.enqueue(ok(TETHER_SNAPSHOT).setBodyDelay(700, TimeUnit.MILLISECONDS))
 
-        val outcome = service(budget = 1000.milliseconds).bootstrap(TETHER)
+        val outcome = service(budget = 1000.milliseconds).bootstrap(owner(), TETHER)
 
         assertEquals("401 재생이 예산을 다시 시작했다", TopicSnapshotOutcome.TimedOut, outcome)
     }
@@ -241,7 +241,7 @@ class TopicSnapshotBootstrapServiceTest {
 
         val job = launch(Dispatchers.IO) {
             try {
-                outcome = service(budget = 30.seconds).bootstrap(TETHER)
+                outcome = service(budget = 30.seconds).bootstrap(owner(), TETHER)
             } catch (cancelled: CancellationException) {
                 withdrawn = true
                 throw cancelled
@@ -271,7 +271,7 @@ class TopicSnapshotBootstrapServiceTest {
 
         val job = launch(Dispatchers.IO) {
             try {
-                outcome = service().bootstrap(TETHER)
+                outcome = service().bootstrap(owner(), TETHER)
             } catch (changed: AuthIdentityChangedException) {
                 moved = true
             }
@@ -282,6 +282,31 @@ class TopicSnapshotBootstrapServiceTest {
 
         assertTrue("계정이 바뀌었는데 이전 답을 적용했다", moved)
         assertNull(outcome)
+    }
+
+    /**
+     * A request issued for one grant is not quietly re-authorised as the next.
+     *
+     * Attaching an owner to the *answer* and binding the *request* to it are different things, and
+     * this is the half a capture taken at execution time would skip: the job runs later than the
+     * decision, so reading whoever is signed in by then would authenticate as `user-b` and come
+     * back with a perfectly ordinary answer nobody asked for. Nothing is sent at all.
+     */
+    @Test
+    fun `a request is not re-authorised as whoever is signed in now`() = runBlocking {
+        server.enqueue(ok(TETHER_SNAPSHOT))
+        val issued = owner()
+        source.identity = AuthIdentity("user-b", 1)
+        var moved = false
+
+        try {
+            service().bootstrap(issued, TETHER)
+        } catch (changed: AuthIdentityChangedException) {
+            moved = true
+        }
+
+        assertTrue("이전 grant 의 요청이 새 계정으로 나갔다", moved)
+        assertEquals("보내지 않았어야 할 요청이 나갔다", 0, server.requestCount)
     }
 
     /**
@@ -297,7 +322,7 @@ class TopicSnapshotBootstrapServiceTest {
         var returned: TopicSnapshotOutcome? = null
 
         val outer = runCatching {
-            withTimeout(200) { returned = service(budget = 30.seconds).bootstrap(TETHER) }
+            withTimeout(200) { returned = service(budget = 30.seconds).bootstrap(owner(), TETHER) }
         }
 
         assertTrue(outer.exceptionOrNull() is TimeoutCancellationException)
@@ -316,7 +341,7 @@ class TopicSnapshotBootstrapServiceTest {
         server.enqueue(ok(TETHER_SNAPSHOT).setBodyDelay(3, TimeUnit.SECONDS))
         val startedAt = System.nanoTime()
 
-        val outcome = service(budget = 300.milliseconds).bootstrap(TETHER)
+        val outcome = service(budget = 300.milliseconds).bootstrap(owner(), TETHER)
         val elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000
 
         assertEquals(TopicSnapshotOutcome.TimedOut, outcome)
@@ -341,7 +366,7 @@ class TopicSnapshotBootstrapServiceTest {
         server.enqueue(ok(TETHER_SNAPSHOT).setBodyDelay(100, TimeUnit.MILLISECONDS))
         var outcome: TopicSnapshotOutcome? = null
 
-        val job = launch { outcome = service(budget = 300.milliseconds).bootstrap(TETHER) }
+        val job = launch { outcome = service(budget = 300.milliseconds).bootstrap(owner(), TETHER) }
         // Proof the attempt is in flight before the loop is taken away, rather than a sleep that
         // hopes so. `takeRequest` cannot be used for it: it blocks, and the loop it would block is
         // the one the attempt has not started on yet.
@@ -381,7 +406,7 @@ class TopicSnapshotBootstrapServiceTest {
         }
 
         val startedAt = TimeSource.Monotonic.markNow()
-        val pending = async(dispatcher) { service(budget = budget).bootstrap(TETHER) }
+        val pending = async(dispatcher) { service(budget = budget).bootstrap(owner(), TETHER) }
         // Queued behind the attempt's first dispatch, so it takes the worker the moment the attempt
         // parks on the socket.
         executor.submit {
@@ -418,6 +443,14 @@ class TopicSnapshotBootstrapServiceTest {
             dispatcher.close()
         }
     }
+
+    /**
+     * The grant a call binds itself to, read at the moment of the call.
+     *
+     * Taken from the transport rather than built by hand, so a test that moves the identity
+     * afterwards is moving it away from what the request actually captured.
+     */
+    private fun owner() = api.captureIdentityFence()
 
     private fun service(budget: Duration = 30.seconds) =
         TopicSnapshotBootstrapService(api, TopicFrameDecoder(NetworkModule.provideWireJson()), budget)

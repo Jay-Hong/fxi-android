@@ -1,5 +1,6 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.remote.dto.SubscriptionAck
@@ -104,7 +105,7 @@ class TopicSessionCoordinatorTest {
         fun closed() = listener!!.onClosed(socket, 1000, "bye")
     }
 
-    private class Harness(test: TestScope) {
+    private class Harness(test: TestScope, desired: Set<String> = setOf(TETHER, USD)) {
         val scheduler = test.testScheduler
         /**
          * `runTest`'s own background scope, not a scope of this harness's making.
@@ -141,6 +142,25 @@ class TopicSessionCoordinatorTest {
             override suspend fun refreshAfterUnauthorized(rejected: AuthSnapshot) = refreshed
         }
         val acknowledgements = mutableListOf<TopicCommandAcknowledgement>()
+
+        /** Every bootstrap the session issued, with the grant each one bound itself to. */
+        val bootstrapCalls = mutableListOf<Pair<AuthIdentityFence, String>>()
+
+        /** Held to keep one bootstrap in flight while the session moves on underneath it. */
+        var bootstrapGate: CompletableDeferred<Unit>? = null
+
+        /** Every bootstrap that got past the gate — which a cancelled one does not. */
+        val bootstrapFinished = mutableListOf<String>()
+
+        /**
+         * What the REST twin answers.
+         *
+         * Read **after** the gate, so a test can stage the answer while the request is held. The
+         * default is the answer a session with nothing staged should get: not a verdict.
+         */
+        var bootstrapOutcome: (String) -> TopicSnapshotOutcome = {
+            TopicSnapshotOutcome.Unreachable(java.io.IOException("nothing staged"))
+        }
 
         /** Every snapshot the session published, in order. */
         val topicStates = mutableListOf<TopicSubscriptionSnapshot>()
@@ -186,6 +206,12 @@ class TopicSessionCoordinatorTest {
                 }
             },
             credentials = credentials,
+            bootstrap = { owner, topic ->
+                bootstrapCalls += owner to topic
+                bootstrapGate?.await()
+                bootstrapFinished += topic
+                bootstrapOutcome(topic)
+            },
             store = store,
             encode = { request -> requests += request; "encoded-${request.requestId}" },
             newRequestId = { "r${requests.size + 1}" },
@@ -205,7 +231,7 @@ class TopicSessionCoordinatorTest {
                     }
                 }
             },
-            desired = setOf(TETHER, USD)
+            desired = desired
         )
 
         val wire: Wire get() = wires.last()
@@ -271,10 +297,13 @@ class TopicSessionCoordinatorTest {
         fun subscriptionError(requestId: String, code: String) =
             """{"type":"subscription_error","request_id":"$requestId","error":"$code"}"""
 
-        fun tetherFrame(rate: Double) =
+        fun tetherFrame(rate: Double, timestamp: String = "2026-08-31T10:20:00+09:00") =
             """{"type":"snapshot","version":1,"topic":"usdt:krw","data":{"usdt_krw":[
                {"source":"upbit","asset":"usdt-krw","rate":$rate,
-                "timestamp":"2026-08-31T10:20:00+09:00"}],"usd_krw_banks":[]}}"""
+                "timestamp":"$timestamp"}],"usd_krw_banks":[]}}"""
+
+        /** One bootstrap answer, decoded by the same decoder the socket path uses. */
+        fun delivered(text: String) = TopicSnapshotOutcome.Delivered(decode(text))
 
         fun dxyFrame(rate: Double) =
             """{"type":"snapshot","version":1,"topic":"dxy:spot","data":{"dxy":{
@@ -2618,6 +2647,513 @@ class TopicSessionCoordinatorTest {
             h.store.snapshot.stateFor(TETHER).deliveryState
         )
         assertEquals("만료된 lease 로 질문을 보냈다", 1, h.requests.size)
+        h.cleanUp()
+    }
+
+    // ---- the REST bootstrap ---------------------------------------------------------------------
+
+    /**
+     * The request carries the grant that was current when it was **decided**.
+     *
+     * Attaching a grant to the answer is not the same as binding the request to it, and this is the
+     * half that is easy to skip: the job runs later than the decision, so a service reading whoever
+     * is signed in at its own start would send under a grant nobody chose.
+     */
+    @Test
+    fun `a bootstrap is bound to the grant it was asked under`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        assertEquals(listOf(fence().identity to TETHER), h.bootstrapCalls)
+        h.cleanUp()
+    }
+
+    /**
+     * Two questions are asked before a request is spent, and both are asked on the loop.
+     *
+     * Being signed in is not enough — an offline session has nowhere to put the answer — and a
+     * topic this build does not consume has no reader for it. The third call is the control: with
+     * both conditions met the same ask does go out, so what the first two measure is the gate and
+     * not a session that never asks at all.
+     */
+    @Test
+    fun `a bootstrap is not spent on a session in no state to use it`() = runTest {
+        val h = Harness(this)
+        h.coordinator.start()
+        h.coordinator.setAccess(true, fence())
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertTrue("오프라인 세션이 요청을 썼다", h.bootstrapCalls.isEmpty())
+
+        h.coordinator.setOnline(true)
+        h.coordinator.requestBootstrap("krx:usd-krw-futures")
+        advanceTimeBy(100)
+        assertTrue("이 빌드가 읽지 않는 topic 을 물었다", h.bootstrapCalls.isEmpty())
+
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertEquals(listOf(fence().identity to TETHER), h.bootstrapCalls)
+        h.cleanUp()
+    }
+
+    /**
+     * A fence that comes back is still a grant that ended.
+     *
+     * **This one is deliberately artificial.** A real sign-out and sign-in raises the auth
+     * generation (`AuthSessionGenerationTracker.observe` bumps on a changed session marker, and
+     * the app's sign-out calls `invalidate` first), so the fence either side would differ and the
+     * transport would object on its own. What is staged here is the fence arriving *equal* anyway,
+     * from whatever cause, and what it locks is that the counter — not fence equality — is what
+     * decides. The withdrawal tests above are the same guard on a case that is not artificial.
+     */
+    @Test
+    fun `an answer authorised before a sign-out is discarded`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertEquals(1, h.bootstrapCalls.size)
+
+        h.coordinator.setAccess(false, null)
+        h.coordinator.setAccess(true, fence())
+        advanceTimeBy(100)
+
+        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue(
+            "지난 grant 의 답이 새 세션에 적용됐다",
+            h.coordinator.rates.value.quotes.isEmpty()
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * An answer authorised before access was withdrawn is not applied after it.
+     *
+     * The withdrawal here hands back the **same** fence, which is the shape a comparison of
+     * fences cannot see. Whether the entitlements layer ever sends that shape is not settled —
+     * it has no wiring to this coordinator yet — so what this locks is the contract rather than
+     * a claim about it: an access withdrawal, however it arrives, ends this session's claim on
+     * an answer authorised before it.
+     */
+    @Test
+    fun `an answer authorised before access was withdrawn is discarded`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertEquals(1, h.bootstrapCalls.size)
+
+        h.coordinator.setAccess(false, fence())
+        advanceTimeBy(100)
+
+        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue(
+            "접근이 철회된 세션에 프리미엄 값이 들어왔다",
+            h.coordinator.rates.value.quotes.isEmpty()
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * And a withdrawal that is granted again does not revive it.
+     *
+     * Both transitions keep the same fence, so nothing in this round trip is a grant change. An
+     * answer decided before the withdrawal belongs to the authority that ended, not to the one
+     * that was granted afterwards — which is what a bare "is access on now?" check would miss.
+     */
+    @Test
+    fun `an answer does not survive a withdrawal that is granted again`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        h.coordinator.setAccess(false, fence())
+        h.coordinator.setAccess(true, fence())
+        advanceTimeBy(100)
+
+        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue(
+            "철회를 왕복한 뒤 옛 답이 되살아났다",
+            h.coordinator.rates.value.quotes.isEmpty()
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * What the session consumes is fixed at construction, whatever the caller does after.
+     *
+     * `val` on the parameter stops the field being re-assigned and says nothing about the set's
+     * contents — a caller that hands in a `mutableSetOf` still holds the same object. Without the
+     * copy the answer path could no longer trust the check the issue made, and the missing
+     * re-check there would stop being sound. Found by review.
+     */
+    @Test
+    fun `the desired set is fixed at construction`() = runTest {
+        val caller = mutableSetOf(TETHER)
+        val h = Harness(this, desired = caller)
+        h.goLive()
+        advanceTimeBy(100)
+
+        caller.remove(TETHER)
+        caller.add("krx:usd-krw-futures")
+        h.coordinator.requestBootstrap(TETHER)
+        h.coordinator.requestBootstrap("krx:usd-krw-futures")
+        advanceTimeBy(100)
+
+        assertEquals(
+            "호출자가 바꾼 집합이 세션의 desired 를 바꿨다",
+            listOf(fence().identity to TETHER),
+            h.bootstrapCalls
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * A grant the socket refused does not get its data back through the other door.
+     *
+     * `premium_required` is a fact about the account, and the session latches it: it stops
+     * connecting and stops asking. Nothing about that is a transition the grant counter can see —
+     * the fence is the same one and access has not been withdrawn yet — so the counter passes an
+     * answer that raced the refusal. This is the check that does not.
+     */
+    @Test
+    fun `an answer for a grant the socket refused is discarded`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertEquals(1, h.bootstrapCalls.size)
+
+        h.wire.deliver(h.ack("r1", active = emptyList(), rejections = mapOf(TETHER to "premium_required")))
+        advanceTimeBy(1)
+
+        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue(
+            "거절된 grant 에 REST 로 값이 다시 들어왔다",
+            h.coordinator.rates.value.quotes.isEmpty()
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * A grant whose credential turned out to be somebody else's does not get its data either.
+     *
+     * The socket's own command discovers this — the provider answers with an account the
+     * connection was not opened for — and the session latches the grant as lost. Like the refusal
+     * above, no fence reaches this session and no access is withdrawn, so the counter sees
+     * nothing. The REST answer itself is unaffected: the fake here does not go through the bound
+     * credentials, which is what leaves the coordinator's own check as the only thing that can
+     * refuse it.
+     */
+    @Test
+    fun `an answer for a grant whose credential moved is discarded`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertEquals(1, h.bootstrapCalls.size)
+
+        h.credential = AuthSnapshot("u2", 1L, "token-2")
+        h.wire.open()
+        advanceTimeBy(10)
+
+        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue(
+            "신원이 사라진 grant 에 값이 들어왔다",
+            h.coordinator.rates.value.quotes.isEmpty()
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * The same answer, with the session standing still, **is** applied.
+     *
+     * Without this the discard above would pass on a bootstrap that never delivers anything.
+     */
+    @Test
+    fun `an answer from the grant still in force is applied`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertEquals(1390.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+        h.cleanUp()
+    }
+
+    /**
+     * A bootstrap delivers on a socket that never opened, and does not stand in for one that did.
+     *
+     * Both halves matter. The prices land with no frame anywhere in the session, which is the whole
+     * reason this path exists — and the canonical delivery state does not move, because the counter
+     * behind it is the socket's and the first-delivery watchdog reads it. A REST answer satisfying
+     * that watchdog would let a session that has never received a frame look like one that has.
+     */
+    @Test
+    fun `a bootstrap delivers without a socket and does not satisfy the watchdog`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals("소켓이 열렸다 — 이 시험의 전제가 아니다", 1, h.wires.size)
+
+        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        assertEquals(1390.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+        val tether = h.store.snapshot.stateFor(TETHER)
+        assertEquals("REST 답이 소켓 수신으로 세어졌다", 0L, tether.receiveGeneration)
+        assertEquals(
+            "REST 답이 최초 배달 감시를 충족시켰다",
+            TopicDeliveryState.NEVER_RECEIVED,
+            tether.deliveryState
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * D14's window is armed by a REST delivery exactly as by a socket one.
+     *
+     * Measured against the deadline that was already running: forty seconds into the first window,
+     * a bootstrap answers. The original deadline passes with no question, and the one the bootstrap
+     * armed produces it forty seconds later — which is the difference between arming the window and
+     * merely putting prices on screen.
+     */
+    @Test
+    fun `a bootstrap arms the silence window`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        advanceTimeBy(40_000)
+        h.bootstrapOutcome = {
+            h.delivered(h.tetherFrame(1391.0, timestamp = "2026-08-31T10:21:00+09:00"))
+        }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertEquals(
+            "새 값이 화면에 오르지 않았다",
+            1391.0,
+            h.coordinator.rates.value.quotes.values.single().rate,
+            0.0
+        )
+
+        advanceTimeBy(6_000)
+        assertEquals("REST 배달이 창을 다시 무장하지 않았다", 1, h.requests.size)
+
+        advanceTimeBy(40_000)
+        assertEquals("다시 무장한 창이 만료되지 않았다", 2, h.requests.size)
+        assertEquals(setOf(TETHER), h.requests[1].topics.toSet())
+        h.cleanUp()
+    }
+
+    /**
+     * A payload with no usable price arms nothing — the KRX-only shape included.
+     *
+     * After D8 an empty tether snapshot and one carrying only `usd_krw_futures` are the same bytes
+     * by the time they reach here, and D14 forbids the second satisfying tether delivery. The
+     * original window runs out on time, which is what says the bootstrap did not touch it.
+     */
+    @Test
+    fun `an empty bootstrap payload arms nothing`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        advanceTimeBy(40_000)
+        h.bootstrapOutcome = { h.delivered(h.emptyTetherFrame()) }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        advanceTimeBy(6_000)
+        assertEquals("빈 payload 가 창을 밀었다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A valid answer that is older than what is held changes no price and is still a delivery.
+     *
+     * The two facts are separate and this is the case that separates them: the merge rule refuses
+     * it, because equal or older never replaces, while the window counts it, because the server
+     * answered and that is what silence is about.
+     */
+    @Test
+    fun `a stale bootstrap payload overwrites nothing and still counts`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        advanceTimeBy(40_000)
+        h.bootstrapOutcome = {
+            h.delivered(h.tetherFrame(1234.0, timestamp = "2026-08-31T10:19:00+09:00"))
+        }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        assertEquals(
+            "오래된 값이 화면의 가격을 덮었다",
+            1390.0,
+            h.coordinator.rates.value.quotes.values.single().rate,
+            0.0
+        )
+        advanceTimeBy(6_000)
+        assertEquals("오래된 배달이 배달로 세어지지 않았다", 1, h.requests.size)
+        advanceTimeBy(40_000)
+        assertEquals(2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * The grant is read where the ask is decided, not where the job happens to start.
+     *
+     * The two are different turns of the same loop: the request is queued behind whatever else is
+     * waiting, and a job body that read the field for itself would send under whichever grant had
+     * arrived by then. Here a different account signs in between the two, and what the request
+     * carries is still the one that asked.
+     */
+    @Test
+    fun `a bootstrap does not follow the session to another grant`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+
+        h.coordinator.requestBootstrap(TETHER)
+        h.coordinator.setAccess(true, fence(uid = "u2", generation = 2L, epoch = "epoch-2"))
+        advanceTimeBy(100)
+
+        assertEquals(listOf(fence().identity to TETHER), h.bootstrapCalls)
+        h.cleanUp()
+    }
+
+    /**
+     * A bootstrap for another topic delivers its own prices and arms nothing.
+     *
+     * D14's window is tether's alone — FX has no time-based expiry at all — so an FX answer must
+     * not move a deadline it has no bearing on. The prices are the control: the answer was applied,
+     * and what it did not do is the subject.
+     */
+    @Test
+    fun `an fx bootstrap does not arm the tether window`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        advanceTimeBy(40_000)
+        h.bootstrapOutcome = { h.delivered(h.fxFrame(1390.0)) }
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(1)
+        assertEquals("FX bootstrap 이 가격을 넣지 않았다", 2, h.coordinator.rates.value.quotes.size)
+
+        advanceTimeBy(6_000)
+        assertEquals("FX bootstrap 이 tether 창을 밀었다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** A stopped session lets go of the request it was still paying for. */
+    @Test
+    fun `stopping lets go of a bootstrap still out`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertEquals(1, h.bootstrapCalls.size)
+
+        h.coordinator.stop()
+        advanceTimeBy(1)
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue("멈춘 세션이 요청을 끝까지 붙들었다", h.bootstrapFinished.isEmpty())
+        h.cleanUp()
+    }
+
+    /**
+     * An identity change during a bootstrap is not an answer, and does not take the session with it.
+     *
+     * The transport raises it when the account it captured is no longer signed in. Nothing about
+     * the topic has been learned, so nothing is recorded — and the next ask still works, which is
+     * what says the failure stayed inside its own job.
+     */
+    @Test
+    fun `an identity change during a bootstrap leaves the session working`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+
+        h.bootstrapOutcome = { throw AuthIdentityChangedException() }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertTrue("계정이 바뀐 요청이 값을 남겼다", h.coordinator.rates.value.quotes.isEmpty())
+
+        h.bootstrapOutcome = { h.delivered(h.tetherFrame(1390.0)) }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertEquals(1390.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+        h.cleanUp()
+    }
+
+    /**
+     * Everything that is not a delivery leaves the session exactly as it was.
+     *
+     * A dormant endpoint is the sharpest of them: it is answered before authentication, so it says
+     * nothing about this user or this topic — and it is a 404, which a path reading statuses rather
+     * than bodies could read as an absence worth recording. Nothing is recorded, and the window
+     * that was already running keeps its own deadline.
+     */
+    @Test
+    fun `a refusal is not a delivery`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        advanceTimeBy(40_000)
+        h.bootstrapOutcome = { TopicSnapshotOutcome.Dormant }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        assertEquals(
+            "거절이 가격을 바꿨다",
+            1390.0,
+            h.coordinator.rates.value.quotes.values.single().rate,
+            0.0
+        )
+        advanceTimeBy(6_000)
+        assertEquals("거절이 창을 밀었다", 2, h.requests.size)
         h.cleanUp()
     }
 }
