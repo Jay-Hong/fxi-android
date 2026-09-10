@@ -242,7 +242,7 @@ class TopicMessageTest {
     /**
      * A number that cannot be a price does not become one.
      *
-     * I5 (`ANDROID_V2_PLAN.md:142`) puts value sanity at the domain conversion, because strict wire
+     * I5 (`ANDROID_V2_PLAN.md`) puts value sanity at the domain conversion, because strict wire
      * decoding has no reason to object: `-1` is a valid JSON number and a valid `Double`. Past this
      * line it would be a quote, and the strictly-newer merge would let it over a real one the
      * moment its clock was newer. Rejected one entry at a time — a topic snapshot is a list of

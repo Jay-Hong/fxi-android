@@ -280,7 +280,7 @@ class TopicSubscribeCommandTest {
     /**
      * The acknowledgement proves the command was heard and buys no more time to arrive in.
      *
-     * `ANDROID_V2_PLAN.md:852-854` calls the delivery deadline absolute, and this is what absolute
+     * `ANDROID_V2_PLAN.md §7 S3` calls the delivery deadline absolute, and this is what absolute
      * means: an ACK at nineteen seconds still leaves twenty-six, not another forty-five.
      */
     @Test
@@ -887,7 +887,7 @@ class TopicSubscribeCommandTest {
     /**
      * A half-written lease fails the whole control frame closed.
      *
-     * Not the topic, and not the lease alone: `ANDROID_V2_PLAN.md:860-863` says the store does not
+     * Not the topic, and not the lease alone: `ANDROID_V2_PLAN.md §7 S3` says the store does not
      * move. So the request stays pending and its ACK deadline decides — the same as never having
      * been answered, which is the safe reading of an answer this client could not parse.
      */

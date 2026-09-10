@@ -268,7 +268,7 @@ class FreeSnapshotSchedulerTest {
     // --- the three-way apply -------------------------------------------------------------------------
 
     /**
-     * `ANDROID_V2_PLAN.md:836` — "동일 `as_of`라도 새 `refresh_not_before` 반영", and iOS carries the
+     * `ANDROID_V2_PLAN.md §7 S2` — "동일 `as_of`라도 새 `refresh_not_before` 반영", and iOS carries the
      * same rule as a Blocker comment: the data may be reused but **the response is replaced**,
      * because `refresh_not_before` is derived from the server's serve-time clock and moves even when
      * the snapshot does not. Keeping the old response would schedule from a hint already in the
@@ -604,7 +604,7 @@ class FreeSnapshotSchedulerTest {
         }
     }
 
-    // --- warming the other periods (ANDROID_V2_PLAN.md:833) --------------------------------------
+    // --- warming the other periods (ANDROID_V2_PLAN.md §7 S2) --------------------------------------
 
     /**
      * The selected period first, then its siblings one at a time in enum order. Sequential matters:

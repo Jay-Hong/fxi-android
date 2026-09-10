@@ -34,20 +34,20 @@ class BackupRulesLedgerTest {
         // namespace that never existed there.
         "fxi_access_epoch" to false,
 
-        // v1, with **no UID at all**. `ANDROID_V2_PLAN.md:817-818` requires that a backup restore
+        // v1, with **no UID at all**. `ANDROID_V2_PLAN.md §7 S1.5` requires that a backup restore
         // not attribute v1 bank preferences to another UID, and a file that never recorded one
         // cannot help doing exactly that. Excluded here, and deleted outright on start — see
         // `RetiredStores`, and `theRetiredStoresAreAlsoKeptOutOfBackup` below for why both.
         "fxi_bank_preferences" to false,
 
-        // v1, no UID either, and the same shape of problem — but `ANDROID_V2_PLAN.md:1226` already
+        // v1, no UID either, and the same shape of problem — but `ANDROID_V2_PLAN.md §9.1` already
         // hands it to **S4**, with the Graph V2 cutover. Recorded rather than changed here: a slice
         // that was not asked to own it should not quietly decide it.
         "fxi_graph_preferences" to true,
 
         // The legacy paid surface's cache, reached only through `MainScreen`, which has no caller.
-        // Two slices share it: `ANDROID_V2_PLAN.md:1223` gives `rates`/`rates_timestamp` to **S3**
-        // and `:1224` gives `last_bank_*` to **S7**. Neither is this slice.
+        // Two slices share it: `ANDROID_V2_PLAN.md` §9.1 gives `rates`/`rates_timestamp` to **S3**
+        // and `last_bank_*` to **S7**. Neither is this slice.
         "fxi_cache" to true
     )
 

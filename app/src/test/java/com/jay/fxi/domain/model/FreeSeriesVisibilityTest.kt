@@ -39,7 +39,7 @@ class FreeSeriesVisibilityTest {
     }
 
     /**
-     * `ANDROID_V2_PLAN.md:839` — the tether tab's spot and futures dollar indices are mutually
+     * `ANDROID_V2_PLAN.md §7 S2` — the tether tab's spot and futures dollar indices are mutually
      * exclusive. Turning one *on* displaces the other; turning one *off* must not summon it, or
      * all-off would be unreachable on that tab.
      */

@@ -60,7 +60,7 @@ class RateRowPreferenceCodecTest {
      *
      * The disk is not something this build wrote — the file survives updates and, by D27, travels
      * between devices. Downstream treats the answer as distinct: the sheet keys its rows by code,
-     * so a repeat would draw one row twice and then throw. `ANDROID_V2_PLAN.md:812` asks for dedup
+     * so a repeat would draw one row twice and then throw. `ANDROID_V2_PLAN.md §7 S1.5` asks for dedup
      * with the relative order kept, and first-occurrence is what keeps it. Found by review.
      */
     @Test

@@ -17,7 +17,7 @@ class RateRowRosterTest {
     private val fxPayload = listOf("investing", "kb", "hana", "shinhan", "woori", "ibk", "nh", "sc", "bs", "citi")
     private val exchanges = listOf("upbit", "bithumb", "coinone", "korbit", "gopax")
 
-    /** `ANDROID_V2_PLAN.md:813` — and only Citi, so a future addition here is a deliberate one. */
+    /** `ANDROID_V2_PLAN.md §7 S1.5` — and only Citi, so a future addition here is a deliberate one. */
     @Test
     fun citiIsTheOnlyBankAFreshInstallHides() {
         assertEquals(setOf("citi"), RateRowRoster.hiddenByDefault(RateRowList.FX_BANKS))

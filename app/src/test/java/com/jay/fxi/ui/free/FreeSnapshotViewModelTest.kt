@@ -280,7 +280,7 @@ class FreeSnapshotViewModelTest {
     }
 
     /**
-     * `ANDROID_V2_PLAN.md:843` — the row opens where this UID left it, and on 달러 for anyone else.
+     * `ANDROID_V2_PLAN.md §7 S2` — the row opens where this UID left it, and on 달러 for anyone else.
      * The owner is stored beside the value precisely so a second account cannot inherit the first
      * one's tab.
      */
@@ -370,7 +370,7 @@ class FreeSnapshotViewModelTest {
     /**
      * Citi does not reach the screen on a fresh install, and everything else does.
      *
-     * `ANDROID_V2_PLAN.md:813` — "Citi는 신규 표시 기본에서 제외". The sanitizer admits Citi on
+     * `ANDROID_V2_PLAN.md §7 S1.5` — "Citi는 신규 표시 기본에서 제외". The sanitizer admits Citi on
      * purpose, so this is a default and not a ban; what it must not be is silent, which is why the
      * assertion is here at the screen state rather than only in the projection's own tests.
      */
@@ -645,7 +645,7 @@ class FreeSnapshotViewModelTest {
     }
 
     /**
-     * `ANDROID_V2_PLAN.md:839`. The defaults match iOS's `FreeCurrencyConfig`. Binding alone must
+     * `ANDROID_V2_PLAN.md §7 S2`. The defaults match iOS's `FreeCurrencyConfig`. Binding alone must
      * not persist the resolved default; the first toggle persists the resulting selection,
      * including an empty set when everything is off.
      */
