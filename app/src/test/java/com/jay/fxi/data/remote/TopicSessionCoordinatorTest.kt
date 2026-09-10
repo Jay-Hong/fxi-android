@@ -154,6 +154,9 @@ class TopicSessionCoordinatorTest {
         /** Every bootstrap that got past the gate — which a cancelled one does not. */
         val bootstrapFinished = mutableListOf<String>()
 
+        /** Transport-level HTTP evidence handed out ahead of the grant filter. */
+        val bootstrapEvidence = mutableListOf<Pair<Int?, String?>>()
+
         /** Every non-delivery handed over, with the grant the session named for it. */
         val undelivered = mutableListOf<Triple<TopicSessionFence, String, TopicSnapshotOutcome>>()
 
@@ -200,6 +203,19 @@ class TopicSessionCoordinatorTest {
 
         val decode = TopicFrameDecoder(Json { ignoreUnknownKeys = true })::decode
 
+        /**
+         * Who Firebase would say is signed in, right now.
+         *
+         * [setAccess] moves this with the grant as a **fixture convenience, not a production
+         * invariant**: live identity and a queued `Access` really can differ, at the same uid
+         * included. A test of that boundary sets this on its own and calls
+         * `coordinator.setAccess` directly, so that granting does not also move the identity.
+         */
+        var liveFence: AuthIdentityFence? = fence().identity
+
+        /** How many times the session actually observed the identity. Counted, not assumed. */
+        var liveIdentityReads = 0
+
         val coordinator = TopicSessionCoordinator(
             scope = scope,
             clock = clock,
@@ -229,6 +245,8 @@ class TopicSessionCoordinatorTest {
             encode = { request -> requests += request; "encoded-${request.requestId}" },
             newRequestId = { "r${requests.size + 1}" },
             jitter = { jitterUnit },
+            liveIdentity = { liveIdentityReads++; liveFence },
+            onBootstrapHttpEvidence = { status, retryAfter -> bootstrapEvidence += status to retryAfter },
             onRejected = { rejected += it },
             onAcknowledgement = {
                 acknowledgements += it
@@ -252,9 +270,20 @@ class TopicSessionCoordinatorTest {
 
         val wire: Wire get() = wires.last()
 
+        /**
+         * Grants access **and** moves the live identity with it.
+         *
+         * Every test that does not care about the apply-time identity check goes through here, so
+         * the check is invisible to them; the ones that do care set [liveFence] afterwards.
+         */
+        fun setAccess(allowed: Boolean, granted: TopicSessionFence?) {
+            liveFence = granted?.identity
+            coordinator.setAccess(allowed, granted)
+        }
+
         fun goLive() {
             coordinator.start()
-            coordinator.setAccess(true, fence())
+            setAccess(true, fence())
             coordinator.setOnline(true)
         }
 
@@ -337,7 +366,7 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(100)
         assertEquals("권한 없이 연결했다", 0, h.wires.size)
 
-        h.coordinator.setAccess(true, fence())
+        h.setAccess(true, fence())
         advanceTimeBy(100)
         assertEquals(1, h.wires.size)
         h.cleanUp()
@@ -642,7 +671,7 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(1)
         assertEquals(1, h.coordinator.rates.value.quotes.size)
 
-        h.coordinator.setAccess(true, fence(uid = "u2"))
+        h.setAccess(true, fence(uid = "u2"))
         advanceTimeBy(1)
         assertTrue("앞 grant 의 소켓이 살아 있다", h.wires[0].cancelled)
         assertEquals("앞 grant 의 시세가 남았다", 0, h.coordinator.rates.value.quotes.size)
@@ -837,7 +866,7 @@ class TopicSessionCoordinatorTest {
         val first = h.wire
 
         first.deliver(h.tetherFrame(1390.0))
-        h.coordinator.setAccess(true, fence(uid = "u2"))
+        h.setAccess(true, fence(uid = "u2"))
         advanceTimeBy(1)
 
         assertEquals("앞 grant 로 온 프레임이 새 세션에 남았다", 0, h.coordinator.rates.value.quotes.size)
@@ -922,7 +951,7 @@ class TopicSessionCoordinatorTest {
         assertEquals(1, h.requests.size)
 
         // …and a different grant is a different question.
-        h.coordinator.setAccess(true, fence(uid = "u2"))
+        h.setAccess(true, fence(uid = "u2"))
         h.credential = AuthSnapshot("u2", 1L, "token-2")
         advanceTimeBy(100)
         assertEquals(2, h.wires.size)
@@ -940,7 +969,7 @@ class TopicSessionCoordinatorTest {
         h.wire.drop()
         advanceTimeBy(1)
 
-        repeat(3) { h.coordinator.setAccess(true, fence()) }
+        repeat(3) { h.setAccess(true, fence()) }
         advanceTimeBy(1)
         assertEquals("같은 grant 반복이 곧바로 다시 연결했다", 1, h.wires.size)
         h.cleanUp()
@@ -1203,7 +1232,7 @@ class TopicSessionCoordinatorTest {
 
         // A grant that is actually signed in is a different question.
         h.credential = AuthSnapshot("u3", 1L, "token-3")
-        h.coordinator.setAccess(true, fence(uid = "u3"))
+        h.setAccess(true, fence(uid = "u3"))
         advanceTimeBy(100)
         assertEquals(2, h.wires.size)
         h.cleanUp()
@@ -1939,7 +1968,7 @@ class TopicSessionCoordinatorTest {
         silenceReady(h)
 
         h.credential = AuthSnapshot("u2", 2L, "token-2")
-        h.coordinator.setAccess(true, fence(uid = "u2", generation = 2L))
+        h.setAccess(true, fence(uid = "u2", generation = 2L))
         advanceTimeBy(100)
         h.wire.open()
         advanceTimeBy(1)
@@ -2044,7 +2073,7 @@ class TopicSessionCoordinatorTest {
         silenceReady(h)
 
         h.credential = AuthSnapshot("u2", 2L, "token-2")
-        h.coordinator.setAccess(true, fence(uid = "u2", generation = 2L))
+        h.setAccess(true, fence(uid = "u2", generation = 2L))
         advanceTimeBy(100)
         h.wire.open()
         advanceTimeBy(1)
@@ -2701,7 +2730,7 @@ class TopicSessionCoordinatorTest {
     fun `a bootstrap is not spent on a session in no state to use it`() = runTest {
         val h = Harness(this)
         h.coordinator.start()
-        h.coordinator.setAccess(true, fence())
+        h.setAccess(true, fence())
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(100)
         assertTrue("오프라인 세션이 요청을 썼다", h.bootstrapCalls.isEmpty())
@@ -2744,8 +2773,8 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(1)
         assertEquals(issued + 1, h.bootstrapCalls.size)
 
-        h.coordinator.setAccess(false, null)
-        h.coordinator.setAccess(true, fence())
+        h.setAccess(false, null)
+        h.setAccess(true, fence())
         advanceTimeBy(100)
 
         // 보류된 그 발행 하나만 값을 낸다 — 세션이 스스로 무엇을 더 묻게 되더라도 이 단정이
@@ -2788,7 +2817,7 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(1)
         assertEquals(issued + 1, h.bootstrapCalls.size)
 
-        h.coordinator.setAccess(false, fence())
+        h.setAccess(false, fence())
         advanceTimeBy(100)
 
         // 보류된 그 발행 하나만 값을 낸다 — 세션이 스스로 무엇을 더 묻게 되더라도 이 단정이
@@ -2828,8 +2857,8 @@ class TopicSessionCoordinatorTest {
         h.coordinator.requestBootstrap(TETHER)
         advanceTimeBy(1)
 
-        h.coordinator.setAccess(false, fence())
-        h.coordinator.setAccess(true, fence())
+        h.setAccess(false, fence())
+        h.setAccess(true, fence())
         advanceTimeBy(100)
 
         // 보류된 그 발행 하나만 값을 낸다 — 세션이 스스로 무엇을 더 묻게 되더라도 이 단정이
@@ -3110,7 +3139,7 @@ class TopicSessionCoordinatorTest {
 
         val issued = h.bootstrapCalls.size
         h.coordinator.requestBootstrap(TETHER)
-        h.coordinator.setAccess(true, fence(uid = "u2", generation = 2L, epoch = "epoch-2"))
+        h.setAccess(true, fence(uid = "u2", generation = 2L, epoch = "epoch-2"))
         advanceTimeBy(100)
 
         // 이 시험이 낸 **첫** 발행만이 대상이다. 두 번째 grant 가 스스로 무엇을 묻든 그것은
@@ -3300,8 +3329,8 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(1)
         val before = h.undelivered.size
 
-        h.coordinator.setAccess(false, null)
-        h.coordinator.setAccess(true, fence())
+        h.setAccess(false, null)
+        h.setAccess(true, fence())
         advanceTimeBy(100)
 
         h.bootstrapOutcome = { issue, _ ->
@@ -3430,7 +3459,7 @@ class TopicSessionCoordinatorTest {
         val h = Harness(this)
         val mine = fence(uid = "u9", generation = 4L, epoch = "epoch-9")
         h.coordinator.start()
-        h.coordinator.setAccess(true, mine)
+        h.setAccess(true, mine)
         h.coordinator.setOnline(true)
         advanceTimeBy(100)
         val before = h.undelivered.size
@@ -3478,7 +3507,7 @@ class TopicSessionCoordinatorTest {
     fun `a grant that arrives before the network asks when the network arrives`() = runTest {
         val h = Harness(this)
         h.coordinator.start()
-        h.coordinator.setAccess(true, fence())
+        h.setAccess(true, fence())
         advanceTimeBy(100)
         assertTrue("네트워크가 없는데 요청을 썼다", h.bootstrapCalls.isEmpty())
 
@@ -3504,7 +3533,7 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(100)
         assertTrue("권한이 없는데 요청을 썼다", h.bootstrapCalls.isEmpty())
 
-        h.coordinator.setAccess(true, fence())
+        h.setAccess(true, fence())
         advanceTimeBy(100)
 
         assertEquals(setOf(TETHER, USD), h.bootstrapCalls.map { it.second }.toSet())
@@ -3541,9 +3570,9 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(100)
         val asked = h.bootstrapCalls.size
 
-        h.coordinator.setAccess(false, fence())
+        h.setAccess(false, fence())
         advanceTimeBy(100)
-        h.coordinator.setAccess(true, fence())
+        h.setAccess(true, fence())
         advanceTimeBy(100)
 
         assertEquals(
@@ -3598,6 +3627,209 @@ class TopicSessionCoordinatorTest {
         assertEquals("재연결이 일어나지 않아 이 시험이 아무것도 재지 않는다", 2, h.wires.size)
 
         assertEquals("재연결마다 다시 물었다", asked, h.bootstrapCalls.size)
+        h.cleanUp()
+    }
+
+    // ---- the apply-time live identity boundary (L-4a) -------------------------------------------
+
+    /**
+     * An answer that arrives after the account moved is not this session's to apply.
+     *
+     * The three filters above it read state the loop was *told* about — the grant counter and the
+     * two latches. None has heard of a move that has not been dequeued, and some moves never
+     * arrive as an `Access` at all: `AuthUidStream` carries a bare uid, while `authGeneration`
+     * also advances on the explicit invalidation the real sign-in path runs before Firebase does
+     * anything.
+     */
+    @Test
+    fun `a bootstrap answer is refused when the account moved while it was out`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.tetherFrame(1390.0)) }
+        val gate = CompletableDeferred<Unit>()
+        h.bootstrapGate = gate
+        // A delta, not a count: this session's own fan-out already finished two on the way here.
+        val finished = h.bootstrapFinished.size
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertEquals("답이 붙들리지 않아 이 시험이 창을 재지 못한다", finished, h.bootstrapFinished.size)
+
+        // No `Access` — this is precisely the move the loop is never told about.
+        h.liveFence = AuthIdentityFence("u2", 1L)
+        gate.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue("떠난 계정의 답이 적용됐다", h.coordinator.rates.value.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    /**
+     * A frame in the same position retires the socket rather than being dropped.
+     *
+     * Dropping frame after frame on a connection that stays up starves the delivery evidence
+     * `receive` records, and D14's silence window would then file an account moving as the topic
+     * going quiet. Retiring is the same sequence a command's own identity report runs.
+     */
+    @Test
+    fun `identity loss retires an armed session until a new grant arrives`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+        val first = h.wire
+        val sockets = h.wires.size
+        val requests = h.requests.size
+        val rates = h.coordinator.rates.value
+        val received = h.store.snapshot.stateFor(TETHER).receiveGeneration
+        val published = h.topicStates.size
+
+        h.liveFence = null
+        first.deliver(h.tetherFrame(1400.0))
+        advanceTimeBy(1)
+
+        assertTrue("신원 상실을 관측한 턴에 소켓을 닫지 않았다", first.cancelled)
+        assertEquals("거절한 프레임이 가격을 바꿨다", rates, h.coordinator.rates.value)
+        assertEquals(received, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+
+        // A live identity can come back before `Access` catches up, so the wrapper is deliberately
+        // not used here: granting must not be what moves the identity.
+        h.liveFence = AuthIdentityFence("u1", 3L)
+        h.credential = AuthSnapshot("u1", 3L, "token-3")
+        h.coordinator.setAccess(true, fence())
+        h.coordinator.setForeground(true)
+        advanceTimeBy(120_000)
+
+        assertEquals("은퇴한 grant 로 다시 연결했다", sockets, h.wires.size)
+        assertEquals("신원 상실 뒤 침묵을 재검증했다", requests, h.requests.size)
+        assertTrue(
+            "신원 상실이 topic 저하로 기록됐다",
+            h.topicStates.drop(published).none {
+                it.stateFor(TETHER).deliveryState in setOf(
+                    TopicDeliveryState.SUSPECT,
+                    TopicDeliveryState.REVALIDATING,
+                    TopicDeliveryState.DEGRADED
+                )
+            }
+        )
+
+        h.coordinator.setAccess(true, fence(generation = 3L))
+        advanceTimeBy(100)
+        assertEquals("새 grant 로 복구하지 못했다", sockets + 1, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1400.0))
+        advanceTimeBy(1)
+        assertEquals(1L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        assertTrue(h.coordinator.rates.value.quotes.isNotEmpty())
+        h.cleanUp()
+    }
+
+    /**
+     * The observation is not free, so a frame this session was never going to consume must not
+     * pay for it: `liveIdentity` reconciles Firebase with the auth tracker and can advance its
+     * generation. Counted rather than argued.
+     */
+    @Test
+    fun `a frame this session does not consume never reads the live identity`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val reads = h.liveIdentityReads
+
+        h.wire.deliver(h.dxyFrame(99.0))
+        advanceTimeBy(1)
+
+        assertEquals("구독하지 않는 topic 이 신원 관측을 구동했다", reads, h.liveIdentityReads)
+        h.cleanUp()
+    }
+
+    /**
+     * Same uid, same Firebase user object — and still a different session.
+     *
+     * `AuthSessionGenerationTracker.invalidate` advances the generation on an explicit call, and
+     * `AuthTransitionCoordinator` runs exactly that before a sign-in starts. A check keyed on the
+     * uid alone would admit the answer the previous session was owed.
+     */
+    @Test
+    fun `the same account with a rotated generation is still a different session`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+
+        h.liveFence = AuthIdentityFence("u1", 2L)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+
+        assertTrue("generation 만 오른 전이를 같은 세션으로 읽었다", h.coordinator.rates.value.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    /**
+     * The body is refused, the rate limit is not — and a refusal with no HTTP answer invents none.
+     *
+     * The limit was levied on the transport by address; it outlives the credential that happened
+     * to carry it. The bare identity change is the control: both fields are null there, and a
+     * seam that fired anyway would tell a floor owner a window exists that never did.
+     */
+    @Test
+    fun `an identity change carries the rate limit out and a bare one carries nothing`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val before = h.bootstrapEvidence.size
+
+        h.bootstrapOutcome = { _, _ ->
+            throw AuthIdentityChangedException(statusCode = 429, retryAfter = "30")
+        }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertEquals(
+            "서버가 닫은 창을 신원 변경과 함께 버렸다",
+            listOf<Pair<Int?, String?>>(429 to "30"),
+            h.bootstrapEvidence.drop(before)
+        )
+
+        val after = h.bootstrapEvidence.size
+        h.bootstrapOutcome = { _, _ -> throw AuthIdentityChangedException() }
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(100)
+        assertEquals("HTTP 답이 없었는데 증거가 생겼다", after, h.bootstrapEvidence.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A refusal's evidence outlives the grant that asked for it.
+     *
+     * The grant filter drops the whole outcome, and the retry floor would go down with it — which
+     * is how the next session arrives inside a window the server explicitly closed. So the
+     * evidence leaves the job before the filter, and the hand-off still does not happen.
+     */
+    @Test
+    fun `a refusal's evidence survives the grant that asked for it ending`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapOutcome = { _, _ -> refusal(429, """{"error":"slow down"}""", retryAfter = "60") }
+        val gate = CompletableDeferred<Unit>()
+        h.bootstrapGate = gate
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        val handed = h.undelivered.size
+        val evidence = h.bootstrapEvidence.size
+
+        h.setAccess(false, fence())
+        gate.complete(Unit)
+        advanceTimeBy(100)
+
+        assertEquals("끝난 grant 의 답이 밖으로 보고됐다", handed, h.undelivered.size)
+        assertEquals(
+            "주소에 매겨진 한도를 grant 와 함께 버렸다",
+            listOf<Pair<Int?, String?>>(429 to "60"),
+            h.bootstrapEvidence.drop(evidence)
+        )
         h.cleanUp()
     }
 

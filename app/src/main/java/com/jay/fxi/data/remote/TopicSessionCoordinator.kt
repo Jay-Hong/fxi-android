@@ -252,6 +252,34 @@ class TopicSessionCoordinator(
     private val encode: (TopicSubscribeRequest) -> String,
     private val newRequestId: () -> String,
     private val jitter: () -> Double,
+    /**
+     * Synchronous observation, not a pure getter. In production this reconciles Firebase's
+     * current user with the auth tracker and may advance its generation.
+     *
+     * Read at the guarded apply boundary; do not substitute a cached Access input.
+     * A mismatch, including `null`, retires the current grant, and repeating its `Access` input
+     * does not restore it. Runtime wiring must therefore observe auth-generation changes
+     * independently of bare-uid deduplication and obtain a valid grant for the current identity
+     * before it supplies a new `Access` fence; `AuthAccessBinder` alone does not guarantee that.
+     *
+     * This is also not a global identity monitor: a timer or a command result can run before any
+     * guarded data input observes the loss. It does not validate live access revocation, guard
+     * command ACK application, or authorize deferred callbacks. Those, and generation-aware grant
+     * recovery, remain prerequisites for runtime wiring.
+     */
+    private val liveIdentity: () -> AuthIdentityFence?,
+    /**
+     * HTTP evidence observed before grant filtering, including identity-change failures.
+     * Called only when at least one evidence field exists.
+     *
+     * Synchronous and non-throwing. The attached sink owns retry-floor recording;
+     * [onBootstrapUndelivered] may later receive the same `Refused` outcome for its
+     * owner-bound handling, but must not apply that response's retry floor again.
+     * Runtime wiring must attach a floor owner before requests are enabled, and the
+     * default below is only honest while nothing is wired.
+     */
+    private val onBootstrapHttpEvidence: (statusCode: Int?, retryAfter: String?) -> Unit =
+        { _, _ -> },
     /** Refusals, handed over as they arrive rather than when the command finishes. */
     private val onRejected: (Map<String, TopicRejectionReason>) -> Unit = {},
     /**
@@ -660,6 +688,10 @@ class TopicSessionCoordinator(
                 // second reading of the fence, it is the first — and it is where the null goes,
                 // because a session with nobody signed in has raised the counter on its way out.
                 val owner = fence ?: return
+                // The epoch above and the latches below only read state this loop was told
+                // about. Observe the account itself before applying an answer whose identity may
+                // have moved without an `Access` input.
+                if (!enforceLiveIdentity(owner)) return
                 // Two facts the counter cannot see, because neither arrives as a transition: the
                 // server refusing this grant on the socket, and the credential turning out to be
                 // somebody else's. The session has already stopped acting on the grant in both,
@@ -713,13 +745,13 @@ class TopicSessionCoordinator(
             }
 
             is SessionInput.CommandIdentityChanged -> current(input.generation)?.let { live ->
-                // Deliberate: the socket was opened for a grant that is no longer signed in, so
-                // there is nothing to reconnect *to* until an `Access` says who is. No ladder,
-                // and no new command. The commands are left for `end` to cancel: this connection
-                // may be running a renewal beside the one that threw.
-                identityLostFor = live.fence
-                end(live, TopicDisconnectCause.DELIBERATE)
-                cancelReconnect()
+                // Deliberate, and no ladder: the socket was opened for a grant that is no longer
+                // signed in, so there is nothing to reconnect *to* until an `Access` says who is.
+                // The commands are left for `end` to cancel — this connection may be running a
+                // renewal beside the one that threw. `retireIdentity` is that whole sequence, and
+                // sharing it is what keeps a command's report and an apply-time mismatch from
+                // being two different meanings of the same event.
+                retireIdentity(live.fence)
             }
 
             is SessionInput.ConnectOverdue -> current(input.generation)?.let { live ->
@@ -807,6 +839,47 @@ class TopicSessionCoordinator(
     /** The live connection, or `null` when [generation] belongs to one already gone. */
     private fun current(generation: Long): Connection? =
         connection?.takeIf { it.generation == generation && !it.ended }
+
+    /**
+     * Whether [owner] is still who is signed in, retiring the session's grant when it is not.
+     *
+     * The counter and the two latches all read state this loop was *told* about; this reads the
+     * identity itself. Between the transport's own post-response check and the turn that applies
+     * the answer, the account can move without an `Access` having been dequeued — and some moves
+     * never produce one at all, because `AuthUidStream` carries a bare uid while `authGeneration`
+     * also advances through `advanceGenerationBeforeSignIn()`, which the tracked sign-in path
+     * calls before the Firebase operation.
+     *
+     * A mismatch retires rather than merely refuses: refusing frame after frame on a socket that
+     * stays up starves the delivery evidence `receive` records and lets D14's silence window fire,
+     * which would file an identity move as a topic going quiet.
+     */
+    private fun enforceLiveIdentity(owner: TopicSessionFence): Boolean {
+        if (liveIdentity() == owner.identity) return true
+        retireIdentity(owner)
+        return false
+    }
+
+    /**
+     * Retires the current grant after an observed identity loss.
+     *
+     * Every caller runs on the loop holding the current fence: the bootstrap answer reads it
+     * directly, and a connection input has already been through `current()`, which an `Access`
+     * that replaced the fence would have ended the socket for. So there is no owner here that is
+     * not this loop's — a `fence != owner` term would be a guard on a state that cannot arrive.
+     *
+     * The latch is what stops this grant being reopened; repeated retirement needs no further
+     * cleanup, and `cancelReconnect` releases a pending timer *and* invalidates an event it has
+     * already queued.
+     */
+    private fun retireIdentity(owner: TopicSessionFence) {
+        if (identityLostFor == owner) return
+        identityLostFor = owner
+        connection?.takeIf { it.fence == owner }?.let {
+            end(it, TopicDisconnectCause.DELIBERATE)
+        }
+        cancelReconnect()
+    }
 
     /**
      * Whether a socket should be open at all.
@@ -964,6 +1037,10 @@ class TopicSessionCoordinator(
      */
     private fun accepts(live: Connection, topic: String): Boolean {
         if (topic !in desired) return false
+        // After the cheap, pure check: `liveIdentity` reconciles Firebase with the auth tracker
+        // and can advance its generation, so a frame this session was never going to consume
+        // must not be what drives it.
+        if (!enforceLiveIdentity(live.fence)) return false
         if (enforceLeaseExpiry(live)) return false
         val snapshot = store.snapshot
         if (snapshot.authResolution == TopicAuthResolution.FAILED) return false
@@ -1292,10 +1369,22 @@ class TopicSessionCoordinator(
             val outcome = try {
                 bootstrap(owner, topic)
             } catch (moved: AuthIdentityChangedException) {
-                // Not an answer about the topic: the account it was authorised for is not signed
-                // in any more. The session learns that from `Access`, and posting anything here
-                // would be this path inventing a verdict the server never gave.
+                // The answer is refused, the rate limit is not: it was levied on the transport by
+                // address and outlives the credential that carried it. Handed over here, ahead of
+                // the grant filter, because that filter drops the whole outcome.
+                if (moved.statusCode != null || moved.retryAfter != null) {
+                    onBootstrapHttpEvidence(moved.statusCode, moved.retryAfter)
+                }
+                // This exception carries no topic verdict. Identity propagation and recovery
+                // need the runtime auth bridge — a bare-uid `Access` notification can miss the
+                // move — so do not turn it into a topic outcome the server never gave.
                 return@launch
+            }
+            // Same reason, on the path that returns instead of throwing: a `Refused` carries
+            // the status and `Retry-After` the server did mean, and the grant filter would take
+            // them down with the outcome. No guard — an HTTP failure always has a status.
+            (outcome as? TopicSnapshotOutcome.Refused)?.failure?.let { failure ->
+                onBootstrapHttpEvidence(failure.statusCode, failure.retryAfter)
             }
             post(SessionInput.BootstrapAnswered(epoch, topic, outcome))
         }
