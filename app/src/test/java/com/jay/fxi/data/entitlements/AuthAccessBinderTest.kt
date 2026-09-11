@@ -2,14 +2,21 @@ package com.jay.fxi.data.entitlements
 
 import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.auth.AuthIdentityFence
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -42,8 +49,18 @@ class AuthAccessBinderTest {
             override fun next() = "epoch-${n++}"
         }
 
-        override suspend fun load() = record
+        /** Parks the next bind, to hold the consumer while more work queues behind it. */
+        var blockNextBindOn: CompletableDeferred<Unit>? = null
+
+        /** Parks one read, including the first read of an executing preparation. */
+        var blockNextLoadOn: CompletableDeferred<Unit>? = null
+
+        override suspend fun load(): AccessEpochRecord {
+            blockNextLoadOn?.let { gate -> blockNextLoadOn = null; gate.await() }
+            return record
+        }
         override suspend fun bindOwner(uid: String): AccessEpochRecord {
+            blockNextBindOn?.let { gate -> blockNextBindOn = null; gate.await() }
             calls += Call.OwnerChanged(uid)
             return AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
         }
@@ -69,8 +86,11 @@ class AuthAccessBinderTest {
     /** Deferred, like production: the journal survives so a resume stays observable. */
     private class RecordingPurger : UserScopePurger, CapabilityScopePurger {
         val attempts = mutableListOf<String?>()
+        /** Runs inside the purge, which the binder calls on its consumer. */
+        var onPurge: suspend () -> Unit = {}
         override suspend fun purgeUserScope(namespace: PurgeNamespace): PurgeResult {
             attempts += namespace.pending.ownerUid
+            onPurge()
             return PurgeResult.Deferred("not this slice")
         }
 
@@ -87,9 +107,11 @@ class AuthAccessBinderTest {
         /** `fresh_premium` flag of every query the binding issued, in order. */
         fetches: MutableList<Boolean> = mutableListOf(),
         /** What the coordinator reads as the live fence. Signed out unless a test says otherwise. */
-        live: () -> AuthIdentityFence? = { null }
+        live: () -> AuthIdentityFence? = { null },
+        store: RecordingStore = RecordingStore(calls),
+        /** Collects failures that end a coroutine of the binder's scope, instead of failing the test run. */
+        uncaught: MutableList<Throwable>? = null
     ): AuthAccessBinder {
-        val store = RecordingStore(calls)
         if (seedJournal) {
             // A journal a previous process left behind — the only thing that makes a resume
             // observable, since an empty journal returns before touching a purger.
@@ -107,7 +129,10 @@ class AuthAccessBinderTest {
                 )
             )
         }
-        val scope = CoroutineScope(processJob + StandardTestDispatcher(testScheduler))
+        val handler = uncaught?.let { sink -> CoroutineExceptionHandler { _, failure -> sink += failure } }
+        val scope = CoroutineScope(
+            processJob + StandardTestDispatcher(testScheduler) + (handler ?: EmptyCoroutineContext)
+        )
         val coordinator = PremiumAccessCoordinator(
             source = object : EntitlementsSource {
                 // Terminal on purpose. Binding an owner now issues one `fresh_premium` query, and
@@ -349,6 +374,189 @@ class AuthAccessBinderTest {
         assertEquals(listOf(Call.OwnerChanged("user-a")), calls)
         processJob.cancel()
     }
+
+    /**
+     * A sign-out request queued behind the binding of its own fence is judged after that binding.
+     * Run out of order, the fence it names would not be bound yet and it could not arm.
+     */
+    @Test
+    fun aSignOutRequestRunsAfterEveryEventQueuedBeforeIt() = runTest {
+        val fence = fenceOf("user-a", 7L)
+        val binder = build(mutableListOf(), live = { fence })
+        binder.start()
+
+        binder.onFenceObserved(fence)
+        val start = async { binder.beginSignOut(fence) }
+        advanceUntilIdle()
+
+        assertTrue(start.await() is SignOutStart.Armed)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aStoppedConsumerFailsTheRequestsStillWaitingOnIt() = runTest {
+        val fence = fenceOf("user-a", 7L)
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val gate = CompletableDeferred<Unit>()
+        store.blockNextBindOn = gate
+        val binder = build(calls, live = { fence }, store = store)
+        binder.start()
+        binder.onFenceObserved(fence)
+        runCurrent() // the consumer is now parked inside the bind
+
+        val waiting = async { runCatching { binder.beginSignOut(fence) } }
+        runCurrent()
+        processJob.cancel()
+        runCurrent()
+
+        val queued = waiting.await().exceptionOrNull()
+        assertTrue("대기 중이던 요청이 실패로 끝나지 않았다: $queued", queued.isStoppedConsumer())
+        val later = runCatching { binder.beginSignOut(fence) }.exceptionOrNull()
+        assertTrue("멈춘 consumer 에 새 요청이 들어갔다: $later", later.isStoppedConsumer())
+    }
+
+    @Test
+    fun cancellationBeforeTheConsumerStartsFailsQueuedAndLaterRequests() = runTest {
+        val fence = fenceOf("user-a", 7L)
+        val binder = build(mutableListOf(), live = { fence })
+        binder.start()
+        val waiting = async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching { binder.beginSignOut(fence) }
+        }
+        try {
+            processJob.cancel() // the scheduled consumer body has not run
+            runCurrent()
+
+            assertTrue("request stranded before consumer entry", waiting.isCompleted)
+            assertTrue(waiting.await().exceptionOrNull().isStoppedConsumer())
+            assertTrue(runCatching { binder.beginSignOut(fence) }.exceptionOrNull().isStoppedConsumer())
+        } finally {
+            waiting.cancel()
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun cancellationAfterReceiveBeforeDispatchFailsTheRemovedRequest() = runTest {
+        val fence = fenceOf("user-a", 7L)
+        val binder = build(mutableListOf(), live = { fence })
+        binder.start()
+        runCurrent() // the consumer is suspended waiting for an inbox item
+        val waiting = async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching { binder.beginSignOut(fence) }
+        }
+        try {
+            // The send resumed the receiver, but its dispatcher has not run it yet.
+            processJob.cancel()
+            runCurrent()
+
+            assertTrue("request lost between receive and dispatch", waiting.isCompleted)
+            assertTrue(waiting.await().exceptionOrNull().isStoppedConsumer())
+        } finally {
+            waiting.cancel()
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun cancellationDuringPreparationIsReportedAsConsumerFailure() = runTest {
+        val fence = fenceOf("user-a", 7L)
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val binder = build(calls, live = { fence }, store = store)
+        binder.start()
+        binder.onFenceObserved(fence)
+        runCurrent()
+        val gate = CompletableDeferred<Unit>()
+        store.blockNextLoadOn = gate
+        val waiting = async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching { binder.beginSignOut(fence) }
+        }
+        try {
+            runCurrent()
+            assertEquals(null, store.blockNextLoadOn)
+            assertTrue("preparation did not suspend at the read", !waiting.isCompleted)
+            processJob.cancel()
+            runCurrent()
+
+            assertTrue("executing request was not completed", waiting.isCompleted)
+            assertTrue(waiting.await().exceptionOrNull().isStoppedConsumer())
+        } finally {
+            gate.complete(Unit)
+            waiting.cancel()
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun callerCancellationDoesNotWithdrawAnEnqueuedPreparation() = runTest {
+        val fence = fenceOf("user-a", 7L)
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val gate = CompletableDeferred<Unit>()
+        store.blockNextBindOn = gate
+        val binder = build(calls, live = { fence }, store = store)
+        binder.start()
+        binder.onFenceObserved(fence)
+        runCurrent()
+        val waiting = async(start = CoroutineStart.UNDISPATCHED) { binder.beginSignOut(fence) }
+        try {
+            waiting.cancel()
+            gate.complete(Unit)
+            runCurrent()
+
+            assertEquals(fence.uid, store.record.teardownOwedFor)
+        } finally {
+            gate.complete(Unit)
+            waiting.cancel()
+            processJob.cancel()
+        }
+    }
+
+    /** From inside the consumer the request would wait on itself; it has to fail instead. */
+    @Test
+    fun aRequestFromTheConsumerFailsInsteadOfWaitingOnItself() = runTest {
+        val fence = fenceOf("user-a", 7L)
+        val purger = RecordingPurger()
+        lateinit var binder: AuthAccessBinder
+        var failure: Throwable? = null
+        purger.onPurge = { failure = runCatching { binder.beginSignOut(fence) }.exceptionOrNull() }
+        binder = build(mutableListOf(), purger = purger, seedJournal = true, live = { fence })
+
+        binder.start() // resumes the seeded journal on the consumer
+        advanceUntilIdle()
+
+        assertTrue("consumer 안의 요청이 실패하지 않았다: $failure", failure is IllegalStateException)
+        processJob.cancel()
+    }
+
+    @Test
+    fun anUnexpectedFailureReachesTheCallerAndStopsTheConsumer() = runTest {
+        val fence = fenceOf("user-a", 7L)
+        val uncaught = mutableListOf<Throwable>()
+        val binder = build(
+            mutableListOf(),
+            live = { throw IllegalArgumentException("live read") },
+            uncaught = uncaught
+        )
+        binder.start()
+
+        val failure = runCatching { binder.beginSignOut(fence) }.exceptionOrNull()
+        advanceUntilIdle()
+
+        assertTrue("준비 실패가 호출자에게 가지 않았다: $failure", failure is IllegalArgumentException)
+        assertTrue("consumer 가 그 실패로 끝나지 않았다: $uncaught", uncaught.singleOrNull() is IllegalArgumentException)
+        val later = runCatching { binder.beginSignOut(fence) }.exceptionOrNull()
+        assertTrue("실패 뒤 consumer 가 계속 받았다: $later", later.isStoppedConsumer())
+    }
 }
+/**
+ * The consumer's own failure, not a cancellation. `CancellationException` extends
+ * `IllegalStateException`, so a bare type check would accept the very thing it must reject.
+ */
+private fun Throwable?.isStoppedConsumer() =
+    this is IllegalStateException && this !is kotlinx.coroutines.CancellationException
+
 /** One observed identity. Generation defaults to 1 so existing cases read as they did. */
 private fun fenceOf(uid: String, generation: Long = 1L) = AuthIdentityFence(uid, generation)

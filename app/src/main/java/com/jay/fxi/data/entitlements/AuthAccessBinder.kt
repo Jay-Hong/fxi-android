@@ -2,8 +2,13 @@ package com.jay.fxi.data.entitlements
 
 import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.auth.AuthIdentityFence
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
 
 /**
@@ -58,11 +63,29 @@ class AuthAccessBinder(
     private val scope: CoroutineScope,
     private val fenceStream: AuthFenceStream
 ) {
+    private sealed interface Item {
+        class Observed(val fence: AuthIdentityFence?) : Item
+        class PrepareSignOut(val fence: AuthIdentityFence, val reply: CompletableDeferred<SignOutStart>) : Item
+    }
+
+    /** Marks the consumer, so a request made from inside it fails instead of waiting on itself. */
+    private class Consumer : AbstractCoroutineContextElement(Consumer) {
+        companion object Key : CoroutineContext.Key<Consumer>
+    }
+
     /**
      * Unbounded because dropping an auth transition is not a recoverable outcome, and the real
      * traffic is a handful of events per process.
      */
-    private val inbox = Channel<AuthIdentityFence?>(Channel.UNLIMITED)
+    private val inbox = Channel<Item>(
+        capacity = Channel.UNLIMITED,
+        onUndeliveredElement = { item ->
+            // A cancelled receive can remove a request before the consumer gets to prepare it.
+            if (item is Item.PrepareSignOut) {
+                item.reply.completeExceptionally(IllegalStateException("identity consumer stopped"))
+            }
+        }
+    )
 
     /** Confined to the single consumer, so it needs no synchronisation. */
     private var boundFence: AuthIdentityFence? = null
@@ -76,23 +99,72 @@ class AuthAccessBinder(
      * this costs one redundant resume, which is a no-op when the journal is empty.
      */
     fun start() {
-        scope.launch {
-            coordinator.resumePendingPurges()
-            for (fence in inbox) {
-                // An open sign-out with an edit in flight holds identity events, in order, until
-                // that edit's outcome is known. The coordinator decides that under its own lock and
-                // hands a held event back, so the same event stays first and is tried again.
-                while (!handle(fence)) coordinator.awaitIdentityEventsAdmitted()
+        scope.launch(Consumer()) {
+            try {
+                coordinator.resumePendingPurges()
+                for (item in inbox) {
+                    when (item) {
+                        // An open sign-out with an edit in flight holds identity events, in order,
+                        // until that edit's outcome is known. The coordinator decides that under its
+                        // own lock and hands a held event back, so the same event stays first.
+                        is Item.Observed ->
+                            while (!handle(item.fence)) coordinator.awaitIdentityEventsAdmitted()
+                        is Item.PrepareSignOut -> prepare(item)
+                    }
+                }
+            } finally {
+                stopConsumer()
             }
+        }.invokeOnCompletion { cause ->
+            // Also covers cancellation that prevents the launch body from starting.
+            stopConsumer(cause)
         }
         // AuthFenceStream replays the tracker's current fence when this subscriber registers.
         // The binder must not synthesize another initial observation.
         fenceStream.observe(::onFenceObserved)
     }
 
+    private fun stopConsumer(cause: Throwable? = null) {
+        val stopped = IllegalStateException("identity consumer stopped", cause)
+        inbox.close(stopped)
+        while (true) {
+            val left = inbox.tryReceive().getOrNull() ?: break
+            if (left is Item.PrepareSignOut) left.reply.completeExceptionally(stopped)
+        }
+    }
+
     /** Test seam. Production reaches this through the registered listener. */
     internal fun onFenceObserved(fence: AuthIdentityFence?) {
-        inbox.trySend(fence)
+        inbox.trySend(Item.Observed(fence))
+    }
+
+    /**
+     * Starts an app sign-out for [fence] after every identity event queued before this call, so the
+     * coordinator judges it against the bindings those events produced.
+     *
+     * Must not be called from the identity consumer, which would wait on itself, nor while holding
+     * the coordinator's lock. Cancelling the caller does not withdraw an enqueued request.
+     * Execution still depends on the consumer reaching it; consumer termination fails pending replies.
+     */
+    internal suspend fun beginSignOut(fence: AuthIdentityFence): SignOutStart {
+        check(currentCoroutineContext()[Consumer] == null) { "a sign-out requested from the identity consumer" }
+        val reply = CompletableDeferred<SignOutStart>()
+        inbox.send(Item.PrepareSignOut(fence, reply))
+        return reply.await()
+    }
+
+    /** An unexpected failure still ends the consumer, as any other failure there does. */
+    private suspend fun prepare(item: Item.PrepareSignOut) {
+        try {
+            item.reply.complete(coordinator.prepareSignOut(item.fence))
+        } catch (failure: Throwable) {
+            // Report the consumer's cancellation as a failure to an independently waiting caller.
+            val reported = if (failure is CancellationException) {
+                IllegalStateException("identity consumer stopped", failure)
+            } else failure
+            item.reply.completeExceptionally(reported)
+            throw failure
+        }
     }
 
     /** False when the coordinator held the event; nothing was applied and it must be retried. */
