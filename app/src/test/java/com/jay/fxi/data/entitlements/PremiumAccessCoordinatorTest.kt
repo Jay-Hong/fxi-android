@@ -1361,7 +1361,7 @@ class PremiumAccessCoordinatorTest {
      * was handed is the live one — which is the common case, and exactly why a re-read survived
      * this long: it produced the right answer for the wrong reason. They do **not** always agree;
      * the delayed-observation race two tests below is the case where they differ on a real path.
-     * Pulling them apart is the only way to see which one the code uses.
+     * Using different generations makes the source of the published value observable in this test.
      */
     @Test
     fun theBindingUsesTheObservedGenerationRatherThanRereadingIt() = runTest {
@@ -1433,12 +1433,12 @@ class PremiumAccessCoordinatorTest {
 }
 
 /**
- * The fence a binding used to be given implicitly.
+ * An explicit binding fence, independent of FakeSource.identity.
  *
- * Before `onIdentityChanged`, the coordinator re-read the generation from its own source, which
- * always answered `1` here regardless of the uid the caller passed — the mixing this replaced.
- * Defaulting to `1` matches what the re-read produced for every case that did not set its own
- * source generation. The two cases that did — the published-session test and the mixing tests
- * below — pass theirs explicitly, so the default is a convenience, not a claim about all of them.
+ * Generation 1 is a fixture default, not a reconstruction of every old source read. The old
+ * onOwnerChanged read returned 1 for the default FakeSource identity, but null when that identity
+ * was null. This helper supplies generation 1 even in those null-source cases, so their bindings
+ * now carry a generation where the old bindings did not.
+ * Tests requiring another generation pass it explicitly; the identity-mixing tests are above.
  */
 private fun ownerFence(uid: String, generation: Long = 1L) = AuthIdentityFence(uid, generation)

@@ -63,7 +63,11 @@ class AuthSessionGenerationTrackerTest {
 
     // ---- publication (L-4b) ---------------------------------------------------------------------
 
-    /** Everything a subscriber was handed, in order. Drained the way the source drains it. */
+    /**
+     * Registers a list-appending listener and delivers one outbox snapshot on the calling thread.
+     * This helper does not use the source's locked drain or SerialDeliveryPump's loop and guards.
+     * Pump behaviour is tested separately in SerialDeliveryPumpTest.
+     */
     private fun AuthSessionGenerationTracker.collect(into: MutableList<AuthIdentityFence?>) {
         subscribe { into += it }
         drainOutbox().forEach { it.deliver() }
@@ -90,7 +94,7 @@ class AuthSessionGenerationTrackerTest {
         assertEquals("the replay moved the generation", 1L, tracker.observe("user-a", session)!!.authGeneration)
     }
 
-    /** A1 — a subscriber that arrives late is not owed less than one that arrived early. */
+    /** A1 — a late subscriber receives the current fence, not the transitions it missed. */
     @Test
     fun subscribingAfterATransition_replaysWhereTheSessionIsNow() {
         val tracker = AuthSessionGenerationTracker("user-a", Any())
@@ -181,12 +185,12 @@ class AuthSessionGenerationTrackerTest {
     }
 
     /**
-     * A6 — a retirement moves the generation without announcing the session it lands on.
+     * A6 — retirement publishes no intermediate fence, and the following sign-out publishes null.
      *
-     * The sign-out path invalidates and then signs out. Announcing the fence in between makes
-     * every subscriber treat a teardown as a new session: the binder rebinds, writes the owner to
-     * disk and asks the server about an account that is one call from being gone. The `null` that
-     * follows is the transition subscribers actually need.
+     * An intermediate same-uid fence can trigger a rebind and entitlement query in the binder.
+     * This test checks the absence of that publication and the later null. Despite the method
+     * name, it does not assert the generation after retirement: null carries no generation, so
+     * these assertions cannot distinguish retirement that advances it from retirement that does not.
      */
     @Test
     fun retiring_movesTheGenerationWithoutAnnouncingIt() {

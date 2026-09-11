@@ -98,10 +98,14 @@ class SerialDeliveryPumpTest {
     }
 
     /**
-     * Two threads never deliver at the same time.
+     * Two threads call run against one preloaded batch; the result must contain each item once.
      *
-     * The barrier makes both threads arrive at `run()` together; the counter fails the test if a
-     * second delivery ever starts while one is still running.
+     * This fixture does not establish mutual exclusion. Outbox.drain atomically takes all 40
+     * preloaded items, and no listener adds more, so removing the pump's lock and delivering guard
+     * still leaves only one non-empty batch. The overlap counter cannot expose that removal.
+     * The sorted-result assertion checks omissions and duplicates in this run. The separate
+     * aHandOverArrivingMidFlightWaitsInsteadOfBeingDropped test detects a missing lock by adding
+     * work after the first thread's last snapshot.
      */
     @Test
     fun twoThreadsDoNotDeliverConcurrently() {
@@ -141,17 +145,16 @@ class SerialDeliveryPumpTest {
     }
 
     /**
-     * Work that arrives while a hand-over is in flight waits for it, rather than being dropped.
+     * A second hand-over call waits, then delivers work missed by the first call's final snapshot.
      *
-     * This is what the lock buys that the flag alone does not, and it is the only test here that
-     * can tell them apart: with the flag alone a second thread sees `delivering` and **returns**,
-     * so an item enqueued after the first thread's last drain is never handed to anyone. Replacing
-     * `synchronized` with `run` leaves [twoThreadsDoNotDeliverConcurrently] green — measured.
-     * That fixture also gives all preloaded deliveries to one drain; no later work can create
-     * a second concurrent batch. Its result does not prove that the flag provides exclusion.
+     * Without the lock, a second thread that sees delivering set returns immediately. Neither
+     * call then delivers the new item: it remains in the outbox until another run drains it.
+     * The pump schedules no retry itself. Here, "dropped" describes the hand-over attempt,
+     * not removal of the item from the outbox.
      *
-     * The window is narrow and deliberate: the second drain has already returned its (empty)
-     * snapshot before the new item is enqueued, so the first thread's loop cannot pick it up.
+     * The outbox has produced an empty snapshot before the new item is enqueued; the fixture
+     * delays returning that snapshot to the first run. That run exits on the empty snapshot.
+     * With the lock, the second call waits for it to exit and then drains the new item.
      */
     @Test
     fun aHandOverArrivingMidFlightWaitsInsteadOfBeingDropped() {

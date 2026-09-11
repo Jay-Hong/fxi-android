@@ -14,9 +14,10 @@ import javax.inject.Singleton
  * same singleton, so both surfaces read one tracker — two Firebase listeners deciding
  * independently is the defect this exists to remove.
  *
- * **Listeners must not block and must not call back into the source.** Delivery happens on
- * whichever thread moved the generation, which includes a session reading its own live identity
- * while applying a frame. Enqueue and return.
+ * **Listeners must not block and must not call back into the source.** The production source
+ * invokes callbacks on the thread running its delivery pump, which need not be the thread that
+ * enqueued them. A live identity read can run that pump before returning; for example,
+ * PremiumAccessCoordinator reads live identity while holding its mutex. Enqueue and return.
  */
 fun interface AuthFenceStream {
     fun observe(onFence: (AuthIdentityFence?) -> Unit)
@@ -213,9 +214,10 @@ internal class AuthSessionGenerationTracker(
     /**
      * Everything owed since the last drain, in order. The caller runs these **outside** its lock.
      *
-     * Listeners are contractually non-blocking and must not call back into the source: this drains
-     * on whatever thread advanced the generation, which includes a coordinator reading its own
-     * live identity mid-frame.
+     * Listeners must not block or call back into the source. The production source takes this
+     * snapshot under identityLock, then delivers it through SerialDeliveryPump after releasing
+     * identityLock. Delivery can occur during a live identity read while the caller holds its own
+     * lock; it need not run on the thread that enqueued the snapshot's items.
      */
     fun drainOutbox(): List<Delivery> {
         if (outbox.isEmpty()) return emptyList()
@@ -247,12 +249,11 @@ internal class AuthSessionGenerationTracker(
     /**
      * Moves past [expected] **without** announcing the session it lands on.
      *
-     * The sign-out side. The generation still has to move — credentials issued for [expected] must
-     * stop being honoured the moment the caller says so — but the fence it moves *to* is a session
-     * nobody will ever act on: `signOut()` follows immediately and publishes the `null` that
-     * subscribers actually need. Announcing the intermediate one makes every subscriber treat a
-     * teardown as a new session and go to work for it — a rebind, a disk write and an entitlement
-     * query, all for an account that is one call away from being gone.
+     * The sign-out path uses this to retire [expected] without enqueueing the intermediate fence.
+     * A subsequent observed sign-out publishes `null` separately. Publishing the intermediate
+     * same-uid fence can make AuthAccessBinder rebind, write the owner to disk and schedule an
+     * entitlement query during teardown. The uid adapter suppresses this generation-only change
+     * if it has already delivered that uid.
      */
     fun retire(expected: AuthIdentity): Boolean = invalidate(expected, announce = false)
 

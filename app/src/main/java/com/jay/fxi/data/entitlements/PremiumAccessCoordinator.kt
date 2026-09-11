@@ -105,9 +105,9 @@ class PremiumAccessCoordinator(
      * these too — the tracked sign-in path advances the generation before Firebase does anything,
      * and that transition never changes the uid.
      *
-     * The generation is taken from [identity] and **not re-read**. Reading it here would pair the
-     * uid one observation carried with the generation of another, and the read itself advances the
-     * tracker — a binding is not the place to move the thing it is binding to.
+     * The generation is taken from [identity] and **not re-read**. A re-read can pair the uid from
+     * one observation with the generation of another. It can also advance the tracker if it sees
+     * a changed uid or session marker; an unchanged observation does not advance it.
      */
     suspend fun onIdentityChanged(identity: AuthIdentityFence): AccessDecisionGeneration = mutex.withLock {
         decisionGeneration += 1

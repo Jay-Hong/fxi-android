@@ -36,9 +36,10 @@ fun interface AuthUidStream {
  *
  * **Dedup lives here, and it is keyed on the fence.** [PremiumAccessCoordinator.onIdentityChanged]
  * is not idempotent — it bumps the decision generation, cancels the recheck schedule and resets the
- * published state to `NoGrant` before it even reaches the store. The stream replays the current
- * fence to every new subscriber, so without [boundFence] a live grant would be thrown away
- * routinely. Keying on the **fence** rather than the bare uid is what makes a same-uid generation
+ * published state to `NoGrant` before it even reaches the store. [boundFence] makes the consumer
+ * skip a non-null fence equal to its current value, avoiding another reset on a repeated delivery.
+ * Registration replays the current fence once; generation changes carry different fences.
+ * Keying on the **fence** rather than the bare uid is what makes a same-uid generation
  * change visible: `authGeneration` also advances on the explicit invalidation the tracked sign-in
  * path runs, and that transition produces no uid change at all.
  *

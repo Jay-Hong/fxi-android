@@ -84,8 +84,9 @@ class EntitlementsModuleAuthUidStreamTest {
     /**
      * D3 — `A → null → A` survives.
      *
-     * Value-keyed dedup that only remembered the last **non-null** uid would collapse the sign-out
-     * in the middle and leave the consumer believing the session never ended.
+     * Suppressing null would hide the sign-out. Emitting null but retaining A as the last uid
+     * would instead suppress the following A. This test checks the entire sequence, including
+     * both the sign-out and the return.
      */
     @Test
     fun aSignOutBetweenTwoSessionsOfTheSameUserIsPreserved() {

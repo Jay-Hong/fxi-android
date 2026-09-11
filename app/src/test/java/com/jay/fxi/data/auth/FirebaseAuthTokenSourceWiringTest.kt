@@ -12,9 +12,11 @@ import org.junit.Test
  * Review measured that deleting **every** `deliverPending()` call left the previous suite green.
  * These checks pin the source wiring; they do not replace behavioural tests of the pump.
  *
- * So this reads the source. It proves nothing about behaviour; what it does is make the one defect
- * this shape invites impossible to land quietly: a sixth path that mutates the tracker under
- * `identityLock` and forgets to hand the result over.
+ * These are text checks, not semantic lock analysis. They pin the names and lock-call counts of
+ * members matched by memberHeader and identityLockCall, and check the hand-over calls there.
+ * A new matching lock site changes the expected list. Qualified lock references, helper-based
+ * locking or unrecognised member headers can evade detection; this does not cover every possible
+ * path that mutates the tracker.
  *
  * Behaviour is covered elsewhere, on purpose — the tracker's replay and announce rules by
  * [AuthSessionGenerationTrackerTest], and the hand-over's serialisation, reentrancy and exception
@@ -100,13 +102,15 @@ class FirebaseAuthTokenSourceWiringTest {
     /**
      * The two invalidation paths use the two tracker entry points, and not each other.
      *
-     * A mutation swapping `retire` for `invalidate` at the sign-out call site **survives the whole
-     * suite** — `AuthSessionGenerationTrackerTest` exercises `retire()` directly and never reaches
-     * this class. So the pairing is pinned here, structurally, the same way the drains are.
+     * A source mutation replacing `retire` with `invalidate` at the sign-out call site survived
+     * the suite before this check was added. AuthSessionGenerationTrackerTest calls the tracker
+     * directly; it does not execute FirebaseAuthTokenSource's sign-out entry point. The assertions
+     * below now reject that source mutation by checking the entry-point pairing.
      *
-     * Getting it wrong is not cosmetic: announcing the fence a sign-out lands on makes every
-     * subscriber treat a teardown as a new session — a rebind, an owner write to disk and an
-     * entitlement query, for an account one call away from being gone.
+     * Announcing the intermediate same-uid fence can trigger rebinding, an owner-store write and
+     * a scheduled entitlement query in AuthAccessBinder. The uid adapter suppresses that
+     * generation-only event if it has already delivered the uid; these costs are not shared by
+     * every subscriber.
      */
     @Test
     fun eachInvalidationPathUsesItsOwnTrackerEntryPoint() {
