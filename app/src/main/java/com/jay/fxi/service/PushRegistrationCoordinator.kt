@@ -24,13 +24,22 @@ internal enum class DeleteResult {
     FAILED
 }
 
-/** The device-registration endpoints, bound to an owner. Premium plays no part in a DELETE. */
+/**
+ * The device-registration endpoints. A call is prepared first — every wait for credentials
+ * happens in [session] — so that the admission check can come after the last wait; the session's
+ * calls then send without waiting for credentials again. Premium plays no part in a DELETE.
+ */
 internal interface PushDeviceServer {
+    /** What calls as [owner] need, or null when it cannot be had. Cancellation propagates. */
+    suspend fun session(owner: AuthIdentityFence): PushServerSession?
+}
+
+internal interface PushServerSession {
     /** True when the server accepted the registration. Cancellation, identity changes included, propagates. */
-    suspend fun register(owner: AuthIdentityFence, token: String): Boolean
+    suspend fun register(token: String): Boolean
 
     /** Cancellation, identity changes included, propagates; everything else is an answer. */
-    suspend fun unregister(owner: AuthIdentityFence, token: String): DeleteResult
+    suspend fun unregister(token: String): DeleteResult
 }
 
 internal enum class RegisterOutcome {
@@ -121,10 +130,12 @@ internal class PushRegistrationCoordinator(
                 return RegisterOutcome.LEDGER_UNAVAILABLE
             } ?: return RegisterOutcome.SAME_KEY_OWED
             synchronized(lock) { if (session == owner) sessionIds += recorded.id }
-            // Admission: the last check before the POST.
+            val call = server.session(owner) ?: return RegisterOutcome.POST_FAILED
+            // Admission: the last check before the POST, after the credential's wait too.
             refusal(owner, admitted)?.let { return it }
             if (!eligible(owner)) return RegisterOutcome.NOT_ELIGIBLE
-            return if (post(owner, token)) RegisterOutcome.REGISTERED else RegisterOutcome.POST_FAILED
+            currentCoroutineContext().ensureActive()
+            return if (call.register(token)) RegisterOutcome.REGISTERED else RegisterOutcome.POST_FAILED
         }
     }
 
@@ -339,15 +350,14 @@ internal class PushRegistrationCoordinator(
         if (resolveUnrecorded(owner, key)) pass.deleted += key.second
     }
 
-    /** No new server call once the caller is cancelled; what is owed stays for the next pass. */
-    private suspend fun post(owner: AuthIdentityFence, token: String): Boolean {
-        currentCoroutineContext().ensureActive()
-        return server.register(owner, token)
-    }
-
+    /**
+     * No new server call once the caller is cancelled: checked after the credential's wait, right
+     * before the call; what is owed stays for the next pass. No credential, no answer.
+     */
     private suspend fun delete(owner: AuthIdentityFence, token: String): DeleteResult {
+        val call = server.session(owner) ?: return DeleteResult.FAILED
         currentCoroutineContext().ensureActive()
-        return server.unregister(owner, token)
+        return call.unregister(token)
     }
 
     /** Completion that throws, or finds the entry moved on, is not a resolution. */

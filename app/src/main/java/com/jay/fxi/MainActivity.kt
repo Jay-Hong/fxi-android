@@ -11,7 +11,6 @@ import com.jay.fxi.admission.ReleaseAdmission
 import com.jay.fxi.service.AlertEvent
 import com.jay.fxi.service.AlertEventBus
 import com.jay.fxi.service.FXiMessagingService
-import com.jay.fxi.service.PushNotificationManager
 import com.jay.fxi.subscription.SubscriptionManager
 import com.jay.fxi.ui.screen.RootScreen
 import com.jay.fxi.ui.theme.FXiTheme
@@ -26,9 +25,6 @@ import javax.inject.Provider
 class MainActivity : ComponentActivity() {
     @Inject
     lateinit var subscriptionManagerProvider: Provider<SubscriptionManager>
-
-    @Inject
-    lateinit var pushNotificationManagerProvider: Provider<PushNotificationManager>
 
     @Inject
     lateinit var alertEventBusProvider: Provider<AlertEventBus>
@@ -54,7 +50,6 @@ class MainActivity : ComponentActivity() {
             FXiTheme {
                 RootScreen(
                     subscriptionManagerProvider = subscriptionManagerProvider,
-                    pushNotificationManagerProvider = pushNotificationManagerProvider,
                     pendingAlertEvent = pendingAlertEvent,
                     onPendingAlertEventConsumed = { _pendingAlertEvent.value = null },
                     alertEventBusProvider = alertEventBusProvider

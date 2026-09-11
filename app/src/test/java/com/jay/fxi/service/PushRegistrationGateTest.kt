@@ -10,7 +10,7 @@ import org.junit.Test
 /**
  * The registration gate, judged on the JVM.
  *
- * Extracted for the same reason [capturePushSnapshotOrNull] is: the manager it belongs to needs a
+ * Extracted for the same reason [ApiPushDeviceServer] is: the manager it belongs to needs a
  * `Context`, and the rule it applies is the one thing here worth failing a build over.
  */
 class PushRegistrationGateTest {

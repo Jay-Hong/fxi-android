@@ -105,8 +105,10 @@ class PushNotificationManager @Inject constructor(
 **호출 책임 정리**:
 
 - `rehydratePushTokenIfNeeded()` → **SubscriptionManager.onAuthCompleted()에서만** 호출 (단일 책임)
-- `unregisterDeviceFromServer()` → **AuthViewModel.signOut()** + **RootScreen** (auth→signedOut 전환, premium→false 전환 시 방어적 호출)
-- RootScreen은 상태 전환 감지 시 unregister 호출 (AuthViewModel.signOut 경로 외 직접 전환 방어). PushNotificationManager는 MainActivity→RootScreen 파라미터 전달.
+- `unregisterDeviceFromServer(owner)` → **AuthViewModel 로그아웃 실행자(`handedOffSignOut`)에서만** 호출한다. owner 는 로그아웃을 시작한 세션이다.
+- ~~RootScreen은 상태 전환 감지 시 unregister 호출~~ — L-4b-2 4c(3b-2)에서 지웠다. 앱 로그아웃의 해제는 실행자가 하고, 외부 로그아웃은
+  A 의 인증이 없어 DELETE 할 수 없으며, 늦게 도는 효과는 새 세션을 해제 대상으로 잡을 수 있었다. 등록·회전·해제의 현재 구조는
+  `PushRegistrationCoordinator`(장부 위 직렬화)와 `ApiPushDeviceServer` 의 KDoc 에 있다. 위 메서드 목록은 v1 구현 당시의 기록이다.
 
 ### Step 4: FXiMessagingService
 

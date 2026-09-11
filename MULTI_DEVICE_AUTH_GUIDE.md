@@ -231,6 +231,10 @@ class SessionManager @Inject constructor(
 }
 ```
 
+> 위 `SessionManager` 예시의 인자 없는 `unregisterDeviceFromServer()` 는 v1 당시의 호출이다. L-4b-2 4c(3b-2) 이후
+> 현행 경로는 `AuthViewModel.signOut → handedOffSignOut → unregisterDeviceFromServer(owner)` 이며, 로그아웃을 시작할 때
+> 캡처한 전체 fence(uid·auth generation)를 전달한다. 해제 시점에 현재 세션을 다시 캡처해 대상으로 삼지 않는다.
+
 #### ApplicationScope 제공 (Hilt)
 
 **파일**: `app/src/main/java/com/jay/fxi/di/AppModule.kt`

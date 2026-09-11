@@ -41,7 +41,6 @@ import com.jay.fxi.domain.model.AuthState
 import com.jay.fxi.ui.free.FreeSnapshotRoute
 import com.jay.fxi.service.AlertEvent
 import com.jay.fxi.service.AlertEventBus
-import com.jay.fxi.service.PushNotificationManager
 import com.jay.fxi.subscription.SubscriptionManager
 import com.jay.fxi.ui.auth.AuthViewModel
 import com.jay.fxi.ui.auth.LoginScreen
@@ -56,7 +55,6 @@ import javax.inject.Provider
 @Composable
 fun RootScreen(
     subscriptionManagerProvider: Provider<SubscriptionManager>,
-    pushNotificationManagerProvider: Provider<PushNotificationManager>,
     pendingAlertEvent: StateFlow<AlertEvent?>? = null,
     onPendingAlertEventConsumed: () -> Unit = {},
     alertEventBusProvider: Provider<AlertEventBus>,
@@ -68,7 +66,6 @@ fun RootScreen(
 
     ArmedRootScreen(
         subscriptionManager = subscriptionManagerProvider.get(),
-        pushNotificationManager = pushNotificationManagerProvider.get(),
         pendingAlertEvent = pendingAlertEvent,
         onPendingAlertEventConsumed = onPendingAlertEventConsumed,
         alertEventBus = alertEventBusProvider.get()
@@ -78,7 +75,6 @@ fun RootScreen(
 @Composable
 private fun ArmedRootScreen(
     subscriptionManager: SubscriptionManager,
-    pushNotificationManager: PushNotificationManager,
     pendingAlertEvent: StateFlow<AlertEvent?>? = null,
     onPendingAlertEventConsumed: () -> Unit = {},
     alertEventBus: AlertEventBus? = null,
@@ -113,17 +109,6 @@ private fun ArmedRootScreen(
     // dismissed it instantly — the decision now lives here alone.
     LaunchedEffect(accessForSession) {
         if (accessForSession == PremiumAccessState.PremiumConfirmed) showPaywall = false
-    }
-
-    val previousAuthState = remember { mutableStateOf<AuthState?>(null) }
-    LaunchedEffect(authState) {
-        val previous = previousAuthState.value
-        if (previous != null && previous !is AuthState.SignedOut && authState is AuthState.SignedOut) {
-            // The premium view models are no longer reachable from Root, so there is nothing of
-            // theirs left to reset. The device registration is still ours to withdraw.
-            pushNotificationManager.unregisterDeviceFromServer()
-        }
-        previousAuthState.value = authState
     }
 
     // The whole Root decision, in one pure call. `isLoadingInitial` is gone with it: D23 sends

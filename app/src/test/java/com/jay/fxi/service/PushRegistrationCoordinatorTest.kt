@@ -87,19 +87,29 @@ class PushRegistrationCoordinatorTest {
         var postGate: CompletableDeferred<Unit>? = null
         var atPost: () -> Unit = {}
         var onDelete: (String) -> Unit = {}
+        var sessionGate: CompletableDeferred<Unit>? = null
+        var atSession: () -> Unit = {}
+        var noSession = false
 
-        override suspend fun register(owner: AuthIdentityFence, token: String): Boolean {
-            calls += "POST ${owner.uid}${owner.authGeneration} $token"
-            atPost()
-            postGate?.await()
-            return accepts
-        }
+        override suspend fun session(owner: AuthIdentityFence): PushServerSession? {
+            sessionGate?.await()
+            atSession()
+            if (noSession) return null
+            return object : PushServerSession {
+                override suspend fun register(token: String): Boolean {
+                    calls += "POST ${owner.uid}${owner.authGeneration} $token"
+                    atPost()
+                    postGate?.await()
+                    return accepts
+                }
 
-        override suspend fun unregister(owner: AuthIdentityFence, token: String): DeleteResult {
-            calls += "DELETE ${owner.uid} $token"
-            deleteGates[token]?.await()
-            onDelete(token)
-            return deletes[token] ?: DeleteResult.DELETED
+                override suspend fun unregister(token: String): DeleteResult {
+                    calls += "DELETE ${owner.uid} $token"
+                    deleteGates[token]?.await()
+                    onDelete(token)
+                    return deletes[token] ?: DeleteResult.DELETED
+                }
+            }
         }
     }
 
@@ -271,6 +281,69 @@ class PushRegistrationCoordinatorTest {
     @Test
     fun aSessionThatMovedBeforeAdmissionStopsThePost() = runTest {
         assertEquals(RegisterOutcome.STALE, changedBeforeAdmission { current = null })
+    }
+
+    /** The credential is the last wait before a POST, so admission is checked after it. */
+    @Test
+    fun aSignOutRaisedWhileTheCredentialIsFetchedStopsThePost() = runTest {
+        val coordinator = coordinator()
+        server.sessionGate = CompletableDeferred()
+        val registration = async { coordinator.register(a1) }
+        runCurrent()
+        val signOut = launch { coordinator.unregister(a1) }
+        runCurrent()
+
+        server.sessionGate!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(RegisterOutcome.HELD, registration.await())
+        assertTrue(server.calls.none { it.startsWith("POST") })
+        signOut.join()
+    }
+
+    @Test
+    fun anEligibilityLostWhileTheCredentialIsFetchedStopsThePost() = runTest {
+        val coordinator = coordinator()
+        server.sessionGate = CompletableDeferred()
+        val registration = async { coordinator.register(a1) }
+        runCurrent()
+
+        eligibleNow = false
+        server.sessionGate!!.complete(Unit)
+
+        assertEquals(RegisterOutcome.NOT_ELIGIBLE, registration.await())
+        assertEquals(emptyList<String>(), server.calls)
+    }
+
+    @Test
+    fun aCallerCancelledAsItsCredentialArrivesSendsNeitherPostNorDelete() = runTest {
+        val coordinator = coordinator()
+        lateinit var registration: Job
+        server.atSession = { registration.cancel() }
+        registration = launch { coordinator.register(a1) }
+        advanceUntilIdle()
+        assertTrue(registration.isCancelled)
+
+        lateinit var signOut: Job
+        server.atSession = { signOut.cancel() }
+        signOut = launch { coordinator.unregister(a1) }
+        advanceUntilIdle()
+
+        assertTrue(signOut.isCancelled)
+        assertEquals(emptyList<String>(), server.calls)
+        assertEquals(OWED, ledger.state.entryFor("a", "t1")?.state)
+    }
+
+    @Test
+    fun noCredentialMeansNoPostAndTheTargetStays() = runTest {
+        val coordinator = coordinator()
+        server.noSession = true
+
+        assertEquals(RegisterOutcome.POST_FAILED, coordinator.register(a1))
+        coordinator.unregister(a1)
+
+        assertEquals(emptyList<String>(), server.calls)
+        assertEquals(listOf(PushLedgerEntry(1, "a", "t1", OWED)), ledger.state.entries)
     }
 
     @Test
