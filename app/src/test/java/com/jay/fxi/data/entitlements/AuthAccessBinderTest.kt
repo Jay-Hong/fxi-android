@@ -85,7 +85,9 @@ class AuthAccessBinderTest {
         purger: RecordingPurger = RecordingPurger(),
         seedJournal: Boolean = false,
         /** `fresh_premium` flag of every query the binding issued, in order. */
-        fetches: MutableList<Boolean> = mutableListOf()
+        fetches: MutableList<Boolean> = mutableListOf(),
+        /** What the coordinator reads as the live fence. Signed out unless a test says otherwise. */
+        live: () -> AuthIdentityFence? = { null }
     ): AuthAccessBinder {
         val store = RecordingStore(calls)
         if (seedJournal) {
@@ -132,7 +134,8 @@ class AuthAccessBinderTest {
             capabilityPurger = purger,
             scope = scope,
             clock = { testScheduler.currentTime },
-            jitter = ProbeJitter.None
+            jitter = ProbeJitter.None,
+            liveFence = live
         )
         // No stream: every test drives onFenceObserved itself, so registration order cannot make
         // a test pass for the wrong reason.

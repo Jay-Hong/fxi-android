@@ -23,6 +23,24 @@ internal enum class TeardownKnowledge {
     LANDED
 }
 
+/** Where an app sign-out request ended up. Only [Armed] lets its caller run the sign-out. */
+internal sealed interface SignOutStart {
+    /** The request's fence is no longer live. Nothing was sealed or written. */
+    data object Stale : SignOutStart
+
+    /** An attempt for the same fence is already open. Being told about it is not a right to run it. */
+    data class Joined(val ticket: SignOutTicket) : SignOutStart
+
+    /** An attempt for another fence is open. */
+    data class Busy(val ticket: SignOutTicket) : SignOutStart
+
+    /** The intent is persisted: this caller, and only this one, may run the sign-out. */
+    data class Armed(val ticket: SignOutTicket) : SignOutStart
+
+    /** Access is sealed but the sign-out cannot run; recovery owns the attempt. */
+    data class RecoveryRequired(val ticket: SignOutTicket) : SignOutStart
+}
+
 /** The namespace edit whose outcome a [SignOutAttempt.Unresolved] is waiting to read back. */
 internal enum class PendingEdit { READ, BEGIN_SIGN_OUT, BIND_OWNER, SIGN_OUT }
 
@@ -36,7 +54,10 @@ internal sealed interface EditResult {
      */
     data class Landed(val after: AccessEpochRecord) : EditResult
 
-    /** Nothing was edited — the edit was deliberately not attempted. */
+    /**
+     * The edit did not take effect: it was not attempted, or a read-back after a failed attempt
+     * showed it absent.
+     */
     data object NotAttempted : EditResult
 
     /** Neither the edit nor a read-back established what happened. */
@@ -130,7 +151,7 @@ internal object SignOutAttemptPolicy {
         current !is SignOutAttempt.Preparing && current !is SignOutAttempt.Unresolved
 
     sealed interface Prologue {
-        /** The request's fence is no longer live. Nothing was sealed. */
+        /** The request's fence is no longer live. Do not start its intent write. */
         data object Stale : Prologue
 
         /** The disk owner could not be read. Sealed; nothing written. */
@@ -251,8 +272,8 @@ internal object SignOutAttemptPolicy {
      *
      * This function decides only the namespace result. Before applying a null result, the caller
      * must accept cleanup as Completed or Deferred. On purge/clear failure it must instead retain
-     * Recovering(LANDED), together with the completed end's receipt, so retrying cleanup does not
-     * execute that end's rotation again.
+     * Recovering(LANDED). Cleanup retries must not replay this end's rotation; the driver is
+     * responsible for keeping those operations separate.
      */
     fun afterEnd(
         attempt: SignOutAttempt,

@@ -4,6 +4,7 @@ import android.os.SystemClock
 import com.google.firebase.auth.FirebaseAuth
 import com.jay.fxi.data.entitlements.AccessEpochStore
 import com.jay.fxi.data.auth.AuthFenceStream
+import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.entitlements.AuthAccessBinder
 import com.jay.fxi.data.entitlements.AuthUidStream
 import com.jay.fxi.data.entitlements.CapabilityScopePurger
@@ -84,14 +85,17 @@ object EntitlementsModule {
         store: AccessEpochStore,
         userPurger: UserScopePurger,
         capabilityPurger: CapabilityScopePurger,
-        clock: RecheckClock
+        clock: RecheckClock,
+        authTokenProvider: AuthTokenProvider
     ): PremiumAccessCoordinator = PremiumAccessCoordinator(
         source = source,
         store = store,
         userPurger = userPurger,
         capabilityPurger = capabilityPurger,
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-        clock = clock
+        clock = clock,
+        // The same read an app sign-out captures its fence with.
+        liveFence = authTokenProvider::currentIdentityFence
     )
 
     /**

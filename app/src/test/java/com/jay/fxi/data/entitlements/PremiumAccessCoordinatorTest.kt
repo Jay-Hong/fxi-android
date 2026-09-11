@@ -109,7 +109,9 @@ class PremiumAccessCoordinatorTest {
     private fun TestScope.build(
         store: FakeStore,
         source: EntitlementsSource,
-        purger: RecordingPurger = RecordingPurger(PurgeResult.Completed)
+        purger: RecordingPurger = RecordingPurger(PurgeResult.Completed),
+        /** The live auth fence the coordinator reads. Signed out unless a test says otherwise. */
+        live: () -> AuthIdentityFence? = { null }
     ) = PremiumAccessCoordinator(
         source = source,
         store = store,
@@ -119,7 +121,8 @@ class PremiumAccessCoordinatorTest {
         clock = { testScheduler.currentTime },
         // Exact nominal delays. Production spreads them; a test that cannot pin the spread
         // cannot assert when a tick fired.
-        jitter = ProbeJitter.None
+        jitter = ProbeJitter.None,
+        liveFence = live
     )
 
     private fun ids(): EpochIdGenerator {
@@ -738,7 +741,7 @@ class PremiumAccessCoordinatorTest {
         testScheduler.runCurrent()
         val duringProbe = calls
 
-        coordinator.onSignedOut()
+        coordinator.onSignedOut(ownerFence(OWNER))
         advanceUntilIdle()
 
         assertEquals("a signed-out user's probe kept querying", duringProbe, calls)
@@ -819,7 +822,7 @@ class PremiumAccessCoordinatorTest {
             coordinator.onIdentityChanged(ownerFence(OWNER))
             advanceUntilIdle()
 
-            coordinator.onSignedOut()
+            coordinator.onSignedOut(ownerFence(OWNER))
             source.identity = null
             assertEquals("the record keeps its uid on purpose", OWNER, store.record.ownerUid)
             calls = 0
@@ -864,7 +867,7 @@ class PremiumAccessCoordinatorTest {
             runCurrent()
 
             // The sign-out happens while the probe is parked reading the identity.
-            val signOut = async { coordinator.onSignedOut() }
+            val signOut = async { coordinator.onSignedOut(ownerFence(OWNER)) }
             runCurrent()
             source.identity = null
             gate.complete(Unit)
@@ -982,7 +985,7 @@ class PremiumAccessCoordinatorTest {
         advanceUntilIdle()
         val epochWhileSignedIn = store.record.userAccessEpoch
 
-        coordinator.onSignedOut()
+        coordinator.onSignedOut(ownerFence(OWNER))
         advanceUntilIdle()
 
         assertNotEquals(epochWhileSignedIn, store.record.userAccessEpoch)
@@ -1038,7 +1041,8 @@ class PremiumAccessCoordinatorTest {
             userPurger = selective,
             capabilityPurger = selective,
             scope = CoroutineScope(processJob + StandardTestDispatcher(testScheduler)),
-            clock = { testScheduler.currentTime }
+            clock = { testScheduler.currentTime },
+            liveFence = { null }
         )
         second.resumePendingPurges()
         advanceUntilIdle()
@@ -1109,7 +1113,7 @@ class PremiumAccessCoordinatorTest {
 
         val gate = CompletableDeferred<Unit>()
         store.blockNextSignOutOn = gate
-        val teardown = launch { coordinator.onSignedOut() }
+        val teardown = launch { coordinator.onSignedOut(ownerFence(OWNER)) }
         advanceUntilIdle()
 
         assertEquals(
@@ -1253,7 +1257,7 @@ class PremiumAccessCoordinatorTest {
                 coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = binding)
             }
             source.identity = null
-            coordinator.onSignedOut()
+            coordinator.onSignedOut(ownerFence(OWNER))
             runCurrent()
             queuedLookup.join()
             advanceTimeBy(30_000L)
@@ -1279,7 +1283,7 @@ class PremiumAccessCoordinatorTest {
             coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
             advanceTimeBy(1_000L)
             source.identity = null
-            coordinator.onSignedOut()
+            coordinator.onSignedOut(ownerFence(OWNER))
             // The first binding owns probe epoch 1; sign-out has advanced it to 2.
             coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireProbeEpoch = 1L)
             advanceTimeBy(30_000L)
@@ -1334,7 +1338,7 @@ class PremiumAccessCoordinatorTest {
             coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
             advanceTimeBy(1_000L)
             source.identity = null
-            coordinator.onSignedOut()
+            coordinator.onSignedOut(ownerFence(OWNER))
             // Model a callback already delivered when cancellation arrives. SCHEDULED bypasses
             // the floor, but must still validate the epoch captured when the timer was armed.
             coordinator.refresh(

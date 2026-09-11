@@ -78,7 +78,12 @@ class AuthAccessBinder(
     fun start() {
         scope.launch {
             coordinator.resumePendingPurges()
-            for (fence in inbox) handle(fence)
+            for (fence in inbox) {
+                // An open sign-out with an edit in flight holds identity events, in order, until
+                // that edit's outcome is known. The coordinator decides that under its own lock and
+                // hands a held event back, so the same event stays first and is tried again.
+                while (!handle(fence)) coordinator.awaitIdentityEventsAdmitted()
+            }
         }
         // AuthFenceStream replays the tracker's current fence when this subscriber registers.
         // The binder must not synthesize another initial observation.
@@ -90,11 +95,12 @@ class AuthAccessBinder(
         inbox.trySend(fence)
     }
 
-    private suspend fun handle(fence: AuthIdentityFence?) {
+    /** False when the coordinator held the event; nothing was applied and it must be retried. */
+    private suspend fun handle(fence: AuthIdentityFence?): Boolean {
         when {
             fence != null && fence != boundFence -> {
+                val boundDecisionGeneration = coordinator.onIdentityChanged(fence) ?: return false
                 boundFence = fence
-                val boundDecisionGeneration = coordinator.onIdentityChanged(fence)
                 // `onIdentityChanged` binds the owner and resets to NoGrant; it asks the server
                 // nothing. D23 also says a cold-start grant can only come from a `fresh_premium`
                 // answer, so without a query here an existing subscriber who merely restores a
@@ -122,9 +128,13 @@ class AuthAccessBinder(
                 }
             }
             fence == null && boundFence != null -> {
+                // The session this null ends, so the coordinator rotates that uid's namespace and
+                // not whoever the record happens to name.
+                val ended = checkNotNull(boundFence)
+                if (!coordinator.onSignedOut(ended)) return false
                 boundFence = null
-                coordinator.onSignedOut()
             }
         }
+        return true
     }
 }

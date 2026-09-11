@@ -148,7 +148,8 @@ class RootViewModelTest {
             userPurger = UserScopePurger { PurgeResult.Completed },
             capabilityPurger = CapabilityScopePurger { PurgeResult.Completed },
             scope = scope,
-            clock = { testScope.testScheduler.currentTime }
+            clock = { testScope.testScheduler.currentTime },
+            liveFence = tokens::currentIdentityFence
         )
         val root = RootViewModel(coordinator, tokens)
 

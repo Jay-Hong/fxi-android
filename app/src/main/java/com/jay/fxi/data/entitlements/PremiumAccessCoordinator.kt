@@ -1,6 +1,7 @@
 package com.jay.fxi.data.entitlements
 
 import com.jay.fxi.data.auth.AuthIdentityFence
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -8,6 +9,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -33,7 +35,14 @@ class PremiumAccessCoordinator(
     private val capabilityPurger: CapabilityScopePurger,
     private val scope: CoroutineScope,
     clock: RecheckClock,
-    private val jitter: ProbeJitter = ProbeJitter.Default
+    private val jitter: ProbeJitter = ProbeJitter.Default,
+    /**
+     * The live auth fence, read from the auth tracker — the same read an app sign-out captures its
+     * fence with. Not [EntitlementsSource.currentIdentity], which turns a lookup failure other than
+     * cancellation into null. Read fresh at each decision that depends on it, after the last
+     * suspension before that decision.
+     */
+    private val liveFence: () -> AuthIdentityFence?
 ) {
     private val mutex = Mutex()
 
@@ -90,6 +99,21 @@ class PremiumAccessCoordinator(
     /** The owner a probe is currently running for, or null. Single-flight, iOS parity. */
     private var probeRunningForOwner: String? = null
 
+    /** The open app sign-out, or null. Guarded by [mutex]; transitions come from [SignOutAttemptPolicy]. */
+    private var attempt: SignOutAttempt? = null
+    private var nextTicket: Long = 0L
+
+    /**
+     * The fence whose binding reached the disk: set once `bindOwner` returns, cleared by an end.
+     *
+     * Not [state]'s identity — that is published *before* the disk work, so it can name a binding
+     * that never landed. Guarded by [mutex].
+     */
+    private var completedBinding: AuthIdentityFence? = null
+
+    /** False while the open attempt has an edit in flight. Identity events wait on it. */
+    private val identityEventsAdmitted = MutableStateFlow(true)
+
     private val schedule =
         RecheckSchedule(scope, clock) { intent, origin, bindingEpoch ->
             refresh(intent, origin, requireProbeEpoch = bindingEpoch)
@@ -108,8 +132,14 @@ class PremiumAccessCoordinator(
      * The generation is taken from [identity] and **not re-read**. A re-read can pair the uid from
      * one observation with the generation of another. It can also advance the tracker if it sees
      * a changed uid or session marker; an unchanged observation does not advance it.
+     *
+     * Returns null, having done nothing, while an open sign-out has an edit in flight. The caller
+     * keeps the event and tries again once [awaitIdentityEventsAdmitted] returns.
      */
-    suspend fun onIdentityChanged(identity: AuthIdentityFence): AccessDecisionGeneration = mutex.withLock {
+    suspend fun onIdentityChanged(identity: AuthIdentityFence): AccessDecisionGeneration? = mutex.withLock {
+        // Checked under the same lock as the edit below: a gate seen open before this lock was
+        // taken can have closed since.
+        if (!SignOutAttemptPolicy.admitsIdentityEvents(attempt)) return@withLock null
         decisionGeneration += 1
         cancelProbeLocked()
         clearForcePremiumLocked()
@@ -118,7 +148,18 @@ class PremiumAccessCoordinator(
         _state.value =
             OwnedPremiumAccess(identity.uid, identity.authGeneration, PremiumAccessState.NoGrant)
         schedule.cancel(preserveServerFloor = true)
-        store.bindOwner(identity.uid)
+        val before = store.load()
+        val after = store.bindOwner(identity.uid)
+        completedBinding = identity
+        // Judged from the record the bind returned, before any purge below can clear its receipt.
+        attempt?.let { open ->
+            setAttemptLocked(
+                SignOutAttemptPolicy.identityBound(
+                    open,
+                    retiredAttemptNamespace = SignOutAttemptPolicy.retired(before, after, open.fence.uid)
+                )
+            )
+        }
         _krx.value = KrxCapabilityState.HIDDEN
         _lastEffects.value = emptyList()
         resumePendingPurgesLocked()
@@ -135,7 +176,9 @@ class PremiumAccessCoordinator(
      * namespace and journals a purge. Clearing only in-memory state would let the next sign-in of
      * the same uid inherit protected data that was never re-authorised.
      */
-    suspend fun onSignedOut() = mutex.withLock {
+    suspend fun onSignedOut(ended: AuthIdentityFence): Boolean = mutex.withLock {
+        // Same contract as [onIdentityChanged]: held, untouched, while an edit is in flight.
+        if (!SignOutAttemptPolicy.admitsIdentityEvents(attempt)) return@withLock false
         decisionGeneration += 1
         cancelProbeLocked()
         clearForcePremiumLocked()
@@ -145,9 +188,134 @@ class PremiumAccessCoordinator(
         // window matches on uid and opens the premium surface on a session that no longer exists.
         _state.value = OwnedPremiumAccess(null, null, PremiumAccessState.NoGrant)
         schedule.cancel(preserveServerFloor = true)
-        store.signOut()
+        // Targeted: `store.signOut()` rotates whoever the record names, so it only runs when that is
+        // the uid whose session ended.
+        val rotation = when (SignOutAttemptPolicy.planEnd(ended, store.load().ownerUid)) {
+            SignOutAttemptPolicy.EndPlan.ROTATE -> EditResult.Landed(store.signOut())
+            SignOutAttemptPolicy.EndPlan.LEAVE_DISK -> EditResult.NotAttempted
+        }
+        completedBinding = null
         _krx.value = KrxCapabilityState.HIDDEN
-        resumePendingPurgesLocked()
+        // What this end did is recorded before cleanup runs, because cleanup can throw. Only
+        // finishing the attempt — which releases the seal — waits for it.
+        val finishing = attempt?.let { open ->
+            val next = SignOutAttemptPolicy.afterEnd(open, ended, rotation, liveFence())
+            // Null only when the rotation landed, so the provisional state says exactly that.
+            setAttemptLocked(next ?: SignOutAttempt.Recovering(open.ticket, open.fence, TeardownKnowledge.LANDED))
+            next == null
+        } ?: false
+        val cleanupOk = resumePendingPurgesLocked()
+        // Read again after the last suspension: somebody may have signed in during cleanup.
+        if (finishing && cleanupOk && liveFence() == null) setAttemptLocked(null)
+        true
+    }
+
+    /**
+     * Starts an app sign-out for [fence]: seals access, then persists the intent.
+     *
+     * The order is fixed — live check, seal, disk. A request already stale at entry does not seal
+     * or write. Sealing publishes NoGrant and HIDDEN and closes this coordinator's protected
+     * access entry points before disk work.
+     */
+    internal suspend fun prepareSignOut(fence: AuthIdentityFence): SignOutStart = mutex.withLock {
+        when (val request = SignOutAttemptPolicy.request(attempt, fence)) {
+            is SignOutAttemptPolicy.Request.Joined -> return@withLock SignOutStart.Joined(request.ticket)
+            is SignOutAttemptPolicy.Request.Busy -> return@withLock SignOutStart.Busy(request.ticket)
+            SignOutAttemptPolicy.Request.Start -> Unit
+        }
+        val live = liveFence()
+        if (live != fence) return@withLock SignOutStart.Stale
+        val ticket = SignOutTicket(++nextTicket)
+        // Keep the seal represented even if the first read is cancelled.
+        setAttemptLocked(
+            SignOutAttempt.Unresolved(
+                ticket, fence, PendingEdit.READ, TeardownKnowledge.NOT_OWED, before = null
+            )
+        )
+        sealLocked(fence)
+        val read = try {
+            Result.success(store.load())
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failed: Exception) {
+            Result.failure(failed)
+        }
+        val prologue = SignOutAttemptPolicy.prologue(
+            ticket, fence, liveFence(), completedBinding, read.map { it.ownerUid }
+        )
+        when (prologue) {
+            SignOutAttemptPolicy.Prologue.Stale -> {
+                // Already sealed, but no intent write was attempted.
+                // A failed read keeps the unresolved READ state.
+                if (read.isSuccess) {
+                    setAttemptLocked(
+                        SignOutAttempt.Recovering(ticket, fence, TeardownKnowledge.NOT_OWED)
+                    )
+                }
+                SignOutStart.RecoveryRequired(ticket)
+            }
+            is SignOutAttemptPolicy.Prologue.Unreadable -> {
+                setAttemptLocked(prologue.attempt)
+                SignOutStart.RecoveryRequired(ticket)
+            }
+            is SignOutAttemptPolicy.Prologue.RecoveryRequired -> {
+                setAttemptLocked(prologue.attempt)
+                SignOutStart.RecoveryRequired(ticket)
+            }
+            is SignOutAttemptPolicy.Prologue.Persist -> {
+                setAttemptLocked(prologue.attempt)
+                // Not abandoned half way: a Preparing attempt holds every identity event, and a
+                // cancellation here would leave it holding them with nothing to settle it.
+                withContext(NonCancellable) {
+                    val write = persistIntentLocked(fence.uid, read.getOrThrow())
+                    val next = SignOutAttemptPolicy.intentWritten(prologue.attempt, write, liveFence())
+                    setAttemptLocked(next)
+                    if (next is SignOutAttempt.Armed) SignOutStart.Armed(ticket)
+                    else SignOutStart.RecoveryRequired(ticket)
+                }
+            }
+        }
+    }
+
+    /**
+     * The intent write, classified by what reached the disk.
+     *
+     * An exception alone does not say whether the edit became durable, so the record is read back.
+     * A read-back that shows the intent confirms that edit; one that does not is not treated as the
+     * edit landing.
+     */
+    private suspend fun persistIntentLocked(uid: String, before: AccessEpochRecord): EditResult = try {
+        EditResult.Landed(store.beginSignOut(uid))
+    } catch (failed: Exception) {
+        // Called inside NonCancellable. A CancellationException thrown by the store still
+        // needs reconciliation; it does not establish whether the edit reached disk.
+        try {
+            val readBack = store.load()
+            if (SignOutAttemptPolicy.holdsIntent(readBack, uid)) EditResult.Landed(readBack)
+            else EditResult.NotAttempted
+        } catch (unreadable: Exception) {
+            EditResult.Unknown(before)
+        }
+    }
+
+    /** Takes protected access away from [fence] ahead of disk work; see [onSignedOut] for why first. */
+    private suspend fun sealLocked(fence: AuthIdentityFence) {
+        decisionGeneration += 1
+        cancelProbeLocked()
+        clearForcePremiumLocked()
+        _state.value = OwnedPremiumAccess(fence.uid, fence.authGeneration, PremiumAccessState.NoGrant)
+        _krx.value = KrxCapabilityState.HIDDEN
+        schedule.cancel(preserveServerFloor = true)
+    }
+
+    /** Suspends while the open sign-out has an edit in flight. The identity FIFO waits here. */
+    suspend fun awaitIdentityEventsAdmitted() {
+        identityEventsAdmitted.first { it }
+    }
+
+    private fun setAttemptLocked(next: SignOutAttempt?) {
+        attempt = next
+        identityEventsAdmitted.value = SignOutAttemptPolicy.admitsIdentityEvents(next)
     }
 
     /**
@@ -185,6 +353,7 @@ class PremiumAccessCoordinator(
             // read and the lock: the record keeps its uid, so the stale identity would still match
             // and the probe would adopt the *post*-sign-out epoch as its own — passing every later
             // fence. Both facts are then established under one critical section.
+            if (!SignOutAttemptPolicy.admitsAccessQueries(attempt)) return
             val live = source.currentIdentity() ?: return
             val owner = store.load().ownerUid ?: return
             if (owner != live.ownerUid) return
@@ -227,7 +396,9 @@ class PremiumAccessCoordinator(
     private data class ProbeRun(val owner: String, val epoch: Long)
 
     /** Re-runs purges a previous process journalled but did not finish. */
-    suspend fun resumePendingPurges() = mutex.withLock { resumePendingPurgesLocked() }
+    suspend fun resumePendingPurges() {
+        mutex.withLock { resumePendingPurgesLocked() }
+    }
 
     suspend fun refresh(
         intent: RefreshIntent,
@@ -247,6 +418,8 @@ class PremiumAccessCoordinator(
     ) {
         var token: Long? = null
         val started: StartedQuery = mutex.withLock {
+            // First, ahead of the schedule and the store: an open sign-out admits no query at all.
+            if (!SignOutAttemptPolicy.admitsAccessQueries(attempt)) return
             if (requireProbeEpoch != null && probeEpoch != requireProbeEpoch) return
             // The caller pinned this query to a binding. `launch` gives no ordering guarantee
             // against a sign-out that ran while it was still queued, and by the time this body runs
@@ -307,6 +480,7 @@ class PremiumAccessCoordinator(
     /** Feeds a WebSocket topic rejection into the same reducer. Not produced by the REST path. */
     suspend fun onTopicRejected(code: TopicRejection) {
         val started = mutex.withLock {
+            if (!SignOutAttemptPolicy.admitsAccessQueries(attempt)) return
             StartedQuery(store.load().fence(), decisionGeneration, boundIdentityLocked())
         }
         val outcome = when (code) {
@@ -365,6 +539,8 @@ class PremiumAccessCoordinator(
         // reaches back through its fire-time callback, which runs in its own coroutine after both
         // locks are released.
         mutex.withLock {
+            // An answer landing while a sign-out is open is dropped without arming anything.
+            if (!SignOutAttemptPolicy.admitsAccessQueries(attempt)) return
             val record = store.load()
             // Five independent staleness checks, because each catches something the others miss:
             //  - generation: an authoritative loss or reset that rotated nothing,
@@ -469,10 +645,14 @@ class PremiumAccessCoordinator(
      * Per entry, not per journal: a chain of account switches leaves several superseded
      * namespaces, and clearing them together would strand whichever ones the purger could not
      * finish.
+     *
+     * Returns false when a purger reported [PurgeResult.Failed]. [PurgeResult.Deferred] is not a
+     * failure: it is what the current wiring always answers.
      */
-    private suspend fun resumePendingPurgesLocked() {
+    private suspend fun resumePendingPurgesLocked(): Boolean {
         val record = store.load()
-        if (record.pendingPurges.isEmpty()) return
+        if (record.pendingPurges.isEmpty()) return true
+        var failed = false
         val completed = record.pendingPurges.filter { entry ->
             val namespace = PurgeNamespace(
                 ownerUid = entry.ownerUid,
@@ -480,14 +660,17 @@ class PremiumAccessCoordinator(
                 currentKrxCapabilityEpoch = record.krxCapabilityEpoch,
                 pending = entry
             )
-            entry.scopes.map { purgeScope ->
+            val results = entry.scopes.map { purgeScope ->
                 when (purgeScope) {
                     PurgeScope.USER -> userPurger.purgeUserScope(namespace)
                     PurgeScope.CAPABILITY -> capabilityPurger.purgeCapabilityScope(namespace)
                 }
-            }.all { it == PurgeResult.Completed }
+            }
+            if (results.any { it is PurgeResult.Failed }) failed = true
+            results.all { it == PurgeResult.Completed }
         }
         if (completed.isNotEmpty()) store.completePurges(completed)
+        return !failed
     }
 }
 
