@@ -737,6 +737,52 @@ class PremiumAccessCoordinatorSignOutTest {
     }
 
     @Test
+    fun onlyTheArmedDriversOwnTicketStopsIt() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+
+        assertFalse(h.coordinator.stopDriver(SignOutTicket(ticket.value + 1)))
+        assertEquals(RecoveryAdvance.DRIVER_OWNS, h.coordinator.advanceRecovery(ticket))
+        assertTrue(h.coordinator.stopDriver(ticket))
+        assertFalse("멈춘 실행자를 다시 멈췄다", h.coordinator.stopDriver(ticket))
+        assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(1, h.store.signOuts)
+    }
+
+    @Test
+    fun theRecoveryStatusIsTheOpenAttemptsAndGoesWithIt() = runTest {
+        val h = harness()
+        val ticket = unboundRecovery(h)
+        h.coordinator.publishRecovery(ticket) { it.copy(running = true) }
+        assertEquals(SignOutRecoveryStatus(ticket, running = true), h.coordinator.recoveryStatus.value)
+
+        // A change within the same attempt keeps it.
+        h.store.loadsFail = true
+        assertEquals(RecoveryAdvance.UNRESOLVED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(SignOutRecoveryStatus(ticket, running = true), h.coordinator.recoveryStatus.value)
+        h.store.loadsFail = false
+        assertEquals(RecoveryAdvance.RESOLVED, h.coordinator.advanceRecovery(ticket))
+
+        // The attempt ends, and a late write for it is dropped.
+        assertEquals(BarrierStep.RELEASED, h.coordinator.completeRecovery(ticket, a7).step)
+        assertNull(h.coordinator.recoveryStatus.value)
+        h.coordinator.publishRecovery(ticket) { it.copy(running = false, outcome = RecoveryOutcome.CLOSED) }
+        assertNull("끝난 시도의 늦은 결과가 기록됐다", h.coordinator.recoveryStatus.value)
+    }
+
+    @Test
+    fun anAutomaticRunIsClaimedOnceAndOnlyWhileRecoveryOwnsTheAttempt() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+
+        assertFalse("실행자가 있는 시도를 복구가 가져갔다", h.coordinator.claimRecovery(ticket))
+        assertTrue(h.coordinator.stopDriver(ticket))
+        assertFalse(h.coordinator.claimRecovery(SignOutTicket(ticket.value + 1)))
+        assertTrue(h.coordinator.claimRecovery(ticket))
+        assertFalse("같은 시도를 두 번 가져갔다", h.coordinator.claimRecovery(ticket))
+    }
+
+    @Test
     fun recoveryLeavesADriverAloneAndIgnoresAnotherTicket() = runTest {
         val h = harness()
         val ticket = armed(h)

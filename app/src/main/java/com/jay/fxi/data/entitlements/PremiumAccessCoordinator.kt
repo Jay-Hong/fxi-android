@@ -116,6 +116,17 @@ class PremiumAccessCoordinator(
     /** The identity event held by a failed edit, until that same event is applied. Guarded by [mutex]. */
     private var heldEvent: HeldIdentityEvent? = null
 
+    /** The attempt whose automatic recovery has been claimed. Tickets are never reused. Guarded by [mutex]. */
+    private var recoveryClaimed: SignOutTicket? = null
+
+    private val _recoveryStatus = MutableStateFlow<SignOutRecoveryStatus?>(null)
+
+    /**
+     * The open attempt's automatic recovery, for the recovery banner. Written under [mutex] together
+     * with the attempt, so it never outlives the attempt it describes. See [SignOutRecoveryStatus].
+     */
+    internal val recoveryStatus: StateFlow<SignOutRecoveryStatus?> = _recoveryStatus.asStateFlow()
+
     /** The open attempt as the identity FIFO and a recovery run see it. Moves with every attempt change. */
     private val attemptSignal = MutableStateFlow(AttemptSignal(ticket = null, revision = 0L, held = false))
 
@@ -566,11 +577,50 @@ class PremiumAccessCoordinator(
 
     private fun setAttemptLocked(next: SignOutAttempt?) {
         attempt = next
+        // The status is the open attempt's and goes with it.
+        if (_recoveryStatus.value?.ticket != next?.ticket) _recoveryStatus.value = null
         attemptSignal.value = AttemptSignal(
             ticket = next?.ticket,
             revision = attemptSignal.value.revision + 1,
-            held = !SignOutAttemptPolicy.admitsIdentityEvents(next)
+            held = !SignOutAttemptPolicy.admitsIdentityEvents(next),
+            recovering = next is SignOutAttempt.Recovering || next is SignOutAttempt.Unresolved
         )
+    }
+
+    /** Every change of the open attempt, for the binder's recovery supervisor. A hint: decisions are taken under the lock. */
+    internal val attemptSignals: StateFlow<AttemptSignal> get() = attemptSignal
+
+    /**
+     * Takes the one automatic recovery run [ticket] gets, if it is the open attempt and recovery owns
+     * it now. Judged under the lock, so a state seen only briefly — the unresolved read a preparation
+     * starts with, before it arms — does not use the claim up.
+     */
+    internal suspend fun claimRecovery(ticket: SignOutTicket): Boolean = mutex.withLock {
+        val open = attempt
+        val recoverable = open is SignOutAttempt.Recovering || open is SignOutAttempt.Unresolved
+        if (open?.ticket != ticket || !recoverable || recoveryClaimed == ticket) return@withLock false
+        recoveryClaimed = ticket
+        true
+    }
+
+    /** Records [change] to [ticket]'s recovery status, only if it is still the open attempt — checked and written under the lock. */
+    internal suspend fun publishRecovery(ticket: SignOutTicket, change: (SignOutRecoveryStatus) -> SignOutRecoveryStatus) {
+        mutex.withLock {
+            if (attempt?.ticket != ticket) return@withLock
+            _recoveryStatus.value =
+                change(_recoveryStatus.value?.takeIf { it.ticket == ticket } ?: SignOutRecoveryStatus(ticket, running = false))
+        }
+    }
+
+    /**
+     * Called by the stopped driver. Transfers only the matching Armed attempt to Recovering(OWED),
+     * without disk work. The recovery executor orders settlement after its FIFO barrier.
+     */
+    internal suspend fun stopDriver(ticket: SignOutTicket): Boolean = mutex.withLock {
+        val open = attempt as? SignOutAttempt.Armed ?: return@withLock false
+        if (open.ticket != ticket) return@withLock false
+        setAttemptLocked(SignOutAttemptPolicy.driverStopped(open))
+        true
     }
 
     /**

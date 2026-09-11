@@ -115,8 +115,16 @@ internal sealed interface BarrierBind {
     data object NotLanded : BarrierBind
 }
 
-/** What the identity FIFO and a recovery run watch: which attempt is open, and whether it holds events. */
-internal data class AttemptSignal(val ticket: SignOutTicket?, val revision: Long, val held: Boolean)
+/**
+ * What the identity FIFO and a recovery run watch: which attempt is open, whether it holds events,
+ * and whether recovery owns it.
+ */
+internal data class AttemptSignal(
+    val ticket: SignOutTicket?,
+    val revision: Long,
+    val held: Boolean,
+    val recovering: Boolean = false
+)
 
 /** One step of recovery, outside the identity FIFO. */
 internal enum class RecoveryAdvance {
@@ -161,6 +169,20 @@ internal enum class RecoveryOutcome {
     /** The run used up its barrier re-entries while the identity kept moving. Still sealed. */
     RETRY_LATER
 }
+
+/**
+ * What the process knows about the open attempt's automatic recovery, for the recovery banner.
+ *
+ * Kept only while [ticket] is the open attempt: it goes when the attempt ends, and a late result
+ * for an ended attempt is not written. [outcome] is null until a run returns.
+ */
+internal data class SignOutRecoveryStatus(
+    val ticket: SignOutTicket,
+    val running: Boolean,
+    val outcome: RecoveryOutcome? = null,
+    /** The run ended with an exception rather than an outcome. */
+    val failed: Boolean = false
+)
 
 internal enum class BarrierStep {
     CLOSED,

@@ -1,6 +1,7 @@
 package com.jay.fxi.data.entitlements
 
 import com.jay.fxi.data.auth.AuthFenceStream
+import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CompletableDeferred
@@ -33,6 +34,9 @@ import org.junit.rules.Timeout
 class AuthAccessBinderTest {
 
     private val processJob = SupervisorJob()
+
+    /** The coordinator the last [build] made, for reading its recovery status. */
+    private lateinit var built: PremiumAccessCoordinator
 
     /** A consumer that stops waiting and spins can keep a test from finishing; fail the test instead. */
     @get:Rule
@@ -73,6 +77,9 @@ class AuthAccessBinderTest {
 
         /** Fails the next read. */
         var failNextLoad = false
+
+        /** Runs after the sign-out intent reached the record. */
+        var onBeginSignOut: () -> Unit = {}
 
         /** Runs after a bind reached the record. */
         var onBind: () -> Unit = {}
@@ -118,7 +125,7 @@ class AuthAccessBinderTest {
             AccessEpochTransitions.markMayContainData(record, premium, krx).also { record = it }
 
         override suspend fun beginSignOut(uid: String) =
-            AccessEpochTransitions.beginSignOut(record, uid).also { record = it }
+            AccessEpochTransitions.beginSignOut(record, uid).also { record = it; onBeginSignOut() }
     }
 
     /** Deferred, like production: the journal survives so a resume stays observable. */
@@ -150,7 +157,9 @@ class AuthAccessBinderTest {
         /** Collects failures that end a coroutine of the binder's scope, instead of failing the test run. */
         uncaught: MutableList<Throwable>? = null,
         /** Hands over the coordinator, for a test that reads back an edit from outside the FIFO. */
-        onCoordinator: (PremiumAccessCoordinator) -> Unit = {}
+        onCoordinator: (PremiumAccessCoordinator) -> Unit = {},
+        /** Off unless a test is about the automatic run: the others drive recoverSignOut themselves. */
+        recoverAutomatically: Boolean = false
     ): AuthAccessBinder {
         if (seedJournal) {
             // A journal a previous process left behind — the only thing that makes a resume
@@ -202,10 +211,11 @@ class AuthAccessBinderTest {
             jitter = ProbeJitter.None,
             liveFence = live
         )
+        built = coordinator
         onCoordinator(coordinator)
         // No stream: every test drives onFenceObserved itself, so registration order cannot make
         // a test pass for the wrong reason.
-        return AuthAccessBinder(coordinator, scope, AuthFenceStream { })
+        return AuthAccessBinder(coordinator, scope, AuthFenceStream { }, recoverAutomatically)
     }
 
     @Test
@@ -934,6 +944,254 @@ class AuthAccessBinderTest {
 
         assertTrue("barrier 실패가 실행기에 가지 않았다: $failure", failure is IllegalArgumentException)
         assertTrue("consumer 가 그 실패로 끝나지 않았다: $uncaught", uncaught.singleOrNull() is IllegalArgumentException)
+    }
+
+    // Automatic recovery
+
+    @Test
+    fun anAttemptThatCannotArmIsRecoveredAutomatically() = runTest {
+        val calls = mutableListOf<Call>()
+        val fetches = mutableListOf<Boolean>()
+        val a = fenceOf("user-a", 7L)
+        val binder = build(calls, fetches = fetches, live = { a }, recoverAutomatically = true)
+        binder.start()
+
+        assertTrue(binder.beginSignOut(a) is SignOutStart.RecoveryRequired)
+        advanceUntilIdle()
+
+        assertEquals(listOf(Call.OwnerChanged("user-a")), calls)
+        assertEquals(listOf(true), fetches)
+        assertEquals("끝난 시도의 상태가 남았다", null, built.recoveryStatus.value)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aPreparationThatArmsDoesNotUseUpTheAutomaticRun() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        lateinit var coordinator: PremiumAccessCoordinator
+        val binder = build(calls, live = { a }, store = store, onCoordinator = { coordinator = it }, recoverAutomatically = true)
+        binder.start()
+        binder.onFenceObserved(a)
+        advanceUntilIdle()
+        // Park the preparation's first read, so its brief unresolved state is what the supervisor sees.
+        val gate = CompletableDeferred<Unit>()
+        store.blockNextLoadOn = gate
+        val start = async { binder.beginSignOut(a) }
+        runCurrent()
+        gate.complete(Unit)
+        val ticket = (start.await() as SignOutStart.Armed).ticket
+        advanceUntilIdle()
+
+        assertTrue(coordinator.stopDriver(ticket))
+        advanceUntilIdle()
+
+        // Settled, then bound again to the session still live: the stopped driver's attempt was recovered.
+        assertEquals(listOf(Call.OwnerChanged("user-a"), Call.SignedOut, Call.OwnerChanged("user-a")), calls)
+        processJob.cancel()
+    }
+
+    @Test
+    fun anEndQueuedBehindThePreparationIsAppliedBeforeAnythingIsSettled() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        var live: AuthIdentityFence? = a
+        lateinit var binder: AuthAccessBinder
+        binder = build(calls, live = { live }, store = store, recoverAutomatically = true)
+        binder.start()
+        binder.onFenceObserved(a)
+        advanceUntilIdle()
+        // The session ends while the intent is written: the preparation sees nobody live and hands the
+        // attempt to recovery, with that end still queued behind it.
+        store.onBeginSignOut = {
+            store.onBeginSignOut = {}
+            live = null
+            binder.onFenceObserved(null)
+        }
+
+        assertTrue(binder.beginSignOut(a) is SignOutStart.RecoveryRequired)
+        advanceUntilIdle()
+
+        assertEquals("대기하던 종료를 두 번 회전했다", listOf(Call.OwnerChanged("user-a"), Call.SignedOut), calls)
+        assertEquals(null, built.recoveryStatus.value)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aDriverThatStopsAheadOfAQueuedEndStillRotatesOnce() = runTest {
+        val calls = mutableListOf<Call>()
+        val a = fenceOf("user-a", 7L)
+        var live: AuthIdentityFence? = a
+        lateinit var coordinator: PremiumAccessCoordinator
+        val binder = build(calls, live = { live }, onCoordinator = { coordinator = it }, recoverAutomatically = true)
+        binder.start()
+        binder.onFenceObserved(a)
+        advanceUntilIdle()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.Armed).ticket
+        live = null
+        // The end is queued, not applied, when the driver stops.
+        binder.onFenceObserved(null)
+        assertTrue(coordinator.stopDriver(ticket))
+        advanceUntilIdle()
+
+        assertEquals(listOf(Call.OwnerChanged("user-a"), Call.SignedOut), calls)
+        processJob.cancel()
+    }
+
+    @Test
+    fun anUnfinishedAutomaticRunIsNotRepeatedByLaterSignals() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        val binder = build(calls, live = { a }, store = store, recoverAutomatically = true)
+        binder.start()
+        store.failBinds = true
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        advanceUntilIdle()
+
+        assertEquals(2, store.bindAttempts)
+        assertEquals(
+            SignOutRecoveryStatus(ticket, running = false, outcome = RecoveryOutcome.UNRESOLVED),
+            built.recoveryStatus.value
+        )
+        processJob.cancel()
+    }
+
+    @Test
+    fun aLateResultForAnEndedAttemptIsNotWritten() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        val b = fenceOf("user-b", 3L)
+        var current: AuthIdentityFence? = a
+        var onNextRead: (() -> Unit)? = null
+        lateinit var binder: AuthAccessBinder
+        binder = build(
+            calls,
+            live = { onNextRead?.let { hook -> onNextRead = null; hook() }; current },
+            store = store,
+            recoverAutomatically = true
+        )
+        binder.start()
+        binder.onFenceObserved(a)
+        advanceUntilIdle()
+        binder.beginSignOut(a)
+        current = null
+        // The run's capture queues a sign-in that parks, so the run returns after its attempt ended.
+        val gate = CompletableDeferred<Unit>()
+        onNextRead = {
+            store.blockNextBindOn = gate
+            binder.onFenceObserved(b)
+        }
+        store.failNextSignOut = true
+        binder.onFenceObserved(null)
+        advanceUntilIdle()
+
+        assertEquals("끝난 시도의 늦은 결과가 기록됐다", null, built.recoveryStatus.value)
+        gate.complete(Unit)
+        advanceUntilIdle()
+        assertEquals(null, built.recoveryStatus.value)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aRunInProgressIsShownAsRunning() = runTest {
+        val store = RecordingStore(mutableListOf())
+        val a = fenceOf("user-a", 7L)
+        val binder = build(mutableListOf(), live = { a }, store = store, recoverAutomatically = true)
+        binder.start()
+        val gate = CompletableDeferred<Unit>()
+        store.blockNextBindOn = gate
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        advanceUntilIdle()
+
+        assertEquals(SignOutRecoveryStatus(ticket, running = true), built.recoveryStatus.value)
+        gate.complete(Unit)
+        advanceUntilIdle()
+        assertEquals(null, built.recoveryStatus.value)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aCancellationThrownIntoAnActiveRunIsRecordedAsFailure() = runTest {
+        val a = fenceOf("user-a", 7L)
+        var reads = 0
+        // The third live read is the run's candidate capture; the session changes under it.
+        val binder = build(
+            mutableListOf(),
+            live = { if (++reads == 3) throw AuthIdentityChangedException() else a },
+            recoverAutomatically = true
+        )
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        advanceUntilIdle()
+
+        assertEquals(SignOutRecoveryStatus(ticket, running = false, failed = true), built.recoveryStatus.value)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aCancelledRunStopsShowingAsRunning() = runTest {
+        val store = RecordingStore(mutableListOf())
+        val a = fenceOf("user-a", 7L)
+        val binder = build(mutableListOf(), live = { a }, store = store, recoverAutomatically = true)
+        binder.start()
+        store.blockNextBindOn = CompletableDeferred()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        advanceUntilIdle()
+        assertEquals(SignOutRecoveryStatus(ticket, running = true), built.recoveryStatus.value)
+
+        processJob.cancel()
+        advanceUntilIdle()
+
+        assertEquals(SignOutRecoveryStatus(ticket, running = false), built.recoveryStatus.value)
+    }
+
+    @Test
+    fun aCancelledRunRecordsItStoppedEvenWhileTheLockIsBusy() = runTest {
+        val store = RecordingStore(mutableListOf())
+        val a = fenceOf("user-a", 7L)
+        lateinit var coordinator: PremiumAccessCoordinator
+        val binder = build(
+            mutableListOf(), live = { a }, store = store, onCoordinator = { coordinator = it }, recoverAutomatically = true
+        )
+        binder.start()
+        store.blockNextBindOn = CompletableDeferred()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        advanceUntilIdle()
+        // Someone outside the cancelled scope takes the lock and holds it on a parked read, so the
+        // cancelled run's last record has to wait for it rather than find it free.
+        val readGate = CompletableDeferred<Unit>()
+        store.blockNextLoadOn = readGate
+        val busy = launch { coordinator.advanceRecovery(ticket) }
+        runCurrent()
+        processJob.cancel()
+        advanceUntilIdle()
+        readGate.complete(Unit)
+        busy.join()
+        advanceUntilIdle()
+
+        assertEquals(SignOutRecoveryStatus(ticket, running = false), built.recoveryStatus.value)
+    }
+
+    @Test
+    fun aRunThatThrowsIsRecordedAsFailed() = runTest {
+        val a = fenceOf("user-a", 7L)
+        var reads = 0
+        // The preparation reads the live fence twice; the third read is the run's candidate capture.
+        val binder = build(
+            mutableListOf(),
+            live = { if (++reads == 3) throw IllegalArgumentException("live read") else a },
+            recoverAutomatically = true
+        )
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        advanceUntilIdle()
+
+        assertEquals(SignOutRecoveryStatus(ticket, running = false, failed = true), built.recoveryStatus.value)
+        processJob.cancel()
     }
 }
 /**

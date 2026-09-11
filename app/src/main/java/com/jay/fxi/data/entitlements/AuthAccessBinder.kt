@@ -11,9 +11,12 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.withContext
 
 /**
  * The signed-in uid, as a callback stream.
@@ -65,7 +68,9 @@ fun interface AuthUidStream {
 class AuthAccessBinder(
     private val coordinator: PremiumAccessCoordinator,
     private val scope: CoroutineScope,
-    private val fenceStream: AuthFenceStream
+    private val fenceStream: AuthFenceStream,
+    /** Off only in tests that drive [recoverSignOut] themselves. */
+    private val recoverAutomatically: Boolean = true
 ) {
     private companion object {
         /** Barriers one recovery run may re-enqueue after RECAPTURE or NOT_READY, together. */
@@ -148,6 +153,7 @@ class AuthAccessBinder(
             // Also covers cancellation that prevents the launch body from starting.
             stopConsumer(cause)
         }
+        if (recoverAutomatically) scope.launch { superviseRecovery() }
         // AuthFenceStream replays the tracker's current fence when this subscriber registers.
         // The binder must not synthesize another initial observation.
         fenceStream.observe(::onFenceObserved)
@@ -199,36 +205,77 @@ class AuthAccessBinder(
         var reentries = 0
         while (true) {
             currentCoroutineContext().ensureActive()
-            when (coordinator.advanceRecovery(ticket, allowReadBack = readBack.left)) {
-                RecoveryAdvance.RESOLVED -> readBack.spend()
-                RecoveryAdvance.PROGRESSED -> Unit
-                RecoveryAdvance.CLOSED -> return RecoveryOutcome.CLOSED
-                RecoveryAdvance.DRIVER_OWNS -> return RecoveryOutcome.DRIVER_OWNS
-                RecoveryAdvance.UNRESOLVED -> return RecoveryOutcome.UNRESOLVED
-                RecoveryAdvance.INCONSISTENT -> return RecoveryOutcome.INCONSISTENT
-                RecoveryAdvance.NEEDS_BARRIER -> {
-                    // Captured before the barrier is enqueued, so whatever the capture published is queued
-                    // ahead of it rather than adopted by it.
-                    val candidate = coordinator.liveIdentity()
-                    val reply = CompletableDeferred<BarrierOutcome>()
-                    inbox.send(Item.RecoveryBarrier(ticket, candidate, reply))
-                    val outcome = when (val waited = awaitBarrier(ticket, reply, readBack)) {
-                        is Waited.Stopped -> return waited.outcome
-                        is Waited.Replied -> waited.outcome
-                    }
-                    when (outcome.step) {
-                        BarrierStep.RELEASED -> return RecoveryOutcome.FINISHED
-                        BarrierStep.CLOSED -> return RecoveryOutcome.CLOSED
-                        BarrierStep.DRIVER_OWNS -> return RecoveryOutcome.DRIVER_OWNS
-                        BarrierStep.HOLD -> return RecoveryOutcome.HOLD
-                        BarrierStep.CLEANUP_FAILED -> return RecoveryOutcome.CLEANUP_FAILED
-                        BarrierStep.RECAPTURE, BarrierStep.NOT_READY ->
-                            if (++reentries >= MAX_BARRIER_REENTRIES) return RecoveryOutcome.RETRY_LATER
-                        BarrierStep.HELD -> error("the consumer judges a held barrier again before replying")
+            // A barrier first, every time: nothing is settled until the identity events queued ahead of
+            // it are applied, so an end still queued is never rotated twice. The candidate is captured
+            // before the barrier is enqueued, so whatever the capture published is queued ahead of it
+            // rather than adopted by it.
+            val candidate = coordinator.liveIdentity()
+            val reply = CompletableDeferred<BarrierOutcome>()
+            inbox.send(Item.RecoveryBarrier(ticket, candidate, reply))
+            val outcome = when (val waited = awaitBarrier(ticket, reply, readBack)) {
+                is Waited.Stopped -> return waited.outcome
+                is Waited.Replied -> waited.outcome
+            }
+            when (outcome.step) {
+                BarrierStep.RELEASED -> return RecoveryOutcome.FINISHED
+                BarrierStep.CLOSED -> return RecoveryOutcome.CLOSED
+                BarrierStep.DRIVER_OWNS -> return RecoveryOutcome.DRIVER_OWNS
+                BarrierStep.HOLD -> return RecoveryOutcome.HOLD
+                BarrierStep.CLEANUP_FAILED -> return RecoveryOutcome.CLEANUP_FAILED
+                BarrierStep.HELD -> error("the consumer judges a held barrier again before replying")
+                BarrierStep.RECAPTURE ->
+                    if (++reentries >= MAX_BARRIER_REENTRIES) return RecoveryOutcome.RETRY_LATER
+                BarrierStep.NOT_READY -> {
+                    if (++reentries >= MAX_BARRIER_REENTRIES) return RecoveryOutcome.RETRY_LATER
+                    // Owed, and everything queued ahead of the barrier has been applied: settle now.
+                    when (coordinator.advanceRecovery(ticket, allowReadBack = readBack.left)) {
+                        RecoveryAdvance.RESOLVED -> readBack.spend()
+                        RecoveryAdvance.PROGRESSED, RecoveryAdvance.NEEDS_BARRIER -> Unit
+                        RecoveryAdvance.CLOSED -> return RecoveryOutcome.CLOSED
+                        RecoveryAdvance.DRIVER_OWNS -> return RecoveryOutcome.DRIVER_OWNS
+                        RecoveryAdvance.UNRESOLVED -> return RecoveryOutcome.UNRESOLVED
+                        RecoveryAdvance.INCONSISTENT -> return RecoveryOutcome.INCONSISTENT
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Starts the one automatic recovery run each attempt gets once recovery owns it — after a
+     * preparation that could not arm, a driver that stopped, or an end that could not finish.
+     *
+     * The signal only says a run may be due; the claim is taken under the coordinator's lock. Runs go
+     * in their own coroutines, so a later signal neither cancels nor duplicates one, and a run that
+     * fails does not end the watch. Retrying a run that returned unfinished is not this slice's.
+     */
+    private suspend fun superviseRecovery() {
+        coordinator.attemptSignals.collect { signal ->
+            val ticket = signal.ticket
+            if (signal.recovering && ticket != null) scope.launch { runRecovery(ticket) }
+        }
+    }
+
+    /**
+     * Every way a run ends is recorded, so a finished run is never shown as still running. A
+     * CancellationException with this run still active is the run failing; this run's own
+     * cancellation records only that it stopped, and then goes on.
+     */
+    private suspend fun runRecovery(ticket: SignOutTicket) {
+        if (!coordinator.claimRecovery(ticket)) return
+        coordinator.publishRecovery(ticket) { it.copy(running = true) }
+        val result = try {
+            Result.success(recoverSignOut(ticket))
+        } catch (failure: Exception) {
+            Result.failure(failure)
+        }
+        val cancelled = !currentCoroutineContext().isActive
+        withContext(NonCancellable) {
+            coordinator.publishRecovery(ticket) {
+                it.copy(running = false, outcome = result.getOrNull(), failed = result.isFailure && !cancelled)
+            }
+        }
+        currentCoroutineContext().ensureActive()
     }
 
     private class ReadBackBudget {
