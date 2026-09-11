@@ -49,7 +49,7 @@ internal enum class EditResolution {
     /** Classified; identity events are admitted again. */
     RESOLVED,
 
-    /** The record could not be read. Still unresolved. */
+    /** The record could not be read, or reading it was not allowed. Still unresolved. */
     STILL_UNKNOWN,
 
     /** The record is neither the edit's result nor where it started. Still unresolved, and nothing is guessed. */
@@ -115,6 +115,9 @@ internal sealed interface BarrierBind {
     data object NotLanded : BarrierBind
 }
 
+/** What the identity FIFO and a recovery run watch: which attempt is open, and whether it holds events. */
+internal data class AttemptSignal(val ticket: SignOutTicket?, val revision: Long, val held: Boolean)
+
 /** One step of recovery, outside the identity FIFO. */
 internal enum class RecoveryAdvance {
     /** No attempt, or another one. */
@@ -123,7 +126,10 @@ internal enum class RecoveryAdvance {
     /** The original driver still holds the right to run the sign-out. */
     DRIVER_OWNS,
 
-    /** The attempt moved on; call again. */
+    /** A read-back classified an unresolved edit; call again. */
+    RESOLVED,
+
+    /** A settling rotation landed; call again. */
     PROGRESSED,
 
     /** An edit's outcome is not established: it just failed, or its read-back did. */
@@ -134,6 +140,26 @@ internal enum class RecoveryAdvance {
 
     /** Further progress requires the identity FIFO: finish its held event, or run a recovery barrier. */
     NEEDS_BARRIER
+}
+
+/**
+ * How one recovery run ended; calling again is the caller's decision.
+ *
+ * FINISHED means this run observed a RELEASED reply. CLOSED means the ticket was no longer open or a
+ * CLOSED reply was observed; it does not imply that the seal remained held. An outstanding barrier
+ * may finish after the run returns.
+ */
+internal enum class RecoveryOutcome {
+    FINISHED,
+    CLOSED,
+    DRIVER_OWNS,
+    UNRESOLVED,
+    INCONSISTENT,
+    HOLD,
+    CLEANUP_FAILED,
+
+    /** The run used up its barrier re-entries while the identity kept moving. Still sealed. */
+    RETRY_LATER
 }
 
 internal enum class BarrierStep {

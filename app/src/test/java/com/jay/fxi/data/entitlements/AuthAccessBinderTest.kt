@@ -10,6 +10,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -17,7 +18,9 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.Timeout
 
 /**
  * The binder is the only caller of the coordinator's identity transitions, so what it filters and
@@ -30,6 +33,10 @@ import org.junit.Test
 class AuthAccessBinderTest {
 
     private val processJob = SupervisorJob()
+
+    /** A consumer that stops waiting and spins can keep a test from finishing; fail the test instead. */
+    @get:Rule
+    val timeout: Timeout = Timeout.seconds(30)
 
     /** What the coordinator was told, in order. */
     private sealed interface Call {
@@ -58,21 +65,45 @@ class AuthAccessBinderTest {
         /** Fails the next bind before it writes anything. */
         var failNextBind = false
 
+        /** Fails every bind before it writes anything, while set. */
+        var failBinds = false
+
+        /** Fails the next sign-out before it writes anything. */
+        var failNextSignOut = false
+
+        /** Fails the next read. */
+        var failNextLoad = false
+
+        /** Runs after a bind reached the record. */
+        var onBind: () -> Unit = {}
+
+        /** Every bind call, failed ones included. */
+        var bindAttempts = 0
+
         override suspend fun load(): AccessEpochRecord {
             blockNextLoadOn?.let { gate -> blockNextLoadOn = null; gate.await() }
+            if (failNextLoad) {
+                failNextLoad = false
+                throw java.io.IOException("simulated read failure")
+            }
             return record
         }
         override suspend fun bindOwner(uid: String): AccessEpochRecord {
             blockNextBindOn?.let { gate -> blockNextBindOn = null; gate.await() }
-            if (failNextBind) {
+            bindAttempts += 1
+            if (failNextBind || failBinds) {
                 failNextBind = false
                 throw java.io.IOException("simulated write failure")
             }
             calls += Call.OwnerChanged(uid)
-            return AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
+            return AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it; onBind() }
         }
 
         override suspend fun signOut(): AccessEpochRecord {
+            if (failNextSignOut) {
+                failNextSignOut = false
+                throw java.io.IOException("simulated write failure")
+            }
             calls += Call.SignedOut
             return AccessEpochTransitions.signOut(record, ids).also { record = it }
         }
@@ -590,6 +621,319 @@ class AuthAccessBinderTest {
             calls
         )
         processJob.cancel()
+    }
+
+    // Recovery runs
+
+    @Test
+    fun aRecoveryRunBindsItsCandidateReleasesAndQueriesOnce() = runTest {
+        val calls = mutableListOf<Call>()
+        val fetches = mutableListOf<Boolean>()
+        val a = fenceOf("user-a", 7L)
+        val binder = build(calls, fetches = fetches, live = { a })
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+
+        assertEquals(RecoveryOutcome.FINISHED, binder.recoverSignOut(ticket))
+        advanceUntilIdle()
+        binder.onFenceObserved(a)
+        advanceUntilIdle()
+
+        assertEquals("barrier 가 맞춘 fence 를 다시 바인딩했다", listOf(Call.OwnerChanged("user-a")), calls)
+        assertEquals(listOf(true), fetches)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aBarrierBindingMovesTheBoundFenceSoTheNextEndRotatesIt() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        var live: AuthIdentityFence? = a
+        val binder = build(calls, live = { live }, store = store)
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        store.onBind = { live = null }
+
+        assertEquals(RecoveryOutcome.HOLD, binder.recoverSignOut(ticket))
+        binder.onFenceObserved(null)
+        advanceUntilIdle()
+
+        assertEquals(listOf(Call.OwnerChanged("user-a"), Call.SignedOut), calls)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aSignedOutRecoveryReleasesWithoutAQuery() = runTest {
+        val calls = mutableListOf<Call>()
+        val fetches = mutableListOf<Boolean>()
+        val a = fenceOf("user-a", 7L)
+        var live: AuthIdentityFence? = a
+        val binder = build(calls, fetches = fetches, live = { live })
+        binder.start()
+        binder.onFenceObserved(a)
+        advanceUntilIdle()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.Armed).ticket
+        live = fenceOf("user-b", 3L)
+        binder.onFenceObserved(null)
+        advanceUntilIdle()
+        live = null
+        val queried = fetches.size
+
+        assertEquals(RecoveryOutcome.FINISHED, binder.recoverSignOut(ticket))
+        advanceUntilIdle()
+
+        assertEquals(queried, fetches.size)
+        assertEquals(1, calls.count { it == Call.SignedOut })
+        processJob.cancel()
+    }
+
+    @Test
+    fun anUnknownBarrierBindIsReadBackByTheRunWithoutDeadlock() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        val binder = build(calls, live = { a }, store = store)
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        store.failNextBind = true
+
+        assertEquals(RecoveryOutcome.FINISHED, binder.recoverSignOut(ticket))
+        assertEquals(listOf(Call.OwnerChanged("user-a")), calls)
+        assertEquals("실패한 bind 뒤 재개하지 않았다", 2, store.bindAttempts)
+        processJob.cancel()
+    }
+
+    @Test
+    fun anIdentityEventFailingAheadOfTheBarrierIsReadBackByTheRun() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        val b = fenceOf("user-b", 3L)
+        var current: AuthIdentityFence? = a
+        var onNextRead: (() -> Unit)? = null
+        lateinit var binder: AuthAccessBinder
+        binder = build(calls, live = { onNextRead?.let { hook -> onNextRead = null; hook() }; current }, store = store)
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        // The candidate capture is the run's first live read. Like the tracker's drain, it queues the
+        // event it saw ahead of the barrier — here one whose bind fails.
+        onNextRead = {
+            current = b
+            store.failNextBind = true
+            binder.onFenceObserved(b)
+        }
+
+        assertEquals(RecoveryOutcome.FINISHED, binder.recoverSignOut(ticket))
+        // Failed, retried after the run read it back, then the barrier's own bind.
+        assertEquals(3, store.bindAttempts)
+        assertEquals(listOf(Call.OwnerChanged("user-b"), Call.OwnerChanged("user-b")), calls)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aRunReadsBackOnceAndStopsWhenTheSameEditKeepsFailing() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        lateinit var coordinator: PremiumAccessCoordinator
+        val binder = build(calls, live = { a }, store = store, onCoordinator = { coordinator = it })
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        store.failBinds = true
+
+        assertEquals(RecoveryOutcome.UNRESOLVED, binder.recoverSignOut(ticket))
+        assertEquals("한 번의 실행이 실패한 bind 를 두 번보다 많이 만났다", 2, store.bindAttempts)
+        // A second run spends its one read-back on the step that finds the edit unresolved.
+        assertEquals(RecoveryOutcome.UNRESOLVED, binder.recoverSignOut(ticket))
+        assertEquals(3, store.bindAttempts)
+
+        // The barrier stays at the FIFO head; once the edit reads back, the consumer finishes it.
+        store.failBinds = false
+        assertEquals(EditResolution.RESOLVED, coordinator.resolvePendingEdit(ticket))
+        advanceUntilIdle()
+        assertEquals(RecoveryOutcome.CLOSED, binder.recoverSignOut(ticket))
+        assertEquals(listOf(Call.OwnerChanged("user-a")), calls)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aHeldSignalSeenAfterTheReadBackIsSpentIsJudgedAgainUnderTheLock() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        lateinit var coordinator: PremiumAccessCoordinator
+        val binder = build(calls, live = { a }, store = store, onCoordinator = { coordinator = it })
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        // An unresolved read, for the run to spend its one read-back on.
+        store.failNextLoad = true
+        assertEquals(RecoveryAdvance.UNRESOLVED, coordinator.advanceRecovery(ticket))
+        store.failNextBind = true
+        // Someone else reads back the barrier's failed bind the moment it holds events. Watching from
+        // before the run starts, it is resumed ahead of the run's own watcher.
+        val current = coordinator.awaitAttemptHeldOrGone(ticket, afterRevision = -1L)
+        val other = launch {
+            coordinator.awaitAttemptHeldOrGone(ticket, afterRevision = current.revision)
+            coordinator.resolvePendingEdit(ticket)
+        }
+        runCurrent()
+
+        val outcome = binder.recoverSignOut(ticket)
+
+        assertEquals("이미 풀린 보류를 지난 신호만 보고 미해소로 보고했다", RecoveryOutcome.FINISHED, outcome)
+        other.join()
+        processJob.cancel()
+    }
+
+    @Test
+    fun aRunGivesUpAfterItsBarrierReentriesWhileTheIdentityKeepsMoving() = runTest {
+        val calls = mutableListOf<Call>()
+        val a = fenceOf("user-a", 7L)
+        var moving = false
+        var generation = 100L
+        val binder = build(calls, live = { if (moving) fenceOf("user-a", ++generation) else a })
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        moving = true
+
+        assertEquals(RecoveryOutcome.RETRY_LATER, binder.recoverSignOut(ticket))
+        assertEquals("움직이는 신원을 채택했다", emptyList<Call>(), calls)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aHeldEndIsFinishedByItsRetryBeforeTheBarrierRuns() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        var live: AuthIdentityFence? = a
+        val binder = build(calls, live = { live }, store = store)
+        binder.start()
+        binder.onFenceObserved(a)
+        advanceUntilIdle()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.Armed).ticket
+        live = null
+        store.failNextSignOut = true
+        binder.onFenceObserved(null)
+        advanceUntilIdle()
+
+        assertEquals(RecoveryOutcome.CLOSED, binder.recoverSignOut(ticket))
+        assertEquals(listOf(Call.OwnerChanged("user-a"), Call.SignedOut), calls)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aRunWhoseAttemptEndsBehindABlockedItemStopsWithoutWaiting() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        val b = fenceOf("user-b", 3L)
+        var current: AuthIdentityFence? = a
+        var onNextRead: (() -> Unit)? = null
+        lateinit var binder: AuthAccessBinder
+        binder = build(calls, live = { onNextRead?.let { hook -> onNextRead = null; hook() }; current }, store = store)
+        binder.start()
+        binder.onFenceObserved(a)
+        advanceUntilIdle()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.Armed).ticket
+        current = null
+        store.failNextSignOut = true
+        binder.onFenceObserved(null)
+        advanceUntilIdle()
+        // The run spends its read-back on the held end. Its candidate capture then queues a sign-in
+        // whose bind parks, between the end's retry — which finishes the attempt — and the barrier.
+        val gate = CompletableDeferred<Unit>()
+        onNextRead = {
+            store.blockNextBindOn = gate
+            binder.onFenceObserved(b)
+        }
+
+        val run = async { binder.recoverSignOut(ticket) }
+        runCurrent()
+
+        assertTrue("시도가 사라졌는데 막힌 항목 뒤의 회신을 기다렸다", run.isCompleted)
+        assertEquals("사라진 시도를 미해소로 보고했다", RecoveryOutcome.CLOSED, run.await())
+        gate.complete(Unit)
+        advanceUntilIdle()
+        assertEquals(listOf(Call.OwnerChanged("user-a"), Call.SignedOut, Call.OwnerChanged("user-b")), calls)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aStoppedConsumerFailsAWaitingRecoveryRun() = runTest {
+        val store = RecordingStore(mutableListOf())
+        val a = fenceOf("user-a", 7L)
+        val binder = build(mutableListOf(), live = { a }, store = store)
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        val gate = CompletableDeferred<Unit>()
+        store.blockNextBindOn = gate
+
+        val run = async { runCatching { binder.recoverSignOut(ticket) } }
+        runCurrent()
+        processJob.cancel()
+        advanceUntilIdle()
+
+        val failure = run.await().exceptionOrNull()
+        assertTrue("멈춘 consumer 가 실행기에 알리지 않았다: $failure", failure.isStoppedConsumer())
+    }
+
+    @Test
+    fun aCancelledRunDoesNotWithdrawItsBarrier() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        val binder = build(calls, live = { a }, store = store)
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        val gate = CompletableDeferred<Unit>()
+        store.blockNextBindOn = gate
+
+        val run = async { binder.recoverSignOut(ticket) }
+        runCurrent()
+        run.cancel()
+        gate.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(listOf(Call.OwnerChanged("user-a")), calls)
+        assertEquals("취소한 실행의 barrier 가 끝나지 않았다", RecoveryOutcome.CLOSED, binder.recoverSignOut(ticket))
+        processJob.cancel()
+    }
+
+    @Test
+    fun aRecoveryRunFromTheConsumerIsRejected() = runTest {
+        val purger = RecordingPurger()
+        var failure: Throwable? = null
+        val binder = build(mutableListOf(), purger = purger, seedJournal = true)
+        purger.onPurge = { failure = runCatching { binder.recoverSignOut(SignOutTicket(1)) }.exceptionOrNull() }
+        binder.start()
+        advanceUntilIdle()
+
+        assertTrue("consumer 안의 복구 실행이 거부되지 않았다: $failure", failure.isStoppedConsumer())
+        processJob.cancel()
+    }
+
+    @Test
+    fun anUnexpectedFailureInABarrierReachesTheRunAndStopsTheConsumer() = runTest {
+        val a = fenceOf("user-a", 7L)
+        val uncaught = mutableListOf<Throwable>()
+        var armed = false
+        var reads = 0
+        val binder = build(
+            mutableListOf(),
+            live = { if (armed && ++reads == 2) throw IllegalArgumentException("live read") else a },
+            uncaught = uncaught
+        )
+        binder.start()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.RecoveryRequired).ticket
+        armed = true
+
+        val failure = runCatching { binder.recoverSignOut(ticket) }.exceptionOrNull()
+        advanceUntilIdle()
+
+        assertTrue("barrier 실패가 실행기에 가지 않았다: $failure", failure is IllegalArgumentException)
+        assertTrue("consumer 가 그 실패로 끝나지 않았다: $uncaught", uncaught.singleOrNull() is IllegalArgumentException)
     }
 }
 /**

@@ -7,9 +7,13 @@ import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 
 /**
  * The signed-in uid, as a callback stream.
@@ -63,9 +67,34 @@ class AuthAccessBinder(
     private val scope: CoroutineScope,
     private val fenceStream: AuthFenceStream
 ) {
+    private companion object {
+        /** Barriers one recovery run may re-enqueue after RECAPTURE or NOT_READY, together. */
+        const val MAX_BARRIER_REENTRIES = 8
+    }
+
     private sealed interface Item {
         class Observed(val fence: AuthIdentityFence?) : Item
-        class PrepareSignOut(val fence: AuthIdentityFence, val reply: CompletableDeferred<SignOutStart>) : Item
+
+        /** A caller waits on it; failing it is how the consumer tells that caller it stopped. */
+        sealed interface Request : Item {
+            fun fail(failure: Throwable)
+        }
+
+        class PrepareSignOut(val fence: AuthIdentityFence, val reply: CompletableDeferred<SignOutStart>) : Request {
+            override fun fail(failure: Throwable) {
+                reply.completeExceptionally(failure)
+            }
+        }
+
+        class RecoveryBarrier(
+            val ticket: SignOutTicket,
+            val candidate: AuthIdentityFence?,
+            val reply: CompletableDeferred<BarrierOutcome>
+        ) : Request {
+            override fun fail(failure: Throwable) {
+                reply.completeExceptionally(failure)
+            }
+        }
     }
 
     /** Marks the consumer, so a request made from inside it fails instead of waiting on itself. */
@@ -80,10 +109,8 @@ class AuthAccessBinder(
     private val inbox = Channel<Item>(
         capacity = Channel.UNLIMITED,
         onUndeliveredElement = { item ->
-            // A cancelled receive can remove a request before the consumer gets to prepare it.
-            if (item is Item.PrepareSignOut) {
-                item.reply.completeExceptionally(IllegalStateException("identity consumer stopped"))
-            }
+            // A cancelled receive can remove a request before the consumer gets to serve it.
+            (item as? Item.Request)?.fail(IllegalStateException("identity consumer stopped"))
         }
     )
 
@@ -109,7 +136,9 @@ class AuthAccessBinder(
                         // own lock and hands a held event back, so the same event stays first.
                         is Item.Observed ->
                             while (!handle(item.fence)) coordinator.awaitIdentityEventsAdmitted()
-                        is Item.PrepareSignOut -> prepare(item)
+                        is Item.PrepareSignOut ->
+                            serve(item) { item.reply.complete(coordinator.prepareSignOut(item.fence)) }
+                        is Item.RecoveryBarrier -> serve(item) { runBarrier(item) }
                     }
                 }
             } finally {
@@ -129,7 +158,7 @@ class AuthAccessBinder(
         inbox.close(stopped)
         while (true) {
             val left = inbox.tryReceive().getOrNull() ?: break
-            if (left is Item.PrepareSignOut) left.reply.completeExceptionally(stopped)
+            (left as? Item.Request)?.fail(stopped)
         }
     }
 
@@ -153,18 +182,138 @@ class AuthAccessBinder(
         return reply.await()
     }
 
+    /**
+     * Carries recovery of attempt [ticket] as far as one run can, and says where it stopped.
+     *
+     * A run limits its own retries: it reads back at most one unresolved edit — its steps and its
+     * barrier waits share that — and after [MAX_BARRIER_REENTRIES] RECAPTURE or NOT_READY results in
+     * all it returns RETRY_LATER without re-entering. Whether a call completes still depends on the
+     * store and the FIFO progressing, or on cancellation. Calling again is the caller's decision. Must
+     * not be called from the identity consumer.
+     * A barrier the run enqueued outlives it: returning or being cancelled does not withdraw it, the
+     * consumer resumes it whenever admission reopens, and it fails only when the consumer stops.
+     */
+    internal suspend fun recoverSignOut(ticket: SignOutTicket): RecoveryOutcome {
+        check(currentCoroutineContext()[Consumer] == null) { "a recovery run from the identity consumer" }
+        val readBack = ReadBackBudget()
+        var reentries = 0
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            when (coordinator.advanceRecovery(ticket, allowReadBack = readBack.left)) {
+                RecoveryAdvance.RESOLVED -> readBack.spend()
+                RecoveryAdvance.PROGRESSED -> Unit
+                RecoveryAdvance.CLOSED -> return RecoveryOutcome.CLOSED
+                RecoveryAdvance.DRIVER_OWNS -> return RecoveryOutcome.DRIVER_OWNS
+                RecoveryAdvance.UNRESOLVED -> return RecoveryOutcome.UNRESOLVED
+                RecoveryAdvance.INCONSISTENT -> return RecoveryOutcome.INCONSISTENT
+                RecoveryAdvance.NEEDS_BARRIER -> {
+                    // Captured before the barrier is enqueued, so whatever the capture published is queued
+                    // ahead of it rather than adopted by it.
+                    val candidate = coordinator.liveIdentity()
+                    val reply = CompletableDeferred<BarrierOutcome>()
+                    inbox.send(Item.RecoveryBarrier(ticket, candidate, reply))
+                    val outcome = when (val waited = awaitBarrier(ticket, reply, readBack)) {
+                        is Waited.Stopped -> return waited.outcome
+                        is Waited.Replied -> waited.outcome
+                    }
+                    when (outcome.step) {
+                        BarrierStep.RELEASED -> return RecoveryOutcome.FINISHED
+                        BarrierStep.CLOSED -> return RecoveryOutcome.CLOSED
+                        BarrierStep.DRIVER_OWNS -> return RecoveryOutcome.DRIVER_OWNS
+                        BarrierStep.HOLD -> return RecoveryOutcome.HOLD
+                        BarrierStep.CLEANUP_FAILED -> return RecoveryOutcome.CLEANUP_FAILED
+                        BarrierStep.RECAPTURE, BarrierStep.NOT_READY ->
+                            if (++reentries >= MAX_BARRIER_REENTRIES) return RecoveryOutcome.RETRY_LATER
+                        BarrierStep.HELD -> error("the consumer judges a held barrier again before replying")
+                    }
+                }
+            }
+        }
+    }
+
+    private class ReadBackBudget {
+        var left = true
+            private set
+
+        fun spend() {
+            left = false
+        }
+    }
+
+    private sealed interface Waited {
+        class Replied(val outcome: BarrierOutcome) : Waited
+        class Stopped(val outcome: RecoveryOutcome) : Waited
+    }
+
+    /**
+     * Waits for the barrier's reply while watching the attempt, because an edit failing on the FIFO —
+     * ahead of the barrier or in it — holds the consumer until someone outside reads it back.
+     */
+    private suspend fun awaitBarrier(
+        ticket: SignOutTicket,
+        reply: CompletableDeferred<BarrierOutcome>,
+        readBack: ReadBackBudget
+    ): Waited {
+        var seen = -1L
+        while (true) {
+            val signal = coroutineScope {
+                val watcher = async { coordinator.awaitAttemptHeldOrGone(ticket, seen) }
+                try {
+                    select<AttemptSignal?> {
+                        reply.onAwait { null }
+                        watcher.onAwait { it }
+                    }
+                } finally {
+                    watcher.cancel()
+                }
+            } ?: return Waited.Replied(reply.await())
+            seen = signal.revision
+            // Gone, so this run is over. The barrier remains consumer-owned. It may reply RELEASED if it
+            // finished the attempt itself, or CLOSED if the attempt was already gone when judged; waiting
+            // for either could mean waiting on another attempt's held event ahead of it.
+            if (signal.ticket != ticket) return Waited.Stopped(RecoveryOutcome.CLOSED)
+            // The signal is a hint: whether an edit is still waiting is judged under the lock, even with
+            // no read-back left.
+            when (coordinator.resolvePendingEdit(ticket, allowReadBack = readBack.left)) {
+                EditResolution.RESOLVED -> readBack.spend()
+                EditResolution.NOT_PENDING -> Unit
+                EditResolution.STILL_UNKNOWN -> return Waited.Stopped(RecoveryOutcome.UNRESOLVED)
+                EditResolution.INCONSISTENT -> return Waited.Stopped(RecoveryOutcome.INCONSISTENT)
+            }
+        }
+    }
+
     /** An unexpected failure still ends the consumer, as any other failure there does. */
-    private suspend fun prepare(item: Item.PrepareSignOut) {
+    private suspend fun serve(item: Item.Request, work: suspend () -> Unit) {
         try {
-            item.reply.complete(coordinator.prepareSignOut(item.fence))
+            work()
         } catch (failure: Throwable) {
             // Report the consumer's cancellation as a failure to an independently waiting caller.
             val reported = if (failure is CancellationException) {
                 IllegalStateException("identity consumer stopped", failure)
             } else failure
-            item.reply.completeExceptionally(reported)
+            item.fail(reported)
             throw failure
         }
+    }
+
+    /** Held at the FIFO head while an edit is unresolved, like an identity event, and judged again with the same candidate. */
+    private suspend fun runBarrier(item: Item.RecoveryBarrier) {
+        var outcome = coordinator.completeRecovery(item.ticket, item.candidate)
+        while (outcome.step == BarrierStep.HELD) {
+            coordinator.awaitIdentityEventsAdmitted()
+            outcome = coordinator.completeRecovery(item.ticket, item.candidate)
+        }
+        // Adopted before the next item: a null observed next ends whatever this barrier left bound.
+        boundFence = outcome.completed
+        // Set only when the seal was released onto a bound candidate. Launched rather than awaited, and
+        // pinned to that binding, for the reasons [handle] gives.
+        outcome.releasedGeneration?.let { generation ->
+            scope.launch {
+                coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = generation)
+            }
+        }
+        item.reply.complete(outcome)
     }
 
     /** False when the coordinator held the event; nothing was applied and it must be retried. */

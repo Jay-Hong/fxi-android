@@ -768,7 +768,7 @@ class PremiumAccessCoordinatorSignOutTest {
         h.store.signOutFault = EditFault.AFTER_WRITE
 
         assertEquals(RecoveryAdvance.UNRESOLVED, h.coordinator.advanceRecovery(ticket))
-        assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(RecoveryAdvance.RESOLVED, h.coordinator.advanceRecovery(ticket))
         assertEquals(RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
 
         assertEquals(1, h.store.signOuts)
@@ -782,13 +782,39 @@ class PremiumAccessCoordinatorSignOutTest {
         h.store.signOutFault = EditFault.BEFORE_WRITE
 
         assertEquals(RecoveryAdvance.UNRESOLVED, h.coordinator.advanceRecovery(ticket))
-        assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(RecoveryAdvance.RESOLVED, h.coordinator.advanceRecovery(ticket))
         assertEquals("같은 호출에서 실패한 정산을 다시 돌렸다", 1, h.store.signOuts)
         assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
         assertEquals(RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
 
         assertEquals(2, h.store.signOuts)
         assertEquals(journal + 1, h.store.record.pendingPurges.size)
+    }
+
+    @Test
+    fun anUnresolvedEditIsLeftUnreadWhenTheRunHasNoReadBackLeft() = runTest {
+        val h = harness()
+        val ticket = owedRecovery(h)
+        h.store.signOutFault = EditFault.AFTER_WRITE
+        assertEquals(RecoveryAdvance.UNRESOLVED, h.coordinator.advanceRecovery(ticket))
+        val loads = h.store.loads
+
+        assertEquals(RecoveryAdvance.UNRESOLVED, h.coordinator.advanceRecovery(ticket, allowReadBack = false))
+        assertEquals("재읽기를 허용하지 않았는데 읽었다", loads, h.store.loads)
+        assertEquals(RecoveryAdvance.RESOLVED, h.coordinator.advanceRecovery(ticket))
+    }
+
+    @Test
+    fun aReadBackThatIsNotAllowedStillJudgesWhetherAnEditIsWaiting() = runTest {
+        val h = harness()
+        val ticket = owedRecovery(h)
+        assertEquals(EditResolution.NOT_PENDING, h.coordinator.resolvePendingEdit(ticket, allowReadBack = false))
+        h.store.signOutFault = EditFault.AFTER_WRITE
+        assertEquals(RecoveryAdvance.UNRESOLVED, h.coordinator.advanceRecovery(ticket))
+        val loads = h.store.loads
+
+        assertEquals(EditResolution.STILL_UNKNOWN, h.coordinator.resolvePendingEdit(ticket, allowReadBack = false))
+        assertEquals("재읽기를 허용하지 않았는데 읽었다", loads, h.store.loads)
     }
 
     @Test
@@ -864,7 +890,7 @@ class PremiumAccessCoordinatorSignOutTest {
         assertNull(h.coordinator.onIdentityChanged(b3))
 
         h.store.loadsFail = false
-        assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(RecoveryAdvance.RESOLVED, h.coordinator.advanceRecovery(ticket))
         assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
         assertEquals(1, h.store.signOuts)
     }

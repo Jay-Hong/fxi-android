@@ -116,8 +116,8 @@ class PremiumAccessCoordinator(
     /** The identity event held by a failed edit, until that same event is applied. Guarded by [mutex]. */
     private var heldEvent: HeldIdentityEvent? = null
 
-    /** False while the open attempt has an edit in flight. Identity events wait on it. */
-    private val identityEventsAdmitted = MutableStateFlow(true)
+    /** The open attempt as the identity FIFO and a recovery run see it. Moves with every attempt change. */
+    private val attemptSignal = MutableStateFlow(AttemptSignal(ticket = null, revision = 0L, held = false))
 
     private val schedule =
         RecheckSchedule(scope, clock) { intent, origin, bindingEpoch ->
@@ -388,13 +388,16 @@ class PremiumAccessCoordinator(
      * Reads back the edit an open attempt is waiting on, from outside the identity FIFO held behind it.
      *
      * Resolving reopens identity events, and the event that was held is retried before any other. A
-     * landed end leaves its result for that retry.
+     * landed end leaves its result for that retry. Without [allowReadBack] the edit is reported as
+     * still unknown and the record is not read — whether one is waiting is judged here either way.
      */
-    internal suspend fun resolvePendingEdit(ticket: SignOutTicket): EditResolution = mutex.withLock {
-        val open = attempt as? SignOutAttempt.Unresolved
-        if (open == null || open.ticket != ticket) return@withLock EditResolution.NOT_PENDING
-        resolvePendingEditLocked(open)
-    }
+    internal suspend fun resolvePendingEdit(ticket: SignOutTicket, allowReadBack: Boolean = true): EditResolution =
+        mutex.withLock {
+            val open = attempt as? SignOutAttempt.Unresolved
+            if (open == null || open.ticket != ticket) return@withLock EditResolution.NOT_PENDING
+            if (!allowReadBack) return@withLock EditResolution.STILL_UNKNOWN
+            resolvePendingEditLocked(open)
+        }
 
     private suspend fun resolvePendingEditLocked(open: SignOutAttempt.Unresolved): EditResolution {
         val readBack = try {
@@ -426,27 +429,32 @@ class PremiumAccessCoordinator(
 
     /**
      * Moves recovery on by at most one logical step — one read-back, or one settling attempt — and
-     * reports where it stands. A failed edit is not retried inside a call.
+     * reports where it stands. A failed edit is not retried inside a call. Without [allowReadBack] an
+     * unresolved edit is reported as it is, unread: a run spends its read-backs as it chooses.
      *
      * Meant for outside the identity FIFO. An unresolved edit may be read back while its event is
      * held. Once resolved, that event must finish on the FIFO before recovery judges whether
      * another settling rotation is needed.
      */
-    internal suspend fun advanceRecovery(ticket: SignOutTicket): RecoveryAdvance = mutex.withLock {
-        val open = attempt
-        if (open == null || open.ticket != ticket) return@withLock RecoveryAdvance.CLOSED
-        when (open) {
-            is SignOutAttempt.Armed -> RecoveryAdvance.DRIVER_OWNS
-            is SignOutAttempt.Preparing -> error("a preparing attempt is only visible inside its own lock")
-            is SignOutAttempt.Unresolved -> when (resolvePendingEditLocked(open)) {
-                EditResolution.RESOLVED -> RecoveryAdvance.PROGRESSED
-                EditResolution.STILL_UNKNOWN -> RecoveryAdvance.UNRESOLVED
-                EditResolution.INCONSISTENT -> RecoveryAdvance.INCONSISTENT
-                EditResolution.NOT_PENDING -> error("resolving the open attempt's own edit")
+    internal suspend fun advanceRecovery(ticket: SignOutTicket, allowReadBack: Boolean = true): RecoveryAdvance =
+        mutex.withLock {
+            val open = attempt
+            if (open == null || open.ticket != ticket) return@withLock RecoveryAdvance.CLOSED
+            when (open) {
+                is SignOutAttempt.Armed -> RecoveryAdvance.DRIVER_OWNS
+                is SignOutAttempt.Preparing -> error("a preparing attempt is only visible inside its own lock")
+                is SignOutAttempt.Unresolved -> when {
+                    !allowReadBack -> RecoveryAdvance.UNRESOLVED
+                    else -> when (resolvePendingEditLocked(open)) {
+                        EditResolution.RESOLVED -> RecoveryAdvance.RESOLVED
+                        EditResolution.STILL_UNKNOWN -> RecoveryAdvance.UNRESOLVED
+                        EditResolution.INCONSISTENT -> RecoveryAdvance.INCONSISTENT
+                        EditResolution.NOT_PENDING -> error("resolving the open attempt's own edit")
+                    }
+                }
+                is SignOutAttempt.Recovering -> settleLocked(open)
             }
-            is SignOutAttempt.Recovering -> settleLocked(open)
         }
-    }
 
     private suspend fun settleLocked(open: SignOutAttempt.Recovering): RecoveryAdvance {
         if (heldEvent != null) return RecoveryAdvance.NEEDS_BARRIER
@@ -543,12 +551,26 @@ class PremiumAccessCoordinator(
 
     /** Suspends while the open sign-out has an edit in flight. The identity FIFO waits here. */
     suspend fun awaitIdentityEventsAdmitted() {
-        identityEventsAdmitted.first { it }
+        attemptSignal.first { !it.held }
     }
+
+    /**
+     * Suspends until the attempt [ticket] names changes after [afterRevision] into holding identity
+     * events, or stops being the open attempt. A hint only: the caller decides under the lock again.
+     */
+    internal suspend fun awaitAttemptHeldOrGone(ticket: SignOutTicket, afterRevision: Long): AttemptSignal =
+        attemptSignal.first { it.revision > afterRevision && (it.ticket != ticket || it.held) }
+
+    /** The live fence, for a recovery barrier's candidate — captured before the barrier is enqueued. */
+    internal fun liveIdentity(): AuthIdentityFence? = liveFence()
 
     private fun setAttemptLocked(next: SignOutAttempt?) {
         attempt = next
-        identityEventsAdmitted.value = SignOutAttemptPolicy.admitsIdentityEvents(next)
+        attemptSignal.value = AttemptSignal(
+            ticket = next?.ticket,
+            revision = attemptSignal.value.revision + 1,
+            held = !SignOutAttemptPolicy.admitsIdentityEvents(next)
+        )
     }
 
     /**
