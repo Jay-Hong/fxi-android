@@ -4,7 +4,16 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.auth.AuthTokenSource
+import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthTransitionCoordinator
+import com.jay.fxi.data.entitlements.SignOutStart
+import com.jay.fxi.data.entitlements.SignOutTicket
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.yield
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -25,6 +34,9 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AuthViewModelSignOutTest {
+
+    private val ticket = SignOutTicket(1)
+    private val armedStart: suspend (AuthIdentityFence) -> SignOutStart = { SignOutStart.Armed(ticket) }
 
     @Test
     fun signOut_ordersUnregisterThenGenerationCasThenFirebaseSignOut() = runTest {
@@ -75,6 +87,8 @@ class AuthViewModelSignOutTest {
             handedOffSignOut(
                 coordinator = coordinator,
                 owner = owner,
+                begin = armedStart,
+                stopDriver = {},
                 unregister = {},
                 invalidate = {
                     events += "invalidate"
@@ -302,6 +316,8 @@ class AuthViewModelSignOutTest {
             handedOffSignOut(
                 coordinator = coordinator,
                 owner = owner,
+                begin = armedStart,
+                stopDriver = {},
                 unregister = {
                     unregisterStarted.complete(Unit)
                     unregisterDone.await()
@@ -344,5 +360,289 @@ class AuthViewModelSignOutTest {
 
         assertFalse(invalidated)
         assertFalse(firebaseSignOutCalled)
+    }
+
+    // The sign-out attempt
+
+    @Test
+    fun anArmedDriverRunsTheSideEffectsAndLeavesTheAttemptToItsEnd() = runTest {
+        val coordinator = AuthTransitionCoordinator(backgroundScope)
+        val owner = AuthIdentityFence("user-a", 7)
+        val events = mutableListOf<String>()
+
+        handedOffSignOut(
+            coordinator = coordinator,
+            owner = owner,
+            begin = { captured -> events += "begin"; assertEquals(owner, captured); SignOutStart.Armed(ticket) },
+            stopDriver = { events += "stop" },
+            unregister = { events += "unregister" },
+            invalidate = { events += "invalidate"; true },
+            signOut = { events += "signOut" }
+        )
+
+        assertEquals(listOf("begin", "unregister", "invalidate", "signOut"), events)
+    }
+
+    @Test
+    fun onlyAnArmedStartRunsTheSideEffects() = runTest {
+        val coordinator = AuthTransitionCoordinator(backgroundScope)
+        val owner = AuthIdentityFence("user-a", 7)
+        listOf(
+            SignOutStart.Stale,
+            SignOutStart.Joined(ticket),
+            SignOutStart.Busy(ticket),
+            SignOutStart.RecoveryRequired(ticket)
+        ).forEach { start ->
+            val events = mutableListOf<String>()
+            handedOffSignOut(
+                coordinator = coordinator,
+                owner = owner,
+                begin = { start },
+                stopDriver = { events += "stop" },
+                unregister = { events += "unregister" },
+                invalidate = { events += "invalidate"; true },
+                signOut = { events += "signOut" }
+            )
+            assertEquals("$start 가 부수효과를 실행했다", emptyList<String>(), events)
+        }
+    }
+
+    @Test
+    fun aSessionAlreadyMovedAtTheCasStopsTheDriver() = runTest {
+        val coordinator = AuthTransitionCoordinator(backgroundScope)
+        val stopped = mutableListOf<SignOutTicket>()
+        var firebaseSignOutCalled = false
+
+        handedOffSignOut(
+            coordinator = coordinator,
+            owner = AuthIdentityFence("user-a", 7),
+            begin = armedStart,
+            stopDriver = { stopped += it },
+            unregister = {},
+            invalidate = { false },
+            signOut = { firebaseSignOutCalled = true }
+        )
+
+        assertEquals(listOf(ticket), stopped)
+        assertFalse(firebaseSignOutCalled)
+    }
+
+    @Test
+    fun anIdentityChangeUnderTheUnregisterStopsTheDriverWithoutSigningOut() = runTest {
+        val coordinator = AuthTransitionCoordinator(backgroundScope)
+        val stopped = mutableListOf<SignOutTicket>()
+        val events = mutableListOf<String>()
+
+        handedOffSignOut(
+            coordinator = coordinator,
+            owner = AuthIdentityFence("user-a", 7),
+            begin = armedStart,
+            stopDriver = { stopped += it },
+            unregister = { throw AuthIdentityChangedException() },
+            invalidate = { events += "invalidate"; true },
+            signOut = { events += "signOut" }
+        )
+
+        assertEquals(listOf(ticket), stopped)
+        assertEquals(emptyList<String>(), events)
+    }
+
+    @Test
+    fun anUnregisterThatRunsOutOfTimeStillSignsOut() = runTest {
+        val coordinator = AuthTransitionCoordinator(backgroundScope)
+        val stopped = mutableListOf<SignOutTicket>()
+        val events = mutableListOf<String>()
+
+        handedOffSignOut(
+            coordinator = coordinator,
+            owner = AuthIdentityFence("user-a", 7),
+            begin = armedStart,
+            stopDriver = { stopped += it },
+            unregister = { awaitCancellation() },
+            invalidate = { events += "invalidate"; true },
+            signOut = { events += "signOut" }
+        )
+
+        assertEquals(listOf("invalidate", "signOut"), events)
+        assertEquals(UNREGISTER_DEADLINE_MILLIS, testScheduler.currentTime)
+        assertEquals(emptyList<SignOutTicket>(), stopped)
+    }
+
+    @Test
+    fun aFirebaseSignOutThatThrowsStopsTheDriver() = runTest {
+        // A process scope of its own: in backgroundScope the failed hand-off would fail the test run itself.
+        val coordinator = AuthTransitionCoordinator(CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler)))
+        val stopped = mutableListOf<SignOutTicket>()
+
+        val failure = runCatching {
+            handedOffSignOut(
+                coordinator = coordinator,
+                owner = AuthIdentityFence("user-a", 7),
+                begin = armedStart,
+                stopDriver = { stopped += it },
+                unregister = {},
+                invalidate = { true },
+                signOut = { throw IllegalStateException("sdk") }
+            )
+        }.exceptionOrNull()
+
+        assertTrue("Firebase 실패가 사라졌다: $failure", failure is IllegalStateException && failure !is CancellationException)
+        assertEquals(listOf(ticket), stopped)
+    }
+
+    @Test
+    fun aCancellationWhileThePreparationIsAnsweredStillStopsTheArmedDriver() = runTest {
+        val process = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val coordinator = AuthTransitionCoordinator(process)
+        val answer = CompletableDeferred<Unit>()
+        val begun = CompletableDeferred<Unit>()
+        val stopped = mutableListOf<SignOutTicket>()
+        val events = mutableListOf<String>()
+
+        val screen = launch {
+            runCatching {
+                handedOffSignOut(
+                    coordinator = coordinator,
+                    owner = AuthIdentityFence("user-a", 7),
+                    // The binder answers a queued preparation even after its caller is gone.
+                    begin = { begun.complete(Unit); answer.await(); SignOutStart.Armed(ticket) },
+                    stopDriver = { yield(); stopped += it },
+                    unregister = { events += "unregister" },
+                    invalidate = { events += "invalidate"; true },
+                    signOut = { events += "signOut" }
+                )
+            }
+        }
+        begun.await()
+        process.cancel()
+        runCurrent()
+        answer.complete(Unit)
+        advanceUntilIdle()
+        screen.join()
+
+        assertEquals("응답을 기다리다 취소된 실행자가 무장 시도를 남겼다", listOf(ticket), stopped)
+        assertEquals(emptyList<String>(), events)
+    }
+
+    @Test
+    fun aCancellationRightAfterTheAnswerStillStopsTheArmedDriver() = runTest {
+        val process = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val coordinator = AuthTransitionCoordinator(process)
+        val answer = CompletableDeferred<Unit>()
+        val begun = CompletableDeferred<Unit>()
+        val stopped = mutableListOf<SignOutTicket>()
+        val events = mutableListOf<String>()
+
+        val screen = launch {
+            runCatching {
+                handedOffSignOut(
+                    coordinator = coordinator,
+                    owner = AuthIdentityFence("user-a", 7),
+                    begin = { begun.complete(Unit); answer.await(); SignOutStart.Armed(ticket) },
+                    stopDriver = { yield(); stopped += it },
+                    unregister = { events += "unregister" },
+                    invalidate = { events += "invalidate"; true },
+                    signOut = { events += "signOut" }
+                )
+            }
+        }
+        begun.await()
+        // The answer is in, but the driver has not resumed yet when its work is cancelled.
+        answer.complete(Unit)
+        process.cancel()
+        advanceUntilIdle()
+        screen.join()
+
+        assertEquals(listOf(ticket), stopped)
+        assertEquals(emptyList<String>(), events)
+    }
+
+    @Test
+    fun aHandOffCancelledBeforeItStartsOpensNoAttempt() = runTest {
+        val process = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val coordinator = AuthTransitionCoordinator(process)
+        var begins = 0
+        val stopped = mutableListOf<SignOutTicket>()
+        process.cancel()
+
+        val screen = launch {
+            runCatching {
+                handedOffSignOut(
+                    coordinator = coordinator,
+                    owner = AuthIdentityFence("user-a", 7),
+                    begin = { begins++; SignOutStart.Armed(ticket) },
+                    stopDriver = { stopped += it },
+                    unregister = {},
+                    invalidate = { true },
+                    signOut = {}
+                )
+            }
+        }
+        advanceUntilIdle()
+        screen.join()
+
+        assertEquals("취소된 인계가 시도를 열었다", 0, begins)
+        assertEquals(emptyList<SignOutTicket>(), stopped)
+    }
+
+    @Test
+    fun aCancellationWhileStoppingAfterTheCasStillStops() = runTest {
+        val process = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val coordinator = AuthTransitionCoordinator(process)
+        val stopping = CompletableDeferred<Unit>()
+        val lockFree = CompletableDeferred<Unit>()
+        val stopped = mutableListOf<SignOutTicket>()
+
+        val screen = launch {
+            runCatching {
+                handedOffSignOut(
+                    coordinator = coordinator,
+                    owner = AuthIdentityFence("user-a", 7),
+                    begin = armedStart,
+                    // Waits like the real one for the coordinator's lock.
+                    stopDriver = { stopping.complete(Unit); lockFree.await(); stopped += it },
+                    unregister = {},
+                    invalidate = { false },
+                    signOut = {}
+                )
+            }
+        }
+        stopping.await()
+        process.cancel()
+        runCurrent()
+        lockFree.complete(Unit)
+        advanceUntilIdle()
+        screen.join()
+
+        assertEquals("CAS 뒤 멈춤이 취소에 끊겼다", listOf(ticket), stopped)
+    }
+
+    @Test
+    fun aCancelledSignOutStillStopsItsDriver() = runTest {
+        val process = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val coordinator = AuthTransitionCoordinator(process)
+        val unregisterStarted = CompletableDeferred<Unit>()
+        val stopped = mutableListOf<SignOutTicket>()
+
+        val screen = launch {
+            runCatching {
+                handedOffSignOut(
+                    coordinator = coordinator,
+                    owner = AuthIdentityFence("user-a", 7),
+                    begin = armedStart,
+                    // Suspends like the real one, which takes the coordinator's lock.
+                    stopDriver = { yield(); stopped += it },
+                    unregister = { unregisterStarted.complete(Unit); awaitCancellation() },
+                    invalidate = { true },
+                    signOut = {}
+                )
+            }
+        }
+        unregisterStarted.await()
+        process.cancel()
+        advanceUntilIdle()
+        screen.join()
+
+        assertEquals("취소된 실행자가 멈췄다고 알리지 않았다", listOf(ticket), stopped)
     }
 }

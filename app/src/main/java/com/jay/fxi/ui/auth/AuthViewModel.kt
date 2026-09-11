@@ -19,6 +19,10 @@ import com.jay.fxi.R
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.auth.AuthTransitionCoordinator
+import com.jay.fxi.data.entitlements.AuthAccessBinder
+import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
+import com.jay.fxi.data.entitlements.SignOutStart
+import com.jay.fxi.data.entitlements.SignOutTicket
 import com.jay.fxi.domain.model.AuthProvider
 import com.jay.fxi.domain.model.AuthState
 import com.jay.fxi.domain.model.UserInfo
@@ -31,10 +35,16 @@ import com.revenuecat.purchases.interfaces.LogInCallback
 import com.revenuecat.purchases.interfaces.ReceiveCustomerInfoCallback
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 import javax.inject.Inject
 
@@ -44,7 +54,9 @@ class AuthViewModel @Inject constructor(
     private val authTokenProvider: AuthTokenProvider,
     private val authTransitionCoordinator: AuthTransitionCoordinator,
     private val subscriptionManager: SubscriptionManager,
-    private val pushNotificationManager: PushNotificationManager
+    private val pushNotificationManager: PushNotificationManager,
+    private val authAccessBinder: AuthAccessBinder,
+    private val premiumAccessCoordinator: PremiumAccessCoordinator
 ) : ViewModel() {
 
     private val _authState = MutableStateFlow<AuthState>(AuthState.Unknown)
@@ -218,6 +230,8 @@ class AuthViewModel @Inject constructor(
             handedOffSignOut(
                 coordinator = authTransitionCoordinator,
                 owner = owner,
+                begin = authAccessBinder::beginSignOut,
+                stopDriver = { ticket -> premiumAccessCoordinator.stopDriver(ticket) },
                 unregister = pushNotificationManager::unregisterDeviceFromServer,
                 invalidate = authTokenProvider::invalidateCurrentSession,
                 signOut = { auth.signOut() }
@@ -244,30 +258,73 @@ class AuthViewModel @Inject constructor(
     }
 }
 
+/** How long sign-out waits to unregister this device, credential acquisition included, before going on. */
+internal const val UNREGISTER_DEADLINE_MILLIS = 10_000L
+
 /**
  * Runs sign-out in the coordinator's process scope once handed off, independently of caller
- * cancellation. The transition keeps the lease until it terminates; this adds no deadline.
+ * cancellation. The transition keeps the lease until it terminates.
+ *
+ * [begin] opens the sign-out attempt; only an armed one runs the authentication side effects, and
+ * only for this driver. A driver that stops before the Firebase sign-out returns hands the attempt to
+ * recovery through [stopDriver]. One whose sign-out returns does nothing more: the end that sign-out
+ * produces finishes the attempt, and if it cannot, the binder's automatic recovery takes the attempt.
  */
 internal suspend fun handedOffSignOut(
     coordinator: AuthTransitionCoordinator,
     owner: AuthIdentityFence,
+    begin: suspend (AuthIdentityFence) -> SignOutStart,
+    stopDriver: suspend (SignOutTicket) -> Unit,
     unregister: suspend (AuthIdentityFence) -> Unit,
     invalidate: (AuthIdentityFence) -> Boolean,
-    signOut: suspend () -> Unit
+    signOut: suspend () -> Unit,
+    unregisterDeadlineMillis: Long = UNREGISTER_DEADLINE_MILLIS
 ) {
     coordinator.withHandedOffTransition {
-        ownerBoundSignOut(owner, unregister, invalidate, signOut)
+        currentCoroutineContext().ensureActive()
+        // The binder serves a queued preparation even after its caller is cancelled, so the answer is
+        // awaited through cancellation: an Armed ticket nobody holds could never be stopped. Work
+        // cancelled by the time it arrives only stops the driver.
+        val armed = withContext(NonCancellable) { begin(owner) } as? SignOutStart.Armed
+            ?: return@withHandedOffTransition
+        if (!currentCoroutineContext().isActive) {
+            withContext(NonCancellable) { stopDriver(armed.ticket) }
+            return@withHandedOffTransition
+        }
+        val signedOut = try {
+            ownerBoundSignOut(
+                owner = owner,
+                // Only running out of time lets the sign-out go on without the unregister.
+                unregister = { captured -> withTimeoutOrNull(unregisterDeadlineMillis) { unregister(captured) } },
+                invalidate = invalidate,
+                signOut = signOut
+            )
+        } catch (failure: Exception) {
+            // Stopped part way, the Firebase sign-out included: what it did is recovery's to find out.
+            withContext(NonCancellable) { stopDriver(armed.ticket) }
+            // A CancellationException — the identity changed under the unregister, or this work was
+            // cancelled — only stops the driver; cancelled work still completes as cancelled.
+            if (failure !is CancellationException) throw failure
+            return@withHandedOffTransition
+        }
+        if (!signedOut) {
+            withContext(NonCancellable) { stopDriver(armed.ticket) }
+        }
     }
 }
 
-/** Orders the destructive sign-out boundary and treats generation invalidation as a CAS. */
+/**
+ * Orders the destructive sign-out boundary and treats generation invalidation as a CAS. True once
+ * the Firebase sign-out has returned; false when the CAS found the session already moved.
+ */
 internal suspend fun ownerBoundSignOut(
     owner: AuthIdentityFence,
     unregister: suspend (AuthIdentityFence) -> Unit,
     invalidate: (AuthIdentityFence) -> Boolean,
     signOut: suspend () -> Unit
-) {
+): Boolean {
     unregister(owner)
-    if (!invalidate(owner)) return
+    if (!invalidate(owner)) return false
     signOut()
+    return true
 }
