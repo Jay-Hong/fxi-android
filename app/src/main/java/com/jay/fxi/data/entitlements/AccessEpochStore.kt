@@ -49,7 +49,27 @@ data class AccessEpochRecord(
     val krxCapabilityEpoch: String? = null,
     val mayContainPremiumData: Boolean = false,
     val mayContainKrxData: Boolean = false,
-    val pendingPurges: List<PendingPurge> = emptyList()
+    val pendingPurges: List<PendingPurge> = emptyList(),
+    /**
+     * The owner whose sign-out was decided but has not landed yet.
+     *
+     * Without a persisted intent, a sign-out whose rotation edit never became durable leaves
+     * this record indistinguishable from one in which that sign-out was not attempted. An
+     * exception or cancellation alone does not establish whether the edit became durable;
+     * recovery must inspect the persisted record.
+     *
+     * This intent must be persisted before the rotation edit. `ANDROID_V2_PLAN.md` §S1 asks for
+     * a logout's journal to materialize before the first protected use even across process death.
+     *
+     * Keyed on the uid alone, deliberately. The namespace to tear down is whatever the record
+     * holds while that uid still owns it, and the epochs can legitimately move in between — a KRX
+     * revoke rotates one axis on its own — so matching on the epochs recorded at decision time
+     * would skip a teardown that is still owed. Settling and rotating happen in the same edit, so a
+     * crash cannot leave the marker set on a namespace that was already retired.
+     *
+     * Not an access fact: [toSnapshotFacts] and [fence] deliberately do not read it.
+     */
+    val teardownOwedFor: String? = null
 ) {
     fun toSnapshotFacts(
         state: PremiumAccessState,
@@ -137,14 +157,59 @@ object AccessEpochTransitions {
         uid: String,
         ids: EpochIdGenerator
     ): AccessEpochRecord {
-        if (record.ownerUid == uid) return ensureNamespace(record, ids)
-        val previousOwner = record.ownerUid
-        val rotated = if (previousOwner != null) {
-            rotate(record, rotateUser = true, rotateKrx = true, ids = ids, purgedOwnerUid = previousOwner)
+        // A sign-out of this same uid that never landed has to land before the uid can bind again,
+        // or the same-owner branch below would hand it the namespace it was leaving. For any other
+        // uid the owner change retires that namespace anyway, so the marker only has to go.
+        val base = if (record.teardownOwedFor == uid) {
+            settleOwedTeardown(record, ids)
         } else {
-            record
+            record.copy(teardownOwedFor = null)
+        }
+        if (base.ownerUid == uid) return ensureNamespace(base, ids)
+        val previousOwner = base.ownerUid
+        val rotated = if (previousOwner != null) {
+            rotate(base, rotateUser = true, rotateKrx = true, ids = ids, purgedOwnerUid = previousOwner)
+        } else {
+            base
         }
         return ensureNamespace(rotated.copy(ownerUid = uid), ids)
+    }
+
+    /**
+     * Records that the sign-out of [uid] has been decided, ahead of the edit that performs it.
+     *
+     * [uid] is the account captured by the caller. A non-owner request returns the record
+     * unchanged. The caller must require both ownerUid and teardownOwedFor in the returned
+     * record to equal [uid]. This function has no auth state; the caller must also validate the
+     * captured auth generation before persisting the intent.
+     *
+     * Changes only teardownOwedFor; epochs, purge entries and mayContain flags stay unchanged.
+     * Repeating this function before the teardown lands is idempotent. Once persisted, the
+     * intent remains owed if the Firebase operation is abandoned. The caller must keep
+     * protected access blocked and arrange settlement independently of another auth event.
+     *
+     * ⚠️ It arms again after a sign-out that already landed: [rotate] keeps the owner, so the record
+     * still names that uid. Nothing here can tell "this sign-out landed" from "a new one is being
+     * decided" — a caller retrying a transition must carry what its first attempt captured rather
+     * than begin again, or a retry of a landed sign-out rotates a second time.
+     */
+    fun beginSignOut(record: AccessEpochRecord, uid: String): AccessEpochRecord {
+        if (record.ownerUid != uid) return record
+        return record.copy(teardownOwedFor = uid)
+    }
+
+    /**
+     * Lands a sign-out that was decided but never landed.
+     *
+     * Owed only while the marker names the current owner; a marker naming anyone else was already
+     * covered by the owner change that replaced them, so it is dropped without rotating again.
+     * [beginSignOut] never arms a non-owner, so that branch is reachable only from a record built
+     * some other way — kept as a pin, because a stale marker must never become a rotation.
+     */
+    fun settleOwedTeardown(record: AccessEpochRecord, ids: EpochIdGenerator): AccessEpochRecord {
+        val owed = record.teardownOwedFor ?: return record
+        if (owed != record.ownerUid) return record.copy(teardownOwedFor = null)
+        return signOut(record, ids)
     }
 
     /**
@@ -155,8 +220,11 @@ object AccessEpochTransitions {
      * protected data that was never re-authorised.
      */
     fun signOut(record: AccessEpochRecord, ids: EpochIdGenerator): AccessEpochRecord {
-        if (record.ownerUid == null) return record
-        return rotate(record, rotateUser = true, rotateKrx = true, ids = ids, purgedOwnerUid = record.ownerUid)
+        // Cleared in the same record the rotation returns, so the marker and the teardown it
+        // stands for land together or not at all.
+        val landed = record.copy(teardownOwedFor = null)
+        if (record.ownerUid == null) return landed
+        return rotate(landed, rotateUser = true, rotateKrx = true, ids = ids, purgedOwnerUid = record.ownerUid)
     }
 
     /** Removes exactly the entries that were purged. Others stay owed. */

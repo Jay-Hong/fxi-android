@@ -215,4 +215,198 @@ class AccessEpochTransitionsTest {
 
         assertNotEquals(before.fence(), after.fence())
     }
+
+    // ---- an owed sign-out (L-4b-2) ---------------------------------------------------------
+    //
+    // Sign-out writes its rotation and journal entry in one edit. When that edit does not land,
+    // the record is indistinguishable from "signed in, sign-out never tried", so the intent has to
+    // be written first and discharged later. These pin the pure half of that.
+
+    @Test
+    fun beginSignOut_recordsTheOwner_andTouchesNothingElse() {
+        val before = bound()
+
+        val after = AccessEpochTransitions.beginSignOut(before, "user-a")
+
+        assertEquals("user-a", after.teardownOwedFor)
+        assertEquals("nothing else may move", before, after.copy(teardownOwedFor = null))
+    }
+
+    @Test
+    fun beginSignOut_onAnUnboundRecord_isANoOp() {
+        val unbound = AccessEpochRecord()
+
+        assertEquals(unbound, AccessEpochTransitions.beginSignOut(unbound, "user-a"))
+    }
+
+    @Test
+    fun signOut_clearsTheOwedMarker_inTheSameRecordThatRotates() {
+        val owed = AccessEpochTransitions.beginSignOut(bound(), "user-a")
+
+        val after = AccessEpochTransitions.signOut(owed, ids)
+
+        assertNull(after.teardownOwedFor)
+        assertNotEquals(owed.userAccessEpoch, after.userAccessEpoch)
+        assertEquals(owed.userAccessEpoch, after.pendingPurges.single().userAccessEpoch)
+    }
+
+    @Test
+    fun signOut_withNoOwner_stillDropsAStaleMarker() {
+        val stale = AccessEpochRecord(teardownOwedFor = "user-a")
+
+        val after = AccessEpochTransitions.signOut(stale, ids)
+
+        assertNull(after.teardownOwedFor)
+        assertTrue("an unbound record has nothing to rotate", after.pendingPurges.isEmpty())
+    }
+
+    @Test
+    fun settleOwedTeardown_forTheCurrentOwner_rotatesAndClears() {
+        val owed = AccessEpochTransitions.beginSignOut(bound(), "user-a")
+
+        val settled = AccessEpochTransitions.settleOwedTeardown(owed, ids)
+
+        assertNull(settled.teardownOwedFor)
+        assertNotEquals(owed.userAccessEpoch, settled.userAccessEpoch)
+        assertNotEquals(owed.krxCapabilityEpoch, settled.krxCapabilityEpoch)
+        val entry = settled.pendingPurges.single()
+        assertEquals("user-a", entry.ownerUid)
+        assertEquals(owed.userAccessEpoch, entry.userAccessEpoch)
+        assertEquals(owed.krxCapabilityEpoch, entry.krxCapabilityEpoch)
+    }
+
+    @Test
+    fun settleOwedTeardown_withNothingOwed_isANoOp() {
+        val clean = bound()
+
+        assertEquals(clean, AccessEpochTransitions.settleOwedTeardown(clean, ids))
+    }
+
+    /** A crash between settling and anything after it must not rotate a second time. */
+    @Test
+    fun settleOwedTeardown_isSafeToRepeat() {
+        val once = AccessEpochTransitions.settleOwedTeardown(AccessEpochTransitions.beginSignOut(bound(), "user-a"), ids)
+
+        val twice = AccessEpochTransitions.settleOwedTeardown(once, ids)
+
+        assertEquals(once, twice)
+        assertEquals(1, twice.pendingPurges.size)
+    }
+
+    @Test
+    fun settleOwedTeardown_namingSomeoneOtherThanTheOwner_dropsTheMarkerWithoutRotating() {
+        val stale = bound("user-b").copy(teardownOwedFor = "user-a")
+
+        val after = AccessEpochTransitions.settleOwedTeardown(stale, ids)
+
+        assertNull(after.teardownOwedFor)
+        assertEquals("the owner's namespace is not the one owed", stale.userAccessEpoch, after.userAccessEpoch)
+        assertTrue(after.pendingPurges.isEmpty())
+    }
+
+    /**
+     * The failure the marker exists for: the same uid signs in again after a sign-out that never
+     * landed. Without the settle, the same-owner branch hands it back the namespace it was leaving.
+     */
+    @Test
+    fun bindOwner_sameUidAfterAnUnfinishedSignOut_getsANewNamespace() {
+        val owed = AccessEpochTransitions.beginSignOut(bound(), "user-a")
+
+        val rebound = AccessEpochTransitions.bindOwner(owed, "user-a", ids)
+
+        assertNull(rebound.teardownOwedFor)
+        assertNotEquals("the old namespace must not be inherited", owed.userAccessEpoch, rebound.userAccessEpoch)
+        assertNotEquals(owed.krxCapabilityEpoch, rebound.krxCapabilityEpoch)
+        assertEquals(owed.userAccessEpoch, rebound.pendingPurges.single().userAccessEpoch)
+    }
+
+    /** A different uid retires the namespace through the owner change — once, not twice. */
+    @Test
+    fun bindOwner_differentUidAfterAnUnfinishedSignOut_journalsThePreviousOwnerOnce() {
+        val owed = AccessEpochTransitions.beginSignOut(bound("user-a"), "user-a")
+
+        val switched = AccessEpochTransitions.bindOwner(owed, "user-b", ids)
+
+        assertNull(switched.teardownOwedFor)
+        assertEquals("user-b", switched.ownerUid)
+        val entry = switched.pendingPurges.single()
+        assertEquals("user-a", entry.ownerUid)
+        assertEquals(owed.userAccessEpoch, entry.userAccessEpoch)
+        assertFalse(
+            "the new owner's namespace is never journalled",
+            switched.pendingPurges.any { it.userAccessEpoch == switched.userAccessEpoch }
+        )
+    }
+
+    /** No marker, no change: same-uid cold-start continuity is what the plan preserves. */
+    @Test
+    fun bindOwner_sameUidWithNothingOwed_keepsTheNamespace() {
+        val clean = bound()
+
+        assertEquals(clean, AccessEpochTransitions.bindOwner(clean, "user-a", ids))
+    }
+
+    /**
+     * Why the marker holds the uid and not the epochs it saw.
+     *
+     * A KRX revoke rotates one axis on its own. Settling only when the recorded epochs still match
+     * would skip here and leave the user axis — the one a returning sign-in would inherit — live.
+     */
+    @Test
+    fun settleOwedTeardown_afterAKrxOnlyRotation_stillRetiresTheUserAxis() {
+        val owed = AccessEpochTransitions.beginSignOut(bound(), "user-a")
+        val drifted = AccessEpochTransitions.rotate(owed, rotateUser = false, rotateKrx = true, ids = ids)
+
+        val settled = AccessEpochTransitions.settleOwedTeardown(drifted, ids)
+
+        assertNull(settled.teardownOwedFor)
+        assertNotEquals(owed.userAccessEpoch, settled.userAccessEpoch)
+        assertTrue(
+            "the user axis the marker was written against is journalled",
+            settled.pendingPurges.any { it.userAccessEpoch == owed.userAccessEpoch }
+        )
+    }
+
+    /** The captured account, not whoever the record happens to name while the binder lags. */
+    @Test
+    fun beginSignOut_forAUidThatDoesNotOwnTheRecord_armsNothing() {
+        val ownedByB = bound("user-b")
+
+        assertEquals(ownedByB, AccessEpochTransitions.beginSignOut(ownedByB, "user-a"))
+    }
+
+    @Test
+    fun beginSignOut_twice_isTheSameAsOnce() {
+        val once = AccessEpochTransitions.beginSignOut(bound(), "user-a")
+
+        assertEquals(once, AccessEpochTransitions.beginSignOut(once, "user-a"))
+    }
+
+    /** The owner change retires the user axis the marker was written against, even after a KRX drift. */
+    @Test
+    fun bindOwner_differentUidAfterAKrxOnlyRotation_stillRetiresTheUserAxisOnce() {
+        val owed = AccessEpochTransitions.beginSignOut(bound("user-a"), "user-a")
+        val drifted = AccessEpochTransitions.rotate(owed, rotateUser = false, rotateKrx = true, ids = ids)
+
+        val switched = AccessEpochTransitions.bindOwner(drifted, "user-b", ids)
+
+        assertNull(switched.teardownOwedFor)
+        assertEquals(
+            "user axis journalled exactly once",
+            1,
+            switched.pendingPurges.count { it.userAccessEpoch == owed.userAccessEpoch }
+        )
+    }
+
+    @Test
+    fun teardownOwedFor_isNotAnAccessFact() {
+        val clean = bound()
+        val owed = AccessEpochTransitions.beginSignOut(clean, "user-a")
+
+        assertEquals(clean.fence(), owed.fence())
+        assertEquals(
+            clean.toSnapshotFacts(PremiumAccessState.NoGrant, KrxCapabilityState.HIDDEN),
+            owed.toSnapshotFacts(PremiumAccessState.NoGrant, KrxCapabilityState.HIDDEN)
+        )
+    }
 }
