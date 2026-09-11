@@ -41,8 +41,54 @@ internal sealed interface SignOutStart {
     data class RecoveryRequired(val ticket: SignOutTicket) : SignOutStart
 }
 
+/** What reading back an unresolved edit established. */
+internal enum class EditResolution {
+    /** No edit of that attempt is waiting. */
+    NOT_PENDING,
+
+    /** Classified; identity events are admitted again. */
+    RESOLVED,
+
+    /** The record could not be read. Still unresolved. */
+    STILL_UNKNOWN,
+
+    /** The record is neither the edit's result nor where it started. Still unresolved, and nothing is guessed. */
+    INCONSISTENT
+}
+
 /** The namespace edit whose outcome a [SignOutAttempt.Unresolved] is waiting to read back. */
-internal enum class PendingEdit { READ, BEGIN_SIGN_OUT, BIND_OWNER, SIGN_OUT }
+internal enum class PendingEdit {
+    /** A read that had to precede an edit failed. Nothing was written. */
+    READ,
+    BEGIN_SIGN_OUT,
+    BIND_OWNER,
+
+    /** The rotation a real end runs. Not safe to repeat once landed: `signOut` keeps the owner. */
+    END,
+
+    /** Recovery's rotation of an intent still owed on disk. */
+    SETTLE
+}
+
+/**
+ * An identity event the coordinator held because its edit failed, kept until that same event is
+ * applied.
+ *
+ * Resolving the edit reopens admission, but the binder retries the event only later. The retry is
+ * checked against this, and a landed end's result waits here for it.
+ */
+internal sealed interface HeldIdentityEvent {
+    val ticket: SignOutTicket
+
+    data class Bind(override val ticket: SignOutTicket, val fence: AuthIdentityFence) : HeldIdentityEvent
+
+    /** [receipt] is set once a read-back confirms the end's rotation landed; the retry uses it instead of rotating. */
+    data class End(
+        override val ticket: SignOutTicket,
+        val ended: AuthIdentityFence,
+        val receipt: EditResult.Landed? = null
+    ) : HeldIdentityEvent
+}
 
 /** What a namespace edit is known to have done. */
 internal sealed interface EditResult {
@@ -286,7 +332,7 @@ internal object SignOutAttemptPolicy {
             is EditResult.Unknown -> SignOutAttempt.Unresolved(
                 attempt.ticket,
                 attempt.fence,
-                PendingEdit.SIGN_OUT,
+                PendingEdit.END,
                 knownBefore,
                 rotation.before
             )
@@ -309,12 +355,70 @@ internal object SignOutAttemptPolicy {
         else -> attempt
     }
 
+    /** An edit an open attempt depends on failed without establishing what it did. */
+    fun editFailed(attempt: SignOutAttempt, edit: PendingEdit, before: AccessEpochRecord?): SignOutAttempt.Unresolved =
+        SignOutAttempt.Unresolved(attempt.ticket, attempt.fence, edit, knowledgeOf(attempt), before)
+
+    sealed interface Resolution {
+        /** [endReceipt] is set only for an [PendingEdit.END] that read back as landed. */
+        data class Resolved(
+            val next: SignOutAttempt.Recovering,
+            val endReceipt: EditResult.Landed? = null
+        ) : Resolution
+
+        /** The read-back is neither the edit's result nor the record it started from. Nothing is guessed. */
+        data object Inconsistent : Resolution
+    }
+
     /**
-     * Applies knowledge the caller established by reconciling this unresolved edit.
-     * This function does not inspect a read-back record or classify the edit's outcome.
+     * Classifies an unresolved edit from a record read back after it.
+     *
+     * [readBack] must come before any purge, for the reason [retired] gives.
      */
-    fun readBack(attempt: SignOutAttempt.Unresolved, knowledge: TeardownKnowledge): SignOutAttempt.Recovering =
-        SignOutAttempt.Recovering(attempt.ticket, attempt.fence, knowledge)
+    fun resolve(attempt: SignOutAttempt.Unresolved, readBack: AccessEpochRecord): Resolution {
+        fun recovering(knowledge: TeardownKnowledge) =
+            SignOutAttempt.Recovering(attempt.ticket, attempt.fence, knowledge)
+        val known = attempt.knownBefore
+        return when (attempt.edit) {
+            PendingEdit.READ -> Resolution.Resolved(recovering(known))
+            PendingEdit.BEGIN_SIGN_OUT -> Resolution.Resolved(
+                recovering(
+                    if (holdsIntent(readBack, attempt.fence.uid)) TeardownKnowledge.OWED else TeardownKnowledge.NOT_OWED
+                )
+            )
+            // Whether a bind itself landed is left to the held event's retry, which repeats a landed
+            // bind as a no-op.
+            // A settle that did not land leaves the intent on disk for recover() to find again.
+            PendingEdit.BIND_OWNER, PendingEdit.SETTLE -> {
+                val before = checkNotNull(attempt.before) { "${attempt.edit} keeps the record it started from" }
+                Resolution.Resolved(
+                    recovering(if (retired(before, readBack, attempt.fence.uid)) TeardownKnowledge.LANDED else known)
+                )
+            }
+            // An end cannot be retried blind: `signOut` keeps the owner, so a landed end would rotate again.
+            PendingEdit.END -> {
+                val before = checkNotNull(attempt.before) { "END keeps the record it started from" }
+                val owner = before.ownerUid
+                when {
+                    owner != null && retired(before, readBack, owner) ->
+                        Resolution.Resolved(recovering(known), endReceipt = EditResult.Landed(readBack))
+                    sameNamespace(before, readBack) -> Resolution.Resolved(recovering(known))
+                    else -> Resolution.Inconsistent
+                }
+            }
+        }
+    }
+
+    /**
+     * The fields a rotation changes. The mayContain markers are left out: they are not what tells a
+     * rotation apart, and their store entry point does not go through the coordinator's lock.
+     */
+    private fun sameNamespace(a: AccessEpochRecord, b: AccessEpochRecord): Boolean =
+        a.ownerUid == b.ownerUid &&
+            a.userAccessEpoch == b.userAccessEpoch &&
+            a.krxCapabilityEpoch == b.krxCapabilityEpoch &&
+            a.teardownOwedFor == b.teardownOwedFor &&
+            a.pendingPurges == b.pendingPurges
 
     enum class RecoveryStep {
         /** The intent is still owed on disk: settle it with one rotation. */
@@ -341,7 +445,7 @@ internal object SignOutAttemptPolicy {
         is EditResult.Unknown -> SignOutAttempt.Unresolved(
             attempt.ticket,
             attempt.fence,
-            PendingEdit.SIGN_OUT,
+            PendingEdit.SETTLE,
             attempt.knowledge,
             rotation.before
         )

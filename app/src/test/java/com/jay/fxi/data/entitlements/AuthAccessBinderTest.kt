@@ -55,12 +55,19 @@ class AuthAccessBinderTest {
         /** Parks one read, including the first read of an executing preparation. */
         var blockNextLoadOn: CompletableDeferred<Unit>? = null
 
+        /** Fails the next bind before it writes anything. */
+        var failNextBind = false
+
         override suspend fun load(): AccessEpochRecord {
             blockNextLoadOn?.let { gate -> blockNextLoadOn = null; gate.await() }
             return record
         }
         override suspend fun bindOwner(uid: String): AccessEpochRecord {
             blockNextBindOn?.let { gate -> blockNextBindOn = null; gate.await() }
+            if (failNextBind) {
+                failNextBind = false
+                throw java.io.IOException("simulated write failure")
+            }
             calls += Call.OwnerChanged(uid)
             return AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
         }
@@ -110,7 +117,9 @@ class AuthAccessBinderTest {
         live: () -> AuthIdentityFence? = { null },
         store: RecordingStore = RecordingStore(calls),
         /** Collects failures that end a coroutine of the binder's scope, instead of failing the test run. */
-        uncaught: MutableList<Throwable>? = null
+        uncaught: MutableList<Throwable>? = null,
+        /** Hands over the coordinator, for a test that reads back an edit from outside the FIFO. */
+        onCoordinator: (PremiumAccessCoordinator) -> Unit = {}
     ): AuthAccessBinder {
         if (seedJournal) {
             // A journal a previous process left behind — the only thing that makes a resume
@@ -162,6 +171,7 @@ class AuthAccessBinderTest {
             jitter = ProbeJitter.None,
             liveFence = live
         )
+        onCoordinator(coordinator)
         // No stream: every test drives onFenceObserved itself, so registration order cannot make
         // a test pass for the wrong reason.
         return AuthAccessBinder(coordinator, scope, AuthFenceStream { })
@@ -549,6 +559,37 @@ class AuthAccessBinderTest {
         assertTrue("consumer 가 그 실패로 끝나지 않았다: $uncaught", uncaught.singleOrNull() is IllegalArgumentException)
         val later = runCatching { binder.beginSignOut(fence) }.exceptionOrNull()
         assertTrue("실패 뒤 consumer 가 계속 받았다: $later", later.isStoppedConsumer())
+    }
+
+    @Test
+    fun aHeldEventIsRetriedFirstAndLaterOnesFollowInOrder() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val a = fenceOf("user-a", 7L)
+        val b = fenceOf("user-b", 3L)
+        var live: AuthIdentityFence? = a
+        lateinit var coordinator: PremiumAccessCoordinator
+        val binder = build(calls, live = { live }, store = store, onCoordinator = { coordinator = it })
+        binder.start()
+        binder.onFenceObserved(a)
+        advanceUntilIdle()
+        val ticket = (binder.beginSignOut(a) as SignOutStart.Armed).ticket
+
+        live = b
+        store.failNextBind = true
+        binder.onFenceObserved(b)
+        binder.onFenceObserved(null)
+        advanceUntilIdle()
+        assertEquals("읽어 보기 전에 보류 사건 뒤의 사건이 적용됐다", listOf(Call.OwnerChanged("user-a")), calls)
+
+        assertEquals(EditResolution.RESOLVED, coordinator.resolvePendingEdit(ticket))
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(Call.OwnerChanged("user-a"), Call.OwnerChanged("user-b"), Call.SignedOut),
+            calls
+        )
+        processJob.cancel()
     }
 }
 /**

@@ -6,6 +6,7 @@ import com.jay.fxi.data.entitlements.SignOutAttemptPolicy.EndPlan
 import com.jay.fxi.data.entitlements.SignOutAttemptPolicy.Prologue
 import com.jay.fxi.data.entitlements.SignOutAttemptPolicy.RecoveryStep
 import com.jay.fxi.data.entitlements.SignOutAttemptPolicy.Request
+import com.jay.fxi.data.entitlements.SignOutAttemptPolicy.Resolution
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -56,7 +57,7 @@ class SignOutAttemptPolicyTest {
             preparing(),
             armed(),
             recovering(TeardownKnowledge.NOT_OWED),
-            unresolved(PendingEdit.SIGN_OUT, TeardownKnowledge.OWED)
+            unresolved(PendingEdit.END, TeardownKnowledge.OWED)
         ).forEach { assertFalse("$it 가 조회를 받았다", SignOutAttemptPolicy.admitsAccessQueries(it)) }
     }
 
@@ -268,7 +269,7 @@ class SignOutAttemptPolicyTest {
     @Test
     fun ambiguousEndRotationIsNotBlindlyRetried() {
         assertEquals(
-            SignOutAttempt.Unresolved(t, a7, PendingEdit.SIGN_OUT, TeardownKnowledge.OWED, armedA),
+            SignOutAttempt.Unresolved(t, a7, PendingEdit.END, TeardownKnowledge.OWED, armedA),
             SignOutAttemptPolicy.afterEnd(armed(), a7, EditResult.Unknown(armedA), live = null)
         )
     }
@@ -284,11 +285,90 @@ class SignOutAttemptPolicyTest {
     }
 
     @Test
-    fun readbackAppliesCallerEstablishedKnowledge() {
+    fun aFailedEditKeepsWhatTheAttemptKnew() {
         assertEquals(
-            recovering(TeardownKnowledge.LANDED),
-            SignOutAttemptPolicy.readBack(unresolved(PendingEdit.SIGN_OUT, TeardownKnowledge.OWED), TeardownKnowledge.LANDED)
+            SignOutAttempt.Unresolved(t, a7, PendingEdit.BIND_OWNER, TeardownKnowledge.OWED, armedA),
+            SignOutAttemptPolicy.editFailed(armed(), PendingEdit.BIND_OWNER, armedA)
         )
+        assertEquals(
+            SignOutAttempt.Unresolved(t, a7, PendingEdit.READ, TeardownKnowledge.LANDED, null),
+            SignOutAttemptPolicy.editFailed(recovering(TeardownKnowledge.LANDED), PendingEdit.READ, null)
+        )
+        assertThrows(IllegalStateException::class.java) {
+            SignOutAttemptPolicy.editFailed(preparing(), PendingEdit.BIND_OWNER, armedA)
+        }
+    }
+
+    @Test
+    fun readBackOfAFailedReadAddsNothing() {
+        val read = SignOutAttempt.Unresolved(t, a7, PendingEdit.READ, TeardownKnowledge.OWED, before = null)
+        assertEquals(Resolution.Resolved(recovering(TeardownKnowledge.OWED)), SignOutAttemptPolicy.resolve(read, settledA))
+    }
+
+    @Test
+    fun readBackOfTheIntentWriteSaysOnlyWhetherItIsOwed() {
+        val begin = SignOutAttempt.Unresolved(t, a7, PendingEdit.BEGIN_SIGN_OUT, TeardownKnowledge.NOT_OWED, boundA)
+        assertEquals(Resolution.Resolved(recovering(TeardownKnowledge.OWED)), SignOutAttemptPolicy.resolve(begin, armedA))
+        assertEquals(Resolution.Resolved(recovering(TeardownKnowledge.NOT_OWED)), SignOutAttemptPolicy.resolve(begin, boundA))
+    }
+
+    @Test
+    fun readBackOfABindCountsOnlyTheJournalReceipt() {
+        val bind = unresolved(PendingEdit.BIND_OWNER, TeardownKnowledge.OWED)
+        // The same uid's bind settles the intent; another uid's retires the namespace by the owner change.
+        val sameUid = AccessEpochTransitions.bindOwner(armedA, "user-a", ids)
+        val otherUid = AccessEpochTransitions.bindOwner(armedA, "user-b", ids)
+        assertEquals(Resolution.Resolved(recovering(TeardownKnowledge.LANDED)), SignOutAttemptPolicy.resolve(bind, sameUid))
+        assertEquals(Resolution.Resolved(recovering(TeardownKnowledge.LANDED)), SignOutAttemptPolicy.resolve(bind, otherUid))
+        assertEquals(Resolution.Resolved(recovering(TeardownKnowledge.OWED)), SignOutAttemptPolicy.resolve(bind, armedA))
+    }
+
+    @Test
+    fun readBackOfASettleThatDidNotLandLeavesItOwed() {
+        val settle = unresolved(PendingEdit.SETTLE, TeardownKnowledge.OWED)
+        assertEquals(Resolution.Resolved(recovering(TeardownKnowledge.LANDED)), SignOutAttemptPolicy.resolve(settle, settledA))
+        assertEquals(Resolution.Resolved(recovering(TeardownKnowledge.OWED)), SignOutAttemptPolicy.resolve(settle, armedA))
+    }
+
+    @Test
+    fun aLandedEndLeavesItsResultForTheRetry() {
+        val end = unresolved(PendingEdit.END, TeardownKnowledge.OWED)
+        assertEquals(
+            Resolution.Resolved(recovering(TeardownKnowledge.OWED), endReceipt = EditResult.Landed(settledA)),
+            SignOutAttemptPolicy.resolve(end, settledA)
+        )
+    }
+
+    @Test
+    fun anotherUidsLandedEndIsReadByTheOwnerItRotated() {
+        // The attempt is a7's, but the end being retried is user-b's: the receipt is b's epoch.
+        val boundB = AccessEpochTransitions.bindOwner(settledA, "user-b", ids)
+        val endOfB = SignOutAttempt.Unresolved(t, a7, PendingEdit.END, TeardownKnowledge.LANDED, boundB)
+        val landed = AccessEpochTransitions.signOut(boundB, ids)
+        assertEquals(
+            Resolution.Resolved(recovering(TeardownKnowledge.LANDED), endReceipt = EditResult.Landed(landed)),
+            SignOutAttemptPolicy.resolve(endOfB, landed)
+        )
+    }
+
+    @Test
+    fun anEndThatDidNotLandIsReadByTheNamespaceAlone() {
+        val end = unresolved(PendingEdit.END, TeardownKnowledge.OWED)
+        val marked = AccessEpochTransitions.markMayContainData(armedA, premium = true, krx = true)
+        assertEquals(Resolution.Resolved(recovering(TeardownKnowledge.OWED)), SignOutAttemptPolicy.resolve(end, armedA))
+        assertEquals(Resolution.Resolved(recovering(TeardownKnowledge.OWED)), SignOutAttemptPolicy.resolve(end, marked))
+    }
+
+    @Test
+    fun anEndReadBackThatIsNeitherIsNotGuessed() {
+        val end = unresolved(PendingEdit.END, TeardownKnowledge.OWED)
+        listOf(
+            armedA.copy(userAccessEpoch = "not-from-any-rotation"),
+            armedA.copy(krxCapabilityEpoch = "not-from-any-rotation"),
+            armedA.copy(ownerUid = "user-b"),
+            armedA.copy(teardownOwedFor = null),
+            armedA.copy(pendingPurges = listOf(PendingPurge("user-a", "elsewhere", null, AccessEpochTransitions.ALL_SCOPES)))
+        ).forEach { assertEquals("$it", Resolution.Inconsistent, SignOutAttemptPolicy.resolve(end, it)) }
     }
 
     // Recovery
@@ -316,7 +396,7 @@ class SignOutAttemptPolicyTest {
     @Test
     fun ambiguousSettlementIsRecordedNotRetried() {
         assertEquals(
-            SignOutAttempt.Unresolved(t, a7, PendingEdit.SIGN_OUT, TeardownKnowledge.OWED, armedA),
+            SignOutAttempt.Unresolved(t, a7, PendingEdit.SETTLE, TeardownKnowledge.OWED, armedA),
             SignOutAttemptPolicy.settled(recovering(TeardownKnowledge.OWED), EditResult.Unknown(armedA))
         )
     }

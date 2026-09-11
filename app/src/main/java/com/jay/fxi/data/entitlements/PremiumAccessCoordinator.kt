@@ -4,7 +4,9 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -111,6 +113,9 @@ class PremiumAccessCoordinator(
      */
     private var completedBinding: AuthIdentityFence? = null
 
+    /** The identity event held by a failed edit, until that same event is applied. Guarded by [mutex]. */
+    private var heldEvent: HeldIdentityEvent? = null
+
     /** False while the open attempt has an edit in flight. Identity events wait on it. */
     private val identityEventsAdmitted = MutableStateFlow(true)
 
@@ -134,12 +139,19 @@ class PremiumAccessCoordinator(
      * a changed uid or session marker; an unchanged observation does not advance it.
      *
      * Returns null, having done nothing, while an open sign-out has an edit in flight. The caller
-     * keeps the event and tries again once [awaitIdentityEventsAdmitted] returns.
+     * keeps the event and tries again once [awaitIdentityEventsAdmitted] returns. It also returns
+     * null when its own edit fails while an attempt is open: see [identityEditLocked].
      */
     suspend fun onIdentityChanged(identity: AuthIdentityFence): AccessDecisionGeneration? = mutex.withLock {
         // Checked under the same lock as the edit below: a gate seen open before this lock was
         // taken can have closed since.
         if (!SignOutAttemptPolicy.admitsIdentityEvents(attempt)) return@withLock null
+        val open = attempt
+        heldEvent?.let { pending ->
+            check(pending is HeldIdentityEvent.Bind && pending.fence == identity && pending.ticket == open?.ticket) {
+                "the held identity event is retried before any other: held $pending, got $identity"
+            }
+        }
         decisionGeneration += 1
         cancelProbeLocked()
         clearForcePremiumLocked()
@@ -148,21 +160,25 @@ class PremiumAccessCoordinator(
         _state.value =
             OwnedPremiumAccess(identity.uid, identity.authGeneration, PremiumAccessState.NoGrant)
         schedule.cancel(preserveServerFloor = true)
-        val before = store.load()
-        val after = store.bindOwner(identity.uid)
+        val held = { HeldIdentityEvent.Bind(checkNotNull(open).ticket, identity) }
+        val before = identityEditLocked(open, PendingEdit.READ, before = null, held) { store.load() }
+            ?: return@withLock null
+        val after = identityEditLocked(open, PendingEdit.BIND_OWNER, before, held) { store.bindOwner(identity.uid) }
+            ?: return@withLock null
         completedBinding = identity
+        heldEvent = null
         // Judged from the record the bind returned, before any purge below can clear its receipt.
-        attempt?.let { open ->
+        open?.let { current ->
             setAttemptLocked(
                 SignOutAttemptPolicy.identityBound(
-                    open,
-                    retiredAttemptNamespace = SignOutAttemptPolicy.retired(before, after, open.fence.uid)
+                    current,
+                    retiredAttemptNamespace = SignOutAttemptPolicy.retired(before, after, current.fence.uid)
                 )
             )
         }
         _krx.value = KrxCapabilityState.HIDDEN
         _lastEffects.value = emptyList()
-        resumePendingPurgesLocked()
+        cleanupLocked()
         // Handed back so the caller can bind its follow-up query to *this* binding. A query queued
         // behind a sign-out would otherwise start under the next generation and revive a session
         // that is gone.
@@ -179,6 +195,13 @@ class PremiumAccessCoordinator(
     suspend fun onSignedOut(ended: AuthIdentityFence): Boolean = mutex.withLock {
         // Same contract as [onIdentityChanged]: held, untouched, while an edit is in flight.
         if (!SignOutAttemptPolicy.admitsIdentityEvents(attempt)) return@withLock false
+        val open = attempt
+        val retry = heldEvent
+        if (retry != null) {
+            check(retry is HeldIdentityEvent.End && retry.ended == ended && retry.ticket == open?.ticket) {
+                "the held identity event is retried before any other: held $retry, got the end of $ended"
+            }
+        }
         decisionGeneration += 1
         cancelProbeLocked()
         clearForcePremiumLocked()
@@ -188,23 +211,34 @@ class PremiumAccessCoordinator(
         // window matches on uid and opens the premium surface on a session that no longer exists.
         _state.value = OwnedPremiumAccess(null, null, PremiumAccessState.NoGrant)
         schedule.cancel(preserveServerFloor = true)
-        // Targeted: `store.signOut()` rotates whoever the record names, so it only runs when that is
-        // the uid whose session ended.
-        val rotation = when (SignOutAttemptPolicy.planEnd(ended, store.load().ownerUid)) {
-            SignOutAttemptPolicy.EndPlan.ROTATE -> EditResult.Landed(store.signOut())
-            SignOutAttemptPolicy.EndPlan.LEAVE_DISK -> EditResult.NotAttempted
+        // A retried end whose rotation a read-back found landed uses that result: rotating again
+        // would take down the namespace minted by the first rotation.
+        val rotation = (retry as? HeldIdentityEvent.End)?.receipt ?: run {
+            val held = { HeldIdentityEvent.End(checkNotNull(open).ticket, ended) }
+            val before = identityEditLocked(open, PendingEdit.READ, before = null, held) { store.load() }
+                ?: return@withLock false
+            // Targeted: `store.signOut()` rotates whoever the record names, so it only runs when that
+            // is the uid whose session ended.
+            when (SignOutAttemptPolicy.planEnd(ended, before.ownerUid)) {
+                SignOutAttemptPolicy.EndPlan.ROTATE -> EditResult.Landed(
+                    identityEditLocked(open, PendingEdit.END, before, held) { store.signOut() }
+                        ?: return@withLock false
+                )
+                SignOutAttemptPolicy.EndPlan.LEAVE_DISK -> EditResult.NotAttempted
+            }
         }
         completedBinding = null
+        heldEvent = null
         _krx.value = KrxCapabilityState.HIDDEN
-        // What this end did is recorded before cleanup runs, because cleanup can throw. Only
+        // What this end did is recorded before cleanup runs, because cleanup can fail. Only
         // finishing the attempt — which releases the seal — waits for it.
-        val finishing = attempt?.let { open ->
-            val next = SignOutAttemptPolicy.afterEnd(open, ended, rotation, liveFence())
+        val finishing = open?.let { current ->
+            val next = SignOutAttemptPolicy.afterEnd(current, ended, rotation, liveFence())
             // Null only when the rotation landed, so the provisional state says exactly that.
-            setAttemptLocked(next ?: SignOutAttempt.Recovering(open.ticket, open.fence, TeardownKnowledge.LANDED))
+            setAttemptLocked(next ?: SignOutAttempt.Recovering(current.ticket, current.fence, TeardownKnowledge.LANDED))
             next == null
         } ?: false
-        val cleanupOk = resumePendingPurgesLocked()
+        val cleanupOk = cleanupLocked()
         // Read again after the last suspension: somebody may have signed in during cleanup.
         if (finishing && cleanupOk && liveFence() == null) setAttemptLocked(null)
         true
@@ -308,6 +342,78 @@ class PremiumAccessCoordinator(
         schedule.cancel(preserveServerFloor = true)
     }
 
+    /**
+     * One disk step of an identity event.
+     *
+     * With no attempt open a failure propagates as it always has. With one open, the step's outcome
+     * is recorded as unresolved and the event is held — null tells the caller to hand it back. No
+     * read-back here: a known "not attempted" would be retried at once by the FIFO, so the retry waits
+     * for [resolvePendingEdit] instead. Nothing after the step runs, so no purge can erase its receipt.
+     */
+    private suspend fun <T : Any> identityEditLocked(
+        open: SignOutAttempt?,
+        edit: PendingEdit,
+        before: AccessEpochRecord?,
+        held: () -> HeldIdentityEvent,
+        step: suspend () -> T
+    ): T? = try {
+        step()
+    } catch (failed: Exception) {
+        if (open == null) throw failed
+        setAttemptLocked(SignOutAttemptPolicy.editFailed(open, edit, before))
+        heldEvent = held()
+        // A store can throw CancellationException of its own. Only this caller's cancellation ends here.
+        currentCoroutineContext().ensureActive()
+        null
+    }
+
+    /**
+     * Resumes purges after an edit that already landed.
+     *
+     * With an attempt open, a failure — reported or thrown — is a cleanup failure: it keeps the seal
+     * and never becomes that edit's failure. With none open it propagates as it always has.
+     */
+    private suspend fun cleanupLocked(): Boolean {
+        if (attempt == null) return resumePendingPurgesLocked()
+        return try {
+            resumePendingPurgesLocked()
+        } catch (failed: Exception) {
+            currentCoroutineContext().ensureActive()
+            false
+        }
+    }
+
+    /**
+     * Reads back the edit an open attempt is waiting on, from outside the identity FIFO held behind it.
+     *
+     * Resolving reopens identity events, and the event that was held is retried before any other. A
+     * landed end leaves its result for that retry.
+     */
+    internal suspend fun resolvePendingEdit(ticket: SignOutTicket): EditResolution = mutex.withLock {
+        val open = attempt as? SignOutAttempt.Unresolved
+        if (open == null || open.ticket != ticket) return@withLock EditResolution.NOT_PENDING
+        val readBack = try {
+            store.load()
+        } catch (failed: Exception) {
+            currentCoroutineContext().ensureActive()
+            return@withLock EditResolution.STILL_UNKNOWN
+        }
+        when (val resolution = SignOutAttemptPolicy.resolve(open, readBack)) {
+            is SignOutAttemptPolicy.Resolution.Resolved -> {
+                resolution.endReceipt?.let { receipt ->
+                    val pending = heldEvent
+                    check(pending is HeldIdentityEvent.End && pending.ticket == ticket) {
+                        "a landed end without the end event it belongs to: $pending"
+                    }
+                    heldEvent = pending.copy(receipt = receipt)
+                }
+                setAttemptLocked(resolution.next)
+                EditResolution.RESOLVED
+            }
+            SignOutAttemptPolicy.Resolution.Inconsistent -> EditResolution.INCONSISTENT
+        }
+    }
+
     /** Suspends while the open sign-out has an edit in flight. The identity FIFO waits here. */
     suspend fun awaitIdentityEventsAdmitted() {
         identityEventsAdmitted.first { it }
@@ -397,7 +503,11 @@ class PremiumAccessCoordinator(
 
     /** Re-runs purges a previous process journalled but did not finish. */
     suspend fun resumePendingPurges() {
-        mutex.withLock { resumePendingPurgesLocked() }
+        mutex.withLock {
+            // An unresolved edit's receipt is a journal entry; purging before its read-back erases it.
+            if (attempt is SignOutAttempt.Unresolved) return@withLock
+            resumePendingPurgesLocked()
+        }
     }
 
     suspend fun refresh(

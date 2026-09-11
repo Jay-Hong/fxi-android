@@ -36,50 +36,52 @@ class PremiumAccessCoordinatorSignOutTest {
     @After
     fun tearDown() = processJob.cancel()
 
-    private enum class BeginFailure { BEFORE_WRITE, AFTER_WRITE, CANCEL_AFTER_WRITE }
+    private enum class EditFault { BEFORE_WRITE, AFTER_WRITE, CANCEL_AFTER_WRITE }
 
     private class Store(private val ids: EpochIdGenerator) : AccessEpochStore {
         var record = AccessEpochRecord()
         var loads = 0
+        var binds = 0
         var signOuts = 0
-        var beginFailure: BeginFailure? = null
-        /** Once the intent write has failed, reading the record fails too. */
+        var beginFailure: EditFault? = null
+        /** The next bind or sign-out fails this way, once. */
+        var bindFault: EditFault? = null
+        var signOutFault: EditFault? = null
+        /** Once an edit has failed, reading the record fails too. */
         var readBackFails = false
+        var loadsFail = false
         var blockBeginSignOutOn: CompletableDeferred<Unit>? = null
         var blockNextLoadOn: CompletableDeferred<Unit>? = null
         var afterLoad: () -> Unit = {}
-        private var failLoads = false
 
         override suspend fun load(): AccessEpochRecord {
             loads += 1
             blockNextLoadOn?.let { gate -> blockNextLoadOn = null; gate.await() }
-            if (failLoads) throw IOException("simulated read failure")
+            if (loadsFail) throw IOException("simulated read failure")
             return record.also { afterLoad() }
         }
-        override suspend fun bindOwner(uid: String) =
-            AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
+        override suspend fun bindOwner(uid: String): AccessEpochRecord {
+            binds += 1
+            return edit(bindFault.also { bindFault = null }) { AccessEpochTransitions.bindOwner(record, uid, ids) }
+        }
         override suspend fun signOut(): AccessEpochRecord {
             signOuts += 1
-            return AccessEpochTransitions.signOut(record, ids).also { record = it }
+            return edit(signOutFault.also { signOutFault = null }) { AccessEpochTransitions.signOut(record, ids) }
         }
         override suspend fun beginSignOut(uid: String): AccessEpochRecord {
             blockBeginSignOutOn?.let { gate -> blockBeginSignOutOn = null; gate.await() }
-            when (beginFailure) {
-                BeginFailure.BEFORE_WRITE -> {
-                    failLoads = readBackFails
-                    throw IOException("simulated write failure")
-                }
-                BeginFailure.AFTER_WRITE, BeginFailure.CANCEL_AFTER_WRITE -> {
-                    record = AccessEpochTransitions.beginSignOut(record, uid)
-                    failLoads = readBackFails
-                    if (beginFailure == BeginFailure.CANCEL_AFTER_WRITE) {
-                        throw CancellationException("simulated store cancellation after the write")
-                    }
-                    throw IOException("simulated failure after the write")
-                }
-                null -> Unit
+            return edit(beginFailure) { AccessEpochTransitions.beginSignOut(record, uid) }
+        }
+        private fun edit(fault: EditFault?, next: () -> AccessEpochRecord): AccessEpochRecord {
+            if (fault == null) return next().also { record = it }
+            if (fault != EditFault.BEFORE_WRITE) record = next()
+            loadsFail = readBackFails
+            when (fault) {
+                EditFault.BEFORE_WRITE -> throw IOException("simulated write failure")
+                EditFault.AFTER_WRITE -> throw IOException("simulated failure after the write")
+                EditFault.CANCEL_AFTER_WRITE ->
+                    throw CancellationException("simulated store cancellation after the write")
             }
-            return AccessEpochTransitions.beginSignOut(record, uid).also { record = it }
         }
         override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean) =
             AccessEpochTransitions.rotate(record, rotateUser, rotateKrx, ids).also { record = it }
@@ -92,8 +94,16 @@ class PremiumAccessCoordinatorSignOutTest {
     private class Purger(var result: PurgeResult = PurgeResult.Deferred("unimplemented")) :
         UserScopePurger, CapabilityScopePurger {
         var beforeAnswer: () -> Unit = {}
-        override suspend fun purgeUserScope(namespace: PurgeNamespace) = result.also { beforeAnswer() }
-        override suspend fun purgeCapabilityScope(namespace: PurgeNamespace) = result.also { beforeAnswer() }
+        var purges = 0
+        /** Thrown instead of answering, while set. */
+        var throwing: Exception? = null
+        override suspend fun purgeUserScope(namespace: PurgeNamespace) = answer()
+        override suspend fun purgeCapabilityScope(namespace: PurgeNamespace) = answer()
+        private fun answer(): PurgeResult {
+            purges += 1
+            throwing?.let { throw it }
+            return result.also { beforeAnswer() }
+        }
     }
 
     private val a7 = AuthIdentityFence("user-a", 7)
@@ -210,7 +220,7 @@ class PremiumAccessCoordinatorSignOutTest {
     fun aFailedWriteThatLandedStillArms() = runTest {
         val h = harness()
         h.coordinator.onIdentityChanged(a7)
-        h.store.beginFailure = BeginFailure.AFTER_WRITE
+        h.store.beginFailure = EditFault.AFTER_WRITE
 
         assertTrue(h.coordinator.prepareSignOut(a7) is SignOutStart.Armed)
     }
@@ -219,7 +229,7 @@ class PremiumAccessCoordinatorSignOutTest {
     fun aFailedWriteThatDidNotLandRequiresRecovery() = runTest {
         val h = harness()
         h.coordinator.onIdentityChanged(a7)
-        h.store.beginFailure = BeginFailure.BEFORE_WRITE
+        h.store.beginFailure = EditFault.BEFORE_WRITE
 
         assertTrue(h.coordinator.prepareSignOut(a7) is SignOutStart.RecoveryRequired)
         assertNull(h.store.record.teardownOwedFor)
@@ -229,7 +239,7 @@ class PremiumAccessCoordinatorSignOutTest {
     fun anUnreadableOutcomeHoldsIdentityEvents() = runTest {
         val h = harness()
         h.coordinator.onIdentityChanged(a7)
-        h.store.beginFailure = BeginFailure.BEFORE_WRITE
+        h.store.beginFailure = EditFault.BEFORE_WRITE
         h.store.readBackFails = true
 
         assertTrue(h.coordinator.prepareSignOut(a7) is SignOutStart.RecoveryRequired)
@@ -279,7 +289,7 @@ class PremiumAccessCoordinatorSignOutTest {
     fun aStoreCancellationAfterTheWriteIsReconciled() = runTest {
         val h = harness()
         h.coordinator.onIdentityChanged(a7)
-        h.store.beginFailure = BeginFailure.CANCEL_AFTER_WRITE
+        h.store.beginFailure = EditFault.CANCEL_AFTER_WRITE
 
         assertTrue(h.coordinator.prepareSignOut(a7) is SignOutStart.Armed)
         assertEquals("user-a", h.store.record.teardownOwedFor)
@@ -448,5 +458,249 @@ class PremiumAccessCoordinatorSignOutTest {
         assertTrue(h.store.record.pendingPurges.any { it.userAccessEpoch == epochBefore })
         assertEquals(SignOutStart.Joined(armed.ticket), h.coordinator.prepareSignOut(a7))
         assertEquals(PremiumAccessState.NoGrant, h.coordinator.state.value.state)
+    }
+
+    // A failed edit while an attempt is open
+
+    /** Binds [a7], arms an attempt for it, and returns its ticket. */
+    private suspend fun armed(h: Harness): SignOutTicket {
+        h.coordinator.onIdentityChanged(a7)
+        return (h.coordinator.prepareSignOut(a7) as SignOutStart.Armed).ticket
+    }
+
+    @Test
+    fun aFailedBindHoldsItsEventUntilTheEditIsReadBack() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(b3)
+        h.store.bindFault = EditFault.BEFORE_WRITE
+
+        assertNull(h.coordinator.onIdentityChanged(b3))
+        assertFalse("읽어 보기 전에 뒤 사건이 적용됐다", h.coordinator.onSignedOut(a7))
+        assertEquals(0, h.store.signOuts)
+
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+        assertNotNull(h.coordinator.onIdentityChanged(b3))
+        assertEquals(b3.uid, h.store.record.ownerUid)
+    }
+
+    @Test
+    fun aBindThatLandedBeforeFailingRotatesNothingMoreWhenRetried() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(a8)
+        h.store.bindFault = EditFault.AFTER_WRITE
+
+        assertNull(h.coordinator.onIdentityChanged(a8))
+        val journal = h.store.record.pendingPurges
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+        assertNotNull(h.coordinator.onIdentityChanged(a8))
+
+        assertEquals("착지한 bind 를 재시도하며 다시 회전했다", journal, h.store.record.pendingPurges)
+    }
+
+    @Test
+    fun aFailedEditLeavesItsReceiptForTheReadBack() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        val epochBefore = h.store.record.userAccessEpoch
+        h.purger.result = PurgeResult.Completed
+        h.setLive(a8)
+        h.store.bindFault = EditFault.AFTER_WRITE
+
+        assertNull(h.coordinator.onIdentityChanged(a8))
+        h.coordinator.resumePendingPurges()
+
+        assertEquals("재읽기 전에 정리가 돌았다", 0, h.purger.purges)
+        assertTrue(h.store.record.pendingPurges.any { it.userAccessEpoch == epochBefore })
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+        assertNotNull(h.coordinator.onIdentityChanged(a8))
+        assertFalse(h.store.record.pendingPurges.any { it.userAccessEpoch == epochBefore })
+    }
+
+    @Test
+    fun aLandedEndIsNotRotatedAgainWhenItsEventIsRetried() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(null)
+        h.store.signOutFault = EditFault.AFTER_WRITE
+
+        assertFalse(h.coordinator.onSignedOut(a7))
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+        assertTrue(h.coordinator.onSignedOut(a7))
+
+        assertEquals("착지한 종료를 다시 회전했다", 1, h.store.signOuts)
+        // Finished: judged afresh, and nobody is signed in to sign out.
+        assertEquals(SignOutStart.Stale, h.coordinator.prepareSignOut(a7))
+        // The retry consumed what it was holding: the next event is an ordinary one.
+        h.setLive(b3)
+        assertNotNull(h.coordinator.onIdentityChanged(b3))
+    }
+
+    @Test
+    fun anEndThatNeverLandedRotatesOnceWhenRetried() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(null)
+        h.store.signOutFault = EditFault.BEFORE_WRITE
+        val journal = h.store.record.pendingPurges.size
+
+        assertFalse(h.coordinator.onSignedOut(a7))
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+        assertTrue(h.coordinator.onSignedOut(a7))
+
+        assertEquals(journal + 1, h.store.record.pendingPurges.size)
+        assertEquals(SignOutStart.Stale, h.coordinator.prepareSignOut(a7))
+    }
+
+    @Test
+    fun markersChangingAloneStillReadAsAnEndThatNeverLanded() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(null)
+        h.store.signOutFault = EditFault.BEFORE_WRITE
+        assertFalse(h.coordinator.onSignedOut(a7))
+        h.store.record = AccessEpochTransitions.markMayContainData(h.store.record, premium = true, krx = true)
+
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+    }
+
+    @Test
+    fun anEndReadBackThatIsNeitherResultIsNotGuessed() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(null)
+        h.store.signOutFault = EditFault.BEFORE_WRITE
+        assertFalse(h.coordinator.onSignedOut(a7))
+        h.store.record = h.store.record.copy(userAccessEpoch = "not-from-any-rotation")
+
+        assertEquals(EditResolution.INCONSISTENT, h.coordinator.resolvePendingEdit(ticket))
+        assertFalse("판정하지 못한 종료의 보류가 풀렸다", h.coordinator.onSignedOut(a7))
+        assertEquals(1, h.store.signOuts)
+    }
+
+    @Test
+    fun anUnreadableReadBackKeepsTheEventHeld() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(null)
+        h.store.readBackFails = true
+        h.store.signOutFault = EditFault.BEFORE_WRITE
+
+        assertFalse(h.coordinator.onSignedOut(a7))
+        assertEquals(EditResolution.STILL_UNKNOWN, h.coordinator.resolvePendingEdit(ticket))
+        assertFalse(h.coordinator.onSignedOut(a7))
+
+        h.store.loadsFail = false
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+        assertTrue(h.coordinator.onSignedOut(a7))
+    }
+
+    @Test
+    fun onlyTheWaitingAttemptsEditIsReadBack() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        assertEquals(EditResolution.NOT_PENDING, h.coordinator.resolvePendingEdit(ticket))
+        h.setLive(null)
+        h.store.signOutFault = EditFault.BEFORE_WRITE
+        assertFalse(h.coordinator.onSignedOut(a7))
+
+        assertEquals(EditResolution.NOT_PENDING, h.coordinator.resolvePendingEdit(SignOutTicket(ticket.value + 1)))
+        assertFalse("다른 시도의 재읽기가 보류를 풀었다", h.coordinator.onSignedOut(a7))
+    }
+
+    @Test
+    fun aFailedReadBeforeTheEditHoldsTheEventWithoutEditing() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(b3)
+        val binds = h.store.binds
+        h.store.loadsFail = true
+
+        assertNull(h.coordinator.onIdentityChanged(b3))
+        assertEquals(binds, h.store.binds)
+
+        h.store.loadsFail = false
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+        assertNotNull(h.coordinator.onIdentityChanged(b3))
+    }
+
+    @Test
+    fun aStoreCancellationHoldsTheEventInsteadOfEndingTheCaller() = runTest {
+        val h = harness()
+        armed(h)
+        h.setLive(a8)
+        h.store.bindFault = EditFault.CANCEL_AFTER_WRITE
+
+        assertNull(h.coordinator.onIdentityChanged(a8))
+    }
+
+    @Test
+    fun withNoAttemptOpenAFailedEditStillPropagates() = runTest {
+        val h = harness()
+        h.coordinator.onIdentityChanged(a7)
+        h.store.bindFault = EditFault.BEFORE_WRITE
+
+        val failure = runCatching { h.coordinator.onIdentityChanged(b3) }.exceptionOrNull()
+        assertTrue("시도가 없을 때의 실패를 삼켰다: $failure", failure is IOException)
+    }
+
+    @Test
+    fun withNoAttemptOpenAFailedCleanupStillPropagates() = runTest {
+        val h = harness()
+        h.coordinator.onIdentityChanged(a7)
+        h.purger.throwing = IOException("purge")
+
+        // Another uid's bind journals a7's namespace, so its cleanup reaches the purger.
+        val failure = runCatching { h.coordinator.onIdentityChanged(b3) }.exceptionOrNull()
+        assertTrue("시도가 없을 때의 정리 실패를 삼켰다: $failure", failure is IOException)
+    }
+
+    @Test
+    fun aThrownCleanupAfterALandedEndKeepsTheSealWithoutRotatingAgain() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(null)
+        h.purger.throwing = IOException("purge")
+
+        assertTrue(h.coordinator.onSignedOut(a7))
+
+        assertEquals(1, h.store.signOuts)
+        assertEquals(SignOutStart.Joined(ticket), h.coordinator.prepareSignOut(a7))
+    }
+
+    @Test
+    fun theHeldEventIsRetriedBeforeAnyOther() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(b3)
+        h.store.bindFault = EditFault.BEFORE_WRITE
+        assertNull(h.coordinator.onIdentityChanged(b3))
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+
+        val failure = runCatching { h.coordinator.onSignedOut(a7) }.exceptionOrNull()
+        assertTrue(
+            "보류된 사건보다 다른 사건이 먼저 적용됐다: $failure",
+            failure is IllegalStateException && failure !is CancellationException
+        )
+        assertEquals(0, h.store.signOuts)
+    }
+
+    @Test
+    fun theHeldEndIsRetriedBeforeABinding() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(null)
+        h.store.signOutFault = EditFault.BEFORE_WRITE
+        assertFalse(h.coordinator.onSignedOut(a7))
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+        val binds = h.store.binds
+
+        val failure = runCatching { h.coordinator.onIdentityChanged(b3) }.exceptionOrNull()
+        assertTrue(
+            "보류된 종료보다 바인딩이 먼저 적용됐다: $failure",
+            failure is IllegalStateException && failure !is CancellationException
+        )
+        assertEquals(binds, h.store.binds)
     }
 }
