@@ -215,14 +215,13 @@ class AuthViewModel @Inject constructor(
     fun signOut() {
         val owner = authTokenProvider.currentIdentityFence() ?: return
         viewModelScope.launch {
-            authTransitionCoordinator.withTransition {
-                ownerBoundSignOut(
-                    owner = owner,
-                    unregister = pushNotificationManager::unregisterDeviceFromServer,
-                    invalidate = authTokenProvider::invalidateCurrentSession,
-                    signOut = { auth.signOut() }
-                )
-            }
+            handedOffSignOut(
+                coordinator = authTransitionCoordinator,
+                owner = owner,
+                unregister = pushNotificationManager::unregisterDeviceFromServer,
+                invalidate = authTokenProvider::invalidateCurrentSession,
+                signOut = { auth.signOut() }
+            )
         }
     }
 
@@ -242,6 +241,22 @@ class AuthViewModel @Inject constructor(
 
     companion object {
         private const val TAG = "Auth"
+    }
+}
+
+/**
+ * Runs sign-out in the coordinator's process scope once handed off, independently of caller
+ * cancellation. The transition keeps the lease until it terminates; this adds no deadline.
+ */
+internal suspend fun handedOffSignOut(
+    coordinator: AuthTransitionCoordinator,
+    owner: AuthIdentityFence,
+    unregister: suspend (AuthIdentityFence) -> Unit,
+    invalidate: (AuthIdentityFence) -> Boolean,
+    signOut: suspend () -> Unit
+) {
+    coordinator.withHandedOffTransition {
+        ownerBoundSignOut(owner, unregister, invalidate, signOut)
     }
 }
 

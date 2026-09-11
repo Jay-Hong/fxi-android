@@ -72,21 +72,20 @@ class AuthViewModelSignOutTest {
         val events = mutableListOf<String>()
 
         val signOut = async {
-            coordinator.withTransition {
-                ownerBoundSignOut(
-                    owner = owner,
-                    unregister = {},
-                    invalidate = {
-                        events += "invalidate"
-                        casCompleted.complete(Unit)
-                        true
-                    },
-                    signOut = {
-                        allowSignOut.await()
-                        events += "signOut"
-                    }
-                )
-            }
+            handedOffSignOut(
+                coordinator = coordinator,
+                owner = owner,
+                unregister = {},
+                invalidate = {
+                    events += "invalidate"
+                    casCompleted.complete(Unit)
+                    true
+                },
+                signOut = {
+                    allowSignOut.await()
+                    events += "signOut"
+                }
+            )
         }
         casCompleted.await()
         val login = async {
@@ -214,6 +213,113 @@ class AuthViewModelSignOutTest {
             subsequentTransitionEntered = true
         }
         assertTrue(subsequentTransitionEntered)
+    }
+
+    @Test
+    fun handedOffTransition_doesNotRunTheSignInHook() = runTest {
+        val events = mutableListOf<String>()
+        val coordinator = AuthTransitionCoordinator(
+            processScope = backgroundScope,
+            beforeTrackedTransition = { events += "advance-generation" }
+        )
+
+        coordinator.withHandedOffTransition {
+            events += "sign-out"
+        }
+
+        assertEquals(listOf("sign-out"), events)
+    }
+
+    /** Caller cancellation leaves the handed-off block holding the lease until this test releases it. */
+    @Test
+    fun cancelledScreen_doesNotAbandonAStartedHandedOffTransition() = runTest {
+        val coordinator = AuthTransitionCoordinator(backgroundScope)
+        val started = CompletableDeferred<Unit>()
+        val terminal = CompletableDeferred<Unit>()
+        var finished = false
+        var competingTransitionEntered = false
+
+        val screen = launch {
+            coordinator.withHandedOffTransition {
+                started.complete(Unit)
+                terminal.await()
+                finished = true
+            }
+        }
+        started.await()
+        screen.cancelAndJoin()
+
+        val competing = async {
+            coordinator.withTransition {
+                competingTransitionEntered = true
+            }
+        }
+        runCurrent()
+        assertFalse(competingTransitionEntered)
+
+        terminal.complete(Unit)
+        competing.await()
+        assertTrue("취소된 화면이 시작된 로그아웃을 중간에 버렸다", finished)
+        assertTrue(competingTransitionEntered)
+    }
+
+    @Test
+    fun cancelledScreen_doesNotStartAHandedOffTransitionThatWasStillQueued() = runTest {
+        val coordinator = AuthTransitionCoordinator(backgroundScope)
+        val releasePrecedingTransition = CompletableDeferred<Unit>()
+        val preceding = launch {
+            coordinator.withTransition {
+                releasePrecedingTransition.await()
+            }
+        }
+        runCurrent()
+
+        var started = false
+        val queuedScreen = launch {
+            coordinator.withHandedOffTransition {
+                started = true
+            }
+        }
+        runCurrent()
+        queuedScreen.cancelAndJoin()
+        releasePrecedingTransition.complete(Unit)
+        preceding.join()
+        runCurrent()
+
+        assertFalse(started)
+    }
+
+    /** After caller cancellation, successful unregister and CAS still lead to the sign-out callback. */
+    @Test
+    fun signOut_isNotAbandonedWhenTheScreenGoesAwayDuringUnregister() = runTest {
+        val coordinator = AuthTransitionCoordinator(backgroundScope)
+        val owner = AuthIdentityFence("user-a", 7)
+        val unregisterStarted = CompletableDeferred<Unit>()
+        val unregisterDone = CompletableDeferred<Unit>()
+        val events = mutableListOf<String>()
+
+        val screen = launch {
+            handedOffSignOut(
+                coordinator = coordinator,
+                owner = owner,
+                unregister = {
+                    unregisterStarted.complete(Unit)
+                    unregisterDone.await()
+                    events += "unregister"
+                },
+                invalidate = {
+                    events += "invalidate"
+                    true
+                },
+                signOut = { events += "signOut" }
+            )
+        }
+        unregisterStarted.await()
+        screen.cancelAndJoin()
+        unregisterDone.complete(Unit)
+        coordinator.withTransition {} // the lease comes back only once the sign-out has finished
+
+        assertEquals(listOf("unregister", "invalidate", "signOut"), events)
     }
 
     @Test

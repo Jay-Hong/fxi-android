@@ -35,7 +35,21 @@ class AuthTransitionCoordinator internal constructor(
      * Once the lease is acquired, the SDK operation starts undispatched and ownership moves to the
      * process scope until that already-started operation reaches a terminal state.
      */
-    suspend fun <T> withTrackedTransition(block: suspend () -> T): T {
+    suspend fun <T> withTrackedTransition(block: suspend () -> T): T =
+        handOff(beforeTrackedTransition, block)
+
+    /**
+     * The same hand-off as [withTrackedTransition], without the sign-in hook. For sign-out.
+     *
+     * The sign-in hook uses the announcing invalidation path. Sign-out instead uses
+     * [AuthTokenProvider.invalidateCurrentSession], whose retire step does not announce its
+     * generation change; an identity change found by its preceding observation can still be
+     * delivered. Announcing the retirement's same-uid fence could make AuthAccessBinder rebind
+     * the uid being signed out.
+     */
+    suspend fun <T> withHandedOffTransition(block: suspend () -> T): T = handOff({}, block)
+
+    private suspend fun <T> handOff(before: () -> Unit, block: suspend () -> T): T {
         currentCoroutineContext().ensureActive()
         val lockOwner = Any()
         mutex.lock(lockOwner)
@@ -46,7 +60,7 @@ class AuthTransitionCoordinator internal constructor(
             currentCoroutineContext().ensureActive()
             val operation = processScope.async(start = CoroutineStart.UNDISPATCHED) {
                 try {
-                    beforeTrackedTransition()
+                    before()
                     block()
                 } finally {
                     mutex.unlock(lockOwner)
