@@ -178,6 +178,9 @@ class RootViewModelTest {
             AccessEpochTransitions.completePurges(record, completed).also { record = it }
         override suspend fun markMayContainData(premium: Boolean, krx: Boolean) =
             AccessEpochTransitions.markMayContainData(record, premium, krx).also { record = it }
+
+        override suspend fun beginSignOut(uid: String) =
+            AccessEpochTransitions.beginSignOut(record, uid).also { record = it }
     }
 
     private fun signedIn() = AuthState.SignedIn(

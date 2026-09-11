@@ -270,6 +270,13 @@ interface AccessEpochStore {
     suspend fun signOut(): AccessEpochRecord
 
     /**
+     * Persists that the sign-out of [uid] has been decided; see [AccessEpochTransitions.beginSignOut].
+     * The caller must require both ownerUid and teardownOwedFor in the returned record to equal
+     * [uid] before going on.
+     */
+    suspend fun beginSignOut(uid: String): AccessEpochRecord
+
+    /**
      * Step one of teardown: mint new ids for the requested axes and append the journal entry,
      * atomically. Returns the new record. No purge has run yet.
      */

@@ -38,19 +38,28 @@ private val Context.accessEpochDataStore: DataStore<Preferences> by preferencesD
  * keeps a test fake from drifting away from production behaviour.
  */
 @Singleton
-class DataStoreAccessEpochStore @Inject constructor(
-    @ApplicationContext private val context: Context,
+class DataStoreAccessEpochStore internal constructor(
+    private val dataStore: DataStore<Preferences>,
     private val ids: EpochIdGenerator
 ) : AccessEpochStore {
 
+    @Inject
+    constructor(
+        @ApplicationContext context: Context,
+        ids: EpochIdGenerator
+    ) : this(context.accessEpochDataStore, ids)
+
     override suspend fun load(): AccessEpochRecord =
-        context.accessEpochDataStore.data.first().toRecord()
+        dataStore.data.first().toRecord()
 
     override suspend fun bindOwner(uid: String): AccessEpochRecord =
         transform { AccessEpochTransitions.bindOwner(it, uid, ids) }
 
     override suspend fun signOut(): AccessEpochRecord =
         transform { AccessEpochTransitions.signOut(it, ids) }
+
+    override suspend fun beginSignOut(uid: String): AccessEpochRecord =
+        transform { AccessEpochTransitions.beginSignOut(it, uid) }
 
     override suspend fun beginRotation(
         rotateUser: Boolean,
@@ -68,13 +77,14 @@ class DataStoreAccessEpochStore @Inject constructor(
     private suspend fun transform(
         block: (AccessEpochRecord) -> AccessEpochRecord
     ): AccessEpochRecord =
-        context.accessEpochDataStore.edit { prefs -> prefs.write(block(prefs.toRecord())) }
+        dataStore.edit { prefs -> prefs.write(block(prefs.toRecord())) }
             .toRecord()
 
     private fun MutablePreferences.write(record: AccessEpochRecord) {
         putOrRemove(OWNER_UID, record.ownerUid)
         putOrRemove(USER_EPOCH, record.userAccessEpoch)
         putOrRemove(KRX_EPOCH, record.krxCapabilityEpoch)
+        putOrRemove(TEARDOWN_OWED_FOR, record.teardownOwedFor)
         this[MAY_CONTAIN_PREMIUM] = record.mayContainPremiumData
         this[MAY_CONTAIN_KRX] = record.mayContainKrxData
         if (record.pendingPurges.isEmpty()) {
@@ -94,6 +104,7 @@ class DataStoreAccessEpochStore @Inject constructor(
         krxCapabilityEpoch = this[KRX_EPOCH],
         mayContainPremiumData = this[MAY_CONTAIN_PREMIUM] ?: false,
         mayContainKrxData = this[MAY_CONTAIN_KRX] ?: false,
+        teardownOwedFor = this[TEARDOWN_OWED_FOR],
         pendingPurges = this[PURGE_JOURNAL]
             ?.split(ENTRY_SEPARATOR)
             ?.filter { it.isNotEmpty() }
@@ -146,5 +157,6 @@ class DataStoreAccessEpochStore @Inject constructor(
         val MAY_CONTAIN_PREMIUM = booleanPreferencesKey("may_contain_premium_data")
         val MAY_CONTAIN_KRX = booleanPreferencesKey("may_contain_krx_data")
         val PURGE_JOURNAL = stringPreferencesKey("pending_purge_journal")
+        val TEARDOWN_OWED_FOR = stringPreferencesKey("teardown_owed_for")
     }
 }
