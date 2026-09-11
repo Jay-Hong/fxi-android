@@ -446,4 +446,23 @@ class SignOutAttemptPolicyTest {
             SignOutAttemptPolicy.barrier(recovering(TeardownKnowledge.NOT_OWED), candidate = null, live = null, completed = null)
         )
     }
+
+    // A held barrier's bind
+
+    @Test
+    fun bindLandedIsTheBindPostcondition() {
+        assertTrue(SignOutAttemptPolicy.bindLanded(boundA, "user-a"))
+        assertFalse("정산 전 의도가 남았다", SignOutAttemptPolicy.bindLanded(armedA, "user-a"))
+        assertFalse(SignOutAttemptPolicy.bindLanded(boundA, "user-b"))
+        assertFalse(SignOutAttemptPolicy.bindLanded(boundA.copy(userAccessEpoch = null), "user-a"))
+        assertFalse(SignOutAttemptPolicy.bindLanded(boundA.copy(krxCapabilityEpoch = null), "user-a"))
+    }
+
+    @Test
+    fun anUnknownBarrierBindIsClassifiedByTheCandidatesBinding() {
+        val unknown = BarrierBind.Unknown(before = AccessEpochRecord())
+        assertEquals(BarrierBind.Landed, SignOutAttemptPolicy.barrierBindResolved(unknown, a7, boundA))
+        assertEquals(BarrierBind.NotLanded, SignOutAttemptPolicy.barrierBindResolved(unknown, a7, AccessEpochRecord()))
+        assertNull(SignOutAttemptPolicy.barrierBindResolved(unknown, a7, boundA.copy(ownerUid = "user-b")))
+    }
 }

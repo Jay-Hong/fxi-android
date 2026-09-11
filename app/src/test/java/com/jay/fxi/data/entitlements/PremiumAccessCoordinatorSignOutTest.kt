@@ -53,6 +53,8 @@ class PremiumAccessCoordinatorSignOutTest {
         var blockBeginSignOutOn: CompletableDeferred<Unit>? = null
         var blockNextLoadOn: CompletableDeferred<Unit>? = null
         var afterLoad: () -> Unit = {}
+        /** Runs after a bind reached the record. */
+        var afterBind: () -> Unit = {}
 
         override suspend fun load(): AccessEpochRecord {
             loads += 1
@@ -63,6 +65,7 @@ class PremiumAccessCoordinatorSignOutTest {
         override suspend fun bindOwner(uid: String): AccessEpochRecord {
             binds += 1
             return edit(bindFault.also { bindFault = null }) { AccessEpochTransitions.bindOwner(record, uid, ids) }
+                .also { afterBind() }
         }
         override suspend fun signOut(): AccessEpochRecord {
             signOuts += 1
@@ -701,6 +704,385 @@ class PremiumAccessCoordinatorSignOutTest {
             "보류된 종료보다 바인딩이 먼저 적용됐다: $failure",
             failure is IllegalStateException && failure !is CancellationException
         )
+        assertEquals(binds, h.store.binds)
+    }
+
+    // Recovery
+
+    /** Intent persisted, but the live session moved during the write: Recovering(OWED), owed on disk. */
+    private suspend fun TestScope.owedRecovery(h: Harness): SignOutTicket {
+        h.coordinator.onIdentityChanged(a7)
+        val gate = CompletableDeferred<Unit>()
+        h.store.blockBeginSignOutOn = gate
+        val start = async { h.coordinator.prepareSignOut(a7) }
+        runCurrent()
+        h.setLive(a8)
+        gate.complete(Unit)
+        val ticket = (start.await() as SignOutStart.RecoveryRequired).ticket
+        assertEquals("user-a", h.store.record.teardownOwedFor)
+        return ticket
+    }
+
+    /** Nothing bound under the live fence: Recovering(NOT_OWED) with an empty record. */
+    private suspend fun unboundRecovery(h: Harness): SignOutTicket =
+        (h.coordinator.prepareSignOut(a7) as SignOutStart.RecoveryRequired).ticket
+
+    /** a7 bound and completed, then live moved to a8 before the intent write: Recovering(NOT_OWED). */
+    private suspend fun movedRecovery(h: Harness): SignOutTicket {
+        h.coordinator.onIdentityChanged(a7)
+        h.store.afterLoad = { h.setLive(a8) }
+        val ticket = (h.coordinator.prepareSignOut(a7) as SignOutStart.RecoveryRequired).ticket
+        h.store.afterLoad = {}
+        return ticket
+    }
+
+    @Test
+    fun recoveryLeavesADriverAloneAndIgnoresAnotherTicket() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+
+        assertEquals(RecoveryAdvance.DRIVER_OWNS, h.coordinator.advanceRecovery(ticket))
+        assertEquals(BarrierStep.DRIVER_OWNS, h.coordinator.completeRecovery(ticket, a7).step)
+        val other = SignOutTicket(ticket.value + 1)
+        assertEquals(RecoveryAdvance.CLOSED, h.coordinator.advanceRecovery(other))
+        assertEquals(BarrierStep.CLOSED, h.coordinator.completeRecovery(other, a7).step)
+        assertEquals(0, h.store.signOuts)
+    }
+
+    @Test
+    fun anOwedIntentIsSettledOnce() = runTest {
+        val h = harness()
+        val ticket = owedRecovery(h)
+
+        assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
+
+        assertEquals(1, h.store.signOuts)
+        assertNull(h.store.record.teardownOwedFor)
+    }
+
+    @Test
+    fun aSettleThatLandedBeforeFailingIsReadBackNotRepeated() = runTest {
+        val h = harness()
+        val ticket = owedRecovery(h)
+        h.store.signOutFault = EditFault.AFTER_WRITE
+
+        assertEquals(RecoveryAdvance.UNRESOLVED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
+
+        assertEquals(1, h.store.signOuts)
+    }
+
+    @Test
+    fun aSettleThatNeverLandedIsTriedAgainOnlyOnALaterCall() = runTest {
+        val h = harness()
+        val ticket = owedRecovery(h)
+        val journal = h.store.record.pendingPurges.size
+        h.store.signOutFault = EditFault.BEFORE_WRITE
+
+        assertEquals(RecoveryAdvance.UNRESOLVED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
+        assertEquals("같은 호출에서 실패한 정산을 다시 돌렸다", 1, h.store.signOuts)
+        assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
+
+        assertEquals(2, h.store.signOuts)
+        assertEquals(journal + 1, h.store.record.pendingPurges.size)
+    }
+
+    @Test
+    fun anOwedAttemptWhoseDiskNoLongerOwesIsNotGuessed() = runTest {
+        val h = harness()
+        val ticket = owedRecovery(h)
+        h.store.record = h.store.record.copy(teardownOwedFor = null)
+
+        assertEquals(RecoveryAdvance.INCONSISTENT, h.coordinator.advanceRecovery(ticket))
+        assertEquals(0, h.store.signOuts)
+    }
+
+    @Test
+    fun aSameUidBindThatSettledTheIntentLeavesNothingToSettle() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(a8)
+        assertNotNull(h.coordinator.onIdentityChanged(a8))
+
+        assertEquals(RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
+        assertEquals(0, h.store.signOuts)
+    }
+
+    @Test
+    fun anEndLeftSealedByItsCleanupLeavesNothingToSettle() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(null)
+        h.purger.result = PurgeResult.Failed(IOException("purge"))
+        assertTrue(h.coordinator.onSignedOut(a7))
+
+        assertEquals(RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
+        assertEquals(1, h.store.signOuts)
+    }
+
+    @Test
+    fun aResolvedEndStillInTheFifoIsNotJudgedAheadOfIt() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(null)
+        h.store.signOutFault = EditFault.AFTER_WRITE
+        assertFalse(h.coordinator.onSignedOut(a7))
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+
+        assertEquals("보류 사건보다 복구가 먼저 디스크를 판정했다", RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
+        assertTrue(h.coordinator.onSignedOut(a7))
+        assertEquals(1, h.store.signOuts)
+    }
+
+    @Test
+    fun anUnlandedEndStillInTheFifoIsLeftToItsRetry() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(null)
+        val journal = h.store.record.pendingPurges.size
+        h.store.signOutFault = EditFault.BEFORE_WRITE
+        assertFalse(h.coordinator.onSignedOut(a7))
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+
+        assertEquals(RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
+        assertEquals(1, h.store.signOuts)
+        assertTrue(h.coordinator.onSignedOut(a7))
+        assertEquals("종료 회전이 한 번보다 많이 착지했다", journal + 1, h.store.record.pendingPurges.size)
+    }
+
+    @Test
+    fun aRecoveryReadFailureHoldsIdentityEventsUntilReadBack() = runTest {
+        val h = harness()
+        val ticket = owedRecovery(h)
+        h.store.loadsFail = true
+
+        assertEquals(RecoveryAdvance.UNRESOLVED, h.coordinator.advanceRecovery(ticket))
+        assertNull(h.coordinator.onIdentityChanged(b3))
+
+        h.store.loadsFail = false
+        assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(RecoveryAdvance.PROGRESSED, h.coordinator.advanceRecovery(ticket))
+        assertEquals(1, h.store.signOuts)
+    }
+
+    // The recovery barrier
+
+    @Test
+    fun aBarrierBindsItsCandidateThenReleases() = runTest {
+        val h = harness()
+        val ticket = unboundRecovery(h)
+
+        val outcome = h.coordinator.completeRecovery(ticket, a7)
+
+        assertEquals(BarrierStep.RELEASED, outcome.step)
+        assertEquals(a7, outcome.completed)
+        assertNotNull(outcome.releasedGeneration)
+        assertEquals("user-a", h.store.record.ownerUid)
+        assertTrue("해제 뒤에도 시도가 남았다", h.coordinator.prepareSignOut(a7) is SignOutStart.Armed)
+    }
+
+    @Test
+    fun aBarrierWhoseCandidateMovedRecapturesWithoutBinding() = runTest {
+        val h = harness()
+        val ticket = unboundRecovery(h)
+        h.setLive(a8)
+
+        val outcome = h.coordinator.completeRecovery(ticket, a7)
+
+        assertEquals(BarrierStep.RECAPTURE, outcome.step)
+        assertNull(outcome.completed)
+        assertEquals(0, h.store.binds)
+    }
+
+    @Test
+    fun aBarrierDoesNotAdoptAnIdentityQueuedBehindIt() = runTest {
+        val h = harness()
+        val ticket = unboundRecovery(h)
+        h.setLive(a8)
+
+        assertEquals(BarrierStep.RECAPTURE, h.coordinator.completeRecovery(ticket, null).step)
+        assertEquals(0, h.store.binds)
+    }
+
+    @Test
+    fun aBindThatLandedBeforeTheCandidateMovedIsStillCompleted() = runTest {
+        val h = harness()
+        val ticket = unboundRecovery(h)
+        h.store.afterBind = { h.setLive(b3) }
+
+        val outcome = h.coordinator.completeRecovery(ticket, a7)
+
+        assertEquals(BarrierStep.RECAPTURE, outcome.step)
+        assertEquals(a7, outcome.completed)
+        assertNull(outcome.releasedGeneration)
+        assertEquals(SignOutStart.Joined(ticket), h.coordinator.prepareSignOut(a7))
+    }
+
+    @Test
+    fun aSignedOutRecoveryFinishesWithoutRotating() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(a8)
+        assertTrue(h.coordinator.onSignedOut(a7))
+        h.setLive(null)
+
+        val outcome = h.coordinator.completeRecovery(ticket, null)
+
+        assertEquals(BarrierStep.RELEASED, outcome.step)
+        assertNull(outcome.completed)
+        assertNull(outcome.releasedGeneration)
+        assertEquals(1, h.store.signOuts)
+        assertEquals(SignOutStart.Stale, h.coordinator.prepareSignOut(a7))
+    }
+
+    @Test
+    fun aFailedCleanupKeepsTheBarrierFromReleasingAndNeverRotates() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(a8)
+        assertTrue(h.coordinator.onSignedOut(a7))
+        h.setLive(null)
+
+        h.purger.result = PurgeResult.Failed(IOException("purge"))
+        assertEquals(BarrierStep.CLEANUP_FAILED, h.coordinator.completeRecovery(ticket, null).step)
+        h.purger.throwing = IOException("purge")
+        assertEquals(BarrierStep.CLEANUP_FAILED, h.coordinator.completeRecovery(ticket, null).step)
+        h.purger.throwing = null
+        h.purger.result = PurgeResult.Deferred("later")
+        assertEquals(BarrierStep.RELEASED, h.coordinator.completeRecovery(ticket, null).step)
+
+        assertEquals("정리 재시도가 종료를 다시 회전했다", 1, h.store.signOuts)
+    }
+
+    @Test
+    fun anUnknownBarrierBindIsCompletedBeforeTheCandidateIsJudgedAgain() = runTest {
+        val h = harness()
+        val ticket = unboundRecovery(h)
+        h.store.bindFault = EditFault.AFTER_WRITE
+        assertEquals(BarrierStep.HELD, h.coordinator.completeRecovery(ticket, a7).step)
+        h.setLive(null)
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+        val binds = h.store.binds
+
+        val outcome = h.coordinator.completeRecovery(ticket, a7)
+
+        assertEquals(BarrierStep.RECAPTURE, outcome.step)
+        assertEquals(a7, outcome.completed)
+        assertEquals(binds, h.store.binds)
+    }
+
+    @Test
+    fun anUnknownSameUidBarrierBindThatWasANoOpStillCompletesTheCandidate() = runTest {
+        val h = harness()
+        val ticket = movedRecovery(h)
+        h.store.bindFault = EditFault.AFTER_WRITE
+        assertEquals(BarrierStep.HELD, h.coordinator.completeRecovery(ticket, a8).step)
+        h.setLive(null)
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+
+        val outcome = h.coordinator.completeRecovery(ticket, a8)
+
+        assertEquals(BarrierStep.RECAPTURE, outcome.step)
+        assertEquals(a8, outcome.completed)
+    }
+
+    @Test
+    fun aReadFailureBeforeTheBarrierBindDoesNotCompleteTheCandidate() = runTest {
+        val h = harness()
+        val ticket = movedRecovery(h)
+        h.store.loadsFail = true
+        assertEquals(BarrierStep.HELD, h.coordinator.completeRecovery(ticket, a8).step)
+        h.store.loadsFail = false
+        h.setLive(null)
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+
+        val outcome = h.coordinator.completeRecovery(ticket, a8)
+
+        assertEquals(BarrierStep.RECAPTURE, outcome.step)
+        assertEquals("시작도 하지 않은 bind 를 완료로 기록했다", a7, outcome.completed)
+    }
+
+    @Test
+    fun aBarrierBindThatNeverLandedBindsAgainWhileTheCandidateHolds() = runTest {
+        val h = harness()
+        val ticket = unboundRecovery(h)
+        h.store.bindFault = EditFault.BEFORE_WRITE
+        assertEquals(BarrierStep.HELD, h.coordinator.completeRecovery(ticket, a7).step)
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+
+        val outcome = h.coordinator.completeRecovery(ticket, a7)
+
+        assertEquals(BarrierStep.RELEASED, outcome.step)
+        assertEquals(a7, outcome.completed)
+        // The resumed barrier consumed what it was holding: the next event is an ordinary one.
+        h.setLive(b3)
+        assertNotNull(h.coordinator.onIdentityChanged(b3))
+    }
+
+    @Test
+    fun aFailedCleanupAfterTheBarrierBindKeepsTheSeal() = runTest {
+        val h = harness()
+        h.coordinator.onIdentityChanged(a7)
+        h.store.afterLoad = { h.setLive(b3) }
+        val ticket = (h.coordinator.prepareSignOut(a7) as SignOutStart.RecoveryRequired).ticket
+        h.store.afterLoad = {}
+        // Binding another uid journals a7's namespace, so the barrier's cleanup reaches the purger.
+        h.purger.result = PurgeResult.Failed(IOException("purge"))
+
+        val outcome = h.coordinator.completeRecovery(ticket, b3)
+
+        assertEquals(BarrierStep.CLEANUP_FAILED, outcome.step)
+        assertEquals(b3, outcome.completed)
+        assertEquals(SignOutStart.Joined(ticket), h.coordinator.prepareSignOut(a7))
+    }
+
+    @Test
+    fun aSignInDuringTheSignedOutBarriersCleanupKeepsTheSeal() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(a8)
+        assertTrue(h.coordinator.onSignedOut(a7))
+        h.setLive(null)
+        h.purger.beforeAnswer = { h.setLive(b3) }
+
+        assertEquals(BarrierStep.RECAPTURE, h.coordinator.completeRecovery(ticket, null).step)
+        assertEquals(SignOutStart.Joined(ticket), h.coordinator.prepareSignOut(a7))
+    }
+
+    @Test
+    fun anUnclassifiableBarrierBindStaysHeld() = runTest {
+        val h = harness()
+        val ticket = unboundRecovery(h)
+        h.store.bindFault = EditFault.BEFORE_WRITE
+        assertEquals(BarrierStep.HELD, h.coordinator.completeRecovery(ticket, a7).step)
+        h.store.record = h.store.record.copy(ownerUid = "user-b")
+
+        assertEquals(EditResolution.INCONSISTENT, h.coordinator.resolvePendingEdit(ticket))
+        assertEquals(BarrierStep.HELD, h.coordinator.completeRecovery(ticket, a7).step)
+    }
+
+    @Test
+    fun aBarrierCannotRunAheadOfAHeldIdentityEvent() = runTest {
+        val h = harness()
+        val ticket = armed(h)
+        h.setLive(b3)
+        h.store.bindFault = EditFault.BEFORE_WRITE
+        assertNull(h.coordinator.onIdentityChanged(b3))
+        assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
+        val loads = h.store.loads
+        val binds = h.store.binds
+
+        val failure = runCatching { h.coordinator.completeRecovery(ticket, b3) }.exceptionOrNull()
+
+        assertTrue(
+            "보류된 사건보다 barrier 가 먼저 실행됐다: $failure",
+            failure is IllegalStateException && failure !is CancellationException
+        )
+        assertEquals(loads, h.store.loads)
         assertEquals(binds, h.store.binds)
     }
 }

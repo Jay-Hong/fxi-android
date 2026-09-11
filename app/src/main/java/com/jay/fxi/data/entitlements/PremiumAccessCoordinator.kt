@@ -343,18 +343,19 @@ class PremiumAccessCoordinator(
     }
 
     /**
-     * One disk step of an identity event.
+     * One disk step of an identity event, a recovery barrier, or recovery itself.
      *
      * With no attempt open a failure propagates as it always has. With one open, the step's outcome
-     * is recorded as unresolved and the event is held — null tells the caller to hand it back. No
-     * read-back here: a known "not attempted" would be retried at once by the FIFO, so the retry waits
-     * for [resolvePendingEdit] instead. Nothing after the step runs, so no purge can erase its receipt.
+     * is recorded as unresolved, along with the FIFO item [held] names when there is one — null tells
+     * the caller to stop there. No read-back here: a known "not attempted" would be retried at once by
+     * the FIFO, so the retry waits for [resolvePendingEdit] instead. Nothing after the step runs, so
+     * no purge can erase its receipt.
      */
     private suspend fun <T : Any> identityEditLocked(
         open: SignOutAttempt?,
         edit: PendingEdit,
         before: AccessEpochRecord?,
-        held: () -> HeldIdentityEvent,
+        held: () -> HeldIdentityEvent?,
         step: suspend () -> T
     ): T? = try {
         step()
@@ -392,27 +393,153 @@ class PremiumAccessCoordinator(
     internal suspend fun resolvePendingEdit(ticket: SignOutTicket): EditResolution = mutex.withLock {
         val open = attempt as? SignOutAttempt.Unresolved
         if (open == null || open.ticket != ticket) return@withLock EditResolution.NOT_PENDING
+        resolvePendingEditLocked(open)
+    }
+
+    private suspend fun resolvePendingEditLocked(open: SignOutAttempt.Unresolved): EditResolution {
         val readBack = try {
             store.load()
         } catch (failed: Exception) {
             currentCoroutineContext().ensureActive()
-            return@withLock EditResolution.STILL_UNKNOWN
+            return EditResolution.STILL_UNKNOWN
         }
-        when (val resolution = SignOutAttemptPolicy.resolve(open, readBack)) {
-            is SignOutAttemptPolicy.Resolution.Resolved -> {
-                resolution.endReceipt?.let { receipt ->
-                    val pending = heldEvent
-                    check(pending is HeldIdentityEvent.End && pending.ticket == ticket) {
-                        "a landed end without the end event it belongs to: $pending"
-                    }
-                    heldEvent = pending.copy(receipt = receipt)
-                }
-                setAttemptLocked(resolution.next)
-                EditResolution.RESOLVED
+        val resolution = SignOutAttemptPolicy.resolve(open, readBack) as? SignOutAttemptPolicy.Resolution.Resolved
+            ?: return EditResolution.INCONSISTENT
+        var held = heldEvent
+        // A barrier's bind that ran is classified by the candidate's binding, apart from what it did to
+        // the attempt's namespace; the result is kept so the resumed barrier need not read again.
+        if (held is HeldIdentityEvent.Barrier && held.bind is BarrierBind.Unknown) {
+            val bind = SignOutAttemptPolicy.barrierBindResolved(held.bind, held.candidate, readBack)
+                ?: return EditResolution.INCONSISTENT
+            held = held.copy(bind = bind)
+        }
+        resolution.endReceipt?.let { receipt ->
+            check(held is HeldIdentityEvent.End && held.ticket == open.ticket) {
+                "a landed end without the end event it belongs to: $held"
             }
-            SignOutAttemptPolicy.Resolution.Inconsistent -> EditResolution.INCONSISTENT
+            held = held.copy(receipt = receipt)
+        }
+        heldEvent = held
+        setAttemptLocked(resolution.next)
+        return EditResolution.RESOLVED
+    }
+
+    /**
+     * Moves recovery on by at most one logical step — one read-back, or one settling attempt — and
+     * reports where it stands. A failed edit is not retried inside a call.
+     *
+     * Meant for outside the identity FIFO. An unresolved edit may be read back while its event is
+     * held. Once resolved, that event must finish on the FIFO before recovery judges whether
+     * another settling rotation is needed.
+     */
+    internal suspend fun advanceRecovery(ticket: SignOutTicket): RecoveryAdvance = mutex.withLock {
+        val open = attempt
+        if (open == null || open.ticket != ticket) return@withLock RecoveryAdvance.CLOSED
+        when (open) {
+            is SignOutAttempt.Armed -> RecoveryAdvance.DRIVER_OWNS
+            is SignOutAttempt.Preparing -> error("a preparing attempt is only visible inside its own lock")
+            is SignOutAttempt.Unresolved -> when (resolvePendingEditLocked(open)) {
+                EditResolution.RESOLVED -> RecoveryAdvance.PROGRESSED
+                EditResolution.STILL_UNKNOWN -> RecoveryAdvance.UNRESOLVED
+                EditResolution.INCONSISTENT -> RecoveryAdvance.INCONSISTENT
+                EditResolution.NOT_PENDING -> error("resolving the open attempt's own edit")
+            }
+            is SignOutAttempt.Recovering -> settleLocked(open)
         }
     }
+
+    private suspend fun settleLocked(open: SignOutAttempt.Recovering): RecoveryAdvance {
+        if (heldEvent != null) return RecoveryAdvance.NEEDS_BARRIER
+        val disk = identityEditLocked(open, PendingEdit.READ, before = null, held = { null }) { store.load() }
+            ?: return RecoveryAdvance.UNRESOLVED
+        return when (SignOutAttemptPolicy.recover(open, disk)) {
+            // Targeted: recover() asks for this only while the disk names the attempt's uid as owner.
+            SignOutAttemptPolicy.RecoveryStep.SETTLE -> {
+                val rotation = try {
+                    EditResult.Landed(store.signOut())
+                } catch (failed: Exception) {
+                    EditResult.Unknown(disk)
+                }
+                setAttemptLocked(SignOutAttemptPolicy.settled(open, rotation))
+                currentCoroutineContext().ensureActive()
+                // Cleanup is left to the barrier, which cannot release the seal before it is accepted.
+                if (rotation is EditResult.Landed) RecoveryAdvance.PROGRESSED else RecoveryAdvance.UNRESOLVED
+            }
+            SignOutAttemptPolicy.RecoveryStep.INCONSISTENT -> RecoveryAdvance.INCONSISTENT
+            SignOutAttemptPolicy.RecoveryStep.AWAIT_BARRIER -> RecoveryAdvance.NEEDS_BARRIER
+        }
+    }
+
+    /**
+     * Recovery's last step, for the identity FIFO's consumer to run at a barrier. [candidate] is to be
+     * captured before that barrier is enqueued.
+     *
+     * Releases the seal only once cleanup is accepted, the candidate — or nobody — is still live
+     * after the last suspension, and no identity event is held. It does not call signOut or replay
+     * an end. Binding can still rotate namespaces through bindOwner; cleanup is checked afterward.
+     */
+    internal suspend fun completeRecovery(ticket: SignOutTicket, candidate: AuthIdentityFence?): BarrierOutcome =
+        mutex.withLock {
+            val open = attempt
+            if (open == null || open.ticket != ticket) return@withLock barrierOutcome(BarrierStep.CLOSED)
+            if (open is SignOutAttempt.Armed) return@withLock barrierOutcome(BarrierStep.DRIVER_OWNS)
+            if (!SignOutAttemptPolicy.admitsIdentityEvents(open)) return@withLock barrierOutcome(BarrierStep.HELD)
+            val recovering = open as SignOutAttempt.Recovering
+            val resumed = heldEvent
+            if (resumed != null) {
+                // Checked before any side effect: only this barrier, resumed, may run while one is held.
+                check(resumed is HeldIdentityEvent.Barrier && resumed.ticket == ticket && resumed.candidate == candidate) {
+                    "a barrier ran ahead of the held identity event: held $resumed, barrier for $candidate"
+                }
+                when (resumed.bind) {
+                    BarrierBind.Landed -> completedBinding = resumed.candidate
+                    BarrierBind.NotStarted, BarrierBind.NotLanded -> Unit
+                    is BarrierBind.Unknown -> error("an unknown barrier bind is classified before admission reopens")
+                }
+                heldEvent = null
+            }
+            when (val step = SignOutAttemptPolicy.barrier(recovering, candidate, liveFence(), completedBinding)) {
+                SignOutAttemptPolicy.Barrier.NotReady -> barrierOutcome(BarrierStep.NOT_READY)
+                SignOutAttemptPolicy.Barrier.Recapture -> barrierOutcome(BarrierStep.RECAPTURE)
+                SignOutAttemptPolicy.Barrier.Hold -> barrierOutcome(BarrierStep.HOLD)
+                is SignOutAttemptPolicy.Barrier.Bind -> bindBarrierLocked(recovering, checkNotNull(candidate))
+                SignOutAttemptPolicy.Barrier.FinishSignedOut -> finishSignedOutLocked()
+            }
+        }
+
+    private suspend fun bindBarrierLocked(open: SignOutAttempt.Recovering, candidate: AuthIdentityFence): BarrierOutcome {
+        decisionGeneration += 1
+        cancelProbeLocked()
+        clearForcePremiumLocked()
+        // Sealed onto the candidate before the disk work, as any binding is.
+        _state.value = OwnedPremiumAccess(candidate.uid, candidate.authGeneration, PremiumAccessState.NoGrant)
+        schedule.cancel(preserveServerFloor = true)
+        val before = identityEditLocked(open, PendingEdit.READ, before = null, held = {
+            HeldIdentityEvent.Barrier(open.ticket, candidate, BarrierBind.NotStarted)
+        }) { store.load() } ?: return barrierOutcome(BarrierStep.HELD)
+        val after = identityEditLocked(open, PendingEdit.BIND_OWNER, before, held = {
+            HeldIdentityEvent.Barrier(open.ticket, candidate, BarrierBind.Unknown(before))
+        }) { store.bindOwner(candidate.uid) } ?: return barrierOutcome(BarrierStep.HELD)
+        completedBinding = candidate
+        _krx.value = KrxCapabilityState.HIDDEN
+        if (!cleanupLocked()) return barrierOutcome(BarrierStep.CLEANUP_FAILED)
+        // Read after the last suspension.
+        if (!SignOutAttemptPolicy.barrierBound(candidate, EditResult.Landed(after), liveFence())) {
+            return barrierOutcome(BarrierStep.RECAPTURE)
+        }
+        setAttemptLocked(null)
+        return barrierOutcome(BarrierStep.RELEASED, AccessDecisionGeneration(decisionGeneration))
+    }
+
+    private suspend fun finishSignedOutLocked(): BarrierOutcome {
+        if (!cleanupLocked()) return barrierOutcome(BarrierStep.CLEANUP_FAILED)
+        if (liveFence() != null) return barrierOutcome(BarrierStep.RECAPTURE)
+        setAttemptLocked(null)
+        return barrierOutcome(BarrierStep.RELEASED)
+    }
+
+    private fun barrierOutcome(step: BarrierStep, releasedGeneration: AccessDecisionGeneration? = null) =
+        BarrierOutcome(step, completedBinding, releasedGeneration)
 
     /** Suspends while the open sign-out has an edit in flight. The identity FIFO waits here. */
     suspend fun awaitIdentityEventsAdmitted() {

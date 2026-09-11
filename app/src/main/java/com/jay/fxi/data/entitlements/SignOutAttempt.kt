@@ -88,7 +88,81 @@ internal sealed interface HeldIdentityEvent {
         val ended: AuthIdentityFence,
         val receipt: EditResult.Landed? = null
     ) : HeldIdentityEvent
+
+    /** A recovery barrier whose own disk step failed; [bind] says how far that step got. */
+    data class Barrier(
+        override val ticket: SignOutTicket,
+        val candidate: AuthIdentityFence,
+        val bind: BarrierBind
+    ) : HeldIdentityEvent
 }
+
+/**
+ * How far a held barrier's bind got. Kept apart from the attempt's teardown knowledge: the record
+ * has no auth generation, so only a bind that actually ran can complete the candidate's binding.
+ */
+internal sealed interface BarrierBind {
+    /** The read before the bind failed; the bind never ran. */
+    data object NotStarted : BarrierBind
+
+    /** The bind ran and failed. [before] is the record it started from. */
+    data class Unknown(val before: AccessEpochRecord) : BarrierBind
+
+    /** A read-back confirmed the candidate bound, a permitted no-op included. */
+    data object Landed : BarrierBind
+
+    /** A read-back confirmed the bind did not land. */
+    data object NotLanded : BarrierBind
+}
+
+/** One step of recovery, outside the identity FIFO. */
+internal enum class RecoveryAdvance {
+    /** No attempt, or another one. */
+    CLOSED,
+
+    /** The original driver still holds the right to run the sign-out. */
+    DRIVER_OWNS,
+
+    /** The attempt moved on; call again. */
+    PROGRESSED,
+
+    /** An edit's outcome is not established: it just failed, or its read-back did. */
+    UNRESOLVED,
+
+    /** The disk contradicts what the attempt knows. Sealed; nothing is guessed. */
+    INCONSISTENT,
+
+    /** Further progress requires the identity FIFO: finish its held event, or run a recovery barrier. */
+    NEEDS_BARRIER
+}
+
+internal enum class BarrierStep {
+    CLOSED,
+    DRIVER_OWNS,
+
+    /** An edit is unresolved. Judge the barrier again, with the same candidate, once it is resolved. */
+    HELD,
+    NOT_READY,
+    RECAPTURE,
+
+    /** Nobody is live, but the end of the completed binding is not proven. An observation, not a diagnosis. */
+    HOLD,
+    CLEANUP_FAILED,
+    RELEASED
+}
+
+/**
+ * A recovery barrier's result.
+ *
+ * [completed] is the coordinator's completed binding when the step ended, whatever the step, so the
+ * consumer can adopt it before its next item. [releasedGeneration] is set only when the seal was
+ * released onto a bound candidate, for the query pinned to that binding.
+ */
+internal data class BarrierOutcome(
+    val step: BarrierStep,
+    val completed: AuthIdentityFence?,
+    val releasedGeneration: AccessDecisionGeneration? = null
+)
 
 /** What a namespace edit is known to have done. */
 internal sealed interface EditResult {
@@ -407,6 +481,29 @@ internal object SignOutAttemptPolicy {
                 }
             }
         }
+    }
+
+    /** What `bindOwner(uid)` leaves behind, whether it bound, settled or found nothing to do. */
+    fun bindLanded(record: AccessEpochRecord, uid: String): Boolean =
+        record.ownerUid == uid &&
+            record.teardownOwedFor == null &&
+            record.userAccessEpoch != null &&
+            record.krxCapabilityEpoch != null
+
+    /**
+     * How a barrier's bind that ran and failed turned out; null when [readBack] shows neither.
+     *
+     * A record already meeting the postcondition counts as landed: the bind ran, and a no-op is one of
+     * its permitted results.
+     */
+    fun barrierBindResolved(
+        bind: BarrierBind.Unknown,
+        candidate: AuthIdentityFence,
+        readBack: AccessEpochRecord
+    ): BarrierBind? = when {
+        bindLanded(readBack, candidate.uid) -> BarrierBind.Landed
+        sameNamespace(bind.before, readBack) -> BarrierBind.NotLanded
+        else -> null
     }
 
     /**
