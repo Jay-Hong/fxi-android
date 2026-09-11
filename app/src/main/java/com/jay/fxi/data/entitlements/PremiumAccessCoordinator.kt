@@ -1,5 +1,6 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AuthIdentityFence
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -95,26 +96,36 @@ class PremiumAccessCoordinator(
         }
 
     /**
-     * Binds a signed-in owner and resumes any purge a previous process left journalled.
+     * Binds the owner to the identity the caller **observed**, and resumes any purge a previous
+     * process left journalled.
      *
      * Resuming first matters: the markers a resumed purge clears are inputs to the reducer.
+     *
+     * Named for the identity rather than the owner because a same-uid generation change is one of
+     * these too — the tracked sign-in path advances the generation before Firebase does anything,
+     * and that transition never changes the uid.
+     *
+     * The generation is taken from [identity] and **not re-read**. Reading it here would pair the
+     * uid one observation carried with the generation of another, and the read itself advances the
+     * tracker — a binding is not the place to move the thing it is binding to.
      */
-    suspend fun onOwnerChanged(uid: String): Long = mutex.withLock {
+    suspend fun onIdentityChanged(identity: AuthIdentityFence): AccessDecisionGeneration = mutex.withLock {
         decisionGeneration += 1
         cancelProbeLocked()
         clearForcePremiumLocked()
         // Same reason as sign-out: the previous owner's grant must stop being readable before the
         // disk work, not after it.
-        _state.value = OwnedPremiumAccess(uid, source.currentIdentity()?.authGeneration, PremiumAccessState.NoGrant)
+        _state.value =
+            OwnedPremiumAccess(identity.uid, identity.authGeneration, PremiumAccessState.NoGrant)
         schedule.cancel(preserveServerFloor = true)
-        store.bindOwner(uid)
+        store.bindOwner(identity.uid)
         _krx.value = KrxCapabilityState.HIDDEN
         _lastEffects.value = emptyList()
         resumePendingPurgesLocked()
         // Handed back so the caller can bind its follow-up query to *this* binding. A query queued
         // behind a sign-out would otherwise start under the next generation and revive a session
         // that is gone.
-        decisionGeneration
+        AccessDecisionGeneration(decisionGeneration)
     }
 
     /**
@@ -222,7 +233,7 @@ class PremiumAccessCoordinator(
         intent: RefreshIntent,
         origin: QueryOrigin = QueryOrigin.CALLER,
         /** The [decisionGeneration] the caller believes it is still querying for, if it pinned one. */
-        requireGeneration: Long? = null,
+        requireDecisionGeneration: AccessDecisionGeneration? = null,
         /**
          * Probe ticks and scheduled retries: the [probeEpoch] the caller believes it still owns.
          *
@@ -241,7 +252,11 @@ class PremiumAccessCoordinator(
             // against a sign-out that ran while it was still queued, and by the time this body runs
             // the generation it would otherwise capture is the *new* one — so an unauthorised query
             // would apply cleanly and re-arm a recheck for a session that ended.
-            if (requireGeneration != null && decisionGeneration != requireGeneration) return
+            if (requireDecisionGeneration != null &&
+                decisionGeneration != requireDecisionGeneration.value
+            ) {
+                return
+            }
             // Validate and defer under the same coordinator lock as identity teardown. A stale
             // queued lookup must not revive the floor's timer before its lifetime check runs.
             // Deferred callbacks carry this binding's probeEpoch back through the check above;
@@ -260,7 +275,7 @@ class PremiumAccessCoordinator(
                 forcePremiumOwner = record.ownerUid
             }
             schedule.recordQueryStarted()
-            StartedQuery(record.fence(), decisionGeneration)
+            StartedQuery(record.fence(), decisionGeneration, boundIdentityLocked())
         }
 
         val result = try {
@@ -292,7 +307,7 @@ class PremiumAccessCoordinator(
     /** Feeds a WebSocket topic rejection into the same reducer. Not produced by the REST path. */
     suspend fun onTopicRejected(code: TopicRejection) {
         val started = mutex.withLock {
-            StartedQuery(store.load().fence(), decisionGeneration)
+            StartedQuery(store.load().fence(), decisionGeneration, boundIdentityLocked())
         }
         val outcome = when (code) {
             TopicRejection.PREMIUM_REQUIRED -> EntitlementsOutcome.PremiumRequired
@@ -303,12 +318,34 @@ class PremiumAccessCoordinator(
         apply(RefreshIntent.FORCE_ENTITLEMENTS, outcome, answeredAs = null, started = started)
     }
 
+    /** The session the published binding is standing on, or null before anything is bound. */
+    private fun boundIdentityLocked(): EntitlementsIdentity? {
+        val bound = _state.value
+        val uid = bound.uid ?: return null
+        val generation = bound.authGeneration ?: return null
+        return EntitlementsIdentity(uid, generation)
+    }
+
     private fun clearForcePremiumLocked() {
         forcePremiumToken = null
         forcePremiumOwner = null
     }
 
-    private data class StartedQuery(val fence: AccessFence, val generation: Long)
+    private data class StartedQuery(
+        val fence: AccessFence,
+        val generation: Long,
+        /**
+         * The auth session the binding was standing on when this query left.
+         *
+         * Not the same question as "is the answer's session live". A binding made from a delayed
+         * `(A, g1)` observation while the live session is already `(A, g2)` sends a query that
+         * runs — and answers — as `g2`. Every other check passes: the decision generation has not
+         * moved, the namespace is the same, the owner uid matches, and the answer's session *is*
+         * the live one. The result would then be published carrying the `g1` the binding still
+         * holds. Comparing against what was bound is what refuses it.
+         */
+        val boundIdentity: EntitlementsIdentity?
+    )
 
     private suspend fun apply(
         intent: RefreshIntent,
@@ -329,11 +366,12 @@ class PremiumAccessCoordinator(
         // locks are released.
         mutex.withLock {
             val record = store.load()
-            // Four independent staleness checks, because each catches something the others miss:
+            // Five independent staleness checks, because each catches something the others miss:
             //  - generation: an authoritative loss or reset that rotated nothing,
             //  - fence: a namespace that has since been retired,
             //  - owner: an answer the transport actually fetched as somebody else,
-            //  - auth session: the same uid on a session the transport has since superseded.
+            //  - auth session: the same uid on a session the transport has since superseded,
+            //  - bound session: an answer for a session this binding was never standing on.
             if (started.generation != decisionGeneration) return
             if (record.fence() != started.fence) return
 
@@ -342,6 +380,10 @@ class PremiumAccessCoordinator(
                 decideLocked(record, intent, outcome)
             } else {
                 if (answeredAs.ownerUid != record.ownerUid) return
+                // ...and the session the binding was standing on, which the live check above
+                // cannot stand in for: both can be the *new* session while the binding is still
+                // the old one.
+                if (started.boundIdentity != null && answeredAs != started.boundIdentity) return
                 val live = source.currentIdentity()
                 when {
                     live == answeredAs -> decideLocked(record, intent, outcome)

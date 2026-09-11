@@ -88,7 +88,7 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > purge·`AccessEffect.PushDelete` 실행·D27 파일 단위 allowlist가, S2는 D26 in-memory preview와 §7 S2 DoD의
 > "UID별 마지막 탭 복원"이 미충족이다. S1.5는 주요 구현이 land했으나 전체 DoD 충족은 미확인이다.
 > 코드에 적힌 세 유예 사유는 서로 다르므로 각각 적는다 — purge는 대상이 아직 legacy rate/graph store,
-> PushDelete는 **서버 D21 순서 계약 미결**(`PremiumAccessCoordinator.kt:17-24`), backup은 기존 사용자 설정의
+> PushDelete는 **서버 D21 순서 계약 미결**(`PremiumAccessCoordinator.kt:18-27`), backup은 기존 사용자 설정의
 > restore 동작 변경을 분리한 것이다. 이 기록은 완료 선언이 아니고 미충족 작업의 후속 슬라이스 이관도
 > 승인하지 않는다 — 소유권은 §7·§9.1이 정한 그대로다. 범위·D-결정·슬라이스 경계·게이트·DoD·활성
 > 미결정 O1은 그대로이고, 어떤 슬라이스 착수나 public arming·rollout·deploy도 열지 않는다.

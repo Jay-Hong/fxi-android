@@ -1,5 +1,6 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AuthIdentityFence
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -136,7 +137,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableActive(krxVisible = false))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
         assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
@@ -171,7 +172,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableActive(krxVisible = false))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
 
         val inFlight = async { coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
         runCurrent()
@@ -202,7 +203,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableActive(krxVisible = true), uid = "user-b")
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
 
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
@@ -219,7 +220,7 @@ class PremiumAccessCoordinatorTest {
     fun currentNamespaceResponse_isApplied() = runTest {
         val store = FakeStore(ids())
         val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = true)) })
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
 
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
@@ -242,7 +243,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableActive(krxVisible = false), generation = 1L)
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
 
         val inFlight = async { coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
         runCurrent()
@@ -272,7 +273,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableActive(krxVisible = false))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
 
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         runCurrent()
@@ -304,7 +305,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 60))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
 
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         testScheduler.advanceTimeBy(59_000)
@@ -336,7 +337,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableActive(krxVisible = false))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
 
         val cancelled = async { coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
         runCurrent()
@@ -378,7 +379,7 @@ class PremiumAccessCoordinatorTest {
             }
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
         assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
@@ -412,7 +413,7 @@ class PremiumAccessCoordinatorTest {
             }
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
 
         coordinator.refresh(RefreshIntent.IF_STALE)
         runCurrent()
@@ -443,7 +444,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableActive(krxVisible = false))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
 
         runCatching { coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
         advanceUntilIdle()
@@ -471,12 +472,12 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableActive(krxVisible = false), uid = "user-b")
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
 
         val stuck = async { coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
         runCurrent()
 
-        coordinator.onOwnerChanged("user-b")
+        coordinator.onIdentityChanged(ownerFence("user-b"))
         // The transport is now signed in as user-b, so its answers are attributable to user-b.
         source.identity = EntitlementsIdentity("user-b", 1L)
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
@@ -507,11 +508,11 @@ class PremiumAccessCoordinatorTest {
             }
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         val a = async { coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
         runCurrent()
 
-        coordinator.onOwnerChanged("user-b")
+        coordinator.onIdentityChanged(ownerFence("user-b"))
         val b = async { coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
         runCurrent()
 
@@ -548,7 +549,7 @@ class PremiumAccessCoordinatorTest {
             }
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
         assertEquals(PremiumAccessState.FreeConfirmed, coordinator.state.value.state)
@@ -587,7 +588,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableInactive(krxVisible = false))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         advanceUntilIdle()
         firedAt.clear()
 
@@ -611,7 +612,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableInactive(krxVisible = false))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         advanceUntilIdle()
         calls = 0
 
@@ -633,7 +634,7 @@ class PremiumAccessCoordinatorTest {
             else answer(EntitlementsOutcome.StableInactive(krxVisible = false))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         advanceUntilIdle()
         calls = 0
 
@@ -654,7 +655,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.PremiumRequired)
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         advanceUntilIdle()
         calls = 0
 
@@ -680,7 +681,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 30))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         advanceUntilIdle()
 
         coordinator.onLocalPremiumSignal()
@@ -701,7 +702,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableInactive(krxVisible = false))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         advanceUntilIdle()
 
         coordinator.onLocalPremiumSignal()
@@ -709,7 +710,7 @@ class PremiumAccessCoordinatorTest {
         testScheduler.runCurrent()
         val duringProbe = calls
 
-        coordinator.onOwnerChanged("user-b")
+        coordinator.onIdentityChanged(ownerFence("user-b"))
         source.identity = EntitlementsIdentity("user-b", 1L)
         advanceUntilIdle()
 
@@ -726,7 +727,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableInactive(krxVisible = false))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         advanceUntilIdle()
 
         coordinator.onLocalPremiumSignal()
@@ -751,7 +752,7 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableInactive(krxVisible = false))
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         advanceUntilIdle()
         calls = 0
 
@@ -787,7 +788,7 @@ class PremiumAccessCoordinatorTest {
         assertEquals("no owner is bound, so there is nobody to query for", 0, calls)
 
         // And it is not replayed when someone does sign in.
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         advanceUntilIdle()
         assertEquals(0, calls)
         processJob.cancel()
@@ -812,7 +813,7 @@ class PremiumAccessCoordinatorTest {
         }
         val coordinator = build(store, source)
         try {
-            coordinator.onOwnerChanged(OWNER)
+            coordinator.onIdentityChanged(ownerFence(OWNER))
             advanceUntilIdle()
 
             coordinator.onSignedOut()
@@ -851,7 +852,7 @@ class PremiumAccessCoordinatorTest {
         }
         val coordinator = build(store, source)
         try {
-            coordinator.onOwnerChanged(OWNER)
+            coordinator.onIdentityChanged(ownerFence(OWNER))
             advanceUntilIdle()
 
             val gate = CompletableDeferred<Unit>()
@@ -889,10 +890,10 @@ class PremiumAccessCoordinatorTest {
             answer(EntitlementsOutcome.StableActive(krxVisible = false), uid = "user-b")
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         advanceUntilIdle()
 
-        coordinator.onOwnerChanged("user-b")
+        coordinator.onIdentityChanged(ownerFence("user-b"))
         source.identity = EntitlementsIdentity("user-b", 1L)
         advanceUntilIdle()
         seenAs.clear()
@@ -922,7 +923,7 @@ class PremiumAccessCoordinatorTest {
         }
         val coordinator = build(store, source)
         try {
-            coordinator.onOwnerChanged(OWNER)
+            coordinator.onIdentityChanged(ownerFence(OWNER))
             advanceUntilIdle()
             calls = 0
 
@@ -933,7 +934,7 @@ class PremiumAccessCoordinatorTest {
 
             // Positive control through the real path: the probe passes its own live epoch, so a
             // guard that simply blocked everything would fail here. Asserting a literal epoch
-            // instead would only re-encode the internal counter, which onOwnerChanged advances.
+            // instead would only re-encode the internal counter, which onIdentityChanged advances.
             coordinator.onLocalPremiumSignal()
             advanceUntilIdle()
             assertEquals("the live epoch was refused too — the guard blocks everything", 1, calls)
@@ -948,7 +949,7 @@ class PremiumAccessCoordinatorTest {
     fun persistenceFailure_leavesTheTransitionUnpublished() = runTest {
         val store = FakeStore(ids())
         val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = false)) })
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
         val epochBefore = store.record.userAccessEpoch
@@ -973,7 +974,7 @@ class PremiumAccessCoordinatorTest {
         val store = FakeStore(ids())
         val purger = RecordingPurger(PurgeResult.Deferred("test"))
         val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = false)) }, purger)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
         val epochWhileSignedIn = store.record.userAccessEpoch
@@ -993,7 +994,7 @@ class PremiumAccessCoordinatorTest {
         val store = FakeStore(ids())
         val purger = RecordingPurger(PurgeResult.Deferred("not owned by this slice"))
         val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = false)) }, purger)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
 
@@ -1013,9 +1014,9 @@ class PremiumAccessCoordinatorTest {
         val purger = RecordingPurger(PurgeResult.Deferred("stuck"))
         val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = false)) }, purger)
 
-        coordinator.onOwnerChanged("user-a")
-        coordinator.onOwnerChanged("user-b")
-        coordinator.onOwnerChanged("user-c")
+        coordinator.onIdentityChanged(ownerFence("user-a"))
+        coordinator.onIdentityChanged(ownerFence("user-b"))
+        coordinator.onIdentityChanged(ownerFence("user-c"))
         advanceUntilIdle()
         assertEquals(2, store.record.pendingPurges.size)
 
@@ -1050,7 +1051,7 @@ class PremiumAccessCoordinatorTest {
     fun pushDelete_isDeclaredButThisSliceExecutesNothing() = runTest {
         val store = FakeStore(ids())
         val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = false)) })
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
 
@@ -1074,7 +1075,7 @@ class PremiumAccessCoordinatorTest {
             }
         }
         val coordinator = build(store, source)
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
 
         coordinator.refresh(RefreshIntent.IF_STALE)
         advanceUntilIdle()
@@ -1098,7 +1099,7 @@ class PremiumAccessCoordinatorTest {
             store,
             FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = false)) }
         )
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
         assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
@@ -1128,14 +1129,14 @@ class PremiumAccessCoordinatorTest {
             store,
             FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = false)) }
         )
-        coordinator.onOwnerChanged(OWNER)
+        coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
         assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
 
         val gate = CompletableDeferred<Unit>()
         store.blockNextBindOn = gate
-        val rebind = launch { coordinator.onOwnerChanged("user-b") }
+        val rebind = launch { coordinator.onIdentityChanged(ownerFence("user-b")) }
         advanceUntilIdle()
 
         assertEquals(
@@ -1162,7 +1163,10 @@ class PremiumAccessCoordinatorTest {
         ) { answer(EntitlementsOutcome.StableActive(krxVisible = false), generation = 7L) }
         val coordinator = build(store, source)
 
-        coordinator.onOwnerChanged(OWNER)
+        // The generation now travels with the observation instead of being re-read at bind time,
+        // so the caller states the session it saw. That is the point of the change: a binding can
+        // no longer pair one observation's uid with another's generation.
+        coordinator.onIdentityChanged(ownerFence(OWNER, 7L))
         advanceUntilIdle()
         assertEquals(
             "the binding published no session",
@@ -1202,11 +1206,11 @@ class PremiumAccessCoordinatorTest {
         }
         val coordinator = build(store, source)
         try {
-            val firstBinding = coordinator.onOwnerChanged(OWNER)
-            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireGeneration = firstBinding)
+            val firstBinding = coordinator.onIdentityChanged(ownerFence(OWNER))
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = firstBinding)
             advanceTimeBy(1_000L)
-            val liveBinding = coordinator.onOwnerChanged(OWNER)
-            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireGeneration = liveBinding)
+            val liveBinding = coordinator.onIdentityChanged(ownerFence(OWNER))
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = liveBinding)
             advanceTimeBy(28_999L)
             runCurrent()
             assertEquals("the new binding queried inside the preserved floor", listOf(0L), firedAt)
@@ -1237,13 +1241,13 @@ class PremiumAccessCoordinatorTest {
         }
         val coordinator = build(store, source)
         try {
-            val binding = coordinator.onOwnerChanged(OWNER)
-            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireGeneration = binding)
+            val binding = coordinator.onIdentityChanged(ownerFence(OWNER))
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = binding)
             advanceTimeBy(1_000L)
 
             // The binder queued this launch while binding N was alive; logout wins delivery.
             val queuedLookup = launch {
-                coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireGeneration = binding)
+                coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = binding)
             }
             source.identity = null
             coordinator.onSignedOut()
@@ -1268,7 +1272,7 @@ class PremiumAccessCoordinatorTest {
         }
         val coordinator = build(store, source)
         try {
-            coordinator.onOwnerChanged(OWNER)
+            coordinator.onIdentityChanged(ownerFence(OWNER))
             coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
             advanceTimeBy(1_000L)
             source.identity = null
@@ -1298,12 +1302,12 @@ class PremiumAccessCoordinatorTest {
         }
         val coordinator = build(store, source)
         try {
-            val oldBinding = coordinator.onOwnerChanged(OWNER)
-            coordinator.refresh(RefreshIntent.IF_STALE, requireGeneration = oldBinding)
+            val oldBinding = coordinator.onIdentityChanged(ownerFence(OWNER))
+            coordinator.refresh(RefreshIntent.IF_STALE, requireDecisionGeneration = oldBinding)
             advanceTimeBy(1_000L)
-            val newBinding = coordinator.onOwnerChanged(OWNER)
-            coordinator.refresh(RefreshIntent.IF_STALE, requireGeneration = newBinding)
-            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireGeneration = oldBinding)
+            val newBinding = coordinator.onIdentityChanged(ownerFence(OWNER))
+            coordinator.refresh(RefreshIntent.IF_STALE, requireDecisionGeneration = newBinding)
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = oldBinding)
             advanceTimeBy(29_000L)
             runCurrent()
             assertEquals("stale work strengthened the live binding's retry", listOf(false, false), modes)
@@ -1323,7 +1327,7 @@ class PremiumAccessCoordinatorTest {
         }
         val coordinator = build(store, source)
         try {
-            coordinator.onOwnerChanged(OWNER) // first binding owns probe epoch 1
+            coordinator.onIdentityChanged(ownerFence(OWNER)) // first binding owns probe epoch 1
             coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
             advanceTimeBy(1_000L)
             source.identity = null
@@ -1347,4 +1351,94 @@ class PremiumAccessCoordinatorTest {
     private companion object {
         const val OWNER = "user-a"
     }
+
+    // ---- identity mixing (L-4b) -------------------------------------------------------------------
+
+    /**
+     * C1 — the binding publishes the generation it was **handed**, not one it read for itself.
+     *
+     * The two are deliberately different here. They agree whenever the observation the binding
+     * was handed is the live one — which is the common case, and exactly why a re-read survived
+     * this long: it produced the right answer for the wrong reason. They do **not** always agree;
+     * the delayed-observation race two tests below is the case where they differ on a real path.
+     * Pulling them apart is the only way to see which one the code uses.
+     */
+    @Test
+    fun theBindingUsesTheObservedGenerationRatherThanRereadingIt() = runTest {
+        val store = FakeStore(ids())
+        // The source would answer 1. The observation carried 9.
+        val source = FakeSource(identity = EntitlementsIdentity(OWNER, 1L)) {
+            answer(EntitlementsOutcome.StableActive(krxVisible = false), generation = 1L)
+        }
+        val coordinator = build(store, source)
+
+        coordinator.onIdentityChanged(ownerFence(OWNER, 9L))
+        advanceUntilIdle()
+
+        assertEquals(
+            "the binding re-read the generation instead of using the one it was given",
+            9L,
+            coordinator.state.value.authGeneration
+        )
+    }
+
+    /**
+     * C2 — an answer from a session the binding is not standing on is refused.
+     *
+     * The delayed-observation race: bound from `(OWNER, 1)` while the live session is already
+     * `(OWNER, 2)`, so the query runs and answers as 2. Every earlier check passes — the decision
+     * generation has not moved, the namespace is the same, the owner uid matches, and the answer's
+     * session *is* the live one. Without the bound-identity comparison the grant lands and is
+     * published carrying the 1 the binding still holds.
+     */
+    @Test
+    fun anAnswerFromASessionTheBindingIsNotOnIsRefused() = runTest {
+        val store = FakeStore(ids())
+        val source = FakeSource(identity = EntitlementsIdentity(OWNER, 2L)) {
+            answer(EntitlementsOutcome.StableActive(krxVisible = false), generation = 2L)
+        }
+        val coordinator = build(store, source)
+
+        coordinator.onIdentityChanged(ownerFence(OWNER, 1L))
+        advanceUntilIdle()
+        coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+
+        assertEquals(
+            "a grant decided on another session was applied",
+            PremiumAccessState.NoGrant,
+            coordinator.state.value.state
+        )
+    }
+
+    /**
+     * C2 control — the same setup with the binding standing on the answering session **does**
+     * apply. Without this the test above would pass on a coordinator that refuses everything.
+     */
+    @Test
+    fun anAnswerFromTheSessionTheBindingIsOnIsApplied() = runTest {
+        val store = FakeStore(ids())
+        val source = FakeSource(identity = EntitlementsIdentity(OWNER, 2L)) {
+            answer(EntitlementsOutcome.StableActive(krxVisible = false), generation = 2L)
+        }
+        val coordinator = build(store, source)
+
+        coordinator.onIdentityChanged(ownerFence(OWNER, 2L))
+        advanceUntilIdle()
+        coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+
+        assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
+    }
 }
+
+/**
+ * The fence a binding used to be given implicitly.
+ *
+ * Before `onIdentityChanged`, the coordinator re-read the generation from its own source, which
+ * always answered `1` here regardless of the uid the caller passed — the mixing this replaced.
+ * Defaulting to `1` matches what the re-read produced for every case that did not set its own
+ * source generation. The two cases that did — the published-session test and the mixing tests
+ * below — pass theirs explicitly, so the default is a convenience, not a claim about all of them.
+ */
+private fun ownerFence(uid: String, generation: Long = 1L) = AuthIdentityFence(uid, generation)

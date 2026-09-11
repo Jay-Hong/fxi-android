@@ -1,5 +1,6 @@
 package com.jay.fxi.ui.screen
 
+import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.auth.AuthTokenSource
@@ -152,8 +153,13 @@ class RootViewModelTest {
         val root = RootViewModel(coordinator, tokens)
 
         suspend fun confirmPremium() {
-            val binding = coordinator.onOwnerChanged(OWNER)
-            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireGeneration = binding)
+            // Derived from the fixture's own identity rather than restated: the binding publishes
+            // the generation it was handed, so a test that sets 7 and binds 1 would be asserting
+            // against a session that never existed.
+            val observed = identity!!
+            val binding =
+                coordinator.onIdentityChanged(AuthIdentityFence(observed.uid, observed.authGeneration))
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = binding)
         }
     }
 

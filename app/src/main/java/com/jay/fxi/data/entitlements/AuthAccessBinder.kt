@@ -1,5 +1,7 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AuthFenceStream
+import com.jay.fxi.data.auth.AuthIdentityFence
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
@@ -7,9 +9,12 @@ import kotlinx.coroutines.launch
 /**
  * The signed-in uid, as a callback stream.
  *
- * A seam, not an abstraction for its own sake: the production implementation is one
- * `FirebaseAuth.AuthStateListener`, and a test needs to drive transitions without Firebase.
- * Mirrors how [RecheckClock] and [EpochIdGenerator] are already injected.
+ * A seam, not an abstraction for its own sake: a test needs to drive transitions without
+ * Firebase. Mirrors how [RecheckClock] and [EpochIdGenerator] are already injected.
+ *
+ * The production implementation is **no longer its own `FirebaseAuth.AuthStateListener`** — it is
+ * an adapter over [com.jay.fxi.data.auth.AuthFenceStream], which drops the generation. Two
+ * listeners watching Firebase independently is what that change removed; see the provider.
  */
 fun interface AuthUidStream {
     fun observe(onUid: (String?) -> Unit)
@@ -23,22 +28,26 @@ fun interface AuthUidStream {
  * `AuthViewModel` already listens, but it is Activity-scoped, and its `viewModelScope` dies at
  * `onCleared`. `FirebaseAuthTokenSource` also listens, but the coordinator reaches it through
  * `EntitlementsSource -> AuthenticatedApiClient -> AuthTokenProvider -> AuthTokenSource`, so
- * calling back from there would close a Hilt dependency cycle. This binder depends on
- * `FirebaseAuth` only, which has no dependencies of its own.
+ * calling back from there would close a Hilt dependency cycle. This binder now depends on the
+ * auth layer's fence stream instead — the same singleton the token source is, so one tracker
+ * answers "which generation is this" for both.
  *
  * ### Three properties that are load-bearing
  *
- * **Dedup lives here.** [PremiumAccessCoordinator.onOwnerChanged] is not same-uid idempotent — it
- * bumps the decision generation, cancels the recheck schedule and resets the published state to
- * `NoGrant` before it even reaches the store. Firebase re-delivers the current user on every
- * listener registration, so without [boundUid] a live grant would be thrown away routinely.
+ * **Dedup lives here, and it is keyed on the fence.** [PremiumAccessCoordinator.onIdentityChanged]
+ * is not idempotent — it bumps the decision generation, cancels the recheck schedule and resets the
+ * published state to `NoGrant` before it even reaches the store. The stream replays the current
+ * fence to every new subscriber, so without [boundFence] a live grant would be thrown away
+ * routinely. Keying on the **fence** rather than the bare uid is what makes a same-uid generation
+ * change visible: `authGeneration` also advances on the explicit invalidation the tracked sign-in
+ * path runs, and that transition produces no uid change at all.
  *
  * **One consumer, in emit order.** Owner-binding and sign-out are not commutative. Dispatching
  * each callback in its own coroutine lets a sign-out/sign-in pair land inverted, leaving a
  * signed-in user with `signOut()` applied last. The coordinator's mutex serialises the calls but
  * cannot recover the order they were emitted in, so the order is preserved here instead.
  *
- * **A cold start never synthesises a sign-out.** [boundUid] starts unbound, so a first `null`
+ * **A cold start never synthesises a sign-out.** [boundFence] starts unbound, so a first `null`
  * observation does nothing. Dispatching `onSignedOut()` there would rotate both epochs and
  * journal a purge whenever a previous process left an owner bound — destroying exactly the
  * same-uid cold-start continuity the plan preserves.
@@ -46,21 +55,21 @@ fun interface AuthUidStream {
 class AuthAccessBinder(
     private val coordinator: PremiumAccessCoordinator,
     private val scope: CoroutineScope,
-    private val uidStream: AuthUidStream
+    private val fenceStream: AuthFenceStream
 ) {
     /**
      * Unbounded because dropping an auth transition is not a recoverable outcome, and the real
      * traffic is a handful of events per process.
      */
-    private val inbox = Channel<String?>(Channel.UNLIMITED)
+    private val inbox = Channel<AuthIdentityFence?>(Channel.UNLIMITED)
 
     /** Confined to the single consumer, so it needs no synchronisation. */
-    private var boundUid: String? = null
+    private var boundFence: AuthIdentityFence? = null
 
     /**
      * Starts consuming, then registers the stream.
      *
-     * The purge resume runs before the loop rather than relying on [onOwnerChanged], which
+     * The purge resume runs before the loop rather than relying on [onIdentityChanged], which
      * resumes purges itself: on a signed-out cold start no owner change ever fires, and a journal
      * a previous process left behind would otherwise never be retried. On a signed-in cold start
      * this costs one redundant resume, which is a no-op when the journal is empty.
@@ -68,24 +77,24 @@ class AuthAccessBinder(
     fun start() {
         scope.launch {
             coordinator.resumePendingPurges()
-            for (uid in inbox) handle(uid)
+            for (fence in inbox) handle(fence)
         }
-        // Firebase 24.0.1 posts the current user to a newly registered listener, so the initial
-        // observation arrives from here — emitting one synthetically would only duplicate it.
-        uidStream.observe(::onUidObserved)
+        // AuthFenceStream replays the tracker's current fence when this subscriber registers.
+        // The binder must not synthesize another initial observation.
+        fenceStream.observe(::onFenceObserved)
     }
 
     /** Test seam. Production reaches this through the registered listener. */
-    internal fun onUidObserved(uid: String?) {
-        inbox.trySend(uid)
+    internal fun onFenceObserved(fence: AuthIdentityFence?) {
+        inbox.trySend(fence)
     }
 
-    private suspend fun handle(uid: String?) {
+    private suspend fun handle(fence: AuthIdentityFence?) {
         when {
-            uid != null && uid != boundUid -> {
-                boundUid = uid
-                val boundGeneration = coordinator.onOwnerChanged(uid)
-                // `onOwnerChanged` binds the owner and resets to NoGrant; it asks the server
+            fence != null && fence != boundFence -> {
+                boundFence = fence
+                val boundDecisionGeneration = coordinator.onIdentityChanged(fence)
+                // `onIdentityChanged` binds the owner and resets to NoGrant; it asks the server
                 // nothing. D23 also says a cold-start grant can only come from a `fresh_premium`
                 // answer, so without a query here an existing subscriber who merely restores a
                 // login sits on the free surface forever — no purchase button is involved, so
@@ -107,12 +116,12 @@ class AuthAccessBinder(
                 scope.launch {
                     coordinator.refresh(
                         RefreshIntent.FORCE_PREMIUM,
-                        requireGeneration = boundGeneration
+                        requireDecisionGeneration = boundDecisionGeneration
                     )
                 }
             }
-            uid == null && boundUid != null -> {
-                boundUid = null
+            fence == null && boundFence != null -> {
+                boundFence = null
                 coordinator.onSignedOut()
             }
         }

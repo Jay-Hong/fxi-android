@@ -60,4 +60,170 @@ class AuthSessionGenerationTrackerTest {
         assertTrue(second.authGeneration > first.authGeneration)
         assertEquals("user-b", second.uid)
     }
+
+    // ---- publication (L-4b) ---------------------------------------------------------------------
+
+    /** Everything a subscriber was handed, in order. Drained the way the source drains it. */
+    private fun AuthSessionGenerationTracker.collect(into: MutableList<AuthIdentityFence?>) {
+        subscribe { into += it }
+        drainOutbox().forEach { it.deliver() }
+    }
+
+    private fun AuthSessionGenerationTracker.pump() = drainOutbox().forEach { it.deliver() }
+
+    /**
+     * A1 — a subscriber is handed the current fence, and that hand-over is not a transition.
+     *
+     * Without this, publishing only on change leaves a signed-in cold start with nothing: the
+     * initial generation is set in the constructor, so the first `observe` of the same user does
+     * not advance and therefore would not publish.
+     */
+    @Test
+    fun subscribing_replaysTheCurrentFenceWithoutRotating() {
+        val session = Any()
+        val tracker = AuthSessionGenerationTracker("user-a", session)
+        val seen = mutableListOf<AuthIdentityFence?>()
+
+        tracker.collect(seen)
+
+        assertEquals(listOf(AuthIdentityFence("user-a", 1L)), seen)
+        assertEquals("the replay moved the generation", 1L, tracker.observe("user-a", session)!!.authGeneration)
+    }
+
+    /** A1 — a subscriber that arrives late is not owed less than one that arrived early. */
+    @Test
+    fun subscribingAfterATransition_replaysWhereTheSessionIsNow() {
+        val tracker = AuthSessionGenerationTracker("user-a", Any())
+        tracker.observe("user-b", Any())
+        val late = mutableListOf<AuthIdentityFence?>()
+
+        tracker.collect(late)
+
+        assertEquals(listOf(AuthIdentityFence("user-b", 2L)), late)
+    }
+
+    /** A2 — a uid transition seen by the Firebase listener publishes. */
+    @Test
+    fun anObservedTransition_publishes() {
+        val tracker = AuthSessionGenerationTracker("user-a", Any())
+        val seen = mutableListOf<AuthIdentityFence?>()
+        tracker.collect(seen)
+
+        tracker.observe("user-b", Any())
+        tracker.pump()
+
+        assertEquals(
+            listOf(AuthIdentityFence("user-a", 1L), AuthIdentityFence("user-b", 2L)),
+            seen
+        )
+    }
+
+    /**
+     * A2·A4 — an explicit invalidation publishes, with no Firebase callback anywhere in it.
+     *
+     * This is the path the tracked sign-in runs before the SDK does anything. If publication hung
+     * off the auth listener instead, an SDK failure after that point would leave the transition
+     * unannounced and nothing would ever ask again.
+     */
+    @Test
+    fun anExplicitInvalidation_publishesWithoutAnyFirebaseCallback() {
+        val session = Any()
+        val tracker = AuthSessionGenerationTracker("user-a", session)
+        val seen = mutableListOf<AuthIdentityFence?>()
+        tracker.collect(seen)
+        val current = tracker.observe("user-a", session)!!
+        tracker.pump()
+
+        assertTrue(tracker.invalidate(current))
+        tracker.pump()
+
+        assertEquals(
+            listOf(AuthIdentityFence("user-a", 1L), AuthIdentityFence("user-a", 2L)),
+            seen
+        )
+    }
+
+    /** A3 — an observation that changes nothing is not a transition, so it publishes nothing. */
+    @Test
+    fun anUnchangedObservation_publishesNothing() {
+        val session = Any()
+        val tracker = AuthSessionGenerationTracker("user-a", session)
+        val seen = mutableListOf<AuthIdentityFence?>()
+        tracker.collect(seen)
+        val afterReplay = seen.size
+
+        repeat(3) { tracker.observe("user-a", session) }
+        tracker.pump()
+
+        assertEquals("an unchanged observation was published as a transition", afterReplay, seen.size)
+    }
+
+    /** A5 — the null between a sign-out and a sign-in reaches every subscriber, in order. */
+    @Test
+    fun everySubscriberGetsEveryTransitionInOrder() {
+        val tracker = AuthSessionGenerationTracker("user-a", Any())
+        val first = mutableListOf<AuthIdentityFence?>()
+        val second = mutableListOf<AuthIdentityFence?>()
+        tracker.collect(first)
+        tracker.collect(second)
+
+        tracker.observe(null, null)
+        tracker.observe("user-a", Any())
+        tracker.pump()
+
+        val expected = listOf(
+            AuthIdentityFence("user-a", 1L),
+            null,
+            AuthIdentityFence("user-a", 3L)
+        )
+        assertEquals(expected, first)
+        assertEquals("a second subscriber was handed a different history", expected, second)
+    }
+
+    /**
+     * A6 — a retirement moves the generation without announcing the session it lands on.
+     *
+     * The sign-out path invalidates and then signs out. Announcing the fence in between makes
+     * every subscriber treat a teardown as a new session: the binder rebinds, writes the owner to
+     * disk and asks the server about an account that is one call from being gone. The `null` that
+     * follows is the transition subscribers actually need.
+     */
+    @Test
+    fun retiring_movesTheGenerationWithoutAnnouncingIt() {
+        val session = Any()
+        val tracker = AuthSessionGenerationTracker("user-a", session)
+        val seen = mutableListOf<AuthIdentityFence?>()
+        tracker.collect(seen)
+        val current = tracker.observe("user-a", session)!!
+        tracker.pump()
+        val afterReplay = seen.size
+
+        assertTrue(tracker.retire(current))
+        tracker.pump()
+        assertEquals("은퇴가 중간 세션을 알렸다", afterReplay, seen.size)
+
+        // ...and the sign-out that follows is announced.
+        tracker.observe(null, null)
+        tracker.pump()
+        assertEquals(listOf(AuthIdentityFence("user-a", 1L), null), seen)
+    }
+
+    /** A6 control — the sign-in side still announces, or the recovery this exists for is gone. */
+    @Test
+    fun invalidatingForSignIn_stillAnnounces() {
+        val session = Any()
+        val tracker = AuthSessionGenerationTracker("user-a", session)
+        val seen = mutableListOf<AuthIdentityFence?>()
+        tracker.collect(seen)
+        val current = tracker.observe("user-a", session)!!
+        tracker.pump()
+
+        assertTrue(tracker.invalidate(current))
+        tracker.pump()
+
+        assertEquals(
+            listOf(AuthIdentityFence("user-a", 1L), AuthIdentityFence("user-a", 2L)),
+            seen
+        )
+    }
 }

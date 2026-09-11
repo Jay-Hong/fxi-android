@@ -33,6 +33,20 @@ data class OwnedPremiumAccess(
 )
 
 /**
+ * The access decision's own counter — **not** the auth generation.
+ *
+ * They move for different reasons and are compared against different things: this one is bumped by
+ * every authoritative-loss input so a query can tell whether the decision it was pinned to still
+ * stands, while `authGeneration` tracks the Firebase session.
+ *
+ * Kotlin treats this as a distinct type: a raw Long cannot be passed where this is required.
+ * The public constructor still accepts any Long, so AccessDecisionGeneration(probeEpoch) is
+ * legal. Type checking prevents implicit mixing; it cannot verify which counter was wrapped.
+ */
+@JvmInline
+value class AccessDecisionGeneration(val value: Long)
+
+/**
  * Whether the server has confirmed premium for **exactly this session**.
  *
  * Bound to the generation as well as the uid. Checking the state alone let one account's grant

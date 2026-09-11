@@ -3,6 +3,7 @@ package com.jay.fxi.di
 import android.os.SystemClock
 import com.google.firebase.auth.FirebaseAuth
 import com.jay.fxi.data.entitlements.AccessEpochStore
+import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.entitlements.AuthAccessBinder
 import com.jay.fxi.data.entitlements.AuthUidStream
 import com.jay.fxi.data.entitlements.CapabilityScopePurger
@@ -94,25 +95,51 @@ object EntitlementsModule {
     )
 
     /**
-     * One `FirebaseAuth.AuthStateListener`, exposed as a callback stream.
+     * The uid half of [AuthFenceStream], for consumers that have no use for the generation.
      *
-     * `FirebaseAuth` is a dependency-free singleton, so binding here introduces no cycle — the
-     * coordinator reaches Firebase the other way round, through the authenticated transport.
+     * **An adapter, not a second listener.** This used to register its own
+     * `FirebaseAuth.AuthStateListener`, which meant the access funnel and the identity tracker
+     * watched Firebase independently and could disagree about what had happened. Both now read one
+     * tracker.
+     *
+     * Two properties the mapping must keep, and neither is free:
+     *
+     * **The first value is always delivered, `null` included.** A subscriber has to be able to tell
+     * "nobody is signed in" from "nothing has arrived yet", so "not delivered yet" is tracked apart
+     * from the value.
+     *
+     * **Consecutive duplicate uids are suppressed, but `A → null → A` is not.** A generation-only
+     * transition carries the same uid, and passing it on is not harmless: `FreeSnapshotScheduler`
+     * skips only the cache wipe for a repeated uid and still runs `pump`, freshness, publish and
+     * timer re-arm for every event. Collapsing the sign-out in the middle, on the other hand,
+     * would hide a real one.
+     *
+     * The two variables are captured per `observe` call, so each subscriber gets its own first
+     * value and its own history.
      */
     @Provides
     @Singleton
-    fun provideAuthUidStream(auth: FirebaseAuth): AuthUidStream = AuthUidStream { emit ->
-        auth.addAuthStateListener { emit(it.currentUser?.uid) }
+    fun provideAuthUidStream(fenceStream: AuthFenceStream): AuthUidStream = AuthUidStream { emit ->
+        var delivered = false
+        var lastUid: String? = null
+        fenceStream.observe { fence ->
+            val uid = fence?.uid
+            if (!delivered || uid != lastUid) {
+                delivered = true
+                lastUid = uid
+                emit(uid)
+            }
+        }
     }
 
     @Provides
     @Singleton
     fun provideAuthAccessBinder(
         coordinator: PremiumAccessCoordinator,
-        uidStream: AuthUidStream
+        fenceStream: AuthFenceStream
     ): AuthAccessBinder = AuthAccessBinder(
         coordinator = coordinator,
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-        uidStream = uidStream
+        fenceStream = fenceStream
     )
 }

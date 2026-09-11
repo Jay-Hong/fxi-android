@@ -1,5 +1,7 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AuthFenceStream
+import com.jay.fxi.data.auth.AuthIdentityFence
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
@@ -129,9 +131,9 @@ class AuthAccessBinderTest {
             clock = { testScheduler.currentTime },
             jitter = ProbeJitter.None
         )
-        // No stream: every test drives onUidObserved itself, so registration order cannot make a
-        // test pass for the wrong reason.
-        return AuthAccessBinder(coordinator, scope, AuthUidStream { })
+        // No stream: every test drives onFenceObserved itself, so registration order cannot make
+        // a test pass for the wrong reason.
+        return AuthAccessBinder(coordinator, scope, AuthFenceStream { })
     }
 
     @Test
@@ -140,11 +142,11 @@ class AuthAccessBinderTest {
         val binder = build(calls)
         binder.start()
 
-        repeat(3) { binder.onUidObserved("user-a") }
+        repeat(3) { binder.onFenceObserved(fenceOf("user-a")) }
         advanceUntilIdle()
 
-        // Firebase re-delivers the current user on every listener registration. Without the dedup
-        // each replay re-enters onOwnerChanged, which resets a live grant to NoGrant.
+        // The fence stream replays the current fence to every new subscriber. Without the dedup
+        // each replay re-enters onIdentityChanged, which resets a live grant to NoGrant.
         assertEquals(listOf(Call.OwnerChanged("user-a")), calls)
         processJob.cancel()
     }
@@ -155,9 +157,9 @@ class AuthAccessBinderTest {
         val binder = build(calls)
         binder.start()
 
-        binder.onUidObserved("user-a")
-        binder.onUidObserved(null)
-        binder.onUidObserved("user-b")
+        binder.onFenceObserved(fenceOf("user-a"))
+        binder.onFenceObserved(null)
+        binder.onFenceObserved(fenceOf("user-b"))
         advanceUntilIdle()
 
         // Inverting the middle pair would leave user-b signed in with signOut() applied last.
@@ -178,7 +180,7 @@ class AuthAccessBinderTest {
         val binder = build(calls)
         binder.start()
 
-        binder.onUidObserved(null)
+        binder.onFenceObserved(null)
         advanceUntilIdle()
 
         // A synthesised sign-out would rotate both epochs and journal a purge whenever a previous
@@ -193,9 +195,9 @@ class AuthAccessBinderTest {
         val binder = build(calls)
         binder.start()
 
-        binder.onUidObserved(null)
-        binder.onUidObserved("user-a")
-        binder.onUidObserved(null)
+        binder.onFenceObserved(null)
+        binder.onFenceObserved(fenceOf("user-a"))
+        binder.onFenceObserved(null)
         advanceUntilIdle()
 
         // The cold-start no-op must not latch: a genuine A -> null transition is a teardown.
@@ -212,8 +214,8 @@ class AuthAccessBinderTest {
         val binder = build(calls)
         binder.start()
 
-        binder.onUidObserved("user-a")
-        repeat(3) { binder.onUidObserved(null) }
+        binder.onFenceObserved(fenceOf("user-a"))
+        repeat(3) { binder.onFenceObserved(null) }
         advanceUntilIdle()
 
         assertEquals(
@@ -243,7 +245,7 @@ class AuthAccessBinderTest {
 
     /**
      * An existing subscriber who merely restores a login presses no purchase button, and
-     * `onOwnerChanged` asks the server nothing — it binds the owner and resets to NoGrant. D23 also
+     * `onIdentityChanged` asks the server nothing — it binds the owner and resets to NoGrant. D23 also
      * says a cold-start grant can only come from a `fresh_premium` answer. Without a query here,
      * that user sits on the free surface for the life of the process.
      */
@@ -254,7 +256,7 @@ class AuthAccessBinderTest {
         val binder = build(calls, fetches = fetches)
         binder.start()
 
-        binder.onUidObserved("user-a")
+        binder.onFenceObserved(fenceOf("user-a"))
         advanceUntilIdle()
 
         assertEquals("the restored login never reached the server", listOf(true), fetches)
@@ -269,7 +271,7 @@ class AuthAccessBinderTest {
         val binder = build(calls, fetches = fetches)
         binder.start()
 
-        repeat(3) { binder.onUidObserved("user-a") }
+        repeat(3) { binder.onFenceObserved(fenceOf("user-a")) }
         advanceUntilIdle()
 
         assertEquals(listOf(true), fetches)
@@ -289,8 +291,8 @@ class AuthAccessBinderTest {
         binder.start()
 
         // Both events are consumed before either launched query gets to run.
-        binder.onUidObserved("user-a")
-        binder.onUidObserved(null)
+        binder.onFenceObserved(fenceOf("user-a"))
+        binder.onFenceObserved(null)
         advanceUntilIdle()
 
         assertEquals(
@@ -301,4 +303,46 @@ class AuthAccessBinderTest {
         assertEquals(listOf(Call.OwnerChanged("user-a"), Call.SignedOut), calls)
         processJob.cancel()
     }
+
+    // ---- fence-keyed binding (L-4b) --------------------------------------------------------------
+
+    /**
+     * B1 — the same account on a new session rebinds.
+     *
+     * The uid does not move here: `authGeneration` also advances on the explicit invalidation the
+     * tracked sign-in path runs. Keyed on the bare uid this transition is invisible, and the
+     * session that L-4a retired would never be handed a fence to recover on.
+     */
+    @Test
+    fun sameUidWithANewGeneration_rebinds() = runTest {
+        val calls = mutableListOf<Call>()
+        val binder = build(calls)
+        binder.start()
+
+        binder.onFenceObserved(fenceOf("user-a", 1L))
+        binder.onFenceObserved(fenceOf("user-a", 2L))
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(Call.OwnerChanged("user-a"), Call.OwnerChanged("user-a")),
+            calls
+        )
+        processJob.cancel()
+    }
+
+    /** B2 — the same fence delivered again is not a transition. */
+    @Test
+    fun theSameFenceDeliveredAgain_doesNotRebind() = runTest {
+        val calls = mutableListOf<Call>()
+        val binder = build(calls)
+        binder.start()
+
+        repeat(3) { binder.onFenceObserved(fenceOf("user-a", 4L)) }
+        advanceUntilIdle()
+
+        assertEquals(listOf(Call.OwnerChanged("user-a")), calls)
+        processJob.cancel()
+    }
 }
+/** One observed identity. Generation defaults to 1 so existing cases read as they did. */
+private fun fenceOf(uid: String, generation: Long = 1L) = AuthIdentityFence(uid, generation)
