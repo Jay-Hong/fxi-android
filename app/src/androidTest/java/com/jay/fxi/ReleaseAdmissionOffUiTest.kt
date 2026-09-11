@@ -6,7 +6,6 @@ import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import com.jay.fxi.service.AlertEventBus
-import com.jay.fxi.service.PushNotificationManager
 import com.jay.fxi.subscription.SubscriptionManager
 import com.jay.fxi.ui.screen.RELEASE_UNAVAILABLE_TEST_TAG
 import com.jay.fxi.ui.screen.RootScreen
@@ -31,7 +30,6 @@ class ReleaseAdmissionOffUiTest {
             FXiTheme {
                 RootScreen(
                     subscriptionManagerProvider = rejectingProvider(providerReads),
-                    pushNotificationManagerProvider = rejectingProvider(providerReads),
                     alertEventBusProvider = rejectingProvider(providerReads)
                 )
             }
