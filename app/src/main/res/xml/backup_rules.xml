@@ -6,4 +6,5 @@
 <full-backup-content>
     <exclude domain="file" path="datastore/fxi_access_epoch.preferences_pb" />
     <exclude domain="file" path="datastore/fxi_bank_preferences.preferences_pb" />
+    <exclude domain="file" path="datastore/fxi_push_registration_ledger.preferences_pb" />
 </full-backup-content>

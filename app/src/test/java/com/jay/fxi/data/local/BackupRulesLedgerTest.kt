@@ -34,6 +34,11 @@ class BackupRulesLedgerTest {
         // namespace that never existed there.
         "fxi_access_epoch" to false,
 
+        // Which `(uid, token)` registrations the server may hold, and which are owed a DELETE. An entry
+        // restored onto another install names that device's token; resuming it would DELETE the other
+        // device's registration.
+        "fxi_push_registration_ledger" to false,
+
         // v1, with **no UID at all**. `ANDROID_V2_PLAN.md §7 S1.5` requires that a backup restore
         // not attribute v1 bank preferences to another UID, and a file that never recorded one
         // cannot help doing exactly that. Excluded here, and deleted outright on start — see
