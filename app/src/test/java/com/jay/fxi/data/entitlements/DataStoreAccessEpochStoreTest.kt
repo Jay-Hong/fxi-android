@@ -182,7 +182,30 @@ class DataStoreAccessEpochStoreTest {
         )
     }
 
+    /**
+     * Slice 5 across a real reopen: the landing takes the owner off the file, and the journal the
+     * next process reads still names who is owed a purge.
+     */
+    @Test
+    fun aLandedSignOutTakesTheOwnerOffTheFile_andTheJournalKeepsIt() = runBlocking {
+        val store = open()
+        val bound = store.bindOwner("u1")
+
+        store.signOut()
+
+        assertNull("착지한 로그아웃 뒤에도 owner 가 파일에 남았다", raw()[OWNER_UID])
+        val reopened = open().load()
+        assertNull(reopened.ownerUid)
+        assertNull(reopened.teardownOwedFor)
+        val entry = reopened.pendingPurges.single()
+        assertEquals("u1", entry.ownerUid)
+        assertEquals(bound.userAccessEpoch, entry.userAccessEpoch)
+        assertEquals(bound.krxCapabilityEpoch, entry.krxCapabilityEpoch)
+        assertNotEquals(bound.userAccessEpoch, reopened.userAccessEpoch)
+    }
+
     private companion object {
         val TEARDOWN_OWED_FOR = stringPreferencesKey("teardown_owed_for")
+        val OWNER_UID = stringPreferencesKey("owner_uid")
     }
 }

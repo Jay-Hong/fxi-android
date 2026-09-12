@@ -647,17 +647,14 @@ class PremiumAccessCoordinator(
      * It does **not** stop on `FreeConfirmed` — that answer *is* the propagation window.
      */
     private suspend fun runPropagationProbe() {
-        // A **live credential**, not persisted ownership. The record keeps its uid across a
-        // sign-out so the purge journal can still name whose namespace it is cleaning, so
-        // `ownerUid != null` stays true for a signed-out process. Gating on it alone let a
-        // billing callback delivered after logout start querying: with no credential the
-        // transport throws, that classifies TRANSIENT, and the reducer arms a recheck — teardown
-        // undone by a retry ladder that outlives the probe window.
+        // A **live credential**, not persisted ownership. A record still names an owner while a
+        // sign-out is only decided, and an external sign-out takes the credential away before any
+        // of that. Gating on the record alone let a billing callback delivered after logout start
+        // querying: with no credential the transport throws, that classifies TRANSIENT, and the
+        // reducer arms a recheck — teardown undone by a retry ladder that outlives the probe window.
         val run = mutex.withLock {
-            // Inside the lock, not before it. Read outside, a sign-out could complete between the
-            // read and the lock: the record keeps its uid, so the stale identity would still match
-            // and the probe would adopt the *post*-sign-out epoch as its own — passing every later
-            // fence. Both facts are then established under one critical section.
+            // Establish admission, live identity and persisted ownership while holding this lock.
+            // A landed sign-out without a subsequent bind is also refused by the null-owner check.
             if (!SignOutAttemptPolicy.admitsAccessQueries(attempt)) return
             val live = source.currentIdentity() ?: return
             val owner = store.load().ownerUid ?: return

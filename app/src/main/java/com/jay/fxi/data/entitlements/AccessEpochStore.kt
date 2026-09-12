@@ -151,6 +151,11 @@ object AccessEpochTransitions {
      *
      * Both axes are journalled even when the markers looked clean: purging an already-empty
      * namespace is harmless, missing one is not.
+     *
+     * An unowned namespace is retired too when a marker stands. The record does not establish who
+     * owns the data in a namespace, so it is not attributed to the arriving uid: both axes rotate
+     * and the journal keeps a null owner. The markers say only that protected data may exist; they
+     * are not evidence of a write, nor of a sign-out having happened.
      */
     fun bindOwner(
         record: AccessEpochRecord,
@@ -167,10 +172,17 @@ object AccessEpochTransitions {
         }
         if (base.ownerUid == uid) return ensureNamespace(base, ids)
         val previousOwner = base.ownerUid
-        val rotated = if (previousOwner != null) {
-            rotate(base, rotateUser = true, rotateKrx = true, ids = ids, purgedOwnerUid = previousOwner)
-        } else {
-            base
+        val rotated = when {
+            previousOwner != null ->
+                rotate(base, rotateUser = true, rotateKrx = true, ids = ids, purgedOwnerUid = previousOwner)
+            // No owner, yet a marker says protected data may sit in this namespace. The marker
+            // proves neither a write nor a past sign-out, and the record does not establish whose
+            // data it is, so the entry is journalled with no owner rather than the arriving uid.
+            base.mayContainPremiumData || base.mayContainKrxData ->
+                rotate(base, rotateUser = true, rotateKrx = true, ids = ids, purgedOwnerUid = null)
+            // Nothing to retire. A first install gets its namespace from ensureNamespace, which is
+            // an allocation and not a rotation.
+            else -> base
         }
         return ensureNamespace(rotated.copy(ownerUid = uid), ids)
     }
@@ -188,10 +200,11 @@ object AccessEpochTransitions {
      * intent remains owed if the Firebase operation is abandoned. The caller must keep
      * protected access blocked and arrange settlement independently of another auth event.
      *
-     * ⚠️ It arms again after a sign-out that already landed: [rotate] keeps the owner, so the record
-     * still names that uid. Nothing here can tell "this sign-out landed" from "a new one is being
-     * decided" — a caller retrying a transition must carry what its first attempt captured rather
-     * than begin again, or a retry of a landed sign-out rotates a second time.
+     * A sign-out that landed leaves no owner ([signOut]), so this cannot arm on top of one until a
+     * binding names an owner again. That bound state is indistinguishable from any other, so the
+     * guarantee ends there: an end event still has to carry its whole fence, keep its FIFO place and
+     * consume its receipt. This function only stops a landed sign-out from being re-decided while
+     * nobody is bound.
      */
     fun beginSignOut(record: AccessEpochRecord, uid: String): AccessEpochRecord {
         if (record.ownerUid != uid) return record
@@ -218,13 +231,22 @@ object AccessEpochTransitions {
      * The plan lists logout with fresh-false and typed reject as an event that rotates and
      * journals. Leaving the namespace live would let the next sign-in of the same uid inherit
      * protected data that was never re-authorised.
+     *
+     * Landing also gives up the owner, in the same record as the rotation. That is what a caller
+     * reads to see there is nothing left to tear down here: [beginSignOut] cannot arm and
+     * `planEnd` cannot rotate until something binds an owner again.
      */
     fun signOut(record: AccessEpochRecord, ids: EpochIdGenerator): AccessEpochRecord {
         // Cleared in the same record the rotation returns, so the marker and the teardown it
         // stands for land together or not at all.
         val landed = record.copy(teardownOwedFor = null)
         if (record.ownerUid == null) return landed
+        // The owner goes with them. The journal entry above already names whose namespace is being
+        // cleaned, so nothing needs the live field to remember it, and leaving it behind is what let
+        // a landed sign-out arm again. Direction matters: a landed sign-out leaves no owner, but no
+        // owner does not identify a landed sign-out — a fresh install has none either.
         return rotate(landed, rotateUser = true, rotateKrx = true, ids = ids, purgedOwnerUid = record.ownerUid)
+            .copy(ownerUid = null)
     }
 
     /** Removes exactly the entries that were purged. Others stay owed. */

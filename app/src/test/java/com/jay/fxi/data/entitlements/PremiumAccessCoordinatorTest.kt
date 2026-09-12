@@ -801,10 +801,13 @@ class PremiumAccessCoordinatorTest {
     }
 
     /**
-     * Regression: `store.signOut()` rotates the epochs but keeps `ownerUid`, so a probe gated on
-     * persisted ownership still started after a logout. With no credential the transport throws,
-     * which classifies TRANSIENT, which arms a recheck — a retry ladder that outlives the probe
-     * window and restarts work the teardown had just stopped.
+     * Regression: a probe gated on persisted ownership still started after a logout. With no
+     * credential the transport throws, which classifies TRANSIENT, which arms a recheck — a retry
+     * ladder that outlives the probe window and restarts work the teardown had just stopped.
+     *
+     * Since slice 5 the landed sign-out also gives up the owner, so the disk check refuses this one
+     * too. The credential gate is what
+     * [aPremiumSignalWithNoCredential_whileTheRecordStillNamesItsOwner_startsNothing] holds down.
      */
     @Test
     fun aPremiumSignalDeliveredAfterSignOut_startsNothing() = runTest {
@@ -824,7 +827,7 @@ class PremiumAccessCoordinatorTest {
 
             coordinator.onSignedOut(ownerFence(OWNER))
             source.identity = null
-            assertEquals("the record keeps its uid on purpose", OWNER, store.record.ownerUid)
+            assertNull("a landed sign-out gives up the owner", store.record.ownerUid)
             calls = 0
 
             coordinator.onLocalPremiumSignal()
@@ -842,9 +845,46 @@ class PremiumAccessCoordinatorTest {
     }
 
     /**
+     * The credential gate alone. An external sign-out takes the credential away while the record
+     * still names its owner, which is the one shape the disk read cannot refuse — so this is the
+     * case that fails if the probe goes back to trusting persisted ownership.
+     */
+    @Test
+    fun aPremiumSignalWithNoCredential_whileTheRecordStillNamesItsOwner_startsNothing() = runTest {
+        val store = FakeStore(ids())
+        var calls = 0
+        val source = FakeSource {
+            calls += 1
+            EntitlementsResult.Unauthenticated(
+                EntitlementsOutcome.Indeterminate(IndeterminateReason.TRANSIENT)
+            )
+        }
+        val coordinator = build(store, source)
+        try {
+            coordinator.onIdentityChanged(ownerFence(OWNER))
+            advanceUntilIdle()
+
+            source.identity = null
+            assertEquals("no teardown ran, so the record still names its owner", OWNER, store.record.ownerUid)
+            calls = 0
+
+            coordinator.onLocalPremiumSignal()
+            testScheduler.advanceTimeBy(60_000)
+            testScheduler.runCurrent()
+
+            assertEquals("a signal with no credential started querying", 0, calls)
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    /**
      * Regression: the identity read used to sit outside the coordinator lock. A sign-out landing
      * in that window left the probe holding a stale-but-matching identity, and it then captured
      * the *post*-sign-out epoch as its own — so every later fence passed.
+     *
+     * Since slice 5, the null-owner check also refuses this case. This test verifies the outcome,
+     * but no longer isolates the placement of the identity read.
      */
     @Test
     fun aSignOutLandingDuringTheIdentityRead_stillStopsTheProbe() = runTest {

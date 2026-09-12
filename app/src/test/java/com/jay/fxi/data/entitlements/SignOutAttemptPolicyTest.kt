@@ -228,6 +228,22 @@ class SignOutAttemptPolicyTest {
         assertEquals(EndPlan.ROTATE, SignOutAttemptPolicy.planEnd(a7, diskOwner = "user-a"))
     }
 
+    /**
+     * Slice 5: the record itself refuses the second rotation. A landed sign-out gives up the owner,
+     * so an end replayed against it plans no rotation at all — the attempt's own receipt, not this
+     * plan, is what tells it the first one landed.
+     */
+    @Test
+    fun endAgainstALandedSignOut_leavesTheDiskAlone() {
+        val landed = AccessEpochTransitions.signOut(
+            AccessEpochTransitions.bindOwner(AccessEpochRecord(), "user-a", ids),
+            ids
+        )
+
+        assertNull(landed.ownerUid)
+        assertEquals(EndPlan.LEAVE_DISK, SignOutAttemptPolicy.planEnd(a7, diskOwner = landed.ownerUid))
+    }
+
     @Test
     fun endNeverRotatesAnotherDiskOwner() {
         assertEquals(EndPlan.LEAVE_DISK, SignOutAttemptPolicy.planEnd(a7, diskOwner = "user-b"))

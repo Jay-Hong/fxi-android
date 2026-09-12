@@ -63,7 +63,7 @@ internal enum class PendingEdit {
     BEGIN_SIGN_OUT,
     BIND_OWNER,
 
-    /** The rotation a real end runs. Not safe to repeat once landed: `signOut` keeps the owner. */
+    /** The rotation a real end runs. A landed-but-unknown end needs its receipt to preserve landing knowledge on retry. */
     END,
 
     /** Recovery's rotation of an intent still owed on disk. */
@@ -517,7 +517,10 @@ internal object SignOutAttemptPolicy {
                     recovering(if (retired(before, readBack, attempt.fence.uid)) TeardownKnowledge.LANDED else known)
                 )
             }
-            // An end cannot be retried blind: `signOut` keeps the owner, so a landed end would rotate again.
+            // An end cannot be retried blind. `signOut` now gives up the owner, so `planEnd` will not
+            // rotate a second time before something binds again — but a retry then reads as
+            // NotAttempted, which keeps this attempt's prior knowledge. The receipt below is what
+            // turns a landed-but-unknown end into a landed one.
             PendingEdit.END -> {
                 val before = checkNotNull(attempt.before) { "END keeps the record it started from" }
                 val owner = before.ownerUid

@@ -398,6 +398,140 @@ class AccessEpochTransitionsTest {
         )
     }
 
+    /** Slice 5: the landing is on the record, not only in the caller's memory of it. */
+    @Test
+    fun signOut_landing_givesUpTheOwner_whileTheJournalKeepsIt() {
+        val before = bound()
+
+        val after = AccessEpochTransitions.signOut(before, ids)
+
+        assertNull("a landed sign-out leaves nobody bound", after.ownerUid)
+        assertEquals("the journal still names whose namespace to purge", "user-a", after.pendingPurges.single().ownerUid)
+        assertEquals(before.userAccessEpoch, after.pendingPurges.single().userAccessEpoch)
+    }
+
+    @Test
+    fun beginSignOut_afterALandedSignOut_armsNothing() {
+        val landed = AccessEpochTransitions.signOut(bound(), ids)
+
+        assertEquals(landed, AccessEpochTransitions.beginSignOut(landed, "user-a"))
+    }
+
+    /** Retrying the end of a landed sign-out must not take down the namespace the first one minted. */
+    @Test
+    fun signOut_repeatedOnItsOwnResult_rotatesNothingMore() {
+        val landed = AccessEpochTransitions.signOut(bound(), ids)
+
+        val again = AccessEpochTransitions.signOut(landed, ids)
+
+        assertEquals(landed, again)
+        assertEquals(1, again.pendingPurges.size)
+    }
+
+    @Test
+    fun settleOwedTeardown_thenTheSameUidBinds_rotatesOnce_andIsUnownedInBetween() {
+        val owed = AccessEpochTransitions.beginSignOut(bound(), "user-a")
+
+        val settled = AccessEpochTransitions.settleOwedTeardown(owed, ids)
+        val rebound = AccessEpochTransitions.bindOwner(settled, "user-a", ids)
+
+        assertNull("settling is a landing", settled.ownerUid)
+        assertEquals("user-a", rebound.ownerUid)
+        assertEquals("one teardown, one journal entry", 1, rebound.pendingPurges.size)
+        assertNotEquals(owed.userAccessEpoch, rebound.userAccessEpoch)
+    }
+
+    /**
+     * Nobody is bound, yet a marker says protected data may be here. The record does not establish
+     * whose data it is, so it is retired rather than inherited — and journalled with no owner,
+     * because the marker says nothing about who wrote it.
+     */
+    @Test
+    fun bindOwner_unownedNamespaceWithAMarker_retiresItWithoutNamingTheArrivingUid() {
+        val unowned = AccessEpochTransitions.markMayContainData(
+            AccessEpochTransitions.ensureNamespace(AccessEpochRecord(), ids),
+            premium = true,
+            krx = false
+        )
+
+        val bound = AccessEpochTransitions.bindOwner(unowned, "user-b", ids)
+
+        val entry = bound.pendingPurges.single()
+        assertNull("the journal must not attribute unowned data to the arriving uid", entry.ownerUid)
+        assertEquals(unowned.userAccessEpoch, entry.userAccessEpoch)
+        assertEquals(unowned.krxCapabilityEpoch, entry.krxCapabilityEpoch)
+        assertNotEquals(unowned.userAccessEpoch, bound.userAccessEpoch)
+        assertFalse(bound.mayContainPremiumData)
+        assertEquals("user-b", bound.ownerUid)
+    }
+
+    /** Either axis is enough: the KRX marker alone also says something is there to retire. */
+    @Test
+    fun bindOwner_unownedNamespaceWithOnlyTheKrxMarker_retiresItToo() {
+        val unowned = AccessEpochTransitions.markMayContainData(
+            AccessEpochTransitions.ensureNamespace(AccessEpochRecord(), ids),
+            premium = false,
+            krx = true
+        )
+
+        val bound = AccessEpochTransitions.bindOwner(unowned, "user-b", ids)
+
+        val entry = bound.pendingPurges.single()
+        assertNull(entry.ownerUid)
+        assertEquals(unowned.krxCapabilityEpoch, entry.krxCapabilityEpoch)
+        assertEquals(unowned.userAccessEpoch, entry.userAccessEpoch)
+        assertFalse(bound.mayContainKrxData)
+    }
+
+    /** Control: a first install is unowned too, and allocating its namespace is not a teardown. */
+    @Test
+    fun bindOwner_unownedNamespaceWithoutMarkers_allocatesWithoutJournalling() {
+        val landed = AccessEpochTransitions.signOut(bound(), ids)
+
+        val bound = AccessEpochTransitions.bindOwner(landed, "user-b", ids)
+
+        assertEquals("user-b", bound.ownerUid)
+        assertEquals("the landing already retired it; binding adds nothing", 1, bound.pendingPurges.size)
+        assertEquals(landed.userAccessEpoch, bound.userAccessEpoch)
+        assertTrue(AccessEpochTransitions.bindOwner(AccessEpochRecord(), "user-a", ids).pendingPurges.isEmpty())
+    }
+
+    /**
+     * Settling first changes nothing a binding does. This is the strongest form of "one teardown,
+     * one rotation": since a landing gives up the owner, the owner change that would have rotated
+     * again finds nobody there. It also says why a mutation that widens [AccessEpochTransitions]'s
+     * settle branch to every owed marker is no longer observable — both orders end in one record.
+     */
+    @Test
+    fun bindOwner_isTheSame_whetherAnOwedTeardownIsSettledFirstOrNot() {
+        val owners = listOf(null, "user-a", "user-b")
+        val owed = listOf(null, "user-a", "user-c")
+        val markers = listOf(false to false, true to false, false to true, true to true)
+        for (owner in owners) for (marker in markers) for (o in owed) for (uid in listOf("user-a", "user-b")) {
+            val seeded = AccessEpochTransitions.markMayContainData(
+                (owner?.let { bound(it) } ?: AccessEpochTransitions.ensureNamespace(AccessEpochRecord(), ids))
+                    .copy(teardownOwedFor = o),
+                premium = marker.first,
+                krx = marker.second
+            )
+            val case = "owner=$owner owed=$o markers=$marker uid=$uid"
+
+            // Two generators at the same point: equal records mean the same ids were minted in the
+            // same order, not just the same shape.
+            var directCounter = 0
+            val direct = AccessEpochTransitions.bindOwner(seeded, uid, EpochIdGenerator { "x-${directCounter++}" })
+            var settledCounter = 0
+            val settledIds = EpochIdGenerator { "x-${settledCounter++}" }
+            val settledFirst = AccessEpochTransitions.bindOwner(
+                AccessEpochTransitions.settleOwedTeardown(seeded, settledIds),
+                uid,
+                settledIds
+            )
+
+            assertEquals(case, direct, settledFirst)
+        }
+    }
+
     @Test
     fun teardownOwedFor_isNotAnAccessFact() {
         val clean = bound()
