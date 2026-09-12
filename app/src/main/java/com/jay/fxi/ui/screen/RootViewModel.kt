@@ -2,6 +2,7 @@ package com.jay.fxi.ui.screen
 
 import androidx.lifecycle.ViewModel
 import com.jay.fxi.data.auth.AuthTokenProvider
+import com.jay.fxi.data.entitlements.IdentityRecoveryState
 import com.jay.fxi.data.entitlements.OwnedPremiumAccess
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.PremiumAccessState
@@ -20,7 +21,7 @@ import kotlinx.coroutines.flow.StateFlow
  */
 @HiltViewModel
 class RootViewModel @Inject constructor(
-    coordinator: PremiumAccessCoordinator,
+    private val coordinator: PremiumAccessCoordinator,
     private val authTokenProvider: AuthTokenProvider
 ) : ViewModel() {
     /**
@@ -31,6 +32,24 @@ class RootViewModel @Inject constructor(
      * previous user's `PremiumConfirmed` is otherwise what Root would branch on.
      */
     val access: StateFlow<OwnedPremiumAccess> = coordinator.state
+
+    /**
+     * What a surface may say about identity work that has not finished. See [IdentityRecoveryState].
+     *
+     * `internal` because the state type is — a public member of this public class could not expose it.
+     */
+    internal val identityRecovery: StateFlow<IdentityRecoveryState> = coordinator.identityRecovery
+
+    /**
+     * Records a re-check for the hold named by [holdId].
+     *
+     * The answer is whether a wake was recorded, never how the re-check went. `false` covers no hold,
+     * a different hold and a wake already standing; a surface does not branch on it, because anything
+     * that actually changed reaches it through [identityRecovery].
+     *
+     * Suspending, so the caller's scope owns it and a test can call and await it directly.
+     */
+    internal suspend fun requestRecheck(holdId: Long): Boolean = coordinator.retryPersistence(holdId)
 
     fun accessForSession(signedInUid: String?, ownedAccess: OwnedPremiumAccess): PremiumAccessState {
         // Root calls this on every recomposition driven by its existing auth/access StateFlows.

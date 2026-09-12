@@ -22,6 +22,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -50,6 +51,7 @@ import com.jay.fxi.ui.theme.Primary
 import com.jay.fxi.ui.theme.PrimaryText
 import com.jay.fxi.ui.theme.SecondaryText
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import javax.inject.Provider
 
 @Composable
@@ -111,53 +113,63 @@ private fun ArmedRootScreen(
         if (accessForSession == PremiumAccessState.PremiumConfirmed) showPaywall = false
     }
 
-    // The whole Root decision, in one pure call. `isLoadingInitial` is gone with it: D23 sends
-    // `Resolving` to the free surface rather than to a spinner, because a local purchase flag is
-    // not an access answer and waiting on one is what let a stale grant open the premium surface.
-    when (rootDestinationFor(authState, accessForSession)) {
-        RootDestination.Splash -> SplashScreen()
+    // Drawn under the D24 gate only: `RootScreen` returns before reaching this function when the build
+    // is not admitted, so the released-off surface stays free of any clickable node.
+    val recovery by rootViewModel.identityRecovery.collectAsStateWithLifecycle()
+    val recheckScope = rememberCoroutineScope()
 
-        // No preview. `ANDROID_V2_PLAN.md` removes the signed-out sample surface outright.
-        RootDestination.Login -> LoginScreen()
+    IdentityRecoveryHost(
+        notice = recoveryNoticeFor(recovery),
+        onRecheck = { holdId -> recheckScope.launch { rootViewModel.requestRecheck(holdId) } }
+    ) {
+        // The whole Root decision, in one pure call. `isLoadingInitial` is gone with it: D23 sends
+        // `Resolving` to the free surface rather than to a spinner, because a local purchase flag is
+        // not an access answer and waiting on one is what let a stale grant open the premium surface.
+        when (rootDestinationFor(authState, accessForSession)) {
+            RootDestination.Splash -> SplashScreen()
 
-        RootDestination.FreeSnapshot -> {
-            val user = (authState as? AuthState.SignedIn)?.user
-            if (user == null) {
-                SplashScreen()
-            } else {
-                Box(modifier = Modifier.fillMaxSize()) {
-                    FreeSnapshotRoute(
-                        uid = user.uid,
-                        onSignOut = { authViewModel.signOut() },
-                        onSubscribe = { showPaywall = true },
-                        userInfo = user,
-                        isActive = !showPaywall
-                    )
-                    if (showPaywall) {
-                        // Absorb taps behind the paywall so the surface underneath stays inert,
-                        // while leaving the paywall's own scrolling and buttons alone.
-                        val interactionSource = remember { MutableInteractionSource() }
-                        Box(modifier = Modifier.fillMaxSize()) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .clickable(
-                                        interactionSource = interactionSource,
-                                        indication = null,
-                                        onClick = {}
-                                    )
-                            )
-                            PaywallScreen(
-                                subscriptionManager = subscriptionManager,
-                                onClose = { showPaywall = false }
-                            )
+            // No preview. `ANDROID_V2_PLAN.md` removes the signed-out sample surface outright.
+            RootDestination.Login -> LoginScreen()
+
+            RootDestination.FreeSnapshot -> {
+                val user = (authState as? AuthState.SignedIn)?.user
+                if (user == null) {
+                    SplashScreen()
+                } else {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        FreeSnapshotRoute(
+                            uid = user.uid,
+                            onSignOut = { authViewModel.signOut() },
+                            onSubscribe = { showPaywall = true },
+                            userInfo = user,
+                            isActive = !showPaywall
+                        )
+                        if (showPaywall) {
+                            // Absorb taps behind the paywall so the surface underneath stays inert,
+                            // while leaving the paywall's own scrolling and buttons alone.
+                            val interactionSource = remember { MutableInteractionSource() }
+                            Box(modifier = Modifier.fillMaxSize()) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .clickable(
+                                            interactionSource = interactionSource,
+                                            indication = null,
+                                            onClick = {}
+                                        )
+                                )
+                                PaywallScreen(
+                                    subscriptionManager = subscriptionManager,
+                                    onClose = { showPaywall = false }
+                                )
+                            }
                         }
                     }
                 }
             }
-        }
 
-        RootDestination.Premium -> PremiumUnavailableScreen()
+            RootDestination.Premium -> PremiumUnavailableScreen()
+        }
     }
 }
 

@@ -9,6 +9,7 @@ import com.jay.fxi.data.entitlements.AccessEpochStore
 import com.jay.fxi.data.entitlements.AccessEpochTransitions
 import com.jay.fxi.data.entitlements.CapabilityScopePurger
 import com.jay.fxi.data.entitlements.boundGeneration
+import com.jay.fxi.data.entitlements.heldByPersistence
 import com.jay.fxi.data.entitlements.EntitlementsIdentity
 import com.jay.fxi.data.entitlements.EntitlementsOutcome
 import com.jay.fxi.data.entitlements.EntitlementsResult
@@ -29,7 +30,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
+import java.io.IOException
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -124,6 +129,43 @@ class RootViewModelTest {
         }
     }
 
+    /**
+     * Root reads the coordinator's own flow rather than a copy, so there is no second value that can
+     * fall behind the first.
+     */
+    @Test
+    fun identityRecovery_isTheCoordinatorsFlow() = runTest {
+        val fixture = Fixture(this)
+        try {
+            assertSame(fixture.coordinator.identityRecovery, fixture.root.identityRecovery)
+        } finally {
+            fixture.processJob.cancel()
+        }
+    }
+
+    /**
+     * A re-check is recorded against the hold that is standing, once, and nothing else is accepted.
+     * The `true`/`false` here is the wake being recorded or refused — not the re-check's outcome.
+     */
+    @Test
+    fun requestRecheck_recordsOneWakeForTheStandingHoldAndRefusesOthers() = runTest {
+        val fixture = Fixture(this)
+        try {
+            assertFalse("보류가 없는데 깨우기가 기록됐다", fixture.root.requestRecheck(0L))
+
+            fixture.store.failNextBind = true
+            val held = fixture.coordinator
+                .onIdentityChanged(AuthIdentityFence(OWNER, 7L))
+                .heldByPersistence("bind 실패로 열린 보류")
+
+            assertFalse("다른 id 가 서 있는 보류를 깨웠다", fixture.root.requestRecheck(held.id + 1))
+            assertTrue("서 있는 보류의 id 로 깨우기가 기록되지 않았다", fixture.root.requestRecheck(held.id))
+            assertFalse("이미 선 깨우기가 두 번 기록됐다", fixture.root.requestRecheck(held.id))
+        } finally {
+            fixture.processJob.cancel()
+        }
+    }
+
     private class Fixture(testScope: TestScope) {
         val processJob = SupervisorJob()
         private val scope = CoroutineScope(processJob + StandardTestDispatcher(testScope.testScheduler))
@@ -143,9 +185,10 @@ class RootViewModelTest {
                     EntitlementsOutcome.StableActive(krxVisible = false)
                 )
         }
-        private val coordinator = PremiumAccessCoordinator(
+        val store = MemoryStore()
+        val coordinator = PremiumAccessCoordinator(
             source = source,
-            store = MemoryStore(),
+            store = store,
             userPurger = UserScopePurger { PurgeResult.Completed },
             capabilityPurger = CapabilityScopePurger { PurgeResult.Completed },
             scope = scope,
@@ -166,12 +209,19 @@ class RootViewModelTest {
     }
 
     private class MemoryStore : AccessEpochStore {
+        /** The next `bindOwner` fails before touching the record, so the edit's outcome is known: nothing. */
+        var failNextBind = false
         private var record = AccessEpochRecord()
         private var nextId = 0
         private val ids = EpochIdGenerator { "epoch-${nextId++}" }
         override suspend fun load() = record
-        override suspend fun bindOwner(uid: String) =
-            AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
+        override suspend fun bindOwner(uid: String): AccessEpochRecord {
+            if (failNextBind) {
+                failNextBind = false
+                throw IOException("injected bind failure")
+            }
+            return AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
+        }
         override suspend fun signOut() =
             AccessEpochTransitions.signOut(record, ids).also { record = it }
         override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean) =
