@@ -8,6 +8,7 @@ import com.jay.fxi.data.entitlements.AccessEpochRecord
 import com.jay.fxi.data.entitlements.AccessEpochStore
 import com.jay.fxi.data.entitlements.AccessEpochTransitions
 import com.jay.fxi.data.entitlements.CapabilityScopePurger
+import com.jay.fxi.data.entitlements.boundGeneration
 import com.jay.fxi.data.entitlements.EntitlementsIdentity
 import com.jay.fxi.data.entitlements.EntitlementsOutcome
 import com.jay.fxi.data.entitlements.EntitlementsResult
@@ -159,7 +160,7 @@ class RootViewModelTest {
             // against a session that never existed.
             val observed = identity!!
             val binding =
-                coordinator.onIdentityChanged(AuthIdentityFence(observed.uid, observed.authGeneration))
+                coordinator.onIdentityChanged(AuthIdentityFence(observed.uid, observed.authGeneration)).boundGeneration()
             coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = binding)
         }
     }

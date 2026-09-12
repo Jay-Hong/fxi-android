@@ -15,6 +15,10 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+
+/** Between automatic persistence rounds. Long enough that a transient disk fault can clear. */
+private const val DEFAULT_PERSISTENCE_RETRY_DELAY_MILLIS = 2_000L
 
 /**
  * Owns the D23 access state and serialises every input that can change it.
@@ -36,8 +40,10 @@ class PremiumAccessCoordinator(
     private val userPurger: UserScopePurger,
     private val capabilityPurger: CapabilityScopePurger,
     private val scope: CoroutineScope,
-    clock: RecheckClock,
+    private val clock: RecheckClock,
     private val jitter: ProbeJitter = ProbeJitter.Default,
+    /** Delay between automatic persistence rounds. A policy value, injected so a test can pin it. */
+    private val persistenceRetryDelayMillis: Long = DEFAULT_PERSISTENCE_RETRY_DELAY_MILLIS,
     /**
      * The live auth fence, read from the auth tracker — the same read an app sign-out captures its
      * fence with. Not [EntitlementsSource.currentIdentity], which turns a lookup failure other than
@@ -116,6 +122,50 @@ class PremiumAccessCoordinator(
     /** The identity event held by a failed edit, until that same event is applied. Guarded by [mutex]. */
     private var heldEvent: HeldIdentityEvent? = null
 
+    /**
+     * The head task whose disk work failed with no sign-out attempt to own the outcome.
+     *
+     * An open attempt records its own unresolved edits and its recovery settles them. Without one,
+     * the same failure used to leave the consumer with an exception and nothing to retry. While
+     * this is set the record on disk may or may not match what [state] already published, so access
+     * queries are refused — but the head task itself may still run, or nothing would ever clear it.
+     *
+     * Guarded by [mutex]. Ids are never reused.
+     */
+    private var identityPersistencePending: PendingPersistence? = null
+    private var nextPendingId: Long = 0L
+
+    private val _persistenceSignal = MutableStateFlow<PendingPersistence?>(null)
+
+    /** Access is refused while a sign-out attempt is open **or** a persistence hold is unresolved. */
+    private fun accessAdmittedLocked(): Boolean =
+        SignOutAttemptPolicy.admitsAccessQueries(attempt) && identityPersistencePending == null
+
+    /** Publishes the hold so waiters see the revision they were handed move. */
+    private fun setPendingLocked(pending: PendingPersistence?) {
+        identityPersistencePending = pending
+        _persistenceSignal.value = pending
+    }
+
+    /**
+     * Where a stalled head task left its work, named so the caller knows what to wait on.
+     *
+     * Which of the two it is follows from [open] and not from the failure: an attempt that owns the
+     * edit records it, and only a task with no attempt opens a hold. Both are read *after* the
+     * failure was recorded, so the revision handed out is one a waiter can observe from.
+     */
+    private fun stalledLocked(open: SignOutAttempt?): IdentityStep =
+        if (open == null) {
+            val pending = checkNotNull(identityPersistencePending) {
+                "an unowned edit failed without opening a hold"
+            }
+            IdentityStep.AwaitPersistence(
+                pending.id, pending.revision, pending.nextAttemptAt, pending.blocked
+            )
+        } else {
+            IdentityStep.AwaitAttempt(open.ticket, attemptSignal.value.revision)
+        }
+
     /** The attempt whose automatic recovery has been claimed. Tickets are never reused. Guarded by [mutex]. */
     private var recoveryClaimed: SignOutTicket? = null
 
@@ -149,14 +199,15 @@ class PremiumAccessCoordinator(
      * one observation with the generation of another. It can also advance the tracker if it sees
      * a changed uid or session marker; an unchanged observation does not advance it.
      *
-     * Returns null, having done nothing, while an open sign-out has an edit in flight. The caller
-     * keeps the event and tries again once [awaitIdentityEventsAdmitted] returns. It also returns
-     * null when its own edit fails while an attempt is open: see [identityEditLocked].
+     * Does nothing and reports [IdentityStep.AwaitAttempt] while an open sign-out has an edit in
+     * flight; the caller keeps the event and tries again. The same answer comes back when its own
+     * edit fails under an open attempt. With no attempt, a failed edit reports
+     * [IdentityStep.AwaitPersistence] instead — see [identityEditLocked].
      */
-    suspend fun onIdentityChanged(identity: AuthIdentityFence): AccessDecisionGeneration? = mutex.withLock {
+    internal suspend fun onIdentityChanged(identity: AuthIdentityFence): IdentityStep = mutex.withLock {
         // Checked under the same lock as the edit below: a gate seen open before this lock was
         // taken can have closed since.
-        if (!SignOutAttemptPolicy.admitsIdentityEvents(attempt)) return@withLock null
+        if (!SignOutAttemptPolicy.admitsIdentityEvents(attempt)) return@withLock stalledLocked(attempt)
         val open = attempt
         heldEvent?.let { pending ->
             check(pending is HeldIdentityEvent.Bind && pending.fence == identity && pending.ticket == open?.ticket) {
@@ -174,12 +225,12 @@ class PremiumAccessCoordinator(
         _krx.value = KrxCapabilityState.HIDDEN
         schedule.cancel(preserveServerFloor = true)
         val held = { HeldIdentityEvent.Bind(checkNotNull(open).ticket, identity) }
-        val before = identityEditLocked(open, PendingEdit.READ, before = null, held) { store.load() }
-            ?: return@withLock null
-        val after = identityEditLocked(open, PendingEdit.BIND_OWNER, before, held) { store.bindOwner(identity.uid) }
-            ?: return@withLock null
-        completedBinding = identity
-        heldEvent = null
+        val work = IdentityWork.Bind(identity)
+        val before = identityEditLocked(open, PendingEdit.READ, before = null, held, work) { store.load() }
+            ?: return@withLock stalledLocked(open)
+        val after = identityEditLocked(open, PendingEdit.BIND_OWNER, before, held, work) { store.bindOwner(identity.uid) }
+            ?: return@withLock stalledLocked(open)
+        adoptLandingLocked(work)
         // Judged from the record the bind returned, before any purge below can clear its receipt.
         open?.let { current ->
             setAttemptLocked(
@@ -189,13 +240,10 @@ class PremiumAccessCoordinator(
                 )
             )
         }
-        _krx.value = KrxCapabilityState.HIDDEN
-        _lastEffects.value = emptyList()
-        cleanupLocked()
-        // Handed back so the caller can bind its follow-up query to *this* binding. A query queued
-        // behind a sign-out would otherwise start under the next generation and revive a session
-        // that is gone.
-        AccessDecisionGeneration(decisionGeneration)
+        // The completion carries the generation, so the caller can bind its follow-up query to
+        // *this* binding. A query queued behind a sign-out would otherwise start under the next
+        // generation and revive a session that is gone.
+        cleanupAndFinishLocked(work, completionFor(work))
     }
 
     /**
@@ -205,9 +253,9 @@ class PremiumAccessCoordinator(
      * namespace and journals a purge. Clearing only in-memory state would let the next sign-in of
      * the same uid inherit protected data that was never re-authorised.
      */
-    suspend fun onSignedOut(ended: AuthIdentityFence): Boolean = mutex.withLock {
+    internal suspend fun onSignedOut(ended: AuthIdentityFence): IdentityStep = mutex.withLock {
         // Same contract as [onIdentityChanged]: held, untouched, while an edit is in flight.
-        if (!SignOutAttemptPolicy.admitsIdentityEvents(attempt)) return@withLock false
+        if (!SignOutAttemptPolicy.admitsIdentityEvents(attempt)) return@withLock stalledLocked(attempt)
         val open = attempt
         val retry = heldEvent
         if (retry != null) {
@@ -227,24 +275,25 @@ class PremiumAccessCoordinator(
         _state.value = OwnedPremiumAccess(null, null, PremiumAccessState.NoGrant)
         _krx.value = KrxCapabilityState.HIDDEN
         schedule.cancel(preserveServerFloor = true)
-        // A retried end whose rotation a read-back found landed uses that result: rotating again
-        // would take down the namespace minted by the first rotation.
+        // A retried end whose rotation a read-back found landed uses that result. Not because
+        // rotating again would destroy anything — slice 5 made `signOut` give up the owner, so
+        // `planEnd` answers LEAVE_DISK — but because a blind retry reads as NotAttempted and throws
+        // away the knowledge that it landed.
+        val endWork = IdentityWork.End(ended)
         val rotation = (retry as? HeldIdentityEvent.End)?.receipt ?: run {
             val held = { HeldIdentityEvent.End(checkNotNull(open).ticket, ended) }
-            val before = identityEditLocked(open, PendingEdit.READ, before = null, held) { store.load() }
-                ?: return@withLock false
+            val before = identityEditLocked(open, PendingEdit.READ, before = null, held, endWork) { store.load() }
+                ?: return@withLock stalledLocked(open)
             // Targeted: `store.signOut()` rotates whoever the record names, so it only runs when that
             // is the uid whose session ended.
             when (SignOutAttemptPolicy.planEnd(ended, before.ownerUid)) {
                 SignOutAttemptPolicy.EndPlan.ROTATE -> EditResult.Landed(
-                    identityEditLocked(open, PendingEdit.END, before, held) { store.signOut() }
-                        ?: return@withLock false
+                    identityEditLocked(open, PendingEdit.END, before, held, endWork) { store.signOut() }
+                        ?: return@withLock stalledLocked(open)
                 )
                 SignOutAttemptPolicy.EndPlan.LEAVE_DISK -> EditResult.NotAttempted
             }
         }
-        completedBinding = null
-        heldEvent = null
         // What this end did is recorded before cleanup runs, because cleanup can fail. Only
         // finishing the attempt — which releases the seal — waits for it.
         val finishing = open?.let { current ->
@@ -253,10 +302,8 @@ class PremiumAccessCoordinator(
             setAttemptLocked(next ?: SignOutAttempt.Recovering(current.ticket, current.fence, TeardownKnowledge.LANDED))
             next == null
         } ?: false
-        val cleanupOk = cleanupLocked()
-        // Read again after the last suspension: somebody may have signed in during cleanup.
-        if (finishing && cleanupOk && liveFence() == null) setAttemptLocked(null)
-        true
+        adoptLandingLocked(endWork)
+        cleanupAndFinishLocked(endWork, completionFor(endWork), finishing)
     }
 
     /**
@@ -267,6 +314,14 @@ class PremiumAccessCoordinator(
      * access entry points before disk work.
      */
     internal suspend fun prepareSignOut(fence: AuthIdentityFence): SignOutStart = mutex.withLock {
+        // Ordering, not exclusion: the app's request goes through the identity FIFO, and a head task
+        // with an unresolved hold has not returned, so this body is unreachable while one stands.
+        // Reaching it with a hold means somebody bypassed the queue. Unowned recovery assumes no
+        // attempt is open — it edits through the unowned path, which records holds rather than the
+        // attempt's unresolved edit — so reject that overlap before creating an attempt.
+        check(identityPersistencePending == null) {
+            "a sign-out prepared while an identity hold is unresolved: $identityPersistencePending"
+        }
         when (val request = SignOutAttemptPolicy.request(attempt, fence)) {
             is SignOutAttemptPolicy.Request.Joined -> return@withLock SignOutStart.Joined(request.ticket)
             is SignOutAttemptPolicy.Request.Busy -> return@withLock SignOutStart.Busy(request.ticket)
@@ -371,11 +426,28 @@ class PremiumAccessCoordinator(
         edit: PendingEdit,
         before: AccessEpochRecord?,
         held: () -> HeldIdentityEvent?,
+        /** What is being persisted, for the hold a failure opens when no attempt owns it. */
+        work: IdentityWork,
+        step: suspend () -> T
+    ): T? =
+        if (open == null) unownedEditLocked(work, edit, before, step)
+        else ownedEditLocked(open, edit, before, held, step)
+
+    /**
+     * One disk step of an event an open attempt owns.
+     *
+     * A failure becomes that attempt's unresolved edit, and its recovery settles it. Nothing is
+     * thrown at the consumer: the FIFO item is held and retried in place.
+     */
+    private suspend fun <T : Any> ownedEditLocked(
+        open: SignOutAttempt,
+        edit: PendingEdit,
+        before: AccessEpochRecord?,
+        held: () -> HeldIdentityEvent?,
         step: suspend () -> T
     ): T? = try {
         step()
     } catch (failed: Exception) {
-        if (open == null) throw failed
         setAttemptLocked(SignOutAttemptPolicy.editFailed(open, edit, before))
         heldEvent = held()
         // A store can throw CancellationException of its own. Only this caller's cancellation ends here.
@@ -384,13 +456,362 @@ class PremiumAccessCoordinator(
     }
 
     /**
+     * One disk step with no attempt to own the outcome.
+     *
+     * This used to throw, and the consumer that called it has no handler — a disk fault took the
+     * process. The failure now opens a persistence hold instead: the disk may or may not have taken
+     * the edit, and only this head task can find out.
+     */
+    private suspend fun <T : Any> unownedEditLocked(
+        work: IdentityWork,
+        edit: PendingEdit,
+        before: AccessEpochRecord?,
+        step: suspend () -> T
+    ): T? = try {
+        step()
+    } catch (failed: Exception) {
+        holdPersistenceLocked(work, edit, before)
+        currentCoroutineContext().ensureActive()
+        null
+    }
+
+    private fun holdPersistenceLocked(work: IdentityWork, edit: PendingEdit, before: AccessEpochRecord?) {
+        openOrExtendHoldLocked(work, PendingPersistence.Phase.Unknown(edit, before))
+    }
+
+    /**
+     * Opens the hold for [work] at [phase], or moves an existing one to it, and schedules a round.
+     *
+     * A failure inside an existing hold keeps that hold's id and budget: minting a new one would
+     * hand every failure a fresh three rounds. Different work replaces the hold — it is a different
+     * head task, and the old one is not this task's to finish.
+     */
+    private fun openOrExtendHoldLocked(work: IdentityWork, phase: PendingPersistence.Phase) {
+        val existing = identityPersistencePending
+        setPendingLocked(
+            if (existing != null && existing.work == work) {
+                PersistenceRecoveryPolicy.afterFailedRound(
+                    existing.copy(phase = phase),
+                    now = clock.elapsedMillis(),
+                    delayMillis = persistenceRetryDelayMillis,
+                    undecidable = false
+                )
+            } else {
+                PendingPersistence(
+                    id = nextPendingId++,
+                    work = work,
+                    phase = phase,
+                    revision = 0L,
+                    // The failure that opens a hold does not spend a round; the first retry does.
+                    spent = 0,
+                    nextAttemptAt = clock.elapsedMillis() + persistenceRetryDelayMillis
+                )
+            }
+        )
+    }
+
+    /** What the purge resume at the end of a head task did. */
+    private enum class CleanupOutcome {
+        /**
+         * The resume was accepted. Completed entries were dropped; deferred ones stay journalled,
+         * which is what the current wiring always answers — so this does not mean the journal is
+         * empty.
+         */
+        DONE,
+
+        /** Cleanup returned false: a purger reported [PurgeResult.Failed], or an open attempt caught a throw. */
+        FAILED,
+
+        /** The resume threw with nobody to own it, so the hold parked at [PendingPersistence.Phase.CleanupPending]. */
+        HELD
+    }
+
+    /**
+     * Resumes purges at the end of a head task, holding rather than throwing when nobody owns it.
+     *
+     * A throw and a reported [PurgeResult.Failed] are not the same fact, and only the throw holds.
+     * The throw can come from the load, a purger, or the completion write — all three are inside
+     * this step — and it says nothing about what ran, so an automatic round is worth having and,
+     * without the hold, the exception would end the consumer. A normal false return means a purger
+     * answered [PurgeResult.Failed]; those entries stay journalled and are not dropped, and this
+     * slice keeps the existing behaviour of completing the identity task on it rather than locking
+     * a signed-in session out over an old namespace. Neither result says the store is healthy.
+     *
+     * The write is already on disk by the time this runs, which is why the hold parks at
+     * [PendingPersistence.Phase.CleanupPending] and not at a phase that would run the write again.
+     */
+    private suspend fun cleanupOrHoldLocked(
+        work: IdentityWork,
+        completion: IdentityCompletion
+    ): CleanupOutcome {
+        if (attempt != null) return if (cleanupLocked()) CleanupOutcome.DONE else CleanupOutcome.FAILED
+        return try {
+            if (resumePendingPurgesLocked()) CleanupOutcome.DONE else CleanupOutcome.FAILED
+        } catch (failed: Exception) {
+            openOrExtendHoldLocked(work, PendingPersistence.Phase.CleanupPending(completion))
+            currentCoroutineContext().ensureActive()
+            CleanupOutcome.HELD
+        }
+    }
+
+    /**
+     * Adopts what a landed write did, in memory. Runs once, when the landing is established.
+     *
+     * Kept apart from the purge resume that follows it because only that resume can fail after the
+     * write is on disk: a hold at [PendingPersistence.Phase.CleanupPending] carries the completion
+     * this produced, so a later round finishes the task without repeating any of this.
+     */
+    private fun adoptLandingLocked(work: IdentityWork) {
+        when (work) {
+            is IdentityWork.Bind -> {
+                completedBinding = work.fence
+                _krx.value = KrxCapabilityState.HIDDEN
+                _lastEffects.value = emptyList()
+            }
+            is IdentityWork.End -> completedBinding = null
+            IdentityWork.StartupPurge -> Unit
+        }
+        heldEvent = null
+    }
+
+    /**
+     * The purge resume that ends a head task, and what it leaves behind.
+     *
+     * [finishing] is the attempt's business and is false on every recovery round, which runs with
+     * no attempt open. Finishing an open attempt here needs an accepted resume and nobody live: a
+     * reported failure means a namespace this teardown owed was not cleared, and releasing the seal
+     * over it would let the next session read what that entry was meant to erase. With no attempt,
+     * a reported failure completes the task and leaves those entries journalled, while a throw
+     * keeps the hold. Neither undoes the landing.
+     */
+    private suspend fun cleanupAndFinishLocked(
+        work: IdentityWork,
+        completion: IdentityCompletion,
+        finishing: Boolean = false
+    ): IdentityStep {
+        val cleanup = cleanupOrHoldLocked(work, completion)
+        if (cleanup == CleanupOutcome.HELD) return stalledLocked(attempt)
+        // Read again after the last suspension: somebody may have signed in during cleanup.
+        if (finishing && cleanup == CleanupOutcome.DONE && liveFence() == null) setAttemptLocked(null)
+        setPendingLocked(null)
+        return IdentityStep.Applied(completion)
+    }
+
+    /**
+     * Suspends until the hold [step] names may be worth resuming: its state moved, or its timer
+     * came due. A hint only — [resumePersistence] judges again under the lock.
+     *
+     * Both wake-ups are needed. The timer alone would sleep through a manual wake, and the signal
+     * alone would sleep through the automatic round nothing else announces.
+     */
+    internal suspend fun awaitPersistenceRetry(step: IdentityStep.AwaitPersistence) {
+        val moved = suspend {
+            _persistenceSignal.first {
+                it == null || it.id != step.id || it.revision > step.afterRevision ||
+                    // Setting the wake did raise a revision, but this step already carries the
+                    // later one the stopped batch returned. No newer revision is coming to admit
+                    // that retained wake, and asking again would only coalesce into it.
+                    (it.nextAttemptAt == null && it.wakeRequested)
+            }
+            Unit
+        }
+        val due = step.nextAttemptAt ?: return moved()
+        val remaining = due - clock.elapsedMillis()
+        if (remaining <= 0) return
+        withTimeoutOrNull(remaining) { moved() }
+    }
+
+    /**
+     * Spends one recovery round on the hold [id] names, and says where that leaves it.
+     *
+     * Admission, the disk work and the result all happen under this one lock hold. That is the
+     * other half of the single-execution guarantee the budget gives: a second resume arriving for
+     * the same deadline can only ever see the state this round left behind.
+     */
+    internal suspend fun resumePersistence(id: Long): IdentityStep = mutex.withLock {
+        val pending = identityPersistencePending ?: return@withLock IdentityStep.StaleResume(id)
+        when (val round = PersistenceRecoveryPolicy.admitRound(pending, id, clock.elapsedMillis())) {
+            PersistenceRecoveryPolicy.Round.Stale -> IdentityStep.StaleResume(id)
+            PersistenceRecoveryPolicy.Round.TooEarly,
+            PersistenceRecoveryPolicy.Round.Blocked -> stalledLocked(open = null)
+            is PersistenceRecoveryPolicy.Round.Run -> runRoundLocked(round.pending)
+        }
+    }
+
+    /**
+     * Asks for one more round on the hold [id] names, whatever its budget says.
+     *
+     * A wake only: it does not run the round. What it does is give a stopped batch something to
+     * spend, so the next resume finds work admitted. A wake that arrives while a batch is still
+     * scheduled is kept rather than spent, so it cannot skip that batch's delay.
+     */
+    internal suspend fun retryPersistence(id: Long): Boolean = mutex.withLock {
+        val pending = identityPersistencePending ?: return@withLock false
+        if (pending.id != id || pending.wakeRequested) return@withLock false
+        setPendingLocked(pending.copy(wakeRequested = true, revision = pending.revision + 1))
+        true
+    }
+
+    /**
+     * One admitted round: establish what the failed edit did, then act on that.
+     *
+     * A read-back and the work it authorises belong to the same round — the read-back is what makes
+     * the work safe to run, so charging it separately would spend the budget on knowing and leave
+     * none for doing.
+     */
+    private suspend fun runRoundLocked(admitted: PendingPersistence): IdentityStep {
+        val known = when (val phase = admitted.phase) {
+            is PendingPersistence.Phase.Unknown -> when (val resolved = resolveHeldEditLocked(admitted, phase)) {
+                is HeldEditResolution.Established -> resolved.pending
+                HeldEditResolution.Unreadable -> return failRoundLocked(admitted, undecidable = false)
+                HeldEditResolution.Undecidable -> return failRoundLocked(admitted, undecidable = true)
+            }
+            else -> admitted
+        }
+        // Published before the work runs, so this round's spent budget and established phase are
+        // the state a failure falls back to. A new edit that fails replaces ReadyToRetry with
+        // Unknown — that edit's outcome is its own question — while keeping the id and the rounds
+        // already spent. After a landing, a thrown cleanup step keeps CleanupPending and the
+        // completion it carries; a reported failure finishes the task and leaves its entries
+        // journalled.
+        setPendingLocked(known)
+        return when (val phase = known.phase) {
+            is PendingPersistence.Phase.ReadyToRetry -> rerunLocked(known, phase.before)
+            is PendingPersistence.Phase.CleanupPending ->
+                cleanupAndFinishLocked(known.work, phase.completion)
+            is PendingPersistence.Phase.Unknown -> error("a round left the outcome unknown: $known")
+        }
+    }
+
+    /** What a round learned about the edit it inherited. The two failures are not the same fact. */
+    private sealed interface HeldEditResolution {
+        data class Established(val pending: PendingPersistence) : HeldEditResolution
+
+        /** The record could not be read, so the edit is exactly as unknown as before. */
+        data object Unreadable : HeldEditResolution
+
+        /** The record matched neither the edit's result nor what it started from. */
+        data object Undecidable : HeldEditResolution
+    }
+
+    /**
+     * Establishes what a held edit did.
+     *
+     * A failed read is not read back at all: the record cannot show a write that never started, so
+     * the question has no answer to find, and asking it would spend the round on a read that can
+     * fail for the same reason the first one did. Every other edit is judged by the policy from the
+     * record as it now stands.
+     *
+     * A landing is adopted here, where it is established, and not again by the round that finishes
+     * the cleanup behind it.
+     */
+    private suspend fun resolveHeldEditLocked(
+        admitted: PendingPersistence,
+        phase: PendingPersistence.Phase.Unknown
+    ): HeldEditResolution {
+        if (!SignOutAttemptPolicy.needsReadBack(phase.edit)) {
+            return HeldEditResolution.Established(
+                admitted.copy(phase = PendingPersistence.Phase.ReadyToRetry(phase.before))
+            )
+        }
+        val readBack = try {
+            store.load()
+        } catch (failed: Exception) {
+            currentCoroutineContext().ensureActive()
+            return HeldEditResolution.Unreadable
+        }
+        return when (
+            val outcome =
+                SignOutAttemptPolicy.resolveUnownedEdit(admitted.work, phase.edit, phase.before, readBack)
+        ) {
+            is SignOutAttemptPolicy.UnownedResolution.RunAgain -> HeldEditResolution.Established(
+                admitted.copy(phase = PendingPersistence.Phase.ReadyToRetry(outcome.before))
+            )
+            SignOutAttemptPolicy.UnownedResolution.Landed -> {
+                adoptLandingLocked(admitted.work)
+                HeldEditResolution.Established(
+                    admitted.copy(
+                        phase = PendingPersistence.Phase.CleanupPending(completionFor(admitted.work))
+                    )
+                )
+            }
+            SignOutAttemptPolicy.UnownedResolution.Undecidable -> HeldEditResolution.Undecidable
+        }
+    }
+
+    /** The completion a landed write earns, by the work that landed. */
+    private fun completionFor(work: IdentityWork): IdentityCompletion = when (work) {
+        is IdentityWork.Bind ->
+            IdentityCompletion(work.fence, AccessDecisionGeneration(decisionGeneration))
+        is IdentityWork.End, IdentityWork.StartupPurge ->
+            IdentityCompletion(completed = null, queryGeneration = null)
+    }
+
+    /** Records a failed round and reports where the hold now stands. */
+    private fun failRoundLocked(admitted: PendingPersistence, undecidable: Boolean): IdentityStep {
+        setPendingLocked(
+            PersistenceRecoveryPolicy.afterFailedRound(
+                admitted,
+                now = clock.elapsedMillis(),
+                delayMillis = persistenceRetryDelayMillis,
+                undecidable = undecidable
+            )
+        )
+        return stalledLocked(open = null)
+    }
+
+    /**
+     * Runs the work again, from where the read-back says it may safely start.
+     *
+     * A null [before] means the read that precedes the write never produced one, so it runs first.
+     * The published state is not touched: the head task published it before its first edit and it
+     * has been correct ever since — the record on disk is what is behind.
+     */
+    private suspend fun rerunLocked(admitted: PendingPersistence, before: AccessEpochRecord?): IdentityStep =
+        when (val work = admitted.work) {
+            is IdentityWork.Bind -> {
+                val read = before ?: unownedEditLocked(work, PendingEdit.READ, before = null) { store.load() }
+                if (read == null) stalledLocked(open = null)
+                else {
+                    val bound = unownedEditLocked(work, PendingEdit.BIND_OWNER, read) {
+                        store.bindOwner(work.fence.uid)
+                    }
+                    if (bound == null) stalledLocked(open = null)
+                    else landAndFinishLocked(work)
+                }
+            }
+            is IdentityWork.End -> {
+                val read = before ?: unownedEditLocked(work, PendingEdit.READ, before = null) { store.load() }
+                if (read == null) stalledLocked(open = null)
+                else when (SignOutAttemptPolicy.planEnd(work.ended, read.ownerUid)) {
+                    SignOutAttemptPolicy.EndPlan.ROTATE -> {
+                        val rotated = unownedEditLocked(work, PendingEdit.END, read) { store.signOut() }
+                        if (rotated == null) stalledLocked(open = null)
+                        else landAndFinishLocked(work)
+                    }
+                    // Nothing to rotate: the record does not name the uid whose session ended.
+                    SignOutAttemptPolicy.EndPlan.LEAVE_DISK -> landAndFinishLocked(work)
+                }
+            }
+            // Nothing about a startup purge lands in the record, so its whole work *is* the cleanup.
+            IdentityWork.StartupPurge -> cleanupAndFinishLocked(work, completionFor(work))
+        }
+
+    /** A write this round put on disk: adopt it, then run the cleanup behind it. */
+    private suspend fun landAndFinishLocked(work: IdentityWork): IdentityStep {
+        adoptLandingLocked(work)
+        return cleanupAndFinishLocked(work, completionFor(work))
+    }
+
+    /**
      * Resumes purges after an edit that already landed.
      *
-     * With an attempt open, a failure — reported or thrown — is a cleanup failure: it keeps the seal
-     * and never becomes that edit's failure. With none open it propagates as it always has.
+     * Requires an open attempt: [cleanupOrHoldLocked] owns the case where nobody does. A failure —
+     * reported or thrown — is that attempt's cleanup failure, so it keeps the seal and never becomes
+     * the edit's failure. The caller's own cancellation still propagates.
      */
     private suspend fun cleanupLocked(): Boolean {
-        if (attempt == null) return resumePendingPurgesLocked()
+        check(attempt != null) { "cleanupLocked requires an open sign-out attempt" }
         return try {
             resumePendingPurgesLocked()
         } catch (failed: Exception) {
@@ -473,7 +894,7 @@ class PremiumAccessCoordinator(
 
     private suspend fun settleLocked(open: SignOutAttempt.Recovering): RecoveryAdvance {
         if (heldEvent != null) return RecoveryAdvance.NEEDS_BARRIER
-        val disk = identityEditLocked(open, PendingEdit.READ, before = null, held = { null }) { store.load() }
+        val disk = ownedEditLocked(open, PendingEdit.READ, before = null, held = { null }) { store.load() }
             ?: return RecoveryAdvance.UNRESOLVED
         return when (SignOutAttemptPolicy.recover(open, disk)) {
             // Targeted: recover() asks for this only while the disk names the attempt's uid as owner.
@@ -537,10 +958,10 @@ class PremiumAccessCoordinator(
         // Sealed onto the candidate before the disk work, as any binding is.
         _state.value = OwnedPremiumAccess(candidate.uid, candidate.authGeneration, PremiumAccessState.NoGrant)
         schedule.cancel(preserveServerFloor = true)
-        val before = identityEditLocked(open, PendingEdit.READ, before = null, held = {
+        val before = ownedEditLocked(open, PendingEdit.READ, before = null, held = {
             HeldIdentityEvent.Barrier(open.ticket, candidate, BarrierBind.NotStarted)
         }) { store.load() } ?: return barrierOutcome(BarrierStep.HELD)
-        val after = identityEditLocked(open, PendingEdit.BIND_OWNER, before, held = {
+        val after = ownedEditLocked(open, PendingEdit.BIND_OWNER, before, held = {
             HeldIdentityEvent.Barrier(open.ticket, candidate, BarrierBind.Unknown(before))
         }) { store.bindOwner(candidate.uid) } ?: return barrierOutcome(BarrierStep.HELD)
         completedBinding = candidate
@@ -659,7 +1080,7 @@ class PremiumAccessCoordinator(
         val run = mutex.withLock {
             // Establish admission, live identity and persisted ownership while holding this lock.
             // A landed sign-out without a subsequent bind is also refused by the null-owner check.
-            if (!SignOutAttemptPolicy.admitsAccessQueries(attempt)) return
+            if (!accessAdmittedLocked()) return
             val live = source.currentIdentity() ?: return
             val owner = store.load().ownerUid ?: return
             if (owner != live.ownerUid) return
@@ -706,6 +1127,10 @@ class PremiumAccessCoordinator(
         mutex.withLock {
             // An unresolved edit's receipt is a journal entry; purging before its read-back erases it.
             if (attempt is SignOutAttempt.Unresolved) return@withLock
+            // The same rule for an edit no attempt owns. What the journal carries is the evidence
+            // an unowned END read-back needs; the guard covers every Unknown phase because the
+            // phase alone does not say which edit is waiting.
+            if (identityPersistencePending?.phase is PendingPersistence.Phase.Unknown) return@withLock
             resumePendingPurgesLocked()
         }
     }
@@ -729,7 +1154,7 @@ class PremiumAccessCoordinator(
         var token: Long? = null
         val started: StartedQuery = mutex.withLock {
             // First, ahead of the schedule and the store: an open sign-out admits no query at all.
-            if (!SignOutAttemptPolicy.admitsAccessQueries(attempt)) return
+            if (!accessAdmittedLocked()) return
             if (requireProbeEpoch != null && probeEpoch != requireProbeEpoch) return
             // The caller pinned this query to a binding. `launch` gives no ordering guarantee
             // against a sign-out that ran while it was still queued, and by the time this body runs
@@ -790,7 +1215,7 @@ class PremiumAccessCoordinator(
     /** Feeds a WebSocket topic rejection into the same reducer. Not produced by the REST path. */
     suspend fun onTopicRejected(code: TopicRejection) {
         val started = mutex.withLock {
-            if (!SignOutAttemptPolicy.admitsAccessQueries(attempt)) return
+            if (!accessAdmittedLocked()) return
             StartedQuery(store.load().fence(), decisionGeneration, boundIdentityLocked())
         }
         val outcome = when (code) {
@@ -850,7 +1275,7 @@ class PremiumAccessCoordinator(
         // locks are released.
         mutex.withLock {
             // An answer landing while a sign-out is open is dropped without arming anything.
-            if (!SignOutAttemptPolicy.admitsAccessQueries(attempt)) return
+            if (!accessAdmittedLocked()) return
             val record = store.load()
             // Five independent staleness checks, because each catches something the others miss:
             //  - generation: an authoritative loss or reset that rotated nothing,

@@ -10,6 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -247,8 +248,8 @@ class PremiumAccessCoordinatorSignOutTest {
 
         assertTrue(h.coordinator.prepareSignOut(a7) is SignOutStart.RecoveryRequired)
         val signOutsBefore = h.store.signOuts
-        assertNull("결과를 모르는 편집 뒤에 신원 사건이 적용됐다", h.coordinator.onIdentityChanged(b3))
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onIdentityChanged(b3).heldByAttempt("결과를 모르는 편집 뒤의 신원 사건")
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
         assertEquals(signOutsBefore, h.store.signOuts)
     }
 
@@ -282,8 +283,8 @@ class PremiumAccessCoordinatorSignOutTest {
 
         val loadsBefore = h.store.loads
         h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
-        assertNull(h.coordinator.onIdentityChanged(a8))
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onIdentityChanged(a8).heldByAttempt()
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
         assertEquals(loadsBefore, h.store.loads)
         assertEquals(PremiumAccessState.NoGrant, h.coordinator.state.value.state)
     }
@@ -308,7 +309,7 @@ class PremiumAccessCoordinatorSignOutTest {
         assertNull(h.store.record.teardownOwedFor)
         // Handed to recovery, not left unresolved: the next identity event is admitted.
         h.store.afterLoad = {}
-        assertNotNull(h.coordinator.onIdentityChanged(a8))
+        h.coordinator.onIdentityChanged(a8).applied()
     }
 
     // The seal
@@ -363,7 +364,7 @@ class PremiumAccessCoordinatorSignOutTest {
         assertTrue(h.coordinator.prepareSignOut(a7) is SignOutStart.Armed)
         h.setLive(null)
 
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
 
         assertEquals(1, h.store.signOuts)
         assertNull(h.store.record.teardownOwedFor)
@@ -378,7 +379,7 @@ class PremiumAccessCoordinatorSignOutTest {
         val armed = h.coordinator.prepareSignOut(a7) as SignOutStart.Armed
         h.setLive(a8)
 
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
 
         assertEquals(SignOutStart.Joined(armed.ticket), h.coordinator.prepareSignOut(a7))
     }
@@ -391,7 +392,7 @@ class PremiumAccessCoordinatorSignOutTest {
         h.setLive(null)
         h.purger.beforeAnswer = { h.setLive(a8) }
 
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
 
         assertEquals(SignOutStart.Joined(armed.ticket), h.coordinator.prepareSignOut(a7))
     }
@@ -405,7 +406,7 @@ class PremiumAccessCoordinatorSignOutTest {
         h.setLive(a8)
         h.purger.beforeAnswer = { h.setLive(null) }
 
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
 
         assertEquals(SignOutStart.Joined(armed.ticket), h.coordinator.prepareSignOut(a7))
     }
@@ -415,7 +416,7 @@ class PremiumAccessCoordinatorSignOutTest {
         val h = harness()
         h.coordinator.onIdentityChanged(a7)
         h.setLive(null)
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
         // The tracker names a7 again with no binding observed for it since that end.
         h.setLive(a7)
 
@@ -430,7 +431,7 @@ class PremiumAccessCoordinatorSignOutTest {
         h.setLive(null)
         h.purger.result = PurgeResult.Failed(IOException("purge"))
 
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
 
         assertEquals(SignOutStart.Joined(armed.ticket), h.coordinator.prepareSignOut(a7))
     }
@@ -441,7 +442,7 @@ class PremiumAccessCoordinatorSignOutTest {
         h.coordinator.onIdentityChanged(a7)
         h.store.record = AccessEpochTransitions.bindOwner(h.store.record, b3.uid) { "foreign-epoch" }
 
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
 
         assertEquals("다른 계정의 namespace 를 회전시켰다", 0, h.store.signOuts)
     }
@@ -478,12 +479,12 @@ class PremiumAccessCoordinatorSignOutTest {
         h.setLive(b3)
         h.store.bindFault = EditFault.BEFORE_WRITE
 
-        assertNull(h.coordinator.onIdentityChanged(b3))
-        assertFalse("읽어 보기 전에 뒤 사건이 적용됐다", h.coordinator.onSignedOut(a7))
+        h.coordinator.onIdentityChanged(b3).heldByAttempt()
+        h.coordinator.onSignedOut(a7).heldByAttempt("읽어 보기 전의 뒤 사건")
         assertEquals(0, h.store.signOuts)
 
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
-        assertNotNull(h.coordinator.onIdentityChanged(b3))
+        h.coordinator.onIdentityChanged(b3).applied()
         assertEquals(b3.uid, h.store.record.ownerUid)
     }
 
@@ -494,10 +495,10 @@ class PremiumAccessCoordinatorSignOutTest {
         h.setLive(a8)
         h.store.bindFault = EditFault.AFTER_WRITE
 
-        assertNull(h.coordinator.onIdentityChanged(a8))
+        h.coordinator.onIdentityChanged(a8).heldByAttempt()
         val journal = h.store.record.pendingPurges
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
-        assertNotNull(h.coordinator.onIdentityChanged(a8))
+        h.coordinator.onIdentityChanged(a8).applied()
 
         assertEquals("착지한 bind 를 재시도하며 다시 회전했다", journal, h.store.record.pendingPurges)
     }
@@ -511,13 +512,13 @@ class PremiumAccessCoordinatorSignOutTest {
         h.setLive(a8)
         h.store.bindFault = EditFault.AFTER_WRITE
 
-        assertNull(h.coordinator.onIdentityChanged(a8))
+        h.coordinator.onIdentityChanged(a8).heldByAttempt()
         h.coordinator.resumePendingPurges()
 
         assertEquals("재읽기 전에 정리가 돌았다", 0, h.purger.purges)
         assertTrue(h.store.record.pendingPurges.any { it.userAccessEpoch == epochBefore })
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
-        assertNotNull(h.coordinator.onIdentityChanged(a8))
+        h.coordinator.onIdentityChanged(a8).applied()
         assertFalse(h.store.record.pendingPurges.any { it.userAccessEpoch == epochBefore })
     }
 
@@ -528,16 +529,16 @@ class PremiumAccessCoordinatorSignOutTest {
         h.setLive(null)
         h.store.signOutFault = EditFault.AFTER_WRITE
 
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
 
         assertEquals("착지한 종료를 다시 회전했다", 1, h.store.signOuts)
         // Finished: judged afresh, and nobody is signed in to sign out.
         assertEquals(SignOutStart.Stale, h.coordinator.prepareSignOut(a7))
         // The retry consumed what it was holding: the next event is an ordinary one.
         h.setLive(b3)
-        assertNotNull(h.coordinator.onIdentityChanged(b3))
+        h.coordinator.onIdentityChanged(b3).applied()
     }
 
     @Test
@@ -548,9 +549,9 @@ class PremiumAccessCoordinatorSignOutTest {
         h.store.signOutFault = EditFault.BEFORE_WRITE
         val journal = h.store.record.pendingPurges.size
 
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
 
         assertEquals(journal + 1, h.store.record.pendingPurges.size)
         assertEquals(SignOutStart.Stale, h.coordinator.prepareSignOut(a7))
@@ -562,7 +563,7 @@ class PremiumAccessCoordinatorSignOutTest {
         val ticket = armed(h)
         h.setLive(null)
         h.store.signOutFault = EditFault.BEFORE_WRITE
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
         h.store.record = AccessEpochTransitions.markMayContainData(h.store.record, premium = true, krx = true)
 
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
@@ -574,11 +575,11 @@ class PremiumAccessCoordinatorSignOutTest {
         val ticket = armed(h)
         h.setLive(null)
         h.store.signOutFault = EditFault.BEFORE_WRITE
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
         h.store.record = h.store.record.copy(userAccessEpoch = "not-from-any-rotation")
 
         assertEquals(EditResolution.INCONSISTENT, h.coordinator.resolvePendingEdit(ticket))
-        assertFalse("판정하지 못한 종료의 보류가 풀렸다", h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("판정하지 못한 종료")
         assertEquals(1, h.store.signOuts)
     }
 
@@ -590,13 +591,13 @@ class PremiumAccessCoordinatorSignOutTest {
         h.store.readBackFails = true
         h.store.signOutFault = EditFault.BEFORE_WRITE
 
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
         assertEquals(EditResolution.STILL_UNKNOWN, h.coordinator.resolvePendingEdit(ticket))
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
 
         h.store.loadsFail = false
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
     }
 
     @Test
@@ -606,10 +607,10 @@ class PremiumAccessCoordinatorSignOutTest {
         assertEquals(EditResolution.NOT_PENDING, h.coordinator.resolvePendingEdit(ticket))
         h.setLive(null)
         h.store.signOutFault = EditFault.BEFORE_WRITE
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
 
         assertEquals(EditResolution.NOT_PENDING, h.coordinator.resolvePendingEdit(SignOutTicket(ticket.value + 1)))
-        assertFalse("다른 시도의 재읽기가 보류를 풀었다", h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("다른 시도의 재읽기 뒤 종료")
     }
 
     @Test
@@ -620,12 +621,12 @@ class PremiumAccessCoordinatorSignOutTest {
         val binds = h.store.binds
         h.store.loadsFail = true
 
-        assertNull(h.coordinator.onIdentityChanged(b3))
+        h.coordinator.onIdentityChanged(b3).heldByAttempt()
         assertEquals(binds, h.store.binds)
 
         h.store.loadsFail = false
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
-        assertNotNull(h.coordinator.onIdentityChanged(b3))
+        h.coordinator.onIdentityChanged(b3).applied()
     }
 
     @Test
@@ -635,28 +636,43 @@ class PremiumAccessCoordinatorSignOutTest {
         h.setLive(a8)
         h.store.bindFault = EditFault.CANCEL_AFTER_WRITE
 
-        assertNull(h.coordinator.onIdentityChanged(a8))
+        h.coordinator.onIdentityChanged(a8).heldByAttempt()
     }
 
+    /**
+     * The failure this used to let through took the process: the consumer that calls this has no
+     * handler for it. It is now held instead, and the hold — not an exception — is what says the
+     * record on disk may not be what was published.
+     */
     @Test
-    fun withNoAttemptOpenAFailedEditStillPropagates() = runTest {
+    fun withNoAttemptOpenAFailedEditIsHeldRatherThanThrown() = runTest {
         val h = harness()
-        h.coordinator.onIdentityChanged(a7)
+        h.coordinator.onIdentityChanged(a7).applied()
         h.store.bindFault = EditFault.BEFORE_WRITE
 
-        val failure = runCatching { h.coordinator.onIdentityChanged(b3) }.exceptionOrNull()
-        assertTrue("시도가 없을 때의 실패를 삼켰다: $failure", failure is IOException)
+        val step = runCatching { h.coordinator.onIdentityChanged(b3) }
+        assertTrue("시도가 없을 때의 실패가 그대로 던져졌다: $step", step.isSuccess)
+        val held = step.getOrThrow().heldByPersistence("시도 없는 편집 실패")
+        assertEquals("첫 실패는 회차를 쓰지 않고 자동 재시도를 예약한다", 0L, held.afterRevision)
+        assertNull("멈춘 이유가 있으면 자동 재시도가 없다는 뜻이다", held.blocked)
+        assertNotNull("자동 재시도가 예약되지 않았다", held.nextAttemptAt)
     }
 
+    /**
+     * Cleanup is the step that can fail *after* the write is on disk, so its hold must not be one
+     * that would run the write again — the phase carries that difference, and this pins that the
+     * failure is held at all.
+     */
     @Test
-    fun withNoAttemptOpenAFailedCleanupStillPropagates() = runTest {
+    fun withNoAttemptOpenAFailedCleanupIsHeldRatherThanThrown() = runTest {
         val h = harness()
-        h.coordinator.onIdentityChanged(a7)
+        h.coordinator.onIdentityChanged(a7).applied()
         h.purger.throwing = IOException("purge")
 
         // Another uid's bind journals a7's namespace, so its cleanup reaches the purger.
-        val failure = runCatching { h.coordinator.onIdentityChanged(b3) }.exceptionOrNull()
-        assertTrue("시도가 없을 때의 정리 실패를 삼켰다: $failure", failure is IOException)
+        val step = runCatching { h.coordinator.onIdentityChanged(b3) }
+        assertTrue("시도가 없을 때의 정리 실패가 그대로 던져졌다: $step", step.isSuccess)
+        step.getOrThrow().heldByPersistence("시도 없는 정리 실패")
     }
 
     @Test
@@ -666,7 +682,7 @@ class PremiumAccessCoordinatorSignOutTest {
         h.setLive(null)
         h.purger.throwing = IOException("purge")
 
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
 
         assertEquals(1, h.store.signOuts)
         assertEquals(SignOutStart.Joined(ticket), h.coordinator.prepareSignOut(a7))
@@ -678,7 +694,7 @@ class PremiumAccessCoordinatorSignOutTest {
         val ticket = armed(h)
         h.setLive(b3)
         h.store.bindFault = EditFault.BEFORE_WRITE
-        assertNull(h.coordinator.onIdentityChanged(b3))
+        h.coordinator.onIdentityChanged(b3).heldByAttempt()
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
 
         val failure = runCatching { h.coordinator.onSignedOut(a7) }.exceptionOrNull()
@@ -695,7 +711,7 @@ class PremiumAccessCoordinatorSignOutTest {
         val ticket = armed(h)
         h.setLive(null)
         h.store.signOutFault = EditFault.BEFORE_WRITE
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
         val binds = h.store.binds
 
@@ -878,7 +894,7 @@ class PremiumAccessCoordinatorSignOutTest {
         val h = harness()
         val ticket = armed(h)
         h.setLive(a8)
-        assertNotNull(h.coordinator.onIdentityChanged(a8))
+        h.coordinator.onIdentityChanged(a8).applied()
 
         assertEquals(RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
         assertEquals(0, h.store.signOuts)
@@ -890,7 +906,7 @@ class PremiumAccessCoordinatorSignOutTest {
         val ticket = armed(h)
         h.setLive(null)
         h.purger.result = PurgeResult.Failed(IOException("purge"))
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
 
         assertEquals(RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
         assertEquals(1, h.store.signOuts)
@@ -902,11 +918,11 @@ class PremiumAccessCoordinatorSignOutTest {
         val ticket = armed(h)
         h.setLive(null)
         h.store.signOutFault = EditFault.AFTER_WRITE
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
 
         assertEquals("보류 사건보다 복구가 먼저 디스크를 판정했다", RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
         assertEquals(1, h.store.signOuts)
     }
 
@@ -917,12 +933,12 @@ class PremiumAccessCoordinatorSignOutTest {
         h.setLive(null)
         val journal = h.store.record.pendingPurges.size
         h.store.signOutFault = EditFault.BEFORE_WRITE
-        assertFalse(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).heldByAttempt("로그아웃")
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
 
         assertEquals(RecoveryAdvance.NEEDS_BARRIER, h.coordinator.advanceRecovery(ticket))
         assertEquals(1, h.store.signOuts)
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
         assertEquals("종료 회전이 한 번보다 많이 착지했다", journal + 1, h.store.record.pendingPurges.size)
     }
 
@@ -933,7 +949,7 @@ class PremiumAccessCoordinatorSignOutTest {
         h.store.loadsFail = true
 
         assertEquals(RecoveryAdvance.UNRESOLVED, h.coordinator.advanceRecovery(ticket))
-        assertNull(h.coordinator.onIdentityChanged(b3))
+        h.coordinator.onIdentityChanged(b3).heldByAttempt()
 
         h.store.loadsFail = false
         assertEquals(RecoveryAdvance.RESOLVED, h.coordinator.advanceRecovery(ticket))
@@ -999,7 +1015,7 @@ class PremiumAccessCoordinatorSignOutTest {
         val h = harness()
         val ticket = armed(h)
         h.setLive(a8)
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
         h.setLive(null)
 
         val outcome = h.coordinator.completeRecovery(ticket, null)
@@ -1016,7 +1032,7 @@ class PremiumAccessCoordinatorSignOutTest {
         val h = harness()
         val ticket = armed(h)
         h.setLive(a8)
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
         h.setLive(null)
 
         h.purger.result = PurgeResult.Failed(IOException("purge"))
@@ -1092,7 +1108,7 @@ class PremiumAccessCoordinatorSignOutTest {
         assertEquals(a7, outcome.completed)
         // The resumed barrier consumed what it was holding: the next event is an ordinary one.
         h.setLive(b3)
-        assertNotNull(h.coordinator.onIdentityChanged(b3))
+        h.coordinator.onIdentityChanged(b3).applied()
     }
 
     @Test
@@ -1117,7 +1133,7 @@ class PremiumAccessCoordinatorSignOutTest {
         val h = harness()
         val ticket = armed(h)
         h.setLive(a8)
-        assertTrue(h.coordinator.onSignedOut(a7))
+        h.coordinator.onSignedOut(a7).applied("로그아웃")
         h.setLive(null)
         h.purger.beforeAnswer = { h.setLive(b3) }
 
@@ -1143,7 +1159,7 @@ class PremiumAccessCoordinatorSignOutTest {
         val ticket = armed(h)
         h.setLive(b3)
         h.store.bindFault = EditFault.BEFORE_WRITE
-        assertNull(h.coordinator.onIdentityChanged(b3))
+        h.coordinator.onIdentityChanged(b3).heldByAttempt()
         assertEquals(EditResolution.RESOLVED, h.coordinator.resolvePendingEdit(ticket))
         val loads = h.store.loads
         val binds = h.store.binds
@@ -1156,5 +1172,332 @@ class PremiumAccessCoordinatorSignOutTest {
         )
         assertEquals(loads, h.store.loads)
         assertEquals(binds, h.store.binds)
+    }
+
+    // A failed edit with no attempt to own it
+
+    /**
+     * Advances to the hold's own deadline and spends the round that falls due there.
+     *
+     * Read from the hold rather than restated: a test that hard-coded the delay would keep passing
+     * if the schedule silently moved, which is one of the things the hold is meant to make visible.
+     */
+    private suspend fun TestScope.resumeWhenDue(h: Harness, held: IdentityStep.AwaitPersistence): IdentityStep {
+        val due = checkNotNull(held.nextAttemptAt) { "자동 재시도가 예약되지 않았다: $held" }
+        advanceTimeBy(due - testScheduler.currentTime)
+        return h.coordinator.resumePersistence(held.id)
+    }
+
+    /** Opens a hold by failing a bind that no sign-out owns. */
+    private suspend fun TestScope.holdABind(
+        h: Harness,
+        fault: EditFault = EditFault.BEFORE_WRITE
+    ): IdentityStep.AwaitPersistence {
+        h.coordinator.onIdentityChanged(a7).applied()
+        h.setLive(b3)
+        h.store.bindFault = fault
+        return h.coordinator.onIdentityChanged(b3).heldByPersistence()
+    }
+
+    /**
+     * While a hold stands the record on disk may not be what [PremiumAccessCoordinator.state]
+     * already published, so nothing may query against it — the same rule an open sign-out follows,
+     * for the same reason.
+     */
+    @Test
+    fun aHeldEditRefusesAccessQueriesUntilItIsResolved() = runTest {
+        val h = harness()
+        val held = holdABind(h)
+        val fetches = h.fetches()
+
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+        assertEquals("보류 중에 질의가 나갔다", fetches, h.fetches())
+
+        resumeWhenDue(h, held).applied()
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+        assertEquals("보류가 풀렸는데도 질의가 막혔다", fetches + 1, h.fetches())
+    }
+
+    @Test
+    fun aResumeBeforeTheScheduledTimeRunsNothing() = runTest {
+        val h = harness()
+        val held = holdABind(h)
+        val loads = h.store.loads
+        val binds = h.store.binds
+
+        val again = h.coordinator.resumePersistence(held.id).heldByPersistence()
+
+        assertEquals("이른 재개가 읽기를 썼다", loads, h.store.loads)
+        assertEquals("이른 재개가 쓰기를 썼다", binds, h.store.binds)
+        assertEquals("이른 재개가 예약을 소비했다", held.nextAttemptAt, again.nextAttemptAt)
+    }
+
+    /**
+     * The whole point of the hold: a fault that was transient costs the user nothing once it
+     * clears. The bind that failed is the bind that lands.
+     */
+    @Test
+    fun aResumeAtTheScheduledTimeReExecutesAndCompletes() = runTest {
+        val h = harness()
+        val held = holdABind(h)
+        assertEquals("실패한 묶기가 기록을 바꿔서는 안 된다", "user-a", h.store.record.ownerUid)
+
+        val completion = resumeWhenDue(h, held).applied("재개된 묶기")
+
+        assertEquals("user-b", h.store.record.ownerUid)
+        assertEquals(b3, completion.completed)
+        assertNotNull("묶기는 뒤따르는 질의를 위한 세대를 넘긴다", completion.queryGeneration)
+    }
+
+    /**
+     * A write that reached the disk before the failure must not run again.
+     *
+     * Slice 5 is what makes this particular repeat merely wasteful rather than destructive: the
+     * bind that just landed cleared any owed teardown, so running it again returns `ensureNamespace`
+     * for the owner the record already names. That is a property of this state, not of `bindOwner`
+     * in general — an owed teardown would settle, and settling rotates. So what this pins is that
+     * the read-back's answer is *used*: a machine that re-ran regardless would leave the
+     * landed/not-landed split as dead weight for the first edit that is not idempotent.
+     */
+    @Test
+    fun aBindThatLandedIsNotBoundASecondTime() = runTest {
+        val h = harness()
+        val held = holdABind(h, EditFault.AFTER_WRITE)
+        val binds = h.store.binds
+        assertEquals("기록에 닿은 묶기여야 이 시험이 성립한다", "user-b", h.store.record.ownerUid)
+
+        resumeWhenDue(h, held).applied("착지한 묶기의 재개")
+
+        assertEquals("착지한 묶기를 다시 실행했다", binds, h.store.binds)
+    }
+
+    /** The same for an end, which also has to keep the receipt of what it did. */
+    @Test
+    fun anEndThatLandedIsNotRotatedASecondTime() = runTest {
+        val h = harness()
+        h.coordinator.onIdentityChanged(a7).applied()
+        h.setLive(null)
+        h.store.signOutFault = EditFault.AFTER_WRITE
+
+        val held = h.coordinator.onSignedOut(a7).heldByPersistence("착지한 종료")
+        val signOuts = h.store.signOuts
+        val epoch = h.store.record.userAccessEpoch
+
+        resumeWhenDue(h, held).applied("착지한 종료의 재개")
+
+        assertEquals("착지한 회전을 다시 실행했다", signOuts, h.store.signOuts)
+        assertEquals("두 번째 회전이 이름공간을 갈아치웠다", epoch, h.store.record.userAccessEpoch)
+    }
+
+    /**
+     * A record that is neither the edit's result nor what it started from says nothing about what
+     * happened. Guessing either way is worse than stopping, so the batch stops and records why.
+     */
+    @Test
+    fun anUnrecognisableRecordStopsTheBatchAsUndecidable() = runTest {
+        val h = harness()
+        val held = holdABind(h)
+        // Somebody else's rotation, landing between the failure and its read-back.
+        h.store.record = AccessEpochTransitions.rotate(
+            h.store.record, rotateUser = true, rotateKrx = true, EpochIdGenerator { "outside" }
+        )
+        val binds = h.store.binds
+
+        val stopped = resumeWhenDue(h, held).heldByPersistence("판정할 수 없는 보류")
+
+        assertEquals(NoAutoRetry.UNDECIDABLE, stopped.blocked)
+        assertNull("판정하지 못했는데도 다음 회차가 예약됐다", stopped.nextAttemptAt)
+        assertEquals("판정하지 못한 채로 다시 썼다", binds, h.store.binds)
+    }
+
+    /**
+     * The write is already on disk when cleanup fails, so the round that follows runs the cleanup
+     * alone. A hold that parked at the retry phase instead would spend the round binding again and
+     * re-derive a completion that belongs to the moment the landing was established.
+     */
+    @Test
+    fun aHeldCleanupResumesTheCleanupAndNotTheWrite() = runTest {
+        val h = harness()
+        h.coordinator.onIdentityChanged(a7).applied()
+        h.setLive(b3)
+        h.purger.throwing = IOException("purge")
+
+        // Another uid's bind journals a7's namespace, so its cleanup reaches the purger.
+        val held = h.coordinator.onIdentityChanged(b3).heldByPersistence("실패한 정리")
+        val binds = h.store.binds
+        assertEquals("묶기가 기록에 닿아야 이 시험이 성립한다", "user-b", h.store.record.ownerUid)
+
+        h.purger.throwing = null
+        resumeWhenDue(h, held).applied("정리만 남은 회차")
+
+        assertEquals("정리 재개가 쓰기를 다시 실행했다", binds, h.store.binds)
+        assertTrue("정리가 실제로 돌지 않았다", h.purger.purges > 0)
+    }
+
+    /** The budget is finite, and running out is a different fact from being undecidable. */
+    @Test
+    fun theAutomaticBudgetRunsOutAndSaysSo() = runTest {
+        val h = harness()
+        var held = holdABind(h)
+        h.store.loadsFail = true
+
+        repeat(PersistenceRecoveryPolicy.AUTOMATIC_ROUNDS) { round ->
+            held = resumeWhenDue(h, held).heldByPersistence("회차 ${round + 1}")
+        }
+
+        assertEquals(NoAutoRetry.BUDGET_EXHAUSTED, held.blocked)
+        assertNull("예산이 끝났는데도 다음 회차가 예약됐다", held.nextAttemptAt)
+    }
+
+    /**
+     * The other way a round can fail: the work ran again and failed again.
+     *
+     * That path extends the hold rather than recording a failed read-back, and the budget has to
+     * survive the trip — a hold that took its rounds back on every re-execution would retry for
+     * ever and never reach a state anybody could be told about.
+     */
+    @Test
+    fun aHoldWhoseReExecutionsKeepFailing_stillRunsOutOfBudget() = runTest {
+        val h = harness()
+        h.coordinator.onIdentityChanged(a7).applied()
+        h.setLive(b3)
+        h.store.loadsFail = true
+        // A failed read is judged without a read-back, so each round spends itself on the retry.
+        var held = h.coordinator.onIdentityChanged(b3).heldByPersistence("실패한 읽기")
+
+        repeat(PersistenceRecoveryPolicy.AUTOMATIC_ROUNDS) { round ->
+            held = resumeWhenDue(h, held).heldByPersistence("재실행 회차 ${round + 1}")
+        }
+
+        assertEquals("재실행이 이어져도 예산은 끝나야 한다", NoAutoRetry.BUDGET_EXHAUSTED, held.blocked)
+        assertNull("예산이 끝났는데도 다음 회차가 예약됐다", held.nextAttemptAt)
+    }
+
+    /** A stopped hold is not a dead one: somebody asking again is what starts the next batch. */
+    @Test
+    fun aManualWakeGivesAStoppedHoldOneMoreRound() = runTest {
+        val h = harness()
+        var held = holdABind(h)
+        h.store.loadsFail = true
+        repeat(PersistenceRecoveryPolicy.AUTOMATIC_ROUNDS) { held = resumeWhenDue(h, held).heldByPersistence() }
+        assertEquals(NoAutoRetry.BUDGET_EXHAUSTED, held.blocked)
+
+        h.store.loadsFail = false
+        assertTrue("멈춘 보류가 깨우기를 받지 않았다", h.coordinator.retryPersistence(held.id))
+        assertFalse(
+            "두 번째 깨우기가 합류하지 않고 따로 섰다",
+            h.coordinator.retryPersistence(held.id)
+        )
+
+        h.coordinator.resumePersistence(held.id).applied("깨운 뒤의 재개")
+        assertEquals("user-b", h.store.record.ownerUid)
+    }
+
+    /**
+     * A wake that arrives mid-batch is kept, not spent. Setting it raises a revision, but the
+     * rounds that follow raise later ones — so the step a waiter ends up holding is already past
+     * it. Watching only for a newer revision would sleep on a hold that is already admissible, and
+     * asking again would only coalesce into the wake that is already set.
+     */
+    @Test
+    fun aWakeKeptThroughTheLastRound_wakesTheWaiterWhenTheBatchStops() = runTest {
+        val h = harness()
+        var held = holdABind(h)
+        h.store.loadsFail = true
+
+        // Asked for during the first round's wait, so it is recorded while a deadline still stands.
+        assertTrue(h.coordinator.retryPersistence(held.id))
+        repeat(PersistenceRecoveryPolicy.AUTOMATIC_ROUNDS) { held = resumeWhenDue(h, held).heldByPersistence() }
+        assertEquals(NoAutoRetry.BUDGET_EXHAUSTED, held.blocked)
+        assertFalse("같은 요청을 다시 보내도 바뀌는 것이 없다", h.coordinator.retryPersistence(held.id))
+
+        h.store.loadsFail = false
+        val waited = async { h.coordinator.awaitPersistenceRetry(held) }
+        advanceUntilIdle()
+
+        assertTrue("멈춘 보류에 선 깨우기를 대기가 보지 못했다", waited.isCompleted)
+        h.coordinator.resumePersistence(held.id).applied("선 깨우기가 얻은 회차")
+        assertEquals("user-b", h.store.record.ownerUid)
+    }
+
+    @Test
+    fun aResumeNamingAHoldThatIsGoneCompletesNothing() = runTest {
+        val h = harness()
+        val held = holdABind(h)
+        resumeWhenDue(h, held).applied()
+
+        val stale = h.coordinator.resumePersistence(held.id)
+
+        assertTrue("사라진 보류를 재개가 완료로 보고했다: $stale", stale is IdentityStep.StaleResume)
+        assertFalse("사라진 보류가 깨우기를 받았다", h.coordinator.retryPersistence(held.id))
+    }
+
+    /**
+     * A purge resume before the read-back would erase what an unowned END's read-back is going to
+     * look for, so the guard covers every Unknown phase. This bind case verifies the guard; a bind
+     * landing is judged by its postcondition and does not itself need the journal.
+     */
+    @Test
+    fun aPurgeResumeWaitsForTheReadBack() = runTest {
+        val h = harness()
+        val held = holdABind(h)
+        val loads = h.store.loads
+
+        h.coordinator.resumePendingPurges()
+        assertEquals("결과를 모르는 편집 앞에서 정리가 기록을 건드렸다", loads, h.store.loads)
+
+        resumeWhenDue(h, held).applied()
+        h.coordinator.resumePendingPurges()
+        assertTrue("보류가 풀렸는데도 정리가 막혔다", h.store.loads > loads)
+    }
+
+    /**
+     * A sign-out attempt must never open on top of a hold, and the identity FIFO is what keeps that
+     * true: the app's request is queued behind the head task, which has not returned while its hold
+     * stands. This test bypasses that queue, and what it pins is that the coordinator refuses the
+     * overlap before recording any sign-out intent. It does not establish what would go wrong
+     * without the guard.
+     */
+    @Test
+    fun aSignOutPreparedOnTopOfAHoldIsRefusedBeforeAnyIntentIsWritten() = runTest {
+        val h = harness()
+        holdABind(h)
+        h.setLive(a7)
+
+        val refused = runCatching { h.coordinator.prepareSignOut(a7) }.exceptionOrNull()
+
+        assertTrue("보류 위의 로그아웃 준비를 받아들였다: $refused", refused is IllegalStateException)
+        assertNull("거절된 준비가 의도를 기록했다", h.store.record.teardownOwedFor)
+    }
+
+    /**
+     * A read that failed started no write, so there is nothing for a read-back to find. Spending
+     * the round on one would waste the whole batch at the very moment reads are failing — the retry
+     * would never run.
+     */
+    @Test
+    fun aHeldReadRetriesTheWorkInsteadOfReadingItBack() = runTest {
+        val h = harness()
+        h.coordinator.onIdentityChanged(a7).applied()
+        h.setLive(b3)
+        h.store.loadsFail = true
+        val held = h.coordinator.onIdentityChanged(b3).heldByPersistence("실패한 읽기")
+
+        // Still failing when the round falls due, so a read-back would take it. The retry's own read
+        // is what must be spent instead — and here it fails, leaving a second round to come.
+        val stillHeld = resumeWhenDue(h, held).heldByPersistence("읽기가 여전히 실패하는 회차")
+        assertNotNull("읽기 실패는 판정 불가가 아니라 재시도 대상이다", stillHeld.nextAttemptAt)
+        assertNull(stillHeld.blocked)
+
+        h.store.loadsFail = false
+        val loads = h.store.loads
+        resumeWhenDue(h, stillHeld).applied("읽기가 돌아온 회차")
+        assertEquals("user-b", h.store.record.ownerUid)
+        // Two reads, and both are doing something: the work's own read, and the purge resume's.
+        // A round that also read the record back to judge a failed READ would spend a third, and
+        // would need the store healthy three times over to make the same progress.
+        assertEquals("회차가 판정용 읽기를 하나 더 썼다", loads + 2, h.store.loads)
     }
 }

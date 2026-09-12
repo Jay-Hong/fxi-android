@@ -557,6 +557,62 @@ internal object SignOutAttemptPolicy {
         else -> null
     }
 
+    /** What a read-back says about an edit that no attempt owned. */
+    internal sealed interface UnownedResolution {
+        /** The write never started, or it did not land: the same work can run again. */
+        data class RunAgain(val before: AccessEpochRecord?) : UnownedResolution
+
+        /** The write landed: only the cleanup behind it is left. */
+        data object Landed : UnownedResolution
+
+        /** Neither the edit's result nor the record it started from. Nothing is guessed. */
+        data object Undecidable : UnownedResolution
+    }
+
+    /**
+     * Whether establishing what [edit] did needs the record read back.
+     *
+     * A READ starts no write, so there is nothing in the record for a read-back to find — and the
+     * caller would be spending a read on a question with no answer, at the one moment reads are
+     * known to be failing. [resolveUnownedEdit] gives the same answer to a caller that read anyway.
+     */
+    internal fun needsReadBack(edit: PendingEdit): Boolean = edit != PendingEdit.READ
+
+    /**
+     * Classifies an unowned edit from a record read back after it, by the work it was persisting.
+     *
+     * The predicates are the ones the attempt paths already use, and the split follows what each
+     * edit can have done. A READ never starts the write that follows it, so its resolution is not a
+     * question about landing at all — and a record that happens to satisfy the postcondition does
+     * not turn it into one. A bind is judged the way a barrier's bind is, by its postcondition, and
+     * an end by whether its rotation reached the journal.
+     */
+    internal fun resolveUnownedEdit(
+        work: IdentityWork,
+        edit: PendingEdit,
+        before: AccessEpochRecord?,
+        readBack: AccessEpochRecord
+    ): UnownedResolution = when {
+        edit == PendingEdit.READ -> UnownedResolution.RunAgain(before)
+        work is IdentityWork.Bind && edit == PendingEdit.BIND_OWNER -> when {
+            bindLanded(readBack, work.fence.uid) -> UnownedResolution.Landed
+            before != null && sameNamespace(before, readBack) -> UnownedResolution.RunAgain(before)
+            else -> UnownedResolution.Undecidable
+        }
+        work is IdentityWork.End && edit == PendingEdit.END -> {
+            val owner = before?.ownerUid
+            when {
+                owner != null && retired(before, readBack, owner) -> UnownedResolution.Landed
+                before != null && sameNamespace(before, readBack) -> UnownedResolution.RunAgain(before)
+                else -> UnownedResolution.Undecidable
+            }
+        }
+        // A startup purge is not an identity edit: nothing about it lands in the record, so the only
+        // answer a read-back gives is that the resume can be tried again.
+        work is IdentityWork.StartupPurge -> UnownedResolution.RunAgain(before)
+        else -> UnownedResolution.Undecidable
+    }
+
     /**
      * The fields a rotation changes. The mayContain markers are left out: they are not what tells a
      * rotation apart, and their store entry point does not go through the coordinator's lock.

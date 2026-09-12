@@ -136,11 +136,10 @@ class AuthAccessBinder(
                 coordinator.resumePendingPurges()
                 for (item in inbox) {
                     when (item) {
-                        // An open sign-out with an edit in flight holds identity events, in order,
-                        // until that edit's outcome is known. The coordinator decides that under its
-                        // own lock and hands a held event back, so the same event stays first.
-                        is Item.Observed ->
-                            while (!handle(item.fence)) coordinator.awaitIdentityEventsAdmitted()
+                        // Runs to completion, waiting out whatever holds it: an open sign-out's
+                        // edit, or this task's own. The coordinator decides which under its own
+                        // lock, and the same event stays first either way.
+                        is Item.Observed -> drive(item.fence)
                         is Item.PrepareSignOut ->
                             serve(item) { item.reply.complete(coordinator.prepareSignOut(item.fence)) }
                         is Item.RecoveryBarrier -> serve(item) { runBarrier(item) }
@@ -363,46 +362,94 @@ class AuthAccessBinder(
         item.reply.complete(outcome)
     }
 
-    /** False when the coordinator held the event; nothing was applied and it must be retried. */
-    private suspend fun handle(fence: AuthIdentityFence?): Boolean {
-        when {
-            fence != null && fence != boundFence -> {
-                val boundDecisionGeneration = coordinator.onIdentityChanged(fence) ?: return false
-                boundFence = fence
-                // `onIdentityChanged` binds the owner and resets to NoGrant; it asks the server
-                // nothing. D23 also says a cold-start grant can only come from a `fresh_premium`
-                // answer, so without a query here an existing subscriber who merely restores a
-                // login sits on the free surface forever — no purchase button is involved, so
-                // nothing else would ever ask. This is the one query, issued by the one funnel
-                // that already owns identity, rather than a second binding mechanism in Root.
-                // The default `CALLER` origin is right: `.forcePremium` already bypasses the
-                // client debounce, and the one thing still able to defer this is the server's own
-                // `Retry-After` floor — a device-wide rate limit that a new sign-in does not lift.
-                //
-                // Launched rather than awaited. This funnel is single-consumer, so awaiting a
-                // network call here would park every later identity event behind it — a sign-out
-                // queued behind a hanging query is the same ordering defect S2 step 1 was about.
-                // A query that outlives its identity cannot land: the coordinator fences late
-                // answers against its own generation.
-                // Pinned to the binding above. `launch` orders nothing against a sign-out that
-                // arrives while this is still queued, and an unpinned query would then start under
-                // the *next* generation — applying cleanly and re-arming a recheck for a session
-                // that has ended.
-                scope.launch {
-                    coordinator.refresh(
-                        RefreshIntent.FORCE_PREMIUM,
-                        requireDecisionGeneration = boundDecisionGeneration
-                    )
+    /**
+     * Runs one observation to completion, waiting out whatever is holding it up.
+     *
+     * Two things can hold it, and they are waited on differently. An open sign-out owns its own
+     * edit, so the event is simply retried once that attempt admits events again. A failure with no
+     * attempt is this task's own: it resumes the phase and completion that failure established,
+     * through [PremiumAccessCoordinator.resumePersistence], rather than starting the event over.
+     * Sending it through the front door would mint a new decision generation and discard the saved
+     * phase and completion instead of resuming them — this loop schedules its follow-up query only
+     * after [IdentityStep.Applied], so what is lost is the generation that completion carries. A
+     * landing with only its cleanup left must not go back to running identity edits.
+     */
+    private suspend fun drive(fence: AuthIdentityFence?) {
+        var step = handle(fence)
+        // While this observation's hold stands, resume it rather than re-entering the head task.
+        var hold: Long? = null
+        while (true) {
+            when (val current = step) {
+                is IdentityStep.Applied -> {
+                    // Taken from the completion rather than from this loop's own `fence`, so the
+                    // three ways an observation can finish — the head task, a recovery round, and
+                    // the no-op above — all adopt from one place.
+                    boundFence = current.completion.completed
+                    current.completion.queryGeneration?.let(::askTheServer)
+                    return
+                }
+                is IdentityStep.AwaitAttempt -> {
+                    // A sign-out attempt cannot open over a hold — the coordinator refuses to
+                    // prepare one, because this consumer has not returned while the hold stands.
+                    check(hold == null) { "a persistence hold was handed to a sign-out attempt" }
+                    coordinator.awaitIdentityEventsAdmitted()
+                    step = handle(fence)
+                }
+                is IdentityStep.AwaitPersistence -> {
+                    hold = current.id
+                    coordinator.awaitPersistenceRetry(current)
+                    step = coordinator.resumePersistence(current.id)
+                }
+                // The hold this loop was following is gone, and nothing is completed by that alone.
+                // With no hold left to resume, the observation goes through the front door again.
+                is IdentityStep.StaleResume -> {
+                    hold = null
+                    step = handle(fence)
                 }
             }
+        }
+    }
+
+    /** What one observation asks of the coordinator, before any waiting. */
+    private suspend fun handle(fence: AuthIdentityFence?): IdentityStep {
+        when {
+            fence != null && fence != boundFence -> return coordinator.onIdentityChanged(fence)
             fence == null && boundFence != null -> {
                 // The session this null ends, so the coordinator rotates that uid's namespace and
                 // not whoever the record happens to name.
-                val ended = checkNotNull(boundFence)
-                if (!coordinator.onSignedOut(ended)) return false
-                boundFence = null
+                return coordinator.onSignedOut(checkNotNull(boundFence))
             }
         }
-        return true
+        // Already where this observation asks it to be. Reported as completed on the binding that
+        // is already adopted, so the loop leaves it alone.
+        return IdentityStep.Applied(IdentityCompletion(boundFence, queryGeneration = null))
+    }
+
+    /**
+     * The follow-up query for a fresh binding.
+     *
+     * `onIdentityChanged` binds the owner and resets to NoGrant; it asks the server nothing. D23
+     * also says a cold-start grant can only come from a `fresh_premium` answer, so without a query
+     * here an existing subscriber who merely restores a login sits on the free surface forever — no
+     * purchase button is involved, so nothing else would ever ask. This is the one query, issued by
+     * the one funnel that already owns identity, rather than a second binding mechanism in Root.
+     * The default `CALLER` origin is right: `.forcePremium` already bypasses the client debounce,
+     * and the one thing still able to defer this is the server's own `Retry-After` floor — a
+     * device-wide rate limit that a new sign-in does not lift.
+     *
+     * Launched rather than awaited. This funnel is single-consumer, so awaiting a network call here
+     * would park every later identity event behind it — a sign-out queued behind a hanging query is
+     * the same ordering defect S2 step 1 was about. A query that outlives its identity cannot land:
+     * the coordinator fences late answers against its own generation.
+     *
+     * Pinned to [generation], the binding this query belongs to. `launch` orders nothing against a
+     * sign-out that arrives while this is still queued, and an unpinned query would then start
+     * under the *next* generation — applying cleanly and re-arming a recheck for a session that has
+     * ended.
+     */
+    private fun askTheServer(generation: AccessDecisionGeneration) {
+        scope.launch {
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = generation)
+        }
     }
 }

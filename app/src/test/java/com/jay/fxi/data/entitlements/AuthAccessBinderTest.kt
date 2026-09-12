@@ -72,6 +72,9 @@ class AuthAccessBinderTest {
         /** Fails every bind before it writes anything, while set. */
         var failBinds = false
 
+        /** Fails the next bind *after* it reached the record, so a read-back can see it landed. */
+        var failNextBindAfterWrite = false
+
         /** Fails the next sign-out before it writes anything. */
         var failNextSignOut = false
 
@@ -103,7 +106,12 @@ class AuthAccessBinderTest {
                 throw java.io.IOException("simulated write failure")
             }
             calls += Call.OwnerChanged(uid)
-            return AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it; onBind() }
+            val bound = AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it; onBind() }
+            if (failNextBindAfterWrite) {
+                failNextBindAfterWrite = false
+                throw java.io.IOException("simulated failure after the write")
+            }
+            return bound
         }
 
         override suspend fun signOut(): AccessEpochRecord {
@@ -1191,6 +1199,54 @@ class AuthAccessBinderTest {
         advanceUntilIdle()
 
         assertEquals(SignOutRecoveryStatus(ticket, running = false, failed = true), built.recoveryStatus.value)
+        processJob.cancel()
+    }
+
+    /**
+     * The consumer used to die here: with no sign-out attempt to own it, a failed bind threw out of
+     * `onIdentityChanged` and the identity funnel went with it. The hold makes it a wait instead,
+     * and the funnel keeps serving what comes next.
+     */
+    @Test
+    fun aFailedBindWithNoAttempt_recoversWithoutStallingTheConsumer() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val binder = build(calls, store = store)
+        binder.start()
+        store.failNextBind = true
+
+        binder.onFenceObserved(fenceOf("user-a"))
+        advanceUntilIdle()
+
+        assertEquals(listOf(Call.OwnerChanged("user-a")), calls)
+        assertEquals("user-a", store.record.ownerUid)
+
+        // The funnel is still serving: a later observation is dispatched, not stuck behind the hold.
+        binder.onFenceObserved(null)
+        advanceUntilIdle()
+        assertEquals(listOf(Call.OwnerChanged("user-a"), Call.SignedOut), calls)
+        processJob.cancel()
+    }
+
+    /**
+     * A bind that reached the record before failing is not run again: recovery reads the record
+     * back, sees its own postcondition, and finishes the task. What this asserts is that recovery
+     * uses the landing result — repeating the bind here would take the same-owner
+     * `ensureNamespace` path, so it is not a rotation this prevents.
+     */
+    @Test
+    fun aBindThatLandedBeforeFailing_isNotBoundAgain() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val binder = build(calls, store = store)
+        binder.start()
+        store.failNextBindAfterWrite = true
+
+        binder.onFenceObserved(fenceOf("user-a"))
+        advanceUntilIdle()
+
+        assertEquals("착지한 묶기를 다시 실행했다", 1, store.bindAttempts)
+        assertEquals("user-a", store.record.ownerUid)
         processJob.cancel()
     }
 }

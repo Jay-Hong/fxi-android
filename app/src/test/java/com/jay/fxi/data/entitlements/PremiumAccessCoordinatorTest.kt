@@ -251,10 +251,9 @@ class PremiumAccessCoordinatorTest {
         assertEquals(KrxCapabilityState.VISIBLE, coordinator.krx.value)
 
         store.failNextLoad = true
-        // With no attempt open the failure propagates, which is what slice 7b takes over. What must
-        // already hold is that nothing readable survives it.
-        val thrown = runCatching { coordinator.onIdentityChanged(ownerFence("user-b")) }.exceptionOrNull()
-        assertTrue("디스크 실패가 전파돼야 한다: $thrown", thrown is java.io.IOException)
+        // Slice 7b took the propagation over: with no attempt open the failure is held, not thrown.
+        // What this test is about is unchanged — nothing readable survives it either way.
+        coordinator.onIdentityChanged(ownerFence("user-b")).heldByPersistence("신원 전환의 디스크 실패")
 
         assertEquals(KrxCapabilityState.HIDDEN, coordinator.krx.value)
         assertEquals(PremiumAccessState.NoGrant, coordinator.state.value.state)
@@ -271,8 +270,7 @@ class PremiumAccessCoordinatorTest {
         assertEquals(KrxCapabilityState.VISIBLE, coordinator.krx.value)
 
         store.failNextLoad = true
-        val thrown = runCatching { coordinator.onSignedOut(ownerFence(OWNER)) }.exceptionOrNull()
-        assertTrue("디스크 실패가 전파돼야 한다: $thrown", thrown is java.io.IOException)
+        coordinator.onSignedOut(ownerFence(OWNER)).heldByPersistence("로그아웃의 디스크 실패")
 
         assertEquals(KrxCapabilityState.HIDDEN, coordinator.krx.value)
         assertEquals(PremiumAccessState.NoGrant, coordinator.state.value.state)
@@ -1373,10 +1371,10 @@ class PremiumAccessCoordinatorTest {
         }
         val coordinator = build(store, source)
         try {
-            val firstBinding = coordinator.onIdentityChanged(ownerFence(OWNER))
+            val firstBinding = coordinator.onIdentityChanged(ownerFence(OWNER)).boundGeneration()
             coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = firstBinding)
             advanceTimeBy(1_000L)
-            val liveBinding = coordinator.onIdentityChanged(ownerFence(OWNER))
+            val liveBinding = coordinator.onIdentityChanged(ownerFence(OWNER)).boundGeneration()
             coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = liveBinding)
             advanceTimeBy(28_999L)
             runCurrent()
@@ -1408,7 +1406,7 @@ class PremiumAccessCoordinatorTest {
         }
         val coordinator = build(store, source)
         try {
-            val binding = coordinator.onIdentityChanged(ownerFence(OWNER))
+            val binding = coordinator.onIdentityChanged(ownerFence(OWNER)).boundGeneration()
             coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = binding)
             advanceTimeBy(1_000L)
 
@@ -1469,10 +1467,10 @@ class PremiumAccessCoordinatorTest {
         }
         val coordinator = build(store, source)
         try {
-            val oldBinding = coordinator.onIdentityChanged(ownerFence(OWNER))
+            val oldBinding = coordinator.onIdentityChanged(ownerFence(OWNER)).boundGeneration()
             coordinator.refresh(RefreshIntent.IF_STALE, requireDecisionGeneration = oldBinding)
             advanceTimeBy(1_000L)
-            val newBinding = coordinator.onIdentityChanged(ownerFence(OWNER))
+            val newBinding = coordinator.onIdentityChanged(ownerFence(OWNER)).boundGeneration()
             coordinator.refresh(RefreshIntent.IF_STALE, requireDecisionGeneration = newBinding)
             coordinator.refresh(RefreshIntent.FORCE_PREMIUM, requireDecisionGeneration = oldBinding)
             advanceTimeBy(29_000L)
