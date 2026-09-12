@@ -129,11 +129,15 @@ class AuthAccessBinder(
      * resumes purges itself: on a signed-out cold start no owner change ever fires, and a journal
      * a previous process left behind would otherwise never be retried. On a signed-in cold start
      * this costs one redundant resume, which is a no-op when the journal is empty.
+     *
+     * It is a head task like any other, so a failure holds instead of ending the consumer before it
+     * has read anything — which is what used to happen, since this call sits inside the same body
+     * whose `finally` stops the consumer. Nothing is accepted until it reports completion.
      */
     fun start() {
         scope.launch(Consumer()) {
             try {
-                coordinator.resumePendingPurges()
+                driveStartupPurge()
                 for (item in inbox) {
                     when (item) {
                         // Runs to completion, waiting out whatever holds it: an open sign-out's
@@ -406,6 +410,29 @@ class AuthAccessBinder(
                     hold = null
                     step = handle(fence)
                 }
+            }
+        }
+    }
+
+    /**
+     * Runs the startup purge to completion, waiting out a hold the way [drive] does.
+     *
+     * It never goes back through the front door: there is no front door for this work, and the
+     * hold is the only thing that knows a resume is owed. A [IdentityStep.StaleResume] here would
+     * mean the hold was cleared by something else, which cannot happen while this task holds the
+     * consumer — so it is a contract violation rather than a completion.
+     */
+    private suspend fun driveStartupPurge() {
+        var step = coordinator.resumeStartupPurge()
+        while (true) {
+            when (val current = step) {
+                is IdentityStep.Applied -> return
+                is IdentityStep.AwaitPersistence -> {
+                    coordinator.awaitPersistenceRetry(current)
+                    step = coordinator.resumePersistence(current.id)
+                }
+                is IdentityStep.AwaitAttempt, is IdentityStep.StaleResume ->
+                    error("the startup purge cannot be held by anything else: $current")
             }
         }
     }

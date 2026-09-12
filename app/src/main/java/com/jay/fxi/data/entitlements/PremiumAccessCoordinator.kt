@@ -205,6 +205,12 @@ class PremiumAccessCoordinator(
      * [IdentityStep.AwaitPersistence] instead — see [identityEditLocked].
      */
     internal suspend fun onIdentityChanged(identity: AuthIdentityFence): IdentityStep = mutex.withLock {
+        // Before anything is touched: this task would raise the generation, republish state and
+        // edit the record, and its success would clear somebody else's hold on the way out. A hold
+        // is resumed through resumePersistence, never by re-entering here.
+        check(identityPersistencePending == null) {
+            "an identity change entered over an unresolved hold: $identityPersistencePending"
+        }
         // Checked under the same lock as the edit below: a gate seen open before this lock was
         // taken can have closed since.
         if (!SignOutAttemptPolicy.admitsIdentityEvents(attempt)) return@withLock stalledLocked(attempt)
@@ -254,6 +260,9 @@ class PremiumAccessCoordinator(
      * the same uid inherit protected data that was never re-authorised.
      */
     internal suspend fun onSignedOut(ended: AuthIdentityFence): IdentityStep = mutex.withLock {
+        check(identityPersistencePending == null) {
+            "an end entered over an unresolved hold: $identityPersistencePending"
+        }
         // Same contract as [onIdentityChanged]: held, untouched, while an edit is in flight.
         if (!SignOutAttemptPolicy.admitsIdentityEvents(attempt)) return@withLock stalledLocked(attempt)
         val open = attempt
@@ -483,11 +492,18 @@ class PremiumAccessCoordinator(
      * Opens the hold for [work] at [phase], or moves an existing one to it, and schedules a round.
      *
      * A failure inside an existing hold keeps that hold's id and budget: minting a new one would
-     * hand every failure a fresh three rounds. Different work replaces the hold — it is a different
-     * head task, and the old one is not this task's to finish.
+     * hand every failure a fresh three rounds.
+     *
+     * Different work never lands here. Replacing a hold would mint a new id, budget and phase, so
+     * whoever was waiting on the old one holds a resume contract that no longer describes anything
+     * — and the journal surviving is not the same fact as the *work* being handed over. The FIFO is
+     * what keeps this true: a head task with an unresolved hold has not returned.
      */
     private fun openOrExtendHoldLocked(work: IdentityWork, phase: PendingPersistence.Phase) {
         val existing = identityPersistencePending
+        check(existing == null || existing.work == work) {
+            "a hold for $work opened over one for ${existing?.work}"
+        }
         setPendingLocked(
             if (existing != null && existing.work == work) {
                 PersistenceRecoveryPolicy.afterFailedRound(
@@ -1123,6 +1139,28 @@ class PremiumAccessCoordinator(
     private data class ProbeRun(val owner: String, val epoch: Long)
 
     /** Re-runs purges a previous process journalled but did not finish. */
+    /**
+     * The purge resume the identity consumer runs before it accepts anything, as a head task.
+     *
+     * Startup-only, and kept apart from [resumePendingPurges] because that one *skips* in front of
+     * an edit whose outcome is unknown — a skip is not a finished startup task, and a caller that
+     * read it as one would open the funnel over work that never ran.
+     *
+     * Nothing has opened an attempt or a hold when this runs, so both are contract checks rather
+     * than gates. A failure here becomes an [IdentityWork.StartupPurge] hold: the consumer waits on
+     * it and resumes it by id, and access stays refused meanwhile — not because the journal still
+     * has entries, which is the normal answer from today's purgers, but because this resume ended
+     * in an exception and the store it could not finish is the same one every access query reads.
+     */
+    internal suspend fun resumeStartupPurge(): IdentityStep = mutex.withLock {
+        check(attempt == null) { "a sign-out attempt was open before the identity consumer started" }
+        check(identityPersistencePending == null) { "a hold stood before the identity consumer started" }
+        val work = IdentityWork.StartupPurge
+        // The whole of this work is the cleanup: a purge resume writes no identity edit, so there
+        // is no landing to establish and nothing for a read-back to classify.
+        cleanupAndFinishLocked(work, completionFor(work))
+    }
+
     suspend fun resumePendingPurges() {
         mutex.withLock {
             // An unresolved edit's receipt is a journal entry; purging before its read-back erases it.

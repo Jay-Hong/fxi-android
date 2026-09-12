@@ -1500,4 +1500,106 @@ class PremiumAccessCoordinatorSignOutTest {
         // would need the store healthy three times over to make the same progress.
         assertEquals("회차가 판정용 읽기를 하나 더 썼다", loads + 2, h.store.loads)
     }
+
+    // The startup purge, as a head task
+
+    /** A journal a previous process left behind, so a resume has something to do. */
+    private fun journalled(h: Harness) {
+        h.store.record = AccessEpochRecord(
+            userAccessEpoch = "current-user-epoch",
+            krxCapabilityEpoch = "current-krx-epoch",
+            pendingPurges = listOf(
+                PendingPurge(
+                    ownerUid = "previous-owner",
+                    userAccessEpoch = "older-user-epoch",
+                    krxCapabilityEpoch = null,
+                    scopes = setOf(PurgeScope.USER)
+                )
+            )
+        )
+    }
+
+    @Test
+    fun aStartupPurgeThatResumesCleanly_completesWithNothingBound() = runTest {
+        val h = harness(live = null)
+        journalled(h)
+
+        val completion = h.coordinator.resumeStartupPurge().applied("시작 purge")
+
+        assertNull("시작 purge 는 아무것도 묶지 않는다", completion.completed)
+        assertNull("뒤따르는 질의도 없다", completion.queryGeneration)
+        assertEquals(1, h.purger.purges)
+    }
+
+    /**
+     * The lock is not about the journal still having entries — today's purgers always answer
+     * Deferred, so that is the normal state. It is about this resume ending in an exception: the
+     * store it could not finish is the one every access query reads, and `refresh` reads it without
+     * a handler of its own.
+     */
+    @Test
+    fun aStartupPurgeThatThrows_holdsAndRefusesAccess() = runTest {
+        val h = harness(live = null)
+        journalled(h)
+        h.purger.throwing = IOException("purge")
+        val fetches = h.fetches()
+
+        val held = h.coordinator.resumeStartupPurge().heldByPersistence("시작 purge")
+
+        assertNotNull("자동 재시도가 예약되지 않았다", held.nextAttemptAt)
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+        assertEquals("시작 보류 중에 질의가 나갔다", fetches, h.fetches())
+    }
+
+    /** Its whole work is the cleanup, so a round runs that and never an identity edit. */
+    @Test
+    fun aHeldStartupPurgeResumesTheCleanupOnly() = runTest {
+        val h = harness(live = null)
+        journalled(h)
+        h.purger.throwing = IOException("purge")
+        val held = h.coordinator.resumeStartupPurge().heldByPersistence()
+        h.purger.throwing = null
+        val binds = h.store.binds
+        val signOuts = h.store.signOuts
+
+        resumeWhenDue(h, held).applied("재개된 시작 purge")
+
+        assertEquals("시작 purge 재개가 묶기를 실행했다", binds, h.store.binds)
+        assertEquals("시작 purge 재개가 회전을 실행했다", signOuts, h.store.signOuts)
+        assertTrue("정리가 실제로 돌지 않았다", h.purger.purges >= 2)
+    }
+
+    /**
+     * The consumer runs this before it has accepted anything, so no attempt can be open — and the
+     * work it does assumes that: its failure records a hold rather than the attempt's unresolved
+     * edit. Unreachable through the FIFO is not the same as unobservable, so the contract is pinned
+     * by opening an attempt and calling the startup entry point directly.
+     */
+    @Test
+    fun aStartupPurgeEnteringOverAnOpenAttemptIsAContractViolation() = runTest {
+        val h = harness()
+        armed(h)
+
+        val refused = runCatching { h.coordinator.resumeStartupPurge() }.exceptionOrNull()
+
+        assertTrue("열린 시도 위의 시작 재개를 받아들였다: $refused", refused is IllegalStateException)
+    }
+
+    /**
+     * A head task never enters over somebody else's hold. It would raise the generation, republish
+     * state and edit the record before anything noticed — and on its way out its own completion
+     * would clear the hold it never owned.
+     */
+    @Test
+    fun anIdentityEventEnteringOverAHoldIsAContractViolation() = runTest {
+        val h = harness()
+        holdABind(h)
+
+        val bind = runCatching { h.coordinator.onIdentityChanged(a8) }.exceptionOrNull()
+        val end = runCatching { h.coordinator.onSignedOut(a7) }.exceptionOrNull()
+
+        assertTrue("보류 위의 신원 변경을 받아들였다: $bind", bind is IllegalStateException)
+        assertTrue("보류 위의 종료를 받아들였다: $end", end is IllegalStateException)
+    }
 }

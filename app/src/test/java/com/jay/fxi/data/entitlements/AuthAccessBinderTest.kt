@@ -1249,6 +1249,51 @@ class AuthAccessBinderTest {
         assertEquals("user-a", store.record.ownerUid)
         processJob.cancel()
     }
+
+    /**
+     * The startup purge used to run inside the same body whose `finally` stops the consumer, so a
+     * journal a previous process left behind could end the identity funnel before it read anything.
+     * It is a head task now: the failure holds, the hold's own round retries it, and the funnel
+     * serves what comes next.
+     */
+    @Test
+    fun aStartupPurgeThatThrows_doesNotEndTheConsumer() = runTest {
+        val calls = mutableListOf<Call>()
+        val purger = RecordingPurger()
+        var failNext = true
+        purger.onPurge = { if (failNext) { failNext = false; throw java.io.IOException("purge") } }
+        val binder = build(calls, purger, seedJournal = true)
+
+        binder.start()
+        advanceUntilIdle()
+
+        assertTrue("재개가 다시 시도되지 않았다", purger.attempts.size >= 2)
+        binder.onFenceObserved(fenceOf("user-a"))
+        advanceUntilIdle()
+        assertEquals("소비자가 죽어 뒤 사건이 버려졌다", listOf(Call.OwnerChanged("user-a")), calls)
+        processJob.cancel()
+    }
+
+    /**
+     * And nothing is accepted until it finishes. A purge that keeps failing runs out of automatic
+     * rounds and the hold stands — the funnel stays at that head task rather than binding an owner
+     * over a startup resume that never completed.
+     */
+    @Test
+    fun aStartupPurgeStillHeld_acceptsNothingBehindIt() = runTest {
+        val calls = mutableListOf<Call>()
+        val purger = RecordingPurger()
+        purger.onPurge = { throw java.io.IOException("purge") }
+        val binder = build(calls, purger, seedJournal = true)
+
+        binder.start()
+        binder.onFenceObserved(fenceOf("user-a"))
+        advanceUntilIdle()
+
+        assertTrue("자동 회차가 돌지 않았다", purger.attempts.size >= 2)
+        assertEquals("보류가 선 채로 뒤 사건이 적용됐다", emptyList<Call>(), calls)
+        processJob.cancel()
+    }
 }
 /**
  * The consumer's own failure, not a cancellation. `CancellationException` extends
