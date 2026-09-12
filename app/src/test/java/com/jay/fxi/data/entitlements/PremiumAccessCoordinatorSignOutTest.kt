@@ -17,6 +17,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -1601,5 +1602,195 @@ class PremiumAccessCoordinatorSignOutTest {
 
         assertTrue("보류 위의 신원 변경을 받아들였다: $bind", bind is IllegalStateException)
         assertTrue("보류 위의 종료를 받아들였다: $end", end is IllegalStateException)
+    }
+
+    // What a surface may say (slice 8a)
+
+    /**
+     * The banner earns its place only when the machine has stopped trying. A hold opened by the
+     * first failed step is still on its automatic batch, and putting that on screen would turn
+     * every transient disk fault into an error the user is asked to act on.
+     */
+    @Test
+    fun aHoldIsNotSurfacedUntilItsAutomaticBatchStops() = runTest {
+        val h = harness()
+        var held = holdABind(h)
+
+        assertEquals(
+            "자동 배치가 도는 중에 배너가 떴다",
+            IdentityRecoveryState.None,
+            h.coordinator.identityRecovery.value
+        )
+
+        h.store.loadsFail = true
+        repeat(PersistenceRecoveryPolicy.AUTOMATIC_ROUNDS) { held = resumeWhenDue(h, held).heldByPersistence() }
+
+        val shown = h.coordinator.identityRecovery.value as IdentityRecoveryState.HoldUnfinished
+        assertEquals(held.id, shown.id)
+        assertEquals(HeldWork.SIGN_IN, shown.work)
+        assertEquals(HoldProgress.STOPPED, shown.progress)
+        assertEquals(NoAutoRetry.BUDGET_EXHAUSTED, shown.reason)
+    }
+
+    /**
+     * And once it has earned it, a re-check does not take it away. `admitRound` clears `blocked`
+     * when it spends a wake, so a surface filtering on that field alone would hide the banner at
+     * the point when the admitted round's updated hold is published — while access is still refused.
+     */
+    @Test
+    fun aSurfacedHoldStaysSurfacedThroughARecheck() = runTest {
+        val h = harness()
+        var held = holdABind(h)
+        h.store.loadsFail = true
+        repeat(PersistenceRecoveryPolicy.AUTOMATIC_ROUNDS) { held = resumeWhenDue(h, held).heldByPersistence() }
+        assertTrue(h.coordinator.identityRecovery.value is IdentityRecoveryState.HoldUnfinished)
+
+        assertTrue(h.coordinator.retryPersistence(held.id))
+        val requested = h.coordinator.identityRecovery.value as IdentityRecoveryState.HoldUnfinished
+        assertEquals(HoldProgress.REQUESTED, requested.progress)
+
+        // The re-check runs and fails again. The wake bought a whole new batch, so the next round
+        // is scheduled rather than stopped — and the banner is still there either way, which is
+        // what this pins.
+        val again = h.coordinator.resumePersistence(held.id).heldByPersistence("재확인 뒤")
+        val still = h.coordinator.identityRecovery.value as IdentityRecoveryState.HoldUnfinished
+        assertEquals(again.id, still.id)
+        assertEquals(HoldProgress.SCHEDULED, still.progress)
+        assertEquals("새 배치가 도는데 멈춘 이유가 남았다", null, still.reason)
+    }
+
+    /** Resolving the work is what clears it — not the button, and not a round starting. */
+    @Test
+    fun aResolvedHoldClearsTheSurface() = runTest {
+        val h = harness()
+        var held = holdABind(h)
+        h.store.loadsFail = true
+        repeat(PersistenceRecoveryPolicy.AUTOMATIC_ROUNDS) { held = resumeWhenDue(h, held).heldByPersistence() }
+        assertTrue(h.coordinator.identityRecovery.value is IdentityRecoveryState.HoldUnfinished)
+
+        h.store.loadsFail = false
+        assertTrue(h.coordinator.retryPersistence(held.id))
+        h.coordinator.resumePersistence(held.id).applied("재확인이 성공한 회차")
+
+        assertEquals(IdentityRecoveryState.None, h.coordinator.identityRecovery.value)
+    }
+
+    /**
+     * An `Armed` attempt is excluded from the `recovering` signal the supervisor watches, so
+     * nothing would ever claim a run for it and the recovery status stays null. Reading the
+     * attempt itself is what keeps that sealed state from being invisible.
+     */
+    @Test
+    fun anArmedAttemptIsSurfacedThoughNoRecoveryRunExists() = runTest {
+        val h = harness()
+        premiumFor(h, a7)
+
+        assertTrue(h.coordinator.prepareSignOut(a7) is SignOutStart.Armed)
+
+        assertEquals(
+            IdentityRecoveryState.SignOutUnfinished(recovering = false),
+            h.coordinator.identityRecovery.value
+        )
+    }
+
+    /**
+     * The surfacing record outlives the hold it names, so what keeps it from mattering is that it
+     * has to name the hold standing *now*. A later hold starts its own automatic batch unseen.
+     */
+    @Test
+    fun aLaterHoldDoesNotInheritAnEarlierHoldsBanner() = runTest {
+        val h = harness()
+        var first = holdABind(h)
+        h.store.loadsFail = true
+        repeat(PersistenceRecoveryPolicy.AUTOMATIC_ROUNDS) { first = resumeWhenDue(h, first).heldByPersistence() }
+        assertTrue("첫 보류가 표시되지 않았다", h.coordinator.identityRecovery.value is IdentityRecoveryState.HoldUnfinished)
+
+        h.store.loadsFail = false
+        assertTrue(h.coordinator.retryPersistence(first.id))
+        h.coordinator.resumePersistence(first.id).applied("첫 보류 해소")
+        assertEquals(IdentityRecoveryState.None, h.coordinator.identityRecovery.value)
+
+        // A second hold, still on its own first automatic batch.
+        h.setLive(a8)
+        h.store.bindFault = EditFault.BEFORE_WRITE
+        val second = h.coordinator.onIdentityChanged(a8).heldByPersistence("두 번째 보류")
+        assertNotEquals(first.id, second.id)
+
+        assertEquals(
+            "앞선 보류의 표시를 새 보류가 물려받았다",
+            IdentityRecoveryState.None,
+            h.coordinator.identityRecovery.value
+        )
+    }
+
+    /** A re-check named against a hold that is no longer the pending one is refused, not misapplied. */
+    @Test
+    fun aRecheckNamingAnEarlierHoldIsRefused() = runTest {
+        val h = harness()
+        val first = holdABind(h)
+        resumeWhenDue(h, first).applied()
+
+        // A second, different hold — a stale surface could still be holding the first id.
+        h.setLive(a8)
+        h.store.bindFault = EditFault.BEFORE_WRITE
+        val second = h.coordinator.onIdentityChanged(a8).heldByPersistence("두 번째 보류")
+        assertNotEquals("두 보류가 같은 id 를 받았다", first.id, second.id)
+
+        assertFalse("옛 id 의 재확인이 새 보류를 건드렸다", h.coordinator.retryPersistence(first.id))
+        // The second hold is untouched: its own re-check is still available to be recorded.
+        assertTrue("새 보류에 이미 깨우기가 서 있었다", h.coordinator.retryPersistence(second.id))
+    }
+
+    /**
+     * This round reads back before publishing its updated hold. While that read is suspended the
+     * surface must already report RUNNING, rather than keep projecting the pre-admission hold's
+     * REQUESTED — which is what the fields alone say.
+     */
+    @Test
+    fun aRoundIsRunningFromItsReadBackOnward() = runTest {
+        val h = harness()
+        var held = holdABind(h)
+        h.store.loadsFail = true
+        repeat(PersistenceRecoveryPolicy.AUTOMATIC_ROUNDS) { held = resumeWhenDue(h, held).heldByPersistence() }
+        assertTrue(h.coordinator.retryPersistence(held.id))
+
+        h.store.loadsFail = false
+        val gate = CompletableDeferred<Unit>()
+        h.store.blockNextLoadOn = gate
+        val round = async { h.coordinator.resumePersistence(held.id) }
+        runCurrent()
+
+        try {
+            val shown = h.coordinator.identityRecovery.value as IdentityRecoveryState.HoldUnfinished
+            assertEquals("재읽기 중인 회차가 실행 중으로 보이지 않는다", HoldProgress.RUNNING, shown.progress)
+            assertEquals("실행 중인데 멈춘 이유가 붙었다", null, shown.reason)
+        } finally {
+            gate.complete(Unit)
+        }
+        round.await()
+    }
+
+    /** And nothing is left marked as running once a round is over, by failure or by success. */
+    @Test
+    fun anEndedRoundLeavesNoRunningMark() = runTest {
+        val h = harness()
+        var held = holdABind(h)
+        h.store.loadsFail = true
+
+        // Every failing round: the hold is surfaced from the last one onward, and never running.
+        repeat(PersistenceRecoveryPolicy.AUTOMATIC_ROUNDS) {
+            held = resumeWhenDue(h, held).heldByPersistence()
+            val shown = h.coordinator.identityRecovery.value
+            if (shown is IdentityRecoveryState.HoldUnfinished) {
+                assertNotEquals("끝난 회차가 실행 중으로 남았다", HoldProgress.RUNNING, shown.progress)
+            }
+        }
+        assertTrue(h.coordinator.identityRecovery.value is IdentityRecoveryState.HoldUnfinished)
+
+        h.store.loadsFail = false
+        assertTrue(h.coordinator.retryPersistence(held.id))
+        h.coordinator.resumePersistence(held.id).applied("성공으로 끝난 회차")
+
+        assertEquals(IdentityRecoveryState.None, h.coordinator.identityRecovery.value)
     }
 }

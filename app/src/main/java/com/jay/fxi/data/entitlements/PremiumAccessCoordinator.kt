@@ -141,10 +141,61 @@ class PremiumAccessCoordinator(
     private fun accessAdmittedLocked(): Boolean =
         SignOutAttemptPolicy.admitsAccessQueries(attempt) && identityPersistencePending == null
 
+    /**
+     * The last hold this process told the user about. Ids are never reused.
+     *
+     * Kept here rather than derived, and by the coordinator rather than a surface: a hold running a
+     * re-check is indistinguishable from one that never stopped, so "we have already said something
+     * about this" has to be remembered by whoever serialises the changes. A surface holding it
+     * instead would be a second source of truth that can disagree.
+     *
+     * Deliberately **not** cleared when the hold resolves. Whether it still counts is one question —
+     * does it name the hold that is standing now — and answering it in one place is what keeps a
+     * stale value from mattering. Clearing as well would be a second guard covering the same case,
+     * and neither would then be observable on its own.
+     */
+    private var surfacedHoldId: Long? = null
+
+    /**
+     * The hold whose round is executing right now, or null. Guarded by [mutex].
+     *
+     * Tracked rather than derived because the fields cannot say it. A round's read-back runs before
+     * the updated hold is published, and admitting an automatic round *keeps* a wake that was held through
+     * it — so "no schedule and a standing wake" describes both a request nobody has picked up and a
+     * round already at work.
+     */
+    private var runningPersistenceId: Long? = null
+
+    private val _identityRecovery = MutableStateFlow<IdentityRecoveryState>(IdentityRecoveryState.None)
+
+    /** What a surface may say about identity work that has not finished. See [IdentityRecoveryState]. */
+    internal val identityRecovery: StateFlow<IdentityRecoveryState> = _identityRecovery.asStateFlow()
+
     /** Publishes the hold so waiters see the revision they were handed move. */
     private fun setPendingLocked(pending: PendingPersistence?) {
         identityPersistencePending = pending
         _persistenceSignal.value = pending
+        // The first stop is what earns the banner. Later rounds of the same hold keep it, blocked
+        // or not, because the id has not changed.
+        if (pending?.blocked != null) surfacedHoldId = pending.id
+        publishIdentityRecoveryLocked()
+    }
+
+    /**
+     * Recomposes the surface state from everything that feeds it, under the lock that changed it.
+     *
+     * Called from every writer of the display inputs, so a surface never sees an attempt change
+     * without the recovery status that belongs to it, or a hold change without its own progress.
+     */
+    private fun publishIdentityRecoveryLocked() {
+        _identityRecovery.value = identityRecoveryOf(
+            attempt = attempt,
+            automaticRunning = _recoveryStatus.value?.running == true,
+            hold = identityPersistencePending,
+            // The only question a stale id has to survive: does it name the hold standing now.
+            surfaced = identityPersistencePending?.let { surfacedHoldId == it.id } ?: false,
+            runningHoldId = runningPersistenceId
+        )
     }
 
     /**
@@ -676,6 +727,19 @@ class PremiumAccessCoordinator(
      * none for doing.
      */
     private suspend fun runRoundLocked(admitted: PendingPersistence): IdentityStep {
+        // Marked before the read-back, not after: that read is the round's first disk work, and
+        // until it returns nothing else would say the round had started.
+        runningPersistenceId = admitted.id
+        publishIdentityRecoveryLocked()
+        try {
+            return runAdmittedRoundLocked(admitted)
+        } finally {
+            runningPersistenceId = null
+            publishIdentityRecoveryLocked()
+        }
+    }
+
+    private suspend fun runAdmittedRoundLocked(admitted: PendingPersistence): IdentityStep {
         val known = when (val phase = admitted.phase) {
             is PendingPersistence.Phase.Unknown -> when (val resolved = resolveHeldEditLocked(admitted, phase)) {
                 is HeldEditResolution.Established -> resolved.pending
@@ -1026,6 +1090,9 @@ class PremiumAccessCoordinator(
             held = !SignOutAttemptPolicy.admitsIdentityEvents(next),
             recovering = next is SignOutAttempt.Recovering || next is SignOutAttempt.Unresolved
         )
+        // The surface reads the attempt itself, not `recovering` — an Armed attempt is excluded
+        // from that flag and would otherwise be a sealed state nothing can report.
+        publishIdentityRecoveryLocked()
     }
 
     /** Every change of the open attempt, for the binder's recovery supervisor. A hint: decisions are taken under the lock. */
@@ -1050,6 +1117,9 @@ class PremiumAccessCoordinator(
             if (attempt?.ticket != ticket) return@withLock
             _recoveryStatus.value =
                 change(_recoveryStatus.value?.takeIf { it.ticket == ticket } ?: SignOutRecoveryStatus(ticket, running = false))
+            // The third writer of a surface input: whether a run is under way is part of what the
+            // banner says, and it changes here without the attempt or the hold moving.
+            publishIdentityRecoveryLocked()
         }
     }
 
