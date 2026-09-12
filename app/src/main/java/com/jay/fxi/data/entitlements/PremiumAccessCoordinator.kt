@@ -167,9 +167,11 @@ class PremiumAccessCoordinator(
         cancelProbeLocked()
         clearForcePremiumLocked()
         // Same reason as sign-out: the previous owner's grant must stop being readable before the
-        // disk work, not after it.
+        // disk work, not after it. KRX goes with it — published after the disk work, a read or
+        // write that fails would leave the previous owner's VISIBLE standing.
         _state.value =
             OwnedPremiumAccess(identity.uid, identity.authGeneration, PremiumAccessState.NoGrant)
+        _krx.value = KrxCapabilityState.HIDDEN
         schedule.cancel(preserveServerFloor = true)
         val held = { HeldIdentityEvent.Bind(checkNotNull(open).ticket, identity) }
         val before = identityEditLocked(open, PendingEdit.READ, before = null, held) { store.load() }
@@ -220,7 +222,10 @@ class PremiumAccessCoordinator(
         // rule for a grant; for taking one away it is backwards — `store.signOut()` is disk I/O, and
         // until it returns a reader still sees the old grant. A same-uid sign-in landing in that
         // window matches on uid and opens the premium surface on a session that no longer exists.
+        // KRX is published here for the same reason, not after the store work: a read or write
+        // that fails below would otherwise leave the ended session's VISIBLE standing.
         _state.value = OwnedPremiumAccess(null, null, PremiumAccessState.NoGrant)
+        _krx.value = KrxCapabilityState.HIDDEN
         schedule.cancel(preserveServerFloor = true)
         // A retried end whose rotation a read-back found landed uses that result: rotating again
         // would take down the namespace minted by the first rotation.
@@ -240,7 +245,6 @@ class PremiumAccessCoordinator(
         }
         completedBinding = null
         heldEvent = null
-        _krx.value = KrxCapabilityState.HIDDEN
         // What this end did is recorded before cleanup runs, because cleanup can fail. Only
         // finishing the attempt — which releases the seal — waits for it.
         val finishing = open?.let { current ->

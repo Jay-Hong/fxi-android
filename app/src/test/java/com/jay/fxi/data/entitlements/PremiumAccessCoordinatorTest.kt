@@ -237,6 +237,99 @@ class PremiumAccessCoordinatorTest {
     }
 
     /**
+     * Slice 7a: KRX used to be hidden only after the disk work of an identity transition. A read or
+     * write that failed there left the previous session's VISIBLE standing while the premium state
+     * had already dropped to NoGrant — the capability outliving the grant it belongs to.
+     */
+    @Test
+    fun anIdentityChangeWhoseDiskWorkFails_stillHidesKrxFirst() = runTest {
+        val store = FakeStore(ids())
+        val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = true)) })
+        coordinator.onIdentityChanged(ownerFence(OWNER))
+        coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+        assertEquals(KrxCapabilityState.VISIBLE, coordinator.krx.value)
+
+        store.failNextLoad = true
+        // With no attempt open the failure propagates, which is what slice 7b takes over. What must
+        // already hold is that nothing readable survives it.
+        val thrown = runCatching { coordinator.onIdentityChanged(ownerFence("user-b")) }.exceptionOrNull()
+        assertTrue("디스크 실패가 전파돼야 한다: $thrown", thrown is java.io.IOException)
+
+        assertEquals(KrxCapabilityState.HIDDEN, coordinator.krx.value)
+        assertEquals(PremiumAccessState.NoGrant, coordinator.state.value.state)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aSignOutWhoseDiskWorkFails_stillHidesKrxFirst() = runTest {
+        val store = FakeStore(ids())
+        val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = true)) })
+        coordinator.onIdentityChanged(ownerFence(OWNER))
+        coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+        assertEquals(KrxCapabilityState.VISIBLE, coordinator.krx.value)
+
+        store.failNextLoad = true
+        val thrown = runCatching { coordinator.onSignedOut(ownerFence(OWNER)) }.exceptionOrNull()
+        assertTrue("디스크 실패가 전파돼야 한다: $thrown", thrown is java.io.IOException)
+
+        assertEquals(KrxCapabilityState.HIDDEN, coordinator.krx.value)
+        assertEquals(PremiumAccessState.NoGrant, coordinator.state.value.state)
+        processJob.cancel()
+    }
+
+    /**
+     * The timing, not just the outcome: KRX is hidden *before* the first suspension, so it is
+     * already hidden while the disk work is still parked. An implementation that hid it from a
+     * failure path instead would pass the two tests above and fail this one.
+     */
+    @Test
+    fun anIdentityChange_hidesKrxBeforeItsDiskWorkEvenStarts() = runTest {
+        val store = FakeStore(ids())
+        val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = true)) })
+        coordinator.onIdentityChanged(ownerFence(OWNER))
+        coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+        assertEquals(KrxCapabilityState.VISIBLE, coordinator.krx.value)
+
+        val parked = CompletableDeferred<Unit>()
+        store.blockNextLoadOn = parked
+        val binding = async { coordinator.onIdentityChanged(ownerFence("user-b")) }
+        runCurrent()
+
+        assertEquals("디스크 작업이 아직 도는 중인데 KRX 가 보였다", KrxCapabilityState.HIDDEN, coordinator.krx.value)
+        assertEquals(PremiumAccessState.NoGrant, coordinator.state.value.state)
+
+        parked.complete(Unit)
+        binding.await()
+        assertEquals(KrxCapabilityState.HIDDEN, coordinator.krx.value)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aSignOut_hidesKrxBeforeItsDiskWorkEvenStarts() = runTest {
+        val store = FakeStore(ids())
+        val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = true)) })
+        coordinator.onIdentityChanged(ownerFence(OWNER))
+        coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceUntilIdle()
+        assertEquals(KrxCapabilityState.VISIBLE, coordinator.krx.value)
+
+        val parked = CompletableDeferred<Unit>()
+        store.blockNextLoadOn = parked
+        val ending = async { coordinator.onSignedOut(ownerFence(OWNER)) }
+        runCurrent()
+
+        assertEquals("해제의 디스크 작업 중에 KRX 가 보였다", KrxCapabilityState.HIDDEN, coordinator.krx.value)
+
+        parked.complete(Unit)
+        ending.await()
+        assertEquals(KrxCapabilityState.HIDDEN, coordinator.krx.value)
+        processJob.cancel()
+    }
+
+    /**
      * Regression: the answer carried an auth generation that nothing checked, so a reply from a
      * session the transport had already superseded still granted.
      */
