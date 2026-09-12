@@ -22,7 +22,12 @@ fun interface EpochIdGenerator {
  * an account switch chain A → B → C would purge A, clear the journal, and strand B.
  *
  * The owner is the user whose data this is, which after a switch is *not* whoever is signed in
- * now. The epochs are null for an axis this entry did not rotate.
+ * now.
+ *
+ * [scopes] decides which axes this entry covers; an axis it does not name is not cleaned. Within a
+ * covered axis a null epoch means that epoch is **unknown**, which is not the same as nothing to
+ * do: the obligation is then every past namespace of that axis except the live one. A null owner
+ * means the target cannot be narrowed to one uid. Both happen when the record itself was lost.
  */
 data class PendingPurge(
     val ownerUid: String?,

@@ -16,7 +16,10 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Rule
 import org.junit.Test
@@ -37,6 +40,9 @@ class DataStoreAccessEpochStoreTest {
     private var counter = 0
     private val ids = EpochIdGenerator { "epoch-${counter++}" }
 
+    /** The production handler with its log swapped for a counter: `android.util.Log` throws here. */
+    private var corruptionsDetected = 0
+
     private val file by lazy { File(folder.root, "access_epoch.preferences_pb") }
     private var scope: CoroutineScope? = null
     private var dataStore: DataStore<Preferences>? = null
@@ -48,7 +54,12 @@ class DataStoreAccessEpochStoreTest {
     private suspend fun open(): DataStoreAccessEpochStore {
         close()
         val opened = CoroutineScope(Dispatchers.IO + SupervisorJob())
-        val store = PreferenceDataStoreFactory.create(scope = opened) { file }
+        // The production handler's own record-building logic, with its log replaced by a counter.
+        // That the app installs a handler at all is [AccessEpochStoreWiringTest]'s job.
+        val store = PreferenceDataStoreFactory.create(
+            corruptionHandler = accessEpochCorruptionHandler(ids) { corruptionsDetected += 1 },
+            scope = opened
+        ) { file }
         scope = opened
         dataStore = store
         return DataStoreAccessEpochStore(store, ids)
@@ -202,6 +213,150 @@ class DataStoreAccessEpochStoreTest {
         assertEquals(bound.userAccessEpoch, entry.userAccessEpoch)
         assertEquals(bound.krxCapabilityEpoch, entry.krxCapabilityEpoch)
         assertNotEquals(bound.userAccessEpoch, reopened.userAccessEpoch)
+    }
+
+    /**
+     * Slice 6: a journal line this build cannot read still owes a purge. Dropping it would forget
+     * an obligation the last process recorded, and nothing else remembers it.
+     */
+    @Test
+    fun anUnreadableJournalEntry_survivesAsAnObligationWithAnUnknownTarget() = runBlocking {
+        open()
+        checkNotNull(dataStore).edit {
+            it[stringPreferencesKey("pending_purge_journal")] =
+                "u0|e-old-user|e-old-krx|USER\nthis-line-is-not-an-entry"
+        }
+
+        val loaded = open().load().pendingPurges
+
+        assertEquals("both lines are obligations", 2, loaded.size)
+        assertEquals(
+            PendingPurge("u0", "e-old-user", "e-old-krx", setOf(PurgeScope.USER)),
+            loaded[0]
+        )
+        assertEquals(
+            PendingPurge(null, null, null, setOf(PurgeScope.USER, PurgeScope.CAPABILITY)),
+            loaded[1]
+        )
+    }
+
+    /** A scope name this build does not know widens the entry; narrowing it would drop that axis. */
+    @Test
+    fun aJournalEntryNamingAnUnknownScope_widensRatherThanDropsIt() = runBlocking {
+        open()
+        checkNotNull(dataStore).edit {
+            it[stringPreferencesKey("pending_purge_journal")] = "u0|e-old-user|e-old-krx|USER,SOMETHING_NEW"
+        }
+
+        assertEquals(
+            listOf(PendingPurge(null, null, null, setOf(PurgeScope.USER, PurgeScope.CAPABILITY))),
+            open().load().pendingPurges
+        )
+    }
+
+    /**
+     * The writer removes the key when nothing is owed, so a key that is present but says nothing is
+     * damage. Only an absent key means an empty journal.
+     */
+    @Test
+    fun aJournalKeyHoldingNothing_isDamageRatherThanAnEmptyJournal() = runBlocking {
+        val unknown = PendingPurge(null, null, null, setOf(PurgeScope.USER, PurgeScope.CAPABILITY))
+        val cases = mapOf(
+            "빈 문자열" to ("" to listOf(unknown)),
+            "줄바꿈만" to ("\n" to listOf(unknown, unknown)),
+            "정상 항목과 빈 줄" to ("u0|e1|e2|USER\n" to listOf(PendingPurge("u0", "e1", "e2", setOf(PurgeScope.USER)), unknown)),
+            "빈 scope 이름 혼합" to ("u0|e1|e2|USER," to listOf(unknown))
+        )
+        for ((name, case) in cases) {
+            val (raw, expected) = case
+            open()
+            checkNotNull(dataStore).edit { it[stringPreferencesKey("pending_purge_journal")] = raw }
+
+            assertEquals(name, expected, open().load().pendingPurges)
+        }
+    }
+
+    /** Control: no key at all is the ordinary "nothing owed" state, not damage. */
+    @Test
+    fun anAbsentJournalKey_owesNothing() = runBlocking {
+        open()
+        checkNotNull(dataStore).edit { it[stringPreferencesKey("owner_uid")] = "u1" }
+
+        assertTrue(open().load().pendingPurges.isEmpty())
+    }
+
+    /**
+     * Slice 6: a file DataStore cannot parse is replaced by the obligation the lost journal stood
+     * for, not by an empty record — the data those entries named is still on disk.
+     */
+    @Test
+    fun anUnparseableFile_isReplacedByAnUnknownTargetObligation() = runBlocking {
+        open().bindOwner("u1")
+        close()
+        file.writeBytes(byteArrayOf(0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07))
+
+        val recovered = open().load()
+
+        assertEquals("the handler ran exactly once", 1, corruptionsDetected)
+        assertNull("recovery leaves nobody bound", recovered.ownerUid)
+        assertNull(recovered.teardownOwedFor)
+        assertEquals(
+            "the obligation names neither an owner nor a past epoch, because neither survived",
+            listOf(PendingPurge(null, null, null, setOf(PurgeScope.USER, PurgeScope.CAPABILITY))),
+            recovered.pendingPurges
+        )
+        assertNotNull("a namespace to use from here", recovered.userAccessEpoch)
+        assertNotNull(recovered.krxCapabilityEpoch)
+        assertNotEquals(recovered.userAccessEpoch, recovered.krxCapabilityEpoch)
+        assertFalse("the new namespace holds nothing yet", recovered.mayContainPremiumData)
+        assertFalse(recovered.mayContainKrxData)
+    }
+
+    /** Recovery has to be persisted, not recomputed: a restart before any bind keeps what it wrote. */
+    @Test
+    fun aRecoveredFile_survivesAReopenWithNoBindInBetween() = runBlocking {
+        open()
+        close()
+        file.writeBytes(byteArrayOf(0x7f, 0x7f, 0x7f, 0x7f))
+        val recovered = open().load()
+
+        val reopened = open().load()
+
+        assertEquals(recovered, reopened)
+        assertEquals(1, reopened.pendingPurges.size)
+    }
+
+    /** And the bind that eventually happens adds no second teardown. */
+    @Test
+    fun bindingAfterRecovery_takesTheNewNamespaceWithoutRotatingAgain() = runBlocking {
+        open()
+        close()
+        file.writeBytes(byteArrayOf(0x41, 0x42, 0x43))
+        val recovered = open().load()
+
+        val bound = open().bindOwner("u2")
+
+        assertEquals("u2", bound.ownerUid)
+        assertEquals(recovered.userAccessEpoch, bound.userAccessEpoch)
+        assertEquals(recovered.krxCapabilityEpoch, bound.krxCapabilityEpoch)
+        assertEquals(recovered.pendingPurges, bound.pendingPurges)
+    }
+
+    /** Control: an intact file is not touched by the handler. */
+    @Test
+    fun anIntactFile_isLeftAlone() = runBlocking {
+        val bound = open().bindOwner("u1")
+
+        assertEquals(bound, open().load())
+        assertTrue(open().load().pendingPurges.isEmpty())
+        assertEquals("an intact file is not corruption", 0, corruptionsDetected)
+    }
+
+    /** Control: a first install has no file at all, and that is not corruption. */
+    @Test
+    fun aMissingFile_isAFreshInstallRatherThanARecovery() = runBlocking {
+        assertEquals(AccessEpochRecord(), open().load())
+        assertEquals("a missing file is not corruption", 0, corruptionsDetected)
     }
 
     private companion object {

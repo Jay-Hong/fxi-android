@@ -1035,6 +1035,33 @@ class PremiumAccessCoordinatorTest {
         processJob.cancel()
     }
 
+    /**
+     * Slice 6: the record a corrupt file is replaced with reaches the purgers with nobody signed in.
+     *
+     * That is the whole point of writing an obligation rather than an empty record — the startup
+     * resume runs before any identity event, and an empty journal would end it there.
+     */
+    @Test
+    fun aRecoveredRecord_deliversItsUnknownObligationToBothPurgers_whileSignedOut() = runTest {
+        val store = FakeStore(ids())
+        store.record = accessEpochRecoveryRecord(ids())
+        val purger = RecordingPurger(PurgeResult.Deferred("not owned by this slice"))
+        val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = false)) }, purger)
+
+        coordinator.resumePendingPurges()
+        advanceUntilIdle()
+
+        assertEquals("both scopes are asked", 2, purger.calls.size)
+        assertTrue("the target is unknown, not narrowed", purger.calls.all { it.ownerUid == null })
+        assertTrue(purger.calls.all { it.pending.userAccessEpoch == null && it.pending.krxCapabilityEpoch == null })
+        assertEquals(
+            "a deferred purge keeps the obligation for the next start",
+            1,
+            store.record.pendingPurges.size
+        )
+        processJob.cancel()
+    }
+
     @Test
     fun deferredPurge_keepsTheJournalForALaterAttempt() = runTest {
         val store = FakeStore(ids())
