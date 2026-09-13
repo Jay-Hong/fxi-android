@@ -83,7 +83,8 @@ class AuthTokenProvider internal constructor(
                 throw AuthIdentityChangedException()
             }
             selectRejectedIdentityLocked(rejected.identity)
-            inFlightRefreshes[key]?.let { return@withLock RefreshDecision.Await(it) }
+            // A completed entry may remain until cleanup runs; later callers must use the completed-refresh policy below.
+            inFlightRefreshes[key]?.takeUnless { it.isCompleted }?.let { return@withLock RefreshDecision.Await(it) }
             if (completedRefreshes.containsKey(key.tokenSha256)) {
                 return@withLock completedRefreshes[key.tokenSha256]?.let {
                     RefreshDecision.UseCurrentCredential(it)
@@ -150,7 +151,7 @@ class AuthTokenProvider internal constructor(
             rejectedIdentity == snapshot.identity &&
                 (
                     completedRefreshes.containsKey(key.tokenSha256) ||
-                        inFlightRefreshes.containsKey(key)
+                        inFlightRefreshes[key]?.isCompleted == false
                     )
         }
     }
@@ -192,7 +193,8 @@ class AuthTokenProvider internal constructor(
 
         val key = FetchKey(identity, forceRefresh)
         val deferred = mutex.withLock {
-            inFlightFetches[key] ?: processScope.async {
+            // Same as refreshes: reusing a completed lookup would hand out a credential a later refresh has replaced.
+            inFlightFetches[key]?.takeUnless { it.isCompleted } ?: processScope.async {
                 if (source.currentIdentity() != identity) {
                     throw AuthIdentityChangedException()
                 }
