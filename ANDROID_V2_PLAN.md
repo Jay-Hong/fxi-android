@@ -137,6 +137,28 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 >
 > 범위·D-결정·슬라이스 경계·release gate·다른 DoD는 바꾸지 않는다. 이 개정은 어떤 arming·rollout·
 > deploy도 열지 않으며, coordinator는 여전히 production에서 생성되지 않는다.
+>
+> **동결 후 6번 명시적 개정 기록(사용자 GO 2026-09-13, Claude·Codex 검토).** D23 `SignedOut` 행("Firebase UID
+> 없음 → epoch를 먼저 rotate·persist한 뒤 purge")과 O5 회수 범위의 "앱 재시작은 … 명시적 거부 없이 보존 namespace를
+> purge하지 않는다"가 **UID 없이 시작한 cold start**에서 서로 다르게 읽혔다. 같은 문단이 정리 사유로 드는 "UID 변경"으로
+> 디스크의 이전 owner → 시작 시 UID 없음을 읽을 수도 있어 해석이 셋이었다. 또 로그아웃한 적이 없을 수도 있는
+> 사용자(Firebase 복원 오류)의 cache namespace를 버리기로 **정하는** 제품 결정이므로 2번으로 기록한다.
+>
+> **확정한 것.** (1) cold start의 첫 신원 관측이 UID 없음이면, 디스크에 이전 owner가 남아 있어도 시작 신원과의
+> 연속성이 확인되지 않은 것으로 보고 D23 `SignedOut` 행을 그 시작에서 적용한다 — 로그아웃이 있었다고 판정하는
+> 것이 아니다. (2) owner가 없어도 보호 자료 marker(`mayContain*Data`)가 서 있으면 owner 불명으로 같은 rotate를 한다.
+> (3) owner도 marker도 없으면 추가 rotate는 하지 않지만 이미 기록된 pendingPurge는 평소대로 재개한다.
+> (4) 저장된 사용자가 같은 UID로 복원된 재시작은 namespace를 보존하되, 그 UID의 로그아웃 의도가 기록돼 있으면
+> 그 정산이 먼저다. (5) 사용자 원본 preference(I4 uid scope)는 보존한다.
+>
+> **감수하는 비용.** Firebase 복원 오류·중단된 로그인 복구에서도 cache를 다시 받고 그동안 오프라인 연속성을
+> 잃는다. 누출이 아니라 비용이다. 이 결정은 Firebase Auth가 저장된 사용자를 생성자에서 동기 복원한다는 가정
+> (firebase-auth 24.0.1을 `javap`로 확인)에 기대므로 Firebase BoM을 올릴 때 다시 확인한다.
+>
+> **이 개정이 충족을 뜻하지 않는 것.** rotate와 pendingPurge 기록은 **실제 디스크 삭제가 아니다** — purger는 여전히
+> `Deferred`를 돌려 journal을 남기므로 3번 기록의 S1 purge 미충족은 그대로다. 바꾼 곳은 D23 상태 전이 표의
+> `SignedOut` 행과 O5 회수 범위 문단 두 곳이다. 범위·다른 D-결정·슬라이스 경계·release gate·다른 DoD는 바꾸지 않았고,
+> 어떤 arming·rollout·deploy도 열지 않는다.
 
 ---
 
@@ -285,7 +307,7 @@ I1의 legacy rates=S3·legacy graph=S4, I8=S7~S9, I6=S11부터 회귀 금지다.
 
 | 상태 | 화면/runtime | 진입·이탈 규칙 |
 | --- | --- | --- |
-| `SignedOut` | Login only | Firebase UID 없음. stable state를 purge하되 user/KRX epoch를 먼저 rotate·persist하고 값을 reset/재사용하지 않음 |
+| `SignedOut` | Login only | Firebase UID 없음. stable state를 purge하되 user/KRX epoch를 먼저 rotate·persist하고 값을 reset/재사용하지 않음. **cold start의 첫 신원 관측이 UID 없음이면, 디스크에 이전 owner가 남아 있어도 시작 신원과의 연속성이 확인되지 않은 것으로 보고 그 시작에서 이 행을 적용한다. owner가 없더라도 보호 자료 marker(`mayContain*Data`)가 서 있으면 owner 불명으로 같은 rotate를 한다. owner도 marker도 없으면 추가 rotate는 하지 않지만 이미 기록된 pendingPurge는 평소대로 재개한다. 사용자 원본 preference(I4 uid scope)는 보존한다**(동결 후 6번 개정) |
 | `Resolving(uid, userAccessEpoch, continuityEligible)` | 무료 snapshot | 새 UID 또는 same-UID cold start에서 서버 확정 전. continuity는 cache namespace 정리 provenance일 뿐 grant가 아니며 WS/bootstrap/Graph/알림 mutation/FCM 등록과 protected-cache read/render는 0 |
 | `Pending(noGrant, continuityEligible)` | 무료 snapshot + 조용한 재확인 | 유효한 last-good 없이 **200 + `premium_pending=true`** 또는 권한 판정 불가. 재조회 시각은 직교 `RecheckSchedule`만 소유하며 `retry_after_seconds`/typed backoff 이전 재조회 금지; continuity가 있어도 protected cache는 봉인 |
 | `FreeConfirmed` | 무료 snapshot | stable `premium_active=false`. 이전 premium runtime 또는 `mayContainPremiumData` marker가 있으면 user/KRX epoch rotate·cancel/purge·push DELETE. 로컬 구매·복원 성공은 fresh 조회와 bounded propagation probe(`[0,2,5,10,20]s`)만 시작 |
@@ -351,8 +373,10 @@ protected/KRX 데이터를 쓰기 전에 해당 `mayContain*Data=true`가 먼저
 > O6/O7에서 검토했던 설계와 선택하지 않은 이유, 재검토 조건은
 > `ANDROID_NOTIFICATION_RELIABILITY_FOLLOWUP.md`에 보존한다. 번호는 감사 이력을 위해 재사용하지 않는다.
 > **O5 회수의 범위.** iOS parity로 돌아가되 다음은 그대로 유지한다 — 명시적 거부(fresh stable false / typed
-> `premium_required` / typed `krx_entitlement_required`)·UID 변경·logout은 각 범위의 즉시 hide·purge, 앱 재시작은 grant를
-> 복원하지 않아 hide/seal하되 명시적 거부 없이 보존 namespace를 purge하지 않는다. **200 pending envelope의
+> `premium_required` / typed `krx_entitlement_required`)·UID 변경·logout은 각 범위의 즉시 hide·purge, **저장된 사용자가
+> 같은 UID로 복원된** 앱 재시작은 grant를 복원하지 않아 hide/seal하되 명시적 거부 없이 보존 namespace를 purge하지
+> 않는다 **(단 그 UID의 로그아웃 의도가 기록돼 있으면 그 정산이 먼저다). UID 없이 시작한 재시작은 D23 `SignedOut`
+> 행을 따른다**(동결 후 6번 개정). **200 pending envelope의
 > `krx_visible=false`도 edge-trigger로 즉시 적용**한다. 사라지는 것은 *시간에 의한* 만료뿐이다.
 
 #### D30 B-IPC 실행 계약
