@@ -159,6 +159,39 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > `Deferred`를 돌려 journal을 남기므로 3번 기록의 S1 purge 미충족은 그대로다. 바꾼 곳은 D23 상태 전이 표의
 > `SignedOut` 행과 O5 회수 범위 문단 두 곳이다. 범위·다른 D-결정·슬라이스 경계·release gate·다른 DoD는 바꾸지 않았고,
 > 어떤 arming·rollout·deploy도 열지 않는다.
+>
+> **동결 후 7번 명시적 개정 기록(사용자 GO 2026-09-13, Claude·Codex 검토).** iOS 1일 그래프 음영 결함 조사와 확정 수정
+> 계획(ios `89e866d`의 `GRAPH_LIVE_BAND_DECISIONS.md`·`GRAPH_LIVE_BAND_IMPLEMENTATION_PLAN.md`)을 Android 계획에 반영한다.
+> 기존 §7 S4 1d live-tail 계약은 봉 배정 시각, 타이머와 관측의 분리, 복구 완료 판정을 충분히 명시하지 않아 동결 기준
+> iOS 코드(`a36682f`)의 확인된 결함을 복제할 여지가 있었고, §7 S3에는 표시 병합(strictly-newer)이 버리는 재관측·역순
+> 입력을 그래프로 넘기는 계약이 없었다. 기준은 수정된 iOS 코드가 아니라 **확정 동작 명세와 합성 입력**이다(iOS 수정
+> 구현은 아직 없다). §2.2의 "확인된 결함은 의도적 divergence로 기록"에 따른다.
+>
+> **확정한 것(2번).** (1) S3: 표시 병합은 유지하고, 기존 권한·세션 검사와 `RateSanity`를 통과한 같은 entry에서 원 시각
+> 관측과 연속성 사건을 coordinator 직렬 scope의 상태 전이 순서로 인계한다. 어댑터는 전달 topic이 아니라 source·asset
+> 의미로 고른다. KRX는 S6. (2) S4 1d live-tail 재작성: 서버 시각 봉 배정, 타이머의 관측 합성 금지, 서버 범위·앱 관측 분리
+> 보관과 반복 seed 합집합, 닫힌 봉 재오염 금지, 봉별 복구 필요 상태·복구 세대, 보존·폐기 규칙(명시적 철회의 저장 실패·
+> 미확정은 일시 공백이 아니라 봉인), 기록기 수명·공유 버전·소비자별 접근 검사, 장기 끝점 tip, DXY tip. close는 검증 관측 중
+> 관측 시각이 가장 늦은 가격이고 없으면 seed close다 — seed에는 가격 시각이 없으므로 이것이 seed보다 실제로 최신인
+> 가격임을 보증하지 않는다는 한계를 받아들인다. (3) S4 disk에는 서버 유래 자료만 두고 관측·복구 상태는 세션 메모리에
+> 둔다. last-known 복원 seed는 관측이 아니다. (4) S4·S5·S6 DoD에 합성 입력의 슬라이스별 적용을 넣는다.
+>
+> **유지한 것.** 600초 정렬, 현재 봉 seed fold 조건, high/low 합집합, 25시간 prune, 350ms publish·off-screen, freshness
+> 600/1200 값, rollover 10초 tick, foreground ≥60초·30초 cooldown·첫 연결 제외, D14 배달·watchdog, D15, bootstrap 적용 전 검사,
+> topic last-known 계약 본문, graph disk key·KRX cache 분리, catalog 규칙, single-flight.
+>
+> **1번 정정(의미 불변, 이 개정에 함께 싣되 구분).** S4 "25시간(+1h 여유)"을 "24시간 창 + 1시간 여유(총 25시간)"로 —
+> 26시간으로도 읽혔고 iOS 코드(`start - 25*3600`)와 같은 값이다. `_bucket_align`이 계약 문서가 아니라 서버 코드 정의임을
+> 명기. S5 성능 경로의 `MainScreen`(호출처 0)을 `RootScreen` 진입의 premium 목적지로 정정 — 측정 여정과 gate는 그대로다.
+> S1 `UserScopePurger` 대상 "전체 domain/user data"에 세션 메모리 그래프 관측 기록기·복구 요청을 예시로 명기.
+>
+> **이 개정이 승인하지 않는 것.** 문서 개정이며 구현·배선 승인이 아니다. 선행조건과 시점: **관측 연결 구현 전** L-4d 권위
+> 토큰·거부 결속, L-4c ACK 적용 경계, L-4f bootstrap 발급 제어의 최종 구현 대조(관측 채택이 입력 허용 조건에 닿는다) /
+> **해당 어댑터 구현 전** 소스별 시각 의미·legacy/fallback의 fixture 확인(거래소별 원천과 전체 fallback, KRX fallback,
+> Tether 경유 FX의 전 경로 동등성은 확인 필요) / **runtime 배선 전** S1 잔여(명시적 철회 저장 실패의 봉인·재승인·정리
+> 재개 계약), L-4e grant 전달·재개와 live 접근권한 철회 검증 대조, 실제 purger 설계. 관측·복구·보관·폐기 책임은
+> topic last-known 저장소와 실제 purger 설계를 확정하기 전에 이 계약으로 맞춘다. 서버 계약·기록 유무 필드, 음영 모양,
+> KRX 관측 소비 시점(S6)은 바꾸지 않는다. 범위·다른 D-결정·release gate를 바꾸지 않고 어떤 arming·rollout·deploy도 열지 않는다.
 
 ---
 
@@ -855,7 +888,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
 - UID namespace, migration journal, `UserScopePurger`/`CapabilityScopePurger` 인터페이스와 **Android 백업 제외 규칙**을
   먼저 만든다. backup 가능한 순수 사용자 의도는 전용 DataStore 파일에만 두고 token/capability/epoch/cache/journal/tap과
   물리적으로 분리한다(D27). 이 단계에서는 아직 소비자가 살아 있는 legacy rate/graph store를 삭제하지 않는다(§9의 슬라이스별 소유권)
-- **purge 2종 분리**: ① `UserScopePurger` — logout / 계정 전환 / 계정삭제 시 전체 **domain/user data**. 단 active
+- **purge 2종 분리**: ① `UserScopePurger` — logout / 계정 전환 / 계정삭제 시 전체 **domain/user data**(세션 메모리 그래프 관측 기록기·복구 요청 포함, 동결 후 7번). 단 active
   `DeletionPending`/deletion request+phase와 완료되지 않은 access/push/purge journal은 purge 대상이 아니라 작업을 지키는 control-plane이며,
   각 전용 finalizer만 마지막에 clear한다. ② `CapabilityScopePurger` — KRX 권한 철회 시 **KRX server-derived 범위만**(시세 행·그래프 series·live 버킷·settings/history 응답 cache·pending tap). source raw preference는 보존하며 철회가 사용자 전체 데이터를 지우지 않는다
 - Entitlements repository — `krx_visible` 단일 신호. 정책명은 **첫 확인 전 deny-by-default + 동일 UID/`userAccessEpoch`/`krxCapabilityEpoch` 안에서 시간 만료 없는 last-known grant**다:
@@ -988,6 +1021,23 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
     - REST에는 `invalid_token`·`premium_required`·`krx_entitlement_required`가 **없다**. KRX 미자격은 404
       `unknown_topic` + `supported_topics`에서 제거(존재 은닉)
 - merge: `(source, asset)` 키, `mergeAt = rate_changed_at ?? timestamp`, **strictly-newer only**, 동일 시각은 기존 유지, 그룹 누락 ≠ 삭제
+  — 표시 저장소 규칙이다. 그래프 관측은 이 병합 전에, 기존 권한·세션 검사와 `RateSanity`를 통과한 같은 entry 집합에서 원 시각
+  (`timestamp`·`rate_changed_at`·DXY 공급 source)과 전달 topic·경로를 보존해 따로 인계한다. 관측 채택 결과는 사용 가능한 가격
+  판정·배달·watchdog을 바꾸지 않는다(동결 후 7번)
+- **그래프 관측 연결**(동결 후 7번): WS·REST bootstrap의 일반 시세와 DXY 네 경로에서, 표시 병합이 버리는 재관측·역순 입력을
+  포함한 관측 후보를 인계한다. 어댑터는 전달 topic이 아니라 source·asset 의미로 고르며(Tether payload의 은행·인베스팅도 단일
+  시각), 원래 topic은 출처로 보존해 topic·source·asset·catalog 매핑을 S4 채택 전에 검사한다. 관측과 연속성 사건은 coordinator
+  직렬 scope가 확정한 상태 전이 순서로 동기·비차단 인계하고 ACK·lease 만료·identity retirement·shutdown 경로를 포함한다 —
+  입력 Channel 순서와의 일치는 주장하지 않는다. 연속성 사건은 초기·접근 재개, topic별 전달 중단·재개, 인증 실패·회복,
+  ACK active set 변화, 연결 생성 실패, 인계 유실, 명시적 취소·접근 봉인·topic purge·기록기 종료를 구분하고 자료 scope·권위
+  세대와 epoch 발생 시각을 싣는다(deadline용 monotonic 시각과 구분하며 가격 봉 배정에 쓰지 않는다). 연결 open은 전달 재개의
+  증거가 아니고 WS 종료는 REST bootstrap 경로의 종료가 아니다. ACK·인증 회복만으로 과거 공백을 해제하지 않는다. 배선하는
+  sink는 즉시 반환·비예외이며 enqueue 실패·닫힘·포화를 조용히 무시하지 않고, 인계 유실은 기록기에 연속성 상실·복구 필요로
+  전달한다. 권위 토큰은 지연 작업 차단에만 쓰고, 보존·폐기는 entitlements가 관측과 독립적으로 발행하는 접근 제어 입력을
+  따른다(§7 S4 보존·폐기). last-known 복원 seed는 관측이 아니다. KRX 분기는 S6 전까지 소비 0. 소비자(기록기)와 어댑터는 S4
+  소유이며 연결 추가(dormant)와 runtime 배선을 분리한다. 관측 연결 구현 전 L-4d 권위 토큰·거부 결속,
+  L-4c ACK 적용 경계, L-4f bootstrap 발급 제어의 최종 구현을 대조한다. L-4e grant 전달·재개와 live 접근권한
+  철회 검증은 runtime 배선 전에 대조한다
 - **topic last-known disk 계약**: 정화·domain 검증을 통과한 FX/Tether/DXY를 서로 다른
   `(uid,userAccessEpoch,topic-kind)` namespace에 저장하고, fresh server premium 승인 뒤 WS/bootstrap보다 먼저 복원한다.
   restored seed는 `refreshingCached/offline` 표시용일 뿐 ACK/delivery 완료·freshness·silence deadline을 충족시키지 않는다.
@@ -1012,7 +1062,9 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   3회 공유 budget·시도별 absolute 45초(ACK 비연장)·lease-id hard-expiry·30초 안정 후 reconnect reset / server premium rejection 즉시 무료 전환 /
   최초 delivery watchdog과 persistent-silence owner의 중복 resubscribe 0 / KRX-only가 Tether delivery·freshness를 충족하지 않음 /
   offline cold start에서 정화된 last-known 복원→`refreshingCached/offline` 표시, 복원 seed가 delivery/freshness로 오인되지 않음 /
-  live-wins·5초 write throttle·UID/epoch 전환 purge / Tether payload와 disk cache의 KRX 오염 폐기(D8)
+  live-wins·5초 write throttle·UID/epoch 전환 purge / Tether payload와 disk cache의 KRX 오염 폐기(D8) /
+  표시 병합이 버린 재관측·역순 입력이 관측 인계에 원 시각째 남음 / 무효 가격·검사 실패·KRX 입력의 관측 0 / 권위 종료 뒤 옛
+  권위의 지연 관측·사건 0 / sink 실패·포화에서도 merge·배달·deadline 계속 / 관측 연결 전후 배달·watchdog 결과 동일(동결 후 7번)
 
 ### S4 — Graph V2 (FX)
 - `catalog` + `tab` 전환. catalog `version`은 **String**, tab별 `periods`와 동적 series ID만 소비하고 top-level
@@ -1022,28 +1074,94 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   freshness를 기록한다. 판정 불가 fetch는 last-good를 시간 만료 없이 유지한다. KRX series는 일반 envelope에서 분리해
   `(uid,userAccessEpoch,krxCapabilityEpoch,tab,period)` cache에만 저장하고 현재 capability 승인 뒤 join한다. 따라서 KRX revoke가
   비-KRX series를 지우지 않으면서도 old KRX namespace를 재개방하지 않는다. `visibleSeriesIds`와 `initializedSeries`를 함께
-  UID-scope 영속해 신규 default와 사용자 all-off를 구분한다
-- topic `(source,asset)`→catalog series bridge(DXY 별도)를 만들고 non-finite/비양수/오염 sample을 reducer 전에 제거한다
-- **1d live-tail 계약**: 서버 closed bucket + optional `in_progress` seed, 클라는 진행 중 봉을 만든다.
-  600초 epoch 정렬(서버 `_bucket_align`과 동일), seed는 `bucket_start == floor(now/600)*600`일 때만 fold하고
-  high/low는 합집합 max/min, close는 더 최신 client live 관측 우선
-  - active period가 1d가 아니어도 600초 live bucket은 누적하고 25시간(+1h 여유) 밖은 prune; 렌더는 1d에서만
+  UID-scope 영속해 신규 default와 사용자 all-off를 구분한다. 디스크에는 검증·권한 필터·namespace 분리를 적용한 서버 유래 자료만
+  저장하고, 앱 관측·재구성 표시 범위·복구 상태는 세션 메모리에 둔다. 캐시 표시를 복구 성공으로 세지 않는다(동결 후 7번)
+- topic `(source,asset)`→catalog series bridge(DXY 별도)는 S3 관측 인계를 입력으로 받고, 원래 topic·source·asset·catalog 매핑을
+  채택 전에 검사하며 non-finite/비양수/오염 sample을 reducer 전에 제거한다. 표시 저장소(`TopicRates`) snapshot을 관측으로
+  재투입하지 않는다(동결 후 7번)
+- **1d live-tail 계약**(동결 후 7번에서 재작성): 서버 closed bucket + optional `in_progress` seed, 클라는 진행 중 봉을 만든다.
+  600초 epoch 정렬(서버 코드 `graph_v2_intraday._bucket_align`과 동일 — 계약 문서가 아니라 코드 정의)
+  - **봉 배정은 관측의 서버 시각으로 한다.** 앱 수신 시각·현재 시각으로 배정하지 않고 관측 시각을 now로 보정하지 않는다.
+    어댑터는 source·asset 의미로 고른다: 두 시각 소스(`usdt-krw` 거래소·`usd-krw-futures`)는 의미가 확인된 일반 경로에서
+    `(가격, 변경 시각)`·`(가격, 재관측 시각)`을 각자 봉 후보로, 은행·인베스팅은 어느 topic으로 왔든 `timestamp` 하나로
+    (snapshot 재전달·다른 source 갱신은 새 관측이 아님), DXY는 `timestamp`+공급 source. 소스별 시각 의미·legacy/fallback 채택은
+    해당 어댑터 구현 전 fixture로 확정한다
+  - **서버 범위와 검증된 앱 관측 범위를 `(자료 scope, series, 봉 시작)` 단위로 분리 보관**하고, 합친 결과는 표시용으로만 계산해
+    다시 입력으로 누적하지 않는다. 저장 시와 렌더 시 seed 병합 규칙은 하나다. 현재 봉 = 채택 seed
+    (`bucket_start == floor(now/600)*600`일 때만 fold) ∪ 검증 관측, high/low는 합집합 max/min. 같은 봉에서 채택한 서버 seed들의
+    범위는 합집합으로 보존하고, 새 seed나 더 늦은 `sampled_at`만으로 기존 서버 극값이나 정상 앱 관측을 삭제하지 않는다. REST가
+    제공하기 전 지난 앱 봉은 보존한 서버 범위와 검증 관측을 유지하고, 서버로 대체된 닫힌 봉에는 이후 도착한 앱 관측을
+    재합성하지 않는다. 다른 봉의 응답 누락은 해당 봉의 대체나 복구 완료가 아니다
+  - **close**: 현재 봉 close는 해당 봉 검증 관측 중 관측 시각이 가장 늦은 가격, 해당 관측이 없으면 채택 seed close. 동시각 가격
+    충돌 규칙은 어댑터별로 고정한다. 이 우선순위는 seed close보다 실제로 최신임을 보증하지 않으며, `sampled_at`을 close 가격
+    시각·집계 완료 경계·seed 간 포함 관계의 증거로 쓰지 않는다
+  - **타이머**(10초 rollover tick·30초 freshness tick)는 시간축 이동·봉 경계 감지·재조회 예약·선 사용 판정만 하고, 마지막 가격을
+    관측으로 넣거나 빈 봉 고저를 만들지 않는다. source freshness는 기본 600초/hana 1200초이고 선 사용 판단일 뿐 현재 봉 관측
+    증거가 아니며, 만료만으로 채택한 극값을 지우지 않는다. bucket 600초와 freshness를 같은 상수로 취급하지 않음
+  - 기록기는 화면·탭이 아니라 사용자 세션 자료 scope 수명이다. 공통 자료는 scope·series·period·봉 간격 단위로 적용 버전을
+    관리해 늦은 응답이 새 버전을 되돌리지 않고, 요청 single-flight는 같은 scope·권한·tab·period 단위이며 서로 다른 탭 payload
+    전체를 같은 요청으로 취급하지 않는다. 공유 자료는 각 소비자의 현재 세션·topic·권한 검사를 통과한 뒤에만 쓰며, 한 경로의
+    허용으로 다른 경로의 취소를 우회하지 않는다. active period가 1d가 아니어도 600초 live bucket은 누적하고 24시간 창 + 1시간
+    여유(총 25시간) 밖은 prune; 렌더는 1d에서만. 장기 응답의 마지막 봉 시각으로 1일 누적을 정리하지 않는다. age-prune 외에
+    관측 근거·중복 식별·미복구 봉의 크기 한도를 두고, 한도 초과·시각 이상으로 근거를 버릴 때 복구 상태도 갱신한다. 기록기는
+    화면 생성·catalog 도착과 무관하게 허용된 입력을 받고, 아직 매핑되지 않은 입력의 보관 한도와 복구 인계를 정하며, 표시
+    저장소 snapshot 재투입으로 대체하지 않는다
   - 350ms trailing publish(리셋 debounce 아님), off-screen은 누적하되 publish task 0, 재노출 즉시 flush
-  - source freshness는 기본 600초/hana 1200초, 30초 tick 재평가. bucket 600초와 freshness를 같은 상수로 취급하지 않음
-  - rollover 10초 tick, foreground 복귀(≥60초, 30초 cooldown)·WS 재연결 시 resync(첫 연결 제외)
+  - **수신 공백이 걸친 모든 봉에 복구 필요 사유를 남긴다.** 현재 seed 적용 여부, 과거 수신 공백 이력, 닫힌 봉 복구 요구를 따로
+    관리하고 seed 하나로 공백 전체가 수집됐다고 판정하지 않는다. 복구 요구는 캐시 hit·쿨다운·진행 중·실패·취소로 지워지지
+    않으며, 요청 자료 scope·복구 세대·series·봉 구간을 검증해 실제 제공된 봉만 해제한다(최대 `lastClosedTs` 이하 일괄 해제 금지,
+    응답 도중 경계가 바뀌어 온 옛 봉 seed를 현재 봉으로 옮기지 않음). 요청 중 새 공백은 새 복구 세대다. 그래프 REST의 실패·부분
+    응답·취소는 S4 복구 담당자가 처리한다
+  - **보존·폐기**: 기록기는 관측 유무와 독립적으로 entitlements에서 현재 신원·자료 namespace·접근 허용 상태·명시적 종료 사유를
+    받는다. 이 제어 입력과 관측·응답 적용은 순서와 세대가 검증되는 한 소비 경계에서 처리한다.
+    관측 envelope 자체가 현재 접근을 개방하지 않는다. 자료 namespace와 현재 접근 허용·명시적 철회·기록기 수명을 구분하며
+    namespace 불변이나 권위 토큰 변경만으로 보존·폐기를 결정하지 않는다. 확인된 일시 수신 중단은 검증 자료와 복구 사유를
+    보존한다. 명시적 premium 취소·사용자 세션 종료는 해당 범위를 재사용 불가로 하고 KRX 취소는 capability 범위만 대상으로 한다
+    (D23: 판정 불가·pending envelope은 기존 grant 유지, stable false·typed `premium_required`·SignedOut·UID 교체는 premium 범위 취소,
+    `krx_visible=false`·`krx_entitlement_required`는 KRX만, Resolving·Pending(noGrant)·DeletionPending은 protected read/render·요청 0).
+    명시적 철회의 epoch 저장이 실패하거나 결과가 미확정이면 일시 공백으로 취급하지 않으며 해당 범위의 read/render·관측 채택·
+    신규 요청·재시도·지연 완료 적용을 봉인한다. 영속 정리는 I4의 persist→cancel/purge→journal 완료 순서를 유지하고, 인계 완료를
+    실제 purge 완료로 보고하지 않는다. 이 봉인·재승인·정리 재개 계약은 S1 잔여에서 확정·검증하며 그래프 runtime 배선의 선행조건이다
+  - **복귀 직후** 출처 없는 누적·tip을 무효화하고 첫 발행 전에 한 직렬 실행자에서 재구성한다. REST 대기 중에도 수집을 계속한다
+  - rollover 10초 tick, foreground 복귀(≥60초, 30초 cooldown)·WS 재연결 시 resync(첫 연결 제외). 실행·복귀·재연결로 생긴 복구
+    요구는 ≥60초 조건·TTL·첫 연결 제외로 소멸하지 않고, 첫 연결 중복 요청을 생략할 때도 초기 요청 담당자가 실패·부분 응답
+    이후의 미충족 요구를 이어받는다. 재시도 간격·상한·봉 경계 재조회의 단일 담당은 구현 전 고정한다. 10분 경계 재조회는 활성
+    1d 전용이며 D15의 TTL·same-day·장기 자정 갱신은 유지한다
+  - **렌더**: 현재 봉만 now까지 연장하고, 시각 없는 최신값으로 고저를 재확장하지 않으며, 무효 구간을 이웃 음영으로 잇지 않고,
+    선의 마지막 가격을 음영 입력으로 역류시키지 않는다. 음영 모양은 바꾸지 않고(미결) DXY 음영을 신설하지 않는다
+  - **장기(1w/3m/1y) 오른쪽 끝**은 검증되고 선 정책에 맞는 최신값만 쓰고, 출처 없는 옛 tip은 복귀 후 첫 발행부터 제외한다.
+    끝점을 now에 두는 것은 현재 10분봉 관측 기록이 아니다. 1일 복구 성공이 장기 REST 요구를 해제하지 않는다
+  - **DXY tip**: timestamp 우선, 동시각이면 investing > cnbc > yahoo. 같은 timestamp·source의 가격 충돌은 최초 채택 tip을 유지하고
+    충돌 관측을 중복으로 삭제하지 않는다. 서버 row id가 wire에 없어 마지막 tie-break의 완전한 parity는 보장하지 않는다.
+    `TopicRates` 병합은 유지한다
 - 갱신 2기전 분리(D15), 단일 주입 Clock으로 TTL·same-day·타이머 공유
 - **`/api/graph` 및 v1 graph cache 소비 제거**. 같은 변경 세트에서 `graph_cache_*.json`과
   `fxi_graph_preferences`를 삭제하고 v2 graph namespace를 authoritative로 전환한다
 - **DoD**: catalog version String·TTL override / catalog에 없는 series 합성 0 / Resolving/Pending의 disk read/render 0,
   same-UID fresh ACTIVE 뒤에만 seed 개방·fresh로 오인하지 않음 / KRX cache 분리 및 capability revoke 뒤 비-KRX cache 유지 /
-  seed↔live close 우선순위·25h prune·off-screen flush·freshness 600/1200 / 23:59→00:00 전이 / 동시 fetch single-flight
+  은행·인베스팅(통화별)·DXY 어댑터에 iOS 확정 계획(ios `89e866d`) 합성 입력을 원문 입력·기대 결과 그대로 적용해 통과 —
+  T02·T04~T12·T14~T21·T23(일반 범위)·T25(무료 회귀)·T26(은행)과 저가 대칭 T05-L·T06-L·T07-L·T08-L·T10-L·T16-L, 추가 경계 입력
+  (빈 입력·NaN/Inf·파싱 실패·역순·중복·source 불일치·같은 5초 구간·시계 차이·보관 범위 밖·low>high·진단 로그 on/off). DXY에는
+  범위·음영 사례를 적용하지 않고 시각·중복·복구·선 사례만, T21은 catalog가 제공하는 기간에만 적용한다 / 타이머만으로 봉·고저
+  생성 0 / 복귀 후 모든 발행에서 출처 없는 옛 tip 0 / 반복 seed 합집합·닫힌 봉 재오염 0 / 명시적 철회·세션 종료 뒤 기록·요청
+  부활 0, 철회 저장 실패·미확정 중 read/render·채택·요청 0, KRX 취소만으로 비-KRX 관측 폐기 0, 공유 자료의 소비자별 접근 검사 /
+  close 계약·25h prune·크기 한도·off-screen flush·freshness 600/1200의 선 사용 역할 / 23:59→00:00 전이 / 동시 fetch single-flight
+  (scope·권한·tab·period 단위)(동결 후 7번)
+- **S4·S5·S6 공통 시험 계약**(동결 후 7번): 각 슬라이스에 배정된 T 번호는 iOS 원문의 전체 입력·기대 결과를 승계한다.
+  위 추가 경계 입력도 S4·S5·S6의 해당 어댑터마다 적용한다. topic–asset 불일치 / WS·REST 같은 관측 재전달 /
+  catalog·화면 전 입력 / 공백 이력≠복구 완료 / sparse 응답·경계 통과 / 크기 한도·미래 시각 / 비동기 purge 완료도
+  세 슬라이스의 해당 어댑터에서 검증한다. T21은 catalog가 제공하는 기간만, T22는 장기 교집합·catalog 변경까지,
+  T23은 공유 자료의 소비자별 접근 경계까지 포함한다. DXY의 범위·음영 사례 제외 규칙은 그대로 적용한다.
 
 ### S5 — 테더 탭
 - 거래소 5 + 참조(kb·hana·investing) 시세 (preference는 S1.5에서 도입, 여기서 테더 표면에 연결)
 - 테더 Graph — **1d만이 아니라 catalog가 제공하는 전 기간(1d/1w/3m/1y)** 소비. 1d 다중 series 성능 검증
 - **DoD**: Graph → 시세 순서와 S8/S9용 안정 insertion slot / 거래소5+참조 effective projection /
-  catalog 전 기간 동작. **성능은 판정 가능한 명제로 고정**: 고정한 실기기·빌드·fixture에서 1d 11-series 전체 표시 상태로
-  실제 `MainActivity → MainScreen → Tether` 경로를 사용하고 운영 계정·운영망에 의존하지 않는 benchmark-variant 전용
+  catalog 전 기간 동작 / 거래소 5종 각각에 합성 입력 T01·T03·T03-L과 해당 경계·복구·극값 보존·권한·기간 전환 사례(T02·T04~T12·
+  T14~T16·T19·T21·T23, 저가 대칭 포함)를 적용해 통과, 테더 참조(은행·인베스팅) 행에 단일 시각 T17·T18, 비-KRX 공통 series 두 탭
+  일치(T22 비-KRX 부분 — 1일과 장기 교집합·catalog 변경 포함), `dxy_futures` REST 전용(T24), 무료 snapshot 회귀(T25). 장기 거래소 series는 catalog 구성을 따르고 없는 series를 합성하지
+  않는다(동결 후 7번). **성능은 판정 가능한 명제로 고정**: 고정한 실기기·빌드·fixture에서 1d 11-series 전체 표시 상태로
+  실제 `MainActivity → RootScreen` 진입의 premium 목적지를 거친 Tether 경로를 사용하고 운영 계정·운영망에 의존하지 않는 benchmark-variant 전용
   deterministic fixture로 같은 11-series/period/clock을 공급한다. public release에는 fixture action·payload·우회 branch가 0이어야 한다.
   benchmark fixture root의 상위 semantics에 `testTagsAsResourceId=true`를 켜고 Tether 탭·기간·스크롤 대상에
   중복 없는 stable Compose `testTag`를 부여해 UIAutomator resource selector로 각각 독립 측정한다.
@@ -1083,6 +1201,8 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   다른 tab/series 선택은 건드리지 않고 source preference raw 원본은 보존
 - WS `krx_entitlement_required` → 즉시 숨김 + 강제 재조회, `true→true` 재확정 콜백으로 재구독
 - **DoD**: WS rejection과 REST `unknown_topic` 모두 revoke 즉시 unsubscribe + KRX 메모리·디스크·live-tail·pending tap purge + late response 폐기 /
+  KRX 관측 인계 연결과 합성 입력 T01·T02·T03·T04~T16·T21·T22(KRX 부분)·T23(KRX 부분),
+  저가 대칭 T03-L·T05-L·T06-L·T07-L·T08-L·T10-L·T16-L 통과. T12/T23은 KRX 취소를 포함한다(동결 후 7번) /
   승인 없으면 inventory의 구현 완료 표면에서 선택지·빈자리·placeholder·semantics도 없음 / 재승인 시 raw preference와 서버 row 복원
 
 ### S7 — 은행 알림 (repeat · history · `rate_alert`)
