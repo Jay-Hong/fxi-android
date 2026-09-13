@@ -282,6 +282,28 @@ object AccessEpochTransitions {
         else -> record
     }
 
+    /**
+     * Restores the cleanup obligation of a namespace this process remembers as owed, when the record no longer shows it.
+     *
+     * Rotates nothing. If the namespace is still live the record is returned as it is, and the caller judges the
+     * obligation still current. If an entry already covers it, nothing is added. Otherwise one entry naming the
+     * obligation's owner, axis and epoch is appended.
+     *
+     * This restores the obligation for the remembered target only. It does not establish that the namespace now live
+     * is valid, grants no access, and completes no purge.
+     */
+    fun journalRetired(record: AccessEpochRecord, obligation: LossObligation): AccessEpochRecord {
+        if (LossObligations.epochOf(record, obligation.axis) == obligation.epoch) return record
+        if (record.pendingPurges.any { LossObligations.covers(it, obligation) }) return record
+        val entry = PendingPurge(
+            ownerUid = obligation.ownerUid,
+            userAccessEpoch = obligation.epoch.takeIf { obligation.axis == PurgeScope.USER },
+            krxCapabilityEpoch = obligation.epoch.takeIf { obligation.axis == PurgeScope.CAPABILITY },
+            scopes = setOf(obligation.axis)
+        )
+        return record.copy(pendingPurges = record.pendingPurges + entry)
+    }
+
     /** Removes exactly the entries that were purged. Others stay owed. */
     fun completePurges(
         record: AccessEpochRecord,
@@ -354,6 +376,9 @@ interface AccessEpochStore {
 
     /** Step three: drop exactly the journal entries whose purge actually completed. */
     suspend fun completePurges(completed: Collection<PendingPurge>): AccessEpochRecord
+
+    /** Restores a remembered cleanup obligation inside one atomic edit; see [AccessEpochTransitions.journalRetired]. */
+    suspend fun journalRetired(obligation: LossObligation): AccessEpochRecord
 
     /**
      * Records that protected data may now exist in the *current* namespace. Must be persisted

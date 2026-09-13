@@ -6,6 +6,7 @@ import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.entitlements.AccessEpochRecord
 import com.jay.fxi.data.entitlements.AccessEpochStore
 import com.jay.fxi.data.entitlements.AccessEpochTransitions
+import com.jay.fxi.data.entitlements.LossObligation
 import com.jay.fxi.data.entitlements.EntitlementsIdentity
 import com.jay.fxi.data.entitlements.EntitlementsOutcome
 import com.jay.fxi.data.entitlements.EntitlementsResult
@@ -776,6 +777,8 @@ class TopicSessionCoordinatorTest {
                 AccessEpochTransitions.rotate(record, rotateUser, rotateKrx, ids).also { record = it }
             override suspend fun completePurges(completed: Collection<PendingPurge>) =
                 AccessEpochTransitions.completePurges(record, completed).also { record = it }
+            override suspend fun journalRetired(obligation: LossObligation) =
+                AccessEpochTransitions.journalRetired(record, obligation).also { record = it }
             override suspend fun markMayContainData(premium: Boolean, krx: Boolean) =
                 AccessEpochTransitions.markMayContainData(record, premium, krx).also { record = it }
         }

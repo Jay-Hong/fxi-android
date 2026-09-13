@@ -20,7 +20,9 @@ S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반�
                                 D27의 파일 단위 allowlist(+`domain="sharedpref"`)는 미구현.
                                 **유예 사유는 셋이 서로 다르다** — purge는 대상이 아직 legacy rate/graph store,
                                 PushDelete는 **서버 D21 순서 계약 미결**, backup은 기존 사용자 설정의 restore 동작
-                                변경을 분리한 것. 이 기록은 완료 선언도, 후속 슬라이스로의 이관 승인도 아니다
+                                변경을 분리한 것. 이 기록은 완료 선언도, 후속 슬라이스로의 이관 승인도 아니다.
+                                명시적 거부 저장 실패의 S1 잔여는 S1r-1·S1r-2b가 land했고 S1r-2a·S1r-2c·봉인의
+                                process death 지속은 미충족이다(동결 후 8번 기록)
 S1.5 확인 필요                : presenter·순서/표시 설정·legacy bank store 삭제는 land. `RateSourceRegistry`와
                                 live/snapshot renderMode 등가까지 포함한 전체 DoD 충족은 미확인
 S2 미충족                     : D26 무료 알림 in-memory 미리보기 미구현 · 마지막 탭은 `(owner_uid, last_tab)` 한 쌍이라
@@ -88,7 +90,7 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > purge·`AccessEffect.PushDelete` 실행·D27 파일 단위 allowlist가, S2는 D26 in-memory preview와 §7 S2 DoD의
 > "UID별 마지막 탭 복원"이 미충족이다. S1.5는 주요 구현이 land했으나 전체 DoD 충족은 미확인이다.
 > 코드에 적힌 세 유예 사유는 서로 다르므로 각각 적는다 — purge는 대상이 아직 legacy rate/graph store,
-> PushDelete는 **서버 D21 순서 계약 미결**(`PremiumAccessCoordinator.kt:18-27`), backup은 기존 사용자 설정의
+> PushDelete는 **서버 D21 순서 계약 미결**(`PremiumAccessCoordinator` 클래스 KDoc — 8번 기록에서 좌표 정정), backup은 기존 사용자 설정의
 > restore 동작 변경을 분리한 것이다. 이 기록은 완료 선언이 아니고 미충족 작업의 후속 슬라이스 이관도
 > 승인하지 않는다 — 소유권은 §7·§9.1이 정한 그대로다. 범위·D-결정·슬라이스 경계·게이트·DoD·활성
 > 미결정 O1은 그대로이고, 어떤 슬라이스 착수나 public arming·rollout·deploy도 열지 않는다.
@@ -192,6 +194,27 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > 재개 계약), L-4e grant 전달·재개와 live 접근권한 철회 검증 대조, 실제 purger 설계. 관측·복구·보관·폐기 책임은
 > topic last-known 저장소와 실제 purger 설계를 확정하기 전에 이 계약으로 맞춘다. 서버 계약·기록 유무 필드, 음영 모양,
 > KRX 관측 소비 시점(S6)은 바꾸지 않는다. 범위·다른 D-결정·release gate를 바꾸지 않고 어떤 arming·rollout·deploy도 열지 않는다.
+>
+> **동결 후 8번 비의미 상태 명확화 기록(2026-09-13, Claude·Codex 검토).** 7번 기록이 runtime 배선 전 선행조건으로 둔
+> "S1 잔여(명시적 철회 저장 실패의 봉인·재승인·정리 재개 계약)"의 진행을 land와 미충족으로 나눠 적는다. **land는 선행조건
+> 충족이 아니다.**
+> (1) S1r-1 `727dff7`: 쓰기가 실패하거나 취소된 뒤 access epoch 되읽기가 저장되지 않은 레코드를 착지로 받아들이지 않게
+> 저장소 어댑터에서 막았다. DataStore 1.1.7은 rename 전에 메모리 사본을 바꾸므로, 그 지점에서 실패하면 되읽기가 디스크에
+> 없는 값을 돌려줄 수 있다(실패 지점을 주입한 JVM 시험으로 확인). 기존 신원 복구의 되읽기에도 적용된다.
+> (2) S1r-2b: 검증된 명시적 손실의 회전 저장이 실패하거나 미확정이면 예외로 내보내지 않고 손실을 발행·봉인한다. 손실 복구가
+> 프로세스 안에서 회전 재시도, 인계 기록이 없는 대상의 journal 복원, `Failed`·예외로 끝난 정리의 재시도를 맡는다. 회전 시도가
+> 던진 뒤나 신원 전이가 대상을 은퇴시킨 뒤의 정리도 여기에 포함된다. `Deferred`만 남으면 손실 복구는 정리 재시도를
+> 예약하지 않는다. 다른 항목·축의 실패로 회차가 재개되거나 외부 재개 계기가 오면 journal 전체를 다시 시도하므로, 이미
+> `Deferred`를 반환한 항목·축도 다시 호출될 수 있다. 봉인 해소 뒤
+> 재승인은 해당 binding에 축별 최소 intent를 **예약**할 뿐, 재확인 요구의 지속 소유와 실제 재조회 실행은 보장하지 않는다.
+> (3) **미충족으로 남는 것**: S1r-2a(single-flight·예약 교체·취소·stale 폐기에도 재확인 요구를 보존) / S1r-2c(레코드를 읽지
+> 못한 손실 응답 — 대기 중 권한을 어떻게 둘지는 정책 선택이라 명시적 개정 대상) / 봉인의 process death 지속(§7 S1 DoD의
+> "명시적 거부 시 process-death 첫 protected use 전 journal materialize+purge"를 저장 실패 경로에서는 충족하지 못한다) /
+> 레코드 필드가 불완전해 epoch 없이 할당된 경우의 null 대상 봉인 종료 규칙 / 실제 purger.
+> (4) 사실 정정: 3번 기록의 `PremiumAccessCoordinator.kt:18-27` 좌표는 코드 이동으로 PushDelete 유예 사유가 아닌 곳을
+> 가리키고 있어 "클래스 KDoc"으로 바꿨다.
+> 이 기록은 7번의 선행조건을 완화하지 않는다. 범위·D-결정·슬라이스 경계·게이트·DoD는 그대로이고 어떤 arming·rollout·deploy도
+> 열지 않는다.
 
 ---
 

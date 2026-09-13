@@ -77,6 +77,8 @@ class PremiumAccessCoordinatorTest {
         }
         override suspend fun completePurges(completed: Collection<PendingPurge>) =
             AccessEpochTransitions.completePurges(record, completed).also { record = it }
+        override suspend fun journalRetired(obligation: LossObligation) =
+            AccessEpochTransitions.journalRetired(record, obligation).also { record = it }
         override suspend fun markMayContainData(premium: Boolean, krx: Boolean) =
             AccessEpochTransitions.markMayContainData(record, premium, krx).also { record = it }
 
@@ -1106,26 +1108,33 @@ class PremiumAccessCoordinatorTest {
 
     // --- persistence ordering ----------------------------------------------------------------------
 
+    /**
+     * This test used to lock persist-before-observe as "nothing is published when the write fails". The plan never
+     * required keeping the previous grant on a failed write, and amendment 7's explicit seal contract does not allow it:
+     * the loss is published and what could not be persisted is sealed (S1r-2b). The persist-first order on the success
+     * path is still checked by the rotation tests.
+     *
+     * The fake keeps failing, so recovery keeps retrying: only the work already due is run here.
+     */
     @Test
-    fun persistenceFailure_leavesTheTransitionUnpublished() = runTest {
+    fun persistenceFailure_publishesTheLossAndSealsWhatWasNotPersisted() = runTest {
         val store = FakeStore(ids())
-        val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = false)) })
+        val coordinator = build(store, FakeSource { answer(EntitlementsOutcome.StableActive(krxVisible = true)) })
         coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
+        assertEquals(KrxCapabilityState.VISIBLE, coordinator.krx.value)
         val epochBefore = store.record.userAccessEpoch
         val grant = coordinator.issuedGrant()
 
         store.failNextRotation = true
-        runCatching { coordinator.onTopicRejected(grant, PREMIUM_REFUSAL) }
-        advanceUntilIdle()
+        coordinator.onTopicRejected(grant, PREMIUM_REFUSAL)
+        runCurrent()
 
-        assertEquals(
-            "state was published although the rotation never persisted",
-            PremiumAccessState.PremiumConfirmed,
-            coordinator.state.value.state
-        )
-        assertEquals(epochBefore, store.record.userAccessEpoch)
+        assertEquals(PremiumAccessState.Rejected, coordinator.state.value.state)
+        assertEquals(KrxCapabilityState.HIDDEN, coordinator.krx.value)
+        assertEquals("nothing reached the disk", epochBefore, store.record.userAccessEpoch)
+        assertNull("a sealed user axis issues no grant", coordinator.topicGrant())
         processJob.cancel()
     }
 

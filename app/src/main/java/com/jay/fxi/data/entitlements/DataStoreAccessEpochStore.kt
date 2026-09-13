@@ -159,6 +159,9 @@ class DataStoreAccessEpochStore internal constructor(
     override suspend fun completePurges(completed: Collection<PendingPurge>): AccessEpochRecord =
         transform { AccessEpochTransitions.completePurges(it, completed) }
 
+    override suspend fun journalRetired(obligation: LossObligation): AccessEpochRecord =
+        transform { AccessEpochTransitions.journalRetired(it, obligation) }
+
     override suspend fun markMayContainData(premium: Boolean, krx: Boolean): AccessEpochRecord =
         transform { AccessEpochTransitions.markMayContainData(it, premium, krx) }
 

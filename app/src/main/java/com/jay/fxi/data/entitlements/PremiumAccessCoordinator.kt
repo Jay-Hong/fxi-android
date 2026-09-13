@@ -6,15 +6,19 @@ import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.domain.model.TopicRejectionReason
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -22,6 +26,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /** Between automatic persistence rounds. Long enough that a transient disk fault can clear. */
 private const val DEFAULT_PERSISTENCE_RETRY_DELAY_MILLIS = 2_000L
+
+/** The longest a loss recovery round waits before trying the disk again. */
+private const val LOSS_RECOVERY_MAX_DELAY_MILLIS = 300_000L
 
 /**
  * Owns the D23 access state and serialises every input that can change it.
@@ -39,7 +46,7 @@ private const val DEFAULT_PERSISTENCE_RETRY_DELAY_MILLIS = 2_000L
  */
 class PremiumAccessCoordinator(
     private val source: EntitlementsSource,
-    private val store: AccessEpochStore,
+    store: AccessEpochStore,
     private val userPurger: UserScopePurger,
     private val capabilityPurger: CapabilityScopePurger,
     private val scope: CoroutineScope,
@@ -53,9 +60,25 @@ class PremiumAccessCoordinator(
      * cancellation into null. Read fresh at each decision that depends on it, after the last
      * suspension before that decision.
      */
-    private val liveFence: () -> AuthIdentityFence?
+    private val liveFence: () -> AuthIdentityFence?,
+    /** Observes a loss re-approval after the scheduler accepts it. */
+    private val onLossReapprovalScheduled: (RefreshIntent, Long) -> Unit = { _, _ -> }
 ) {
     private val mutex = Mutex()
+
+    /** Explicit losses whose rotation this process could not establish. Guarded by [mutex]. */
+    private val lossSeals = LossSealLedger()
+
+    /** Every store call this class makes; each confirmed record reaches [lossSeals] on its way back. */
+    private val store: AccessEpochStore = ObservedStore(store)
+
+    /** The loss recovery run while one is armed. Guarded by [mutex]; the run clears it when it has nothing to do. */
+    private var lossRecovery: Job? = null
+
+    /** A landed loss rotation whose journal is still to be handed to the purgers, or whose purge failed or threw. */
+    private var lossCleanupOwed = false
+
+    private var lossRecoveryAttempts = 0
 
     private val _state = MutableStateFlow(OwnedPremiumAccess())
     /**
@@ -646,6 +669,10 @@ class PremiumAccessCoordinator(
                 completedBinding = work.fence
                 _krx.value = KrxCapabilityState.HIDDEN
                 _lastEffects.value = emptyList()
+                // After the bind's confirmed record was observed: a seal still standing for this owner is owed to
+                // this binding too, before any answer reaches it (S1r-2b §7.2).
+                lossSeals.registerReapproval(probeEpoch, work.fence.uid)
+                if (!lossSeals.isEmpty) kickLossRecoveryLocked()
             }
             is IdentityWork.End, IdentityWork.UnverifiedStart -> completedBinding = null
             IdentityWork.StartupPurge -> Unit
@@ -1064,6 +1091,8 @@ class PremiumAccessCoordinator(
         }) { store.bindOwner(candidate.uid) } ?: return barrierOutcome(BarrierStep.HELD)
         completedBinding = candidate
         _krx.value = KrxCapabilityState.HIDDEN
+        lossSeals.registerReapproval(probeEpoch, candidate.uid)
+        if (!lossSeals.isEmpty) kickLossRecoveryLocked()
         if (!cleanupLocked()) return barrierOutcome(BarrierStep.CLEANUP_FAILED)
         // Read after the last suspension.
         if (!SignOutAttemptPolicy.barrierBound(candidate, EditResult.Landed(after), liveFence())) {
@@ -1406,6 +1435,8 @@ class PremiumAccessCoordinator(
         val bound = boundIdentityLocked() ?: return@withLock null
         val record = store.load()
         if (record.ownerUid != bound.ownerUid) return@withLock null
+        // Checked against the record just confirmed, not a value computed before it (S1r-2b §5).
+        if (PurgeScope.USER in lossSeals.sealedAxes(bound.ownerUid)) return@withLock null
         if (source.currentIdentity() != bound) return@withLock null
         val context = TopicGrantContext(bound, record.fence(), decisionGeneration)
         val issued = issuedTopicGrant?.takeIf { it.context == context }
@@ -1435,8 +1466,8 @@ class PremiumAccessCoordinator(
      * cancellation, because whatever is scheduled belongs to a later event. A live identity that
      * cannot be read discards it too, and that says nothing about a sign-out having happened.
      *
-     * Throws what the record or identity read throws, before the reducer runs, and what persisting
-     * a rotation throws — in which case nothing is published and the previous state stands.
+     * Throws what the record or identity read throws, before the reducer runs. A rotation that cannot be
+     * persisted does not throw; see [decideLocked].
      */
     internal suspend fun onTopicRejected(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) {
         val outcome = when (TopicRejection.of(reasons) ?: return) {
@@ -1561,7 +1592,16 @@ class PremiumAccessCoordinator(
         else schedule.schedule(recheck, bindingEpoch = probeEpoch)
     }
 
-    /** Reduce, persist, publish. Callers must hold [mutex] — hence the `Locked` suffix. */
+    /**
+     * Reduce, persist, publish. Callers must hold [mutex] — hence the `Locked` suffix.
+     *
+     * I4 on the success path: the new ids and the purge journal are persisted before the transition is published, and
+     * the purge runs after. A rotation whose write fails or whose outcome is unknown does not escape: the loss is still
+     * published, and what could not be established is sealed and handed to loss recovery ([LossSealLedger], S1r-2b).
+     * A loss for a target recovery already owns joins it and writes nothing now.
+     *
+     * What is sealed for this owner is applied before publishing, on both paths ([publishLocked]).
+     */
     private suspend fun decideLocked(
         record: AccessEpochRecord,
         intent: RefreshIntent,
@@ -1572,40 +1612,283 @@ class PremiumAccessCoordinator(
             intent = intent,
             outcome = outcome
         )
-
-        // I4: persist the new id and the purge journal *before* the transition is observable.
-        // Publishing first would leave a visible Rejected with a namespace still live if the
-        // write failed.
-        persistRotationsLocked(decision.effects)
+        // AccessEffect.PushDelete is intentionally not executed; see the class KDoc.
+        // AccessEffect.StartForcePremiumSingleFlight is carried out by the scheduled recheck.
+        val targets = buildList {
+            if (AccessEffect.RotateUserEpoch in decision.effects) add(LossTarget.of(record, PurgeScope.USER))
+            if (AccessEffect.RotateKrxEpoch in decision.effects) add(LossTarget.of(record, PurgeScope.CAPABILITY))
+        }
+        val fresh = targets.filterNot(lossSeals::joins)
+        // Settled even when the caller is cancelled: once the write starts, its outcome is classified and the loss
+        // published before cancellation is allowed through.
+        val rotated = fresh.isEmpty() || withContext(NonCancellable) { rotateLossTargetsLocked(record, fresh) }
 
         if (outcome.isAuthoritativeLoss()) decisionGeneration += 1
 
-        // The generation was published when this owner was bound and does not move while they
-        // stay bound — an answer for anyone else never reaches here, `apply` refuses it first.
-        _state.value = OwnedPremiumAccess(record.ownerUid, _state.value.authGeneration, decision.state)
-        _krx.value = decision.krx
-        _lastEffects.value = decision.effects
+        publishLocked(record.ownerUid, decision.state, decision.krx, decision.effects)
 
-        if (decision.effects.any {
-                it == AccessEffect.PurgeUserScope || it == AccessEffect.PurgeCapabilityScope
-            }
-        ) {
-            resumePendingPurgesLocked()
+        // A cleanup recovery already owns keeps its retry deadline: a repeated input — a purge-only KRX false edge
+        // included — does not run it early. Recovery's round covers this decision's journal too.
+        val purgeNow = rotated && !lossCleanupOwed && decision.effects.any {
+            it == AccessEffect.PurgeUserScope || it == AccessEffect.PurgeCapabilityScope
         }
+        if (purgeNow && !currentCoroutineContext().isActive) lossCleanupOwed = true
+        if (!rotated || lossCleanupOwed) kickLossRecoveryLocked()
+        currentCoroutineContext().ensureActive()
+        if (purgeNow) purgeOrHandOverLocked()
         return decision
     }
 
     private fun EntitlementsOutcome.isAuthoritativeLoss(): Boolean =
         this is EntitlementsOutcome.StableInactive || this == EntitlementsOutcome.PremiumRequired
 
-    private suspend fun persistRotationsLocked(effects: List<AccessEffect>) {
-        val rotateUser = AccessEffect.RotateUserEpoch in effects
-        val rotateKrx = AccessEffect.RotateKrxEpoch in effects
-        if (rotateUser || rotateKrx) {
-            store.beginRotation(rotateUser = rotateUser, rotateKrx = rotateKrx)
+    /**
+     * The first write for [fresh]. True when every target is established retired — the write returned, or a confirmed
+     * read-back shows it. Otherwise the targets not established are sealed, this binding is owed a re-approval, and
+     * false is returned. A CancellationException thrown by the store is an unknown outcome like any other.
+     *
+     * A null target is never ended by a read-back: its release needs a rotation that returned (S1r-2b §3B).
+     */
+    private suspend fun rotateLossTargetsLocked(record: AccessEpochRecord, fresh: List<LossTarget>): Boolean {
+        try {
+            store.beginRotation(
+                rotateUser = fresh.any { it.axis == PurgeScope.USER },
+                rotateKrx = fresh.any { it.axis == PurgeScope.CAPABILITY }
+            )
+            return true
+        } catch (failed: Exception) {
+            // Classified below. The write may have landed, so its cleanup is owed from here whatever the read-back says.
+            lossCleanupOwed = true
         }
-        // AccessEffect.PushDelete is intentionally not executed; see the class KDoc.
-        // AccessEffect.StartForcePremiumSingleFlight is carried out by the scheduled recheck.
+        val readBack = try {
+            store.load()
+        } catch (unreadable: Exception) {
+            null
+        }
+        val owed = fresh.filter { target ->
+            readBack == null || when (target) {
+                is LossTarget.Namespace ->
+                    LossObligations.judge(target.obligation, readBack) != ObligationStatus.RETIRED
+                is LossTarget.NullNamespace -> true
+            }
+        }
+        if (owed.isEmpty()) return true
+        lossSeals.open(owed)
+        lossSeals.registerReapproval(probeEpoch, record.ownerUid)
+        return false
+    }
+
+    /**
+     * Publishes a decided state after applying what is sealed for [ownerUid] (S1r-2b §7.1). A sealed user axis
+     * suppresses a premium grant and hides KRX; a sealed KRX axis hides KRX only. A suppressed grant leaves the published
+     * state as it was when that grants nothing, NoGrant otherwise, and owes this binding a re-approval.
+     */
+    private fun publishLocked(
+        ownerUid: String?,
+        state: PremiumAccessState,
+        krx: KrxCapabilityState,
+        effects: List<AccessEffect>
+    ) {
+        val sealed = lossSeals.sealedAxes(ownerUid)
+        var published = state
+        var visibleKrx = krx
+        if (PurgeScope.USER in sealed) {
+            if (state.grantsPremiumRuntime) {
+                published = _state.value.state.takeUnless { it.grantsPremiumRuntime } ?: PremiumAccessState.NoGrant
+                lossSeals.registerReapproval(probeEpoch, ownerUid)
+            }
+            visibleKrx = KrxCapabilityState.HIDDEN
+        }
+        if (PurgeScope.CAPABILITY in sealed) visibleKrx = KrxCapabilityState.HIDDEN
+        // The generation was published when this owner was bound and does not move while they
+        // stay bound — an answer for anyone else never reaches here, `apply` refuses it first.
+        _state.value = OwnedPremiumAccess(ownerUid, _state.value.authGeneration, published)
+        _krx.value = visibleKrx
+        _lastEffects.value = effects
+    }
+
+    /**
+     * The purge behind a landed loss rotation. A reported failure or a throw is not the caller's: loss recovery keeps
+     * the cleanup owed and retries it without rotating again (S1r-2b §6). Deferred is a hand-over, not a failure.
+     */
+    private suspend fun purgeOrHandOverLocked() {
+        val clean = try {
+            resumePendingPurgesLocked()
+        } catch (failed: Exception) {
+            lossCleanupOwed = true
+            kickLossRecoveryLocked()
+            // A CancellationException from a purger or the store is a failed cleanup; the caller's own cancellation
+            // still goes through, with the cleanup already handed over.
+            currentCoroutineContext().ensureActive()
+            false
+        }
+        if (!clean) {
+            lossCleanupOwed = true
+            kickLossRecoveryLocked()
+        }
+    }
+
+    private fun kickLossRecoveryLocked() {
+        if (lossRecovery != null) return
+        lossRecovery = scope.launch { runLossRecovery() }
+    }
+
+    private suspend fun runLossRecovery() {
+        val self = currentCoroutineContext()[Job]
+        try {
+            while (true) {
+                when (val next = mutex.withLock { lossRecoveryRoundLocked() }) {
+                    LossRecoveryNext.Done -> return
+                    LossRecoveryNext.Retry -> delay(lossRecoveryDelayMillis())
+                    is LossRecoveryNext.AwaitAdmission -> merge(
+                        attemptSignal.filter { it != next.attempt },
+                        _persistenceSignal.filter { it != next.pending }
+                    ).first()
+                }
+            }
+        } finally {
+            // However the run ends, a later kick must be able to start another. Only this run's own reference is cleared.
+            withContext(NonCancellable) {
+                mutex.withLock { if (lossRecovery === self) lossRecovery = null }
+            }
+        }
+    }
+
+    private fun lossRecoveryDelayMillis(): Long {
+        val shift = (lossRecoveryAttempts - 1).coerceIn(0, 16)
+        return (persistenceRetryDelayMillis shl shift).coerceAtMost(LOSS_RECOVERY_MAX_DELAY_MILLIS)
+    }
+
+    /**
+     * One loss recovery round (S1r-2b §4). Writes nothing while access is not admitted — an identity edit or an open
+     * sign-out owns the record then — and waits for either to move.
+     *
+     * Rotates only the current owner's namespace, and only for a target of that owner (§3B (R)). A null target is
+     * rotated only while a rotation can release it: its axis still has no epoch, or an unknown entry already covers it.
+     * An obligation whose epoch left the record with nothing handed on gets its entry restored ([AccessEpochStore.journalRetired]).
+     * A round that throws is retried after a growing delay. A round that leaves nothing it can act on ends the run; what is
+     * still sealed then waits for evidence from elsewhere, and is not rotated on a timer.
+     */
+    private suspend fun lossRecoveryRoundLocked(): LossRecoveryNext {
+        if (!accessAdmittedLocked()) {
+            return LossRecoveryNext.AwaitAdmission(attemptSignal.value, _persistenceSignal.value)
+        }
+        try {
+            val record = store.load()
+            val owner = record.ownerUid
+            val current = lossSeals.obligations().filter {
+                it.ownerUid == owner && lossSeals.status(it) == ObligationStatus.STILL_CURRENT
+            }
+            val releasable = lossSeals.nullTargets().filter { rotationCanRelease(it, record) }
+            val axes = current.map { it.axis } + releasable.map { it.axis }
+            val rotateUser = PurgeScope.USER in axes
+            val rotateKrx = PurgeScope.CAPABILITY in axes
+            if (rotateUser || rotateKrx) {
+                // Owed from the attempt: a rotation that lands and then throws is retired by the next read, and its
+                // journal must not be left behind.
+                lossCleanupOwed = true
+                val after = store.beginRotation(rotateUser = rotateUser, rotateKrx = rotateKrx)
+                releasable.forEach { lossSeals.releaseByRotation(it, record, after) }
+            }
+            lossSeals.obligations().filter { lossSeals.status(it) == ObligationStatus.UNKNOWN }.forEach {
+                lossCleanupOwed = true
+                store.journalRetired(it)
+            }
+            // Before the cleanup: a purge that keeps failing must not keep a resolved binding from being asked again.
+            lossSeals.takeReapproval(probeEpoch, _state.value.uid)?.let { axes ->
+                val intent =
+                    if (PurgeScope.USER in axes) RefreshIntent.FORCE_PREMIUM else RefreshIntent.FORCE_ENTITLEMENTS
+                schedule.schedule(RecheckRequest(intent, minDelayMillis = 0L), bindingEpoch = probeEpoch)
+                onLossReapprovalScheduled(intent, probeEpoch)
+            }
+            if (lossCleanupOwed) lossCleanupOwed = !resumePendingPurgesLocked()
+        } catch (failed: Exception) {
+            // A CancellationException thrown by the store or a purger is a failed round; this run being cancelled is not.
+            currentCoroutineContext().ensureActive()
+            lossRecoveryAttempts += 1
+            return LossRecoveryNext.Retry
+        }
+        if (lossCleanupOwed || lossRecoveryHasWorkLocked()) {
+            lossRecoveryAttempts += 1
+            return LossRecoveryNext.Retry
+        }
+        lossRecovery = null
+        lossRecoveryAttempts = 0
+        return LossRecoveryNext.Done
+    }
+
+    /** Whether a round could still act on something, judged on the last confirmed record. */
+    private fun lossRecoveryHasWorkLocked(): Boolean {
+        val record = lossSeals.lastConfirmed ?: return !lossSeals.isEmpty
+        return lossSeals.obligations().any {
+            val status = lossSeals.status(it)
+            status == ObligationStatus.UNKNOWN || (status == ObligationStatus.STILL_CURRENT && it.ownerUid == record.ownerUid)
+        } || lossSeals.nullTargets().any { rotationCanRelease(it, record) }
+    }
+
+    private fun rotationCanRelease(seal: NullTargetSeal, record: AccessEpochRecord): Boolean =
+        seal.ownerUid == record.ownerUid && (
+            LossObligations.epochOf(record, seal.axis) == null ||
+                record.pendingPurges.any { entry ->
+                    seal.axis in entry.scopes &&
+                        (entry.ownerUid == null || entry.ownerUid == seal.ownerUid) &&
+                        when (seal.axis) {
+                            PurgeScope.USER -> entry.userAccessEpoch
+                            PurgeScope.CAPABILITY -> entry.krxCapabilityEpoch
+                        } == null
+                }
+            )
+
+    private sealed interface LossRecoveryNext {
+        data object Done : LossRecoveryNext
+        data object Retry : LossRecoveryNext
+        data class AwaitAdmission(val attempt: AttemptSignal, val pending: PendingPersistence?) : LossRecoveryNext
+    }
+
+    /**
+     * Passes every confirmed record to [lossSeals] (S1r-2b §5).
+     *
+     * A load that returns is confirmed ([AccessEpochStore.load]). A mutation's return is observed only when no store call
+     * has failed or been cancelled since the last confirmed load: after one, a no-op edit's normal return does not
+     * establish anything, and the next load decides. [before] handed to the ledger is the last confirmed record at the
+     * start of the call.
+     */
+    private inner class ObservedStore(private val delegate: AccessEpochStore) : AccessEpochStore {
+        private var unconfirmed = false
+
+        private suspend fun call(op: StoreOp, block: suspend () -> AccessEpochRecord): AccessEpochRecord {
+            val before = lossSeals.lastConfirmed
+            val result = try {
+                block()
+            } catch (failed: Throwable) {
+                unconfirmed = true
+                throw failed
+            }
+            if (op == StoreOp.LOAD) unconfirmed = false
+            if (!unconfirmed) {
+                // Something retired here was handed to a journal that still needs cleaning, whoever's call this was —
+                // an identity task that completes on a failed purge does not end that.
+                if (lossSeals.observe(op, before, result)) lossCleanupOwed = true
+                // New evidence can make a seal recovery had given up on actionable again. A waiting retry keeps its deadline.
+                if (lossRecovery == null && (lossCleanupOwed || lossRecoveryHasWorkLocked())) kickLossRecoveryLocked()
+            }
+            return result
+        }
+
+        override suspend fun load() = call(StoreOp.LOAD) { delegate.load() }
+        override suspend fun bindOwner(uid: String) = call(StoreOp.BIND_OWNER) { delegate.bindOwner(uid) }
+        override suspend fun signOut() = call(StoreOp.SIGN_OUT) { delegate.signOut() }
+        override suspend fun retireUnverifiedStart() =
+            call(StoreOp.RETIRE_UNVERIFIED_START) { delegate.retireUnverifiedStart() }
+        override suspend fun beginSignOut(uid: String) = call(StoreOp.BEGIN_SIGN_OUT) { delegate.beginSignOut(uid) }
+        override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean) =
+            call(StoreOp.BEGIN_ROTATION) { delegate.beginRotation(rotateUser, rotateKrx) }
+        override suspend fun completePurges(completed: Collection<PendingPurge>) =
+            call(StoreOp.COMPLETE_PURGES) { delegate.completePurges(completed) }
+        override suspend fun journalRetired(obligation: LossObligation) =
+            call(StoreOp.JOURNAL_RETIRED) { delegate.journalRetired(obligation) }
+        override suspend fun markMayContainData(premium: Boolean, krx: Boolean) =
+            call(StoreOp.MARK_MAY_CONTAIN_DATA) { delegate.markMayContainData(premium, krx) }
     }
 
     /**

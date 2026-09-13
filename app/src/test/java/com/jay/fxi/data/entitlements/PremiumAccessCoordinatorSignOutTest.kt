@@ -104,6 +104,8 @@ class PremiumAccessCoordinatorSignOutTest {
             AccessEpochTransitions.rotate(record, rotateUser, rotateKrx, ids).also { record = it }
         override suspend fun completePurges(completed: Collection<PendingPurge>) =
             AccessEpochTransitions.completePurges(record, completed).also { record = it }
+        override suspend fun journalRetired(obligation: LossObligation) =
+            AccessEpochTransitions.journalRetired(record, obligation).also { record = it }
         override suspend fun markMayContainData(premium: Boolean, krx: Boolean) =
             AccessEpochTransitions.markMayContainData(record, premium, krx).also { record = it }
     }
