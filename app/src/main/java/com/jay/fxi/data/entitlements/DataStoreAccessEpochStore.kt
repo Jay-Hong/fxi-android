@@ -9,12 +9,15 @@ import androidx.datastore.preferences.core.mutablePreferencesOf
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Dedicated store name.
@@ -87,6 +90,21 @@ private const val TAG = "AccessEpochStore"
  * All record semantics live in [AccessEpochTransitions]; this class only reads, transforms and
  * writes. Keeping the logic out of here is what lets it be unit tested without Android, and what
  * keeps a test fake from drifting away from production behaviour.
+ *
+ * A write that throws can leave `data` showing a value that is not on disk. DataStore 1.1.7 updates
+ * its in-memory copy inside the write scope and renames the scratch file after it
+ * (`DataStoreImpl.writeData`, `FileStorage.writeScope`), and `data` serves that copy while its version
+ * is current. A failure injected at that point in `DataStoreAccessEpochStoreReadBackTest` leaves `data`
+ * returning the rotation the reopened file does not have. An `edit` transforms what it reads from the
+ * file under the write lock. If the value changes, it returns only after the write scope, including
+ * the rename, completes; an unchanged value skips the write. So after any read or write that did not
+ * return normally, [load] answers with the result of an `edit` that changes [READ_BARRIER], and keeps
+ * doing so until one returns normally. Every read and write goes through one lock, so no read can
+ * reach the in-memory copy of a write still in flight.
+ *
+ * A completed write scope is as far as this goes. DataStore syncs the scratch file but not its
+ * directory, which `FileStorage` leaves as a TODO noting that a badly timed crash could revert to the
+ * previous state.
  */
 @Singleton
 class DataStoreAccessEpochStore internal constructor(
@@ -100,8 +118,25 @@ class DataStoreAccessEpochStore internal constructor(
         ids: EpochIdGenerator
     ) : this(context.accessEpochDataStore, ids)
 
-    override suspend fun load(): AccessEpochRecord =
-        dataStore.data.first().toRecord()
+    private val lock = Mutex()
+
+    /**
+     * Whether `data` may hold a write that never reached disk. Guarded by [lock].
+     *
+     * Cleared only by a barrier edit that returned and decoded. A mutation that returns normally does
+     * not clear it: an edit whose transform changes nothing skips the write and leaves the copy as it was.
+     */
+    private var readBackUnverified = false
+
+    override suspend fun load(): AccessEpochRecord = locked {
+        if (readBackUnverified) {
+            val written = dataStore.edit { it[READ_BARRIER] = (it[READ_BARRIER] ?: 0L) + 1L }.toRecord()
+            readBackUnverified = false
+            written
+        } else {
+            dataStore.data.first().toRecord()
+        }
+    }
 
     override suspend fun bindOwner(uid: String): AccessEpochRecord =
         transform { AccessEpochTransitions.bindOwner(it, uid, ids) }
@@ -130,9 +165,23 @@ class DataStoreAccessEpochStore internal constructor(
     /** Read, transform and write inside one atomic `edit`. */
     private suspend fun transform(
         block: (AccessEpochRecord) -> AccessEpochRecord
-    ): AccessEpochRecord =
+    ): AccessEpochRecord = locked {
         dataStore.edit { prefs -> prefs.write(block(prefs.toRecord())) }
             .toRecord()
+    }
+
+    /**
+     * Runs [block] under [lock]; anything but a normal return marks the read-back unverified before the
+     * lock is released. A cancelled caller counts: the edit it was waiting on can still be in flight.
+     */
+    private suspend fun <T> locked(block: suspend () -> T): T = lock.withLock {
+        var returned = false
+        try {
+            block().also { returned = true }
+        } finally {
+            if (!returned) readBackUnverified = true
+        }
+    }
 
     private fun Preferences.toRecord(): AccessEpochRecord = AccessEpochRecord(
         ownerUid = this[OWNER_UID],
@@ -237,5 +286,8 @@ class DataStoreAccessEpochStore internal constructor(
         val MAY_CONTAIN_KRX = booleanPreferencesKey("may_contain_krx_data")
         val PURGE_JOURNAL = stringPreferencesKey("pending_purge_journal")
         val TEARDOWN_OWED_FOR = stringPreferencesKey("teardown_owed_for")
+
+        /** Store-internal: changed only to force a write whose result [load] can trust. Not part of the record. */
+        val READ_BARRIER = longPreferencesKey("read_barrier")
     }
 }

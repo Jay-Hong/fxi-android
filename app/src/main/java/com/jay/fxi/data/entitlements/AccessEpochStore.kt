@@ -316,6 +316,14 @@ object AccessEpochTransitions {
  * device would point cleanup at a namespace that never existed there.
  */
 interface AccessEpochStore {
+    /**
+     * The record as persisted.
+     *
+     * Callers read back after a mutation that threw to learn whether it became durable, so a read must
+     * not answer with that mutation's result unless it did. After a mutation that failed or whose
+     * outcome is unknown — a cancellation included — this returns only a record whose persistence it has
+     * established, and ends in an exception when it cannot establish one.
+     */
     suspend fun load(): AccessEpochRecord
 
     /** Binds the record to [uid], allocating or rotating the namespace as required. */

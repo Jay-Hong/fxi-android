@@ -1255,8 +1255,8 @@ class PremiumAccessCoordinatorTest {
 
         // Consumed in both orders. The reducer's application count is not observable from here, so the
         // yardstick is what one premium refusal does on its own: applied one at a time, KRX first would
-        // rotate the capability epoch and leave the premium refusal stale, and premium first would be
-        // followed by a KRX re-query.
+        // rotate the capability epoch and leave the premium refusal stale. After premium, the same grant
+        // is stale too; a KRX re-query would require incorrectly bypassing that check.
         val alone = granted(krxVisible = true)
         val aloneRotations = alone.store.rotations
         alone.coordinator.onTopicRejected(alone.grant, listOf(premium))
