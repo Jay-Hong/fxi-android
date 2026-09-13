@@ -1470,11 +1470,17 @@ class PremiumAccessCoordinatorTest {
         g.source.identity = null
         g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
         g.source.identity = EntitlementsIdentity(OWNER, 1L)
-        g.store.failNextLoad = true
-        assertTrue(runCatching { g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL) }.isFailure)
         g.source.identityFailure = java.io.IOException("simulated identity failure")
         assertTrue(runCatching { g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL) }.isFailure)
         assertEquals(PremiumAccessState.PremiumConfirmed, g.coordinator.state.value.state)
+
+        // S1r-2c: a refusal whose record cannot be read is held rather than thrown, and recovery applies it once the
+        // record reads. Neither answers the demand behind the scheduled re-check.
+        g.store.failNextLoad = true
+        assertTrue(runCatching { g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL) }.isSuccess)
+        assertEquals("읽지 못한 거부의 보류가 grant 를 가리지 않았다", PremiumAccessState.NoGrant, g.coordinator.state.value.state)
+        runCurrent()
+        assertEquals("복구가 거부를 적용하지 않았다", PremiumAccessState.Rejected, g.coordinator.state.value.state)
 
         advanceTimeBy(5_100)
         runCurrent()

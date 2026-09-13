@@ -131,6 +131,30 @@ class RootViewModelTest {
     }
 
     /**
+     * A grant Root collected before a loss candidate withdrew it (S1r-2c) is not honoured on the next read, even before the
+     * new value reaches the collector.
+     */
+    @Test
+    fun aCollectedGrant_isRefusedOnceALossCandidateHoldsTheUserAxis() = runTest {
+        val fixture = Fixture(this)
+        try {
+            fixture.confirmPremium()
+            val collected = fixture.root.access.value
+            assertEquals(PremiumAccessState.PremiumConfirmed, fixture.root.accessForSession(OWNER, collected))
+
+            fixture.outcome = EntitlementsOutcome.StableInactive(krxVisible = false)
+            fixture.afterFetch = { fixture.store.loadFailures = Int.MAX_VALUE }
+            fixture.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+
+            val access = fixture.root.accessForSession(OWNER, collected)
+            assertEquals(PremiumAccessState.NoGrant, access)
+            assertEquals(RootDestination.FreeSnapshot, rootDestinationFor(signedIn(), access))
+        } finally {
+            fixture.processJob.cancel()
+        }
+    }
+
+    /**
      * Root reads the coordinator's own flow rather than a copy, so there is no second value that can
      * fall behind the first.
      */
@@ -171,6 +195,10 @@ class RootViewModelTest {
         val processJob = SupervisorJob()
         private val scope = CoroutineScope(processJob + StandardTestDispatcher(testScope.testScheduler))
         var identity: AuthIdentity? = AuthIdentity(OWNER, 7L)
+        var outcome: EntitlementsOutcome = EntitlementsOutcome.StableActive(krxVisible = false)
+
+        /** Runs once after an answer is formed and before it returns. */
+        var afterFetch: () -> Unit = {}
         private val tokens = AuthTokenProvider(object : AuthTokenSource {
             override fun currentIdentity() = identity
             override suspend fun fetchToken(identity: AuthIdentity, forceRefresh: Boolean): String =
@@ -180,11 +208,11 @@ class RootViewModelTest {
             override suspend fun currentIdentity(): EntitlementsIdentity? =
                 identity?.let { EntitlementsIdentity(it.uid, it.authGeneration) }
 
-            override suspend fun fetch(freshPremium: Boolean): EntitlementsResult =
-                EntitlementsResult.Answered(
-                    checkNotNull(currentIdentity()),
-                    EntitlementsOutcome.StableActive(krxVisible = false)
-                )
+            override suspend fun fetch(freshPremium: Boolean): EntitlementsResult {
+                val answer = EntitlementsResult.Answered(checkNotNull(currentIdentity()), outcome)
+                afterFetch().also { afterFetch = {} }
+                return answer
+            }
         }
         val store = MemoryStore()
         val coordinator = PremiumAccessCoordinator(
@@ -212,10 +240,19 @@ class RootViewModelTest {
     private class MemoryStore : AccessEpochStore {
         /** The next `bindOwner` fails before touching the record, so the edit's outcome is known: nothing. */
         var failNextBind = false
+
+        /** The next this many loads throw. */
+        var loadFailures = 0
         private var record = AccessEpochRecord()
         private var nextId = 0
         private val ids = EpochIdGenerator { "epoch-${nextId++}" }
-        override suspend fun load() = record
+        override suspend fun load(): AccessEpochRecord {
+            if (loadFailures > 0) {
+                loadFailures -= 1
+                throw IOException("injected load failure")
+            }
+            return record
+        }
         override suspend fun bindOwner(uid: String): AccessEpochRecord {
             if (failNextBind) {
                 failNextBind = false

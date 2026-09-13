@@ -21,8 +21,9 @@ S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반�
                                 **유예 사유는 셋이 서로 다르다** — purge는 대상이 아직 legacy rate/graph store,
                                 PushDelete는 **서버 D21 순서 계약 미결**, backup은 기존 사용자 설정의 restore 동작
                                 변경을 분리한 것. 이 기록은 완료 선언도, 후속 슬라이스로의 이관 승인도 아니다.
-                                명시적 거부 저장 실패의 S1 잔여 중 S1r-1·S1r-2b는 land했고, 이번 변경에 S1r-2a 구현을
-                                포함한다. S1r-2c·봉인과 재확인 요구의 process death 지속은 미충족이다(동결 후 8·9번 기록)
+                                명시적 거부 저장 실패의 S1 잔여 중 S1r-1·S1r-2b·S1r-2a는 land했고, 이번 변경에 S1r-2c
+                                구현을 포함한다. 봉인·재확인 요구·손실 후보 보류의 process death 지속은 미충족이다
+                                (동결 후 8·9·10번 기록)
 S1.5 확인 필요                : presenter·순서/표시 설정·legacy bank store 삭제는 land. `RateSourceRegistry`와
                                 live/snapshot renderMode 등가까지 포함한 전체 DoD 충족은 미확인
 S2 미충족                     : D26 무료 알림 in-memory 미리보기 미구현 · 마지막 탭은 `(owner_uid, last_tab)` 한 쌍이라
@@ -231,6 +232,15 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > 봉인과 재확인 요구의 process death 지속 / 실제 purger.
 > 이 기록은 7번의 선행조건을 완화하지 않는다. 범위·D-결정·슬라이스 경계·게이트·DoD는 그대로이고 어떤 arming·rollout·deploy도
 > 열지 않는다.
+>
+> **동결 후 10번 명시적 개정 기록(사용자 P4 GO 2026-09-14, Claude·Codex 설계 합의).** §7 S4의 명시적 철회 봉인 계약이 정하지 않은, 결정용 레코드 읽기 실패로 응답의 현재 신원·namespace·세대에 대한 유효성을 확인할 수 없는 경우를 보완한다(S1r-2c).
+> 이 경우 권위 상태를 보존하고 해당 범위의 접근만 임시 보류한다(P4). 레코드 없이 확인된 stale은 보류 없이 버리고, identity 확인 불가를 다른 세션으로 간주하지 않는다.
+> premium 후보는 USER·CAPABILITY, KRX 후보는 CAPABILITY만 보류한다. 보류 자체로 권위 손실·epoch 회전·purge를 합성하지 않으며 무료 snapshot과 기존 비-grant 상태의 최소 접근을 유지한다.
+> 해당 범위의 protected read/render·관측 채택·신규 요청·재시도·지연 완료 적용은 현재 유효 접근으로 차단해야 한다. Root와 push 등록을 포함한 소비처에 적용하며, 이 문구는 아직 없는 topic/KRX/그래프 runtime 배선의 완료를 뜻하지 않는다.
+> 보류를 해결하는 레코드 읽기·identity 재검증·권한 재확인과 이미 필요한 정리는 차단하지 않는다. 기존 D를 보존하고 후보 응답의 새 서버 하한도 기록하되, 보류 생성만으로 새 D를 만들지 않는다. 일정은 기존 admission·AUTH·in-flight·floor 규칙에 따라 기다리거나 재무장될 수 있다.
+> LossRecovery와 별도인 단일 CandidateRecovery가 후보별 최신 레코드로 재검증한다. 유효한 후보는 기존 손실 발행·봉인·회전·미완료 정리의 인계 후 보류를 해제하며, 인계를 실제 purge 완료로 보고하지 않는다. stale이면 해당 후보의 보류만 해제한다. binding 종료와 취소에도 옛 grant의 중간 발행이나 후보 정리 누락이 없어야 한다.
+> 보류의 process death 지속은 미충족이다. 이 개정은 위 미정의 경우를 보완하며 다른 D-결정·슬라이스 경계·게이트를 바꾸지 않는다. 어떤 arming·rollout·deploy도 열지 않는다.
+> 이번 변경에 이 계약의 구현을 포함한다. 손실 후보가 아닌 답의 결정용 읽기 실패, 조회 전 읽기 실패, `topicGrant()` 읽기 실패는 이 계약 밖이며 예외 전파를 그대로 둔다.
 
 ---
 

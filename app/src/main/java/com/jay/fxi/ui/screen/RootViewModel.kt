@@ -56,9 +56,12 @@ class RootViewModel @Inject constructor(
         // Read the non-suspend live fence here, without remember or another cached Flow: auth may
         // already have advanced while the collected grant still belongs to the previous session.
         val live = authTokenProvider.currentIdentityFence()
+        // A collected grant is also checked against the coordinator's current value: a hold placed since it was collected
+        // (S1r-2c) must win before the next emission reaches this recomposition. Anything that is not a grant opens nothing.
+        val grantStillStands = !ownedAccess.state.grantsPremiumRuntime || coordinator.state.value == ownedAccess
         return if (signedInUid != null && live != null &&
             live.uid == signedInUid && ownedAccess.uid == signedInUid &&
-            ownedAccess.authGeneration == live.authGeneration
+            ownedAccess.authGeneration == live.authGeneration && grantStillStands
         ) {
             ownedAccess.state
         } else {

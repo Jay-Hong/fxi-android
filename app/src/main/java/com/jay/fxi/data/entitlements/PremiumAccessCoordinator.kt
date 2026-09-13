@@ -81,6 +81,17 @@ class PremiumAccessCoordinator(
     private var lossCleanupOwed = false
 
     /**
+     * Loss answers whose decision read failed, oldest first. Each holds its axes back from [state] and [krx] until
+     * candidate recovery reads the record and applies or discards it (S1r-2c). Guarded by [mutex].
+     */
+    private val lossCandidates = ArrayList<LossCandidate>()
+    private var nextHoldId: Long = 0L
+
+    /** The candidate recovery run while one is armed. Guarded by [mutex]; the run clears it when no candidate is left. */
+    private var candidateRecovery: Job? = null
+    private var candidateRecoveryAttempts = 0
+
+    /**
      * The re-check the current binding still owes (S1r-2a). Kept apart from the schedule's timer, so a query that is dropped,
      * goes stale or is cancelled, or an answer that clears the timer without answering the requirement, does not take the
      * requirement with it. Guarded by [mutex].
@@ -95,13 +106,18 @@ class PremiumAccessCoordinator(
 
     internal data class RecheckDiagnostics(
         val bindingEpoch: Long,
-        val registeredQueryCount: Int
+        val registeredQueryCount: Int,
+        /** The intent the current demand owes, or null with none. */
+        val owedIntent: RefreshIntent? = null
     )
 
     /** Immutable diagnostic snapshot, including any registration incorrectly retained from an old binding. */
     internal suspend fun recheckDiagnostics(): RecheckDiagnostics = mutex.withLock {
-        RecheckDiagnostics(probeEpoch, inFlightQueries.size)
+        RecheckDiagnostics(probeEpoch, inFlightQueries.size, recheckDemand?.intent)
     }
+
+    /** Diagnostic: how many loss candidates still hold access back (S1r-2c). */
+    internal suspend fun heldLossCandidateCount(): Int = mutex.withLock { lossCandidates.size }
 
     /** An authentication answer stopped new automatic re-queries for this binding. Guarded by [mutex]. */
     private var authStopped = false
@@ -114,7 +130,23 @@ class PremiumAccessCoordinator(
 
     private var lossRecoveryAttempts = 0
 
-    private val _state = MutableStateFlow(OwnedPremiumAccess())
+    /**
+     * The reducer's view of access: what every decision reads and publishes, and what binding and the probes read. Not
+     * what consumers see — [state] and [krx] put the loss candidates' holds on top (S1r-2c §2.2). A write republishes
+     * those in the same call, so no reader sees a held grant between the two. Guarded by [mutex].
+     */
+    private val _state = Authoritative(OwnedPremiumAccess())
+    private val _krx = Authoritative(KrxCapabilityState.HIDDEN)
+
+    private inner class Authoritative<T>(initial: T) {
+        var value: T = initial
+            set(next) {
+                field = next
+                republishEffectiveLocked()
+            }
+    }
+
+    private val _effectiveState = MutableStateFlow(OwnedPremiumAccess())
     /**
      * The access decision **and the identity it was decided for**.
      *
@@ -123,11 +155,15 @@ class PremiumAccessCoordinator(
      * them, a bare `PremiumConfirmed` left over from the previous user is what Root would branch on.
      * Publishing the owner alongside lets a reader refuse a grant that is not its own instead of
      * inferring it from timing.
+     *
+     * While a loss answer whose record could not be read holds the user axis, a grant is shown as NoGrant; the decision
+     * itself is untouched and comes back as soon as the hold is released (S1r-2c).
      */
-    val state: StateFlow<OwnedPremiumAccess> = _state.asStateFlow()
+    val state: StateFlow<OwnedPremiumAccess> = _effectiveState.asStateFlow()
 
-    private val _krx = MutableStateFlow(KrxCapabilityState.HIDDEN)
-    val krx: StateFlow<KrxCapabilityState> = _krx.asStateFlow()
+    private val _effectiveKrx = MutableStateFlow(KrxCapabilityState.HIDDEN)
+    /** KRX visibility as consumers see it: hidden while any loss candidate holds the capability axis (S1r-2c). */
+    val krx: StateFlow<KrxCapabilityState> = _effectiveKrx.asStateFlow()
 
     /** Effects the reducer declared on the most recent applied decision. Diagnostic and tests. */
     private val _lastEffects = MutableStateFlow<List<AccessEffect>>(emptyList())
@@ -1301,6 +1337,9 @@ class PremiumAccessCoordinator(
         authStopped = false
         authStateOrder = 0L
         unreportedReapproval = null
+        // Not republished here: every caller publishes NoGrant next, with no suspension between (S1r-2c §2.1). Republishing
+        // now would show the ending binding's grant with its holds already gone.
+        lossCandidates.clear()
     }
 
     private data class ProbeRun(val owner: String, val epoch: Long)
@@ -1518,6 +1557,8 @@ class PremiumAccessCoordinator(
     internal suspend fun topicGrant(): TopicSessionFence? = mutex.withLock {
         if (!accessAdmittedLocked()) return@withLock null
         if (_state.value.state != PremiumAccessState.PremiumConfirmed) return@withLock null
+        // Refused without touching the issued grant: a hold is not a loss, and it must not make its own candidate stale.
+        if (lossCandidates.any { PurgeScope.USER in it.axes }) return@withLock null
         val bound = boundIdentityLocked() ?: return@withLock null
         val record = store.load()
         if (record.ownerUid != bound.ownerUid) return@withLock null
@@ -1552,8 +1593,9 @@ class PremiumAccessCoordinator(
      * cancellation, because whatever is scheduled belongs to a later event. A live identity that
      * cannot be read discards it too, and that says nothing about a sign-out having happened.
      *
-     * Throws what the record or identity read throws, before the reducer runs. A rotation that cannot be
-     * persisted does not throw; see [decideLocked].
+     * A record read that throws does not throw from here: the refusal is held as a loss candidate unless it is already
+     * known stale, and candidate recovery reads the record again (S1r-2c). An identity read that throws still throws,
+     * before the reducer runs. A rotation that cannot be persisted does not throw; see [decideLocked].
      */
     internal suspend fun onTopicRejected(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) {
         val outcome = when (TopicRejection.of(reasons) ?: return) {
@@ -1564,7 +1606,12 @@ class PremiumAccessCoordinator(
             val context = issuedTopicGrant?.takeIf { it.token == grant }?.context ?: return
             if (!accessAdmittedLocked()) return
             if (context.generation != decisionGeneration) return
-            val record = store.load()
+            val record = try {
+                store.load()
+            } catch (failed: Exception) {
+                holdUnreadableLossLocked(outcome, CandidateProvenance.Topic(grant, context), failed)
+                return
+            }
             if (record.fence() != context.access) return
             if (boundIdentityLocked() != context.identity) return
             if (source.currentIdentity() != context.identity) return
@@ -1641,7 +1688,12 @@ class PremiumAccessCoordinator(
         mutex.withLock {
             // An answer landing while a sign-out is open is dropped without arming anything.
             if (!accessAdmittedLocked()) return
-            val record = store.load()
+            val record = try {
+                store.load()
+            } catch (failed: Exception) {
+                holdUnreadableLossLocked(outcome, CandidateProvenance.Query(started, answeredAs), failed)
+                return
+            }
             // Five independent staleness checks, because each catches something the others miss:
             //  - generation: an authoritative loss or reset that rotated nothing,
             //  - fence: a namespace that has since been retired,
@@ -1808,7 +1860,12 @@ class PremiumAccessCoordinator(
     private suspend fun decideLocked(
         record: AccessEpochRecord,
         intent: RefreshIntent,
-        outcome: EntitlementsOutcome
+        outcome: EntitlementsOutcome,
+        /**
+         * Runs once the decision is published, before a cancellation after publishing goes through — for a caller whose own
+         * follow-up must not be lost with it (S1r-2c §2.3). Protected from cancellation itself.
+         */
+        onPublished: (suspend (AccessDecision) -> Unit)? = null
     ): AccessDecision {
         val decision = PremiumAccessReducer.reduce(
             current = record.toSnapshotFacts(_state.value.state, _krx.value),
@@ -1837,8 +1894,12 @@ class PremiumAccessCoordinator(
         }
         if (purgeNow && !currentCoroutineContext().isActive) lossCleanupOwed = true
         if (!rotated || lossCleanupOwed) kickLossRecoveryLocked()
-        currentCoroutineContext().ensureActive()
-        if (purgeNow) purgeOrHandOverLocked()
+        try {
+            currentCoroutineContext().ensureActive()
+            if (purgeNow) purgeOrHandOverLocked()
+        } finally {
+            onPublished?.let { followUp -> withContext(NonCancellable) { followUp(decision) } }
+        }
         return decision
     }
 
@@ -1933,17 +1994,31 @@ class PremiumAccessCoordinator(
 
     private fun kickLossRecoveryLocked() {
         if (lossRecovery != null) return
-        lossRecovery = scope.launch { runLossRecovery() }
+        lossRecovery = scope.launch {
+            runRecovery(
+                roundLocked = { lossRecoveryRoundLocked() },
+                delayMillis = { recoveryDelayMillis(lossRecoveryAttempts) },
+                clearIfMineLocked = { self -> if (lossRecovery === self) lossRecovery = null }
+            )
+        }
     }
 
-    private suspend fun runLossRecovery() {
+    /**
+     * One recovery worker: rounds under [mutex], waits outside it. Shared by loss recovery and candidate recovery, which
+     * keep their own job, attempts and retry time.
+     */
+    private suspend fun runRecovery(
+        roundLocked: suspend () -> RecoveryNext,
+        delayMillis: () -> Long,
+        clearIfMineLocked: (Job?) -> Unit
+    ) {
         val self = currentCoroutineContext()[Job]
         try {
             while (true) {
-                when (val next = mutex.withLock { lossRecoveryRoundLocked() }) {
-                    LossRecoveryNext.Done -> return
-                    LossRecoveryNext.Retry -> delay(lossRecoveryDelayMillis())
-                    is LossRecoveryNext.AwaitAdmission -> merge(
+                when (val next = mutex.withLock { roundLocked() }) {
+                    RecoveryNext.Done -> return
+                    RecoveryNext.Retry -> delay(delayMillis())
+                    is RecoveryNext.AwaitAdmission -> merge(
                         attemptSignal.filter { it != next.attempt },
                         _persistenceSignal.filter { it != next.pending }
                     ).first()
@@ -1952,13 +2027,13 @@ class PremiumAccessCoordinator(
         } finally {
             // However the run ends, a later kick must be able to start another. Only this run's own reference is cleared.
             withContext(NonCancellable) {
-                mutex.withLock { if (lossRecovery === self) lossRecovery = null }
+                mutex.withLock { clearIfMineLocked(self) }
             }
         }
     }
 
-    private fun lossRecoveryDelayMillis(): Long {
-        val shift = (lossRecoveryAttempts - 1).coerceIn(0, 16)
+    private fun recoveryDelayMillis(attempts: Int): Long {
+        val shift = (attempts - 1).coerceIn(0, 16)
         return (persistenceRetryDelayMillis shl shift).coerceAtMost(LOSS_RECOVERY_MAX_DELAY_MILLIS)
     }
 
@@ -1972,9 +2047,9 @@ class PremiumAccessCoordinator(
      * A round that throws is retried after a growing delay. A round that leaves nothing it can act on ends the run; what is
      * still sealed then waits for evidence from elsewhere, and is not rotated on a timer.
      */
-    private suspend fun lossRecoveryRoundLocked(): LossRecoveryNext {
+    private suspend fun lossRecoveryRoundLocked(): RecoveryNext {
         if (!accessAdmittedLocked()) {
-            return LossRecoveryNext.AwaitAdmission(attemptSignal.value, _persistenceSignal.value)
+            return RecoveryNext.AwaitAdmission(attemptSignal.value, _persistenceSignal.value)
         }
         try {
             val record = store.load()
@@ -2011,15 +2086,15 @@ class PremiumAccessCoordinator(
             // A CancellationException thrown by the store or a purger is a failed round; this run being cancelled is not.
             currentCoroutineContext().ensureActive()
             lossRecoveryAttempts += 1
-            return LossRecoveryNext.Retry
+            return RecoveryNext.Retry
         }
         if (lossCleanupOwed || lossRecoveryHasWorkLocked()) {
             lossRecoveryAttempts += 1
-            return LossRecoveryNext.Retry
+            return RecoveryNext.Retry
         }
         lossRecovery = null
         lossRecoveryAttempts = 0
-        return LossRecoveryNext.Done
+        return RecoveryNext.Done
     }
 
     /** Whether a round could still act on something, judged on the last confirmed record. */
@@ -2044,10 +2119,255 @@ class PremiumAccessCoordinator(
                 }
             )
 
-    private sealed interface LossRecoveryNext {
-        data object Done : LossRecoveryNext
-        data object Retry : LossRecoveryNext
-        data class AwaitAdmission(val attempt: AttemptSignal, val pending: PendingPersistence?) : LossRecoveryNext
+    // --- S1r-2c: a loss answer whose record could not be read ------------------------------------------------------------
+
+    /** Where a loss candidate came from, kept as it was so recovery checks it the way the original path would have. */
+    private sealed interface CandidateProvenance {
+        /** A REST answer: the query as it started, and the session the transport answered as. */
+        data class Query(val started: StartedQuery, val answeredAs: EntitlementsIdentity?) : CandidateProvenance
+
+        /** A WebSocket refusal: the grant it refused and the context that grant was issued in. No query order is made up. */
+        data class Topic(val grant: TopicGrantToken, val context: TopicGrantContext) : CandidateProvenance
+    }
+
+    private class LossCandidate(
+        val holdId: Long,
+        /** The [probeEpoch] it was held under. */
+        val binding: Long,
+        val axes: Set<PurgeScope>,
+        val outcome: EntitlementsOutcome,
+        val provenance: CandidateProvenance,
+        /** The stated server floor as an absolute time, taken once when the hold was made; null without one. */
+        val floorNotBefore: Long?
+    )
+
+    private sealed interface CandidateCheck {
+        data object Stale : CandidateCheck
+        data object IdentityUnknown : CandidateCheck
+        data class Valid(val record: AccessEpochRecord) : CandidateCheck
+    }
+
+    /** The axes a loss answer takes away, or null when it is not one — the reducer's loss branches (PremiumAccessReducer). */
+    private fun EntitlementsOutcome.lossAxes(): Set<PurgeScope>? = when (this) {
+        is EntitlementsOutcome.StableInactive, EntitlementsOutcome.PremiumRequired ->
+            setOf(PurgeScope.USER, PurgeScope.CAPABILITY)
+        EntitlementsOutcome.KrxEntitlementRequired -> setOf(PurgeScope.CAPABILITY)
+        // A KRX false edge is applied ahead of the premium branch, whatever that branch does.
+        is EntitlementsOutcome.StableActive -> setOf(PurgeScope.CAPABILITY).takeUnless { krxVisible }
+        is EntitlementsOutcome.Pending -> setOf(PurgeScope.CAPABILITY).takeUnless { krxVisible }
+        is EntitlementsOutcome.Indeterminate -> null
+    }
+
+    /**
+     * [state] and [krx] from the reducer's view and the candidates' holds. A user hold shows a grant as NoGrant and leaves
+     * any other state as it is; a capability hold, or a state that grants nothing, hides KRX. Called on every write of
+     * either. Callers hold [mutex].
+     */
+    private fun republishEffectiveLocked() {
+        val decided = _state.value
+        _effectiveState.value =
+            if (decided.state.grantsPremiumRuntime && lossCandidates.any { PurgeScope.USER in it.axes }) {
+                decided.copy(state = PremiumAccessState.NoGrant)
+            } else {
+                decided
+            }
+        // KRX opens only under a premium runtime (PremiumAccessReducer). Following that here too keeps a boundary — NoGrant
+        // written before HIDDEN — from showing KRX again in between once it has dropped the holds.
+        _effectiveKrx.value =
+            if (!decided.state.grantsPremiumRuntime || lossCandidates.any { PurgeScope.CAPABILITY in it.axes }) {
+                KrxCapabilityState.HIDDEN
+            } else {
+                _krx.value
+            }
+    }
+
+    /**
+     * A decision's record read threw (S1r-2c §2.1). A loss answer that is not already known stale is held: its axes are
+     * withheld from [state] and [krx], and candidate recovery owns reading the record again. Nothing the reducer reads moves
+     * — no state, seal, epoch, purge, demand or authentication order. A floor the answer stated is recorded once (§2.5).
+     *
+     * An answer that is not a loss rethrows [failed], as before (§2.7). The caller's own cancellation goes through after
+     * the hand-over; a CancellationException the store threw while the caller is still active is a failed read like any
+     * other. Callers hold [mutex].
+     */
+    private suspend fun holdUnreadableLossLocked(
+        outcome: EntitlementsOutcome,
+        provenance: CandidateProvenance,
+        failed: Exception
+    ) {
+        val axes = outcome.lossAxes() ?: throw failed
+        if (!knownStaleWithoutRecordLocked(provenance, probeEpoch)) {
+            val floor = outcome.statedRetryFloorMillis()
+            lossCandidates += LossCandidate(
+                holdId = ++nextHoldId,
+                binding = probeEpoch,
+                axes = axes,
+                outcome = outcome,
+                provenance = provenance,
+                floorNotBefore = floor?.let { clock.elapsedMillis() + it }
+            )
+            republishEffectiveLocked()
+            kickCandidateRecoveryLocked()
+            // After the hand-over: a timer that fired into this query is the very job recording a floor cancels.
+            if (floor != null) withContext(NonCancellable) { schedule.recordFloorWithoutArming(floor) }
+        }
+        currentCoroutineContext().ensureActive()
+    }
+
+    /**
+     * What can be told stale without the record: the generation or binding moved, the answer is for another owner than the
+     * query's namespace, for another session than the binding stood on, or a live session is known and is someone else.
+     * A live identity that cannot be read says nothing. Callers hold [mutex].
+     */
+    private fun knownStaleWithoutRecordLocked(provenance: CandidateProvenance, binding: Long): Boolean {
+        if (binding != probeEpoch) return true
+        val live = liveFence()?.let { EntitlementsIdentity(it.uid, it.authGeneration) }
+        return when (provenance) {
+            is CandidateProvenance.Query -> {
+                val started = provenance.started
+                val answeredAs = provenance.answeredAs
+                started.generation != decisionGeneration ||
+                    started.binding != probeEpoch ||
+                    (answeredAs != null && (
+                        answeredAs.ownerUid != started.fence.ownerUid ||
+                            (started.boundIdentity != null && answeredAs != started.boundIdentity) ||
+                            (live != null && live != answeredAs)
+                        ))
+            }
+            is CandidateProvenance.Topic -> {
+                val context = provenance.context
+                issuedTopicGrant?.takeIf { it.token == provenance.grant }?.context != context ||
+                    context.generation != decisionGeneration ||
+                    boundIdentityLocked() != context.identity ||
+                    (live != null && live != context.identity)
+            }
+        }
+    }
+
+    private fun kickCandidateRecoveryLocked() {
+        if (candidateRecovery != null) return
+        candidateRecovery = scope.launch {
+            runRecovery(
+                roundLocked = { candidateRecoveryRoundLocked() },
+                delayMillis = { recoveryDelayMillis(candidateRecoveryAttempts) },
+                clearIfMineLocked = { self -> if (candidateRecovery === self) candidateRecovery = null }
+            )
+        }
+    }
+
+    /**
+     * One candidate recovery round (S1r-2c §2.3), oldest candidate first, each checked against a record read for it.
+     * Waits while access is not admitted. A failed read, or a live identity that cannot be read, keeps the candidate and
+     * ends the round; stale and resolved candidates release their own hold only. Ends the run when none is left.
+     */
+    private suspend fun candidateRecoveryRoundLocked(): RecoveryNext {
+        while (true) {
+            val candidate = lossCandidates.firstOrNull() ?: run {
+                candidateRecovery = null
+                candidateRecoveryAttempts = 0
+                return RecoveryNext.Done
+            }
+            if (!accessAdmittedLocked()) {
+                return RecoveryNext.AwaitAdmission(attemptSignal.value, _persistenceSignal.value)
+            }
+            if (knownStaleWithoutRecordLocked(candidate.provenance, candidate.binding)) {
+                releaseCandidateLocked(candidate)
+                continue
+            }
+            val check = try {
+                checkCandidateLocked(candidate, store.load())
+            } catch (failed: Exception) {
+                // A CancellationException thrown by the store or the source is a failed round; this run being cancelled is not.
+                currentCoroutineContext().ensureActive()
+                candidateRecoveryAttempts += 1
+                return RecoveryNext.Retry
+            }
+            when (check) {
+                CandidateCheck.Stale -> releaseCandidateLocked(candidate)
+                CandidateCheck.IdentityUnknown -> {
+                    candidateRecoveryAttempts += 1
+                    return RecoveryNext.Retry
+                }
+                is CandidateCheck.Valid -> resolveCandidateLocked(candidate, check.record)
+            }
+        }
+    }
+
+    /** The checks the original path would have made, against [record] just read. Callers hold [mutex]. */
+    private suspend fun checkCandidateLocked(candidate: LossCandidate, record: AccessEpochRecord): CandidateCheck {
+        when (val provenance = candidate.provenance) {
+            is CandidateProvenance.Query -> {
+                val started = provenance.started
+                if (started.generation != decisionGeneration || record.fence() != started.fence) return CandidateCheck.Stale
+                val answeredAs = provenance.answeredAs ?: return CandidateCheck.Valid(record)
+                if (answeredAs.ownerUid != record.ownerUid) return CandidateCheck.Stale
+                if (started.boundIdentity != null && answeredAs != started.boundIdentity) return CandidateCheck.Stale
+                return when (source.currentIdentity()) {
+                    answeredAs -> CandidateCheck.Valid(record)
+                    null -> CandidateCheck.IdentityUnknown
+                    else -> CandidateCheck.Stale
+                }
+            }
+            is CandidateProvenance.Topic -> {
+                val context = provenance.context
+                if (issuedTopicGrant?.takeIf { it.token == provenance.grant }?.context != context) return CandidateCheck.Stale
+                if (context.generation != decisionGeneration || record.fence() != context.access) return CandidateCheck.Stale
+                if (boundIdentityLocked() != context.identity) return CandidateCheck.Stale
+                return when (source.currentIdentity()) {
+                    context.identity -> CandidateCheck.Valid(record)
+                    null -> CandidateCheck.IdentityUnknown
+                    else -> CandidateCheck.Stale
+                }
+            }
+        }
+    }
+
+    /**
+     * Applies a candidate that checked out, then releases its hold. The loss is published inside [decideLocked]; what follows
+     * it — the schedule, handled the way the candidate's own path handles a decided answer (§2.5, §2.6), and the release — is
+     * handed to [decideLocked] so a cancellation after publishing loses neither. Callers hold [mutex].
+     */
+    private suspend fun resolveCandidateLocked(candidate: LossCandidate, record: AccessEpochRecord) {
+        val provenance = candidate.provenance
+        val intent = when (provenance) {
+            is CandidateProvenance.Query -> provenance.started.intent
+            is CandidateProvenance.Topic -> RefreshIntent.FORCE_ENTITLEMENTS
+        }
+        decideLocked(record, intent, candidate.outcome) { decision ->
+            try {
+                val recheck = decision.recheck?.remainingOf(candidate)
+                when (provenance) {
+                    is CandidateProvenance.Query -> settleDemandLocked(provenance.started, candidate.outcome, recheck)
+                    // Not a query's answer, so it answers no demand; a re-check it asks for is a new requirement (S1r-2a §2.1).
+                    is CandidateProvenance.Topic ->
+                        if (recheck != null) {
+                            raiseDemandLocked(recheck.intent, independent = true)
+                            armRecheckLocked(recheck)
+                        } else if (recheckDemand == null) {
+                            schedule.cancel()
+                        }
+                }
+                ensureDemandArmedLocked()
+            } finally {
+                releaseCandidateLocked(candidate)
+            }
+        }
+    }
+
+    /** A stated floor is not restarted by a late resolution: only what is left of it is asked for. */
+    private fun RecheckRequest.remainingOf(candidate: LossCandidate): RecheckRequest {
+        val notBefore = candidate.floorNotBefore ?: return this
+        return copy(minDelayMillis = (notBefore - clock.elapsedMillis()).coerceAtLeast(0L))
+    }
+
+    private fun releaseCandidateLocked(candidate: LossCandidate) {
+        if (lossCandidates.remove(candidate)) republishEffectiveLocked()
+    }
+
+    private sealed interface RecoveryNext {
+        data object Done : RecoveryNext
+        data object Retry : RecoveryNext
+        data class AwaitAdmission(val attempt: AttemptSignal, val pending: PendingPersistence?) : RecoveryNext
     }
 
     /**
