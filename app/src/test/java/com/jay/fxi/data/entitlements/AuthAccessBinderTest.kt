@@ -18,6 +18,7 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -46,6 +47,8 @@ class AuthAccessBinderTest {
     private sealed interface Call {
         data class OwnerChanged(val uid: String) : Call
         data object SignedOut : Call
+        /** Recorded only when the store is asked to retire; a start with nothing owed never asks. */
+        data object RetiredUnverifiedStart : Call
     }
 
     /**
@@ -90,7 +93,23 @@ class AuthAccessBinderTest {
         /** Every bind call, failed ones included. */
         var bindAttempts = 0
 
+        /** Every read, failed ones included — what shows a start's settlement asked the store at all. */
+        var loads = 0
+
+        /** Fails the next retirement before it writes anything. */
+        var failNextRetire = false
+
+        override suspend fun retireUnverifiedStart(): AccessEpochRecord {
+            if (failNextRetire) {
+                failNextRetire = false
+                throw java.io.IOException("simulated write failure")
+            }
+            calls += Call.RetiredUnverifiedStart
+            return AccessEpochTransitions.retireUnverifiedStart(record, ids).also { record = it }
+        }
+
         override suspend fun load(): AccessEpochRecord {
+            loads += 1
             blockNextLoadOn?.let { gate -> blockNextLoadOn = null; gate.await() }
             if (failNextLoad) {
                 failNextLoad = false
@@ -167,7 +186,13 @@ class AuthAccessBinderTest {
         /** Hands over the coordinator, for a test that reads back an edit from outside the FIFO. */
         onCoordinator: (PremiumAccessCoordinator) -> Unit = {},
         /** Off unless a test is about the automatic run: the others drive recoverSignOut themselves. */
-        recoverAutomatically: Boolean = false
+        recoverAutomatically: Boolean = false,
+        /**
+         * Replays [initial] once on registration, as the production stream does. Off by default so a
+         * test that drives [AuthAccessBinder.onFenceObserved] itself controls every observation.
+         */
+        replaying: Boolean = false,
+        initial: AuthIdentityFence? = null
     ): AuthAccessBinder {
         if (seedJournal) {
             // A journal a previous process left behind — the only thing that makes a resume
@@ -221,9 +246,10 @@ class AuthAccessBinderTest {
         )
         built = coordinator
         onCoordinator(coordinator)
-        // No stream: every test drives onFenceObserved itself, so registration order cannot make
-        // a test pass for the wrong reason.
-        return AuthAccessBinder(coordinator, scope, AuthFenceStream { }, recoverAutomatically)
+        // No stream unless asked: most tests drive onFenceObserved themselves, so registration order
+        // cannot make them pass for the wrong reason. The replaying stream is for the start-up order.
+        val stream = if (replaying) AuthFenceStream { onFence -> onFence(initial) } else AuthFenceStream { }
+        return AuthAccessBinder(coordinator, scope, stream, recoverAutomatically)
     }
 
     @Test
@@ -273,8 +299,8 @@ class AuthAccessBinderTest {
         binder.onFenceObserved(null)
         advanceUntilIdle()
 
-        // A synthesised sign-out would rotate both epochs and journal a purge whenever a previous
-        // process left an owner bound, destroying same-uid cold-start continuity.
+        // No owner, marker or intent on the record, so a first null has nothing to settle: nothing is
+        // bound, signed out or retired. The start that does owe a retirement is its own test below.
         assertEquals(emptyList<Call>(), calls)
         processJob.cancel()
     }
@@ -316,8 +342,9 @@ class AuthAccessBinderTest {
     }
 
     /**
-     * The explicit resume at [AuthAccessBinder.start] is the only path that retries a previous
-     * process's journal when nobody signs in — no owner change ever fires in that session.
+     * The explicit resume at [AuthAccessBinder.start] retries a previous process's journal before
+     * any observation arrives. With no observation at all — this test sends none — it is the only
+     * path that does; a first observation may then land an edit whose cleanup resumes it again.
      */
     @Test
     fun signedOutColdStart_stillRetriesAJournalledPurge() = runTest {
@@ -329,7 +356,7 @@ class AuthAccessBinderTest {
         advanceUntilIdle()
 
         assertEquals(listOf("previous-owner"), purger.attempts)
-        assertEquals("nobody signed in, so nothing may bind or tear down", emptyList<Call>(), calls)
+        assertEquals("no observation yet, so nothing may bind, tear down or retire", emptyList<Call>(), calls)
         processJob.cancel()
     }
 
@@ -1292,6 +1319,161 @@ class AuthAccessBinderTest {
 
         assertTrue("자동 회차가 돌지 않았다", purger.attempts.size >= 2)
         assertEquals("보류가 선 채로 뒤 사건이 적용됐다", emptyList<Call>(), calls)
+        processJob.cancel()
+    }
+
+    // Unverified start (plan amendment 6), through the stream's start-up replay
+
+    private val previousA = AccessEpochRecord(ownerUid = "user-a", userAccessEpoch = "u0", krxCapabilityEpoch = "k0")
+
+    /** T2. A new process then binding the same uid over the kept record does not get the old namespace back. */
+    @Test
+    fun aFirstNullOverAPreviousOwnerRetiresIt_andALaterStartDoesNotHandItBack() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls).apply { record = previousA }
+        build(calls, store = store, replaying = true, initial = null).start()
+        advanceUntilIdle()
+
+        assertEquals(listOf(Call.RetiredUnverifiedStart), calls)
+        val retired = store.record
+        assertEquals(null, retired.ownerUid)
+
+        val a = fenceOf("user-a")
+        val later = mutableListOf<Call>()
+        val nextProcessStore = RecordingStore(later).apply { record = retired }
+        build(later, store = nextProcessStore, live = { a }, replaying = true, initial = a).start()
+        advanceUntilIdle()
+
+        assertEquals(listOf(Call.OwnerChanged("user-a")), later)
+        assertEquals("회전 뒤 namespace 가 아니다", retired.userAccessEpoch, nextProcessStore.record.userAccessEpoch)
+        assertTrue("이전 namespace 를 이어받았다", nextProcessStore.record.userAccessEpoch != previousA.userAccessEpoch)
+        processJob.cancel()
+    }
+
+    /** T3. A restored same-uid start binds and keeps the namespace; the answer carries no marker to rotate on. */
+    @Test
+    fun aFirstObservationOfTheSameUidKeepsTheNamespace() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls).apply { record = previousA }
+        val a = fenceOf("user-a")
+        build(calls, store = store, live = { a }, replaying = true, initial = a).start()
+        advanceUntilIdle()
+
+        assertEquals(listOf(Call.OwnerChanged("user-a")), calls)
+        assertEquals(previousA.userAccessEpoch, store.record.userAccessEpoch)
+        assertEquals(previousA.pendingPurges, store.record.pendingPurges)
+        processJob.cancel()
+    }
+
+    /** T4. After a sign-out landed, a first null finds no owner and no marker: no rotation, the journal resumes. */
+    @Test
+    fun aFirstNullAfterALandedSignOutRetiresNothingButTheJournalResumes() = runTest {
+        val calls = mutableListOf<Call>()
+        val purger = RecordingPurger()
+        var n = 0
+        val landed = AccessEpochTransitions.signOut(previousA, EpochIdGenerator { "landed-${n++}" })
+        val store = RecordingStore(calls).apply { record = landed }
+        build(calls, purger, store = store, replaying = true, initial = null).start()
+        advanceUntilIdle()
+
+        assertEquals(emptyList<Call>(), calls)
+        assertEquals(landed, store.record)
+        assertTrue("시작 purge 가 journal 을 재개하지 않았다", "user-a" in purger.attempts)
+        processJob.cancel()
+    }
+
+    /** T6. Signed out and landed, the same uid bound again, then lost off disk before anything recorded it. */
+    @Test
+    fun theRebindThenExternalSignOutCounterexampleIsRetiredAtTheNextStart() = runTest {
+        val calls = mutableListOf<Call>()
+        var n = 0
+        val gen = EpochIdGenerator { "hist-${n++}" }
+        val history = AccessEpochTransitions.bindOwner(AccessEpochTransitions.signOut(previousA, gen), "user-a", gen)
+        val store = RecordingStore(calls).apply { record = history }
+        build(calls, store = store, replaying = true, initial = null).start()
+        advanceUntilIdle()
+
+        assertEquals(listOf(Call.RetiredUnverifiedStart), calls)
+        assertEquals(history.pendingPurges.size + 1, store.record.pendingPurges.size)
+        assertEquals(history.userAccessEpoch, store.record.pendingPurges.last().userAccessEpoch)
+        processJob.cancel()
+    }
+
+    /** T9. While the settlement is held, the sign-in queued behind it binds nothing and asks nothing; then it does. */
+    @Test
+    fun aHeldSettlementKeepsTheSignInBehindItWaiting_thenTheSignInBinds() = runTest {
+        val calls = mutableListOf<Call>()
+        val fetches = mutableListOf<Boolean>()
+        val store = RecordingStore(calls).apply { record = previousA; failNextRetire = true }
+        val a = fenceOf("user-a")
+        val binder = build(calls, fetches = fetches, store = store, live = { a }, replaying = true, initial = null)
+        binder.start()
+        binder.onFenceObserved(a)
+        runCurrent()
+
+        assertEquals("보류 중에 바인딩했다", emptyList<Call>(), calls)
+        assertEquals("보류 중에 질의했다", emptyList<Boolean>(), fetches)
+
+        advanceUntilIdle()
+        assertEquals(listOf(Call.RetiredUnverifiedStart, Call.OwnerChanged("user-a")), calls)
+        assertEquals(listOf(true), fetches)
+        processJob.cancel()
+    }
+
+    /** T11. A restored same-uid start whose sign-out intent is still owed settles it before binding. */
+    @Test
+    fun aFirstObservationOfTheSameUidSettlesAnOwedIntentBeforeBinding() = runTest {
+        val calls = mutableListOf<Call>()
+        val owed = AccessEpochTransitions.beginSignOut(previousA, "user-a")
+        val store = RecordingStore(calls).apply { record = owed }
+        val a = fenceOf("user-a")
+        build(calls, store = store, live = { a }, replaying = true, initial = a).start()
+        advanceUntilIdle()
+
+        assertEquals("시작 정산이 아니라 바인딩이 정산해야 한다", listOf(Call.OwnerChanged("user-a")), calls)
+        assertEquals("user-a", store.record.ownerUid)
+        assertTrue("owed 가 정산되지 않았다", store.record.userAccessEpoch != previousA.userAccessEpoch)
+        assertEquals(previousA.userAccessEpoch, store.record.pendingPurges.last().userAccessEpoch)
+        processJob.cancel()
+    }
+
+    /** Only the first observation says anything about a previous process; later nulls with nothing bound read nothing. */
+    @Test
+    fun onlyTheFirstObservationSettlesAStart() = runTest {
+        val calls = mutableListOf<Call>()
+        val store = RecordingStore(calls)
+        val binder = build(calls, store = store)
+        binder.start()
+        advanceUntilIdle()
+        val beforeObservations = store.loads
+
+        repeat(3) { binder.onFenceObserved(null) }
+        advanceUntilIdle()
+
+        assertEquals("첫 null 만 기록을 읽어야 한다", beforeObservations + 1, store.loads)
+        processJob.cancel()
+    }
+
+    /** Everything queued behind a held startup purge keeps its order: purge, settlement, sign-in, request. */
+    @Test
+    fun aHeldStartupPurgeKeepsTheSettlementTheSignInAndTheRequestInOrder() = runTest {
+        val calls = mutableListOf<Call>()
+        val purger = RecordingPurger()
+        var failNext = true
+        purger.onPurge = { if (failNext) { failNext = false; throw java.io.IOException("purge") } }
+        val a = fenceOf("user-a")
+        val binder = build(calls, purger, seedJournal = true, live = { a }, replaying = true, initial = null)
+        binder.start()
+        binder.onFenceObserved(a)
+        val request = async { binder.beginSignOut(a) }
+        runCurrent()
+        assertEquals("시작 purge 보류 중에 뒤 사건이 적용됐다", emptyList<Call>(), calls)
+        assertFalse("시작 purge 보류 중에 요청이 끝났다", request.isCompleted)
+
+        advanceUntilIdle()
+        assertEquals(listOf(Call.RetiredUnverifiedStart, Call.OwnerChanged("user-a")), calls)
+        assertTrue("요청이 끝나지 않았다", request.isCompleted)
+        assertTrue("로그인 바인딩 뒤 요청이 무장되지 않았다", request.await() is SignOutStart.Armed)
         processJob.cancel()
     }
 }

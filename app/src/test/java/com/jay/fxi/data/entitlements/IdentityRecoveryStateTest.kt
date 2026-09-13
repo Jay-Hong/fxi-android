@@ -151,6 +151,8 @@ class IdentityRecoveryStateTest {
                 as IdentityRecoveryState.HoldUnfinished).work
 
         assertEquals(HeldWork.STARTUP_PURGE, workOf(IdentityWork.StartupPurge))
+        // A cold start's settlement is start-up cleanup to the surface; it never says a sign-out happened.
+        assertEquals(HeldWork.STARTUP_PURGE, workOf(IdentityWork.UnverifiedStart))
         assertEquals(HeldWork.SIGN_IN, workOf(IdentityWork.Bind(fence)))
         assertEquals(HeldWork.SIGN_OUT, workOf(IdentityWork.End(fence)))
     }

@@ -481,4 +481,145 @@ class SignOutAttemptPolicyTest {
         assertEquals(BarrierBind.NotLanded, SignOutAttemptPolicy.barrierBindResolved(unknown, a7, AccessEpochRecord()))
         assertNull(SignOutAttemptPolicy.barrierBindResolved(unknown, a7, boundA.copy(ownerUid = "user-b")))
     }
+
+    // Unverified start (plan amendment 6)
+
+    private val owedUnknown =
+        PendingPurge(ownerUid = null, userAccessEpoch = null, krxCapabilityEpoch = null, scopes = AccessEpochTransitions.ALL_SCOPES)
+
+    /** Owner, each epoch on its own, which marker, whose intent — with an entry of unknown epochs already owed. */
+    private fun startSeeds(): List<Pair<String, AccessEpochRecord>> {
+        val seeds = mutableListOf<Pair<String, AccessEpochRecord>>()
+        for (owner in listOf(null, "user-a"))
+            for ((u, k) in listOf("u0" to "k0", "u0" to null, null to "k0", null to null))
+                for ((premium, krx) in listOf(false to false, true to false, false to true))
+                    for (owed in listOf(null, "user-a", "user-c"))
+                        seeds += "owner=$owner epochs=($u,$k) markers=($premium,$krx) owed=$owed" to AccessEpochRecord(
+                            ownerUid = owner,
+                            userAccessEpoch = u,
+                            krxCapabilityEpoch = k,
+                            mayContainPremiumData = premium,
+                            mayContainKrxData = krx,
+                            pendingPurges = listOf(owedUnknown),
+                            teardownOwedFor = owed
+                        )
+        return seeds
+    }
+
+    private fun retire(record: AccessEpochRecord) = AccessEpochTransitions.retireUnverifiedStart(record, ids)
+
+    @Test
+    fun theUnverifiedStartPlanNamesWhatTheTransitionDoes() {
+        for ((case, seed) in startSeeds()) {
+            val result = retire(seed)
+            val expected = when {
+                result.userAccessEpoch != seed.userAccessEpoch -> setOf(
+                    SignOutAttemptPolicy.UnverifiedStartPlan.RETIRE_OWNER,
+                    SignOutAttemptPolicy.UnverifiedStartPlan.RETIRE_UNOWNED
+                )
+                result != seed -> setOf(SignOutAttemptPolicy.UnverifiedStartPlan.DROP_STALE_INTENT)
+                else -> setOf(SignOutAttemptPolicy.UnverifiedStartPlan.LEAVE)
+            }
+            val plan = SignOutAttemptPolicy.planUnverifiedStart(seed)
+            assertTrue("$case -> $plan", plan in expected)
+            if (plan == SignOutAttemptPolicy.UnverifiedStartPlan.RETIRE_OWNER) assertTrue(case, seed.ownerUid != null)
+            if (plan == SignOutAttemptPolicy.UnverifiedStartPlan.RETIRE_UNOWNED) assertNull(case, seed.ownerUid)
+        }
+    }
+
+    @Test
+    fun rotationLandedIsTrueForExactlyTheTwoRetiringBranches() {
+        for ((case, seed) in startSeeds()) {
+            val plan = SignOutAttemptPolicy.planUnverifiedStart(seed)
+            val retiring = plan == SignOutAttemptPolicy.UnverifiedStartPlan.RETIRE_OWNER ||
+                plan == SignOutAttemptPolicy.UnverifiedStartPlan.RETIRE_UNOWNED
+            assertEquals("$case plan=$plan", retiring, SignOutAttemptPolicy.rotationLanded(seed, retire(seed)))
+            // A write that never started leaves the record as it was.
+            assertFalse("$case unchanged", SignOutAttemptPolicy.rotationLanded(seed, seed))
+        }
+    }
+
+    @Test
+    fun rotationLandedFindsAnOwnersRotationThatRetiredMisses() {
+        // An owner with no user epoch: the old receipt has no epoch to look for.
+        val ownerWithoutUserEpoch = AccessEpochRecord(ownerUid = "user-a", krxCapabilityEpoch = "k0")
+        val landed = retire(ownerWithoutUserEpoch)
+
+        assertFalse(SignOutAttemptPolicy.retired(ownerWithoutUserEpoch, landed, "user-a"))
+        assertTrue(SignOutAttemptPolicy.rotationLanded(ownerWithoutUserEpoch, landed))
+    }
+
+    /**
+     * Each clause stops something. A read-back that carries every other part of the receipt but not
+     * this one is not the rotation — inputs outside the store transitions' contract, kept on purpose.
+     */
+    @Test
+    fun rotationLandedRejectsAReadBackMissingAnyPartOfTheReceipt() {
+        val before = AccessEpochRecord(
+            ownerUid = null,
+            userAccessEpoch = null,
+            krxCapabilityEpoch = null,
+            mayContainPremiumData = true,
+            pendingPurges = listOf(owedUnknown)
+        )
+        val landed = retire(before)
+        assertTrue(SignOutAttemptPolicy.rotationLanded(before, landed))
+        // The receipt of a null-epoch, ownerless rotation is equal to the entry already owed.
+        assertEquals(listOf(owedUnknown, owedUnknown), landed.pendingPurges)
+
+        val withEpochs = AccessEpochRecord(ownerUid = "user-a", userAccessEpoch = "u0", krxCapabilityEpoch = "k0", pendingPurges = listOf(owedUnknown))
+        val rotated = retire(withEpochs)
+        assertTrue(SignOutAttemptPolicy.rotationLanded(withEpochs, rotated))
+
+        val broken = mapOf(
+            "user epoch kept" to rotated.copy(userAccessEpoch = withEpochs.userAccessEpoch),
+            "user epoch lost" to rotated.copy(userAccessEpoch = null),
+            "krx epoch kept" to rotated.copy(krxCapabilityEpoch = withEpochs.krxCapabilityEpoch),
+            "krx epoch lost" to rotated.copy(krxCapabilityEpoch = null),
+            "no entry appended" to rotated.copy(pendingPurges = withEpochs.pendingPurges),
+            "entries reordered" to rotated.copy(pendingPurges = rotated.pendingPurges.reversed()),
+            "owner still bound" to rotated.copy(ownerUid = "user-a"),
+            "intent still owed" to rotated.copy(teardownOwedFor = "user-a")
+        )
+        for ((name, readBack) in broken) assertFalse(name, SignOutAttemptPolicy.rotationLanded(withEpochs, readBack))
+        // Only the already-owed entry, new epochs: its count is what tells it from the receipt.
+        assertFalse("count lost", SignOutAttemptPolicy.rotationLanded(before, landed.copy(pendingPurges = listOf(owedUnknown))))
+    }
+
+    @Test
+    fun anUnverifiedStartsFailedEditIsClassifiedByWhatTheReadBackShows() {
+        val work = IdentityWork.UnverifiedStart
+        val edit = PendingEdit.UNVERIFIED_START
+        fun resolve(before: AccessEpochRecord?, readBack: AccessEpochRecord) =
+            SignOutAttemptPolicy.resolveUnownedEdit(work, edit, before, readBack)
+
+        val owned = AccessEpochRecord(ownerUid = "user-a", userAccessEpoch = "u0", krxCapabilityEpoch = "k0")
+        val droppable = AccessEpochRecord(userAccessEpoch = "u0", krxCapabilityEpoch = "k0", teardownOwedFor = "user-c")
+
+        assertEquals(
+            SignOutAttemptPolicy.UnownedResolution.RunAgain(null),
+            SignOutAttemptPolicy.resolveUnownedEdit(work, PendingEdit.READ, null, owned)
+        )
+        assertEquals(SignOutAttemptPolicy.UnownedResolution.Undecidable, resolve(null, owned))
+        assertEquals(SignOutAttemptPolicy.UnownedResolution.Landed, resolve(owned, retire(owned)))
+        // A dropped intent lands without a rotation, so only its own branch recognises it.
+        assertEquals(SignOutAttemptPolicy.UnownedResolution.Landed, resolve(droppable, retire(droppable)))
+        // A marker set after the read turned the drop into a rotation inside the edit: still this work landing.
+        val raced = retire(AccessEpochTransitions.markMayContainData(droppable, premium = true, krx = false))
+        assertEquals(SignOutAttemptPolicy.UnownedResolution.Landed, resolve(droppable, raced))
+        // Not written, and a marker arrived meanwhile: run again from the read-back, not from `before`.
+        val remarked = AccessEpochTransitions.markMayContainData(droppable, premium = true, krx = false)
+        assertEquals(SignOutAttemptPolicy.UnownedResolution.RunAgain(remarked), resolve(droppable, remarked))
+        // New ids with no receipt are neither result.
+        assertEquals(
+            SignOutAttemptPolicy.UnownedResolution.Undecidable,
+            resolve(owned, owned.copy(userAccessEpoch = "u9", krxCapabilityEpoch = "k9"))
+        )
+    }
+
+    @Test
+    fun anUnverifiedStartsEditIsNeverAnAttempts() {
+        val attempt = SignOutAttempt.Unresolved(t, a7, PendingEdit.UNVERIFIED_START, TeardownKnowledge.NOT_OWED, before = armedA)
+        assertThrows(IllegalStateException::class.java) { SignOutAttemptPolicy.resolve(attempt, armedA) }
+    }
 }

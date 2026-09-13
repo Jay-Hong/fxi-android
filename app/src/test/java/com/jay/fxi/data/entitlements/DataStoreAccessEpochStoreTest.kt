@@ -7,13 +7,16 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import java.io.File
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -357,6 +360,101 @@ class DataStoreAccessEpochStoreTest {
     fun aMissingFile_isAFreshInstallRatherThanARecovery() = runBlocking {
         assertEquals(AccessEpochRecord(), open().load())
         assertEquals("a missing file is not corruption", 0, corruptionsDetected)
+    }
+
+    /** Plan amendment 6 across a real reopen: both retirements, the journal's order and its unknown-epoch entries persist. */
+    @Test
+    fun anUnverifiedStartsRetirementSurvivesAReopen() = runBlocking {
+        val store = open()
+        store.bindOwner("u1")
+        store.signOut()
+        // No owner now; a marker then stands in the namespace the landing left, so the owner is unknown.
+        store.markMayContainData(krx = true)
+        val retired = store.retireUnverifiedStart()
+
+        assertNull(retired.ownerUid)
+        assertEquals(2, retired.pendingPurges.size)
+        assertEquals("u1", retired.pendingPurges.first().ownerUid)
+        assertNull(retired.pendingPurges.last().ownerUid)
+        assertEquals(retired, open().load())
+
+        // And the owner branch from a file with no epochs at all: the entry keeps them unknown.
+        close()
+        file.delete()
+        val fresh = open()
+        checkNotNull(dataStore).edit { it[OWNER_UID] = "u2" }
+        val ownerRetired = fresh.retireUnverifiedStart()
+        assertEquals(
+            listOf(PendingPurge("u2", null, null, AccessEpochTransitions.ALL_SCOPES)),
+            ownerRetired.pendingPurges
+        )
+        assertEquals(ownerRetired, open().load())
+    }
+
+    /** Parks the retirement just before it reaches the real store, so something can land first. */
+    private class GatedStore(private val real: AccessEpochStore) : AccessEpochStore by real {
+        val reached = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        override suspend fun retireUnverifiedStart(): AccessEpochRecord {
+            reached.complete(Unit)
+            release.await()
+            return real.retireUnverifiedStart()
+        }
+    }
+
+    /**
+     * The coordinator reads `b` (no owner, no marker, an intent owed) and plans a drop; a marker write
+     * completes before its edit runs. The real store decides the edit on the record inside its own
+     * atomic edit, so the marker turns the drop into a rotation. A store or coordinator that used the
+     * record read before the marker would drop the intent and rotate nothing, failing here.
+     */
+    @Test
+    fun aMarkerWrittenAfterTheReadDecidesTheRetirementInsideTheEdit() = runBlocking {
+        val real = open()
+        checkNotNull(dataStore).edit {
+            it[stringPreferencesKey("user_access_epoch")] = "u0"
+            it[stringPreferencesKey("krx_capability_epoch")] = "k0"
+            it[TEARDOWN_OWED_FOR] = "user-a"
+        }
+        val before = real.load()
+        val gated = GatedStore(real)
+        val deferred = object : UserScopePurger, CapabilityScopePurger {
+            override suspend fun purgeUserScope(namespace: PurgeNamespace) = PurgeResult.Deferred("not this slice")
+            override suspend fun purgeCapabilityScope(namespace: PurgeNamespace) = PurgeResult.Deferred("not this slice")
+        }
+        val coordinatorScope = CoroutineScope(SupervisorJob())
+        val coordinator = PremiumAccessCoordinator(
+            source = object : EntitlementsSource {
+                override suspend fun fetch(freshPremium: Boolean): EntitlementsResult = error("no query at a signed-out start")
+                override suspend fun currentIdentity(): EntitlementsIdentity? = null
+            },
+            store = gated,
+            userPurger = deferred,
+            capabilityPurger = deferred,
+            scope = coordinatorScope,
+            clock = { 0L },
+            jitter = ProbeJitter.None,
+            liveFence = { null }
+        )
+        try {
+            val settling = async { coordinator.onUnverifiedStart() }
+            // Bounded, so a coordinator that never reaches the store fails here instead of hanging the run.
+            withTimeout(10_000) { gated.reached.await() }
+            real.markMayContainData(premium = true)
+            gated.release.complete(Unit)
+            withTimeout(10_000) { settling.await() }.applied("경합 뒤 정산")
+
+            val after = real.load()
+            assertNull(after.teardownOwedFor)
+            assertNotEquals(before.userAccessEpoch, after.userAccessEpoch)
+            assertNotEquals(before.krxCapabilityEpoch, after.krxCapabilityEpoch)
+            assertEquals(
+                before.pendingPurges + PendingPurge(null, "u0", "k0", AccessEpochTransitions.ALL_SCOPES),
+                after.pendingPurges
+            )
+        } finally {
+            coordinatorScope.coroutineContext[Job]?.cancelAndJoin()
+        }
     }
 
     private companion object {

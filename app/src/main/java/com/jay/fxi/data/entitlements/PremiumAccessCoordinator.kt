@@ -635,7 +635,7 @@ class PremiumAccessCoordinator(
                 _krx.value = KrxCapabilityState.HIDDEN
                 _lastEffects.value = emptyList()
             }
-            is IdentityWork.End -> completedBinding = null
+            is IdentityWork.End, IdentityWork.UnverifiedStart -> completedBinding = null
             IdentityWork.StartupPurge -> Unit
         }
         heldEvent = null
@@ -823,7 +823,7 @@ class PremiumAccessCoordinator(
     private fun completionFor(work: IdentityWork): IdentityCompletion = when (work) {
         is IdentityWork.Bind ->
             IdentityCompletion(work.fence, AccessDecisionGeneration(decisionGeneration))
-        is IdentityWork.End, IdentityWork.StartupPurge ->
+        is IdentityWork.End, IdentityWork.StartupPurge, IdentityWork.UnverifiedStart ->
             IdentityCompletion(completed = null, queryGeneration = null)
     }
 
@@ -875,6 +875,12 @@ class PremiumAccessCoordinator(
             }
             // Nothing about a startup purge lands in the record, so its whole work *is* the cleanup.
             IdentityWork.StartupPurge -> cleanupAndFinishLocked(work, completionFor(work))
+            // Planned again from what the round was handed — the read-back a resolution kept, or a new
+            // read — never from the record the failed attempt started with.
+            IdentityWork.UnverifiedStart -> {
+                val read = before ?: unownedEditLocked(work, PendingEdit.READ, before = null) { store.load() }
+                if (read == null) stalledLocked(open = null) else retireUnverifiedStartLocked(read)
+            }
         }
 
     /** A write this round put on disk: adopt it, then run the cleanup behind it. */
@@ -1229,6 +1235,55 @@ class PremiumAccessCoordinator(
         // The whole of this work is the cleanup: a purge resume writes no identity edit, so there
         // is no landing to establish and nothing for a read-back to classify.
         cleanupAndFinishLocked(work, completionFor(work))
+    }
+
+    /**
+     * Settles a cold start whose first identity observation is no uid (plan amendment 6).
+     *
+     * Not a sign-out being inferred: a sign-out that never reached the record and a restore error look
+     * the same from here. The namespace is retired because nothing shows it continues with the starting
+     * identity; preferences are not in it. See [AccessEpochTransitions.retireUnverifiedStart].
+     *
+     * For the start-up path only — the binder's first observation, which the stream replays on
+     * registration ahead of any sign-out request, after the startup purge finished. So the checks below
+     * are the contract, not gates. A failure opens a hold, and that hold is resumed through
+     * [resumePersistence], never by calling this again.
+     */
+    internal suspend fun onUnverifiedStart(): IdentityStep = mutex.withLock {
+        check(attempt == null) { "a sign-out attempt was open at the first identity observation" }
+        check(identityPersistencePending == null) { "a hold stood at the first identity observation" }
+        // Taking away, so published before the disk work — for the same reason [onSignedOut] gives.
+        decisionGeneration += 1
+        cancelProbeLocked()
+        clearForcePremiumLocked()
+        _state.value = OwnedPremiumAccess(null, null, PremiumAccessState.NoGrant)
+        _krx.value = KrxCapabilityState.HIDDEN
+        schedule.cancel(preserveServerFloor = true)
+        val work = IdentityWork.UnverifiedStart
+        val read = unownedEditLocked(work, PendingEdit.READ, before = null) { store.load() }
+            ?: return@withLock stalledLocked(open = null)
+        retireUnverifiedStartLocked(read)
+    }
+
+    /**
+     * From a read that succeeded: complete, or run the retirement and land it.
+     *
+     * [read] is also when a LEAVE completes — a marker set after it is later input, for whatever binds
+     * next. The store decides the edit on the record it reads inside its own edit, so a marker that
+     * arrived after [read] still takes part; the landing check recognises what it caused.
+     */
+    private suspend fun retireUnverifiedStartLocked(read: AccessEpochRecord): IdentityStep {
+        val work = IdentityWork.UnverifiedStart
+        if (SignOutAttemptPolicy.planUnverifiedStart(read) == SignOutAttemptPolicy.UnverifiedStartPlan.LEAVE) {
+            adoptLandingLocked(work)
+            // A retry that reads nothing owed finishes here, and this is what ends its hold: there is no
+            // cleanup to run, which is the only other place a hold is cleared.
+            setPendingLocked(null)
+            return IdentityStep.Applied(completionFor(work))
+        }
+        unownedEditLocked(work, PendingEdit.UNVERIFIED_START, before = read) { store.retireUnverifiedStart() }
+            ?: return stalledLocked(open = null)
+        return landAndFinishLocked(work)
     }
 
     suspend fun resumePendingPurges() {

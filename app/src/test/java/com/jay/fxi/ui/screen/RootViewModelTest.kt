@@ -224,6 +224,8 @@ class RootViewModelTest {
         }
         override suspend fun signOut() =
             AccessEpochTransitions.signOut(record, ids).also { record = it }
+        override suspend fun retireUnverifiedStart() =
+            AccessEpochTransitions.retireUnverifiedStart(record, ids).also { record = it }
         override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean) =
             AccessEpochTransitions.rotate(record, rotateUser, rotateKrx, ids).also { record = it }
         override suspend fun completePurges(completed: Collection<PendingPurge>) =

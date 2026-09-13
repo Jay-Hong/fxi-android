@@ -67,7 +67,10 @@ internal enum class PendingEdit {
     END,
 
     /** Recovery's rotation of an intent still owed on disk. */
-    SETTLE
+    SETTLE,
+
+    /** A cold start's retirement when its first observation is no uid. No attempt ever owns it. */
+    UNVERIFIED_START
 }
 
 /**
@@ -531,6 +534,10 @@ internal object SignOutAttemptPolicy {
                     else -> Resolution.Inconsistent
                 }
             }
+            // Only the identity consumer's first observation starts one, before any sign-out can be
+            // requested, and its failures are held as unowned work — never as an attempt's edit.
+            PendingEdit.UNVERIFIED_START ->
+                error("an unverified start's edit cannot belong to a sign-out attempt")
         }
     }
 
@@ -607,10 +614,70 @@ internal object SignOutAttemptPolicy {
                 else -> UnownedResolution.Undecidable
             }
         }
+        work is IdentityWork.UnverifiedStart && edit == PendingEdit.UNVERIFIED_START -> when {
+            before == null -> UnownedResolution.Undecidable
+            // First, whatever the plan was: a marker set after the read can turn a dropped intent into
+            // a rotation inside the store's edit, and that rotation landing is still this work landing.
+            rotationLanded(before, readBack) -> UnownedResolution.Landed
+            planUnverifiedStart(before) == UnverifiedStartPlan.DROP_STALE_INTENT &&
+                sameNamespace(before.copy(teardownOwedFor = null), readBack) -> UnownedResolution.Landed
+            // The read-back, not `before`: a marker added meanwhile must decide the next plan.
+            sameNamespace(before, readBack) -> UnownedResolution.RunAgain(readBack)
+            else -> UnownedResolution.Undecidable
+        }
         // A startup purge is not an identity edit: nothing about it lands in the record, so the only
         // answer a read-back gives is that the resume can be tried again.
         work is IdentityWork.StartupPurge -> UnownedResolution.RunAgain(before)
         else -> UnownedResolution.Undecidable
+    }
+
+    /** What a cold start whose first observation is no uid does to [record]; see [planUnverifiedStart]. */
+    enum class UnverifiedStartPlan {
+        /** An owner is on the record: retire it the way a landed sign-out does. */
+        RETIRE_OWNER,
+
+        /** No owner, but a marker says protected data may be here: retire with the owner unknown. */
+        RETIRE_UNOWNED,
+
+        /** Nothing to retire, only an intent that names nobody bound: drop it. */
+        DROP_STALE_INTENT,
+
+        /** Nothing owed. The read that found this is when the work is complete. */
+        LEAVE
+    }
+
+    /** Mirrors [AccessEpochTransitions.retireUnverifiedStart] branch for branch, deciding only. */
+    fun planUnverifiedStart(record: AccessEpochRecord): UnverifiedStartPlan = when {
+        record.ownerUid != null -> UnverifiedStartPlan.RETIRE_OWNER
+        record.mayContainPremiumData || record.mayContainKrxData -> UnverifiedStartPlan.RETIRE_UNOWNED
+        record.teardownOwedFor != null -> UnverifiedStartPlan.DROP_STALE_INTENT
+        else -> UnverifiedStartPlan.LEAVE
+    }
+
+    /**
+     * Whether [readBack] is exactly the both-axes rotation of [before] that retires its namespace.
+     *
+     * [retired]'s evidence is an epoch reaching the journal, which needs no owner; this is that
+     * evidence made exact so it also holds with no owner or null epochs. The journal must be the old
+     * one plus precisely the retiring entry, in order and count — so an entry of unknown epochs that
+     * was already owed is never taken for this rotation's receipt — and both epochs must be new.
+     * Markers are not compared: they may stand again in the new namespace after the landing.
+     *
+     * [readBack] must come before any purge, for the reason [retired] gives.
+     */
+    fun rotationLanded(before: AccessEpochRecord, readBack: AccessEpochRecord): Boolean {
+        fun fresh(next: String?, old: String?) = next != null && next != old
+        val receipt = PendingPurge(
+            ownerUid = before.ownerUid,
+            userAccessEpoch = before.userAccessEpoch,
+            krxCapabilityEpoch = before.krxCapabilityEpoch,
+            scopes = AccessEpochTransitions.ALL_SCOPES
+        )
+        return readBack.ownerUid == null &&
+            readBack.teardownOwedFor == null &&
+            fresh(readBack.userAccessEpoch, before.userAccessEpoch) &&
+            fresh(readBack.krxCapabilityEpoch, before.krxCapabilityEpoch) &&
+            readBack.pendingPurges == before.pendingPurges + receipt
     }
 
     /**

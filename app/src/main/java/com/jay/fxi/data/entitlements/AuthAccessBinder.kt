@@ -60,10 +60,12 @@ fun interface AuthUidStream {
  * signed-in user with `signOut()` applied last. The coordinator's mutex serialises the calls but
  * cannot recover the order they were emitted in, so the order is preserved here instead.
  *
- * **A cold start never synthesises a sign-out.** [boundFence] starts unbound, so a first `null`
- * observation does nothing. Dispatching `onSignedOut()` there would rotate both epochs and
- * journal a purge whenever a previous process left an owner bound — destroying exactly the
- * same-uid cold-start continuity the plan preserves.
+ * **A cold start never synthesises a sign-out, and does not inherit on no evidence either.**
+ * [boundFence] starts unbound, so a first `null` is never dispatched as `onSignedOut()` — that is for
+ * a session this process saw end. It goes to [PremiumAccessCoordinator.onUnverifiedStart] instead
+ * (plan amendment 6): nothing shows that what a previous process left on disk continues with the
+ * starting identity, so that namespace is retired and preferences are kept. A first observation of a
+ * uid binds as before, which is what keeps same-uid cold-start continuity.
  */
 class AuthAccessBinder(
     private val coordinator: PremiumAccessCoordinator,
@@ -123,12 +125,21 @@ class AuthAccessBinder(
     private var boundFence: AuthIdentityFence? = null
 
     /**
+     * Whether the consumer has yet to finish its first observation. Confined like [boundFence].
+     *
+     * Cleared only when that observation's [drive] reaches `Applied` — not when a hold or a wait sends
+     * it back through [handle] — so a first `null` whose settlement is held is still the first when it
+     * resumes, and a `null` after that is not.
+     */
+    private var firstObservationPending = true
+
+    /**
      * Starts consuming, then registers the stream.
      *
-     * The purge resume runs before the loop rather than relying on [onIdentityChanged], which
-     * resumes purges itself: on a signed-out cold start no owner change ever fires, and a journal
-     * a previous process left behind would otherwise never be retried. On a signed-in cold start
-     * this costs one redundant resume, which is a no-op when the journal is empty.
+     * The purge resume runs before the loop rather than relying on the cleanup behind an identity
+     * edit: a signed-out cold start with nothing to retire lands no edit at all, and a journal a
+     * previous process left behind would otherwise never be retried. Where the first observation
+     * does land one, this costs one redundant resume, which is a no-op when the journal is empty.
      *
      * It is a head task like any other, so a failure holds instead of ending the consumer before it
      * has read anything — which is what used to happen, since this call sits inside the same body
@@ -389,6 +400,7 @@ class AuthAccessBinder(
                     // three ways an observation can finish — the head task, a recovery round, and
                     // the no-op above — all adopt from one place.
                     boundFence = current.completion.completed
+                    firstObservationPending = false
                     current.completion.queryGeneration?.let(::askTheServer)
                     return
                 }
@@ -446,6 +458,10 @@ class AuthAccessBinder(
                 // not whoever the record happens to name.
                 return coordinator.onSignedOut(checkNotNull(boundFence))
             }
+            // Nothing bound yet, so this is not a session ending. Only the process's first observation
+            // says anything about what a previous process left on disk; a later `null` with nothing
+            // bound has nothing new to say.
+            fence == null && firstObservationPending -> return coordinator.onUnverifiedStart()
         }
         // Already where this observation asks it to be. Reported as completed on the binding that
         // is already adopted, so the loop leaves it alone.

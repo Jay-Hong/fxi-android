@@ -125,6 +125,9 @@ internal fun identityRecoveryOf(
 
 private fun heldWorkOf(work: IdentityWork): HeldWork = when (work) {
     IdentityWork.StartupPurge -> HeldWork.STARTUP_PURGE
+    // The screen's category, not the work's identity: it is start-up cleanup of what was there before,
+    // and saying "signing out" would claim a sign-out happened, which this work never decides.
+    IdentityWork.UnverifiedStart -> HeldWork.STARTUP_PURGE
     is IdentityWork.Bind -> HeldWork.SIGN_IN
     is IdentityWork.End -> HeldWork.SIGN_OUT
 }

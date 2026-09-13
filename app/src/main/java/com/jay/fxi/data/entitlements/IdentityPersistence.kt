@@ -14,6 +14,16 @@ internal sealed interface IdentityWork {
     /** The purge resume the consumer runs before it accepts any identity event. */
     data object StartupPurge : IdentityWork
 
+    /**
+     * What a cold start owes when the consumer's first observation is no uid (plan amendment 6).
+     *
+     * Kept apart from [StartupPurge] although both are start-up cleanup: that one runs before any
+     * observation and writes no identity edit, so a read-back has nothing to classify, while this one
+     * exists only because of what the first observation was and does write one — whose landing a
+     * read-back must establish. No sign-out attempt or ended fence is involved.
+     */
+    data object UnverifiedStart : IdentityWork
+
     data class Bind(val fence: AuthIdentityFence) : IdentityWork
 
     data class End(val ended: AuthIdentityFence) : IdentityWork

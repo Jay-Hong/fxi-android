@@ -62,6 +62,8 @@ class PremiumAccessCoordinatorTest {
             blockNextSignOutOn?.let { gate -> blockNextSignOutOn = null; gate.await() }
             return AccessEpochTransitions.signOut(record, ids).also { record = it }
         }
+        override suspend fun retireUnverifiedStart(): AccessEpochRecord =
+            AccessEpochTransitions.retireUnverifiedStart(record, ids).also { record = it }
         override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean): AccessEpochRecord {
             if (failNextRotation) throw java.io.IOException("simulated persistence failure")
             return AccessEpochTransitions.rotate(record, rotateUser, rotateKrx, ids).also { record = it }

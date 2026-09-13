@@ -254,6 +254,34 @@ object AccessEpochTransitions {
             .copy(ownerUid = null)
     }
 
+    /**
+     * What a cold start owes when its first identity observation is no uid (plan amendment 6).
+     *
+     * This is not a sign-out being inferred. Nothing here can tell a sign-out that never reached the
+     * record from a restore error, so the namespace is retired because its continuity with the
+     * starting identity cannot be shown, and the previous owner's stays unreachable either way.
+     *
+     * - An owner: the same record a landed sign-out leaves (both axes, journal names the owner).
+     * - No owner, a marker standing: both axes, with the owner left unknown in the journal — the
+     *   rule [bindOwner] already applies to that record. Null epochs are journalled as they are: an
+     *   entry's null epoch means "unknown", not "nothing to purge" ([PendingPurge]).
+     * - No owner, no marker, an intent left behind: the stale intent is dropped, as
+     *   [settleOwedTeardown] drops one that names nobody bound.
+     * - Otherwise unchanged. Journal entries already owed are not touched here; the startup resume
+     *   and the cleanup behind a landing own them.
+     *
+     * Decided on the record passed in, which a store must read inside the same atomic edit: a marker
+     * set between the caller's read and this edit then decides the edit, and the landing check
+     * recognises the rotation it caused.
+     */
+    fun retireUnverifiedStart(record: AccessEpochRecord, ids: EpochIdGenerator): AccessEpochRecord = when {
+        record.ownerUid != null -> signOut(record, ids)
+        record.mayContainPremiumData || record.mayContainKrxData ->
+            rotate(record.copy(teardownOwedFor = null), rotateUser = true, rotateKrx = true, ids = ids, purgedOwnerUid = null)
+        record.teardownOwedFor != null -> record.copy(teardownOwedFor = null)
+        else -> record
+    }
+
     /** Removes exactly the entries that were purged. Others stay owed. */
     fun completePurges(
         record: AccessEpochRecord,
@@ -295,6 +323,13 @@ interface AccessEpochStore {
 
     /** Rotates and journals on sign-out. */
     suspend fun signOut(): AccessEpochRecord
+
+    /**
+     * Settles a cold start whose first observation is no uid; see
+     * [AccessEpochTransitions.retireUnverifiedStart]. Must decide on the record read inside the same
+     * atomic edit, not on one the caller read earlier.
+     */
+    suspend fun retireUnverifiedStart(): AccessEpochRecord
 
     /**
      * Persists that the sign-out of [uid] has been decided; see [AccessEpochTransitions.beginSignOut].

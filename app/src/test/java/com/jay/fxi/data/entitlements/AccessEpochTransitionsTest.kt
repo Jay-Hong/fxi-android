@@ -532,6 +532,91 @@ class AccessEpochTransitionsTest {
         }
     }
 
+    /**
+     * Every start record a first `null` can find, across the axes the rule reads: owner, each epoch
+     * present or absent on its own, which marker stands, and whose intent is left behind. A journal
+     * entry of unknown epochs is already owed in every seed, so an append is never mistaken for a
+     * fresh journal.
+     */
+    private fun unverifiedStartSeeds(): List<Pair<String, AccessEpochRecord>> {
+        val alreadyOwed = PendingPurge(ownerUid = null, userAccessEpoch = null, krxCapabilityEpoch = null, scopes = AccessEpochTransitions.ALL_SCOPES)
+        val seeds = mutableListOf<Pair<String, AccessEpochRecord>>()
+        for (owner in listOf(null, "user-a"))
+            for ((u, k) in listOf("u0" to "k0", "u0" to null, null to "k0", null to null))
+                for ((premium, krx) in listOf(false to false, true to false, false to true))
+                    for (owed in listOf(null, "user-a", "user-c")) {
+                        val record = AccessEpochRecord(
+                            ownerUid = owner,
+                            userAccessEpoch = u,
+                            krxCapabilityEpoch = k,
+                            mayContainPremiumData = premium,
+                            mayContainKrxData = krx,
+                            pendingPurges = listOf(alreadyOwed),
+                            teardownOwedFor = owed
+                        )
+                        seeds += "owner=$owner epochs=($u,$k) markers=($premium,$krx) owed=$owed" to record
+                    }
+        return seeds
+    }
+
+    @Test
+    fun retireUnverifiedStart_followsTheAmendedTable_forEveryStartRecord() {
+        for ((case, seed) in unverifiedStartSeeds()) {
+            var n = 0
+            val result = AccessEpochTransitions.retireUnverifiedStart(seed, EpochIdGenerator { "new-${n++}" })
+            val marked = seed.mayContainPremiumData || seed.mayContainKrxData
+            when {
+                seed.ownerUid != null -> {
+                    // The record a landed sign-out leaves, minted from the same point.
+                    var m = 0
+                    assertEquals(case, AccessEpochTransitions.signOut(seed, EpochIdGenerator { "new-${m++}" }), result)
+                    assertNull(case, result.ownerUid)
+                    assertNull(case, result.teardownOwedFor)
+                    assertEquals(case, seed.ownerUid, result.pendingPurges.last().ownerUid)
+                }
+                marked -> {
+                    assertNull(case, result.ownerUid)
+                    assertNull(case, result.teardownOwedFor)
+                    assertEquals(case, "new-0", result.userAccessEpoch)
+                    assertEquals(case, "new-1", result.krxCapabilityEpoch)
+                    assertFalse(case, result.mayContainPremiumData)
+                    assertFalse(case, result.mayContainKrxData)
+                    // Appended with the owner unknown and the epochs as they were, nulls included:
+                    // a null epoch in an entry means "unknown", not "nothing to purge".
+                    assertEquals(
+                        case,
+                        seed.pendingPurges + PendingPurge(null, seed.userAccessEpoch, seed.krxCapabilityEpoch, AccessEpochTransitions.ALL_SCOPES),
+                        result.pendingPurges
+                    )
+                }
+                seed.teardownOwedFor != null -> assertEquals(case, seed.copy(teardownOwedFor = null), result)
+                else -> assertEquals(case, seed, result)
+            }
+        }
+    }
+
+    @Test
+    fun retireUnverifiedStart_changesNothingASecondTime_withoutNewInput() {
+        for ((case, seed) in unverifiedStartSeeds()) {
+            var n = 0
+            val gen = EpochIdGenerator { "new-${n++}" }
+            val once = AccessEpochTransitions.retireUnverifiedStart(seed, gen)
+            assertEquals(case, once, AccessEpochTransitions.retireUnverifiedStart(once, gen))
+        }
+    }
+
+    @Test
+    fun retireUnverifiedStart_retiresAgain_whenAMarkerStandsInTheNewNamespace() {
+        // Not idempotence being broken: a marker set after the landing is new input for the new namespace.
+        val landed = AccessEpochTransitions.retireUnverifiedStart(bound(), ids)
+        val remarked = AccessEpochTransitions.markMayContainData(landed, premium = true, krx = false)
+
+        val again = AccessEpochTransitions.retireUnverifiedStart(remarked, ids)
+
+        assertEquals(landed.pendingPurges.size + 1, again.pendingPurges.size)
+        assertEquals(landed.userAccessEpoch, again.pendingPurges.last().userAccessEpoch)
+    }
+
     @Test
     fun teardownOwedFor_isNotAnAccessFact() {
         val clean = bound()

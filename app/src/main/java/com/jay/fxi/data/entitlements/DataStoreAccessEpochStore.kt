@@ -109,6 +109,9 @@ class DataStoreAccessEpochStore internal constructor(
     override suspend fun signOut(): AccessEpochRecord =
         transform { AccessEpochTransitions.signOut(it, ids) }
 
+    override suspend fun retireUnverifiedStart(): AccessEpochRecord =
+        transform { AccessEpochTransitions.retireUnverifiedStart(it, ids) }
+
     override suspend fun beginSignOut(uid: String): AccessEpochRecord =
         transform { AccessEpochTransitions.beginSignOut(it, uid) }
 

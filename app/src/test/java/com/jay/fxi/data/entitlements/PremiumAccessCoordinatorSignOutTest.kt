@@ -73,6 +73,17 @@ class PremiumAccessCoordinatorSignOutTest {
             signOuts += 1
             return edit(signOutFault.also { signOutFault = null }) { AccessEpochTransitions.signOut(record, ids) }
         }
+        var retires = 0
+        var retireFault: EditFault? = null
+        /** Runs inside the retirement edit before it reads the record, as a concurrent marker write would. */
+        var beforeRetire: () -> Unit = {}
+        override suspend fun retireUnverifiedStart(): AccessEpochRecord {
+            retires += 1
+            return edit(retireFault.also { retireFault = null }) {
+                beforeRetire()
+                AccessEpochTransitions.retireUnverifiedStart(record, ids)
+            }
+        }
         override suspend fun beginSignOut(uid: String): AccessEpochRecord {
             blockBeginSignOutOn?.let { gate -> blockBeginSignOutOn = null; gate.await() }
             return edit(beginFailure) { AccessEpochTransitions.beginSignOut(record, uid) }
@@ -102,9 +113,13 @@ class PremiumAccessCoordinatorSignOutTest {
         var purges = 0
         /** Thrown instead of answering, while set. */
         var throwing: Exception? = null
-        override suspend fun purgeUserScope(namespace: PurgeNamespace) = answer()
-        override suspend fun purgeCapabilityScope(namespace: PurgeNamespace) = answer()
-        private fun answer(): PurgeResult {
+        val requestedNamespaces = mutableListOf<Pair<PurgeScope, PurgeNamespace>>()
+        override suspend fun purgeUserScope(namespace: PurgeNamespace) =
+            answer(PurgeScope.USER, namespace)
+        override suspend fun purgeCapabilityScope(namespace: PurgeNamespace) =
+            answer(PurgeScope.CAPABILITY, namespace)
+        private fun answer(scope: PurgeScope, namespace: PurgeNamespace): PurgeResult {
+            requestedNamespaces += scope to namespace
             purges += 1
             throwing?.let { throw it }
             return result.also { beforeAnswer() }
@@ -1792,5 +1807,214 @@ class PremiumAccessCoordinatorSignOutTest {
         h.coordinator.resumePersistence(held.id).applied("성공으로 끝난 회차")
 
         assertEquals(IdentityRecoveryState.None, h.coordinator.identityRecovery.value)
+    }
+
+    // Unverified start (plan amendment 6): a cold start whose first observation is no uid
+
+    private val ownedByA = AccessEpochRecord(ownerUid = "user-a", userAccessEpoch = "u0", krxCapabilityEpoch = "k0")
+
+    /** The entry a both-axes rotation of [before] appends. */
+    private fun receiptOf(before: AccessEpochRecord) =
+        PendingPurge(before.ownerUid, before.userAccessEpoch, before.krxCapabilityEpoch, AccessEpochTransitions.ALL_SCOPES)
+
+    @Test
+    fun anUnverifiedStartRetiresThePreviousOwnersNamespace_andTheSameUidDoesNotInheritIt() = runTest {
+        val h = harness(live = null)
+        h.store.record = ownedByA.copy(mayContainPremiumData = true)
+
+        h.coordinator.onUnverifiedStart().applied("첫 관측이 uid 없음")
+
+        val retired = h.store.record
+        assertNull("이전 owner 가 남았다", retired.ownerUid)
+        assertEquals(listOf(receiptOf(ownedByA)), retired.pendingPurges)
+        // Recorded as owed, not deleted: the purger is Deferred and the entry stays for a later start.
+        assertTrue("정리가 시도되지 않았다", h.purger.purges > 0)
+        assertEquals(AccessEpochTransitions.ALL_SCOPES, retired.pendingPurges.single().scopes)
+        val expectedScopes = setOf(PurgeScope.USER, PurgeScope.CAPABILITY)
+        assertEquals(2, h.purger.requestedNamespaces.size)
+        assertEquals(expectedScopes, h.purger.requestedNamespaces.map { it.first }.toSet())
+        h.purger.requestedNamespaces.forEach { (_, namespace) ->
+            assertEquals(expectedScopes, namespace.pending.scopes)
+        }
+        assertEquals(IdentityRecoveryState.None, h.coordinator.identityRecovery.value)
+
+        h.setLive(a7)
+        h.coordinator.onIdentityChanged(a7).applied("같은 uid 로그인")
+        assertEquals("user-a", h.store.record.ownerUid)
+        assertEquals("회전 뒤의 namespace 를 쓰지 않았다", retired.userAccessEpoch, h.store.record.userAccessEpoch)
+        assertNotEquals("이전 namespace 를 이어받았다", ownedByA.userAccessEpoch, h.store.record.userAccessEpoch)
+    }
+
+    @Test
+    fun anUnverifiedStartWithNothingOwedWritesNothingAndRunsNoCleanup() = runTest {
+        val h = harness(live = null)
+
+        h.coordinator.onUnverifiedStart().applied()
+
+        assertEquals(AccessEpochRecord(), h.store.record)
+        assertEquals(1, h.store.loads)
+        assertEquals("정산할 것이 없는데 편집했다", 0, h.store.retires)
+        assertEquals(0, h.purger.purges)
+    }
+
+    @Test
+    fun anUnverifiedStartRetiresAnOwnerlessMarkedNamespaceWithTheOwnerUnknown() = runTest {
+        val h = harness(live = null)
+        val marked = AccessEpochRecord(userAccessEpoch = "u0", krxCapabilityEpoch = "k0", mayContainKrxData = true)
+        h.store.record = marked
+
+        h.coordinator.onUnverifiedStart().applied()
+
+        assertEquals(listOf(receiptOf(marked)), h.store.record.pendingPurges)
+        assertNull(h.store.record.pendingPurges.single().ownerUid)
+        assertFalse(h.store.record.mayContainKrxData)
+    }
+
+    @Test
+    fun anUnverifiedStartDropsAStaleIntentWithoutRotating() = runTest {
+        val h = harness(live = null)
+        val stale = AccessEpochRecord(userAccessEpoch = "u0", krxCapabilityEpoch = "k0", teardownOwedFor = "user-c")
+        h.store.record = stale
+
+        h.coordinator.onUnverifiedStart().applied()
+
+        assertEquals(stale.copy(teardownOwedFor = null), h.store.record)
+    }
+
+    /** T10. The disk took the rotation and the store reported a failure anyway. */
+    @Test
+    fun aRetirementThatLandedButReportedAFailureIsRecognisedWithoutRunningAgain() = runTest {
+        val h = harness(live = null)
+        h.store.record = ownedByA
+        h.store.retireFault = EditFault.AFTER_WRITE
+
+        val held = h.coordinator.onUnverifiedStart().heldByPersistence("저장 뒤 실패")
+        val completion = resumeWhenDue(h, held).applied("착지를 알아본 재개")
+
+        assertEquals(IdentityCompletion(completed = null, queryGeneration = null), completion)
+        assertEquals("착지한 편집을 다시 실행했다", 1, h.store.retires)
+        assertEquals("journal 이 정확히 한 항목 늘지 않았다", listOf(receiptOf(ownedByA)), h.store.record.pendingPurges)
+        assertTrue(h.coordinator.resumePersistence(held.id) is IdentityStep.StaleResume)
+    }
+
+    /** The contrast to T10: a write that never started must still retire on resume. */
+    @Test
+    fun aRetirementThatFailedBeforeWritingRunsAgainAndRotatesOnce() = runTest {
+        val h = harness(live = null)
+        h.store.record = ownedByA
+        h.store.retireFault = EditFault.BEFORE_WRITE
+
+        val held = h.coordinator.onUnverifiedStart().heldByPersistence("저장 전 실패")
+        assertEquals("쓰기 전에 실패했는데 레코드가 바뀌었다", ownedByA, h.store.record)
+        resumeWhenDue(h, held).applied()
+
+        assertEquals(2, h.store.retires)
+        assertEquals(listOf(receiptOf(ownedByA)), h.store.record.pendingPurges)
+        assertNull(h.store.record.ownerUid)
+    }
+
+    @Test
+    fun aDroppedIntentThatLandedButReportedAFailureIsRecognised() = runTest {
+        val h = harness(live = null)
+        val stale = AccessEpochRecord(userAccessEpoch = "u0", krxCapabilityEpoch = "k0", teardownOwedFor = "user-c")
+        h.store.record = stale
+        h.store.retireFault = EditFault.AFTER_WRITE
+
+        val held = h.coordinator.onUnverifiedStart().heldByPersistence()
+        resumeWhenDue(h, held).applied()
+
+        assertEquals(1, h.store.retires)
+        assertEquals(stale.copy(teardownOwedFor = null), h.store.record)
+    }
+
+    /** A marker written after the read turns the planned drop into a rotation inside the edit. */
+    @Test
+    fun aDropThatAConcurrentMarkerTurnedIntoARotationIsStillThisWorkLanding() = runTest {
+        val h = harness(live = null)
+        val stale = AccessEpochRecord(userAccessEpoch = "u0", krxCapabilityEpoch = "k0", teardownOwedFor = "user-c")
+        h.store.record = stale
+        h.store.beforeRetire = {
+            h.store.record = AccessEpochTransitions.markMayContainData(h.store.record, premium = true, krx = false)
+        }
+        h.store.retireFault = EditFault.AFTER_WRITE
+
+        val held = h.coordinator.onUnverifiedStart().heldByPersistence()
+        resumeWhenDue(h, held).applied("경합으로 회전한 편집의 재개")
+
+        assertEquals(1, h.store.retires)
+        assertEquals(listOf(receiptOf(stale)), h.store.record.pendingPurges)
+        assertNull(h.store.record.teardownOwedFor)
+    }
+
+    /** A marker in the *new* namespace after the landing is later input, not a reason to run again. */
+    @Test
+    fun aMarkerSetAfterTheLandingDoesNotMakeTheResumeEditAgain() = runTest {
+        val h = harness(live = null)
+        h.store.record = ownedByA
+        h.store.retireFault = EditFault.AFTER_WRITE
+
+        val held = h.coordinator.onUnverifiedStart().heldByPersistence()
+        h.store.record = AccessEpochTransitions.markMayContainData(h.store.record, premium = true, krx = false)
+        resumeWhenDue(h, held).applied()
+
+        assertEquals("착지 뒤 선 marker 때문에 다시 편집했다", 1, h.store.retires)
+        assertEquals(listOf(receiptOf(ownedByA)), h.store.record.pendingPurges)
+    }
+
+    @Test
+    fun aFailedReadThatFindsNothingOwedOnResumeEndsTheHold() = runTest {
+        val h = harness(live = null)
+        h.store.loadsFail = true
+
+        val held = h.coordinator.onUnverifiedStart().heldByPersistence("읽기 실패")
+        h.store.loadsFail = false
+        resumeWhenDue(h, held).applied("아무것도 빚지지 않은 재개")
+
+        assertEquals(0, h.store.retires)
+        assertTrue("보류가 남았다", h.coordinator.resumePersistence(held.id) is IdentityStep.StaleResume)
+        assertFalse("보류가 남아 깨우기를 받았다", h.coordinator.retryPersistence(held.id))
+        assertEquals(IdentityRecoveryState.None, h.coordinator.identityRecovery.value)
+    }
+
+    @Test
+    fun aCleanupThatThrewAfterTheLandingResumesTheCleanupOnly() = runTest {
+        val h = harness(live = null)
+        h.store.record = ownedByA
+        h.purger.throwing = IOException("purge")
+
+        val held = h.coordinator.onUnverifiedStart().heldByPersistence("정리 실패")
+        assertNull("착지하지 않았다", h.store.record.ownerUid)
+        h.purger.throwing = null
+        resumeWhenDue(h, held).applied()
+
+        assertEquals("정리만 남았는데 편집을 다시 실행했다", 1, h.store.retires)
+    }
+
+    /** While the landing is unknown, the journal is the receipt; an outside purge resume must not erase it. */
+    @Test
+    fun anOutsidePurgeResumeDoesNotEraseTheReceiptOfAnUnknownRetirement() = runTest {
+        val h = harness(live = null)
+        h.store.record = ownedByA
+        h.store.retireFault = EditFault.AFTER_WRITE
+        h.purger.result = PurgeResult.Completed
+
+        val held = h.coordinator.onUnverifiedStart().heldByPersistence()
+        val purgesBefore = h.purger.purges
+        h.coordinator.resumePendingPurges()
+
+        assertEquals("착지 판정 전에 purge 가 돌았다", purgesBefore, h.purger.purges)
+        assertEquals(listOf(receiptOf(ownedByA)), h.store.record.pendingPurges)
+        resumeWhenDue(h, held).applied()
+        assertEquals(1, h.store.retires)
+    }
+
+    @Test
+    fun anUnverifiedStartOverAStandingHoldIsAContractViolation() = runTest {
+        val h = harness()
+        holdABind(h)
+
+        val failure = runCatching { h.coordinator.onUnverifiedStart() }.exceptionOrNull()
+
+        assertTrue("보류 위에서 시작 정산이 허용됐다: $failure", failure is IllegalStateException)
     }
 }
