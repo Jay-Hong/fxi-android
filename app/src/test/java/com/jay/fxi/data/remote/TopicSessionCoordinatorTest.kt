@@ -143,12 +143,32 @@ class TopicSessionCoordinatorTest {
         /** Every wait asked for, which is how a command's deadline windows are seen from here. */
         val sleeps = mutableListOf<Duration>()
         val clock = object : TopicCommandClock {
-            override fun nowMillis(): Long = scheduler.currentTime + clockSkewMillis
+            override fun nowMillis(): Long {
+                val now = scheduler.currentTime + clockSkewMillis
+                armedClockRead?.let { hook ->
+                    armedClockRead = null
+                    hook()
+                }
+                return now
+            }
             override suspend fun sleep(duration: Duration) {
                 sleeps += duration
                 delay(duration)
             }
         }
+
+        /** Invoked inside a live identity read, before it returns. */
+        var onLiveIdentityRead: (() -> Unit)? = null
+
+        /**
+         * Invoked after the first clock reading following a live identity read.
+         * Tests clear this hook when it fires and check where the reading occurred.
+         *
+         * Armed by the identity read itself, not by a flag left from an earlier one: a hook set after some unrelated read must not
+         * fire at a clock reading that came before the read it is waiting for.
+         */
+        var afterIdentityClockRead: (() -> Unit)? = null
+        private var armedClockRead: (() -> Unit)? = null
         var credential = AuthSnapshot("u1", 1L, "token-1")
         var refreshed: AuthSnapshot? = null
 
@@ -160,8 +180,18 @@ class TopicSessionCoordinatorTest {
                 return credential
             }
 
-            override suspend fun refreshAfterUnauthorized(rejected: AuthSnapshot) = refreshed
+            override suspend fun refreshAfterUnauthorized(rejected: AuthSnapshot): AuthSnapshot? {
+                refreshCalls++
+                refreshGate?.await()
+                return refreshed
+            }
         }
+
+        /** Every forced refresh a command asked for, counted as it was asked. */
+        var refreshCalls = 0
+
+        /** Held to keep a command inside its refresh, which is where the world can move under it. */
+        var refreshGate: CompletableDeferred<Unit>? = null
         val acknowledgements = mutableListOf<TopicCommandAcknowledgement>()
 
         /** Every bootstrap the session issued, with the grant each one bound itself to. */
@@ -271,7 +301,12 @@ class TopicSessionCoordinatorTest {
             encode = { request -> requests += request; "encoded-${request.requestId}" },
             newRequestId = { "r${requests.size + 1}" },
             jitter = { jitterUnit },
-            liveIdentity = { liveIdentityReads++; liveFence },
+            liveIdentity = {
+                liveIdentityReads++
+                onLiveIdentityRead?.invoke()
+                armedClockRead = afterIdentityClockRead
+                liveFence
+            },
             onBootstrapHttpEvidence = { status, retryAfter -> bootstrapEvidence += status to retryAfter },
             onRejected = { owner, reasons ->
                 rejected += reasons
@@ -359,6 +394,28 @@ class TopicSessionCoordinatorTest {
                     }
                 )
             ).replace("""{"request_id""", """{"type":"subscription_ack","request_id""")
+
+        /** An acknowledgement carrying leases on some topics and refusals of others, as one answer. */
+        fun ackOf(
+            requestId: String,
+            leases: List<Triple<String, String, Long>>,
+            rejections: Map<String, String>
+        ) = Json.encodeToString(
+            SubscriptionAck.serializer(),
+            SubscriptionAck(
+                requestId = requestId,
+                operation = "subscribe",
+                acceptedTopics = leases.map { SubscriptionAckTopic(it.first) },
+                rejectedTopics = rejections.map { SubscriptionRejection(it.key, it.value) },
+                removedTopics = emptyList(),
+                activeSubscriptions = leases.map { SubscriptionAckTopic(it.first, it.second, it.third) }
+            )
+        ).replace("""{"request_id""", """{"type":"subscription_ack","request_id""")
+
+        /** Moves this clock, and only this clock, to [millis]: the waits stay where the scheduler has them. */
+        fun clockAt(millis: Long) {
+            clockSkewMillis = millis - scheduler.currentTime
+        }
 
         fun fxFrame(rate: Double) =
             """{"type":"snapshot","version":1,"topic":"$USD","data":{"banks":[
@@ -4128,6 +4185,449 @@ class TopicSessionCoordinatorTest {
             listOf<Pair<Int?, String?>>(429 to "60"),
             h.bootstrapEvidence.drop(evidence)
         )
+        h.cleanUp()
+    }
+
+    // ---- the answer application boundary (L-4c) ---------------------------------------------------
+
+    /**
+     * An acknowledgement that arrives after the account moved is not applied, and nothing it carried survives.
+     *
+     * The move is the one the loop has not been told about — no `Access` follows it — so request id, format and deadline all
+     * pass. Without a check where the answer is applied, the store took it: confirmations, the refusal, the lease and the
+     * handover, for an account that had already gone.
+     */
+    private suspend fun TestScope.acknowledgementAfterMove(moved: AuthIdentityFence?) {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.wire
+        val published = h.topicStates.size
+
+        h.liveFence = moved
+        first.deliver(
+            h.ackOf(
+                "r1",
+                leases = listOf(Triple(TETHER, "L1", 900L)),
+                // Not `premium_required`: that one ends the connection by itself, and the socket closing here must be the
+                // retirement's doing.
+                rejections = mapOf(USD to "krx_entitlement_required")
+            )
+        )
+        advanceTimeBy(1)
+
+        assertTrue("떠난 신원의 ACK 에 소켓이 남았다", first.cancelled)
+        assertEquals("떠난 신원의 ACK 가 밖으로 넘어갔다", 0, h.acknowledgements.size)
+        assertEquals("떠난 신원의 거부가 밖으로 넘어갔다", 0, h.rejected.size)
+        assertTrue(
+            "떠난 신원의 ACK 가 store 에 적용돼 발행됐다",
+            h.topicStates.drop(published).none {
+                it.controlState == TopicControlState.ACKNOWLEDGED ||
+                    it.stateFor(TETHER).confirmed ||
+                    it.stateFor(USD).rejection != null
+            }
+        )
+        // A KRX refusal outlives a teardown, so this is where one that was applied would still be standing.
+        assertNull("떠난 신원의 거부가 teardown 뒤에 남았다", h.store.snapshot.stateFor(USD).rejection)
+
+        // The same grant again, and a trigger: neither reopens, and the lease the answer carried was never installed.
+        h.coordinator.setAccess(true, fence())
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1_000_000)
+        assertEquals("은퇴한 grant 로 다시 연결했다", 1, h.wires.size)
+        assertEquals("설치되지 않았어야 할 lease 가 갱신됐다", 1, h.requests.size)
+
+        h.liveFence = AuthIdentityFence("u1", 3L)
+        h.credential = AuthSnapshot("u1", 3L, "token-3")
+        h.coordinator.setAccess(true, fence(generation = 3L))
+        advanceTimeBy(100)
+        assertEquals("새 grant 로 복구하지 못했다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `an acknowledgement after the account signed out is not applied`() = runTest {
+        acknowledgementAfterMove(null)
+    }
+
+    @Test
+    fun `an acknowledgement after another account signed in is not applied`() = runTest {
+        acknowledgementAfterMove(AuthIdentityFence("u2", 1L))
+    }
+
+    @Test
+    fun `an acknowledgement after the same account rotated its generation is not applied`() = runTest {
+        acknowledgementAfterMove(AuthIdentityFence("u1", 2L))
+    }
+
+    /**
+     * A request failure in the same position is not applied either, whichever kind it is.
+     *
+     * One harness per kind on the shared background scope, cancelled once at the end: cancelling it between kinds would
+     * stop the next session before it started.
+     */
+    @Test
+    fun `a request failure for an account that moved is not applied`() = runTest {
+        var last: Harness? = null
+        listOf("invalid_token", "invalid_request", "request_too_large", "temporarily_unavailable").forEach { code ->
+            val h = Harness(this).also { last = it }
+            h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+            h.goLive()
+            advanceTimeBy(100)
+            h.wire.open()
+            advanceTimeBy(1)
+            val first = h.wire
+            val published = h.topicStates.size
+
+            h.liveFence = AuthIdentityFence("u2", 1L)
+            first.deliver(
+                """{"type":"subscription_error","request_id":"r1","error":"$code","retry_after_seconds":5}"""
+            )
+            advanceTimeBy(1)
+            assertTrue("[$code] 떠난 신원의 실패에 소켓이 남았다", first.cancelled)
+            assertEquals("[$code] 떠난 신원의 실패로 갱신을 불렀다", 0, h.refreshCalls)
+
+            // Long enough for a retry after five seconds, and for any turn to have published what the command wrote.
+            advanceTimeBy(60_000)
+            assertEquals("[$code] 떠난 신원의 실패가 재시도·replay 됐다", 1, h.requests.size)
+            assertTrue(
+                "[$code] 떠난 신원의 실패가 store 에 적용돼 발행됐다",
+                h.topicStates.drop(published).none {
+                    it.controlState == TopicControlState.FAILED ||
+                        it.wholeFailure != null ||
+                        it.authResolution != TopicAuthResolution.RESOLVED
+                }
+            )
+        }
+        last!!.cleanUp()
+    }
+
+    /** Leaves a command inside the forced refresh an `invalid_token` for `r1` is owed, with the refresh held. */
+    private suspend fun TestScope.refreshHeld(h: Harness): Wire {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.refreshGate = CompletableDeferred()
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("갱신이 붙들리지 않아 이 시험이 창을 재지 못한다", 1, h.refreshCalls)
+        assertEquals(TopicAuthResolution.REFRESHING, h.store.snapshot.authResolution)
+        return h.wire
+    }
+
+    /**
+     * The failure was this account's, the refresh result is not: it suspended, and the account moved while it did.
+     *
+     * The refreshed credential is still bound to the connection's own identity, so the credential check passes. What is left
+     * to stop the replay is the admission its result goes through.
+     */
+    @Test
+    fun `a refresh that returns after the account moved neither completes nor replays`() = runTest {
+        val h = Harness(this)
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        val first = refreshHeld(h)
+
+        h.liveFence = AuthIdentityFence("u2", 1L)
+        h.refreshGate!!.complete(Unit)
+        advanceTimeBy(1)
+
+        assertTrue("떠난 신원의 갱신 결과에 소켓이 남았다", first.cancelled)
+        assertEquals("떠난 신원으로 replay 했다", 1, h.requests.size)
+        assertEquals("갱신 중 상태가 남았다", TopicAuthResolution.RESOLVED, h.store.snapshot.authResolution)
+        h.cleanUp()
+    }
+
+    /** The same, when the refresh produced nothing: that is a result too, and the failure it would record is not owed. */
+    @Test
+    fun `an empty refresh that returns after the account moved records no failure`() = runTest {
+        val h = Harness(this)
+        h.refreshed = null
+        val first = refreshHeld(h)
+        val published = h.topicStates.size
+
+        h.liveFence = null
+        h.refreshGate!!.complete(Unit)
+        advanceTimeBy(1)
+
+        assertTrue("떠난 신원의 갱신 결과에 소켓이 남았다", first.cancelled)
+        advanceTimeBy(60_000)
+        assertTrue(
+            "떠난 신원의 빈 갱신이 실패로 기록됐다",
+            h.topicStates.drop(published).none { it.authResolution == TopicAuthResolution.FAILED }
+        )
+        assertEquals(TopicAuthResolution.RESOLVED, h.store.snapshot.authResolution)
+        h.cleanUp()
+    }
+
+    /**
+     * A renewal in flight on a fifteen-second lease, and the absolute deadline that lease holds.
+     *
+     * Under the renewal lead, so the renewal is sent at once and the deadline is still ahead. Short for the reason given in
+     * `a grant arriving after the deadline does not extend it`: the renewal's own twenty-second acknowledgement deadline
+     * stays open while the lease's is reached, and [Harness.clockAt] moves the clock without waking the expiry timer.
+     */
+    private suspend fun TestScope.renewalInFlight(h: Harness, vararg topics: String): Pair<Wire, Long> {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", *topics.map { Triple(it, "L-$it", 15L) }.toTypedArray()))
+        advanceTimeBy(1)
+        assertEquals("lead 아래 lease 가 즉시 갱신하지 않았다", 2, h.requests.size)
+        assertEquals(topics.toSet(), h.requests[1].topics.toSet())
+        return h.wire to h.acknowledgements.single().acknowledgedAtMillis + 15_000
+    }
+
+    /**
+     * One millisecond inside the lease: applied, and stamped with the instant it was admitted at.
+     *
+     * The clock passes the deadline the moment the admission has read it. Anything that judged the same answer again at a
+     * later reading — the lease a second time, or the instant it is stamped with — would find it expired, and publish an
+     * answer the store had already taken on the way to a teardown.
+     */
+    @Test
+    fun `an acknowledgement just inside its lease is applied at its admitted instant`() = runTest {
+        val h = Harness(this)
+        val (first, deadline) = renewalInFlight(h, TETHER)
+
+        h.clockAt(deadline - 2)
+        h.onLiveIdentityRead = {
+            h.onLiveIdentityRead = null
+            h.clockAt(deadline - 1)
+        }
+        h.afterIdentityClockRead = {
+            assertEquals("시계 hook 이 ACK 적용 뒤에 발화했다", TopicControlState.PENDING, h.store.snapshot.controlState)
+            h.afterIdentityClockRead = null
+            h.clockAt(deadline + 1)
+        }
+        first.deliver(h.ackWithLeases("r2", Triple(TETHER, "L3", 900L)))
+        advanceTimeBy(1)
+        assertNull("live 신원을 읽지 않았다", h.onLiveIdentityRead)
+        assertNull("admission 시각을 읽지 않았다", h.afterIdentityClockRead)
+
+        assertEquals("마감 전 ACK 에 연결이 끝났다", false, first.cancelled)
+        assertEquals(2, h.acknowledgements.size)
+        assertEquals(deadline - 1, h.acknowledgements.last().acknowledgedAtMillis)
+        h.cleanUp()
+    }
+
+    /**
+     * At the deadline itself the answer is refused before the store takes it — the H3 leak.
+     *
+     * The expiry still publishes its degraded snapshot on the way to the teardown. Before L-4c the acknowledgement had
+     * already been applied by then, so that snapshot carried its control state, and a KRX refusal it held outlived the
+     * teardown and was handed over.
+     */
+    @Test
+    fun `an acknowledgement at its lease deadline is refused before it is applied`() = runTest {
+        val h = Harness(this)
+        val (first, deadline) = renewalInFlight(h, TETHER)
+        val published = h.topicStates.size
+
+        h.clockAt(deadline)
+        first.deliver(h.ack("r2", active = emptyList(), rejections = mapOf(TETHER to "krx_entitlement_required")))
+        advanceTimeBy(1)
+
+        assertTrue("만료된 lease 위의 ACK 에 연결이 남았다", first.cancelled)
+        val during = h.topicStates.drop(published)
+        val degraded = during.filter { it.stateFor(TETHER).deliveryState == TopicDeliveryState.DEGRADED }
+        assertEquals("만료 발행이 한 번이 아니었다", 1, degraded.size)
+        assertEquals("만료 발행에 거절된 ACK 의 control 상태가 실렸다", TopicControlState.PENDING, degraded.single().controlState)
+        assertTrue("거절된 ACK 의 거부가 발행됐다", during.none { it.stateFor(TETHER).rejection != null })
+        assertNull("거절된 ACK 의 KRX 거부가 teardown 뒤에 남았다", h.store.snapshot.stateFor(TETHER).rejection)
+        assertEquals("거절된 ACK 가 밖으로 넘어갔다", 1, h.acknowledgements.size)
+        assertEquals("거절된 ACK 의 거부가 밖으로 넘어갔다", 0, h.rejected.size)
+        h.cleanUp()
+    }
+
+    /**
+     * Past the deadline: refused, and the connection the admission ended is recovered the way any expiry is.
+     *
+     * The command unwinds instead of returning, so this is also where a cleanup that stopped with it would show — the session
+     * would be left holding a command that is gone, and nothing would reconnect.
+     */
+    @Test
+    fun `an acknowledgement past its lease deadline is refused and the expiry reconnects`() = runTest {
+        val h = Harness(this)
+        val (first, deadline) = renewalInFlight(h, TETHER)
+
+        h.clockAt(deadline + 1)
+        first.deliver(h.ackWithLeases("r2", Triple(TETHER, "L3", 900L)))
+        advanceTimeBy(1)
+
+        assertTrue("만료된 lease 위의 ACK 에 연결이 남았다", first.cancelled)
+        assertEquals("거절된 ACK 가 밖으로 넘어갔다", 1, h.acknowledgements.size)
+        // The first rung only: a socket this test never opens is given up on and climbs the ladder again after it.
+        advanceTimeBy(2_100)
+        assertEquals("만료로 끝난 연결을 다시 열지 않았다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** Both at once: the account moving is the finding, and the expiry — with its degraded publication and its reconnection — is not. */
+    @Test
+    fun `an account that moved is retired ahead of a lease that ran out`() = runTest {
+        val h = Harness(this)
+        val (first, deadline) = renewalInFlight(h, TETHER)
+        val published = h.topicStates.size
+
+        h.clockAt(deadline + 1)
+        h.liveFence = null
+        first.deliver(h.ackWithLeases("r2", Triple(TETHER, "L3", 900L)))
+        advanceTimeBy(1)
+
+        assertTrue(first.cancelled)
+        assertTrue(
+            "신원 상실이 lease 만료로 기록됐다",
+            h.topicStates.drop(published).none { it.degradedTopics.isNotEmpty() }
+        )
+        h.coordinator.setForeground(true)
+        advanceTimeBy(120_000)
+        assertEquals("은퇴한 grant 가 만료 재연결을 탔다", 1, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A `premium_required` for a topic the request sent is settled as a refusal even past the lease, as it always was.
+     *
+     * It latches the grant — which also stops a bootstrap answer for it that is still out — and ends the connection before any
+     * lease or publication is looked at. Refusing it as an expiry instead would drop the latch, and the bootstrap answer with
+     * it would land. What the store keeps and publishes is the teardown's, not the acknowledgement's; what is handed over is
+     * the acknowledgement as the server gave it.
+     */
+    @Test
+    fun `a premium refusal past its lease is still settled as a refusal`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        val (first, deadline) = renewalInFlight(h, TETHER, USD, TopicCatalogue.DXY)
+        val expectedRefusals = mapOf(
+            TETHER to TopicRejectionReason.PREMIUM_REQUIRED,
+            USD to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED
+        )
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        val published = h.topicStates.size
+
+        h.clockAt(deadline + 1)
+        first.deliver(
+            h.ackOf(
+                "r2",
+                leases = listOf(Triple(TopicCatalogue.DXY, "L4", 900L)),
+                rejections = mapOf(TETHER to "premium_required", USD to "krx_entitlement_required")
+            )
+        )
+        advanceTimeBy(1)
+
+        assertTrue(first.cancelled)
+        assertEquals(listOf(expectedRefusals), h.rejected)
+        assertEquals(listOf(fence()), h.rejectedOwners)
+        assertEquals(2, h.acknowledgements.size)
+        val ack = h.acknowledgements.last()
+        assertEquals(deadline + 1, ack.acknowledgedAtMillis)
+        assertEquals(setOf(TopicCatalogue.DXY), ack.accepted)
+        assertEquals(expectedRefusals, ack.rejected)
+        assertEquals(listOf("L4"), ack.leases.map { it.leaseId })
+
+        val during = h.topicStates.drop(published)
+        assertTrue(
+            "거부 ACK 의 중간 상태가 발행됐다",
+            during.none { it.controlState == TopicControlState.ACKNOWLEDGED || it.topics.values.any { s -> s.confirmed } }
+        )
+        assertTrue("거부 ACK 가 만료로 기록됐다", during.none { it.degradedTopics.isNotEmpty() })
+        val after = h.store.snapshot
+        assertEquals(TopicControlState.IDLE, after.controlState)
+        assertNull(after.wholeFailure)
+        assertEquals(TopicAuthResolution.RESOLVED, after.authResolution)
+        listOf(TETHER, USD, TopicCatalogue.DXY).forEach { topic ->
+            assertEquals("$topic 확인이 남았다", false, after.stateFor(topic).confirmed)
+            assertEquals(TopicDeliveryState.NEVER_RECEIVED, after.stateFor(topic).deliveryState)
+        }
+        assertEquals(TopicRejectionReason.PREMIUM_REQUIRED, after.stateFor(TETHER).rejection)
+        assertEquals(TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED, after.stateFor(USD).rejection)
+
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.tetherFrame(1390.0)) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+        assertTrue("거절된 grant 에 REST 로 값이 다시 들어왔다", h.coordinator.rates.value.quotes.isEmpty())
+
+        h.coordinator.setOnline(false)
+        h.coordinator.setOnline(true)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(60_000)
+        assertEquals("거절받은 grant 로 다시 연결했다", 1, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A `premium_required` for a topic this request never sent is somebody else's answer, so it buys no exception: the
+     * acknowledgement is judged against its lease like any other, and nothing is latched.
+     */
+    @Test
+    fun `a premium refusal of a topic the request did not send is judged against the lease`() = runTest {
+        val h = Harness(this)
+        val (first, deadline) = renewalInFlight(h, TETHER)
+
+        h.clockAt(deadline)
+        first.deliver(
+            h.ackOf("r2", leases = listOf(Triple(TETHER, "L3", 900L)), rejections = mapOf(USD to "premium_required"))
+        )
+        advanceTimeBy(1)
+
+        assertTrue("만료된 lease 위의 ACK 에 연결이 남았다", first.cancelled)
+        assertEquals("거절된 ACK 가 밖으로 넘어갔다", 1, h.acknowledgements.size)
+        assertEquals(0, h.rejected.size)
+        advanceTimeBy(2_100)
+        assertEquals("남의 거부로 grant 를 잠갔다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** A refusal is no exception to the account: one for an account that moved is neither latched nor handed over. */
+    @Test
+    fun `a premium refusal for an account that moved is not settled`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.wire
+
+        h.liveFence = AuthIdentityFence("u2", 1L)
+        first.deliver(h.ack("r1", active = emptyList(), rejections = mapOf(TETHER to "premium_required")))
+        advanceTimeBy(1)
+
+        assertTrue(first.cancelled)
+        assertEquals("떠난 신원의 거부가 밖으로 넘어갔다", 0, h.rejected.size)
+        assertEquals(0, h.acknowledgements.size)
+        assertNull("떠난 신원의 거부가 store 에 남았다", h.store.snapshot.stateFor(TETHER).rejection)
+        h.cleanUp()
+    }
+
+    /**
+     * The live identity is read once for each answer that is applied, and not at all for one the command sets aside.
+     *
+     * An unknown request id and an error this client does not recognise never reach an application, and reading the identity
+     * for them would drive an observation that can advance its generation for nothing.
+     */
+    @Test
+    fun `an applied answer reads the live identity once and an ignored one never`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val reads = h.liveIdentityReads
+
+        h.wire.deliver(h.ack("r9", active = listOf(TETHER)))
+        h.wire.deliver(h.subscriptionError("r1", "no_such_error"))
+        advanceTimeBy(1)
+        assertEquals("무시할 답이 신원 관측을 구동했다", reads, h.liveIdentityReads)
+
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertEquals("적용한 ACK 가 신원을 정확히 한 번 관측하지 않았다", reads + 1, h.liveIdentityReads)
+        assertEquals(1, h.acknowledgements.size)
         h.cleanUp()
     }
 

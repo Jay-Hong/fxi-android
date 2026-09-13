@@ -281,10 +281,11 @@ class TopicSessionCoordinator(
      * before it supplies a new `Access` fence; `AuthAccessBinder` alone does not guarantee that.
      *
      * This is also not a global identity monitor: a timer or a command result can run before any
-     * guarded data input observes the loss. It does not validate live access revocation, guard
-     * command ACK application, or authorize deferred callbacks — the refusal hand-over carries its
-     * connection's fence for the consumer to check, and nothing here checks it. Those, and
-     * generation-aware grant recovery, remain prerequisites for runtime wiring.
+     * guarded data input observes the loss. A command's answer is read against it at application
+     * (L-4c, [admitsAnswer]). It does not validate live access revocation or authorize deferred
+     * callbacks — the refusal hand-over carries its connection's fence for the consumer to check, and
+     * nothing here checks it. Those, and generation-aware grant recovery, remain prerequisites for
+     * runtime wiring.
      */
     private val liveIdentity: () -> AuthIdentityFence?,
     /**
@@ -307,13 +308,13 @@ class TopicSessionCoordinator(
      * runs: a `premium_required` refusal ends the connection **before** this is called, and a
      * consumer has to be able to tell a refusal for the grant it still holds from a late one.
      * Carrying it is all this does — whether the refusal still applies is the consumer's
-     * decision, and the store writes and latch changes made before this call are not validated
-     * by it.
+     * decision. The acknowledgement was admitted for application before its store writes and the
+     * latch (L-4c); this call does not validate them again.
      */
     private val onRejected: (owner: TopicSessionFence, rejected: Map<String, TopicRejectionReason>) -> Unit =
         { _, _ -> },
     /**
-     * Every acknowledgement, as it arrives.
+     * Every acknowledgement admitted for application (L-4c), as it arrives — one refused at application is not handed over.
      *
      * Kept even though this slice uses only the refusals: the leases and the instant are what
      * S3k-2 renews against, and dropping them here would mean re-plumbing the seam that was the
@@ -891,12 +892,41 @@ class TopicSessionCoordinator(
     }
 
     /**
+     * Whether a command's answer on [live] may be applied now (L-4c): the application boundary a data frame and a bootstrap
+     * answer already have, for the answers a command writes itself.
+     *
+     * The pure checks first; then the live identity, which can advance its generation and so must not be driven by an answer
+     * the connection or the latches already rule out; then the lease this connection holds, read at the one instant the
+     * answer is applied and stamped at. An identity loss retires the grant and wins over an expiry seen at the same time.
+     *
+     * A `premium_required` refusal skips the lease, as it always came first: it latches the grant — which also stops a
+     * bootstrap answer for it — and ends the connection before any lease or publication is looked at. Expiring the lease
+     * first would drop that refusal, and with it the latch.
+     *
+     * [TopicAnswerDenial.ENDED_CONNECTION] and [TopicAnswerDenial.LATCHED] are defensive: an ended connection has already
+     * cancelled its commands, and both latches end their connection as they are set.
+     */
+    private fun admitsAnswer(live: Connection, refusesPremium: Boolean): TopicAnswerAdmission {
+        val still = current(live.generation) ?: return TopicAnswerAdmission.Denied(TopicAnswerDenial.ENDED_CONNECTION)
+        if (still.fence == refusedFor || still.fence == identityLostFor) {
+            return TopicAnswerAdmission.Denied(TopicAnswerDenial.LATCHED)
+        }
+        if (!enforceLiveIdentity(still.fence)) return TopicAnswerAdmission.Denied(TopicAnswerDenial.IDENTITY_LOST)
+        val atMillis = clock.nowMillis()
+        if (!refusesPremium && enforceLeaseExpiry(still, atMillis)) {
+            return TopicAnswerAdmission.Denied(TopicAnswerDenial.LEASE_EXPIRED)
+        }
+        return TopicAnswerAdmission.Admitted(atMillis)
+    }
+
+    /**
      * Retires the current grant after an observed identity loss.
      *
-     * Every caller runs on the loop holding the current fence: the bootstrap answer reads it
-     * directly, and a connection input has already been through `current()`, which an `Access`
-     * that replaced the fence would have ended the socket for. So there is no owner here that is
-     * not this loop's — a `fence != owner` term would be a guard on a state that cannot arrive.
+     * Callers run on the session's serial scope, either on the loop or in a command coroutine.
+     * A bootstrap answer checks the current fence directly; connection inputs and command
+     * admission pass `current()` before reaching this method. An `Access` replacing the fence
+     * ends the old connection, so each caller holds the current session fence — a
+     * `fence != owner` term would be a guard on a state that cannot arrive.
      *
      * The latch is what stops this grant being reopened; repeated retirement needs no further
      * cleanup, and `cancelReconnect` releases a pending timer *and* invalidates an event it has
@@ -1182,7 +1212,8 @@ class TopicSessionCoordinator(
             newRequestId = newRequestId,
             jitter = jitter,
             scope = { if (current(live.generation) == null) emptySet() else topics() },
-            onAcknowledged = { ack -> onAcknowledged(live, id, ack) }
+            onAcknowledged = { ack -> onAcknowledged(live, id, ack) },
+            admitAnswer = { refusesPremium -> admitsAnswer(live, refusesPremium) }
         )
         val running = RunningCommand(command, purpose)
         live.commands[id] = running
@@ -1256,12 +1287,12 @@ class TopicSessionCoordinator(
         }
         // Also before, and only while the connection is still standing: the leases belong to this
         // socket, and re-arming timers on one that has just been ended would schedule work for a
-        // connection nobody is holding. A deadline that passed while this answer was in flight is
-        // enforced **instead of** applying it — a new grant must not carry a subscription past the
-        // absolute expiry of the one it replaces, which is what "hard" means. Found by review.
-        current(live.generation)?.let { still ->
-            if (!enforceLeaseExpiry(still)) applyLeases(still, ack)
-        }
+        // connection nobody is holding. A deadline that passed while this answer was in flight was
+        // enforced **instead of** applying it, by the admission this acknowledgement already passed
+        // (L-4c) — at one instant, the one it is stamped with. Judging it again here, at a later
+        // reading of the clock, could find the deadline passed after the store had taken the answer
+        // and publish that answer on the way to the teardown.
+        current(live.generation)?.let { still -> applyLeases(still, ack) }
         // The acknowledgement's own store writes happen inside the command, not on the loop, so
         // the turn-boundary publication would not carry them until something else arrives.
         publishIfChanged()
@@ -1327,7 +1358,7 @@ class TopicSessionCoordinator(
      * Lets go of every lease whose deadline has arrived, and takes the connection with them.
      *
      * The same judgment for every caller — the timer, the foreground return, a renewal coming due,
-     * an acknowledgement being applied, and a data frame arriving — because the timer's wait is
+     * a command's answer being admitted, and a data frame arriving — because the timer's wait is
      * relative and the deadline is not: an app suspended past the deadline has a timer that has
      * not fired yet, and whichever of the others runs first is where that is noticed.
      *
@@ -1336,8 +1367,8 @@ class TopicSessionCoordinator(
      * because [end] is idempotent and the connection is gone after the first — which is also why
      * this needs no equivalent of iOS's `leaseExpiryReconnectIssuedGeneration`.
      */
-    private fun enforceLeaseExpiry(live: Connection): Boolean {
-        val expired = live.leases.expiredAt(clock.nowMillis())
+    private fun enforceLeaseExpiry(live: Connection, nowMillis: Long = clock.nowMillis()): Boolean {
+        val expired = live.leases.expiredAt(nowMillis)
         if (expired.isEmpty()) return false
         // Written and published before the teardown, which puts a still-wanted topic back to
         // never-received in the same turn. iOS does the same (`WebSocketService.swift:1383-1384`).

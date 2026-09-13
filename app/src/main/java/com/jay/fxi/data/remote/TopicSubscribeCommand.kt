@@ -21,6 +21,7 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import com.jay.fxi.domain.model.TopicAuthRefreshTicket
 import com.jay.fxi.domain.model.TopicRequestTicket
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -107,6 +108,36 @@ data class TopicCommandAcknowledgement(
     val leases: List<TopicLease>
 )
 
+/**
+ * Whether an answer this command has correlated may be applied now (L-4c).
+ *
+ * Asked at the moment of application, not when the answer arrived: the connection, the grant and the account can all have
+ * moved since. [Admitted.atMillis] is the application instant supplied by the admission callback. The session reads it
+ * after checking the live identity; the standalone default only reads the injected clock. An admitted ACK uses this
+ * instant as its timestamp. It is not the arrival time, and the ACK deadline is not judged again against it.
+ */
+sealed interface TopicAnswerAdmission {
+    data class Admitted(val atMillis: Long) : TopicAnswerAdmission
+    data class Denied(val reason: TopicAnswerDenial) : TopicAnswerAdmission
+}
+
+enum class TopicAnswerDenial {
+    /** Defensive: a connection ended first cancels its commands, so a running command does not normally see this. */
+    ENDED_CONNECTION,
+
+    /** Defensive: both latches end their connection as they are set. */
+    LATCHED,
+    IDENTITY_LOST,
+    LEASE_EXPIRED
+}
+
+/**
+ * An answer refused at application. A cancellation, and deliberately not [com.jay.fxi.data.auth.AuthIdentityChangedException]:
+ * a lease that ran out or a connection that ended is not the account moving, and a report of one must not read as the other.
+ */
+class TopicAnswerNotAdmittedException(val reason: TopicAnswerDenial) :
+    CancellationException("answer not admitted: $reason")
+
 sealed interface TopicCommandOutcome {
     /**
      * The server answered, and nothing more is being waited for.
@@ -168,6 +199,8 @@ sealed interface TopicCommandOutcome {
  * `AuthIdentityChangedException` is *not* caught either — it is a
  * `CancellationException`, the account moved out from under this command, and swallowing it to
  * return a value would restart work on behalf of an identity that is gone.
+ * [TopicAnswerNotAdmittedException] is the same shape for an answer refused at application (L-4c): it unwinds before the
+ * answer touches the store or reaches [onAcknowledged], and `run`'s cleanup still runs.
  */
 class TopicSubscribeCommand(
     private val purpose: TopicCommandPurpose,
@@ -186,8 +219,16 @@ class TopicSubscribeCommand(
      * whole intent. An empty answer ends the command as [TopicCommandOutcome.Superseded].
      */
     private val scope: () -> Set<String>,
-    /** Called once, on the acknowledgement, before the delivery deadline is waited out. */
-    private val onAcknowledged: (TopicCommandAcknowledgement) -> Unit = {}
+    /** Called once, on an admitted acknowledgement, before the delivery deadline is waited out. */
+    private val onAcknowledged: (TopicCommandAcknowledgement) -> Unit = {},
+    /**
+     * Asked immediately before each answer is applied to [store]: an acknowledgement, a classified request failure, and the
+     * result of a credential refresh. [refusesPremium] is whether an acknowledgement refuses a topic this request sent with
+     * `premium_required` — the one answer settled ahead of an expired lease. The default admits everything; a session must
+     * supply its own.
+     */
+    private val admitAnswer: (refusesPremium: Boolean) -> TopicAnswerAdmission =
+        { TopicAnswerAdmission.Admitted(clock.nowMillis()) }
 ) {
     private class Pending(
         val requestId: String,
@@ -229,6 +270,18 @@ class TopicSubscribeCommand(
 
     fun deliver(frame: DecodedTopicFrame) {
         inbox.trySend(frame)
+    }
+
+    /**
+     * The admission for one application, or an unwind. Callers apply what it admits before suspending again: nothing may run
+     * between this and the write it allows. A command already cancelled — by a teardown that ran first — never asks.
+     */
+    private suspend fun admit(refusesPremium: Boolean): Long {
+        currentCoroutineContext().ensureActive()
+        return when (val admission = admitAnswer(refusesPremium)) {
+            is TopicAnswerAdmission.Admitted -> admission.atMillis
+            is TopicAnswerAdmission.Denied -> throw TopicAnswerNotAdmittedException(admission.reason)
+        }
     }
 
     suspend fun run(): TopicCommandOutcome =
@@ -337,7 +390,12 @@ class TopicSubscribeCommand(
 
                     is Answer.Failed -> {
                         val failure = answer.error.wholeFailureOrNull()
-                        failure?.let(store::applyWholeFailure)
+                        // An unclassified error writes nothing and is not asked about. A classified one is admitted first, and the
+                        // decision and `beginAuthRefresh` below run on that admission: nothing suspends before them.
+                        if (failure != null) {
+                            admit(refusesPremium = false)
+                            store.applyWholeFailure(failure)
+                        }
                         val decision = TopicWholeRequestMatrix.decide(
                             failure = failure,
                             attempt = attempt,
@@ -362,7 +420,9 @@ class TopicSubscribeCommand(
                                 authTicket = recovery
                                 val refreshed =
                                     credentials.refreshAfterUnauthorized(pending.credential)
-                                authTicket = null
+                                // The refresh suspended, so its result is a new answer to admit. The ticket stays held until
+                                // the refresh is settled: a denial here unwinds, and `run`'s finally is what abandons it.
+                                admit(refusesPremium = false)
                                 if (refreshed == null) {
                                     // Back to FAILED, and by the same route it got there.
                                     store.applyWholeFailure(TopicWholeRequestFailure.InvalidToken)
@@ -374,6 +434,7 @@ class TopicSubscribeCommand(
                                 // leaving REFRESHING for the replay to clear would strand it
                                 // there whenever the replay is never answered.
                                 store.endAuthRefresh(recovery)
+                                authTicket = null
                                 replayCredential = refreshed
                                 // The matrix already spent the attempt and named the next number;
                                 // spending it again here would skip one of the three.
@@ -490,6 +551,8 @@ class TopicSubscribeCommand(
             .mapNotNull { rejection -> rejection.reasonOrNull()?.let { rejection.topic to it } }
             .toMap()
 
+        // The same map the session reads for its refusal latch, so the premium exception covers exactly those refusals.
+        val admittedAt = admit(refusesPremium = rejected.values.any { it == TopicRejectionReason.PREMIUM_REQUIRED })
         store.applyAck(
             activeTopics = active,
             rejections = rejected,
@@ -498,7 +561,7 @@ class TopicSubscribeCommand(
         )
         onAcknowledged(
             TopicCommandAcknowledgement(
-                acknowledgedAtMillis = clock.nowMillis(),
+                acknowledgedAtMillis = admittedAt,
                 accepted = accepted,
                 rejected = rejected,
                 leases = answer.leases

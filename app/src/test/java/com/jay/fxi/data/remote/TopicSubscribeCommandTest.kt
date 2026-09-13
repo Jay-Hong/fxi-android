@@ -81,6 +81,9 @@ class TopicSubscribeCommandTest {
         var refreshGateMillis = 0L
         var identityChanges = 0
         var refreshed: AuthSnapshot? = AuthSnapshot("u1", 1L, "token-2")
+
+        /** Run as the refresh returns, without suspending: where a teardown on the same thread lands just before the result is used. */
+        var onRefreshReturn: (() -> Unit)? = null
         val refreshedFrom = mutableListOf<AuthSnapshot>()
 
         val credentials = object : TopicCommandCredentials {
@@ -100,6 +103,7 @@ class TopicSubscribeCommandTest {
             override suspend fun refreshAfterUnauthorized(rejected: AuthSnapshot): AuthSnapshot? {
                 refreshedFrom += rejected
                 if (refreshGateMillis > 0) delay(refreshGateMillis)
+                onRefreshReturn?.invoke()
                 return refreshed
             }
         }
@@ -114,6 +118,11 @@ class TopicSubscribeCommandTest {
         var jitterUnit = 0.0
         val acknowledgements = mutableListOf<Pair<Long, TopicCommandAcknowledgement>>()
         var onAcknowledgement: (() -> Unit)? = null
+
+        /** What each application is answered with; every question is recorded in [admissions] first. */
+        var admission: (refusesPremium: Boolean) -> TopicAnswerAdmission =
+            { TopicAnswerAdmission.Admitted(clock.nowMillis()) }
+        val admissions = mutableListOf<Boolean>()
 
         /** Fired every time the command asks what is still wanted. */
         var onScope: (() -> Unit)? = null
@@ -141,6 +150,10 @@ class TopicSubscribeCommandTest {
                 onAcknowledged = {
                     acknowledgements += scheduler.currentTime to it
                     onAcknowledgement?.invoke()
+                },
+                admitAnswer = { refusesPremium ->
+                    admissions += refusesPremium
+                    admission(refusesPremium)
                 }
             )
         }
@@ -1159,6 +1172,177 @@ class TopicSubscribeCommandTest {
             TopicDeliveryState.NEVER_RECEIVED,
             harness.store.snapshot.stateFor(USD).deliveryState
         )
+        harness.cleanUp()
+    }
+
+    // ---- the application admission (L-4c) -------------------------------------------------------
+
+    /**
+     * An acknowledgement refused at application is not applied and not handed over, and the command unwinds.
+     *
+     * Its request is still released on the way out: what `run`'s cleanup owns is the ticket, and a refusal is no reason to
+     * leave `PENDING` standing.
+     */
+    @Test
+    fun `an acknowledgement refused at application reaches neither the store nor the caller`() = runTest {
+        val harness = Harness(this)
+        harness.admission = { TopicAnswerAdmission.Denied(TopicAnswerDenial.IDENTITY_LOST) }
+        harness.build()
+        val run = harness.start()
+        advanceTimeBy(100)
+        harness.command.deliver(
+            harness.ack("r1", active = listOf(USD), rejected = mapOf(JPY to "premium_required"), leaseSeconds = 900)
+        )
+        advanceUntilIdle()
+
+        assertEquals(
+            TopicAnswerDenial.IDENTITY_LOST,
+            (run.thrown as TopicAnswerNotAdmittedException).reason
+        )
+        assertNull(run.outcome)
+        assertEquals("거절된 ACK 가 넘어갔다", 0, harness.acknowledgements.size)
+        val snapshot = harness.store.snapshot
+        assertEquals("거절된 ACK 가 적용됐거나 요청이 남았다", TopicControlState.IDLE, snapshot.controlState)
+        assertEquals(false, snapshot.stateFor(USD).confirmed)
+        assertEquals(listOf(false), harness.admissions)
+        harness.cleanUp()
+    }
+
+    /**
+     * A classified failure refused at application writes nothing and starts no refresh; answers that are set aside before
+     * that are never asked about at all.
+     */
+    @Test
+    fun `a failure refused at application is neither recorded nor refreshed`() = runTest {
+        val harness = Harness(this)
+        harness.admission = { TopicAnswerAdmission.Denied(TopicAnswerDenial.LEASE_EXPIRED) }
+        harness.build()
+        val run = harness.start()
+        advanceTimeBy(100)
+
+        harness.command.deliver(harness.ack("r0", active = listOf(USD)))
+        harness.command.deliver(harness.error("r1", "no_such_error"))
+        harness.command.deliver(harness.ackWithBrokenLease("r1", USD))
+        advanceTimeBy(100)
+        assertEquals("무시할 답이 적용 판정을 구동했다", emptyList<Boolean>(), harness.admissions)
+        assertNull(run.outcome)
+        assertNull(run.thrown)
+
+        harness.command.deliver(harness.error("r1", "invalid_token"))
+        advanceUntilIdle()
+
+        assertEquals(
+            TopicAnswerDenial.LEASE_EXPIRED,
+            (run.thrown as TopicAnswerNotAdmittedException).reason
+        )
+        assertEquals(listOf(false), harness.admissions)
+        assertEquals("거절된 실패로 갱신을 불렀다", emptyList<AuthSnapshot>(), harness.refreshedFrom)
+        assertEquals(1, harness.requests.size)
+        val snapshot = harness.store.snapshot
+        assertNull("거절된 실패가 기록됐다", snapshot.wholeFailure)
+        assertEquals(TopicAuthResolution.RESOLVED, snapshot.authResolution)
+        assertEquals(TopicControlState.IDLE, snapshot.controlState)
+        harness.cleanUp()
+    }
+
+    /**
+     * The refresh suspended, so what it returns is a new answer: refused, the recovery it would have completed is abandoned
+     * instead — `REFRESHING` gives way to the failure that started it — and nothing is replayed.
+     */
+    @Test
+    fun `a refresh result refused at application abandons its recovery and replays nothing`() = runTest {
+        val harness = Harness(this)
+        harness.refreshGateMillis = 1_000
+        harness.admission = {
+            if (harness.admissions.size == 1) TopicAnswerAdmission.Admitted(harness.clock.nowMillis())
+            else TopicAnswerAdmission.Denied(TopicAnswerDenial.ENDED_CONNECTION)
+        }
+        harness.build()
+        val run = harness.start()
+        advanceTimeBy(100)
+        harness.command.deliver(harness.error("r1", "invalid_token"))
+        advanceTimeBy(500)
+        assertEquals(TopicAuthResolution.REFRESHING, harness.store.snapshot.authResolution)
+
+        advanceUntilIdle()
+
+        assertEquals(
+            TopicAnswerDenial.ENDED_CONNECTION,
+            (run.thrown as TopicAnswerNotAdmittedException).reason
+        )
+        assertEquals(listOf(false, false), harness.admissions)
+        assertEquals("거절된 갱신 결과로 replay 했다", 1, harness.requests.size)
+        assertEquals(
+            "거절된 갱신이 복구를 끝낸 것으로 남았다",
+            TopicAuthResolution.FAILED,
+            harness.store.snapshot.authResolution
+        )
+        harness.cleanUp()
+    }
+
+    /**
+     * A command torn down as its refresh returns does not ask whether to apply the result.
+     *
+     * The refresh can return without suspending again, so the cancellation is not delivered by a resumption; it has to be
+     * read before the question. Asked anyway, a session's admission would drive the live identity for a command that is gone.
+     */
+    @Test
+    fun `a command cancelled as its refresh returns does not ask to apply the result`() = runTest {
+        val harness = Harness(this)
+        harness.build()
+        lateinit var run: Run
+        harness.onRefreshReturn = { run.job.cancel() }
+        run = harness.start()
+        advanceTimeBy(100)
+        harness.command.deliver(harness.error("r1", "invalid_token"))
+        advanceUntilIdle()
+
+        assertEquals("취소된 명령이 갱신 결과의 적용을 물었다", listOf(false), harness.admissions)
+        assertEquals(1, harness.requests.size)
+        assertEquals(TopicAuthResolution.FAILED, harness.store.snapshot.authResolution)
+        harness.cleanUp()
+    }
+
+    /** The premium exception is asked for exactly the refusals the session latches on: `premium_required`, for a topic this request sent. */
+    @Test
+    fun `the premium exception is asked only for a refusal of a topic this request sent`() = runTest {
+        listOf(
+            harnessAck(rejected = mapOf(USD to "premium_required"), active = emptyList()) to listOf(true),
+            harnessAck(rejected = mapOf(JPY to "premium_required"), active = listOf(USD)) to listOf(false),
+            harnessAck(rejected = mapOf(USD to "krx_entitlement_required"), active = emptyList()) to listOf(false)
+        ).forEach { (answer, expected) ->
+            val harness = Harness(this)
+            harness.build(TopicCommandPurpose.LEASE_RENEWAL)
+            harness.start()
+            advanceTimeBy(100)
+            harness.command.deliver(answer(harness))
+            advanceUntilIdle()
+            assertEquals(expected, harness.admissions)
+            harness.cleanUp()
+        }
+    }
+
+    private fun harnessAck(rejected: Map<String, String>, active: List<String>): (Harness) -> DecodedTopicFrame =
+        { harness -> harness.ack("r1", active = active, rejected = rejected) }
+
+    /**
+     * The acknowledgement carries the instant it was admitted at, not a second reading of the clock.
+     *
+     * Read inside the deadline and admitted past it: the deadline was judged on receipt and is not judged again, and the
+     * lease a session installs from this acknowledgement starts at the instant it was applied.
+     */
+    @Test
+    fun `an acknowledgement is stamped with the instant it was admitted at`() = runTest {
+        val harness = Harness(this)
+        harness.admission = { TopicAnswerAdmission.Admitted(ACK_TIMEOUT_MS + 1) }
+        harness.build(TopicCommandPurpose.LEASE_RENEWAL)
+        val run = harness.start()
+        advanceTimeBy(ACK_TIMEOUT_MS - 1)
+        harness.command.deliver(harness.ack("r1", active = listOf(USD), leaseSeconds = 900))
+        advanceTimeBy(1)
+
+        assertTrue(run.outcome is TopicCommandOutcome.Acknowledged)
+        assertEquals(ACK_TIMEOUT_MS + 1, harness.acknowledgements.single().second.acknowledgedAtMillis)
         harness.cleanUp()
     }
 }
