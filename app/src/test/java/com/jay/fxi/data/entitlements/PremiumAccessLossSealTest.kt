@@ -148,9 +148,11 @@ class PremiumAccessLossSealTest {
         var identity: EntitlementsIdentity? = EntitlementsIdentity(OWNER, 1L)
         var liveFence: AuthIdentityFence? = null
         var fetches = 0
+        val freshRequests = mutableListOf<Boolean>()
         var gate: CompletableDeferred<Unit>? = null
         override suspend fun fetch(freshPremium: Boolean): EntitlementsResult {
             fetches += 1
+            freshRequests += freshPremium
             val outcome = next()
             val owner = checkNotNull(identity)
             gate?.let { g -> gate = null; g.await() }
@@ -950,7 +952,7 @@ class PremiumAccessLossSealTest {
     }
 
     @Test
-    fun aForcePremiumInFlightDoesNotSuppressTheLossReapprovalSchedule() = sealTest {
+    fun aForcePremiumInFlightTakesTheLossReapproval_andWhenItsAnswerIsStaleTheReapprovalRuns() = sealTest {
         val h = granted()
         h.store.rotationFailures = 2
         h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
@@ -972,14 +974,136 @@ class PremiumAccessLossSealTest {
 
         assertNotEquals(capturedEpoch, h.store.record.userAccessEpoch)
         assertTrue("the old FP has not answered yet", !first.isCompleted)
-        assertEquals(
-            listOf(RefreshIntent.FORCE_PREMIUM),
-            h.reapprovals.map { it.first }
-        )
+        // S1r-2a §2.5: a premium query still running answers for the demand first, so nothing is armed or reported yet.
+        assertEquals(emptyList<Pair<RefreshIntent, Long>>(), h.reapprovals)
+        val fetches = h.source.fetches
 
-        // Its captured namespace is now stale. Actual re-query execution belongs to S1r-2a.
+        // Its captured namespace is now stale: its end arms the re-approval, which then runs.
         gate.complete(Unit)
         first.await()
+        runCurrent()
+        assertEquals(listOf(RefreshIntent.FORCE_PREMIUM), h.reapprovals.map { it.first })
+        settle()
+        assertEquals("the re-approval ran once", fetches + 1, h.source.fetches)
+        assertEquals(PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)
+    }
+
+    @Test
+    fun aScheduledPremiumQueryBeforeLossReapproval_rearmsAfterItsOwnStaleAnswer() = sealTest {
+        val h = granted()
+        h.store.rotationFailures = 2
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+
+        h.source.identity = EntitlementsIdentity(OWNER, 2L)
+        h.coordinator.onIdentityChanged(AuthIdentityFence(OWNER, 2L)).applied()
+        h.source.next = { EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 0) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+
+        val gate = CompletableDeferred<Unit>()
+        h.source.gate = gate
+        h.source.next = { active(krx = true) }
+        val capturedEpoch = h.store.record.userAccessEpoch
+        val beforeScheduled = h.source.fetches
+        runCurrent()
+        assertEquals(beforeScheduled + 1, h.source.fetches)
+        assertTrue(h.source.freshRequests.last())
+
+        advanceTimeBy(RETRY)
+        runCurrent()
+        assertNotEquals(capturedEpoch, h.store.record.userAccessEpoch)
+        assertEquals(emptyList<Pair<RefreshIntent, Long>>(), h.reapprovals)
+        val total = h.source.fetches
+
+        gate.complete(Unit)
+        runCurrent()
+        assertEquals(listOf(RefreshIntent.FORCE_PREMIUM), h.reapprovals.map { it.first })
+        settle()
+
+        assertEquals(total + 1, h.source.fetches)
+        assertTrue(h.source.freshRequests.last())
+        assertEquals(PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)
+    }
+
+    @Test
+    fun lossReapprovalWhileAuthStopped_upgradesTheIntentUsedByTheExistingEntitlementsTimer() = sealTest {
+        val h = granted()
+        h.store.rotationFailures = 2
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+
+        val retryGate = CompletableDeferred<Unit>()
+        h.source.gate = retryGate
+        h.source.next = { EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 60) }
+        val retry = async { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+
+        val authGate = CompletableDeferred<Unit>()
+        h.source.gate = authGate
+        h.source.next = { EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION) }
+        val auth = async { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+
+        retryGate.complete(Unit)
+        retry.await()
+        authGate.complete(Unit)
+        auth.await()
+        val total = h.source.fetches
+
+        advanceTimeBy(RETRY)
+        runCurrent()
+        assertEquals(total, h.source.fetches)
+        assertEquals(emptyList<Pair<RefreshIntent, Long>>(), h.reapprovals)
+
+        h.source.next = { active(krx = true) }
+        advanceTimeBy(60_000L - RETRY)
+        runCurrent()
+
+        assertEquals(total + 1, h.source.fetches)
+        assertTrue("the existing FE timer executes the current FP demand", h.source.freshRequests.last())
+        assertEquals(PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)
+    }
+
+    @Test
+    fun aQueryAfterRotationButBeforeReapproval_doesNotAnswerTheLaterIndependentDemand() = sealTest {
+        val h = granted()
+        h.store.rotationLandsThenThrows = 1
+        h.store.failTheReadBackOfALandedThrow = true
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+
+        h.store.loadFailures = 1
+        runCurrent()
+
+        h.source.next = { EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 0) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        val landedEpoch = h.store.record.userAccessEpoch
+
+        val gate = CompletableDeferred<Unit>()
+        h.source.gate = gate
+        h.source.next = { active(krx = true) }
+        val first = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        }
+        runCurrent()
+        assertTrue(!first.isCompleted)
+
+        advanceTimeBy(RETRY)
+        runCurrent()
+        assertEquals("the query already captured the landed namespace", landedEpoch, h.store.record.userAccessEpoch)
+        assertEquals(emptyList<Pair<RefreshIntent, Long>>(), h.reapprovals)
+        val total = h.source.fetches
+
+        gate.complete(Unit)
+        first.await()
+        runCurrent()
+        assertEquals(listOf(RefreshIntent.FORCE_PREMIUM), h.reapprovals.map { it.first })
+        settle()
+
+        assertEquals("the later independent demand still executes", total + 1, h.source.fetches)
+        assertEquals(PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)
     }
 
     private fun active(krx: Boolean) = EntitlementsOutcome.StableActive(krxVisible = krx)

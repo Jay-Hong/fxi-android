@@ -61,6 +61,8 @@ class PremiumAccessCoordinator(
      * suspension before that decision.
      */
     private val liveFence: () -> AuthIdentityFence?,
+    /** Test barrier before completion delivery, outside both locks. Production leaves it empty. */
+    private val beforeRecheckSettled: suspend (Long, Long) -> Unit = { _, _ -> },
     /** Observes a loss re-approval after the scheduler accepts it. */
     private val onLossReapprovalScheduled: (RefreshIntent, Long) -> Unit = { _, _ -> }
 ) {
@@ -77,6 +79,38 @@ class PremiumAccessCoordinator(
 
     /** A landed loss rotation whose journal is still to be handed to the purgers, or whose purge failed or threw. */
     private var lossCleanupOwed = false
+
+    /**
+     * The re-check the current binding still owes (S1r-2a). Kept apart from the schedule's timer, so a query that is dropped,
+     * goes stale or is cancelled, or an answer that clears the timer without answering the requirement, does not take the
+     * requirement with it. Guarded by [mutex].
+     */
+    private var recheckDemand: RecheckDemand? = null
+
+    /** One sequence for demands and query starts, so "started after the demand" can be compared. Guarded by [mutex]. */
+    private var nextOrderSeq: Long = 0L
+
+    /** Queries that have started and have not finished applying, by their start order. Guarded by [mutex]. */
+    private val inFlightQueries = HashMap<Long, InFlightQuery>()
+
+    internal data class RecheckDiagnostics(
+        val bindingEpoch: Long,
+        val registeredQueryCount: Int
+    )
+
+    /** Immutable diagnostic snapshot, including any registration incorrectly retained from an old binding. */
+    internal suspend fun recheckDiagnostics(): RecheckDiagnostics = mutex.withLock {
+        RecheckDiagnostics(probeEpoch, inFlightQueries.size)
+    }
+
+    /** An authentication answer stopped new automatic re-queries for this binding. Guarded by [mutex]. */
+    private var authStopped = false
+
+    /** The order of the event that last stopped or resumed [authStopped]; an answer that started earlier moves neither. */
+    private var authStateOrder: Long = 0L
+
+    /** A loss re-approval not yet reported through onLossReapprovalScheduled, because nothing could be armed for it yet. */
+    private var unreportedReapproval: RefreshIntent? = null
 
     private var lossRecoveryAttempts = 0
 
@@ -267,9 +301,15 @@ class PremiumAccessCoordinator(
     private val attemptSignal = MutableStateFlow(AttemptSignal(ticket = null, revision = 0L, held = false))
 
     private val schedule =
-        RecheckSchedule(scope, clock) { intent, origin, bindingEpoch ->
-            refresh(intent, origin, requireProbeEpoch = bindingEpoch)
-        }
+        RecheckSchedule(
+            scope,
+            clock,
+            onDue = { intent, origin, bindingEpoch -> refresh(intent, origin, requireProbeEpoch = bindingEpoch) },
+            onSettled = { bindingEpoch, revision ->
+                beforeRecheckSettled(bindingEpoch, revision)
+                onScheduleSettled(bindingEpoch, revision)
+            }
+        )
 
     /**
      * Binds the owner to the identity the caller **observed**, and resumes any purge a previous
@@ -700,6 +740,8 @@ class PremiumAccessCoordinator(
         // Read again after the last suspension: somebody may have signed in during cleanup.
         if (finishing && cleanup == CleanupOutcome.DONE && liveFence() == null) setAttemptLocked(null)
         setPendingLocked(null)
+        // Admission can reopen on the same binding here (a StartupPurge hold): what it owes is looked at again.
+        ensureDemandArmedLocked()
         return IdentityStep.Applied(completion)
     }
 
@@ -1099,6 +1141,7 @@ class PremiumAccessCoordinator(
             return barrierOutcome(BarrierStep.RECAPTURE)
         }
         setAttemptLocked(null)
+        ensureDemandArmedLocked()
         return barrierOutcome(BarrierStep.RELEASED, AccessDecisionGeneration(decisionGeneration))
     }
 
@@ -1106,6 +1149,7 @@ class PremiumAccessCoordinator(
         if (!cleanupLocked()) return barrierOutcome(BarrierStep.CLEANUP_FAILED)
         if (liveFence() != null) return barrierOutcome(BarrierStep.RECAPTURE)
         setAttemptLocked(null)
+        ensureDemandArmedLocked()
         return barrierOutcome(BarrierStep.RELEASED)
     }
 
@@ -1251,6 +1295,12 @@ class PremiumAccessCoordinator(
     private fun cancelProbeLocked() {
         probeEpoch += 1
         probeRunningForOwner = null
+        // A binding's re-check state and query registrations end with it (S1r-2a §2.1).
+        inFlightQueries.clear()
+        recheckDemand = null
+        authStopped = false
+        authStateOrder = 0L
+        unreportedReapproval = null
     }
 
     private data class ProbeRun(val owner: String, val epoch: Long)
@@ -1320,6 +1370,7 @@ class PremiumAccessCoordinator(
             // A retry that reads nothing owed finishes here, and this is what ends its hold: there is no
             // cleanup to run, which is the only other place a hold is cleared.
             setPendingLocked(null)
+            ensureDemandArmedLocked()
             return IdentityStep.Applied(completionFor(work))
         }
         unownedEditLocked(work, PendingEdit.UNVERIFIED_START, before = read) { store.retireUnverifiedStart() }
@@ -1356,6 +1407,7 @@ class PremiumAccessCoordinator(
         requireProbeEpoch: Long? = null
     ) {
         var token: Long? = null
+        var queryIntent = intent
         val started: StartedQuery = mutex.withLock {
             // First, ahead of the schedule and the store: an open sign-out admits no query at all.
             if (!accessAdmittedLocked()) return
@@ -1369,16 +1421,33 @@ class PremiumAccessCoordinator(
             ) {
                 return
             }
+            // A caller asking again is what resumes re-queries an authentication answer stopped, before the floor is
+            // consulted: a caller the floor holds back still gets its request armed below (S1r-2a §2.4).
+            if (origin == QueryOrigin.CALLER) resumeAfterAuthStopLocked()
+            if (origin == QueryOrigin.SCHEDULED) {
+                // A timer serves the demand: with nothing owed it asks nothing, it runs at the demand's current strength, and a
+                // query already running at that strength answers for it.
+                val demand = recheckDemand ?: return
+                queryIntent = maxOf(intent, demand.intent)
+                if (inFlightCoversLocked(probeEpoch, queryIntent)) return
+            }
             // Validate and defer under the same coordinator lock as identity teardown. A stale
             // queued lookup must not revive the floor's timer before its lifetime check runs.
             // Deferred callbacks carry this binding's probeEpoch back through the check above;
             // unlike decisionGeneration, it survives a live probe's StableInactive answers.
-            if (!schedule.shouldQuery(intent, origin)) {
-                schedule.deferUntilFloor(intent, bindingEpoch = probeEpoch)
+            val queryAt = clock.elapsedMillis()
+            if (!schedule.shouldQuery(queryIntent, origin, now = queryAt)) {
+                val heldByFloor = schedule.floorBlocksNow(now = queryAt)
+                schedule.deferUntilFloor(queryIntent, bindingEpoch = probeEpoch)
+                // The debounce alone is not a request; a floor holding a caller back is (S1r-2a §2.1).
+                if (heldByFloor) {
+                    raiseDemandLocked(queryIntent, independent = true)
+                    ensureDemandArmedLocked()
+                }
                 return
             }
             val record = store.load()
-            if (intent == RefreshIntent.FORCE_PREMIUM) {
+            if (queryIntent == RefreshIntent.FORCE_PREMIUM) {
                 // Owner-bound, not a global flag: an escalation still running for a signed-out
                 // user must not suppress the new user's first query.
                 if (forcePremiumToken != null && forcePremiumOwner == record.ownerUid) return
@@ -1387,9 +1456,26 @@ class PremiumAccessCoordinator(
                 forcePremiumOwner = record.ownerUid
             }
             schedule.recordQueryStarted()
-            StartedQuery(record.fence(), decisionGeneration, boundIdentityLocked())
+            val order = ++nextOrderSeq
+            inFlightQueries[order] = InFlightQuery(probeEpoch, queryIntent)
+            StartedQuery(record.fence(), decisionGeneration, boundIdentityLocked(), order, probeEpoch, queryIntent)
         }
 
+        try {
+            fetchAndApply(queryIntent, started) { token }
+        } finally {
+            // Around the fetch and the apply both, however they end: whatever this query was relied on to answer is looked at
+            // again once it cannot answer any more (S1r-2a §2.4).
+            withContext(NonCancellable) {
+                mutex.withLock {
+                    inFlightQueries.remove(started.order)
+                    if (started.binding == probeEpoch) ensureDemandArmedLocked()
+                }
+            }
+        }
+    }
+
+    private suspend fun fetchAndApply(intent: RefreshIntent, started: StartedQuery, token: () -> Long?) {
         val result = try {
             source.fetch(freshPremium = intent.canGrantPremium)
         } finally {
@@ -1399,7 +1485,7 @@ class PremiumAccessCoordinator(
             // suspends whenever anything else holds it, and a cancelled coroutine cannot suspend —
             // so without this a cancellation timed against any other coordinator call left the
             // token behind and wedged every later escalation for that owner.
-            token?.let { mine ->
+            token()?.let { mine ->
                 withContext(NonCancellable) {
                     mutex.withLock { if (forcePremiumToken == mine) clearForcePremiumLocked() }
                 }
@@ -1483,7 +1569,15 @@ class PremiumAccessCoordinator(
             if (boundIdentityLocked() != context.identity) return
             if (source.currentIdentity() != context.identity) return
             val decision = decideLocked(record, RefreshIntent.FORCE_ENTITLEMENTS, outcome)
-            scheduleRecheckLocked(decision.recheck)
+            // Not a query's answer, so it answers no demand; a re-check it asks for is a new requirement (S1r-2a §2.1).
+            val recheck = decision.recheck
+            if (recheck != null) {
+                raiseDemandLocked(recheck.intent, independent = true)
+                armRecheckLocked(recheck)
+            } else if (recheckDemand == null) {
+                schedule.cancel()
+            }
+            ensureDemandArmedLocked()
         }
     }
 
@@ -1513,8 +1607,19 @@ class PremiumAccessCoordinator(
          * the live one. The result would then be published carrying the `g1` the binding still
          * holds. Comparing against what was bound is what refuses it.
          */
-        val boundIdentity: EntitlementsIdentity?
+        val boundIdentity: EntitlementsIdentity?,
+        /** Start order, shared with demands (S1r-2a §2.2). */
+        val order: Long,
+        /** The [probeEpoch] this query started under. */
+        val binding: Long,
+        /** The intent it actually asked with. */
+        val intent: RefreshIntent
     )
+
+    /** What the current binding still owes: a query at least [intent] strong that starts after [raisedAt]. */
+    private data class RecheckDemand(val binding: Long, val intent: RefreshIntent, val raisedAt: Long)
+
+    private data class InFlightQuery(val binding: Long, val intent: RefreshIntent)
 
     private suspend fun apply(
         intent: RefreshIntent,
@@ -1568,28 +1673,126 @@ class PremiumAccessCoordinator(
                 }
             }
 
-            val recheck = if (decision != null) {
-                decision.recheck
+            if (decision != null) {
+                settleDemandLocked(started, outcome, decision.recheck)
             } else {
                 // Held back, not decided. The answer stays out of the state, but the query is
                 // retried at its own strength so an eventual identity reaches the same conclusion.
                 // The floor is the one the answer stated, falling back to the same default the
                 // reducer uses for an outcome it cannot settle — zero would re-query immediately
                 // inside a window the server had explicitly asked us to wait out.
-                RecheckRequest(
+                val retry = RecheckRequest(
                     intent,
                     minDelayMillis = outcome.statedRetryFloorMillis()
                         ?: PremiumAccessReducer.DEFAULT_BACKOFF_FLOOR_MILLIS
                 )
+                // The same requirement retried, not a new one.
+                raiseDemandLocked(retry.intent, independent = false)
+                armRecheckLocked(retry)
             }
-            scheduleRecheckLocked(recheck)
+            ensureDemandArmedLocked()
         }
     }
 
-    /** Arms [recheck] for this binding, or clears the schedule when there is none. Callers hold [mutex]. */
-    private suspend fun scheduleRecheckLocked(recheck: RecheckRequest?) {
-        if (recheck == null) schedule.cancel()
+    /**
+     * Updates the demand for a decided answer (S1r-2a §2.3) and acts on the schedule. Callers hold [mutex].
+     *
+     * Only an answer that started after the demand, asked at least as strongly and settled what the demand needs ends it.
+     * An answer that does not leaves the timer alone even when it asks for nothing more; its own re-check joins the demand
+     * as a retry. With no demand, or once it is answered, the schedule is armed or cleared as before.
+     */
+    private suspend fun settleDemandLocked(started: StartedQuery, outcome: EntitlementsOutcome, recheck: RecheckRequest?) {
+        val authentication =
+            outcome is EntitlementsOutcome.Indeterminate && outcome.reason == IndeterminateReason.AUTHENTICATION
+        if (started.order > authStateOrder) {
+            if (authentication) {
+                authStopped = true
+                authStateOrder = started.order
+            } else if (authStopped) {
+                authStopped = false
+                authStateOrder = started.order
+            }
+        }
+        val demand = recheckDemand
+        val answered = demand != null &&
+            started.binding == demand.binding &&
+            started.order > demand.raisedAt &&
+            started.intent >= demand.intent &&
+            outcome.settlesDemandFor(demand.intent)
+        if (demand == null || answered) {
+            recheckDemand = null
+            unreportedReapproval = null
+            if (recheck == null) {
+                schedule.cancel()
+            } else {
+                raiseDemandLocked(recheck.intent, independent = true)
+                armRecheckLocked(recheck)
+            }
+        } else if (recheck != null) {
+            raiseDemandLocked(recheck.intent, independent = false)
+            armRecheckLocked(recheck)
+        }
+    }
+
+    private fun EntitlementsOutcome.settlesDemandFor(demand: RefreshIntent): Boolean = when (this) {
+        is EntitlementsOutcome.StableActive, is EntitlementsOutcome.StableInactive, is EntitlementsOutcome.PremiumRequired -> true
+        // The premium axis is left as it was, so a premium demand is still owed.
+        is EntitlementsOutcome.KrxEntitlementRequired -> demand != RefreshIntent.FORCE_PREMIUM
+        else -> false
+    }
+
+    /**
+     * Records a demand for the current binding. A retry of the one owed keeps its order unless it asks more strongly; an
+     * independent event always takes a new one (S1r-2a §2.1). Callers hold [mutex].
+     */
+    private fun raiseDemandLocked(intent: RefreshIntent, independent: Boolean) {
+        val current = recheckDemand
+        recheckDemand = when {
+            current == null -> RecheckDemand(probeEpoch, intent, ++nextOrderSeq)
+            independent || intent > current.intent -> RecheckDemand(probeEpoch, maxOf(intent, current.intent), ++nextOrderSeq)
+            else -> current
+        }
+    }
+
+    /** Arms [recheck] as before, unless an authentication answer stopped re-queries: then only its floor is kept. */
+    private suspend fun armRecheckLocked(recheck: RecheckRequest) {
+        if (authStopped) schedule.recordFloorWithoutArming(recheck.minDelayMillis)
         else schedule.schedule(recheck, bindingEpoch = probeEpoch)
+    }
+
+    /**
+     * Makes sure something will run the owed demand, and arms a re-query only when nothing will (S1r-2a §2.4). Callers hold
+     * [mutex]; the schedule's lock is taken inside it, never the other way round, and no job is awaited.
+     */
+    private suspend fun ensureDemandArmedLocked() {
+        val demand = recheckDemand ?: return
+        if (demand.binding != probeEpoch || !accessAdmittedLocked() || authStopped) return
+        // A query at least as strong is still running, whenever it started: its end looks again.
+        if (inFlightCoversLocked(demand.binding, demand.intent)) return
+        if (!schedule.foldIntoUnfired(demand.intent)) {
+            schedule.schedule(RecheckRequest(demand.intent, minDelayMillis = 0L), bindingEpoch = demand.binding)
+        }
+        unreportedReapproval?.let { reapproval ->
+            unreportedReapproval = null
+            onLossReapprovalScheduled(reapproval, demand.binding)
+        }
+    }
+
+    private fun inFlightCoversLocked(binding: Long, intent: RefreshIntent): Boolean =
+        inFlightQueries.values.any { it.binding == binding && it.intent >= intent }
+
+    private fun resumeAfterAuthStopLocked() {
+        authStopped = false
+        authStateOrder = ++nextOrderSeq
+    }
+
+    /** A timer finished, fired or not. Only the latest arming of this binding looks again; later ones own what follows. */
+    private suspend fun onScheduleSettled(bindingEpoch: Long, revision: Long) {
+        mutex.withLock {
+            if (bindingEpoch != probeEpoch || schedule.revision != revision) return
+            if (scope.coroutineContext[Job]?.isActive == false) return
+            ensureDemandArmedLocked()
+        }
     }
 
     /**
@@ -1798,8 +2001,10 @@ class PremiumAccessCoordinator(
             lossSeals.takeReapproval(probeEpoch, _state.value.uid)?.let { axes ->
                 val intent =
                     if (PurgeScope.USER in axes) RefreshIntent.FORCE_PREMIUM else RefreshIntent.FORCE_ENTITLEMENTS
-                schedule.schedule(RecheckRequest(intent, minDelayMillis = 0L), bindingEpoch = probeEpoch)
-                onLossReapprovalScheduled(intent, probeEpoch)
+                // Handed to the demand before the next suspension; reported once something is armed for it (S1r-2a §2.5).
+                raiseDemandLocked(intent, independent = true)
+                unreportedReapproval = unreportedReapproval?.let { maxOf(it, intent) } ?: intent
+                ensureDemandArmedLocked()
             }
             if (lossCleanupOwed) lossCleanupOwed = !resumePendingPurgesLocked()
         } catch (failed: Exception) {

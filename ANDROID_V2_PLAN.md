@@ -21,8 +21,8 @@ S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반�
                                 **유예 사유는 셋이 서로 다르다** — purge는 대상이 아직 legacy rate/graph store,
                                 PushDelete는 **서버 D21 순서 계약 미결**, backup은 기존 사용자 설정의 restore 동작
                                 변경을 분리한 것. 이 기록은 완료 선언도, 후속 슬라이스로의 이관 승인도 아니다.
-                                명시적 거부 저장 실패의 S1 잔여는 S1r-1·S1r-2b가 land했고 S1r-2a·S1r-2c·봉인의
-                                process death 지속은 미충족이다(동결 후 8번 기록)
+                                명시적 거부 저장 실패의 S1 잔여 중 S1r-1·S1r-2b는 land했고, 이번 변경에 S1r-2a 구현을
+                                포함한다. S1r-2c·봉인과 재확인 요구의 process death 지속은 미충족이다(동결 후 8·9번 기록)
 S1.5 확인 필요                : presenter·순서/표시 설정·legacy bank store 삭제는 land. `RateSourceRegistry`와
                                 live/snapshot renderMode 등가까지 포함한 전체 DoD 충족은 미확인
 S2 미충족                     : D26 무료 알림 in-memory 미리보기 미구현 · 마지막 탭은 `(owner_uid, last_tab)` 한 쌍이라
@@ -213,6 +213,22 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > 레코드 필드가 불완전해 epoch 없이 할당된 경우의 null 대상 봉인 종료 규칙 / 실제 purger.
 > (4) 사실 정정: 3번 기록의 `PremiumAccessCoordinator.kt:18-27` 좌표는 코드 이동으로 PushDelete 유예 사유가 아닌 곳을
 > 가리키고 있어 "클래스 KDoc"으로 바꿨다.
+> 이 기록은 7번의 선행조건을 완화하지 않는다. 범위·D-결정·슬라이스 경계·게이트·DoD는 그대로이고 어떤 arming·rollout·deploy도
+> 열지 않는다.
+>
+> **동결 후 9번 비의미 상태 명확화 기록(2026-09-14, Claude·Codex 검토).** 8번 (3)이 미충족으로 적은 S1r-2a 구현을 이번 변경에 포함한다.
+> **이 구현은 선행조건 전체의 충족 선언이 아니다.** 재확인 요구(reducer의 재확인, 보류 답의 재시도, S1r-2b 손실 재승인, floor에 막힌 호출)를
+> 조회·타이머의 수명과 분리해 binding별로 보존한다. 요구보다 뒤에 시작한 같은 binding의 같거나 더 센 조회가 요구 축을 충족하는 정착 답으로
+> 결정됐을 때 요구를 끝낸다. FP single-flight 반환·stale 폐기·예약 교체·AUTHENTICATION 답·topic 거부 자체로는 요구가 사라지지 않는다(프로세스 안).
+> 인증 정지·재개는 마지막 상태 사건 순서보다 늦게 시작해 검증·결정된 답에만 반영한다. AUTHENTICATION 결정 답은 새 자동 재조회를 멈추고,
+> AUTHENTICATION 이외의 결정 답은 재개한다. admission·binding·generation 검사를 통과한 CALLER는 실제 fetch 여부와 무관하게
+> floor 검사 전에 재개 순서를 기록한다. 정지 시 이미 무장돼 남아 있는 타이머는 한 번 실행될 수 있다.
+> 8번 (3)의 null 대상 봉인 종료 규칙 미충족 표기는 정정한다. S1r-2b의 `LossSealLedger.observe`는 조건을 만족하는 신원 은퇴의 착지로,
+> `releaseByRotation`은 조건을 만족하며 정상 반환한 회전의 증거로 null 대상 봉인을 해제한다. 단순 epoch 할당은 명시적 null 대상 봉인의
+> 해제 근거가 아니다. 현재 레코드의 epoch 누락에 따른 접근 차단은 이 명시적 봉인과 별도로 판정한다.
+> 할당만 일어나고 덮는 journal 증거가 없으면 그 null 대상 봉인은 프로세스 안에서 유지된다(재시작 시 메모리와 함께 사라진다).
+> **미충족으로 남는 것**: 같은 binding에서 신원 사건 없이 credential만 회복될 때의 자동 재개(재개 신호가 없다) / S1r-2c /
+> 봉인과 재확인 요구의 process death 지속 / 실제 purger.
 > 이 기록은 7번의 선행조건을 완화하지 않는다. 범위·D-결정·슬라이스 경계·게이트·DoD는 그대로이고 어떤 arming·rollout·deploy도
 > 열지 않는다.
 

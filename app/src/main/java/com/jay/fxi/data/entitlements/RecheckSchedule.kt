@@ -1,11 +1,16 @@
 package com.jay.fxi.data.entitlements
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /** Monotonic time source, injected so tests do not depend on the wall clock. */
 fun interface RecheckClock {
@@ -36,10 +41,26 @@ enum class QueryOrigin {
 class RecheckSchedule(
     private val scope: CoroutineScope,
     private val clock: RecheckClock,
+    /**
+     * Called once a re-query armed by [schedule] has finished — fired or not, normally, by throwing or cancelled — outside
+     * this schedule's lock, with the binding and [revision] it was armed under. Not awaited by anyone who cancels it.
+     */
+    private val onSettled: suspend (bindingEpoch: Long, revision: Long) -> Unit = { _, _ -> },
+    /** Test barrier after the delay and before taking the fire lock. Production leaves it empty. */
+    private val beforeFire: suspend () -> Unit = {},
     private val onDue: suspend (intent: RefreshIntent, origin: QueryOrigin, bindingEpoch: Long) -> Unit
 ) {
     private val mutex = Mutex()
     private var pending: Job? = null
+
+    /** Whether [pending] has passed its delay and handed its intent to [onDue]. */
+    private var pendingFired = false
+
+    /** Moves with every arming, replacement and cancellation, so a late completion can tell it is no longer current. */
+    @Volatile
+    var revision: Long = 0L
+        private set
+
     private var pendingIntent: RefreshIntent? = null
     private var consecutiveAttempts = 0
     private var lastQueryAtMillis: Long? = null
@@ -64,14 +85,62 @@ class RecheckSchedule(
         val intent = strongest(pendingIntent, request.intent)
         pendingIntent = intent
         val delayMillis = (target - now).coerceAtLeast(0L)
-        pending = scope.launch {
-            if (delayMillis > 0) delay(delayMillis)
-            // Read at fire time, not launch time: a caller blocked by the floor in the meantime
-            // may have upgraded the queued mode.
-            // The epoch belongs to the binding that armed THIS callback. Never read a replacement
-            // binding's epoch at fire time; the coordinator revalidates this captured value there.
-            onDue(mutex.withLock { pendingIntent } ?: intent, QueryOrigin.SCHEDULED, bindingEpoch)
+        val armed = ++revision
+        pendingFired = false
+        // ATOMIC: an arming replaced or cancelled before it was dispatched still runs its finally, so every arming settles.
+        pending = scope.launch(start = CoroutineStart.ATOMIC) {
+            try {
+                currentCoroutineContext().ensureActive()
+                if (delayMillis > 0) delay(delayMillis)
+                beforeFire()
+                // Read at fire time, not launch time: a caller blocked by the floor in the meantime
+                // may have upgraded the queued mode. Marked fired under the same lock, so a fold after this
+                // point is known not to reach the query.
+                val due = mutex.withLock {
+                    if (revision != armed) return@launch
+                    pendingFired = true
+                    pendingIntent
+                } ?: intent
+                // The epoch belongs to the binding that armed THIS callback. Never read a replacement
+                // binding's epoch at fire time; the coordinator revalidates this captured value there.
+                onDue(due, QueryOrigin.SCHEDULED, bindingEpoch)
+            } finally {
+                withContext(NonCancellable) {
+                    // Only this arming's own reference is detached; intent, attempts and floor stay.
+                    mutex.withLock {
+                        if (revision == armed) {
+                            pending = null
+                            pendingFired = false
+                        }
+                    }
+                    onSettled(bindingEpoch, armed)
+                }
+            }
         }
+    }
+
+    /**
+     * Folds [intent] into a re-query that has not fired yet, as one step. False when there is none — nothing armed, or the
+     * armed one has already handed its intent to the query — and then nothing changes. Deadline and attempts never move.
+     */
+    suspend fun foldIntoUnfired(intent: RefreshIntent): Boolean = mutex.withLock {
+        if (pending == null || pendingFired) return false
+        pendingIntent = strongest(pendingIntent, intent)
+        true
+    }
+
+    /**
+     * Records a later floor without arming anything: at least [minDelayMillis] from now, never earlier than the floor already
+     * held. Whatever is armed is cancelled, fired or not, so it cannot run inside the new floor; intent and attempts stay for
+     * whoever arms next.
+     */
+    suspend fun recordFloorWithoutArming(minDelayMillis: Long) = mutex.withLock {
+        pending?.cancel()
+        pending = null
+        pendingFired = false
+        revision += 1
+        val floor = clock.elapsedMillis() + minDelayMillis
+        earliestAllowedAtMillis = maxOf(floor, earliestAllowedAtMillis ?: Long.MIN_VALUE)
     }
 
     /**
@@ -84,6 +153,8 @@ class RecheckSchedule(
     suspend fun cancel(preserveServerFloor: Boolean = false) = mutex.withLock {
         pending?.cancel()
         pending = null
+        pendingFired = false
+        revision += 1
         pendingIntent = null
         consecutiveAttempts = 0
         // A settled outcome retires the floor with the request that earned it. An *identity*
@@ -104,8 +175,11 @@ class RecheckSchedule(
      *    not a permission TTL, and a [QueryOrigin.SCHEDULED] retry is exempt because it already
      *    waited out its own floor.
      */
-    fun shouldQuery(intent: RefreshIntent, origin: QueryOrigin): Boolean {
-        val now = clock.elapsedMillis()
+    fun shouldQuery(
+        intent: RefreshIntent,
+        origin: QueryOrigin,
+        now: Long = clock.elapsedMillis()
+    ): Boolean {
         if (origin == QueryOrigin.CALLER) {
             earliestAllowedAtMillis?.let { if (now < it) return false }
         }
@@ -154,6 +228,12 @@ class RecheckSchedule(
             ),
             bindingEpoch
         )
+    }
+
+    /** Whether a caller refused by [shouldQuery] was held back by the server floor, not only by the debounce. */
+    fun floorBlocksNow(now: Long = clock.elapsedMillis()): Boolean {
+        val floor = earliestAllowedAtMillis ?: return false
+        return now < floor
     }
 
     fun recordQueryStarted() {

@@ -411,4 +411,224 @@ class RecheckScheduleTest {
             fired += testScheduler.currentTime
             firedIntents += intent
         }
+
+    // --- S1r-2a: fired state, completion and floor-only recording ---------------------------------------------------------
+
+    @Test
+    fun aCancellationAfterTheDelay_cannotDeliverTheOldCallbackInsideANewerFloor() = runTest {
+        val reachedFireLock = CompletableDeferred<Unit>()
+        val releaseFireLock = CompletableDeferred<Unit>()
+        val fired = mutableListOf<Long>()
+        var first = true
+        val schedule = RecheckSchedule(
+            testScope(),
+            { testScheduler.currentTime },
+            beforeFire = {
+                if (first) {
+                    first = false
+                    // Models preemption after delay returned. Cancellation must not turn this
+                    // test barrier into an extra cancellation check before the fire lock.
+                    withContext(NonCancellable) {
+                        reachedFireLock.complete(Unit)
+                        releaseFireLock.await()
+                    }
+                }
+            }
+        ) { _, _, _ ->
+            fired += testScheduler.currentTime
+        }
+        try {
+            schedule.schedule(
+                RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 1_000L),
+                bindingEpoch = 7L
+            )
+            advanceTimeBy(1_000L)
+            runCurrent()
+            assertTrue(reachedFireLock.isCompleted)
+
+            schedule.recordFloorWithoutArming(minDelayMillis = 60_000L)
+            releaseFireLock.complete(Unit)
+            runCurrent()
+            assertEquals(
+                "the cancelled old callback did not cross the new floor",
+                emptyList<Long>(),
+                fired
+            )
+
+            val expected = testScheduler.currentTime + 60_000L
+            schedule.schedule(
+                RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 0L),
+                bindingEpoch = 7L
+            )
+            advanceTimeBy(59_999L)
+            runCurrent()
+            assertEquals(emptyList<Long>(), fired)
+
+            advanceTimeBy(1L)
+            runCurrent()
+            assertEquals(listOf(expected), fired)
+        } finally {
+            releaseFireLock.complete(Unit)
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun foldIntoUnfired_reachesATimerThatHasNotFired_andIsRefusedOnceItHas() = runTest {
+        val fired = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val intents = mutableListOf<RefreshIntent>()
+        val schedule = RecheckSchedule(CoroutineScope(processJob + StandardTestDispatcher(testScheduler)), { testScheduler.currentTime }) { intent, _, _ ->
+            intents += intent
+            fired.complete(Unit)
+            release.await()
+        }
+        try {
+            schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 1_000L), bindingEpoch = 1L)
+            assertTrue("not fired yet", schedule.foldIntoUnfired(RefreshIntent.FORCE_ENTITLEMENTS))
+            advanceTimeBy(1_001L)
+            runCurrent()
+            assertTrue(fired.isCompleted)
+            assertEquals(listOf(RefreshIntent.FORCE_ENTITLEMENTS), intents)
+            assertFalse("a fired timer takes no fold", schedule.foldIntoUnfired(RefreshIntent.FORCE_PREMIUM))
+        } finally {
+            release.complete(Unit)
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun onSettled_reportsEachArmingOnce_withItsRevision_whetherItFired_wasReplaced_orWasCancelled() = runTest {
+        val settled = mutableListOf<Pair<Long, Long>>()
+        val schedule = RecheckSchedule(
+            CoroutineScope(processJob + StandardTestDispatcher(testScheduler)),
+            { testScheduler.currentTime },
+            onSettled = { binding, revision -> settled += binding to revision }
+        ) { _, _, _ -> }
+        try {
+            schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 1_000L), bindingEpoch = 7L)
+            val first = schedule.revision
+            schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 1_000L), bindingEpoch = 7L)
+            val second = schedule.revision
+            runCurrent()
+            assertEquals("the replaced arming settled, unfired", listOf(7L to first), settled)
+
+            advanceTimeBy(60_000L)
+            runCurrent()
+            assertEquals(listOf(7L to first, 7L to second), settled)
+            assertEquals("a fired arming that settled is still the latest", second, schedule.revision)
+
+            schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 1_000L), bindingEpoch = 8L)
+            val third = schedule.revision
+            schedule.cancel()
+            runCurrent()
+            assertEquals(8L to third, settled.last())
+            assertTrue("cancelling moved the revision past it", schedule.revision > third)
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun recordFloorWithoutArming_cancelsWhatIsArmed_neverShortensTheFloor_andKeepsTheIntentForTheNextArming() = runTest {
+        val fired = mutableListOf<Pair<Long, RefreshIntent>>()
+        val schedule = RecheckSchedule(CoroutineScope(processJob + StandardTestDispatcher(testScheduler)), { testScheduler.currentTime }) { intent, _, _ ->
+            fired += testScheduler.currentTime to intent
+        }
+        try {
+            schedule.schedule(RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 30_000L), bindingEpoch = 1L)
+            schedule.recordFloorWithoutArming(minDelayMillis = 10_000L)
+            advanceTimeBy(15_000L)
+            runCurrent()
+            assertTrue("the 30s floor was not shortened to 10s", schedule.floorBlocksNow())
+            advanceTimeBy(105_000L)
+            runCurrent()
+            assertEquals("nothing armed any more", emptyList<Pair<Long, RefreshIntent>>(), fired)
+
+            val now = testScheduler.currentTime
+            schedule.recordFloorWithoutArming(minDelayMillis = 45_000L)
+            schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 0L), bindingEpoch = 1L)
+            advanceTimeBy(45_000L)
+            runCurrent()
+            assertEquals("fired at the recorded floor, with the premium intent kept", listOf(now + 45_000L to RefreshIntent.FORCE_PREMIUM), fired)
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun recordFloorWithoutArming_cancelsATimerThatHasAlreadyFired() = runTest {
+        val started = CompletableDeferred<Unit>()
+        val never = CompletableDeferred<Unit>()
+        var cancelled = false
+        val schedule = RecheckSchedule(CoroutineScope(processJob + StandardTestDispatcher(testScheduler)), { testScheduler.currentTime }) { _, _, _ ->
+            started.complete(Unit)
+            try {
+                never.await()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                cancelled = true
+                throw e
+            }
+        }
+        try {
+            schedule.schedule(RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 0L), bindingEpoch = 1L)
+            runCurrent()
+            assertTrue(started.isCompleted)
+            schedule.recordFloorWithoutArming(minDelayMillis = 10_000L)
+            runCurrent()
+            assertTrue("the running re-query does not run on inside the new floor", cancelled)
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun aReplacedArmingThatSettlesLate_leavesItsSuccessorCancellable() = runTest {
+        val fired = mutableListOf<Long>()
+        val schedule = RecheckSchedule(CoroutineScope(processJob + StandardTestDispatcher(testScheduler)), { testScheduler.currentTime }) { _, _, _ ->
+            fired += testScheduler.currentTime
+        }
+        try {
+            schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 10_000L), bindingEpoch = 1L)
+            schedule.schedule(RecheckRequest(RefreshIntent.IF_STALE, minDelayMillis = 10_000L), bindingEpoch = 1L)
+            runCurrent()
+            assertTrue(
+                "late cleanup did not detach the successor: it still accepts a pending upgrade",
+                schedule.foldIntoUnfired(RefreshIntent.FORCE_PREMIUM)
+            )
+            schedule.cancel()
+            advanceTimeBy(60_000L)
+            runCurrent()
+            assertEquals("the successor was still the one cancel reached", emptyList<Long>(), fired)
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    @Test
+    fun anAtomicZeroDelayArmingCancelledBeforeDispatch_settlesWithoutCallingOnDue() = runTest {
+        val fired = mutableListOf<Long>()
+        val settled = mutableListOf<Pair<Long, Long>>()
+        val schedule = RecheckSchedule(
+            testScope(),
+            { testScheduler.currentTime },
+            onSettled = { binding, revision -> settled += binding to revision }
+        ) { _, _, _ ->
+            fired += testScheduler.currentTime
+        }
+        try {
+            schedule.schedule(
+                RecheckRequest(RefreshIntent.FORCE_PREMIUM, minDelayMillis = 0L),
+                bindingEpoch = 7L
+            )
+            val revision = schedule.revision
+            processJob.cancel()
+            runCurrent()
+
+            assertEquals(emptyList<Long>(), fired)
+            assertEquals(listOf(7L to revision), settled)
+        } finally {
+            processJob.cancel()
+        }
+    }
 }
