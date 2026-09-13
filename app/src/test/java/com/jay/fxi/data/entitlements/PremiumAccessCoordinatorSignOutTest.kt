@@ -1,6 +1,7 @@
 package com.jay.fxi.data.entitlements
 
 import com.jay.fxi.data.auth.AuthIdentityFence
+import com.jay.fxi.domain.model.TopicRejectionReason
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -333,7 +334,10 @@ class PremiumAccessCoordinatorSignOutTest {
     @Test
     fun anOpenAttemptRejectsRefreshProbeAndTopicBeforeSideEffects() = runTest {
         val h = harness()
-        h.coordinator.onIdentityChanged(a7)
+        // A real grant and its topic token, taken before the seal: a refusal for a grant that was
+        // never issued would be refused for that reason, and would say nothing about the seal.
+        premiumFor(h, a7)
+        val grant = checkNotNull(h.coordinator.topicGrant()).grant
         assertTrue(h.coordinator.prepareSignOut(a7) is SignOutStart.Armed)
         val fetchesBefore = h.fetches()
         val loadsBefore = h.store.loads
@@ -341,7 +345,7 @@ class PremiumAccessCoordinatorSignOutTest {
 
         h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         h.coordinator.onLocalPremiumSignal()
-        h.coordinator.onTopicRejected(TopicRejection.PREMIUM_REQUIRED)
+        h.coordinator.onTopicRejected(grant, listOf(TopicRejectionReason.PREMIUM_REQUIRED))
         advanceUntilIdle()
 
         assertEquals("봉인 중에 조회가 나갔다", fetchesBefore, h.fetches())
@@ -1234,6 +1238,24 @@ class PremiumAccessCoordinatorSignOutTest {
         h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
         assertEquals("보류가 풀렸는데도 질의가 막혔다", fetches + 1, h.fetches())
+    }
+
+    /** The same rule for the topic side: no grant is issued while a hold stands, and none is acted on. */
+    @Test
+    fun aHeldEditIssuesNoTopicGrantAndAppliesNoRefusal() = runTest {
+        val h = harness()
+        premiumFor(h, a7)
+        val grant = checkNotNull(h.coordinator.topicGrant()).grant
+        holdABind(h)
+        val recordBefore = h.store.record
+        val stateBefore = h.coordinator.state.value
+
+        assertNull("보류 중에 topic grant 가 나왔다", h.coordinator.topicGrant())
+        h.coordinator.onTopicRejected(grant, listOf(TopicRejectionReason.PREMIUM_REQUIRED))
+        advanceUntilIdle()
+
+        assertEquals(recordBefore, h.store.record)
+        assertEquals(stateBefore, h.coordinator.state.value)
     }
 
     @Test

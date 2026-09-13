@@ -1,6 +1,9 @@
 package com.jay.fxi.data.entitlements
 
 import com.jay.fxi.data.auth.AuthIdentityFence
+import com.jay.fxi.data.remote.TopicGrantToken
+import com.jay.fxi.data.remote.TopicSessionFence
+import com.jay.fxi.domain.model.TopicRejectionReason
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
@@ -106,6 +109,15 @@ class PremiumAccessCoordinator(
 
     /** The owner a probe is currently running for, or null. Single-flight, iOS parity. */
     private var probeRunningForOwner: String? = null
+
+    /**
+     * The grant last issued to a topic session by [topicGrant], or null. Guarded by [mutex].
+     *
+     * Only the latest is kept. An older token is not a grant anyone may still act for — it either
+     * named the same context (and was re-issued as itself) or a context that has since moved.
+     */
+    private var issuedTopicGrant: IssuedTopicGrant? = null
+    private var nextTopicGrant: Long = 0L
 
     /** The open app sign-out, or null. Guarded by [mutex]; transitions come from [SignOutAttemptPolicy]. */
     private var attempt: SignOutAttempt? = null
@@ -1375,19 +1387,73 @@ class PremiumAccessCoordinator(
         }
     }
 
-    /** Feeds a WebSocket topic rejection into the same reducer. Not produced by the REST path. */
-    suspend fun onTopicRejected(code: TopicRejection) {
-        val started = mutex.withLock {
-            if (!accessAdmittedLocked()) return
-            StartedQuery(store.load().fence(), decisionGeneration, boundIdentityLocked())
-        }
-        val outcome = when (code) {
+    /**
+     * The fence a topic session may run under right now, or null when no premium grant stands.
+     *
+     * Issued only while access is admitted, the state is [PremiumAccessState.PremiumConfirmed], a
+     * binding exists, the record on disk is owned by that binding and the live identity is that
+     * binding — all read under one lock hold. The context it names is the binding, the record's
+     * three-part fence and [decisionGeneration]; asking again while that context holds returns the
+     * **same** token, and a changed context — a KRX rotation alone included — gets a new one.
+     *
+     * A read that throws or is cancelled issues nothing and leaves the previous grant as it was.
+     *
+     * Wiring this to a session's `setAccess` is not done here.
+     */
+    internal suspend fun topicGrant(): TopicSessionFence? = mutex.withLock {
+        if (!accessAdmittedLocked()) return@withLock null
+        if (_state.value.state != PremiumAccessState.PremiumConfirmed) return@withLock null
+        val bound = boundIdentityLocked() ?: return@withLock null
+        val record = store.load()
+        if (record.ownerUid != bound.ownerUid) return@withLock null
+        if (source.currentIdentity() != bound) return@withLock null
+        val context = TopicGrantContext(bound, record.fence(), decisionGeneration)
+        val issued = issuedTopicGrant?.takeIf { it.context == context }
+            ?: IssuedTopicGrant(TopicGrantToken(++nextTopicGrant), context).also { issuedTopicGrant = it }
+        TopicSessionFence(
+            identity = AuthIdentityFence(bound.ownerUid, bound.authGeneration),
+            userAccessEpoch = record.userAccessEpoch,
+            grant = issued.token
+        )
+    }
+
+    /**
+     * Feeds one acknowledgement's WebSocket refusals into the reducer, for the grant they answered.
+     *
+     * [grant] is the token on the fence of the connection that was refused, as that connection was
+     * opened — not the session's current one. [reasons] is the acknowledgement's whole set, collapsed
+     * by [TopicRejection.of] into at most one decision; reasons that are not about access reach
+     * neither the reducer nor the schedule.
+     *
+     * The refusal is applied only if, under one lock hold and in this order: [grant] is the grant
+     * last issued, access is admitted, the decision generation is still the one it was issued at,
+     * the record's fence is unchanged, the binding is the same and the live identity is still that
+     * binding. Matching the token is necessary and not sufficient — the context behind it can have
+     * moved without anyone asking for a new grant.
+     *
+     * Anything else discards it: no state, rotation, purge or schedule change, not even a
+     * cancellation, because whatever is scheduled belongs to a later event. A live identity that
+     * cannot be read discards it too, and that says nothing about a sign-out having happened.
+     *
+     * Throws what the record or identity read throws, before the reducer runs, and what persisting
+     * a rotation throws — in which case nothing is published and the previous state stands.
+     */
+    internal suspend fun onTopicRejected(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) {
+        val outcome = when (TopicRejection.of(reasons) ?: return) {
             TopicRejection.PREMIUM_REQUIRED -> EntitlementsOutcome.PremiumRequired
             TopicRejection.KRX_ENTITLEMENT_REQUIRED -> EntitlementsOutcome.KrxEntitlementRequired
         }
-        // The rejection concerns the session the coordinator already owns, and the namespace fence
-        // covers that. There is no separate transport identity to match against.
-        apply(RefreshIntent.FORCE_ENTITLEMENTS, outcome, answeredAs = null, started = started)
+        mutex.withLock {
+            val context = issuedTopicGrant?.takeIf { it.token == grant }?.context ?: return
+            if (!accessAdmittedLocked()) return
+            if (context.generation != decisionGeneration) return
+            val record = store.load()
+            if (record.fence() != context.access) return
+            if (boundIdentityLocked() != context.identity) return
+            if (source.currentIdentity() != context.identity) return
+            val decision = decideLocked(record, RefreshIntent.FORCE_ENTITLEMENTS, outcome)
+            scheduleRecheckLocked(decision.recheck)
+        }
     }
 
     /** The session the published binding is standing on, or null before anything is bound. */
@@ -1485,9 +1551,14 @@ class PremiumAccessCoordinator(
                         ?: PremiumAccessReducer.DEFAULT_BACKOFF_FLOOR_MILLIS
                 )
             }
-            if (recheck == null) schedule.cancel()
-            else schedule.schedule(recheck, bindingEpoch = probeEpoch)
+            scheduleRecheckLocked(recheck)
         }
+    }
+
+    /** Arms [recheck] for this binding, or clears the schedule when there is none. Callers hold [mutex]. */
+    private suspend fun scheduleRecheckLocked(recheck: RecheckRequest?) {
+        if (recheck == null) schedule.cancel()
+        else schedule.schedule(recheck, bindingEpoch = probeEpoch)
     }
 
     /** Reduce, persist, publish. Callers must hold [mutex] — hence the `Locked` suffix. */
@@ -1605,5 +1676,32 @@ fun interface ProbeJitter {
     }
 }
 
-/** WebSocket topic rejection codes (`app/topic_wire.py`). Fed in by a later WS slice. */
-enum class TopicRejection { PREMIUM_REQUIRED, KRX_ENTITLEMENT_REQUIRED }
+/** WebSocket topic rejection codes (`app/topic_wire.py`) that are about access. Not wired to a session yet. */
+enum class TopicRejection {
+    PREMIUM_REQUIRED,
+    KRX_ENTITLEMENT_REQUIRED;
+
+    companion object {
+        /**
+         * One acknowledgement's refusals as one access event, independent of order and repeats.
+         *
+         * Premium wins. Applying a KRX refusal first could rotate the capability epoch and turn the
+         * premium refusal that came with it into a stale one; a premium refusal already covers both
+         * axes. Reasons that are not about access give null.
+         */
+        fun of(reasons: Collection<TopicRejectionReason>): TopicRejection? = when {
+            TopicRejectionReason.PREMIUM_REQUIRED in reasons -> PREMIUM_REQUIRED
+            TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED in reasons -> KRX_ENTITLEMENT_REQUIRED
+            else -> null
+        }
+    }
+}
+
+/** What a topic grant was issued for: the binding, the record's fence, and the decision generation. */
+private data class TopicGrantContext(
+    val identity: EntitlementsIdentity,
+    val access: AccessFence,
+    val generation: Long
+)
+
+private data class IssuedTopicGrant(val token: TopicGrantToken, val context: TopicGrantContext)

@@ -3,6 +3,23 @@ package com.jay.fxi.data.remote
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
+import com.jay.fxi.data.entitlements.AccessEpochRecord
+import com.jay.fxi.data.entitlements.AccessEpochStore
+import com.jay.fxi.data.entitlements.AccessEpochTransitions
+import com.jay.fxi.data.entitlements.EntitlementsIdentity
+import com.jay.fxi.data.entitlements.EntitlementsOutcome
+import com.jay.fxi.data.entitlements.EntitlementsResult
+import com.jay.fxi.data.entitlements.EntitlementsSource
+import com.jay.fxi.data.entitlements.EpochIdGenerator
+import com.jay.fxi.data.entitlements.PendingPurge
+import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
+import com.jay.fxi.data.entitlements.PremiumAccessState
+import com.jay.fxi.data.entitlements.ProbeJitter
+import com.jay.fxi.data.entitlements.CapabilityScopePurger
+import com.jay.fxi.data.entitlements.PurgeNamespace
+import com.jay.fxi.data.entitlements.PurgeResult
+import com.jay.fxi.data.entitlements.UserScopePurger
+import com.jay.fxi.data.entitlements.RefreshIntent
 import com.jay.fxi.data.remote.dto.SubscriptionAck
 import com.jay.fxi.data.remote.dto.SubscriptionAckTopic
 import com.jay.fxi.data.remote.dto.SubscriptionRejection
@@ -19,6 +36,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
@@ -54,8 +72,8 @@ class TopicSessionCoordinatorTest {
         const val USD = "fx:usd-krw"
         val STABILITY_MS = 30_000L
         val PING_MS = 30_000L
-        fun fence(uid: String = "u1", generation: Long = 1L, epoch: String = "epoch-1") =
-            TopicSessionFence(AuthIdentityFence(uid, generation), epoch)
+        fun fence(uid: String = "u1", generation: Long = 1L, epoch: String = "epoch-1", grant: Long = 1L) =
+            TopicSessionFence(AuthIdentityFence(uid, generation), epoch, TopicGrantToken(grant))
     }
 
     /** One connection's socket, and the listener the coordinator's transport installed on it. */
@@ -194,6 +212,13 @@ class TopicSessionCoordinatorTest {
         var failNextConnect = false
         val requests = mutableListOf<TopicSubscribeRequest>()
         val rejected = mutableListOf<Map<String, TopicRejectionReason>>()
+
+        /** The fence each refusal was handed back with, and whether its socket had already gone. */
+        val rejectedOwners = mutableListOf<TopicSessionFence>()
+        val socketGoneAtRefusal = mutableListOf<Boolean>()
+
+        /** Where a test sends each refusal on, the way runtime wiring would. Recorded above either way. */
+        var refusalSink: ((TopicSessionFence, Map<String, TopicRejectionReason>) -> Unit)? = null
         val undecodable = mutableListOf<Pair<Int, String>>()
         var jitterUnit = 0.0
         var clockSkewMillis = 0L
@@ -247,7 +272,12 @@ class TopicSessionCoordinatorTest {
             jitter = { jitterUnit },
             liveIdentity = { liveIdentityReads++; liveFence },
             onBootstrapHttpEvidence = { status, retryAfter -> bootstrapEvidence += status to retryAfter },
-            onRejected = { rejected += it },
+            onRejected = { owner, reasons ->
+                rejected += reasons
+                rejectedOwners += owner
+                socketGoneAtRefusal += wires.last().cancelled
+                refusalSink?.invoke(owner, reasons)
+            },
             onAcknowledgement = {
                 acknowledgements += it
                 acknowledgementFailure?.let { failure -> throw failure }
@@ -698,6 +728,241 @@ class TopicSessionCoordinatorTest {
         assertEquals(
             listOf(mapOf(USD to TopicRejectionReason.PREMIUM_REQUIRED)),
             h.rejected
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * The refusal goes back with the grant its connection was opened under, after that
+     * connection has already ended itself.
+     *
+     * A `premium_required` refusal tears the connection down before anyone is told. Reading the
+     * owner from the session at that point would name whatever is current, which is exactly the
+     * thing a consumer has to be able to tell apart from the grant that was refused.
+     */
+    @Test
+    fun `a refusal is handed back with its connection's grant after that connection has ended`() = runTest {
+        val h = Harness(this)
+        h.coordinator.start()
+        h.setAccess(true, fence(grant = 7L))
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+
+        h.wire.deliver(
+            h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required"))
+        )
+        advanceTimeBy(1)
+
+        assertEquals("거부가 연결의 grant 가 아닌 것을 들고 왔다", listOf(fence(grant = 7L)), h.rejectedOwners)
+        assertEquals("거부를 넘길 때 연결이 아직 살아 있었다", listOf(true), h.socketGoneAtRefusal)
+        h.cleanUp()
+    }
+
+    /** The access side of these tests, in memory, issuing grants for the harness's own account `u1`/1. */
+    private class Issuer(test: TestScope, h: Harness) {
+        private var n = 0
+        val ids = EpochIdGenerator { "issuer-${n++}" }
+        var record = AccessEpochRecord()
+        val store = object : AccessEpochStore {
+            override suspend fun load() = record
+            override suspend fun bindOwner(uid: String) = AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
+            override suspend fun signOut() = AccessEpochTransitions.signOut(record, ids).also { record = it }
+            override suspend fun retireUnverifiedStart() =
+                AccessEpochTransitions.retireUnverifiedStart(record, ids).also { record = it }
+            override suspend fun beginSignOut(uid: String) = AccessEpochTransitions.beginSignOut(record, uid).also { record = it }
+            override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean) =
+                AccessEpochTransitions.rotate(record, rotateUser, rotateKrx, ids).also { record = it }
+            override suspend fun completePurges(completed: Collection<PendingPurge>) =
+                AccessEpochTransitions.completePurges(record, completed).also { record = it }
+            override suspend fun markMayContainData(premium: Boolean, krx: Boolean) =
+                AccessEpochTransitions.markMayContainData(record, premium, krx).also { record = it }
+        }
+        private val purger = object : UserScopePurger, CapabilityScopePurger {
+            override suspend fun purgeUserScope(namespace: PurgeNamespace) = PurgeResult.Completed
+            override suspend fun purgeCapabilityScope(namespace: PurgeNamespace) = PurgeResult.Completed
+        }
+        val premium = PremiumAccessCoordinator(
+            source = object : EntitlementsSource {
+                override suspend fun fetch(freshPremium: Boolean): EntitlementsResult = EntitlementsResult.Answered(
+                    EntitlementsIdentity("u1", 1L),
+                    EntitlementsOutcome.StableActive(krxVisible = false)
+                )
+                override suspend fun currentIdentity() = EntitlementsIdentity("u1", 1L)
+            },
+            store = store,
+            userPurger = purger,
+            capabilityPurger = purger,
+            scope = h.scope,
+            clock = { test.testScheduler.currentTime },
+            jitter = ProbeJitter.None,
+            liveFence = { AuthIdentityFence("u1", 1L) }
+        )
+
+        init {
+            // What runtime wiring would do with a refusal: hand the grant it answered to the issuer.
+            h.refusalSink = { owner, reasons -> h.scope.launch { premium.onTopicRejected(owner.grant, reasons.values) } }
+        }
+
+        /** Binds `u1`/1, confirms premium, and returns the fence a session may run under. */
+        suspend fun grant(): TopicSessionFence {
+            premium.onIdentityChanged(AuthIdentityFence("u1", 1L))
+            premium.refresh(RefreshIntent.FORCE_PREMIUM)
+            return checkNotNull(premium.topicGrant()) { "no grant was issued" }
+        }
+    }
+
+    private suspend fun TestScope.refusedUnder(h: Harness, issued: TopicSessionFence) {
+        h.coordinator.start()
+        h.setAccess(true, issued)
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+    }
+
+    /** Joined end to end: a refusal on a connection opened under an issued grant is applied by the issuer. */
+    @Test
+    fun `a refusal for the grant a connection was opened under is applied by the issuer`() = runTest {
+        val h = Harness(this)
+        val issuer = Issuer(this, h)
+        val issued = issuer.grant()
+        assertEquals(PremiumAccessState.PremiumConfirmed, issuer.premium.state.value.state)
+        refusedUnder(h, issued)
+
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+
+        assertEquals("발급한 grant 의 거부가 적용되지 않았다", PremiumAccessState.Rejected, issuer.premium.state.value.state)
+        h.cleanUp()
+    }
+
+    /** The same refusal, after the grant's context moved without anyone asking for a new grant, is discarded. */
+    @Test
+    fun `a refusal arriving after its grant's context moved is discarded by the issuer`() = runTest {
+        val h = Harness(this)
+        val issuer = Issuer(this, h)
+        val issued = issuer.grant()
+        refusedUnder(h, issued)
+
+        issuer.record = AccessEpochTransitions.rotate(issuer.record, rotateUser = true, rotateKrx = false, ids = issuer.ids)
+        val moved = issuer.record
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+
+        assertEquals(1, h.rejectedOwners.size)
+        assertEquals("문맥이 바뀐 뒤의 거부가 적용됐다", PremiumAccessState.PremiumConfirmed, issuer.premium.state.value.state)
+        assertEquals(moved, issuer.record)
+        h.cleanUp()
+    }
+
+    /** A fence that differs only in its grant is a different session, with everything that implies. */
+    @Test
+    fun `a grant that differs only in its token drops the socket and the prices`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertEquals(1, h.coordinator.rates.value.quotes.size)
+
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(1)
+        assertTrue("앞 grant 의 소켓이 살아 있다", h.wires[0].cancelled)
+        assertEquals("앞 grant 의 시세가 남았다", 0, h.coordinator.rates.value.quotes.size)
+        assertEquals(0L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+
+        advanceTimeBy(100)
+        assertEquals(2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** The refusal latch is the refused grant's, so a new token for the same account asks again. */
+    @Test
+    fun `a refused session connects again only once its grant token changes`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(
+            h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required"))
+        )
+        advanceTimeBy(1)
+
+        h.setAccess(true, fence())
+        advanceTimeBy(10_000)
+        assertEquals("거부된 같은 grant 로 다시 연결했다", 1, h.wires.size)
+
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+        assertEquals("새 grant 인데 연결하지 않았다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** The identity-loss latch is keyed the same way: the same fence stays retired, a new token does not. */
+    @Test
+    fun `a retired session connects again only once its grant token changes`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+        val first = h.wire
+
+        h.liveFence = null
+        first.deliver(h.tetherFrame(1400.0))
+        advanceTimeBy(1)
+        assertTrue("신원 상실로 은퇴하지 않았다", first.cancelled)
+
+        // The identity is back, as the same session. Granting is done directly so it does not move it.
+        h.liveFence = fence().identity
+        h.coordinator.setAccess(true, fence())
+        advanceTimeBy(10_000)
+        assertEquals("은퇴한 같은 grant 로 다시 연결했다", 1, h.wires.size)
+
+        h.coordinator.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+        assertEquals("새 토큰인데 연결하지 않았다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** An answer decided under the previous token is neither applied nor handed over. */
+    @Test
+    fun `a bootstrap answer from before a token change is neither applied nor handed over`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapGate = CompletableDeferred()
+        val issued = h.bootstrapCalls.size
+        h.coordinator.requestBootstrap(TETHER)
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(1)
+        assertEquals(issued + 2, h.bootstrapCalls.size)
+        val handedBefore = h.undelivered.size
+
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+        assertEquals("새 토큰이 desired topic 을 다시 묻지 않았다", issued + 4, h.bootstrapCalls.size)
+
+        // Only the two held issues answer; whatever the new grant asks for itself is not the subject.
+        h.bootstrapOutcome = { issue, _ ->
+            when (issue) {
+                issued -> h.delivered(h.tetherFrame(1390.0, timestamp = "2026-08-31T10:25:00+09:00"))
+                issued + 1 -> TopicSnapshotOutcome.Dormant
+                else -> TopicSnapshotOutcome.Unreachable(java.io.IOException("이 시험의 대상이 아니다"))
+            }
+        }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue(
+            "앞 토큰의 답이 시세에 들어왔다",
+            h.coordinator.rates.value.quotes.values.none { it.rate == 1390.0 }
+        )
+        assertTrue(
+            "앞 토큰의 답을 밖으로 보고했다",
+            h.undelivered.drop(handedBefore).none { it.third === TopicSnapshotOutcome.Dormant }
         )
         h.cleanUp()
     }
@@ -1985,6 +2250,36 @@ class TopicSessionCoordinatorTest {
 
         // Asking again here would mean the old grant's window survived the purge — the foreground
         // return is what would read it.
+        advanceTimeBy(46_000)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        assertEquals("지워진 창이 물었다", 3, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** The same holds when only the grant token moved — the account and its credential stay put. */
+    @Test
+    fun `a token change clears the window`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+        // A second socket, not the first one opened again: re-opening the old wire would also send a
+        // subscription, and then nothing below would be about the new grant at all.
+        assertEquals("토큰만 바뀐 grant 가 새 연결을 열지 않았다", 2, h.wires.size)
+        assertTrue(h.wires[0].cancelled)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("새 grant 가 구독하지 않았다", 2, h.requests.size)
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
+        advanceTimeBy(45_200)
+        assertEquals(3, h.requests.size)
+        h.wire.deliver(h.ack("r3", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
         advanceTimeBy(46_000)
         h.coordinator.setForeground(true)
         advanceTimeBy(1)

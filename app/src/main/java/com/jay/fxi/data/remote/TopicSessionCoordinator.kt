@@ -62,11 +62,29 @@ object TopicCatalogue {
  * a *previous login of the same account* is not mistaken for the current one. [userAccessEpoch] is
  * the namespace id `AccessEpochStore` mints, an opaque string rather than a number; writing it as
  * a counter here would have been a second, disagreeing idea of the same value. Found by review.
+ *
+ * [grant] names the access decision the session was issued under. It is part of equality on
+ * purpose: a fence that differs only in its grant is a **different session** here, so everything
+ * a grant change does — ending the socket, clearing prices and the store, forgetting both refusal
+ * latches, and reconnecting and re-asking bootstraps where the session may ask at all — follows
+ * from a new grant too, including one caused by nothing more than a KRX capability rotation. That is the cost of carrying the grant at all; without it
+ * a same-fence re-issue would leave the socket holding the old grant, and a refusal it later
+ * carried back would be discarded as stale while the account was being refused now.
  */
 data class TopicSessionFence(
     val identity: AuthIdentityFence,
-    val userAccessEpoch: String?
+    val userAccessEpoch: String?,
+    val grant: TopicGrantToken
 )
+
+/**
+ * The access decision a session runs under, as the entitlements side issued it.
+ *
+ * Opaque to this layer: nothing here mints, advances or interprets it. It rides on the fence and
+ * comes back with a refusal, and the issuer decides what it still stands for.
+ */
+@JvmInline
+value class TopicGrantToken(val value: Long)
 
 /** Why a connection ended, which decides whether another one is opened. */
 enum class TopicDisconnectCause {
@@ -264,8 +282,9 @@ class TopicSessionCoordinator(
      *
      * This is also not a global identity monitor: a timer or a command result can run before any
      * guarded data input observes the loss. It does not validate live access revocation, guard
-     * command ACK application, or authorize deferred callbacks. Those, and generation-aware grant
-     * recovery, remain prerequisites for runtime wiring.
+     * command ACK application, or authorize deferred callbacks — the refusal hand-over carries its
+     * connection's fence for the consumer to check, and nothing here checks it. Those, and
+     * generation-aware grant recovery, remain prerequisites for runtime wiring.
      */
     private val liveIdentity: () -> AuthIdentityFence?,
     /**
@@ -280,8 +299,19 @@ class TopicSessionCoordinator(
      */
     private val onBootstrapHttpEvidence: (statusCode: Int?, retryAfter: String?) -> Unit =
         { _, _ -> },
-    /** Refusals, handed over as they arrive rather than when the command finishes. */
-    private val onRejected: (Map<String, TopicRejectionReason>) -> Unit = {},
+    /**
+     * Refusals, handed over as they arrive rather than when the command finishes, with the fence
+     * of the connection that was refused.
+     *
+     * That fence is the one the connection was opened under, not whatever is current when this
+     * runs: a `premium_required` refusal ends the connection **before** this is called, and a
+     * consumer has to be able to tell a refusal for the grant it still holds from a late one.
+     * Carrying it is all this does — whether the refusal still applies is the consumer's
+     * decision, and the store writes and latch changes made before this call are not validated
+     * by it.
+     */
+    private val onRejected: (owner: TopicSessionFence, rejected: Map<String, TopicRejectionReason>) -> Unit =
+        { _, _ -> },
     /**
      * Every acknowledgement, as it arrives.
      *
@@ -1237,7 +1267,9 @@ class TopicSessionCoordinator(
         publishIfChanged()
 
         onAcknowledgement(ack)
-        if (ack.rejected.isNotEmpty()) onRejected(ack.rejected)
+        // `live.fence`, not the session's current one: the refusal above may already have ended
+        // this connection, and the grant it answered is the one this connection was opened under.
+        if (ack.rejected.isNotEmpty()) onRejected(live.fence, ack.rejected)
     }
 
     // ---- leases -----------------------------------------------------------------------------
