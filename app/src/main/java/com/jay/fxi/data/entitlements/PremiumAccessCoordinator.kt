@@ -68,11 +68,40 @@ class PremiumAccessCoordinator(
 ) {
     private val mutex = Mutex()
 
+    /**
+     * The topic access snapshot, replaced whole under [mutex] and read without it (L-4e E1). Published before any state flow
+     * that shows the same change: see [publishAccessSnapshotLocked].
+     */
+    @Volatile private var accessSnapshotValue = TopicAccessSnapshot.INITIAL
+
+    /** Moves with every published snapshot and never otherwise. A hint to pull again; decisions read [accessSnapshot]. */
+    private val _accessRevision = MutableStateFlow(0L)
+
+    /** Guarded by [mutex]. */
+    private var userAccessInvalidations = 0L
+    private var userEndSequence = 0L
+    private var capabilityEndSequence = 0L
+    private var lastUserEnd: TopicAccessEnd? = null
+    private var lastCapabilityEnd: TopicAccessEnd? = null
+
+    /**
+     * A loss rotation that can change that axis's epoch is about to run, is running, or the decision it serves is not yet
+     * published. Guarded by [mutex]. Only a loss rotation sets these; identity writes already publish NoGrant before their
+     * disk work.
+     *
+     * Held from before the write until that decision is published, then released: from there the published user loss and the
+     * raised generation hold the user axis, the published HIDDEN holds the capability, and an explicit seal the rotation opened
+     * holds its own axis. The release itself establishes neither the write's outcome nor a re-approval. A write that returned
+     * while the store is unconfirmed is not observed, so the confirmed record can lag it.
+     */
+    private var userContextUncertain = false
+    private var capabilityContextUncertain = false
+
     /** Explicit losses whose rotation this process could not establish. Guarded by [mutex]. */
     private val lossSeals = LossSealLedger()
 
     /** Every store call this class makes; each confirmed record reaches [lossSeals] on its way back. */
-    private val store: AccessEpochStore = ObservedStore(store)
+    private val store = ObservedStore(store)
 
     /** The loss recovery run while one is armed. Guarded by [mutex]; the run clears it when it has nothing to do. */
     private var lossRecovery: Job? = null
@@ -279,6 +308,7 @@ class PremiumAccessCoordinator(
     /** Publishes the hold so waiters see the revision they were handed move. */
     private fun setPendingLocked(pending: PendingPersistence?) {
         identityPersistencePending = pending
+        publishAccessSnapshotLocked()
         _persistenceSignal.value = pending
         // The first stop is what earns the banner. Later rounds of the same hold keep it, blocked
         // or not, because the id has not changed.
@@ -382,7 +412,9 @@ class PremiumAccessCoordinator(
                 "the held identity event is retried before any other: held $pending, got $identity"
             }
         }
+        recordBindingEndLocked(TopicAccessEndReason.IDENTITY_CHANGED)
         decisionGeneration += 1
+        publishAccessSnapshotLocked()
         cancelProbeLocked()
         clearForcePremiumLocked()
         // Same reason as sign-out: the previous owner's grant must stop being readable before the
@@ -434,7 +466,9 @@ class PremiumAccessCoordinator(
                 "the held identity event is retried before any other: held $retry, got the end of $ended"
             }
         }
+        recordBindingEndLocked(TopicAccessEndReason.SIGNED_OUT)
         decisionGeneration += 1
+        publishAccessSnapshotLocked()
         cancelProbeLocked()
         clearForcePremiumLocked()
         // Publish the revocation *before* the store work, not after. Persist-before-observe is the
@@ -575,7 +609,9 @@ class PremiumAccessCoordinator(
 
     /** Takes protected access away from [fence] ahead of disk work; see [onSignedOut] for why first. */
     private suspend fun sealLocked(fence: AuthIdentityFence) {
+        recordBindingEndLocked(TopicAccessEndReason.SIGNED_OUT)
         decisionGeneration += 1
+        publishAccessSnapshotLocked()
         cancelProbeLocked()
         clearForcePremiumLocked()
         _state.value = OwnedPremiumAccess(fence.uid, fence.authGeneration, PremiumAccessState.NoGrant)
@@ -1155,7 +1191,9 @@ class PremiumAccessCoordinator(
         }
 
     private suspend fun bindBarrierLocked(open: SignOutAttempt.Recovering, candidate: AuthIdentityFence): BarrierOutcome {
+        recordBindingEndLocked(TopicAccessEndReason.IDENTITY_CHANGED)
         decisionGeneration += 1
+        publishAccessSnapshotLocked()
         cancelProbeLocked()
         clearForcePremiumLocked()
         // Sealed onto the candidate before the disk work, as any binding is.
@@ -1209,6 +1247,8 @@ class PremiumAccessCoordinator(
 
     private fun setAttemptLocked(next: SignOutAttempt?) {
         attempt = next
+        // Before the signals below: a waiter woken by them reads the snapshot next.
+        publishAccessSnapshotLocked()
         // The status is the open attempt's and goes with it.
         if (_recoveryStatus.value?.ticket != next?.ticket) _recoveryStatus.value = null
         attemptSignal.value = AttemptSignal(
@@ -1383,7 +1423,9 @@ class PremiumAccessCoordinator(
         check(attempt == null) { "a sign-out attempt was open at the first identity observation" }
         check(identityPersistencePending == null) { "a hold stood at the first identity observation" }
         // Taking away, so published before the disk work — for the same reason [onSignedOut] gives.
+        recordBindingEndLocked(TopicAccessEndReason.UNVERIFIED_START)
         decisionGeneration += 1
+        publishAccessSnapshotLocked()
         cancelProbeLocked()
         clearForcePremiumLocked()
         _state.value = OwnedPremiumAccess(null, null, PremiumAccessState.NoGrant)
@@ -1554,21 +1596,36 @@ class PremiumAccessCoordinator(
      *
      * Wiring this to a session's `setAccess` is not done here.
      */
-    internal suspend fun topicGrant(): TopicSessionFence? = mutex.withLock {
-        if (!accessAdmittedLocked()) return@withLock null
-        if (_state.value.state != PremiumAccessState.PremiumConfirmed) return@withLock null
+    internal suspend fun topicGrant(): TopicSessionFence? = topicGrantResult().fence
+
+    /**
+     * [topicGrant] together with the access snapshot published by the same lock hold (L-4e E1).
+     *
+     * The snapshot is read after the store read, the token issue and their publications, and before the lock is released, so
+     * a later change can never be returned as if it produced this answer. A read that throws still throws.
+     */
+    internal suspend fun topicGrantResult(): TopicGrantResult = mutex.withLock {
+        TopicGrantResult(issueTopicGrantLocked(), accessSnapshotValue)
+    }
+
+    private suspend fun issueTopicGrantLocked(): TopicSessionFence? {
+        if (!accessAdmittedLocked()) return null
+        if (_state.value.state != PremiumAccessState.PremiumConfirmed) return null
         // Refused without touching the issued grant: a hold is not a loss, and it must not make its own candidate stale.
-        if (lossCandidates.any { PurgeScope.USER in it.axes }) return@withLock null
-        val bound = boundIdentityLocked() ?: return@withLock null
+        if (lossCandidates.any { PurgeScope.USER in it.axes }) return null
+        val bound = boundIdentityLocked() ?: return null
         val record = store.load()
-        if (record.ownerUid != bound.ownerUid) return@withLock null
+        if (record.ownerUid != bound.ownerUid) return null
         // Checked against the record just confirmed, not a value computed before it (S1r-2b §5).
-        if (PurgeScope.USER in lossSeals.sealedAxes(bound.ownerUid)) return@withLock null
-        if (source.currentIdentity() != bound) return@withLock null
+        if (PurgeScope.USER in lossSeals.sealedAxes(bound.ownerUid)) return null
+        if (source.currentIdentity() != bound) return null
         val context = TopicGrantContext(bound, record.fence(), decisionGeneration)
         val issued = issuedTopicGrant?.takeIf { it.context == context }
-            ?: IssuedTopicGrant(TopicGrantToken(++nextTopicGrant), context).also { issuedTopicGrant = it }
-        TopicSessionFence(
+            ?: IssuedTopicGrant(TopicGrantToken(++nextTopicGrant), context).also {
+                issuedTopicGrant = it
+                publishAccessSnapshotLocked()
+            }
+        return TopicSessionFence(
             identity = AuthIdentityFence(bound.ownerUid, bound.authGeneration),
             userAccessEpoch = record.userAccessEpoch,
             grant = issued.token
@@ -1879,13 +1936,42 @@ class PremiumAccessCoordinator(
             if (AccessEffect.RotateKrxEpoch in decision.effects) add(LossTarget.of(record, PurgeScope.CAPABILITY))
         }
         val fresh = targets.filterNot(lossSeals::joins)
-        // Settled even when the caller is cancelled: once the write starts, its outcome is classified and the loss
-        // published before cancellation is allowed through.
-        val rotated = fresh.isEmpty() || withContext(NonCancellable) { rotateLossTargetsLocked(record, fresh) }
+        // The decision's own record names the namespace, and only when it is the binding's: another owner's epoch is not
+        // this binding's end.
+        val ending = boundIdentityLocked()
+        val endingRecord = record.takeIf { ending != null && it.ownerUid == ending.ownerUid }
+        if (outcome.isAuthoritativeLoss()) {
+            recordUserEndLocked(TopicAccessEndReason.AUTHORITATIVE_LOSS, ending, ending?.ownerUid, endingRecord?.userAccessEpoch)
+        }
+        if (AccessEffect.RotateKrxEpoch in decision.effects) {
+            recordCapabilityEndLocked(
+                TopicAccessEndReason.CAPABILITY_REVOKED, ending, ending?.ownerUid, endingRecord?.krxCapabilityEpoch
+            )
+        }
+        // In doubt from before the write until the decision it serves is published (L-4e E1 §3-1): the write can land while
+        // the reducer's state still grants, and a read-back can come back before the loss is published.
+        val doubtsUser = fresh.any { it.axis == PurgeScope.USER }
+        val doubtsCapability = fresh.any { it.axis == PurgeScope.CAPABILITY }
+        if (doubtsUser) userContextUncertain = true
+        if (doubtsCapability) capabilityContextUncertain = true
+        publishAccessSnapshotLocked()
+        val rotated = try {
+            // Settled even when the caller is cancelled: once the write starts, its outcome is classified and the loss
+            // published before cancellation is allowed through.
+            val landed = fresh.isEmpty() || withContext(NonCancellable) { rotateLossTargetsLocked(record, fresh) }
 
-        if (outcome.isAuthoritativeLoss()) decisionGeneration += 1
+            if (outcome.isAuthoritativeLoss()) {
+                decisionGeneration += 1
+                publishAccessSnapshotLocked()
+            }
 
-        publishLocked(record.ownerUid, decision.state, decision.krx, decision.effects)
+            publishLocked(record.ownerUid, decision.state, decision.krx, decision.effects)
+            landed
+        } finally {
+            if (doubtsUser) userContextUncertain = false
+            if (doubtsCapability) capabilityContextUncertain = false
+            publishAccessSnapshotLocked()
+        }
 
         // A cleanup recovery already owns keeps its retry deadline: a repeated input — a purge-only KRX false edge
         // included — does not run it early. Recovery's round covers this decision's journal too.
@@ -1938,6 +2024,14 @@ class PremiumAccessCoordinator(
         }
         if (owed.isEmpty()) return true
         lossSeals.open(owed)
+        // From the targets that were owed, not the read-back: a read-back can show another epoch without retiring this one.
+        owed.firstOrNull { it.axis == PurgeScope.USER }?.let { target ->
+            recordUserEndLocked(TopicAccessEndReason.SEALED, boundIdentityLocked(), target.ownerUid(), target.epoch())
+        }
+        owed.firstOrNull { it.axis == PurgeScope.CAPABILITY }?.let { target ->
+            recordCapabilityEndLocked(TopicAccessEndReason.SEALED, boundIdentityLocked(), target.ownerUid(), target.epoch())
+        }
+        publishAccessSnapshotLocked()
         lossSeals.registerReapproval(probeEpoch, record.ownerUid)
         return false
     }
@@ -2067,6 +2161,7 @@ class PremiumAccessCoordinator(
                 lossCleanupOwed = true
                 val after = store.beginRotation(rotateUser = rotateUser, rotateKrx = rotateKrx)
                 releasable.forEach { lossSeals.releaseByRotation(it, record, after) }
+                publishAccessSnapshotLocked()
             }
             lossSeals.obligations().filter { lossSeals.status(it) == ObligationStatus.UNKNOWN }.forEach {
                 lossCleanupOwed = true
@@ -2158,12 +2253,149 @@ class PremiumAccessCoordinator(
         is EntitlementsOutcome.Indeterminate -> null
     }
 
+    /** The published topic access snapshot (L-4e E1). Read without the lock; see [TopicAccessSnapshot]. */
+    internal val accessSnapshot: TopicAccessSnapshot get() = accessSnapshotValue
+
+    /** The snapshot revision, moving with each publication. A trigger to pull again, not something to decide on. */
+    internal val accessRevisions: StateFlow<Long> = _accessRevision.asStateFlow()
+
+    /** Test support: whether the published facts equal a recomputation under the lock. Says nothing about order in between. */
+    internal suspend fun accessFactsAreCurrent(): Boolean = mutex.withLock { accessSnapshotValue.facts == accessFactsLocked() }
+
+    /**
+     * What topic access is right now, from memory only. Callers hold [mutex].
+     *
+     * The user axis carries every condition [topicGrant] checks except the live identity and the disk read, which it cannot
+     * make without suspending; the confirmed record stands in for the disk. Blocks are all collected, not the first one.
+     */
+    private fun accessFactsLocked(): TopicAccessFacts {
+        val decided = _state.value
+        val binding = boundIdentityLocked()
+        val record = lossSeals.lastConfirmed
+        val owner = binding?.ownerUid
+        val ownRecord = record?.takeIf { owner != null && it.ownerUid == owner }
+        val explicit = lossSeals.explicitSealedAxes(owner)
+        val userBlocks = buildSet {
+            if (!SignOutAttemptPolicy.admitsAccessQueries(attempt)) add(TopicAccessBlock.ATTEMPT_OPEN)
+            if (identityPersistencePending != null) add(TopicAccessBlock.PERSISTENCE_HOLD)
+            if (decided.state != PremiumAccessState.PremiumConfirmed) add(TopicAccessBlock.NOT_GRANTED)
+            if (binding == null) add(TopicAccessBlock.NO_BINDING)
+            if (record == null) add(TopicAccessBlock.NO_CONFIRMED_RECORD)
+            else if (binding != null && record.ownerUid != binding.ownerUid) add(TopicAccessBlock.OWNER_MISMATCH)
+            if (lossCandidates.any { PurgeScope.USER in it.axes }) add(TopicAccessBlock.LOSS_CANDIDATE)
+            if (owner != null && PurgeScope.USER in explicit) add(TopicAccessBlock.EXPLICIT_SEAL)
+            if (ownRecord != null && ownRecord.userAccessEpoch == null) add(TopicAccessBlock.DERIVED_SEAL)
+            if (userContextUncertain) add(TopicAccessBlock.CONTEXT_UNCERTAIN)
+        }
+        val capabilityBlocks = buildSet {
+            if (!decided.state.grantsPremiumRuntime || _krx.value != KrxCapabilityState.VISIBLE) add(TopicAccessBlock.NOT_GRANTED)
+            if (lossCandidates.any { PurgeScope.CAPABILITY in it.axes }) add(TopicAccessBlock.LOSS_CANDIDATE)
+            if (owner != null && PurgeScope.CAPABILITY in explicit) add(TopicAccessBlock.EXPLICIT_SEAL)
+            if (ownRecord != null && ownRecord.krxCapabilityEpoch == null) add(TopicAccessBlock.DERIVED_SEAL)
+            if (capabilityContextUncertain) add(TopicAccessBlock.CONTEXT_UNCERTAIN)
+        }
+        val issued = issuedTopicGrant
+        val current = if (binding != null && record != null) TopicGrantContext(binding, record.fence(), decisionGeneration) else null
+        return TopicAccessFacts(
+            token = issued?.token,
+            issuedFor = issued?.context,
+            binding = binding,
+            recordFence = record?.fence(),
+            decisionGeneration = decisionGeneration,
+            tokenStanding = issued != null && current != null && !userContextUncertain && issued.context == current,
+            userBlocks = userBlocks,
+            capabilityBlocks = capabilityBlocks,
+            recordUnconfirmed = store.unconfirmed,
+            userContextUncertain = userContextUncertain,
+            capabilityContextUncertain = capabilityContextUncertain
+        )
+    }
+
+    /**
+     * Recomputes the snapshot and publishes it if anything moved. Callers hold [mutex].
+     *
+     * Called after a change of an input, before the next external publication, callback or suspension. One exception is
+     * deliberate: [cancelProbeLocked] clears the loss candidates without publishing, because every caller has just raised the
+     * decision generation and publishes NoGrant next with no suspension between — publishing in between would show the ending
+     * binding's grant with its holds gone. A transition that takes the user axis or the standing token away counts one
+     * invalidation, however many of the two moved. An unchanged recomputation keeps the reference, the revision and the
+     * revision flow as they are.
+     */
+    private fun publishAccessSnapshotLocked() {
+        val previous = accessSnapshotValue
+        val facts = accessFactsLocked()
+        val invalidated = (previous.facts.userAllowed && !facts.userAllowed) ||
+            (previous.facts.tokenStanding && !facts.tokenStanding)
+        if (invalidated) userAccessInvalidations += 1
+        val next = TopicAccessSnapshot(
+            revision = previous.revision,
+            facts = facts,
+            userInvalidations = userAccessInvalidations,
+            lastUserEnd = lastUserEnd,
+            lastCapabilityEnd = lastCapabilityEnd
+        )
+        if (next == previous) return
+        val published = next.copy(revision = previous.revision + 1)
+        accessSnapshotValue = published
+        _accessRevision.value = published.revision
+    }
+
+    /**
+     * Records an end of the user axis for what the event itself names. Callers hold [mutex] and publish before any suspension.
+     *
+     * The owner and the namespace are passed in rather than read here: the published binding and the last confirmed record can
+     * belong to different owners, and pairing them would name one owner's namespace as another's end.
+     */
+    private fun recordUserEndLocked(
+        reason: TopicAccessEndReason,
+        binding: EntitlementsIdentity?,
+        ownerUid: String?,
+        namespace: String?
+    ) {
+        lastUserEnd = TopicAccessEnd(++userEndSequence, reason, binding, ownerUid, namespace)
+    }
+
+    /** As [recordUserEndLocked], for the capability axis. */
+    private fun recordCapabilityEndLocked(
+        reason: TopicAccessEndReason,
+        binding: EntitlementsIdentity?,
+        ownerUid: String?,
+        namespace: String?
+    ) {
+        lastCapabilityEnd = TopicAccessEnd(++capabilityEndSequence, reason, binding, ownerUid, namespace)
+    }
+
+    /**
+     * Records the end of the published binding at an identity boundary, before the binding changes. Callers hold [mutex].
+     *
+     * Nothing is recorded with no binding — the first bind of a process, or a cold start whose first observation is no uid —
+     * because no session of this process is ending. The namespace is the confirmed record's only when that record is the
+     * binding owner's.
+     */
+    private fun recordBindingEndLocked(reason: TopicAccessEndReason) {
+        val binding = boundIdentityLocked() ?: return
+        val namespace = lossSeals.lastConfirmed?.takeIf { it.ownerUid == binding.ownerUid }?.userAccessEpoch
+        recordUserEndLocked(reason, binding, binding.ownerUid, namespace)
+    }
+
+    private fun LossTarget.ownerUid(): String? = when (this) {
+        is LossTarget.Namespace -> obligation.ownerUid
+        is LossTarget.NullNamespace -> seal.ownerUid
+    }
+
+    private fun LossTarget.epoch(): String? = when (this) {
+        is LossTarget.Namespace -> obligation.epoch
+        is LossTarget.NullNamespace -> null
+    }
+
     /**
      * [state] and [krx] from the reducer's view and the candidates' holds. A user hold shows a grant as NoGrant and leaves
      * any other state as it is; a capability hold, or a state that grants nothing, hides KRX. Called on every write of
      * either. Callers hold [mutex].
      */
     private fun republishEffectiveLocked() {
+        // First, before either flow: a reader that sees a withdrawal here must not find an older allowance in the snapshot.
+        publishAccessSnapshotLocked()
         val decided = _state.value
         _effectiveState.value =
             if (decided.state.grantsPremiumRuntime && lossCandidates.any { PurgeScope.USER in it.axes }) {
@@ -2379,7 +2611,9 @@ class PremiumAccessCoordinator(
      * start of the call.
      */
     private inner class ObservedStore(private val delegate: AccessEpochStore) : AccessEpochStore {
-        private var unconfirmed = false
+        /** A store call failed or was cancelled since the last confirmed load. Read by the topic access snapshot. */
+        var unconfirmed = false
+            private set
 
         private suspend fun call(op: StoreOp, block: suspend () -> AccessEpochRecord): AccessEpochRecord {
             val before = lossSeals.lastConfirmed
@@ -2387,6 +2621,7 @@ class PremiumAccessCoordinator(
                 block()
             } catch (failed: Throwable) {
                 unconfirmed = true
+                publishAccessSnapshotLocked()
                 throw failed
             }
             if (op == StoreOp.LOAD) unconfirmed = false
@@ -2394,6 +2629,7 @@ class PremiumAccessCoordinator(
                 // Something retired here was handed to a journal that still needs cleaning, whoever's call this was —
                 // an identity task that completes on a failed purge does not end that.
                 if (lossSeals.observe(op, before, result)) lossCleanupOwed = true
+                publishAccessSnapshotLocked()
                 // New evidence can make a seal recovery had given up on actionable again. A waiting retry keeps its deadline.
                 if (lossRecovery == null && (lossCleanupOwed || lossRecoveryHasWorkLocked())) kickLossRecoveryLocked()
             }
@@ -2506,7 +2742,7 @@ enum class TopicRejection {
 }
 
 /** What a topic grant was issued for: the binding, the record's fence, and the decision generation. */
-private data class TopicGrantContext(
+internal data class TopicGrantContext(
     val identity: EntitlementsIdentity,
     val access: AccessFence,
     val generation: Long

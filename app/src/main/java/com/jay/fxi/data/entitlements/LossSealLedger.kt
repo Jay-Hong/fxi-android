@@ -186,6 +186,9 @@ class LossSealLedger {
         return axes.toSet()
     }
 
+    /** The axes sealed for [ownerUid] by an obligation or a null-target seal — [sealedAxes] without the derived part. */
+    fun explicitSealedAxes(ownerUid: String?): Set<PurgeScope> = lossSealedAxes(ownerUid)
+
     private fun lossSealedAxes(ownerUid: String?): Set<PurgeScope> = buildSet {
         obligations.filter { it.ownerUid == ownerUid }.forEach { add(it.axis) }
         nullTargets.filter { it.ownerUid == ownerUid }.forEach { add(it.axis) }
