@@ -8,6 +8,7 @@ import com.jay.fxi.data.remote.dto.TopicSourceEntry
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
 import com.jay.fxi.data.remote.dto.toDollarIndex
 import com.jay.fxi.data.remote.dto.toQuote
+import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.TopicLeaseInput
 import com.jay.fxi.domain.model.TopicLeasePolicy
 import com.jay.fxi.domain.model.TopicLeaseRegistry
@@ -121,6 +122,20 @@ private sealed interface SessionInput {
      * decided under, not whichever one is current when the job happens to start.
      */
     data class BootstrapRequested(val topic: String) : SessionInput
+
+    /**
+     * The tab being shown, for the account whose restore or choice produced it (L-4f).
+     *
+     * [owner] is the identity captured when that work started, not the one current when it finished: a restore that outlived
+     * a sign-out must not be able to speak for whoever signed in next.
+     */
+    data class Focus(val owner: AuthIdentityFence, val tab: FreeTab) : SessionInput
+
+    /** The pacing wait for the next bootstrap ran out. Stale unless both numbers are still the session's. */
+    data class BootstrapIssueDue(val grantEpoch: Long, val ticket: Long) : SessionInput
+
+    /** A bootstrap's job ended, however it ended — including the paths that post no answer. */
+    data class BootstrapSettled(val requestId: Long) : SessionInput
 
     /**
      * One REST bootstrap finished.
@@ -274,9 +289,12 @@ class TopicSessionCoordinator(
      * Synchronous observation, not a pure getter. In production this reconciles Firebase's
      * current user with the auth tracker and may advance its generation.
      *
-     * Read at the guarded apply boundary; do not substitute a cached Access input.
-     * A mismatch, including `null`, retires the current grant, and repeating its `Access` input
-     * does not restore it. Runtime wiring must therefore observe auth-generation changes
+     * At a guarded apply boundary, a mismatch, including `null`, retires the current grant.
+     * A cached Access input cannot replace that observation, and repeating it does not restore the grant.
+     * L-4f also reads this to admit Focus inputs and retain focus during Access processing:
+     * a stale Focus is dropped, while a missing or different live UID clears the held focus.
+     * These focus checks do not themselves retire the grant.
+     * Runtime wiring must therefore observe auth-generation changes
      * independently of bare-uid deduplication and obtain a valid grant for the current identity
      * before it supplies a new `Access` fence; `AuthAccessBinder` alone does not guarantee that.
      *
@@ -300,6 +318,17 @@ class TopicSessionCoordinator(
      */
     private val onBootstrapHttpEvidence: (statusCode: Int?, retryAfter: String?) -> Unit =
         { _, _ -> },
+    /**
+     * The earliest instant, on [clock]'s timeline, a bootstrap may start (L-4f). Synchronous and non-throwing.
+     *
+     * Read, never written: the retry floor is recorded by whoever [onBootstrapHttpEvidence] hands the server's evidence to, and a
+     * grant change does not reset it. Read before every logical call and again when a wait ends. It cannot space the sends of a
+     * call that has already started and is waiting for its token, nor a replay inside the transport. The default is only honest
+     * while nothing is wired.
+     */
+    private val bootstrapNotBeforeMillis: () -> Long = { 0L },
+    /** The least time between logical calls after the shown tab's first batch; see [TopicBootstrapOrder.ISSUE_GAP]. */
+    private val bootstrapIssueGap: Duration = TopicBootstrapOrder.ISSUE_GAP,
     /**
      * Refusals, handed over as they arrive rather than when the command finishes, with the fence
      * of the connection that was refused.
@@ -485,7 +514,7 @@ class TopicSessionCoordinator(
     private var grantEpoch = 0L
 
     /**
-     * The grant this session has already asked for, or `null` before it has asked for any.
+     * The grant whose automatic bootstrap plan has been created, or `null` before any plan exists.
      *
      * The counter **is** the reset: a grant whose authority ended raised it, so the next one
      * cannot match a number spent on the one before. There is no clearing code, and nothing to
@@ -499,14 +528,42 @@ class TopicSessionCoordinator(
     private var fannedOutForGrant: Long? = null
 
     /**
-     * The REST bootstraps still out.
+     * The REST bootstraps still out, by request, with the grant and topic each was issued for.
      *
      * Held for shutdown, which is the one moment the answers stop having anywhere to go. A grant
      * change does not cancel them — [grantEpoch] refuses those answers instead — which can leave
-     * multiple requests running to the end of their budgets. Pruned on the loop, where the list is
-     * only ever touched.
+     * multiple requests running to the end of their budgets. An entry leaves on its own
+     * [SessionInput.BootstrapSettled], by request id, so an older request finishing late cannot take
+     * a newer one's entry with it. Touched only on the loop.
      */
-    private val bootstraps = mutableListOf<Job>()
+    private val bootstrapsOut = HashMap<Long, BootstrapOut>()
+    private var nextBootstrapRequestId = 0L
+
+    private class BootstrapOut(val grantEpoch: Long, val topic: String, val job: Job)
+
+    /** Whose shown tab this session knows, if any (L-4f). Kept per account, not per grant. */
+    private sealed interface FocusState {
+        data object Undetermined : FocusState
+        data class Confirmed(val uid: String, val tab: FreeTab) : FocusState
+    }
+
+    private var focus: FocusState = FocusState.Undetermined
+
+    /**
+     * The topics still owed a bootstrap under [unissuedForGrant]: the grant's plan, and explicit requests waiting their turn.
+     *
+     * A set, and ordered only when one is taken: the next is whichever ranks first for the tab shown **then**, which is what
+     * moves a newly shown tab's topics ahead and what folds an explicit request into the plan without a second list. Emptied
+     * the moment the grant it belongs to ends.
+     */
+    private val unissuedBootstraps = LinkedHashSet<String>()
+    private var unissuedForGrant: Long? = null
+
+    /** null until this grant first issues; thereafter, the remaining topics eligible for its initial batch. */
+    private var bootstrapFirstBatch: Set<String>? = null
+    private var lastBootstrapIssuedAtMillis: Long? = null
+    private var bootstrapIssueTimer: Job? = null
+    private var bootstrapIssueTicket = 0L
 
     /**
      * D14's window, and the two facts that decide it. **Session-scoped, not per connection.**
@@ -597,6 +654,15 @@ class TopicSessionCoordinator(
      */
     fun requestBootstrap(topic: String) = post(SessionInput.BootstrapRequested(topic))
 
+    /**
+     * Which tab is shown, for [owner] — the identity captured when the restore or the choice that produced it began (L-4f).
+     *
+     * A bootstrap waits for this: nothing is issued before the shown tab is known. The provider owes one on every outcome of
+     * the last-tab restore — the stored tab, or 달러 when there is none, it is unknown, or it cannot be read — and must not
+     * publish a restore that was cancelled or replaced. Refused on the loop unless [owner] is exactly who is signed in now.
+     */
+    fun setFocus(owner: AuthIdentityFence, tab: FreeTab) = post(SessionInput.Focus(owner, tab))
+
     fun stop() = post(SessionInput.Stop)
 
     private fun post(input: SessionInput) {
@@ -651,9 +717,9 @@ class TopicSessionCoordinator(
                 if (online == input.value) return
                 online = input.value
                 reconsider(budgetIsFresh = input.value)
-                // A grant that arrived while the network was down is asked for here, and this is
-                // the only place it can be: `Access` already ran and found nothing to ask on.
-                fanOutBootstrap()
+                // A grant that arrived while the network was down is asked for here, and a plan the
+                // network interrupted carries on from here: `Access` already ran and could not.
+                pumpBootstraps()
             }
 
             is SessionInput.Access -> {
@@ -698,15 +764,41 @@ class TopicSessionCoordinator(
                     tetherDelivered = false
                     silenceTicket++
                 }
+                // The shown tab belongs to the account, not the grant: a grant arriving, ending or rotating
+                // under the same account leaves it. It goes only when the account it was confirmed for is
+                // no longer the one signed in — read from the account itself, since `moved` also fires on
+                // a session's very first grant, which would drop a tab restored before it.
+                (focus as? FocusState.Confirmed)?.let { held ->
+                    if (liveIdentity()?.uid != held.uid) focus = FocusState.Undetermined
+                }
                 reconsider(budgetIsFresh = true)
                 // After the socket is decided, because reading order should follow the session's:
                 // open the connection, then fill the screen while it negotiates. Nothing here
                 // depends on that order — `reconsider` changes none of [wanted]'s inputs — and no
                 // test tells the two placements apart.
-                fanOutBootstrap()
+                pumpBootstraps()
             }
 
-            is SessionInput.BootstrapRequested -> startBootstrap(input.topic)
+            is SessionInput.BootstrapRequested -> requestBootstrapOnLoop(input.topic)
+
+            is SessionInput.Focus -> {
+                // Before anything is touched: an input that is not the signed-in account's — a restore
+                // that outlived a sign-out, or an earlier session of the same account — is dropped
+                // whole, and the tab, the plan and the latch stay as they were.
+                if (liveIdentity() != input.owner) return
+                focus = FocusState.Confirmed(input.owner.uid, input.tab)
+                pumpBootstraps()
+            }
+
+            is SessionInput.BootstrapIssueDue -> {
+                if (input.grantEpoch != grantEpoch || input.ticket != bootstrapIssueTicket) return
+                bootstrapIssueTimer = null
+                pumpBootstraps()
+            }
+
+            is SessionInput.BootstrapSettled -> {
+                bootstrapsOut.remove(input.requestId)
+            }
 
             is SessionInput.BootstrapAnswered -> {
                 // The grant it was authorised under, against the one this session is on now. The
@@ -1387,27 +1479,101 @@ class TopicSessionCoordinator(
     // ---- the REST bootstrap ------------------------------------------------------------------
 
     /**
-     * Asks, once per grant, for everything this session consumes.
+     * Plans this grant's bootstraps once, and issues what is owed as the pacing allows (L-4f, 동결 후 11번).
      *
-     * **[wanted] is checked before the latch, and the order is the whole function.** A session
-     * that has an account but no network reaches here — access arrives before connectivity often
-     * enough — and burning the latch there would mean that grant is never asked for at all. So
-     * the gate comes first and the latch is spent only when the asking actually happens.
+     * **[wanted] and the shown tab come before the latch, and the order is the whole function.** A session that has an
+     * account but no network, or no tab yet, reaches here — and burning the latch there would mean that grant is never asked
+     * for at all. So the gates come first and the latch is spent only when the plan is actually made.
      *
-     * **Every topic, every time, in one go.** No order, no lead, no stagger: [desired] is what
-     * this session consumes and the answer to "which of them do we need" is all of them. The
-     * coordinator has no tab input, while the current UI consumes DXY in the USD tab.
-     * L-4 must implement and verify S1 request ordering, single-flight, inactive-tab lazy loading
-     * and the actual request budget before runtime wiring. This fan-out does not establish them. It also
-     * keeps the request pattern independent of what the account holds: asking for fewer topics
-     * because a capability is missing would make the shape of the traffic a statement about the
-     * user's entitlements.
+     * **Every desired topic, once per grant, the shown tab's first.** The plan is [TopicBootstrapOrder.plan]: nothing is
+     * dropped, only ordered. Laziness is a graph-query matter, not this one. The shape does not depend on what the account
+     * holds — asking for fewer topics because a capability is missing would make the traffic a statement about entitlements.
+     *
+     * **A plan outlives an interruption, not its grant.** Offline, or no longer wanted, the wait is dropped and what is owed
+     * stays; the same grant coming back carries on where it stopped. The latch only ever guarded making the plan. A new grant
+     * empties it: those topics are asked for again under the new one.
      */
-    private fun fanOutBootstrap() {
-        if (!wanted()) return
-        if (fannedOutForGrant == grantEpoch) return
-        fannedOutForGrant = grantEpoch
-        desired.forEach(::startBootstrap)
+    private fun pumpBootstraps() {
+        if (unissuedForGrant != grantEpoch) {
+            unissuedBootstraps.clear()
+            unissuedForGrant = grantEpoch
+            bootstrapFirstBatch = null
+        }
+        val tab = shownTab()
+        if (!wanted() || tab == null) {
+            cancelBootstrapIssue()
+            return
+        }
+        if (fannedOutForGrant != grantEpoch) {
+            fannedOutForGrant = grantEpoch
+            unissuedBootstraps += TopicBootstrapOrder.plan(tab, desired)
+        }
+        issueOwedBootstraps(tab)
+    }
+
+    /**
+     * Starts owed bootstraps in rank order until the gap or the floor says wait, and then waits.
+     *
+     * Nothing owed is already out under this grant. The plan is made before anything of this grant starts, and taking a topic
+     * off what is owed is what starts it; the one way back in while it is out is an explicit request, which joins the call
+     * instead ([requestBootstrapOnLoop]).
+     */
+    private fun issueOwedBootstraps(tab: FreeTab) {
+        val rank = TopicBootstrapOrder.plan(tab, desired)
+        val shown = TopicBootstrapOrder.shownBy(tab).filter { it in desired }.toSet()
+        while (true) {
+            val next = unissuedBootstraps.minByOrNull { rank.indexOf(it) } ?: return cancelBootstrapIssue()
+            val batch = bootstrapFirstBatch
+            val usesFirstBatch = batch == null || (next in batch && next in shown)
+            val now = clock.nowMillis()
+            val paced = lastBootstrapIssuedAtMillis
+                ?.takeIf { !usesFirstBatch }
+                ?.let { it + bootstrapIssueGap.inWholeMilliseconds }
+                ?: now
+            val notBefore = maxOf(paced, bootstrapNotBeforeMillis())
+            if (notBefore > now) {
+                scheduleBootstrapIssue((notBefore - now).milliseconds)
+                return
+            }
+            unissuedBootstraps.remove(next)
+            bootstrapFirstBatch = if (usesFirstBatch) (batch ?: shown) - next else emptySet()
+            lastBootstrapIssuedAtMillis = now
+            startBootstrap(next)
+        }
+    }
+
+    /**
+     * An explicit request: owed like the plan's, and never started ahead of the shown tab being known.
+     *
+     * Dropped when the session may not ask at all, or for a topic it does not consume. Otherwise it joins a call already out
+     * under this grant, or waits among what is owed — bound to this grant and gone with it — and takes its turn by rank.
+     * Once a topic's call has completed, asking again is a new call; the latch that guards the plan does not guard this.
+     */
+    private fun requestBootstrapOnLoop(topic: String) {
+        if (!wanted() || topic !in desired) return
+        // What is owed is already bound to the current grant here: the counter moves only in `Access`, which pumps in the
+        // same turn, and the pump is what rebinds it.
+        if (bootstrapsOut.values.any { it.grantEpoch == grantEpoch && it.topic == topic }) return
+        unissuedBootstraps += topic
+        pumpBootstraps()
+    }
+
+    /** The shown tab, when it was confirmed for the account this session's grant is for; `null` is "not known yet". */
+    private fun shownTab(): FreeTab? =
+        (focus as? FocusState.Confirmed)?.takeIf { it.uid == fence?.identity?.uid }?.tab
+
+    private fun scheduleBootstrapIssue(wait: Duration) {
+        cancelBootstrapIssue()
+        val epoch = grantEpoch
+        val ticket = bootstrapIssueTicket
+        bootstrapIssueTimer = after(wait) { post(SessionInput.BootstrapIssueDue(epoch, ticket)) }
+    }
+
+    /** Drops the pacing wait. The ticket moves too, so a wait that already posted its input is not acted on. */
+    private fun cancelBootstrapIssue() {
+        bootstrapIssueTimer?.cancel()
+        bootstrapIssueTimer = null
+        bootstrapIssueTicket++
     }
 
     /**
@@ -1422,46 +1588,56 @@ class TopicSessionCoordinator(
      * been refused this grant, or whose credential turned out to be somebody else's should not be
      * spending a request. [desired] is the other half — a topic this build does not consume has no
      * reader for its answer.
+     *
+     * The job reports that it ended from `finally`, apart from its answer: the identity-change path posts no answer, and a
+     * cancelled job posts none either, and both must still leave [bootstrapsOut].
      */
     private fun startBootstrap(topic: String) {
         if (!wanted() || topic !in desired) return
         val owner = fence?.identity ?: return
         val epoch = grantEpoch
-        bootstraps.removeAll { it.isCompleted }
-        bootstraps += scope.launch {
-            val outcome = try {
-                bootstrap(owner, topic)
-            } catch (moved: AuthIdentityChangedException) {
-                // The answer is refused, the rate limit is not: it was levied on the transport by
-                // address and outlives the credential that carried it. Handed over here, ahead of
-                // the grant filter, because that filter drops the whole outcome.
-                if (moved.statusCode != null || moved.retryAfter != null) {
-                    onBootstrapHttpEvidence(moved.statusCode, moved.retryAfter)
+        val requestId = ++nextBootstrapRequestId
+        val job = scope.launch {
+            try {
+                val outcome = try {
+                    bootstrap(owner, topic)
+                } catch (moved: AuthIdentityChangedException) {
+                    // The answer is refused, the rate limit is not: it was levied on the transport by
+                    // address and outlives the credential that carried it. Handed over here, ahead of
+                    // the grant filter, because that filter drops the whole outcome.
+                    if (moved.statusCode != null || moved.retryAfter != null) {
+                        onBootstrapHttpEvidence(moved.statusCode, moved.retryAfter)
+                    }
+                    // This exception carries no topic verdict. Identity propagation and recovery
+                    // need the runtime auth bridge — a bare-uid `Access` notification can miss the
+                    // move — so do not turn it into a topic outcome the server never gave.
+                    return@launch
                 }
-                // This exception carries no topic verdict. Identity propagation and recovery
-                // need the runtime auth bridge — a bare-uid `Access` notification can miss the
-                // move — so do not turn it into a topic outcome the server never gave.
-                return@launch
+                // Same reason, on the path that returns instead of throwing: a `Refused` carries
+                // the status and `Retry-After` the server did mean, and the grant filter would take
+                // them down with the outcome. No guard — an HTTP failure always has a status.
+                (outcome as? TopicSnapshotOutcome.Refused)?.failure?.let { failure ->
+                    onBootstrapHttpEvidence(failure.statusCode, failure.retryAfter)
+                }
+                post(SessionInput.BootstrapAnswered(epoch, topic, outcome))
+            } finally {
+                post(SessionInput.BootstrapSettled(requestId))
             }
-            // Same reason, on the path that returns instead of throwing: a `Refused` carries
-            // the status and `Retry-After` the server did mean, and the grant filter would take
-            // them down with the outcome. No guard — an HTTP failure always has a status.
-            (outcome as? TopicSnapshotOutcome.Refused)?.failure?.let { failure ->
-                onBootstrapHttpEvidence(failure.statusCode, failure.retryAfter)
-            }
-            post(SessionInput.BootstrapAnswered(epoch, topic, outcome))
         }
+        bootstrapsOut[requestId] = BootstrapOut(epoch, topic, job)
     }
 
     /**
-     * Lets go of every bootstrap still out. Idempotent, and safe with none.
+     * Lets go of every bootstrap still out, and of everything still owed. Idempotent, and safe with none.
      *
      * Shutdown only. The session's scope outlives [stop], so without this a request issued a
      * moment before it would run to completion and answer into a closed queue.
      */
     private fun cancelBootstraps() {
-        bootstraps.forEach(Job::cancel)
-        bootstraps.clear()
+        bootstrapsOut.values.forEach { it.job.cancel() }
+        bootstrapsOut.clear()
+        cancelBootstrapIssue()
+        unissuedBootstraps.clear()
     }
 
     /**

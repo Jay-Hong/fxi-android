@@ -25,6 +25,7 @@ import com.jay.fxi.data.remote.dto.SubscriptionAck
 import com.jay.fxi.data.remote.dto.SubscriptionAckTopic
 import com.jay.fxi.data.remote.dto.SubscriptionRejection
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
+import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.TopicAuthResolution
 import com.jay.fxi.domain.model.TopicControlState
 import com.jay.fxi.domain.model.TopicDeliveryState
@@ -32,6 +33,7 @@ import com.jay.fxi.domain.model.TopicRejectionReason
 import com.jay.fxi.domain.model.TopicSubscriptionSnapshot
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CompletableDeferred
@@ -71,6 +73,8 @@ class TopicSessionCoordinatorTest {
         const val PONG = """{"type":"pong"}"""
         const val TETHER = TopicCatalogue.TETHER
         const val USD = "fx:usd-krw"
+        const val JPY_TOPIC = "fx:jpy-krw"
+        const val EUR_TOPIC = "fx:eur-krw"
         val STABILITY_MS = 30_000L
         val PING_MS = 30_000L
         fun fence(uid: String = "u1", generation: Long = 1L, epoch: String = "epoch-1", grant: Long = 1L) =
@@ -126,7 +130,12 @@ class TopicSessionCoordinatorTest {
         fun closed() = listener!!.onClosed(socket, 1000, "bye")
     }
 
-    private class Harness(test: TestScope, desired: Set<String> = setOf(TETHER, USD)) {
+    private class Harness(
+        test: TestScope,
+        desired: Set<String> = setOf(TETHER, USD),
+        /** Zero by default so a test about something else sees every owed bootstrap start in one turn; L-4f tests set it. */
+        bootstrapIssueGap: Duration = Duration.ZERO
+    ) {
         val scheduler = test.testScheduler
         /**
          * `runTest`'s own background scope, not a scope of this harness's making.
@@ -197,8 +206,28 @@ class TopicSessionCoordinatorTest {
         /** Every bootstrap the session issued, with the grant each one bound itself to. */
         val bootstrapCalls = mutableListOf<Pair<AuthIdentityFence, String>>()
 
+        /** When each of [bootstrapCalls] started, on the scheduler's clock — the pacing is read off this. */
+        val bootstrapCallTimes = mutableListOf<Long>()
+
         /** Held to keep one bootstrap in flight while the session moves on underneath it. */
         var bootstrapGate: CompletableDeferred<Unit>? = null
+
+        /** The gate for one issue, by its number; defaults to [bootstrapGate], so a test can hold some calls and release others. */
+        var bootstrapGateFor: (issue: Int) -> CompletableDeferred<Unit>? = { bootstrapGate }
+
+        /** What the retry-floor owner would answer; read by the session before every bootstrap it starts. */
+        var bootstrapNotBeforeMillis = 0L
+
+        /** The floor as read, by default [bootstrapNotBeforeMillis]; a test replaces it to answer differently per read. */
+        var bootstrapFloor: () -> Long = { bootstrapNotBeforeMillis }
+
+        /**
+         * The tab [setAccess] reports as shown for the account it grants, or `null` to report none.
+         *
+         * A fixture convenience in the same spirit as [liveFence]: tests that do not care about L-4f's wait for the shown tab
+         * should not have to supply one. The tests that do care set this to `null` and call `coordinator.setFocus` themselves.
+         */
+        var autoFocus: FreeTab? = FreeTab.USD
 
         /** Every bootstrap that got past the gate — which a cancelled one does not. */
         val bootstrapFinished = mutableListOf<String>()
@@ -293,7 +322,8 @@ class TopicSessionCoordinatorTest {
                 // harness runs on one serial test dispatcher, so no other issue can land between.
                 val issue = bootstrapCalls.size
                 bootstrapCalls += owner to topic
-                bootstrapGate?.await()
+                bootstrapCallTimes += scheduler.currentTime
+                bootstrapGateFor(issue)?.await()
                 bootstrapFinished += topic
                 bootstrapOutcome(issue, topic)
             },
@@ -301,6 +331,8 @@ class TopicSessionCoordinatorTest {
             encode = { request -> requests += request; "encoded-${request.requestId}" },
             newRequestId = { "r${requests.size + 1}" },
             jitter = { jitterUnit },
+            bootstrapNotBeforeMillis = { bootstrapFloor() },
+            bootstrapIssueGap = bootstrapIssueGap,
             liveIdentity = {
                 liveIdentityReads++
                 onLiveIdentityRead?.invoke()
@@ -345,6 +377,8 @@ class TopicSessionCoordinatorTest {
         fun setAccess(allowed: Boolean, granted: TopicSessionFence?) {
             liveFence = granted?.identity
             coordinator.setAccess(allowed, granted)
+            val tab = autoFocus
+            if (granted != null && tab != null) coordinator.setFocus(granted.identity, tab)
         }
 
         fun goLive() {
@@ -3876,9 +3910,9 @@ class TopicSessionCoordinatorTest {
     /**
      * And a grant that arrives on a live network is asked for at once.
      *
-     * The mirror of the test above, and the reason there are two call sites: neither branch can
-     * make the other's case. `goLive()` is deliberately not used — it sets access before
-     * connectivity, which is the *other* order.
+     * The network is already available when the fixture supplies Access followed by Focus.
+     * Together they start the plan; this test does not isolate which input triggers it.
+     * `goLive()` is not used because it supplies access before connectivity.
      */
     @Test
     fun `a grant that arrives on a live network asks at once`() = runTest {
@@ -4629,6 +4663,564 @@ class TopicSessionCoordinatorTest {
         assertEquals("적용한 ACK 가 신원을 정확히 한 번 관측하지 않았다", reads + 1, h.liveIdentityReads)
         assertEquals(1, h.acknowledgements.size)
         h.cleanUp()
+    }
+
+    // ---- bootstrap issuing (L-4f, 동결 후 11번) -------------------------------------------------------
+
+    private val plannedAll = listOf(USD, TopicCatalogue.DXY, TETHER, JPY_TOPIC, EUR_TOPIC)
+
+    /** The topics this session has started bootstraps for since [from], in order. */
+    private fun Harness.asked(from: Int = 0) = bootstrapCalls.drop(from).map { it.second }
+
+    /** When each of those started, relative to [origin]. */
+    private fun Harness.askedAt(origin: Long, from: Int = 0) = bootstrapCallTimes.drop(from).map { it - origin }
+
+    /**
+     * A grant asks the shown tab's topics at once, then every other desired topic, one gap apart.
+     *
+     * All five, as 동결 후 5번 has it — laziness belongs to graph queries, not to these — but not in one go: the order is
+     * the tab first, then D1's, and the gap spaces the starts of the rest.
+     */
+    @Test
+    fun `a grant asks the shown tab first and the rest one gap apart`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.goLive()
+        advanceTimeBy(2_000)
+
+        assertEquals(plannedAll, h.asked())
+        assertEquals(listOf(0L, 0L, 500L, 1_000L, 1_500L), h.askedAt(0))
+        h.cleanUp()
+    }
+
+    /**
+     * Nothing is asked until the shown tab is known, and then that tab goes first (user GO 2026-09-14).
+     *
+     * The wait is for the device's own last-tab restore, not for the server. It spends no latch: the grant is asked for when
+     * the tab arrives, not lost to the turn that had nothing to go on.
+     */
+    @Test
+    fun `nothing is asked before the shown tab is known and then that tab leads`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.autoFocus = null
+        h.goLive()
+        advanceTimeBy(5_000)
+        assertEquals("탭을 모르는데 bootstrap 을 선발급했다", 0, h.bootstrapCalls.size)
+
+        h.coordinator.setFocus(fence().identity, FreeTab.TETHER)
+        advanceTimeBy(2_000)
+        assertEquals(listOf(TETHER, TopicCatalogue.DXY, USD, JPY_TOPIC, EUR_TOPIC), h.asked())
+        assertEquals(listOf(0L, 0L, 500L, 1_000L, 1_500L), h.askedAt(5_000))
+        h.cleanUp()
+    }
+
+    /**
+     * Each tab leads with what it shows; 뉴스 shows none, so it starts the rest at once, one at a time.
+     *
+     * One harness per tab on the shared background scope, cancelled once at the end.
+     */
+    @Test
+    fun `each shown tab leads with its own topics and news leads with none`() = runTest {
+        val expected = mapOf(
+            FreeTab.NEWS to (listOf(TETHER, TopicCatalogue.DXY, USD, JPY_TOPIC, EUR_TOPIC) to listOf(0L, 500L, 1_000L, 1_500L, 2_000L)),
+            FreeTab.TETHER to (listOf(TETHER, TopicCatalogue.DXY, USD, JPY_TOPIC, EUR_TOPIC) to listOf(0L, 0L, 500L, 1_000L, 1_500L)),
+            FreeTab.USD to (plannedAll to listOf(0L, 0L, 500L, 1_000L, 1_500L)),
+            FreeTab.JPY to (listOf(JPY_TOPIC, TETHER, TopicCatalogue.DXY, USD, EUR_TOPIC) to listOf(0L, 500L, 1_000L, 1_500L, 2_000L)),
+            FreeTab.EUR to (listOf(EUR_TOPIC, TETHER, TopicCatalogue.DXY, USD, JPY_TOPIC) to listOf(0L, 500L, 1_000L, 1_500L, 2_000L))
+        )
+        var last: Harness? = null
+        expected.forEach { (tab, want) ->
+            val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds).also { last = it }
+            h.autoFocus = tab
+            val origin = testScheduler.currentTime
+            h.goLive()
+            advanceTimeBy(3_000)
+            assertEquals("[$tab] 순서", want.first, h.asked())
+            assertEquals("[$tab] 시각", want.second, h.askedAt(origin))
+        }
+        last!!.cleanUp()
+    }
+
+    /**
+     * A shown tab that is not the signed-in account's is dropped whole, and the one already held stays.
+     *
+     * Both shapes the user's condition names: another account, and an earlier session of the same account — which only the
+     * generation tells apart. Either one, accepted, would move its tab to the front of what is still owed.
+     */
+    @Test
+    fun `a shown tab from another account or an earlier session changes nothing`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.autoFocus = FreeTab.TETHER
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(listOf(TETHER, TopicCatalogue.DXY), h.asked())
+
+        h.coordinator.setFocus(AuthIdentityFence("u2", 1L), FreeTab.EUR)
+        h.coordinator.setFocus(AuthIdentityFence("u1", 0L), FreeTab.JPY)
+        advanceTimeBy(2_000)
+
+        assertEquals(
+            "신원이 다른 탭 입력이 남은 순서를 바꾸거나 멈췄다",
+            listOf(TETHER, TopicCatalogue.DXY, USD, JPY_TOPIC, EUR_TOPIC),
+            h.asked()
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * The shown tab belongs to the account, not the grant: a new grant for the same account asks in that tab's order without
+     * being told again, and another account signing in has to say its own.
+     */
+    @Test
+    fun `the shown tab outlives a grant but not the account`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED)
+        h.autoFocus = FreeTab.EUR
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(5, h.bootstrapCalls.size)
+
+        h.autoFocus = null
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+        assertEquals(
+            "같은 계정의 새 grant 가 탭을 잃었다",
+            listOf(EUR_TOPIC, TETHER, TopicCatalogue.DXY, USD, JPY_TOPIC),
+            h.asked(from = 5)
+        )
+
+        h.setAccess(true, fence(uid = "u2"))
+        advanceTimeBy(100)
+        assertEquals("다른 계정이 이전 계정의 탭으로 물었다", 10, h.bootstrapCalls.size)
+
+        h.coordinator.setFocus(fence(uid = "u2").identity, FreeTab.USD)
+        advanceTimeBy(100)
+        assertEquals(plannedAll, h.asked(from = 10))
+        h.cleanUp()
+    }
+
+    /** Whichever of the three arrives last, one plan, once — including a tab restored before any grant. */
+    @Test
+    fun `the tab, the grant and the network make one plan in the three specified orders`() = runTest {
+        val orders = listOf<(Harness) -> Unit>(
+            { h -> h.coordinator.setFocus(fence().identity, FreeTab.USD); h.setAccess(true, fence()); h.coordinator.setOnline(true) },
+            { h -> h.coordinator.setFocus(fence().identity, FreeTab.USD); h.coordinator.setOnline(true); h.setAccess(true, fence()) },
+            { h -> h.setAccess(true, fence()); h.coordinator.setOnline(true); h.coordinator.setFocus(fence().identity, FreeTab.USD) }
+        )
+        var last: Harness? = null
+        orders.forEachIndexed { index, arrive ->
+            val h = Harness(this, desired = TopicCatalogue.DESIRED).also { last = it }
+            h.autoFocus = null
+            h.coordinator.start()
+            arrive(h)
+            advanceTimeBy(100)
+            assertEquals("[$index] 순서가 다르거나 계획이 한 번이 아니다", plannedAll, h.asked())
+        }
+        last!!.cleanUp()
+    }
+
+    /** An explicit request made before the tab is known starts nothing, and is one call in the plan once the tab arrives. */
+    @Test
+    fun `an explicit request waits for the shown tab and joins the plan`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.autoFocus = null
+        h.goLive()
+        h.coordinator.requestBootstrap(EUR_TOPIC)
+        advanceTimeBy(1_000)
+        assertEquals("탭을 모르는데 명시 요청을 선발급했다", 0, h.bootstrapCalls.size)
+
+        h.coordinator.setFocus(fence().identity, FreeTab.USD)
+        advanceTimeBy(2_000)
+        assertEquals(plannedAll, h.asked())
+        h.cleanUp()
+    }
+
+    /**
+     * Codex's counterexample to letting the plan stand in for a waiting request (설계 v4 검토).
+     *
+     * The plan is done; the account moves before any `Access` says so, and the new account's tab is accepted — so, under the
+     * same grant, no shown tab counts. A request for a topic the plan already asked is a new question. It must wait, not be
+     * dropped as though the finished plan answered it, and go out when a tab counts again under that same grant.
+     */
+    @Test
+    fun `a request under a tab that no longer counts waits rather than being taken as answered`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED)
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(5, h.bootstrapCalls.size)
+
+        h.liveFence = AuthIdentityFence("u2", 1L)
+        h.coordinator.setFocus(AuthIdentityFence("u2", 1L), FreeTab.USD)
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(100)
+        assertEquals("효력 없는 탭 아래서 명시 요청을 발급했다", 5, h.bootstrapCalls.size)
+
+        h.liveFence = fence().identity
+        h.coordinator.setFocus(fence().identity, FreeTab.USD)
+        advanceTimeBy(100)
+        assertEquals("기다리던 명시 요청을 완료된 계획으로 버렸다", listOf(USD), h.asked(from = 5))
+        h.cleanUp()
+    }
+
+    /** Offline stops the plan where it is; the same grant coming back asks only what is still owed. */
+    @Test
+    fun `going offline pauses the plan and coming back finishes it`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(2, h.bootstrapCalls.size)
+
+        h.coordinator.setOnline(false)
+        advanceTimeBy(3_000)
+        assertEquals("오프라인에서 계속 물었다", 2, h.bootstrapCalls.size)
+
+        h.coordinator.setOnline(true)
+        advanceTimeBy(2_000)
+        assertEquals(plannedAll, h.asked())
+        assertEquals(listOf(0L, 0L, 3_100L, 3_600L, 4_100L), h.askedAt(0))
+        h.cleanUp()
+    }
+
+    /** A refusal latches the grant, and what the plan still owed is not asked under it. */
+    @Test
+    fun `a refused grant asks nothing more of its plan`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = emptyList(), rejections = mapOf(TETHER to "premium_required")))
+        advanceTimeBy(3_000)
+
+        assertEquals("거절된 grant 로 남은 계획을 물었다", listOf(USD, TopicCatalogue.DXY), h.asked())
+        h.cleanUp()
+    }
+
+    /** The first actual issue uses the tab confirmed when the floor opens. */
+    @Test
+    fun `the first batch follows focus changes while the floor holds`() = runTest {
+        val cases = listOf(
+            Triple(FreeTab.USD, FreeTab.NEWS, listOf(0L, 500L, 1_000L, 1_500L, 2_000L)),
+            Triple(FreeTab.JPY, FreeTab.USD, listOf(0L, 0L, 500L, 1_000L, 1_500L))
+        )
+        var last: Harness? = null
+        cases.forEach { (initial, current, times) ->
+            val h = Harness(
+                this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds
+            ).also { last = it }
+            val origin = testScheduler.currentTime
+            h.autoFocus = initial
+            h.bootstrapNotBeforeMillis = origin + 2_000
+            h.goLive()
+            advanceTimeBy(100)
+            h.coordinator.setFocus(fence().identity, current)
+            advanceTimeBy(5_000)
+
+            val topics = if (current == FreeTab.NEWS) {
+                listOf(TETHER, TopicCatalogue.DXY, USD, JPY_TOPIC, EUR_TOPIC)
+            } else {
+                plannedAll
+            }
+            assertEquals("[$initial → $current] 순서", topics, h.asked())
+            assertEquals("[$initial → $current] 첫 묶음", times, h.askedAt(origin + 2_000))
+        }
+        last!!.cleanUp()
+    }
+
+    /**
+     * A tab shown after the first call gets no batch of its own: its topics move ahead, and wait out the gap like the rest.
+     *
+     * The batch is settled by the first call. Showing 달러 once 엔화 has gone out must not let `fx:usd-krw` and `dxy:spot`
+     * start at once, as though the plan were being made again.
+     */
+    @Test
+    fun `a tab shown after the first call gets no batch of its own`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.autoFocus = FreeTab.JPY
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(listOf(JPY_TOPIC), h.asked())
+
+        h.coordinator.setFocus(fence().identity, FreeTab.USD)
+        advanceTimeBy(2_000)
+        assertEquals(listOf(JPY_TOPIC, USD, TopicCatalogue.DXY, TETHER, EUR_TOPIC), h.asked())
+        assertEquals("첫 호출 뒤 보인 탭이 새 묶음을 받았다", listOf(0L, 500L, 1_000L, 1_500L, 2_000L), h.askedAt(0))
+        h.cleanUp()
+    }
+
+    /**
+     * A topic left in the first batch is exempt from the gap only while the shown tab still shows it (설계 v5 구현 2차 검토 반례).
+     *
+     * 테더 goes out first and leaves `dxy:spot` in the batch; the floor then holds it for a moment. Switching to 뉴스 — whose
+     * order also puts `dxy:spot` next, but which does not show it — turns it into an ordinary call that waits out the gap.
+     * Staying on 테더 is the control: there it is still the batch, and goes as soon as the floor lets it.
+     */
+    @Test
+    fun `a first-batch topic the newly shown tab does not show waits out the gap`() = runTest {
+        var last: Harness? = null
+        listOf(FreeTab.NEWS to 500L, null to 100L).forEach { (switchTo, dxyAt) ->
+            val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds).also { last = it }
+            val origin = testScheduler.currentTime
+            var reads = 0
+            h.bootstrapFloor = { if (reads++ == 0) 0L else origin + 100 }
+            h.autoFocus = FreeTab.TETHER
+            h.goLive()
+            advanceTimeBy(50)
+            assertEquals("[$switchTo] 첫 발급", listOf(TETHER), h.asked())
+            switchTo?.let { h.coordinator.setFocus(fence().identity, it) }
+            advanceTimeBy(1_000)
+
+            assertEquals("[$switchTo] 다음 차례", TopicCatalogue.DXY, h.asked().getOrNull(1))
+            assertEquals("[$switchTo] DXY 발급 시각", dxyAt, h.askedAt(origin).getOrNull(1))
+        }
+        last!!.cleanUp()
+    }
+
+    /** The retry floor wins over the order and the gap, at the first call and in the middle alike. */
+    @Test
+    fun `the retry floor holds back the first call and the rest`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.bootstrapNotBeforeMillis = 2_000
+        h.goLive()
+        advanceTimeBy(4_000)
+        assertEquals(plannedAll, h.asked())
+        assertEquals(listOf(2_000L, 2_000L, 2_500L, 3_000L, 3_500L), h.askedAt(0))
+
+        val later = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        val origin = testScheduler.currentTime
+        later.goLive()
+        advanceTimeBy(100)
+        later.bootstrapNotBeforeMillis = origin + 1_200
+        advanceTimeBy(3_000)
+        assertEquals(listOf(0L, 0L, 1_200L, 1_700L, 2_200L), later.askedAt(origin))
+        later.cleanUp()
+    }
+
+    /** A topic already out under this grant is one call however often it is asked; a finished one is asked again. */
+    @Test
+    fun `a request for a topic already out joins it and a finished one is asked again`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED)
+        val gate = CompletableDeferred<Unit>()
+        h.bootstrapGate = gate
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(5, h.bootstrapCalls.size)
+
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertEquals("나가 있는 topic 을 한 번 더 물었다", 5, h.bootstrapCalls.size)
+
+        gate.complete(Unit)
+        advanceTimeBy(100)
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertEquals("끝난 topic 의 명시 재조회를 막았다", listOf(TETHER), h.asked(from = 5))
+        h.cleanUp()
+    }
+
+    /** A request still out under the grant before is not joined: its answer is that grant's, and the new one asks for itself. */
+    @Test
+    fun `a new grant does not join the old grant's calls still out`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED)
+        h.bootstrapGate = CompletableDeferred()
+        h.goLive()
+        advanceTimeBy(100)
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+
+        assertEquals("새 grant 가 옛 grant 의 진행 중 요청에 합류했다", plannedAll, h.asked(from = 5))
+        h.cleanUp()
+    }
+
+    /**
+     * An explicit request joins only a call out under **this** grant.
+     *
+     * The old grant's calls are held while the new grant's finish; a request for a topic the new grant has already been
+     * answered for is a new call, however long the old grant's call for it is still running.
+     */
+    @Test
+    fun `an explicit request does not join the old grant's call for the same topic`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED)
+        val old = CompletableDeferred<Unit>()
+        h.bootstrapGateFor = { issue -> if (issue < 5) old else null }
+        h.goLive()
+        advanceTimeBy(100)
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+        assertEquals(10, h.bootstrapCalls.size)
+
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertEquals("옛 grant 의 진행 중 요청에 합류했다", listOf(TETHER), h.asked(from = 10))
+        old.complete(Unit)
+        h.cleanUp()
+    }
+
+    /**
+     * A call from the grant before, finishing late, takes only its own entry with it.
+     *
+     * Both grants' calls for every topic are held. The old grant's are released first; a request for a topic the new grant
+     * still has out must join that call, which it can only do if the old call's ending left the new call's entry alone.
+     */
+    @Test
+    fun `an old grant's call finishing late does not take the new grant's entry with it`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED)
+        val old = CompletableDeferred<Unit>()
+        val new = CompletableDeferred<Unit>()
+        h.bootstrapGateFor = { issue -> if (issue < 5) old else new }
+        h.goLive()
+        advanceTimeBy(100)
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+        assertEquals(10, h.bootstrapCalls.size)
+
+        old.complete(Unit)
+        advanceTimeBy(100)
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertEquals("옛 요청의 끝이 새 요청의 등록을 지웠다", 10, h.bootstrapCalls.size)
+        new.complete(Unit)
+        h.cleanUp()
+    }
+
+    /**
+     * An account that signs out and back in says its tab again.
+     *
+     * The tab held for it belongs to its earlier session, and the device's restore for the new one may name another — so,
+     * until it does, nothing is asked on the strength of the old one.
+     */
+    @Test
+    fun `an account that comes back has to say its shown tab again`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED)
+        h.autoFocus = FreeTab.EUR
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(5, h.bootstrapCalls.size)
+
+        h.autoFocus = null
+        h.setAccess(true, fence(uid = "u2"))
+        advanceTimeBy(100)
+        h.setAccess(true, fence(generation = 3L))
+        advanceTimeBy(1_000)
+        assertEquals("돌아온 계정이 이전 세션의 탭으로 물었다", 5, h.bootstrapCalls.size)
+
+        h.coordinator.setFocus(fence(generation = 3L).identity, FreeTab.JPY)
+        advanceTimeBy(100)
+        assertEquals(listOf(JPY_TOPIC, TETHER, TopicCatalogue.DXY, USD, EUR_TOPIC), h.asked(from = 5))
+        h.cleanUp()
+    }
+
+    /**
+     * A new grant's plan starts at once, even a moment after the last grant's calls.
+     *
+     * The gap spaces a plan's own calls. It does not hold back the first of the next plan — including a plan for 뉴스, whose
+     * batch is the one topic that leads it.
+     */
+    @Test
+    fun `a new grant's plan starts at once even right after the last one`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.autoFocus = FreeTab.NEWS
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(listOf(0L), h.askedAt(0))
+
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(1)
+        assertEquals("새 grant 의 첫 호출이 옛 grant 의 간격을 기다렸다", listOf(100L), h.askedAt(0, from = 1))
+        h.cleanUp()
+    }
+
+    /** A newly shown tab's topics move ahead of what is still owed; showing a tab already asked for asks nothing. */
+    @Test
+    fun `showing another tab moves its topics ahead of what is still owed`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.goLive()
+        advanceTimeBy(100)
+        h.coordinator.setFocus(fence().identity, FreeTab.EUR)
+        advanceTimeBy(2_000)
+        assertEquals(listOf(USD, TopicCatalogue.DXY, EUR_TOPIC, TETHER, JPY_TOPIC), h.asked())
+
+        h.coordinator.setFocus(fence().identity, FreeTab.USD)
+        advanceTimeBy(2_000)
+        assertEquals("이미 물은 탭으로 돌아가 다시 물었다", 5, h.bootstrapCalls.size)
+        h.cleanUp()
+    }
+
+    /** Stopping lets go of what the plan still owed as well as what is out. */
+    @Test
+    fun `stopping ends the plan as well as the calls out`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        val gate = CompletableDeferred<Unit>()
+        h.bootstrapGate = gate
+        h.goLive()
+        advanceTimeBy(100)
+        h.coordinator.stop()
+        gate.complete(Unit)
+        advanceTimeBy(3_000)
+
+        assertEquals("멈춘 세션이 남은 계획을 물었다", 2, h.bootstrapCalls.size)
+        assertEquals("멈춘 세션의 요청이 끝까지 돌았다", 0, h.bootstrapFinished.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A call that ends without an answer still leaves the calls out.
+     *
+     * The identity-change path posts no answer. If only an answer took the entry away, the topic would read as out for good,
+     * and every later request for it would join a call that no longer exists.
+     */
+    @Test
+    fun `a call that ends in an identity change is not left reading as out`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED)
+        h.bootstrapOutcome = { _, topic ->
+            if (topic == TETHER) throw AuthIdentityChangedException()
+            TopicSnapshotOutcome.Unreachable(java.io.IOException("nothing staged"))
+        }
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(5, h.bootstrapCalls.size)
+
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertEquals("답 없이 끝난 요청이 나가 있는 것으로 남았다", listOf(TETHER), h.asked(from = 5))
+        h.cleanUp()
+    }
+
+    /** An explicit request after the plan still takes the gap and the floor. */
+    @Test
+    fun `an explicit request after the plan still takes the gap and the floor`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.goLive()
+        advanceTimeBy(1_600)
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(1_000)
+        assertEquals("명시 요청이 간격을 무시했다", listOf(2_000L), h.askedAt(0, from = 5))
+
+        h.bootstrapNotBeforeMillis = 5_000
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(3_000)
+        assertEquals("명시 요청이 floor 를 무시했다", listOf(2_000L, 5_000L), h.askedAt(0, from = 5))
+        h.cleanUp()
+    }
+
+    /**
+     * Two sessions with the same desired set and tab but different user epochs and grant tokens
+     * issue the same topics at the same relative times. Capability values and KRX rotation are not exercised.
+     */
+    @Test
+    fun `different user epochs and grant tokens preserve a fixed tab's issue sequence`() = runTest {
+        val plain = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        plain.goLive()
+        advanceTimeBy(2_000)
+
+        val other = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        val origin = testScheduler.currentTime
+        other.coordinator.start()
+        other.setAccess(true, fence(epoch = "epoch-other", grant = 9L))
+        other.coordinator.setOnline(true)
+        advanceTimeBy(2_000)
+
+        assertEquals(plain.asked(), other.asked())
+        assertEquals(plain.askedAt(0), other.askedAt(origin))
+        other.cleanUp()
     }
 
     /** One refusal with the server's own evidence on it, built the way the transport builds one. */
