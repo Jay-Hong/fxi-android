@@ -126,8 +126,10 @@ class AuthenticatedApiClient internal constructor(
      */
     suspend fun getTopicSnapshot(
         owner: AuthSnapshot,
-        topic: String
-    ): AuthenticatedHttpResponse<ByteArray> = transport.executeRead(owner) {
+        topic: String,
+        /** When given, every send is refused once it answers false; see [AuthenticatedTransport.executeRead] (L-4e E2a). */
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthenticatedHttpResponse<ByteArray> = transport.executeRead(owner, useAdmitted) {
         service.getTopicSnapshot(it, topic)
     }.preserve(AuthenticatedEndpoint.TOPIC_SNAPSHOT)
 

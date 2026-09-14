@@ -8,6 +8,7 @@ import com.jay.fxi.data.remote.AuthSnapshotInterceptor
 import com.jay.fxi.data.remote.ClientMetadataInterceptor
 import com.jay.fxi.data.remote.FXiApiService
 import com.jay.fxi.data.remote.MutationOneShotInterceptor
+import com.jay.fxi.data.remote.TopicUseNetworkInterceptor
 import okhttp3.Authenticator
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -37,7 +38,8 @@ class NetworkModuleClientMetadataTest {
             }
         )
         val authInterceptor = AuthSnapshotInterceptor(provider)
-        val client = NetworkModule.provideProtectedOkHttpClient(authInterceptor)
+        val useInterceptor = TopicUseNetworkInterceptor(provider)
+        val client = NetworkModule.provideProtectedOkHttpClient(authInterceptor, useInterceptor)
         assertEquals(
             "D24 admission must be the first REST interceptor",
             ReleaseAdmissionInterceptor::class,
@@ -63,6 +65,11 @@ class NetworkModuleClientMetadataTest {
             MutationOneShotInterceptor::class,
             client.interceptors.last()::class
         )
+        assertSame(
+            "the use check must be the exact instance, and the last network interceptor, so it sees every exchange",
+            useInterceptor,
+            client.networkInterceptors.last()
+        )
         assertFalse(client.retryOnConnectionFailure)
         assertFalse(client.followRedirects)
         assertFalse(client.followSslRedirects)
@@ -77,6 +84,7 @@ class NetworkModuleClientMetadataTest {
         assertTrue(publicClient.followSslRedirects)
         assertFalse(publicClient.interceptors.any { it is AuthSnapshotInterceptor })
         assertFalse(publicClient.interceptors.any { it is MutationOneShotInterceptor })
+        assertFalse(publicClient.networkInterceptors.any { it is TopicUseNetworkInterceptor })
 
         val protectedRetrofit = NetworkModule.provideProtectedRetrofit(
             client,

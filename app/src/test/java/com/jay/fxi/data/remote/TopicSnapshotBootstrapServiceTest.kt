@@ -64,6 +64,7 @@ class TopicSnapshotBootstrapServiceTest {
             .proxyAuthenticator(Authenticator.NONE)
             .addInterceptor(AuthSnapshotInterceptor(provider))
             .addInterceptor(MutationOneShotInterceptor())
+            .addNetworkInterceptor(TopicUseNetworkInterceptor(provider))
             .build()
         val retrofit = Retrofit.Builder()
             .baseUrl(server.url("/"))
@@ -307,6 +308,38 @@ class TopicSnapshotBootstrapServiceTest {
 
         assertTrue("이전 grant 의 요청이 새 계정으로 나갔다", moved)
         assertEquals("보내지 않았어야 할 요청이 나갔다", 0, server.requestCount)
+    }
+
+    /**
+     * A send refused because the access it serves was withheld leaves the attempt as that refusal (L-4e E2a).
+     *
+     * It is not an unreachable server and not a timeout: nothing was asked, and the session decides what a withheld use means.
+     * The refusal travels out as a cancellation, like an identity change, so no outcome is formed for it.
+     */
+    @Test
+    fun `a withheld use leaves the attempt as a refusal, not as an outcome`() = runBlocking {
+        server.enqueue(ok(TETHER_SNAPSHOT))
+        var outcome: TopicSnapshotOutcome? = null
+
+        val refused = runCatching { outcome = service().bootstrap(owner(), TETHER) { false } }.exceptionOrNull()
+
+        assertTrue("the withheld use became something else: $refused", refused is TopicUseWithheldException)
+        assertNull(outcome)
+        assertEquals("a withheld send reached the server", 0, server.requestCount)
+    }
+
+    /** A use still admitted at every exchange delivers as it always did, the server's immediate repeat included. */
+    @Test
+    fun `an admitted use delivers through the server's immediate repeat`() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(503).setHeader("Retry-After", "0"))
+        server.enqueue(ok(TETHER_SNAPSHOT))
+        var checks = 0
+
+        val outcome = service().bootstrap(owner(), TETHER) { checks += 1; true }
+
+        assertTrue("an admitted use did not deliver: $outcome", outcome is TopicSnapshotOutcome.Delivered)
+        assertEquals(2, server.requestCount)
+        assertEquals("each exchange was not checked", 2, checks)
     }
 
     /**

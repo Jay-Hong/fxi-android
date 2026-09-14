@@ -63,10 +63,14 @@ class TopicSnapshotBootstrapService internal constructor(
      * The mark is taken once, before anything else, so neither the transport's 401 replay nor
      * decoding can push it back.
      */
-    suspend fun bootstrap(owner: AuthIdentityFence, topic: String): TopicSnapshotOutcome {
+    suspend fun bootstrap(
+        owner: AuthIdentityFence,
+        topic: String,
+        useAdmitted: (() -> Boolean)? = null
+    ): TopicSnapshotOutcome {
         val started = TimeSource.Monotonic.markNow()
         val answered = try {
-            withTimeoutOrNull(attemptBudget) { attempt(owner, topic) }
+            withTimeoutOrNull(attemptBudget) { attempt(owner, topic, useAdmitted) }
         } catch (unreachable: IOException) {
             // Not an answer that arrived late — an answer that never arrived. The cause is the
             // evidence, so it is kept rather than flattened into the deadline.
@@ -78,7 +82,7 @@ class TopicSnapshotBootstrapService internal constructor(
         return answered
     }
 
-    private suspend fun attempt(owner: AuthIdentityFence, topic: String): TopicSnapshotOutcome {
+    private suspend fun attempt(owner: AuthIdentityFence, topic: String, useAdmitted: (() -> Boolean)?): TopicSnapshotOutcome {
         // Bound to the account the caller issued under, not to whoever happens to be signed in
         // when this job starts. The transport binds **identity only** — it re-checks uid and
         // authGeneration before the token is read and again once the response is in hand — and
@@ -89,7 +93,7 @@ class TopicSnapshotBootstrapService internal constructor(
         // transport re-checks after the response and refuses it, closing the bodies and carrying the
         // status and `Retry-After` out with the identity change. Re-checking again below would be a
         // second guard that no test can tell from the first — measured, not assumed.
-        val response = api.getTopicSnapshot(credential, topic)
+        val response = api.getTopicSnapshot(credential, topic, useAdmitted)
 
         response.failure?.let { return it.toTopicSnapshotOutcome() }
         val body = response.body

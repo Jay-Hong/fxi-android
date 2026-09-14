@@ -11,6 +11,7 @@ import com.jay.fxi.data.remote.ClientMetadataInterceptor
 import com.jay.fxi.data.remote.FXiApiService
 import com.jay.fxi.data.remote.MutationOneShotInterceptor
 import com.jay.fxi.data.remote.TopicFrameDecoder
+import com.jay.fxi.data.remote.TopicUseNetworkInterceptor
 import com.jay.fxi.util.ApiConfig
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import dagger.Module
@@ -70,7 +71,8 @@ object NetworkModule {
     @Singleton
     @ProtectedRest
     internal fun provideProtectedOkHttpClient(
-        authSnapshotInterceptor: AuthSnapshotInterceptor
+        authSnapshotInterceptor: AuthSnapshotInterceptor,
+        topicUseNetworkInterceptor: TopicUseNetworkInterceptor
     ): OkHttpClient = commonRestClientBuilder(
         beforeLogging = { addInterceptor(authSnapshotInterceptor) },
         afterLogging = {
@@ -78,6 +80,8 @@ object NetworkModule {
             addInterceptor(MutationOneShotInterceptor())
         }
     )
+        // Must remain the final network interceptor: it checks each exchange, follow-ups included, right before it is written.
+        .addNetworkInterceptor(topicUseNetworkInterceptor)
         .retryOnConnectionFailure(false)
         .followRedirects(false)
         .followSslRedirects(false)

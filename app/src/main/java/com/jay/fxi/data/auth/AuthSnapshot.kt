@@ -62,5 +62,27 @@ class AuthIdentityChangedException(
      */
     val statusCode: Int? = null,
     /** `Retry-After` from that same response, verbatim and unparsed. */
-    val retryAfter: String? = null
+    val retryAfter: String? = null,
+    /**
+     * Every response a use-checked request observed on the wire before this ended it, oldest first (L-4e E2a).
+     *
+     * Empty for any other request. When not empty it is the evidence to hand over, one call per response.
+     * When [statusCode] is present, it and [retryAfter] repeat the last entry; a send refused before returning a response
+     * may leave both null. Never hand these fields over separately from a non-empty list.
+     */
+    val exchanges: List<HttpExchangeEvidence> = emptyList()
 ) : CancellationException("Authentication changed while acquiring or using a credential")
+
+/**
+ * One response a protected read received on the wire: which send of the logical call it answered, which exchange of that
+ * send, and what the server said about retrying. [retryAfter] is verbatim and unparsed.
+ *
+ * Several can belong to one send, because OkHttp repeats a request below the application interceptors on
+ * `503 + Retry-After: 0` and on a misdirected 421 — each is a response of its own, and neither replaces the one before.
+ */
+data class HttpExchangeEvidence(
+    val send: Int,
+    val exchange: Int,
+    val statusCode: Int,
+    val retryAfter: String?
+)
