@@ -432,7 +432,7 @@ class TopicSessionCoordinator(
         (attribution: TopicUseAttribution, topic: String, outcome: TopicSnapshotOutcome) -> Unit =
         { _, _, _ -> },
     desired: Set<String> = TopicCatalogue.DESIRED
-) {
+) : TopicGrantSink {
     /**
      * Copied, so what this session consumes cannot change under it.
      *
@@ -681,7 +681,7 @@ class TopicSessionCoordinator(
      * the plan it asked for is made again when access returns, and a different fence is a different session. Holds go to
      * [accessRevised].
      */
-    fun setAccess(allowed: Boolean, fence: TopicSessionFence?) =
+    override fun setAccess(allowed: Boolean, fence: TopicSessionFence?) =
         post(SessionInput.Access(allowed, fence))
 
     /**
@@ -691,7 +691,7 @@ class TopicSessionCoordinator(
      * it observes, including one whose hold it missed: the session asks its own questions again and changes only what they answer
      * differently. Repeating it is harmless, and it resets no budget.
      */
-    fun accessRevised() = post(SessionInput.AccessRevised)
+    override fun accessRevised() = post(SessionInput.AccessRevised)
 
     /**
      * Asks the REST twin for [topic] once.

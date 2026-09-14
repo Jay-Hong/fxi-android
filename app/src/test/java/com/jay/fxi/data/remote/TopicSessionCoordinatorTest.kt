@@ -1,5 +1,12 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.auth.AuthFenceStream
+import com.jay.fxi.data.entitlements.PremiumAccessTopicGrantIssuer
+import com.jay.fxi.data.entitlements.TopicGrantDeliverer
+import com.jay.fxi.data.entitlements.TopicGrantIssuer
+import com.jay.fxi.data.entitlements.TopicGrantResult
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
@@ -7018,5 +7025,350 @@ class TopicSessionCoordinatorTest {
         assertTrue(TopicAccessBlock.LOSS_CANDIDATE in issuer.premium.accessSnapshot.facts.userBlocks)
         assertTrue("USER 보류 revision 이 프레임 없이 연결을 끝내지 않았다", first.cancelled)
         backgroundScope.cancel()
+    }
+
+    // ---- the deliverer, joined (L-4e E3) ----------------------------------------------------------------------------
+
+    /** The auth stream as a test drives it: registration replays `u1`/1, and [callback] is a later transition. */
+    private class DrivenFences : AuthFenceStream {
+        var callback: ((AuthIdentityFence?) -> Unit)? = null
+        override fun observe(onFence: (AuthIdentityFence?) -> Unit) {
+            callback = onFence
+            onFence(AuthIdentityFence("u1", 1L))
+        }
+    }
+
+    /** The session as the deliverer sees it, with every call recorded before it is passed on. */
+    private class RecordingSink(private val session: TopicSessionCoordinator) : TopicGrantSink {
+        val calls = mutableListOf<String>()
+        val granted = mutableListOf<TopicSessionFence>()
+        override fun setAccess(allowed: Boolean, fence: TopicSessionFence?) {
+            calls += "access:$allowed:${fence?.grant?.value}"
+            if (allowed && fence != null) granted += fence
+            session.setAccess(allowed, fence)
+        }
+
+        override fun accessRevised() {
+            calls += "revised"
+            session.accessRevised()
+        }
+    }
+
+    /** A pull counter in front of an issuer. */
+    private class CountingIssuer(private val inner: TopicGrantIssuer) : TopicGrantIssuer by inner {
+        var pulls = 0
+        override suspend fun topicGrantResult(): TopicGrantResult {
+            pulls += 1
+            return inner.topicGrantResult()
+        }
+    }
+
+    private class Delivered(val deliverer: TopicGrantDeliverer, val sink: RecordingSink, val fences: DrivenFences)
+
+    /** A deliverer from [issuer] to [h]'s session, with the session's refusals wired back through it. Not started. */
+    private fun delivering(h: Harness, issuer: TopicGrantIssuer): Delivered {
+        val sink = RecordingSink(h.coordinator)
+        val fences = DrivenFences()
+        val deliverer = TopicGrantDeliverer(
+            issuer, sink, fences, h.scope, h.clock,
+            deliveryDispatcher = h.scope.coroutineContext[kotlin.coroutines.ContinuationInterceptor]
+                as kotlinx.coroutines.CoroutineDispatcher
+        )
+        h.refusalSink = { owner, reasons -> deliverer.forwardRejection(owner, reasons) }
+        return Delivered(deliverer, sink, fences)
+    }
+
+    /** The real issuer with a granted premium user, KRX visible and loss markers standing, and the session reading its snapshot. */
+    private suspend fun TestScope.grantedIssuer(h: Harness): Pair<Issuer, TopicSessionFence> {
+        val issuer = Issuer(this, h)
+        issuer.outcome = { EntitlementsOutcome.StableActive(krxVisible = true) }
+        val issued = issuer.grant()
+        issuer.record = issuer.record.copy(mayContainPremiumData = true, mayContainKrxData = true)
+        h.authority = SnapshotTopicUseAuthority { issuer.premium.accessSnapshot }
+        return issuer to issued
+    }
+
+    private suspend fun TestScope.liveThroughDeliverer(
+        h: Harness,
+        d: Delivered,
+        issued: TopicSessionFence,
+        firstAck: String = h.ack("r1", active = listOf(TETHER, USD))
+    ) {
+        h.coordinator.start()
+        h.coordinator.setOnline(true)
+        h.coordinator.setFocus(issued.identity, FreeTab.USD)
+        d.deliverer.start()
+        advanceTimeBy(100)
+        assertEquals("전달자가 grant 를 넘기지 않았다", 1, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(firstAck)
+        advanceTimeBy(1)
+    }
+
+    /**
+     * Joined end to end: the deliverer carries the issuer's grant to the session, and a USER hold the issuer publishes goes over as a
+     * revision — the connection ends with no frame, and no explicit end reaches the session (L-4e E3).
+     */
+    @Test
+    fun `the deliverer carries the grant and a user hold as a revision, never as an end`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val d = delivering(h, PremiumAccessTopicGrantIssuer(issuer.premium))
+        liveThroughDeliverer(h, d, issued)
+        assertEquals(listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        assertEquals("access:true:${issued.grant.value}", d.sink.calls.first())
+
+        issuer.outcome = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        issuer.afterFetch = { issuer.loadFailures = 2 }
+        issuer.premium.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceTimeBy(1)
+        assertTrue(TopicAccessBlock.LOSS_CANDIDATE in issuer.premium.accessSnapshot.facts.userBlocks)
+        assertTrue("보류 revision 이 연결을 끝내지 않았다", h.wires.first().cancelled)
+        assertTrue("보류를 명시적 종료로 보냈다: ${d.sink.calls}", d.sink.calls.none { it.startsWith("access:false") })
+        h.cleanUp()
+    }
+
+    /**
+     * A hold released by the transport moving leaves a missing grant the snapshot does not explain — the binding is still the old
+     * session's — so the deliverer keeps reading on its wait and never ends the grant (L-4e E3).
+     */
+    @Test
+    fun `a release the binding has not caught up with is read again and not taken as an end`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val counting = CountingIssuer(PremiumAccessTopicGrantIssuer(issuer.premium))
+        val d = delivering(h, counting)
+        liveThroughDeliverer(h, d, issued)
+
+        issuer.outcome = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        issuer.afterFetch = { issuer.loadFailures = 2 }
+        issuer.premium.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceTimeBy(1)
+        issuer.transportIdentity = EntitlementsIdentity("u1", 2L)
+        advanceTimeBy(2_100)
+        assertTrue(issuer.premium.accessSnapshot.facts.userAllowed)
+        val afterRelease = counting.pulls
+        advanceTimeBy(10_000)
+        assertTrue("판정 불가 null 을 다시 읽지 않았다: $afterRelease → ${counting.pulls}", counting.pulls > afterRelease)
+        assertTrue("판정 불가 null 을 종료로 보냈다: ${d.sink.calls}", d.sink.calls.none { it.startsWith("access:false") })
+        h.cleanUp()
+    }
+
+    /**
+     * A hold the deliverer never saw — it was held and released before the deliverer read — still ends the connection it invalidated
+     * (L-4e E3): the read after it is a missing grant the snapshot does not explain, which goes over as a revision, and the session's
+     * own check finds the lifetime spent. No frame, no explicit end.
+     */
+    @Test
+    fun `a hold the deliverer missed still ends the connection it invalidated`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val counting = CountingIssuer(PremiumAccessTopicGrantIssuer(issuer.premium))
+        val d = delivering(h, counting)
+        refusedUnder(h, issued)
+        val first = h.wire
+        first.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+
+        issuer.outcome = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        issuer.afterFetch = { issuer.loadFailures = 2 }
+        issuer.premium.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceTimeBy(1)
+        issuer.transportIdentity = EntitlementsIdentity("u1", 2L)
+        advanceTimeBy(2_100)
+        assertTrue(issuer.premium.accessSnapshot.facts.userAllowed)
+        assertEquals("아무도 revision 을 넘기지 않았는데 연결이 끝났다", false, first.cancelled)
+
+        d.deliverer.start()
+        advanceTimeBy(1)
+        assertTrue(counting.pulls >= 1)
+        assertTrue("판정 불가 null 이 revision 으로 가지 않았다: ${d.sink.calls}", "revised" in d.sink.calls)
+        assertTrue("놓친 보류가 무효로 만든 연결이 남았다", first.cancelled)
+        assertTrue(d.sink.calls.none { it.startsWith("access:") })
+        h.cleanUp()
+    }
+
+    /** A decided loss is an end: the session is told, stops, and a later approval arrives as a new grant with its own plan (L-4e E3). */
+    @Test
+    fun `a decided loss ends the grant and a later approval arrives as a new one`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val d = delivering(h, PremiumAccessTopicGrantIssuer(issuer.premium))
+        liveThroughDeliverer(h, d, issued)
+
+        issuer.outcome = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        issuer.premium.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceTimeBy(100)
+        assertTrue("결정된 손실을 종료로 보내지 않았다: ${d.sink.calls}", "access:false:${issued.grant.value}" in d.sink.calls)
+        assertTrue(h.wires.first().cancelled)
+        val planned = h.bootstrapCalls.size
+        advanceTimeBy(60_000)
+        assertEquals("종료 뒤 다시 연결했다", 1, h.wires.size)
+        assertEquals("종료 뒤 다시 발급했다", planned, h.bootstrapCalls.size)
+
+        issuer.outcome = { EntitlementsOutcome.StableActive(krxVisible = false) }
+        issuer.premium.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceTimeBy(100)
+        val regranted = d.sink.calls.last { it.startsWith("access:true") }
+        assertNotEquals("재승인이 옛 token 을 되살렸다", "access:true:${issued.grant.value}", regranted)
+        assertEquals("새 grant 로 연결하지 않았다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** An identity move ends the delivered grant; the re-approval arrives as a grant for the new binding (L-4e E3). */
+    @Test
+    fun `an identity move ends the grant and the re-approval arrives for the new binding`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val d = delivering(h, PremiumAccessTopicGrantIssuer(issuer.premium))
+        liveThroughDeliverer(h, d, issued)
+
+        issuer.transportIdentity = EntitlementsIdentity("u1", 2L)
+        issuer.premium.onIdentityChanged(AuthIdentityFence("u1", 2L))
+        d.fences.callback!!(AuthIdentityFence("u1", 2L))
+        advanceTimeBy(100)
+        assertTrue("identity 이동이 종료로 가지 않았다: ${d.sink.calls}", "access:false:${issued.grant.value}" in d.sink.calls)
+        assertTrue(h.wires.first().cancelled)
+
+        issuer.premium.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceTimeBy(100)
+        val regranted = d.sink.granted.last()
+        assertEquals("새 binding 의 grant 가 아니다", AuthIdentityFence("u1", 2L), regranted.identity)
+        assertNotEquals(issued.grant, regranted.grant)
+        h.cleanUp()
+    }
+
+    /** A KRX rotation changes the token, which reaches the session as a different grant: a different session (L-4e E3). */
+    @Test
+    fun `a capability rotation reaches the session as a new grant`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val d = delivering(h, PremiumAccessTopicGrantIssuer(issuer.premium))
+        liveThroughDeliverer(h, d, issued)
+        h.wires.first().deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+
+        issuer.outcome = { EntitlementsOutcome.StableActive(krxVisible = false) }
+        issuer.premium.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        advanceTimeBy(100)
+        assertTrue(d.sink.calls.none { it.startsWith("access:false") })
+        assertNotEquals("access:true:${issued.grant.value}", d.sink.calls.last { it.startsWith("access:true") })
+        assertTrue("회전한 grant 의 옛 연결이 남았다", h.wires.first().cancelled)
+        assertTrue("다른 grant 인데 옛 시세가 남았다", h.coordinator.rates.value.quotes.isEmpty())
+        assertEquals(2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** A socket refusal travels session → deliverer → issuer, and the end the issuer decides comes back the same way (L-4e E3). */
+    @Test
+    fun `a socket refusal reaches the issuer through the deliverer and its end comes back`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val d = delivering(h, PremiumAccessTopicGrantIssuer(issuer.premium))
+        liveThroughDeliverer(h, d, issued, h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(100)
+
+        assertEquals(listOf(issued), h.rejectedOwners)
+        assertEquals("전달자를 거친 거부가 적용되지 않았다", PremiumAccessState.Rejected, issuer.premium.state.value.state)
+        assertTrue("발급자가 정한 종료가 돌아오지 않았다: ${d.sink.calls}", "access:false:${issued.grant.value}" in d.sink.calls)
+        h.cleanUp()
+    }
+
+    /** The same refusal through the deliverer, after the grant's context moved, is discarded by the issuer (L-4e E3). */
+    @Test
+    fun `a refusal through the deliverer after its grant's context moved is discarded`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val d = delivering(h, PremiumAccessTopicGrantIssuer(issuer.premium))
+        h.coordinator.start()
+        h.coordinator.setOnline(true)
+        h.coordinator.setFocus(issued.identity, FreeTab.USD)
+        d.deliverer.start()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+
+        issuer.record = AccessEpochTransitions.rotate(issuer.record, rotateUser = true, rotateKrx = false, ids = issuer.ids)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(100)
+        assertEquals(listOf(issued), h.rejectedOwners)
+        assertEquals("문맥이 바뀐 뒤의 거부가 적용됐다", PremiumAccessState.PremiumConfirmed, issuer.premium.state.value.state)
+        assertTrue(d.sink.calls.none { it.startsWith("access:false") })
+        h.cleanUp()
+    }
+
+    /**
+     * A pull whose record read fails changes nothing at the session (L-4e E3). The failed read is itself published — the record is
+     * unconfirmed — so the next read comes at once; reads that keep failing publish nothing more and wait on the growing retry.
+     */
+    @Test
+    fun `failed pulls change nothing at the session and are read again`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val counting = CountingIssuer(PremiumAccessTopicGrantIssuer(issuer.premium))
+        val d = delivering(h, counting)
+        liveThroughDeliverer(h, d, issued)
+        val calls = d.sink.calls.size
+        val pulls = counting.pulls
+
+        issuer.loadFailures = 3
+        d.fences.callback!!(AuthIdentityFence("u1", 1L))
+        advanceTimeBy(1)
+        assertEquals("실패가 게시한 revision 을 곧바로 읽지 않았다", pulls + 2, counting.pulls)
+        advanceTimeBy(3_900)
+        assertEquals(pulls + 2, counting.pulls)
+        advanceTimeBy(200)
+        assertEquals("두 번째 실패 뒤 4초에 다시 읽지 않았다", pulls + 3, counting.pulls)
+        advanceTimeBy(7_700)
+        assertEquals(pulls + 3, counting.pulls)
+        assertEquals("실패한 pull 이 세션에 무엇을 보냈다", calls, d.sink.calls.size)
+        assertEquals(false, h.wires.first().cancelled)
+
+        advanceTimeBy(200)
+        assertTrue(counting.pulls >= pulls + 4)
+        assertEquals("access:true:${issued.grant.value}", d.sink.calls.drop(calls).first())
+        assertTrue(d.sink.calls.drop(calls).none { it.startsWith("access:false") })
+        assertEquals(1, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * The same context's hold and release through the real deliverer, over an issuer whose snapshot the test controls (L-4e E3): the
+     * release reconnects under a new use and carries on only what the plan still owed, and no explicit end is ever sent.
+     */
+    @Test
+    fun `a same-context hold and release through the deliverer keep the grant and carry on what is owed`() = runTest {
+        val h = Harness(this, bootstrapIssueGap = 10.seconds)
+        val access = h.publishedAccess()
+        val revisions = MutableStateFlow(0L)
+        val issuer = object : TopicGrantIssuer {
+            override val accessRevisions: StateFlow<Long> = revisions
+            override suspend fun topicGrantResult(): TopicGrantResult {
+                val snapshot = access.snapshot().copy(revision = revisions.value)
+                val fence = fence().takeIf { snapshot.facts.userAllowed && snapshot.facts.tokenStanding }
+                return TopicGrantResult(fence, snapshot)
+            }
+            override suspend fun onTopicRejected(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) = Unit
+        }
+        val d = delivering(h, issuer)
+        liveThroughDeliverer(h, d, fence())
+        assertEquals(listOf(USD), h.bootstrapCalls.map { it.second })
+
+        access.hold()
+        revisions.value = 1L
+        advanceTimeBy(1)
+        assertTrue(h.wires.first().cancelled)
+        advanceTimeBy(20_000)
+        assertEquals(listOf(USD), h.bootstrapCalls.map { it.second })
+
+        access.release()
+        revisions.value = 2L
+        advanceTimeBy(1)
+        assertEquals("해제 뒤 남은 topic 만 이어서 발급하지 않았다", listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        advanceTimeBy(1_700)
+        assertEquals("해제가 사다리로 다시 열지 않았다", 2, h.wires.size)
+        assertTrue("보류를 명시적 종료로 보냈다: ${d.sink.calls}", d.sink.calls.none { it.startsWith("access:false") })
+        h.cleanUp()
     }
 }

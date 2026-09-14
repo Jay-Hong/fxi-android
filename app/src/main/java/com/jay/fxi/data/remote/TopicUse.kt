@@ -34,3 +34,15 @@ class TopicUseAttribution internal constructor(
     internal val grantEpoch: Long,
     internal val lifetime: TopicUseLifetime
 )
+
+/**
+ * What a deliverer tells the session about the grant it may run under (L-4e E3).
+ *
+ * Both calls only post to the session's loop: neither suspends nor reads anything, so a deliverer can make them from wherever it
+ * decided. [setAccess] carries a grant or its explicit end, [accessRevised] a new access snapshot under the context already held.
+ */
+interface TopicGrantSink {
+    fun setAccess(allowed: Boolean, fence: TopicSessionFence?)
+
+    fun accessRevised()
+}
