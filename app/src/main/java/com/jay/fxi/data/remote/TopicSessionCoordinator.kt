@@ -1544,14 +1544,15 @@ class TopicSessionCoordinator(
         // reading of the clock, could find the deadline passed after the store had taken the answer
         // and publish that answer on the way to the teardown.
         current(live.generation)?.let { still -> applyLeases(still, ack) }
+        // Reported before the two observers below (L-4e E4a): the refusal is settled and its leases handled, and an observer that
+        // throws must not keep the grant's refusal from the issuer. `live.fence`, not the session's current one: the refusal
+        // above may already have ended this connection, and the grant it answered is the one this connection was opened under.
+        if (ack.rejected.isNotEmpty()) onRejected(live.fence, ack.rejected)
         // The acknowledgement's own store writes happen inside the command, not on the loop, so
         // the turn-boundary publication would not carry them until something else arrives.
         publishIfChanged()
 
         onAcknowledgement(ack)
-        // `live.fence`, not the session's current one: the refusal above may already have ended
-        // this connection, and the grant it answered is the one this connection was opened under.
-        if (ack.rejected.isNotEmpty()) onRejected(live.fence, ack.rejected)
     }
 
     // ---- leases -----------------------------------------------------------------------------

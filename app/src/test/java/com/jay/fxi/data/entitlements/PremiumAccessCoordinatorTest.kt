@@ -126,7 +126,8 @@ class PremiumAccessCoordinatorTest {
         source: EntitlementsSource,
         purger: RecordingPurger = RecordingPurger(PurgeResult.Completed),
         /** The live auth fence the coordinator reads. Signed out unless a test says otherwise. */
-        live: () -> AuthIdentityFence? = { null }
+        live: () -> AuthIdentityFence? = { null },
+        beforeRejectionRecheckArmed: suspend () -> Unit = {}
     ) = PremiumAccessCoordinator(
         source = source,
         store = store,
@@ -137,7 +138,8 @@ class PremiumAccessCoordinatorTest {
         // Exact nominal delays. Production spreads them; a test that cannot pin the spread
         // cannot assert when a tick fired.
         jitter = ProbeJitter.None,
-        liveFence = live
+        liveFence = live,
+        beforeRejectionRecheckArmed = beforeRejectionRecheckArmed
     )
 
     private fun ids(): EpochIdGenerator {
@@ -1146,25 +1148,36 @@ class PremiumAccessCoordinatorTest {
         val purger: RecordingPurger,
         val coordinator: PremiumAccessCoordinator,
         val grant: TopicGrantToken,
-        val fetches: () -> Int
+        val fetches: () -> Int,
+        /** Fetches that asked for a fresh premium answer, a `FORCE_PREMIUM` query's (L-4e E4a). */
+        val freshFetches: () -> Int = { 0 }
     )
 
     /** A bound owner with a confirmed premium grant and the topic grant issued for it. */
     private suspend fun TestScope.granted(
         krxVisible: Boolean = false,
         live: () -> AuthIdentityFence? = { null },
-        next: () -> EntitlementsOutcome = { EntitlementsOutcome.StableActive(krxVisible = krxVisible) }
+        next: () -> EntitlementsOutcome = { EntitlementsOutcome.StableActive(krxVisible = krxVisible) },
+        /** Parks a fetch while it is set; the fetch takes and clears it (L-4e E4a). */
+        fetchGate: () -> CompletableDeferred<Unit>? = { null },
+        beforeRejectionRecheckArmed: suspend () -> Unit = {}
     ): Granted {
         val store = FakeStore(ids())
         var fetches = 0
-        val source = FakeSource { fetches += 1; answer(next()) }
+        var freshFetches = 0
+        val source = FakeSource { fresh ->
+            fetches += 1
+            if (fresh) freshFetches += 1
+            fetchGate()?.await()
+            answer(next())
+        }
         val purger = RecordingPurger(PurgeResult.Completed)
-        val coordinator = build(store, source, purger, live)
+        val coordinator = build(store, source, purger, live, beforeRejectionRecheckArmed)
         coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
         assertEquals(PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
-        return Granted(store, source, purger, coordinator, coordinator.issuedGrant(), { fetches })
+        return Granted(store, source, purger, coordinator, coordinator.issuedGrant(), { fetches }, { freshFetches })
     }
 
     @Test
@@ -1374,10 +1387,11 @@ class PremiumAccessCoordinatorTest {
      * A refusal delivered after its context moved, with nobody having asked for a new grant.
      *
      * The token, generation, record-fence and live-identity cases isolate those checks.
-     * Rebinding to another account changes generation, record fence and binding together.
+     * Rebinding to another account changes generation, record fence and binding together. A live identity that cannot be read
+     * is not a moved context and is kept rather than discarded (L-4e E4a R1′); see the refusal re-check section.
      */
     @Test
-    fun aDelayedRefusalIsDiscarded_whenItsContextMovedWithoutAReissue() = runTest {
+    fun aDelayedRefusalIsDiscarded_whenItsContextMovedWithoutAReissue() = refusalTest {
         val external = run { var n = 0; EpochIdGenerator { "external-${n++}" } }
         fun case(name: String, move: suspend Granted.() -> TopicGrantToken) = name to move
         val cases = listOf(
@@ -1392,7 +1406,6 @@ class PremiumAccessCoordinatorTest {
                 grant
             },
             case("live 세션 이동") { source.identity = EntitlementsIdentity(OWNER, 2L); grant },
-            case("live 신원 읽기 불가") { source.identity = null; grant },
             case("다른 계정 바인딩") { coordinator.onIdentityChanged(ownerFence("user-b")); grant }
         )
         for ((name, move) in cases) {
@@ -1403,17 +1416,22 @@ class PremiumAccessCoordinatorTest {
             val purgesBefore = g.purger.calls.size
 
             g.coordinator.onTopicRejected(token, PREMIUM_REFUSAL)
-            advanceUntilIdle()
+            // Bounded, not until idle: a discard leaves nothing to run, and a refusal wrongly kept would re-check forever.
+            advanceTimeBy(120_000)
+            runCurrent()
 
             assertEquals("$name: 상태가 바뀌었다", stateBefore, g.coordinator.state.value)
             assertEquals("$name: 기록이 바뀌었다", recordBefore, g.store.record)
             assertEquals("$name: purge 가 돌았다", purgesBefore, g.purger.calls.size)
+            assertNull("$name: 버린 거부가 재확인을 남겼다", g.coordinator.recheckDiagnostics().owedIntent)
+            assertNull("$name: 버린 거부가 인계로 기록됐다", g.coordinator.rejectionView(token).latestCurrent)
+            assertEquals("$name: 예약이 남았다", emptyList<Long>(), g.coordinator.rejectionView(token).pendingOrders)
         }
         processJob.cancel()
     }
 
     @Test
-    fun aDelayedRefusalIsDiscarded_whileASignOutIsOpen() = runTest {
+    fun aDelayedRefusalIsDiscarded_whileASignOutIsOpen() = refusalTest {
         val g = granted(live = { ownerFence(OWNER) })
         assertTrue(g.coordinator.prepareSignOut(ownerFence(OWNER)) is SignOutStart.Armed)
         val loadsBefore = g.store.loads
@@ -1425,6 +1443,61 @@ class PremiumAccessCoordinatorTest {
         assertEquals("봉인 중에 저장소를 읽었다", loadsBefore, g.store.loads)
         assertEquals(recordBefore, g.store.record)
         assertNull("봉인 중에 grant 가 나왔다", g.coordinator.topicGrant())
+        // L-4e E4a: not admitted is not a refusal kept for later.
+        assertNull(g.coordinator.recheckDiagnostics().owedIntent)
+        assertEquals(emptyList<Long>(), g.coordinator.rejectionView(g.grant).pendingOrders)
+        assertNull(g.coordinator.rejectionView(g.grant).latestCurrent)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aRefusalDuringAPersistenceHold_isDiscardedWithoutChangingItsContext() = refusalTest {
+        val g = granted()
+        val generation = g.coordinator.accessSnapshot.facts.decisionGeneration
+        g.store.failNextLoad = true
+        val held = g.coordinator.resumeStartupPurge().heldByPersistence()
+        val snapshot = g.coordinator.accessSnapshot
+        val record = g.store.record
+        val loads = g.store.loads
+        val fetches = g.fetches()
+        assertEquals(generation, snapshot.facts.decisionGeneration)
+
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        assertEquals(loads, g.store.loads)
+        assertEquals(record, g.store.record)
+        assertEquals(snapshot, g.coordinator.accessSnapshot)
+        assertNull(g.coordinator.owed())
+        val ended = g.coordinator.rejectionView(g.grant)
+        assertEquals(emptyList<Long>(), ended.pendingOrders)
+        assertTrue(ended.latestReported != null)
+        assertNull(ended.latestCurrent)
+
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(60_000)
+        runCurrent()
+        assertEquals(fetches, g.fetches())
+        g.coordinator.resumePersistence(held.id).applied()
+        advanceTimeBy(60_000)
+        runCurrent()
+        assertEquals("보류 중 거부가 해제 뒤 조회를 만들었다", fetches, g.fetches())
+        assertEquals(g.grant, g.coordinator.issuedGrant())
+        processJob.cancel()
+    }
+
+    /** A sign-out opened after an undecidable refusal left its demand: that demand is not run for the binding that is ending. */
+    @Test
+    fun anUndecidableRefusalsDemand_isNotRunOnceASignOutIsOpen() = refusalTest {
+        val g = granted(live = { ownerFence(OWNER) })
+        val fetches = g.fetches()
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.recheckDiagnostics().owedIntent)
+        assertTrue(g.coordinator.prepareSignOut(ownerFence(OWNER)) is SignOutStart.Armed)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(60_000)
+        runCurrent()
+        assertEquals("봉인된 binding 의 demand 가 돌았다", fetches, g.fetches())
         processJob.cancel()
     }
 
@@ -1453,7 +1526,7 @@ class PremiumAccessCoordinatorTest {
      * count of timers.
      */
     @Test
-    fun aDiscardedOrFailedRefusal_leavesTheScheduledRecheckToRun() = runTest {
+    fun aDiscardedOrFailedRefusal_leavesTheScheduledRecheckToRun() = refusalTest {
         var pending = false
         val g = granted(next = {
             if (pending) EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 5)
@@ -1471,8 +1544,10 @@ class PremiumAccessCoordinatorTest {
         g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
         g.source.identity = EntitlementsIdentity(OWNER, 1L)
         g.source.identityFailure = java.io.IOException("simulated identity failure")
-        assertTrue(runCatching { g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL) }.isFailure)
+        // L-4e E4a: a throwing identity read is kept like an unreadable one, not thrown; both leave a premium-strength demand.
+        assertTrue(runCatching { g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL) }.isSuccess)
         assertEquals(PremiumAccessState.PremiumConfirmed, g.coordinator.state.value.state)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.recheckDiagnostics().owedIntent)
 
         // S1r-2c: a refusal whose record cannot be read is held rather than thrown, and recovery applies it once the
         // record reads. Neither answers the demand behind the scheduled re-check.
@@ -1482,9 +1557,15 @@ class PremiumAccessCoordinatorTest {
         runCurrent()
         assertEquals("복구가 거부를 적용하지 않았다", PremiumAccessState.Rejected, g.coordinator.state.value.state)
 
-        advanceTimeBy(5_100)
+        // Armed three times at the same instant — the pending answer's, then each kept refusal's — so the third arming's
+        // backoff (10 s) is the deadline, not the 5 s floor.
+        advanceTimeBy(9_900)
         runCurrent()
-        assertTrue("버려진·실패한 거부가 예약된 재조회를 없앴다", g.fetches() > fetchesBefore)
+        assertEquals("재무장의 backoff 전에 재조회했다", fetchesBefore, g.fetches())
+        advanceTimeBy(200)
+        runCurrent()
+        assertTrue("보존·실패한 거부가 예약된 재조회를 없앴다", g.fetches() > fetchesBefore)
+        assertTrue("재조회가 premium 강도가 아니었다", g.freshFetches() > 0)
         processJob.cancel()
     }
 
@@ -1895,6 +1976,524 @@ class PremiumAccessCoordinatorTest {
         } finally {
             processJob.cancel()
         }
+    }
+
+    // --- refusal re-check and the rejection ledger (L-4e E4a) --------------------------------------------------------------
+
+    private suspend fun PremiumAccessCoordinator.owed(): RefreshIntent? = recheckDiagnostics().owedIntent
+
+    /**
+     * [runTest] that ends the coordinators' shared job however the body ends (L-4e E4a). A refusal kept for an unreadable identity
+     * re-checks until the identity reads; a failing assertion that skipped the cancel would leave that running, and the test would
+     * hang in its own cleanup instead of failing.
+     */
+    private fun refusalTest(body: suspend TestScope.() -> Unit) = runTest {
+        try {
+            body()
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    /** A refusal for the standing grant whose live identity cannot be read changes nothing, and asks again at premium strength. */
+    @Test
+    fun anUndecidableRefusal_changesNothing_andAsksAgainAtPremiumStrengthAfterTheFloor() = refusalTest {
+        var outcome: EntitlementsOutcome = EntitlementsOutcome.StableActive(krxVisible = false)
+        val g = granted(next = { outcome })
+        val state = g.coordinator.state.value
+        val record = g.store.record
+        val purges = g.purger.calls.size
+        val revision = g.coordinator.accessSnapshot.revision
+        val fetches = g.fetches()
+        val fresh = g.freshFetches()
+
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        runCurrent()
+        assertEquals(state, g.coordinator.state.value)
+        assertEquals(record, g.store.record)
+        assertEquals(purges, g.purger.calls.size)
+        assertEquals("판정 불가 보존이 snapshot 을 바꿨다", revision, g.coordinator.accessSnapshot.revision)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+        val view = g.coordinator.rejectionView(g.grant)
+        assertEquals(emptyList<Long>(), view.pendingOrders)
+        assertTrue("판정 불가 보존이 인계로 기록되지 않았다", view.latestCurrent != null)
+        assertEquals(view.latestReported, view.latestCurrent)
+
+        advanceTimeBy(4_990)
+        runCurrent()
+        assertEquals("floor 전에 재조회했다", fetches, g.fetches())
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        outcome = EntitlementsOutcome.StableInactive(krxVisible = false)
+        val ends = g.coordinator.accessSnapshot.lastUserEnd?.sequence ?: 0L
+        advanceTimeBy(20)
+        runCurrent()
+        assertEquals(fetches + 1, g.fetches())
+        assertEquals("재조회가 premium 강도가 아니었다", fresh + 1, g.freshFetches())
+        assertEquals(PremiumAccessState.FreeConfirmed, g.coordinator.state.value.state)
+        assertTrue("손실이 USER 종료로 기록되지 않았다", (g.coordinator.accessSnapshot.lastUserEnd?.sequence ?: 0L) > ends)
+        assertNull(g.coordinator.owed())
+        processJob.cancel()
+    }
+
+    @Test
+    fun anUndecidableRefusalAnsweredPremiumRequired_isARejection() = refusalTest {
+        var outcome: EntitlementsOutcome = EntitlementsOutcome.StableActive(krxVisible = false)
+        val g = granted(next = { outcome })
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        outcome = EntitlementsOutcome.PremiumRequired
+        advanceTimeBy(5_010)
+        runCurrent()
+        assertEquals(PremiumAccessState.Rejected, g.coordinator.state.value.state)
+        processJob.cancel()
+    }
+
+    /** Answered active with the whole context held: the demand is settled, nothing more is asked, and the token stays. */
+    @Test
+    fun anUndecidableRefusalAnsweredActive_settlesTheDemand_andKeepsTheToken() = refusalTest {
+        val g = granted()
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        val taken = g.coordinator.rejectionView(g.grant)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(5_010)
+        runCurrent()
+        val fetches = g.fetches()
+        assertNull(g.coordinator.owed())
+        assertEquals(PremiumAccessState.PremiumConfirmed, g.coordinator.state.value.state)
+        assertEquals("같은 문맥인데 토큰이 바뀌었다", g.grant, g.coordinator.issuedGrant())
+
+        advanceTimeBy(120_000)
+        runCurrent()
+        assertEquals("해소된 뒤 또 물었다", fetches, g.fetches())
+        assertEquals("demand 해소가 거부 이력을 지웠다", taken, g.coordinator.rejectionView(g.grant))
+        processJob.cancel()
+    }
+
+    @Test
+    fun anUndecidableKrxRefusal_asksAtEntitlementsStrength() = refusalTest {
+        val g = granted()
+        val fresh = g.freshFetches()
+        val fetches = g.fetches()
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, KRX_REFUSAL)
+        assertEquals(RefreshIntent.FORCE_ENTITLEMENTS, g.coordinator.owed())
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(5_010)
+        runCurrent()
+        assertEquals(fetches + 1, g.fetches())
+        assertEquals("KRX 거부가 premium 강도로 물었다", fresh, g.freshFetches())
+        processJob.cancel()
+    }
+
+    @Test
+    fun aRefusalFromAnotherLiveSession_isDiscarded_andAsksNothing() = refusalTest {
+        val g = granted()
+        val fetches = g.fetches()
+        g.source.identity = EntitlementsIdentity(OWNER, 2L)
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        advanceTimeBy(120_000)
+        runCurrent()
+        assertNull(g.coordinator.owed())
+        assertEquals(fetches, g.fetches())
+        val view = g.coordinator.rejectionView(g.grant)
+        assertNull("stale 거부가 인계로 기록됐다", view.latestCurrent)
+        assertTrue("보고된 거부의 순서가 남지 않았다", view.latestReported != null)
+        processJob.cancel()
+    }
+
+    @Test
+    fun aThrowingIdentityRead_isKeptLikeAnUnreadableOne_butCancellationStillThrows() = refusalTest {
+        val g = granted()
+        g.source.identityFailure = java.io.IOException("identity")
+        assertTrue(runCatching { g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL) }.isSuccess)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+        assertTrue(g.coordinator.rejectionView(g.grant).latestCurrent != null)
+
+        val c = granted()
+        c.source.identityFailure = kotlinx.coroutines.CancellationException("identity read cancelled")
+        val thrown = runCatching { c.coordinator.onTopicRejected(c.grant, PREMIUM_REFUSAL) }.exceptionOrNull()
+        assertTrue("취소가 전파되지 않았다: $thrown", thrown is kotlinx.coroutines.CancellationException)
+        assertNull(c.coordinator.owed())
+        assertEquals(TopicRejectionView(emptyList(), c.coordinator.rejectionView(c.grant).latestReported, null), c.coordinator.rejectionView(c.grant))
+        processJob.cancel()
+    }
+
+    /** Several undecidable refusals at once leave one demand and one query, behind the schedule's backoff. */
+    @Test
+    fun repeatedUndecidableRefusals_leaveOneQueryBehindTheBackoff() = refusalTest {
+        val g = granted()
+        val fetches = g.fetches()
+        g.source.identity = null
+        repeat(3) { g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL) }
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(9_990)
+        runCurrent()
+        assertEquals("backoff 전에 물었다", fetches, g.fetches())
+        advanceTimeBy(20)
+        runCurrent()
+        assertEquals(fetches + 1, g.fetches())
+        advanceTimeBy(120_000)
+        runCurrent()
+        assertEquals("반복 거부가 조회를 늘렸다", fetches + 1, g.fetches())
+        processJob.cancel()
+    }
+
+    @Test
+    fun strengthsJoinWithoutWeakening_andRefusalsNotAboutAccessLeaveNothing() = refusalTest {
+        val a = granted()
+        a.source.identity = null
+        a.coordinator.onTopicRejected(a.grant, PREMIUM_REFUSAL)
+        a.coordinator.onTopicRejected(a.grant, KRX_REFUSAL)
+        assertEquals("KRX 거부가 premium demand 를 약화했다", RefreshIntent.FORCE_PREMIUM, a.coordinator.owed())
+        // The coordinators share one scheduler: each identity comes back so its demand ends before the next is set up.
+        a.source.identity = EntitlementsIdentity(OWNER, 1L)
+
+        val b = granted()
+        b.source.identity = null
+        b.coordinator.onTopicRejected(b.grant, KRX_REFUSAL)
+        b.coordinator.onTopicRejected(b.grant, PREMIUM_REFUSAL)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, b.coordinator.owed())
+        b.source.identity = EntitlementsIdentity(OWNER, 1L)
+
+        val c = granted()
+        c.source.identity = null
+        c.coordinator.onTopicRejected(c.grant, KRX_REFUSAL + PREMIUM_REFUSAL)
+        assertEquals("혼합 거부가 premium 우선이 아니었다", RefreshIntent.FORCE_PREMIUM, c.coordinator.owed())
+        c.source.identity = EntitlementsIdentity(OWNER, 1L)
+
+        val d = granted()
+        d.source.identity = null
+        d.coordinator.onTopicRejected(d.grant, emptyList())
+        d.coordinator.onTopicRejected(d.grant, listOf(TopicRejectionReason.TOPICS_DISABLED))
+        assertNull(d.coordinator.owed())
+        assertEquals(TopicRejectionView(emptyList(), null, null), d.coordinator.rejectionView(d.grant))
+        processJob.cancel()
+    }
+
+    /**
+     * A query that started before a refusal does not answer it; a query that starts after does. With a demand already owed, a
+     * new undecidable refusal takes a new order, so the query running for the old one does not settle it (L-4e E4a §3.2).
+     *
+     * The running query is a caller's, started the instant the first refusal's floor lapses and ahead of its timer, which then
+     * stands aside for it. A query the timer itself started would not do: arming for the second refusal cancels the timer's
+     * running query, and a cancelled query answers nothing either way.
+     */
+    @Test
+    fun aQueryRunningBeforeARefusal_doesNotAnswerIt_evenWhenADemandWasAlreadyOwed() = refusalTest {
+        var gate: CompletableDeferred<Unit>? = null
+        val g = granted(fetchGate = { gate.also { gate = null } })
+        val fetches = g.fetches()
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+
+        // Exactly at the floor, before the timer's own turn at that instant.
+        advanceTimeBy(5_000)
+        val parked = CompletableDeferred<Unit>()
+        gate = parked
+        val caller = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            g.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        }
+        runCurrent()
+        assertEquals("타이머가 달리는 조회를 두고 또 물었다", fetches + 1, g.fetches())
+        val running = g.coordinator.recheckDiagnostics().inFlightOrders.single()
+
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        assertTrue("거부 순서가 먼저 시작한 조회보다 앞섰다", g.coordinator.rejectionView(g.grant).latestReported!! > running)
+        assertEquals("두 번째 거부의 무장이 달리는 caller 조회를 끊었다", listOf(running), g.coordinator.recheckDiagnostics().inFlightOrders)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        parked.complete(Unit)
+        runCurrent()
+        assertTrue(caller.isCompleted)
+        assertEquals("거부 전에 시작한 조회가 새 demand 에 답했다", RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+
+        advanceTimeBy(5_010)
+        runCurrent()
+        assertEquals("남은 demand 가 돌지 않았다", fetches + 2, g.fetches())
+        assertNull(g.coordinator.owed())
+
+        val later = CompletableDeferred<Unit>()
+        gate = later
+        val next = launch { g.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+        advanceTimeBy(60_000)
+        runCurrent()
+        assertTrue(
+            "거부 뒤에 시작한 조회의 순서가 거부보다 앞섰다",
+            g.coordinator.recheckDiagnostics().inFlightOrders.single() > g.coordinator.rejectionView(g.grant).latestReported!!
+        )
+        next.cancel()
+        later.complete(Unit)
+        processJob.cancel()
+    }
+
+    /** The query that was covering the demand ends without answering it: the demand still runs. */
+    @Test
+    fun aCoveringQueryThatIsCancelled_leavesTheDemandToRun() = refusalTest {
+        var gate: CompletableDeferred<Unit>? = null
+        val g = granted(fetchGate = { gate.also { gate = null } })
+        val parked = CompletableDeferred<Unit>()
+        gate = parked
+        val caller = launch { g.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+        runCurrent()
+        val fetches = g.fetches()
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        caller.cancel()
+        runCurrent()
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+        advanceTimeBy(5_010)
+        runCurrent()
+        assertEquals("취소된 조회가 demand 를 가져갔다", fetches + 1, g.fetches())
+        assertNull(g.coordinator.owed())
+        processJob.cancel()
+    }
+
+    /** Stopped by an authentication answer: the refusal keeps its floor and demand, and only a caller resumes it. */
+    @Test
+    fun anUndecidableRefusalWhileAuthenticationStopped_waitsForACaller() = refusalTest {
+        var auth = false
+        val g = granted(next = {
+            if (auth) EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION)
+            else EntitlementsOutcome.StableActive(krxVisible = false)
+        })
+        auth = true
+        g.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        auth = false
+        val fetches = g.fetches()
+
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(120_000)
+        runCurrent()
+        assertEquals("AUTH 정지 중에 자동으로 물었다", fetches, g.fetches())
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+
+        g.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertEquals(fetches + 1, g.fetches())
+        assertNull(g.coordinator.owed())
+        processJob.cancel()
+    }
+
+    @Test
+    fun anUndecidableRefusal_doesNotBringALongerServerFloorForward() = refusalTest {
+        var pending = false
+        val g = granted(next = {
+            if (pending) EntitlementsOutcome.Pending(krxVisible = false, retryAfterSeconds = 30)
+            else EntitlementsOutcome.StableActive(krxVisible = false)
+        })
+        pending = true
+        g.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        runCurrent()
+        pending = false
+        val fetches = g.fetches()
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(29_990)
+        runCurrent()
+        assertEquals("서버 floor 전에 물었다", fetches, g.fetches())
+        advanceTimeBy(20)
+        runCurrent()
+        assertEquals(fetches + 1, g.fetches())
+        processJob.cancel()
+    }
+
+    /** What counts as taken over: a decision, a standing demand or a held candidate — not a refusal found stale on the way. */
+    @Test
+    fun onlyATakenOverRefusal_recordsItsOrder() = refusalTest {
+        val decided = granted()
+        decided.coordinator.onTopicRejected(decided.grant, PREMIUM_REFUSAL)
+        assertEquals(PremiumAccessState.Rejected, decided.coordinator.state.value.state)
+        val d = decided.coordinator.rejectionView(decided.grant)
+        assertTrue(d.latestCurrent != null && d.latestCurrent == d.latestReported)
+
+        val held = granted()
+        held.store.failNextLoad = true
+        held.coordinator.onTopicRejected(held.grant, PREMIUM_REFUSAL)
+        val h = held.coordinator.rejectionView(held.grant)
+        assertTrue("후보가 인계로 기록되지 않았다", h.latestCurrent != null && h.latestCurrent == h.latestReported)
+
+        val known = granted(live = { ownerFence(OWNER, 2L) })
+        known.store.failNextLoad = true
+        known.coordinator.onTopicRejected(known.grant, PREMIUM_REFUSAL)
+        assertEquals("알려진 stale 이 후보가 됐다", PremiumAccessState.PremiumConfirmed, known.coordinator.state.value.state)
+        val k = known.coordinator.rejectionView(known.grant)
+        assertNull("후보를 만들지 않은 기록 실패가 인계로 기록됐다", k.latestCurrent)
+        assertTrue(k.latestReported != null)
+        processJob.cancel()
+    }
+
+    /** A refusal reported while a query runs and then never handed over still leaves its order for that query to be judged by. */
+    @Test
+    fun aRefusalReportedAndAbandoned_keepsItsOrderAheadOfTheRunningQuery() = refusalTest {
+        var gate: CompletableDeferred<Unit>? = null
+        val g = granted(fetchGate = { gate.also { gate = null } })
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        val first = g.coordinator.rejectionView(g.grant).latestCurrent!!
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        val parked = CompletableDeferred<Unit>()
+        gate = parked
+        advanceTimeBy(5_010)
+        runCurrent()
+        val running = g.coordinator.recheckDiagnostics().inFlightOrders.single()
+
+        val second = g.coordinator.reserveRejection(g.grant, PREMIUM_REFUSAL)
+        g.coordinator.abandonRejection(second)
+        val view = g.coordinator.rejectionView(g.grant)
+        assertEquals(emptyList<Long>(), view.pendingOrders)
+        assertEquals(second.order, view.latestReported)
+        assertTrue(second.order > running)
+        assertEquals("버린 예약이 인계로 기록됐다", first, view.latestCurrent)
+
+        parked.complete(Unit)
+        runCurrent()
+        assertEquals(view, g.coordinator.rejectionView(g.grant))
+        processJob.cancel()
+    }
+
+    @Test
+    fun aNewGrant_retiresTheOldSummary_andLateEndingsForTheOldGrantDoNotTouchIt() = refusalTest {
+        var krxVisible = true
+        val g = granted(next = { EntitlementsOutcome.StableActive(krxVisible = krxVisible) })
+        val late = g.coordinator.reserveRejection(g.grant, PREMIUM_REFUSAL)
+        krxVisible = false
+        g.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        advanceUntilIdle()
+        val replacement = g.coordinator.issuedGrant()
+        assertNotEquals(g.grant, replacement)
+        val fresh = g.coordinator.reserveRejection(replacement, KRX_REFUSAL)
+
+        g.coordinator.onTopicRejected(late)
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        assertEquals("퇴역한 요약이 되살아났다", TopicRejectionView(emptyList(), null, null), g.coordinator.rejectionView(g.grant))
+        assertEquals(TopicRejectionView(listOf(fresh.order), fresh.order, null), g.coordinator.rejectionView(replacement))
+        g.coordinator.abandonRejection(late)
+        assertEquals(listOf(fresh.order), g.coordinator.rejectionView(replacement).pendingOrders)
+        processJob.cancel()
+    }
+
+    /** Reserving waits on neither the issuer's lock nor an identity read (L-4e E4a §3.5). */
+    @Test
+    fun reserving_doesNotWaitOnTheIssuersLockOrAnIdentityRead() = refusalTest {
+        val g = granted()
+        val loadGate = CompletableDeferred<Unit>()
+        g.store.blockNextLoadOn = loadGate
+        val holder = launch { g.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+        val reservation = g.coordinator.reserveRejection(g.grant, PREMIUM_REFUSAL)
+        assertEquals(listOf(reservation.order), g.coordinator.rejectionView(g.grant).pendingOrders)
+        g.coordinator.abandonRejection(reservation)
+        assertEquals(emptyList<Long>(), g.coordinator.rejectionView(g.grant).pendingOrders)
+        loadGate.complete(Unit)
+        holder.cancel()
+
+        val r = granted()
+        val identityGate = CompletableDeferred<Unit>()
+        r.source.identityGate = identityGate
+        val reading = launch { r.coordinator.onTopicRejected(r.grant, PREMIUM_REFUSAL) }
+        runCurrent()
+        val parkedOrder = r.coordinator.rejectionView(r.grant).pendingOrders.single()
+        val second = r.coordinator.reserveRejection(r.grant, KRX_REFUSAL)
+        assertEquals("identity 읽기 대기 중에 예약하지 못했다", listOf(parkedOrder, second.order), r.coordinator.rejectionView(r.grant).pendingOrders)
+        r.coordinator.abandonRejection(second)
+        identityGate.complete(Unit)
+        runCurrent()
+        assertTrue(reading.isCompleted)
+        assertEquals(emptyList<Long>(), r.coordinator.rejectionView(r.grant).pendingOrders)
+        processJob.cancel()
+    }
+
+    /** Cancellation before, during and after the hand-over: the reservation ends, and it counts as taken over only after it. */
+    @Test
+    fun cancellation_endsTheReservation_andCountsOnlyAHandOverThatHappened() = refusalTest {
+        val before = granted()
+        val loadGate = CompletableDeferred<Unit>()
+        before.store.blockNextLoadOn = loadGate
+        val holder = launch { before.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+        val waiting = launch { before.coordinator.onTopicRejected(before.grant, PREMIUM_REFUSAL) }
+        runCurrent()
+        assertEquals(1, before.coordinator.rejectionView(before.grant).pendingOrders.size)
+        waiting.cancel()
+        runCurrent()
+        val b = before.coordinator.rejectionView(before.grant)
+        assertEquals("락을 기다리다 취소된 예약이 남았다", emptyList<Long>(), b.pendingOrders)
+        assertNull(b.latestCurrent)
+        assertTrue(b.latestReported != null)
+        loadGate.complete(Unit)
+        holder.cancel()
+
+        val candidate = granted()
+        candidate.store.failNextLoad = true
+        var thrown: Throwable? = null
+        launch {
+            coroutineContext[kotlinx.coroutines.Job]!!.cancel()
+            thrown = runCatching { candidate.coordinator.onTopicRejected(candidate.grant, PREMIUM_REFUSAL) }.exceptionOrNull()
+        }
+        runCurrent()
+        assertTrue(thrown is kotlinx.coroutines.CancellationException)
+        assertNotEquals("후보가 남지 않았다", PremiumAccessState.PremiumConfirmed, candidate.coordinator.state.value.state)
+        val c = candidate.coordinator.rejectionView(candidate.grant)
+        assertTrue("후보 삽입 뒤 취소가 인계를 지웠다", c.latestCurrent != null && c.pendingOrders.isEmpty())
+
+        val decided = granted()
+        thrown = null
+        launch {
+            coroutineContext[kotlinx.coroutines.Job]!!.cancel()
+            thrown = runCatching { decided.coordinator.onTopicRejected(decided.grant, PREMIUM_REFUSAL) }.exceptionOrNull()
+        }
+        runCurrent()
+        assertTrue(thrown is kotlinx.coroutines.CancellationException)
+        assertEquals(PremiumAccessState.Rejected, decided.coordinator.state.value.state)
+        assertTrue("결정 게시 뒤 취소가 인계를 지웠다", decided.coordinator.rejectionView(decided.grant).latestCurrent != null)
+        processJob.cancel()
+    }
+
+    /**
+     * Cancelled while arming the demand an undecidable refusal left: the demand still has its query, and the caller still sees
+     * the cancellation (L-4e E4a §2.2).
+     */
+    @Test
+    fun cancellationWhileArmingAnUndecidableRefusalsDemand_stillRunsTheDemand() = refusalTest {
+        val barrier = CompletableDeferred<Unit>()
+        var armed = false
+        val g = granted(beforeRejectionRecheckArmed = { if (!armed) { armed = true; barrier.await() } })
+        val fetches = g.fetches()
+        val fresh = g.freshFetches()
+        g.source.identity = null
+        var thrown: Throwable? = null
+        val caller = launch { thrown = runCatching { g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL) }.exceptionOrNull() }
+        runCurrent()
+        assertTrue("barrier 에 닿지 않았다", armed)
+        caller.cancel()
+        barrier.complete(Unit)
+        runCurrent()
+        assertTrue("취소가 호출자에게 전파되지 않았다: $thrown", thrown is kotlinx.coroutines.CancellationException)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+        val ended = g.coordinator.rejectionView(g.grant)
+        assertEquals(emptyList<Long>(), ended.pendingOrders)
+        assertTrue(ended.latestCurrent != null)
+        assertEquals(ended.latestReported, ended.latestCurrent)
+        assertEquals(fetches, g.fetches())
+
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(4_999)
+        runCurrent()
+        assertEquals("floor 전에 조회했다", fetches, g.fetches())
+        advanceTimeBy(1)
+        runCurrent()
+        assertEquals("취소가 demand 의 조회를 끊었다", fetches + 1, g.fetches())
+        assertEquals(fresh + 1, g.freshFetches())
+        processJob.cancel()
     }
 
     /** The grant a topic session would be issued right now; fails the test when there is none. */

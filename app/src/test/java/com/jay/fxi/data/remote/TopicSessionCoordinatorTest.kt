@@ -5,6 +5,9 @@ import com.jay.fxi.data.entitlements.PremiumAccessTopicGrantIssuer
 import com.jay.fxi.data.entitlements.TopicGrantDeliverer
 import com.jay.fxi.data.entitlements.TopicGrantIssuer
 import com.jay.fxi.data.entitlements.TopicGrantResult
+import com.jay.fxi.data.entitlements.TopicRejectionReservation
+import com.jay.fxi.data.entitlements.TopicRejectionView
+import com.jay.fxi.data.entitlements.TopicRejectionLedger
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import com.jay.fxi.data.auth.AuthIdentityChangedException
@@ -309,6 +312,9 @@ class TopicSessionCoordinatorTest {
          */
         var topicStateFailure: Throwable? = null
 
+        /** Armed after setup, consumed by the first state publication that shows a premium refusal (L-4e E4a). */
+        var nextTopicStateFailure: Throwable? = null
+
         /** Injected into the acknowledgement listener, to stand for one that misbehaves. */
         var acknowledgementFailure: Throwable? = null
 
@@ -414,6 +420,12 @@ class TopicSessionCoordinatorTest {
             },
             onTopicState = {
                 topicStates += it
+                if (it.topics.values.any { topic -> topic.rejection == TopicRejectionReason.PREMIUM_REQUIRED }) {
+                    nextTopicStateFailure?.let { failure ->
+                        nextTopicStateFailure = null
+                        throw failure
+                    }
+                }
                 if (it.stateFor(TETHER).deliveryState == TopicDeliveryState.DEGRADED) {
                     topicStateFailure?.let { failure ->
                         topicStateFailure = null
@@ -916,6 +928,9 @@ class TopicSessionCoordinatorTest {
 
         /** Whom the entitlements transport answers for (L-4e E2b). Moving it makes a held answer stale, which releases its hold. */
         var transportIdentity = EntitlementsIdentity("u1", 1L)
+
+        /** Whether the issuer's live identity read answers at all; the session's own identity is the harness's (L-4e E4a). */
+        var identityReadable = true
         val ids = EpochIdGenerator { "issuer-${n++}" }
         var record = AccessEpochRecord()
 
@@ -961,7 +976,7 @@ class TopicSessionCoordinatorTest {
                     afterFetch().also { afterFetch = {} }
                     return EntitlementsResult.Answered(answeredAs, answer)
                 }
-                override suspend fun currentIdentity() = transportIdentity
+                override suspend fun currentIdentity() = transportIdentity.takeIf { identityReadable }
             },
             store = store,
             userPurger = purger,
@@ -7333,6 +7348,238 @@ class TopicSessionCoordinatorTest {
         h.cleanUp()
     }
 
+    /** A pass-through issuer whose refusal hand-over waits for [gate], to hold the FIFO consumer still (L-4e E4a). */
+    private class GatedIssuer(private val inner: TopicGrantIssuer) : TopicGrantIssuer by inner {
+        val gate = CompletableDeferred<Unit>()
+        override suspend fun onTopicRejected(reservation: TopicRejectionReservation) {
+            var handedOver = false
+            try {
+                gate.await()
+                handedOver = true
+                inner.onTopicRejected(reservation)
+            } finally {
+                if (!handedOver) inner.abandonRejection(reservation)
+            }
+        }
+    }
+
+    /**
+     * A socket refusal the issuer cannot tie to a live identity is kept (L-4e E4a R1′): nothing changes and the session stays
+     * latched, and once the identity reads, the premium question it left is asked — a loss ends the grant; an approval with the
+     * whole context held leaves the session where it is.
+     */
+    @Test
+    fun `a refusal whose identity the issuer cannot read is kept and asked about once it can`() = runTest {
+        for (answer in listOf("inactive", "active")) {
+            val h = Harness(this)
+            val (issuer, issued) = grantedIssuer(h)
+            val d = delivering(h, PremiumAccessTopicGrantIssuer(issuer.premium))
+            var fetches = 0
+            issuer.outcome = { EntitlementsOutcome.StableActive(krxVisible = true) }
+            h.coordinator.start()
+            h.coordinator.setOnline(true)
+            h.coordinator.setFocus(issued.identity, FreeTab.USD)
+            d.deliverer.start()
+            advanceTimeBy(100)
+            assertEquals("$answer: 전달자가 grant 를 넘기지 않았다", 1, h.wires.size)
+            h.wire.open()
+            advanceTimeBy(1)
+            // Only the issuer's read fails: the session's own identity stays, so the acknowledgement is admitted and reported.
+            issuer.identityReadable = false
+            h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+            advanceTimeBy(100)
+            assertEquals("$answer: 판정 불가 거부가 결정됐다", PremiumAccessState.PremiumConfirmed, issuer.premium.state.value.state)
+            assertEquals(listOf(issued), h.rejectedOwners)
+            assertTrue("$answer: 세션이 잠기지 않았다", h.wires.first().cancelled)
+            assertEquals(RefreshIntent.FORCE_PREMIUM, issuer.premium.recheckDiagnostics().owedIntent)
+
+            issuer.outcome = {
+                fetches += 1
+                if (answer == "inactive") EntitlementsOutcome.StableInactive(krxVisible = false)
+                else EntitlementsOutcome.StableActive(krxVisible = true)
+            }
+            issuer.identityReadable = true
+            advanceTimeBy(5_100)
+            assertEquals("$answer: floor 뒤 한 번 묻지 않았다", 1, fetches)
+            if (answer == "inactive") {
+                assertTrue("손실이 종료로 오지 않았다: ${d.sink.calls}", "access:false:${issued.grant.value}" in d.sink.calls)
+            } else {
+                assertNull(issuer.premium.recheckDiagnostics().owedIntent)
+                assertTrue(d.sink.calls.none { it.startsWith("access:false") })
+            }
+            advanceTimeBy(60_000)
+            assertEquals("$answer: 잠긴 세션이 다시 연결했다", 1, h.wires.size)
+        }
+        backgroundScope.cancel()
+    }
+
+    /**
+     * The grant loop and the refusal loop run apart (L-4e E4a §3.4): a pull that lands before the refusal is taken over hands the
+     * old grant again, one after hands the end; either way the end comes once and the latched session does not reconnect.
+     */
+    @Test
+    fun `a pull before or after the refusal is taken over ends the grant once without a reconnect`() = runTest {
+        for (pullFirst in listOf(true, false)) {
+            val h = Harness(this)
+            val (issuer, issued) = grantedIssuer(h)
+            val gated = GatedIssuer(PremiumAccessTopicGrantIssuer(issuer.premium))
+            val d = delivering(h, gated)
+            liveThroughDeliverer(h, d, issued, h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+            advanceTimeBy(1)
+            if (pullFirst) {
+                val granted = d.sink.calls.count { it == "access:true:${issued.grant.value}" }
+                d.fences.callback!!(AuthIdentityFence("u1", 1L))
+                advanceTimeBy(1)
+                assertEquals(
+                    "거부 인계 전 pull 이 옛 grant 를 다시 넘기지 않았다",
+                    granted + 1,
+                    d.sink.calls.count { it == "access:true:${issued.grant.value}" }
+                )
+            }
+            gated.gate.complete(Unit)
+            advanceTimeBy(100)
+            if (!pullFirst) {
+                d.fences.callback!!(AuthIdentityFence("u1", 1L))
+                advanceTimeBy(1)
+            }
+            assertEquals(PremiumAccessState.Rejected, issuer.premium.state.value.state)
+            assertEquals("pullFirst=$pullFirst: 종료가 한 번이 아니었다", 1, d.sink.calls.count { it == "access:false:${issued.grant.value}" })
+            advanceTimeBy(60_000)
+            assertEquals("pullFirst=$pullFirst: 다시 연결했다", 1, h.wires.size)
+        }
+        backgroundScope.cancel()
+    }
+
+    @Test
+    fun `null pulls around a refusal retry the pull without adding a demand or protected work`() = runTest {
+        for (pullFirst in listOf(true, false)) {
+            val h = Harness(this)
+            val (issuer, issued) = grantedIssuer(h)
+            val gated = GatedIssuer(PremiumAccessTopicGrantIssuer(issuer.premium))
+            val counting = CountingIssuer(gated)
+            val d = delivering(h, counting)
+            liveThroughDeliverer(h, d, issued,
+                h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+            var fetches = 0
+            issuer.outcome = { fetches += 1; EntitlementsOutcome.StableActive(krxVisible = true) }
+            issuer.identityReadable = false
+            var takenAt = testScheduler.currentTime
+            if (!pullFirst) {
+                gated.gate.complete(Unit)
+                advanceTimeBy(1)
+            }
+            val view = issuer.premium.rejectionView(issued.grant)
+            val revision = issuer.premium.accessSnapshot.revision
+            val pulls = counting.pulls
+            val calls = d.sink.calls.size
+            val bootstraps = h.bootstrapCalls.size
+            val requests = h.requests.size
+
+            d.fences.callback!!(AuthIdentityFence("u1", 1L))
+            advanceTimeBy(2_100)
+            assertTrue("null pull을 재시도하지 않았다", counting.pulls >= pulls + 2)
+            assertTrue(d.sink.calls.drop(calls).count { it == "revised" } >= 2)
+            assertTrue(d.sink.calls.drop(calls).none { it.startsWith("access:") })
+            assertEquals(view, issuer.premium.rejectionView(issued.grant))
+            assertEquals(revision, issuer.premium.accessSnapshot.revision)
+            assertEquals(bootstraps, h.bootstrapCalls.size)
+            assertEquals(requests, h.requests.size)
+            assertEquals(1, h.wires.size)
+            assertEquals(0, fetches)
+            assertEquals(
+                if (pullFirst) null else RefreshIntent.FORCE_PREMIUM,
+                issuer.premium.recheckDiagnostics().owedIntent
+            )
+
+            if (pullFirst) {
+                takenAt = testScheduler.currentTime
+                gated.gate.complete(Unit)
+                advanceTimeBy(1)
+            }
+            issuer.identityReadable = true
+            advanceTimeBy(takenAt + 4_999 - testScheduler.currentTime)
+            runCurrent()
+            assertEquals(0, fetches)
+            advanceTimeBy(1)
+            runCurrent()
+            assertEquals("null pull이 거부의 재확인을 늦추거나 늘렸다", 1, fetches)
+            assertNull(issuer.premium.recheckDiagnostics().owedIntent)
+            advanceTimeBy(60_000)
+            assertEquals(1, fetches)
+            assertEquals(1, h.wires.size)
+        }
+        backgroundScope.cancel()
+    }
+
+    /** While the FIFO consumer is held, the reported refusal is already visible to the issuer in its order (L-4e E4a §3.5). */
+    @Test
+    fun `a reported refusal is visible to the issuer before it is handed over`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val gated = GatedIssuer(PremiumAccessTopicGrantIssuer(issuer.premium))
+        val d = delivering(h, gated)
+        liveThroughDeliverer(h, d, issued, h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+        val waiting = issuer.premium.rejectionView(issued.grant)
+        assertEquals(1, waiting.pendingOrders.size)
+        assertEquals(waiting.pendingOrders.single(), waiting.latestReported)
+        assertNull(waiting.latestCurrent)
+
+        gated.gate.complete(Unit)
+        advanceTimeBy(100)
+        val done = issuer.premium.rejectionView(issued.grant)
+        assertEquals(TopicRejectionView(emptyList(), waiting.latestReported, waiting.latestReported), done)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `a state observer failing on the refusal acknowledgement does not lose its reservation`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val d = delivering(h, PremiumAccessTopicGrantIssuer(issuer.premium))
+        h.coordinator.start()
+        h.coordinator.setOnline(true)
+        h.coordinator.setFocus(issued.identity, FreeTab.USD)
+        d.deliverer.start()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+
+        h.nextTopicStateFailure = kotlinx.coroutines.CancellationException("state observer")
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(100)
+        assertNull("ACK의 state observer가 실행되지 않았다", h.nextTopicStateFailure)
+        assertTrue(h.acknowledgements.isEmpty())
+        assertEquals(listOf(issued), h.rejectedOwners)
+        assertEquals(listOf(true), h.socketGoneAtRefusal)
+        assertEquals(PremiumAccessState.Rejected, issuer.premium.state.value.state)
+        val ended = issuer.premium.rejectionView(issued.grant)
+        assertEquals(emptyList<Long>(), ended.pendingOrders)
+        assertTrue(ended.latestCurrent != null)
+        assertEquals(ended.latestReported, ended.latestCurrent)
+        h.cleanUp()
+    }
+
+    /**
+     * An acknowledgement observer that throws does not keep the refusal from the issuer (L-4e E4a). `CancellationException` is the
+     * failure a listener can end a command with and leave the session working; see `an acknowledgement listener that throws`.
+     */
+    @Test
+    fun `an acknowledgement observer that throws does not keep a refusal from the issuer`() = runTest {
+        for (failure in listOf<Throwable>(kotlinx.coroutines.CancellationException("listener"))) {
+            val h = Harness(this)
+            val (issuer, issued) = grantedIssuer(h)
+            val d = delivering(h, PremiumAccessTopicGrantIssuer(issuer.premium))
+            h.acknowledgementFailure = failure
+            liveThroughDeliverer(h, d, issued, h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+            advanceTimeBy(100)
+            assertEquals("${failure.javaClass.simpleName}: 거부가 한 번 인계되지 않았다", listOf(issued), h.rejectedOwners)
+            assertEquals(PremiumAccessState.Rejected, issuer.premium.state.value.state)
+            assertTrue("잠금·연결 종료가 보고보다 늦었다", h.socketGoneAtRefusal.single())
+        }
+        backgroundScope.cancel()
+    }
+
     /**
      * The same context's hold and release through the real deliverer, over an issuer whose snapshot the test controls (L-4e E3): the
      * release reconnects under a new use and carries on only what the plan still owed, and no explicit end is ever sent.
@@ -7349,7 +7596,11 @@ class TopicSessionCoordinatorTest {
                 val fence = fence().takeIf { snapshot.facts.userAllowed && snapshot.facts.tokenStanding }
                 return TopicGrantResult(fence, snapshot)
             }
-            override suspend fun onTopicRejected(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) = Unit
+            val ledger = TopicRejectionLedger(java.util.concurrent.atomic.AtomicLong(0L)::incrementAndGet)
+            override fun reserveRejection(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) =
+                ledger.reserve(grant, reasons)
+            override fun abandonRejection(reservation: TopicRejectionReservation) = ledger.abandon(reservation)
+            override suspend fun onTopicRejected(reservation: TopicRejectionReservation) = ledger.complete(reservation, current = false)
         }
         val d = delivering(h, issuer)
         liveThroughDeliverer(h, d, fence())

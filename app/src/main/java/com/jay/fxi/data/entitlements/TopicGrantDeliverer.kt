@@ -18,15 +18,23 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
-/** What the deliverer reads from the issuer, and where it hands a refusal back (L-4e E3). */
+/** What the deliverer reads from the issuer, and where it hands a refusal back (L-4e E3, E4a). */
 internal interface TopicGrantIssuer {
     val accessRevisions: StateFlow<Long>
 
     suspend fun topicGrantResult(): TopicGrantResult
 
-    suspend fun onTopicRejected(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>)
+    /** Numbers a refusal as it is reported. Never suspends, never waits on the issuer's lock and never throws. */
+    fun reserveRejection(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>): TopicRejectionReservation
+
+    /** Ends a reservation that will not be handed over. Short and synchronous, like [reserveRejection]. */
+    fun abandonRejection(reservation: TopicRejectionReservation)
+
+    /** Processes a reservation; however this returns, the issuer has ended it. */
+    suspend fun onTopicRejected(reservation: TopicRejectionReservation)
 }
 
 /** [TopicGrantIssuer] over the coordinator, whose own members keep their visibility (L-4e E3). */
@@ -35,8 +43,12 @@ internal class PremiumAccessTopicGrantIssuer(private val coordinator: PremiumAcc
 
     override suspend fun topicGrantResult(): TopicGrantResult = coordinator.topicGrantResult()
 
-    override suspend fun onTopicRejected(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) =
-        coordinator.onTopicRejected(grant, reasons)
+    override fun reserveRejection(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) =
+        coordinator.reserveRejection(grant, reasons)
+
+    override fun abandonRejection(reservation: TopicRejectionReservation) = coordinator.abandonRejection(reservation)
+
+    override suspend fun onTopicRejected(reservation: TopicRejectionReservation) = coordinator.onTopicRejected(reservation)
 }
 
 /**
@@ -54,8 +66,9 @@ internal class PremiumAccessTopicGrantIssuer(private val coordinator: PremiumAcc
  * user axis allowed — a live identity read that failed looks like this), leave what was delivered as it is and are read again on a
  * growing wait; neither is turned into a withdrawal. Anything else settles the read, resetting the wait.
  *
- * Refusals are handed to the issuer one at a time in the order the session reported them. One the issuer drops or fails is not kept
- * for a later re-check here — that is R1′'s, in E4a.
+ * Refusals are numbered by the issuer the moment the session reports them, then handed over one at a time in that order (L-4e E4a).
+ * A reservation that cannot be handed over — reported after the deliverer stopped, left in the buffer when the scope ends, or
+ * received after it ended — is abandoned here; once handed over, the issuer ends it. One the issuer fails on is skipped.
  */
 internal class TopicGrantDeliverer(
     private val issuer: TopicGrantIssuer,
@@ -67,11 +80,14 @@ internal class TopicGrantDeliverer(
     /** Must enqueue execution; Main.immediate and Unconfined are not supported here. */
     private val deliveryDispatcher: CoroutineDispatcher = Dispatchers.Default
 ) {
-    private class Rejection(val grant: TopicGrantToken, val reasons: List<TopicRejectionReason>)
-
     private val started = AtomicBoolean(false)
     private val signals = Channel<Unit>(Channel.CONFLATED)
-    private val rejections = Channel<Rejection>(Channel.UNLIMITED)
+    private val rejections = Channel<TopicRejectionReservation>(Channel.UNLIMITED) { issuer.abandonRejection(it) }
+
+    init {
+        // Tied to the scope, not to [start]: reports buffered by a deliverer that never started are abandoned when the scope ends.
+        scope.coroutineContext[Job]?.invokeOnCompletion { rejections.cancel() }
+    }
 
     /** Raised by an auth transition, and read once by the pull it causes. */
     private val fenceSignalled = AtomicBoolean(false)
@@ -110,9 +126,17 @@ internal class TopicGrantDeliverer(
         }
     }
 
-    /** Where the session's refusals go. Never blocks the session; a refusal after the deliverer stopped goes nowhere. */
+    /** Where the session's refusals go. Never blocks the session; a refusal after the deliverer stopped is numbered and abandoned. */
     fun forwardRejection(owner: TopicSessionFence, reasons: Map<String, TopicRejectionReason>) {
-        rejections.trySend(Rejection(owner.grant, reasons.values.toList()))
+        val reservation = issuer.reserveRejection(owner.grant, reasons.values.toList())
+        val sent = try {
+            rejections.trySend(reservation).isSuccess
+        } catch (failed: Throwable) {
+            issuer.abandonRejection(reservation)
+            throw failed
+        }
+        // A failed trySend does not call the channel's undelivered handler.
+        if (!sent) issuer.abandonRejection(reservation)
     }
 
     private suspend fun consumeGrants(runScope: CoroutineScope) {
@@ -191,10 +215,13 @@ internal class TopicGrantDeliverer(
     }
 
     private suspend fun forwardRejections() {
-        for (rejection in rejections) {
-            currentCoroutineContext().ensureActive()
+        for (reservation in rejections) {
+            if (!currentCoroutineContext().isActive) {
+                issuer.abandonRejection(reservation)
+                currentCoroutineContext().ensureActive()
+            }
             try {
-                issuer.onTopicRejected(rejection.grant, rejection.reasons)
+                issuer.onTopicRejected(reservation)
             } catch (failed: Throwable) {
                 // The consumer's own cancellation ends it; a refusal the issuer failed on is not kept here (E4a).
                 currentCoroutineContext().ensureActive()

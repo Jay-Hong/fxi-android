@@ -23,6 +23,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicLong
 
 /** Between automatic persistence rounds. Long enough that a transient disk fault can clear. */
 private const val DEFAULT_PERSISTENCE_RETRY_DELAY_MILLIS = 2_000L
@@ -64,7 +65,12 @@ class PremiumAccessCoordinator(
     /** Test barrier before completion delivery, outside both locks. Production leaves it empty. */
     private val beforeRecheckSettled: suspend (Long, Long) -> Unit = { _, _ -> },
     /** Observes a loss re-approval after the scheduler accepts it. */
-    private val onLossReapprovalScheduled: (RefreshIntent, Long) -> Unit = { _, _ -> }
+    private val onLossReapprovalScheduled: (RefreshIntent, Long) -> Unit = { _, _ -> },
+    /**
+     * Test barrier at the start of the arming an unreadable-identity refusal's demand is protected by (L-4e E4a R1′), inside
+     * that protection and under [mutex]. Production leaves it empty.
+     */
+    private val beforeRejectionRecheckArmed: suspend () -> Unit = {}
 ) {
     private val mutex = Mutex()
 
@@ -127,8 +133,15 @@ class PremiumAccessCoordinator(
      */
     private var recheckDemand: RecheckDemand? = null
 
-    /** One sequence for demands and query starts, so "started after the demand" can be compared. Guarded by [mutex]. */
-    private var nextOrderSeq: Long = 0L
+    /**
+     * One sequence for demands, query starts and reported refusals, so "started after the demand" and "started after the refusal"
+     * can be compared. Demands and query starts take it under [mutex]; a refusal takes it from the session's scope without the
+     * mutex, through [rejectionLedger] (L-4e E4a §3.5).
+     */
+    private val nextOrderSeq = AtomicLong(0L)
+
+    /** The refusals sessions reported and the order of the latest, for the grant last issued (L-4e E4a §3.5). */
+    private val rejectionLedger = TopicRejectionLedger { nextOrderSeq.incrementAndGet() }
 
     /** Queries that have started and have not finished applying, by their start order. Guarded by [mutex]. */
     private val inFlightQueries = HashMap<Long, InFlightQuery>()
@@ -137,12 +150,14 @@ class PremiumAccessCoordinator(
         val bindingEpoch: Long,
         val registeredQueryCount: Int,
         /** The intent the current demand owes, or null with none. */
-        val owedIntent: RefreshIntent? = null
+        val owedIntent: RefreshIntent? = null,
+        /** Start orders of the queries still running, ascending (L-4e E4a). */
+        val inFlightOrders: List<Long> = emptyList()
     )
 
     /** Immutable diagnostic snapshot, including any registration incorrectly retained from an old binding. */
     internal suspend fun recheckDiagnostics(): RecheckDiagnostics = mutex.withLock {
-        RecheckDiagnostics(probeEpoch, inFlightQueries.size, recheckDemand?.intent)
+        RecheckDiagnostics(probeEpoch, inFlightQueries.size, recheckDemand?.intent, inFlightQueries.keys.sorted())
     }
 
     /** Diagnostic: how many loss candidates still hold access back (S1r-2c). */
@@ -1537,7 +1552,7 @@ class PremiumAccessCoordinator(
                 forcePremiumOwner = record.ownerUid
             }
             schedule.recordQueryStarted()
-            val order = ++nextOrderSeq
+            val order = nextOrderSeq.incrementAndGet()
             inFlightQueries[order] = InFlightQuery(probeEpoch, queryIntent)
             StartedQuery(record.fence(), decisionGeneration, boundIdentityLocked(), order, probeEpoch, queryIntent)
         }
@@ -1623,6 +1638,7 @@ class PremiumAccessCoordinator(
         val issued = issuedTopicGrant?.takeIf { it.context == context }
             ?: IssuedTopicGrant(TopicGrantToken(++nextTopicGrant), context).also {
                 issuedTopicGrant = it
+                rejectionLedger.grantIssued(it.token)
                 publishAccessSnapshotLocked()
             }
         return TopicSessionFence(
@@ -1633,55 +1649,111 @@ class PremiumAccessCoordinator(
     }
 
     /**
+     * Numbers a refusal a session is reporting, at the moment it reports it (L-4e E4a §3.5). Never suspends and never waits on
+     * [mutex], so a session's serial scope can call it; the reservation is then handed to [onTopicRejected] or [abandonRejection].
+     */
+    internal fun reserveRejection(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>): TopicRejectionReservation =
+        rejectionLedger.reserve(grant, reasons)
+
+    /** Ends a reservation that will not reach [onTopicRejected]. The record of its having been reported stays. */
+    internal fun abandonRejection(reservation: TopicRejectionReservation) {
+        if (rejectionLedger.owns(reservation)) rejectionLedger.abandon(reservation)
+    }
+
+    /** Diagnostic: the refusals recorded for [grant] (L-4e E4a). */
+    internal fun rejectionView(grant: TopicGrantToken): TopicRejectionView = rejectionLedger.view(grant)
+
+    /** [onTopicRejected] for a refusal reported now: reserved when this runs, not when a caller decided to run it. */
+    internal suspend fun onTopicRejected(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) =
+        onTopicRejected(reserveRejection(grant, reasons))
+
+    /**
      * Feeds one acknowledgement's WebSocket refusals into the reducer, for the grant they answered.
      *
-     * [grant] is the token on the fence of the connection that was refused, as that connection was
-     * opened — not the session's current one. [reasons] is the acknowledgement's whole set, collapsed
-     * by [TopicRejection.of] into at most one decision; reasons that are not about access reach
-     * neither the reducer nor the schedule.
+     * The reservation's grant is the token on the fence of the connection that was refused, as that connection was opened — not
+     * the session's current one. Its reasons are the acknowledgement's whole set, collapsed by [TopicRejection.of] into at most
+     * one decision; reasons that are not about access reach neither the reducer nor the schedule. A reservation another issuer
+     * made is neither processed nor ended here.
      *
-     * The refusal is applied only if, under one lock hold and in this order: [grant] is the grant
-     * last issued, access is admitted, the decision generation is still the one it was issued at,
-     * the record's fence is unchanged, the binding is the same and the live identity is still that
-     * binding. Matching the token is necessary and not sufficient — the context behind it can have
-     * moved without anyone asking for a new grant.
+     * The refusal is applied only if, under one lock hold and in this order: its grant is the grant last issued, access is
+     * admitted, the decision generation is still the one it was issued at, the record's fence is unchanged, the binding is the
+     * same and the live identity is still that binding. Matching the token is necessary and not sufficient — the context behind
+     * it can have moved without anyone asking for a new grant.
      *
-     * Anything else discards it: no state, rotation, purge or schedule change, not even a
-     * cancellation, because whatever is scheduled belongs to a later event. A live identity that
-     * cannot be read discards it too, and that says nothing about a sign-out having happened.
+     * A live identity that is another session discards it: no state, rotation, purge or schedule change, not even a
+     * cancellation, because whatever moved the identity owns what follows. Every other staleness discards it the same way.
      *
-     * A record read that throws does not throw from here: the refusal is held as a loss candidate unless it is already
-     * known stale, and candidate recovery reads the record again (S1r-2c). An identity read that throws still throws,
-     * before the reducer runs. A rotation that cannot be persisted does not throw; see [decideLocked].
+     * A live identity that cannot be read — null, or a read that throws anything but cancellation — does not discard it
+     * (L-4e E4a R1′): nothing is decided, and the binding is left owing a query at the refusal's strength, started after the
+     * refusal was taken, behind the default floor and every existing floor, backoff, admission and authentication stop.
+     *
+     * A record read that throws does not throw from here either: the refusal is held as a loss candidate unless it is already
+     * known stale, and candidate recovery reads the record again (S1r-2c). A rotation that cannot be persisted does not throw;
+     * see [decideLocked].
+     *
+     * However it ends, the reservation is completed; it counts as taken over only once the decision is published, the demand
+     * stands or the candidate is held, and a cancellation after that point does not undo it (L-4e E4a §3.5).
      */
-    internal suspend fun onTopicRejected(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) {
-        val outcome = when (TopicRejection.of(reasons) ?: return) {
-            TopicRejection.PREMIUM_REQUIRED -> EntitlementsOutcome.PremiumRequired
-            TopicRejection.KRX_ENTITLEMENT_REQUIRED -> EntitlementsOutcome.KrxEntitlementRequired
-        }
-        mutex.withLock {
-            val context = issuedTopicGrant?.takeIf { it.token == grant }?.context ?: return
-            if (!accessAdmittedLocked()) return
-            if (context.generation != decisionGeneration) return
-            val record = try {
-                store.load()
-            } catch (failed: Exception) {
-                holdUnreadableLossLocked(outcome, CandidateProvenance.Topic(grant, context), failed)
-                return
+    internal suspend fun onTopicRejected(reservation: TopicRejectionReservation) {
+        if (!rejectionLedger.owns(reservation)) return
+        var current = false
+        try {
+            val rejection = TopicRejection.of(reservation.reasons) ?: return
+            val outcome = when (rejection) {
+                TopicRejection.PREMIUM_REQUIRED -> EntitlementsOutcome.PremiumRequired
+                TopicRejection.KRX_ENTITLEMENT_REQUIRED -> EntitlementsOutcome.KrxEntitlementRequired
             }
-            if (record.fence() != context.access) return
-            if (boundIdentityLocked() != context.identity) return
-            if (source.currentIdentity() != context.identity) return
-            val decision = decideLocked(record, RefreshIntent.FORCE_ENTITLEMENTS, outcome)
-            // Not a query's answer, so it answers no demand; a re-check it asks for is a new requirement (S1r-2a §2.1).
-            val recheck = decision.recheck
-            if (recheck != null) {
-                raiseDemandLocked(recheck.intent, independent = true)
-                armRecheckLocked(recheck)
-            } else if (recheckDemand == null) {
-                schedule.cancel()
+            val grant = reservation.grant
+            mutex.withLock {
+                val context = issuedTopicGrant?.takeIf { it.token == grant }?.context ?: return
+                if (!accessAdmittedLocked()) return
+                if (context.generation != decisionGeneration) return
+                val record = try {
+                    store.load()
+                } catch (failed: Exception) {
+                    holdUnreadableLossLocked(outcome, CandidateProvenance.Topic(grant, context), failed) { current = true }
+                    return
+                }
+                if (record.fence() != context.access) return
+                if (boundIdentityLocked() != context.identity) return
+                val live = try {
+                    source.currentIdentity()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    null
+                }
+                if (live == null) {
+                    // A refusal for this grant whose session cannot be told: not decided, and not dropped either (L-4e E4a R1′).
+                    val intent = when (rejection) {
+                        TopicRejection.PREMIUM_REQUIRED -> RefreshIntent.FORCE_PREMIUM
+                        TopicRejection.KRX_ENTITLEMENT_REQUIRED -> RefreshIntent.FORCE_ENTITLEMENTS
+                    }
+                    raiseDemandLocked(intent, independent = true)
+                    current = true
+                    // The demand stands; a cancellation waiting on the schedule's lock must not leave it with nothing to run it.
+                    withContext(NonCancellable) {
+                        beforeRejectionRecheckArmed()
+                        armRecheckLocked(RecheckRequest(intent, minDelayMillis = PremiumAccessReducer.DEFAULT_BACKOFF_FLOOR_MILLIS))
+                        ensureDemandArmedLocked()
+                    }
+                    currentCoroutineContext().ensureActive()
+                    return
+                }
+                if (live != context.identity) return
+                val decision = decideLocked(record, RefreshIntent.FORCE_ENTITLEMENTS, outcome) { current = true }
+                // Not a query's answer, so it answers no demand; a re-check it asks for is a new requirement (S1r-2a §2.1).
+                val recheck = decision.recheck
+                if (recheck != null) {
+                    raiseDemandLocked(recheck.intent, independent = true)
+                    armRecheckLocked(recheck)
+                } else if (recheckDemand == null) {
+                    schedule.cancel()
+                }
+                ensureDemandArmedLocked()
             }
-            ensureDemandArmedLocked()
+        } finally {
+            rejectionLedger.complete(reservation, current)
         }
     }
 
@@ -1857,8 +1929,9 @@ class PremiumAccessCoordinator(
     private fun raiseDemandLocked(intent: RefreshIntent, independent: Boolean) {
         val current = recheckDemand
         recheckDemand = when {
-            current == null -> RecheckDemand(probeEpoch, intent, ++nextOrderSeq)
-            independent || intent > current.intent -> RecheckDemand(probeEpoch, maxOf(intent, current.intent), ++nextOrderSeq)
+            current == null -> RecheckDemand(probeEpoch, intent, nextOrderSeq.incrementAndGet())
+            independent || intent > current.intent ->
+                RecheckDemand(probeEpoch, maxOf(intent, current.intent), nextOrderSeq.incrementAndGet())
             else -> current
         }
     }
@@ -1892,7 +1965,7 @@ class PremiumAccessCoordinator(
 
     private fun resumeAfterAuthStopLocked() {
         authStopped = false
-        authStateOrder = ++nextOrderSeq
+        authStateOrder = nextOrderSeq.incrementAndGet()
     }
 
     /** A timer finished, fired or not. Only the latest arming of this binding looks again; later ones own what follows. */
@@ -2425,7 +2498,9 @@ class PremiumAccessCoordinator(
     private suspend fun holdUnreadableLossLocked(
         outcome: EntitlementsOutcome,
         provenance: CandidateProvenance,
-        failed: Exception
+        failed: Exception,
+        /** Told as soon as the candidate is held, before anything that can throw or be cancelled (L-4e E4a §3.5). */
+        onHeld: () -> Unit = {}
     ) {
         val axes = outcome.lossAxes() ?: throw failed
         if (!knownStaleWithoutRecordLocked(provenance, probeEpoch)) {
@@ -2438,6 +2513,7 @@ class PremiumAccessCoordinator(
                 provenance = provenance,
                 floorNotBefore = floor?.let { clock.elapsedMillis() + it }
             )
+            onHeld()
             republishEffectiveLocked()
             kickCandidateRecoveryLocked()
             // After the hand-over: a timer that fired into this query is the very job recording a floor cancels.

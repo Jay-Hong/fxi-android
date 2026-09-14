@@ -8,6 +8,7 @@ import com.jay.fxi.data.remote.TopicGrantToken
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.domain.model.TopicRejectionReason
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -57,9 +58,23 @@ class TopicGrantDelivererTest {
             return answer()
         }
 
-        override suspend fun onTopicRejected(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) {
-            onRejected(grant)
-            rejected += grant to reasons.toList()
+        /** The same reservation contract as the issuer's: numbered on report, ended once however it goes (L-4e E4a). */
+        val ledger = TopicRejectionLedger(AtomicLong(0L)::incrementAndGet)
+
+        override fun reserveRejection(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) =
+            ledger.reserve(grant, reasons)
+
+        override fun abandonRejection(reservation: TopicRejectionReservation) = ledger.abandon(reservation)
+
+        override suspend fun onTopicRejected(reservation: TopicRejectionReservation) {
+            var current = false
+            try {
+                onRejected(reservation.grant)
+                rejected += reservation.grant to reservation.reasons
+                current = true
+            } finally {
+                ledger.complete(reservation, current)
+            }
         }
 
         fun result(
@@ -503,6 +518,77 @@ class TopicGrantDelivererTest {
         s.deliverer.forwardRejection(f2, mapOf("fx:usd-krw" to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED))
         runCurrent()
         assertEquals(listOf(TopicGrantToken(1L) to listOf(TopicRejectionReason.PREMIUM_REQUIRED)), s.issuer.rejected)
+        assertEquals("넘기지 않은 예약이 남았다", emptyList<Long>(), s.issuer.ledger.view(f2.grant).pendingOrders)
+        assertEquals(emptyList<Long>(), s.issuer.ledger.view(f1.grant).pendingOrders)
+    }
+
+    @Test
+    fun aRefusalReportedAfterTheDelivererStopped_isAbandonedAtOnce() = deliverTest { s ->
+        s.deliverer.start()
+        runCurrent()
+        s.scope.cancel()
+        runCurrent()
+        s.deliverer.forwardRejection(f1, mapOf("usdt:krw" to TopicRejectionReason.PREMIUM_REQUIRED))
+        assertEquals(emptyList<Long>(), s.issuer.ledger.view(f1.grant).pendingOrders)
+        assertEquals(emptyList<Pair<TopicGrantToken, List<TopicRejectionReason>>>(), s.issuer.rejected)
+    }
+
+    @Test
+    fun aReceivedRefusalCancelledBeforeResumption_isAbandoned() = deliverTest { s ->
+        s.issuer.ledger.grantIssued(f1.grant)
+        s.deliverer.start()
+        runCurrent()
+        s.deliverer.forwardRejection(f1, mapOf("usdt:krw" to TopicRejectionReason.PREMIUM_REQUIRED))
+        val reported = s.issuer.ledger.view(f1.grant).latestReported
+        assertTrue(reported != null)
+        s.scope.cancel()
+        runCurrent()
+        assertTrue(s.issuer.rejected.isEmpty())
+        assertEquals(TopicRejectionView(emptyList(), reported, null), s.issuer.ledger.view(f1.grant))
+    }
+
+    @Test
+    fun refusalsLeftInTheBufferWhenTheScopeEnds_areAbandoned() = deliverTest { s ->
+        val slow = CompletableDeferred<Unit>()
+        s.issuer.onRejected = { grant -> if (grant.value == 1L) slow.await() }
+        s.deliverer.start()
+        runCurrent()
+        val third = TopicSessionFence(AuthIdentityFence("u1", 1L), "epoch-1", TopicGrantToken(3L))
+        for (fence in listOf(f1, f2, third)) {
+            s.deliverer.forwardRejection(fence, mapOf("usdt:krw" to TopicRejectionReason.PREMIUM_REQUIRED))
+        }
+        runCurrent()
+        assertEquals(1, s.issuer.ledger.view(f2.grant).pendingOrders.size)
+        s.scope.cancel()
+        runCurrent()
+        for (fence in listOf(f1, f2, third)) {
+            assertEquals("${fence.grant} 의 예약이 남았다", emptyList<Long>(), s.issuer.ledger.view(fence.grant).pendingOrders)
+        }
+        assertEquals(emptyList<Pair<TopicGrantToken, List<TopicRejectionReason>>>(), s.issuer.rejected)
+    }
+
+    @Test
+    fun refusalsReportedToADelivererThatNeverStarted_areAbandonedWhenTheScopeEnds() = deliverTest { s ->
+        s.deliverer.forwardRejection(f1, mapOf("usdt:krw" to TopicRejectionReason.PREMIUM_REQUIRED))
+        assertEquals("시작 전 보고가 버퍼링되지 않았다", 1, s.issuer.ledger.view(f1.grant).pendingOrders.size)
+        s.scope.cancel()
+        runCurrent()
+        assertEquals(emptyList<Long>(), s.issuer.ledger.view(f1.grant).pendingOrders)
+
+        val ended = CoroutineScope(Job().also { it.cancel() } + StandardTestDispatcher(testScheduler))
+        val late = TopicGrantDeliverer(s.issuer, s.sink, s.fences, ended, s.clock)
+        late.forwardRejection(f2, mapOf("usdt:krw" to TopicRejectionReason.PREMIUM_REQUIRED))
+        assertEquals("끝난 scope 의 전달자가 예약을 남겼다", emptyList<Long>(), s.issuer.ledger.view(f2.grant).pendingOrders)
+    }
+
+    @Test
+    fun aStartCancelledBeforeItRuns_leavesNoReservation() = deliverTest { s ->
+        s.deliverer.forwardRejection(f1, mapOf("usdt:krw" to TopicRejectionReason.PREMIUM_REQUIRED))
+        s.deliverer.start()
+        s.scope.cancel()
+        runCurrent()
+        assertEquals(emptyList<Long>(), s.issuer.ledger.view(f1.grant).pendingOrders)
+        assertEquals(emptyList<Pair<TopicGrantToken, List<TopicRejectionReason>>>(), s.issuer.rejected)
     }
 
     @Test
