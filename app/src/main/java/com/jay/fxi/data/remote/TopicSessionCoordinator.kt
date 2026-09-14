@@ -256,6 +256,9 @@ private sealed interface SessionInput {
     /** A deferred protected side effect asking to run under the session that attributed it (L-4e E2a). */
     class DeferredUse(val attribution: TopicUseAttribution, val action: () -> Unit) : SessionInput
 
+    /** The issuer published a new access snapshot under the context this session already holds (L-4e E2b). */
+    data object AccessRevised : SessionInput
+
     data object Stop : SessionInput
 }
 
@@ -671,8 +674,24 @@ class TopicSessionCoordinator(
 
     fun setOnline(value: Boolean) = post(SessionInput.Online(value))
 
+    /**
+     * The grant this session may run under, or its explicit end.
+     *
+     * A hold that keeps the context — and its release — is not sent here (L-4e E2b): `false` for the same fence ends the grant, so
+     * the plan it asked for is made again when access returns, and a different fence is a different session. Holds go to
+     * [accessRevised].
+     */
     fun setAccess(allowed: Boolean, fence: TopicSessionFence?) =
         post(SessionInput.Access(allowed, fence))
+
+    /**
+     * The issuer published a new access snapshot under the context this session already holds (L-4e E2b).
+     *
+     * Not a context change and not an explicit end — those still come as [setAccess]. A deliverer calls this for the latest revision
+     * it observes, including one whose hold it missed: the session asks its own questions again and changes only what they answer
+     * differently. Repeating it is harmless, and it resets no budget.
+     */
+    fun accessRevised() = post(SessionInput.AccessRevised)
 
     /**
      * Asks the REST twin for [topic] once.
@@ -809,6 +828,9 @@ class TopicSessionCoordinator(
                 (focus as? FocusState.Confirmed)?.let { held ->
                     if (liveIdentity()?.uid != held.uid) focus = FocusState.Undetermined
                 }
+                // A grant given again or changed starts its budget from zero here rather than inside `reconsider`, which returns
+                // before it when the use is held (L-4e E2b): the connection a later release opens must still have its ladder.
+                if (input.allowed && input.fence != null) reconnectAttempt = 0
                 reconsider(budgetIsFresh = true)
                 // After the socket is decided, because reading order should follow the session's:
                 // open the connection, then fill the screen while it negotiates. Nothing here
@@ -983,6 +1005,8 @@ class TopicSessionCoordinator(
                 current(input.generation)?.let { live -> end(live, TopicDisconnectCause.DELIBERATE) }
 
             is SessionInput.DeferredUse -> if (stillOwns(input.attribution)) input.action()
+
+            SessionInput.AccessRevised -> reevaluateAccess()
 
             is SessionInput.ReconnectDue -> {
                 if (input.ticket != reconnectTicket) return
@@ -1167,6 +1191,26 @@ class TopicSessionCoordinator(
         if (budgetIsFresh) reconnectAttempt = 0
         cancelReconnect()
         open()
+    }
+
+    /**
+     * Asks again what an access revision under the same context may have changed, and changes only that (L-4e E2b).
+     *
+     * Not a lifecycle trigger: nothing pending is cancelled or brought forward, and no budget is reset.
+     * - A connection whose use is no longer admitted ends, as at any other boundary.
+     * - A new start that has become possible goes on the ladder, one rung reserved as any reconnection reserves it — a hold coming
+     *   and going must not open a socket per flap. A session that never attempted a connection opens at once instead: that is the
+     *   connection the held `Access` or `Online` would have opened, and there is nothing yet to hold back.
+     * - The plan carries on under the same grant: only what is still owed is issued, each under its own new use.
+     */
+    private fun reevaluateAccess() {
+        connection?.let { live ->
+            if (!authority.admits(live.lifetime)) end(live, TopicDisconnectCause.DELIBERATE)
+        }
+        if (connection == null && reconnectJob == null && wanted()) {
+            if (everAttempted) scheduleReconnect() else open()
+        }
+        pumpBootstraps()
     }
 
     private fun open() {

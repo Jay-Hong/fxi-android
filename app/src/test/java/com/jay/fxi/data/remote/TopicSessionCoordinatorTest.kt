@@ -3,6 +3,7 @@ package com.jay.fxi.data.remote
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
+import com.jay.fxi.data.auth.AuthUnavailableException
 import com.jay.fxi.data.auth.HttpExchangeEvidence
 import com.jay.fxi.data.entitlements.AccessEpochRecord
 import com.jay.fxi.data.entitlements.AccessEpochStore
@@ -33,6 +34,7 @@ import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.TopicAuthResolution
 import com.jay.fxi.domain.model.TopicControlState
+import com.jay.fxi.domain.model.TopicReconnectPolicy
 import com.jay.fxi.domain.model.TopicDeliveryState
 import com.jay.fxi.domain.model.TopicRejectionReason
 import com.jay.fxi.domain.model.TopicSubscriptionSnapshot
@@ -189,9 +191,23 @@ class TopicSessionCoordinatorTest {
 
         /** Held to keep a command inside its token wait, which is where a deadline can pass. */
         var credentialGate: CompletableDeferred<Unit>? = null
+        /**
+         * The next this many credential reads fail as unavailable (L-4e E2b, the E6 fixture): a command's preparation fails without
+         * a send. Setting it back to zero is the credential recovering under the same binding and grant.
+         */
+        var credentialFailures = 0
+
+        /** Every credential read a command made, failed or not. */
+        var credentialReads = 0
+
         val credentials = object : TopicCommandCredentials {
             override suspend fun currentSnapshot(): AuthSnapshot {
                 credentialGate?.await()
+                credentialReads++
+                if (credentialFailures > 0) {
+                    credentialFailures--
+                    throw AuthUnavailableException("no credential")
+                }
                 return credential
             }
 
@@ -291,6 +307,12 @@ class TopicSessionCoordinatorTest {
 
         val wires = mutableListOf<Wire>()
         var failNextConnect = false
+
+        /** The next this many connects fail, as [failNextConnect] does for one (L-4e E2b). */
+        var failConnects = 0
+
+        /** Every connect the session attempted, refused or not. */
+        var connectCalls = 0
         val requests = mutableListOf<TopicSubscribeRequest>()
         val rejected = mutableListOf<Map<String, TopicRejectionReason>>()
 
@@ -326,8 +348,10 @@ class TopicSessionCoordinatorTest {
             scope = scope,
             clock = clock,
             connect = {
-                if (failNextConnect) {
+                connectCalls++
+                if (failNextConnect || failConnects > 0) {
                     failNextConnect = false
+                    if (failConnects > 0) failConnects--
                     throw java.io.IOException("refused")
                 }
                 val wire = Wire()
@@ -882,6 +906,9 @@ class TopicSessionCoordinatorTest {
     /** The access side of these tests, in memory, issuing grants for the harness's own account `u1`/1. */
     private class Issuer(test: TestScope, h: Harness) {
         private var n = 0
+
+        /** Whom the entitlements transport answers for (L-4e E2b). Moving it makes a held answer stale, which releases its hold. */
+        var transportIdentity = EntitlementsIdentity("u1", 1L)
         val ids = EpochIdGenerator { "issuer-${n++}" }
         var record = AccessEpochRecord()
 
@@ -923,10 +950,11 @@ class TopicSessionCoordinatorTest {
             source = object : EntitlementsSource {
                 override suspend fun fetch(freshPremium: Boolean): EntitlementsResult {
                     val answer = outcome()
+                    val answeredAs = transportIdentity
                     afterFetch().also { afterFetch = {} }
-                    return EntitlementsResult.Answered(EntitlementsIdentity("u1", 1L), answer)
+                    return EntitlementsResult.Answered(answeredAs, answer)
                 }
-                override suspend fun currentIdentity() = EntitlementsIdentity("u1", 1L)
+                override suspend fun currentIdentity() = transportIdentity
             },
             store = store,
             userPurger = purger,
@@ -6420,5 +6448,575 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(1)
         assertEquals(1391.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
         h.cleanUp()
+    }
+
+    // ---- a revision under the same context (L-4e E2b) ---------------------------------------------------------------
+
+    /** The first rung of the ladder with the harness's jitter of zero: `2s × 1`, 20% early. */
+    private val firstRungMillis = 1_600L
+
+    /**
+     * A revision that changes nothing leaves everything as it was (L-4e E2b): the connection, the plan, and a reconnection already
+     * reserved — which is neither brought forward nor reserved again.
+     */
+    @Test
+    fun `a revision that changes nothing keeps the connection, the plan and the reservation`() = runTest {
+        val h = Harness(this)
+        h.publishedAccess()
+        val first = acknowledgedUnder(h)
+        val calls = h.bootstrapCalls.size
+        val requests = h.requests.size
+
+        repeat(3) { h.coordinator.accessRevised() }
+        advanceTimeBy(100)
+        assertEquals(false, first.cancelled)
+        assertEquals(1, h.wires.size)
+        assertEquals("변화 없는 revision 이 계획을 다시 발급했다", calls, h.bootstrapCalls.size)
+        assertEquals(requests, h.requests.size)
+
+        first.drop()
+        advanceTimeBy(800)
+        repeat(2) { h.coordinator.accessRevised() }
+        advanceTimeBy(firstRungMillis - 900)
+        assertEquals("revision 이 예약된 재연결을 앞당겼다", 1, h.wires.size)
+        advanceTimeBy(200)
+        assertEquals("예약된 재연결이 제때 일어나지 않았다", 2, h.wires.size)
+        // Short of the new connection's own connect deadline, which would end it and take the next rung for a reason of its own.
+        advanceTimeBy(10_000)
+        assertEquals("revision 이 재연결을 한 번 더 예약했다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A revision that withholds the use ends the connection without a frame and without a ladder, keeps what is on screen, and
+     * leaves the plan owed; the release reserves one rung and carries on only what is still owed (L-4e E2b).
+     */
+    @Test
+    fun `a hold and its release by revision end the connection, keep the plan and carry on what is owed`() = runTest {
+        val h = Harness(this, bootstrapIssueGap = 10.seconds)
+        val access = h.publishedAccess()
+        val first = acknowledgedUnder(h)
+        first.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertEquals("첫 묶음만 나가야 한다", listOf(USD), h.bootstrapCalls.map { it.second })
+
+        access.hold()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertTrue("보류 revision 이 연결을 끝내지 않았다", first.cancelled)
+        assertEquals("보류가 시세를 지웠다", 1390.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+        assertEquals(1L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        assertEquals(false, h.store.snapshot.stateFor(TETHER).confirmed)
+        advanceTimeBy(120_000)
+        assertEquals("보류 중 사다리를 탔다", 1, h.wires.size)
+        assertEquals("보류 중 남은 topic 을 발급했다", listOf(USD), h.bootstrapCalls.map { it.second })
+
+        access.release()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals("해제가 사다리 없이 바로 열었다", 1, h.wires.size)
+        assertEquals("해제 뒤 남은 topic 만 이어서 발급하지 않았다", listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        assertEquals(true, h.bootstrapUseChecks.last()())
+        advanceTimeBy(firstRungMillis)
+        assertEquals("해제가 예약한 재연결이 일어나지 않았다", 2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(3_000)
+        assertEquals("새 사용의 연결이 구독하지 않았다", 1, h.wire.sent.count { it.startsWith("encoded-") })
+        h.cleanUp()
+    }
+
+    /**
+     * An answer from before a hold is not applied after its release, a refusal from before it is still handed over with its floor,
+     * the topic is not issued again by itself, and an explicit request joins the call still out and asks again once it settled.
+     */
+    @Test
+    fun `answers from before a released hold follow their own rules and are not asked again by themselves`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val gates = mutableMapOf<String, CompletableDeferred<Unit>>()
+        h.bootstrapGateFor = { issue -> gates.getOrPut(h.bootstrapCalls[issue].second) { CompletableDeferred() } }
+        val refused = refusal(429, """{"error":"slow down"}""", retryAfter = "60")
+        h.bootstrapOutcome = { issue, topic ->
+            when {
+                issue >= 2 -> TopicSnapshotOutcome.Dormant
+                topic == USD -> h.delivered(h.fxFrame(1400.0))
+                else -> refused
+            }
+        }
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        val handed = h.undelivered.size
+        val evidence = h.bootstrapEvidence.size
+
+        access.hold()
+        h.coordinator.accessRevised()
+        access.release()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(1)
+        assertEquals("나가 있는 호출에 합류하지 않았다", 2, h.bootstrapCalls.size)
+
+        gates.getValue(USD).complete(Unit)
+        gates.getValue(TETHER).complete(Unit)
+        advanceTimeBy(100)
+        assertTrue("보류 전 답이 해제 뒤 적용됐다", h.coordinator.rates.value.quotes.isEmpty())
+        assertSame(refused, h.undelivered.drop(handed).single().third)
+        assertEquals(listOf<Pair<Int?, String?>>(429 to "60"), h.bootstrapEvidence.drop(evidence))
+        advanceTimeBy(60_000)
+        assertEquals("적용 못 한 topic 을 스스로 다시 발급했다", 2, h.bootstrapCalls.size)
+
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(100)
+        assertEquals("끝난 호출 뒤의 명시 요청을 받지 않았다", 3, h.bootstrapCalls.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A hold the deliverer missed altogether — only the revision after its release arrives — is still found (L-4e E2b): the
+     * connection opened before it ends and the ladder reopens under a new use, and an answer from before it is not applied. What the
+     * plan still owed is issued when its gap comes, under a use acquired after the release, with no revision needed for that.
+     */
+    @Test
+    fun `a hold whose revision was missed is found by the revision after its release`() = runTest {
+        val h = Harness(this, bootstrapIssueGap = 10.seconds)
+        val access = h.publishedAccess()
+        h.bootstrapGateFor = { issue -> if (issue == 0) h.bootstrapGate else null }
+        h.bootstrapGate = CompletableDeferred()
+        h.bootstrapOutcome = { issue, _ -> if (issue == 0) h.delivered(h.fxFrame(1400.0)) else TopicSnapshotOutcome.Dormant }
+        val first = acknowledgedUnder(h)
+        assertEquals(listOf(USD), h.bootstrapCalls.map { it.second })
+
+        access.flicker()
+        advanceTimeBy(11_000)
+        assertEquals("간격이 온 남은 topic 을 발급하지 않았다", listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        assertEquals("보류 뒤의 발급이 새 사용을 얻지 않았다", true, h.bootstrapUseChecks.last()())
+        assertEquals(false, h.bootstrapUseChecks.first()())
+        assertEquals("아무 경계도 지나지 않았는데 연결이 끝났다", false, first.cancelled)
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertTrue("놓친 보류 전의 연결이 남았다", first.cancelled)
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+        assertTrue("놓친 보류 전의 답이 적용됐다", h.coordinator.rates.value.quotes.isEmpty())
+        advanceTimeBy(firstRungMillis)
+        assertEquals("놓친 보류 뒤 사다리가 다시 열지 않았다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** A hold that came before any connection was attempted opens at once when released, and the first connection subscribes at once. */
+    @Test
+    fun `a hold released before the first attempt opens at once`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        access.hold()
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(0, h.connectCalls)
+        assertEquals(0, h.bootstrapCalls.size)
+
+        access.release()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals("시도한 적 없는 연결을 사다리에 올렸다", 1, h.wires.size)
+        assertEquals("최초 계획을 한 번 만들지 않았다", listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("첫 연결이 곧바로 구독하지 않았다", 1, h.requests.size)
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals(2, h.bootstrapCalls.size)
+        h.cleanUp()
+    }
+
+    /** A reservation made before a hold is kept when the hold is released before it falls due: no second rung is spent. */
+    @Test
+    fun `a reservation made before a hold is kept by a release that comes before it is due`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val first = acknowledgedUnder(h)
+
+        first.drop()
+        advanceTimeBy(500)
+        access.hold()
+        h.coordinator.accessRevised()
+        advanceTimeBy(500)
+        access.release()
+        h.coordinator.accessRevised()
+        advanceTimeBy(firstRungMillis - 1_100)
+        assertEquals(1, h.wires.size)
+        advanceTimeBy(200)
+        assertEquals("원래 예약이 제때 열지 않았다", 2, h.wires.size)
+
+        // One rung spent so far: the next reservation is the second rung, not the third.
+        h.wire.drop()
+        advanceTimeBy(2 * firstRungMillis - 100)
+        assertEquals(2, h.wires.size)
+        advanceTimeBy(200)
+        assertEquals("해제가 한 칸을 더 썼다", 3, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** A reservation that falls due during a hold opens nothing and is spent; the release reserves the next rung. */
+    @Test
+    fun `a reservation due during a hold is spent and the release reserves the next rung`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val first = acknowledgedUnder(h)
+
+        first.drop()
+        advanceTimeBy(500)
+        access.hold()
+        h.coordinator.accessRevised()
+        advanceTimeBy(2_000)
+        assertEquals("보류 중에 만료된 예약이 열었다", 1, h.wires.size)
+
+        access.release()
+        h.coordinator.accessRevised()
+        advanceTimeBy(2 * firstRungMillis - 100)
+        assertEquals("해제가 첫 칸으로 되돌렸다", 1, h.wires.size)
+        advanceTimeBy(200)
+        assertEquals("해제가 다음 칸을 예약하지 않았다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** Reservations spent without connecting run the budget out: a release then opens nothing, and a foreground return resets it. */
+    @Test
+    fun `reservations spent under holds run the budget out until a foreground return`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val first = acknowledgedUnder(h)
+
+        first.drop()
+        // Handled before the first hold, so the drop reserves the first rung rather than the hold ending the connection first.
+        advanceTimeBy(1)
+        repeat(TopicReconnectPolicy.MAX_ATTEMPTS) {
+            access.hold()
+            h.coordinator.accessRevised()
+            advanceTimeBy(20_000)
+            access.release()
+            h.coordinator.accessRevised()
+            advanceTimeBy(1)
+        }
+        // The first rung was reserved by the drop; each of the five releases before the last reserved the next one.
+        advanceTimeBy(60_000)
+        assertEquals("예산이 다 쓰였는데 자동으로 열었다", 1, h.wires.size)
+
+        h.coordinator.setForeground(true)
+        advanceTimeBy(100)
+        assertEquals("Foreground 가 예산을 되돌리지 않았다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** A revision and a send the use refused, handled in either order, end the old connection once and open one new one. */
+    @Test
+    fun `a revision and a refused send in either order open one connection`() = runTest {
+        suspend fun TestScope.refusedSendThenRevision(revisionFirst: Boolean): Harness {
+            val h = Harness(this)
+            val access = h.publishedAccess()
+            h.credentialGate = CompletableDeferred()
+            h.goLive()
+            advanceTimeBy(100)
+            h.wire.open()
+            advanceTimeBy(1)
+            access.flicker()
+            if (revisionFirst) {
+                h.credentialGate!!.complete(Unit)
+                h.coordinator.accessRevised()
+            } else {
+                h.credentialGate!!.complete(Unit)
+                runCurrent()
+                h.coordinator.accessRevised()
+            }
+            // Past the first rung and short of the new connection's connect deadline.
+            advanceTimeBy(5_000)
+            return h
+        }
+        val queuedAfter = refusedSendThenRevision(revisionFirst = true)
+        val handledBefore = refusedSendThenRevision(revisionFirst = false)
+        listOf(queuedAfter, handledBefore).forEach { h ->
+            assertTrue(h.wires.first().cancelled)
+            assertEquals("연결이 하나로 끝나지 않았다", 2, h.wires.size)
+            assertEquals(2, h.connectCalls)
+        }
+        backgroundScope.cancel()
+    }
+
+    /** Revisions while a connection is still negotiating keep that one connection, and an owed topic whose floor has come is issued. */
+    @Test
+    fun `revisions during a negotiation keep one connection and issue an owed topic whose floor has come`() = runTest {
+        val h = Harness(this)
+        h.publishedAccess()
+        var floor = 20_000L
+        var floorReads = 0
+        h.bootstrapFloor = { if (++floorReads == 1) 0L else floor }
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(listOf(USD), h.bootstrapCalls.map { it.second })
+        assertEquals(1, h.wires.size)
+
+        repeat(3) { h.coordinator.accessRevised() }
+        advanceTimeBy(1)
+        assertEquals("협상 중 revision 이 연결을 더 열었다", 1, h.wires.size)
+        assertEquals(1, h.bootstrapCalls.size)
+
+        floor = 0L
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals("floor 가 지난 남은 topic 을 revision 이 발급하지 않았다", listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        h.cleanUp()
+    }
+
+    /**
+     * A grant given during a hold starts its ladder from zero: the budget an earlier context spent does not stop the first
+     * reconnection after the release — neither for a new fence nor for the same fence withdrawn and given again.
+     */
+    @Test
+    fun `a grant given during a hold keeps a fresh ladder for after the release`() = runTest {
+        suspend fun TestScope.spentThenHeld(h: Harness, access: PublishedAccess) {
+            h.failConnects = TopicReconnectPolicy.MAX_ATTEMPTS + 1
+            h.goLive()
+            advanceTimeBy(120_000)
+            assertEquals("앞 context 의 예산이 다 쓰이지 않았다", TopicReconnectPolicy.MAX_ATTEMPTS + 1, h.connectCalls)
+            access.hold()
+        }
+
+        val moved = Harness(this)
+        val movedAccess = moved.publishedAccess()
+        spentThenHeld(moved, movedAccess)
+        movedAccess.rotate(2L)
+        movedAccess.hold()
+        moved.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+        movedAccess.release()
+        moved.failConnects = 1
+        moved.coordinator.accessRevised()
+        advanceTimeBy(1)
+        val afterRelease = moved.connectCalls
+        advanceTimeBy(firstRungMillis + 100)
+        assertEquals("새 grant 의 첫 연결 실패 뒤 사다리가 없었다", afterRelease + 1, moved.connectCalls)
+        assertEquals(1, moved.wires.size)
+
+        val regranted = Harness(this)
+        val regrantedAccess = regranted.publishedAccess()
+        spentThenHeld(regranted, regrantedAccess)
+        regranted.setAccess(false, fence())
+        regranted.setAccess(true, fence())
+        advanceTimeBy(100)
+        regrantedAccess.release()
+        regranted.coordinator.accessRevised()
+        advanceTimeBy(1)
+        val beforeRung = regranted.connectCalls
+        advanceTimeBy(firstRungMillis + 100)
+        assertEquals("같은 fence 재부여의 예산이 새로 열리지 않았다", beforeRung + 1, regranted.connectCalls)
+        backgroundScope.cancel()
+    }
+
+    /**
+     * A release published while the revision is being handled is left to the revision that publishes it (L-4e E2b): ending the old
+     * connection does not ask for a new start of its own, so only the one question after it decides, and it found the use still
+     * held.
+     */
+    @Test
+    fun `a release published during a revision waits for its own revision`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val first = acknowledgedUnder(h)
+
+        access.hold()
+        access.afterAcquire = { access.release() }
+        h.coordinator.accessRevised()
+        runCurrent()
+        assertTrue(first.cancelled)
+        assertNull("재평가가 새 시작을 묻지 않았다", access.afterAcquire)
+        advanceTimeBy(firstRungMillis + 1L)
+        runCurrent()
+        assertEquals("연결을 끝내는 일이 새 시작을 따로 물어 예약했다", 1, h.connectCalls)
+
+        h.coordinator.accessRevised()
+        advanceTimeBy(firstRungMillis)
+        runCurrent()
+        assertEquals(2, h.connectCalls)
+        h.cleanUp()
+    }
+
+    /**
+     * Joined to the real issuer end to end (L-4e E2b): a USER hold ends the connection, and its release — the held answer turning
+     * stale when the transport moves, as the E1 tests release it — comes back as a revision that reconnects under the same token
+     * with a new use and carries on only what the plan still owed.
+     */
+    @Test
+    fun `a real issuer release reconnects under the same token and continues only what is owed`() = runTest {
+        val h = Harness(this, bootstrapIssueGap = 10.seconds)
+        val issuer = Issuer(this, h)
+        issuer.outcome = { EntitlementsOutcome.StableActive(krxVisible = true) }
+        val issued = issuer.grant()
+        issuer.record = issuer.record.copy(
+            mayContainPremiumData = true,
+            mayContainKrxData = true
+        )
+        h.authority = SnapshotTopicUseAuthority { issuer.premium.accessSnapshot }
+        backgroundScope.launch {
+            issuer.premium.accessRevisions.collect { h.coordinator.accessRevised() }
+        }
+
+        refusedUnder(h, issued)
+        val first = h.wire
+        first.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        runCurrent()
+        val before = issuer.premium.accessSnapshot
+        val oldUse = checkNotNull(h.authority.acquire(issued))
+        assertEquals(listOf(USD), h.bootstrapCalls.map { it.second })
+
+        issuer.outcome = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        issuer.afterFetch = { issuer.loadFailures = 2 }
+        issuer.premium.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertTrue(
+            TopicAccessBlock.LOSS_CANDIDATE in
+                issuer.premium.accessSnapshot.facts.userBlocks
+        )
+        assertTrue(first.cancelled)
+
+        issuer.transportIdentity = EntitlementsIdentity("u1", 2L)
+        advanceTimeBy(2_000L)
+        runCurrent()
+
+        val released = issuer.premium.accessSnapshot
+        assertEquals(0, issuer.premium.heldLossCandidateCount())
+        assertTrue(released.facts.userAllowed)
+        assertTrue(released.facts.tokenStanding)
+        assertEquals(before.facts.token, released.facts.token)
+        assertEquals(before.facts.binding, released.facts.binding)
+        assertEquals(before.facts.recordFence, released.facts.recordFence)
+        assertEquals(before.lastUserEnd, released.lastUserEnd)
+        assertEquals(false, h.authority.admits(oldUse))
+        assertNotEquals(oldUse, checkNotNull(h.authority.acquire(issued)))
+        assertEquals(1, h.connectCalls)
+
+        advanceTimeBy(firstRungMillis - 1L)
+        runCurrent()
+        assertEquals(1, h.connectCalls)
+        advanceTimeBy(1L)
+        runCurrent()
+        assertEquals(2, h.connectCalls)
+        h.wire.open()
+        runCurrent()
+        assertEquals(1, h.wire.sent.count { it.startsWith("encoded-") })
+
+        val owedAt = h.bootstrapCallTimes.first() + 10_000L
+        advanceTimeBy(owedAt - testScheduler.currentTime - 1L)
+        runCurrent()
+        assertEquals(listOf(USD), h.bootstrapCalls.map { it.second })
+        advanceTimeBy(1L)
+        runCurrent()
+        assertEquals(listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        assertEquals(false, h.bootstrapUseChecks.first()())
+        assertEquals(true, h.bootstrapUseChecks.last()())
+        h.cleanUp()
+    }
+
+    /** A revision releases neither latch, and does nothing for a session offline, without access, or stopped. */
+    @Test
+    fun `a revision releases no latch and does nothing where nothing is wanted`() = runTest {
+        val refused = Harness(this)
+        refused.publishedAccess()
+        val first = acknowledgedUnder(refused)
+        first.deliver(refused.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+        repeat(2) { refused.coordinator.accessRevised() }
+        advanceTimeBy(60_000)
+        assertEquals("거절 잠금을 revision 이 풀었다", 1, refused.wires.size)
+
+        val retired = Harness(this)
+        retired.publishedAccess()
+        val live = acknowledgedUnder(retired)
+        retired.liveFence = AuthIdentityFence("u1", 2L)
+        live.deliver(retired.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        repeat(2) { retired.coordinator.accessRevised() }
+        advanceTimeBy(60_000)
+        assertEquals("신원 은퇴를 revision 이 풀었다", 1, retired.wires.size)
+
+        val offline = Harness(this)
+        offline.publishedAccess()
+        offline.coordinator.start()
+        offline.setAccess(true, fence())
+        offline.coordinator.accessRevised()
+        advanceTimeBy(60_000)
+        assertEquals(0, offline.connectCalls)
+        assertEquals(0, offline.bootstrapCalls.size)
+
+        val stopped = Harness(this)
+        stopped.publishedAccess()
+        stopped.goLive()
+        advanceTimeBy(100)
+        stopped.coordinator.stop()
+        stopped.coordinator.accessRevised()
+        advanceTimeBy(60_000)
+        assertEquals(1, stopped.connectCalls)
+        backgroundScope.cancel()
+    }
+
+    /**
+     * The E6 fixture: a command whose credential could not be prepared three times ends, and nothing here opens it again — not a
+     * revision that changes nothing, not the same grant said again — even once the credential is back. The connection stays.
+     */
+    @Test
+    fun `a command ended by an unavailable credential is not reopened by a revision or the same grant`() = runTest {
+        val h = Harness(this)
+        h.publishedAccess()
+        h.credentialFailures = 3
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(60_000)
+        assertEquals("준비 실패 세 번으로 끝나지 않았다", 3, h.credentialReads)
+        assertEquals(0, h.requests.size)
+        assertEquals(0, h.credentialFailures)
+
+        repeat(2) { h.coordinator.accessRevised() }
+        h.setAccess(true, fence())
+        advanceTimeBy(60_000)
+        assertEquals("같은 grant 의 revision 이 끝난 명령을 다시 열었다", 3, h.credentialReads)
+        assertEquals(0, h.requests.size)
+        assertEquals(1, h.wires.size)
+        assertEquals(false, h.wire.cancelled)
+        h.cleanUp()
+    }
+
+    /**
+     * Joined to the real issuer through a small deliverer that turns every published revision into [accessRevised]: a USER hold
+     * ends the connection before any `Access` reaches the session, and a capability-only hold leaves it standing.
+     */
+    @Test
+    fun `revisions from the real issuer end the connection on a user hold and not on a capability hold`() = runTest {
+        val h = Harness(this)
+        val issuer = Issuer(this, h)
+        issuer.outcome = { EntitlementsOutcome.StableActive(krxVisible = true) }
+        val issued = issuer.grant()
+        issuer.record = issuer.record.copy(mayContainPremiumData = true, mayContainKrxData = true)
+        h.authority = SnapshotTopicUseAuthority { issuer.premium.accessSnapshot }
+        backgroundScope.launch { issuer.premium.accessRevisions.collect { h.coordinator.accessRevised() } }
+        refusedUnder(h, issued)
+        val first = h.wire
+        first.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+
+        issuer.outcome = { EntitlementsOutcome.StableActive(krxVisible = false) }
+        issuer.afterFetch = { issuer.loadFailures = 2 }
+        issuer.premium.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        advanceTimeBy(1)
+        assertTrue(TopicAccessBlock.LOSS_CANDIDATE in issuer.premium.accessSnapshot.facts.capabilityBlocks)
+        assertEquals("capability 보류 revision 이 연결을 끝냈다", false, first.cancelled)
+
+        issuer.outcome = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        issuer.afterFetch = { issuer.loadFailures = 2 }
+        issuer.premium.refresh(RefreshIntent.FORCE_PREMIUM)
+        advanceTimeBy(1)
+        assertTrue(TopicAccessBlock.LOSS_CANDIDATE in issuer.premium.accessSnapshot.facts.userBlocks)
+        assertTrue("USER 보류 revision 이 프레임 없이 연결을 끝내지 않았다", first.cancelled)
+        backgroundScope.cancel()
     }
 }
