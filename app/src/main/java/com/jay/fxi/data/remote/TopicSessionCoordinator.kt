@@ -3,6 +3,7 @@ package com.jay.fxi.data.remote
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
+import com.jay.fxi.data.auth.HttpExchangeEvidence
 import com.jay.fxi.data.remote.dto.DxyTopicMessage
 import com.jay.fxi.data.remote.dto.TopicSourceEntry
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
@@ -148,7 +149,9 @@ private sealed interface SessionInput {
     data class BootstrapAnswered(
         val grantEpoch: Long,
         val topic: String,
-        val outcome: TopicSnapshotOutcome
+        val outcome: TopicSnapshotOutcome,
+        /** The use its issue acquired (L-4e E2a). A delivered snapshot is applied only while this is still admitted. */
+        val lifetime: TopicUseLifetime
     ) : SessionInput
 
     data class Transport(val generation: Long, val event: TopicTransportEvent) : SessionInput
@@ -242,6 +245,17 @@ private sealed interface SessionInput {
      */
     data class ReconnectDue(val ticket: Long) : SessionInput
 
+    /**
+     * A command found, at its send, that the access its connection's use serves no longer admits it (L-4e E2a).
+     *
+     * Posted rather than acted on for the same reason as [LeaseExpiryDue]: ending the connection from the command would cancel
+     * its own coroutine. The handler checks the generation, so a dead connection cannot end a newer one.
+     */
+    data class AccessWithheldDue(val generation: Long) : SessionInput
+
+    /** A deferred protected side effect asking to run under the session that attributed it (L-4e E2a). */
+    class DeferredUse(val attribution: TopicUseAttribution, val action: () -> Unit) : SessionInput
+
     data object Stop : SessionInput
 }
 
@@ -273,14 +287,22 @@ class TopicSessionCoordinator(
     private val connect: (generation: Long) -> TopicTransport,
     private val credentials: TopicCommandCredentials,
     /**
+     * The issuer's published access, as the session asks it (L-4e E2a): a new protected use acquires a lifetime from it, and every
+     * send and application under that use asks whether it is still admitted. Thread-safe and side-effect free.
+     */
+    private val authority: TopicUseAuthority,
+    /**
      * One REST snapshot for one topic, bound to the grant it was asked for.
      *
      * Takes an [AuthIdentityFence] rather than a whole [TopicSessionFence] because that is all the
      * transport can enforce: it re-checks uid and auth generation before the token is read and
      * again once the response is in hand, and knows nothing of `userAccessEpoch`. The half it
      * cannot see is refused here instead, by [SessionInput.BootstrapAnswered]'s epoch.
+     *
+     * [useAdmitted] is the use this call was issued under (L-4e E2a): the transport asks it before every send, and a refusal
+     * ends the call with [TopicUseWithheldException].
      */
-    private val bootstrap: suspend (owner: AuthIdentityFence, topic: String) -> TopicSnapshotOutcome,
+    private val bootstrap: suspend (owner: AuthIdentityFence, topic: String, useAdmitted: () -> Boolean) -> TopicSnapshotOutcome,
     private val store: TopicSubscriptionStateStore,
     private val encode: (TopicSubscribeRequest) -> String,
     private val newRequestId: () -> String,
@@ -348,6 +370,9 @@ class TopicSessionCoordinator(
      * Kept even though this slice uses only the refusals: the leases and the instant are what
      * S3k-2 renews against, and dropping them here would mean re-plumbing the seam that was the
      * point of handing an acknowledgement over early.
+     *
+     * Receiving one authorises nothing later. A consumer that acts on it afterwards goes through the session's own boundaries,
+     * and a deferred protected side effect through [runIfStillOwned]; its attribution argument is added with that consumer (S3k-2).
      */
     private val onAcknowledgement: (TopicCommandAcknowledgement) -> Unit = {},
     /** A frame the decoder refused: its length and the exception's class name, and nothing else. */
@@ -390,20 +415,18 @@ class TopicSessionCoordinator(
      * | `TimedOut` / `Unreachable` | the store's "gave up without a verdict" is keyed to a
      *   request ticket, and a ticket belongs to the socket's single control channel |
      *
-     * **The owner identifies attribution, not authority for a deferred continuation.**
-     * This callback runs synchronously on the coordinator loop and must return promptly.
-     * [TopicSessionFence] contains no [grantEpoch]: owner equality cannot detect a same-fence
-     * withdrawal and re-grant, or a later refusal/identity-loss latch. Deferred side effects
-     * therefore require a separate revocation-aware ownership check, including live identity
-     * and access validation. That boundary must exist before runtime wiring; this callback
-     * does not implement it.
+     * **The attribution identifies who the outcome belongs to; it authorises nothing (L-4e E2a).**
+     * This callback runs synchronously on the coordinator loop and must return promptly. The hand-over itself is control
+     * flow, so a use that is no longer admitted does not stop it. A deferred protected side effect goes back through
+     * [runIfStillOwned], which checks this session instance, its grant epoch and fence, both latches, the live identity
+     * and the use's lifetime at the moment it runs.
      *
      * **Do not log the outcome whole.** `Unsupported` is a data class, so its default
      * `toString()` prints the server's supported-topic list — which, with a topic removed for
      * this user, *is* an entitlement. `Malformed`'s reason may contain body excerpts from decoder errors.
      */
     private val onBootstrapUndelivered:
-        (owner: TopicSessionFence, topic: String, outcome: TopicSnapshotOutcome) -> Unit =
+        (attribution: TopicUseAttribution, topic: String, outcome: TopicSnapshotOutcome) -> Unit =
         { _, _, _ -> },
     desired: Set<String> = TopicCatalogue.DESIRED
 ) {
@@ -416,11 +439,16 @@ class TopicSessionCoordinator(
      */
     private val desired: Set<String> = desired.toSet()
 
+    /** This instance, as the attributions it hands out name it: another session's grant epoch can be the same number. */
+    private val sessionKey = Any()
+
     private class Connection(
         val generation: Long,
         val transport: TopicTransport,
         /** The grant this socket was opened for. Nothing is sent under any other. */
         val fence: TopicSessionFence,
+        /** The use this socket was opened under (L-4e E2a). Every send and application on it asks whether it is still admitted. */
+        val lifetime: TopicUseLifetime,
         /** Whether this was the session's first attempt at a socket, which subscribes at once. */
         val firstAttempt: Boolean
     ) {
@@ -663,6 +691,16 @@ class TopicSessionCoordinator(
      */
     fun setFocus(owner: AuthIdentityFence, tab: FreeTab) = post(SessionInput.Focus(owner, tab))
 
+    /**
+     * Runs [action] on this session's scope if what [attribution] names still owns a protected use (L-4e E2a).
+     *
+     * Checked on the loop, in this order: the same session instance, the same grant epoch, access still granted to the same fence,
+     * neither latch, the live identity, and the use's lifetime. [action] runs in that same turn or not at all; no answer is handed
+     * back to act on later. It must return promptly and not throw — an exception ends the session as any loop failure does. Work it
+     * starts asynchronously does not carry this admission with it, and each send or application of that work is checked again.
+     */
+    fun runIfStillOwned(attribution: TopicUseAttribution, action: () -> Unit) = post(SessionInput.DeferredUse(attribution, action))
+
     fun stop() = post(SessionInput.Stop)
 
     private fun post(input: SessionInput) {
@@ -823,7 +861,15 @@ class TopicSessionCoordinator(
                 // No second `desired` check: the set is copied at construction and never changes,
                 // and the issue already refused anything outside it.
                 val delivered = input.outcome as? TopicSnapshotOutcome.Delivered
-                    ?: return onBootstrapUndelivered(owner, input.topic, input.outcome)
+                    // A refusal or a failure is handed to its owner whatever the use came to: that is control flow (L-4e E2a).
+                    ?: return onBootstrapUndelivered(
+                        TopicUseAttribution(sessionKey, owner, grantEpoch, input.lifetime),
+                        input.topic,
+                        input.outcome
+                    )
+                // The snapshot is protected data: applied only while the use its issue acquired is still admitted, however the
+                // access came back in between.
+                if (!authority.admits(input.lifetime)) return
                 applyBootstrap(input.topic, delivered.frame)
             }
 
@@ -933,6 +979,11 @@ class TopicSessionCoordinator(
             is SessionInput.LeaseExpiryDue ->
                 current(input.generation)?.let { live -> enforceLeaseExpiry(live) }
 
+            is SessionInput.AccessWithheldDue ->
+                current(input.generation)?.let { live -> end(live, TopicDisconnectCause.DELIBERATE) }
+
+            is SessionInput.DeferredUse -> if (stillOwns(input.attribution)) input.action()
+
             is SessionInput.ReconnectDue -> {
                 if (input.ticket != reconnectTicket) return
                 reconnectJob = null
@@ -998,17 +1049,39 @@ class TopicSessionCoordinator(
      * [TopicAnswerDenial.ENDED_CONNECTION] and [TopicAnswerDenial.LATCHED] are defensive: an ended connection has already
      * cancelled its commands, and both latches end their connection as they are set.
      */
-    private fun admitsAnswer(live: Connection, refusesPremium: Boolean): TopicAnswerAdmission {
+    private fun admitsAnswer(live: Connection, rejected: Map<String, TopicRejectionReason>): TopicAnswerAdmission {
         val still = current(live.generation) ?: return TopicAnswerAdmission.Denied(TopicAnswerDenial.ENDED_CONNECTION)
         if (still.fence == refusedFor || still.fence == identityLostFor) {
             return TopicAnswerAdmission.Denied(TopicAnswerDenial.LATCHED)
         }
         if (!enforceLiveIdentity(still.fence)) return TopicAnswerAdmission.Denied(TopicAnswerDenial.IDENTITY_LOST)
+        // The use no longer admitted (L-4e E2a): what the answer refuses is still handed over — that is control flow, and a
+        // premium refusal still latches — but nothing it grants is applied, and the connection ends.
+        if (!authority.admits(still.lifetime)) {
+            settleRefusal(still, rejected)
+            end(still, TopicDisconnectCause.DELIBERATE)
+            if (rejected.isNotEmpty()) onRejected(still.fence, rejected)
+            return TopicAnswerAdmission.Denied(TopicAnswerDenial.ACCESS_WITHHELD)
+        }
+        val refusesPremium = rejected.values.any { it == TopicRejectionReason.PREMIUM_REQUIRED }
         val atMillis = clock.nowMillis()
         if (!refusesPremium && enforceLeaseExpiry(still, atMillis)) {
             return TopicAnswerAdmission.Denied(TopicAnswerDenial.LEASE_EXPIRED)
         }
         return TopicAnswerAdmission.Admitted(atMillis)
+    }
+
+    /**
+     * A `premium_required` refusal latches the grant [live] was opened for and ends it, before anyone outside is told.
+     *
+     * Shared by an admitted acknowledgement and by one refused because its use was withheld (L-4e E2a): the latch is what stops
+     * the session asking again under a grant the server refused, whichever of the two carried the refusal.
+     */
+    private fun settleRefusal(live: Connection, rejected: Map<String, TopicRejectionReason>) {
+        if (rejected.values.none { it == TopicRejectionReason.PREMIUM_REQUIRED }) return
+        refusedFor = live.fence
+        end(live, TopicDisconnectCause.DELIBERATE)
+        cancelReconnect()
     }
 
     /**
@@ -1045,9 +1118,36 @@ class TopicSessionCoordinator(
      * working while the app was suspended does **not** reliably announce itself as a dropped one.
      * Assuming it did is what left an expired connection standing. Found by review.
      */
-    private fun wanted(): Boolean =
+    private fun wanted(): Boolean = sessionWanted() && useLifetime() != null
+
+    /** [wanted] without the issuer: only what this session was told. Pure, so it cannot change inside one turn. */
+    private fun sessionWanted(): Boolean =
         access && online && fence != null && desired.isNotEmpty() &&
             fence != refusedFor && fence != identityLostFor
+
+    /**
+     * A lifetime for a new protected use under the current fence, or null (L-4e E2a).
+     *
+     * New starts only. An existing connection or bootstrap keeps the lifetime it started with, and a new one succeeding does not
+     * make that one valid again.
+     */
+    private fun useLifetime(): TopicUseLifetime? = fence?.let(authority::acquire)
+
+    /**
+     * Whether a protected use under the session attributed to [attribution] may still run now (L-4e E2a).
+     *
+     * The session's own facts first, then the live identity — which can advance its generation, so it is not driven by an
+     * attribution the pure checks already rule out — then the issuer.
+     */
+    private fun stillOwns(attribution: TopicUseAttribution): Boolean {
+        if (attribution.sessionKey !== sessionKey) return false
+        if (attribution.grantEpoch != grantEpoch) return false
+        val owner = fence ?: return false
+        if (!access || owner != attribution.owner) return false
+        if (owner == refusedFor || owner == identityLostFor) return false
+        if (!enforceLiveIdentity(owner)) return false
+        return authority.admits(attribution.lifetime)
+    }
 
     private fun reconsider(budgetIsFresh: Boolean) {
         if (!wanted()) {
@@ -1056,7 +1156,11 @@ class TopicSessionCoordinator(
             firstDeliveryOutstanding = false
             return
         }
-        if (connection != null) return
+        connection?.let { live ->
+            // A connection keeps the use it opened under; a new start being possible does not make that one valid again.
+            if (authority.admits(live.lifetime)) return
+            end(live, TopicDisconnectCause.DELIBERATE)
+        }
         // A lifecycle transition is a different trigger from the automatic ladder, and starts
         // again from zero — `TopicReconnectPolicy` says so, and a user who returns to a screen
         // should not inherit the exhaustion of a socket that failed while they were away.
@@ -1066,6 +1170,8 @@ class TopicSessionCoordinator(
     }
 
     private fun open() {
+        // Acquired before anything is numbered or opened: a publication between `wanted()` and here does not open a socket.
+        val lifetime = useLifetime() ?: return
         val number = ++generation
         val firstAttempt = !everAttempted
         everAttempted = true
@@ -1077,10 +1183,11 @@ class TopicSessionCoordinator(
             // exception it rethrows — and counting both would spend two rungs of the ladder for
             // one attempt. Only one of them can reach this session: the transport is never handed
             // back, so nothing collects its events, and the exception is the whole report.
-            scheduleReconnect()
+            // Asked again rather than trusting the lifetime just acquired: the issuer can publish while `connect` runs.
+            if (wanted()) scheduleReconnect()
             return
         }
-        val live = Connection(number, transport, fence ?: return, firstAttempt)
+        val live = Connection(number, transport, fence ?: return, lifetime, firstAttempt)
         connection = live
         live.timers += scope.launch {
             transport.events.collect { post(SessionInput.Transport(number, it)) }
@@ -1193,6 +1300,12 @@ class TopicSessionCoordinator(
         // and can advance its generation, so a frame this session was never going to consume
         // must not be what drives it.
         if (!enforceLiveIdentity(live.fence)) return false
+        // Ended rather than refused, as an identity loss is: refusing frame after frame on a standing socket would starve the
+        // delivery evidence and let D14 file a withheld use as a topic gone quiet (L-4e E2a).
+        if (!authority.admits(live.lifetime)) {
+            end(live, TopicDisconnectCause.DELIBERATE)
+            return false
+        }
         if (enforceLeaseExpiry(live)) return false
         val snapshot = store.snapshot
         if (snapshot.authResolution == TopicAuthResolution.FAILED) return false
@@ -1294,18 +1407,24 @@ class TopicSessionCoordinator(
             // starters cannot cover, because the deadline can pass between the decision and the
             // send. The handler checks the generation, so a dead connection cannot end a newer one.
             send = { text ->
-                if (live.leases.expiredAt(clock.nowMillis()).isNotEmpty()) {
-                    post(SessionInput.LeaseExpiryDue(live.generation))
-                    false
-                } else {
-                    transport.send(text)
+                when {
+                    // The use first (L-4e E2a): a withheld use is not a lease that ran out, and ending it must not start a ladder.
+                    !authority.admits(live.lifetime) -> {
+                        post(SessionInput.AccessWithheldDue(live.generation))
+                        false
+                    }
+                    live.leases.expiredAt(clock.nowMillis()).isNotEmpty() -> {
+                        post(SessionInput.LeaseExpiryDue(live.generation))
+                        false
+                    }
+                    else -> transport.send(text)
                 }
             },
             newRequestId = newRequestId,
             jitter = jitter,
             scope = { if (current(live.generation) == null) emptySet() else topics() },
             onAcknowledged = { ack -> onAcknowledged(live, id, ack) },
-            admitAnswer = { refusesPremium -> admitsAnswer(live, refusesPremium) }
+            admitAnswer = { rejected -> admitsAnswer(live, rejected) }
         )
         val running = RunningCommand(command, purpose)
         live.commands[id] = running
@@ -1372,11 +1491,7 @@ class TopicSessionCoordinator(
         // Settled **before** anyone outside is told, and against the grant this connection was
         // opened for rather than whatever is current: a listener that throws must not be able to
         // leave the session still asking under an account that has been refused. Found by review.
-        if (ack.rejected.values.any { it == TopicRejectionReason.PREMIUM_REQUIRED }) {
-            refusedFor = live.fence
-            end(live, TopicDisconnectCause.DELIBERATE)
-            cancelReconnect()
-        }
+        settleRefusal(live, ack.rejected)
         // Also before, and only while the connection is still standing: the leases belong to this
         // socket, and re-arming timers on one that has just been ended would schedule work for a
         // connection nobody is holding. A deadline that passed while this answer was in flight was
@@ -1535,10 +1650,13 @@ class TopicSessionCoordinator(
                 scheduleBootstrapIssue((notBefore - now).milliseconds)
                 return
             }
+            // Each issue is its own start (L-4e E2a): acquired right before it is taken off what is owed, never carried over from
+            // the issue before it, whose job was already enqueued. Refused, nothing is consumed and the plan waits.
+            val lifetime = useLifetime() ?: return cancelBootstrapIssue()
             unissuedBootstraps.remove(next)
             bootstrapFirstBatch = if (usesFirstBatch) (batch ?: shown) - next else emptySet()
             lastBootstrapIssuedAtMillis = now
-            startBootstrap(next)
+            startBootstrap(next, lifetime)
         }
     }
 
@@ -1592,22 +1710,27 @@ class TopicSessionCoordinator(
      * The job reports that it ended from `finally`, apart from its answer: the identity-change path posts no answer, and a
      * cancelled job posts none either, and both must still leave [bootstrapsOut].
      */
-    private fun startBootstrap(topic: String) {
-        if (!wanted() || topic !in desired) return
+    private fun startBootstrap(topic: String, lifetime: TopicUseLifetime) {
+        // The session's own conditions only: the use was acquired in this turn and the topic already taken off what is owed, so
+        // a live re-read here could only drop the topic silently.
+        if (!sessionWanted() || topic !in desired) return
         val owner = fence?.identity ?: return
         val epoch = grantEpoch
         val requestId = ++nextBootstrapRequestId
         val job = scope.launch {
             try {
                 val outcome = try {
-                    bootstrap(owner, topic)
+                    bootstrap(owner, topic) { authority.admits(lifetime) }
+                } catch (withheld: TopicUseWithheldException) {
+                    // The use was withheld before a send (L-4e E2a): nothing was applied, and what the server had already said
+                    // about retrying is still the floor owner's. No outcome — the issue is not asked again by itself.
+                    handOverEvidence(withheld.exchanges, statusCode = null, retryAfter = null)
+                    return@launch
                 } catch (moved: AuthIdentityChangedException) {
                     // The answer is refused, the rate limit is not: it was levied on the transport by
                     // address and outlives the credential that carried it. Handed over here, ahead of
                     // the grant filter, because that filter drops the whole outcome.
-                    if (moved.statusCode != null || moved.retryAfter != null) {
-                        onBootstrapHttpEvidence(moved.statusCode, moved.retryAfter)
-                    }
+                    handOverEvidence(moved.exchanges, moved.statusCode, moved.retryAfter)
                     // This exception carries no topic verdict. Identity propagation and recovery
                     // need the runtime auth bridge — a bare-uid `Access` notification can miss the
                     // move — so do not turn it into a topic outcome the server never gave.
@@ -1619,12 +1742,26 @@ class TopicSessionCoordinator(
                 (outcome as? TopicSnapshotOutcome.Refused)?.failure?.let { failure ->
                     onBootstrapHttpEvidence(failure.statusCode, failure.retryAfter)
                 }
-                post(SessionInput.BootstrapAnswered(epoch, topic, outcome))
+                post(SessionInput.BootstrapAnswered(epoch, topic, outcome, lifetime))
             } finally {
                 post(SessionInput.BootstrapSettled(requestId))
             }
         }
         bootstrapsOut[requestId] = BootstrapOut(epoch, topic, job)
+    }
+
+    /**
+     * HTTP evidence a refused call carries, handed to the floor owner once per response (L-4e E2a).
+     *
+     * A use-checked call carries every response it saw; when it did, the single status and `Retry-After` only repeat the last of
+     * them and are not handed over again. Any other call carries at most that single pair, handed over as before.
+     */
+    private fun handOverEvidence(exchanges: List<HttpExchangeEvidence>, statusCode: Int?, retryAfter: String?) {
+        if (exchanges.isNotEmpty()) {
+            exchanges.forEach { onBootstrapHttpEvidence(it.statusCode, it.retryAfter) }
+        } else if (statusCode != null || retryAfter != null) {
+            onBootstrapHttpEvidence(statusCode, retryAfter)
+        }
     }
 
     /**
@@ -1759,6 +1896,16 @@ class TopicSessionCoordinator(
             deliveryState = store.snapshot.stateFor(TopicCatalogue.TETHER).deliveryState,
             firstDeliveryOwnerActive = live == null || firstDeliveryOutstanding
         )
+        // A withheld use is not a silence (L-4e E2a). Nothing on the socket has to arrive for this window to run out, so no frame
+        // boundary ends the connection first; asked before anything is marked, and ended as a frame is. The live identity is read
+        // only on this branch, where a move retires ahead of the hold as at the other boundaries. The window is still spent: the
+        // next connection's first delivery owns this silence, and an unspent window would ask again once that effort and its
+        // revalidation have ended.
+        if (decision is TopicSilenceDecision.Revalidate && live != null && !authority.admits(live.lifetime)) {
+            if (enforceLiveIdentity(live.fence)) end(live, TopicDisconnectCause.DELIBERATE)
+            silenceHandledWindowMillis = silenceArmedUntilMillis
+            return
+        }
         if (decision.spendsWindow) silenceHandledWindowMillis = silenceArmedUntilMillis
         if (decision is TopicSilenceDecision.Revalidate && live != null) {
             store.markSuspect(TopicCatalogue.TETHER)

@@ -124,6 +124,9 @@ class TopicSubscribeCommandTest {
             { TopicAnswerAdmission.Admitted(clock.nowMillis()) }
         val admissions = mutableListOf<Boolean>()
 
+        /** The whole refusal map each application was asked with (L-4e E2a); [admissions] keeps only whether it refused premium. */
+        val admittedRejections = mutableListOf<Map<String, TopicRejectionReason>>()
+
         /** Fired every time the command asks what is still wanted. */
         var onScope: (() -> Unit)? = null
         private var nextId = 0
@@ -151,8 +154,10 @@ class TopicSubscribeCommandTest {
                     acknowledgements += scheduler.currentTime to it
                     onAcknowledgement?.invoke()
                 },
-                admitAnswer = { refusesPremium ->
+                admitAnswer = { rejected ->
+                    val refusesPremium = rejected.values.any { it == TopicRejectionReason.PREMIUM_REQUIRED }
                     admissions += refusesPremium
+                    admittedRejections += rejected
                     admission(refusesPremium)
                 }
             )
@@ -1324,6 +1329,50 @@ class TopicSubscribeCommandTest {
 
     private fun harnessAck(rejected: Map<String, String>, active: List<String>): (Harness) -> DecodedTopicFrame =
         { harness -> harness.ack("r1", active = active, rejected = rejected) }
+
+    /**
+     * Each application is asked with what its own answer refuses among the topics this request sent, and nothing else (L-4e E2a).
+     *
+     * A session hands these refusals over even when the use is withheld, so the map has to be the one the store would apply: every
+     * reason, not only `premium_required`, and never a refusal of a topic this request did not send. A failure and a refresh result
+     * refuse no topic.
+     */
+    @Test
+    fun `each application is asked with its own answer's refusals of the topics this request sent`() = runTest {
+        val eur = "fx:eur-krw"
+        val ack = Harness(this)
+        ack.wanted = setOf(USD, eur)
+        ack.build(TopicCommandPurpose.LEASE_RENEWAL)
+        ack.start()
+        advanceTimeBy(100)
+        ack.command.deliver(
+            ack.ack(
+                "r1",
+                active = emptyList(),
+                rejected = mapOf(USD to "krx_entitlement_required", eur to "premium_required", JPY to "premium_required")
+            )
+        )
+        advanceUntilIdle()
+        assertEquals(
+            listOf(mapOf(USD to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED, eur to TopicRejectionReason.PREMIUM_REQUIRED)),
+            ack.admittedRejections
+        )
+        ack.cleanUp()
+
+        val failure = Harness(this)
+        failure.refreshed = null
+        failure.build()
+        failure.start()
+        advanceTimeBy(100)
+        failure.command.deliver(failure.error("r1", "invalid_token"))
+        advanceUntilIdle()
+        assertEquals(
+            "실패·갱신 결과의 적용 판정이 거부를 실었다",
+            listOf(emptyMap<String, TopicRejectionReason>(), emptyMap()),
+            failure.admittedRejections
+        )
+        failure.cleanUp()
+    }
 
     /**
      * The acknowledgement carries the instant it was admitted at, not a second reading of the clock.

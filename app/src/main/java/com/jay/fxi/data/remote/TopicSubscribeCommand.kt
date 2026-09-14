@@ -128,7 +128,10 @@ enum class TopicAnswerDenial {
     /** Defensive: both latches end their connection as they are set. */
     LATCHED,
     IDENTITY_LOST,
-    LEASE_EXPIRED
+    LEASE_EXPIRED,
+
+    /** The access the connection's use serves no longer admits it (L-4e E2a). Its refusals were still handed over. */
+    ACCESS_WITHHELD
 }
 
 /**
@@ -223,11 +226,11 @@ class TopicSubscribeCommand(
     private val onAcknowledged: (TopicCommandAcknowledgement) -> Unit = {},
     /**
      * Asked immediately before each answer is applied to [store]: an acknowledgement, a classified request failure, and the
-     * result of a credential refresh. [refusesPremium] is whether an acknowledgement refuses a topic this request sent with
-     * `premium_required` — the one answer settled ahead of an expired lease. The default admits everything; a session must
-     * supply its own.
+     * result of a credential refresh. [rejected] is what an acknowledgement refuses among the topics this request sent — empty for
+     * a failure or a refresh. A `premium_required` among them is the one answer settled ahead of an expired lease, and every
+     * refusal is still handed over when the use is withheld (L-4e E2a). The default admits everything; a session must supply its own.
      */
-    private val admitAnswer: (refusesPremium: Boolean) -> TopicAnswerAdmission =
+    private val admitAnswer: (rejected: Map<String, TopicRejectionReason>) -> TopicAnswerAdmission =
         { TopicAnswerAdmission.Admitted(clock.nowMillis()) }
 ) {
     private class Pending(
@@ -276,9 +279,9 @@ class TopicSubscribeCommand(
      * The admission for one application, or an unwind. Callers apply what it admits before suspending again: nothing may run
      * between this and the write it allows. A command already cancelled — by a teardown that ran first — never asks.
      */
-    private suspend fun admit(refusesPremium: Boolean): Long {
+    private suspend fun admit(rejected: Map<String, TopicRejectionReason> = emptyMap()): Long {
         currentCoroutineContext().ensureActive()
-        return when (val admission = admitAnswer(refusesPremium)) {
+        return when (val admission = admitAnswer(rejected)) {
             is TopicAnswerAdmission.Admitted -> admission.atMillis
             is TopicAnswerAdmission.Denied -> throw TopicAnswerNotAdmittedException(admission.reason)
         }
@@ -393,7 +396,7 @@ class TopicSubscribeCommand(
                         // An unclassified error writes nothing and is not asked about. A classified one is admitted first, and the
                         // decision and `beginAuthRefresh` below run on that admission: nothing suspends before them.
                         if (failure != null) {
-                            admit(refusesPremium = false)
+                            admit()
                             store.applyWholeFailure(failure)
                         }
                         val decision = TopicWholeRequestMatrix.decide(
@@ -422,7 +425,7 @@ class TopicSubscribeCommand(
                                     credentials.refreshAfterUnauthorized(pending.credential)
                                 // The refresh suspended, so its result is a new answer to admit. The ticket stays held until
                                 // the refresh is settled: a denial here unwinds, and `run`'s finally is what abandons it.
-                                admit(refusesPremium = false)
+                                admit()
                                 if (refreshed == null) {
                                     // Back to FAILED, and by the same route it got there.
                                     store.applyWholeFailure(TopicWholeRequestFailure.InvalidToken)
@@ -551,8 +554,9 @@ class TopicSubscribeCommand(
             .mapNotNull { rejection -> rejection.reasonOrNull()?.let { rejection.topic to it } }
             .toMap()
 
-        // The same map the session reads for its refusal latch, so the premium exception covers exactly those refusals.
-        val admittedAt = admit(refusesPremium = rejected.values.any { it == TopicRejectionReason.PREMIUM_REQUIRED })
+        // The same map the session reads for its refusal latch and hands over, so the premium exception and the refusals delivered
+        // while a use is withheld are exactly these.
+        val admittedAt = admit(rejected)
         store.applyAck(
             activeTopics = active,
             rejections = rejected,

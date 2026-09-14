@@ -3,6 +3,7 @@ package com.jay.fxi.data.remote
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
+import com.jay.fxi.data.auth.HttpExchangeEvidence
 import com.jay.fxi.data.entitlements.AccessEpochRecord
 import com.jay.fxi.data.entitlements.AccessEpochStore
 import com.jay.fxi.data.entitlements.AccessEpochTransitions
@@ -21,6 +22,10 @@ import com.jay.fxi.data.entitlements.PurgeNamespace
 import com.jay.fxi.data.entitlements.PurgeResult
 import com.jay.fxi.data.entitlements.UserScopePurger
 import com.jay.fxi.data.entitlements.RefreshIntent
+import com.jay.fxi.data.entitlements.SnapshotTopicUseAuthority
+import com.jay.fxi.data.entitlements.TopicAccessBlock
+import com.jay.fxi.data.entitlements.TopicAccessFacts
+import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.remote.dto.SubscriptionAck
 import com.jay.fxi.data.remote.dto.SubscriptionAckTopic
 import com.jay.fxi.data.remote.dto.SubscriptionRejection
@@ -42,6 +47,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
 import okhttp3.Protocol
@@ -238,6 +244,21 @@ class TopicSessionCoordinatorTest {
         /** Every non-delivery handed over, with the grant the session named for it. */
         val undelivered = mutableListOf<Triple<TopicSessionFence, String, TopicSnapshotOutcome>>()
 
+        /** Each undelivered hand-over's attribution, in order (L-4e E2a). */
+        val attributions = mutableListOf<TopicUseAttribution>()
+
+        /**
+         * The issuer as this session asks it (L-4e E2a). Admits every use by default, so a test about something else never meets it;
+         * the access-use tests replace it with the real judgement over a snapshot they control.
+         */
+        var authority: TopicUseAuthority = object : TopicUseAuthority {
+            override fun acquire(fence: TopicSessionFence) = TopicUseLifetime(fence.grant, 0L)
+            override fun admits(lifetime: TopicUseLifetime) = true
+        }
+
+        /** The use check each bootstrap call was handed, in call order. */
+        val bootstrapUseChecks = mutableListOf<() -> Boolean>()
+
         /**
          * What the REST twin answers, chosen by **issue** as well as topic.
          *
@@ -317,11 +338,16 @@ class TopicSessionCoordinatorTest {
                 }
             },
             credentials = credentials,
-            bootstrap = { owner, topic ->
+            authority = object : TopicUseAuthority {
+                override fun acquire(fence: TopicSessionFence) = authority.acquire(fence)
+                override fun admits(lifetime: TopicUseLifetime) = authority.admits(lifetime)
+            },
+            bootstrap = { owner, topic, useAdmitted ->
                 // Taken before the append and never re-read: the pair is non-suspending, and this
                 // harness runs on one serial test dispatcher, so no other issue can land between.
                 val issue = bootstrapCalls.size
                 bootstrapCalls += owner to topic
+                bootstrapUseChecks += useAdmitted
                 bootstrapCallTimes += scheduler.currentTime
                 bootstrapGateFor(issue)?.await()
                 bootstrapFinished += topic
@@ -351,8 +377,9 @@ class TopicSessionCoordinatorTest {
                 acknowledgementFailure?.let { failure -> throw failure }
             },
             onUndecodable = { length, failure -> undecodable += length to failure },
-            onBootstrapUndelivered = { owner, topic, outcome ->
-                undelivered += Triple(owner, topic, outcome)
+            onBootstrapUndelivered = { attribution, topic, outcome ->
+                undelivered += Triple(attribution.owner, topic, outcome)
+                attributions += attribution
             },
             onTopicState = {
                 topicStates += it
@@ -857,8 +884,23 @@ class TopicSessionCoordinatorTest {
         private var n = 0
         val ids = EpochIdGenerator { "issuer-${n++}" }
         var record = AccessEpochRecord()
+
+        /** The next this many record reads fail: where a loss answer is held rather than landed (L-4e E2a). */
+        var loadFailures = 0
+
+        /** What the entitlements source answers. */
+        var outcome: () -> EntitlementsOutcome = { EntitlementsOutcome.StableActive(krxVisible = false) }
+
+        /** Runs once, after an answer is formed and before it returns. */
+        var afterFetch: () -> Unit = {}
         val store = object : AccessEpochStore {
-            override suspend fun load() = record
+            override suspend fun load(): AccessEpochRecord {
+                if (loadFailures > 0) {
+                    loadFailures -= 1
+                    throw java.io.IOException("load")
+                }
+                return record
+            }
             override suspend fun bindOwner(uid: String) = AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
             override suspend fun signOut() = AccessEpochTransitions.signOut(record, ids).also { record = it }
             override suspend fun retireUnverifiedStart() =
@@ -879,10 +921,11 @@ class TopicSessionCoordinatorTest {
         }
         val premium = PremiumAccessCoordinator(
             source = object : EntitlementsSource {
-                override suspend fun fetch(freshPremium: Boolean): EntitlementsResult = EntitlementsResult.Answered(
-                    EntitlementsIdentity("u1", 1L),
-                    EntitlementsOutcome.StableActive(krxVisible = false)
-                )
+                override suspend fun fetch(freshPremium: Boolean): EntitlementsResult {
+                    val answer = outcome()
+                    afterFetch().also { afterFetch = {} }
+                    return EntitlementsResult.Answered(EntitlementsIdentity("u1", 1L), answer)
+                }
                 override suspend fun currentIdentity() = EntitlementsIdentity("u1", 1L)
             },
             store = store,
@@ -5242,5 +5285,1140 @@ class TopicSessionCoordinatorTest {
         return TopicSnapshotOutcome.Refused(
             response.preserve(AuthenticatedEndpoint.TOPIC_SNAPSHOT).failure!!
         )
+    }
+
+    // ---- the access use (L-4e E2a) ----------------------------------------------------------------------------------
+
+    /**
+     * The issuer's published access as these tests drive it (L-4e E2a): the real judgement ([SnapshotTopicUseAuthority]) over a
+     * snapshot the test controls, with every question the session asks recorded in order.
+     *
+     * [hold] and [rotate] count an invalidation the way the issuer does — only when they take the user axis or the standing
+     * token away — so a hold that came and went leaves a use started before it refused even with the same token.
+     */
+    private class PublishedAccess(grant: Long = 1L) {
+        var token: Long? = grant
+        var standing = true
+        var userAllowed = true
+        var capabilityAllowed = true
+        var invalidations = 0L
+
+        /** In order: each question with the answer the session got (`acquire:true`, `admits:false`), and what a test [note]d. */
+        val events = mutableListOf<String>()
+
+        /** Runs once, after the next `admits` answer is formed and before the session has it: a change between a check and its use. */
+        var afterAdmits: (() -> Unit)? = null
+
+        /** The same, for the next `acquire`. */
+        var afterAcquire: (() -> Unit)? = null
+
+        fun snapshot(): TopicAccessSnapshot = TopicAccessSnapshot.INITIAL.copy(
+            facts = TopicAccessFacts.NONE.copy(
+                token = token?.let(::TopicGrantToken),
+                tokenStanding = standing,
+                userBlocks = if (userAllowed) emptySet() else setOf(TopicAccessBlock.LOSS_CANDIDATE),
+                capabilityBlocks = if (capabilityAllowed) emptySet() else setOf(TopicAccessBlock.LOSS_CANDIDATE)
+            ),
+            userInvalidations = invalidations
+        )
+
+        private val judged = SnapshotTopicUseAuthority(::snapshot)
+
+        val authority = object : TopicUseAuthority {
+            override fun acquire(fence: TopicSessionFence): TopicUseLifetime? = judged.acquire(fence).also { lifetime ->
+                events += "acquire:${lifetime != null}"
+                afterAcquire?.let { hook ->
+                    afterAcquire = null
+                    hook()
+                }
+            }
+
+            override fun admits(lifetime: TopicUseLifetime): Boolean = judged.admits(lifetime).also { admitted ->
+                events += "admits:$admitted"
+                afterAdmits?.let { hook ->
+                    afterAdmits = null
+                    hook()
+                }
+            }
+        }
+
+        fun note(event: String) {
+            events += event
+        }
+
+        /** The user axis held, as a loss answer whose record could not be read holds it. */
+        fun hold() {
+            if (userAllowed) invalidations += 1
+            userAllowed = false
+        }
+
+        fun release() {
+            userAllowed = true
+        }
+
+        /** Held and released again before anything looked: the token is the same, and a use started before it is not. */
+        fun flicker() {
+            hold()
+            release()
+        }
+
+        /** Another token issued in place of the standing one. */
+        fun rotate(to: Long) {
+            if (standing) invalidations += 1
+            token = to
+            standing = true
+        }
+    }
+
+    private fun Harness.publishedAccess(grant: Long = 1L) = PublishedAccess(grant).also { authority = it.authority }
+
+    /** A live connection whose subscribe was acknowledged for both topics. */
+    private suspend fun TestScope.acknowledgedUnder(h: Harness): Wire {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertTrue(h.store.snapshot.stateFor(TETHER).confirmed)
+        return h.wire
+    }
+
+    /**
+     * A held use opens no socket and issues no bootstrap; a later trigger under the same grant carries on (L-4e E2a).
+     *
+     * Nothing re-reads the issuer on its own yet (E2b). After the release it is the next trigger that finds a new use available:
+     * the shown tab for the plan, a network transition for the socket. The plan is this grant's, asked once.
+     */
+    @Test
+    fun `a held use opens nothing and a later trigger under the same grant carries on`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.bootstrapNotBeforeMillis = 1_000L
+        access.hold()
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals("보류 중 소켓을 열었다", 0, h.wires.size)
+        assertEquals("보류 중 bootstrap 을 발급했다", 0, h.bootstrapCalls.size)
+
+        access.release()
+        // Past the floor with no trigger: a plan made while held would have left a wait behind that issues on its own.
+        advanceTimeBy(1_100)
+        assertEquals("해제만으로 bootstrap 이 발급됐다", 0, h.bootstrapCalls.size)
+        h.coordinator.setFocus(fence().identity, FreeTab.USD)
+        advanceTimeBy(100)
+        assertEquals("해제 뒤 계획이 이어지지 않았다", listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        h.coordinator.setFocus(fence().identity, FreeTab.USD)
+        advanceTimeBy(100)
+        assertEquals("같은 grant 의 계획을 다시 발급했다", 2, h.bootstrapCalls.size)
+
+        assertEquals(0, h.wires.size)
+        h.coordinator.setOnline(false)
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        assertEquals("해제 뒤 연결하지 않았다", 1, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * Each issue acquires its own use right before it is taken off what is owed (L-4e E2a).
+     *
+     * The hold lands on the second issue's floor read: after the first call was enqueued under its own use, before the second
+     * acquires. The second topic stays owed, so the grant's next trigger issues it; and the first call's use check, handed over
+     * under a lifetime from before the hold, refuses its sends even once the hold is gone.
+     */
+    @Test
+    fun `a hold between two issues leaves the second owed and refuses the first call's sends`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.bootstrapGate = CompletableDeferred()
+        var floorReads = 0
+        h.bootstrapFloor = {
+            if (++floorReads == 2) access.hold()
+            0L
+        }
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals("보류 뒤의 topic 까지 발급했다", listOf(USD), h.bootstrapCalls.map { it.second })
+        assertTrue("두 번째 발급의 floor 를 읽지 않았다", floorReads >= 2)
+        assertEquals(false, h.bootstrapUseChecks.single()())
+
+        access.release()
+        assertEquals("해제가 보류 전에 얻은 사용을 되살렸다", false, h.bootstrapUseChecks.single()())
+        h.coordinator.setFocus(fence().identity, FreeTab.USD)
+        advanceTimeBy(100)
+        assertEquals("남은 topic 이 이어서 발급되지 않았다", listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        assertEquals(true, h.bootstrapUseChecks.last()())
+        h.cleanUp()
+    }
+
+    /**
+     * An issue whose use is withheld after it acquired it is still issued, and not lost (L-4e E2a).
+     *
+     * Taken off what is owed and started in one turn: a second, live reading between the two would drop the topic silently,
+     * neither issued nor owed. Issued, its sends are what the use check refuses.
+     */
+    @Test
+    fun `an issue withheld right after it acquired its use is issued rather than lost`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.bootstrapGate = CompletableDeferred()
+        var floorReads = 0
+        h.bootstrapFloor = {
+            if (++floorReads == 2) access.afterAcquire = { access.hold() }
+            0L
+        }
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals("획득 뒤 보류된 topic 을 잃었다", listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        assertNull("두 번째 발급이 사용을 얻지 않았다", access.afterAcquire)
+        assertEquals(false, h.bootstrapUseChecks.last()())
+
+        access.release()
+        h.coordinator.setFocus(fence().identity, FreeTab.USD)
+        advanceTimeBy(100)
+        assertEquals("이미 발급한 topic 을 다시 발급했다", 2, h.bootstrapCalls.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A use withheld while a command waits for its credential sends nothing, and the connection ends without a ladder.
+     *
+     * The hold comes and goes before the send, so a new use is available again: a connection ended as an unexpected loss would
+     * be reopened on the ladder, and this one must not be. The next trigger opens a new connection under a new use, and that
+     * connection subscribes.
+     */
+    @Test
+    fun `a use withheld while a command waits for its credential sends nothing and takes no ladder`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.credentialGate = CompletableDeferred()
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.wire
+
+        access.flicker()
+        h.credentialGate!!.complete(Unit)
+        advanceTimeBy(1)
+        assertTrue("보류된 사용으로 구독을 보냈다", first.sent.none { it.startsWith("encoded-") })
+        assertTrue("보류된 사용의 연결이 남았다", first.cancelled)
+        advanceTimeBy(120_000)
+        assertEquals("보류로 끝난 연결이 사다리를 탔다", 1, h.wires.size)
+
+        h.coordinator.setForeground(true)
+        advanceTimeBy(100)
+        assertEquals(2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("새 사용의 연결이 구독하지 않았다", 1, h.wire.sent.count { it.startsWith("encoded-") })
+        h.cleanUp()
+    }
+
+    /**
+     * A frame under a use withheld since its connection opened is not applied, and the connection ends rather than starving.
+     *
+     * Refused frame after frame on a standing socket, the delivery evidence would stop and the silence watchdog would file the
+     * hold as a topic gone quiet. No ladder follows; the next trigger opens under a new use, whose frames are applied.
+     */
+    @Test
+    fun `a frame under a use withheld in between is not applied and ends its connection`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val first = acknowledgedUnder(h)
+
+        access.flicker()
+        first.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertTrue("무효가 된 사용의 프레임이 시세가 됐다", h.coordinator.rates.value.quotes.isEmpty())
+        assertEquals(0L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        assertTrue("무효가 된 사용의 연결이 남았다", first.cancelled)
+        advanceTimeBy(120_000)
+        assertEquals("보류로 끝난 연결이 사다리를 탔다", 1, h.wires.size)
+
+        h.coordinator.setForeground(true)
+        advanceTimeBy(100)
+        assertEquals(2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        assertEquals("새 사용의 프레임이 적용되지 않았다", 1391.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+        h.cleanUp()
+    }
+
+    /**
+     * The socket is opened under a use acquired where it is opened, not under the answer the decision to open read (L-4e E2a).
+     *
+     * The hold lands right after `wanted()` acquired, before `open()` does.
+     */
+    @Test
+    fun `a hold between deciding to open and opening opens nothing`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.coordinator.start()
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        assertTrue("온라인 전에 사용을 얻었다", access.events.none { it.startsWith("acquire") })
+        access.afterAcquire = { access.hold() }
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        assertNull(access.afterAcquire)
+        assertEquals("열기로 한 뒤 보류된 사용으로 소켓을 열었다", 0, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A connect that fails while the use is withheld schedules no reconnection; a release afterwards opens nothing by itself,
+     * and the next trigger does (L-4e E2a).
+     */
+    @Test
+    fun `a connect refused while the use is withheld schedules no reconnection`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.coordinator.start()
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        h.failNextConnect = true
+        // The first acquire is the decision to open, the second is `open()`'s own: the hold lands after that one, while the
+        // connect runs.
+        access.afterAcquire = { access.afterAcquire = { access.hold() } }
+        h.coordinator.setOnline(true)
+        advanceTimeBy(1)
+        assertEquals(false, h.failNextConnect)
+        access.release()
+        advanceTimeBy(120_000)
+        assertEquals("보류 중 실패한 연결이 사다리를 예약했다", 0, h.wires.size)
+
+        h.coordinator.setForeground(true)
+        advanceTimeBy(100)
+        assertEquals(1, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A silence window that runs out while the use is withheld is not filed as the topic going quiet (L-4e E2a).
+     *
+     * No frame arrives, so nothing at the frame boundary ends the connection first. Neither SUSPECT nor REVALIDATING is published,
+     * nothing is asked, and the connection ends without a ladder.
+     */
+    @Test
+    fun `a silence that runs out under a withheld use marks nothing and asks nothing`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        silenceReady(h)
+        val first = h.wire
+        val requests = h.requests.size
+        val published = h.topicStates.size
+
+        access.flicker()
+        // Read where the session asks, not only at the publication after the turn: the teardown in the same turn would write a
+        // mark made before the question back over.
+        var atCheck: TopicDeliveryState? = null
+        access.afterAdmits = { atCheck = h.store.snapshot.stateFor(TETHER).deliveryState }
+        advanceTimeBy(46_000)
+        assertNull("침묵 평가가 사용을 묻지 않았다", access.afterAdmits)
+        assertEquals("묻기 전에 이미 침묵으로 표시했다", TopicDeliveryState.HEALTHY, atCheck)
+        assertTrue(
+            "보류를 침묵으로 기록했다",
+            h.topicStates.drop(published).none {
+                it.stateFor(TETHER).deliveryState == TopicDeliveryState.SUSPECT ||
+                    it.stateFor(TETHER).deliveryState == TopicDeliveryState.REVALIDATING
+            }
+        )
+        assertEquals("보류 중 재확인을 물었다", requests, h.requests.size)
+        assertTrue("보류된 사용의 연결이 남았다", first.cancelled)
+        advanceTimeBy(120_000)
+        assertEquals("보류로 끝난 연결이 사다리를 탔다", 1, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * The window a withheld use ended is spent (L-4e E2a): the connection that follows owns the silence with its own first
+     * delivery, and once that effort's revalidation has run out without an answer — which puts the topic back to healthy — a
+     * return to the foreground does not ask about the old window again.
+     */
+    @Test
+    fun `a silence window a withheld use ended is spent`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        silenceReady(h)
+        access.flicker()
+        advanceTimeBy(46_000)
+        assertTrue(h.wires[0].cancelled)
+
+        h.coordinator.setForeground(true)
+        advanceTimeBy(100)
+        assertEquals(2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(2_100)
+        assertEquals("새 연결이 구독하지 않았다", 2, h.requests.size)
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+
+        // The new connection's first delivery never comes: that effort hands its silence to one question and ends.
+        advanceTimeBy(45_100)
+        assertEquals(3, h.requests.size)
+        // No ACK for any revalidation attempt: exhaust its budget before returning.
+        advanceTimeBy(120_000)
+        assertEquals(5, h.requests.size)
+        val settled = h.store.snapshot.stateFor(TETHER)
+        assertTrue(settled.confirmed)
+        assertEquals(TopicDeliveryState.HEALTHY, settled.deliveryState)
+        assertEquals(0, settled.revalidationAttempt)
+
+        h.coordinator.setForeground(false)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        assertEquals("보류로 끝낸 창이 다시 물었다", 5, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** The same window, after a refused frame already ended the connection: the first delivery owns the silence, and nothing is marked. */
+    @Test
+    fun `a silence after a refused frame marks nothing`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        silenceReady(h)
+        val requests = h.requests.size
+        val published = h.topicStates.size
+
+        access.flicker()
+        h.wire.deliver(h.tetherFrame(1391.0, timestamp = "2026-08-31T10:21:00+09:00"))
+        advanceTimeBy(1)
+        assertTrue(h.wire.cancelled)
+        advanceTimeBy(46_000)
+        assertTrue(
+            "끊긴 뒤의 침묵을 기록했다",
+            h.topicStates.drop(published).none {
+                it.stateFor(TETHER).deliveryState == TopicDeliveryState.SUSPECT ||
+                    it.stateFor(TETHER).deliveryState == TopicDeliveryState.REVALIDATING
+            }
+        )
+        assertEquals(requests, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** At a silence, an account that moved is retired ahead of a withheld use: the retirement latch holds against the next trigger. */
+    @Test
+    fun `a silence under a withheld use retires an account that moved`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        silenceReady(h)
+        val first = h.wire
+
+        access.flicker()
+        h.liveFence = AuthIdentityFence("u1", 2L)
+        advanceTimeBy(46_000)
+        assertTrue(first.cancelled)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(10_000)
+        assertEquals("은퇴하지 않고 끝나기만 했다", 1, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** A lifecycle trigger ends a connection whose use no longer holds even though a new one would, and opens that new one. */
+    @Test
+    fun `a trigger replaces a connection whose use lapsed with one under a new use`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val first = acknowledgedUnder(h)
+
+        access.flicker()
+        h.coordinator.setForeground(true)
+        advanceTimeBy(100)
+        assertTrue("새 사용이 가능하다는 이유로 옛 연결을 남겼다", first.cancelled)
+        assertEquals(2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** An acknowledgement under a withheld use is not applied, hands nothing over when it refuses nothing, and ends the connection. */
+    @Test
+    fun `an acknowledgement under a withheld use is not applied and ends its connection`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.wire
+        val published = h.topicStates.size
+
+        access.flicker()
+        first.deliver(h.ackWithLease("r1", TETHER, 900L))
+        advanceTimeBy(1)
+        assertTrue(first.cancelled)
+        assertEquals("보류 중 ACK 가 밖으로 넘어갔다", 0, h.acknowledgements.size)
+        assertEquals(0, h.rejected.size)
+        assertTrue(
+            "보류 중 ACK 가 store 에 적용돼 발행됐다",
+            h.topicStates.drop(published).none { it.controlState == TopicControlState.ACKNOWLEDGED || it.stateFor(TETHER).confirmed }
+        )
+        advanceTimeBy(120_000)
+        assertEquals("보류로 끝난 연결이 사다리를 탔다", 1, h.wires.size)
+        assertEquals("설치되지 않았어야 할 lease 가 갱신됐다", 1, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A `premium_required` under a withheld use is still latched and handed over — control flow — and nothing the same answer
+     * grants is applied (L-4e E2a).
+     */
+    @Test
+    fun `a premium refusal under a withheld use is latched and handed over, and nothing else is applied`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.wire
+
+        access.flicker()
+        first.deliver(h.ackOf("r1", leases = listOf(Triple(TETHER, "L1", 900L)), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+        assertEquals(listOf(mapOf(USD to TopicRejectionReason.PREMIUM_REQUIRED)), h.rejected)
+        assertEquals(listOf(fence()), h.rejectedOwners)
+        assertEquals("거부를 넘길 때 연결이 아직 살아 있었다", listOf(true), h.socketGoneAtRefusal)
+        assertEquals(0, h.acknowledgements.size)
+        assertEquals(false, h.store.snapshot.stateFor(TETHER).confirmed)
+        assertNull("보류 중 거부가 store 에 적용됐다", h.store.snapshot.stateFor(USD).rejection)
+        assertTrue(first.cancelled)
+
+        h.coordinator.setOnline(false)
+        h.coordinator.setOnline(true)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(60_000)
+        assertEquals("거절받은 grant 로 다시 연결했다", 1, h.wires.size)
+
+        access.rotate(2L)
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+        assertEquals("새 grant 인데 연결하지 않았다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** Any other refusal is handed over the same way and latches nothing; the accepted half of the same answer is not applied. */
+    @Test
+    fun `a mixed acknowledgement under a withheld use hands its refusal over and applies nothing`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.wire
+
+        access.flicker()
+        first.deliver(
+            h.ackOf("r1", leases = listOf(Triple(TETHER, "L1", 900L)), rejections = mapOf(USD to "krx_entitlement_required"))
+        )
+        advanceTimeBy(1)
+        assertEquals(listOf(mapOf(USD to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED)), h.rejected)
+        assertEquals(0, h.acknowledgements.size)
+        assertEquals("보류 중 수락이 적용됐다", false, h.store.snapshot.stateFor(TETHER).confirmed)
+        assertNull(h.store.snapshot.stateFor(USD).rejection)
+        assertTrue(first.cancelled)
+        advanceTimeBy(120_000)
+        assertEquals(1, h.wires.size)
+
+        h.coordinator.setForeground(true)
+        advanceTimeBy(100)
+        assertEquals("KRX 거부가 grant 를 잠갔다", 2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** A classified request failure under a withheld use is not recorded and starts no refresh. */
+    @Test
+    fun `a request failure under a withheld use is not recorded and refreshes nothing`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.wire
+
+        access.flicker()
+        first.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(100)
+        assertNull("보류 중 실패가 기록됐다", h.store.snapshot.wholeFailure)
+        assertEquals(TopicAuthResolution.RESOLVED, h.store.snapshot.authResolution)
+        assertEquals("보류 중 실패로 갱신을 불렀다", 0, h.refreshCalls)
+        assertTrue(first.cancelled)
+        h.cleanUp()
+    }
+
+    /**
+     * A delivered bootstrap under a use withheld while it was out is not applied; a refusal still goes to its owner with its
+     * evidence and its attribution (L-4e E2a).
+     */
+    @Test
+    fun `a bootstrap delivery under a use withheld in flight is not applied while a refusal is still handed over`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.bootstrapGate = CompletableDeferred()
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals(listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+        val handed = h.undelivered.size
+        val evidence = h.bootstrapEvidence.size
+
+        access.flicker()
+        val refused = refusal(429, """{"error":"slow down"}""", retryAfter = "60")
+        h.bootstrapOutcome = { _, topic -> if (topic == TETHER) h.delivered(h.tetherFrame(1390.0)) else refused }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue("무효가 된 사용의 bootstrap 이 시세가 됐다", h.coordinator.rates.value.quotes.isEmpty())
+        val handedOver = h.undelivered.drop(handed)
+        assertEquals("거부가 인계되지 않았다", 1, handedOver.size)
+        assertEquals(fence(), handedOver.single().first)
+        assertEquals(USD, handedOver.single().second)
+        assertSame(refused, handedOver.single().third)
+        assertEquals(listOf<Pair<Int?, String?>>(429 to "60"), h.bootstrapEvidence.drop(evidence))
+        h.cleanUp()
+    }
+
+    /** A token that no longer stands refuses the uses started under it before any `Access` says so, and opens nothing new. */
+    @Test
+    fun `a rotated token refuses the old connection and the old calls before the grant arrives`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val first = acknowledgedUnder(h)
+        h.bootstrapGate = CompletableDeferred()
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.fxFrame(1400.0)) }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        val calls = h.bootstrapCalls.size
+
+        access.rotate(2L)
+        first.deliver(h.tetherFrame(1390.0))
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+        assertTrue("옛 token 의 답이 시세가 됐다", h.coordinator.rates.value.quotes.isEmpty())
+        assertTrue(first.cancelled)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(10_000)
+        assertEquals("옛 grant 로 새 사용을 시작했다", 1, h.wires.size)
+        assertEquals(calls, h.bootstrapCalls.size)
+
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+        assertEquals(2, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** A token that stops standing without a replacement refuses the same way. */
+    @Test
+    fun `a token that stops standing refuses a frame under it`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val first = acknowledgedUnder(h)
+
+        access.standing = false
+        access.invalidations += 1
+        first.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertTrue(h.coordinator.rates.value.quotes.isEmpty())
+        assertTrue(first.cancelled)
+        h.cleanUp()
+    }
+
+    /** A capability-only hold stops none of these boundaries: no topic this session consumes is a KRX one (C34). */
+    @Test
+    fun `a capability-only hold stops no boundary`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        access.capabilityAllowed = false
+        h.bootstrapOutcome = { _, topic ->
+            if (topic == USD) h.delivered(h.fxFrame(1400.0)) else TopicSnapshotOutcome.Dormant
+        }
+        val first = acknowledgedUnder(h)
+        assertEquals(1, h.acknowledgements.size)
+        assertEquals(1400.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+
+        first.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertEquals(2, h.coordinator.rates.value.quotes.size)
+        assertEquals(false, first.cancelled)
+        var ran = 0
+        h.coordinator.runIfStillOwned(h.attributions.single()) { ran++ }
+        advanceTimeBy(1)
+        assertEquals(1, ran)
+        h.cleanUp()
+    }
+
+    /**
+     * At an application, an account that moved is retired ahead of a withheld use: its refusals are not handed over, and the
+     * retirement latch holds against the next trigger, which a plain end would not.
+     */
+    @Test
+    fun `an account that moved is retired ahead of a withheld use`() = runTest {
+        val acknowledgement = Harness(this)
+        val acknowledgementAccess = acknowledgement.publishedAccess()
+        acknowledgement.goLive()
+        advanceTimeBy(100)
+        acknowledgement.wire.open()
+        advanceTimeBy(1)
+        val acked = acknowledgement.wire
+        acknowledgementAccess.flicker()
+        acknowledgement.liveFence = AuthIdentityFence("u1", 2L)
+        acked.deliver(
+            acknowledgement.ackOf(
+                "r1",
+                leases = listOf(Triple(TETHER, "L1", 900L)),
+                rejections = mapOf(USD to "krx_entitlement_required")
+            )
+        )
+        advanceTimeBy(1)
+        assertTrue(acked.cancelled)
+        assertEquals("보류가 신원 은퇴보다 먼저 거부를 넘겼다", 0, acknowledgement.rejected.size)
+        acknowledgement.coordinator.setForeground(true)
+        advanceTimeBy(10_000)
+        assertEquals("은퇴하지 않고 끝나기만 했다", 1, acknowledgement.wires.size)
+
+        val frame = Harness(this)
+        val frameAccess = frame.publishedAccess()
+        val framed = acknowledgedUnder(frame)
+        frameAccess.flicker()
+        frame.liveFence = AuthIdentityFence("u1", 2L)
+        framed.deliver(frame.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertTrue(framed.cancelled)
+        frame.coordinator.setForeground(true)
+        advanceTimeBy(10_000)
+        assertEquals("프레임 경계에서 은퇴보다 보류가 먼저였다", 1, frame.wires.size)
+        acknowledgement.cleanUp()
+    }
+
+    /** A withheld use found together with a lapsed lease ends the connection as a withheld use: no ladder. */
+    @Test
+    fun `a withheld use found with a lapsed lease takes no ladder`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val (first, deadline) = renewalInFlight(h, TETHER)
+
+        access.flicker()
+        h.clockAt(deadline + 1)
+        first.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertTrue(first.cancelled)
+        advanceTimeBy(120_000)
+        assertEquals("보류와 lease 만료가 겹쳐 사다리를 탔다", 1, h.wires.size)
+        h.cleanUp()
+    }
+
+    /** An unexpected loss after a hold came and went reconnects on the ladder: the reconnection is a new start, under a new use. */
+    @Test
+    fun `an unexpected loss after a hold came and went reconnects under a new use`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val first = acknowledgedUnder(h)
+
+        access.flicker()
+        first.drop()
+        // Stepped rather than one long wait: a connection that never opens is given up on and the ladder climbs again.
+        repeat(600) { if (h.wires.size < 2) advanceTimeBy(100) }
+        assertEquals("새 시작이 가능한데 사다리가 연결하지 않았다", 2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals(1, h.wire.sent.count { it.startsWith("encoded-") })
+        h.cleanUp()
+    }
+
+    /**
+     * A call refused for a withheld use hands every response it saw over once, and no outcome; one refused for a moved identity
+     * hands its responses over once, without its last pair again (L-4e E2a).
+     */
+    @Test
+    fun `a refused call hands each response it saw over once`() = runTest {
+        val h = Harness(this)
+        h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        val calls = h.bootstrapCalls.size
+        val handed = h.undelivered.size
+        val before = h.bootstrapEvidence.size
+
+        h.bootstrapOutcome = { _, _ ->
+            throw TopicUseWithheldException(listOf(HttpExchangeEvidence(1, 1, 401, null), HttpExchangeEvidence(2, 1, 503, "0")))
+        }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertEquals(listOf<Pair<Int?, String?>>(401 to null, 503 to "0"), h.bootstrapEvidence.drop(before))
+        assertEquals("보류된 호출이 답으로 인계됐다", handed, h.undelivered.size)
+        assertTrue(h.coordinator.rates.value.quotes.isEmpty())
+
+        val middle = h.bootstrapEvidence.size
+        h.bootstrapOutcome = { _, _ ->
+            throw AuthIdentityChangedException(
+                statusCode = 429,
+                retryAfter = "30",
+                exchanges = listOf(HttpExchangeEvidence(1, 1, 401, null), HttpExchangeEvidence(2, 1, 429, "30"))
+            )
+        }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertEquals("보류로 끝난 호출이 나간 채로 남아 새 요청을 삼켰다", calls + 2, h.bootstrapCalls.size)
+        assertEquals(
+            "응답 목록과 마지막 응답 쌍을 둘 다 넘겼다",
+            listOf<Pair<Int?, String?>>(401 to null, 429 to "30"),
+            h.bootstrapEvidence.drop(middle)
+        )
+        h.cleanUp()
+    }
+
+    // -- a deferred continuation --
+
+    /** Two undelivered hand-overs under [h]'s grant, and the attribution of the last. */
+    private suspend fun TestScope.attributed(h: Harness): TopicUseAttribution {
+        h.bootstrapOutcome = { _, _ -> TopicSnapshotOutcome.Dormant }
+        h.goLive()
+        advanceTimeBy(100)
+        return h.attributions.last()
+    }
+
+    private fun TestScope.runs(h: Harness, attribution: TopicUseAttribution): Boolean {
+        var ran = false
+        h.coordinator.runIfStillOwned(attribution) { ran = true }
+        advanceTimeBy(1)
+        return ran
+    }
+
+    @Test
+    fun `a deferred continuation runs while its session still owns the use`() = runTest {
+        val h = Harness(this)
+        h.publishedAccess()
+        assertTrue(runs(h, attributed(h)))
+        h.cleanUp()
+    }
+
+    @Test
+    fun `a deferred continuation does not run once its use lapsed, and a new hand-over's does`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val attribution = attributed(h)
+        access.flicker()
+        assertEquals("보류가 지나간 뒤의 옛 사용으로 실행했다", false, runs(h, attribution))
+
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        assertTrue("새 사용의 인계가 실행되지 않았다", runs(h, h.attributions.last()))
+        h.cleanUp()
+    }
+
+    @Test
+    fun `a deferred continuation does not run after its access was withdrawn, even when granted again`() = runTest {
+        val h = Harness(this)
+        h.publishedAccess()
+        val attribution = attributed(h)
+        h.setAccess(false, fence())
+        advanceTimeBy(1)
+        assertEquals(false, runs(h, attribution))
+        h.setAccess(true, fence())
+        advanceTimeBy(100)
+        assertEquals("같은 fence 로 다시 받은 access 가 옛 인계를 되살렸다", false, runs(h, attribution))
+        h.cleanUp()
+    }
+
+    @Test
+    fun `a deferred continuation does not run under a refused grant though the issuer still admits it`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val attribution = attributed(h)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+        assertTrue("발급자는 여전히 허용해야 한다", access.authority.admits(TopicUseLifetime(TopicGrantToken(1L), 0L)))
+        assertEquals("거절 잠금 아래에서 실행했다", false, runs(h, attribution))
+        h.cleanUp()
+    }
+
+    @Test
+    fun `a deferred continuation does not run once the account moved`() = runTest {
+        val h = Harness(this)
+        h.publishedAccess()
+        val attribution = attributed(h)
+        h.liveFence = AuthIdentityFence("u1", 2L)
+        assertEquals(false, runs(h, attribution))
+        h.cleanUp()
+    }
+
+    @Test
+    fun `a deferred continuation does not run after the session stopped`() = runTest {
+        val h = Harness(this)
+        h.publishedAccess()
+        val attribution = attributed(h)
+        h.coordinator.stop()
+        assertEquals(false, runs(h, attribution))
+        h.cleanUp()
+    }
+
+    /** Another session with the same owner, grant epoch and lifetime is still another session. */
+    @Test
+    fun `a deferred continuation is not run by a session that did not attribute it`() = runTest {
+        val first = Harness(this)
+        first.publishedAccess()
+        val theirs = attributed(first)
+        val second = Harness(this)
+        second.publishedAccess()
+        val ours = attributed(second)
+        assertEquals(theirs.owner, ours.owner)
+
+        assertEquals("다른 세션의 인계를 실행했다", false, runs(second, theirs))
+        assertTrue(runs(second, ours))
+        first.cleanUp()
+        second.cleanUp()
+    }
+
+    // -- the six orders (§8-1) --
+
+    /**
+     * One kind of protected use: how to reach its check, start it, count what it did, and start the next one of its kind.
+     *
+     * Built fresh for each order, so what a boundary keeps between its steps is its own.
+     */
+    private class UseBoundary(
+        val prepare: suspend (Harness) -> Unit,
+        val trigger: suspend (Harness) -> Unit,
+        val uses: (Harness) -> Int,
+        val next: suspend (Harness) -> Unit
+    )
+
+    /**
+     * Drives [boundary] through the six orders of an invalidation I, the issuer's blocking publication P, the check C and the use
+     * U (`l4e_design_v7.md` §8-1): I before C uses nothing; C before I before U makes that one use and the next check refuses;
+     * C and U before I is the allowed control.
+     *
+     * Only I reaches this session through the snapshot. P is the issuer's own publication — its arrival here would be a later
+     * `Access(false)`, which none of these orders delivers — so the orders that differ only in P are equal for this session by
+     * construction; each is still produced, and the recorded order is asserted, so none of them is assumed.
+     */
+    private suspend fun TestScope.inEveryOrder(name: String, boundary: TestScope.() -> UseBoundary) {
+        listOf("IPCU", "ICPU", "ICUP", "CIPU", "CIUP", "CUIP").forEach { order ->
+            val h = Harness(this)
+            val access = h.publishedAccess()
+            val b = boundary()
+            b.prepare(h)
+            val step: (Char) -> Unit = { event ->
+                access.note(event.toString())
+                if (event == 'I') access.hold()
+            }
+            val before = b.uses(h)
+            order.substringBefore('C').forEach(step)
+            access.afterAdmits = {
+                access.note("C")
+                order.substringAfter('C').substringBefore('U').forEach(step)
+            }
+            b.trigger(h)
+            assertNull("$name $order: 검사가 일어나지 않았다", access.afterAdmits)
+            access.note("U")
+            order.substringAfter('U').forEach(step)
+            assertEquals("$name $order: 순서가 만들어지지 않았다", order, access.events.filter { it.length == 1 }.joinToString(""))
+
+            val expected = if (order.indexOf('I') < order.indexOf('C')) 0 else 1
+            val atCheck = access.events[access.events.indexOf("C") - 1]
+            assertEquals("$name $order: 검사의 답", if (expected == 0) "admits:false" else "admits:true", atCheck)
+            assertEquals("$name $order: 그 사용", expected, b.uses(h) - before)
+            val afterUse = access.events.size
+            b.next(h)
+            assertEquals("$name $order: 뒤이은 경계가 허용됐다", expected, b.uses(h) - before)
+            // Where the use was made, the next one of its kind has to have been asked and refused — not merely never reached.
+            if (expected == 1) {
+                assertTrue("$name $order: 뒤이은 경계가 묻지 않았다", "admits:false" in access.events.drop(afterUse))
+            }
+        }
+        // Once, after every order: each harness runs on this test's background scope, and cancelling it for one ends the rest.
+        backgroundScope.cancel()
+    }
+
+    @Test
+    fun `a frame is applied only when its check came before the invalidation`() = runTest {
+        inEveryOrder("frame") {
+            UseBoundary(
+                prepare = { h -> acknowledgedUnder(h) },
+                trigger = { h ->
+                    h.wires.first().deliver(h.tetherFrame(1390.0))
+                    advanceTimeBy(1)
+                },
+                uses = { h -> h.store.snapshot.stateFor(TETHER).receiveGeneration.toInt() },
+                next = { h ->
+                    h.wires.first().deliver(h.tetherFrame(1391.0, timestamp = "2026-08-31T10:21:00+09:00"))
+                    advanceTimeBy(1)
+                }
+            )
+        }
+    }
+
+    @Test
+    fun `a command send goes out only when its check came before the invalidation`() = runTest {
+        inEveryOrder("send") {
+            UseBoundary(
+                prepare = { h ->
+                    h.credentialGate = CompletableDeferred()
+                    h.goLive()
+                    advanceTimeBy(100)
+                    h.wire.open()
+                    advanceTimeBy(1)
+                },
+                trigger = { h ->
+                    h.credentialGate!!.complete(Unit)
+                    advanceTimeBy(1)
+                },
+                uses = { h -> h.wires.first().sent.count { it.startsWith("encoded-") } },
+                // The same command's next attempt, once its acknowledgement is overdue.
+                next = { h -> advanceTimeBy(30_000) }
+            )
+        }
+    }
+
+    @Test
+    fun `a bootstrap delivery is applied only when its check came before the invalidation`() = runTest {
+        inEveryOrder("bootstrap") {
+            val gates = mutableMapOf<String, CompletableDeferred<Unit>>()
+            UseBoundary(
+                prepare = { h ->
+                    h.bootstrapGateFor = { issue -> gates.getOrPut(h.bootstrapCalls[issue].second) { CompletableDeferred() } }
+                    h.bootstrapOutcome = { _, topic ->
+                        if (topic == TETHER) h.delivered(h.tetherFrame(1390.0)) else h.delivered(h.fxFrame(1400.0))
+                    }
+                    h.goLive()
+                    advanceTimeBy(100)
+                    assertEquals(listOf(USD, TETHER), h.bootstrapCalls.map { it.second })
+                },
+                trigger = { h ->
+                    gates.getValue(TETHER).complete(Unit)
+                    advanceTimeBy(1)
+                },
+                uses = { h -> h.coordinator.rates.value.quotes.size },
+                next = { h ->
+                    gates.getValue(USD).complete(Unit)
+                    advanceTimeBy(1)
+                }
+            )
+        }
+    }
+
+    @Test
+    fun `a deferred continuation runs only when its check came before the invalidation`() = runTest {
+        inEveryOrder("deferred") {
+            var ran = 0
+            lateinit var attribution: TopicUseAttribution
+            UseBoundary(
+                prepare = { h -> attribution = attributed(h) },
+                trigger = { h ->
+                    h.coordinator.runIfStillOwned(attribution) { ran++ }
+                    advanceTimeBy(1)
+                },
+                uses = { ran },
+                next = { h ->
+                    h.coordinator.runIfStillOwned(attribution) { ran++ }
+                    advanceTimeBy(1)
+                }
+            )
+        }
+    }
+
+    // -- the issuer itself --
+
+    /**
+     * Joined to the real issuer: a hold it publishes stops a frame and a bootstrap answer before any `Access` reaches the
+     * session, and a capability-only hold stops neither.
+     */
+    @Test
+    fun `a hold the issuer publishes stops the session's uses before anything tells the session`() = runTest {
+        val h = Harness(this)
+        val issuer = Issuer(this, h)
+        val issued = issuer.grant()
+        h.authority = SnapshotTopicUseAuthority { issuer.premium.accessSnapshot }
+        h.bootstrapGate = CompletableDeferred()
+        h.bootstrapOutcome = { _, topic -> if (topic == TETHER) h.delivered(h.tetherFrame(1390.0)) else TopicSnapshotOutcome.Dormant }
+        refusedUnder(h, issued)
+        val first = h.wire
+        first.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertTrue(h.store.snapshot.stateFor(TETHER).confirmed)
+
+        issuer.outcome = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        issuer.afterFetch = { issuer.loadFailures = 2 }
+        issuer.premium.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertTrue(TopicAccessBlock.LOSS_CANDIDATE in issuer.premium.accessSnapshot.facts.userBlocks)
+
+        first.deliver(h.tetherFrame(1391.0))
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(1)
+        assertTrue("발급자의 보류 아래 값이 들어왔다", h.coordinator.rates.value.quotes.isEmpty())
+        assertTrue(first.cancelled)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `a capability-only hold the issuer publishes stops no use`() = runTest {
+        val h = Harness(this)
+        val issuer = Issuer(this, h)
+        issuer.outcome = { EntitlementsOutcome.StableActive(krxVisible = true) }
+        val issued = issuer.grant()
+        issuer.record = issuer.record.copy(mayContainPremiumData = true, mayContainKrxData = true)
+        h.authority = SnapshotTopicUseAuthority { issuer.premium.accessSnapshot }
+        refusedUnder(h, issued)
+        val first = h.wire
+
+        issuer.outcome = { EntitlementsOutcome.StableActive(krxVisible = false) }
+        issuer.afterFetch = { issuer.loadFailures = 2 }
+        issuer.premium.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        runCurrent()
+        val facts = issuer.premium.accessSnapshot.facts
+        assertTrue(TopicAccessBlock.LOSS_CANDIDATE in facts.capabilityBlocks)
+        assertTrue(facts.userAllowed)
+
+        first.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        first.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertTrue(h.store.snapshot.stateFor(TETHER).confirmed)
+        assertEquals(1390.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+        assertEquals(false, first.cancelled)
+        h.cleanUp()
+    }
+
+    /** A capability rotation takes the token away: the old fence's connection stops, and the grant issued next is used. */
+    @Test
+    fun `a capability rotation at the issuer stops the old fence and the next grant is used`() = runTest {
+        val h = Harness(this)
+        val issuer = Issuer(this, h)
+        issuer.outcome = { EntitlementsOutcome.StableActive(krxVisible = true) }
+        val issued = issuer.grant()
+        issuer.record = issuer.record.copy(mayContainPremiumData = true, mayContainKrxData = true)
+        h.authority = SnapshotTopicUseAuthority { issuer.premium.accessSnapshot }
+        refusedUnder(h, issued)
+        val first = h.wire
+        first.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+
+        issuer.outcome = { EntitlementsOutcome.StableActive(krxVisible = false) }
+        issuer.premium.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        advanceTimeBy(100)
+        assertEquals(false, issuer.premium.accessSnapshot.facts.tokenStanding)
+
+        first.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertTrue("회전 뒤 옛 fence 의 프레임이 들어왔다", h.coordinator.rates.value.quotes.isEmpty())
+        assertTrue(first.cancelled)
+
+        val next = checkNotNull(issuer.premium.topicGrant())
+        assertNotEquals(issued.grant, next.grant)
+        h.setAccess(true, next)
+        advanceTimeBy(100)
+        assertEquals(2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        assertEquals(1391.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+        h.cleanUp()
     }
 }
