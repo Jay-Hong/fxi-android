@@ -1554,7 +1554,9 @@ class PremiumAccessCoordinator(
             schedule.recordQueryStarted()
             val order = nextOrderSeq.incrementAndGet()
             inFlightQueries[order] = InFlightQuery(probeEpoch, queryIntent)
-            StartedQuery(record.fence(), decisionGeneration, boundIdentityLocked(), order, probeEpoch, queryIntent)
+            StartedQuery(
+                record.fence(), decisionGeneration, boundIdentityLocked(), order, probeEpoch, queryIntent, userAccessInvalidations
+            )
         }
 
         try {
@@ -1620,10 +1622,30 @@ class PremiumAccessCoordinator(
      * a later change can never be returned as if it produced this answer. A read that throws still throws.
      */
     internal suspend fun topicGrantResult(): TopicGrantResult = mutex.withLock {
-        TopicGrantResult(issueTopicGrantLocked(), accessSnapshotValue)
+        val fence = issueTopicGrantLocked()
+        TopicGrantResult(fence, accessSnapshotValue, cause = fence?.let { issuedTopicGrant?.cause })
     }
 
     private suspend fun issueTopicGrantLocked(): TopicSessionFence? {
+        val context = issuableContextLocked() ?: return null
+        val issued = issuedTopicGrant?.takeIf { it.context == context }
+            ?: IssuedTopicGrant(TopicGrantToken(++nextTopicGrant), context, TopicGrantCause.Context, lineage = emptySet()).also {
+                issuedTopicGrant = it
+                rejectionLedger.grantIssued(it.token)
+                publishAccessSnapshotLocked()
+            }
+        return TopicSessionFence(
+            identity = AuthIdentityFence(context.identity.ownerUid, context.identity.authGeneration),
+            userAccessEpoch = context.access.userAccessEpoch,
+            grant = issued.token
+        )
+    }
+
+    /**
+     * The context a grant may be issued for now, or null. Shared by an issue and a re-approval's last check (L-4e E4b §2), so the
+     * two cannot disagree on what makes a grant issuable. A read that throws still throws. Callers hold [mutex].
+     */
+    private suspend fun issuableContextLocked(): TopicGrantContext? {
         if (!accessAdmittedLocked()) return null
         if (_state.value.state != PremiumAccessState.PremiumConfirmed) return null
         // Refused without touching the issued grant: a hold is not a loss, and it must not make its own candidate stale.
@@ -1634,18 +1656,54 @@ class PremiumAccessCoordinator(
         // Checked against the record just confirmed, not a value computed before it (S1r-2b §5).
         if (PurgeScope.USER in lossSeals.sealedAxes(bound.ownerUid)) return null
         if (source.currentIdentity() != bound) return null
-        val context = TopicGrantContext(bound, record.fence(), decisionGeneration)
-        val issued = issuedTopicGrant?.takeIf { it.context == context }
-            ?: IssuedTopicGrant(TopicGrantToken(++nextTopicGrant), context).also {
-                issuedTopicGrant = it
-                rejectionLedger.grantIssued(it.token)
-                publishAccessSnapshotLocked()
-            }
-        return TopicSessionFence(
-            identity = AuthIdentityFence(bound.ownerUid, bound.authGeneration),
-            userAccessEpoch = record.userAccessEpoch,
-            grant = issued.token
-        )
+        return TopicGrantContext(bound, record.fence(), decisionGeneration)
+    }
+
+    /**
+     * Whether the answer just published re-approves the grant a session is latched on, and if so issues it (L-4e E4b §2, §3).
+     *
+     * [issuing] is the answering query when the answer may issue — a `FORCE_PREMIUM` query answered `StableActive` into
+     * `PremiumConfirmed` — and null for a path that only asks whether something is owed. For an issue the grant is checked again
+     * the way a pull checks it, against the query that approved it; then, with no suspension left, the grant still standing, the
+     * user axis open and no invalidation since the query left; and the ledger binds the refusal it consumes to the issue under its
+     * own monitor. A failed check issues nothing and retires nothing, but still reports what is owed. Callers hold [mutex].
+     */
+    private suspend fun attemptTopicReapprovalLocked(issuing: StartedQuery?): TopicReapprovalAttempt {
+        val standing = issuedTopicGrant?.takeIf { accessFactsLocked().tokenStanding } ?: return TopicReapprovalAttempt.NotOwed
+        val verified = issuing?.let { reapprovalVerifiedLocked(it, standing) } ?: false
+        val facts = accessFactsLocked()
+        val query = issuing?.takeIf {
+            verified && facts.tokenStanding && facts.userAllowed &&
+                userAccessInvalidations == it.userInvalidations
+        }?.let { TopicReapprovalQuery(it.order, it.userInvalidations) }
+        val attempt = rejectionLedger.rotateForTopicReapproval(standing.token, query) { TopicGrantToken(++nextTopicGrant) }
+        if (attempt is TopicReapprovalAttempt.Issued) {
+            val issue = attempt.issue
+            issuedTopicGrant = IssuedTopicGrant(
+                issue.token,
+                standing.context,
+                TopicGrantCause.RefusalReapproval(issue.from, issue.refusalOrder, issue.queryOrder),
+                lineage = standing.lineage + standing.token
+            )
+            publishAccessSnapshotLocked()
+        }
+        return attempt
+    }
+
+    /** A pull's checks again, and [started] still the query of [standing]'s context. A read that fails fails the check. */
+    private suspend fun reapprovalVerifiedLocked(started: StartedQuery, standing: IssuedTopicGrant): Boolean {
+        val context = try {
+            issuableContextLocked()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (unreadable: Exception) {
+            null
+        } ?: return false
+        return context == standing.context &&
+            started.generation == decisionGeneration &&
+            started.binding == probeEpoch &&
+            started.fence == context.access &&
+            started.boundIdentity == context.identity
     }
 
     /**
@@ -1789,7 +1847,9 @@ class PremiumAccessCoordinator(
         /** The [probeEpoch] this query started under. */
         val binding: Long,
         /** The intent it actually asked with. */
-        val intent: RefreshIntent
+        val intent: RefreshIntent,
+        /** [userAccessInvalidations] when it left: a re-approval needs none since (L-4e E4b §2-6). */
+        val userInvalidations: Long
     )
 
     /** What the current binding still owes: a query at least [intent] strong that starts after [raisedAt]. */
@@ -1832,9 +1892,18 @@ class PremiumAccessCoordinator(
             if (started.generation != decisionGeneration) return
             if (record.fence() != started.fence) return
 
+            // Set by the decision's follow-up, which runs once it is published; read only on a normal return.
+            var reapproval: TopicReapprovalAttempt? = null
+            val followUp: suspend (AccessDecision) -> Unit = { published ->
+                val issuing = started.takeIf {
+                    it.intent == RefreshIntent.FORCE_PREMIUM && outcome is EntitlementsOutcome.StableActive &&
+                        published.state == PremiumAccessState.PremiumConfirmed
+                }
+                reapproval = attemptTopicReapprovalLocked(issuing)
+            }
             // Null means the answer was held back rather than decided.
             val decision: AccessDecision? = if (answeredAs == null) {
-                decideLocked(record, intent, outcome)
+                decideLocked(record, intent, outcome, followUp)
             } else {
                 if (answeredAs.ownerUid != record.ownerUid) return
                 // ...and the session the binding was standing on, which the live check above
@@ -1843,7 +1912,7 @@ class PremiumAccessCoordinator(
                 if (started.boundIdentity != null && answeredAs != started.boundIdentity) return
                 val live = source.currentIdentity()
                 when {
-                    live == answeredAs -> decideLocked(record, intent, outcome)
+                    live == answeredAs -> decideLocked(record, intent, outcome, followUp)
                     // A *different* session superseded this answer, and whatever established it
                     // owns the schedule from here.
                     live != null -> return
@@ -1855,7 +1924,7 @@ class PremiumAccessCoordinator(
             }
 
             if (decision != null) {
-                settleDemandLocked(started, outcome, decision.recheck)
+                settleDemandLocked(started, outcome, decision.recheck, checkNotNull(reapproval))
             } else {
                 // Held back, not decided. The answer stays out of the state, but the query is
                 // retried at its own strength so an eventual identity reaches the same conclusion.
@@ -1880,9 +1949,16 @@ class PremiumAccessCoordinator(
      *
      * Only an answer that started after the demand, asked at least as strongly and settled what the demand needs ends it.
      * An answer that does not leaves the timer alone even when it asks for nothing more; its own re-check joins the demand
-     * as a retry. With no demand, or once it is answered, the schedule is armed or cleared as before.
+     * as a retry. With no demand, or once it is answered, the schedule is armed or cleared as before. An answer whose
+     * re-approval is blocked answers no demand: it stays the premium requirement it was, retried (L-4e E4b §3.3).
      */
-    private suspend fun settleDemandLocked(started: StartedQuery, outcome: EntitlementsOutcome, recheck: RecheckRequest?) {
+    private suspend fun settleDemandLocked(
+        started: StartedQuery,
+        outcome: EntitlementsOutcome,
+        recheck: RecheckRequest?,
+        /** What the answer did about a re-approval: a blocked one answers no demand (L-4e E4b §3.3). */
+        reapproval: TopicReapprovalAttempt
+    ) {
         val authentication =
             outcome is EntitlementsOutcome.Indeterminate && outcome.reason == IndeterminateReason.AUTHENTICATION
         if (started.order > authStateOrder) {
@@ -1895,7 +1971,9 @@ class PremiumAccessCoordinator(
             }
         }
         val demand = recheckDemand
+        val blocked = reapproval == TopicReapprovalAttempt.Blocked
         val answered = demand != null &&
+            !blocked &&
             started.binding == demand.binding &&
             started.order > demand.raisedAt &&
             started.intent >= demand.intent &&
@@ -1909,6 +1987,21 @@ class PremiumAccessCoordinator(
                 raiseDemandLocked(recheck.intent, independent = true)
                 armRecheckLocked(recheck)
             }
+        } else if (blocked) {
+            // The same premium requirement retried (L-4e E4b §3.3), never sooner than the default floor. The schedule is not
+            // cancelled, so a repeat keeps its attempts and backs off; a re-query already armed and not yet fired runs it at its
+            // own deadline instead of being pushed back by this one.
+            val retry = RecheckRequest(
+                RefreshIntent.FORCE_PREMIUM,
+                minDelayMillis = maxOf(recheck?.minDelayMillis ?: 0L, PremiumAccessReducer.DEFAULT_BACKOFF_FLOOR_MILLIS)
+            )
+            raiseDemandLocked(retry.intent, independent = false)
+            // Nor is a query at least as strong still running cut off by arming: its end looks again, as ensureDemandArmedLocked
+            // relies on. The answering query is still registered here, so it is left out.
+            val running = inFlightQueries.any { (order, query) ->
+                order != started.order && query.binding == probeEpoch && query.intent >= retry.intent
+            }
+            if (recheck != null || authStopped || (!running && !schedule.foldIntoUnfired(retry.intent))) armRecheckLocked(retry)
         } else if (recheck != null) {
             raiseDemandLocked(recheck.intent, independent = false)
             armRecheckLocked(recheck)
@@ -2544,7 +2637,7 @@ class PremiumAccessCoordinator(
             }
             is CandidateProvenance.Topic -> {
                 val context = provenance.context
-                issuedTopicGrant?.takeIf { it.token == provenance.grant }?.context != context ||
+                issuedTopicGrant?.takeIf { it.issuedFor(provenance.grant) }?.context != context ||
                     context.generation != decisionGeneration ||
                     boundIdentityLocked() != context.identity ||
                     (live != null && live != context.identity)
@@ -2618,7 +2711,7 @@ class PremiumAccessCoordinator(
             }
             is CandidateProvenance.Topic -> {
                 val context = provenance.context
-                if (issuedTopicGrant?.takeIf { it.token == provenance.grant }?.context != context) return CandidateCheck.Stale
+                if (issuedTopicGrant?.takeIf { it.issuedFor(provenance.grant) }?.context != context) return CandidateCheck.Stale
                 if (context.generation != decisionGeneration || record.fence() != context.access) return CandidateCheck.Stale
                 if (boundIdentityLocked() != context.identity) return CandidateCheck.Stale
                 return when (source.currentIdentity()) {
@@ -2645,7 +2738,9 @@ class PremiumAccessCoordinator(
             try {
                 val recheck = decision.recheck?.remainingOf(candidate)
                 when (provenance) {
-                    is CandidateProvenance.Query -> settleDemandLocked(provenance.started, candidate.outcome, recheck)
+                    // Never issues: the approving query's last checks belong to its own answer. What is still owed stays owed.
+                    is CandidateProvenance.Query ->
+                        settleDemandLocked(provenance.started, candidate.outcome, recheck, attemptTopicReapprovalLocked(null))
                     // Not a query's answer, so it answers no demand; a re-check it asks for is a new requirement (S1r-2a §2.1).
                     is CandidateProvenance.Topic ->
                         if (recheck != null) {
@@ -2824,4 +2919,24 @@ internal data class TopicGrantContext(
     val generation: Long
 )
 
-private data class IssuedTopicGrant(val token: TopicGrantToken, val context: TopicGrantContext)
+/** Why the grant in force was issued (L-4e E4b §3.2). E5 reads it to tell a re-approval from a new context. */
+internal sealed interface TopicGrantCause {
+    /** Issued for a context no grant had yet. */
+    data object Context : TopicGrantCause
+
+    /** Replaced [from] in the same context after the premium refusal at [refusalOrder], re-approved by the query at [queryOrder]. */
+    data class RefusalReapproval(val from: TopicGrantToken, val refusalOrder: Long, val queryOrder: Long) : TopicGrantCause
+}
+
+/**
+ * The grant in force. [lineage] holds the tokens it replaced by re-approval in the same context; a new context starts it empty.
+ * It is for holds already made for those tokens and nothing else: a refusal reported for one is still an old grant's (§4).
+ */
+private data class IssuedTopicGrant(
+    val token: TopicGrantToken,
+    val context: TopicGrantContext,
+    val cause: TopicGrantCause,
+    val lineage: Set<TopicGrantToken>
+) {
+    fun issuedFor(grant: TopicGrantToken): Boolean = grant == token || grant in lineage
+}

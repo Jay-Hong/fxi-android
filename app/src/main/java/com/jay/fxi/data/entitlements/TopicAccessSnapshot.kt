@@ -148,5 +148,12 @@ internal data class TopicAccessSnapshot(
     }
 }
 
-/** A topic grant answer and the snapshot published by the same lock hold that produced it. */
-internal data class TopicGrantResult(val fence: TopicSessionFence?, val snapshot: TopicAccessSnapshot)
+/**
+ * A topic grant answer and the snapshot published by the same lock hold that produced it, with why the grant was issued when there
+ * is one (L-4e E4b §5).
+ */
+internal data class TopicGrantResult(
+    val fence: TopicSessionFence?,
+    val snapshot: TopicAccessSnapshot,
+    val cause: TopicGrantCause? = null
+)

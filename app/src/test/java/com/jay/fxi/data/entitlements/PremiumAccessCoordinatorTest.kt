@@ -2050,26 +2050,548 @@ class PremiumAccessCoordinatorTest {
         processJob.cancel()
     }
 
-    /** Answered active with the whole context held: the demand is settled, nothing more is asked, and the token stays. */
+    /**
+     * Answered active with the whole context held: the latched grant is re-approved once with a new token in the same context,
+     * the demand is settled and nothing more is asked (L-4e E4b; E4a kept the token here).
+     */
     @Test
-    fun anUndecidableRefusalAnsweredActive_settlesTheDemand_andKeepsTheToken() = refusalTest {
+    fun anUndecidableRefusalAnsweredActive_settlesTheDemand_andReapprovesWithANewToken() = refusalTest {
         val g = granted()
         g.source.identity = null
         g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
         val taken = g.coordinator.rejectionView(g.grant)
+        val revision = g.coordinator.accessSnapshot.revision
         g.source.identity = EntitlementsIdentity(OWNER, 1L)
         advanceTimeBy(5_010)
         runCurrent()
         val fetches = g.fetches()
         assertNull(g.coordinator.owed())
         assertEquals(PremiumAccessState.PremiumConfirmed, g.coordinator.state.value.state)
-        assertEquals("같은 문맥인데 토큰이 바뀌었다", g.grant, g.coordinator.issuedGrant())
+        assertTrue("재승인이 게시되지 않았다", g.coordinator.accessSnapshot.revision > revision)
+        val reapproved = checkNotNull(g.coordinator.accessSnapshot.facts.token)
+        assertNotEquals("재승인이 토큰을 바꾸지 않았다", g.grant, reapproved)
+        assertTrue("같은 문맥의 재승인이 standing 이 아니다", g.coordinator.accessSnapshot.facts.tokenStanding)
+        val result = g.coordinator.topicGrantResult()
+        assertEquals(reapproved, checkNotNull(result.fence).grant)
+        val cause = result.cause as TopicGrantCause.RefusalReapproval
+        assertEquals(g.grant, cause.from)
+        assertEquals(taken.latestCurrent, cause.refusalOrder)
+        assertTrue("거부 전에 시작한 조회가 재승인했다", cause.queryOrder > checkNotNull(taken.latestReported))
+        assertEquals("옛 grant 의 요약이 남았다", TopicRejectionView(emptyList(), null, null), g.coordinator.rejectionView(g.grant))
 
         advanceTimeBy(120_000)
         runCurrent()
         assertEquals("해소된 뒤 또 물었다", fetches, g.fetches())
-        assertEquals("demand 해소가 거부 이력을 지웠다", taken, g.coordinator.rejectionView(g.grant))
-        processJob.cancel()
+        assertEquals("다시 회전했다", reapproved, g.coordinator.issuedGrant())
+        assertEquals(cause, g.coordinator.topicGrantResult().cause)
+    }
+
+    /** A refusal reported and dropped while the approving query ran blocks that answer and keeps the demand; a later query issues. */
+    @Test
+    fun aRefusalReportedDuringTheQuery_blocksItsReapproval_andALaterQueryIssuesIt() = refusalTest {
+        var gate: CompletableDeferred<Unit>? = null
+        val g = granted(fetchGate = { gate.also { gate = null } })
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        val parked = CompletableDeferred<Unit>()
+        gate = parked
+        advanceTimeBy(5_010)
+        runCurrent()
+        val fetches = g.fetches()
+        g.coordinator.abandonRejection(g.coordinator.reserveRejection(g.grant, PREMIUM_REFUSAL))
+        parked.complete(Unit)
+        runCurrent()
+        assertEquals("뒤에 보고된 거부 앞의 조회로 회전했다", g.grant, g.coordinator.issuedGrant())
+        assertEquals("막힌 답이 요구를 지웠다", RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+
+        advanceTimeBy(4_990)
+        runCurrent()
+        assertEquals("floor 전에 다시 물었다", fetches, g.fetches())
+        advanceTimeBy(20)
+        runCurrent()
+        assertEquals(fetches + 1, g.fetches())
+        assertNotEquals("뒤에 시작한 조회가 재승인하지 않았다", g.grant, g.coordinator.issuedGrant())
+        assertNull(g.coordinator.owed())
+    }
+
+    /** An answer to a query that did not ask for premium issues nothing and leaves the demand for the one that did. */
+    @Test
+    fun anAnswerThatDidNotAskForPremium_leavesTheGrantAndTheDemand() = refusalTest {
+        var gate: CompletableDeferred<Unit>? = null
+        val g = granted(fetchGate = { gate.also { gate = null } })
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        val parked = CompletableDeferred<Unit>()
+        gate = parked
+        advanceTimeBy(5_010)
+        runCurrent()
+        val fetches = g.fetches()
+        val entitlements = launch { g.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+        assertTrue(entitlements.isCompleted)
+        assertEquals("FORCE_ENTITLEMENTS 조회가 돌지 않았다", fetches + 1, g.fetches())
+        assertEquals("premium 을 묻지 않은 답으로 회전했다", g.grant, g.coordinator.issuedGrant())
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+
+        parked.complete(Unit)
+        runCurrent()
+        assertNotEquals(g.grant, g.coordinator.issuedGrant())
+        assertNull(g.coordinator.owed())
+    }
+
+    @Test
+    fun aBlockedWeakAnswerFollowedByCancellation_rearmsThePremiumDemand() = refusalTest {
+        var gate: CompletableDeferred<Unit>? = null
+        val g = granted(fetchGate = { gate.also { gate = null } })
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+
+        val parked = CompletableDeferred<Unit>()
+        gate = parked
+        advanceTimeBy(5_010)
+        runCurrent()
+        val running = g.coordinator.recheckDiagnostics().inFlightOrders.single()
+
+        g.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        runCurrent()
+        assertEquals(
+            "막힌 약한 답이 실행 중인 premium 조회를 끊었다",
+            listOf(running),
+            g.coordinator.recheckDiagnostics().inFlightOrders
+        )
+        assertEquals(g.grant, g.coordinator.accessSnapshot.facts.token)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+
+        val fetches = g.fetches()
+        parked.cancel()
+        runCurrent()
+        assertTrue(g.coordinator.recheckDiagnostics().inFlightOrders.isEmpty())
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+
+        advanceTimeBy(4_999)
+        runCurrent()
+        assertEquals("취소 뒤 재시도가 floor를 앞당겼다", fetches, g.fetches())
+        advanceTimeBy(1)
+        runCurrent()
+        assertEquals("취소 뒤 요구가 다시 실행되지 않았다", fetches + 1, g.fetches())
+        assertNotEquals(g.grant, g.coordinator.accessSnapshot.facts.token)
+        assertNull(g.coordinator.owed())
+    }
+
+    /** A premium query answered pending keeps the grant it had, but approves nothing: no re-approval until an active answer. */
+    @Test
+    fun aPendingAnswerToAPremiumQuery_issuesNothing() = refusalTest {
+        var outcome: EntitlementsOutcome = EntitlementsOutcome.StableActive(krxVisible = false)
+        val g = granted(next = { outcome })
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        outcome = EntitlementsOutcome.Pending(krxVisible = false)
+        val fetches = g.fetches()
+        advanceTimeBy(5_010)
+        runCurrent()
+        assertEquals(fetches + 1, g.fetches())
+        assertEquals(PremiumAccessState.PremiumConfirmed, g.coordinator.state.value.state)
+        assertEquals("pending 답으로 재승인했다", g.grant, g.coordinator.accessSnapshot.facts.token)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+
+        outcome = EntitlementsOutcome.StableActive(krxVisible = false)
+        advanceTimeBy(20_000)
+        runCurrent()
+        assertNotEquals(g.grant, g.coordinator.issuedGrant())
+        assertNull(g.coordinator.owed())
+    }
+
+    /**
+     * A re-approval checked again after the decision is published: a live identity that moved, or a record that cannot be read at
+     * that last check, issues nothing, keeps the grant and its history, and leaves the demand for a later query.
+     */
+    @Test
+    fun aReapprovalWhoseLastCheckFails_issuesNothing_andKeepsWhatIsOwed() = refusalTest {
+        for (failure in listOf("identity", "record")) {
+            var gate: CompletableDeferred<Unit>? = null
+            val g = granted(fetchGate = { gate.also { gate = null } })
+            g.source.identity = null
+            g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+            val taken = g.coordinator.rejectionView(g.grant)
+            g.source.identity = EntitlementsIdentity(OWNER, 1L)
+            val parked = CompletableDeferred<Unit>()
+            gate = parked
+            advanceTimeBy(5_010)
+            runCurrent()
+            // Held at the answer's own read, so the change lands after the checks the answer passed and before the last one.
+            val held = CompletableDeferred<Unit>()
+            if (failure == "identity") g.source.identityGate = held else g.store.blockNextLoadOn = held
+            parked.complete(Unit)
+            runCurrent()
+            if (failure == "identity") g.source.identity = EntitlementsIdentity(OWNER, 2L) else g.store.failNextLoad = true
+            held.complete(Unit)
+            runCurrent()
+            assertEquals("$failure: 답이 결정되지 않았다", PremiumAccessState.PremiumConfirmed, g.coordinator.state.value.state)
+            assertEquals("$failure: 마지막 검사가 실패했는데 회전했다", g.grant, g.coordinator.accessSnapshot.facts.token)
+            assertEquals("$failure: 실패한 검사가 요약을 퇴역시켰다", taken, g.coordinator.rejectionView(g.grant))
+            assertEquals("$failure: 요구를 지웠다", RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+
+            g.source.identity = EntitlementsIdentity(OWNER, 1L)
+            advanceTimeBy(20_000)
+            runCurrent()
+            assertNotEquals("$failure: 뒤의 조회가 재승인하지 않았다", g.grant, g.coordinator.issuedGrant())
+            assertNull(g.coordinator.owed())
+            processJob.children.forEach { it.cancel() }
+        }
+    }
+
+    /** A user hold that stands and goes while the approving query runs leaves an invalidation behind: that answer issues nothing. */
+    @Test
+    fun aUserHoldThatCameAndWentDuringTheQuery_blocksItsReapproval() = refusalTest {
+        var gate: CompletableDeferred<Unit>? = null
+        var outcome: EntitlementsOutcome = EntitlementsOutcome.StableActive(krxVisible = false)
+        val g = granted(next = { outcome }, fetchGate = { gate.also { gate = null } })
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        val approving = CompletableDeferred<Unit>()
+        gate = approving
+        advanceTimeBy(5_010)
+        runCurrent()
+        val invalidations = g.coordinator.accessSnapshot.userInvalidations
+
+        // Another query answers a loss the record cannot confirm: a USER hold. Its recovery then finds a different live session and
+        // releases it as stale, with the context unchanged.
+        val losing = CompletableDeferred<Unit>()
+        gate = losing
+        val other = launch { g.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+        outcome = EntitlementsOutcome.StableInactive(krxVisible = false)
+        g.store.failNextLoad = true
+        g.source.identity = EntitlementsIdentity(OWNER, 2L)
+        losing.complete(Unit)
+        runCurrent()
+        assertTrue(other.isCompleted)
+        assertTrue("무효화가 남지 않았다", g.coordinator.accessSnapshot.userInvalidations > invalidations)
+        assertTrue("보류가 풀리지 않았다", g.coordinator.accessSnapshot.facts.userAllowed)
+
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        outcome = EntitlementsOutcome.StableActive(krxVisible = false)
+        approving.complete(Unit)
+        runCurrent()
+        assertEquals(PremiumAccessState.PremiumConfirmed, g.coordinator.state.value.state)
+        assertEquals("무효화를 지난 답이 재승인했다", g.grant, g.coordinator.accessSnapshot.facts.token)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+
+        advanceTimeBy(20_000)
+        runCurrent()
+        assertNotEquals("무효화 뒤에 시작한 조회가 재승인하지 않았다", g.grant, g.coordinator.issuedGrant())
+    }
+
+    /**
+     * A premium refusal still on its way is owed: an answer landing meanwhile blocks and keeps a demand it would otherwise settle.
+     * Without a demand it adds none; the refusal's own hand-over owns what follows, and dropping it leaves nothing owed.
+     */
+    @Test
+    fun aPremiumRefusalOnItsWay_keepsADemand_butAddsNone() = refusalTest {
+        val withDemand = granted()
+        withDemand.source.identity = null
+        withDemand.coordinator.onTopicRejected(withDemand.grant, KRX_REFUSAL)
+        withDemand.source.identity = EntitlementsIdentity(OWNER, 1L)
+        val onItsWay = withDemand.coordinator.reserveRejection(withDemand.grant, PREMIUM_REFUSAL)
+        advanceTimeBy(5_010)
+        runCurrent()
+        assertEquals(withDemand.grant, withDemand.coordinator.issuedGrant())
+        assertEquals("처리 중인 premium 거부가 있는데 요구를 지웠다", RefreshIntent.FORCE_PREMIUM, withDemand.coordinator.owed())
+        withDemand.coordinator.abandonRejection(onItsWay)
+        advanceTimeBy(20_000)
+        runCurrent()
+        assertNull("버린 거부가 요구로 남았다", withDemand.coordinator.owed())
+        assertEquals("버린 거부로 회전했다", withDemand.grant, withDemand.coordinator.issuedGrant())
+        processJob.children.forEach { it.cancel() }
+
+        val without = granted()
+        val reserved = without.coordinator.reserveRejection(without.grant, PREMIUM_REFUSAL)
+        without.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertNull("demand 없는 요구가 demand 를 만들었다", without.coordinator.owed())
+        assertEquals(without.grant, without.coordinator.issuedGrant())
+        without.source.identity = null
+        without.coordinator.onTopicRejected(reserved)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, without.coordinator.owed())
+        without.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(20_000)
+        runCurrent()
+        assertNotEquals(without.grant, without.coordinator.issuedGrant())
+        assertNull(without.coordinator.owed())
+    }
+
+    /**
+     * An approving answer held as a capability candidate and resolved later, with the context unchanged: the resolution issues
+     * nothing, but it does not settle what the refusal is owed either, and the query that follows re-approves.
+     */
+    @Test
+    fun aHeldActiveAnswerResolvedInTheSameContext_keepsTheDemandForTheNextQuery() = refusalTest {
+        var gate: CompletableDeferred<Unit>? = null
+        val g = granted(fetchGate = { gate.also { gate = null } })
+        assertEquals(KrxCapabilityState.HIDDEN, g.coordinator.krx.value)
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        val parked = CompletableDeferred<Unit>()
+        gate = parked
+        advanceTimeBy(5_010)
+        runCurrent()
+        g.store.failNextLoad = true
+        g.source.identity = null
+        parked.complete(Unit)
+        runCurrent()
+        assertTrue(
+            "답이 후보로 보류되지 않았다",
+            TopicAccessBlock.LOSS_CANDIDATE in g.coordinator.accessSnapshot.facts.capabilityBlocks
+        )
+        val fence = g.store.record.fence()
+
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(2_010)
+        runCurrent()
+        assertFalse(TopicAccessBlock.LOSS_CANDIDATE in g.coordinator.accessSnapshot.facts.capabilityBlocks)
+        assertEquals("후보 해소가 문맥을 바꿨다", fence, g.store.record.fence())
+        assertEquals("후보 해소가 회전했다", g.grant, g.coordinator.accessSnapshot.facts.token)
+        assertEquals("후보 해소가 요구를 지웠다", RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+
+        advanceTimeBy(20_000)
+        runCurrent()
+        assertNotEquals("다음 조회가 재승인하지 않았다", g.grant, g.coordinator.issuedGrant())
+        assertNull(g.coordinator.owed())
+    }
+
+    /** A capability hold made for a grant later re-approved is still that grant's: it resolves instead of being released as stale. */
+    @Test
+    fun aCapabilityHoldForAReapprovedGrant_isResolvedNotReleased() = refusalTest {
+        val g = granted(krxVisible = true)
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.store.failNextLoad = true
+        g.coordinator.onTopicRejected(g.grant, KRX_REFUSAL)
+        advanceTimeBy(3_000)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(1_990)
+        runCurrent()
+        assertTrue("보류가 서지 않았다", TopicAccessBlock.LOSS_CANDIDATE in g.coordinator.accessSnapshot.facts.capabilityBlocks)
+        assertEquals(g.grant, g.coordinator.accessSnapshot.facts.token)
+        val epoch = g.store.record.krxCapabilityEpoch
+
+        advanceTimeBy(4_000)
+        runCurrent()
+        // Resolved before the re-approval, the KRX loss would have moved the context and left nothing to re-approve: a new token
+        // together with the loss applied means the hold outlived the re-approval and was then resolved.
+        assertNotEquals("보류가 선 채 재승인하지 않았다", g.grant, g.coordinator.accessSnapshot.facts.token)
+        assertFalse(TopicAccessBlock.LOSS_CANDIDATE in g.coordinator.accessSnapshot.facts.capabilityBlocks)
+        // Released as stale, the hold would leave the capability as it was; resolved, the loss rotates its epoch.
+        assertNotEquals("재승인이 옛 grant 의 보류를 stale 로 풀었다", epoch, g.store.record.krxCapabilityEpoch)
+    }
+
+    @Test
+    fun aCapabilityCandidate_survivesTwoReapprovals() = refusalTest {
+        val g = granted(krxVisible = true)
+        val original = checkNotNull(g.coordinator.topicGrant())
+        val oldUse = checkNotNull(g.coordinator.accessSnapshot.acquireUse(original))
+        val epoch = g.store.record.krxCapabilityEpoch
+
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.store.failNextLoad = true
+        g.coordinator.onTopicRejected(g.grant, KRX_REFUSAL)
+
+        // Candidate recovery retries at 0, 2, 6 and 14 seconds.
+        advanceTimeBy(4_990)
+        runCurrent()
+        assertEquals(1, g.coordinator.heldLossCandidateCount())
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(20)
+        runCurrent()
+
+        val first = checkNotNull(g.coordinator.accessSnapshot.facts.token)
+        assertNotEquals(g.grant, first)
+        assertEquals(1, g.coordinator.heldLossCandidateCount())
+        assertEquals(epoch, g.store.record.krxCapabilityEpoch)
+        // Checked before the next pull: publication alone ends the old use.
+        assertFalse(g.coordinator.accessSnapshot.admitsUse(oldUse))
+        assertEquals(
+            g.grant,
+            (g.coordinator.topicGrantResult().cause as TopicGrantCause.RefusalReapproval).from
+        )
+
+        g.source.identity = null
+        g.coordinator.onTopicRejected(first, PREMIUM_REFUSAL)
+        advanceTimeBy(4_990)
+        runCurrent()
+        assertEquals(1, g.coordinator.heldLossCandidateCount())
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(20)
+        runCurrent()
+
+        val second = checkNotNull(g.coordinator.accessSnapshot.facts.token)
+        assertNotEquals(first, second)
+        assertEquals(1, g.coordinator.heldLossCandidateCount())
+        assertEquals(epoch, g.store.record.krxCapabilityEpoch)
+        assertEquals(
+            first,
+            (g.coordinator.topicGrantResult().cause as TopicGrantCause.RefusalReapproval).from
+        )
+        assertNull(g.coordinator.owed())
+
+        advanceTimeBy(4_000)
+        runCurrent()
+        assertEquals(0, g.coordinator.heldLossCandidateCount())
+        assertNotEquals(
+            "두 번째 회전이 최초 후보를 stale로 해제했다",
+            epoch,
+            g.store.record.krxCapabilityEpoch
+        )
+        assertEquals(TopicGrantCause.Context, g.coordinator.topicGrantResult().cause)
+    }
+
+    /** After a re-approval the replaced grant's late refusal is discarded; a refusal for the new grant is re-approved in turn. */
+    @Test
+    fun aLateRefusalForTheReplacedGrant_isDiscarded_andTheNewGrantCanBeReapprovedAgain() = refusalTest {
+        val g = granted()
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(5_010)
+        runCurrent()
+        val first = g.coordinator.issuedGrant()
+        assertNotEquals(g.grant, first)
+        val fetches = g.fetches()
+
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        runCurrent()
+        assertEquals("옛 grant 의 늦은 거부가 결정됐다", PremiumAccessState.PremiumConfirmed, g.coordinator.state.value.state)
+        assertNull(g.coordinator.owed())
+        assertEquals(TopicRejectionView(emptyList(), null, null), g.coordinator.rejectionView(first))
+        advanceTimeBy(60_000)
+        runCurrent()
+        assertEquals("옛 grant 의 늦은 거부가 조회를 만들었다", fetches, g.fetches())
+        assertEquals(first, g.coordinator.issuedGrant())
+
+        g.source.identity = null
+        g.coordinator.onTopicRejected(first, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(5_010)
+        runCurrent()
+        val second = g.coordinator.topicGrantResult()
+        assertNotEquals(first, checkNotNull(second.fence).grant)
+        assertEquals(first, (second.cause as TopicGrantCause.RefusalReapproval).from)
+    }
+
+    /**
+     * Blocked right after an authentication stop is lifted, when the stop left the refusal's re-query unarmed and the schedule's
+     * attempts at zero: the retry still waits the default floor instead of asking again at once.
+     */
+    @Test
+    fun aBlockedAnswerAfterAnAuthenticationStop_stillWaitsTheFloor() = refusalTest {
+        var gate: CompletableDeferred<Unit>? = null
+        var outcome: EntitlementsOutcome = EntitlementsOutcome.StableActive(krxVisible = false)
+        val g = granted(next = { outcome }, fetchGate = { gate.also { gate = null } })
+        outcome = EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION)
+        g.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        runCurrent()
+        val stopped = g.fetches()
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        outcome = EntitlementsOutcome.StableActive(krxVisible = false)
+        advanceTimeBy(5_010)
+        runCurrent()
+        assertEquals("AUTH 정지 중에 스스로 다시 물었다", stopped, g.fetches())
+
+        val parked = CompletableDeferred<Unit>()
+        gate = parked
+        launch { g.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+        runCurrent()
+        val fetches = g.fetches()
+        assertEquals(stopped + 1, fetches)
+        g.coordinator.abandonRejection(g.coordinator.reserveRejection(g.grant, PREMIUM_REFUSAL))
+        parked.complete(Unit)
+        runCurrent()
+        assertEquals(g.grant, g.coordinator.accessSnapshot.facts.token)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+
+        advanceTimeBy(4_990)
+        runCurrent()
+        assertEquals("막힌 답의 재시도가 floor 없이 다시 물었다", fetches, g.fetches())
+        advanceTimeBy(20)
+        runCurrent()
+        assertEquals(fetches + 1, g.fetches())
+        assertNotEquals(g.grant, g.coordinator.issuedGrant())
+        assertNull(g.coordinator.owed())
+    }
+
+    /** A re-approval blocked again and again is one requirement retried along the schedule's ladder, not restarted each time. */
+    @Test
+    fun aRepeatedlyBlockedReapproval_backsOffAlongTheSchedule() = refusalTest {
+        val g = granted()
+        g.source.identity = null
+        val start = testScheduler.currentTime
+        g.coordinator.onTopicRejected(g.grant, KRX_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        // Never handed over: every answer finds a premium refusal still on its way.
+        g.coordinator.reserveRejection(g.grant, PREMIUM_REFUSAL)
+        val fetches = g.fetches()
+        val at = mutableListOf<Long>()
+        repeat(60) {
+            advanceTimeBy(1_000)
+            runCurrent()
+            if (g.fetches() > fetches + at.size) at += testScheduler.currentTime - start
+        }
+        // The refusal's floor, then the schedule's attempts: 5 s, 10 s, 20 s after each blocked answer.
+        assertEquals("막힌 답의 재시도가 사다리를 따르지 않았다: $at", listOf(5_000L, 10_000L, 20_000L, 40_000L), at)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+        assertEquals(g.grant, g.coordinator.issuedGrant())
+    }
+
+    /** Cancelled while the re-approval's last check is suspended: the issue is completed as a whole, and what is owed settles. */
+    @Test
+    fun aQueryCancelledDuringTheLastCheck_stillCompletesTheIssueWhole() = refusalTest {
+        var gate: CompletableDeferred<Unit>? = null
+        val g = granted(fetchGate = { gate.also { gate = null } })
+        g.source.identity = null
+        g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        g.source.identity = EntitlementsIdentity(OWNER, 1L)
+        advanceTimeBy(5_000)
+        val parked = CompletableDeferred<Unit>()
+        gate = parked
+        val caller = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            g.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        }
+        runCurrent()
+        val answering = CompletableDeferred<Unit>()
+        g.store.blockNextLoadOn = answering
+        parked.complete(Unit)
+        runCurrent()
+        val lastCheck = CompletableDeferred<Unit>()
+        g.store.blockNextLoadOn = lastCheck
+        answering.complete(Unit)
+        runCurrent()
+        caller.cancel()
+        runCurrent()
+        lastCheck.complete(Unit)
+        runCurrent()
+
+        val facts = g.coordinator.accessSnapshot.facts
+        val reapproved = checkNotNull(facts.token)
+        assertNotEquals("취소가 발급을 막았다", g.grant, reapproved)
+        assertTrue(facts.tokenStanding)
+        assertEquals(TopicRejectionView(emptyList(), null, null), g.coordinator.rejectionView(g.grant))
+        val result = g.coordinator.topicGrantResult()
+        assertEquals(reapproved, checkNotNull(result.fence).grant)
+        assertEquals(g.grant, (result.cause as TopicGrantCause.RefusalReapproval).from)
+
+        advanceTimeBy(60_000)
+        runCurrent()
+        assertNull("취소 뒤 요구가 해소되지 않았다", g.coordinator.owed())
+        assertEquals("취소 뒤 다시 회전했다", reapproved, g.coordinator.issuedGrant())
     }
 
     @Test
@@ -2203,13 +2725,15 @@ class PremiumAccessCoordinatorTest {
 
         g.source.identity = null
         g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
-        assertTrue("거부 순서가 먼저 시작한 조회보다 앞섰다", g.coordinator.rejectionView(g.grant).latestReported!! > running)
+        val reported = g.coordinator.rejectionView(g.grant).latestReported!!
+        assertTrue("거부 순서가 먼저 시작한 조회보다 앞섰다", reported > running)
         assertEquals("두 번째 거부의 무장이 달리는 caller 조회를 끊었다", listOf(running), g.coordinator.recheckDiagnostics().inFlightOrders)
         g.source.identity = EntitlementsIdentity(OWNER, 1L)
         parked.complete(Unit)
         runCurrent()
         assertTrue(caller.isCompleted)
         assertEquals("거부 전에 시작한 조회가 새 demand 에 답했다", RefreshIntent.FORCE_PREMIUM, g.coordinator.owed())
+        assertEquals("거부 전에 시작한 조회가 재승인했다", g.grant, g.coordinator.accessSnapshot.facts.token)
 
         advanceTimeBy(5_010)
         runCurrent()
@@ -2223,7 +2747,7 @@ class PremiumAccessCoordinatorTest {
         runCurrent()
         assertTrue(
             "거부 뒤에 시작한 조회의 순서가 거부보다 앞섰다",
-            g.coordinator.recheckDiagnostics().inFlightOrders.single() > g.coordinator.rejectionView(g.grant).latestReported!!
+            g.coordinator.recheckDiagnostics().inFlightOrders.single() > reported
         )
         next.cancel()
         later.complete(Unit)

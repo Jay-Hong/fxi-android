@@ -4,6 +4,7 @@ import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.entitlements.PremiumAccessTopicGrantIssuer
 import com.jay.fxi.data.entitlements.TopicGrantDeliverer
 import com.jay.fxi.data.entitlements.TopicGrantIssuer
+import com.jay.fxi.data.entitlements.TopicGrantCause
 import com.jay.fxi.data.entitlements.TopicGrantResult
 import com.jay.fxi.data.entitlements.TopicRejectionReservation
 import com.jay.fxi.data.entitlements.TopicRejectionView
@@ -7366,7 +7367,8 @@ class TopicSessionCoordinatorTest {
     /**
      * A socket refusal the issuer cannot tie to a live identity is kept (L-4e E4a R1′): nothing changes and the session stays
      * latched, and once the identity reads, the premium question it left is asked — a loss ends the grant; an approval with the
-     * whole context held leaves the session where it is.
+     * whole context held re-approves it with a new token, which the session connects with (L-4e E4b R2′). A late refusal for the
+     * replaced grant then changes nothing.
      */
     @Test
     fun `a refusal whose identity the issuer cannot read is kept and asked about once it can`() = runTest {
@@ -7406,9 +7408,21 @@ class TopicSessionCoordinatorTest {
             } else {
                 assertNull(issuer.premium.recheckDiagnostics().owedIntent)
                 assertTrue(d.sink.calls.none { it.startsWith("access:false") })
+                val result = issuer.premium.topicGrantResult()
+                val reapproved = checkNotNull(result.fence)
+                assertNotEquals("재승인이 토큰을 바꾸지 않았다", issued.grant, reapproved.grant)
+                assertEquals(issued.grant, (result.cause as TopicGrantCause.RefusalReapproval).from)
+                assertEquals("재승인 grant 가 세션에 가지 않았다: ${d.sink.calls}", reapproved, d.sink.granted.last())
+                assertEquals("재승인 grant 로 연결하지 않았다", 2, h.wires.size)
+
+                h.refusalSink!!(issued, mapOf(USD to TopicRejectionReason.PREMIUM_REQUIRED))
+                advanceTimeBy(100)
+                assertEquals("옛 grant 의 늦은 거부가 결정됐다", PremiumAccessState.PremiumConfirmed, issuer.premium.state.value.state)
+                assertEquals(reapproved.grant, issuer.premium.accessSnapshot.facts.token)
+                assertTrue(d.sink.calls.none { it.startsWith("access:false") })
             }
             advanceTimeBy(60_000)
-            assertEquals("$answer: 잠긴 세션이 다시 연결했다", 1, h.wires.size)
+            if (answer == "inactive") assertEquals("잠긴 세션이 다시 연결했다", 1, h.wires.size)
         }
         backgroundScope.cancel()
     }
@@ -7470,6 +7484,7 @@ class TopicSessionCoordinatorTest {
             }
             val view = issuer.premium.rejectionView(issued.grant)
             val revision = issuer.premium.accessSnapshot.revision
+            val granted = d.sink.granted.size
             val pulls = counting.pulls
             val calls = d.sink.calls.size
             val bootstraps = h.bootstrapCalls.size
@@ -7506,7 +7521,12 @@ class TopicSessionCoordinatorTest {
             assertNull(issuer.premium.recheckDiagnostics().owedIntent)
             advanceTimeBy(60_000)
             assertEquals(1, fetches)
-            assertEquals(1, h.wires.size)
+            // The approval re-approves the latched grant (L-4e E4b): the session moves to the new token, never back to the old one.
+            val reapproved = checkNotNull(issuer.premium.topicGrantResult().fence)
+            assertNotEquals(issued.grant, reapproved.grant)
+            val handed = d.sink.granted.drop(granted)
+            assertEquals(reapproved, handed.last())
+            assertTrue("재승인 뒤 옛 grant 로 돌아갔다: $handed", handed.drop(handed.indexOf(reapproved)).all { it == reapproved })
         }
         backgroundScope.cancel()
     }
