@@ -1,7 +1,11 @@
 package com.jay.fxi.data.remote
 
 import com.jay.fxi.data.auth.AccessOrderSequence
+import com.jay.fxi.data.auth.AuthCredentialRecovery
 import com.jay.fxi.data.auth.AuthFenceStream
+import com.jay.fxi.data.auth.AuthIdentity
+import com.jay.fxi.data.auth.AuthTokenProvider
+import com.jay.fxi.data.auth.AuthTokenSource
 import com.jay.fxi.data.entitlements.PremiumAccessTopicGrantIssuer
 import com.jay.fxi.data.entitlements.TopicGrantDeliverer
 import com.jay.fxi.data.entitlements.TopicGrantIssuer
@@ -56,9 +60,13 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
@@ -212,8 +220,15 @@ class TopicSessionCoordinatorTest {
         /** Every credential read a command made, failed or not. */
         var credentialReads = 0
 
+        /** When set, every credential call goes to it instead of the fakes here: a real token provider (L-4e E6b). Reads are still counted. */
+        var credentialsDelegate: TopicCommandCredentials? = null
+
         val credentials = object : TopicCommandCredentials {
             override suspend fun currentSnapshot(): AuthSnapshot {
+                credentialsDelegate?.let { delegate ->
+                    credentialReads++
+                    return delegate.currentSnapshot()
+                }
                 credentialGate?.await()
                 credentialReads++
                 if (credentialFailures > 0) {
@@ -225,16 +240,19 @@ class TopicSessionCoordinatorTest {
 
             override suspend fun refreshAfterUnauthorized(rejected: AuthSnapshot): AuthSnapshot? {
                 refreshCalls++
+                credentialsDelegate?.let { return it.refreshAfterUnauthorized(rejected) }
                 refreshGate?.await()
                 return refreshed
             }
 
             override suspend fun recordRejected(credential: AuthSnapshot) {
                 rejectionsRecorded += credential
+                credentialsDelegate?.recordRejected(credential)
             }
 
             override suspend fun recordRejectionEvidence(credential: AuthSnapshot) {
                 rejectionEvidence += credential
+                credentialsDelegate?.recordRejectionEvidence(credential)
             }
         }
 
@@ -319,6 +337,9 @@ class TopicSessionCoordinatorTest {
 
         /** Every snapshot the session published, in order. */
         val topicStates = mutableListOf<TopicSubscriptionSnapshot>()
+
+        /** Called with each published snapshot, on the loop's turn and before anything queued after it runs. */
+        var onTopicStatePublished: ((TopicSubscriptionSnapshot) -> Unit)? = null
 
         /**
          * Thrown by the state observer on the **degraded** snapshot, once.
@@ -438,6 +459,7 @@ class TopicSessionCoordinatorTest {
             },
             onTopicState = {
                 topicStates += it
+                onTopicStatePublished?.invoke(it)
                 if (it.topics.values.any { topic -> topic.rejection == TopicRejectionReason.PREMIUM_REQUIRED }) {
                     nextTopicStateFailure?.let { failure ->
                         nextTopicStateFailure = null
@@ -8169,5 +8191,1095 @@ class TopicSessionCoordinatorTest {
         assertEquals("해제가 사다리로 다시 열지 않았다", 2, h.wires.size)
         assertTrue("보류를 명시적 종료로 보냈다: ${d.sink.calls}", d.sink.calls.none { it.startsWith("access:false") })
         h.cleanUp()
+    }
+
+    // ---- credential recovery (L-4e E6b) ----------------------------------------------------------------------------
+
+    /** A recovery of this harness's identity, decided after everything numbered so far: both of its orders are taken now. */
+    private fun Harness.recovery(episode: Long, identity: AuthIdentityFence = fence().identity): AuthCredentialRecovery {
+        val started = orders.next()
+        return AuthCredentialRecovery(identity, episode, started, orders.next())
+    }
+
+    /** A first delivery whose credential could not be prepared three times: an authentication ending, the connection standing. */
+    private suspend fun TestScope.firstDeliveryCredentialEnded(h: Harness) {
+        h.credentialFailures = 3
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(11_000)
+        assertEquals("첫 전달이 준비 실패 세 번으로 끝나지 않았다", 3, h.credentialReads)
+        assertEquals(0, h.requests.size)
+        assertEquals(false, h.wire.cancelled)
+    }
+
+    /**
+     * A renewal whose credential could not be prepared three times, on a fifteen-second lease still ahead of it. Tether spoke before
+     * the acknowledgement, so the first delivery ended there. Returns the lease's absolute deadline.
+     */
+    private suspend fun TestScope.renewalCredentialEnded(h: Harness): Long {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.credentialFailures = 3
+        h.wire.deliver(h.ackWithLease("r1", TETHER, 15))
+        advanceTimeBy(10_500)
+        assertEquals("갱신이 준비 실패 세 번으로 끝나지 않았다", 4, h.credentialReads)
+        assertEquals(1, h.requests.size)
+        return h.acknowledgements.single().acknowledgedAtMillis + 15_000
+    }
+
+    /**
+     * A revalidation D14 asked for, whose credential could not be prepared three times: an authentication ending, and tether taken
+     * back to healthy. With [leaseSeconds], the acknowledgement before it leased tether.
+     */
+    private suspend fun TestScope.revalidationCredentialEnded(h: Harness, leaseSeconds: Long? = null) {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(if (leaseSeconds == null) h.ack("r1", active = listOf(TETHER)) else h.ackWithLease("r1", TETHER, leaseSeconds))
+        advanceTimeBy(1)
+        h.credentialFailures = 3
+        advanceTimeBy(56_000)
+        assertEquals("재확인이 준비 실패 세 번으로 끝나지 않았다", 4, h.credentialReads)
+        assertEquals(1, h.requests.size)
+        assertEquals(TopicDeliveryState.HEALTHY, h.store.snapshot.stateFor(TETHER).deliveryState)
+    }
+
+    /**
+     * The E6 fixture recovered: a recovery of the same identity decided after the ending reopens the first delivery — once per
+     * episode, on a budget of its own — without touching the connection, the ladder or the bootstrap plan.
+     */
+    @Test
+    fun `a recovery reopens a first delivery its credential ended, once, on a budget of its own`() = runTest {
+        val h = Harness(this)
+        firstDeliveryCredentialEnded(h)
+        val connects = h.connectCalls
+        val bootstraps = h.bootstrapCalls.size
+
+        h.credentialFailures = 3
+        val recovery = h.recovery(episode = 1)
+        h.coordinator.onCredentialRecovered(recovery)
+        advanceTimeBy(11_000)
+        assertEquals("회복이 첫 전달을 새 예산 세 번으로 열지 않았다", 6, h.credentialReads)
+        assertEquals(0, h.requests.size)
+
+        // The same episode again, however late or newly numbered, is spent.
+        h.coordinator.onCredentialRecovered(recovery)
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(11_000)
+        assertEquals("같은 회복 구간이 두 번 열었다", 6, h.credentialReads)
+
+        // The reopened command ended on authentication too, and the next episode reopens it.
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 2))
+        advanceTimeBy(1)
+        assertEquals(7, h.credentialReads)
+        assertEquals("거부 없는 desired 전체를 묻지 않았다", setOf(TETHER, USD), h.requests.single().topics.toSet())
+        assertEquals(connects, h.connectCalls)
+        assertEquals(1, h.wires.size)
+        assertEquals(bootstraps, h.bootstrapCalls.size)
+        h.cleanUp()
+    }
+
+    /** Refused after its one replay, the credential reads as failed: a recovery reopens without taking that back, and only the answer does. */
+    @Test
+    fun `a first delivery refused after its replay is reopened and only its acknowledgement resolves it`() = runTest {
+        val h = Harness(this)
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals(TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+        assertEquals(2, h.requests.size)
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("replay 거부 뒤 회복이 첫 전달을 열지 않았다", 3, h.requests.size)
+        assertEquals(setOf(TETHER, USD), h.requests[2].topics.toSet())
+        assertEquals("회복·명령 시작이 인증 실패를 풀었다", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+
+        h.wire.deliver(h.ack("r3", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertEquals(TopicAuthResolution.RESOLVED, h.store.snapshot.authResolution)
+        h.cleanUp()
+    }
+
+    /**
+     * A recovery can reach the session before the ending it answers — decided after that ending on the provider's thread, queued
+     * first. It is kept, and acted on only once that command has left the connection.
+     */
+    @Test
+    fun `a recovery that arrives before the ending it answers waits for that command to leave`() = runTest {
+        val h = Harness(this)
+        h.credentialFailures = 3
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(6_000)
+        assertEquals(2, h.credentialReads)
+
+        // Nothing else takes this harness's orders: the ending will take 1, and this recovery is numbered after it.
+        h.coordinator.onCredentialRecovered(AuthCredentialRecovery(fence().identity, 1L, 2L, 3L))
+        // An older recovery arriving after it does not take its place.
+        h.coordinator.onCredentialRecovered(AuthCredentialRecovery(fence().identity, 1L, 0L, 0L))
+        advanceTimeBy(1)
+        assertEquals("끝나기 전 명령에 회복이 무엇을 열었다", 2, h.credentialReads)
+
+        advanceTimeBy(5_000)
+        assertEquals("먼저 온 회복을 버렸다", 4, h.credentialReads)
+        assertEquals(1, h.requests.size)
+        assertEquals("인증 종료가 순서 1 을 쓰지 않았다", 2L, h.orders.next())
+        h.cleanUp()
+    }
+
+    /** A recovery decided at the ending's own order is not after it, and reopens nothing; one after it does. */
+    @Test
+    fun `a recovery decided at an ending's order does not reopen it`() = runTest {
+        val h = Harness(this)
+        firstDeliveryCredentialEnded(h)
+        // The ending took order 1.
+        h.coordinator.onCredentialRecovered(AuthCredentialRecovery(fence().identity, 1L, 1L, 1L))
+        advanceTimeBy(11_000)
+        assertEquals("종료와 같은 순서의 회복이 열었다", 3, h.credentialReads)
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 2))
+        advanceTimeBy(1)
+        assertEquals(1, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** Another identity's recovery is not this connection's; one read after the account moved retires the grant instead. */
+    @Test
+    fun `a recovery for another identity or after the identity moved reopens nothing`() = runTest {
+        val other = Harness(this)
+        firstDeliveryCredentialEnded(other)
+        other.coordinator.onCredentialRecovered(other.recovery(episode = 1, identity = AuthIdentityFence("u2", 1L)))
+        other.coordinator.onCredentialRecovered(other.recovery(episode = 1, identity = AuthIdentityFence("u1", 2L)))
+        advanceTimeBy(11_000)
+        assertEquals("다른 신원의 회복이 열었다", 3, other.credentialReads)
+        assertEquals(false, other.wires.first().cancelled)
+
+        val moved = Harness(this)
+        firstDeliveryCredentialEnded(moved)
+        moved.liveFence = AuthIdentityFence("u1", 2L)
+        moved.coordinator.onCredentialRecovered(moved.recovery(episode = 1))
+        advanceTimeBy(11_000)
+        assertEquals("신원이 옮긴 뒤의 회복이 열었다", 3, moved.credentialReads)
+        assertTrue("신원 이동을 은퇴로 처리하지 않았다", moved.wires.first().cancelled)
+
+        // With nothing ended on its connection, the recovery is still read against the account, as every input for a grant is.
+        val idle = Harness(this)
+        silenceReady(idle)
+        idle.liveFence = AuthIdentityFence("u1", 2L)
+        idle.coordinator.onCredentialRecovered(idle.recovery(episode = 1, identity = fence().identity))
+        advanceTimeBy(1)
+        assertTrue("기록 없는 회복이 신원 이동을 보지 않았다", idle.wires.first().cancelled)
+        backgroundScope.cancel()
+    }
+
+    /**
+     * The account moved while a reopen waited for the lane, and nothing on the way read it: the renewal holding the lane spent its
+     * budget on unanswered sends. When the lane frees, the reopen reads the account, retires the grant and reopens nothing.
+     */
+    @Test
+    fun `an identity move while a reopen waits retires the grant instead of reopening`() = runTest {
+        val h = Harness(this)
+        val gate = revalidationEndedBehindHeldRenewal(h)
+        h.liveFence = AuthIdentityFence("u1", 2L)
+        gate.complete(Unit)
+        advanceTimeBy(80_000)
+        assertEquals("갱신이 응답 없는 세 번으로 끝나지 않았다", 4, h.requests.size)
+        assertTrue("대기하던 재개가 신원 이동을 보지 않았다", h.wires.first().cancelled)
+        assertEquals(listOf(TETHER), h.requests.last().topics)
+        h.cleanUp()
+    }
+
+    /**
+     * An acknowledgement that no longer confirms tether settles a recorded revalidation for good: a later one confirming it again —
+     * a subscription the server gave back, not a delivery — does not revive it for a recovery.
+     */
+    @Test
+    fun `an acknowledgement that drops tether settles a recorded revalidation for good`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        h.wire.deliver(h.fxFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "T1", 300L), Triple(USD, "U1", 300L)))
+        advanceTimeBy(1)
+        h.credentialFailures = 3
+        advanceTimeBy(56_000)
+        assertEquals("재확인이 준비 실패 세 번으로 끝나지 않았다", 4, h.credentialReads)
+
+        advanceTimeBy(64_100)
+        assertEquals(setOf(TETHER, USD), h.requests[1].topics.toSet())
+        h.wire.deliver(h.ackWithLeases("r2", Triple(USD, "U1", 300L)))
+        advanceTimeBy(1)
+        assertEquals(false, h.store.snapshot.stateFor(TETHER).confirmed)
+
+        advanceTimeBy(120_000)
+        assertEquals(listOf(USD), h.requests[2].topics)
+        h.wire.deliver(h.ackWithLeases("r3", Triple(USD, "U2", 300L), Triple(TETHER, "T2", 300L)))
+        advanceTimeBy(1)
+        assertEquals(true, h.store.snapshot.stateFor(TETHER).confirmed)
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("확인이 떨어졌던 재확인을 회복이 되살렸다", 3, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A combined command a recovery reopened is the replacement for both obligations: when it ends on authentication too, a recovery
+     * decided before that ending reopens neither of the originals. One decided after it reopens the combined command again.
+     */
+    @Test
+    fun `a late recovery decided before a combined replacement ended reopens neither original`() = runTest {
+        val h = Harness(this)
+        revalidationCredentialEnded(h, leaseSeconds = 300)
+        h.credentialFailures = 3
+        advanceTimeBy(75_000)
+        assertEquals(7, h.credentialReads)
+
+        h.credentialFailures = 3
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals(8, h.credentialReads)
+        val late = h.recovery(episode = 2)
+        advanceTimeBy(11_000)
+        assertEquals(10, h.credentialReads)
+
+        h.coordinator.onCredentialRecovered(late)
+        advanceTimeBy(1)
+        assertEquals("대체된 원래 종료를 옛 회복이 열었다", 1, h.requests.size)
+        assertEquals(10, h.credentialReads)
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 3))
+        advanceTimeBy(1)
+        assertEquals(2, h.requests.size)
+        assertEquals(TopicDeliveryState.REVALIDATING, h.store.snapshot.stateFor(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    /**
+     * Not on the connection's use once it is no longer admitted — even when a new use could start, as after a hold that came and went —
+     * and not past a lease, whose deadline ends the connection instead.
+     */
+    @Test
+    fun `a recovery does not reopen on a withheld use or past a lease`() = runTest {
+        val withheld = Harness(this)
+        val access = withheld.publishedAccess()
+        firstDeliveryCredentialEnded(withheld)
+        access.flicker()
+        withheld.coordinator.onCredentialRecovered(withheld.recovery(episode = 1))
+        advanceTimeBy(11_000)
+        assertEquals("보류된 사용 위에서 다시 열었다", 3, withheld.credentialReads)
+        assertEquals(0, withheld.requests.size)
+
+        val lapsed = Harness(this)
+        val deadline = renewalCredentialEnded(lapsed)
+        lapsed.clockAt(deadline)
+        lapsed.coordinator.onCredentialRecovered(lapsed.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("만료된 lease 위에서 갱신을 다시 열었다", 1, lapsed.requests.size)
+        assertTrue("만료를 집행하지 않았다", lapsed.wires.first().cancelled)
+        backgroundScope.cancel()
+    }
+
+    /** A budget spent on refused sends is not an authentication ending, and a recovery does not reopen it. */
+    @Test
+    fun `a command whose budget went on refused sends is not reopened by a recovery`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        h.wire.sendSucceeds = false
+        advanceTimeBy(11_000)
+        assertEquals(3, h.requests.size)
+        h.wire.sendSucceeds = true
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("인증과 무관한 종료를 회복이 다시 열었다", 3, h.requests.size)
+        assertEquals(3, h.credentialReads)
+        h.cleanUp()
+    }
+
+    /** A renewal its credential ended is reopened as a renewal before the lease runs out, and its answer's lease replaces the deadline. */
+    @Test
+    fun `a recovery reopens a renewal its credential ended and the new lease replaces the old deadline`() = runTest {
+        val h = Harness(this)
+        val deadline = renewalCredentialEnded(h)
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals(2, h.requests.size)
+        assertEquals(listOf(TETHER), h.requests[1].topics)
+
+        h.sleeps.clear()
+        h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "lease-2", 900L)))
+        advanceTimeBy(1)
+        assertTrue("다시 연 갱신이 배달 마감을 기다렸다: ${h.sleeps}", h.sleeps.none { it >= 40.seconds && it <= 50.seconds })
+        advanceTimeBy(deadline - h.scheduler.currentTime + 1_000)
+        assertEquals("새 lease 가 옛 마감을 대신하지 않았다", false, h.wire.cancelled)
+        assertEquals(2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** Taken back to healthy, a revalidation is marked suspect and asked again as a revalidation, whose silence still degrades. */
+    @Test
+    fun `a recovery reopens a revalidation its credential ended from healthy and it can still degrade`() = runTest {
+        val h = Harness(this)
+        revalidationCredentialEnded(h)
+        val connects = h.connectCalls
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals(listOf(TETHER), h.requests[1].topics)
+        assertEquals(TopicDeliveryState.REVALIDATING, h.store.snapshot.stateFor(TETHER).deliveryState)
+        assertEquals(1, h.store.snapshot.stateFor(TETHER).revalidationAttempt)
+
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(46_000)
+        assertEquals("다시 연 재확인의 침묵이 degrade 되지 않았다", TopicDeliveryState.DEGRADED, h.store.snapshot.stateFor(TETHER).deliveryState)
+        assertEquals(2, h.requests.size)
+        assertEquals(connects, h.connectCalls)
+        h.cleanUp()
+    }
+
+    /** A revalidation refused after its replay, set up to the point the recovery arrives: failed, and tether taken back to healthy. */
+    private suspend fun TestScope.revalidationReplayRefused(h: Harness) {
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        silenceReady(h)
+        advanceTimeBy(45_000)
+        assertEquals(2, h.requests.size)
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        h.wire.deliver(h.subscriptionError("r3", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals(3, h.requests.size)
+        assertEquals(TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+        assertEquals(TopicDeliveryState.HEALTHY, h.store.snapshot.stateFor(TETHER).deliveryState)
+    }
+
+    /**
+     * Refused after its replay, a revalidation is reopened past the start guard a failed credential puts on D14 — that guard stays for
+     * every other path — and a refusal the server gives before identity does not resolve it; an accepted answer does.
+     */
+    @Test
+    fun `a revalidation refused after its replay is reopened and only an identity-proving answer resolves it`() = runTest {
+        val disabled = Harness(this)
+        revalidationReplayRefused(disabled)
+        disabled.coordinator.onCredentialRecovered(disabled.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("실패한 인증에서 재확인을 다시 열지 않았다", 4, disabled.requests.size)
+        assertEquals(listOf(TETHER), disabled.requests[3].topics)
+        assertEquals(TopicAuthResolution.FAILED, disabled.store.snapshot.authResolution)
+        disabled.wires.first().deliver(disabled.ack("r4", active = emptyList(), rejections = mapOf(TETHER to "topics_disabled")))
+        advanceTimeBy(1)
+        assertEquals("topics_disabled 만의 답이 인증 실패를 풀었다", TopicAuthResolution.FAILED, disabled.store.snapshot.authResolution)
+
+        val proven = Harness(this)
+        revalidationReplayRefused(proven)
+        proven.coordinator.onCredentialRecovered(proven.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals(4, proven.requests.size)
+        proven.wires.first().deliver(proven.ack("r4", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertEquals(TopicAuthResolution.RESOLVED, proven.store.snapshot.authResolution)
+        backgroundScope.cancel()
+    }
+
+    /**
+     * A revalidation and a renewal ended on authentication one after the other, and one recovery reopens both as a single command:
+     * one subscribe, one budget of three, the answer's lease applied and the revalidation's silence still degrading.
+     */
+    @Test
+    fun `a recovery reopens a renewal and a revalidation as one command on one budget`() = runTest {
+        val h = Harness(this)
+        revalidationCredentialEnded(h, leaseSeconds = 300)
+        h.credentialFailures = 3
+        advanceTimeBy(75_000)
+        assertEquals("갱신이 준비 실패 세 번으로 끝나지 않았다", 7, h.credentialReads)
+        assertEquals(1, h.requests.size)
+
+        h.credentialFailures = 3
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(11_000)
+        assertEquals("합친 명령이 예산 세 번이 아니었다", 10, h.credentialReads)
+        assertEquals(1, h.requests.size)
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 2))
+        advanceTimeBy(1)
+        assertEquals("두 책임을 한 subscribe 로 묻지 않았다", 2, h.requests.size)
+        assertEquals(listOf(TETHER), h.requests[1].topics)
+        assertEquals(TopicDeliveryState.REVALIDATING, h.store.snapshot.stateFor(TETHER).deliveryState)
+
+        h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "lease-2", 900L)))
+        advanceTimeBy(46_000)
+        assertEquals(TopicDeliveryState.DEGRADED, h.store.snapshot.stateFor(TETHER).deliveryState)
+        advanceTimeBy(310_000 - h.scheduler.currentTime)
+        assertEquals("새 lease 가 옛 마감을 대신하지 않았다", false, h.wire.cancelled)
+        assertEquals(2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** The revalidation is answered by a frame before the recovery, so the recovery reopens only the renewal still owed. */
+    @Test
+    fun `a revalidation settled by a receipt leaves a recovery only the renewal`() = runTest {
+        val h = Harness(this)
+        revalidationCredentialEnded(h, leaseSeconds = 300)
+        h.credentialFailures = 3
+        advanceTimeBy(75_000)
+        assertEquals(7, h.credentialReads)
+
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        assertEquals(2L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals(listOf(TETHER), h.requests[1].topics)
+        assertEquals("수신으로 해소된 재확인을 다시 열었다", TopicDeliveryState.HEALTHY, h.store.snapshot.stateFor(TETHER).deliveryState)
+        assertEquals(0, h.store.snapshot.stateFor(TETHER).revalidationAttempt)
+
+        h.sleeps.clear()
+        h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "lease-2", 900L)))
+        advanceTimeBy(1)
+        assertTrue("갱신만 남았는데 배달 마감을 기다렸다: ${h.sleeps}", h.sleeps.none { it >= 40.seconds && it <= 50.seconds })
+        h.cleanUp()
+    }
+
+    /**
+     * A reopened command is a replacement: when it too ends on authentication, a recovery decided before that later ending — delivered
+     * late, with an episode not yet spent — does not reopen it. One decided after it does.
+     */
+    @Test
+    fun `a late recovery decided before a replacement ended does not reopen the replacement`() = runTest {
+        val h = Harness(this)
+        firstDeliveryCredentialEnded(h)
+        h.credentialFailures = 3
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals(4, h.credentialReads)
+        // Decided now, while the replacement is still preparing.
+        val late = h.recovery(episode = 2)
+        advanceTimeBy(11_000)
+        assertEquals(6, h.credentialReads)
+
+        h.coordinator.onCredentialRecovered(late)
+        advanceTimeBy(11_000)
+        assertEquals("대체 명령의 더 늦은 종료를 옛 회복이 열었다", 6, h.credentialReads)
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 3))
+        advanceTimeBy(1)
+        assertEquals(1, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A frame received while a revalidation prepares its last credential answers it, even though the command then ends on
+     * authentication without asking: that ending is judged from the reading its registration took, so nothing is left to reopen.
+     */
+    @Test
+    fun `a receipt during a revalidation's last failed preparation leaves nothing to reopen`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+        h.credentialFailures = 3
+        advanceTimeBy(52_000)
+        assertEquals(3, h.credentialReads)
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        advanceTimeBy(4_000)
+
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals(4, h.credentialReads)
+        assertEquals(1, h.requests.size)
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("등록 뒤 수신으로 답한 재확인을 회복이 다시 열었다", 1, h.requests.size)
+        assertEquals(4, h.credentialReads)
+        h.cleanUp()
+    }
+
+    /**
+     * A receipt recorded between a revalidation's registration and its command starting answers it: the command is judged from the
+     * reading the registration took, and sends nothing.
+     */
+    @Test
+    fun `a receipt between a revalidation's registration and its start answers it`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+        h.onTopicStatePublished = { snapshot ->
+            if (snapshot.stateFor(TETHER).deliveryState == TopicDeliveryState.REVALIDATING) {
+                h.onTopicStatePublished = null
+                h.store.recordFrame(TETHER)
+            }
+        }
+        advanceTimeBy(46_000)
+        assertNull("재확인 등록을 게시하지 않았다", h.onTopicStatePublished)
+        assertEquals("등록과 시작 사이의 수신을 흡수하고 물었다", 1, h.requests.size)
+        assertEquals(TopicDeliveryState.HEALTHY, h.store.snapshot.stateFor(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    /** A revalidation that may not start yet is not reopened, and the recovery is not spent on it: the same episode reopens it later. */
+    @Test
+    fun `a revalidation that cannot start keeps the recovery for when it can`() = runTest {
+        val h = Harness(this)
+        revalidationCredentialEnded(h)
+        h.store.markSuspect(TETHER)
+        assertTrue(h.store.beginRevalidation(TETHER))
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("시작할 수 없는 재확인을 등록했다", 1, h.requests.size)
+
+        h.store.abortRevalidation(TETHER)
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("준비 실패가 회복 구간을 소비했다", 2, h.requests.size)
+        assertEquals(listOf(TETHER), h.requests[1].topics)
+        h.cleanUp()
+    }
+
+    /**
+     * A revalidation's ending, then a renewal holding the lane in its token wait when the recovery arrives. Returns the gate that holds
+     * the renewal; the recovery has been handled and has reopened nothing.
+     */
+    private suspend fun TestScope.revalidationEndedBehindHeldRenewal(h: Harness): CompletableDeferred<Unit> {
+        revalidationCredentialEnded(h, leaseSeconds = 300)
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        advanceTimeBy(64_100)
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("lane 을 쥔 갱신 앞에서 재개했다", 1, h.requests.size)
+        assertEquals(4, h.credentialReads)
+        return gate
+    }
+
+    /**
+     * A lane release is handled before an offline input the acknowledgement's observer posts after it: the waiting reopen registers,
+     * and its revalidation is published, before the connection ends. (Found by Codex review: the battery had filed the release's wake
+     * and ControlLaneFree's reconsideration as equivalent to CommandDone's.)
+     */
+    @Test
+    fun `a recovery lane release precedes an offline input posted by the acknowledgement observer`() = runTest {
+        val h = Harness(this)
+        val gate = revalidationEndedBehindHeldRenewal(h)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals(2, h.requests.size)
+
+        val wire = h.wire
+        val published = h.topicStates.size
+        h.onTopicStatePublished = { snapshot ->
+            if (snapshot.controlState == TopicControlState.ACKNOWLEDGED) {
+                h.onTopicStatePublished = null
+                h.coordinator.setOnline(false)
+            }
+        }
+
+        wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "lease-2", 900L)))
+        advanceTimeBy(1)
+
+        assertNull("ACK 관찰자가 실행되지 않았다", h.onTopicStatePublished)
+        assertTrue("offline 입력이 연결을 끝내지 않았다", wire.cancelled)
+        assertTrue(
+            "먼저 게시된 lane 해제의 재확인이 offline 전에 발행되지 않았다",
+            h.topicStates.drop(published).any {
+                it.stateFor(TETHER).deliveryState == TopicDeliveryState.REVALIDATING
+            }
+        )
+        h.cleanUp()
+    }
+
+    /** A reopen that waited for the lane runs once the lane is free, and asks everything again when it does. */
+    @Test
+    fun `a reopen that waited for the lane runs when the lane is free`() = runTest {
+        val h = Harness(this)
+        val gate = revalidationEndedBehindHeldRenewal(h)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals(2, h.requests.size)
+        assertEquals(listOf(TETHER), h.requests[1].topics)
+
+        h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "lease-2", 900L)))
+        advanceTimeBy(1)
+        assertEquals("lane 이 풀린 뒤 재확인을 다시 열지 않았다", 3, h.requests.size)
+        assertEquals(listOf(TETHER), h.requests[2].topics)
+        assertEquals(TopicDeliveryState.REVALIDATING, h.store.snapshot.stateFor(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    /**
+     * The renewal holding the lane ends on authentication too, after the recovery: its CommandDone frees the lane and reopens the
+     * revalidation once, while the ControlLaneFree that release posted finds nothing more. The renewal's own ending stays for a later
+     * episode, which waits behind the reopened revalidation. Returns the wire.
+     */
+    private suspend fun TestScope.renewalEndedBehindReopenedRevalidation(h: Harness): Wire {
+        val gate = revalidationEndedBehindHeldRenewal(h)
+        h.credentialFailures = 3
+        gate.complete(Unit)
+        advanceTimeBy(11_000)
+        assertEquals(8, h.credentialReads)
+        assertEquals("미뤘던 재개가 한 번이 아니었다", 2, h.requests.size)
+        assertEquals(listOf(TETHER), h.requests[1].topics)
+        assertEquals(TopicDeliveryState.REVALIDATING, h.store.snapshot.stateFor(TETHER).deliveryState)
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 2))
+        advanceTimeBy(1)
+        assertEquals("응답 전 재확인 뒤에서 갱신을 다시 열었다", 2, h.requests.size)
+        return h.wire
+    }
+
+    /** The lane's acknowledgement carries no leases: nothing is left to renew, and the waiting renewal is not reopened. */
+    @Test
+    fun `an acknowledgement with no leases settles a renewal waiting behind it`() = runTest {
+        val h = Harness(this)
+        val wire = renewalEndedBehindReopenedRevalidation(h)
+        wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertEquals("빈 lease 목록 뒤에 갱신을 다시 열었다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** The lane's acknowledgement reports the same lease id: the renewal is settled, and that lease keeps its absolute deadline. */
+    @Test
+    fun `an acknowledgement with the same lease id settles a renewal waiting behind it and keeps the deadline`() = runTest {
+        val h = Harness(this)
+        val wire = renewalEndedBehindReopenedRevalidation(h)
+        wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "lease-1", 900L)))
+        advanceTimeBy(1)
+        assertEquals("같은 lease 재보고 뒤에 갱신을 다시 열었다", 2, h.requests.size)
+        advanceTimeBy(300_200 - h.scheduler.currentTime)
+        assertTrue("같은 lease id 가 절대 마감을 늘렸다", wire.cancelled)
+        assertEquals(2, h.requests.size)
+        backgroundScope.cancel()
+    }
+
+    /** The lane's acknowledgement grants a new lease: the renewal is settled, and the new schedule replaces the old deadline. */
+    @Test
+    fun `an acknowledgement with a new lease settles a renewal waiting behind it`() = runTest {
+        val h = Harness(this)
+        val wire = renewalEndedBehindReopenedRevalidation(h)
+        wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "lease-2", 900L)))
+        advanceTimeBy(1)
+        assertEquals("새 lease 뒤에 갱신을 다시 열었다", 2, h.requests.size)
+        advanceTimeBy(300_200 - h.scheduler.currentTime)
+        assertEquals(false, wire.cancelled)
+        h.cleanUp()
+    }
+
+    /** Access withheld while the reopen waits: the lane holder's send is refused, the connection ends, and nothing is reopened. */
+    @Test
+    fun `a reopen waiting for the lane does not run once the use is withheld`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val gate = revalidationEndedBehindHeldRenewal(h)
+        access.hold()
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        val first = h.wires.first()
+        assertTrue("보류된 사용의 연결이 남았다", first.cancelled)
+        assertEquals("보류 뒤에 재개를 보냈다", listOf("encoded-r1"), first.sent.filter { it.startsWith("encoded-") })
+        advanceTimeBy(60_000)
+        assertEquals(listOf("encoded-r1"), h.wires.flatMap { it.sent }.filter { it.startsWith("encoded-") })
+        h.cleanUp()
+    }
+
+    /** A different grant while the reopen waits is a different session: the old connection's endings go with it. */
+    @Test
+    fun `a reopen waiting for the lane does not run on the next grant's connection`() = runTest {
+        val h = Harness(this)
+        val gate = revalidationEndedBehindHeldRenewal(h)
+        h.setAccess(true, fence(grant = 2))
+        gate.complete(Unit)
+        advanceTimeBy(100)
+        assertTrue(h.wires.first().cancelled)
+        assertEquals(2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("새 grant 의 첫 전달이 아니었다", setOf(TETHER, USD), h.requests.last().topics.toSet())
+        // Inside the new first delivery's acknowledgement deadline, so any other subscribe here is a reopen.
+        advanceTimeBy(15_000)
+        assertEquals("옛 연결의 종료를 새 연결에서 다시 열었다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A reopened first delivery is the first-delivery effort again: a window running out while it waits for its credential is held and
+     * spent, so nothing asks beside it, and only its own silence hands over the one revalidation.
+     */
+    @Test
+    fun `a reopened first delivery holds the silence that runs out while it is under way`() = runTest {
+        val h = Harness(this)
+        h.bootstrapOutcome = { _, topic ->
+            if (topic == TETHER) h.delivered(h.tetherFrame(1390.0)) else TopicSnapshotOutcome.Unreachable(java.io.IOException("x"))
+        }
+        firstDeliveryCredentialEnded(h)
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(40_000)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals(1, h.requests.size)
+
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertEquals("다시 연 첫 전달이 진행 중인데 침묵에 재확인을 보냈다", 1, h.requests.size)
+        advanceTimeBy(46_000)
+        assertEquals("첫 전달의 침묵이 재확인을 넘기지 않았다", 2, h.requests.size)
+        assertEquals(listOf(TETHER), h.requests[1].topics)
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(60_000)
+        assertEquals("쓴 창으로 다시 물었다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A refusal that outlives its connection — `krx_entitlement_required` is kept across a reconnection and latches nothing — stays out
+     * of a recovered first delivery. (Found by Codex review: the battery had filed this filter as equivalent.)
+     */
+    @Test
+    fun `a recovered first delivery excludes a refusal retained from the previous connection`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(
+            h.ack(
+                "r1",
+                active = listOf(TETHER),
+                rejections = mapOf(USD to "krx_entitlement_required")
+            )
+        )
+        advanceTimeBy(1)
+        assertEquals(false, h.wire.cancelled)
+
+        h.credentialFailures = 3
+        h.wire.drop()
+        advanceTimeBy(2_000)
+        assertEquals(2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(11_000)
+        assertEquals(4, h.credentialReads)
+        assertEquals(1, h.requests.size)
+        assertEquals(
+            TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED,
+            h.store.snapshot.stateFor(USD).rejection
+        )
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals(2, h.requests.size)
+        assertEquals(listOf(TETHER), h.requests.last().topics)
+        h.cleanUp()
+    }
+
+    /**
+     * A recovery with nothing left owed changes nothing on the connection: a revalidation answered by a receipt does not carry the
+     * recovery on to the reopen's lease check, which would end the connection before its own expiry timer. (Found by Codex review.)
+     */
+    @Test
+    fun `a recovery whose revalidation was received does not reach the reopen expiry check`() = runTest {
+        val h = Harness(this)
+        revalidationCredentialEnded(h, leaseSeconds = 300)
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        assertEquals(2L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+
+        val wire = h.wire
+        val deadline = h.acknowledgements.single().acknowledgedAtMillis + 300_000
+        // Only the monotonic clock moves; the ordinary expiry timer has not woken.
+        h.clockAt(deadline)
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+
+        assertEquals(1, h.requests.size)
+        assertEquals("해소된 기록으로 재개 경로의 만료 검사를 실행했다", false, wire.cancelled)
+        h.cleanUp()
+    }
+
+    /**
+     * A combined command whose revalidation is answered by a frame during its last failed credential preparation ends owing only the
+     * renewal: the next recovery reopens a renewal, and tether is not asked about again.
+     */
+    @Test
+    fun `a combined command answered during its last failed preparation leaves only the renewal`() = runTest {
+        val h = Harness(this)
+        revalidationCredentialEnded(h, leaseSeconds = 300)
+        h.credentialFailures = 3
+        advanceTimeBy(75_000)
+        assertEquals(7, h.credentialReads)
+
+        h.credentialFailures = 3
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(7_000)
+        assertEquals(9, h.credentialReads)
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        advanceTimeBy(4_000)
+        assertEquals(TopicDeliveryState.REVALIDATING, h.store.snapshot.stateFor(TETHER).deliveryState)
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals(10, h.credentialReads)
+        assertEquals(1, h.requests.size)
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 2))
+        advanceTimeBy(1)
+        assertEquals(2, h.requests.size)
+        assertEquals(listOf(TETHER), h.requests[1].topics)
+        assertEquals("수신으로 답한 재확인을 다시 열었다", TopicDeliveryState.HEALTHY, h.store.snapshot.stateFor(TETHER).deliveryState)
+        h.sleeps.clear()
+        h.wire.deliver(h.ackWithLeases("r2", Triple(TETHER, "lease-2", 900L)))
+        advanceTimeBy(1)
+        assertTrue("갱신만 남았는데 배달 마감을 기다렸다: ${h.sleeps}", h.sleeps.none { it >= 40.seconds && it <= 50.seconds })
+        h.cleanUp()
+    }
+
+    /** A spent episode stays spent for the session: a new connection's authentication ending is not reopened by it again. */
+    @Test
+    fun `a spent episode stays spent across a reconnection`() = runTest {
+        val h = Harness(this)
+        firstDeliveryCredentialEnded(h)
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals(1, h.requests.size)
+
+        h.credentialFailures = 3
+        h.wire.drop()
+        advanceTimeBy(2_000)
+        assertEquals(2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(11_000)
+        assertEquals("새 연결의 첫 전달이 준비 실패 세 번으로 끝나지 않았다", 7, h.credentialReads)
+
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("소비한 회복 구간이 새 연결에서 다시 열었다", 1, h.requests.size)
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 2))
+        advanceTimeBy(1)
+        assertEquals(2, h.requests.size)
+        h.cleanUp()
+    }
+
+    // ---- credential recovery, with the real token provider (L-4e E6b) ---------------------------------------------------------------
+
+    /** Firebase as the provider sees it: one identity, a token the test sets, and a gate a fetch can be held on. */
+    private class ProviderTokens : AuthTokenSource {
+        var current = "token-1"
+
+        /** What a forced refresh hands out, or null to keep [current]. */
+        var forced: String? = null
+        var gate: CompletableDeferred<Unit>? = null
+
+        override fun currentIdentity() = AuthIdentity("u1", 1L)
+
+        override suspend fun fetchToken(identity: AuthIdentity, forceRefresh: Boolean): String {
+            gate?.await()
+            if (forceRefresh) forced?.let { current = it }
+            return current
+        }
+    }
+
+    /**
+     * The session's credentials are a real [AuthTokenProvider] sharing the session's order, and its recoveries go to [onRecovery] —
+     * straight to the session unless a test holds them back.
+     */
+    private fun TestScope.realProvider(
+        h: Harness,
+        tokens: ProviderTokens,
+        processJob: Job,
+        handOverGate: () -> CompletableDeferred<Unit>? = { null },
+        onRecovery: (AuthCredentialRecovery) -> Unit = { h.coordinator.onCredentialRecovered(it) }
+    ): AuthTokenProvider {
+        val provider = AuthTokenProvider(tokens, CoroutineScope(processJob + StandardTestDispatcher(testScheduler)), h.orders)
+        h.credentialsDelegate = object : TopicCommandCredentials {
+            override suspend fun currentSnapshot() = provider.currentSnapshot()
+            override suspend fun refreshAfterUnauthorized(rejected: AuthSnapshot) = provider.refreshAfterUnauthorized(rejected)
+            override suspend fun recordRejected(credential: AuthSnapshot) {
+                provider.recordRejected(credential)
+                handOverGate()?.await()
+            }
+            override suspend fun recordRejectionEvidence(credential: AuthSnapshot) {
+                provider.recordRejectionEvidence(credential)
+                handOverGate()?.await()
+            }
+        }
+        provider.observe(onRecovery)
+        return provider
+    }
+
+    /** Opens a first delivery refused after its replay: token-1 refused, refreshed to token-2, token-2 refused and handed over. */
+    private suspend fun TestScope.firstDeliveryReplayRefusedThroughProvider(h: Harness, tokens: ProviderTokens) {
+        tokens.forced = "token-2"
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("token-1", h.requests.single().idToken)
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("token-2", h.requests[1].idToken)
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+    }
+
+    /**
+     * End to end: a topic replay refused is handed to the provider, another consumer's acquisition recovers the identity, and the
+     * session reopens the first delivery once with the new credential. Acquiring again recovers nothing more.
+     */
+    @Test
+    fun `a real provider's recovery after a topic replay refusal reopens the first delivery once`() = runTest {
+        val processJob = SupervisorJob()
+        try {
+            val h = Harness(this)
+            val tokens = ProviderTokens()
+            val provider = realProvider(h, tokens, processJob)
+            firstDeliveryReplayRefusedThroughProvider(h, tokens)
+            assertEquals(listOf(AuthSnapshot("u1", 1L, "token-2")), h.rejectionsRecorded)
+            assertEquals(TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+            assertEquals(2, h.requests.size)
+
+            tokens.current = "token-3"
+            assertEquals("token-3", provider.currentSnapshot().token)
+            advanceTimeBy(1)
+            assertEquals("다른 획득의 회복이 첫 전달을 열지 않았다", 3, h.requests.size)
+            assertEquals("token-3", h.requests[2].idToken)
+
+            assertEquals("token-3", provider.currentSnapshot().token)
+            advanceTimeBy(11_000)
+            assertEquals("회복 없는 재획득이 다시 열었다", 3, h.requests.size)
+            h.cleanUp()
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    /**
+     * End to end, the evidence path: a read credential refused with no attempt left is handed over without spending its refresh, and
+     * acquiring that same credential again is no recovery. A new one is, and reopens the first delivery with it.
+     */
+    @Test
+    fun `a real provider's recovery after refusal evidence reopens the first delivery with the new credential`() = runTest {
+        val processJob = SupervisorJob()
+        try {
+            val h = Harness(this)
+            val tokens = ProviderTokens()
+            val provider = realProvider(h, tokens, processJob)
+            h.goLive()
+            advanceTimeBy(100)
+            h.wire.open()
+            h.wire.sendSucceeds = false
+            advanceTimeBy(6_000)
+            h.wire.sendSucceeds = true
+            advanceTimeBy(5_000)
+            assertEquals(3, h.requests.size)
+            h.wire.deliver(h.subscriptionError("r3", "invalid_token"))
+            advanceTimeBy(1)
+            assertEquals(listOf(AuthSnapshot("u1", 1L, "token-1")), h.rejectionEvidence)
+
+            assertEquals("token-1", provider.currentSnapshot().token)
+            advanceTimeBy(1)
+            assertEquals("증거로 기록된 credential 재획득이 회복이 됐다", 3, h.requests.size)
+
+            tokens.current = "token-2"
+            assertEquals("token-2", provider.currentSnapshot().token)
+            advanceTimeBy(1)
+            assertEquals(4, h.requests.size)
+            assertEquals("token-2", h.requests[3].idToken)
+            h.cleanUp()
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    /**
+     * An acquisition that started while the refusal was being handed over — after the provider recorded it, before the command took
+     * its ending order — and completed after the ending is a recovery after that ending, and reopens the first delivery.
+     */
+    @Test
+    fun `a real provider's recovery started before an ending and decided after it reopens the command`() = runTest {
+        val processJob = SupervisorJob()
+        try {
+            val h = Harness(this)
+            val tokens = ProviderTokens()
+            var handOver: CompletableDeferred<Unit>? = CompletableDeferred()
+            val provider = realProvider(h, tokens, processJob, handOverGate = { handOver })
+            firstDeliveryReplayRefusedThroughProvider(h, tokens)
+            assertEquals("인계가 붙잡히지 않았다", 2, h.requests.size)
+
+            val fetch = CompletableDeferred<Unit>()
+            tokens.current = "token-3"
+            tokens.gate = fetch
+            val acquired = backgroundScope.launch { provider.currentSnapshot() }
+            advanceTimeBy(1)
+            handOver!!.complete(Unit)
+            handOver = null
+            advanceTimeBy(1)
+            assertEquals("획득이 끝나기 전에 명령을 다시 열었다", 2, h.requests.size)
+
+            tokens.gate = null
+            fetch.complete(Unit)
+            advanceTimeBy(1)
+            assertTrue(acquired.isCompleted)
+            assertEquals("종료 뒤 확정된 회복이 첫 전달을 열지 않았다", 3, h.requests.size)
+            assertEquals("token-3", h.requests[2].idToken)
+            h.cleanUp()
+        } finally {
+            processJob.cancel()
+        }
+    }
+
+    /**
+     * A recovery the provider decided while the refusal was being handed over — before the command took its ending order — and that
+     * reaches the session only after the ending is older than that ending, and reopens nothing.
+     */
+    @Test
+    fun `a real provider's recovery decided before an ending and delivered after it does not reopen the command`() = runTest {
+        val processJob = SupervisorJob()
+        try {
+            val h = Harness(this)
+            val tokens = ProviderTokens()
+            var handOver: CompletableDeferred<Unit>? = CompletableDeferred()
+            val held = mutableListOf<AuthCredentialRecovery>()
+            val provider = realProvider(h, tokens, processJob, handOverGate = { handOver }, onRecovery = { held += it })
+            firstDeliveryReplayRefusedThroughProvider(h, tokens)
+
+            tokens.current = "token-3"
+            assertEquals("token-3", provider.currentSnapshot().token)
+            advanceTimeBy(1)
+            assertEquals("인계 중 획득이 회복을 확정하지 않았다", 1, held.size)
+            handOver!!.complete(Unit)
+            handOver = null
+            advanceTimeBy(1)
+
+            held.forEach(h.coordinator::onCredentialRecovered)
+            advanceTimeBy(11_000)
+            assertEquals("종료 전에 확정된 회복이 늦게 와서 열었다", 2, h.requests.size)
+            h.cleanUp()
+        } finally {
+            processJob.cancel()
+        }
     }
 }

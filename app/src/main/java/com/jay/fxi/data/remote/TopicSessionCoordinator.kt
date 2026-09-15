@@ -1,6 +1,7 @@
 package com.jay.fxi.data.remote
 
 import com.jay.fxi.data.auth.AccessOrderSequence
+import com.jay.fxi.data.auth.AuthCredentialRecovery
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
@@ -264,6 +265,9 @@ private sealed interface SessionInput {
     /** The issuer published a new access snapshot under the context this session already holds (L-4e E2b). */
     data object AccessRevised : SessionInput
 
+    /** The token provider saw the signed-in identity acquire a usable credential again after a failure (L-4e E6b). */
+    data class CredentialRecovered(val recovery: AuthCredentialRecovery) : SessionInput
+
     data object Stop : SessionInput
 }
 
@@ -507,6 +511,19 @@ class TopicSessionCoordinator(
         var renewalDeferred = false
         var revalidationDeferred = false
 
+        /**
+         * The commands on this socket that ended on authentication and still owe something a credential recovery may reopen,
+         * by command id (L-4e E6b). Each obligation is in at most one place: a record here or a running command. A command
+         * that takes one over empties it here, and a record owing nothing is dropped.
+         */
+        val authEnded = linkedMapOf<Long, AuthEndedRecord>()
+
+        /** The newest recovery for this socket's identity, kept until it reopens something or a newer one replaces it. */
+        var recoveryCandidate: AuthCredentialRecovery? = null
+
+        /** A reopen that stood aside for [controlOwner]. It carries no permission: every condition is asked again when it runs. */
+        var recoveryReopenDeferred = false
+
         var renewalTimer: Job? = null
         var expiryTimer: Job? = null
 
@@ -517,9 +534,37 @@ class TopicSessionCoordinator(
 
     private class RunningCommand(
         val command: TopicSubscribeCommand,
-        val purpose: TopicCommandPurpose
+        val purpose: TopicCommandPurpose,
+        /**
+         * Tether's receive generation read at this command's registration, when it carries a revalidation (L-4e E6b). The
+         * command judges its question against this same number, and an authentication ending records it.
+         */
+        val revalidationEntry: Long?
     ) {
         var job: Job? = null
+
+        /**
+         * What this command takes over at registration (L-4e E6b §4), and still owes if it ends on authentication: that ending comes
+         * before any acknowledgement of its own, and no other command's acknowledgement is applied while it holds the lane.
+         */
+        val takesFirstDelivery: Boolean get() = purpose == TopicCommandPurpose.FIRST_DELIVERY
+        val takesRenewal: Boolean get() = purpose == TopicCommandPurpose.LEASE_RENEWAL ||
+            purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION
+    }
+
+    /**
+     * What an authentication ending left owed on its connection (L-4e E6b §2). Each obligation is settled on its own, and the
+     * record goes once none is left. [tetherEntryGeneration] is present exactly while the ended command's revalidation is owed,
+     * and is the reading that command was judged against.
+     */
+    private class AuthEndedRecord(
+        val purpose: TopicCommandPurpose,
+        val authEnd: TopicAuthEnd,
+        var firstDeliveryRequired: Boolean,
+        var renewalRequired: Boolean,
+        var tetherEntryGeneration: Long?
+    ) {
+        val settled: Boolean get() = !firstDeliveryRequired && !renewalRequired && tetherEntryGeneration == null
     }
 
     private val inputs = Channel<SessionInput>(Channel.UNLIMITED)
@@ -637,6 +682,12 @@ class TopicSessionCoordinator(
      */
     private var firstDeliveryOutstanding = false
 
+    /**
+     * The newest recovery episode that reopened a command (L-4e E6b). Session-wide and never lowered, so a recovery reopens at
+     * most one command whichever connection it arrives on.
+     */
+    private var consumedRecoveryEpisode = 0L
+
     /** What the last publication said, so an unchanged snapshot is not sent again. */
     private var publishedSnapshot: TopicSubscriptionSnapshot? = null
 
@@ -712,6 +763,14 @@ class TopicSessionCoordinator(
      * the wait for a connection before automatic bootstraps (L-4e E5).
      */
     override fun accessRevised() = post(SessionInput.AccessRevised)
+
+    /**
+     * A credential recovery the token provider decided (S1 recovery signal), for this session to reopen what authentication ended
+     * on its current connection — once per recovery episode, and only a command that ended before the recovery (L-4e E6b).
+     *
+     * Not a grant and not a trigger to connect: with no connection, or one for another identity, it is dropped. Safe from any thread.
+     */
+    fun onCredentialRecovered(recovery: AuthCredentialRecovery) = post(SessionInput.CredentialRecovered(recovery))
 
     /**
      * Asks the REST twin for [topic] once.
@@ -938,15 +997,19 @@ class TopicSessionCoordinator(
             // from writing degraded onto a grant that is already over. Found by review.
             is SessionInput.CommandFinished -> current(input.generation)?.let { live ->
                 if (enforceLeaseExpiry(live)) return@let
-                if (
-                    input.purpose == TopicCommandPurpose.REVALIDATION &&
-                    live.revalidationOwner != input.commandId
-                ) return@let
-
-                applyOutcome(live, input.purpose, input.outcome)
-                if (live.revalidationOwner == input.commandId) {
-                    live.revalidationOwner = null
+                // Read before the result is applied or the owner cleared (L-4e E6b §3): what the command still owed, and whether
+                // its revalidation was still the one whose result counts. Nothing below asks the owner again.
+                val running = live.commands[input.commandId]
+                val ownsRevalidation = live.revalidationOwner == input.commandId
+                val revalidates = input.purpose == TopicCommandPurpose.REVALIDATION ||
+                    input.purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION
+                if (!revalidates || ownsRevalidation) applyOutcome(live, input.purpose, input.outcome)
+                if (ownsRevalidation) live.revalidationOwner = null
+                val authEnd = (input.outcome as? TopicCommandOutcome.Stopped)?.authEnd
+                if (authEnd != null && running != null) {
+                    recordAuthEnded(live, input.commandId, running, authEnd, ownsRevalidation)
                 }
+                reconsiderRecovery(live)
             }
 
             is SessionInput.CommandDone -> current(input.generation)?.let { live ->
@@ -962,10 +1025,14 @@ class TopicSessionCoordinator(
                     live.revalidationOwner = null
                     store.abortRevalidation(TopicCatalogue.TETHER)
                 }
-                // Deliberately nothing else. Re-sending `desired − confirmed` here would hand a
+                // Nothing else of its own. Re-sending `desired − confirmed` here would hand a
                 // terminal refusal or a spent budget a fresh one on the next lap, which is the
                 // ceiling those two exist to be. A new command needs a new reason: a reconnection,
                 // or a trigger the store's own retry rules allow. Found by review.
+                // A credential recovery is such a reason, and only for an authentication ending
+                // (L-4e E6b): this is where the ended command has left, so a recovery that already
+                // arrived may reopen it now. It creates no recovery and no budget.
+                reconsiderRecovery(live)
             }
 
             is SessionInput.CommandIdentityChanged -> current(input.generation)?.let { live ->
@@ -1029,6 +1096,8 @@ class TopicSessionCoordinator(
                 if (enforceLeaseExpiry(live)) return@let
                 if (live.renewalDeferred) startRenewal(live)
                 if (live.revalidationDeferred) startRevalidation(live)
+                // After the two it always resumed, and asking everything again (L-4e E6b).
+                reconsiderRecovery(live)
             }
 
             is SessionInput.LeaseExpiryDue ->
@@ -1040,6 +1109,18 @@ class TopicSessionCoordinator(
             is SessionInput.DeferredUse -> if (stillOwns(input.attribution)) input.action()
 
             SessionInput.AccessRevised -> reevaluateAccess()
+
+            // Kept for the connection it names, then asked about (L-4e E6b §3). The pure comparison first; the live identity is
+            // read only for a recovery that could be this connection's, and a move retires as at every other boundary.
+            is SessionInput.CredentialRecovered -> connection?.let { live ->
+                if (live.ended || input.recovery.fence != live.fence.identity) return@let
+                if (!enforceLiveIdentity(live.fence)) return@let
+                val held = live.recoveryCandidate
+                if (held == null || input.recovery.recoveredOrder > held.recoveredOrder) {
+                    live.recoveryCandidate = input.recovery
+                }
+                reconsiderRecovery(live)
+            }
 
             is SessionInput.ReconnectDue -> {
                 if (input.ticket != reconnectTicket) return
@@ -1462,13 +1543,22 @@ class TopicSessionCoordinator(
      *
      * A **new** command every time, deliberately: re-running one that failed would hand it the
      * three attempts it has already spent, which is the ceiling those attempts exist to be.
+     *
+     * Registering is also taking over (L-4e E6b §4): the obligations this command carries leave every authentication-ending
+     * record here, so a later ending of this one is recorded under its own id and order and an earlier ending is never reopened
+     * for it. A command carrying a revalidation reads tether's receive generation once, now, and hands that same reading to the
+     * command. [revalidationTopics] is the combined purpose's revalidation scope and nothing else's.
      */
     private fun startCommand(
         live: Connection,
         purpose: TopicCommandPurpose,
+        revalidationTopics: () -> Set<String> = { emptySet() },
         topics: () -> Set<String>
     ) {
         val id = ++commandSerial
+        val revalidates = purpose == TopicCommandPurpose.REVALIDATION ||
+            purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION
+        val revalidationEntry = if (revalidates) store.snapshot.stateFor(TopicCatalogue.TETHER).receiveGeneration else null
         // The transport is captured here rather than read from the field at send time. A command
         // that outlived its connection would otherwise write to whichever socket is current, which
         // is a subscribe sent on a connection that never asked for it. Found by review.
@@ -1504,14 +1594,22 @@ class TopicSessionCoordinator(
             jitter = jitter,
             scope = { if (current(live.generation) == null) emptySet() else topics() },
             onAcknowledged = { ack -> onAcknowledged(live, id, ack) },
-            admitAnswer = { rejected -> admitsAnswer(live, rejected) }
+            admitAnswer = { rejected -> admitsAnswer(live, rejected) },
+            revalidationEntry = revalidationEntry?.let { mapOf(TopicCatalogue.TETHER to it) },
+            revalidationScope = { if (current(live.generation) == null) emptySet() else revalidationTopics() }
         )
-        val running = RunningCommand(command, purpose)
+        val running = RunningCommand(command, purpose, revalidationEntry)
         live.commands[id] = running
         live.controlOwner = id
-        if (purpose == TopicCommandPurpose.REVALIDATION) {
+        if (revalidates) {
             live.revalidationOwner = id
         }
+        live.authEnded.values.forEach { record ->
+            if (running.takesFirstDelivery) record.firstDeliveryRequired = false
+            if (running.takesRenewal) record.renewalRequired = false
+            if (revalidates) record.tetherEntryGeneration = null
+        }
+        live.authEnded.values.removeAll { it.settled }
         // `finally`, so a command that ends by cancellation is still taken off the connection. A
         // listener throwing `CancellationException` out of the acknowledgement callback used to
         // leave the entry behind for good: the socket stayed up, and every later control frame was
@@ -1578,6 +1676,10 @@ class TopicSessionCoordinator(
         // The server answered, so the request channel is free — before the delivery wait, which
         // needs nothing another command wants.
         releaseControlLane(live, commandId)
+        // The store already holds this answer: a recorded revalidation it confirmed away or refused is settled, for good (L-4e E6b §4).
+        // A recorded first delivery needs nothing here — the only first delivery that can answer after one ended is the one a
+        // recovery registered, which took it over.
+        settleOwedRevalidations(live)
 
         // Settled **before** anyone outside is told, and against the grant this connection was
         // opened for rather than whatever is current: a listener that throws must not be able to
@@ -1591,6 +1693,7 @@ class TopicSessionCoordinator(
         // reading of the clock, could find the deadline passed after the store had taken the answer
         // and publish that answer on the way to the teardown.
         current(live.generation)?.let { still -> applyLeases(still, ack) }
+        live.authEnded.values.removeAll { it.settled }
         // Reported before the two observers below (L-4e E4a): the refusal is settled and its leases handled, and an observer that
         // throws must not keep the grant's refusal from the issuer. `live.fence`, not the session's current one: the refusal
         // above may already have ended this connection, and the grant it answered is the one this connection was opened under.
@@ -1624,6 +1727,9 @@ class TopicSessionCoordinator(
         // renewal that stood aside for the channel — otherwise the release that follows sends one
         // immediately, moments after the server granted a fresh lease.
         live.renewalDeferred = false
+        // For the same reason no authentication ending owes a renewal any more (L-4e E6b §4), whether this answer schedules a new
+        // one or, with no leases, none. A lease id reported again keeps its deadline.
+        live.authEnded.values.forEach { it.renewalRequired = false }
 
         // Expiry first, the order iOS arms them in.
         //
@@ -2064,7 +2170,9 @@ class TopicSessionCoordinator(
         when (purpose) {
             TopicCommandPurpose.FIRST_DELIVERY -> if (topic in silent) startRevalidation(live)
 
-            TopicCommandPurpose.REVALIDATION -> {
+            // A combined command's result is its revalidation's (L-4e E6b); its leases were applied at the acknowledgement.
+            TopicCommandPurpose.REVALIDATION,
+            TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION -> {
                 if (
                     store.snapshot.stateFor(topic).deliveryState != TopicDeliveryState.REVALIDATING
                 ) {
@@ -2089,9 +2197,156 @@ class TopicSessionCoordinator(
     private fun releaseControlLane(live: Connection, commandId: Long) {
         if (live.controlOwner != commandId) return
         live.controlOwner = null
-        if (live.renewalDeferred || live.revalidationDeferred) {
+        if (live.renewalDeferred || live.revalidationDeferred || live.recoveryReopenDeferred) {
             post(SessionInput.ControlLaneFree(live.generation))
         }
+    }
+
+    // ---- credential recovery (L-4e E6b) --------------------------------------------------------
+
+    /**
+     * What [running] still owed when authentication ended it, kept under its id and ending order.
+     *
+     * The revalidation only when [ownsRevalidation] was read before its result was applied, and only while still owed; nothing
+     * when nothing is.
+     */
+    private fun recordAuthEnded(
+        live: Connection,
+        commandId: Long,
+        running: RunningCommand,
+        authEnd: TopicAuthEnd,
+        ownsRevalidation: Boolean
+    ) {
+        val record = AuthEndedRecord(
+            purpose = running.purpose,
+            authEnd = authEnd,
+            firstDeliveryRequired = running.takesFirstDelivery,
+            renewalRequired = running.takesRenewal,
+            tetherEntryGeneration = running.revalidationEntry?.takeIf { ownsRevalidation && revalidationOwed(it) }
+        )
+        if (!record.settled) live.authEnded[commandId] = record
+    }
+
+    /**
+     * Whether a tether revalidation judged from [entry] is still owed: nothing received since, and still a desired, confirmed,
+     * unrefused subscription that has not been degraded.
+     *
+     * A HEALTHY that `abortRevalidation` wrote is not a receipt, and neither is a REST bootstrap: only the receive generation says.
+     */
+    private fun revalidationOwed(entry: Long): Boolean {
+        val state = store.snapshot.stateFor(TopicCatalogue.TETHER)
+        return TopicCatalogue.TETHER in desired && state.desired && state.confirmed && state.rejection == null &&
+            state.deliveryState != TopicDeliveryState.DEGRADED && state.receiveGeneration <= entry
+    }
+
+    /** Settles, for good, every recorded revalidation the store now says is no longer owed. */
+    private fun settleOwedRevalidations(live: Connection) {
+        live.authEnded.values.forEach { record ->
+            val entry = record.tetherEntryGeneration ?: return@forEach
+            if (!revalidationOwed(entry)) record.tetherEntryGeneration = null
+        }
+    }
+
+    /**
+     * Reopens, once, what authentication ended on [live] before its recovery, when everything still allows it (L-4e E6b §5).
+     *
+     * Only records whose command has left the connection count — one still here may be a replacement's predecessor that has
+     * not finished — and only those that ended before the recovery was decided. A reopen that finds the lane held waits for
+     * it and carries nothing: when it runs, all of this is asked again. Nothing registered, nothing consumed.
+     */
+    private fun reconsiderRecovery(live: Connection) {
+        val recovery = live.recoveryCandidate ?: return
+        if (current(live.generation) !== live) return
+        if (recovery.episode <= consumedRecoveryEpisode) {
+            live.recoveryCandidate = null
+            live.recoveryReopenDeferred = false
+            return
+        }
+        settleOwedRevalidations(live)
+        live.authEnded.values.removeAll { it.settled }
+        val ended = live.authEnded.filter { (id, record) ->
+            recovery.recoveredOrder > record.authEnd.endedOrder && id !in live.commands
+        }.values
+        if (ended.isEmpty()) {
+            // A recovery can arrive before the ending it answers is recorded, so it is kept.
+            live.recoveryReopenDeferred = false
+            return
+        }
+        // The deadline first, then the session's own facts, then the live identity — which can advance its generation — and
+        // then the issuer, as at the other boundaries. The connection's own use still admitted under the session's fence is
+        // what [wanted] asks of a new one, and more: a new start is possible whenever that use still is.
+        if (enforceLeaseExpiry(live)) return
+        if (live.fence != fence || !sessionWanted()) return
+        if (!enforceLiveIdentity(live.fence)) return
+        if (!authority.admits(live.lifetime)) return
+        if (live.controlOwner != null) {
+            live.recoveryReopenDeferred = true
+            return
+        }
+        live.recoveryReopenDeferred = false
+        reopenAfterRecovery(live, recovery, ended)
+    }
+
+    /**
+     * One command, on one budget, for what [ended] owes (L-4e E6b §5).
+     *
+     * A first delivery is reopened alone — nothing else can have been owed beside it. Otherwise a renewal, a revalidation, or
+     * both as one combined command. Everything that can refuse is asked before the store is touched, and the episode is
+     * consumed in the same turn the command is registered, never without one. The store's authentication verdict is not
+     * changed here: only an acknowledgement proves the credential.
+     */
+    private fun reopenAfterRecovery(live: Connection, recovery: AuthCredentialRecovery, ended: Collection<AuthEndedRecord>) {
+        if (ended.any { it.firstDeliveryRequired }) {
+            if (live.commands.values.any { it.purpose == TopicCommandPurpose.FIRST_DELIVERY }) return
+            val scope = { desired.filterTo(mutableSetOf()) { store.snapshot.stateFor(it).rejection == null } }
+            if (scope().isEmpty()) return
+            consumeRecovery(live, recovery)
+            // The effort to get a first delivery is under way again, so D14 does not answer its silence twice.
+            firstDeliveryOutstanding = true
+            startCommand(live, TopicCommandPurpose.FIRST_DELIVERY, topics = scope)
+            return
+        }
+        val renewal = ended.any { it.renewalRequired }
+        val revalidation = ended.any { it.tetherEntryGeneration != null }
+        val renewalScope = {
+            (live.renewalScope intersect desired).filterTo(mutableSetOf()) { store.snapshot.stateFor(it).rejection == null }
+        }
+        if (!revalidation) {
+            if (!renewal || renewalScope().isEmpty()) return
+            consumeRecovery(live, recovery)
+            startCommand(live, TopicCommandPurpose.LEASE_RENEWAL, topics = renewalScope)
+            return
+        }
+        // Owed, so tether is desired, confirmed and has not spoken; what is left to ask is whether it may start. HEALTHY — which is
+        // what the ending's own result left — is marked suspect first; a HEALTHY topic has no attempt spent, so that mark is never
+        // left behind by a start that then refuses. The FAILED start guard is not asked: this is the one path a verified recovery
+        // reaches, and only an acknowledgement takes the verdict back.
+        if (live.revalidationOwner != null) return
+        store.markSuspect(TopicCatalogue.TETHER)
+        if (!store.beginRevalidation(TopicCatalogue.TETHER)) return
+        consumeRecovery(live, recovery)
+        if (renewal) {
+            startCommand(
+                live,
+                TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION,
+                revalidationTopics = { owedTether() },
+                topics = renewalScope
+            )
+        } else {
+            startCommand(live, TopicCommandPurpose.REVALIDATION) { setOf(TopicCatalogue.TETHER) }
+        }
+    }
+
+    /** Tether while its state still allows a revalidation question: desired and unrefused. */
+    private fun owedTether(): Set<String> {
+        val state = store.snapshot.stateFor(TopicCatalogue.TETHER)
+        return if (TopicCatalogue.TETHER in desired && state.rejection == null) setOf(TopicCatalogue.TETHER) else emptySet()
+    }
+
+    private fun consumeRecovery(live: Connection, recovery: AuthCredentialRecovery) {
+        consumedRecoveryEpisode = recovery.episode
+        live.recoveryCandidate = null
+        live.recoveryReopenDeferred = false
     }
 
     /** The draw the lease policy wants: whole seconds, `0..60`, and only ever subtracted. */

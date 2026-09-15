@@ -114,9 +114,18 @@ enum class TopicCommandPurpose {
      * [FIRST_DELIVERY] here is not the same as iOS's ordinary command: iOS ends its arbiter at the
      * acknowledgement, and this one would not.
      */
-    LEASE_RENEWAL;
+    LEASE_RENEWAL,
 
-    /** Whether the acknowledgement leaves anything still to be waited for. */
+    /**
+     * A renewal and a revalidation a credential recovery reopens as one command, on one budget (L-4e E6b).
+     *
+     * The name says what it may carry, not what it still owes: the session hands over the revalidation's topics and entry
+     * reading separately, and only those topics are watched. A tether sent because its lease is due is not a question about
+     * delivery.
+     */
+    LEASE_RENEWAL_WITH_REVALIDATION;
+
+    /** Whether an acknowledgement can leave anything still to be waited for. */
     val watchesDelivery: Boolean get() = this != LEASE_RENEWAL
 }
 
@@ -180,9 +189,10 @@ sealed interface TopicCommandOutcome {
      * already spoken, has nothing left to wait on and returns at once.
      *
      * [accepted] empty means every topic was refused — the reasons are in the store, and in the
-     * acknowledgement that was handed over when it arrived. [silent] is the accepted topics that
-     * had still said nothing **and are still wanted** — and it is empty whenever [purpose] did not
-     * watch delivery, because a set measured without waiting is not evidence of silence.
+     * acknowledgement that was handed over when it arrived. [silent] is the watched accepted topics
+     * that had still said nothing **and are still wanted** — and it is empty whenever the answered
+     * send watched nothing, because a set measured without waiting is not evidence of silence. A
+     * renewal watches nothing; a combined command watches only its revalidation's topics.
      */
     data class Acknowledged(
         val accepted: Set<String>,
@@ -194,7 +204,8 @@ sealed interface TopicCommandOutcome {
     /**
      * A revalidation whose topics started speaking again before it needed to ask.
      *
-     * Only a revalidation can end this way. Its whole question is whether the topic is still
+     * Only a command carrying a revalidation can end this way — a combined one only when its renewal has nothing left to send
+     * either. Its whole question is whether the topic is still
      * alive, and a frame answers that question better than an acknowledgement would — so asking
      * again would be a subscribe sent to confirm something already confirmed. A first delivery
      * cannot: no acknowledgement means no lease and no confirmed subscription, and frames arriving
@@ -266,11 +277,30 @@ class TopicSubscribeCommand(
      * refusal is still handed over when the use is withheld (L-4e E2a). The default admits everything; a session must supply its own.
      */
     private val admitAnswer: (rejected: Map<String, TopicRejectionReason>) -> TopicAnswerAdmission =
-        { TopicAnswerAdmission.Admitted(clock.nowMillis()) }
+        { TopicAnswerAdmission.Admitted(clock.nowMillis()) },
+    /**
+     * Each revalidated topic's receive generation, read by whoever registered this command (L-4e E6b). A revalidation is judged
+     * against it and does not read its own when it starts; `null` reads one then, as a standalone command always did. Required
+     * for [TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION].
+     */
+    private val revalidationEntry: Map<String, Long>? = null,
+    /**
+     * [TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION] only: the topics whose revalidation this command still owes, asked
+     * at the same points as [scope] — which, for that purpose, is the renewal's topics. Empty for every other purpose.
+     */
+    private val revalidationScope: () -> Set<String> = { emptySet() }
 ) {
+    init {
+        require(purpose != TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION || revalidationEntry != null) {
+            "a combined command is judged against the entry its registration read"
+        }
+    }
+
     private class Pending(
         val requestId: String,
         val topics: Set<String>,
+        /** The sent topics whose delivery this send watches: all of them, none for a renewal, a combined command's revalidation. */
+        val watched: Set<String>,
         val baseline: Map<String, Long>,
         val deadlines: TopicRequestDeadlines,
         val credential: AuthSnapshot,
@@ -286,7 +316,7 @@ class TopicSubscribeCommand(
 
     /** What the scope says to do next, asked again at every point where sending is possible. */
     private sealed interface Sendable {
-        data class Topics(val values: Set<String>) : Sendable
+        data class Topics(val values: Set<String>, val watched: Set<String>) : Sendable
         data class Recovered(val values: Set<String>) : Sendable
         data object Nothing : Sendable
     }
@@ -362,7 +392,9 @@ class TopicSubscribeCommand(
         // attempt was sent. A revalidation is judged against this one: a frame that arrived during
         // an earlier attempt's cooldown answered its question, and a per-send baseline would
         // absorb that evidence into the next attempt and lose it. Found by review.
-        val entry = scope().associateWith { store.snapshot.stateFor(it).receiveGeneration }
+        // A registration that read it already is not read again (L-4e E6b): a frame between that reading and this coroutine
+        // starting answered the question, and the session judges this command's ending against the same number.
+        val entry = revalidationEntry ?: scope().associateWith { store.snapshot.stateFor(it).receiveGeneration }
 
         while (true) {
             when (val before = sendable(entry)) {
@@ -390,13 +422,14 @@ class TopicSubscribeCommand(
             // Asked again after the wait, not only before it: acquiring a credential suspends, and
             // a command that checked only on the way in would send to a scope that emptied while
             // it was blocked. Found by review.
-            val wanted = when (val now = sendable(entry)) {
+            val now = when (val next = sendable(entry)) {
                 Sendable.Nothing -> return TopicCommandOutcome.Superseded
-                is Sendable.Recovered -> return TopicCommandOutcome.AlreadyDelivering(now.values)
-                is Sendable.Topics -> now.values
+                is Sendable.Recovered -> return TopicCommandOutcome.AlreadyDelivering(next.values)
+                is Sendable.Topics -> next
             }
+            val wanted = now.values
 
-            val pending = register(wanted, credential, replayOfRefresh) ?: return programmingError()
+            val pending = register(wanted, now.watched, credential, replayOfRefresh) ?: return programmingError()
             // Before the store is touched, not after. Nothing goes on the wire on behalf of a
             // cancelled command — and a cancelled command must not take the replacement's request
             // with it either, which is what `beginRequest` here would do by claiming the ticket
@@ -524,13 +557,28 @@ class TopicSubscribeCommand(
      * Only a revalidation takes them out. Its question is whether a topic is still alive and a
      * frame settles that, so re-asking would confirm something already confirmed — while a first
      * delivery has an unanswered control request either way, and frames say nothing about that.
+     *
+     * A combined command (L-4e E6b) asks for its renewal's topics and for the revalidation topics that have not spoken, and
+     * watches only the second. A renewal topic stays in however much it has spoken: a frame does not re-authenticate a lease.
+     * With nothing to send, a revalidation that spoke answered it; one whose topics are no longer owed at all did not.
      */
     private fun sendable(entry: Map<String, Long>): Sendable {
+        if (purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION) {
+            val (spoke, silent) = revalidationScope().partition { spokeSince(entry, it) }
+            val renewal = scope()
+            return when {
+                renewal.isNotEmpty() || silent.isNotEmpty() -> Sendable.Topics(renewal + silent, silent.toSet())
+                spoke.isNotEmpty() -> Sendable.Recovered(spoke.toSet())
+                else -> Sendable.Nothing
+            }
+        }
         val wanted = scope()
         if (wanted.isEmpty()) return Sendable.Nothing
-        if (purpose != TopicCommandPurpose.REVALIDATION) return Sendable.Topics(wanted)
+        if (purpose != TopicCommandPurpose.REVALIDATION) {
+            return Sendable.Topics(wanted, if (purpose.watchesDelivery) wanted else emptySet())
+        }
         val (spoke, silent) = wanted.partition { spokeSince(entry, it) }
-        return if (silent.isEmpty()) Sendable.Recovered(spoke.toSet()) else Sendable.Topics(silent.toSet())
+        return if (silent.isEmpty()) Sendable.Recovered(spoke.toSet()) else Sendable.Topics(silent.toSet(), silent.toSet())
     }
 
     /**
@@ -540,12 +588,18 @@ class TopicSubscribeCommand(
      * acknowledgement would be counted as "already there before we asked" and the topic would look
      * silent for the rest of the deadline.
      */
-    private fun register(wanted: Set<String>, credential: AuthSnapshot, replayOfRefresh: Boolean): Pending? {
+    private fun register(
+        wanted: Set<String>,
+        watched: Set<String>,
+        credential: AuthSnapshot,
+        replayOfRefresh: Boolean
+    ): Pending? {
         val sentAt = clock.nowMillis()
         val deadlines = TopicRequestPolicy.deadlinesFor(sentAt) ?: return null
         return Pending(
             requestId = newRequestId(),
             topics = wanted,
+            watched = watched,
             baseline = wanted.associateWith { store.snapshot.stateFor(it).receiveGeneration },
             deadlines = deadlines,
             credential = credential,
@@ -637,23 +691,26 @@ class TopicSubscribeCommand(
 
         // The ACK narrows the watch and takes nothing off the clock: a topic that has already
         // spoken is done, the rest are judged at the deadline this send set. A renewal watches
-        // nothing — see [TopicCommandPurpose.LEASE_RENEWAL].
-        if (purpose.watchesDelivery && silentOf(pending, accepted).isNotEmpty()) {
+        // nothing — see [TopicCommandPurpose.LEASE_RENEWAL] — and a combined command watches only
+        // the revalidation topics it sent (L-4e E6b).
+        val observed = accepted intersect pending.watched
+        if (silentOf(pending, observed).isNotEmpty()) {
             awaitUntil(pending.deadlines.deliverByMillis)
         }
         // Narrowed by the scope as it is *now*: a topic dropped while the deadline ran is not
         // something to revalidate or degrade, and the caller would act on it if it were reported.
-        val stillWanted = scope()
+        // A combined command's silence is its revalidation's, so that is the scope it is narrowed by.
+        val stillWanted =
+            if (purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION) revalidationScope() else scope()
         return TopicCommandOutcome.Acknowledged(
             accepted = accepted,
-            // A purpose that did not watch has nothing to report. The set would otherwise be a
+            // A send that did not watch has nothing to report. The set would otherwise be a
             // reading taken at the acknowledgement — every accepted topic that had not spoken in
             // the few milliseconds since the send — and a caller treating it like a watchdog
             // result would revalidate or degrade a topic that was never given its window. The
             // caller branches on [purpose] too; this is the half that cannot be forgotten.
             // Found by review.
-            silent = if (purpose.watchesDelivery) silentOf(pending, accepted) intersect stillWanted
-            else emptySet(),
+            silent = silentOf(pending, observed) intersect stillWanted,
             leases = answer.leases,
             purpose = purpose
         )
@@ -722,7 +779,8 @@ class TopicSubscribeCommand(
     private suspend fun waitBeforeRetry(base: Duration): WaitResult {
         val wait = TopicCommandRetryPolicy.waitFor(base, jitter()) ?: return WaitResult.REFUSED
         clock.sleep(wait)
-        return if (scope().isEmpty()) WaitResult.SUPERSEDED else WaitResult.PROCEED
+        // A combined command whose renewal emptied still owes its revalidation, which the next send check settles (L-4e E6b).
+        return if (scope().isEmpty() && revalidationScope().isEmpty()) WaitResult.SUPERSEDED else WaitResult.PROCEED
     }
 
     private fun budgetSpent() =

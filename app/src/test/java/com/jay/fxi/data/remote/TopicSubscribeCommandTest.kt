@@ -47,6 +47,7 @@ class TopicSubscribeCommandTest {
     private companion object {
         const val USD = "fx:usd-krw"
         const val JPY = "fx:jpy-krw"
+        const val TETHER = "usdt:krw"
         const val ACK_TIMEOUT_MS = 20_000L
         const val DELIVERY_TIMEOUT_MS = 45_000L
 
@@ -159,11 +160,17 @@ class TopicSubscribeCommandTest {
 
         /** Fired every time the command asks what is still wanted. */
         var onScope: (() -> Unit)? = null
+
+        /** A combined command's owed revalidation topics, asked as the session would ask them (L-4e E6b). */
+        var revalidating: Set<String> = emptySet()
         private var nextId = 0
 
         lateinit var command: TopicSubscribeCommand
 
-        fun build(purpose: TopicCommandPurpose = TopicCommandPurpose.FIRST_DELIVERY) {
+        fun build(
+            purpose: TopicCommandPurpose = TopicCommandPurpose.FIRST_DELIVERY,
+            revalidationEntry: Map<String, Long>? = null
+        ) {
             command = TopicSubscribeCommand(
                 purpose = purpose,
                 store = store,
@@ -190,7 +197,19 @@ class TopicSubscribeCommandTest {
                     admissions += refusesPremium
                     admittedRejections += rejected
                     admission(refusesPremium)
-                }
+                },
+                revalidationEntry = revalidationEntry,
+                revalidationScope = { revalidating }
+            )
+        }
+
+        /** A combined command owing a renewal of [renewal] and a revalidation of [revalidation], judged from the store as it is now. */
+        fun buildCombined(renewal: Set<String>, revalidation: Set<String>) {
+            wanted = renewal
+            revalidating = revalidation
+            build(
+                TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION,
+                revalidationEntry = revalidation.associateWith { store.snapshot.stateFor(it).receiveGeneration }
             )
         }
 
@@ -1678,6 +1697,214 @@ class TopicSubscribeCommandTest {
 
         assertTrue(run.outcome is TopicCommandOutcome.Acknowledged)
         assertEquals(ACK_TIMEOUT_MS + 1, harness.acknowledgements.single().second.acknowledgedAtMillis)
+        harness.cleanUp()
+    }
+
+    // ---- a combined renewal and revalidation (L-4e E6b) ------------------------------------------------------------------
+
+    /**
+     * The renewal's topics and the revalidation's go out as one subscribe, and only the revalidation is waited for.
+     *
+     * USD is renewed and says nothing too, and is not reported: a lease re-authenticated is answered by the acknowledgement,
+     * and reporting its silence would have the session degrade a topic nobody asked about.
+     */
+    @Test
+    fun `a combined command sends both obligations once and watches only the revalidation`() = runTest {
+        val harness = Harness(this)
+        harness.buildCombined(renewal = setOf(USD, TETHER), revalidation = setOf(TETHER))
+        val run = harness.start()
+        advanceTimeBy(100)
+        assertEquals(setOf(USD, TETHER), harness.requests.single().topics.toSet())
+        assertEquals("겹친 topic 을 두 번 실었다", 2, harness.requests.single().topics.size)
+
+        harness.command.deliver(harness.ack("r1", active = listOf(USD, TETHER)))
+        advanceUntilIdle()
+
+        val outcome = run.outcome as TopicCommandOutcome.Acknowledged
+        assertEquals(TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION, outcome.purpose)
+        assertEquals(setOf(USD, TETHER), outcome.accepted)
+        assertEquals("갱신 topic 의 침묵을 보고했다", setOf(TETHER), outcome.silent)
+        assertEquals(DELIVERY_TIMEOUT_MS, run.finishedAtMillis)
+        harness.cleanUp()
+    }
+
+    /** Accepted for its renewal only: the revalidation topic was not subscribed, so there is no window to wait out. */
+    @Test
+    fun `a combined command whose accepted topics are only its renewal's opens no window`() = runTest {
+        val harness = Harness(this)
+        harness.buildCombined(renewal = setOf(USD), revalidation = setOf(TETHER))
+        val run = harness.start()
+        advanceTimeBy(100)
+        assertEquals(setOf(USD, TETHER), harness.requests.single().topics.toSet())
+        harness.command.deliver(harness.ack("r1", active = listOf(USD)))
+        advanceTimeBy(1)
+
+        val outcome = run.outcome as TopicCommandOutcome.Acknowledged
+        assertEquals("갱신만 수락됐는데 전달 창을 열었다", 100L, run.finishedAtMillis)
+        assertEquals(emptySet<String>(), outcome.silent)
+        harness.cleanUp()
+    }
+
+    /**
+     * A revalidation that spoke before the send is answered, and the renewal still goes — with tether in it, because its lease is
+     * due whatever it said. The acknowledgement then ends the command: the tether it carried is a renewal, not a question.
+     */
+    @Test
+    fun `a combined command whose revalidation already spoke still renews and ends at its acknowledgement`() = runTest {
+        val harness = Harness(this)
+        harness.store.recordFrame(TETHER)
+        harness.buildCombined(renewal = setOf(TETHER), revalidation = setOf(TETHER))
+        harness.store.recordFrame(TETHER)
+        val run = harness.start()
+        advanceTimeBy(100)
+        assertEquals("갱신할 tether 를 보내지 않았다", listOf(TETHER), harness.requests.single().topics)
+
+        harness.command.deliver(harness.ack("r1", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        val outcome = run.outcome as TopicCommandOutcome.Acknowledged
+        assertEquals("갱신으로 보낸 tether 에 전달 창을 열었다", 100L, run.finishedAtMillis)
+        assertEquals(emptySet<String>(), outcome.silent)
+        harness.cleanUp()
+    }
+
+    /** Settled while the credential is fetched: the send carries the renewal alone, and nothing is waited for. */
+    @Test
+    fun `a combined command's revalidation settled during the token wait leaves only the renewal`() = runTest {
+        val harness = Harness(this)
+        harness.credentialGateMillis = 1_000
+        harness.buildCombined(renewal = setOf(USD), revalidation = setOf(TETHER))
+        val run = harness.start()
+        advanceTimeBy(500)
+        harness.store.recordFrame(TETHER)
+        advanceTimeBy(600)
+        assertEquals(listOf(USD), harness.requests.single().topics)
+
+        harness.command.deliver(harness.ack("r1", active = listOf(USD)))
+        advanceTimeBy(1)
+        assertEquals(1_100L, run.finishedAtMillis)
+        assertEquals(emptySet<String>(), (run.outcome as TopicCommandOutcome.Acknowledged).silent)
+        harness.cleanUp()
+    }
+
+    /** …and settled during a retry cooldown, the same: the next attempt asks only for the renewal. */
+    @Test
+    fun `a combined command's revalidation settled during a cooldown leaves only the renewal`() = runTest {
+        val harness = Harness(this)
+        harness.sendSucceeds = listOf(false)
+        harness.buildCombined(renewal = setOf(USD), revalidation = setOf(TETHER))
+        val run = harness.start()
+        advanceTimeBy(1)
+        assertEquals(setOf(USD, TETHER), harness.requests.single().topics.toSet())
+
+        harness.store.recordFrame(TETHER)
+        advanceTimeBy(COOLDOWN_MS + 1)
+        assertEquals("쿨다운 중 해소된 재확인을 다시 물었다", listOf(USD), harness.requests[1].topics)
+        val ackedAt = harness.scheduler.currentTime
+        harness.command.deliver(harness.ack("r2", active = listOf(USD)))
+        advanceTimeBy(1)
+        assertEquals("갱신만 남았는데 전달 창을 열었다", ackedAt, run.finishedAtMillis)
+        assertEquals(emptySet<String>(), (run.outcome as TopicCommandOutcome.Acknowledged).silent)
+        harness.cleanUp()
+    }
+
+    /**
+     * With nothing to renew, a revalidation answered by a frame is [TopicCommandOutcome.AlreadyDelivering] and one no longer owed is
+     * [TopicCommandOutcome.Superseded] — before the first send and after a cooldown alike, where a renewal that emptied must not be
+     * read as the whole command having nothing left.
+     */
+    @Test
+    fun `a combined command with nothing to renew tells a revalidation that spoke from one no longer owed`() = runTest {
+        val spoke = Harness(this)
+        spoke.buildCombined(renewal = emptySet(), revalidation = setOf(TETHER))
+        spoke.store.recordFrame(TETHER)
+        val answered = spoke.start()
+        advanceUntilIdle()
+        assertEquals(TopicCommandOutcome.AlreadyDelivering(setOf(TETHER)), answered.outcome)
+        assertEquals(0, spoke.requests.size)
+
+        val dropped = Harness(this)
+        dropped.buildCombined(renewal = emptySet(), revalidation = setOf(TETHER))
+        dropped.revalidating = emptySet()
+        val gone = dropped.start()
+        advanceUntilIdle()
+        assertEquals(TopicCommandOutcome.Superseded, gone.outcome)
+        assertEquals(0, dropped.requests.size)
+
+        val cooled = Harness(this)
+        cooled.sendSucceeds = listOf(false)
+        cooled.buildCombined(renewal = setOf(USD), revalidation = setOf(TETHER))
+        val waited = cooled.start()
+        advanceTimeBy(1)
+        cooled.wanted = emptySet()
+        cooled.store.recordFrame(TETHER)
+        advanceTimeBy(COOLDOWN_MS + 1)
+        assertEquals("갱신이 비자 수신으로 답한 재확인을 대체로 끝냈다", TopicCommandOutcome.AlreadyDelivering(setOf(TETHER)), waited.outcome)
+        assertEquals(1, cooled.requests.size)
+
+        spoke.cleanUp()
+        dropped.cleanUp()
+        cooled.cleanUp()
+    }
+
+    /** What is reported silent is narrowed by what the revalidation still owes, not by the renewal's scope. */
+    @Test
+    fun `a combined command's silence is narrowed by what its revalidation still owes`() = runTest {
+        val harness = Harness(this)
+        harness.buildCombined(renewal = setOf(USD, TETHER), revalidation = setOf(TETHER))
+        val run = harness.start()
+        advanceTimeBy(100)
+        harness.command.deliver(harness.ack("r1", active = listOf(USD, TETHER)))
+        advanceTimeBy(1_000)
+        harness.revalidating = emptySet()
+        advanceUntilIdle()
+
+        assertEquals(
+            "더는 빚지지 않은 재확인의 침묵을 보고했다",
+            emptySet<String>(), (run.outcome as TopicCommandOutcome.Acknowledged).silent
+        )
+        harness.cleanUp()
+    }
+
+    /** One budget of three for both obligations: a credential that cannot be prepared ends it after three reads, not six. */
+    @Test
+    fun `a combined command spends one budget of three`() = runTest {
+        val harness = Harness(this)
+        harness.credentialFailures = 3
+        harness.buildCombined(renewal = setOf(USD), revalidation = setOf(TETHER))
+        val run = harness.start()
+        advanceUntilIdle()
+
+        val stopped = run.outcome as TopicCommandOutcome.Stopped
+        assertEquals(TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT, stopped.reason)
+        assertEquals(TopicAuthEnd.Kind.CREDENTIAL_UNAVAILABLE, stopped.authEnd?.kind)
+        assertEquals(3, harness.credentialReadCount)
+        assertEquals(0, harness.requests.size)
+        harness.cleanUp()
+    }
+
+    /**
+     * A revalidation handed the reading its registration took is judged against it (L-4e E6b): a frame between that reading and
+     * the command starting answered the question, and reading again at the start would absorb it and ask anyway.
+     */
+    @Test
+    fun `a revalidation judged from its registration's entry does not read its own`() = runTest {
+        val harness = Harness(this)
+        harness.build(TopicCommandPurpose.REVALIDATION, revalidationEntry = mapOf(USD to 0L))
+        harness.store.recordFrame(USD)
+        val run = harness.start()
+        advanceUntilIdle()
+
+        assertEquals("등록이 읽은 기준 뒤의 수신을 흡수하고 물었다", 0, harness.requests.size)
+        assertEquals(TopicCommandOutcome.AlreadyDelivering(setOf(USD)), run.outcome)
+        harness.cleanUp()
+    }
+
+    /** A combined command without the reading its registration took is refused where it is built. */
+    @Test
+    fun `a combined command needs the entry its registration read`() = runTest {
+        val harness = Harness(this)
+        val failure = runCatching { harness.build(TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION) }.exceptionOrNull()
+        assertTrue("기준 없는 합친 명령이 만들어졌다", failure is IllegalArgumentException)
         harness.cleanUp()
     }
 }
