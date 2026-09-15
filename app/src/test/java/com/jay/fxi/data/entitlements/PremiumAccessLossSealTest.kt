@@ -1,5 +1,6 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentityFence
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
@@ -189,7 +190,8 @@ class PremiumAccessLossSealTest {
             jitter = ProbeJitter.None,
             persistenceRetryDelayMillis = RETRY,
             liveFence = { source.liveFence },
-            onLossReapprovalScheduled = { intent, binding -> reapprovals += intent to binding }
+            onLossReapprovalScheduled = { intent, binding -> reapprovals += intent to binding },
+            orders = AccessOrderSequence()
         )
         return Harness(store, source, purger, coordinator, reapprovals)
     }

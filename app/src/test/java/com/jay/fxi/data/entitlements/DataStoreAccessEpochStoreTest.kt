@@ -1,5 +1,6 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
@@ -434,7 +435,8 @@ class DataStoreAccessEpochStoreTest {
             scope = coordinatorScope,
             clock = { 0L },
             jitter = ProbeJitter.None,
-            liveFence = { null }
+            liveFence = { null },
+            orders = AccessOrderSequence()
         )
         try {
             val settling = async { coordinator.onUnverifiedStart() }

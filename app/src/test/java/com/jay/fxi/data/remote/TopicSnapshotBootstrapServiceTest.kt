@@ -1,5 +1,6 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthTokenProvider
@@ -56,7 +57,7 @@ class TopicSnapshotBootstrapServiceTest {
         server = MockWebServer()
         server.start()
         source = FakeAuthTokenSource()
-        val provider = AuthTokenProvider(source)
+        val provider = AuthTokenProvider(source, orders = AccessOrderSequence())
         val http = OkHttpClient.Builder()
             .retryOnConnectionFailure(false)
             .followRedirects(false)

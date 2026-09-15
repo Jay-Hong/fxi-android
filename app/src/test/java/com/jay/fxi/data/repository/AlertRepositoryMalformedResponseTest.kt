@@ -1,5 +1,6 @@
 package com.jay.fxi.data.repository
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.auth.AuthTokenSource
@@ -44,7 +45,7 @@ class AlertRepositoryMalformedResponseTest {
                     forceRefresh: Boolean
                 ): String = "credential"
             }
-            val provider = AuthTokenProvider(source, backgroundScope)
+            val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
             val client = OkHttpClient.Builder()
                 .addInterceptor(AuthSnapshotInterceptor(provider))
                 .addInterceptor(MutationOneShotInterceptor())

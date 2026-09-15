@@ -1,5 +1,6 @@
 package com.jay.fxi.ui.screen
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthTokenProvider
@@ -199,11 +200,13 @@ class RootViewModelTest {
 
         /** Runs once after an answer is formed and before it returns. */
         var afterFetch: () -> Unit = {}
+        /** The provider and the issuer share one order, as in production. */
+        private val orders = AccessOrderSequence()
         private val tokens = AuthTokenProvider(object : AuthTokenSource {
             override fun currentIdentity() = identity
             override suspend fun fetchToken(identity: AuthIdentity, forceRefresh: Boolean): String =
                 error("Root must only read the non-suspend fence, never fetch a token")
-        }, scope)
+        }, scope, orders)
         private val source = object : EntitlementsSource {
             override suspend fun currentIdentity(): EntitlementsIdentity? =
                 identity?.let { EntitlementsIdentity(it.uid, it.authGeneration) }
@@ -222,7 +225,8 @@ class RootViewModelTest {
             capabilityPurger = CapabilityScopePurger { PurgeResult.Completed },
             scope = scope,
             clock = { testScope.testScheduler.currentTime },
-            liveFence = tokens::currentIdentityFence
+            liveFence = tokens::currentIdentityFence,
+            orders = orders
         )
         val root = RootViewModel(coordinator, tokens)
 

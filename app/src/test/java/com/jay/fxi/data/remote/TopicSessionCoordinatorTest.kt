@@ -1,5 +1,6 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.entitlements.PremiumAccessTopicGrantIssuer
 import com.jay.fxi.data.entitlements.TopicGrantDeliverer
@@ -985,7 +986,8 @@ class TopicSessionCoordinatorTest {
             scope = h.scope,
             clock = { test.testScheduler.currentTime },
             jitter = ProbeJitter.None,
-            liveFence = { AuthIdentityFence("u1", 1L) }
+            liveFence = { AuthIdentityFence("u1", 1L) },
+            orders = AccessOrderSequence()
         )
 
         init {

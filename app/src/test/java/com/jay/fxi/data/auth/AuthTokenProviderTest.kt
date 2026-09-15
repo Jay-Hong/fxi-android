@@ -29,7 +29,7 @@ class AuthTokenProviderTest {
             releaseFetch.await()
             "token-a"
         }
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
 
         val first = async { provider.currentSnapshot() }
         fetchStarted.await()
@@ -55,7 +55,8 @@ class AuthTokenProviderTest {
         val processJob = SupervisorJob()
         val provider = AuthTokenProvider(
             source,
-            CoroutineScope(processJob + StandardTestDispatcher(testScheduler))
+            CoroutineScope(processJob + StandardTestDispatcher(testScheduler)),
+            AccessOrderSequence()
         )
         val lookup = async {
             runCatching { provider.currentSnapshot() }
@@ -75,7 +76,7 @@ class AuthTokenProviderTest {
         val identity = AuthIdentity("user-a", 2)
         val source = FakeAuthTokenSource(identity)
         source.fetch = { _, forceRefresh -> if (forceRefresh) "fresh-token" else "old-token" }
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val rejected = provider.currentSnapshot()
 
         val first = async { provider.refreshAfterUnauthorized(rejected) }
@@ -95,7 +96,7 @@ class AuthTokenProviderTest {
             if (forceRefresh) currentToken = "fresh-token"
             currentToken
         }
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val rejected = provider.currentSnapshot()
 
         assertEquals("fresh-token", provider.refreshAfterUnauthorized(rejected)?.token)
@@ -109,7 +110,7 @@ class AuthTokenProviderTest {
         val identity = AuthIdentity("user-a", 8)
         val source = FakeAuthTokenSource(identity)
         source.fetch = { _, _ -> "same-token" }
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val rejected = provider.currentSnapshot()
 
         assertNull(provider.refreshAfterUnauthorized(rejected))
@@ -128,7 +129,8 @@ class AuthTokenProviderTest {
         val processJob = SupervisorJob()
         val provider = AuthTokenProvider(
             source,
-            CoroutineScope(processJob + StandardTestDispatcher(testScheduler))
+            CoroutineScope(processJob + StandardTestDispatcher(testScheduler)),
+            AccessOrderSequence()
         )
         val rejected = provider.currentSnapshot()
 
@@ -158,7 +160,7 @@ class AuthTokenProviderTest {
                 "fresh-token"
             }
         }
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val rejected = provider.currentSnapshot()
 
         val first = async { runCatching { provider.refreshAfterUnauthorized(rejected) } }
@@ -184,7 +186,7 @@ class AuthTokenProviderTest {
         val identity = AuthIdentity("user-a", 3)
         val source = FakeAuthTokenSource(identity)
         source.fetch = { _, forceRefresh -> if (forceRefresh) "third-token" else "second-token" }
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val replayed = provider.currentSnapshot()
         provider.recordRejected(replayed)
 
@@ -196,7 +198,7 @@ class AuthTokenProviderTest {
     fun rejectedCredentials_areNotForgottenAfterMoreThanSixteenTokens() = runTest {
         val identity = AuthIdentity("user-a", 3)
         val source = FakeAuthTokenSource(identity)
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val oldest = AuthSnapshot(identity.uid, identity.authGeneration, "rejected-0")
 
         repeat(17) { index ->
@@ -212,7 +214,7 @@ class AuthTokenProviderTest {
     @Test
     fun rejectedCredential_isScopedToItsExactAuthGeneration() = runTest {
         val source = FakeAuthTokenSource(AuthIdentity("user-a", 1))
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         provider.recordRejected(AuthSnapshot("user-a", 1, "same-token"))
 
         source.identity = AuthIdentity("user-a", 2)
@@ -224,7 +226,7 @@ class AuthTokenProviderTest {
     @Test
     fun explicitSessionInvalidation_makesOldSnapshotStaleBeforeFirebaseSignOut() = runTest {
         val source = FakeAuthTokenSource(AuthIdentity("user-a", 4))
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val oldSnapshot = provider.currentSnapshot()
 
         assertTrue(provider.invalidateCurrentSession(oldSnapshot.fence))
@@ -235,7 +237,7 @@ class AuthTokenProviderTest {
     @Test
     fun appOwnedSignIn_advancesAnExistingSameUidGenerationBeforeSdkMutation() = runTest {
         val source = FakeAuthTokenSource(AuthIdentity("user-a", 4))
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val oldSnapshot = provider.currentSnapshot()
 
         assertTrue(provider.advanceGenerationBeforeSignIn())
@@ -263,7 +265,7 @@ class AuthTokenProviderTest {
                 forceRefresh: Boolean
             ): String = "credential"
         }
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
 
         val failure = runCatching { provider.currentSnapshot() }.exceptionOrNull()
 
@@ -288,7 +290,7 @@ class AuthTokenProviderTest {
                 else -> "new-rejected"
             }
         }
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val generationOne = provider.currentSnapshot()
         val oldRefresh = async {
             runCatching { provider.refreshAfterUnauthorized(generationOne) }

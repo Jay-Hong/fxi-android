@@ -56,7 +56,7 @@ class AuthTokenProviderCompletionOrderTest {
         val source = Source(AuthIdentity("user-a", 1))
         val manual = ManualDispatcher()
         val job = SupervisorJob()
-        val provider = AuthTokenProvider(source, CoroutineScope(job + manual))
+        val provider = AuthTokenProvider(source, CoroutineScope(job + manual), AccessOrderSequence())
 
         val first = async { provider.currentSnapshot() }
         runCurrent()
@@ -94,7 +94,7 @@ class AuthTokenProviderCompletionOrderTest {
         val source = Source(AuthIdentity("user-a", 1))
         val manual = ManualDispatcher()
         val job = SupervisorJob()
-        val provider = AuthTokenProvider(source, CoroutineScope(job + manual))
+        val provider = AuthTokenProvider(source, CoroutineScope(job + manual), AccessOrderSequence())
         fun drain() {
             while (manual.queue.isNotEmpty()) {
                 manual.runNext()
@@ -135,7 +135,7 @@ class AuthTokenProviderCompletionOrderTest {
         val source = Source(AuthIdentity("user-a", 1)).apply { cancelFirstForced = true }
         val manual = ManualDispatcher()
         val job = SupervisorJob()
-        val provider = AuthTokenProvider(source, CoroutineScope(job + manual))
+        val provider = AuthTokenProvider(source, CoroutineScope(job + manual), AccessOrderSequence())
         fun drain() {
             while (manual.queue.isNotEmpty()) {
                 manual.runNext()

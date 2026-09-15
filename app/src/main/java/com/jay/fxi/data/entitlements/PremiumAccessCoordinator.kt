@@ -1,5 +1,7 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AccessOrderSequence
+import com.jay.fxi.data.auth.AuthCredentialRecovery
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.remote.TopicGrantToken
 import com.jay.fxi.data.remote.TopicSessionFence
@@ -23,7 +25,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.util.concurrent.atomic.AtomicLong
 
 /** Between automatic persistence rounds. Long enough that a transient disk fault can clear. */
 private const val DEFAULT_PERSISTENCE_RETRY_DELAY_MILLIS = 2_000L
@@ -62,6 +63,11 @@ class PremiumAccessCoordinator(
      * suspension before that decision.
      */
     private val liveFence: () -> AuthIdentityFence?,
+    /**
+     * The order shared with [com.jay.fxi.data.auth.AuthTokenProvider] (S1 recovery signal §3). Production passes the one singleton;
+     * no default, since a sequence of this class's own would compare with nothing the provider stamps.
+     */
+    private val orders: AccessOrderSequence,
     /** Test barrier before completion delivery, outside both locks. Production leaves it empty. */
     private val beforeRecheckSettled: suspend (Long, Long) -> Unit = { _, _ -> },
     /** Observes a loss re-approval after the scheduler accepts it. */
@@ -136,12 +142,14 @@ class PremiumAccessCoordinator(
     /**
      * One sequence for demands, query starts and reported refusals, so "started after the demand" and "started after the refusal"
      * can be compared. Demands and query starts take it under [mutex]; a refusal takes it from the session's scope without the
-     * mutex, through [rejectionLedger] (L-4e E4a §3.5).
+     * mutex, through [rejectionLedger] (L-4e E4a §3.5). The token provider stamps acquisition starts, failures and recoveries from
+     * the same [orders], which only adds gaps between these numbers: every comparison here is strict or a maximum, and a number is
+     * never re-taken for an existing query or demand.
      */
-    private val nextOrderSeq = AtomicLong(0L)
+    private fun nextOrder(): Long = orders.next()
 
     /** The refusals sessions reported and the order of the latest, for the grant last issued (L-4e E4a §3.5). */
-    private val rejectionLedger = TopicRejectionLedger { nextOrderSeq.incrementAndGet() }
+    private val rejectionLedger = TopicRejectionLedger(orders::next)
 
     /** Queries that have started and have not finished applying, by their start order. Guarded by [mutex]. */
     private val inFlightQueries = HashMap<Long, InFlightQuery>()
@@ -152,12 +160,14 @@ class PremiumAccessCoordinator(
         /** The intent the current demand owes, or null with none. */
         val owedIntent: RefreshIntent? = null,
         /** Start orders of the queries still running, ascending (L-4e E4a). */
-        val inFlightOrders: List<Long> = emptyList()
+        val inFlightOrders: List<Long> = emptyList(),
+        /** An authentication answer stopped automatic re-queries (S1 recovery signal §3). */
+        val authStopped: Boolean = false
     )
 
     /** Immutable diagnostic snapshot, including any registration incorrectly retained from an old binding. */
     internal suspend fun recheckDiagnostics(): RecheckDiagnostics = mutex.withLock {
-        RecheckDiagnostics(probeEpoch, inFlightQueries.size, recheckDemand?.intent, inFlightQueries.keys.sorted())
+        RecheckDiagnostics(probeEpoch, inFlightQueries.size, recheckDemand?.intent, inFlightQueries.keys.sorted(), authStopped)
     }
 
     /** Diagnostic: how many loss candidates still hold access back (S1r-2c). */
@@ -168,6 +178,19 @@ class PremiumAccessCoordinator(
 
     /** The order of the event that last stopped or resumed [authStopped]; an answer that started earlier moves neither. */
     private var authStateOrder: Long = 0L
+
+    /**
+     * When an authentication stop was last applied: a fresh number at every accepted authentication answer, whether re-queries
+     * were already stopped or not (S1 recovery signal §3). A recovery decided before it is older than that stop. Guarded by
+     * [mutex]; a binding's end resets it.
+     */
+    private var authStopAppliedOrder: Long = 0L
+
+    /** When the current binding started: taken in [cancelProbeLocked], ahead of its first query. Guarded by [mutex]. */
+    private var bindingStartedOrder: Long = 0L
+
+    /** The latest recovery episode that resumed re-queries. Episodes only grow, across bindings too. Guarded by [mutex]. */
+    private var consumedRecoveryEpisode: Long = 0L
 
     /** A loss re-approval not yet reported through onLossReapprovalScheduled, because nothing could be armed for it yet. */
     private var unreportedReapproval: RefreshIntent? = null
@@ -1391,6 +1414,9 @@ class PremiumAccessCoordinator(
         recheckDemand = null
         authStopped = false
         authStateOrder = 0L
+        // Its stop marker too; the binding that starts here gets its own start order, before any query it owns.
+        authStopAppliedOrder = 0L
+        bindingStartedOrder = nextOrder()
         unreportedReapproval = null
         // Not republished here: every caller publishes NoGrant next, with no suspension between (S1r-2c §2.1). Republishing
         // now would show the ending binding's grant with its holds already gone.
@@ -1552,7 +1578,7 @@ class PremiumAccessCoordinator(
                 forcePremiumOwner = record.ownerUid
             }
             schedule.recordQueryStarted()
-            val order = nextOrderSeq.incrementAndGet()
+            val order = nextOrder()
             inFlightQueries[order] = InFlightQuery(probeEpoch, queryIntent)
             StartedQuery(
                 record.fence(), decisionGeneration, boundIdentityLocked(), order, probeEpoch, queryIntent, userAccessInvalidations
@@ -1965,6 +1991,7 @@ class PremiumAccessCoordinator(
             if (authentication) {
                 authStopped = true
                 authStateOrder = started.order
+                authStopAppliedOrder = nextOrder()
             } else if (authStopped) {
                 authStopped = false
                 authStateOrder = started.order
@@ -2022,9 +2049,9 @@ class PremiumAccessCoordinator(
     private fun raiseDemandLocked(intent: RefreshIntent, independent: Boolean) {
         val current = recheckDemand
         recheckDemand = when {
-            current == null -> RecheckDemand(probeEpoch, intent, nextOrderSeq.incrementAndGet())
+            current == null -> RecheckDemand(probeEpoch, intent, nextOrder())
             independent || intent > current.intent ->
-                RecheckDemand(probeEpoch, maxOf(intent, current.intent), nextOrderSeq.incrementAndGet())
+                RecheckDemand(probeEpoch, maxOf(intent, current.intent), nextOrder())
             else -> current
         }
     }
@@ -2056,9 +2083,42 @@ class PremiumAccessCoordinator(
     private fun inFlightCoversLocked(binding: Long, intent: RefreshIntent): Boolean =
         inFlightQueries.values.any { it.binding == binding && it.intent >= intent }
 
+    /**
+     * The token provider saw a credential for the bound identity again after a failure (S1 recovery signal §3).
+     *
+     * Resumes the re-queries an authentication answer stopped — once per recovery, and only for a recovery of this binding's
+     * identity, as the live tracker still reads it, whose acquisition started after this binding and after the answer that
+     * stopped, decided after that stop was applied, in an episode not yet used. With nothing owed it asks nothing. It is not a
+     * caller: it takes no order of its own, and moves no floor, demand, premium or KRX state, epoch, grant or refusal latch.
+     *
+     * While access is refused a recovery is dropped, not kept. In today's wiring a sign-out's preparation and an identity
+     * transition's hold have already ended the stopped binding, and the startup purge's hold comes before the first binding, so
+     * no refused recovery matches a stop it could resume. A lifetime that keeps a binding's stop across a closed and reopened
+     * admission has to redesign this.
+     */
+    internal suspend fun onCredentialRecovered(recovery: AuthCredentialRecovery) {
+        mutex.withLock {
+            if (!accessAdmittedLocked() || !recoveryQualifiesLocked(recovery)) return
+            consumedRecoveryEpisode = recovery.episode
+            authStopped = false
+            authStateOrder = recovery.recoveredOrder
+            ensureDemandArmedLocked()
+        }
+    }
+
+    private fun recoveryQualifiesLocked(recovery: AuthCredentialRecovery): Boolean {
+        if (!authStopped) return false
+        val bound = boundIdentityLocked() ?: return false
+        if (recovery.fence.uid != bound.ownerUid || recovery.fence.authGeneration != bound.authGeneration) return false
+        if (liveFence() != recovery.fence) return false
+        return recovery.fetchStartedOrder > maxOf(bindingStartedOrder, authStateOrder) &&
+            recovery.recoveredOrder > authStopAppliedOrder &&
+            recovery.episode > consumedRecoveryEpisode
+    }
+
     private fun resumeAfterAuthStopLocked() {
         authStopped = false
-        authStateOrder = nextOrderSeq.incrementAndGet()
+        authStateOrder = nextOrder()
     }
 
     /** A timer finished, fired or not. Only the latest arming of this binding looks again; later ones own what follows. */

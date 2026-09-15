@@ -1,5 +1,6 @@
 package com.jay.fxi.data.free
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthTokenProvider
@@ -49,7 +50,7 @@ class AuthenticatedFreeSnapshotServiceTest {
     @Before
     fun setUp() {
         source = TokenSource()
-        val provider = AuthTokenProvider(source)
+        val provider = AuthTokenProvider(source, orders = AccessOrderSequence())
         http = OkHttpClient.Builder()
             .retryOnConnectionFailure(false)
             .followRedirects(false)

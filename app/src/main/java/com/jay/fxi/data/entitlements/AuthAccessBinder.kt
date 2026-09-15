@@ -1,7 +1,10 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AuthCredentialRecovery
+import com.jay.fxi.data.auth.AuthCredentialRecoveryStream
 import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.auth.AuthIdentityFence
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CancellationException
@@ -71,6 +74,8 @@ class AuthAccessBinder(
     private val coordinator: PremiumAccessCoordinator,
     private val scope: CoroutineScope,
     private val fenceStream: AuthFenceStream,
+    /** Credential recoveries for [PremiumAccessCoordinator.onCredentialRecovered] (S1 recovery signal §2.2, §3). */
+    private val recoveryStream: AuthCredentialRecoveryStream,
     /** Off only in tests that drive [recoverSignOut] themselves. */
     private val recoverAutomatically: Boolean = true
 ) {
@@ -121,6 +126,17 @@ class AuthAccessBinder(
         }
     )
 
+    /**
+     * Recoveries, apart from [inbox] and consumed on their own: identity work waiting out a hold must not keep a recovery
+     * waiting, and a recovery must not hold up identity or sign-out work. Unbounded for the same reason as [inbox]; a recovery
+     * that reaches the coordinator while access is refused is dropped there. Cancelled once its consumer ends, so a recovery the
+     * provider hands over afterwards is refused instead of kept.
+     */
+    private val recoveries = Channel<AuthCredentialRecovery>(capacity = Channel.UNLIMITED)
+
+    /** One start per binder: a second would add a second identity consumer and a second recovery subscription. */
+    private val started = AtomicBoolean(false)
+
     /** Confined to the single consumer, so it needs no synchronisation. */
     private var boundFence: AuthIdentityFence? = null
 
@@ -134,7 +150,7 @@ class AuthAccessBinder(
     private var firstObservationPending = true
 
     /**
-     * Starts consuming, then registers the stream.
+     * Subscribes to recoveries, starts consuming, then registers the fence stream. Once per binder: a later call does nothing.
      *
      * The purge resume runs before the loop rather than relying on the cleanup behind an identity
      * edit: a signed-out cold start with nothing to retire lands no edit at all, and a journal a
@@ -146,6 +162,15 @@ class AuthAccessBinder(
      * whose `finally` stops the consumer. Nothing is accepted until it reports completion.
      */
     fun start() {
+        if (!started.compareAndSet(false, true)) return
+        // First, before the fence replay below binds anyone and opens the first query: the provider does not replay, so a
+        // recovery decided after this call is what the coordinator can rely on seeing (S1 recovery signal §2.2).
+        recoveryStream.observe { recovery -> recoveries.trySend(recovery) }
+        scope.launch {
+            for (recovery in recoveries) coordinator.onCredentialRecovered(recovery)
+        }.invokeOnCompletion {
+            recoveries.cancel()
+        }
         scope.launch(Consumer()) {
             try {
                 driveStartupPurge()

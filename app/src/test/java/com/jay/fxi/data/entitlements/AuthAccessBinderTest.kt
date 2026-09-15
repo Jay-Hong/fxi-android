@@ -1,5 +1,8 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AccessOrderSequence
+import com.jay.fxi.data.auth.AuthCredentialRecovery
+import com.jay.fxi.data.auth.AuthCredentialRecoveryStream
 import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
@@ -13,6 +16,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
@@ -194,7 +198,16 @@ class AuthAccessBinderTest {
          * test that drives [AuthAccessBinder.onFenceObserved] itself controls every observation.
          */
         replaying: Boolean = false,
-        initial: AuthIdentityFence? = null
+        initial: AuthIdentityFence? = null,
+        /** No recoveries unless a test hands a stream over. */
+        recovery: AuthCredentialRecoveryStream = AuthCredentialRecoveryStream { },
+        /** Runs when the binder registers with the fence stream. */
+        onFenceSubscribed: () -> Unit = {},
+        /** What every query is answered. */
+        outcome: EntitlementsOutcome = EntitlementsOutcome.StableInactive(krxVisible = false),
+        orders: AccessOrderSequence = AccessOrderSequence(),
+        /** Runs dispatched work at once, as an immediate dispatcher would. */
+        immediate: Boolean = false
     ): AuthAccessBinder {
         if (seedJournal) {
             // A journal a previous process left behind — the only thing that makes a resume
@@ -215,7 +228,8 @@ class AuthAccessBinderTest {
         }
         val handler = uncaught?.let { sink -> CoroutineExceptionHandler { _, failure -> sink += failure } }
         val scope = CoroutineScope(
-            processJob + StandardTestDispatcher(testScheduler) + (handler ?: EmptyCoroutineContext)
+            processJob + (if (immediate) UnconfinedTestDispatcher(testScheduler) else StandardTestDispatcher(testScheduler)) +
+                (handler ?: EmptyCoroutineContext)
         )
         val coordinator = PremiumAccessCoordinator(
             source = object : EntitlementsSource {
@@ -230,10 +244,7 @@ class AuthAccessBinderTest {
 
                 override suspend fun fetch(freshPremium: Boolean): EntitlementsResult {
                     fetches += freshPremium
-                    return EntitlementsResult.Answered(
-                        identity = boundIdentity(),
-                        outcome = EntitlementsOutcome.StableInactive(krxVisible = false)
-                    )
+                    return EntitlementsResult.Answered(identity = boundIdentity(), outcome = outcome)
                 }
 
                 override suspend fun currentIdentity(): EntitlementsIdentity = boundIdentity()
@@ -244,14 +255,80 @@ class AuthAccessBinderTest {
             scope = scope,
             clock = { testScheduler.currentTime },
             jitter = ProbeJitter.None,
-            liveFence = live
+            liveFence = live,
+            orders = orders
         )
         built = coordinator
         onCoordinator(coordinator)
         // No stream unless asked: most tests drive onFenceObserved themselves, so registration order
         // cannot make them pass for the wrong reason. The replaying stream is for the start-up order.
-        val stream = if (replaying) AuthFenceStream { onFence -> onFence(initial) } else AuthFenceStream { }
-        return AuthAccessBinder(coordinator, scope, stream, recoverAutomatically)
+        val stream = if (replaying) {
+            AuthFenceStream { onFence -> onFenceSubscribed(); onFence(initial) }
+        } else {
+            AuthFenceStream { onFenceSubscribed() }
+        }
+        return AuthAccessBinder(coordinator, scope, stream, recovery, recoverAutomatically)
+    }
+
+    /** S1 recovery signal §2.2: the provider does not replay, so recoveries are subscribed before the fence replay binds anyone. */
+    @Test
+    fun recoveries_areSubscribedBeforeTheFenceStream() = runTest {
+        val subscribed = mutableListOf<String>()
+        val binder = build(
+            mutableListOf(),
+            recovery = AuthCredentialRecoveryStream { subscribed += "recovery" },
+            onFenceSubscribed = { subscribed += "fence" }
+        )
+
+        binder.start()
+        binder.start()
+
+        assertEquals("a second start subscribed again", listOf("recovery", "fence"), subscribed)
+        processJob.cancel()
+    }
+
+    /** A recovery the stream hands over reaches the coordinator on its own lane and resumes what authentication stopped. */
+    @Test
+    fun aRecoveryFromTheStream_resumesTheBoundCoordinator() = runTest {
+        recoveryThroughTheBinder(immediate = false)
+    }
+
+    /** The same with an immediate dispatcher: the recovery lane is subscribed and consuming before anything it could miss. */
+    @Test
+    fun aRecoveryFromTheStream_resumesTheBoundCoordinator_onAnImmediateDispatcher() = runTest {
+        recoveryThroughTheBinder(immediate = true)
+    }
+
+    private suspend fun TestScope.recoveryThroughTheBinder(immediate: Boolean) {
+        val fence = AuthIdentityFence("user-a", 1L)
+        val orders = AccessOrderSequence()
+        var deliver: (AuthCredentialRecovery) -> Unit = {}
+        var coordinator: PremiumAccessCoordinator? = null
+        val binder = build(
+            mutableListOf(),
+            live = { fence },
+            onCoordinator = { coordinator = it },
+            replaying = true,
+            initial = fence,
+            recovery = AuthCredentialRecoveryStream { deliver = it },
+            outcome = EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION),
+            orders = orders,
+            immediate = immediate
+        )
+        binder.start()
+        runCurrent()
+        val bound = checkNotNull(coordinator)
+        assertTrue("the binding's query did not stop", bound.recheckDiagnostics().authStopped)
+
+        deliver(AuthCredentialRecovery(fence, 1L, orders.next(), orders.next()))
+        runCurrent()
+
+        assertFalse(bound.recheckDiagnostics().authStopped)
+        processJob.cancel()
+        runCurrent()
+        // The lane has ended: a recovery handed over now is refused, not thrown or kept.
+        deliver(AuthCredentialRecovery(fence, 2L, orders.next(), orders.next()))
+        runCurrent()
     }
 
     @Test

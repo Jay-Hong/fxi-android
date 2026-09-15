@@ -1,5 +1,6 @@
 package com.jay.fxi.ui.auth
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthTokenProvider
@@ -183,7 +184,7 @@ class AuthViewModelSignOutTest {
                     forceRefresh: Boolean
                 ): String = "credential"
             }
-            val provider = AuthTokenProvider(source, backgroundScope)
+            val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
             val staleSnapshot = provider.currentSnapshot()
             val coordinator = AuthTransitionCoordinator(provider)
 

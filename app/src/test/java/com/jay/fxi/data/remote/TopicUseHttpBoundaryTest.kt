@@ -1,5 +1,6 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthSnapshot
@@ -60,7 +61,7 @@ class TopicUseHttpBoundaryTest {
         server = MockWebServer()
         server.start()
         source = FakeAuthTokenSource()
-        provider = AuthTokenProvider(source)
+        provider = AuthTokenProvider(source, orders = AccessOrderSequence())
     }
 
     @After
@@ -278,7 +279,7 @@ class TopicUseHttpBoundaryTest {
     @Test
     fun `a replay refused before it is sent closes the 401 it holds`() = runTest {
         val tokens = FakeAuthTokenSource()
-        val transport = AuthenticatedTransport(AuthTokenProvider(tokens, backgroundScope), admitted = { true })
+        val transport = AuthenticatedTransport(AuthTokenProvider(tokens, backgroundScope, AccessOrderSequence()), admitted = { true })
         val body = TrackedBody("expired")
         var calls = 0
 
@@ -302,7 +303,7 @@ class TopicUseHttpBoundaryTest {
     @Test
     fun `a replayed 401 whose rejection cannot be recorded is closed before the failure goes on`() = runTest {
         val tokens = FakeAuthTokenSource()
-        val transport = AuthenticatedTransport(AuthTokenProvider(tokens, backgroundScope), admitted = { true })
+        val transport = AuthenticatedTransport(AuthTokenProvider(tokens, backgroundScope, AccessOrderSequence()), admitted = { true })
         val replayBody = TrackedBody("still expired")
         var calls = 0
 
@@ -327,7 +328,7 @@ class TopicUseHttpBoundaryTest {
     @Test
     fun `an identity that moved just before the replay refuses it as an identity change, and carries the 401`() = runTest {
         val tokens = FakeAuthTokenSource()
-        val transport = AuthenticatedTransport(AuthTokenProvider(tokens, backgroundScope), admitted = { true })
+        val transport = AuthenticatedTransport(AuthTokenProvider(tokens, backgroundScope, AccessOrderSequence()), admitted = { true })
         var calls = 0
 
         val refused = runCatching {
@@ -349,7 +350,7 @@ class TopicUseHttpBoundaryTest {
     @Test
     fun `an answer refused because the identity moved while it was out keeps the responses before it`() = runTest {
         val tokens = FakeAuthTokenSource()
-        val transport = AuthenticatedTransport(AuthTokenProvider(tokens, backgroundScope), admitted = { true })
+        val transport = AuthenticatedTransport(AuthTokenProvider(tokens, backgroundScope, AccessOrderSequence()), admitted = { true })
         var calls = 0
 
         val refused = runCatching {

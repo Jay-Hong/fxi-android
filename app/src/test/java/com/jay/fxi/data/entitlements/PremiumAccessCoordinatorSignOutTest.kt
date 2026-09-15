@@ -1,5 +1,6 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.domain.model.TopicRejectionReason
 import java.io.IOException
@@ -173,7 +174,8 @@ class PremiumAccessCoordinatorSignOutTest {
             scope = CoroutineScope(processJob + StandardTestDispatcher(testScheduler)),
             clock = { testScheduler.currentTime },
             jitter = ProbeJitter.None,
-            liveFence = { current }
+            liveFence = { current },
+            orders = AccessOrderSequence()
         )
         return Harness(coordinator, store, purger, { fetchCount }, { current = it }, release)
     }

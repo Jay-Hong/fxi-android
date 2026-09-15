@@ -1,5 +1,6 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.domain.model.TopicRejectionReason
 import com.jay.fxi.service.pushRegistrationAllowed
@@ -149,7 +150,8 @@ class PremiumAccessLossCandidateTest {
             clock = { testScheduler.currentTime },
             jitter = ProbeJitter.None,
             persistenceRetryDelayMillis = RETRY,
-            liveFence = { source.liveFence }
+            liveFence = { source.liveFence },
+            orders = AccessOrderSequence()
         )
         return Harness(store, source, purger, coordinator)
     }

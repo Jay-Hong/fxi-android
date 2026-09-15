@@ -1,6 +1,7 @@
 package com.jay.fxi.service
 
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
@@ -94,7 +95,7 @@ class ApiPushDeviceServerTest {
     fun setUp() {
         web = MockWebServer()
         web.start()
-        val provider = AuthTokenProvider(source)
+        val provider = AuthTokenProvider(source, orders = AccessOrderSequence())
         val http = OkHttpClient.Builder()
             .retryOnConnectionFailure(false)
             .followRedirects(false)

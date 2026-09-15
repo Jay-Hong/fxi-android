@@ -1,5 +1,6 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentityFence
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
@@ -187,7 +188,8 @@ class PremiumAccessTopicSnapshotTest {
             jitter = ProbeJitter.None,
             persistenceRetryDelayMillis = RETRY,
             liveFence = { source.liveFence },
-            onLossReapprovalScheduled = { _, _ -> hooks.onReapproval() }
+            onLossReapprovalScheduled = { _, _ -> hooks.onReapproval() },
+            orders = AccessOrderSequence()
         )
         return Harness(store, source, coordinator, hooks)
     }

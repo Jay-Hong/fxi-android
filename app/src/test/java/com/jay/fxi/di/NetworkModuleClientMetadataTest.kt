@@ -1,6 +1,7 @@
 package com.jay.fxi.di
 
 import com.jay.fxi.admission.ReleaseAdmissionInterceptor
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.auth.AuthTokenSource
@@ -35,7 +36,8 @@ class NetworkModuleClientMetadataTest {
                 override fun currentIdentity(): AuthIdentity? = null
                 override suspend fun fetchToken(identity: AuthIdentity, forceRefresh: Boolean) =
                     error("not used")
-            }
+            },
+            orders = AccessOrderSequence()
         )
         val authInterceptor = AuthSnapshotInterceptor(provider)
         val useInterceptor = TopicUseNetworkInterceptor(provider)

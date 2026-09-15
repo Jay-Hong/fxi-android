@@ -1,5 +1,6 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthSnapshot
@@ -29,7 +30,7 @@ class AuthenticatedTransportTest {
     fun admissionRunsBeforeTokenLookup() = runTest {
         val source = FakeAuthTokenSource()
         val transport = AuthenticatedTransport(
-            AuthTokenProvider(source, backgroundScope),
+            AuthTokenProvider(source, backgroundScope, AccessOrderSequence()),
             admitted = { false }
         )
 
@@ -48,7 +49,7 @@ class AuthenticatedTransportTest {
     fun mutation401_isReturnedWithoutRefreshOrReplay() = runTest {
         val source = FakeAuthTokenSource()
         val transport = AuthenticatedTransport(
-            AuthTokenProvider(source, backgroundScope),
+            AuthTokenProvider(source, backgroundScope, AccessOrderSequence()),
             admitted = { true }
         )
         var calls = 0
@@ -70,7 +71,7 @@ class AuthenticatedTransportTest {
     @Test
     fun read401_refreshesOnce_andReplaysWithBoundFreshSnapshot() = runTest {
         val source = FakeAuthTokenSource()
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val transport = AuthenticatedTransport(provider, admitted = { true })
         val seen = mutableListOf<String>()
         val snapshot = provider.currentSnapshot()
@@ -92,7 +93,7 @@ class AuthenticatedTransportTest {
     @Test
     fun replay401_marksFreshSnapshotRejected_andNeverStartsSecondRefresh() = runTest {
         val source = FakeAuthTokenSource()
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val transport = AuthenticatedTransport(provider, admitted = { true })
         val snapshot = provider.currentSnapshot()
 
@@ -111,7 +112,7 @@ class AuthenticatedTransportTest {
     @Test
     fun lateOld401_doesNotReplayCredentialAlreadyRejectedByConcurrentRequest() = runTest {
         val source = FakeAuthTokenSource()
-        val provider = AuthTokenProvider(source, backgroundScope)
+        val provider = AuthTokenProvider(source, backgroundScope, AccessOrderSequence())
         val transport = AuthenticatedTransport(provider, admitted = { true })
         val firstFinished = CompletableDeferred<Unit>()
         var firstCalls = 0
@@ -143,7 +144,7 @@ class AuthenticatedTransportTest {
     fun identityChangeWhileRequestIsInFlight_discardsResponse() = runTest {
         val source = FakeAuthTokenSource()
         val transport = AuthenticatedTransport(
-            AuthTokenProvider(source, backgroundScope),
+            AuthTokenProvider(source, backgroundScope, AccessOrderSequence()),
             admitted = { true }
         )
         val snapshot = transport.captureSnapshot()
@@ -169,7 +170,7 @@ class AuthenticatedTransportTest {
     fun identityChangeWhileRequestIsInFlight_stillCarriesOutTheRateLimit() = runTest {
         val source = FakeAuthTokenSource()
         val transport = AuthenticatedTransport(
-            AuthTokenProvider(source, backgroundScope),
+            AuthTokenProvider(source, backgroundScope, AccessOrderSequence()),
             admitted = { true }
         )
         val snapshot = transport.captureSnapshot()
@@ -196,7 +197,7 @@ class AuthenticatedTransportTest {
     @Test
     fun authInterceptorUsesCapturedSnapshot_andRedactsItsTag() {
         val source = FakeAuthTokenSource()
-        val provider = AuthTokenProvider(source)
+        val provider = AuthTokenProvider(source, orders = AccessOrderSequence())
         val server = MockWebServer()
         server.enqueue(MockResponse().setResponseCode(204))
         server.start()
@@ -225,7 +226,7 @@ class AuthenticatedTransportTest {
 
     @Test
     fun authInterceptorRejectsMissingSnapshot_beforeNetwork() {
-        val provider = AuthTokenProvider(FakeAuthTokenSource())
+        val provider = AuthTokenProvider(FakeAuthTokenSource(), orders = AccessOrderSequence())
         val server = MockWebServer()
         server.start()
         try {

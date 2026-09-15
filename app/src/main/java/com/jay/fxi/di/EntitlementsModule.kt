@@ -3,6 +3,8 @@ package com.jay.fxi.di
 import android.os.SystemClock
 import com.google.firebase.auth.FirebaseAuth
 import com.jay.fxi.data.entitlements.AccessEpochStore
+import com.jay.fxi.data.auth.AccessOrderSequence
+import com.jay.fxi.data.auth.AuthCredentialRecoveryStream
 import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.entitlements.AuthAccessBinder
@@ -86,7 +88,8 @@ object EntitlementsModule {
         userPurger: UserScopePurger,
         capabilityPurger: CapabilityScopePurger,
         clock: RecheckClock,
-        authTokenProvider: AuthTokenProvider
+        authTokenProvider: AuthTokenProvider,
+        orders: AccessOrderSequence
     ): PremiumAccessCoordinator = PremiumAccessCoordinator(
         source = source,
         store = store,
@@ -95,7 +98,9 @@ object EntitlementsModule {
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
         clock = clock,
         // The same read an app sign-out captures its fence with.
-        liveFence = authTokenProvider::currentIdentityFence
+        liveFence = authTokenProvider::currentIdentityFence,
+        // The provider's own instance: recovery orders and query orders are compared with each other.
+        orders = orders
     )
 
     /**
@@ -140,10 +145,12 @@ object EntitlementsModule {
     @Singleton
     fun provideAuthAccessBinder(
         coordinator: PremiumAccessCoordinator,
-        fenceStream: AuthFenceStream
+        fenceStream: AuthFenceStream,
+        recoveryStream: AuthCredentialRecoveryStream
     ): AuthAccessBinder = AuthAccessBinder(
         coordinator = coordinator,
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-        fenceStream = fenceStream
+        fenceStream = fenceStream,
+        recoveryStream = recoveryStream
     )
 }

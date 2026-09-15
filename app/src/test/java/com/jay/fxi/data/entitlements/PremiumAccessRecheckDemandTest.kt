@@ -1,5 +1,7 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AccessOrderSequence
+import com.jay.fxi.data.auth.AuthCredentialRecovery
 import com.jay.fxi.data.auth.AuthIdentityFence
 import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
@@ -14,6 +16,9 @@ import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -95,7 +100,9 @@ class PremiumAccessRecheckDemandTest {
 
     private fun TestScope.build(
         clock: RecheckClock? = null,
-        beforeSettled: suspend (Long, Long) -> Unit = { _, _ -> }
+        beforeSettled: suspend (Long, Long) -> Unit = { _, _ -> },
+        orders: AccessOrderSequence = AccessOrderSequence(),
+        live: () -> AuthIdentityFence? = { null }
     ): Harness {
         val store = Store()
         val source = Source()
@@ -108,17 +115,20 @@ class PremiumAccessRecheckDemandTest {
             scope = CoroutineScope(processJob + StandardTestDispatcher(testScheduler)),
             clock = clock ?: RecheckClock { testScheduler.currentTime },
             jitter = ProbeJitter.None,
-            liveFence = { null },
-            beforeRecheckSettled = beforeSettled
+            liveFence = live,
+            beforeRecheckSettled = beforeSettled,
+            orders = orders
         )
         return Harness(store, source, purger, coordinator)
     }
 
     /** Bound to [OWNER] and confirmed premium, with nothing scheduled. */
     private suspend fun TestScope.confirmed(
-        beforeSettled: suspend (Long, Long) -> Unit = { _, _ -> }
+        beforeSettled: suspend (Long, Long) -> Unit = { _, _ -> },
+        orders: AccessOrderSequence = AccessOrderSequence(),
+        live: () -> AuthIdentityFence? = { null }
     ): Harness {
-        val h = build(beforeSettled = beforeSettled)
+        val h = build(beforeSettled = beforeSettled, orders = orders, live = live)
         h.coordinator.onIdentityChanged(AuthIdentityFence(OWNER, 1L)).applied()
         h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         runCurrent()
@@ -173,14 +183,28 @@ class PremiumAccessRecheckDemandTest {
 
     @Test
     fun anAnswerThatStartedBeforeTheDemand_doesNotEndIt() = demandTest {
-        val h = confirmed()
+        answerStartedBeforeTheDemand(AccessOrderSequence(), between = {})
+    }
+
+    /** The same with provider numbers taken from the shared order around each step (S1 recovery signal §3). */
+    @Test
+    fun providerNumbersAroundTheDemand_doNotLetAnOlderAnswerEndIt() = demandTest {
+        val orders = AccessOrderSequence()
+        answerStartedBeforeTheDemand(orders, between = { repeat(3) { orders.next() } })
+    }
+
+    private suspend fun TestScope.answerStartedBeforeTheDemand(orders: AccessOrderSequence, between: () -> Unit) {
+        val h = confirmed(orders = orders)
+        between()
         // X asks without fresh_premium and will settle with nothing more to ask.
         h.source.next = { EntitlementsOutcome.StableActive(krxVisible = true) }
         h.source.parkNext = true
         val x = async { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
         runCurrent()
+        between()
         h.source.next = { EntitlementsOutcome.Pending(krxVisible = true, retryAfterSeconds = 60) }
         h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        between()
         val fresh = h.freshFetches()
 
         checkNotNull(h.source.fetches.first { it.gate != null }.gate).complete(Unit)
@@ -751,6 +775,337 @@ class PremiumAccessRecheckDemandTest {
         settle()
 
         assertEquals(total, h.source.fetches.size)
+    }
+
+
+    // --- S1 recovery signal §3: a credential recovery resumes what an authentication answer stopped --------------------------
+
+    private val ownerFence = AuthIdentityFence(OWNER, 1L)
+
+    /** A recovery of [fence] whose acquisition starts and whose recovery is decided now, in that order. */
+    private fun AccessOrderSequence.recovery(episode: Long = 1L, fence: AuthIdentityFence = ownerFence) =
+        AuthCredentialRecovery(fence, episode, fetchStartedOrder = next(), recoveredOrder = next())
+
+    private suspend fun Harness.diagnostics() = coordinator.recheckDiagnostics()
+
+    /**
+     * Stopped by an authentication answer, with a premium re-check owed behind a 90-second `Retry-After` and nothing armed.
+     *
+     * Y (premium) starts first and parks; X starts after it and answers authentication, which stops. Y then answers pending: it
+     * started before the stop, so it resumes nothing, and its re-check keeps only its floor.
+     */
+    private suspend fun TestScope.stoppedWithAFlooredDemand(
+        orders: AccessOrderSequence,
+        live: () -> AuthIdentityFence? = { ownerFence }
+    ): Harness {
+        val h = confirmed(orders = orders, live = live)
+        h.source.next = { EntitlementsOutcome.Pending(krxVisible = true, retryAfterSeconds = 90) }
+        h.source.parkNext = true
+        val y = async { h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+        runCurrent()
+        h.source.next = { EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION) }
+        h.source.parkNext = true
+        val x = async { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+        val (yGate, xGate) = h.source.fetches.mapNotNull { it.gate }
+        xGate.complete(Unit)
+        x.await()
+        yGate.complete(Unit)
+        y.await()
+        runCurrent()
+        val stopped = h.diagnostics()
+        assertTrue("an authentication answer stopped re-queries", stopped.authStopped)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, stopped.owedIntent)
+        return h
+    }
+
+    @Test
+    fun aRecoveryAfterTheStop_resumesTheOwedDemandOnce_withoutCuttingItsFloor() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = stoppedWithAFlooredDemand(orders)
+        val fresh = h.freshFetches()
+        val recovery = orders.recovery()
+
+        h.source.next = { EntitlementsOutcome.StableActive(krxVisible = true) }
+        h.coordinator.onCredentialRecovered(recovery)
+        runCurrent()
+        assertFalse(h.diagnostics().authStopped)
+        advanceTimeBy(89_990)
+        runCurrent()
+        assertEquals("the recovery cut the Retry-After floor", fresh, h.freshFetches())
+
+        settle()
+        assertEquals("the owed premium re-check ran once", fresh + 1, h.freshFetches())
+        assertNull(h.diagnostics().owedIntent)
+        val total = h.source.fetches.size
+        h.coordinator.onCredentialRecovered(recovery)
+        settle()
+        assertEquals("a repeated recovery asked again", total, h.source.fetches.size)
+    }
+
+    /** After a recovery, re-queries are ordinary again: a pending answer retries after its floor, and a decided one settles. */
+    @Test
+    fun afterARecovery_aPendingAnswerRetriesAsUsual_andADecidedOneSettles() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = stoppedWithAFlooredDemand(orders)
+        val beforeRecovery = h.freshFetches()
+        h.coordinator.onCredentialRecovered(orders.recovery())
+        h.source.next = { EntitlementsOutcome.Pending(krxVisible = true, retryAfterSeconds = 60) }
+        advanceTimeBy(90_010)
+        runCurrent()
+        val afterResumed = h.freshFetches()
+        assertEquals("the recovered demand did not fetch its pending answer once", beforeRecovery + 1, afterResumed)
+        assertFalse(h.diagnostics().authStopped)
+        assertEquals(RefreshIntent.FORCE_PREMIUM, h.diagnostics().owedIntent)
+
+        h.source.next = { EntitlementsOutcome.StableActive(krxVisible = true) }
+        advanceTimeBy(59_980)
+        runCurrent()
+        assertEquals("the pending answer's floor was cut", afterResumed, h.freshFetches())
+        settle()
+
+        assertEquals("the pending answer did not retry", afterResumed + 1, h.freshFetches())
+        assertNull(h.diagnostics().owedIntent)
+    }
+
+    @Test
+    fun aRecoveryWithNothingOwed_resumesButAsksNothing() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = confirmed(orders = orders, live = { ownerFence })
+        h.source.next = { EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION) }
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        runCurrent()
+        assertTrue(h.diagnostics().authStopped)
+        assertNull(h.diagnostics().owedIntent)
+        val total = h.source.fetches.size
+
+        h.coordinator.onCredentialRecovered(orders.recovery())
+        settle()
+
+        assertFalse(h.diagnostics().authStopped)
+        assertEquals("with nothing owed a recovery asked", total, h.source.fetches.size)
+    }
+
+    @Test
+    fun aRecoveryDecidedBeforeTheStopWasApplied_isIgnored() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = confirmed(orders = orders, live = { ownerFence })
+        h.source.next = { EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION) }
+        h.source.parkNext = true
+        val x = async { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+        // Started after the stopping query and decided before its answer is applied.
+        val early = orders.recovery()
+        checkNotNull(h.source.fetches.last().gate).complete(Unit)
+        x.await()
+        runCurrent()
+
+        h.coordinator.onCredentialRecovered(early)
+        runCurrent()
+
+        assertTrue("a recovery older than the stop resumed", h.diagnostics().authStopped)
+    }
+
+    @Test
+    fun aRecoveryWhoseAcquisitionStartedBeforeTheStoppingQuery_isIgnored() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = confirmed(orders = orders, live = { ownerFence })
+        val fetchStarted = orders.next()
+        h.source.next = { EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION) }
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        runCurrent()
+
+        h.coordinator.onCredentialRecovered(AuthCredentialRecovery(ownerFence, 1L, fetchStarted, orders.next()))
+        runCurrent()
+
+        assertTrue("a recovery that started before the stopping query resumed", h.diagnostics().authStopped)
+    }
+
+    /**
+     * The resumption is ordered at the recovery, not at its delivery: a leftover re-query that started after the recovery was
+     * decided but before it arrived may still stop again. Then the same recovery resumes nothing; a later episode does.
+     */
+    @Test
+    fun aQueryStartedAfterTheRecoveryMayStopAgain_andOnlyALaterEpisodeResumes() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = stoppedWithAFlooredDemand(orders)
+        val first = orders.recovery(episode = 1L)
+        h.source.next = { EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION) }
+        h.source.parkNext = true
+        val leftover = async { h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM, origin = QueryOrigin.SCHEDULED) }
+        runCurrent()
+
+        h.coordinator.onCredentialRecovered(first)
+        runCurrent()
+        assertFalse(h.diagnostics().authStopped)
+        checkNotNull(h.source.fetches.last().gate).complete(Unit)
+        leftover.await()
+        runCurrent()
+        assertTrue("an authentication answer that started after the recovery did not stop", h.diagnostics().authStopped)
+
+        h.coordinator.onCredentialRecovered(first)
+        runCurrent()
+        assertTrue("a consumed recovery resumed again", h.diagnostics().authStopped)
+        h.coordinator.onCredentialRecovered(orders.recovery(episode = 1L))
+        runCurrent()
+        assertTrue("a newer recovery of a consumed episode resumed", h.diagnostics().authStopped)
+
+        h.coordinator.onCredentialRecovered(orders.recovery(episode = 2L))
+        runCurrent()
+        assertFalse(h.diagnostics().authStopped)
+    }
+
+    @Test
+    fun aRecoveryOfAnotherSession_orWhileTheLiveTrackerMovedFirst_isIgnored() = demandTest {
+        var live: AuthIdentityFence? = ownerFence
+        val orders = AccessOrderSequence()
+        val h = stoppedWithAFlooredDemand(orders, live = { live })
+
+        h.coordinator.onCredentialRecovered(orders.recovery(fence = AuthIdentityFence(OWNER, 2L)))
+        h.coordinator.onCredentialRecovered(orders.recovery(fence = AuthIdentityFence("user-b", 1L)))
+        runCurrent()
+        assertTrue("another session's recovery resumed", h.diagnostics().authStopped)
+
+        live = AuthIdentityFence(OWNER, 2L)
+        h.coordinator.onCredentialRecovered(orders.recovery())
+        runCurrent()
+        assertTrue("a recovery the live tracker has moved past resumed", h.diagnostics().authStopped)
+        h.coordinator.onCredentialRecovered(orders.recovery(fence = AuthIdentityFence(OWNER, 2L)))
+        runCurrent()
+        assertTrue("the live session's recovery resumed a binding still standing on the previous one", h.diagnostics().authStopped)
+
+        live = ownerFence
+        h.coordinator.onCredentialRecovered(orders.recovery())
+        runCurrent()
+        assertFalse(h.diagnostics().authStopped)
+    }
+
+    /**
+     * A later authentication answer accepted while already stopped moves the stop's applied order: a recovery decided between the
+     * two stops is older than the later one.
+     */
+    @Test
+    fun aRecoveryDecidedBeforeALaterAcceptedStop_isIgnored() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = stoppedWithAFlooredDemand(orders)
+        h.source.next = { EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION) }
+        h.source.parkNext = true
+        val leftover = async { h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM, origin = QueryOrigin.SCHEDULED) }
+        runCurrent()
+        val between = orders.recovery()
+        checkNotNull(h.source.fetches.last().gate).complete(Unit)
+        leftover.await()
+        runCurrent()
+        assertTrue(h.diagnostics().authStopped)
+
+        h.coordinator.onCredentialRecovered(between)
+        runCurrent()
+
+        assertTrue("a recovery older than the later stop resumed", h.diagnostics().authStopped)
+    }
+
+    /**
+     * Not stopped, a recovery moves nothing. Taken anyway, it would order the resumption after an authentication answer that
+     * started before it arrived, and that answer would no longer stop re-queries.
+     */
+    @Test
+    fun aRecoveryWhileNotStopped_doesNotKeepARunningAuthenticationAnswerFromStopping() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = confirmed(orders = orders, live = { ownerFence })
+        h.source.next = { EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION) }
+        h.source.parkNext = true
+        val running = async { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+        assertFalse(h.diagnostics().authStopped)
+
+        h.coordinator.onCredentialRecovered(orders.recovery())
+        runCurrent()
+        checkNotNull(h.source.fetches.last().gate).complete(Unit)
+        running.await()
+        runCurrent()
+
+        assertTrue("a recovery that arrived while not stopped kept a later authentication answer from stopping", h.diagnostics().authStopped)
+    }
+
+    @Test
+    fun aRecoveryFromBeforeTheSameFenceWasBoundAgain_isIgnored() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = confirmed(orders = orders, live = { ownerFence })
+        val old = orders.recovery()
+        h.coordinator.onIdentityChanged(ownerFence).applied()
+        h.source.next = { EntitlementsOutcome.Indeterminate(IndeterminateReason.AUTHENTICATION) }
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        runCurrent()
+        assertTrue(h.diagnostics().authStopped)
+
+        h.coordinator.onCredentialRecovered(old)
+        runCurrent()
+
+        assertTrue("a previous binding's recovery resumed", h.diagnostics().authStopped)
+    }
+
+    /**
+     * A recovery that arrives while access is refused is dropped, not kept (S1 recovery signal §3, changed with Codex). Only this
+     * coordinator-level lifetime keeps a stop across a closed and reopened admission: in production the startup purge runs before
+     * the first binding. Its resolution still arms what is owed, which the stop then holds; the dropped recovery adds no query.
+     */
+    @Test
+    fun aRecoveryWhileAccessIsRefused_isDropped_andAddsNoQueryWhenAccessReopens() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = stoppedWithAFlooredDemand(orders)
+        val fetches = h.source.fetches.size
+        h.store.record = h.store.record.copy(
+            pendingPurges = listOf(PendingPurge(OWNER, "older-user-epoch", null, setOf(PurgeScope.USER)))
+        )
+        h.purger.throwing = IOException("purge")
+        val held = h.coordinator.resumeStartupPurge().heldByPersistence()
+
+        h.coordinator.onCredentialRecovered(orders.recovery())
+        runCurrent()
+        assertTrue(h.diagnostics().authStopped)
+
+        h.purger.throwing = null
+        advanceTimeBy((checkNotNull(held.nextAttemptAt) - testScheduler.currentTime).coerceAtLeast(0))
+        h.coordinator.resumePersistence(held.id).applied()
+        settle()
+
+        assertTrue("a recovery received while access was refused resumed later", h.diagnostics().authStopped)
+        assertEquals("the dropped recovery added a query", fetches, h.source.fetches.size)
+    }
+
+    /** During a sign-out's preparation the stopped binding has already ended: a recovery then resumes and asks nothing. */
+    @Test
+    fun aRecoveryDuringASignOutsPreparation_resumesNothingAndAsksNothing() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = stoppedWithAFlooredDemand(orders)
+        val fetches = h.source.fetches.size
+        h.coordinator.prepareSignOut(ownerFence)
+
+        h.coordinator.onCredentialRecovered(orders.recovery())
+        settle()
+
+        assertEquals("a recovery during a sign-out asked", fetches, h.source.fetches.size)
+    }
+
+    @Test
+    fun aRecovery_changesNoAccessStateEpochOrGrant() = demandTest {
+        val orders = AccessOrderSequence()
+        val h = stoppedWithAFlooredDemand(orders)
+        val state = h.coordinator.state.value
+        val krx = h.coordinator.krx.value
+        val record = h.store.record
+        val snapshot = h.coordinator.accessSnapshot
+        val fetches = h.source.fetches.size
+
+        h.coordinator.onCredentialRecovered(orders.recovery())
+        runCurrent()
+
+        assertFalse(h.diagnostics().authStopped)
+        assertEquals(state, h.coordinator.state.value)
+        assertEquals(krx, h.coordinator.krx.value)
+        assertEquals(record, h.store.record)
+        assertSame("the recovery republished the access snapshot", snapshot, h.coordinator.accessSnapshot)
+        assertEquals("the recovery itself queried", fetches, h.source.fetches.size)
     }
 
     private companion object {

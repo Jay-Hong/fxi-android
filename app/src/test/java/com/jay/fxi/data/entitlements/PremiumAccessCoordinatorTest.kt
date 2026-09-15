@@ -1,5 +1,6 @@
 package com.jay.fxi.data.entitlements
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.remote.TopicGrantToken
 import com.jay.fxi.domain.model.TopicRejectionReason
@@ -127,7 +128,8 @@ class PremiumAccessCoordinatorTest {
         purger: RecordingPurger = RecordingPurger(PurgeResult.Completed),
         /** The live auth fence the coordinator reads. Signed out unless a test says otherwise. */
         live: () -> AuthIdentityFence? = { null },
-        beforeRejectionRecheckArmed: suspend () -> Unit = {}
+        beforeRejectionRecheckArmed: suspend () -> Unit = {},
+        orders: AccessOrderSequence = AccessOrderSequence()
     ) = PremiumAccessCoordinator(
         source = source,
         store = store,
@@ -139,7 +141,8 @@ class PremiumAccessCoordinatorTest {
         // cannot assert when a tick fired.
         jitter = ProbeJitter.None,
         liveFence = live,
-        beforeRejectionRecheckArmed = beforeRejectionRecheckArmed
+        beforeRejectionRecheckArmed = beforeRejectionRecheckArmed,
+        orders = orders
     )
 
     private fun ids(): EpochIdGenerator {
@@ -1160,7 +1163,8 @@ class PremiumAccessCoordinatorTest {
         next: () -> EntitlementsOutcome = { EntitlementsOutcome.StableActive(krxVisible = krxVisible) },
         /** Parks a fetch while it is set; the fetch takes and clears it (L-4e E4a). */
         fetchGate: () -> CompletableDeferred<Unit>? = { null },
-        beforeRejectionRecheckArmed: suspend () -> Unit = {}
+        beforeRejectionRecheckArmed: suspend () -> Unit = {},
+        orders: AccessOrderSequence = AccessOrderSequence()
     ): Granted {
         val store = FakeStore(ids())
         var fetches = 0
@@ -1172,7 +1176,7 @@ class PremiumAccessCoordinatorTest {
             answer(next())
         }
         val purger = RecordingPurger(PurgeResult.Completed)
-        val coordinator = build(store, source, purger, live, beforeRejectionRecheckArmed)
+        val coordinator = build(store, source, purger, live, beforeRejectionRecheckArmed, orders)
         coordinator.onIdentityChanged(ownerFence(OWNER))
         coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
         advanceUntilIdle()
@@ -1665,7 +1669,8 @@ class PremiumAccessCoordinatorTest {
             capabilityPurger = selective,
             scope = CoroutineScope(processJob + StandardTestDispatcher(testScheduler)),
             clock = { testScheduler.currentTime },
-            liveFence = { null }
+            liveFence = { null },
+            orders = AccessOrderSequence()
         )
         second.resumePendingPurges()
         advanceUntilIdle()
@@ -2089,17 +2094,35 @@ class PremiumAccessCoordinatorTest {
     /** A refusal reported and dropped while the approving query ran blocks that answer and keeps the demand; a later query issues. */
     @Test
     fun aRefusalReportedDuringTheQuery_blocksItsReapproval_andALaterQueryIssuesIt() = refusalTest {
+        refusalDuringTheQuery(AccessOrderSequence(), between = {})
+    }
+
+    /**
+     * The same, with the token provider taking numbers from the shared order at every step (S1 recovery signal §3): numbers it
+     * takes only add gaps, so the query still started before the refusal and nothing re-numbers it.
+     */
+    @Test
+    fun providerNumbersBetweenEveryStep_changeNoRefusalComparison() = refusalTest {
+        val orders = AccessOrderSequence()
+        refusalDuringTheQuery(orders, between = { repeat(3) { orders.next() } })
+    }
+
+    private suspend fun TestScope.refusalDuringTheQuery(orders: AccessOrderSequence, between: () -> Unit) {
         var gate: CompletableDeferred<Unit>? = null
-        val g = granted(fetchGate = { gate.also { gate = null } })
+        val g = granted(fetchGate = { between(); gate.also { gate = null } }, orders = orders)
+        between()
         g.source.identity = null
         g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)
+        between()
         g.source.identity = EntitlementsIdentity(OWNER, 1L)
         val parked = CompletableDeferred<Unit>()
         gate = parked
         advanceTimeBy(5_010)
         runCurrent()
         val fetches = g.fetches()
+        between()
         g.coordinator.abandonRejection(g.coordinator.reserveRejection(g.grant, PREMIUM_REFUSAL))
+        between()
         parked.complete(Unit)
         runCurrent()
         assertEquals("뒤에 보고된 거부 앞의 조회로 회전했다", g.grant, g.coordinator.issuedGrant())

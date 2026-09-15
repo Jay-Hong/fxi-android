@@ -1,6 +1,9 @@
 package com.jay.fxi.di
 
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.crashlytics.FirebaseCrashlytics
+import com.jay.fxi.data.auth.AccessOrderSequence
+import com.jay.fxi.data.auth.AuthCredentialRecoveryStream
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.auth.AuthTokenSource
@@ -36,11 +39,25 @@ object AuthModule {
     @Singleton
     internal fun provideAuthFenceStream(source: FirebaseAuthTokenSource): AuthFenceStream = source
 
+    /** One order for the token provider and the premium issuer to compare (S1 recovery signal §3). */
     @Provides
     @Singleton
-    internal fun provideAuthTokenProvider(source: AuthTokenSource): AuthTokenProvider =
+    fun provideAccessOrderSequence(): AccessOrderSequence = AccessOrderSequence()
+
+    /** The provider decides recoveries for what goes through it, so it is the stream (S1 recovery signal §2.2). */
+    @Provides
+    @Singleton
+    fun provideAuthCredentialRecoveryStream(provider: AuthTokenProvider): AuthCredentialRecoveryStream = provider
+
+    @Provides
+    @Singleton
+    internal fun provideAuthTokenProvider(source: AuthTokenSource, orders: AccessOrderSequence): AuthTokenProvider =
         AuthTokenProvider(
             source = source,
-            processScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            processScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            orders = orders,
+            // Reported, not thrown: a subscriber's failure does not undo the credential, and a crash here would take the caller's
+            // result and every later recovery with it. Crashlytics' own collection flag gates whether anything leaves the device.
+            onRecoverySubscriberFailure = FirebaseCrashlytics.getInstance()::recordException
         )
 }
