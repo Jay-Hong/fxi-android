@@ -1,5 +1,6 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.AuthUnavailableException
 import com.jay.fxi.data.remote.dto.SubscriptionAck
@@ -56,6 +57,35 @@ interface TopicCommandCredentials {
 
     /** The one forced refresh [rejected] is owed, or `null` when a replay would be unsafe. */
     suspend fun refreshAfterUnauthorized(rejected: AuthSnapshot): AuthSnapshot?
+
+    /** The server refused [credential], which this command sent as the replay of a forced refresh (L-4e E6a). */
+    suspend fun recordRejected(credential: AuthSnapshot)
+
+    /** The server refused [credential], which this command read without refreshing it; its forced refresh stays unspent (L-4e E6a). */
+    suspend fun recordRejectionEvidence(credential: AuthSnapshot)
+}
+
+/**
+ * Why a command's stop was an authentication ending, and when that was settled (L-4e E6a).
+ *
+ * Carried on [TopicCommandOutcome.Stopped] so the session can tell it from a budget spent on sends or acknowledgements, which a
+ * credential recovery must not reopen. [endedOrder] comes from the order the token provider stamps its recoveries with, taken
+ * once the ending is settled and re-admitted; a recovery decided at or before it is older than this ending.
+ */
+data class TopicAuthEnd(val kind: Kind, val endedOrder: Long) {
+    enum class Kind {
+        /** The attempt that spent the budget failed to get a credential. */
+        CREDENTIAL_UNAVAILABLE,
+
+        /** An `invalid_token` whose forced refresh handed nothing usable back. */
+        REFRESH_UNUSABLE,
+
+        /** An `invalid_token` after this command had already spent its one replay. */
+        REPLAY_REJECTED,
+
+        /** An `invalid_token` with no attempt left to refresh and replay in. */
+        REJECTED_WITHOUT_BUDGET
+    }
 }
 
 /**
@@ -172,8 +202,11 @@ sealed interface TopicCommandOutcome {
      */
     data class AlreadyDelivering(val topics: Set<String>) : TopicCommandOutcome
 
-    /** No more sends, for [reason]. */
-    data class Stopped(val reason: TopicWholeRequestDecision.Stop.Reason) : TopicCommandOutcome
+    /** No more sends, for [reason]. [authEnd] says it was an authentication ending, and is null for any other. */
+    data class Stopped(
+        val reason: TopicWholeRequestDecision.Stop.Reason,
+        val authEnd: TopicAuthEnd? = null
+    ) : TopicCommandOutcome
 
     /** Nobody wants these topics any more; nothing further was sent. */
     data object Superseded : TopicCommandOutcome
@@ -209,6 +242,8 @@ class TopicSubscribeCommand(
     private val purpose: TopicCommandPurpose,
     private val store: TopicSubscriptionStateStore,
     private val credentials: TopicCommandCredentials,
+    /** The token provider's order (S1 recovery signal §3), for [TopicAuthEnd.endedOrder]. No default: one of its own compares with nothing. */
+    private val orders: AccessOrderSequence,
     private val clock: TopicCommandClock,
     private val encode: (TopicSubscribeRequest) -> String,
     private val send: (String) -> Boolean,
@@ -238,7 +273,9 @@ class TopicSubscribeCommand(
         val topics: Set<String>,
         val baseline: Map<String, Long>,
         val deadlines: TopicRequestDeadlines,
-        val credential: AuthSnapshot
+        val credential: AuthSnapshot,
+        /** Sent as the replay of this command's forced refresh, not read: which of the two hand-overs a final refusal takes. */
+        val replayOfRefresh: Boolean
     )
 
     private sealed interface Answer {
@@ -334,12 +371,14 @@ class TopicSubscribeCommand(
                 is Sendable.Topics -> Unit
             }
 
+            val replayOfRefresh = replayCredential != null
             val credential = replayCredential ?: try {
                 credentials.currentSnapshot()
             } catch (unavailable: AuthUnavailableException) {
                 // A preparation failure spends an attempt of its own — three of these leave no
                 // send behind and no budget left, which is what the plan asks for.
-                attempt = TopicRequestPolicy.nextAttempt(attempt) ?: return budgetSpent()
+                attempt = TopicRequestPolicy.nextAttempt(attempt)
+                    ?: return authEnded(TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT, TopicAuthEnd.Kind.CREDENTIAL_UNAVAILABLE)
                 when (waitBeforeRetry(TopicCommandRetryPolicy.SILENT_RETRY_COOLDOWN)) {
                     WaitResult.PROCEED -> continue
                     WaitResult.SUPERSEDED -> return TopicCommandOutcome.Superseded
@@ -357,7 +396,7 @@ class TopicSubscribeCommand(
                 is Sendable.Topics -> now.values
             }
 
-            val pending = register(wanted, credential) ?: return programmingError()
+            val pending = register(wanted, credential, replayOfRefresh) ?: return programmingError()
             // Before the store is touched, not after. Nothing goes on the wire on behalf of a
             // cancelled command — and a cancelled command must not take the replacement's request
             // with it either, which is what `beginRequest` here would do by claiming the ticket
@@ -410,8 +449,25 @@ class TopicSubscribeCommand(
                             // request, its deadlines and its attempt all survive an `Ignore`.
                             TopicWholeRequestDecision.Ignore -> continue@waiting
 
-                            is TopicWholeRequestDecision.Stop ->
-                                return TopicCommandOutcome.Stopped(decision.reason)
+                            is TopicWholeRequestDecision.Stop -> {
+                                if (failure != TopicWholeRequestFailure.InvalidToken) {
+                                    return TopicCommandOutcome.Stopped(decision.reason)
+                                }
+                                val kind = when (decision.reason) {
+                                    TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT -> TopicAuthEnd.Kind.REPLAY_REJECTED
+                                    TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT -> TopicAuthEnd.Kind.REJECTED_WITHOUT_BUDGET
+                                    else -> return TopicCommandOutcome.Stopped(decision.reason)
+                                }
+                                // The provider hears the refusal before anything else settles: which call follows where this
+                                // request's credential came from, never the value it happens to share with a replay.
+                                if (pending.replayOfRefresh) {
+                                    credentials.recordRejected(pending.credential)
+                                } else {
+                                    credentials.recordRejectionEvidence(pending.credential)
+                                }
+                                // The hand-over suspended. What the provider took stands even if this ending is then refused.
+                                return authEnded(decision.reason, kind)
+                            }
 
                             is TopicWholeRequestDecision.RefreshAndReplay -> {
                                 authReplayUsed = true
@@ -430,7 +486,9 @@ class TopicSubscribeCommand(
                                     // Back to FAILED, and by the same route it got there.
                                     store.applyWholeFailure(TopicWholeRequestFailure.InvalidToken)
                                     return TopicCommandOutcome.Stopped(
-                                        TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT
+                                        TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT,
+                                        // Admitted just above, and nothing has suspended since.
+                                        TopicAuthEnd(TopicAuthEnd.Kind.REFRESH_UNUSABLE, orders.next())
                                     )
                                 }
                                 // The refresh is over the moment it produces a credential;
@@ -482,7 +540,7 @@ class TopicSubscribeCommand(
      * acknowledgement would be counted as "already there before we asked" and the topic would look
      * silent for the rest of the deadline.
      */
-    private fun register(wanted: Set<String>, credential: AuthSnapshot): Pending? {
+    private fun register(wanted: Set<String>, credential: AuthSnapshot, replayOfRefresh: Boolean): Pending? {
         val sentAt = clock.nowMillis()
         val deadlines = TopicRequestPolicy.deadlinesFor(sentAt) ?: return null
         return Pending(
@@ -490,7 +548,8 @@ class TopicSubscribeCommand(
             topics = wanted,
             baseline = wanted.associateWith { store.snapshot.stateFor(it).receiveGeneration },
             deadlines = deadlines,
-            credential = credential
+            credential = credential,
+            replayOfRefresh = replayOfRefresh
         )
     }
 
@@ -668,6 +727,16 @@ class TopicSubscribeCommand(
 
     private fun budgetSpent() =
         TopicCommandOutcome.Stopped(TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT)
+
+    /**
+     * Settles an authentication ending (L-4e E6a): admitted again first — the credential read or the hand-over before it may have
+     * suspended past a teardown — and then its order taken, with nothing between the two. A refusal unwinds instead, and leaves no
+     * ending behind.
+     */
+    private suspend fun authEnded(reason: TopicWholeRequestDecision.Stop.Reason, kind: TopicAuthEnd.Kind): TopicCommandOutcome.Stopped {
+        admit()
+        return TopicCommandOutcome.Stopped(reason, TopicAuthEnd(kind, orders.next()))
+    }
 
     /**
      * A local contract was broken — an injected clock outside the deadline range, or a jitter draw

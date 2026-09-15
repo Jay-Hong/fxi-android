@@ -1,5 +1,6 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
@@ -293,6 +294,8 @@ class TopicSessionCoordinator(
     /** Opens a socket. Given the generation only so a test can tell the attempts apart. */
     private val connect: (generation: Long) -> TopicTransport,
     private val credentials: TopicCommandCredentials,
+    /** The token provider's order (S1 recovery signal §3), handed to every command for its authentication ending (L-4e E6a). */
+    private val orders: AccessOrderSequence,
     /**
      * The issuer's published access, as the session asks it (L-4e E2a): a new protected use acquires a lifetime from it, and every
      * send and application under that use asks whether it is still admitted. Thread-safe and side-effect free.
@@ -1474,6 +1477,7 @@ class TopicSessionCoordinator(
             purpose = purpose,
             store = store,
             credentials = boundTo(live.fence),
+            orders = orders,
             clock = clock,
             encode = encode,
             // Refuses the send and asks the loop to enforce the expiry. Ending the connection
@@ -1545,6 +1549,17 @@ class TopicSessionCoordinator(
             val refreshed = credentials.refreshAfterUnauthorized(rejected) ?: return null
             if (refreshed.fence != bound.identity) throw AuthIdentityChangedException()
             return refreshed
+        }
+
+        // A refusal is handed over only for this grant's identity; the provider checks the live one again under its own lock.
+        override suspend fun recordRejected(credential: AuthSnapshot) {
+            if (credential.fence != bound.identity) throw AuthIdentityChangedException()
+            credentials.recordRejected(credential)
+        }
+
+        override suspend fun recordRejectionEvidence(credential: AuthSnapshot) {
+            if (credential.fence != bound.identity) throw AuthIdentityChangedException()
+            credentials.recordRejectionEvidence(credential)
         }
     }
 

@@ -20,6 +20,7 @@ import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -466,6 +467,168 @@ class AuthTokenProviderRecoveryTest {
         runCurrent()
 
         assertTrue("a recovery was announced for the identity that left", events.isEmpty())
+    }
+
+    // ---- rejection evidence (L-4e E6a) ---------------------------------------------------------------------------------------
+
+    @Test
+    fun rememberedNullThroughBothRefusalApis_doesNotMoveTheFailureOrder() = recoveryTest {
+        for (evidenceFirst in listOf(true, false)) {
+            val source = Source(userA1)
+            val orders = AccessOrderSequence()
+            val provider = provider(source, orders)
+            val events = provider.recorded()
+            val refused = AuthSnapshot("user-a", 1, "refused")
+
+            // Creates completedRefreshes[fp] = null without either refusal API.
+            source.fetch = { _, _ -> "refused" }
+            assertNull(provider.refreshAfterUnauthorized(refused))
+            runCurrent()
+
+            val release = CompletableDeferred<Unit>()
+            source.fetch = { _, _ ->
+                release.await()
+                "fresh"
+            }
+            val recovering = async { provider.currentSnapshot() }
+            runCurrent()
+
+            val before = orders.next()
+            if (evidenceFirst) {
+                provider.recordRejectionEvidence(refused)
+                provider.recordRejected(refused)
+            } else {
+                provider.recordRejected(refused)
+                provider.recordRejectionEvidence(refused)
+            }
+            assertEquals(before + 1L, orders.next())
+
+            release.complete(Unit)
+            assertEquals("fresh", recovering.await().token)
+            assertEquals(listOf(1L), events.map { it.episode })
+            assertEquals(1, source.forceRefreshCount)
+        }
+    }
+
+    /** Evidence opens a run: the refused token read again is no recovery, a new one is. */
+    @Test
+    fun rejectionEvidence_opensARun_theSameTokenIsNoRecovery_andANewOneIs() = recoveryTest {
+        val source = Source(userA1)
+        val provider = provider(source)
+        val events = provider.recorded()
+        provider.recordRejectionEvidence(AuthSnapshot("user-a", 1, "refused"))
+
+        source.fetch = { _, _ -> "refused" }
+        provider.currentSnapshot()
+        runCurrent()
+        assertTrue(events.isEmpty())
+        assertTrue(provider.isKnownRejected(AuthSnapshot("user-a", 1, "refused")))
+
+        source.fetch = { _, _ -> "fresh" }
+        provider.currentSnapshot()
+
+        assertEquals(listOf(1L), events.map { it.episode })
+    }
+
+    /** One refusal reported through both calls, in either order and across a recovery, is one failure. */
+    @Test
+    fun theSameRefusalThroughBothCalls_acrossARecovery_isNeverANewFailure() = recoveryTest {
+        for (evidenceFirst in listOf(true, false)) {
+            val source = Source(userA1)
+            val provider = provider(source)
+            val events = provider.recorded()
+            val refused = AuthSnapshot("user-a", 1, "refused")
+            if (evidenceFirst) provider.recordRejectionEvidence(refused) else provider.recordRejected(refused)
+            source.fetch = { _, _ -> "fresh" }
+            provider.currentSnapshot()
+            runCurrent()
+            assertEquals(1, events.size)
+
+            if (evidenceFirst) provider.recordRejected(refused) else provider.recordRejectionEvidence(refused)
+            provider.currentSnapshot()
+            runCurrent()
+
+            assertEquals("evidenceFirst=$evidenceFirst: 같은 거부가 새 실패가 됐다", 1, events.size)
+        }
+    }
+
+    /**
+     * A refusal recorded while that credential's own forced refresh is running: the refresh then writes its result over the spent
+     * marker. The fingerprint still says the refusal was reported, so reporting it again as evidence is not a new failure — and a
+     * lookup that started after the first report still recovers.
+     */
+    @Test
+    fun aRefusalRecordedDuringItsOwnRefresh_isStillReportedOnce() = recoveryTest {
+        val source = Source(userA1)
+        val provider = provider(source)
+        val events = provider.recorded()
+        val refused = AuthSnapshot("user-a", 1, "refused")
+        val forcedStarted = CompletableDeferred<Unit>()
+        val releaseForced = CompletableDeferred<Unit>()
+        source.fetch = { _, forceRefresh ->
+            if (forceRefresh) {
+                forcedStarted.complete(Unit)
+                releaseForced.await()
+                "replacement"
+            } else {
+                "refused"
+            }
+        }
+        val refresh = async { provider.refreshAfterUnauthorized(refused) }
+        forcedStarted.await()
+        provider.recordRejected(refused)
+        releaseForced.complete(Unit)
+        assertEquals("replacement", refresh.await()?.token)
+        runCurrent()
+
+        val lookupStarted = CompletableDeferred<Unit>()
+        val releaseLookup = CompletableDeferred<Unit>()
+        source.fetch = { _, _ ->
+            lookupStarted.complete(Unit)
+            releaseLookup.await()
+            "fresh"
+        }
+        val lookup = async { provider.currentSnapshot() }
+        lookupStarted.await()
+        provider.recordRejectionEvidence(refused)
+        releaseLookup.complete(Unit)
+        lookup.await()
+
+        assertEquals("같은 거부의 재보고가 새 실패가 되어 회복을 막았다", 1, events.size)
+    }
+
+    /** Evidence spends nothing: the refused credential's forced refresh still runs, and a refresh handing a refused token back is unusable. */
+    @Test
+    fun rejectionEvidence_leavesTheForcedRefreshUnspent_butARefusedTokenIsNeverReplayed() = recoveryTest {
+        val source = Source(userA1)
+        val provider = provider(source)
+        val first = AuthSnapshot("user-a", 1, "first")
+        provider.recordRejectionEvidence(first)
+        source.fetch = { _, forceRefresh -> if (forceRefresh) "second" else "first" }
+
+        assertEquals("second", provider.refreshAfterUnauthorized(first)?.token)
+        assertEquals(1, source.forceRefreshCount)
+
+        val third = AuthSnapshot("user-a", 1, "third")
+        provider.recordRejectionEvidence(third)
+        runCurrent()
+        source.fetch = { _, forceRefresh -> if (forceRefresh) "third" else "second" }
+        assertNull("거부된 토큰을 replay 후보로 돌려줬다", provider.refreshAfterUnauthorized(AuthSnapshot("user-a", 1, "second")))
+        assertEquals(2, source.forceRefreshCount)
+    }
+
+    /** Evidence belongs to its identity: another identity starts clean, and evidence for one that left is refused. */
+    @Test
+    fun rejectionEvidence_isScopedToItsIdentity() = recoveryTest {
+        val source = Source(userA1)
+        val provider = provider(source)
+        provider.recordRejectionEvidence(AuthSnapshot("user-a", 1, "refused"))
+
+        source.identity = AuthIdentity("user-a", 2)
+        provider.recordRejectionEvidence(AuthSnapshot("user-a", 2, "other"))
+
+        assertFalse(provider.isKnownRejected(AuthSnapshot("user-a", 2, "refused")))
+        assertTrue(runCatching { provider.recordRejectionEvidence(AuthSnapshot("user-a", 1, "late")) }.exceptionOrNull() is AuthIdentityChangedException)
     }
 
     /**

@@ -228,7 +228,22 @@ class TopicSessionCoordinatorTest {
                 refreshGate?.await()
                 return refreshed
             }
+
+            override suspend fun recordRejected(credential: AuthSnapshot) {
+                rejectionsRecorded += credential
+            }
+
+            override suspend fun recordRejectionEvidence(credential: AuthSnapshot) {
+                rejectionEvidence += credential
+            }
         }
+
+        /** Refusals a command handed to the provider as a spent replay, and as evidence only (L-4e E6a). */
+        val rejectionsRecorded = mutableListOf<AuthSnapshot>()
+        val rejectionEvidence = mutableListOf<AuthSnapshot>()
+
+        /** The order shared with the token provider in production. */
+        val orders = AccessOrderSequence()
 
         /** Every forced refresh a command asked for, counted as it was asked. */
         var refreshCalls = 0
@@ -362,6 +377,7 @@ class TopicSessionCoordinatorTest {
         val coordinator = TopicSessionCoordinator(
             scope = scope,
             clock = clock,
+            orders = orders,
             connect = {
                 connectCalls++
                 if (failNextConnect || failConnects > 0) {
@@ -2618,6 +2634,27 @@ class TopicSessionCoordinatorTest {
         h.cleanUp()
     }
 
+    /** A topic replay refused again is handed to the provider as a spent replay, for this grant's identity (L-4e E6a). */
+    @Test
+    fun `a refused topic replay is handed to the provider as a spent replay`() = runTest {
+        val h = Harness(this)
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+
+        assertEquals(listOf(AuthSnapshot("u1", 1L, "token-2")), h.rejectionsRecorded)
+        assertTrue(h.rejectionEvidence.isEmpty())
+        // The fake credentials take no orders; this authentication ending takes one.
+        assertEquals("인증 종료가 세션의 공유 순서를 사용하지 않았다", 2L, h.orders.next())
+        h.cleanUp()
+    }
+
     // ---- silence (D14) -------------------------------------------------------------------------
 
     /** Delivers, is acknowledged, and ends its first-delivery command — the state D14 starts from. */
@@ -4839,6 +4876,47 @@ class TopicSessionCoordinatorTest {
         assertTrue("떠난 신원의 갱신 결과에 소켓이 남았다", first.cancelled)
         assertEquals("떠난 신원으로 replay 했다", 1, h.requests.size)
         assertEquals("갱신 중 상태가 남았다", TopicAuthResolution.RESOLVED, h.store.snapshot.authResolution)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `the last unavailable credential ends a withheld use without an auth ending`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.credentialFailures = 3
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(5_001)
+        assertEquals(2, h.credentialReads)
+
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        advanceTimeBy(5_000)
+        assertEquals(2, h.credentialReads)
+        val first = h.wire
+
+        access.flicker()
+        gate.complete(Unit)
+        advanceTimeBy(1)
+
+        assertEquals(3, h.credentialReads)
+        assertTrue(first.cancelled)
+        assertTrue(h.requests.isEmpty())
+        assertTrue(h.rejectionsRecorded.isEmpty())
+        assertTrue(h.rejectionEvidence.isEmpty())
+        assertEquals(1L, h.orders.next())
+
+        advanceTimeBy(120_000)
+        assertEquals(1, h.wires.size)
+
+        // The session still accepts a later trigger under a fresh use.
+        h.coordinator.setForeground(true)
+        advanceTimeBy(100)
+        assertEquals(2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals(1, h.requests.size)
         h.cleanUp()
     }
 

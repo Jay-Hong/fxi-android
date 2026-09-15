@@ -1,5 +1,6 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.AuthUnavailableException
@@ -76,6 +77,10 @@ class TopicSubscribeCommandTest {
         var credential = AuthSnapshot("u1", 1L, "token-1")
         var credentialFailures = 0
 
+        /** Credential reads, counted from 1, that fail as unavailable wherever they fall among the attempts (L-4e E6a). */
+        var failingReads: Set<Int> = emptySet()
+        var credentialReadCount = 0
+
         /** How long acquiring a credential suspends for, so a test can act during the wait. */
         var credentialGateMillis = 0L
         var refreshGateMillis = 0L
@@ -88,7 +93,9 @@ class TopicSubscribeCommandTest {
 
         val credentials = object : TopicCommandCredentials {
             override suspend fun currentSnapshot(): AuthSnapshot {
+                credentialReadCount++
                 if (credentialGateMillis > 0) delay(credentialGateMillis)
+                if (credentialReadCount in failingReads) throw AuthUnavailableException("no user")
                 if (identityChanges > 0) {
                     identityChanges--
                     throw AuthIdentityChangedException()
@@ -106,7 +113,30 @@ class TopicSubscribeCommandTest {
                 onRefreshReturn?.invoke()
                 return refreshed
             }
+
+            override suspend fun recordRejected(credential: AuthSnapshot) {
+                handOvers += "recordRejected" to credential
+                handOverOrders += orders.next()
+                if (handOverGateMillis > 0) delay(handOverGateMillis)
+                onHandOver?.invoke()
+            }
+
+            override suspend fun recordRejectionEvidence(credential: AuthSnapshot) {
+                handOvers += "evidence" to credential
+                handOverOrders += orders.next()
+                if (handOverGateMillis > 0) delay(handOverGateMillis)
+                onHandOver?.invoke()
+            }
         }
+
+        /** The order shared with the token provider in production (L-4e E6a). */
+        val orders = AccessOrderSequence()
+
+        /** Each refusal handed to the provider, by which call, and the order taken as it was handed over. */
+        val handOvers = mutableListOf<Pair<String, AuthSnapshot>>()
+        val handOverOrders = mutableListOf<Long>()
+        var handOverGateMillis = 0L
+        var onHandOver: (() -> Unit)? = null
 
         val requests = mutableListOf<TopicSubscribeRequest>()
 
@@ -138,6 +168,7 @@ class TopicSubscribeCommandTest {
                 purpose = purpose,
                 store = store,
                 credentials = credentials,
+                orders = orders,
                 clock = clock,
                 encode = { request -> requests += request; "encoded-${request.requestId}" },
                 send = { _ ->
@@ -674,7 +705,10 @@ class TopicSubscribeCommandTest {
 
         assertEquals(TopicAuthResolution.FAILED, harness.store.snapshot.authResolution)
         assertEquals(
-            TopicCommandOutcome.Stopped(TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT),
+            TopicCommandOutcome.Stopped(
+                TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT,
+                TopicAuthEnd(TopicAuthEnd.Kind.REFRESH_UNUSABLE, endedOrder = 1L)
+            ),
             run.outcome
         )
         harness.cleanUp()
@@ -988,9 +1022,13 @@ class TopicSubscribeCommandTest {
 
         assertEquals("보낸 적 없는데 요청이 있다", 0, harness.requests.size)
         assertEquals(
-            TopicCommandOutcome.Stopped(TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT),
+            TopicCommandOutcome.Stopped(
+                TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT,
+                TopicAuthEnd(TopicAuthEnd.Kind.CREDENTIAL_UNAVAILABLE, endedOrder = 1L)
+            ),
             run.outcome
         )
+        assertTrue("준비 실패는 제공자가 이미 안다 — 인계가 없어야 한다", harness.handOvers.isEmpty())
         harness.cleanUp()
     }
 
@@ -1014,12 +1052,15 @@ class TopicSubscribeCommandTest {
         assertEquals("교체는 즉시다 — 서버가 준 대기가 없다", 2, harness.requests.size)
         assertEquals("갱신된 토큰으로 보내지 않았다", "token-2", harness.requests[1].idToken)
 
-        // A second refusal has no licence left.
+        // A second refusal has no licence left, and the replay it refused is handed over as a spent one (L-4e E6a).
         harness.command.deliver(harness.error("r2", "invalid_token"))
         advanceTimeBy(1)
+        assertEquals(listOf("recordRejected" to AuthSnapshot("u1", 1L, "token-2")), harness.handOvers)
         assertEquals(
             TopicCommandOutcome.Stopped(
-                TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT
+                TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT,
+                // The hand-over took 1; the ending is settled after it returned.
+                TopicAuthEnd(TopicAuthEnd.Kind.REPLAY_REJECTED, endedOrder = 2L)
             ),
             run.outcome
         )
@@ -1039,11 +1080,256 @@ class TopicSubscribeCommandTest {
 
         assertEquals(
             TopicCommandOutcome.Stopped(
-                TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT
+                TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT,
+                TopicAuthEnd(TopicAuthEnd.Kind.REFRESH_UNUSABLE, endedOrder = 1L)
             ),
             run.outcome
         )
+        assertTrue("갱신이 비어도 제공자가 판정한다 — 인계가 없어야 한다", harness.handOvers.isEmpty())
         assertEquals(1, harness.requests.size)
+        harness.cleanUp()
+    }
+
+    // ---- authentication endings (L-4e E6a) -------------------------------------------------------------------------------
+
+    @Test
+    fun `a refused read after replay hands over the new credential`() = runTest {
+        val harness = Harness(this)
+        harness.build()
+        val run = harness.start()
+        advanceTimeBy(100)
+        harness.command.deliver(harness.error("r1", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("token-2", harness.requests[1].idToken)
+
+        val current = AuthSnapshot("u1", 1L, "token-3")
+        harness.credential = current
+        advanceTimeBy(ACK_TIMEOUT_MS + COOLDOWN_MS + 1)
+        assertEquals("token-3", harness.requests[2].idToken)
+        harness.command.deliver(harness.error("r3", "invalid_token"))
+        advanceTimeBy(1)
+
+        assertEquals(listOf("evidence" to current), harness.handOvers)
+        assertEquals(
+            TopicCommandOutcome.Stopped(
+                TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT,
+                TopicAuthEnd(TopicAuthEnd.Kind.REPLAY_REJECTED, endedOrder = 2L)
+            ),
+            run.outcome
+        )
+        harness.cleanUp()
+    }
+
+    @Test
+    fun `cancellation as the hand-over returns creates no ending order`() = runTest {
+        val harness = Harness(this)
+        harness.build()
+        val run = harness.start()
+        harness.onHandOver = { run.job.cancel() }
+
+        advanceTimeBy(100)
+        harness.command.deliver(harness.error("r1", "invalid_token"))
+        advanceTimeBy(1)
+        harness.command.deliver(harness.error("r2", "invalid_token"))
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("recordRejected" to AuthSnapshot("u1", 1L, "token-2")),
+            harness.handOvers
+        )
+        assertNull(run.outcome)
+        assertTrue(run.thrown is kotlinx.coroutines.CancellationException)
+        assertEquals(listOf(false, false, false), harness.admissions)
+        assertEquals(2L, harness.orders.next())
+        harness.cleanUp()
+    }
+
+    /** The last attempt decides: sends refused first, then a credential that cannot be read, is an authentication ending. */
+    @Test
+    fun `a credential failure on the last attempt after refused sends is an authentication ending`() = runTest {
+        val harness = Harness(this)
+        harness.sendSucceeds = listOf(false, false)
+        harness.failingReads = setOf(3)
+        harness.build()
+        val run = harness.start()
+        advanceUntilIdle()
+
+        assertEquals(2, harness.requests.size)
+        assertEquals(
+            TopicCommandOutcome.Stopped(
+                TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT,
+                TopicAuthEnd(TopicAuthEnd.Kind.CREDENTIAL_UNAVAILABLE, endedOrder = 1L)
+            ),
+            run.outcome
+        )
+        harness.cleanUp()
+    }
+
+    /** And the other way round: a credential failure first and sends refused last is not one. */
+    @Test
+    fun `refused sends on the last attempts after a credential failure are not an authentication ending`() = runTest {
+        val harness = Harness(this)
+        harness.failingReads = setOf(1)
+        harness.sendSucceeds = listOf(false, false)
+        harness.build()
+        val run = harness.start()
+        advanceUntilIdle()
+
+        assertEquals(
+            TopicCommandOutcome.Stopped(TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT),
+            run.outcome
+        )
+        assertTrue(harness.handOvers.isEmpty())
+        harness.cleanUp()
+    }
+
+    /**
+     * `authReplayUsed` belongs to the command, the replay credential to one attempt: a credential read after an unanswered replay
+     * and then refused is handed over as evidence — even when its value is the replay's.
+     */
+    @Test
+    fun `a read credential refused after the replay is handed over as evidence even with the replay's value`() = runTest {
+        val harness = Harness(this)
+        harness.build()
+        val run = harness.start()
+        advanceTimeBy(100)
+        harness.command.deliver(harness.error("r1", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals(2, harness.requests.size)
+        // The replay goes unanswered; the next attempt reads a credential with the same value.
+        harness.credential = AuthSnapshot("u1", 1L, "token-2")
+        advanceTimeBy(ACK_TIMEOUT_MS + COOLDOWN_MS + 1)
+        assertEquals(3, harness.requests.size)
+        harness.command.deliver(harness.error("r3", "invalid_token"))
+        advanceTimeBy(1)
+
+        assertEquals(listOf("evidence" to AuthSnapshot("u1", 1L, "token-2")), harness.handOvers)
+        assertEquals(
+            TopicCommandOutcome.Stopped(
+                TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT,
+                TopicAuthEnd(TopicAuthEnd.Kind.REPLAY_REJECTED, endedOrder = 2L)
+            ),
+            run.outcome
+        )
+        harness.cleanUp()
+    }
+
+    /** An `invalid_token` on the last attempt, with no replay spent, is handed over as evidence: its refresh is not this command's. */
+    @Test
+    fun `invalid_token with no attempt left is handed over as evidence`() = runTest {
+        val harness = Harness(this)
+        harness.sendSucceeds = listOf(false, false)
+        harness.build()
+        val run = harness.start()
+        advanceTimeBy(2 * COOLDOWN_MS + 100)
+        assertEquals(3, harness.requests.size)
+        harness.command.deliver(harness.error("r3", "invalid_token"))
+        advanceTimeBy(1)
+
+        assertTrue("시도가 없는데 갱신했다", harness.refreshedFrom.isEmpty())
+        assertEquals(listOf("evidence" to harness.credential), harness.handOvers)
+        assertEquals(
+            TopicCommandOutcome.Stopped(
+                TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT,
+                TopicAuthEnd(TopicAuthEnd.Kind.REJECTED_WITHOUT_BUDGET, endedOrder = 2L)
+            ),
+            run.outcome
+        )
+        harness.cleanUp()
+    }
+
+    /** A `temporarily_unavailable` that spends the last attempt is a spent budget, not an authentication ending: nothing is handed over. */
+    @Test
+    fun `temporarily_unavailable on the last attempt is not an authentication ending`() = runTest {
+        val harness = Harness(this)
+        harness.sendSucceeds = listOf(false, false)
+        harness.build()
+        val run = harness.start()
+        advanceTimeBy(2 * COOLDOWN_MS + 100)
+        assertEquals(3, harness.requests.size)
+        harness.command.deliver(harness.error("r3", "temporarily_unavailable", retryAfter = 1))
+        advanceTimeBy(1)
+
+        assertEquals(
+            TopicCommandOutcome.Stopped(TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT),
+            run.outcome
+        )
+        assertTrue(harness.handOvers.isEmpty())
+        harness.cleanUp()
+    }
+
+    /** The ending is settled after the hand-over: its order is taken past the one the hand-over saw, and not before. */
+    @Test
+    fun `the ending order is taken after the hand-over returns`() = runTest {
+        val harness = Harness(this)
+        harness.handOverGateMillis = 50
+        harness.build()
+        val run = harness.start()
+        advanceTimeBy(100)
+        harness.command.deliver(harness.error("r1", "invalid_token"))
+        advanceTimeBy(1)
+        harness.command.deliver(harness.error("r2", "invalid_token"))
+        advanceTimeBy(1)
+        // Inside the hand-over: nothing settled yet.
+        assertEquals(null, run.outcome)
+        val takenDuringTheWait = harness.orders.next()
+        advanceTimeBy(100)
+
+        val ended = (run.outcome as TopicCommandOutcome.Stopped).authEnd
+        assertEquals(TopicAuthEnd.Kind.REPLAY_REJECTED, ended?.kind)
+        assertTrue("인계가 끝나기 전에 순서를 뽑았다", checkNotNull(ended).endedOrder > takenDuringTheWait)
+        harness.cleanUp()
+    }
+
+    /** Refused on re-admission after the hand-over: the command unwinds with no ending, and what the provider took stands. */
+    @Test
+    fun `an ending refused on re-admission after the hand-over unwinds and keeps the hand-over`() = runTest {
+        val harness = Harness(this)
+        harness.onHandOver = { harness.admission = { TopicAnswerAdmission.Denied(TopicAnswerDenial.ENDED_CONNECTION) } }
+        harness.build()
+        val run = harness.start()
+        advanceTimeBy(100)
+        harness.command.deliver(harness.error("r1", "invalid_token"))
+        advanceTimeBy(1)
+        harness.command.deliver(harness.error("r2", "invalid_token"))
+        advanceUntilIdle()
+
+        assertEquals(1, harness.handOvers.size)
+        assertEquals(null, run.outcome)
+        assertTrue(run.thrown is TopicAnswerNotAdmittedException)
+        harness.cleanUp()
+    }
+
+    /** A credential ending is re-admitted too: a teardown that landed during the last read leaves no ending. */
+    @Test
+    fun `a credential ending refused on re-admission unwinds`() = runTest {
+        val harness = Harness(this)
+        harness.credentialFailures = 3
+        harness.admission = { TopicAnswerAdmission.Denied(TopicAnswerDenial.ENDED_CONNECTION) }
+        harness.build()
+        val run = harness.start()
+        advanceUntilIdle()
+
+        assertEquals(null, run.outcome)
+        assertTrue(run.thrown is TopicAnswerNotAdmittedException)
+        harness.cleanUp()
+    }
+
+    /** The account moving during the hand-over is the cancellation it always was. */
+    @Test
+    fun `an identity change during the hand-over unwinds`() = runTest {
+        val harness = Harness(this)
+        harness.onHandOver = { throw AuthIdentityChangedException() }
+        harness.build()
+        val run = harness.start()
+        advanceTimeBy(100)
+        harness.command.deliver(harness.error("r1", "invalid_token"))
+        advanceTimeBy(1)
+        harness.command.deliver(harness.error("r2", "invalid_token"))
+        advanceUntilIdle()
+
+        assertEquals(null, run.outcome)
+        assertTrue(run.thrown is AuthIdentityChangedException)
         harness.cleanUp()
     }
 

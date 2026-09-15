@@ -30,7 +30,10 @@ import kotlinx.coroutines.withContext
  * lookup keep that lookup's start. An identity change drops an open run without an event. Recovery neither clears remembered
  * rejections nor restores a replay budget, and none of this changes what acquisitions return or throw.
  *
- * Topic's final `invalid_token` rejection does not reach this provider yet; L-4e E6 hands it over.
+ * A topic command hands its final `invalid_token` over (L-4e E6a): through [recordRejected] when the refused request replayed this
+ * provider's forced refresh, as REST does, and otherwise through [recordRejectionEvidence], which records the refusal without
+ * spending that credential's forced refresh for everybody else. Both share one set of refused fingerprints, so the same refusal
+ * reported either way, before or after a recovery, is never a new failure.
  */
 class AuthTokenProvider internal constructor(
     private val source: AuthTokenSource,
@@ -69,6 +72,12 @@ class AuthTokenProvider internal constructor(
     private val inFlightRefreshes = mutableMapOf<RejectedKey, Deferred<RefreshOutcome>>()
     private var rejectedIdentity: AuthIdentity? = null
     private val completedRefreshes = mutableMapOf<String, String?>()
+
+    /**
+     * Fingerprints refused for [rejectedIdentity], whichever API reported them. Guarded by [mutex] and cleared with
+     * [completedRefreshes]. A refused credential is a known rejection whether or not its forced refresh has been spent.
+     */
+    private val rejectedEvidence = mutableSetOf<String>()
 
     /** An identity's open failure run. Guarded by [mutex]. */
     private data class FailureEpisode(val identity: AuthIdentity, val number: Long, val latestFailureOrder: Long)
@@ -197,13 +206,7 @@ class AuthTokenProvider internal constructor(
 
     suspend fun isKnownRejected(snapshot: AuthSnapshot): Boolean {
         val key = snapshot.rejectedKey()
-        return mutex.withLock {
-            rejectedIdentity == snapshot.identity &&
-                (
-                    completedRefreshes.containsKey(key.tokenSha256) ||
-                        inFlightRefreshes[key]?.isCompleted == false
-                    )
-        }
+        return mutex.withLock { knownRejectedLocked(key) }
     }
 
     /** Marks a replay credential as rejected without granting it another replay in this process. */
@@ -214,9 +217,31 @@ class AuthTokenProvider internal constructor(
                 throw AuthIdentityChangedException()
             }
             selectRejectedIdentityLocked(snapshot.identity)
-            val repeated = completedRefreshes.containsKey(key.tokenSha256) && completedRefreshes[key.tokenSha256] == null
+            val repeated = refusalRecordedLocked(key)
             completedRefreshes[key.tokenSha256] = null
             inFlightRefreshes.remove(key)
+            rejectedEvidence += key.tokenSha256
+            if (!repeated) recordFailureLocked(snapshot.identity)
+        }
+    }
+
+    /**
+     * Records that the server refused [snapshot] without spending its forced refresh (L-4e E6a).
+     *
+     * For a refusal nothing here has replayed: a topic request sent with a credential read directly, which its command could not
+     * refresh because its own budget was spent. That says nothing about the refresh other callers are still owed for it, so
+     * [refreshAfterUnauthorized] keeps it. The credential is a known rejection from now on, and a new refusal opens or extends the
+     * identity's failure run exactly as [recordRejected] does.
+     */
+    suspend fun recordRejectionEvidence(snapshot: AuthSnapshot) {
+        val key = snapshot.rejectedKey()
+        mutex.withLock {
+            if (source.currentIdentity() != snapshot.identity) {
+                throw AuthIdentityChangedException()
+            }
+            selectRejectedIdentityLocked(snapshot.identity)
+            val repeated = refusalRecordedLocked(key)
+            rejectedEvidence += key.tokenSha256
             if (!repeated) recordFailureLocked(snapshot.identity)
         }
     }
@@ -310,10 +335,7 @@ class AuthTokenProvider internal constructor(
             return
         }
         if (startedOrder <= open.latestFailureOrder) return
-        val key = snapshot.rejectedKey()
-        val knownRejected = rejectedIdentity == identity &&
-            (completedRefreshes.containsKey(key.tokenSha256) || inFlightRefreshes[key]?.isCompleted == false)
-        if (knownRejected) return
+        if (knownRejectedLocked(snapshot.rejectedKey())) return
         // Decided under the subscribers' monitor: a subscriber registered before it gets it, one registered after does not.
         synchronized(recoveryLock) {
             failureEpisode = null
@@ -351,8 +373,23 @@ class AuthTokenProvider internal constructor(
         if (rejectedIdentity != identity) {
             rejectedIdentity = identity
             completedRefreshes.clear()
+            rejectedEvidence.clear()
         }
     }
+
+    /** Whether [key] is refused, being refreshed, or spent for its identity. Callers hold [mutex]. */
+    private fun knownRejectedLocked(key: RejectedKey): Boolean =
+        rejectedIdentity == key.identity &&
+            (
+                key.tokenSha256 in rejectedEvidence ||
+                    completedRefreshes.containsKey(key.tokenSha256) ||
+                    inFlightRefreshes[key]?.isCompleted == false
+                )
+
+    /** Whether this refusal of [key] was already reported, by either API. Callers hold [mutex] after selecting the identity. */
+    private fun refusalRecordedLocked(key: RejectedKey): Boolean =
+        key.tokenSha256 in rejectedEvidence ||
+            (completedRefreshes.containsKey(key.tokenSha256) && completedRefreshes[key.tokenSha256] == null)
 
     private fun AuthSnapshot.rejectedKey(): RejectedKey = RejectedKey(
         identity = identity,
