@@ -2,6 +2,7 @@ package com.jay.fxi.data.entitlements
 
 import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.remote.TopicCommandClock
+import com.jay.fxi.data.remote.TopicGrantOrigin
 import com.jay.fxi.data.remote.TopicGrantSink
 import com.jay.fxi.data.remote.TopicGrantToken
 import com.jay.fxi.data.remote.TopicSessionFence
@@ -58,9 +59,14 @@ internal class PremiumAccessTopicGrantIssuer(private val coordinator: PremiumAcc
  * signal; the consumer then reads the grant and its snapshot once. A result the issuer has already moved past is dropped and read
  * again.
  *
- * **An end is what the issuer recorded, not what a block looks like.** A grant goes over as `setAccess(true, fence)`. With none, the
- * delivered grant is ended — `setAccess(false, …)` — only when the user axis's end sequence has advanced since it was delivered;
- * anything else goes over as [TopicGrantSink.accessRevised] alone, so a hold never makes the session plan again.
+ * **An end is what the issuer recorded, not what a block looks like.** A grant goes over as `setAccess(true, fence, origin)`. With
+ * none, the delivered grant is ended — `setAccess(false, …, NewContext)` — only when the user axis's end sequence has advanced since it
+ * was delivered; anything else goes over as [TopicGrantSink.accessRevised] alone, so a hold never makes the session plan again.
+ *
+ * **A re-approval is passed on only when it continues what was delivered** (L-4e E5). The issuer's cause names the last issue alone,
+ * and reads coalesce: a context change can sit between the grant delivered and a re-approval read now. So a grant goes over as
+ * [TopicGrantOrigin.Reapproval] only when its cause is a refusal re-approval and the context it was issued for is the one the delivered
+ * grant was issued for; a first grant, one after an end, and any other goes over as [TopicGrantOrigin.NewContext].
  *
  * **Nothing unexplained is taken as settled.** A pull that fails, and a missing grant the published snapshot does not explain (the
  * user axis allowed — a live identity read that failed looks like this), leave what was delivered as it is and are read again on a
@@ -102,6 +108,9 @@ internal class TopicGrantDeliverer(
     private var attempt = 0
     private var retryTimer: Job? = null
     private var delivered: TopicSessionFence? = null
+
+    /** The context [delivered] was issued for, read from the same result. */
+    private var deliveredContext: TopicGrantContext? = null
     private var endSeen = 0L
 
     /** Starts once per instance; a stopped deliverer is not started again. */
@@ -176,17 +185,28 @@ internal class TopicGrantDeliverer(
         val ends = snapshot.lastUserEnd?.sequence ?: 0L
         val fence = result.fence
         if (fence != null) {
-            sink.setAccess(true, fence)
+            val context = snapshot.facts.issuedFor
+            val cause = result.cause
+            val origin = if (cause is TopicGrantCause.RefusalReapproval && delivered != null && context != null &&
+                context == deliveredContext
+            ) {
+                TopicGrantOrigin.Reapproval(cause.from)
+            } else {
+                TopicGrantOrigin.NewContext
+            }
+            sink.setAccess(true, fence, origin)
             sink.accessRevised()
             delivered = fence
+            deliveredContext = context
             endSeen = ends
             settle()
             return
         }
         val ended = delivered
         if (ended != null && ends > endSeen) {
-            sink.setAccess(false, ended)
+            sink.setAccess(false, ended, TopicGrantOrigin.NewContext)
             delivered = null
+            deliveredContext = null
             endSeen = ends
         }
         sink.accessRevised()

@@ -3,6 +3,7 @@ package com.jay.fxi.data.entitlements
 import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.remote.TopicCommandClock
+import com.jay.fxi.data.remote.TopicGrantOrigin
 import com.jay.fxi.data.remote.TopicGrantSink
 import com.jay.fxi.data.remote.TopicGrantToken
 import com.jay.fxi.data.remote.TopicSessionFence
@@ -81,28 +82,34 @@ class TopicGrantDelivererTest {
             fence: TopicSessionFence?,
             userAllowed: Boolean = true,
             endSequence: Long = 0L,
-            revision: Long = revisions.value
+            revision: Long = revisions.value,
+            issuedFor: TopicGrantContext? = null,
+            cause: TopicGrantCause? = null
         ) = TopicGrantResult(
             fence,
             TopicAccessSnapshot.INITIAL.copy(
                 revision = revision,
                 facts = TopicAccessFacts.NONE.copy(
                     token = fence?.grant,
+                    issuedFor = issuedFor,
                     tokenStanding = fence != null,
                     userBlocks = if (userAllowed) emptySet() else setOf(TopicAccessBlock.NOT_GRANTED)
                 ),
                 lastUserEnd = endSequence.takeIf { it > 0 }?.let {
                     TopicAccessEnd(it, TopicAccessEndReason.AUTHORITATIVE_LOSS, null, null, null)
                 }
-            )
+            ),
+            cause
         )
     }
 
     private class Sink : TopicGrantSink {
         val calls = mutableListOf<String>()
         var onAccess: () -> Unit = {}
-        override fun setAccess(allowed: Boolean, fence: TopicSessionFence?) {
+        val origins = mutableListOf<TopicGrantOrigin>()
+        override fun setAccess(allowed: Boolean, fence: TopicSessionFence?, origin: TopicGrantOrigin) {
             calls += "access:$allowed:${fence?.grant?.value}"
+            origins += origin
             onAccess()
         }
 
@@ -156,6 +163,50 @@ class TopicGrantDelivererTest {
         advanceTimeBy(600_000)
         runCurrent()
         assertEquals("안정된 상태에서 계속 읽었다", settled, s.issuer.pulls)
+    }
+
+    /**
+     * A re-approval goes over as one only when it continues the context of the grant delivered (L-4e E5): a first grant, a grant after
+     * an end, one whose context moved in between reads that were coalesced, and one with no context read all go over as new.
+     */
+    @Test
+    fun aReapproval_goesOverAsOne_onlyWhenItContinuesTheDeliveredContext() = deliverTest { s ->
+        val c1 = TopicGrantContext(EntitlementsIdentity("u1", 1L), AccessFence("u1", "epoch-1", "krx-1"), 1L)
+        val c2 = c1.copy(generation = 2L)
+        fun fence(grant: Long) = f1.copy(grant = TopicGrantToken(grant))
+        fun reapproval(from: Long) = TopicGrantCause.RefusalReapproval(TopicGrantToken(from), from, from + 1)
+        // Built when the deliverer pulls, so the result carries the revision it is read at rather than one it has moved past.
+        fun TestScope.deliver(result: () -> TopicGrantResult) {
+            s.issuer.answer = { result() }
+            s.issuer.revisions.value += 1
+            runCurrent()
+        }
+
+        s.issuer.answer = { s.issuer.result(fence(1L), issuedFor = c1, cause = reapproval(9L)) }
+        s.deliverer.start()
+        runCurrent()
+        assertEquals("첫 grant 를 재승인으로 보냈다", listOf<TopicGrantOrigin>(TopicGrantOrigin.NewContext), s.sink.origins)
+
+        deliver { s.issuer.result(fence(2L), issuedFor = c1, cause = reapproval(1L)) }
+        assertEquals(TopicGrantOrigin.Reapproval(TopicGrantToken(1L)), s.sink.origins.last())
+
+        deliver { s.issuer.result(fence(4L), issuedFor = c2, cause = reapproval(3L)) }
+        assertEquals("건너뛴 문맥 변경을 재승인으로 이어 보냈다", TopicGrantOrigin.NewContext, s.sink.origins.last())
+
+        deliver { s.issuer.result(fence(5L), issuedFor = c2, cause = TopicGrantCause.Context) }
+        assertEquals(TopicGrantOrigin.NewContext, s.sink.origins.last())
+
+        deliver { s.issuer.result(fence(8L), issuedFor = c2, cause = reapproval(7L)) }
+        assertEquals("중간 전달이 생략된 같은 문맥의 재승인을 이어 보내지 않았다", TopicGrantOrigin.Reapproval(TopicGrantToken(7L)), s.sink.origins.last())
+
+        deliver { s.issuer.result(fence(6L), cause = reapproval(8L)) }
+        assertEquals("문맥을 읽지 못한 결과를 재승인으로 보냈다", TopicGrantOrigin.NewContext, s.sink.origins.last())
+
+        deliver { s.issuer.result(null, endSequence = 2L) }
+        assertEquals(listOf("access:false:6", "revised"), s.sink.calls.takeLast(2))
+        assertEquals(TopicGrantOrigin.NewContext, s.sink.origins.last())
+        deliver { s.issuer.result(fence(7L), issuedFor = c2, cause = reapproval(6L)) }
+        assertEquals("끝난 뒤의 grant 를 재승인으로 보냈다", TopicGrantOrigin.NewContext, s.sink.origins.last())
     }
 
     @Test

@@ -445,9 +445,9 @@ class TopicSessionCoordinatorTest {
          * Every test that does not care about the apply-time identity check goes through here, so
          * the check is invisible to them; the ones that do care set [liveFence] afterwards.
          */
-        fun setAccess(allowed: Boolean, granted: TopicSessionFence?) {
+        fun setAccess(allowed: Boolean, granted: TopicSessionFence?, origin: TopicGrantOrigin = TopicGrantOrigin.NewContext) {
             liveFence = granted?.identity
-            coordinator.setAccess(allowed, granted)
+            coordinator.setAccess(allowed, granted, origin)
             val tab = autoFocus
             if (granted != null && tab != null) coordinator.setFocus(granted.identity, tab)
         }
@@ -1091,6 +1091,378 @@ class TopicSessionCoordinatorTest {
         h.cleanUp()
     }
 
+    // ---- a re-approved grant keeps the reconnection budget (L-4e E5) ---------------------------------------------------------------
+
+    /** Opens the current wire and refuses its subscribe with `premium_required`, which latches the grant it was opened for. */
+    private fun TestScope.refuseOnTheWire(h: Harness) {
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+    }
+
+    /**
+     * `refused → re-approved`, again and again, spends one ladder: each re-approved grant reconnects one rung later than the last, the
+     * sixth finds it spent and opens nothing — no connection and no bootstrap, whatever else arrives — and a foreground return opens it
+     * again. A plain new grant would have started from zero every time (`a refused session connects again only once its grant token
+     * changes`).
+     */
+    @Test
+    fun `refusal and re-approval in turn share one ladder, stop when it is spent, and a foreground return opens it again`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        var grant = 1L
+        for (rung in 1..TopicReconnectPolicy.MAX_ATTEMPTS) {
+            refuseOnTheWire(h)
+            assertTrue(h.wires.last().cancelled)
+            val wires = h.wires.size
+            grant += 1
+            h.setAccess(true, fence(grant = grant), TopicGrantOrigin.Reapproval(TopicGrantToken(grant - 1)))
+            advanceTimeBy(firstRungMillis * rung - 1)
+            assertEquals("재승인 $rung 번째가 사다리 칸 전에 연결했다", wires, h.wires.size)
+            advanceTimeBy(2)
+            assertEquals("재승인 $rung 번째가 사다리 칸 뒤에 연결하지 않았다", wires + 1, h.wires.size)
+        }
+        refuseOnTheWire(h)
+        val spent = h.wires.size
+        grant += 1
+        h.setAccess(true, fence(grant = grant), TopicGrantOrigin.Reapproval(TopicGrantToken(grant - 1)))
+        val bootstraps = h.bootstrapCalls.size
+        advanceTimeBy(120_000)
+        h.coordinator.accessRevised()
+        h.coordinator.setFocus(fence(grant = grant).identity, FreeTab.USD)
+        advanceTimeBy(60_000)
+        assertEquals("다 쓴 사다리 뒤 재승인이 다시 연결했다", spent, h.wires.size)
+        assertEquals("다 쓴 사다리 뒤 재승인이 자동 bootstrap 했다", bootstraps, h.bootstrapCalls.size)
+
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        assertEquals("foreground 복귀가 사다리를 다시 열지 않았다", spent + 1, h.wires.size)
+        assertTrue("연결이 생겼는데 미발급분을 잇지 않았다", h.bootstrapCalls.size > bootstraps)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `the last reapproval rung admits bootstraps until end and online resumes only what remains`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.goLive()
+        advanceTimeBy(10_000)
+        val first = h.bootstrapCalls.size
+        assertEquals(plannedAll, h.asked())
+        refuseOnTheWire(h)
+
+        val t = testScheduler.currentTime
+        val max = TopicReconnectPolicy.MAX_ATTEMPTS
+        val lastWait = firstRungMillis * (1..max).sum()
+        h.failConnects = max - 1
+        h.bootstrapNotBeforeMillis = t + lastWait + 1_000
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+
+        advanceTimeBy(lastWait)
+        assertEquals(max, h.connectCalls)
+        assertEquals(1, h.wires.size)
+        assertEquals(first, h.bootstrapCalls.size)
+
+        advanceTimeBy(1)
+        assertEquals(max + 1, h.connectCalls)
+        assertEquals(2, h.wires.size)
+        assertEquals(first, h.bootstrapCalls.size)
+
+        // No Opened or ACK: the last rung's registered connection admits the issue at the floor.
+        advanceTimeBy(1_000)
+        assertEquals(listOf(USD), h.asked(from = first))
+        assertEquals(listOf(lastWait + 1_000), h.askedAt(t, from = first))
+
+        h.wire.drop()
+        advanceTimeBy(501)
+        h.coordinator.setFocus(fence(grant = 2L).identity, FreeTab.USD)
+        h.coordinator.accessRevised()
+        advanceTimeBy(60_000)
+        assertEquals(max + 1, h.connectCalls)
+        assertEquals(listOf(USD), h.asked(from = first))
+
+        // Exhaustion still permits this explicit topic alone.
+        h.coordinator.requestBootstrap(EUR_TOPIC)
+        advanceTimeBy(1)
+        assertEquals(listOf(USD, EUR_TOPIC), h.asked(from = first))
+        assertEquals(max + 1, h.connectCalls)
+
+        h.coordinator.setOnline(false)
+        advanceTimeBy(1)
+        h.coordinator.setOnline(true)
+        advanceTimeBy(1)
+        assertEquals(max + 2, h.connectCalls)
+        advanceTimeBy(2_000)
+        assertEquals(
+            listOf(USD, EUR_TOPIC, TopicCatalogue.DXY, TETHER, JPY_TOPIC),
+            h.asked(from = first)
+        )
+        assertTrue(h.askedAt(t, from = first).zipWithNext().all { (a, b) -> b - a >= 500L })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `reapproval reservations spent under holds stay spent and a failed reset opens no automatic bootstrap`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        val access = h.publishedAccess()
+        access.hold()
+        h.goLive()
+        advanceTimeBy(1)
+
+        // Grant 2 was coalesced: replaced need not name the grant held by the session.
+        val reapproved = fence(grant = 3L)
+        access.rotate(3L)
+        h.setAccess(true, reapproved, TopicGrantOrigin.Reapproval(TopicGrantToken(2L)))
+        advanceTimeBy(1)
+
+        for (rung in 1..TopicReconnectPolicy.MAX_ATTEMPTS) {
+            access.release()
+            h.coordinator.accessRevised()
+            advanceTimeBy(1)
+            access.hold()
+            h.coordinator.accessRevised()
+            advanceTimeBy(firstRungMillis * rung)
+            assertEquals("held rung $rung connected", 0, h.connectCalls)
+            assertEquals("held rung $rung bootstrapped", 0, h.bootstrapCalls.size)
+        }
+
+        access.release()
+        // Dedupe must preserve the R2′ marker even if the repeated input says NewContext.
+        h.setAccess(true, reapproved, TopicGrantOrigin.NewContext)
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals(0, h.connectCalls)
+        assertEquals(0, h.bootstrapCalls.size)
+
+        // Foreground reaches the reset, but open's own acquire fails.
+        access.afterAcquire = { access.hold() }
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        assertNull(access.afterAcquire)
+        assertEquals(0, h.connectCalls)
+
+        access.release()
+        h.coordinator.setFocus(reapproved.identity, FreeTab.USD)
+        h.coordinator.requestBootstrap(EUR_TOPIC)
+        advanceTimeBy(1)
+        assertEquals(listOf(EUR_TOPIC), h.asked())
+        assertEquals(0, h.connectCalls)
+
+        h.coordinator.accessRevised()
+        advanceTimeBy(firstRungMillis - 1)
+        assertEquals(0, h.connectCalls)
+        advanceTimeBy(2)
+        assertEquals(1, h.connectCalls)
+
+        // This is the first actual attempt, despite the reservations consumed earlier.
+        h.jitterUnit = 0.5
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals(1, h.requests.size)
+        advanceTimeBy(2_000)
+        assertEquals(
+            listOf(EUR_TOPIC, USD, TopicCatalogue.DXY, TETHER, JPY_TOPIC),
+            h.asked()
+        )
+        h.cleanUp()
+    }
+
+    @Test
+    fun `thirty stable seconds reset the rung inherited by the next reapproval`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(firstRungMillis + 1)
+        assertEquals(2, h.wires.size)
+
+        h.wire.open()
+        advanceTimeBy(STABILITY_MS + 1)
+        assertEquals(2, h.wires.size)
+        val bootstraps = h.bootstrapCalls.size
+
+        h.setAccess(true, fence(grant = 3L), TopicGrantOrigin.Reapproval(TopicGrantToken(2L)))
+        advanceTimeBy(firstRungMillis - 1)
+        assertEquals(2, h.wires.size)
+        assertEquals(bootstraps, h.bootstrapCalls.size)
+        advanceTimeBy(2)
+        assertEquals(3, h.wires.size)
+        assertEquals(bootstraps + 2, h.bootstrapCalls.size)
+        h.cleanUp()
+    }
+
+    /** A re-approved grant's connection is a reconnection in both ways: it waits its rung and spreads its subscribe. */
+    @Test
+    fun `a re-approved grant's connection waits its rung and spreads its resubscribe`() = runTest {
+        val h = Harness(this)
+        h.jitterUnit = 0.5
+        h.goLive()
+        advanceTimeBy(100)
+        refuseOnTheWire(h)
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(1_999)
+        assertEquals(1, h.wires.size)
+        advanceTimeBy(2)
+        assertEquals(2, h.wires.size)
+        val requests = h.requests.size
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("재승인 연결이 첫 연결처럼 즉시 구독했다", requests, h.requests.size)
+        advanceTimeBy(1_100)
+        assertEquals(requests + 1, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** Only a re-approval for the same account and namespace carries the ladder over; any other is a new session's first grant. */
+    @Test
+    fun `a re-approval for another session or namespace is a new grant`() = runTest {
+        for (case in listOf("generation", "epoch", "plain")) {
+            val h = Harness(this)
+            h.goLive()
+            advanceTimeBy(100)
+            refuseOnTheWire(h)
+            when (case) {
+                "generation" -> h.setAccess(true, fence(generation = 2L, grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+                "epoch" -> h.setAccess(true, fence(epoch = "epoch-2", grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+                else -> h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.NewContext)
+            }
+            advanceTimeBy(100)
+            assertEquals("$case: 새 grant 가 사다리를 이어받았다", 2, h.wires.size)
+        }
+        backgroundScope.cancel()
+    }
+
+    /**
+     * Under a re-approved grant, automatic bootstraps wait for a connection that grant started and then keep the gap from the first
+     * one — no first batch. What a caller asks for meanwhile goes by the usual rules alone, and is not asked again.
+     */
+    @Test
+    fun `a re-approved grant bootstraps under its own connection without a first batch, and a request goes alone before it`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.goLive()
+        advanceTimeBy(10_000)
+        val first = h.bootstrapCalls.size
+        assertEquals(plannedAll.size, first)
+        refuseOnTheWire(h)
+        val reapprovedAt = testScheduler.currentTime
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(100)
+        assertEquals("재승인 grant 가 연결 전에 자동 bootstrap 했다", first, h.bootstrapCalls.size)
+        h.coordinator.requestBootstrap(EUR_TOPIC)
+        advanceTimeBy(1)
+        assertEquals("연결 전 명시 요청이 나가지 않았다", listOf(EUR_TOPIC), h.asked(from = first))
+        advanceTimeBy(firstRungMillis - 102)
+        assertEquals("명시 요청이 나머지 자동 계획까지 풀었다", first + 1, h.bootstrapCalls.size)
+        advanceTimeBy(2)
+        assertEquals(2, h.wires.size)
+        advanceTimeBy(5_000)
+        assertEquals(listOf(EUR_TOPIC, USD, TopicCatalogue.DXY, TETHER, JPY_TOPIC), h.asked(from = first))
+        assertEquals(
+            "재승인 grant 가 첫 묶음 면제로 한꺼번에 나갔다",
+            listOf(100L, 1_600L, 2_100L, 2_600L, 3_100L),
+            h.askedAt(reapprovedAt, from = first)
+        )
+        h.cleanUp()
+    }
+
+    /** An unexpected drop and a re-approval are the same automatic ladder: the re-approval takes the next rung, not the first again. */
+    @Test
+    fun `an unexpected drop and a re-approval spend the same ladder`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.drop()
+        advanceTimeBy(firstRungMillis + 1)
+        assertEquals(2, h.wires.size)
+        refuseOnTheWire(h)
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(firstRungMillis * 2 - 1)
+        assertEquals("재승인이 끊김이 쓴 첫 칸을 다시 썼다", 2, h.wires.size)
+        advanceTimeBy(2)
+        assertEquals(3, h.wires.size)
+        h.cleanUp()
+    }
+
+    /**
+     * Under a re-approved grant, automatic bootstraps go only while a connection it started is there: a floor that passes after that
+     * connection dropped, and a connect the factory refused, issue nothing; the next connection carries on without any other trigger.
+     */
+    @Test
+    fun `under a re-approved grant automatic bootstraps stop with the connection and a refused connect opens none`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.goLive()
+        advanceTimeBy(10_000)
+        val first = h.bootstrapCalls.size
+        refuseOnTheWire(h)
+        val t = testScheduler.currentTime
+        h.bootstrapNotBeforeMillis = t + 6_000
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(firstRungMillis + 1)
+        assertEquals(2, h.wires.size)
+        assertEquals("floor 전에 자동 bootstrap 했다", first, h.bootstrapCalls.size)
+        h.failConnects = 1
+        h.wire.drop()
+
+        // Rung 2 (3.2 s) is refused by the factory; rung 3 (4.8 s later) connects. The floor passes in between, with no connection.
+        advanceTimeBy(t + 9_600 - testScheduler.currentTime)
+        assertEquals("거절된 연결이 시도로 세지지 않았다", 3, h.connectCalls)
+        assertEquals(2, h.wires.size)
+        assertEquals("연결이 없는데 floor 가 지나자 자동 bootstrap 했다", first, h.bootstrapCalls.size)
+        advanceTimeBy(2)
+        assertEquals(4, h.connectCalls)
+        assertEquals(3, h.wires.size)
+        advanceTimeBy(5_000)
+        assertEquals(plannedAll, h.asked(from = first))
+        assertEquals(listOf(9_601L, 10_101L, 10_601L, 11_101L, 11_601L), h.askedAt(t, from = first))
+        h.cleanUp()
+    }
+
+    /** A request one re-approved grant still owed is that grant's: the next re-approved grant does not issue it without a connection. */
+    @Test
+    fun `a request owed under one re-approved grant is not carried into the next`() = runTest {
+        val h = Harness(this, desired = TopicCatalogue.DESIRED, bootstrapIssueGap = 500.milliseconds)
+        h.goLive()
+        advanceTimeBy(10_000)
+        val first = h.bootstrapCalls.size
+        refuseOnTheWire(h)
+        val t = testScheduler.currentTime
+        h.bootstrapNotBeforeMillis = t + 60_000
+        h.failConnects = 100
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(100)
+        h.coordinator.requestBootstrap(EUR_TOPIC)
+        advanceTimeBy(1)
+        h.setAccess(true, fence(grant = 3L), TopicGrantOrigin.Reapproval(TopicGrantToken(2L)))
+        advanceTimeBy(t + 61_000 - testScheduler.currentTime)
+        assertEquals(1, h.wires.size)
+        assertEquals("앞 grant 의 명시 요청이 다음 재승인 grant 에서 연결 없이 나갔다", first, h.bootstrapCalls.size)
+        h.cleanUp()
+    }
+
+    /** A re-approved grant goes on the ladder even for a session that never attempted a connection: the release is not a fresh trigger. */
+    @Test
+    fun `a re-approval released after a hold goes on the ladder even with no earlier attempt`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        access.hold()
+        h.goLive()
+        advanceTimeBy(10_000)
+        assertEquals(0, h.connectCalls)
+        access.rotate(2L)
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(100)
+        access.release()
+        h.coordinator.accessRevised()
+        advanceTimeBy(firstRungMillis - 1)
+        assertEquals("재승인의 보류 해제가 사다리 없이 열었다", 0, h.connectCalls)
+        advanceTimeBy(2)
+        assertEquals(1, h.connectCalls)
+        h.cleanUp()
+    }
+
     /** The identity-loss latch is keyed the same way: the same fence stays retired, a new token does not. */
     @Test
     fun `a retired session connects again only once its grant token changes`() = runTest {
@@ -1105,11 +1477,11 @@ class TopicSessionCoordinatorTest {
 
         // The identity is back, as the same session. Granting is done directly so it does not move it.
         h.liveFence = fence().identity
-        h.coordinator.setAccess(true, fence())
+        h.coordinator.setAccess(true, fence(), TopicGrantOrigin.NewContext)
         advanceTimeBy(10_000)
         assertEquals("은퇴한 같은 grant 로 다시 연결했다", 1, h.wires.size)
 
-        h.coordinator.setAccess(true, fence(grant = 2L))
+        h.coordinator.setAccess(true, fence(grant = 2L), TopicGrantOrigin.NewContext)
         advanceTimeBy(100)
         assertEquals("새 토큰인데 연결하지 않았다", 2, h.wires.size)
         h.cleanUp()
@@ -4177,7 +4549,7 @@ class TopicSessionCoordinatorTest {
         // not used here: granting must not be what moves the identity.
         h.liveFence = AuthIdentityFence("u1", 3L)
         h.credential = AuthSnapshot("u1", 3L, "token-3")
-        h.coordinator.setAccess(true, fence())
+        h.coordinator.setAccess(true, fence(), TopicGrantOrigin.NewContext)
         h.coordinator.setForeground(true)
         advanceTimeBy(120_000)
 
@@ -4194,7 +4566,7 @@ class TopicSessionCoordinatorTest {
             }
         )
 
-        h.coordinator.setAccess(true, fence(generation = 3L))
+        h.coordinator.setAccess(true, fence(generation = 3L), TopicGrantOrigin.NewContext)
         advanceTimeBy(100)
         assertEquals("새 grant 로 복구하지 못했다", sockets + 1, h.wires.size)
         h.wire.open()
@@ -4361,7 +4733,7 @@ class TopicSessionCoordinatorTest {
         assertNull("떠난 신원의 거부가 teardown 뒤에 남았다", h.store.snapshot.stateFor(USD).rejection)
 
         // The same grant again, and a trigger: neither reopens, and the lease the answer carried was never installed.
-        h.coordinator.setAccess(true, fence())
+        h.coordinator.setAccess(true, fence(), TopicGrantOrigin.NewContext)
         h.coordinator.setForeground(true)
         advanceTimeBy(1_000_000)
         assertEquals("은퇴한 grant 로 다시 연결했다", 1, h.wires.size)
@@ -4369,7 +4741,7 @@ class TopicSessionCoordinatorTest {
 
         h.liveFence = AuthIdentityFence("u1", 3L)
         h.credential = AuthSnapshot("u1", 3L, "token-3")
-        h.coordinator.setAccess(true, fence(generation = 3L))
+        h.coordinator.setAccess(true, fence(generation = 3L), TopicGrantOrigin.NewContext)
         advanceTimeBy(100)
         assertEquals("새 grant 로 복구하지 못했다", 2, h.wires.size)
         h.cleanUp()
@@ -7058,10 +7430,12 @@ class TopicSessionCoordinatorTest {
     private class RecordingSink(private val session: TopicSessionCoordinator) : TopicGrantSink {
         val calls = mutableListOf<String>()
         val granted = mutableListOf<TopicSessionFence>()
-        override fun setAccess(allowed: Boolean, fence: TopicSessionFence?) {
+        val origins = mutableListOf<TopicGrantOrigin>()
+        override fun setAccess(allowed: Boolean, fence: TopicSessionFence?, origin: TopicGrantOrigin) {
             calls += "access:$allowed:${fence?.grant?.value}"
             if (allowed && fence != null) granted += fence
-            session.setAccess(allowed, fence)
+            origins += origin
+            session.setAccess(allowed, fence, origin)
         }
 
         override fun accessRevised() {
@@ -7258,7 +7632,7 @@ class TopicSessionCoordinatorTest {
     /** A KRX rotation changes the token, which reaches the session as a different grant: a different session (L-4e E3). */
     @Test
     fun `a capability rotation reaches the session as a new grant`() = runTest {
-        val h = Harness(this)
+        val h = Harness(this, bootstrapIssueGap = 500.milliseconds)
         val (issuer, issued) = grantedIssuer(h)
         val d = delivering(h, PremiumAccessTopicGrantIssuer(issuer.premium))
         liveThroughDeliverer(h, d, issued)
@@ -7273,6 +7647,9 @@ class TopicSessionCoordinatorTest {
         assertTrue("회전한 grant 의 옛 연결이 남았다", h.wires.first().cancelled)
         assertTrue("다른 grant 인데 옛 시세가 남았다", h.coordinator.rates.value.quotes.isEmpty())
         assertEquals(2, h.wires.size)
+        assertEquals(TopicGrantOrigin.NewContext, d.sink.origins.last())
+        // Both issues occur inside 500 ms: the new context gets its own first-batch exemption.
+        assertEquals(listOf(USD, USD), h.asked())
         h.cleanUp()
     }
 
@@ -7413,17 +7790,88 @@ class TopicSessionCoordinatorTest {
                 assertNotEquals("재승인이 토큰을 바꾸지 않았다", issued.grant, reapproved.grant)
                 assertEquals(issued.grant, (result.cause as TopicGrantCause.RefusalReapproval).from)
                 assertEquals("재승인 grant 가 세션에 가지 않았다: ${d.sink.calls}", reapproved, d.sink.granted.last())
-                assertEquals("재승인 grant 로 연결하지 않았다", 2, h.wires.size)
+                assertEquals("재승인이 원인을 싣지 않았다", TopicGrantOrigin.Reapproval(issued.grant), d.sink.origins.last())
+                // The ladder is carried over (L-4e E5): one rung, not at once.
+                assertEquals("재승인 grant 로 사다리 칸 전에 연결했다", 1, h.wires.size)
 
                 h.refusalSink!!(issued, mapOf(USD to TopicRejectionReason.PREMIUM_REQUIRED))
                 advanceTimeBy(100)
                 assertEquals("옛 grant 의 늦은 거부가 결정됐다", PremiumAccessState.PremiumConfirmed, issuer.premium.state.value.state)
                 assertEquals(reapproved.grant, issuer.premium.accessSnapshot.facts.token)
                 assertTrue(d.sink.calls.none { it.startsWith("access:false") })
+                advanceTimeBy(firstRungMillis)
+                assertEquals("재승인 grant 로 사다리 칸 뒤에 연결하지 않았다", 2, h.wires.size)
             }
             advanceTimeBy(60_000)
             if (answer == "inactive") assertEquals("잠긴 세션이 다시 연결했다", 1, h.wires.size)
         }
+        backgroundScope.cancel()
+    }
+
+    /**
+     * Through the real issuer and deliverer, `refused → re-approved` repeats on one ladder (L-4e E5): each re-approval's connection waits
+     * the issuer's floor and then its own rung, one later each time, and once the ladder is spent the re-approvals keep coming but open no
+     * connection and no automatic bootstrap. What else it cost is counted, not asserted zero: the issuer's re-checks, the re-approval
+     * tokens, the credential refreshes and the requests already out.
+     */
+    @Test
+    fun `repeated re-approvals through the issuer spend one ladder and then open nothing`() = runTest {
+        val h = Harness(this)
+        val (issuer, issued) = grantedIssuer(h)
+        val d = delivering(h, PremiumAccessTopicGrantIssuer(issuer.premium))
+        var fetches = 0
+        issuer.outcome = {
+            fetches += 1
+            EntitlementsOutcome.StableActive(krxVisible = true)
+        }
+        h.coordinator.start()
+        h.coordinator.setOnline(true)
+        h.coordinator.setFocus(issued.identity, FreeTab.USD)
+        d.deliverer.start()
+        advanceTimeBy(100)
+        assertEquals(1, h.wires.size)
+
+        val waits = mutableListOf<Long>()
+        for (round in 1..TopicReconnectPolicy.MAX_ATTEMPTS + 1) {
+            val wires = h.wires.size
+            val reapprovals = d.sink.origins.count { it is TopicGrantOrigin.Reapproval }
+            h.wire.open()
+            advanceTimeBy(1)
+            issuer.identityReadable = false
+            h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+            advanceTimeBy(100)
+            val refusedAt = testScheduler.currentTime
+            issuer.identityReadable = true
+            var waited = 0L
+            while (h.wires.size == wires && waited < 60_000L) {
+                advanceTimeBy(100)
+                waited += 100
+            }
+            assertEquals("$round 번째 거부가 재승인으로 오지 않았다", reapprovals + 1, d.sink.origins.count { it is TopicGrantOrigin.Reapproval })
+            if (round <= TopicReconnectPolicy.MAX_ATTEMPTS) {
+                assertEquals("$round 번째 재승인이 연결하지 않았다", wires + 1, h.wires.size)
+                waits += testScheduler.currentTime - refusedAt
+            } else {
+                assertEquals("다 쓴 사다리 뒤 재승인이 연결했다", wires, h.wires.size)
+            }
+        }
+        // The issuer's floor, then rung n: each wait at least 5 s + 1.6 s × n, and each longer than the last.
+        waits.forEachIndexed { index, wait -> assertTrue("대기 $waits", wait >= 5_000L + firstRungMillis * (index + 1)) }
+        assertEquals("대기가 사다리대로 늘지 않았다: $waits", waits.sorted(), waits)
+        assertEquals(waits.distinct().size, waits.size)
+
+        val connects = h.connectCalls
+        val bootstraps = h.bootstrapCalls.size
+        val rechecks = fetches
+        advanceTimeBy(120_000)
+        assertEquals("소진 뒤 WS 시도가 늘었다", connects, h.connectCalls)
+        assertEquals("소진 뒤 자동 bootstrap 이 늘었다", bootstraps, h.bootstrapCalls.size)
+        assertEquals(TopicReconnectPolicy.MAX_ATTEMPTS + 1, h.connectCalls)
+        // Recorded, not bounded here (S1's whole budget is not this slice's to declare): re-checks, tokens, refreshes, requests.
+        println(
+            "E5 반복 재승인 집계: WS 시도=${h.connectCalls}, bootstrap=${h.bootstrapCalls.size}, 발급자 재확인 조회=$rechecks→$fetches, " +
+                "재승인 전달=${d.sink.origins.count { it is TopicGrantOrigin.Reapproval }}, credential 갱신=${h.refreshCalls}, 구독 요청=${h.requests.size}"
+        )
         backgroundScope.cancel()
     }
 

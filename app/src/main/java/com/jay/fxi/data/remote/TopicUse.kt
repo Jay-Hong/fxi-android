@@ -40,9 +40,25 @@ class TopicUseAttribution internal constructor(
  *
  * Both calls only post to the session's loop: neither suspends nor reads anything, so a deliverer can make them from wherever it
  * decided. [setAccess] carries a grant or its explicit end, [accessRevised] a new access snapshot under the context already held.
+ * A [TopicGrantOrigin.Reapproval] carries the reconnection budget over when the session's continuation conditions hold;
+ * an explicit end carries [TopicGrantOrigin.NewContext] (L-4e E5).
  */
 interface TopicGrantSink {
-    fun setAccess(allowed: Boolean, fence: TopicSessionFence?)
+    fun setAccess(allowed: Boolean, fence: TopicSessionFence?, origin: TopicGrantOrigin)
 
     fun accessRevised()
+}
+
+/**
+ * Why a grant handed to [TopicGrantSink.setAccess] was issued, as far as the session needs to know (L-4e E5).
+ *
+ * The session reads nothing into the grant token itself; this is the one fact about its issuance it acts on. An end is always
+ * [NewContext].
+ */
+sealed interface TopicGrantOrigin {
+    /** A grant for a context the session did not hold, or one the deliverer could not show continues it. */
+    data object NewContext : TopicGrantOrigin
+
+    /** The issuer re-approved [replaced] in the same context after a refusal; the session keeps its reconnection budget. */
+    data class Reapproval(val replaced: TopicGrantToken) : TopicGrantOrigin
 }

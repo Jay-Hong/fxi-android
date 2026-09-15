@@ -72,6 +72,10 @@ object TopicCatalogue {
  * from a new grant too, including one caused by nothing more than a KRX capability rotation. That is the cost of carrying the grant at all; without it
  * a same-fence re-issue would leave the socket holding the old grant, and a refusal it later
  * carried back would be discarded as stale while the account was being refused now.
+ *
+ * One exception keeps what a grant change would otherwise reset (L-4e E5): a grant the issuer re-approved in the same context after a
+ * refusal ([TopicGrantOrigin.Reapproval]) is still a different session for the socket, the prices and the store, but it takes over the
+ * automatic reconnection budget instead of starting it again — otherwise `refused → re-approved` would reconnect at once forever.
  */
 data class TopicSessionFence(
     val identity: AuthIdentityFence,
@@ -111,8 +115,8 @@ private sealed interface SessionInput {
 
     data class Online(val value: Boolean) : SessionInput
 
-    /** Premium access, and the grant it belongs to. `null` fence means nobody is signed in. */
-    data class Access(val allowed: Boolean, val fence: TopicSessionFence?) : SessionInput
+    /** Premium access, the grant it belongs to, and why that grant was issued. `null` fence means nobody is signed in. */
+    data class Access(val allowed: Boolean, val fence: TopicSessionFence?, val origin: TopicGrantOrigin) : SessionInput
 
     /**
      * Ask the REST twin for one topic's snapshot.
@@ -590,6 +594,18 @@ class TopicSessionCoordinator(
     private val unissuedBootstraps = LinkedHashSet<String>()
     private var unissuedForGrant: Long? = null
 
+    /**
+     * The topics owed only because a caller asked for them, bound to the same grant as [unissuedBootstraps] (L-4e E5). Under a
+     * re-approved grant with no connection these are the only ones issued; taking one off takes it off both.
+     */
+    private val requestedBootstraps = HashSet<String>()
+
+    /**
+     * The grant epoch a refusal re-approval started, or null (L-4e E5). Under it the automatic reconnection budget carried over, the
+     * first batch is not exempt from the gap, and automatic bootstraps wait for a connection this grant started.
+     */
+    private var reapprovedEpoch: Long? = null
+
     /** null until this grant first issues; thereafter, the remaining topics eligible for its initial batch. */
     private var bootstrapFirstBatch: Set<String>? = null
     private var lastBootstrapIssuedAtMillis: Long? = null
@@ -679,17 +695,18 @@ class TopicSessionCoordinator(
      *
      * A hold that keeps the context — and its release — is not sent here (L-4e E2b): `false` for the same fence ends the grant, so
      * the plan it asked for is made again when access returns, and a different fence is a different session. Holds go to
-     * [accessRevised].
+     * [accessRevised]. [origin] says whether a new grant re-approved the one this session holds in the same context (L-4e E5).
      */
-    override fun setAccess(allowed: Boolean, fence: TopicSessionFence?) =
-        post(SessionInput.Access(allowed, fence))
+    override fun setAccess(allowed: Boolean, fence: TopicSessionFence?, origin: TopicGrantOrigin) =
+        post(SessionInput.Access(allowed, fence, origin))
 
     /**
      * The issuer published a new access snapshot under the context this session already holds (L-4e E2b).
      *
      * Not a context change and not an explicit end — those still come as [setAccess]. A deliverer calls this for the latest revision
      * it observes, including one whose hold it missed: the session asks its own questions again and changes only what they answer
-     * differently. Repeating it is harmless, and it resets no budget.
+     * differently. Repeating it is harmless, and it resets no budget — neither the reconnection ladder nor, under a re-approved grant,
+     * the wait for a connection before automatic bootstraps (L-4e E5).
      */
     override fun accessRevised() = post(SessionInput.AccessRevised)
 
@@ -784,6 +801,13 @@ class TopicSessionCoordinator(
                 // backoff used to open a socket immediately. Found by review.
                 if (access == input.allowed && fence == input.fence) return
                 val moved = fence != input.fence
+                // A re-approval in the same context takes over the reconnection budget (L-4e E5 §3.1): a different grant, the same
+                // account and namespace. Not required to name the grant held: deliveries coalesce, and a chain of re-approvals can
+                // arrive as its last one — the deliverer has already told a skipped context change apart.
+                val held = fence
+                val inherits = input.allowed && input.origin is TopicGrantOrigin.Reapproval && moved &&
+                    held != null && input.fence != null &&
+                    input.fence.identity == held.identity && input.fence.userAccessEpoch == held.userAccessEpoch
                 // An access withdrawal that hands back the same fence is invisible to a
                 // comparison of fences, and it is still the transition after which an answer
                 // authorised under that access is no longer this session's.
@@ -801,6 +825,7 @@ class TopicSessionCoordinator(
                 // costs is real and bounded: a request whose grant is over runs to the end of its
                 // ten-second budget before anyone stops paying for it.
                 if (moved || withdrawn) grantEpoch++
+                reapprovedEpoch = grantEpoch.takeIf { inherits }
                 if (moved) {
                     // A different grant is a different session. The socket was authenticated as
                     // the grant that is gone, so it goes with it — leaving it open would carry
@@ -809,7 +834,7 @@ class TopicSessionCoordinator(
                     connection?.let { end(it, TopicDisconnectCause.DELIBERATE) }
                     cancelReconnect()
                     _rates.value = TopicRates()
-                    everAttempted = false
+                    if (!inherits) everAttempted = false
                     // `setDesired(false)` is not enough: it keeps the receive generation, because
                     // a user losing interest in a topic has not unseen its frames. A grant change
                     // has — those frames were another session's.
@@ -830,8 +855,13 @@ class TopicSessionCoordinator(
                 }
                 // A grant given again or changed starts its budget from zero here rather than inside `reconsider`, which returns
                 // before it when the use is held (L-4e E2b): the connection a later release opens must still have its ladder.
-                if (input.allowed && input.fence != null) reconnectAttempt = 0
-                reconsider(budgetIsFresh = true)
+                if (inherits) {
+                    // On the ladder, whether or not a connection was ever attempted: nothing here is a fresh trigger.
+                    if (connection == null && reconnectJob == null && wanted()) scheduleReconnect()
+                } else {
+                    if (input.allowed && input.fence != null) reconnectAttempt = 0
+                    reconsider(budgetIsFresh = true)
+                }
                 // After the socket is decided, because reading order should follow the session's:
                 // open the connection, then fill the screen while it negotiates. Nothing here
                 // depends on that order — `reconsider` changes none of [wanted]'s inputs — and no
@@ -1199,8 +1229,8 @@ class TopicSessionCoordinator(
      * Not a lifecycle trigger: nothing pending is cancelled or brought forward, and no budget is reset.
      * - A connection whose use is no longer admitted ends, as at any other boundary.
      * - A new start that has become possible goes on the ladder, one rung reserved as any reconnection reserves it — a hold coming
-     *   and going must not open a socket per flap. A session that never attempted a connection opens at once instead: that is the
-     *   connection the held `Access` or `Online` would have opened, and there is nothing yet to hold back.
+     *   and going must not open a socket per flap. A re-approved grant uses the ladder even before the first actual attempt.
+     *   Otherwise, a session that never attempted a connection opens at once: the held `Access` or `Online` already owed that start.
      * - The plan carries on under the same grant: only what is still owed is issued, each under its own new use.
      */
     private fun reevaluateAccess() {
@@ -1208,7 +1238,7 @@ class TopicSessionCoordinator(
             if (!authority.admits(live.lifetime)) end(live, TopicDisconnectCause.DELIBERATE)
         }
         if (connection == null && reconnectJob == null && wanted()) {
-            if (everAttempted) scheduleReconnect() else open()
+            if (everAttempted || reapprovedEpoch == grantEpoch) scheduleReconnect() else open()
         }
         pumpBootstraps()
     }
@@ -1238,6 +1268,8 @@ class TopicSessionCoordinator(
         }
         live.connectDueAtMillis = clock.nowMillis() + CONNECT_TIMEOUT.inWholeMilliseconds
         live.timers += after(CONNECT_TIMEOUT) { post(SessionInput.ConnectOverdue(number)) }
+        // Under a re-approved grant this connection is what lets automatic bootstraps go (L-4e E5): whatever path opened it.
+        if (reapprovedEpoch == grantEpoch) pumpBootstraps()
     }
 
     private fun onTransportEvent(live: Connection, event: TopicTransportEvent) {
@@ -1656,8 +1688,10 @@ class TopicSessionCoordinator(
     private fun pumpBootstraps() {
         if (unissuedForGrant != grantEpoch) {
             unissuedBootstraps.clear()
+            requestedBootstraps.clear()
             unissuedForGrant = grantEpoch
-            bootstrapFirstBatch = null
+            // A re-approved grant's first issue keeps the gap after the last one (L-4e E5): it is not a new plan's first batch.
+            bootstrapFirstBatch = if (reapprovedEpoch == grantEpoch) emptySet() else null
         }
         val tab = shownTab()
         if (!wanted() || tab == null) {
@@ -1682,7 +1716,11 @@ class TopicSessionCoordinator(
         val rank = TopicBootstrapOrder.plan(tab, desired)
         val shown = TopicBootstrapOrder.shownBy(tab).filter { it in desired }.toSet()
         while (true) {
-            val next = unissuedBootstraps.minByOrNull { rank.indexOf(it) } ?: return cancelBootstrapIssue()
+            // Under a re-approved grant, only a connection this grant started lets automatic bootstraps go (L-4e E5 §5-2); without
+            // one, what a caller asked for still goes by the usual rules and the rest waits.
+            val automatic = reapprovedEpoch != grantEpoch || connection?.fence == fence
+            val candidates = if (automatic) unissuedBootstraps else unissuedBootstraps.filter { it in requestedBootstraps }
+            val next = candidates.minByOrNull { rank.indexOf(it) } ?: return cancelBootstrapIssue()
             val batch = bootstrapFirstBatch
             val usesFirstBatch = batch == null || (next in batch && next in shown)
             val now = clock.nowMillis()
@@ -1699,6 +1737,7 @@ class TopicSessionCoordinator(
             // the issue before it, whose job was already enqueued. Refused, nothing is consumed and the plan waits.
             val lifetime = useLifetime() ?: return cancelBootstrapIssue()
             unissuedBootstraps.remove(next)
+            requestedBootstraps.remove(next)
             bootstrapFirstBatch = if (usesFirstBatch) (batch ?: shown) - next else emptySet()
             lastBootstrapIssuedAtMillis = now
             startBootstrap(next, lifetime)
@@ -1718,6 +1757,7 @@ class TopicSessionCoordinator(
         // same turn, and the pump is what rebinds it.
         if (bootstrapsOut.values.any { it.grantEpoch == grantEpoch && it.topic == topic }) return
         unissuedBootstraps += topic
+        requestedBootstraps += topic
         pumpBootstraps()
     }
 
