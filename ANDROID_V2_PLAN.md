@@ -268,6 +268,16 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > (A)는 사실 정정·상태 명확화이며 범위·D-결정·게이트·DoD를 바꾸지 않는다. REST bootstrap은 L-4f coordinator 조각의 land와 미배선 상태를 확인했으며 전체 완료를 뜻하지 않는다. 머리말의 그 밖의 기존 상태·잔여 항목(S3의 k-2 lease·k-3 D14 침묵·topic last-known disk·FX cutover 포함)과 각 슬라이스의 전체 DoD는 이번에 재확인하지 않았다. 최종 보정 날짜는 문서 수정일이며 전체 구현 상태의 재검증일이 아니다.
 > **(B) 관측 계기 결정 [2형, 사용자 GO 2026-09-16].** S1 설계 §2.3의 관측 계기는 (가) 수동 관측만 채택하고, (나) Firebase 토큰 리스너 기반 자동 획득은 넣지 않는다. 회복 관측만을 위한 추가 credential 획득은 0으로 유지한다.
 > 이 결정은 위 (A)의 발견 한계를 없애지 않으며, 미결정으로 남아 있던 항목을 닫을 뿐이다. 실제 앱 검증에서 멈춘 상태를 어떻게 벗어나는지 관찰한 뒤 필요하면 다시 판단한다. 이 결정도 운영 배선·arming·rollout·deploy를 열지 않는다.
+>
+> **동결 후 14번 명시적 개정 기록(2026-09-16, 사용자 결정 위임에 따른 Claude·Codex 설계 합의).** §7 S1의 clean cold start와 동결 후 8·9·10번의 제어 상태 복구 계약을 다음과 같이 보완한다.
+> 손실 응답을 받을 수 있는 요청·관측 수명과 protected 사용은 대상 owner·epoch·축·session id의 선행 복구 의도가 저장됐음을 확인한 뒤 연다. 새 owner 또는 새 epoch의 수명은 그 대상을 덮는 의도를 별도로 확보한다.
+> 검증된 손실과 P4 후보는 저장 시도 전에 해당 접근을 메모리에서 닫는다. 저장 실패·취소·미확정으로 차단을 해제하지 않는다. 관련 in-flight 종료·접근 닫힘·제어 의무 정산의 저장을 확인한 뒤에만 선행 의도를 해제한다.
+> 다음 프로세스에서 미정산 선행 의도가 발견되면 그 대상의 clean continuity를 인정하지 않는다. 대상이 현재 owner·해당 epoch와 일치할 때 필요한 축을 새 UUID와 purge journal로 원자적으로 은퇴시킨다. 이미 은퇴했다면 필요한 journal의 인계·완료를 확인하며 현재의 다른 namespace를 다시 회전시키지 않는다. null-target 봉인은 기존 정산 증거 규칙을 유지한다.
+> 해당 protected 입장은 필요한 실제 purge 완료와 새 서버 승인 뒤에만 연다. 복구용 레코드 읽기·신원 재검증·권한 재확인은 기존 admission·AUTH·floor 규칙으로 허용한다. DeletionPending의 우선 차단과 무료 경로의 기존 신원 조건은 유지한다.
+> 이 은퇴는 미정산 재시작의 정리 정책이다. 서버의 명시적 거부를 합성하지 않고, 같은 프로세스의 P4 보류만으로 회전·purge하지 않는 10번 계약도 유지한다. 옛 runtime grant와 후보 응답을 새 세션의 권위로 복원하지 않는다.
+> 실행 중이던 예약 task와 process-local binding은 복원하지 않는다. 저장된 재확인 의무와 floor는 새 binding의 제어 조회에 인계한다. 저장되지 못한 응답 세부·새 floor의 복원은 보장하지 않는다.
+> 미정산 종료에서는 same-UID여도 protected cache 연속성을 잃을 수 있다는 비용을 선택한다. 원본 선호 보존, §9.1의 cutover 소유, 13번의 수동 회복 관측 결정은 유지한다.
+> 이 기록은 설계 결정이며 구현·배선·실제 purger 또는 process-death DoD의 충족 선언이 아니다. 기존 runtime 연결·arming·rollout·deploy 게이트를 유지한다.
 
 ---
 
@@ -429,7 +439,7 @@ I1의 legacy rates=S3·legacy graph=S4, I8=S7~S9, I6=S11부터 회귀 금지다.
 `PremiumConfirmed`가 같은 owner를 공유한다. 예약은 현재 grant를 만들거나 연장·만료시키지 않는다. 중복 pending/실패는
 기존 `notBefore` hard floor를 앞당기지 않고 한 task로 합치며, stable non-pending 응답·reset/logout·UID 전환·typed reject에서
 cancel/invalidate한다. background에서 별도 wake를 보장하지 않고 foreground 복귀 시 due 여부를 먼저 평가한다. process death에는
-예약을 복원하지 않으며 cold start의 `Resolving`이 새 조회를 시작한다. 늦은 결과는 captured UID/`userAccessEpoch`/
+실행 중이던 예약 task·binding을 복원하지 않는다. cold start의 `Resolving`은 동결 후 14번에 따라 저장된 재확인 의무·floor를 인계받아 새 조회를 시작한다. 늦은 결과는 captured UID/`userAccessEpoch`/
 `refreshGeneration` 중 하나라도 다르면 폐기한다.
 
 동일 UID에서 entitlements 조회가 transport/HTTP/decoding 판정 불가로 끝나면 **새 권한을 만들지 않되 기존 premium runtime `PremiumConfirmed`는 그대로 유지한다 — 클라이언트 시간 상한은 두지 않는다.**
@@ -947,7 +957,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
 - backup 제외 `AccessEpochStore`: `(ownerUid,userAccessEpoch,krxCapabilityEpoch,mayContainPremiumData,
   mayContainKrxData,pendingPurge)`를 한 crash-safe control record로 관리한다. 일반 key=`(uid,userAccessEpoch,feature,tab,period)`,
   KRX key에는 `krxCapabilityEpoch`를 추가하고 모든 in-flight가 동일 fence를 캡처한다.
-  - same-UID clean cold start는 epoch namespace만 이어받되 `.forcePremium` fresh ACTIVE 전 protected read/render는 0.
+  - same-UID clean cold start는 epoch namespace만 이어받되 `.forcePremium` fresh ACTIVE 전 protected read/render는 0. 미정산 선행 복구 의도가 있는 재시작은 동결 후 14번의 은퇴·정리 정책을 따른다.
     UID 불일치·불완전 teardown journal은 새 epoch를 먼저 persist하고 old namespace를 purge한다
   - protected/KRX 첫 write 전에 해당 `mayContain*Data=true`를 먼저 persist. teardown은
     `새 UUID + old namespace pendingPurge persist → runtime cancel → old namespace purge → journal clear` 순이며 각 crash 경계를 재실행한다
