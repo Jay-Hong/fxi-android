@@ -13,6 +13,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 S3는 a~k-1 land(`4f50b64`). 남은 S3 = k-2 lease · k-3 D14 침묵 ·
                                 REST bootstrap · topic last-known disk · FX cutover. 구독자 목적지는 아직
                                 `PremiumUnavailableScreen`이고 FX cutover가 그것을 치운다.
+                                L-4b·L-4c·L-4d·L-4e(E1~E6)·L-4f와 S1 회복 신호는 land했다.
+                                S1 발급자 회복 경로는 배선돼 있으며, topic 세션·grant 전달자의 runtime 배선은
+                                미착수다(동결 후 13번)
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -36,7 +39,7 @@ Android public rollout        : BLOCKED by SV-1 / SV-2 production 배포·검증
 iOS common server gate        : SV-1 / SV-2
 Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 전달 신뢰성 hardening(DEFERRED) · SV-4 cross-device 계정삭제 hardening
 작성                          : 2026-08-29
-최종 보정                     : 2026-09-09
+최종 보정                     : 2026-09-16
 ```
 
 > **`Plan approval`은 구현 착수 승인이 아니다.** 계획을 기준으로 채택했을 뿐이고, 각 슬라이스 착수에는 별도 GO가 필요하다.
@@ -255,6 +258,16 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > (3) **임시 보류 해제 뒤 bootstrap**: context가 유지된 임시 보류(10번의 판정 불가 보류 등)가 풀리면 11번의 grant당 계획을 이어 미발급분만 발급한다. 보류 때문에 적용하지 못한 기발급 요청은 자동 재요청하지 않으며, 간격·floor·소비 기록을 유지한다. context가 바뀐 복구는 새 grant 경로를 따른다.
 > (4) **반복 재승인의 예산**: 서버 거부 뒤 fresh ACTIVE에 따른 topic grant 재발급(D23의 거부 latch 해제 구현)으로 새 fence가 생긴 경우, 같은 binding의 재승인 회복과 자동 재연결은 D3 예산(5회, 2s×n ±20%)을 공유한다. token 교체·ACTIVE 답·단순 보류 해제는 예산을 초기화하지 않고, 초기화는 조건을 충족한 foreground·online 복귀와 같은 열린 연결의 30초 안정만 따른다. 이 제한은 WS 연결과 그 회복에 따른 자동 bootstrap에 함께 적용하며, 재승인 뒤 첫 bootstrap은 직전 발급 간격과 서버 floor를 따른다. 일반 context 변경의 새 grant는 기존 첫 묶음 규칙을 유지한다. 보류 해소·거부 전달·floor 기록 같은 제어 흐름은 막지 않는다.
 > 이 기록은 L-4e 설계 합의이며 구현·배선 완료나 S1 합산 요청 예산 검증의 완료가 아니다. 7번의 runtime 배선 전 선행조건과 5번의 "구현·검증 전 런타임 연결 금지"를 유지한다. 다른 D-결정·슬라이스 경계·게이트·DoD를 바꾸지 않으며 어떤 arming·rollout·deploy도 열지 않는다.
+>
+> **동결 후 13번 — (A) 비의미 상태 명확화 기록(2026-09-16, Claude·Codex 검토)과 (B) 관측 계기 결정(사용자 GO 2026-09-16).** 성격이 다르므로 나눠 적는다.
+> **(A) 사실 갱신 [1형].** 12번이 확정한 L-4e의 구현 조각이 모두 land했다 — E1 `3e0b387` / E2a-1 `8a15abf` / E2a-2 `32e4f4c` / E2b `4c78b13` / E3 `c0b12c3` / E4a `6d34f26` / E4b `c4035d7` / E5 `dfe6556` / E6a `0e4c90a` / E6b `f2d0817`, 그리고 12번 (2)가 전제한 회복 신호는 S1 쪽 `fdecc53`이다.
+> 대응은 (1)=E1·E2a, (2)=`fdecc53`·E6a·E6b, (3)=E2b·E3, (4)=E4a·E4b·E5이다. 각 조각은 시험·변이 배터리·CI·commit/push 이중 합의를 거쳤고 증거는 `/Users/jay/logs/fxi-android-evidence/`에 있다.
+> 9번이 미충족으로 적은 "같은 binding에서 신원 사건 없이 credential만 회복될 때의 자동 재개(재개 신호가 없다)"는 사실이 달라졌으므로 정정한다. 신호는 `fdecc53`로 존재하고, 발급자 쪽 재개는 운영에 배선돼 있다(`FXiApplication`이 `AuthAccessBinder.start()`를 부르고, binder가 회복 스트림을 구독해 발급자에 넘긴다). topic 명령 재개는 E6a·E6b로 구현했으나 세션을 만드는 production 코드가 없어 배선 전이다.
+> 발견 계기는 S1 설계 §2.3의 (가) 수동 관측이므로, 앱의 다른 인증 요청이 모두 멈추면 회복을 발견하지 못할 수 있다. 조각 land를 "모든 상황의 자동 회복"으로 읽지 않는다.
+> **이번 갱신과 관련해 미충족으로 남는 것**: 실제 purger / 봉인·재확인 요구·손실 후보 보류의 process death 지속 / S1 합산 요청 예산 검증 / topic runtime 통합(발급자 어댑터·전달자·세션의 생성·수명·연결, 세션의 회복 구독, 마지막 탭 복원·현재 탭 focus 제공자의 구현·연결). 이미 배선된 S1 발급자 회복 경로와 구분한다. 이 네 범주는 계획 전체의 잔여 목록이 아니며, 7번의 선행조건과 5번의 "구현·검증 전 런타임 연결 금지"는 그대로다.
+> (A)는 사실 정정·상태 명확화이며 범위·D-결정·게이트·DoD를 바꾸지 않는다. REST bootstrap은 L-4f coordinator 조각의 land와 미배선 상태를 확인했으며 전체 완료를 뜻하지 않는다. 머리말의 그 밖의 기존 상태·잔여 항목(S3의 k-2 lease·k-3 D14 침묵·topic last-known disk·FX cutover 포함)과 각 슬라이스의 전체 DoD는 이번에 재확인하지 않았다. 최종 보정 날짜는 문서 수정일이며 전체 구현 상태의 재검증일이 아니다.
+> **(B) 관측 계기 결정 [2형, 사용자 GO 2026-09-16].** S1 설계 §2.3의 관측 계기는 (가) 수동 관측만 채택하고, (나) Firebase 토큰 리스너 기반 자동 획득은 넣지 않는다. 회복 관측만을 위한 추가 credential 획득은 0으로 유지한다.
+> 이 결정은 위 (A)의 발견 한계를 없애지 않으며, 미결정으로 남아 있던 항목을 닫을 뿐이다. 실제 앱 검증에서 멈춘 상태를 어떻게 벗어나는지 관찰한 뒤 필요하면 다시 판단한다. 이 결정도 운영 배선·arming·rollout·deploy를 열지 않는다.
 
 ---
 
