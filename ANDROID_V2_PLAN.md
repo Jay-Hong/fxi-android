@@ -24,9 +24,10 @@ S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반�
                                 **유예 사유는 셋이 서로 다르다** — purge는 대상이 아직 legacy rate/graph store,
                                 PushDelete는 **서버 D21 순서 계약 미결**, backup은 기존 사용자 설정의 restore 동작
                                 변경을 분리한 것. 이 기록은 완료 선언도, 후속 슬라이스로의 이관 승인도 아니다.
-                                명시적 거부 저장 실패의 S1 잔여 중 S1r-1·S1r-2b·S1r-2a는 land했고, 이번 변경에 S1r-2c
-                                구현을 포함한다. 봉인·재확인 요구·손실 후보 보류의 process death 지속은 미충족이다
-                                (동결 후 8·9·10번 기록)
+                                명시적 거부 저장 실패의 S1 잔여 S1r-1·S1r-2b·S1r-2a·S1r-2c는 모두 land했다.
+                                봉인·재확인 요구·손실 후보 보류의 process death 지속은 미충족이고, 14번이 더한
+                                선행 복구 의도 저장·미정산 namespace 은퇴도 아직 구현되지 않았다
+                                (동결 후 8·9·10·13·14·15번 기록)
 S1.5 확인 필요                : presenter·순서/표시 설정·legacy bank store 삭제는 land. `RateSourceRegistry`와
                                 live/snapshot renderMode 등가까지 포함한 전체 DoD 충족은 미확인
 S2 미충족                     : D26 무료 알림 in-memory 미리보기 미구현 · 마지막 탭은 `(owner_uid, last_tab)` 한 쌍이라
@@ -39,7 +40,7 @@ Android public rollout        : BLOCKED by SV-1 / SV-2 production 배포·검증
 iOS common server gate        : SV-1 / SV-2
 Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 전달 신뢰성 hardening(DEFERRED) · SV-4 cross-device 계정삭제 hardening
 작성                          : 2026-08-29
-최종 보정                     : 2026-09-16
+최종 보정                     : 2026-09-17
 ```
 
 > **`Plan approval`은 구현 착수 승인이 아니다.** 계획을 기준으로 채택했을 뿐이고, 각 슬라이스 착수에는 별도 GO가 필요하다.
@@ -278,6 +279,13 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > 실행 중이던 예약 task와 process-local binding은 복원하지 않는다. 저장된 재확인 의무와 floor는 새 binding의 제어 조회에 인계한다. 저장되지 못한 응답 세부·새 floor의 복원은 보장하지 않는다.
 > 미정산 종료에서는 same-UID여도 protected cache 연속성을 잃을 수 있다는 비용을 선택한다. 원본 선호 보존, §9.1의 cutover 소유, 13번의 수동 회복 관측 결정은 유지한다.
 > 이 기록은 설계 결정이며 구현·배선·실제 purger 또는 process-death DoD의 충족 선언이 아니다. 기존 runtime 연결·arming·rollout·deploy 게이트를 유지한다.
+>
+> **동결 후 15번 비의미 정합 보정 기록(2026-09-17, Claude·Codex 검토).** 14번이 바꾼 규범을 같은 규칙이 적힌 다른 자리에 연결하고, 14번 기록이 빠뜨린 대상·근거를 여기서 정정한다. 9번을 13번이 정정한 방식과 같게 14번 기록 본문은 고치지 않는다.
+> (A) 14번의 개정 대상 선언은 "§7 S1의 clean cold start와 동결 후 8·9·10번"만 들었지만 같은 결정이 **O5 회수 범위 문단**과 §3 불변식 I4·D23의 cold start 서술에도 미친다. 특히 O5는 "명시적 거부 없이 보존 namespace를 purge하지 않는다"를 보장으로 두고 예외를 로그아웃 의도 하나로만 열어 두었으므로, 미정산 선행 복구 의도가 있는 재시작에서 14번과 지시가 갈렸다. I4·D23은 이미 `clean cold start`로 한정돼 있어 충돌이 아니라 예외 연결 누락이다. 세 자리에 그 예외를 적는다. 바뀐 규범 자체는 14번의 것이고 여기서 새로 정하지 않는다.
+> (B) 14번의 승인 근거는 2026-09-16 사용자 위임(결정할 일은 Codex와 상의해 정하고 계속 진행)이다. 다른 개정 기록처럼 위임 시점을 남긴다.
+> (C) 현재 `UnimplementedScopePurger`는 `Deferred`를 돌려주고 실제 purge를 하지 않으므로, 필요한 purge가 남은 미정산 재시작의 protected 입장은 이 stub 아래에서 열리지 않는다. 8번이 적은 대로 다른 항목·축의 실패나 외부 재개 계기로 다시 호출될 수는 있으나, 재호출이 실제 purge 완료를 대신하지는 않는다. 활성화 순서는 14번이 근거로 든 purger 설계 v3 final §9를 따른다 — P1·P2는 production 비활성으로 구현·검증하고, P3에서 실제 adapter를 쓰는 첫 protected use 차단을 검증한 뒤 저장·복원·purger를 함께 연다. 미전환 대상과 상위 선행조건은 완료로 보고하지 않으며 §9.1의 cutover 소유를 유지한다.
+> (D) 저장된 재확인 의무·floor의 인계는 목표 계약이고 process death 지속은 여전히 미충족이다. 저장 항목·키 형식·재시작의 floor 해석은 같은 설계 §7·§7.1을 따르며, 그 저장·복구 모델의 구현·시험은 §9의 P2다. 여기서 새 저장 형식을 정하지 않는다.
+> **유형 판정**: 1형으로 기록한다 — 규범을 바꾼 것은 14번이고 여기서는 그 결정이 이미 미치는 자리에 문장을 맞출 뿐이며, 범위·D-결정·슬라이스 경계·release gate·DoD를 바꾸지 않는다. 다만 머리말의 "애매하면 2번" 규칙을 의식해 밝혀 둔다 — 이 보정을 2형으로 읽더라도 14번을 연 같은 위임이 그대로 적용되고 새로 더해지는 제약은 없다. 이 기록도 구현·배선·arming·rollout·deploy를 열지 않는다.
 
 ---
 
@@ -353,7 +361,7 @@ I1의 legacy rates=S3·legacy graph=S4, I8=S7~S9, I6=S11부터 회귀 금지다.
 | **I1** | legacy 소비 0 — `/api/rates*`, `/api/graph/{currency}`, WS `rates` 프레임을 **읽지 않는다**. 서버는 접속 즉시 legacy `rates` 프레임을 1회 보내므로(`app/main.py:1103-1125`) **명시적으로 무시**하고, 이 프레임 수신으로 reconnect 실패 카운터를 초기화하지 않는다. |
 | **I2** | KRX **deny-by-default**. 단일 신호 `GET /api/entitlements`의 `krx_visible`만 사용하고 클라가 G1/G2/G3를 조합하지 않는다(**G3**=`KRX_FUTURES_ENABLED` 수집 / **G2**=`KRX_CLIENT_DISTRIBUTION_ENABLED` 배포 / **G1**=`user_entitlements` row 운영자 수동 부여, `krx_visible = G3 ∧ G2 ∧ G1 ∧ premium` — ADR-038 Decision 1, `exchange-rate/app/entitlements.py:7-9,68`). `false`면 시세·그래프 series·알림 picker·**설정 목록·히스토리**·접근성 label·analytics에서 전부 제거하고, sender의 발송 직전 재판정에 철회가 반영된 뒤 시작하는 신규 KRX FCM은 0이다. 서버 row는 삭제하지 않는다(재승인 복구). 권한 확인과 RPC 시작 사이의 race, 이미 시작됐거나 FCM/APNs가 수락한 visible message의 사후 회수는 현 iOS와 현재 서버 topology가 보장하지 못하며 v2.0 known limitation으로 명시한다. |
 | **I3** | 무료(로그인·비구독) 경로는 **인증된 hourly REST 전용**. WS 연결 0, FCM 기기 등록 0, 알림 mutation 0, app-owned KRX 데이터·UI 흔적 0. 철회 전에 broker가 수락한 visible message는 I2의 공통 한계를 따른다. |
-| **I4** | 사용자 원본 preference는 `uid` scope다. 일반 권한 파생 cache/live/in-flight는 `(uid,userAccessEpoch)`, KRX 파생 데이터는 `(uid,userAccessEpoch,krxCapabilityEpoch)` scope다. 두 epoch는 backup 제외 로컬 저장소의 opaque UUID이며 **권한 teardown에서 새 UUID와 이전 namespace purge journal을 먼저 원자적으로 persist**하고 절대 재사용/0 reset하지 않는다. KRX revoke는 `krxCapabilityEpoch`만 바꿔 비-KRX 사용자 데이터를 무효화하지 않는다. same-UID clean cold start는 namespace epoch만 이어받을 수 있지만 fresh 서버 승인 전에는 protected cache를 읽거나 그리지 않는다. KRX effective projection은 파생 상태이며 원본 preference를 덮지 않는다(D17의 Graph hana↔KRX 쌍 예외 제외). 이전 UID/epoch에서 출발한 응답은 새 세션에 반영하지 않는다. |
+| **I4** | 사용자 원본 preference는 `uid` scope다. 일반 권한 파생 cache/live/in-flight는 `(uid,userAccessEpoch)`, KRX 파생 데이터는 `(uid,userAccessEpoch,krxCapabilityEpoch)` scope다. 두 epoch는 backup 제외 로컬 저장소의 opaque UUID이며 **권한 teardown에서 새 UUID와 이전 namespace purge journal을 먼저 원자적으로 persist**하고 절대 재사용/0 reset하지 않는다. KRX revoke는 `krxCapabilityEpoch`만 바꿔 비-KRX 사용자 데이터를 무효화하지 않는다. same-UID clean cold start는 namespace epoch만 이어받을 수 있지만 fresh 서버 승인 전에는 protected cache를 읽거나 그리지 않는다. 미정산 선행 복구 의도가 있는 재시작은 동결 후 14번의 은퇴·정리 정책을 따른다. KRX effective projection은 파생 상태이며 원본 preference를 덮지 않는다(D17의 Graph hana↔KRX 쌍 예외 제외). 이전 UID/epoch에서 출발한 응답은 새 세션에 반영하지 않는다. |
 | **I5** | **strict wire decode ⊥ domain 검증.** wire는 계약 위반 시 실패하고, 값 sanity(finite / >0 / 상한)는 domain 변환에서 검증한다. |
 | **I6** | **Android 공개 rollout**은 SV-1·SV-2의 production 배포·검증 전에는 시작하지 않는다(§10.1). SV-1은 subprocess를 포함한 모든 visible-alert 발송 경로의 send-time premium/KRX 권한 확인, SV-2는 KRX settings/history의 filter-before-limit를 뜻한다. |
 | **I7** | **premium 정본은 서버 `premium_active`**다. 로컬 RevenueCat은 구매·복원 신호일 뿐 runtime 접근 권위가 아니다. 서버 거부 후 로컬 `true`만으로 premium을 다시 열지 않는다(D23). |
@@ -439,7 +447,7 @@ I1의 legacy rates=S3·legacy graph=S4, I8=S7~S9, I6=S11부터 회귀 금지다.
 `PremiumConfirmed`가 같은 owner를 공유한다. 예약은 현재 grant를 만들거나 연장·만료시키지 않는다. 중복 pending/실패는
 기존 `notBefore` hard floor를 앞당기지 않고 한 task로 합치며, stable non-pending 응답·reset/logout·UID 전환·typed reject에서
 cancel/invalidate한다. background에서 별도 wake를 보장하지 않고 foreground 복귀 시 due 여부를 먼저 평가한다. process death에는
-실행 중이던 예약 task·binding을 복원하지 않는다. cold start의 `Resolving`은 동결 후 14번에 따라 저장된 재확인 의무·floor를 인계받아 새 조회를 시작한다. 늦은 결과는 captured UID/`userAccessEpoch`/
+실행 중이던 예약 task·binding을 복원하지 않는다. cold start의 `Resolving`은 동결 후 14번의 목표 계약에 따라 저장된 재확인 의무·floor를 인계받아 새 조회를 시작하도록 한다. 구체 저장·복구 규칙은 14번이 근거로 든 purger 설계를 따르며, 현재 process death 지속은 미충족이다. 늦은 결과는 captured UID/`userAccessEpoch`/
 `refreshGeneration` 중 하나라도 다르면 폐기한다.
 
 동일 UID에서 entitlements 조회가 transport/HTTP/decoding 판정 불가로 끝나면 **새 권한을 만들지 않되 기존 premium runtime `PremiumConfirmed`는 그대로 유지한다 — 클라이언트 시간 상한은 두지 않는다.**
@@ -452,7 +460,8 @@ cancel/invalidate한다. background에서 별도 wake를 보장하지 않고 for
 새 UID·프로세스 cold start에는 last-good premium/KRX **grant**를 이관하지 않는다. 다만 backup 제외 control store의
 `(ownerUid,userAccessEpoch,krxCapabilityEpoch,mayContainPremiumData,mayContainKrxData,pendingPurge)`는 정리 provenance로
 유지한다. same-UID clean cold start는 epoch를 보존하되 protected cache를 봉인하고, fresh ACTIVE 뒤에만 같은 namespace를
-개방한다. fresh false/typed reject/UID 변경/logout/KRX false는 해당 marker가 가리키는 old namespace를
+개방한다. 미정산 선행 복구 의도가 있는 재시작은 동결 후 14번의 은퇴·정리 정책을 따른다.
+fresh false/typed reject/UID 변경/logout/KRX false는 해당 marker가 가리키는 old namespace를
 `새 epoch+pendingPurge persist → old namespace purge → journal clear` 순으로 정리한다. marker는 권한 정보가 아니며
 protected/KRX 데이터를 쓰기 전에 해당 `mayContain*Data=true`가 먼저 persist돼야 한다.
 
@@ -494,7 +503,8 @@ protected/KRX 데이터를 쓰기 전에 해당 `mayContain*Data=true`가 먼저
 > **O5 회수의 범위.** iOS parity로 돌아가되 다음은 그대로 유지한다 — 명시적 거부(fresh stable false / typed
 > `premium_required` / typed `krx_entitlement_required`)·UID 변경·logout은 각 범위의 즉시 hide·purge, **저장된 사용자가
 > 같은 UID로 복원된** 앱 재시작은 grant를 복원하지 않아 hide/seal하되 명시적 거부 없이 보존 namespace를 purge하지
-> 않는다 **(단 그 UID의 로그아웃 의도가 기록돼 있으면 그 정산이 먼저다). UID 없이 시작한 재시작은 D23 `SignedOut`
+> 않는다 **(단 그 UID의 로그아웃 의도가 기록돼 있으면 그 정산이 먼저다. 미정산 선행 복구 의도가 있는 재시작은
+> 동결 후 14번의 은퇴·정리·재개방 정책을 따른다). UID 없이 시작한 재시작은 D23 `SignedOut`
 > 행을 따른다**(동결 후 6번 개정). **200 pending envelope의
 > `krx_visible=false`도 edge-trigger로 즉시 적용**한다. 사라지는 것은 *시간에 의한* 만료뿐이다.
 
