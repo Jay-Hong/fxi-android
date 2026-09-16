@@ -15,16 +15,23 @@ data class PurgeNamespace(
 )
 
 /**
- * Outcome of a purge attempt.
+ * Outcome of a purge attempt, for the whole obligation rather than for whatever ran.
  *
  * [Deferred] exists so that an unimplemented purger cannot be mistaken for a completed one. The
  * journal is cleared only on [Completed]; anything else leaves the pending-purge entry in place so
- * the next process start retries it.
+ * the next process start retries it. [Completed] therefore means every target this entry covers is
+ * gone or proven absent — not that the targets a build happens to know about were handled
+ * (purger 설계 v3 final §4).
  */
 sealed interface PurgeResult {
     data object Completed : PurgeResult
 
-    /** No purge ran. The caller must keep the journal. */
+    /**
+     * Nothing ran, or some of it did and the rest is still owed.
+     *
+     * Partial progress lands here on purpose: a purge that deleted one surface and left another to
+     * the slice that owns it has not finished the entry, and the caller must keep the journal.
+     */
     data class Deferred(val reason: String) : PurgeResult
 
     data class Failed(val cause: Throwable) : PurgeResult
