@@ -2279,7 +2279,14 @@ class TopicSessionCoordinator(
         if (live.fence != fence || !sessionWanted()) return
         if (!enforceLiveIdentity(live.fence)) return
         if (!authority.admits(live.lifetime)) return
-        if (live.controlOwner != null) {
+        // A lane that was just released can still owe a start: `releaseControlLane` only *posts*
+        // `ControlLaneFree`. Calls from `CommandDone` and `CredentialRecovered` can run inline,
+        // ahead of that queued input. Without the two flags here, a reopen registered
+        // now takes the lane and the renewal that was waiting first is deferred again, inverting
+        // the order the `ControlLaneFree` handler was written to keep (L-4e E6c). Neither flag can
+        // stand with a free lane for long: both are set only under `controlOwner != null`, and the
+        // owner's release posts the input that clears them.
+        if (live.controlOwner != null || live.renewalDeferred || live.revalidationDeferred) {
             live.recoveryReopenDeferred = true
             return
         }

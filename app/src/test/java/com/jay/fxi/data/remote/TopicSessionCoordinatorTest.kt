@@ -8828,6 +8828,226 @@ class TopicSessionCoordinatorTest {
     }
 
     /**
+     * A revalidation holds the lane while the renewal comes due behind it. Returns the gate that releases the credential, with the
+     * revalidation still holding and `renewalDeferred` standing.
+     */
+    private suspend fun TestScope.renewalDeferredBehindHeldRevalidation(h: Harness): CompletableDeferred<Unit> {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 300L), Triple(USD, "L2", 300L)))
+        advanceTimeBy(1)
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        advanceTimeBy(56_000)
+        assertEquals("재확인이 lane 을 쥐지 않았다", 1, h.requests.size)
+        advanceTimeBy(70_000)
+        assertEquals("lane 을 쥔 재확인 앞에서 갱신이 시작됐다", 1, h.requests.size)
+        return gate
+    }
+
+    /**
+     * The same inversion with the orders drawn the way production draws them, and the inputs queued the way it queues them.
+     *
+     * The ending's order is taken inside the command (`TopicSubscribeCommand.authEnded`) and the recovery's inside the provider, from
+     * one shared `AccessOrderSequence` — so a recovery can only answer an ending whose order was taken first. Here the recovery is
+     * created from that same sequence *while the session is publishing the ending*, which is after the command took its order, and
+     * the post lands behind the `CommandDone` the command had already queued. The session then handles `CommandDone` (freeing the
+     * lane and queueing `ControlLaneFree`), the recovery, and only then `ControlLaneFree` — the order that defeats a fix made in
+     * `CommandDone` alone.
+     */
+    @Test
+    fun `a recovery queued behind CommandDone does not jump ahead of the waiting renewal`() = runTest {
+        val h = Harness(this)
+        val gate = renewalDeferredBehindHeldRevalidation(h)
+
+        h.onTopicStatePublished = {
+            h.onTopicStatePublished = null
+            // Nothing has been reopened yet, so this post lands behind the `CommandDone` the command already queued.
+            assertEquals("관찰자가 도는 시점에 이미 새 명령이 열려 있었다", 1, h.requests.size)
+            // Drawn now, from the sequence the command already took its ending order from.
+            h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        }
+        h.credentialFailures = 3
+        gate.complete(Unit)
+        advanceTimeBy(11_000)
+
+        assertNull("관찰자가 실행되지 않았다", h.onTopicStatePublished)
+        assertEquals("재확인이 끝난 뒤 아무것도 열리지 않았다", 2, h.requests.size)
+        assertEquals(
+            "CommandDone 뒤에 놓인 회복이 lane 을 먼저 가져가 갱신이 다시 밀렸다",
+            setOf(TETHER, USD),
+            h.requests[1].topics.toSet()
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * The other deferred start: a renewal holds the lane and ends on authentication while the quiet question waits behind it.
+     *
+     * The battery found that dropping `revalidationDeferred` from the guard survives every renewal-side test, because all of those
+     * park a renewal. Here the roles are swapped, and the two candidates ask for different things: a pure renewal's ending owes a
+     * renewal, so the reopen would ask the renewal scope, while the waiting question asks tether alone. The delivery state tells them
+     * apart too — a plain revalidation start reaches `beginRevalidation`, while a pure-renewal reopen leaves tether in the
+     * `SUSPECT` state already set by D14.
+     *
+     * The renewal sends once before it ends so that its failure publishes a state at all; a renewal that never got past preparation
+     * changes nothing the observer could fire on.
+     */
+    @Test
+    fun `a queued recovery does not overtake a waiting revalidation`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        h.wire.deliver(h.fxFrame(1400.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 300L), Triple(USD, "L2", 300L)))
+        advanceTimeBy(1)
+
+        // Keep D14's window behind the renewal, which comes due at 300 − 180 = 120s.
+        for (at in listOf(40_000L, 80_000L, 118_000L)) {
+            advanceTimeBy(at - h.scheduler.currentTime)
+            h.wire.deliver(h.tetherFrame(1391.0))
+            advanceTimeBy(1)
+        }
+
+        advanceTimeBy(121_000L - h.scheduler.currentTime)
+        assertEquals(2, h.requests.size)
+        assertEquals(setOf(TETHER, USD), h.requests[1].topics.toSet())
+
+        // The first attempt goes unacknowledged; the next two find no credential.
+        h.credentialFailures = 2
+        advanceTimeBy(147_000L - h.scheduler.currentTime)
+        assertEquals(3, h.credentialReads)
+        assertEquals(1, h.credentialFailures)
+
+        // Hold the last preparation across D14's deadline at 118 + 45 = 163s, so the question is deferred behind the lane.
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        advanceTimeBy(166_000L - h.scheduler.currentTime)
+        assertEquals(2, h.requests.size)
+        assertEquals(3, h.credentialReads)
+        assertEquals(TopicDeliveryState.SUSPECT, h.store.snapshot.stateFor(TETHER).deliveryState)
+
+        h.onTopicStatePublished = { snapshot ->
+            if (snapshot.controlState == TopicControlState.FAILED) {
+                h.onTopicStatePublished = null
+                assertEquals(2, h.requests.size)
+                h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+            }
+        }
+
+        gate.complete(Unit)
+        advanceTimeBy(1)
+
+        assertNull("종료 상태 관찰자가 실행되지 않았다", h.onTopicStatePublished)
+        assertEquals(3, h.requests.size)
+        assertEquals(
+            "재개가 lane 을 먼저 가져가 재확인이 다시 밀렸다",
+            setOf(TETHER),
+            h.requests[2].topics.toSet()
+        )
+        assertEquals(
+            "밀린 재확인이 아니라 재개가 돌았다",
+            TopicDeliveryState.REVALIDATING,
+            h.store.snapshot.stateFor(TETHER).deliveryState
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * The same rule at the other trigger: `CommandDone` reaches `reconsiderRecovery` inline, with the lane already free because
+     * `releaseControlLane` only *posts* `ControlLaneFree`. Registering the reopen there takes the lane back and defers the renewal a
+     * second time — the inversion of the order the `ControlLaneFree` handler keeps. Found by audit after E6b landed (L-4e E6c).
+     *
+     * **The recovery's order is injected here, and that is a simulation.** Production draws the ending's order and the recovery's
+     * from one shared `AccessOrderSequence`, so a recovery *delivered* this early would carry a *smaller* order than the ending taken
+     * later, and would answer nothing. The state this test sets up is reachable in production only by preemption between the command
+     * taking its order and posting `CommandFinished` — a window this single-threaded harness cannot open. So this test locks the
+     * guard at the `CommandDone` trigger, and `a recovery queued behind CommandDone does not jump ahead of the waiting renewal`
+     * carries the interleaving with orders drawn the way production draws them.
+     */
+    @Test
+    fun `a recovery reopen does not jump ahead of a renewal already waiting for the lane`() = runTest {
+        val h = Harness(this)
+        val gate = renewalDeferredBehindHeldRevalidation(h)
+
+        // Decided after the ending it will answer, although it arrives before that ending is recorded — the connection keeps it
+        // (the coordinator says so where it holds the candidate) and asks again once the ended command has left.
+        h.coordinator.onCredentialRecovered(AuthCredentialRecovery(fence().identity, 1L, 1L, 10_000L))
+        advanceTimeBy(1)
+        assertEquals("lane 을 쥔 명령 앞에서 재개했다", 1, h.requests.size)
+
+        h.credentialFailures = 3
+        gate.complete(Unit)
+        advanceTimeBy(11_000)
+
+        assertEquals("재확인이 끝난 뒤 아무것도 열리지 않았다", 2, h.requests.size)
+        assertEquals(
+            "재개가 lane 을 먼저 가져가 갱신이 다시 밀렸다",
+            setOf(TETHER, USD),
+            h.requests[1].topics.toSet()
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * Going first is not going instead: once the renewal has the answer it was waiting for, the reopen it stood aside for runs.
+     *
+     * This is the other half of the guard. Making the recovery wait for `renewalDeferred` would be a deadlock if nothing ever cleared
+     * that flag — so the flag's clearing and the reopen that follows it are asserted here, not argued.
+     */
+    @Test
+    fun `the reopen the renewal went ahead of still runs once the renewal is answered`() = runTest {
+        val h = Harness(this)
+        val gate = renewalDeferredBehindHeldRevalidation(h)
+        h.coordinator.onCredentialRecovered(AuthCredentialRecovery(fence().identity, 1L, 1L, 10_000L))
+        h.credentialFailures = 3
+        gate.complete(Unit)
+        advanceTimeBy(11_000)
+        assertEquals(setOf(TETHER, USD), h.requests[1].topics.toSet())
+
+        h.wire.deliver(h.ackWithLeases(h.requests[1].requestId, Triple(TETHER, "L3", 900L), Triple(USD, "L4", 900L)))
+        advanceTimeBy(1)
+
+        assertEquals("갱신이 답을 받은 뒤에도 재개가 열리지 않았다", 3, h.requests.size)
+        assertEquals(listOf(TETHER), h.requests[2].topics)
+        h.cleanUp()
+    }
+
+    /**
+     * …and going first is not a licence to ask twice: an obligation the answer settled is not reopened.
+     *
+     * The renewal's acknowledgement clears `renewalDeferred` where it applies the leases, and a tether frame received meanwhile
+     * settles what the revalidation owed. With nothing owed, a test that demanded one more request would be writing a duplicate
+     * request down as the correct answer.
+     */
+    @Test
+    fun `nothing is reopened when the answer settled what was owed`() = runTest {
+        val h = Harness(this)
+        val gate = renewalDeferredBehindHeldRevalidation(h)
+        h.coordinator.onCredentialRecovered(AuthCredentialRecovery(fence().identity, 1L, 1L, 10_000L))
+        h.credentialFailures = 3
+        gate.complete(Unit)
+        advanceTimeBy(11_000)
+        assertEquals(setOf(TETHER, USD), h.requests[1].topics.toSet())
+
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLeases(h.requests[1].requestId, Triple(TETHER, "L3", 900L), Triple(USD, "L4", 900L)))
+        advanceTimeBy(1)
+
+        assertEquals("해소된 의무를 다시 물었다", 2, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
      * The renewal holding the lane ends on authentication too, after the recovery: its CommandDone frees the lane and reopens the
      * revalidation once, while the ControlLaneFree that release posted finds nothing more. The renewal's own ending stays for a later
      * episode, which waits behind the reopened revalidation. Returns the wire.
