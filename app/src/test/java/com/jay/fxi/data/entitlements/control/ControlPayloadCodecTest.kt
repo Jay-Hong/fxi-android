@@ -319,6 +319,63 @@ class ControlPayloadCodecTest {
         }
     }
 
+    // --- 저장이 지우는 문자 -------------------------------------------------------------------------------------------
+
+    /**
+     * A lone surrogate is not a character UTF-8 can carry, and the record's storage substitutes `?`
+     * for it. Measured on a real DataStore file: the escaped form arrives as pure ASCII and stores
+     * fine, so writing the tree's own spelling back is what loses it. The value is the same either
+     * way, so it is written in the spelling that survives.
+     */
+    @Test
+    fun `a lone surrogate is written in the spelling storage keeps`() {
+        for (raw in listOf(
+            """[{"future":"\uD800"}]""",
+            """[{"future":"\uDC00"}]""",
+            """[{"\uD800":"x"}]""",
+            """[{"a":{"nested":"\uDFFF"}}]"""
+        )) {
+            val written = codec.encode((codec.decode(raw) as PayloadRead.Parsed).entries)
+
+            assertEquals(raw, PayloadWrite.Encoded(raw), written)
+        }
+    }
+
+    /**
+     * Two of them in one object is the sharp case: stored as the tree spells them, both keys come
+     * back as `?`, and this codec's own duplicate-key branch then refuses the payload for good.
+     * Writing them escaped is what keeps that from being self-inflicted.
+     */
+    @Test
+    fun `two lone surrogate keys stay two keys`() {
+        val raw = """[{"\uD800":1,"\uDC00":2}]"""
+
+        val written = codec.encode((codec.decode(raw) as PayloadRead.Parsed).entries)
+
+        assertEquals(PayloadWrite.Encoded(raw), written)
+        assertTrue(codec.decode((written as PayloadWrite.Encoded).text) is PayloadRead.Parsed)
+    }
+
+    /** A surrogate that has its pair encodes, so it is left alone. */
+    @Test
+    fun `a surrogate pair is written as the characters it is`() {
+        val raw = """[{"ok":"\uD83D\uDE00한글"}]"""
+        val entries = (codec.decode(raw) as PayloadRead.Parsed).entries
+
+        val text = (codec.encode(entries) as PayloadWrite.Encoded).text
+
+        assertEquals("""[{"ok":"😀한글"}]""", text)
+        assertEquals(text, String(text.toByteArray(Charsets.UTF_8), Charsets.UTF_8))
+    }
+
+    /** The escape is six characters where the tree had one, so the limit has to see the longer text. */
+    @Test
+    fun `the size limit sees the escaped length`() {
+        val entries = (codec.decode("""[{"a":"\uD800"}]""") as PayloadRead.Parsed).entries
+
+        assertEquals(PayloadWrite.TooLarge(16, 12), codecWith(12).encode(entries))
+    }
+
     // --- depth ---------------------------------------------------------------------------------------------------------
 
     private fun nested(depth: Int) = "[" + """{"a":""".repeat(depth) + "0" + "}".repeat(depth) + "]"

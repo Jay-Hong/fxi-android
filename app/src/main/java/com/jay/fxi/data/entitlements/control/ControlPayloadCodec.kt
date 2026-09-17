@@ -123,6 +123,10 @@ sealed interface PayloadWrite {
  * keeps rounding it to the same thing. Preservation is what the verbatim write below buys; idempotence
  * is only what it costs DataStore.
  *
+ * The one place the written text is not the tree's own spelling is an unpaired surrogate, which
+ * [storable] writes as `\uXXXX` because that is the only spelling the record's storage keeps. It is
+ * the same value either way, and the size below is measured after it.
+ *
  * Writing goes through [JsonElement.toString] rather than a serializer, and that is not a style
  * choice. `JsonPrimitiveSerializer` re-reads an unquoted literal as a `Long` or a `Double` and writes
  * *that* back, which silently rounds `1.0000000000000000001` to `1.0`, turns `1e-400` into `0.0`, and
@@ -206,6 +210,46 @@ class ControlPayloadCodec(
         return PayloadRead.Parsed(element.map { item ->
             if (item is JsonObject) PayloadEntry.Obj(item) else PayloadEntry.Uninterpretable(item)
         })
+    }
+
+    /**
+     * The text with every unpaired surrogate spelled as `\uXXXX`, which is the only way to store one.
+     *
+     * A lone surrogate is not a character UTF-8 can carry, and the record's storage is protobuf, whose
+     * encoder substitutes `?` for it rather than failing. Measured on a real DataStore file:
+     * `[{"future":"\uD800"}]` arrives as pure ASCII and stores fine, but the tree it parses to holds a
+     * lone surrogate, and writing *that* back puts `3F` in the file — the payload comes back saying
+     * something else. Two such keys in one object come back as two `?` keys, and every later read of
+     * that file answers [PayloadUnreadable.DUPLICATE_KEY] — the output would manufacture exactly the
+     * damage that branch exists to catch, and the branch has no way to tell it apart from the real
+     * thing. What that costs a user is for the slice that wires this up to say; nothing here is wired.
+     *
+     * Escaping is not a change of value *to this reader*: `\uD800` and the lone surrogate parse to the
+     * same tree, so this writes the same obligation in the spelling that survives the trip. The claim
+     * is scoped on purpose — RFC 8259 §8.2 leaves unpaired surrogates to the implementation, so two
+     * JSON readers need not agree, and what is measured here is that this parser's UTF-16 value comes
+     * back from a real file unchanged. Surrogates that form a pair are left alone — they encode, and
+     * the measured file keeps them.
+     *
+     * Every surrogate in the output sits inside a string literal: [scanTree] has already held every
+     * non-string value to ASCII (`NUMBER`, `BARE_LITERALS`), and the structural characters are ASCII
+     * too. So this needs no parser of its own, and it reaches object keys as readily as values.
+     */
+    private fun storable(text: String): String {
+        if (text.none(Char::isSurrogate)) return text
+        val out = StringBuilder(text.length)
+        var i = 0
+        while (i < text.length) {
+            val ch = text[i]
+            if (ch.isHighSurrogate() && i + 1 < text.length && text[i + 1].isLowSurrogate()) {
+                out.append(ch).append(text[i + 1])
+                i += 2
+                continue
+            }
+            if (ch.isSurrogate()) out.append("\\u%04X".format(ch.code)) else out.append(ch)
+            i++
+        }
+        return out.toString()
     }
 
     /**
@@ -304,7 +348,7 @@ class ControlPayloadCodec(
         require(scanTree(array) is Scan.Ok) {
             "payload entries must hold values JSON can express, nested no deeper than $maxDepth"
         }
-        val text = array.toString()
+        val text = storable(array.toString())
         val bytes = text.toByteArray(Charsets.UTF_8).size
         return if (bytes > maxPayloadBytes) PayloadWrite.TooLarge(bytes, maxPayloadBytes) else PayloadWrite.Encoded(text)
     }
