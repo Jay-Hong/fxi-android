@@ -50,6 +50,9 @@ enum class EditStep {
 /** Why an edit produced nothing. */
 enum class ControlWriteFailure {
 
+    /** The original obligation, including every nested field, could not be interpreted. */
+    UNINTERPRETABLE_OBLIGATION,
+
     /** Some step of the edit was refused, so no part of it was published. */
     INVALID_CHANGE
 }
@@ -134,6 +137,26 @@ class ControlEditor internal constructor(private val fields: MutableMap<String, 
         childRunning = true
         try {
             child.change()
+        } catch (t: Throwable) {
+            failed = true
+            throw t
+        } finally {
+            child.close()
+            childRunning = false
+        }
+        if (child.failed) return refuse()
+        fields[name] = JsonObject(LinkedHashMap(child.fields))
+        return EditStep.EDITED
+    }
+
+    /** Creates an absent object only; a builder cannot import another node's tree. */
+    fun createChild(name: String, block: ControlBuilder.() -> Unit): EditStep {
+        guard()
+        if (name in fields) return refuse()
+        val child = ControlEditor(linkedMapOf())
+        childRunning = true
+        try {
+            ControlBuilder(child).block()
         } catch (t: Throwable) {
             failed = true
             throw t

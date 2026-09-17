@@ -126,10 +126,13 @@ class ControlNodeEnvelopeTest {
     /**
      * Depth is the envelope's precondition rather than a refusal it returns, and an edit can cross it.
      *
-     * Two edits can, not one. A name that was not there before is the obvious way. The other is an
-     * existing empty list: `all {}` holds vacuously, so a list with nothing in it takes names, and its
-     * first element sits a level below where the list already was — the key and its kind both stay the
-     * same. A node cannot check this itself, because it does not know where in a payload it sits.
+     * Three edits can, and the count is checked below rather than argued for. A name that was not
+     * there before is the obvious way. The second is an existing empty list: `all {}` holds vacuously,
+     * so a list with nothing in it takes names, and its first element sits a level below where the
+     * list already was — the key and its kind both stay the same. The third arrived with the
+     * obligation layer: [ControlEditor.createChild] makes an object where there was no key, and its
+     * own fields sit a level below that. A node cannot check any of this itself, because it does not
+     * know where in a payload it sits.
      *
      * The limit counts every level the tree scan walks, leaves included: `[{"a":{"b":"scalar"}}]` is
      * four, not the three its brackets suggest.
@@ -147,6 +150,15 @@ class ControlNodeEnvelopeTest {
         )
         assertThrows(IllegalArgumentException::class.java) {
             shallow.encode(listOf(filled.toPayloadEntry()))
+        }
+
+        val created = written(empty.edited { descend("a") { createChild("made") { set("k", ControlScalar.Text("v")) } } })
+        assertEquals(
+            """[{"a":{"names":[],"made":{"k":"v"}}}]""",
+            (codec.encode(listOf(created.toPayloadEntry())) as PayloadWrite.Encoded).text
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            shallow.encode(listOf(created.toPayloadEntry()))
         }
 
         val base = node("""{"a":{"b":"scalar"}}""")
