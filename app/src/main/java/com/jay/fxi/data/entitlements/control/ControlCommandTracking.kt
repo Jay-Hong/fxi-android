@@ -1,0 +1,64 @@
+package com.jay.fxi.data.entitlements.control
+
+import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore
+import java.lang.ref.ReferenceQueue
+import java.lang.ref.WeakReference
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+
+internal class TrackedControlCommand(val command: CommandRef) {
+    val targets = AtomicReference<List<ControlCommandTarget?>>(List(command.actions.size) { null })
+    val confirmationRequested = AtomicBoolean(false)
+    val confirmed = AtomicBoolean(false)
+}
+
+/**
+ * Metadata only. All file reads, writes, cache confirmation and serialization belong to the owner.
+ * Prepared commands and adopted targets remain for the owner's entire tracking lifetime, including
+ * after confirmation or rejection; forgetting either could turn a retry into a fresh command.
+ * There is no per-command eviction in D2a. D2c must define an explicit release/retention contract
+ * before pruning this potentially growing history, preserving unresolved references and fixed targets.
+ */
+internal class ControlCommandTracking {
+    val commands = ConcurrentHashMap<String, TrackedControlCommand>()
+    // Also covers previous-lifetime references, which are not locally prepared commands.
+    // This nonblocking lease refuses duplicate execution; the owner alone serializes storage.
+    val executing = ConcurrentHashMap.newKeySet<CommandRef>()
+    private val unresolved = AtomicReference<Set<CommandRef>>(emptySet())
+    fun isUnresolved(command: CommandRef): Boolean = command in unresolved.get()
+    fun markUnresolved(command: CommandRef) { unresolved.updateAndGet { it + command } }
+    fun resolve(command: CommandRef) { unresolved.updateAndGet { it - command } }
+    // One immutable set version, not a weakly consistent iteration across concurrent attempts.
+    fun snapshot(): Set<CommandRef> = Collections.unmodifiableSet(unresolved.get())
+
+    companion object {
+        private val collected = ReferenceQueue<DataStoreAccessEpochStore>()
+        private val owners = ConcurrentHashMap<OwnerKey, ControlCommandTracking>()
+
+        /**
+         * Recreating a facade does not lose commands while the same owner is alive. No second lock.
+         * A future injection boundary can replace this registry only if one retained facade/tracker
+         * spans the owner's whole lifetime; merely injecting one facade at a time is insufficient.
+         */
+        fun forOwner(owner: DataStoreAccessEpochStore): ControlCommandTracking {
+            while (true) {
+                val dead = collected.poll() ?: break
+                owners.remove(dead)
+            }
+            return owners.computeIfAbsent(OwnerKey(owner)) { ControlCommandTracking() }
+        }
+
+        private class OwnerKey(owner: DataStoreAccessEpochStore) :
+            WeakReference<DataStoreAccessEpochStore>(owner, collected) {
+            private val identity = System.identityHashCode(owner)
+            override fun hashCode(): Int = identity
+            override fun equals(other: Any?): Boolean {
+                if (this === other) return true
+                val owner = get() ?: return false
+                return other is OwnerKey && owner === other.get()
+            }
+        }
+    }
+}
