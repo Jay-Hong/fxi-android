@@ -8,7 +8,6 @@ import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.mutablePreferencesOf
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
-import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -83,7 +82,7 @@ private const val TAG = "AccessEpochStore"
 /**
  * DataStore-backed [AccessEpochStore].
  *
- * Atomicity comes from `DataStore.edit`, which writes a temporary file and renames it, so a crash
+ * Atomicity comes from `DataStore.updateData`, which writes a temporary file and renames it, so a crash
  * leaves either the whole previous record or the whole new one. That is what makes the plan's
  * three-step teardown — persist new epoch and journal, purge, then clear that entry — resumable.
  *
@@ -123,14 +122,18 @@ class DataStoreAccessEpochStore internal constructor(
     /**
      * Whether `data` may hold a write that never reached disk. Guarded by [lock].
      *
-     * Cleared only by a barrier edit that returned and decoded. A mutation that returns normally does
-     * not clear it: an edit whose transform changes nothing skips the write and leaves the copy as it was.
+     * Cleared only by an owner-added barrier update that returned (and, for [load], decoded).
+     * Legacy mutations and internal observations never clear it: an unchanged update skips the write
+     * and leaves the copy as it was. This is cache confirmation, not command or domain confirmation.
      */
     private var readBackUnverified = false
 
     override suspend fun load(): AccessEpochRecord = locked {
         if (readBackUnverified) {
-            val written = dataStore.edit { it[READ_BARRIER] = (it[READ_BARRIER] ?: 0L) + 1L }.toRecord()
+            val written = updateRecordLocked(
+                transform = { it.withReadBarrier() },
+                read = { it.toRecord() }
+            )
             readBackUnverified = false
             written
         } else {
@@ -165,12 +168,64 @@ class DataStoreAccessEpochStore internal constructor(
     override suspend fun markMayContainData(premium: Boolean, krx: Boolean): AccessEpochRecord =
         transform { AccessEpochTransitions.markMayContainData(it, premium, krx) }
 
-    /** Read, transform and write inside one atomic `edit`. */
+    /**
+     * The only internal record transaction entry point. Consumers share this owner, never a raw
+     * DataStore, a second lock, or a separate cache-confirmation flag. [decide] runs synchronously
+     * against a frozen snapshot inside the atomic update; it must not call back into this store.
+     *
+     * A non-normal return, including cancellation or a corruption-replacement failure before
+     * [decide], leaves the same read-back obligation that [load] honours. Results escape only after
+     * the update completes. Domain validation remains the caller's responsibility.
+     */
+    internal suspend fun <T> transactRecord(
+        decide: (Preferences) -> RecordTransactionDecision<T>
+    ): RecordTransactionResult<T> = locked {
+        lateinit var decision: RecordTransactionDecision<T>
+        var evidence = RecordTransactionEvidence.LockedFileRead
+        var confirmsReadBack = false
+        val result = updateRecordLocked(
+            transform = { current ->
+                val snapshot = current.toPreferences()
+                decision = decide(snapshot)
+                when (val chosen = decision) {
+                    is RecordTransactionDecision.Observe -> current
+                    is RecordTransactionDecision.Confirm -> {
+                        val candidate = chosen.candidate.toPreferences()
+                        // Compare raw values so a mistyped reserved key cannot evade ownership.
+                        require(candidate.asMap()[READ_BARRIER] == snapshot.asMap()[READ_BARRIER]) {
+                            "read_barrier is owned by DataStoreAccessEpochStore"
+                        }
+                        confirmsReadBack = readBackUnverified
+                        val next = if (confirmsReadBack) candidate.withReadBarrier() else candidate
+                        if (next != current) evidence = RecordTransactionEvidence.CompletedWriteScope
+                        next
+                    }
+                }
+            },
+            read = { RecordTransactionResult(decision.value, it.toPreferences(), evidence) }
+        )
+        if (confirmsReadBack) readBackUnverified = false
+        result
+    }
+
+    /** Read, transform and write inside one atomic update; retain the legacy confirmation policy. */
     private suspend fun transform(
         block: (AccessEpochRecord) -> AccessEpochRecord
     ): AccessEpochRecord = locked {
-        dataStore.edit { prefs -> prefs.write(block(prefs.toRecord())) }
-            .toRecord()
+        updateRecordLocked(
+            transform = { prefs -> prefs.toMutablePreferences().apply { write(block(toRecord())) } },
+            read = { it.toRecord() }
+        )
+    }
+
+    /** All updates and their result decoding stay inside the owner's [lock]. */
+    private suspend fun <T> updateRecordLocked(
+        transform: (Preferences) -> Preferences,
+        read: (Preferences) -> T
+    ): T = read(dataStore.updateData { transform(it) })
+
+    private fun Preferences.withReadBarrier(): Preferences = toMutablePreferences().apply {
+        this[READ_BARRIER] = (this[READ_BARRIER] ?: 0L) + 1L
     }
 
     /**
