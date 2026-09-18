@@ -71,7 +71,7 @@ class ControlRecordStoreMutationTest {
 
     @Test fun completeUnrequestedCheckpointRemainsHistoryUnavailable() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val (command, addition) = rejectedAddition(o)
         val checkpoint = o.control.checkpoint(command)!!
         // Reuse the immutable prepared operation in an independent command, with the normal limit.
@@ -146,7 +146,7 @@ class ControlRecordStoreMutationTest {
 
     @Test fun retryCannotIgnoreAnOpaqueSealAddedAfterFirstAttempt() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val command = o.control.prepare(o.control.sealAddition())
         o.storage.before = true
         assertTrue(o.control.execute(command) is ControlStoreResult.Unconfirmed)
@@ -161,7 +161,7 @@ class ControlRecordStoreMutationTest {
 
     @Test fun rejectedAdditionCannotClaimAnotherCommandsIdenticalPostcondition() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val (command, addition) = rejectedAddition(o)
         val other = confirmed(o.control.execute(o.control.prepare(addition)))
         assertEquals(o.control.checkpoint(command)!!.targets.single()!!.id, other.effectiveIds.single())

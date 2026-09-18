@@ -246,7 +246,7 @@ class ControlPayloadCodec(
                 i += 2
                 continue
             }
-            if (ch.isSurrogate()) out.append("\\u%04X".format(ch.code)) else out.append(ch)
+            if (text.hasUnpairedSurrogateAt(i)) out.append("\\u%04X".format(ch.code)) else out.append(ch)
             i++
         }
         return out.toString()

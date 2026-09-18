@@ -67,3 +67,11 @@ internal class ControlCommandTarget(
     val postcondition: ControlNode,
     val joined: Boolean
 )
+
+/** Named composite transitions cannot be smuggled into the generic obligation mutation API. */
+internal sealed interface ControlCommandBody {
+    class Mutations(actions: List<ControlMutation>) : ControlCommandBody {
+        val actions: List<ControlMutation> = Collections.unmodifiableList(actions.toList())
+    }
+    class RotateAndSettle(val input: RotateAndSettleNamespaces) : ControlCommandBody
+}

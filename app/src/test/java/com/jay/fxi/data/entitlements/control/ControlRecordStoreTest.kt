@@ -70,7 +70,7 @@ class ControlRecordStoreTest {
         o.seed()
         val epochs = o.owner.bindOwner("owner")
         o.data.edit { it[EXTRA] = "opaque" }
-        val command = o.control.prepare(o.control.add(ControlKind.SEAL, seal), o.control.add(ControlKind.DEMAND, request),
+        val command = o.control.prepare(o.control.add(ControlKind.SEAL, seal.replace("null", "\"owner\"").replace("old", epochs.userAccessEpoch!!)), o.control.add(ControlKind.DEMAND, request),
             o.control.add(ControlKind.HOLD, hold), o.control.add(ControlKind.RECOVERY_INTENT, recovery))
         val writes = o.storage.writes
         val result = confirmed(o.control.execute(command))
@@ -129,7 +129,7 @@ class ControlRecordStoreTest {
 
     @Test fun concurrentSameKeyCommandsJoinOnePersistedIdentity() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val commands = List(12) { o.control.addSeal() }
         val results = commands.map { async { confirmed(o.control.execute(it)) } }.map { it.await() }
         assertEquals(1, results.count { it.effect == ConfirmedEffect.AppliedThisAttempt })
@@ -293,7 +293,7 @@ class ControlRecordStoreTest {
 
     @Test fun multiPayloadOversizeRejectsEveryChangeWithUtf8Count() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val c = ControlRecordStore(o.owner, codec = ControlPayloadCodec(maxPayloadBytes = 300))
         val command = c.prepare(c.add(ControlKind.SEAL, seal), c.add(ControlKind.RECOVERY_INTENT,
             recovery.replace("\"session\"", "\"${"한".repeat(100)}\"")))
@@ -347,7 +347,7 @@ class ControlRecordStoreTest {
 
     @Test fun failureBeforeWriteRemainsUnconfirmedAndSameCommandCanRetry() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val command = o.control.addSeal()
         o.storage.before = true
         val result = o.control.execute(command) as ControlStoreResult.Unconfirmed
@@ -365,7 +365,7 @@ class ControlRecordStoreTest {
         val o = open()
         o.seed()
         val before = o.owner.bindOwner("A")
-        val command = o.control.addSeal()
+        val command = o.control.addSeal(seal.replace("null", "\"A\"").replace("old", before.userAccessEpoch!!))
         o.storage.after = true
         assertTrue(o.control.execute(command) is ControlStoreResult.Unconfirmed)
         assertNotEquals("[]", o.raw()[SEAL])
@@ -432,7 +432,7 @@ class ControlRecordStoreTest {
 
     @Test fun laterRejectionPreservesEarlierUncertaintyForTheSameCommand() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val c = ControlRecordStore(o.owner, codec = ControlPayloadCodec(maxPayloadBytes = 180))
         val command = c.addSeal()
         o.storage.before = true
@@ -446,18 +446,19 @@ class ControlRecordStoreTest {
 
     @Test fun confirmingOneCommandDoesNotSettleAnotherCommandsUncertainty() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val first = o.control.addSeal()
         o.storage.before = true
         assertTrue(o.control.execute(first) is ControlStoreResult.Unconfirmed)
-        val second = o.control.addSeal(seal.replace("old", "different"))
+        o.data.edit { it[com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.KRX_EPOCH] = "different" }
+        val second = o.control.addSeal(seal.replace("USER", "CAPABILITY").replace("old", "different"))
         val result = confirmed(o.control.execute(second))
         assertEquals(setOf(first), result.localUnresolvedCommands)
     }
 
     @Test fun facadeRecreationRetainsOwnerLocalHistoryAndAdoption() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val command = o.control.addSeal()
         o.storage.before = true
         assertTrue(o.control.execute(command) is ControlStoreResult.Unconfirmed)
@@ -506,7 +507,7 @@ class ControlRecordStoreTest {
 
     @Test fun previousConfirmationCannotRecreateMissingAddition() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val command = o.control.addSeal()
         o.storage.before = true
         assertTrue(o.control.execute(command) is ControlStoreResult.Unconfirmed)
@@ -538,7 +539,7 @@ class ControlRecordStoreTest {
 
     private suspend fun cancelledAddition(fail: Boolean) = kotlinx.coroutines.coroutineScope {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val command = o.control.addSeal()
         val pause = ControlStoreTestStorage.Pause()
         o.storage.pause = pause
@@ -593,7 +594,7 @@ class ControlRecordStoreTest {
 
     @Test fun completedCommandDoesNotResurrectRemovedObligation() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val command = o.control.addSeal()
         confirmed(o.control.execute(command))
         o.data.edit { it[SEAL] = "[]" }
@@ -617,7 +618,7 @@ class ControlRecordStoreTest {
 
     @Test fun unexpectedExceptionPropagatesInsteadOfBecomingRejected() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val command = o.control.addSeal()
         o.storage.unexpected = true
         val failure = runCatching { o.control.execute(command) }.exceptionOrNull()
@@ -631,7 +632,7 @@ class ControlRecordStoreTest {
 
     @Test fun aFailedNewSealCannotDuplicateOrAdoptALaterSameKeySeal() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val first = o.control.addSeal()
         o.storage.before = true
         assertTrue(o.control.execute(first) is ControlStoreResult.Unconfirmed)
@@ -647,7 +648,7 @@ class ControlRecordStoreTest {
 
     @Test fun twoNewSameKeySealsInOneBatchAreRejectedAtomically() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val command = o.control.prepare(o.control.add(ControlKind.SEAL, seal), o.control.add(ControlKind.SEAL, seal))
         assertTrue(o.control.execute(command) is ControlStoreResult.Rejected)
         assertEquals("[]", o.raw()[SEAL])
@@ -660,7 +661,7 @@ class ControlRecordStoreTest {
         val before = o.owner.bindOwner("A")
         val pause = ControlStoreTestStorage.Pause()
         o.storage.pause = pause
-        val write = async { o.control.execute(o.control.addSeal()) }
+        val write = async { o.control.execute(o.control.addSeal(seal.replace("null", "\"A\"").replace("old", before.userAccessEpoch!!))) }
         withTimeout(10_000) { pause.reached.await() }
         val load = async(start = CoroutineStart.UNDISPATCHED) { o.owner.load() }
         try {
@@ -681,7 +682,7 @@ class ControlRecordStoreTest {
         o.storage.after = true
         assertTrue(runCatching { o.owner.beginRotation(true, true) }.isFailure)
         val writes = o.storage.writes
-        val result = confirmed(o.control.execute(o.control.addSeal()))
+        val result = confirmed(o.control.execute(o.control.addSeal(seal.replace("null", "\"A\"").replace("old", before.userAccessEpoch!!))))
         assertEquals(ConfirmedEffect.AppliedThisAttempt, result.effect)
         assertEquals(RecordTransactionEvidence.CompletedWriteScope, result.proof.storage)
         assertEquals(1L, result.snapshot.record.original[BARRIER])
@@ -692,7 +693,7 @@ class ControlRecordStoreTest {
 
     @Test fun recoveryDoesNotSettleAnEarlierUnconfirmedCommand() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val command = o.control.addSeal()
         o.storage.before = true
         assertTrue(o.control.execute(command) is ControlStoreResult.Unconfirmed)
@@ -705,7 +706,7 @@ class ControlRecordStoreTest {
 
     @Test fun resultsRetainDetachedUnmodifiableTrackingSnapshots() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val command = o.control.addSeal()
         o.storage.before = true
         val failed = o.control.execute(command)
@@ -743,7 +744,7 @@ class ControlRecordStoreTest {
 
     @Test fun exactEncodedByteLimitIsAcceptedAndOneByteLessIsRejected() = runBlocking {
         val o = open()
-        o.seed()
+        o.seed(); o.currentNamespace()
         val command = o.control.addSeal()
         val addition = command.actions.single() as ControlMutation.Add
         val text = ControlObligationFixtures.text((addition.built as ControlWriteResult.Written).node)

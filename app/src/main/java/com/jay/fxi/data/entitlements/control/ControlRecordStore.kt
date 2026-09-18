@@ -1,8 +1,11 @@
 package com.jay.fxi.data.entitlements.control
 
 import androidx.datastore.preferences.core.Preferences
-import androidx.datastore.preferences.core.stringPreferencesKey
 import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore
+import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.OWNER_UID
+import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.USER_EPOCH
+import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.KRX_EPOCH
+import com.jay.fxi.data.entitlements.PurgeScope
 import com.jay.fxi.data.entitlements.RecordTransactionDecision
 import java.io.IOException
 import java.util.Collections
@@ -11,13 +14,14 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 
 /**
- * Unwired D2a-1 facade. Uses only the owner's record transaction API; never owns a DataStore, lock,
+ * Unwired D2a/D2b facade. Uses only the owner's record transaction API; never owns a DataStore, lock,
  * read-back flag or barrier. Inputs are prepared once, then all targets are resolved by id against
  * the latest D1 classification in the atomic update. Unchanged payload strings remain verbatim.
  *
- * Additions, seal joins, constrained non-settlement edits and explicit guard floor recapture are
- * the complete scope. Confirmation proves the documented postcondition, not historical causation.
- * There is deliberately no coordinator, admission, retry scheduler or settlement path here.
+ * The scope is additions, seal joins, constrained non-settlement edits, explicit guard floor
+ * recapture, and the named namespace settlement transition.
+ * Confirmation proves storage postconditions, never admission or fresh server approval.
+ * There is deliberately no coordinator wiring or retry scheduler here.
  */
 internal class ControlRecordStore(
     private val owner: DataStoreAccessEpochStore,
@@ -50,8 +54,27 @@ internal class ControlRecordStore(
         return command
     }
 
+    /** Issue operation, demand and axis UUIDs independently, once. Context is supplied at execution. */
+    fun prepareRotation(
+        targets: List<ControlNode>, before: FenceV1, origin: LifetimeId, demand: SettlementDemand
+    ): CommandRef {
+        val operationId = ids.next().toString()
+        val demandId = ids.next().toString()
+        val axes = targets.mapNotNull {
+            ((ControlObligations.read(ControlKind.SEAL, it) as? ControlEntryRead.Interpreted)?.value as? SealV1)?.key?.axis
+        }.toSet()
+        val input = RotateAndSettleNamespaces(targets, before, origin, demand, operationId, demandId,
+            if (PurgeScope.USER in axes) ids.next().toString() else null,
+            if (PurgeScope.CAPABILITY in axes) ids.next().toString() else null)
+        val command = CommandRef(operationId, ControlCommandBody.RotateAndSettle(input))
+        check(tracking.commands.putIfAbsent(command.id, TrackedControlCommand(command)) == null) {
+            "command UUID collision; do not reissue an identity to hide it"
+        }
+        return command
+    }
+
     fun checkpoint(command: CommandRef): ControlCommandCheckpoint? = tracking.commands[command.id]
-        ?.takeIf { it.command === command }
+        ?.takeIf { it.command === command && command.body is ControlCommandBody.Mutations }
         ?.let {
             // Targets only advance from null to fixed values, before the flag becomes true.
             // Read the flag first so a requested checkpoint cannot contain an older partial list.
@@ -59,12 +82,23 @@ internal class ControlRecordStore(
             ControlCommandCheckpoint(command, it.targets.get(), requested)
         }
 
-    /** An unconfirmed missing own seal can be retried; a replacement same-key seal blocks it as TargetChanged. */
-    suspend fun execute(command: CommandRef): ControlStoreResult = run(command, checkpoint = null, confirmOnly = false)
+    /**
+     * Missing own seals can be retried. A replacement same-key seal or a new NAMESPACE append whose
+     * owner/axis epoch is no longer current yields TargetChanged; unreadable required epoch keys
+     * yield UnreadableEpochState. Existing confirmations/joins do not recheck append currentness.
+     * A rotation can reconfirm its witness here, but a new application is rejected with the stable
+     * InvalidRequest detail "AttemptContextRequired". Supply fresh context for each new attempt.
+     */
+    suspend fun execute(command: CommandRef): ControlStoreResult = run(command, checkpoint = null, confirmOnly = false, context = null)
+
+    /** Context admits a new rotation; generic mutations retain their existing context-free contract. */
+    suspend fun execute(command: CommandRef, context: AttemptContext): ControlStoreResult =
+        run(command, checkpoint = null, confirmOnly = false, context = context)
 
     /**
      * Previous-lifetime confirmation never applies a missing effect or adopts a current same-key seal.
-     * A reference without a complete checkpoint is HistoryUnavailable, unless D1 first needs recovery.
+     * A generic mutation reference without a complete checkpoint is HistoryUnavailable, unless D1 needs recovery.
+     * Named rotation references instead confirm their durable witnesses without a checkpoint or AttemptContext.
      * A live command's local history is authoritative: a supplied checkpoint must agree with it.
      * Imported targets must also match the prepared operation; they never replace live tracking.
      * HistoryUnavailable marks even a confirmed live command unresolved; a later Conflict preserves that membership.
@@ -72,12 +106,13 @@ internal class ControlRecordStore(
      * Use execute for a live command, and keep using confirmPrevious for a previous-lifetime reference.
      */
     suspend fun confirmPrevious(command: CommandRef, checkpoint: ControlCommandCheckpoint? = null): ControlStoreResult =
-        run(command, checkpoint, confirmOnly = true)
+        run(command, checkpoint, confirmOnly = true, context = null)
 
     private suspend fun run(
         command: CommandRef,
         checkpoint: ControlCommandCheckpoint?,
-        confirmOnly: Boolean
+        confirmOnly: Boolean,
+        context: AttemptContext?
     ): ControlStoreResult {
         val known = tracking.commands[command.id]
         val tracked = if (known?.command === command) known else TrackedControlCommand(command)
@@ -99,7 +134,16 @@ internal class ControlRecordStore(
                     historyUnavailable(command, read)
                 } else {
                     phase.set(ControlAttemptPhase.PreparingCandidate)
-                    if (confirmOnly) {
+                    val rotation = command.body as? ControlCommandBody.RotateAndSettle
+                    if (rotation != null) {
+                        NamespaceSettlementTransition(codec).decide(command, rotation.input, read, context,
+                            confirmOnly, tracked.confirmed.get()).also {
+                            if (it is RecordTransactionDecision.Confirm) {
+                                tracked.confirmationRequested.set(true)
+                                phase.set(ControlAttemptPhase.ConfirmingStorage)
+                            }
+                        }
+                    } else if (confirmOnly) {
                         if (checkpoint?.command !== command || !checkpoint.confirmationRequested ||
                             checkpoint.targets.size != command.actions.size || checkpoint.targets.any { it == null }
                         ) {
@@ -127,7 +171,7 @@ internal class ControlRecordStore(
                     ControlStoreResult.Confirmed(
                         command, tracking.snapshot(), outcome.effect, outcome.ids,
                         confirmedSnapshot,
-                        ConfirmationProof(transaction.evidence)
+                        ConfirmationProof(transaction.evidence), outcome.settlement
                     )
                 }
                 is Outcome.Negative -> {
@@ -237,6 +281,15 @@ internal class ControlRecordStore(
                                 seal.settlement == null && seal.key == desiredFacts.key
                             }) return conflict(ConflictReason.TargetChanged)
                         }
+                        if (desiredFacts is SealV1 && desiredFacts.kind == SealTargetKind.NAMESPACE) {
+                            val epochKey = if (desiredFacts.key.axis == PurgeScope.USER) USER_EPOCH else KRX_EPOCH
+                            if (!read.original.validType<String>(OWNER_UID)) return negative(ControlStoreResult.RecoveryRequired(
+                                command, emptySet(), RecoveryReason.UnreadableEpochState, read))
+                            if (!read.original.validType<String>(epochKey)) return negative(ControlStoreResult.RecoveryRequired(
+                                command, emptySet(), RecoveryReason.UnreadableEpochState, read))
+                            if (read.original[OWNER_UID] != desiredFacts.key.ownerUid) return conflict(ConflictReason.TargetChanged)
+                            if (read.original[epochKey] != desiredFacts.key.epoch) return conflict(ConflictReason.TargetChanged)
+                        }
                         array += desired.node.toPayloadEntry()
                         changedKinds += action.kind
                     } else {
@@ -272,7 +325,7 @@ internal class ControlRecordStore(
             when (encoded) {
                 is PayloadWrite.TooLarge -> return negative(ControlStoreResult.Rejected(command, emptySet(),
                     RejectionReason.TooLarge(kind, encoded.bytes, encoded.limit), read))
-                is PayloadWrite.Encoded -> candidate[payloadKey(kind)] = encoded.text
+                is PayloadWrite.Encoded -> candidate[ControlRecordKeys.payload(kind)] = encoded.text
             }
         }
         val complete = reader.read(candidate) as? ControlRecordRead.Supported
@@ -340,8 +393,8 @@ internal class ControlRecordStore(
             if (found?.value == id) kind to entry else null
         } }
 
-    private sealed interface Outcome {
-        data class Positive(val effect: ConfirmedEffect, val ids: List<String>) : Outcome
+    internal sealed interface Outcome {
+        data class Positive(val effect: ConfirmedEffect, val ids: List<String>, val settlement: SettlementReceipt? = null) : Outcome
         data class Negative(val result: ControlStoreResult) : Outcome
     }
 
@@ -365,10 +418,4 @@ internal class ControlRecordStore(
 
     private fun same(left: ControlNode, right: ControlNode): Boolean = left.toPayloadEntry() == right.toPayloadEntry()
 
-    private fun payloadKey(kind: ControlKind) = stringPreferencesKey(when (kind) {
-        ControlKind.SEAL -> "seal_v1"
-        ControlKind.DEMAND -> "demand_v1"
-        ControlKind.HOLD -> "hold_v1"
-        ControlKind.RECOVERY_INTENT -> "recovery_intent_v1"
-    })
 }

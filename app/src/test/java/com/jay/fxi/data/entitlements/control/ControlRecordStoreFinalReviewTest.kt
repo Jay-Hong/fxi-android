@@ -96,7 +96,7 @@ class ControlRecordStoreFinalReviewTest {
     }
 
     @Test fun liveCheckpointCannotChangeOnlyTheJoinedFlag() = runBlocking {
-        val o = open(); o.seed()
+        val o = open(); o.seed(); o.currentNamespace()
         val command = o.control.prepare(o.control.add())
         assertEquals(ConfirmedEffect.AppliedThisAttempt, confirmed(o.control.execute(command)).effect)
         val checkpoint = o.control.checkpoint(command)!!
@@ -163,7 +163,7 @@ class ControlRecordStoreFinalReviewTest {
     }
 
     @Test fun missingOwnSealReportsTheBlockerForReapplicationAndAbsenceForConfirmation() = runBlocking {
-        val o = open(); o.seed()
+        val o = open(); o.seed(); o.currentNamespace()
         val command = o.control.prepare(o.control.add())
         o.storage.before = true
         val uncertain = o.control.execute(command)

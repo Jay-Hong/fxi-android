@@ -5,9 +5,15 @@ import com.jay.fxi.data.entitlements.RecordTransactionEvidence
 /** Prepared identity and fixed inputs, never evidence that an attempt executed. */
 internal class CommandRef internal constructor(
     val id: String,
-    actions: List<ControlMutation>
+    val body: ControlCommandBody
 ) {
-    val actions: List<ControlMutation> = java.util.Collections.unmodifiableList(actions.toList())
+    init {
+        require(body !is ControlCommandBody.RotateAndSettle || id == body.input.operationId) {
+            "rotation command id must equal operationId"
+        }
+    }
+    internal constructor(id: String, actions: List<ControlMutation>) : this(id, ControlCommandBody.Mutations(actions))
+    val actions: List<ControlMutation> get() = (body as? ControlCommandBody.Mutations)?.actions.orEmpty()
 }
 
 internal data class TargetExpectation(val command: CommandRef, val effectiveIds: List<String?>)
@@ -32,10 +38,12 @@ internal sealed interface RejectionReason {
 }
 
 internal enum class ConflictReason {
-    IdCollision, TargetChanged, TargetMissing, UninterpretableTarget, AmbiguousSealKey
+    IdCollision, TargetChanged, TargetMissing, UninterpretableTarget, AmbiguousSealKey, OperationIdCollision, IdentityTransitionPending
 }
 
-internal enum class RecoveryReason { MigrationOrRecovery, UnreadableRecord }
+internal enum class RecoveryReason {
+    MigrationOrRecovery, UnreadableRecord, UnreadableEpochState, InconsistentSettlement, JournalMigrationRequired
+}
 internal enum class UnconfirmedReason { StorageFailure, HistoryUnavailable }
 internal enum class ControlAttemptPhase { ReadingSnapshot, PreparingCandidate, ConfirmingStorage }
 
@@ -57,7 +65,8 @@ internal sealed interface ControlStoreResult {
         val effect: ConfirmedEffect,
         val effectiveIds: List<String>,
         val snapshot: ConfirmedControlSnapshot,
-        val proof: ConfirmationProof
+        val proof: ConfirmationProof,
+        val settlement: SettlementReceipt? = null
     ) : ControlStoreResult
 
     data class Rejected(

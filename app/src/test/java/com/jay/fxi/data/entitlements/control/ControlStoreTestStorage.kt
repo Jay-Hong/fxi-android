@@ -32,7 +32,7 @@ import okio.buffer
 import okio.sink
 import okio.source
 
-/** Real FileStorage; fault injection brackets DataStore's block, not an OS rename syscall. */
+/** Real FileStorage; faults distinguish block completion from completed FileStorage write scope. */
 internal class ControlStoreTestStorage(private val file: File) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     val storage = Faults(FileStorage(Streams) { file })
@@ -57,6 +57,14 @@ internal class ControlStoreTestStorage(private val file: File) {
         }
     }
 
+    /** Explicit D2a namespace fixture; seed() itself still writes only control keys. */
+    suspend fun currentNamespace() {
+        data.edit {
+            it.remove(DataStoreAccessEpochStore.OWNER_UID)
+            it[DataStoreAccessEpochStore.USER_EPOCH] = "old"
+        }
+    }
+
     class Pause {
         val reached = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
@@ -66,6 +74,8 @@ internal class ControlStoreTestStorage(private val file: File) {
         @Volatile var writes = 0
         @Volatile var before = false
         @Volatile var after = false
+        @Volatile var afterScope = false
+        @Volatile var pauseAfterScope: Pause? = null
         @Volatile var unexpected = false
         @Volatile var pause: Pause? = null
         override fun createConnection(): StorageConnection<Preferences> {
@@ -73,25 +83,36 @@ internal class ControlStoreTestStorage(private val file: File) {
             return object : StorageConnection<Preferences> {
                 override suspend fun <R> readScope(block: suspend ReadScope<Preferences>.(Boolean) -> R): R =
                     connection.readScope(block)
-                override suspend fun writeScope(block: suspend WriteScope<Preferences>.() -> Unit) = connection.writeScope {
-                    writes++
-                    if (unexpected) {
-                        unexpected = false
-                        throw IllegalStateException("unexpected implementation failure")
+                override suspend fun writeScope(block: suspend WriteScope<Preferences>.() -> Unit) {
+                    connection.writeScope {
+                        writes++
+                        if (unexpected) {
+                            unexpected = false
+                            throw IllegalStateException("unexpected implementation failure")
+                        }
+                        if (before) {
+                            before = false
+                            throw IOException("before write block")
+                        }
+                        block()
+                        pause?.let {
+                            pause = null
+                            it.reached.complete(Unit)
+                            it.release.await()
+                        }
+                        if (after) {
+                            after = false
+                            throw IOException("after write block")
+                        }
                     }
-                    if (before) {
-                        before = false
-                        throw IOException("before write block")
-                    }
-                    block()
-                    pause?.let {
-                        pause = null
+                    pauseAfterScope?.let {
+                        pauseAfterScope = null
                         it.reached.complete(Unit)
                         it.release.await()
                     }
-                    if (after) {
-                        after = false
-                        throw IOException("after write block")
+                    if (afterScope) {
+                        afterScope = false
+                        throw IOException("after completed write scope")
                     }
                 }
                 override val coordinator get() = connection.coordinator

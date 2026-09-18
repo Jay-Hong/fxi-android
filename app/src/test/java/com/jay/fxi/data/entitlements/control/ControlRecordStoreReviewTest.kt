@@ -108,7 +108,7 @@ class ControlRecordStoreReviewTest {
     }
 
     @Test fun liveCheckpointRequiresActualLocalConfirmationRequest() = runBlocking {
-        val o = open(); o.seed()
+        val o = open(); o.seed(); o.currentNamespace()
         val small = ControlRecordStore(o.owner, codec = ControlPayloadCodec(maxPayloadBytes = 100))
         val action = small.add()
         val command = small.prepare(action)
@@ -273,7 +273,7 @@ class ControlRecordStoreReviewTest {
     }
 
     @Test fun overlappingRefusalsRetainTheLeaseAndTheFailedAttemptsUncertainty() = runBlocking {
-        val o = open(); o.seed()
+        val o = open(); o.seed(); o.currentNamespace()
         val command = o.control.prepare(o.control.add())
         val pause = ControlStoreTestStorage.Pause(); o.storage.pause = pause
         val first = async { o.control.execute(command) }
@@ -318,7 +318,7 @@ class ControlRecordStoreReviewTest {
         val result = o.control.execute(o.control.prepare(o.control.add()))
         assertTrue(result is ControlStoreResult.RecoveryRequired)
         assertTrue(result.localUnresolvedCommands.isEmpty())
-        o.seed()
+        o.seed(); o.currentNamespace()
         assertTrue(confirmed(o.control.execute(o.control.prepare(o.control.add()))).localUnresolvedCommands.isEmpty())
     }
 
@@ -339,7 +339,7 @@ class ControlRecordStoreReviewTest {
     }
 
     @Test fun requestedCheckpointAtStorageBoundaryContainsEveryFixedTarget() = runBlocking {
-        val o = open(); o.seed()
+        val o = open(); o.seed(); o.currentNamespace()
         val command = o.control.prepare(o.control.add(), o.control.add(ControlKind.RECOVERY_INTENT, recovery))
         val pause = ControlStoreTestStorage.Pause(); o.storage.pause = pause
         val first = async { o.control.execute(command) }
@@ -355,7 +355,7 @@ class ControlRecordStoreReviewTest {
     }
 
     @Test fun previousRequestedFlagDoesNotInventLocalUnresolvedHistory() = runBlocking {
-        val o = open(); o.seed()
+        val o = open(); o.seed(); o.currentNamespace()
         val command = o.control.prepare(o.control.add())
         o.storage.before = true
         assertTrue(o.control.execute(command) is ControlStoreResult.Unconfirmed)

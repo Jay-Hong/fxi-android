@@ -91,16 +91,16 @@ class ControlRecordReader(private val codec: ControlPayloadCodec = ControlPayloa
     fun read(preferences: Preferences): ControlRecordRead {
         val original = preferences.toPreferences()
         val values = original.asMap().entries.associate { it.key.name to it.value }
-        if (SCHEMA_KEY !in values) {
-            return if (PAYLOAD_KEYS.values.none { it in values }) {
+        if (ControlRecordKeys.SCHEMA !in values) {
+            return if (ControlRecordKeys.payloads.values.none { it in values }) {
                 ControlRecordRead.MigrationOrRecoveryRequired(original)
             } else {
                 ControlRecordRead.Unreadable(original, listOf(ControlRecordProblem.MissingSchema))
             }
         }
-        val schema = values[SCHEMA_KEY]
+        val schema = values[ControlRecordKeys.SCHEMA]
         if (schema !is Int) {
-            return ControlRecordRead.Unreadable(original, listOf(ControlRecordProblem.WrongType(SCHEMA_KEY)))
+            return ControlRecordRead.Unreadable(original, listOf(ControlRecordProblem.WrongType(ControlRecordKeys.SCHEMA)))
         }
         if (schema != 1) {
             return ControlRecordRead.Unreadable(original, listOf(ControlRecordProblem.UnsupportedSchema(schema)))
@@ -108,7 +108,7 @@ class ControlRecordReader(private val codec: ControlPayloadCodec = ControlPayloa
 
         val problems = mutableListOf<ControlRecordProblem>()
         val payloads = mutableMapOf<ControlKind, PayloadRead.Parsed>()
-        for ((kind, key) in PAYLOAD_KEYS) {
+        for ((kind, key) in ControlRecordKeys.payloads) {
             if (key !in values) {
                 problems += ControlRecordProblem.MissingPayload(kind)
                 continue
@@ -140,13 +140,4 @@ class ControlRecordReader(private val codec: ControlPayloadCodec = ControlPayloa
         return ControlRecordRead.Supported(original, arrays)
     }
 
-    private companion object {
-        const val SCHEMA_KEY = "control_schema"
-        val PAYLOAD_KEYS = mapOf(
-            ControlKind.SEAL to "seal_v1",
-            ControlKind.DEMAND to "demand_v1",
-            ControlKind.HOLD to "hold_v1",
-            ControlKind.RECOVERY_INTENT to "recovery_intent_v1"
-        )
-    }
 }
