@@ -119,4 +119,3 @@ class ControlReleaseFailureTest : ReleaseOwnerTestBase() {
         assertEquals(BigInteger.ZERO, tracking.evidenceDiscontinuityCount)
     }
 }
-
