@@ -295,4 +295,95 @@ class NamespaceSettlementRevisionTest {
         refusal(bad, raw().toMutablePreferences().apply { this[TEARDOWN_OWED_FOR] = "A" }, RejectionReason.InvalidRequest("InvalidDemand"))
         refusal(bad, raw(seals = jsonArray(withWitness(user, witness()))), RejectionReason.InvalidRequest("InvalidDemand"))
     }
+
+    @Test
+    fun previouslyConfirmedRotationRejectsRestoredPreimageAtTransitionBoundary() {
+        val spec = input()
+        val c = ref(spec)
+        val read = ControlRecordReader().read(raw()) as ControlRecordRead.Supported
+
+        assertNull(spec.invalidInput())
+        assertNull(ControlAppliedEvidence.own(read, c))
+
+        val decision = transition.decide(
+            command = c,
+            input = spec,
+            read = read,
+            context = context,
+            confirmOnly = false,
+            previouslyConfirmed = true
+        )
+
+        assertEquals(RecordTransactionDecision.Observe::class.java, decision.javaClass)
+        val result = (decision.value as ControlRecordStore.Outcome.Negative).result
+        negative(result, ConflictReason.TargetChanged)
+        assertSame(c, result.command)
+    }
+
+    @Test
+    fun failedNamespaceAppendConfirmsForeignPostconditionAfterEpochChange() = runBlocking {
+        controlTestTimeout("namespace postcondition without own Applied") {
+            val o = open()
+            o.data.updateData { raw(seals = "[]") }
+
+            val action = o.control.addition(ControlKind.SEAL) { id ->
+                literal(user)
+                set("id", ControlScalar.Text(id))
+            }
+            val c = o.control.prepare(action)
+
+            o.storage.before = true
+            val failed = o.control.execute(c)
+            assertTrue(failed is ControlStoreResult.Unconfirmed)
+            failed as ControlStoreResult.Unconfirmed
+            assertEquals(ControlAttemptPhase.ConfirmingStorage, failed.phase)
+            assertEquals(IOException::class.java, failed.failure?.javaClass)
+            assertEquals("before write block", failed.failure?.message)
+
+            val checkpoint = checkNotNull(o.control.checkpoint(c))
+            val target = checkNotNull(checkpoint.targets.single())
+            assertTrue(checkpoint.confirmationRequested)
+            assertFalse(target.joined)
+
+            val tracked = checkNotNull(
+                ControlCommandTracking.forOwner(o.owner).findPrepared(c)
+            )
+            assertFalse(tracked.confirmed.get())
+            assertFalse(tracked.observedApplied.get())
+
+            // 같은 고정 Add를 다른 command ID로 실행한다.
+            val other = o.control.prepare(action)
+            val landed = o.control.execute(other)
+            assertTrue(landed is ControlStoreResult.Confirmed)
+            landed as ControlStoreResult.Confirmed
+            assertEquals(ConfirmedEffect.AppliedThisAttempt, landed.effect)
+            assertEquals(listOf(target.id), landed.effectiveIds)
+
+            o.data.edit { it[USER_EPOCH] = "later-user" }
+
+            val before = o.raw()
+            val read = ControlRecordReader().read(before) as ControlRecordRead.Supported
+            assertNull(ControlAppliedEvidence.own(read, c))
+            assertNotNull(ControlAppliedEvidence.own(read, other))
+            assertFalse(tracked.confirmed.get())
+            assertFalse(tracked.observedApplied.get())
+            assertEquals(
+                tracked.firstConfirmDiscontinuityCount,
+                ControlCommandTracking.forOwner(o.owner).evidenceDiscontinuityCount
+            )
+
+            val writes = o.storage.writes
+            val result = o.control.execute(c)
+
+            assertTrue(result is ControlStoreResult.Confirmed)
+            result as ControlStoreResult.Confirmed
+            assertEquals(ConfirmedEffect.PostconditionConfirmed, result.effect)
+            assertEquals(listOf(target.id), result.effectiveIds)
+            assertTrue(result.localUnresolvedCommands.isEmpty())
+            assertEquals(RecordTransactionEvidence.LockedFileRead, result.proof.storage)
+            assertEquals(before, result.snapshot.record.original)
+            assertEquals(before, o.raw())
+            assertEquals(writes, o.storage.writes)
+        }
+    }
 }
