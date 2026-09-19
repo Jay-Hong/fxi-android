@@ -270,6 +270,19 @@ android {
     }
 }
 
+// Owner structure tests inspect all three merged manifests, including library declarations.
+// Build their current inputs even when only one unit-test variant is requested, and invalidate
+// cached test results when any merged manifest changes. This does not assemble the other variants.
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    dependsOn("processDebugManifest", "processBenchmarkManifest", "processCiMinifiedManifest")
+    inputs.files(
+        layout.buildDirectory.file("intermediates/merged_manifests/debug/processDebugManifest/AndroidManifest.xml"),
+        layout.buildDirectory.file("intermediates/merged_manifests/benchmark/processBenchmarkManifest/AndroidManifest.xml"),
+        layout.buildDirectory.file("intermediates/merged_manifests/ciMinified/processCiMinifiedManifest/AndroidManifest.xml")
+    ).withPropertyName("controlOwnerMergedManifests")
+        .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+}
+
 val verifyProductionGoogleServicesConfig = {
     check(Files.isRegularFile(productionGoogleServicesPath, LinkOption.NOFOLLOW_LINKS)) {
         "Public release requires a regular, non-symlink app/google-services.json; " +

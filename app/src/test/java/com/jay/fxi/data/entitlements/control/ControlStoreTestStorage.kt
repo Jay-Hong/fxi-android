@@ -47,9 +47,12 @@ internal class ControlStoreTestStorage(private val file: File) {
 
     suspend fun close() = scope.coroutineContext[Job]!!.cancelAndJoin()
     suspend fun raw(): Preferences = data.data.first()
-    suspend fun seed(seal: String = "[]", demand: String = "[]", hold: String = "[]", recovery: String = "[]") {
+    suspend fun seed(seal: String = "[]", demand: String = "[]", hold: String = "[]", recovery: String = "[]", schema: Int = 1) {
         data.edit {
-            it[SCHEMA] = 1
+            it[SCHEMA] = schema
+            for (key in listOf(ControlPayloadKey.COMMAND_EVIDENCE, ControlPayloadKey.SCOPE_FENCE)) {
+                if (schema == 2) it[ControlRecordKeys.payload(key)] = "[]" else it.remove(ControlRecordKeys.payload(key))
+            }
             it[SEAL] = seal
             it[DEMAND] = demand
             it[HOLD] = hold

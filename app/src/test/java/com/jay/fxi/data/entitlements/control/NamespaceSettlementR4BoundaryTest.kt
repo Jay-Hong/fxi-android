@@ -40,7 +40,7 @@ class NamespaceSettlementR4BoundaryTest {
             return ControlRecordRead.Supported(raw(seals = jsonArray(*Array(count) { target })),
                 ControlKind.entries.associateWith { kind ->
                     ControlArrayRead.Parsed(if (kind == ControlKind.SEAL) entries else emptyList())
-                })
+                }, 1, ControlMetadataRead.NotPresentV1)
         }
         val duplicate = supported(2)
         val matches = duplicate.locations("s")
@@ -101,7 +101,7 @@ class NamespaceSettlementR4BoundaryTest {
             source[ControlRecordKeys.payload(ControlKind.DEMAND)] = jsonArray(demand.original, second.original)
         }
         // Exercise the transition's internal input directly, without D1 demoting duplicate ids.
-        val read = ControlRecordRead.Supported(source, arrays)
+        val read = ControlRecordRead.Supported(source, arrays, 1, ControlMetadataRead.NotPresentV1)
         val matches = read.locations(spec.demandId)
         assertEquals(2, matches.size)
         assertEquals(ControlKind.DEMAND, matches.first().first)

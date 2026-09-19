@@ -381,7 +381,7 @@ class NamespaceSettlementIntegrationTest {
             assertEquals(IOException::class.java, prime?.javaClass); assertEquals("prime size rejection", prime?.message)
             val before = disk(); val writes = o.storage.writes
             val result = o.control.execute(c, context)
-            negative(result, RejectionReason.TooLarge(kind, bytes, 65_536))
+            negative(result, RejectionReason.TooLarge(ControlPayloadKey.forKind(kind), bytes, 65_536))
             assertTrue(result.localUnresolvedCommands.isEmpty()); assertEquals(before, disk()); assertEquals(before, o.raw())
             assertEquals(writes, o.storage.writes); assertNull(o.raw()[BARRIER])
             assertTrue(ControlCommandTracking.forOwner(o.owner).executing.isEmpty())

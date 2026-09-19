@@ -41,6 +41,11 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
             TargetExpectation(command, input.seals.map { it.id }), read))
         fun recovery(reason: RecoveryReason) = negative(ControlStoreResult.RecoveryRequired(command, emptySet(), reason, read))
 
+        val snapshotSchema = read.original.asMap().entries
+            .singleOrNull { it.key.name == ControlRecordKeys.SCHEMA }?.value
+        if (read.schemaVersion != 1 || snapshotSchema !is Int || snapshotSchema != 1) {
+            return recovery(RecoveryReason.ControlWriterUpgradeRequired)
+        }
         input.invalidInput()?.let { return reject(it) }
         val located = mutableListOf<ControlEntryRead.Interpreted>()
         for (seal in input.seals) {
@@ -224,7 +229,7 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
             return ChangedPayload.Rejected(RejectionReason.InvalidRequest("InvalidEnvelope"))
         }
         return when (encoded) {
-            is PayloadWrite.TooLarge -> ChangedPayload.Rejected(RejectionReason.TooLarge(kind, encoded.bytes, encoded.limit))
+            is PayloadWrite.TooLarge -> ChangedPayload.Rejected(RejectionReason.TooLarge(ControlPayloadKey.forKind(kind), encoded.bytes, encoded.limit))
             is PayloadWrite.Encoded -> ChangedPayload.Encoded(encoded.text)
         }
     }
@@ -292,7 +297,7 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
         return SettlementReceipt(input.operationId, input.originLifetimeId, input.before, input.after,
             input.seals.associate { it.id to input.witness(it) }, observations, input.demandId, demandObservation,
             read.arrays.getValue(ControlKind.SEAL).entries.filterIsInstance<ControlEntryRead.Interpreted>()
-                .map { it.value as SealV1 }.filter { it.settlement == null }, read.hasUninterpretable)
+                .map { it.value as SealV1 }.filter { it.settlement == null }, read.hasUninterpretable, read.hasUninterpretableMetadata)
     }
 
     private fun PendingPurge.covers(key: SealKey): Boolean = key.axis in scopes &&

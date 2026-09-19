@@ -74,7 +74,7 @@ class NamespaceSettlementBoundaryTest {
         for (kind in listOf(ControlKind.SEAL, ControlKind.DEMAND)) {
             val entries = listOf(PayloadEntry.Uninterpretable(JsonPrimitive("한".repeat(21_845))))
             val bytes = 65_539 // [ + quote + 65535 UTF-8 bytes + quote + ]
-            assertEquals(NamespaceSettlementTransition.ChangedPayload.Rejected(RejectionReason.TooLarge(kind, bytes, 65_536)),
+            assertEquals(NamespaceSettlementTransition.ChangedPayload.Rejected(RejectionReason.TooLarge(ControlPayloadKey.forKind(kind), bytes, 65_536)),
                 transition.encodeChanged(kind, entries))
             assertEquals(NamespaceSettlementTransition.ChangedPayload.Encoded("[]"), transition.encodeChanged(kind, emptyList()))
             val depth = NamespaceSettlementTransition(ControlPayloadCodec(maxDepth = 2))
@@ -106,7 +106,7 @@ class NamespaceSettlementBoundaryTest {
         val bytes = 65_536
         assertEquals(NamespaceSettlementTransition.ChangedPayload.Encoded("[\"${"한".repeat(21_844)}\"]"), transition.encodeChanged(ControlKind.SEAL, entries))
         val smaller = NamespaceSettlementTransition(ControlPayloadCodec(maxPayloadBytes = bytes - 1))
-        assertEquals(NamespaceSettlementTransition.ChangedPayload.Rejected(RejectionReason.TooLarge(ControlKind.SEAL, bytes, bytes - 1)),
+        assertEquals(NamespaceSettlementTransition.ChangedPayload.Rejected(RejectionReason.TooLarge(ControlPayloadKey.forKind(ControlKind.SEAL), bytes, bytes - 1)),
             smaller.encodeChanged(ControlKind.SEAL, entries))
     }
 }

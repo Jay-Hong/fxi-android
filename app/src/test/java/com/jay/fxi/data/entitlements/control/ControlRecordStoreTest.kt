@@ -300,7 +300,7 @@ class ControlRecordStoreTest {
         val before = o.raw()
         val result = c.execute(command) as ControlStoreResult.Rejected
         val reason = result.reason as RejectionReason.TooLarge
-        assertEquals(ControlKind.RECOVERY_INTENT, reason.kind)
+        assertEquals(ControlPayloadKey.RECOVERY_INTENT, reason.payloadKey)
         assertTrue(reason.bytes > 300)
         assertEquals(300, reason.limit)
         assertEquals(before, open().raw())
@@ -319,18 +319,24 @@ class ControlRecordStoreTest {
     @Test fun incompleteFutureAndMistypedRecordsAreNeverNormalized() = runBlocking {
         val o = open()
         val command = o.control.addSeal()
-        for (variant in 0..4) {
+        for (variant in 0..6) {
             o.seed()
             o.data.edit { when (variant) {
                 0 -> it.remove(HOLD)
-                1 -> it[SCHEMA] = 2
+                1 -> it[SCHEMA] = 3
                 2 -> it[stringPreferencesKey("control_schema")] = "1"
                 3 -> it[DEMAND] = "malformed"
-                else -> it.remove(SCHEMA)
+                4 -> it.remove(SCHEMA)
+                5 -> it[SCHEMA] = 2
+                else -> {
+                    it[SCHEMA] = 2
+                    it[ControlRecordKeys.payload(ControlPayloadKey.COMMAND_EVIDENCE)] = "[]"
+                    it[ControlRecordKeys.payload(ControlPayloadKey.SCOPE_FENCE)] = "[]"
+                }
             } }
             val before = o.raw()
             val result = o.control.execute(command) as ControlStoreResult.RecoveryRequired
-            assertEquals(RecoveryReason.UnreadableRecord, result.reason)
+            assertEquals(if (variant == 6) RecoveryReason.ControlWriterUpgradeRequired else RecoveryReason.UnreadableRecord, result.reason)
             assertEquals(before, o.raw())
         }
     }
@@ -751,7 +757,7 @@ class ControlRecordStoreTest {
         val bytes = text.toByteArray(Charsets.UTF_8).size
         val small = ControlRecordStore(o.owner, codec = ControlPayloadCodec(maxPayloadBytes = bytes - 1))
         val result = small.execute(command) as ControlStoreResult.Rejected
-        assertEquals(RejectionReason.TooLarge(ControlKind.SEAL, bytes, bytes - 1), result.reason)
+        assertEquals(RejectionReason.TooLarge(ControlPayloadKey.forKind(ControlKind.SEAL), bytes, bytes - 1), result.reason)
         val exact = ControlRecordStore(o.owner, codec = ControlPayloadCodec(maxPayloadBytes = bytes))
         assertEquals(text, confirmed(exact.execute(command)).snapshot.record.original[SEAL])
     }

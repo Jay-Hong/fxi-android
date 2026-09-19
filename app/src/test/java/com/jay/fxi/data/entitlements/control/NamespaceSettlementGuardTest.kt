@@ -88,10 +88,12 @@ class NamespaceSettlementGuardTest(private val guard: String) {
                 invalid("UnrepresentableJournalField")
             }
             "G12.legacy" -> {
-                snapshot.remove(SCHEMA); ControlKind.entries.forEach { snapshot.remove(ControlRecordKeys.payload(it)) }
+                snapshot.remove(SCHEMA); ControlRecordKeys.allPayloads.forEach { snapshot.remove(ControlRecordKeys.payload(it)) }
                 expected = RecoveryReason.MigrationOrRecovery
             }
-            "G12.unreadable" -> { snapshot[SCHEMA] = 2; expected = RecoveryReason.UnreadableRecord }
+            "G12.future" -> { snapshot[SCHEMA] = 3; expected = RecoveryReason.UnreadableRecord }
+            "G12.missingV2" -> { snapshot[SCHEMA] = 2; expected = RecoveryReason.UnreadableRecord }
+            "G12.writerV2" -> { snapshot = raw(schema = 2).toMutablePreferences(); expected = RecoveryReason.ControlWriterUpgradeRequired }
             "G13.missing" -> { rawSeal("[]"); expected = ConflictReason.TargetMissing }
             "G13.duplicate" -> { rawSeal("[$user,$user]"); expected = ConflictReason.IdCollision }
             "G13.wrongArray" -> {
@@ -200,7 +202,7 @@ class NamespaceSettlementGuardTest(private val guard: String) {
         @JvmStatic @Parameterized.Parameters(name = "{0}") fun cases(): List<Array<String>> = (
             listOf("G01", "G02", "G03", "G04", "G05", "G06.owner", "G06.epoch", "G07.oldEpoch", "G07.otherNewEpoch",
                 "G08.owner", "G08.origin", "G09.binding", "G09.order", "G10.USER", "G10.CAPABILITY",
-                "G11.owner", "G11.userEpoch", "G11.krxEpoch", "G12.legacy", "G12.unreadable",
+                "G11.owner", "G11.userEpoch", "G11.krxEpoch", "G12.legacy", "G12.future", "G12.missingV2", "G12.writerV2",
                 "G13.missing", "G13.duplicate", "G13.wrongArray", "G13.opaque", "G14.kind", "G14.owner", "G14.axis", "G14.epoch",
                 "G15", "G16", "G17", "G19", "G20", "G22.owner", "G22.userEpoch", "G22.krxEpoch", "G23",
                 "G24.signOut", "G24.identityPending", "G25.owner", "G25.binding", "G25.origin") +

@@ -126,6 +126,9 @@ internal class ControlRecordStore(
                     }, read))
                 } else if (known == null && !confirmOnly) {
                     historyUnavailable(command, read)
+                } else if (read.schemaVersion != 1) {
+                    negative(ControlStoreResult.RecoveryRequired(command, emptySet(),
+                        RecoveryReason.ControlWriterUpgradeRequired, read))
                 } else {
                     phase.set(ControlAttemptPhase.PreparingCandidate)
                     val rotation = command.body as? ControlCommandBody.RotateAndSettle
@@ -318,7 +321,7 @@ internal class ControlRecordStore(
             }
             when (encoded) {
                 is PayloadWrite.TooLarge -> return negative(ControlStoreResult.Rejected(command, emptySet(),
-                    RejectionReason.TooLarge(kind, encoded.bytes, encoded.limit), read))
+                    RejectionReason.TooLarge(ControlPayloadKey.forKind(kind), encoded.bytes, encoded.limit), read))
                 is PayloadWrite.Encoded -> candidate[ControlRecordKeys.payload(kind)] = encoded.text
             }
         }

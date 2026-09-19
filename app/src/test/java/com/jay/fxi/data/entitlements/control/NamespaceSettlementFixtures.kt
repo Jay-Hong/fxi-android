@@ -32,8 +32,12 @@ internal object NamespaceSettlementFixtures {
         op: String = operation, did: String = demandId, u: String? = newUser, k: String? = newKrx
     ) = RotateAndSettleNamespaces(targets, before, origin, request, op, did, u, k)
 
-    fun raw(seals: String = "[$user]", requests: String = "[]"): Preferences = mutablePreferencesOf().apply {
-        this[SCHEMA] = 1
+    fun raw(seals: String = "[$user]", requests: String = "[]", schema: Int = 1): Preferences = mutablePreferencesOf().apply {
+        this[SCHEMA] = schema
+        if (schema == 2) {
+            this[ControlRecordKeys.payload(ControlPayloadKey.COMMAND_EVIDENCE)] = "[]"
+            this[ControlRecordKeys.payload(ControlPayloadKey.SCOPE_FENCE)] = "[]"
+        }
         this[ControlRecordKeys.payload(ControlKind.SEAL)] = seals
         this[ControlRecordKeys.payload(ControlKind.DEMAND)] = requests
         this[ControlRecordKeys.payload(ControlKind.HOLD)] = "[]"

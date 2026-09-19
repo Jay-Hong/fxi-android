@@ -126,20 +126,20 @@ class ControlRecordReaderTest {
 
     @Test fun `every required payload is checked for absence`() {
         keys.forEach { (kind, name) ->
-            unreadable(normal().apply { remove(stringPreferencesKey(name)) }, ControlRecordProblem.MissingPayload(kind))
+            unreadable(normal().apply { remove(stringPreferencesKey(name)) }, ControlRecordProblem.MissingPayload(ControlPayloadKey.forKind(kind)))
         }
-        unreadable(mutablePreferencesOf(schema to 1), *ControlKind.entries.map { ControlRecordProblem.MissingPayload(it) }.toTypedArray())
+        unreadable(mutablePreferencesOf(schema to 1), *ControlKind.entries.map { ControlRecordProblem.MissingPayload(ControlPayloadKey.forKind(it)) }.toTypedArray())
     }
 
     @Test fun `future zero and negative schema are unsupported even with healthy payloads`() {
-        for (version in listOf(Int.MIN_VALUE, -1, 0, 2, Int.MAX_VALUE)) {
+        for (version in listOf(Int.MIN_VALUE, -1, 0, 3, Int.MAX_VALUE)) {
             unreadable(normal().apply { this[schema] = version }, ControlRecordProblem.UnsupportedSchema(version))
         }
     }
 
     @Test fun `unsupported schema is decided before missing wrong typed or malformed payloads`() {
-        unreadable(mutablePreferencesOf(schema to 2, booleanPreferencesKey("seal_v1") to true,
-            stringPreferencesKey("hold_v1") to "{"), ControlRecordProblem.UnsupportedSchema(2))
+        unreadable(mutablePreferencesOf(schema to 3, booleanPreferencesKey("seal_v1") to true,
+            stringPreferencesKey("hold_v1") to "{"), ControlRecordProblem.UnsupportedSchema(3))
     }
 
     private fun wrongTypes(name: String): List<Preferences.Pair<*>> = listOf(
@@ -169,9 +169,9 @@ class ControlRecordReaderTest {
             payload(ControlKind.HOLD, "{}")
             payload(ControlKind.RECOVERY_INTENT, "[$recovery]")
         }
-        unreadable(prefs, ControlRecordProblem.MissingPayload(ControlKind.SEAL),
+        unreadable(prefs, ControlRecordProblem.MissingPayload(ControlPayloadKey.forKind(ControlKind.SEAL)),
             ControlRecordProblem.WrongType("demand_v1"),
-            ControlRecordProblem.UnreadablePayload(ControlKind.HOLD, PayloadRead.Unreadable(PayloadUnreadable.NOT_AN_ARRAY, "{}")))
+            ControlRecordProblem.UnreadablePayload(ControlPayloadKey.forKind(ControlKind.HOLD), PayloadRead.Unreadable(PayloadUnreadable.NOT_AN_ARRAY, "{}")))
     }
 
     @Test fun `each envelope refusal makes whole record unreadable retaining exact raw text`() {
@@ -179,7 +179,7 @@ class ControlRecordReaderTest {
             "[" to PayloadUnreadable.NOT_JSON, "{}" to PayloadUnreadable.NOT_AN_ARRAY,
             "null" to PayloadUnreadable.NOT_AN_ARRAY, "[{\"id\":\"a\",\"id\":\"b\"}]" to PayloadUnreadable.DUPLICATE_KEY)
         for (kind in ControlKind.entries) for ((raw, reason) in bad) {
-            unreadable(normal().apply { payload(kind, raw) }, ControlRecordProblem.UnreadablePayload(kind, PayloadRead.Unreadable(reason, raw)))
+            unreadable(normal().apply { payload(kind, raw) }, ControlRecordProblem.UnreadablePayload(ControlPayloadKey.forKind(kind), PayloadRead.Unreadable(reason, raw)))
         }
     }
 
@@ -190,7 +190,7 @@ class ControlRecordReaderTest {
                 Triple(ControlPayloadCodec(maxDepth = 1), "[[]]", PayloadUnreadable.TOO_DEEP)
             )) {
                 val result = ControlRecordReader(limited).read(normal().apply { payload(kind, raw) }) as ControlRecordRead.Unreadable
-                assertEquals(listOf(ControlRecordProblem.UnreadablePayload(kind, PayloadRead.Unreadable(reason, raw))), result.problems)
+                assertEquals(listOf(ControlRecordProblem.UnreadablePayload(ControlPayloadKey.forKind(kind), PayloadRead.Unreadable(reason, raw))), result.problems)
             }
         }
     }
@@ -310,7 +310,7 @@ class ControlRecordReaderTest {
 
     @Test fun `unrelated Preferences keys and actual types survive all classifications`() {
         val bytesKey = byteArrayPreferencesKey("opaque")
-        for (prefs in listOf(normal(), mutablePreferencesOf(), mutablePreferencesOf(schema to 2))) {
+        for (prefs in listOf(normal(), mutablePreferencesOf(), mutablePreferencesOf(schema to 3))) {
             prefs[bytesKey] = byteArrayOf(3, 4)
             prefs[stringSetPreferencesKey("future")] = setOf("a", "b")
             prefs[intPreferencesKey("owner_uid")] = 7 // Outside D1's validation scope.

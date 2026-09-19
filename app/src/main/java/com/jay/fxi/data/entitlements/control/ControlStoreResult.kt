@@ -33,7 +33,7 @@ internal class ConfirmedControlSnapshot internal constructor(val record: Control
 internal data class ConfirmationProof(val storage: RecordTransactionEvidence)
 
 internal sealed interface RejectionReason {
-    data class TooLarge(val kind: ControlKind, val bytes: Int, val limit: Int) : RejectionReason
+    data class TooLarge(val payloadKey: ControlPayloadKey, val bytes: Int, val limit: Int) : RejectionReason
     data class InvalidRequest(val detail: String) : RejectionReason
 }
 
@@ -42,7 +42,7 @@ internal enum class ConflictReason {
 }
 
 internal enum class RecoveryReason {
-    MigrationOrRecovery, UnreadableRecord, UnreadableEpochState, InconsistentSettlement, JournalMigrationRequired
+    MigrationOrRecovery, UnreadableRecord, ControlWriterUpgradeRequired, UnreadableEpochState, InconsistentSettlement, JournalMigrationRequired
 }
 internal enum class UnconfirmedReason { StorageFailure, HistoryUnavailable }
 internal enum class ControlAttemptPhase { ReadingSnapshot, PreparingCandidate, ConfirmingStorage }
