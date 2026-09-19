@@ -27,8 +27,17 @@ internal object ControlAppliedEvidence {
                 if (row.sealIds != body.input.seals.map { it.id }) return false
                 if (row.demandId != body.input.demandId) return false
             }
-            // R/N/L have no executor or retained witness confirmation in this unit.
-            is ControlCommandBody.Handover -> return false
+            is ControlCommandBody.Handover -> when (val input = body.input) {
+                is RetiredNamespaceSettlement -> {
+                    if (row !is AppliedEvidence.Settlement) return false
+                    if (row.transition != HandoverSettlementTransition.RETIRED_NAMESPACE) return false
+                    val seal = (ControlObligations.read(ControlKind.SEAL, input.target) as? ControlEntryRead.Interpreted)?.value as? SealV1
+                        ?: return false
+                    if (row.sealIds != listOf(seal.id)) return false
+                    if (row.demandId != input.demandId) return false
+                }
+                is CurrentNullSettlement, is RetiredNullSettlement -> return false
+            }
             is ControlCommandBody.Mutations -> {
                 if (row !is AppliedEvidence.Mutations) return false
                 if (row.targets.size != command.actions.size) return false

@@ -79,6 +79,19 @@ internal class ControlRecordStore(
         }
     }
 
+    /** Capture the actual fence and current executor under the caller's coordinator lock.
+     * A current-owner target requires a fresh demand; omission never opts out of that obligation.
+     * All supplied values and issued IDs remain fixed across retries.
+     */
+    fun prepareRetiredNamespaceSettlement(
+        target: ControlNode, before: FenceV1, executor: SettlementExecutor, demand: SettlementDemand?
+    ): CommandRef {
+        val operationId = ids.next().toString()
+        val input = RetiredNamespaceSettlement(target, before, executor, operationId,
+            demand?.let { ids.next().toString() }, demand)
+        return tracking.registerPrepared(CommandRef(operationId, ControlCommandBody.SettleRetiredNamespace(input), tracking.lifetimeId))
+    }
+
     /**
      * Missing own seals can be retried. A replacement same-key seal or a new NAMESPACE append whose
      * owner/axis epoch is no longer current yields TargetChanged; unreadable required epoch keys
@@ -302,15 +315,22 @@ internal class ControlRecordStore(
                     historyUnavailable(command, read)
                 } else {
                     phase.set(ControlAttemptPhase.PreparingCandidate)
-                    // Type-only handovers must never reach mutation/checkpoint fallthrough.
-                    if (command.body is ControlCommandBody.Handover) return@transactRecord negative(
+                    val handover = (command.body as? ControlCommandBody.Handover)?.input
+                    // N/L remain type-only; neither may reach mutation/checkpoint fallthrough.
+                    if (handover != null && handover !is RetiredNamespaceSettlement) return@transactRecord negative(
                         ControlStoreResult.Rejected(command, emptySet(), emptySet(),
                             RejectionReason.InvalidRequest("HandoverSettlementNotImplemented"), read))
-                    val rotation = command.body as? ControlCommandBody.RotateAndSettle
                     val own = ControlAppliedEvidence.own(read, command)
-                    // Preserve actual observation even when checkpoint admission later refuses confirmation.
+                    // Preserve actual observation even when later admission rejects the record.
                     if (own != null) tracked.observedApplied.set(true)
-                    if (confirmOnly && rotation == null) {
+                    if (handover is RetiredNamespaceSettlement) {
+                        RetiredNamespaceSettlementTransition.recordProblem(read)?.let { reason ->
+                            return@transactRecord negative(ControlStoreResult.RecoveryRequired(
+                                command, emptySet(), emptySet(), reason, read))
+                        }
+                    }
+                    val rotation = command.body as? ControlCommandBody.RotateAndSettle
+                    if (confirmOnly && rotation == null && handover == null) {
                         if (checkpoint?.command !== command || !checkpoint.confirmationRequested ||
                             checkpoint.targets.size != command.actions.size || checkpoint.targets.any { it == null } ||
                             (known != null && !matchesLocalHistory(tracked, checkpoint)) ||
@@ -340,7 +360,10 @@ internal class ControlRecordStore(
                         return@transactRecord negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(),
                             RecoveryReason.CommandEvidenceContinuityLost, read))
                     }
-                    val decision = if (rotation != null) {
+                    val decision = if (handover is RetiredNamespaceSettlement) {
+                        RetiredNamespaceSettlementTransition(codec).decide(command, handover, read, context,
+                            onlyConfirm, tracked.confirmed.get())
+                    } else if (rotation != null) {
                         NamespaceSettlementTransition(codec).decide(command, rotation.input, read, context,
                             onlyConfirm, tracked.confirmed.get())
                     } else decide(command, tracked, read, onlyConfirm)
@@ -365,7 +388,7 @@ internal class ControlRecordStore(
                     ControlStoreResult.Confirmed(
                         command, work.unresolvedCommands, work.pendingReleases, outcome.effect, outcome.ids,
                         confirmedSnapshot,
-                        ConfirmationProof(transaction.evidence), outcome.settlement
+                        ConfirmationProof(transaction.evidence), outcome.receipt
                     )
                 }
                 is Outcome.Negative -> {
@@ -614,7 +637,10 @@ internal class ControlRecordStore(
         } }
 
     internal sealed interface Outcome {
-        data class Positive(val effect: ConfirmedEffect, val ids: List<String>, val settlement: SettlementReceipt? = null) : Outcome
+        data class Positive(val effect: ConfirmedEffect, val ids: List<String>, val receipt: ControlSettlementReceipt? = null) : Outcome {
+            val settlement: SettlementReceipt? = receipt as? SettlementReceipt
+            val handoverSettlement: HandoverSettlementReceipt? = receipt as? HandoverSettlementReceipt
+        }
         data class Negative(val result: ControlStoreResult) : Outcome
     }
 

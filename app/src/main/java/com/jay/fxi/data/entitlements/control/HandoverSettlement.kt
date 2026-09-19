@@ -5,7 +5,7 @@ import java.util.Collections
 /** These are the only handover kinds supported by schema 2. */
 enum class HandoverSettlementTransition { RETIRED_NAMESPACE, CURRENT_NULL, RETIRED_NULL }
 
-/** Fixed executor identity; fresh attempt admission remains a future writer responsibility. */
+/** Fixed executor identity, compared with a fresh context on each new application. */
 internal data class SettlementExecutor(val ownerUid: String?, val binding: Long, val originLifetimeId: LifetimeId)
 
 /** Fixed inputs only. Constructing one neither prepares a ref nor validates a storage candidate. */
@@ -22,7 +22,11 @@ internal class RetiredNamespaceSettlement(
     override val operationId: String,
     val demandId: String?,
     val demand: SettlementDemand?
-) : HandoverSettlementInput
+) : HandoverSettlementInput {
+    init {
+        require((demandId == null) == (demand == null)) { "demandId and demand must be present together" }
+    }
+}
 
 internal class CurrentNullSettlement(
     nullTargets: List<ControlNode>,
@@ -51,8 +55,11 @@ internal class RetiredNullSettlement(
 /** NotRequired says this command issued no demand; Absent says a required demand is now absent. */
 internal enum class HandoverDemandObservation { NotRequired, Present, Changed, Absent, Uninterpretable }
 
+/** Closed result tag; rotation and handover observations have different demand contracts. */
+internal sealed interface ControlSettlementReceipt
+
 /**
- * R/N/L receipt type only, distinct from the existing rotation receipt. No writer returns it yet.
+ * R/N/L receipt, distinct from the existing rotation receipt.
  * Journal/demand observations never prove consumption, freshness, or protected admission.
  */
 internal class HandoverSettlementReceipt(
@@ -68,7 +75,7 @@ internal class HandoverSettlementReceipt(
     remainingSeals: List<SealV1>,
     val hasUninterpretable: Boolean,
     val hasUninterpretableMetadata: Boolean
-) {
+) : ControlSettlementReceipt {
     val blocksProtectedAdmission: Boolean get() = hasUninterpretable || hasUninterpretableMetadata
     val witnesses: Map<String, SettlementEvidence> = Collections.unmodifiableMap(witnesses.toMap())
     val journal: Map<String, JournalObservation> = Collections.unmodifiableMap(journal.toMap())

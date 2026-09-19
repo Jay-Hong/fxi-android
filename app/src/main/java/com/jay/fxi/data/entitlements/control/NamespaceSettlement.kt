@@ -111,7 +111,7 @@ internal class SettlementReceipt(
     remainingSeals: List<SealV1>,
     val hasUninterpretable: Boolean,
     val hasUninterpretableMetadata: Boolean
-) {
+) : ControlSettlementReceipt {
     val blocksProtectedAdmission: Boolean get() = hasUninterpretable || hasUninterpretableMetadata
     val witnesses: Map<String, SettlementEvidenceV1> = Collections.unmodifiableMap(witnesses.toMap())
     val journal: Map<String, JournalObservation> = Collections.unmodifiableMap(journal.toMap())

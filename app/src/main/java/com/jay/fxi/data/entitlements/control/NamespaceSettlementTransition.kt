@@ -260,7 +260,7 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
         return true
     }
 
-    private fun settle(original: ControlNode, evidence: SettlementEvidenceV1): ControlNode? =
+    internal fun settle(original: ControlNode, evidence: SettlementEvidenceV1): ControlNode? =
         (ControlObligations.editExisting(ControlKind.SEAL, original) {
             createChild("settlement") {
                 set("operationId", ControlScalar.Text(evidence.operationId))

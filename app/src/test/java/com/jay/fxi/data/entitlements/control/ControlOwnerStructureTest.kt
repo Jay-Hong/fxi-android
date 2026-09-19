@@ -95,6 +95,17 @@ class ControlOwnerStructureTest {
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.USER_EPOCH",
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.encode",
             ),
+            "main/java/com/jay/fxi/data/entitlements/control/RetiredNamespaceSettlementTransition.kt" to listOf(
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.ENTRY_SEPARATOR",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.KRX_EPOCH",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.MAY_CONTAIN_KRX",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.MAY_CONTAIN_PREMIUM",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.OWNER_UID",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.PURGE_JOURNAL",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.TEARDOWN_OWED_FOR",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.USER_EPOCH",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.encode",
+            ),
             "main/java/com/jay/fxi/data/entitlements/purge/PurgeJournalCodec.kt" to listOf(
                 "* `DataStoreAccessEpochStore` keeps its own four-field decoder, which turns any line that is not",
                 "* unreadable line, which widens, and not an empty journal. `DataStoreAccessEpochStore` draws",

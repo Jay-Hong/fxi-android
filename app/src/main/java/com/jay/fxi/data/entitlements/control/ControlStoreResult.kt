@@ -94,8 +94,11 @@ internal sealed interface ControlStoreResult {
         val effectiveIds: List<String>,
         val snapshot: ConfirmedControlSnapshot,
         val proof: ConfirmationProof,
-        val settlement: SettlementReceipt? = null
-    ) : ControlStoreResult
+        val receipt: ControlSettlementReceipt? = null
+    ) : ControlStoreResult {
+        val settlement: SettlementReceipt? = receipt as? SettlementReceipt
+        val handoverSettlement: HandoverSettlementReceipt? = receipt as? HandoverSettlementReceipt
+    }
 
     data class Rejected(
         override val command: CommandRef,
