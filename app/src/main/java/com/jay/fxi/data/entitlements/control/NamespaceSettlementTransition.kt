@@ -152,7 +152,9 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
         data class Rejected(val reason: RejectionReason) : CandidateBuild
     }
 
-    /** Reserve journal epochs and all nested epoch fields in every obligation array.
+    /** Required rejection guard for retained journal epochs and nested epoch fields in every array.
+     * This is not a history of all issued epochs: erased UUIDs cannot be detected here. Production
+     * issuance relies on random UUIDs fixed during preparation and retained across retries.
      * Opaque rows are scanned too; excluding reuse grants no interpretation or authority.
      * Run only for a new application: its own persisted epoch is expected during reconfirmation.
      */

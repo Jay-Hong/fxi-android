@@ -48,10 +48,7 @@ internal class ControlRecordStore(
 
     fun prepare(vararg actions: ControlMutation): CommandRef {
         val command = CommandRef(ids.next().toString(), actions.toList())
-        check(tracking.commands.putIfAbsent(command.id, TrackedControlCommand(command)) == null) {
-            "command UUID collision; do not reissue an identity to hide it"
-        }
-        return command
+        return tracking.registerPrepared(command)
     }
 
     /** Issue operation, demand and axis UUIDs independently, once. Context is supplied at execution. */
@@ -67,14 +64,11 @@ internal class ControlRecordStore(
             if (PurgeScope.USER in axes) ids.next().toString() else null,
             if (PurgeScope.CAPABILITY in axes) ids.next().toString() else null)
         val command = CommandRef(operationId, ControlCommandBody.RotateAndSettle(input))
-        check(tracking.commands.putIfAbsent(command.id, TrackedControlCommand(command)) == null) {
-            "command UUID collision; do not reissue an identity to hide it"
-        }
-        return command
+        return tracking.registerPrepared(command)
     }
 
-    fun checkpoint(command: CommandRef): ControlCommandCheckpoint? = tracking.commands[command.id]
-        ?.takeIf { it.command === command && command.body is ControlCommandBody.Mutations }
+    fun checkpoint(command: CommandRef): ControlCommandCheckpoint? = tracking.findPrepared(command)
+        ?.takeIf { command.body is ControlCommandBody.Mutations }
         ?.let {
             // Targets only advance from null to fixed values, before the flag becomes true.
             // Read the flag first so a requested checkpoint cannot contain an older partial list.
@@ -114,8 +108,8 @@ internal class ControlRecordStore(
         confirmOnly: Boolean,
         context: AttemptContext?
     ): ControlStoreResult {
-        val known = tracking.commands[command.id]
-        val tracked = if (known?.command === command) known else TrackedControlCommand(command)
+        val known = tracking.findPrepared(command)
+        val tracked = known ?: TrackedControlCommand(command)
         check(tracking.executing.add(command)) { "the same command is already executing" }
         val wasUnresolved = tracking.isUnresolved(command)
         tracking.markUnresolved(command)
@@ -130,7 +124,7 @@ internal class ControlRecordStore(
                         is ControlRecordRead.MigrationOrRecoveryRequired -> RecoveryReason.MigrationOrRecovery
                         else -> RecoveryReason.UnreadableRecord
                     }, read))
-                } else if (known?.command !== command && !confirmOnly) {
+                } else if (known == null && !confirmOnly) {
                     historyUnavailable(command, read)
                 } else {
                     phase.set(ControlAttemptPhase.PreparingCandidate)
@@ -148,12 +142,12 @@ internal class ControlRecordStore(
                             checkpoint.targets.size != command.actions.size || checkpoint.targets.any { it == null }
                         ) {
                             historyUnavailable(command, read)
-                        } else if ((known?.command === command && !matchesLocalHistory(tracked, checkpoint)) ||
+                        } else if ((known != null && !matchesLocalHistory(tracked, checkpoint)) ||
                             !matchesPreparedActions(command, checkpoint)
                         ) {
                             historyUnavailable(command, read)
                         } else {
-                            if (known?.command !== command) {
+                            if (known == null) {
                                 // Only the temporary previous-lifetime tracker imports caller evidence.
                                 tracked.targets.set(checkpoint.targets)
                                 tracked.confirmationRequested.set(true)

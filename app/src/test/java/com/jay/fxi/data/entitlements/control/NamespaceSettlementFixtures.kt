@@ -45,10 +45,11 @@ internal object NamespaceSettlementFixtures {
         this[MAY_CONTAIN_KRX] = true
     }
 
+    /** Test registration for fixed and deliberately invalid inputs; does not test production issuance. */
     fun command(o: ControlStoreTestStorage, input: RotateAndSettleNamespaces): CommandRef =
-        CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input)).also {
-            check(ControlCommandTracking.forOwner(o.owner).commands.putIfAbsent(it.id, TrackedControlCommand(it)) == null)
-        }
+        ControlCommandTracking.forOwner(o.owner).registerPrepared(
+            CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input))
+        )
 
     fun confirmed(result: ControlStoreResult, effect: ConfirmedEffect): ControlStoreResult.Confirmed {
         assertEquals(ControlStoreResult.Confirmed::class.java, result.javaClass)

@@ -21,8 +21,19 @@ internal class TrackedControlCommand(val command: CommandRef) {
  * There is no per-command eviction in D2a. D2c must define an explicit release/retention contract
  * before pruning this potentially growing history, preserving unresolved references and fixed targets.
  */
-internal class ControlCommandTracking {
-    val commands = ConcurrentHashMap<String, TrackedControlCommand>()
+internal class ControlCommandTracking private constructor() {
+    private val commands = ConcurrentHashMap<String, TrackedControlCommand>()
+
+    internal fun registerPrepared(command: CommandRef): CommandRef {
+        check(commands.putIfAbsent(command.id, TrackedControlCommand(command)) == null) {
+            "command UUID collision; do not reissue an identity to hide it"
+        }
+        return command
+    }
+
+    internal fun findPrepared(command: CommandRef): TrackedControlCommand? =
+        commands[command.id]?.takeIf { it.command === command }
+
     // Also covers previous-lifetime references, which are not locally prepared commands.
     // This nonblocking lease refuses duplicate execution; the owner alone serializes storage.
     val executing = ConcurrentHashMap.newKeySet<CommandRef>()
