@@ -36,7 +36,13 @@ internal object ControlAppliedEvidence {
                     if (row.sealIds != listOf(seal.id)) return false
                     if (row.demandId != input.demandId) return false
                 }
-                is CurrentNullSettlement, is RetiredNullSettlement -> return false
+                is CurrentNullSettlement -> {
+                    if (row !is AppliedEvidence.Settlement) return false
+                    if (row.transition != HandoverSettlementTransition.CURRENT_NULL) return false
+                    if (row.sealIds != input.targets.map { it.seal.id }) return false
+                    if (row.demandId != input.demandId) return false
+                }
+                is RetiredNullSettlement -> return false
             }
             is ControlCommandBody.Mutations -> {
                 if (row !is AppliedEvidence.Mutations) return false

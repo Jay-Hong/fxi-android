@@ -179,7 +179,11 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
      */
     internal fun epochsAreUnused(input: RotateAndSettleNamespaces, read: ControlRecordRead.Supported,
         journal: List<PendingPurge>): Boolean {
-        val fresh = input.newEpochs().filterNotNull()
+        return epochsAreUnused(input.newEpochs().filterNotNull(), read, journal)
+    }
+
+    internal fun epochsAreUnused(fresh: List<String>, read: ControlRecordRead.Supported,
+        journal: List<PendingPurge>): Boolean {
         if (journal.any { it.userAccessEpoch in fresh }) return false
         if (journal.any { it.krxCapabilityEpoch in fresh }) return false
         for ((_, array) in read.arrays) {

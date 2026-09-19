@@ -92,6 +92,25 @@ internal class ControlRecordStore(
         return tracking.registerPrepared(CommandRef(operationId, ControlCommandBody.SettleRetiredNamespace(input), tracking.lifetimeId))
     }
 
+    /** Fix companions from the caller's observed record, captured with fence/executor under its lock.
+     * Execution rechecks the complete latest companion set; preparation grants no storage authority.
+     */
+    fun prepareCurrentNullSettlement(
+        nullTargets: List<ControlNode>, observed: ControlRecordRead.Supported, before: FenceV1,
+        executor: SettlementExecutor, demand: SettlementDemand
+    ): CommandRef {
+        val axes = nullTargets.mapNotNull {
+            ((ControlObligations.read(ControlKind.SEAL, it) as? ControlEntryRead.Interpreted)?.value as? SealV1)
+                ?.takeIf { seal -> seal.kind == SealTargetKind.NULL_NAMESPACE }?.key?.axis
+        }.toSet()
+        val companions = CurrentNullSettlementTransition.companions(observed, before, axes).map { it.original }
+        val operationId = ids.next().toString()
+        val input = CurrentNullSettlement(nullTargets, companions, before, executor, operationId, ids.next().toString(), demand,
+            if (PurgeScope.USER in axes) ids.next().toString() else null,
+            if (PurgeScope.CAPABILITY in axes) ids.next().toString() else null)
+        return tracking.registerPrepared(CommandRef(operationId, ControlCommandBody.RotateAndSettleCurrentNull(input), tracking.lifetimeId))
+    }
+
     /**
      * Missing own seals can be retried. A replacement same-key seal or a new NAMESPACE append whose
      * owner/axis epoch is no longer current yields TargetChanged; unreadable required epoch keys
@@ -316,14 +335,14 @@ internal class ControlRecordStore(
                 } else {
                     phase.set(ControlAttemptPhase.PreparingCandidate)
                     val handover = (command.body as? ControlCommandBody.Handover)?.input
-                    // N/L remain type-only; neither may reach mutation/checkpoint fallthrough.
-                    if (handover != null && handover !is RetiredNamespaceSettlement) return@transactRecord negative(
+                    // L remains type-only and must not reach mutation/checkpoint fallthrough.
+                    if (handover is RetiredNullSettlement) return@transactRecord negative(
                         ControlStoreResult.Rejected(command, emptySet(), emptySet(),
                             RejectionReason.InvalidRequest("HandoverSettlementNotImplemented"), read))
                     val own = ControlAppliedEvidence.own(read, command)
                     // Preserve actual observation even when later admission rejects the record.
                     if (own != null) tracked.observedApplied.set(true)
-                    if (handover is RetiredNamespaceSettlement) {
+                    if (handover != null) {
                         RetiredNamespaceSettlementTransition.recordProblem(read)?.let { reason ->
                             return@transactRecord negative(ControlStoreResult.RecoveryRequired(
                                 command, emptySet(), emptySet(), reason, read))
@@ -362,6 +381,9 @@ internal class ControlRecordStore(
                     }
                     val decision = if (handover is RetiredNamespaceSettlement) {
                         RetiredNamespaceSettlementTransition(codec).decide(command, handover, read, context,
+                            onlyConfirm, tracked.confirmed.get())
+                    } else if (handover is CurrentNullSettlement) {
+                        CurrentNullSettlementTransition(codec).decide(command, handover, read, context,
                             onlyConfirm, tracked.confirmed.get())
                     } else if (rotation != null) {
                         NamespaceSettlementTransition(codec).decide(command, rotation.input, read, context,

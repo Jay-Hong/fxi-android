@@ -106,7 +106,18 @@ class HandoverTypeBoundaryTest : ReleaseOwnerTestBase() {
         assertNull(o.control.checkpoint(command))
         assertFalse(command in tracking.executing)
     }
-    @Test fun A18_N_has_no_writer_or_checkpoint() = unimplemented(n())
+    @Test fun A18_N_named_writer_has_no_checkpoint() = runReleaseTest {
+        val input = CurrentNullFixtures.both()
+        controlTestTimeout("N boundary seed") { o.data.updateData { CurrentNullFixtures.raw(input) } }
+        val command = tracking.registerPrepared(CurrentNullFixtures.command(input, tracking.lifetimeId))
+        assertNull(o.control.checkpoint(command))
+        val result = controlTestTimeout("N named dispatch") { o.control.execute(command, CurrentNullFixtures.context) }
+        assertTrue(result is ControlStoreResult.Confirmed)
+        assertEquals(HandoverSettlementTransition.CURRENT_NULL, (result as ControlStoreResult.Confirmed).handoverSettlement!!.transition)
+        assertNull(result.settlement)
+        assertNull(o.control.checkpoint(command))
+        assertFalse(command in tracking.executing)
+    }
     @Test fun A18_L_has_no_writer_or_checkpoint() = unimplemented(l())
     @Test fun A18_confirmPrevious_cannot_import_empty_handover_checkpoint() = runReleaseTest {
         o.seed()

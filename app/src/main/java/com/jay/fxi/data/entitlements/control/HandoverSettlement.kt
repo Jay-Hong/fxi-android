@@ -1,6 +1,7 @@
 package com.jay.fxi.data.entitlements.control
 
 import java.util.Collections
+import com.jay.fxi.data.entitlements.PurgeScope
 
 /** These are the only handover kinds supported by schema 2. */
 enum class HandoverSettlementTransition { RETIRED_NAMESPACE, CURRENT_NULL, RETIRED_NULL }
@@ -41,6 +42,23 @@ internal class CurrentNullSettlement(
 ) : HandoverSettlementInput {
     val nullTargets: List<ControlNode> = Collections.unmodifiableList(nullTargets.toList())
     val companions: List<ControlNode> = Collections.unmodifiableList(companions.toList())
+    internal data class Target(val original: ControlNode, val seal: SealV1)
+    private fun parse(nodes: List<ControlNode>) = nodes.mapNotNull { node ->
+        ((ControlObligations.read(ControlKind.SEAL, node) as? ControlEntryRead.Interpreted)?.value as? SealV1)
+            ?.let { Target(node, it) }
+    }
+    val nulls: List<Target> = Collections.unmodifiableList(parse(this.nullTargets))
+    val accompanying: List<Target> = Collections.unmodifiableList(parse(this.companions))
+    // Only NULL targets determine which axes may rotate.
+    val axes: Set<PurgeScope> = Collections.unmodifiableSet(nulls.map { it.seal.key.axis }.toSet())
+    val targets: List<Target> = Collections.unmodifiableList((nulls + accompanying).sortedWith(
+        compareBy<Target> { if (it.seal.key.axis == PurgeScope.USER) 0 else 1 }
+            .thenBy { if (it.seal.kind == SealTargetKind.NULL_NAMESPACE) 0 else 1 }))
+    val effectiveIds: List<String> = Collections.unmodifiableList(targets.map { it.seal.id } + demandId)
+    val after: FenceV1 get() = FenceV1(before.ownerUid,
+        if (PurgeScope.USER in axes) newUserEpoch else before.userAccessEpoch,
+        if (PurgeScope.CAPABILITY in axes) newKrxEpoch else before.krxCapabilityEpoch)
+    internal fun newEpochs(): List<String?> = axes.map { if (it == PurgeScope.USER) newUserEpoch else newKrxEpoch }
 }
 
 internal class RetiredNullSettlement(
