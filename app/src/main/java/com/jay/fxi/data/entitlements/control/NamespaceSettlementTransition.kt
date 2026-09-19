@@ -36,10 +36,10 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
         previouslyConfirmed: Boolean
     ): RecordTransactionDecision<Outcome> {
         fun negative(result: ControlStoreResult) = RecordTransactionDecision.Observe<Outcome>(Outcome.Negative(result))
-        fun reject(detail: String) = negative(ControlStoreResult.Rejected(command, emptySet(), RejectionReason.InvalidRequest(detail), read))
-        fun conflict(reason: ConflictReason) = negative(ControlStoreResult.Conflict(command, emptySet(), reason,
+        fun reject(detail: String) = negative(ControlStoreResult.Rejected(command, emptySet(), emptySet(), RejectionReason.InvalidRequest(detail), read))
+        fun conflict(reason: ConflictReason) = negative(ControlStoreResult.Conflict(command, emptySet(), emptySet(), reason,
             TargetExpectation(command, input.seals.map { it.id }), read))
-        fun recovery(reason: RecoveryReason) = negative(ControlStoreResult.RecoveryRequired(command, emptySet(), reason, read))
+        fun recovery(reason: RecoveryReason) = negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), reason, read))
 
         val snapshotSchema = read.original.asMap().entries
             .singleOrNull { it.key.name == ControlRecordKeys.SCHEMA }?.value
@@ -116,14 +116,14 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
         if (read.locations(input.demandId).isNotEmpty()) return conflict(ConflictReason.IdCollision)
 
         val built = when (val result = buildCandidate(input, read)) {
-            is CandidateBuild.Rejected -> return negative(ControlStoreResult.Rejected(command, emptySet(), result.reason, read))
+            is CandidateBuild.Rejected -> return negative(ControlStoreResult.Rejected(command, emptySet(), emptySet(), result.reason, read))
             is CandidateBuild.Built -> result
         }
         val candidate = built.candidate.toMutablePreferences()
         val evidence = AppliedEvidence.Rotation(command.id, command.ownerTrackingLifetimeId.value,
             input.seals.map { it.id }, input.demandId)
         ControlAppliedEvidence.append(candidate, read, evidence, codec)?.let {
-            return negative(ControlStoreResult.Rejected(command, emptySet(), it, read))
+            return negative(ControlStoreResult.Rejected(command, emptySet(), emptySet(), it, read))
         }
         val complete = ControlRecordReader(codec).read(candidate)
         if (!validCandidate(complete, built.expected) || (complete as? ControlRecordRead.Supported)?.hasUninterpretableMetadata != false) return reject("InvalidCandidate")

@@ -19,6 +19,14 @@ internal class TrackedControlCommand(val command: CommandRef) {
     var firstConfirmDiscontinuityCount: BigInteger? = null
         private set
     var expectedApplied: AppliedEvidence? = null
+    var releaseDescriptor: ReleasePendingDescriptor? = null
+        private set
+
+    // No production caller until the owner transaction is connected in unit 2.
+    private fun bindReleaseDescriptor(descriptor: ReleasePendingDescriptor) {
+        check(releaseDescriptor == null) { "release descriptor is already fixed" }
+        releaseDescriptor = descriptor
+    }
     fun bindFirstConfirm(count: BigInteger) {
         if (firstConfirmDiscontinuityCount == null) firstConfirmDiscontinuityCount = count
     }
@@ -33,10 +41,9 @@ internal class OwnerTrackingLifetimeId private constructor(val value: String) {
 
 /**
  * Metadata only. All file reads, writes, cache confirmation and serialization belong to the owner.
- * Prepared commands and adopted targets remain for the owner's entire tracking lifetime, including
- * after confirmation or rejection; forgetting either could turn a retry into a fresh command.
- * There is no per-command eviction in D2a. D2c must define an explicit release/retention contract
- * before pruning this potentially growing history, preserving unresolved references and fixed targets.
+ * Prepared commands and adopted targets remain strongly retained, including after confirmation or
+ * rejection. Unit 1 defines release contracts but provides no production eviction or closure path.
+ * Unit 2 must couple reclamation and cleanup to owner confirmation before either can be exposed.
  */
 internal class ControlCommandTracking private constructor() {
     val lifetimeId = OwnerTrackingLifetimeId.issue()
@@ -54,6 +61,7 @@ internal class ControlCommandTracking private constructor() {
 
     internal fun registerPrepared(command: CommandRef): CommandRef {
         check(command.ownerTrackingLifetimeId === lifetimeId) { "command belongs to another tracker lifetime" }
+        check(command.lifecycleState == ControlCommandLifecycle.RETAINED) { "closed command cannot be registered" }
         check(commands.putIfAbsent(command.id, TrackedControlCommand(command)) == null) {
             "command UUID collision; do not reissue an identity to hide it"
         }
@@ -65,13 +73,17 @@ internal class ControlCommandTracking private constructor() {
 
     // Also covers previous-lifetime references, which are not locally prepared commands.
     // This nonblocking lease refuses duplicate execution; the owner alone serializes storage.
-    val executing = ConcurrentHashMap.newKeySet<CommandRef>()
-    private val unresolved = AtomicReference<Set<CommandRef>>(emptySet())
-    fun isUnresolved(command: CommandRef): Boolean = command in unresolved.get()
-    fun markUnresolved(command: CommandRef) { unresolved.updateAndGet { it + command } }
-    fun resolve(command: CommandRef) { unresolved.updateAndGet { it - command } }
-    // One immutable set version, not a weakly consistent iteration across concurrent attempts.
-    fun snapshot(): Set<CommandRef> = Collections.unmodifiableSet(unresolved.get())
+    val executing: MutableSet<CommandRef> = ConcurrentHashMap.newKeySet()
+    private val recoveryWork = AtomicReference(LocalRecoveryWork(emptySet(), emptySet()))
+    fun isUnresolved(command: CommandRef): Boolean = command in recoveryWork.get().unresolvedCommands
+    fun markUnresolved(command: CommandRef) {
+        recoveryWork.updateAndGet { LocalRecoveryWork(it.unresolvedCommands + command, it.pendingReleases) }
+    }
+    fun resolve(command: CommandRef) {
+        recoveryWork.updateAndGet { LocalRecoveryWork(it.unresolvedCommands - command, it.pendingReleases) }
+    }
+    fun recoverySnapshot(): LocalRecoveryWork = recoveryWork.get()
+    fun snapshot(): Set<CommandRef> = recoverySnapshot().unresolvedCommands
 
     companion object {
         private val collected = ReferenceQueue<DataStoreAccessEpochStore>()
@@ -101,4 +113,10 @@ internal class ControlCommandTracking private constructor() {
             }
         }
     }
+}
+
+/** Both memberships come from one immutable version; this does not snapshot ref lifecycles. */
+internal class LocalRecoveryWork(unresolvedCommands: Set<CommandRef>, pendingReleases: Set<CommandRef>) {
+    val unresolvedCommands: Set<CommandRef> = Collections.unmodifiableSet(unresolvedCommands.toSet())
+    val pendingReleases: Set<CommandRef> = Collections.unmodifiableSet(pendingReleases.toSet())
 }

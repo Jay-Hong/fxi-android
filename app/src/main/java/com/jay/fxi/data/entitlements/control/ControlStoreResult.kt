@@ -1,6 +1,9 @@
 package com.jay.fxi.data.entitlements.control
 
 import com.jay.fxi.data.entitlements.RecordTransactionEvidence
+import java.util.concurrent.atomic.AtomicReference
+
+internal enum class ControlCommandLifecycle { RETAINED, RELEASE_PENDING, RELEASED }
 
 /** Prepared identity and fixed inputs, never evidence that an attempt executed. */
 internal class CommandRef internal constructor(
@@ -8,6 +11,19 @@ internal class CommandRef internal constructor(
     val body: ControlCommandBody,
     val ownerTrackingLifetimeId: OwnerTrackingLifetimeId
 ) {
+    private val lifecycle = AtomicReference(ControlCommandLifecycle.RETAINED)
+    val lifecycleState: ControlCommandLifecycle get() = lifecycle.get()
+
+    // Deliberately private and uncalled in unit 1. Only test-source reflection can exercise these
+    // transitions until an owner-confirmed reclamation path is implemented in unit 2.
+    private fun beginRelease() {
+        check(lifecycle.compareAndSet(ControlCommandLifecycle.RETAINED, ControlCommandLifecycle.RELEASE_PENDING))
+    }
+
+    private fun completeRelease() {
+        check(lifecycle.compareAndSet(ControlCommandLifecycle.RELEASE_PENDING, ControlCommandLifecycle.RELEASED))
+    }
+
     init {
         require(body !is ControlCommandBody.RotateAndSettle || id == body.input.operationId) {
             "rotation command id must equal operationId"
@@ -52,6 +68,9 @@ internal enum class UnconfirmedReason { StorageFailure, HistoryUnavailable }
 internal enum class ControlAttemptPhase { ReadingSnapshot, PreparingCandidate, ConfirmingStorage }
 
 /**
+ * localPendingReleases enumerates confirmed business commands whose management removal is pending.
+ * It is separate from localUnresolvedCommands; business success never clears pending releases.
+ * Both sets are immutable memberships from one local recovery snapshot, not a lifecycle snapshot.
  * localUnresolvedCommands covers only this store owner's in-memory tracking lifetime. Empty does
  * not prove absence of earlier commands, clean continuity, settlement or permission to enter.
  * A rejection/conflict may coexist with an earlier unconfirmed attempt of the same command.
@@ -62,10 +81,12 @@ internal enum class ControlAttemptPhase { ReadingSnapshot, PreparingCandidate, C
 internal sealed interface ControlStoreResult {
     val command: CommandRef
     val localUnresolvedCommands: Set<CommandRef>
+    val localPendingReleases: Set<CommandRef>
 
     data class Confirmed(
         override val command: CommandRef,
         override val localUnresolvedCommands: Set<CommandRef>,
+        override val localPendingReleases: Set<CommandRef>,
         val effect: ConfirmedEffect,
         val effectiveIds: List<String>,
         val snapshot: ConfirmedControlSnapshot,
@@ -76,6 +97,7 @@ internal sealed interface ControlStoreResult {
     data class Rejected(
         override val command: CommandRef,
         override val localUnresolvedCommands: Set<CommandRef>,
+        override val localPendingReleases: Set<CommandRef>,
         val reason: RejectionReason,
         val observation: ControlRecordRead?
     ) : ControlStoreResult
@@ -83,6 +105,7 @@ internal sealed interface ControlStoreResult {
     data class Conflict(
         override val command: CommandRef,
         override val localUnresolvedCommands: Set<CommandRef>,
+        override val localPendingReleases: Set<CommandRef>,
         val reason: ConflictReason,
         val expected: TargetExpectation,
         val observation: ControlRecordRead.Supported
@@ -91,6 +114,7 @@ internal sealed interface ControlStoreResult {
     data class RecoveryRequired(
         override val command: CommandRef,
         override val localUnresolvedCommands: Set<CommandRef>,
+        override val localPendingReleases: Set<CommandRef>,
         val reason: RecoveryReason,
         val observation: ControlRecordRead
     ) : ControlStoreResult
@@ -98,9 +122,23 @@ internal sealed interface ControlStoreResult {
     data class Unconfirmed(
         override val command: CommandRef,
         override val localUnresolvedCommands: Set<CommandRef>,
+        override val localPendingReleases: Set<CommandRef>,
         val reason: UnconfirmedReason,
         val phase: ControlAttemptPhase,
         val lastObservation: ControlRecordRead?,
         val failure: java.io.IOException? = null
+    ) : ControlStoreResult
+
+    /** Execution is closed; these results issue no business snapshot, effect or storage proof. */
+    data class ReleasePending(
+        override val command: CommandRef,
+        override val localUnresolvedCommands: Set<CommandRef>,
+        override val localPendingReleases: Set<CommandRef>
+    ) : ControlStoreResult
+
+    data class Released(
+        override val command: CommandRef,
+        override val localUnresolvedCommands: Set<CommandRef>,
+        override val localPendingReleases: Set<CommandRef>
     ) : ControlStoreResult
 }

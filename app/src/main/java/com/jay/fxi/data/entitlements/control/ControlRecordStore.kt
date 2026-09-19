@@ -67,7 +67,9 @@ internal class ControlRecordStore(
         return tracking.registerPrepared(command)
     }
 
-    fun checkpoint(command: CommandRef): ControlCommandCheckpoint? = tracking.findPrepared(command)
+    fun checkpoint(command: CommandRef): ControlCommandCheckpoint? {
+        if (command.lifecycleState != ControlCommandLifecycle.RETAINED) return null
+        return tracking.findPrepared(command)
         ?.takeIf { command.body is ControlCommandBody.Mutations }
         ?.let {
             // Targets only advance from null to fixed values, before the flag becomes true.
@@ -75,6 +77,7 @@ internal class ControlRecordStore(
             val requested = it.confirmationRequested.get()
             ControlCommandCheckpoint(command, it.targets.get(), requested)
         }
+    }
 
     /**
      * Missing own seals can be retried. A replacement same-key seal or a new NAMESPACE append whose
@@ -145,11 +148,31 @@ internal class ControlRecordStore(
         confirmOnly: Boolean,
         context: AttemptContext?
     ): ControlStoreResult {
-        val known = tracking.findPrepared(command)
-        val tracked = known ?: TrackedControlCommand(command)
+        terminalResult(command)?.let { return it }
         check(tracking.executing.add(command)) { "the same command is already executing" }
-        val wasUnresolved = tracking.isUnresolved(command)
-        tracking.markUnresolved(command)
+        try {
+            // Re-read after acquiring the lease, before even temporarily adding unresolved work.
+            terminalResult(command)?.let { return it }
+            val known = tracking.findPrepared(command)
+            val tracked = known ?: TrackedControlCommand(command)
+            val wasUnresolved = tracking.isUnresolved(command)
+            tracking.markUnresolved(command)
+            return attempt(command, checkpoint, confirmOnly, context, known, tracked, wasUnresolved)
+        } finally {
+            // Unexpected programming exceptions propagate; their attempt remains conservatively unresolved.
+            tracking.executing.remove(command)
+        }
+    }
+
+    private suspend fun attempt(
+        command: CommandRef,
+        checkpoint: ControlCommandCheckpoint?,
+        confirmOnly: Boolean,
+        context: AttemptContext?,
+        known: TrackedControlCommand?,
+        tracked: TrackedControlCommand,
+        wasUnresolved: Boolean
+    ): ControlStoreResult {
         val observation = AtomicReference<ControlRecordRead?>(null)
         val phase = AtomicReference(ControlAttemptPhase.ReadingSnapshot)
         try {
@@ -158,7 +181,7 @@ internal class ControlRecordStore(
                 tracking.observe(read)
                 observation.set(read)
                 if (read !is ControlRecordRead.Supported) {
-                    negative(ControlStoreResult.RecoveryRequired(command, emptySet(), when (read) {
+                    negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), when (read) {
                         is ControlRecordRead.MigrationOrRecoveryRequired -> RecoveryReason.MigrationOrRecovery
                         else -> RecoveryReason.UnreadableRecord
                     }, read))
@@ -182,22 +205,22 @@ internal class ControlRecordStore(
                         }
                     }
                     if (ControlAppliedEvidence.hasOpaqueOwn(read, command)) return@transactRecord negative(
-                        ControlStoreResult.RecoveryRequired(command, emptySet(), RecoveryReason.UninterpretableMetadata, read))
+                        ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), RecoveryReason.UninterpretableMetadata, read))
                     var onlyConfirm = confirmOnly
                     if (own != null) {
                         if (!ControlAppliedEvidence.matches(command, tracked, own)) return@transactRecord negative(
-                            ControlStoreResult.Conflict(command, emptySet(), ConflictReason.CommandEvidenceMismatch,
+                            ControlStoreResult.Conflict(command, emptySet(), emptySet(), ConflictReason.CommandEvidenceMismatch,
                                 TargetExpectation(command, tracked.targets.get().map { it?.id }), read))
                         onlyConfirm = true
                     } else if (tracked.observedApplied.get()) {
-                        return@transactRecord negative(ControlStoreResult.RecoveryRequired(command, emptySet(),
+                        return@transactRecord negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(),
                             RecoveryReason.CommandEvidenceLost, read))
                     } else if (tracked.confirmed.get()) {
                         onlyConfirm = true
                     } else if (!confirmOnly && tracked.firstConfirmDiscontinuityCount?.let {
                             it != tracking.evidenceDiscontinuityCount
                         } == true) {
-                        return@transactRecord negative(ControlStoreResult.RecoveryRequired(command, emptySet(),
+                        return@transactRecord negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(),
                             RecoveryReason.CommandEvidenceContinuityLost, read))
                     }
                     val decision = if (rotation != null) {
@@ -221,26 +244,38 @@ internal class ControlRecordStore(
                     if (ControlAppliedEvidence.own(confirmedSnapshot.record, command) != null) tracked.observedApplied.set(true)
                     tracked.confirmed.set(true)
                     tracking.resolve(command)
+                    val work = tracking.recoverySnapshot()
                     ControlStoreResult.Confirmed(
-                        command, tracking.snapshot(), outcome.effect, outcome.ids,
+                        command, work.unresolvedCommands, work.pendingReleases, outcome.effect, outcome.ids,
                         confirmedSnapshot,
                         ConfirmationProof(transaction.evidence), outcome.settlement
                     )
                 }
                 is Outcome.Negative -> {
                     if (!wasUnresolved && outcome.result !is ControlStoreResult.Unconfirmed) tracking.resolve(command)
-                    outcome.result.withUnresolved(tracking.snapshot())
+                    outcome.result.withRecoveryWork(tracking.recoverySnapshot())
                 }
             }
         } catch (cancelled: CancellationException) {
             // Targets are published before requesting persistence, even if this caller never returns.
             throw cancelled
         } catch (failure: IOException) {
-            return ControlStoreResult.Unconfirmed(command, tracking.snapshot(), UnconfirmedReason.StorageFailure,
+            val work = tracking.recoverySnapshot()
+            return ControlStoreResult.Unconfirmed(command, work.unresolvedCommands, work.pendingReleases, UnconfirmedReason.StorageFailure,
                 phase.get(), observation.get(), failure)
-        } finally {
-            // Unexpected programming exceptions propagate; their attempt remains conservatively unresolved.
-            tracking.executing.remove(command)
+        }
+    }
+
+    private fun terminalResult(command: CommandRef): ControlStoreResult? {
+        val state = command.lifecycleState
+        if (state == ControlCommandLifecycle.RETAINED) return null
+        val work = tracking.recoverySnapshot()
+        return when (state) {
+            ControlCommandLifecycle.RELEASE_PENDING -> ControlStoreResult.ReleasePending(
+                command, work.unresolvedCommands, work.pendingReleases)
+            ControlCommandLifecycle.RELEASED -> ControlStoreResult.Released(
+                command, work.unresolvedCommands, work.pendingReleases)
+            ControlCommandLifecycle.RETAINED -> error("retained command passed terminal gate")
         }
     }
 
@@ -250,9 +285,9 @@ internal class ControlRecordStore(
         read: ControlRecordRead.Supported,
         confirmOnly: Boolean
     ): RecordTransactionDecision<Outcome> {
-        fun reject(detail: String) = negative(ControlStoreResult.Rejected(command, emptySet(),
+        fun reject(detail: String) = negative(ControlStoreResult.Rejected(command, emptySet(), emptySet(),
             RejectionReason.InvalidRequest(detail), read))
-        fun conflict(reason: ConflictReason) = negative(ControlStoreResult.Conflict(command, emptySet(), reason,
+        fun conflict(reason: ConflictReason) = negative(ControlStoreResult.Conflict(command, emptySet(), emptySet(), reason,
             TargetExpectation(command, Collections.unmodifiableList(tracked.targets.get().map { it?.id })), read))
 
         if (command.actions.isEmpty()) return reject("at least one operation is required")
@@ -337,9 +372,9 @@ internal class ControlRecordStore(
                         if (desiredFacts is SealV1 && desiredFacts.kind == SealTargetKind.NAMESPACE) {
                             val epochKey = if (desiredFacts.key.axis == PurgeScope.USER) USER_EPOCH else KRX_EPOCH
                             if (!read.original.validType<String>(OWNER_UID)) return negative(ControlStoreResult.RecoveryRequired(
-                                command, emptySet(), RecoveryReason.UnreadableEpochState, read))
+                                command, emptySet(), emptySet(), RecoveryReason.UnreadableEpochState, read))
                             if (!read.original.validType<String>(epochKey)) return negative(ControlStoreResult.RecoveryRequired(
-                                command, emptySet(), RecoveryReason.UnreadableEpochState, read))
+                                command, emptySet(), emptySet(), RecoveryReason.UnreadableEpochState, read))
                             if (read.original[OWNER_UID] != desiredFacts.key.ownerUid) return conflict(ConflictReason.TargetChanged)
                             if (read.original[epochKey] != desiredFacts.key.epoch) return conflict(ConflictReason.TargetChanged)
                         }
@@ -370,9 +405,9 @@ internal class ControlRecordStore(
         }
 
         if (changedKinds.isNotEmpty() && read.schemaVersion != 2) return negative(
-            ControlStoreResult.RecoveryRequired(command, emptySet(), RecoveryReason.ControlSchemaMigrationRequired, read))
+            ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), RecoveryReason.ControlSchemaMigrationRequired, read))
         if (changedKinds.isNotEmpty() && read.hasUninterpretableMetadata) return negative(
-            ControlStoreResult.RecoveryRequired(command, emptySet(), RecoveryReason.UninterpretableMetadata, read))
+            ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), RecoveryReason.UninterpretableMetadata, read))
         val candidate = read.original.toMutablePreferences()
         for (kind in changedKinds) {
             // The codec's documented envelope precondition is an invalid candidate, not an I/O attempt.
@@ -382,7 +417,7 @@ internal class ControlRecordStore(
                 return reject("candidate violates codec envelope constraints")
             }
             when (encoded) {
-                is PayloadWrite.TooLarge -> return negative(ControlStoreResult.Rejected(command, emptySet(),
+                is PayloadWrite.TooLarge -> return negative(ControlStoreResult.Rejected(command, emptySet(), emptySet(),
                     RejectionReason.TooLarge(ControlPayloadKey.forKind(kind), encoded.bytes, encoded.limit), read))
                 is PayloadWrite.Encoded -> candidate[ControlRecordKeys.payload(kind)] = encoded.text
             }
@@ -394,7 +429,7 @@ internal class ControlRecordStore(
                         target.joined, index in writtenIndices)
                 })
             ControlAppliedEvidence.append(candidate, read, evidence, codec)?.let {
-                return negative(ControlStoreResult.Rejected(command, emptySet(), it, read))
+                return negative(ControlStoreResult.Rejected(command, emptySet(), emptySet(), it, read))
             }
         }
         val complete = reader.read(candidate) as? ControlRecordRead.Supported
@@ -468,15 +503,17 @@ internal class ControlRecordStore(
 
     private fun negative(result: ControlStoreResult) = RecordTransactionDecision.Observe<Outcome>(Outcome.Negative(result))
     private fun historyUnavailable(command: CommandRef, read: ControlRecordRead) = negative(
-        ControlStoreResult.Unconfirmed(command, emptySet(), UnconfirmedReason.HistoryUnavailable,
+        ControlStoreResult.Unconfirmed(command, emptySet(), emptySet(), UnconfirmedReason.HistoryUnavailable,
             ControlAttemptPhase.PreparingCandidate, read))
 
-    private fun ControlStoreResult.withUnresolved(commands: Set<CommandRef>): ControlStoreResult = when (this) {
-        is ControlStoreResult.Rejected -> copy(localUnresolvedCommands = commands)
-        is ControlStoreResult.Conflict -> copy(localUnresolvedCommands = commands)
-        is ControlStoreResult.RecoveryRequired -> copy(localUnresolvedCommands = commands)
-        is ControlStoreResult.Unconfirmed -> copy(localUnresolvedCommands = commands)
+    private fun ControlStoreResult.withRecoveryWork(work: LocalRecoveryWork): ControlStoreResult = when (this) {
+        is ControlStoreResult.Rejected -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
+        is ControlStoreResult.Conflict -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
+        is ControlStoreResult.RecoveryRequired -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
+        is ControlStoreResult.Unconfirmed -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
         is ControlStoreResult.Confirmed -> error("positive results are published after storage confirmation")
+        is ControlStoreResult.ReleasePending, is ControlStoreResult.Released ->
+            error("terminal results cannot be storage outcomes")
     }
 
     private fun ControlEntryRead.originalEntry(): PayloadEntry = when (this) {
