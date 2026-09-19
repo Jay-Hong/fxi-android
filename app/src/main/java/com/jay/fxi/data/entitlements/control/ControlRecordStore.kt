@@ -47,7 +47,7 @@ internal class ControlRecordStore(
         ControlMutation.Edit.floor(expected, now, waitMillis, origin)
 
     fun prepare(vararg actions: ControlMutation): CommandRef {
-        val command = CommandRef(ids.next().toString(), actions.toList())
+        val command = CommandRef(ids.next().toString(), actions.toList(), tracking.lifetimeId)
         return tracking.registerPrepared(command)
     }
 
@@ -63,7 +63,7 @@ internal class ControlRecordStore(
         val input = RotateAndSettleNamespaces(targets, before, origin, demand, operationId, demandId,
             if (PurgeScope.USER in axes) ids.next().toString() else null,
             if (PurgeScope.CAPABILITY in axes) ids.next().toString() else null)
-        val command = CommandRef(operationId, ControlCommandBody.RotateAndSettle(input))
+        val command = CommandRef(operationId, ControlCommandBody.RotateAndSettle(input), tracking.lifetimeId)
         return tracking.registerPrepared(command)
     }
 
@@ -102,6 +102,25 @@ internal class ControlRecordStore(
     suspend fun confirmPrevious(command: CommandRef, checkpoint: ControlCommandCheckpoint? = null): ControlStoreResult =
         run(command, checkpoint, confirmOnly = true, context = null)
 
+    suspend fun upgradeControlSchemaV1ToV2(): ControlSchemaUpgradeResult {
+        var observation: ControlRecordRead? = null
+        return try {
+            val transaction = owner.transactRecord { snapshot ->
+                val read = reader.read(snapshot)
+                tracking.observe(read)
+                observation = read
+                UpgradeControlSchemaV1ToV2.decide(read)
+            }
+            val reason = transaction.value
+            if (reason != null) ControlSchemaUpgradeResult.RecoveryRequired(reason, checkNotNull(observation))
+            else ControlSchemaUpgradeResult.Confirmed(
+                ConfirmedControlSnapshot(reader.read(transaction.snapshot) as ControlRecordRead.Supported),
+                ConfirmationProof(transaction.evidence))
+        } catch (failure: IOException) {
+            ControlSchemaUpgradeResult.Unconfirmed(observation, failure)
+        }
+    }
+
     private suspend fun run(
         command: CommandRef,
         checkpoint: ControlCommandCheckpoint?,
@@ -118,6 +137,7 @@ internal class ControlRecordStore(
         try {
             val transaction = owner.transactRecord { snapshot ->
                 val read = reader.read(snapshot)
+                tracking.observe(read)
                 observation.set(read)
                 if (read !is ControlRecordRead.Supported) {
                     negative(ControlStoreResult.RecoveryRequired(command, emptySet(), when (read) {
@@ -126,43 +146,61 @@ internal class ControlRecordStore(
                     }, read))
                 } else if (known == null && !confirmOnly) {
                     historyUnavailable(command, read)
-                } else if (read.schemaVersion != 1) {
-                    negative(ControlStoreResult.RecoveryRequired(command, emptySet(),
-                        RecoveryReason.ControlWriterUpgradeRequired, read))
                 } else {
                     phase.set(ControlAttemptPhase.PreparingCandidate)
                     val rotation = command.body as? ControlCommandBody.RotateAndSettle
-                    if (rotation != null) {
-                        NamespaceSettlementTransition(codec).decide(command, rotation.input, read, context,
-                            confirmOnly, tracked.confirmed.get()).also {
-                            if (it is RecordTransactionDecision.Confirm) {
-                                tracked.confirmationRequested.set(true)
-                                phase.set(ControlAttemptPhase.ConfirmingStorage)
-                            }
-                        }
-                    } else if (confirmOnly) {
+                    val own = ControlAppliedEvidence.own(read, command)
+                    // Preserve actual observation even when checkpoint admission later refuses confirmation.
+                    if (own != null) tracked.observedApplied.set(true)
+                    if (confirmOnly && rotation == null) {
                         if (checkpoint?.command !== command || !checkpoint.confirmationRequested ||
-                            checkpoint.targets.size != command.actions.size || checkpoint.targets.any { it == null }
-                        ) {
-                            historyUnavailable(command, read)
-                        } else if ((known != null && !matchesLocalHistory(tracked, checkpoint)) ||
+                            checkpoint.targets.size != command.actions.size || checkpoint.targets.any { it == null } ||
+                            (known != null && !matchesLocalHistory(tracked, checkpoint)) ||
                             !matchesPreparedActions(command, checkpoint)
-                        ) {
-                            historyUnavailable(command, read)
-                        } else {
-                            if (known == null) {
-                                // Only the temporary previous-lifetime tracker imports caller evidence.
-                                tracked.targets.set(checkpoint.targets)
-                                tracked.confirmationRequested.set(true)
-                            }
-                            decide(command, tracked, read, confirmOnly = true, phase)
+                        ) return@transactRecord historyUnavailable(command, read)
+                        if (known == null) {
+                            tracked.targets.set(checkpoint.targets)
+                            tracked.confirmationRequested.set(true)
                         }
-                    } else decide(command, tracked, read, confirmOnly = false, phase)
+                    }
+                    if (ControlAppliedEvidence.hasOpaqueOwn(read, command)) return@transactRecord negative(
+                        ControlStoreResult.RecoveryRequired(command, emptySet(), RecoveryReason.UninterpretableMetadata, read))
+                    var onlyConfirm = confirmOnly
+                    if (own != null) {
+                        if (!ControlAppliedEvidence.matches(command, tracked, own)) return@transactRecord negative(
+                            ControlStoreResult.Conflict(command, emptySet(), ConflictReason.CommandEvidenceMismatch,
+                                TargetExpectation(command, tracked.targets.get().map { it?.id }), read))
+                        onlyConfirm = true
+                    } else if (tracked.observedApplied.get()) {
+                        return@transactRecord negative(ControlStoreResult.RecoveryRequired(command, emptySet(),
+                            RecoveryReason.CommandEvidenceLost, read))
+                    } else if (tracked.confirmed.get()) {
+                        onlyConfirm = true
+                    } else if (!confirmOnly && tracked.firstConfirmDiscontinuityCount?.let {
+                            it != tracking.evidenceDiscontinuityCount
+                        } == true) {
+                        return@transactRecord negative(ControlStoreResult.RecoveryRequired(command, emptySet(),
+                            RecoveryReason.CommandEvidenceContinuityLost, read))
+                    }
+                    val decision = if (rotation != null) {
+                        NamespaceSettlementTransition(codec).decide(command, rotation.input, read, context,
+                            onlyConfirm, tracked.confirmed.get())
+                    } else decide(command, tracked, read, onlyConfirm)
+                    if (decision is RecordTransactionDecision.Confirm) {
+                        // All candidate checks are complete. This precedes write-scope entry and cancellation.
+                        if (known != null) tracked.bindFirstConfirm(tracking.evidenceDiscontinuityCount)
+                        tracked.expectedApplied = ControlAppliedEvidence.own(
+                            reader.read(decision.candidate) as ControlRecordRead.Supported, command)
+                        tracked.confirmationRequested.set(true)
+                        phase.set(ControlAttemptPhase.ConfirmingStorage)
+                    }
+                    decision
                 }
             }
             return when (val outcome = transaction.value) {
                 is Outcome.Positive -> {
                     val confirmedSnapshot = ConfirmedControlSnapshot(reader.read(transaction.snapshot) as ControlRecordRead.Supported)
+                    if (ControlAppliedEvidence.own(confirmedSnapshot.record, command) != null) tracked.observedApplied.set(true)
                     tracked.confirmed.set(true)
                     tracking.resolve(command)
                     ControlStoreResult.Confirmed(
@@ -192,8 +230,7 @@ internal class ControlRecordStore(
         command: CommandRef,
         tracked: TrackedControlCommand,
         read: ControlRecordRead.Supported,
-        confirmOnly: Boolean,
-        phase: AtomicReference<ControlAttemptPhase>
+        confirmOnly: Boolean
     ): RecordTransactionDecision<Outcome> {
         fun reject(detail: String) = negative(ControlStoreResult.Rejected(command, emptySet(),
             RejectionReason.InvalidRequest(detail), read))
@@ -206,6 +243,7 @@ internal class ControlRecordStore(
         val effectiveIds = mutableListOf<String>()
         val requestedSealKeys = mutableSetOf<SealKey>()
         val targets = tracked.targets.get().toMutableList()
+        val writtenIndices = mutableSetOf<Int>()
         var joined = false
         val mayConfirmPostcondition = tracked.confirmationRequested.get()
 
@@ -288,6 +326,7 @@ internal class ControlRecordStore(
                             if (read.original[epochKey] != desiredFacts.key.epoch) return conflict(ConflictReason.TargetChanged)
                         }
                         array += desired.node.toPayloadEntry()
+                        writtenIndices += actionIndex
                         changedKinds += action.kind
                     } else {
                         if (!mayConfirmPostcondition) return conflict(ConflictReason.IdCollision)
@@ -302,6 +341,7 @@ internal class ControlRecordStore(
                             if (tracked.confirmed.get()) return conflict(ConflictReason.TargetChanged)
                             val index = read.arrays.getValue(action.kind).entries.indexOf(current)
                             array[index] = desired.node.toPayloadEntry()
+                            writtenIndices += actionIndex
                             changedKinds += action.kind
                         }
                     } else if (!mayConfirmPostcondition || !same(current.original, target.postcondition)) {
@@ -311,6 +351,10 @@ internal class ControlRecordStore(
             }
         }
 
+        if (changedKinds.isNotEmpty() && read.schemaVersion != 2) return negative(
+            ControlStoreResult.RecoveryRequired(command, emptySet(), RecoveryReason.ControlSchemaMigrationRequired, read))
+        if (changedKinds.isNotEmpty() && read.hasUninterpretableMetadata) return negative(
+            ControlStoreResult.RecoveryRequired(command, emptySet(), RecoveryReason.UninterpretableMetadata, read))
         val candidate = read.original.toMutablePreferences()
         for (kind in changedKinds) {
             // The codec's documented envelope precondition is an invalid candidate, not an I/O attempt.
@@ -325,11 +369,20 @@ internal class ControlRecordStore(
                 is PayloadWrite.Encoded -> candidate[ControlRecordKeys.payload(kind)] = encoded.text
             }
         }
+        if (changedKinds.isNotEmpty()) {
+            val evidence = AppliedEvidence.Mutations(command.id, command.ownerTrackingLifetimeId.value,
+                targets.mapIndexed { index, target ->
+                    AppliedTarget(index, command.actions[index].kind, checkNotNull(target).id,
+                        target.joined, index in writtenIndices)
+                })
+            ControlAppliedEvidence.append(candidate, read, evidence, codec)?.let {
+                return negative(ControlStoreResult.Rejected(command, emptySet(), it, read))
+            }
+        }
         val complete = reader.read(candidate) as? ControlRecordRead.Supported
             ?: return reject("the complete candidate must remain a supported record")
         candidateRejection(command, complete, effectiveIds, targets)?.let { return reject(it.detail) }
-        tracked.confirmationRequested.set(true)
-        phase.set(ControlAttemptPhase.ConfirmingStorage)
+        if (changedKinds.isNotEmpty() && complete.hasUninterpretableMetadata) return reject("invalid candidate evidence")
         val effect = when {
             changedKinds.isNotEmpty() -> ConfirmedEffect.AppliedThisAttempt
             joined && !mayConfirmPostcondition -> ConfirmedEffect.JoinedExisting

@@ -116,6 +116,8 @@ class NamespaceSettlementIntegrationTest {
             this[SEAL] = "[${targets.indices.joinToString(",") { withWitness(targets[it].toPayloadEntry().fields.toString(), NamespaceSettlementOracle.witness(spec.seals[it].key.axis, axes.size == 2)).toPayloadEntry().fields.toString() }},$sibling,$opaque]"
             this[DEMAND] = "[${ControlObligationFixtures.guard},${ControlObligationFixtures.request},{\"id\":\"$demandId\",\"kind\":\"REQUEST\",\"ownerUid\":\"A\",\"binding\":3,\"originLifetimeId\":\"life\",\"raisedAt\":7,\"intent\":\"${spec.demand.intent}\"}]"
         }
+        expected[ControlRecordKeys.payload(ControlPayloadKey.COMMAND_EVIDENCE)] =
+            """[{"version":2,"commandId":"$operation","ownerTrackingLifetimeId":"${c.ownerTrackingLifetimeId.value}","kind":"ROTATION","sealIds":[${spec.seals.joinToString(",") { "\"${it.id}\"" }}],"demandId":"$demandId"}]"""
         assertEquals(expected, result.snapshot.record.original)
         assertEquals(expected, disk())
         val receipt = result.settlement!!
@@ -265,7 +267,7 @@ class NamespaceSettlementIntegrationTest {
         confirmed(o.control.execute(c, context), ConfirmedEffect.AppliedThisAttempt)
         o.data.updateData { before }; val writes = o.storage.writes
         val result = o.control.execute(c, context)
-        negative(result, ConflictReason.TargetChanged); assertTrue(result.localUnresolvedCommands.isEmpty())
+        negative(result, RecoveryReason.CommandEvidenceLost); assertTrue(result.localUnresolvedCommands.isEmpty())
         assertEquals(before, disk()); assertEquals(writes, o.storage.writes)
     }
 

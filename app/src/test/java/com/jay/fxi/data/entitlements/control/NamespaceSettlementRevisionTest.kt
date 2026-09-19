@@ -69,7 +69,7 @@ class NamespaceSettlementRevisionTest {
     private val opened = mutableListOf<ControlStoreTestStorage>()
     private fun open() = ControlStoreTestStorage(File(folder.root, "revision-${opened.size}.preferences_pb")).also { opened += it }
     @After fun close() = runBlocking { opened.forEach { it.close() } }
-    private fun ref(spec: RotateAndSettleNamespaces) = CommandRef(spec.operationId, ControlCommandBody.RotateAndSettle(spec))
+    private fun ref(spec: RotateAndSettleNamespaces) = CommandRef(spec.operationId, ControlCommandBody.RotateAndSettle(spec), NamespaceSettlementFixtures.trackerLife)
     private fun decision(spec: RotateAndSettleNamespaces, source: Preferences = raw(), attempt: AttemptContext? = context,
         confirmOnly: Boolean = false) = transition.decide(ref(spec), spec,
         ControlRecordReader().read(source) as ControlRecordRead.Supported, attempt, confirmOnly, false)
@@ -160,7 +160,7 @@ class NamespaceSettlementRevisionTest {
     }
 
     @Test fun commandIdentityMustEqualPersistedOperationIdentity() {
-        val error = runCatching { CommandRef("wrong", ControlCommandBody.RotateAndSettle(input())) }.exceptionOrNull()
+        val error = runCatching { CommandRef("wrong", ControlCommandBody.RotateAndSettle(input()), NamespaceSettlementFixtures.trackerLife) }.exceptionOrNull()
         assertEquals(IllegalArgumentException::class.java, error?.javaClass)
         assertEquals("rotation command id must equal operationId", error?.message)
         assertEquals(operation, ref(input()).id)

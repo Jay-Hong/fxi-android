@@ -5,14 +5,16 @@ import com.jay.fxi.data.entitlements.RecordTransactionEvidence
 /** Prepared identity and fixed inputs, never evidence that an attempt executed. */
 internal class CommandRef internal constructor(
     val id: String,
-    val body: ControlCommandBody
+    val body: ControlCommandBody,
+    val ownerTrackingLifetimeId: OwnerTrackingLifetimeId
 ) {
     init {
         require(body !is ControlCommandBody.RotateAndSettle || id == body.input.operationId) {
             "rotation command id must equal operationId"
         }
     }
-    internal constructor(id: String, actions: List<ControlMutation>) : this(id, ControlCommandBody.Mutations(actions))
+    internal constructor(id: String, actions: List<ControlMutation>, lifetime: OwnerTrackingLifetimeId) :
+        this(id, ControlCommandBody.Mutations(actions), lifetime)
     val actions: List<ControlMutation> get() = (body as? ControlCommandBody.Mutations)?.actions.orEmpty()
 }
 
@@ -38,11 +40,13 @@ internal sealed interface RejectionReason {
 }
 
 internal enum class ConflictReason {
-    IdCollision, TargetChanged, TargetMissing, UninterpretableTarget, AmbiguousSealKey, OperationIdCollision, IdentityTransitionPending
+    IdCollision, TargetChanged, TargetMissing, UninterpretableTarget, AmbiguousSealKey, OperationIdCollision, IdentityTransitionPending,
+    CommandEvidenceMismatch
 }
 
 internal enum class RecoveryReason {
-    MigrationOrRecovery, UnreadableRecord, ControlWriterUpgradeRequired, UnreadableEpochState, InconsistentSettlement, JournalMigrationRequired
+    MigrationOrRecovery, UnreadableRecord, ControlSchemaMigrationRequired, UnreadableEpochState, InconsistentSettlement, JournalMigrationRequired,
+    UninterpretableMetadata, CommandEvidenceLost, CommandEvidenceContinuityLost
 }
 internal enum class UnconfirmedReason { StorageFailure, HistoryUnavailable }
 internal enum class ControlAttemptPhase { ReadingSnapshot, PreparingCandidate, ConfirmingStorage }

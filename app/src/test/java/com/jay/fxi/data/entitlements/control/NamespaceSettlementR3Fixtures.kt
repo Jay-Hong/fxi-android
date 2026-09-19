@@ -63,7 +63,7 @@ internal object NamespaceSettlementR3Fixtures {
         if (owner == null) remove(OWNER_UID) else this[OWNER_UID] = owner
     }
     fun decide(spec: RotateAndSettleNamespaces, source: Preferences = raw(), attempt: AttemptContext? = context) =
-        transition.decide(CommandRef(spec.operationId, ControlCommandBody.RotateAndSettle(spec)), spec,
+        transition.decide(CommandRef(spec.operationId, ControlCommandBody.RotateAndSettle(spec), NamespaceSettlementFixtures.trackerLife), spec,
             ControlRecordReader().read(source) as ControlRecordRead.Supported, attempt, false, false)
     fun refusal(spec: RotateAndSettleNamespaces, source: Preferences, reason: Any, attempt: AttemptContext? = context) {
         val result = decide(spec, source, attempt)

@@ -44,7 +44,7 @@ class NamespaceSettlementWitnessPathTest(private val field: String) {
         val read = ControlRecordReader().read(raw(seals = jsonArray(withWitness(user, changed)))) as ControlRecordRead.Supported
         // D1 requires journal.axis == seal.key.axis; all other variants are valid D1 objects.
         assertEquals(field != "journal.axis", read.arrays.getValue(ControlKind.SEAL).entries.single() is ControlEntryRead.Interpreted)
-        val spec = input(); val command = CommandRef(spec.operationId, ControlCommandBody.RotateAndSettle(spec))
+        val spec = input(); val command = CommandRef(spec.operationId, ControlCommandBody.RotateAndSettle(spec), NamespaceSettlementFixtures.trackerLife)
         val decision = transition.decide(command, spec, read, context, false, false)
         assertEquals(RecordTransactionDecision.Observe::class.java, decision.javaClass)
         val reason = when (field) {

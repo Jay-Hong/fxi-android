@@ -319,7 +319,7 @@ class ControlRecordStoreTest {
     @Test fun incompleteFutureAndMistypedRecordsAreNeverNormalized() = runBlocking {
         val o = open()
         val command = o.control.addSeal()
-        for (variant in 0..6) {
+        for (variant in 0..5) {
             o.seed()
             o.data.edit { when (variant) {
                 0 -> it.remove(HOLD)
@@ -327,16 +327,11 @@ class ControlRecordStoreTest {
                 2 -> it[stringPreferencesKey("control_schema")] = "1"
                 3 -> it[DEMAND] = "malformed"
                 4 -> it.remove(SCHEMA)
-                5 -> it[SCHEMA] = 2
-                else -> {
-                    it[SCHEMA] = 2
-                    it[ControlRecordKeys.payload(ControlPayloadKey.COMMAND_EVIDENCE)] = "[]"
-                    it[ControlRecordKeys.payload(ControlPayloadKey.SCOPE_FENCE)] = "[]"
-                }
+                else -> it.remove(ControlRecordKeys.payload(ControlPayloadKey.COMMAND_EVIDENCE))
             } }
             val before = o.raw()
             val result = o.control.execute(command) as ControlStoreResult.RecoveryRequired
-            assertEquals(if (variant == 6) RecoveryReason.ControlWriterUpgradeRequired else RecoveryReason.UnreadableRecord, result.reason)
+            assertEquals(RecoveryReason.UnreadableRecord, result.reason)
             assertEquals(before, o.raw())
         }
     }
@@ -439,11 +434,11 @@ class ControlRecordStoreTest {
     @Test fun laterRejectionPreservesEarlierUncertaintyForTheSameCommand() = runBlocking {
         val o = open()
         o.seed(); o.currentNamespace()
-        val c = ControlRecordStore(o.owner, codec = ControlPayloadCodec(maxPayloadBytes = 180))
+        val c = ControlRecordStore(o.owner, codec = ControlPayloadCodec(maxPayloadBytes = 300))
         val command = c.addSeal()
         o.storage.before = true
         assertTrue(c.execute(command) is ControlStoreResult.Unconfirmed)
-        o.data.edit { it[SEAL] = "[${seal.replace("old", "other")}]" }
+        o.data.edit { it[SEAL] = "[${seal.replace("old", "other-" + "x".repeat(160))}]" }
         val rejected = c.execute(command) as ControlStoreResult.Rejected
         assertTrue(rejected.reason is RejectionReason.TooLarge)
         assertEquals(setOf(command), rejected.localUnresolvedCommands)
@@ -751,7 +746,10 @@ class ControlRecordStoreTest {
     @Test fun exactEncodedByteLimitIsAcceptedAndOneByteLessIsRejected() = runBlocking {
         val o = open()
         o.seed(); o.currentNamespace()
-        val command = o.control.addSeal()
+        val command = o.control.prepare(o.control.addition(ControlKind.SEAL) { id ->
+            literal(seal.replace("old", "o".repeat(300))); set("id", ControlScalar.Text(id))
+        })
+        o.data.edit { it[com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.USER_EPOCH] = "o".repeat(300) }
         val addition = command.actions.single() as ControlMutation.Add
         val text = ControlObligationFixtures.text((addition.built as ControlWriteResult.Written).node)
         val bytes = text.toByteArray(Charsets.UTF_8).size

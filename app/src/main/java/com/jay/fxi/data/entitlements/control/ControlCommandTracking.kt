@@ -3,7 +3,9 @@ package com.jay.fxi.data.entitlements.control
 import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore
 import java.lang.ref.ReferenceQueue
 import java.lang.ref.WeakReference
+import java.math.BigInteger
 import java.util.Collections
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -12,6 +14,21 @@ internal class TrackedControlCommand(val command: CommandRef) {
     val targets = AtomicReference<List<ControlCommandTarget?>>(List(command.actions.size) { null })
     val confirmationRequested = AtomicBoolean(false)
     val confirmed = AtomicBoolean(false)
+    val observedApplied = AtomicBoolean(false)
+    // Accessed only in the owner's synchronous decision, never at prepare or after return.
+    var firstConfirmDiscontinuityCount: BigInteger? = null
+        private set
+    var expectedApplied: AppliedEvidence? = null
+    fun bindFirstConfirm(count: BigInteger) {
+        if (firstConfirmDiscontinuityCount == null) firstConfirmDiscontinuityCount = count
+    }
+}
+
+/** Internal issuance is independent of command/epoch/origin generators. */
+internal class OwnerTrackingLifetimeId private constructor(val value: String) {
+    companion object {
+        fun issue(): OwnerTrackingLifetimeId = OwnerTrackingLifetimeId(UUID.randomUUID().toString())
+    }
 }
 
 /**
@@ -22,9 +39,21 @@ internal class TrackedControlCommand(val command: CommandRef) {
  * before pruning this potentially growing history, preserving unresolved references and fixed targets.
  */
 internal class ControlCommandTracking private constructor() {
+    val lifetimeId = OwnerTrackingLifetimeId.issue()
+    var evidenceDiscontinuityCount: BigInteger = BigInteger.ZERO
+        private set
+
+    /** Only actual owner snapshots count; candidate validation and returned snapshots do not. */
+    fun observe(read: ControlRecordRead) {
+        if (read !is ControlRecordRead.Supported || read.schemaVersion != 2) {
+            evidenceDiscontinuityCount = evidenceDiscontinuityCount.add(BigInteger.ONE)
+        }
+    }
+
     private val commands = ConcurrentHashMap<String, TrackedControlCommand>()
 
     internal fun registerPrepared(command: CommandRef): CommandRef {
+        check(command.ownerTrackingLifetimeId === lifetimeId) { "command belongs to another tracker lifetime" }
         check(commands.putIfAbsent(command.id, TrackedControlCommand(command)) == null) {
             "command UUID collision; do not reissue an identity to hide it"
         }

@@ -14,6 +14,7 @@ import kotlinx.serialization.json.Json
 import org.junit.Assert.*
 
 internal object NamespaceSettlementFixtures {
+    val trackerLife = OwnerTrackingLifetimeId.issue()
     val life = LifetimeId("life")
     val fence = FenceV1("A", "u", "k")
     val context = AttemptContext("A", 3, life, false, false)
@@ -32,7 +33,7 @@ internal object NamespaceSettlementFixtures {
         op: String = operation, did: String = demandId, u: String? = newUser, k: String? = newKrx
     ) = RotateAndSettleNamespaces(targets, before, origin, request, op, did, u, k)
 
-    fun raw(seals: String = "[$user]", requests: String = "[]", schema: Int = 1): Preferences = mutablePreferencesOf().apply {
+    fun raw(seals: String = "[$user]", requests: String = "[]", schema: Int = 2): Preferences = mutablePreferencesOf().apply {
         this[SCHEMA] = schema
         if (schema == 2) {
             this[ControlRecordKeys.payload(ControlPayloadKey.COMMAND_EVIDENCE)] = "[]"
@@ -52,7 +53,7 @@ internal object NamespaceSettlementFixtures {
     /** Test registration for fixed and deliberately invalid inputs; does not test production issuance. */
     fun command(o: ControlStoreTestStorage, input: RotateAndSettleNamespaces): CommandRef =
         ControlCommandTracking.forOwner(o.owner).registerPrepared(
-            CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input))
+            CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input), ControlCommandTracking.forOwner(o.owner).lifetimeId)
         )
 
     fun confirmed(result: ControlStoreResult, effect: ConfirmedEffect): ControlStoreResult.Confirmed {
@@ -83,8 +84,8 @@ internal object NamespaceSettlementFixtures {
         }
     }
 
-    fun settled(input: RotateAndSettleNamespaces, source: Preferences = raw()): Preferences {
-        val command = CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input))
+    fun settled(input: RotateAndSettleNamespaces, source: Preferences = raw(), lifetime: OwnerTrackingLifetimeId = trackerLife): Preferences {
+        val command = CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input), lifetime)
         val read = ControlRecordReader().read(source) as ControlRecordRead.Supported
         val result = transition.decide(command, input, read, context, false, false)
         return (result as com.jay.fxi.data.entitlements.RecordTransactionDecision.Confirm).candidate

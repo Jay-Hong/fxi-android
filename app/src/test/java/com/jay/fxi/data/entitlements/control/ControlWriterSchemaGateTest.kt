@@ -37,216 +37,123 @@ class ControlWriterSchemaGateTest {
         }
     }
 
-    @Test fun genericAndFacadeRotationGatesPreserveNewAndExistingUnresolvedHistory() = runBlocking {
-        for (kind in listOf("add", "edit", "floor", "rotation")) for (unresolved in listOf(false, true)) {
-            val o = ControlStoreTestStorage(File(folder.root, "$kind-$unresolved.preferences_pb"))
-            try {
-                seed(o, 1)
-                val command = prepare(o, kind)
-                val tracking = ControlCommandTracking.forOwner(o.owner)
-                val sibling = prepare(o, "add")
-                if (unresolved) {
-                    o.storage.before = true
-                    val failed = o.control.execute(command, NamespaceSettlementFixtures.context)
-                    assertEquals(ControlStoreResult.Unconfirmed::class.java, failed.javaClass)
-                    failed as ControlStoreResult.Unconfirmed
-                    assertEquals(UnconfirmedReason.StorageFailure, failed.reason)
-                    assertEquals(ControlAttemptPhase.ConfirmingStorage, failed.phase)
-                    assertEquals(java.io.IOException::class.java, failed.failure?.javaClass)
-                    assertEquals("before write block", failed.failure?.message)
-                    o.storage.before = false
-                    tracking.markUnresolved(sibling)
-                }
-                seed(o, 2)
-                val before = o.raw()
-                val writes = o.storage.writes
-                val members = tracking.snapshot()
-                val tracked = tracking.findPrepared(command)!!
-                val targets = tracked.targets.get()
-                val requested = tracked.confirmationRequested.get()
-                for (confirm in listOf(false, true)) {
-                    val result = if (confirm) o.control.confirmPrevious(command, o.control.checkpoint(command))
-                        else o.control.execute(command, NamespaceSettlementFixtures.context)
-                    assertEquals(ControlStoreResult.RecoveryRequired::class.java, result.javaClass)
-                    result as ControlStoreResult.RecoveryRequired
-                    assertSame(command, result.command)
-                    assertEquals(RecoveryReason.ControlWriterUpgradeRequired, result.reason)
-                    assertEquals(before, result.observation.original)
-                    assertEquals(2, (result.observation as ControlRecordRead.Supported).schemaVersion)
-                    assertEquals(members, result.localUnresolvedCommands)
-                    assertEquals(members, tracking.snapshot())
-                    assertEquals(before, o.raw())
-                    assertEquals(writes, o.storage.writes)
-                    assertSame(targets, tracked.targets.get()) // candidate dispatch would capture targets
-                    assertEquals(requested, tracked.confirmationRequested.get())
-                    assertFalse(tracked.confirmed.get())
-                    assertTrue(tracking.executing.isEmpty())
-                }
-                seed(o, 1)
-                val allowed = o.control.execute(command, NamespaceSettlementFixtures.context)
-                assertEquals("$kind/$unresolved: $allowed", ControlStoreResult.Confirmed::class.java, allowed.javaClass)
-                allowed as ControlStoreResult.Confirmed
-                assertEquals(ConfirmedEffect.AppliedThisAttempt, allowed.effect)
-                assertSame(command, allowed.command)
-                assertEquals(1, allowed.snapshot.record.schemaVersion)
-                assertFalse(command in allowed.localUnresolvedCommands)
-            } finally { o.close() }
-        }
-    }
+    @Test fun addRequiresMigrationForNewEffect() = assertNewEffectRequiresMigration("add")
+    @Test fun editRequiresMigrationForNewEffect() = assertNewEffectRequiresMigration("edit")
+    @Test fun floorRequiresMigrationForNewEffect() = assertNewEffectRequiresMigration("floor")
+    @Test fun facadeRotationRequiresMigrationForNewEffect() = assertNewEffectRequiresMigration("rotation")
 
-    @Test fun completedCommandsAndPreviousReferencesStillCannotConfirmV2() = runBlocking {
-        for (kind in listOf("add", "rotation")) {
-            val o = ControlStoreTestStorage(File(folder.root, "confirmed-$kind.preferences_pb"))
-            try {
-                seed(o, 1)
-                val command = prepare(o, kind)
-                val first = o.control.execute(command, NamespaceSettlementFixtures.context) as ControlStoreResult.Confirmed
-                val checkpoint = o.control.checkpoint(command)
-                o.data.edit {
-                    it[ControlStoreTestStorage.SCHEMA] = 2
-                    it[ControlRecordKeys.payload(ControlPayloadKey.COMMAND_EVIDENCE)] = "[]"
-                    it[ControlRecordKeys.payload(ControlPayloadKey.SCOPE_FENCE)] = "[]"
-                }
-                val before = o.raw(); val writes = o.storage.writes
-                for (result in listOf(o.control.execute(command), o.control.confirmPrevious(command, checkpoint))) {
-                    assertEquals(ControlStoreResult.RecoveryRequired::class.java, result.javaClass)
-                    result as ControlStoreResult.RecoveryRequired
-                    assertEquals(RecoveryReason.ControlWriterUpgradeRequired, result.reason)
-                    assertEquals(before, result.observation.original)
-                    assertTrue(result.localUnresolvedCommands.isEmpty())
-                }
-                assertEquals(before, o.raw()); assertEquals(writes, o.storage.writes)
-                assertTrue(ControlCommandTracking.forOwner(o.owner).findPrepared(command)!!.confirmed.get())
-                assertEquals(ConfirmedEffect.AppliedThisAttempt, first.effect)
-            } finally { o.close() }
-        }
-    }
-
-    @Test fun readerAndRegistrationFailuresKeepTheirPrecedence() = runBlocking {
-        val o = ControlStoreTestStorage(File(folder.root, "precedence.preferences_pb"))
+    private fun assertNewEffectRequiresMigration(kind: String) = runBlocking {
+        val o = ControlStoreTestStorage(File(folder.root, "$kind.preferences_pb"))
         try {
-            seed(o, 2)
-            val foreign = CommandRef("foreign", emptyList())
+            seed(o, 1)
+            val command = prepare(o, kind)
             val before = o.raw(); val writes = o.storage.writes
-            val result = o.control.execute(foreign)
-            assertEquals(ControlStoreResult.Unconfirmed::class.java, result.javaClass)
-            result as ControlStoreResult.Unconfirmed
-            assertEquals(UnconfirmedReason.HistoryUnavailable, result.reason)
-            assertEquals(ControlAttemptPhase.PreparingCandidate, result.phase)
-            assertEquals(before, result.lastObservation!!.original)
-            assertEquals(setOf(foreign), result.localUnresolvedCommands)
-            val previous = o.control.confirmPrevious(foreign)
-            assertEquals(ControlStoreResult.RecoveryRequired::class.java, previous.javaClass)
-            previous as ControlStoreResult.RecoveryRequired
-            assertEquals(RecoveryReason.ControlWriterUpgradeRequired, previous.reason)
-            assertEquals(setOf(foreign), previous.localUnresolvedCommands)
+            NamespaceSettlementFixtures.negative(o.control.execute(command, NamespaceSettlementFixtures.context),
+                RecoveryReason.ControlSchemaMigrationRequired)
             assertEquals(before, o.raw()); assertEquals(writes, o.storage.writes)
-            o.data.edit { it.remove(ControlRecordKeys.payload(ControlPayloadKey.SCOPE_FENCE)) }
-            val damaged = o.control.execute(foreign) as ControlStoreResult.RecoveryRequired
-            assertEquals(RecoveryReason.UnreadableRecord, damaged.reason)
-            assertEquals(listOf(ControlRecordProblem.MissingPayload(ControlPayloadKey.SCOPE_FENCE)),
-                (damaged.observation as ControlRecordRead.Unreadable).problems)
+            val tracked = ControlCommandTracking.forOwner(o.owner).findPrepared(command)!!
+            assertNull(tracked.firstConfirmDiscontinuityCount)
+            assertFalse(tracked.confirmationRequested.get())
+            assertTrue(ControlCommandTracking.forOwner(o.owner).snapshot().isEmpty())
+            assertTrue(o.control.upgradeControlSchemaV1ToV2() is ControlSchemaUpgradeResult.Confirmed)
+            val allowed = o.control.execute(command, NamespaceSettlementFixtures.context) as ControlStoreResult.Confirmed
+            assertEquals(ConfirmedEffect.AppliedThisAttempt, allowed.effect)
+            assertEquals(2, allowed.snapshot.record.schemaVersion)
+            assertNotNull(ControlAppliedEvidence.own(allowed.snapshot.record, command))
         } finally { o.close() }
     }
 
-    @Test fun directRotationGateReturnsObserveBeforeAnyCandidateOrConfirmation() {
-        val input = NamespaceSettlementFixtures.input()
-        val command = CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input))
-        for (confirm in listOf(false, true)) for (confirmed in listOf(false, true)) {
-            val read = ControlRecordReader().read(NamespaceSettlementFixtures.raw(schema = 2)) as ControlRecordRead.Supported
-            val decision = NamespaceSettlementFixtures.transition.decide(command, input, read, NamespaceSettlementFixtures.context, confirm, confirmed)
-            assertEquals(RecordTransactionDecision.Observe::class.java, decision.javaClass)
-            assertEquals(ControlRecordStore.Outcome.Negative::class.java, decision.value.javaClass)
-            val result = (decision.value as ControlRecordStore.Outcome.Negative).result
-            assertEquals(ControlStoreResult.RecoveryRequired::class.java, result.javaClass)
-            result as ControlStoreResult.RecoveryRequired
-            assertSame(command, result.command)
-            assertSame(read, result.observation)
-            assertEquals(RecoveryReason.ControlWriterUpgradeRequired, result.reason)
-            assertTrue(result.localUnresolvedCommands.isEmpty())
-            assertEquals(NamespaceSettlementFixtures.raw(schema = 2), read.original)
-        }
-        val allowed = NamespaceSettlementFixtures.transition.decide(command, input,
-            ControlRecordReader().read(NamespaceSettlementFixtures.raw()) as ControlRecordRead.Supported,
-            NamespaceSettlementFixtures.context, false, false)
-        assertEquals(RecordTransactionDecision.Confirm::class.java, allowed.javaClass)
-        assertEquals(ConfirmedEffect.AppliedThisAttempt, (allowed.value as ControlRecordStore.Outcome.Positive).effect)
+    @Test fun executeRegistrationFailureKeepsReaderPrecedence() = assertHistoryFailurePrecedence(false)
+    @Test fun previousConfirmationHistoryFailureKeepsReaderPrecedence() = assertHistoryFailurePrecedence(true)
+
+    private fun assertHistoryFailurePrecedence(confirmOnly: Boolean) = runBlocking {
+        val o = ControlStoreTestStorage(File(folder.root, "precedence.preferences_pb"))
+        try {
+            seed(o, 2)
+            val foreign = CommandRef("foreign", emptyList(), NamespaceSettlementFixtures.trackerLife)
+            val before = o.raw(); val writes = o.storage.writes
+            val result = if (confirmOnly) o.control.confirmPrevious(foreign) else o.control.execute(foreign)
+            assertTrue(result is ControlStoreResult.Unconfirmed)
+            assertEquals(UnconfirmedReason.HistoryUnavailable, (result as ControlStoreResult.Unconfirmed).reason)
+            assertEquals(setOf(foreign), result.localUnresolvedCommands)
+            assertEquals(before, o.raw()); assertEquals(writes, o.storage.writes)
+            o.data.edit { it.remove(ControlRecordKeys.payload(ControlPayloadKey.SCOPE_FENCE)) }
+            NamespaceSettlementFixtures.negative(
+                if (confirmOnly) o.control.confirmPrevious(foreign) else o.control.execute(foreign),
+                RecoveryReason.UnreadableRecord)
+        } finally { o.close() }
     }
 
-    @Test fun directRotationChecksTheOriginalSchemaEvenWhenRelabeled() {
+    @Test fun directRotationRequiresMigrationForV1() = assertDirectRotationSchema(1)
+    @Test fun directRotationAllowsV2WithApplied() = assertDirectRotationSchema(2)
+
+    private fun assertDirectRotationSchema(schema: Int) {
         val input = NamespaceSettlementFixtures.input()
-        val command = CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input))
-        val v1 = ControlRecordReader().read(NamespaceSettlementFixtures.raw()) as ControlRecordRead.Supported
-        val allowed = NamespaceSettlementFixtures.transition.decide(command, input, v1, NamespaceSettlementFixtures.context, false, false)
-        assertEquals(RecordTransactionDecision.Confirm::class.java, allowed.javaClass)
-        assertEquals(ConfirmedEffect.AppliedThisAttempt, (allowed.value as ControlRecordStore.Outcome.Positive).effect)
-        val v2 = ControlRecordReader().read(NamespaceSettlementFixtures.raw(schema = 2)) as ControlRecordRead.Supported
-        val relabeled = ControlRecordRead.Supported(v2.original, v2.arrays, 1, ControlMetadataRead.NotPresentV1)
-        for ((label, read) in listOf("CONTROL normal v2" to v2, "NEGATIVE[SNAPSHOT_V2_RELABELLED]" to relabeled)) {
-            for (confirm in listOf(false, true)) for (confirmed in listOf(false, true)) {
-                val decision = NamespaceSettlementFixtures.transition.decide(command, input, read, NamespaceSettlementFixtures.context, confirm, confirmed)
-                assertEquals(label, RecordTransactionDecision.Observe::class.java, decision.javaClass)
-                assertEquals(ControlRecordStore.Outcome.Negative::class.java, decision.value.javaClass)
-                val result = (decision.value as ControlRecordStore.Outcome.Negative).result
-                assertEquals(ControlStoreResult.RecoveryRequired::class.java, result.javaClass)
-                result as ControlStoreResult.RecoveryRequired
-                assertSame(command, result.command)
-                assertSame(read, result.observation)
-                assertEquals(RecoveryReason.ControlWriterUpgradeRequired, result.reason)
-                assertTrue(result.localUnresolvedCommands.isEmpty())
-                assertEquals(v2.original, read.original)
-            }
+        val command = CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input), NamespaceSettlementFixtures.trackerLife)
+        val read = ControlRecordReader().read(NamespaceSettlementFixtures.raw(schema = schema)) as ControlRecordRead.Supported
+        val decision = NamespaceSettlementFixtures.transition.decide(command, input, read, NamespaceSettlementFixtures.context, false, false)
+        if (schema == 1) {
+            assertTrue(decision is RecordTransactionDecision.Observe)
+            NamespaceSettlementFixtures.negative((decision.value as ControlRecordStore.Outcome.Negative).result,
+                RecoveryReason.ControlSchemaMigrationRequired)
+        } else {
+            assertTrue(decision is RecordTransactionDecision.Confirm)
+            val candidate = (decision as RecordTransactionDecision.Confirm).candidate
+            val row = ControlAppliedEvidence.own(ControlRecordReader().read(candidate) as ControlRecordRead.Supported, command)
+            assertTrue("rotation must persist its Applied row", row is AppliedEvidence.Rotation)
+            val evidence = row as AppliedEvidence.Rotation
+            assertEquals(command.ownerTrackingLifetimeId.value, evidence.ownerTrackingLifetimeId)
+            assertEquals(listOf("s"), evidence.sealIds); assertEquals(input.demandId, evidence.demandId)
         }
     }
 
-    @Test fun directRotationRejectsMistypedOrMissingOriginalSchema() {
+    @Test fun directRotationRejectsMissingOriginalSchema() = assertDirectRotationRejectsOriginalSchema("missing")
+    @Test fun directRotationRejectsStringOriginalSchema() = assertDirectRotationRejectsOriginalSchema("string")
+    @Test fun directRotationRejectsLongOriginalSchema() = assertDirectRotationRejectsOriginalSchema("long")
+    @Test fun directRotationRejectsRelabeledOriginalSchema() = assertDirectRotationRejectsOriginalSchema("relabeled")
+
+    private fun assertDirectRotationRejectsOriginalSchema(variant: String) {
         val input = NamespaceSettlementFixtures.input()
-        val command = CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input))
+        val command = CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input), NamespaceSettlementFixtures.trackerLife)
         val normal = ControlRecordReader().read(NamespaceSettlementFixtures.raw()) as ControlRecordRead.Supported
-        val allowed = NamespaceSettlementFixtures.transition.decide(command, input, normal, NamespaceSettlementFixtures.context, false, false)
-        assertEquals(RecordTransactionDecision.Confirm::class.java, allowed.javaClass)
-        for (variant in listOf("missing", "string", "long")) {
-            val original = normal.original.toMutablePreferences().apply {
-                when (variant) {
-                    "missing" -> remove(ControlStoreTestStorage.SCHEMA)
-                    "string" -> this[androidx.datastore.preferences.core.stringPreferencesKey("control_schema")] = "1"
-                    else -> this[androidx.datastore.preferences.core.longPreferencesKey("control_schema")] = 1L
-                }
-            }.toPreferences()
-            val read = ControlRecordRead.Supported(original, normal.arrays, 1, ControlMetadataRead.NotPresentV1)
-            val decision = NamespaceSettlementFixtures.transition.decide(command, input, read, NamespaceSettlementFixtures.context, false, false)
-            assertEquals("NEGATIVE[SNAPSHOT_SCHEMA_TYPE:$variant]", RecordTransactionDecision.Observe::class.java, decision.javaClass)
-            assertEquals(ControlRecordStore.Outcome.Negative::class.java, decision.value.javaClass)
-            val result = (decision.value as ControlRecordStore.Outcome.Negative).result
-            assertEquals("NEGATIVE[SNAPSHOT_SCHEMA_TYPE:$variant] result", ControlStoreResult.RecoveryRequired::class.java, result.javaClass)
-            result as ControlStoreResult.RecoveryRequired
-            assertEquals(RecoveryReason.ControlWriterUpgradeRequired, result.reason)
-            assertSame(read, result.observation)
-            assertSame(command, result.command)
-            assertTrue(result.localUnresolvedCommands.isEmpty())
-            assertEquals(original, read.original)
+        val source = normal.original.toMutablePreferences().apply {
+            when (variant) {
+                "missing" -> remove(ControlStoreTestStorage.SCHEMA)
+                "string" -> this[androidx.datastore.preferences.core.stringPreferencesKey("control_schema")] = "2"
+                "long" -> this[androidx.datastore.preferences.core.longPreferencesKey("control_schema")] = 2L
+                else -> this[ControlStoreTestStorage.SCHEMA] = 1
+            }
         }
+        val read = ControlRecordRead.Supported(source, normal.arrays, 2, normal.metadata)
+        val decision = NamespaceSettlementFixtures.transition.decide(command, input, read, NamespaceSettlementFixtures.context, false, false)
+        assertTrue(variant, decision is RecordTransactionDecision.Observe)
+        NamespaceSettlementFixtures.negative((decision.value as ControlRecordStore.Outcome.Negative).result, RecoveryReason.UnreadableRecord)
     }
 
-    @Test fun receiptFlagsAreIndependentAndForwardedFromTheSnapshot() {
-        for (obligation in listOf(false, true)) for (metadata in listOf(false, true)) {
-            val input = NamespaceSettlementFixtures.input()
-            val source = NamespaceSettlementFixtures.settled(input).toMutablePreferences().apply {
-                if (obligation) this[ControlRecordKeys.payload(ControlKind.HOLD)] = "[null]"
-            }
-            val read = ControlRecordReader().read(source) as ControlRecordRead.Supported
-            // Deliberate internal synthetic read exercises receipt forwarding behind the temporary v2 gate.
-            val synthetic = ControlRecordRead.Supported(source, read.arrays, 1, ControlMetadataRead.V2(
-                ControlEvidenceReader.read(ControlPayloadCodec().decode(if (metadata) "[null]" else "[]") as PayloadRead.Parsed),
-                ScopeFenceRead(PayloadRead.Parsed(emptyList()))))
-            val command = CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input))
-            val decision = NamespaceSettlementFixtures.transition.decide(command, input, synthetic, null, true, true)
-            assertEquals(RecordTransactionDecision.Confirm::class.java, decision.javaClass)
-            val receipt = (decision.value as ControlRecordStore.Outcome.Positive).settlement!!
-            assertEquals(input.operationId, receipt.operationId)
-            assertEquals(obligation, receipt.hasUninterpretable)
-            assertEquals(metadata, receipt.hasUninterpretableMetadata)
-            assertEquals(obligation || metadata, receipt.blocksProtectedAdmission)
+    @Test fun receiptFlagsWithInterpretableObligationsAndMetadata() = assertReceiptFlags(false to false)
+    @Test fun receiptFlagsWithOpaqueMetadataOnly() = assertReceiptFlags(false to true)
+    @Test fun receiptFlagsWithOpaqueObligationsOnly() = assertReceiptFlags(true to false)
+    @Test fun receiptFlagsWithOpaqueObligationsAndMetadata() = assertReceiptFlags(true to true)
+
+    private fun assertReceiptFlags(flags: Pair<Boolean, Boolean>) {
+        val (obligation, metadata) = flags
+        val input = NamespaceSettlementFixtures.input()
+        val source = NamespaceSettlementFixtures.settled(input).toMutablePreferences().apply {
+            if (obligation) this[ControlRecordKeys.payload(ControlKind.HOLD)] = "[null]"
         }
+        val read = ControlRecordReader().read(source) as ControlRecordRead.Supported
+        // Independent metadata flags on a confirmation-only settled witness.
+        val synthetic = ControlRecordRead.Supported(source, read.arrays, 2, ControlMetadataRead.V2(
+            ControlEvidenceReader.read(ControlPayloadCodec().decode(if (metadata) "[null]" else "[]") as PayloadRead.Parsed),
+            ScopeFenceRead(PayloadRead.Parsed(emptyList()))))
+        val command = CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input), NamespaceSettlementFixtures.trackerLife)
+        val decision = NamespaceSettlementFixtures.transition.decide(command, input, synthetic, null, true, true)
+        assertEquals(RecordTransactionDecision.Confirm::class.java, decision.javaClass)
+        val receipt = (decision.value as ControlRecordStore.Outcome.Positive).settlement!!
+        assertEquals(input.operationId, receipt.operationId)
+        assertEquals(obligation, receipt.hasUninterpretable)
+        assertEquals(metadata, receipt.hasUninterpretableMetadata)
+        assertEquals(obligation || metadata, receipt.blocksProtectedAdmission)
     }
+
 }

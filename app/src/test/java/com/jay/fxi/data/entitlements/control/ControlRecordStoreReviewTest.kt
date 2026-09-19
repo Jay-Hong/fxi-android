@@ -268,7 +268,7 @@ class ControlRecordStoreReviewTest {
         val command = o.control.prepare(o.control.add())
         confirmed(o.control.execute(command))
         val checkpoint = o.control.checkpoint(command)!!
-        val differentRef = CommandRef(command.id, command.actions)
+        val differentRef = CommandRef(command.id, command.actions, command.ownerTrackingLifetimeId)
         historyUnavailable(open().control.confirmPrevious(differentRef, checkpoint))
     }
 

@@ -31,6 +31,21 @@ class ControlIssuanceStructureTest {
         assertEquals(1, source.countLiteral("commands.putIfAbsent(command.id, TrackedControlCommand(command))"))
     }
 
+    @Test fun trackerLifetimeIssuanceAndOwnerDecisionSitesStayPinned() {
+        val sources = SealSourceTripwire.read(productionRoot())
+        val tracking = sources.getValue(control + "ControlCommandTracking.kt")
+        val store = sources.getValue(control + "ControlRecordStore.kt")
+        val ref = sources.getValue(control + "ControlStoreResult.kt")
+        assertEquals(1, tracking.countExactLine("val lifetimeId = OwnerTrackingLifetimeId.issue()"))
+        assertEquals(1, tracking.countExactLine("fun issue(): OwnerTrackingLifetimeId = OwnerTrackingLifetimeId(UUID.randomUUID().toString())"))
+        assertEquals(1, tracking.countExactLine("check(command.ownerTrackingLifetimeId === lifetimeId) { \"command belongs to another tracker lifetime\" }"))
+        assertEquals(1, ref.countExactLine("val ownerTrackingLifetimeId: OwnerTrackingLifetimeId"))
+        assertEquals(2, store.countExactLine("tracking.observe(read)"))
+        assertEquals(1, store.countExactLine("if (known != null) tracked.bindFirstConfirm(tracking.evidenceDiscontinuityCount)"))
+        assertEquals(0, sources.filterKeys { it != control + "ControlCommandTracking.kt" }
+            .values.sumOf { it.countLiteral("OwnerTrackingLifetimeId.issue()") })
+    }
+
     @Test fun randomImplementationAndCorruptionSourceStayPinned() {
         val sources = SealSourceTripwire.read(productionRoot())
         assertEquals(1, sources.getValue(ent + "AccessEpochStore.kt")
@@ -167,7 +182,7 @@ class ControlIssuanceStructureTest {
         private const val control = ent + "control/"
         private val expected = mapOf(
             "registerPrepared" to mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 2),
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 1),
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 7),
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,
@@ -177,7 +192,7 @@ class ControlIssuanceStructureTest {
             "UUID::randomUUID" to mapOf(control + "ControlRecordStore.kt" to 1),
             "ControlRecordStore" to mapOf(control + "ControlRecordStore.kt" to 1, control + "NamespaceSettlementTransition.kt" to 1),
             "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 2,
-                control + "ControlStoreResult.kt" to 1)
+                control + "ControlStoreResult.kt" to 1, control + "ControlAppliedEvidence.kt" to 1)
         )
 
         private fun productionRoot(): File = SealSourceTripwire.sourceRoot(

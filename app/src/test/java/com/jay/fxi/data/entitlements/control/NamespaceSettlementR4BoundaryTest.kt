@@ -78,7 +78,7 @@ class NamespaceSettlementR4BoundaryTest {
         val base = ControlRecordReader().read(original) as ControlRecordRead.Supported
         val demand = base.arrays.getValue(ControlKind.DEMAND).entries.single() as ControlEntryRead.Interpreted
         fun receipt(read: ControlRecordRead.Supported): SettlementReceipt {
-            val result = transition.decide(CommandRef(spec.operationId, ControlCommandBody.RotateAndSettle(spec)),
+            val result = transition.decide(CommandRef(spec.operationId, ControlCommandBody.RotateAndSettle(spec), NamespaceSettlementFixtures.trackerLife),
                 spec, read, null, false, false)
             assertEquals(RecordTransactionDecision.Confirm::class.java, result.javaClass)
             assertEquals(read.original, (result as RecordTransactionDecision.Confirm).candidate)
@@ -101,7 +101,7 @@ class NamespaceSettlementR4BoundaryTest {
             source[ControlRecordKeys.payload(ControlKind.DEMAND)] = jsonArray(demand.original, second.original)
         }
         // Exercise the transition's internal input directly, without D1 demoting duplicate ids.
-        val read = ControlRecordRead.Supported(source, arrays, 1, ControlMetadataRead.NotPresentV1)
+        val read = ControlRecordRead.Supported(source, arrays, 2, base.metadata)
         val matches = read.locations(spec.demandId)
         assertEquals(2, matches.size)
         assertEquals(ControlKind.DEMAND, matches.first().first)

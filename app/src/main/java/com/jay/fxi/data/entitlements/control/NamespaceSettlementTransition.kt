@@ -43,8 +43,13 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
 
         val snapshotSchema = read.original.asMap().entries
             .singleOrNull { it.key.name == ControlRecordKeys.SCHEMA }?.value
-        if (read.schemaVersion != 1 || snapshotSchema !is Int || snapshotSchema != 1) {
-            return recovery(RecoveryReason.ControlWriterUpgradeRequired)
+        if (snapshotSchema !is Int || snapshotSchema != read.schemaVersion || read.schemaVersion !in 1..2) {
+            return recovery(RecoveryReason.UnreadableRecord)
+        }
+        val own = ControlAppliedEvidence.own(read, command)
+        if (ControlAppliedEvidence.hasOpaqueOwn(read, command)) return recovery(RecoveryReason.UninterpretableMetadata)
+        if (own != null && !ControlAppliedEvidence.matches(command, TrackedControlCommand(command), own)) {
+            return conflict(ConflictReason.CommandEvidenceMismatch)
         }
         input.invalidInput()?.let { return reject(it) }
         val located = mutableListOf<ControlEntryRead.Interpreted>()
@@ -77,8 +82,11 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
             if (!unsettledTargetMatches(current[index], input.seals[index])) return conflict(ConflictReason.TargetChanged)
         }
         // Matching preimages are insufficient proof in either confirmation-only or completed history.
-        if (confirmOnly) return conflict(ConflictReason.TargetMissing)
+        if (confirmOnly || own != null) return conflict(if (own != null)
+            ConflictReason.TargetChanged else ConflictReason.TargetMissing)
         if (previouslyConfirmed) return conflict(ConflictReason.TargetChanged)
+        if (read.schemaVersion != 2) return recovery(RecoveryReason.ControlSchemaMigrationRequired)
+        if (read.hasUninterpretableMetadata) return recovery(RecoveryReason.UninterpretableMetadata)
         val targetIds = input.seals.map { it.id }.toSet()
         if (read.arrays.getValue(ControlKind.SEAL).entries.filterIsInstance<ControlEntryRead.Interpreted>().any {
                 val seal = it.value as SealV1
@@ -111,9 +119,15 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
             is CandidateBuild.Rejected -> return negative(ControlStoreResult.Rejected(command, emptySet(), result.reason, read))
             is CandidateBuild.Built -> result
         }
-        val complete = ControlRecordReader(codec).read(built.candidate)
-        if (!validCandidate(complete, built.expected)) return reject("InvalidCandidate")
-        return RecordTransactionDecision.Confirm(built.candidate,
+        val candidate = built.candidate.toMutablePreferences()
+        val evidence = AppliedEvidence.Rotation(command.id, command.ownerTrackingLifetimeId.value,
+            input.seals.map { it.id }, input.demandId)
+        ControlAppliedEvidence.append(candidate, read, evidence, codec)?.let {
+            return negative(ControlStoreResult.Rejected(command, emptySet(), it, read))
+        }
+        val complete = ControlRecordReader(codec).read(candidate)
+        if (!validCandidate(complete, built.expected) || (complete as? ControlRecordRead.Supported)?.hasUninterpretableMetadata != false) return reject("InvalidCandidate")
+        return RecordTransactionDecision.Confirm(candidate,
             Outcome.Positive(ConfirmedEffect.AppliedThisAttempt, input.effectiveIds,
                 receipt(input, complete as ControlRecordRead.Supported)))
     }

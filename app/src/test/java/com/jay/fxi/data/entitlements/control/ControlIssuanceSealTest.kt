@@ -81,7 +81,7 @@ class ControlIssuanceSealTest {
         assertEquals(1, targets.size); assertNotNull(targets.single())
         tracker.markUnresolved(command)
         val before = o.raw(); val writes = o.storage.writes
-        for (duplicate in listOf(command, CommandRef(command.id, command.body))) {
+        for (duplicate in listOf(command, CommandRef(command.id, command.body, command.ownerTrackingLifetimeId))) {
             val failure = runCatching { tracker.registerPrepared(duplicate) }.exceptionOrNull()
             // Check preservation before the error, so destructive put is killed by history loss.
             assertSame(first, tracker.findPrepared(command))
@@ -96,7 +96,7 @@ class ControlIssuanceSealTest {
     // Concurrent smoke coverage; the putIfAbsent structure check, not a forced interleaving, pins atomicity.
     @Test fun concurrentDuplicateIdsHaveExactlyOneRegisteredWinner() {
         val o = open(); val tracker = ControlCommandTracking.forOwner(o.owner)
-        val refs = listOf(CommandRef(uuid(7), emptyList()), CommandRef(uuid(7), emptyList()))
+        val refs = listOf(CommandRef(uuid(7), emptyList(), tracker.lifetimeId), CommandRef(uuid(7), emptyList(), tracker.lifetimeId))
         val ready = CountDownLatch(2); val go = CountDownLatch(1)
         val pool = Executors.newFixedThreadPool(2)
         try {
@@ -132,7 +132,7 @@ class ControlIssuanceSealTest {
         val o = open(); o.seed()
         val prepared = o.control.prepare(action(o.control))
         assertNotNull(o.control.checkpoint(prepared))
-        val refs = listOf(CommandRef(uuid(9), prepared.body), CommandRef(prepared.id, prepared.body))
+        val refs = listOf(CommandRef(uuid(9), prepared.body, prepared.ownerTrackingLifetimeId), CommandRef(prepared.id, prepared.body, prepared.ownerTrackingLifetimeId))
         for (ref in refs) {
             val before = o.raw(); val writes = o.storage.writes
             assertNull(o.control.checkpoint(ref))
@@ -219,7 +219,7 @@ class ControlIssuanceSealTest {
                 assertEquals(spec.effectiveIds, confirmed.effectiveIds)
                 assertEquals(spec.operationId, confirmed.settlement!!.operationId)
                 assertEquals(spec.after, confirmed.settlement.after)
-                assertEquals(NamespaceSettlementFixtures.settled(spec, source), o.raw())
+                assertEquals(NamespaceSettlementFixtures.settled(spec, source, command.ownerTrackingLifetimeId), o.raw())
             }
             assertEquals(2L + targets.size, calls)
         }
@@ -232,7 +232,7 @@ class ControlIssuanceSealTest {
             val store = ControlRecordStore(o.owner, ControlIdGenerator { UUID(0, ++calls) })
             val command = store.prepareRotation(listOf(node(user), node(krx)), fence, life, demand)
             val spec = (command.body as ControlCommandBody.RotateAndSettle).input
-            val expected = NamespaceSettlementFixtures.settled(spec, source)
+            val expected = NamespaceSettlementFixtures.settled(spec, source, command.ownerTrackingLifetimeId)
             if (landed) o.storage.afterScope = true else o.storage.before = true
             val failed = store.execute(command, context)
             assertEquals(ControlStoreResult.Unconfirmed::class.java, failed.javaClass)
