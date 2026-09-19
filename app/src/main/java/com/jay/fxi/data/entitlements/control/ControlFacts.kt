@@ -94,6 +94,24 @@ data class IdentityV1(val ownerUid: String, val authGeneration: Long)
  */
 data class JournalTargetV1(val ownerUid: String?, val axis: PurgeScope, val epoch: String?)
 
+/** Closed witness union. Neither branch is runtime authority or proof of current journal presence. */
+sealed interface SettlementEvidence {
+    val operationId: String
+    val originLifetimeId: LifetimeId
+    val before: FenceV1
+    val after: FenceV1
+    val journal: JournalTargetV1
+}
+
+/** L-only historical NULL handover; version/kind are fixed by the type, not caller options. */
+data class RetiredNullSettlementEvidenceV2(
+    override val operationId: String,
+    override val originLifetimeId: LifetimeId,
+    override val before: FenceV1,
+    override val after: FenceV1,
+    override val journal: JournalTargetV1
+) : SettlementEvidence
+
 /**
  * Evidence retained through the seal's atomic settlement handover. [operationId] is a durable
  * operation identifier; [originLifetimeId] identifies the lifetime recording the evidence.
@@ -103,13 +121,13 @@ data class JournalTargetV1(val ownerUid: String?, val axis: PurgeScope, val epoc
  * transition. Constructing or reading this value grants no authority to delete a seal.
  */
 data class SettlementEvidenceV1(
-    val operationId: String,
-    val originLifetimeId: LifetimeId,
+    override val operationId: String,
+    override val originLifetimeId: LifetimeId,
     val operation: StoreOp,
-    val before: FenceV1,
-    val after: FenceV1,
-    val journal: JournalTargetV1
-)
+    override val before: FenceV1,
+    override val after: FenceV1,
+    override val journal: JournalTargetV1
+) : SettlementEvidence
 
 /**
  * Durable obligation identity plus archived facts. [id] is a newly issued stable storage identity
@@ -129,13 +147,13 @@ data class SealKey(val ownerUid: String?, val axis: PurgeScope, val epoch: Strin
  * durably confirmed. A repeated loss for the same still-unsettled key must join the existing id in
  * the future transition layer; an independent loss after settlement has a new identity. Already
  * stored key collisions are handled by [ControlObligations.readArray], not merged here.
- * [settlement] retains the operation witness described by [SettlementEvidenceV1].
+ * [settlement] retains the operation witness described by [SettlementEvidence].
  */
 data class SealV1(
     override val id: String,
     val kind: SealTargetKind,
     val key: SealKey,
-    val settlement: SettlementEvidenceV1?
+    val settlement: SettlementEvidence?
 ) : ControlObligationV1
 
 /**

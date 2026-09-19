@@ -41,6 +41,17 @@ sealed interface AppliedEvidence {
     ) : AppliedEvidence {
         val sealIds: List<String> = Collections.unmodifiableList(sealIds.toList())
     }
+
+    class Settlement internal constructor(
+        override val commandId: String,
+        override val ownerTrackingLifetimeId: String,
+        val transition: HandoverSettlementTransition,
+        sealIds: List<String>,
+        val demandId: String?
+    ) : AppliedEvidence {
+        val sealIds: List<String> = Collections.unmodifiableList(sealIds.toList())
+    }
+
 }
 
 data class AppliedTarget(val index: Int, val kind: ControlKind, val id: String, val joined: Boolean, val written: Boolean)
@@ -63,6 +74,7 @@ internal object ControlEvidenceReader {
     private val common = setOf("version", "commandId", "ownerTrackingLifetimeId", "kind")
     private val mutationNames = common + "targets"
     private val rotationNames = common + setOf("sealIds", "demandId")
+    private val settlementNames = rotationNames + "transition"
     private val targetNames = setOf("index", "kind", "id", "joined", "written")
     private val canonicalUuid = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -122,6 +134,32 @@ internal object ControlEvidenceReader {
                 if (demand.isEmpty()) return null
                 if (demand in seals) return null
                 AppliedEvidence.Rotation(commandId, owner, seals, demand)
+            }
+            "SETTLEMENT" -> {
+                if (node.hasNamesBeyond(settlementNames)) return null
+                val transition = (node.enumName("transition", HandoverSettlementTransition.entries)
+                    as? FieldRead.Present)?.value ?: return null
+                val raw = node.array("sealIds") ?: return null
+                val cardinality = when (transition) {
+                    HandoverSettlementTransition.RETIRED_NAMESPACE -> 1..1
+                    HandoverSettlementTransition.CURRENT_NULL -> 1..4
+                    HandoverSettlementTransition.RETIRED_NULL -> 1..2
+                }
+                if (raw.size !in cardinality) return null
+                val seals = raw.map { element ->
+                    val id = element as? JsonPrimitive ?: return null
+                    if (!id.isString) return null
+                    if (id.content.isEmpty()) return null
+                    id.content
+                }
+                if (seals.toSet().size != seals.size) return null
+                val demandField = node.nullableText("demandId") as? FieldRead.Present ?: return null
+                val demand = demandField.value
+                if (demand == "") return null
+                if (demand != null && demand in seals) return null
+                if (transition == HandoverSettlementTransition.CURRENT_NULL && demand == null) return null
+                if (transition == HandoverSettlementTransition.RETIRED_NULL && demand != null) return null
+                AppliedEvidence.Settlement(commandId, owner, transition, seals, demand)
             }
             else -> null
         }

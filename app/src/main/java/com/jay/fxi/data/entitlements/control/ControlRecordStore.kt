@@ -302,6 +302,10 @@ internal class ControlRecordStore(
                     historyUnavailable(command, read)
                 } else {
                     phase.set(ControlAttemptPhase.PreparingCandidate)
+                    // Type-only handovers must never reach mutation/checkpoint fallthrough.
+                    if (command.body is ControlCommandBody.Handover) return@transactRecord negative(
+                        ControlStoreResult.Rejected(command, emptySet(), emptySet(),
+                            RejectionReason.InvalidRequest("HandoverSettlementNotImplemented"), read))
                     val rotation = command.body as? ControlCommandBody.RotateAndSettle
                     val own = ControlAppliedEvidence.own(read, command)
                     // Preserve actual observation even when checkpoint admission later refuses confirmation.

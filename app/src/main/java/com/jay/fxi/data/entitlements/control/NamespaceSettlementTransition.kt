@@ -212,7 +212,8 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
     }
 
     /** Independent boundary: D1 may reject malformed evidence before this exact comparison. */
-    internal fun witnessMatches(actual: SettlementEvidenceV1, expected: SettlementEvidenceV1): Boolean {
+    internal fun witnessMatches(actual: SettlementEvidence, expected: SettlementEvidenceV1): Boolean {
+        if (actual !is SettlementEvidenceV1) return false
         if (actual.operationId != expected.operationId) return false
         if (actual.originLifetimeId != expected.originLifetimeId) return false
         if (actual.operation != expected.operation) return false

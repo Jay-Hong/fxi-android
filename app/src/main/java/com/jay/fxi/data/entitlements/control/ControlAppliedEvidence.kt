@@ -27,6 +27,8 @@ internal object ControlAppliedEvidence {
                 if (row.sealIds != body.input.seals.map { it.id }) return false
                 if (row.demandId != body.input.demandId) return false
             }
+            // R/N/L have no executor or retained witness confirmation in this unit.
+            is ControlCommandBody.Handover -> return false
             is ControlCommandBody.Mutations -> {
                 if (row !is AppliedEvidence.Mutations) return false
                 if (row.targets.size != command.actions.size) return false
@@ -82,6 +84,9 @@ internal object ControlAppliedEvidence {
                     JsonObject(linkedMapOf("index" to JsonPrimitive(it.index), "kind" to JsonPrimitive(it.kind.name),
                         "id" to JsonPrimitive(it.id), "joined" to JsonPrimitive(it.joined), "written" to JsonPrimitive(it.written)))
                 }))
+            is AppliedEvidence.Settlement -> mapOf("kind" to JsonPrimitive("SETTLEMENT"),
+                "transition" to JsonPrimitive(row.transition.name),
+                "sealIds" to JsonArray(row.sealIds.map(::JsonPrimitive)), "demandId" to JsonPrimitive(row.demandId))
             is AppliedEvidence.Rotation -> mapOf("kind" to JsonPrimitive("ROTATION"),
                 "sealIds" to JsonArray(row.sealIds.map(::JsonPrimitive)), "demandId" to JsonPrimitive(row.demandId))
         }

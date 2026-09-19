@@ -74,4 +74,10 @@ internal sealed interface ControlCommandBody {
         val actions: List<ControlMutation> = Collections.unmodifiableList(actions.toList())
     }
     class RotateAndSettle(val input: RotateAndSettleNamespaces) : ControlCommandBody
+
+    /** Type declarations only: preparation and execution arrive with each named transition. */
+    sealed interface Handover : ControlCommandBody { val input: HandoverSettlementInput }
+    class SettleRetiredNamespace(override val input: RetiredNamespaceSettlement) : Handover
+    class RotateAndSettleCurrentNull(override val input: CurrentNullSettlement) : Handover
+    class SettleRetiredNull(override val input: RetiredNullSettlement) : Handover
 }

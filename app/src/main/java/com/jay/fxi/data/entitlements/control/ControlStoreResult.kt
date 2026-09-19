@@ -25,6 +25,9 @@ internal class CommandRef internal constructor(
     }
 
     init {
+        require(body !is ControlCommandBody.Handover || id == body.input.operationId) {
+            "handover command id must equal operationId"
+        }
         require(body !is ControlCommandBody.RotateAndSettle || id == body.input.operationId) {
             "rotation command id must equal operationId"
         }

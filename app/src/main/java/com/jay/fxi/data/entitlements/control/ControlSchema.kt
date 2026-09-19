@@ -51,6 +51,11 @@ import kotlinx.serialization.json.JsonNull
  * after-fence epoch on that axis must differ from the seal epoch; journal owner must be null or
  * equal to the seal owner, and journal epoch must be null or equal to the seal epoch.
  *
+ * The following NULL_NAMESPACE conditions describe V1 only. Schema 2 additionally supports
+ * the closed L witness {version:2, kind:RETIRED_NULL, operationId, originLifetimeId, before,
+ * after, journal}: NULL target, before=after, different target/before owners, and exact target
+ * journal owner/axis with null epoch. The record reader gates L to schema 2.
+ *
  * For NULL_NAMESPACE, journal epoch must be null and before.ownerUid must equal the seal owner.
  * Exactly two operation cases are accepted:
  * - BEGIN_ROTATION: after.ownerUid equals the seal owner; after's target-axis epoch is non-null
@@ -138,7 +143,41 @@ internal object ControlSchema {
         return seal.takeIf { settlement == null || settlementFits(it, settlement) }
     }
 
-    private fun settlement(n: ControlNode): SettlementEvidenceV1? {
+    private fun settlement(n: ControlNode): SettlementEvidence? =
+        if ("version" in n.names || "kind" in n.names) retiredNullSettlement(n) else settlementV1(n)
+
+    private fun retiredNullSettlement(n: ControlNode): RetiredNullSettlementEvidenceV2? {
+        if (!n.only("version", "kind", "operationId", "originLifetimeId", "before", "after", "journal")) return null
+        if (n.integer("version").present()?.value != 2L) return null
+        if (n.text("kind").present()?.value != "RETIRED_NULL") return null
+        val operationId = n.id("operationId") ?: return null
+        val origin = n.origin() ?: return null
+        val before = fence(n.obj("before") ?: return null) ?: return null
+        val after = fence(n.obj("after") ?: return null) ?: return null
+        val journal = n.obj("journal") ?: return null
+        if (!journal.only("ownerUid", "axis", "epoch")) return null
+        val owner = journal.nullableText("ownerUid").present() ?: return null
+        val axis = journal.enum<PurgeScope>("axis") ?: return null
+        val epoch = journal.nullableId("epoch") ?: return null
+        if (epoch.value != null) return null
+        return RetiredNullSettlementEvidenceV2(operationId, origin, before, after,
+            JournalTargetV1(owner.value, axis, null))
+    }
+
+    private fun settlementFits(seal: SealV1, evidence: SettlementEvidence): Boolean = when (evidence) {
+        is SettlementEvidenceV1 -> settlementFitsV1(seal, evidence)
+        is RetiredNullSettlementEvidenceV2 -> {
+            seal.kind == SealTargetKind.NULL_NAMESPACE &&
+                evidence.before.ownerUid == evidence.after.ownerUid &&
+                evidence.before.userAccessEpoch == evidence.after.userAccessEpoch &&
+                evidence.before.krxCapabilityEpoch == evidence.after.krxCapabilityEpoch &&
+                seal.key.ownerUid != evidence.before.ownerUid &&
+                evidence.journal.ownerUid == seal.key.ownerUid &&
+                evidence.journal.axis == seal.key.axis
+        }
+    }
+
+    private fun settlementV1(n: ControlNode): SettlementEvidenceV1? {
         if (!n.only("operationId", "originLifetimeId", "operation", "before", "after", "journal")) return null
         val operationId = n.id("operationId") ?: return null
         val origin = n.origin() ?: return null
@@ -153,7 +192,7 @@ internal object ControlSchema {
         return SettlementEvidenceV1(operationId, origin, operation, before, after, JournalTargetV1(owner.value, axis, epoch.value))
     }
 
-    private fun settlementFits(seal: SealV1, evidence: SettlementEvidenceV1): Boolean {
+    private fun settlementFitsV1(seal: SealV1, evidence: SettlementEvidenceV1): Boolean {
         val target = seal.key
         val journal = evidence.journal
         if (journal.axis != target.axis) return false

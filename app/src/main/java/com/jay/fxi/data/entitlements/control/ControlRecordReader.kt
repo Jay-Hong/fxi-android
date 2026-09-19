@@ -151,7 +151,8 @@ class ControlRecordReader(private val codec: ControlPayloadCodec = ControlPayloa
         val arrays = obligations.mapValues { (kind, payload) ->
             val array = ControlObligations.readArray(kind, payload) as ControlArrayRead.Parsed
             ControlArrayRead.Parsed(array.entries.map { entry ->
-                if (entry is ControlEntryRead.Interpreted && entry.value.id in duplicateIds) {
+                if (entry is ControlEntryRead.Interpreted && (entry.value.id in duplicateIds ||
+                        (schema == 1 && (entry.value as? SealV1)?.settlement is RetiredNullSettlementEvidenceV2))) {
                     ControlEntryRead.Uninterpretable(entry.original.toPayloadEntry())
                 } else entry
             })

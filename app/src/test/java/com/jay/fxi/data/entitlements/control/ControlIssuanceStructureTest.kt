@@ -182,7 +182,8 @@ class ControlIssuanceStructureTest {
         private const val control = ent + "control/"
         private val expected = mapOf(
             "registerPrepared" to mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 2),
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 13),
+            // Includes the type-only handover rejection label; no additional transaction call.
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 14),
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,

@@ -35,7 +35,12 @@ internal object ReclaimPreviousLifetimeEvidence {
 
         val evidence = (read.metadata as ControlMetadataRead.V2).evidence.entries
             .map { it as ControlEvidenceEntryRead.Interpreted }
-        val previous = evidence.filter { it.value.ownerTrackingLifetimeId != lifetime.value }
+        val previous = evidence.filter {
+            it.value.ownerTrackingLifetimeId != lifetime.value && when (it.value) {
+                is AppliedEvidence.Mutations, is AppliedEvidence.Rotation -> true
+                is AppliedEvidence.Settlement -> false
+            }
+        }
         if (previous.isEmpty()) return RecordTransactionDecision.Confirm(read.original, null)
 
         val seals = read.arrays.getValue(ControlKind.SEAL).entries.map { it as ControlEntryRead.Interpreted }
