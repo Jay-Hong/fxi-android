@@ -79,7 +79,7 @@ internal object ControlReleaseFixtures {
             .newInstance(lifetime.value)
 
     private fun invoke(target: Any, name: String, types: Array<Class<*>> = emptyArray(), args: Array<Any> = emptyArray()) {
-        try { target.javaClass.getDeclaredMethod(name, *types).apply { isAccessible = true }.invoke(target, *args) }
+        try { target.javaClass.declaredMethods.single { it.name.substringBefore('$') == name && it.parameterTypes.contentEquals(types) }.apply { isAccessible = true }.invoke(target, *args) }
         catch (wrapped: InvocationTargetException) { throw wrapped.targetException }
     }
 }

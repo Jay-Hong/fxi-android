@@ -19,10 +19,10 @@ internal sealed interface ReleaseRejectionReason {
 }
 
 /**
- * Contract for releaseAfterConsumption(command: CommandRef), to be connected in unit 2.
- * Calling it will declare that the single consumer/retry owner has received Confirmed, completed
+ * Contract for releaseAfterConsumption(command: CommandRef).
+ * Calling it declares that the single consumer/retry owner has received Confirmed, completed
  * consumption and durable handoff, and joined all business work. It cannot verify that declaration.
- * No facade entry point is exposed until owner-confirmed reclamation can complete this contract.
+ * Pending retries retain that owner's responsibility; only owner confirmation completes release.
  * Both local sets enumerate this owner's memory work, never global recovery or admission.
  */
 internal sealed interface ControlCommandReleaseResult {

@@ -78,6 +78,9 @@ class ControlOwnerStructureTest {
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.USER_EPOCH",
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.KRX_EPOCH",
                 "private val owner: DataStoreAccessEpochStore,",
+                "val candidateBarrier = DataStoreAccessEpochStore.READ_BARRIER",
+                "\"read_barrier is owned by DataStoreAccessEpochStore\"",
+                "val barrier = DataStoreAccessEpochStore.READ_BARRIER",
             ),
             "main/java/com/jay/fxi/data/entitlements/control/NamespaceSettlementTransition.kt" to listOf(
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.ENTRY_SEPARATOR",

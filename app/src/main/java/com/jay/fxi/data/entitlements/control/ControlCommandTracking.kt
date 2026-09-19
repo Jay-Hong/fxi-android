@@ -22,8 +22,8 @@ internal class TrackedControlCommand(val command: CommandRef) {
     var releaseDescriptor: ReleasePendingDescriptor? = null
         private set
 
-    // No production caller until the owner transaction is connected in unit 2.
-    private fun bindReleaseDescriptor(descriptor: ReleasePendingDescriptor) {
+    // Called only at the validated owner release boundary, before publishing pending membership.
+    internal fun bindReleaseDescriptor(descriptor: ReleasePendingDescriptor) {
         check(releaseDescriptor == null) { "release descriptor is already fixed" }
         releaseDescriptor = descriptor
     }
@@ -42,8 +42,7 @@ internal class OwnerTrackingLifetimeId private constructor(val value: String) {
 /**
  * Metadata only. All file reads, writes, cache confirmation and serialization belong to the owner.
  * Prepared commands and adopted targets remain strongly retained, including after confirmation or
- * rejection. Unit 1 defines release contracts but provides no production eviction or closure path.
- * Unit 2 must couple reclamation and cleanup to owner confirmation before either can be exposed.
+ * rejection, until explicit owner-confirmed release. Only that path may remove the exact history.
  */
 internal class ControlCommandTracking private constructor() {
     val lifetimeId = OwnerTrackingLifetimeId.issue()
@@ -84,6 +83,17 @@ internal class ControlCommandTracking private constructor() {
     }
     fun recoverySnapshot(): LocalRecoveryWork = recoveryWork.get()
     fun snapshot(): Set<CommandRef> = recoverySnapshot().unresolvedCommands
+
+    internal fun publishPendingRelease(command: CommandRef) {
+        recoveryWork.updateAndGet { LocalRecoveryWork(it.unresolvedCommands, it.pendingReleases + command) }
+    }
+
+    internal fun finishRelease(tracked: TrackedControlCommand) {
+        val command = tracked.command
+        check(command.lifecycleState == ControlCommandLifecycle.RELEASED)
+        recoveryWork.updateAndGet { LocalRecoveryWork(it.unresolvedCommands, it.pendingReleases - command) }
+        commands.remove(command.id, tracked)
+    }
 
     companion object {
         private val collected = ReferenceQueue<DataStoreAccessEpochStore>()

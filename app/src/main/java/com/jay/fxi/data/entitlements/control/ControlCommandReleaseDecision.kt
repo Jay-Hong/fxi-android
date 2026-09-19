@@ -1,6 +1,6 @@
 package com.jay.fxi.data.entitlements.control
 
-/** Pure admission only. The future facade must acquire the shared lease and re-read identity/state. */
+/** Pure admission only. The facade acquires the shared lease and re-reads identity/state. */
 internal object ControlCommandReleaseEligibility {
     sealed interface Decision {
         data object Eligible : Decision
@@ -52,8 +52,8 @@ internal object ControlReleaseEvidenceMatch {
 
 /**
  * Pure latest-record release judgement, with no candidate construction, observation or mutation.
- * Unit 2 must observe the actual read (including interpretable own evidence) before calling this,
- * then validate/encode a removal candidate before publishing the returned descriptor as pending.
+ * The caller observes the actual read (including interpretable own evidence) before calling this,
+ * then validates/encodes a removal candidate before publishing the returned descriptor as pending.
  * Ready is not storage confirmation and must never be exposed as a successful release.
  */
 internal object ControlCommandReleaseDecision {

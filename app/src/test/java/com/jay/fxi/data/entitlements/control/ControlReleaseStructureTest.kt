@@ -19,18 +19,26 @@ class ControlReleaseStructureTest {
     private fun sources() = SealSourceTripwire.read(SealSourceTripwire.sourceRoot(
         File(checkNotNull(System.getProperty("user.dir"))), System.getProperty("fxi.seal.sourceRoot")))
 
-    @Test fun M09_lifecycleMutationIsPrivateAndHasNoProductionCaller() {
+    @Test fun M09_lifecycleTransitionsHaveOnlyTheOwnerReleaseCaller() {
         val all = sources()
         val ref = all.getValue(control + "ControlStoreResult.kt")
         assertTrue(Modifier.isPrivate(CommandRef::class.java.getDeclaredField("lifecycle").modifiers))
-        val begin = CommandRef::class.java.declaredMethods.singleOrNull { it.name == "beginRelease" }
-        assertNotNull("private lifecycle method must retain private JVM shape", begin)
-        assertTrue(Modifier.isPrivate(checkNotNull(begin).modifiers))
-        val complete = CommandRef::class.java.declaredMethods.singleOrNull { it.name == "completeRelease" }
-        assertNotNull("private completion method must retain private JVM shape", complete)
-        assertTrue(Modifier.isPrivate(checkNotNull(complete).modifiers))
-        assertEquals(1, Regex("\\bbeginRelease\\b").findAll(all.values.joinToString("\n")).count())
-        assertEquals(1, Regex("\\bcompleteRelease\\b").findAll(all.values.joinToString("\n")).count())
+        assertEquals(setOf("beginRelease", "completeRelease"), CommandRef::class.java.declaredMethods
+            .map { it.name.substringBefore('$') }.filter { it in setOf("beginRelease", "completeRelease") }.toSet())
+        val store = all.getValue(control + "ControlRecordStore.kt")
+        assertEquals(1, ref.lineSequence().count { it.trim() == "internal fun beginRelease() {" })
+        assertEquals(1, ref.lineSequence().count { it.trim() == "internal fun completeRelease() {" })
+        assertEquals(mapOf(control + "ControlStoreResult.kt" to 1, control + "ControlRecordStore.kt" to 1),
+            SealSourceTripwire.occurrences(all, "beginRelease"))
+        assertEquals(mapOf(control + "ControlStoreResult.kt" to 1, control + "ControlRecordStore.kt" to 1),
+            SealSourceTripwire.occurrences(all, "completeRelease"))
+        val attempt = store.substringAfter("private suspend fun releaseAttempt(").substringBefore("private fun releaseRejected(")
+        val steps = listOf("ControlCommandReleaseDecision.decide", "ControlReleaseCandidate.build",
+            "tracked.bindReleaseDescriptor(descriptor)", "tracking.publishPendingRelease(command)",
+            "command.beginRelease()", "RecordTransactionDecision.Confirm(candidate, null)",
+            "check(ControlReleaseCandidate.hasAbsencePostcondition", "command.completeRelease()", "tracking.finishRelease(tracked)")
+        assertTrue(steps.all { attempt.contains(it) })
+        assertEquals(steps.map { attempt.indexOf(it) }.sorted(), steps.map { attempt.indexOf(it) })
         assertEquals(2, Regex("lifecycle\\.compareAndSet").findAll(ref).count())
         assertFalse(ref.contains("lifecycle.set("))
         assertFalse(ref.contains("lifecycle.getAndSet("))
@@ -53,11 +61,12 @@ class ControlReleaseStructureTest {
             })
     }
 
-    @Test fun M09_descriptorBindingPrivateAndUncalled() {
-        val method = TrackedControlCommand::class.java.declaredMethods.singleOrNull { it.name == "bindReleaseDescriptor" }
-        assertNotNull("descriptor binder must retain private JVM shape", method)
-        assertTrue(Modifier.isPrivate(checkNotNull(method).modifiers))
-        assertEquals(1, Regex("\\bbindReleaseDescriptor\\b").findAll(sources().values.joinToString("\n")).count())
+    @Test fun M09_descriptorBindingHasOnlyTheValidatedReleaseCaller() {
+        val all = sources()
+        val tracking = all.getValue(control + "ControlCommandTracking.kt")
+        assertEquals(1, tracking.lineSequence().count { it.trim() == "internal fun bindReleaseDescriptor(descriptor: ReleasePendingDescriptor) {" })
+        assertEquals(mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 1),
+            SealSourceTripwire.occurrences(all, "bindReleaseDescriptor"))
         assertFalse(TrackedControlCommand::class.java.declaredMethods.any { it.name.startsWith("setReleaseDescriptor") })
     }
     @Test fun M07_refHasOnlyIdentityInputsAndSmallTerminalCell() {
@@ -67,15 +76,22 @@ class ControlReleaseStructureTest {
             CommandRef::class.java.getDeclaredField("lifecycle").type)
         assertEquals(setOf("RETAINED", "RELEASE_PENDING", "RELEASED"), ControlCommandLifecycle.entries.map { it.name }.toSet())
     }
-    @Test fun M08_noReleasedIdReservationOrProductionEviction() {
+    @Test fun M08_noReleasedIdReservationAndOnlyConditionalCleanup() {
         assertEquals(setOf("lifetimeId", "evidenceDiscontinuityCount", "commands", "executing", "recoveryWork", "Companion", "collected", "owners"),
             contractFieldNames(ControlCommandTracking::class.java))
         val tracking = sources().getValue(control + "ControlCommandTracking.kt")
-        assertFalse(tracking.contains("commands.remove")); assertFalse(tracking.contains("commands.clear"))
+        assertEquals(1, tracking.lineSequence().count { it.trim() == "commands.remove(command.id, tracked)" })
+        assertEquals(1, Regex("commands\\.remove").findAll(tracking).count())
+        assertFalse(tracking.contains("commands.clear"))
+        val all = sources()
+        for (method in listOf("finishRelease", "publishPendingRelease")) {
+            assertEquals(mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 1),
+                SealSourceTripwire.occurrences(all, method))
+        }
     }
     @Test fun A17_twoRecoverySetsUseOneAtomicCell() {
         val fields = ControlCommandTracking::class.java.declaredFields.filter { it.type == java.util.concurrent.atomic.AtomicReference::class.java }
-        assertEquals(listOf("recoveryWork"), fields.map { it.name })
+        assertEquals(setOf("recoveryWork"), fields.map { it.name }.toSet())
         val store = sources().getValue(control + "ControlRecordStore.kt")
         assertFalse("facade must not independently read unresolved", store.contains("tracking.snapshot()"))
         assertFalse(sources().getValue(control + "ControlStoreResult.kt").contains("localPendingReleases: Set<CommandRef> ="))
@@ -89,10 +105,20 @@ class ControlReleaseStructureTest {
         assertEquals(setOf("command", "localUnresolvedCommands", "localPendingReleases"),
             contractFieldNames(ControlCommandReleaseResult.AlreadyReleased::class.java))
     }
-    @Test fun M09_noFacadeReleaseUntilOwnerReclamationExists() {
-        assertFalse(ControlRecordStore::class.java.declaredMethods.any { it.name.contains("release", ignoreCase = true) })
-        val store = sources().getValue(control + "ControlRecordStore.kt")
-        assertFalse(store.contains("ControlCommandReleaseResult"))
-        assertFalse(store.contains("ControlCommandReleaseDecision"))
+    @Test fun M09_releaseFacadeHasOneRefAndNoProductionConsumer() {
+        val methods = ControlRecordStore::class.java.declaredMethods.filter { it.name == "releaseAfterConsumption" }
+        assertEquals(1, methods.size)
+        assertEquals(listOf(CommandRef::class.java, kotlin.coroutines.Continuation::class.java), methods.single().parameterTypes.toList())
+        val all = sources()
+        assertEquals(mapOf(control + "ControlRecordStore.kt" to 1, control + "ControlCommandReleaseResult.kt" to 1),
+            SealSourceTripwire.occurrences(all, "releaseAfterConsumption"))
+        assertEquals(mapOf(control + "ControlRecordStore.kt" to 2), SealSourceTripwire.occurrences(all, "releaseAttempt"))
+        val store = all.getValue(control + "ControlRecordStore.kt")
+        assertEquals(1, Regex("\\breleaseAfterConsumption\\b").findAll(store).count())
+        assertEquals(1, store.lineSequence().count { it.trim() == "return releaseAttempt(command, checkNotNull(tracked))" })
+        val release = store.substringAfter("suspend fun releaseAfterConsumption(").substringBefore("private suspend fun releaseAttempt(")
+        assertEquals(2, release.lineSequence().count { it.trim() == "if (command.lifecycleState == ControlCommandLifecycle.RELEASED) return alreadyReleased(command)" })
+        assertTrue(release.indexOf("tracking.executing.add(command)") < release.indexOf("val tracked = tracking.findPrepared(command)"))
+        assertEquals(1, store.lineSequence().count { it.trim() == "if (command.lifecycleState == ControlCommandLifecycle.RETAINED) {" })
     }
 }

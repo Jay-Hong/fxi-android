@@ -105,6 +105,119 @@ internal class ControlRecordStore(
     suspend fun confirmPrevious(command: CommandRef, checkpoint: ControlCommandCheckpoint? = null): ControlStoreResult =
         run(command, checkpoint, confirmOnly = true, context = null)
 
+    /**
+     * The single consumer declares durable handoff, consumption and business-worker join complete.
+     * It must retain this ref for management retries after cancellation or an unconfirmed removal.
+     * This method neither checks that declaration nor issues business/admission authority.
+     */
+    suspend fun releaseAfterConsumption(command: CommandRef): ControlCommandReleaseResult {
+        if (command.ownerTrackingLifetimeId !== tracking.lifetimeId) {
+            return releaseRejected(command, ReleaseRejectionReason.WrongTrackerLifetime)
+        }
+        if (command.lifecycleState == ControlCommandLifecycle.RELEASED) return alreadyReleased(command)
+        if (!tracking.executing.add(command)) return releaseRejected(command, ReleaseRejectionReason.InFlight)
+        try {
+            // A concurrent release can complete between the precheck and lease acquisition.
+            if (command.lifecycleState == ControlCommandLifecycle.RELEASED) return alreadyReleased(command)
+            val tracked = tracking.findPrepared(command)
+            when (val admission = ControlCommandReleaseEligibility.decide(
+                command, tracking.lifetimeId, tracked, inFlight = false, unresolved = tracking.isUnresolved(command)
+            )) {
+                is ControlCommandReleaseEligibility.Decision.Rejected -> return releaseRejected(command, admission.reason)
+                ControlCommandReleaseEligibility.Decision.AlreadyReleased -> return alreadyReleased(command)
+                ControlCommandReleaseEligibility.Decision.Eligible -> Unit
+            }
+            return releaseAttempt(command, checkNotNull(tracked))
+        } finally {
+            // Failure and cancellation preserve the lifecycle and both recovery memberships.
+            tracking.executing.remove(command)
+        }
+    }
+
+    private suspend fun releaseAttempt(command: CommandRef, tracked: TrackedControlCommand): ControlCommandReleaseResult {
+        val observation = AtomicReference<ControlRecordRead?>(null)
+        val phase = AtomicReference(ControlAttemptPhase.ReadingSnapshot)
+        var confirmedCandidate: Preferences? = null
+        try {
+            val transaction = owner.transactRecord<ControlCommandReleaseResult?> { snapshot ->
+                val read = reader.read(snapshot)
+                tracking.observe(read)
+                observation.set(read)
+                if (read is ControlRecordRead.Supported && ControlAppliedEvidence.own(read, command) != null) {
+                    tracked.observedApplied.set(true)
+                }
+                phase.set(ControlAttemptPhase.PreparingCandidate)
+                val decision = ControlCommandReleaseDecision.decide(read, tracked)
+                val descriptor = when (decision) {
+                    is ControlCommandReleaseDecision.Decision.Conflict -> return@transactRecord RecordTransactionDecision.Observe(
+                        ControlCommandReleaseResult.Conflict(command, emptySet(), emptySet(), decision.reason,
+                            command.lifecycleState, read as ControlRecordRead.Supported))
+                    is ControlCommandReleaseDecision.Decision.RecoveryRequired -> return@transactRecord RecordTransactionDecision.Observe(
+                        ControlCommandReleaseResult.RecoveryRequired(command, emptySet(), emptySet(), decision.reason, command.lifecycleState, read))
+                    is ControlCommandReleaseDecision.Decision.Ready -> decision.descriptor
+                }
+                val candidate = when (val built = ControlReleaseCandidate.build(read as ControlRecordRead.Supported, command, codec)) {
+                    is ControlReleaseCandidate.Result.Rejected -> return@transactRecord RecordTransactionDecision.Observe(
+                        ControlCommandReleaseResult.Rejected(command, emptySet(), emptySet(), ReleaseRejectionReason.Encoding(built.reason),
+                            command.lifecycleState, read))
+                    ControlReleaseCandidate.Result.Inconsistent -> return@transactRecord RecordTransactionDecision.Observe(
+                        ControlCommandReleaseResult.RecoveryRequired(command, emptySet(), emptySet(), RecoveryReason.InconsistentReclamation,
+                            command.lifecycleState, read))
+                    is ControlReleaseCandidate.Result.Ready -> built.snapshot
+                }
+                val candidateBarrier = DataStoreAccessEpochStore.READ_BARRIER
+                require(candidate.asMap()[candidateBarrier] == snapshot.asMap()[candidateBarrier]) {
+                    "read_barrier is owned by DataStoreAccessEpochStore"
+                }
+                confirmedCandidate = candidate
+                if (command.lifecycleState == ControlCommandLifecycle.RETAINED) {
+                    // No suspension: descriptor, membership, then closure before requesting storage.
+                    tracked.bindReleaseDescriptor(descriptor)
+                    tracking.publishPendingRelease(command)
+                    command.beginRelease()
+                }
+                phase.set(ControlAttemptPhase.ConfirmingStorage)
+                RecordTransactionDecision.Confirm(candidate, null)
+            }
+            transaction.value?.let { return it.withReleaseRecoveryWork(tracking.recoverySnapshot()) }
+            val returned = reader.read(transaction.snapshot)
+            check(ControlReleaseCandidate.hasAbsencePostcondition(returned, command)) { "release postcondition was not confirmed" }
+            val barrier = DataStoreAccessEpochStore.READ_BARRIER
+            check(transaction.snapshot.toMutablePreferences().apply { remove(barrier) } ==
+                checkNotNull(confirmedCandidate).toMutablePreferences().apply { remove(barrier) }) { "release confirmation changed unrelated values" }
+            // No suspension between owner confirmation, closure and exact-history cleanup.
+            command.completeRelease()
+            tracking.finishRelease(tracked)
+            val work = tracking.recoverySnapshot()
+            return ControlCommandReleaseResult.Released(command, work.unresolvedCommands, work.pendingReleases,
+                ConfirmedControlSnapshot(returned as ControlRecordRead.Supported), ConfirmationProof(transaction.evidence))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: IOException) {
+            val work = tracking.recoverySnapshot()
+            return ControlCommandReleaseResult.Unconfirmed(command, work.unresolvedCommands, work.pendingReleases,
+                command.lifecycleState, phase.get(), observation.get(), failure)
+        }
+    }
+
+    private fun releaseRejected(command: CommandRef, reason: ReleaseRejectionReason): ControlCommandReleaseResult.Rejected {
+        val work = tracking.recoverySnapshot()
+        return ControlCommandReleaseResult.Rejected(command, work.unresolvedCommands, work.pendingReleases, reason, command.lifecycleState, null)
+    }
+
+    private fun alreadyReleased(command: CommandRef): ControlCommandReleaseResult.AlreadyReleased {
+        val work = tracking.recoverySnapshot()
+        return ControlCommandReleaseResult.AlreadyReleased(command, work.unresolvedCommands, work.pendingReleases)
+    }
+
+    private fun ControlCommandReleaseResult.withReleaseRecoveryWork(work: LocalRecoveryWork): ControlCommandReleaseResult = when (this) {
+        is ControlCommandReleaseResult.Rejected -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
+        is ControlCommandReleaseResult.Conflict -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
+        is ControlCommandReleaseResult.RecoveryRequired -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
+        is ControlCommandReleaseResult.Unconfirmed, is ControlCommandReleaseResult.Released, is ControlCommandReleaseResult.AlreadyReleased ->
+            error("release transaction carried a non-decision result")
+    }
+
     suspend fun upgradeControlSchemaV1ToV2(): ControlSchemaUpgradeResult {
         var observation: ControlRecordRead? = null
         return try {

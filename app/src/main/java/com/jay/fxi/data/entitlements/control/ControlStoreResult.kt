@@ -14,13 +14,13 @@ internal class CommandRef internal constructor(
     private val lifecycle = AtomicReference(ControlCommandLifecycle.RETAINED)
     val lifecycleState: ControlCommandLifecycle get() = lifecycle.get()
 
-    // Deliberately private and uncalled in unit 1. Only test-source reflection can exercise these
-    // transitions until an owner-confirmed reclamation path is implemented in unit 2.
-    private fun beginRelease() {
+    // Internal transition sites are pinned to the validated owner release path by source tripwires.
+    // The cell itself never escapes; neither operation restores business execution authority.
+    internal fun beginRelease() {
         check(lifecycle.compareAndSet(ControlCommandLifecycle.RETAINED, ControlCommandLifecycle.RELEASE_PENDING))
     }
 
-    private fun completeRelease() {
+    internal fun completeRelease() {
         check(lifecycle.compareAndSet(ControlCommandLifecycle.RELEASE_PENDING, ControlCommandLifecycle.RELEASED))
     }
 

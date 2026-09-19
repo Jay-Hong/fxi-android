@@ -26,28 +26,30 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import okio.buffer
 import okio.sink
 import okio.source
 
 /** Real FileStorage; faults distinguish block completion from completed FileStorage write scope. */
-internal class ControlStoreTestStorage(private val file: File) {
+internal class ControlStoreTestStorage(
+    private val file: File,
+    wrapData: (DataStore<Preferences>) -> DataStore<Preferences> = { it }
+) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     val storage = Faults(FileStorage(Streams) { file })
     private var epoch = 0
     private val epochIds = EpochIdGenerator { "epoch-${epoch++}" }
-    val data: DataStore<Preferences> = PreferenceDataStoreFactory.create(
+    val data: DataStore<Preferences> = wrapData(PreferenceDataStoreFactory.create(
         storage = storage, corruptionHandler = accessEpochCorruptionHandler(epochIds) {},
         migrations = emptyList(), scope = scope
-    )
+    ))
     val owner = DataStoreAccessEpochStore(data, epochIds)
     val control = ControlRecordStore(owner)
 
-    suspend fun close() = scope.coroutineContext[Job]!!.cancelAndJoin()
-    suspend fun raw(): Preferences = data.data.first()
-    suspend fun seed(seal: String = "[]", demand: String = "[]", hold: String = "[]", recovery: String = "[]", schema: Int = 2) {
+    suspend fun close() = scope.coroutineContext[Job]!!.cancelAndJoinForTest()
+    suspend fun raw(): Preferences = controlTestTimeout("storage data read") { data.data.first() }
+    suspend fun seed(seal: String = "[]", demand: String = "[]", hold: String = "[]", recovery: String = "[]", schema: Int = 2): Unit = controlTestTimeout("storage seed") {
         data.edit {
             it[SCHEMA] = schema
             for (key in listOf(ControlPayloadKey.COMMAND_EVIDENCE, ControlPayloadKey.SCOPE_FENCE)) {
@@ -61,7 +63,7 @@ internal class ControlStoreTestStorage(private val file: File) {
     }
 
     /** Explicit D2a namespace fixture; seed() itself still writes only control keys. */
-    suspend fun currentNamespace() {
+    suspend fun currentNamespace(): Unit = controlTestTimeout("storage namespace seed") {
         data.edit {
             it.remove(DataStoreAccessEpochStore.OWNER_UID)
             it[DataStoreAccessEpochStore.USER_EPOCH] = "old"
@@ -101,7 +103,7 @@ internal class ControlStoreTestStorage(private val file: File) {
                         pause?.let {
                             pause = null
                             it.reached.complete(Unit)
-                            it.release.await()
+                            controlTestTimeout("storage write pause", 30_000) { it.release.await() }
                         }
                         if (after) {
                             after = false
@@ -111,7 +113,7 @@ internal class ControlStoreTestStorage(private val file: File) {
                     pauseAfterScope?.let {
                         pauseAfterScope = null
                         it.reached.complete(Unit)
-                        it.release.await()
+                        controlTestTimeout("storage landed pause", 30_000) { it.release.await() }
                     }
                     if (afterScope) {
                         afterScope = false
