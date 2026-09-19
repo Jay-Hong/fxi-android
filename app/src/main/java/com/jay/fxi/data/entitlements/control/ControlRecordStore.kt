@@ -19,7 +19,7 @@ import kotlinx.coroutines.CancellationException
  * the latest D1 classification in the atomic update. Unchanged payload strings remain verbatim.
  *
  * The scope is additions, seal joins, constrained non-settlement edits, explicit guard floor
- * recapture, and the named namespace settlement transition.
+ * recapture, namespace settlement, and explicit schema/evidence management transitions.
  * Confirmation proves storage postconditions, never admission or fresh server approval.
  * There is deliberately no coordinator wiring or retry scheduler here.
  */
@@ -118,6 +118,24 @@ internal class ControlRecordStore(
                 ConfirmationProof(transaction.evidence))
         } catch (failure: IOException) {
             ControlSchemaUpgradeResult.Unconfirmed(observation, failure)
+        }
+    }
+
+    /** Reclaims earlier tracker evidence atomically; current-lifetime rows are always retained. */
+    suspend fun reclaimPreviousLifetimeEvidence(): ControlEvidenceReclamationResult {
+        var observation: ControlRecordRead? = null
+        return try {
+            val transaction = owner.transactRecord { snapshot ->
+                val read = reader.read(snapshot)
+                tracking.observe(read)
+                observation = read
+                ReclaimPreviousLifetimeEvidence.decide(read, tracking.lifetimeId, codec)
+            }
+            transaction.value ?: ControlEvidenceReclamationResult.Confirmed(
+                ConfirmedControlSnapshot(reader.read(transaction.snapshot) as ControlRecordRead.Supported),
+                ConfirmationProof(transaction.evidence))
+        } catch (failure: IOException) {
+            ControlEvidenceReclamationResult.Unconfirmed(observation, failure)
         }
     }
 
