@@ -274,10 +274,10 @@ class ControlRecordStoreTest {
     @Test fun authAndFixedFloorEditsPreserveEachOthersEvidence() = runBlocking {
         val o = open()
         o.seed(demand = "[$emptyGuard]")
-        val authCommand = o.control.prepare(o.control.edit(ControlKind.DEMAND, node(emptyGuard)) {
-            createChild("auth") { literal(auth) }
-        })
-        val withAuth = confirmed(o.control.execute(authCommand)).snapshot.record.arrays.getValue(ControlKind.DEMAND)
+        o.data.edit { it[com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.OWNER_UID] = "A" }
+        val authCommand = o.control.prepareUpdateAuth(node(emptyGuard), null, DemandAuthFixtures.binding,
+            LifecycleAuthEvent.Initialize, LifecycleOrderSource(DemandAuthFixtures.life))
+        val withAuth = confirmed(o.control.execute(authCommand, DemandAuthFixtures.context())).snapshot.record.arrays.getValue(ControlKind.DEMAND)
             .entries.single() as ControlEntryRead.Interpreted
         val floorCommand = o.control.prepare(o.control.recordFloor(withAuth.original, BootReading("boot", 50), 100,
             LifetimeId("floor-life")))

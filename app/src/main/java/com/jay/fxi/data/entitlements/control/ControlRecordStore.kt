@@ -51,6 +51,28 @@ internal class ControlRecordStore(
         return tracking.registerPrepared(command)
     }
 
+    fun prepareRebindRequests(targets: List<ControlNode>, binding: LifecycleBinding, orders: LifecycleOrderSource,
+        intents: Map<String, com.jay.fxi.data.entitlements.RefreshIntent> = emptyMap()): CommandRef =
+        registerDemandAuth(DemandAuthPlan.rebind(targets, binding, orders, intents))
+
+    fun prepareSettleQuery(requests: List<ControlNode>, guard: ControlNode?, retry: ControlNode?,
+        binding: LifecycleBinding, decision: AcceptedQueryDecision, orders: LifecycleOrderSource): CommandRef =
+        registerDemandAuth(DemandAuthPlan.settle(requests, guard, retry, binding, decision, orders,
+            ids.next().toString(), ids.next().toString()))
+
+    fun prepareUpdateAuth(guard: ControlNode?, retry: ControlNode?, binding: LifecycleBinding,
+        event: LifecycleAuthEvent, orders: LifecycleOrderSource): CommandRef =
+        registerDemandAuth(DemandAuthPlan.auth(guard, retry, binding, event, orders, ids.next().toString(), ids.next().toString()))
+
+    fun prepareEndAuthBinding(guard: ControlNode, requests: List<ControlNode>, binding: LifecycleBinding,
+        closure: LifecycleBindingClosure, replacement: LifecycleBinding?, orders: LifecycleOrderSource): CommandRef =
+        registerDemandAuth(DemandAuthPlan.end(guard, requests, binding, closure, replacement, orders))
+
+    private fun registerDemandAuth(plan: DemandAuthPlan): CommandRef {
+        val id = ids.next().toString()
+        return tracking.registerPrepared(CommandRef(id, ControlCommandBody.Lifecycle(plan.descriptor(id)), tracking.lifetimeId))
+    }
+
     /** Issue operation, demand and axis UUIDs independently, once. Context is supplied at execution. */
     fun prepareRotation(
         targets: List<ControlNode>, before: FenceV1, origin: LifetimeId, demand: SettlementDemand

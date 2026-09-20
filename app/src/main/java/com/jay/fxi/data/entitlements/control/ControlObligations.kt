@@ -145,10 +145,18 @@ object ControlObligations {
         }
         if (result !is ControlWriteResult.Written) return result
         val after = ControlSchema.read(ControlKind.DEMAND, result.node) as? ScheduleGuardV1 ?: return invalid()
-        return if (unchangedExcept(original, result.node, setOf("floor")) &&
-            after.floor == FloorV1(now.bootId, now.elapsedMillis, wait, origin)
-        ) result else invalid()
+        return if (validFloorResult(original, result.node, after, FloorV1(now.bootId, now.elapsedMillis, wait, origin))) result else invalid()
     }
+
+    internal fun validFloorResult(original: ControlNode, candidate: ControlNode, after: ScheduleGuardV1, expected: FloorV1): Boolean {
+        if (floorUnchangedValues(original) != floorUnchangedValues(candidate)) return false // A11a
+        if (after.floor != expected) return false // A11b
+        return true
+    }
+
+    // Compare each untouched subtree's serialization, including AUTH key order and number literals.
+    private fun floorUnchangedValues(node: ControlNode): Map<String, String> = node.toPayloadEntry().fields
+        .filterKeys { it != "floor" }.mapValues { (_, value) -> value.toString() }
 
     /**
      * Applies whole-array constraints in addition to [read]'s per-obligation schema. An unreadable

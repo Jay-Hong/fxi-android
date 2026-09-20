@@ -197,11 +197,11 @@ class ControlRecordStoreReviewTest {
 
     @Test fun confirmedAuthEditCannotRestoreAnEndedBinding() = runBlocking {
         val o = open(); o.seed(demand = "[$emptyGuard]")
-        val command = o.control.prepare(o.control.edit(ControlKind.DEMAND, node(emptyGuard)) {
-            createChild("auth") { literal(auth) }
-        })
-        confirmed(o.control.execute(command))
-        o.data.edit { it[DEMAND] = "[$emptyGuard]" } // Future D2b binding-end transition.
+        o.data.edit { it[com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.OWNER_UID] = "A" }
+        val command = o.control.prepareUpdateAuth(node(emptyGuard), null, DemandAuthFixtures.binding,
+            LifecycleAuthEvent.Initialize, LifecycleOrderSource(DemandAuthFixtures.life))
+        confirmed(o.control.execute(command, DemandAuthFixtures.context()))
+        o.data.edit { it[DEMAND] = "[$emptyGuard]" } // Simulate the ended AUTH postcondition; the old ref must not reinstall it.
         val writes = o.storage.writes
         conflict(o.control.execute(command), ConflictReason.TargetChanged)
         assertEquals("[$emptyGuard]", o.raw()[DEMAND]); assertEquals(writes, o.storage.writes)

@@ -19,7 +19,7 @@ internal sealed class ControlMutation private constructor(val kind: ControlKind)
                 val built = ControlObligations.build(kind) { build(id) }
                 val valid = (built as? ControlWriteResult.Written)?.let {
                     val value = (ControlObligations.read(kind, it.node) as ControlEntryRead.Interpreted).value
-                    value.id == id && (value !is SealV1 || value.settlement == null)
+                    value.id == id && (value !is SealV1 || value.settlement == null) && genericAddAllowed(value, it.node)
                 } ?: false
                 return Add(kind, id, if (valid) built else ControlWriteResult.Rejected(ControlWriteFailure.INVALID_CHANGE))
             }
@@ -37,7 +37,8 @@ internal sealed class ControlMutation private constructor(val kind: ControlKind)
                 // The pure editor permits settlement; this slice has no authority to persist it.
                 val nonSettlement = kind != ControlKind.SEAL || (changed is ControlWriteResult.Written &&
                     expected.toPayloadEntry() == changed.node.toPayloadEntry())
-                return Edit(kind, expected, if (nonSettlement) changed else ControlWriteResult.Rejected(ControlWriteFailure.INVALID_CHANGE))
+                val authPreserved = changed !is ControlWriteResult.Written || genericAuthUnchanged(kind, expected, changed.node)
+                return Edit(kind, expected, if (nonSettlement && authPreserved) changed else ControlWriteResult.Rejected(ControlWriteFailure.INVALID_CHANGE))
             }
 
             fun floor(expected: ControlNode, now: BootReading, waitMillis: Long, origin: LifetimeId): Edit =
@@ -81,4 +82,14 @@ internal sealed interface ControlCommandBody {
     class SettleRetiredNamespace(override val input: RetiredNamespaceSettlement) : Handover
     class RotateAndSettleCurrentNull(override val input: CurrentNullSettlement) : Handover
     class SettleRetiredNull(override val input: RetiredNullSettlement) : Handover
+}
+
+internal fun genericAddAllowed(value: ControlObligationV1, node: ControlNode): Boolean {
+    if (value is ScheduleGuardV1 && "auth" in node.names) return false // A10
+    return true
+}
+internal fun genericAuthUnchanged(kind: ControlKind, before: ControlNode, after: ControlNode): Boolean {
+    if (kind == ControlKind.DEMAND && ControlSchema.read(kind, before) is ScheduleGuardV1 &&
+        before.toPayloadEntry().fields["auth"]?.toString() != after.toPayloadEntry().fields["auth"]?.toString()) return false // A09
+    return true
 }

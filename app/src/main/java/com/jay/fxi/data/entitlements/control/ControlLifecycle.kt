@@ -44,7 +44,8 @@ internal class ControlLifecycleDescriptor(
     targets: List<LifecycleFixedTarget>,
     val executor: SettlementExecutor? = null,
     val namespace: LifecycleNamespacePostcondition? = null,
-    requiredUnchanged: List<LifecycleFixedTarget> = emptyList()
+    requiredUnchanged: List<LifecycleFixedTarget> = emptyList(),
+    val demandAuth: DemandAuthPlan? = null
 ) {
     val targets: List<LifecycleFixedTarget> = Collections.unmodifiableList(targets.toList())
     // Required effects already satisfied before the command are checked without fake wire targets.
@@ -176,6 +177,7 @@ internal class ControlLifecycleConfirmation(private val codec: ControlPayloadCod
             TargetExpectation(command, input.targets.map { it.target.id }), read))
         fun recovery(reason: RecoveryReason) = negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), reason, read))
         ControlLifecycleBoundary.recordProblem(read)?.let { return recovery(it) }
+        input.demandAuth?.preparationFailure?.let { return reject(it) }
         if (!validDescriptor(input)) return reject("InvalidLifecycleDescriptor")
         ControlLifecycleBoundary.rawProblem(read.original)?.let { return recovery(it) }
         val own = ControlAppliedEvidence.own(read, command)
@@ -210,6 +212,7 @@ internal class ControlLifecycleConfirmation(private val codec: ControlPayloadCod
             if (context == null) return reject("AttemptContextRequired")
             ControlLifecycleBoundary.current(it, context, read.original)?.let { reason -> return conflict(reason) }
         }
+        if (input.demandAuth != null && context != null) return DemandAuthTransition(codec).decide(command, input, read, context)
         return reject("LifecycleWriterUnavailable")
     }
 
@@ -260,7 +263,7 @@ internal class ControlLifecycleConfirmation(private val codec: ControlPayloadCod
         }
     }
 
-    private fun receipt(input: ControlLifecycleDescriptor, read: ControlRecordRead.Supported): ControlLifecycleReceipt {
+    internal fun receipt(input: ControlLifecycleDescriptor, read: ControlRecordRead.Supported): ControlLifecycleReceipt {
         val journal = shared.canonicalJournal(read.original)
         return ControlLifecycleReceipt(input.transition, input.operationId,
             input.targets.map { ControlLifecycleBoundary.observe(read, it) }, input.namespace?.before, input.namespace?.after,
