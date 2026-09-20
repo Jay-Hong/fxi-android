@@ -76,22 +76,6 @@ class HandoverTypeBoundaryTest : ReleaseOwnerTestBase() {
             runCatching { CommandRef("other", l(), OwnerTrackingLifetimeId.issue()) }.exceptionOrNull()?.message)
     }
 
-    private fun unimplemented(body: ControlCommandBody) = runReleaseTest {
-        o.seed()
-        val command = tracking.registerPrepared(CommandRef("op", body, tracking.lifetimeId))
-        val source = o.raw()
-        val writes = o.storage.writes
-        assertNull(o.control.checkpoint(command))
-        val result = controlTestTimeout("type-only handover execute") { o.control.execute(command) }
-        assertEquals(RejectionReason.InvalidRequest("HandoverSettlementNotImplemented"),
-            (result as? ControlStoreResult.Rejected)?.reason)
-        assertEquals(writes, o.storage.writes)
-        assertEquals(source, o.raw())
-        assertTrue(result.localUnresolvedCommands.isEmpty())
-        assertTrue(result.localPendingReleases.isEmpty())
-        assertFalse(command in tracking.executing)
-        assertFalse(history(command).confirmationRequested.get())
-    }
     @Test fun A18_R_named_writer_has_no_checkpoint() = runReleaseTest {
         val input = (r() as ControlCommandBody.SettleRetiredNamespace).input
         controlTestTimeout("R boundary seed") { o.data.updateData { RetiredNamespaceFixtures.raw(input) } }
@@ -118,24 +102,36 @@ class HandoverTypeBoundaryTest : ReleaseOwnerTestBase() {
         assertNull(o.control.checkpoint(command))
         assertFalse(command in tracking.executing)
     }
-    @Test fun A18_L_has_no_writer_or_checkpoint() = unimplemented(l())
+    @Test fun A18_L_named_writer_has_no_checkpoint() = runReleaseTest {
+        val input = (l() as ControlCommandBody.SettleRetiredNull).input
+        controlTestTimeout("L boundary seed") { o.data.updateData { RetiredNullFixtures.raw(input) } }
+        val command = o.control.prepareRetiredNullSettlement(input.targets, before, executor)
+        assertNull(o.control.checkpoint(command))
+        val result = controlTestTimeout("L named dispatch") {
+            o.control.execute(command, AttemptContext("B", 3, LifetimeId("origin"), false, false))
+        }
+        assertTrue(result is ControlStoreResult.Confirmed)
+        assertEquals(HandoverSettlementTransition.RETIRED_NULL, (result as ControlStoreResult.Confirmed).handoverSettlement!!.transition)
+        assertNull(result.settlement)
+        assertNull(o.control.checkpoint(command))
+        assertFalse(command in tracking.executing)
+    }
     @Test fun A18_confirmPrevious_cannot_import_empty_handover_checkpoint() = runReleaseTest {
         o.seed()
         val command = CommandRef("op", l(), OwnerTrackingLifetimeId.issue())
         val source = o.raw()
         val checkpoint = ControlCommandCheckpoint(command, emptyList(), true)
-        val result = controlTestTimeout("type-only previous handover") { o.control.confirmPrevious(command, checkpoint) }
-        assertEquals(RejectionReason.InvalidRequest("HandoverSettlementNotImplemented"),
-            (result as? ControlStoreResult.Rejected)?.reason)
+        val result = controlTestTimeout("previous handover without witness") { o.control.confirmPrevious(command, checkpoint) }
+        assertEquals(ConflictReason.TargetMissing, (result as? ControlStoreResult.Conflict)?.reason)
         assertEquals(source, o.raw())
         assertNull(tracking.findPrepared(command))
         assertFalse(command in tracking.executing)
     }
-    @Test fun A18_no_matching_Applied_confirmation_before_writer_unit() {
+    @Test fun A18_L_matching_Applied_is_recognized() {
         val command = CommandRef("op", l(), OwnerTrackingLifetimeId.issue())
         val row = AppliedEvidence.Settlement("op", command.ownerTrackingLifetimeId.value,
             HandoverSettlementTransition.RETIRED_NULL, listOf("s"), null)
-        assertFalse(ControlAppliedEvidence.matches(command, TrackedControlCommand(command), row))
+        assertTrue(ControlAppliedEvidence.matches(command, TrackedControlCommand(command), row))
     }
 
     @Test fun A19_rotation_witness_match_excludes_L_type() {

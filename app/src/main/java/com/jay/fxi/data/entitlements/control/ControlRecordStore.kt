@@ -111,6 +111,14 @@ internal class ControlRecordStore(
         return tracking.registerPrepared(CommandRef(operationId, ControlCommandBody.RotateAndSettleCurrentNull(input), tracking.lifetimeId))
     }
 
+    /** Historical NULL handover. Issue only an operation ID; current namespace and demands stay intact. */
+    fun prepareRetiredNullSettlement(
+        targets: List<ControlNode>, before: FenceV1, executor: SettlementExecutor
+    ): CommandRef {
+        val input = RetiredNullSettlement(targets, before, executor, ids.next().toString())
+        return tracking.registerPrepared(CommandRef(input.operationId, ControlCommandBody.SettleRetiredNull(input), tracking.lifetimeId))
+    }
+
     /**
      * Missing own seals can be retried. A replacement same-key seal or a new NAMESPACE append whose
      * owner/axis epoch is no longer current yields TargetChanged; unreadable required epoch keys
@@ -335,10 +343,6 @@ internal class ControlRecordStore(
                 } else {
                     phase.set(ControlAttemptPhase.PreparingCandidate)
                     val handover = (command.body as? ControlCommandBody.Handover)?.input
-                    // L remains type-only and must not reach mutation/checkpoint fallthrough.
-                    if (handover is RetiredNullSettlement) return@transactRecord negative(
-                        ControlStoreResult.Rejected(command, emptySet(), emptySet(),
-                            RejectionReason.InvalidRequest("HandoverSettlementNotImplemented"), read))
                     val own = ControlAppliedEvidence.own(read, command)
                     // Preserve actual observation even when later admission rejects the record.
                     if (own != null) tracked.observedApplied.set(true)
@@ -384,6 +388,9 @@ internal class ControlRecordStore(
                             onlyConfirm, tracked.confirmed.get())
                     } else if (handover is CurrentNullSettlement) {
                         CurrentNullSettlementTransition(codec).decide(command, handover, read, context,
+                            onlyConfirm, tracked.confirmed.get())
+                    } else if (handover is RetiredNullSettlement) {
+                        RetiredNullSettlementTransition(codec).decide(command, handover, read, context,
                             onlyConfirm, tracked.confirmed.get())
                     } else if (rotation != null) {
                         NamespaceSettlementTransition(codec).decide(command, rotation.input, read, context,

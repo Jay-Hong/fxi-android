@@ -68,6 +68,12 @@ internal class RetiredNullSettlement(
     override val operationId: String
 ) : HandoverSettlementInput {
     val targets: List<ControlNode> = Collections.unmodifiableList(targets.toList())
+    internal data class Target(val original: ControlNode, val seal: SealV1)
+    val ordered: List<Target> = Collections.unmodifiableList(this.targets.mapNotNull { node ->
+        ((ControlObligations.read(ControlKind.SEAL, node) as? ControlEntryRead.Interpreted)?.value as? SealV1)
+            ?.let { Target(node, it) }
+    }.sortedBy { if (it.seal.key.axis == PurgeScope.USER) 0 else 1 })
+    val effectiveIds: List<String> = Collections.unmodifiableList(ordered.map { it.seal.id })
 }
 
 /** NotRequired says this command issued no demand; Absent says a required demand is now absent. */

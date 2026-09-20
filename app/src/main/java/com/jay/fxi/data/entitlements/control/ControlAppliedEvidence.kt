@@ -42,7 +42,12 @@ internal object ControlAppliedEvidence {
                     if (row.sealIds != input.targets.map { it.seal.id }) return false
                     if (row.demandId != input.demandId) return false
                 }
-                is RetiredNullSettlement -> return false
+                is RetiredNullSettlement -> {
+                    if (row !is AppliedEvidence.Settlement) return false
+                    if (row.transition != HandoverSettlementTransition.RETIRED_NULL) return false
+                    if (row.sealIds != input.effectiveIds) return false
+                    if (row.demandId != null) return false
+                }
             }
             is ControlCommandBody.Mutations -> {
                 if (row !is AppliedEvidence.Mutations) return false

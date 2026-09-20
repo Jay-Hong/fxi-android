@@ -181,9 +181,9 @@ class ControlIssuanceStructureTest {
         private const val ent = "main/java/com/jay/fxi/data/entitlements/"
         private const val control = ent + "control/"
         private val expected = mapOf(
-            "registerPrepared" to mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 4),
-            // Includes R/N metadata and L rejection return labels; no additional transaction call.
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 15),
+            "registerPrepared" to mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 5),
+            // Includes handover metadata return labels; L now uses the shared transaction dispatch.
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 14),
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,
@@ -192,7 +192,7 @@ class ControlIssuanceStructureTest {
             "EpochIdGenerator.Random" to mapOf("main/java/com/jay/fxi/di/EntitlementsModule.kt" to 1, ent + "DataStoreAccessEpochStore.kt" to 1),
             "UUID::randomUUID" to mapOf(control + "ControlRecordStore.kt" to 1),
             "ControlRecordStore" to mapOf(control + "ControlRecordStore.kt" to 1, control + "NamespaceSettlementTransition.kt" to 1,
-                control + "RetiredNamespaceSettlementTransition.kt" to 1, control + "CurrentNullSettlementTransition.kt" to 1),
+                control + "RetiredNamespaceSettlementTransition.kt" to 1, control + "CurrentNullSettlementTransition.kt" to 1, control + "RetiredNullSettlementTransition.kt" to 1),
             "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 2,
                 control + "ControlStoreResult.kt" to 1, control + "ControlAppliedEvidence.kt" to 1)
         )
