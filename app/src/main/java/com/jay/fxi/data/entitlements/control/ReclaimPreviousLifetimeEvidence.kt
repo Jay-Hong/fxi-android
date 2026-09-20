@@ -39,6 +39,7 @@ internal object ReclaimPreviousLifetimeEvidence {
             it.value.ownerTrackingLifetimeId != lifetime.value && when (it.value) {
                 is AppliedEvidence.Mutations, is AppliedEvidence.Rotation -> true
                 is AppliedEvidence.Settlement -> false
+                is AppliedEvidence.Lifecycle -> false
             }
         }
         if (previous.isEmpty()) return RecordTransactionDecision.Confirm(read.original, null)

@@ -333,91 +333,113 @@ internal class ControlRecordStore(
                 val read = reader.read(snapshot)
                 tracking.observe(read)
                 observation.set(read)
-                if (read !is ControlRecordRead.Supported) {
-                    negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), when (read) {
-                        is ControlRecordRead.MigrationOrRecoveryRequired -> RecoveryReason.MigrationOrRecovery
-                        else -> RecoveryReason.UnreadableRecord
-                    }, read))
-                } else if (known == null && !confirmOnly) {
-                    historyUnavailable(command, read)
-                } else {
-                    phase.set(ControlAttemptPhase.PreparingCandidate)
-                    val handover = (command.body as? ControlCommandBody.Handover)?.input
-                    val own = ControlAppliedEvidence.own(read, command)
-                    // Preserve actual observation even when later admission rejects the record.
-                    if (own != null) tracked.observedApplied.set(true)
-                    if (handover != null) {
-                        RetiredNamespaceSettlementTransition.recordProblem(read)?.let { reason ->
-                            return@transactRecord negative(ControlStoreResult.RecoveryRequired(
-                                command, emptySet(), emptySet(), reason, read))
+                val own = (read as? ControlRecordRead.Supported)?.let { ControlAppliedEvidence.own(it, command) }
+                // Actual observation precedes registration, schema and opaque-sibling rejection.
+                if (own != null) tracked.observedApplied.set(true)
+                val decision = run decision@ {
+                    if (read !is ControlRecordRead.Supported) {
+                        negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), when (read) {
+                            is ControlRecordRead.MigrationOrRecoveryRequired -> RecoveryReason.MigrationOrRecovery
+                            else -> RecoveryReason.UnreadableRecord
+                        }, read))
+                    } else if (known == null && !confirmOnly) {
+                        historyUnavailable(command, read)
+                    } else {
+                        phase.set(ControlAttemptPhase.PreparingCandidate)
+                        val handover = (command.body as? ControlCommandBody.Handover)?.input
+                        val lifecycle = (command.body as? ControlCommandBody.Lifecycle)?.input
+                        if (lifecycle != null) {
+                            ControlLifecycleBoundary.recordProblem(read)?.let { reason ->
+                                return@decision negative(ControlStoreResult.RecoveryRequired(
+                                    command, emptySet(), emptySet(), reason, read))
+                            }
                         }
-                    }
-                    val rotation = command.body as? ControlCommandBody.RotateAndSettle
-                    if (confirmOnly && rotation == null && handover == null) {
-                        if (checkpoint?.command !== command || !checkpoint.confirmationRequested ||
-                            checkpoint.targets.size != command.actions.size || checkpoint.targets.any { it == null } ||
-                            (known != null && !matchesLocalHistory(tracked, checkpoint)) ||
-                            !matchesPreparedActions(command, checkpoint)
-                        ) return@transactRecord historyUnavailable(command, read)
-                        if (known == null) {
-                            tracked.targets.set(checkpoint.targets)
+                        if (handover != null) {
+                            RetiredNamespaceSettlementTransition.recordProblem(read)?.let { reason ->
+                                return@decision negative(ControlStoreResult.RecoveryRequired(
+                                    command, emptySet(), emptySet(), reason, read))
+                            }
+                        }
+                        val rotation = command.body as? ControlCommandBody.RotateAndSettle
+                        if (confirmOnly && rotation == null && handover == null && lifecycle == null) {
+                            if (checkpoint?.command !== command || !checkpoint.confirmationRequested ||
+                                checkpoint.targets.size != command.actions.size || checkpoint.targets.any { it == null } ||
+                                (known != null && !matchesLocalHistory(tracked, checkpoint)) ||
+                                !matchesPreparedActions(command, checkpoint)
+                            ) return@decision historyUnavailable(command, read)
+                            if (known == null) {
+                                tracked.targets.set(checkpoint.targets)
+                                tracked.confirmationRequested.set(true)
+                            }
+                        }
+                        if (ControlAppliedEvidence.hasOpaqueOwn(read, command)) return@decision negative(
+                            ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), RecoveryReason.UninterpretableMetadata, read))
+                        var onlyConfirm = confirmOnly
+                        if (own != null) {
+                            if (!ControlAppliedEvidence.matches(command, tracked, own)) return@decision negative(
+                                ControlStoreResult.Conflict(command, emptySet(), emptySet(), ConflictReason.CommandEvidenceMismatch,
+                                    TargetExpectation(command, tracked.targets.get().map { it?.id }), read))
+                            onlyConfirm = true
+                        } else if (tracked.observedApplied.get()) {
+                            return@decision negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(),
+                                RecoveryReason.CommandEvidenceLost, read))
+                        } else if (tracked.confirmed.get()) {
+                            onlyConfirm = true
+                        } else if (!confirmOnly && tracked.firstConfirmDiscontinuityCount?.let {
+                                it != tracking.evidenceDiscontinuityCount
+                            } == true) {
+                            return@decision negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(),
+                                RecoveryReason.CommandEvidenceContinuityLost, read))
+                        }
+                        val decision = if (lifecycle != null) {
+                            ControlLifecycleConfirmation(codec).decide(command, lifecycle, read, context,
+                                onlyConfirm, tracked.confirmed.get())
+                        } else if (handover is RetiredNamespaceSettlement) {
+                            RetiredNamespaceSettlementTransition(codec).decide(command, handover, read, context,
+                                onlyConfirm, tracked.confirmed.get())
+                        } else if (handover is CurrentNullSettlement) {
+                            CurrentNullSettlementTransition(codec).decide(command, handover, read, context,
+                                onlyConfirm, tracked.confirmed.get())
+                        } else if (handover is RetiredNullSettlement) {
+                            RetiredNullSettlementTransition(codec).decide(command, handover, read, context,
+                                onlyConfirm, tracked.confirmed.get())
+                        } else if (rotation != null) {
+                            NamespaceSettlementTransition(codec).decide(command, rotation.input, read, context,
+                                onlyConfirm, tracked.confirmed.get())
+                        } else decide(command, tracked, read, onlyConfirm)
+                        if (decision is RecordTransactionDecision.Confirm) {
+                            // All candidate checks are complete. This precedes write-scope entry and cancellation.
+                            if (known != null) tracked.bindFirstConfirm(tracking.evidenceDiscontinuityCount)
+                            tracked.expectedApplied = ControlAppliedEvidence.own(
+                                reader.read(decision.candidate) as ControlRecordRead.Supported, command)
                             tracked.confirmationRequested.set(true)
+                            phase.set(ControlAttemptPhase.ConfirmingStorage)
                         }
+                        decision
                     }
-                    if (ControlAppliedEvidence.hasOpaqueOwn(read, command)) return@transactRecord negative(
-                        ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), RecoveryReason.UninterpretableMetadata, read))
-                    var onlyConfirm = confirmOnly
-                    if (own != null) {
-                        if (!ControlAppliedEvidence.matches(command, tracked, own)) return@transactRecord negative(
-                            ControlStoreResult.Conflict(command, emptySet(), emptySet(), ConflictReason.CommandEvidenceMismatch,
-                                TargetExpectation(command, tracked.targets.get().map { it?.id }), read))
-                        onlyConfirm = true
-                    } else if (tracked.observedApplied.get()) {
-                        return@transactRecord negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(),
-                            RecoveryReason.CommandEvidenceLost, read))
-                    } else if (tracked.confirmed.get()) {
-                        onlyConfirm = true
-                    } else if (!confirmOnly && tracked.firstConfirmDiscontinuityCount?.let {
-                            it != tracking.evidenceDiscontinuityCount
-                        } == true) {
-                        return@transactRecord negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(),
-                            RecoveryReason.CommandEvidenceContinuityLost, read))
-                    }
-                    val decision = if (handover is RetiredNamespaceSettlement) {
-                        RetiredNamespaceSettlementTransition(codec).decide(command, handover, read, context,
-                            onlyConfirm, tracked.confirmed.get())
-                    } else if (handover is CurrentNullSettlement) {
-                        CurrentNullSettlementTransition(codec).decide(command, handover, read, context,
-                            onlyConfirm, tracked.confirmed.get())
-                    } else if (handover is RetiredNullSettlement) {
-                        RetiredNullSettlementTransition(codec).decide(command, handover, read, context,
-                            onlyConfirm, tracked.confirmed.get())
-                    } else if (rotation != null) {
-                        NamespaceSettlementTransition(codec).decide(command, rotation.input, read, context,
-                            onlyConfirm, tracked.confirmed.get())
-                    } else decide(command, tracked, read, onlyConfirm)
-                    if (decision is RecordTransactionDecision.Confirm) {
-                        // All candidate checks are complete. This precedes write-scope entry and cancellation.
-                        if (known != null) tracked.bindFirstConfirm(tracking.evidenceDiscontinuityCount)
-                        tracked.expectedApplied = ControlAppliedEvidence.own(
-                            reader.read(decision.candidate) as ControlRecordRead.Supported, command)
-                        tracked.confirmationRequested.set(true)
-                        phase.set(ControlAttemptPhase.ConfirmingStorage)
-                    }
-                    decision
+                }
+                val diagnostic = ControlLifecycleDiagnostics.observe(command, tracked, read,
+                    (decision.value as? Outcome.Negative)?.result)
+                if (diagnostic != null) command.observeLifecycleDiagnostic(diagnostic)
+                when (val outcome = decision.value) {
+                    is Outcome.Negative -> negative(ControlLifecycleDiagnostics.attach(outcome.result, diagnostic))
+                    is Outcome.Positive -> decision
                 }
             }
             return when (val outcome = transaction.value) {
                 is Outcome.Positive -> {
                     val confirmedSnapshot = ConfirmedControlSnapshot(reader.read(transaction.snapshot) as ControlRecordRead.Supported)
                     if (ControlAppliedEvidence.own(confirmedSnapshot.record, command) != null) tracked.observedApplied.set(true)
+                    val diagnostic = ControlLifecycleDiagnostics.observe(command, tracked, confirmedSnapshot.record,
+                        result = null, storageConfirmed = true)
+                    if (diagnostic != null) command.observeLifecycleDiagnostic(diagnostic)
                     tracked.confirmed.set(true)
                     tracking.resolve(command)
                     val work = tracking.recoverySnapshot()
                     ControlStoreResult.Confirmed(
                         command, work.unresolvedCommands, work.pendingReleases, outcome.effect, outcome.ids,
                         confirmedSnapshot,
-                        ConfirmationProof(transaction.evidence), outcome.receipt
+                        ConfirmationProof(transaction.evidence), outcome.receipt, diagnostic
                     )
                 }
                 is Outcome.Negative -> {
@@ -430,8 +452,10 @@ internal class ControlRecordStore(
             throw cancelled
         } catch (failure: IOException) {
             val work = tracking.recoverySnapshot()
-            return ControlStoreResult.Unconfirmed(command, work.unresolvedCommands, work.pendingReleases, UnconfirmedReason.StorageFailure,
+            val result = ControlStoreResult.Unconfirmed(command, work.unresolvedCommands, work.pendingReleases, UnconfirmedReason.StorageFailure,
                 phase.get(), observation.get(), failure)
+            // No invented snapshot on I/O failure; retain only the last actual observation.
+            return ControlLifecycleDiagnostics.attach(result, command.lastLifecycleDiagnostic)
         }
     }
 

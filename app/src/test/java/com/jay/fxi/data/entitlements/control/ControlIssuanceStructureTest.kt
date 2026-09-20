@@ -182,8 +182,8 @@ class ControlIssuanceStructureTest {
         private const val control = ent + "control/"
         private val expected = mapOf(
             "registerPrepared" to mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 5),
-            // Includes handover metadata return labels; L now uses the shared transaction dispatch.
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 14),
+            // Lifecycle diagnostics collect negative decisions before returning from the transaction.
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 8),
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,
@@ -192,7 +192,8 @@ class ControlIssuanceStructureTest {
             "EpochIdGenerator.Random" to mapOf("main/java/com/jay/fxi/di/EntitlementsModule.kt" to 1, ent + "DataStoreAccessEpochStore.kt" to 1),
             "UUID::randomUUID" to mapOf(control + "ControlRecordStore.kt" to 1),
             "ControlRecordStore" to mapOf(control + "ControlRecordStore.kt" to 1, control + "NamespaceSettlementTransition.kt" to 1,
-                control + "RetiredNamespaceSettlementTransition.kt" to 1, control + "CurrentNullSettlementTransition.kt" to 1, control + "RetiredNullSettlementTransition.kt" to 1),
+                control + "RetiredNamespaceSettlementTransition.kt" to 1, control + "CurrentNullSettlementTransition.kt" to 1, control + "RetiredNullSettlementTransition.kt" to 1,
+                control + "ControlLifecycle.kt" to 1),
             "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 2,
                 control + "ControlStoreResult.kt" to 1, control + "ControlAppliedEvidence.kt" to 1)
         )

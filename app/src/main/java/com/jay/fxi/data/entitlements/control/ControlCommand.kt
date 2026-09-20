@@ -73,6 +73,7 @@ internal sealed interface ControlCommandBody {
     class Mutations(actions: List<ControlMutation>) : ControlCommandBody {
         val actions: List<ControlMutation> = Collections.unmodifiableList(actions.toList())
     }
+    class Lifecycle(val input: ControlLifecycleDescriptor) : ControlCommandBody
     class RotateAndSettle(val input: RotateAndSettleNamespaces) : ControlCommandBody
 
     /** Type declarations only: preparation and execution arrive with each named transition. */

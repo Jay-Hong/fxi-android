@@ -22,6 +22,10 @@ internal object ControlAppliedEvidence {
         if (row.ownerTrackingLifetimeId != command.ownerTrackingLifetimeId.value) return false
         if (row.commandId != command.id) return false
         when (val body = command.body) {
+            is ControlCommandBody.Lifecycle -> {
+                if (row !is AppliedEvidence.Lifecycle) return false
+                if (!ControlLifecycleEvidence.matches(body.input, row)) return false
+            }
             is ControlCommandBody.RotateAndSettle -> {
                 if (row !is AppliedEvidence.Rotation) return false
                 if (row.sealIds != body.input.seals.map { it.id }) return false
@@ -99,6 +103,12 @@ internal object ControlAppliedEvidence {
             "ownerTrackingLifetimeId" to JsonPrimitive(row.ownerTrackingLifetimeId)
         )
         val extra = when (row) {
+            is AppliedEvidence.Lifecycle -> mapOf(
+                "kind" to JsonPrimitive("CONTROL_LIFECYCLE"), "transition" to JsonPrimitive(row.transition.name),
+                "targets" to JsonArray(row.targets.map {
+                    JsonObject(linkedMapOf("kind" to JsonPrimitive(it.kind.name), "id" to JsonPrimitive(it.id),
+                        "effect" to JsonPrimitive(it.effect.name)))
+                }))
             is AppliedEvidence.Mutations -> mapOf(
                 "kind" to JsonPrimitive("MUTATIONS"), "targets" to JsonArray(row.targets.map {
                     JsonObject(linkedMapOf("index" to JsonPrimitive(it.index), "kind" to JsonPrimitive(it.kind.name),

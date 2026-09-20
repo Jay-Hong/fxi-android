@@ -11,6 +11,10 @@ internal class CommandRef internal constructor(
     val body: ControlCommandBody,
     val ownerTrackingLifetimeId: OwnerTrackingLifetimeId
 ) {
+    private val diagnostic = AtomicReference<ControlLifecycleDiagnostic?>(null)
+    val lastLifecycleDiagnostic: ControlLifecycleDiagnostic? get() = diagnostic.get()
+    internal fun observeLifecycleDiagnostic(value: ControlLifecycleDiagnostic) { diagnostic.set(value) }
+
     private val lifecycle = AtomicReference(ControlCommandLifecycle.RETAINED)
     val lifecycleState: ControlCommandLifecycle get() = lifecycle.get()
 
@@ -25,6 +29,9 @@ internal class CommandRef internal constructor(
     }
 
     init {
+        require(body !is ControlCommandBody.Lifecycle || id == body.input.operationId) {
+            "lifecycle command id must equal operationId"
+        }
         require(body !is ControlCommandBody.Handover || id == body.input.operationId) {
             "handover command id must equal operationId"
         }
@@ -83,6 +90,7 @@ internal enum class ControlAttemptPhase { ReadingSnapshot, PreparingCandidate, C
  */
 internal sealed interface ControlStoreResult {
     val command: CommandRef
+    val lifecycleDiagnostic: ControlLifecycleDiagnostic? get() = null
     val localUnresolvedCommands: Set<CommandRef>
     val localPendingReleases: Set<CommandRef>
 
@@ -94,8 +102,10 @@ internal sealed interface ControlStoreResult {
         val effectiveIds: List<String>,
         val snapshot: ConfirmedControlSnapshot,
         val proof: ConfirmationProof,
-        val receipt: ControlSettlementReceipt? = null
+        val receipt: ControlSettlementReceipt? = null,
+        override val lifecycleDiagnostic: ControlLifecycleDiagnostic? = null
     ) : ControlStoreResult {
+        val lifecycleReceipt: ControlLifecycleReceipt? = receipt as? ControlLifecycleReceipt
         val settlement: SettlementReceipt? = receipt as? SettlementReceipt
         val handoverSettlement: HandoverSettlementReceipt? = receipt as? HandoverSettlementReceipt
     }
@@ -105,7 +115,8 @@ internal sealed interface ControlStoreResult {
         override val localUnresolvedCommands: Set<CommandRef>,
         override val localPendingReleases: Set<CommandRef>,
         val reason: RejectionReason,
-        val observation: ControlRecordRead?
+        val observation: ControlRecordRead?,
+        override val lifecycleDiagnostic: ControlLifecycleDiagnostic? = null
     ) : ControlStoreResult
 
     data class Conflict(
@@ -114,7 +125,8 @@ internal sealed interface ControlStoreResult {
         override val localPendingReleases: Set<CommandRef>,
         val reason: ConflictReason,
         val expected: TargetExpectation,
-        val observation: ControlRecordRead.Supported
+        val observation: ControlRecordRead.Supported,
+        override val lifecycleDiagnostic: ControlLifecycleDiagnostic? = null
     ) : ControlStoreResult
 
     data class RecoveryRequired(
@@ -122,7 +134,8 @@ internal sealed interface ControlStoreResult {
         override val localUnresolvedCommands: Set<CommandRef>,
         override val localPendingReleases: Set<CommandRef>,
         val reason: RecoveryReason,
-        val observation: ControlRecordRead
+        val observation: ControlRecordRead,
+        override val lifecycleDiagnostic: ControlLifecycleDiagnostic? = null
     ) : ControlStoreResult
 
     data class Unconfirmed(
@@ -132,7 +145,8 @@ internal sealed interface ControlStoreResult {
         val reason: UnconfirmedReason,
         val phase: ControlAttemptPhase,
         val lastObservation: ControlRecordRead?,
-        val failure: java.io.IOException? = null
+        val failure: java.io.IOException? = null,
+        override val lifecycleDiagnostic: ControlLifecycleDiagnostic? = null
     ) : ControlStoreResult
 
     /** Execution is closed; these results issue no business snapshot, effect or storage proof. */

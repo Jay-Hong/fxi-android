@@ -42,6 +42,15 @@ sealed interface AppliedEvidence {
         val sealIds: List<String> = Collections.unmodifiableList(sealIds.toList())
     }
 
+    class Lifecycle internal constructor(
+        override val commandId: String,
+        override val ownerTrackingLifetimeId: String,
+        val transition: LifecycleTransition,
+        targets: List<LifecycleTarget>
+    ) : AppliedEvidence {
+        val targets: List<LifecycleTarget> = Collections.unmodifiableList(targets.toList())
+    }
+
     class Settlement internal constructor(
         override val commandId: String,
         override val ownerTrackingLifetimeId: String,
@@ -135,6 +144,7 @@ internal object ControlEvidenceReader {
                 if (demand in seals) return null
                 AppliedEvidence.Rotation(commandId, owner, seals, demand)
             }
+            "CONTROL_LIFECYCLE" -> ControlLifecycleEvidence.parse(node, commandId, owner)
             "SETTLEMENT" -> {
                 if (node.hasNamesBeyond(settlementNames)) return null
                 val transition = (node.enumName("transition", HandoverSettlementTransition.entries)

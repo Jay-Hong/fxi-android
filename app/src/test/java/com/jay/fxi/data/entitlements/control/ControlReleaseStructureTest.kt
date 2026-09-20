@@ -70,10 +70,13 @@ class ControlReleaseStructureTest {
         assertFalse(TrackedControlCommand::class.java.declaredMethods.any { it.name.startsWith("setReleaseDescriptor") })
     }
     @Test fun M07_refHasOnlyIdentityInputsAndSmallTerminalCell() {
-        assertEquals(setOf("id", "body", "ownerTrackingLifetimeId", "lifecycle"),
+        assertEquals(setOf("id", "body", "ownerTrackingLifetimeId", "lifecycle", "diagnostic"),
             contractFieldNames(CommandRef::class.java))
         assertEquals(java.util.concurrent.atomic.AtomicReference::class.java,
             CommandRef::class.java.getDeclaredField("lifecycle").type)
+        // 5a adds one replaceable observation, never a growing history or a release authority.
+        assertEquals("java.util.concurrent.atomic.AtomicReference<com.jay.fxi.data.entitlements.control.ControlLifecycleDiagnostic>",
+            CommandRef::class.java.getDeclaredField("diagnostic").genericType.typeName)
         assertEquals(setOf("RETAINED", "RELEASE_PENDING", "RELEASED"), ControlCommandLifecycle.entries.map { it.name }.toSet())
     }
     @Test fun M08_noReleasedIdReservationAndOnlyConditionalCleanup() {
