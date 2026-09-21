@@ -45,7 +45,8 @@ internal class ControlLifecycleDescriptor(
     val executor: SettlementExecutor? = null,
     val namespace: LifecycleNamespacePostcondition? = null,
     requiredUnchanged: List<LifecycleFixedTarget> = emptyList(),
-    val demandAuth: DemandAuthPlan? = null
+    val demandAuth: DemandAuthPlan? = null,
+    val removeEmptyGuard: RemoveEmptyGuardPlan? = null
 ) {
     val targets: List<LifecycleFixedTarget> = Collections.unmodifiableList(targets.toList())
     // Required effects already satisfied before the command are checked without fake wire targets.
@@ -213,6 +214,7 @@ internal class ControlLifecycleConfirmation(private val codec: ControlPayloadCod
             ControlLifecycleBoundary.current(it, context, read.original)?.let { reason -> return conflict(reason) }
         }
         if (input.demandAuth != null && context != null) return DemandAuthTransition(codec).decide(command, input, read, context)
+        if (input.removeEmptyGuard != null) return RemoveEmptyGuardTransition(codec).decide(command, input, read)
         return reject("LifecycleWriterUnavailable")
     }
 

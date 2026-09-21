@@ -73,6 +73,18 @@ internal class ControlRecordStore(
         return tracking.registerPrepared(CommandRef(id, ControlCommandBody.Lifecycle(plan.descriptor(id)), tracking.lifetimeId))
     }
 
+    /** Global guard cleanup: neither REQUEST count nor current AUTH authority proves emptiness. */
+    fun prepareRemoveEmptyGuard(expected: ControlNode): CommandRef {
+        val id = ids.next().toString()
+        val input = RemoveEmptyGuardPlan.prepare(expected).descriptor(id)
+        return tracking.registerPrepared(CommandRef(id, ControlCommandBody.Lifecycle(input), tracking.lifetimeId))
+    }
+
+    /** Preparation only. 5d must join this fixed floor plan to source removal in one transaction. */
+    fun prepareHoldFloor(hold: ControlNode, guard: ControlNode?, mergeNow: BootReading,
+        origin: LifetimeId): HoldFloorPlan? = HoldFloorPlan.prepare(
+        HoldFloorInput(hold, guard, mergeNow, origin, ids.next().toString()))
+
     /** Issue operation, demand and axis UUIDs independently, once. Context is supplied at execution. */
     fun prepareRotation(
         targets: List<ControlNode>, before: FenceV1, origin: LifetimeId, demand: SettlementDemand
