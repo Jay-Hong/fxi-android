@@ -181,7 +181,7 @@ class ControlIssuanceStructureTest {
         private const val ent = "main/java/com/jay/fxi/data/entitlements/"
         private const val control = ent + "control/"
         private val expected = mapOf(
-            "registerPrepared" to mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 7),
+            "registerPrepared" to mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 8),
             // Lifecycle diagnostics collect negative decisions before returning from the transaction.
             "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 8),
             // Identifier rows include declarations, types, imports, comments and references.
@@ -193,7 +193,7 @@ class ControlIssuanceStructureTest {
             "UUID::randomUUID" to mapOf(control + "ControlRecordStore.kt" to 1),
             "ControlRecordStore" to mapOf(control + "ControlRecordStore.kt" to 1, control + "NamespaceSettlementTransition.kt" to 1,
                 control + "RetiredNamespaceSettlementTransition.kt" to 1, control + "CurrentNullSettlementTransition.kt" to 1, control + "RetiredNullSettlementTransition.kt" to 1,
-                control + "ControlLifecycle.kt" to 1, control + "DemandAuthTransition.kt" to 1, control + "RemoveEmptyGuardTransition.kt" to 1),
+                control + "ControlLifecycle.kt" to 1, control + "DemandAuthTransition.kt" to 1, control + "RemoveEmptyGuardTransition.kt" to 1, control + "RecoverHoldTransition.kt" to 1),
             "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 2,
                 control + "ControlStoreResult.kt" to 1, control + "ControlAppliedEvidence.kt" to 1)
         )

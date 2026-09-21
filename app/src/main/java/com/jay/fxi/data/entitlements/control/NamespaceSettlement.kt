@@ -17,7 +17,8 @@ internal data class AttemptContext(
     val originLifetimeId: LifetimeId,
     val signOutOpen: Boolean,
     val identityPersistencePending: Boolean,
-    val demandAuth: DemandAuthRuntime? = null
+    val demandAuth: DemandAuthRuntime? = null,
+    val holdRecovery: HoldRecoveryRuntime? = null
 )
 
 internal data class SettlementDemand(

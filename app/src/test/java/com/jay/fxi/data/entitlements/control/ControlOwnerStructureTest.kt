@@ -72,6 +72,16 @@ class ControlOwnerStructureTest {
                 "private class OwnerKey(owner: DataStoreAccessEpochStore) :",
                 "WeakReference<DataStoreAccessEpochStore>(owner, collected) {",
             ),
+            "main/java/com/jay/fxi/data/entitlements/control/RecoverHoldTransition.kt" to listOf(
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.KRX_EPOCH",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.MAY_CONTAIN_KRX",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.MAY_CONTAIN_PREMIUM",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.OWNER_UID",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.PURGE_JOURNAL",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.TEARDOWN_OWED_FOR",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.USER_EPOCH",
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.encode",
+            ),
             "main/java/com/jay/fxi/data/entitlements/control/DemandAuthTransition.kt" to listOf(
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.OWNER_UID",
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.USER_EPOCH",

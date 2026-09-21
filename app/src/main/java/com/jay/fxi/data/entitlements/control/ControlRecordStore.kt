@@ -85,6 +85,20 @@ internal class ControlRecordStore(
         origin: LifetimeId): HoldFloorPlan? = HoldFloorPlan.prepare(
         HoldFloorInput(hold, guard, mergeNow, origin, ids.next().toString()))
 
+    /** Fixed source, UUIDs, order and floor anchor; execution never retains or reuses the suppliers. */
+    fun prepareRecoverHold(input: RecoverHoldInput, orders: LifecycleOrderSource): CommandRef {
+        val source = HoldRecoverySource.from(input.source)
+        val rotating = source?.axes.orEmpty().filter {
+            RecoveryRetirementBoundary.rotationRequired(checkNotNull(source), it, input.before)
+        }
+        val issued = RecoverHoldIds(ids.next().toString(), ids.next().toString(), ids.next().toString(),
+            RecoveryFreshEpochs(if (PurgeScope.USER in rotating) ids.next().toString() else null,
+                if (PurgeScope.CAPABILITY in rotating) ids.next().toString() else null))
+        val plan = RecoverHoldPlan.prepare(input, issued, orders)
+        return tracking.registerPrepared(CommandRef(issued.operationId,
+            ControlCommandBody.Lifecycle(plan.descriptor()), tracking.lifetimeId))
+    }
+
     /** Issue operation, demand and axis UUIDs independently, once. Context is supplied at execution. */
     fun prepareRotation(
         targets: List<ControlNode>, before: FenceV1, origin: LifetimeId, demand: SettlementDemand

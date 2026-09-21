@@ -46,7 +46,8 @@ internal class ControlLifecycleDescriptor(
     val namespace: LifecycleNamespacePostcondition? = null,
     requiredUnchanged: List<LifecycleFixedTarget> = emptyList(),
     val demandAuth: DemandAuthPlan? = null,
-    val removeEmptyGuard: RemoveEmptyGuardPlan? = null
+    val removeEmptyGuard: RemoveEmptyGuardPlan? = null,
+    val recoverHold: RecoverHoldPlan? = null
 ) {
     val targets: List<LifecycleFixedTarget> = Collections.unmodifiableList(targets.toList())
     // Required effects already satisfied before the command are checked without fake wire targets.
@@ -179,6 +180,13 @@ internal class ControlLifecycleConfirmation(private val codec: ControlPayloadCod
         fun recovery(reason: RecoveryReason) = negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), reason, read))
         ControlLifecycleBoundary.recordProblem(read)?.let { return recovery(it) }
         input.demandAuth?.preparationFailure?.let { return reject(it) }
+        input.recoverHold?.preparationProblem?.let { problem ->
+            return when (problem) {
+                is HoldRecoveryProblem.Rejected -> negative(ControlStoreResult.Rejected(command, emptySet(), emptySet(), problem.reason, read))
+                is HoldRecoveryProblem.Conflict -> conflict(problem.reason)
+                is HoldRecoveryProblem.RecoveryRequired -> recovery(problem.reason)
+            }
+        }
         if (!validDescriptor(input)) return reject("InvalidLifecycleDescriptor")
         ControlLifecycleBoundary.rawProblem(read.original)?.let { return recovery(it) }
         val own = ControlAppliedEvidence.own(read, command)
@@ -215,6 +223,7 @@ internal class ControlLifecycleConfirmation(private val codec: ControlPayloadCod
         }
         if (input.demandAuth != null && context != null) return DemandAuthTransition(codec).decide(command, input, read, context)
         if (input.removeEmptyGuard != null) return RemoveEmptyGuardTransition(codec).decide(command, input, read)
+        if (input.recoverHold != null && context != null) return RecoverHoldTransition(codec).decide(command, input, read, context)
         return reject("LifecycleWriterUnavailable")
     }
 
