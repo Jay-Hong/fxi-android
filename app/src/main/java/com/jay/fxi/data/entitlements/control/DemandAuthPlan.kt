@@ -25,6 +25,7 @@ internal class DemandAuthPlan private constructor(
     targets: List<LifecycleFixedTarget>,
     unchanged: List<LifecycleFixedTarget>,
     grants: Map<String, LifecycleOrderGrant>,
+    val authStopGrant: LifecycleOrderGrant?,
     val preparationFailure: String?
 ) {
     val targets = Collections.unmodifiableList(targets.toList())
@@ -105,6 +106,7 @@ internal class DemandAuthPlan private constructor(
         val changes = mutableListOf<LifecycleFixedTarget>()
         val unchanged = mutableListOf<LifecycleFixedTarget>()
         val grants = mutableMapOf<String, LifecycleOrderGrant>()
+        var authStopGrant: LifecycleOrderGrant? = null
         var failure: String? = null
         var guardBefore: ControlNode? = null
         var guardAfter: ControlNode? = null
@@ -169,6 +171,9 @@ internal class DemandAuthPlan private constructor(
             if (auth != null && DemandAuthBoundary.answerOrder(auth, d.query.order.value)) {
                 if ((d.outcome as? EntitlementsOutcome.Indeterminate)?.reason == IndeterminateReason.AUTHENTICATION) {
                     val grant = issue("auth", maxOf(auth.authStopAppliedOrder, d.query.order.value)) ?: return
+                    // The map retains the legacy diagnostic entry; REQUEST ids may overwrite it.
+                    // AUTH validation uses this separate, fixed issuance fact.
+                    authStopGrant = grant
                     auth = auth.copy(authStopped = true, authStateOrder = d.query.order.value, authStopAppliedOrder = grant.value)
                 } else if (auth.authStopped) auth = auth.copy(authStopped = false, authStateOrder = d.query.order.value)
             }
@@ -187,7 +192,7 @@ internal class DemandAuthPlan private constructor(
         fun finish(transition: LifecycleTransition, event: LifecycleAuthEvent? = null, decision: AcceptedQueryDecision? = null,
             closure: LifecycleBindingClosure? = null, replacement: LifecycleBinding? = null): DemandAuthPlan =
             DemandAuthPlan(binding, transition, event, decision, closure, replacement, guardBefore, guardAfter,
-                retryBefore, retryAfter, minRetry, mergeNow, requiredFloor, existingFloor, changes, unchanged, grants, failure)
+                retryBefore, retryAfter, minRetry, mergeNow, requiredFloor, existingFloor, changes, unchanged, grants, authStopGrant, failure)
     }
 }
 

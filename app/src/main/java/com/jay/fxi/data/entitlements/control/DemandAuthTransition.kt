@@ -144,7 +144,7 @@ internal class DemandAuthTransition(private val codec: ControlPayloadCodec) {
         } else if (beforeAuth != null && afterAuth != null && beforeAuth != afterAuth) {
             if (!DemandAuthBoundary.authChange(beforeAuth, afterAuth)) return "AuthEventIneligible" // W.authChange
             if (afterAuth.authStopped) {
-                val grant = plan.grants["auth"] ?: return "OrderExhausted"
+                val grant = plan.authStopGrant ?: return "OrderExhausted"
                 if (!DemandAuthBoundary.order(grant, binding, maxOf(beforeAuth.authStopAppliedOrder, afterAuth.authStateOrder))) return "OrderExhausted" // W.stopOrder
             }
         }
@@ -234,7 +234,7 @@ internal class DemandAuthTransition(private val codec: ControlPayloadCodec) {
             d != null && before != null && d.query.order.value > before.authStateOrder -> {
                 if ((d.outcome as? EntitlementsOutcome.Indeterminate)?.reason == IndeterminateReason.AUTHENTICATION)
                     before.copy(authStopped = true, authStateOrder = d.query.order.value,
-                        authStopAppliedOrder = plan.grants["auth"]?.value ?: return false)
+                        authStopAppliedOrder = plan.authStopGrant?.value ?: return false)
                 else if (before.authStopped) before.copy(authStopped = false, authStateOrder = d.query.order.value) else before
             }
             else -> before
