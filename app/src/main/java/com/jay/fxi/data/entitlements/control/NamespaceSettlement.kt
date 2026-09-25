@@ -18,7 +18,8 @@ internal data class AttemptContext(
     val signOutOpen: Boolean,
     val identityPersistencePending: Boolean,
     val demandAuth: DemandAuthRuntime? = null,
-    val holdRecovery: HoldRecoveryRuntime? = null
+    val holdRecovery: HoldRecoveryRuntime? = null,
+    val intentRecovery: HoldRecoveryRuntime? = null
 )
 
 internal data class SettlementDemand(

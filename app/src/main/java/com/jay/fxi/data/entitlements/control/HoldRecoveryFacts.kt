@@ -5,13 +5,18 @@ import com.jay.fxi.data.entitlements.RefreshIntent
 import java.util.Collections
 
 /** Archived source only. No conversion to a live outcome, query, grant or admission permit. */
-internal class HoldRecoverySource private constructor(val original: ControlNode, val hold: RestoredHold) {
+internal class HoldRecoverySource private constructor(override val original: ControlNode, val hold: RestoredHold) : RecoveryRetirementSource {
     /** Query.started.fence or Topic.context.access, including exact nulls. */
     val subject: FenceV1 = when (val provenance = hold.provenance) {
         is HoldProvenanceV1.Query -> provenance.started.fence
         is HoldProvenanceV1.Topic -> provenance.context.access
     }
-    val axes: Set<PurgeScope> = Collections.unmodifiableSet(hold.axes.toSet())
+    override val axes: Set<PurgeScope> = Collections.unmodifiableSet(hold.axes.toSet())
+    override val ownerUid: String? get() = subject.ownerUid
+    override fun targetEpoch(axis: PurgeScope): String? {
+        require(axis in axes)
+        return subject.epoch(axis)
+    }
 
     companion object {
         /** Schema-valid HOLD only; the implementation must detach the archived axis set. */

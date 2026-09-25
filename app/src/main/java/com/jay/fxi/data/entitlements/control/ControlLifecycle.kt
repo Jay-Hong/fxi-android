@@ -47,7 +47,8 @@ internal class ControlLifecycleDescriptor(
     requiredUnchanged: List<LifecycleFixedTarget> = emptyList(),
     val demandAuth: DemandAuthPlan? = null,
     val removeEmptyGuard: RemoveEmptyGuardPlan? = null,
-    val recoverHold: RecoverHoldPlan? = null
+    val recoverHold: RecoverHoldPlan? = null,
+    val recoverIntent: RecoverIntentPlan? = null
 ) {
     val targets: List<LifecycleFixedTarget> = Collections.unmodifiableList(targets.toList())
     // Required effects already satisfied before the command are checked without fake wire targets.
@@ -187,12 +188,22 @@ internal class ControlLifecycleConfirmation(private val codec: ControlPayloadCod
                 is HoldRecoveryProblem.RecoveryRequired -> recovery(problem.reason)
             }
         }
+        input.recoverIntent?.preparationProblem?.let { problem -> // RI.lifecyclePreparation
+            return when (problem) {
+                is HoldRecoveryProblem.Rejected -> negative(ControlStoreResult.Rejected(command, emptySet(), emptySet(), problem.reason, read))
+                is HoldRecoveryProblem.Conflict -> conflict(problem.reason)
+                is HoldRecoveryProblem.RecoveryRequired -> recovery(problem.reason)
+            }
+        }
         if (!validDescriptor(input)) return reject("InvalidLifecycleDescriptor")
         ControlLifecycleBoundary.rawProblem(read.original)?.let { return recovery(it) }
         val own = ControlAppliedEvidence.own(read, command)
         if (confirmOnly) {
             if (own == null && !previouslyConfirmed) return negative(ControlStoreResult.Unconfirmed(command, emptySet(), emptySet(),
                 UnconfirmedReason.HistoryUnavailable, ControlAttemptPhase.PreparingCandidate, read))
+            // Named RECOVER_INTENT descriptors were independently validated above. These exact
+            // targets and namespace facts confirm the handover without rechecking closure, source
+            // preimage or fresh reservations, and without rebuilding any effects.
             for (target in input.targets + input.requiredUnchanged) {
                 ControlLifecycleBoundary.postcondition(read, target)?.let { return conflict(it) }
             }
@@ -224,10 +235,16 @@ internal class ControlLifecycleConfirmation(private val codec: ControlPayloadCod
         if (input.demandAuth != null && context != null) return DemandAuthTransition(codec).decide(command, input, read, context)
         if (input.removeEmptyGuard != null) return RemoveEmptyGuardTransition(codec).decide(command, input, read)
         if (input.recoverHold != null && context != null) return RecoverHoldTransition(codec).decide(command, input, read, context)
+        if (input.recoverIntent != null && context != null) return RecoverIntentTransition(codec).decide(command, input, read, context) // RI.lifecycleDispatch
         return reject("LifecycleWriterUnavailable")
     }
 
     internal fun validDescriptor(input: ControlLifecycleDescriptor): Boolean {
+        input.recoverIntent?.let { plan ->
+            if (input.transition != LifecycleTransition.RECOVER_INTENT) return false // RI.lifecycleTransition
+            if (input.demandAuth != null || input.removeEmptyGuard != null || input.recoverHold != null) return false // RI.lifecycleOtherWriter
+            if (!RecoverIntentTransition(codec).validDescriptor(plan, input)) return false // RI.lifecycleDescriptor
+        }
         if (input.operationId.isEmpty()) return false
         if (!ControlLifecycleEvidence.validShape(input.transition, input.targets.map { it.target })) return false
         val all = input.targets + input.requiredUnchanged

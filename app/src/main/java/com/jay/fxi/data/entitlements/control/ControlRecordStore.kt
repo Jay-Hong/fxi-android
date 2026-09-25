@@ -99,6 +99,20 @@ internal class ControlRecordStore(
             ControlCommandBody.Lifecycle(plan.descriptor()), tracking.lifetimeId))
     }
 
+    /** Fixed intent source, IDs and rotating-axis UUIDs; no supplier is retained for retries. */
+    fun prepareRecoverIntent(input: RecoverIntentInput, orders: LifecycleOrderSource): CommandRef {
+        val source = IntentRecoverySource.from(input.source)
+        val rotating = source?.axes.orEmpty().filter {
+            RecoveryRetirementBoundary.rotationRequired(checkNotNull(source), it, input.before)
+        }
+        val issued = RecoverIntentIds(ids.next().toString(), ids.next().toString(),
+            RecoveryFreshEpochs(if (PurgeScope.USER in rotating) ids.next().toString() else null,
+                if (PurgeScope.CAPABILITY in rotating) ids.next().toString() else null))
+        val plan = RecoverIntentPlan.prepare(input, issued, orders)
+        return tracking.registerPrepared(CommandRef(issued.operationId,
+            ControlCommandBody.Lifecycle(plan.descriptor()), tracking.lifetimeId))
+    }
+
     /** Issue operation, demand and axis UUIDs independently, once. Context is supplied at execution. */
     fun prepareRotation(
         targets: List<ControlNode>, before: FenceV1, origin: LifetimeId, demand: SettlementDemand
