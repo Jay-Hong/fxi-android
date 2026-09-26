@@ -283,6 +283,25 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
 }
 
+// The accumulation suite is deliberately opt-in; keep the shared manifest setup above intact.
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    if (name != "testRotationAccumulation") {
+        filter.excludeTestsMatching("*.RotationAccumulationLongTest")
+    }
+}
+tasks.register<org.gradle.api.tasks.testing.Test>("testRotationAccumulation") {
+    val debugUnitTestForAccumulation = tasks.named<org.gradle.api.tasks.testing.Test>("testDebugUnitTest")
+    group = "verification"
+    description = "Runs only the opt-in rotation accumulation suite"
+    dependsOn("compileDebugUnitTestKotlin", "compileDebugUnitTestJavaWithJavac", "processDebugUnitTestJavaRes")
+    testClassesDirs = files(debugUnitTestForAccumulation.map { it.testClassesDirs })
+    classpath = files(debugUnitTestForAccumulation.map { it.classpath })
+    filter.includeTestsMatching("*.RotationAccumulationLongTest")
+    filter.isFailOnNoMatchingTests = true
+    systemProperty("fxi.rotation.report", layout.buildDirectory.file("reports/rotation-accumulation.txt").get().asFile.absolutePath)
+    testLogging.showStandardStreams = true
+}
+
 val verifyProductionGoogleServicesConfig = {
     check(Files.isRegularFile(productionGoogleServicesPath, LinkOption.NOFOLLOW_LINKS)) {
         "Public release requires a regular, non-symlink app/google-services.json; " +
