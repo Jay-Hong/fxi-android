@@ -119,6 +119,9 @@ class ControlOwnerStructureTest {
                 // 6-2B: the shared termination owner keeps the barrier owner-only for both plans; EvidenceAbsent return validation.
                 "\"read_barrier is owned by DataStoreAccessEpochStore\"",
                 "val barrier = DataStoreAccessEpochStore.READ_BARRIER",
+                // 6-3C2: the previous-lifetime Settlement reclamation owner keeps the barrier owner-only.
+                "val barrier = DataStoreAccessEpochStore.READ_BARRIER",
+                "\"read_barrier is owned by DataStoreAccessEpochStore\"",
             ),
             // 6-2B: the rotation consumption return validator compares without the owner's barrier.
             "main/java/com/jay/fxi/data/entitlements/control/ControlRotationConsumption.kt" to listOf(

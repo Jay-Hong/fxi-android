@@ -32,6 +32,31 @@ internal class PreviousEvidenceSelection(items: List<Item>) {
             is Item.Lifecycle -> Item.Lifecycle(item.commandId, item.rawApplied)
         }
     })
+
+    /** Validate fixed caller evidence without consulting the latest owner record. */
+    internal fun problem(currentLifetime: OwnerTrackingLifetimeId): String? {
+        if (items.isEmpty() || items.any { it !is Item.Settlement } ||
+            items.map { it.commandId }.toSet().size != items.size
+        ) return "invalid previous settlement selection"
+        val selectedIds = mutableSetOf<String>()
+        for (item in items.filterIsInstance<Item.Settlement>()) {
+            val evidence = ControlEvidenceReader.read(PayloadRead.Parsed(listOf(item.rawApplied.toPayloadEntry())))
+                .entries.single() as? ControlEvidenceEntryRead.Interpreted
+            val row = evidence?.value as? AppliedEvidence.Settlement
+                ?: return "invalid selected settlement evidence"
+            if (row.commandId != item.commandId || row.ownerTrackingLifetimeId == currentLifetime.value)
+                return "invalid selected settlement identity"
+            val seals = item.orderedRawSeals.map { raw ->
+                (ControlObligations.read(ControlKind.SEAL, raw) as? ControlEntryRead.Interpreted)?.value as? SealV1
+                    ?: return "invalid selected seal"
+            }
+            if (seals.map { it.id } != row.sealIds || seals.any {
+                    it.settlement?.operationId != item.commandId
+                } || seals.any { !selectedIds.add(it.id) }
+            ) return "invalid selected seal identities"
+        }
+        return null
+    }
 }
 
 private fun ControlNode.detached(): ControlNode = ControlNode.of(toPayloadEntry().fields)
@@ -80,6 +105,7 @@ internal object PreviousSettlementEvidenceReclamation {
             if (present != 0 || selectedIds.any { bySealId[it] != null } || seals.any {
                     ((it.value as SealV1).settlement?.operationId) in commandIds
                 }) return inconsistent
+            selection.problem(currentLifetime)?.let { return Decision.Rejected(RejectionReason.InvalidRequest(it)) }
             return Decision.Ready(read.original)
         }
 

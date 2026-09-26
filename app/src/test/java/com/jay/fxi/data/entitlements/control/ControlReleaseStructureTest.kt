@@ -228,7 +228,14 @@ class ControlReleaseStructureTest {
         assertTrue(order.filterNot { attempt.contains(it) }.toString(), order.all { attempt.contains(it) })
         assertEquals(order.map { attempt.indexOf(it) }.sorted(), order.map { attempt.indexOf(it) })
         assertFalse("S1: no closure re-check inside the decide", attempt.contains("violation("))
-        assertEquals("S1: four entry checks only", 4, Regex("closure\\.violation\\(").findAll(store).count())
+        // 6-3C2: four termination entry checks plus one previous-reclamation entry check, each inside its own entry.
+        assertEquals("S1: five entry checks in total", 5, Regex("closure\\.violation\\(").findAll(store).count())
+        val terminationEntries = listOf("suspend fun abandonBeforeFirstConfirm(", "suspend fun completeAfterConsumption(",
+            "suspend fun completeSettlementAfterConsumption(", "suspend fun retryTermination(")
+        assertEquals("S1: one check per termination entry", List(4) { 1 },
+            terminationEntries.map { Regex("closure\\.violation\\(").findAll(member(store, it)).count() })
+        assertEquals("S1: one previous entry check", 1, Regex("closure\\.violation\\(")
+            .findAll(member(store, "internal suspend fun reclaimPreviousSettlementOrLifecycleEvidence(")).count())
         // S2: projectDependency has one production caller, inside consumptionDependencyViolation.
         assertEquals(mapOf(control + "ControlRecordStore.kt" to 1, control + "DependencyProjection.kt" to 1),
             SealSourceTripwire.occurrences(all, "projectDependency"))

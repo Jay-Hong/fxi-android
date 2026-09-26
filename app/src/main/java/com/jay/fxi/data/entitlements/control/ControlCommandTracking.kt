@@ -78,7 +78,7 @@ internal class ControlCommandTracking private constructor() {
         commands[command.id]?.takeIf { it.command === command }
 
     /** Enumerate only for the owner's synchronous decision; no persistent dependency index. */
-    internal fun dependencyCandidatesExcluding(self: CommandRef): List<CommandRef> {
+    internal fun dependencyCandidatesExcluding(self: CommandRef?): List<CommandRef> {
         val work = recoverySnapshot()
         val candidates = ArrayList<CommandRef>()
         fun add(ref: CommandRef) {

@@ -641,6 +641,29 @@ internal class ControlRecordStore(
         }
     }
 
+    private sealed interface ConsumptionDependencyViolation {
+        data class Present(val dependent: CommandRef, val atom: DependencyAtom) : ConsumptionDependencyViolation
+        data class Unknown(val dependent: CommandRef, val source: DependencyGapSource?) : ConsumptionDependencyViolation
+    }
+
+    private fun consumptionDependencyViolation(self: CommandRef?,
+        protectedAtoms: Set<DependencyAtom>): ConsumptionDependencyViolation? {
+        for (dependent in tracking.dependencyCandidatesExcluding(self)) {
+            val view = dependent.captureStateAndBody()
+            val tracked = if (view.state == ControlCommandLifecycle.RELEASED ||
+                view.state == ControlCommandLifecycle.TERMINATED) null else tracking.findPrepared(dependent)
+            val projection = projectDependency(DependencyProjectionInput(dependent.id,
+                dependent.ownerTrackingLifetimeId.value, view, tracked?.targets?.get(),
+                tracked?.releaseDescriptor, tracked?.terminationDescriptor))
+            when (val intersection = classifyDependency(projection, protectedAtoms)) {
+                is DependencyIntersection.Present -> return ConsumptionDependencyViolation.Present(dependent, intersection.atom)
+                is DependencyIntersection.Unknown -> return ConsumptionDependencyViolation.Unknown(dependent, intersection.gap?.source)
+                DependencyIntersection.Clear -> Unit
+            }
+        }
+        return null
+    }
+
     private fun consumptionDependencyViolation(command: CommandRef,
         operationId: String, orderedSealIds: List<String>): CompletionRejectionReason? {
         val protectedAtoms = buildSet<DependencyAtom> {
@@ -650,22 +673,13 @@ internal class ControlRecordStore(
                 add(DependencyAtom.SealWitness(sealId, operationId))
             }
         }
-        for (dependent in tracking.dependencyCandidatesExcluding(command)) {
-            val view = dependent.captureStateAndBody()
-            val tracked = if (view.state == ControlCommandLifecycle.RELEASED ||
-                view.state == ControlCommandLifecycle.TERMINATED) null else tracking.findPrepared(dependent)
-            val projection = projectDependency(DependencyProjectionInput(dependent.id,
-                dependent.ownerTrackingLifetimeId.value, view, tracked?.targets?.get(),
-                tracked?.releaseDescriptor, tracked?.terminationDescriptor))
-            when (val intersection = classifyDependency(projection, protectedAtoms)) {
-                is DependencyIntersection.Present -> return CompletionRejectionReason.DependencyPresent(
-                    dependent.id, dependent.ownerTrackingLifetimeId.value, intersection.atom)
-                is DependencyIntersection.Unknown -> return CompletionRejectionReason.DependencyUnknown(
-                    dependent.id, dependent.ownerTrackingLifetimeId.value, intersection.gap?.source)
-                DependencyIntersection.Clear -> Unit
-            }
+        return when (val violation = consumptionDependencyViolation(command, protectedAtoms)) {
+            is ConsumptionDependencyViolation.Present -> CompletionRejectionReason.DependencyPresent(
+                violation.dependent.id, violation.dependent.ownerTrackingLifetimeId.value, violation.atom)
+            is ConsumptionDependencyViolation.Unknown -> CompletionRejectionReason.DependencyUnknown(
+                violation.dependent.id, violation.dependent.ownerTrackingLifetimeId.value, violation.source)
+            null -> null
         }
-        return null
     }
 
     private fun validateTerminationReturn(plan: TerminationPendingDescriptor, returned: ControlRecordRead,
@@ -735,6 +749,122 @@ internal class ControlRecordStore(
         } catch (failure: IOException) {
             ControlSchemaUpgradeResult.Unconfirmed(observation, failure)
         }
+    }
+
+    /** Reclaim only the caller's fixed previous-lifetime Settlement selection. */
+    internal suspend fun reclaimPreviousSettlementOrLifecycleEvidence(
+        selection: PreviousEvidenceSelection,
+        closure: PreviousReclamationClosure,
+        retry: Boolean = false
+    ): PreviousEvidenceReclamationResult {
+        fun rejected(reason: PreviousReclamationRejectionReason): PreviousEvidenceReclamationResult.Rejected {
+            val work = tracking.recoverySnapshot()
+            return PreviousEvidenceReclamationResult.Rejected(reason, null, work.unresolvedCommands, work.pendingReleases)
+        }
+        if (selection.items.any { it is PreviousEvidenceSelection.Item.Lifecycle })
+            return rejected(PreviousReclamationRejectionReason.UnsupportedInThisUnit)
+        selection.problem(tracking.lifetimeId)?.let {
+            return rejected(PreviousReclamationRejectionReason.InvalidSelection(it))
+        }
+        closure.violation(selection, tracking.lifetimeId)?.let {
+            return rejected(PreviousReclamationRejectionReason.ClosureNotSatisfied(it))
+        }
+
+        var observation: ControlRecordRead? = null
+        var confirmedCandidate: Preferences? = null
+        var disposition: PreviousReclamationDisposition? = null
+        try {
+            val transaction = owner.transactRecord<PreviousEvidenceReclamationResult?> { snapshot ->
+                val read = reader.read(snapshot)
+                tracking.observe(read)
+                observation = read
+                val decision = previousReclamationDecision(read, selection, retry)
+                if (decision is RecordTransactionDecision.Confirm) {
+                    val barrier = DataStoreAccessEpochStore.READ_BARRIER
+                    check(decision.candidate.asMap()[barrier] == snapshot.asMap()[barrier]) {
+                        "read_barrier is owned by DataStoreAccessEpochStore"
+                    }
+                    confirmedCandidate = decision.candidate
+                    disposition = if (decision.candidate === read.original) PreviousReclamationDisposition.AlreadyAbsent
+                        else PreviousReclamationDisposition.RemovedNow
+                }
+                decision
+            }
+            transaction.value?.let { return it.withPreviousRecoveryWork(tracking.recoverySnapshot()) }
+            val returned = reader.read(transaction.snapshot)
+            check(PreviousSettlementEvidenceReclamation.validateReturn(returned, selection,
+                checkNotNull(confirmedCandidate))) { "previous settlement reclamation was not confirmed" }
+            val work = tracking.recoverySnapshot()
+            return PreviousEvidenceReclamationResult.Reclaimed(
+                ConfirmedControlSnapshot(returned as ControlRecordRead.Supported), ConfirmationProof(transaction.evidence),
+                Collections.unmodifiableList(selection.items.map { it.commandId }), checkNotNull(disposition),
+                work.unresolvedCommands, work.pendingReleases)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: IOException) {
+            val work = tracking.recoverySnapshot()
+            return PreviousEvidenceReclamationResult.Unconfirmed(observation, failure,
+                work.unresolvedCommands, work.pendingReleases)
+        }
+    }
+
+    private fun previousReclamationDecision(read: ControlRecordRead, selection: PreviousEvidenceSelection,
+        retry: Boolean): RecordTransactionDecision<PreviousEvidenceReclamationResult?> {
+        fun recovery(reason: RecoveryReason) = RecordTransactionDecision.Observe<PreviousEvidenceReclamationResult?>(
+            PreviousEvidenceReclamationResult.RecoveryRequired(reason, read, emptySet(), emptySet()))
+        fun rejected(reason: PreviousReclamationRejectionReason) =
+            RecordTransactionDecision.Observe<PreviousEvidenceReclamationResult?>(
+                PreviousEvidenceReclamationResult.Rejected(reason, read, emptySet(), emptySet()))
+        if (read !is ControlRecordRead.Supported) return recovery(
+            if (read is ControlRecordRead.MigrationOrRecoveryRequired) RecoveryReason.MigrationOrRecovery
+            else RecoveryReason.UnreadableRecord)
+        if (read.schemaVersion != 2) return recovery(RecoveryReason.ControlSchemaMigrationRequired)
+        if (read.hasUninterpretableMetadata) return recovery(RecoveryReason.UninterpretableMetadata)
+        if (read.hasUninterpretable) return recovery(RecoveryReason.UninterpretableObligations)
+
+        val candidate = when (val decision = PreviousSettlementEvidenceReclamation.decide(
+            read, selection, tracking.lifetimeId, retry, codec)) {
+            is PreviousSettlementEvidenceReclamation.Decision.Recovery -> return recovery(decision.reason)
+            PreviousSettlementEvidenceReclamation.Decision.Conflict -> return RecordTransactionDecision.Observe(
+                PreviousEvidenceReclamationResult.Conflict(ConflictReason.CommandEvidenceMismatch, read,
+                    emptySet(), emptySet()))
+            is PreviousSettlementEvidenceReclamation.Decision.Rejected ->
+                return rejected(PreviousReclamationRejectionReason.Encoding(decision.reason))
+            is PreviousSettlementEvidenceReclamation.Decision.Ready -> decision.candidate
+        }
+        val protectedAtoms = buildSet<DependencyAtom> {
+            for (item in selection.items.filterIsInstance<PreviousEvidenceSelection.Item.Settlement>()) {
+                val row = (ControlEvidenceReader.read(PayloadRead.Parsed(listOf(item.rawApplied.toPayloadEntry())))
+                    .entries.single() as ControlEvidenceEntryRead.Interpreted).value as AppliedEvidence.Settlement
+                add(DependencyAtom.AppliedRow(item.commandId, row.ownerTrackingLifetimeId))
+                for (raw in item.orderedRawSeals) {
+                    val id = ((ControlObligations.read(ControlKind.SEAL, raw) as ControlEntryRead.Interpreted)
+                        .value as SealV1).id
+                    add(DependencyAtom.ControlRow(ControlKind.SEAL, id))
+                    add(DependencyAtom.SealWitness(id, item.commandId))
+                }
+            }
+        }
+        when (val violation = consumptionDependencyViolation(null, protectedAtoms)) {
+            is ConsumptionDependencyViolation.Present -> return rejected(PreviousReclamationRejectionReason.DependencyPresent(
+                violation.dependent.id, violation.dependent.ownerTrackingLifetimeId.value, violation.atom))
+            is ConsumptionDependencyViolation.Unknown -> return rejected(PreviousReclamationRejectionReason.DependencyUnknown(
+                violation.dependent.id, violation.dependent.ownerTrackingLifetimeId.value, violation.source))
+            null -> Unit
+        }
+        return RecordTransactionDecision.Confirm(candidate, null)
+    }
+
+    private fun PreviousEvidenceReclamationResult.withPreviousRecoveryWork(
+        work: LocalRecoveryWork): PreviousEvidenceReclamationResult = when (this) {
+        is PreviousEvidenceReclamationResult.Rejected -> copy(localUnresolvedCommands = work.unresolvedCommands,
+            localPendingReleases = work.pendingReleases)
+        is PreviousEvidenceReclamationResult.Conflict -> copy(localUnresolvedCommands = work.unresolvedCommands,
+            localPendingReleases = work.pendingReleases)
+        is PreviousEvidenceReclamationResult.RecoveryRequired -> copy(localUnresolvedCommands = work.unresolvedCommands,
+            localPendingReleases = work.pendingReleases)
+        is PreviousEvidenceReclamationResult.Reclaimed, is PreviousEvidenceReclamationResult.Unconfirmed ->
+            error("previous reclamation transaction carried a non-decision result")
     }
 
     /** Reclaims earlier tracker evidence atomically; current-lifetime rows are always retained. */
