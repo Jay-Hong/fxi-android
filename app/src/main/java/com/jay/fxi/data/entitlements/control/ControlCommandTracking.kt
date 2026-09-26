@@ -10,8 +10,9 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
-internal class TrackedControlCommand(val command: CommandRef) {
-    val targets = AtomicReference<List<ControlCommandTarget?>>(List(command.actions.size) { null })
+internal class TrackedControlCommand(val command: CommandRef, actions: List<ControlMutation>) {
+    constructor(command: CommandRef) : this(command, command.actions)
+    val targets = AtomicReference<List<ControlCommandTarget?>>(List(actions.size) { null })
     val confirmationRequested = AtomicBoolean(false)
     val confirmed = AtomicBoolean(false)
     val observedApplied = AtomicBoolean(false)

@@ -3,29 +3,51 @@ package com.jay.fxi.data.entitlements.control
 import com.jay.fxi.data.entitlements.RecordTransactionEvidence
 import java.util.concurrent.atomic.AtomicReference
 
-internal enum class ControlCommandLifecycle { RETAINED, RELEASE_PENDING, RELEASED }
+internal enum class ControlCommandLifecycle { RETAINED, RELEASE_PENDING, RELEASED, TERMINATION_PENDING, TERMINATED }
+
+internal data class RefCell(val state: ControlCommandLifecycle, val body: ControlCommandBody?)
+internal data class RefView(val state: ControlCommandLifecycle, val body: ControlCommandBody?)
 
 /** Prepared identity and fixed inputs, never evidence that an attempt executed. */
 internal class CommandRef internal constructor(
     val id: String,
-    val body: ControlCommandBody,
+    body: ControlCommandBody,
     val ownerTrackingLifetimeId: OwnerTrackingLifetimeId
 ) {
     private val diagnostic = AtomicReference<ControlLifecycleDiagnostic?>(null)
     val lastLifecycleDiagnostic: ControlLifecycleDiagnostic? get() = diagnostic.get()
     internal fun observeLifecycleDiagnostic(value: ControlLifecycleDiagnostic) { diagnostic.set(value) }
 
-    private val lifecycle = AtomicReference(ControlCommandLifecycle.RETAINED)
-    val lifecycleState: ControlCommandLifecycle get() = lifecycle.get()
+    private val cell = AtomicReference(RefCell(ControlCommandLifecycle.RETAINED, body))
+    val lifecycleState: ControlCommandLifecycle get() = cell.get().state
+    val body: ControlCommandBody get() = cell.get().body
+        ?: throw IllegalStateException("terminated command has no executable body")
+    internal fun captureStateAndBody(): RefView = cell.get().let { RefView(it.state, it.body) }
 
     // Internal transition sites are pinned to the validated owner release path by source tripwires.
     // The cell itself never escapes; neither operation restores business execution authority.
     internal fun beginRelease() {
-        check(lifecycle.compareAndSet(ControlCommandLifecycle.RETAINED, ControlCommandLifecycle.RELEASE_PENDING))
+        val current = cell.get()
+        check(current.state == ControlCommandLifecycle.RETAINED &&
+            cell.compareAndSet(current, RefCell(ControlCommandLifecycle.RELEASE_PENDING, current.body)))
     }
 
     internal fun completeRelease() {
-        check(lifecycle.compareAndSet(ControlCommandLifecycle.RELEASE_PENDING, ControlCommandLifecycle.RELEASED))
+        val current = cell.get()
+        check(current.state == ControlCommandLifecycle.RELEASE_PENDING &&
+            cell.compareAndSet(current, RefCell(ControlCommandLifecycle.RELEASED, current.body)))
+    }
+
+    internal fun beginTermination() {
+        val current = cell.get()
+        check(current.state == ControlCommandLifecycle.RETAINED &&
+            cell.compareAndSet(current, RefCell(ControlCommandLifecycle.TERMINATION_PENDING, current.body)))
+    }
+
+    internal fun completeTermination() {
+        val current = cell.get()
+        check(current.state == ControlCommandLifecycle.TERMINATION_PENDING &&
+            cell.compareAndSet(current, RefCell(ControlCommandLifecycle.TERMINATED, null)))
     }
 
     init {
@@ -78,7 +100,8 @@ internal enum class UnconfirmedReason { StorageFailure, HistoryUnavailable }
 internal enum class ControlAttemptPhase { ReadingSnapshot, PreparingCandidate, ConfirmingStorage }
 
 /**
- * localPendingReleases enumerates confirmed business commands whose management removal is pending.
+ * localPendingReleases enumerates refs whose release or termination storage confirmation is pending.
+ * Pending membership does not imply business confirmation; a ref may belong to both local sets.
  * It is separate from localUnresolvedCommands; business success never clears pending releases.
  * Both sets are immutable memberships from one local recovery snapshot, not a lifecycle snapshot.
  * localUnresolvedCommands covers only this store owner's in-memory tracking lifetime. Empty does
@@ -157,6 +180,18 @@ internal sealed interface ControlStoreResult {
     ) : ControlStoreResult
 
     data class Released(
+        override val command: CommandRef,
+        override val localUnresolvedCommands: Set<CommandRef>,
+        override val localPendingReleases: Set<CommandRef>
+    ) : ControlStoreResult
+
+    data class TerminationPending(
+        override val command: CommandRef,
+        override val localUnresolvedCommands: Set<CommandRef>,
+        override val localPendingReleases: Set<CommandRef>
+    ) : ControlStoreResult
+
+    data class Terminated(
         override val command: CommandRef,
         override val localUnresolvedCommands: Set<CommandRef>,
         override val localPendingReleases: Set<CommandRef>

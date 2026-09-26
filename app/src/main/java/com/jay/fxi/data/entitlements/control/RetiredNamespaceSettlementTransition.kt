@@ -22,6 +22,12 @@ internal class RetiredNamespaceSettlementTransition(private val codec: ControlPa
     private val shared = NamespaceSettlementTransition(codec)
 
     fun decide(command: CommandRef, input: RetiredNamespaceSettlement, read: ControlRecordRead.Supported,
+        context: AttemptContext?, confirmOnly: Boolean, previouslyConfirmed: Boolean): RecordTransactionDecision<Outcome> =
+        decide(command, checkNotNull(command.captureStateAndBody().body),
+            input, read, context, confirmOnly, previouslyConfirmed)
+
+    fun decide(command: CommandRef, body: ControlCommandBody,
+        input: RetiredNamespaceSettlement, read: ControlRecordRead.Supported,
         context: AttemptContext?, confirmOnly: Boolean, previouslyConfirmed: Boolean): RecordTransactionDecision<Outcome> {
         fun negative(result: ControlStoreResult) = RecordTransactionDecision.Observe<Outcome>(Outcome.Negative(result))
         fun reject(detail: String) = negative(ControlStoreResult.Rejected(command, emptySet(), emptySet(), RejectionReason.InvalidRequest(detail), read))
@@ -32,7 +38,8 @@ internal class RetiredNamespaceSettlementTransition(private val codec: ControlPa
         invalidInput(input)?.let { return reject(it) }
         val seal = checkNotNull(target(input))
         val own = ControlAppliedEvidence.own(read, command)
-        if (own != null && !ControlAppliedEvidence.matches(command, TrackedControlCommand(command), own)) {
+        // Null matches the former temporary tracked command: expectedApplied is not compared.
+        if (own != null && !ControlAppliedEvidence.matches(command, body, null, own)) {
             return conflict(ConflictReason.CommandEvidenceMismatch)
         }
         val located = read.locations(seal.id)

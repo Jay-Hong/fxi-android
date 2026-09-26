@@ -27,6 +27,7 @@ class ControlReleaseResultContractTest {
         val actual = when (result) {
             is ControlCommandReleaseResult.Released -> result
             is ControlCommandReleaseResult.AlreadyReleased -> result
+            is ControlCommandReleaseResult.AlreadyTerminated -> result
             is ControlCommandReleaseResult.Rejected -> result
             is ControlCommandReleaseResult.Conflict -> result
             is ControlCommandReleaseResult.RecoveryRequired -> result
@@ -40,6 +41,8 @@ class ControlReleaseResultContractTest {
     @Test fun A17_releasedContract() = assertContract(ControlCommandReleaseResult.Released(c,
         work.unresolvedCommands, work.pendingReleases, ConfirmedControlSnapshot(observation), ConfirmationProof(RecordTransactionEvidence.LockedFileRead)))
     @Test fun A17_alreadyReleasedContract() = assertContract(ControlCommandReleaseResult.AlreadyReleased(c,
+        work.unresolvedCommands, work.pendingReleases))
+    @Test fun D2B6_alreadyTerminatedContract() = assertContract(ControlCommandReleaseResult.AlreadyTerminated(c,
         work.unresolvedCommands, work.pendingReleases))
     @Test fun A17_rejectedContract() = assertContract(ControlCommandReleaseResult.Rejected(c,
         work.unresolvedCommands, work.pendingReleases, ReleaseRejectionReason.InFlight, state, null))

@@ -18,10 +18,13 @@ internal object ControlAppliedEvidence {
             (entry?.let { obj -> ControlNode.of(obj.fields).text("commandId") } as? FieldRead.Present)?.value == command.id
         }
 
-    fun matches(command: CommandRef, tracked: TrackedControlCommand, row: AppliedEvidence): Boolean {
+    fun matches(command: CommandRef, tracked: TrackedControlCommand, row: AppliedEvidence): Boolean =
+        matches(command, checkNotNull(command.captureStateAndBody().body), tracked, row)
+
+    fun matches(command: CommandRef, body: ControlCommandBody, tracked: TrackedControlCommand?, row: AppliedEvidence): Boolean {
         if (row.ownerTrackingLifetimeId != command.ownerTrackingLifetimeId.value) return false
         if (row.commandId != command.id) return false
-        when (val body = command.body) {
+        when (body) {
             is ControlCommandBody.Lifecycle -> {
                 if (row !is AppliedEvidence.Lifecycle) return false
                 if (!ControlLifecycleEvidence.matches(body.input, row)) return false
@@ -55,9 +58,9 @@ internal object ControlAppliedEvidence {
             }
             is ControlCommandBody.Mutations -> {
                 if (row !is AppliedEvidence.Mutations) return false
-                if (row.targets.size != command.actions.size) return false
-                for ((index, action) in command.actions.withIndex()) {
-                    val fixed = tracked.targets.get()[index] ?: return false
+                if (row.targets.size != body.actions.size) return false
+                for ((index, action) in body.actions.withIndex()) {
+                    val fixed = tracked?.targets?.get()?.get(index) ?: return false
                     val target = row.targets[index]
                     if (target.index != index) return false
                     if (target.kind != action.kind) return false
@@ -74,7 +77,7 @@ internal object ControlAppliedEvidence {
         }
         // A live attempt also retains the exact per-target changes it requested. Previous-lifetime
         // checkpoints prove fixed postconditions, not the historical write flags of an absent owner.
-        return tracked.expectedApplied?.let { node(it) == node(row) } ?: true
+        return tracked?.expectedApplied?.let { node(it) == node(row) } ?: true
     }
 
     fun append(candidate: MutablePreferences, read: ControlRecordRead.Supported, row: AppliedEvidence,

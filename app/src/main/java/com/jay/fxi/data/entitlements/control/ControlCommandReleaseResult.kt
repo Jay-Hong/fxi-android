@@ -13,6 +13,7 @@ internal sealed interface ReleaseRejectionReason {
     data object NotRegisteredIdentity : ReleaseRejectionReason
     data object UnsupportedCommandKind : ReleaseRejectionReason
     data object InFlight : ReleaseRejectionReason
+    data object OtherManagementPath : ReleaseRejectionReason
     data object Unresolved : ReleaseRejectionReason
     data object NotConfirmed : ReleaseRejectionReason
     data class Encoding(val reason: RejectionReason) : ReleaseRejectionReason
@@ -40,6 +41,13 @@ internal sealed interface ControlCommandReleaseResult {
 
     /** Idempotent memory response; supplies no new storage evidence. */
     data class AlreadyReleased(
+        override val command: CommandRef,
+        override val localUnresolvedCommands: Set<CommandRef>,
+        override val localPendingReleases: Set<CommandRef>
+    ) : ControlCommandReleaseResult
+
+    /** Closed ref response; supplies no new storage evidence. */
+    data class AlreadyTerminated(
         override val command: CommandRef,
         override val localUnresolvedCommands: Set<CommandRef>,
         override val localPendingReleases: Set<CommandRef>

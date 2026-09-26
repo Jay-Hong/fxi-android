@@ -20,6 +20,12 @@ internal class RetiredNullSettlementTransition(private val codec: ControlPayload
     private val shared = NamespaceSettlementTransition(codec)
 
     fun decide(command: CommandRef, input: RetiredNullSettlement, read: ControlRecordRead.Supported,
+        context: AttemptContext?, confirmOnly: Boolean, previouslyConfirmed: Boolean): RecordTransactionDecision<Outcome> =
+        decide(command, checkNotNull(command.captureStateAndBody().body),
+            input, read, context, confirmOnly, previouslyConfirmed)
+
+    fun decide(command: CommandRef, body: ControlCommandBody,
+        input: RetiredNullSettlement, read: ControlRecordRead.Supported,
         context: AttemptContext?, confirmOnly: Boolean, previouslyConfirmed: Boolean): RecordTransactionDecision<Outcome> {
         fun negative(result: ControlStoreResult) = RecordTransactionDecision.Observe<Outcome>(Outcome.Negative(result))
         fun reject(detail: String) = negative(ControlStoreResult.Rejected(command, emptySet(), emptySet(), RejectionReason.InvalidRequest(detail), read))
@@ -29,7 +35,8 @@ internal class RetiredNullSettlementTransition(private val codec: ControlPayload
         RetiredNamespaceSettlementTransition.recordProblem(read)?.let { return recovery(it) }
         invalidInput(input)?.let { return reject(it) }
         val own = ControlAppliedEvidence.own(read, command)
-        if (own != null && !ControlAppliedEvidence.matches(command, TrackedControlCommand(command), own)) {
+        // Null matches the former temporary tracked command: expectedApplied is not compared.
+        if (own != null && !ControlAppliedEvidence.matches(command, body, null, own)) {
             return conflict(ConflictReason.CommandEvidenceMismatch)
         }
         val operationSeals = seals(read).filter { it.settlement?.operationId == input.operationId }.map { it.id }.toSet()

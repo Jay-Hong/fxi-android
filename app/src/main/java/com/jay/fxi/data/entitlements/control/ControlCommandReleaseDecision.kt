@@ -5,6 +5,7 @@ internal object ControlCommandReleaseEligibility {
     sealed interface Decision {
         data object Eligible : Decision
         data object AlreadyReleased : Decision
+        data object AlreadyTerminated : Decision
         data class Rejected(val reason: ReleaseRejectionReason) : Decision
     }
 
@@ -17,11 +18,14 @@ internal object ControlCommandReleaseEligibility {
     ): Decision {
         fun reject(reason: ReleaseRejectionReason) = Decision.Rejected(reason)
         if (command.ownerTrackingLifetimeId !== lifetime) return reject(ReleaseRejectionReason.WrongTrackerLifetime)
-        if (command.lifecycleState == ControlCommandLifecycle.RELEASED) return Decision.AlreadyReleased
+        val view = command.captureStateAndBody()
+        if (view.state == ControlCommandLifecycle.RELEASED) return Decision.AlreadyReleased
+        if (view.state == ControlCommandLifecycle.TERMINATED) return Decision.AlreadyTerminated
+        if (view.state == ControlCommandLifecycle.TERMINATION_PENDING) return reject(ReleaseRejectionReason.OtherManagementPath)
         if (inFlight) return reject(ReleaseRejectionReason.InFlight)
         if (registered?.command !== command) return reject(ReleaseRejectionReason.NotRegisteredIdentity)
-        if (command.body !is ControlCommandBody.Mutations) return reject(ReleaseRejectionReason.UnsupportedCommandKind)
-        if (command.lifecycleState == ControlCommandLifecycle.RELEASE_PENDING) {
+        if (view.body !is ControlCommandBody.Mutations) return reject(ReleaseRejectionReason.UnsupportedCommandKind)
+        if (view.state == ControlCommandLifecycle.RELEASE_PENDING) {
             check(!unresolved) { "pending release is also business unresolved" }
             checkNotNull(registered.releaseDescriptor) { "pending release has no descriptor" }
         } else {
@@ -35,7 +39,13 @@ internal object ControlCommandReleaseEligibility {
 /** Exact persisted linkage, including all write flags. There is deliberately no null wildcard. */
 internal object ControlReleaseEvidenceMatch {
     fun matches(command: CommandRef, expected: AppliedEvidence?, actual: AppliedEvidence): Boolean {
-        if (command.body !is ControlCommandBody.Mutations) return false
+        val view = command.captureStateAndBody()
+        check(view.state != ControlCommandLifecycle.TERMINATION_PENDING && view.state != ControlCommandLifecycle.TERMINATED)
+        return matches(command, view.body, expected, actual)
+    }
+
+    fun matches(command: CommandRef, body: ControlCommandBody?, expected: AppliedEvidence?, actual: AppliedEvidence): Boolean {
+        if (body !is ControlCommandBody.Mutations) return false
         if (expected !is AppliedEvidence.Mutations) return false
         if (expected.commandId != command.id) return false
         if (expected.ownerTrackingLifetimeId != command.ownerTrackingLifetimeId.value) return false
@@ -63,13 +73,19 @@ internal object ControlCommandReleaseDecision {
         data class RecoveryRequired(val reason: RecoveryReason) : Decision
     }
 
-    fun decide(read: ControlRecordRead, tracked: TrackedControlCommand): Decision {
+    fun decide(read: ControlRecordRead, tracked: TrackedControlCommand): Decision =
+        decide(read, tracked, tracked.command.captureStateAndBody())
+
+    fun decide(read: ControlRecordRead, tracked: TrackedControlCommand, view: RefView): Decision {
         fun recovery(reason: RecoveryReason) = Decision.RecoveryRequired(reason)
         fun mismatch() = Decision.Conflict(ConflictReason.CommandEvidenceMismatch)
         val command = tracked.command
-        val state = command.lifecycleState
+        val state = view.state
         check(state != ControlCommandLifecycle.RELEASED) { "released ref needs no record decision" }
-        check(command.body is ControlCommandBody.Mutations) { "release requires mutations" }
+        check(state == ControlCommandLifecycle.RETAINED || state == ControlCommandLifecycle.RELEASE_PENDING) {
+            "closed ref needs no release record decision"
+        }
+        check(view.body is ControlCommandBody.Mutations) { "release requires mutations" }
         val pending = if (state == ControlCommandLifecycle.RELEASE_PENDING) {
             checkNotNull(tracked.releaseDescriptor) { "pending release has no descriptor" }
         } else null
@@ -84,7 +100,7 @@ internal object ControlCommandReleaseDecision {
         if (pending != null) {
             when (pending) {
                 is ReleasePendingDescriptor.ExactMutations -> {
-                    if (own != null && !ControlReleaseEvidenceMatch.matches(command, pending.row, own)) return mismatch()
+                    if (own != null && !ControlReleaseEvidenceMatch.matches(command, view.body, pending.row, own)) return mismatch()
                 }
                 ReleasePendingDescriptor.ConfirmedWithoutApplied -> if (own != null) return mismatch()
             }
@@ -92,7 +108,7 @@ internal object ControlCommandReleaseDecision {
             return Decision.Ready(pending)
         }
         if (own != null) {
-            if (!ControlReleaseEvidenceMatch.matches(command, tracked.expectedApplied, own)) return mismatch()
+            if (!ControlReleaseEvidenceMatch.matches(command, view.body, tracked.expectedApplied, own)) return mismatch()
             return Decision.Ready(ReleasePendingDescriptor.ExactMutations(own as AppliedEvidence.Mutations))
         }
         if (tracked.observedApplied.get()) return recovery(RecoveryReason.CommandEvidenceLost)

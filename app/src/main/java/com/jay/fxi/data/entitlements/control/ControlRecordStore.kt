@@ -130,15 +130,15 @@ internal class ControlRecordStore(
     }
 
     fun checkpoint(command: CommandRef): ControlCommandCheckpoint? {
-        if (command.lifecycleState != ControlCommandLifecycle.RETAINED) return null
-        return tracking.findPrepared(command)
-        ?.takeIf { command.body is ControlCommandBody.Mutations }
-        ?.let {
-            // Targets only advance from null to fixed values, before the flag becomes true.
-            // Read the flag first so a requested checkpoint cannot contain an older partial list.
-            val requested = it.confirmationRequested.get()
-            ControlCommandCheckpoint(command, it.targets.get(), requested)
-        }
+        if (command.ownerTrackingLifetimeId !== tracking.lifetimeId) return null
+        val tracked = tracking.findPrepared(command) ?: return null
+        val view = command.captureStateAndBody()
+        if (view.state != ControlCommandLifecycle.RETAINED) return null
+        val body = checkNotNull(view.body) { "retained command has no executable body" }
+        if (body !is ControlCommandBody.Mutations) return null
+        // Targets only advance from null to fixed values, before the flag becomes true.
+        val requested = tracked.confirmationRequested.get()
+        return ControlCommandCheckpoint(command, tracked.targets.get(), requested)
     }
 
     /** Capture the actual fence and current executor under the caller's coordinator lock.
@@ -217,16 +217,23 @@ internal class ControlRecordStore(
             return releaseRejected(command, ReleaseRejectionReason.WrongTrackerLifetime)
         }
         if (command.lifecycleState == ControlCommandLifecycle.RELEASED) return alreadyReleased(command)
+        if (command.lifecycleState == ControlCommandLifecycle.TERMINATED) return alreadyTerminated(command)
+        if (command.lifecycleState == ControlCommandLifecycle.TERMINATION_PENDING)
+            return releaseRejected(command, ReleaseRejectionReason.OtherManagementPath)
         if (!tracking.executing.add(command)) return releaseRejected(command, ReleaseRejectionReason.InFlight)
         try {
             // A concurrent release can complete between the precheck and lease acquisition.
             if (command.lifecycleState == ControlCommandLifecycle.RELEASED) return alreadyReleased(command)
+            if (command.lifecycleState == ControlCommandLifecycle.TERMINATED) return alreadyTerminated(command)
+            if (command.lifecycleState == ControlCommandLifecycle.TERMINATION_PENDING)
+                return releaseRejected(command, ReleaseRejectionReason.OtherManagementPath)
             val tracked = tracking.findPrepared(command)
             when (val admission = ControlCommandReleaseEligibility.decide(
                 command, tracking.lifetimeId, tracked, inFlight = false, unresolved = tracking.isUnresolved(command)
             )) {
                 is ControlCommandReleaseEligibility.Decision.Rejected -> return releaseRejected(command, admission.reason)
                 ControlCommandReleaseEligibility.Decision.AlreadyReleased -> return alreadyReleased(command)
+                ControlCommandReleaseEligibility.Decision.AlreadyTerminated -> return alreadyTerminated(command)
                 ControlCommandReleaseEligibility.Decision.Eligible -> Unit
             }
             return releaseAttempt(command, checkNotNull(tracked))
@@ -237,6 +244,9 @@ internal class ControlRecordStore(
     }
 
     private suspend fun releaseAttempt(command: CommandRef, tracked: TrackedControlCommand): ControlCommandReleaseResult {
+        val view = command.captureStateAndBody()
+        check(view.state == ControlCommandLifecycle.RETAINED || view.state == ControlCommandLifecycle.RELEASE_PENDING)
+        check(view.body is ControlCommandBody.Mutations)
         val observation = AtomicReference<ControlRecordRead?>(null)
         val phase = AtomicReference(ControlAttemptPhase.ReadingSnapshot)
         var confirmedCandidate: Preferences? = null
@@ -249,7 +259,7 @@ internal class ControlRecordStore(
                     tracked.observedApplied.set(true)
                 }
                 phase.set(ControlAttemptPhase.PreparingCandidate)
-                val decision = ControlCommandReleaseDecision.decide(read, tracked)
+                val decision = ControlCommandReleaseDecision.decide(read, tracked, view)
                 val descriptor = when (decision) {
                     is ControlCommandReleaseDecision.Decision.Conflict -> return@transactRecord RecordTransactionDecision.Observe(
                         ControlCommandReleaseResult.Conflict(command, emptySet(), emptySet(), decision.reason,
@@ -312,11 +322,17 @@ internal class ControlRecordStore(
         return ControlCommandReleaseResult.AlreadyReleased(command, work.unresolvedCommands, work.pendingReleases)
     }
 
+    private fun alreadyTerminated(command: CommandRef): ControlCommandReleaseResult.AlreadyTerminated {
+        val work = tracking.recoverySnapshot()
+        return ControlCommandReleaseResult.AlreadyTerminated(command, work.unresolvedCommands, work.pendingReleases)
+    }
+
     private fun ControlCommandReleaseResult.withReleaseRecoveryWork(work: LocalRecoveryWork): ControlCommandReleaseResult = when (this) {
         is ControlCommandReleaseResult.Rejected -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
         is ControlCommandReleaseResult.Conflict -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
         is ControlCommandReleaseResult.RecoveryRequired -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
-        is ControlCommandReleaseResult.Unconfirmed, is ControlCommandReleaseResult.Released, is ControlCommandReleaseResult.AlreadyReleased ->
+        is ControlCommandReleaseResult.Unconfirmed, is ControlCommandReleaseResult.Released,
+        is ControlCommandReleaseResult.AlreadyReleased, is ControlCommandReleaseResult.AlreadyTerminated ->
             error("release transaction carried a non-decision result")
     }
 
@@ -368,11 +384,15 @@ internal class ControlRecordStore(
         try {
             // Re-read after acquiring the lease, before even temporarily adding unresolved work.
             terminalResult(command)?.let { return it }
+            val view = command.captureStateAndBody()
+            if (view.state != ControlCommandLifecycle.RETAINED) return checkNotNull(terminalResult(command))
+            val body = checkNotNull(view.body) { "retained command has no executable body" }
+            val actions = (body as? ControlCommandBody.Mutations)?.actions.orEmpty()
             val known = tracking.findPrepared(command)
-            val tracked = known ?: TrackedControlCommand(command)
+            val tracked = known ?: TrackedControlCommand(command, actions)
             val wasUnresolved = tracking.isUnresolved(command)
             tracking.markUnresolved(command)
-            return attempt(command, checkpoint, confirmOnly, context, known, tracked, wasUnresolved)
+            return attempt(command, body, actions, checkpoint, confirmOnly, context, known, tracked, wasUnresolved)
         } finally {
             // Unexpected programming exceptions propagate; their attempt remains conservatively unresolved.
             tracking.executing.remove(command)
@@ -381,6 +401,8 @@ internal class ControlRecordStore(
 
     private suspend fun attempt(
         command: CommandRef,
+        body: ControlCommandBody,
+        actions: List<ControlMutation>,
         checkpoint: ControlCommandCheckpoint?,
         confirmOnly: Boolean,
         context: AttemptContext?,
@@ -408,8 +430,8 @@ internal class ControlRecordStore(
                         historyUnavailable(command, read)
                     } else {
                         phase.set(ControlAttemptPhase.PreparingCandidate)
-                        val handover = (command.body as? ControlCommandBody.Handover)?.input
-                        val lifecycle = (command.body as? ControlCommandBody.Lifecycle)?.input
+                        val handover = (body as? ControlCommandBody.Handover)?.input
+                        val lifecycle = (body as? ControlCommandBody.Lifecycle)?.input
                         if (lifecycle != null) {
                             ControlLifecycleBoundary.recordProblem(read)?.let { reason ->
                                 return@decision negative(ControlStoreResult.RecoveryRequired(
@@ -422,12 +444,12 @@ internal class ControlRecordStore(
                                     command, emptySet(), emptySet(), reason, read))
                             }
                         }
-                        val rotation = command.body as? ControlCommandBody.RotateAndSettle
+                        val rotation = body as? ControlCommandBody.RotateAndSettle
                         if (confirmOnly && rotation == null && handover == null && lifecycle == null) {
                             if (checkpoint?.command !== command || !checkpoint.confirmationRequested ||
-                                checkpoint.targets.size != command.actions.size || checkpoint.targets.any { it == null } ||
+                                checkpoint.targets.size != actions.size || checkpoint.targets.any { it == null } ||
                                 (known != null && !matchesLocalHistory(tracked, checkpoint)) ||
-                                !matchesPreparedActions(command, checkpoint)
+                                !matchesPreparedActions(actions, checkpoint)
                             ) return@decision historyUnavailable(command, read)
                             if (known == null) {
                                 tracked.targets.set(checkpoint.targets)
@@ -438,7 +460,7 @@ internal class ControlRecordStore(
                             ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), RecoveryReason.UninterpretableMetadata, read))
                         var onlyConfirm = confirmOnly
                         if (own != null) {
-                            if (!ControlAppliedEvidence.matches(command, tracked, own)) return@decision negative(
+                            if (!ControlAppliedEvidence.matches(command, body, tracked, own)) return@decision negative(
                                 ControlStoreResult.Conflict(command, emptySet(), emptySet(), ConflictReason.CommandEvidenceMismatch,
                                     TargetExpectation(command, tracked.targets.get().map { it?.id }), read))
                             onlyConfirm = true
@@ -457,18 +479,18 @@ internal class ControlRecordStore(
                             ControlLifecycleConfirmation(codec).decide(command, lifecycle, read, context,
                                 onlyConfirm, tracked.confirmed.get())
                         } else if (handover is RetiredNamespaceSettlement) {
-                            RetiredNamespaceSettlementTransition(codec).decide(command, handover, read, context,
+                            RetiredNamespaceSettlementTransition(codec).decide(command, body, handover, read, context,
                                 onlyConfirm, tracked.confirmed.get())
                         } else if (handover is CurrentNullSettlement) {
-                            CurrentNullSettlementTransition(codec).decide(command, handover, read, context,
+                            CurrentNullSettlementTransition(codec).decide(command, body, handover, read, context,
                                 onlyConfirm, tracked.confirmed.get())
                         } else if (handover is RetiredNullSettlement) {
-                            RetiredNullSettlementTransition(codec).decide(command, handover, read, context,
+                            RetiredNullSettlementTransition(codec).decide(command, body, handover, read, context,
                                 onlyConfirm, tracked.confirmed.get())
                         } else if (rotation != null) {
-                            NamespaceSettlementTransition(codec).decide(command, rotation.input, read, context,
+                            NamespaceSettlementTransition(codec).decide(command, body, rotation.input, read, context,
                                 onlyConfirm, tracked.confirmed.get())
-                        } else decide(command, tracked, read, onlyConfirm)
+                        } else decide(command, actions, tracked, read, onlyConfirm)
                         if (decision is RecordTransactionDecision.Confirm) {
                             // All candidate checks are complete. This precedes write-scope entry and cancellation.
                             if (known != null) tracked.bindFirstConfirm(tracking.evidenceDiscontinuityCount)
@@ -480,7 +502,7 @@ internal class ControlRecordStore(
                         decision
                     }
                 }
-                val diagnostic = ControlLifecycleDiagnostics.observe(command, tracked, read,
+                val diagnostic = ControlLifecycleDiagnostics.observe(command, body, tracked, read,
                     (decision.value as? Outcome.Negative)?.result)
                 if (diagnostic != null) command.observeLifecycleDiagnostic(diagnostic)
                 when (val outcome = decision.value) {
@@ -492,7 +514,7 @@ internal class ControlRecordStore(
                 is Outcome.Positive -> {
                     val confirmedSnapshot = ConfirmedControlSnapshot(reader.read(transaction.snapshot) as ControlRecordRead.Supported)
                     if (ControlAppliedEvidence.own(confirmedSnapshot.record, command) != null) tracked.observedApplied.set(true)
-                    val diagnostic = ControlLifecycleDiagnostics.observe(command, tracked, confirmedSnapshot.record,
+                    val diagnostic = ControlLifecycleDiagnostics.observe(command, body, tracked, confirmedSnapshot.record,
                         result = null, storageConfirmed = true)
                     if (diagnostic != null) command.observeLifecycleDiagnostic(diagnostic)
                     tracked.confirmed.set(true)
@@ -530,12 +552,17 @@ internal class ControlRecordStore(
                 command, work.unresolvedCommands, work.pendingReleases)
             ControlCommandLifecycle.RELEASED -> ControlStoreResult.Released(
                 command, work.unresolvedCommands, work.pendingReleases)
+            ControlCommandLifecycle.TERMINATION_PENDING -> ControlStoreResult.TerminationPending(
+                command, work.unresolvedCommands, work.pendingReleases)
+            ControlCommandLifecycle.TERMINATED -> ControlStoreResult.Terminated(
+                command, work.unresolvedCommands, work.pendingReleases)
             ControlCommandLifecycle.RETAINED -> error("retained command passed terminal gate")
         }
     }
 
     private fun decide(
         command: CommandRef,
+        actions: List<ControlMutation>,
         tracked: TrackedControlCommand,
         read: ControlRecordRead.Supported,
         confirmOnly: Boolean
@@ -545,7 +572,7 @@ internal class ControlRecordStore(
         fun conflict(reason: ConflictReason) = negative(ControlStoreResult.Conflict(command, emptySet(), emptySet(), reason,
             TargetExpectation(command, Collections.unmodifiableList(tracked.targets.get().map { it?.id })), read))
 
-        if (command.actions.isEmpty()) return reject("at least one operation is required")
+        if (actions.isEmpty()) return reject("at least one operation is required")
         val arrays = read.arrays.mapValues { (_, array) -> array.entries.map { it.originalEntry() }.toMutableList() }
         val changedKinds = mutableSetOf<ControlKind>()
         val effectiveIds = mutableListOf<String>()
@@ -555,7 +582,7 @@ internal class ControlRecordStore(
         var joined = false
         val mayConfirmPostcondition = tracked.confirmationRequested.get()
 
-        for ((actionIndex, action) in command.actions.withIndex()) {
+        for ((actionIndex, action) in actions.withIndex()) {
             val array = arrays.getValue(action.kind)
             val previous = targets[actionIndex]
             val desired = when (action) {
@@ -680,7 +707,7 @@ internal class ControlRecordStore(
         if (changedKinds.isNotEmpty()) {
             val evidence = AppliedEvidence.Mutations(command.id, command.ownerTrackingLifetimeId.value,
                 targets.mapIndexed { index, target ->
-                    AppliedTarget(index, command.actions[index].kind, checkNotNull(target).id,
+                    AppliedTarget(index, actions[index].kind, checkNotNull(target).id,
                         target.joined, index in writtenIndices)
                 })
             ControlAppliedEvidence.append(candidate, read, evidence, codec)?.let {
@@ -689,7 +716,7 @@ internal class ControlRecordStore(
         }
         val complete = reader.read(candidate) as? ControlRecordRead.Supported
             ?: return reject("the complete candidate must remain a supported record")
-        candidateRejection(command, complete, effectiveIds, targets)?.let { return reject(it.detail) }
+        candidateRejection(actions, complete, effectiveIds, targets)?.let { return reject(it.detail) }
         if (changedKinds.isNotEmpty() && complete.hasUninterpretableMetadata) return reject("invalid candidate evidence")
         val effect = when {
             changedKinds.isNotEmpty() -> ConfirmedEffect.AppliedThisAttempt
@@ -706,6 +733,13 @@ internal class ControlRecordStore(
         complete: ControlRecordRead.Supported,
         effectiveIds: List<String>,
         targets: List<ControlCommandTarget?>
+    ): RejectionReason.InvalidRequest? = candidateRejection(command.actions, complete, effectiveIds, targets)
+
+    private fun candidateRejection(
+        actions: List<ControlMutation>,
+        complete: ControlRecordRead.Supported,
+        effectiveIds: List<String>,
+        targets: List<ControlCommandTarget?>
     ): RejectionReason.InvalidRequest? {
         // Validate each affected target against whole-record identity/cardinality, not just its node.
         for ((index, id) in effectiveIds.withIndex()) {
@@ -713,7 +747,7 @@ internal class ControlRecordStore(
             val entry = matches.singleOrNull()?.second as? ControlEntryRead.Interpreted
                 ?: return RejectionReason.InvalidRequest("candidate introduces an id or guard-cardinality collision")
             // Validate the completed arrays independently of input/checkpoint admission checks.
-            if (matches.single().first != command.actions[index].kind ||
+            if (matches.single().first != actions[index].kind ||
                 !same(entry.original, checkNotNull(targets[index]).postcondition)
             ) return RejectionReason.InvalidRequest("candidate does not preserve the required postcondition")
         }
@@ -728,8 +762,8 @@ internal class ControlRecordStore(
         }
     }
 
-    private fun matchesPreparedActions(command: CommandRef, checkpoint: ControlCommandCheckpoint): Boolean =
-        command.actions.zip(checkpoint.targets).all { (action, supplied) ->
+    private fun matchesPreparedActions(actions: List<ControlMutation>, checkpoint: ControlCommandCheckpoint): Boolean =
+        actions.zip(checkpoint.targets).all { (action, supplied) ->
             val target = checkNotNull(supplied) // The checkpoint shape gate has already checked this.
             val desired = when (action) {
                 is ControlMutation.Add -> action.built
@@ -770,7 +804,8 @@ internal class ControlRecordStore(
         is ControlStoreResult.RecoveryRequired -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
         is ControlStoreResult.Unconfirmed -> copy(localUnresolvedCommands = work.unresolvedCommands, localPendingReleases = work.pendingReleases)
         is ControlStoreResult.Confirmed -> error("positive results are published after storage confirmation")
-        is ControlStoreResult.ReleasePending, is ControlStoreResult.Released ->
+        is ControlStoreResult.ReleasePending, is ControlStoreResult.Released,
+        is ControlStoreResult.TerminationPending, is ControlStoreResult.Terminated ->
             error("terminal results cannot be storage outcomes")
     }
 

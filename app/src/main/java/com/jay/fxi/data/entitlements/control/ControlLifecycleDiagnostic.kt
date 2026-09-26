@@ -27,14 +27,18 @@ internal class ControlLifecycleDiagnostic(
 
 internal object ControlLifecycleDiagnostics {
     fun observe(command: CommandRef, tracked: TrackedControlCommand, read: ControlRecordRead?,
+        result: ControlStoreResult?, storageConfirmed: Boolean = false): ControlLifecycleDiagnostic? =
+        observe(command, command.body, tracked, read, result, storageConfirmed)
+
+    fun observe(command: CommandRef, body: ControlCommandBody, tracked: TrackedControlCommand, read: ControlRecordRead?,
         result: ControlStoreResult?, storageConfirmed: Boolean = false): ControlLifecycleDiagnostic? {
-        val input = (command.body as? ControlCommandBody.Lifecycle)?.input ?: return null
+        val input = (body as? ControlCommandBody.Lifecycle)?.input ?: return null
         val supported = read as? ControlRecordRead.Supported
         val own = when {
             supported == null -> LifecycleOwnEvidence.Unknown
             ControlAppliedEvidence.hasOpaqueOwn(supported, command) -> LifecycleOwnEvidence.Uninterpretable
             else -> ControlAppliedEvidence.own(supported, command)?.let {
-                if (ControlAppliedEvidence.matches(command, tracked, it)) LifecycleOwnEvidence.Matched else LifecycleOwnEvidence.Mismatched
+                if (ControlAppliedEvidence.matches(command, body, tracked, it)) LifecycleOwnEvidence.Matched else LifecycleOwnEvidence.Mismatched
             } ?: LifecycleOwnEvidence.Absent
         }
         val classification = if (storageConfirmed) LifecycleClassification.CURRENT_POSTCONDITION_CONFIRMED
@@ -71,6 +75,7 @@ internal object ControlLifecycleDiagnostics {
         is ControlStoreResult.Conflict -> result.copy(lifecycleDiagnostic = diagnostic)
         is ControlStoreResult.RecoveryRequired -> result.copy(lifecycleDiagnostic = diagnostic)
         is ControlStoreResult.Unconfirmed -> result.copy(lifecycleDiagnostic = diagnostic)
-        is ControlStoreResult.ReleasePending, is ControlStoreResult.Released -> result
+        is ControlStoreResult.ReleasePending, is ControlStoreResult.Released,
+        is ControlStoreResult.TerminationPending, is ControlStoreResult.Terminated -> result
     }
 }

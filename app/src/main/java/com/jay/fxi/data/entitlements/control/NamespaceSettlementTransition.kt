@@ -27,8 +27,14 @@ import kotlinx.serialization.json.JsonPrimitive
  * and recovery tests past the retention budget. TTL/count/local tracking emptiness are not GC proof.
  */
 internal class NamespaceSettlementTransition(private val codec: ControlPayloadCodec) {
+    fun decide(command: CommandRef, input: RotateAndSettleNamespaces, read: ControlRecordRead.Supported,
+        context: AttemptContext?, confirmOnly: Boolean, previouslyConfirmed: Boolean): RecordTransactionDecision<Outcome> =
+        decide(command, checkNotNull(command.captureStateAndBody().body),
+            input, read, context, confirmOnly, previouslyConfirmed)
+
     fun decide(
         command: CommandRef,
+        body: ControlCommandBody,
         input: RotateAndSettleNamespaces,
         read: ControlRecordRead.Supported,
         context: AttemptContext?,
@@ -40,6 +46,27 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
         fun conflict(reason: ConflictReason) = negative(ControlStoreResult.Conflict(command, emptySet(), emptySet(), reason,
             TargetExpectation(command, input.seals.map { it.id }), read))
         fun recovery(reason: RecoveryReason) = negative(ControlStoreResult.RecoveryRequired(command, emptySet(), emptySet(), reason, read))
+        fun receipt(snapshot: ControlRecordRead.Supported): SettlementReceipt {
+            val journal = canonicalJournal(snapshot.original)
+            val demand = snapshot.locations(input.demandId)
+            val demandEntry = demand.singleOrNull()?.takeIf { it.first == ControlKind.DEMAND }?.second as? ControlEntryRead.Interpreted
+            val demandObservation = when {
+                demand.isEmpty() -> DemandObservation.Absent
+                demandEntry == null -> DemandObservation.Uninterpretable
+                demandEntry.original.toPayloadEntry() == demandNode(input)?.toPayloadEntry() -> DemandObservation.Present
+                else -> DemandObservation.Changed
+            }
+            val observations = input.seals.associate { seal -> seal.id to when {
+                journal == null -> JournalObservation.Uninterpretable
+                input.journal in journal -> JournalObservation.Present
+                journal.any { it.covers(seal.key) } -> JournalObservation.Covered
+                else -> JournalObservation.Absent
+            } }
+            return SettlementReceipt(input.operationId, input.originLifetimeId, input.before, input.after,
+                input.seals.associate { it.id to input.witness(it) }, observations, input.demandId, demandObservation,
+                snapshot.arrays.getValue(ControlKind.SEAL).entries.filterIsInstance<ControlEntryRead.Interpreted>()
+                    .map { it.value as SealV1 }.filter { it.settlement == null }, snapshot.hasUninterpretable, snapshot.hasUninterpretableMetadata)
+        }
 
         val snapshotSchema = read.original.asMap().entries
             .singleOrNull { it.key.name == ControlRecordKeys.SCHEMA }?.value
@@ -48,7 +75,8 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
         }
         val own = ControlAppliedEvidence.own(read, command)
         if (ControlAppliedEvidence.hasOpaqueOwn(read, command)) return recovery(RecoveryReason.UninterpretableMetadata)
-        if (own != null && !ControlAppliedEvidence.matches(command, TrackedControlCommand(command), own)) {
+        // Null matches the former temporary tracked command: expectedApplied is not compared.
+        if (own != null && !ControlAppliedEvidence.matches(command, body, null, own)) {
             return conflict(ConflictReason.CommandEvidenceMismatch)
         }
         input.invalidInput()?.let { return reject(it) }
@@ -75,7 +103,7 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
                 }
             }
             return RecordTransactionDecision.Confirm(read.original,
-                Outcome.Positive(ConfirmedEffect.PostconditionConfirmed, input.effectiveIds, receipt(input, read)))
+                Outcome.Positive(ConfirmedEffect.PostconditionConfirmed, input.effectiveIds, receipt(read)))
         }
         if (current.any { it.settlement != null }) return conflict(ConflictReason.TargetChanged)
         for (index in current.indices) {
@@ -129,7 +157,7 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
         if (!validCandidate(complete, built.expected) || (complete as? ControlRecordRead.Supported)?.hasUninterpretableMetadata != false) return reject("InvalidCandidate")
         return RecordTransactionDecision.Confirm(candidate,
             Outcome.Positive(ConfirmedEffect.AppliedThisAttempt, input.effectiveIds,
-                receipt(input, complete as ControlRecordRead.Supported)))
+                receipt(complete as ControlRecordRead.Supported)))
     }
 
     /** Admission has succeeded. Construct locally; the caller must validate before requesting storage. */
@@ -296,28 +324,6 @@ internal class NamespaceSettlementTransition(private val codec: ControlPayloadCo
             set("raisedAt", ControlScalar.Integer(input.demand.raisedAt.value))
             set("intent", ControlScalar.Text(input.demand.intent.name))
         } as? ControlWriteResult.Written)?.node
-
-    private fun receipt(input: RotateAndSettleNamespaces, read: ControlRecordRead.Supported): SettlementReceipt {
-        val journal = canonicalJournal(read.original)
-        val demand = read.locations(input.demandId)
-        val demandEntry = demand.singleOrNull()?.takeIf { it.first == ControlKind.DEMAND }?.second as? ControlEntryRead.Interpreted
-        val demandObservation = when {
-            demand.isEmpty() -> DemandObservation.Absent
-            demandEntry == null -> DemandObservation.Uninterpretable
-            demandEntry.original.toPayloadEntry() == demandNode(input)?.toPayloadEntry() -> DemandObservation.Present
-            else -> DemandObservation.Changed
-        }
-        val observations = input.seals.associate { seal -> seal.id to when {
-            journal == null -> JournalObservation.Uninterpretable
-            input.journal in journal -> JournalObservation.Present
-            journal.any { it.covers(seal.key) } -> JournalObservation.Covered
-            else -> JournalObservation.Absent
-        } }
-        return SettlementReceipt(input.operationId, input.originLifetimeId, input.before, input.after,
-            input.seals.associate { it.id to input.witness(it) }, observations, input.demandId, demandObservation,
-            read.arrays.getValue(ControlKind.SEAL).entries.filterIsInstance<ControlEntryRead.Interpreted>()
-                .map { it.value as SealV1 }.filter { it.settlement == null }, read.hasUninterpretable, read.hasUninterpretableMetadata)
-    }
 
     private fun PendingPurge.covers(key: SealKey): Boolean = key.axis in scopes &&
         (ownerUid == null || ownerUid == key.ownerUid) &&
