@@ -345,7 +345,7 @@ internal class ControlRecordStore(
             val tracked = tracking.findPrepared(command)
                 ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
             val body = command.captureStateAndBody().body
-            if (body == null || body is ControlCommandBody.Handover)
+            if (body == null)
                 return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
             closure.violation(command, tracking.lifetimeId)?.let {
                 return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
@@ -395,7 +395,8 @@ internal class ControlRecordStore(
             val tracked = tracking.findPrepared(command)
                 ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
             val body = command.captureStateAndBody().body
-            if (body == null || body is ControlCommandBody.Handover)
+            if (body == null || (body is ControlCommandBody.Handover &&
+                    tracked.terminationDescriptor !is TerminationPendingDescriptor.EvidenceAbsent))
                 return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
             val descriptor = tracked.terminationDescriptor
                 ?: return completionRejected(command, CompletionRejectionReason.NotTerminationPending)
@@ -483,7 +484,7 @@ internal class ControlRecordStore(
                 val candidate: Preferences
                 if (request is TerminationRequest.FirstNeverConfirm ||
                     (request is TerminationRequest.Retry && request.descriptor is TerminationPendingDescriptor.EvidenceAbsent)) {
-                    // The entry gates Handover; the remaining non-Mutations/Lifecycle body is Rotation.
+                    // Rotation and Handover settlements share the own-seal witness scan.
                     if (ControlAppliedEvidence.own(read, command) != null ||
                         (body !is ControlCommandBody.Mutations && body !is ControlCommandBody.Lifecycle &&
                             read.arrays.getValue(ControlKind.SEAL).entries.any {

@@ -19,9 +19,9 @@ import org.junit.rules.TemporaryFolder
 
 /**
  * Claude-owned 6-1B T3 contract (skeleton v12 §4.1; revision 06 §3.3·§7.1). abandonBeforeFirstConfirm terminates only a
- * Mutations, Lifecycle, or RotateAndSettle command with no business confirmation history: each history field alone refuses with
- * NotNeverConfirm(field) before any storage access; a Handover body is UnsupportedInThisUnit after the lease (InFlight
- * first under contention; 6-3 opens it — RotateAndSettle was opened by 6-2A, see ControlRotationNeverConfirmContractTest);
+ * Mutations, Lifecycle, RotateAndSettle or Handover command with no business confirmation history: each history field alone
+ * refuses with NotNeverConfirm(field) before any storage access (RotateAndSettle was opened by 6-2A, see
+ * ControlRotationNeverConfirmContractTest; Handover R/N/L by 6-3A, see ControlSettlementNeverConfirmContractTest);
  * wrong tracker lifetime and a same-id unregistered ref are refused first. The owner reads the latest record and
  * observes it at once — an interpretable own Applied is recorded as observedApplied before any whole-record rejection —
  * and refuses a record that is not wholly interpretable schema 2 (RecoveryRequired) or that still carries an own Applied
@@ -162,10 +162,16 @@ class ControlNeverConfirmOwnerContractTest {
             assertEquals("D2B6/T3.16b: noStorageAccess", 0, f.boundary.accesses - accessBefore)
         } finally { f.tracker.executing.remove(c) }
     }
-    @Test fun T3_17_handoverBodyUnsupportedInThisUnit() = runBlocking {
+    @Test fun T3_17_handoverBodyReachesTheOwnerSince6_3A() = runBlocking {
+        // 6-3A superseded the 6-1B "Handover UnsupportedInThisUnit" row: the entry no longer refuses a Handover body before
+        // storage. The owner behavior for R/N/L is ControlSettlementNeverConfirmContractTest's.
         val f = fixture(); f.storage.seed()
         val c = f.tracker.registerPrepared(CurrentNullFixtures.command(lifetime = f.tracker.lifetimeId))
-        refusedBeforeStorage("17", f, c, CompletionRejectionReason.UnsupportedInThisUnit)
+        val access = f.boundary.accesses
+        val r = controlTestTimeout("handover abandon") { f.store.abandonBeforeFirstConfirm(c, closure(c)) }
+        assertFalse("D2B6/T3.17: notUnsupported $r",
+            (r as? ControlCompletionResult.Rejected)?.reason == CompletionRejectionReason.UnsupportedInThisUnit)
+        assertTrue("D2B6/T3.17: ownerReached", f.boundary.accesses > access)
     }
     @Test fun T3_18_wrongTrackerLifetime() = runBlocking {
         val f = fixture(); f.storage.seed(); val other = fixture(); val c = other.mutations()
