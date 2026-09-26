@@ -233,4 +233,158 @@ class DependencyProjectionContractTest {
         unknownKeeping("19g", projectDependency(input(b = ControlCommandBody.SettleRetiredNull(retiredNull), adopted = emptyList(), id = retiredNull.operationId)),
             DependencyAtom.Journal(JournalTargetV1("A", PurgeScope.USER, null)))
     }
+
+    // ── 6-2C C1 (API consensus 6-2C_api_consensus.md): typed gaps, the ExactEvidenceAndSeals projection, classification ──
+    private fun gaps(id: String, p: DependencyProjection): Set<DependencyGap> {
+        assertTrue("D2B6/6-2C.$id: unknown $p", p is DependencyProjection.Unknown)
+        p as DependencyProjection.Unknown
+        assertTrue("D2B6/6-2C.$id: gapsNonEmpty", p.gaps.isNotEmpty())
+        assertTrue("D2B6/6-2C.$id: everyFootprintNonEmpty", p.gaps.all { it.possibleAtoms.isNotEmpty() })
+        return p.gaps
+    }
+    private fun causes(id: String, p: DependencyProjection) = gaps(id, p).map { it.cause }.toSet()
+    private fun gap(id: String, p: DependencyProjection, cause: DependencyGapCause) = gaps(id, p).single { it.cause == cause }
+    @Test fun T7_20_eachUnknownRecordsItsTypedCauseAndSource() {
+        val pa = gap("20a", projectDependency(input(adopted = listOf(demandTarget("d"), null))), DependencyGapCause.PartialAdoption)
+        assertEquals("D2B6/6-2C.20a: nullIndex", DependencyGapSource.Adoption(1), pa.source)
+        assertEquals("D2B6/6-2C.20b", DependencyGapSource.Adoption(null),
+            gap("20b", projectDependency(input(adopted = null)), DependencyGapCause.AdoptionUnavailable).source)
+        assertEquals("D2B6/6-2C.20c", DependencyGapSource.Adoption(null),
+            gap("20c", projectDependency(input(adopted = listOf(null))), DependencyGapCause.AdoptionUnavailable).source)
+        assertEquals("D2B6/6-2C.20d", DependencyGapSource.Body,
+            gap("20d", projectDependency(input(b = null)), DependencyGapCause.OpenViewWithoutBody).source)
+        val row = ControlReleaseFixtures.row(command)
+        assertEquals(setOf(DependencyGapCause.ReleaseDescriptorMissing), causes("20e", projectDependency(input(state = ControlCommandLifecycle.RELEASE_PENDING))))
+        assertEquals(setOf(DependencyGapCause.UnexpectedReleaseDescriptor), causes("20f", projectDependency(input(release = ReleasePendingDescriptor.ExactMutations(row)))))
+        assertEquals(setOf(DependencyGapCause.TerminationDescriptorMissing), causes("20g", projectDependency(input(state = ControlCommandLifecycle.TERMINATION_PENDING))))
+        assertEquals(setOf(DependencyGapCause.UnexpectedTerminationDescriptor), causes("20h", projectDependency(input(termination = evidenceAbsent))))
+        assertEquals(setOf(DependencyGapCause.ReleaseIdentityMismatch), causes("20i",
+            projectDependency(input(state = ControlCommandLifecycle.RELEASE_PENDING, release = ReleasePendingDescriptor.ExactMutations(row), id = "other-command"))))
+        val mismatch = ControlReleaseFixtures.row(command, targets = listOf(AppliedTarget(0, ControlKind.DEMAND, "desc-only", false, true),
+            AppliedTarget(1, ControlKind.RECOVERY_INTENT, "r", false, false)))
+        assertEquals("D2B6/6-2C.20j", DependencyGapSource.ReleaseDescriptor(0), gap("20j", projectDependency(input(state = ControlCommandLifecycle.RELEASE_PENDING,
+            adopted = listOf(demandTarget("d"), recoveryTarget), release = ReleasePendingDescriptor.ExactMutations(mismatch))), DependencyGapCause.ReleaseTargetMismatch).source)
+        assertEquals("D2B6/6-2C.20k", DependencyGapSource.Adoption(0), gap("20k", projectDependency(input(adopted = listOf(
+            ControlCommandTarget("", demandTarget("d").postcondition, false), recoveryTarget))), DependencyGapCause.EmptyTargetId).source)
+        val unreadableBefore = ControlMutation.Edit.prepare(ControlKind.DEMAND, node("""{"id":"x","kind":"REQUEST"}""")) {}
+        assertEquals("D2B6/6-2C.20l", DependencyGapSource.Mutation(0, MutationSlot.Before), gap("20l",
+            projectDependency(input(b = ControlCommandBody.Mutations(listOf(unreadableBefore)), adopted = listOf(null), id = "edit-cmd")),
+            DependencyGapCause.UnreadableMutationBefore).source)
+        val mismatched = NamespaceSettlementFixtures.user.replace("\"epoch\":\"u\"", "\"epoch\":\"old\"")
+        assertEquals("D2B6/6-2C.20m", DependencyGapSource.FixedInput(FixedBodyKind.Rotation), gap("20m", projectDependency(input(
+            b = ControlCommandBody.RotateAndSettle(NamespaceSettlementFixtures.input(targets = listOf(node(mismatched)))), adopted = emptyList(),
+            id = NamespaceSettlementFixtures.operation)), DependencyGapCause.InvalidRotationInput).source)
+        val retiredBad = RetiredNamespaceFixtures.spec(exec = RetiredNamespaceFixtures.executor.copy(ownerUid = "B"))
+        assertEquals(setOf(DependencyGapCause.InvalidRetiredNamespaceInput), causes("20n",
+            projectDependency(input(b = ControlCommandBody.SettleRetiredNamespace(retiredBad), adopted = emptyList(), id = retiredBad.operationId))))
+        val cnBad = CurrentNullFixtures.spec(target = node(CurrentNullFixtures.companionUser))
+        assertEquals(setOf(DependencyGapCause.InvalidCurrentNullInput), causes("20o",
+            projectDependency(input(b = ControlCommandBody.RotateAndSettleCurrentNull(cnBad), adopted = emptyList(), id = cnBad.operationId))))
+        val rnBad = RetiredNullFixtures.spec(target = node(NamespaceSettlementFixtures.user))
+        assertEquals(setOf(DependencyGapCause.InvalidRetiredNullInput), causes("20p",
+            projectDependency(input(b = ControlCommandBody.SettleRetiredNull(rnBad), adopted = emptyList(), id = rnBad.operationId))))
+    }
+    @Test fun T7_21_firstReasonIsKeptAndEveryGapAccumulates() {
+        // Two independent problems in one ref: a partial adoption (first mark) and an unexpected termination descriptor.
+        val p = projectDependency(input(adopted = listOf(demandTarget("d"), null), termination = evidenceAbsent))
+        assertEquals("D2B6/6-2C.21: firstReason", "PartialAdoption", (p as DependencyProjection.Unknown).reason)
+        assertEquals("D2B6/6-2C.21: bothGaps", setOf(DependencyGapCause.PartialAdoption, DependencyGapCause.UnexpectedTerminationDescriptor), causes("21", p))
+    }
+
+    private val sealS = DependencyAtom.ControlRow(ControlKind.SEAL, "s")
+    private val protectedS = setOf(DependencyAtom.AppliedRow(NamespaceSettlementFixtures.operation, "rot-life"), sealS,
+        DependencyAtom.SealWitness("s", NamespaceSettlementFixtures.operation))
+    @Test fun T7_22_possibleIntersectionHonorsKindAndWildcard() {
+        fun g(vararg atoms: DependencyAtomFootprint) = DependencyGap(DependencyGapCause.Unclassified, DependencyGapSource.Unclassified, atoms.toSet())
+        assertTrue("D2B6/6-2C.22a: sealWildcard", possibleIntersection(g(DependencyAtomFootprint.ControlRow(setOf(ControlKind.SEAL), GapValue.Wildcard)), protectedS))
+        assertTrue("D2B6/6-2C.22b: exactSame", possibleIntersection(g(DependencyAtomFootprint.ControlRow(setOf(ControlKind.SEAL), GapValue.Exact("s"))), protectedS))
+        assertTrue("D2B6/6-2C.22c: exactOther", !possibleIntersection(g(DependencyAtomFootprint.ControlRow(setOf(ControlKind.SEAL), GapValue.Exact("x"))), protectedS))
+        assertTrue("D2B6/6-2C.22d: otherKind", !possibleIntersection(g(DependencyAtomFootprint.ControlRow(setOf(ControlKind.DEMAND), GapValue.Wildcard)), protectedS))
+        assertTrue("D2B6/6-2C.22e: witnessWildcard", possibleIntersection(g(DependencyAtomFootprint.SealWitness(GapValue.Wildcard, GapValue.Wildcard)), protectedS))
+        assertTrue("D2B6/6-2C.22f: appliedWildcard", possibleIntersection(g(DependencyAtomFootprint.AppliedRow(GapValue.Wildcard, GapValue.Wildcard)), protectedS))
+        assertTrue("D2B6/6-2C.22g: journalNotProtected", !possibleIntersection(g(DependencyAtomFootprint.Journal(GapValue.Wildcard)), protectedS))
+    }
+    @Test fun T7_23_classifyDependencyKnownFirstThenEveryGap() {
+        // Known ∩ P → Present; Known disjoint → Clear.
+        val known = DependencyProjection.Known(setOf(sealS))
+        assertEquals("D2B6/6-2C.23a", DependencyIntersection.Present(sealS), classifyDependency(known, protectedS))
+        assertEquals("D2B6/6-2C.23b", DependencyIntersection.Clear, classifyDependency(DependencyProjection.Known(setOf(d)), protectedS))
+        // U-only SEAL Add: adoption unknown, the proposed id is unrelated, yet an existing-seal join could be "s".
+        val proposed = java.util.UUID(0, 88)
+        val add = ControlMutation.Add.prepare(ControlKind.SEAL, proposed) { id -> literal(ControlObligationFixtures.seal); set("id", ControlScalar.Text(id)) }
+        val sealAdd = projectDependency(input(b = ControlCommandBody.Mutations(listOf(add)), adopted = null, id = "seal-add"))
+        assertTrue("D2B6/6-2C.23c: sealAddUnknown", classifyDependency(sealAdd, protectedS) is DependencyIntersection.Unknown)
+        // The DEMAND/RECOVERY_INTENT fixture in the same adoption-unknown state stays clear of a rotation's seal/witness/Applied.
+        assertEquals("D2B6/6-2C.23d: nonSealClear", DependencyIntersection.Clear, classifyDependency(projectDependency(input(adopted = null)), protectedS))
+        // First gap is non-SEAL, a later gap is broad: every gap is checked, not only the first reason.
+        val multi = projectDependency(input(adopted = listOf(demandTarget("d"), null), termination = evidenceAbsent))
+        assertTrue("D2B6/6-2C.23e: laterGapCounts", classifyDependency(multi, protectedS) is DependencyIntersection.Unknown)
+        // Unknown whose known atoms already meet P is Present before any gap.
+        val knownMeets = projectDependency(input(b = ControlCommandBody.RotateAndSettle(NamespaceSettlementFixtures.input(targets = listOf(node(
+            NamespaceSettlementFixtures.user.replace("\"epoch\":\"u\"", "\"epoch\":\"old\""))))), adopted = emptyList(), id = NamespaceSettlementFixtures.operation))
+        assertEquals("D2B6/6-2C.23f", DependencyIntersection.Present(sealS), classifyDependency(knownMeets, setOf(sealS)))
+    }
+    @Test fun T7_24_exactEvidenceAndSealsDescriptorProjectsItsFixedAtoms() {
+        val rotLife = OwnerTrackingLifetimeId.issue()
+        val input = NamespaceSettlementFixtures.input()
+        val rot = CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input), rotLife)
+        fun exact(ordered: List<String>) = TerminationPendingDescriptor.ExactEvidenceAndSeals(CompletionMode.Consumed, TerminationEntry.ConsumedRotation,
+            TerminationClosures.of(rot).binding(), AppliedEvidence.Rotation(rot.id, rotLife.value, listOf("s"), input.demandId), rot.id, ordered)
+        fun project(d: TerminationPendingDescriptor) = projectDependency(DependencyProjectionInput(rot.id, rotLife.value,
+            RefView(ControlCommandLifecycle.TERMINATION_PENDING, rot.body), emptyList(), null, d))
+        val deps = known("24a", project(exact(listOf("s"))))
+        assertTrue("D2B6/6-2C.24a: appliedFromDescriptor", DependencyAtom.AppliedRow(rot.id, rotLife.value) in deps)
+        assertTrue("D2B6/6-2C.24a: sealFromDescriptor", DependencyAtom.ControlRow(ControlKind.SEAL, "s") in deps)
+        assertTrue("D2B6/6-2C.24a: witnessFromDescriptor", DependencyAtom.SealWitness("s", rot.id) in deps)
+        // Descriptor ordered ids disagreeing with its expected Rotation: both read ids kept, conservative gap.
+        val bad = project(exact(listOf("s", "x")))
+        assertEquals(setOf(DependencyGapCause.TerminationDescriptorMismatch), causes("24b", bad))
+        assertTrue("D2B6/6-2C.24b: extraIdKept", DependencyAtom.ControlRow(ControlKind.SEAL, "x") in (bad as DependencyProjection.Unknown).knownDependencies)
+    }
+
+    // ── r2 (measurement 6-2C1 r1): each rule alone ────────────────────────────────────────────────────────────
+    @Test fun T7_25_eachExactDescriptorInconsistencyAloneIsAGap() {
+        val rotLife = OwnerTrackingLifetimeId.issue()
+        fun rotRef(input: RotateAndSettleNamespaces) = CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input), rotLife)
+        val one = rotRef(NamespaceSettlementFixtures.input())
+        val two = rotRef(NamespaceSettlementFixtures.input(targets = listOf(node(NamespaceSettlementFixtures.user), node(NamespaceSettlementFixtures.krx))))
+        val demand = NamespaceSettlementFixtures.demandId
+        fun project(body: CommandRef, d: TerminationPendingDescriptor) = projectDependency(DependencyProjectionInput(body.id, rotLife.value,
+            RefView(ControlCommandLifecycle.TERMINATION_PENDING, body.body), emptyList(), null, d))
+        fun exact(mode: CompletionMode = CompletionMode.Consumed, binding: TerminationClosureBinding = TerminationClosures.of(one).binding(),
+            expectedIds: List<String> = listOf("s"), ordered: List<String> = listOf("s")) =
+            TerminationPendingDescriptor.ExactEvidenceAndSeals(mode, TerminationEntry.ConsumedRotation, binding,
+                AppliedEvidence.Rotation(one.id, rotLife.value, expectedIds, demand), one.id, ordered)
+        known("25 consistent", project(one, exact()))
+        val mismatch = setOf(DependencyGapCause.TerminationDescriptorMismatch)
+        // ordered == body, expected differs: also keeps the expected-only id "y".
+        val expectedOnly = project(one, exact(expectedIds = listOf("s", "y")))
+        assertEquals(mismatch, causes("25a expectedVsOrdered", expectedOnly))
+        assertTrue("D2B6/6-2C.25a: expectedIdKept", DependencyAtom.ControlRow(ControlKind.SEAL, "y") in (expectedOnly as DependencyProjection.Unknown).knownDependencies)
+        // ordered == expected, body has another seal.
+        assertEquals(mismatch, causes("25b bodyIds", project(two, exact())))
+        assertEquals(mismatch, causes("25c mode", project(one, exact(mode = CompletionMode.NeverSubmitted))))
+        // Binding of another command with this command's related scope: only the binding identity is wrong.
+        val other = rotRef(NamespaceSettlementFixtures.input(op = "00000000-0000-0000-0000-000000000055", did = "00000000-0000-0000-0000-000000000056"))
+        assertEquals(mismatch, causes("25d binding", project(one, exact(binding = TerminationClosures.of(one, command = other).binding()))))
+    }
+    @Test fun T7_26_classificationOfBroadAndSealGaps() {
+        // No body on an open view: broad footprint reaches any protected seal/witness/Applied.
+        assertTrue("D2B6/6-2C.26a: noBody", classifyDependency(projectDependency(input(b = null)), protectedS) is DependencyIntersection.Unknown)
+        // An invalid rotation of seal "s" still may concern another seal "x": the SEAL wildcard, not only its known ids.
+        val invalidRotation = projectDependency(input(b = ControlCommandBody.RotateAndSettle(NamespaceSettlementFixtures.input(targets = listOf(node(
+            NamespaceSettlementFixtures.user.replace("\"epoch\":\"u\"", "\"epoch\":\"old\""))))), adopted = emptyList(), id = NamespaceSettlementFixtures.operation))
+        val otherSeal = setOf(DependencyAtom.ControlRow(ControlKind.SEAL, "x"))
+        assertTrue("D2B6/6-2C.26b: sealWildcard", classifyDependency(invalidRotation, otherSeal) is DependencyIntersection.Unknown)
+        // A Mutations body with no actions and no adoption list: the footprint cannot be derived → Unclassified → Unknown(null).
+        val empty = projectDependency(input(b = ControlCommandBody.Mutations(emptyList()), adopted = null, id = "empty-mutations"))
+        assertEquals("D2B6/6-2C.26c: unclassifiedFailsClosed", DependencyIntersection.Unknown(null), classifyDependency(empty, protectedS))
+    }
+    @Test fun T7_27_journalFootprintsCompareExactly() {
+        val k1 = JournalTargetV1("A", PurgeScope.USER, "u"); val k2 = JournalTargetV1("A", PurgeScope.USER, "u2")
+        fun g(key: GapValue<JournalTargetV1>) = DependencyGap(DependencyGapCause.Unclassified, DependencyGapSource.Unclassified, setOf(DependencyAtomFootprint.Journal(key)))
+        val p = setOf<DependencyAtom>(DependencyAtom.Journal(k2))
+        assertTrue("D2B6/6-2C.27a: otherKey", !possibleIntersection(g(GapValue.Exact(k1)), p))
+        assertTrue("D2B6/6-2C.27b: sameKey", possibleIntersection(g(GapValue.Exact(k2)), p))
+    }
 }
