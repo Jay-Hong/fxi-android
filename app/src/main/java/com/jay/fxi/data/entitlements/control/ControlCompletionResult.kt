@@ -4,7 +4,13 @@ import java.io.IOException
 import java.util.Collections
 
 internal enum class CompletionMode { Consumed, NeverSubmitted, ResponsibilityTransferred }
-internal enum class TerminationEntry { AbandonBeforeFirstConfirm }
+internal enum class TerminationEntry { AbandonBeforeFirstConfirm, ConsumedRotation }
+
+/** The caller declares both business handoff conditions before evidence can be consumed. */
+internal class RotationConsumption(
+    val resultConsumed: Boolean,
+    val followUpCompletedOrDurablyOwned: Boolean
+)
 
 internal enum class NeverConfirmViolation {
     ConfirmationRequested, FirstConfirmBound, Confirmed, ExpectedApplied, ObservedApplied, TerminationDescriptorBound
@@ -20,6 +26,9 @@ internal sealed interface CompletionRejectionReason {
     data object NotRegisteredIdentity : CompletionRejectionReason
     data object InFlight : CompletionRejectionReason
     data object OtherManagementPath : CompletionRejectionReason
+    data object NotConfirmed : CompletionRejectionReason
+    data object Unresolved : CompletionRejectionReason
+    data object ConsumptionNotDeclared : CompletionRejectionReason
     data class NotNeverConfirm(val violation: NeverConfirmViolation) : CompletionRejectionReason
     data class ClosureNotSatisfied(val violation: ClosureViolation) : CompletionRejectionReason
     data object NotTerminationPending : CompletionRejectionReason
@@ -95,6 +104,17 @@ internal sealed interface TerminationPendingDescriptor {
         val entry: TerminationEntry,
         val closureBinding: TerminationClosureBinding
     ) : TerminationPendingDescriptor
+
+    class ExactEvidenceAndSeals(
+        val mode: CompletionMode,
+        val entry: TerminationEntry,
+        val closureBinding: TerminationClosureBinding,
+        val expectedRotation: AppliedEvidence.Rotation,
+        val operationId: String,
+        orderedSealIds: List<String>
+    ) : TerminationPendingDescriptor {
+        val orderedSealIds: List<String> = Collections.unmodifiableList(orderedSealIds.toList())
+    }
 }
 
 internal sealed interface ControlCompletionResult {

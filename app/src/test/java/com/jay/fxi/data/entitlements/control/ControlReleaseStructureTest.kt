@@ -165,12 +165,13 @@ class ControlReleaseStructureTest {
         val all = sources(); val store = all.getValue(control + "ControlRecordStore.kt")
         for (method in listOf("publishPendingTermination", "finishTermination", "bindTerminationDescriptor"))
             assertEquals(method, 1, all.getValue(control + "ControlRecordStore.kt").let { Regex("\\b$method\\(").findAll(it).count() })
-        assertEquals(mapOf(control + "ControlRecordStore.kt" to 3), SealSourceTripwire.occurrences(all, "terminationAttempt"))
+        // 6-2B: declaration 1 + abandon/retry/consume calls 3.
+        assertEquals(mapOf(control + "ControlRecordStore.kt" to 4), SealSourceTripwire.occurrences(all, "terminationAttempt"))
         // 6-1 completion (§7 "finishTermination 1곳"): one declaration and one owner call across every production file.
         assertEquals(mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 1),
             SealSourceTripwire.occurrences(all, "finishTermination"))
         // The only termination transitions happen in terminationAttempt, reached only after the entry acquired c's lease.
-        for (entry in listOf("suspend fun abandonBeforeFirstConfirm(", "suspend fun retryTermination(")) {
+        for (entry in listOf("suspend fun abandonBeforeFirstConfirm(", "suspend fun retryTermination(", "suspend fun completeAfterConsumption(")) {
             val body = member(store, entry)
             val lease = body.indexOf("tracking.executing.add(command)"); val call = body.indexOf("terminationAttempt(")
             assertTrue("$entry: lease before attempt", lease in 0 until call)
@@ -179,8 +180,9 @@ class ControlReleaseStructureTest {
         val attempt = member(store, "private suspend fun terminationAttempt(")
         val steps = listOf("tracked.bindTerminationDescriptor(", "tracking.publishPendingTermination(command)",
             "command.beginTermination()", "RecordTransactionDecision.Confirm(",
-            // 6-1 completion (§7 same strength as release): the returned snapshot is verified before the terminal step.
-            "check(ControlReleaseCandidate.hasAbsencePostcondition(returned, command))", "\"termination confirmation changed unrelated values\"",
+            // 6-1 completion (§7 same strength as release) as generalized by 6-2B (skeleton r3 §7): the returned snapshot is
+            // verified by plan kind in one call before the terminal step; each plan's branch has its own behavior tests.
+            "validateTerminationReturn(",
             "command.completeTermination()", "tracking.finishTermination(tracked)")
         assertTrue(steps.filterNot { attempt.contains(it) }.toString(), steps.all { attempt.contains(it) })
         assertEquals(steps.map { attempt.indexOf(it) }.sorted(), steps.map { attempt.indexOf(it) })

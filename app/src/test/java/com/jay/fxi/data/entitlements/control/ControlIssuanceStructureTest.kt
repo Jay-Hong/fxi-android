@@ -184,11 +184,13 @@ class ControlIssuanceStructureTest {
             "registerPrepared" to mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 9),
             // Lifecycle diagnostics collect negative decisions before returning from the transaction.
             // 6-1B adds one termination owner transaction and its five return@transactRecord labels.
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 14),
+            // 6-2B: the consumption decision's Recovery/Conflict/Rejected exits add three return@transactRecord labels.
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 17),
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,
-                control + "NamespaceSettlementTransition.kt" to 5),
+                control + "NamespaceSettlementTransition.kt" to 5,
+                control + "ControlRotationConsumption.kt" to 1), // 6-2B: the fixed input parameter of the consumption decision.
             "ControlCommandTracking" to mapOf(control + "ControlCommandTracking.kt" to 4, control + "ControlRecordStore.kt" to 1),
             "EpochIdGenerator.Random" to mapOf("main/java/com/jay/fxi/di/EntitlementsModule.kt" to 1, ent + "DataStoreAccessEpochStore.kt" to 1),
             "UUID::randomUUID" to mapOf(control + "ControlRecordStore.kt" to 1),
@@ -197,7 +199,8 @@ class ControlIssuanceStructureTest {
                 control + "ControlLifecycle.kt" to 1, control + "DemandAuthTransition.kt" to 1, control + "RemoveEmptyGuardTransition.kt" to 1, control + "RecoverHoldTransition.kt" to 1,
                 control + "RecoverIntentTransition.kt" to 1),
             // 6-1C: the pure dependency projection covers every body kind in one exhaustive when.
-            "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 2,
+            // 6-2B: consume entry, retry dispatch and the attempt's consumption branch each name the Rotation body (2 → 5).
+            "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 5,
                 control + "ControlStoreResult.kt" to 1, control + "ControlAppliedEvidence.kt" to 1, control + "DependencyProjection.kt" to 1)
         )
 

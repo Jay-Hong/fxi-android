@@ -116,6 +116,14 @@ class ControlOwnerStructureTest {
                 "\"read_barrier is owned by DataStoreAccessEpochStore\"",
                 "val barrier = DataStoreAccessEpochStore.READ_BARRIER",
                 "val barrier = DataStoreAccessEpochStore.READ_BARRIER", // 6-1B termination return validation, same as release.
+                // 6-2B: the shared termination owner keeps the barrier owner-only for both plans; EvidenceAbsent return validation.
+                "\"read_barrier is owned by DataStoreAccessEpochStore\"",
+                "val barrier = DataStoreAccessEpochStore.READ_BARRIER",
+            ),
+            // 6-2B: the rotation consumption return validator compares without the owner's barrier.
+            "main/java/com/jay/fxi/data/entitlements/control/ControlRotationConsumption.kt" to listOf(
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore",
+                "remove(DataStoreAccessEpochStore.READ_BARRIER)",
             ),
             "main/java/com/jay/fxi/data/entitlements/control/NamespaceSettlementTransition.kt" to listOf(
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.ENTRY_SEPARATOR",

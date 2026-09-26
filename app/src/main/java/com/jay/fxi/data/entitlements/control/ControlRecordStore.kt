@@ -353,13 +353,40 @@ internal class ControlRecordStore(
             neverConfirmViolation(tracked)?.let {
                 return completionRejected(command, CompletionRejectionReason.NotNeverConfirm(it))
             }
-            return terminationAttempt(command, tracked, closure, body, firstEntry = true)
+            return terminationAttempt(command, tracked, closure, body, TerminationRequest.FirstNeverConfirm)
         } finally {
             tracking.executing.remove(command)
         }
     }
 
-    /** Retry only the fixed absence authority; the caller supplies a current closure declaration. */
+    /** Consume only a confirmed current Rotation with a complete caller declaration. */
+    suspend fun completeAfterConsumption(command: CommandRef, closure: TerminationClosure,
+        consumption: RotationConsumption): ControlCompletionResult {
+        completionPrecheck(command, firstEntry = true)?.let { return it }
+        if (!tracking.executing.add(command)) return completionRejected(command, CompletionRejectionReason.InFlight)
+        try {
+            completionPrecheck(command, firstEntry = true)?.let { return it }
+            val tracked = tracking.findPrepared(command)
+                ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
+            val view = command.captureStateAndBody()
+            val body = view.body as? ControlCommandBody.RotateAndSettle
+                ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+            check(view.state == ControlCommandLifecycle.RETAINED)
+            if (!tracked.confirmed.get()) return completionRejected(command, CompletionRejectionReason.NotConfirmed)
+            if (tracking.isUnresolved(command)) return completionRejected(command, CompletionRejectionReason.Unresolved)
+            if (!consumption.resultConsumed || !consumption.followUpCompletedOrDurablyOwned)
+                return completionRejected(command, CompletionRejectionReason.ConsumptionNotDeclared)
+            closure.violation(command, tracking.lifetimeId)?.let {
+                return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
+            }
+            check(body.input.operationId == command.id) { "rotation body must match the command" }
+            return terminationAttempt(command, tracked, closure, body, TerminationRequest.FirstConsumed)
+        } finally {
+            tracking.executing.remove(command)
+        }
+    }
+
+    /** Retry only the fixed descriptor authority; the caller supplies a current closure declaration. */
     suspend fun retryTermination(command: CommandRef, closure: TerminationClosure): ControlCompletionResult {
         completionPrecheck(command, firstEntry = false)?.let { return it }
         if (!tracking.executing.add(command)) return completionRejected(command, CompletionRejectionReason.InFlight)
@@ -370,14 +397,31 @@ internal class ControlRecordStore(
             val body = command.captureStateAndBody().body
             if (body == null || body is ControlCommandBody.Handover)
                 return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
-            val descriptor = tracked.terminationDescriptor as? TerminationPendingDescriptor.EvidenceAbsent
+            val descriptor = tracked.terminationDescriptor
                 ?: return completionRejected(command, CompletionRejectionReason.NotTerminationPending)
-            check(descriptor.mode == CompletionMode.NeverSubmitted &&
-                descriptor.entry == TerminationEntry.AbandonBeforeFirstConfirm)
-            closure.violation(command, tracking.lifetimeId, descriptor.closureBinding)?.let {
+            val binding = when (descriptor) {
+                is TerminationPendingDescriptor.EvidenceAbsent -> {
+                    check(descriptor.mode == CompletionMode.NeverSubmitted &&
+                        descriptor.entry == TerminationEntry.AbandonBeforeFirstConfirm)
+                    descriptor.closureBinding
+                }
+                is TerminationPendingDescriptor.ExactEvidenceAndSeals -> {
+                    check(descriptor.mode == CompletionMode.Consumed &&
+                        descriptor.entry == TerminationEntry.ConsumedRotation)
+                    val rotation = body as? ControlCommandBody.RotateAndSettle
+                        ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+                    check(descriptor.operationId == command.id && rotation.input.operationId == command.id &&
+                        descriptor.orderedSealIds == rotation.input.seals.map { it.id } &&
+                        tracked.expectedApplied === descriptor.expectedRotation) {
+                        "fixed rotation termination authority changed"
+                    }
+                    descriptor.closureBinding
+                }
+            }
+            closure.violation(command, tracking.lifetimeId, binding)?.let {
                 return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
             }
-            return terminationAttempt(command, tracked, closure, body, firstEntry = false)
+            return terminationAttempt(command, tracked, closure, body, TerminationRequest.Retry(descriptor))
         } finally {
             tracking.executing.remove(command)
         }
@@ -407,11 +451,18 @@ internal class ControlRecordStore(
         else -> null
     }
 
+    private sealed interface TerminationRequest {
+        data object FirstNeverConfirm : TerminationRequest
+        data object FirstConsumed : TerminationRequest
+        data class Retry(val descriptor: TerminationPendingDescriptor) : TerminationRequest
+    }
+
     private suspend fun terminationAttempt(command: CommandRef, tracked: TrackedControlCommand,
-        closure: TerminationClosure, body: ControlCommandBody, firstEntry: Boolean): ControlCompletionResult {
+        closure: TerminationClosure, body: ControlCommandBody, request: TerminationRequest): ControlCompletionResult {
         val observation = AtomicReference<ControlRecordRead?>(null)
         val phase = AtomicReference(ControlAttemptPhase.ReadingSnapshot)
         var confirmedCandidate: Preferences? = null
+        var confirmedPlan: TerminationPendingDescriptor? = null
         try {
             val transaction = owner.transactRecord<ControlCompletionResult?> { snapshot ->
                 val read = reader.read(snapshot)
@@ -428,40 +479,73 @@ internal class ControlRecordStore(
                 if (read.schemaVersion != 2) return@transactRecord recovery(RecoveryReason.ControlSchemaMigrationRequired)
                 if (read.hasUninterpretableMetadata) return@transactRecord recovery(RecoveryReason.UninterpretableMetadata)
                 if (read.hasUninterpretable) return@transactRecord recovery(RecoveryReason.UninterpretableObligations)
-                // The entry gates Handover; the remaining non-Mutations/Lifecycle body is Rotation.
-                if (ControlAppliedEvidence.own(read, command) != null ||
-                    (body !is ControlCommandBody.Mutations && body !is ControlCommandBody.Lifecycle &&
-                        read.arrays.getValue(ControlKind.SEAL).entries.any {
-                            ((it as ControlEntryRead.Interpreted).value as SealV1).settlement?.operationId == command.id
-                        })
-                ) return@transactRecord RecordTransactionDecision.Observe(
-                    ControlCompletionResult.Conflict(command, emptySet(), emptySet(), ConflictReason.CommandEvidenceMismatch,
-                        command.lifecycleState, read))
-                confirmedCandidate = read.original
-                if (firstEntry) {
-                    tracked.bindTerminationDescriptor(TerminationPendingDescriptor.EvidenceAbsent(
-                        CompletionMode.NeverSubmitted, TerminationEntry.AbandonBeforeFirstConfirm, closure.binding()))
+                val plan: TerminationPendingDescriptor
+                val candidate: Preferences
+                if (request is TerminationRequest.FirstNeverConfirm ||
+                    (request is TerminationRequest.Retry && request.descriptor is TerminationPendingDescriptor.EvidenceAbsent)) {
+                    // The entry gates Handover; the remaining non-Mutations/Lifecycle body is Rotation.
+                    if (ControlAppliedEvidence.own(read, command) != null ||
+                        (body !is ControlCommandBody.Mutations && body !is ControlCommandBody.Lifecycle &&
+                            read.arrays.getValue(ControlKind.SEAL).entries.any {
+                                ((it as ControlEntryRead.Interpreted).value as SealV1).settlement?.operationId == command.id
+                            })
+                    ) return@transactRecord RecordTransactionDecision.Observe(
+                        ControlCompletionResult.Conflict(command, emptySet(), emptySet(), ConflictReason.CommandEvidenceMismatch,
+                            command.lifecycleState, read))
+                    candidate = read.original
+                    plan = if (request is TerminationRequest.Retry) request.descriptor else
+                        TerminationPendingDescriptor.EvidenceAbsent(CompletionMode.NeverSubmitted,
+                            TerminationEntry.AbandonBeforeFirstConfirm, closure.binding())
+                } else {
+                    val input = (body as ControlCommandBody.RotateAndSettle).input
+                    val expected = when (request) {
+                        is TerminationRequest.Retry ->
+                            (request.descriptor as TerminationPendingDescriptor.ExactEvidenceAndSeals).expectedRotation
+                        TerminationRequest.FirstConsumed -> tracked.expectedApplied?.let {
+                            check(it is AppliedEvidence.Rotation) { "expected evidence must be Rotation" }
+                            it
+                        }
+                        TerminationRequest.FirstNeverConfirm -> error("unexpected never-confirm request")
+                    }
+                    when (val decision = ControlRotationConsumption.decide(read, command, input, expected,
+                        request is TerminationRequest.Retry, codec)) {
+                        is ControlRotationConsumption.Decision.Recovery -> return@transactRecord recovery(decision.reason)
+                        ControlRotationConsumption.Decision.Conflict -> return@transactRecord RecordTransactionDecision.Observe(
+                            ControlCompletionResult.Conflict(command, emptySet(), emptySet(), ConflictReason.CommandEvidenceMismatch,
+                                command.lifecycleState, read))
+                        is ControlRotationConsumption.Decision.Rejected -> return@transactRecord RecordTransactionDecision.Observe(
+                            ControlCompletionResult.Rejected(command, emptySet(), emptySet(),
+                                CompletionRejectionReason.Encoding(decision.reason), command.lifecycleState, read))
+                        is ControlRotationConsumption.Decision.Ready -> candidate = decision.candidate
+                    }
+                    plan = if (request is TerminationRequest.Retry) request.descriptor else
+                        TerminationPendingDescriptor.ExactEvidenceAndSeals(CompletionMode.Consumed,
+                            TerminationEntry.ConsumedRotation, closure.binding(), checkNotNull(expected), command.id,
+                            input.seals.map { it.id })
+                }
+                val barrier = DataStoreAccessEpochStore.READ_BARRIER
+                check(candidate.asMap()[barrier] == snapshot.asMap()[barrier]) {
+                    "read_barrier is owned by DataStoreAccessEpochStore"
+                }
+                confirmedCandidate = candidate
+                confirmedPlan = plan
+                if (request !is TerminationRequest.Retry) {
+                    tracked.bindTerminationDescriptor(plan)
                     tracking.publishPendingTermination(command)
                     command.beginTermination()
                 }
                 phase.set(ControlAttemptPhase.ConfirmingStorage)
-                RecordTransactionDecision.Confirm(read.original, null)
+                RecordTransactionDecision.Confirm(candidate, null)
             }
             transaction.value?.let { return it.withCompletionRecoveryWork(tracking.recoverySnapshot()) }
             val returned = reader.read(transaction.snapshot)
-            check(ControlReleaseCandidate.hasAbsencePostcondition(returned, command)) {
-                "termination absence postcondition was not confirmed"
-            }
-            val barrier = DataStoreAccessEpochStore.READ_BARRIER
-            check(transaction.snapshot.toMutablePreferences().apply { remove(barrier) } ==
-                checkNotNull(confirmedCandidate).toMutablePreferences().apply { remove(barrier) }) {
-                "termination confirmation changed unrelated values"
-            }
+            validateTerminationReturn(checkNotNull(confirmedPlan), returned, checkNotNull(confirmedCandidate), command)
             command.completeTermination()
             tracking.finishTermination(tracked)
             val work = tracking.recoverySnapshot()
             return ControlCompletionResult.Completed(command, work.unresolvedCommands, work.pendingReleases,
-                CompletionMode.NeverSubmitted, ConfirmedControlSnapshot(returned as ControlRecordRead.Supported),
+                if (confirmedPlan is TerminationPendingDescriptor.ExactEvidenceAndSeals) CompletionMode.Consumed
+                else CompletionMode.NeverSubmitted, ConfirmedControlSnapshot(returned as ControlRecordRead.Supported),
                 ConfirmationProof(transaction.evidence))
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -469,6 +553,26 @@ internal class ControlRecordStore(
             val work = tracking.recoverySnapshot()
             return ControlCompletionResult.Unconfirmed(command, work.unresolvedCommands, work.pendingReleases,
                 command.lifecycleState, phase.get(), observation.get(), failure)
+        }
+    }
+
+    private fun validateTerminationReturn(plan: TerminationPendingDescriptor, returned: ControlRecordRead,
+        candidate: Preferences, command: CommandRef) {
+        when (plan) {
+            is TerminationPendingDescriptor.EvidenceAbsent -> {
+                check(ControlReleaseCandidate.hasAbsencePostcondition(returned, command)) {
+                    "termination absence postcondition was not confirmed"
+                }
+                val barrier = DataStoreAccessEpochStore.READ_BARRIER
+                check(returned.original.toMutablePreferences().apply { remove(barrier) } ==
+                    candidate.toMutablePreferences().apply { remove(barrier) }) {
+                    "termination confirmation changed unrelated values"
+                }
+            }
+            is TerminationPendingDescriptor.ExactEvidenceAndSeals ->
+                check(ControlRotationConsumption.validateReturn(returned, command, candidate)) {
+                    "termination confirmation changed unrelated values"
+                }
         }
     }
 
