@@ -196,8 +196,9 @@ class ControlIssuanceStructureTest {
                 control + "RetiredNamespaceSettlementTransition.kt" to 1, control + "CurrentNullSettlementTransition.kt" to 1, control + "RetiredNullSettlementTransition.kt" to 1,
                 control + "ControlLifecycle.kt" to 1, control + "DemandAuthTransition.kt" to 1, control + "RemoveEmptyGuardTransition.kt" to 1, control + "RecoverHoldTransition.kt" to 1,
                 control + "RecoverIntentTransition.kt" to 1),
+            // 6-1C: the pure dependency projection covers every body kind in one exhaustive when.
             "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 2,
-                control + "ControlStoreResult.kt" to 1, control + "ControlAppliedEvidence.kt" to 1)
+                control + "ControlStoreResult.kt" to 1, control + "ControlAppliedEvidence.kt" to 1, control + "DependencyProjection.kt" to 1)
         )
 
         private fun productionRoot(): File = SealSourceTripwire.sourceRoot(
