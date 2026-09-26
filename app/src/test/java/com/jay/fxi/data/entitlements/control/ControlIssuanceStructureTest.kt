@@ -185,7 +185,7 @@ class ControlIssuanceStructureTest {
             // Lifecycle diagnostics collect negative decisions before returning from the transaction.
             // 6-1B adds one termination owner transaction and its five return@transactRecord labels.
             // 6-2B: the consumption decision's Recovery/Conflict/Rejected exits add three return@transactRecord labels.
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 19),
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 17),
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,

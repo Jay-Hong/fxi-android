@@ -29,9 +29,8 @@ import org.junit.rules.TemporaryFolder
  * Rejected(DependencyUnknown(dependentCommandId, dependentLifetimeId, source)). Both keep the record (no Confirm) and the
  * ref's lifecycle (RETAINED on first entry; TERMINATION_PENDING with its fixed descriptor and P on retry). Refs the tracker
  * never registered are still found through U/P/executing; the consuming ref itself is excluded; unrelated Known refs do not
- * block. The closure declaration is a pure value check at the entry (6-2B) and, per 6-2C API consensus d (6-2D), is
- * checked again inside the owner decide before G11 with the same helper (on retry together with the fixed descriptor
- * binding). The implementation thread reads but does not edit this file.
+ * block. The closure declaration is a pure value check at the entry (6-2B); it is not repeated inside the decide. The
+ * implementation thread reads but does not edit this file.
  */
 class ControlRotationDependencyContractTest {
     @get:Rule val folder = TemporaryFolder()

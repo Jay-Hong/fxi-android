@@ -216,20 +216,17 @@ class ControlReleaseStructureTest {
         assertEquals(1, store.lineSequence().count { it.trim() == "if (command.lifecycleState == ControlCommandLifecycle.RETAINED) {" })
     }
 
-    // 6-2D (contracts-6-2D S1–S6; skeleton r3 last structure item; 6-2C API consensus d).
-    @Test fun D2B6_ownerDecideRechecksBeforeG11AndG11StaysLocal() {
+    // 6-2D (contracts-6-2D S1–S6; skeleton r3 last structure item). S1 follows the 6-2C2 agreement that withdrew
+    // consensus d's in-decide re-check: the closure is a pure value check done once at each entry (6-2D.1 correction).
+    @Test fun D2B6_g11BeforeBindingAndG11StaysLocal() {
         val all = sources(); val store = all.getValue(control + "ControlRecordStore.kt")
         val attempt = member(store, "private suspend fun terminationAttempt(")
-        // S1: inside the owner decide — closure (and, on retry, the fixed binding) re-checked, then G11, then any binding/Confirm.
-        val order = listOf("fixedTerminationBinding(command, tracked, body, request.descriptor)",
-            "terminationClosureViolation(command, closure, recheckBinding)", "rotationDependencyViolation(command, plan)",
-            "tracked.bindTerminationDescriptor(", "RecordTransactionDecision.Confirm(")
+        // S1: inside the owner decide, G11 runs before any binding/Confirm, and the closure is not re-checked there.
+        val order = listOf("rotationDependencyViolation(command, plan)", "tracked.bindTerminationDescriptor(", "RecordTransactionDecision.Confirm(")
         assertTrue(order.filterNot { attempt.contains(it) }.toString(), order.all { attempt.contains(it) })
         assertEquals(order.map { attempt.indexOf(it) }.sorted(), order.map { attempt.indexOf(it) })
-        // One closure condition: the helper is the only closure.violation caller; three entries + the decide use it.
-        assertEquals(1, Regex("closure\\.violation\\(").findAll(store).count())
-        assertEquals(1 + 3 + 1, Regex("\\bterminationClosureViolation\\(").findAll(store).count())
-        assertEquals(1 + 1 + 1, Regex("\\bfixedTerminationBinding\\(").findAll(store).count())
+        assertFalse("S1: no closure re-check inside the decide", attempt.contains("violation("))
+        assertEquals("S1: three entry checks only", 3, Regex("closure\\.violation\\(").findAll(store).count())
         // S2: projectDependency has one production caller, inside rotationDependencyViolation.
         assertEquals(mapOf(control + "ControlRecordStore.kt" to 1, control + "DependencyProjection.kt" to 1),
             SealSourceTripwire.occurrences(all, "projectDependency"))
