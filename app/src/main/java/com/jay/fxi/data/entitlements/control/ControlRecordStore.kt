@@ -413,6 +413,33 @@ internal class ControlRecordStore(
         }
     }
 
+    /** Consume one confirmed current Lifecycle result after the caller declares its handoff complete. */
+    suspend fun completeLifecycleAfterConsumption(command: CommandRef, closure: TerminationClosure,
+        consumption: RotationConsumption): ControlCompletionResult {
+        completionPrecheck(command, firstEntry = true)?.let { return it }
+        if (!tracking.executing.add(command)) return completionRejected(command, CompletionRejectionReason.InFlight)
+        try {
+            completionPrecheck(command, firstEntry = true)?.let { return it }
+            val tracked = tracking.findPrepared(command)
+                ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
+            val view = command.captureStateAndBody()
+            val body = view.body as? ControlCommandBody.Lifecycle
+                ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+            check(view.state == ControlCommandLifecycle.RETAINED)
+            if (!tracked.confirmed.get()) return completionRejected(command, CompletionRejectionReason.NotConfirmed)
+            if (tracking.isUnresolved(command)) return completionRejected(command, CompletionRejectionReason.Unresolved)
+            if (!consumption.resultConsumed || !consumption.followUpCompletedOrDurablyOwned)
+                return completionRejected(command, CompletionRejectionReason.ConsumptionNotDeclared)
+            closure.violation(command, tracking.lifetimeId)?.let {
+                return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
+            }
+            check(body.input.operationId == command.id) { "lifecycle body must match the command" }
+            return terminationAttempt(command, tracked, closure, body, TerminationRequest.FirstConsumedLifecycle)
+        } finally {
+            tracking.executing.remove(command)
+        }
+    }
+
     /** Retry only the fixed descriptor authority; the caller supplies a current closure declaration. */
     suspend fun retryTermination(command: CommandRef, closure: TerminationClosure): ControlCompletionResult {
         completionPrecheck(command, firstEntry = false)?.let { return it }
@@ -422,7 +449,7 @@ internal class ControlRecordStore(
             val tracked = tracking.findPrepared(command)
                 ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
             val body = command.captureStateAndBody().body
-            // Each descriptor branch below admits only its own body kind (Rotation or Handover).
+            // Each descriptor branch below admits only its own body kind.
             if (body == null) return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
             val descriptor = tracked.terminationDescriptor
                 ?: return completionRejected(command, CompletionRejectionReason.NotTerminationPending)
@@ -441,6 +468,18 @@ internal class ControlRecordStore(
                         descriptor.orderedSealIds == rotation.input.seals.map { it.id } &&
                         tracked.expectedApplied === descriptor.expectedRotation) {
                         "fixed rotation termination authority changed"
+                    }
+                    descriptor.closureBinding
+                }
+                is TerminationPendingDescriptor.ExactLifecycleEvidence -> {
+                    check(descriptor.mode == CompletionMode.Consumed &&
+                        descriptor.entry == TerminationEntry.ConsumedLifecycle)
+                    val lifecycle = body as? ControlCommandBody.Lifecycle
+                        ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+                    check(lifecycle.input.operationId == command.id &&
+                        tracked.expectedApplied === descriptor.expectedLifecycle &&
+                        ControlLifecycleEvidence.matches(lifecycle.input, descriptor.expectedLifecycle)) {
+                        "fixed lifecycle termination authority changed"
                     }
                     descriptor.closureBinding
                 }
@@ -494,6 +533,7 @@ internal class ControlRecordStore(
     private sealed interface TerminationRequest {
         data object FirstNeverConfirm : TerminationRequest
         data object FirstConsumed : TerminationRequest
+        data object FirstConsumedLifecycle : TerminationRequest
         data object FirstConsumedSettlement : TerminationRequest
         data class Retry(val descriptor: TerminationPendingDescriptor) : TerminationRequest
     }
@@ -548,7 +588,8 @@ internal class ControlRecordStore(
                             check(it is AppliedEvidence.Rotation) { "expected evidence must be Rotation" }
                             it
                         }
-                        TerminationRequest.FirstConsumedSettlement -> error("unexpected settlement request")
+                        TerminationRequest.FirstConsumedLifecycle, TerminationRequest.FirstConsumedSettlement ->
+                            error("unexpected non-rotation request")
                         TerminationRequest.FirstNeverConfirm -> error("unexpected never-confirm request")
                     }
                     when (val decision = ControlRotationConsumption.decide(read, command, input, expected,
@@ -566,6 +607,34 @@ internal class ControlRecordStore(
                         TerminationPendingDescriptor.ExactEvidenceAndSeals(CompletionMode.Consumed,
                             TerminationEntry.ConsumedRotation, closure.binding(), checkNotNull(expected), command.id,
                             input.seals.map { it.id })
+                } else if (request is TerminationRequest.FirstConsumedLifecycle ||
+                    (request is TerminationRequest.Retry &&
+                        request.descriptor is TerminationPendingDescriptor.ExactLifecycleEvidence)) {
+                    val input = (body as ControlCommandBody.Lifecycle).input
+                    val expected = when (request) {
+                        is TerminationRequest.Retry ->
+                            (request.descriptor as TerminationPendingDescriptor.ExactLifecycleEvidence).expectedLifecycle
+                        TerminationRequest.FirstConsumedLifecycle -> tracked.expectedApplied?.let {
+                            check(it is AppliedEvidence.Lifecycle) { "expected evidence must be Lifecycle" }
+                            it
+                        }
+                        TerminationRequest.FirstConsumed, TerminationRequest.FirstConsumedSettlement,
+                        TerminationRequest.FirstNeverConfirm -> error("unexpected non-lifecycle request")
+                    }
+                    when (val decision = ControlLifecycleConsumption.decide(read, command, input, expected,
+                        request is TerminationRequest.Retry, codec)) {
+                        is ControlLifecycleConsumption.Decision.Recovery -> return@transactRecord recovery(decision.reason)
+                        ControlLifecycleConsumption.Decision.Conflict -> return@transactRecord RecordTransactionDecision.Observe(
+                            ControlCompletionResult.Conflict(command, emptySet(), emptySet(), ConflictReason.CommandEvidenceMismatch,
+                                command.lifecycleState, read))
+                        is ControlLifecycleConsumption.Decision.Rejected -> return@transactRecord RecordTransactionDecision.Observe(
+                            ControlCompletionResult.Rejected(command, emptySet(), emptySet(),
+                                CompletionRejectionReason.Encoding(decision.reason), command.lifecycleState, read))
+                        is ControlLifecycleConsumption.Decision.Ready -> candidate = decision.candidate
+                    }
+                    plan = if (request is TerminationRequest.Retry) request.descriptor else
+                        TerminationPendingDescriptor.ExactLifecycleEvidence(CompletionMode.Consumed,
+                            TerminationEntry.ConsumedLifecycle, closure.binding(), checkNotNull(expected))
                 } else {
                     val input = (body as ControlCommandBody.Handover).input
                     val expected = when (request) {
@@ -575,7 +644,8 @@ internal class ControlRecordStore(
                             check(it is AppliedEvidence.Settlement) { "expected evidence must be Settlement" }
                             it
                         }
-                        TerminationRequest.FirstConsumed, TerminationRequest.FirstNeverConfirm ->
+                        TerminationRequest.FirstConsumed, TerminationRequest.FirstConsumedLifecycle,
+                        TerminationRequest.FirstNeverConfirm ->
                             error("unexpected non-settlement request")
                     }
                     when (val decision = ControlSettlementConsumption.decide(read, command, input, expected,
@@ -600,6 +670,9 @@ internal class ControlRecordStore(
                         consumptionDependencyViolation(command, plan.operationId, plan.orderedSealIds)
                     is TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals ->
                         consumptionDependencyViolation(command, plan.operationId, plan.orderedSealIds)
+                    is TerminationPendingDescriptor.ExactLifecycleEvidence ->
+                        completionDependencyViolation(command, setOf(DependencyAtom.AppliedRow(command.id,
+                            command.ownerTrackingLifetimeId.value)))
                     is TerminationPendingDescriptor.EvidenceAbsent -> null
                 }
                 if (dependencyReason != null) {
@@ -628,9 +701,7 @@ internal class ControlRecordStore(
             tracking.finishTermination(tracked)
             val work = tracking.recoverySnapshot()
             return ControlCompletionResult.Completed(command, work.unresolvedCommands, work.pendingReleases,
-                if (confirmedPlan is TerminationPendingDescriptor.ExactEvidenceAndSeals ||
-                    confirmedPlan is TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals) CompletionMode.Consumed
-                else CompletionMode.NeverSubmitted, ConfirmedControlSnapshot(returned as ControlRecordRead.Supported),
+                checkNotNull(confirmedPlan).mode, ConfirmedControlSnapshot(returned as ControlRecordRead.Supported),
                 ConfirmationProof(transaction.evidence))
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -673,14 +744,18 @@ internal class ControlRecordStore(
                 add(DependencyAtom.SealWitness(sealId, operationId))
             }
         }
-        return when (val violation = consumptionDependencyViolation(command, protectedAtoms)) {
+        return completionDependencyViolation(command, protectedAtoms)
+    }
+
+    private fun completionDependencyViolation(command: CommandRef,
+        protectedAtoms: Set<DependencyAtom>): CompletionRejectionReason? =
+        when (val violation = consumptionDependencyViolation(command, protectedAtoms)) {
             is ConsumptionDependencyViolation.Present -> CompletionRejectionReason.DependencyPresent(
                 violation.dependent.id, violation.dependent.ownerTrackingLifetimeId.value, violation.atom)
             is ConsumptionDependencyViolation.Unknown -> CompletionRejectionReason.DependencyUnknown(
                 violation.dependent.id, violation.dependent.ownerTrackingLifetimeId.value, violation.source)
             null -> null
         }
-    }
 
     private fun validateTerminationReturn(plan: TerminationPendingDescriptor, returned: ControlRecordRead,
         candidate: Preferences, command: CommandRef) {
@@ -701,6 +776,10 @@ internal class ControlRecordStore(
                 }
             is TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals ->
                 check(ControlSettlementConsumption.validateReturn(returned, command, candidate)) {
+                    "termination confirmation changed unrelated values"
+                }
+            is TerminationPendingDescriptor.ExactLifecycleEvidence ->
+                check(ControlLifecycleConsumption.validateReturn(returned, command, candidate)) {
                     "termination confirmation changed unrelated values"
                 }
         }

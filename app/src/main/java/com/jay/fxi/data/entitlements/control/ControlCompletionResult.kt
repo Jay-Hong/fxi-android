@@ -4,7 +4,7 @@ import java.io.IOException
 import java.util.Collections
 
 internal enum class CompletionMode { Consumed, NeverSubmitted, ResponsibilityTransferred }
-internal enum class TerminationEntry { AbandonBeforeFirstConfirm, ConsumedRotation, ConsumedSettlement }
+internal enum class TerminationEntry { AbandonBeforeFirstConfirm, ConsumedRotation, ConsumedLifecycle, ConsumedSettlement }
 
 /** The caller declares both business handoff conditions before evidence can be consumed. */
 internal class RotationConsumption(
@@ -109,14 +109,16 @@ internal class TerminationClosureBinding(
 }
 
 internal sealed interface TerminationPendingDescriptor {
+    val mode: CompletionMode
+
     data class EvidenceAbsent(
-        val mode: CompletionMode,
+        override val mode: CompletionMode,
         val entry: TerminationEntry,
         val closureBinding: TerminationClosureBinding
     ) : TerminationPendingDescriptor
 
     class ExactEvidenceAndSeals(
-        val mode: CompletionMode,
+        override val mode: CompletionMode,
         val entry: TerminationEntry,
         val closureBinding: TerminationClosureBinding,
         val expectedRotation: AppliedEvidence.Rotation,
@@ -127,7 +129,7 @@ internal sealed interface TerminationPendingDescriptor {
     }
 
     class ExactSettlementEvidenceAndSeals(
-        val mode: CompletionMode,
+        override val mode: CompletionMode,
         val entry: TerminationEntry,
         val closureBinding: TerminationClosureBinding,
         val expectedSettlement: AppliedEvidence.Settlement,
@@ -137,6 +139,13 @@ internal sealed interface TerminationPendingDescriptor {
     ) : TerminationPendingDescriptor {
         val orderedSealIds: List<String> = Collections.unmodifiableList(orderedSealIds.toList())
     }
+
+    class ExactLifecycleEvidence(
+        override val mode: CompletionMode,
+        val entry: TerminationEntry,
+        val closureBinding: TerminationClosureBinding,
+        val expectedLifecycle: AppliedEvidence.Lifecycle
+    ) : TerminationPendingDescriptor
 }
 
 internal sealed interface ControlCompletionResult {

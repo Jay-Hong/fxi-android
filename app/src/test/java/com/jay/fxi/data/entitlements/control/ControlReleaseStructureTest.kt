@@ -165,14 +165,14 @@ class ControlReleaseStructureTest {
         val all = sources(); val store = all.getValue(control + "ControlRecordStore.kt")
         for (method in listOf("publishPendingTermination", "finishTermination", "bindTerminationDescriptor"))
             assertEquals(method, 1, all.getValue(control + "ControlRecordStore.kt").let { Regex("\\b$method\\(").findAll(it).count() })
-        // 6-2B: declaration 1 + abandon/retry/consume calls 3; 6-3B2: + settlement consume call = 5.
-        assertEquals(mapOf(control + "ControlRecordStore.kt" to 5), SealSourceTripwire.occurrences(all, "terminationAttempt"))
+        // 6-2B: declaration 1 + abandon/retry/consume calls 3; 6-3B2: + settlement consume call = 5; 6-4aB: + lifecycle = 6.
+        assertEquals(mapOf(control + "ControlRecordStore.kt" to 6), SealSourceTripwire.occurrences(all, "terminationAttempt"))
         // 6-1 completion (§7 "finishTermination 1곳"): one declaration and one owner call across every production file.
         assertEquals(mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 1),
             SealSourceTripwire.occurrences(all, "finishTermination"))
         // The only termination transitions happen in terminationAttempt, reached only after the entry acquired c's lease.
         for (entry in listOf("suspend fun abandonBeforeFirstConfirm(", "suspend fun retryTermination(", "suspend fun completeAfterConsumption(",
-            "suspend fun completeSettlementAfterConsumption(")) {
+            "suspend fun completeSettlementAfterConsumption(", "suspend fun completeLifecycleAfterConsumption(")) {
             val body = member(store, entry)
             val lease = body.indexOf("tracking.executing.add(command)"); val call = body.indexOf("terminationAttempt(")
             assertTrue("$entry: lease before attempt", lease in 0 until call)
@@ -228,11 +228,13 @@ class ControlReleaseStructureTest {
         assertTrue(order.filterNot { attempt.contains(it) }.toString(), order.all { attempt.contains(it) })
         assertEquals(order.map { attempt.indexOf(it) }.sorted(), order.map { attempt.indexOf(it) })
         assertFalse("S1: no closure re-check inside the decide", attempt.contains("violation("))
-        // 6-3C2: four termination entry checks plus one previous-reclamation entry check, each inside its own entry.
-        assertEquals("S1: five entry checks in total", 5, Regex("closure\\.violation\\(").findAll(store).count())
+        // 6-3C2: termination entry checks plus one previous-reclamation entry check, each inside its own entry.
+        // 6-4aB: + the Lifecycle consumption entry (six in total).
+        assertEquals("S1: six entry checks in total", 6, Regex("closure\\.violation\\(").findAll(store).count())
         val terminationEntries = listOf("suspend fun abandonBeforeFirstConfirm(", "suspend fun completeAfterConsumption(",
-            "suspend fun completeSettlementAfterConsumption(", "suspend fun retryTermination(")
-        assertEquals("S1: one check per termination entry", List(4) { 1 },
+            "suspend fun completeSettlementAfterConsumption(", "suspend fun completeLifecycleAfterConsumption(",
+            "suspend fun retryTermination(")
+        assertEquals("S1: one check per termination entry", List(5) { 1 },
             terminationEntries.map { Regex("closure\\.violation\\(").findAll(member(store, it)).count() })
         assertEquals("S1: one previous entry check", 1, Regex("closure\\.violation\\(")
             .findAll(member(store, "internal suspend fun reclaimPreviousSettlementOrLifecycleEvidence(")).count())

@@ -374,6 +374,21 @@ internal fun projectDependency(input: DependencyProjectionInput): DependencyProj
         ) mark("TerminationDescriptorMismatch", DependencyGapCause.TerminationDescriptorMismatch,
             DependencyGapSource.TerminationDescriptor, broadFootprint)
     }
+    if (input.terminationDescriptor is TerminationPendingDescriptor.ExactLifecycleEvidence) {
+        val descriptor = input.terminationDescriptor
+        val expected = descriptor.expectedLifecycle
+        dependencies += DependencyAtom.AppliedRow(expected.commandId, expected.ownerTrackingLifetimeId)
+        val lifecycle = body as? ControlCommandBody.Lifecycle
+        val binding = descriptor.closureBinding
+        if (descriptor.mode != CompletionMode.Consumed || descriptor.entry != TerminationEntry.ConsumedLifecycle ||
+            expected.commandId != input.commandId || expected.ownerTrackingLifetimeId != input.lifetimeId ||
+            lifecycle == null || lifecycle.input.operationId != input.commandId ||
+            binding.command.id != input.commandId || binding.ownerTrackingLifetimeId.value != input.lifetimeId ||
+            binding.relatedScope != input.commandId ||
+            !ControlLifecycleEvidence.matches(lifecycle.input, expected)
+        ) mark("TerminationDescriptorMismatch", DependencyGapCause.TerminationDescriptorMismatch,
+            DependencyGapSource.TerminationDescriptor, broadFootprint)
+    }
     if (input.view.state == ControlCommandLifecycle.TERMINATION_PENDING && input.terminationDescriptor == null)
         mark("TerminationDescriptorMissing", DependencyGapCause.TerminationDescriptorMissing,
             DependencyGapSource.TerminationDescriptor, broadFootprint)
