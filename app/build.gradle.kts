@@ -302,6 +302,24 @@ tasks.register<org.gradle.api.tasks.testing.Test>("testRotationAccumulation") {
     testLogging.showStandardStreams = true
 }
 
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    if (name != "testSettlementAccumulation") {
+        filter.excludeTestsMatching("*.SettlementAccumulationLongTest")
+    }
+}
+tasks.register<org.gradle.api.tasks.testing.Test>("testSettlementAccumulation") {
+    val debugUnitTestForAccumulation = tasks.named<org.gradle.api.tasks.testing.Test>("testDebugUnitTest")
+    group = "verification"
+    description = "Runs only the opt-in settlement accumulation suite"
+    dependsOn("compileDebugUnitTestKotlin", "compileDebugUnitTestJavaWithJavac", "processDebugUnitTestJavaRes")
+    testClassesDirs = files(debugUnitTestForAccumulation.map { it.testClassesDirs })
+    classpath = files(debugUnitTestForAccumulation.map { it.classpath })
+    filter.includeTestsMatching("*.SettlementAccumulationLongTest")
+    filter.isFailOnNoMatchingTests = true
+    systemProperty("fxi.settlement.report", layout.buildDirectory.file("reports/settlement-accumulation.txt").get().asFile.absolutePath)
+    testLogging.showStandardStreams = true
+}
+
 val verifyProductionGoogleServicesConfig = {
     check(Files.isRegularFile(productionGoogleServicesPath, LinkOption.NOFOLLOW_LINKS)) {
         "Public release requires a regular, non-symlink app/google-services.json; " +
