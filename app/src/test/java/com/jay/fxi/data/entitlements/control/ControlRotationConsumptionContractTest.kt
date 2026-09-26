@@ -5,7 +5,11 @@ import com.jay.fxi.data.entitlements.RecordTransactionEvidence
 import com.jay.fxi.data.entitlements.control.ControlObligationFixtures.node
 import com.jay.fxi.data.entitlements.control.TerminationClosures.of as closure
 import java.io.File
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -309,13 +313,14 @@ class ControlRotationConsumptionContractTest {
         assertEquals("D2B6/6-2B.30: otherSealKept", listOf("c"), arr(f.disk(), sealKey).map { id(it) })
         assertEquals("D2B6/6-2B.30: otherRowKept", listOf(other.operationId), arr(f.disk(), evidenceKey).map { rowCommand(it) })
     }
-    private suspend fun badReturn(id: String, change: (Preferences, CommandRef) -> Preferences) {
+    private suspend fun badReturn(id: String, seed: Preferences = N.raw(), input: RotateAndSettleNamespaces = N.input(),
+        change: (Preferences, CommandRef) -> Preferences) {
         lateinit var boundary: ReleaseBoundaryData
         val s = ControlStoreTestStorage(File(folder.root, "return-$id.preferences_pb")) { ReleaseBoundaryData(it).also { b -> boundary = b } }
             .also { openedBoundary += it }
-        s.data.updateData { N.raw() }
+        s.data.updateData { seed }
         val tracker = ControlCommandTracking.forOwner(s.owner)
-        val c = tracker.registerPrepared(CommandRef(N.operation, ControlCommandBody.RotateAndSettle(N.input()), tracker.lifetimeId))
+        val c = tracker.registerPrepared(CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input), tracker.lifetimeId))
         check(controlTestTimeout("rotation execute") { s.control.execute(c, N.context) } is ControlStoreResult.Confirmed)
         boundary.after = { change(it, c) }
         val failure = runCatching { controlTestTimeout("consume") { s.control.completeAfterConsumption(c, closure(c), declared) } }.exceptionOrNull()
@@ -465,5 +470,211 @@ class ControlRotationConsumptionContractTest {
         }
         check(arr(f.storage.raw(), sealKey).none { op(it) == c.id })
         retryHeld("48", f, c, d, RecoveryReason.InconsistentReclamation)
+    }
+
+    // ── 6-2D (contracts-6-2D): single-field closure refusals ─────────────────────────────────────────────────────
+    @Test fun T1_09_eachClosureFieldAloneIsRefusedBeforeStorage() = runBlocking {
+        val cases: List<Pair<ClosureViolation, (TerminationFixture, CommandRef) -> TerminationClosure>> = listOf(
+            ClosureViolation.CommandMismatch to { f, c ->
+                closure(c, command = CommandRef(c.id, checkNotNull(c.captureStateAndBody().body), f.tracker.lifetimeId)) },
+            ClosureViolation.LifetimeMismatch to { _, c -> closure(c, lifetime = fixture().tracker.lifetimeId) },
+            ClosureViolation.RelatedScopeMismatch to { _, c -> closure(c, scope = c.id + "-other") },
+            ClosureViolation.GenerationMismatch to { _, c -> closure(c, capture = 6L) },
+            ClosureViolation.CapturedJoinedMismatch to { _, c -> closure(c, joined = setOf("job-2")) },
+            ClosureViolation.RegisteredMismatch to { _, c -> closure(c, registered = setOf("job-2")) },
+            ClosureViolation.ReceiptsOpen to { _, c -> closure(c, receiptsClosed = false) },
+            ClosureViolation.OwnerMissing to { _, c -> closure(c, owner = " ") }
+        )
+        for ((violation, make) in cases) {
+            val f = fixture(); val c = confirmed(f)
+            refusedBeforeStorage("09 $violation", f, c, CompletionRejectionReason.ClosureNotSatisfied(violation), k = make(f, c))
+            assertConsumed("09r $violation", f, c, consume(f, c), expectedAfterDeletion(f.disk(), c))
+        }
+    }
+    @Test fun T5_50_eachRetryBindingFieldAloneIsHeld() = runBlocking {
+        val cases: List<Pair<ClosureViolation, (CommandRef) -> TerminationClosure>> = listOf(
+            // capture == current, but both differ from the fixed binding generation 7.
+            ClosureViolation.GenerationMismatch to { c -> closure(c, capture = 8L, current = 8L) },
+            ClosureViolation.OwnerMismatch to { c -> closure(c, owner = "owner-2") },
+            ClosureViolation.WorkSetChanged to { c ->
+                closure(c, captured = setOf("job-2"), joined = setOf("job-2"), registered = setOf("job-2")) },
+            ClosureViolation.ReceiptsOpen to { c -> closure(c, receiptsClosed = false) }
+        )
+        for ((violation, make) in cases) {
+            val f = fixture(); val c = confirmed(f); val before = f.disk(); val d = pendingByWriteFault(f, c)
+            retryHeld("50 $violation", f, c, d, CompletionRejectionReason.ClosureNotSatisfied(violation), k = make(c))
+            assertConsumed("50r $violation", f, c, retry(f, c), expectedAfterDeletion(before, c))
+        }
+    }
+    // ── 6-2D (contracts-6-2D): remaining T2–T5 rows ──────────────────────────────────────────────────────────────
+    @Test fun T2_15_twoWitnessedSealsWithoutAnOwnRowLeaveExpectedNull() = runBlocking {
+        val f = fixture(); val witnessed = N.settled(both, N.raw("[${N.user},${N.krx}]"), f.tracker.lifetimeId).toMutablePreferences()
+            .apply { this[evidenceKey] = "[]" }.toPreferences()
+        check(arr(witnessed, sealKey).count { op(it) == both.operationId } == 2) { "fixture: both seals witnessed" }
+        f.edit { it.clear(); it += witnessed }
+        val c = register(f, both)
+        check(controlTestTimeout("witness execute") { f.store.execute(c, N.context) } is ControlStoreResult.Confirmed)
+        check(f.history(c).confirmed.get() && f.history(c).expectedApplied == null) { "fixture: expected must be null" }
+        ownerRefused("15", f, c, RecoveryReason.ExpectedRotationEvidenceUnavailable)
+    }
+    @Test fun T2_16_pureDecisionAndOwnerForEachRowField() = runBlocking {
+        // Each case changes one field of the stored own Rotation row; the pure decision (the exact matcher) and the owner
+        // reach the same outcome. Values stay schema-valid (UUID-shaped ids) so check (1) passes.
+        val other = "00000000-0000-0000-0000-0000000000aa"
+        val cases = listOf<Triple<String, (CommandRef) -> Pair<String, String>, Any>>(
+            Triple("commandId", { c -> "\"commandId\":\"${c.id}\"" to "\"commandId\":\"$other\"" }, RecoveryReason.CommandEvidenceLost),
+            Triple("lifetime", { c -> "\"ownerTrackingLifetimeId\":\"${c.ownerTrackingLifetimeId.value}\"" to "\"ownerTrackingLifetimeId\":\"$other\"" },
+                ConflictReason::class), // own row is found by commandId; the lifetime fails the exact comparison
+            Triple("order", { _ -> "\"sealIds\":[\"s\",\"c\"]" to "\"sealIds\":[\"c\",\"s\"]" }, RecoveryReason.InconsistentReclamation),
+            Triple("demand", { _ -> "\"demandId\":\"${N.demandId}\"" to "\"demandId\":\"$other\"" }, ConflictReason::class))
+        for ((name, edit, want) in cases) {
+            val f = fixture(); val c = confirmed(f, both, "[${N.user},${N.krx}]")
+            val expected = f.history(c).expectedApplied as AppliedEvidence.Rotation
+            val (from, to) = edit(c)
+            f.edit { p -> p[evidenceKey] = checkNotNull(p[evidenceKey]).replace(from, to).also { check(it != p[evidenceKey]) { "fixture edit $name" } } }
+            val read = ControlRecordReader(ControlPayloadCodec()).read(f.storage.raw())
+            check(read is ControlRecordRead.Supported && !read.hasUninterpretableMetadata && !read.hasUninterpretable) { "fixture $name: interpretable" }
+            val pure = ControlRotationConsumption.decide(read, c, both, expected, false, ControlPayloadCodec())
+            val wantPure = if (want is RecoveryReason) ControlRotationConsumption.Decision.Recovery(want) else ControlRotationConsumption.Decision.Conflict
+            assertEquals("D2B6/6-2D.16 $name: pure", wantPure, pure)
+            ownerRefused("16 $name", f, c, want)
+        }
+        val f = fixture(); val c = confirmed(f, both, "[${N.user},${N.krx}]")
+        val read = ControlRecordReader(ControlPayloadCodec()).read(f.storage.raw()) as ControlRecordRead.Supported
+        assertTrue("D2B6/6-2D.16 exact: ready", ControlRotationConsumption.decide(read, c, both,
+            f.history(c).expectedApplied as AppliedEvidence.Rotation, false, ControlPayloadCodec()) is ControlRotationConsumption.Decision.Ready)
+    }
+    @Test fun T2_17_ownRowIsObservedBeforeAnUnrelatedOpaqueEntryRefuses() = runBlocking {
+        val f = fixture(); val c = confirmed(f)
+        f.history(c).observedApplied.set(false) // isolate this transaction's observation
+        f.edit { p -> p[demandKey] = "[17]" }
+        ownerRefused("17", f, c, RecoveryReason.UninterpretableObligations)
+        assertTrue("D2B6/6-2D.17: observedFirst", f.history(c).observedApplied.get())
+    }
+    @Test fun T3_26_eachSchemaFailureIsTheFirstFailure() = runBlocking {
+        val cases = listOf<Pair<String, (androidx.datastore.preferences.core.MutablePreferences) -> Unit>>(
+            "ownRowDuplicateSealId" to { p -> p[evidenceKey] = checkNotNull(p[evidenceKey]).replace("\"sealIds\":[\"s\"]", "\"sealIds\":[\"s\",\"s\"]") },
+            "ownRowMissingField" to { p -> p[evidenceKey] = checkNotNull(p[evidenceKey]).replace(",\"demandId\":\"${N.demandId}\"", "") },
+            "witnessExtraVersion" to { p -> p[sealKey] = checkNotNull(p[sealKey]).replace("\"settlement\":{", "\"settlement\":{\"version\":3,") })
+        for ((name, change) in cases) {
+            val f = fixture(); val c = confirmed(f)
+            val before = checkNotNull(f.storage.raw()[evidenceKey]) + f.storage.raw()[sealKey]
+            f.edit { change(it) }
+            check(checkNotNull(f.storage.raw()[evidenceKey]) + f.storage.raw()[sealKey] != before) { "fixture edit $name" }
+            ownerRefused("26 $name", f, c, if (name.startsWith("ownRow")) RecoveryReason.UninterpretableMetadata
+                else RecoveryReason.UninterpretableObligations)
+        }
+    }
+    @Test fun T3_27_eachRemainingWitnessFieldAloneFailsTheExactComparison() = runBlocking {
+        val changes = listOf<Pair<String, (String) -> String>>(
+            "after" to { s -> Regex("(\"after\":\\{[^}]*\"krxCapabilityEpoch\":)\"k\"").replace(s) { it.groupValues[1] + "\"k-other\"" } },
+            "operation" to { s -> s.replace("\"operation\":\"BEGIN_ROTATION\"", "\"operation\":\"SIGN_OUT\"") },
+            "journalEpoch" to { s -> s.replace("\"journal\":{\"ownerUid\":\"A\",\"axis\":\"USER\",\"epoch\":\"u\"}",
+                "\"journal\":{\"ownerUid\":\"A\",\"axis\":\"USER\",\"epoch\":null}") })
+        for ((name, change) in changes) {
+            val f = fixture(); val c = confirmed(f)
+            f.edit { p -> p[sealKey] = replaceSeal(arr(p.toPreferences(), sealKey), "s", change) }
+            check(ControlRecordReader().read(f.storage.raw()).let { it is ControlRecordRead.Supported && !it.hasUninterpretable }) { "fixture $name: must parse" }
+            check(op(arr(f.storage.raw(), sealKey).single()) == c.id) { "fixture $name: still this operation" }
+            ownerRefused("27 $name", f, c, RecoveryReason.InconsistentReclamation)
+        }
+    }
+    @Test fun T3_28_movedCurrentEpochsAreNotRequired() = runBlocking {
+        for (key in listOf(com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.USER_EPOCH, com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.KRX_EPOCH)) {
+            val f = fixture(); val c = confirmed(f)
+            f.edit { p -> p[key] = "moved-${key.name}" }
+            val before = f.disk()
+            assertConsumed("28 ${key.name}", f, c, consume(f, c), expectedAfterDeletion(before, c))
+            assertEquals("D2B6/6-2D.28: epochKept", "moved-${key.name}", f.disk()[key])
+        }
+    }
+    @Test fun T4_33_markersOwnerTeardownAndForeignKeysSurvive() = runBlocking {
+        val f = fixture(); val c = confirmed(f)
+        f.edit { p ->
+            p[com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.MAY_CONTAIN_PREMIUM] = true
+            p[com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.MAY_CONTAIN_KRX] = true
+            p[com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.TEARDOWN_OWED_FOR] = "old-owner"
+            p[ControlStoreTestStorage.EXTRA] = "future-value"
+        }
+        val before = f.disk()
+        check(before[com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.OWNER_UID] != null) { "fixture: owner present" }
+        assertConsumed("33", f, c, consume(f, c), expectedAfterDeletion(before, c))
+    }
+    @Test fun T4_34_returnWithAPartialOwnSealOrAMissingSurvivorIsAnInvariantFailure() = runBlocking {
+        // a: two-seal rotation; the return re-carries only ONE of its own seals ("s") — a partial reappearance.
+        badReturn("34a", seed = N.raw("[${N.user},${N.krx}]"), input = both) { returned, c -> returned.toMutablePreferences().apply {
+            val own = arr(N.settled(both, N.raw("[${N.user},${N.krx}]"), c.ownerTrackingLifetimeId), sealKey).filter { id(it) == "s" }
+            check(own.size == 1 && op(own.single()) == c.id) { "fixture: one own seal" }
+            this[sealKey] = JsonArray(arr(returned, sealKey) + own).toString()
+        }.toPreferences() }
+        // Another operation's settled seal and Applied row survive the candidate; b loses only the seal, c only the row.
+        val other = N.input(targets = listOf(node(N.krx)), op = "00000000-0000-0000-0000-000000000009", did = "00000000-0000-0000-0000-000000000010")
+        val foreignRecord = N.settled(other, N.raw("[${N.krx}]"), N.trackerLife)
+        val seed = N.raw().toMutablePreferences().apply {
+            this[sealKey] = JsonArray(arr(foreignRecord, sealKey) + arr(this.toPreferences(), sealKey)).toString()
+            this[evidenceKey] = JsonArray(arr(foreignRecord, evidenceKey)).toString()
+        }.toPreferences()
+        badReturn("34b", seed = seed) { returned, _ -> returned.toMutablePreferences().apply {
+            this[sealKey] = JsonArray(arr(returned, sealKey).filter { op(it) != other.operationId }).toString()
+                .also { check(it != returned[sealKey]) { "fixture: survivor seal removed" } }
+        }.toPreferences() }
+        badReturn("34c", seed = seed) { returned, _ -> returned.toMutablePreferences().apply {
+            this[evidenceKey] = JsonArray(arr(returned, evidenceKey).filter { rowCommand(it) != other.operationId }).toString()
+                .also { check(it != returned[evidenceKey]) { "fixture: survivor row removed" } }
+        }.toPreferences() }
+    }
+    @Test fun T5_40b_readFaultLeavesTheFileUnchanged() = runBlocking {
+        val f = fixture(); val c = confirmed(f); val before = f.disk()
+        f.boundary.failNextBeforeSnapshot = true
+        check(consume(f, c) is ControlCompletionResult.Unconfirmed)
+        assertEquals("D2B6/6-2D.40b: diskUnchanged", before, f.disk())
+    }
+    @Test fun T5_49_cancellationBeforeTheCandidateKeepsRetained() = runBlocking {
+        val f = fixture(); val c = confirmed(f); val before = f.disk(); val work = f.tracker.recoverySnapshot()
+        val reached = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        f.boundary.gate = reached to release
+        val caller = async { f.store.completeAfterConsumption(c, closure(c), declared) }
+        try {
+            withTimeout(10_000) { reached.await() }
+            caller.cancelAndJoin()
+            assertTrue("D2B6/6-2D.49: cancelled", caller.isCancelled)
+        } finally { release.complete(Unit); caller.cancelAndJoin() }
+        assertEquals("D2B6/6-2D.49: retained", ControlCommandLifecycle.RETAINED, c.lifecycleState)
+        assertNull("D2B6/6-2D.49: noDescriptor", f.history(c).terminationDescriptor)
+        assertEquals("D2B6/6-2D.49: setsKept", work, f.tracker.recoverySnapshot())
+        assertEquals("D2B6/6-2D.49: diskUnchanged", before, f.disk())
+        assertTrue("D2B6/6-2D.49: leaseReleased", f.tracker.executing.isEmpty())
+        assertConsumed("49r", f, c, consume(f, c), expectedAfterDeletion(before, c))
+    }
+
+    /** A surviving unrelated seal whose ownerUid holds 12,000 real unpaired surrogate code units. */
+    private val loneSurvivor = N.krx.replace("\"ownerUid\":\"A\"", "\"ownerUid\":\"${"\uD800".repeat(12_000)}\"")
+        .also { check(it != N.krx) { "fixture edit" } }
+    @Test fun T4_35a_theRealFileStoragePathCarriesNoUnpairedSurrogate() = runBlocking {
+        // Reachability boundary of the TooLarge branch (review E2): a snapshot the owner reads through the real FileStorage
+        // never holds a raw unpaired surrogate, so the surviving array re-encodes no longer than it was read and the
+        // consumption completes.
+        val f = fixture(); val c = confirmed(f)
+        f.edit { p -> p[sealKey] = JsonArray(arr(p.toPreferences(), sealKey) + Json.parseToJsonElement(loneSurvivor)).toString() }
+        val r = consume(f, c)
+        assertTrue("D2B6/6-2D.35a: completed $r", r is ControlCompletionResult.Completed)
+        assertTrue("D2B6/6-2D.35a: noUnpairedSurrogateOnDisk", checkNotNull(f.disk()[sealKey]).none(Char::isSurrogate))
+    }
+    @Test fun T4_35b_aSurvivingPayloadThatReencodesPastTheLimitIsRejected() = runBlocking {
+        // An in-memory snapshot with raw unpaired surrogates: read counts each as one UTF-8 byte ('?') but the codec writes
+        // the six-byte escape, so decode passes and the surviving SEAL re-encodes past 65,536 bytes.
+        val f = fixture(); val c = confirmed(f)
+        val record = f.disk().toMutablePreferences().apply {
+            this[sealKey] = checkNotNull(this[sealKey]).removeSuffix("]") + "," + loneSurvivor + "]"
+        }.toPreferences()
+        check(checkNotNull(record[sealKey]).toByteArray(Charsets.UTF_8).size <= ControlPayloadCodec.DEFAULT_MAX_PAYLOAD_BYTES) { "fixture: decodes" }
+        val read = ControlRecordReader(ControlPayloadCodec()).read(record)
+        check(read is ControlRecordRead.Supported && !read.hasUninterpretable) { "fixture: $read" }
+        val input = (checkNotNull(c.captureStateAndBody().body) as ControlCommandBody.RotateAndSettle).input
+        val decision = ControlRotationConsumption.decide(read, c, input, f.history(c).expectedApplied as AppliedEvidence.Rotation,
+            false, ControlPayloadCodec())
+        val reason = (decision as? ControlRotationConsumption.Decision.Rejected)?.reason
+        assertTrue("D2B6/6-2D.35b: tooLarge $decision", reason is RejectionReason.TooLarge && reason.payloadKey == ControlPayloadKey.SEAL &&
+            reason.bytes > reason.limit)
     }
 }

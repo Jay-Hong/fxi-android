@@ -88,11 +88,29 @@ class RotationAccumulationLongTest {
         private val sealKey = ControlRecordKeys.payload(ControlKind.SEAL)
         private val evidenceKey = ControlRecordKeys.payload(ControlPayloadKey.COMMAND_EVIDENCE)
         private val declared = RotationConsumption(resultConsumed = true, followUpCompletedOrDurablyOwned = true)
+        // 6-2D: the profile string also rides on the owner uid, the origin lifetime and every new epoch (journal fields
+        // exclude '|', newline and unpaired surrogates; every profile satisfies that). Operation/demand ids stay UUIDs.
+        private val ownerUid = "${profile.sample}-owner"
+        private val life = LifetimeId("${profile.sample}-life")
+        private val context = AttemptContext(ownerUid, 3, life, false, false)
+        private val demand = SettlementDemand(ownerUid, 3, EventOrderV1(life, 7), com.jay.fxi.data.entitlements.RefreshIntent.FORCE_PREMIUM)
+        private fun seal(id: String, axisName: String, epoch: String) =
+            """{"id":${JsonPrimitive(id)},"kind":"NAMESPACE","ownerUid":${JsonPrimitive(ownerUid)},"axis":"$axisName","epoch":${JsonPrimitive(epoch)}}"""
+        /** Fixed-input registration (the test path for profile epochs); production issuance is not under test here. */
+        private fun register(sealJson: List<String>, fence: FenceV1, tag: String): CommandRef {
+            val axes = sealJson.map { Json.parseToJsonElement(it).jsonObject.getValue("axis").jsonPrimitive.content }
+            val input = RotateAndSettleNamespaces(sealJson.map { node(it) }, fence, life, demand, UUID.randomUUID().toString(), UUID.randomUUID().toString(),
+                if ("USER" in axes) "${profile.sample}-eu-$tag" else null, if ("CAPABILITY" in axes) "${profile.sample}-ek-$tag" else null)
+            check(input.invalidInput() == null) { "profile input: ${input.invalidInput()}" }
+            return tracker.registerPrepared(CommandRef(input.operationId, ControlCommandBody.RotateAndSettle(input), tracker.lifetimeId))
+        }
         private lateinit var waiting: CommandRef
         private lateinit var unrelatedU: CommandRef
         private lateinit var unrelatedP: CommandRef
         private lateinit var waitingRow: String
         private lateinit var waitingSeal: String
+        private lateinit var baselineDemand: String
+        private val demandKey = ControlRecordKeys.payload(ControlKind.DEMAND)
         private lateinit var baselineCommands: Map<String, TrackedControlCommand>
         private lateinit var baselineWork: LocalRecoveryWork
         private val payloadTotal = mutableMapOf<String, Long>()
@@ -136,15 +154,20 @@ class RotationAccumulationLongTest {
             set("id", ControlScalar.Text(issued))
         })
         suspend fun seed() {
-            data.updateData { NamespaceSettlementFixtures.raw() }
-            waiting = control.prepareRotation(listOf(node(NamespaceSettlementFixtures.user)),
-                NamespaceSettlementFixtures.fence, NamespaceSettlementFixtures.life, NamespaceSettlementFixtures.demand)
-            assertTrue("waiting bundle apply", control.execute(waiting, NamespaceSettlementFixtures.context) is ControlStoreResult.Confirmed)
+            val seedUser = "${profile.sample}-eu-seed"; val seedKrx = "${profile.sample}-ek-seed"
+            data.updateData { NamespaceSettlementFixtures.raw("[${seal("${profile.sample}-s", "USER", seedUser)}]").toMutablePreferences().apply {
+                this[DataStoreAccessEpochStore.OWNER_UID] = ownerUid
+                this[DataStoreAccessEpochStore.USER_EPOCH] = seedUser
+                this[DataStoreAccessEpochStore.KRX_EPOCH] = seedKrx
+            }.toPreferences() }
+            waiting = register(listOf(seal("${profile.sample}-s", "USER", seedUser)), FenceV1(ownerUid, seedUser, seedKrx), "waiting")
+            assertTrue("waiting bundle apply", control.execute(waiting, context) is ControlStoreResult.Confirmed)
             val p = record()
             waitingRow = rows(p).single { it.jsonObject.getValue("commandId").jsonPrimitive.content == waiting.id }.toString()
             waitingSeal = seals(p).single { operation(it) == waiting.id }.toString()
             unrelatedU = unrelated().also { tracker.markUnresolved(it) }
             unrelatedP = unrelated().also { ControlReleaseFixtures.simulatePending(tracker, it) }
+            baselineDemand = checkNotNull(p[demandKey])
             baselineCommands = commands.toMap()
             baselineWork = tracker.recoverySnapshot()
             assertBaseline(p)
@@ -163,27 +186,25 @@ class RotationAccumulationLongTest {
             assertEquals("waiting Applied unchanged", waitingRow,
                 rows(p).single { it.jsonObject.getValue("commandId").jsonPrimitive.content == waiting.id }.toString())
             assertEquals("waiting seal unchanged", waitingSeal, seals(p).single { operation(it) == waiting.id }.toString())
+            assertEquals("REQUEST payload at baseline", baselineDemand, p[demandKey])
             assertEquals("own Applied baseline", 1, rows(p).size)
             assertEquals("settled seal baseline", 1, seals(p).count { operation(it) != null })
             assertEquals("no active fixture seal after cycle", 0, seals(p).count { operation(it) == null })
         }
-        private fun active(id: String, axisName: String, epoch: String): kotlinx.serialization.json.JsonElement = JsonObject(mapOf(
-            "id" to JsonPrimitive(id), "kind" to JsonPrimitive("NAMESPACE"),
-            "ownerUid" to JsonPrimitive("A"), "axis" to JsonPrimitive(axisName), "epoch" to JsonPrimitive(epoch)
-        ))
+        private fun active(id: String, axisName: String, epoch: String): kotlinx.serialization.json.JsonElement =
+            Json.parseToJsonElement(seal(id, axisName, epoch))
         suspend fun cycle(index: Int) {
             val before = record()
-            val fence = FenceV1("A", before[DataStoreAccessEpochStore.USER_EPOCH], before[DataStoreAccessEpochStore.KRX_EPOCH])
+            val fence = FenceV1(ownerUid, before[DataStoreAccessEpochStore.USER_EPOCH], before[DataStoreAccessEpochStore.KRX_EPOCH])
             val targets = buildList {
                 if (axis != Axis.CAPABILITY) add(active("${profile.sample}-u-$index", "USER", checkNotNull(fence.userAccessEpoch)))
                 if (axis != Axis.USER) add(active("${profile.sample}-k-$index", "CAPABILITY", checkNotNull(fence.krxCapabilityEpoch)))
             }
             // The fixture supplies only the next active seal. Owner code performs both rotation and reclamation.
             data.edit { p -> p[sealKey] = JsonArray(seals(p) + targets).toString() }
-            val command = control.prepareRotation(targets.map { node(it.toString()) }, fence,
-                NamespaceSettlementFixtures.life, NamespaceSettlementFixtures.demand)
+            val command = register(targets.map { it.toString() }, fence, index.toString())
             val tracked = checkNotNull(tracker.findPrepared(command))
-            val confirmed = control.execute(command, NamespaceSettlementFixtures.context)
+            val confirmed = control.execute(command, context)
             assertTrue("$profile/$axis/$index Confirmed: $confirmed", confirmed is ControlStoreResult.Confirmed)
             assertNotNull("confirmed receipt", (confirmed as ControlStoreResult.Confirmed).settlement)
             val applied = record()
@@ -193,9 +214,19 @@ class RotationAccumulationLongTest {
             assertEquals("own settled seals added", targets.size, seals(applied).count { operation(it) == command.id })
             observe(applied)
             // The caller consumed the returned result and receipt, closed its entries and receipts, and owns follow-up.
+            val demandId = (checkNotNull(command.captureStateAndBody().body) as ControlCommandBody.RotateAndSettle).input.demandId
             val completed = control.completeAfterConsumption(command, closure(command), declared)
             assertTrue("$profile/$axis/$index Completed: $completed", completed is ControlCompletionResult.Completed)
             assertEquals(CompletionMode.Consumed, (completed as ControlCompletionResult.Completed).mode)
+            // 6-2D: the caller's declared follow-up (D2c's REQUEST consumption, not the store's job) is simulated here by
+            // removing exactly this cycle's REQUEST; without it a long profile's REQUEST payload reaches the codec limit
+            // within 256 cycles (6-2D_T9_request_overflow_probe.log, cycle 53 of LONG_EXTERNAL_ID).
+            data.edit { p ->
+                val requests = array(p, demandKey)
+                val kept = requests.filter { it.jsonObject.getValue("id").jsonPrimitive.content != demandId }
+                check(requests.size - kept.size == 1) { "exactly this cycle's REQUEST" }
+                p[demandKey] = JsonArray(kept).toString()
+            }
             val after = record()
             assertEquals("own Applied reclaimed", 0, rows(after).count {
                 it.jsonObject.getValue("commandId").jsonPrimitive.content == command.id
@@ -233,7 +264,10 @@ class RotationAccumulationLongTest {
     }
 
     @Test fun T9_measureThenRunChosenBackend(): Unit = runBlocking {
-        val report = mutableListOf("Rotation accumulation T9: 3 axes x 4 profiles x 256 = 3072 full cycles")
+        val report = mutableListOf("Rotation accumulation T9: 3 axes x 4 profiles x 256 = 3072 full cycles",
+            "profileFields=sealIds,ownerUid(record/fence/context/demand/seals),originLifetimeId,newEpochs(USER/CAPABILITY); " +
+                "operationId/demandId=UUID (code-issued kind, not replaced); each cycle's REQUEST removed by the fixture as the declared caller follow-up",
+            "caveat: writes and elapsedMs include that fixture REQUEST deletion (one write per cycle); they are not store-only figures")
         val measured = Profile.entries.map { profile ->
             run(profile, Axis.USER, Backend.FILE, 16, "measure-${profile.name}").also { report += "measurement ${it.line()}" }
         }

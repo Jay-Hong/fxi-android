@@ -215,4 +215,44 @@ class ControlReleaseStructureTest {
         assertTrue(release.indexOf("tracking.executing.add(command)") < release.indexOf("val tracked = tracking.findPrepared(command)"))
         assertEquals(1, store.lineSequence().count { it.trim() == "if (command.lifecycleState == ControlCommandLifecycle.RETAINED) {" })
     }
+
+    // 6-2D (contracts-6-2D S1–S6; skeleton r3 last structure item; 6-2C API consensus d).
+    @Test fun D2B6_ownerDecideRechecksBeforeG11AndG11StaysLocal() {
+        val all = sources(); val store = all.getValue(control + "ControlRecordStore.kt")
+        val attempt = member(store, "private suspend fun terminationAttempt(")
+        // S1: inside the owner decide — closure (and, on retry, the fixed binding) re-checked, then G11, then any binding/Confirm.
+        val order = listOf("fixedTerminationBinding(command, tracked, body, request.descriptor)",
+            "terminationClosureViolation(command, closure, recheckBinding)", "rotationDependencyViolation(command, plan)",
+            "tracked.bindTerminationDescriptor(", "RecordTransactionDecision.Confirm(")
+        assertTrue(order.filterNot { attempt.contains(it) }.toString(), order.all { attempt.contains(it) })
+        assertEquals(order.map { attempt.indexOf(it) }.sorted(), order.map { attempt.indexOf(it) })
+        // One closure condition: the helper is the only closure.violation caller; three entries + the decide use it.
+        assertEquals(1, Regex("closure\\.violation\\(").findAll(store).count())
+        assertEquals(1 + 3 + 1, Regex("\\bterminationClosureViolation\\(").findAll(store).count())
+        assertEquals(1 + 1 + 1, Regex("\\bfixedTerminationBinding\\(").findAll(store).count())
+        // S2: projectDependency has one production caller, inside rotationDependencyViolation.
+        assertEquals(mapOf(control + "ControlRecordStore.kt" to 1, control + "DependencyProjection.kt" to 1),
+            SealSourceTripwire.occurrences(all, "projectDependency"))
+        val g11 = member(store, "private fun rotationDependencyViolation(")
+        assertTrue("S2: caller inside G11", g11.contains("projectDependency("))
+        // S3: no other ref's lease, one captured view per dependent, no body re-read.
+        assertFalse("S3: no lease", g11.contains("executing"))
+        assertEquals("S3: one capture", 1, Regex("captureStateAndBody\\(\\)").findAll(g11).count())
+        assertFalse("S3: no body re-read", g11.contains("dependent.body") || g11.contains(".captureStateAndBody().body"))
+        assertEquals("S3: candidates enumerated once", 1, Regex("dependencyCandidatesExcluding\\(").findAll(g11).count())
+        // S5: ordinary release takes Mutations only (behavior: HandoverCombinedTest R/N/L, CurrentNullOwnerTest).
+        assertEquals(1, all.getValue(control + "ControlCommandReleaseDecision.kt").lineSequence().count {
+            it.trim() == "if (view.body !is ControlCommandBody.Mutations) return reject(ReleaseRejectionReason.UnsupportedCommandKind)" })
+        // S6: 2c previous allowlist is exactly Mutations and Rotation.
+        val reclaim = all.getValue(control + "ReclaimPreviousLifetimeEvidence.kt")
+        for (line in listOf("is AppliedEvidence.Mutations, is AppliedEvidence.Rotation -> true",
+            "is AppliedEvidence.Settlement -> false", "is AppliedEvidence.Lifecycle -> false"))
+            assertEquals(line, 1, reclaim.lineSequence().count { it.trim() == line })
+    }
+    @Test fun D2B6_noPersistentIdentityCache() {
+        // S4: the candidate list is a local of dependencyCandidatesExcluding; neither holder gains a field for it.
+        fun instanceFields(type: Class<*>) = type.declaredFields.filterNot { Modifier.isStatic(it.modifiers) }.map { it.name }.toSet()
+        assertEquals(setOf("lifetimeId", "evidenceDiscontinuityCount", "commands", "executing", "recoveryWork"),
+            instanceFields(ControlCommandTracking::class.java))
+    }
 }

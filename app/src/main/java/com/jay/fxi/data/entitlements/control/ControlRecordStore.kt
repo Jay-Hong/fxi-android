@@ -347,7 +347,7 @@ internal class ControlRecordStore(
             val body = command.captureStateAndBody().body
             if (body == null || body is ControlCommandBody.Handover)
                 return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
-            closure.violation(command, tracking.lifetimeId)?.let {
+            terminationClosureViolation(command, closure, null)?.let {
                 return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
             }
             neverConfirmViolation(tracked)?.let {
@@ -376,7 +376,7 @@ internal class ControlRecordStore(
             if (tracking.isUnresolved(command)) return completionRejected(command, CompletionRejectionReason.Unresolved)
             if (!consumption.resultConsumed || !consumption.followUpCompletedOrDurablyOwned)
                 return completionRejected(command, CompletionRejectionReason.ConsumptionNotDeclared)
-            closure.violation(command, tracking.lifetimeId)?.let {
+            terminationClosureViolation(command, closure, null)?.let {
                 return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
             }
             check(body.input.operationId == command.id) { "rotation body must match the command" }
@@ -399,26 +399,9 @@ internal class ControlRecordStore(
                 return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
             val descriptor = tracked.terminationDescriptor
                 ?: return completionRejected(command, CompletionRejectionReason.NotTerminationPending)
-            val binding = when (descriptor) {
-                is TerminationPendingDescriptor.EvidenceAbsent -> {
-                    check(descriptor.mode == CompletionMode.NeverSubmitted &&
-                        descriptor.entry == TerminationEntry.AbandonBeforeFirstConfirm)
-                    descriptor.closureBinding
-                }
-                is TerminationPendingDescriptor.ExactEvidenceAndSeals -> {
-                    check(descriptor.mode == CompletionMode.Consumed &&
-                        descriptor.entry == TerminationEntry.ConsumedRotation)
-                    val rotation = body as? ControlCommandBody.RotateAndSettle
-                        ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
-                    check(descriptor.operationId == command.id && rotation.input.operationId == command.id &&
-                        descriptor.orderedSealIds == rotation.input.seals.map { it.id } &&
-                        tracked.expectedApplied === descriptor.expectedRotation) {
-                        "fixed rotation termination authority changed"
-                    }
-                    descriptor.closureBinding
-                }
-            }
-            closure.violation(command, tracking.lifetimeId, binding)?.let {
+            val binding = fixedTerminationBinding(command, tracked, body, descriptor)
+                ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+            terminationClosureViolation(command, closure, binding)?.let {
                 return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
             }
             return terminationAttempt(command, tracked, closure, body, TerminationRequest.Retry(descriptor))
@@ -426,6 +409,33 @@ internal class ControlRecordStore(
             tracking.executing.remove(command)
         }
     }
+
+    /** The fixed descriptor authority; null means the descriptor's body kind is not supported in this unit. */
+    private fun fixedTerminationBinding(command: CommandRef, tracked: TrackedControlCommand, body: ControlCommandBody,
+        descriptor: TerminationPendingDescriptor): TerminationClosureBinding? = when (descriptor) {
+        is TerminationPendingDescriptor.EvidenceAbsent -> {
+            check(descriptor.mode == CompletionMode.NeverSubmitted &&
+                descriptor.entry == TerminationEntry.AbandonBeforeFirstConfirm)
+            descriptor.closureBinding
+        }
+        is TerminationPendingDescriptor.ExactEvidenceAndSeals -> {
+            check(descriptor.mode == CompletionMode.Consumed &&
+                descriptor.entry == TerminationEntry.ConsumedRotation)
+            (body as? ControlCommandBody.RotateAndSettle)?.let { rotation ->
+                check(descriptor.operationId == command.id && rotation.input.operationId == command.id &&
+                    descriptor.orderedSealIds == rotation.input.seals.map { it.id } &&
+                    tracked.expectedApplied === descriptor.expectedRotation) {
+                    "fixed rotation termination authority changed"
+                }
+                descriptor.closureBinding
+            }
+        }
+    }
+
+    /** One closure condition for the entry fast path and the owner decision. */
+    private fun terminationClosureViolation(command: CommandRef, closure: TerminationClosure,
+        binding: TerminationClosureBinding?): ClosureViolation? =
+        closure.violation(command, tracking.lifetimeId, binding)
 
     private fun completionPrecheck(command: CommandRef, firstEntry: Boolean): ControlCompletionResult? {
         if (command.ownerTrackingLifetimeId !== tracking.lifetimeId)
@@ -476,6 +486,17 @@ internal class ControlRecordStore(
                 if (read !is ControlRecordRead.Supported) return@transactRecord recovery(
                     if (read is ControlRecordRead.MigrationOrRecoveryRequired) RecoveryReason.MigrationOrRecovery
                     else RecoveryReason.UnreadableRecord)
+                // Final eligibility is decided here; the entry checks are only the fast path.
+                val recheckBinding = when (request) {
+                    is TerminationRequest.Retry -> fixedTerminationBinding(command, tracked, body, request.descriptor)
+                        ?: return@transactRecord RecordTransactionDecision.Observe(ControlCompletionResult.Rejected(command,
+                            emptySet(), emptySet(), CompletionRejectionReason.UnsupportedInThisUnit, command.lifecycleState, read))
+                    TerminationRequest.FirstNeverConfirm, TerminationRequest.FirstConsumed -> null
+                }
+                terminationClosureViolation(command, closure, recheckBinding)?.let {
+                    return@transactRecord RecordTransactionDecision.Observe(ControlCompletionResult.Rejected(command,
+                        emptySet(), emptySet(), CompletionRejectionReason.ClosureNotSatisfied(it), command.lifecycleState, read))
+                }
                 if (read.schemaVersion != 2) return@transactRecord recovery(RecoveryReason.ControlSchemaMigrationRequired)
                 if (read.hasUninterpretableMetadata) return@transactRecord recovery(RecoveryReason.UninterpretableMetadata)
                 if (read.hasUninterpretable) return@transactRecord recovery(RecoveryReason.UninterpretableObligations)

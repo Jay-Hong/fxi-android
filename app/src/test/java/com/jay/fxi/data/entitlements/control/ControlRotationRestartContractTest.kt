@@ -12,6 +12,10 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore
 import okio.buffer
 import okio.source
 import org.junit.After
@@ -128,5 +132,43 @@ class ControlRotationRestartContractTest {
             r.reason == RecoveryReason.InconsistentReclamation)
         assertEquals("D2B6/6-2C3.84: untouched", before, disk())
         assertEquals("D2B6/6-2C3.84: noWrite", writes, next.storage.writes)
+    }
+
+    // ── 6-2D (contracts-6-2D T8_85): allowlist across a real restart ────────────────────────────────────────────
+    @Test fun T8_85_restart2cTakesPreviousMutationsAndRotationButKeepsTheCurrentRotation() = runBlocking {
+        // Previous lifetime: one Rotation R0 and one Mutations M0 (RECOVERY_INTENT). New lifetime: its own Rotation R1 over
+        // another seal. The REQUEST is consumed before 2c. 2c removes exactly R0's row+seal and M0's row; R1's row and
+        // seal, M0's obligation and the consumed REQUEST stay. (Previous S/L/N preservation: R13a, CurrentNullOwnerTest,
+        // RetiredNullOwnerTest.)
+        val N = NamespaceSettlementFixtures
+        val o = open(); val r0 = confirmedRotation(o)
+        val m0 = o.control.prepare(o.control.addition(ControlKind.RECOVERY_INTENT) { id ->
+            ControlObligationFixtures.run { literal(recovery) }; set("id", ControlScalar.Text(id)) })
+        check(o.control.execute(m0) is ControlStoreResult.Confirmed) { "fixture: M0" }
+        val next = open()
+        next.data.updateData { p -> p.toMutablePreferences().apply { this[SEAL] = this[SEAL]!!.removeSuffix("]") + "," + N.krx + "]" }.toPreferences() }
+        val now = disk()
+        val fence = FenceV1("A", now[DataStoreAccessEpochStore.USER_EPOCH], now[DataStoreAccessEpochStore.KRX_EPOCH])
+        val krx = N.krx.replace("\"epoch\":\"k\"", "\"epoch\":\"${fence.krxCapabilityEpoch}\"")
+        if (krx != N.krx) next.data.updateData { p -> p.toMutablePreferences().apply { this[SEAL] = this[SEAL]!!.replace(N.krx, krx) }.toPreferences() }
+        val r1 = next.control.prepareRotation(listOf(node(krx)), fence, N.life, N.demand)
+        check(next.control.execute(r1, N.context) is ControlStoreResult.Confirmed) { "fixture: R1" }
+        next.data.updateData { p -> p.toMutablePreferences().apply { this[ControlStoreTestStorage.DEMAND] = "[]" }.toPreferences() }
+        val source = disk()
+        val rows = kotlinx.serialization.json.Json.parseToJsonElement(source[evidenceKey]!!).jsonArray
+        val seals = kotlinx.serialization.json.Json.parseToJsonElement(source[SEAL]!!).jsonArray
+        fun cmd(e: kotlinx.serialization.json.JsonElement) = e.jsonObject.getValue("commandId").jsonPrimitive.content
+        fun op(e: kotlinx.serialization.json.JsonElement) = e.jsonObject["settlement"]?.jsonObject?.get("operationId")?.jsonPrimitive?.content
+        check(rows.map(::cmd).toSet() == setOf(r0.id, m0.id, r1.id)) { "fixture rows: $rows" }
+        val expected = source.toMutablePreferences().apply {
+            this[evidenceKey] = kotlinx.serialization.json.JsonArray(rows.filter { cmd(it) == r1.id }).toString()
+            this[SEAL] = kotlinx.serialization.json.JsonArray(seals.filter { op(it) != r0.id }).toString()
+            remove(BARRIER)
+        }.toPreferences()
+        val r = next.control.reclaimPreviousLifetimeEvidence()
+        assertTrue("D2B6/6-2D.85: reclaimed $r", r is ControlEvidenceReclamationResult.Confirmed)
+        assertEquals("D2B6/6-2D.85: allowlist", expected, withoutBarrier(disk()))
+        assertEquals("D2B6/6-2D.85: requestStillConsumed", "[]", disk()[ControlStoreTestStorage.DEMAND])
+        assertTrue("D2B6/6-2D.85: r1Registered", tracker(next).findPrepared(r1) != null)
     }
 }
