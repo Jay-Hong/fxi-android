@@ -19,9 +19,9 @@ import org.junit.rules.TemporaryFolder
 
 /**
  * Claude-owned 6-1B T3 contract (skeleton v12 §4.1; revision 06 §3.3·§7.1). abandonBeforeFirstConfirm terminates only a
- * Mutations or Lifecycle command with no business confirmation history: each history field alone refuses with
- * NotNeverConfirm(field) before any storage access; RotateAndSettle/Handover bodies are UnsupportedInThisUnit after the
- * lease (InFlight first under contention; 6-2/6-3 open them);
+ * Mutations, Lifecycle, or RotateAndSettle command with no business confirmation history: each history field alone refuses with
+ * NotNeverConfirm(field) before any storage access; a Handover body is UnsupportedInThisUnit after the lease (InFlight
+ * first under contention; 6-3 opens it — RotateAndSettle was opened by 6-2A, see ControlRotationNeverConfirmContractTest);
  * wrong tracker lifetime and a same-id unregistered ref are refused first. The owner reads the latest record and
  * observes it at once — an interpretable own Applied is recorded as observedApplied before any whole-record rejection —
  * and refuses a record that is not wholly interpretable schema 2 (RecoveryRequired) or that still carries an own Applied
@@ -148,13 +148,6 @@ class ControlNeverConfirmOwnerContractTest {
             val field = TrackedControlCommand::class.java.getDeclaredField("terminationDescriptor").apply { isAccessible = true }
             field.set(t, checkNotNull(field.get(f.history(d))))
         }
-    }
-    @Test fun T3_16_rotationBodyUnsupportedInThisUnit() = runBlocking {
-        val f = fixture(); f.storage.seed()
-        val input = RotateAndSettleNamespaces(emptyList(), NamespaceSettlementFixtures.fence, NamespaceSettlementFixtures.life,
-            NamespaceSettlementFixtures.demand, "op", "d", null, null)
-        val c = f.tracker.registerPrepared(CommandRef("op", ControlCommandBody.RotateAndSettle(input), f.tracker.lifetimeId))
-        refusedBeforeStorage("16", f, c, CompletionRejectionReason.UnsupportedInThisUnit)
     }
     @Test fun T3_16b_inFlightPrecedesUnsupportedBody() = runBlocking {
         val f = fixture(); f.storage.seed()

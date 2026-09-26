@@ -345,7 +345,7 @@ internal class ControlRecordStore(
             val tracked = tracking.findPrepared(command)
                 ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
             val body = command.captureStateAndBody().body
-            if (body !is ControlCommandBody.Mutations && body !is ControlCommandBody.Lifecycle)
+            if (body == null || body is ControlCommandBody.Handover)
                 return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
             closure.violation(command, tracking.lifetimeId)?.let {
                 return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
@@ -353,7 +353,7 @@ internal class ControlRecordStore(
             neverConfirmViolation(tracked)?.let {
                 return completionRejected(command, CompletionRejectionReason.NotNeverConfirm(it))
             }
-            return terminationAttempt(command, tracked, closure, firstEntry = true)
+            return terminationAttempt(command, tracked, closure, body, firstEntry = true)
         } finally {
             tracking.executing.remove(command)
         }
@@ -368,7 +368,7 @@ internal class ControlRecordStore(
             val tracked = tracking.findPrepared(command)
                 ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
             val body = command.captureStateAndBody().body
-            if (body !is ControlCommandBody.Mutations && body !is ControlCommandBody.Lifecycle)
+            if (body == null || body is ControlCommandBody.Handover)
                 return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
             val descriptor = tracked.terminationDescriptor as? TerminationPendingDescriptor.EvidenceAbsent
                 ?: return completionRejected(command, CompletionRejectionReason.NotTerminationPending)
@@ -377,7 +377,7 @@ internal class ControlRecordStore(
             closure.violation(command, tracking.lifetimeId, descriptor.closureBinding)?.let {
                 return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
             }
-            return terminationAttempt(command, tracked, closure, firstEntry = false)
+            return terminationAttempt(command, tracked, closure, body, firstEntry = false)
         } finally {
             tracking.executing.remove(command)
         }
@@ -408,7 +408,7 @@ internal class ControlRecordStore(
     }
 
     private suspend fun terminationAttempt(command: CommandRef, tracked: TrackedControlCommand,
-        closure: TerminationClosure, firstEntry: Boolean): ControlCompletionResult {
+        closure: TerminationClosure, body: ControlCommandBody, firstEntry: Boolean): ControlCompletionResult {
         val observation = AtomicReference<ControlRecordRead?>(null)
         val phase = AtomicReference(ControlAttemptPhase.ReadingSnapshot)
         var confirmedCandidate: Preferences? = null
@@ -428,7 +428,13 @@ internal class ControlRecordStore(
                 if (read.schemaVersion != 2) return@transactRecord recovery(RecoveryReason.ControlSchemaMigrationRequired)
                 if (read.hasUninterpretableMetadata) return@transactRecord recovery(RecoveryReason.UninterpretableMetadata)
                 if (read.hasUninterpretable) return@transactRecord recovery(RecoveryReason.UninterpretableObligations)
-                if (ControlAppliedEvidence.own(read, command) != null) return@transactRecord RecordTransactionDecision.Observe(
+                // The entry gates Handover; the remaining non-Mutations/Lifecycle body is Rotation.
+                if (ControlAppliedEvidence.own(read, command) != null ||
+                    (body !is ControlCommandBody.Mutations && body !is ControlCommandBody.Lifecycle &&
+                        read.arrays.getValue(ControlKind.SEAL).entries.any {
+                            ((it as ControlEntryRead.Interpreted).value as SealV1).settlement?.operationId == command.id
+                        })
+                ) return@transactRecord RecordTransactionDecision.Observe(
                     ControlCompletionResult.Conflict(command, emptySet(), emptySet(), ConflictReason.CommandEvidenceMismatch,
                         command.lifecycleState, read))
                 confirmedCandidate = read.original
