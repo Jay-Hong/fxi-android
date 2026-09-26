@@ -130,6 +130,11 @@ class ControlOwnerStructureTest {
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore",
                 "remove(DataStoreAccessEpochStore.READ_BARRIER)",
             ),
+            // 6-3C1: the previous-lifetime Settlement reclamation return validator compares the same way.
+            "main/java/com/jay/fxi/data/entitlements/control/PreviousSettlementEvidenceReclamation.kt" to listOf(
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore",
+                "remove(DataStoreAccessEpochStore.READ_BARRIER)",
+            ),
             "main/java/com/jay/fxi/data/entitlements/control/NamespaceSettlementTransition.kt" to listOf(
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.ENTRY_SEPARATOR",
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.FIELD_SEPARATOR",
