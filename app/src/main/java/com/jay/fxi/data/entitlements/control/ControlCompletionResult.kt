@@ -4,7 +4,7 @@ import java.io.IOException
 import java.util.Collections
 
 internal enum class CompletionMode { Consumed, NeverSubmitted, ResponsibilityTransferred }
-internal enum class TerminationEntry { AbandonBeforeFirstConfirm, ConsumedRotation }
+internal enum class TerminationEntry { AbandonBeforeFirstConfirm, ConsumedRotation, ConsumedSettlement }
 
 /** The caller declares both business handoff conditions before evidence can be consumed. */
 internal class RotationConsumption(
@@ -120,6 +120,18 @@ internal sealed interface TerminationPendingDescriptor {
         val entry: TerminationEntry,
         val closureBinding: TerminationClosureBinding,
         val expectedRotation: AppliedEvidence.Rotation,
+        val operationId: String,
+        orderedSealIds: List<String>
+    ) : TerminationPendingDescriptor {
+        val orderedSealIds: List<String> = Collections.unmodifiableList(orderedSealIds.toList())
+    }
+
+    class ExactSettlementEvidenceAndSeals(
+        val mode: CompletionMode,
+        val entry: TerminationEntry,
+        val closureBinding: TerminationClosureBinding,
+        val expectedSettlement: AppliedEvidence.Settlement,
+        val transition: HandoverSettlementTransition,
         val operationId: String,
         orderedSealIds: List<String>
     ) : TerminationPendingDescriptor {

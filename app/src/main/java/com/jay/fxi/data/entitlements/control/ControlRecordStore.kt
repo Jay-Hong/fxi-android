@@ -386,6 +386,33 @@ internal class ControlRecordStore(
         }
     }
 
+    /** Consume one confirmed current R/N/L settlement after the caller declares its handoff complete. */
+    suspend fun completeSettlementAfterConsumption(command: CommandRef, closure: TerminationClosure,
+        consumption: RotationConsumption): ControlCompletionResult {
+        completionPrecheck(command, firstEntry = true)?.let { return it }
+        if (!tracking.executing.add(command)) return completionRejected(command, CompletionRejectionReason.InFlight)
+        try {
+            completionPrecheck(command, firstEntry = true)?.let { return it }
+            val tracked = tracking.findPrepared(command)
+                ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
+            val view = command.captureStateAndBody()
+            val body = view.body as? ControlCommandBody.Handover
+                ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+            check(view.state == ControlCommandLifecycle.RETAINED)
+            if (!tracked.confirmed.get()) return completionRejected(command, CompletionRejectionReason.NotConfirmed)
+            if (tracking.isUnresolved(command)) return completionRejected(command, CompletionRejectionReason.Unresolved)
+            if (!consumption.resultConsumed || !consumption.followUpCompletedOrDurablyOwned)
+                return completionRejected(command, CompletionRejectionReason.ConsumptionNotDeclared)
+            closure.violation(command, tracking.lifetimeId)?.let {
+                return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
+            }
+            check(body.input.operationId == command.id) { "settlement body must match the command" }
+            return terminationAttempt(command, tracked, closure, body, TerminationRequest.FirstConsumedSettlement)
+        } finally {
+            tracking.executing.remove(command)
+        }
+    }
+
     /** Retry only the fixed descriptor authority; the caller supplies a current closure declaration. */
     suspend fun retryTermination(command: CommandRef, closure: TerminationClosure): ControlCompletionResult {
         completionPrecheck(command, firstEntry = false)?.let { return it }
@@ -395,9 +422,8 @@ internal class ControlRecordStore(
             val tracked = tracking.findPrepared(command)
                 ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
             val body = command.captureStateAndBody().body
-            if (body == null || (body is ControlCommandBody.Handover &&
-                    tracked.terminationDescriptor !is TerminationPendingDescriptor.EvidenceAbsent))
-                return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+            // Each descriptor branch below admits only its own body kind (Rotation or Handover).
+            if (body == null) return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
             val descriptor = tracked.terminationDescriptor
                 ?: return completionRejected(command, CompletionRejectionReason.NotTerminationPending)
             val binding = when (descriptor) {
@@ -415,6 +441,19 @@ internal class ControlRecordStore(
                         descriptor.orderedSealIds == rotation.input.seals.map { it.id } &&
                         tracked.expectedApplied === descriptor.expectedRotation) {
                         "fixed rotation termination authority changed"
+                    }
+                    descriptor.closureBinding
+                }
+                is TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals -> {
+                    check(descriptor.mode == CompletionMode.Consumed &&
+                        descriptor.entry == TerminationEntry.ConsumedSettlement)
+                    val settlement = body as? ControlCommandBody.Handover
+                        ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+                    val fixed = settlementAuthority(settlement.input)
+                    check(descriptor.operationId == command.id && settlement.input.operationId == command.id &&
+                        descriptor.transition == fixed.first && descriptor.orderedSealIds == fixed.second &&
+                        tracked.expectedApplied === descriptor.expectedSettlement) {
+                        "fixed settlement termination authority changed"
                     }
                     descriptor.closureBinding
                 }
@@ -455,6 +494,7 @@ internal class ControlRecordStore(
     private sealed interface TerminationRequest {
         data object FirstNeverConfirm : TerminationRequest
         data object FirstConsumed : TerminationRequest
+        data object FirstConsumedSettlement : TerminationRequest
         data class Retry(val descriptor: TerminationPendingDescriptor) : TerminationRequest
     }
 
@@ -497,7 +537,9 @@ internal class ControlRecordStore(
                     plan = if (request is TerminationRequest.Retry) request.descriptor else
                         TerminationPendingDescriptor.EvidenceAbsent(CompletionMode.NeverSubmitted,
                             TerminationEntry.AbandonBeforeFirstConfirm, closure.binding())
-                } else {
+                } else if (request is TerminationRequest.FirstConsumed ||
+                    (request is TerminationRequest.Retry &&
+                        request.descriptor is TerminationPendingDescriptor.ExactEvidenceAndSeals)) {
                     val input = (body as ControlCommandBody.RotateAndSettle).input
                     val expected = when (request) {
                         is TerminationRequest.Retry ->
@@ -506,6 +548,7 @@ internal class ControlRecordStore(
                             check(it is AppliedEvidence.Rotation) { "expected evidence must be Rotation" }
                             it
                         }
+                        TerminationRequest.FirstConsumedSettlement -> error("unexpected settlement request")
                         TerminationRequest.FirstNeverConfirm -> error("unexpected never-confirm request")
                     }
                     when (val decision = ControlRotationConsumption.decide(read, command, input, expected,
@@ -523,9 +566,42 @@ internal class ControlRecordStore(
                         TerminationPendingDescriptor.ExactEvidenceAndSeals(CompletionMode.Consumed,
                             TerminationEntry.ConsumedRotation, closure.binding(), checkNotNull(expected), command.id,
                             input.seals.map { it.id })
+                } else {
+                    val input = (body as ControlCommandBody.Handover).input
+                    val expected = when (request) {
+                        is TerminationRequest.Retry ->
+                            (request.descriptor as TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals).expectedSettlement
+                        TerminationRequest.FirstConsumedSettlement -> tracked.expectedApplied?.let {
+                            check(it is AppliedEvidence.Settlement) { "expected evidence must be Settlement" }
+                            it
+                        }
+                        TerminationRequest.FirstConsumed, TerminationRequest.FirstNeverConfirm ->
+                            error("unexpected non-settlement request")
+                    }
+                    when (val decision = ControlSettlementConsumption.decide(read, command, input, expected,
+                        request is TerminationRequest.Retry, codec)) {
+                        is ControlSettlementConsumption.Decision.Recovery -> return@transactRecord recovery(decision.reason)
+                        ControlSettlementConsumption.Decision.Conflict -> return@transactRecord RecordTransactionDecision.Observe(
+                            ControlCompletionResult.Conflict(command, emptySet(), emptySet(), ConflictReason.CommandEvidenceMismatch,
+                                command.lifecycleState, read))
+                        is ControlSettlementConsumption.Decision.Rejected -> return@transactRecord RecordTransactionDecision.Observe(
+                            ControlCompletionResult.Rejected(command, emptySet(), emptySet(),
+                                CompletionRejectionReason.Encoding(decision.reason), command.lifecycleState, read))
+                        is ControlSettlementConsumption.Decision.Ready -> candidate = decision.candidate
+                    }
+                    val fixed = settlementAuthority(input)
+                    plan = if (request is TerminationRequest.Retry) request.descriptor else
+                        TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals(CompletionMode.Consumed,
+                            TerminationEntry.ConsumedSettlement, closure.binding(), checkNotNull(expected), fixed.first,
+                            command.id, fixed.second)
                 }
-                val dependencyReason = if (plan is TerminationPendingDescriptor.ExactEvidenceAndSeals)
-                    rotationDependencyViolation(command, plan) else null
+                val dependencyReason = when (plan) {
+                    is TerminationPendingDescriptor.ExactEvidenceAndSeals ->
+                        consumptionDependencyViolation(command, plan.operationId, plan.orderedSealIds)
+                    is TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals ->
+                        consumptionDependencyViolation(command, plan.operationId, plan.orderedSealIds)
+                    is TerminationPendingDescriptor.EvidenceAbsent -> null
+                }
                 if (dependencyReason != null) {
                     RecordTransactionDecision.Observe(ControlCompletionResult.Rejected(command, emptySet(), emptySet(),
                         dependencyReason, command.lifecycleState, read))
@@ -552,7 +628,8 @@ internal class ControlRecordStore(
             tracking.finishTermination(tracked)
             val work = tracking.recoverySnapshot()
             return ControlCompletionResult.Completed(command, work.unresolvedCommands, work.pendingReleases,
-                if (confirmedPlan is TerminationPendingDescriptor.ExactEvidenceAndSeals) CompletionMode.Consumed
+                if (confirmedPlan is TerminationPendingDescriptor.ExactEvidenceAndSeals ||
+                    confirmedPlan is TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals) CompletionMode.Consumed
                 else CompletionMode.NeverSubmitted, ConfirmedControlSnapshot(returned as ControlRecordRead.Supported),
                 ConfirmationProof(transaction.evidence))
         } catch (cancelled: CancellationException) {
@@ -564,13 +641,13 @@ internal class ControlRecordStore(
         }
     }
 
-    private fun rotationDependencyViolation(command: CommandRef,
-        plan: TerminationPendingDescriptor.ExactEvidenceAndSeals): CompletionRejectionReason? {
+    private fun consumptionDependencyViolation(command: CommandRef,
+        operationId: String, orderedSealIds: List<String>): CompletionRejectionReason? {
         val protectedAtoms = buildSet<DependencyAtom> {
             add(DependencyAtom.AppliedRow(command.id, command.ownerTrackingLifetimeId.value))
-            for (sealId in plan.orderedSealIds) {
+            for (sealId in orderedSealIds) {
                 add(DependencyAtom.ControlRow(ControlKind.SEAL, sealId))
-                add(DependencyAtom.SealWitness(sealId, plan.operationId))
+                add(DependencyAtom.SealWitness(sealId, operationId))
             }
         }
         for (dependent in tracking.dependencyCandidatesExcluding(command)) {
@@ -608,8 +685,16 @@ internal class ControlRecordStore(
                 check(ControlRotationConsumption.validateReturn(returned, command, candidate)) {
                     "termination confirmation changed unrelated values"
                 }
+            is TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals ->
+                check(ControlSettlementConsumption.validateReturn(returned, command, candidate)) {
+                    "termination confirmation changed unrelated values"
+                }
         }
     }
+
+    private fun settlementAuthority(input: HandoverSettlementInput): Pair<HandoverSettlementTransition, List<String>> =
+        checkNotNull(ControlSettlementConsumption.authority(input)) { "confirmed settlement input is readable" }
+            .let { it.transition to it.orderedSealIds }
 
     private fun completionRejected(command: CommandRef, reason: CompletionRejectionReason): ControlCompletionResult.Rejected {
         val work = tracking.recoverySnapshot()

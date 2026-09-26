@@ -165,13 +165,14 @@ class ControlReleaseStructureTest {
         val all = sources(); val store = all.getValue(control + "ControlRecordStore.kt")
         for (method in listOf("publishPendingTermination", "finishTermination", "bindTerminationDescriptor"))
             assertEquals(method, 1, all.getValue(control + "ControlRecordStore.kt").let { Regex("\\b$method\\(").findAll(it).count() })
-        // 6-2B: declaration 1 + abandon/retry/consume calls 3.
-        assertEquals(mapOf(control + "ControlRecordStore.kt" to 4), SealSourceTripwire.occurrences(all, "terminationAttempt"))
+        // 6-2B: declaration 1 + abandon/retry/consume calls 3; 6-3B2: + settlement consume call = 5.
+        assertEquals(mapOf(control + "ControlRecordStore.kt" to 5), SealSourceTripwire.occurrences(all, "terminationAttempt"))
         // 6-1 completion (§7 "finishTermination 1곳"): one declaration and one owner call across every production file.
         assertEquals(mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 1),
             SealSourceTripwire.occurrences(all, "finishTermination"))
         // The only termination transitions happen in terminationAttempt, reached only after the entry acquired c's lease.
-        for (entry in listOf("suspend fun abandonBeforeFirstConfirm(", "suspend fun retryTermination(", "suspend fun completeAfterConsumption(")) {
+        for (entry in listOf("suspend fun abandonBeforeFirstConfirm(", "suspend fun retryTermination(", "suspend fun completeAfterConsumption(",
+            "suspend fun completeSettlementAfterConsumption(")) {
             val body = member(store, entry)
             val lease = body.indexOf("tracking.executing.add(command)"); val call = body.indexOf("terminationAttempt(")
             assertTrue("$entry: lease before attempt", lease in 0 until call)
@@ -222,15 +223,16 @@ class ControlReleaseStructureTest {
         val all = sources(); val store = all.getValue(control + "ControlRecordStore.kt")
         val attempt = member(store, "private suspend fun terminationAttempt(")
         // S1: inside the owner decide, G11 runs before any binding/Confirm, and the closure is not re-checked there.
-        val order = listOf("rotationDependencyViolation(command, plan)", "tracked.bindTerminationDescriptor(", "RecordTransactionDecision.Confirm(")
+        // 6-3B2: the G11 helper is shared by Rotation and Settlement consumption (API consensus a).
+        val order = listOf("consumptionDependencyViolation(", "tracked.bindTerminationDescriptor(", "RecordTransactionDecision.Confirm(")
         assertTrue(order.filterNot { attempt.contains(it) }.toString(), order.all { attempt.contains(it) })
         assertEquals(order.map { attempt.indexOf(it) }.sorted(), order.map { attempt.indexOf(it) })
         assertFalse("S1: no closure re-check inside the decide", attempt.contains("violation("))
-        assertEquals("S1: three entry checks only", 3, Regex("closure\\.violation\\(").findAll(store).count())
-        // S2: projectDependency has one production caller, inside rotationDependencyViolation.
+        assertEquals("S1: four entry checks only", 4, Regex("closure\\.violation\\(").findAll(store).count())
+        // S2: projectDependency has one production caller, inside consumptionDependencyViolation.
         assertEquals(mapOf(control + "ControlRecordStore.kt" to 1, control + "DependencyProjection.kt" to 1),
             SealSourceTripwire.occurrences(all, "projectDependency"))
-        val g11 = member(store, "private fun rotationDependencyViolation(")
+        val g11 = member(store, "private fun consumptionDependencyViolation(")
         assertTrue("S2: caller inside G11", g11.contains("projectDependency("))
         // S3: no other ref's lease, one captured view per dependent, no body re-read.
         assertFalse("S3: no lease", g11.contains("executing"))

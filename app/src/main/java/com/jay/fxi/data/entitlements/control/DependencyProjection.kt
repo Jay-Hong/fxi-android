@@ -348,6 +348,32 @@ internal fun projectDependency(input: DependencyProjectionInput): DependencyProj
         ) mark("TerminationDescriptorMismatch", DependencyGapCause.TerminationDescriptorMismatch,
             DependencyGapSource.TerminationDescriptor, broadFootprint)
     }
+    if (input.terminationDescriptor is TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals) {
+        val descriptor = input.terminationDescriptor
+        val expected = descriptor.expectedSettlement
+        dependencies += DependencyAtom.AppliedRow(expected.commandId, expected.ownerTrackingLifetimeId)
+        descriptor.orderedSealIds.forEach { id ->
+            row(ControlKind.SEAL, id, DependencyGapSource.TerminationDescriptor)
+            dependencies += DependencyAtom.SealWitness(id, descriptor.operationId)
+        }
+        expected.sealIds.forEach { id ->
+            row(ControlKind.SEAL, id, DependencyGapSource.TerminationDescriptor)
+            dependencies += DependencyAtom.SealWitness(id, expected.commandId)
+        }
+        val settlement = body as? ControlCommandBody.Handover
+        val fixed = settlement?.input?.let(ControlSettlementConsumption::authority)
+        val binding = descriptor.closureBinding
+        if (descriptor.mode != CompletionMode.Consumed || descriptor.entry != TerminationEntry.ConsumedSettlement ||
+            expected.commandId != input.commandId || expected.ownerTrackingLifetimeId != input.lifetimeId ||
+            descriptor.operationId != input.commandId || descriptor.orderedSealIds != expected.sealIds ||
+            descriptor.transition != expected.transition || fixed == null || fixed.transition != descriptor.transition ||
+            fixed.orderedSealIds != descriptor.orderedSealIds || fixed.demandId != expected.demandId ||
+            settlement?.input?.operationId != descriptor.operationId ||
+            binding.command.id != input.commandId || binding.ownerTrackingLifetimeId.value != input.lifetimeId ||
+            binding.relatedScope != input.commandId
+        ) mark("TerminationDescriptorMismatch", DependencyGapCause.TerminationDescriptorMismatch,
+            DependencyGapSource.TerminationDescriptor, broadFootprint)
+    }
     if (input.view.state == ControlCommandLifecycle.TERMINATION_PENDING && input.terminationDescriptor == null)
         mark("TerminationDescriptorMissing", DependencyGapCause.TerminationDescriptorMissing,
             DependencyGapSource.TerminationDescriptor, broadFootprint)

@@ -112,6 +112,10 @@ internal object ControlSettlementConsumption {
         return Decision.Ready(candidate.toPreferences())
     }
 
+    /** The fixed authority of one R/N/L input: its transition, ordered seal ids and demand id (null when unreadable). */
+    internal data class Authority(val transition: HandoverSettlementTransition, val orderedSealIds: List<String>, val demandId: String?)
+    internal fun authority(input: HandoverSettlementInput): Authority? = fixed(input)?.let { Authority(it.transition, it.ids, it.demandId) }
+
     fun validateReturn(returned: ControlRecordRead, command: CommandRef, candidate: Preferences): Boolean {
         if (returned !is ControlRecordRead.Supported || returned.schemaVersion != 2 || returned.blocksProtectedAdmission)
             return false

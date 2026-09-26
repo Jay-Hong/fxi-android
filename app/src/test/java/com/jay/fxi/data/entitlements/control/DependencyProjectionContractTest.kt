@@ -387,4 +387,64 @@ class DependencyProjectionContractTest {
         assertTrue("D2B6/6-2C.27a: otherKey", !possibleIntersection(g(GapValue.Exact(k1)), p))
         assertTrue("D2B6/6-2C.27b: sameKey", possibleIntersection(g(GapValue.Exact(k2)), p))
     }
+
+    // ── 6-3B2 (contracts-6-3B2): the Settlement pending descriptor, symmetric to T7_24/25 ────────────────────────
+    private fun settlementRef(body: ControlCommandBody.Handover, opId: String, life: OwnerTrackingLifetimeId) = CommandRef(opId, body, life)
+    private fun projectSettlement(ref: CommandRef, life: OwnerTrackingLifetimeId, d: TerminationPendingDescriptor) =
+        projectDependency(DependencyProjectionInput(ref.id, life.value, RefView(ControlCommandLifecycle.TERMINATION_PENDING, ref.body), emptyList(), null, d))
+    @Test fun T7_28_exactSettlementDescriptorProjectsItsFixedAtoms() {
+        val life = OwnerTrackingLifetimeId.issue()
+        val s = CurrentNullFixtures.both()
+        val ref = settlementRef(ControlCommandBody.RotateAndSettleCurrentNull(s), s.operationId, life)
+        val ids = s.targets.map { it.seal.id }
+        val d = TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals(CompletionMode.Consumed, TerminationEntry.ConsumedSettlement,
+            TerminationClosures.of(ref).binding(), AppliedEvidence.Settlement(ref.id, life.value, HandoverSettlementTransition.CURRENT_NULL, ids, s.demandId),
+            HandoverSettlementTransition.CURRENT_NULL, ref.id, ids)
+        val deps = known("28", projectSettlement(ref, life, d))
+        assertTrue("D2B6/6-3B2.28: appliedFromDescriptor", DependencyAtom.AppliedRow(ref.id, life.value) in deps)
+        for (id in ids) {
+            assertTrue("D2B6/6-3B2.28: seal $id", DependencyAtom.ControlRow(ControlKind.SEAL, id) in deps)
+            assertTrue("D2B6/6-3B2.28: witness $id", DependencyAtom.SealWitness(id, ref.id) in deps)
+        }
+    }
+    @Test fun T7_29_eachExactSettlementDescriptorInconsistencyAloneIsAGap() {
+        val life = OwnerTrackingLifetimeId.issue()
+        val one = RetiredNamespaceFixtures.spec()
+        val ref = settlementRef(ControlCommandBody.SettleRetiredNamespace(one), one.operationId, life)
+        val ids = listOf("s")
+        fun exact(mode: CompletionMode = CompletionMode.Consumed, binding: TerminationClosureBinding = TerminationClosures.of(ref).binding(),
+            expectedIds: List<String> = ids, ordered: List<String> = ids,
+            transition: HandoverSettlementTransition = HandoverSettlementTransition.RETIRED_NAMESPACE,
+            expectedTransition: HandoverSettlementTransition = HandoverSettlementTransition.RETIRED_NAMESPACE) =
+            TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals(mode, TerminationEntry.ConsumedSettlement, binding,
+                AppliedEvidence.Settlement(ref.id, life.value, expectedTransition, expectedIds, one.demandId), transition, ref.id, ordered)
+        known("29 consistent", projectSettlement(ref, life, exact()))
+        val mismatch = setOf(DependencyGapCause.TerminationDescriptorMismatch)
+        val expectedOnly = projectSettlement(ref, life, exact(expectedIds = listOf("s", "y")))
+        assertEquals(mismatch, causes("29a expectedVsOrdered", expectedOnly))
+        assertTrue("D2B6/6-3B2.29a: expectedIdKept", DependencyAtom.ControlRow(ControlKind.SEAL, "y") in (expectedOnly as DependencyProjection.Unknown).knownDependencies)
+        val bodyTwo = settlementRef(ControlCommandBody.SettleRetiredNamespace(RetiredNamespaceFixtures.spec(target = node(NamespaceSettlementFixtures.krx))), one.operationId, life)
+        assertEquals(mismatch, causes("29b bodyIds", projectSettlement(bodyTwo, life, exact())))
+        assertEquals(mismatch, causes("29c mode", projectSettlement(ref, life, exact(mode = CompletionMode.NeverSubmitted))))
+        // r2: each transition alone (descriptor only / expected only), with the typed source asserted.
+        for ((name, d) in listOf("29d descriptorTransition" to exact(transition = HandoverSettlementTransition.RETIRED_NULL),
+            "29d expectedTransition" to exact(expectedTransition = HandoverSettlementTransition.RETIRED_NULL),
+            // measurement 6-3B2 r1: descriptor and expected agree with each other but not with the body.
+            "29d bodyTransition" to exact(transition = HandoverSettlementTransition.RETIRED_NULL,
+                expectedTransition = HandoverSettlementTransition.RETIRED_NULL))) {
+            val p = projectSettlement(ref, life, d)
+            assertEquals(mismatch, causes(name, p))
+            assertEquals("D2B6/6-3B2.$name: source", DependencyGapSource.TerminationDescriptor, gap(name, p, DependencyGapCause.TerminationDescriptorMismatch).source)
+        }
+        // measurement 6-3B2 r1: the expected demand alone disagrees with the body; an ordered-only id is kept.
+        val demandExpected = TerminationPendingDescriptor.ExactSettlementEvidenceAndSeals(CompletionMode.Consumed, TerminationEntry.ConsumedSettlement,
+            TerminationClosures.of(ref).binding(), AppliedEvidence.Settlement(ref.id, life.value, HandoverSettlementTransition.RETIRED_NAMESPACE, ids,
+                "00000000-0000-0000-0000-0000000000dd"), HandoverSettlementTransition.RETIRED_NAMESPACE, ref.id, ids)
+        assertEquals(mismatch, causes("29f demand", projectSettlement(ref, life, demandExpected)))
+        val orderedOnly = projectSettlement(ref, life, exact(ordered = listOf("s", "x")))
+        assertEquals(mismatch, causes("29g orderedVsExpected", orderedOnly))
+        assertTrue("D2B6/6-3B2.29g: orderedIdKept", DependencyAtom.ControlRow(ControlKind.SEAL, "x") in (orderedOnly as DependencyProjection.Unknown).knownDependencies)
+        val other = settlementRef(ControlCommandBody.SettleRetiredNamespace(RetiredNamespaceFixtures.spec(op = "r-other-op")), "r-other-op", life)
+        assertEquals(mismatch, causes("29e binding", projectSettlement(ref, life, exact(binding = TerminationClosures.of(ref, command = other).binding()))))
+    }
 }
