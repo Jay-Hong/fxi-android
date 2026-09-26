@@ -27,7 +27,7 @@ class ControlIssuanceStructureTest {
         val source = SealSourceTripwire.read(productionRoot()).getValue(control + "ControlCommandTracking.kt")
         assertEquals(1, source.countLiteral("internal class ControlCommandTracking private constructor()"))
         assertEquals(1, source.countLiteral("private val commands = ConcurrentHashMap<String, TrackedControlCommand>()"))
-        assertEquals(7, Regex("\\bcommands\\b").findAll(source).count()) // declaration, insertion, lookup, conditional removal, three comments
+        assertEquals(8, Regex("\\bcommands\\b").findAll(source).count()) // declaration, insertion, lookup, two conditional removals (release, 6-1B termination), three comments
         assertEquals(1, source.countLiteral("commands.putIfAbsent(command.id, TrackedControlCommand(command))"))
     }
 
@@ -40,7 +40,7 @@ class ControlIssuanceStructureTest {
         assertEquals(1, tracking.countExactLine("fun issue(): OwnerTrackingLifetimeId = OwnerTrackingLifetimeId(UUID.randomUUID().toString())"))
         assertEquals(1, tracking.countExactLine("check(command.ownerTrackingLifetimeId === lifetimeId) { \"command belongs to another tracker lifetime\" }"))
         assertEquals(1, ref.countExactLine("val ownerTrackingLifetimeId: OwnerTrackingLifetimeId"))
-        assertEquals(4, store.countExactLine("tracking.observe(read)"))
+        assertEquals(5, store.countExactLine("tracking.observe(read)")) // + 6-1B termination owner transaction
         assertEquals(1, store.countExactLine("if (known != null) tracked.bindFirstConfirm(tracking.evidenceDiscontinuityCount)"))
         assertEquals(0, sources.filterKeys { it != control + "ControlCommandTracking.kt" }
             .values.sumOf { it.countLiteral("OwnerTrackingLifetimeId.issue()") })
@@ -183,7 +183,8 @@ class ControlIssuanceStructureTest {
         private val expected = mapOf(
             "registerPrepared" to mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 9),
             // Lifecycle diagnostics collect negative decisions before returning from the transaction.
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 8),
+            // 6-1B adds one termination owner transaction and its five return@transactRecord labels.
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 14),
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,

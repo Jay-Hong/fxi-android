@@ -115,6 +115,7 @@ class ControlOwnerStructureTest {
                 "val candidateBarrier = DataStoreAccessEpochStore.READ_BARRIER",
                 "\"read_barrier is owned by DataStoreAccessEpochStore\"",
                 "val barrier = DataStoreAccessEpochStore.READ_BARRIER",
+                "val barrier = DataStoreAccessEpochStore.READ_BARRIER", // 6-1B termination return validation, same as release.
             ),
             "main/java/com/jay/fxi/data/entitlements/control/NamespaceSettlementTransition.kt" to listOf(
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.ENTRY_SEPARATOR",

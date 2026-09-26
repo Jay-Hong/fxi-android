@@ -336,6 +336,158 @@ internal class ControlRecordStore(
             error("release transaction carried a non-decision result")
     }
 
+    /** Declare that no business Confirm was submitted and all related work has joined. */
+    suspend fun abandonBeforeFirstConfirm(command: CommandRef, closure: TerminationClosure): ControlCompletionResult {
+        completionPrecheck(command, firstEntry = true)?.let { return it }
+        if (!tracking.executing.add(command)) return completionRejected(command, CompletionRejectionReason.InFlight)
+        try {
+            completionPrecheck(command, firstEntry = true)?.let { return it }
+            val tracked = tracking.findPrepared(command)
+                ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
+            val body = command.captureStateAndBody().body
+            if (body !is ControlCommandBody.Mutations && body !is ControlCommandBody.Lifecycle)
+                return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+            closure.violation(command, tracking.lifetimeId)?.let {
+                return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
+            }
+            neverConfirmViolation(tracked)?.let {
+                return completionRejected(command, CompletionRejectionReason.NotNeverConfirm(it))
+            }
+            return terminationAttempt(command, tracked, closure, firstEntry = true)
+        } finally {
+            tracking.executing.remove(command)
+        }
+    }
+
+    /** Retry only the fixed absence authority; the caller supplies a current closure declaration. */
+    suspend fun retryTermination(command: CommandRef, closure: TerminationClosure): ControlCompletionResult {
+        completionPrecheck(command, firstEntry = false)?.let { return it }
+        if (!tracking.executing.add(command)) return completionRejected(command, CompletionRejectionReason.InFlight)
+        try {
+            completionPrecheck(command, firstEntry = false)?.let { return it }
+            val tracked = tracking.findPrepared(command)
+                ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
+            val body = command.captureStateAndBody().body
+            if (body !is ControlCommandBody.Mutations && body !is ControlCommandBody.Lifecycle)
+                return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+            val descriptor = tracked.terminationDescriptor as? TerminationPendingDescriptor.EvidenceAbsent
+                ?: return completionRejected(command, CompletionRejectionReason.NotTerminationPending)
+            check(descriptor.mode == CompletionMode.NeverSubmitted &&
+                descriptor.entry == TerminationEntry.AbandonBeforeFirstConfirm)
+            closure.violation(command, tracking.lifetimeId, descriptor.closureBinding)?.let {
+                return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
+            }
+            return terminationAttempt(command, tracked, closure, firstEntry = false)
+        } finally {
+            tracking.executing.remove(command)
+        }
+    }
+
+    private fun completionPrecheck(command: CommandRef, firstEntry: Boolean): ControlCompletionResult? {
+        if (command.ownerTrackingLifetimeId !== tracking.lifetimeId)
+            return completionRejected(command, CompletionRejectionReason.WrongTrackerLifetime)
+        return when (command.lifecycleState) {
+            ControlCommandLifecycle.TERMINATED -> completionAlreadyTerminated(command)
+            ControlCommandLifecycle.RETAINED -> if (firstEntry) null
+                else completionRejected(command, CompletionRejectionReason.NotTerminationPending)
+            ControlCommandLifecycle.TERMINATION_PENDING -> if (firstEntry)
+                completionRejected(command, CompletionRejectionReason.OtherManagementPath) else null
+            ControlCommandLifecycle.RELEASE_PENDING, ControlCommandLifecycle.RELEASED ->
+                completionRejected(command, CompletionRejectionReason.OtherManagementPath)
+        }
+    }
+
+    private fun neverConfirmViolation(tracked: TrackedControlCommand): NeverConfirmViolation? = when {
+        tracked.confirmationRequested.get() -> NeverConfirmViolation.ConfirmationRequested
+        tracked.firstConfirmDiscontinuityCount != null -> NeverConfirmViolation.FirstConfirmBound
+        tracked.confirmed.get() -> NeverConfirmViolation.Confirmed
+        tracked.expectedApplied != null -> NeverConfirmViolation.ExpectedApplied
+        tracked.observedApplied.get() -> NeverConfirmViolation.ObservedApplied
+        tracked.terminationDescriptor != null -> NeverConfirmViolation.TerminationDescriptorBound
+        else -> null
+    }
+
+    private suspend fun terminationAttempt(command: CommandRef, tracked: TrackedControlCommand,
+        closure: TerminationClosure, firstEntry: Boolean): ControlCompletionResult {
+        val observation = AtomicReference<ControlRecordRead?>(null)
+        val phase = AtomicReference(ControlAttemptPhase.ReadingSnapshot)
+        var confirmedCandidate: Preferences? = null
+        try {
+            val transaction = owner.transactRecord<ControlCompletionResult?> { snapshot ->
+                val read = reader.read(snapshot)
+                tracking.observe(read)
+                observation.set(read)
+                if (read is ControlRecordRead.Supported && ControlAppliedEvidence.own(read, command) != null)
+                    tracked.observedApplied.set(true)
+                phase.set(ControlAttemptPhase.PreparingCandidate)
+                fun recovery(reason: RecoveryReason) = RecordTransactionDecision.Observe<ControlCompletionResult?>(
+                    ControlCompletionResult.RecoveryRequired(command, emptySet(), emptySet(), reason, command.lifecycleState, read))
+                if (read !is ControlRecordRead.Supported) return@transactRecord recovery(
+                    if (read is ControlRecordRead.MigrationOrRecoveryRequired) RecoveryReason.MigrationOrRecovery
+                    else RecoveryReason.UnreadableRecord)
+                if (read.schemaVersion != 2) return@transactRecord recovery(RecoveryReason.ControlSchemaMigrationRequired)
+                if (read.hasUninterpretableMetadata) return@transactRecord recovery(RecoveryReason.UninterpretableMetadata)
+                if (read.hasUninterpretable) return@transactRecord recovery(RecoveryReason.UninterpretableObligations)
+                if (ControlAppliedEvidence.own(read, command) != null) return@transactRecord RecordTransactionDecision.Observe(
+                    ControlCompletionResult.Conflict(command, emptySet(), emptySet(), ConflictReason.CommandEvidenceMismatch,
+                        command.lifecycleState, read))
+                confirmedCandidate = read.original
+                if (firstEntry) {
+                    tracked.bindTerminationDescriptor(TerminationPendingDescriptor.EvidenceAbsent(
+                        CompletionMode.NeverSubmitted, TerminationEntry.AbandonBeforeFirstConfirm, closure.binding()))
+                    tracking.publishPendingTermination(command)
+                    command.beginTermination()
+                }
+                phase.set(ControlAttemptPhase.ConfirmingStorage)
+                RecordTransactionDecision.Confirm(read.original, null)
+            }
+            transaction.value?.let { return it.withCompletionRecoveryWork(tracking.recoverySnapshot()) }
+            val returned = reader.read(transaction.snapshot)
+            check(ControlReleaseCandidate.hasAbsencePostcondition(returned, command)) {
+                "termination absence postcondition was not confirmed"
+            }
+            val barrier = DataStoreAccessEpochStore.READ_BARRIER
+            check(transaction.snapshot.toMutablePreferences().apply { remove(barrier) } ==
+                checkNotNull(confirmedCandidate).toMutablePreferences().apply { remove(barrier) }) {
+                "termination confirmation changed unrelated values"
+            }
+            command.completeTermination()
+            tracking.finishTermination(tracked)
+            val work = tracking.recoverySnapshot()
+            return ControlCompletionResult.Completed(command, work.unresolvedCommands, work.pendingReleases,
+                CompletionMode.NeverSubmitted, ConfirmedControlSnapshot(returned as ControlRecordRead.Supported),
+                ConfirmationProof(transaction.evidence))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: IOException) {
+            val work = tracking.recoverySnapshot()
+            return ControlCompletionResult.Unconfirmed(command, work.unresolvedCommands, work.pendingReleases,
+                command.lifecycleState, phase.get(), observation.get(), failure)
+        }
+    }
+
+    private fun completionRejected(command: CommandRef, reason: CompletionRejectionReason): ControlCompletionResult.Rejected {
+        val work = tracking.recoverySnapshot()
+        return ControlCompletionResult.Rejected(command, work.unresolvedCommands, work.pendingReleases,
+            reason, command.lifecycleState, null)
+    }
+
+    private fun completionAlreadyTerminated(command: CommandRef): ControlCompletionResult.AlreadyTerminated {
+        val work = tracking.recoverySnapshot()
+        return ControlCompletionResult.AlreadyTerminated(command, work.unresolvedCommands, work.pendingReleases)
+    }
+
+    private fun ControlCompletionResult.withCompletionRecoveryWork(work: LocalRecoveryWork): ControlCompletionResult = when (this) {
+        is ControlCompletionResult.Rejected -> copy(localUnresolvedCommands = work.unresolvedCommands,
+            localPendingReleases = work.pendingReleases)
+        is ControlCompletionResult.Conflict -> copy(localUnresolvedCommands = work.unresolvedCommands,
+            localPendingReleases = work.pendingReleases)
+        is ControlCompletionResult.RecoveryRequired -> copy(localUnresolvedCommands = work.unresolvedCommands,
+            localPendingReleases = work.pendingReleases)
+        is ControlCompletionResult.Unconfirmed, is ControlCompletionResult.Completed,
+        is ControlCompletionResult.AlreadyTerminated -> error("termination transaction carried a non-decision result")
+    }
+
     suspend fun upgradeControlSchemaV1ToV2(): ControlSchemaUpgradeResult {
         var observation: ControlRecordRead? = null
         return try {

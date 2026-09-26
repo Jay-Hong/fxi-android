@@ -22,11 +22,17 @@ internal class TrackedControlCommand(val command: CommandRef, actions: List<Cont
     var expectedApplied: AppliedEvidence? = null
     var releaseDescriptor: ReleasePendingDescriptor? = null
         private set
+    var terminationDescriptor: TerminationPendingDescriptor? = null
+        private set
 
     // Called only at the validated owner release boundary, before publishing pending membership.
     internal fun bindReleaseDescriptor(descriptor: ReleasePendingDescriptor) {
         check(releaseDescriptor == null) { "release descriptor is already fixed" }
         releaseDescriptor = descriptor
+    }
+    internal fun bindTerminationDescriptor(descriptor: TerminationPendingDescriptor) {
+        check(terminationDescriptor == null) { "termination descriptor is already fixed" }
+        terminationDescriptor = descriptor
     }
     fun bindFirstConfirm(count: BigInteger) {
         if (firstConfirmDiscontinuityCount == null) firstConfirmDiscontinuityCount = count
@@ -93,6 +99,19 @@ internal class ControlCommandTracking private constructor() {
         val command = tracked.command
         check(command.lifecycleState == ControlCommandLifecycle.RELEASED)
         recoveryWork.updateAndGet { LocalRecoveryWork(it.unresolvedCommands, it.pendingReleases - command) }
+        commands.remove(command.id, tracked)
+    }
+
+    internal fun publishPendingTermination(command: CommandRef) {
+        recoveryWork.updateAndGet { LocalRecoveryWork(it.unresolvedCommands, it.pendingReleases + command) }
+    }
+
+    internal fun finishTermination(tracked: TrackedControlCommand) {
+        val command = tracked.command
+        check(command.lifecycleState == ControlCommandLifecycle.TERMINATED)
+        recoveryWork.updateAndGet {
+            LocalRecoveryWork(it.unresolvedCommands - command, it.pendingReleases - command)
+        }
         commands.remove(command.id, tracked)
     }
 

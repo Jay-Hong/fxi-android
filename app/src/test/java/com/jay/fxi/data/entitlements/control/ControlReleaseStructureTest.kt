@@ -67,9 +67,11 @@ class ControlReleaseStructureTest {
             .map { it.name.substringBefore('$') }.filter { it in setOf("beginTermination", "completeTermination") }.toSet())
         assertEquals(1, ref.lineSequence().count { it.trim() == "internal fun beginTermination() {" })
         assertEquals(1, ref.lineSequence().count { it.trim() == "internal fun completeTermination() {" })
-        // 6-1A has no production termination caller; 6-1B pins exactly one owner-path caller each.
-        assertEquals(mapOf(control + "ControlStoreResult.kt" to 1), SealSourceTripwire.occurrences(all, "beginTermination"))
-        assertEquals(mapOf(control + "ControlStoreResult.kt" to 1), SealSourceTripwire.occurrences(all, "completeTermination"))
+        // 6-1B: exactly one owner-path caller each, inside terminationAttempt.
+        assertEquals(mapOf(control + "ControlStoreResult.kt" to 1, control + "ControlRecordStore.kt" to 1),
+            SealSourceTripwire.occurrences(all, "beginTermination"))
+        assertEquals(mapOf(control + "ControlStoreResult.kt" to 1, control + "ControlRecordStore.kt" to 1),
+            SealSourceTripwire.occurrences(all, "completeTermination"))
         assertFalse(all.values.any { it.contains("ControlReleaseFixtures") })
         assertFalse(all.filterKeys { it.startsWith(control) }.values.any {
             it.contains("getDeclaredField") || it.contains("getDeclaredMethod") || it.contains("java.lang.reflect")
@@ -113,8 +115,9 @@ class ControlReleaseStructureTest {
         assertEquals(setOf("lifetimeId", "evidenceDiscontinuityCount", "commands", "executing", "recoveryWork", "Companion", "collected", "owners"),
             contractFieldNames(ControlCommandTracking::class.java))
         val tracking = sources().getValue(control + "ControlCommandTracking.kt")
-        assertEquals(1, tracking.lineSequence().count { it.trim() == "commands.remove(command.id, tracked)" })
-        assertEquals(1, Regex("commands\\.remove").findAll(tracking).count())
+        // finishRelease and finishTermination each remove only their exact tracked entry.
+        assertEquals(2, tracking.lineSequence().count { it.trim() == "commands.remove(command.id, tracked)" })
+        assertEquals(2, Regex("commands\\.remove").findAll(tracking).count())
         assertFalse(tracking.contains("commands.clear"))
         val all = sources()
         for (method in listOf("finishRelease", "publishPendingRelease")) {
@@ -157,6 +160,25 @@ class ControlReleaseStructureTest {
         assertEquals(1, Regex("captureStateAndBody\\(\\)").findAll(run).count())
         assertEquals(1, run.lineSequence().count { it.trim().startsWith("return attempt(command, body, actions, ") })
         for (reread in listOf("command.body", "command.actions")) assertFalse("run must not use $reread", run.contains(reread))
+    }
+    @Test fun D2B6_terminationRunsUnderTheCommandLeaseInOrder() {
+        val all = sources(); val store = all.getValue(control + "ControlRecordStore.kt")
+        for (method in listOf("publishPendingTermination", "finishTermination", "bindTerminationDescriptor"))
+            assertEquals(method, 1, all.getValue(control + "ControlRecordStore.kt").let { Regex("\\b$method\\(").findAll(it).count() })
+        assertEquals(mapOf(control + "ControlRecordStore.kt" to 3), SealSourceTripwire.occurrences(all, "terminationAttempt"))
+        // The only termination transitions happen in terminationAttempt, reached only after the entry acquired c's lease.
+        for (entry in listOf("suspend fun abandonBeforeFirstConfirm(", "suspend fun retryTermination(")) {
+            val body = member(store, entry)
+            val lease = body.indexOf("tracking.executing.add(command)"); val call = body.indexOf("terminationAttempt(")
+            assertTrue("$entry: lease before attempt", lease in 0 until call)
+            assertTrue("$entry: lease released in finally", body.contains("tracking.executing.remove(command)"))
+        }
+        val attempt = member(store, "private suspend fun terminationAttempt(")
+        val steps = listOf("tracked.bindTerminationDescriptor(", "tracking.publishPendingTermination(command)",
+            "command.beginTermination()", "RecordTransactionDecision.Confirm(", "command.completeTermination()",
+            "tracking.finishTermination(tracked)")
+        assertTrue(steps.filterNot { attempt.contains(it) }.toString(), steps.all { attempt.contains(it) })
+        assertEquals(steps.map { attempt.indexOf(it) }.sorted(), steps.map { attempt.indexOf(it) })
     }
     @Test fun A17_terminalResultCarriesNoAuthority() {
         assertEquals(setOf("command", "localUnresolvedCommands", "localPendingReleases"),
