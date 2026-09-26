@@ -77,6 +77,20 @@ internal class ControlCommandTracking private constructor() {
     internal fun findPrepared(command: CommandRef): TrackedControlCommand? =
         commands[command.id]?.takeIf { it.command === command }
 
+    /** Enumerate only for the owner's synchronous decision; no persistent dependency index. */
+    internal fun dependencyCandidatesExcluding(self: CommandRef): List<CommandRef> {
+        val work = recoverySnapshot()
+        val candidates = ArrayList<CommandRef>()
+        fun add(ref: CommandRef) {
+            if (ref !== self && candidates.none { it === ref }) candidates += ref
+        }
+        commands.values.forEach { add(it.command) }
+        work.unresolvedCommands.forEach(::add)
+        work.pendingReleases.forEach(::add)
+        executing.forEach(::add)
+        return candidates
+    }
+
     // Also covers previous-lifetime references, which are not locally prepared commands.
     // This nonblocking lease refuses duplicate execution; the owner alone serializes storage.
     val executing: MutableSet<CommandRef> = ConcurrentHashMap.newKeySet()

@@ -27,7 +27,7 @@ class ControlIssuanceStructureTest {
         val source = SealSourceTripwire.read(productionRoot()).getValue(control + "ControlCommandTracking.kt")
         assertEquals(1, source.countLiteral("internal class ControlCommandTracking private constructor()"))
         assertEquals(1, source.countLiteral("private val commands = ConcurrentHashMap<String, TrackedControlCommand>()"))
-        assertEquals(8, Regex("\\bcommands\\b").findAll(source).count()) // declaration, insertion, lookup, two conditional removals (release, 6-1B termination), three comments
+        assertEquals(9, Regex("\\bcommands\\b").findAll(source).count()) // declaration, insertion, lookup, two conditional removals (release, 6-1B termination), three comments, 6-2C2 read-only owner enumeration
         assertEquals(1, source.countLiteral("commands.putIfAbsent(command.id, TrackedControlCommand(command))"))
     }
 

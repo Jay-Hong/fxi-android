@@ -523,19 +523,26 @@ internal class ControlRecordStore(
                             TerminationEntry.ConsumedRotation, closure.binding(), checkNotNull(expected), command.id,
                             input.seals.map { it.id })
                 }
-                val barrier = DataStoreAccessEpochStore.READ_BARRIER
-                check(candidate.asMap()[barrier] == snapshot.asMap()[barrier]) {
-                    "read_barrier is owned by DataStoreAccessEpochStore"
+                val dependencyReason = if (plan is TerminationPendingDescriptor.ExactEvidenceAndSeals)
+                    rotationDependencyViolation(command, plan) else null
+                if (dependencyReason != null) {
+                    RecordTransactionDecision.Observe(ControlCompletionResult.Rejected(command, emptySet(), emptySet(),
+                        dependencyReason, command.lifecycleState, read))
+                } else {
+                    val barrier = DataStoreAccessEpochStore.READ_BARRIER
+                    check(candidate.asMap()[barrier] == snapshot.asMap()[barrier]) {
+                        "read_barrier is owned by DataStoreAccessEpochStore"
+                    }
+                    confirmedCandidate = candidate
+                    confirmedPlan = plan
+                    if (request !is TerminationRequest.Retry) {
+                        tracked.bindTerminationDescriptor(plan)
+                        tracking.publishPendingTermination(command)
+                        command.beginTermination()
+                    }
+                    phase.set(ControlAttemptPhase.ConfirmingStorage)
+                    RecordTransactionDecision.Confirm(candidate, null)
                 }
-                confirmedCandidate = candidate
-                confirmedPlan = plan
-                if (request !is TerminationRequest.Retry) {
-                    tracked.bindTerminationDescriptor(plan)
-                    tracking.publishPendingTermination(command)
-                    command.beginTermination()
-                }
-                phase.set(ControlAttemptPhase.ConfirmingStorage)
-                RecordTransactionDecision.Confirm(candidate, null)
             }
             transaction.value?.let { return it.withCompletionRecoveryWork(tracking.recoverySnapshot()) }
             val returned = reader.read(transaction.snapshot)
@@ -554,6 +561,33 @@ internal class ControlRecordStore(
             return ControlCompletionResult.Unconfirmed(command, work.unresolvedCommands, work.pendingReleases,
                 command.lifecycleState, phase.get(), observation.get(), failure)
         }
+    }
+
+    private fun rotationDependencyViolation(command: CommandRef,
+        plan: TerminationPendingDescriptor.ExactEvidenceAndSeals): CompletionRejectionReason? {
+        val protectedAtoms = buildSet<DependencyAtom> {
+            add(DependencyAtom.AppliedRow(command.id, command.ownerTrackingLifetimeId.value))
+            for (sealId in plan.orderedSealIds) {
+                add(DependencyAtom.ControlRow(ControlKind.SEAL, sealId))
+                add(DependencyAtom.SealWitness(sealId, plan.operationId))
+            }
+        }
+        for (dependent in tracking.dependencyCandidatesExcluding(command)) {
+            val view = dependent.captureStateAndBody()
+            val tracked = if (view.state == ControlCommandLifecycle.RELEASED ||
+                view.state == ControlCommandLifecycle.TERMINATED) null else tracking.findPrepared(dependent)
+            val projection = projectDependency(DependencyProjectionInput(dependent.id,
+                dependent.ownerTrackingLifetimeId.value, view, tracked?.targets?.get(),
+                tracked?.releaseDescriptor, tracked?.terminationDescriptor))
+            when (val intersection = classifyDependency(projection, protectedAtoms)) {
+                is DependencyIntersection.Present -> return CompletionRejectionReason.DependencyPresent(
+                    dependent.id, dependent.ownerTrackingLifetimeId.value, intersection.atom)
+                is DependencyIntersection.Unknown -> return CompletionRejectionReason.DependencyUnknown(
+                    dependent.id, dependent.ownerTrackingLifetimeId.value, intersection.gap?.source)
+                DependencyIntersection.Clear -> Unit
+            }
+        }
+        return null
     }
 
     private fun validateTerminationReturn(plan: TerminationPendingDescriptor, returned: ControlRecordRead,

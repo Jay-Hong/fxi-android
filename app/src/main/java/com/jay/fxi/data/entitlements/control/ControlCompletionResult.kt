@@ -31,6 +31,16 @@ internal sealed interface CompletionRejectionReason {
     data object ConsumptionNotDeclared : CompletionRejectionReason
     data class NotNeverConfirm(val violation: NeverConfirmViolation) : CompletionRejectionReason
     data class ClosureNotSatisfied(val violation: ClosureViolation) : CompletionRejectionReason
+    data class DependencyPresent(
+        val dependentCommandId: String,
+        val dependentLifetimeId: String,
+        val atom: DependencyAtom
+    ) : CompletionRejectionReason
+    data class DependencyUnknown(
+        val dependentCommandId: String?,
+        val dependentLifetimeId: String?,
+        val source: DependencyGapSource?
+    ) : CompletionRejectionReason
     data object NotTerminationPending : CompletionRejectionReason
     data object UnsupportedInThisUnit : CompletionRejectionReason
     data class Encoding(val reason: RejectionReason) : CompletionRejectionReason
