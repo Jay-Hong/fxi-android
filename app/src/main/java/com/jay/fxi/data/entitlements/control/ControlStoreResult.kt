@@ -95,7 +95,7 @@ internal enum class ConflictReason {
 internal enum class RecoveryReason {
     MigrationOrRecovery, UnreadableRecord, ControlSchemaMigrationRequired, UnreadableEpochState, InconsistentSettlement, JournalMigrationRequired,
     UninterpretableMetadata, UninterpretableObligations, InconsistentReclamation, CommandEvidenceLost, CommandEvidenceContinuityLost,
-    ExpectedRotationEvidenceUnavailable, ExpectedSettlementEvidenceUnavailable
+    ExpectedRotationEvidenceUnavailable, ExpectedSettlementEvidenceUnavailable, ExpectedLifecycleEvidenceUnavailable
 }
 internal enum class UnconfirmedReason { StorageFailure, HistoryUnavailable }
 internal enum class ControlAttemptPhase { ReadingSnapshot, PreparingCandidate, ConfirmingStorage }

@@ -138,6 +138,11 @@ class ControlOwnerStructureTest {
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore",
                 "remove(DataStoreAccessEpochStore.READ_BARRIER)",
             ),
+            // 6-4aA: the Lifecycle consumption return validator compares the same way.
+            "main/java/com/jay/fxi/data/entitlements/control/ControlLifecycleConsumption.kt" to listOf(
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore",
+                "remove(DataStoreAccessEpochStore.READ_BARRIER)",
+            ),
             "main/java/com/jay/fxi/data/entitlements/control/NamespaceSettlementTransition.kt" to listOf(
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.ENTRY_SEPARATOR",
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.FIELD_SEPARATOR",
