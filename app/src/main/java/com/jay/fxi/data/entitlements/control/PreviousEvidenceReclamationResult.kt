@@ -51,7 +51,6 @@ internal enum class PreviousReclamationDisposition { RemovedNow, AlreadyAbsent }
 
 internal sealed interface PreviousReclamationRejectionReason {
     data class InvalidSelection(val detail: String) : PreviousReclamationRejectionReason
-    data object UnsupportedInThisUnit : PreviousReclamationRejectionReason
     data class ClosureNotSatisfied(val violation: PreviousReclamationClosureViolation) : PreviousReclamationRejectionReason
     data class DependencyPresent(val dependentCommandId: String, val dependentLifetimeId: String,
         val atom: DependencyAtom) : PreviousReclamationRejectionReason

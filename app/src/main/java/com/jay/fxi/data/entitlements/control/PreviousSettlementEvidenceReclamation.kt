@@ -35,33 +35,46 @@ internal class PreviousEvidenceSelection(items: List<Item>) {
 
     /** Validate fixed caller evidence without consulting the latest owner record. */
     internal fun problem(currentLifetime: OwnerTrackingLifetimeId): String? {
-        if (items.isEmpty() || items.any { it !is Item.Settlement } ||
-            items.map { it.commandId }.toSet().size != items.size
+        if (items.isEmpty() || items.map { it.commandId }.toSet().size != items.size
         ) return "invalid previous settlement selection"
         val selectedIds = mutableSetOf<String>()
-        for (item in items.filterIsInstance<Item.Settlement>()) {
-            val evidence = ControlEvidenceReader.read(PayloadRead.Parsed(listOf(item.rawApplied.toPayloadEntry())))
-                .entries.single() as? ControlEvidenceEntryRead.Interpreted
-            val row = evidence?.value as? AppliedEvidence.Settlement
-                ?: return "invalid selected settlement evidence"
-            if (row.commandId != item.commandId || row.ownerTrackingLifetimeId == currentLifetime.value)
-                return "invalid selected settlement identity"
-            val seals = item.orderedRawSeals.map { raw ->
-                (ControlObligations.read(ControlKind.SEAL, raw) as? ControlEntryRead.Interpreted)?.value as? SealV1
-                    ?: return "invalid selected seal"
+        for (item in items) {
+            when (item) {
+                is Item.Settlement -> {
+                    val evidence = ControlEvidenceReader.read(PayloadRead.Parsed(listOf(item.rawApplied.toPayloadEntry())))
+                        .entries.single() as? ControlEvidenceEntryRead.Interpreted
+                    val row = evidence?.value as? AppliedEvidence.Settlement
+                        ?: return "invalid selected settlement evidence"
+                    if (row.commandId != item.commandId || row.ownerTrackingLifetimeId == currentLifetime.value)
+                        return "invalid selected settlement identity"
+                    val seals = item.orderedRawSeals.map { raw ->
+                        (ControlObligations.read(ControlKind.SEAL, raw) as? ControlEntryRead.Interpreted)?.value as? SealV1
+                            ?: return "invalid selected seal"
+                    }
+                    if (seals.map { it.id } != row.sealIds || seals.any {
+                            it.settlement?.operationId != item.commandId
+                        } || seals.any { !selectedIds.add(it.id) }
+                    ) return "invalid selected seal identities"
+                }
+                is Item.Lifecycle -> lifecycleProblem(item, currentLifetime)?.let { return it }
             }
-            if (seals.map { it.id } != row.sealIds || seals.any {
-                    it.settlement?.operationId != item.commandId
-                } || seals.any { !selectedIds.add(it.id) }
-            ) return "invalid selected seal identities"
         }
+        return null
+    }
+
+    internal fun lifecycleProblem(item: Item.Lifecycle, currentLifetime: OwnerTrackingLifetimeId): String? {
+        val evidence = ControlEvidenceReader.read(PayloadRead.Parsed(listOf(item.rawApplied.toPayloadEntry())))
+            .entries.single() as? ControlEvidenceEntryRead.Interpreted
+        val row = evidence?.value as? AppliedEvidence.Lifecycle ?: return "invalid selected lifecycle evidence"
+        if (row.commandId != item.commandId || row.ownerTrackingLifetimeId == currentLifetime.value)
+            return "invalid selected lifecycle identity"
         return null
     }
 }
 
 private fun ControlNode.detached(): ControlNode = ControlNode.of(toPayloadEntry().fields)
 
-/** Pure 6-3C1 decision. The owner entry, closure and dependency gate belong to 6-3C2. */
+/** Pure previous-lifetime Settlement/Lifecycle decision. The owner entry, closure and dependency gate are separate. */
 internal object PreviousSettlementEvidenceReclamation {
     sealed interface Decision {
         data class Ready(val candidate: Preferences) : Decision
@@ -82,10 +95,14 @@ internal object PreviousSettlementEvidenceReclamation {
         if (read.schemaVersion != 2 || read.blocksProtectedAdmission || read.metadata !is ControlMetadataRead.V2)
             return inconsistent
         val items = selection.items
-        if (items.isEmpty() || items.any { it !is PreviousEvidenceSelection.Item.Settlement } ||
-            items.map { it.commandId }.toSet().size != items.size
+        if (items.isEmpty() || items.map { it.commandId }.toSet().size != items.size
         ) return Decision.Rejected(RejectionReason.InvalidRequest("invalid previous settlement selection"))
-        val selected = items.map { it as PreviousEvidenceSelection.Item.Settlement }
+        for (item in items.filterIsInstance<PreviousEvidenceSelection.Item.Lifecycle>()) {
+            selection.lifecycleProblem(item, currentLifetime)?.let {
+                return Decision.Rejected(RejectionReason.InvalidRequest(it))
+            }
+        }
+        val selected = items.filterIsInstance<PreviousEvidenceSelection.Item.Settlement>()
         val metadata = read.metadata as ControlMetadataRead.V2
         val evidence = metadata.evidence.entries.map { it as ControlEvidenceEntryRead.Interpreted }
         val seals = read.arrays.getValue(ControlKind.SEAL).entries.map { it as ControlEntryRead.Interpreted }
@@ -98,9 +115,9 @@ internal object PreviousSettlementEvidenceReclamation {
             selectedIds.toSet().size != selectedIds.size
         ) return Decision.Rejected(RejectionReason.InvalidRequest("invalid selected seal identities"))
 
-        val commandIds = selected.map { it.commandId }.toSet()
-        val present = selected.count { byCommand[it.commandId] != null }
-        if (present != selected.size) {
+        val commandIds = items.map { it.commandId }.toSet()
+        val present = items.count { byCommand[it.commandId] != null }
+        if (present != items.size) {
             if (!retry) return Decision.Conflict
             if (present != 0 || selectedIds.any { bySealId[it] != null } || seals.any {
                     ((it.value as SealV1).settlement?.operationId) in commandIds
@@ -109,32 +126,22 @@ internal object PreviousSettlementEvidenceReclamation {
             return Decision.Ready(read.original)
         }
 
-        for (item in selected) {
+        for (item in items) {
             val entry = byCommand.getValue(item.commandId)
-            val row = entry.value as? AppliedEvidence.Settlement ?: return Decision.Conflict
-            if (row.ownerTrackingLifetimeId == currentLifetime.value ||
-                entry.original.toPayloadEntry() != item.rawApplied.toPayloadEntry()
-            ) return Decision.Conflict
-            if (row.sealIds.size != item.orderedRawSeals.size) return Decision.Conflict
-            val bundle = row.sealIds.map { id -> bySealId[id] ?: return inconsistent }
-            if (bundle.map { it.original.toPayloadEntry() } != item.orderedRawSeals.map { it.toPayloadEntry() })
-                return Decision.Conflict
-            val typed = bundle.map { it.value as SealV1 }
-            if (typed.any { it.settlement?.operationId != row.commandId } ||
-                seals.filter { (it.value as SealV1).settlement?.operationId == row.commandId }
-                    .map { it.value.id }.toSet() != row.sealIds.toSet()
-            ) return inconsistent
-            if (!validBundle(row, typed)) return inconsistent
+            val problem = when (item) {
+                is PreviousEvidenceSelection.Item.Settlement -> settlementItem(entry, item, currentLifetime, bySealId, seals)
+                is PreviousEvidenceSelection.Item.Lifecycle -> lifecycleItem(entry, item, currentLifetime)
+            }
+            if (problem != null) return problem
         }
 
         val sealIds = selectedIds.toSet()
         val survivingEvidence = evidence.filterNot { it.value.commandId in commandIds }.map { it.original.toPayloadEntry() }
         val survivingSeals = seals.filterNot { it.value.id in sealIds }.map { it.original.toPayloadEntry() }
         val candidate = read.original.toMutablePreferences()
-        for ((key, entries) in listOf(
-            ControlPayloadKey.COMMAND_EVIDENCE to survivingEvidence,
-            ControlPayloadKey.SEAL to survivingSeals
-        )) {
+        val payloads = if (selected.isEmpty()) listOf(ControlPayloadKey.COMMAND_EVIDENCE to survivingEvidence)
+            else listOf(ControlPayloadKey.COMMAND_EVIDENCE to survivingEvidence, ControlPayloadKey.SEAL to survivingSeals)
+        for ((key, entries) in payloads) {
             val encoded = try { codec.encode(entries) } catch (_: IllegalArgumentException) {
                 return Decision.Rejected(RejectionReason.InvalidRequest("reclamation violates codec envelope constraints"))
             }
@@ -153,6 +160,39 @@ internal object PreviousSettlementEvidenceReclamation {
             } != survivingSeals
         ) return inconsistent
         return Decision.Ready(frozen)
+    }
+
+    private fun settlementItem(
+        entry: ControlEvidenceEntryRead.Interpreted,
+        item: PreviousEvidenceSelection.Item.Settlement,
+        currentLifetime: OwnerTrackingLifetimeId,
+        bySealId: Map<String, ControlEntryRead.Interpreted>,
+        seals: List<ControlEntryRead.Interpreted>
+    ): Decision? {
+        val row = entry.value as? AppliedEvidence.Settlement ?: return Decision.Conflict
+        if (row.ownerTrackingLifetimeId == currentLifetime.value ||
+            entry.original.toPayloadEntry() != item.rawApplied.toPayloadEntry()
+        ) return Decision.Conflict
+        if (row.sealIds.size != item.orderedRawSeals.size) return Decision.Conflict
+        val bundle = row.sealIds.map { id -> bySealId[id] ?: return inconsistent }
+        if (bundle.map { it.original.toPayloadEntry() } != item.orderedRawSeals.map { it.toPayloadEntry() })
+            return Decision.Conflict
+        val typed = bundle.map { it.value as SealV1 }
+        if (typed.any { it.settlement?.operationId != row.commandId } ||
+            seals.filter { (it.value as SealV1).settlement?.operationId == row.commandId }
+                .map { it.value.id }.toSet() != row.sealIds.toSet()
+        ) return inconsistent
+        if (!validBundle(row, typed)) return inconsistent
+        return null
+    }
+
+    private fun lifecycleItem(entry: ControlEvidenceEntryRead.Interpreted,
+        item: PreviousEvidenceSelection.Item.Lifecycle, currentLifetime: OwnerTrackingLifetimeId): Decision? {
+        val row = entry.value as? AppliedEvidence.Lifecycle ?: return Decision.Conflict
+        if (row.ownerTrackingLifetimeId == currentLifetime.value ||
+            entry.original.toPayloadEntry() != item.rawApplied.toPayloadEntry()
+        ) return Decision.Conflict
+        return null
     }
 
     fun validateReturn(returned: ControlRecordRead, selection: PreviousEvidenceSelection, candidate: Preferences): Boolean {

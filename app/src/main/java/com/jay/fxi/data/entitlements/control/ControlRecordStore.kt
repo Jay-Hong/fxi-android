@@ -830,7 +830,7 @@ internal class ControlRecordStore(
         }
     }
 
-    /** Reclaim only the caller's fixed previous-lifetime Settlement selection. */
+    /** Reclaim the caller's fixed previous-lifetime Settlement/Lifecycle selection. */
     internal suspend fun reclaimPreviousSettlementOrLifecycleEvidence(
         selection: PreviousEvidenceSelection,
         closure: PreviousReclamationClosure,
@@ -840,8 +840,6 @@ internal class ControlRecordStore(
             val work = tracking.recoverySnapshot()
             return PreviousEvidenceReclamationResult.Rejected(reason, null, work.unresolvedCommands, work.pendingReleases)
         }
-        if (selection.items.any { it is PreviousEvidenceSelection.Item.Lifecycle })
-            return rejected(PreviousReclamationRejectionReason.UnsupportedInThisUnit)
         selection.problem(tracking.lifetimeId)?.let {
             return rejected(PreviousReclamationRejectionReason.InvalidSelection(it))
         }
@@ -872,7 +870,7 @@ internal class ControlRecordStore(
             transaction.value?.let { return it.withPreviousRecoveryWork(tracking.recoverySnapshot()) }
             val returned = reader.read(transaction.snapshot)
             check(PreviousSettlementEvidenceReclamation.validateReturn(returned, selection,
-                checkNotNull(confirmedCandidate))) { "previous settlement reclamation was not confirmed" }
+                checkNotNull(confirmedCandidate))) { "previous evidence reclamation was not confirmed" }
             val work = tracking.recoverySnapshot()
             return PreviousEvidenceReclamationResult.Reclaimed(
                 ConfirmedControlSnapshot(returned as ControlRecordRead.Supported), ConfirmationProof(transaction.evidence),
@@ -912,15 +910,24 @@ internal class ControlRecordStore(
             is PreviousSettlementEvidenceReclamation.Decision.Ready -> decision.candidate
         }
         val protectedAtoms = buildSet<DependencyAtom> {
-            for (item in selection.items.filterIsInstance<PreviousEvidenceSelection.Item.Settlement>()) {
-                val row = (ControlEvidenceReader.read(PayloadRead.Parsed(listOf(item.rawApplied.toPayloadEntry())))
-                    .entries.single() as ControlEvidenceEntryRead.Interpreted).value as AppliedEvidence.Settlement
-                add(DependencyAtom.AppliedRow(item.commandId, row.ownerTrackingLifetimeId))
-                for (raw in item.orderedRawSeals) {
-                    val id = ((ControlObligations.read(ControlKind.SEAL, raw) as ControlEntryRead.Interpreted)
-                        .value as SealV1).id
-                    add(DependencyAtom.ControlRow(ControlKind.SEAL, id))
-                    add(DependencyAtom.SealWitness(id, item.commandId))
+            for (item in selection.items) {
+                when (item) {
+                    is PreviousEvidenceSelection.Item.Settlement -> {
+                        val row = (ControlEvidenceReader.read(PayloadRead.Parsed(listOf(item.rawApplied.toPayloadEntry())))
+                            .entries.single() as ControlEvidenceEntryRead.Interpreted).value as AppliedEvidence.Settlement
+                        add(DependencyAtom.AppliedRow(item.commandId, row.ownerTrackingLifetimeId))
+                        for (raw in item.orderedRawSeals) {
+                            val id = ((ControlObligations.read(ControlKind.SEAL, raw) as ControlEntryRead.Interpreted)
+                                .value as SealV1).id
+                            add(DependencyAtom.ControlRow(ControlKind.SEAL, id))
+                            add(DependencyAtom.SealWitness(id, item.commandId))
+                        }
+                    }
+                    is PreviousEvidenceSelection.Item.Lifecycle -> {
+                        val row = (ControlEvidenceReader.read(PayloadRead.Parsed(listOf(item.rawApplied.toPayloadEntry())))
+                            .entries.single() as ControlEvidenceEntryRead.Interpreted).value as AppliedEvidence.Lifecycle
+                        add(DependencyAtom.AppliedRow(item.commandId, row.ownerTrackingLifetimeId))
+                    }
                 }
             }
         }

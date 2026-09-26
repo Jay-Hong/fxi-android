@@ -45,9 +45,10 @@ import org.junit.rules.TemporaryFolder
  *     Rejected(reason, observation?, U, P); Conflict(reason, observation, U, P); RecoveryRequired(reason, observation, U, P);
  *     Unconfirmed(observation?, failure, U, P) } — U/P are localUnresolvedCommands / localPendingReleases
  *   enum PreviousReclamationDisposition { RemovedNow, AlreadyAbsent }
- *   sealed PreviousReclamationRejectionReason { InvalidSelection(detail); UnsupportedInThisUnit; ClosureNotSatisfied(v);
+ *   sealed PreviousReclamationRejectionReason { InvalidSelection(detail); ClosureNotSatisfied(v);
  *     DependencyPresent(dependentCommandId, dependentLifetimeId, atom); DependencyUnknown(...); Encoding(reason) }
- * Entry order, all before storage (no write, file unchanged): any Lifecycle item → UnsupportedInThisUnit; selection.problem →
+ * 6-4aC: UnsupportedInThisUnit is gone — Lifecycle items are supported (PreviousLifecycleReclamationContractTest); an
+ * ineligible one is InvalidSelection. Entry order, all before storage (no write, file unchanged): selection.problem →
  * InvalidSelection; closure.violation → ClosureNotSatisfied. Then one owner transaction: read, observe, schema/opaque
  * (RecoveryRequired), the 6-3C1 decider (Conflict / RecoveryRequired / Encoding), G11 over every ref the current tracker holds
  * (no self is excluded — an old-lifetime ref of the same operation in U blocks), Confirm, then the return is validated.
@@ -162,10 +163,16 @@ class PreviousEvidenceReclamationOwnerContractTest {
     // ── entry refusals, all before storage ───────────────────────────────────────────────────────────────────────
     @Test fun C2_02_lifecycleAndInvalidSelectionsAreRefusedBeforeStorage() = runBlocking {
         val (next, c) = previous(cn(NN.both(), "CURRENT_NULL-both")); val item = itemFor(c)
-        refusedBeforeStorage("02 lifecycleOnly", next, selection(PreviousEvidenceSelection.Item.Lifecycle(c.id, item.rawApplied)),
-            PreviousReclamationRejectionReason.UnsupportedInThisUnit)
-        refusedBeforeStorage("02 mixed", next, selection(item, PreviousEvidenceSelection.Item.Lifecycle("lc-other", item.rawApplied)),
-            PreviousReclamationRejectionReason.UnsupportedInThisUnit)
+        // 6-4aC: a Lifecycle item carrying a Settlement row is an ineligible (wrong-kind) selection → InvalidSelection.
+        for ((name, sel) in listOf("lifecycleWrongKind" to selection(PreviousEvidenceSelection.Item.Lifecycle(c.id, item.rawApplied)),
+            "mixedWrongKind" to selection(item, PreviousEvidenceSelection.Item.Lifecycle("lc-other", item.rawApplied)))) {
+            val before = disk(); val writes = next.storage.writes
+            val r = reclaim(next, sel)
+            assertTrue("D2B6/6-3C2.02 $name: $r", (r as? PreviousEvidenceReclamationResult.Rejected)?.reason is PreviousReclamationRejectionReason.InvalidSelection)
+            assertNull("D2B6/6-3C2.02 $name: noObservation", (r as PreviousEvidenceReclamationResult.Rejected).observation)
+            assertEquals("D2B6/6-3C2.02 $name: noWrite", writes, next.storage.writes)
+            assertEquals("D2B6/6-3C2.02 $name: fileUnchanged", before, disk())
+        }
         // Selected raw row claims the CURRENT tracker lifetime: not a previous-lifetime selection.
         val currentRow = obj(item.rawApplied.toPayloadEntry().fields) {
             this["ownerTrackingLifetimeId"] = JsonPrimitive(tracker(next).lifetimeId.value) }

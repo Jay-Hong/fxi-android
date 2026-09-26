@@ -353,7 +353,8 @@ class PreviousSettlementReclamationContractTest {
         val a = Applied(rn()); val b = Applied(rl(L.spec(target = ControlObligationFixtures.node(L.nullKrx)), "RETIRED_NULL-c"))
         val record = withRows(withSeals(a.record, arr(a.record, sealKey) + b.seals), arr(a.record, evidenceKey) + b.row)
         assertTrue("D2B6/6-3C1.14 empty", invalid(decide(record, PreviousEvidenceSelection(emptyList()))))
-        assertTrue("D2B6/6-3C1.14 lifecycle", invalid(decide(record, selection(a.item(), PreviousEvidenceSelection.Item.Lifecycle(b.c.id, node(b.row))))))
+        // 6-4aC: Lifecycle items are supported; a Lifecycle item carrying a Settlement row is a wrong-kind selection.
+        assertTrue("D2B6/6-3C1.14 lifecycleWrongKind", invalid(decide(record, selection(a.item(), PreviousEvidenceSelection.Item.Lifecycle(b.c.id, node(b.row))))))
         // Same command twice with disjoint seals, so only the duplicate-command rule applies.
         assertTrue("D2B6/6-3C1.14 duplicateCommand", invalid(decide(record, selection(a.item(),
             PreviousEvidenceSelection.Item.Settlement(a.c.id, node(a.row), b.seals.map { node(it) })))))
