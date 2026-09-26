@@ -125,6 +125,11 @@ class ControlOwnerStructureTest {
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore",
                 "remove(DataStoreAccessEpochStore.READ_BARRIER)",
             ),
+            // 6-3B1: the settlement consumption return validator compares the same way.
+            "main/java/com/jay/fxi/data/entitlements/control/ControlSettlementConsumption.kt" to listOf(
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore",
+                "remove(DataStoreAccessEpochStore.READ_BARRIER)",
+            ),
             "main/java/com/jay/fxi/data/entitlements/control/NamespaceSettlementTransition.kt" to listOf(
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.ENTRY_SEPARATOR",
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.FIELD_SEPARATOR",
