@@ -517,4 +517,51 @@ class PreviousEvidenceReclamationOwnerContractTest {
             DependencyGapSource.Adoption(1)), (r as? PreviousEvidenceReclamationResult.Rejected)?.reason)
         assertEquals("D2B6/6-3C2.16: recordUntouched", withoutBarrier(before), withoutBarrier(disk()))
     }
+
+    // ── 6-3E (completion gaps): T8.2 previous Mutations/Rotation/Lifecycle rows and an unrelated seal survive ────
+    @Test fun C2_17_previousMutationsRotationLifecycleRowsAndAnUnrelatedSealSurvive() = runBlocking {
+        val (next, c) = previous(rn()); val item = itemFor(c)
+        // A real previous Rotation bundle over seal "c", applied in another file by another (previous) tracker.
+        val holder = TemporaryFolder().also { it.create() }
+        val other = ControlStoreTestStorage(File(holder.root, "rotation.preferences_pb"))
+        val rotation = try {
+            other.data.updateData { NamespaceSettlementFixtures.raw("[${NamespaceSettlementFixtures.krx}]") }
+            val r = other.control.prepareRotation(listOf(node(NamespaceSettlementFixtures.krx)), NamespaceSettlementFixtures.fence,
+                NamespaceSettlementFixtures.life, NamespaceSettlementFixtures.demand)
+            check(controlTestTimeout("rotation execute") { other.control.execute(r, NamespaceSettlementFixtures.context) } is ControlStoreResult.Confirmed)
+            val p = controlTestTimeout("rotation read") { other.raw() }
+            Triple(r.id, arr(p, evidenceKey).single { cmd(it) == r.id }, arr(p, sealKey).single { op(it) == r.id })
+        } finally { other.close(); holder.delete() }
+        val old = c.ownerTrackingLifetimeId.value
+        val mutations = Json.parseToJsonElement("""{"version":2,"commandId":"m-old","ownerTrackingLifetimeId":"$old","kind":"MUTATIONS","targets":[{"index":0,"kind":"DEMAND","id":"x-demand","joined":false,"written":true}]}""")
+        val lifecycle = Json.parseToJsonElement(ControlLifecycleEvidenceFixtures.wire(command = "lc-old", lifetime = old))
+        val unrelated = Json.parseToJsonElement("""{"id":"free","kind":"NULL_NAMESPACE","ownerUid":"Q","axis":"USER"}""")
+        next.data.updateData { p -> p.toMutablePreferences().apply {
+            this[evidenceKey] = JsonArray(arr(p, evidenceKey) + rotation.second + mutations + lifecycle).toString()
+            this[sealKey] = JsonArray(arr(p, sealKey) + rotation.third + unrelated).toString() }.toPreferences() }
+        val before = disk()
+        check(arr(before, evidenceKey).size == 4 && arr(before, sealKey).size == 3) { "fixture: merged record" }
+        assertReclaimed("17", next, reclaim(next, selection(item)), oracle(before, c.id), listOf(c.id), PreviousReclamationDisposition.RemovedNow)
+        val after = disk()
+        assertEquals("D2B6/6-3C2.17 previousRowsKept", listOf(rotation.first, "m-old", "lc-old"), arr(after, evidenceKey).map { cmd(it) })
+        assertEquals("D2B6/6-3C2.17 otherSealsKept", listOf(rotation.third, unrelated), arr(after, sealKey).toList())
+    }
+
+    // ── 6-3E: T8.6 a Settlement ref closed in the old lifetime is refused by its own terminal gate after restart ─
+    @Test fun C2_18_aClosedOldSettlementRefIsRefusedByItsTerminalGate() = runBlocking {
+        for (k in listOf(rn(), cn(), rl())) {
+            newFile(); val o = open(); o.data.updateData { k.raw }
+            val c = applyOld(o, k)
+            val declared = RotationConsumption(resultConsumed = true, followUpCompletedOrDurablyOwned = true)
+            val done = controlTestTimeout("old consume") { o.control.completeSettlementAfterConsumption(c, TerminationClosures.of(c), declared) }
+            check(done is ControlCompletionResult.Completed && c.lifecycleState == ControlCommandLifecycle.TERMINATED) { "fixture ${k.name}: $done" }
+            val next = open(); val before = disk(); val writes = next.storage.writes
+            val r = controlTestTimeout("old execute") { next.control.execute(c, k.context) }
+            assertTrue("D2B6/6-3C2.18 ${k.name}: terminated $r", r is ControlStoreResult.Terminated)
+            assertEquals("D2B6/6-3C2.18 ${k.name}: noWrite", writes, next.storage.writes)
+            assertEquals("D2B6/6-3C2.18 ${k.name}: fileUnchanged", before, disk())
+            assertEquals("D2B6/6-3C2.18 ${k.name}: lifetimeGate", IllegalStateException::class.java,
+                runCatching { tracker(next).registerPrepared(c) }.exceptionOrNull()?.javaClass)
+        }
+    }
 }

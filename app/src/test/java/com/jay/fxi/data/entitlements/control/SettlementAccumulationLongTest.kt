@@ -260,6 +260,10 @@ class SettlementAccumulationLongTest {
             val result = control.execute(command, context)
             assertTrue("$profile/$shape/$index Confirmed: $result", result is ControlStoreResult.Confirmed)
             assertNotNull("handover receipt", (result as ControlStoreResult.Confirmed).handoverSettlement)
+            // T10.2: the caller re-confirms the settled witness before consuming the receipt.
+            val reconfirmed = control.execute(command, context)
+            assertTrue("$profile/$shape/$index reconfirmed: $reconfirmed", reconfirmed is ControlStoreResult.Confirmed)
+            assertNotNull("reconfirmed handover receipt", (reconfirmed as ControlStoreResult.Confirmed).handoverSettlement)
             val applied = record()
             assertEquals("own Applied added", 1, rows(applied).count { rowCommand(it) == command.id })
             assertEquals("own settled seals added", active.size, seals(applied).count { operation(it) == command.id })
@@ -319,6 +323,7 @@ class SettlementAccumulationLongTest {
             "Settlement accumulation T10: ${Shape.entries.size} shapes x ${Profile.entries.size} profiles x 256 = ${Shape.entries.size * Profile.entries.size * 256} full cycles",
             "profileFields=sealIds,ownerUid(record/fence/context/demand/seals),originLifetimeId; N newEpochs=canonical name UUIDs derived from profile+shape+axis+cycle; operationId/demandId=UUID",
             "N companionEpoch=current record fence each cycle; journal keys reuse owner|axis|null. R reuses owner|USER|retiredEpoch and L reuses departedOwner|axis|null; journal fixed after cycle 1",
+            "cycle: apply -> witness reconfirmation (second execute) -> receipt consumption -> reclamation",
             "caveat: writes and elapsedMs include fixture REQUEST deletion writes for R-demand and N; they are not store-only figures"
         )
         val representative = listOf(Shape.R_DEMAND, Shape.N_BOTH, Shape.L_BOTH)
