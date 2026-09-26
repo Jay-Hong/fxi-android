@@ -347,6 +347,9 @@ class ControlNeverConfirmBoundaryContractTest {
         assertEquals("D2B6/T4.$id: observedApplied", observedFirst, f.history(c).observedApplied.get())
         assertPendingKept(id, f, c, descriptor)
         assertEquals("D2B6/T4.$id: noContentWrite", withoutBarrier(before), withoutBarrier(f.storage.raw()))
+        // 6-1 completion (§8 T4 "Confirm 미요청"): pending() left the read-back armed, so any management Confirm would
+        // write the read barrier. The whole record, barrier included, is therefore unchanged only if none was requested.
+        assertEquals("D2B6/T4.$id: noConfirmRequested", before, f.storage.raw())
     }
     @Test fun T4_60_retryUnrelatedArrayUninterpretable() = runBlocking {
         retryGate("60", RecoveryReason.UninterpretableObligations, false) { p, _ -> p[ControlStoreTestStorage.DEMAND] = "[17]" }

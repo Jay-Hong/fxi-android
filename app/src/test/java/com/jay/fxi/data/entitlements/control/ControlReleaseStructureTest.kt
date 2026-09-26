@@ -166,6 +166,9 @@ class ControlReleaseStructureTest {
         for (method in listOf("publishPendingTermination", "finishTermination", "bindTerminationDescriptor"))
             assertEquals(method, 1, all.getValue(control + "ControlRecordStore.kt").let { Regex("\\b$method\\(").findAll(it).count() })
         assertEquals(mapOf(control + "ControlRecordStore.kt" to 3), SealSourceTripwire.occurrences(all, "terminationAttempt"))
+        // 6-1 completion (§7 "finishTermination 1곳"): one declaration and one owner call across every production file.
+        assertEquals(mapOf(control + "ControlCommandTracking.kt" to 1, control + "ControlRecordStore.kt" to 1),
+            SealSourceTripwire.occurrences(all, "finishTermination"))
         // The only termination transitions happen in terminationAttempt, reached only after the entry acquired c's lease.
         for (entry in listOf("suspend fun abandonBeforeFirstConfirm(", "suspend fun retryTermination(")) {
             val body = member(store, entry)
@@ -175,8 +178,10 @@ class ControlReleaseStructureTest {
         }
         val attempt = member(store, "private suspend fun terminationAttempt(")
         val steps = listOf("tracked.bindTerminationDescriptor(", "tracking.publishPendingTermination(command)",
-            "command.beginTermination()", "RecordTransactionDecision.Confirm(", "command.completeTermination()",
-            "tracking.finishTermination(tracked)")
+            "command.beginTermination()", "RecordTransactionDecision.Confirm(",
+            // 6-1 completion (§7 same strength as release): the returned snapshot is verified before the terminal step.
+            "check(ControlReleaseCandidate.hasAbsencePostcondition(returned, command))", "\"termination confirmation changed unrelated values\"",
+            "command.completeTermination()", "tracking.finishTermination(tracked)")
         assertTrue(steps.filterNot { attempt.contains(it) }.toString(), steps.all { attempt.contains(it) })
         assertEquals(steps.map { attempt.indexOf(it) }.sorted(), steps.map { attempt.indexOf(it) })
     }
