@@ -314,4 +314,103 @@ class PreviousLifecycleReclamationContractTest {
         assertTrue("D2B6/6-4aC.09 retryAbsent commandId: $d", d is PreviousSettlementEvidenceReclamation.Decision.Rejected &&
             d.reason is RejectionReason.InvalidRequest)
     }
+
+    // ── 6-4aE (completion gaps T8/T9) ──────────────────────────────────────────────────────────────────────────
+    /** A previous RETIRED_NULL settlement (real, old tracker) plus one foreign previous Lifecycle row in the same file. */
+    private suspend fun mixed(): Triple<ControlStoreTestStorage, PreviousEvidenceSelection.Item.Settlement, PreviousEvidenceSelection.Item.Lifecycle> {
+        newFile(); val o = open()
+        val L = RetiredNullFixtures; val s = L.spec()
+        o.data.updateData { L.raw(s) }
+        val sc = tracker(o).registerPrepared(CommandRef(s.operationId, ControlCommandBody.SettleRetiredNull(s), tracker(o).lifetimeId))
+        check(controlTestTimeout("settle") { o.control.execute(sc, L.context) } is ControlStoreResult.Confirmed)
+        val next = open()
+        val l = foreignLifecycleRow(writer(LifecycleTransition.RECOVER_INTENT)); withRows(next, l)
+        val p = disk()
+        val sRow = arr(p, evidenceKey).single { cmd(it) == sc.id }
+        val sSeals = arr(p, sealKey).filter { op(it) == sc.id }
+        return Triple(next, PreviousEvidenceSelection.Item.Settlement(sc.id, node(sRow.toString()), sSeals.map { node(it.toString()) }),
+            PreviousEvidenceSelection.Item.Lifecycle(cmd(l), node(l.toString())))
+    }
+    private suspend fun edit(next: ControlStoreTestStorage, change: (androidx.datastore.preferences.core.MutablePreferences) -> Unit) =
+        next.data.updateData { it.toMutablePreferences().apply(change).toPreferences() }
+    @Test fun PL_10_mixedSelectionPartialAbsenceReplacementAndFirstCallAbsence() = runBlocking {
+        run { // Retry: S gone (row and seals), L still present → held.
+            val (next, si, li) = mixed()
+            edit(next) { p -> p[evidenceKey] = JsonArray(arr(p.toPreferences(), evidenceKey).filter { cmd(it) != si.commandId }).toString()
+                p[sealKey] = JsonArray(arr(p.toPreferences(), sealKey).filter { op(it) != si.commandId }).toString() }
+            kept("10 retrySOnlyGone", next, selection(si, li), retry = true) {
+                it is PreviousEvidenceReclamationResult.RecoveryRequired && it.reason == RecoveryReason.InconsistentReclamation }
+        }
+        run { // Retry: L gone, S still present → held.
+            val (next, si, li) = mixed()
+            edit(next) { p -> p[evidenceKey] = JsonArray(arr(p.toPreferences(), evidenceKey).filter { cmd(it) != li.commandId }).toString() }
+            kept("10 retryLOnlyGone", next, selection(si, li), retry = true) {
+                it is PreviousEvidenceReclamationResult.RecoveryRequired && it.reason == RecoveryReason.InconsistentReclamation }
+        }
+        run { // First call: both gone → Conflict (no absence confirmation outside retry).
+            val (next, si, li) = mixed()
+            edit(next) { p -> p[evidenceKey] = JsonArray(arr(p.toPreferences(), evidenceKey).filter { cmd(it) != si.commandId && cmd(it) != li.commandId }).toString()
+                p[sealKey] = JsonArray(arr(p.toPreferences(), sealKey).filter { op(it) != si.commandId }).toString() }
+            kept("10 firstCallAbsent", next, selection(si, li)) { it is PreviousEvidenceReclamationResult.Conflict }
+        }
+        run { // S seal replaced (its witness changed) alongside a valid L → Conflict, nothing removed.
+            val (next, si, li) = mixed()
+            edit(next) { p -> p[sealKey] = JsonArray(arr(p.toPreferences(), sealKey).map { if (op(it) == si.commandId) obj(it) {
+                this["settlement"] = obj(getValue("settlement")) { this["originLifetimeId"] = JsonPrimitive("changed-origin") } } else it }).toString() }
+            kept("10 sSealReplaced", next, selection(si, li)) { it is PreviousEvidenceReclamationResult.Conflict }
+        }
+        run { // S seal partly gone (two-NULL bundle, one seal removed) alongside a valid L → held.
+            newFile(); val o = open()
+            val L = RetiredNullFixtures; val s = L.both()
+            o.data.updateData { L.raw(s) }
+            val sc = tracker(o).registerPrepared(CommandRef(s.operationId, ControlCommandBody.SettleRetiredNull(s), tracker(o).lifetimeId))
+            check(controlTestTimeout("settle both") { o.control.execute(sc, L.context) } is ControlStoreResult.Confirmed)
+            val next = open()
+            val l = foreignLifecycleRow(writer(LifecycleTransition.REMOVE_EMPTY_GUARD)); withRows(next, l)
+            val p = disk()
+            val sRow = arr(p, evidenceKey).single { cmd(it) == sc.id }
+            // Seals in the row's canonical sealIds order (USER first), as the eligibility check requires.
+            val sSeals = sRow.jsonObject.getValue("sealIds").jsonArray.map { sid ->
+                arr(p, sealKey).single { it.jsonObject.getValue("id").jsonPrimitive.content == sid.jsonPrimitive.content } }
+            check(sSeals.size == 2) { "fixture: two seals" }
+            val sel = selection(PreviousEvidenceSelection.Item.Settlement(sc.id, node(sRow.toString()), sSeals.map { node(it.toString()) }),
+                PreviousEvidenceSelection.Item.Lifecycle(cmd(l), node(l.toString())))
+            edit(next) { q -> q[sealKey] = JsonArray(arr(q.toPreferences(), sealKey).drop(1)).toString() }
+            kept("10 sSealPartial", next, sel) {
+                it is PreviousEvidenceReclamationResult.RecoveryRequired && it.reason == RecoveryReason.InconsistentReclamation }
+        }
+    }
+    @Test fun PL_11_readFaultCancellationBeforeTheCandidateAndABadReturn() = runBlocking {
+        // A fresh old-tracker Lifecycle row, the SAME file then reopened behind a TerminationBoundary.
+        suspend fun previousBehindBoundary(w: LifecycleWriters.Writer): Triple<ControlStoreTestStorage, TerminationBoundary, CommandRef> {
+            newFile(); val o = open(); val c = w.confirm(o); opened?.close()
+            lateinit var b: TerminationBoundary
+            val next = ControlStoreTestStorage(file) { TerminationBoundary(it).also { x -> b = x } }.also { opened = it }
+            return Triple(next, b, c)
+        }
+        run { // Initial read failure: Unconfirmed, nothing written; the same selection then succeeds.
+            val (next, b, c) = previousBehindBoundary(writer(LifecycleTransition.UPDATE_AUTH)); val before = disk(); val sel = selection(lItem(c))
+            b.failNextBeforeSnapshot = true
+            val r = reclaim(next, sel)
+            assertTrue("D2B6/6-4aC.11 readFault: $r", r is PreviousEvidenceReclamationResult.Unconfirmed)
+            assertEquals("D2B6/6-4aC.11 readFault untouched", before, disk())
+            assertReclaimed("11 afterReadFault", next, reclaim(next, sel), oracle(before, c.id), listOf(c.id), PreviousReclamationDisposition.RemovedNow)
+        }
+        run { // Cancellation before the candidate: propagates, nothing written; the same selection then succeeds.
+            val (next, b, c) = previousBehindBoundary(writer(LifecycleTransition.SETTLE_QUERY)); val before = disk(); val sel = selection(lItem(c))
+            val reached = kotlinx.coroutines.CompletableDeferred<Unit>(); val release = kotlinx.coroutines.CompletableDeferred<Unit>()
+            b.gate = reached to release
+            val caller = async { next.control.reclaimPreviousSettlementOrLifecycleEvidence(sel, closure(next, sel)) }
+            try { withTimeout(10_000) { reached.await() }; caller.cancelAndJoin(); assertTrue(caller.isCancelled) }
+            finally { release.complete(Unit); caller.cancelAndJoin() }
+            assertEquals("D2B6/6-4aC.11 cancel untouched", before, disk())
+            assertReclaimed("11 afterCancel", next, reclaim(next, sel), oracle(before, c.id), listOf(c.id), PreviousReclamationDisposition.RemovedNow)
+        }
+        run { // A return that does not match the confirmed candidate is an invariant failure.
+            val (next, b, c) = previousBehindBoundary(writer(LifecycleTransition.RECOVER_HOLD)); val sourceEvidence = checkNotNull(disk()[evidenceKey])
+            b.afterReturn = { p -> p.toMutablePreferences().apply { this[evidenceKey] = sourceEvidence }.toPreferences() }
+            val failure = runCatching { reclaim(next, selection(lItem(c))) }.exceptionOrNull()
+            assertEquals("D2B6/6-4aC.11 badReturn", IllegalStateException::class.java, failure?.javaClass)
+        }
+    }
 }

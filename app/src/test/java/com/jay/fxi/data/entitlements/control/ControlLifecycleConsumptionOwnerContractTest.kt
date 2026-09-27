@@ -546,4 +546,49 @@ class ControlLifecycleConsumptionOwnerContractTest {
         gapOnly("bindingLifetimeOnly", project(ref, exact(closure(ref, lifetime = OwnerTrackingLifetimeId.issue()).binding())))
         gapOnly("bindingScopeOnly", project(ref, exact(closure(ref, scope = ref.id + "-other").binding())))
     }
+
+    // ── 6-4aE (completion gaps T5/T6) ──────────────────────────────────────────────────────────────────────────
+    @Test fun LB_22_aGapCarriesItsExactSourceAndATerminatedDependentNoLongerBlocks() = runBlocking {
+        val f = fixture(); val c = confirmed(f); val m = f.mutations()
+        ControlReleaseFixtures.pending(m); f.addPending(m)
+        refusedByDependency("22 exactSource", f, c) { it == CompletionRejectionReason.DependencyUnknown(m.id,
+            m.ownerTrackingLifetimeId.value, DependencyGapSource.ReleaseDescriptor(null)) }
+        // Each call captures the dependent's (state, body) once; after the dependent closes, the next capture is Known(empty).
+        // (An interleaving inside one owner decision has no test hook; the per-call capture rule is DependencyProjection T7_07.)
+        ControlReleaseFixtures.released(m)
+        val before = f.disk()
+        assertConsumed("22 afterTerminal", f, c, consume(f, c), expectedAfterDeletion(before, c))
+    }
+    @Test fun LB_23_aRealSuccessorWriterConsumesQ1sTargetAndQ1IsStillConsumed() = runBlocking {
+        val f = fixture(); val q1 = confirmed(f, W.all.single { it.transition == LifecycleTransition.REBIND_REQUESTS })
+        // Q2: SETTLE_QUERY removes the REQUEST Q1 rebound (Q1's current target postcondition disappears).
+        val a = DemandAuthFixtures
+        val rebound = node(arr(f.disk(), demandKey).single { it.jsonObject.getValue("id").jsonPrimitive.content == "r" }.toString())
+        val g = a.guard()
+        f.edit { p -> p[demandKey] = JsonArray(arr(p.toPreferences(), demandKey) + Json.parseToJsonElement(g.toPayloadEntry().fields.toString())).toString() }
+        // Q1 raised the rebound REQUEST at order 21, so Q2 answers a later query (order 30).
+        val later = a.query.copy(order = EventOrderV1(a.life, 30))
+        val q2 = f.store.prepareSettleQuery(listOf(rebound), g, null, a.binding, a.decision(q = later), LifecycleOrderSource(a.life, 31))
+        val r2 = controlTestTimeout("q2") { f.store.execute(q2, a.context(a.runtime(registrations = listOf(LifecycleQueryRegistration("query-21", later))))) }
+        check(r2 is ControlStoreResult.Confirmed) { "fixture: Q2 $r2" }
+        check(arr(f.disk(), demandKey).none { it.jsonObject.getValue("id").jsonPrimitive.content == "r" }) { "fixture: Q1 target gone" }
+        val before = f.disk()
+        assertConsumed("23", f, q1, consume(f, q1), expectedAfterDeletion(before, q1))
+        assertTrue("D2B6/6-4aB.23 q2Untouched", f.tracker.findPrepared(q2) != null && arr(f.disk(), evidenceKey).any { rowCommand(it) == q2.id })
+    }
+    @Test fun LB_24_afterRecoverHoldGuardJournalAndEpochChangesOnlyTheAppliedRowIsConsumed() = runBlocking {
+        val f = fixture(); val c = confirmed(f, W.all.single { it.transition == LifecycleTransition.RECOVER_HOLD })
+        // Another actor later rewrote the guard, rotated the USER epoch and appended a journal line.
+        f.edit { p ->
+            val rows = arr(p.toPreferences(), demandKey).map { row ->
+                if (row.jsonObject.getValue("id").jsonPrimitive.content == "g")
+                    Json.parseToJsonElement(DemandAuthFixtures.guard(id = "g").toPayloadEntry().fields.toString()) else row }
+            p[demandKey] = JsonArray(rows).toString()
+            p[com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.USER_EPOCH] = "rotated-after-hold"
+            val journal = com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.PURGE_JOURNAL
+            p[journal] = (listOfNotNull(p[journal]?.takeIf { it.isNotEmpty() }) + "Q|||USER").joinToString("\n")
+        }
+        val before = f.disk()
+        assertConsumed("24", f, c, consume(f, c), expectedAfterDeletion(before, c))
+    }
 }
