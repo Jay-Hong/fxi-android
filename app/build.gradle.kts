@@ -320,6 +320,24 @@ tasks.register<org.gradle.api.tasks.testing.Test>("testSettlementAccumulation") 
     testLogging.showStandardStreams = true
 }
 
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    if (name != "testLifecycleAccumulation") {
+        filter.excludeTestsMatching("*.LifecycleAccumulationLongTest")
+    }
+}
+tasks.register<org.gradle.api.tasks.testing.Test>("testLifecycleAccumulation") {
+    val debugUnitTestForAccumulation = tasks.named<org.gradle.api.tasks.testing.Test>("testDebugUnitTest")
+    group = "verification"
+    description = "Runs only the opt-in lifecycle accumulation suite"
+    dependsOn("compileDebugUnitTestKotlin", "compileDebugUnitTestJavaWithJavac", "processDebugUnitTestJavaRes")
+    testClassesDirs = files(debugUnitTestForAccumulation.map { it.testClassesDirs })
+    classpath = files(debugUnitTestForAccumulation.map { it.classpath })
+    filter.includeTestsMatching("*.LifecycleAccumulationLongTest")
+    filter.isFailOnNoMatchingTests = true
+    systemProperty("fxi.lifecycle.report", layout.buildDirectory.file("reports/lifecycle-accumulation.txt").get().asFile.absolutePath)
+    testLogging.showStandardStreams = true
+}
+
 val verifyProductionGoogleServicesConfig = {
     check(Files.isRegularFile(productionGoogleServicesPath, LinkOption.NOFOLLOW_LINKS)) {
         "Public release requires a regular, non-symlink app/google-services.json; " +
