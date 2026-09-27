@@ -4,7 +4,10 @@ import androidx.datastore.preferences.core.Preferences
 import com.jay.fxi.data.entitlements.control.ControlObligationFixtures.literal
 import com.jay.fxi.data.entitlements.control.ControlObligationFixtures.node
 import com.jay.fxi.data.entitlements.control.TerminationClosures.of as closure
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
@@ -554,7 +557,7 @@ class ControlLifecycleConsumptionOwnerContractTest {
         refusedByDependency("22 exactSource", f, c) { it == CompletionRejectionReason.DependencyUnknown(m.id,
             m.ownerTrackingLifetimeId.value, DependencyGapSource.ReleaseDescriptor(null)) }
         // Each call captures the dependent's (state, body) once; after the dependent closes, the next capture is Known(empty).
-        // (An interleaving inside one owner decision has no test hook; the per-call capture rule is DependencyProjection T7_07.)
+        // LB_25 covers the same-call interleaving; T7_07 covers projection of the captured view.
         ControlReleaseFixtures.released(m)
         val before = f.disk()
         assertConsumed("22 afterTerminal", f, c, consume(f, c), expectedAfterDeletion(before, c))
@@ -590,5 +593,74 @@ class ControlLifecycleConsumptionOwnerContractTest {
         }
         val before = f.disk()
         assertConsumed("24", f, c, consume(f, c), expectedAfterDeletion(before, c))
+    }
+
+    // ── 6-4aF (completion judgment r3, Codex's exact test): the same-decision terminal race ──────────────────────
+    @Test fun LB_25_aCapturedPendingDependentStillBlocksAfterTerminalInTheSameDecision() = runBlocking {
+        val f = fixture()
+        val c = confirmed(f)
+        val dependent = f.mutations()
+        val tracked = f.history(dependent)
+
+        // A pending dependent with a missing descriptor has a broad, blocking gap.
+        dependent.beginTermination()
+        f.tracker.publishPendingTermination(dependent)
+        f.armReadBack()
+        val before = f.storage.raw()
+        val beforeDisk = f.disk()
+        val beforeWork = f.tracker.recoverySnapshot()
+
+        val enteredProjection = CountDownLatch(1)
+        val continueProjection = CountDownLatch(1)
+        tracked.targets.set(object : AbstractList<ControlCommandTarget?>() {
+            override val size: Int
+                get() {
+                    enteredProjection.countDown()
+                    check(continueProjection.await(10, TimeUnit.SECONDS)) {
+                        "projection was not released"
+                    }
+                    return 1
+                }
+
+            override fun get(index: Int): ControlCommandTarget? {
+                require(index == 0)
+                return null
+            }
+        })
+
+        val call = async(Dispatchers.IO) {
+            controlTestTimeout("LB_25 owner call", 30_000) {
+                f.store.completeLifecycleAfterConsumption(c, closure(c), declared)
+            }
+        }
+        try {
+            assertTrue("projection reached after capture",
+                enteredProjection.await(10, TimeUnit.SECONDS))
+            assertEquals(ControlCommandLifecycle.TERMINATION_PENDING, dependent.lifecycleState)
+            dependent.completeTermination()
+            f.tracker.finishTermination(tracked)
+            assertEquals(ControlCommandLifecycle.TERMINATED, dependent.lifecycleState)
+            assertNull(dependent.captureStateAndBody().body)
+        } finally {
+            continueProjection.countDown()
+        }
+
+        val result = call.await()
+        assertEquals(
+            CompletionRejectionReason.DependencyUnknown(
+                dependent.id,
+                dependent.ownerTrackingLifetimeId.value,
+                DependencyGapSource.TerminationDescriptor
+            ),
+            (result as? ControlCompletionResult.Rejected)?.reason
+        )
+        assertEquals(ControlCommandLifecycle.RETAINED, c.lifecycleState)
+        assertNull(f.history(c).terminationDescriptor)
+        assertEquals(before, f.storage.raw())
+        assertEquals(beforeDisk, f.disk())
+        val afterWork = f.tracker.recoverySnapshot()
+        assertEquals(beforeWork.unresolvedCommands, afterWork.unresolvedCommands)
+        assertEquals(beforeWork.pendingReleases - dependent, afterWork.pendingReleases)
+        assertTrue(f.tracker.executing.isEmpty())
     }
 }

@@ -247,6 +247,8 @@ class ControlReleaseStructureTest {
         assertFalse("S3: no lease", g11.contains("executing"))
         assertEquals("S3: one capture", 1, Regex("captureStateAndBody\\(\\)").findAll(g11).count())
         assertFalse("S3: no body re-read", g11.contains("dependent.body") || g11.contains(".captureStateAndBody().body"))
+        // 6-4aF: nor a state re-read — a dependent that turns terminal after its capture is judged by the captured view.
+        assertFalse("S3: no state re-read", g11.contains("dependent.lifecycleState") || g11.contains(".captureStateAndBody().state"))
         assertEquals("S3: candidates enumerated once", 1, Regex("dependencyCandidatesExcluding\\(").findAll(g11).count())
         // S5: ordinary release takes Mutations only (behavior: HandoverCombinedTest R/N/L, CurrentNullOwnerTest).
         assertEquals(1, all.getValue(control + "ControlCommandReleaseDecision.kt").lineSequence().count {
