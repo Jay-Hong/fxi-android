@@ -46,6 +46,12 @@ import org.junit.rules.TemporaryFolder
  *    entry before reading latest; G05 does not prove the external purge (P03, N13).
  *  - A valid multi-link chain is not constructible inside one exact command's fixed sources for these three transitions, so
  *    the contract pins continuity only negatively (N11a/N11b).
+ * 6-4bA3c (6-4bA3 consensus r5 N10) adds the G05 floor boundary rows F01–F05 for a single RECOVER_HOLD: an invalid now is
+ * G05.lowerBound on every floor slot; another boot or a regressed reading applies the confirmed output tuple's full wait
+ * (and the latest guard's, computed with the same now); a latest guard without its floor field is G05.destination plus the
+ * G05.confirmation of every token bound to the rewritten guard row, not G05.lowerBound; a same-boot output tuple whose
+ * remaining is 0 is still accepted as DurablyOwned. Cross-command floor transfer and the combined max with another
+ * untransferred source are A3d (N11), not claimed here.
  * The implementation thread reads but does not edit this file.
  */
 class NamedChainHandoffContractTest {
@@ -170,8 +176,8 @@ class NamedChainHandoffContractTest {
         SlotHandoff(it.key, given[it.key] ?: HandoffDisposition.CompletedAndConsumed(ComponentCompletion(it.key.subject), emptyList()))
     }
     private fun assess(run: Run, given: Map<RequiredObligationKey, HandoffDisposition>,
-        latest: ControlRecordRead = run.confirmed.snapshot.record) = assessG05(run.c, run.a1,
-        CompletionHandoff(run.a1.commandBinding, owner(run), slots(run, given)), TerminationClosures.of(run.c), latest, now)
+        latest: ControlRecordRead = run.confirmed.snapshot.record, at: BootReading = now) = assessG05(run.c, run.a1,
+        CompletionHandoff(run.a1.commandBinding, owner(run), slots(run, given)), TerminationClosures.of(run.c), latest, at)
     private fun accepted(r: G05Result) = assertEquals(G05Result.Accepted, r)
     private fun rejected(r: G05Result, expected: List<G05Failure>) {
         assertTrue("expected Rejected, got $r", r is G05Result.Rejected)
@@ -585,5 +591,46 @@ class NamedChainHandoffContractTest {
             (link2.source as TypedSourceTuple.Request).preimage.toPayloadEntry())
         rejected(assess(run, rebindGiven(run, first) + (reqN(run) to chain(rPayload, listOf(first, link2), link2.confirmation))),
             listOf(f(G05Id.CONFIRMATION, run, reqN(run)), f(G05Id.LOWER_BOUND, run, reqN(run), rowAt(run.confirmed.snapshot.record, "r"))))
+    }
+
+    // ═══ 6-4bA3c: G05 floor boundary (consensus r5 N10) ══════════════════════════════════════════════════════════════
+    private fun floorSlots(run: Run) = listOf(hfL(run), hfN(run), gfL(run), gfN(run))
+
+    @Test fun F01_recover_invalidNow_lowerBoundOnEveryFloorSlot() = runReleaseTest {
+        val run = recoverHold(); val latest = afterPurge(run); val a = rowAt(latest, "g")
+        for (invalid in listOf(BootReading("", 20_000), BootReading("boot", -1)))
+            rejected(assess(run, recoverGiven(run), latest, invalid), floorSlots(run).map { f(G05Id.LOWER_BOUND, run, it, a) })
+    }
+
+    /**
+     * Another or an unknown boot: no elapsed time is credited, so the output tuple's full 29000 is required — and the
+     * unchanged guard has it.
+     */
+    @Test fun F02_recover_nowInAnotherOrUnknownBoot_outputFullWait_accepted() = runReleaseTest {
+        val run = recoverHold(); val latest = afterPurge(run)
+        for (other in listOf(BootReading("other-boot", 5), BootReading(null, 5)))
+            accepted(assess(run, recoverGiven(run), latest, other))
+    }
+
+    /** A reading before the anchor in the same boot is a regression: full wait on both sides, not the HOLD's old 30000. */
+    @Test fun F03_recover_regressedNowInTheSameBoot_outputFullWait_accepted() = runReleaseTest {
+        val run = recoverHold()
+        accepted(assess(run, recoverGiven(run), afterPurge(run), BootReading("boot", 5_000)))
+    }
+
+    /** Remaining 0 does not make the floor optional: without the field the guard is no floor destination for any floor slot. */
+    @Test fun F04_recover_latestGuardWithoutFloor_destinationAndConfirmation_noLowerBound() = runReleaseTest {
+        val run = recoverHold()
+        val latest = rewritten(afterPurge(run), "g") { H.field(it, "floor", null) }
+        val a = rowAt(latest, "g")
+        rejected(assess(run, recoverGiven(run), latest, BootReading("boot", 40_000)),
+            floorSlots(run).map { f(G05Id.DESTINATION, run, it, a) } +
+                (floorSlots(run) + listOf(authL(run), authN(run))).map { f(G05Id.CONFIRMATION, run, it, a) })
+    }
+
+    /** Same boot, 29000 elapsed since the 11000 anchor: the output tuple's remaining is 0 and it is still DurablyOwned. */
+    @Test fun F05_recover_sameBootOutputRemainingZero_stillAccepted() = runReleaseTest {
+        val run = recoverHold()
+        accepted(assess(run, recoverGiven(run), afterPurge(run), BootReading("boot", 40_000)))
     }
 }
