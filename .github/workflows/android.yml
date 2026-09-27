@@ -33,6 +33,15 @@ jobs:
       # provider is not cache-equivalent. Keep that migration separate from Node 24.
       - uses: gradle/actions/setup-gradle@v5
 
+      # CI 전용 Kotlin 데몬 힙: 세 변형 시험 컴파일 태스크가 수 초 간격으로 로그에 기록된 뒤 4g 로 OOM 이 났고(2026-09-27
+      # run 36304799327 attempt 1·2), compileBenchmarkUnitTestKotlin 출력 뒤 약 41분 무출력 상태에서 45분 job 제한에 도달한 시점에 취소된 적도 있다(제한에 따른 것으로 추정)
+      # (36283759393 attempt 1, OOM 기록은 없음). 사용자 홈 설정이 저장소
+      # gradle.properties 보다 우선하므로 로컬 개발 환경은 4g 그대로다. 첫 Gradle 실행 전에 둔다.
+      - name: Set CI Kotlin daemon heap
+        run: |
+          mkdir -p "$HOME/.gradle"
+          printf '%s\n' 'kotlin.daemon.jvmargs=-Xmx6g -Dfile.encoding=UTF-8' >> "$HOME/.gradle/gradle.properties"
+
       # 계획 S0 DoD: hosted runner가 실제로 사용하는 Gradle/JVM을 evidence에 남긴다.
       - name: Verify Gradle and JVM
         run: ./gradlew --version
