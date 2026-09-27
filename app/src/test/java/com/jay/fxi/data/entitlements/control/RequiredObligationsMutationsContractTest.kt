@@ -28,7 +28,7 @@ import org.junit.Test
  *  - An Edit whose before node is uninterpretable reports BEFORE, not AFTER (fixedSources order WHOLE → BEFORE → AFTER).
  *  - A joined target is valid only for a SEAL Add whose adopted seal has the target's id, the prepared key, and no
  *    settlement. An empty Mutations body → FIXED_INPUT_INCONSISTENT at (COMMAND, null, WHOLE) (6-4bA1a measurement r1).
- * Rotation, Settlement and Lifecycle inputs → UNSUPPORTED_IN_THIS_UNIT at (COMMAND, null, WHOLE) until 6-4bA1c.
+ * Lifecycle inputs → UNSUPPORTED_IN_THIS_UNIT at (COMMAND, null, WHOLE) until 6-4bA1c (Rotation/Settlement: 6-4bA1b contract).
  * The implementation thread reads but does not edit this file.
  */
 class RequiredObligationsMutationsContractTest {
@@ -514,17 +514,11 @@ class RequiredObligationsMutationsContractTest {
         unavailable(previous(b), RequiredObligationsUnavailable.PREPARED_ACTION_UNINTERPRETABLE, at)
     }
 
-    // ═══ other branches are outside 6-4bA1a ═════════════════════════════════════════════════════════════════════════════
-    @Test fun X01_otherBranchesUnsupportedInThisUnit() {
-        val fence = FenceV1("A", "u", "k")
+    // ═══ other branches ════════════════════════════════════════════════════════════════════════════════════════════════
+    // 6-4bA1b implements Rotation and Settlement (RequiredObligationsSettlementContractTest); Lifecycle stays unsupported until 6-4bA1c.
+    @Test fun X01_lifecycleUnsupportedInThisUnit() {
         val lifecycle = ControlCommandBody.Lifecycle(ControlLifecycleDescriptor("op-l", LifecycleTransition.REMOVE_EMPTY_GUARD, listOf()))
-        val rotation = ControlCommandBody.RotateAndSettle(RotateAndSettleNamespaces(listOf(), fence, life,
-            SettlementDemand("A", 3, EventOrderV1(life, 4), RefreshIntent.FORCE_PREMIUM), "op-r", "d", "u2", null))
-        val handover = ControlCommandBody.SettleRetiredNull(RetiredNullSettlement(listOf(), fence, SettlementExecutor("A", 3, life), "op-h"))
-        val inputs = listOf(
-            RequirementInput.Lifecycle(CommandRef("op-l", lifecycle, OwnerTrackingLifetimeId.issue()), lifecycle),
-            RequirementInput.Rotation(CommandRef("op-r", rotation, OwnerTrackingLifetimeId.issue()), rotation),
-            RequirementInput.Settlement(CommandRef("op-h", handover, OwnerTrackingLifetimeId.issue()), handover))
-        for (input in inputs) unavailable(input, RequiredObligationsUnavailable.UNSUPPORTED_IN_THIS_UNIT, command)
+        unavailable(RequirementInput.Lifecycle(CommandRef("op-l", lifecycle, OwnerTrackingLifetimeId.issue()), lifecycle),
+            RequiredObligationsUnavailable.UNSUPPORTED_IN_THIS_UNIT, command)
     }
 }

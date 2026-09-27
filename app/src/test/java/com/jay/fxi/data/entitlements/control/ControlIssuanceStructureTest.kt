@@ -190,7 +190,8 @@ class ControlIssuanceStructureTest {
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,
                 control + "NamespaceSettlementTransition.kt" to 5,
-                control + "ControlRotationConsumption.kt" to 1), // 6-2B: the fixed input parameter of the consumption decision.
+                control + "ControlRotationConsumption.kt" to 1,
+                control + "RequiredObligations.kt" to 1), // 6-4bA1b: the fixed rotation fact.
             "ControlCommandTracking" to mapOf(control + "ControlCommandTracking.kt" to 4, control + "ControlRecordStore.kt" to 1),
             "EpochIdGenerator.Random" to mapOf("main/java/com/jay/fxi/di/EntitlementsModule.kt" to 1, ent + "DataStoreAccessEpochStore.kt" to 1),
             "UUID::randomUUID" to mapOf(control + "ControlRecordStore.kt" to 1),
@@ -203,7 +204,8 @@ class ControlIssuanceStructureTest {
             "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 5,
                 control + "ControlStoreResult.kt" to 1, control + "ControlAppliedEvidence.kt" to 1,
                 control + "DependencyProjection.kt" to 2, // 6-2C1: the ExactEvidenceAndSeals projection also names the Rotation body.
-                control + "RequiredObligations.kt" to 1) // 6-4bA1a: the Rotation requirement input's fixed body type.
+                control + "RequiredObligations.kt" to 1,
+                control + "RequiredNamedObligations.kt" to 1) // 6-4bA1b: the named rotation derivation.
         )
 
         private fun productionRoot(): File = SealSourceTripwire.sourceRoot(

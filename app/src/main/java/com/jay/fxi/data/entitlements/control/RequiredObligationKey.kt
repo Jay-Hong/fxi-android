@@ -13,6 +13,7 @@ internal sealed interface ObligationRole {
 }
 
 internal sealed interface ObligationSubject {
+    data class NamedRequest(val demandId: String?) : ObligationSubject
     data class Request(val id: String, val ownerUid: String?, val binding: Long,
         val raisedAt: EventOrderV1) : ObligationSubject
     data class Seal(val id: String, val kind: SealTargetKind, val key: SealKey) : ObligationSubject

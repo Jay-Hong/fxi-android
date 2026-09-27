@@ -69,6 +69,8 @@ internal data class FixedInputLocation(
 )
 
 internal sealed interface FixedSourceFact {
+    data class RotationInput(val value: RotateAndSettleNamespaces) : FixedSourceFact
+    data class SettlementInput(val value: HandoverSettlementInput) : FixedSourceFact
     data class Mutation(val value: ControlMutation) : FixedSourceFact
     data class Node(val kind: ControlKind, val value: ControlNode) : FixedSourceFact
     data class Adoption(val value: ControlCommandTarget) : FixedSourceFact
@@ -251,7 +253,9 @@ internal fun deriveRequiredObligations(
     input: RequirementInput
 ): RequirementDerivation = when (input) {
     is RequirementInput.Mutations -> deriveMutationObligations(input)
-    is RequirementInput.Rotation, is RequirementInput.Settlement, is RequirementInput.Lifecycle ->
+    is RequirementInput.Rotation -> deriveRotationObligations(input)
+    is RequirementInput.Settlement -> deriveSettlementObligations(input)
+    is RequirementInput.Lifecycle ->
         RequirementDerivation.Unavailable(RequiredObligationsUnavailable.UNSUPPORTED_IN_THIS_UNIT,
             FixedInputLocation(FixedInputRoot.COMMAND, null, FixedInputFacet.WHOLE))
 }
