@@ -10,6 +10,7 @@ internal sealed interface ObligationRole {
     data object Rotation : ObligationRole
     data class Settlement(val transition: HandoverSettlementTransition) : ObligationRole
     data class Lifecycle(val transition: LifecycleTransition, val role: LifecycleRole) : ObligationRole
+    data class LifecycleCommand(val transition: LifecycleTransition) : ObligationRole
 }
 
 internal sealed interface ObligationSubject {
@@ -27,10 +28,11 @@ internal sealed interface ObligationSubject {
     data class Auth(val ownerUid: String, val binding: Long,
         val origin: LifetimeId, val generation: Long) : ObligationSubject
     data class NamedEffect(val operationId: String, val effectIndex: Int) : ObligationSubject
+    data class ExactTarget(val kind: ControlKind, val id: String) : ObligationSubject
 }
 
 internal enum class ObligationComponent {
-    REQUEST, SOURCE, SEAL, JOURNAL, FLOOR, AUTH, BINDING,
+    REQUEST, SOURCE, SEAL, JOURNAL, FLOOR, AUTH, BINDING, QUERY,
     NAMESPACE_RETIREMENT, DURABLE_EFFECT, RECEIPT
 }
 internal data class RequiredObligationKey(

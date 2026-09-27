@@ -1,6 +1,5 @@
 package com.jay.fxi.data.entitlements.control
 
-import com.jay.fxi.data.entitlements.PurgeScope
 import com.jay.fxi.data.entitlements.RefreshIntent
 import java.util.Collections
 
@@ -79,6 +78,7 @@ internal sealed interface FixedSourceFact {
     data class Demand(val value: SettlementDemand) : FixedSourceFact
     data class Executor(val value: SettlementExecutor) : FixedSourceFact
     data class LifecycleTarget(val value: LifecycleFixedTarget) : FixedSourceFact
+    data class LifecyclePlan(val value: ControlLifecycleDescriptor) : FixedSourceFact
     data class Namespace(val value: LifecycleNamespacePostcondition) : FixedSourceFact
     data class Binding(val value: LifecycleBinding) : FixedSourceFact
     data class BindingClosure(val value: LifecycleBindingClosure) : FixedSourceFact
@@ -96,32 +96,6 @@ internal data class FixedSourceEvidence(
     val location: FixedInputLocation,
     val fact: FixedSourceFact
 )
-
-internal data class QueryDuty(
-    val transition: LifecycleTransition,
-    val ordinal: Int
-) : ObligationRole
-
-internal data class BindingDuty(
-    val transition: LifecycleTransition,
-    val ordinal: Int
-) : ObligationRole
-
-internal data class ReceiptDuty(
-    val transition: LifecycleTransition,
-    val ordinal: Int
-) : ObligationRole
-
-internal data class RetirementDuty(
-    val commandKind: FixedCommandKind,
-    val sourceOrdinal: Int?,
-    val axis: PurgeScope
-) : ObligationRole
-
-internal data class DecisionEffectDuty(
-    val transition: LifecycleTransition,
-    val effectIndex: Int
-) : ObligationRole
 
 internal data class QueryScope(
     val registration: LifecycleQueryRegistration,
@@ -153,6 +127,13 @@ internal data class DecisionEffectScope(
     val effectIndex: Int,
     val kind: ControlKind,
     val node: ControlNode
+) : ObligationSubject
+
+internal data class DecisionNamespaceScope(
+    val operationId: String,
+    val queryId: String,
+    val before: FenceV1,
+    val after: FenceV1
 ) : ObligationSubject
 
 internal sealed interface RequiredLowerBound {
@@ -187,6 +168,7 @@ internal sealed interface RequiredLowerBound {
     data class Receipt(val scope: ReceiptScope) : RequiredLowerBound
     data class NamespaceRetirement(val scope: RetirementScope) : RequiredLowerBound
     data class DecisionEffect(val required: LifecycleDurableEffect) : RequiredLowerBound
+    data class DecisionNamespace(val before: FenceV1, val after: FenceV1) : RequiredLowerBound
 }
 
 internal enum class AllowedSlotDisposition {
@@ -255,9 +237,7 @@ internal fun deriveRequiredObligations(
     is RequirementInput.Mutations -> deriveMutationObligations(input)
     is RequirementInput.Rotation -> deriveRotationObligations(input)
     is RequirementInput.Settlement -> deriveSettlementObligations(input)
-    is RequirementInput.Lifecycle ->
-        RequirementDerivation.Unavailable(RequiredObligationsUnavailable.UNSUPPORTED_IN_THIS_UNIT,
-            FixedInputLocation(FixedInputRoot.COMMAND, null, FixedInputFacet.WHOLE))
+    is RequirementInput.Lifecycle -> deriveLifecycleObligations(input)
 }
 
 private fun deriveMutationObligations(input: RequirementInput.Mutations): RequirementDerivation {
