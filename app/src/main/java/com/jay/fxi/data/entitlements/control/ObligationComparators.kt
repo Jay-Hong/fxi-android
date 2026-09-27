@@ -24,7 +24,7 @@ internal sealed interface TypedComparison {
 internal data class RequestNeed(val source: DemandV1, val minIntent: RefreshIntent,
     val minOrder: EventOrderV1)
 
-private fun RefreshIntent.strength(): Int = when (this) {
+internal fun RefreshIntent.strength(): Int = when (this) {
     RefreshIntent.IF_STALE -> 0
     RefreshIntent.FORCE_ENTITLEMENTS -> 1
     RefreshIntent.FORCE_PREMIUM -> 2
@@ -41,6 +41,32 @@ internal fun compareRequest(need: RequestNeed, actual: DemandV1): TypedCompariso
     if (actual.intent.strength() < maxOf(source.intent.strength(), need.minIntent.strength()))
         return TypedComparison.Mismatch(RequestField.INTENT)
     if (actual.raisedAt.value < maxOf(source.raisedAt.value, need.minOrder.value))
+        return TypedComparison.Mismatch(RequestField.ORDER)
+    return TypedComparison.Matches
+}
+
+internal fun compareNamedRequest(need: RequestNeed, terminalLink: NamedTransferLink,
+    actual: DemandV1): TypedComparison {
+    val source = terminalLink.source as? TypedSourceTuple.Request
+        ?: return TypedComparison.Unavailable(TypedUnavailableReason.NAMED_LINK_REQUIRED)
+    val destination = terminalLink.destination as? TypedDestinationTuple.Request
+        ?: return TypedComparison.Unavailable(TypedUnavailableReason.NAMED_LINK_REQUIRED)
+    if (need.source != source.parsed)
+        return TypedComparison.Unavailable(TypedUnavailableReason.NAMED_LINK_REQUIRED)
+    val original = source.parsed
+    val output = destination.parsed
+    if (need.minOrder.value < 0 || original.raisedAt.value < 0 || output.raisedAt.value < 0 ||
+        need.minOrder.origin != original.raisedAt.origin && need.minOrder.origin != output.raisedAt.origin)
+        return TypedComparison.Unavailable(TypedUnavailableReason.INVALID_INPUT)
+    if (actual.ownerUid != original.ownerUid) return TypedComparison.Mismatch(RequestField.OWNER)
+    if (actual.id != original.id) return TypedComparison.Mismatch(RequestField.SUBJECT)
+    if (actual.binding != output.binding || actual.raisedAt.origin != output.raisedAt.origin)
+        return TypedComparison.Unavailable(TypedUnavailableReason.REBIND_UNSUPPORTED)
+    if (actual.intent.strength() < maxOf(original.intent.strength(), need.minIntent.strength()))
+        return TypedComparison.Mismatch(RequestField.INTENT)
+    if (need.minOrder.origin == original.raisedAt.origin && original.raisedAt.value < need.minOrder.value ||
+        need.minOrder.origin == output.raisedAt.origin && actual.raisedAt.value < need.minOrder.value ||
+        actual.raisedAt.value != output.raisedAt.value)
         return TypedComparison.Mismatch(RequestField.ORDER)
     return TypedComparison.Matches
 }

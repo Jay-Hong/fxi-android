@@ -301,14 +301,30 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
             return confirmRetained(slot, destination, observed.value, observed.evidence)
         }
 
-        private fun retainedSourceRequired(slot: RequiredSlot): Boolean =
-            when ((slot.requirement as? SlotRequirement.Required)?.lowerBound) {
+        private fun retainedSourceRequired(slot: RequiredSlot): Boolean {
+            val requirement = slot.requirement as? SlotRequirement.Required ?: return false
+            return when (val bound = requirement.lowerBound) {
                 is RequiredLowerBound.Hold, is RequiredLowerBound.ExactSource ->
                     slot.key.component == ObligationComponent.SOURCE
                 is RequiredLowerBound.Floor -> slot.key.component == ObligationComponent.FLOOR
                 is RequiredLowerBound.Auth -> slot.key.component == ObligationComponent.AUTH
                 is RequiredLowerBound.Journal -> slot.key.component == ObligationComponent.JOURNAL
+                is RequiredLowerBound.Intent -> slot.key.component == ObligationComponent.SOURCE &&
+                    hasOriginalSourceRow(requirement, ControlKind.RECOVERY_INTENT)
+                is RequiredLowerBound.Seal -> slot.key.component == ObligationComponent.SEAL &&
+                    hasOriginalSourceRow(requirement, ControlKind.SEAL)
+                is RequiredLowerBound.Request -> slot.key.component == ObligationComponent.REQUEST &&
+                    bound.source != null && hasOriginalSourceRow(requirement, ControlKind.DEMAND)
                 else -> false
+            }
+        }
+
+        private fun hasOriginalSourceRow(requirement: SlotRequirement.Required, kind: ControlKind): Boolean =
+            requirement.fixedSources.any { fixed ->
+                (fixed.location.facet == FixedInputFacet.SOURCE || fixed.location.facet == FixedInputFacet.BEFORE) &&
+                    (fixed.fact as? FixedSourceFact.Node)?.let { node ->
+                        node.kind == kind && ControlObligations.read(kind, node.value) is ControlEntryRead.Interpreted
+                    } == true
             }
 
         private fun originalSourceRow(requirement: SlotRequirement.Required, kind: ControlKind,
@@ -368,6 +384,29 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                     destination == DestinationLocator.Payload(bound.kind, bound.id) &&
                     originalSourceRow(requirement, bound.kind, bound.id)?.toPayloadEntry() ==
                         bound.node.toPayloadEntry()
+                is RequiredLowerBound.Intent -> subject == ObligationSubject.Intent(bound.source.id,
+                    bound.source.sessionId, bound.source.ownerUid, bound.source.axis, bound.source.targetEpoch) &&
+                    destination == DestinationLocator.Payload(ControlKind.RECOVERY_INTENT, bound.source.id) &&
+                    originalSourceRow(requirement, ControlKind.RECOVERY_INTENT, bound.source.id)?.let {
+                        (ControlObligations.read(ControlKind.RECOVERY_INTENT, it) as? ControlEntryRead.Interpreted)
+                            ?.value == bound.source
+                    } == true
+                is RequiredLowerBound.Seal -> subject == ObligationSubject.Seal(bound.source.id,
+                    bound.source.kind, bound.source.key) &&
+                    destination == DestinationLocator.Payload(ControlKind.SEAL, bound.source.id) &&
+                    originalSourceRow(requirement, ControlKind.SEAL, bound.source.id)?.let {
+                        (ControlObligations.read(ControlKind.SEAL, it) as? ControlEntryRead.Interpreted)
+                            ?.value == bound.source
+                    } == true
+                is RequiredLowerBound.Request -> bound.source?.let { source ->
+                    subject == ObligationSubject.Request(source.id, source.ownerUid, source.binding, source.raisedAt) &&
+                        destination == DestinationLocator.Payload(ControlKind.DEMAND, bound.requiredId) &&
+                        source.id == bound.requiredId && source.ownerUid == bound.ownerUid &&
+                        originalSourceRow(requirement, ControlKind.DEMAND, source.id)?.let {
+                            (ControlObligations.read(ControlKind.DEMAND, it) as? ControlEntryRead.Interpreted)
+                                ?.value == source
+                        } == true
+                } == true
                 else -> false
             }
             if (!subjectMatches) return reject(RetainedConfirmationFailure.SUBJECT_OR_BOUND_MISMATCH)
@@ -376,8 +415,11 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                     val found = read.locations(destination.id).singleOrNull()
                     val entry = found?.second as? ControlEntryRead.Interpreted
                     val original = originalSourceRow(requirement, destination.kind, destination.id)
-                    if (entry == null || !retainedRowMatches(bound, entry) ||
-                        (bound is RequiredLowerBound.Hold || bound is RequiredLowerBound.Floor) &&
+                    if (entry == null ||
+                        (bound !is RequiredLowerBound.Intent && !retainedRowMatches(bound, entry)) ||
+                        (bound is RequiredLowerBound.Hold || bound is RequiredLowerBound.Floor ||
+                            bound is RequiredLowerBound.Intent || bound is RequiredLowerBound.Seal ||
+                            bound is RequiredLowerBound.Request) &&
                         entry.original.toPayloadEntry() != original?.toPayloadEntry()) null
                     else RetainedDestinationTuple.Payload(destination, entry.original)
                 }
@@ -414,6 +456,16 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                     else -> false
                 }
                 is RequiredLowerBound.ExactSource -> entry.original.toPayloadEntry() == bound.node.toPayloadEntry()
+                is RequiredLowerBound.Seal -> (entry.value as? SealV1)?.let {
+                    compareSeal(bound.source.copy(settlement = bound.requiredSettlement), it) == TypedComparison.Matches
+                } == true
+                is RequiredLowerBound.Request -> (entry.value as? DemandV1)?.let { actual ->
+                    val source = bound.source
+                    source != null && actual.binding == bound.binding && actual.ownerUid == bound.ownerUid &&
+                        actual.id == bound.requiredId &&
+                        compareRequest(RequestNeed(source, bound.minimumIntent, bound.minimumOrder), actual) ==
+                        TypedComparison.Matches
+                } == true
                 else -> false
             }
     }
@@ -425,8 +477,7 @@ internal enum class NamedTransferFailureKind {
     DESTINATION_MISMATCH,
     OWNER_MISMATCH,
     CONFIRMATION_MISMATCH,
-    REQUEST_INTENT_OR_GRANT,
-    RELATED_EFFECT_MISMATCH
+    REQUEST_INTENT_OR_GRANT
 }
 
 internal sealed interface NamedTransferFailure {
@@ -451,7 +502,126 @@ internal class NamedTransferLink private constructor(
             fixedSource: TypedSourceTuple,
             destination: TypedDestinationTuple,
             confirmation: PriorStorageConfirmation
-        ): NamedTransferResult = TODO("A3 named issuer")
+        ): NamedTransferResult {
+            fun invalid(kind: NamedTransferFailureKind) =
+                NamedTransferResult.Rejected(NamedTransferFailure.Invalid(kind))
+            fun sameRow(a: ControlNode?, b: ControlNode?): Boolean =
+                a?.toPayloadEntry() == b?.toPayloadEntry()
+
+            val binding = confirmation.binding as? ConfirmationBinding.LifecycleOutput
+                ?: return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
+            val fixed = binding.fixed
+            val selected = fixed.targets.singleOrNull { it.target == binding.outputTarget }
+            val supported = selected != null && when (fixed.transition) {
+                LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.END_AUTH_BINDING ->
+                    fixedSource is TypedSourceTuple.Request && destination is TypedDestinationTuple.Request
+                LifecycleTransition.RECOVER_HOLD ->
+                    (fixedSource is TypedSourceTuple.HoldFloor || fixedSource is TypedSourceTuple.GuardFloor) &&
+                        destination is TypedDestinationTuple.GuardFloor
+                else -> false
+            }
+            if (!supported) return invalid(NamedTransferFailureKind.UNSUPPORTED_TRANSITION_OR_REPLACEMENT)
+            val row = checkNotNull(selected)
+            val recovery = fixed.recoverHold
+            val hold = fixed.targets.singleOrNull {
+                it.role == LifecycleRole.HOLD && it.target.effect == LifecycleEffect.REMOVE
+            }
+            val recoverySourceMatches = recovery != null && hold != null &&
+                hold.target.kind == ControlKind.HOLD &&
+                sameRow(recovery.input.source, hold.before) && hold.after == null &&
+                sameRow(recovery.input.guard, row.before) &&
+                fixed.executor == recovery.input.binding.executor
+
+            val sourceMatches = when (fixedSource) {
+                is TypedSourceTuple.Request -> {
+                    val before = demand(fixedSource.preimage)
+                    val after = demand(row.after)
+                    row.target.kind == ControlKind.DEMAND &&
+                        before == fixedSource.parsed && sameRow(fixedSource.preimage, row.before) &&
+                        after != null && after.id == before.id && after.ownerUid == before.ownerUid
+                }
+                is TypedSourceTuple.HoldFloor -> {
+                    recoverySourceMatches &&
+                        hold.target.id == fixedSource.source.sourceId &&
+                        sameRow(fixedSource.source.originalHold, hold.before) &&
+                        sameRow(fixedSource.oldGuard, row.before) &&
+                        fixedSource.mergeNow == recovery.input.mergeNow &&
+                        fixedSource.executorOrigin == recovery.input.binding.executor.originLifetimeId
+                }
+                is TypedSourceTuple.GuardFloor ->
+                    recoverySourceMatches && row.target.kind == ControlKind.DEMAND &&
+                        sameRow(fixedSource.preimage, row.before) &&
+                        fixedSource.parsed.floor != null &&
+                        guard(fixedSource.preimage) == fixedSource.parsed
+            }
+            if (!sourceMatches) return invalid(NamedTransferFailureKind.SOURCE_MISMATCH)
+
+            val destinationMatches = when (destination) {
+                is TypedDestinationTuple.Request ->
+                    destination.locator.kind == ControlKind.DEMAND &&
+                        destination.locator.id == destination.parsed.id &&
+                        demand(destination.row) == destination.parsed
+                is TypedDestinationTuple.GuardFloor ->
+                    destination.locator.part == GuardPart.FLOOR &&
+                        destination.locator.id == destination.parsed.id &&
+                        destination.parsed.floor != null &&
+                        guard(destination.row) == destination.parsed
+            }
+            if (!destinationMatches) return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+            if (fixedSource.responsibilityOwner.trackingLifetime !== binding.command.ownerTrackingLifetimeId ||
+                fixedSource.responsibilityOwner.ownerKey.isBlank())
+                return invalid(NamedTransferFailureKind.OWNER_MISMATCH)
+
+            val confirmed = binding.output
+            if (!sameRow(confirmed.row, destination.row))
+                return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
+
+            if (fixedSource is TypedSourceTuple.Request && destination is TypedDestinationTuple.Request) {
+                val source = fixedSource.parsed
+                val actual = destination.parsed
+                val executor = fixed.executor
+                    ?: return invalid(NamedTransferFailureKind.REQUEST_INTENT_OR_GRANT)
+                val grant = fixed.demandAuth?.grants?.get(source.id)
+                    ?: return invalid(NamedTransferFailureKind.REQUEST_INTENT_OR_GRANT)
+                val minimum = fixedSource.minimumOrder
+                val minOrderMet = when (minimum.origin) {
+                    source.raisedAt.origin -> source.raisedAt.value >= minimum.value
+                    actual.raisedAt.origin -> actual.raisedAt.value >= minimum.value
+                    else -> false
+                }
+                if (source.raisedAt.value < 0 || minimum.value < 0 ||
+                    actual.ownerUid != executor.ownerUid ||
+                    actual.binding != executor.binding ||
+                    actual.raisedAt.origin != executor.originLifetimeId ||
+                    actual.raisedAt.origin != grant.origin || actual.raisedAt.value != grant.value ||
+                    actual.intent.strength() < source.intent.strength() ||
+                    actual.intent.strength() < fixedSource.minimumIntent.strength() || !minOrderMet)
+                    return invalid(NamedTransferFailureKind.REQUEST_INTENT_OR_GRANT)
+            }
+            if (fixedSource is TypedSourceTuple.HoldFloor && destination is TypedDestinationTuple.GuardFloor) {
+                when (val result = validHoldReanchor(fixedSource.source, fixedSource.oldGuard,
+                    fixedSource.mergeNow, fixedSource.executorOrigin, destination.locator.id, destination.row)) {
+                    is ReanchorValidation.Invalid ->
+                        return NamedTransferResult.Rejected(NamedTransferFailure.Reanchor(result.field))
+                    is ReanchorValidation.Valid -> Unit
+                }
+            }
+            if (fixedSource is TypedSourceTuple.GuardFloor && destination is TypedDestinationTuple.GuardFloor) {
+                val input = checkNotNull(recovery).input
+                val parsedHold = HoldRecoverySource.from(input.source)?.hold
+                    ?: return invalid(NamedTransferFailureKind.SOURCE_MISMATCH)
+                val floor = parsedHold.floor ?: return invalid(NamedTransferFailureKind.SOURCE_MISMATCH)
+                val source = FloorSource(parsedHold.id, input.source, parsedHold, floor, input.guard)
+                when (val result = validHoldReanchor(source, input.guard, input.mergeNow,
+                    input.binding.executor.originLifetimeId, destination.locator.id, destination.row)) {
+                    is ReanchorValidation.Invalid ->
+                        return NamedTransferResult.Rejected(NamedTransferFailure.Reanchor(result.field))
+                    is ReanchorValidation.Valid -> Unit
+                }
+            }
+            return NamedTransferResult.Issued(NamedTransferLink(fixed.transition, fixedSource, destination,
+                fixedSource.responsibilityOwner, confirmation))
+        }
     }
 }
 
