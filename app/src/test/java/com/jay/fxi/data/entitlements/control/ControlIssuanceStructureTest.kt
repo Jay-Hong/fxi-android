@@ -202,7 +202,8 @@ class ControlIssuanceStructureTest {
             // 6-2B: consume entry, retry dispatch and the attempt's consumption branch each name the Rotation body (2 → 5).
             "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 5,
                 control + "ControlStoreResult.kt" to 1, control + "ControlAppliedEvidence.kt" to 1,
-                control + "DependencyProjection.kt" to 2) // 6-2C1: the ExactEvidenceAndSeals projection also names the Rotation body.
+                control + "DependencyProjection.kt" to 2, // 6-2C1: the ExactEvidenceAndSeals projection also names the Rotation body.
+                control + "RequiredObligations.kt" to 1) // 6-4bA1a: the Rotation requirement input's fixed body type.
         )
 
         private fun productionRoot(): File = SealSourceTripwire.sourceRoot(
