@@ -28,7 +28,7 @@ import org.junit.Test
  *  - An Edit whose before node is uninterpretable reports BEFORE, not AFTER (fixedSources order WHOLE → BEFORE → AFTER).
  *  - A joined target is valid only for a SEAL Add whose adopted seal has the target's id, the prepared key, and no
  *    settlement. An empty Mutations body → FIXED_INPUT_INCONSISTENT at (COMMAND, null, WHOLE) (6-4bA1a measurement r1).
- * Lifecycle inputs → UNSUPPORTED_IN_THIS_UNIT at (COMMAND, null, WHOLE) until 6-4bA1c (Rotation/Settlement: 6-4bA1b contract).
+ * Other branches: 6-4bA1b (Rotation/Settlement) and 6-4bA1c-1/-2 (Lifecycle) contracts; X01 locks that no branch is unsupported.
  * The implementation thread reads but does not edit this file.
  */
 class RequiredObligationsMutationsContractTest {
@@ -515,10 +515,10 @@ class RequiredObligationsMutationsContractTest {
     }
 
     // ═══ other branches ════════════════════════════════════════════════════════════════════════════════════════════════
-    // 6-4bA1b implements Rotation and Settlement (RequiredObligationsSettlementContractTest); Lifecycle stays unsupported until 6-4bA1c.
-    @Test fun X01_lifecycleUnsupportedInThisUnit() {
+    // Every branch is implemented since 6-4bA1c-2: a Lifecycle descriptor without its named plan ends in PLAN_MISSING.
+    @Test fun X01_lifecycleWithoutPlan_isPlanMissing() {
         val lifecycle = ControlCommandBody.Lifecycle(ControlLifecycleDescriptor("op-l", LifecycleTransition.REMOVE_EMPTY_GUARD, listOf()))
         unavailable(RequirementInput.Lifecycle(CommandRef("op-l", lifecycle, OwnerTrackingLifetimeId.issue()), lifecycle),
-            RequiredObligationsUnavailable.UNSUPPORTED_IN_THIS_UNIT, command)
+            RequiredObligationsUnavailable.PLAN_MISSING, loc(FixedInputRoot.LIFECYCLE_PLAN, null, FixedInputFacet.WHOLE))
     }
 }

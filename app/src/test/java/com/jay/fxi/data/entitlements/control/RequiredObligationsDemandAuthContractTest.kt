@@ -608,12 +608,12 @@ class RequiredObligationsDemandAuthContractTest {
         unavailable(lifecycleInput(p.descriptor(op)), inconsistent, FixedInputRoot.LIFECYCLE_PLAN, null, FixedInputFacet.BINDING)
     }
 
-    // ═══ the other three transitions stay outside 6-4bA1c-1 ═════════════════════════════════════════════════════════════
-    @Test fun X03_removeEmptyGuardRecoverHoldRecoverIntentUnsupported() {
+    // ═══ the other three transitions (6-4bA1c-2): without their named plan they end in PLAN_MISSING ═════════════════════════════════════════════════════════════
+    @Test fun X03_removeEmptyGuardRecoverHoldRecoverIntent_withoutPlan_arePlanMissing() {
         for (tr in listOf(LifecycleTransition.REMOVE_EMPTY_GUARD, LifecycleTransition.RECOVER_HOLD, LifecycleTransition.RECOVER_INTENT)) {
             val body = ControlCommandBody.Lifecycle(ControlLifecycleDescriptor("op-x", tr, listOf()))
             unavailable(RequirementInput.Lifecycle(CommandRef("op-x", body, OwnerTrackingLifetimeId.issue()), body),
-                RequiredObligationsUnavailable.UNSUPPORTED_IN_THIS_UNIT, FixedInputRoot.COMMAND, null, FixedInputFacet.WHOLE)
+                RequiredObligationsUnavailable.PLAN_MISSING, FixedInputRoot.LIFECYCLE_PLAN, null, FixedInputFacet.WHOLE)
         }
     }
 }

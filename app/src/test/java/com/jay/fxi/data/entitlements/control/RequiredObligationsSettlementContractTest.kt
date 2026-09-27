@@ -445,9 +445,9 @@ class RequiredObligationsSettlementContractTest {
         unavailable(settlement(ControlCommandBody.SettleRetiredNull(l)), inconsistent, settlementWhole)
     }
 
-    @Test fun X02_lifecycleStillUnsupportedInThisUnit() {
+    @Test fun X02_lifecycleWithoutPlan_isPlanMissing() {
         val body = ControlCommandBody.Lifecycle(ControlLifecycleDescriptor("op-l", LifecycleTransition.REMOVE_EMPTY_GUARD, listOf()))
         unavailable(RequirementInput.Lifecycle(CommandRef("op-l", body, OwnerTrackingLifetimeId.issue()), body),
-            RequiredObligationsUnavailable.UNSUPPORTED_IN_THIS_UNIT, command)
+            RequiredObligationsUnavailable.PLAN_MISSING, loc(FixedInputRoot.LIFECYCLE_PLAN, null, FixedInputFacet.WHOLE))
     }
 }

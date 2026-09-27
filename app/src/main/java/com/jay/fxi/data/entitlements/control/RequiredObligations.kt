@@ -215,8 +215,7 @@ internal enum class RequiredObligationsUnavailable {
     DECISION_MISSING,
     DECISION_EFFECT_MISSING,
     FIXED_INPUT_INCONSISTENT,
-    DUPLICATE_REQUIRED_KEY,
-    UNSUPPORTED_IN_THIS_UNIT // Removed when A1c implements the remaining branches.
+    DUPLICATE_REQUIRED_KEY
 }
 
 internal sealed interface RequirementDerivation {

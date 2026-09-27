@@ -24,12 +24,20 @@ internal fun deriveLifecycleObligations(input: RequirementInput.Lifecycle): Requ
     if (body !== input.body || body !is ControlCommandBody.Lifecycle)
         return lifecycleUnavailable(RequiredObligationsUnavailable.BODY_MISMATCH, FixedInputRoot.COMMAND)
     val descriptor = body.input
-    if (descriptor.transition !in setOf(LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.SETTLE_QUERY,
-            LifecycleTransition.UPDATE_AUTH, LifecycleTransition.END_AUTH_BINDING))
-        return lifecycleUnavailable(RequiredObligationsUnavailable.UNSUPPORTED_IN_THIS_UNIT, FixedInputRoot.COMMAND)
-    val plan = descriptor.demandAuth
-        ?: return lifecycleUnavailable(RequiredObligationsUnavailable.PLAN_MISSING, FixedInputRoot.LIFECYCLE_PLAN)
-    if (plan.preparationFailure != null)
+    val demandAuth = descriptor.transition in setOf(LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.SETTLE_QUERY,
+        LifecycleTransition.UPDATE_AUTH, LifecycleTransition.END_AUTH_BINDING)
+    val planPresent = when (descriptor.transition) {
+        LifecycleTransition.REMOVE_EMPTY_GUARD -> descriptor.removeEmptyGuard != null
+        LifecycleTransition.RECOVER_HOLD -> descriptor.recoverHold != null
+        LifecycleTransition.RECOVER_INTENT -> descriptor.recoverIntent != null
+        else -> descriptor.demandAuth != null
+    }
+    if (!planPresent) return lifecycleUnavailable(RequiredObligationsUnavailable.PLAN_MISSING, FixedInputRoot.LIFECYCLE_PLAN)
+    val writers = listOf(descriptor.demandAuth, descriptor.removeEmptyGuard, descriptor.recoverHold, descriptor.recoverIntent)
+    if (writers.count { it != null } != 1)
+        return lifecycleUnavailable(RequiredObligationsUnavailable.FIXED_INPUT_INCONSISTENT, FixedInputRoot.LIFECYCLE_PLAN)
+    if (descriptor.demandAuth?.preparationFailure != null || descriptor.recoverHold?.preparationProblem != null ||
+        descriptor.recoverIntent?.preparationProblem != null)
         return lifecycleUnavailable(RequiredObligationsUnavailable.FIXED_INPUT_INCONSISTENT, FixedInputRoot.LIFECYCLE_PLAN)
 
     // Interpret original rows before a shape failure can hide the more precise source location.
@@ -48,9 +56,17 @@ internal fun deriveLifecycleObligations(input: RequirementInput.Lifecycle): Requ
     if (!ControlLifecycleConfirmation(ControlPayloadCodec()).validDescriptor(descriptor))
         return lifecycleUnavailable(RequiredObligationsUnavailable.FIXED_INPUT_INCONSISTENT, FixedInputRoot.LIFECYCLE_PLAN)
 
+    val binding = ExactCommandBinding(input.exactCommand, body, FixedCommandKind.Lifecycle(descriptor.transition))
+    if (!demandAuth) return when (descriptor.transition) {
+        LifecycleTransition.REMOVE_EMPTY_GUARD -> deriveRemoveEmptyGuard(binding, descriptor)
+        LifecycleTransition.RECOVER_HOLD -> deriveRecoverHold(binding, descriptor)
+        LifecycleTransition.RECOVER_INTENT -> deriveRecoverIntent(binding, descriptor)
+        else -> error("Unexpected demand/auth transition")
+    }
+    val plan = checkNotNull(descriptor.demandAuth)
+
     val named = plan.descriptor(descriptor.operationId)
-    if (descriptor.transition != named.transition || descriptor.namespace != null ||
-        descriptor.removeEmptyGuard != null || descriptor.recoverHold != null || descriptor.recoverIntent != null)
+    if (descriptor.transition != named.transition || descriptor.namespace != null)
         return lifecycleUnavailable(RequiredObligationsUnavailable.FIXED_INPUT_INCONSISTENT, FixedInputRoot.LIFECYCLE_PLAN)
     if (descriptor.executor != named.executor)
         return lifecycleUnavailable(RequiredObligationsUnavailable.FIXED_INPUT_INCONSISTENT,
@@ -74,8 +90,211 @@ internal fun deriveLifecycleObligations(input: RequirementInput.Lifecycle): Requ
                 FixedInputRoot.LIFECYCLE_PLAN, facet = FixedInputFacet.BINDING)
     }
 
-    val binding = ExactCommandBinding(input.exactCommand, body, FixedCommandKind.Lifecycle(descriptor.transition))
     return LifecycleSlots(binding, descriptor, plan).build()
+}
+
+private fun deriveRemoveEmptyGuard(binding: ExactCommandBinding, descriptor: ControlLifecycleDescriptor): RequirementDerivation {
+    val plan = checkNotNull(descriptor.removeEmptyGuard)
+    val named = plan.descriptor(descriptor.operationId)
+    if (descriptor.executor != named.executor || descriptor.namespace != named.namespace)
+        return lifecycleUnavailable(RequiredObligationsUnavailable.FIXED_INPUT_INCONSISTENT, FixedInputRoot.LIFECYCLE_PLAN)
+    for ((root, actual, expected) in listOf(
+            Triple(FixedInputRoot.LIFECYCLE_TARGET, descriptor.targets, named.targets),
+            Triple(FixedInputRoot.LIFECYCLE_UNCHANGED, descriptor.requiredUnchanged, named.requiredUnchanged))) {
+        for (index in 0 until maxOf(actual.size, expected.size)) {
+            if (index >= actual.size || index >= expected.size || !sameFixedRow(actual[index], expected[index]))
+                return lifecycleUnavailable(RequiredObligationsUnavailable.FIXED_INPUT_INCONSISTENT, root, index)
+        }
+    }
+    if (!RemoveEmptyGuardTransition(ControlPayloadCodec()).empty(checkNotNull(descriptor.targets[0].before)))
+        return lifecycleUnavailable(RequiredObligationsUnavailable.FIXED_INPUT_INCONSISTENT,
+            FixedInputRoot.LIFECYCLE_TARGET, 0, FixedInputFacet.SOURCE)
+    return LifecycleRecoverySlots(binding, descriptor, listOf(fixedEvidence(FixedInputRoot.LIFECYCLE_PLAN,
+        null, FixedInputFacet.WHOLE, FixedSourceFact.LifecyclePlan(descriptor)))).remove()
+}
+
+private fun recoveryBase(descriptor: ControlLifecycleDescriptor, binding: LifecycleBinding,
+                         closure: HoldRecoveryClosure, mergeNow: BootReading?): List<FixedSourceEvidence> = buildList {
+    add(fixedEvidence(FixedInputRoot.LIFECYCLE_PLAN, null, FixedInputFacet.WHOLE, FixedSourceFact.LifecyclePlan(descriptor)))
+    add(fixedEvidence(FixedInputRoot.LIFECYCLE_PLAN, null, FixedInputFacet.BINDING, FixedSourceFact.Binding(binding)))
+    add(fixedEvidence(FixedInputRoot.LIFECYCLE_PLAN, null, FixedInputFacet.CLOSURE, FixedSourceFact.RecoveryClosure(closure)))
+    mergeNow?.let { add(fixedEvidence(FixedInputRoot.LIFECYCLE_PLAN, null, FixedInputFacet.FLOOR, FixedSourceFact.Boot(it))) }
+    val namespace = checkNotNull(descriptor.namespace)
+    add(fixedEvidence(FixedInputRoot.LIFECYCLE_NAMESPACE, null, FixedInputFacet.WHOLE, FixedSourceFact.Namespace(namespace)))
+    add(fixedEvidence(FixedInputRoot.LIFECYCLE_NAMESPACE, null, FixedInputFacet.BEFORE, FixedSourceFact.Fence(namespace.before)))
+    add(fixedEvidence(FixedInputRoot.LIFECYCLE_NAMESPACE, null, FixedInputFacet.AFTER, FixedSourceFact.Fence(namespace.after)))
+}
+
+private fun deriveRecoverHold(binding: ExactCommandBinding, descriptor: ControlLifecycleDescriptor): RequirementDerivation {
+    val plan = checkNotNull(descriptor.recoverHold)
+    if (!RecoverHoldTransition(ControlPayloadCodec()).validDescriptor(plan, descriptor))
+        return lifecycleUnavailable(RequiredObligationsUnavailable.FIXED_INPUT_INCONSISTENT, FixedInputRoot.LIFECYCLE_PLAN)
+    val base = recoveryBase(descriptor, plan.input.binding, plan.input.closure, plan.input.mergeNow)
+    return LifecycleRecoverySlots(binding, descriptor, base).hold(plan)
+}
+
+private fun deriveRecoverIntent(binding: ExactCommandBinding, descriptor: ControlLifecycleDescriptor): RequirementDerivation {
+    val plan = checkNotNull(descriptor.recoverIntent)
+    val base = recoveryBase(descriptor, plan.input.binding, plan.input.closure, null)
+    return LifecycleRecoverySlots(binding, descriptor, base).intent(plan)
+}
+
+/** Additional lifecycle transitions use their fixed source rows, never a current record or candidate. */
+private class LifecycleRecoverySlots(
+    private val binding: ExactCommandBinding,
+    private val descriptor: ControlLifecycleDescriptor,
+    private val base: List<FixedSourceEvidence>
+) {
+    private val slots = mutableListOf<RequiredSlot>()
+    private val keys = mutableSetOf<RequiredObligationKey>()
+    private var duplicate: FixedInputLocation? = null
+    private val commandRole = ObligationRole.LifecycleCommand(descriptor.transition)
+
+    private fun rowSources(root: FixedInputRoot, index: Int, row: LifecycleFixedTarget): List<FixedSourceEvidence> = buildList {
+        add(fixedEvidence(root, index, FixedInputFacet.WHOLE, FixedSourceFact.LifecycleTarget(row)))
+        (row.before ?: row.after)?.let { add(fixedEvidence(root, index, FixedInputFacet.SOURCE, FixedSourceFact.Node(row.target.kind, it))) }
+        row.after?.let { add(fixedEvidence(root, index, FixedInputFacet.AFTER, FixedSourceFact.Node(row.target.kind, it))) }
+    }
+
+    private fun pair(role: ObligationRole, subject: ObligationSubject, component: ObligationComponent,
+                     landing: RequiredLowerBound?, nonLanding: RequiredLowerBound?,
+                     landingAllowed: AllowedSlotDisposition = AllowedSlotDisposition.EITHER,
+                     nonLandingAllowed: AllowedSlotDisposition = AllowedSlotDisposition.EITHER,
+                     fixed: List<FixedSourceEvidence>, location: FixedInputLocation) {
+        val sources = Collections.unmodifiableList(fixed.toList())
+        for ((branch, bound, allowed) in listOf(
+                Triple(LandingBranch.L, landing, landingAllowed), Triple(LandingBranch.N, nonLanding, nonLandingAllowed))) {
+            val key = RequiredObligationKey(role, subject, component, branch)
+            if (!keys.add(key) && duplicate == null) duplicate = location
+            slots += RequiredSlot(key, if (bound == null) SlotRequirement.NotRequiredByContract(sources)
+                else SlotRequirement.Required(bound, allowed, sources))
+        }
+    }
+
+    private fun requiredPair(role: ObligationRole, subject: ObligationSubject, component: ObligationComponent,
+                             bound: RequiredLowerBound, fixed: List<FixedSourceEvidence>, location: FixedInputLocation,
+                             allowed: AllowedSlotDisposition = AllowedSlotDisposition.EITHER) =
+        pair(role, subject, component, bound, bound, allowed, allowed, fixed, location)
+
+    private fun sourceRow() = descriptor.targets[0]
+    private fun sourceFixed() = base + rowSources(FixedInputRoot.LIFECYCLE_TARGET, 0, sourceRow())
+
+    fun remove(): RequirementDerivation {
+        val row = sourceRow()
+        val source = checkNotNull(row.before)
+        val scope = ObligationSubject.ExactTarget(ControlKind.DEMAND, row.target.id)
+        pair(ObligationRole.Lifecycle(descriptor.transition, LifecycleRole.GUARD), scope, ObligationComponent.SOURCE,
+            RequiredLowerBound.ExactSource(ControlKind.DEMAND, row.target.id, source), null,
+            AllowedSlotDisposition.COMPLETED_AND_CONSUMED_ONLY, fixed = sourceFixed(),
+            location = lifecycleLocation(FixedInputRoot.LIFECYCLE_TARGET, 0))
+        return finish()
+    }
+
+    private fun retirement(source: RecoveryRetirementSource) {
+        val namespace = checkNotNull(descriptor.namespace)
+        val fixed = sourceFixed()
+        for (axis in source.axes.sortedBy { it.ordinal }) {
+            val key = JournalTargetV1(source.ownerUid, axis, source.targetEpoch(axis))
+            requiredPair(commandRole, ObligationSubject.Journal(sourceRow().target.id, key), ObligationComponent.JOURNAL,
+                RequiredLowerBound.Journal(key), fixed, lifecycleLocation(FixedInputRoot.LIFECYCLE_TARGET, 0))
+            val scope = RetirementScope(sourceRow().target.id, namespace.before, namespace.after, key)
+            requiredPair(commandRole, scope, ObligationComponent.NAMESPACE_RETIREMENT,
+                RequiredLowerBound.NamespaceRetirement(scope), fixed, lifecycleLocation(FixedInputRoot.LIFECYCLE_TARGET, 0))
+        }
+    }
+
+    private fun request(order: LifecycleOrderGrant?) {
+        val index = descriptor.targets.indexOfFirst { it.role == LifecycleRole.REQUEST }
+        val role = ObligationRole.Lifecycle(descriptor.transition, LifecycleRole.REQUEST)
+        if (index < 0) {
+            pair(role, ObligationSubject.NamedRequest(null), ObligationComponent.REQUEST, null, null,
+                fixed = sourceFixed(), location = lifecycleLocation(FixedInputRoot.LIFECYCLE_TARGET, 0))
+            return
+        }
+        val row = descriptor.targets[index]
+        val after = checkNotNull(demand(row.after))
+        val bound = RequiredLowerBound.Request(after, after.id, after.ownerUid, after.binding, after.intent, after.raisedAt)
+        val fixed = sourceFixed() + rowSources(FixedInputRoot.LIFECYCLE_TARGET, index, row) +
+            fixedEvidence(FixedInputRoot.LIFECYCLE_PLAN, index, FixedInputFacet.GRANT,
+                FixedSourceFact.OrderGrant(checkNotNull(order)))
+        requiredPair(role, ObligationSubject.Request(after.id, after.ownerUid, after.binding, after.raisedAt),
+            ObligationComponent.REQUEST, bound, fixed, lifecycleLocation(FixedInputRoot.LIFECYCLE_TARGET, index))
+    }
+
+    private fun guardRow(root: FixedInputRoot, index: Int, row: LifecycleFixedTarget) {
+        val old = guard(row.before)
+        val after = checkNotNull(guard(row.after))
+        val role = ObligationRole.Lifecycle(descriptor.transition, LifecycleRole.GUARD)
+        val fixed = sourceFixed() + rowSources(root, index, row)
+        val location = lifecycleLocation(root, index)
+        after.floor?.let { floor ->
+            requiredPair(role, ObligationSubject.Floor(ControlKind.DEMAND, row.target.id,
+                (old?.floor ?: floor).originLifetimeId), ObligationComponent.FLOOR,
+                RequiredLowerBound.Floor(ControlKind.DEMAND, row.target.id, floor), fixed, location,
+                AllowedSlotDisposition.DURABLY_OWNED_ONLY)
+        }
+        old?.auth?.let { auth ->
+            val required = checkNotNull(after.auth)
+            pair(role, ObligationSubject.Auth(auth.ownerUid, auth.binding, auth.originLifetimeId, auth.authGeneration),
+                ObligationComponent.AUTH, RequiredLowerBound.Auth(required), RequiredLowerBound.Auth(auth),
+                fixed = fixed, location = location)
+        }
+        if (root == FixedInputRoot.LIFECYCLE_UNCHANGED && after.floor == null && after.auth == null) {
+            requiredPair(role, ObligationSubject.ExactTarget(ControlKind.DEMAND, row.target.id), ObligationComponent.SOURCE,
+                RequiredLowerBound.ExactSource(ControlKind.DEMAND, row.target.id, checkNotNull(row.before)), fixed, location)
+        }
+    }
+
+    fun hold(plan: RecoverHoldPlan): RequirementDerivation {
+        val source = checkNotNull(HoldRecoverySource.from(plan.input.source))
+        val hold = source.hold
+        val role = ObligationRole.Lifecycle(descriptor.transition, LifecycleRole.HOLD)
+        val fixed = sourceFixed()
+        val location = lifecycleLocation(FixedInputRoot.LIFECYCLE_TARGET, 0)
+        requiredPair(role, ObligationSubject.Hold(hold.id, hold.originLifetimeId, hold.binding, hold.provenance, hold.axes),
+            ObligationComponent.SOURCE, RequiredLowerBound.Hold(hold), fixed, location)
+        hold.floor?.let { floor ->
+            requiredPair(role, ObligationSubject.Floor(ControlKind.HOLD, hold.id, floor.originLifetimeId),
+                ObligationComponent.FLOOR, RequiredLowerBound.Floor(ControlKind.HOLD, hold.id, floor), fixed, location,
+                AllowedSlotDisposition.DURABLY_OWNED_ONLY)
+        }
+        retirement(source)
+        request(plan.requestOrder)
+        descriptor.targets.forEachIndexed { index, row ->
+            if (row.role == LifecycleRole.GUARD) guardRow(FixedInputRoot.LIFECYCLE_TARGET, index, row)
+        }
+        descriptor.requiredUnchanged.forEachIndexed { index, row ->
+            guardRow(FixedInputRoot.LIFECYCLE_UNCHANGED, index, row)
+        }
+        return finish()
+    }
+
+    fun intent(plan: RecoverIntentPlan): RequirementDerivation {
+        val source = checkNotNull(IntentRecoverySource.from(plan.input.source))
+        val intent = source.intent
+        val role = ObligationRole.Lifecycle(descriptor.transition, LifecycleRole.RECOVERY_INTENT)
+        requiredPair(role, ObligationSubject.Intent(intent.id, intent.sessionId, intent.ownerUid, intent.axis, intent.targetEpoch),
+            ObligationComponent.SOURCE, RequiredLowerBound.Intent(intent), sourceFixed(),
+            lifecycleLocation(FixedInputRoot.LIFECYCLE_TARGET, 0))
+        retirement(source)
+        request(plan.requestOrder)
+        return finish()
+    }
+
+    private fun finish(): RequirementDerivation {
+        val scope = ReceiptScope(descriptor.operationId, descriptor.transition, null, null)
+        val fixed = base + descriptor.targets.flatMapIndexed { index, row ->
+            rowSources(FixedInputRoot.LIFECYCLE_TARGET, index, row)
+        } + descriptor.requiredUnchanged.flatMapIndexed { index, row ->
+            rowSources(FixedInputRoot.LIFECYCLE_UNCHANGED, index, row)
+        }
+        pair(commandRole, scope, ObligationComponent.RECEIPT, RequiredLowerBound.Receipt(scope), null,
+            AllowedSlotDisposition.COMPLETED_AND_CONSUMED_ONLY, fixed = fixed,
+            location = lifecycleLocation(FixedInputRoot.LIFECYCLE_PLAN))
+        return duplicate?.let {
+            RequirementDerivation.Unavailable(RequiredObligationsUnavailable.DUPLICATE_REQUIRED_KEY, it)
+        } ?: RequirementDerivation.Available(binding, Collections.unmodifiableList(slots.toList()))
+    }
 }
 
 private class LifecycleSlots(
