@@ -1,8 +1,12 @@
 package com.jay.fxi.data.entitlements.control
 
 import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.KRX_EPOCH
+import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.MAY_CONTAIN_KRX
+import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.MAY_CONTAIN_PREMIUM
 import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.OWNER_UID
 import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.USER_EPOCH
+import com.jay.fxi.data.entitlements.RecordTransactionEvidence
+import com.jay.fxi.data.entitlements.RecordTransactionResult
 import java.util.Collections
 
 internal class CompletionHandoff(
@@ -71,9 +75,385 @@ internal sealed interface ReceiptIdentity {
     ) : ReceiptIdentity
 }
 
-/* A3가 필드와 검증 발급 경로를 정한다. A2에는 생성 경로가 없다. */
-internal class PriorStorageConfirmation private constructor()
-internal class NamedTransferLink private constructor()
+internal sealed interface TypedSourceTuple {
+    val responsibilityOwner: ResponsibilityOwner
+
+    data class Request(
+        override val responsibilityOwner: ResponsibilityOwner,
+        val preimage: ControlNode,
+        val parsed: DemandV1,
+        val minimumIntent: com.jay.fxi.data.entitlements.RefreshIntent,
+        val minimumOrder: EventOrderV1
+    ) : TypedSourceTuple
+
+    data class HoldFloor(
+        override val responsibilityOwner: ResponsibilityOwner,
+        val source: FloorSource,
+        val oldGuard: ControlNode?,
+        val mergeNow: BootReading,
+        val executorOrigin: LifetimeId
+    ) : TypedSourceTuple
+
+    data class GuardFloor(
+        override val responsibilityOwner: ResponsibilityOwner,
+        val preimage: ControlNode,
+        val parsed: ScheduleGuardV1
+    ) : TypedSourceTuple
+}
+
+internal sealed interface TypedDestinationTuple {
+    val locator: DestinationLocator
+    val row: ControlNode
+
+    data class Request(
+        override val locator: DestinationLocator.Payload,
+        override val row: ControlNode,
+        val parsed: DemandV1
+    ) : TypedDestinationTuple
+
+    data class GuardFloor(
+        override val locator: DestinationLocator.Guard,
+        override val row: ControlNode,
+        val parsed: ScheduleGuardV1
+    ) : TypedDestinationTuple
+}
+
+internal sealed interface RetainedDestinationTuple {
+    val locator: DestinationLocator
+
+    data class Payload(
+        override val locator: DestinationLocator.Payload,
+        val row: ControlNode
+    ) : RetainedDestinationTuple
+
+    data class Guard(
+        override val locator: DestinationLocator.Guard,
+        val row: ControlNode
+    ) : RetainedDestinationTuple
+
+    data class Journal(
+        override val locator: DestinationLocator.Journal
+    ) : RetainedDestinationTuple
+}
+
+internal sealed interface ConfirmationBinding {
+    class LifecycleOutput(
+        val command: CommandRef,
+        val fixed: ControlLifecycleDescriptor,
+        val outputTarget: LifecycleTarget,
+        val output: TypedDestinationTuple,
+        val effect: ConfirmedEffect,
+        val observation: LifecycleTargetObservation,
+        val storageEvidence: RecordTransactionEvidence
+    ) : ConfirmationBinding
+
+    class RetainedSource(
+        val slot: RequiredSlot,
+        val observed: RetainedDestinationTuple,
+        val storageEvidence: RecordTransactionEvidence
+    ) : ConfirmationBinding
+}
+
+internal enum class LifecycleConfirmationFailure {
+    REF_OR_DESCRIPTOR_MISMATCH,
+    UNSUPPORTED_TRANSITION_OR_TARGET,
+    EFFECT_NOT_ELIGIBLE,
+    RECEIPT_MISSING,
+    RECEIPT_MISMATCH,
+    APPLIED_MISSING_OR_MISMATCH,
+    SNAPSHOT_UNINTERPRETABLE,
+    SNAPSHOT_OUTPUT_MISMATCH,
+    NAMED_EFFECT_MISMATCH
+}
+
+internal sealed interface LifecycleOutputConfirmationResult {
+    data class Issued(val value: PriorStorageConfirmation) : LifecycleOutputConfirmationResult
+    data class Rejected(val reason: LifecycleConfirmationFailure) : LifecycleOutputConfirmationResult
+}
+
+internal enum class RetainedConfirmationFailure {
+    NOT_A_REQUIRED_SOURCE,
+    NO_EXACT_RETAINED_ROW,
+    SUBJECT_OR_BOUND_MISMATCH,
+    OBSERVATION_RECORD_MISMATCH
+}
+
+internal sealed interface RetainedSourceConfirmationResult {
+    data class Issued(val value: PriorStorageConfirmation) : RetainedSourceConfirmationResult
+    data class Rejected(val reason: RetainedConfirmationFailure) : RetainedSourceConfirmationResult
+}
+
+internal class PriorStorageConfirmation private constructor(val binding: ConfirmationBinding) {
+    companion object {
+        fun confirmLifecycleOutput(
+            exactCommand: CommandRef,
+            fixed: ControlLifecycleDescriptor,
+            confirmed: ControlStoreResult.Confirmed,
+            outputTarget: LifecycleTarget
+        ): LifecycleOutputConfirmationResult {
+            fun reject(reason: LifecycleConfirmationFailure) = LifecycleOutputConfirmationResult.Rejected(reason)
+            val body = exactCommand.captureStateAndBody().body as? ControlCommandBody.Lifecycle
+            if (confirmed.command !== exactCommand || body == null || body.input !== fixed ||
+                exactCommand.id != fixed.operationId)
+                return reject(LifecycleConfirmationFailure.REF_OR_DESCRIPTOR_MISMATCH)
+
+            val outputFixed = fixed.targets.singleOrNull { it.target == outputTarget }
+            val supported = outputFixed != null && when (fixed.transition) {
+                LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.END_AUTH_BINDING ->
+                    outputFixed.role == LifecycleRole.REQUEST && outputTarget.kind == ControlKind.DEMAND &&
+                        outputTarget.effect == LifecycleEffect.REPLACE && outputFixed.before != null
+                LifecycleTransition.RECOVER_HOLD ->
+                    outputFixed.role == LifecycleRole.GUARD && outputTarget.kind == ControlKind.DEMAND &&
+                        outputTarget.effect == LifecycleEffect.REPLACE && outputFixed.before != null
+                else -> false
+            }
+            if (!supported) return reject(LifecycleConfirmationFailure.UNSUPPORTED_TRANSITION_OR_TARGET)
+            val selected = checkNotNull(outputFixed)
+            if (confirmed.effect == ConfirmedEffect.JoinedExisting ||
+                (confirmed.effect == ConfirmedEffect.AppliedThisAttempt &&
+                    confirmed.proof.storage != RecordTransactionEvidence.CompletedWriteScope))
+                return reject(LifecycleConfirmationFailure.EFFECT_NOT_ELIGIBLE)
+
+            val receipt = confirmed.lifecycleReceipt ?: return reject(LifecycleConfirmationFailure.RECEIPT_MISSING)
+            val namespace = fixed.namespace
+            val expectedObservations = fixed.targets.map { target ->
+                LifecycleObservedTarget(target.target, if (target.target.effect == LifecycleEffect.REMOVE)
+                    LifecycleTargetObservation.Absent else LifecycleTargetObservation.PresentExact)
+            }
+            val expectedUnchanged = fixed.requiredUnchanged.map {
+                LifecycleObservedTarget(it.target, LifecycleTargetObservation.PresentExact)
+            }
+            if (receipt.commandId != exactCommand.id || receipt.transition != fixed.transition ||
+                receipt.targets != expectedObservations || receipt.requiredUnchanged != expectedUnchanged ||
+                receipt.before != namespace?.before || receipt.after != namespace?.after ||
+                receipt.journal != namespace?.journal.orEmpty().associateWith { JournalObservation.Present } ||
+                receipt.hasUninterpretable || receipt.hasUninterpretableMetadata)
+                return reject(LifecycleConfirmationFailure.RECEIPT_MISMATCH)
+
+            val read = confirmed.snapshot.record
+            val own = ControlAppliedEvidence.own(read, exactCommand)
+            if (own !is AppliedEvidence.Lifecycle ||
+                !ControlAppliedEvidence.matches(exactCommand, body, null, own))
+                return reject(LifecycleConfirmationFailure.APPLIED_MISSING_OR_MISMATCH)
+            if (read.hasUninterpretable || read.hasUninterpretableMetadata)
+                return reject(LifecycleConfirmationFailure.SNAPSHOT_UNINTERPRETABLE)
+            val found = read.locations(outputTarget.id).singleOrNull()
+            val entry = found?.second as? ControlEntryRead.Interpreted
+            if (entry == null ||
+                entry.original.toPayloadEntry() != selected.after?.toPayloadEntry())
+                return reject(LifecycleConfirmationFailure.SNAPSHOT_OUTPUT_MISMATCH)
+            val output = when (fixed.transition) {
+                LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.END_AUTH_BINDING -> {
+                    val parsed = entry.value as? DemandV1
+                        ?: return reject(LifecycleConfirmationFailure.SNAPSHOT_OUTPUT_MISMATCH)
+                    TypedDestinationTuple.Request(DestinationLocator.Payload(outputTarget.kind, outputTarget.id),
+                        entry.original, parsed)
+                }
+                LifecycleTransition.RECOVER_HOLD -> {
+                    val parsed = entry.value as? ScheduleGuardV1
+                        ?: return reject(LifecycleConfirmationFailure.SNAPSHOT_OUTPUT_MISMATCH)
+                    TypedDestinationTuple.GuardFloor(DestinationLocator.Guard(outputTarget.id, GuardPart.FLOOR),
+                        entry.original, parsed)
+                }
+                else -> error("Unsupported named output")
+            }
+            // The selected row is checked separately so its failure keeps a distinct reason.
+            if ((fixed.targets - selected + fixed.requiredUnchanged).any {
+                    ControlLifecycleBoundary.postcondition(read, it) != null
+                }) return reject(LifecycleConfirmationFailure.NAMED_EFFECT_MISMATCH)
+            if (namespace != null) {
+                val journal = NamespaceSettlementTransition(ControlPayloadCodec()).canonicalJournal(read.original)
+                if (!ControlLifecycleBoundary.fence(read.original, namespace.after) ||
+                    (namespace.userMayContain != null &&
+                        read.original[MAY_CONTAIN_PREMIUM] != namespace.userMayContain) ||
+                    (namespace.krxMayContain != null &&
+                        read.original[MAY_CONTAIN_KRX] != namespace.krxMayContain) ||
+                    journal == null || !journal.containsAll(namespace.journal))
+                    return reject(LifecycleConfirmationFailure.NAMED_EFFECT_MISMATCH)
+            }
+            val fixedCopy = ControlLifecycleDescriptor(fixed.operationId, fixed.transition, fixed.targets,
+                fixed.executor, fixed.namespace?.let {
+                    LifecycleNamespacePostcondition(it.before, it.after, it.journal,
+                        it.userMayContain, it.krxMayContain)
+                }, fixed.requiredUnchanged, fixed.demandAuth, fixed.removeEmptyGuard,
+                fixed.recoverHold, fixed.recoverIntent)
+            return LifecycleOutputConfirmationResult.Issued(PriorStorageConfirmation(
+                ConfirmationBinding.LifecycleOutput(exactCommand, fixedCopy, outputTarget, output,
+                    confirmed.effect, LifecycleTargetObservation.PresentExact, confirmed.proof.storage)))
+        }
+
+        fun confirmRetainedSource(
+            slot: RequiredSlot,
+            destination: DestinationLocator,
+            confirmed: ControlStoreResult.Confirmed
+        ): RetainedSourceConfirmationResult = confirmRetained(slot, destination, confirmed.snapshot.record,
+            confirmed.proof.storage)
+
+        fun confirmRetainedSource(
+            slot: RequiredSlot,
+            destination: DestinationLocator,
+            observed: RecordTransactionResult<ControlRecordRead.Supported>
+        ): RetainedSourceConfirmationResult {
+            if (!retainedSourceRequired(slot))
+                return RetainedSourceConfirmationResult.Rejected(RetainedConfirmationFailure.NOT_A_REQUIRED_SOURCE)
+            if (observed.value.original != observed.snapshot)
+                return RetainedSourceConfirmationResult.Rejected(RetainedConfirmationFailure.OBSERVATION_RECORD_MISMATCH)
+            return confirmRetained(slot, destination, observed.value, observed.evidence)
+        }
+
+        private fun retainedSourceRequired(slot: RequiredSlot): Boolean =
+            when ((slot.requirement as? SlotRequirement.Required)?.lowerBound) {
+                is RequiredLowerBound.Hold, is RequiredLowerBound.ExactSource ->
+                    slot.key.component == ObligationComponent.SOURCE
+                is RequiredLowerBound.Floor -> slot.key.component == ObligationComponent.FLOOR
+                is RequiredLowerBound.Auth -> slot.key.component == ObligationComponent.AUTH
+                is RequiredLowerBound.Journal -> slot.key.component == ObligationComponent.JOURNAL
+                else -> false
+            }
+
+        private fun originalSourceRow(requirement: SlotRequirement.Required, kind: ControlKind,
+            id: String): ControlNode? = requirement.fixedSources.mapNotNull { fixed ->
+            if (fixed.location.facet != FixedInputFacet.SOURCE &&
+                fixed.location.facet != FixedInputFacet.BEFORE) return@mapNotNull null
+            val fact = fixed.fact as? FixedSourceFact.Node ?: return@mapNotNull null
+            if (fact.kind != kind) return@mapNotNull null
+            val parsed = (ControlObligations.read(kind, fact.value) as? ControlEntryRead.Interpreted)?.value
+            fact.value.takeIf { parsed?.id == id }
+        }.distinctBy { it.toPayloadEntry() }.singleOrNull()
+
+        private fun confirmRetained(slot: RequiredSlot, destination: DestinationLocator,
+            read: ControlRecordRead.Supported, evidence: RecordTransactionEvidence): RetainedSourceConfirmationResult {
+            fun reject(reason: RetainedConfirmationFailure) = RetainedSourceConfirmationResult.Rejected(reason)
+            if (!retainedSourceRequired(slot))
+                return reject(RetainedConfirmationFailure.NOT_A_REQUIRED_SOURCE)
+            val requirement = slot.requirement as SlotRequirement.Required
+            val bound = requirement.lowerBound
+            val subject = slot.key.subject
+            val subjectMatches = when (bound) {
+                is RequiredLowerBound.Hold -> subject == ObligationSubject.Hold(bound.source.id,
+                    bound.source.originLifetimeId, bound.source.binding, bound.source.provenance, bound.source.axes) &&
+                    destination == DestinationLocator.Payload(ControlKind.HOLD, bound.source.id) &&
+                    originalSourceRow(requirement, ControlKind.HOLD, bound.source.id)?.let { original ->
+                        val fixed = (ControlObligations.read(ControlKind.HOLD, original)
+                            as? ControlEntryRead.Interpreted)?.value as? RestoredHold
+                        fixed != null && compareHold(bound.source, fixed) == TypedComparison.Matches
+                    } == true
+                is RequiredLowerBound.Floor -> subject == ObligationSubject.Floor(bound.sourceKind,
+                    bound.sourceId, bound.captured.originLifetimeId) &&
+                    originalSourceRow(requirement, bound.sourceKind, bound.sourceId)?.let { original ->
+                        when (val value = (ControlObligations.read(bound.sourceKind, original)
+                            as? ControlEntryRead.Interpreted)?.value) {
+                            is RestoredHold -> value.id == bound.sourceId && value.floor == bound.captured
+                            is ScheduleGuardV1 -> value.id == bound.sourceId && value.floor == bound.captured
+                            else -> false
+                        }
+                    } == true && when (destination) {
+                    is DestinationLocator.Payload -> destination == DestinationLocator.Payload(bound.sourceKind, bound.sourceId)
+                    is DestinationLocator.Guard -> bound.sourceKind == ControlKind.DEMAND &&
+                        destination == DestinationLocator.Guard(bound.sourceId, GuardPart.FLOOR)
+                    else -> false
+                }
+                is RequiredLowerBound.Auth -> subject == ObligationSubject.Auth(bound.required.ownerUid,
+                    bound.required.binding, bound.required.originLifetimeId, bound.required.authGeneration) &&
+                    destination is DestinationLocator.Guard && destination.part == GuardPart.AUTH &&
+                    destination.id == originalAuthGuardId(requirement)
+                is RequiredLowerBound.Journal -> subject is ObligationSubject.Journal && subject.key == bound.key &&
+                    requirement.fixedSources.any { fixed ->
+                        val source = fixed.fact as? FixedSourceFact.Node
+                        fixed.location.facet == FixedInputFacet.SOURCE && source != null &&
+                            (ControlObligations.read(source.kind, source.value) as? ControlEntryRead.Interpreted)
+                                ?.value?.id == subject.sourceSealId
+                    } && destination == DestinationLocator.Journal(bound.key)
+                is RequiredLowerBound.ExactSource -> subject == ObligationSubject.ExactTarget(bound.kind, bound.id) &&
+                    destination == DestinationLocator.Payload(bound.kind, bound.id) &&
+                    originalSourceRow(requirement, bound.kind, bound.id)?.toPayloadEntry() ==
+                        bound.node.toPayloadEntry()
+                else -> false
+            }
+            if (!subjectMatches) return reject(RetainedConfirmationFailure.SUBJECT_OR_BOUND_MISMATCH)
+            val result = when (destination) {
+                is DestinationLocator.Payload -> {
+                    val found = read.locations(destination.id).singleOrNull()
+                    val entry = found?.second as? ControlEntryRead.Interpreted
+                    val original = originalSourceRow(requirement, destination.kind, destination.id)
+                    if (entry == null || !retainedRowMatches(bound, entry) ||
+                        (bound is RequiredLowerBound.Hold || bound is RequiredLowerBound.Floor) &&
+                        entry.original.toPayloadEntry() != original?.toPayloadEntry()) null
+                    else RetainedDestinationTuple.Payload(destination, entry.original)
+                }
+                is DestinationLocator.Guard -> {
+                    val found = read.locations(destination.id).singleOrNull()
+                    val entry = found?.second as? ControlEntryRead.Interpreted
+                    val guard = entry?.value as? ScheduleGuardV1
+                    val same = when (bound) {
+                        is RequiredLowerBound.Floor -> guard?.floor == bound.captured
+                        is RequiredLowerBound.Auth -> guard?.auth == bound.required
+                        else -> false
+                    }
+                    if (found?.first != ControlKind.DEMAND || entry == null || same != true) null
+                    else RetainedDestinationTuple.Guard(destination, entry.original)
+                }
+                is DestinationLocator.Journal -> {
+                    val canonical = NamespaceSettlementTransition(ControlPayloadCodec()).canonicalJournal(read.original)
+                    if (canonical == null || compareJournal(destination.key, canonical) != TypedComparison.Matches) null
+                    else RetainedDestinationTuple.Journal(destination)
+                }
+            } ?: return reject(RetainedConfirmationFailure.NO_EXACT_RETAINED_ROW)
+            return RetainedSourceConfirmationResult.Issued(PriorStorageConfirmation(
+                ConfirmationBinding.RetainedSource(slot, result, evidence)))
+        }
+
+        private fun retainedRowMatches(bound: RequiredLowerBound, entry: ControlEntryRead.Interpreted): Boolean =
+            when (bound) {
+                is RequiredLowerBound.Hold -> (entry.value as? RestoredHold)?.let {
+                    compareHold(bound.source, it) == TypedComparison.Matches
+                } == true
+                is RequiredLowerBound.Floor -> when (val value = entry.value) {
+                    is RestoredHold -> value.floor == bound.captured
+                    is ScheduleGuardV1 -> value.floor == bound.captured
+                    else -> false
+                }
+                is RequiredLowerBound.ExactSource -> entry.original.toPayloadEntry() == bound.node.toPayloadEntry()
+                else -> false
+            }
+    }
+}
+
+internal enum class NamedTransferFailureKind {
+    UNSUPPORTED_TRANSITION_OR_REPLACEMENT,
+    SOURCE_MISMATCH,
+    DESTINATION_MISMATCH,
+    OWNER_MISMATCH,
+    CONFIRMATION_MISMATCH,
+    REQUEST_INTENT_OR_GRANT,
+    RELATED_EFFECT_MISMATCH
+}
+
+internal sealed interface NamedTransferFailure {
+    data class Invalid(val kind: NamedTransferFailureKind) : NamedTransferFailure
+    data class Reanchor(val field: ReanchorField) : NamedTransferFailure
+}
+
+internal sealed interface NamedTransferResult {
+    data class Issued(val value: NamedTransferLink) : NamedTransferResult
+    data class Rejected(val reason: NamedTransferFailure) : NamedTransferResult
+}
+
+internal class NamedTransferLink private constructor(
+    val transition: LifecycleTransition,
+    val source: TypedSourceTuple,
+    val destination: TypedDestinationTuple,
+    val responsibilityOwner: ResponsibilityOwner,
+    val confirmation: PriorStorageConfirmation
+) {
+    companion object {
+        fun linkNamedTransfer(
+            fixedSource: TypedSourceTuple,
+            destination: TypedDestinationTuple,
+            confirmation: PriorStorageConfirmation
+        ): NamedTransferResult = TODO("A3 named issuer")
+    }
+}
 
 internal enum class G05Id(val wire: String) {
     REF("G05.ref"),
