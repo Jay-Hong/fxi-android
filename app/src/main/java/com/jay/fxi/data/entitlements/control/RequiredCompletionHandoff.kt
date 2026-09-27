@@ -744,10 +744,15 @@ internal fun assessG05(
                 val destination = inspectDestination(owned.destination, requirement, latest, now)
                 if (!destination.exists)
                     failures += failure(G05Id.DESTINATION, slot, entry.index, destination.actualAt)
-                // A2 has no issuer for PriorStorageConfirmation. A snapshot is not confirmation.
-                failures += failure(G05Id.CONFIRMATION, slot, entry.index)
+                // Named chains are checked in A3b2b; only the unchanged source can use an empty chain.
+                val confirmation = if (owned.linkChain.isEmpty())
+                    inspectRetainedConfirmation(slot, owned, latest) else ConfirmationFinding(false)
+                if (!confirmation.valid)
+                    failures += failure(G05Id.CONFIRMATION, slot, entry.index, confirmation.actualAt)
                 if (destination.exists && destination.lowerBound != true)
                     failures += failure(G05Id.LOWER_BOUND, slot, entry.index, destination.actualAt)
+                if (requirement.allowed == AllowedSlotDisposition.COMPLETED_AND_CONSUMED_ONLY)
+                    failures += failure(G05Id.COMPLETED_CONFLICT, slot, entry.index)
             }
         }
 
@@ -785,6 +790,49 @@ private data class DestinationFinding(
     val exists: Boolean,
     val lowerBound: Boolean? = null
 )
+
+private data class ConfirmationFinding(
+    val valid: Boolean,
+    val actualAt: G05Location? = null
+)
+
+private fun inspectRetainedConfirmation(slot: RequiredSlot, owned: HandoffDisposition.DurablyOwned,
+    latest: ControlRecordRead): ConfirmationFinding {
+    val retained = owned.priorWrite?.binding as? ConfirmationBinding.RetainedSource
+        ?: return ConfirmationFinding(false)
+    if (retained.slot != slot || retained.observed.locator != owned.destination)
+        return ConfirmationFinding(false)
+    val read = latest as? ControlRecordRead.Supported ?: return ConfirmationFinding(false)
+    return when (val observed = retained.observed) {
+        is RetainedDestinationTuple.Payload, is RetainedDestinationTuple.Guard -> {
+            val id = when (observed) {
+                is RetainedDestinationTuple.Payload -> observed.locator.id
+                is RetainedDestinationTuple.Guard -> observed.locator.id
+                else -> error("Unreachable retained destination")
+            }
+            val found = read.locations(id).singleOrNull() ?: return ConfirmationFinding(false)
+            val (kind, entry) = found
+            val at = G05Location.ActualPayload(kind,
+                read.arrays.getValue(kind).entries.indexOfFirst { it === entry })
+            val original = (entry as? ControlEntryRead.Interpreted)?.original
+            val matches = when (observed) {
+                is RetainedDestinationTuple.Payload ->
+                    original?.toPayloadEntry() == observed.row.toPayloadEntry()
+                is RetainedDestinationTuple.Guard ->
+                    original?.toPayloadEntry() == observed.row.toPayloadEntry()
+                else -> false
+            }
+            ConfirmationFinding(matches, if (matches) null else at)
+        }
+        is RetainedDestinationTuple.Journal -> {
+            val canonical = NamespaceSettlementTransition(ControlPayloadCodec()).canonicalJournal(read.original)
+                ?: return ConfirmationFinding(false)
+            ConfirmationFinding(canonical.any {
+                compareJournal(observed.locator.key, listOf(it)) == TypedComparison.Matches
+            })
+        }
+    }
+}
 
 private fun originalAuthGuardId(requirement: SlotRequirement.Required): String? {
     val bound = requirement.lowerBound as? RequiredLowerBound.Auth ?: return null
