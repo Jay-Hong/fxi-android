@@ -36,7 +36,9 @@ import org.junit.rules.TemporaryFolder
  *  - AppliedThisAttempt and PostconditionConfirmed both require the exact own Lifecycle Applied row in the returned snapshot.
  *  - AppliedThisAttempt must come with CompletedWriteScope storage evidence; with LockedFileRead it is EFFECT_NOT_ELIGIBLE (N03b).
  *  - Named output targets supported in A3a: REQUEST REPLACE of REBIND_REQUESTS / END_AUTH_BINDING (same id), and the GUARD
- *    REPLACE of RECOVER_HOLD as the guard FLOOR component. Any other target is UNSUPPORTED_TRANSITION_OR_TARGET.
+ *    REPLACE of RECOVER_HOLD as the guard FLOOR component. 6-4bA3 consensus r4 N8 adds the GUARD AUTH REPLACE of
+ *    END_AUTH_BINDING (a GuardAuth output; its rows live in the A3b2b contract). Any other target is
+ *    UNSUPPORTED_TRANSITION_OR_TARGET.
  *  - Retained reason order: NOT_A_REQUIRED_SOURCE → OBSERVATION_RECORD_MISMATCH → SUBJECT_OR_BOUND_MISMATCH →
  *    NO_EXACT_RETAINED_ROW. OBSERVATION_NOT_NORMAL is removed from the declaration (6-4bA3 consensus r2 N5): both overloads
  *    only accept types that already denote a normal return (Confirmed; RecordTransactionResult whose evidence values are both
@@ -549,13 +551,10 @@ class PriorStorageConfirmationContractTest {
         return Run(s, c, execute(s, c, ctx), ctx)
     }
 
-    @Test fun N02b_unsupported_sameIdOtherEffect_endGuardTarget_settleTransition() = runReleaseTest {
+    @Test fun N02b_unsupported_sameIdOtherEffect_settleTransition() = runReleaseTest {
         val run = rebind()
         rejected(confirm(run, LifecycleTarget(ControlKind.DEMAND, "r", LifecycleEffect.CREATE)),
             LifecycleConfirmationFailure.UNSUPPORTED_TRANSITION_OR_TARGET)
-        val e = end()
-        assertTrue("fixture: END replaces guard g", e.fixed.targets.any { it.target == guardTarget() })
-        rejected(confirm(e, guardTarget()), LifecycleConfirmationFailure.UNSUPPORTED_TRANSITION_OR_TARGET)
         val st = settle()
         assertEquals(LifecycleTransition.SETTLE_QUERY, st.fixed.transition)
         rejected(confirm(st, st.fixed.targets.first().target), LifecycleConfirmationFailure.UNSUPPORTED_TRANSITION_OR_TARGET)
