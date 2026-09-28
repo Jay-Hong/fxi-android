@@ -397,6 +397,13 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
 
         private fun retainedSourceRequired(slot: RequiredSlot): Boolean {
             val requirement = slot.requirement as? SlotRequirement.Required ?: return false
+            if (slot.key.role is ObligationRole.MutationAction && when (requirement.lowerBound) {
+                    is RequiredLowerBound.Request -> slot.key.component == ObligationComponent.REQUEST
+                    is RequiredLowerBound.Seal -> slot.key.component == ObligationComponent.SEAL
+                    is RequiredLowerBound.Hold, is RequiredLowerBound.Intent ->
+                        slot.key.component == ObligationComponent.SOURCE
+                    else -> false
+                }) return true
             return when (val bound = requirement.lowerBound) {
                 is RequiredLowerBound.Hold, is RequiredLowerBound.ExactSource ->
                     slot.key.component == ObligationComponent.SOURCE
@@ -434,6 +441,60 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
             fact.value.takeIf { parsed?.id == id }
         }.distinctBy { it.toPayloadEntry() }.singleOrNull()
 
+        private data class MutationRetainedRow(
+            val kind: ControlKind,
+            val source: ControlObligationV1,
+            val subjectSource: ControlObligationV1,
+            val adopted: ControlObligationV1
+        )
+
+        /** Select only this slot's prepared action and fixed adoption; never search another action's sources. */
+        private fun mutationRetainedRow(slot: RequiredSlot,
+            requirement: SlotRequirement.Required): MutationRetainedRow? {
+            val index = (slot.key.role as? ObligationRole.MutationAction)?.index ?: return null
+            fun fixed(root: FixedInputRoot, facet: FixedInputFacet): FixedSourceFact? =
+                requirement.fixedSources.filter { it.location == FixedInputLocation(root, index, facet) }
+                    .singleOrNull()?.fact
+            val action = (fixed(FixedInputRoot.MUTATION_ACTION, FixedInputFacet.WHOLE)
+                as? FixedSourceFact.Mutation)?.value ?: return null
+            fun node(facet: FixedInputFacet): ControlNode? {
+                val fact = fixed(FixedInputRoot.MUTATION_ACTION, facet) as? FixedSourceFact.Node
+                return fact?.value?.takeIf { fact.kind == action.kind }
+            }
+            val afterNode = node(FixedInputFacet.AFTER) ?: return null
+            val beforeNode = node(FixedInputFacet.BEFORE)
+            val preparedAfter = when (action) {
+                is ControlMutation.Add -> (action.built as? ControlWriteResult.Written)?.node
+                is ControlMutation.Edit -> (action.changed as? ControlWriteResult.Written)?.node
+            } ?: return null
+            if (afterNode.toPayloadEntry() != preparedAfter.toPayloadEntry() ||
+                (action is ControlMutation.Add && beforeNode != null) ||
+                (action is ControlMutation.Edit && beforeNode?.toPayloadEntry() != action.before.toPayloadEntry()))
+                return null
+            val adoption = listOfNotNull(
+                fixed(FixedInputRoot.MUTATION_ADOPTION, FixedInputFacet.WHOLE),
+                fixed(FixedInputRoot.PREVIOUS_CHECKPOINT, FixedInputFacet.AFTER)
+            ).singleOrNull() as? FixedSourceFact.Adoption ?: return null
+            val target = adoption.value
+            fun parsed(node: ControlNode?) = node?.let {
+                (ControlObligations.read(action.kind, it) as? ControlEntryRead.Interpreted)?.value
+            }
+            val after = parsed(afterNode) ?: return null
+            val before = parsed(beforeNode)
+            val adopted = parsed(target.postcondition) ?: return null
+            if (target.id != adopted.id || when {
+                    target.joined -> action !is ControlMutation.Add || action.kind != ControlKind.SEAL ||
+                        after !is SealV1 || adopted !is SealV1 || after.key != adopted.key ||
+                        adopted.settlement != null
+                    else -> target.postcondition.toPayloadEntry() != afterNode.toPayloadEntry()
+                }) return null
+            val source = when (action) {
+                is ControlMutation.Add -> after
+                is ControlMutation.Edit -> if (slot.key.branch == LandingBranch.L) after else before ?: return null
+            }
+            return MutationRetainedRow(action.kind, source, before ?: after, adopted)
+        }
+
         private fun confirmRetained(slot: RequiredSlot, destination: DestinationLocator,
             read: ControlRecordRead.Supported, evidence: RecordTransactionEvidence): RetainedSourceConfirmationResult {
             fun reject(reason: RetainedConfirmationFailure) = RetainedSourceConfirmationResult.Rejected(reason)
@@ -443,11 +504,16 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
             val bound = requirement.lowerBound
             val subject = slot.key.subject
             val floorFixed = (bound as? RequiredLowerBound.Floor)?.let { floorFixedRow(slot, requirement, it) }
+            val mutationSlot = slot.key.role is ObligationRole.MutationAction &&
+                bound !is RequiredLowerBound.Floor && bound !is RequiredLowerBound.Auth
+            val mutation = if (mutationSlot) mutationRetainedRow(slot, requirement) else null
             val subjectMatches = when (bound) {
                 is RequiredLowerBound.Hold -> subject == ObligationSubject.Hold(bound.source.id,
                     bound.source.originLifetimeId, bound.source.binding, bound.source.provenance, bound.source.axes) &&
                     destination == DestinationLocator.Payload(ControlKind.HOLD, bound.source.id) &&
-                    originalSourceRow(requirement, ControlKind.HOLD, bound.source.id)?.let { original ->
+                    if (mutationSlot) mutation?.let { it.kind == ControlKind.HOLD &&
+                        it.source == bound.source && it.adopted.id == bound.source.id } == true
+                    else originalSourceRow(requirement, ControlKind.HOLD, bound.source.id)?.let { original ->
                         val fixed = (ControlObligations.read(ControlKind.HOLD, original)
                             as? ControlEntryRead.Interpreted)?.value as? RestoredHold
                         fixed != null && compareHold(bound.source, fixed) == TypedComparison.Matches
@@ -478,22 +544,37 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                 is RequiredLowerBound.Intent -> subject == ObligationSubject.Intent(bound.source.id,
                     bound.source.sessionId, bound.source.ownerUid, bound.source.axis, bound.source.targetEpoch) &&
                     destination == DestinationLocator.Payload(ControlKind.RECOVERY_INTENT, bound.source.id) &&
-                    originalSourceRow(requirement, ControlKind.RECOVERY_INTENT, bound.source.id)?.let {
+                    if (mutationSlot) mutation?.let { it.kind == ControlKind.RECOVERY_INTENT &&
+                        it.source == bound.source && it.adopted.id == bound.source.id } == true
+                    else originalSourceRow(requirement, ControlKind.RECOVERY_INTENT, bound.source.id)?.let {
                         (ControlObligations.read(ControlKind.RECOVERY_INTENT, it) as? ControlEntryRead.Interpreted)
                             ?.value == bound.source
                     } == true
                 is RequiredLowerBound.Seal -> subject == ObligationSubject.Seal(bound.source.id,
                     bound.source.kind, bound.source.key) &&
                     destination == DestinationLocator.Payload(ControlKind.SEAL, bound.source.id) &&
-                    originalSourceRow(requirement, ControlKind.SEAL, bound.source.id)?.let {
+                    if (mutationSlot) mutation?.let { it.kind == ControlKind.SEAL &&
+                        it.adopted == bound.source &&
+                        (it.source as? SealV1)?.key == bound.source.key } == true
+                    else originalSourceRow(requirement, ControlKind.SEAL, bound.source.id)?.let {
                         (ControlObligations.read(ControlKind.SEAL, it) as? ControlEntryRead.Interpreted)
                             ?.value == bound.source
                     } == true
                 is RequiredLowerBound.Request -> bound.source?.let { source ->
-                    subject == ObligationSubject.Request(source.id, source.ownerUid, source.binding, source.raisedAt) &&
+                    val mutationSubject = mutation?.subjectSource as? DemandV1
+                    subject == ObligationSubject.Request(
+                        mutationSubject?.id ?: source.id, mutationSubject?.ownerUid ?: source.ownerUid,
+                        mutationSubject?.binding ?: source.binding, mutationSubject?.raisedAt ?: source.raisedAt) &&
                         destination == DestinationLocator.Payload(ControlKind.DEMAND, bound.requiredId) &&
                         source.id == bound.requiredId && source.ownerUid == bound.ownerUid &&
-                        originalSourceRow(requirement, ControlKind.DEMAND, source.id)?.let {
+                        if (mutationSlot) mutation?.let { it.kind == ControlKind.DEMAND &&
+                            it.source == source && it.adopted.id == bound.requiredId &&
+                            (it.adopted as? DemandV1)?.let { adopted ->
+                                adopted.ownerUid == bound.ownerUid && adopted.binding == bound.binding &&
+                                    bound.minimumIntent == adopted.intent &&
+                                    bound.minimumOrder == adopted.raisedAt
+                            } == true } == true
+                        else originalSourceRow(requirement, ControlKind.DEMAND, source.id)?.let {
                             (ControlObligations.read(ControlKind.DEMAND, it) as? ControlEntryRead.Interpreted)
                                 ?.value == source
                         } == true
@@ -510,12 +591,17 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                     val entry = found?.second as? ControlEntryRead.Interpreted
                     val original = if (bound is RequiredLowerBound.Floor)
                         floorFixed?.node
+                    else if (mutationSlot) null
                     else originalSourceRow(requirement, destination.kind, destination.id)
-                    if (entry == null ||
+                    if (found?.first != destination.kind || entry == null ||
                         (bound !is RequiredLowerBound.Intent && !retainedRowMatches(bound, entry)) ||
+                        (bound is RequiredLowerBound.Intent && mutationSlot &&
+                            (entry.value as? RecoveryIntentV1)?.let {
+                                compareRecoveryIntent(bound.source, it) != TypedComparison.Matches
+                            } != false) ||
                         (bound is RequiredLowerBound.Hold || bound is RequiredLowerBound.Floor ||
                             bound is RequiredLowerBound.Intent || bound is RequiredLowerBound.Seal ||
-                            bound is RequiredLowerBound.Request) &&
+                            bound is RequiredLowerBound.Request) && !mutationSlot &&
                         entry.original.toPayloadEntry() != original?.toPayloadEntry()) null
                     else RetainedDestinationTuple.Payload(destination, entry.original)
                 }

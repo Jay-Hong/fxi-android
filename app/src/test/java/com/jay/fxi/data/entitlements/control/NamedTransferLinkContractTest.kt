@@ -484,7 +484,8 @@ class NamedTransferLinkContractTest {
         val rc = rebindStore.control.prepareRebindRequests(listOf(oldRebind), F.binding, LifecycleOrderSource(F.life, 21))
         val rn = derivation(rc).orderedSlots.single { it.key.component == ObligationComponent.REQUEST && it.key.branch == LandingBranch.N }
         rejectedRetained(PriorStorageConfirmation.confirmRetainedSource(rn, locator, lockedRead(rebindStore)), RetainedConfirmationFailure.NO_EXACT_RETAINED_ROW)
-        // Named REQUEST with source=null (R) and an Add REQUEST have no fixed SOURCE/BEFORE row.
+        // Named REQUEST with source=null (R) has no fixed SOURCE/BEFORE row. An Add REQUEST is a retained source from its AFTER
+        // row since 6-4bC1b-0 (consensus C1b-D2); here its row is absent from the record, so it has no exact retained row.
         val ref = RetiredNamespaceFixtures.command(R)
         val named = (deriveRequiredObligations(RequirementInput.Settlement(ref, ref.body as ControlCommandBody.Handover)) as RequirementDerivation.Available)
             .orderedSlots.single { it.key.component == ObligationComponent.REQUEST && it.key.branch == LandingBranch.N }
@@ -498,7 +499,7 @@ class NamedTransferLinkContractTest {
             MutationAdoption.Current(listOf(ControlCommandTarget(add.proposedId, (add.built as ControlWriteResult.Written).node, false)))))
             as RequirementDerivation.Available).orderedSlots.single { it.key.component == ObligationComponent.REQUEST && it.key.branch == LandingBranch.N }
         rejectedRetained(PriorStorageConfirmation.confirmRetainedSource(addN, DestinationLocator.Payload(ControlKind.DEMAND, add.proposedId), lockedRead(s)),
-            RetainedConfirmationFailure.NOT_A_REQUIRED_SOURCE)
+            RetainedConfirmationFailure.NO_EXACT_RETAINED_ROW)
     }
 
     // ═══ measurement r1 additions (Codex 6-4bA3b1_survivors_codex.r1.md; forged tokens use the real Confirmed.copy path) ═══
