@@ -7,6 +7,7 @@ import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.OWNER_U
 import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.USER_EPOCH
 import com.jay.fxi.data.entitlements.RecordTransactionEvidence
 import com.jay.fxi.data.entitlements.RecordTransactionResult
+import com.jay.fxi.data.entitlements.StoreOp
 import java.util.Collections
 
 internal class CompletionHandoff(
@@ -140,6 +141,78 @@ internal sealed interface RetainedDestinationTuple {
     data class Journal(
         override val locator: DestinationLocator.Journal
     ) : RetainedDestinationTuple
+
+    class RetirementJournal(
+        override val locator: DestinationLocator.Journal,
+        val scope: RetirementScope,
+        val observedAfter: FenceV1,
+        settledSeals: List<ControlNode>
+    ) : RetainedDestinationTuple {
+        val settledSeals: List<ControlNode> = Collections.unmodifiableList(settledSeals.toList())
+    }
+}
+
+private data class RetirementSealSource(
+    val original: ControlNode,
+    val seal: SealV1,
+    val witness: SettlementEvidenceV1
+)
+
+/** Rebuild the axis and its indexed SOURCE facts from the fixed writer input. */
+private fun retirementSealSources(requirement: SlotRequirement.Required,
+    scope: RetirementScope, role: ObligationRole): List<RetirementSealSource>? {
+    val sources = requirement.fixedSources
+    val rotation = sources.mapNotNull { (it.fact as? FixedSourceFact.RotationInput)?.value }
+    val settlement = sources.mapNotNull { (it.fact as? FixedSourceFact.SettlementInput)?.value }
+    if (sources.any { fixed ->
+            (fixed.fact is FixedSourceFact.RotationInput &&
+                fixed.location != FixedInputLocation(FixedInputRoot.ROTATION_INPUT, null, FixedInputFacet.WHOLE)) ||
+                (fixed.fact is FixedSourceFact.SettlementInput &&
+                    fixed.location != FixedInputLocation(FixedInputRoot.SETTLEMENT_INPUT, null, FixedInputFacet.WHOLE))
+        }) return null
+    val root: FixedInputRoot
+    val selected: List<Pair<Int, RetirementSealSource>>
+    when {
+        role == ObligationRole.Rotation && rotation.size == 1 && settlement.isEmpty() -> {
+            val fixed = rotation.single()
+            if (scope.before != fixed.before || scope.after != fixed.after) return null
+            root = FixedInputRoot.ROTATION_TARGET
+            selected = fixed.sealTargets.withIndex().filter { it.value.seal.key.axis == scope.journalKey.axis }
+                .map { (index, target) -> index to RetirementSealSource(target.original, target.seal,
+                    fixed.witness(target.seal)) }
+        }
+        role == ObligationRole.Settlement(HandoverSettlementTransition.CURRENT_NULL) &&
+            settlement.size == 1 && rotation.isEmpty() -> {
+            val fixed = settlement.single() as? CurrentNullSettlement ?: return null
+            if (scope.before != fixed.before || scope.after != fixed.after ||
+                scope.journalKey.axis !in fixed.axes) return null
+            root = FixedInputRoot.SETTLEMENT_TARGET
+            val writer = CurrentNullSettlementTransition(ControlPayloadCodec())
+            selected = fixed.targets.withIndex().filter { it.value.seal.key.axis == scope.journalKey.axis }
+                .map { (index, target) -> index to RetirementSealSource(target.original, target.seal,
+                    writer.witness(fixed, target.seal)) }
+        }
+        else -> return null
+    }
+    if (selected.isEmpty() || scope.sourceId != selected.first().second.seal.id) return null
+    val representative = selected.first().second.seal
+    val epoch = if (root == FixedInputRoot.ROTATION_TARGET) representative.key.epoch else null
+    if (scope.journalKey != JournalTargetV1(representative.key.ownerUid, representative.key.axis, epoch) ||
+        selected.map { it.second.seal.id }.distinct().size != selected.size) return null
+    val fixedRows = sources.filter { it.location.root == root }
+    if (selected.any { it.second.seal.settlement != null } ||
+        sources.any { it.location.root in setOf(FixedInputRoot.ROTATION_TARGET, FixedInputRoot.SETTLEMENT_TARGET) &&
+            it.location.root != root } ||
+        fixedRows.size != selected.size || fixedRows.zip(selected).any { (fixed, indexed) ->
+            val (index, expected) = indexed
+            val fact = fixed.fact as? FixedSourceFact.Node
+            fixed.location != FixedInputLocation(root, index, FixedInputFacet.SOURCE) ||
+                fact == null || fact.kind != ControlKind.SEAL ||
+                fact.value.toPayloadEntry() != expected.original.toPayloadEntry() ||
+                ((ControlObligations.read(ControlKind.SEAL, fact.value) as? ControlEntryRead.Interpreted)
+                    ?.value as? SealV1)?.id != expected.seal.id
+        }) return null
+    return selected.map { it.second }
 }
 
 internal sealed interface ConfirmationBinding {
@@ -336,6 +409,9 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                     hasOriginalSourceRow(requirement, ControlKind.SEAL)
                 is RequiredLowerBound.Request -> slot.key.component == ObligationComponent.REQUEST &&
                     bound.source != null && hasOriginalSourceRow(requirement, ControlKind.DEMAND)
+                is RequiredLowerBound.NamespaceRetirement ->
+                    slot.key.component == ObligationComponent.NAMESPACE_RETIREMENT &&
+                        hasOriginalSourceRow(requirement, ControlKind.SEAL)
                 else -> false
             }
         }
@@ -422,6 +498,9 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                                 ?.value == source
                         } == true
                 } == true
+                is RequiredLowerBound.NamespaceRetirement -> subject == bound.scope &&
+                    destination == DestinationLocator.Journal(bound.scope.journalKey) &&
+                    retirementSealSources(requirement, bound.scope, slot.key.role) != null
                 else -> false
             }
             if (!subjectMatches) return reject(RetainedConfirmationFailure.SUBJECT_OR_BOUND_MISMATCH)
@@ -455,7 +534,32 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                 is DestinationLocator.Journal -> {
                     val canonical = NamespaceSettlementTransition(ControlPayloadCodec()).canonicalJournal(read.original)
                     if (canonical == null || compareJournal(destination.key, canonical) != TypedComparison.Matches) null
-                    else RetainedDestinationTuple.Journal(destination)
+                    else if (bound is RequiredLowerBound.NamespaceRetirement) {
+                        val sources = retirementSealSources(requirement, bound.scope, slot.key.role)
+                        val raw = read.original
+                        if (sources == null || !raw.validType<String>(OWNER_UID) ||
+                            !raw.validType<String>(USER_EPOCH) || !raw.validType<String>(KRX_EPOCH) ||
+                            !ControlLifecycleBoundary.fence(raw, bound.scope.after) ||
+                            read.arrays.getValue(ControlKind.SEAL).entries.any {
+                                it is ControlEntryRead.Uninterpretable
+                            }) null
+                        else {
+                            val writer = NamespaceSettlementTransition(ControlPayloadCodec())
+                            val rows = sources.map { source ->
+                                val found = read.locations(source.seal.id).singleOrNull()
+                                val entry = found?.second as? ControlEntryRead.Interpreted
+                                val actual = entry?.value as? SealV1
+                                if (found?.first != ControlKind.SEAL || entry == null || actual == null ||
+                                    !writer.immutableSealMatches(entry.original, source.original) ||
+                                    actual.settlement == null ||
+                                    !writer.witnessMatches(actual.settlement, source.witness)) null
+                                else entry.original
+                            }
+                            if (rows.any { it == null }) null
+                            else RetainedDestinationTuple.RetirementJournal(destination, bound.scope,
+                                bound.scope.after, rows.filterNotNull())
+                        }
+                    } else RetainedDestinationTuple.Journal(destination)
                 }
             } ?: return reject(RetainedConfirmationFailure.NO_EXACT_RETAINED_ROW)
             return RetainedSourceConfirmationResult.Issued(PriorStorageConfirmation(
@@ -796,7 +900,7 @@ internal fun assessG05(
                 if (entry.value.disposition !is HandoffDisposition.CompletedAndConsumed) continue
                 if (requirement.allowed == AllowedSlotDisposition.DURABLY_OWNED_ONLY)
                     failures += failure(G05Id.COMPLETED_CONFLICT, slot, entry.index)
-                for (actual in completionConflicts(requirement.lowerBound, slot.key, latest, available.orderedSlots))
+                for (actual in completionConflicts(slot, latest, available.orderedSlots))
                     failures += failure(G05Id.COMPLETED_CONFLICT, slot, entry.index, actual)
             }
         }
@@ -1021,6 +1125,8 @@ private fun inspectRetainedConfirmation(slot: RequiredSlot, owned: HandoffDispos
                 compareJournal(observed.locator.key, listOf(it)) == TypedComparison.Matches
             })
         }
+        // A4b supplies the independent destination, lower-bound, and continuity checks.
+        is RetainedDestinationTuple.RetirementJournal -> ConfirmationFinding(false)
     }
 }
 
@@ -1143,12 +1249,13 @@ private fun inspectDestination(locator: DestinationLocator, requirement: SlotReq
 }
 
 private fun completionConflicts(
-    bound: RequiredLowerBound,
-    key: RequiredObligationKey,
+    slot: RequiredSlot,
     latest: ControlRecordRead,
     allSlots: List<RequiredSlot>
 ): List<G05Location> {
     if (latest !is ControlRecordRead.Supported) return listOf(G05Location.ActualMetadata)
+    val requirement = slot.requirement as SlotRequirement.Required
+    val bound = requirement.lowerBound
     val result = linkedSetOf<G05Location>()
 
     fun rows(kind: ControlKind, matching: (ControlObligationV1) -> Boolean) {
@@ -1239,7 +1346,32 @@ private fun completionConflicts(
                         is RequiredLowerBound.Seal -> ControlKind.SEAL.takeIf { candidate.source.id == scope.sourceId }
                         else -> null
                     } }
-                sameId(checkNotNull(sourceKind), scope.sourceId)
+                if (sourceKind == ControlKind.SEAL) {
+                    val sources = retirementSealSources(requirement, scope, slot.key.role)
+                    if (sources == null) result += G05Location.ActualMetadata
+                    else {
+                        // An opaque SEAL can hide any fixed id, including one it cannot expose.
+                        rows(ControlKind.SEAL) { false }
+                        for (source in sources) {
+                            val matches = latest.locations(source.seal.id)
+                            for ((kind, entry) in matches) {
+                                val at = G05Location.ActualPayload(kind,
+                                    latest.arrays.getValue(kind).entries.indexOfFirst { it === entry })
+                                val actual = (entry as? ControlEntryRead.Interpreted)?.value as? SealV1
+                                val witness = actual?.settlement
+                                val eligible = matches.size == 1 && kind == ControlKind.SEAL && actual != null &&
+                                    actual.kind == source.seal.kind && actual.key == source.seal.key &&
+                                    witness is SettlementEvidenceV1 && when (slot.key.branch) {
+                                        LandingBranch.L -> witness == source.witness
+                                        LandingBranch.N -> witness.operation == StoreOp.BEGIN_ROTATION &&
+                                            witness.before == scope.before && witness.after == scope.after &&
+                                            witness.journal == scope.journalKey
+                                    }
+                                if (!eligible) result += at
+                            }
+                        }
+                    }
+                } else sameId(checkNotNull(sourceKind), scope.sourceId)
             }
             journal(scope.journalKey)
             fence(scope.before, scope.after)

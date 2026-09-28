@@ -76,7 +76,7 @@ class FloorIssuanceContractTest {
     private fun observedRow(b: ConfirmationBinding.RetainedSource) = when (val o = b.observed) {
         is RetainedDestinationTuple.Payload -> o.row
         is RetainedDestinationTuple.Guard -> o.row
-        is RetainedDestinationTuple.Journal -> error("no row")
+        is RetainedDestinationTuple.Journal, is RetainedDestinationTuple.RetirementJournal -> error("no row")
     }.toPayloadEntry()
 
     // ═══ retained floor rows ═══════════════════════════════════════════════════════════════════════════════════════════
