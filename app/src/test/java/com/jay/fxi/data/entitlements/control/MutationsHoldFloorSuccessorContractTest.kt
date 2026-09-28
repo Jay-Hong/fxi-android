@@ -638,4 +638,103 @@ class MutationsHoldFloorSuccessorContractTest {
         assertTrue("fixture: auth changed", guard(u.after)?.auth != guard(run.r.guardAfter)?.auth)
         chainTransferred(run, listOf(u))
     }
+
+    // ═══ contract r7 — 6-4bC1d-3a: the old command also edits the guard RECOVER_HOLD rewrites (consensus D6) ════════════
+    // Action 0 adds the HOLD, action 1 is a no-op Edit of the existing guard "g" (floor and AUTH). After the real 5d the guard
+    // FLOOR slots of action 1 submit their own chain GuardFloor(old g) → GuardFloor(5d output); the AUTH slots, preserved by
+    // 5d, are retained on the guard's AUTH part.
+    private inner class WithGuard(val c: CommandRef, val r: Recover, val oldGuard: ControlNode)
+    private suspend fun withGuardEdit(): WithGuard {
+        val g = H.guard(); seed(g)
+        val a = holdAdd(); val c = oldU(a, fx.store.edit(ControlKind.DEMAND, g) {}, own = 1)
+        val r = recover(holdId(a), "g")
+        assertEquals("fixture: guard REPLACE", LifecycleEffect.REPLACE, r.guardFixed.target.effect)
+        assertEquals("fixture: AUTH preserved by 5d", guard(g)?.auth, guard(r.guardAfter)?.auth)
+        return WithGuard(c, r, g)
+    }
+    private fun guardFirstLink(w: WithGuard, t: PriorStorageConfirmation) =
+        linked(NamedTransferLink.linkNamedTransfer(guardSource(w.r.c, w.oldGuard), output(w.r), t))
+    private suspend fun retainedAuth(b1: B1, branch: LandingBranch) {
+        val slot = b1.s.of(1, ObligationComponent.AUTH, branch); val d = DestinationLocator.Guard("g", GuardPart.AUTH)
+        val t = PriorStorageConfirmation.confirmRetainedSource(slot, d, lockedRead())
+        assertTrue("fixture: AUTH retained token, got $t", t is RetainedSourceConfirmationResult.Issued)
+        recorded(b1.h.recordConfirmedTransfer(b1.b, slot.key,
+            HandoffDisposition.DurablyOwned(d, emptyList(), (t as RetainedSourceConfirmationResult.Issued).value)))
+    }
+    private suspend fun lockedRead() = controlTestTimeout("locked read") {
+        fx.storage.owner.transactRecord { raw -> RecordTransactionDecision.Observe(ControlRecordReader().read(raw) as ControlRecordRead.Supported) }
+    }
+
+    @Test fun M1_holdAndSameGuardEdit_bothFloorChainsAndRetainedAuth_transferred() = runReleaseTest {
+        val w = withGuardEdit(); val b1 = B1(w.c); b1.completeSources()
+        val t = token(w.r); val holdChain = listOf(holdLink(w.r, t)); val guardChain = listOf(guardFirstLink(w, t))
+        for (branch in listOf(L, N)) {
+            recorded(b1.floor(b1.s.of(0, ObligationComponent.FLOOR, branch), w.r.destination, holdChain, t))
+            recorded(b1.floor(b1.s.of(1, ObligationComponent.FLOOR, branch), w.r.destination, guardChain, t))
+            retainedAuth(b1, branch)
+        }
+        transferred(w.c, issued(b1.issue()), 1)
+    }
+
+    @Test fun M2_guardFloorSlotWithTheHoldsLinkOrAnEmptyChain_invalidConfirmation() = runReleaseTest {
+        val w = withGuardEdit(); val b1 = B1(w.c); val t = token(w.r)
+        val slot = b1.s.of(1, ObligationComponent.FLOOR, L)
+        invalid(b1.floor(slot, w.r.destination, listOf(holdLink(w.r, t)), t))
+        invalid(b1.floor(slot, w.r.destination, emptyList(), t))
+    }
+
+    @Test fun M3_guardFloorNNotRecorded_b1IncompleteSlots() = runReleaseTest {
+        val w = withGuardEdit(); val b1 = B1(w.c); b1.completeSources()
+        val t = token(w.r); val holdChain = listOf(holdLink(w.r, t)); val guardChain = listOf(guardFirstLink(w, t))
+        for (branch in listOf(L, N)) {
+            recorded(b1.floor(b1.s.of(0, ObligationComponent.FLOOR, branch), w.r.destination, holdChain, t))
+            retainedAuth(b1, branch)
+        }
+        recorded(b1.floor(b1.s.of(1, ObligationComponent.FLOOR, L), w.r.destination, guardChain, t))
+        refusedIssue(b1.issue(), HandoffIssueRefusal.INCOMPLETE_OR_INVALID_SLOTS)
+    }
+
+    private fun failuresAt(i: HandoffIssueResult.Issued, s: Slots, index: Int, component: ObligationComponent, id: G05Id, actual: G05Location?) =
+        listOf(L, N).map { branch -> val slot = s.of(index, component, branch)
+            G05Failure(id, slot.key, G05Location.Fixed((slot.requirement as SlotRequirement.Required).fixedSources.first().location),
+                G05Location.Submitted(i.handoff.slots.indexOfFirst { it.key == slot.key }), actual) }
+
+    /** M4: a later recordFloor extends only the HOLD chain; the guard chain stops at the 5d output: G05 CONFIRMATION on it. */
+    @Test fun M4_laterRecordFloorLinkedOnlyForTheHold_guardFloorStale_g05Confirmation() = runReleaseTest {
+        val w = withGuardEdit(); val t = token(w.r)
+        val m = floorStep(w.r.guardAfter)
+        val b1 = B1(w.c); b1.completeSources()
+        val holdChain = listOf(holdLink(w.r, t), m.link); val guardChain = listOf(guardFirstLink(w, t))
+        for (branch in listOf(L, N)) {
+            retainedAuth(b1, branch)
+            recorded(b1.floor(b1.s.of(0, ObligationComponent.FLOOR, branch), m.link.destination.locator, holdChain, m.token))
+            recorded(b1.floor(b1.s.of(1, ObligationComponent.FLOOR, branch), w.r.destination, guardChain, t))
+        }
+        val i = issued(b1.issue())
+        val at = G05Location.ActualPayload(ControlKind.DEMAND, guardIndex("g"))
+        g05Refused(w.c, i, failuresAt(i, b1.s, 1, ObligationComponent.FLOOR, G05Id.CONFIRMATION, at))
+    }
+
+    /**
+     * M5 (scope boundary, consensus D6): a later UPDATE_AUTH changes the same guard's AUTH. Both FLOOR chains reach the latest
+     * guard, but the old AUTH retained tokens no longer match: G05 CONFIRMATION and LOWER_BOUND on AUTH L/N; a new retained
+     * token cannot be issued. The AUTH successor handover is C1d-4.
+     */
+    @Test fun M5_laterUpdateAuthChangesTheAuth_oldAuthRefused() = runReleaseTest {
+        val w = withGuardEdit(); val t = token(w.r)
+        val b1 = B1(w.c); b1.completeSources()
+        for (branch in listOf(L, N)) retainedAuth(b1, branch)
+        val u = callerStep(w.r.guardAfter)
+        val holdChain = listOf(holdLink(w.r, t), u.link); val guardChain = listOf(guardFirstLink(w, t), u.link)
+        for (branch in listOf(L, N)) {
+            recorded(b1.floor(b1.s.of(0, ObligationComponent.FLOOR, branch), u.link.destination.locator, holdChain, u.token))
+            recorded(b1.floor(b1.s.of(1, ObligationComponent.FLOOR, branch), u.link.destination.locator, guardChain, u.token))
+        }
+        assertEquals(RetainedSourceConfirmationResult.Rejected(RetainedConfirmationFailure.NO_EXACT_RETAINED_ROW),
+            PriorStorageConfirmation.confirmRetainedSource(b1.s.of(1, ObligationComponent.AUTH, L), DestinationLocator.Guard("g", GuardPart.AUTH), lockedRead()))
+        val i = issued(b1.issue())
+        val at = G05Location.ActualPayload(ControlKind.DEMAND, guardIndex("g"))
+        g05Refused(w.c, i, failuresAt(i, b1.s, 1, ObligationComponent.AUTH, G05Id.CONFIRMATION, at) +
+            failuresAt(i, b1.s, 1, ObligationComponent.AUTH, G05Id.LOWER_BOUND, at))
+    }
 }

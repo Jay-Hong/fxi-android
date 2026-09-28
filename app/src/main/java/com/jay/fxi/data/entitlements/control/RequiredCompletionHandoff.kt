@@ -1314,8 +1314,8 @@ internal fun namedChainOwnerValid(slot: RequiredSlot, owned: HandoffDisposition.
     else link.responsibilityOwner == owner
 }
 
-/** B1 successor recording and issuance predicate; G05 checks named chain structure and owner separately. */
-internal fun mutationHoldFloorChainValid(slot: RequiredSlot, owned: HandoffDisposition.DurablyOwned,
+/** B1 Mutations FLOOR successor recording and issuance predicate; G05 checks named chain structure and owner separately. */
+internal fun mutationFloorChainValid(slot: RequiredSlot, owned: HandoffDisposition.DurablyOwned,
     exactCommand: CommandRef, owner: ResponsibilityOwner): Boolean {
     val bound = (slot.requirement as? SlotRequirement.Required)?.lowerBound as? RequiredLowerBound.Floor
         ?: return false
@@ -1325,9 +1325,13 @@ internal fun mutationHoldFloorChainValid(slot: RequiredSlot, owned: HandoffDispo
         is ConfirmationBinding.MutationFloorOutput -> confirmation.command
         is ConfirmationBinding.RetainedSource -> return false
     }
+    val firstSourceMatches = when (bound.sourceKind) {
+        ControlKind.HOLD -> owned.linkChain.first().source is TypedSourceTuple.HoldFloor
+        ControlKind.DEMAND -> owned.linkChain.first().source is TypedSourceTuple.GuardFloor
+        else -> false
+    }
     return slot.key.role is ObligationRole.MutationAction &&
-        slot.key.component == ObligationComponent.FLOOR && bound.sourceKind == ControlKind.HOLD &&
-        owned.linkChain.first().source is TypedSourceTuple.HoldFloor &&
+        slot.key.component == ObligationComponent.FLOOR && firstSourceMatches &&
         owned.linkChain.drop(1).all { it.source is TypedSourceTuple.GuardFloor } &&
         last.destination is TypedDestinationTuple.GuardFloor &&
         successorCommand !== exactCommand &&
