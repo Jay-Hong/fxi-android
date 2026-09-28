@@ -46,6 +46,8 @@ import org.junit.rules.TemporaryFolder
  *    A changed retained row (e.g. another AUTH state) is NO_EXACT_RETAINED_ROW; a changed slot — its subject, its locator, or a
  *    lower bound that no longer matches the slot's fixed original source (U03c) — is SUBJECT_OR_BOUND_MISMATCH.
  *  - A retained locator that is not the slot's own source location (same kind, other id) is SUBJECT_OR_BOUND_MISMATCH.
+ *  - 6-4bA3 consensus r6 N12 (2) (A3d1): a floor slot's original row is the fixed row that produced its floor — a lifecycle
+ *    guard's AFTER row — so END's T05 (before landing) / T05b (landed) payload expectations are the AFTER row's.
  *  - The issued binding keeps fixed values only: its non-static fields are exactly the declared ones and none holds a
  *    snapshot, record read, Preferences, proof, receipt or store result (canonical §4.2: "snapshot을 붙잡지 않는다"); the fixed
  *    descriptor and its namespace are separate copies with unmodifiable lists, plans are the same immutable plan objects.
@@ -636,11 +638,10 @@ class PriorStorageConfirmationContractTest {
         }
         val b = issuedRetained(PriorStorageConfirmation.confirmRetainedSource(slot, DestinationLocator.Guard("g", GuardPart.FLOOR), lockedRead(s)))
         assertEquals(payloadOf(g), payloadOf((b.observed as RetainedDestinationTuple.Guard).row))
-        // The same floor through the payload locator: the original row is the fixed SOURCE/BEFORE node, not the AFTER node
-        // (END changes the guard's AUTH while keeping its floor).
-        val payload = issuedRetained(PriorStorageConfirmation.confirmRetainedSource(
-            slot, DestinationLocator.Payload(ControlKind.DEMAND, "g"), lockedRead(s)))
-        assertEquals(payloadOf(g), payloadOf((payload.observed as RetainedDestinationTuple.Payload).row))
+        // The whole row through the payload locator: 6-4bA3 consensus r6 N12 (2) binds a lifecycle guard's floor slot to its
+        // fixed AFTER row, and END changes the guard's AUTH while keeping its floor — the stored before row is not it.
+        rejectedRetained(PriorStorageConfirmation.confirmRetainedSource(
+            slot, DestinationLocator.Payload(ControlKind.DEMAND, "g"), lockedRead(s)), RetainedConfirmationFailure.NO_EXACT_RETAINED_ROW)
         val shorter = open()
         controlTestTimeout("seed shorter floor") {
             shorter.data.updateData { F.raw(F.guard(F.auth.copy(binding = 2, originLifetimeId = LifetimeId("old")), 80000), r, F.request(id = "dormant", owner = "B")) }
@@ -768,8 +769,8 @@ class PriorStorageConfirmationContractTest {
             RetainedConfirmationFailure.SUBJECT_OR_BOUND_MISMATCH)
     }
 
-    /** After END lands the guard keeps its floor but its AUTH changed: the whole-row payload locator is no longer the original. */
-    @Test fun T05b_endLanded_payloadRetained_isNotTheOriginalRow() = runReleaseTest {
+    /** After END lands the guard keeps its floor and carries the new AUTH: the whole row is the fixed AFTER row (r6 N12 (2)). */
+    @Test fun T05b_endLanded_payloadRetained_isTheAfterRow() = runReleaseTest {
         val run = end()
         val slot = holdDerivation(run.c).slot {
             it.component == ObligationComponent.FLOOR && (it.subject as? ObligationSubject.Floor)?.sourceKind == ControlKind.DEMAND && it.branch == LandingBranch.N
@@ -778,7 +779,9 @@ class PriorStorageConfirmationContractTest {
             guard(demandRows(run.confirmed).single { (it.text("id") as? FieldRead.Present)?.value == "g" })?.floor ==
                 ((slot.requirement as SlotRequirement.Required).lowerBound as RequiredLowerBound.Floor).captured)
         issuedRetained(PriorStorageConfirmation.confirmRetainedSource(slot, DestinationLocator.Guard("g", GuardPart.FLOOR), run.confirmed))
-        rejectedRetained(PriorStorageConfirmation.confirmRetainedSource(slot, DestinationLocator.Payload(ControlKind.DEMAND, "g"), run.confirmed),
-            RetainedConfirmationFailure.NO_EXACT_RETAINED_ROW)
+        val after = checkNotNull(run.fixed.targets.single { it.target.id == "g" }.after)
+        val payload = issuedRetained(PriorStorageConfirmation.confirmRetainedSource(slot, DestinationLocator.Payload(ControlKind.DEMAND, "g"),
+            run.confirmed))
+        assertEquals(payloadOf(after), payloadOf((payload.observed as RetainedDestinationTuple.Payload).row))
     }
 }

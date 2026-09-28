@@ -214,7 +214,8 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                         outputTarget.effect == LifecycleEffect.REPLACE && outputFixed.before != null
                 LifecycleTransition.RECOVER_HOLD ->
                     outputFixed.role == LifecycleRole.GUARD && outputTarget.kind == ControlKind.DEMAND &&
-                        outputTarget.effect == LifecycleEffect.REPLACE && outputFixed.before != null
+                        ((outputTarget.effect == LifecycleEffect.REPLACE && outputFixed.before != null) ||
+                            (outputTarget.effect == LifecycleEffect.CREATE && outputFixed.before == null))
                 else -> false
             }
             if (!supported) return reject(LifecycleConfirmationFailure.UNSUPPORTED_TRANSITION_OR_TARGET)
@@ -270,6 +271,8 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                 fixed.transition == LifecycleTransition.RECOVER_HOLD -> {
                     val parsed = entry.value as? ScheduleGuardV1
                         ?: return reject(LifecycleConfirmationFailure.SNAPSHOT_OUTPUT_MISMATCH)
+                    if (parsed.floor == null)
+                        return reject(LifecycleConfirmationFailure.SNAPSHOT_OUTPUT_MISMATCH)
                     TypedDestinationTuple.GuardFloor(DestinationLocator.Guard(outputTarget.id, GuardPart.FLOOR),
                         entry.original, parsed)
                 }
@@ -355,6 +358,59 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
             fact.value.takeIf { parsed?.id == id }
         }.distinctBy { it.toPayloadEntry() }.singleOrNull()
 
+        private data class FloorFixedRow(val node: ControlNode, val subjectOrigin: LifetimeId)
+
+        private fun floorFixedRow(slot: RequiredSlot, requirement: SlotRequirement.Required,
+            bound: RequiredLowerBound.Floor): FloorFixedRow? {
+            fun node(root: FixedInputRoot, index: Int, facet: FixedInputFacet): ControlNode? =
+                requirement.fixedSources.filter { it.location == FixedInputLocation(root, index, facet) }
+                    .mapNotNull { (it.fact as? FixedSourceFact.Node)?.value }
+                    .singleOrNull()
+
+            val selected: ControlNode
+            val before: ControlNode?
+            when (val role = slot.key.role) {
+                is ObligationRole.MutationAction -> {
+                    val root = FixedInputRoot.MUTATION_ACTION
+                    // A HOLD edit is a raw no-op, so its AFTER is also the original floor row.
+                    selected = node(root, role.index, FixedInputFacet.AFTER) ?: return null
+                    before = node(root, role.index, FixedInputFacet.BEFORE)
+                }
+                is ObligationRole.Lifecycle -> {
+                    val hold = role.role == LifecycleRole.HOLD
+                    // Descriptor validation makes target IDs unique across target and unchanged rows.
+                    val rows = requirement.fixedSources.filter { fixed ->
+                        fixed.location.facet == FixedInputFacet.WHOLE &&
+                            (fixed.fact as? FixedSourceFact.LifecycleTarget)?.value?.let { row ->
+                                row.target.id == bound.sourceId
+                            } == true
+                    }
+                    val fixed = rows.singleOrNull() ?: return null
+                    val row = (fixed.fact as FixedSourceFact.LifecycleTarget).value
+                    val root = fixed.location.root
+                    val index = fixed.location.index ?: return null
+                    val facet = if (hold) FixedInputFacet.SOURCE else FixedInputFacet.AFTER
+                    selected = node(root, index, facet) ?: return null
+                    before = row.before
+                }
+                else -> return null
+            }
+            val parsed = (ControlObligations.read(bound.sourceKind, selected) as? ControlEntryRead.Interpreted)?.value
+                ?: return null
+            val floor = when (parsed) {
+                is RestoredHold -> parsed.floor
+                is ScheduleGuardV1 -> parsed.floor
+                else -> null
+            } ?: return null
+            if (parsed.id != bound.sourceId || floor != bound.captured) return null
+            // A recaptured guard keeps the previous floor's origin in its subject, while its bound is the AFTER floor.
+            val origin = if (parsed is ScheduleGuardV1) {
+                val old = before?.let { guard(it) ?: return null }
+                old?.floor?.originLifetimeId ?: floor.originLifetimeId
+            } else floor.originLifetimeId
+            return FloorFixedRow(selected, origin)
+        }
+
         private fun confirmRetained(slot: RequiredSlot, destination: DestinationLocator,
             read: ControlRecordRead.Supported, evidence: RecordTransactionEvidence): RetainedSourceConfirmationResult {
             fun reject(reason: RetainedConfirmationFailure) = RetainedSourceConfirmationResult.Rejected(reason)
@@ -363,6 +419,7 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
             val requirement = slot.requirement as SlotRequirement.Required
             val bound = requirement.lowerBound
             val subject = slot.key.subject
+            val floorFixed = (bound as? RequiredLowerBound.Floor)?.let { floorFixedRow(slot, requirement, it) }
             val subjectMatches = when (bound) {
                 is RequiredLowerBound.Hold -> subject == ObligationSubject.Hold(bound.source.id,
                     bound.source.originLifetimeId, bound.source.binding, bound.source.provenance, bound.source.axes) &&
@@ -372,16 +429,9 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                             as? ControlEntryRead.Interpreted)?.value as? RestoredHold
                         fixed != null && compareHold(bound.source, fixed) == TypedComparison.Matches
                     } == true
-                is RequiredLowerBound.Floor -> subject == ObligationSubject.Floor(bound.sourceKind,
-                    bound.sourceId, bound.captured.originLifetimeId) &&
-                    originalSourceRow(requirement, bound.sourceKind, bound.sourceId)?.let { original ->
-                        when (val value = (ControlObligations.read(bound.sourceKind, original)
-                            as? ControlEntryRead.Interpreted)?.value) {
-                            is RestoredHold -> value.id == bound.sourceId && value.floor == bound.captured
-                            is ScheduleGuardV1 -> value.id == bound.sourceId && value.floor == bound.captured
-                            else -> false
-                        }
-                    } == true && when (destination) {
+                is RequiredLowerBound.Floor -> floorFixed?.let { fixed ->
+                    subject == ObligationSubject.Floor(bound.sourceKind, bound.sourceId, fixed.subjectOrigin)
+                } == true && when (destination) {
                     is DestinationLocator.Payload -> destination == DestinationLocator.Payload(bound.sourceKind, bound.sourceId)
                     is DestinationLocator.Guard -> bound.sourceKind == ControlKind.DEMAND &&
                         destination == DestinationLocator.Guard(bound.sourceId, GuardPart.FLOOR)
@@ -432,7 +482,9 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                 is DestinationLocator.Payload -> {
                     val found = read.locations(destination.id).singleOrNull()
                     val entry = found?.second as? ControlEntryRead.Interpreted
-                    val original = originalSourceRow(requirement, destination.kind, destination.id)
+                    val original = if (bound is RequiredLowerBound.Floor)
+                        floorFixed?.node
+                    else originalSourceRow(requirement, destination.kind, destination.id)
                     if (entry == null ||
                         (bound !is RequiredLowerBound.Intent && !retainedRowMatches(bound, entry)) ||
                         (bound is RequiredLowerBound.Hold || bound is RequiredLowerBound.Floor ||
