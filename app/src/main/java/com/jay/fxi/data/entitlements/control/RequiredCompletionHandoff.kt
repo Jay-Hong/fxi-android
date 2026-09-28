@@ -868,7 +868,7 @@ internal fun assessG05(
                 val namedStructure = owned.linkChain.isNotEmpty() &&
                     namedChainStructurallyValid(slot, owned, exactCommand)
                 val terminal = owned.linkChain.lastOrNull().takeIf { namedStructure }
-                val destination = inspectDestination(owned.destination, requirement, slot.key.branch,
+                val destination = inspectDestination(owned.destination, requirement, slot.key.branch, slot.key.role,
                     terminal, latest, now)
                 if (!destination.exists)
                     failures += failure(G05Id.DESTINATION, slot, entry.index, destination.actualAt)
@@ -888,7 +888,8 @@ internal fun assessG05(
                 if (!confirmation.valid)
                     failures += failure(G05Id.CONFIRMATION, slot, entry.index, confirmation.actualAt)
                 if (destination.exists && destination.lowerBound != true)
-                    failures += failure(G05Id.LOWER_BOUND, slot, entry.index, destination.actualAt)
+                    failures += failure(G05Id.LOWER_BOUND, slot, entry.index,
+                        destination.lowerBoundAt ?: destination.actualAt)
                 if (requirement.allowed == AllowedSlotDisposition.COMPLETED_AND_CONSUMED_ONLY)
                     failures += failure(G05Id.COMPLETED_CONFLICT, slot, entry.index)
             }
@@ -926,7 +927,8 @@ internal fun assessG05(
 private data class DestinationFinding(
     val actualAt: G05Location?,
     val exists: Boolean,
-    val lowerBound: Boolean? = null
+    val lowerBound: Boolean? = null,
+    val lowerBoundAt: G05Location? = null
 )
 
 private data class ConfirmationFinding(
@@ -1125,9 +1127,54 @@ private fun inspectRetainedConfirmation(slot: RequiredSlot, owned: HandoffDispos
                 compareJournal(observed.locator.key, listOf(it)) == TypedComparison.Matches
             })
         }
-        // A4b supplies the independent destination, lower-bound, and continuity checks.
-        is RetainedDestinationTuple.RetirementJournal -> ConfirmationFinding(false)
+        is RetainedDestinationTuple.RetirementJournal -> {
+            val requirement = slot.requirement as? SlotRequirement.Required
+                ?: return ConfirmationFinding(false)
+            val bound = requirement.lowerBound as? RequiredLowerBound.NamespaceRetirement
+                ?: return ConfirmationFinding(false)
+            val sources = retirementSealSources(requirement, bound.scope, slot.key.role)
+                ?: return ConfirmationFinding(false)
+            val canonical = NamespaceSettlementTransition(ControlPayloadCodec()).canonicalJournal(read.original)
+                ?: return ConfirmationFinding(false)
+            if (canonical.none {
+                    compareJournal(observed.locator.key, listOf(it)) == TypedComparison.Matches
+                }) return ConfirmationFinding(false)
+            inspectRetirementSeals(read, sources, bound.scope.after)
+        }
     }
+}
+
+private fun retirementSealMatches(row: ControlNode, seal: SealV1?, source: RetirementSealSource): Boolean {
+    val writer = NamespaceSettlementTransition(ControlPayloadCodec())
+    return seal != null && seal.id == source.seal.id &&
+        writer.immutableSealMatches(row, source.original) &&
+        seal.settlement?.let { writer.witnessMatches(it, source.witness) } == true
+}
+
+private fun inspectRetirementSeals(read: ControlRecordRead.Supported,
+    sources: List<RetirementSealSource>, after: FenceV1): ConfirmationFinding {
+    val raw = read.original
+    if (!raw.validType<String>(OWNER_UID) || !raw.validType<String>(USER_EPOCH) ||
+        !raw.validType<String>(KRX_EPOCH) || !ControlLifecycleBoundary.fence(raw, after))
+        return ConfirmationFinding(false, G05Location.ActualMetadata)
+    val seals = read.arrays.getValue(ControlKind.SEAL).entries
+    seals.forEachIndexed { index, entry ->
+        if (entry is ControlEntryRead.Uninterpretable)
+            return ConfirmationFinding(false, G05Location.ActualPayload(ControlKind.SEAL, index))
+    }
+    for (source in sources) {
+        val matches = read.locations(source.seal.id)
+        if (matches.isEmpty()) continue // A fixed original seal may have been consumed after issuance.
+        val (kind, entry) = matches.first()
+        val at = G05Location.ActualPayload(kind,
+            read.arrays.getValue(kind).entries.indexOfFirst { it === entry })
+        val original = (entry as? ControlEntryRead.Interpreted)?.original
+        val seal = (entry as? ControlEntryRead.Interpreted)?.value as? SealV1
+        if (matches.size != 1 || kind != ControlKind.SEAL || original == null ||
+            !retirementSealMatches(original, seal, source))
+            return ConfirmationFinding(false, at)
+    }
+    return ConfirmationFinding(true)
 }
 
 private fun originalAuthGuardId(requirement: SlotRequirement.Required): String? {
@@ -1142,7 +1189,7 @@ private fun originalAuthGuardId(requirement: SlotRequirement.Required): String? 
 }
 
 private fun inspectDestination(locator: DestinationLocator, requirement: SlotRequirement.Required,
-    branch: LandingBranch, namedTerminal: NamedTransferLink?, latest: ControlRecordRead,
+    branch: LandingBranch, requirementRole: ObligationRole, namedTerminal: NamedTransferLink?, latest: ControlRecordRead,
     now: BootReading): DestinationFinding {
     val read = latest as? ControlRecordRead.Supported ?: return DestinationFinding(null, false)
     val bound = requirement.lowerBound
@@ -1243,7 +1290,13 @@ private fun inspectDestination(locator: DestinationLocator, requirement: SlotReq
                 else -> null
             }
             val exists = expected == locator.key
-            DestinationFinding(at, exists, if (exists) true else null)
+            val sources = (bound as? RequiredLowerBound.NamespaceRetirement)?.let {
+                retirementSealSources(requirement, it.scope, requirementRole)
+            }
+            val lower = if (exists && sources != null)
+                inspectRetirementSeals(read, sources, (bound as RequiredLowerBound.NamespaceRetirement).scope.after)
+            else null
+            DestinationFinding(at, exists, if (exists) (lower?.valid ?: true) else null, lower?.actualAt)
         }
     }
 }
