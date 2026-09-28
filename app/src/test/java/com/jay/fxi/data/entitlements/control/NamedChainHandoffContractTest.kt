@@ -20,13 +20,20 @@ import org.junit.rules.TemporaryFolder
  * committed issuers, never hand-built.
  *
  * Decisions this contract fixes (flagged for review):
- *  - N9: a named chain is structurally valid for a slot when (a) its first link's source is bound to the slot's A1 fixed
- *    SOURCE row (REQUEST: the fixed before; HOLD FLOOR: the fixed HOLD row; guard FLOOR: the fixed old guard), (b) every
+ *  - N9: a named chain is structurally valid for a slot when (a) its first link meets the slot's source rule
+ *    (REQUEST: its source ID resolves to one distinct interpreted A1 fixed SOURCE row; floor: see N12), (b) every
  *    link's token was issued for the exact command (binding.command === exactCommand), (c) adjacent links continue: REQUEST
  *    output → next REQUEST source, or GuardFloor output → next GuardFloor source (id, raw row, parsed; the source locator is
  *    Guard(parsed.id, FLOOR)) — any other type pair is invalid (N7), and (d) the last link's destination locator equals the
  *    submitted destination. It is then accepted when also (e) every link's owner equals the handoff owner, (f) the last link's
  *    confirmation is the very priorWrite object (===), and (g) the last output's raw row equals latest's unique row.
+ *  - 6-4bA3 consensus r6 N12 (A3d2) replaces (a), (b) and (e) for floor slots only; REQUEST keeps them. A floor chain's first
+ *    link is bound to the slot's floor-producing fixed row (lifecycle HOLD: SOURCE; Mutations action, including
+ *    no-op HOLD Edit: AFTER; lifecycle guard: AFTER), or
+ *    — RECOVER_HOLD's own guard slot only — is that command's own GuardFloor(BEFORE → AFTER) link; each link's token belongs to
+ *    the command that issued it (not necessarily this one); a HoldFloor link may only be first; link owner keys equal the
+ *    handoff owner key. Cross-command floor rows live in CrossCommandFloorContractTest; T01–T04 below pin the own-link form
+ *    against one changed derivation slot.
  *  - Structural validity (a)–(d) alone decides which lower bound applies: with it, REQUEST N uses compareNamedRequest(
  *    RequestNeed(N.source, N.minimumIntent, N.minimumOrder), last link, latest) and HOLD FLOOR's destination becomes the last
  *    link's guard FLOOR, compared against that confirmed output floor's remainingAt(now) — never the old HOLD floor again.
@@ -632,5 +639,59 @@ class NamedChainHandoffContractTest {
     @Test fun F05_recover_sameBootOutputRemainingZero_stillAccepted() = runReleaseTest {
         val run = recoverHold()
         accepted(assess(run, recoverGiven(run), afterPurge(run), BootReading("boot", 40_000)))
+    }
+
+    // ═══ 6-4bA3d2: RECOVER_HOLD own-link form against a changed derivation slot (consensus r6 N12 (2)) ═══════════════════
+    /**
+     * G05 judges the derivation it is given without re-deriving it. With one guard FLOOR N slot changed (key role/transition,
+     * fixed WHOLE.before, fixed AFTER node) the command's own GuardFloor(BEFORE → AFTER) link no longer matches that slot's own
+     * form, so the slot's confirmation fails; the unchanged latest guard still meets destination and bound.
+     */
+    private suspend fun ownLinkAgainst(change: (RequiredSlot) -> RequiredSlot) {
+        val run = recoverHold(); val latest = afterPurge(run)
+        val original = run.slot(gfN(run)); val changed = change(original)
+        val a1 = run.a1.copy(orderedSlots = run.a1.orderedSlots.map { if (it.key == original.key) changed else it })
+        val given = recoverGiven(run).mapKeys { (k, _) -> if (k == original.key) changed.key else k }
+        val required = a1.orderedSlots.filter { it.requirement is SlotRequirement.Required }
+        val handoff = CompletionHandoff(a1.commandBinding, owner(run), required.map {
+            SlotHandoff(it.key, given[it.key] ?: HandoffDisposition.CompletedAndConsumed(ComponentCompletion(it.key.subject), emptyList())) })
+        rejected(assessG05(run.c, a1, handoff, TerminationClosures.of(run.c), latest, now), listOf(G05Failure(G05Id.CONFIRMATION, changed.key,
+            G05Location.Fixed((changed.requirement as SlotRequirement.Required).fixedSources.first().location),
+            G05Location.Submitted(required.indexOfFirst { it.key == changed.key }), null)))
+    }
+    private fun withFixed(slot: RequiredSlot, change: (FixedSourceEvidence) -> FixedSourceEvidence): RequiredSlot {
+        val req = slot.requirement as SlotRequirement.Required
+        return slot.copy(requirement = req.copy(fixedSources = req.fixedSources.map(change)))
+    }
+    private fun isGuardRow(e: FixedSourceEvidence) = (e.fact as? FixedSourceFact.LifecycleTarget)?.value?.target?.id == "g"
+
+    @Test fun T01_ownLink_slotKeyTransitionChanged_confirmation() = runReleaseTest {
+        ownLinkAgainst { it.copy(key = it.key.copy(role = ObligationRole.Lifecycle(LifecycleTransition.RECOVER_INTENT, LifecycleRole.GUARD))) }
+    }
+
+    @Test fun T02_ownLink_slotKeyRoleChanged_confirmation() = runReleaseTest {
+        ownLinkAgainst { it.copy(key = it.key.copy(role = ObligationRole.Lifecycle(LifecycleTransition.RECOVER_HOLD, LifecycleRole.REQUEST))) }
+    }
+
+    @Test fun T03_ownLink_slotFixedGuardBeforeChanged_confirmation() = runReleaseTest {
+        ownLinkAgainst { slot -> withFixed(slot) { e ->
+            if (e.location.facet == FixedInputFacet.WHOLE && isGuardRow(e)) {
+                val row = (e.fact as FixedSourceFact.LifecycleTarget).value
+                e.copy(fact = FixedSourceFact.LifecycleTarget(row.copy(before = H.guard(wait = 9_999))))
+            } else e
+        } }
+    }
+
+    @Test fun T04_ownLink_slotFixedGuardAfterNodeChanged_confirmation() = runReleaseTest {
+        ownLinkAgainst { slot ->
+            val req = slot.requirement as SlotRequirement.Required
+            val guardWhole = req.fixedSources.single { it.location.facet == FixedInputFacet.WHOLE && isGuardRow(it) }.location
+            withFixed(slot) { e ->
+                if (e.location == guardWhole.copy(facet = FixedInputFacet.AFTER)) {
+                    val node = (e.fact as FixedSourceFact.Node).value
+                    e.copy(fact = FixedSourceFact.Node(ControlKind.DEMAND, H.field(node, "auth", null)))
+                } else e
+            }
+        }
     }
 }

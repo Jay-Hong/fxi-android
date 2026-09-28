@@ -358,59 +358,6 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
             fact.value.takeIf { parsed?.id == id }
         }.distinctBy { it.toPayloadEntry() }.singleOrNull()
 
-        private data class FloorFixedRow(val node: ControlNode, val subjectOrigin: LifetimeId)
-
-        private fun floorFixedRow(slot: RequiredSlot, requirement: SlotRequirement.Required,
-            bound: RequiredLowerBound.Floor): FloorFixedRow? {
-            fun node(root: FixedInputRoot, index: Int, facet: FixedInputFacet): ControlNode? =
-                requirement.fixedSources.filter { it.location == FixedInputLocation(root, index, facet) }
-                    .mapNotNull { (it.fact as? FixedSourceFact.Node)?.value }
-                    .singleOrNull()
-
-            val selected: ControlNode
-            val before: ControlNode?
-            when (val role = slot.key.role) {
-                is ObligationRole.MutationAction -> {
-                    val root = FixedInputRoot.MUTATION_ACTION
-                    // A HOLD edit is a raw no-op, so its AFTER is also the original floor row.
-                    selected = node(root, role.index, FixedInputFacet.AFTER) ?: return null
-                    before = node(root, role.index, FixedInputFacet.BEFORE)
-                }
-                is ObligationRole.Lifecycle -> {
-                    val hold = role.role == LifecycleRole.HOLD
-                    // Descriptor validation makes target IDs unique across target and unchanged rows.
-                    val rows = requirement.fixedSources.filter { fixed ->
-                        fixed.location.facet == FixedInputFacet.WHOLE &&
-                            (fixed.fact as? FixedSourceFact.LifecycleTarget)?.value?.let { row ->
-                                row.target.id == bound.sourceId
-                            } == true
-                    }
-                    val fixed = rows.singleOrNull() ?: return null
-                    val row = (fixed.fact as FixedSourceFact.LifecycleTarget).value
-                    val root = fixed.location.root
-                    val index = fixed.location.index ?: return null
-                    val facet = if (hold) FixedInputFacet.SOURCE else FixedInputFacet.AFTER
-                    selected = node(root, index, facet) ?: return null
-                    before = row.before
-                }
-                else -> return null
-            }
-            val parsed = (ControlObligations.read(bound.sourceKind, selected) as? ControlEntryRead.Interpreted)?.value
-                ?: return null
-            val floor = when (parsed) {
-                is RestoredHold -> parsed.floor
-                is ScheduleGuardV1 -> parsed.floor
-                else -> null
-            } ?: return null
-            if (parsed.id != bound.sourceId || floor != bound.captured) return null
-            // A recaptured guard keeps the previous floor's origin in its subject, while its bound is the AFTER floor.
-            val origin = if (parsed is ScheduleGuardV1) {
-                val old = before?.let { guard(it) ?: return null }
-                old?.floor?.originLifetimeId ?: floor.originLifetimeId
-            } else floor.originLifetimeId
-            return FloorFixedRow(selected, origin)
-        }
-
         private fun confirmRetained(slot: RequiredSlot, destination: DestinationLocator,
             read: ControlRecordRead.Supported, evidence: RecordTransactionEvidence): RetainedSourceConfirmationResult {
             fun reject(reason: RetainedConfirmationFailure) = RetainedSourceConfirmationResult.Rejected(reason)
@@ -826,7 +773,11 @@ internal fun assessG05(
                         inspectEndAuthOutputConfirmation(slot, owned, exactCommand, latest)
                     else inspectRetainedConfirmation(slot, owned, latest)
                 else {
-                    val ownerMatches = owned.linkChain.all { it.responsibilityOwner == handoff.responsibilityOwner }
+                    val ownerMatches = owned.linkChain.all { link ->
+                        if (requirement.lowerBound is RequiredLowerBound.Floor)
+                            link.responsibilityOwner.ownerKey == handoff.responsibilityOwner.ownerKey
+                        else link.responsibilityOwner == handoff.responsibilityOwner
+                    }
                     if (namedStructure && !ownerMatches) failures += failure(G05Id.OWNER, slot, entry.index)
                     inspectNamedConfirmation(owned, namedStructure && ownerMatches, latest)
                 }
@@ -882,6 +833,63 @@ private data class ConfirmationFinding(
 private fun sameG05Row(left: ControlNode, right: ControlNode): Boolean =
     left.toPayloadEntry() == right.toPayloadEntry()
 
+private data class FloorFixedRow(
+    val node: ControlNode,
+    val before: ControlNode?,
+    val subjectOrigin: LifetimeId
+)
+
+private fun floorFixedRow(slot: RequiredSlot, requirement: SlotRequirement.Required,
+    bound: RequiredLowerBound.Floor): FloorFixedRow? {
+    fun node(root: FixedInputRoot, index: Int, facet: FixedInputFacet): ControlNode? =
+        requirement.fixedSources.filter { it.location == FixedInputLocation(root, index, facet) }
+            .mapNotNull { (it.fact as? FixedSourceFact.Node)?.value }
+            .singleOrNull()
+
+    val selected: ControlNode
+    val before: ControlNode?
+    when (val role = slot.key.role) {
+        is ObligationRole.MutationAction -> {
+            val root = FixedInputRoot.MUTATION_ACTION
+            // A HOLD edit is a raw no-op, so its AFTER is also the original floor row.
+            selected = node(root, role.index, FixedInputFacet.AFTER) ?: return null
+            before = node(root, role.index, FixedInputFacet.BEFORE)
+        }
+        is ObligationRole.Lifecycle -> {
+            val hold = role.role == LifecycleRole.HOLD
+            // Descriptor validation makes target IDs unique across target and unchanged rows.
+            val rows = requirement.fixedSources.filter { fixed ->
+                fixed.location.facet == FixedInputFacet.WHOLE &&
+                    (fixed.fact as? FixedSourceFact.LifecycleTarget)?.value?.let { row ->
+                        row.target.id == bound.sourceId
+                    } == true
+            }
+            val fixed = rows.singleOrNull() ?: return null
+            val row = (fixed.fact as FixedSourceFact.LifecycleTarget).value
+            val root = fixed.location.root
+            val index = fixed.location.index ?: return null
+            val facet = if (hold) FixedInputFacet.SOURCE else FixedInputFacet.AFTER
+            selected = node(root, index, facet) ?: return null
+            before = row.before
+        }
+        else -> return null
+    }
+    val parsed = (ControlObligations.read(bound.sourceKind, selected) as? ControlEntryRead.Interpreted)?.value
+        ?: return null
+    val floor = when (parsed) {
+        is RestoredHold -> parsed.floor
+        is ScheduleGuardV1 -> parsed.floor
+        else -> null
+    } ?: return null
+    if (parsed.id != bound.sourceId || floor != bound.captured) return null
+    // A recaptured guard keeps the previous floor's origin in its subject, while its bound is the AFTER floor.
+    val origin = if (parsed is ScheduleGuardV1) {
+        val old = before?.let { guard(it) ?: return null }
+        old?.floor?.originLifetimeId ?: floor.originLifetimeId
+    } else floor.originLifetimeId
+    return FloorFixedRow(selected, before, origin)
+}
+
 private fun fixedNamedSource(slot: RequiredSlot, kind: ControlKind, id: String): ControlNode? =
     (slot.requirement as SlotRequirement.Required).fixedSources.mapNotNull { fixed ->
         if (fixed.location.facet != FixedInputFacet.SOURCE) return@mapNotNull null
@@ -895,16 +903,35 @@ private fun namedChainStructurallyValid(slot: RequiredSlot, owned: HandoffDispos
     exactCommand: CommandRef): Boolean {
     val links = owned.linkChain
     val first = links.firstOrNull() ?: return false
-    val bound = (slot.requirement as SlotRequirement.Required).lowerBound
+    val requirement = slot.requirement as SlotRequirement.Required
+    val bound = requirement.lowerBound
     val firstMatches = when (val source = first.source) {
         is TypedSourceTuple.Request -> bound is RequiredLowerBound.Request &&
             fixedNamedSource(slot, ControlKind.DEMAND, source.parsed.id) != null
-        is TypedSourceTuple.HoldFloor -> bound is RequiredLowerBound.Floor &&
-            bound.sourceKind == ControlKind.HOLD
-        is TypedSourceTuple.GuardFloor -> bound is RequiredLowerBound.Floor &&
-            bound.sourceKind == ControlKind.DEMAND
+        is TypedSourceTuple.HoldFloor -> {
+            val fixed = (bound as? RequiredLowerBound.Floor)?.let { floorFixedRow(slot, requirement, it) }
+            // The issuer already binds this source's ID, parsed hold, and floor to originalHold.
+            fixed != null && sameG05Row(fixed.node, source.source.originalHold)
+        }
+        is TypedSourceTuple.GuardFloor -> {
+            val fixed = (bound as? RequiredLowerBound.Floor)?.let { floorFixedRow(slot, requirement, it) }
+            val after = fixed?.node?.let(::guard)
+            val fromAfter = fixed != null && after != null &&
+                sameG05Row(fixed.node, source.preimage)
+            val role = slot.key.role as? ObligationRole.Lifecycle
+            val output = first.destination as? TypedDestinationTuple.GuardFloor
+            // RECOVER_HOLD may first transfer its own guard BEFORE floor into its AFTER row.
+            val fromOwnBefore = role?.transition == LifecycleTransition.RECOVER_HOLD &&
+                role?.role == LifecycleRole.GUARD &&
+                (first.confirmation.binding as? ConfirmationBinding.LifecycleOutput)?.command === exactCommand &&
+                fixed?.before?.let { before ->
+                    sameG05Row(before, source.preimage)
+                } == true && output != null && fixed != null && after != null &&
+                sameG05Row(output.row, fixed.node)
+            fromAfter || fromOwnBefore
+        }
     }
-    if (!firstMatches || links.any {
+    if (!firstMatches || bound is RequiredLowerBound.Request && links.any {
             (it.confirmation.binding as? ConfirmationBinding.LifecycleOutput)?.command !== exactCommand
         }) return false
     val continuous = links.zipWithNext().all { (earlier, later) ->
@@ -915,6 +942,7 @@ private fun namedChainStructurallyValid(slot: RequiredSlot, owned: HandoffDispos
             }
             is TypedDestinationTuple.GuardFloor -> {
                 val source = later.source as? TypedSourceTuple.GuardFloor
+                // Issuance binds both parsed guards and the output locator to their raw rows.
                 source != null && sameG05Row(output.row, source.preimage)
             }
             is TypedDestinationTuple.GuardAuth -> false
