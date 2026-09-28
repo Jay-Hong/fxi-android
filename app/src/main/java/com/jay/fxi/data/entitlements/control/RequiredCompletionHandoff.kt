@@ -100,6 +100,13 @@ internal sealed interface TypedSourceTuple {
         val preimage: ControlNode,
         val parsed: ScheduleGuardV1
     ) : TypedSourceTuple
+
+    /** 6-4bC1d-4b: the AUTH part of a stored guard row [preimage]. */
+    data class GuardAuth(
+        override val responsibilityOwner: ResponsibilityOwner,
+        val preimage: ControlNode,
+        val parsed: ScheduleGuardV1
+    ) : TypedSourceTuple
 }
 
 internal sealed interface TypedDestinationTuple {
@@ -136,6 +143,11 @@ private fun guardAuthRewriteKeepsFloor(before: ControlNode, after: ControlNode):
         oldFields.filterKeys { it != "auth" && it != "floor" } ==
             nextFields.filterKeys { it != "auth" && it != "floor" }
 }
+
+private fun sameAuthScope(before: AuthSnapshotV1, after: AuthSnapshotV1): Boolean =
+    before.ownerUid == after.ownerUid && before.binding == after.binding &&
+        before.originLifetimeId == after.originLifetimeId &&
+        before.authGeneration == after.authGeneration
 
 internal sealed interface RetainedDestinationTuple {
     val locator: DestinationLocator
@@ -305,20 +317,25 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
             exactCommand: CommandRef,
             fixed: ControlLifecycleDescriptor,
             confirmed: ControlStoreResult.Confirmed,
-            outputTarget: LifecycleTarget
-        ): LifecycleOutputConfirmationResult = confirmOutput(exactCommand, fixed, confirmed, outputTarget, false)
+            outputTarget: LifecycleTarget,
+            authPart: Boolean = false
+        ): LifecycleOutputConfirmationResult =
+            confirmOutput(exactCommand, fixed, confirmed, outputTarget, false, authPart = authPart)
 
         /** The sole unchanged RECOVER_HOLD guard is a real, observed output of that command. */
         fun confirmRecoverHoldUnchangedGuardOutput(
             exactCommand: CommandRef,
             fixed: ControlLifecycleDescriptor,
             confirmed: ControlStoreResult.Confirmed,
-            outputTarget: LifecycleTarget
-        ): LifecycleOutputConfirmationResult = confirmOutput(exactCommand, fixed, confirmed, outputTarget, true)
+            outputTarget: LifecycleTarget,
+            authPart: Boolean = false
+        ): LifecycleOutputConfirmationResult =
+            confirmOutput(exactCommand, fixed, confirmed, outputTarget, true, authPart = authPart)
 
         private fun confirmOutput(exactCommand: CommandRef, fixed: ControlLifecycleDescriptor,
             confirmed: ControlStoreResult.Confirmed, outputTarget: LifecycleTarget,
-            unchangedGuard: Boolean, floorGuard: Boolean = false): LifecycleOutputConfirmationResult {
+            unchangedGuard: Boolean, floorGuard: Boolean = false,
+            authPart: Boolean = false): LifecycleOutputConfirmationResult {
             fun reject(reason: LifecycleConfirmationFailure) = LifecycleOutputConfirmationResult.Rejected(reason)
             val body = exactCommand.captureStateAndBody().body as? ControlCommandBody.Lifecycle
             if (confirmed.command !== exactCommand || body == null || body.input !== fixed ||
@@ -377,6 +394,8 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
             }
             if (!supported) return reject(LifecycleConfirmationFailure.UNSUPPORTED_TRANSITION_OR_TARGET)
             val selected = checkNotNull(outputFixed)
+            if (authPart && selected.role != LifecycleRole.GUARD)
+                return reject(LifecycleConfirmationFailure.UNSUPPORTED_TRANSITION_OR_TARGET)
             if (confirmed.effect == ConfirmedEffect.JoinedExisting ||
                 (confirmed.effect == ConfirmedEffect.AppliedThisAttempt &&
                     confirmed.proof.storage != RecordTransactionEvidence.CompletedWriteScope))
@@ -415,6 +434,16 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                     val parsed = entry.value as? DemandV1
                         ?: return reject(LifecycleConfirmationFailure.SNAPSHOT_OUTPUT_MISMATCH)
                     TypedDestinationTuple.Request(DestinationLocator.Payload(outputTarget.kind, outputTarget.id),
+                        entry.original, parsed)
+                }
+                authPart -> {
+                    val parsed = entry.value as? ScheduleGuardV1
+                        ?: return reject(LifecycleConfirmationFailure.SNAPSHOT_OUTPUT_MISMATCH)
+                    if (parsed.auth == null ||
+                        (fixed.transition in setOf(LifecycleTransition.RECOVER_HOLD, LifecycleTransition.UPDATE_AUTH) &&
+                            parsed.floor == null))
+                        return reject(LifecycleConfirmationFailure.SNAPSHOT_OUTPUT_MISMATCH)
+                    TypedDestinationTuple.GuardAuth(DestinationLocator.Guard(outputTarget.id, GuardPart.AUTH),
                         entry.original, parsed)
                 }
                 floorGuard -> {
@@ -474,9 +503,11 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
             exactCommand: CommandRef,
             fixed: ControlLifecycleDescriptor,
             confirmed: ControlStoreResult.Confirmed,
-            outputTarget: LifecycleTarget
-        ): LifecycleOutputConfirmationResult = confirmOutput(exactCommand, fixed, confirmed, outputTarget,
-            unchangedGuard = false, floorGuard = true)
+            outputTarget: LifecycleTarget,
+            authPart: Boolean = false
+        ): LifecycleOutputConfirmationResult =
+            confirmOutput(exactCommand, fixed, confirmed, outputTarget, unchangedGuard = false,
+                floorGuard = true, authPart = authPart)
 
         /** 6-4bC1d-1(b): the guard output of Mutations action [actionIndex] (an Edit.floor recapture) of [exactCommand]. */
         fun confirmMutationFloorOutput(
@@ -883,7 +914,8 @@ internal class NamedTransferLink private constructor(
             fun sameRow(a: ControlNode?, b: ControlNode?): Boolean =
                 a?.toPayloadEntry() == b?.toPayloadEntry()
 
-            if (destination is TypedDestinationTuple.GuardAuth)
+            // Only the 6-4bC1d-4b UPDATE_AUTH GuardAuth → GuardAuth pair reaches the token checks with an AUTH destination.
+            if (destination is TypedDestinationTuple.GuardAuth && fixedSource !is TypedSourceTuple.GuardAuth)
                 return invalid(NamedTransferFailureKind.UNSUPPORTED_TRANSITION_OR_REPLACEMENT)
             val binding = confirmation.binding as? ConfirmationBinding.LifecycleOutput
                 ?: return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
@@ -901,7 +933,8 @@ internal class NamedTransferLink private constructor(
                         destination is TypedDestinationTuple.GuardFloor
                 LifecycleTransition.UPDATE_AUTH ->
                     selected.role == LifecycleRole.GUARD && selected.target.effect == LifecycleEffect.REPLACE &&
-                        fixedSource is TypedSourceTuple.GuardFloor && destination is TypedDestinationTuple.GuardFloor
+                        ((fixedSource is TypedSourceTuple.GuardFloor && destination is TypedDestinationTuple.GuardFloor) ||
+                            (fixedSource is TypedSourceTuple.GuardAuth && destination is TypedDestinationTuple.GuardAuth))
                 else -> false
             }
             if (!supported) return invalid(NamedTransferFailureKind.UNSUPPORTED_TRANSITION_OR_REPLACEMENT)
@@ -932,6 +965,13 @@ internal class NamedTransferLink private constructor(
                         fixedSource.mergeNow == recovery.input.mergeNow &&
                         fixedSource.executorOrigin == recovery.input.binding.executor.originLifetimeId
                 }
+                is TypedSourceTuple.GuardAuth ->
+                    row.role == LifecycleRole.GUARD && row.target.effect == LifecycleEffect.REPLACE &&
+                        row.target.kind == ControlKind.DEMAND &&
+                        sameRow(fixedSource.preimage, row.before) &&
+                        fixedSource.parsed.auth != null &&
+                        guard(fixedSource.preimage) == fixedSource.parsed &&
+                        (destination as? TypedDestinationTuple.GuardAuth)?.parsed?.id == fixedSource.parsed.id
                 is TypedSourceTuple.GuardFloor ->
                     (if (fixed.transition == LifecycleTransition.UPDATE_AUTH)
                         row.role == LifecycleRole.GUARD && row.target.effect == LifecycleEffect.REPLACE
@@ -952,9 +992,16 @@ internal class NamedTransferLink private constructor(
                         destination.locator.id == destination.parsed.id &&
                         destination.parsed.floor != null &&
                         guard(destination.row) == destination.parsed
-                is TypedDestinationTuple.GuardAuth -> false
+                is TypedDestinationTuple.GuardAuth ->
+                    destination.locator.part == GuardPart.AUTH &&
+                        destination.locator.id == destination.parsed.id &&
+                        destination.parsed.auth != null &&
+                        guard(destination.row) == destination.parsed
             }
             if (!destinationMatches) return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+            if (fixedSource is TypedSourceTuple.GuardAuth && destination is TypedDestinationTuple.GuardAuth &&
+                !sameAuthScope(checkNotNull(fixedSource.parsed.auth), checkNotNull(destination.parsed.auth)))
+                return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
             if (fixed.transition == LifecycleTransition.UPDATE_AUTH &&
                 fixedSource is TypedSourceTuple.GuardFloor && destination is TypedDestinationTuple.GuardFloor) {
                 val plan = fixed.demandAuth
@@ -1001,6 +1048,9 @@ internal class NamedTransferLink private constructor(
                 return invalid(NamedTransferFailureKind.OWNER_MISMATCH)
 
             val confirmed = binding.output
+            if (fixedSource is TypedSourceTuple.GuardAuth &&
+                (confirmed !is TypedDestinationTuple.GuardAuth || confirmed.locator != destination.locator))
+                return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
             if (!sameRow(confirmed.row, destination.row))
                 return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
 
@@ -1054,12 +1104,68 @@ internal class NamedTransferLink private constructor(
 
         /** 6-4bC1d-4a: a guard FLOOR carried unchanged across a confirmed guard write of a closed writer list. */
         fun linkPreservedGuardTransfer(
-            source: TypedSourceTuple.GuardFloor,
-            destination: TypedDestinationTuple.GuardFloor,
+            source: TypedSourceTuple,
+            destination: TypedDestinationTuple,
             confirmation: PriorStorageConfirmation
         ): NamedTransferResult {
             fun invalid(kind: NamedTransferFailureKind) =
                 NamedTransferResult.Rejected(NamedTransferFailure.Invalid(kind))
+            if (source is TypedSourceTuple.GuardAuth && destination is TypedDestinationTuple.GuardAuth) {
+                val binding = confirmation.binding
+                val command: CommandRef
+                val before: ControlNode
+                val outputRow: ControlNode
+                val outputId: String
+                val transition: LifecycleTransition?
+                when (binding) {
+                    is ConfirmationBinding.LifecycleOutput -> {
+                        val selected = (binding.fixed.targets + binding.fixed.requiredUnchanged).singleOrNull {
+                            it.role == LifecycleRole.GUARD && it.target == binding.outputTarget
+                        } ?: return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
+                        if (binding.fixed.transition !in setOf(LifecycleTransition.RECOVER_HOLD,
+                                LifecycleTransition.UPDATE_AUTH, LifecycleTransition.SETTLE_QUERY) ||
+                            selected.target.effect != LifecycleEffect.REPLACE)
+                            return invalid(NamedTransferFailureKind.UNSUPPORTED_TRANSITION_OR_REPLACEMENT)
+                        val output = binding.output as? TypedDestinationTuple.GuardAuth
+                            ?: return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
+                        command = binding.command
+                        before = selected.before ?: return invalid(NamedTransferFailureKind.SOURCE_MISMATCH)
+                        outputRow = output.row
+                        outputId = output.locator.id
+                        transition = binding.fixed.transition
+                    }
+                    is ConfirmationBinding.MutationFloorOutput -> {
+                        command = binding.command
+                        before = binding.before
+                        outputRow = binding.output.row
+                        outputId = binding.output.locator.id
+                        transition = null
+                    }
+                    is ConfirmationBinding.RetainedSource ->
+                        return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
+                }
+                if (destination.locator.part != GuardPart.AUTH ||
+                    destination.locator.id != destination.parsed.id || destination.parsed.auth == null ||
+                    guard(destination.row) != destination.parsed)
+                    return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+                if (outputId != destination.locator.id ||
+                    outputRow.toPayloadEntry() != destination.row.toPayloadEntry())
+                    return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
+                if (source.preimage.toPayloadEntry() != before.toPayloadEntry() ||
+                    guard(source.preimage) != source.parsed || source.parsed.auth == null ||
+                    source.parsed.id != destination.parsed.id)
+                    return invalid(NamedTransferFailureKind.SOURCE_MISMATCH)
+                if (source.responsibilityOwner.trackingLifetime !== command.ownerTrackingLifetimeId ||
+                    source.responsibilityOwner.ownerKey.isBlank())
+                    return invalid(NamedTransferFailureKind.OWNER_MISMATCH)
+                if (source.preimage.toPayloadEntry().fields["auth"] !=
+                    destination.row.toPayloadEntry().fields["auth"])
+                    return NamedTransferResult.Rejected(NamedTransferFailure.PreservedComponentChanged)
+                return NamedTransferResult.Issued(NamedTransferLink(transition, source, destination,
+                    source.responsibilityOwner, confirmation))
+            }
+            if (source !is TypedSourceTuple.GuardFloor || destination !is TypedDestinationTuple.GuardFloor)
+                return invalid(NamedTransferFailureKind.UNSUPPORTED_TRANSITION_OR_REPLACEMENT)
             val binding = confirmation.binding
             val command: CommandRef
             val before: ControlNode
@@ -1403,31 +1509,40 @@ private fun fixedNamedSource(slot: RequiredSlot, kind: ControlKind, id: String):
 
 internal fun namedChainOwnerValid(slot: RequiredSlot, owned: HandoffDisposition.DurablyOwned,
     owner: ResponsibilityOwner): Boolean = owned.linkChain.all { link ->
-    if ((slot.requirement as? SlotRequirement.Required)?.lowerBound is RequiredLowerBound.Floor)
+    if ((slot.requirement as? SlotRequirement.Required)?.lowerBound.let {
+            it is RequiredLowerBound.Floor || it is RequiredLowerBound.Auth
+        })
         link.responsibilityOwner.ownerKey == owner.ownerKey
     else link.responsibilityOwner == owner
 }
 
-/** B1 Mutations FLOOR successor recording and issuance predicate; G05 checks named chain structure and owner separately. */
-internal fun mutationFloorChainValid(slot: RequiredSlot, owned: HandoffDisposition.DurablyOwned,
+/** B1 Mutations guard successor recording and issuance predicate; G05 checks structure and owner separately. */
+internal fun mutationGuardChainValid(slot: RequiredSlot, owned: HandoffDisposition.DurablyOwned,
     exactCommand: CommandRef, owner: ResponsibilityOwner): Boolean {
-    val bound = (slot.requirement as? SlotRequirement.Required)?.lowerBound as? RequiredLowerBound.Floor
-        ?: return false
+    val bound = (slot.requirement as? SlotRequirement.Required)?.lowerBound
     val last = owned.linkChain.lastOrNull() ?: return false
     val successorCommand = when (val confirmation = last.confirmation.binding) {
         is ConfirmationBinding.LifecycleOutput -> confirmation.command
         is ConfirmationBinding.MutationFloorOutput -> confirmation.command
         is ConfirmationBinding.RetainedSource -> return false
     }
-    val firstSourceMatches = when (bound.sourceKind) {
-        ControlKind.HOLD -> owned.linkChain.first().source is TypedSourceTuple.HoldFloor
-        ControlKind.DEMAND -> owned.linkChain.first().source is TypedSourceTuple.GuardFloor
+    val chainMatches = when {
+        slot.key.component == ObligationComponent.FLOOR && bound is RequiredLowerBound.Floor -> {
+            val firstSourceMatches = when (bound.sourceKind) {
+                ControlKind.HOLD -> owned.linkChain.first().source is TypedSourceTuple.HoldFloor
+                ControlKind.DEMAND -> owned.linkChain.first().source is TypedSourceTuple.GuardFloor
+                else -> false
+            }
+            firstSourceMatches && owned.linkChain.drop(1).all { it.source is TypedSourceTuple.GuardFloor } &&
+                last.destination is TypedDestinationTuple.GuardFloor
+        }
+        slot.key.component == ObligationComponent.AUTH && bound is RequiredLowerBound.Auth ->
+            owned.linkChain.all { it.source is TypedSourceTuple.GuardAuth &&
+                it.destination is TypedDestinationTuple.GuardAuth }
         else -> false
     }
     return slot.key.role is ObligationRole.MutationAction &&
-        slot.key.component == ObligationComponent.FLOOR && firstSourceMatches &&
-        owned.linkChain.drop(1).all { it.source is TypedSourceTuple.GuardFloor } &&
-        last.destination is TypedDestinationTuple.GuardFloor &&
+        chainMatches &&
         successorCommand !== exactCommand &&
         owned.priorWrite === last.confirmation && last.destination.locator == owned.destination &&
         namedChainStructurallyValid(slot, owned, exactCommand) &&
@@ -1447,6 +1562,17 @@ internal fun namedChainStructurallyValid(slot: RequiredSlot, owned: HandoffDispo
             val fixed = (bound as? RequiredLowerBound.Floor)?.let { floorFixedRow(slot, requirement, it) }
             // The issuer already binds this source's ID, parsed hold, and floor to originalHold.
             fixed != null && sameG05Row(fixed.node, source.source.originalHold)
+        }
+        is TypedSourceTuple.GuardAuth -> {
+            val role = slot.key.role as? ObligationRole.MutationAction
+            val after = role?.let { action ->
+                requirement.fixedSources.filter {
+                    it.location == FixedInputLocation(FixedInputRoot.MUTATION_ACTION, action.index,
+                        FixedInputFacet.AFTER)
+                }.mapNotNull { (it.fact as? FixedSourceFact.Node)?.value }.singleOrNull()
+            }
+            bound is RequiredLowerBound.Auth && after != null &&
+                guard(after)?.auth == bound.required && sameG05Row(after, source.preimage)
         }
         is TypedSourceTuple.GuardFloor -> {
             val fixed = (bound as? RequiredLowerBound.Floor)?.let { floorFixedRow(slot, requirement, it) }
@@ -1480,7 +1606,10 @@ internal fun namedChainStructurallyValid(slot: RequiredSlot, owned: HandoffDispo
                 // Issuance binds both parsed guards and the output locator to their raw rows.
                 source != null && sameG05Row(output.row, source.preimage)
             }
-            is TypedDestinationTuple.GuardAuth -> false
+            is TypedDestinationTuple.GuardAuth -> {
+                val source = later.source as? TypedSourceTuple.GuardAuth
+                source != null && sameG05Row(output.row, source.preimage)
+            }
         }
     }
     return continuous && links.last().destination.locator == owned.destination
@@ -1681,6 +1810,7 @@ private fun inspectDestination(locator: DestinationLocator, requirement: SlotReq
                 is DestinationLocator.Guard -> {
                     val guard = value as? ScheduleGuardV1
                     val namedFloor = namedTerminal?.destination as? TypedDestinationTuple.GuardFloor
+                    val namedAuth = namedTerminal?.destination as? TypedDestinationTuple.GuardAuth
                     val transferredHold = namedFloor != null
                     val exists = kind == ControlKind.DEMAND && guard != null && when (locator.part) {
                         GuardPart.FLOOR -> bound is RequiredLowerBound.Floor && guard.floor != null &&
@@ -1698,8 +1828,10 @@ private fun inspectDestination(locator: DestinationLocator, requirement: SlotReq
                                 compareFloor(it, guard?.floor, now) == TypedComparison.Matches
                             } ?: false
                         }
-                        is RequiredLowerBound.Auth -> compareAuth(bound.required, checkNotNull(guard?.auth)) ==
-                            TypedComparison.Matches
+                        is RequiredLowerBound.Auth -> {
+                            val requiredAuth = namedAuth?.parsed?.auth ?: bound.required
+                            compareAuth(requiredAuth, checkNotNull(guard?.auth)) == TypedComparison.Matches
+                        }
                         else -> false
                     }
                     DestinationFinding(at, exists, comparison)

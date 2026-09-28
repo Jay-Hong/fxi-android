@@ -175,14 +175,14 @@ internal class HandoffCoordinator(
         }
 
     /** An old Mutations FLOOR slot transferred through a HoldFloor or GuardFloor first link and a GuardFloor destination. */
-    fun recordConfirmedMutationFloorTransfer(binding: HandoffEventBinding, slot: RequiredSlot,
+    fun recordConfirmedMutationGuardTransfer(binding: HandoffEventBinding, slot: RequiredSlot,
         disposition: HandoffDisposition.DurablyOwned, sourceWorkId: String? = null): RecordResult =
         record(binding, sourceWorkId) {
             when {
                 slot.key in confirmedTransfers || slot.key in completions ->
                     RecordResult.Rejected(RecordRefusal.DUPLICATE_OR_CONFLICTING_EVENT)
                 command.captureStateAndBody().body !is ControlCommandBody.Mutations ||
-                    !mutationFloorChainValid(slot, disposition, command, owner) ->
+                    !mutationGuardChainValid(slot, disposition, command, owner) ->
                     RecordResult.Rejected(RecordRefusal.INVALID_CONFIRMATION)
                 else -> {
                     confirmedTransfers[slot.key] = disposition
@@ -328,9 +328,9 @@ internal class HandoffCoordinator(
                                 proof.observed.locator != owned.destination
                             is ConfirmationBinding.LifecycleOutput ->
                                 if (proof.command === command) false
-                                else !mutationFloorChainValid(slot, owned, command, owner)
+                                else !mutationGuardChainValid(slot, owned, command, owner)
                             is ConfirmationBinding.MutationFloorOutput ->
-                                !mutationFloorChainValid(slot, owned, command, owner)
+                                !mutationGuardChainValid(slot, owned, command, owner)
                         }) return@synchronized refuse(HandoffIssueRefusal.TRANSFER_NOT_CONFIRMED)
                         slots += SlotHandoff(key, owned)
                     }

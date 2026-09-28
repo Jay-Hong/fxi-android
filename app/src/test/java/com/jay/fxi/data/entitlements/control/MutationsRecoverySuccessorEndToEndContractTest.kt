@@ -187,7 +187,7 @@ class MutationsRecoverySuccessorEndToEndContractTest {
             assertEquals(RecordResult.Recorded, h.recordComponentCompleted(b, s.key, ComponentCompletion(s.key.subject)))
             assertEquals(RecordResult.Recorded, h.recordCompletionResultConsumed(b, s.key)) }
         fun floorChain(index: Int, steps: List<Step>, branches: List<LandingBranch> = listOf(L, N)) = branches.forEach { branch ->
-            assertEquals(RecordResult.Recorded, h.recordConfirmedMutationFloorTransfer(b, of(index, ObligationComponent.FLOOR, branch),
+            assertEquals(RecordResult.Recorded, h.recordConfirmedMutationGuardTransfer(b, of(index, ObligationComponent.FLOOR, branch),
                 HandoffDisposition.DurablyOwned(steps.last().link.destination.locator, steps.map { it.link }, steps.last().token))) }
         suspend fun retained(index: Int, component: ObligationComponent, d: DestinationLocator) = listOf(L, N).forEach { branch ->
             val s = of(index, component, branch)

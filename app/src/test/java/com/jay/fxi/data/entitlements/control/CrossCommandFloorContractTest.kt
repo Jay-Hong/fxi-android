@@ -26,7 +26,8 @@ import org.junit.rules.TemporaryFolder
  *  - After both, A's FLOOR L/N use the two-command chain HoldFloor(A) → GuardFloor(B's), B's FLOOR L/N their HoldFloor(B): the
  *    whole old handoff is accepted, every FLOOR slot represented by the last output (29300).
  * Two old commands with byte-identical fixed HOLD rows are not distinguishable by these data (consensus r6 design §limit); HOLD
- * ids are issued per Add, so that case is not constructed. The implementation thread reads but does not edit this file.
+ * ids are issued per Add, so that case is not constructed. A13 (6-4bC1d-4b, consensus D9) applies the same ownerKey rule to a
+ * guard AUTH chain across a reopen. The implementation thread reads but does not edit this file.
  */
 class CrossCommandFloorContractTest {
     @get:Rule val folder = TemporaryFolder()
@@ -393,5 +394,50 @@ class CrossCommandFloorContractTest {
             G05Location.Submitted(a1.orderedSlots.filter { it.requirement is SlotRequirement.Required }.indexOfFirst { it.key == slot.key }), null)
         assertEquals(1, foreignFailures.count { it == confirmation })
         assertEquals(ownFailures, foreignFailures.filter { it != confirmation })
+    }
+
+    // ═══ 6-4bC1d-4b (consensus D9): the guard AUTH chain across a reopen keeps the FLOOR ownerKey rule ═══════════════════
+    /**
+     * A13: the old command adds HOLD A and no-op edits guard "g" (floor and AUTH); after a reopen A's RECOVER_HOLD, in another
+     * tracking lifetime, replaces "g" keeping its AUTH. The guard Edit's AUTH L/N submit the 5d AUTH preservation link, whose
+     * owner has the new lifetime and the same key: G05 accepts the whole old handoff.
+     */
+    @Test fun A13_guardAuthChainAfterReopen_linkOwnerOfAnotherLifetimeWithTheSameKey_accepted() = runReleaseTest {
+        val file = folder.newFile()
+        val first = ControlStoreTestStorage(file)
+        val g = H.guard()
+        controlTestTimeout("seed namespace") {
+            first.data.updateData { H.before(H.input(g = g), siblings = false).toMutablePreferences().apply {
+                this[ControlRecordKeys.payload(ControlKind.HOLD)] = "[]" }.toPreferences() }
+        }
+        checkNotNull(guard(g)?.auth) { "fixture: the guard has an AUTH" }
+        val addA = first.control.addition(ControlKind.HOLD) { id -> literal(holdJson(10_000)); set("id", ControlScalar.Text(id)) }
+        val c = first.control.prepare(addA, first.control.edit(ControlKind.DEMAND, g) {})
+        execute(first, c, null)
+        val a1 = deriveRequiredObligations(RequirementInput.Mutations(c, c.body as ControlCommandBody.Mutations,
+            MutationAdoption.Previous(checkNotNull(first.control.checkpoint(c))))) as RequirementDerivation.Available
+        val idA = (ControlObligations.read(ControlKind.HOLD, ((addA as ControlMutation.Add).built as ControlWriteResult.Written).node)
+            as ControlEntryRead.Interpreted).value.id
+        val o = Old(c, a1, idA, idA)
+        controlTestTimeout("close first", 30_000) { first.close() }
+        val s = open(file)
+        val rowA = H.row(s.raw(), ControlKind.HOLD, idA); val oldG = H.row(s.raw(), ControlKind.DEMAND, "g")
+        val r = recover(s, rowA, oldG, "k", 21)
+        assertTrue("fixture: another tracking lifetime", r.c.ownerTrackingLifetimeId !== c.ownerTrackingLifetimeId)
+        assertEquals("fixture: guard REPLACE", LifecycleEffect.REPLACE, r.guardTarget.effect)
+        assertEquals("fixture: AUTH kept by 5d", guard(oldG)?.auth, guard(r.guardAfter)?.auth)
+        val tF = token(r)
+        val tA = PriorStorageConfirmation.confirmLifecycleOutput(r.c, r.fixed, r.confirmed, r.guardTarget, authPart = true)
+        assertTrue("fixture: AUTH output token, got $tA", tA is LifecycleOutputConfirmationResult.Issued)
+        val authToken = (tA as LifecycleOutputConfirmationResult.Issued).value
+        val authLink = issued(NamedTransferLink.linkPreservedGuardTransfer(TypedSourceTuple.GuardAuth(owner(r.c), oldG, checkNotNull(guard(oldG))),
+            TypedDestinationTuple.GuardAuth(DestinationLocator.Guard("g", GuardPart.AUTH), r.guardAfter, checkNotNull(guard(r.guardAfter))), authToken))
+        val holdChain = listOf(holdLink(r, rowA, oldG, tF)); val guardChain = listOf(guardLink(r, oldG, tF))
+        val floor = output(r).locator; val auth = DestinationLocator.Guard("g", GuardPart.AUTH)
+        val given = listOf(L, N).flatMap { b -> listOf(
+            o.key(0, ObligationComponent.FLOOR, b) to chain(floor, holdChain, tF),
+            o.key(1, ObligationComponent.FLOOR, b) to chain(floor, guardChain, tF),
+            o.key(1, ObligationComponent.AUTH, b) to chain(auth, listOf(authLink), authToken)) }.toMap()
+        assertEquals(G05Result.Accepted, assess(o, given, lockedRead(s).value))
     }
 }
