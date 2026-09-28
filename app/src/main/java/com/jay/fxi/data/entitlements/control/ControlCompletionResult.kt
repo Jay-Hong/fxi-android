@@ -4,7 +4,7 @@ import java.io.IOException
 import java.util.Collections
 
 internal enum class CompletionMode { Consumed, NeverSubmitted, ResponsibilityTransferred }
-internal enum class TerminationEntry { AbandonBeforeFirstConfirm, ConsumedRotation, ConsumedLifecycle, ConsumedSettlement }
+internal enum class TerminationEntry { AbandonBeforeFirstConfirm, ConsumedRotation, ConsumedLifecycle, ConsumedSettlement, UncertainMutations }
 
 /** The caller declares both business handoff conditions before evidence can be consumed. */
 internal class RotationConsumption(
@@ -28,6 +28,9 @@ internal sealed interface CompletionRejectionReason {
     data object OtherManagementPath : CompletionRejectionReason
     data object NotConfirmed : CompletionRejectionReason
     data object Unresolved : CompletionRejectionReason
+    data object NotUnresolved : CompletionRejectionReason
+    data object NotOnceConfirm : CompletionRejectionReason
+    data object DeclarationRefMismatch : CompletionRejectionReason
     data object ConsumptionNotDeclared : CompletionRejectionReason
     data class NotNeverConfirm(val violation: NeverConfirmViolation) : CompletionRejectionReason
     data class ClosureNotSatisfied(val violation: ClosureViolation) : CompletionRejectionReason
@@ -44,6 +47,13 @@ internal sealed interface CompletionRejectionReason {
     data object NotTerminationPending : CompletionRejectionReason
     data object UnsupportedInThisUnit : CompletionRejectionReason
     data class Encoding(val reason: RejectionReason) : CompletionRejectionReason
+    data class Clock(val reason: BootReadingRefusal) : CompletionRejectionReason
+    class G05(failures: List<G05Failure>) : CompletionRejectionReason {
+        val failures: List<G05Failure> = Collections.unmodifiableList(failures.toList())
+        override fun equals(other: Any?) = other is G05 && other.failures == failures
+        override fun hashCode() = failures.hashCode()
+        override fun toString() = "G05(failures=$failures)"
+    }
 }
 
 /** A caller declaration, retained only as small immutable values at the pending boundary. */
@@ -110,6 +120,16 @@ internal class TerminationClosureBinding(
 
 internal sealed interface TerminationPendingDescriptor {
     val mode: CompletionMode
+
+    /** 6-4bC1a: an OnceConfirm·U Mutations handoff; expectedOwn null = own absence verified at the first owner read. */
+    class MutationsHandoff(
+        val closureBinding: TerminationClosureBinding,
+        val expectedOwn: AppliedEvidence.Mutations?,
+        val deletionIdentity: DependencyAtom.AppliedRow
+    ) : TerminationPendingDescriptor {
+        override val mode: CompletionMode = CompletionMode.ResponsibilityTransferred
+        val entry: TerminationEntry = TerminationEntry.UncertainMutations
+    }
 
     data class EvidenceAbsent(
         override val mode: CompletionMode,

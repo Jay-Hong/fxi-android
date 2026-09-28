@@ -455,6 +455,9 @@ internal class ControlRecordStore(
             val descriptor = tracked.terminationDescriptor
                 ?: return completionRejected(command, CompletionRejectionReason.NotTerminationPending)
             val binding = when (descriptor) {
+                is TerminationPendingDescriptor.MutationsHandoff -> {
+                    descriptor.closureBinding
+                }
                 is TerminationPendingDescriptor.EvidenceAbsent -> {
                     check(descriptor.mode == CompletionMode.NeverSubmitted &&
                         descriptor.entry == TerminationEntry.AbandonBeforeFirstConfirm)
@@ -533,6 +536,7 @@ internal class ControlRecordStore(
 
     private sealed interface TerminationRequest {
         data object FirstNeverConfirm : TerminationRequest
+        data class FirstMutationsHandoff(val handoff: CompletionHandoff) : TerminationRequest
         data object FirstConsumed : TerminationRequest
         data object FirstConsumedLifecycle : TerminationRequest
         data object FirstConsumedSettlement : TerminationRequest
@@ -578,6 +582,40 @@ internal class ControlRecordStore(
                     plan = if (request is TerminationRequest.Retry) request.descriptor else
                         TerminationPendingDescriptor.EvidenceAbsent(CompletionMode.NeverSubmitted,
                             TerminationEntry.AbandonBeforeFirstConfirm, closure.binding())
+                } else if (request is TerminationRequest.FirstMutationsHandoff ||
+                    (request is TerminationRequest.Retry &&
+                        request.descriptor is TerminationPendingDescriptor.MutationsHandoff)) {
+                    val mutations = body as ControlCommandBody.Mutations
+                    if (request is TerminationRequest.FirstMutationsHandoff) {
+                        val input = RequirementInput.Mutations(command, mutations,
+                            MutationAdoption.Current(tracked.targets.get()))
+                        when (val gate = assessHandoffAtOwner(command, deriveRequiredObligations(input),
+                            closure, request.handoff, read)) {
+                            HandoffGateDecision.Eligible -> Unit
+                            is HandoffGateDecision.Rejected -> return@transactRecord RecordTransactionDecision.Observe(
+                                ControlCompletionResult.Rejected(command, emptySet(), emptySet(),
+                                    gate.reason.toCompletionRejectionReason(), command.lifecycleState, read))
+                            is HandoffGateDecision.RecoveryRequired -> return@transactRecord recovery(gate.reason)
+                            HandoffGateDecision.AlreadyTerminated, is HandoffGateDecision.ReadFailed ->
+                                error("unexpected owner handoff gate result")
+                        }
+                    }
+                    val fixed = (request as? TerminationRequest.Retry)?.descriptor as?
+                        TerminationPendingDescriptor.MutationsHandoff
+                    when (val decision = ControlMutationsHandoffCandidate.decide(read, command, mutations,
+                        tracked.targets.get(), tracked.expectedApplied, fixed, codec)) {
+                        is ControlMutationsHandoffCandidate.Decision.Recovery ->
+                            return@transactRecord recovery(decision.reason)
+                        ControlMutationsHandoffCandidate.Decision.Conflict ->
+                            return@transactRecord RecordTransactionDecision.Observe(
+                                ControlCompletionResult.Conflict(command, emptySet(), emptySet(),
+                                    ConflictReason.CommandEvidenceMismatch, command.lifecycleState, read))
+                        is ControlMutationsHandoffCandidate.Decision.Ready -> {
+                            candidate = decision.candidate
+                            plan = fixed ?: TerminationPendingDescriptor.MutationsHandoff(closure.binding(),
+                                decision.expectedOwn, decision.deletionIdentity)
+                        }
+                    }
                 } else if (request is TerminationRequest.FirstConsumed ||
                     (request is TerminationRequest.Retry &&
                         request.descriptor is TerminationPendingDescriptor.ExactEvidenceAndSeals)) {
@@ -589,7 +627,8 @@ internal class ControlRecordStore(
                             check(it is AppliedEvidence.Rotation) { "expected evidence must be Rotation" }
                             it
                         }
-                        TerminationRequest.FirstConsumedLifecycle, TerminationRequest.FirstConsumedSettlement ->
+                        TerminationRequest.FirstConsumedLifecycle, TerminationRequest.FirstConsumedSettlement,
+                        is TerminationRequest.FirstMutationsHandoff ->
                             error("unexpected non-rotation request")
                         TerminationRequest.FirstNeverConfirm -> error("unexpected never-confirm request")
                     }
@@ -620,6 +659,7 @@ internal class ControlRecordStore(
                             it
                         }
                         TerminationRequest.FirstConsumed, TerminationRequest.FirstConsumedSettlement,
+                        is TerminationRequest.FirstMutationsHandoff,
                         TerminationRequest.FirstNeverConfirm -> error("unexpected non-lifecycle request")
                     }
                     when (val decision = ControlLifecycleConsumption.decide(read, command, input, expected,
@@ -646,6 +686,7 @@ internal class ControlRecordStore(
                             it
                         }
                         TerminationRequest.FirstConsumed, TerminationRequest.FirstConsumedLifecycle,
+                        is TerminationRequest.FirstMutationsHandoff,
                         TerminationRequest.FirstNeverConfirm ->
                             error("unexpected non-settlement request")
                     }
@@ -675,6 +716,8 @@ internal class ControlRecordStore(
                         completionDependencyViolation(command, setOf(DependencyAtom.AppliedRow(command.id,
                             command.ownerTrackingLifetimeId.value)))
                     is TerminationPendingDescriptor.EvidenceAbsent -> null
+                    is TerminationPendingDescriptor.MutationsHandoff ->
+                        completionDependencyViolation(command, setOf(plan.deletionIdentity))
                 }
                 if (dependencyReason != null) {
                     RecordTransactionDecision.Observe(ControlCompletionResult.Rejected(command, emptySet(), emptySet(),
@@ -761,14 +804,19 @@ internal class ControlRecordStore(
     private fun validateTerminationReturn(plan: TerminationPendingDescriptor, returned: ControlRecordRead,
         candidate: Preferences, command: CommandRef) {
         when (plan) {
+            is TerminationPendingDescriptor.MutationsHandoff,
             is TerminationPendingDescriptor.EvidenceAbsent -> {
-                check(ControlReleaseCandidate.hasAbsencePostcondition(returned, command)) {
-                    "termination absence postcondition was not confirmed"
+                if (plan is TerminationPendingDescriptor.EvidenceAbsent) {
+                    check(ControlReleaseCandidate.hasAbsencePostcondition(returned, command)) {
+                        "termination absence postcondition was not confirmed"
+                    }
                 }
                 val barrier = DataStoreAccessEpochStore.READ_BARRIER
                 check(returned.original.toMutablePreferences().apply { remove(barrier) } ==
                     candidate.toMutablePreferences().apply { remove(barrier) }) {
-                    "termination confirmation changed unrelated values"
+                    if (plan is TerminationPendingDescriptor.MutationsHandoff)
+                        "mutations handoff confirmation changed unrelated values"
+                    else "termination confirmation changed unrelated values"
                 }
             }
             is TerminationPendingDescriptor.ExactEvidenceAndSeals ->
@@ -810,6 +858,42 @@ internal class ControlRecordStore(
             localPendingReleases = work.pendingReleases)
         is ControlCompletionResult.Unconfirmed, is ControlCompletionResult.Completed,
         is ControlCompletionResult.AlreadyTerminated -> error("termination transaction carried a non-decision result")
+    }
+
+    /** 6-4bC1a: terminate a current-lifetime OnceConfirm·U Mutations command by handing over its L/N responsibilities. */
+    suspend fun handoffAfterUncertainConfirm(command: CommandRef, closure: TerminationClosure,
+        handoff: CompletionHandoff): ControlCompletionResult {
+        completionPrecheck(command, firstEntry = true)?.let { return it }
+        if (!tracking.executing.add(command)) return completionRejected(command, CompletionRejectionReason.InFlight)
+        try {
+            completionPrecheck(command, firstEntry = true)?.let { return it }
+            val tracked = tracking.findPrepared(command)
+                ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
+            val body = command.captureStateAndBody().body as? ControlCommandBody.Mutations
+                ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+            if (!tracking.isUnresolved(command))
+                return completionRejected(command, CompletionRejectionReason.NotUnresolved)
+            if (!tracked.confirmationRequested.get())
+                return completionRejected(command, CompletionRejectionReason.NotOnceConfirm)
+            if (handoff.command.ref !== command)
+                return completionRejected(command, CompletionRejectionReason.DeclarationRefMismatch)
+            closure.violation(command, tracking.lifetimeId)?.let {
+                return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
+            }
+            return terminationAttempt(command, tracked, closure, body,
+                TerminationRequest.FirstMutationsHandoff(handoff))
+        } finally {
+            tracking.executing.remove(command)
+        }
+    }
+
+    private fun HandoffGateRefusal.toCompletionRejectionReason(): CompletionRejectionReason = when (this) {
+        is HandoffGateRefusal.Precondition -> reason
+        HandoffGateRefusal.NotUnresolved -> CompletionRejectionReason.NotUnresolved
+        HandoffGateRefusal.NotOnceConfirm -> CompletionRejectionReason.NotOnceConfirm
+        HandoffGateRefusal.DeclarationRefMismatch -> CompletionRejectionReason.DeclarationRefMismatch
+        is HandoffGateRefusal.Clock -> CompletionRejectionReason.Clock(reason)
+        is HandoffGateRefusal.G05 -> CompletionRejectionReason.G05(failures)
     }
 
     /** Observe the current OnceConfirm·U handoff against the latest owner snapshot. */

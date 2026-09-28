@@ -186,7 +186,9 @@ class ControlIssuanceStructureTest {
             // 6-1B adds one termination owner transaction and its five return@transactRecord labels.
             // 6-2B: the consumption decision's Recovery/Conflict/Rejected exits add three return@transactRecord labels.
             // 6-4bB2: the OnceConfirm·U handoff gate adds one observation-only owner transaction.
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 25),
+            // 6-4bC1a: the Mutations handoff branch of the shared termination decision adds four return@transactRecord
+            // labels; owner.transactRecord calls stay 7.
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 29),
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,
