@@ -269,15 +269,36 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
             fixed: ControlLifecycleDescriptor,
             confirmed: ControlStoreResult.Confirmed,
             outputTarget: LifecycleTarget
-        ): LifecycleOutputConfirmationResult {
+        ): LifecycleOutputConfirmationResult = confirmOutput(exactCommand, fixed, confirmed, outputTarget, false)
+
+        /** The sole unchanged RECOVER_HOLD guard is a real, observed output of that command. */
+        fun confirmRecoverHoldUnchangedGuardOutput(
+            exactCommand: CommandRef,
+            fixed: ControlLifecycleDescriptor,
+            confirmed: ControlStoreResult.Confirmed,
+            outputTarget: LifecycleTarget
+        ): LifecycleOutputConfirmationResult = confirmOutput(exactCommand, fixed, confirmed, outputTarget, true)
+
+        private fun confirmOutput(exactCommand: CommandRef, fixed: ControlLifecycleDescriptor,
+            confirmed: ControlStoreResult.Confirmed, outputTarget: LifecycleTarget,
+            unchangedGuard: Boolean): LifecycleOutputConfirmationResult {
             fun reject(reason: LifecycleConfirmationFailure) = LifecycleOutputConfirmationResult.Rejected(reason)
             val body = exactCommand.captureStateAndBody().body as? ControlCommandBody.Lifecycle
             if (confirmed.command !== exactCommand || body == null || body.input !== fixed ||
                 exactCommand.id != fixed.operationId)
                 return reject(LifecycleConfirmationFailure.REF_OR_DESCRIPTOR_MISMATCH)
 
-            val outputFixed = fixed.targets.singleOrNull { it.target == outputTarget }
-            val supported = outputFixed != null && when (fixed.transition) {
+            val outputFixed = if (unchangedGuard) fixed.requiredUnchanged.singleOrNull {
+                it.role == LifecycleRole.GUARD && it.target == outputTarget
+            } else fixed.targets.singleOrNull { it.target == outputTarget }
+            val supported = outputFixed != null && if (unchangedGuard) {
+                fixed.transition == LifecycleTransition.RECOVER_HOLD &&
+                    fixed.requiredUnchanged.count { it.role == LifecycleRole.GUARD } == 1 &&
+                    fixed.targets.none { it.role == LifecycleRole.GUARD || it.target == outputTarget } &&
+                    outputTarget.kind == ControlKind.DEMAND && outputTarget.effect == LifecycleEffect.REPLACE &&
+                    outputFixed.before != null && outputFixed.after != null &&
+                    outputFixed.before.toPayloadEntry() == outputFixed.after.toPayloadEntry()
+            } else when (fixed.transition) {
                 LifecycleTransition.REBIND_REQUESTS ->
                     outputFixed.role == LifecycleRole.REQUEST && outputTarget.kind == ControlKind.DEMAND &&
                         outputTarget.effect == LifecycleEffect.REPLACE && outputFixed.before != null
@@ -720,7 +741,11 @@ internal class NamedTransferLink private constructor(
             val binding = confirmation.binding as? ConfirmationBinding.LifecycleOutput
                 ?: return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
             val fixed = binding.fixed
-            val selected = fixed.targets.singleOrNull { it.target == binding.outputTarget }
+            val selected = if (fixed.transition == LifecycleTransition.RECOVER_HOLD &&
+                fixed.requiredUnchanged.singleOrNull { it.role == LifecycleRole.GUARD }?.target == binding.outputTarget &&
+                fixed.targets.none { it.target == binding.outputTarget })
+                fixed.requiredUnchanged.singleOrNull { it.role == LifecycleRole.GUARD && it.target == binding.outputTarget }
+            else fixed.targets.singleOrNull { it.target == binding.outputTarget }
             val supported = selected != null && when (fixed.transition) {
                 LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.END_AUTH_BINDING ->
                     fixedSource is TypedSourceTuple.Request && destination is TypedDestinationTuple.Request
@@ -963,11 +988,7 @@ internal fun assessG05(
                         inspectEndAuthOutputConfirmation(slot, owned, exactCommand, latest)
                     else inspectRetainedConfirmation(slot, owned, latest)
                 else {
-                    val ownerMatches = owned.linkChain.all { link ->
-                        if (requirement.lowerBound is RequiredLowerBound.Floor)
-                            link.responsibilityOwner.ownerKey == handoff.responsibilityOwner.ownerKey
-                        else link.responsibilityOwner == handoff.responsibilityOwner
-                    }
+                    val ownerMatches = namedChainOwnerValid(slot, owned, handoff.responsibilityOwner)
                     if (namedStructure && !ownerMatches) failures += failure(G05Id.OWNER, slot, entry.index)
                     inspectNamedConfirmation(owned, namedStructure && ownerMatches, latest)
                 }
@@ -1091,7 +1112,32 @@ private fun fixedNamedSource(slot: RequiredSlot, kind: ControlKind, id: String):
         node.value.takeIf { value?.id == id }
     }.distinctBy { it.toPayloadEntry() }.singleOrNull()
 
-private fun namedChainStructurallyValid(slot: RequiredSlot, owned: HandoffDisposition.DurablyOwned,
+internal fun namedChainOwnerValid(slot: RequiredSlot, owned: HandoffDisposition.DurablyOwned,
+    owner: ResponsibilityOwner): Boolean = owned.linkChain.all { link ->
+    if ((slot.requirement as? SlotRequirement.Required)?.lowerBound is RequiredLowerBound.Floor)
+        link.responsibilityOwner.ownerKey == owner.ownerKey
+    else link.responsibilityOwner == owner
+}
+
+/** B1 successor recording and issuance predicate; G05 checks named chain structure and owner separately. */
+internal fun mutationHoldFloorChainValid(slot: RequiredSlot, owned: HandoffDisposition.DurablyOwned,
+    exactCommand: CommandRef, owner: ResponsibilityOwner): Boolean {
+    val bound = (slot.requirement as? SlotRequirement.Required)?.lowerBound as? RequiredLowerBound.Floor
+        ?: return false
+    val last = owned.linkChain.lastOrNull() ?: return false
+    val confirmation = last.confirmation.binding as? ConfirmationBinding.LifecycleOutput ?: return false
+    return slot.key.role is ObligationRole.MutationAction &&
+        slot.key.component == ObligationComponent.FLOOR && bound.sourceKind == ControlKind.HOLD &&
+        owned.linkChain.first().source is TypedSourceTuple.HoldFloor &&
+        owned.linkChain.drop(1).all { it.source is TypedSourceTuple.GuardFloor } &&
+        last.destination is TypedDestinationTuple.GuardFloor &&
+        confirmation.command !== exactCommand &&
+        owned.priorWrite === last.confirmation && last.destination.locator == owned.destination &&
+        namedChainStructurallyValid(slot, owned, exactCommand) &&
+        namedChainOwnerValid(slot, owned, owner)
+}
+
+internal fun namedChainStructurallyValid(slot: RequiredSlot, owned: HandoffDisposition.DurablyOwned,
     exactCommand: CommandRef): Boolean {
     val links = owned.linkChain
     val first = links.firstOrNull() ?: return false

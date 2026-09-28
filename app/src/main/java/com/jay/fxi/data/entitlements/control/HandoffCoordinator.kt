@@ -173,6 +173,24 @@ internal class HandoffCoordinator(
             }
         }
 
+    /** 6-4bC1d-1(a): an old Mutations HOLD FLOOR slot transferred through a HoldFloor → GuardFloor… chain (the G05 predicate). */
+    fun recordConfirmedMutationFloorTransfer(binding: HandoffEventBinding, slot: RequiredSlot,
+        disposition: HandoffDisposition.DurablyOwned, sourceWorkId: String? = null): RecordResult =
+        record(binding, sourceWorkId) {
+            when {
+                slot.key in confirmedTransfers || slot.key in completions ->
+                    RecordResult.Rejected(RecordRefusal.DUPLICATE_OR_CONFLICTING_EVENT)
+                command.captureStateAndBody().body !is ControlCommandBody.Mutations ||
+                    !mutationHoldFloorChainValid(slot, disposition, command, owner) ->
+                    RecordResult.Rejected(RecordRefusal.INVALID_CONFIRMATION)
+                else -> {
+                    confirmedTransfers[slot.key] = disposition
+                    changed()
+                    RecordResult.Recorded
+                }
+            }
+        }
+
     fun recordComponentCompleted(binding: HandoffEventBinding, slot: RequiredObligationKey,
         completion: ComponentCompletion, sourceWorkId: String? = null): RecordResult = record(binding, sourceWorkId) {
         when {
@@ -307,7 +325,9 @@ internal class HandoffCoordinator(
                         if (proof == null || when (proof) {
                             is ConfirmationBinding.RetainedSource -> proof.slot != slot ||
                                 proof.observed.locator != owned.destination
-                            is ConfirmationBinding.LifecycleOutput -> proof.command !== command
+                            is ConfirmationBinding.LifecycleOutput ->
+                                if (proof.command === command) false
+                                else !mutationHoldFloorChainValid(slot, owned, command, owner)
                         }) return@synchronized refuse(HandoffIssueRefusal.TRANSFER_NOT_CONFIRMED)
                         slots += SlotHandoff(key, owned)
                     }
