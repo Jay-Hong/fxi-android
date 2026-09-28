@@ -125,6 +125,18 @@ internal sealed interface TypedDestinationTuple {
     ) : TypedDestinationTuple
 }
 
+/** A Caller/Recovery auth rewrite can carry an existing floor only when its stored literal is untouched. */
+private fun guardAuthRewriteKeepsFloor(before: ControlNode, after: ControlNode): Boolean {
+    val old = guard(before) ?: return false
+    val next = guard(after) ?: return false
+    val oldFields = before.toPayloadEntry().fields
+    val nextFields = after.toPayloadEntry().fields
+    return old.id == next.id && old.auth != next.auth && old.floor != null && old.floor == next.floor &&
+        oldFields["floor"] == nextFields["floor"] &&
+        oldFields.filterKeys { it != "auth" && it != "floor" } ==
+            nextFields.filterKeys { it != "auth" && it != "floor" }
+}
+
 internal sealed interface RetainedDestinationTuple {
     val locator: DestinationLocator
 
@@ -231,6 +243,16 @@ internal sealed interface ConfirmationBinding {
         val observed: RetainedDestinationTuple,
         val storageEvidence: RecordTransactionEvidence
     ) : ConfirmationBinding
+
+    /** 6-4bC1d-1(b): in-memory confirmation of a Mutations recordFloor action's stored guard output (never written to the wire). */
+    class MutationFloorOutput(
+        val command: CommandRef,
+        val actionIndex: Int,
+        val before: ControlNode,
+        val output: TypedDestinationTuple.GuardFloor,
+        val effect: ConfirmedEffect,
+        val storageEvidence: RecordTransactionEvidence
+    ) : ConfirmationBinding
 }
 
 internal enum class LifecycleConfirmationFailure {
@@ -248,6 +270,21 @@ internal enum class LifecycleConfirmationFailure {
 internal sealed interface LifecycleOutputConfirmationResult {
     data class Issued(val value: PriorStorageConfirmation) : LifecycleOutputConfirmationResult
     data class Rejected(val reason: LifecycleConfirmationFailure) : LifecycleOutputConfirmationResult
+}
+
+internal enum class MutationFloorConfirmationFailure {
+    REF_OR_ACTION_MISMATCH,
+    UNSUPPORTED_ACTION,
+    EFFECT_NOT_ELIGIBLE,
+    APPLIED_MISSING_OR_MISMATCH,
+    SNAPSHOT_UNINTERPRETABLE,
+    SNAPSHOT_OUTPUT_MISMATCH,
+    FLOOR_RULE_MISMATCH
+}
+
+internal sealed interface MutationFloorOutputConfirmationResult {
+    data class Issued(val value: PriorStorageConfirmation) : MutationFloorOutputConfirmationResult
+    data class Rejected(val reason: MutationFloorConfirmationFailure) : MutationFloorOutputConfirmationResult
 }
 
 internal enum class RetainedConfirmationFailure {
@@ -310,6 +347,16 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                     outputFixed.role == LifecycleRole.GUARD && outputTarget.kind == ControlKind.DEMAND &&
                         ((outputTarget.effect == LifecycleEffect.REPLACE && outputFixed.before != null) ||
                             (outputTarget.effect == LifecycleEffect.CREATE && outputFixed.before == null))
+                LifecycleTransition.UPDATE_AUTH ->
+                    outputFixed.role == LifecycleRole.GUARD && outputTarget.kind == ControlKind.DEMAND &&
+                        outputTarget.effect == LifecycleEffect.REPLACE && outputFixed.before != null &&
+                        when (fixed.demandAuth?.event) {
+                            is LifecycleAuthEvent.Answer -> true
+                            is LifecycleAuthEvent.Caller, is LifecycleAuthEvent.Recovery ->
+                                outputFixed.after != null &&
+                                    guardAuthRewriteKeepsFloor(outputFixed.before, outputFixed.after)
+                            else -> false
+                        }
                 else -> false
             }
             if (!supported) return reject(LifecycleConfirmationFailure.UNSUPPORTED_TRANSITION_OR_TARGET)
@@ -362,7 +409,8 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
                     TypedDestinationTuple.GuardAuth(DestinationLocator.Guard(outputTarget.id, GuardPart.AUTH),
                         entry.original, parsed)
                 }
-                fixed.transition == LifecycleTransition.RECOVER_HOLD -> {
+                fixed.transition == LifecycleTransition.RECOVER_HOLD ||
+                    fixed.transition == LifecycleTransition.UPDATE_AUTH -> {
                     val parsed = entry.value as? ScheduleGuardV1
                         ?: return reject(LifecycleConfirmationFailure.SNAPSHOT_OUTPUT_MISMATCH)
                     if (parsed.floor == null)
@@ -395,6 +443,70 @@ internal class PriorStorageConfirmation private constructor(val binding: Confirm
             return LifecycleOutputConfirmationResult.Issued(PriorStorageConfirmation(
                 ConfirmationBinding.LifecycleOutput(exactCommand, fixedCopy, outputTarget, output,
                     confirmed.effect, LifecycleTargetObservation.PresentExact, confirmed.proof.storage)))
+        }
+
+        /** 6-4bC1d-1(b): the guard output of Mutations action [actionIndex] (an Edit.floor recapture) of [exactCommand]. */
+        fun confirmMutationFloorOutput(
+            exactCommand: CommandRef,
+            actionIndex: Int,
+            confirmed: ControlStoreResult.Confirmed
+        ): MutationFloorOutputConfirmationResult {
+            fun reject(reason: MutationFloorConfirmationFailure) = MutationFloorOutputConfirmationResult.Rejected(reason)
+            val body = exactCommand.captureStateAndBody().body as? ControlCommandBody.Mutations
+            if (confirmed.command !== exactCommand || body == null || actionIndex !in body.actions.indices)
+                return reject(MutationFloorConfirmationFailure.REF_OR_ACTION_MISMATCH)
+            val action = body.actions[actionIndex] as? ControlMutation.Edit
+                ?: return reject(MutationFloorConfirmationFailure.UNSUPPORTED_ACTION)
+            val after = (action.changed as? ControlWriteResult.Written)?.node
+            val before = guard(action.before)
+            val output = after?.let(::guard)
+            if (action.kind != ControlKind.DEMAND || after == null || before == null || output == null ||
+                before.id != output.id || before.floor == null || output.floor == null ||
+                action.before.toPayloadEntry() == after.toPayloadEntry())
+                return reject(MutationFloorConfirmationFailure.UNSUPPORTED_ACTION)
+            if (confirmed.effect == ConfirmedEffect.JoinedExisting ||
+                (confirmed.effect == ConfirmedEffect.AppliedThisAttempt &&
+                    confirmed.proof.storage != RecordTransactionEvidence.CompletedWriteScope))
+                return reject(MutationFloorConfirmationFailure.EFFECT_NOT_ELIGIBLE)
+            val read = confirmed.snapshot.record
+            val own = ControlAppliedEvidence.own(read, exactCommand) as? AppliedEvidence.Mutations
+            val applied = own?.targets?.getOrNull(actionIndex)
+            if (own == null || own.commandId != exactCommand.id ||
+                own.ownerTrackingLifetimeId != exactCommand.ownerTrackingLifetimeId.value ||
+                own.targets.size != body.actions.size || applied == null || applied.index != actionIndex ||
+                applied.kind != ControlKind.DEMAND || applied.id != output.id ||
+                applied.joined || !applied.written || own.targets.withIndex().any { (index, target) ->
+                    val fixedAction = body.actions[index]
+                    val id = when (fixedAction) {
+                        is ControlMutation.Add -> fixedAction.proposedId
+                        is ControlMutation.Edit ->
+                            (ControlObligations.read(fixedAction.kind, fixedAction.before) as?
+                                ControlEntryRead.Interpreted)?.value?.id
+                    }
+                    target.index != index || target.kind != fixedAction.kind || target.id != id
+                })
+                return reject(MutationFloorConfirmationFailure.APPLIED_MISSING_OR_MISMATCH)
+            if (read.hasUninterpretable || read.hasUninterpretableMetadata)
+                return reject(MutationFloorConfirmationFailure.SNAPSHOT_UNINTERPRETABLE)
+            val found = read.locations(output.id).singleOrNull()
+            val entry = found?.second as? ControlEntryRead.Interpreted
+            if (found?.first != ControlKind.DEMAND || entry == null ||
+                entry.original.toPayloadEntry() != after.toPayloadEntry() ||
+                entry.value != output)
+                return reject(MutationFloorConfirmationFailure.SNAPSHOT_OUTPUT_MISMATCH)
+            val floor = output.floor
+            val at = BootReading(floor.anchorBootId, floor.anchorElapsedMillis)
+            val remaining = before.floor.remainingAt(at)
+            if (at.bootId == "" || at.elapsedMillis < 0 || remaining == null ||
+                floor.remainingAt(at) == null || floor.waitMillis < remaining ||
+                action.before.toPayloadEntry().fields.filterKeys { it != "floor" } !=
+                    after.toPayloadEntry().fields.filterKeys { it != "floor" })
+                return reject(MutationFloorConfirmationFailure.FLOOR_RULE_MISMATCH)
+            val destination = TypedDestinationTuple.GuardFloor(
+                DestinationLocator.Guard(output.id, GuardPart.FLOOR), entry.original, output)
+            return MutationFloorOutputConfirmationResult.Issued(PriorStorageConfirmation(
+                ConfirmationBinding.MutationFloorOutput(exactCommand, actionIndex, action.before,
+                    destination, confirmed.effect, confirmed.proof.storage)))
         }
 
         fun confirmRetainedSource(
@@ -719,7 +831,7 @@ internal sealed interface NamedTransferResult {
 }
 
 internal class NamedTransferLink private constructor(
-    val transition: LifecycleTransition,
+    val transition: LifecycleTransition?,
     val source: TypedSourceTuple,
     val destination: TypedDestinationTuple,
     val responsibilityOwner: ResponsibilityOwner,
@@ -752,6 +864,9 @@ internal class NamedTransferLink private constructor(
                 LifecycleTransition.RECOVER_HOLD ->
                     (fixedSource is TypedSourceTuple.HoldFloor || fixedSource is TypedSourceTuple.GuardFloor) &&
                         destination is TypedDestinationTuple.GuardFloor
+                LifecycleTransition.UPDATE_AUTH ->
+                    selected.role == LifecycleRole.GUARD && selected.target.effect == LifecycleEffect.REPLACE &&
+                        fixedSource is TypedSourceTuple.GuardFloor && destination is TypedDestinationTuple.GuardFloor
                 else -> false
             }
             if (!supported) return invalid(NamedTransferFailureKind.UNSUPPORTED_TRANSITION_OR_REPLACEMENT)
@@ -783,7 +898,9 @@ internal class NamedTransferLink private constructor(
                         fixedSource.executorOrigin == recovery.input.binding.executor.originLifetimeId
                 }
                 is TypedSourceTuple.GuardFloor ->
-                    recoverySourceMatches && row.target.kind == ControlKind.DEMAND &&
+                    (if (fixed.transition == LifecycleTransition.UPDATE_AUTH)
+                        row.role == LifecycleRole.GUARD && row.target.effect == LifecycleEffect.REPLACE
+                    else recoverySourceMatches) && row.target.kind == ControlKind.DEMAND &&
                         sameRow(fixedSource.preimage, row.before) &&
                         fixedSource.parsed.floor != null &&
                         guard(fixedSource.preimage) == fixedSource.parsed
@@ -803,6 +920,47 @@ internal class NamedTransferLink private constructor(
                 is TypedDestinationTuple.GuardAuth -> false
             }
             if (!destinationMatches) return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+            if (fixed.transition == LifecycleTransition.UPDATE_AUTH &&
+                fixedSource is TypedSourceTuple.GuardFloor && destination is TypedDestinationTuple.GuardFloor) {
+                val plan = fixed.demandAuth
+                    ?: return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+                when (val event = plan.event) {
+                    is LifecycleAuthEvent.Answer -> {
+                        val decision = event.decision
+                        val before = fixedSource.parsed
+                        val after = destination.parsed
+                        val mergeNow = decision.mergeNow
+                        val oldRemaining = before.floor?.remainingAt(mergeNow)
+                        val seconds = DemandAuthBoundary.statedSeconds(decision.outcome)
+                        if (plan.decision !== decision || !DemandAuthBoundary.floorOrigin(decision) ||
+                            !DemandAuthBoundary.seconds(seconds) || oldRemaining == null ||
+                            mergeNow.bootId == "" || mergeNow.elapsedMillis < 0)
+                            return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+                        val stated = if (seconds != null)
+                            FloorV1(decision.capture.bootId, decision.capture.elapsedMillis,
+                                seconds * 1000, decision.floorOrigin).remainingAt(mergeNow)
+                        else null
+                        if (seconds != null && stated == null)
+                            return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+                        val delay = DemandAuthBoundary.minimumDelay(decision)
+                        val required = if (seconds != null || delay > 0) maxOf(stated ?: 0, delay) else null
+                        val expected = if (required != null && oldRemaining < required)
+                            FloorV1(mergeNow.bootId, mergeNow.elapsedMillis, maxOf(oldRemaining, required),
+                                plan.binding.executor.originLifetimeId)
+                        else before.floor
+                        if (before.id != after.id || after.auth == before.auth || after.floor != expected ||
+                            fixedSource.preimage.toPayloadEntry().fields.filterKeys { it != "auth" && it != "floor" } !=
+                                destination.row.toPayloadEntry().fields.filterKeys { it != "auth" && it != "floor" } ||
+                            (expected == before.floor && fixedSource.preimage.toPayloadEntry().fields["floor"] !=
+                                destination.row.toPayloadEntry().fields["floor"]))
+                            return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+                    }
+                    is LifecycleAuthEvent.Caller, is LifecycleAuthEvent.Recovery ->
+                        if (!guardAuthRewriteKeepsFloor(fixedSource.preimage, destination.row))
+                            return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+                    else -> return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+                }
+            }
             if (fixedSource.responsibilityOwner.trackingLifetime !== binding.command.ownerTrackingLifetimeId ||
                 fixedSource.responsibilityOwner.ownerKey.isBlank())
                 return invalid(NamedTransferFailureKind.OWNER_MISMATCH)
@@ -841,7 +999,8 @@ internal class NamedTransferLink private constructor(
                     is ReanchorValidation.Valid -> Unit
                 }
             }
-            if (fixedSource is TypedSourceTuple.GuardFloor && destination is TypedDestinationTuple.GuardFloor) {
+            if (fixed.transition == LifecycleTransition.RECOVER_HOLD &&
+                fixedSource is TypedSourceTuple.GuardFloor && destination is TypedDestinationTuple.GuardFloor) {
                 val input = checkNotNull(recovery).input
                 val parsedHold = HoldRecoverySource.from(input.source)?.hold
                     ?: return invalid(NamedTransferFailureKind.SOURCE_MISMATCH)
@@ -856,6 +1015,42 @@ internal class NamedTransferLink private constructor(
             }
             return NamedTransferResult.Issued(NamedTransferLink(fixed.transition, fixedSource, destination,
                 fixedSource.responsibilityOwner, confirmation))
+        }
+
+        /** 6-4bC1d-1(b): a guard FLOOR rewritten by a Mutations recordFloor, confirmed by its MutationFloorOutput. */
+        fun linkRecordedFloorTransfer(
+            source: TypedSourceTuple.GuardFloor,
+            destination: TypedDestinationTuple.GuardFloor,
+            confirmation: PriorStorageConfirmation
+        ): NamedTransferResult {
+            fun invalid(kind: NamedTransferFailureKind) =
+                NamedTransferResult.Rejected(NamedTransferFailure.Invalid(kind))
+            val binding = confirmation.binding as? ConfirmationBinding.MutationFloorOutput
+                ?: return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
+            val sourceFloor = source.parsed.floor
+            if (source.preimage.toPayloadEntry() != binding.before.toPayloadEntry() ||
+                guard(source.preimage) != source.parsed || sourceFloor == null)
+                return invalid(NamedTransferFailureKind.SOURCE_MISMATCH)
+            val after = guard(destination.row)
+            val floor = destination.parsed.floor
+            if (destination.locator.part != GuardPart.FLOOR ||
+                destination.locator.id != source.parsed.id || after != destination.parsed || floor == null ||
+                destination.parsed.id != source.parsed.id ||
+                source.preimage.toPayloadEntry().fields.filterKeys { it != "floor" } !=
+                    destination.row.toPayloadEntry().fields.filterKeys { it != "floor" })
+                return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+            val at = BootReading(floor.anchorBootId, floor.anchorElapsedMillis)
+            val oldRemaining = sourceFloor.remainingAt(at)
+            if (floor.remainingAt(at) == null || oldRemaining == null || floor.waitMillis < oldRemaining)
+                return invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)
+            if (source.responsibilityOwner.trackingLifetime !== binding.command.ownerTrackingLifetimeId ||
+                source.responsibilityOwner.ownerKey.isBlank())
+                return invalid(NamedTransferFailureKind.OWNER_MISMATCH)
+            if (binding.output.locator != destination.locator ||
+                binding.output.row.toPayloadEntry() != destination.row.toPayloadEntry())
+                return invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)
+            return NamedTransferResult.Issued(NamedTransferLink(null, source, destination,
+                source.responsibilityOwner, confirmation))
         }
     }
 }
@@ -1125,13 +1320,17 @@ internal fun mutationHoldFloorChainValid(slot: RequiredSlot, owned: HandoffDispo
     val bound = (slot.requirement as? SlotRequirement.Required)?.lowerBound as? RequiredLowerBound.Floor
         ?: return false
     val last = owned.linkChain.lastOrNull() ?: return false
-    val confirmation = last.confirmation.binding as? ConfirmationBinding.LifecycleOutput ?: return false
+    val successorCommand = when (val confirmation = last.confirmation.binding) {
+        is ConfirmationBinding.LifecycleOutput -> confirmation.command
+        is ConfirmationBinding.MutationFloorOutput -> confirmation.command
+        is ConfirmationBinding.RetainedSource -> return false
+    }
     return slot.key.role is ObligationRole.MutationAction &&
         slot.key.component == ObligationComponent.FLOOR && bound.sourceKind == ControlKind.HOLD &&
         owned.linkChain.first().source is TypedSourceTuple.HoldFloor &&
         owned.linkChain.drop(1).all { it.source is TypedSourceTuple.GuardFloor } &&
         last.destination is TypedDestinationTuple.GuardFloor &&
-        confirmation.command !== exactCommand &&
+        successorCommand !== exactCommand &&
         owned.priorWrite === last.confirmation && last.destination.locator == owned.destination &&
         namedChainStructurallyValid(slot, owned, exactCommand) &&
         namedChainOwnerValid(slot, owned, owner)

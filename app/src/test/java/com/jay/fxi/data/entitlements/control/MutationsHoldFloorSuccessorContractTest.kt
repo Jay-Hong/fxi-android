@@ -448,4 +448,194 @@ class MutationsHoldFloorSuccessorContractTest {
         val run = singleNoopEdit()
         transferred(run.c, issued(declaredSingle(run).issue()), 0)
     }
+
+    // ═══ contract r5 — 6-4bC1d-1(b): the guard rewritten after RECOVER_HOLD (consensus D3 (b)) ═══════════════════════════
+    // Each rewrite continues the chain GuardFloor(previous output) → GuardFloor(new output): a Mutations recordFloor is
+    // confirmed by the new MutationFloorOutput token and linked by linkRecordedFloorTransfer; an UPDATE_AUTH (auth changed,
+    // floor unchanged or raised by its Answer) is a LifecycleOutput of its GUARD REPLACE linked by linkNamedTransfer. The old
+    // HOLD FLOOR L/N submit the whole chain to the latest guard through recordConfirmedMutationFloorTransfer.
+    // After RECOVER_HOLD the guard floor is (boot, 11000, 29000, new-life): 28000 left at 12000.
+    private val at12 = BootReading("boot", 12_000)
+    private class Step(val c: CommandRef, val token: PriorStorageConfirmation, val link: NamedTransferLink, val after: ControlNode)
+    private fun issuedFloorToken(r: MutationFloorOutputConfirmationResult): PriorStorageConfirmation {
+        assertTrue("fixture: floor output token, got $r", r is MutationFloorOutputConfirmationResult.Issued)
+        return (r as MutationFloorOutputConfirmationResult.Issued).value
+    }
+    private fun guardSource(c: CommandRef, preimage: ControlNode) = TypedSourceTuple.GuardFloor(owner(c), preimage, checkNotNull(guard(preimage)))
+    /** A real Mutations recordFloor of the stored guard [previous], waiting [wait] at 12000. */
+    private suspend fun floorStep(previous: ControlNode, wait: Long = 31_000): Step {
+        val m = fx.store.prepare(fx.store.recordFloor(previous, at12, wait, H.life))
+        val r = controlTestTimeout("recordFloor") { fx.store.execute(m) }
+        assertTrue("fixture: recordFloor Confirmed, got $r", r is ControlStoreResult.Confirmed)
+        val t = issuedFloorToken(PriorStorageConfirmation.confirmMutationFloorOutput(m, 0, r as ControlStoreResult.Confirmed))
+        val out = (t.binding as ConfirmationBinding.MutationFloorOutput).output
+        return Step(m, t, linked(NamedTransferLink.linkRecordedFloorTransfer(guardSource(m, previous), out, t)), out.row)
+    }
+    /** A real UPDATE_AUTH Answer (AUTHENTICATION, [seconds]) of the stored guard [previous]: auth changes; floor per the merge. */
+    private suspend fun authStep(previous: ControlNode, seconds: Long): Step {
+        val q = DemandAuthFixtures
+        val krx = checkNotNull(fx.disk()[DataStoreAccessEpochStore.KRX_EPOCH])
+        val fence = FenceV1("A", "u", krx) // RECOVER_HOLD rotated the KRX epoch; the answer is accepted and confirmed under it
+        val started = q.query.copy(fence = fence)
+        val d = q.decision(q = started, before = fence, after = fence, outcome = com.jay.fxi.data.entitlements.EntitlementsOutcome.Indeterminate(
+            com.jay.fxi.data.entitlements.IndeterminateReason.AUTHENTICATION, seconds), capture = at12, merge = at12)
+        val u = fx.store.prepareUpdateAuth(previous, null, q.binding, LifecycleAuthEvent.Answer(d), LifecycleOrderSource(q.life, 21))
+        val r = controlTestTimeout("update auth") {
+            fx.store.execute(u, q.context(q.runtime(registrations = listOf(LifecycleQueryRegistration("query-21", started))))) }
+        assertTrue("fixture: UPDATE_AUTH Confirmed, got $r", r is ControlStoreResult.Confirmed)
+        val fixed = (u.body as ControlCommandBody.Lifecycle).input
+        val target = fixed.targets.single { it.role == LifecycleRole.GUARD }
+        val t = PriorStorageConfirmation.confirmLifecycleOutput(u, fixed, r as ControlStoreResult.Confirmed, target.target)
+        assertTrue("fixture: UPDATE_AUTH guard token, got $t", t is LifecycleOutputConfirmationResult.Issued)
+        val token = (t as LifecycleOutputConfirmationResult.Issued).value
+        val out = (token.binding as ConfirmationBinding.LifecycleOutput).output as TypedDestinationTuple.GuardFloor
+        return Step(u, token, linked(NamedTransferLink.linkNamedTransfer(guardSource(u, previous), out, token)), out.row)
+    }
+    /** A real UPDATE_AUTH from a Caller or Recovery event: auth changes (stop cleared, new order), the floor is kept. */
+    private suspend fun eventStep(previous: ControlNode, event: LifecycleAuthEvent, runtime: DemandAuthRuntime): Step {
+        val q = DemandAuthFixtures
+        val u = fx.store.prepareUpdateAuth(previous, null, q.binding, event, LifecycleOrderSource(q.life, 21))
+        val r = controlTestTimeout("update auth event") { fx.store.execute(u, q.context(runtime)) }
+        assertTrue("fixture: UPDATE_AUTH Confirmed, got $r", r is ControlStoreResult.Confirmed)
+        val fixed = (u.body as ControlCommandBody.Lifecycle).input
+        assertEquals("fixture: only the guard is rewritten", listOf(LifecycleRole.GUARD), fixed.targets.map { it.role })
+        val t = PriorStorageConfirmation.confirmLifecycleOutput(u, fixed, r as ControlStoreResult.Confirmed, fixed.targets.single().target)
+        assertTrue("fixture: UPDATE_AUTH guard token, got $t", t is LifecycleOutputConfirmationResult.Issued)
+        val token = (t as LifecycleOutputConfirmationResult.Issued).value
+        val out = (token.binding as ConfirmationBinding.LifecycleOutput).output as TypedDestinationTuple.GuardFloor
+        return Step(u, token, linked(NamedTransferLink.linkNamedTransfer(guardSource(u, previous), out, token)), out.row)
+    }
+    /** Caller at boot 60000, after the floor (29000 from 11000) expired: no retry REQUEST. */
+    private suspend fun callerStep(previous: ControlNode): Step {
+        val q = DemandAuthFixtures
+        val caller = LifecycleCaller("later", LifecycleCallerOrigin.CALLER, q.binding, LifecycleOrderGrant(q.life, 20, 1, 0, 21),
+            com.jay.fxi.data.entitlements.RefreshIntent.FORCE_PREMIUM, BootReading("boot", 60_000))
+        return eventStep(previous, LifecycleAuthEvent.Caller(caller), q.runtime(caller = caller))
+    }
+    private suspend fun recoveryStep(previous: ControlNode): Step {
+        val q = DemandAuthFixtures
+        val rec = LifecycleRecovery("rec", q.identity, q.life, 11, 22, 1)
+        return eventStep(previous, LifecycleAuthEvent.Recovery(rec), q.runtime(recovery = rec))
+    }
+
+    /** SOURCE L/N completed; FLOOR L/N each the chain [first, …rest] ending at [last]'s output with its token. */
+    private suspend fun chainTransferred(run: Single, rest: List<Step>) {
+        val b1 = B1(run.c); b1.completeSources()
+        val chain = listOf(holdLink(run.r)) + rest.map { it.link }; val last = rest.last()
+        for (branch in listOf(L, N)) recorded(b1.floor(b1.s.of(0, ObligationComponent.FLOOR, branch), last.link.destination.locator, chain, last.token))
+        transferred(run.c, issued(b1.issue()), run.own)
+    }
+
+    @Test fun R1_recordFloorRewrite_chainToTheLatestGuard_transferred() = runReleaseTest {
+        val run = singleAdd(H.guard()); val m = floorStep(run.r.guardAfter)
+        assertEquals("fixture: max(28000, 31000) at 12000", FloorV1("boot", 12_000, 31_000, H.life), guard(m.after)?.floor)
+        chainTransferred(run, listOf(m))
+    }
+
+    @Test fun R2_updateAuthAnswerRaisesTheFloor_chainToTheLatestGuard_transferred() = runReleaseTest {
+        val run = singleAdd(H.guard()); val u = authStep(run.r.guardAfter, 60)
+        assertEquals("fixture: raised to 60000 at 12000", 60_000L, guard(u.after)?.floor?.waitMillis)
+        assertTrue("fixture: auth changed", guard(u.after)?.auth != guard(run.r.guardAfter)?.auth)
+        chainTransferred(run, listOf(u))
+    }
+
+    @Test fun R3_updateAuthAnswerKeepsTheFloor_chainToTheLatestGuard_transferred() = runReleaseTest {
+        val run = singleAdd(H.guard()); val u = authStep(run.r.guardAfter, 10)
+        assertEquals("fixture: floor unchanged", guard(run.r.guardAfter)?.floor, guard(u.after)?.floor)
+        assertTrue("fixture: auth changed", guard(u.after)?.auth != guard(run.r.guardAfter)?.auth)
+        chainTransferred(run, listOf(u))
+    }
+
+    @Test fun R4_recoverThenRecordFloorThenUpdateAuth_threeLinkChain_transferred() = runReleaseTest {
+        val run = singleAdd(H.guard()); val m = floorStep(run.r.guardAfter); val u = authStep(m.after, 10)
+        chainTransferred(run, listOf(m, u))
+    }
+
+    @Test fun R5_rewriteNotLinked_staleChainAtHandoff_g05Confirmation() = runReleaseTest {
+        val run = singleAdd(H.guard()); val b1 = declaredSingle(run); val i = issued(b1.issue())
+        floorStep(run.r.guardAfter) // the guard is rewritten after issuance; the chain still ends at RECOVER_HOLD's output
+        val at = G05Location.ActualPayload(ControlKind.DEMAND, guardIndex(run.r.destination.id))
+        g05Refused(run.c, i, floorFailures(i, b1.s, G05Id.CONFIRMATION, at))
+    }
+
+    @Test fun R6_rewritesLinkedOutOfOrder_invalidConfirmation() = runReleaseTest {
+        val run = singleAdd(H.guard()); val m = floorStep(run.r.guardAfter); val u = authStep(m.after, 10)
+        val b1 = B1(run.c)
+        invalid(b1.floor(b1.s.of(0, ObligationComponent.FLOOR, L), u.link.destination.locator, listOf(holdLink(run.r), u.link, m.link), m.token))
+    }
+
+    @Test fun R7_priorWriteNotTheLastLinksToken_invalidConfirmation() = runReleaseTest {
+        val run = singleAdd(H.guard()); val m = floorStep(run.r.guardAfter)
+        val b1 = B1(run.c); val tr = token(run.r)
+        invalid(b1.floor(b1.s.of(0, ObligationComponent.FLOOR, L), m.link.destination.locator, listOf(holdLink(run.r, tr), m.link), tr))
+    }
+
+    @Test fun R8_recordedFloorLinkFromAnotherPreimage_sourceMismatch() = runReleaseTest {
+        val run = singleAdd(H.guard()); val m = floorStep(run.r.guardAfter)
+        val out = (m.token.binding as ConfirmationBinding.MutationFloorOutput).output
+        assertEquals(NamedTransferResult.Rejected(NamedTransferFailure.Invalid(NamedTransferFailureKind.SOURCE_MISMATCH)),
+            NamedTransferLink.linkRecordedFloorTransfer(guardSource(m.c, H.guard()), out, m.token))
+    }
+
+    @Test fun R9_recordedFloorDestinationWeakerThanTheSource_destinationMismatch() = runReleaseTest {
+        val run = singleAdd(H.guard()); val m = floorStep(run.r.guardAfter)
+        val weak = FloorGuardFixtures.field(m.after, "floor", FloorGuardFixtures.floor(20_000, "boot", 12_000, "life"))
+        assertEquals(NamedTransferResult.Rejected(NamedTransferFailure.Invalid(NamedTransferFailureKind.DESTINATION_MISMATCH)),
+            NamedTransferLink.linkRecordedFloorTransfer(guardSource(m.c, run.r.guardAfter),
+                TypedDestinationTuple.GuardFloor(m.link.destination.locator as DestinationLocator.Guard, weak, checkNotNull(guard(weak))), m.token))
+    }
+
+    @Test fun R10_recordedFloorDestinationNotTheConfirmedOutput_confirmationMismatch() = runReleaseTest {
+        val run = singleAdd(H.guard()); val m = floorStep(run.r.guardAfter)
+        val other = FloorGuardFixtures.field(m.after, "floor", FloorGuardFixtures.floor(40_000, "boot", 12_000, "life"))
+        assertEquals(NamedTransferResult.Rejected(NamedTransferFailure.Invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)),
+            NamedTransferLink.linkRecordedFloorTransfer(guardSource(m.c, run.r.guardAfter),
+                TypedDestinationTuple.GuardFloor(m.link.destination.locator as DestinationLocator.Guard, other, checkNotNull(guard(other))), m.token))
+    }
+
+    @Test fun R11_floorOutputTokenOfAnotherActionOrCommandOrKind_rejected() = runReleaseTest {
+        val run = singleAdd(H.guard())
+        val m = fx.store.prepare(fx.store.recordFloor(run.r.guardAfter, at12, 31_000, H.life))
+        val cm = controlTestTimeout("recordFloor") { fx.store.execute(m) } as ControlStoreResult.Confirmed
+        assertEquals(MutationFloorOutputConfirmationResult.Rejected(MutationFloorConfirmationFailure.REF_OR_ACTION_MISMATCH),
+            PriorStorageConfirmation.confirmMutationFloorOutput(m, 1, cm))
+        val other = fx.store.prepare(fx.store.addition(ControlKind.RECOVERY_INTENT) { id ->
+            literal(ControlObligationFixtures.recovery); set("id", ControlScalar.Text(id)) })
+        val co = controlTestTimeout("other") { fx.store.execute(other) } as ControlStoreResult.Confirmed
+        assertEquals(MutationFloorOutputConfirmationResult.Rejected(MutationFloorConfirmationFailure.REF_OR_ACTION_MISMATCH),
+            PriorStorageConfirmation.confirmMutationFloorOutput(m, 0, co))
+        assertEquals(MutationFloorOutputConfirmationResult.Rejected(MutationFloorConfirmationFailure.UNSUPPORTED_ACTION),
+            PriorStorageConfirmation.confirmMutationFloorOutput(other, 0, co))
+    }
+
+    @Test fun R12_floorOutputTokenOutsideItsEntries_rejected() = runReleaseTest {
+        val run = singleAdd(H.guard()); val m = floorStep(run.r.guardAfter)
+        val b1 = B1(run.c); val chain = listOf(holdLink(run.r), m.link)
+        invalid(b1.h.recordConfirmedTransfer(b1.b, b1.s.of(0, ObligationComponent.FLOOR, L).key,
+            HandoffDisposition.DurablyOwned(m.link.destination.locator, chain, m.token)))
+        val out = (m.token.binding as ConfirmationBinding.MutationFloorOutput).output
+        assertEquals(NamedTransferResult.Rejected(NamedTransferFailure.Invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)),
+            NamedTransferLink.linkNamedTransfer(guardSource(m.c, run.r.guardAfter), out, m.token))
+        val u = authStep(m.after, 10)
+        assertEquals(NamedTransferResult.Rejected(NamedTransferFailure.Invalid(NamedTransferFailureKind.CONFIRMATION_MISMATCH)),
+            NamedTransferLink.linkRecordedFloorTransfer(guardSource(u.c, m.after), u.link.destination as TypedDestinationTuple.GuardFloor, u.token))
+    }
+
+    // ── contract r6: UPDATE_AUTH from Caller and Recovery events (6-4bC1d1b_candidates_codex.r1.md: both may REPLACE the guard) ──
+    @Test fun R13_updateAuthCallerRewrite_chainToTheLatestGuard_transferred() = runReleaseTest {
+        val run = singleAdd(H.guard()); val u = callerStep(run.r.guardAfter)
+        assertEquals("fixture: floor unchanged", guard(run.r.guardAfter)?.floor, guard(u.after)?.floor)
+        assertTrue("fixture: auth changed", guard(u.after)?.auth != guard(run.r.guardAfter)?.auth)
+        chainTransferred(run, listOf(u))
+    }
+
+    /** R14: Recovery applies to a stopped AUTH, so the existing guard carries the stopped fixture auth. */
+    @Test fun R14_updateAuthRecoveryRewrite_chainToTheLatestGuard_transferred() = runReleaseTest {
+        val stopped = DemandAuthFixtures.guard(auth = DemandAuthFixtures.auth, wait = 10_000)
+        assertTrue("fixture: stopped auth", guard(stopped)?.auth?.authStopped == true)
+        val run = singleAdd(stopped); val u = recoveryStep(run.r.guardAfter)
+        assertEquals("fixture: floor unchanged", guard(run.r.guardAfter)?.floor, guard(u.after)?.floor)
+        assertTrue("fixture: auth changed", guard(u.after)?.auth != guard(run.r.guardAfter)?.auth)
+        chainTransferred(run, listOf(u))
+    }
 }

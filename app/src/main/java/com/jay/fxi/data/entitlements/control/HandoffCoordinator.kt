@@ -160,6 +160,7 @@ internal class HandoffCoordinator(
                     is ConfirmationBinding.RetainedSource ->
                         confirmation.slot.key != slot || confirmation.observed.locator != disposition.destination
                     is ConfirmationBinding.LifecycleOutput -> confirmation.command !== command
+                    is ConfirmationBinding.MutationFloorOutput -> true
                 } -> RecordResult.Rejected(RecordRefusal.INVALID_CONFIRMATION)
                 disposition.linkChain.isNotEmpty() &&
                     (disposition.linkChain.last().confirmation !== disposition.priorWrite ||
@@ -328,6 +329,8 @@ internal class HandoffCoordinator(
                             is ConfirmationBinding.LifecycleOutput ->
                                 if (proof.command === command) false
                                 else !mutationHoldFloorChainValid(slot, owned, command, owner)
+                            is ConfirmationBinding.MutationFloorOutput ->
+                                !mutationHoldFloorChainValid(slot, owned, command, owner)
                         }) return@synchronized refuse(HandoffIssueRefusal.TRANSFER_NOT_CONFIRMED)
                         slots += SlotHandoff(key, owned)
                     }
