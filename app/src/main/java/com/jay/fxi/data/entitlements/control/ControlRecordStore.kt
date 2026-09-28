@@ -458,6 +458,20 @@ internal class ControlRecordStore(
                 is TerminationPendingDescriptor.MutationsHandoff -> {
                     descriptor.closureBinding
                 }
+                is TerminationPendingDescriptor.RotationHandoff -> {
+                    check(descriptor.mode == CompletionMode.ResponsibilityTransferred &&
+                        descriptor.entry == TerminationEntry.UncertainRotation)
+                    val rotation = body as? ControlCommandBody.RotateAndSettle
+                        ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+                    check(descriptor.operationId == command.id && rotation.input.operationId == command.id &&
+                        descriptor.orderedSealIds == rotation.input.seals.map { it.id } &&
+                        descriptor.deletionIdentity == DependencyAtom.AppliedRow(command.id,
+                            command.ownerTrackingLifetimeId.value) &&
+                        (descriptor.expectedOwn == null || tracked.expectedApplied === descriptor.expectedOwn)) {
+                        "fixed rotation handoff authority changed"
+                    }
+                    descriptor.closureBinding
+                }
                 is TerminationPendingDescriptor.EvidenceAbsent -> {
                     check(descriptor.mode == CompletionMode.NeverSubmitted &&
                         descriptor.entry == TerminationEntry.AbandonBeforeFirstConfirm)
@@ -537,6 +551,7 @@ internal class ControlRecordStore(
     private sealed interface TerminationRequest {
         data object FirstNeverConfirm : TerminationRequest
         data class FirstMutationsHandoff(val handoff: CompletionHandoff) : TerminationRequest
+        data class FirstRotationHandoff(val handoff: CompletionHandoff) : TerminationRequest
         data object FirstConsumed : TerminationRequest
         data object FirstConsumedLifecycle : TerminationRequest
         data object FirstConsumedSettlement : TerminationRequest
@@ -616,6 +631,44 @@ internal class ControlRecordStore(
                                 decision.expectedOwn, decision.deletionIdentity)
                         }
                     }
+                } else if (request is TerminationRequest.FirstRotationHandoff ||
+                    (request is TerminationRequest.Retry &&
+                        request.descriptor is TerminationPendingDescriptor.RotationHandoff)) {
+                    val rotation = body as ControlCommandBody.RotateAndSettle
+                    val input = rotation.input
+                    if (request is TerminationRequest.FirstRotationHandoff) {
+                        when (val gate = assessHandoffAtOwner(command,
+                            deriveRequiredObligations(RequirementInput.Rotation(command, rotation)),
+                            closure, request.handoff, read)) {
+                            HandoffGateDecision.Eligible -> Unit
+                            is HandoffGateDecision.Rejected -> return@transactRecord RecordTransactionDecision.Observe(
+                                ControlCompletionResult.Rejected(command, emptySet(), emptySet(),
+                                    gate.reason.toCompletionRejectionReason(), command.lifecycleState, read))
+                            is HandoffGateDecision.RecoveryRequired -> return@transactRecord recovery(gate.reason)
+                            HandoffGateDecision.AlreadyTerminated, is HandoffGateDecision.ReadFailed ->
+                                error("unexpected owner handoff gate result")
+                        }
+                    }
+                    val fixed = (request as? TerminationRequest.Retry)?.descriptor as?
+                        TerminationPendingDescriptor.RotationHandoff
+                    when (val decision = ControlRotationHandoffCandidate.decide(read, command, input,
+                        tracked.expectedApplied, fixed, codec)) {
+                        is ControlRotationHandoffCandidate.Decision.Recovery ->
+                            return@transactRecord recovery(decision.reason)
+                        ControlRotationHandoffCandidate.Decision.Conflict ->
+                            return@transactRecord RecordTransactionDecision.Observe(
+                                ControlCompletionResult.Conflict(command, emptySet(), emptySet(),
+                                    ConflictReason.CommandEvidenceMismatch, command.lifecycleState, read))
+                        is ControlRotationHandoffCandidate.Decision.Rejected ->
+                            return@transactRecord RecordTransactionDecision.Observe(
+                                ControlCompletionResult.Rejected(command, emptySet(), emptySet(),
+                                    CompletionRejectionReason.Encoding(decision.reason), command.lifecycleState, read))
+                        is ControlRotationHandoffCandidate.Decision.Ready -> {
+                            candidate = decision.candidate
+                            plan = fixed ?: TerminationPendingDescriptor.RotationHandoff(closure.binding(),
+                                decision.expectedOwn, command.id, input.seals.map { it.id }, decision.deletionIdentity)
+                        }
+                    }
                 } else if (request is TerminationRequest.FirstConsumed ||
                     (request is TerminationRequest.Retry &&
                         request.descriptor is TerminationPendingDescriptor.ExactEvidenceAndSeals)) {
@@ -628,7 +681,7 @@ internal class ControlRecordStore(
                             it
                         }
                         TerminationRequest.FirstConsumedLifecycle, TerminationRequest.FirstConsumedSettlement,
-                        is TerminationRequest.FirstMutationsHandoff ->
+                        is TerminationRequest.FirstMutationsHandoff, is TerminationRequest.FirstRotationHandoff ->
                             error("unexpected non-rotation request")
                         TerminationRequest.FirstNeverConfirm -> error("unexpected never-confirm request")
                     }
@@ -659,7 +712,7 @@ internal class ControlRecordStore(
                             it
                         }
                         TerminationRequest.FirstConsumed, TerminationRequest.FirstConsumedSettlement,
-                        is TerminationRequest.FirstMutationsHandoff,
+                        is TerminationRequest.FirstMutationsHandoff, is TerminationRequest.FirstRotationHandoff,
                         TerminationRequest.FirstNeverConfirm -> error("unexpected non-lifecycle request")
                     }
                     when (val decision = ControlLifecycleConsumption.decide(read, command, input, expected,
@@ -686,7 +739,7 @@ internal class ControlRecordStore(
                             it
                         }
                         TerminationRequest.FirstConsumed, TerminationRequest.FirstConsumedLifecycle,
-                        is TerminationRequest.FirstMutationsHandoff,
+                        is TerminationRequest.FirstMutationsHandoff, is TerminationRequest.FirstRotationHandoff,
                         TerminationRequest.FirstNeverConfirm ->
                             error("unexpected non-settlement request")
                     }
@@ -718,6 +771,8 @@ internal class ControlRecordStore(
                     is TerminationPendingDescriptor.EvidenceAbsent -> null
                     is TerminationPendingDescriptor.MutationsHandoff ->
                         completionDependencyViolation(command, setOf(plan.deletionIdentity))
+                    is TerminationPendingDescriptor.RotationHandoff ->
+                        consumptionDependencyViolation(command, plan.operationId, plan.orderedSealIds)
                 }
                 if (dependencyReason != null) {
                     RecordTransactionDecision.Observe(ControlCompletionResult.Rejected(command, emptySet(), emptySet(),
@@ -831,6 +886,10 @@ internal class ControlRecordStore(
                 check(ControlLifecycleConsumption.validateReturn(returned, command, candidate)) {
                     "termination confirmation changed unrelated values"
                 }
+            is TerminationPendingDescriptor.RotationHandoff ->
+                check(ControlRotationConsumption.validateReturn(returned, command, candidate)) {
+                    "rotation handoff confirmation changed unrelated values"
+                }
         }
     }
 
@@ -860,7 +919,7 @@ internal class ControlRecordStore(
         is ControlCompletionResult.AlreadyTerminated -> error("termination transaction carried a non-decision result")
     }
 
-    /** 6-4bC1a: terminate a current-lifetime OnceConfirm·U Mutations command by handing over its L/N responsibilities. */
+    /** Terminate a current-lifetime OnceConfirm·U Mutations or rotation command by handing over its L/N responsibilities. */
     suspend fun handoffAfterUncertainConfirm(command: CommandRef, closure: TerminationClosure,
         handoff: CompletionHandoff): ControlCompletionResult {
         completionPrecheck(command, firstEntry = true)?.let { return it }
@@ -869,8 +928,9 @@ internal class ControlRecordStore(
             completionPrecheck(command, firstEntry = true)?.let { return it }
             val tracked = tracking.findPrepared(command)
                 ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
-            val body = command.captureStateAndBody().body as? ControlCommandBody.Mutations
-                ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+            val body = command.captureStateAndBody().body
+            if (body !is ControlCommandBody.Mutations && body !is ControlCommandBody.RotateAndSettle)
+                return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
             if (!tracking.isUnresolved(command))
                 return completionRejected(command, CompletionRejectionReason.NotUnresolved)
             if (!tracked.confirmationRequested.get())
@@ -880,8 +940,11 @@ internal class ControlRecordStore(
             closure.violation(command, tracking.lifetimeId)?.let {
                 return completionRejected(command, CompletionRejectionReason.ClosureNotSatisfied(it))
             }
-            return terminationAttempt(command, tracked, closure, body,
-                TerminationRequest.FirstMutationsHandoff(handoff))
+            return terminationAttempt(command, tracked, closure, body, when (body) {
+                is ControlCommandBody.Mutations -> TerminationRequest.FirstMutationsHandoff(handoff)
+                is ControlCommandBody.RotateAndSettle -> TerminationRequest.FirstRotationHandoff(handoff)
+                else -> error("unsupported handoff body")
+            })
         } finally {
             tracking.executing.remove(command)
         }

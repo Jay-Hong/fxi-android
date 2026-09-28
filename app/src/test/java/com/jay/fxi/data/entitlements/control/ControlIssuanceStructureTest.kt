@@ -188,13 +188,15 @@ class ControlIssuanceStructureTest {
             // 6-4bB2: the OnceConfirm·U handoff gate adds one observation-only owner transaction.
             // 6-4bC1a: the Mutations handoff branch of the shared termination decision adds four return@transactRecord
             // labels; owner.transactRecord calls stay 7.
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 29),
+            // 6-4bC2a: the rotation handoff branch of the same decision adds five return@transactRecord labels; calls stay 7.
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 34),
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,
                 control + "NamespaceSettlementTransition.kt" to 5,
                 control + "ControlRotationConsumption.kt" to 1,
-                control + "RequiredObligations.kt" to 1), // 6-4bA1b: the fixed rotation fact.
+                control + "RequiredObligations.kt" to 1, // 6-4bA1b: the fixed rotation fact.
+                control + "ControlRotationHandoffCandidate.kt" to 1), // 6-4bC2a: the handoff matcher's fixed input.
             "ControlCommandTracking" to mapOf(control + "ControlCommandTracking.kt" to 4, control + "ControlRecordStore.kt" to 1),
             "EpochIdGenerator.Random" to mapOf("main/java/com/jay/fxi/di/EntitlementsModule.kt" to 1, ent + "DataStoreAccessEpochStore.kt" to 1),
             "UUID::randomUUID" to mapOf(control + "ControlRecordStore.kt" to 1),
@@ -205,9 +207,11 @@ class ControlIssuanceStructureTest {
             // 6-1C: the pure dependency projection covers every body kind in one exhaustive when.
             // 6-2B: consume entry, retry dispatch and the attempt's consumption branch each name the Rotation body (2 → 5).
             // 6-4bB2: the handoff gate's requirement-input dispatch names it once more (5 → 6).
-            "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 6,
+            // 6-4bC2a: the handoff entry, retry binding, first owner decision and requirement input name it four more times (6 → 10).
+            "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 10,
                 control + "ControlStoreResult.kt" to 1, control + "ControlAppliedEvidence.kt" to 1,
-                control + "DependencyProjection.kt" to 2, // 6-2C1: the ExactEvidenceAndSeals projection also names the Rotation body.
+                control + "DependencyProjection.kt" to 3, // 6-2C1: the ExactEvidenceAndSeals projection also names the Rotation body;
+                // 6-4bC2a: the RotationHandoff projection names it once more (2 → 3).
                 control + "RequiredObligations.kt" to 1,
                 control + "RequiredNamedObligations.kt" to 1) // 6-4bA1b: the named rotation derivation.
         )
