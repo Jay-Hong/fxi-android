@@ -230,7 +230,8 @@ class ControlReleaseStructureTest {
         assertFalse("S1: no closure re-check inside the decide", attempt.contains("violation("))
         // 6-3C2: termination entry checks plus one previous-reclamation entry check, each inside its own entry.
         // 6-4aB: + the Lifecycle consumption entry (six in total).
-        assertEquals("S1: six entry checks in total", 6, Regex("closure\\.violation\\(").findAll(store).count())
+        // 6-4bB2: + the OnceConfirm·U handoff gate entry, before its owner transaction (seven in total).
+        assertEquals("S1: seven entry checks in total", 7, Regex("closure\\.violation\\(").findAll(store).count())
         val terminationEntries = listOf("suspend fun abandonBeforeFirstConfirm(", "suspend fun completeAfterConsumption(",
             "suspend fun completeSettlementAfterConsumption(", "suspend fun completeLifecycleAfterConsumption(",
             "suspend fun retryTermination(")

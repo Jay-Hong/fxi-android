@@ -26,7 +26,8 @@ import kotlinx.coroutines.CancellationException
 internal class ControlRecordStore(
     private val owner: DataStoreAccessEpochStore,
     private val ids: ControlIdGenerator = ControlIdGenerator(UUID::randomUUID),
-    private val codec: ControlPayloadCodec = ControlPayloadCodec()
+    private val codec: ControlPayloadCodec = ControlPayloadCodec(),
+    private val bootReadingSource: BootReadingSource? = null
 ) {
     private val reader = ControlRecordReader(codec)
     private val tracking = ControlCommandTracking.forOwner(owner)
@@ -809,6 +810,92 @@ internal class ControlRecordStore(
             localPendingReleases = work.pendingReleases)
         is ControlCompletionResult.Unconfirmed, is ControlCompletionResult.Completed,
         is ControlCompletionResult.AlreadyTerminated -> error("termination transaction carried a non-decision result")
+    }
+
+    /** Observe the current OnceConfirm·U handoff against the latest owner snapshot. */
+    internal suspend fun inspectCurrentUncertainHandoffGate(command: CommandRef, closure: TerminationClosure,
+        handoff: CompletionHandoff): HandoffGateDecision {
+        handoffPrecheck(command)?.let { return it }
+        if (!tracking.executing.add(command)) return handoffRejected(CompletionRejectionReason.InFlight)
+        try {
+            handoffPrecheck(command)?.let { return it }
+            val tracked = tracking.findPrepared(command)
+                ?: return handoffRejected(CompletionRejectionReason.NotRegisteredIdentity)
+            val body = command.captureStateAndBody().body
+                ?: return handoffRejected(CompletionRejectionReason.UnsupportedInThisUnit)
+            if (!tracking.isUnresolved(command)) return HandoffGateDecision.Rejected(HandoffGateRefusal.NotUnresolved)
+            if (!tracked.confirmationRequested.get())
+                return HandoffGateDecision.Rejected(HandoffGateRefusal.NotOnceConfirm)
+            if (handoff.command.ref !== command)
+                return HandoffGateDecision.Rejected(HandoffGateRefusal.DeclarationRefMismatch)
+            closure.violation(command, tracking.lifetimeId)?.let {
+                return handoffRejected(CompletionRejectionReason.ClosureNotSatisfied(it))
+            }
+
+            val input = when (body) {
+                is ControlCommandBody.Mutations -> RequirementInput.Mutations(command, body,
+                    MutationAdoption.Current(tracked.targets.get()))
+                is ControlCommandBody.RotateAndSettle -> RequirementInput.Rotation(command, body)
+                is ControlCommandBody.Handover -> RequirementInput.Settlement(command, body)
+                is ControlCommandBody.Lifecycle -> RequirementInput.Lifecycle(command, body)
+            }
+            return try {
+                owner.transactRecord { snapshot ->
+                    val derivation = deriveRequiredObligations(input)
+                    val latest = reader.read(snapshot)
+                    val decision = assessHandoffAtOwner(command, derivation, closure, handoff, latest)
+                    RecordTransactionDecision.Observe(decision)
+                }.value
+            } catch (failure: IOException) {
+                HandoffGateDecision.ReadFailed(failure)
+            }
+        } finally {
+            tracking.executing.remove(command)
+        }
+    }
+
+    private fun handoffPrecheck(command: CommandRef): HandoffGateDecision? {
+        if (command.ownerTrackingLifetimeId !== tracking.lifetimeId)
+            return handoffRejected(CompletionRejectionReason.WrongTrackerLifetime)
+        return when (command.lifecycleState) {
+            ControlCommandLifecycle.TERMINATED -> HandoffGateDecision.AlreadyTerminated
+            ControlCommandLifecycle.RETAINED -> null
+            ControlCommandLifecycle.RELEASE_PENDING, ControlCommandLifecycle.RELEASED,
+            ControlCommandLifecycle.TERMINATION_PENDING ->
+                handoffRejected(CompletionRejectionReason.OtherManagementPath)
+        }
+    }
+
+    private fun handoffRejected(reason: CompletionRejectionReason): HandoffGateDecision =
+        HandoffGateDecision.Rejected(HandoffGateRefusal.Precondition(reason))
+
+    private fun assessHandoffAtOwner(command: CommandRef, derivation: RequirementDerivation,
+        closure: TerminationClosure, handoff: CompletionHandoff, latest: ControlRecordRead): HandoffGateDecision {
+        if (latest !is ControlRecordRead.Supported) return HandoffGateDecision.RecoveryRequired(
+            if (latest is ControlRecordRead.MigrationOrRecoveryRequired) RecoveryReason.MigrationOrRecovery
+            else RecoveryReason.UnreadableRecord)
+        if (latest.schemaVersion != 2)
+            return HandoffGateDecision.RecoveryRequired(RecoveryReason.ControlSchemaMigrationRequired)
+        if (latest.hasUninterpretableMetadata)
+            return HandoffGateDecision.RecoveryRequired(RecoveryReason.UninterpretableMetadata)
+        if (latest.hasUninterpretable)
+            return HandoffGateDecision.RecoveryRequired(RecoveryReason.UninterpretableObligations)
+
+        val source = bootReadingSource
+            ?: return HandoffGateDecision.Rejected(HandoffGateRefusal.Clock(BootReadingRefusal.SOURCE_MISSING))
+        val now = try {
+            source.read()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            return HandoffGateDecision.Rejected(HandoffGateRefusal.Clock(BootReadingRefusal.SOURCE_EXCEPTION))
+        }
+        if (now.bootId?.isEmpty() == true || now.elapsedMillis < 0)
+            return HandoffGateDecision.Rejected(HandoffGateRefusal.Clock(BootReadingRefusal.INVALID_READING))
+        return when (val result = assessG05(command, derivation, handoff, closure, latest, now)) {
+            G05Result.Accepted -> HandoffGateDecision.Eligible
+            is G05Result.Rejected -> HandoffGateDecision.Rejected(HandoffGateRefusal.G05(result.failures))
+        }
     }
 
     suspend fun upgradeControlSchemaV1ToV2(): ControlSchemaUpgradeResult {

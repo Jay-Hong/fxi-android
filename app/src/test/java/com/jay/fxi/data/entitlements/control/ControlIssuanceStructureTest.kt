@@ -185,7 +185,8 @@ class ControlIssuanceStructureTest {
             // Lifecycle diagnostics collect negative decisions before returning from the transaction.
             // 6-1B adds one termination owner transaction and its five return@transactRecord labels.
             // 6-2B: the consumption decision's Recovery/Conflict/Rejected exits add three return@transactRecord labels.
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 24),
+            // 6-4bB2: the OnceConfirm·U handoff gate adds one observation-only owner transaction.
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 25),
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,
@@ -201,7 +202,8 @@ class ControlIssuanceStructureTest {
                 control + "RecoverIntentTransition.kt" to 1),
             // 6-1C: the pure dependency projection covers every body kind in one exhaustive when.
             // 6-2B: consume entry, retry dispatch and the attempt's consumption branch each name the Rotation body (2 → 5).
-            "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 5,
+            // 6-4bB2: the handoff gate's requirement-input dispatch names it once more (5 → 6).
+            "RotateAndSettle" to mapOf(control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 6,
                 control + "ControlStoreResult.kt" to 1, control + "ControlAppliedEvidence.kt" to 1,
                 control + "DependencyProjection.kt" to 2, // 6-2C1: the ExactEvidenceAndSeals projection also names the Rotation body.
                 control + "RequiredObligations.kt" to 1,
