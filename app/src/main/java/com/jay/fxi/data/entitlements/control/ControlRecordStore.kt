@@ -1225,6 +1225,27 @@ internal class ControlRecordStore(
         }
     }
 
+    /** Test-only 계획서 16번 recovery; confirmation is storage evidence, not protected admission. */
+    internal suspend fun recoverSchemaAbsentLegacy(): ControlSchemaUpgradeResult {
+        val freshEpochs = RecoveryFreshEpochs(ids.next().toString(), ids.next().toString())
+        var observation: ControlRecordRead? = null
+        return try {
+            val transaction = owner.transactRecord { snapshot ->
+                val read = reader.read(snapshot)
+                tracking.observe(read)
+                observation = read
+                RecoverSchemaAbsentLegacy.decide(read, freshEpochs)
+            }
+            val reason = transaction.value
+            if (reason != null) ControlSchemaUpgradeResult.RecoveryRequired(reason, checkNotNull(observation))
+            else ControlSchemaUpgradeResult.Confirmed(
+                ConfirmedControlSnapshot(reader.read(transaction.snapshot) as ControlRecordRead.Supported),
+                ConfirmationProof(transaction.evidence))
+        } catch (failure: IOException) {
+            ControlSchemaUpgradeResult.Unconfirmed(observation, failure)
+        }
+    }
+
     /** Reclaim the caller's fixed previous-lifetime Settlement/Lifecycle selection. */
     internal suspend fun reclaimPreviousSettlementOrLifecycleEvidence(
         selection: PreviousEvidenceSelection,

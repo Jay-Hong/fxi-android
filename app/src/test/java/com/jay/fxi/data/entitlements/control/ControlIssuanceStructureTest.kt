@@ -40,7 +40,7 @@ class ControlIssuanceStructureTest {
         assertEquals(1, tracking.countExactLine("fun issue(): OwnerTrackingLifetimeId = OwnerTrackingLifetimeId(UUID.randomUUID().toString())"))
         assertEquals(1, tracking.countExactLine("check(command.ownerTrackingLifetimeId === lifetimeId) { \"command belongs to another tracker lifetime\" }"))
         assertEquals(1, ref.countExactLine("val ownerTrackingLifetimeId: OwnerTrackingLifetimeId"))
-        assertEquals(6, store.countExactLine("tracking.observe(read)")) // + 6-1B termination owner transaction + 6-3C2 previous reclamation
+        assertEquals(7, store.countExactLine("tracking.observe(read)")) // + 6-1B termination, 6-3C2 previous reclamation, P2-L explicit recovery
         assertEquals(1, store.countExactLine("if (known != null) tracked.bindFirstConfirm(tracking.evidenceDiscontinuityCount)"))
         assertEquals(0, sources.filterKeys { it != control + "ControlCommandTracking.kt" }
             .values.sumOf { it.countLiteral("OwnerTrackingLifetimeId.issue()") })
@@ -191,7 +191,7 @@ class ControlIssuanceStructureTest {
             // 6-4bC2a: the rotation handoff branch of the same decision adds five return@transactRecord labels; calls stay 7.
             // 6-4bC2b: the settlement handoff branch adds five more; calls stay 7.
             // 6-4bC3a: the Lifecycle handoff branch adds five more; calls stay 7.
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 44),
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 45), // P2-L adds one owner transaction.
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,
