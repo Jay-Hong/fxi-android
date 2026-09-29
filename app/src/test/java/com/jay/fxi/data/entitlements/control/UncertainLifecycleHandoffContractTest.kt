@@ -23,8 +23,8 @@ import org.junit.rules.TemporaryFolder
 /**
  * Claude-owned 6-4bC3a contract (C3/split_codex.r1.md): a current-lifetime OnceConfirm·U Lifecycle REMOVE_EMPTY_GUARD is
  * terminated by handing over its L/N responsibilities through handoffAfterUncertainConfirm, and retried on its fixed
- * TerminationPendingDescriptor.LifecycleHandoff. 6-4bC3b opens REBIND_REQUESTS; the other five transitions stay UnsupportedInThisUnit
- * (C3c–g). The paths
+ * TerminationPendingDescriptor.LifecycleHandoff. 6-4bC3b opens REBIND_REQUESTS and 6-4bC3c SETTLE_QUERY; the other four transitions stay
+ * UnsupportedInThisUnit (C3d–g). The paths
  * C2a locked once for every kind (the refusals before storage, cancellation, read failure, reopen) are not repeated.
  *  - The U fixture is a real REMOVE_EMPTY_GUARD execute whose Confirm landed and whose return failed (afterScope): the guard is gone
  *    and the own Lifecycle row is on disk.
@@ -48,7 +48,7 @@ class UncertainLifecycleHandoffContractTest {
     private val demandKey = ControlRecordKeys.payload(ControlKind.DEMAND)
     private val L = LandingBranch.L
     /** The Lifecycle transitions this contract hands over so far. */
-    private val OPENED = setOf(LifecycleTransition.REMOVE_EMPTY_GUARD, LifecycleTransition.REBIND_REQUESTS)
+    private val OPENED = setOf(LifecycleTransition.REMOVE_EMPTY_GUARD, LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.SETTLE_QUERY)
 
     private fun store(f: TerminationFixture) = ControlRecordStore(f.storage.owner, bootReadingSource = BootReadingSource { now })
     private fun arr(p: Preferences, key: Preferences.Key<String>) = Json.parseToJsonElement(p[key] ?: "[]").jsonArray
@@ -82,14 +82,23 @@ class UncertainLifecycleHandoffContractTest {
     }
     private class Declared(val closure: TerminationClosure, val handoff: CompletionHandoff, val required: List<RequiredSlot>,
         val all: List<RequiredSlot>)
-    private suspend fun declare(f: TerminationFixture, c: CommandRef): Declared {
+    /** Every Required slot completed and consumed, except those [retain] names a destination for: retained there on a fresh token. */
+    private suspend fun declare(f: TerminationFixture, c: CommandRef, retain: (RequiredSlot) -> DestinationLocator? = { null }): Declared {
         val input = RequirementInput.Lifecycle(c, c.body as ControlCommandBody.Lifecycle)
         val a = deriveRequiredObligations(input) as RequirementDerivation.Available
         val slots = a.orderedSlots.filter { it.requirement is SlotRequirement.Required }
         val owner = ResponsibilityOwner(c.ownerTrackingLifetimeId, "owner-1")
         val h = HandoffCoordinator(c, owner, HandoffEntryCloser { true }, 300); val e = HandoffEventBinding(c, owner)
-        lockedRead(f)
+        val locked = lockedRead(f)
         for (slot in slots) {
+            val destination = retain(slot)
+            if (destination != null) {
+                val t = PriorStorageConfirmation.confirmRetainedSource(slot, destination, locked)
+                assertTrue("fixture: retained token for ${slot.key.component}:${slot.key.branch}, got $t", t is RetainedSourceConfirmationResult.Issued)
+                assertEquals(RecordResult.Recorded, h.recordConfirmedTransfer(e, slot.key,
+                    HandoffDisposition.DurablyOwned(destination, emptyList(), (t as RetainedSourceConfirmationResult.Issued).value)))
+                continue
+            }
             assertEquals(RecordResult.Recorded, h.recordComponentCompleted(e, slot.key, ComponentCompletion(slot.key.subject)))
             assertEquals(RecordResult.Recorded, h.recordCompletionResultConsumed(e, slot.key))
         }
@@ -504,5 +513,135 @@ class UncertainLifecycleHandoffContractTest {
         assertTrue("fixture: the settle query's result consumed, got $consumed", consumed is ControlCompletionResult.Completed)
         val d = declare(f, c); val before = f.disk()
         completed("T7_b01", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+    }
+
+    // ═══ C3c: SETTLE_QUERY ════════════════════════════════════════════════════════════════════════════════════════════
+    // Measured with assessG05 before these rows (C3/C3c_probe_outputs.r1.txt): Required = BINDING L/N, QUERY L/N, REQUEST L/N for
+    // each removed request, AUTH L/N when the guard carries one, SOURCE L/N when a guard stands unchanged (requiredUnchanged),
+    // DURABLE_EFFECT L/N for each wire-external decision effect, and RECEIPT L. The removed requests complete without conflict. A
+    // changed AUTH that stands retains its L on the guard but its N cannot complete until that AUTH is closed; an unchanged guard's
+    // SOURCE L/N are retained on it; an effect row that stands is a completion conflict until it is consumed. A SETTLE_QUERY of no
+    // request never reaches U. The default decision carries no follow-up request, so no successor row is owed here.
+    private fun settleRequests(n: Int) = (1..n).map { D.request(id = "q$it") }
+
+    /** A real SETTLE_QUERY removing [requests] (with [guard], and one wire-external effect when [effect]) whose return failed. */
+    private suspend fun settleU(f: TerminationFixture, requests: List<ControlNode> = settleRequests(1), guard: ControlNode? = null,
+        effect: ControlNode? = null, seed: (MutablePreferences) -> Unit = {}): CommandRef {
+        f.edit { it.clear(); it += D.raw(*(listOfNotNull(guard) + requests + listOfNotNull(effect)).toTypedArray()); seed(it) }
+        val decision = if (effect == null) D.decision()
+            else D.decision(effects = listOf(LifecycleDurableEffect(ControlKind.DEMAND, effect, ConfirmedControlSnapshot(D.read(D.raw(effect))))))
+        val c = f.store.prepareSettleQuery(requests, guard, null, D.binding, decision, LifecycleOrderSource(D.life, 21))
+        f.storage.storage.afterScope = true
+        val r = try { controlTestTimeout("SETTLE execute") { f.store.execute(c, D.context(D.runtime())) } } finally { f.storage.storage.afterScope = false }
+        check(r is ControlStoreResult.Unconfirmed) { "fixture: Unconfirmed, got $r" }
+        check(f.tracker.isUnresolved(c) && f.history(c).confirmationRequested.get()) { "fixture: OnceConfirm·U" }
+        check(ownIn(f.disk(), c) == 1) { "fixture: own row landed" }
+        return c
+    }
+    private fun component(d: Declared, component: ObligationComponent, branch: LandingBranch) =
+        d.required.single { it.key.component == component && it.key.branch == branch }
+
+    @Test fun T1_c01_settleSlots_perRemovedRequest_gateAdmits_ownRowOnlyRemoved() = runReleaseTest {
+        for (n in listOf(1, 2)) {
+            val f = fixture(); val other = D.request(id = "other", binding = 9)
+            val c = settleU(f, settleRequests(n)) { p -> p[demandKey] = JsonArray(arr(p.toPreferences(), demandKey) + Json.parseToJsonElement(other.toPayloadEntry().fields.toString())).toString() }
+            check(demandIds(f.disk()) == listOf("other")) { "fixture: the removed requests are gone, the unrelated one stays" }
+            val d = declare(f, c)
+            assertEquals("C3c.T1_c01 $n: components",
+                listOf(ObligationComponent.BINDING to L, ObligationComponent.BINDING to LandingBranch.N,
+                    ObligationComponent.QUERY to L, ObligationComponent.QUERY to LandingBranch.N) +
+                    (1..n).flatMap { listOf(ObligationComponent.REQUEST to L, ObligationComponent.REQUEST to LandingBranch.N) } +
+                    listOf(ObligationComponent.RECEIPT to L),
+                d.handoff.slots.map { it.key.component to it.key.branch })
+            assertEquals("C3c.T1_c01 $n: request subjects", (1..n).flatMap { listOf("q$it", "q$it") },
+                d.required.filter { it.key.component == ObligationComponent.REQUEST }.map { (it.key.subject as ObligationSubject.Request).id })
+            assertEquals("C3c.T1_c01 $n: the observation gate admits it", HandoffGateDecision.Eligible,
+                controlTestTimeout("inspect") { store(f).inspectCurrentUncertainHandoffGate(c, d.closure, d.handoff) })
+            val before = f.disk()
+            completed("T1_c01 $n", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+            assertEquals("C3c.T1_c01 $n: the unrelated request kept", listOf("other"), demandIds(f.disk()))
+        }
+    }
+
+    @Test fun T1_c02_aRemovedRequestStandingAgain_isACompletionConflict_andAMissingRequestSlotIsCoverage() = runReleaseTest {
+        val f = fixture(); val q1 = settleRequests(1).single(); val c = settleU(f, listOf(q1))
+        f.edit { p -> p[demandKey] = JsonArray(arr(p.toPreferences(), demandKey) + Json.parseToJsonElement(q1.toPayloadEntry().fields.toString())).toString() }
+        val d = declare(f, c)
+        heldFirst("T1_c02 standing", f, c, d, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures.orEmpty()
+            assertEquals("C3c.T1_c02: completion conflicts on the request's slots, got $r",
+                d.required.filter { it.key.component == ObligationComponent.REQUEST }.map { it.key }.toSet(),
+                failures.filter { it.id == G05Id.COMPLETED_CONFLICT }.map { it.key }.toSet())
+        })
+        val g = fixture(); val e = settleU(g); val dg = declare(g, e)
+        val missing = component(dg, ObligationComponent.REQUEST, L)
+        heldFirst("T1_c02 missing", g, e, dg,
+            rejected(CompletionRejectionReason.G05(listOf(G05Failure(G05Id.COVERAGE_L, missing.key, fixedAt(missing), null, null)))),
+            CompletionHandoff(dg.handoff.command, dg.handoff.responsibilityOwner, dg.handoff.slots.filter { it.key != missing.key }))
+    }
+
+    @Test fun T3_c01_aChangedAuthStanding_retainsItsL_butItsNCannotComplete() = runReleaseTest {
+        val f = fixture(); val c = settleU(f, guard = D.guard())
+        val d = declare(f, c) { slot -> if (slot.key.component == ObligationComponent.AUTH && slot.key.branch == L) DestinationLocator.Guard("g", GuardPart.AUTH) else null }
+        val authN = component(d, ObligationComponent.AUTH, LandingBranch.N)
+        heldFirst("T3_c01", f, c, d, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures.orEmpty()
+            assertEquals("C3c.T3_c01: only AUTH N conflicts, got $r", listOf(G05Id.COMPLETED_CONFLICT to authN.key), failures.map { it.id to it.key }.distinct())
+        })
+    }
+
+    @Test fun T3_c02_onceTheAuthIsClosed_itsLAndNComplete() = runReleaseTest {
+        val f = fixture(); val c = settleU(f, guard = D.guard())
+        // Stands for a later command closing the binding's AUTH: the guard is gone.
+        f.edit { p -> p[demandKey] = JsonArray(arr(p.toPreferences(), demandKey).filter { it.jsonObject.getValue("id").jsonPrimitive.content != "g" }).toString() }
+        val d = declare(f, c)
+        assertEquals("C3c.T3_c02: AUTH L and N owed", listOf(L, LandingBranch.N),
+            d.required.filter { it.key.component == ObligationComponent.AUTH }.map { it.key.branch })
+        val before = f.disk()
+        completed("T3_c02", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+    }
+
+    @Test fun T2_c01_anUnchangedGuard_isRetainedOnItself_forItsSourceLAndN() = runReleaseTest {
+        val f = fixture(); val guard = D.guard(auth = null); val c = settleU(f, guard = guard)
+        val d = declare(f, c) { slot -> if (slot.key.component == ObligationComponent.SOURCE) DestinationLocator.Payload(ControlKind.DEMAND, "g") else null }
+        assertEquals("C3c.T2_c01: SOURCE L and N owed", listOf(L, LandingBranch.N),
+            d.required.filter { it.key.component == ObligationComponent.SOURCE }.map { it.key.branch })
+        val before = f.disk()
+        completed("T2_c01", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+        assertTrue("C3c.T2_c01: the unchanged guard stays", "g" in demandIds(f.disk()))
+
+        val g = fixture(); val e = settleU(g, guard = guard)
+        val dg = declare(g, e) { slot -> if (slot.key.component == ObligationComponent.SOURCE) DestinationLocator.Payload(ControlKind.DEMAND, "g") else null }
+        val sourceN = component(dg, ObligationComponent.SOURCE, LandingBranch.N)
+        heldFirst("T2_c01 missing SOURCE N", g, e, dg,
+            rejected(CompletionRejectionReason.G05(listOf(G05Failure(G05Id.COVERAGE_N, sourceN.key, fixedAt(sourceN), null, null)))),
+            CompletionHandoff(dg.handoff.command, dg.handoff.responsibilityOwner, dg.handoff.slots.filter { it.key != sourceN.key }))
+    }
+
+    @Test fun T2_c02_aWireExternalEffect_isOwedLAndN_conflictsWhileItStands_completesOnceConsumed() = runReleaseTest {
+        val effect = D.request(id = "effect")
+        val f = fixture(); val c = settleU(f, effect = effect)
+        val d = declare(f, c)
+        val effects = d.required.filter { it.key.component == ObligationComponent.DURABLE_EFFECT }
+        assertEquals("C3c.T2_c02: DURABLE_EFFECT L and N owed", listOf(L, LandingBranch.N), effects.map { it.key.branch })
+        heldFirst("T2_c02 standing", f, c, d, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures.orEmpty()
+            assertEquals("C3c.T2_c02: conflicts on the effect's two slots, got $r",
+                effects.map { G05Id.COMPLETED_CONFLICT to it.key }.toSet(), failures.map { it.id to it.key }.toSet())
+        })
+        val g = fixture(); val e = settleU(g, effect = effect)
+        consume(g, "effect")
+        val dg = declare(g, e); val before = g.disk()
+        completed("T2_c02 consumed", g, e, handoff(g, e, dg), expectedAfterDeletion(before, e))
+    }
+
+    @Test fun T6_c01_writeFaultFixesASettleDescriptor_retryDeletes() = runReleaseTest {
+        val f = fixture(); val c = settleU(f)
+        val d = declare(f, c); val before = f.disk()
+        val fixed = pendingByWriteFault(f, c, d)
+        assertEquals(LifecycleTransition.SETTLE_QUERY, fixed.transition)
+        assertNotNull("exact own fixed", fixed.expectedOwn)
+        assertEquals("nothing landed", before, f.disk())
+        completed("T6_c01", f, c, retry(f, c, d), expectedAfterDeletion(before, c))
     }
 }
