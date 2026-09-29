@@ -12,7 +12,10 @@ import com.jay.fxi.data.remote.AuthenticatedHttpResponse
 import com.jay.fxi.data.remote.dto.AlertHistoryItem
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
+import com.jay.fxi.data.remote.dto.SourceAlertSettingRequest
+import com.jay.fxi.data.remote.dto.SourceAlertSettingUpdateRequest
 import com.jay.fxi.domain.model.AlertSetting
+import com.jay.fxi.domain.model.SourceAlertSetting
 import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -35,6 +38,34 @@ class AlertRepository @Inject constructor(
             apiService.getNotificationSettings(snapshot)
                 .requireBody("GET /api/notification-settings")
                 .settings
+        }
+
+    /** Source (tether exchange / KRX) alerts; [asset] null is every asset. */
+    suspend fun getSourceSettings(owner: AuthIdentityFence, asset: String? = null): AuthBoundResult<List<SourceAlertSetting>> =
+        safeApiCall(owner) { snapshot ->
+            apiService.getSourceNotificationSettings(snapshot, asset)
+                .requireBody("GET /api/source-notification-settings")
+                .settings
+        }
+
+    suspend fun createSourceSetting(owner: AuthIdentityFence, request: SourceAlertSettingRequest): AuthBoundResult<SourceAlertSetting> =
+        safeApiCall(owner) { snapshot ->
+            apiService.createSourceNotificationSetting(snapshot, request)
+                .requireBody("POST /api/source-notification-settings")
+        }
+
+    /** Partial update: only the request's non-null fields change. */
+    suspend fun updateSourceSetting(owner: AuthIdentityFence, id: Int, request: SourceAlertSettingUpdateRequest): AuthBoundResult<SourceAlertSetting> =
+        safeApiCall(owner) { snapshot ->
+            apiService.updateSourceNotificationSetting(snapshot, id, request)
+                .requireBody("PUT /api/source-notification-settings/{id}")
+        }
+
+    /** Idempotent on the server: an already deleted setting also succeeds. */
+    suspend fun deleteSourceSetting(owner: AuthIdentityFence, id: Int): AuthBoundResult<Unit> =
+        safeApiCall(owner) { snapshot ->
+            val response = apiService.deleteSourceNotificationSetting(snapshot, id)
+            response.failure?.let { throw AuthenticatedApiException(it) }
         }
 
     /** Delivered bank alerts, newest first; [currency] null is every currency, [limit] 1..200 (server caps). */

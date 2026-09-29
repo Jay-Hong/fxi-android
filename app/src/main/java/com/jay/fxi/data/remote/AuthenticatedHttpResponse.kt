@@ -15,9 +15,12 @@ internal enum class AuthenticatedEndpoint {
     REGISTER_DEVICE,
     UNREGISTER_DEVICE,
     NOTIFICATION_SETTINGS,
+    SOURCE_NOTIFICATION_SETTINGS,
     NOTIFICATION_LOGS,
     UPDATE_NOTIFICATION_SETTING,
+    UPDATE_SOURCE_NOTIFICATION_SETTING,
     DELETE_NOTIFICATION_SETTING,
+    DELETE_SOURCE_NOTIFICATION_SETTING,
     DELETE_USER,
     GRAPH_V2_CATALOG,
     GRAPH_V2_TAB,
@@ -209,7 +212,8 @@ private fun classifyFailure(
         404 -> if (
             (endpoint == AuthenticatedEndpoint.UNREGISTER_DEVICE &&
                 error == null && detailText == "Device not found") ||
-            (endpoint == AuthenticatedEndpoint.UPDATE_NOTIFICATION_SETTING &&
+            (endpoint in setOf(AuthenticatedEndpoint.UPDATE_NOTIFICATION_SETTING,
+                AuthenticatedEndpoint.UPDATE_SOURCE_NOTIFICATION_SETTING) &&
                 error == null && detailText == "Setting not found")
         ) {
             AuthenticatedFailureKind.KNOWN_NOT_FOUND
@@ -222,9 +226,12 @@ private fun classifyFailure(
 
 private val PREMIUM_REQUIRED_ENDPOINTS = setOf(
     AuthenticatedEndpoint.NOTIFICATION_SETTINGS,
+    AuthenticatedEndpoint.SOURCE_NOTIFICATION_SETTINGS,
     AuthenticatedEndpoint.NOTIFICATION_LOGS,
     AuthenticatedEndpoint.UPDATE_NOTIFICATION_SETTING,
+    AuthenticatedEndpoint.UPDATE_SOURCE_NOTIFICATION_SETTING,
     AuthenticatedEndpoint.DELETE_NOTIFICATION_SETTING,
+    AuthenticatedEndpoint.DELETE_SOURCE_NOTIFICATION_SETTING,
     AuthenticatedEndpoint.GRAPH_V2_CATALOG,
     AuthenticatedEndpoint.GRAPH_V2_TAB
 )

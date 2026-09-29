@@ -11,7 +11,11 @@ import com.jay.fxi.data.remote.dto.FreeSnapshotResponse
 import com.jay.fxi.data.remote.dto.GraphV2CatalogResponse
 import com.jay.fxi.data.remote.dto.GraphV2TabResponse
 import com.jay.fxi.data.remote.dto.NotificationSettingsResponse
+import com.jay.fxi.data.remote.dto.SourceAlertSettingRequest
+import com.jay.fxi.data.remote.dto.SourceAlertSettingUpdateRequest
+import com.jay.fxi.data.remote.dto.SourceAlertSettingsResponse
 import com.jay.fxi.domain.model.AlertSetting
+import com.jay.fxi.domain.model.SourceAlertSetting
 import javax.inject.Singleton
 import kotlinx.serialization.json.Json
 import okhttp3.ResponseBody
@@ -60,6 +64,31 @@ internal interface AuthenticatedApiService {
     @GET("api/notification-settings")
     suspend fun getNotificationSettings(
         @Tag auth: AuthRequestTag
+    ): Response<ResponseBody>
+
+    @GET("api/source-notification-settings")
+    suspend fun getSourceNotificationSettings(
+        @Tag auth: AuthRequestTag,
+        @Query("asset") asset: String?
+    ): Response<ResponseBody>
+
+    @POST("api/source-notification-settings")
+    suspend fun createSourceNotificationSetting(
+        @Tag auth: AuthRequestTag,
+        @Body request: SourceAlertSettingRequest
+    ): Response<ResponseBody>
+
+    @PUT("api/source-notification-settings/{id}")
+    suspend fun updateSourceNotificationSetting(
+        @Tag auth: AuthRequestTag,
+        @Path("id") id: Int,
+        @Body request: SourceAlertSettingUpdateRequest
+    ): Response<ResponseBody>
+
+    @DELETE("api/source-notification-settings/{id}")
+    suspend fun deleteSourceNotificationSetting(
+        @Tag auth: AuthRequestTag,
+        @Path("id") id: Int
     ): Response<ResponseBody>
 
     @GET("api/v2/graph/catalog")
@@ -190,6 +219,39 @@ class AuthenticatedApiClient internal constructor(
         transport.executeRead(owner) { service.getNotificationSettings(it) }
             .preserve(AuthenticatedEndpoint.NOTIFICATION_SETTINGS)
             .decodeSuccess(wireJson)
+
+    suspend fun getSourceNotificationSettings(
+        owner: AuthSnapshot,
+        asset: String?
+    ): AuthenticatedHttpResponse<SourceAlertSettingsResponse> =
+        transport.executeRead(owner) { service.getSourceNotificationSettings(it, asset) }
+            .preserve(AuthenticatedEndpoint.SOURCE_NOTIFICATION_SETTINGS)
+            .decodeSuccess(wireJson)
+
+    suspend fun createSourceNotificationSetting(
+        owner: AuthSnapshot,
+        request: SourceAlertSettingRequest
+    ): AuthenticatedHttpResponse<SourceAlertSetting> =
+        transport.executeMutation(owner) { service.createSourceNotificationSetting(it, request) }
+            .preserve(AuthenticatedEndpoint.SOURCE_NOTIFICATION_SETTINGS)
+            .decodeSuccess(wireJson)
+
+    suspend fun updateSourceNotificationSetting(
+        owner: AuthSnapshot,
+        id: Int,
+        request: SourceAlertSettingUpdateRequest
+    ): AuthenticatedHttpResponse<SourceAlertSetting> =
+        transport.executeMutation(owner) { service.updateSourceNotificationSetting(it, id, request) }
+            .preserve(AuthenticatedEndpoint.UPDATE_SOURCE_NOTIFICATION_SETTING)
+            .decodeSuccess(wireJson)
+
+    suspend fun deleteSourceNotificationSetting(
+        owner: AuthSnapshot,
+        id: Int
+    ): AuthenticatedHttpResponse<Unit> =
+        transport.executeMutation(owner) { service.deleteSourceNotificationSetting(it, id) }
+            .preserve(AuthenticatedEndpoint.DELETE_SOURCE_NOTIFICATION_SETTING)
+            .asUnit()
 
     /** GET /api/v2/graph/catalog (premium; KRX series only when the user may see them). */
     suspend fun getGraphV2Catalog(
