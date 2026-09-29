@@ -107,16 +107,16 @@ class PurgeManifestTest {
     }
 
     /**
-     * Nothing is classified as this purger's own work yet.
+     * The only surface classified as this purger's own work is the S3 topic last-known store (S3-R2).
      *
-     * The topic and graph runtimes that will write server-derived caches are not wired
-     * (동결 후 13번), so a `DERIVED_HERE` entry appearing here means either a new runtime landed —
-     * and this test should be updated with it — or a legacy surface was quietly reclassified.
+     * The topic and graph runtimes are still not wired (동결 후 13번); the store landed ahead of them, with its deletion adapter
+     * still owed, so a purge stays Deferred. Any other `DERIVED_HERE` entry means either another runtime landed — and this test
+     * should be updated with it — or a legacy surface was quietly reclassified.
      */
     @Test
-    fun `no derived target exists before the runtimes land`() {
+    fun `the only derived target is the topic last-known store`() {
         assertEquals(
-            emptyList<String>(),
+            listOf("datastore:fxi_topic_last_known"),
             PurgeManifest.TARGETS.filter { it.classification == PurgeClassification.DERIVED_HERE }.map { it.id }
         )
     }

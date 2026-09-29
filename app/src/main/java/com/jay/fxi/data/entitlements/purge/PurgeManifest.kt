@@ -70,7 +70,7 @@ data class PurgeTarget(
 /**
  * The storage surfaces this app's own data code manages, classified.
  *
- * Surveyed from the code rather than from the plan: eight preference DataStores, three
+ * Surveyed from the code rather than from the plan: ten preference DataStores, three
  * `SharedPreferences` files and the two file shapes under `filesDir`. There is no Room, SQLite or
  * WorkManager state of ours. It is **not** an inventory of what a framework or an SDK persists on
  * its own — `NewsDetailOverlay` turns on WebView DOM storage, for one — and `PurgeManifestTest`
@@ -80,10 +80,9 @@ data class PurgeTarget(
  * A surface missing from this list is the failure this list exists to prevent, which is why
  * `PurgeManifestTest` pins the set rather than the classifications alone.
  *
- * **There is no `DERIVED_HERE` entry yet.** The topic and graph runtimes that will hold
- * server-derived caches are not wired (`ANDROID_V2_PLAN.md` 동결 후 13번), so the honest state of
- * this manifest today is that every user-axis obligation is outstanding elsewhere. That is exactly
- * what this purger reports; see [com.jay.fxi.data.entitlements.purge.ManifestScopePurger].
+ * The S3 topic last-known store is classified as `DERIVED_HERE`, but its deletion adapter is not
+ * wired. A user-axis purge therefore remains Deferred until that adapter exists; see
+ * [com.jay.fxi.data.entitlements.purge.ManifestScopePurger].
  */
 object PurgeManifest {
 
@@ -179,6 +178,13 @@ object PurgeManifest {
             scopes = emptySet(),
             owner = "LocalMigrationJournal",
             note = "§9.1 per-target legacy migration progress for this install — not the user's data, and a purge must not rewind it"
+        ),
+        PurgeTarget(
+            id = "datastore:fxi_topic_last_known",
+            classification = PurgeClassification.DERIVED_HERE,
+            scopes = setOf(PurgeScope.USER),
+            owner = "S3",
+            note = "FX/Tether/DXY display seeds per UID and user epoch; deletion adapter TODO(S3-R2), so purge remains Deferred"
         ),
         PurgeTarget(
             id = "prefs:alert_prefs",

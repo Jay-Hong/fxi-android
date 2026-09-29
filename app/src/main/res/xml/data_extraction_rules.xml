@@ -16,11 +16,13 @@
         <exclude domain="file" path="datastore/fxi_bank_preferences.preferences_pb" />
         <exclude domain="file" path="datastore/fxi_migration_journal.preferences_pb" />
         <exclude domain="file" path="datastore/fxi_push_registration_ledger.preferences_pb" />
+        <exclude domain="file" path="datastore/fxi_topic_last_known.preferences_pb" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="file" path="datastore/fxi_access_epoch.preferences_pb" />
         <exclude domain="file" path="datastore/fxi_bank_preferences.preferences_pb" />
         <exclude domain="file" path="datastore/fxi_migration_journal.preferences_pb" />
         <exclude domain="file" path="datastore/fxi_push_registration_ledger.preferences_pb" />
+        <exclude domain="file" path="datastore/fxi_topic_last_known.preferences_pb" />
     </device-transfer>
 </data-extraction-rules>
