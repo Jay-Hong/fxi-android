@@ -40,7 +40,6 @@ import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
 import com.jay.fxi.di.NetworkModule
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.TopicRejectionReason
-import java.io.IOException
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -56,10 +55,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import okhttp3.Authenticator
-import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Response
 import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -93,40 +90,15 @@ class PremiumColdStartBudgetTest {
     private companion object {
         val DESIRED = TopicCatalogue.DESIRED
         const val TETHER = TopicCatalogue.TETHER
-        const val MAX_EXCESS_MILLI = 10_000L
-        const val MAX_API_IN_FLIGHT = 10
         val UNMEASURED = listOf(
             "firebase-token", "free-snapshot(②b-3)", "alerts", "push-registration", "graph", "history",
             "app-cold-start-wiring", "through-nginx"
         )
     }
 
-    /** One physical exchange as the last network interceptor saw it. [end] is when the response headers arrived. */
-    private data class Exchange(val start: Long, val path: String, val topic: String?, val zone: String) {
-        @Volatile var end: Long? = null
-        @Volatile var status: Int? = null
-    }
-
     private val origin = System.nanoTime()
     private fun nowMillis() = (System.nanoTime() - origin) / 1_000_000
-
-    private val exchanges: MutableList<Exchange> = Collections.synchronizedList(mutableListOf())
-
-    private val recorder = Interceptor { chain ->
-        val request = chain.request()
-        val path = request.url.encodedPath
-        val exchange = Exchange(nowMillis(), path, request.url.queryParameter("topic"), if (path == "/ws") "ws" else "api")
-        exchanges += exchange
-        try {
-            chain.proceed(request).also { response: Response ->
-                exchange.status = response.code
-                exchange.end = nowMillis()
-            }
-        } catch (failed: IOException) {
-            exchange.end = nowMillis()
-            throw failed
-        }
-    }
+    private val sends = SendRecorder(::nowMillis)
 
     private lateinit var server: MockWebServer
     /** Every request the server received, as `path?topic`, in arrival order. */
@@ -176,7 +148,7 @@ class PremiumColdStartBudgetTest {
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 val url = request.requestUrl!!
-                received += url.encodedPath + (url.queryParameter("topic")?.let { "?$it" } ?: "")
+                received += SendRecorder.describe(url.encodedPath, url.queryParameterNames.associateWith { url.queryParameter(it) })
                 return when {
                     url.encodedPath == "/ws" -> MockResponse().withWebSocketUpgrade(object : WebSocketListener() {})
                     url.encodedPath == "/api/entitlements" ->
@@ -199,7 +171,7 @@ class PremiumColdStartBudgetTest {
             .addInterceptor(AuthSnapshotInterceptor(provider))
             .addInterceptor(MutationOneShotInterceptor())
             .addNetworkInterceptor(TopicUseNetworkInterceptor(provider))
-            .addNetworkInterceptor(recorder)
+            .addNetworkInterceptor(sends.interceptor)
             .build()
         val retrofit = Retrofit.Builder()
             .baseUrl(server.url("/"))
@@ -229,7 +201,7 @@ class PremiumColdStartBudgetTest {
             override suspend fun sleep(duration: Duration) = delay(duration)
         }
         // OkHttp runs no network interceptor on a WebSocket call, so the handshake is recorded as an application interceptor.
-        val wsClient = OkHttpClient.Builder().addInterceptor(recorder).build()
+        val wsClient = OkHttpClient.Builder().addInterceptor(sends.interceptor).build()
         val factory = TopicRuntimeFactory(
             webSocketFactory = { wsClient },
             webSocketUrl = server.url("/ws").toString(),
@@ -267,43 +239,32 @@ class PremiumColdStartBudgetTest {
         runtime.setOnline(true)
         try {
             withTimeout(20.seconds) {
-                while (snapshotTopics() != DESIRED || exchanges.none { it.zone == "ws" }) delay(50)
+                while (snapshotTopics() != DESIRED || sends.all().none { it.zone == "ws" }) delay(50)
             }
             delay(1_000) // anything owed right behind the last one
         } finally {
             runtime.stop()
-            println("②b-2 raw: " + synchronized(exchanges) { exchanges.toList() }.joinToString { "${it.start}ms ${it.zone} ${it.path}${it.topic?.let { t -> "?$t" } ?: ""} -> ${it.status}" })
+            println("②b-2 timeline: " + sends.timeline())
         }
 
-        val all = synchronized(exchanges) { exchanges.toList() }.sortedBy { it.start }
-        println("②b-2 timeline: " + all.joinToString { "${it.start}ms ${it.zone} ${it.path}${it.topic?.let { t -> "?$t" } ?: ""} -> ${it.status}" })
+        val all = sends.all()
         println("②b-2 not measured: $UNMEASURED")
 
         // The recorder saw what the server saw, and a 401 and its replay are two sends.
         assertEquals(
             "the recorder and the server disagree, path by path",
             synchronized(received) { received.toList() }.sorted(),
-            all.map { it.path + (it.topic?.let { t -> "?$t" } ?: "") }.sorted()
+            all.map { it.key }.sorted()
         )
         assertEquals("the handshake was not a single upgrade", listOf(101), all.filter { it.zone == "ws" }.map { it.status })
         assertEquals(listOf(401, 200), all.filter { it.path == "/api/entitlements" }.map { it.status })
-        assertEquals(listOf(401, 404), all.filter { it.topic == TETHER }.map { it.status })
+        assertEquals(listOf(401, 404), all.filter { it.param("topic") == TETHER }.map { it.status })
         assertEquals("the measurement did not cover every desired topic", DESIRED, snapshotTopics())
-        assertTrue("an exchange never ended", all.all { it.end != null })
 
-        val api = all.filter { it.zone == "api" }
-        val ws = all.filter { it.zone == "ws" }
-        val apiVerdict = NginxLimitModel.limitReq(NginxLimitModel.API, api.map { it.start })
-        val wsVerdict = NginxLimitModel.limitReq(NginxLimitModel.WS_HANDSHAKE, ws.map { it.start })
-        val inFlight = NginxLimitModel.maxConcurrent(api.map { it.start until maxOf(it.start + 1, it.end!!) })
-        println("②b-2 verdict: api excess ${apiVerdict.maxExcessMilli}, ws excess ${wsVerdict.maxExcessMilli}, api in flight $inFlight")
-        assertTrue("api excess ${apiVerdict.maxExcessMilli} > $MAX_EXCESS_MILLI", apiVerdict.maxExcessMilli <= MAX_EXCESS_MILLI)
-        assertTrue("ws excess ${wsVerdict.maxExcessMilli} > $MAX_EXCESS_MILLI", wsVerdict.maxExcessMilli <= MAX_EXCESS_MILLI)
-        assertEquals(emptyList<Int>(), apiVerdict.rejected + wsVerdict.rejected)
-        assertTrue("api in flight $inFlight > $MAX_API_IN_FLIGHT", inFlight <= MAX_API_IN_FLIGHT)
-        assertEquals("a 429 was answered", 0, all.count { it.status == 429 })
+        val verdict = ColdStartBudget.judge(all)
+        println("②b-2 verdict: $verdict")
+        ColdStartBudget.assertWithin(verdict)
     }
 
-    private fun snapshotTopics(): Set<String> =
-        synchronized(exchanges) { exchanges.mapNotNull { it.topic }.toSet() }
+    private fun snapshotTopics(): Set<String> = sends.all().mapNotNull { it.param("topic") }.toSet()
 }
