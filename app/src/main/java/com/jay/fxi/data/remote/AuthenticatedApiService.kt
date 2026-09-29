@@ -5,6 +5,7 @@ import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.remote.dto.AlertHistoryResponse
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
+import com.jay.fxi.data.remote.dto.ComparisonAlertHistoryResponse
 import com.jay.fxi.data.remote.dto.ComparisonAlertRequest
 import com.jay.fxi.data.remote.dto.ComparisonAlertUpdateRequest
 import com.jay.fxi.data.remote.dto.ComparisonAlertsResponse
@@ -126,6 +127,14 @@ internal interface AuthenticatedApiService {
     suspend fun deleteComparisonAlert(
         @Tag auth: AuthRequestTag,
         @Path("id") id: Int
+    ): Response<ResponseBody>
+
+    @GET("api/comparison-notification-logs")
+    suspend fun getComparisonNotificationLogs(
+        @Tag auth: AuthRequestTag,
+        @Query("tab") tab: String?,
+        @Query("diff_type") diffType: String?,
+        @Query("limit") limit: Int
     ): Response<ResponseBody>
 
     @GET("api/v2/graph/catalog")
@@ -323,6 +332,17 @@ class AuthenticatedApiClient internal constructor(
         transport.executeMutation(owner) { service.deleteComparisonAlert(it, id) }
             .preserve(AuthenticatedEndpoint.DELETE_COMPARISON_ALERT)
             .asUnit()
+
+    /** GET /api/comparison-notification-logs (delivered comparison alerts). */
+    suspend fun getComparisonNotificationLogs(
+        owner: AuthSnapshot,
+        tab: String?,
+        diffType: String?,
+        limit: Int
+    ): AuthenticatedHttpResponse<ComparisonAlertHistoryResponse> =
+        transport.executeRead(owner) { service.getComparisonNotificationLogs(it, tab, diffType, limit) }
+            .preserve(AuthenticatedEndpoint.COMPARISON_NOTIFICATION_LOGS)
+            .decodeSuccess(wireJson)
 
     /** GET /api/v2/graph/catalog (premium; KRX series only when the user may see them). */
     suspend fun getGraphV2Catalog(

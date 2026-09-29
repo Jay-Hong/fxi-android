@@ -12,6 +12,7 @@ import com.jay.fxi.data.remote.AuthenticatedHttpResponse
 import com.jay.fxi.data.remote.dto.AlertHistoryItem
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
+import com.jay.fxi.data.remote.dto.ComparisonAlertHistoryItem
 import com.jay.fxi.data.remote.dto.ComparisonAlertRequest
 import com.jay.fxi.data.remote.dto.ComparisonAlertUpdateRequest
 import com.jay.fxi.data.remote.dto.SourceAlertHistoryItem
@@ -110,6 +111,18 @@ class AlertRepository @Inject constructor(
             val response = apiService.deleteComparisonAlert(snapshot, id)
             response.failure?.let { throw AuthenticatedApiException(it) }
         }
+
+    /** Delivered comparison alerts, newest first; [tab] / [diffType] null are every value, [limit] 1..200 (server caps). */
+    suspend fun getComparisonHistory(
+        owner: AuthIdentityFence,
+        tab: String? = null,
+        diffType: String? = null,
+        limit: Int = 100
+    ): AuthBoundResult<List<ComparisonAlertHistoryItem>> = safeApiCall(owner) { snapshot ->
+        apiService.getComparisonNotificationLogs(snapshot, tab, diffType, limit)
+            .requireBody("GET /api/comparison-notification-logs")
+            .logs
+    }
 
     /** Delivered bank alerts, newest first; [currency] null is every currency, [limit] 1..200 (server caps). */
     suspend fun getHistory(
