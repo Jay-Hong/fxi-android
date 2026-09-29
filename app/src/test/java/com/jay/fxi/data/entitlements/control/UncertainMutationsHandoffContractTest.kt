@@ -405,7 +405,8 @@ class UncertainMutationsHandoffContractTest {
     @Test fun N1d_nonMutationsBody_unsupportedInThisUnit() = runReleaseTest {
         val c = noopEdit(); val d = declare(c, completed = false)
         // A body this unit does not hand over: a Lifecycle command (C3). R and N settlements are opened by 6-4bC2b/C2c.
-        val settlement = fx.tracker.registerPrepared(ControlLifecycleEvidenceFixtures.command(life = fx.tracker.lifetimeId))
+        // RECOVER_HOLD: a Lifecycle transition C3a does not open (REMOVE_EMPTY_GUARD is handed over from C3a on).
+        val settlement = fx.tracker.registerPrepared(ControlLifecycleEvidenceFixtures.command(ControlLifecycleEvidenceFixtures.descriptor(transition = LifecycleTransition.RECOVER_HOLD), life = fx.tracker.lifetimeId))
         val accesses = fx.boundary.accesses
         rejected(controlTestTimeout("non-mutations") { store().handoffAfterUncertainConfirm(settlement, TerminationClosures.of(settlement), d.handoff) },
             CompletionRejectionReason.UnsupportedInThisUnit)

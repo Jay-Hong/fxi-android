@@ -386,6 +386,29 @@ internal fun projectDependency(input: DependencyProjectionInput): DependencyProj
         ) mark("TerminationDescriptorMismatch", DependencyGapCause.TerminationDescriptorMismatch,
             DependencyGapSource.TerminationDescriptor, broadFootprint)
     }
+    if (input.terminationDescriptor is TerminationPendingDescriptor.LifecycleHandoff) {
+        val descriptor = input.terminationDescriptor
+        val expected = descriptor.expectedOwn
+        dependencies += descriptor.deletionIdentity
+        expected?.let { dependencies += DependencyAtom.AppliedRow(it.commandId, it.ownerTrackingLifetimeId) }
+        val lifecycle = body as? ControlCommandBody.Lifecycle
+        val binding = descriptor.closureBinding
+        if (descriptor.mode != CompletionMode.ResponsibilityTransferred ||
+            descriptor.entry != TerminationEntry.UncertainLifecycle ||
+            descriptor.deletionIdentity != DependencyAtom.AppliedRow(input.commandId, input.lifetimeId) ||
+            binding.command.id != input.commandId || binding.ownerTrackingLifetimeId.value != input.lifetimeId ||
+            binding.relatedScope != input.commandId || !binding.entriesClosed || !binding.receiptsClosed ||
+            binding.owner.isBlank() || binding.captured != binding.joined || binding.registered != binding.captured ||
+            lifecycle == null || lifecycle.input.operationId != input.commandId ||
+            descriptor.transition != LifecycleTransition.REMOVE_EMPTY_GUARD ||
+            lifecycle.input.transition != descriptor.transition ||
+            (expected != null && (expected.commandId != input.commandId ||
+                expected.ownerTrackingLifetimeId != input.lifetimeId ||
+                expected.transition != descriptor.transition ||
+                !ControlLifecycleEvidence.matches(lifecycle.input, expected)))
+        ) mark("TerminationDescriptorMismatch", DependencyGapCause.TerminationDescriptorMismatch,
+            DependencyGapSource.TerminationDescriptor, broadFootprint)
+    }
     if (input.terminationDescriptor is TerminationPendingDescriptor.ExactEvidenceAndSeals) {
         val descriptor = input.terminationDescriptor
         val expected = descriptor.expectedRotation

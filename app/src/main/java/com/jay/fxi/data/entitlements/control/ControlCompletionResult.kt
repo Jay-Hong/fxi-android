@@ -4,7 +4,7 @@ import java.io.IOException
 import java.util.Collections
 
 internal enum class CompletionMode { Consumed, NeverSubmitted, ResponsibilityTransferred }
-internal enum class TerminationEntry { AbandonBeforeFirstConfirm, ConsumedRotation, ConsumedLifecycle, ConsumedSettlement, UncertainMutations, UncertainRotation, UncertainSettlement }
+internal enum class TerminationEntry { AbandonBeforeFirstConfirm, ConsumedRotation, ConsumedLifecycle, ConsumedSettlement, UncertainMutations, UncertainRotation, UncertainSettlement, UncertainLifecycle }
 
 /** The caller declares both business handoff conditions before evidence can be consumed. */
 internal class RotationConsumption(
@@ -163,6 +163,17 @@ internal sealed interface TerminationPendingDescriptor {
         override val mode: CompletionMode = CompletionMode.ResponsibilityTransferred
         val entry: TerminationEntry = TerminationEntry.UncertainSettlement
         val orderedSealIds: List<String> = Collections.unmodifiableList(orderedSealIds.toList())
+    }
+
+    /** 6-4bC3a: expectedOwn null fixes whole own-row absence at the first owner read. */
+    class LifecycleHandoff(
+        val closureBinding: TerminationClosureBinding,
+        val expectedOwn: AppliedEvidence.Lifecycle?,
+        val transition: LifecycleTransition,
+        val deletionIdentity: DependencyAtom.AppliedRow
+    ) : TerminationPendingDescriptor {
+        override val mode: CompletionMode = CompletionMode.ResponsibilityTransferred
+        val entry: TerminationEntry = TerminationEntry.UncertainLifecycle
     }
 
     data class EvidenceAbsent(

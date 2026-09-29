@@ -190,7 +190,8 @@ class ControlIssuanceStructureTest {
             // labels; owner.transactRecord calls stay 7.
             // 6-4bC2a: the rotation handoff branch of the same decision adds five return@transactRecord labels; calls stay 7.
             // 6-4bC2b: the settlement handoff branch adds five more; calls stay 7.
-            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 39),
+            // 6-4bC3a: the Lifecycle handoff branch adds five more; calls stay 7.
+            "transactRecord" to mapOf(ent + "DataStoreAccessEpochStore.kt" to 1, control + "ControlRecordStore.kt" to 44),
             // Identifier rows include declarations, types, imports, comments and references.
             "RotateAndSettleNamespaces" to mapOf(control + "NamespaceSettlement.kt" to 1,
                 control + "ControlCommand.kt" to 1, control + "ControlRecordStore.kt" to 1,
