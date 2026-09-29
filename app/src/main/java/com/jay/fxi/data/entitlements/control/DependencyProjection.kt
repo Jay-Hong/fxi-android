@@ -354,6 +354,38 @@ internal fun projectDependency(input: DependencyProjectionInput): DependencyProj
         ) mark("TerminationDescriptorMismatch", DependencyGapCause.TerminationDescriptorMismatch,
             DependencyGapSource.TerminationDescriptor, broadFootprint)
     }
+    if (input.terminationDescriptor is TerminationPendingDescriptor.SettlementHandoff) {
+        val descriptor = input.terminationDescriptor
+        val expected = descriptor.expectedOwn
+        dependencies += descriptor.deletionIdentity
+        descriptor.orderedSealIds.forEach { id ->
+            row(ControlKind.SEAL, id, DependencyGapSource.TerminationDescriptor)
+            dependencies += DependencyAtom.SealWitness(id, descriptor.operationId)
+        }
+        expected?.sealIds?.forEach { id ->
+            row(ControlKind.SEAL, id, DependencyGapSource.TerminationDescriptor)
+            dependencies += DependencyAtom.SealWitness(id, expected.commandId)
+        }
+        val settlement = body as? ControlCommandBody.Handover
+        val fixed = settlement?.input?.let(ControlSettlementConsumption::authority)
+        val binding = descriptor.closureBinding
+        if (descriptor.mode != CompletionMode.ResponsibilityTransferred ||
+            descriptor.entry != TerminationEntry.UncertainSettlement ||
+            descriptor.deletionIdentity != DependencyAtom.AppliedRow(input.commandId, input.lifetimeId) ||
+            descriptor.operationId != input.commandId ||
+            binding.command.id != input.commandId || binding.ownerTrackingLifetimeId.value != input.lifetimeId ||
+            binding.relatedScope != input.commandId || !binding.entriesClosed || !binding.receiptsClosed ||
+            binding.owner.isBlank() || binding.captured != binding.joined || binding.registered != binding.captured ||
+            fixed == null || settlement?.input?.operationId != descriptor.operationId ||
+            fixed.transition != descriptor.transition || fixed.orderedSealIds != descriptor.orderedSealIds ||
+            fixed.demandId != descriptor.demandId ||
+            (expected != null && (expected.commandId != input.commandId ||
+                expected.ownerTrackingLifetimeId != input.lifetimeId ||
+                expected.transition != descriptor.transition || expected.sealIds != descriptor.orderedSealIds ||
+                expected.demandId != descriptor.demandId))
+        ) mark("TerminationDescriptorMismatch", DependencyGapCause.TerminationDescriptorMismatch,
+            DependencyGapSource.TerminationDescriptor, broadFootprint)
+    }
     if (input.terminationDescriptor is TerminationPendingDescriptor.ExactEvidenceAndSeals) {
         val descriptor = input.terminationDescriptor
         val expected = descriptor.expectedRotation

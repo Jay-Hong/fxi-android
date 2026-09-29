@@ -4,7 +4,7 @@ import java.io.IOException
 import java.util.Collections
 
 internal enum class CompletionMode { Consumed, NeverSubmitted, ResponsibilityTransferred }
-internal enum class TerminationEntry { AbandonBeforeFirstConfirm, ConsumedRotation, ConsumedLifecycle, ConsumedSettlement, UncertainMutations, UncertainRotation }
+internal enum class TerminationEntry { AbandonBeforeFirstConfirm, ConsumedRotation, ConsumedLifecycle, ConsumedSettlement, UncertainMutations, UncertainRotation, UncertainSettlement }
 
 /** The caller declares both business handoff conditions before evidence can be consumed. */
 internal class RotationConsumption(
@@ -144,6 +144,24 @@ internal sealed interface TerminationPendingDescriptor {
     ) : TerminationPendingDescriptor {
         override val mode: CompletionMode = CompletionMode.ResponsibilityTransferred
         val entry: TerminationEntry = TerminationEntry.UncertainRotation
+        val orderedSealIds: List<String> = Collections.unmodifiableList(orderedSealIds.toList())
+    }
+
+    /**
+     * 6-4bC2b: an OnceConfirm·U settlement handoff (R now; N/L in C2c/d). expectedOwn null = the own row and every seal of the
+     * operation were absent at the first owner read. The seal ids are the fixed input order.
+     */
+    class SettlementHandoff(
+        val closureBinding: TerminationClosureBinding,
+        val expectedOwn: AppliedEvidence.Settlement?,
+        val transition: HandoverSettlementTransition,
+        val operationId: String,
+        orderedSealIds: List<String>,
+        val demandId: String?,
+        val deletionIdentity: DependencyAtom.AppliedRow
+    ) : TerminationPendingDescriptor {
+        override val mode: CompletionMode = CompletionMode.ResponsibilityTransferred
+        val entry: TerminationEntry = TerminationEntry.UncertainSettlement
         val orderedSealIds: List<String> = Collections.unmodifiableList(orderedSealIds.toList())
     }
 
