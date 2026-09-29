@@ -21,7 +21,17 @@ class RateRowRosterTest {
     @Test
     fun citiIsTheOnlyBankAFreshInstallHides() {
         assertEquals(setOf("citi"), RateRowRoster.hiddenByDefault(RateRowList.FX_BANKS))
-        assertEquals(emptySet<String>(), RateRowRoster.hiddenByDefault(RateRowList.TETHER_EXCHANGES))
+    }
+
+    /**
+     * The tether list hides investing and kb by default, and a fresh install draws hana ahead of the five exchanges — iOS a36682f
+     * `SourcePreferenceManager.effectiveDefault(krxVisible = false)` (S1.5-b4a).
+     */
+    @Test
+    fun theTetherListHidesInvestingAndKb_andDrawsHanaAheadOfTheExchanges() {
+        assertEquals(setOf("investing", "kb"), RateRowRoster.hiddenByDefault(RateRowList.TETHER_EXCHANGES))
+        val arrived = listOf("investing", "kb", "hana") + exchanges
+        assertEquals(listOf("hana") + exchanges, RateRowRoster.effective(RateRowList.TETHER_EXCHANGES, arrived).codes)
     }
 
     /** Everything that arrived, in the order it arrived, minus what the default hides. */

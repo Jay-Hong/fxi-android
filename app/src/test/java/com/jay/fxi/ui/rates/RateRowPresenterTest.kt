@@ -62,12 +62,11 @@ class RateRowPresenterTest {
     private data class Case(val name: String, val scale: RateScale, val quotes: Int)
 
     private fun cases(): List<Case> {
-        val tetherScales = tether.asRateScales()
         return listOf(
             // 씨티는 명부 기본값이 숨긴다 — 6행이 들어가 5행이 나온다.
             Case("무료 FX(달러)", freeFx.asRateScales().single(), 5),
-            Case("무료 테더 — 거래소", tetherScales[0], 5),
-            Case("무료 테더 — USD/KRW 두 섹션", tetherScales[1], 3),
+            // 테더는 한 목록(S1.5-b4a, iOS a36682f) — investing·kb 는 기본 숨김이라 8행이 들어가 6행이 나온다.
+            Case("무료 테더 — 한 목록", tether.asRateScales().single(), 6),
             // 유료 목록도 같은 명부를 지난다 — `BankPreferenceManager` v2 가 정하는 기본값이고,
             // 두 표면이 다른 은행 집합을 보이면 그게 갈라진 것이다. 10행이 들어가 9행이 나온다.
             Case("유료 은행 목록", premium, 9)
@@ -207,62 +206,6 @@ class RateRowPresenterTest {
     // ---- what is specific to one shape ----
 
     /**
-     * The tether tab's two USD/KRW headings share a ruler, and the exchanges do not join them.
-     *
-     * Reviewed into existence: with a domain per heading, "기준 USD/KRW" holds one row, so its span
-     * is zero and its bar sits at the middle of the track while the identical figure under "은행
-     * USD/KRW" sits somewhere else entirely. And folding USDT/KRW in would be comparing two assets.
-     */
-    @Test
-    fun theTethersTwoUsdKrwHeadingsShareOneRulerAndTheExchangesDoNot() {
-        val scales = tether.asRateScales()
-        assertEquals(2, scales.size)
-
-        val exchangeViews = RateRowPresenter.present(scales[0])
-        val usdViews = RateRowPresenter.present(scales[1])
-        assertEquals(listOf("거래소 USDT/KRW"), exchangeViews.map { it.title })
-        assertEquals(listOf("은행 USD/KRW", "기준 USD/KRW"), usdViews.map { it.title })
-        assertEquals(usdViews[0].domain, usdViews[1].domain)
-        assertTrue(
-            "거래소와 은행이 한 자를 썼다",
-            exchangeViews.single().domain != usdViews.first().domain
-        )
-        assertEquals(setOf("usdt-krw"), exchangeViews.map { it.asset }.toSet())
-        assertEquals(setOf("usd-krw"), usdViews.map { it.asset }.toSet())
-    }
-
-    /**
-     * The banks are measured against the reference section, not against each other.
-     *
-     * Otherwise the heading that says "기준" measures nothing, and the first bank silently becomes
-     * the baseline for a screen that names a different one.
-     */
-    @Test
-    fun theBanksAreMeasuredAgainstTheReferenceSection() {
-        val usd = RateRowPresenter.present(tether.asRateScales()[1])
-        val banks = usd.first { it.title == "은행 USD/KRW" }
-        assertTrue("은행 섹션이 자기 첫 행을 기준으로 삼았다", banks.rows.none { it.isReference })
-        assertEquals(1399.0 - 1398.8, banks.rows.first { it.id == "kb" }.difference!!, 1e-9)
-        assertEquals(1398.4 - 1398.8, banks.rows.first { it.id == "hana" }.difference!!, 1e-9)
-
-        val reference = usd.first { it.title == "기준 USD/KRW" }
-        assertEquals(listOf("investing"), reference.rows.map { it.id })
-        assertTrue(reference.rows.single().isReference)
-    }
-
-    /** No reference quote is normal, and then the banks measure against their own first row. */
-    @Test
-    fun anAbsentReferenceFallsBackToTheGroupsFirstRow() {
-        val scales = tether.copy(usdKrwReference = null).asRateScales()
-        val usd = RateRowPresenter.present(scales[1])
-        assertEquals("빈 기준 섹션이 남았다", listOf("은행 USD/KRW", "기준 USD/KRW"), usd.map { it.title })
-        assertTrue(usd.first { it.title == "기준 USD/KRW" }.rows.isEmpty())
-        val banks = usd.first { it.title == "은행 USD/KRW" }
-        assertEquals("kb", banks.rows.first { it.isReference }.id)
-        assertEquals(1398.4 - 1399.0, banks.rows.first { it.id == "hana" }.difference!!, 1e-9)
-    }
-
-    /**
      * A code with no display name keeps the code, and keeps its row.
      *
      * The sanitizer decides what may be shown; by the time a quote is here, dropping it would take
@@ -299,31 +242,22 @@ class RateRowPresenterTest {
     /**
      * Each list consults the roster named for it, and no other.
      *
-     * The fixtures below are synthetic — the sanitizer confines the tether tab's banks to kb/hana
-     * (`FreeSnapshotSanitizer.kt:180`) and its exchanges to the five, so Citi cannot arrive there.
-     * That is exactly why this needs saying: today the FX roster hides one code that no tether list
-     * can contain, so wiring the wrong roster in changes nothing and nothing notices. The day a
-     * second code is hidden — `kb`, say, which every tether section does carry — the mis-wiring
-     * would quietly empty a section instead.
+     * Synthetic, as before: the sanitizer keeps Citi out of the tether list. The FX roster hides Citi and the tether roster does
+     * not, so a tether list drawn through the FX roster would lose it here; and the tether roster hides investing and kb, which the
+     * FX roster would show.
      */
     @Test
     fun eachListConsultsItsOwnRoster() {
-        val citiEverywhere = FreeRate.Grouped(
+        val citiInTether = FreeRate.Grouped(
             primaryAsset = "usdt-krw",
             usdtKrw = listOf(exchange("upbit", 1402.0), SourceRate("citi", "usdt-krw", 1403.0, at)),
-            usdKrwBanks = listOf(bank("hana", 1398.4), bank("citi", 1401.6)),
+            usdKrwBanks = listOf(bank("hana", 1398.4), bank("kb", 1399.0)),
             usdKrwReference = bank("investing", 1398.8)
         )
-        val scales = citiEverywhere.asRateScales()
         assertEquals(
-            "거래소 목록이 FX 명부를 봤다",
-            listOf("upbit", "citi"),
-            RateRowPresenter.present(scales[0]).single().rows.map { it.id }
-        )
-        assertEquals(
-            "테더 은행 섹션이 FX 명부를 봤다",
-            listOf("hana", "citi"),
-            RateRowPresenter.present(scales[1]).first().rows.map { it.id }
+            "테더 목록이 FX 명부를 봤다",
+            listOf("hana", "upbit", "citi"),
+            RateRowPresenter.present(citiInTether.asRateScales().single()).single().rows.map { it.id }
         )
     }
 

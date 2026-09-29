@@ -7,6 +7,7 @@ import com.jay.fxi.domain.model.FreeRate
 import com.jay.fxi.domain.model.RateRowList
 import com.jay.fxi.domain.model.RateRowPreference
 import com.jay.fxi.domain.model.RateRowRoster
+import com.jay.fxi.domain.model.RateSourceSets
 import com.jay.fxi.domain.model.SourceRate
 
 /**
@@ -21,11 +22,8 @@ import com.jay.fxi.domain.model.SourceRate
 /**
  * A bank list — free FX tabs and the premium rate list are the same shape.
  *
- * [asset] is checked, not taken on faith. This is the last place that still knows what each quote
- * came in as: past here a `RateQuote` has only a value, so a JPY row folded into a USD group would
- * be drawn on the won scale and reported as roughly 450원 below it, with nothing left to catch it.
- * The free sanitizer already refuses a mismatch (`FreeSnapshotSanitizer.kt:134`) — this keeps the
- * guarantee for callers that do not come through it.
+ * [asset] is checked against every bank quote before projection, including callers that bypass
+ * the free snapshot sanitizer. Each projected quote also retains its asset for presenter checks.
  */
 fun List<ExchangeRate>.asRateScale(
     title: String,
@@ -48,20 +46,6 @@ private fun List<ExchangeRate>.rateGroup(
     )
 }
 
-private fun List<SourceRate>.sourceGroup(
-    title: String,
-    asset: String,
-    roster: RateRowList? = null,
-    preferences: Map<RateRowList, RateRowPreference>? = null
-): RateQuoteGroup {
-    require(all { it.asset == asset }) {
-        "$title declares $asset but holds ${map { it.asset }.distinct()}"
-    }
-    return RateQuoteGroup(
-        title, asset, shownBy(roster, preferences) { it.source }.map { it.quote() }, list = roster
-    )
-}
-
 /**
  * The roster's answer, applied before the group exists rather than after.
  *
@@ -70,9 +54,6 @@ private fun List<SourceRate>.sourceGroup(
  * policy the presenter resolves over whatever list it is handed, not a hold on one quote — but
  * there is no reason to let the two halves of "what is the reference" be decided at two different
  * moments. Filtering first means both are decided over what remains.
- *
- * A list with no roster keeps every row: the tether tab's two USD/KRW headings hold two banks and a
- * reference quote, and nothing about them is a preference yet.
  */
 private inline fun <T> List<T>.shownBy(
     roster: RateRowList?,
@@ -98,11 +79,9 @@ private inline fun <T> List<T>.shownBy(
 }
 
 /**
- * A free snapshot's rate block, split into the scales it draws.
- *
- * The tether tab returns two: the exchanges are USDT/KRW, and the two USD/KRW headings share one
- * ruler with the reference quote supplying the banks' differences. An absent reference is normal,
- * and then the banks fall back to measuring against their own first row.
+ * A free snapshot's rate block as display scales. Tether returns one scale with one editable
+ * source group: all arrived quotes in registry order, then preference order and visibility. Its
+ * first displayed row is the reference, even when the payload has no hana or investing quote.
  */
 fun FreeRate.asRateScales(
     preferences: Map<RateRowList, RateRowPreference>? = null
@@ -110,30 +89,51 @@ fun FreeRate.asRateScales(
     is FreeRate.Flat -> listOf(entries.asRateScale("은행별 환율", asset, preferences))
 
     is FreeRate.Grouped -> {
-        val referenceQuote = usdKrwReference?.quote()
-        val exchanges = usdtKrw.sourceGroup(
-            "거래소 USDT/KRW", primaryAsset, RateRowList.TETHER_EXCHANGES, preferences
-        )
-        val banks = usdKrwBanks.rateGroup(
-            title = "은행 USD/KRW",
-            asset = USD_KRW,
-            reference = referenceQuote?.let { RateReference.External(it) } ?: RateReference.FirstRow
-        )
-        val reference = listOfNotNull(usdKrwReference).rateGroup(USD_KRW_REFERENCE_TITLE, USD_KRW)
-        listOf(RateScale(listOf(exchanges)), RateScale(listOf(banks, reference)))
+        val quotes = tetherQuotes().shownBy(RateRowList.TETHER_EXCHANGES, preferences) { it.id }
+        listOf(RateScale(listOf(
+            RateQuoteGroup(
+                title = "테더 시세",
+                asset = primaryAsset,
+                quotes = quotes,
+                reference = RateReference.FirstRow,
+                list = RateRowList.TETHER_EXCHANGES,
+                accepts = setOf(USDT_KRW, USD_KRW)
+            )
+        )))
     }
+}
+
+/** All arrived tether sources, including hidden ones, in registry order. Unknown codes follow arrival order. */
+private fun FreeRate.Grouped.tetherQuotes(): List<RateQuote> {
+    require(primaryAsset == USDT_KRW) { "tether declares $primaryAsset instead of $USDT_KRW" }
+    require(usdtKrw.all { it.asset == primaryAsset }) {
+        "tether exchanges declare $primaryAsset but hold ${usdtKrw.map { it.asset }.distinct()}"
+    }
+    require(usdKrwBanks.all { it.currency == USD_KRW }) {
+        "tether banks declare $USD_KRW but hold ${usdKrwBanks.map { it.currency }.distinct()}"
+    }
+    require(usdKrwReference == null || usdKrwReference.currency == USD_KRW) {
+        "tether reference declares $USD_KRW but holds ${usdKrwReference?.currency}"
+    }
+    val quotes = listOfNotNull(usdKrwReference?.quote()) +
+        usdKrwBanks.map { it.quote() } + usdtKrw.map { it.quote() }
+    require(quotes.map { it.id }.distinct().size == quotes.size) {
+        "duplicate codes in tether list: ${quotes.map { it.id }.groupingBy { it }.eachCount().filterValues { it > 1 }.keys}"
+    }
+    val rank = RateSourceSets.TETHER_SOURCES.withIndex().associate { (index, code) -> code to index }
+    return quotes.sortedWith(compareBy<RateQuote> { rank[it.id] ?: Int.MAX_VALUE })
 }
 
 /**
  * The lists in this payload a user can edit, with every quote that arrived — hidden ones included.
  *
  * The sheet cannot be built from what is on screen: a hidden row is not on screen, and it is
- * exactly the row somebody opens the sheet to turn back on. The tether tab's two USD/KRW headings
- * are absent here because they hold a fixed trio the server picks, not a list anyone arranges.
+ * exactly the row somebody opens the sheet to turn back on. Tether's bank, reference and exchange
+ * quotes share the same editor and stored roster key.
  */
 fun FreeRate.editableRosters(): Map<RateRowList, List<RateQuote>> = when (this) {
     is FreeRate.Flat -> mapOf(RateRowList.FX_BANKS to entries.map { it.quote() })
-    is FreeRate.Grouped -> mapOf(RateRowList.TETHER_EXCHANGES to usdtKrw.map { it.quote() })
+    is FreeRate.Grouped -> mapOf(RateRowList.TETHER_EXCHANGES to tetherQuotes())
 }
 
 /**
@@ -147,15 +147,17 @@ private fun ExchangeRate.quote() = RateQuote(
     id = bank,
     label = Bank.fromCode(bank)?.displayName ?: bank,
     value = rate,
-    observedAt = timestamp
+    observedAt = timestamp,
+    asset = currency
 )
 
 private fun SourceRate.quote() = RateQuote(
     id = source,
     label = Exchange.fromCode(source)?.displayName ?: source,
     value = rate,
-    observedAt = timestamp
+    observedAt = timestamp,
+    asset = asset
 )
 
+private const val USDT_KRW = "usdt-krw"
 private const val USD_KRW = "usd-krw"
-private const val USD_KRW_REFERENCE_TITLE = "기준 USD/KRW"

@@ -7,29 +7,22 @@ import kotlinx.datetime.Instant
 /**
  * One quote, with nothing in it about how to draw one.
  *
- * [id] is the wire's source code — `kb`, `upbit` — which is what the row resolves a logo and a
- * brand colour from, and what makes a row identifiable across a refresh. The label is resolved
- * here rather than at the Canvas because an unknown code has to fall back to *something*, and the
- * projection is the only place that still knows what the server actually sent.
+ * [id] is the wire's source code — `kb`, `upbit` — which identifies a row across refreshes.
+ * [asset] retains the source asset so a mixed tether group can validate each quote. The label is
+ * resolved before drawing, including the fallback for an unknown source code.
  */
 data class RateQuote(
     val id: String,
     val label: String,
     val value: Double,
-    val observedAt: Instant
+    val observedAt: Instant,
+    /** The asset this quote is for, when the projection knows it — the tether list mixes two (S1.5-b4a). */
+    val asset: String? = null
 )
 
 /**
- * Quotes that mean the same thing.
- *
- * **[asset] is on the group, never on a quote.** The tether tab shows 업비트's USDT/KRW next to
- * 하나은행's USD/KRW, and subtracting one from the other would be a kimchi premium — a number this
- * screen does not claim to compute. One level up is where the asset can be checked once and then
- * relied on; a quote that carried its own would have to be re-checked at every subtraction.
- *
- * Putting it here does not by itself make a mixed group impossible — the projections are what
- * verify that the quotes they build really are the asset they declare, because they are the last
- * place that still knows.
+ * A heading's quotes and the assets it accepts. [asset] is the heading's primary asset; [accepts]
+ * also allows USD/KRW in the tether list. The presenter checks each known quote asset against it.
  */
 data class RateQuoteGroup(
     val title: String,
@@ -42,7 +35,9 @@ data class RateQuoteGroup(
      * Carried through rather than matched on the title later: a heading and its editor have to be
      * the same thing, and two places spelling the same Korean string is not the same thing.
      */
-    val list: RateRowList? = null
+    val list: RateRowList? = null,
+    /** The assets this group may hold. One, except the tether list, which declares both it mixes (S1.5-b4a). */
+    val accepts: Set<String> = setOf(asset)
 )
 
 /** What the group's differences are measured against. */
@@ -53,26 +48,15 @@ sealed interface RateReference {
      */
     data object FirstRow : RateReference
 
-    /**
-     * A quote drawn under a different heading **on the same ruler**.
-     *
-     * The tether tab's "기준 USD/KRW" is its own section, and the bank section beside it is
-     * measured against that row rather than against its own first bank. Without this the section
-     * headed "기준" would be measuring nothing and the banks would be measuring each other.
-     *
-     * It has to be one of the scale's own rows: that is what makes its value part of the shared
-     * domain, and what lets the reference marker live in exactly one place.
-     */
+    /** A quote under another heading on this scale; it must also be among the drawn quotes. */
     data class External(val quote: RateQuote) : RateReference
 }
 
 /**
  * Groups drawn against one ruler.
  *
- * A section is a heading; a scale is what the bar lengths mean. The tether tab has three headings
- * and two scales — the exchanges are USDT/KRW and cannot share a domain with the two USD/KRW
- * sections, which must share one with each other or the same 1400원 is drawn at two lengths on one
- * screen.
+ * A section is a heading; a scale is what the bar lengths mean. Tether has one heading and one
+ * scale for its mixed USD/KRW and USDT/KRW source list, measured from the first visible row.
  */
 data class RateScale(val groups: List<RateQuoteGroup>)
 
@@ -90,7 +74,7 @@ data class RateRow(
 data class RateRowsView(
     val title: String,
     val asset: String,
-    /** Null for a heading nobody arranges — the tether tab's USD/KRW context rows. */
+    /** Null for a heading without an editable roster. */
     val list: RateRowList? = null,
     val rows: List<RateRow>,
     /**
@@ -112,17 +96,24 @@ object RateRowPresenter {
     /**
      * Every group in [scale] measured against one domain.
      *
-     * Order is the server's throughout — which bank comes first, and which section. Reordering
-     * and hiding belong to the preference layer, and putting them here would mean two owners
-     * disagreeing the day that layer arrives.
+     * The projection supplies the quote order after applying the roster. This presenter preserves
+     * it while computing one display domain for the scale.
      */
     fun present(scale: RateScale): List<RateRowsView> {
         val groups = scale.groups
-        require(groups.map { it.asset }.distinct().size <= 1) {
-            "one scale, one asset: ${groups.map { it.asset }.distinct()}"
+        require(groups.map { it.accepts }.distinct().size <= 1) {
+            "one scale, one accepted asset set: ${groups.map { it.accepts }.distinct()}"
         }
         val drawn = groups.flatMap { it.quotes }
         groups.forEach { group ->
+            require(group.asset in group.accepts) {
+                "${group.title} declares ${group.asset} outside ${group.accepts}"
+            }
+            group.quotes.forEach { quote ->
+                require(quote.asset == null || quote.asset in group.accepts) {
+                    "${group.title} cannot hold ${quote.id} for ${quote.asset}"
+                }
+            }
             (group.reference as? RateReference.External)?.let { external ->
                 require(external.quote in drawn) {
                     "external reference ${external.quote.id} is not drawn on this scale"
@@ -137,9 +128,8 @@ object RateRowPresenter {
 
         return groups.map { group ->
             // The marker belongs to the group that holds the reference row, and only that group.
-            // Two sections can legitimately carry the same source code — the tether tab's banks and
-            // its reference section both quote USD/KRW — and marking by code alone would put the
-            // border on a row that is merely a namesake, and rob it of the difference it should show.
+            // Two sections can carry the same source code. Marking an external reference by code
+            // alone would put its border on a namesake in the referring group.
             val ownsReference = group.reference is RateReference.FirstRow
             val reference = when (val r = group.reference) {
                 is RateReference.External -> r.quote

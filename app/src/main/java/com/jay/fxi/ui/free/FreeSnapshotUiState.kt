@@ -27,10 +27,8 @@ enum class FreeSnapshotAvailability { AWAITING_SNAPSHOT, FRESH, DELAYED, UNAVAIL
 /**
  * A titled group of rows, as it will be drawn.
  *
- * The FX tabs send one group and the tether tab sends three, which is the shape the server already
- * has: `FreeRate.Grouped` is not a flat list with extras, it is exchanges, banks and a single
- * reference quote that mean different things beside each other. Flattening them would put 업비트 and
- * 하나은행 in one column under one heading and lose what the tab is for.
+ * FX and tether each draw one group. The tether payload's separate source kinds are arranged into
+ * one list, with the first visible row as its reference.
  *
  * The rows keep their numbers. An earlier shape carried `(source: String, value: String)`, which
  * lost the value, the observation time and the source's identity somewhere between the snapshot and
@@ -161,8 +159,7 @@ data class FreeSnapshotUiState(
         /**
          * Empty groups are dropped rather than shown as headings with nothing under them.
          *
-         * Each scale is presented on its own, which is the point: the tether tab's exchanges are
-         * USDT/KRW and its two USD/KRW headings share one ruler with each other.
+         * Each scale is presented once. Tether supplies one scale for its combined source list.
          */
         private fun sections(
             rate: FreeRate,
@@ -207,7 +204,7 @@ data class FreeSnapshotUiState(
         private val RateRowList.editorTitle: String
             get() = when (this) {
                 RateRowList.FX_BANKS -> "은행 순서 설정"
-                RateRowList.TETHER_EXCHANGES -> "거래소 순서 설정"
+                RateRowList.TETHER_EXCHANGES -> "소스 순서 설정"
             }
 
         private val zone = ZoneId.of("Asia/Seoul")

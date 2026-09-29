@@ -3,9 +3,8 @@ package com.jay.fxi.domain.model
 /**
  * A list of quotes the user could reorder or hide as a unit.
  *
- * Two, because two are what anyone would rearrange. The tether tab's USD/KRW headings hold two
- * banks and one reference quote, and neither is a list you sort — the reference is the reference by
- * position, not by preference. Naming scopes nobody edits would give the store keys with no writer.
+ * The FX banks and the tether sources are each one editable list. The tether list includes its
+ * USD/KRW sources and USDT/KRW exchanges under the existing stored key.
  */
 enum class RateRowList {
     FX_BANKS,
@@ -59,13 +58,12 @@ object RateRowRoster {
     /**
      * Codes a fresh install does not show. Everything else on the wire is shown.
      *
-     * Citi is the only one, by `ANDROID_V2_PLAN.md §7 S1.5` — "Citi는 신규 표시 기본에서 제외". It is a
-     * default, not a ban: the sanitizer admits Citi deliberately (`FreeSnapshotSanitizer.kt:178`)
-     * and the sheet can turn it back on.
+     * FX hides Citi (`ANDROID_V2_PLAN.md §7 S1.5`); tether hides investing and kb. These are
+     * defaults, not bans: the editing sheet can turn any arrived source back on.
      */
     fun hiddenByDefault(list: RateRowList): Set<String> = when (list) {
         RateRowList.FX_BANKS -> setOf("citi")
-        RateRowList.TETHER_EXCHANGES -> emptySet()
+        RateRowList.TETHER_EXCHANGES -> setOf("investing", "kb")
     }
 
     /**

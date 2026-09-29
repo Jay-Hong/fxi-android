@@ -50,22 +50,18 @@ class TopicRateDisplayTest {
     }
 
     @Test
-    fun D03_theTetherTab_drawsTheExchanges_andTheDollarContextOnItsOwnRuler() {
+    fun D03_theTetherTab_isOneList_withTheDefaultsShown_hanaFirst() {
+        // S1.5-b4a: one list, one scale, first drawn row the reference; investing and kb off by default (iOS a36682f).
         val shown = everything.displayFor(FreeTab.TETHER)
-        assertEquals(2, shown.scales.size)
-        assertEquals(listOf("usdt-krw" to setOf("upbit", "bithumb")), shown.scales[0].ids())
-        assertEquals(listOf("usd-krw" to setOf("kb", "hana"), "usd-krw" to setOf("investing")), shown.scales[1].ids())
-        val banks = shown.scales[1].groups[0]
-        val reference = banks.reference as? RateReference.External
-        assertEquals("the banks are not measured against investing", "investing", reference?.quote?.id)
-        assertEquals(1399.0, reference!!.quote.value, 0.0)
+        assertEquals(1, shown.scales.size)
+        assertEquals(listOf("hana", "upbit", "bithumb"), shown.scales.single().groups.single().quotes.map { it.id })
     }
 
     @Test
-    fun D04_withoutAReference_theTetherBanksMeasureAgainstTheirFirstRow() {
+    fun D04_withoutHana_theFirstExchangeLeads() {
         val shown = TopicRates().merge(listOf(q("kb", "usd-krw", 1400.0), q("upbit", "usdt-krw", 1420.0))).displayFor(FreeTab.TETHER)
-        assertEquals(RateReference.FirstRow, shown.scales[1].groups[0].reference)
-        assertEquals(emptyList<RateQuote>(), shown.scales[1].groups[1].quotes)
+        assertEquals(listOf("upbit"), shown.scales.single().groups.single().quotes.map { it.id })
+        assertEquals(RateReference.FirstRow, shown.scales.single().groups.single().reference)
     }
 
     @Test
@@ -91,7 +87,7 @@ class TopicRateDisplayTest {
             RateRowList.TETHER_EXCHANGES to RateRowPreference(hidden = setOf("upbit"))
         )
         assertEquals(listOf("hana", "kb", "investing"), everything.displayFor(FreeTab.USD, prefs).scales.single().groups.single().quotes.map { it.id })
-        assertEquals(listOf("bithumb"), everything.displayFor(FreeTab.TETHER, prefs).scales[0].groups.single().quotes.map { it.id })
+        assertEquals(listOf("investing", "kb", "hana", "bithumb"), everything.displayFor(FreeTab.TETHER, prefs).scales.single().groups.single().quotes.map { it.id })
     }
 
     @Test
@@ -106,7 +102,8 @@ class TopicRateDisplayTest {
     @Test
     fun D09_withNoSavedArrangement_rowsFollowTheDefaultOrder_andTheFirstIsTheReference() {
         // iOS a36682f defaults: FX investing → kb → hana → shinhan → woori → ibk → nh → sc → bs (`Constants.swift:153-175`);
-        // tether exchanges in registry order (`RateSource.swift:41`). Arrival order must not decide it.
+        // tether in registry order with investing and kb off (`RateSource.swift:41`, `SourcePreferenceManager.swift:141-159`).
+        // Arrival order must not decide it.
         val fx = TopicRates().merge(
             listOf("bs", "sc", "nh", "ibk", "woori", "shinhan", "hana", "kb", "investing").mapIndexed { i, s -> q(s, "usd-krw", 1400.0 + i) }
         )
@@ -117,7 +114,6 @@ class TopicRateDisplayTest {
             listOf("gopax", "korbit", "coinone", "bithumb", "upbit").map { q(it, "usdt-krw", 1420.0) } +
                 listOf(q("hana", "usd-krw", 1401.0), q("kb", "usd-krw", 1400.0))
         ).displayFor(FreeTab.TETHER)
-        assertEquals(listOf("upbit", "bithumb", "coinone", "korbit", "gopax"), tether.scales[0].groups.single().quotes.map { it.id })
-        assertEquals(listOf("kb", "hana"), tether.scales[1].groups[0].quotes.map { it.id })
+        assertEquals(listOf("hana", "upbit", "bithumb", "coinone", "korbit", "gopax"), tether.scales.single().groups.single().quotes.map { it.id })
     }
 }

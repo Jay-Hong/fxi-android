@@ -621,12 +621,11 @@ class FreeSnapshotViewModelTest {
         .copy(rate = FreeRate.Flat("usd-krw", entries))
 
     /**
-     * The tether tab's rate block is three groups, not a flat list with extras: exchanges, banks
-     * and one reference quote mean different things beside each other. Flattening them would put
-     * 업비트 and 하나은행 in one column under one heading.
+     * The tether tab's rate block is one list under one heading, first row the reference — iOS a36682f
+     * `FreeSnapshotViewModel.buildTetherSourceState` (S1.5-b4a), with hana ahead of the exchanges by default.
      */
     @Test
-    fun tetherKeepsItsThreeGroupsApart_andDropsEmptyOnes() = withViewModel(FakeTabStore("u1" to FreeTab.TETHER)) { vm, reads ->
+    fun tetherIsOneList_hanaFirst() = withViewModel(FakeTabStore("u1" to FreeTab.TETHER)) { vm, reads ->
         val tether = FreeSnapshotKey("tether", FreeSnapshotUiState.DEFAULT_PERIOD)
         val grouped = snapshot(tether).copy(
             rate = FreeRate.Grouped(
@@ -639,9 +638,13 @@ class FreeSnapshotViewModelTest {
         reads.value = readState(snapshot = grouped)
         vm.bind("u1")
         assertEquals(
-            listOf("거래소 USDT/KRW" to "업비트", "은행 USD/KRW" to "하나은행"),
-            vm.uiState.value.rateSections.map { it.title to it.rows.single().label }
+            listOf("테더 시세" to listOf("하나은행", "업비트")),
+            vm.uiState.value.rateSections.map { section -> section.title to section.rows.map { it.label } }
         )
+        // The sheet edits every source, banks and exchanges together, under iOS's title (`SourceCustomizeSheet.swift:51`).
+        val editor = vm.uiState.value.rowEditors.single()
+        assertEquals("소스 순서 설정", editor.title)
+        assertEquals(listOf("hana", "upbit"), editor.entries.map { it.code })
     }
 
     /**

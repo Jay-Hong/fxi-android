@@ -40,12 +40,12 @@ sealed interface FreeRate {
     /** usd / jpy / eur — `{asset, entries}`. */
     data class Flat(val asset: String, val entries: List<ExchangeRate>) : FreeRate
 
-    /** tether — exchange rates plus the USD/KRW context shown beside them. */
+    /** tether — exchanges and USD/KRW sources projected into one editable display list. */
     data class Grouped(
         val primaryAsset: String,
         val usdtKrw: List<SourceRate>,
         val usdKrwBanks: List<ExchangeRate>,
-        /** Investing's USD/KRW, when present. Absent is normal, not an error. */
+        /** Investing's USD/KRW, when present. The first visible source becomes the display reference. */
         val usdKrwReference: ExchangeRate?
     ) : FreeRate
 }
