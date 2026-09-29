@@ -10,5 +10,7 @@ data class AlertSettingRequest(
     val currency: String,
     val condition: AlertCondition,
     val threshold: Double,
-    @SerialName("is_enabled") val isEnabled: Boolean
+    @SerialName("is_enabled") val isEnabled: Boolean,
+    /** Null (omitted) creates a once alert. */
+    @SerialName("repeat_interval_sec") val repeatIntervalSec: Int? = null
 )

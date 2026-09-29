@@ -26,7 +26,9 @@ data class AlertSetting(
     var updatedAt: Instant,
     @SerialName("triggered_at")
     @Serializable(with = InstantSerializer::class)
-    var triggeredAt: Instant?
+    var triggeredAt: Instant?,
+    /** Seconds between repeated fires; null fires once. The server always sends it, so it has no default. */
+    @SerialName("repeat_interval_sec") val repeatIntervalSec: Int?
 ) {
     val bankType: Bank? get() = Bank.fromCode(bank)
     val currencyType: SupportedCurrency? get() = SupportedCurrency.fromCode(currency)
