@@ -463,6 +463,7 @@ internal class ControlRecordStore(
                         descriptor.entry == TerminationEntry.UncertainSettlement)
                     val settlement: ControlCommandBody.Handover = when (body) {
                         is ControlCommandBody.SettleRetiredNamespace,
+                        is ControlCommandBody.SettleRetiredNull,
                         is ControlCommandBody.RotateAndSettleCurrentNull -> body
                         else -> return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
                     }
@@ -697,6 +698,7 @@ internal class ControlRecordStore(
                         request.descriptor is TerminationPendingDescriptor.SettlementHandoff)) {
                     val settlement: ControlCommandBody.Handover = when (body) {
                         is ControlCommandBody.SettleRetiredNamespace,
+                        is ControlCommandBody.SettleRetiredNull,
                         is ControlCommandBody.RotateAndSettleCurrentNull -> body
                         else -> error("unsupported settlement handoff body")
                     }
@@ -1007,6 +1009,7 @@ internal class ControlRecordStore(
             val body = command.captureStateAndBody().body
             if (body !is ControlCommandBody.Mutations && body !is ControlCommandBody.RotateAndSettle &&
                 body !is ControlCommandBody.SettleRetiredNamespace &&
+                body !is ControlCommandBody.SettleRetiredNull &&
                 body !is ControlCommandBody.RotateAndSettleCurrentNull)
                 return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
             if (!tracking.isUnresolved(command))
@@ -1022,6 +1025,7 @@ internal class ControlRecordStore(
                 is ControlCommandBody.Mutations -> TerminationRequest.FirstMutationsHandoff(handoff)
                 is ControlCommandBody.RotateAndSettle -> TerminationRequest.FirstRotationHandoff(handoff)
                 is ControlCommandBody.SettleRetiredNamespace,
+                is ControlCommandBody.SettleRetiredNull,
                 is ControlCommandBody.RotateAndSettleCurrentNull -> TerminationRequest.FirstSettlementHandoff(handoff)
                 else -> error("unsupported handoff body")
             })
