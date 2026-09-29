@@ -2,6 +2,9 @@ package com.jay.fxi.data.entitlements.control
 
 import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
+import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.MAY_CONTAIN_KRX
+import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.MAY_CONTAIN_PREMIUM
+import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore.Companion.PURGE_JOURNAL
 import com.jay.fxi.data.entitlements.RecordTransactionDecision
 import com.jay.fxi.data.entitlements.control.TerminationClosures.of as closure
 import kotlinx.serialization.json.Json
@@ -23,8 +26,8 @@ import org.junit.rules.TemporaryFolder
 /**
  * Claude-owned 6-4bC3a contract (C3/split_codex.r1.md): a current-lifetime OnceConfirm·U Lifecycle REMOVE_EMPTY_GUARD is
  * terminated by handing over its L/N responsibilities through handoffAfterUncertainConfirm, and retried on its fixed
- * TerminationPendingDescriptor.LifecycleHandoff. 6-4bC3b–e open REBIND_REQUESTS, SETTLE_QUERY, UPDATE_AUTH and END_AUTH_BINDING; the
- * other two transitions stay UnsupportedInThisUnit (C3f–g). The paths
+ * TerminationPendingDescriptor.LifecycleHandoff. 6-4bC3b–f open REBIND_REQUESTS, SETTLE_QUERY, UPDATE_AUTH, END_AUTH_BINDING and RECOVER_INTENT;
+ * RECOVER_HOLD stays UnsupportedInThisUnit (C3g). The paths
  * C2a locked once for every kind (the refusals before storage, cancellation, read failure, reopen) are not repeated.
  *  - The U fixture is a real REMOVE_EMPTY_GUARD execute whose Confirm landed and whose return failed (afterScope): the guard is gone
  *    and the own Lifecycle row is on disk.
@@ -49,7 +52,7 @@ class UncertainLifecycleHandoffContractTest {
     private val L = LandingBranch.L
     /** The Lifecycle transitions this contract hands over so far. */
     private val OPENED = setOf(LifecycleTransition.REMOVE_EMPTY_GUARD, LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.SETTLE_QUERY,
-        LifecycleTransition.UPDATE_AUTH, LifecycleTransition.END_AUTH_BINDING)
+        LifecycleTransition.UPDATE_AUTH, LifecycleTransition.END_AUTH_BINDING, LifecycleTransition.RECOVER_INTENT)
 
     private fun store(f: TerminationFixture) = ControlRecordStore(f.storage.owner, bootReadingSource = BootReadingSource { now })
     private fun arr(p: Preferences, key: Preferences.Key<String>) = Json.parseToJsonElement(p[key] ?: "[]").jsonArray
@@ -821,5 +824,94 @@ class UncertainLifecycleHandoffContractTest {
         assertNotNull("exact own fixed", fixed.expectedOwn)
         assertEquals("nothing landed", before, f.disk())
         completed("T6_e01", f, c, retry(f, c, d), expectedAfterDeletion(before, c))
+    }
+
+    // ── 6-4bC3f RECOVER_INTENT ───────────────────────────────────────────────────────────────────────────────────────
+    // Measured (C3/C3f_probe_outputs.r1.txt): a U RECOVER_INTENT consumed its intent, opened the purge journal and raised a FORCE
+    // request. Its Required slots are SOURCE, JOURNAL, NAMESPACE_RETIREMENT and REQUEST (L and N) and RECEIPT L. The journal and the
+    // request it created take a retained-source token on themselves; the namespace retirement conflicts while its journal stands and
+    // completes once that journal is consumed.
+    private val intentKey = ControlRecordKeys.payload(ControlKind.RECOVERY_INTENT)
+
+    /** A real RECOVER_INTENT of one CAPABILITY intent after restart, whose Confirm landed and whose return failed. */
+    private suspend fun intentU(f: TerminationFixture): CommandRef {
+        val life = LifetimeId("new-life")
+        val source = ControlObligationFixtures.node("""{"id":"r","sessionId":"session","ownerUid":"A","axis":"CAPABILITY","targetEpoch":"k0"}""")
+        val binding = LifecycleBinding(SettlementExecutor("A", 3, life), IdentityV1("A", 2), 1, "binding-start")
+        val closure = HoldRecoveryClosure.AfterRestart(source, binding.executor, "old-tracking", true, true)
+        f.edit { p ->
+            p.clear(); p += ControlLifecycleEvidenceFixtures.raw()
+            p[MAY_CONTAIN_PREMIUM] = true; p[MAY_CONTAIN_KRX] = true
+            p[intentKey] = "[${source.toPayloadEntry().fields}]"
+        }
+        val c = f.store.prepareRecoverIntent(RecoverIntentInput(source, FenceV1("A", "u", "k"), binding, closure), LifecycleOrderSource(life, 21))
+        val context = AttemptContext("A", 3, life, false, false, intentRecovery = HoldRecoveryRuntime(binding, 5, true, emptySet(), closure))
+        f.storage.storage.afterScope = true
+        val r = try { controlTestTimeout("RECOVER_INTENT execute") { f.store.execute(c, context) } } finally { f.storage.storage.afterScope = false }
+        check(r is ControlStoreResult.Unconfirmed) { "fixture: Unconfirmed, got $r" }
+        check(f.tracker.isUnresolved(c) && f.history(c).confirmationRequested.get()) { "fixture: OnceConfirm·U" }
+        check(arr(f.disk(), intentKey).isEmpty() && f.disk()[PURGE_JOURNAL] != null && demandIds(f.disk()).size == 1) { "fixture: outputs" }
+        check(ownIn(f.disk(), c) == 1) { "fixture: own row landed" }
+        return c
+    }
+    private suspend fun consumeJournal(f: TerminationFixture) = f.edit { it.remove(PURGE_JOURNAL) }
+    private suspend fun consumeRequest(f: TerminationFixture) = f.edit { it[demandKey] = "[]" }
+    private val retainJournalAndRequest: (RequiredSlot) -> DestinationLocator? = { slot ->
+        when (val b = (slot.requirement as SlotRequirement.Required).lowerBound) {
+            is RequiredLowerBound.Journal -> DestinationLocator.Journal(b.key)
+            is RequiredLowerBound.Request -> DestinationLocator.Payload(ControlKind.DEMAND, b.requiredId)
+            else -> null
+        }
+    }
+
+    @Test fun T1_f01_intentSlots_gateAdmits_completesOnceJournalAndRequestAreConsumed() = runReleaseTest {
+        val f = fixture(); val c = intentU(f); consumeJournal(f); consumeRequest(f)
+        val d = declare(f, c)
+        assertEquals("C3f.T1_f01: components",
+            listOf(ObligationComponent.SOURCE, ObligationComponent.JOURNAL, ObligationComponent.NAMESPACE_RETIREMENT, ObligationComponent.REQUEST)
+                .flatMap { listOf(it to L, it to LandingBranch.N) } + listOf(ObligationComponent.RECEIPT to L),
+            d.handoff.slots.map { it.key.component to it.key.branch })
+        assertEquals("C3f.T1_f01: the observation gate admits it", HandoffGateDecision.Eligible,
+            controlTestTimeout("inspect") { store(f).inspectCurrentUncertainHandoffGate(c, d.closure, d.handoff) })
+        val before = f.disk()
+        completed("T1_f01", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+    }
+
+    @Test fun T2_f01_theStandingJournalAndRequest_areRetainedOnThemselves_butTheRetirementConflictsWhileTheJournalStands() = runReleaseTest {
+        val f = fixture(); val c = intentU(f)
+        val d = declare(f, c, retainJournalAndRequest)
+        heldFirst("T2_f01", f, c, d, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures.orEmpty()
+            assertEquals("C3f.T2_f01: only the retirement's two slots conflict, got $r",
+                d.required.filter { it.key.component == ObligationComponent.NAMESPACE_RETIREMENT }.map { G05Id.COMPLETED_CONFLICT to it.key }.toSet(),
+                failures.map { it.id to it.key }.toSet())
+        })
+    }
+
+    @Test fun T2_f02_theRequestRetainedOnItself_andTheJournalConsumed_completes() = runReleaseTest {
+        val f = fixture(); val c = intentU(f); consumeJournal(f)
+        val d = declare(f, c) { slot -> retainJournalAndRequest(slot)?.takeIf { it is DestinationLocator.Payload } }
+        assertEquals("C3f.T2_f02: the request stands", 1, demandIds(f.disk()).size)
+        val before = f.disk()
+        completed("T2_f02", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+    }
+
+    @Test fun T3_f01_aMissingSourceN_isCoverage() = runReleaseTest {
+        val f = fixture(); val c = intentU(f); consumeJournal(f); consumeRequest(f)
+        val d = declare(f, c)
+        val sourceN = component(d, ObligationComponent.SOURCE, LandingBranch.N)
+        heldFirst("T3_f01", f, c, d,
+            rejected(CompletionRejectionReason.G05(listOf(G05Failure(G05Id.COVERAGE_N, sourceN.key, fixedAt(sourceN), null, null)))),
+            CompletionHandoff(d.handoff.command, d.handoff.responsibilityOwner, d.handoff.slots.filter { it.key != sourceN.key }))
+    }
+
+    @Test fun T6_f01_writeFaultFixesARecoverIntentDescriptor_retryDeletes() = runReleaseTest {
+        val f = fixture(); val c = intentU(f); consumeJournal(f); consumeRequest(f)
+        val d = declare(f, c); val before = f.disk()
+        val fixed = pendingByWriteFault(f, c, d)
+        assertEquals(LifecycleTransition.RECOVER_INTENT, fixed.transition)
+        assertNotNull("exact own fixed", fixed.expectedOwn)
+        assertEquals("nothing landed", before, f.disk())
+        completed("T6_f01", f, c, retry(f, c, d), expectedAfterDeletion(before, c))
     }
 }
