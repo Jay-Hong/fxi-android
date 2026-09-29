@@ -151,4 +151,15 @@ class SourceAlertContractTest {
         val failed = repo.run { deleteSourceSetting(it, 12) }.exceptionOrNull()
         assertEquals(500, (failed as? AlertRepositoryException)?.httpFailure?.statusCode)
     }
+
+    /** updated_at and triggered_at are nullable but always set by the server's builder, so a missing key is refused. */
+    @Test fun S08_aSettingMissingANullableTimestampKey_isRefused() = runTest {
+        for (key in listOf(",\n        \"updated_at\":null", ",\"triggered_at\":\"2026-09-04T10:30:00+09:00\"")) {
+            val row = repeatRow.replace(key, "")
+            check(row != repeatRow) { "fixture edit for $key did not apply" }
+            server.enqueue(ok("""{"settings":[$row],"total_count":1}"""))
+            val error = repository(backgroundScope).run { getSourceSettings(it) }.exceptionOrNull()
+            assertTrue("$key: refused, got $error", error is AlertRepositoryException)
+        }
+    }
 }

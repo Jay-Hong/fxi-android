@@ -120,4 +120,15 @@ class AlertHistoryContractTest {
         }
         if (server.requestCount != 2) fail("one request per call, got ${server.requestCount}")
     }
+
+    /** The nullable fields are always serialized (Optional = None), so a row missing any of those keys is refused too. */
+    @Test fun H07_aRowMissingANullableKey_isRefused() = runTest {
+        for (key in listOf("\"setting_id\":null,", "\"condition\":null,", "\"threshold\":null,")) {
+            val row = oldRow.replace(key, "")
+            check(row != oldRow) { "fixture edit for $key did not apply" }
+            server.enqueue(ok("""{"logs":[$row],"total_count":1}"""))
+            val error = repository(backgroundScope).history().exceptionOrNull()
+            assertTrue("$key: refused, got $error", error is AlertRepositoryException)
+        }
+    }
 }
