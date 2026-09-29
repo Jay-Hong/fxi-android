@@ -12,10 +12,13 @@ import com.jay.fxi.data.remote.AuthenticatedHttpResponse
 import com.jay.fxi.data.remote.dto.AlertHistoryItem
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
+import com.jay.fxi.data.remote.dto.ComparisonAlertRequest
+import com.jay.fxi.data.remote.dto.ComparisonAlertUpdateRequest
 import com.jay.fxi.data.remote.dto.SourceAlertHistoryItem
 import com.jay.fxi.data.remote.dto.SourceAlertSettingRequest
 import com.jay.fxi.data.remote.dto.SourceAlertSettingUpdateRequest
 import com.jay.fxi.domain.model.AlertSetting
+import com.jay.fxi.domain.model.ComparisonAlertSetting
 import com.jay.fxi.domain.model.SourceAlertSetting
 import java.io.IOException
 import javax.inject.Inject
@@ -79,6 +82,34 @@ class AlertRepository @Inject constructor(
             .requireBody("GET /api/source-notification-logs")
             .logs
     }
+
+    /** Comparison / kimchi-premium alerts; [tab] null is every tab. */
+    suspend fun getComparisonAlerts(owner: AuthIdentityFence, tab: String? = null): AuthBoundResult<List<ComparisonAlertSetting>> =
+        safeApiCall(owner) { snapshot ->
+            apiService.getComparisonAlerts(snapshot, tab)
+                .requireBody("GET /api/comparison-alerts")
+                .alerts
+        }
+
+    suspend fun createComparisonAlert(owner: AuthIdentityFence, request: ComparisonAlertRequest): AuthBoundResult<ComparisonAlertSetting> =
+        safeApiCall(owner) { snapshot ->
+            apiService.createComparisonAlert(snapshot, request)
+                .requireBody("POST /api/comparison-alerts")
+        }
+
+    /** Partial update of enabled / repeat / threshold / operator. */
+    suspend fun updateComparisonAlert(owner: AuthIdentityFence, id: Int, request: ComparisonAlertUpdateRequest): AuthBoundResult<ComparisonAlertSetting> =
+        safeApiCall(owner) { snapshot ->
+            apiService.updateComparisonAlert(snapshot, id, request)
+                .requireBody("PUT /api/comparison-alerts/{id}")
+        }
+
+    /** Idempotent on the server: an already deleted alert also succeeds. */
+    suspend fun deleteComparisonAlert(owner: AuthIdentityFence, id: Int): AuthBoundResult<Unit> =
+        safeApiCall(owner) { snapshot ->
+            val response = apiService.deleteComparisonAlert(snapshot, id)
+            response.failure?.let { throw AuthenticatedApiException(it) }
+        }
 
     /** Delivered bank alerts, newest first; [currency] null is every currency, [limit] 1..200 (server caps). */
     suspend fun getHistory(

@@ -16,12 +16,15 @@ internal enum class AuthenticatedEndpoint {
     UNREGISTER_DEVICE,
     NOTIFICATION_SETTINGS,
     SOURCE_NOTIFICATION_SETTINGS,
+    COMPARISON_ALERTS,
     NOTIFICATION_LOGS,
     SOURCE_NOTIFICATION_LOGS,
     UPDATE_NOTIFICATION_SETTING,
     UPDATE_SOURCE_NOTIFICATION_SETTING,
+    UPDATE_COMPARISON_ALERT,
     DELETE_NOTIFICATION_SETTING,
     DELETE_SOURCE_NOTIFICATION_SETTING,
+    DELETE_COMPARISON_ALERT,
     DELETE_USER,
     GRAPH_V2_CATALOG,
     GRAPH_V2_TAB,
@@ -215,7 +218,9 @@ private fun classifyFailure(
                 error == null && detailText == "Device not found") ||
             (endpoint in setOf(AuthenticatedEndpoint.UPDATE_NOTIFICATION_SETTING,
                 AuthenticatedEndpoint.UPDATE_SOURCE_NOTIFICATION_SETTING) &&
-                error == null && detailText == "Setting not found")
+                error == null && detailText == "Setting not found") ||
+            (endpoint == AuthenticatedEndpoint.UPDATE_COMPARISON_ALERT &&
+                error == null && detailText == "Comparison alert not found")
         ) {
             AuthenticatedFailureKind.KNOWN_NOT_FOUND
         } else {
@@ -228,12 +233,15 @@ private fun classifyFailure(
 private val PREMIUM_REQUIRED_ENDPOINTS = setOf(
     AuthenticatedEndpoint.NOTIFICATION_SETTINGS,
     AuthenticatedEndpoint.SOURCE_NOTIFICATION_SETTINGS,
+    AuthenticatedEndpoint.COMPARISON_ALERTS,
     AuthenticatedEndpoint.NOTIFICATION_LOGS,
     AuthenticatedEndpoint.SOURCE_NOTIFICATION_LOGS,
     AuthenticatedEndpoint.UPDATE_NOTIFICATION_SETTING,
     AuthenticatedEndpoint.UPDATE_SOURCE_NOTIFICATION_SETTING,
+    AuthenticatedEndpoint.UPDATE_COMPARISON_ALERT,
     AuthenticatedEndpoint.DELETE_NOTIFICATION_SETTING,
     AuthenticatedEndpoint.DELETE_SOURCE_NOTIFICATION_SETTING,
+    AuthenticatedEndpoint.DELETE_COMPARISON_ALERT,
     AuthenticatedEndpoint.GRAPH_V2_CATALOG,
     AuthenticatedEndpoint.GRAPH_V2_TAB
 )

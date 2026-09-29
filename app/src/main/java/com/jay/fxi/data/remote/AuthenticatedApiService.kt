@@ -5,6 +5,9 @@ import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.remote.dto.AlertHistoryResponse
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
+import com.jay.fxi.data.remote.dto.ComparisonAlertRequest
+import com.jay.fxi.data.remote.dto.ComparisonAlertUpdateRequest
+import com.jay.fxi.data.remote.dto.ComparisonAlertsResponse
 import com.jay.fxi.data.remote.dto.DeviceRequest
 import com.jay.fxi.data.remote.dto.EntitlementsResponse
 import com.jay.fxi.data.remote.dto.FreeSnapshotResponse
@@ -16,6 +19,7 @@ import com.jay.fxi.data.remote.dto.SourceAlertSettingRequest
 import com.jay.fxi.data.remote.dto.SourceAlertSettingUpdateRequest
 import com.jay.fxi.data.remote.dto.SourceAlertSettingsResponse
 import com.jay.fxi.domain.model.AlertSetting
+import com.jay.fxi.domain.model.ComparisonAlertSetting
 import com.jay.fxi.domain.model.SourceAlertSetting
 import javax.inject.Singleton
 import kotlinx.serialization.json.Json
@@ -97,6 +101,31 @@ internal interface AuthenticatedApiService {
         @Tag auth: AuthRequestTag,
         @Query("asset") asset: String?,
         @Query("limit") limit: Int
+    ): Response<ResponseBody>
+
+    @GET("api/comparison-alerts")
+    suspend fun getComparisonAlerts(
+        @Tag auth: AuthRequestTag,
+        @Query("tab") tab: String?
+    ): Response<ResponseBody>
+
+    @POST("api/comparison-alerts")
+    suspend fun createComparisonAlert(
+        @Tag auth: AuthRequestTag,
+        @Body request: ComparisonAlertRequest
+    ): Response<ResponseBody>
+
+    @PUT("api/comparison-alerts/{id}")
+    suspend fun updateComparisonAlert(
+        @Tag auth: AuthRequestTag,
+        @Path("id") id: Int,
+        @Body request: ComparisonAlertUpdateRequest
+    ): Response<ResponseBody>
+
+    @DELETE("api/comparison-alerts/{id}")
+    suspend fun deleteComparisonAlert(
+        @Tag auth: AuthRequestTag,
+        @Path("id") id: Int
     ): Response<ResponseBody>
 
     @GET("api/v2/graph/catalog")
@@ -270,6 +299,30 @@ class AuthenticatedApiClient internal constructor(
         transport.executeRead(owner) { service.getSourceNotificationLogs(it, asset, limit) }
             .preserve(AuthenticatedEndpoint.SOURCE_NOTIFICATION_LOGS)
             .decodeSuccess(wireJson)
+
+    suspend fun getComparisonAlerts(owner: AuthSnapshot, tab: String?): AuthenticatedHttpResponse<ComparisonAlertsResponse> =
+        transport.executeRead(owner) { service.getComparisonAlerts(it, tab) }
+            .preserve(AuthenticatedEndpoint.COMPARISON_ALERTS)
+            .decodeSuccess(wireJson)
+
+    suspend fun createComparisonAlert(owner: AuthSnapshot, request: ComparisonAlertRequest): AuthenticatedHttpResponse<ComparisonAlertSetting> =
+        transport.executeMutation(owner) { service.createComparisonAlert(it, request) }
+            .preserve(AuthenticatedEndpoint.COMPARISON_ALERTS)
+            .decodeSuccess(wireJson)
+
+    suspend fun updateComparisonAlert(
+        owner: AuthSnapshot,
+        id: Int,
+        request: ComparisonAlertUpdateRequest
+    ): AuthenticatedHttpResponse<ComparisonAlertSetting> =
+        transport.executeMutation(owner) { service.updateComparisonAlert(it, id, request) }
+            .preserve(AuthenticatedEndpoint.UPDATE_COMPARISON_ALERT)
+            .decodeSuccess(wireJson)
+
+    suspend fun deleteComparisonAlert(owner: AuthSnapshot, id: Int): AuthenticatedHttpResponse<Unit> =
+        transport.executeMutation(owner) { service.deleteComparisonAlert(it, id) }
+            .preserve(AuthenticatedEndpoint.DELETE_COMPARISON_ALERT)
+            .asUnit()
 
     /** GET /api/v2/graph/catalog (premium; KRX series only when the user may see them). */
     suspend fun getGraphV2Catalog(
