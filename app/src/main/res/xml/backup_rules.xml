@@ -2,9 +2,11 @@
    API 30 and below full-backup rules. Same reasoning as data_extraction_rules.xml: the access
    epoch store is control-plane provenance, not user preference, and must not be restored onto a
    different install.
+   The migration journal is install-local and must not travel apart from legacy data.
 -->
 <full-backup-content>
     <exclude domain="file" path="datastore/fxi_access_epoch.preferences_pb" />
     <exclude domain="file" path="datastore/fxi_bank_preferences.preferences_pb" />
+    <exclude domain="file" path="datastore/fxi_migration_journal.preferences_pb" />
     <exclude domain="file" path="datastore/fxi_push_registration_ledger.preferences_pb" />
 </full-backup-content>

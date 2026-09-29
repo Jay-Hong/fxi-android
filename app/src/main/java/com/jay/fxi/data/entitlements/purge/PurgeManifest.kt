@@ -174,6 +174,13 @@ object PurgeManifest {
             note = "rows the server may still hold a registration for; cleared by its own finalizer"
         ),
         PurgeTarget(
+            id = "datastore:fxi_migration_journal",
+            classification = PurgeClassification.NOT_USER_DATA,
+            scopes = emptySet(),
+            owner = "LocalMigrationJournal",
+            note = "§9.1 per-target legacy migration progress for this install — not the user's data, and a purge must not rewind it"
+        ),
+        PurgeTarget(
             id = "prefs:alert_prefs",
             classification = PurgeClassification.NOT_USER_DATA,
             scopes = emptySet(),

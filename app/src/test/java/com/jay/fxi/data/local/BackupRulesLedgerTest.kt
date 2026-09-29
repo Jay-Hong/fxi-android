@@ -39,6 +39,10 @@ class BackupRulesLedgerTest {
         // device's registration.
         "fxi_push_registration_ledger" to false,
 
+        // `ANDROID_V2_PLAN.md §9.1`: the migration journal is excluded, so the journal marker itself is never restored; the
+        // legacy stores' own backup policy is tracked separately (`fxi_cache`, `fxi_graph_preferences` below).
+        "fxi_migration_journal" to false,
+
         // v1, with **no UID at all**. `ANDROID_V2_PLAN.md §7 S1.5` requires that a backup restore
         // not attribute v1 bank preferences to another UID, and a file that never recorded one
         // cannot help doing exactly that. Excluded here, and deleted outright on start — see
