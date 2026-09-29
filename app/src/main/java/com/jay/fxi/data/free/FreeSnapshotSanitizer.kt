@@ -2,6 +2,7 @@ package com.jay.fxi.data.free
 
 import com.jay.fxi.data.remote.dto.FreeSnapshotRateSerializer
 import com.jay.fxi.data.remote.dto.FreeSnapshotResponse
+import com.jay.fxi.domain.model.RateSourceSets
 import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.FreeSnapshot
 import com.jay.fxi.domain.model.FreeGraphCarryIn
@@ -81,7 +82,7 @@ class FreeSnapshotSanitizer @Inject constructor() {
                 takeRates(rawRate.array("usdt_krw"), EXCHANGES, "usdt-krw", response.asOf),
                 takeRates(rawRate.array("usd_krw_banks"), TETHER_BANKS, "usd-krw", response.asOf)
                     .map { it.asExchangeRate() },
-                takeRates(listOf(rawRate.getValue("usd_krw_reference")), setOf("investing"), "usd-krw", response.asOf)
+                takeRates(listOf(rawRate.getValue("usd_krw_reference")), setOf(RateSourceSets.USD_KRW_REFERENCE), "usd-krw", response.asOf)
                     .singleOrNull()?.asExchangeRate()
             )
         }
@@ -173,12 +174,11 @@ class FreeSnapshotSanitizer @Inject constructor() {
     private fun SourceRate.asExchangeRate() = ExchangeRate(asset, source, rate, timestamp)
 
     private companion object {
-        val TAB_ASSETS = mapOf("usd" to "usd-krw", "jpy" to "jpy-krw", "eur" to "eur-krw", "tether" to "usdt-krw")
-        val FX_GRAPH_SOURCES = setOf("investing", "kb", "hana", "shinhan", "woori", "ibk", "nh", "sc", "bs")
-        // Citi is valid in flat rate payloads, but is not in the free graph catalog.
-        val FX_RATE_SOURCES = FX_GRAPH_SOURCES + "citi"
-        val EXCHANGES = setOf("upbit", "bithumb", "coinone", "korbit", "gopax")
-        val TETHER_BANKS = setOf("kb", "hana")
+        val TAB_ASSETS = RateSourceSets.TAB_ASSETS
+        val FX_GRAPH_SOURCES = RateSourceSets.FX_GRAPH_SOURCES
+        val FX_RATE_SOURCES = RateSourceSets.FX_RATE_SOURCES
+        val EXCHANGES = RateSourceSets.EXCHANGES
+        val TETHER_BANKS = RateSourceSets.TETHER_BANKS
         val INTRADAY_GRAPH_IDS = mapOf(
             "usd" to (FX_GRAPH_SOURCES.map { "$it.usd" }.toSet() + "dxy"),
             "jpy" to FX_GRAPH_SOURCES.map { "$it.jpy" }.toSet(),
