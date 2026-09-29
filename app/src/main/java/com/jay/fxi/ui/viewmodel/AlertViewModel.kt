@@ -22,6 +22,8 @@ import com.jay.fxi.domain.model.AlertSetting
 import com.jay.fxi.domain.model.sortedByCreatedAt
 import com.jay.fxi.service.AlertEvent
 import com.jay.fxi.service.AlertEventBus
+import com.jay.fxi.service.AlertPushRouting
+import com.jay.fxi.service.BankAlertAction
 import com.jay.fxi.service.FXiMessagingService
 import com.jay.fxi.service.PushNotificationManager
 import com.jay.fxi.subscription.SubscriptionManager
@@ -166,9 +168,10 @@ class AlertViewModel @Inject constructor(
     init {
         viewModelScope.launch {
             alertEventBus.events.collect { event ->
-                when (event) {
-                    is AlertEvent.SettingTriggered -> handleSettingTriggered(event.settingId)
-                    is AlertEvent.RefreshNeeded -> requestRefresh()
+                when (val action = AlertPushRouting.bankAction(event)) {
+                    is BankAlertAction.Trigger -> handleSettingTriggered(action.settingId)
+                    BankAlertAction.Refresh -> requestRefresh()
+                    null -> Unit
                 }
             }
         }

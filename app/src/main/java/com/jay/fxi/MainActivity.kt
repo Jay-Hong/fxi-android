@@ -10,6 +10,7 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.jay.fxi.admission.ReleaseAdmission
 import com.jay.fxi.service.AlertEvent
 import com.jay.fxi.service.AlertEventBus
+import com.jay.fxi.service.AlertPushRouting
 import com.jay.fxi.service.FXiMessagingService
 import com.jay.fxi.subscription.SubscriptionManager
 import com.jay.fxi.ui.screen.RootScreen
@@ -90,19 +91,15 @@ class MainActivity : ComponentActivity() {
         // 2. 서버 FCM data payload 직접 전달 (백그라운드/종료 상태 시스템 알림)
         val type = intent.getStringExtra(FXiMessagingService.EXTRA_NOTIFICATION_TYPE)
             ?: intent.getStringExtra("type")
-        if (type != "rate_alert") return null
 
         // Int extra (커스텀) 또는 String extra (서버 payload) 모두 처리
         val settingId = intent.getIntExtra(FXiMessagingService.EXTRA_SETTING_ID, -1)
             .takeIf { it != -1 }
-            ?: intent.getStringExtra(FXiMessagingService.EXTRA_SETTING_ID)?.toIntOrNull()
-            ?: intent.getStringExtra("setting_id")?.toIntOrNull()
+            ?.toString()
+            ?: intent.getStringExtra(FXiMessagingService.EXTRA_SETTING_ID)
+            ?: intent.getStringExtra("setting_id")
 
-        return if (settingId != null) {
-            AlertEvent.SettingTriggered(settingId)
-        } else {
-            AlertEvent.RefreshNeeded
-        }
+        return AlertPushRouting.route(type, settingId)?.event
     }
 
     private fun clearNotificationExtras(intent: Intent?) {

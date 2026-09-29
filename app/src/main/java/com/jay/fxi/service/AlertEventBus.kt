@@ -18,7 +18,14 @@ class AlertEventBus @Inject constructor() {
     }
 }
 
+/** The three server alert families (FCM `type`: rate_alert / source_rate_alert / comparison_alert). */
+enum class AlertFamily { BANK, SOURCE, COMPARISON }
+
 sealed class AlertEvent {
-    data class SettingTriggered(val settingId: Int) : AlertEvent()
+    /** One setting of [family] fired. */
+    data class SettingTriggered(val settingId: Int, val family: AlertFamily = AlertFamily.BANK) : AlertEvent()
+    /** [family]'s settings need a reload (its push carried no readable setting id). */
+    data class FamilyRefreshNeeded(val family: AlertFamily) : AlertEvent()
+    /** Every family needs a reload (sync_alerts or an unreadable bank setting id). */
     data object RefreshNeeded : AlertEvent()
 }

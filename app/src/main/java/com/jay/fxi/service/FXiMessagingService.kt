@@ -46,23 +46,10 @@ class FXiMessagingService : FirebaseMessagingService() {
         super.onMessageReceived(message)
         Log.d(TAG, "Message received: type=${message.data["type"]}")
 
-        when (message.data["type"]) {
-            "rate_alert" -> {
-                // 환율 알림: UI 업데이트 + 사용자 알림 표시
-                val settingId = message.data["setting_id"]?.toIntOrNull()
-                if (settingId != null) {
-                    alertEventBusProvider.get().emit(AlertEvent.SettingTriggered(settingId))
-                } else {
-                    alertEventBusProvider.get().emit(AlertEvent.RefreshNeeded)
-                }
-                showRateAlertNotification(message)
-            }
-            "sync_alerts" -> {
-                // 다중 기기 동기화: 사일런트 새로고침 (알림 표시 없음)
-                Log.d(TAG, "Sync alerts requested from another device")
-                alertEventBusProvider.get().emit(AlertEvent.RefreshNeeded)
-            }
-        }
+        val type = message.data["type"] ?: return
+        val route = AlertPushRouting.route(type, message.data["setting_id"]) ?: return
+        alertEventBusProvider.get().emit(route.event)
+        if (route.showBanner) showAlertNotification(message, type)
     }
 
     /**
@@ -78,14 +65,14 @@ class FXiMessagingService : FirebaseMessagingService() {
         return title to body
     }
 
-    private fun showRateAlertNotification(message: RemoteMessage) {
+    private fun showAlertNotification(message: RemoteMessage, type: String) {
         if (!ReleaseAdmission.isOpen) return
         val (title, body) = parseNotificationContent(message)
 
         val settingId = message.data["setting_id"]?.toIntOrNull()
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            putExtra(EXTRA_NOTIFICATION_TYPE, "rate_alert")
+            putExtra(EXTRA_NOTIFICATION_TYPE, type)
             if (settingId != null) {
                 putExtra(EXTRA_SETTING_ID, settingId)
             }
