@@ -185,6 +185,46 @@ internal class TopicLastKnownStore internal constructor(
         }
     }
 
+    /**
+     * S3-P1: removes every namespace of [uid] except `(uid, keepEpoch)` — on disk and still pending — and answers whether
+     * anything was there. Returns only after the removal is on disk; a pending write for a removed namespace never lands.
+     */
+    suspend fun purgeUser(uid: String, keepEpoch: String?): Boolean = writeMutex.withLock {
+        require(uid.isNotBlank())
+        val uidPrefix = "topic_last_known_${hex(uid)}_"
+        val keepPrefix = keepEpoch?.let { "${uidPrefix}${hex(it)}_" }
+        fun isRetiredKey(name: String): Boolean =
+            name.startsWith(uidPrefix) && (keepPrefix == null || !name.startsWith(keepPrefix))
+
+        val removedPending = synchronized(stateLock) {
+            val retired = pending.keys.filter { target ->
+                target.owner.uid == uid && target.owner.userAccessEpoch != keepEpoch
+            }
+            retired.forEach { target ->
+                retiredNamespaces += namespace(target.owner)
+                pending.remove(target)
+            }
+            retired.isNotEmpty()
+        }
+
+        var removedDisk = false
+        dataStore.edit { preferences ->
+            val keys = preferences.asMap().keys.map { it.name }.filter(::isRetiredKey)
+            synchronized(stateLock) {
+                keys.forEach { name ->
+                    val epochHex = name.removePrefix(uidPrefix).substringBefore('_')
+                    retiredNamespaces += "$uidPrefix$epochHex"
+                }
+            }
+            keys.forEach { name -> preferences.remove(stringPreferencesKey(name)) }
+            removedDisk = keys.isNotEmpty()
+            check(preferences.asMap().keys.none { isRetiredKey(it.name) }) {
+                "retired topic last-known keys remain for owner"
+            }
+        }
+        removedPending || removedDisk
+    }
+
     private suspend fun flushAtDeadline(target: OwnerKind) {
         while (true) {
             val remaining = synchronized(stateLock) { pending[target]?.deadline?.minus(clock.elapsedRealtimeMillis()) }
