@@ -5,7 +5,6 @@ import android.util.Log
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.jay.fxi.di.StorageJson
@@ -48,8 +47,8 @@ class CacheService @Inject constructor(
 ) {
     companion object {
         private const val TAG = "CacheService"
-        private val KEY_RATES = stringPreferencesKey("rates")
-        private val KEY_RATES_TIMESTAMP = longPreferencesKey("rates_timestamp")
+        private val KEY_RATES = LegacyRateCacheKeys.RATES
+        private val KEY_RATES_TIMESTAMP = LegacyRateCacheKeys.RATES_TIMESTAMP
 
         private const val GRAPH_CACHE_VERSION = "v1"
         private const val GRAPH_FILE_PREFIX = "graph_cache_"
