@@ -259,10 +259,10 @@ class UncertainRotationHandoffContractTest {
         refused("notOnceConfirm", notU, CompletionRejectionReason.NotOnceConfirm)
         refused("otherHandoffRef", c, CompletionRejectionReason.DeclarationRefMismatch, dg.handoff)
         refused("closureOpen", c, CompletionRejectionReason.ClosureNotSatisfied(ClosureViolation.EntriesOpen), k = closure(c, entriesClosed = false))
-        // A body this unit does not hand over: a Lifecycle command (C3). R and N settlements are opened by 6-4bC2b/C2c.
-        // RECOVER_HOLD: a Lifecycle transition C3a does not open (REMOVE_EMPTY_GUARD is handed over from C3a on).
+        // Since 6-4bC3g every body kind is handed over, so no live body is UnsupportedInThisUnit: a Lifecycle command of the last
+        // transition opened (RECOVER_HOLD) that is not unresolved is refused before storage like any other kind.
         val s = f.tracker.registerPrepared(ControlLifecycleEvidenceFixtures.command(ControlLifecycleEvidenceFixtures.descriptor(transition = LifecycleTransition.RECOVER_HOLD), life = f.tracker.lifetimeId))
-        refused("unsupportedBody", s, CompletionRejectionReason.UnsupportedInThisUnit)
+        refused("lifecycleNotUnresolved", s, CompletionRejectionReason.NotUnresolved)
         // Pending and terminal refs, on a fresh fixture (the refs above reference the seal "s" and would block by G11).
         val h = fixture(); val (p, dp) = ready(h)
         pendingByWriteFault(h, p, dp)

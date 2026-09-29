@@ -19,7 +19,8 @@ private val LIFECYCLE_HANDOFF_TRANSITIONS = setOf(
     LifecycleTransition.SETTLE_QUERY,
     LifecycleTransition.UPDATE_AUTH,
     LifecycleTransition.END_AUTH_BINDING,
-    LifecycleTransition.RECOVER_INTENT
+    LifecycleTransition.RECOVER_INTENT,
+    LifecycleTransition.RECOVER_HOLD
 )
 
 /**

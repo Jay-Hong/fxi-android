@@ -26,8 +26,8 @@ import org.junit.rules.TemporaryFolder
 /**
  * Claude-owned 6-4bC3a contract (C3/split_codex.r1.md): a current-lifetime OnceConfirm·U Lifecycle REMOVE_EMPTY_GUARD is
  * terminated by handing over its L/N responsibilities through handoffAfterUncertainConfirm, and retried on its fixed
- * TerminationPendingDescriptor.LifecycleHandoff. 6-4bC3b–f open REBIND_REQUESTS, SETTLE_QUERY, UPDATE_AUTH, END_AUTH_BINDING and RECOVER_INTENT;
- * RECOVER_HOLD stays UnsupportedInThisUnit (C3g). The paths
+ * TerminationPendingDescriptor.LifecycleHandoff. 6-4bC3b–g open REBIND_REQUESTS, SETTLE_QUERY, UPDATE_AUTH, END_AUTH_BINDING, RECOVER_INTENT and
+ * RECOVER_HOLD, so every Lifecycle transition is handed over. The paths
  * C2a locked once for every kind (the refusals before storage, cancellation, read failure, reopen) are not repeated.
  *  - The U fixture is a real REMOVE_EMPTY_GUARD execute whose Confirm landed and whose return failed (afterScope): the guard is gone
  *    and the own Lifecycle row is on disk.
@@ -52,7 +52,8 @@ class UncertainLifecycleHandoffContractTest {
     private val L = LandingBranch.L
     /** The Lifecycle transitions this contract hands over so far. */
     private val OPENED = setOf(LifecycleTransition.REMOVE_EMPTY_GUARD, LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.SETTLE_QUERY,
-        LifecycleTransition.UPDATE_AUTH, LifecycleTransition.END_AUTH_BINDING, LifecycleTransition.RECOVER_INTENT)
+        LifecycleTransition.UPDATE_AUTH, LifecycleTransition.END_AUTH_BINDING, LifecycleTransition.RECOVER_INTENT,
+        LifecycleTransition.RECOVER_HOLD)
 
     private fun store(f: TerminationFixture) = ControlRecordStore(f.storage.owner, bootReadingSource = BootReadingSource { now })
     private fun arr(p: Preferences, key: Preferences.Key<String>) = Json.parseToJsonElement(p[key] ?: "[]").jsonArray
@@ -210,6 +211,8 @@ class UncertainLifecycleHandoffContractTest {
     }
 
     @Test fun T1_03_theTransitionsNotYetOpened_stayUnsupported() = runReleaseTest {
+        // After 6-4bC3g every transition is opened, so the loop below has nothing left to refuse.
+        assertEquals("C3g.T1_03: every Lifecycle transition is opened", LifecycleTransition.entries.toSet(), OPENED)
         val f = fixture(); val (c, d) = ready(f)
         for (t in LifecycleTransition.entries - OPENED) {
             val other = f.tracker.registerPrepared(ControlLifecycleEvidenceFixtures.command(
@@ -913,5 +916,115 @@ class UncertainLifecycleHandoffContractTest {
         assertNotNull("exact own fixed", fixed.expectedOwn)
         assertEquals("nothing landed", before, f.disk())
         completed("T6_f01", f, c, retry(f, c, d), expectedAfterDeletion(before, c))
+    }
+
+    // ── 6-4bC3g RECOVER_HOLD ─────────────────────────────────────────────────────────────────────────────────────────
+    // Measured (C3/C3g_probe_outputs.r1.txt): a U RECOVER_HOLD removed the hold, opened the purge journal and raised a FORCE request.
+    // A floorless hold leaves the guard unchanged: its FLOOR and AUTH are retained on it, the request on itself, and once the journal is
+    // consumed every slot hands over (with or without a guard). A floored hold moves its floor into a guard this command replaced or
+    // created (a created guard's own FLOOR is retained on it). The hold's floor is DURABLY_OWNED_ONLY, has no retained-source token on the command's own output, and a U command has no
+    // Confirmed result to confirm the output with, so no valid declaration exists: a forged one that completes it is a completion
+    // conflict and the command is held.
+    private val HR = HoldRecoveryFixtures
+
+    /** A real RECOVER_HOLD of the hold ([floor]ed or not, with the guard g or none) whose Confirm landed and whose return failed. */
+    private suspend fun holdU(f: TerminationFixture, floor: Boolean, withGuard: Boolean = true): CommandRef {
+        val input = HR.input(h = HR.hold(floor = floor), g = if (withGuard) HR.guard() else null)
+        f.edit { it.clear(); it += HR.before(input) }
+        val c = f.store.prepareRecoverHold(input, LifecycleOrderSource(HR.life, 21))
+        f.storage.storage.afterScope = true
+        val r = try { controlTestTimeout("RECOVER_HOLD execute") { f.store.execute(c, HR.context(input)) } } finally { f.storage.storage.afterScope = false }
+        check(r is ControlStoreResult.Unconfirmed) { "fixture: Unconfirmed, got $r" }
+        check(f.tracker.isUnresolved(c) && f.history(c).confirmationRequested.get()) { "fixture: OnceConfirm·U" }
+        check(arr(f.disk(), ControlRecordKeys.payload(ControlKind.HOLD)).isEmpty() && f.disk()[PURGE_JOURNAL] != null) { "fixture: outputs" }
+        check(ownIn(f.disk(), c) == 1) { "fixture: own row landed" }
+        return c
+    }
+    /** The guard's FLOOR (when it names the guard) and AUTH on the guard, the request on itself. */
+    private val retainHold: (RequiredSlot) -> DestinationLocator? = { slot ->
+        when (val b = (slot.requirement as SlotRequirement.Required).lowerBound) {
+            is RequiredLowerBound.Request -> DestinationLocator.Payload(ControlKind.DEMAND, b.requiredId)
+            is RequiredLowerBound.Floor -> if (b.sourceKind == ControlKind.DEMAND) DestinationLocator.Guard(b.sourceId, GuardPart.FLOOR) else null
+            is RequiredLowerBound.Auth -> DestinationLocator.Guard("g", GuardPart.AUTH)
+            else -> null
+        }
+    }
+    private fun isHoldFloor(slot: RequiredSlot) = ((slot.requirement as SlotRequirement.Required).lowerBound as? RequiredLowerBound.Floor)?.sourceKind == ControlKind.HOLD
+    /** Built without the coordinator: [retain]ed slots that get a token are durably owned, every other slot completed and consumed. */
+    private suspend fun forged(f: TerminationFixture, c: CommandRef, retain: (RequiredSlot) -> DestinationLocator?): Declared {
+        val a = deriveRequiredObligations(RequirementInput.Lifecycle(c, c.body as ControlCommandBody.Lifecycle)) as RequirementDerivation.Available
+        val slots = a.orderedSlots.filter { it.requirement is SlotRequirement.Required }
+        val locked = lockedRead(f)
+        val handed = slots.map { slot ->
+            val destination = retain(slot)
+            val t = destination?.let { PriorStorageConfirmation.confirmRetainedSource(slot, it, locked) }
+            SlotHandoff(slot.key, if (t is RetainedSourceConfirmationResult.Issued) HandoffDisposition.DurablyOwned(destination, emptyList(), t.value)
+                else HandoffDisposition.CompletedAndConsumed(ComponentCompletion(slot.key.subject), emptyList()))
+        }
+        return Declared(closure(c), CompletionHandoff(a.commandBinding, ResponsibilityOwner(c.ownerTrackingLifetimeId, "owner-1"), handed), slots, a.orderedSlots)
+    }
+
+    @Test fun T1_g01_floorlessHold_guardFloorAndAuthRetained_requestRetained_completesOnceTheJournalIsConsumed() = runReleaseTest {
+        val f = fixture(); val c = holdU(f, floor = false); consumeJournal(f)
+        val d = declare(f, c, retainHold)
+        assertEquals("C3g.T1_g01: components",
+            listOf(ObligationComponent.SOURCE, ObligationComponent.JOURNAL, ObligationComponent.NAMESPACE_RETIREMENT, ObligationComponent.REQUEST,
+                ObligationComponent.FLOOR, ObligationComponent.AUTH).flatMap { listOf(it to L, it to LandingBranch.N) } + listOf(ObligationComponent.RECEIPT to L),
+            d.handoff.slots.map { it.key.component to it.key.branch })
+        assertEquals("C3g.T1_g01: the observation gate admits it", HandoffGateDecision.Eligible,
+            controlTestTimeout("inspect") { store(f).inspectCurrentUncertainHandoffGate(c, d.closure, d.handoff) })
+        val before = f.disk()
+        completed("T1_g01", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+        assertEquals("C3g.T1_g01: the guard and the request stay", demandIds(before), demandIds(f.disk()))
+    }
+
+    @Test fun T1_g02_floorlessHoldWithoutGuard_completesOnceTheJournalIsConsumed() = runReleaseTest {
+        val f = fixture(); val c = holdU(f, floor = false, withGuard = false); consumeJournal(f)
+        val d = declare(f, c, retainHold)
+        assertEquals("C3g.T1_g02: components",
+            listOf(ObligationComponent.SOURCE, ObligationComponent.JOURNAL, ObligationComponent.NAMESPACE_RETIREMENT, ObligationComponent.REQUEST)
+                .flatMap { listOf(it to L, it to LandingBranch.N) } + listOf(ObligationComponent.RECEIPT to L),
+            d.handoff.slots.map { it.key.component to it.key.branch })
+        val before = f.disk()
+        completed("T1_g02", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+    }
+
+    @Test fun T3_g01_aFlooredHoldsFloorMovedIntoTheReplacedGuard_hasNoToken_andCompletingItIsAConflict() = runReleaseTest {
+        val f = fixture(); val c = holdU(f, floor = true); consumeJournal(f)
+        val d = forged(f, c, retainHold)
+        val holdFloor = d.required.filter(::isHoldFloor)
+        assertEquals("C3g.T3_g01: the hold's FLOOR L and N", listOf(L, LandingBranch.N), holdFloor.map { it.key.branch })
+        val locked = lockedRead(f)
+        for (slot in holdFloor) for (guardId in listOf("g")) assertEquals("C3g.T3_g01: no retained token on the replaced guard",
+            RetainedSourceConfirmationResult.Rejected(RetainedConfirmationFailure.SUBJECT_OR_BOUND_MISMATCH),
+            PriorStorageConfirmation.confirmRetainedSource(slot, DestinationLocator.Guard(guardId, GuardPart.FLOOR), locked))
+        heldFirst("T3_g01", f, c, d, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures.orEmpty()
+            assertEquals("C3g.T3_g01: only the hold's FLOOR slots conflict, got $r",
+                holdFloor.map { G05Id.COMPLETED_CONFLICT to it.key }.toSet(), failures.map { it.id to it.key }.toSet())
+        })
+    }
+
+    @Test fun T3_g02_aFlooredHoldWithoutGuard_theCreatedGuardsFloorIsRetainedOnIt_butTheHoldFloorConflicts() = runReleaseTest {
+        val f = fixture(); val c = holdU(f, floor = true, withGuard = false); consumeJournal(f)
+        val d = forged(f, c, retainHold)
+        val guardFloor = d.required.filter { it.key.component == ObligationComponent.FLOOR && !isHoldFloor(it) }
+        assertEquals("C3g.T3_g02: the created guard's FLOOR L and N are durably owned on it", listOf(L, LandingBranch.N),
+            d.handoff.slots.filter { s -> guardFloor.any { it.key == s.key } && s.disposition is HandoffDisposition.DurablyOwned }.map { it.key.branch })
+        heldFirst("T3_g02", f, c, d, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures.orEmpty()
+            assertEquals("C3g.T3_g02: only the hold's FLOOR slots conflict, got $r",
+                d.required.filter(::isHoldFloor).map { G05Id.COMPLETED_CONFLICT to it.key }.toSet(), failures.map { it.id to it.key }.toSet())
+        })
+    }
+
+    @Test fun T6_g01_writeFaultFixesARecoverHoldDescriptor_retryDeletes() = runReleaseTest {
+        val f = fixture(); val c = holdU(f, floor = false); consumeJournal(f)
+        val d = declare(f, c, retainHold); val before = f.disk()
+        val fixed = pendingByWriteFault(f, c, d)
+        assertEquals(LifecycleTransition.RECOVER_HOLD, fixed.transition)
+        assertNotNull("exact own fixed", fixed.expectedOwn)
+        assertEquals("nothing landed", before, f.disk())
+        completed("T6_g01", f, c, retry(f, c, d), expectedAfterDeletion(before, c))
     }
 }

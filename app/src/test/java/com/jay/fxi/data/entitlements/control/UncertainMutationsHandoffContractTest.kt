@@ -401,15 +401,15 @@ class UncertainMutationsHandoffContractTest {
         assertEquals("no owner access", accesses, fx.boundary.accesses)
     }
 
-    /** N1d: a registered ref whose fixed body is not Mutations is not handled by this entrance (C2/C3). */
-    @Test fun N1d_nonMutationsBody_unsupportedInThisUnit() = runReleaseTest {
+    /** N1d: a registered ref whose fixed body is not Mutations is handed over by its own branch (C2/C3); one that is not unresolved is refused before storage. */
+    @Test fun N1d_nonMutationsBody_notUnresolved_refusedBeforeStorage() = runReleaseTest {
         val c = noopEdit(); val d = declare(c, completed = false)
-        // A body this unit does not hand over: a Lifecycle command (C3). R and N settlements are opened by 6-4bC2b/C2c.
-        // RECOVER_HOLD: a Lifecycle transition C3a does not open (REMOVE_EMPTY_GUARD is handed over from C3a on).
+        // Since 6-4bC3g every body kind is handed over, so no live body is UnsupportedInThisUnit: a Lifecycle command of the last
+        // transition opened (RECOVER_HOLD) that is not unresolved is refused before storage.
         val settlement = fx.tracker.registerPrepared(ControlLifecycleEvidenceFixtures.command(ControlLifecycleEvidenceFixtures.descriptor(transition = LifecycleTransition.RECOVER_HOLD), life = fx.tracker.lifetimeId))
         val accesses = fx.boundary.accesses
         rejected(controlTestTimeout("non-mutations") { store().handoffAfterUncertainConfirm(settlement, TerminationClosures.of(settlement), d.handoff) },
-            CompletionRejectionReason.UnsupportedInThisUnit)
+            CompletionRejectionReason.NotUnresolved)
         assertEquals("no owner access", accesses, fx.boundary.accesses)
     }
 
