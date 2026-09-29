@@ -23,8 +23,8 @@ import org.junit.rules.TemporaryFolder
 /**
  * Claude-owned 6-4bC3a contract (C3/split_codex.r1.md): a current-lifetime OnceConfirm·U Lifecycle REMOVE_EMPTY_GUARD is
  * terminated by handing over its L/N responsibilities through handoffAfterUncertainConfirm, and retried on its fixed
- * TerminationPendingDescriptor.LifecycleHandoff. 6-4bC3b opens REBIND_REQUESTS, 6-4bC3c SETTLE_QUERY and 6-4bC3d UPDATE_AUTH; the other
- * three transitions stay UnsupportedInThisUnit (C3e–g). The paths
+ * TerminationPendingDescriptor.LifecycleHandoff. 6-4bC3b–e open REBIND_REQUESTS, SETTLE_QUERY, UPDATE_AUTH and END_AUTH_BINDING; the
+ * other two transitions stay UnsupportedInThisUnit (C3f–g). The paths
  * C2a locked once for every kind (the refusals before storage, cancellation, read failure, reopen) are not repeated.
  *  - The U fixture is a real REMOVE_EMPTY_GUARD execute whose Confirm landed and whose return failed (afterScope): the guard is gone
  *    and the own Lifecycle row is on disk.
@@ -49,7 +49,7 @@ class UncertainLifecycleHandoffContractTest {
     private val L = LandingBranch.L
     /** The Lifecycle transitions this contract hands over so far. */
     private val OPENED = setOf(LifecycleTransition.REMOVE_EMPTY_GUARD, LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.SETTLE_QUERY,
-        LifecycleTransition.UPDATE_AUTH)
+        LifecycleTransition.UPDATE_AUTH, LifecycleTransition.END_AUTH_BINDING)
 
     private fun store(f: TerminationFixture) = ControlRecordStore(f.storage.owner, bootReadingSource = BootReadingSource { now })
     private fun arr(p: Preferences, key: Preferences.Key<String>) = Json.parseToJsonElement(p[key] ?: "[]").jsonArray
@@ -666,7 +666,7 @@ class UncertainLifecycleHandoffContractTest {
     }
     /** Stands for a later command closing the guard's AUTH: the auth field goes, the floor stays. */
     private suspend fun closeAuth(f: TerminationFixture) = f.edit { p ->
-        p[demandKey] = checkNotNull(p[demandKey]).replace(Regex("\"auth\":\\{[^}]*\\},"), "").also { check(it != p[demandKey]) { "fixture: auth closed" } } }
+        p[demandKey] = checkNotNull(p[demandKey]).replace(Regex(",\"auth\":\\{[^}]*\\}|\"auth\":\\{[^}]*\\},"), "").also { check(it != p[demandKey]) { "fixture: auth closed" } } }
     /** The floor on the guard and the retry request on itself; [authL] also retains AUTH L on the guard. */
     private fun retainFloorAndRequest(authL: Boolean = false): (RequiredSlot) -> DestinationLocator? = { slot ->
         val bound = (slot.requirement as SlotRequirement.Required).lowerBound
@@ -740,5 +740,86 @@ class UncertainLifecycleHandoffContractTest {
         f.edit { p -> p[demandKey] = "[]" }
         val beforeRetry = f.disk()
         completed("T6_d01", f, c, retry(f, c, d), expectedAfterDeletion(beforeRetry, c))
+    }
+
+    // ═══ C3e: END_AUTH_BINDING ════════════════════════════════════════════════════════════════════════════════════════
+    // Measured with assessG05 before these rows (C3/C3e_probe_outputs.r1.txt), for a binding end with a replacement binding:
+    // Required = BINDING L (completed only) and N, AUTH L/N, REQUEST L/N for each request handed to the replacement, and RECEIPT L.
+    // The replacement AUTH and the handed-over requests are outputs of the command; a U command has no Confirmed result to issue an
+    // output confirmation from, so while they stand, AUTH L and each REQUEST L/N are completion conflicts. Once a later command has
+    // closed that AUTH and consumed those requests, every slot completes.
+    private val endOld = AuthSnapshotV1("A", 2, 2, DemandAuthFixtures.life, true, 10, 20)
+    private val endClosure = LifecycleBindingClosure(endOld, true, setOf("w"), setOf("w"), 5)
+
+    /** A real END_AUTH_BINDING of the old binding's guard (and [count] requests) with a replacement binding, whose return failed. */
+    private suspend fun endAuthU(f: TerminationFixture, count: Int = 0): CommandRef {
+        val g = D.guard(auth = endOld); val rs = (1..count).map { D.request(id = "e$it", binding = 2) }
+        f.edit { it.clear(); it += D.raw(*(listOf(g) + rs).toTypedArray()) }
+        val c = f.store.prepareEndAuthBinding(g, rs, D.binding, endClosure, D.binding, LifecycleOrderSource(D.life, 21))
+        f.storage.storage.afterScope = true
+        val r = try { controlTestTimeout("END execute") { f.store.execute(c, D.context(D.runtime(closure = endClosure))) } } finally { f.storage.storage.afterScope = false }
+        check(r is ControlStoreResult.Unconfirmed) { "fixture: Unconfirmed, got $r" }
+        check(f.tracker.isUnresolved(c) && f.history(c).confirmationRequested.get()) { "fixture: OnceConfirm·U" }
+        check(ownIn(f.disk(), c) == 1) { "fixture: own row landed" }
+        return c
+    }
+    private suspend fun consumeEndRequests(f: TerminationFixture) =
+        f.edit { p -> p[demandKey] = JsonArray(arr(p.toPreferences(), demandKey).filter { it.jsonObject.getValue("kind").jsonPrimitive.content != "REQUEST" }).toString() }
+
+    @Test fun T1_e01_endSlots_perHandedRequest_gateAdmits_completesOnceOutputsAreGone() = runReleaseTest {
+        for (n in listOf(0, 1)) {
+            val f = fixture(); val c = endAuthU(f, n); closeAuth(f); consumeEndRequests(f)
+            val d = declare(f, c)
+            assertEquals("C3e.T1_e01 $n: components",
+                listOf(ObligationComponent.BINDING to L, ObligationComponent.BINDING to LandingBranch.N,
+                    ObligationComponent.AUTH to L, ObligationComponent.AUTH to LandingBranch.N) +
+                    (1..n).flatMap { listOf(ObligationComponent.REQUEST to L, ObligationComponent.REQUEST to LandingBranch.N) } +
+                    listOf(ObligationComponent.RECEIPT to L),
+                d.handoff.slots.map { it.key.component to it.key.branch })
+            assertEquals("C3e.T1_e01 $n: the observation gate admits it", HandoffGateDecision.Eligible,
+                controlTestTimeout("inspect") { store(f).inspectCurrentUncertainHandoffGate(c, d.closure, d.handoff) })
+            val before = f.disk()
+            completed("T1_e01 $n", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+        }
+    }
+
+    @Test fun T3_e01_theReplacementAuthStanding_isACompletionConflictOnAuthLOnly() = runReleaseTest {
+        val f = fixture(); val c = endAuthU(f, 1); consumeEndRequests(f)
+        val d = declare(f, c)
+        val authL = component(d, ObligationComponent.AUTH, L)
+        heldFirst("T3_e01", f, c, d, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures.orEmpty()
+            assertEquals("C3e.T3_e01: only AUTH L conflicts, got $r", listOf(G05Id.COMPLETED_CONFLICT to authL.key), failures.map { it.id to it.key }.distinct())
+        })
+    }
+
+    @Test fun T3_e02_aHandedRequestStanding_isACompletionConflictOnItsSlots() = runReleaseTest {
+        val f = fixture(); val c = endAuthU(f, 1); closeAuth(f)
+        val d = declare(f, c)
+        heldFirst("T3_e02", f, c, d, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures.orEmpty()
+            assertEquals("C3e.T3_e02: the request's two slots conflict, got $r",
+                d.required.filter { it.key.component == ObligationComponent.REQUEST }.map { G05Id.COMPLETED_CONFLICT to it.key }.toSet(),
+                failures.map { it.id to it.key }.toSet())
+        })
+    }
+
+    @Test fun T3_e03_aMissingAuthN_isCoverage() = runReleaseTest {
+        val f = fixture(); val c = endAuthU(f); closeAuth(f)
+        val d = declare(f, c)
+        val authN = component(d, ObligationComponent.AUTH, LandingBranch.N)
+        heldFirst("T3_e03", f, c, d,
+            rejected(CompletionRejectionReason.G05(listOf(G05Failure(G05Id.COVERAGE_N, authN.key, fixedAt(authN), null, null)))),
+            CompletionHandoff(d.handoff.command, d.handoff.responsibilityOwner, d.handoff.slots.filter { it.key != authN.key }))
+    }
+
+    @Test fun T6_e01_writeFaultFixesAnEndAuthDescriptor_retryDeletes() = runReleaseTest {
+        val f = fixture(); val c = endAuthU(f); closeAuth(f)
+        val d = declare(f, c); val before = f.disk()
+        val fixed = pendingByWriteFault(f, c, d)
+        assertEquals(LifecycleTransition.END_AUTH_BINDING, fixed.transition)
+        assertNotNull("exact own fixed", fixed.expectedOwn)
+        assertEquals("nothing landed", before, f.disk())
+        completed("T6_e01", f, c, retry(f, c, d), expectedAfterDeletion(before, c))
     }
 }
