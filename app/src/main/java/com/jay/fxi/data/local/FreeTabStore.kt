@@ -23,35 +23,52 @@ private val Context.freeTabDataStore: DataStore<Preferences> by preferencesDataS
 )
 
 /**
- * One owner, one tab.
- *
- * The plan asks for the last tab to be restored per UID, and what that has to guarantee is that a
- * second account never opens on the first one's tab. Storing the owner beside the value gives
- * exactly that: a UID that does not match reads as 달러. What it deliberately does not do is keep a
- * tab *per* account — a map would grow one entry per UID that ever signed in here, with no moment
- * at which anything prunes it, to restore a choice only an account-switching user would notice.
- * If that is ever wanted, it is a change behind [FreeTabStore] and nothing above it moves.
+ * Keeps the last confirmed tab per UID, shared by free and subscriber surfaces. A legacy
+ * `(owner_uid, last_tab)` pair remains readable for its owner until the next write migrates it.
  */
 @Singleton
-class DataStoreFreeTabStore @Inject constructor(
-    @ApplicationContext private val context: Context
+class DataStoreFreeTabStore internal constructor(
+    private val dataStore: DataStore<Preferences>
 ) : FreeTabStore {
 
+    @Inject constructor(@ApplicationContext context: Context) : this(context.freeTabDataStore)
+
     override suspend fun lastTab(uid: String): FreeTab {
-        require(uid.isNotBlank())
-        val preferences = context.freeTabDataStore.data.first()
-        return if (preferences[OWNER_UID] == uid) FreeTab.fromStorageValue(preferences[LAST_TAB]) else FreeTab.INITIAL
+        require(uid.isNotBlank()) { "UID must not be blank" }
+        val preferences = dataStore.data.first()
+        val stored = preferences[key(uid)]
+            ?: preferences[LAST_TAB].takeIf { preferences[OWNER_UID] == uid }
+        return FreeTab.fromStorageValue(stored)
     }
 
     override suspend fun remember(uid: String, tab: FreeTab) {
-        require(uid.isNotBlank())
-        context.freeTabDataStore.edit { preferences ->
-            preferences[OWNER_UID] = uid
-            preferences[LAST_TAB] = tab.storageValue
+        require(uid.isNotBlank()) { "UID must not be blank" }
+        dataStore.edit { preferences ->
+            val oldOwner = preferences[OWNER_UID]
+            val oldTab = preferences[LAST_TAB]
+            if (!oldOwner.isNullOrBlank() && oldTab != null) {
+                val oldKey = key(oldOwner)
+                if (preferences[oldKey] == null) preferences[oldKey] = oldTab
+            }
+            preferences.remove(OWNER_UID)
+            preferences.remove(LAST_TAB)
+            preferences[key(uid)] = tab.storageValue
         }
     }
 
+    private fun key(uid: String): Preferences.Key<String> = stringPreferencesKey(
+        buildString {
+            append("last_tab_uid_")
+            uid.toByteArray(Charsets.UTF_8).forEach { byte ->
+                val value = byte.toInt() and 0xff
+                append(HEX_DIGITS[value ushr 4])
+                append(HEX_DIGITS[value and 0x0f])
+            }
+        }
+    )
+
     private companion object {
+        const val HEX_DIGITS = "0123456789abcdef"
         val OWNER_UID = stringPreferencesKey("owner_uid")
         val LAST_TAB = stringPreferencesKey("last_tab")
     }
