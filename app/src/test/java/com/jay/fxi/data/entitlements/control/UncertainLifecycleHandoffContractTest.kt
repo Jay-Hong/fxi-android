@@ -23,7 +23,8 @@ import org.junit.rules.TemporaryFolder
 /**
  * Claude-owned 6-4bC3a contract (C3/split_codex.r1.md): a current-lifetime OnceConfirm·U Lifecycle REMOVE_EMPTY_GUARD is
  * terminated by handing over its L/N responsibilities through handoffAfterUncertainConfirm, and retried on its fixed
- * TerminationPendingDescriptor.LifecycleHandoff. The other six Lifecycle transitions stay UnsupportedInThisUnit (C3b–g). The paths
+ * TerminationPendingDescriptor.LifecycleHandoff. 6-4bC3b opens REBIND_REQUESTS; the other five transitions stay UnsupportedInThisUnit
+ * (C3c–g). The paths
  * C2a locked once for every kind (the refusals before storage, cancellation, read failure, reopen) are not repeated.
  *  - The U fixture is a real REMOVE_EMPTY_GUARD execute whose Confirm landed and whose return failed (afterScope): the guard is gone
  *    and the own Lifecycle row is on disk.
@@ -46,6 +47,8 @@ class UncertainLifecycleHandoffContractTest {
     private val evidenceKey = ControlRecordKeys.payload(ControlPayloadKey.COMMAND_EVIDENCE)
     private val demandKey = ControlRecordKeys.payload(ControlKind.DEMAND)
     private val L = LandingBranch.L
+    /** The Lifecycle transitions this contract hands over so far. */
+    private val OPENED = setOf(LifecycleTransition.REMOVE_EMPTY_GUARD, LifecycleTransition.REBIND_REQUESTS)
 
     private fun store(f: TerminationFixture) = ControlRecordStore(f.storage.owner, bootReadingSource = BootReadingSource { now })
     private fun arr(p: Preferences, key: Preferences.Key<String>) = Json.parseToJsonElement(p[key] ?: "[]").jsonArray
@@ -193,9 +196,9 @@ class UncertainLifecycleHandoffContractTest {
             CompletionHandoff(dg.handoff.command, dg.handoff.responsibilityOwner, slots))
     }
 
-    @Test fun T1_03_theOtherSixTransitions_stayUnsupported() = runReleaseTest {
+    @Test fun T1_03_theTransitionsNotYetOpened_stayUnsupported() = runReleaseTest {
         val f = fixture(); val (c, d) = ready(f)
-        for (t in LifecycleTransition.entries - LifecycleTransition.REMOVE_EMPTY_GUARD) {
+        for (t in LifecycleTransition.entries - OPENED) {
             val other = f.tracker.registerPrepared(ControlLifecycleEvidenceFixtures.command(
                 ControlLifecycleEvidenceFixtures.descriptor(id = "lc-$t", transition = t), life = f.tracker.lifetimeId))
             val access = f.boundary.accesses
@@ -371,5 +374,135 @@ class UncertainLifecycleHandoffContractTest {
         assertTrue("C3a.T6_06 mismatch: a gap keeping the own row, got $pm", pm is DependencyProjection.Unknown &&
             DependencyGapCause.TerminationDescriptorMismatch in pm.gaps.map { it.cause } &&
             DependencyAtom.AppliedRow(ref.id, life.value) in pm.knownDependencies)
+    }
+
+    // ═══ C3b: REBIND_REQUESTS ═════════════════════════════════════════════════════════════════════════════════════════
+    // Measured with assessG05 before these rows (C3/C3b_probe_outputs.r1.txt): Required = BINDING L/N, REQUEST L/N for each
+    // rebound request, RECEIPT L. REQUEST L/N complete only after the rebound request is consumed by a later command; while it
+    // stands, each REQUEST slot is a G05 completion conflict.
+    private val D = DemandAuthFixtures
+
+    /** A real REBIND_REQUESTS of [count] requests (binding 2 → 3) whose Confirm landed and whose return failed. */
+    private suspend fun rebindU(f: TerminationFixture, count: Int = 1, seed: (MutablePreferences) -> Unit = {}): CommandRef {
+        val requests = (1..count).map { D.request(id = "r$it", binding = 2) }
+        f.edit { it.clear(); it += D.raw(*requests.toTypedArray()); seed(it) }
+        val c = f.store.prepareRebindRequests(requests, D.binding, LifecycleOrderSource(D.life, 21))
+        f.storage.storage.afterScope = true
+        val r = try { controlTestTimeout("REBIND execute") { f.store.execute(c, D.context(D.runtime())) } } finally { f.storage.storage.afterScope = false }
+        check(r is ControlStoreResult.Unconfirmed) { "fixture: Unconfirmed, got $r" }
+        check(f.tracker.isUnresolved(c) && f.history(c).confirmationRequested.get()) { "fixture: OnceConfirm·U" }
+        check(ownIn(f.disk(), c) == 1) { "fixture: own row landed" }
+        return c
+    }
+    private fun demandIds(p: Preferences) = arr(p, demandKey).map { it.jsonObject.getValue("id").jsonPrimitive.content }
+    /** Stands for the rebound requests consumed by a later command (T7b does it with a real SETTLE_QUERY). */
+    private suspend fun consume(f: TerminationFixture, vararg ids: String) =
+        f.edit { p -> p[demandKey] = JsonArray(arr(p.toPreferences(), demandKey).filter { it.jsonObject.getValue("id").jsonPrimitive.content !in ids }).toString() }
+
+    @Test fun T1_b01_rebindSlots_bindingRequestPerRebound_receipt_issuanceTouchesNothing() = runReleaseTest {
+        for ((count, expected) in listOf(1 to 5, 2 to 7)) {
+            val f = fixture(); val c = rebindU(f, count); consume(f, *(1..count).map { "r$it" }.toTypedArray())
+            val before = f.disk(); val work = f.tracker.recoverySnapshot()
+            val d = declare(f, c)
+            val keys = d.handoff.slots.map { it.key }
+            assertEquals("C3b.T1_b01 $count: each Required key once", d.required.map { it.key }, keys)
+            assertEquals("C3b.T1_b01 $count: count", expected, keys.size)
+            assertEquals("C3b.T1_b01 $count: components",
+                listOf(ObligationComponent.BINDING to L, ObligationComponent.BINDING to LandingBranch.N) +
+                    (1..count).flatMap { listOf(ObligationComponent.REQUEST to L, ObligationComponent.REQUEST to LandingBranch.N) } +
+                    listOf(ObligationComponent.RECEIPT to L),
+                keys.map { it.component to it.branch })
+            assertEquals("C3b.T1_b01 $count: issuance wrote nothing", before, f.disk())
+            assertEquals("C3b.T1_b01 $count: recovery sets unchanged", work, f.tracker.recoverySnapshot())
+            // Each rebound request is its own pair of slots, in input order, bound at the order it was raised.
+            val requests = d.required.filter { it.key.component == ObligationComponent.REQUEST }
+            assertEquals("C3b.T1_b01 $count: request subjects and branches",
+                (1..count).flatMap { listOf("r$it" to L, "r$it" to LandingBranch.N) },
+                requests.map { (it.key.subject as ObligationSubject.Request).id to it.key.branch })
+            assertEquals("C3b.T1_b01 $count: request lower bounds follow the raise order",
+                (1..count).flatMap { listOf(21L + it, 21L + it) },
+                requests.map { ((it.requirement as SlotRequirement.Required).lowerBound as RequiredLowerBound.Request).minimumOrder.value })
+            assertEquals("C3b.T1_b01 $count: the observation gate admits an opened transition", HandoffGateDecision.Eligible,
+                controlTestTimeout("inspect") { store(f).inspectCurrentUncertainHandoffGate(c, d.closure, d.handoff) })
+            completed("T1_b01 $count", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+        }
+    }
+
+    @Test fun T1_b03_aMissingRequestSlotAndADuplicatedOne_areRefusedByG05() = runReleaseTest {
+        val f = fixture(); val c = rebindU(f, 2); consume(f, "r1", "r2")
+        val d = declare(f, c)
+        val r2n = d.required.single { it.key.component == ObligationComponent.REQUEST && it.key.branch == LandingBranch.N &&
+            (it.key.subject as ObligationSubject.Request).id == "r2" }
+        heldFirst("T1_b03 missing r2/N", f, c, d,
+            rejected(CompletionRejectionReason.G05(listOf(G05Failure(G05Id.COVERAGE_N, r2n.key, fixedAt(r2n), null, null)))),
+            CompletionHandoff(d.handoff.command, d.handoff.responsibilityOwner, d.handoff.slots.filter { it.key != r2n.key }))
+
+        val g = fixture(); val e = rebindU(g, 2); consume(g, "r1", "r2")
+        val dg = declare(g, e)
+        val r1l = dg.handoff.slots.single { it.key.component == ObligationComponent.REQUEST && it.key.branch == L &&
+            (it.key.subject as ObligationSubject.Request).id == "r1" }
+        val slots = dg.handoff.slots + r1l
+        heldFirst("T1_b03 duplicate r1/L", g, e, dg, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures.orEmpty()
+            assertTrue("C3b.T1_b03: a DUPLICATE for r1/L at the second submission, got $r",
+                failures.any { it.id == G05Id.DUPLICATE && it.key == r1l.key && it.submittedAt == G05Location.Submitted(slots.size - 1) })
+            assertTrue("C3b.T1_b03: nothing but DUPLICATE refused: $failures", failures.isNotEmpty() && failures.all { it.id == G05Id.DUPLICATE })
+        }, CompletionHandoff(dg.handoff.command, dg.handoff.responsibilityOwner, slots))
+    }
+
+    @Test fun T1_b02_aReboundRequestStillStanding_isAG05CompletionConflict_forItsOwnSlotsOnly() = runReleaseTest {
+        val f = fixture(); val c = rebindU(f, 2); consume(f, "r1")
+        val d = declare(f, c)
+        val standing = d.required.filter { it.key.component == ObligationComponent.REQUEST }.drop(2)
+        check(standing.size == 2) { "fixture: r2's two REQUEST slots" }
+        heldFirst("T1_b02", f, c, d, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures
+            assertEquals("C3b.T1_b02: completion conflicts on r2's REQUEST L and N only, got $r",
+                standing.map { it.key }.toSet(), failures?.filter { it.id == G05Id.COMPLETED_CONFLICT }?.map { it.key }?.toSet())
+            assertTrue("C3b.T1_b02: nothing else refused: $failures", failures.orEmpty().all { it.id == G05Id.COMPLETED_CONFLICT })
+        })
+    }
+
+    @Test fun T5_b01_exactOwnRow_onlyItRemoved_otherDemandsKept() = runReleaseTest {
+        val f = fixture()
+        val other = D.request(id = "other", binding = 9)
+        val c = rebindU(f) { p -> p[demandKey] = JsonArray(arr(p.toPreferences(), demandKey) + Json.parseToJsonElement(other.toPayloadEntry().fields.toString())).toString() }
+        consume(f, "r1")
+        check(demandIds(f.disk()) == listOf("other")) { "fixture: only the unrelated request left" }
+        val d = declare(f, c); val before = f.disk()
+        completed("T5_b01", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+        assertEquals("the unrelated request kept", listOf("other"), demandIds(f.disk()))
+    }
+
+    @Test fun T5_b02_wholeAbsenceAtTheFirstRead_confirmed() = runReleaseTest {
+        val f = fixture(); val c = rebindU(f); consume(f, "r1"); absent(f, c)
+        val d = declare(f, c); val before = f.disk()
+        completed("T5_b02", f, c, handoff(f, c, d), withoutBarrier(before))
+    }
+
+    @Test fun T6_b01_writeFaultFixesARebindDescriptor_retryDeletes() = runReleaseTest {
+        val f = fixture(); val c = rebindU(f); consume(f, "r1")
+        val d = declare(f, c); val before = f.disk()
+        val fixed = pendingByWriteFault(f, c, d)
+        assertEquals(LifecycleTransition.REBIND_REQUESTS, fixed.transition)
+        assertNotNull("exact own fixed", fixed.expectedOwn)
+        assertEquals("nothing landed", before, f.disk())
+        completed("T6_b01", f, c, retry(f, c, d), expectedAfterDeletion(before, c))
+    }
+
+    /** The rebound request (owner A, binding 3, origin life, raised at 22) consumed by a real SETTLE_QUERY at order 24. */
+    @Test fun T7_b01_aRealSettleQueryConsumesTheReboundRequest_thenTheRebindHandsOver() = runReleaseTest {
+        val f = fixture(); val c = rebindU(f)
+        val started = StartedQueryV1(D.fence, 5, D.identity, EventOrderV1(D.life, 24), 3, com.jay.fxi.data.entitlements.RefreshIntent.FORCE_PREMIUM, 0)
+        val request = D.node(arr(f.disk(), demandKey).single { it.jsonObject.getValue("id").jsonPrimitive.content == "r1" }.toString())
+        val s = f.store.prepareSettleQuery(listOf(request), null, null, D.binding, D.decision(q = started), LifecycleOrderSource(D.life, 24))
+        val rs = controlTestTimeout("settle") { f.store.execute(s, D.context(D.runtime(registrations = listOf(LifecycleQueryRegistration("query-21", started))))) }
+        assertTrue("fixture: SETTLE_QUERY Confirmed, got $rs", rs is ControlStoreResult.Confirmed)
+        assertTrue("fixture: the rebound request consumed", "r1" !in demandIds(f.disk()))
+        val consumed = controlTestTimeout("settle consumed") {
+            f.store.completeLifecycleAfterConsumption(s, closure(s), RotationConsumption(resultConsumed = true, followUpCompletedOrDurablyOwned = true)) }
+        assertTrue("fixture: the settle query's result consumed, got $consumed", consumed is ControlCompletionResult.Completed)
+        val d = declare(f, c); val before = f.disk()
+        completed("T7_b01", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
     }
 }

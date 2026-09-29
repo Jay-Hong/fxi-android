@@ -13,6 +13,11 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 
+private val LIFECYCLE_HANDOFF_TRANSITIONS = setOf(
+    LifecycleTransition.REMOVE_EMPTY_GUARD,
+    LifecycleTransition.REBIND_REQUESTS
+)
+
 /**
  * Unwired D2a/D2b facade. Uses only the owner's record transaction API; never owns a DataStore, lock,
  * read-back flag or barrier. Inputs are prepared once, then all targets are resolved by id against
@@ -486,7 +491,7 @@ internal class ControlRecordStore(
                         descriptor.entry == TerminationEntry.UncertainLifecycle)
                     val lifecycle = body as? ControlCommandBody.Lifecycle
                         ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
-                    if (lifecycle.input.transition != LifecycleTransition.REMOVE_EMPTY_GUARD)
+                    if (lifecycle.input.transition !in LIFECYCLE_HANDOFF_TRANSITIONS)
                         return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
                     check(descriptor.transition == lifecycle.input.transition &&
                         lifecycle.input.operationId == command.id &&
@@ -1073,7 +1078,7 @@ internal class ControlRecordStore(
                 body !is ControlCommandBody.SettleRetiredNull &&
                 body !is ControlCommandBody.RotateAndSettleCurrentNull &&
                 (body !is ControlCommandBody.Lifecycle ||
-                    body.input.transition != LifecycleTransition.REMOVE_EMPTY_GUARD))
+                    body.input.transition !in LIFECYCLE_HANDOFF_TRANSITIONS))
                 return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
             if (!tracking.isUnresolved(command))
                 return completionRejected(command, CompletionRejectionReason.NotUnresolved)
@@ -1119,7 +1124,7 @@ internal class ControlRecordStore(
             val body = command.captureStateAndBody().body
                 ?: return handoffRejected(CompletionRejectionReason.UnsupportedInThisUnit)
             if (body is ControlCommandBody.Lifecycle &&
-                body.input.transition != LifecycleTransition.REMOVE_EMPTY_GUARD)
+                body.input.transition !in LIFECYCLE_HANDOFF_TRANSITIONS)
                 return handoffRejected(CompletionRejectionReason.UnsupportedInThisUnit)
             if (!tracking.isUnresolved(command)) return HandoffGateDecision.Rejected(HandoffGateRefusal.NotUnresolved)
             if (!tracked.confirmationRequested.get())
