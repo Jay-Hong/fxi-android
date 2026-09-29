@@ -404,8 +404,8 @@ class UncertainMutationsHandoffContractTest {
     /** N1d: a registered ref whose fixed body is not Mutations is not handled by this entrance (C2/C3). */
     @Test fun N1d_nonMutationsBody_unsupportedInThisUnit() = runReleaseTest {
         val c = noopEdit(); val d = declare(c, completed = false)
-        val s = CurrentNullFixtures.spec()
-        val settlement = fx.tracker.registerPrepared(CurrentNullFixtures.command(s, fx.tracker.lifetimeId))
+        // A body this unit does not hand over: a Lifecycle command (C3). R and N settlements are opened by 6-4bC2b/C2c.
+        val settlement = fx.tracker.registerPrepared(ControlLifecycleEvidenceFixtures.command(life = fx.tracker.lifetimeId))
         val accesses = fx.boundary.accesses
         rejected(controlTestTimeout("non-mutations") { store().handoffAfterUncertainConfirm(settlement, TerminationClosures.of(settlement), d.handoff) },
             CompletionRejectionReason.UnsupportedInThisUnit)

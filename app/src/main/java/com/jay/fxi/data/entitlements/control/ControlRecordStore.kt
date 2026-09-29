@@ -461,8 +461,11 @@ internal class ControlRecordStore(
                 is TerminationPendingDescriptor.SettlementHandoff -> {
                     check(descriptor.mode == CompletionMode.ResponsibilityTransferred &&
                         descriptor.entry == TerminationEntry.UncertainSettlement)
-                    val settlement = body as? ControlCommandBody.SettleRetiredNamespace
-                        ?: return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+                    val settlement: ControlCommandBody.Handover = when (body) {
+                        is ControlCommandBody.SettleRetiredNamespace,
+                        is ControlCommandBody.RotateAndSettleCurrentNull -> body
+                        else -> return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
+                    }
                     val authority = checkNotNull(ControlSettlementConsumption.authority(settlement.input)) {
                         "fixed settlement handoff input became unreadable"
                     }
@@ -692,7 +695,11 @@ internal class ControlRecordStore(
                 } else if (request is TerminationRequest.FirstSettlementHandoff ||
                     (request is TerminationRequest.Retry &&
                         request.descriptor is TerminationPendingDescriptor.SettlementHandoff)) {
-                    val settlement = body as ControlCommandBody.SettleRetiredNamespace
+                    val settlement: ControlCommandBody.Handover = when (body) {
+                        is ControlCommandBody.SettleRetiredNamespace,
+                        is ControlCommandBody.RotateAndSettleCurrentNull -> body
+                        else -> error("unsupported settlement handoff body")
+                    }
                     val input = settlement.input
                     if (request is TerminationRequest.FirstSettlementHandoff) {
                         when (val gate = assessHandoffAtOwner(command,
@@ -999,7 +1006,8 @@ internal class ControlRecordStore(
                 ?: return completionRejected(command, CompletionRejectionReason.NotRegisteredIdentity)
             val body = command.captureStateAndBody().body
             if (body !is ControlCommandBody.Mutations && body !is ControlCommandBody.RotateAndSettle &&
-                body !is ControlCommandBody.SettleRetiredNamespace)
+                body !is ControlCommandBody.SettleRetiredNamespace &&
+                body !is ControlCommandBody.RotateAndSettleCurrentNull)
                 return completionRejected(command, CompletionRejectionReason.UnsupportedInThisUnit)
             if (!tracking.isUnresolved(command))
                 return completionRejected(command, CompletionRejectionReason.NotUnresolved)
@@ -1013,7 +1021,8 @@ internal class ControlRecordStore(
             return terminationAttempt(command, tracked, closure, body, when (body) {
                 is ControlCommandBody.Mutations -> TerminationRequest.FirstMutationsHandoff(handoff)
                 is ControlCommandBody.RotateAndSettle -> TerminationRequest.FirstRotationHandoff(handoff)
-                is ControlCommandBody.SettleRetiredNamespace -> TerminationRequest.FirstSettlementHandoff(handoff)
+                is ControlCommandBody.SettleRetiredNamespace,
+                is ControlCommandBody.RotateAndSettleCurrentNull -> TerminationRequest.FirstSettlementHandoff(handoff)
                 else -> error("unsupported handoff body")
             })
         } finally {

@@ -259,10 +259,9 @@ class UncertainRotationHandoffContractTest {
         refused("notOnceConfirm", notU, CompletionRejectionReason.NotOnceConfirm)
         refused("otherHandoffRef", c, CompletionRejectionReason.DeclarationRefMismatch, dg.handoff)
         refused("closureOpen", c, CompletionRejectionReason.ClosureNotSatisfied(ClosureViolation.EntriesOpen), k = closure(c, entriesClosed = false))
-        // 6-4bC2b opened R; a settlement body not yet opened (the current NULL settlement, C2c) stays unsupported.
-        val settlement = CurrentNullFixtures.spec()
-        val s = f.tracker.registerPrepared(CommandRef(settlement.operationId, ControlCommandBody.RotateAndSettleCurrentNull(settlement), f.tracker.lifetimeId))
-        refused("settlementBody", s, CompletionRejectionReason.UnsupportedInThisUnit)
+        // A body this unit does not hand over: a Lifecycle command (C3). R and N settlements are opened by 6-4bC2b/C2c.
+        val s = f.tracker.registerPrepared(ControlLifecycleEvidenceFixtures.command(life = f.tracker.lifetimeId))
+        refused("unsupportedBody", s, CompletionRejectionReason.UnsupportedInThisUnit)
         // Pending and terminal refs, on a fresh fixture (the refs above reference the seal "s" and would block by G11).
         val h = fixture(); val (p, dp) = ready(h)
         pendingByWriteFault(h, p, dp)
