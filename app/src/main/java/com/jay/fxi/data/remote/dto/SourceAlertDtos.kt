@@ -2,6 +2,8 @@ package com.jay.fxi.data.remote.dto
 
 import com.jay.fxi.domain.model.AlertCondition
 import com.jay.fxi.domain.model.SourceAlertSetting
+import com.jay.fxi.util.InstantSerializer
+import kotlinx.datetime.Instant
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -36,4 +38,25 @@ data class SourceAlertSettingUpdateRequest(
     val threshold: Double? = null,
     @SerialName("is_enabled") val isEnabled: Boolean? = null,
     @SerialName("repeat_interval_sec") val repeatIntervalSec: JsonElement? = null
+)
+
+/** One delivered source alert (GET /api/source-notification-logs; server SourceNotificationLogResponse, iOS SourceAlertHistoryItem). */
+@Serializable
+data class SourceAlertHistoryItem(
+    val id: Int,
+    @SerialName("setting_id") val settingId: Int?,
+    val source: String,
+    val asset: String,
+    val condition: AlertCondition,
+    val threshold: Double,
+    /** The rate that fired it. */
+    @SerialName("triggered_rate") val triggeredRate: Double,
+    @SerialName("sent_at") @Serializable(with = InstantSerializer::class) val sentAt: Instant
+)
+
+/** Delivered source alerts, newest first; total_count is the page length. */
+@Serializable
+data class SourceAlertHistoryResponse(
+    val logs: List<SourceAlertHistoryItem>,
+    @SerialName("total_count") val totalCount: Int
 )

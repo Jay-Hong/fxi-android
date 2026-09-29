@@ -12,6 +12,7 @@ import com.jay.fxi.data.remote.AuthenticatedHttpResponse
 import com.jay.fxi.data.remote.dto.AlertHistoryItem
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
+import com.jay.fxi.data.remote.dto.SourceAlertHistoryItem
 import com.jay.fxi.data.remote.dto.SourceAlertSettingRequest
 import com.jay.fxi.data.remote.dto.SourceAlertSettingUpdateRequest
 import com.jay.fxi.domain.model.AlertSetting
@@ -67,6 +68,17 @@ class AlertRepository @Inject constructor(
             val response = apiService.deleteSourceNotificationSetting(snapshot, id)
             response.failure?.let { throw AuthenticatedApiException(it) }
         }
+
+    /** Delivered source alerts, newest first; [asset] null is every asset, [limit] 1..200 (server caps). */
+    suspend fun getSourceHistory(
+        owner: AuthIdentityFence,
+        asset: String? = null,
+        limit: Int = 100
+    ): AuthBoundResult<List<SourceAlertHistoryItem>> = safeApiCall(owner) { snapshot ->
+        apiService.getSourceNotificationLogs(snapshot, asset, limit)
+            .requireBody("GET /api/source-notification-logs")
+            .logs
+    }
 
     /** Delivered bank alerts, newest first; [currency] null is every currency, [limit] 1..200 (server caps). */
     suspend fun getHistory(

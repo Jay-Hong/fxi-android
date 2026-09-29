@@ -11,6 +11,7 @@ import com.jay.fxi.data.remote.dto.FreeSnapshotResponse
 import com.jay.fxi.data.remote.dto.GraphV2CatalogResponse
 import com.jay.fxi.data.remote.dto.GraphV2TabResponse
 import com.jay.fxi.data.remote.dto.NotificationSettingsResponse
+import com.jay.fxi.data.remote.dto.SourceAlertHistoryResponse
 import com.jay.fxi.data.remote.dto.SourceAlertSettingRequest
 import com.jay.fxi.data.remote.dto.SourceAlertSettingUpdateRequest
 import com.jay.fxi.data.remote.dto.SourceAlertSettingsResponse
@@ -89,6 +90,13 @@ internal interface AuthenticatedApiService {
     suspend fun deleteSourceNotificationSetting(
         @Tag auth: AuthRequestTag,
         @Path("id") id: Int
+    ): Response<ResponseBody>
+
+    @GET("api/source-notification-logs")
+    suspend fun getSourceNotificationLogs(
+        @Tag auth: AuthRequestTag,
+        @Query("asset") asset: String?,
+        @Query("limit") limit: Int
     ): Response<ResponseBody>
 
     @GET("api/v2/graph/catalog")
@@ -252,6 +260,16 @@ class AuthenticatedApiClient internal constructor(
         transport.executeMutation(owner) { service.deleteSourceNotificationSetting(it, id) }
             .preserve(AuthenticatedEndpoint.DELETE_SOURCE_NOTIFICATION_SETTING)
             .asUnit()
+
+    /** GET /api/source-notification-logs (delivered source alerts). */
+    suspend fun getSourceNotificationLogs(
+        owner: AuthSnapshot,
+        asset: String?,
+        limit: Int
+    ): AuthenticatedHttpResponse<SourceAlertHistoryResponse> =
+        transport.executeRead(owner) { service.getSourceNotificationLogs(it, asset, limit) }
+            .preserve(AuthenticatedEndpoint.SOURCE_NOTIFICATION_LOGS)
+            .decodeSuccess(wireJson)
 
     /** GET /api/v2/graph/catalog (premium; KRX series only when the user may see them). */
     suspend fun getGraphV2Catalog(
