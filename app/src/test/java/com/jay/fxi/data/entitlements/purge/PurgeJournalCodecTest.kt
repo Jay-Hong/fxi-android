@@ -262,7 +262,8 @@ class PurgeJournalCodecTest {
     }
 
     /**
-     * Nothing in the app reaches this codec yet — the slice boundary, checked rather than asserted.
+     * Nothing in the app reaches this codec yet except the unwired P2-J snapshot reader — the slice boundary, checked
+     * rather than asserted (PurgeControlSnapshotReaderContractTest.J18 locks that nothing reaches the reader).
      *
      * P2a supplies the reader and leaves `DataStoreAccessEpochStore` on its own four-field decoder,
      * which still turns a five-field line into the widest obligation. The day that changes is a
@@ -272,7 +273,7 @@ class PurgeJournalCodecTest {
     fun `no production code references this codec yet`() {
         val sources = File("src/main/java/com/jay/fxi").walkTopDown().filter { it.extension == "kt" }
         val referencing = sources
-            .filter { it.name != "PurgeJournalCodec.kt" && it.readText().contains("PurgeJournalCodec") }
+            .filter { it.name !in setOf("PurgeJournalCodec.kt", "PurgeControlSnapshotReader.kt") && it.readText().contains("PurgeJournalCodec") }
             .map { it.name }
             .toList()
 
