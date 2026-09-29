@@ -8,6 +8,8 @@ import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
 import com.jay.fxi.data.remote.dto.DeviceRequest
 import com.jay.fxi.data.remote.dto.EntitlementsResponse
 import com.jay.fxi.data.remote.dto.FreeSnapshotResponse
+import com.jay.fxi.data.remote.dto.GraphV2CatalogResponse
+import com.jay.fxi.data.remote.dto.GraphV2TabResponse
 import com.jay.fxi.data.remote.dto.NotificationSettingsResponse
 import com.jay.fxi.domain.model.AlertSetting
 import javax.inject.Singleton
@@ -58,6 +60,18 @@ internal interface AuthenticatedApiService {
     @GET("api/notification-settings")
     suspend fun getNotificationSettings(
         @Tag auth: AuthRequestTag
+    ): Response<ResponseBody>
+
+    @GET("api/v2/graph/catalog")
+    suspend fun getGraphV2Catalog(
+        @Tag auth: AuthRequestTag
+    ): Response<ResponseBody>
+
+    @GET("api/v2/graph/tab")
+    suspend fun getGraphV2Tab(
+        @Tag auth: AuthRequestTag,
+        @Query("tab") tab: String,
+        @Query("period") period: String
     ): Response<ResponseBody>
 
     @GET("api/notification-logs")
@@ -175,6 +189,24 @@ class AuthenticatedApiClient internal constructor(
     ): AuthenticatedHttpResponse<NotificationSettingsResponse> =
         transport.executeRead(owner) { service.getNotificationSettings(it) }
             .preserve(AuthenticatedEndpoint.NOTIFICATION_SETTINGS)
+            .decodeSuccess(wireJson)
+
+    /** GET /api/v2/graph/catalog (premium; KRX series only when the user may see them). */
+    suspend fun getGraphV2Catalog(
+        owner: AuthSnapshot
+    ): AuthenticatedHttpResponse<GraphV2CatalogResponse> =
+        transport.executeRead(owner) { service.getGraphV2Catalog(it) }
+            .preserve(AuthenticatedEndpoint.GRAPH_V2_CATALOG)
+            .decodeSuccess(wireJson)
+
+    /** GET /api/v2/graph/tab?tab=&period= (premium; period "1d" / "1w" / "3m" / "1y"). */
+    suspend fun getGraphV2Tab(
+        owner: AuthSnapshot,
+        tab: String,
+        period: String
+    ): AuthenticatedHttpResponse<GraphV2TabResponse> =
+        transport.executeRead(owner) { service.getGraphV2Tab(it, tab, period) }
+            .preserve(AuthenticatedEndpoint.GRAPH_V2_TAB)
             .decodeSuccess(wireJson)
 
     /** GET /api/notification-logs (delivered bank alerts). */

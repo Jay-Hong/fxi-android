@@ -19,6 +19,8 @@ internal enum class AuthenticatedEndpoint {
     UPDATE_NOTIFICATION_SETTING,
     DELETE_NOTIFICATION_SETTING,
     DELETE_USER,
+    GRAPH_V2_CATALOG,
+    GRAPH_V2_TAB,
 
     /**
      * `GET /api/entitlements`.
@@ -196,7 +198,7 @@ private fun classifyFailure(
     return when (statusCode) {
         401 -> AuthenticatedFailureKind.AUTHENTICATION
         403 -> if (
-            endpoint in NOTIFICATION_ENDPOINTS &&
+            endpoint in PREMIUM_REQUIRED_ENDPOINTS &&
             error == null &&
             detailText == "Premium subscription required"
         ) {
@@ -218,9 +220,11 @@ private fun classifyFailure(
     }
 }
 
-private val NOTIFICATION_ENDPOINTS = setOf(
+private val PREMIUM_REQUIRED_ENDPOINTS = setOf(
     AuthenticatedEndpoint.NOTIFICATION_SETTINGS,
     AuthenticatedEndpoint.NOTIFICATION_LOGS,
     AuthenticatedEndpoint.UPDATE_NOTIFICATION_SETTING,
-    AuthenticatedEndpoint.DELETE_NOTIFICATION_SETTING
+    AuthenticatedEndpoint.DELETE_NOTIFICATION_SETTING,
+    AuthenticatedEndpoint.GRAPH_V2_CATALOG,
+    AuthenticatedEndpoint.GRAPH_V2_TAB
 )
