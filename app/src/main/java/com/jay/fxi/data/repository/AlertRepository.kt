@@ -9,6 +9,7 @@ import com.jay.fxi.data.remote.AuthenticatedBodyDecodingException
 import com.jay.fxi.data.remote.AuthenticatedFailureKind
 import com.jay.fxi.data.remote.AuthenticatedHttpFailure
 import com.jay.fxi.data.remote.AuthenticatedHttpResponse
+import com.jay.fxi.data.remote.dto.AlertHistoryItem
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
 import com.jay.fxi.domain.model.AlertSetting
@@ -35,6 +36,17 @@ class AlertRepository @Inject constructor(
                 .requireBody("GET /api/notification-settings")
                 .settings
         }
+
+    /** Delivered bank alerts, newest first; [currency] null is every currency, [limit] 1..200 (server caps). */
+    suspend fun getHistory(
+        owner: AuthIdentityFence,
+        currency: String? = null,
+        limit: Int = 100
+    ): AuthBoundResult<List<AlertHistoryItem>> = safeApiCall(owner) { snapshot ->
+        apiService.getNotificationLogs(snapshot, currency, limit)
+            .requireBody("GET /api/notification-logs")
+            .logs
+    }
 
     suspend fun createSetting(
         owner: AuthIdentityFence,

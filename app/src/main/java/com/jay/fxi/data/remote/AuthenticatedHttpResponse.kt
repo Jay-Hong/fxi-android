@@ -15,6 +15,7 @@ internal enum class AuthenticatedEndpoint {
     REGISTER_DEVICE,
     UNREGISTER_DEVICE,
     NOTIFICATION_SETTINGS,
+    NOTIFICATION_LOGS,
     UPDATE_NOTIFICATION_SETTING,
     DELETE_NOTIFICATION_SETTING,
     DELETE_USER,
@@ -219,6 +220,7 @@ private fun classifyFailure(
 
 private val NOTIFICATION_ENDPOINTS = setOf(
     AuthenticatedEndpoint.NOTIFICATION_SETTINGS,
+    AuthenticatedEndpoint.NOTIFICATION_LOGS,
     AuthenticatedEndpoint.UPDATE_NOTIFICATION_SETTING,
     AuthenticatedEndpoint.DELETE_NOTIFICATION_SETTING
 )

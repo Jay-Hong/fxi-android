@@ -2,6 +2,7 @@ package com.jay.fxi.data.remote
 
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
+import com.jay.fxi.data.remote.dto.AlertHistoryResponse
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
 import com.jay.fxi.data.remote.dto.DeviceRequest
@@ -57,6 +58,13 @@ internal interface AuthenticatedApiService {
     @GET("api/notification-settings")
     suspend fun getNotificationSettings(
         @Tag auth: AuthRequestTag
+    ): Response<ResponseBody>
+
+    @GET("api/notification-logs")
+    suspend fun getNotificationLogs(
+        @Tag auth: AuthRequestTag,
+        @Query("currency") currency: String?,
+        @Query("limit") limit: Int
     ): Response<ResponseBody>
 
     @POST("api/notification-settings")
@@ -167,6 +175,16 @@ class AuthenticatedApiClient internal constructor(
     ): AuthenticatedHttpResponse<NotificationSettingsResponse> =
         transport.executeRead(owner) { service.getNotificationSettings(it) }
             .preserve(AuthenticatedEndpoint.NOTIFICATION_SETTINGS)
+            .decodeSuccess(wireJson)
+
+    /** GET /api/notification-logs (delivered bank alerts). */
+    suspend fun getNotificationLogs(
+        owner: AuthSnapshot,
+        currency: String?,
+        limit: Int
+    ): AuthenticatedHttpResponse<AlertHistoryResponse> =
+        transport.executeRead(owner) { service.getNotificationLogs(it, currency, limit) }
+            .preserve(AuthenticatedEndpoint.NOTIFICATION_LOGS)
             .decodeSuccess(wireJson)
 
     suspend fun createNotificationSetting(
