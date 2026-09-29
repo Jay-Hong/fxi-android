@@ -23,8 +23,8 @@ import org.junit.rules.TemporaryFolder
 /**
  * Claude-owned 6-4bC3a contract (C3/split_codex.r1.md): a current-lifetime OnceConfirm·U Lifecycle REMOVE_EMPTY_GUARD is
  * terminated by handing over its L/N responsibilities through handoffAfterUncertainConfirm, and retried on its fixed
- * TerminationPendingDescriptor.LifecycleHandoff. 6-4bC3b opens REBIND_REQUESTS and 6-4bC3c SETTLE_QUERY; the other four transitions stay
- * UnsupportedInThisUnit (C3d–g). The paths
+ * TerminationPendingDescriptor.LifecycleHandoff. 6-4bC3b opens REBIND_REQUESTS, 6-4bC3c SETTLE_QUERY and 6-4bC3d UPDATE_AUTH; the other
+ * three transitions stay UnsupportedInThisUnit (C3e–g). The paths
  * C2a locked once for every kind (the refusals before storage, cancellation, read failure, reopen) are not repeated.
  *  - The U fixture is a real REMOVE_EMPTY_GUARD execute whose Confirm landed and whose return failed (afterScope): the guard is gone
  *    and the own Lifecycle row is on disk.
@@ -48,7 +48,8 @@ class UncertainLifecycleHandoffContractTest {
     private val demandKey = ControlRecordKeys.payload(ControlKind.DEMAND)
     private val L = LandingBranch.L
     /** The Lifecycle transitions this contract hands over so far. */
-    private val OPENED = setOf(LifecycleTransition.REMOVE_EMPTY_GUARD, LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.SETTLE_QUERY)
+    private val OPENED = setOf(LifecycleTransition.REMOVE_EMPTY_GUARD, LifecycleTransition.REBIND_REQUESTS, LifecycleTransition.SETTLE_QUERY,
+        LifecycleTransition.UPDATE_AUTH)
 
     private fun store(f: TerminationFixture) = ControlRecordStore(f.storage.owner, bootReadingSource = BootReadingSource { now })
     private fun arr(p: Preferences, key: Preferences.Key<String>) = Json.parseToJsonElement(p[key] ?: "[]").jsonArray
@@ -643,5 +644,101 @@ class UncertainLifecycleHandoffContractTest {
         assertNotNull("exact own fixed", fixed.expectedOwn)
         assertEquals("nothing landed", before, f.disk())
         completed("T6_c01", f, c, retry(f, c, d), expectedAfterDeletion(before, c))
+    }
+
+    // ═══ C3d: UPDATE_AUTH ═════════════════════════════════════════════════════════════════════════════════════════════
+    // Measured with assessG05 before these rows (C3/C3d_probe_outputs.r1.txt), for an Answer that leaves a Pending floor and a retry
+    // request: Required = BINDING L/N, QUERY L/N, FLOOR L/N (durably owned only), AUTH L/N, REQUEST L/N for the retry request, and
+    // RECEIPT L. The floor is retained on the guard and the retry request on itself. While the changed AUTH stands, its L is retained
+    // on the guard and its N cannot complete; once that AUTH is closed (the guard keeps its floor), AUTH L/N complete.
+    private val pendingAnswer get() = LifecycleAuthEvent.Answer(D.decision(outcome = com.jay.fxi.data.entitlements.EntitlementsOutcome.Pending(false, 30)))
+
+    /** A real UPDATE_AUTH (Pending answer) on the auth guard g whose Confirm landed and whose return failed. */
+    private suspend fun updateAuthU(f: TerminationFixture): CommandRef {
+        f.edit { it.clear(); it += D.raw(D.guard()) }
+        val c = f.store.prepareUpdateAuth(D.guard(), null, D.binding, pendingAnswer, LifecycleOrderSource(D.life, 21))
+        f.storage.storage.afterScope = true
+        val r = try { controlTestTimeout("UPDATE_AUTH execute") { f.store.execute(c, D.context(D.runtime())) } } finally { f.storage.storage.afterScope = false }
+        check(r is ControlStoreResult.Unconfirmed) { "fixture: Unconfirmed, got $r" }
+        check(f.tracker.isUnresolved(c) && f.history(c).confirmationRequested.get()) { "fixture: OnceConfirm·U" }
+        check(ownIn(f.disk(), c) == 1) { "fixture: own row landed" }
+        return c
+    }
+    /** Stands for a later command closing the guard's AUTH: the auth field goes, the floor stays. */
+    private suspend fun closeAuth(f: TerminationFixture) = f.edit { p ->
+        p[demandKey] = checkNotNull(p[demandKey]).replace(Regex("\"auth\":\\{[^}]*\\},"), "").also { check(it != p[demandKey]) { "fixture: auth closed" } } }
+    /** The floor on the guard and the retry request on itself; [authL] also retains AUTH L on the guard. */
+    private fun retainFloorAndRequest(authL: Boolean = false): (RequiredSlot) -> DestinationLocator? = { slot ->
+        val bound = (slot.requirement as SlotRequirement.Required).lowerBound
+        when {
+            bound is RequiredLowerBound.Floor -> DestinationLocator.Guard(bound.sourceId, GuardPart.FLOOR)
+            bound is RequiredLowerBound.Request -> DestinationLocator.Payload(ControlKind.DEMAND, bound.requiredId)
+            authL && slot.key.component == ObligationComponent.AUTH && slot.key.branch == L -> DestinationLocator.Guard("g", GuardPart.AUTH)
+            else -> null
+        }
+    }
+
+    @Test fun T1_d01_updateAuthSlots_floorAndRequestRetained_authClosed_completes() = runReleaseTest {
+        val f = fixture(); val c = updateAuthU(f); closeAuth(f)
+        val d = declare(f, c, retainFloorAndRequest())
+        assertEquals("C3d.T1_d01: components",
+            listOf(ObligationComponent.BINDING to L, ObligationComponent.BINDING to LandingBranch.N,
+                ObligationComponent.QUERY to L, ObligationComponent.QUERY to LandingBranch.N,
+                ObligationComponent.FLOOR to L, ObligationComponent.FLOOR to LandingBranch.N,
+                ObligationComponent.AUTH to L, ObligationComponent.AUTH to LandingBranch.N,
+                ObligationComponent.REQUEST to L, ObligationComponent.REQUEST to LandingBranch.N,
+                ObligationComponent.RECEIPT to L),
+            d.handoff.slots.map { it.key.component to it.key.branch })
+        assertEquals("C3d.T1_d01: the observation gate admits it", HandoffGateDecision.Eligible,
+            controlTestTimeout("inspect") { store(f).inspectCurrentUncertainHandoffGate(c, d.closure, d.handoff) })
+        val before = f.disk()
+        completed("T1_d01", f, c, handoff(f, c, d), expectedAfterDeletion(before, c))
+        assertEquals("C3d.T1_d01: the guard and the retry request stay", demandIds(before), demandIds(f.disk()))
+    }
+
+    @Test fun T3_d01_aChangedAuthStanding_retainsItsL_butItsNCannotComplete() = runReleaseTest {
+        val f = fixture(); val c = updateAuthU(f)
+        val d = declare(f, c, retainFloorAndRequest(authL = true))
+        val authN = component(d, ObligationComponent.AUTH, LandingBranch.N)
+        heldFirst("T3_d01", f, c, d, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures.orEmpty()
+            assertEquals("C3d.T3_d01: only AUTH N conflicts, got $r", listOf(G05Id.COMPLETED_CONFLICT to authN.key), failures.map { it.id to it.key }.distinct())
+        })
+    }
+
+    @Test fun T3_d02_theFloorCannotBeDeclaredCompleted_itIsDurablyOwnedOnly() = runReleaseTest {
+        val f = fixture(); val c = updateAuthU(f); closeAuth(f)
+        // The coordinator will not issue it, so the declaration is forged from a valid one: FLOOR L completed instead of retained.
+        val d = declare(f, c, retainFloorAndRequest())
+        val floorL = component(d, ObligationComponent.FLOOR, L)
+        val forged = CompletionHandoff(d.handoff.command, d.handoff.responsibilityOwner, d.handoff.slots.map {
+            if (it.key == floorL.key) SlotHandoff(it.key, HandoffDisposition.CompletedAndConsumed(ComponentCompletion(it.key.subject), emptyList())) else it })
+        heldFirst("T3_d02", f, c, d, { r ->
+            val failures = ((r as? ControlCompletionResult.Rejected)?.reason as? CompletionRejectionReason.G05)?.failures.orEmpty()
+            assertEquals("C3d.T3_d02: FLOOR L completed is a completion conflict, got $r",
+                listOf(G05Id.COMPLETED_CONFLICT to floorL.key), failures.map { it.id to it.key }.distinct())
+        }, forged)
+    }
+
+    @Test fun T3_d03_aMissingFloorN_isCoverage() = runReleaseTest {
+        val f = fixture(); val c = updateAuthU(f); closeAuth(f)
+        val d = declare(f, c, retainFloorAndRequest())
+        val floorN = component(d, ObligationComponent.FLOOR, LandingBranch.N)
+        heldFirst("T3_d03", f, c, d,
+            rejected(CompletionRejectionReason.G05(listOf(G05Failure(G05Id.COVERAGE_N, floorN.key, fixedAt(floorN), null, null)))),
+            CompletionHandoff(d.handoff.command, d.handoff.responsibilityOwner, d.handoff.slots.filter { it.key != floorN.key }))
+    }
+
+    @Test fun T6_d01_writeFaultFixesAnUpdateAuthDescriptor_retryDeletesWithoutTheFirstDestinations() = runReleaseTest {
+        val f = fixture(); val c = updateAuthU(f); closeAuth(f)
+        val d = declare(f, c, retainFloorAndRequest()); val before = f.disk()
+        val fixed = pendingByWriteFault(f, c, d)
+        assertEquals(LifecycleTransition.UPDATE_AUTH, fixed.transition)
+        assertNotNull("exact own fixed", fixed.expectedOwn)
+        assertEquals("nothing landed", before, f.disk())
+        // The destinations the first decision named are gone; the retry does not ask for them again.
+        f.edit { p -> p[demandKey] = "[]" }
+        val beforeRetry = f.disk()
+        completed("T6_d01", f, c, retry(f, c, d), expectedAfterDeletion(beforeRetry, c))
     }
 }

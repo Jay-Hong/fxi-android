@@ -16,7 +16,8 @@ import kotlinx.coroutines.CancellationException
 private val LIFECYCLE_HANDOFF_TRANSITIONS = setOf(
     LifecycleTransition.REMOVE_EMPTY_GUARD,
     LifecycleTransition.REBIND_REQUESTS,
-    LifecycleTransition.SETTLE_QUERY
+    LifecycleTransition.SETTLE_QUERY,
+    LifecycleTransition.UPDATE_AUTH
 )
 
 /**
