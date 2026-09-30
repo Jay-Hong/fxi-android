@@ -283,7 +283,7 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > **동결 후 15번 비의미 정합 보정 기록(2026-09-17, Claude·Codex 검토).** 14번이 바꾼 규범을 같은 규칙이 적힌 다른 자리에 연결하고, 14번 기록이 빠뜨린 대상·근거를 여기서 정정한다. 9번을 13번이 정정한 방식과 같게 14번 기록 본문은 고치지 않는다.
 > (A) 14번의 개정 대상 선언은 "§7 S1의 clean cold start와 동결 후 8·9·10번"만 들었지만 같은 결정이 **O5 회수 범위 문단**과 §3 불변식 I4·D23의 cold start 서술에도 미친다. 특히 O5는 "명시적 거부 없이 보존 namespace를 purge하지 않는다"를 보장으로 두고 예외를 로그아웃 의도 하나로만 열어 두었으므로, 미정산 선행 복구 의도가 있는 재시작에서 14번과 지시가 갈렸다. I4·D23은 이미 `clean cold start`로 한정돼 있어 충돌이 아니라 예외 연결 누락이다. 세 자리에 그 예외를 적는다. 바뀐 규범 자체는 14번의 것이고 여기서 새로 정하지 않는다.
 > (B) 14번의 승인 근거는 2026-09-16 사용자 위임(결정할 일은 Codex와 상의해 정하고 계속 진행)이다. 다른 개정 기록처럼 위임 시점을 남긴다.
-> (C) 현재 `UnimplementedScopePurger`는 `Deferred`를 돌려주고 실제 purge를 하지 않으므로, 필요한 purge가 남은 미정산 재시작의 protected 입장은 이 stub 아래에서 열리지 않는다. 8번이 적은 대로 다른 항목·축의 실패나 외부 재개 계기로 다시 호출될 수는 있으나, 재호출이 실제 purge 완료를 대신하지는 않는다. 활성화 순서는 14번이 근거로 든 purger 설계 v3 final §9를 따른다 — P1·P2는 production 비활성으로 구현·검증하고, P3에서 실제 adapter를 쓰는 첫 protected use 차단을 검증한 뒤 저장·복원·purger를 함께 연다. 미전환 대상과 상위 선행조건은 완료로 보고하지 않으며 §9.1의 cutover 소유를 유지한다.
+> (C) 현재 `UnimplementedScopePurger`는 `Deferred`를 돌려주고 실제 purge를 하지 않으므로, 필요한 purge가 남은 미정산 재시작의 protected 입장은 이 stub 아래에서 열리지 않는다. 8번이 적은 대로 다른 항목·축의 실패나 외부 재개 계기로 다시 호출될 수는 있으나, 재호출이 실제 purge 완료를 대신하지는 않는다. 활성화 순서는 동결 후 17번을 따른다 — P1·P2는 production 비활성으로 구현·검증하고, R4 준비와 S3·S4·S7 소비자 cutover·대상별 migration 증거, S10의 news 확인·삭제 phase/허가 생산자 준비, 적용 가능한 모든 USER 의무와 인계 정산 경로 및 기존 사용자 업그레이드·중단·재시작·fresh 승인 시험을 P3-i 선행조건으로 닫는다. 그 뒤 실제 adapter를 쓰는 첫 protected use 차단을 검증하고 저장·복원·purger를 함께 활성화한다. 미전환 대상과 상위 선행조건은 완료로 보고하지 않으며 §9.1의 cutover 소유를 유지한다.
 > (D) 저장된 재확인 의무·floor의 인계는 목표 계약이고 process death 지속은 여전히 미충족이다. 저장 항목·키 형식·재시작의 floor 해석은 같은 설계 §7·§7.1을 따르며, 그 저장·복구 모델의 구현·시험은 §9의 P2다. 여기서 새 저장 형식을 정하지 않는다.
 > **유형 판정**: 1형으로 기록한다 — 규범을 바꾼 것은 14번이고 여기서는 그 결정이 이미 미치는 자리에 문장을 맞출 뿐이며, 범위·D-결정·슬라이스 경계·release gate·DoD를 바꾸지 않는다. 다만 머리말의 "애매하면 2번" 규칙을 의식해 밝혀 둔다 — 이 보정을 2형으로 읽더라도 14번을 연 같은 위임이 그대로 적용되고 새로 더해지는 제약은 없다. 이 기록도 구현·배선·arming·rollout·deploy를 열지 않는다.
 >
@@ -297,6 +297,13 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > **O5 회수 범위와의 관계.** O5 문단의 "명시적 거부 없이 보존 namespace를 purge하지 않는다"에 대한 좁은 예외는 일곱 제어 키가 모두 없는 모호한 시작의 복구 은퇴뿐이다. 서버 거부·로그아웃·계정삭제를 합성하지 않고, 원인을 증명할 수 없는 파생 자료 의무는 §3.1의 UNKNOWN으로 다룬다. 정상 제어 레코드와 정산된 의무를 가진 same-UID clean cold start의 보존 계약, UID 원본 선호 보존, §9.1의 cutover 소유는 유지한다.
 > 이 기록은 설계 결정이며 구현·배선·실제 purger·process-death DoD 의 충족 선언이 아니다. 시험용 전이는 P2, 실제 writer·purger·admission 연결은 P3 이다. 기존 runtime 연결·arming·rollout·deploy 게이트를 유지한다.
 > **유형 판정:** 2형 명시적 개정이다. O5에 새 복구 은퇴 예외를 추가하지만 슬라이스 경계·release gate·DoD를 완화하지 않는다.
+>
+> **동결 후 17번 명시적 개정 기록(2026-09-30, 사용자 결정 위임에 따른 Claude·Codex 설계 합의).** 16번의 일곱 제어 키 부재 복구 은퇴를 기존 사용자에게 적용할 때의 P3-i 활성화 순서와 완료 판정을 개정한다.
+> 16번은 모호한 시작에서 USER·CAPABILITY 두 축을 은퇴시키고 실제 purge와 journal 정산 뒤에만 protected 입장을 열도록 한다. 그러나 현재 USER 대상 판정은 `CUTOVER_OWNED`·`UNDER_REVIEW`·`HANDED_OVER`를 무조건 `OUTSTANDING`으로 남긴다. 소비자 cutover만으로 이 의무가 정산되지는 않는다. 이 상태에서 P3-i의 입장 차단을 활성화하면 일곱 키가 없는 기존 구독자의 protected 입장이 필요한 정산 경로 없이 닫힌 채 남을 수 있다. 키 부재를 clean continuity로 승격하거나 미완료 의무를 완료로 간주해 해결하지 않는다.
+> **활성화 순서:** R4의 미배선 last-known·grant/runtime 경계와 기존 사용자 업그레이드 fixture를 준비한다 → S3·S4·S7이 각자 소유한 소비자를 전환하고 §9.1 대상별 migration 증거를 확보한다 → S10의 `news_cache.json` 호환 확인과 삭제 phase·허가 생산자를 준비한다 → manifest에서 해당 원인과 축에 적용되는 모든 USER 의무 및 인계 대상의 정산 경로를 검증한다 → P3-i에서 저장 writer·재시작 복원·실제 purger·protected admission을 함께 활성화한다 → 실제 purger를 포함해 R4·S4·S7·S10의 DoD를 최종 재검증한다. 소유 슬라이스의 삭제·호환 확인과 인계 경로의 완료 증거를 `PurgeDecision`의 대상 판정 및 purge journal 정산에 연결한다. migration journal의 `committed`, 인계 통지 또는 adapter 등록만으로 purge 완료를 기록하지 않는다. `Deferred`·실패·미해석 의무·완료 저장 불확실성은 의무와 입장 차단을 유지한다.
+> P3-i 전까지 운영 purger는 placeholder로 유지한다. R4와 S10의 앞 단계는 각각 준비·소비자 전환과 phase·허가 생산자 준비이며, 실제 purge를 요구하는 최종 DoD 완료가 아니다. S3·S4·S7의 각 cutover는 소비자와 로컬 상태를 바꾸므로 그 단계마다 현재 동작 변화·회귀 0을 별도로 검증한다. 앞 단계의 회귀 검증은 실제 purger를 포함한 최종 DoD 검증을 대신하지 않는다.
+> **P3-i 활성화 필수 시험:** 실제 구버전 저장소에서 시작해 첫 실행·중단·재시작·fresh 서버 승인까지 검증한다. 일곱 키 부재와 기존 4필드 journal의 원문·순서 보존, 두 축 은퇴의 중복 방지, 대상별 삭제·호환 확인과 인계 정산, UID 원본 선호 보존, 미완료 의무에서 protected 사용 0, 정산 확인 뒤 시작한 fresh 승인에서만 재개방을 입증한다. 첫 설치·UID 없음·UID 변경, 미해석 또는 손상된 제어 상태와 저장 실패도 기존 차단·복구 계약대로 시험한다. 이 시험이나 적용 가능한 USER 의무의 정산 경로가 미충족이면 P3-i를 활성화하지 않는다.
+> **유형 판정:** 2형 명시적 개정이다. P3-i의 선행 순서와 R4·S10의 준비/최종 완료 판정을 바꾸기 때문이다. 새 D-결정은 만들지 않고 §9.1의 삭제 소유권, 기존 슬라이스 DoD와 release gate를 완화하지 않는다. 이 기록 자체는 구현·배선·arming·rollout·deploy를 열지 않는다.
 
 ---
 
@@ -1164,8 +1171,9 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   실제 premium Root destination으로 교체한다
 - rate consumer cutover와 같은 변경 세트에서 `fxi_cache`의 legacy `rates`·`rates_timestamp`를 제거하고
   legacy rate DTO/repository/VM을 삭제한다. 아직 S7 알림 편집기가 소비하는 `last_bank_*`는 이 단계에서 건드리지 않는다.
-  S1에서 만든 journal은 성공한 cutover 뒤에만 rate target을 committed로 표시한다
-- **DoD**: premium 런타임에서 legacy rate API 호출 0 / REST↔WS 경합에서 오래된 값이 최신을 덮지 못함 /
+  S1에서 만든 migration journal은 소비자 전환과 대상별 legacy 삭제가 확인된 뒤에만 rate target을 committed로 표시한다. 이 표시는 purge journal의 USER 의무 정산이나 R4 최종 DoD 완료를 뜻하지 않는다
+- **R4 준비·소비자 전환 판정**: last-known·grant/runtime 연결과 업그레이드 fixture를 검증하고, rate 소비자 전환·legacy 삭제·대상별 migration 증거를 확보한다. 이 단계의 현재 동작 변화·회귀 0을 별도로 검증한다. 운영 purger가 placeholder인 동안 UID/epoch 전환 purge를 완료로 세거나 R4 DoD를 완료로 선언하지 않는다
+- **최종 DoD(P3-i 활성화 뒤 실제 purger로 재검증)**: premium 런타임에서 legacy rate API 호출 0 / REST↔WS 경합에서 오래된 값이 최신을 덮지 못함 /
   3회 공유 budget·시도별 absolute 45초(ACK 비연장)·lease-id hard-expiry·30초 안정 후 reconnect reset / server premium rejection 즉시 무료 전환 /
   최초 delivery watchdog과 persistent-silence owner의 중복 resubscribe 0 / KRX-only가 Tether delivery·freshness를 충족하지 않음 /
   offline cold start에서 정화된 last-known 복원→`refreshingCached/offline` 표시, 복원 seed가 delivery/freshness로 오인되지 않음 /
@@ -1451,7 +1459,8 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   Free로 가지 않고 local `DeletionPending(SERVER_DELETED)`을 재구성한다. SV-4 전에는 S10 보증 범위가 **현재 설치의
   crash/process-death**까지이며 기존 cross-device 재생성 공백은 후속 위험으로 명시한다
 - 무료 알림 preview polish
-- **DoD**: premium host 필터/free banner / KB WebView와 external fallback 실기기 smoke / deletion hold 중 token 회전 POST 0 /
+- **S10 준비 판정**: `news_cache.json`은 호환 fixture로 유지 여부를 확인하고 decode 실패 시 재조회한다. 삭제 phase·허가 생산자와 재시작 계약을 준비하되, 운영 purger가 placeholder인 동안 계정삭제 후 domain purge·journal 정산·finalizer 완료를 선언하지 않는다
+- **최종 DoD(P3-i 활성화 뒤 실제 purger로 재검증)**: premium host 필터/free banner / KB WebView와 external fallback 실기기 smoke / deletion hold 중 token 회전 POST 0 /
   request 전 cancel은 admission 복원 / timeout·5xx·204 직후·Firebase 실패 각 process-death 지점에서
   API·WS·mutation·register-device 0 및 idempotent retry CTA만 노출 / Firebase remote success 직후 callback 전 crash에서
   `FIREBASE_DELETE_IN_FLIGHT+currentUser null`이 terminal local success / Firebase success 또는 user-not-found 뒤
