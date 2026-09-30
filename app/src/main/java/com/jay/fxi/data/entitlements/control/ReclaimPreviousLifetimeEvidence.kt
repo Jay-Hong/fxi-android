@@ -1,6 +1,8 @@
 package com.jay.fxi.data.entitlements.control
 
 import com.jay.fxi.data.entitlements.RecordTransactionDecision
+import com.jay.fxi.data.entitlements.PurgeScope
+import com.jay.fxi.data.entitlements.StoreOp
 import java.io.IOException
 
 /** Management confirmation only; reclamation issues neither a business ref nor its own Applied. */
@@ -15,6 +17,7 @@ internal sealed interface ControlEvidenceReclamationResult {
  * Runs after actual-snapshot observation in the owner's decision. A different tracker lifetime
  * means an earlier process only under the file's single-owner contract. Validate every old row
  * before constructing one removal candidate; never infer a deletion scope from opaque fields.
+ * A rotation's seals are removed only when every settlement witness tells the same rotation.
  */
 internal object ReclaimPreviousLifetimeEvidence {
     fun decide(
@@ -50,11 +53,24 @@ internal object ReclaimPreviousLifetimeEvidence {
         for (entry in previous) {
             val row = entry.value
             if (row is AppliedEvidence.Rotation) {
+                var first: SettlementEvidenceV1? = null
+                val axes = mutableSetOf<PurgeScope>()
                 for (id in row.sealIds) {
                     val seal = byId[id] ?: return recovery(RecoveryReason.InconsistentReclamation)
                     if (seal.kind != SealTargetKind.NAMESPACE) return recovery(RecoveryReason.InconsistentReclamation)
-                    val settlement = seal.settlement ?: return recovery(RecoveryReason.InconsistentReclamation)
-                    if (settlement.operationId != row.commandId) return recovery(RecoveryReason.InconsistentReclamation)
+                    val witness = seal.settlement as? SettlementEvidenceV1
+                        ?: return recovery(RecoveryReason.InconsistentReclamation)
+                    if (witness.operation != StoreOp.BEGIN_ROTATION ||
+                        witness.before.ownerUid != seal.key.ownerUid || witness.after.ownerUid != seal.key.ownerUid ||
+                        seal.key.epoch != witness.before.epoch(seal.key.axis) ||
+                        witness.after.epoch(seal.key.axis) == null ||
+                        witness.journal != JournalTargetV1(seal.key.ownerUid, seal.key.axis, seal.key.epoch) ||
+                        !axes.add(seal.key.axis)
+                    ) return recovery(RecoveryReason.InconsistentReclamation)
+                    if (first == null) first = witness
+                    else if (witness.before != first.before || witness.after != first.after ||
+                        witness.originLifetimeId != first.originLifetimeId
+                    ) return recovery(RecoveryReason.InconsistentReclamation)
                 }
                 val operationSeals = byId.values.filter { it.settlement?.operationId == row.commandId }.map { it.id }.toSet()
                 if (operationSeals != row.sealIds.toSet()) return recovery(RecoveryReason.InconsistentReclamation)
