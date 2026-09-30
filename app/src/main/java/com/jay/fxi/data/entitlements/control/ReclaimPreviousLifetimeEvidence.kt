@@ -11,6 +11,8 @@ internal sealed interface ControlEvidenceReclamationResult {
     data class RecoveryRequired(val reason: RecoveryReason, val observation: ControlRecordRead) : ControlEvidenceReclamationResult
     data class Rejected(val reason: RejectionReason, val observation: ControlRecordRead) : ControlEvidenceReclamationResult
     data class Unconfirmed(val observation: ControlRecordRead?, val failure: IOException) : ControlEvidenceReclamationResult
+    /** A current command depends, or may depend, on evidence selected for removal. */
+    data class DependencyBlocked(val present: Boolean, val dependentCommandId: String?) : ControlEvidenceReclamationResult
 }
 
 /**
@@ -23,7 +25,8 @@ internal object ReclaimPreviousLifetimeEvidence {
     fun decide(
         read: ControlRecordRead,
         lifetime: OwnerTrackingLifetimeId,
-        codec: ControlPayloadCodec
+        codec: ControlPayloadCodec,
+        dependencyCheck: (Set<DependencyAtom>) -> ControlEvidenceReclamationResult.DependencyBlocked? = { null }
     ): RecordTransactionDecision<ControlEvidenceReclamationResult?> {
         fun recovery(reason: RecoveryReason) = RecordTransactionDecision.Observe<ControlEvidenceReclamationResult?>(
             ControlEvidenceReclamationResult.RecoveryRequired(reason, read))
@@ -97,6 +100,10 @@ internal object ReclaimPreviousLifetimeEvidence {
         if (complete !is ControlRecordRead.Supported || complete.schemaVersion != 2 || complete.blocksProtectedAdmission) {
             return recovery(RecoveryReason.InconsistentReclamation)
         }
+        // A current command cannot reference a previous lifetime's Applied row, and every projected seal witness comes with
+        // its seal row, so the removed seal rows are the protected set (an Unclassified gap still answers Unknown).
+        val protectedAtoms: Set<DependencyAtom> = removedSeals.mapTo(mutableSetOf()) { DependencyAtom.ControlRow(ControlKind.SEAL, it) }
+        dependencyCheck(protectedAtoms)?.let { return RecordTransactionDecision.Observe(it) }
         return RecordTransactionDecision.Confirm(candidate, null)
     }
 }

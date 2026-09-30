@@ -1377,7 +1377,15 @@ internal class ControlRecordStore(
                 val read = reader.read(snapshot)
                 tracking.observe(read)
                 observation = read
-                ReclaimPreviousLifetimeEvidence.decide(read, tracking.lifetimeId, codec)
+                ReclaimPreviousLifetimeEvidence.decide(read, tracking.lifetimeId, codec) { protectedAtoms ->
+                    when (val violation = consumptionDependencyViolation(null, protectedAtoms)) {
+                        is ConsumptionDependencyViolation.Present ->
+                            ControlEvidenceReclamationResult.DependencyBlocked(true, violation.dependent.id)
+                        is ConsumptionDependencyViolation.Unknown ->
+                            ControlEvidenceReclamationResult.DependencyBlocked(false, violation.dependent.id)
+                        null -> null
+                    }
+                }
             }
             transaction.value ?: ControlEvidenceReclamationResult.Confirmed(
                 ConfirmedControlSnapshot(reader.read(transaction.snapshot) as ControlRecordRead.Supported),

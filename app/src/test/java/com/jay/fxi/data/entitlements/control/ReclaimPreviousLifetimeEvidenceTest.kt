@@ -19,7 +19,7 @@ import org.junit.Test
 class ReclaimPreviousLifetimeEvidenceTest {
     private val lifetime = OwnerTrackingLifetimeId.issue()
     private fun decide(raw: Preferences) = ReclaimPreviousLifetimeEvidence.decide(
-        ControlRecordReader().read(raw), lifetime, ControlPayloadCodec())
+        ControlRecordReader().read(raw), lifetime, ControlPayloadCodec()) { null }
 
     private fun confirmed(raw: Preferences): Preferences {
         val decision = decide(raw)
@@ -81,7 +81,7 @@ class ReclaimPreviousLifetimeEvidenceTest {
     @Test fun noPreviousRowsConfirmOriginalWithoutNormalizationOrTombstone() {
         val source = raw(evidence = " [ ${mutation(lifetime = lifetime.value)} ] ", seals = " [ ] ")
         val read = ControlRecordReader().read(source)
-        val decision = ReclaimPreviousLifetimeEvidence.decide(read, lifetime, ControlPayloadCodec())
+        val decision = ReclaimPreviousLifetimeEvidence.decide(read, lifetime, ControlPayloadCodec()) { null }
         assertSame(read.original, (decision as RecordTransactionDecision.Confirm).candidate)
         assertEquals(source, confirmed(source))
     }
@@ -160,7 +160,15 @@ class ReclaimPreviousLifetimeEvidenceTest {
                 val read = reader.read(snapshot)
                 tracking.observe(read)
                 observation = read
-                ReclaimPreviousLifetimeEvidence.decide(read, tracking.lifetimeId, codec)
+                ReclaimPreviousLifetimeEvidence.decide(read, tracking.lifetimeId, codec) { protectedAtoms ->
+                    when (val violation = consumptionDependencyViolation(null, protectedAtoms)) {
+                        is ConsumptionDependencyViolation.Present ->
+                            ControlEvidenceReclamationResult.DependencyBlocked(true, violation.dependent.id)
+                        is ConsumptionDependencyViolation.Unknown ->
+                            ControlEvidenceReclamationResult.DependencyBlocked(false, violation.dependent.id)
+                        null -> null
+                    }
+                }
             }
         """.trimIndent().lines().map(String::trim)
         assertEquals(1, method.lines().map(String::trim).windowed(expected.size).count { it == expected })

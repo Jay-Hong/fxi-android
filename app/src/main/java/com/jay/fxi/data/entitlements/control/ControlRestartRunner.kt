@@ -30,7 +30,8 @@ internal class ControlRestartRunner(
             RestartStep.ReclaimPreviousLifetimeEvidence -> when (store.reclaimPreviousLifetimeEvidence()) {
                 is ControlEvidenceReclamationResult.Confirmed -> null
                 is ControlEvidenceReclamationResult.RecoveryRequired,
-                is ControlEvidenceReclamationResult.Rejected -> RestartRunResult.StepRefused(step)
+                is ControlEvidenceReclamationResult.Rejected,
+                is ControlEvidenceReclamationResult.DependencyBlocked -> RestartRunResult.StepRefused(step)
                 is ControlEvidenceReclamationResult.Unconfirmed -> RestartRunResult.Unconfirmed
             }
             else -> return RestartRunResult.Handoff(step)
