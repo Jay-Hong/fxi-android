@@ -479,8 +479,12 @@ class TopicSessionCoordinatorTest {
                 }
             },
             desired = desired,
-            restoreSeed = { granted -> restoreCalls += granted; restoreProvider?.invoke(granted) ?: TopicLastKnownRestore.NotAdmitted }
+            restoreSeed = { granted -> restoreCalls += granted; restoreProvider?.invoke(granted) ?: TopicLastKnownRestore.NotAdmitted },
+            offerLive = { uid, epoch, rates -> offers += Triple(uid, epoch, rates) }
         )
+
+        /** R4-b2: every save the session offered, in order. */
+        val offers = mutableListOf<Triple<String, String, TopicRates>>()
 
         /** R4-b1: every restore the session asked for, and what answers it (none by default, so other tests see no seed). */
         val restoreCalls = mutableListOf<TopicSessionFence>()
@@ -9707,6 +9711,132 @@ class TopicSessionCoordinatorTest {
         h.setAccess(true, fence())
         advanceTimeBy(1)
         assertEquals("R4-B10", before, h.restoreCalls.size)
+        h.cleanUp()
+    }
+
+    // ---- R4-b2 (Claude-owned contract; R4b2/design_codex.r1.md): the session offers to save only the live prices a grant
+    // adopted, under the (uid, userAccessEpoch) of the turn that adopted them — never a seed, never a price that did not merge.
+    // The implementation reads but does not edit these rows. ----
+
+    private fun TopicRates.sources() = quotes.values.map { it.source }.toSet()
+
+    @Test
+    fun `R4-C1 an adopted socket price is offered under the grant's owner`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        val (uid, epoch, rates) = h.offers.single()
+        assertEquals("R4-C1 owner", "u1" to "epoch-1", uid to epoch)
+        assertEquals("R4-C1 rates", 1390.0, rates.quotes.values.single { it.source == "upbit" }.rate, 0.0)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `R4-C2 an adopted bootstrap price is offered the same way`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.fxFrame(1390.0)) }
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(1)
+        val last = h.offers.last()
+        assertEquals("R4-C2 owner", "u1" to "epoch-1", last.first to last.second)
+        assertEquals("R4-C2 rates", 1390.0, last.third.quotes.values.single { it.source == "kb" }.rate, 0.0)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `R4-C3 a price that did not merge is not offered`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertEquals("R4-C3", 1, h.offers.size)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `R4-C4 a seed is never offered, alone or mixed into a later live offer`() = runTest {
+        val h = Harness(this)
+        h.restoreProvider = { granted -> TopicLastKnownRestore.Seed(seedOf(seedQuote("kb", "usd-krw", 1395.0, "2026-08-31T02:00:00Z")),
+            granted, TopicUseLifetime(granted.grant, 0L)) }
+        h.goLive()
+        advanceTimeBy(100)
+        assertTrue("R4-C4: the seed shows", h.coordinator.rates.value.sources().contains("kb"))
+        assertTrue("R4-C4: nothing offered for a seed", h.offers.isEmpty())
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertEquals("R4-C4: only the live price is offered", setOf("upbit"), h.offers.single().third.sources())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `R4-C5 a new grant's offers carry only its own prices and owner`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.fxFrame(1390.0)) }
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(1)
+        val before = h.offers.size
+        // The new grant bootstraps on its own; stage only a tether answer for it, so a kb price in its offers could only have
+        // carried over from the earlier grant (fixture corrected after the first run: C5PROBE showed the new grant's own
+        // fx bootstrap answered by the earlier staging).
+        h.bootstrapOutcome = { _, topic ->
+            if (topic == TETHER) h.delivered(h.tetherFrame(1391.0)) else TopicSnapshotOutcome.Unreachable(java.io.IOException("none"))
+        }
+        h.setAccess(true, fence(uid = "u2", generation = 2L, epoch = "epoch-2"))
+        advanceTimeBy(100)
+        val later = h.offers.drop(before)
+        assertTrue("R4-C5: the new grant offered", later.isNotEmpty())
+        assertTrue("R4-C5: every later offer is the new owner's", later.all { it.first == "u2" && it.second == "epoch-2" })
+        assertTrue("R4-C5: no earlier price carried over", later.none { "kb" in it.third.sources() })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `R4-C6 a grant without a user epoch shows prices but offers nothing`() = runTest {
+        val h = Harness(this)
+        h.coordinator.start()
+        h.setAccess(true, TopicSessionFence(fence().identity, null, TopicGrantToken(1L)))
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertTrue("R4-C6: shown", h.coordinator.rates.value.sources().contains("upbit"))
+        assertTrue("R4-C6: nothing offered", h.offers.isEmpty())
+        h.cleanUp()
+    }
+
+    // Battery r1 (OM3·OM7): the index slot is offered like a quote, once per adopted change.
+    @Test
+    fun `R4-C7 an adopted dollar index is offered once`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.dxyFrame(98.5))
+        advanceTimeBy(1)
+        h.wire.deliver(h.dxyFrame(98.5))
+        advanceTimeBy(1)
+        assertEquals("R4-C7: one offer", 1, h.offers.size)
+        assertEquals("R4-C7: the index is offered", 98.5, h.offers.single().third.dollarIndex!!.rate, 0.0)
         h.cleanUp()
     }
 }

@@ -454,7 +454,9 @@ class TopicSessionCoordinator(
         { _, _, _ -> },
     desired: Set<String> = TopicCatalogue.DESIRED,
     /** Reads a display seed for a granted fence; null disables restore. */
-    private val restoreSeed: (suspend (TopicSessionFence) -> TopicLastKnownRestore)? = null
+    private val restoreSeed: (suspend (TopicSessionFence) -> TopicLastKnownRestore)? = null,
+    /** Offers adopted live rates synchronously; the sink must return promptly. */
+    private val offerLive: ((uid: String, userAccessEpoch: String, rates: TopicRates) -> Unit)? = null
 ) : TopicGrantSink {
     /**
      * Copied, so what this session consumes cannot change under it.
@@ -582,6 +584,7 @@ class TopicSessionCoordinator(
     private val inputs = Channel<SessionInput>(Channel.UNLIMITED)
 
     private val _rates = MutableStateFlow(TopicRates())
+    private var liveRates = TopicRates()
 
     /** Everything the topics have said, under the strictly-newer rule. */
     val rates: StateFlow<TopicRates> = _rates.asStateFlow()
@@ -911,6 +914,7 @@ class TopicSessionCoordinator(
                     connection?.let { end(it, TopicDisconnectCause.DELIBERATE) }
                     cancelReconnect()
                     _rates.value = TopicRates()
+                    liveRates = TopicRates()
                     if (!inherits) everAttempted = false
                     // `setDesired(false)` is not enough: it keeps the receive generation, because
                     // a user losing interest in a topic has not unseen its frames. A grant change
@@ -1545,7 +1549,10 @@ class TopicSessionCoordinator(
         // satisfy tether delivery, and since the two cannot be told apart, neither counts.
         // Found by review.
         if (quotes.isEmpty()) return
-        _rates.value = _rates.value.merge(quotes)
+        val held = _rates.value
+        val merged = held.merge(quotes)
+        _rates.value = merged
+        offerAdopted(held, merged)
         store.recordFrame(topic)
         recordDelivery(evidenceFor(topic), clock.nowMillis())
     }
@@ -1555,8 +1562,25 @@ class TopicSessionCoordinator(
         // The index has one slot rather than a list, so "everything failed validation" and
         // "nothing arrived" are the same frame here: either way there is no reading to record.
         val index = message.data.dxy.toDollarIndex() ?: return
-        _rates.value = _rates.value.merge(index)
+        val held = _rates.value
+        val merged = held.merge(index)
+        _rates.value = merged
+        offerAdopted(held, merged)
         store.recordFrame(TopicCatalogue.DXY)
+    }
+
+    /** Keeps only live changes adopted by the display in this grant. */
+    private fun offerAdopted(held: TopicRates, merged: TopicRates) {
+        val changedQuotes = merged.quotes.filter { (key, quote) -> held.quotes[key] != quote }.values.toList()
+        val changedIndex = merged.dollarIndex?.takeIf { it != held.dollarIndex }
+        if (changedQuotes.isEmpty() && changedIndex == null) return
+
+        liveRates = liveRates.merge(changedQuotes)
+        if (changedIndex != null) liveRates = liveRates.merge(changedIndex)
+
+        val owner = fence ?: return
+        val epoch = owner.userAccessEpoch ?: return
+        offerLive?.invoke(owner.identity.uid, epoch, liveRates)
     }
 
     // ---- subscribing ----------------------------------------------------------------------
@@ -2059,8 +2083,11 @@ class TopicSessionCoordinator(
             // One slot rather than a list, so "everything failed validation" and "nothing arrived"
             // are the same answer here — and it arms nothing either way, exactly as the socket's
             // index path records no delivery.
-            is DecodedTopicFrame.Dxy -> frame.value.data.dxy.toDollarIndex()?.let {
-                _rates.value = _rates.value.merge(it)
+            is DecodedTopicFrame.Dxy -> frame.value.data.dxy.toDollarIndex()?.let { index ->
+                val held = _rates.value
+                val merged = held.merge(index)
+                _rates.value = merged
+                offerAdopted(held, merged)
             }
 
             // S6 owns KRX and `desired` cannot name it, so this is unreachable rather than
@@ -2088,7 +2115,10 @@ class TopicSessionCoordinator(
     private fun applyBootstrapEntries(topic: String, entries: List<TopicSourceEntry>) {
         val quotes: List<TopicQuote> = entries.mapNotNull { it.toQuote() }
         if (quotes.isEmpty()) return
-        _rates.value = _rates.value.merge(quotes)
+        val held = _rates.value
+        val merged = held.merge(quotes)
+        _rates.value = merged
+        offerAdopted(held, merged)
         recordDelivery(evidenceFor(topic), clock.nowMillis())
     }
 
