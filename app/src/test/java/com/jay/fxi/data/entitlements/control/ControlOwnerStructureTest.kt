@@ -65,6 +65,10 @@ class ControlOwnerStructureTest {
                 ") : this(context.accessEpochDataStore, ids)",
                 "\"read_barrier is owned by DataStoreAccessEpochStore\"",
             ),
+            "main/java/com/jay/fxi/data/entitlements/purge/PurgeControlConfirmedRead.kt" to listOf(
+                "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore",
+                "private val owner: DataStoreAccessEpochStore,",
+            ),
             "main/java/com/jay/fxi/data/entitlements/control/ControlCommandTracking.kt" to listOf(
                 "import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore",
                 "private val collected = ReferenceQueue<DataStoreAccessEpochStore>()",

@@ -161,10 +161,13 @@ class PurgeControlSnapshotReaderContractTest {
         assertEquals(raw, p[journalKey])
     }
 
-    @Test fun J18_onlyTheNewReaderReachesTheCodec_andNothingInProductionReachesTheReader() {
+    @Test fun J18_onlyTheConfirmedSeamReachesTheReader() {
         val sources = File("src/main/java/com/jay/fxi").walkTopDown().filter { it.extension == "kt" }.toList()
         assertTrue("the walk must see the reader", sources.any { it.name == "PurgeControlSnapshotReader.kt" })
-        assertEquals(emptyList<String>(), sources.filter { it.name != "PurgeControlSnapshotReader.kt" && it.readText().contains("PurgeControlSnapshotReader") }.map { it.name })
+        // The confirmed seam is the sole caller: it decodes only the owner's completed transaction snapshot.
+        assertEquals(listOf("PurgeControlConfirmedRead.kt"), sources.filter {
+            it.name != "PurgeControlSnapshotReader.kt" && it.readText().contains("PurgeControlSnapshotReader")
+        }.map { it.name })
     }
 }
 
