@@ -101,10 +101,11 @@ class PurgeControlConfirmedReadContractTest {
         }
     }
 
-    @Test fun A07_lock_noProductionCaller() {
+    @Test fun A07_lock_onlyTheUnconnectedRunnerCallsTheSeam() {
         val callers = File("src/main/java").walkTopDown().filter { it.isFile && it.extension == "kt" && it.name != "PurgeControlConfirmedRead.kt" }
             .filter { it.readText().contains("PurgeControlConfirmedRead") }.map { it.name }.toList()
-        assertEquals("A07", emptyList<String>(), callers)
+        // P3-d's runner is the sole allowed caller; its D12 keeps production from reaching it.
+        assertEquals("A07", listOf("ControlRestartRunner.kt"), callers)
     }
 
 }

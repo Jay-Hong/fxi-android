@@ -151,10 +151,11 @@ class ControlRestartModelContractTest {
             "AwaitFreshApproval"), names)
     }
 
-    @Test fun M16_lock_noProductionCaller() {
+    @Test fun M16_lock_onlyTheUnconnectedRunnerCallsTheModel() {
         val main = File("src/main/java")
         val callers = main.walkTopDown().filter { it.isFile && it.extension == "kt" && it.name != "ControlRestartModel.kt" }
             .filter { it.readText().contains("ControlRestartModel") }.map { it.name }.toList()
-        assertEquals("M16", emptyList<String>(), callers)
+        // P3-d's runner is the sole allowed caller; D12 keeps production from reaching it.
+        assertEquals("M16", listOf("ControlRestartRunner.kt"), callers)
     }
 }

@@ -207,7 +207,8 @@ class ControlIssuanceStructureTest {
                 control + "RetiredNamespaceSettlementTransition.kt" to 1, control + "CurrentNullSettlementTransition.kt" to 1, control + "RetiredNullSettlementTransition.kt" to 1,
                 control + "ControlLifecycle.kt" to 1, control + "DemandAuthTransition.kt" to 1, control + "RemoveEmptyGuardTransition.kt" to 1, control + "RecoverHoldTransition.kt" to 1,
                 control + "RecoverIntentTransition.kt" to 1,
-                control + "PriorIntentLifetime.kt" to 2), // P2-K: the test-only intent lifetime drives the existing addition and RecoverIntent commands through its store.
+                control + "PriorIntentLifetime.kt" to 2,
+                control + "ControlRestartRunner.kt" to 1), // P3-d: the unconnected runner owns only three store-backed restart steps.
             // 6-1C: the pure dependency projection covers every body kind in one exhaustive when.
             // 6-2B: consume entry, retry dispatch and the attempt's consumption branch each name the Rotation body (2 → 5).
             // 6-4bB2: the handoff gate's requirement-input dispatch names it once more (5 → 6).

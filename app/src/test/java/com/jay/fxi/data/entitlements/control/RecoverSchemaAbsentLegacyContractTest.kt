@@ -173,10 +173,11 @@ class RecoverSchemaAbsentLegacyContractTest {
         }
     }
 
-    @Test fun L06_onlyTheStoreReachesTheRecovery_andNothingInProductionCallsTheCommand() {
+    @Test fun L06_onlyTheStoreAndUnconnectedRunnerReachTheRecovery() {
         val sources = File("src/main/java/com/jay/fxi").walkTopDown().filter { it.extension == "kt" }.toList()
         assertTrue("the walk must see the decider", sources.any { it.name == "RecoverSchemaAbsentLegacy.kt" })
-        assertEquals(emptyList<String>(), sources.filter { it.name !in setOf("RecoverSchemaAbsentLegacy.kt", "ControlRecordStore.kt") &&
+        // The runner invokes the store facade; D12 prevents an operational caller.
+        assertEquals(emptyList<String>(), sources.filter { it.name !in setOf("RecoverSchemaAbsentLegacy.kt", "ControlRecordStore.kt", "ControlRestartRunner.kt") &&
             (it.readText().contains("RecoverSchemaAbsentLegacy") || it.readText().contains("recoverSchemaAbsentLegacy")) }.map { it.name })
         val store = sources.single { it.name == "ControlRecordStore.kt" }.readText()
         assertEquals("the store only declares the command", 1, Regex("\\brecoverSchemaAbsentLegacy\\b").findAll(store).count())
