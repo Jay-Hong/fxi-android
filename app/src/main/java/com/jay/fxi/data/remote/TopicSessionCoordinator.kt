@@ -6,6 +6,7 @@ import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.HttpExchangeEvidence
+import com.jay.fxi.data.local.TopicLastKnownRestore
 import com.jay.fxi.data.remote.dto.DxyTopicMessage
 import com.jay.fxi.data.remote.dto.TopicSourceEntry
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
@@ -159,6 +160,15 @@ private sealed interface SessionInput {
         /** The use its issue acquired (L-4e E2a). A delivered snapshot is applied only while this is still admitted. */
         val lifetime: TopicUseLifetime
     ) : SessionInput
+
+    /** A display seed returned to the grant that started its read. */
+    data class RestoreAnswered(
+        val grantEpoch: Long,
+        val fence: TopicSessionFence,
+        val outcome: TopicLastKnownRestore
+    ) : SessionInput
+
+    data class RestoreSettled(val requestId: Long) : SessionInput
 
     data class Transport(val generation: Long, val event: TopicTransportEvent) : SessionInput
 
@@ -442,7 +452,9 @@ class TopicSessionCoordinator(
     private val onBootstrapUndelivered:
         (attribution: TopicUseAttribution, topic: String, outcome: TopicSnapshotOutcome) -> Unit =
         { _, _, _ -> },
-    desired: Set<String> = TopicCatalogue.DESIRED
+    desired: Set<String> = TopicCatalogue.DESIRED,
+    /** Reads a display seed for a granted fence; null disables restore. */
+    private val restoreSeed: (suspend (TopicSessionFence) -> TopicLastKnownRestore)? = null
 ) : TopicGrantSink {
     /**
      * Copied, so what this session consumes cannot change under it.
@@ -621,6 +633,9 @@ class TopicSessionCoordinator(
      */
     private val bootstrapsOut = HashMap<Long, BootstrapOut>()
     private var nextBootstrapRequestId = 0L
+
+    private val restoresOut = HashMap<Long, Job>()
+    private var nextRestoreRequestId = 0L
 
     private class BootstrapOut(val grantEpoch: Long, val topic: String, val job: Job)
 
@@ -929,6 +944,7 @@ class TopicSessionCoordinator(
                 // depends on that order — `reconsider` changes none of [wanted]'s inputs — and no
                 // test tells the two placements apart.
                 pumpBootstraps()
+                if (input.allowed) input.fence?.let(::startRestore)
             }
 
             is SessionInput.BootstrapRequested -> requestBootstrapOnLoop(input.topic)
@@ -950,6 +966,27 @@ class TopicSessionCoordinator(
 
             is SessionInput.BootstrapSettled -> {
                 bootstrapsOut.remove(input.requestId)
+            }
+
+            is SessionInput.RestoreSettled -> restoresOut.remove(input.requestId)
+
+            is SessionInput.RestoreAnswered -> {
+                val seed = input.outcome as? TopicLastKnownRestore.Seed ?: return
+                if (input.grantEpoch != grantEpoch) return
+                // grantEpoch rises on every moved or withdrawn grant, so the same epoch is the same fence and access.
+                val owner = input.fence
+                // The provider is outside this session; a seed for another fence is not this grant's.
+                if (seed.fence != owner) return
+                if (owner == refusedFor || owner == identityLostFor) return
+                if (!enforceLiveIdentity(owner)) return
+                if (!authority.admits(seed.lifetime)) return
+
+                val held = _rates.value
+                val missing = seed.rates.quotes.filterKeys { it !in held.quotes }
+                val index = held.dollarIndex ?: seed.rates.dollarIndex
+                if (missing.isNotEmpty() || index != held.dollarIndex) {
+                    _rates.value = TopicRates(held.quotes + missing, index)
+                }
             }
 
             is SessionInput.BootstrapAnswered -> {
@@ -1285,6 +1322,23 @@ class TopicSessionCoordinator(
         if (owner == refusedFor || owner == identityLostFor) return false
         if (!enforceLiveIdentity(owner)) return false
         return authority.admits(attribution.lifetime)
+    }
+
+    /** Start once per new allowed Access; its answer is checked on the loop. */
+    private fun startRestore(owner: TopicSessionFence) {
+        val restore = restoreSeed ?: return
+        // A refusal latch outlives a withdrawal of the same fence; reading its data would already be a protected use.
+        if (owner == refusedFor || owner == identityLostFor) return
+        val epoch = grantEpoch
+        val requestId = ++nextRestoreRequestId
+        val job = scope.launch {
+            try {
+                post(SessionInput.RestoreAnswered(epoch, owner, restore(owner)))
+            } finally {
+                post(SessionInput.RestoreSettled(requestId))
+            }
+        }
+        restoresOut[requestId] = job
     }
 
     private fun reconsider(budgetIsFresh: Boolean) {
@@ -2421,6 +2475,8 @@ class TopicSessionCoordinator(
         connection?.let { end(it, TopicDisconnectCause.DELIBERATE) }
         cancelReconnect()
         cancelBootstraps()
+        restoresOut.values.forEach { it.cancel() }
+        restoresOut.clear()
         silenceTimer?.cancel()
         silenceTimer = null
     }

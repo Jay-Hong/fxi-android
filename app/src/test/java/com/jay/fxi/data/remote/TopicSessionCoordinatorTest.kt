@@ -48,6 +48,10 @@ import com.jay.fxi.data.remote.dto.SubscriptionAckTopic
 import com.jay.fxi.data.remote.dto.SubscriptionRejection
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
 import com.jay.fxi.domain.model.FreeTab
+import com.jay.fxi.domain.model.TopicDollarIndex
+import com.jay.fxi.domain.model.TopicQuote
+import com.jay.fxi.domain.model.TopicRates
+import kotlinx.datetime.Instant
 import com.jay.fxi.domain.model.TopicAuthResolution
 import com.jay.fxi.domain.model.TopicControlState
 import com.jay.fxi.domain.model.TopicReconnectPolicy
@@ -59,6 +63,7 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import com.jay.fxi.data.local.TopicLastKnownRestore
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -473,8 +478,15 @@ class TopicSessionCoordinatorTest {
                     }
                 }
             },
-            desired = desired
+            desired = desired,
+            restoreSeed = { granted -> restoreCalls += granted; restoreProvider?.invoke(granted) ?: TopicLastKnownRestore.NotAdmitted }
         )
+
+        /** R4-b1: every restore the session asked for, and what answers it (none by default, so other tests see no seed). */
+        val restoreCalls = mutableListOf<TopicSessionFence>()
+        var restoreProvider: (suspend (TopicSessionFence) -> TopicLastKnownRestore)? = null
+        /** Restores whose gate released while the read was still wanted. */
+        var restoresPastGate = 0
 
         val wire: Wire get() = wires.last()
 
@@ -9501,5 +9513,200 @@ class TopicSessionCoordinatorTest {
         } finally {
             processJob.cancel()
         }
+    }
+
+    // ---- R4-b1 (Claude-owned contract, 계획 개정 17 R4 준비; R4b/design_codex.r1.md): a last-known seed restored for an admitted
+    // grant fills only what the session holds nothing for, is re-checked on the session's loop against the grant epoch, fence,
+    // live identity and use lifetime it was started under, and is never delivery evidence. The implementation reads but does
+    // not edit these rows. ----
+
+    private fun seedQuote(source: String, asset: String, rate: Double, at: String) = TopicQuote(source, asset, rate, Instant.parse(at))
+    private fun seedOf(vararg q: TopicQuote, index: TopicDollarIndex? = null) = TopicRates(dollarIndex = index).merge(q.toList())
+    /** A provider that answers each restore with [seed] once its gate (by call order) is released. */
+    private fun Harness.gatedSeeds(seed: TopicRates): MutableList<CompletableDeferred<Unit>> {
+        val gates = mutableListOf<CompletableDeferred<Unit>>()
+        restoreProvider = { granted ->
+            val gate = CompletableDeferred<Unit>().also { gates += it }
+            gate.await()
+            restoresPastGate++
+            TopicLastKnownRestore.Seed(seed, granted, TopicUseLifetime(granted.grant, 0L))
+        }
+        return gates
+    }
+
+    @Test
+    fun `R4-B1 an admitted grant shows its seed offline, without delivery evidence`() = runTest {
+        val h = Harness(this)
+        val seed = seedOf(seedQuote("upbit", "usdt-krw", 1400.0, "2026-08-31T00:00:00Z"), seedQuote("kb", "usd-krw", 1390.0, "2026-08-31T00:00:00Z"),
+            index = TopicDollarIndex(98.5, Instant.parse("2026-08-31T00:00:00Z"), "investing"))
+        h.restoreProvider = { granted -> TopicLastKnownRestore.Seed(seed, granted, TopicUseLifetime(granted.grant, 0L)) }
+        h.coordinator.start()
+        h.setAccess(true, fence())
+        advanceTimeBy(100)
+        assertEquals("R4-B1: one restore for the grant", listOf(fence()), h.restoreCalls)
+        assertEquals("R4-B1: the seed is shown", seed, h.coordinator.rates.value)
+        assertTrue("R4-B1: no connection offline", h.wires.isEmpty())
+        assertEquals("R4-B1: no delivery evidence", 0L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `R4-B2 a late seed does not replace a live price, even when its time is newer, and fills only what is missing`() = runTest {
+        val h = Harness(this)
+        val gates = h.gatedSeeds(seedOf(seedQuote("upbit", "usdt-krw", 1500.0, "2026-08-31T02:00:00Z"),
+            seedQuote("kb", "usd-krw", 1395.0, "2026-08-31T02:00:00Z"),
+            index = TopicDollarIndex(99.0, Instant.parse("2026-08-31T02:00:00Z"), "investing")))
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        val generation = h.store.snapshot.stateFor(TETHER).receiveGeneration
+        gates.single().complete(Unit)
+        advanceTimeBy(1)
+        val quotes = h.coordinator.rates.value.quotes.values
+        assertEquals("R4-B2: the live tether price stays", 1390.0, quotes.single { it.source == "upbit" }.rate, 0.0)
+        assertEquals("R4-B2: the missing USD is filled", 1395.0, quotes.single { it.source == "kb" }.rate, 0.0)
+        assertEquals("R4-B2: the missing index is filled", 99.0, h.coordinator.rates.value.dollarIndex!!.rate, 0.0)
+        assertEquals("R4-B2: no delivery evidence from the seed", generation, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `R4-B3 a seed started under an earlier grant of the same fence is dropped`() = runTest {
+        val h = Harness(this)
+        val gates = h.gatedSeeds(seedOf(seedQuote("kb", "usd-krw", 1395.0, "2026-08-31T02:00:00Z")))
+        h.coordinator.start()
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        h.setAccess(false, null)
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        assertEquals("R4-B3: a restore per grant", 2, gates.size)
+        gates[0].complete(Unit)
+        advanceTimeBy(1)
+        assertTrue("R4-B3: the earlier grant's seed is not shown", h.coordinator.rates.value.quotes.isEmpty())
+        gates[1].complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("R4-B3: the current grant's seed is shown", 1, h.coordinator.rates.value.quotes.size)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `R4-B4 a seed that returns after the live identity moved is dropped`() = runTest {
+        val h = Harness(this)
+        val gates = h.gatedSeeds(seedOf(seedQuote("kb", "usd-krw", 1395.0, "2026-08-31T02:00:00Z")))
+        h.coordinator.start()
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        h.liveFence = fence(generation = 2L).identity
+        gates.single().complete(Unit)
+        advanceTimeBy(1)
+        assertTrue("R4-B4", h.coordinator.rates.value.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `R4-B5 a seed whose use the issuer no longer admits is dropped`() = runTest {
+        val h = Harness(this)
+        val gates = h.gatedSeeds(seedOf(seedQuote("kb", "usd-krw", 1395.0, "2026-08-31T02:00:00Z")))
+        h.coordinator.start()
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        h.authority = object : TopicUseAuthority {
+            override fun acquire(fence: TopicSessionFence) = TopicUseLifetime(fence.grant, 1L)
+            override fun admits(lifetime: TopicUseLifetime) = lifetime.invalidations == 1L
+        }
+        gates.single().complete(Unit)
+        advanceTimeBy(1)
+        assertTrue("R4-B5", h.coordinator.rates.value.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `R4-B6 no restore without an admitted grant, and a stopped session applies nothing`() = runTest {
+        val h = Harness(this)
+        val gates = h.gatedSeeds(seedOf(seedQuote("kb", "usd-krw", 1395.0, "2026-08-31T02:00:00Z")))
+        h.coordinator.start()
+        h.setAccess(false, null)
+        h.coordinator.setAccess(false, fence(), TopicGrantOrigin.NewContext)
+        advanceTimeBy(1)
+        assertTrue("R4-B6: no restore without a grant, fence or not", h.restoreCalls.isEmpty())
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        h.coordinator.stop()
+        advanceTimeBy(1)
+        gates.single().complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("R4-B6: the read in flight was cancelled by stop", 0, h.restoresPastGate)
+        assertTrue("R4-B6: nothing after stop", h.coordinator.rates.value.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    // Battery r1 (SM7): a live index is kept over a later seed's index as well.
+    @Test
+    fun `R4-B7 a live dollar index is kept over a late seed's index`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        val gates = h.gatedSeeds(seedOf(index = TopicDollarIndex(99.9, Instant.parse("2026-08-31T05:00:00Z"), "investing")))
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.dxyFrame(98.5))
+        advanceTimeBy(1)
+        gates.single().complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("R4-B7", 98.5, h.coordinator.rates.value.dollarIndex!!.rate, 0.0)
+        h.cleanUp()
+    }
+
+    // Battery r1 (SM11): a premium refusal latches the grant without a new epoch; a seed for it must still be dropped.
+    @Test
+    fun `R4-B8 a seed for a grant the server refused is dropped`() = runTest {
+        val h = Harness(this)
+        val gates = h.gatedSeeds(seedOf(seedQuote("kb", "usd-krw", 1395.0, "2026-08-31T02:00:00Z")))
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+        gates.single().complete(Unit)
+        advanceTimeBy(1)
+        assertTrue("R4-B8", h.coordinator.rates.value.quotes.values.none { it.source == "kb" })
+        h.cleanUp()
+    }
+
+    // Codex r2 review: the restore provider is outside the session, so a seed must name this grant's fence.
+    @Test
+    fun `R4-B9 a seed that names another fence is dropped`() = runTest {
+        val h = Harness(this)
+        h.restoreProvider = { granted -> TopicLastKnownRestore.Seed(seedOf(seedQuote("kb", "usd-krw", 1395.0, "2026-08-31T02:00:00Z")),
+            fence(uid = "u2"), TopicUseLifetime(granted.grant, 0L)) }
+        h.coordinator.start()
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        assertTrue("R4-B9", h.coordinator.rates.value.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    // Codex r2 review: a refusal latch outlives a withdrawal of the same fence, so granting it again must not read its seed.
+    @Test
+    fun `R4-B10 a fence the server refused is not restored again after a withdrawal and a new grant`() = runTest {
+        val h = Harness(this)
+        h.gatedSeeds(seedOf(seedQuote("kb", "usd-krw", 1395.0, "2026-08-31T02:00:00Z")))
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+        val before = h.restoreCalls.size
+        h.setAccess(false, null)
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        assertEquals("R4-B10", before, h.restoreCalls.size)
+        h.cleanUp()
     }
 }

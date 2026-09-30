@@ -7,7 +7,7 @@ import com.jay.fxi.data.remote.TopicUseLifetime
 import com.jay.fxi.domain.model.TopicRates
 
 /** What a restore under one grant produced; only [Seed] carries prices, and those are display seeds only. */
-internal sealed interface TopicLastKnownRestore {
+sealed interface TopicLastKnownRestore {
     data object NotAdmitted : TopicLastKnownRestore
     data object Withdrawn : TopicLastKnownRestore
     data class Seed(val rates: TopicRates, val fence: TopicSessionFence, val lifetime: TopicUseLifetime) : TopicLastKnownRestore
