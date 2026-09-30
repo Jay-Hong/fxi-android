@@ -14,6 +14,13 @@ import com.jay.fxi.data.entitlements.TopicGrantResult
 import com.jay.fxi.data.entitlements.TopicRejectionLedger
 import com.jay.fxi.data.entitlements.TopicRejectionReservation
 import com.jay.fxi.data.local.FreeTabStore
+import com.jay.fxi.data.local.TopicLastKnownOwner
+import com.jay.fxi.data.local.TopicLastKnownStore
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.emptyPreferences
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import com.jay.fxi.data.remote.dto.SubscriptionAck
 import com.jay.fxi.data.remote.dto.SubscriptionAckTopic
 import com.jay.fxi.data.remote.dto.SubscriptionRejection
@@ -147,7 +154,16 @@ class TopicRuntimeFactoryTest {
         override fun notBeforeMillis(): Long { events += "read"; return 0L }
     }
 
-    private class Harness(test: TestScope) {
+    /** R4-b3: an in-memory Preferences store that counts reads, so the virtual clock drives the last-known store. */
+    private class MemoryPrefs : DataStore<Preferences> {
+        val state = MutableStateFlow(emptyPreferences())
+        var reads = 0
+        override val data: Flow<Preferences> get() = flow { reads += 1; emit(state.value) }
+        override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences =
+            transform(state.value).also { state.value = it }
+    }
+
+    private class Harness(test: TestScope, withLastKnown: Boolean = false) {
         val scheduler = test.testScheduler
         private val parent = test.backgroundScope.coroutineContext[Job]
         val wire = Wire()
@@ -172,6 +188,9 @@ class TopicRuntimeFactoryTest {
             override fun nowMillis(): Long = scheduler.currentTime
             override suspend fun sleep(duration: Duration) = delay(duration)
         }
+        val memory = MemoryPrefs()
+        fun lastKnownOver(prefs: DataStore<Preferences>) = TopicLastKnownStore(prefs, { scheduler.currentTime }, 300L,
+            CoroutineScope(SupervisorJob(parent) + StandardTestDispatcher(scheduler)).also { scopes += it })
         val factory = TopicRuntimeFactory(
             webSocketFactory = { wire },
             webSocketUrl = URL,
@@ -208,7 +227,8 @@ class TopicRuntimeFactoryTest {
             newScope = { CoroutineScope(SupervisorJob(parent) + StandardTestDispatcher(scheduler)).also { scopes += it } },
             encode = { request -> subscribes += request; Json.encodeToString(TopicSubscribeRequest.serializer(), request) },
             newRequestId = { "r${++ids}" },
-            jitter = { 0.0 }
+            jitter = { 0.0 },
+            lastKnown = if (withLastKnown) lastKnownOver(memory) else null
         )
 
         fun asked() = bootstrapCalls.map { it.second }
@@ -401,5 +421,59 @@ class TopicRuntimeFactoryTest {
         advanceTimeBy(5_000)
         assertEquals("fixture: the hook never ran on the loop", null, h.onLiveRead)
         assertEquals("an input queued behind stop opened another socket", 1, h.wire.requests.size)
+    }
+
+    // ---- R4-b3 (Claude-owned contract, 계획 개정 17 R4 준비; R4b/design_codex.r1.md): a factory given the last-known store
+    // hands the session its restore gate and save offer; creating a runtime reads nothing, a started one restores for the grant
+    // and saves the prices it adopted under the grant's owner. Nothing in the app creates or starts a runtime yet. The
+    // implementation reads but does not edit these rows. ----
+
+    private val tetherJson = """{"type":"snapshot","version":1,"topic":"usdt:krw","data":{"usdt_krw":[
+        {"source":"upbit","asset":"usdt-krw","rate":1390.0,"timestamp":"2026-08-31T10:20:00+09:00"}],"usd_krw_banks":[]}}"""
+
+    @Test
+    fun D1_creatingARuntimeWithTheStore_readsNothing() = runTest {
+        val h = Harness(this, withLastKnown = true)
+        h.factory.create()
+        advanceTimeBy(10_000)
+        assertEquals("D1", 0, h.memory.reads)
+    }
+
+    @Test
+    fun D2_aStartedRuntime_restoresForTheGrant() = runTest {
+        val h = Harness(this, withLastKnown = true)
+        h.tabs.stored["u1"] = FreeTab.TETHER
+        val runtime = h.factory.create()
+        advanceTimeBy(1_000)
+        assertEquals("D2: nothing before start", 0, h.memory.reads)
+        runtime.start()
+        runtime.setOnline(true)
+        advanceTimeBy(5_000)
+        assertTrue("D2: the grant restored its seed", h.memory.reads >= 1)
+    }
+
+    @Test
+    fun D3_anAdoptedPriceIsSavedUnderTheGrantsOwner() = runTest {
+        val h = Harness(this, withLastKnown = true)
+        h.bootstrapOutcome = { topic ->
+            if (topic == TETHER) TopicSnapshotOutcome.Delivered(TopicFrameDecoder(Json { ignoreUnknownKeys = true }).decode(tetherJson))
+            else TopicSnapshotOutcome.Degraded
+        }
+        h.tabs.stored["u1"] = FreeTab.TETHER
+        val runtime = h.factory.create()
+        runtime.start()
+        runtime.setOnline(true)
+        advanceTimeBy(10_000)
+        val saved = h.lastKnownOver(h.memory).restore(TopicLastKnownOwner("u1", "epoch-1"))
+        assertEquals("D3", 1390.0, saved.quotes.values.single { it.source == "upbit" }.rate, 0.0)
+    }
+
+    @Test
+    fun D4_lock_onlyTheFactoryUsesTheGate_andNothingCreatesTheFactory() {
+        val main = java.io.File("src/main/java").walkTopDown().filter { it.isFile && it.extension == "kt" }.toList()
+        assertEquals("D4 gate", listOf("TopicRuntime.kt"), main.filter { it.name != "TopicLastKnownRestoreGate.kt" &&
+            it.readText().contains("TopicLastKnownRestoreGate") }.map { it.name })
+        assertEquals("D4 factory", emptyList<String>(), main.filter { it.name != "TopicRuntime.kt" &&
+            it.readText().contains("TopicRuntimeFactory") }.map { it.name })
     }
 }

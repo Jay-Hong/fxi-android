@@ -14,9 +14,13 @@ import com.jay.fxi.data.entitlements.TopicGrantDeliverer
 import com.jay.fxi.data.entitlements.TopicGrantIssuer
 import com.jay.fxi.data.free.FreeSnapshotSchedulePolicy
 import com.jay.fxi.data.local.FreeTabStore
+import com.jay.fxi.data.local.TopicLastKnownOwner
+import com.jay.fxi.data.local.TopicLastKnownRestoreGate
+import com.jay.fxi.data.local.TopicLastKnownStore
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
 import com.jay.fxi.di.WireJson
 import com.jay.fxi.domain.model.FreeTab
+import com.jay.fxi.domain.model.TopicRates
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import com.jay.fxi.util.ApiConfig
 import java.util.UUID
@@ -63,7 +67,9 @@ internal class TopicRuntimeFactory internal constructor(
     private val newScope: () -> CoroutineScope,
     private val encode: (TopicSubscribeRequest) -> String,
     private val newRequestId: () -> String,
-    private val jitter: () -> Double
+    private val jitter: () -> Double,
+    /** Optional store for display seeds and adopted live rates. */
+    private val lastKnown: TopicLastKnownStore? = null
 ) {
     @Inject
     constructor(
@@ -100,6 +106,10 @@ internal class TopicRuntimeFactory internal constructor(
     fun create(): TopicRuntime {
         val scope = newScope()
         val floor = newBootstrapFloor(clock)
+        val restoreGate = lastKnown?.let { TopicLastKnownRestoreGate(it, authority, liveFence) }
+        val offerLive: ((String, String, TopicRates) -> Unit)? = lastKnown?.let { store ->
+            { uid, epoch, rates -> store.offer(TopicLastKnownOwner(uid, epoch), rates) }
+        }
         lateinit var deliverer: TopicGrantDeliverer
         val session = TopicSessionCoordinator(
             scope = scope,
@@ -118,6 +128,8 @@ internal class TopicRuntimeFactory internal constructor(
             newRequestId = newRequestId,
             jitter = jitter,
             liveIdentity = liveFence,
+            restoreSeed = restoreGate?.let { it::restore },
+            offerLive = offerLive,
             onBootstrapHttpEvidence = floor::record,
             bootstrapNotBeforeMillis = floor::notBeforeMillis,
             onRejected = { owner, rejected -> deliverer.forwardRejection(owner, rejected) }

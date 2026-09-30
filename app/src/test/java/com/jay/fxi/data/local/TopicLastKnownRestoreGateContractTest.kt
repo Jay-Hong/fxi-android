@@ -115,6 +115,7 @@ class TopicLastKnownRestoreGateContractTest {
     @Test fun A5_lock_noProductionCaller() {
         val callers = File("src/main/java").walkTopDown().filter { it.isFile && it.extension == "kt" && it.name != "TopicLastKnownRestoreGate.kt" }
             .filter { it.readText().contains("TopicLastKnownRestoreGate") }.map { it.name }.toList()
-        assertEquals("A5", emptyList<String>(), callers)
+        // R4-b3 wires the gate only in the dormant runtime factory; app startup is deferred to R4-c.
+        assertEquals("A5", listOf("TopicRuntime.kt"), callers)
     }
 }
