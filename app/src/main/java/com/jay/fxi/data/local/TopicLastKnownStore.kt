@@ -89,13 +89,19 @@ internal class TopicLastKnownStore internal constructor(
     private val writeMutex = Mutex()
     private val pending = mutableMapOf<OwnerKind, PendingWrite>()
     private val retiredNamespaces = mutableSetOf<String>()
+    private val keptEpochByUid = mutableMapOf<String, String?>()
     private var activeNamespace: String? = null
+
+    /** Called under [stateLock]; a purge fences even epochs with no key yet. */
+    private fun isRetired(owner: TopicLastKnownOwner, namespace: String): Boolean =
+        namespace in retiredNamespaces ||
+            (keptEpochByUid.containsKey(owner.uid) && keptEpochByUid[owner.uid] != owner.userAccessEpoch) ||
+            (activeNamespace != null && activeNamespace != namespace)
 
     /** Empty [TopicRates] when absent; invalid entries must never become a display seed. */
     suspend fun restore(owner: TopicLastKnownOwner): TopicRates {
         val namespace = namespace(owner)
-        if (synchronized(stateLock) { namespace in retiredNamespaces ||
-                (activeNamespace != null && activeNamespace != namespace) }) return TopicRates()
+        if (synchronized(stateLock) { isRetired(owner, namespace) }) return TopicRates()
 
         val preferences = dataStore.data.first()
         val quotes = mutableListOf<TopicQuote>()
@@ -130,7 +136,8 @@ internal class TopicLastKnownStore internal constructor(
                 at?.let { time -> TopicDollarIndex(it.rate, time, it.source) }
             }
         }
-        return TopicRates(dollarIndex = dollarIndex).merge(quotes)
+        val rates = TopicRates(dollarIndex = dollarIndex).merge(quotes)
+        return if (synchronized(stateLock) { isRetired(owner, namespace) }) TopicRates() else rates
     }
 
     /** Non-suspending ingress; implementation will coalesce changed values within five seconds. */
@@ -140,8 +147,7 @@ internal class TopicLastKnownStore internal constructor(
             jsonFor(kind, rates)?.let { kind to it }
         }
         synchronized(stateLock) {
-            if (namespace in retiredNamespaces ||
-                (activeNamespace != null && activeNamespace != namespace)) return
+            if (isRetired(owner, namespace)) return
             val deadline = clock.elapsedRealtimeMillis() + throttleMillis
             values.forEach { (kind, json) ->
                 val target = OwnerKind(owner, kind)
@@ -187,7 +193,7 @@ internal class TopicLastKnownStore internal constructor(
 
     /**
      * S3-P1: removes every namespace of [uid] except `(uid, keepEpoch)` — on disk and still pending — and answers whether
-     * anything was there. Returns only after the removal is on disk; a pending write for a removed namespace never lands.
+     * anything was there. Returns after disk removal; late offers and in-flight reads of retired epochs are fenced.
      */
     suspend fun purgeUser(uid: String, keepEpoch: String?): Boolean = writeMutex.withLock {
         require(uid.isNotBlank())
@@ -197,6 +203,7 @@ internal class TopicLastKnownStore internal constructor(
             name.startsWith(uidPrefix) && (keepPrefix == null || !name.startsWith(keepPrefix))
 
         val removedPending = synchronized(stateLock) {
+            keptEpochByUid[uid] = keepEpoch
             val retired = pending.keys.filter { target ->
                 target.owner.uid == uid && target.owner.userAccessEpoch != keepEpoch
             }
@@ -235,8 +242,8 @@ internal class TopicLastKnownStore internal constructor(
         writeMutex.withLock {
             val value = synchronized(stateLock) {
                 val namespace = namespace(target.owner)
-                if (namespace in retiredNamespaces ||
-                    (activeNamespace != null && activeNamespace != namespace)) {
+                // purgeUser drops a retired epoch's pending write under stateLock, so the keep rule never reaches here.
+                if (namespace in retiredNamespaces || (activeNamespace != null && activeNamespace != namespace)) {
                     pending.remove(target)
                     null
                 } else {
