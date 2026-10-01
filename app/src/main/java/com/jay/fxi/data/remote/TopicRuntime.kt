@@ -35,6 +35,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlinx.serialization.encodeToString
@@ -46,8 +47,8 @@ import okhttp3.WebSocket
  * Assembly boundary for one topic session. [create] builds its scope, store, retry floor, and connectors
  * without starting REST, WebSocket, or grant work.
  *
- * Application wiring, foreground input, topic-state consumers, and the undelivered-bootstrap policy
- * belong to a later slice.
+ * The runtime exposes the session's display state and passes network and foreground input on; application
+ * wiring, the screen that consumes it, and the undelivered-bootstrap policy belong to a later slice.
  */
 internal class TopicRuntimeFactory internal constructor(
     private val webSocketFactory: () -> WebSocket.Factory,
@@ -179,7 +180,12 @@ internal class TopicRuntime internal constructor(
         scope.cancel()
     }
 
+    /** The screen's read-only view of this session. */
+    val display: StateFlow<TopicDisplayState> = session.display
+
     fun setOnline(value: Boolean) = session.setOnline(value)
+
+    fun setForeground(value: Boolean) = session.setForeground(value)
 
     fun selectTab(owner: AuthIdentityFence, tab: FreeTab) = focus.onTabSelected(owner, tab)
 }

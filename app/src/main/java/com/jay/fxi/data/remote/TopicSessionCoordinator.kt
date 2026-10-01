@@ -86,6 +86,28 @@ data class TopicSessionFence(
     val grant: TopicGrantToken
 )
 
+/** The transport alone (R4-c C2): [OPEN] is a socket that opened, never a subscription, a delivery or a fresh price. */
+enum class TopicConnectionDisplay { OFFLINE, DISCONNECTED, OPEN }
+
+/** The account and the grant turn a display belongs to; [grantEpoch] tells a grant ended and given again from the one before. */
+data class TopicDisplayOwner(val identity: AuthIdentityFence, val grantEpoch: Long)
+
+/**
+ * What a premium topic screen may show (R4-c C2): prices only while a grant owner holds them. [containsSeed] says some shown value is
+ * a restored seed no live answer has replaced; it is never delivery, freshness or silence evidence. A screen reads "connected" from
+ * [connection] alone, never from [rates] being non-empty.
+ */
+data class TopicDisplayState(
+    val owner: TopicDisplayOwner?,
+    val rates: TopicRates,
+    val containsSeed: Boolean,
+    val connection: TopicConnectionDisplay
+) {
+    companion object {
+        val NONE = TopicDisplayState(null, TopicRates(), false, TopicConnectionDisplay.OFFLINE)
+    }
+}
+
 /**
  * The access decision a session runs under, as the entitlements side issued it.
  *
@@ -589,6 +611,11 @@ class TopicSessionCoordinator(
     /** Everything the topics have said, under the strictly-newer rule. */
     val rates: StateFlow<TopicRates> = _rates.asStateFlow()
 
+    private val _display = MutableStateFlow(TopicDisplayState.NONE)
+
+    /** The screen's read-only view; see [TopicDisplayState]. */
+    val display: StateFlow<TopicDisplayState> = _display.asStateFlow()
+
     private var loop: Job? = null
     private var generation = 0L
     private var connection: Connection? = null
@@ -753,7 +780,9 @@ class TopicSessionCoordinator(
                 // Reached when the scope is cancelled too. Cancelling the socket alone was not
                 // enough: the store went on reading as confirmed on a connection that no longer
                 // existed, which is the thing `end` exists to prevent. Found by review.
+                stopped = true
                 shutDown()
+                publishDisplay()
             }
         }
     }
@@ -828,6 +857,7 @@ class TopicSessionCoordinator(
     private suspend fun handle(input: SessionInput) {
         if (stopped) return
         dispatch(input)
+        publishDisplay()
         publishIfChanged()
     }
 
@@ -2277,6 +2307,27 @@ class TopicSessionCoordinator(
         onTopicState(next)
     }
 
+    /**
+     * Derives the screen's view from the current grant, held prices and transport. Called after every handled input,
+     * when a connection ends (including from command callbacks), and when the loop ends. A runtime stop may cancel
+     * the scope before its Stop input is handled.
+     */
+    private fun publishDisplay() {
+        val owner = fence?.takeIf { access && !stopped && it != refusedFor && it != identityLostFor }
+            ?.let { TopicDisplayOwner(it.identity, grantEpoch) }
+        val shown = if (owner == null) TopicRates() else _rates.value
+        val containsSeed = owner != null && (
+            shown.quotes.keys.any { it !in liveRates.quotes } ||
+                (shown.dollarIndex != null && liveRates.dollarIndex == null)
+            )
+        val connectionState = when {
+            !online -> TopicConnectionDisplay.OFFLINE
+            connection?.let { it.opened && !it.ended } == true -> TopicConnectionDisplay.OPEN
+            else -> TopicConnectionDisplay.DISCONNECTED
+        }
+        _display.value = TopicDisplayState(owner, shown, containsSeed, connectionState)
+    }
+
     /** Lets go of the request channel, and wakes whatever stood aside for it. */
     private fun releaseControlLane(live: Connection, commandId: Long) {
         if (live.controlOwner != commandId) return
@@ -2483,6 +2534,7 @@ class TopicSessionCoordinator(
         store.clearConnectionState()
 
         if (cause == TopicDisconnectCause.UNEXPECTED && wanted()) scheduleReconnect()
+        publishDisplay()
     }
 
     private fun scheduleReconnect() {

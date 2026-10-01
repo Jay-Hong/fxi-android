@@ -9839,4 +9839,182 @@ class TopicSessionCoordinatorTest {
         assertEquals("R4-C7: the index is offered", 98.5, h.offers.single().third.dollarIndex!!.rate, 0.0)
         h.cleanUp()
     }
+
+    // ---- R4-c C2 (Claude-owned contract; R4c/C2/design_codex.r2.md, rounds r1→r2 agreed): the session's read-only display state.
+    // Prices are shown only under a grant owner; an explicit end, an observed identity loss, a premium refusal and stop clear the
+    // display at once, while a hold keeps it. The session's own rates keep their existing meaning (a plain withdrawal leaves them).
+    // The connection says only whether a socket opened. The implementation reads but does not edit these rows. ----
+
+    private fun Harness.shown() = coordinator.display.value
+    private fun Harness.assertCleared(id: String) {
+        val d = shown()
+        assertNull("$id: no owner", d.owner)
+        assertTrue("$id: no prices shown", d.rates.quotes.isEmpty() && d.rates.dollarIndex == null)
+        assertEquals("$id: no seed", false, d.containsSeed)
+        assertNotEquals("$id: not shown as open", TopicConnectionDisplay.OPEN, d.connection)
+    }
+    /** Granted, online, socket open, one live tether price shown. */
+    private suspend fun TestScope.showingLive(h: Harness) {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        check(h.shown().rates.quotes.isNotEmpty()) { "fixture: a live price is shown" }
+    }
+
+    @Test
+    fun `C2-01 an offline grant shows its seed under its owner, marked as a seed, without delivery evidence`() = runTest {
+        val h = Harness(this)
+        val seed = seedOf(seedQuote("kb", "usd-krw", 1390.0, "2026-08-31T00:00:00Z"))
+        h.restoreProvider = { granted -> TopicLastKnownRestore.Seed(seed, granted, TopicUseLifetime(granted.grant, 0L)) }
+        h.coordinator.start()
+        h.setAccess(true, fence())
+        advanceTimeBy(100)
+        val d = h.shown()
+        assertEquals("C2-01 owner", fence().identity, d.owner?.identity)
+        assertEquals("C2-01 prices", seed, d.rates)
+        assertEquals("C2-01 seed", true, d.containsSeed)
+        assertEquals("C2-01 offline", TopicConnectionDisplay.OFFLINE, d.connection)
+        assertEquals("C2-01 no delivery evidence", 0L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2-02 the connection is told apart from the prices, and a drop keeps owner and prices`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals("C2-02 a socket being opened is not open", TopicConnectionDisplay.DISCONNECTED, h.shown().connection)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("C2-02 open with no price", TopicConnectionDisplay.OPEN to true, h.shown().connection to h.shown().rates.quotes.isEmpty())
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        val owner = h.shown().owner
+        assertEquals("C2-02 owner", fence().identity, owner?.identity)
+        h.wire.drop()
+        advanceTimeBy(1)
+        val d = h.shown()
+        assertEquals("C2-02 disconnected", TopicConnectionDisplay.DISCONNECTED, d.connection)
+        assertEquals("C2-02 owner kept", owner, d.owner)
+        assertEquals("C2-02 price kept", 1390.0, d.rates.quotes.values.single().rate, 0.0)
+        assertEquals("C2-02 a live price is not a seed", false, d.containsSeed)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2-03 a mixed display is marked as containing a seed until live replaces the last seed slot`() = runTest {
+        val h = Harness(this)
+        val gates = h.gatedSeeds(seedOf(seedQuote("kb", "usd-krw", 1395.0, "2026-08-31T00:00:00Z")))
+        showingLive(h)
+        assertEquals("C2-03 live only", false, h.shown().containsSeed)
+        gates.single().complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("C2-03 the seed fills USD", setOf("upbit", "kb"), h.shown().rates.quotes.values.map { it.source }.toSet())
+        assertEquals("C2-03 mixed", true, h.shown().containsSeed)
+        h.wire.deliver(h.fxFrame(1391.0))
+        advanceTimeBy(1)
+        assertEquals("C2-03 live replaced the seed", 1391.0, h.shown().rates.quotes.values.single { it.source == "kb" }.rate, 0.0)
+        assertEquals("C2-03 no seed left", false, h.shown().containsSeed)
+        h.cleanUp()
+    }
+
+    // Battery r1 (PM7): a seed that only fills the dollar index is a seed too, until a live index replaces it.
+    @Test
+    fun `C2-03b a seeded dollar index is marked as a seed until a live index replaces it`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        val gates = h.gatedSeeds(seedOf(index = TopicDollarIndex(99.0, Instant.parse("2026-08-31T00:00:00Z"), "investing")))
+        showingLive(h)
+        gates.single().complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("C2-03b the seed fills the index", 99.0, h.shown().rates.dollarIndex!!.rate, 0.0)
+        assertEquals("C2-03b index seed", true, h.shown().containsSeed)
+        h.wire.deliver(h.dxyFrame(98.5))
+        advanceTimeBy(1)
+        assertEquals("C2-03b live index", 98.5, h.shown().rates.dollarIndex!!.rate, 0.0)
+        assertEquals("C2-03b no seed left", false, h.shown().containsSeed)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2-04 an explicit end of the same fence clears the display at once, and the grant given again is a new owner turn`() = runTest {
+        val h = Harness(this)
+        showingLive(h)
+        val before = checkNotNull(h.shown().owner)
+        h.coordinator.setAccess(false, fence(), TopicGrantOrigin.NewContext)
+        advanceTimeBy(1)
+        h.assertCleared("C2-04 withdrawn")
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        val after = h.shown().owner
+        assertEquals("C2-04 same account", fence().identity, after?.identity)
+        assertNotEquals("C2-04 a new owner turn", before.grantEpoch, after?.grantEpoch)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2-05 an observed identity loss clears the display, and the next account sees none of the earlier prices`() = runTest {
+        val h = Harness(this)
+        showingLive(h)
+        h.liveFence = null
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        h.assertCleared("C2-05 lost")
+        h.setAccess(true, fence(uid = "u2"))
+        advanceTimeBy(1)
+        assertEquals("C2-05 new owner", "u2", h.shown().owner?.identity?.uid)
+        assertTrue("C2-05 no earlier price", h.shown().rates.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    // r2: one harness per test — cleanUp cancels the runTest background scope a second harness would run on.
+    @Test
+    fun `C2-07a a premium refusal clears the display`() = runTest {
+        val h = Harness(this)
+        showingLive(h)
+        // Codex C2 commit review r1: the refusal is settled inside the command's own callback, before any input is handled.
+        var checkedAtRefusal = false
+        h.refusalSink = { _, _ ->
+            h.assertCleared("C2-07a before refusal hand-over")
+            checkedAtRefusal = true
+        }
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+        assertTrue("C2-07a refusal callback ran", checkedAtRefusal)
+        h.assertCleared("C2-07a refused")
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2-07b stop clears the display`() = runTest {
+        val h = Harness(this)
+        showingLive(h)
+        h.coordinator.stop()
+        advanceTimeBy(1)
+        h.assertCleared("C2-07b stopped")
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2-08 a hold keeps owner and prices, and its release is not a new grant`() = runTest {
+        val h = Harness(this, bootstrapIssueGap = 10.seconds)
+        val access = h.publishedAccess()
+        val wire = acknowledgedUnder(h)
+        wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        val owner = checkNotNull(h.shown().owner)
+        access.hold()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals("C2-08 owner kept", owner, h.shown().owner)
+        assertEquals("C2-08 price kept", 1390.0, h.shown().rates.quotes.values.single().rate, 0.0)
+        assertEquals("C2-08 the held connection ended", TopicConnectionDisplay.DISCONNECTED, h.shown().connection)
+        access.release()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals("C2-08 release is the same owner turn", owner, h.shown().owner)
+        h.cleanUp()
+    }
 }

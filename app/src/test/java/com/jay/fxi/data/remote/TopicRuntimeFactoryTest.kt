@@ -98,6 +98,7 @@ class TopicRuntimeFactoryTest {
             socket,
             Response.Builder().request(socket.request()).protocol(Protocol.HTTP_1_1).code(101).message("").build()
         )
+        fun drop() = listener!!.onFailure(socket, java.io.IOException("dropped"), null)
         fun deliver(text: String) = listener!!.onMessage(socket, text)
     }
 
@@ -475,5 +476,41 @@ class TopicRuntimeFactoryTest {
             it.readText().contains("TopicLastKnownRestoreGate") }.map { it.name })
         assertEquals("D4 factory", emptyList<String>(), main.filter { it.name != "TopicRuntime.kt" &&
             it.readText().contains("TopicRuntimeFactory") }.map { it.name })
+    }
+
+    // R4-c C2-06 (Claude-owned contract; R4c/C2/design_codex.r2.md): the runtime exposes its session's display state and passes a
+    // foreground return on — observed as the coming-back reconnection that skips the waiting rung.
+    @Test
+    fun `C2-06 the runtime shows its session's display and passes the foreground on`() = runTest {
+        val (h, runtime) = running()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("C2-06 display owner", U1, runtime.display.value.owner?.identity)
+        assertEquals("C2-06 display connection", TopicConnectionDisplay.OPEN, runtime.display.value.connection)
+        h.wire.drop()
+        advanceTimeBy(100)
+        assertEquals("C2-06 fixture: the reconnection waits on its rung", 1, h.wire.requests.size)
+        runtime.setForeground(true)
+        advanceTimeBy(1)
+        assertEquals("C2-06 coming back reconnects at once", 2, h.wire.requests.size)
+        runtime.stop()
+    }
+
+    // Battery r1 (PM13·PM14): a runtime stop posts Stop and cancels the scope at once, so the loop can end before handling it; the
+    // display must still be cleared.
+    @Test
+    fun `C2-07c a runtime stop clears the display even when its scope ends before the Stop input`() = runTest {
+        val (h, runtime) = running()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        check(runtime.display.value.owner != null) { "fixture: an owner is shown" }
+        runtime.stop()
+        advanceTimeBy(1)
+        val d = runtime.display.value
+        assertEquals("C2-07c no owner", null, d.owner)
+        assertTrue("C2-07c no prices", d.rates.quotes.isEmpty())
+        assertTrue("C2-07c not open", d.connection != TopicConnectionDisplay.OPEN)
     }
 }
