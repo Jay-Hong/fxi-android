@@ -23,15 +23,22 @@ data class TopicRateDisplay(val scales: List<RateScale>, val dollarIndex: TopicD
 fun TopicRates.displayFor(
     tab: FreeTab,
     preferences: Map<RateRowList, RateRowPreference>? = null
-): TopicRateDisplay {
-    val scales = when (tab) {
+): TopicRateDisplay = TopicRateDisplay(freeRateFor(tab)?.asRateScales(preferences).orEmpty(), dollarIndex)
+
+/** The rosters [tab]'s editor offers, hidden sources included (R4-c C3b); the same sources [displayFor] draws from. */
+fun TopicRates.editableRostersFor(tab: FreeTab): Map<RateRowList, List<RateQuote>> =
+    freeRateFor(tab)?.editableRosters().orEmpty()
+
+/** One source projection for both the displayed rows and the editor's unfiltered roster. */
+private fun TopicRates.freeRateFor(tab: FreeTab): FreeRate? =
+    when (tab) {
         FreeTab.USD, FreeTab.JPY, FreeTab.EUR -> {
             val asset = RateSourceSets.TAB_ASSETS.getValue(requireNotNull(tab.serverTab))
             FreeRate.Flat(
                 asset,
                 RateSourceSets.PREMIUM_FX_SOURCES.mapNotNull { quotes[TopicQuoteKey(it, asset)] }
                     .map { ExchangeRate(asset, it.source, it.rate, it.at) }
-            ).asRateScales(preferences)
+            )
         }
 
         FreeTab.TETHER -> {
@@ -45,10 +52,8 @@ fun TopicRates.displayFor(
                     .map { ExchangeRate(it.asset, it.source, it.rate, it.at) },
                 usdKrwReference = quotes[TopicQuoteKey(RateSourceSets.USD_KRW_REFERENCE, usdAsset)]
                     ?.let { ExchangeRate(it.asset, it.source, it.rate, it.at) }
-            ).asRateScales(preferences)
+            )
         }
 
-        FreeTab.NEWS -> emptyList()
+        FreeTab.NEWS -> null
     }
-    return TopicRateDisplay(scales, dollarIndex)
-}
