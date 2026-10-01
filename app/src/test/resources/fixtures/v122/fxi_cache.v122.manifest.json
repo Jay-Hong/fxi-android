@@ -1,0 +1,57 @@
+{
+ "label": "소스 재현 합성 입력 — 구버전 소스(6cea639)의 debug 앱에서 계측 시험이 옛 writer 를 직접 호출해 생성; 배포본 아님",
+ "scope": "C0 시험의 입력 형식과 키 처리 검증용. 미증명: 배포 바이너리·UI 경로·두 축 은퇴~fresh 승인 전체 업그레이드(개정 17, P3-i 전)",
+ "source_commit": "6cea63951f1f9abf204997f86cb6fbe34c113c67 (versionName 1.2.2, versionCode 15; dbfad63..6cea639 data/local·CacheService·build·libs 변경 0)",
+ "capture_test": {
+  "file": "V122CacheCaptureTest.kt",
+  "sha256": "1a6ced9804b24ec9956eba3e2e2aeeb154836347292f392f53eb807135f27849",
+  "app_source_changes": "none (only this androidTest file added; git status in capture_worktree_status.txt)"
+ },
+ "build_aux_input": {
+  "file": "fake_google_services.json",
+  "sha256": "ff884ea23bf9372bfeb70707d3550b8c3cd5a6ba4858eafd5bd0997796068245",
+  "note": "직접 작성한 가짜 설정(실제 파일 읽기·복사 0), commit 하지 않음"
+ },
+ "apks": [
+  "51a132dc5e37a09ccc40ac995f4b42b32673ce74ab923414435d4b6521155547  app/build/outputs/apk/debug/app-debug.apk",
+  "3ce3c53f6ba471a30d15d09edd50d9bb55390e699e375ccf5999cf85b6f8484d  app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk"
+ ],
+ "device": [
+  "List of devices attached",
+  "emulator-5554          device product:sdk_gphone64_arm64 model:sdk_gphone64_arm64 device:emulator64_arm64 transport_id:2",
+  "",
+  "google/sdk_gphone64_arm64/emulator64_arm64:12/SE1B.240122.005/11418786:userdebug/dev-keys",
+  "userdebug",
+  "sdk_gphone64_arm64"
+ ],
+ "network": "wifi·data 비활성 + airplane_mode_on=1 상태에서 실행; logcat okhttp/UnknownHost/HttpURLConnection 0건",
+ "commands": [
+  "adb uninstall com.jay.fxi (prior dev build, see emulator_prior_state.txt)",
+  "adb install -r -t app-debug.apk",
+  "adb install -r -t app-debug-androidTest.apk",
+  "adb shell pm clear com.jay.fxi",
+  "adb shell am instrument -w -e class com.jay.fxi.V122CacheCaptureTest com.jay.fxi.test/androidx.test.runner.AndroidJUnitRunner",
+  "adb shell am force-stop com.jay.fxi",
+  "adb root",
+  "adb pull /data/data/com.jay.fxi/files/datastore/fxi_cache.preferences_pb"
+ ],
+ "instrument_result": "com.jay.fxi.V122CacheCaptureTest:.\n\nTime: 0.068\n\nOK (1 test)",
+ "files_dir": [
+  "total 16",
+  "drwx------ 2 u0_a150 u0_a150 4096 2026-10-01 19:56 firebaseSessions",
+  "-rw------- 1 u0_a150 u0_a150  354 2026-10-01 19:56 fxi_cache.preferences_pb"
+ ],
+ "raw_file": {
+  "name": "fxi_cache.v122.preferences_pb",
+  "bytes": 354,
+  "sha256_device": "d91a05a9f16aaf63f35b8474859315cd03d6443e7aeaa77b8bb20ebc5ed78bb2",
+  "sha256_host": "d91a05a9f16aaf63f35b8474859315cd03d6443e7aeaa77b8bb20ebc5ed78bb2"
+ },
+ "decoded_keys": {
+  "rates": "string (JSON, 3 entries)",
+  "rates_timestamp": "long 1790852161736 (capture-time System.currentTimeMillis)",
+  "last_bank_usd-krw": "string kb",
+  "last_bank_jpy-krw": "string hana"
+ },
+ "procedural_note": "첫 실행에서 설치 실패(저장 공간 부족) 전에 pm clear 가 기존 개발 빌드(1.0.2) 데이터를 지움 — 실사용자 데이터 아님, emulator_prior_state.txt"
+}
