@@ -81,7 +81,8 @@ internal class TopicRuntimeFactory internal constructor(
         bootstrapService: TopicSnapshotBootstrapService,
         decoder: TopicFrameDecoder,
         tabs: FreeTabStore,
-        @WireJson json: Json
+        @WireJson json: Json,
+        lastKnown: TopicLastKnownStore
     ) : this(
         webSocketFactory = ::buildWebSocketClient,
         webSocketUrl = ApiConfig.WS_URL,
@@ -100,7 +101,8 @@ internal class TopicRuntimeFactory internal constructor(
         newScope = { CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1)) },
         encode = { json.encodeToString(it) },
         newRequestId = { UUID.randomUUID().toString() },
-        jitter = { Random.nextDouble() }
+        jitter = { Random.nextDouble() },
+        lastKnown = lastKnown
     )
 
     fun create(): TopicRuntime {
