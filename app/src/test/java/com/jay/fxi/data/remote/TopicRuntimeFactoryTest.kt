@@ -19,6 +19,7 @@ import com.jay.fxi.data.local.TopicLastKnownStore
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.emptyPreferences
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import com.jay.fxi.data.remote.dto.SubscriptionAck
@@ -512,5 +513,25 @@ class TopicRuntimeFactoryTest {
         assertEquals("C2-07c no owner", null, d.owner)
         assertTrue("C2-07c no prices", d.rates.quotes.isEmpty())
         assertTrue("C2-07c not open", d.connection != TopicConnectionDisplay.OPEN)
+    }
+
+    // R4-c C3a-07 (Claude-owned contract; R4c/C3/design_codex.r3.md): the runtime passes on its focus provider's accepted tab, and
+    // watching it adds nothing to the session's plan.
+    @Test
+    fun `C3a-07 the runtime shows the restored tab, and watching it adds no request`() = runTest {
+        val (plain, plainRuntime) = running(FreeTab.TETHER)
+        advanceTimeBy(3_000)
+        val baseline = plain.asked()
+        plainRuntime.stop()
+
+        val (h, runtime) = running(FreeTab.TETHER)
+        val seen = mutableListOf<OwnedTopicFocus?>()
+        val watcher = backgroundScope.launch { runtime.focus.collect { seen += it } }
+        advanceTimeBy(3_000)
+        assertEquals("C3a-07 shown", OwnedTopicFocus(U1, FreeTab.TETHER), runtime.focus.value)
+        assertEquals("C3a-07 watched", OwnedTopicFocus(U1, FreeTab.TETHER), seen.last())
+        assertEquals("C3a-07 same plan as without a watcher", baseline, h.asked())
+        watcher.cancel()
+        runtime.stop()
     }
 }

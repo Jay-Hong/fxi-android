@@ -156,7 +156,7 @@ internal class TopicRuntime internal constructor(
     private val scope: CoroutineScope,
     private val session: TopicSessionCoordinator,
     private val deliverer: TopicGrantDeliverer,
-    private val focus: TopicFocusProvider,
+    private val focusProvider: TopicFocusProvider,
     private val recoveries: AuthCredentialRecoveryStream
 ) {
     private var started = false
@@ -168,7 +168,7 @@ internal class TopicRuntime internal constructor(
         started = true
         session.start()
         deliverer.start()
-        focus.start()
+        focusProvider.start()
         recoveries.observe(session::onCredentialRecovered)
     }
 
@@ -187,7 +187,10 @@ internal class TopicRuntime internal constructor(
 
     fun setForeground(value: Boolean) = session.setForeground(value)
 
-    fun selectTab(owner: AuthIdentityFence, tab: FreeTab) = focus.onTabSelected(owner, tab)
+    /** The tab the focus provider accepted for the live identity; see [OwnedTopicFocus]. */
+    val focus: StateFlow<OwnedTopicFocus?> = focusProvider.focus
+
+    fun selectTab(owner: AuthIdentityFence, tab: FreeTab) = focusProvider.onTabSelected(owner, tab)
 }
 
 /** Replaceable boundary for one session's bootstrap HTTP retry floor. */

@@ -7,7 +7,13 @@ import com.jay.fxi.domain.model.FreeTab
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+
+/** A tab the focus provider accepted for [identity] (R4-c C3a): restored or chosen — not the session having handled it. */
+internal data class OwnedTopicFocus(val identity: AuthIdentityFence, val tab: FreeTab)
 
 /**
  * L-4f: tells the topic session which tab is shown. On each identity it restores that UID's last tab and hands it to
@@ -34,6 +40,11 @@ internal class TopicFocusProvider(
     private val writes = Channel<Pair<String, FreeTab>>(Channel.UNLIMITED)
     private var started = false
 
+    private val _focus = MutableStateFlow<OwnedTopicFocus?>(null)
+
+    /** The latest accepted tab, or null before the live identity's restore settles. A state, not a log of every choice. */
+    val focus: StateFlow<OwnedTopicFocus?> = _focus.asStateFlow()
+
     @Synchronized
     fun start() {
         if (started) return
@@ -48,6 +59,7 @@ internal class TopicFocusProvider(
                         if (event.owner != liveFence() || event.owner == active) continue
                         active = event.owner
                         selected = false
+                        _focus.value = null
                         val owner = event.owner ?: continue
                         scope.launch restore@{
                             val tab = try {
@@ -63,6 +75,7 @@ internal class TopicFocusProvider(
                     is Event.Restored -> {
                         if (event.owner == active && !selected && liveFence() == event.owner) {
                             setFocus(event.owner, event.tab)
+                            _focus.value = OwnedTopicFocus(event.owner, event.tab)
                         }
                     }
                     is Event.Selected -> {
@@ -70,6 +83,7 @@ internal class TopicFocusProvider(
                         active = event.owner
                         selected = true
                         setFocus(event.owner, event.tab)
+                        _focus.value = OwnedTopicFocus(event.owner, event.tab)
                         writes.send(event.owner.uid to event.tab)
                     }
                 }
