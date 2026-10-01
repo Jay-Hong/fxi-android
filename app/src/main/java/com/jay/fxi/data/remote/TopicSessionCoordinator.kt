@@ -93,6 +93,17 @@ enum class TopicConnectionDisplay { OFFLINE, DISCONNECTED, OPEN }
 data class TopicDisplayOwner(val identity: AuthIdentityFence, val grantEpoch: Long)
 
 /**
+ * Where the automatic reconnection stands (R4-c C2+a). [Exhausted]: the session wants a connection but the automatic ladder has no
+ * rung left — the state a manual retry is offered for. Never a delivery or freshness claim.
+ */
+sealed interface TopicRecoveryDisplay {
+    data object None : TopicRecoveryDisplay
+    data object Connecting : TopicRecoveryDisplay
+    data class Reconnecting(val attempt: Int) : TopicRecoveryDisplay
+    data object Exhausted : TopicRecoveryDisplay
+}
+
+/**
  * What a premium topic screen may show (R4-c C2): prices only while a grant owner holds them. [containsSeed] says some shown value is
  * a restored seed no live answer has replaced; it is never delivery, freshness or silence evidence. A screen reads "connected" from
  * [connection] alone, never from [rates] being non-empty.
@@ -101,7 +112,8 @@ data class TopicDisplayState(
     val owner: TopicDisplayOwner?,
     val rates: TopicRates,
     val containsSeed: Boolean,
-    val connection: TopicConnectionDisplay
+    val connection: TopicConnectionDisplay,
+    val recovery: TopicRecoveryDisplay = TopicRecoveryDisplay.None
 ) {
     companion object {
         val NONE = TopicDisplayState(null, TopicRates(), false, TopicConnectionDisplay.OFFLINE)
@@ -282,6 +294,9 @@ private sealed interface SessionInput {
      * even `stop()` could not close it. Found by review.
      */
     data class ReconnectDue(val ticket: Long) : SessionInput
+
+    /** A manual connection retry, carrying the display owner that offered it. */
+    data class RetryConnection(val owner: TopicDisplayOwner) : SessionInput
 
     /**
      * A command found, at its send, that the access its connection's use serves no longer admits it (L-4e E2a).
@@ -622,6 +637,7 @@ class TopicSessionCoordinator(
     private var reconnectJob: Job? = null
     private var reconnectTicket = 0L
     private var reconnectAttempt = 0
+    private var recovery: TopicRecoveryDisplay = TopicRecoveryDisplay.None
     private var commandSerial = 0L
     private var stopped = false
 
@@ -788,6 +804,9 @@ class TopicSessionCoordinator(
     }
 
     fun setForeground(value: Boolean) = post(SessionInput.Foreground(value))
+
+    /** A user's retry of an exhausted connection for [owner] (R4-c C2+a); anything else is ignored on the session's loop. */
+    fun retryConnection(owner: TopicDisplayOwner) = post(SessionInput.RetryConnection(owner))
 
     fun setOnline(value: Boolean) = post(SessionInput.Online(value))
 
@@ -1196,7 +1215,23 @@ class TopicSessionCoordinator(
             is SessionInput.ReconnectDue -> {
                 if (input.ticket != reconnectTicket) return
                 reconnectJob = null
-                if (wanted() && connection == null) open()
+                if (wanted() && connection == null) {
+                    open(TopicRecoveryDisplay.Reconnecting(reconnectAttempt))
+                } else {
+                    // The reservation is spent. A hold released before publication must not revive its Reconnecting display.
+                    recovery = TopicRecoveryDisplay.None
+                }
+            }
+
+            is SessionInput.RetryConnection -> {
+                val held = fence ?: return
+                if (input.owner.identity != held.identity || input.owner.grantEpoch != grantEpoch) return
+                // Exhausted is written only with no connection or reservation and a spent ladder. Losing sessionWanted
+                // clears it via cancelReconnect; resetting the ladder clears it before another input can be handled.
+                if (recovery != TopicRecoveryDisplay.Exhausted) return
+                if (!enforceLiveIdentity(held) || !wanted()) return
+                reconnectAttempt = 0
+                open()
             }
 
             SessionInput.Stop -> {
@@ -1415,9 +1450,14 @@ class TopicSessionCoordinator(
         pumpBootstraps()
     }
 
-    private fun open() {
+    private fun open(recoveryState: TopicRecoveryDisplay = TopicRecoveryDisplay.Connecting) {
         // Acquired before anything is numbered or opened: a publication between `wanted()` and here does not open a socket.
-        val lifetime = useLifetime() ?: return
+        val lifetime = useLifetime() ?: run {
+            // A retry already reset the ladder. A hold released before publication must not restore the old Exhausted display.
+            recovery = TopicRecoveryDisplay.None
+            return
+        }
+        recovery = recoveryState
         val number = ++generation
         val firstAttempt = !everAttempted
         everAttempted = true
@@ -1430,7 +1470,8 @@ class TopicSessionCoordinator(
             // one attempt. Only one of them can reach this session: the transport is never handed
             // back, so nothing collects its events, and the exception is the whole report.
             // Asked again rather than trusting the lifetime just acquired: the issuer can publish while `connect` runs.
-            if (wanted()) scheduleReconnect()
+            // If that answer withholds a start, a release before publication must not show the failed attempt still connecting.
+            if (wanted()) scheduleReconnect() else recovery = TopicRecoveryDisplay.None
             return
         }
         val live = Connection(number, transport, fence ?: return, lifetime, firstAttempt)
@@ -1455,6 +1496,7 @@ class TopicSessionCoordinator(
                     return
                 }
                 live.opened = true
+                recovery = TopicRecoveryDisplay.None
                 live.timers += after(TopicReconnectPolicy.STABILITY_RESET) {
                     post(SessionInput.StableFor(live.generation))
                 }
@@ -2325,7 +2367,15 @@ class TopicSessionCoordinator(
             connection?.let { it.opened && !it.ended } == true -> TopicConnectionDisplay.OPEN
             else -> TopicConnectionDisplay.DISCONNECTED
         }
-        _display.value = TopicDisplayState(owner, shown, containsSeed, connectionState)
+        // A hold keeps prices and may keep a reserved rung, but offers no connection recovery while a new use is withheld.
+        // This only filters the display: it neither cancels that reservation nor resets the ladder.
+        // wanted() excludes every ownerless state except stop; shutDown clears recovery before stop is published.
+        val shownRecovery = if (recovery != TopicRecoveryDisplay.None && wanted()) {
+            recovery
+        } else {
+            TopicRecoveryDisplay.None
+        }
+        _display.value = TopicDisplayState(owner, shown, containsSeed, connectionState, shownRecovery)
     }
 
     /** Lets go of the request channel, and wakes whatever stood aside for it. */
@@ -2527,6 +2577,8 @@ class TopicSessionCoordinator(
         live.timers.forEach(Job::cancel)
         live.transport.cancel()
         if (connection === live) connection = null
+        // If an unopened connection ends while wanted() is false, a release before publication must not revive Connecting.
+        recovery = TopicRecoveryDisplay.None
 
         // Desired survives a connection; everything the server told us about it does not. Called
         // at the *end* rather than at the next open, because between the two there is no
@@ -2539,9 +2591,14 @@ class TopicSessionCoordinator(
 
     private fun scheduleReconnect() {
         if (reconnectJob != null) return
-        val next = TopicReconnectPolicy.nextAttempt(reconnectAttempt) ?: return
+        val next = TopicReconnectPolicy.nextAttempt(reconnectAttempt) ?: run {
+            recovery = TopicRecoveryDisplay.Exhausted
+            return
+        }
+        // Null only for a jitter outside [0, 1]; the production source is Random.nextDouble(), so this is not a state to display.
         val delay = TopicReconnectPolicy.delayFor(next, jitter()) ?: return
         reconnectAttempt = next
+        recovery = TopicRecoveryDisplay.Reconnecting(next)
         val ticket = ++reconnectTicket
         reconnectJob = after(delay) { post(SessionInput.ReconnectDue(ticket)) }
     }
@@ -2567,6 +2624,8 @@ class TopicSessionCoordinator(
         reconnectJob?.cancel()
         reconnectJob = null
         reconnectTicket++
+        // Also clears Exhausted on stop: wanted() itself does not test stopped (C2+a-01b).
+        recovery = TopicRecoveryDisplay.None
     }
 
     private fun resubscribeJitter(): Duration =

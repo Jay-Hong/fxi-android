@@ -10017,4 +10017,223 @@ class TopicSessionCoordinatorTest {
         assertEquals("C2-08 release is the same owner turn", owner, h.shown().owner)
         h.cleanUp()
     }
+
+    // ---- R4-c C2+a (Claude-owned contract; R4c/C3c/design_codex.r2.md, rounds r1→r2 agreed): the display says where the automatic
+    // reconnection stands — connecting, reconnecting on rung n, or exhausted — and a user's retry of an exhausted connection for the
+    // current owner restarts the ladder with one connection. The existing reset rules (an open, an ACK or a price does not reset; thirty
+    // seconds of an open connection does) are unchanged. The implementation reads but does not edit these rows. ----
+
+    private fun Harness.recovery() = coordinator.display.value.recovery
+    /** Fails the first connection and every automatic one, until no rung is left: six sockets in all. */
+    private suspend fun TestScope.exhaust(h: Harness) {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.drop()
+        advanceTimeBy(1)
+        for (n in 1..5) {
+            advanceTimeBy(1_600L * n + 10)
+            h.wire.drop()
+            advanceTimeBy(1)
+        }
+        check(h.wires.size == 6) { "fixture: six sockets, got ${h.wires.size}" }
+    }
+
+    @Test
+    fun `C2+a-01 the display follows the ladder rung by rung, and an exhausted ladder connects no more`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals("C2+a-01 first connection", TopicRecoveryDisplay.Connecting, h.recovery())
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("C2+a-01 open", TopicRecoveryDisplay.None, h.recovery())
+        h.wire.drop()
+        advanceTimeBy(1)
+        for (n in 1..5) {
+            assertEquals("C2+a-01 rung $n scheduled", TopicRecoveryDisplay.Reconnecting(n), h.recovery())
+            advanceTimeBy(1_600L * n + 10)
+            assertEquals("C2+a-01 rung $n connects", n + 1, h.wires.size)
+            assertEquals("C2+a-01 rung $n connecting", TopicRecoveryDisplay.Reconnecting(n), h.recovery())
+            h.wire.drop()
+            advanceTimeBy(1)
+        }
+        assertEquals("C2+a-01 exhausted", TopicRecoveryDisplay.Exhausted, h.recovery())
+        advanceTimeBy(120_000)
+        assertEquals("C2+a-01 no automatic connection after", 6, h.wires.size)
+        assertEquals("C2+a-01 still exhausted", TopicRecoveryDisplay.Exhausted, h.recovery())
+        h.coordinator.setOnline(false)
+        advanceTimeBy(1)
+        assertTrue("C2+a-01 offline is not exhaustion", h.recovery() !is TopicRecoveryDisplay.Exhausted)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2+a-01b a stopped session shows no recovery`() = runTest {
+        val h = Harness(this)
+        exhaust(h)
+        h.coordinator.stop()
+        advanceTimeBy(1)
+        assertEquals("C2+a-01b", TopicRecoveryDisplay.None, h.recovery())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2+a-02 an open connection or a price does not reset the ladder, thirty seconds of one does`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.drop()
+        advanceTimeBy(1_611)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertEquals("C2+a-02 open", TopicRecoveryDisplay.None, h.recovery())
+        h.wire.drop()
+        advanceTimeBy(1)
+        assertEquals("C2+a-02 open and a price do not reset", TopicRecoveryDisplay.Reconnecting(2), h.recovery())
+        advanceTimeBy(3_210)
+        h.wire.open()
+        advanceTimeBy(30_010)
+        h.wire.drop()
+        advanceTimeBy(1)
+        assertEquals("C2+a-02 thirty seconds open resets", TopicRecoveryDisplay.Reconnecting(1), h.recovery())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2+a-03 only the current owner's retry of an exhausted connection connects, once, and restarts the ladder`() = runTest {
+        val h = Harness(this)
+        exhaust(h)
+        val owner = checkNotNull(h.coordinator.display.value.owner)
+        h.coordinator.retryConnection(owner.copy(grantEpoch = owner.grantEpoch + 1))
+        h.coordinator.retryConnection(TopicDisplayOwner(fence(uid = "u2").identity, owner.grantEpoch))
+        advanceTimeBy(1)
+        assertEquals("C2+a-03 stale owners connect nothing", 6, h.wires.size)
+        assertEquals("C2+a-03 still exhausted", TopicRecoveryDisplay.Exhausted, h.recovery())
+        h.coordinator.retryConnection(owner)
+        h.coordinator.retryConnection(owner)
+        advanceTimeBy(1)
+        assertEquals("C2+a-03 one connection for repeated clicks", 7, h.wires.size)
+        assertEquals("C2+a-03 connecting", TopicRecoveryDisplay.Connecting, h.recovery())
+        h.wire.drop()
+        advanceTimeBy(1)
+        assertEquals("C2+a-03 the ladder restarted", TopicRecoveryDisplay.Reconnecting(1), h.recovery())
+        h.coordinator.retryConnection(owner)
+        advanceTimeBy(1)
+        assertEquals("C2+a-03 not exhausted: ignored", 7, h.wires.size)
+        assertEquals("C2+a-03 rung kept", TopicRecoveryDisplay.Reconnecting(1), h.recovery())
+        h.cleanUp()
+    }
+
+    // Battery r1 (RM18), Codex APPROVE: a display owner that still matches is not enough when the live identity moved before the click.
+    @Test
+    fun `C2+a-03b a retry after the live identity moved connects nothing`() = runTest {
+        val h = Harness(this)
+        exhaust(h)
+        val owner = checkNotNull(h.coordinator.display.value.owner)
+        h.liveFence = fence(generation = 2L).identity
+        h.coordinator.retryConnection(owner)
+        advanceTimeBy(1)
+        assertEquals("C2+a-03b", 6, h.wires.size)
+        h.cleanUp()
+    }
+
+    // Battery r1 (RM11): a hold withholds any new use, so a rung still reserved under it is not offered as recovery.
+    @Test
+    fun `C2+a-05 a hold shows no recovery while a rung is reserved`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.drop()
+        advanceTimeBy(1)
+        check(h.recovery() == TopicRecoveryDisplay.Reconnecting(1)) { "fixture: rung 1 reserved, got ${h.recovery()}" }
+        access.hold()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals("C2+a-05", TopicRecoveryDisplay.None, h.recovery())
+        h.cleanUp()
+    }
+
+    // Battery r2 (RM17·RM15·RM16·RM13): a hold that refuses a start and is released before the turn publishes must not leave a stale
+    // recovery behind. The issuer's release is staged inside its own acquire answer (afterAcquire), so it lands between the refusal and
+    // the display. No tab is focused, so no bootstrap asks the issuer in between.
+    private fun Harness.releasedRecovery(access: PublishedAccess, id: String, refusalsBefore: Int) {
+        check(access.events.count { it == "acquire:false" } > refusalsBefore) { "fixture $id: the start was refused" }
+        assertEquals(id, TopicRecoveryDisplay.None, recovery())
+    }
+
+    @Test
+    fun `C2+a-06 a reservation refused at its due time leaves no Reconnecting behind`() = runTest {
+        val h = Harness(this).apply { autoFocus = null }
+        val access = h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.drop()
+        advanceTimeBy(1)
+        check(h.recovery() == TopicRecoveryDisplay.Reconnecting(1)) { "fixture: rung 1 reserved" }
+        val refused = access.events.count { it == "acquire:false" }
+        access.hold()
+        access.afterAcquire = { access.release() }
+        advanceTimeBy(1_610)
+        h.releasedRecovery(access, "C2+a-06", refused)
+        assertEquals("C2+a-06 no connection", 1, h.wires.size)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2+a-07 a retry whose open is refused does not show the reset ladder as exhausted`() = runTest {
+        val h = Harness(this).apply { autoFocus = null }
+        val access = h.publishedAccess()
+        exhaust(h)
+        val owner = checkNotNull(h.coordinator.display.value.owner)
+        val refused = access.events.count { it == "acquire:false" }
+        access.afterAcquire = { access.hold(); access.afterAcquire = { access.release() } }
+        h.coordinator.retryConnection(owner)
+        advanceTimeBy(1)
+        h.releasedRecovery(access, "C2+a-07", refused)
+        assertEquals("C2+a-07 no connection", 6, h.wires.size)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2+a-08 a failed connect whose retry is refused does not show the attempt still running`() = runTest {
+        val h = Harness(this).apply { autoFocus = null }
+        val access = h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.drop()
+        advanceTimeBy(1)
+        val refused = access.events.count { it == "acquire:false" }
+        h.failConnects = 1
+        access.afterAcquire = { access.afterAcquire = { access.hold(); access.afterAcquire = { access.release() } } }
+        advanceTimeBy(1_610)
+        h.releasedRecovery(access, "C2+a-08", refused)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `C2+a-09 an unopened connection that ends while refused does not show Connecting`() = runTest {
+        val h = Harness(this).apply { autoFocus = null }
+        val access = h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        check(h.recovery() == TopicRecoveryDisplay.Connecting) { "fixture: connecting" }
+        val refused = access.events.count { it == "acquire:false" }
+        access.hold()
+        access.afterAcquire = { access.release() }
+        h.wire.drop()
+        advanceTimeBy(1)
+        h.releasedRecovery(access, "C2+a-09", refused)
+        h.cleanUp()
+    }
 }

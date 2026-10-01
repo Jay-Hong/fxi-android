@@ -534,4 +534,25 @@ class TopicRuntimeFactoryTest {
         watcher.cancel()
         runtime.stop()
     }
+
+    // R4-c C2+a-04 (Claude-owned contract; R4c/C3c/design_codex.r2.md): the runtime shows the exhausted ladder and passes the user's
+    // retry on to its session.
+    @Test
+    fun `C2+a-04 the runtime passes a retry of an exhausted connection on`() = runTest {
+        val (h, runtime) = running()
+        advanceTimeBy(100)
+        h.wire.drop()
+        advanceTimeBy(1)
+        for (n in 1..5) {
+            advanceTimeBy(1_600L * n + 10)
+            h.wire.drop()
+            advanceTimeBy(1)
+        }
+        assertEquals("C2+a-04 exhausted", TopicRecoveryDisplay.Exhausted, runtime.display.value.recovery)
+        val before = h.wire.requests.size
+        runtime.retryConnection(checkNotNull(runtime.display.value.owner))
+        advanceTimeBy(1)
+        assertEquals("C2+a-04 one new connection", before + 1, h.wire.requests.size)
+        runtime.stop()
+    }
 }

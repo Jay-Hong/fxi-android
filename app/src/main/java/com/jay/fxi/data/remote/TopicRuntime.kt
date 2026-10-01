@@ -187,6 +187,8 @@ internal class TopicRuntime internal constructor(
 
     fun setForeground(value: Boolean) = session.setForeground(value)
 
+    fun retryConnection(owner: TopicDisplayOwner) = session.retryConnection(owner)
+
     /** The tab the focus provider accepted for the live identity; see [OwnedTopicFocus]. */
     val focus: StateFlow<OwnedTopicFocus?> = focusProvider.focus
 
