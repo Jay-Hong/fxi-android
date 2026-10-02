@@ -3,7 +3,6 @@ package com.jay.fxi.data.repository
 import com.jay.fxi.data.remote.FXiApiService
 import com.jay.fxi.domain.model.GraphDataResult
 import com.jay.fxi.domain.model.GraphPeriod
-import com.jay.fxi.domain.model.RatesResult
 import com.jay.fxi.domain.model.SupportedCurrency
 import com.jay.fxi.domain.repository.ExchangeRateRepository
 import javax.inject.Inject
@@ -16,12 +15,6 @@ import javax.inject.Singleton
 class ExchangeRateRepositoryImpl @Inject constructor(
     private val apiService: FXiApiService
 ) : ExchangeRateRepository {
-
-    override suspend fun getRates(): Result<RatesResult> {
-        return runCatching {
-            apiService.getRates()
-        }
-    }
 
     override suspend fun getGraph(
         currency: SupportedCurrency,

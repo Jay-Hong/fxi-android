@@ -49,8 +49,8 @@ const val RATE_ROW_SHEET_TAG = "rate-row-sheet"
  *
  * The skeleton is the paid sheet's (`ui/components/BankCustomizeSheet.kt`) — a modal sheet, a
  * cancel/title/done header, one reorderable row per source with a visibility eye. It is copied
- * rather than called for the same reason the rate row was: that file is reached only through
- * `MainScreen`, which nothing calls, and it speaks a preference model this surface does not share.
+ * rather than called for the same reason the rate row was: that file belongs to the removed
+ * legacy screen's consumer chain, and it speaks a preference model this surface does not share.
  *
  * **Everything happens in a draft.** Nothing is written until 완료, so 취소 and a swipe-down both
  * mean "forget it" without needing an undo path. The draft is seeded once and deliberately not

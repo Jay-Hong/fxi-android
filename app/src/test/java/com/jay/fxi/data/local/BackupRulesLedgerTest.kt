@@ -57,9 +57,9 @@ class BackupRulesLedgerTest {
         // that was not asked to own it should not quietly decide it.
         "fxi_graph_preferences" to true,
 
-        // The legacy paid surface's cache, reached only through `MainScreen`, which has no caller.
+        // The shared v1 cache: S3 deletes its retired rate keys; last-bank preferences remain.
         // Two slices share it: `ANDROID_V2_PLAN.md` §9.1 gives `rates`/`rates_timestamp` to **S3**
-        // and `last_bank_*` to **S7**. Neither is this slice.
+        // and `last_bank_*` to **S7**. Backup exclusion for the remaining keys is outside S3.
         "fxi_cache" to true
     )
 

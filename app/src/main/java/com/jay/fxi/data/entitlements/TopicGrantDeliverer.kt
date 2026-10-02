@@ -53,7 +53,7 @@ internal class PremiumAccessTopicGrantIssuer(private val coordinator: PremiumAcc
 }
 
 /**
- * Carries the issuer's topic grant to one session, and that session's refusals back (L-4e E3). Dormant: nothing creates one yet.
+ * Carries the issuer's topic grant to one runtime session, and that session's refusals back (L-4e E3).
  *
  * **Latest state, not every revision.** A revision, an auth transition, a retry falling due and the start each raise one conflated
  * signal; the consumer then reads the grant and its snapshot once. A result the issuer has already moved past is dropped and read

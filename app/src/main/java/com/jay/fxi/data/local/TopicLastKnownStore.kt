@@ -67,7 +67,7 @@ private val lastKnownJson = Json { ignoreUnknownKeys = true }
  * Values are validated before writing and after reading. Offers coalesce by kind to a deadline
  * measured from the first offer; purge fences queued writes before deleting retired namespaces.
  * Hilt hands it to the topic runtime factory, whose sessions restore from it and offer adopted live rates;
- * nothing in the app creates a runtime yet, and no purger registers it.
+ * the process owner starts that runtime; no purger registers this store yet.
  */
 @Singleton
 internal class TopicLastKnownStore internal constructor(

@@ -11,11 +11,12 @@ Plan approval                 : **APPROVED (2026-08-31)** — 이 계획을 작�
 Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주요 구현 land · S3 진행 중 (2026-09-09)**.
                                 구현 커밋의 land는 슬라이스 완료가 아니다 — 아래 미충족 항목을 함께 읽을 것.
                                 S3는 a~k-1 land(`4f50b64`). 남은 S3 = k-2 lease · k-3 D14 침묵 ·
-                                REST bootstrap · topic last-known disk · FX cutover. 구독자 목적지는 아직
-                                `PremiumUnavailableScreen`이고 FX cutover가 그것을 치운다.
+                                REST bootstrap · topic last-known disk · FX cutover. C4는 구독자 목적지를
+                                `PremiumTopicRoute`로 연결했다. ON 기기·legacy 동적 증거는 비공개 ciMinified 로컬 기기로
+                                수집됐으며, ROOT-REFUSAL 기기 증거는 미수집이다.
                                 L-4b·L-4c·L-4d·L-4e(E1~E6)·L-4f와 S1 회복 신호는 land했다.
-                                S1 발급자 회복 경로는 배선돼 있으며, topic 세션·grant 전달자의 runtime 배선은
-                                미착수다(동결 후 13번)
+                                S1 발급자 회복 경로와 topic 세션·grant 전달자의 runtime 배선은 C4에서 연결됐다.
+                                C4 완료 판정은 ROOT-REFUSAL 기기 증거 미수집으로 PENDING_EVIDENCE다(동결 후 13번).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의

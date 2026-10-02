@@ -8,7 +8,23 @@ import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.auth.AuthTokenSource
+import com.jay.fxi.data.entitlements.AccessEpochRecord
+import com.jay.fxi.data.entitlements.AccessEpochStore
+import com.jay.fxi.data.entitlements.AccessEpochTransitions
 import com.jay.fxi.data.entitlements.AuthenticatedEntitlementsSource
+import com.jay.fxi.data.entitlements.CapabilityScopePurger
+import com.jay.fxi.data.entitlements.EpochIdGenerator
+import com.jay.fxi.data.entitlements.LossObligation
+import com.jay.fxi.data.entitlements.PendingPurge
+import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
+import com.jay.fxi.data.entitlements.PremiumAccessState
+import com.jay.fxi.data.entitlements.PremiumAccessTopicGrantIssuer
+import com.jay.fxi.data.entitlements.ProbeJitter
+import com.jay.fxi.data.entitlements.PurgeNamespace
+import com.jay.fxi.data.entitlements.PurgeResult
+import com.jay.fxi.data.entitlements.RefreshIntent
+import com.jay.fxi.data.entitlements.SnapshotTopicUseAuthority
+import com.jay.fxi.data.entitlements.UserScopePurger
 import com.jay.fxi.data.entitlements.EntitlementsIdentity
 import com.jay.fxi.data.entitlements.EntitlementsOutcome
 import com.jay.fxi.data.entitlements.EntitlementsResult
@@ -19,6 +35,7 @@ import com.jay.fxi.data.entitlements.TopicGrantResult
 import com.jay.fxi.data.entitlements.TopicRejectionLedger
 import com.jay.fxi.data.entitlements.TopicRejectionReservation
 import com.jay.fxi.data.local.FreeTabStore
+import com.jay.fxi.data.local.RateRowPreferenceStore
 import com.jay.fxi.data.remote.AuthSnapshotInterceptor
 import com.jay.fxi.data.remote.AuthTokenTopicCommandCredentials
 import com.jay.fxi.data.remote.AuthenticatedApiClient
@@ -31,6 +48,8 @@ import com.jay.fxi.data.remote.TopicCommandClock
 import com.jay.fxi.data.remote.TopicFrameDecoder
 import com.jay.fxi.data.remote.TopicGrantToken
 import com.jay.fxi.data.remote.TopicRuntimeFactory
+import com.jay.fxi.data.remote.TopicRuntimeOwner
+import com.jay.fxi.data.remote.TopicForegroundStream
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.remote.TopicSnapshotBootstrapService
 import com.jay.fxi.data.remote.TopicUseAuthority
@@ -39,6 +58,8 @@ import com.jay.fxi.data.remote.TopicUseNetworkInterceptor
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
 import com.jay.fxi.di.NetworkModule
 import com.jay.fxi.domain.model.FreeTab
+import com.jay.fxi.domain.model.RateRowList
+import com.jay.fxi.domain.model.RateRowPreference
 import com.jay.fxi.domain.model.TopicRejectionReason
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
@@ -48,10 +69,12 @@ import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import okhttp3.Authenticator
@@ -83,7 +106,8 @@ import retrofit2.Retrofit
  * 429. It is a prediction from send starts, not a measurement through nginx.
  *
  * **Not measured here** (reported, never counted as passed): Firebase's own token traffic, the free snapshot path (②b-3), alerts
- * and push registration, Graph and history, the app's real cold start (nothing starts the runtime yet), and anything through nginx.
+ * and push registration, Graph and history, the app's real cold start (the `Application`, Firebase and the platform inputs; the
+ * C4 test below joins the process owner and its consumer, not the app's start), and anything through nginx.
  */
 class PremiumColdStartBudgetTest {
 
@@ -99,6 +123,7 @@ class PremiumColdStartBudgetTest {
     private val origin = System.nanoTime()
     private fun nowMillis() = (System.nanoTime() - origin) / 1_000_000
     private val sends = SendRecorder(::nowMillis)
+    private val accessOrders = AccessOrderSequence()
 
     private lateinit var server: MockWebServer
     /** Every request the server received, as `path?topic`, in arrival order. */
@@ -162,7 +187,7 @@ class PremiumColdStartBudgetTest {
             }
         }
         server.start()
-        provider = AuthTokenProvider(TokenSource(), orders = AccessOrderSequence())
+        provider = AuthTokenProvider(TokenSource(), orders = accessOrders)
         val http = OkHttpClient.Builder()
             .retryOnConnectionFailure(false)
             .followRedirects(false)
@@ -264,6 +289,136 @@ class PremiumColdStartBudgetTest {
         val verdict = ColdStartBudget.judge(all)
         println("②b-2 verdict: $verdict")
         ColdStartBudget.assertWithin(verdict)
+    }
+
+    // R4-c C4-J-BUDGET (Claude-owned contract; R4c/C4/design_codex.r3.md): the same cold start with the runtime created and started
+    // by the process owner, together with its consumer and the owner started a second time. Every physical send, the replays and the
+    // handshake are counted as above; one handshake means one assembly. UNMEASURED is unchanged: this is not the app's real start.
+    @Test
+    fun `C4-J-BUDGET the process owner's cold start assembles once and stays inside the budget`() = runBlocking {
+        val owner: AuthIdentityFence = api.captureIdentityFence()
+        val wireJson = NetworkModule.provideWireJson()
+        val service = TopicSnapshotBootstrapService(api, TopicFrameDecoder(wireJson), 10.seconds)
+        val clock = object : TopicCommandClock {
+            override fun nowMillis(): Long = this@PremiumColdStartBudgetTest.nowMillis()
+            override suspend fun sleep(duration: Duration) = delay(duration)
+        }
+        val wsClient = OkHttpClient.Builder().addInterceptor(sends.interceptor).build()
+        val runtimeJob = SupervisorJob()
+        val mainJob = SupervisorJob()
+        val main = Dispatchers.Default.limitedParallelism(1)
+        val coordinator = budgetCoordinator(owner, CoroutineScope(mainJob + main))
+        val factory = TopicRuntimeFactory(
+            webSocketFactory = { wsClient },
+            webSocketUrl = server.url("/ws").toString(),
+            decode = TopicFrameDecoder(wireJson)::decode,
+            bootstrap = { fence, topic, useAdmitted -> service.bootstrap(fence, topic, useAdmitted) },
+            issuer = PremiumAccessTopicGrantIssuer(coordinator),
+            fences = AuthFenceStream { it(owner) },
+            liveFence = { owner },
+            recoveries = AuthCredentialRecoveryStream { },
+            tabs = Tabs(FreeTab.TETHER),
+            credentials = AuthTokenTopicCommandCredentials(provider),
+            orders = accessOrders,
+            authority = SnapshotTopicUseAuthority { coordinator.accessSnapshot },
+            clock = clock,
+            newBootstrapFloor = { TopicBootstrapRetryFloor(it) { kotlinx.datetime.Clock.System.now() } },
+            newScope = { CoroutineScope(runtimeJob + Dispatchers.Default.limitedParallelism(1)) },
+            encode = { wireJson.encodeToString(TopicSubscribeRequest.serializer(), it) },
+            newRequestId = { java.util.UUID.randomUUID().toString() },
+            jitter = { 0.0 }
+        )
+        val processOwner = TopicRuntimeOwner(
+            factory = factory,
+            online = MutableStateFlow(true),
+            // A user-opened cold start: the process is in the foreground (C4 r4 gates the session on the first foreground).
+            foreground = TopicForegroundStream { onForeground -> onForeground(true) },
+            fences = AuthFenceStream { it(owner) },
+            liveIdentity = { owner },
+            rowPreferenceStore = object : RateRowPreferenceStore {
+                override suspend fun preferences(uid: String): Map<RateRowList, RateRowPreference> = emptyMap()
+                override suspend fun remember(uid: String, list: RateRowList, preference: RateRowPreference) = Unit
+            },
+            main = CoroutineScope(mainJob + main)
+        )
+
+        try {
+            coordinator.onIdentityChanged(owner)
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+            assertEquals(
+                "the cold start did not begin from a fresh premium approval",
+                PremiumAccessState.PremiumConfirmed,
+                coordinator.state.value.state
+            )
+            withContext(main) {
+                processOwner.start()
+                processOwner.start()
+            }
+            withTimeout(20.seconds) {
+                while (snapshotTopics() != DESIRED || sends.all().none { it.zone == "ws" }) delay(50)
+            }
+            delay(1_000) // anything owed right behind the last one
+        } finally {
+            runtimeJob.cancel()
+            mainJob.cancel()
+            println("C4-J-BUDGET timeline: " + sends.timeline())
+        }
+
+        val all = sends.all()
+        println("C4-J-BUDGET not measured: $UNMEASURED")
+        assertEquals(
+            "the recorder and the server disagree, path by path",
+            synchronized(received) { received.toList() }.sorted(),
+            all.map { it.key }.sorted()
+        )
+        assertEquals("more than one assembly reached the server", listOf(101), all.filter { it.zone == "ws" }.map { it.status })
+        assertEquals(listOf(401, 200), all.filter { it.path == "/api/entitlements" }.map { it.status })
+        assertEquals(listOf(401, 404), all.filter { it.param("topic") == TETHER }.map { it.status })
+        assertEquals("the measurement did not cover every desired topic", DESIRED, snapshotTopics())
+
+        val verdict = ColdStartBudget.judge(all)
+        println("C4-J-BUDGET verdict: $verdict")
+        ColdStartBudget.assertWithin(verdict)
+    }
+
+    private fun budgetCoordinator(owner: AuthIdentityFence, scope: CoroutineScope): PremiumAccessCoordinator {
+        var n = 0
+        val ids = EpochIdGenerator { "budget-${n++}" }
+        var record = AccessEpochRecord()
+        val store = object : AccessEpochStore {
+            override suspend fun load(): AccessEpochRecord = record
+            override suspend fun bindOwner(uid: String) =
+                AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
+            override suspend fun signOut() =
+                AccessEpochTransitions.signOut(record, ids).also { record = it }
+            override suspend fun retireUnverifiedStart() =
+                AccessEpochTransitions.retireUnverifiedStart(record, ids).also { record = it }
+            override suspend fun beginSignOut(uid: String) =
+                AccessEpochTransitions.beginSignOut(record, uid).also { record = it }
+            override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean) =
+                AccessEpochTransitions.rotate(record, rotateUser, rotateKrx, ids).also { record = it }
+            override suspend fun completePurges(completed: Collection<PendingPurge>) =
+                AccessEpochTransitions.completePurges(record, completed).also { record = it }
+            override suspend fun journalRetired(obligation: LossObligation) =
+                AccessEpochTransitions.journalRetired(record, obligation).also { record = it }
+            override suspend fun markMayContainData(premium: Boolean, krx: Boolean) =
+                AccessEpochTransitions.markMayContainData(record, premium, krx).also { record = it }
+        }
+        val purger = object : UserScopePurger, CapabilityScopePurger {
+            override suspend fun purgeUserScope(namespace: PurgeNamespace) = PurgeResult.Completed
+            override suspend fun purgeCapabilityScope(namespace: PurgeNamespace) = PurgeResult.Completed
+        }
+        return PremiumAccessCoordinator(
+            source = AuthenticatedEntitlementsSource(api),
+            store = store,
+            userPurger = purger,
+            capabilityPurger = purger,
+            scope = scope,
+            clock = { nowMillis() },
+            jitter = ProbeJitter.None,
+            liveFence = { owner },
+            orders = accessOrders
+        )
     }
 
     private fun snapshotTopics(): Set<String> = sends.all().mapNotNull { it.param("topic") }.toSet()

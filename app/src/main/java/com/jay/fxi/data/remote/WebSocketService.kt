@@ -7,14 +7,12 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import com.jay.fxi.admission.ReleaseAdmission
 import com.jay.fxi.admission.ReleaseAdmissionInterceptor
 import com.jay.fxi.data.network.NetworkMonitor
-import com.jay.fxi.data.remote.dto.IndicesPayload
 import com.jay.fxi.data.remote.dto.WebSocketGraphBuckets
 import com.jay.fxi.data.remote.dto.WebSocketMessageType
 import com.jay.fxi.data.remote.dto.WebSocketPing
 import com.jay.fxi.data.remote.dto.WebSocketRatesMessage
 import com.jay.fxi.di.WireJson
 import com.jay.fxi.domain.model.ConnectionState
-import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.util.ApiConfig
 import com.jay.fxi.util.WebSocketConfig
 import kotlinx.coroutines.CoroutineScope
@@ -107,9 +105,7 @@ class WebSocketService @Inject constructor(
 
     // ============ 콜백 ============
 
-    var onRatesReceived: ((List<ExchangeRate>) -> Unit)? = null
     var onGraphBucketsReceived: ((WebSocketGraphBuckets) -> Unit)? = null
-    var onIndicesReceived: ((IndicesPayload?) -> Unit)? = null
 
     init {
         if (ReleaseAdmission.isOpen) {
@@ -321,10 +317,6 @@ class WebSocketService @Inject constructor(
                 WebSocketMessageType.RATES -> {
                     // 콜백은 Main 스레드에서 호출
                     kotlinx.coroutines.withContext(Dispatchers.Main) {
-                        message.data?.let { data ->
-                            onRatesReceived?.invoke(data.rates)
-                            onIndicesReceived?.invoke(data.indices)
-                        }
                         message.graphBuckets?.let { buckets ->
                             onGraphBucketsReceived?.invoke(buckets)
                         }

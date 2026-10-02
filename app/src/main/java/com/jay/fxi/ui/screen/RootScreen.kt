@@ -28,6 +28,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -37,7 +38,9 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.jay.fxi.R
 import com.jay.fxi.admission.ReleaseAdmission
+import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.entitlements.PremiumAccessState
+import com.jay.fxi.data.remote.TopicRuntimeOwner
 import com.jay.fxi.domain.model.AuthState
 import com.jay.fxi.ui.free.FreeSnapshotRoute
 import com.jay.fxi.service.AlertEvent
@@ -45,6 +48,7 @@ import com.jay.fxi.service.AlertEventBus
 import com.jay.fxi.subscription.SubscriptionManager
 import com.jay.fxi.ui.auth.AuthViewModel
 import com.jay.fxi.ui.auth.LoginScreen
+import com.jay.fxi.ui.premium.view.PremiumTopicRoute
 import com.jay.fxi.ui.subscription.PaywallScreen
 import com.jay.fxi.ui.theme.Background
 import com.jay.fxi.ui.theme.Primary
@@ -53,6 +57,16 @@ import com.jay.fxi.ui.theme.SecondaryText
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import javax.inject.Provider
+import dagger.hilt.EntryPoint
+import dagger.hilt.InstallIn
+import dagger.hilt.android.EntryPointAccessors
+import dagger.hilt.components.SingletonComponent
+
+@EntryPoint
+@InstallIn(SingletonComponent::class)
+internal interface PremiumTopicOwnerEntryPoint {
+    fun topicRuntimeOwner(): TopicRuntimeOwner
+}
 
 @Composable
 fun RootScreen(
@@ -168,7 +182,20 @@ private fun ArmedRootScreen(
                 }
             }
 
-            RootDestination.Premium -> PremiumUnavailableScreen()
+            RootDestination.Premium -> {
+                val owner = EntryPointAccessors.fromApplication(
+                    LocalContext.current.applicationContext,
+                    PremiumTopicOwnerEntryPoint::class.java
+                ).topicRuntimeOwner()
+                PremiumTopicRoute(
+                    consumer = owner.consumer,
+                    identity = AuthIdentityFence(checkNotNull(ownedAccess.uid), checkNotNull(ownedAccess.authGeneration)),
+                    isActive = true,
+                    newsViewModel = hiltViewModel(),
+                    userInfo = (authState as? AuthState.SignedIn)?.user,
+                    onSignOut = { authViewModel.signOut() }
+                )
+            }
         }
     }
 }

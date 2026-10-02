@@ -8,7 +8,6 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.jay.fxi.di.StorageJson
-import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.GraphBucket
 import com.jay.fxi.domain.model.GraphCache
 import com.jay.fxi.domain.model.GraphPeriod
@@ -33,7 +32,7 @@ private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(na
 /**
  * 로컬 캐시 서비스
  *
- * 환율 캐시: DataStore (JSON 문자열, ~5KB)
+ * 마지막 선택 은행: DataStore (v1 환율 키는 cutover 후 삭제)
  * 그래프 캐시: File (통화별 JSON 파일, ~50KB each)
  *
  * 캐시 규칙:
@@ -47,8 +46,6 @@ class CacheService @Inject constructor(
 ) {
     companion object {
         private const val TAG = "CacheService"
-        private val KEY_RATES = LegacyRateCacheKeys.RATES
-        private val KEY_RATES_TIMESTAMP = LegacyRateCacheKeys.RATES_TIMESTAMP
 
         private const val GRAPH_CACHE_VERSION = "v1"
         private const val GRAPH_FILE_PREFIX = "graph_cache_"
@@ -58,39 +55,8 @@ class CacheService @Inject constructor(
         private const val NEWS_CACHE_FILE = "news_cache.json"
     }
 
-    // ============ 환율 캐시 (DataStore) ============
-
-    /**
-     * 환율 데이터 저장
-     */
-    suspend fun saveRates(rates: List<ExchangeRate>) {
-        context.dataStore.edit { preferences ->
-            preferences[KEY_RATES] = json.encodeToString(rates)
-            preferences[KEY_RATES_TIMESTAMP] = System.currentTimeMillis()
-        }
-    }
-
-    /**
-     * 캐시된 환율 데이터 로드
-     */
-    suspend fun loadCachedRates(): List<ExchangeRate>? {
-        val preferences = context.dataStore.data.first()
-        val ratesJson = preferences[KEY_RATES] ?: return null
-        return try {
-            json.decodeFromString<List<ExchangeRate>>(ratesJson)
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    /**
-     * 환율 캐시 타임스탬프 조회
-     */
-    suspend fun cachedRatesTimestamp(): Instant? {
-        val preferences = context.dataStore.data.first()
-        val timestamp = preferences[KEY_RATES_TIMESTAMP] ?: return null
-        return Instant.fromEpochMilliseconds(timestamp)
-    }
+    /** Deletes only retired rate keys through this service's existing fxi_cache instance. */
+    internal suspend fun deleteRetiredRateKeys() = deleteLegacyRateKeys(context.dataStore)
 
     // ============ 마지막 선택 은행 (알림 추가용) ============
 

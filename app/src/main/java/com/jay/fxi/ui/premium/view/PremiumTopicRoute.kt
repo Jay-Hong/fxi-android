@@ -31,7 +31,7 @@ import com.jay.fxi.ui.viewmodel.NewsViewModel
 
 /**
  * R4-c C3c-2: connects [PremiumTopicScreen] to its consumer, the news view model and settings. The host owns the consumer and its
- * main-thread scope; this route neither creates nor stops the topic runtime. Not mounted yet (C4 mounts it).
+ * main-thread scope; this route neither creates nor stops the topic runtime. Root mounts it for a current premium grant.
  */
 @Composable
 internal fun PremiumTopicRoute(

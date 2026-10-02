@@ -47,8 +47,8 @@ import okhttp3.WebSocket
  * Assembly boundary for one topic session. [create] builds its scope, store, retry floor, and connectors
  * without starting REST, WebSocket, or grant work.
  *
- * The runtime exposes the session's display state and passes network and foreground input on; application
- * wiring, the screen that consumes it, and the undelivered-bootstrap policy belong to a later slice.
+ * The runtime exposes the session's display state and passes network and foreground input on;
+ * the undelivered-bootstrap policy belongs to a later slice.
  */
 internal class TopicRuntimeFactory internal constructor(
     private val webSocketFactory: () -> WebSocket.Factory,

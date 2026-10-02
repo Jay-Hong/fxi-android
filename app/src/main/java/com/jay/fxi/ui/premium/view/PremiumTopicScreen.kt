@@ -76,7 +76,7 @@ import kotlinx.coroutines.flow.first
 
 /**
  * R4-c C3c-2: the premium topic screen's layout — five tabs in a pager, the status line, the selected tab's rows, the row sheet,
- * the rate fullscreen and the news slot. It draws [state] as given and reports only confirmed user actions. Not mounted yet.
+ * the rate fullscreen and the news slot. It draws [state] as given and reports only confirmed user actions through the Root route.
  */
 @Composable
 internal fun PremiumTopicScreen(

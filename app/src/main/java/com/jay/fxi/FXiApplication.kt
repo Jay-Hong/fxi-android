@@ -17,6 +17,8 @@ import com.revenuecat.purchases.PurchasesConfiguration
 import com.jay.fxi.data.entitlements.AuthAccessBinder
 import com.jay.fxi.data.free.FreeSnapshotScheduler
 import com.jay.fxi.data.local.LegacyStorePurge
+import com.jay.fxi.data.local.RatesCacheCutover
+import com.jay.fxi.data.remote.TopicRuntimeOwner
 import dagger.hilt.android.HiltAndroidApp
 import javax.inject.Inject
 import javax.inject.Provider
@@ -35,16 +37,18 @@ internal fun shouldEnableCrashlytics(
 /**
  * Everything an admitted process starts, in one place that can be called without an `Application`.
  *
- * Written as a function taking the three starts rather than as three statements in `onCreate`,
+ * Written as a function taking the five starts rather than as statements in `onCreate`,
  * because one of them is silent when it does not happen. A missing [bindAccess] or
  * [startFreeSnapshots] shows up as an app that never signs in or never refreshes; a missing
  * [purgeRetiredStores] looks exactly like a phone that had nothing left to delete. Grouping them
- * makes the quiet one fail the same way as the loud ones — all three run, or the list is wrong and
+ * makes the quiet one fail the same way as the loud ones — all five run, or the list is wrong and
  * `FXiApplicationStartTest` says so.
  */
 internal fun startAppOwnedServices(
     bindAccess: () -> Unit,
     startFreeSnapshots: () -> Unit,
+    startTopicOwner: () -> Unit,
+    launchRateMigration: () -> Unit,
     purgeRetiredStores: () -> Unit
 ) {
     // The single process-wide auth -> access-state funnel. Identity only: it binds the owner and
@@ -54,6 +58,10 @@ internal fun startAppOwnedServices(
     // The single owner of every free-snapshot refresh. Starting it only binds identity and arms
     // deadlines; nothing is fetched until a screen says which tab is on show.
     startFreeSnapshots()
+
+    // Install the process consumer and all inputs before the rate cache cutover may delete v1 keys.
+    startTopicOwner()
+    launchRateMigration()
 
     // Deletes the v1 stores this build has replaced (`ANDROID_V2_PLAN.md §7 S1.5`). Nothing waits on it
     // and nothing v2 reads what it removes, so it goes last and answers to no one.
@@ -74,6 +82,13 @@ class FXiApplication : Application() {
     /** A [Provider] for the same reason: it observes `FirebaseAuth`. */
     @Inject
     lateinit var freeSnapshotScheduler: Provider<FreeSnapshotScheduler>
+
+    /** Resolve only after admission and Firebase initialization, like the other identity owners. */
+    @Inject
+    internal lateinit var topicRuntimeOwner: Provider<TopicRuntimeOwner>
+
+    @Inject
+    internal lateinit var ratesCacheCutover: Provider<RatesCacheCutover>
 
     /**
      * Not a [Provider]: it holds a context and a scope and observes nothing, so constructing it
@@ -102,6 +117,8 @@ class FXiApplication : Application() {
         startAppOwnedServices(
             bindAccess = { authAccessBinder.get().start() },
             startFreeSnapshots = { freeSnapshotScheduler.get().start() },
+            startTopicOwner = { topicRuntimeOwner.get().start() },
+            launchRateMigration = { ratesCacheCutover.get().launch() },
             purgeRetiredStores = { legacyStorePurge.start() }
         )
 

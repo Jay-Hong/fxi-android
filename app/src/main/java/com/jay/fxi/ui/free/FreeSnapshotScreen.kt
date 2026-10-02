@@ -88,14 +88,14 @@ fun FreeSnapshotScreen(
     modifier: Modifier = Modifier
 ) {
     // Edge-to-edge is on for the whole app, so a surface that insets nowhere is drawn under the
-    // clock and under the navigation bar. The premium surface pads the status bar the same way
-    // (`MainScreen.kt:244`); the bottom is handled as list padding so content still scrolls under
+    // clock and under the navigation bar. The premium topic surface also pads the status bar;
+    // the bottom is handled as list padding so content still scrolls under
     // the bar rather than stopping short of it.
     // Two things, and painting only the first is worse than painting neither.
     //
     // The window theme is `Theme.Material.Light`, so a Compose surface that paints nothing shows
     // white through — and this app is dark-only. Every other screen paints the app background
-    // itself (`SettingsScreen`, `MainScreen`, the splash); this one was the exception.
+    // itself (`SettingsScreen`, `PremiumTopicScreen`, the splash); this one was the exception.
     //
     // `LocalContentColor` also defaults to black outside a `Surface`, so every `Text` that does not
     // name a colour — the heading, the basis time, the bank rows, the empty and expired notices —
@@ -195,7 +195,7 @@ private fun ColumnScope.FreeSnapshotTabs(
 
     // Equal widths, not a scrolling row. Five two-character labels fit any phone, and letting the
     // row scroll centred 달러 and pushed 뉴스 and 유로 half off their edges. Deliberately the same
-    // idiom as the premium tab row (`MainScreen.kt:368`) so the two surfaces do not drift apart.
+    // idiom as the premium topic tab row so the two surfaces do not drift apart.
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(top = 4.dp),
         verticalAlignment = Alignment.CenterVertically

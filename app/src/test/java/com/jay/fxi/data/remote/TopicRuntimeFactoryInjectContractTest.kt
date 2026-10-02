@@ -30,8 +30,9 @@ import org.junit.Test
  * Claude-owned R4-c C1 contract (R4c/design_codex.r1.md C1). The Hilt constructor of [TopicRuntimeFactory] hands the singleton
  * [TopicLastKnownStore] to the same factory field the test constructor fills, which `create()` turns into the session's
  * restore gate and live offer (TopicRuntimeFactoryTest D1–D4). Building the factory touches no dependency: every interface
- * here throws if called and the work scope never runs, so construction alone does no store, network or disk work. Nothing
- * in the app references the factory yet. The implementation reads but does not edit this file.
+ * here throws if called and the work scope never runs, so construction alone does no store, network or disk work. Since
+ * R4-c C4 the process owner `TopicRuntimeOwner` is the one app reference to the factory (TopicRuntimeFactoryTest D4). The
+ * implementation reads but does not edit this file.
  */
 class TopicRuntimeFactoryInjectContractTest {
     private val calls = mutableListOf<String>()

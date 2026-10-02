@@ -3,7 +3,6 @@ package com.jay.fxi.di
 import com.jay.fxi.data.remote.dto.GraphResponse
 import com.jay.fxi.data.remote.dto.IndicesPayload
 import com.jay.fxi.data.remote.dto.NotificationSettingsResponse
-import com.jay.fxi.data.remote.dto.RatesData
 import com.jay.fxi.data.remote.dto.WebSocketGraphBucket
 import com.jay.fxi.data.remote.dto.WebSocketRatesMessage
 import com.jay.fxi.domain.model.AlertSetting
@@ -12,8 +11,6 @@ import com.jay.fxi.domain.model.GraphBucket
 import com.jay.fxi.domain.model.NewsItem
 import com.jay.fxi.domain.model.NewsMetadata
 import com.jay.fxi.domain.model.NewsResponse
-import com.jay.fxi.domain.model.RatesMetadata
-import com.jay.fxi.domain.model.RatesResult
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.ExperimentalSerializationApi
@@ -118,8 +115,6 @@ class JsonProfilesTest {
         assertOnlyOptional(GraphResponse.serializer().descriptor, setOf("as_of"))
         assertOnlyOptional(AlertSetting.serializer().descriptor, emptySet())
         assertOnlyOptional(NotificationSettingsResponse.serializer().descriptor, emptySet())
-        assertOnlyOptional(RatesResult.serializer().descriptor, emptySet())
-        assertOnlyOptional(RatesMetadata.serializer().descriptor, emptySet())
         assertOnlyOptional(ExchangeRate.serializer().descriptor, emptySet())
         assertOnlyOptional(GraphBucket.serializer().descriptor, emptySet())
         assertOnlyOptional(NewsResponse.serializer().descriptor, emptySet())
@@ -127,9 +122,8 @@ class JsonProfilesTest {
         assertOnlyOptional(NewsItem.serializer().descriptor, setOf("link"))
         assertOnlyOptional(
             WebSocketRatesMessage.serializer().descriptor,
-            setOf("data", "graph_buckets")
+            setOf("graph_buckets")
         )
-        assertOnlyOptional(RatesData.serializer().descriptor, setOf("indices"))
         assertOnlyOptional(IndicesPayload.serializer().descriptor, setOf("dxy"))
         assertOnlyOptional(WebSocketGraphBucket.serializer().descriptor, emptySet())
     }

@@ -24,7 +24,7 @@ internal suspend fun deleteLegacyRateKeys(store: DataStore<Preferences>) {
 
 /**
  * S3-R3: runs [LegacyMigrationTarget.RATES_CACHE] through the journal — `detected`, then the consumer cutover [run] is handed,
- * then [deleteLegacy] — serialising its own calls, as the journal requires. Nothing calls this yet; the cutover that does is S3-R4.
+ * then [deleteLegacy] — serialising its own calls, as the journal requires. [RatesCacheCutover] launches it once per process.
  */
 internal class RatesCacheMigration(
     private val journal: LocalMigrationJournal,

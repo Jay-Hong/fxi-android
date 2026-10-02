@@ -471,11 +471,12 @@ class TopicRuntimeFactoryTest {
     }
 
     @Test
-    fun D4_lock_onlyTheFactoryUsesTheGate_andNothingCreatesTheFactory() {
+    fun D4_lock_onlyTheFactoryUsesTheGate_andOnlyTheProcessOwnerNamesTheFactory() {
         val main = java.io.File("src/main/java").walkTopDown().filter { it.isFile && it.extension == "kt" }.toList()
         assertEquals("D4 gate", listOf("TopicRuntime.kt"), main.filter { it.name != "TopicLastKnownRestoreGate.kt" &&
             it.readText().contains("TopicLastKnownRestoreGate") }.map { it.name })
-        assertEquals("D4 factory", emptyList<String>(), main.filter { it.name != "TopicRuntime.kt" &&
+        // R4-c C4 (R4c/C4/design_codex.r3.md): the process owner is the one place that holds the factory.
+        assertEquals("D4 factory", listOf("TopicRuntimeOwner.kt"), main.filter { it.name != "TopicRuntime.kt" &&
             it.readText().contains("TopicRuntimeFactory") }.map { it.name })
     }
 

@@ -268,8 +268,9 @@ class GraphViewModel @Inject constructor(
      * Foreground 복귀 시 stale 1d 그래프 silent resync.
      *
      * WebSocket graph_buckets는 마지막 bucket 1개만 보내므로, 화면 off 동안 놓친 이전
-     * bucket의 최종 close 값은 재연결만으로 복구되지 않는다. 이 API는 MainScreen의
-     * ON_RESUME에서 호출되어, 필요한 경우 REST로 전체 1d 그래프를 silent 재동기화한다.
+     * bucket의 최종 close 값은 재연결만으로 복구되지 않는다. 구 화면의 ON_RESUME 호출은
+     * S3 cutover로 제거됐다. 필요한 경우 REST로 전체 1d 그래프를 silent 재동기화하는
+     * legacy API는 S4까지 유지한다.
      *
      * 조건 (1차 primary → 2차 cache-based 순):
      *  1. backgroundDurationMs >= 60s  (cache 유무 무관)

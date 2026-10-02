@@ -28,9 +28,9 @@ internal object RetiredStores {
      * Retired preference stores, by DataStore name.
      *
      * A name is safe to list here only once nothing v2 reads it. `fxi_bank_preferences` is reached
-     * through `BankPreferenceManager`, whose only consumer chain ends at `MainScreen`, which has no
-     * caller — so nothing can write it back after a purge. The legacy files themselves belong to
-     * the slices that own their surfaces (`ANDROID_V2_PLAN.md §7 S3`), and are left alone here.
+     * through `BankPreferenceManager`, whose legacy screen consumer was removed by the S3 cutover —
+     * so nothing can write it back after a purge. Cleanup of remaining legacy helpers belongs to
+     * the slices that own their surfaces (`ANDROID_V2_PLAN.md §7 S3`).
      */
     val NAMES = listOf("fxi_bank_preferences")
 

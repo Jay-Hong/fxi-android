@@ -21,7 +21,7 @@ internal data class OwnedTopicFocus(val identity: AuthIdentityFence, val tab: Fr
  * A later confirmed choice ([onTabSelected]) wins over a restore still in flight and is remembered for the UID. A restore or a
  * choice for an identity that is no longer the live one is dropped, as is a restore that was cancelled.
  *
- * Wiring (the coordinator's construction and the subscriber surface's tab choice) is the next slice; nothing calls this yet.
+ * The runtime constructs this provider; its Main consumer forwards the subscriber surface's confirmed tab choices.
  */
 internal class TopicFocusProvider(
     private val scope: CoroutineScope,

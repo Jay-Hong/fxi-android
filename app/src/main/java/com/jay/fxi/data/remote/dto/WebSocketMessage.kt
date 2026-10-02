@@ -1,8 +1,6 @@
 package com.jay.fxi.data.remote.dto
 
-import com.jay.fxi.domain.model.ExchangeRate
 import com.jay.fxi.domain.model.GraphBucket
-import com.jay.fxi.domain.model.RatesMetadata
 import com.jay.fxi.util.InstantSerializer
 import kotlinx.datetime.Instant
 import kotlinx.serialization.SerialName
@@ -24,29 +22,14 @@ object WebSocketPing {
 }
 
 /**
- * WebSocket 수신 메시지 (환율 데이터)
- *
- * 서버에서 10초마다 브로드캐스트:
- * {
- *   "type": "rates",
- *   "data": { "rates": [...], "metadata": {...} },
- *   "graph_buckets": { "usd-krw": { "investing": {...}, ... } }
- * }
+ * Legacy WebSocket envelope retained only for graph_buckets until S4.
+ * The price payload is ignored; premium prices use topic frames.
  */
 @Serializable
 data class WebSocketRatesMessage(
     val type: String,
-    val data: RatesData? = null,
     @SerialName("graph_buckets")
     val graphBuckets: Map<String, Map<String, WebSocketGraphBucket>>? = null
-)
-
-@Serializable
-data class RatesData(
-    val rates: List<ExchangeRate>,
-    val metadata: RatesMetadata,
-    /** WebSocket 전용, REST 응답에는 없음. 구 서버 응답에도 부재 가능해 optional. */
-    val indices: IndicesPayload? = null
 )
 
 /**
