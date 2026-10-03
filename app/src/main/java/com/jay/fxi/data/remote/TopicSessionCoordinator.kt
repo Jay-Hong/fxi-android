@@ -115,7 +115,9 @@ data class TopicDisplayState(
     val connection: TopicConnectionDisplay,
     val recovery: TopicRecoveryDisplay = TopicRecoveryDisplay.None,
     /** An accepted answer resolved the stored-price wait in this display round; never delivery, freshness or authentication. */
-    val cachedRefreshResolved: Boolean = false
+    val cachedRefreshResolved: Boolean = false,
+    /** The owner's canonical topic facts at publication; empty when there is no owner. */
+    val topicState: TopicSubscriptionSnapshot = TopicSubscriptionSnapshot()
 ) {
     companion object {
         val NONE = TopicDisplayState(null, TopicRates(), false, TopicConnectionDisplay.OFFLINE)
@@ -629,6 +631,7 @@ class TopicSessionCoordinator(
     val rates: StateFlow<TopicRates> = _rates.asStateFlow()
 
     private val _display = MutableStateFlow(TopicDisplayState.NONE)
+    private var displayPublicationDeferred = false
 
     /** The screen's read-only view; see [TopicDisplayState]. */
     val display: StateFlow<TopicDisplayState> = _display.asStateFlow()
@@ -880,9 +883,15 @@ class TopicSessionCoordinator(
 
     private suspend fun handle(input: SessionInput) {
         if (stopped) return
-        dispatch(input)
-        publishDisplay()
-        publishIfChanged()
+        // Publish each loop turn only after all of its synchronous work has finished.
+        // This also keeps a new Access owner from carrying the old prices and topic facts.
+        displayPublicationDeferred = true
+        try {
+            dispatch(input)
+        } finally {
+            displayPublicationDeferred = false
+        }
+        publishState()
     }
 
     private suspend fun dispatch(input: SessionInput) {
@@ -1756,6 +1765,7 @@ class TopicSessionCoordinator(
             scope = { if (current(live.generation) == null) emptySet() else topics() },
             onAcknowledged = { ack -> onAcknowledged(live, id, ack) },
             onClassifiedFailure = { onClassifiedFailure(live) },
+            onRequestStarted = ::publishState,
             admitAnswer = { rejected -> admitsAnswer(live, rejected) },
             revalidationEntry = revalidationEntry?.let { mapOf(TopicCatalogue.TETHER to it) },
             revalidationScope = { if (current(live.generation) == null) emptySet() else revalidationTopics() }
@@ -1863,8 +1873,7 @@ class TopicSessionCoordinator(
         if (ack.rejected.isNotEmpty()) onRejected(live.fence, ack.rejected)
         // The acknowledgement's own store writes happen inside the command, not on the loop, so
         // the turn-boundary publication would not carry them until something else arrives.
-        publishDisplay()
-        publishIfChanged()
+        publishState()
 
         onAcknowledgement(ack)
     }
@@ -1872,8 +1881,7 @@ class TopicSessionCoordinator(
     /** The command has applied a classified server failure, including any synchronous refresh transition. */
     private fun onClassifiedFailure(live: Connection) {
         resolveCachedRefresh(live.lifetime)
-        publishDisplay()
-        publishIfChanged()
+        publishState()
     }
 
     // ---- leases -----------------------------------------------------------------------------
@@ -2364,9 +2372,15 @@ class TopicSessionCoordinator(
         }
     }
 
-    /** One publication point, and only when the snapshot actually moved. */
-    private fun publishIfChanged() {
+    /** Ordinary boundaries share one reading, with the display updated before the raw observer. */
+    private fun publishState() {
         val next = store.snapshot
+        publishDisplay(next)
+        publishIfChanged(next)
+    }
+
+    /** One raw publication point; lease expiry also uses it before teardown, without a display. */
+    private fun publishIfChanged(next: TopicSubscriptionSnapshot = store.snapshot) {
         if (next == publishedSnapshot) return
         publishedSnapshot = next
         onTopicState(next)
@@ -2390,7 +2404,8 @@ class TopicSessionCoordinator(
      * when a connection ends (including from command callbacks), and when the loop ends. A runtime stop may cancel
      * the scope before its Stop input is handled.
      */
-    private fun publishDisplay() {
+    private fun publishDisplay(topicState: TopicSubscriptionSnapshot = store.snapshot) {
+        if (displayPublicationDeferred) return
         val owner = fence?.takeIf { access && !stopped && it != refusedFor && it != identityLostFor }
             ?.let { TopicDisplayOwner(it.identity, grantEpoch) }
         val shown = if (owner == null) TopicRates() else _rates.value
@@ -2414,7 +2429,10 @@ class TopicSessionCoordinator(
         // A publication may precede the deliverer's AccessRevised input after a hold spent this use.
         invalidateCachedRefresh()
         val cachedRefreshResolved = owner != null && resolvedLifetime != null
-        _display.value = TopicDisplayState(owner, shown, containsSeed, connectionState, shownRecovery, cachedRefreshResolved)
+        _display.value = TopicDisplayState(
+            owner, shown, containsSeed, connectionState, shownRecovery, cachedRefreshResolved,
+            if (owner == null) TopicSubscriptionSnapshot() else topicState
+        )
     }
 
     /** Lets go of the request channel, and wakes whatever stood aside for it. */

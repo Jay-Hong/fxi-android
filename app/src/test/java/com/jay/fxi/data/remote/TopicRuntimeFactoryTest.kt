@@ -516,6 +516,43 @@ class TopicRuntimeFactoryTest {
         assertTrue("C2-07c not open", d.connection != TopicConnectionDisplay.OPEN)
     }
 
+    // R4-c C2+b-1 B1-08 (Claude-owned contract; R4c/C2b/b1_design_codex.r2.md): the runtime's display alone carries the owner's
+    // canonical topic state — the request in flight, its acknowledgement and a failed authentication — with no raw observer wired,
+    // and a stop clears it. A refresh that succeeds is the coordinator's B1-04 (this harness's provider refreshes nothing).
+    @Test
+    fun `B1-08 the runtime display carries the owner's topic state, and a stop clears it`() = runTest {
+        val (h, runtime) = running()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val subscribe = h.subscribes.first()
+        assertEquals("B1-08 the request in flight", com.jay.fxi.domain.model.TopicControlState.PENDING,
+            runtime.display.value.topicState.controlState)
+        h.wire.deliver(h.ack(subscribe.requestId, active = listOf(TETHER), rejections = mapOf(USD to "topic_unavailable")))
+        advanceTimeBy(1)
+        val acknowledged = runtime.display.value.topicState
+        assertEquals("B1-08 acknowledged", com.jay.fxi.domain.model.TopicControlState.ACKNOWLEDGED, acknowledged.controlState)
+        assertEquals("B1-08 the refusal", TopicRejectionReason.TOPIC_UNAVAILABLE, acknowledged.stateFor(USD).rejection)
+        assertTrue("B1-08 tether confirmed", acknowledged.stateFor(TETHER).confirmed)
+        runtime.stop()
+        advanceTimeBy(1)
+        assertEquals("B1-08 a stop clears it", com.jay.fxi.domain.model.TopicSubscriptionSnapshot(), runtime.display.value.topicState)
+    }
+
+    @Test
+    fun `B1-08b a failed authentication reaches the runtime display`() = runTest {
+        val (h, runtime) = running()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val subscribe = h.subscribes.first()
+        h.wire.deliver("""{"type":"subscription_error","request_id":"${subscribe.requestId}","error":"invalid_token"}""")
+        advanceTimeBy(1)
+        assertEquals("B1-08b failed", com.jay.fxi.domain.model.TopicAuthResolution.FAILED,
+            runtime.display.value.topicState.authResolution)
+        runtime.stop()
+    }
+
     // R4-c C3a-07 (Claude-owned contract; R4c/C3/design_codex.r3.md): the runtime passes on its focus provider's accepted tab, and
     // watching it adds nothing to the session's plan.
     @Test

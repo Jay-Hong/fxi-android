@@ -19,6 +19,8 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 C4 완료 판정은 ROOT-REFUSAL 기기 증거 미수집으로 PENDING_EVIDENCE다(동결 후 13번).
                                 C2+b 첫 단위 F2(저장값 배너 해제, S3 'R4-c F2' 항목)는 JVM 계약으로 연결했고 기기
                                 증거는 미수집이다. C2+b-1·C2+b-3 전에는 출시할 수 없다.
+                                C2+b-1은 화면 상태에 owner의 canonical topic snapshot을 싣고, 루프 한 턴의 중간
+                                발행을 보류해 새 owner와 이전 가격·상태가 함께 발행되지 않게 했다(JVM 계약).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의

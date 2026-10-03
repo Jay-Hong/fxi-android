@@ -290,7 +290,9 @@ class TopicSubscribeCommand(
      */
     private val revalidationScope: () -> Set<String> = { emptySet() },
     /** Once per admitted classified server failure, after synchronous state transitions and before the next suspension. */
-    private val onClassifiedFailure: () -> Unit = {}
+    private val onClassifiedFailure: () -> Unit = {},
+    /** Once per attempt, after opening its request and before sending or waiting; not evidence of an answer. */
+    private val onRequestStarted: () -> Unit = {}
 ) {
     init {
         require(purpose != TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION || revalidationEntry != null) {
@@ -439,6 +441,7 @@ class TopicSubscribeCommand(
             // from the last suspension point to here has none of its own. Found by review.
             currentCoroutineContext().ensureActive()
             ticket = store.beginRequest()
+            onRequestStarted()
             if (!send(encode(subscribe(pending, wanted)))) {
                 attempt = TopicRequestPolicy.nextAttempt(attempt) ?: return budgetSpent()
                 when (waitBeforeRetry(TopicCommandRetryPolicy.SILENT_RETRY_COOLDOWN)) {

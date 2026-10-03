@@ -11010,4 +11010,357 @@ class TopicSessionCoordinatorTest {
         assertEquals("F2-15 [identity lost, no socket] not released", false, lost.released())
         last!!.cleanUp()
     }
+
+    // ---- R4-c C2+b-1 (Claude-owned contract; R4c/C2b/b1_design_codex.r2.md with b1_review_claude.r1.md, agreed): the display carries
+    // the owner's canonical topic state. Under an owner each publication holds the store's current snapshot; without one it holds
+    // the empty snapshot. A command that changes the store and then waits — the start of every attempt — publishes before it
+    // waits; an answer or an ending is published where it is handled. An Access transition publishes once, after its teardown,
+    // so no published value pairs a new owner with the earlier owner's prices or topic state. The raw observer keeps its own
+    // boundary. The implementation reads but does not edit these rows. ----
+
+    private fun Harness.topicShown() = coordinator.display.value.topicState
+
+    /** What the display may carry right now: the store's snapshot under an owner, the empty one without. */
+    private fun Harness.assertTopicMirrors(id: String) {
+        val d = coordinator.display.value
+        val expected = if (d.owner == null) TopicSubscriptionSnapshot() else store.snapshot
+        assertEquals("$id: display topic state", expected, d.topicState)
+    }
+
+    /** Every display value as it is published, including ones a later value replaces within the same turn. */
+    private fun TestScope.recordDisplays(h: Harness): MutableList<TopicDisplayState> {
+        val seen = mutableListOf<TopicDisplayState>()
+        backgroundScope.launch(kotlinx.coroutines.test.UnconfinedTestDispatcher(testScheduler)) {
+            h.coordinator.display.collect { seen += it }
+        }
+        return seen
+    }
+
+    @Test
+    fun `B1-01 without an owner the display carries the empty snapshot, whatever the store still holds`() = runTest {
+        val initial = Harness(this)
+        initial.coordinator.start()
+        advanceTimeBy(1)
+        assertEquals("B1-01 initial", TopicSubscriptionSnapshot(), initial.topicShown())
+
+        val withdrawn = Harness(this)
+        acknowledgedUnder(withdrawn)
+        withdrawn.coordinator.setAccess(false, fence(), TopicGrantOrigin.NewContext)
+        advanceTimeBy(1)
+        assertNull("fixture: withdrawn", withdrawn.shown().owner)
+        assertTrue("fixture: the store still holds topics", withdrawn.store.snapshot.topics.isNotEmpty())
+        assertEquals("B1-01 withdrawn", TopicSubscriptionSnapshot(), withdrawn.topicShown())
+
+        val refused = Harness(this)
+        refused.goLive()
+        advanceTimeBy(100)
+        refused.wire.open()
+        advanceTimeBy(1)
+        var atRefusal: TopicSubscriptionSnapshot? = null
+        refused.refusalSink = { _, _ -> atRefusal = refused.topicShown() }
+        refused.wire.deliver(refused.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+        assertEquals("fixture: the refusal is recorded raw", TopicRejectionReason.PREMIUM_REQUIRED,
+            refused.store.snapshot.stateFor(USD).rejection)
+        assertEquals("B1-01 at the refusal hand-over", TopicSubscriptionSnapshot(), atRefusal)
+        assertEquals("B1-01 refused", TopicSubscriptionSnapshot(), refused.topicShown())
+
+        val retired = Harness(this)
+        acknowledgedUnder(retired)
+        retired.liveFence = AuthIdentityFence("u2", 1L)
+        retired.wire.deliver(retired.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        assertNull("fixture: retired", retired.shown().owner)
+        assertEquals("B1-01 retired", TopicSubscriptionSnapshot(), retired.topicShown())
+
+        val stopped = Harness(this)
+        acknowledgedUnder(stopped)
+        stopped.coordinator.stop()
+        advanceTimeBy(1)
+        assertEquals("B1-01 stopped", TopicSubscriptionSnapshot(), stopped.topicShown())
+        stopped.cleanUp()
+    }
+
+    @Test
+    fun `B1-02 the display mirrors the owner's store at each step of a mixed scenario`() = runTest {
+        val h = Harness(this)
+        h.restoreProvider = { granted ->
+            TopicLastKnownRestore.Seed(seedOf(seedQuote("upbit", "usdt-krw", 1400.0, frameAt)), granted, TopicUseLifetime(granted.grant, 0L))
+        }
+        h.goLive()
+        advanceTimeBy(100)
+        h.assertTopicMirrors("B1-02 granted, connecting")
+        h.wire.open()
+        advanceTimeBy(1)
+        h.assertTopicMirrors("B1-02 first subscribe")
+        assertEquals("B1-02 the request in flight is shown", TopicControlState.PENDING, h.topicShown().controlState)
+
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "topic_unavailable")))
+        advanceTimeBy(1)
+        h.assertTopicMirrors("B1-02 mixed acknowledgement")
+        assertEquals(TopicControlState.ACKNOWLEDGED, h.topicShown().controlState)
+        assertEquals(TopicRejectionReason.TOPIC_UNAVAILABLE, h.topicShown().stateFor(USD).rejection)
+        val kept = h.topicShown()
+        val keptCopy = kept.copy(topics = HashMap(kept.topics))
+
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.assertTopicMirrors("B1-02 same-time frame")
+        assertEquals("B1-02 the seed price stays", 1400.0, h.shown().rates.quotes.values.single().rate, 0.0)
+        assertEquals("B1-02 the receipt is shown although no price changed",
+            kept.stateFor(TETHER).receiveGeneration + 1, h.topicShown().stateFor(TETHER).receiveGeneration)
+
+        advanceTimeBy(45_100)
+        assertEquals("fixture: the silence asked", 2, h.requests.size)
+        h.assertTopicMirrors("B1-02 revalidating")
+        assertEquals(TopicDeliveryState.REVALIDATING, h.topicShown().stateFor(TETHER).deliveryState)
+
+        h.wire.deliver("""{"type":"subscription_error","request_id":"r2","error":"temporarily_unavailable","retry_after_seconds":5}""")
+        advanceTimeBy(1)
+        h.assertTopicMirrors("B1-02 server delay")
+        assertEquals(com.jay.fxi.domain.model.TopicWholeRequestFailure.TemporarilyUnavailable(5L), h.topicShown().wholeFailure)
+
+        advanceTimeBy(5_100)
+        assertEquals("fixture: asked again after the delay", 3, h.requests.size)
+        h.assertTopicMirrors("B1-02 asked again")
+        assertNull("B1-02 the failure is cleared before any answer", h.topicShown().wholeFailure)
+
+        h.wire.deliver(h.ack("r3", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        h.assertTopicMirrors("B1-02 revalidation acknowledged")
+        advanceTimeBy(45_100)
+        h.assertTopicMirrors("B1-02 still silent")
+        assertEquals(TopicDeliveryState.DEGRADED, h.topicShown().stateFor(TETHER).deliveryState)
+        assertEquals("B1-02 an earlier snapshot is never changed", keptCopy, kept)
+
+        // A lease that runs out without a new acknowledgement: the display after the teardown.
+        val expiring = Harness(this)
+        expiring.goLive()
+        advanceTimeBy(100)
+        expiring.wire.open()
+        advanceTimeBy(1)
+        expiring.wire.deliver(expiring.ackWithLease("r1", TETHER, 15L))
+        advanceTimeBy(1)
+        val socket = expiring.wire
+        advanceTimeBy(15_100)
+        assertTrue("fixture: the lease expiry tore the connection down", socket.cancelled)
+        expiring.assertTopicMirrors("B1-02 after a lease expiry")
+        expiring.cleanUp()
+    }
+
+    @Test
+    fun `B1-03 the start of every attempt is shown before its answer`() = runTest {
+        val first = Harness(this)
+        first.goLive()
+        advanceTimeBy(100)
+        first.wire.open()
+        advanceTimeBy(1)
+        assertEquals("fixture: one request sent", 1, first.requests.size)
+        assertEquals("B1-03 the first attempt is pending on screen", TopicControlState.PENDING, first.topicShown().controlState)
+        first.assertTopicMirrors("B1-03 first attempt")
+
+        // A disabled topic is retried by hand, except while the server asks for a delay; the delay ends when the next attempt starts.
+        val delayed = Harness(this).also { it.goLive() }
+        advanceTimeBy(100)
+        delayed.wire.open()
+        advanceTimeBy(1)
+        delayed.wire.deliver(delayed.ackOf("r1", leases = listOf(Triple(TETHER, "L1", 15L)), rejections = mapOf(USD to "topics_disabled")))
+        advanceTimeBy(1)
+        assertEquals("fixture: the lease renewal is in flight", listOf("r1", "r2"), delayed.requests.map { it.requestId })
+        assertTrue("fixture: a disabled topic can be retried by hand", USD in delayed.topicShown().manualRetryTopics)
+        delayed.wire.deliver("""{"type":"subscription_error","request_id":"r2","error":"temporarily_unavailable","retry_after_seconds":5}""")
+        advanceTimeBy(1)
+        assertTrue("B1-03 not while the server asks for a delay", USD !in delayed.topicShown().manualRetryTopics)
+        advanceTimeBy(5_100)
+        assertEquals("fixture: asked again", listOf("r1", "r2", "r3"), delayed.requests.map { it.requestId })
+        assertTrue("B1-03 retried by hand again once the next attempt started", USD in delayed.topicShown().manualRetryTopics)
+        delayed.assertTopicMirrors("B1-03 asked again, unanswered")
+        delayed.cleanUp()
+    }
+
+    @Test
+    fun `B1-04 a refresh and every command ending are shown without waiting for a later answer`() = runTest {
+        val succeeded = Harness(this)
+        succeeded.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        refreshHeld(succeeded)
+        assertEquals("B1-04 refreshing is shown", TopicAuthResolution.REFRESHING, succeeded.topicShown().authResolution)
+        succeeded.refreshGate!!.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the replay went out", 2, succeeded.requests.size)
+        assertEquals("B1-04 resolved before the replay's answer", TopicAuthResolution.RESOLVED, succeeded.topicShown().authResolution)
+        succeeded.assertTopicMirrors("B1-04 replay unanswered")
+
+        val empty = Harness(this)
+        empty.refreshed = null
+        refreshHeld(empty)
+        empty.refreshGate!!.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("B1-04 a refresh that produced nothing is shown failed", TopicAuthResolution.FAILED, empty.topicShown().authResolution)
+        empty.assertTopicMirrors("B1-04 refresh produced nothing")
+
+        val dropped = Harness(this)
+        refreshHeld(dropped)
+        dropped.wire.drop()
+        advanceTimeBy(1)
+        dropped.assertTopicMirrors("B1-04 the command cancelled with its connection")
+        assertNotEquals("B1-04 no refresh left standing", TopicAuthResolution.REFRESHING, dropped.topicShown().authResolution)
+
+        val spent = Harness(this)
+        spent.goLive()
+        advanceTimeBy(100)
+        spent.wire.open()
+        advanceTimeBy(1)
+        advanceTimeBy(80_000)
+        assertTrue("fixture: three unanswered attempts", spent.requests.size >= 3)
+        spent.assertTopicMirrors("B1-04 budget spent")
+        spent.cleanUp()
+    }
+
+    @Test
+    fun `B1-05 no published display pairs a new owner with the earlier owner's prices or topic state`() = runTest {
+        val targets = listOf(
+            "another uid" to fence(uid = "u2"),
+            "another auth generation" to fence(generation = 2L),
+            "another access epoch" to fence(epoch = "epoch-2"),
+            "another grant token" to fence(grant = 2L)
+        )
+        var last: Harness? = null
+        for ((name, next) in targets) {
+            val h = Harness(this).also { last = it }
+            acknowledgedUnder(h)
+            h.wire.deliver(h.tetherFrame(1390.0))
+            advanceTimeBy(1)
+            assertTrue("fixture [$name]: prices shown", h.shown().rates.quotes.isNotEmpty())
+            assertTrue("fixture [$name]: receipts shown", h.topicShown().stateFor(TETHER).receiveGeneration > 0)
+            val earlierTurn = checkNotNull(h.shown().owner).grantEpoch
+            val seen = recordDisplays(h)
+            h.setAccess(true, next)
+            advanceTimeBy(1)
+            val underNew = seen.filter { it.owner != null && it.owner?.grantEpoch != earlierTurn }
+            assertTrue("fixture [$name]: the new owner was published", underNew.isNotEmpty())
+            underNew.forEach { d ->
+                assertTrue("B1-05 [$name] no earlier price under the new owner", d.rates.quotes.isEmpty())
+                assertTrue("B1-05 [$name] no earlier topic state under the new owner",
+                    d.topicState.topics.values.none { it.confirmed || it.receiveGeneration > 0 })
+            }
+            assertEquals("B1-05 [$name] the new owner is shown", next.identity, h.shown().owner?.identity)
+            h.assertTopicMirrors("B1-05 [$name] after the transition")
+        }
+        last!!.cleanUp()
+    }
+
+    @Test
+    fun `B1-06 a withdrawal shows nothing, a regrant shows its own turn, and holds keep the owner's state`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        acknowledgedUnder(h)
+        val before = checkNotNull(h.shown().owner)
+        h.coordinator.setAccess(false, fence(), TopicGrantOrigin.NewContext)
+        advanceTimeBy(1)
+        assertNull("fixture: withdrawn", h.shown().owner)
+        assertEquals("B1-06 withdrawn", TopicSubscriptionSnapshot(), h.topicShown())
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        assertNotEquals("B1-06 a new owner turn", before.grantEpoch, h.shown().owner?.grantEpoch)
+        h.assertTopicMirrors("B1-06 regranted")
+        h.setAccess(true, fence())
+        repeat(2) { h.coordinator.accessRevised() }
+        advanceTimeBy(1)
+        h.assertTopicMirrors("B1-06 the same access and repeated revisions")
+        access.capabilityAllowed = false
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        h.assertTopicMirrors("B1-06 a capability-only hold")
+        access.hold()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals("B1-06 a hold keeps the owner", fence().identity, h.shown().owner?.identity)
+        h.assertTopicMirrors("B1-06 a user hold")
+        access.release()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        h.assertTopicMirrors("B1-06 released")
+        h.cleanUp()
+    }
+
+    @Test
+    fun `B1-07 a command of the earlier owner finishing late changes nothing the next owner shows`() = runTest {
+        val h = Harness(this)
+        val lateRefresh = CompletableDeferred<Unit>()
+        var refreshFor: String? = null
+        h.credentialsDelegate = object : TopicCommandCredentials {
+            override suspend fun currentSnapshot(): AuthSnapshot = h.credential
+            override suspend fun refreshAfterUnauthorized(rejected: AuthSnapshot): AuthSnapshot? {
+                refreshFor = rejected.uid
+                // A provider that finishes its refresh even when its caller was cancelled, so the late ending is really visited.
+                return kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                    lateRefresh.await()
+                    AuthSnapshot(rejected.uid, rejected.authGeneration, "token-2")
+                }
+            }
+            override suspend fun recordRejected(credential: AuthSnapshot) = Unit
+            override suspend fun recordRejectionEvidence(credential: AuthSnapshot) = Unit
+        }
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: the first owner's refresh is running", "u1", refreshFor)
+        assertEquals("fixture: refreshing", TopicAuthResolution.REFRESHING, h.topicShown().authResolution)
+
+        h.credential = AuthSnapshot("u2", 1L, "token-b")
+        h.setAccess(true, fence(uid = "u2"))
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("fixture: the next owner subscribed", "u2", h.shown().owner?.identity?.uid)
+        val nextShown = h.topicShown()
+        assertEquals("B1-07 the next owner starts without the earlier refresh", TopicAuthResolution.RESOLVED, nextShown.authResolution)
+        assertEquals("B1-07 the next owner's request is shown", TopicControlState.PENDING, nextShown.controlState)
+        val requestsBefore = h.requests.size
+
+        val seen = recordDisplays(h)
+        lateRefresh.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("B1-07 the next owner's state is unchanged by the late ending", nextShown, h.topicShown())
+        h.assertTopicMirrors("B1-07 after the late ending")
+        assertTrue("B1-07 no published value shows the next owner with the earlier refresh",
+            seen.none { it.owner?.identity?.uid == "u2" && it.topicState.authResolution != TopicAuthResolution.RESOLVED })
+        assertEquals("B1-07 the earlier owner did not replay", requestsBefore, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * Battery r1 (B04): at an ordinary publication the display already carries what the raw observer is then told — at a request's
+     * start, an acknowledgement, a loop turn and a classified failure. A lease expiry's raw publication before its teardown is the
+     * one boundary without a display, and this scenario does not reach it.
+     */
+    @Test
+    fun `B1-09 the display is updated before the raw observer hears the same snapshot`() = runTest {
+        val h = Harness(this)
+        val behind = mutableListOf<String>()
+        var calls = 0
+        h.onTopicStatePublished = { snapshot ->
+            calls += 1
+            val d = h.coordinator.display.value
+            if (d.owner != null && d.topicState != snapshot) behind += "call $calls (${snapshot.controlState})"
+        }
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "topic_unavailable")))
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        advanceTimeBy(45_100)
+        assertEquals("fixture: the silence asked", 2, h.requests.size)
+        h.wire.deliver("""{"type":"subscription_error","request_id":"r2","error":"temporarily_unavailable","retry_after_seconds":5}""")
+        advanceTimeBy(1)
+        assertTrue("fixture: the raw observer was told several times", calls >= 5)
+        assertEquals("B1-09 the display lagged the raw observer", emptyList<String>(), behind)
+        h.cleanUp()
+    }
 }
