@@ -11363,4 +11363,1257 @@ class TopicSessionCoordinatorTest {
         assertEquals("B1-09 the display lagged the raw observer", emptyList<String>(), behind)
         h.cleanUp()
     }
+
+    // ---- R4-c C2+b-2a (Claude-owned contract; R4c/C2b/b2_design_codex.r2.md, b2_review_claude.r2.md, b2_design_codex.r3.md, agreed):
+    // a user's retry of a tab's topics. The targets are the tab's topics the canonical model lets a user retry, decided when the input
+    // is handled and again when the command registers. One registered batch sends every target in one subscribe on the existing
+    // REVALIDATION purpose with one budget: a rejection that allows it is reopened, a degraded or suspect topic revalidates, and every
+    // target owes the acknowledgement of this subscribe whatever arrives meanwhile. After an accepted acknowledgement each target with
+    // no receipt since the registration degrades at the send's delivery deadline; a spent budget — authentication ending it too — or an
+    // acknowledgement that names a sent topic nowhere, degrades the targets without a receipt; a terminal ending, a refused replay or a
+    // refresh that produced nothing puts back only what this batch moved. A deadline or result of a batch, automatic or by hand, does
+    // not reach a topic a newer batch has taken. With no target or no open connection nothing happens and a spent ladder stays spent.
+    // 2a stops there: a batch ended by authentication is not resumed by a credential recovery (2b), so 2a alone is not shippable. The
+    // implementation reads but does not edit these rows. ----
+
+    private val allDesired = setOf(TETHER, USD, JPY_TOPIC, EUR_TOPIC, TopicCatalogue.DXY)
+    private fun Harness.retry(tab: FreeTab) = coordinator.retryTopics(checkNotNull(shown().owner) { "fixture: an owner" }, tab)
+    private fun Harness.lastTopics() = requests.last().topics.toSet()
+    private fun Harness.stateOf(topic: String) = topicShown().stateFor(topic)
+
+    /** Open, the first subscribe answered `invalid_token` and the refresh producing nothing: authentication FAILED, the lane free. */
+    private suspend fun TestScope.authFailedOpen(h: Harness, received: List<String> = emptyList()) {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        received.forEach { topic ->
+            h.wire.deliver(
+                when (topic) {
+                    TETHER -> h.tetherFrame(1390.0)
+                    TopicCatalogue.DXY -> h.dxyFrame(98.5)
+                    else -> h.fxFrame(1391.0)
+                }
+            )
+        }
+        advanceTimeBy(1)
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: authentication failed", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+        assertEquals("fixture: one request so far", listOf("r1"), h.requests.map { it.requestId })
+    }
+
+    /** Open and acknowledged, with [disabled] refused as `topics_disabled`; tether received first so the first delivery has ended. */
+    private suspend fun TestScope.disabledOpen(h: Harness, vararg disabled: String) {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = disabled.associateWith { "topics_disabled" }))
+        advanceTimeBy(1)
+        disabled.forEach { assertEquals("fixture: $it disabled", TopicRejectionReason.TOPICS_DISABLED, h.store.snapshot.stateFor(it).rejection) }
+    }
+
+    /** A tether revalidation acknowledged and then silent: tether DEGRADED, two requests so far. */
+    private suspend fun TestScope.degradedTetherOpen(h: Harness) {
+        silenceReady(h)
+        advanceTimeBy(45_100)
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        advanceTimeBy(45_100)
+        assertEquals("fixture: tether degraded", TopicDeliveryState.DEGRADED, h.store.snapshot.stateFor(TETHER).deliveryState)
+        assertEquals("fixture: two requests", listOf("r1", "r2"), h.requests.map { it.requestId })
+    }
+
+    @Test
+    fun `B2-01 a retry sends exactly the tab's topics the model allows by hand, and the news tab nothing`() = runTest {
+        val expected = mapOf(
+            FreeTab.TETHER to setOf(TETHER, TopicCatalogue.DXY),
+            FreeTab.USD to setOf(USD, TopicCatalogue.DXY),
+            FreeTab.JPY to setOf(JPY_TOPIC),
+            FreeTab.EUR to setOf(EUR_TOPIC)
+        )
+        var last: Harness? = null
+        for ((tab, topics) in expected) {
+            val h = Harness(this, desired = allDesired).also { last = it }
+            authFailedOpen(h)
+            assertEquals("fixture [$tab]: every desired topic can be retried", allDesired, h.store.snapshot.manualRetryTopics)
+            h.retry(tab)
+            advanceTimeBy(1)
+            assertEquals("B2-01 [$tab] one request", 2, h.requests.size)
+            assertEquals("B2-01 [$tab] its topics", topics, h.lastTopics())
+        }
+        val news = Harness(this, desired = allDesired).also { last = it }
+        authFailedOpen(news)
+        news.retry(FreeTab.NEWS)
+        advanceTimeBy(100)
+        assertEquals("B2-01 news sends nothing", 1, news.requests.size)
+        last!!.cleanUp()
+    }
+
+    @Test
+    fun `B2-02 a retry reopens what may be reopened and revalidates only a degraded or suspect topic`() = runTest {
+        val degraded = Harness(this)
+        degradedTetherOpen(degraded)
+        degraded.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("B2-02 degraded: revalidating on screen", TopicDeliveryState.REVALIDATING, degraded.stateOf(TETHER).deliveryState)
+        assertEquals("B2-02 degraded: attempt 1", 1, degraded.stateOf(TETHER).revalidationAttempt)
+        assertEquals("B2-02 degraded: sent", setOf(TETHER), degraded.lastTopics())
+
+        val disabled = Harness(this)
+        disabledOpen(disabled, USD)
+        disabled.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        val usd = disabled.stateOf(USD)
+        assertNull("B2-02 disabled: reopened", usd.rejection)
+        assertEquals("B2-02 disabled: not confirmed", false, usd.confirmed)
+        assertEquals("B2-02 disabled: never received, not revalidating", TopicDeliveryState.NEVER_RECEIVED, usd.deliveryState)
+        assertEquals("B2-02 disabled: sent", setOf(USD), disabled.lastTopics())
+
+        val healthy = Harness(this)
+        authFailedOpen(healthy, received = listOf(TETHER))
+        val before = healthy.store.snapshot.stateFor(TETHER)
+        assertEquals("fixture: tether healthy before the failure", TopicDeliveryState.HEALTHY, before.deliveryState)
+        healthy.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("B2-02 healthy: state kept", TopicDeliveryState.HEALTHY, healthy.stateOf(TETHER).deliveryState)
+        assertEquals("B2-02 healthy: no receipt made up", before.receiveGeneration, healthy.stateOf(TETHER).receiveGeneration)
+        assertEquals("B2-02 healthy: still failed until an answer proves otherwise", TopicAuthResolution.FAILED,
+            healthy.topicShown().authResolution)
+        assertEquals("B2-02 healthy: sent", setOf(TETHER), healthy.lastTopics())
+        healthy.cleanUp()
+    }
+
+    @Test
+    fun `B2-03 repeated or overlapping retries merge by topic, and a waiting set goes as one batch`() = runTest {
+        // Repeated clicks while the batch waits for its answer add no request and no budget.
+        val repeated = Harness(this)
+        disabledOpen(repeated, USD)
+        repeated.retry(FreeTab.USD)
+        repeated.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        repeated.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("B2-03 one manual request for three clicks", listOf("r1", "r2"), repeated.requests.map { it.requestId })
+
+        // A renewal holds the lane; tether and dollar retries wait as one set and go in one batch, the shared index once.
+        val waiting = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        waiting.goLive()
+        advanceTimeBy(100)
+        waiting.wire.open()
+        advanceTimeBy(1)
+        waiting.wire.deliver(waiting.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        val renewalGate = CompletableDeferred<Unit>()
+        waiting.credentialGate = renewalGate
+        waiting.wire.deliver(waiting.ackOf("r1", leases = listOf(Triple(TETHER, "L1", 15L)),
+            rejections = mapOf(USD to "topics_disabled", TopicCatalogue.DXY to "topics_disabled")))
+        advanceTimeBy(1)
+        waiting.retry(FreeTab.TETHER)
+        waiting.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: only the first request so far; the renewal holds the lane at its credential", 1, waiting.requests.size)
+        renewalGate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the renewal went out", 2, waiting.requests.size)
+        waiting.wire.deliver(waiting.ack("r2", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertEquals("B2-03 one batch for the waiting set", 3, waiting.requests.size)
+        assertEquals("B2-03 the union, the index once", setOf(USD, TopicCatalogue.DXY), waiting.lastTopics())
+        waiting.cleanUp()
+    }
+
+    @Test
+    fun `B2-04 a waiting topic is asked about again at registration, and a registered one is not dropped by its own transition`() = runTest {
+        // Waiting behind the first batch, the dollar topic stops qualifying when that batch's answer proves the account.
+        val dropped = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        authFailedOpen(dropped)
+        val gate = CompletableDeferred<Unit>()
+        dropped.credentialGate = gate
+        dropped.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        dropped.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the tether batch went out", setOf(TETHER, TopicCatalogue.DXY), dropped.lastTopics())
+        dropped.wire.deliver(dropped.ack(dropped.requests.last().requestId, active = listOf(TETHER, TopicCatalogue.DXY)))
+        advanceTimeBy(1)
+        assertEquals("fixture: authentication proven", TopicAuthResolution.RESOLVED, dropped.store.snapshot.authResolution)
+        assertEquals("B2-04 the dollar topic no longer qualifies and is not sent", 2, dropped.requests.size)
+
+        // A degraded tether that starts revalidating is out of the retry set, and is still sent once its credential arrives.
+        val registered = Harness(this)
+        degradedTetherOpen(registered)
+        val held = CompletableDeferred<Unit>()
+        registered.credentialGate = held
+        registered.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertTrue("fixture: its own transition took it out of the retry set", TETHER !in registered.store.snapshot.manualRetryTopics)
+        held.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("B2-04 still sent", setOf(TETHER), registered.lastTopics())
+
+        // A waiting set does not survive its connection.
+        val moved = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        authFailedOpen(moved)
+        val wait = CompletableDeferred<Unit>()
+        moved.credentialGate = wait
+        moved.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        moved.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        moved.wire.drop()
+        advanceTimeBy(1)
+        wait.complete(Unit)
+        advanceTimeBy(5_000)
+        moved.wire.open()
+        advanceTimeBy(1)
+        assertEquals("B2-04 the new connection sends only its own first subscribe", 2, moved.requests.size)
+        assertEquals("B2-04 that subscribe is the whole desired set", setOf(TETHER, USD, TopicCatalogue.DXY), moved.lastTopics())
+        moved.cleanUp()
+    }
+
+    @Test
+    fun `B2-05 a receipt ends a target's delivery wait but not its acknowledgement`() = runTest {
+        // A receipt while the credential is awaited: the subscribe still goes and still carries it.
+        val received = Harness(this)
+        degradedTetherOpen(received)
+        val gate = CompletableDeferred<Unit>()
+        received.credentialGate = gate
+        received.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        received.wire.deliver(received.tetherFrame(1392.0))
+        advanceTimeBy(1)
+        assertEquals("fixture: tether healthy again", TopicDeliveryState.HEALTHY, received.stateOf(TETHER).deliveryState)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("B2-05 the subscribe is still sent", 3, received.requests.size)
+        assertEquals("B2-05 and still carries tether", setOf(TETHER), received.lastTopics())
+
+        // Two reopened targets, one received during the wait: after the answer only the silent one degrades.
+        val split = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        disabledOpen(split, USD, TopicCatalogue.DXY)
+        val wait = CompletableDeferred<Unit>()
+        split.credentialGate = wait
+        split.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        split.wire.deliver(split.fxFrame(1391.0))
+        advanceTimeBy(1)
+        wait.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: both sent", setOf(USD, TopicCatalogue.DXY), split.lastTopics())
+        split.wire.deliver(split.ack(split.requests.last().requestId, active = listOf(TETHER, USD, TopicCatalogue.DXY)))
+        advanceTimeBy(45_100)
+        assertEquals("B2-05 the received one stays healthy", TopicDeliveryState.HEALTHY, split.stateOf(USD).deliveryState)
+        assertEquals("B2-05 the silent one degrades", TopicDeliveryState.DEGRADED, split.stateOf(TopicCatalogue.DXY).deliveryState)
+        split.cleanUp()
+    }
+
+    @Test
+    fun `B2-06 the outcome is per target, whatever state a target started in`() = runTest {
+        // Cross 2: failed authentication over healthy targets, both accepted, one received.
+        val mixed = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        authFailedOpen(mixed, received = listOf(USD, TopicCatalogue.DXY))
+        mixed.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: both healthy at the start", TopicDeliveryState.HEALTHY, mixed.stateOf(TopicCatalogue.DXY).deliveryState)
+        mixed.wire.deliver(mixed.ack(mixed.requests.last().requestId, active = listOf(USD, TopicCatalogue.DXY)))
+        advanceTimeBy(1)
+        assertEquals("B2-06 the answer proved the account", TopicAuthResolution.RESOLVED, mixed.topicShown().authResolution)
+        mixed.wire.deliver(mixed.fxFrame(1392.0))
+        advanceTimeBy(45_100)
+        assertEquals("B2-06 the received target stays healthy", TopicDeliveryState.HEALTHY, mixed.stateOf(USD).deliveryState)
+        assertEquals("B2-06 the silent one degrades without having been revalidating", TopicDeliveryState.DEGRADED,
+            mixed.stateOf(TopicCatalogue.DXY).deliveryState)
+
+        // A refused target keeps its refusal and is not silence.
+        val refused = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        authFailedOpen(refused)
+        refused.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        refused.wire.deliver(refused.ack(refused.requests.last().requestId, active = listOf(USD),
+            rejections = mapOf(TopicCatalogue.DXY to "topics_disabled")))
+        advanceTimeBy(1)
+        assertEquals("B2-06 the refusal shows at once", TopicRejectionReason.TOPICS_DISABLED, refused.stateOf(TopicCatalogue.DXY).rejection)
+        advanceTimeBy(45_100)
+        assertEquals("B2-06 the accepted silent target degrades", TopicDeliveryState.DEGRADED, refused.stateOf(USD).deliveryState)
+        assertNotEquals("B2-06 the refused one is not called silent", TopicDeliveryState.DEGRADED,
+            refused.stateOf(TopicCatalogue.DXY).deliveryState)
+
+        // An answer that names a sent target nowhere degrades it at the answer.
+        val missing = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        authFailedOpen(missing)
+        missing.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        missing.wire.deliver(missing.ack(missing.requests.last().requestId, active = listOf(USD)))
+        advanceTimeBy(1)
+        assertEquals("B2-06 the unnamed target is not confirmed", false, missing.stateOf(TopicCatalogue.DXY).confirmed)
+        assertEquals("B2-06 and degrades without waiting", TopicDeliveryState.DEGRADED, missing.stateOf(TopicCatalogue.DXY).deliveryState)
+
+        // A target that received since the registration is not degraded by being left unnamed.
+        val kept = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        disabledOpen(kept, USD, TopicCatalogue.DXY)
+        kept.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        kept.wire.deliver(kept.dxyFrame(98.5))
+        advanceTimeBy(1)
+        kept.wire.deliver(kept.ack(kept.requests.last().requestId, active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertEquals("B2-06 its receipt is kept", TopicDeliveryState.HEALTHY, kept.stateOf(TopicCatalogue.DXY).deliveryState)
+        kept.cleanUp()
+    }
+
+    @Test
+    fun `B2-07 one budget for the batch, a spent one degrades the silent targets, a terminal or authentication end puts back`() = runTest {
+        // Three unanswered attempts: one budget, the silent target degrades, nothing left pending.
+        val unanswered = Harness(this)
+        authFailedOpen(unanswered)
+        unanswered.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        advanceTimeBy(75_000)
+        assertEquals("B2-07 three attempts and no more", listOf("r1", "r2", "r3", "r4"), unanswered.requests.map { it.requestId })
+        assertEquals("B2-07 the silent target degrades", TopicDeliveryState.DEGRADED, unanswered.stateOf(USD).deliveryState)
+        assertNotEquals("B2-07 nothing left pending", TopicControlState.PENDING, unanswered.topicShown().controlState)
+
+        // A terminal error puts the revalidating tether back to degraded, not healthy.
+        val terminal = Harness(this)
+        degradedTetherOpen(terminal)
+        terminal.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        terminal.wire.deliver(terminal.subscriptionError(terminal.requests.last().requestId, "invalid_request"))
+        advanceTimeBy(1)
+        assertEquals("B2-07 terminal: put back to degraded", TopicDeliveryState.DEGRADED, terminal.stateOf(TETHER).deliveryState)
+        assertEquals("B2-07 terminal: the failure is kept", com.jay.fxi.domain.model.TopicWholeRequestFailure.InvalidRequest,
+            terminal.topicShown().wholeFailure)
+
+        // A replay refused again ends by authentication: put back, the refusal kept.
+        val replay = Harness(this)
+        degradedTetherOpen(replay)
+        replay.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        replay.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        replay.wire.deliver(replay.subscriptionError(replay.requests.last().requestId, "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: the replay went out", 4, replay.requests.size)
+        replay.wire.deliver(replay.subscriptionError(replay.requests.last().requestId, "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("B2-07 replay refused: put back to degraded", TopicDeliveryState.DEGRADED, replay.stateOf(TETHER).deliveryState)
+        assertEquals("B2-07 replay refused: authentication failed", TopicAuthResolution.FAILED, replay.topicShown().authResolution)
+        replay.cleanUp()
+    }
+
+    @Test
+    fun `B2-09 a retry from an earlier owner does nothing, and a batch does not outlive its grant`() = runTest {
+        val stale = Harness(this)
+        disabledOpen(stale, USD)
+        val owner = checkNotNull(stale.shown().owner)
+        stale.coordinator.retryTopics(owner.copy(grantEpoch = owner.grantEpoch + 9), FreeTab.USD)
+        advanceTimeBy(100)
+        assertEquals("B2-09 a stale owner's retry sends nothing", 1, stale.requests.size)
+        assertEquals("B2-09 and opens nothing", TopicRejectionReason.TOPICS_DISABLED, stale.stateOf(USD).rejection)
+
+        val moved = Harness(this)
+        authFailedOpen(moved)
+        val gate = CompletableDeferred<Unit>()
+        moved.credentialGate = gate
+        moved.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        moved.setAccess(true, fence(uid = "u2"))
+        moved.credential = AuthSnapshot("u2", 1L, "token-b")
+        advanceTimeBy(1)
+        gate.complete(Unit)
+        advanceTimeBy(100)
+        moved.wire.open()
+        advanceTimeBy(1)
+        assertEquals("B2-09 the earlier grant's batch never went out", 2, moved.requests.size)
+        assertEquals("B2-09 only the next owner's first subscribe", setOf(TETHER, USD), moved.lastTopics())
+        moved.cleanUp()
+    }
+
+    @Test
+    fun `B2-10 a batch held by a use hold is not brought back by its release`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        authFailedOpen(h)
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        access.hold()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        access.release()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        gate.complete(Unit)
+        advanceTimeBy(100)
+        if (h.wires.size > 1) {
+            h.wire.open()
+            advanceTimeBy(1)
+        }
+        assertTrue("B2-10 the held batch was not sent", h.requests.drop(1).none { it.topics.toSet() == setOf(USD) })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `B2-11 a retry waits its turn on the lane, frees it at its answer, and a batch ended by authentication is not resumed in 2a`() = runTest {
+        // The answer frees the lane: a lease in the batch's answer starts its renewal before the batch's delivery deadline.
+        val freed = Harness(this)
+        disabledOpen(freed, USD)
+        freed.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        val batch = freed.requests.last().requestId
+        freed.wire.deliver(freed.ackOf(batch, leases = listOf(Triple(USD, "L2", 15L)), rejections = emptyMap()))
+        advanceTimeBy(1)
+        assertEquals("B2-11 the renewal went out while the batch still waits for delivery", 3, freed.requests.size)
+
+        // A batch ended by authentication is not resumed by a recovery.
+        val ended = Harness(this)
+        degradedTetherOpen(ended)
+        ended.refreshed = null
+        ended.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        ended.wire.deliver(ended.subscriptionError(ended.requests.last().requestId, "invalid_token"))
+        advanceTimeBy(1)
+        // 07-d: a refresh that produced nothing ends by authentication and puts back what the batch moved.
+        assertEquals("B2-11 a refresh that produced nothing puts tether back to degraded", TopicDeliveryState.DEGRADED,
+            ended.stateOf(TETHER).deliveryState)
+        val sent = ended.requests.size
+        ended.coordinator.onCredentialRecovered(ended.recovery(1L))
+        advanceTimeBy(11_000)
+        assertEquals("B2-11 no resumed batch in 2a", sent, ended.requests.size)
+
+        // A new click after that is a new batch.
+        assertTrue("fixture: tether can be retried by hand", TETHER in ended.store.snapshot.manualRetryTopics)
+        ended.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("B2-11 a new click sends a new batch", sent + 1, ended.requests.size)
+        ended.cleanUp()
+    }
+
+    @Test
+    fun `B2-13 with no target or no open connection a retry does nothing, and a spent ladder stays spent`() = runTest {
+        val healthy = Harness(this)
+        acknowledgedUnder(healthy)
+        healthy.wire.deliver(healthy.tetherFrame(1390.0))
+        healthy.wire.deliver(healthy.fxFrame(1391.0))
+        advanceTimeBy(1)
+        val before = healthy.requests.size
+        healthy.retry(FreeTab.TETHER)
+        healthy.retry(FreeTab.USD)
+        advanceTimeBy(100)
+        assertEquals("B2-13 open with no target: nothing", before, healthy.requests.size)
+
+        val spent = Harness(this)
+        exhaust(spent)
+        assertEquals("fixture: exhausted", TopicRecoveryDisplay.Exhausted, spent.shown().recovery)
+        spent.retry(FreeTab.TETHER)
+        advanceTimeBy(10_000)
+        assertEquals("B2-13 no new socket from a topic retry", 6, spent.wires.size)
+        assertEquals("B2-13 still exhausted", TopicRecoveryDisplay.Exhausted, spent.shown().recovery)
+        spent.coordinator.retryConnection(checkNotNull(spent.shown().owner))
+        advanceTimeBy(1)
+        assertEquals("B2-13 the connection retry still works", 7, spent.wires.size)
+
+        val offline = Harness(this)
+        authFailedOpen(offline)
+        offline.coordinator.setOnline(false)
+        advanceTimeBy(1)
+        offline.retry(FreeTab.USD)
+        advanceTimeBy(10_000)
+        assertEquals("B2-13 offline: no socket", 1, offline.wires.size)
+        assertEquals("B2-13 offline: no request", 1, offline.requests.size)
+        offline.cleanUp()
+    }
+
+    @Test
+    fun `B2-14 a retry is published when it starts, and a REST answer is not a receipt`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        disabledOpen(h, USD)
+        h.bootstrapOutcome = { _, topic -> if (topic == USD) h.delivered(h.fxFrame(1391.0)) else TopicSnapshotOutcome.Unreachable(java.io.IOException("staged")) }
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        h.assertTopicMirrors("B2-14 the start is published")
+        assertNull("B2-14 reopened on screen", h.stateOf(USD).rejection)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        val generation = h.store.snapshot.stateFor(USD).receiveGeneration
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: the REST answer changed no receipt", generation, h.store.snapshot.stateFor(USD).receiveGeneration)
+        advanceTimeBy(45_100)
+        assertEquals("B2-14 a REST answer does not satisfy the delivery wait", TopicDeliveryState.DEGRADED, h.stateOf(USD).deliveryState)
+        h.cleanUp()
+    }
+
+    /** Cross 4: an automatic tether revalidation is taken over by a retry, and a terminal end leaves nothing revalidating. */
+    @Test
+    fun `B2-15 a retry takes over a running tether revalidation, its answer included, and cleans it up`() = runTest {
+        val h = Harness(this)
+        silenceReady(h)
+        advanceTimeBy(45_100)
+        assertEquals("fixture: the automatic revalidation asked", 2, h.requests.size)
+        h.wire.deliver(h.ackWithLease("r2", TETHER, 15L))
+        advanceTimeBy(1)
+        assertEquals("fixture: revalidating, waiting for delivery", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        assertEquals("fixture: the renewal is in flight", 3, h.requests.size)
+        h.wire.deliver(h.subscriptionError("r3", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: authentication failed", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+        assertTrue("fixture: tether can be retried by hand", TETHER in h.store.snapshot.manualRetryTopics)
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("B2-15 the automatic answer does not stand for the retry's", 4, h.requests.size)
+        assertEquals("B2-15 tether sent again", setOf(TETHER), h.lastTopics())
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_request"))
+        advanceTimeBy(1)
+        assertNotEquals("B2-15 nothing left revalidating", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        assertEquals("B2-15 cleaned up as the automatic one would be", TopicDeliveryState.HEALTHY, h.stateOf(TETHER).deliveryState)
+
+        // 08-f: once taken over, the automatic revalidation's own deadline changes nothing; the retry's deadline decides.
+        val over = Harness(this)
+        silenceReady(over)
+        advanceTimeBy(45_100)
+        over.wire.deliver(over.ackWithLease("r2", TETHER, 120L))
+        advanceTimeBy(1)
+        assertEquals("fixture: the renewal is in flight", 3, over.requests.size)
+        over.wire.deliver(over.subscriptionError("r3", "invalid_token"))
+        advanceTimeBy(1)
+        advanceTimeBy(20_000)
+        assertEquals("fixture: authentication failed", TopicAuthResolution.FAILED, over.store.snapshot.authResolution)
+        assertEquals("fixture: still revalidating, nothing else asked", TopicDeliveryState.REVALIDATING, over.stateOf(TETHER).deliveryState)
+        assertEquals("fixture: three requests", 3, over.requests.size)
+        over.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: the retry went out", 4, over.requests.size)
+        over.wire.deliver(over.ack(over.requests.last().requestId, active = listOf(TETHER)))
+        advanceTimeBy(1)
+        advanceTimeBy(30_000)
+        assertEquals("B2-15 the automatic deadline passed and changed nothing", TopicDeliveryState.REVALIDATING,
+            over.stateOf(TETHER).deliveryState)
+        advanceTimeBy(16_000)
+        assertEquals("B2-15 the retry's own silence degrades", TopicDeliveryState.DEGRADED, over.stateOf(TETHER).deliveryState)
+        over.cleanUp()
+    }
+
+    /** 08-b: an earlier batch's deadline does not reach a topic a newer batch has taken. */
+    @Test
+    fun `B2-17 an earlier batch's result does not reach a topic a newer batch owns`() = runTest {
+        val h = Harness(this)
+        authFailedOpen(h)
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        val first = h.requests.last().requestId
+        h.wire.deliver(h.ackOf(first, leases = listOf(Triple(USD, "L1", 120L)), rejections = emptyMap()))
+        advanceTimeBy(1)
+        assertEquals("fixture: the renewal is in flight", 3, h.requests.size)
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: authentication failed again", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+        advanceTimeBy(20_000)
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: the second batch went out", 4, h.requests.size)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(USD)))
+        advanceTimeBy(1)
+        advanceTimeBy(30_000)
+        assertNotEquals("B2-17 the first batch's deadline did not degrade the second batch's topic", TopicDeliveryState.DEGRADED,
+            h.stateOf(USD).deliveryState)
+        advanceTimeBy(16_000)
+        assertEquals("B2-17 the second batch's own silence degrades it", TopicDeliveryState.DEGRADED, h.stateOf(USD).deliveryState)
+        h.cleanUp()
+    }
+
+    /** 07-e·07-f: a spent budget degrades the silent targets even when authentication ended it. */
+    @Test
+    fun `B2-18 a budget spent by authentication degrades the silent targets and asks nothing more`() = runTest {
+        // A first invalid token on the third attempt: no replay left.
+        val third = Harness(this)
+        authFailedOpen(third)
+        val refreshes = third.refreshCalls
+        third.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        advanceTimeBy(55_000)
+        assertEquals("fixture: the third attempt went out", listOf("r1", "r2", "r3", "r4"), third.requests.map { it.requestId })
+        third.wire.deliver(third.subscriptionError("r4", "invalid_token"))
+        advanceTimeBy(1)
+        advanceTimeBy(30_000)
+        assertEquals("B2-18 no refresh and no replay", refreshes, third.refreshCalls)
+        assertEquals("B2-18 nothing more asked", 4, third.requests.size)
+        assertEquals("B2-18 the silent target degrades", TopicDeliveryState.DEGRADED, third.stateOf(USD).deliveryState)
+        assertEquals("B2-18 authentication stays failed", TopicAuthResolution.FAILED, third.topicShown().authResolution)
+        assertEquals("B2-18 the refusal is kept", com.jay.fxi.domain.model.TopicWholeRequestFailure.InvalidToken,
+            third.topicShown().wholeFailure)
+
+        // Three credentials that could not be prepared: nothing sent, the reopened target degrades, no server failure made up.
+        val unprepared = Harness(this)
+        disabledOpen(unprepared, USD)
+        val control = unprepared.topicShown().controlState
+        unprepared.credentialFailures = 3
+        unprepared.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        advanceTimeBy(12_000)
+        assertEquals("fixture: three preparations failed", 4, unprepared.credentialReads)
+        assertEquals("B2-18 nothing sent", 1, unprepared.requests.size)
+        assertEquals("B2-18 the reopened target degrades", TopicDeliveryState.DEGRADED, unprepared.stateOf(USD).deliveryState)
+        assertNull("B2-18 no server failure made up", unprepared.topicShown().wholeFailure)
+        assertEquals("B2-18 with no request opened, the control state is not changed", control, unprepared.topicShown().controlState)
+        unprepared.cleanUp()
+    }
+
+    /** 03-b·03-c: a waiting set is every newly asked topic; a registered batch keeps its own targets. */
+    @Test
+    fun `B2-19 a waiting set is the union of what was asked, and a registered batch is not widened`() = runTest {
+        // Three tabs asked while the lane is held by a batch whose answer proves nothing: one batch of all three, the index once.
+        val union = Harness(this, desired = allDesired)
+        authFailedOpen(union)
+        val gate = CompletableDeferred<Unit>()
+        union.credentialGate = gate
+        union.retry(FreeTab.JPY)
+        advanceTimeBy(1)
+        union.retry(FreeTab.TETHER)
+        union.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the yen batch went out", setOf(JPY_TOPIC), union.lastTopics())
+        union.wire.deliver(union.ack(union.requests.last().requestId, active = emptyList(), rejections = mapOf(JPY_TOPIC to "topics_disabled")))
+        advanceTimeBy(1)
+        assertEquals("fixture: a disabled-only answer proves nothing", TopicAuthResolution.FAILED, union.store.snapshot.authResolution)
+        assertEquals("B2-19 one batch for the waiting set", 3, union.requests.size)
+        assertEquals("B2-19 every asked topic, the index once", setOf(TETHER, USD, TopicCatalogue.DXY), union.lastTopics())
+
+        // A registered tether batch keeps its targets; the dollar retry adds only the dollar topic to the waiting set.
+        val fixed = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        authFailedOpen(fixed)
+        val held = CompletableDeferred<Unit>()
+        fixed.credentialGate = held
+        fixed.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        fixed.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        held.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("B2-19 the registered batch is not widened", setOf(TETHER, TopicCatalogue.DXY), fixed.lastTopics())
+        fixed.wire.deliver(fixed.ack(fixed.requests.last().requestId, active = emptyList(),
+            rejections = mapOf(TETHER to "topics_disabled", TopicCatalogue.DXY to "topics_disabled")))
+        advanceTimeBy(1)
+        assertEquals("B2-19 the next batch carries only the newly asked topic", setOf(USD), fixed.lastTopics())
+        assertEquals("B2-19 one more request", 3, fixed.requests.size)
+        fixed.cleanUp()
+    }
+
+    /** 11-d·11-g: a renewal and an automatic revalidation go before a waiting retry; a retry leaves an unrelated automatic authentication ending alone. */
+    @Test
+    fun `B2-20 a renewal and an automatic revalidation go before a waiting retry, and a retry leaves the automatic recovery record alone`() = runTest {
+        val order = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        order.goLive()
+        advanceTimeBy(100)
+        order.wire.open()
+        advanceTimeBy(1)
+        order.wire.deliver(order.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        order.wire.deliver(order.ackOf("r1", leases = listOf(Triple(TETHER, "L1", 185L)),
+            rejections = mapOf(USD to "topics_disabled", TopicCatalogue.DXY to "topics_disabled")))
+        advanceTimeBy(1)
+        val gate = CompletableDeferred<Unit>()
+        order.credentialGate = gate
+        order.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        order.retry(FreeTab.USD)
+        advanceTimeBy(6_000)
+        assertEquals("fixture: only the first request; the retry holds the lane at its credential", 1, order.requests.size)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the tether-tab batch went out", setOf(TopicCatalogue.DXY), order.lastTopics())
+        // Ended without an acknowledgement: an acknowledgement would bring the lease schedule anew and clear the renewal standing
+        // aside, and then nothing would be waiting when the lane frees.
+        order.wire.deliver(order.subscriptionError(order.requests.last().requestId, "invalid_request"))
+        advanceTimeBy(1)
+        assertEquals("B2-20 the renewal goes first", listOf(TETHER), order.requests.last().topics)
+        assertEquals("B2-20 one request at a time", 3, order.requests.size)
+        order.wire.deliver(order.ackWithLease(order.requests.last().requestId, TETHER, 900L))
+        advanceTimeBy(1)
+        assertEquals("B2-20 the waiting retry goes after it", setOf(USD), order.lastTopics())
+        assertEquals("B2-20 and only it", 4, order.requests.size)
+
+        // A revalidation that came due while a renewal held the lane goes before the waiting retry as well.
+        val question = Harness(this)
+        question.goLive()
+        advanceTimeBy(100)
+        question.wire.open()
+        advanceTimeBy(1)
+        question.wire.deliver(question.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        // 220 − 180: the renewal goes out at forty seconds, before the silence runs out at forty-five.
+        question.wire.deliver(question.ackOf("r1", leases = listOf(Triple(TETHER, "L1", 220L)), rejections = mapOf(USD to "topics_disabled")))
+        advanceTimeBy(1)
+        advanceTimeBy(40_100)
+        assertEquals("fixture: the renewal holds the lane", listOf(TETHER), question.requests.last().topics)
+        assertEquals("fixture: two requests", 2, question.requests.size)
+        question.retry(FreeTab.USD)
+        advanceTimeBy(5_000)
+        assertEquals("fixture: neither the question nor the retry went while the renewal holds", 2, question.requests.size)
+        question.wire.deliver(question.ackWithLeases("r2", Triple(TETHER, "L2", 900L)))
+        advanceTimeBy(1)
+        assertEquals("B2-20 the automatic revalidation goes first", listOf(TETHER), question.requests.last().topics)
+        assertEquals("B2-20 one request at a time", 3, question.requests.size)
+        assertEquals("B2-20 it is the revalidation", TopicDeliveryState.REVALIDATING, question.stateOf(TETHER).deliveryState)
+        question.wire.deliver(question.ack("r3", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertEquals("B2-20 the waiting retry goes after it", setOf(USD), question.lastTopics())
+        assertEquals("B2-20 and only it", 4, question.requests.size)
+
+        // An automatic revalidation ended by unprepared credentials; a dollar retry in between; the recovery still reopens tether.
+        val record = Harness(this)
+        record.goLive()
+        advanceTimeBy(100)
+        record.wire.open()
+        advanceTimeBy(1)
+        record.wire.deliver(record.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        record.wire.deliver(record.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "topics_disabled")))
+        advanceTimeBy(1)
+        record.credentialFailures = 3
+        advanceTimeBy(56_000)
+        assertEquals("fixture: three preparations failed", 4, record.credentialReads)
+        assertEquals("fixture: the automatic revalidation ended without a send", 1, record.requests.size)
+        record.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: the retry went out", setOf(USD), record.lastTopics())
+        record.wire.deliver(record.ack(record.requests.last().requestId, active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        record.coordinator.onCredentialRecovered(record.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("B2-20 the recovery still reopens the automatic tether revalidation", listOf(TETHER), record.requests.last().topics)
+        record.cleanUp()
+    }
+
+    /** 11-d: a recovery of an automatic ending that waited for the lane goes before a waiting retry. */
+    @Test
+    fun `B2-21 a recovery of an automatic ending goes before a waiting retry, which then sends what is still eligible`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, JPY_TOPIC))
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "topics_disabled", JPY_TOPIC to "topics_disabled")))
+        advanceTimeBy(1)
+        h.credentialFailures = 3
+        advanceTimeBy(56_000)
+        assertEquals("fixture: the automatic revalidation ended on its credential", 4, h.credentialReads)
+        assertEquals("fixture: one request", 1, h.requests.size)
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        h.retry(FreeTab.JPY)
+        advanceTimeBy(1)
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("fixture: the lane is held at the credential", 1, h.requests.size)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the yen batch went out", setOf(JPY_TOPIC), h.lastTopics())
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_request"))
+        advanceTimeBy(1)
+        assertEquals("B2-21 the recovery goes first", listOf(TETHER), h.requests.last().topics)
+        assertEquals("B2-21 one request at a time", 3, h.requests.size)
+        assertEquals("B2-21 it is the automatic revalidation reopened", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertEquals("B2-21 the waiting retry goes after it, with what is still eligible", setOf(USD), h.lastTopics())
+        assertEquals("B2-21 and only it", 4, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** 11-h: a retry that takes over an ended automatic tether obligation settles that obligation, and only that one. */
+    @Test
+    fun `B2-22 a tether retry settles an ended automatic revalidation, and an owed renewal stays owed`() = runTest {
+        // Ended by a refused replay: the revalidation owed, authentication failed.
+        val alone = Harness(this)
+        revalidationReplayRefused(alone)
+        assertTrue("fixture: tether can be retried by hand", TETHER in alone.store.snapshot.manualRetryTopics)
+        alone.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: the retry went out", setOf(TETHER), alone.lastTopics())
+        assertEquals("fixture: four requests", 4, alone.requests.size)
+        alone.wire.deliver(alone.subscriptionError("r4", "invalid_request"))
+        advanceTimeBy(1)
+        alone.coordinator.onCredentialRecovered(alone.recovery(episode = 1))
+        advanceTimeBy(100)
+        assertEquals("B2-22 the revalidation the retry took over is not reopened", 4, alone.requests.size)
+
+        // A combined renewal and revalidation ended on authentication: the retry settles the revalidation, the renewal stays owed.
+        val both = Harness(this)
+        revalidationCredentialEnded(both, leaseSeconds = 300)
+        both.credentialFailures = 3
+        advanceTimeBy(75_000)
+        assertEquals("fixture: the renewal ended on its credential", 7, both.credentialReads)
+        both.coordinator.onCredentialRecovered(both.recovery(episode = 1))
+        advanceTimeBy(1)
+        assertEquals("fixture: the combined reopen went out", listOf(TETHER), both.requests.last().topics)
+        assertEquals("fixture: two requests", 2, both.requests.size)
+        assertEquals("fixture: revalidating", TopicDeliveryState.REVALIDATING, both.stateOf(TETHER).deliveryState)
+        both.wire.deliver(both.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: authentication failed", TopicAuthResolution.FAILED, both.store.snapshot.authResolution)
+        assertTrue("fixture: tether can be retried by hand", TETHER in both.store.snapshot.manualRetryTopics)
+        both.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: the retry went out", 3, both.requests.size)
+        both.wire.deliver(both.subscriptionError("r3", "invalid_request"))
+        advanceTimeBy(1)
+        val attempt = both.stateOf(TETHER).revalidationAttempt
+        both.coordinator.onCredentialRecovered(both.recovery(episode = 2))
+        advanceTimeBy(1)
+        assertEquals("B2-22 the renewal is reopened", 4, both.requests.size)
+        assertEquals("B2-22 for tether's lease", listOf(TETHER), both.requests.last().topics)
+        assertEquals("B2-22 as a renewal alone, not a revalidation", TopicDeliveryState.HEALTHY, both.stateOf(TETHER).deliveryState)
+        assertEquals("B2-22 no revalidation attempt added", attempt, both.stateOf(TETHER).revalidationAttempt)
+        both.cleanUp()
+    }
+
+    // ---- R4-c C2+b-2a windows (contract r4): rows written inside the instant where a guard changes the answer, after the r3
+    // battery left their guards' single mutants alive. Each row's comment names the window it stands in. ----
+
+    /**
+     * 08-b at one instant. The earlier batch's deadline wake was scheduled long before, so at its instant it runs first and reads
+     * its own scope; a retry posted at that instant is handled before that result. Whichever comes first, the topic the newer
+     * batch took is not degraded by the earlier batch.
+     */
+    @Test
+    fun `B2-23 an earlier batch's deadline result handled after a newer batch registered changes nothing of the newer batch`() = runTest {
+        val delivery = com.jay.fxi.domain.model.TopicRequestPolicy.DELIVERY_TIMEOUT.inWholeMilliseconds
+        val h = Harness(this)
+        authFailedOpen(h)
+        val sentAt = testScheduler.currentTime
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: the first batch went out", setOf(USD), h.lastTopics())
+        val ackAt = testScheduler.currentTime
+        h.wire.deliver(h.ackOf(h.requests.last().requestId, leases = listOf(Triple(USD, "L1", 120L)), rejections = emptyMap()))
+        advanceTimeBy(1)
+        val deadline = sentAt + delivery
+        assertTrue("fixture: the first batch waits for exactly its deadline: ${h.sleeps}", h.sleeps.contains((deadline - ackAt).milliseconds))
+        assertEquals("fixture: the renewal is in flight", 3, h.requests.size)
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: authentication failed again", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+        advanceTimeBy(deadline - testScheduler.currentTime)
+        assertNotEquals("fixture: the deadline has not been handled yet", TopicDeliveryState.DEGRADED, h.stateOf(USD).deliveryState)
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: the second batch went out at the same instant", 4, h.requests.size)
+        assertNotEquals("B2-23 the earlier batch's silence did not degrade the topic the newer batch took", TopicDeliveryState.DEGRADED,
+            h.stateOf(USD).deliveryState)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(USD)))
+        advanceTimeBy(1)
+        advanceTimeBy(delivery)
+        assertEquals("B2-23 the newer batch's own silence degrades", TopicDeliveryState.DEGRADED, h.stateOf(USD).deliveryState)
+        h.cleanUp()
+    }
+
+    /**
+     * A receipt in an attempt's cooldown is a receipt since registration. The window is the next attempt's answer: judged against a
+     * baseline read at that send, the target would look silent and the answer would wait out a delivery deadline it does not owe.
+     */
+    @Test
+    fun `B2-24 a receipt between attempts ends the delivery wait the next attempt would otherwise owe`() = runTest {
+        val h = Harness(this)
+        // Not a failed credential: frames are refused while authentication is failed, and the receipt is the point here.
+        disabledOpen(h, USD)
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: the first attempt went out", listOf("r1", "r2"), h.requests.map { it.requestId })
+        advanceTimeBy(20_100)
+        assertEquals("fixture: unanswered, in its cooldown", 2, h.requests.size)
+        h.wire.deliver(h.fxFrame(1391.0))
+        advanceTimeBy(1)
+        assertEquals("fixture: the dollar topic spoke", TopicDeliveryState.HEALTHY, h.stateOf(USD).deliveryState)
+        advanceTimeBy(7_000)
+        assertEquals("fixture: the second attempt went out", listOf("r1", "r2", "r3"), h.requests.map { it.requestId })
+        h.sleeps.clear()
+        h.wire.deliver(h.ack("r3", active = listOf(USD)))
+        advanceTimeBy(1)
+        assertTrue("B2-24 no delivery wait for a target that spoke since the registration: ${h.sleeps}",
+            h.sleeps.none { it >= 40.seconds && it <= 50.seconds })
+        advanceTimeBy(50_000)
+        assertEquals("B2-24 and it is not degraded", TopicDeliveryState.HEALTHY, h.stateOf(USD).deliveryState)
+        h.cleanUp()
+    }
+
+    /**
+     * 11-e. The window is the turn between `CommandDone`, which frees the lane and queues `ControlLaneFree`, and that queued input.
+     * A retry posted from the observer while the ending batch's result is published lands in it. The renewal waiting for the lane
+     * still goes first.
+     */
+    @Test
+    fun `B2-25 a retry that arrives between a freed lane and its queued wake does not go ahead of the waiting renewal`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackOf("r1", leases = listOf(Triple(TETHER, "L1", 300L)), rejections = mapOf(USD to "topics_disabled")))
+        advanceTimeBy(1)
+        advanceTimeBy(45_100)
+        assertEquals("fixture: the automatic revalidation asked", 2, h.requests.size)
+        h.wire.deliver(h.ackOf("r2", leases = listOf(Triple(TETHER, "L1", 300L)), rejections = emptyMap()))
+        advanceTimeBy(1)
+        advanceTimeBy(45_100)
+        assertEquals("fixture: tether degraded", TopicDeliveryState.DEGRADED, h.stateOf(TETHER).deliveryState)
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: the retry holds the lane at its credential", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        advanceTimeBy(80_000)
+        assertEquals("fixture: nothing else went while the lane is held", 2, h.requests.size)
+        var posted = false
+        h.onTopicStatePublished = { snapshot ->
+            if (!posted && snapshot.stateFor(TETHER).deliveryState == TopicDeliveryState.DEGRADED) {
+                posted = true
+                h.retry(FreeTab.USD)
+            }
+        }
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the retry went out", setOf(TETHER), h.lastTopics())
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_request"))
+        advanceTimeBy(1)
+        assertTrue("fixture: the dollar retry was posted while the ending was published", posted)
+        assertEquals("B2-25 the waiting renewal goes first", listOf(TETHER), h.requests.last().topics)
+        assertEquals("B2-25 one request at a time", 4, h.requests.size)
+        h.onTopicStatePublished = null
+        h.wire.deliver(h.ackWithLeases(h.requests.last().requestId, Triple(TETHER, "L2", 900L)))
+        advanceTimeBy(1)
+        assertEquals("B2-25 the dollar retry goes after it", setOf(USD), h.lastTopics())
+        assertEquals("B2-25 and only it", 5, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * The window is a tether silence that runs out while a retry owns tether and waits for its own deadline: an automatic
+     * revalidation started then would be a second owner of the same delivery result. The retry's own deadline decides.
+     */
+    @Test
+    fun `B2-26 a tether silence that runs out while a retry owns tether does not start an automatic revalidation`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        // The window is armed by this receipt, before authentication fails: once it has failed, frames are refused.
+        val frameAt = testScheduler.currentTime
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLease("r1", TETHER, 120L))
+        advanceTimeBy(1)
+        assertEquals("fixture: the renewal is in flight", 2, h.requests.size)
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: authentication failed", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: the retry went out", setOf(TETHER), h.lastTopics())
+        assertEquals("fixture: three requests", 3, h.requests.size)
+        h.wire.deliver(h.ack("r3", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertEquals("fixture: the answer proved the account", TopicAuthResolution.RESOLVED, h.store.snapshot.authResolution)
+        assertEquals("fixture: tether healthy, nothing moved", TopicDeliveryState.HEALTHY, h.stateOf(TETHER).deliveryState)
+        advanceTimeBy(frameAt + com.jay.fxi.domain.model.TopicSilencePolicy.SILENCE_WINDOW.inWholeMilliseconds - testScheduler.currentTime)
+        advanceTimeBy(1)
+        assertEquals("B2-26 the silence asked nothing while the retry owns tether", 3, h.requests.size)
+        // Whether the silence marks tether suspect is not this row's: no second owner of the delivery result is started.
+        assertNotEquals("B2-26 no automatic revalidation started", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        assertEquals("B2-26 no revalidation attempt", 0, h.stateOf(TETHER).revalidationAttempt)
+        advanceTimeBy(1_000)
+        assertEquals("B2-26 the retry's own deadline degrades", TopicDeliveryState.DEGRADED, h.stateOf(TETHER).deliveryState)
+        assertEquals("B2-26 still nothing more asked", 3, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * The window is a batch whose command leaves without a result on a standing connection — its acknowledgement listener threw,
+     * so no `CommandFinished` comes. What takes it off the connection also puts back what it moved, as the automatic one does,
+     * and the topic can be retried again.
+     */
+    @Test
+    fun `B2-27 a batch that leaves without a result on a standing connection puts back what it moved`() = runTest {
+        val h = Harness(this)
+        degradedTetherOpen(h)
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: revalidating", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        h.acknowledgementFailure = kotlinx.coroutines.CancellationException("listener")
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER)))
+        advanceTimeBy(1)
+        h.acknowledgementFailure = null
+        assertTrue("fixture: the listener threw and the connection stands", !h.wire.cancelled)
+        assertEquals("B2-27 put back to degraded, not left revalidating", TopicDeliveryState.DEGRADED, h.stateOf(TETHER).deliveryState)
+        advanceTimeBy(50_000)
+        assertEquals("B2-27 nothing judges it later", TopicDeliveryState.DEGRADED, h.stateOf(TETHER).deliveryState)
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("B2-27 a new retry goes", 4, h.requests.size)
+        assertEquals("B2-27 for tether", setOf(TETHER), h.lastTopics())
+        h.cleanUp()
+    }
+
+    /**
+     * The window is a batch's send boundary: the identity source can change inside the observer called when the attempt's request
+     * opens, after the batch's last check and before the send. Nothing goes out under the old credential.
+     */
+    @Test
+    fun `B2-28 an identity that changes as the attempt opens sends nothing`() = runTest {
+        val h = Harness(this)
+        disabledOpen(h, USD)
+        var armed = true
+        h.onTopicStatePublished = { snapshot ->
+            if (armed && snapshot.controlState == TopicControlState.PENDING) {
+                armed = false
+                h.liveFence = AuthIdentityFence("u2", 2L)
+            }
+        }
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertTrue("fixture: the identity moved while the attempt opened", !armed)
+        // `requests` records what was encoded, which comes before the send; the wire records what went out.
+        assertEquals("fixture: the attempt was encoded", 2, h.requests.size)
+        assertEquals("B2-28 nothing sent under the old credential", listOf("encoded-r1"), h.wire.sent.filter { it.startsWith("encoded-") })
+        h.onTopicStatePublished = null
+        h.cleanUp()
+    }
+
+    /**
+     * The window is between a batch's deadline result and its application: the batch computes its silence under the identity it
+     * read, and the identity changes before the session applies that result. The stale silence is not applied or published.
+     */
+    @Test
+    fun `B2-29 a deadline result applied after the identity changed is not applied`() = runTest {
+        val delivery = com.jay.fxi.domain.model.TopicRequestPolicy.DELIVERY_TIMEOUT.inWholeMilliseconds
+        val h = Harness(this)
+        authFailedOpen(h)
+        val sentAt = testScheduler.currentTime
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackOf(h.requests.last().requestId, leases = listOf(Triple(USD, "L1", 120L)), rejections = emptyMap()))
+        advanceTimeBy(1)
+        assertEquals("fixture: the renewal is in flight", 3, h.requests.size)
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_token"))
+        advanceTimeBy(1)
+        advanceTimeBy(sentAt + delivery - testScheduler.currentTime)
+        val published = h.topicStates.size
+        // The first clock reading after the deadline wake has read the identity — inside its own admission, after the identity check.
+        h.afterIdentityClockRead = {
+            h.afterIdentityClockRead = null
+            h.liveFence = AuthIdentityFence("u2", 2L)
+        }
+        advanceTimeBy(1)
+        assertNull("fixture: the identity moved after the result was computed", h.afterIdentityClockRead)
+        assertTrue("B2-29 the session noticed the identity at the application", h.wire.cancelled)
+        assertTrue("B2-29 the stale silence was not published",
+            h.topicStates.drop(published).none { it.stateFor(USD).deliveryState == TopicDeliveryState.DEGRADED })
+        h.cleanUp()
+    }
+
+    /**
+     * The window is a topic a batch's acknowledgement named nowhere while the batch still waits on another target: that topic is no
+     * longer the batch's, so a silence that runs out on it — armed by a receipt after the registration, and with the topic
+     * confirmed again by another batch's answer — is asked about as usual.
+     */
+    @Test
+    fun `B2-30 a target the answer named nowhere is released, and its silence is asked about while the batch waits on another`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = emptyList(),
+            rejections = mapOf(TETHER to "topics_disabled", USD to "topics_disabled", TopicCatalogue.DXY to "topics_disabled")))
+        advanceTimeBy(1)
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        val frameAt = testScheduler.currentTime
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertEquals("fixture: tether spoke after the registration", 1L, h.stateOf(TETHER).receiveGeneration)
+        advanceTimeBy(9_000)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the tether-tab batch went out", setOf(TETHER, TopicCatalogue.DXY), h.lastTopics())
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TopicCatalogue.DXY)))
+        advanceTimeBy(1)
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: the dollar batch went out", setOf(USD), h.lastTopics())
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER, TopicCatalogue.DXY, USD)))
+        advanceTimeBy(1)
+        assertEquals("fixture: tether confirmed again", true, h.stateOf(TETHER).confirmed)
+        assertEquals("fixture: three requests", 3, h.requests.size)
+        advanceTimeBy(frameAt + com.jay.fxi.domain.model.TopicSilencePolicy.SILENCE_WINDOW.inWholeMilliseconds - testScheduler.currentTime)
+        advanceTimeBy(1)
+        assertEquals("B2-30 the silence asks about tether", 4, h.requests.size)
+        assertEquals("B2-30 a tether revalidation", listOf(TETHER), h.requests.last().topics)
+        assertEquals("B2-30 revalidating", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    /**
+     * The window is a silence armed by a receipt after the registration that runs out while the batch still owns tether: it is not
+     * a second owner then, and once the batch lets tether go it is asked in the lane's order — not left suspect with its window spent.
+     */
+    @Test
+    fun `B2-31 a silence that ran out while a batch owned tether is asked once the batch lets go`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, TopicCatalogue.DXY))
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = emptyList(),
+            rejections = mapOf(TETHER to "topics_disabled", TopicCatalogue.DXY to "topics_disabled")))
+        advanceTimeBy(1)
+        val gate = CompletableDeferred<Unit>()
+        h.credentialGate = gate
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        val frameAt = testScheduler.currentTime
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        advanceTimeBy(9_000)
+        val sentAt = testScheduler.currentTime
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the tether-tab batch went out", setOf(TETHER, TopicCatalogue.DXY), h.lastTopics())
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER, TopicCatalogue.DXY)))
+        advanceTimeBy(1)
+        advanceTimeBy(frameAt + com.jay.fxi.domain.model.TopicSilencePolicy.SILENCE_WINDOW.inWholeMilliseconds - testScheduler.currentTime)
+        advanceTimeBy(1)
+        assertEquals("fixture: not a second owner while the batch holds tether", 2, h.requests.size)
+        advanceTimeBy(sentAt + com.jay.fxi.domain.model.TopicRequestPolicy.DELIVERY_TIMEOUT.inWholeMilliseconds - testScheduler.currentTime)
+        advanceTimeBy(1)
+        assertEquals("fixture: the silent index degraded at the batch's deadline", TopicDeliveryState.DEGRADED,
+            h.stateOf(TopicCatalogue.DXY).deliveryState)
+        assertEquals("B2-31 the silence is asked once the batch lets tether go", 3, h.requests.size)
+        assertEquals("B2-31 a tether revalidation", listOf(TETHER), h.requests.last().topics)
+        assertEquals("B2-31 revalidating, not left suspect", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    /**
+     * The window is a silence that runs out while a batch owns tether before its answer — here during the refresh its refused
+     * credential started — and a batch that then ends without judging tether. The question the silence raised is owed to no one
+     * else: once the batch lets go it is asked in the lane's order, not left suspect with its window spent.
+     */
+    @Test
+    fun `B2-32 a silence that ran out before a batch's answer is asked once the batch ends without judging tether`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val frameAt = testScheduler.currentTime
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLease("r1", TETHER, 120L))
+        advanceTimeBy(1)
+        assertEquals("fixture: the renewal is in flight", 2, h.requests.size)
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: authentication failed", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: the retry went out", setOf(TETHER), h.lastTopics())
+        val gate = CompletableDeferred<Unit>()
+        h.refreshGate = gate
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: refreshing", TopicAuthResolution.REFRESHING, h.store.snapshot.authResolution)
+        advanceTimeBy(frameAt + com.jay.fxi.domain.model.TopicSilencePolicy.SILENCE_WINDOW.inWholeMilliseconds - testScheduler.currentTime)
+        advanceTimeBy(1)
+        assertEquals("fixture: the silence marked tether suspect", TopicDeliveryState.SUSPECT, h.stateOf(TETHER).deliveryState)
+        assertEquals("fixture: and started nothing while the batch owns tether", 3, h.requests.size)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the replay went out", 4, h.requests.size)
+        assertEquals("fixture: the refresh resolved authentication", TopicAuthResolution.RESOLVED, h.store.snapshot.authResolution)
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_request"))
+        advanceTimeBy(1)
+        assertEquals("B2-32 the silence is asked once the batch lets tether go", 5, h.requests.size)
+        assertEquals("B2-32 a tether revalidation", listOf(TETHER), h.requests.last().topics)
+        assertEquals("B2-32 revalidating, not left suspect", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    /**
+     * The window is a batch ending with tether no longer suspect but never-received again — a later batch reopened it, keeping its
+     * receive generation, and another answer confirmed it. Nothing was raised for the batch to hand on: the silence asks at its
+     * own time, not earlier.
+     */
+    @Test
+    fun `B2-33 a batch's end asks nothing early for a tether that was reopened and confirmed again since`() = runTest {
+        val delivery = com.jay.fxi.domain.model.TopicRequestPolicy.DELIVERY_TIMEOUT.inWholeMilliseconds
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = emptyList(),
+            rejections = mapOf(TETHER to "topics_disabled", USD to "topics_disabled", TopicCatalogue.DXY to "topics_disabled")))
+        advanceTimeBy(1)
+        val sentAt = testScheduler.currentTime
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: batch A went out", setOf(TETHER, TopicCatalogue.DXY), h.lastTopics())
+        advanceTimeBy(5_000)
+        val frameAt = testScheduler.currentTime
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        advanceTimeBy(1_000)
+        h.wire.deliver(h.ackOf("r2", leases = listOf(Triple(TETHER, "L1", 120L), Triple(TopicCatalogue.DXY, "L2", 900L)),
+            rejections = emptyMap()))
+        advanceTimeBy(1)
+        // The renewal asks for every lease the answer gave, the index's too.
+        assertEquals("fixture: the renewal is in flight", setOf(TETHER, TopicCatalogue.DXY), h.lastTopics())
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TopicCatalogue.DXY), rejections = mapOf(TETHER to "topics_disabled")))
+        advanceTimeBy(1)
+        assertEquals("fixture: tether refused again", TopicRejectionReason.TOPICS_DISABLED, h.stateOf(TETHER).rejection)
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: batch B reopened tether", setOf(TETHER), h.lastTopics())
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_request"))
+        advanceTimeBy(1)
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: the dollar batch went out", setOf(USD), h.lastTopics())
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER, TopicCatalogue.DXY, USD)))
+        advanceTimeBy(1)
+        val before = h.requests.size
+        val tether = h.stateOf(TETHER)
+        assertEquals("fixture: tether never-received again", TopicDeliveryState.NEVER_RECEIVED, tether.deliveryState)
+        assertEquals("fixture: confirmed by the other answer", true, tether.confirmed)
+        assertEquals("fixture: its receive generation kept", 1L, tether.receiveGeneration)
+        advanceTimeBy(sentAt + delivery - testScheduler.currentTime)
+        advanceTimeBy(1)
+        assertEquals("fixture: batch A's silent index degraded", TopicDeliveryState.DEGRADED, h.stateOf(TopicCatalogue.DXY).deliveryState)
+        assertEquals("B2-33 batch A's end asks nothing", before, h.requests.size)
+        assertEquals("B2-33 and moves tether nowhere", TopicDeliveryState.NEVER_RECEIVED, h.stateOf(TETHER).deliveryState)
+        advanceTimeBy(frameAt + com.jay.fxi.domain.model.TopicSilencePolicy.SILENCE_WINDOW.inWholeMilliseconds - testScheduler.currentTime)
+        advanceTimeBy(1)
+        assertEquals("B2-33 the silence asks at its own time", before + 1, h.requests.size)
+        assertEquals("B2-33 a tether revalidation", listOf(TETHER), h.requests.last().topics)
+        h.cleanUp()
+    }
 }

@@ -21,6 +21,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 증거는 미수집이다. C2+b-1·C2+b-3 전에는 출시할 수 없다.
                                 C2+b-1은 화면 상태에 owner의 canonical topic snapshot을 싣고, 루프 한 턴의 중간
                                 발행을 보류해 새 owner와 이전 가격·상태가 함께 발행되지 않게 했다(JVM 계약).
+                                C2+b-2a는 탭별 수동 topic 재시도(`retryTopics`)를 세션에 연결했다(JVM 계약, 화면
+                                연결 없음). 인증으로 끝난 수동 batch의 회복 재개는 2b라서 2a만으로는 출시할 수
+                                없다(동결 후 12번 (2)).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1191,6 +1194,29 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   - **F2만 적용한 상태는 출시 불가다.** 수락된 오류로 저장값 배너가 내려가도 seed 가격이 남고 topic 배너가 아직 없는
     상태가 가능하다. C2+b-1(canonical snapshot 노출)과 C2+b-3(실패·재검증·재시도 표시)까지 완료·검증해야 하며, 그
     완료도 기존 출시 게이트를 자동 충족하지 않는다
+- **탭별 수동 topic 재시도(R4-c C2+b-2a, 의도적 iOS 이탈 포함, §2.2 기록).** 대상은 canonical `manualRetryTopics`와 탭이
+  보여 주는 topic의 교집합이다. 등록된 batch 하나가 REVALIDATION command 하나를 만들며, 최초 시도를 포함한 최대 3 attempt의
+  예산을 공유한다. lane이 비기를 기다리는 요청은 topic 단위 합집합으로 다음 batch가 되고, 등록 직전에 자격을 다시 검사한다.
+  lane이 풀리면 renewal, 자동 재확인, 기존 자동 인증 회복이 수동보다 먼저 나간다. 대상별 종료는 다음과 같다. registration
+  뒤 새 수신이 없는 대상의 ACK 뒤 무수신·ACK 불일치·예산 소진(인증 종료가 겹쳐도)은 DEGRADED다. terminal·replay 재거절·
+  refresh 무효는 이번 batch가 옮긴 것만 되돌린다. 실행 중인 자동 Tether 재확인을 인계하면 그 정리 책임도 인계하며, 이미 끝난
+  자동 Tether 인증 의무는 Tether를 인계할 때만 정산한다
+  - iOS `a36682f`는 연결이 없으면 대상이 없는 경우에도 재연결한다(`retryTopicsManually`). 대상이 없고 연결되어 있으면
+    아무것도 하지 않는다. Android는 연결 재시도를 C2+a의 별도 경로로 두고, 탭 재시도는 대상이나 열린 연결이 없으면 아무것도
+    하지 않는다
+  - iOS는 invalid_request 계열 terminal 오류에서 `abortRevalidation`으로 수신 이력이 있는 topic을 HEALTHY로 돌린다.
+    Android 수동 batch는 이번에 옮긴 DEGRADED·SUSPECT를 그대로 되돌린다. 수신 증거 없는 상태를 HEALTHY로 가리지 않기 위한
+    강화다. 인계한 자동 재확인은 자동 abort와 같은 의미로 정리한다
+  - iOS는 송신할 때마다 수신 기준을 다시 읽는다(`pending.receiveGenerations`). Android 수동 batch는 등록 때 읽은 기준을 송신
+    대상 계산·ACK 뒤 무수신·예산 소진·늦은 결과 검사에 함께 쓴다. 앞선 시도의 cooldown 중 도착한 수신을 다음 시도가 흡수해
+    잃지 않기 위해서다
+  - iOS는 수동 재검증이 진행 중이어도 D14 침묵이 오면 `revalidateSilencedTopic`이 SUSPECT로 표시하고 재확인을 시작해
+    지연 송신을 예약한다. Android는 수동 batch가 Tether를 가진 동안 자동 재확인을 시작하지 않는다. 같은 delivery 결과에
+    소유자가 둘이 되지 않게 하기 위해서다. registration 이후 미수신 결과는 수동 batch가 판정한다. 이미 무장된 D14가 수동 소유
+    중 만료되고 batch 종료 처리 뒤 SUSPECT가 남으면, registration 이후 새 수신 유무와 무관하게 수동 소유권 해제 뒤 기존 lane
+    우선순위와 현재 권위·topic 조건에 따라 자동 재확인을 처리한다
+  - **2a만 적용한 상태는 출시 불가다.** 수동 batch가 인증으로 끝나면 credential 회복이 다시 열지 않는다(2b, 동결 후 12번
+    (2)). 재시도 버튼과 topic 배너는 C2+b-3이다
 - **USD/JPY/EUR 현재가를 topic으로 전환하고 `/api/rates`·legacy WS 소비 제거**. S2의 premium unavailable shell을
   실제 premium Root destination으로 교체한다
 - rate consumer cutover와 같은 변경 세트에서 `fxi_cache`의 legacy `rates`·`rates_timestamp`를 제거하고

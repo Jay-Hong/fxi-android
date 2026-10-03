@@ -23,12 +23,15 @@ import com.jay.fxi.domain.model.TopicRates
 import com.jay.fxi.domain.model.TopicReconnectPolicy
 import com.jay.fxi.domain.model.TopicPurgeScope
 import com.jay.fxi.domain.model.TopicRejectionReason
+import com.jay.fxi.domain.model.TopicRetryTrigger
 import com.jay.fxi.domain.model.TopicSilenceArming
 import com.jay.fxi.domain.model.TopicSilenceDecision
 import com.jay.fxi.domain.model.TopicSilenceEvidence
 import com.jay.fxi.domain.model.TopicSilencePolicy
 import com.jay.fxi.domain.model.TopicSubscriptionSnapshot
+import com.jay.fxi.domain.model.TopicSubscriptionState
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
+import com.jay.fxi.domain.model.TopicWholeRequestDecision
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -38,6 +41,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /** Which topics this build subscribes to, and the one it does not yet. */
@@ -301,6 +305,9 @@ private sealed interface SessionInput {
 
     /** A manual connection retry, carrying the display owner that offered it. */
     data class RetryConnection(val owner: TopicDisplayOwner) : SessionInput
+
+    /** A tab retry belongs to the display owner that offered it, never to a later connection. */
+    data class RetryTopics(val owner: TopicDisplayOwner, val tab: FreeTab) : SessionInput
 
     /**
      * A command found, at its send, that the access its connection's use serves no longer admits it (L-4e E2a).
@@ -566,6 +573,12 @@ class TopicSessionCoordinator(
         var renewalDeferred = false
         var revalidationDeferred = false
 
+        /** Unregistered manual intent; the registered command's targets never grow. */
+        val manualPending = linkedSetOf<String>()
+
+        /** Delivery result and abort ownership, independent of a topic's current delivery state. */
+        val manualOwners = mutableMapOf<String, Long>()
+
         /**
          * The commands on this socket that ended on authentication and still owe something a credential recovery may reopen,
          * by command id (L-4e E6b). Each obligation is in at most one place: a record here or a running command. A command
@@ -594,7 +607,8 @@ class TopicSessionCoordinator(
          * Tether's receive generation read at this command's registration, when it carries a revalidation (L-4e E6b). The
          * command judges its question against this same number, and an authentication ending records it.
          */
-        val revalidationEntry: Long?
+        val revalidationEntry: Long?,
+        val manual: ManualRetryContext? = null
     ) {
         var job: Job? = null
 
@@ -605,6 +619,17 @@ class TopicSessionCoordinator(
         val takesFirstDelivery: Boolean get() = purpose == TopicCommandPurpose.FIRST_DELIVERY
         val takesRenewal: Boolean get() = purpose == TopicCommandPurpose.LEASE_RENEWAL ||
             purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION
+    }
+
+    /** Fixed at registration, before opening rejections or changing delivery state. No manual auth recovery in 2a. */
+    private class ManualRetryContext(
+        val grantEpoch: Long,
+        val targets: Set<String>,
+        val entryReceiveGeneration: Map<String, Long>,
+        val previousDelivery: Map<String, TopicSubscriptionState>,
+        val automaticAbort: Set<String>
+    ) {
+        var awaitingAcknowledgement = true
     }
 
     /**
@@ -815,6 +840,8 @@ class TopicSessionCoordinator(
 
     /** A user's retry of an exhausted connection for [owner] (R4-c C2+a); anything else is ignored on the session's loop. */
     fun retryConnection(owner: TopicDisplayOwner) = post(SessionInput.RetryConnection(owner))
+
+    fun retryTopics(owner: TopicDisplayOwner, tab: FreeTab) = post(SessionInput.RetryTopics(owner, tab))
 
     fun setOnline(value: Boolean) = post(SessionInput.Online(value))
 
@@ -1110,10 +1137,14 @@ class TopicSessionCoordinator(
                 val ownsRevalidation = live.revalidationOwner == input.commandId
                 val revalidates = input.purpose == TopicCommandPurpose.REVALIDATION ||
                     input.purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION
-                if (!revalidates || ownsRevalidation) applyOutcome(live, input.purpose, input.outcome)
+                if (running?.manual != null) {
+                    finishManual(live, input.commandId, running.manual, input.outcome)
+                } else if (!revalidates || ownsRevalidation) {
+                    applyOutcome(live, input.purpose, input.outcome)
+                }
                 if (ownsRevalidation) live.revalidationOwner = null
                 val authEnd = (input.outcome as? TopicCommandOutcome.Stopped)?.authEnd
-                if (authEnd != null && running != null) {
+                if (authEnd != null && running != null && running.manual == null) {
                     recordAuthEnded(live, input.commandId, running, authEnd, ownsRevalidation)
                 }
                 reconsiderRecovery(live)
@@ -1125,6 +1156,7 @@ class TopicSessionCoordinator(
                     firstDeliveryOutstanding = false
                 }
                 releaseControlLane(live, input.commandId)
+                done?.manual?.let { finishManual(live, input.commandId, it, TopicCommandOutcome.Superseded) }
                 // A revalidation that ended without a result — cancelled, so no `CommandFinished`
                 // — would otherwise leave the topic revalidating for good, with its window already
                 // spent and nothing left to ask again. Found by review.
@@ -1205,6 +1237,7 @@ class TopicSessionCoordinator(
                 if (live.revalidationDeferred) startRevalidation(live)
                 // After the two it always resumed, and asking everything again (L-4e E6b).
                 reconsiderRecovery(live)
+                startPendingManual(live)
             }
 
             is SessionInput.LeaseExpiryDue ->
@@ -1250,6 +1283,8 @@ class TopicSessionCoordinator(
                 reconnectAttempt = 0
                 open()
             }
+
+            is SessionInput.RetryTopics -> retryTopicsOnLoop(input.owner, input.tab)
 
             SessionInput.Stop -> {
                 // A flag, not only a cancellation. `Job.cancel()` takes effect at the next
@@ -1677,6 +1712,160 @@ class TopicSessionCoordinator(
 
     // ---- subscribing ----------------------------------------------------------------------
 
+    private fun retryTopicsOnLoop(owner: TopicDisplayOwner, tab: FreeTab) {
+        val held = fence ?: return
+        if (owner.identity != held.identity || owner.grantEpoch != grantEpoch) return
+        val live = connection ?: return
+        val eligible = store.snapshot.manualRetryTopics
+        val requested = TopicBootstrapOrder.shownBy(tab).filterTo(linkedSetOf()) { topic ->
+            topic in desired && topic in eligible && !manualAcknowledgementOutstanding(live, topic)
+        }
+        if (requested.isEmpty()) return
+        if (!manualAdmitted(live, owner.grantEpoch)) return
+        live.manualPending += requested
+        startPendingManual(live)
+    }
+
+    /** Uses the connection's original lifetime; a hold/release never grants this work a replacement use. */
+    private fun manualAdmitted(live: Connection, expectedGrantEpoch: Long): Boolean {
+        if (stopped || !scope.isActive || current(live.generation) !== live || !live.opened) return false
+        if (expectedGrantEpoch != grantEpoch || live.fence != fence || !sessionWanted()) return false
+        if (!enforceLiveIdentity(live.fence)) return false
+        if (!authority.admits(live.lifetime)) {
+            end(live, TopicDisconnectCause.DELIBERATE)
+            return false
+        }
+        return !enforceLeaseExpiry(live)
+    }
+
+    private fun manualAcknowledgementOutstanding(live: Connection, topic: String): Boolean {
+        val owner = live.manualOwners[topic] ?: return false
+        return live.commands[owner]?.manual?.awaitingAcknowledgement == true
+    }
+
+    private fun startPendingManual(live: Connection) {
+        if (live.manualPending.isEmpty() || !manualAdmitted(live, grantEpoch)) return
+        // A free lane may still have an earlier start queued in ControlLaneFree. Inline input must observe that order too.
+        if (live.controlOwner != null || live.renewalDeferred || live.revalidationDeferred) return
+        reconsiderRecovery(live)
+        if (live.controlOwner != null || live.renewalDeferred || live.revalidationDeferred || live.recoveryReopenDeferred) return
+        if (!manualAdmitted(live, grantEpoch)) return
+
+        val before = store.snapshot
+        val eligible = before.manualRetryTopics
+        val targets = live.manualPending.filterTo(linkedSetOf()) { topic ->
+            topic in desired && topic in eligible && !manualAcknowledgementOutstanding(live, topic)
+        }
+        live.manualPending.clear()
+        if (targets.isEmpty()) return
+        val entries = targets.associateWith { before.stateFor(it).receiveGeneration }
+        val predecessors = targets.associateWith { topic ->
+            live.manualOwners[topic]?.let { live.commands[it]?.manual }
+        }
+        val inheritsAutomaticTether = live.revalidationOwner != null
+        store.openRejectedTopics(TopicRetryTrigger.Manual, requestedTopics = targets)
+        val opened = store.snapshot
+        val previous = mutableMapOf<String, TopicSubscriptionState>()
+        val automaticAbort = mutableSetOf<String>()
+        targets.forEach { topic ->
+            val state = opened.stateFor(topic)
+            when (state.deliveryState) {
+                TopicDeliveryState.DEGRADED, TopicDeliveryState.SUSPECT -> previous[topic] = state
+                TopicDeliveryState.REVALIDATING -> {
+                    val predecessor = predecessors[topic]
+                    predecessor?.previousDelivery?.get(topic)?.let { previous[topic] = it }
+                    if (predecessor?.automaticAbort?.contains(topic) == true ||
+                        topic == TopicCatalogue.TETHER && inheritsAutomaticTether
+                    ) {
+                        automaticAbort += topic
+                    }
+                }
+                else -> Unit
+            }
+        }
+        store.beginManualRevalidation(targets)
+        val manual = ManualRetryContext(grantEpoch, targets.toSet(), entries, previous.toMap(), automaticAbort.toSet())
+        startCommand(live, TopicCommandPurpose.REVALIDATION, manual = manual) { manual.targets }
+    }
+
+    /** Registered intent survives its own open/start transitions; only current authority, ownership and topic facts narrow it. */
+    private fun manualScope(live: Connection, commandId: Long, manual: ManualRetryContext): Set<String> {
+        if (!manualAdmitted(live, manual.grantEpoch)) return emptySet()
+        val snapshot = store.snapshot
+        return manual.targets.filterTo(linkedSetOf()) { topic ->
+            val state = snapshot.stateFor(topic)
+            live.manualOwners[topic] == commandId && topic in desired && state.desired && state.rejection == null
+        }
+    }
+
+    /** Re-read at application: an enqueued silence or abort cannot overwrite a new receipt or a new episode. */
+    private fun manualResultStillOwed(live: Connection, commandId: Long, manual: ManualRetryContext, topic: String): Boolean {
+        if (live.manualOwners[topic] != commandId) return false
+        val state = store.snapshot.stateFor(topic)
+        val entry = manual.entryReceiveGeneration[topic]
+        return topic in desired && state.desired && state.rejection == null &&
+            (entry == null || state.receiveGeneration <= entry)
+    }
+
+    private fun applyManualAcknowledgement(
+        live: Connection,
+        commandId: Long,
+        manual: ManualRetryContext,
+        ack: TopicCommandAcknowledgement
+    ) {
+        manual.awaitingAcknowledgement = false
+        // The command just passed answer admission, and nothing has suspended. Preserve its refusal/lease ordering.
+        if (current(live.generation) !== live) return
+        (manual.targets intersect ack.missing).forEach { topic ->
+            if (manualResultStillOwed(live, commandId, manual, topic)) store.markDegraded(topic)
+        }
+        // Rejection and missing ACK results are final for these targets; a later batch may take them immediately.
+        (manual.targets intersect (ack.rejected.keys + ack.missing)).forEach { topic ->
+            if (live.manualOwners[topic] == commandId) live.manualOwners.remove(topic)
+        }
+    }
+
+    private fun finishManual(live: Connection, commandId: Long, manual: ManualRetryContext, outcome: TopicCommandOutcome) {
+        if (!manualAdmitted(live, manual.grantEpoch)) return
+        val degraded = when (outcome) {
+            is TopicCommandOutcome.Acknowledged -> outcome.silent
+            is TopicCommandOutcome.Stopped -> if (outcome.reason == TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT) {
+                manual.targets
+            } else emptySet()
+            else -> emptySet()
+        }
+        val abort = outcome !is TopicCommandOutcome.Acknowledged &&
+            !(outcome is TopicCommandOutcome.Stopped && outcome.reason == TopicWholeRequestDecision.Stop.Reason.BUDGET_SPENT)
+        manual.targets.forEach { topic ->
+            if (manualResultStillOwed(live, commandId, manual, topic)) {
+                when {
+                    topic in degraded -> store.markDegraded(topic)
+                    abort -> {
+                        val previous = manual.previousDelivery[topic]
+                        if (previous != null) store.restoreManualRevalidation(topic, previous)
+                        else if (topic in manual.automaticAbort) store.abortRevalidation(topic)
+                    }
+                }
+            }
+            if (live.manualOwners[topic] == commandId) live.manualOwners.remove(topic)
+        }
+        // D14 can spend its window while this batch owns tether, even without a receipt after registration. Resume a remaining
+        // suspect question through the lane after releasing ownership, so a waiting renewal goes first. A target the batch
+        // already degraded does not pass the suspect guard.
+        val tether = TopicCatalogue.TETHER
+        val entry = manual.entryReceiveGeneration[tether]
+        val state = store.snapshot.stateFor(tether)
+        if (
+            entry != null &&
+            state.desired && state.confirmed && state.rejection == null &&
+            state.deliveryState == TopicDeliveryState.SUSPECT &&
+            live.manualOwners[tether] == null && live.revalidationOwner == null
+        ) {
+            live.revalidationDeferred = true
+            post(SessionInput.ControlLaneFree(live.generation))
+        }
+    }
+
     private fun subscribe(live: Connection) {
         if (live.commands.values.any { it.purpose == TopicCommandPurpose.FIRST_DELIVERY }) return
         desired.forEach { store.setDesired(true, it) }
@@ -1723,11 +1912,12 @@ class TopicSessionCoordinator(
         live: Connection,
         purpose: TopicCommandPurpose,
         revalidationTopics: () -> Set<String> = { emptySet() },
+        manual: ManualRetryContext? = null,
         topics: () -> Set<String>
     ) {
         val id = ++commandSerial
-        val revalidates = purpose == TopicCommandPurpose.REVALIDATION ||
-            purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION
+        val revalidates = manual == null && (purpose == TopicCommandPurpose.REVALIDATION ||
+            purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION)
         val revalidationEntry = if (revalidates) store.snapshot.stateFor(TopicCatalogue.TETHER).receiveGeneration else null
         // The transport is captured here rather than read from the field at send time. A command
         // that outlived its connection would otherwise write to whichever socket is current, which
@@ -1748,6 +1938,7 @@ class TopicSessionCoordinator(
             // send. The handler checks the generation, so a dead connection cannot end a newer one.
             send = { text ->
                 when {
+                    manual != null && manualScope(live, id, manual).isEmpty() -> false
                     // The use first (L-4e E2a): a withheld use is not a lease that ran out, and ending it must not start a ladder.
                     !authority.admits(live.lifetime) -> {
                         post(SessionInput.AccessWithheldDue(live.generation))
@@ -1762,24 +1953,33 @@ class TopicSessionCoordinator(
             },
             newRequestId = newRequestId,
             jitter = jitter,
-            scope = { if (current(live.generation) == null) emptySet() else topics() },
+            scope = {
+                if (current(live.generation) == null) emptySet()
+                else if (manual != null) manualScope(live, id, manual)
+                else topics()
+            },
             onAcknowledged = { ack -> onAcknowledged(live, id, ack) },
             onClassifiedFailure = { onClassifiedFailure(live) },
             onRequestStarted = ::publishState,
             admitAnswer = { rejected -> admitsAnswer(live, rejected) },
-            revalidationEntry = revalidationEntry?.let { mapOf(TopicCatalogue.TETHER to it) },
-            revalidationScope = { if (current(live.generation) == null) emptySet() else revalidationTopics() }
+            revalidationEntry = manual?.entryReceiveGeneration ?: revalidationEntry?.let { mapOf(TopicCatalogue.TETHER to it) },
+            revalidationScope = { if (current(live.generation) == null) emptySet() else revalidationTopics() },
+            manualRetry = manual != null
         )
-        val running = RunningCommand(command, purpose, revalidationEntry)
+        val running = RunningCommand(command, purpose, revalidationEntry, manual)
         live.commands[id] = running
         live.controlOwner = id
         if (revalidates) {
             live.revalidationOwner = id
         }
+        if (manual != null) {
+            manual.targets.forEach { live.manualOwners[it] = id }
+            if (TopicCatalogue.TETHER in manual.targets) live.revalidationOwner = null
+        }
         live.authEnded.values.forEach { record ->
             if (running.takesFirstDelivery) record.firstDeliveryRequired = false
             if (running.takesRenewal) record.renewalRequired = false
-            if (revalidates) record.tetherEntryGeneration = null
+            if (revalidates || manual?.targets?.contains(TopicCatalogue.TETHER) == true) record.tetherEntryGeneration = null
         }
         live.authEnded.values.removeAll { it.settled }
         // `finally`, so a command that ends by cancellation is still taken off the connection. A
@@ -1865,6 +2065,7 @@ class TopicSessionCoordinator(
         // reading of the clock, could find the deadline passed after the store had taken the answer
         // and publish that answer on the way to the teardown.
         current(live.generation)?.let { still -> applyLeases(still, ack) }
+        live.commands[commandId]?.manual?.let { applyManualAcknowledgement(live, commandId, it, ack) }
         live.authEnded.values.removeAll { it.settled }
         resolveCachedRefresh(live.lifetime)
         // Reported before the two observers below (L-4e E4a): the refusal is settled and its leases handled, and an observer that
@@ -2311,7 +2512,7 @@ class TopicSessionCoordinator(
         // Both direct and deferred starts pass here: a question that stood aside for the
         // request channel is resumed from `ControlLaneFree`, and the credential can have failed
         // while it waited.
-        if (store.snapshot.authResolution == TopicAuthResolution.FAILED) {
+        if (live.manualOwners.containsKey(TopicCatalogue.TETHER) || store.snapshot.authResolution == TopicAuthResolution.FAILED) {
             live.revalidationDeferred = false
             return
         }
@@ -2439,7 +2640,7 @@ class TopicSessionCoordinator(
     private fun releaseControlLane(live: Connection, commandId: Long) {
         if (live.controlOwner != commandId) return
         live.controlOwner = null
-        if (live.renewalDeferred || live.revalidationDeferred || live.recoveryReopenDeferred) {
+        if (live.renewalDeferred || live.revalidationDeferred || live.recoveryReopenDeferred || live.manualPending.isNotEmpty()) {
             post(SessionInput.ControlLaneFree(live.generation))
         }
     }
@@ -2628,6 +2829,8 @@ class TopicSessionCoordinator(
     private fun end(live: Connection, cause: TopicDisconnectCause) {
         if (live.ended) return
         live.ended = true
+        live.manualPending.clear()
+        live.manualOwners.clear()
         resetCachedRefresh()
         live.commands.values.forEach { it.job?.cancel() }
         live.renewalTimer?.cancel()

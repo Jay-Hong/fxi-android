@@ -553,6 +553,25 @@ class TopicRuntimeFactoryTest {
         runtime.stop()
     }
 
+    // R4-c C2+b-2a B2-16 (Claude-owned contract; R4c/C2b/b2_design_codex.r3.md §9): the runtime passes a user's tab retry on with the
+    // owner shown on screen; the session decides the targets.
+    @Test
+    fun `B2-16 the runtime passes a tab retry on to its session`() = runTest {
+        val (h, runtime) = running()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val first = h.subscribes.first()
+        h.wire.deliver("""{"type":"subscription_error","request_id":"${first.requestId}","error":"invalid_token"}""")
+        advanceTimeBy(1)
+        val owner = checkNotNull(runtime.display.value.owner)
+        runtime.retryTopics(owner, FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("B2-16 a second subscribe", 2, h.subscribes.size)
+        assertEquals("B2-16 the tether tab's topics", setOf(TETHER, TopicCatalogue.DXY), h.subscribes.last().topics.toSet())
+        runtime.stop()
+    }
+
     // R4-c C3a-07 (Claude-owned contract; R4c/C3/design_codex.r3.md): the runtime passes on its focus provider's accepted tab, and
     // watching it adds nothing to the session's plan.
     @Test

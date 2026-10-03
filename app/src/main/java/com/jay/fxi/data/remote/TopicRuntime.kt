@@ -189,6 +189,8 @@ internal class TopicRuntime internal constructor(
 
     fun retryConnection(owner: TopicDisplayOwner) = session.retryConnection(owner)
 
+    fun retryTopics(owner: TopicDisplayOwner, tab: FreeTab) = session.retryTopics(owner, tab)
+
     /** The tab the focus provider accepted for the live identity; see [OwnedTopicFocus]. */
     val focus: StateFlow<OwnedTopicFocus?> = focusProvider.focus
 

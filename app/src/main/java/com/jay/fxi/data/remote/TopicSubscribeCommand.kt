@@ -144,7 +144,9 @@ data class TopicCommandAcknowledgement(
     val acknowledgedAtMillis: Long,
     val accepted: Set<String>,
     val rejected: Map<String, TopicRejectionReason>,
-    val leases: List<TopicLease>
+    val leases: List<TopicLease>,
+    /** A manual batch's sent topics neither active nor refused with a known reason. */
+    val missing: Set<String> = emptySet()
 )
 
 /**
@@ -292,11 +294,16 @@ class TopicSubscribeCommand(
     /** Once per admitted classified server failure, after synchronous state transitions and before the next suspension. */
     private val onClassifiedFailure: () -> Unit = {},
     /** Once per attempt, after opening its request and before sending or waiting; not evidence of an answer. */
-    private val onRequestStarted: () -> Unit = {}
+    private val onRequestStarted: () -> Unit = {},
+    /** A manual REVALIDATION owes a subscribe ACK even when its delivery has already arrived. */
+    private val manualRetry: Boolean = false
 ) {
     init {
         require(purpose != TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION || revalidationEntry != null) {
             "a combined command is judged against the entry its registration read"
+        }
+        require(!manualRetry || purpose == TopicCommandPurpose.REVALIDATION && revalidationEntry != null) {
+            "a manual batch requires its fixed registration entry and REVALIDATION purpose"
         }
     }
 
@@ -582,6 +589,7 @@ class TopicSubscribeCommand(
         }
         val wanted = scope()
         if (wanted.isEmpty()) return Sendable.Nothing
+        if (manualRetry) return Sendable.Topics(wanted, wanted)
         if (purpose != TopicCommandPurpose.REVALIDATION) {
             return Sendable.Topics(wanted, if (purpose.watchesDelivery) wanted else emptySet())
         }
@@ -608,7 +616,11 @@ class TopicSubscribeCommand(
             requestId = newRequestId(),
             topics = wanted,
             watched = watched,
-            baseline = wanted.associateWith { store.snapshot.stateFor(it).receiveGeneration },
+            baseline = if (manualRetry) {
+                checkNotNull(revalidationEntry)
+            } else {
+                wanted.associateWith { store.snapshot.stateFor(it).receiveGeneration }
+            },
             deadlines = deadlines,
             credential = credential,
             replayOfRefresh = replayOfRefresh
@@ -689,7 +701,8 @@ class TopicSubscribeCommand(
                 acknowledgedAtMillis = admittedAt,
                 accepted = accepted,
                 rejected = rejected,
-                leases = answer.leases
+                leases = answer.leases,
+                missing = if (manualRetry) pending.topics - active - rejected.keys else emptySet()
             )
         )
         // The callback is where a session tears itself down on a refusal, and the branch below it
@@ -754,7 +767,11 @@ class TopicSubscribeCommand(
      */
     private fun silentOf(pending: Pending, accepted: Set<String>): Set<String> =
         accepted.filterTo(mutableSetOf()) {
-            store.snapshot.stateFor(it).receiveGeneration == pending.baseline[it]
+            if (manualRetry) {
+                !spokeSince(pending.baseline, it)
+            } else {
+                store.snapshot.stateFor(it).receiveGeneration == pending.baseline[it]
+            }
         }
 
     /**

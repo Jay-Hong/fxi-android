@@ -392,6 +392,16 @@ class TopicSubscriptionStateStore {
         }
     }
 
+    /** Restores only a manual delivery transition; current control and receive facts stand. */
+    fun restoreManualRevalidation(topic: String, previous: TopicSubscriptionState) {
+        update(topic) { state ->
+            if (!state.desired || state.rejection != null || state.deliveryState != TopicDeliveryState.REVALIDATING) {
+                return@update state
+            }
+            state.copy(deliveryState = previous.deliveryState, revalidationAttempt = previous.revalidationAttempt)
+        }
+    }
+
     /** Opens only rejection states that explicitly permit the supplied retry trigger. */
     fun openRejectedTopics(
         trigger: TopicRetryTrigger,
