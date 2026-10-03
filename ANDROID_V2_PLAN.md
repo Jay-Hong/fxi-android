@@ -22,8 +22,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 C2+b-1은 화면 상태에 owner의 canonical topic snapshot을 싣고, 루프 한 턴의 중간
                                 발행을 보류해 새 owner와 이전 가격·상태가 함께 발행되지 않게 했다(JVM 계약).
                                 C2+b-2a는 탭별 수동 topic 재시도(`retryTopics`)를 세션에 연결했다(JVM 계약, 화면
-                                연결 없음). 인증으로 끝난 수동 batch의 회복 재개는 2b라서 2a만으로는 출시할 수
-                                없다(동결 후 12번 (2)).
+                                연결 없음). C2+b-2b는 인증으로 끝난 수동 batch를 검증된 credential 회복 1건당 한 번,
+                                남은 자동 의무와 한 command로 재개한다(JVM 계약, 동결 후 12번 (2)의 수동 batch 몫).
+                                재시도 버튼·topic 배너(C2+b-3) 전에는 출시할 수 없다.
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1215,8 +1216,14 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
     소유자가 둘이 되지 않게 하기 위해서다. registration 이후 미수신 결과는 수동 batch가 판정한다. 이미 무장된 D14가 수동 소유
     중 만료되고 batch 종료 처리 뒤 SUSPECT가 남으면, registration 이후 새 수신 유무와 무관하게 수동 소유권 해제 뒤 기존 lane
     우선순위와 현재 권위·topic 조건에 따라 자동 재확인을 처리한다
-  - **2a만 적용한 상태는 출시 불가다.** 수동 batch가 인증으로 끝나면 credential 회복이 다시 열지 않는다(2b, 동결 후 12번
-    (2)). 재시도 버튼과 topic 배너는 C2+b-3이다
+  - **인증 종료 batch의 회복 재개(R4-c C2+b-2b).** 인증 종료(`authEnd`가 있는 종료 네 종류)로 끝난 batch는 아직 소유한
+    대상과 원 registration 기준을 기록한다. 2a의 종료 처리(DEGRADED·되돌림)는 그대로다. 검증된 회복 1건은 기록된 대상 중
+    현재 desired이고 거절되지 않은 것을, 남은 renewal·자동 Tether·첫 전달 의무와 한 command·한 예산으로 재개한다. 회복은
+    rejection을 열지 않는다. 원 기준 뒤 수신이 있는 대상은 구독 확인만 다시 하고 delivery를 기다리지 않으며 REVALIDATING으로
+    옮기지 않는다. 수동 Tether는 자기 delivery 의무가 남았을 때만 자동 Tether 의무를 넘겨받는다. 새 클릭은 실제로 등록한
+    자기 topic만 기록에서 넘겨받는다. iOS `a36682f`는 회복으로 명령을 재개하지 않는다(12번 (2)의 의도적 개선)
+  - **출시 전 남은 것.** 재시도 버튼과 topic 배너는 C2+b-3이다. FAILED 동안 D14가 시작 전에 버린 질문은 인증이 회복돼도
+    다시 묻지 않는다(tether가 SUSPECT로 남음). 이 공백은 2b 이전부터 자동 경로에 있었고 별도 단위로 다룬다
 - **USD/JPY/EUR 현재가를 topic으로 전환하고 `/api/rates`·legacy WS 소비 제거**. S2의 premium unavailable shell을
   실제 premium Root destination으로 교체한다
 - rate consumer cutover와 같은 변경 세트에서 `fxi_cache`의 legacy `rates`·`rates_timestamp`를 제거하고

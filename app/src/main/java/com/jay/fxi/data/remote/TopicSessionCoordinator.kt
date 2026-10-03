@@ -621,7 +621,7 @@ class TopicSessionCoordinator(
             purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION
     }
 
-    /** Fixed at registration, before opening rejections or changing delivery state. No manual auth recovery in 2a. */
+    /** Fixed at registration; a recovery keeps the original entries and builds fresh delivery restoration state. */
     private class ManualRetryContext(
         val grantEpoch: Long,
         val targets: Set<String>,
@@ -631,6 +631,12 @@ class TopicSessionCoordinator(
     ) {
         var awaitingAcknowledgement = true
     }
+
+    private class AuthEndedManual(
+        val grantEpoch: Long,
+        val targets: MutableSet<String>,
+        val entryReceiveGeneration: Map<String, Long>
+    )
 
     /**
      * What an authentication ending left owed on its connection (L-4e E6b §2). Each obligation is settled on its own, and the
@@ -642,9 +648,11 @@ class TopicSessionCoordinator(
         val authEnd: TopicAuthEnd,
         var firstDeliveryRequired: Boolean,
         var renewalRequired: Boolean,
-        var tetherEntryGeneration: Long?
+        var tetherEntryGeneration: Long?,
+        val manual: AuthEndedManual?
     ) {
-        val settled: Boolean get() = !firstDeliveryRequired && !renewalRequired && tetherEntryGeneration == null
+        val settled: Boolean get() = !firstDeliveryRequired && !renewalRequired && tetherEntryGeneration == null &&
+            manual?.targets.isNullOrEmpty()
     }
 
     private val inputs = Channel<SessionInput>(Channel.UNLIMITED)
@@ -1137,15 +1145,19 @@ class TopicSessionCoordinator(
                 val ownsRevalidation = live.revalidationOwner == input.commandId
                 val revalidates = input.purpose == TopicCommandPurpose.REVALIDATION ||
                     input.purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION
-                if (running?.manual != null) {
-                    finishManual(live, input.commandId, running.manual, input.outcome)
-                } else if (!revalidates || ownsRevalidation) {
+                val authEnd = (input.outcome as? TopicCommandOutcome.Stopped)?.authEnd
+                // finishManual releases these owners. Authentication records the subscribe still owed, including targets
+                // that have received data since their original entry; that data settles only their delivery obligation.
+                val manualTargets = if (authEnd != null && running?.manual != null) {
+                    manualScope(live, input.commandId, running.manual)
+                } else emptySet()
+                if (!revalidates || ownsRevalidation) {
                     applyOutcome(live, input.purpose, input.outcome)
                 }
+                running?.manual?.let { finishManual(live, input.commandId, it, input.outcome) }
                 if (ownsRevalidation) live.revalidationOwner = null
-                val authEnd = (input.outcome as? TopicCommandOutcome.Stopped)?.authEnd
-                if (authEnd != null && running != null && running.manual == null) {
-                    recordAuthEnded(live, input.commandId, running, authEnd, ownsRevalidation)
+                if (authEnd != null && running != null) {
+                    recordAuthEnded(live, input.commandId, running, authEnd, ownsRevalidation, manualTargets)
                 }
                 reconsiderRecovery(live)
             }
@@ -1759,20 +1771,24 @@ class TopicSessionCoordinator(
         live.manualPending.clear()
         if (targets.isEmpty()) return
         val entries = targets.associateWith { before.stateFor(it).receiveGeneration }
-        val predecessors = targets.associateWith { topic ->
-            live.manualOwners[topic]?.let { live.commands[it]?.manual }
-        }
-        val inheritsAutomaticTether = live.revalidationOwner != null
         store.openRejectedTopics(TopicRetryTrigger.Manual, requestedTopics = targets)
+        val manual = beginManual(live, targets, entries)
+        startCommand(live, TopicCommandPurpose.REVALIDATION, manual = manual) { emptySet() }
+    }
+
+    /** Only still-owed delivery is moved; restoration belongs to this registration, never to an ended predecessor. */
+    private fun beginManual(live: Connection, targets: Set<String>, entries: Map<String, Long>): ManualRetryContext {
         val opened = store.snapshot
+        val delivery = targets.filterTo(mutableSetOf()) { opened.stateFor(it).receiveGeneration <= entries.getValue(it) }
+        val inheritsAutomaticTether = live.revalidationOwner != null
         val previous = mutableMapOf<String, TopicSubscriptionState>()
         val automaticAbort = mutableSetOf<String>()
-        targets.forEach { topic ->
+        delivery.forEach { topic ->
             val state = opened.stateFor(topic)
             when (state.deliveryState) {
                 TopicDeliveryState.DEGRADED, TopicDeliveryState.SUSPECT -> previous[topic] = state
                 TopicDeliveryState.REVALIDATING -> {
-                    val predecessor = predecessors[topic]
+                    val predecessor = live.manualOwners[topic]?.let { live.commands[it]?.manual }
                     predecessor?.previousDelivery?.get(topic)?.let { previous[topic] = it }
                     if (predecessor?.automaticAbort?.contains(topic) == true ||
                         topic == TopicCatalogue.TETHER && inheritsAutomaticTether
@@ -1783,9 +1799,8 @@ class TopicSessionCoordinator(
                 else -> Unit
             }
         }
-        store.beginManualRevalidation(targets)
-        val manual = ManualRetryContext(grantEpoch, targets.toSet(), entries, previous.toMap(), automaticAbort.toSet())
-        startCommand(live, TopicCommandPurpose.REVALIDATION, manual = manual) { manual.targets }
+        store.beginManualRevalidation(delivery)
+        return ManualRetryContext(grantEpoch, targets.toSet(), entries, previous.toMap(), automaticAbort.toSet())
     }
 
     /** Registered intent survives its own open/start transitions; only current authority, ownership and topic facts narrow it. */
@@ -1913,11 +1928,12 @@ class TopicSessionCoordinator(
         purpose: TopicCommandPurpose,
         revalidationTopics: () -> Set<String> = { emptySet() },
         manual: ManualRetryContext? = null,
+        automaticRevalidation: Boolean = manual == null && (purpose == TopicCommandPurpose.REVALIDATION ||
+            purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION),
         topics: () -> Set<String>
     ) {
         val id = ++commandSerial
-        val revalidates = manual == null && (purpose == TopicCommandPurpose.REVALIDATION ||
-            purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION)
+        val revalidates = automaticRevalidation
         val revalidationEntry = if (revalidates) store.snapshot.stateFor(TopicCatalogue.TETHER).receiveGeneration else null
         // The transport is captured here rather than read from the field at send time. A command
         // that outlived its connection would otherwise write to whichever socket is current, which
@@ -1938,7 +1954,10 @@ class TopicSessionCoordinator(
             // send. The handler checks the generation, so a dead connection cannot end a newer one.
             send = { text ->
                 when {
-                    manual != null && manualScope(live, id, manual).isEmpty() -> false
+                    // A manual scope can empty independently of the base obligation. Its admission still protects the
+                    // whole send, including the live identity after the attempt-start publication.
+                    manual != null && (!manualAdmitted(live, manual.grantEpoch) ||
+                        topics().isEmpty() && revalidationTopics().isEmpty() && manualScope(live, id, manual).isEmpty()) -> false
                     // The use first (L-4e E2a): a withheld use is not a lease that ran out, and ending it must not start a ladder.
                     !authority.admits(live.lifetime) -> {
                         post(SessionInput.AccessWithheldDue(live.generation))
@@ -1955,16 +1974,16 @@ class TopicSessionCoordinator(
             jitter = jitter,
             scope = {
                 if (current(live.generation) == null) emptySet()
-                else if (manual != null) manualScope(live, id, manual)
                 else topics()
             },
             onAcknowledged = { ack -> onAcknowledged(live, id, ack) },
             onClassifiedFailure = { onClassifiedFailure(live) },
             onRequestStarted = ::publishState,
             admitAnswer = { rejected -> admitsAnswer(live, rejected) },
-            revalidationEntry = manual?.entryReceiveGeneration ?: revalidationEntry?.let { mapOf(TopicCatalogue.TETHER to it) },
+            revalidationEntry = revalidationEntry?.let { mapOf(TopicCatalogue.TETHER to it) },
             revalidationScope = { if (current(live.generation) == null) emptySet() else revalidationTopics() },
-            manualRetry = manual != null
+            manualEntry = manual?.entryReceiveGeneration,
+            manualScope = { if (manual == null) emptySet() else manualScope(live, id, manual) }
         )
         val running = RunningCommand(command, purpose, revalidationEntry, manual)
         live.commands[id] = running
@@ -1974,12 +1993,17 @@ class TopicSessionCoordinator(
         }
         if (manual != null) {
             manual.targets.forEach { live.manualOwners[it] = id }
-            if (TopicCatalogue.TETHER in manual.targets) live.revalidationOwner = null
         }
+        val takesManualTetherDelivery = manual?.let {
+            TopicCatalogue.TETHER in it.targets &&
+                store.snapshot.stateFor(TopicCatalogue.TETHER).receiveGeneration <= it.entryReceiveGeneration.getValue(TopicCatalogue.TETHER)
+        } == true
+        if (takesManualTetherDelivery) live.revalidationOwner = null
         live.authEnded.values.forEach { record ->
             if (running.takesFirstDelivery) record.firstDeliveryRequired = false
             if (running.takesRenewal) record.renewalRequired = false
-            if (revalidates || manual?.targets?.contains(TopicCatalogue.TETHER) == true) record.tetherEntryGeneration = null
+            if (revalidates || takesManualTetherDelivery) record.tetherEntryGeneration = null
+            record.manual?.targets?.removeAll(manual?.targets.orEmpty())
         }
         live.authEnded.values.removeAll { it.settled }
         // `finally`, so a command that ends by cancellation is still taken off the connection. A
@@ -2048,10 +2072,11 @@ class TopicSessionCoordinator(
         // The server answered, so the request channel is free — before the delivery wait, which
         // needs nothing another command wants.
         releaseControlLane(live, commandId)
-        // The store already holds this answer: a recorded revalidation it confirmed away or refused is settled, for good (L-4e E6b §4).
+        // The store already holds this answer: obsolete automatic delivery and refused manual targets are settled, for good.
+        // Confirming another command's manual target does not answer that target's recorded subscribe.
         // A recorded first delivery needs nothing here — the only first delivery that can answer after one ended is the one a
         // recovery registered, which took it over.
-        settleOwedRevalidations(live)
+        settleAuthEndedObligations(live)
 
         // Settled **before** anyone outside is told, and against the grant this connection was
         // opened for rather than whatever is current: a listener that throws must not be able to
@@ -2658,14 +2683,18 @@ class TopicSessionCoordinator(
         commandId: Long,
         running: RunningCommand,
         authEnd: TopicAuthEnd,
-        ownsRevalidation: Boolean
+        ownsRevalidation: Boolean,
+        manualTargets: Set<String>
     ) {
         val record = AuthEndedRecord(
             purpose = running.purpose,
             authEnd = authEnd,
             firstDeliveryRequired = running.takesFirstDelivery,
             renewalRequired = running.takesRenewal,
-            tetherEntryGeneration = running.revalidationEntry?.takeIf { ownsRevalidation && revalidationOwed(it) }
+            tetherEntryGeneration = running.revalidationEntry?.takeIf { ownsRevalidation && revalidationOwed(it) },
+            manual = running.manual?.takeIf { manualTargets.isNotEmpty() }?.let {
+                AuthEndedManual(it.grantEpoch, manualTargets.toMutableSet(), it.entryReceiveGeneration)
+            }
         )
         if (!record.settled) live.authEnded[commandId] = record
     }
@@ -2682,11 +2711,17 @@ class TopicSessionCoordinator(
             state.deliveryState != TopicDeliveryState.DEGRADED && state.receiveGeneration <= entry
     }
 
-    /** Settles, for good, every recorded revalidation the store now says is no longer owed. */
-    private fun settleOwedRevalidations(live: Connection) {
+    /** A receipt settles automatic delivery, but manual subscribe survives it and another command's confirming ACK. */
+    private fun settleAuthEndedObligations(live: Connection) {
+        val snapshot = store.snapshot
         live.authEnded.values.forEach { record ->
-            val entry = record.tetherEntryGeneration ?: return@forEach
-            if (!revalidationOwed(entry)) record.tetherEntryGeneration = null
+            record.tetherEntryGeneration?.let { if (!revalidationOwed(it)) record.tetherEntryGeneration = null }
+            record.manual?.let { manual ->
+                manual.targets.removeAll { topic ->
+                    val state = snapshot.stateFor(topic)
+                    manual.grantEpoch != grantEpoch || topic !in desired || !state.desired || state.rejection != null
+                }
+            }
         }
     }
 
@@ -2705,7 +2740,7 @@ class TopicSessionCoordinator(
             live.recoveryReopenDeferred = false
             return
         }
-        settleOwedRevalidations(live)
+        settleAuthEndedObligations(live)
         live.authEnded.values.removeAll { it.settled }
         val ended = live.authEnded.filter { (id, record) ->
             recovery.recoveredOrder > record.authEnd.endedOrder && id !in live.commands
@@ -2740,51 +2775,70 @@ class TopicSessionCoordinator(
     /**
      * One command, on one budget, for what [ended] owes (L-4e E6b §5).
      *
-     * A first delivery is reopened alone — nothing else can have been owed beside it. Otherwise a renewal, a revalidation, or
-     * both as one combined command. Everything that can refuse is asked before the store is touched, and the episode is
-     * consumed in the same turn the command is registered, never without one. The store's authentication verdict is not
+     * Automatic obligations choose the base purpose; any manual subscribe and delivery attach independently. Everything
+     * that can refuse is asked before the store is touched, and the episode is consumed in the same turn the command is
+     * registered, never without one. The store's authentication verdict is not
      * changed here: only an acknowledgement proves the credential.
      */
     private fun reopenAfterRecovery(live: Connection, recovery: AuthCredentialRecovery, ended: Collection<AuthEndedRecord>) {
-        if (ended.any { it.firstDeliveryRequired }) {
-            if (live.commands.values.any { it.purpose == TopicCommandPurpose.FIRST_DELIVERY }) return
-            val scope = { desired.filterTo(mutableSetOf()) { store.snapshot.stateFor(it).rejection == null } }
-            if (scope().isEmpty()) return
-            consumeRecovery(live, recovery)
-            // The effort to get a first delivery is under way again, so D14 does not answer its silence twice.
-            firstDeliveryOutstanding = true
-            startCommand(live, TopicCommandPurpose.FIRST_DELIVERY, topics = scope)
-            return
+        val firstDelivery = ended.any { it.firstDeliveryRequired }
+        if (firstDelivery && live.commands.values.any { it.purpose == TopicCommandPurpose.FIRST_DELIVERY }) return
+        val manualEntries = linkedMapOf<String, Long>()
+        ended.forEach { record ->
+            record.manual?.let { manual ->
+                manual.targets.forEach { manualEntries[it] = manual.entryReceiveGeneration.getValue(it) }
+            }
         }
+        val manualTargets = manualEntries.keys.toSet()
+        if (manualTargets.isNotEmpty() && !manualAdmitted(live, grantEpoch)) return
+        val manualTetherDelivery = manualEntries[TopicCatalogue.TETHER]?.let {
+            store.snapshot.stateFor(TopicCatalogue.TETHER).receiveGeneration <= it
+        } == true
         val renewal = ended.any { it.renewalRequired }
-        val revalidation = ended.any { it.tetherEntryGeneration != null }
+        // A-only cannot take over the later automatic D. A manual D can, and retains manual state/ending semantics.
+        val revalidation = ended.any { it.tetherEntryGeneration != null } && !manualTetherDelivery
+        if (revalidation && live.revalidationOwner != null) return
+        val firstDeliveryScope = {
+            desired.filterTo(mutableSetOf()) { store.snapshot.stateFor(it).rejection == null }
+        }
         val renewalScope = {
             (live.renewalScope intersect desired).filterTo(mutableSetOf()) { store.snapshot.stateFor(it).rejection == null }
         }
-        if (!revalidation) {
-            if (!renewal || renewalScope().isEmpty()) return
-            consumeRecovery(live, recovery)
-            startCommand(live, TopicCommandPurpose.LEASE_RENEWAL, topics = renewalScope)
-            return
-        }
+        if (manualTargets.isEmpty() && !revalidation &&
+            !(firstDelivery && firstDeliveryScope().isNotEmpty()) && !(renewal && renewalScope().isNotEmpty())
+        ) return
         // Owed, so tether is desired, confirmed and has not spoken; what is left to ask is whether it may start. HEALTHY — which is
         // what the ending's own result left — is marked suspect first; a HEALTHY topic has no attempt spent, so that mark is never
         // left behind by a start that then refuses. The FAILED start guard is not asked: this is the one path a verified recovery
         // reaches, and only an acknowledgement takes the verdict back.
-        if (live.revalidationOwner != null) return
-        store.markSuspect(TopicCatalogue.TETHER)
-        if (!store.beginRevalidation(TopicCatalogue.TETHER)) return
-        consumeRecovery(live, recovery)
-        if (renewal) {
-            startCommand(
-                live,
-                TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION,
-                revalidationTopics = { owedTether() },
-                topics = renewalScope
-            )
-        } else {
-            startCommand(live, TopicCommandPurpose.REVALIDATION) { setOf(TopicCatalogue.TETHER) }
+        if (revalidation) {
+            store.markSuspect(TopicCatalogue.TETHER)
+            if (!store.beginRevalidation(TopicCatalogue.TETHER)) return
         }
+        val manual = manualTargets.takeIf { it.isNotEmpty() }?.let { beginManual(live, it, manualEntries.toMap()) }
+        val purpose = when {
+            firstDelivery -> TopicCommandPurpose.FIRST_DELIVERY
+            renewal && revalidation -> TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION
+            renewal -> TopicCommandPurpose.LEASE_RENEWAL
+            else -> TopicCommandPurpose.REVALIDATION
+        }
+        val baseScope = {
+            when (purpose) {
+                TopicCommandPurpose.FIRST_DELIVERY -> firstDeliveryScope()
+                TopicCommandPurpose.LEASE_RENEWAL, TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION -> renewalScope()
+                TopicCommandPurpose.REVALIDATION -> if (revalidation) owedTether() else emptySet()
+            }
+        }
+        consumeRecovery(live, recovery)
+        if (firstDelivery) firstDeliveryOutstanding = true
+        startCommand(
+            live,
+            purpose,
+            revalidationTopics = { if (revalidation) owedTether() else emptySet() },
+            manual = manual,
+            automaticRevalidation = revalidation,
+            topics = baseScope
+        )
     }
 
     /** Tether while its state still allows a revalidation question: desired and unrefused. */

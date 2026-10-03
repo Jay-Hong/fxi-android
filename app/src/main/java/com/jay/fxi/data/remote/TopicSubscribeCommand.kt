@@ -125,7 +125,7 @@ enum class TopicCommandPurpose {
      */
     LEASE_RENEWAL_WITH_REVALIDATION;
 
-    /** Whether an acknowledgement can leave anything still to be waited for. */
+    /** Whether the automatic purpose watches delivery. An attached manual obligation supplies its own watch. */
     val watchesDelivery: Boolean get() = this != LEASE_RENEWAL
 }
 
@@ -295,23 +295,23 @@ class TopicSubscribeCommand(
     private val onClassifiedFailure: () -> Unit = {},
     /** Once per attempt, after opening its request and before sending or waiting; not evidence of an answer. */
     private val onRequestStarted: () -> Unit = {},
-    /** A manual REVALIDATION owes a subscribe ACK even when its delivery has already arrived. */
-    private val manualRetry: Boolean = false
+    /** A manual obligation's original registration entries, independent of the automatic purpose. */
+    private val manualEntry: Map<String, Long>? = null,
+    /** Manual targets still owned: they owe a subscribe ACK even when their delivery has already arrived. */
+    private val manualScope: () -> Set<String> = { emptySet() }
 ) {
     init {
         require(purpose != TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION || revalidationEntry != null) {
             "a combined command is judged against the entry its registration read"
-        }
-        require(!manualRetry || purpose == TopicCommandPurpose.REVALIDATION && revalidationEntry != null) {
-            "a manual batch requires its fixed registration entry and REVALIDATION purpose"
         }
     }
 
     private class Pending(
         val requestId: String,
         val topics: Set<String>,
-        /** The sent topics whose delivery this send watches: all of them, none for a renewal, a combined command's revalidation. */
+        /** The automatic delivery scope plus manual targets that have not received since their original entry. */
         val watched: Set<String>,
+        val manualTopics: Set<String>,
         val baseline: Map<String, Long>,
         val deadlines: TopicRequestDeadlines,
         val credential: AuthSnapshot,
@@ -327,7 +327,7 @@ class TopicSubscribeCommand(
 
     /** What the scope says to do next, asked again at every point where sending is possible. */
     private sealed interface Sendable {
-        data class Topics(val values: Set<String>, val watched: Set<String>) : Sendable
+        data class Topics(val values: Set<String>, val watched: Set<String>, val manualTopics: Set<String> = emptySet()) : Sendable
         data class Recovered(val values: Set<String>) : Sendable
         data object Nothing : Sendable
     }
@@ -440,7 +440,7 @@ class TopicSubscribeCommand(
             }
             val wanted = now.values
 
-            val pending = register(wanted, now.watched, credential, replayOfRefresh) ?: return programmingError()
+            val pending = register(wanted, now.watched, now.manualTopics, credential, replayOfRefresh) ?: return programmingError()
             // Before the store is touched, not after. Nothing goes on the wire on behalf of a
             // cancelled command — and a cancelled command must not take the replacement's request
             // with it either, which is what `beginRequest` here would do by claiming the ticket
@@ -578,6 +578,16 @@ class TopicSubscribeCommand(
      * With nothing to send, a revalidation that spoke answered it; one whose topics are no longer owed at all did not.
      */
     private fun sendable(entry: Map<String, Long>): Sendable {
+        val automatic = automaticSendable(entry)
+        val manual = manualScope()
+        if (manual.isEmpty()) return automatic
+        val manualBaseline = checkNotNull(manualEntry) { "manual targets require their registration entries" }
+        val manualDelivery = manual.filterTo(mutableSetOf()) { !spokeSince(manualBaseline, it) }
+        val base = automatic as? Sendable.Topics
+        return Sendable.Topics(base?.values.orEmpty() + manual, base?.watched.orEmpty() + manualDelivery, manual)
+    }
+
+    private fun automaticSendable(entry: Map<String, Long>): Sendable {
         if (purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION) {
             val (spoke, silent) = revalidationScope().partition { spokeSince(entry, it) }
             val renewal = scope()
@@ -589,7 +599,6 @@ class TopicSubscribeCommand(
         }
         val wanted = scope()
         if (wanted.isEmpty()) return Sendable.Nothing
-        if (manualRetry) return Sendable.Topics(wanted, wanted)
         if (purpose != TopicCommandPurpose.REVALIDATION) {
             return Sendable.Topics(wanted, if (purpose.watchesDelivery) wanted else emptySet())
         }
@@ -607,6 +616,7 @@ class TopicSubscribeCommand(
     private fun register(
         wanted: Set<String>,
         watched: Set<String>,
+        manualTopics: Set<String>,
         credential: AuthSnapshot,
         replayOfRefresh: Boolean
     ): Pending? {
@@ -616,10 +626,14 @@ class TopicSubscribeCommand(
             requestId = newRequestId(),
             topics = wanted,
             watched = watched,
-            baseline = if (manualRetry) {
-                checkNotNull(revalidationEntry)
-            } else {
-                wanted.associateWith { store.snapshot.stateFor(it).receiveGeneration }
+            manualTopics = manualTopics,
+            // A manual A-only target may share a topic with a later automatic delivery question. Only a still-owed manual D
+            // supplies its old baseline; otherwise the automatic question keeps its own reading.
+            baseline = wanted.associateWith { topic ->
+                val manual = manualEntry?.get(topic)
+                if (topic in manualTopics && manual != null && store.snapshot.stateFor(topic).receiveGeneration <= manual) {
+                    manual
+                } else store.snapshot.stateFor(topic).receiveGeneration
             },
             deadlines = deadlines,
             credential = credential,
@@ -702,7 +716,7 @@ class TopicSubscribeCommand(
                 accepted = accepted,
                 rejected = rejected,
                 leases = answer.leases,
-                missing = if (manualRetry) pending.topics - active - rejected.keys else emptySet()
+                missing = pending.manualTopics - active - rejected.keys
             )
         )
         // The callback is where a session tears itself down on a refusal, and the branch below it
@@ -720,9 +734,9 @@ class TopicSubscribeCommand(
         }
         // Narrowed by the scope as it is *now*: a topic dropped while the deadline ran is not
         // something to revalidate or degrade, and the caller would act on it if it were reported.
-        // A combined command's silence is its revalidation's, so that is the scope it is narrowed by.
+        // A combined command's automatic silence is its revalidation's; manual targets remain independently owned.
         val stillWanted =
-            if (purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION) revalidationScope() else scope()
+            (if (purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION) revalidationScope() else scope()) + manualScope()
         return TopicCommandOutcome.Acknowledged(
             accepted = accepted,
             // A send that did not watch has nothing to report. The set would otherwise be a
@@ -766,13 +780,7 @@ class TopicSubscribeCommand(
      * anything would satisfy its own watchdog.
      */
     private fun silentOf(pending: Pending, accepted: Set<String>): Set<String> =
-        accepted.filterTo(mutableSetOf()) {
-            if (manualRetry) {
-                !spokeSince(pending.baseline, it)
-            } else {
-                store.snapshot.stateFor(it).receiveGeneration == pending.baseline[it]
-            }
-        }
+        accepted.filterTo(mutableSetOf()) { !spokeSince(pending.baseline, it) }
 
     /**
      * This topic has moved past where it was when the command started.
@@ -805,7 +813,9 @@ class TopicSubscribeCommand(
         val wait = TopicCommandRetryPolicy.waitFor(base, jitter()) ?: return WaitResult.REFUSED
         clock.sleep(wait)
         // A combined command whose renewal emptied still owes its revalidation, which the next send check settles (L-4e E6b).
-        return if (scope().isEmpty() && revalidationScope().isEmpty()) WaitResult.SUPERSEDED else WaitResult.PROCEED
+        return if (scope().isEmpty() && revalidationScope().isEmpty() && manualScope().isEmpty()) {
+            WaitResult.SUPERSEDED
+        } else WaitResult.PROCEED
     }
 
     private fun budgetSpent() =
