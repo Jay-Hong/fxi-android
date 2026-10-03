@@ -44,7 +44,8 @@ class PremiumTopicPresenterTest {
         q("upbit", "usdt-krw", 1400.0), q("bithumb", "usdt-krw", 1401.0), q("investing", "usd-krw", 1389.0),
         index = dxy)
     private fun display(r: TopicRates = full, seed: Boolean = false, connection: TopicConnectionDisplay = TopicConnectionDisplay.OPEN,
-                        owner: TopicDisplayOwner? = TopicDisplayOwner(a1, 1L)) = TopicDisplayState(owner, r, seed, connection)
+                        owner: TopicDisplayOwner? = TopicDisplayOwner(a1, 1L), resolved: Boolean = false) =
+        TopicDisplayState(owner, r, seed, connection, cachedRefreshResolved = resolved)
     private fun present(tab: FreeTab, d: TopicDisplayState = display(), prefs: Map<RateRowList, RateRowPreference> = emptyMap()) =
         PremiumTopicPresenter.present(d, OwnedTopicFocus(a1, tab), a1, prefs)
     /** What the free projection and presenter draw for [tab], keeping an empty section only where an editor speaks for it. */
@@ -109,17 +110,23 @@ class PremiumTopicPresenterTest {
         assertEquals("C3b-05 live moved", PremiumTopicUiState.NONE, ui.forCurrent(d, OwnedTopicFocus(a1, FreeTab.USD), AuthIdentityFence("A", 2L)))
     }
 
+    // R4-c F2 revision (R4c/C2b/design_codex.r2.md §6, agreed): a stored price is announced as being refreshed only until the session
+    // accepts an answer in the current round (`cachedRefreshResolved`); offline is unchanged, and no banner means no time.
     @Test fun `C3b-06 the status line follows iOS, and its time is the latest shown observation`() {
-        for (c in TopicConnectionDisplay.entries) for (seed in listOf(false, true)) for (empty in listOf(false, true)) {
-            val ui = present(FreeTab.USD, display(if (empty) TopicRates() else full, seed, c))
-            val banner = when {
-                c == TopicConnectionDisplay.OFFLINE -> PremiumTopicBanner.OFFLINE
-                seed -> PremiumTopicBanner.REFRESHING_CACHED
-                else -> null
-            }
-            assertEquals("C3b-06 banner $c seed=$seed empty=$empty", banner, ui.statusBanner)
-            if (banner == null || empty) assertNull("C3b-06 no time $c seed=$seed empty=$empty", ui.lastUpdated)
-        }
+        for (tab in FreeTab.entries)
+            for (c in TopicConnectionDisplay.entries) for (seed in listOf(false, true)) for (resolved in listOf(false, true))
+                for (empty in listOf(false, true)) {
+                    val ui = present(tab, display(if (empty) TopicRates() else full, seed, c, resolved = resolved))
+                    val banner = when {
+                        c == TopicConnectionDisplay.OFFLINE -> PremiumTopicBanner.OFFLINE
+                        seed && !resolved -> PremiumTopicBanner.REFRESHING_CACHED
+                        else -> null
+                    }
+                    assertEquals("C3b-06 banner $tab $c seed=$seed resolved=$resolved empty=$empty", banner, ui.statusBanner)
+                    if (banner == null || empty) {
+                        assertNull("C3b-06 no time $tab $c seed=$seed resolved=$resolved empty=$empty", ui.lastUpdated)
+                    }
+                }
         assertEquals("C3b-06 texts", listOf("오프라인 모드", "저장된 환율 · 최신 데이터 확인 중"), PremiumTopicBanner.entries.map { it.text })
         val offline = display(connection = TopicConnectionDisplay.OFFLINE)
         assertEquals("C3b-06 dollar tab counts its index", t3, present(FreeTab.USD, offline).lastUpdated)

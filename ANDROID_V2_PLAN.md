@@ -17,6 +17,8 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 L-4b·L-4c·L-4d·L-4e(E1~E6)·L-4f와 S1 회복 신호는 land했다.
                                 S1 발급자 회복 경로와 topic 세션·grant 전달자의 runtime 배선은 C4에서 연결됐다.
                                 C4 완료 판정은 ROOT-REFUSAL 기기 증거 미수집으로 PENDING_EVIDENCE다(동결 후 13번).
+                                C2+b 첫 단위 F2(저장값 배너 해제, S3 'R4-c F2' 항목)는 JVM 계약으로 연결했고 기기
+                                증거는 미수집이다. C2+b-1·C2+b-3 전에는 출시할 수 없다.
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1168,6 +1170,25 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
     그대로 옮기면 KRX-only 200이 tether 창을 무장시킨다. D14와 §7 S3 DoD(KRX-only가 Tether delivery·
     freshness를 충족하지 않음)를 따르는 강화이며 새 정책이 아니다. '사용 가능한 가격 존재'와 '캐시 변경
     발생'은 다른 검사다 — merge 결과가 불변이어도 유효한 가격이 있었으면 배달이다
+- **저장값 배너 해제(R4-c F2, 의도적 iOS 이탈 포함, §2.2 기록).** "저장된 환율 · 최신 데이터 확인 중"은 현재 표시 회차에서
+  세션이 응답을 수락하면 내린다. 응답은 현재 연결의 유효 가격(병합 변경 여부 무관), 명령이 수락한 ACK 또는 분류된 요청
+  오류, 적용된 REST bootstrap이다. 해제는 가격·seed 표시·배달·freshness·인증 상태를 바꾸지 않으며, 연결 종료·새 연결
+  시도(transport 생성 실패 포함)·owner/grant/신원 경계·적용 lifetime 무효화로 끝난다
+  - iOS `a36682f`는 네트워크가 연결된 현재 소켓에서 envelope을 해독하면 type별 본문 수락 전에 연결 상태를 확인한다.
+    Android는 기존 적용 검사를 통과한 유효 데이터·ACK·분류 오류만 해제 증거로 삼는다. Opened, legacy `rates`, pong,
+    미지원·해독 불가 프레임, 비희망·거절 데이터, 빈·전부 무효 Tether, 미분류·unmatched·늦은 오류는 제외한다
+  - iOS는 유효 KRX 데이터 적용으로도 해제한다. Android는 S6 전까지 KRX 구독·데이터 소비가 범위 밖이므로 KRX를 해제
+    증거로 쓰지 않는다
+  - iOS도 bootstrap 적용으로 해제한다(`ExchangeRateViewModel`의 `applyTetherSnapshot`·`applyFxSnapshot`). Android는
+    bootstrap의 기존 grantEpoch·신원·refusal latch·lifetime 적용 검사를 유지한다. 요청 발급 당시 소켓 회차는 요구하지
+    않으며, 유효 응답의 표시 효과는 적용 당시 표시 회차에 귀속한다
+  - REST DXY는 유효 index가 표시 슬롯을 실제로 교체할 때 해제하고, WS DXY는 유효 수락 자체로 해제한다. iOS
+    `applyDxySnapshot`의 strictly-newer 적용과 소켓 확인 경로의 차이를 그대로 따른다
+  - iOS는 topic 인증 FAILED 진입 시 전체 topic 데이터를 purge한다. Android는 topic 인증 오류만으로 기존 가격을 제거하지
+    않고 control·failure·auth 상태를 갱신한다. F2는 이 기존 차이를 기록할 뿐 가격 제거 정책을 바꾸지 않는다
+  - **F2만 적용한 상태는 출시 불가다.** 수락된 오류로 저장값 배너가 내려가도 seed 가격이 남고 topic 배너가 아직 없는
+    상태가 가능하다. C2+b-1(canonical snapshot 노출)과 C2+b-3(실패·재검증·재시도 표시)까지 완료·검증해야 하며, 그
+    완료도 기존 출시 게이트를 자동 충족하지 않는다
 - **USD/JPY/EUR 현재가를 topic으로 전환하고 `/api/rates`·legacy WS 소비 제거**. S2의 premium unavailable shell을
   실제 premium Root destination으로 교체한다
 - rate consumer cutover와 같은 변경 세트에서 `fxi_cache`의 legacy `rates`·`rates_timestamp`를 제거하고

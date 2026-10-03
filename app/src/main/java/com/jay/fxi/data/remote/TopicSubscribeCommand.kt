@@ -233,7 +233,7 @@ sealed interface TopicCommandOutcome {
  * against connection and account changes that only the session above can see.
  *
  * **Threading.** [deliver] is safe from any thread — it only hands a frame to a channel. Everything
- * else, including every read and write of [store] and the [onAcknowledged] callback, happens on the
+ * else, including every read and write of [store] and the answer callbacks, happens on the
  * coroutine that called [run], and this class adds no synchronisation of its own because
  * [TopicSubscriptionStateStore] has none. A caller that runs two commands against one store
  * concurrently has to serialise them itself.
@@ -288,7 +288,9 @@ class TopicSubscribeCommand(
      * [TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION] only: the topics whose revalidation this command still owes, asked
      * at the same points as [scope] — which, for that purpose, is the renewal's topics. Empty for every other purpose.
      */
-    private val revalidationScope: () -> Set<String> = { emptySet() }
+    private val revalidationScope: () -> Set<String> = { emptySet() },
+    /** Once per admitted classified server failure, after synchronous state transitions and before the next suspension. */
+    private val onClassifiedFailure: () -> Unit = {}
 ) {
     init {
         require(purpose != TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION || revalidationEntry != null) {
@@ -483,6 +485,7 @@ class TopicSubscribeCommand(
                             TopicWholeRequestDecision.Ignore -> continue@waiting
 
                             is TopicWholeRequestDecision.Stop -> {
+                                onClassifiedFailure()
                                 if (failure != TopicWholeRequestFailure.InvalidToken) {
                                     return TopicCommandOutcome.Stopped(decision.reason)
                                 }
@@ -510,6 +513,7 @@ class TopicSubscribeCommand(
                                 // recovery it is owed is still running.
                                 val recovery = store.beginAuthRefresh()
                                 authTicket = recovery
+                                onClassifiedFailure()
                                 val refreshed =
                                     credentials.refreshAfterUnauthorized(pending.credential)
                                 // The refresh suspended, so its result is a new answer to admit. The ticket stays held until
@@ -538,6 +542,7 @@ class TopicSubscribeCommand(
 
                             is TopicWholeRequestDecision.RetryAfter -> {
                                 attempt = decision.attempt
+                                onClassifiedFailure()
                                 when (waitBeforeRetry(decision.delay)) {
                                     WaitResult.PROCEED -> break@waiting
                                     WaitResult.SUPERSEDED -> return TopicCommandOutcome.Superseded

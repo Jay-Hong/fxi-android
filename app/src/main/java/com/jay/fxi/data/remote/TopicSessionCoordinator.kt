@@ -113,7 +113,9 @@ data class TopicDisplayState(
     val rates: TopicRates,
     val containsSeed: Boolean,
     val connection: TopicConnectionDisplay,
-    val recovery: TopicRecoveryDisplay = TopicRecoveryDisplay.None
+    val recovery: TopicRecoveryDisplay = TopicRecoveryDisplay.None,
+    /** An accepted answer resolved the stored-price wait in this display round; never delivery, freshness or authentication. */
+    val cachedRefreshResolved: Boolean = false
 ) {
     companion object {
         val NONE = TopicDisplayState(null, TopicRates(), false, TopicConnectionDisplay.OFFLINE)
@@ -641,6 +643,9 @@ class TopicSessionCoordinator(
     private var commandSerial = 0L
     private var stopped = false
 
+    /** One session-wide release, cleared at display-round boundaries and bound to the accepted answer's existing use. */
+    private var resolvedLifetime: TopicUseLifetime? = null
+
     /**
      * Which grant's authority is current, counted rather than compared.
      *
@@ -953,7 +958,10 @@ class TopicSessionCoordinator(
                 // late answer, and only the second is a correctness question. What not cancelling
                 // costs is real and bounded: a request whose grant is over runs to the end of its
                 // ten-second budget before anyone stops paying for it.
-                if (moved || withdrawn) grantEpoch++
+                if (moved || withdrawn) {
+                    grantEpoch++
+                    resetCachedRefresh()
+                }
                 reapprovedEpoch = grantEpoch.takeIf { inherits }
                 if (moved) {
                     // A different grant is a different session. The socket was authenticated as
@@ -1074,7 +1082,7 @@ class TopicSessionCoordinator(
                 // The snapshot is protected data: applied only while the use its issue acquired is still admitted, however the
                 // access came back in between.
                 if (!authority.admits(input.lifetime)) return
-                applyBootstrap(input.topic, delivered.frame)
+                applyBootstrap(input.topic, delivered.frame, input.lifetime)
             }
 
             is SessionInput.Transport ->
@@ -1459,6 +1467,7 @@ class TopicSessionCoordinator(
         }
         recovery = recoveryState
         val number = ++generation
+        resetCachedRefresh()
         val firstAttempt = !everAttempted
         everAttempted = true
         firstDeliveryOutstanding = true
@@ -1627,6 +1636,7 @@ class TopicSessionCoordinator(
         offerAdopted(held, merged)
         store.recordFrame(topic)
         recordDelivery(evidenceFor(topic), clock.nowMillis())
+        resolveCachedRefresh(live.lifetime)
     }
 
     private fun receiveIndex(live: Connection, message: DxyTopicMessage) {
@@ -1639,6 +1649,7 @@ class TopicSessionCoordinator(
         _rates.value = merged
         offerAdopted(held, merged)
         store.recordFrame(TopicCatalogue.DXY)
+        resolveCachedRefresh(live.lifetime)
     }
 
     /** Keeps only live changes adopted by the display in this grant. */
@@ -1744,6 +1755,7 @@ class TopicSessionCoordinator(
             jitter = jitter,
             scope = { if (current(live.generation) == null) emptySet() else topics() },
             onAcknowledged = { ack -> onAcknowledged(live, id, ack) },
+            onClassifiedFailure = { onClassifiedFailure(live) },
             admitAnswer = { rejected -> admitsAnswer(live, rejected) },
             revalidationEntry = revalidationEntry?.let { mapOf(TopicCatalogue.TETHER to it) },
             revalidationScope = { if (current(live.generation) == null) emptySet() else revalidationTopics() }
@@ -1844,15 +1856,24 @@ class TopicSessionCoordinator(
         // and publish that answer on the way to the teardown.
         current(live.generation)?.let { still -> applyLeases(still, ack) }
         live.authEnded.values.removeAll { it.settled }
+        resolveCachedRefresh(live.lifetime)
         // Reported before the two observers below (L-4e E4a): the refusal is settled and its leases handled, and an observer that
         // throws must not keep the grant's refusal from the issuer. `live.fence`, not the session's current one: the refusal
         // above may already have ended this connection, and the grant it answered is the one this connection was opened under.
         if (ack.rejected.isNotEmpty()) onRejected(live.fence, ack.rejected)
         // The acknowledgement's own store writes happen inside the command, not on the loop, so
         // the turn-boundary publication would not carry them until something else arrives.
+        publishDisplay()
         publishIfChanged()
 
         onAcknowledgement(ack)
+    }
+
+    /** The command has applied a classified server failure, including any synchronous refresh transition. */
+    private fun onClassifiedFailure(live: Connection) {
+        resolveCachedRefresh(live.lifetime)
+        publishDisplay()
+        publishIfChanged()
     }
 
     // ---- leases -----------------------------------------------------------------------------
@@ -2147,10 +2168,10 @@ class TopicSessionCoordinator(
      * never received a frame look like one that did. What a bootstrap does earn is D14's window,
      * which `TopicSilencePolicy` arms from either path.
      */
-    private fun applyBootstrap(topic: String, frame: DecodedTopicFrame) {
+    private fun applyBootstrap(topic: String, frame: DecodedTopicFrame, lifetime: TopicUseLifetime) {
         when (frame) {
-            is DecodedTopicFrame.Tether -> applyBootstrapEntries(topic, frame.value.data.allEntries)
-            is DecodedTopicFrame.Fx -> applyBootstrapEntries(topic, frame.value.data.allEntries)
+            is DecodedTopicFrame.Tether -> applyBootstrapEntries(topic, frame.value.data.allEntries, lifetime)
+            is DecodedTopicFrame.Fx -> applyBootstrapEntries(topic, frame.value.data.allEntries, lifetime)
 
             // One slot rather than a list, so "everything failed validation" and "nothing arrived"
             // are the same answer here — and it arms nothing either way, exactly as the socket's
@@ -2160,6 +2181,7 @@ class TopicSessionCoordinator(
                 val merged = held.merge(index)
                 _rates.value = merged
                 offerAdopted(held, merged)
+                if (merged.dollarIndex != held.dollarIndex) resolveCachedRefresh(lifetime)
             }
 
             // S6 owns KRX and `desired` cannot name it, so this is unreachable rather than
@@ -2184,7 +2206,7 @@ class TopicSessionCoordinator(
      * satisfying tether delivery. A payload that merged **nothing because everything in it was
      * older** is still a delivery: the server answered, and that is what the window measures.
      */
-    private fun applyBootstrapEntries(topic: String, entries: List<TopicSourceEntry>) {
+    private fun applyBootstrapEntries(topic: String, entries: List<TopicSourceEntry>, lifetime: TopicUseLifetime) {
         val quotes: List<TopicQuote> = entries.mapNotNull { it.toQuote() }
         if (quotes.isEmpty()) return
         val held = _rates.value
@@ -2192,6 +2214,7 @@ class TopicSessionCoordinator(
         _rates.value = merged
         offerAdopted(held, merged)
         recordDelivery(evidenceFor(topic), clock.nowMillis())
+        resolveCachedRefresh(lifetime)
     }
 
     // ---- silence (D14) -----------------------------------------------------------------------
@@ -2349,6 +2372,19 @@ class TopicSessionCoordinator(
         onTopicState(next)
     }
 
+    private fun resetCachedRefresh() {
+        resolvedLifetime = null
+    }
+
+    /** A hold may have come and gone without its revision reaching this session. */
+    private fun invalidateCachedRefresh() {
+        resolvedLifetime?.let { if (!authority.admits(it)) resetCachedRefresh() }
+    }
+
+    private fun resolveCachedRefresh(lifetime: TopicUseLifetime) {
+        resolvedLifetime = lifetime
+    }
+
     /**
      * Derives the screen's view from the current grant, held prices and transport. Called after every handled input,
      * when a connection ends (including from command callbacks), and when the loop ends. A runtime stop may cancel
@@ -2375,7 +2411,10 @@ class TopicSessionCoordinator(
         } else {
             TopicRecoveryDisplay.None
         }
-        _display.value = TopicDisplayState(owner, shown, containsSeed, connectionState, shownRecovery)
+        // A publication may precede the deliverer's AccessRevised input after a hold spent this use.
+        invalidateCachedRefresh()
+        val cachedRefreshResolved = owner != null && resolvedLifetime != null
+        _display.value = TopicDisplayState(owner, shown, containsSeed, connectionState, shownRecovery, cachedRefreshResolved)
     }
 
     /** Lets go of the request channel, and wakes whatever stood aside for it. */
@@ -2571,6 +2610,7 @@ class TopicSessionCoordinator(
     private fun end(live: Connection, cause: TopicDisconnectCause) {
         if (live.ended) return
         live.ended = true
+        resetCachedRefresh()
         live.commands.values.forEach { it.job?.cancel() }
         live.renewalTimer?.cancel()
         live.expiryTimer?.cancel()

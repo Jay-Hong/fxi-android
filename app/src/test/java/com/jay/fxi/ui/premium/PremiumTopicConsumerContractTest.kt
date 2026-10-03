@@ -88,9 +88,9 @@ class PremiumTopicConsumerContractTest {
         fun rowIds() = shown().ui.rateSections.flatMap { s -> s.rows.map { it.id } }
     }
     private fun state(owner: TopicDisplayOwner? = TopicDisplayOwner(a1, 1L), r: TopicRates = rates(), seed: Boolean = false,
-                      connection: TopicConnectionDisplay = TopicConnectionDisplay.OPEN,
+                      connection: TopicConnectionDisplay = TopicConnectionDisplay.OPEN, resolved: Boolean = false,
                       recovery: TopicDisplayState.() -> TopicRecoveryDisplay = { TopicRecoveryDisplay.None }) =
-        TopicDisplayState(owner, r, seed, connection).let { it.copy(recovery = it.recovery()) }
+        TopicDisplayState(owner, r, seed, connection, cachedRefreshResolved = resolved).let { it.copy(recovery = it.recovery()) }
     private val o1 = TopicDisplayOwner(a1, 1L)
 
     @Test fun `C3c1-01 only the current owner's screen is published or served, and nothing is selected for it`() = runTest {
@@ -207,13 +207,33 @@ class PremiumTopicConsumerContractTest {
             state(connection = TopicConnectionDisplay.DISCONNECTED) { TopicRecoveryDisplay.Reconnecting(1) } to PremiumTopicScreenBanner.Reconnecting(1),
             state(connection = TopicConnectionDisplay.DISCONNECTED) { TopicRecoveryDisplay.Reconnecting(5) } to PremiumTopicScreenBanner.Reconnecting(5),
             state() to null,
-            state(connection = TopicConnectionDisplay.DISCONNECTED) to null)
+            state(connection = TopicConnectionDisplay.DISCONNECTED) to null,
+            // R4-c F2 revision (R4c/C2b/design_codex.r2.md §6, agreed): once the session accepted an answer in this round, a seed no
+            // longer holds the line; the next status that applies shows, in the same order as before.
+            state(connection = TopicConnectionDisplay.OFFLINE, seed = true, resolved = true) to PremiumTopicScreenBanner.Offline,
+            state(connection = TopicConnectionDisplay.DISCONNECTED, seed = true, resolved = true) { TopicRecoveryDisplay.Exhausted } to
+                PremiumTopicScreenBanner.Failed,
+            state(connection = TopicConnectionDisplay.DISCONNECTED, seed = true) { TopicRecoveryDisplay.Connecting } to
+                PremiumTopicScreenBanner.RefreshingCached,
+            state(connection = TopicConnectionDisplay.DISCONNECTED, seed = true, resolved = true) { TopicRecoveryDisplay.Connecting } to
+                PremiumTopicScreenBanner.Connecting,
+            state(connection = TopicConnectionDisplay.DISCONNECTED, seed = true, resolved = true) { TopicRecoveryDisplay.Reconnecting(2) } to
+                PremiumTopicScreenBanner.Reconnecting(2),
+            state(connection = TopicConnectionDisplay.DISCONNECTED, seed = true, resolved = true) to null,
+            state(seed = true, resolved = true) to null)
         val h = Harness(this)
         h.consumer.start(); runCurrent()
-        for ((d, banner) in cases) {
+        for (tab in FreeTab.entries) for ((d, banner) in cases) {
+            h.focus.value = OwnedTopicFocus(a1, tab)
             h.display.value = d; runCurrent()
-            assertEquals("C3c1-06 ${d.connection} ${d.recovery} seed=${d.containsSeed}", banner, h.shown().banner)
+            assertEquals("C3c1-06 $tab ${d.connection} ${d.recovery} seed=${d.containsSeed} resolved=${d.cachedRefreshResolved}",
+                banner, h.shown().banner)
+            if (d.cachedRefreshResolved && banner != PremiumTopicScreenBanner.Offline) {
+                assertNull("C3c1-06 $tab released: no cached time", h.shown().updatedText)
+            }
         }
+        // The retry rows below are about the owner, not the tab: back to the tab the harness started on.
+        h.focus.value = OwnedTopicFocus(a1, FreeTab.USD); runCurrent()
         assertEquals("C3c1-06 texts", listOf("연결 중...", "연결 중...", "재연결 중 (2/5)", "연결할 수 없습니다"),
             listOf(PremiumTopicScreenBanner.Connecting.text, PremiumTopicScreenBanner.Reconnecting(1).text,
                 PremiumTopicScreenBanner.Reconnecting(2).text, PremiumTopicScreenBanner.Failed.text))
@@ -244,6 +264,14 @@ class PremiumTopicConsumerContractTest {
         assertNull("C3c1-07 a failure hides the cached time", h.shown().updatedText)
         h.display.value = state(connection = TopicConnectionDisplay.DISCONNECTED) { TopicRecoveryDisplay.Connecting }; runCurrent()
         assertNull("C3c1-07 connecting has no time", h.shown().updatedText)
+        // R4-c F2 revision: a released seed carries no cached time, whichever status replaces it.
+        h.display.value = state(r = rates(t1), connection = TopicConnectionDisplay.DISCONNECTED, seed = true, resolved = true) {
+            TopicRecoveryDisplay.Connecting
+        }; runCurrent()
+        assertNull("C3c1-07 released and connecting: no time", h.shown().updatedText)
+        h.display.value = state(r = rates(t1), seed = true, resolved = true); runCurrent()
+        assertNull("C3c1-07 released and open: no banner", h.shown().banner)
+        assertNull("C3c1-07 released and open: no time", h.shown().updatedText)
         h.scope.cancel()
     }
 

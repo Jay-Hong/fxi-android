@@ -10236,4 +10236,778 @@ class TopicSessionCoordinatorTest {
         h.releasedRecovery(access, "C2+a-09", refused)
         h.cleanUp()
     }
+
+    // ---- R4-c F2 (Claude-owned contract; R4c/C2b/design_codex.r2.md with review_claude.r2.md, agreed): the stored-price banner is
+    // released by an answer the session accepted in the current display round, and by nothing else. An answer is a valid price on the
+    // live connection whether or not it changed anything, an acknowledgement or a classified request failure the command accepted, or
+    // an applied REST bootstrap. A release changes no price, no seed mark, no delivery or freshness evidence and no authentication
+    // state. It ends with the round: the connection ending, a new connection attempt (one whose transport cannot be built included),
+    // an owner, grant or identity boundary, or the lifetime it was applied under no longer being admitted. Only the observable
+    // `cachedRefreshResolved` is contracted; how the session keeps it is the implementation's. Immediate publication (F2-16) is
+    // asserted inside F2-05 and F2-06: one millisecond after the answer, with no other input queued. The implementation reads but does
+    // not edit these rows. ----
+
+    private fun Harness.released() = coordinator.display.value.cachedRefreshResolved
+
+    /** The instant every frame in this harness carries (`10:20+09:00`), and one after it. */
+    private val frameAt = "2026-08-31T01:20:00Z"
+    private val afterFrames = "2026-08-31T02:00:00Z"
+    private fun usdSeed(at: String = afterFrames) = seedOf(seedQuote("kb", "usd-krw", 1395.0, at))
+    private fun staged() = TopicSnapshotOutcome.Unreachable(java.io.IOException("staged"))
+
+    /** Granted and online with [seed] restored, the socket open and the first subscribe sent as `r1`, nothing answered yet. */
+    private suspend fun TestScope.seededOpen(h: Harness, seed: TopicRates) {
+        h.restoreProvider = { granted -> TopicLastKnownRestore.Seed(seed, granted, TopicUseLifetime(granted.grant, 0L)) }
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals("fixture: the seed is shown", true, h.shown().containsSeed)
+        assertEquals("fixture: not released while connecting", false, h.released())
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("fixture: open", TopicConnectionDisplay.OPEN, h.shown().connection)
+        assertEquals("fixture: r1 sent", listOf("r1"), h.requests.map { it.requestId })
+        assertEquals("fixture: not released by the open", false, h.released())
+    }
+
+    /** As [seededOpen], then released by a valid FX price older than the seed. */
+    private suspend fun TestScope.releasedOpen(h: Harness) {
+        seededOpen(h, usdSeed())
+        h.wire.deliver(h.fxFrame(1391.0))
+        advanceTimeBy(1)
+        assertEquals("fixture: released", true, h.released())
+    }
+
+    /**
+     * Every connection failed until the ladder is spent, so no socket exists; then one REST answer for USD, older than the seed,
+     * applied by an explicit request. The plan's own answers were unreachable.
+     */
+    private suspend fun TestScope.releasedWithoutSocket(h: Harness) {
+        h.restoreProvider = { granted -> TopicLastKnownRestore.Seed(usdSeed(), granted, TopicUseLifetime(granted.grant, 0L)) }
+        h.bootstrapOutcome = { _, _ -> staged() }
+        exhaust(h)
+        assertEquals("fixture: exhausted", TopicRecoveryDisplay.Exhausted, h.shown().recovery)
+        assertEquals("fixture: no socket", TopicConnectionDisplay.DISCONNECTED, h.shown().connection)
+        assertEquals("fixture: not released", false, h.released())
+        h.bootstrapOutcome = { _, topic -> if (topic == USD) h.delivered(h.fxFrame(1391.0)) else staged() }
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: released without a socket", true, h.released())
+        assertEquals("fixture: the seed price stays", 1395.0, h.shown().rates.quotes.values.single().rate, 0.0)
+    }
+
+    @Test
+    fun `F2-01 a restored seed and an opened socket release nothing, and the seed is no evidence`() = runTest {
+        val h = Harness(this)
+        seededOpen(h, usdSeed())
+        advanceTimeBy(1_000)
+        assertEquals("F2-01 opened only", false, h.released())
+        assertEquals("F2-01 still a seed", true, h.shown().containsSeed)
+        assertEquals("F2-01 no USD delivery", 0L, h.store.snapshot.stateFor(USD).receiveGeneration)
+        assertEquals("F2-01 no tether delivery", 0L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        assertTrue("F2-01 the seed offered nothing to save", h.offers.isEmpty())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `F2-01b a repeated Opened on the standing connection keeps the release`() = runTest {
+        val h = Harness(this)
+        releasedOpen(h)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertEquals("F2-01b still open", TopicConnectionDisplay.OPEN, h.shown().connection)
+        assertEquals("F2-01b kept", true, h.released())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `F2-01c an Opened after the connect deadline still ends the connection, and the release with it`() = runTest {
+        val h = Harness(this)
+        releasedOpen(h)
+        advanceTimeBy(15_000)
+        val first = h.wire
+        first.open()
+        advanceTimeBy(1)
+        assertTrue("F2-01c the late Opened ended the connection, as before F2", first.cancelled)
+        assertEquals("F2-01c not released", false, h.released())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `F2-02 legacy rates, pong, unsupported, undecodable and KRX frames neither release nor cancel a release`() = runTest {
+        val h = Harness(this)
+        seededOpen(h, usdSeed())
+        val ignored = listOf(
+            """{"type":"rates","data":{"rates":[]}}""",
+            PONG,
+            """{"type":"update","version":1,"topic":"usdt:krw","data":{}}""",
+            """{"type":"mystery"}""",
+            "not json",
+            """{"type":"snapshot","version":1,"topic":"krx:usd-krw-futures","data":{"usd_krw_futures":
+               {"source":"krx","asset":"usd-krw-futures","rate":1390.0,"timestamp":"2026-08-31T10:20:00+09:00"}}}"""
+        )
+        ignored.forEach { frame ->
+            h.wire.deliver(frame)
+            advanceTimeBy(1)
+            assertEquals("F2-02 released by: $frame", false, h.released())
+        }
+        h.wire.deliver(h.fxFrame(1391.0))
+        advanceTimeBy(1)
+        assertEquals("fixture: released", true, h.released())
+        ignored.forEach { frame ->
+            h.wire.deliver(frame)
+            advanceTimeBy(1)
+            assertEquals("F2-02 cancelled by: $frame", true, h.released())
+        }
+        assertEquals("F2-02 the connection stood throughout", TopicConnectionDisplay.OPEN, h.shown().connection)
+        h.cleanUp()
+    }
+
+    /** The reproduction of F2: an answer that merges nothing still answers. One harness per path, cancelled once at the end. */
+    @Test
+    fun `F2-03 a valid live price at the seed's time or older releases, and leaves the seed and its mark`() = runTest {
+        val tether = Harness(this)
+        seededOpen(tether, seedOf(seedQuote("upbit", "usdt-krw", 1400.0, frameAt)))
+        tether.wire.deliver(tether.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        assertEquals("F2-03 tether at the same time: released", true, tether.released())
+        assertEquals("F2-03 tether: seed price kept", 1400.0, tether.shown().rates.quotes.values.single().rate, 0.0)
+        assertEquals("F2-03 tether: still a seed", true, tether.shown().containsSeed)
+        assertEquals("F2-03 tether: delivery as before F2", 1L, tether.store.snapshot.stateFor(TETHER).receiveGeneration)
+        assertTrue("F2-03 tether: nothing adopted to save", tether.offers.isEmpty())
+
+        val fx = Harness(this)
+        seededOpen(fx, usdSeed(afterFrames))
+        fx.wire.deliver(fx.fxFrame(1391.0))
+        advanceTimeBy(1)
+        assertEquals("F2-03 FX older: released", true, fx.released())
+        assertEquals("F2-03 FX: seed price kept", 1395.0, fx.shown().rates.quotes.values.single().rate, 0.0)
+        assertEquals("F2-03 FX: still a seed", true, fx.shown().containsSeed)
+        assertEquals("F2-03 FX: delivery as before F2", 1L, fx.store.snapshot.stateFor(USD).receiveGeneration)
+        assertTrue("F2-03 FX: nothing adopted to save", fx.offers.isEmpty())
+
+        val dxy = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        seededOpen(dxy, seedOf(index = TopicDollarIndex(98.0, Instant.parse(frameAt), "investing")))
+        dxy.wire.deliver(dxy.dxyFrame(98.5))
+        advanceTimeBy(1)
+        assertEquals("F2-03 DXY at the same time: released", true, dxy.released())
+        assertEquals("F2-03 DXY: seed index kept", 98.0, dxy.shown().rates.dollarIndex!!.rate, 0.0)
+        assertEquals("F2-03 DXY: still a seed", true, dxy.shown().containsSeed)
+        dxy.cleanUp()
+    }
+
+    @Test
+    fun `F2-04b desired prices still pass refusal and failed-authentication guards`() = runTest {
+        var last: Harness? = null
+        for (topic in listOf(USD, TopicCatalogue.DXY))
+            for (guard in listOf("refused", "auth failed"))
+                for (resolved in listOf(false, true)) {
+                    val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY)).also { last = it }
+                    if (resolved) releasedOpen(h) else seededOpen(h, usdSeed())
+
+                    // Fixture state, not a server answer: an accepted ACK/error would itself resolve the wait.
+                    if (guard == "refused") {
+                        h.store.applyAck(
+                            activeTopics = setOf(TETHER),
+                            rejections = mapOf(topic to TopicRejectionReason.TOPIC_UNAVAILABLE),
+                            sentTopics = setOf(TETHER, USD, TopicCatalogue.DXY)
+                        )
+                        assertEquals("fixture: refused", TopicRejectionReason.TOPIC_UNAVAILABLE,
+                            h.store.snapshot.stateFor(topic).rejection)
+                    } else {
+                        h.store.applyWholeFailure(com.jay.fxi.domain.model.TopicWholeRequestFailure.InvalidToken)
+                        assertEquals("fixture: auth failed", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+                    }
+
+                    val received = h.store.snapshot.stateFor(topic).receiveGeneration
+                    h.wire.deliver(if (topic == USD) h.fxFrame(1391.0) else h.dxyFrame(98.5))
+                    advanceTimeBy(1)
+                    assertEquals("F2-04b $topic $guard resolved=$resolved", resolved, h.released())
+                    assertEquals("F2-04b no delivery", received, h.store.snapshot.stateFor(topic).receiveGeneration)
+                    assertEquals("F2-04b prices unchanged", usdSeed(), h.shown().rates)
+                    assertEquals("F2-04b connection kept", TopicConnectionDisplay.OPEN, h.shown().connection)
+                }
+        last!!.cleanUp()
+    }
+
+    /** Empty, invalid and undesired prices do not resolve the wait. */
+    @Test
+    fun `F2-04 a frame with no usable price, or for a topic this session does not take, releases nothing`() = runTest {
+        val h = Harness(this)
+        seededOpen(h, usdSeed())
+        listOf(
+            h.emptyTetherFrame(),
+            h.tetherFrame(-1.0),
+            """{"type":"snapshot","version":1,"topic":"$JPY_TOPIC","data":{"banks":[
+               {"source":"kb","asset":"jpy-krw","rate":950.0,"timestamp":"2026-08-31T10:20:00+09:00"}]}}"""
+        ).forEach { frame ->
+            h.wire.deliver(frame)
+            advanceTimeBy(1)
+            assertEquals("F2-04 released by: $frame", false, h.released())
+        }
+        h.cleanUp()
+    }
+
+    /** Battery r1 (K08): the socket's index releases only once its reading is usable. */
+    @Test
+    fun `F2-04c a socket index with no usable reading releases nothing`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        seededOpen(h, usdSeed())
+        h.wire.deliver(h.dxyFrame(-1.0))
+        advanceTimeBy(1)
+        assertEquals("F2-04c an invalid index", false, h.released())
+        assertNull("F2-04c no index shown", h.shown().rates.dollarIndex)
+        assertEquals("F2-04c the connection stands", TopicConnectionDisplay.OPEN, h.shown().connection)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `F2-05 an acknowledgement the command accepted releases at once, whatever it accepted, and is no delivery`() = runTest {
+        val answers = listOf<Pair<String, (Harness) -> String>>(
+            "both accepted" to { it.ack("r1", active = listOf(TETHER, USD)) },
+            "nothing accepted" to { it.ack("r1", active = emptyList()) },
+            "only disabled" to { it.ack("r1", active = emptyList(), rejections = mapOf(TETHER to "topics_disabled", USD to "topics_disabled")) },
+            "all refused" to { it.ack("r1", active = emptyList(), rejections = mapOf(TETHER to "topic_unavailable", USD to "unknown_topic")) }
+        )
+        var last: Harness? = null
+        for ((name, answer) in answers) {
+            val h = Harness(this).also { last = it }
+            seededOpen(h, usdSeed())
+            h.wire.deliver(answer(h))
+            advanceTimeBy(1)
+            assertEquals("F2-05 [$name] acknowledged", 1, h.acknowledgements.size)
+            assertEquals("F2-05 [$name] released at once", true, h.released())
+            assertEquals("F2-05 [$name] owner kept", fence().identity, h.shown().owner?.identity)
+            assertEquals("F2-05 [$name] still a seed", true, h.shown().containsSeed)
+            assertEquals("F2-05 [$name] no tether delivery", 0L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+            assertEquals("F2-05 [$name] no USD delivery", 0L, h.store.snapshot.stateFor(USD).receiveGeneration)
+        }
+        last!!.cleanUp()
+    }
+
+    @Test
+    fun `F2-05b an acknowledgement the command did not take releases nothing`() = runTest {
+        val h = Harness(this)
+        seededOpen(h, usdSeed())
+        h.wire.deliver(h.ack("r9", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertEquals("F2-05b another request's answer", false, h.released())
+        val malformed = Json.encodeToString(
+            SubscriptionAck.serializer(),
+            SubscriptionAck(
+                requestId = "r1",
+                operation = "subscribe",
+                acceptedTopics = listOf(SubscriptionAckTopic(TETHER)),
+                rejectedTopics = emptyList(),
+                removedTopics = emptyList(),
+                activeSubscriptions = listOf(SubscriptionAckTopic(TETHER, "", 60L))
+            )
+        ).replace("""{"request_id""", """{"type":"subscription_ack","request_id""")
+        h.wire.deliver(malformed)
+        advanceTimeBy(1)
+        assertEquals("F2-05b a malformed lease", false, h.released())
+        assertTrue("F2-05b nothing acknowledged", h.acknowledgements.isEmpty())
+        // Past the ACK deadline and the silent cooldown the command has asked again as r2, so r1's answer is late.
+        advanceTimeBy(26_000)
+        assertEquals("fixture: asked again", listOf("r1", "r2"), h.requests.map { it.requestId })
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertEquals("F2-05b a late answer", false, h.released())
+        h.wire.deliver(h.ack("r2", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertEquals("F2-05b control: the current request's answer releases", true, h.released())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `F2-05c a premium refusal ends the owner first and is never shown as a release`() = runTest {
+        val h = Harness(this)
+        seededOpen(h, usdSeed())
+        var atRefusal: Boolean? = null
+        h.refusalSink = { _, _ -> atRefusal = h.released() }
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+        assertEquals("F2-05c not released when the refusal is handed over", false, atRefusal)
+        h.assertCleared("F2-05c refused")
+        assertEquals("F2-05c not released", false, h.released())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `F2-06 a classified request failure the command accepted releases at once and is published, changing no price`() = runTest {
+        val failures = listOf<Pair<String, com.jay.fxi.domain.model.TopicWholeRequestFailure>>(
+            "invalid_request" to com.jay.fxi.domain.model.TopicWholeRequestFailure.InvalidRequest,
+            "request_too_large" to com.jay.fxi.domain.model.TopicWholeRequestFailure.RequestTooLarge,
+            "temporarily_unavailable" to com.jay.fxi.domain.model.TopicWholeRequestFailure.TemporarilyUnavailable(5L),
+            "invalid_token" to com.jay.fxi.domain.model.TopicWholeRequestFailure.InvalidToken
+        )
+        var last: Harness? = null
+        for ((code, failure) in failures) {
+            val h = Harness(this).also { last = it }
+            // An invalid token's refresh is held, so its answer is seen before the refresh settles.
+            h.refreshGate = CompletableDeferred()
+            seededOpen(h, usdSeed())
+            h.wire.deliver("""{"type":"subscription_error","request_id":"r1","error":"$code","retry_after_seconds":5}""")
+            advanceTimeBy(1)
+            assertEquals("F2-06 [$code] released at once", true, h.released())
+            assertEquals("F2-06 [$code] the retry or replay has not gone out", 1, h.requests.size)
+            assertEquals("F2-06 [$code] seed price kept", 1395.0, h.shown().rates.quotes.values.single().rate, 0.0)
+            assertEquals("F2-06 [$code] still a seed", true, h.shown().containsSeed)
+            assertEquals("F2-06 [$code] no delivery", 0L, h.store.snapshot.stateFor(USD).receiveGeneration)
+            val published = h.topicStates.last()
+            assertEquals("F2-06 [$code] the failure is published", failure, published.wholeFailure)
+            assertEquals("F2-06 [$code] control failed is published", TopicControlState.FAILED, published.controlState)
+        }
+        last!!.cleanUp()
+    }
+
+    @Test
+    fun `F2-06b an invalid token is published as refreshing while its refresh runs, and as failed once it cannot recover`() = runTest {
+        val h = Harness(this)
+        h.refreshGate = CompletableDeferred()
+        seededOpen(h, usdSeed())
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: refresh held", 1, h.refreshCalls)
+        assertEquals("F2-06b released", true, h.released())
+        assertEquals("F2-06b refreshing is published", TopicAuthResolution.REFRESHING, h.topicStates.last().authResolution)
+        // The refresh produces nothing usable (`refreshed` stays null).
+        h.refreshGate!!.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("F2-06b failed once it cannot recover", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+        assertEquals("F2-06b the connection stands", TopicConnectionDisplay.OPEN, h.shown().connection)
+        assertEquals("F2-06b the release stays, and says nothing about authentication", true, h.released())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `F2-06c a failure the command did not take releases nothing`() = runTest {
+        val h = Harness(this)
+        seededOpen(h, usdSeed())
+        h.wire.deliver(h.subscriptionError("r9", "invalid_request"))
+        advanceTimeBy(1)
+        assertEquals("F2-06c another request's failure", false, h.released())
+        h.wire.deliver(h.subscriptionError("r1", "no_such_failure"))
+        advanceTimeBy(1)
+        assertEquals("F2-06c an unclassified failure", false, h.released())
+        assertNull("F2-06c nothing applied", h.store.snapshot.wholeFailure)
+        advanceTimeBy(26_000)
+        assertEquals("fixture: asked again", listOf("r1", "r2"), h.requests.map { it.requestId })
+        h.wire.deliver(h.subscriptionError("r1", "invalid_request"))
+        advanceTimeBy(1)
+        assertEquals("F2-06c a late failure", false, h.released())
+        assertNull("F2-06c still nothing applied", h.store.snapshot.wholeFailure)
+        h.wire.deliver(h.subscriptionError("r2", "invalid_request"))
+        advanceTimeBy(1)
+        assertEquals("F2-06c control: the current request's failure releases", true, h.released())
+        h.cleanUp()
+    }
+
+    /**
+     * The answer is collected after the connection that received it has ended: the frame is handed to the transport first, then the
+     * session goes offline before the frame's collector posts it, so it is read with the old generation.
+     */
+    @Test
+    fun `F2-07 an answer queued from a connection that has since ended releases nothing on the next`() = runTest {
+        val answers = listOf<Pair<String, (Harness) -> String>>(
+            "price" to { it.fxFrame(1391.0) },
+            "acknowledgement" to { it.ack("r1", active = listOf(TETHER, USD)) },
+            "failure" to { it.subscriptionError("r1", "invalid_request") }
+        )
+        var last: Harness? = null
+        for ((name, answer) in answers) {
+            val h = Harness(this).also { last = it }
+            seededOpen(h, usdSeed())
+            val first = h.wire
+            first.deliver(answer(h))
+            h.coordinator.setOnline(false)
+            advanceTimeBy(1)
+            assertTrue("fixture [$name]: going offline ended the first socket", first.cancelled)
+            assertEquals("F2-07 [$name] no release between rounds", false, h.released())
+            h.coordinator.setOnline(true)
+            advanceTimeBy(100)
+            assertEquals("fixture [$name]: a second socket", 2, h.wires.size)
+            h.wire.open()
+            advanceTimeBy(1)
+            assertEquals("F2-07 [$name] not released", false, h.released())
+            assertEquals("F2-07 [$name] seed price untouched", 1395.0, h.shown().rates.quotes.values.single().rate, 0.0)
+            assertEquals("F2-07 [$name] no delivery", 0L, h.store.snapshot.stateFor(USD).receiveGeneration)
+            assertTrue("F2-07 [$name] nothing acknowledged", h.acknowledgements.isEmpty())
+            assertNull("F2-07 [$name] no failure applied", h.store.snapshot.wholeFailure)
+        }
+        last!!.cleanUp()
+    }
+
+    @Test
+    fun `F2-08 identity loss, withheld use and expired leases end before an answer can release`() = runTest {
+        val lost = Harness(this)
+        seededOpen(lost, usdSeed())
+        lost.liveFence = AuthIdentityFence("u2", 1L)
+        lost.wire.deliver(lost.fxFrame(1391.0))
+        advanceTimeBy(1)
+        lost.assertCleared("F2-08 identity lost")
+        assertEquals("F2-08 identity lost: not released", false, lost.released())
+
+        val withheld = Harness(this)
+        val access = withheld.publishedAccess()
+        seededOpen(withheld, usdSeed())
+        // Not delivered as a revision yet: the frame's own check is what finds it.
+        access.hold()
+        val first = withheld.wire
+        first.deliver(withheld.fxFrame(1391.0))
+        advanceTimeBy(1)
+        assertTrue("fixture: the withheld use ended the socket", first.cancelled)
+        assertEquals("F2-08 withheld: a hold keeps the owner", fence().identity, withheld.shown().owner?.identity)
+        assertEquals("F2-08 withheld: not released", false, withheld.released())
+        advanceTimeBy(5_000)
+        assertEquals("F2-08 withheld: still not released", false, withheld.released())
+
+        val leaseAnswers = listOf<Pair<String, (Harness) -> String>>(
+            "price" to { it.fxFrame(1391.0) },
+            "acknowledgement" to { it.ack("r2", active = listOf(TETHER, USD)) },
+            "failure" to { it.subscriptionError("r2", "invalid_request") }
+        )
+        for ((name, answer) in leaseAnswers) {
+            val expired = Harness(this)
+            seededOpen(expired, usdSeed())
+            expired.wire.deliver(expired.ackWithLease("r1", TETHER, 15L))
+            advanceTimeBy(1)
+            assertEquals("fixture [$name]: the ACK released", true, expired.released())
+            assertEquals("fixture [$name]: renewal is pending", listOf("r1", "r2"),
+                expired.requests.map { it.requestId })
+
+            // Reach the absolute expiry without waking the relative expiry/renewal timers.
+            val deadline = expired.acknowledgements.single().acknowledgedAtMillis + 15_000
+            val socket = expired.wire
+            expired.clockAt(deadline)
+            socket.deliver(answer(expired))
+            advanceTimeBy(1)
+            assertTrue("F2-08 [$name] expiry ended the socket", socket.cancelled)
+            assertEquals("F2-08 [$name] no release after expiry", false, expired.released())
+            assertEquals("F2-08 [$name] no delivery", 0L, expired.store.snapshot.stateFor(USD).receiveGeneration)
+            assertEquals("F2-08 [$name] no second ACK applied", 1, expired.acknowledgements.size)
+            assertNull("F2-08 [$name] no failure applied", expired.store.snapshot.wholeFailure)
+            assertEquals("F2-08 [$name] prices unchanged", usdSeed(), expired.shown().rates)
+        }
+        withheld.cleanUp()
+    }
+
+    /** No socket is opened: the answer is the REST twin's, and the seed is shown before it is applied. */
+    @Test
+    fun `F2-09 an applied tether or FX bootstrap at the seed's time or older releases, without socket evidence`() = runTest {
+        val cases = listOf<Triple<String, TopicRates, (Harness) -> String>>(
+            Triple(USD, usdSeed(frameAt), { it.fxFrame(1391.0) }),
+            Triple(USD, usdSeed(afterFrames), { it.fxFrame(1391.0) }),
+            Triple(TETHER, seedOf(seedQuote("upbit", "usdt-krw", 1400.0, frameAt)), { it.tetherFrame(1390.0) }),
+            Triple(TETHER, seedOf(seedQuote("upbit", "usdt-krw", 1400.0, afterFrames)), { it.tetherFrame(1390.0) })
+        )
+        var last: Harness? = null
+        cases.forEachIndexed { i, (topic, seed, frame) ->
+            val h = Harness(this).also { last = it }
+            val seedGates = h.gatedSeeds(seed)
+            h.bootstrapGate = CompletableDeferred()
+            h.bootstrapOutcome = { _, t -> if (t == topic) h.delivered(frame(h)) else staged() }
+            h.goLive()
+            advanceTimeBy(1)
+            seedGates.single().complete(Unit)
+            advanceTimeBy(1)
+            assertEquals("fixture #$i: the seed is shown", true, h.shown().containsSeed)
+            assertEquals("fixture #$i: not released before the answer", false, h.released())
+            h.bootstrapGate!!.complete(Unit)
+            advanceTimeBy(1)
+            assertEquals("F2-09 #$i [$topic] released", true, h.released())
+            assertEquals("F2-09 #$i the seed's prices are what is shown", seed.quotes, h.shown().rates.quotes)
+            assertEquals("F2-09 #$i still a seed", true, h.shown().containsSeed)
+            assertEquals("F2-09 #$i no socket evidence", 0L, h.store.snapshot.stateFor(topic).receiveGeneration)
+            assertEquals("F2-09 #$i never opened", TopicConnectionDisplay.DISCONNECTED, h.shown().connection)
+        }
+        last!!.cleanUp()
+    }
+
+    /** The REST index releases only when it takes the slot, as iOS's strictly-newer apply does; the socket's index releases anyway (F2-03). */
+    @Test
+    fun `F2-10 a DXY bootstrap releases only when its valid index replaces the slot`() = runTest {
+        val dxyAt = { at: String -> TopicDollarIndex(98.0, Instant.parse(at), "investing") }
+        val valid = { h: Harness -> h.delivered(h.dxyFrame(98.5)) }
+        val cases = listOf<Triple<String, TopicDollarIndex?, Pair<(Harness) -> TopicSnapshotOutcome, Boolean>>>(
+            Triple("empty slot", null, valid to true),
+            Triple("held is older", dxyAt("2026-08-31T00:00:00Z"), valid to true),
+            Triple("held is the same time", dxyAt(frameAt), valid to false),
+            Triple("held is newer", dxyAt(afterFrames), valid to false),
+            Triple("invalid index", null, { h: Harness -> h.delivered(h.dxyFrame(-1.0)) } to false),
+            Triple("undelivered", null, { _: Harness -> staged() } to false)
+        )
+        var last: Harness? = null
+        for ((name, held, answer) in cases) {
+            val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY)).also { last = it }
+            // The tether seed is what keeps the banner relevant when the index slot starts empty.
+            val seedGates = h.gatedSeeds(seedOf(seedQuote("upbit", "usdt-krw", 1400.0, afterFrames), index = held))
+            h.bootstrapGate = CompletableDeferred()
+            h.bootstrapOutcome = { _, t -> if (t == TopicCatalogue.DXY) answer.first(h) else staged() }
+            h.goLive()
+            advanceTimeBy(1)
+            seedGates.single().complete(Unit)
+            advanceTimeBy(1)
+            assertEquals("fixture [$name]: not released before the answer", false, h.released())
+            h.bootstrapGate!!.complete(Unit)
+            advanceTimeBy(1)
+            assertEquals("F2-10 [$name]", answer.second, h.released())
+        }
+        last!!.cleanUp()
+    }
+
+    @Test
+    fun `F2-11 a bootstrap issued before a reconnection releases the round it is applied in, unless its grant, use or account moved`() = runTest {
+        // Applied after the connection it was issued beside has ended and the next attempt has begun.
+        val carried = Harness(this)
+        carried.restoreProvider = { granted -> TopicLastKnownRestore.Seed(usdSeed(), granted, TopicUseLifetime(granted.grant, 0L)) }
+        carried.bootstrapGate = CompletableDeferred()
+        carried.bootstrapOutcome = { _, t -> if (t == USD) carried.delivered(carried.fxFrame(1391.0)) else staged() }
+        carried.goLive()
+        advanceTimeBy(100)
+        carried.wire.drop()
+        advanceTimeBy(1_700)
+        assertEquals("fixture: the next attempt began", 2, carried.wires.size)
+        carried.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("F2-11 carried over a reconnection: released", true, carried.released())
+
+        // The grant moved before the answer: the old issue's answer is gated apart from the new grant's own.
+        val moved = Harness(this)
+        val oldIssues = CompletableDeferred<Unit>()
+        val newIssues = CompletableDeferred<Unit>()
+        var issuedBeforeMove = Int.MAX_VALUE
+        moved.bootstrapGateFor = { issue -> if (issue < issuedBeforeMove) oldIssues else newIssues }
+        moved.bootstrapOutcome = { _, t -> if (t == USD) moved.delivered(moved.fxFrame(1391.0)) else staged() }
+        moved.goLive()
+        advanceTimeBy(100)
+        issuedBeforeMove = moved.bootstrapCalls.size
+        assertTrue("fixture: the first grant issued", issuedBeforeMove > 0)
+        moved.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(1_700)
+        assertTrue("fixture: the new grant issued behind its own gate",
+            moved.bootstrapCalls.size > issuedBeforeMove)
+        oldIssues.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("F2-11 an earlier grant's answer: not released", false, moved.released())
+        newIssues.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("F2-11 control: the new grant's own answer releases", true, moved.released())
+
+        // The use was withheld and given back before the answer: its lifetime is spent.
+        val spent = Harness(this)
+        val access = spent.publishedAccess()
+        spent.bootstrapGate = CompletableDeferred()
+        spent.bootstrapOutcome = { _, t -> if (t == USD) spent.delivered(spent.fxFrame(1391.0)) else staged() }
+        spent.goLive()
+        advanceTimeBy(100)
+        access.flicker()
+        spent.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("F2-11 a spent use's answer: not released", false, spent.released())
+
+        // The account moved before the answer.
+        val other = Harness(this)
+        other.bootstrapGate = CompletableDeferred()
+        other.bootstrapOutcome = { _, t -> if (t == USD) other.delivered(other.fxFrame(1391.0)) else staged() }
+        other.goLive()
+        advanceTimeBy(100)
+        other.liveFence = AuthIdentityFence("u2", 1L)
+        other.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("F2-11 another account's answer: not released", false, other.released())
+        other.cleanUp()
+    }
+
+    @Test
+    fun `F2-12 a release ends with its connection and with every new attempt, one whose transport cannot be built included`() = runTest {
+        val dropped = Harness(this)
+        releasedOpen(dropped)
+        dropped.wire.drop()
+        advanceTimeBy(1)
+        assertEquals("F2-12 the connection ended: not released", false, dropped.released())
+        assertEquals("F2-12 the seed stays shown", true, dropped.shown().containsSeed)
+
+        val retried = Harness(this)
+        releasedWithoutSocket(retried)
+        retried.coordinator.retryConnection(checkNotNull(retried.shown().owner))
+        advanceTimeBy(1)
+        assertEquals("fixture: a new attempt", 7, retried.wires.size)
+        assertEquals("F2-12 a new attempt: not released", false, retried.released())
+
+        val unbuilt = Harness(this)
+        releasedWithoutSocket(unbuilt)
+        unbuilt.failNextConnect = true
+        val connects = unbuilt.connectCalls
+        unbuilt.coordinator.retryConnection(checkNotNull(unbuilt.shown().owner))
+        advanceTimeBy(1)
+        assertEquals("fixture: the attempt was made and its transport refused", connects + 1, unbuilt.connectCalls)
+        assertEquals("fixture: still no socket", 6, unbuilt.wires.size)
+        assertEquals("F2-12 an attempt whose transport failed: not released", false, unbuilt.released())
+        unbuilt.cleanUp()
+    }
+
+    @Test
+    fun `F2-12b a release without a socket ends when the use is held, and stays ended once it is released`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        releasedWithoutSocket(h)
+        access.hold()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals("F2-12b held: not released", false, h.released())
+        assertEquals("F2-12b held: owner kept", fence().identity, h.shown().owner?.identity)
+        assertEquals("F2-12b held: price kept", 1395.0, h.shown().rates.quotes.values.single().rate, 0.0)
+        access.release()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals("F2-12b given back: still not released", false, h.released())
+        assertEquals("F2-12b given back: owner kept", fence().identity, h.shown().owner?.identity)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `F2-12c a hold the deliverer missed still ends a release without a socket, and only a new answer releases again`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        releasedWithoutSocket(h)
+        access.flicker()
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals("F2-12c a missed hold: not released", false, h.released())
+        assertEquals("F2-12c owner kept", fence().identity, h.shown().owner?.identity)
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(1)
+        assertEquals("F2-12c a new answer releases", true, h.released())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `F2-12d a repeated revision, the same access, a capability-only hold and a tab change keep a release`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        releasedWithoutSocket(h)
+        repeat(2) { h.coordinator.accessRevised() }
+        advanceTimeBy(1)
+        assertEquals("F2-12d repeated revisions", true, h.released())
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        assertEquals("F2-12d the same access", true, h.released())
+        access.capabilityAllowed = false
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        assertEquals("F2-12d a capability-only hold", true, h.released())
+        h.coordinator.setFocus(fence().identity, FreeTab.JPY)
+        advanceTimeBy(1)
+        assertEquals("F2-12d a tab change", true, h.released())
+        h.cleanUp()
+    }
+
+    /** The lifetime is asked again whenever the display is published, not only when a revision arrives (impl review r1 ③). */
+    @Test
+    fun `F2-12e a spent use ends a release at the next published turn, before its revision arrives`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        releasedWithoutSocket(h)
+        access.flicker()
+        // The same Access: ignored by the session's dispatch, yet a turn whose display is published.
+        h.coordinator.setAccess(true, fence(), TopicGrantOrigin.NewContext)
+        advanceTimeBy(1)
+        assertEquals("F2-12e not released", false, h.released())
+        assertEquals("F2-12e owner kept", fence().identity, h.shown().owner?.identity)
+        assertEquals("F2-12e price kept", 1395.0, h.shown().rates.quotes.values.single().rate, 0.0)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `F2-13 a seed arriving after the release fills its slot and marks itself, and does not bring the banner back`() = runTest {
+        val tetherSeed = seedOf(seedQuote("upbit", "usdt-krw", 1400.0, afterFrames))
+        val paths = listOf<Pair<String, suspend TestScope.(Harness) -> Unit>>(
+            "price" to { h -> h.wire.open(); advanceTimeBy(1); h.wire.deliver(h.fxFrame(1391.0)) },
+            "acknowledgement" to { h -> h.wire.open(); advanceTimeBy(1); h.wire.deliver(h.ack("r1", active = listOf(TETHER, USD))) },
+            "failure" to { h -> h.wire.open(); advanceTimeBy(1); h.wire.deliver(h.subscriptionError("r1", "invalid_request")) },
+            "bootstrap" to { h -> h.bootstrapGate!!.complete(Unit) }
+        )
+        var last: Harness? = null
+        for ((name, answer) in paths) {
+            val h = Harness(this).also { last = it }
+            val seedGates = h.gatedSeeds(tetherSeed)
+            h.bootstrapGate = CompletableDeferred()
+            h.bootstrapOutcome = { _, t -> if (t == USD && name == "bootstrap") h.delivered(h.fxFrame(1391.0)) else staged() }
+            h.goLive()
+            advanceTimeBy(100)
+            answer(h)
+            advanceTimeBy(1)
+            assertEquals("fixture [$name]: released", true, h.released())
+            assertEquals("fixture [$name]: no seed yet", false, h.shown().containsSeed)
+            seedGates.single().complete(Unit)
+            advanceTimeBy(1)
+            assertEquals("F2-13 [$name] the seed fills tether", 1400.0,
+                h.shown().rates.quotes.values.single { it.source == "upbit" }.rate, 0.0)
+            assertEquals("F2-13 [$name] marked as a seed", true, h.shown().containsSeed)
+            assertEquals("F2-13 [$name] still released", true, h.released())
+        }
+        last!!.cleanUp()
+    }
+
+    @Test
+    fun `F2-15 an owner, grant or account boundary ends a release, with or without a socket`() = runTest {
+        val boundaries = listOf<Pair<String, (Harness) -> Unit>>(
+            "withdrawn and granted again" to { h ->
+                h.coordinator.setAccess(false, fence(), TopicGrantOrigin.NewContext)
+                h.setAccess(true, fence())
+            },
+            "another uid" to { h -> h.setAccess(true, fence(uid = "u2")) },
+            "another auth generation" to { h -> h.setAccess(true, fence(generation = 2L)) },
+            "another access epoch" to { h -> h.setAccess(true, fence(epoch = "epoch-2")) },
+            "a re-approved grant" to { h -> h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L))) },
+            "stopped" to { h -> h.coordinator.stop() }
+        )
+        var last: Harness? = null
+        for ((name, cross) in boundaries) {
+            val h = Harness(this).also { last = it }
+            releasedOpen(h)
+            cross(h)
+            advanceTimeBy(1)
+            assertEquals("F2-15 [$name] not released", false, h.released())
+        }
+        val socketless = Harness(this).also { last = it }
+        releasedWithoutSocket(socketless)
+        // The new grant issues its own plan; it answers nothing here, so only a carried-over release could show.
+        socketless.bootstrapOutcome = { _, _ -> staged() }
+        socketless.setAccess(true, fence(epoch = "epoch-2"))
+        advanceTimeBy(1)
+        assertEquals("F2-15 [another access epoch, no socket] not released", false, socketless.released())
+
+        // Battery r1 (K01·K30·K25): offline with no socket no new attempt follows the boundary, so only the boundary itself, or the
+        // owner it removes, can end the release.
+        val offlineBoundaries = listOf<Pair<String, (Harness) -> Unit>>(
+            "another access epoch" to { it.setAccess(true, fence(epoch = "epoch-2")) },
+            "withdrawn and granted again" to { h ->
+                h.coordinator.setAccess(false, fence(), TopicGrantOrigin.NewContext)
+                h.setAccess(true, fence())
+            },
+            "stopped" to { it.coordinator.stop() }
+        )
+        for ((name, cross) in offlineBoundaries) {
+            val h = Harness(this).also { last = it }
+            releasedWithoutSocket(h)
+            h.bootstrapOutcome = { _, _ -> staged() }
+            h.coordinator.setOnline(false)
+            advanceTimeBy(1)
+            assertEquals("fixture [$name]: going offline without a socket keeps the release", true, h.released())
+            cross(h)
+            advanceTimeBy(1)
+            assertEquals("F2-15 [$name, offline, no socket] not released", false, h.released())
+        }
+        // An identity loss observed with no socket: a REST answer is where it is seen, whatever that answer is.
+        val lost = Harness(this).also { last = it }
+        releasedWithoutSocket(lost)
+        lost.bootstrapOutcome = { _, _ -> staged() }
+        lost.liveFence = AuthIdentityFence("u2", 1L)
+        lost.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertNull("fixture: the identity loss was observed", lost.shown().owner)
+        assertEquals("F2-15 [identity lost, no socket] not released", false, lost.released())
+        last!!.cleanUp()
+    }
 }

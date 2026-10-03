@@ -43,7 +43,7 @@ internal object PremiumTopicPresenter {
         val dollarIndex = projection.dollarIndex.takeIf { tab == FreeTab.USD || tab == FreeTab.TETHER }
         val banner = when {
             display.connection == TopicConnectionDisplay.OFFLINE -> PremiumTopicBanner.OFFLINE
-            display.containsSeed -> PremiumTopicBanner.REFRESHING_CACHED
+            display.containsSeed && !display.cachedRefreshResolved -> PremiumTopicBanner.REFRESHING_CACHED
             else -> null
         }
         val lastUpdated = if (banner == null) null else {
