@@ -145,6 +145,8 @@ data class TopicCommandAcknowledgement(
     val accepted: Set<String>,
     val rejected: Map<String, TopicRejectionReason>,
     val leases: List<TopicLease>,
+    /** The same credential evidence used for this ACK's canonical authentication transition. */
+    val provesAuthentication: Boolean,
     /** A manual batch's sent topics neither active nor refused with a known reason. */
     val missing: Set<String> = emptySet()
 )
@@ -704,11 +706,12 @@ class TopicSubscribeCommand(
         // The same map the session reads for its refusal latch and hands over, so the premium exception and the refusals delivered
         // while a use is withheld are exactly these.
         val admittedAt = admit(rejected)
+        val authenticationProven = provesAuthentication(accepted, rejected)
         store.applyAck(
             activeTopics = active,
             rejections = rejected,
             sentTopics = pending.topics,
-            authResolved = provesAuthentication(accepted, rejected)
+            authResolved = authenticationProven
         )
         onAcknowledged(
             TopicCommandAcknowledgement(
@@ -716,6 +719,7 @@ class TopicSubscribeCommand(
                 accepted = accepted,
                 rejected = rejected,
                 leases = answer.leases,
+                provesAuthentication = authenticationProven,
                 missing = pending.manualTopics - active - rejected.keys
             )
         )

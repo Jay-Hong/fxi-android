@@ -32,6 +32,7 @@ import com.jay.fxi.domain.model.TopicSubscriptionSnapshot
 import com.jay.fxi.domain.model.TopicSubscriptionState
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import com.jay.fxi.domain.model.TopicWholeRequestDecision
+import com.jay.fxi.domain.model.TopicWholeRequestFailure
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -569,9 +570,14 @@ class TopicSessionCoordinator(
          */
         var revalidationOwner: Long? = null
 
-        /** Starts that stood aside for [controlOwner], resumed when it lets go. */
+        /** A renewal that stood aside for [controlOwner], resumed when it lets go. */
         var renewalDeferred = false
+
+        /** An automatic question owing a lane wake; a held question awaiting authentication keeps this false. */
         var revalidationDeferred = false
+
+        /** An actual D14 question not yet registered; FAILED waits for a proving ACK, without blocking recovery. */
+        var heldSilenceQuestion: HeldSilenceQuestion? = null
 
         /** Unregistered manual intent; the registered command's targets never grow. */
         val manualPending = linkedSetOf<String>()
@@ -599,6 +605,11 @@ class TopicSessionCoordinator(
         var connectDueAtMillis = 0L
         var pongDueAtMillis: Long? = null
     }
+
+    private class HeldSilenceQuestion(
+        val windowMillis: Long,
+        var awaitingAuthenticationAck: Boolean
+    )
 
     private class RunningCommand(
         val command: TopicSubscribeCommand,
@@ -923,6 +934,7 @@ class TopicSessionCoordinator(
         displayPublicationDeferred = true
         try {
             dispatch(input)
+            connection?.let { currentHeldSilenceQuestion(it) }
         } finally {
             displayPublicationDeferred = false
         }
@@ -1159,6 +1171,7 @@ class TopicSessionCoordinator(
                 if (authEnd != null && running != null) {
                     recordAuthEnded(live, input.commandId, running, authEnd, ownsRevalidation, manualTargets)
                 }
+                wakeHeldSilenceQuestion(live)
                 reconsiderRecovery(live)
             }
 
@@ -1183,6 +1196,7 @@ class TopicSessionCoordinator(
                 // A credential recovery is such a reason, and only for an authentication ending
                 // (L-4e E6b): this is where the ended command has left, so a recovery that already
                 // arrived may reopen it now. It creates no recovery and no budget.
+                wakeHeldSilenceQuestion(live)
                 reconsiderRecovery(live)
             }
 
@@ -1864,21 +1878,9 @@ class TopicSessionCoordinator(
             }
             if (live.manualOwners[topic] == commandId) live.manualOwners.remove(topic)
         }
-        // D14 can spend its window while this batch owns tether, even without a receipt after registration. Resume a remaining
-        // suspect question through the lane after releasing ownership, so a waiting renewal goes first. A target the batch
-        // already degraded does not pass the suspect guard.
-        val tether = TopicCatalogue.TETHER
-        val entry = manual.entryReceiveGeneration[tether]
-        val state = store.snapshot.stateFor(tether)
-        if (
-            entry != null &&
-            state.desired && state.confirmed && state.rejection == null &&
-            state.deliveryState == TopicDeliveryState.SUSPECT &&
-            live.manualOwners[tether] == null && live.revalidationOwner == null
-        ) {
-            live.revalidationDeferred = true
-            post(SessionInput.ControlLaneFree(live.generation))
-        }
+        // D14 can spend its window while this batch owns tether, even without a receipt after registration (B2-32).
+        // Wake that same question after releasing ownership; a new, unexpired window does not recreate the old one.
+        if (TopicCatalogue.TETHER in manual.entryReceiveGeneration) wakeHeldSilenceQuestion(live)
     }
 
     private fun subscribe(live: Connection) {
@@ -1999,6 +2001,9 @@ class TopicSessionCoordinator(
                 store.snapshot.stateFor(TopicCatalogue.TETHER).receiveGeneration <= it.entryReceiveGeneration.getValue(TopicCatalogue.TETHER)
         } == true
         if (takesManualTetherDelivery) live.revalidationOwner = null
+        // Registration hands off delivery, not merely a manual target's subscribe (B2-40). Authentication endings from here
+        // belong to the registered command's existing record; they must not also leave an unregistered D14 question.
+        if (revalidates || takesManualTetherDelivery) clearHeldSilenceQuestion(live)
         live.authEnded.values.forEach { record ->
             if (running.takesFirstDelivery) record.firstDeliveryRequired = false
             if (running.takesRenewal) record.renewalRequired = false
@@ -2092,6 +2097,14 @@ class TopicSessionCoordinator(
         current(live.generation)?.let { still -> applyLeases(still, ack) }
         live.commands[commandId]?.manual?.let { applyManualAcknowledgement(live, commandId, it, ack) }
         live.authEnded.values.removeAll { it.settled }
+        if (current(live.generation) === live) {
+            currentHeldSilenceQuestion(live)?.let { question ->
+                if (ack.provesAuthentication) question.awaitingAuthenticationAck = false
+            }
+            // The lane was released before these flags could be set. Post an explicit wake after refusal, leases and manual
+            // bookkeeping; registration stays in ControlLaneFree's renewal -> revalidation -> recovery -> manual order.
+            wakeHeldSilenceQuestion(live)
+        }
         resolveCachedRefresh(live.lifetime)
         // Reported before the two observers below (L-4e E4a): the refusal is settled and its leases handled, and an observer that
         // throws must not keep the grant's refusal from the issuer. `live.fence`, not the session's current one: the refusal
@@ -2106,6 +2119,13 @@ class TopicSessionCoordinator(
 
     /** The command has applied a classified server failure, including any synchronous refresh transition. */
     private fun onClassifiedFailure(live: Connection) {
+        // The callback may already see REFRESHING: InvalidToken passed through FAILED before beginAuthRefresh. A question
+        // already waiting then needs an ACK even if that refresh later writes RESOLVED. A D14 raised during the refresh is
+        // a later question and keeps the existing manual-ending rule (B2-32).
+        if (store.snapshot.wholeFailure == TopicWholeRequestFailure.InvalidToken) {
+            live.heldSilenceQuestion?.awaitingAuthenticationAck = true
+            if (live.heldSilenceQuestion != null) live.revalidationDeferred = false
+        }
         resolveCachedRefresh(live.lifetime)
         publishState()
     }
@@ -2481,6 +2501,8 @@ class TopicSessionCoordinator(
         if (evidence == TopicSilenceEvidence.TETHER_DELIVERY) tetherDelivered = true
         val arming = TopicSilencePolicy.armAfter(evidence, receivedAtMillis)
         if (arming !is TopicSilenceArming.ArmAt) return
+        // A validated tether delivery replaces this question's window on either path, including REST without recordFrame.
+        connection?.let { clearHeldSilenceQuestion(it) }
         silenceArmedUntilMillis = arming.millis
         armSilenceTimer(arming.millis)
     }
@@ -2528,12 +2550,73 @@ class TopicSessionCoordinator(
         if (decision.spendsWindow) silenceHandledWindowMillis = silenceArmedUntilMillis
         if (decision is TopicSilenceDecision.Revalidate && live != null) {
             store.markSuspect(TopicCatalogue.TETHER)
+            val snapshot = store.snapshot
+            val tether = snapshot.stateFor(TopicCatalogue.TETHER)
+            if (
+                TopicCatalogue.TETHER in desired && tether.desired && tether.confirmed &&
+                tether.deliveryState == TopicDeliveryState.SUSPECT
+            ) {
+                live.heldSilenceQuestion = HeldSilenceQuestion(
+                    windowMillis = checkNotNull(silenceArmedUntilMillis),
+                    awaitingAuthenticationAck = snapshot.authResolution == TopicAuthResolution.FAILED
+                )
+            }
             startRevalidation(live)
         }
     }
 
+    private fun clearHeldSilenceQuestion(live: Connection) {
+        if (live.heldSilenceQuestion == null) return
+        live.heldSilenceQuestion = null
+        live.revalidationDeferred = false
+    }
+
+    /** Subscription loss or a replaced window settles the question permanently, before any later ACK can reopen it. */
+    private fun currentHeldSilenceQuestion(live: Connection): HeldSilenceQuestion? {
+        val question = live.heldSilenceQuestion ?: return null
+        val snapshot = store.snapshot
+        val tether = snapshot.stateFor(TopicCatalogue.TETHER)
+        if (
+            question.windowMillis != silenceArmedUntilMillis || question.windowMillis != silenceHandledWindowMillis ||
+            TopicCatalogue.TETHER !in desired || !tether.desired || !tether.confirmed ||
+            tether.deliveryState != TopicDeliveryState.SUSPECT
+        ) {
+            clearHeldSilenceQuestion(live)
+            return null
+        }
+        if (snapshot.authResolution == TopicAuthResolution.FAILED) {
+            question.awaitingAuthenticationAck = true
+            live.revalidationDeferred = false
+        }
+        return question
+    }
+
+    private fun heldSilenceQuestionReady(live: Connection): Boolean {
+        val question = currentHeldSilenceQuestion(live) ?: return false
+        return !question.awaitingAuthenticationAck && store.snapshot.authResolution == TopicAuthResolution.RESOLVED &&
+            live.manualOwners[TopicCatalogue.TETHER] == null
+    }
+
+    /** Only readiness reserves lane priority. FAILED and manual delivery ownership leave recovery and manual work unblocked. */
+    private fun wakeHeldSilenceQuestion(live: Connection) {
+        if (current(live.generation) !== live || live.heldSilenceQuestion == null) return
+        live.revalidationDeferred = heldSilenceQuestionReady(live)
+        if (live.revalidationDeferred) post(SessionInput.ControlLaneFree(live.generation))
+    }
+
     /** D14's quiet question: tether only, and only if the store agrees to start one. */
     private fun startRevalidation(live: Connection) {
+        if (live.heldSilenceQuestion != null) {
+            // Reuse the start boundary that checks this connection, grant, live identity, original lifetime and hard expiry.
+            if (!manualAdmitted(live, grantEpoch)) {
+                clearHeldSilenceQuestion(live)
+                return
+            }
+            if (!heldSilenceQuestionReady(live)) {
+                live.revalidationDeferred = false
+                return
+            }
+        }
         // Both direct and deferred starts pass here: a question that stood aside for the
         // request channel is resumed from `ControlLaneFree`, and the credential can have failed
         // while it waited.
@@ -2547,6 +2630,12 @@ class TopicSessionCoordinator(
         }
         if (live.controlOwner != null) {
             live.revalidationDeferred = true
+            return
+        }
+        if (live.heldSilenceQuestion != null && live.renewalDeferred) {
+            // A SilenceDue can precede the queued lane wake after its owner leaves. Preserve the waiting renewal's priority.
+            live.revalidationDeferred = true
+            post(SessionInput.ControlLaneFree(live.generation))
             return
         }
         live.revalidationDeferred = false
@@ -2762,8 +2851,8 @@ class TopicSessionCoordinator(
         // ahead of that queued input. Without the two flags here, a reopen registered
         // now takes the lane and the renewal that was waiting first is deferred again, inverting
         // the order the `ControlLaneFree` handler was written to keep (L-4e E6c). Neither flag can
-        // stand with a free lane for long: both are set only under `controlOwner != null`, and the
-        // owner's release posts the input that clears them.
+        // stand with a free lane for long: a ready held D14 question posts its own wake, and a start
+        // waiting for controlOwner is woken by the owner's release.
         if (live.controlOwner != null || live.renewalDeferred || live.revalidationDeferred) {
             live.recoveryReopenDeferred = true
             return
@@ -2883,6 +2972,7 @@ class TopicSessionCoordinator(
     private fun end(live: Connection, cause: TopicDisconnectCause) {
         if (live.ended) return
         live.ended = true
+        clearHeldSilenceQuestion(live)
         live.manualPending.clear()
         live.manualOwners.clear()
         resetCachedRefresh()

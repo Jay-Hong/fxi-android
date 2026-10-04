@@ -13364,4 +13364,530 @@ class TopicSessionCoordinatorTest {
         assertEquals("B2-49 once", 6, h.requests.size)
         h.cleanUp()
     }
+
+    // ---- R4-c D14 held question (Claude-owned contract; R4c/C2b/d14held_design_codex.r1.md, agreed in d14held_contract.r1): a D14
+    // question that a failed credential refused to start is kept on its connection, not dropped, and asked once — in the lane's order —
+    // after an answer that proves the credential. A recovery signal alone proves nothing, and neither does a state a refresh resolved
+    // without an answer. A refusal of tether cancels the kept question; a batch that takes over tether's delivery answers it. The
+    // implementation reads but does not edit these rows. ----
+
+    /** Tether spoke, its renewal was refused for its credential, and the silence then ran out: a question kept under a failed credential. */
+    private suspend fun TestScope.heldUnderFailedCredential(h: Harness) {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val frameAt = testScheduler.currentTime
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLease("r1", TETHER, 120L))
+        advanceTimeBy(1)
+        assertEquals("fixture: the renewal is in flight", 2, h.requests.size)
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: authentication failed", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+        advanceTimeBy(frameAt + com.jay.fxi.domain.model.TopicSilencePolicy.SILENCE_WINDOW.inWholeMilliseconds - testScheduler.currentTime)
+        advanceTimeBy(1)
+        assertEquals("fixture: the silence marked tether suspect", TopicDeliveryState.SUSPECT, h.stateOf(TETHER).deliveryState)
+        assertEquals("fixture: and asked nothing under the failed credential", 2, h.requests.size)
+    }
+
+    @Test
+    fun `D14H-01 a question kept under a failed credential is asked once a proving answer arrives, not on the recovery signal alone`() = runTest {
+        val h = Harness(this)
+        heldUnderFailedCredential(h)
+        h.recover(1)
+        advanceTimeBy(1)
+        assertEquals("fixture: the recovery reopened the renewal", 3, h.requests.size)
+        assertEquals("D14H-01 the renewal alone", listOf(TETHER), h.requests.last().topics)
+        assertEquals("D14H-01 no question before an answer proves the credential", TopicDeliveryState.SUSPECT,
+            h.stateOf(TETHER).deliveryState)
+        h.recover(1)
+        h.recover(2)
+        advanceTimeBy(1)
+        assertEquals("D14H-01 a repeated recovery signal asks nothing", 3, h.requests.size)
+        h.wire.deliver(h.ackWithLeases("r3", Triple(TETHER, "L2", 900L)))
+        advanceTimeBy(1)
+        assertEquals("D14H-01 the proving answer brings the kept question", 4, h.requests.size)
+        assertEquals("D14H-01 a tether revalidation", listOf(TETHER), h.requests.last().topics)
+        assertEquals("D14H-01 revalidating", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        h.wire.deliver(h.ack("r4", active = listOf(TETHER)))
+        advanceTimeBy(1)
+        advanceTimeBy(45_100)
+        assertEquals("D14H-01 its silence degrades as any revalidation's", TopicDeliveryState.DEGRADED, h.stateOf(TETHER).deliveryState)
+        assertEquals("D14H-01 asked once", 4, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** The question that waited for the lane when the credential failed (the regression above) is kept, and asked after the proof. */
+    @Test
+    fun `D14H-02 a question waiting for the lane when the credential failed is kept and asked after the proving answer`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        // 220 − 180: the renewal goes out at forty seconds and holds the lane when the silence runs out at forty-five.
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 220L)))
+        advanceTimeBy(1)
+        advanceTimeBy(40_100)
+        assertEquals("fixture: the renewal went", 2, h.requests.size)
+        advanceTimeBy(5_000)
+        assertEquals("fixture: the question waits for the lane", 2, h.requests.size)
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: authentication failed", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+        assertEquals("D14H-02 nothing asked under the failed credential", 2, h.requests.size)
+        h.recover(1)
+        advanceTimeBy(1)
+        assertEquals("D14H-02 the renewal goes first", listOf(TETHER), h.requests.last().topics)
+        assertEquals("D14H-02 and alone", 3, h.requests.size)
+        h.wire.deliver(h.ackWithLeases("r3", Triple(TETHER, "L2", 900L)))
+        advanceTimeBy(1)
+        assertEquals("D14H-02 the kept question after the proving answer", 4, h.requests.size)
+        assertEquals("D14H-02 revalidating", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `D14H-03 a proving answer to another command brings the kept question`() = runTest {
+        val h = Harness(this)
+        heldUnderFailedCredential(h)
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: a dollar batch went out", setOf(USD), h.lastTopics())
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertEquals("D14H-03 the kept question after the batch's proving answer", 4, h.requests.size)
+        assertEquals("D14H-03 a tether revalidation", listOf(TETHER), h.requests.last().topics)
+        assertEquals("D14H-03 revalidating", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `D14H-04 an answer that proves nothing brings nothing, and a refusal of tether cancels the kept question`() = runTest {
+        // A disabled-only answer proves nothing.
+        val unproved = Harness(this)
+        heldUnderFailedCredential(unproved)
+        unproved.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        // Tether stays active on the connection, so the answer leaves its question standing; only the sent topic is refused.
+        unproved.wire.deliver(unproved.ack(unproved.requests.last().requestId, active = listOf(TETHER),
+            rejections = mapOf(USD to "topics_disabled")))
+        advanceTimeBy(1)
+        assertEquals("fixture: a disabled-only answer proves nothing", TopicAuthResolution.FAILED,
+            unproved.store.snapshot.authResolution)
+        assertTrue("fixture: tether still confirmed", unproved.stateOf(TETHER).confirmed)
+        assertEquals("fixture: tether still suspect", TopicDeliveryState.SUSPECT, unproved.stateOf(TETHER).deliveryState)
+        advanceTimeBy(100)
+        assertEquals("D14H-04 nothing asked", 3, unproved.requests.size)
+
+        // The recovery reopens the renewal and its answer refuses tether; a later proving answer asks nothing for tether.
+        val refused = Harness(this)
+        heldUnderFailedCredential(refused)
+        refused.recover(1)
+        advanceTimeBy(1)
+        assertEquals("fixture: the renewal reopened", 3, refused.requests.size)
+        refused.wire.deliver(refused.ack("r3", active = emptyList(), rejections = mapOf(TETHER to "topics_disabled")))
+        advanceTimeBy(1)
+        assertEquals("fixture: tether refused", TopicRejectionReason.TOPICS_DISABLED, refused.stateOf(TETHER).rejection)
+        refused.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: a dollar batch went out", setOf(USD), refused.lastTopics())
+        refused.wire.deliver(refused.ack(refused.requests.last().requestId, active = listOf(USD)))
+        advanceTimeBy(1)
+        assertEquals("fixture: that answer proved the credential", TopicAuthResolution.RESOLVED, refused.store.snapshot.authResolution)
+        advanceTimeBy(100)
+        assertEquals("D14H-04 the refused tether's question is gone", 4, refused.requests.size)
+        refused.cleanUp()
+    }
+
+    @Test
+    fun `D14H-05 a state a refresh resolved without an answer does not bring the kept question`() = runTest {
+        val h = Harness(this)
+        heldUnderFailedCredential(h)
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: the refresh resolved the state, no answer yet", TopicAuthResolution.RESOLVED,
+            h.store.snapshot.authResolution)
+        assertEquals("fixture: the replay went out", 4, h.requests.size)
+        // The replay ends without any answer that proves the credential; the lane is free.
+        h.wire.deliver(h.subscriptionError("r4", "invalid_request"))
+        advanceTimeBy(1)
+        advanceTimeBy(100)
+        assertEquals("D14H-05 the kept question still waits for a proving answer", 4, h.requests.size)
+        assertEquals("D14H-05 tether still suspect", TopicDeliveryState.SUSPECT, h.stateOf(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `D14H-06 a batch that takes over tether's delivery answers the kept question, and nothing is asked after it`() = runTest {
+        val h = Harness(this)
+        heldUnderFailedCredential(h)
+        assertTrue("fixture: tether can be retried by hand", TETHER in h.store.snapshot.manualRetryTopics)
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: a tether batch went out", setOf(TETHER), h.lastTopics())
+        assertEquals("fixture: the batch moved suspect to revalidating", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertEquals("D14H-06 the proving answer brings no second question beside the batch", 3, h.requests.size)
+        advanceTimeBy(45_100)
+        assertEquals("D14H-06 the batch's silence degrades tether", TopicDeliveryState.DEGRADED, h.stateOf(TETHER).deliveryState)
+        advanceTimeBy(1_000)
+        assertEquals("D14H-06 and nothing is asked after it", 3, h.requests.size)
+        h.cleanUp()
+    }
+
+    /**
+     * A valid tether REST answer while the question is kept arms a new window without a socket receipt; the proving answer then asks
+     * nothing until that window runs out, and the window asks its own question once.
+     */
+    @Test
+    fun `D14H-07 a valid tether REST answer while the question is kept re-arms the window, and the proving answer asks nothing before it runs out`() = runTest {
+        val h = Harness(this)
+        heldUnderFailedCredential(h)
+        val received = h.store.snapshot.stateFor(TETHER).receiveGeneration
+        h.bootstrapOutcome = { _, _ -> h.delivered(h.tetherFrame(1391.0, timestamp = "2026-08-31T10:21:00+09:00")) }
+        val restAt = testScheduler.currentTime
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: the REST answer was applied", 1391.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+        assertEquals("fixture: not counted as a socket receipt", received, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        assertEquals("fixture: tether still suspect", TopicDeliveryState.SUSPECT, h.stateOf(TETHER).deliveryState)
+        assertEquals("fixture: nothing asked", 2, h.requests.size)
+        h.recover(1)
+        advanceTimeBy(1)
+        assertEquals("fixture: the recovery reopened the renewal alone", 3, h.requests.size)
+        h.wire.deliver(h.ackWithLeases("r3", Triple(TETHER, "L2", 900L)))
+        advanceTimeBy(1)
+        assertEquals("fixture: that answer proved the credential", TopicAuthResolution.RESOLVED, h.store.snapshot.authResolution)
+        val window = com.jay.fxi.domain.model.TopicSilencePolicy.SILENCE_WINDOW.inWholeMilliseconds
+        advanceTimeBy(restAt + window - 100 - testScheduler.currentTime)
+        assertEquals("D14H-07 the REST answer's window took the kept question's place", 3, h.requests.size)
+        advanceTimeBy(200)
+        assertEquals("D14H-07 the new window asks its own question", 4, h.requests.size)
+        assertEquals("D14H-07 a tether revalidation", listOf(TETHER), h.requests.last().topics)
+        advanceTimeBy(1_000)
+        assertEquals("D14H-07 once", 4, h.requests.size)
+        h.cleanUp()
+    }
+
+    /** After a refresh resolved the state, an answer that proves nothing still brings nothing: the proof is the answer's, not the state's. */
+    @Test
+    fun `D14H-08 after a refresh resolved the state, an answer that proves nothing does not bring the kept question`() = runTest {
+        val h = Harness(this)
+        heldUnderFailedCredential(h)
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: the refresh resolved the state", TopicAuthResolution.RESOLVED, h.store.snapshot.authResolution)
+        assertEquals("fixture: the replay went out", 4, h.requests.size)
+        // Tether stays active on the connection; only the sent topic is refused, so nothing in this answer proves the credential.
+        h.wire.deliver(h.ack("r4", active = listOf(TETHER), rejections = mapOf(USD to "topics_disabled")))
+        advanceTimeBy(1)
+        assertEquals("fixture: the replay was answered", TopicRejectionReason.TOPICS_DISABLED, h.stateOf(USD).rejection)
+        assertTrue("fixture: tether still confirmed", h.stateOf(TETHER).confirmed)
+        advanceTimeBy(100)
+        assertEquals("D14H-08 nothing asked for tether", 4, h.requests.size)
+        assertEquals("D14H-08 tether still suspect", TopicDeliveryState.SUSPECT, h.stateOf(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    /**
+     * A question waiting for the lane when the credential failed waits for a proving answer even when the refresh resolves the state at
+     * once: the replay ending without an answer brings nothing.
+     */
+    @Test
+    fun `D14H-09 a waiting question that met an invalid token waits for a proving answer though the refresh resolved the state`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        // 220 − 180: the renewal goes out at forty seconds and holds the lane when the silence runs out at forty-five.
+        h.wire.deliver(h.ackWithLeases("r1", Triple(TETHER, "L1", 220L)))
+        advanceTimeBy(1)
+        advanceTimeBy(40_100)
+        assertEquals("fixture: the renewal went", 2, h.requests.size)
+        advanceTimeBy(5_000)
+        assertEquals("fixture: the question waits for the lane", 2, h.requests.size)
+        assertEquals("fixture: tether suspect", TopicDeliveryState.SUSPECT, h.stateOf(TETHER).deliveryState)
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: the refresh resolved the state", TopicAuthResolution.RESOLVED, h.store.snapshot.authResolution)
+        assertEquals("fixture: the replay went out", 3, h.requests.size)
+        assertEquals("fixture: the replay is the renewal", listOf(TETHER), h.requests.last().topics)
+        h.wire.deliver(h.subscriptionError("r3", "invalid_request"))
+        advanceTimeBy(1)
+        advanceTimeBy(100)
+        assertEquals("D14H-09 nothing asked after the replay ended without an answer", 3, h.requests.size)
+        assertEquals("D14H-09 tether still suspect", TopicDeliveryState.SUSPECT, h.stateOf(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    /**
+     * An authority withdrawn after the proving answer is found when the kept question starts: the connection ends there, and the
+     * question is never registered (R4c/C2b/d14held_contract.r3/review_codex.md, D14).
+     */
+    @Test
+    fun `D14H-10 an authority withdrawn after the proving answer is found at the kept question's start, and nothing is registered`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        heldUnderFailedCredential(h)
+        h.recover(1)
+        advanceTimeBy(1)
+        assertEquals("fixture: the recovery reopened the renewal", 3, h.requests.size)
+        val wire = h.wire
+        val published = h.topicStates.size
+        var withheld = false
+        h.onTopicStatePublished = { snapshot ->
+            if (snapshot.controlState == TopicControlState.ACKNOWLEDGED &&
+                snapshot.authResolution == TopicAuthResolution.RESOLVED) {
+                h.onTopicStatePublished = null
+                withheld = true
+                access.hold() // No AccessRevised: only a start that asks again can see it.
+            }
+        }
+        wire.deliver(h.ackWithLeases("r3", Triple(TETHER, "L2", 900L)))
+        advanceTimeBy(1)
+        assertTrue("fixture: the authority was withdrawn at the proving answer", withheld)
+        assertTrue("D14H-10 the connection ended at the start", wire.cancelled)
+        assertTrue(
+            "D14H-10 the kept question was never registered",
+            h.topicStates.drop(published).none { it.stateFor(TETHER).deliveryState == TopicDeliveryState.REVALIDATING }
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * A kept question found by a foreground evaluation between the lane's release and its wake does not jump the renewal that was
+     * waiting for that lane (review_codex.md, D15).
+     */
+    @Test
+    fun `D14H-11 a kept question found on foreground before the lane's wake does not jump a waiting renewal`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackOf("r1", leases = listOf(Triple(TETHER, "L1", 240L)), rejections = mapOf(USD to "topics_disabled")))
+        advanceTimeBy(1)
+        val manualAt = testScheduler.currentTime
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("fixture: a dollar batch went out", setOf(USD), h.lastTopics())
+        // The batch gets no answer and ends after its three attempts, 20 + 5 + 20 + 5 + 20 seconds on.
+        advanceTimeBy(manualAt + 30_000 - testScheduler.currentTime)
+        val frameAt = testScheduler.currentTime
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        var posted = false
+        h.onTopicStatePublished = { snapshot ->
+            if (snapshot.controlState == TopicControlState.FAILED && snapshot.wholeFailure == null &&
+                snapshot.stateFor(USD).deliveryState == TopicDeliveryState.DEGRADED) {
+                h.onTopicStatePublished = null
+                posted = true
+                h.clockAt(frameAt + com.jay.fxi.domain.model.TopicSilencePolicy.SILENCE_WINDOW.inWholeMilliseconds)
+                h.coordinator.setForeground(true)
+            }
+        }
+        // The lease's renewal fell due at sixty seconds behind the batch; the batch ends at seventy.
+        advanceTimeBy(manualAt + 70_001 - testScheduler.currentTime)
+        assertTrue("fixture: the foreground was posted at the batch ending", posted)
+        assertEquals("fixture: three dollar attempts, then one more", 5, h.requests.size)
+        assertEquals("D14H-11 the renewal goes first", listOf(TETHER), h.requests.last().topics)
+        assertEquals("D14H-11 the question waits behind it", TopicDeliveryState.SUSPECT, h.stateOf(TETHER).deliveryState)
+        h.wire.deliver(h.ackWithLeases("r5", Triple(TETHER, "L2", 900L)))
+        advanceTimeBy(1)
+        assertEquals("D14H-11 the kept question follows the renewal", 6, h.requests.size)
+        assertEquals("D14H-11 revalidating", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    /**
+     * A question raised while a renewal's refresh was in flight, on a renewal that then runs out of attempts: it is woken when the
+     * command finishes, so an input queued behind that ending does not overtake it (review_codex.md, D18).
+     */
+    @Test
+    fun `D14H-12 a question raised during a renewal's refresh is woken when the renewal finishes, ahead of an input queued behind it`() = runTest {
+        val h = Harness(this)
+        val gate = CompletableDeferred<Unit>()
+        raisedDuringRenewalRefresh(h, gate)
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the replay went out", 3, h.requests.size)
+        val replayAt = testScheduler.currentTime
+        val published = h.topicStates.size
+        var offline = false
+        h.onTopicStatePublished = { snapshot ->
+            if (snapshot.controlState == TopicControlState.FAILED && snapshot.wholeFailure == null) {
+                h.onTopicStatePublished = null
+                offline = true
+                h.coordinator.setOnline(false)
+            }
+        }
+        // The replay and its last attempt get no answer: the renewal's budget runs out 20 + 5 + 20 seconds after the replay.
+        advanceTimeBy(replayAt + 45_100 - testScheduler.currentTime)
+        assertTrue("fixture: offline was posted at the renewal's ending", offline)
+        assertTrue(
+            "D14H-12 the question was registered before offline",
+            h.topicStates.drop(published).any { it.stateFor(TETHER).deliveryState == TopicDeliveryState.REVALIDATING }
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * The same question when the renewal's replay is cancelled at its start: there is no finishing result, and the command's ending
+     * alone wakes it (review_codex.md, D24).
+     */
+    @Test
+    fun `D14H-13 a question raised during a renewal's refresh is woken when a cancelled replay leaves without a result`() = runTest {
+        val h = Harness(this)
+        val gate = CompletableDeferred<Unit>()
+        raisedDuringRenewalRefresh(h, gate)
+        var cancelled = false
+        h.onTopicStatePublished = { snapshot ->
+            if (snapshot.controlState == TopicControlState.PENDING &&
+                snapshot.authResolution == TopicAuthResolution.RESOLVED) {
+                h.onTopicStatePublished = null
+                cancelled = true
+                throw kotlinx.coroutines.CancellationException("cancel the replay at its request start")
+            }
+        }
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        advanceTimeBy(100)
+        assertTrue("fixture: the replay was cancelled at its start", cancelled)
+        assertEquals("D14H-13 the kept question was asked", 3, h.requests.size)
+        assertEquals("D14H-13 a tether revalidation", listOf(TETHER), h.requests.last().topics)
+        assertEquals("D14H-13 revalidating", TopicDeliveryState.REVALIDATING, h.stateOf(TETHER).deliveryState)
+        h.cleanUp()
+    }
+
+    /**
+     * A kept question that is not ready does not reserve the lane: a recovery queued at the answer's admission resumes the batch
+     * ended on its credential before an offline queued with it. Ownership by a manual tether batch is one such not-ready question
+     * (review_codex.md, D05).
+     */
+    @Test
+    fun `D14H-14 a question raised under a manual tether batch reserves nothing, so a recovery queued at the answer goes first`() = runTest {
+        val h = Harness(this)
+        dollarBatchEndedOnCredentialWhileHeld(h)
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        assertEquals("fixture: a tether batch went out", setOf(TETHER), h.lastTopics())
+        val gate = CompletableDeferred<Unit>()
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        h.refreshGate = gate
+        h.wire.deliver(h.subscriptionError(h.requests.last().requestId, "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: refreshing", TopicAuthResolution.REFRESHING, h.store.snapshot.authResolution)
+        val frameAt = testScheduler.currentTime
+        h.wire.deliver(h.tetherFrame(1391.0))
+        advanceTimeBy(1)
+        advanceTimeBy(frameAt + com.jay.fxi.domain.model.TopicSilencePolicy.SILENCE_WINDOW.inWholeMilliseconds - testScheduler.currentTime)
+        advanceTimeBy(1)
+        assertEquals("fixture: a new silence under the batch", TopicDeliveryState.SUSPECT, h.stateOf(TETHER).deliveryState)
+        val sent = h.requests.size
+        gate.complete(Unit)
+        advanceTimeBy(1)
+        assertEquals("fixture: the replay went out", sent + 1, h.requests.size)
+        val published = h.topicStates.size
+        installRecoveryThenOffline(h)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertTrue("fixture: the recovery and offline were queued", h.onLiveIdentityRead == null)
+        assertTrue(
+            "D14H-14 the recovery resumed the dollar batch before offline",
+            h.topicStates.drop(published).any { it.stateFor(USD).deliveryState == TopicDeliveryState.REVALIDATING }
+        )
+        h.cleanUp()
+    }
+
+    /**
+     * A question waiting for a proving answer is not ready either: a non-proving answer leaves the lane unreserved, so the recovery
+     * queued at its admission resumes the ended batch before an offline queued with it (review_codex.md, D19).
+     */
+    @Test
+    fun `D14H-15 a question waiting for a proving answer reserves nothing, so a recovery queued at a non-proving answer goes first`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, JPY_TOPIC))
+        dollarBatchEndedOnCredentialWhileHeld(h)
+        h.retry(FreeTab.JPY)
+        advanceTimeBy(1)
+        assertEquals("fixture: a yen batch went out", setOf(JPY_TOPIC), h.lastTopics())
+        val published = h.topicStates.size
+        installRecoveryThenOffline(h)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER), rejections = mapOf(JPY_TOPIC to "topics_disabled")))
+        advanceTimeBy(1)
+        assertTrue("fixture: the recovery and offline were queued", h.onLiveIdentityRead == null)
+        assertEquals(
+            "fixture: the answer proved nothing",
+            TopicAuthResolution.FAILED,
+            h.topicStates.drop(published).first { it.controlState == TopicControlState.ACKNOWLEDGED }.authResolution
+        )
+        assertTrue(
+            "D14H-15 the recovery resumed the dollar batch before offline",
+            h.topicStates.drop(published).any { it.stateFor(USD).deliveryState == TopicDeliveryState.REVALIDATING }
+        )
+        h.cleanUp()
+    }
+
+    /** A question kept under a failed credential, then a dollar batch ended on its credential and recorded for recovery. */
+    private suspend fun TestScope.dollarBatchEndedOnCredentialWhileHeld(h: Harness) {
+        heldUnderFailedCredential(h)
+        val sent = h.requests.size
+        h.credentialFailures = 3
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        advanceTimeBy(12_000)
+        assertEquals("fixture: the batch ended without a send", sent, h.requests.size)
+        assertEquals("fixture: the dollar topic degraded", TopicDeliveryState.DEGRADED, h.stateOf(USD).deliveryState)
+        assertEquals("fixture: still failed", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+    }
+
+    /** At the next answer's admission, a credential recovery and then offline are queued ahead of anything that answer posts. */
+    private fun installRecoveryThenOffline(h: Harness) {
+        h.onLiveIdentityRead = {
+            h.onLiveIdentityRead = null
+            h.recover(1)
+            h.coordinator.setOnline(false)
+        }
+    }
+
+    /** A renewal's invalid token starts a refresh held by [gate]; the silence then runs out during the refresh. */
+    private suspend fun TestScope.raisedDuringRenewalRefresh(h: Harness, gate: CompletableDeferred<Unit>) {
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val frameAt = testScheduler.currentTime
+        h.wire.deliver(h.tetherFrame(1390.0))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ackWithLease("r1", TETHER, 120L))
+        advanceTimeBy(1)
+        assertEquals("fixture: the renewal is in flight", 2, h.requests.size)
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        h.refreshGate = gate
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("fixture: refreshing", TopicAuthResolution.REFRESHING, h.store.snapshot.authResolution)
+        advanceTimeBy(frameAt + com.jay.fxi.domain.model.TopicSilencePolicy.SILENCE_WINDOW.inWholeMilliseconds - testScheduler.currentTime)
+        advanceTimeBy(1)
+        assertEquals("fixture: still refreshing", TopicAuthResolution.REFRESHING, h.store.snapshot.authResolution)
+        assertEquals("fixture: the silence marked tether suspect", TopicDeliveryState.SUSPECT, h.stateOf(TETHER).deliveryState)
+        assertEquals("fixture: nothing asked during the refresh", 2, h.requests.size)
+    }
 }

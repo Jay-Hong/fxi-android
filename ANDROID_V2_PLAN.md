@@ -24,6 +24,8 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 C2+b-2a는 탭별 수동 topic 재시도(`retryTopics`)를 세션에 연결했다(JVM 계약, 화면
                                 연결 없음). C2+b-2b는 인증으로 끝난 수동 batch를 검증된 credential 회복 1건당 한 번,
                                 남은 자동 의무와 한 command로 재개한다(JVM 계약, 동결 후 12번 (2)의 수동 batch 몫).
+                                D14 보류 단위는 인증 FAILED로 시작하지 못한 D14 질문을 연결에 보존하고, 인증을
+                                증명하는 ACK 뒤 한 번 재개한다(JVM 계약, 의도적 iOS 이탈).
                                 재시도 버튼·topic 배너(C2+b-3) 전에는 출시할 수 없다.
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
@@ -1222,8 +1224,19 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
     rejection을 열지 않는다. 원 기준 뒤 수신이 있는 대상은 구독 확인만 다시 하고 delivery를 기다리지 않으며 REVALIDATING으로
     옮기지 않는다. 수동 Tether는 자기 delivery 의무가 남았을 때만 자동 Tether 의무를 넘겨받는다. 새 클릭은 실제로 등록한
     자기 topic만 기록에서 넘겨받는다. iOS `a36682f`는 회복으로 명령을 재개하지 않는다(12번 (2)의 의도적 개선)
-  - **출시 전 남은 것.** 재시도 버튼과 topic 배너는 C2+b-3이다. FAILED 동안 D14가 시작 전에 버린 질문은 인증이 회복돼도
-    다시 묻지 않는다(tether가 SUSPECT로 남음). 이 공백은 2b 이전부터 자동 경로에 있었고 별도 단위로 다룬다
+  - **D14 보류 질문 재개(R4-c D14 보류 단위, 의도적 iOS 이탈).** Android는 topic 인증 FAILED만으로 기존 가격과 D14 창을
+    제거하지 않는다. 현재 연결에서 실제 발생했으나 FAILED로 시작하지 못한 D14 질문을 보존하고, 인증을 증명하는 ACK 뒤
+    현재 권위·topic·소유권 조건과 기존 lane 순서에 따라 한 번 재개한다. 회복 신호나 refresh가 쓴 RESOLVED만으로는 재개하지
+    않는다. 등록 전에 다음 사건이 오면 보류 질문을 지운다.
+    - tether 거절·desired 제외
+    - 유효 Tether 수신(WS 또는 REST — REST는 수신 세대를 올리지 않고 창만 재무장한다)
+    - 재확인이나 수동 Tether delivery를 넘겨받는 command의 등록
+    - 연결 종료·권위 상실
+
+    iOS `a36682f`는 FAILED 진입 시 topic 데이터와 freshness 창을 제거하며(`purgeTopicData(.all)`), 서비스 재검증 시작
+    자체에는 FAILED 가드가 없다. 이 재개는 등록 전 D14 질문의 보존·재개다. 실제 command의 인증 종료에 대한 기존 credential
+    recovery 재개(2b)와는 다르다
+  - **출시 전 남은 것.** 재시도 버튼과 topic 배너는 C2+b-3이다
 - **USD/JPY/EUR 현재가를 topic으로 전환하고 `/api/rates`·legacy WS 소비 제거**. S2의 premium unavailable shell을
   실제 premium Root destination으로 교체한다
 - rate consumer cutover와 같은 변경 세트에서 `fxi_cache`의 legacy `rates`·`rates_timestamp`를 제거하고
