@@ -83,7 +83,8 @@ class PremiumTopicConsumerContractTest {
         val selects = mutableListOf<Pair<AuthIdentityFence, FreeTab>>()
         val retries = mutableListOf<TopicDisplayOwner>()
         val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(test.testScheduler))
-        val consumer = PremiumTopicConsumer(display, focus, { live }, store, { o, t -> selects += o to t }, { retries += it }, scope)
+        val consumer = PremiumTopicConsumer(display, focus, { live }, store, { o, t -> selects += o to t }, { retries += it }, { _, _ -> },
+            scope)
         fun shown() = consumer.state.value
         fun rowIds() = shown().ui.rateSections.flatMap { s -> s.rows.map { it.id } }
     }
@@ -355,7 +356,7 @@ class PremiumTopicConsumerContractTest {
         val base = MutableStateFlow(state())
         val moving = MovingDisplay(base, state(owner = TopicDisplayOwner(a1, 2L)))
         val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
-        val consumer = PremiumTopicConsumer(moving, MutableStateFlow(OwnedTopicFocus(a1, FreeTab.USD)), { a1 }, GatedStore(), { _, _ -> }, { }, scope)
+        val consumer = PremiumTopicConsumer(moving, MutableStateFlow(OwnedTopicFocus(a1, FreeTab.USD)), { a1 }, GatedStore(), { _, _ -> }, { }, { _, _ -> }, scope)
         consumer.start(); runCurrent()
         check(consumer.currentState().ui.owner == o1) { "fixture: shown before it moves" }
         moving.armed = true

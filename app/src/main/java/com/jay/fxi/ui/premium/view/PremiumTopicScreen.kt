@@ -60,6 +60,7 @@ import com.jay.fxi.data.remote.TopicDisplayOwner
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.RateRowList
 import com.jay.fxi.ui.free.RateRowEditor
+import com.jay.fxi.ui.premium.PremiumTopicScreenBanner
 import com.jay.fxi.ui.premium.PremiumTopicScreenState
 import com.jay.fxi.ui.premium.PremiumTopicUiState
 import com.jay.fxi.ui.rates.RateDisplay
@@ -83,6 +84,7 @@ internal fun PremiumTopicScreen(
     state: PremiumTopicScreenState,
     onUserTabSelected: (TopicDisplayOwner, FreeTab) -> Unit,
     onRetryConnection: (TopicDisplayOwner) -> Unit,
+    onRetryTopics: (TopicDisplayOwner, FreeTab) -> Unit,
     onApplyRows: (owner: TopicDisplayOwner, tab: FreeTab, list: RateRowList, seeded: List<String>, order: List<String>, hidden: Set<String>) -> Unit,
     onOpenSettings: () -> Unit,
     newsContent: @Composable (isTabVisible: Boolean) -> Unit,
@@ -109,7 +111,7 @@ internal fun PremiumTopicScreen(
             // The provider starts a fresh composition per owner key, so nothing remembered crosses owners.
             ownerState.SaveableStateProvider(ownerKey) {
                 PremiumTopicOwnedScreen(state, owner, selectedTab, onUserTabSelected, onRetryConnection,
-                    onApplyRows, onOpenSettings, newsContent)
+                    onRetryTopics, onApplyRows, onOpenSettings, newsContent)
             }
         }
     }
@@ -124,6 +126,7 @@ private fun PremiumTopicOwnedScreen(
     selectedTab: FreeTab,
     onUserTabSelected: (TopicDisplayOwner, FreeTab) -> Unit,
     onRetryConnection: (TopicDisplayOwner) -> Unit,
+    onRetryTopics: (TopicDisplayOwner, FreeTab) -> Unit,
     onApplyRows: (TopicDisplayOwner, FreeTab, RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onOpenSettings: () -> Unit,
     newsContent: @Composable (Boolean) -> Unit
@@ -218,7 +221,13 @@ private fun PremiumTopicOwnedScreen(
                             }
                         }
                         banner.action?.let {
-                            TextButton(onClick = { onRetryConnection(owner) }, modifier = Modifier.testTag(PremiumTopicTags.BANNER_ACTION)) {
+                            TextButton(onClick = {
+                                when (banner) {
+                                    PremiumTopicScreenBanner.Failed -> onRetryConnection(owner)
+                                    is PremiumTopicScreenBanner.Topic -> onRetryTopics(owner, selectedTab)
+                                    else -> Unit
+                                }
+                            }, modifier = Modifier.testTag(PremiumTopicTags.BANNER_ACTION)) {
                                 Text(it)
                             }
                         }

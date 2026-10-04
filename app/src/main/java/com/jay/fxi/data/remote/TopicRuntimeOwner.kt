@@ -76,6 +76,7 @@ internal class TopicRuntimeOwner internal constructor(
             rowPreferenceStore = rowPreferenceStore,
             selectTab = runtime::selectTab,
             retryConnection = runtime::retryConnection,
+            retryTopics = runtime::retryTopics,
             scope = main
         )
         installed.start()

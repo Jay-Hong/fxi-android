@@ -13890,4 +13890,40 @@ class TopicSessionCoordinatorTest {
         assertEquals("fixture: the silence marked tether suspect", TopicDeliveryState.SUSPECT, h.stateOf(TETHER).deliveryState)
         assertEquals("fixture: nothing asked during the refresh", 2, h.requests.size)
     }
+
+    // ---- R4-c C2+b-3 B3-08 (Claude-owned, R4c/C2b/b3_design_codex.r2.md): the publication that releases the stored-price wait
+    // carries what the topic line reads, so the screen moves from the stored-price line to the topic line with no publication in
+    // between that has the release without the refusal. The implementation reads but does not edit these rows. ----
+
+    @Test
+    fun `B3-08a a disabled answer releases the stored prices in the same publication that carries the refusal`() = runTest {
+        val h = Harness(this)
+        val seen = recordDisplays(h)
+        seededOpen(h, usdSeed())
+        val before = seen.size
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "topics_disabled")))
+        advanceTimeBy(1)
+        val released = seen.drop(before).filter { it.cachedRefreshResolved }
+        assertTrue("fixture: released", released.isNotEmpty())
+        assertTrue("B3-08a still a seed", released.first().containsSeed)
+        assertTrue(
+            "B3-08a every released publication carries the refusal",
+            released.all { it.topicState.stateFor(USD).rejection == TopicRejectionReason.TOPICS_DISABLED }
+        )
+        h.cleanUp()
+    }
+
+    @Test
+    fun `B3-08b an invalid token releases the stored prices, and the failed refresh then reads as failed authentication`() = runTest {
+        val h = Harness(this)
+        seededOpen(h, usdSeed())
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        val shown = h.shown()
+        assertTrue("B3-08b released", shown.cachedRefreshResolved)
+        assertTrue("B3-08b still a seed", shown.containsSeed)
+        assertEquals("B3-08b the connection stays open", TopicConnectionDisplay.OPEN, shown.connection)
+        assertEquals("B3-08b the refresh failed", TopicAuthResolution.FAILED, shown.topicState.authResolution)
+        h.cleanUp()
+    }
 }

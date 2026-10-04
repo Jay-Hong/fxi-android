@@ -10,6 +10,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.performClick
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.local.RateRowPreferenceStore
@@ -22,6 +24,9 @@ import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.NewsItem
 import com.jay.fxi.domain.model.RateRowList
 import com.jay.fxi.domain.model.RateRowPreference
+import com.jay.fxi.domain.model.TopicRejectionReason
+import com.jay.fxi.domain.model.TopicSubscriptionSnapshot
+import com.jay.fxi.domain.model.TopicSubscriptionState
 import com.jay.fxi.domain.model.TopicQuote
 import com.jay.fxi.domain.model.TopicRates
 import com.jay.fxi.domain.model.UserInfo
@@ -81,9 +86,10 @@ class PremiumTopicRouteTest {
     private var live: AuthIdentityFence? = a1
     private val rows = MemoryRows()
     private val selects = mutableListOf<Pair<AuthIdentityFence, FreeTab>>()
+    private val topicRetries = mutableListOf<Pair<TopicDisplayOwner, FreeTab>>()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val consumer = PremiumTopicConsumer(display, focus, { live }, rows,
-        { o, tab -> selects += o to tab; focus.value = OwnedTopicFocus(o, tab) }, { }, scope)
+        { o, tab -> selects += o to tab; focus.value = OwnedTopicFocus(o, tab) }, { }, { o, tab -> topicRetries += o to tab }, scope)
     private var identity by mutableStateOf<AuthIdentityFence?>(a1)
     private var active by mutableStateOf(true)
     private var signOuts = 0
@@ -237,5 +243,74 @@ class PremiumTopicRouteTest {
         rule.onNodeWithText("설정 fixture A").assertDoesNotExist()
         display.value = TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN); rule.waitForIdle()
         rule.onNodeWithText("설정 fixture A").assertDoesNotExist()
+    }
+
+    // R4-c C2+b-3 (R4c/C2b/b3_design_codex.r2.md B3-09, Claude-owned): the topic line's retry reaches the runtime through the
+    // consumer once, with the shown owner and tab, and an inactive route draws and forwards nothing.
+    @Test fun b3_09b_theTopicRetryReachesTheConsumerOnce_andAnInactiveRouteForwardsNothing() {
+        val problem = TopicSubscriptionSnapshot(topics = mapOf(
+            "fx:usd-krw" to TopicSubscriptionState(desired = true, rejection = TopicRejectionReason.TOPICS_DISABLED),
+            "dxy:spot" to TopicSubscriptionState(desired = true, confirmed = true)))
+        display.value = TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN, topicState = problem)
+        show()
+        rule.onNode(hasTestTag(PremiumTopicTags.BANNER) and hasText("실시간 시세를 일시적으로 제공할 수 없습니다"), useUnmergedTree = true)
+            .assertExists()
+        rule.onNode(hasTestTag(PremiumTopicTags.BANNER_ACTION) and hasText("다시 시도")).performClick(); rule.waitForIdle()
+        assertEquals("B3-09b one topic retry with the shown owner and tab", listOf(o1 to FreeTab.USD), topicRetries)
+        active = false; rule.waitForIdle()
+        rule.onNodeWithTag(PremiumTopicTags.BANNER).assertDoesNotExist()
+        rule.onNodeWithTag(PremiumTopicTags.BANNER_ACTION).assertDoesNotExist()
+        assertEquals("B3-09b nothing more", 1, topicRetries.size)
+    }
+
+    // R4-c C2+b-3 (R4c/C2b/b3_survivor_codex.r1.md, mutant R01; Claude-owned): the route reads the screen again before handing the
+    // click to the consumer, which reads it once more. A resolution published while the first read finishes is seen by the second, so
+    // a line that already ended forwards nothing. The display change is fixed at the first read's last live-identity read, standing in
+    // for a publication from the runtime's own dispatcher.
+    @Test fun b3_09c_aResolutionPublishedDuringTheFirstReadIsSeenBeforeForwarding() {
+        val problem = TopicSubscriptionSnapshot(topics = mapOf(
+            "fx:usd-krw" to TopicSubscriptionState(desired = true, rejection = TopicRejectionReason.TOPICS_DISABLED)))
+        val resolved = TopicSubscriptionSnapshot(topics = mapOf(
+            "fx:usd-krw" to TopicSubscriptionState(desired = true, confirmed = true)))
+        val input = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN, topicState = problem))
+        val forwarded = mutableListOf<Pair<TopicDisplayOwner, FreeTab>>()
+        // Non-immediate Main, as the production owner uses.
+        val routeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+        var armed = false
+        var reads = 0
+        val c = PremiumTopicConsumer(
+            display = input,
+            focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.USD)),
+            liveIdentity = {
+                if (armed && ++reads == 2) {
+                    armed = false
+                    input.value = input.value.copy(topicState = resolved)
+                }
+                a1
+            },
+            rowPreferenceStore = rows,
+            selectTab = { _, _ -> },
+            retryConnection = {},
+            retryTopics = { owner, tab -> forwarded += owner to tab },
+            scope = routeScope
+        )
+        try {
+            val vm = NewsViewModel(FakeNews())
+            rule.setContent { PremiumTopicRoute(c, a1, true, vm, null, {}) }
+            rule.waitForIdle()
+            val click = requireNotNull(
+                rule.onNodeWithTag(PremiumTopicTags.BANNER_ACTION).fetchSemanticsNode()
+                    .config[androidx.compose.ui.semantics.SemanticsActions.OnClick].action
+            )
+            rule.runOnIdle {
+                armed = true
+                assertTrue("fixture: the click was handled", click())
+            }
+            rule.waitForIdle()
+            assertTrue("fixture: the resolution was published during the first read", !armed)
+            assertEquals("B3-09c a line that ended while it was read forwards nothing", 0, forwarded.size)
+        } finally {
+            routeScope.cancel()
+        }
     }
 }

@@ -42,6 +42,7 @@ import com.jay.fxi.ui.premium.PremiumTopicPresenter
 import com.jay.fxi.ui.premium.PremiumTopicScreenBanner
 import com.jay.fxi.ui.premium.PremiumTopicScreenState
 import com.jay.fxi.ui.premium.PremiumTopicUiState
+import com.jay.fxi.ui.premium.TopicBannerReason
 import com.jay.fxi.ui.premium.view.PremiumTopicScreen
 import com.jay.fxi.ui.premium.view.PremiumTopicTags
 import com.jay.fxi.ui.rates.RateDisplay
@@ -80,6 +81,7 @@ class PremiumTopicScreenTest {
     private var state by mutableStateOf(PremiumTopicScreenState.NONE)
     private val selections = mutableListOf<Pair<TopicDisplayOwner, FreeTab>>()
     private val retries = mutableListOf<TopicDisplayOwner>()
+    private val topicRetries = mutableListOf<Pair<TopicDisplayOwner, FreeTab>>()
     private val applied = mutableListOf<List<Any>>()
     private var settingsOpened = 0
 
@@ -88,6 +90,7 @@ class PremiumTopicScreenTest {
             state = state,
             onUserTabSelected = { o, tab -> selections += o to tab },
             onRetryConnection = { retries += it },
+            onRetryTopics = { o, tab -> topicRetries += o to tab },
             onApplyRows = { o, tab, list, seeded, order, hidden -> applied += listOf(o, tab, list, seeded, order, hidden) },
             onOpenSettings = { settingsOpened += 1 },
             newsContent = { visible -> Text(if (visible) "뉴스 보임" else "뉴스 숨김") }
@@ -205,6 +208,44 @@ class PremiumTopicScreenTest {
         assertEquals("C3c2-04 retry with its owner", listOf(o1), retries)
         state = screen(FreeTab.USD); rule.waitForIdle()
         rule.onNodeWithTag(PremiumTopicTags.BANNER).assertDoesNotExist()
+    }
+
+    // R4-c C2+b-3 (R4c/C2b/b3_design_codex.r2.md B3-09, adjusted by b3_review_claude.r1.md; Claude-owned): a topic line is drawn
+    // as given with no time; its "다시 시도" reports the owner and the selected tab to the topic retry, never to the connection's; a
+    // line without a retry has no button at all.
+    @Test fun b3_09_theTopicLineAsGiven_itsRetryReportsTheOwnerAndTab_andOnlyTheFailureReconnects() {
+        show(screen(FreeTab.USD, banner = PremiumTopicScreenBanner.Topic(TopicBannerReason.TOPICS_DISABLED, canRetry = true)))
+        rule.onNode(hasTestTag(PremiumTopicTags.BANNER) and hasText("실시간 시세를 일시적으로 제공할 수 없습니다"), useUnmergedTree = true)
+            .assertExists()
+        rule.onNodeWithTag(PremiumTopicTags.BANNER_TIME).assertDoesNotExist()
+        rule.onNode(hasTestTag(PremiumTopicTags.BANNER_ACTION) and hasText("다시 시도")).performClick()
+        rule.waitForIdle()
+        assertEquals("B3-09 the topic retry with its owner and tab", listOf(o1 to FreeTab.USD), topicRetries)
+        assertTrue("B3-09 not the connection retry", retries.isEmpty())
+
+        for ((reason, text) in listOf(
+            TopicBannerReason.AUTH_FAILED to "로그인 상태를 다시 확인해 주세요",
+            TopicBannerReason.TOPICS_DISABLED to "실시간 시세를 일시적으로 제공할 수 없습니다",
+            TopicBannerReason.TOPIC_UNAVAILABLE to "일부 실시간 시세를 사용할 수 없습니다",
+            TopicBannerReason.DELIVERY_DELAYED to "실시간 시세 수신이 지연되고 있습니다"
+        )) {
+            state = screen(FreeTab.USD, banner = PremiumTopicScreenBanner.Topic(reason, canRetry = false)); rule.waitForIdle()
+            rule.onNode(hasTestTag(PremiumTopicTags.BANNER) and hasText(text), useUnmergedTree = true).assertExists()
+            rule.onNodeWithTag(PremiumTopicTags.BANNER_ACTION).assertDoesNotExist()
+            rule.onNodeWithText("다시 시도").assertDoesNotExist()
+        }
+
+        state = screen(FreeTab.TETHER, banner = PremiumTopicScreenBanner.Topic(TopicBannerReason.DELIVERY_DELAYED, canRetry = true))
+        rule.waitForIdle()
+        rule.onNode(hasTestTag(PremiumTopicTags.BANNER_ACTION) and hasText("다시 시도")).performClick()
+        rule.waitForIdle()
+        assertEquals("B3-09 the selected tab", listOf(o1 to FreeTab.USD, o1 to FreeTab.TETHER), topicRetries)
+
+        state = screen(FreeTab.USD, banner = PremiumTopicScreenBanner.Failed); rule.waitForIdle()
+        rule.onNode(hasTestTag(PremiumTopicTags.BANNER_ACTION) and hasText("재연결")).performClick()
+        rule.waitForIdle()
+        assertEquals("B3-09 the failure reconnects", listOf(o1), retries)
+        assertEquals("B3-09 and is no topic retry", 2, topicRetries.size)
     }
 
     @Test fun c3c2_05_theNewsSlotIsToldWhetherItsPageIsShown() {

@@ -3,6 +3,7 @@ package com.jay.fxi.ui.premium
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.local.RateRowPreferenceStore
 import com.jay.fxi.data.remote.OwnedTopicFocus
+import com.jay.fxi.data.remote.TopicBootstrapOrder
 import com.jay.fxi.data.remote.TopicConnectionDisplay
 import com.jay.fxi.data.remote.TopicDisplayOwner
 import com.jay.fxi.data.remote.TopicDisplayState
@@ -10,7 +11,10 @@ import com.jay.fxi.data.remote.TopicRecoveryDisplay
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.RateRowList
 import com.jay.fxi.domain.model.RateRowPreference
+import com.jay.fxi.domain.model.TopicAuthResolution
 import com.jay.fxi.domain.model.TopicReconnectPolicy
+import com.jay.fxi.domain.model.TopicRejectionReason
+import com.jay.fxi.domain.model.TopicSubscriptionSnapshot
 import java.io.IOException
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CoroutineScope
@@ -27,7 +31,15 @@ import kotlinx.coroutines.launch
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 
-/** The one status line the premium screen draws (R4-c C3c-1), worded as iOS words it; [action] is the button, when there is one. */
+/** The topic status reasons (R4-c C2+b-3), worded as iOS words them. */
+internal enum class TopicBannerReason(val text: String) {
+    AUTH_FAILED("로그인 상태를 다시 확인해 주세요"),
+    TOPICS_DISABLED("실시간 시세를 일시적으로 제공할 수 없습니다"),
+    TOPIC_UNAVAILABLE("일부 실시간 시세를 사용할 수 없습니다"),
+    DELIVERY_DELAYED("실시간 시세 수신이 지연되고 있습니다")
+}
+
+/** The one status line the premium screen draws, worded as iOS words it; [action] is the button, when there is one. */
 internal sealed class PremiumTopicScreenBanner(val text: String, val action: String? = null) {
     data object Offline : PremiumTopicScreenBanner("오프라인 모드")
     data object RefreshingCached : PremiumTopicScreenBanner("저장된 환율 · 최신 데이터 확인 중")
@@ -37,6 +49,9 @@ internal sealed class PremiumTopicScreenBanner(val text: String, val action: Str
         if (attempt == 1) "연결 중..." else "재연결 중 ($attempt/${TopicReconnectPolicy.MAX_ATTEMPTS})"
     )
     data object Failed : PremiumTopicScreenBanner("연결할 수 없습니다", "재연결")
+    data class Topic(val reason: TopicBannerReason, val canRetry: Boolean) : PremiumTopicScreenBanner(
+        reason.text, if (canRetry) "다시 시도" else null
+    )
 }
 
 /** What the premium screen draws: the presenter's model, the final status line and its time text (KST HH:mm). */
@@ -63,6 +78,7 @@ internal class PremiumTopicConsumer(
     private val rowPreferenceStore: RateRowPreferenceStore,
     private val selectTab: (AuthIdentityFence, FreeTab) -> Unit,
     private val retryConnection: (TopicDisplayOwner) -> Unit,
+    private val retryTopics: (TopicDisplayOwner, FreeTab) -> Unit,
     private val scope: CoroutineScope
 ) {
     private val mutableState = MutableStateFlow(PremiumTopicScreenState.NONE)
@@ -111,6 +127,15 @@ internal class PremiumTopicConsumer(
         // Reject an old owner's click or a click after failure ended; Failed already excludes offline and requires Exhausted.
         if (screen.ui.owner == owner && screen.banner == PremiumTopicScreenBanner.Failed) {
             retryConnection.invoke(owner)
+        }
+    }
+
+    fun retryTopics(owner: TopicDisplayOwner, tab: FreeTab) {
+        val screen = refresh()
+        val banner = screen.banner as? PremiumTopicScreenBanner.Topic ?: return
+        // Recheck the accepted tab and current retry eligibility, including any higher-priority status line.
+        if (screen.ui.owner == owner && screen.ui.selectedTab == tab && banner.canRetry) {
+            retryTopics.invoke(owner, tab)
         }
     }
 
@@ -205,6 +230,8 @@ internal class PremiumTopicConsumer(
                 currentDisplay.recovery == TopicRecoveryDisplay.Connecting -> PremiumTopicScreenBanner.Connecting
                 currentDisplay.recovery is TopicRecoveryDisplay.Reconnecting ->
                     PremiumTopicScreenBanner.Reconnecting(currentDisplay.recovery.attempt)
+                currentDisplay.connection == TopicConnectionDisplay.OPEN ->
+                    ui.selectedTab?.let { topicBanner(currentDisplay.topicState, it) }
                 else -> null
             }
             val time = ui.lastUpdated?.toLocalDateTime(KST)?.let {
@@ -234,6 +261,22 @@ internal class PremiumTopicConsumer(
         }
         mutableState.value = currentScreen
         return currentScreen
+    }
+
+    /** Projects only the accepted tab's canonical topics; row visibility does not narrow its scope. */
+    private fun topicBanner(snapshot: TopicSubscriptionSnapshot, tab: FreeTab): PremiumTopicScreenBanner.Topic? {
+        val topics = TopicBootstrapOrder.shownBy(tab)
+        val desired = topics.map(snapshot::stateFor).filter { it.desired }
+        val degraded = snapshot.degradedTopics
+        val reason = when {
+            snapshot.authResolution == TopicAuthResolution.FAILED && desired.isNotEmpty() -> TopicBannerReason.AUTH_FAILED
+            desired.any { it.rejection == TopicRejectionReason.TOPICS_DISABLED } -> TopicBannerReason.TOPICS_DISABLED
+            desired.any { it.rejection == TopicRejectionReason.TOPIC_UNAVAILABLE } -> TopicBannerReason.TOPIC_UNAVAILABLE
+            topics.any { it in degraded } -> TopicBannerReason.DELIVERY_DELAYED
+            else -> return null
+        }
+        val retryable = snapshot.manualRetryTopics
+        return PremiumTopicScreenBanner.Topic(reason, canRetry = topics.any { it in retryable })
     }
 
     private fun enqueue(write: PreferenceWrite) {

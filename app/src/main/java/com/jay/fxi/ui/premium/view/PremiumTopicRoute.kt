@@ -73,6 +73,9 @@ internal fun PremiumTopicRoute(
                     onRetryConnection = { capturedOwner ->
                         if (allowed() && capturedOwner == owner) consumer.retryConnection(capturedOwner)
                     },
+                    onRetryTopics = { capturedOwner, tab ->
+                        if (allowed() && capturedOwner == owner) consumer.retryTopics(capturedOwner, tab)
+                    },
                     onApplyRows = { capturedOwner, tab, list, seeded, order, hidden ->
                         if (allowed() && capturedOwner == owner) {
                             consumer.applyRowPreference(capturedOwner, tab, list, seeded, order, hidden)

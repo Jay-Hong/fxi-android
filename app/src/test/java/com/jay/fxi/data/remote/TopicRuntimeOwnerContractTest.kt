@@ -4,12 +4,14 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.remote.C4OwnerHarness.Companion.LEGACY_RATES_FRAME
 import com.jay.fxi.data.remote.C4OwnerHarness.Companion.TETHER
 import com.jay.fxi.data.remote.C4OwnerHarness.Companion.U1
+import com.jay.fxi.data.remote.C4OwnerHarness.Companion.USD
 import com.jay.fxi.data.remote.C4OwnerHarness.Companion.decoder
 import com.jay.fxi.data.remote.C4OwnerHarness.Companion.tetherFrame
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.RateRowList
 import com.jay.fxi.ui.premium.PremiumTopicScreenBanner
 import com.jay.fxi.ui.premium.PremiumTopicScreenState
+import com.jay.fxi.ui.premium.TopicBannerReason
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.advanceTimeBy
@@ -415,5 +417,31 @@ class TopicRuntimeOwnerContractTest {
         h.settle(1_000)
         assertTrue("positive control: a topic frame is drawn", h.hasPrices())
         assertTrue("positive control: a topic frame is saved", h.memory.writes > writes)
+    }
+
+    // R4-c C2+b-3 B3-10 (Claude-owned, R4c/C2b/b3_design_codex.r2.md): through the production factory, runtime, owner and consumer,
+    // the topic line's retry for the shown tab is one subscribe for that tab's retryable topic on the open socket, not a reconnection.
+    @Test
+    fun `B3-10 the owner's consumer turns a topic retry into one subscribe for the shown tab, not a reconnection`() = runTest {
+        val h = C4OwnerHarness(this, online = true)
+        h.tabs.stored["u1"] = FreeTab.USD
+        h.owner.start()
+        h.foreground(true) // the process's first foreground (C4 r4)
+        h.settle(100)
+        h.wire.open()
+        h.settle(1)
+        val first = h.subscribes.last()
+        h.wire.deliver(C4OwnerHarness.ack(first.requestId, active = first.topics - USD, rejections = mapOf(USD to "topics_disabled")))
+        h.settle(1)
+        assertEquals("fixture: the line offers a retry", PremiumTopicScreenBanner.Topic(TopicBannerReason.TOPICS_DISABLED, canRetry = true),
+            h.screen.banner)
+        val owner = h.shownOwner()
+        val subscribes = h.subscribes.size
+        val sockets = h.wire.requests.size
+        h.owner.consumer.retryTopics(owner, FreeTab.USD)
+        h.settle(1)
+        assertEquals("B3-10 one subscribe", subscribes + 1, h.subscribes.size)
+        assertEquals("B3-10 for the dollar topic", listOf(USD), h.subscribes.last().topics)
+        assertEquals("B3-10 no reconnection", sockets, h.wire.requests.size)
     }
 }

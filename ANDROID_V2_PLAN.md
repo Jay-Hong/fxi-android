@@ -26,7 +26,8 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 남은 자동 의무와 한 command로 재개한다(JVM 계약, 동결 후 12번 (2)의 수동 batch 몫).
                                 D14 보류 단위는 인증 FAILED로 시작하지 못한 D14 질문을 연결에 보존하고, 인증을
                                 증명하는 ACK 뒤 한 번 재개한다(JVM 계약, 의도적 iOS 이탈).
-                                재시도 버튼·topic 배너(C2+b-3) 전에는 출시할 수 없다.
+                                C2+b-3은 premium 화면에 topic 배너와 "다시 시도"를 연결했다(JVM·에뮬레이터 계측
+                                계약). F2를 포함한 기기 확인 전에는 출시할 수 없다.
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1236,7 +1237,18 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
     iOS `a36682f`는 FAILED 진입 시 topic 데이터와 freshness 창을 제거하며(`purgeTopicData(.all)`), 서비스 재검증 시작
     자체에는 FAILED 가드가 없다. 이 재개는 등록 전 D14 질문의 보존·재개다. 실제 command의 인증 종료에 대한 기존 credential
     recovery 재개(2b)와는 다르다
-  - **출시 전 남은 것.** 재시도 버튼과 topic 배너는 C2+b-3이다
+- **topic 배너·재시도 표시(R4-c C2+b-3, iOS `ExchangeRateViewModel.swift:499-546`·`OfflineBanner.swift:72-155` 대응).**
+  - 순서: Offline → Failed → 저장값 확인 중 → 연결 중 → 재연결 중 → 열린 연결에서만 topic 줄. 저장값 배너가 남아 있으면
+    topic 문제가 있어도 저장값 배너가 먼저다(iOS `.refreshingCached`와 같다).
+  - 문구(iOS 그대로, 앞이 우선): 인증 FAILED이고 desired topic 있음 "로그인 상태를 다시 확인해 주세요" / desired·TOPICS_DISABLED
+    "실시간 시세를 일시적으로 제공할 수 없습니다" / desired·TOPIC_UNAVAILABLE "일부 실시간 시세를 사용할 수 없습니다" /
+    DEGRADED "실시간 시세 수신이 지연되고 있습니다". 각 탭이 보여 주는 topic만 본다.
+  - "다시 시도"는 문구가 있고 탭의 topic 중 하나가 `manualRetryTopics`일 때 보인다. 클릭은 현재 owner·확정된 탭·현재 줄을
+    다시 확인한 뒤 그 탭의 수동 재시도로 한 번만 보낸다. 클릭만으로 줄을 숨기거나 진행 중 표시를 만들지 않는다. 버튼
+    이름은 시각 문구와 같다(iOS와 같고, 별도 접근성 이름·알림 없음).
+  - iOS 이탈: 탭 scope에 KRX가 없다(iOS는 테더·달러 탭에 KRX 포함). KRX 구독은 S6 범위다.
+  - **출시 전 남은 것.** SM-F711N 기기 확인(F2 포함). 운영 서버·시험 계정에서 생기지 않은 문구는 미수집으로 남기고,
+    운영 관찰 증거와 계측 계약을 구분해 적는다
 - **USD/JPY/EUR 현재가를 topic으로 전환하고 `/api/rates`·legacy WS 소비 제거**. S2의 premium unavailable shell을
   실제 premium Root destination으로 교체한다
 - rate consumer cutover와 같은 변경 세트에서 `fxi_cache`의 legacy `rates`·`rates_timestamp`를 제거하고
