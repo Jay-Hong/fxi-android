@@ -400,6 +400,9 @@ class TopicSessionCoordinatorTest {
         /** How many times the session actually observed the identity. Counted, not assumed. */
         var liveIdentityReads = 0
 
+        /** GOBS: where the session's graph hand-over goes — the dormant sink unless a test installs its own. */
+        var graphSink: TopicGraphSink = DormantTopicGraphSink
+
         val coordinator = TopicSessionCoordinator(
             scope = scope,
             clock = clock,
@@ -480,7 +483,8 @@ class TopicSessionCoordinatorTest {
             },
             desired = desired,
             restoreSeed = { granted -> restoreCalls += granted; restoreProvider?.invoke(granted) ?: TopicLastKnownRestore.NotAdmitted },
-            offerLive = { uid, epoch, rates -> offers += Triple(uid, epoch, rates) }
+            offerLive = { uid, epoch, rates -> offers += Triple(uid, epoch, rates) },
+            graphSink = TopicGraphSink { input -> graphSink.tryOffer(input) }
         )
 
         /** R4-b2: every save the session offered, in order. */
@@ -13924,6 +13928,658 @@ class TopicSessionCoordinatorTest {
         assertTrue("B3-08b still a seed", shown.containsSeed)
         assertEquals("B3-08b the connection stays open", TopicConnectionDisplay.OPEN, shown.connection)
         assertEquals("B3-08b the refresh failed", TopicAuthResolution.FAILED, shown.topicState.authResolution)
+        h.cleanUp()
+    }
+
+    // ---- S3 graph observation hand-over, unit 1 (GOBS-01..18) --------------------------------------------------------------
+    // The candidates, their attribution, the sink and its loss record. Continuity events are the next unit's. The hand-over
+    // never changes what the price runtime does with the same input; GOBS-17 compares whole traces across sinks for that.
+
+    private val gT0 = "2026-08-31T01:10:00Z"
+    private val gT1 = "2026-08-31T01:20:00Z"
+    private val gT2 = "2026-08-31T01:21:00Z"
+    private val gT3 = "2026-08-31T01:22:00Z"
+    private val gT4 = "2026-08-31T01:23:00Z"
+
+    private fun gEntry(source: String, asset: String, rate: Double, timestamp: String, changed: String? = null): String {
+        val changedField = if (changed == null) "" else ""","rate_changed_at":"$changed""""
+        return """{"source":"$source","asset":"$asset","rate":$rate,"timestamp":"$timestamp"$changedField}"""
+    }
+
+    private fun gTether(usdt: List<String>, banks: List<String> = emptyList()) =
+        """{"type":"snapshot","version":1,"topic":"usdt:krw","data":{"usdt_krw":[${usdt.joinToString(",")}],""" +
+            """"usd_krw_banks":[${banks.joinToString(",")}]}}"""
+
+    private fun gFx(topic: String, banks: List<String>) =
+        """{"type":"snapshot","version":1,"topic":"$topic","data":{"banks":[${banks.joinToString(",")}]}}"""
+
+    private fun gDxy(rate: Double, timestamp: String, source: String) =
+        """{"type":"snapshot","version":1,"topic":"dxy:spot","data":{"dxy":{"rate":$rate,"timestamp":"$timestamp","source":"$source"}}}"""
+
+    private fun gQuote(source: String, asset: String, rate: Double, timestamp: String, changed: String? = null) =
+        TopicGraphCandidate.Quote(source, asset, rate, Instant.parse(timestamp), changed?.let(Instant::parse))
+
+    /** Records every hand-over, and what the display held at that moment, then answers as told. */
+    private class GraphRecorder(private val h: Harness) : TopicGraphSink {
+        var answer: (TopicGraphInput) -> TopicGraphOffer = { TopicGraphOffer.ENQUEUED }
+        val inputs = mutableListOf<TopicGraphInput>()
+        val ratesAtOffer = mutableListOf<TopicRates>()
+        val observations get() = inputs.filterIsInstance<TopicGraphInput.Observations>()
+
+        override fun tryOffer(input: TopicGraphInput): TopicGraphOffer {
+            inputs += input
+            ratesAtOffer += h.coordinator.rates.value
+            return answer(input)
+        }
+    }
+
+    /** A live, opened socket with [GraphRecorder] installed; the grant's own bootstraps have already failed unreachable. */
+    private suspend fun TestScope.graphLive(h: Harness): GraphRecorder {
+        val recorder = GraphRecorder(h)
+        h.graphSink = recorder
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertTrue("GOBS fixture: nothing handed over before any price arrived", recorder.inputs.isEmpty())
+        return recorder
+    }
+
+    @Test
+    fun `GOBS-01 a socket entry is handed over with both clocks, its topic, path and use, before the display merges it`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT2, changed = gT1))))
+        advanceTimeBy(1)
+
+        val o = g.observations.single()
+        assertEquals("GOBS-01 topic", TETHER, o.topic)
+        assertEquals("GOBS-01 path", TopicGraphPath.WS, o.path)
+        assertEquals("GOBS-01 both clocks as sent", listOf(gQuote("upbit", "usdt-krw", 1390.0, gT2, changed = gT1)), o.candidates)
+        assertEquals("GOBS-01 owner", fence(), o.attribution.owner)
+        assertEquals("GOBS-01 the socket's own use", TopicUseLifetime(fence().grant, 0L), o.attribution.lifetime)
+        assertEquals("GOBS-01 the grant in force", checkNotNull(h.shown().owner).grantEpoch, o.attribution.grantEpoch)
+        assertTrue("GOBS-01 a socket generation", o.connectionGeneration != null)
+        assertEquals("GOBS-01 handed over before the merge", TopicRates(), g.ratesAtOffer.single())
+        assertEquals("GOBS-01 the display still merges on rate_changed_at", Instant.parse(gT1), h.coordinator.rates.value.quotes.values.single().at)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-02 a socket index keeps its supplier and clock, before the display merges it`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        val g = graphLive(h)
+
+        h.wire.deliver(gDxy(98.5, gT2, "cnbc"))
+        advanceTimeBy(1)
+
+        val o = g.observations.single()
+        assertEquals("GOBS-02 topic", TopicCatalogue.DXY, o.topic)
+        assertEquals("GOBS-02 path", TopicGraphPath.WS, o.path)
+        assertTrue("GOBS-02 a socket generation", o.connectionGeneration != null)
+        assertEquals("GOBS-02 supplier and clock", listOf(TopicGraphCandidate.DollarIndex(98.5, Instant.parse(gT2), "cnbc")), o.candidates)
+        assertNull("GOBS-02 handed over before the merge", g.ratesAtOffer.single().dollarIndex)
+        assertEquals("GOBS-02 the display took it", 98.5, checkNotNull(h.coordinator.rates.value.dollarIndex).rate, 0.0)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-03 a bootstrap answer is handed over on the REST path, under the use its issue acquired, before the merge`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(1)
+
+        h.bootstrapOutcome = { _, _ ->
+            h.delivered(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT2, changed = gT1), gEntry("hana", "usd-krw", 1392.0, gT2))))
+        }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        val o = g.observations.single()
+        assertEquals("GOBS-03 topic", USD, o.topic)
+        assertEquals("GOBS-03 path", TopicGraphPath.REST_BOOTSTRAP, o.path)
+        assertNull("GOBS-03 no socket generation on REST", o.connectionGeneration)
+        assertEquals(
+            "GOBS-03 entries as sent, in order",
+            listOf(gQuote("kb", "usd-krw", 1391.0, gT2, changed = gT1), gQuote("hana", "usd-krw", 1392.0, gT2)),
+            o.candidates
+        )
+        assertEquals("GOBS-03 owner", fence(), o.attribution.owner)
+        assertEquals("GOBS-03 the issue's use", TopicUseLifetime(fence().grant, 0L), o.attribution.lifetime)
+        assertEquals("GOBS-03 the grant in force", checkNotNull(h.shown().owner).grantEpoch, o.attribution.grantEpoch)
+        assertEquals("GOBS-03 handed over before the merge", TopicRates(), g.ratesAtOffer.single())
+        assertEquals("GOBS-03 the display took both", 2, h.coordinator.rates.value.quotes.size)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-04 a bootstrap index that changes nothing on screen is still handed over`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        val g = graphLive(h)
+        h.bootstrapOutcome = { _, topic -> if (topic == TopicCatalogue.DXY) h.delivered(gDxy(98.5, gT2, "yahoo")) else staged() }
+
+        h.coordinator.requestBootstrap(TopicCatalogue.DXY)
+        advanceTimeBy(100)
+        val shownAfterFirst = h.coordinator.rates.value.dollarIndex
+        h.coordinator.requestBootstrap(TopicCatalogue.DXY)
+        advanceTimeBy(100)
+
+        val rest = g.observations.filter { it.path == TopicGraphPath.REST_BOOTSTRAP }
+        assertEquals("GOBS-04 one hand-over per answer", 2, rest.size)
+        rest.forEach {
+            assertEquals("GOBS-04 topic", TopicCatalogue.DXY, it.topic)
+            assertNull("GOBS-04 no socket generation on REST", it.connectionGeneration)
+            assertEquals("GOBS-04 as sent", listOf(TopicGraphCandidate.DollarIndex(98.5, Instant.parse(gT2), "yahoo")), it.candidates)
+        }
+        assertTrue("GOBS-04 fixture: the first answer was shown", shownAfterFirst != null)
+        assertNull("GOBS-04 the first answer handed over before the merge", g.ratesAtOffer[g.inputs.indexOf(rest.first())].dollarIndex)
+        assertEquals("GOBS-04 the second answer changed nothing on screen", shownAfterFirst, h.coordinator.rates.value.dollarIndex)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-05 re-observed, older and same-time conflicting entries are all handed over while the display keeps its rule`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+        val sent = listOf(
+            gEntry("upbit", "usdt-krw", 1390.0, gT2, changed = gT1), // adopted
+            gEntry("upbit", "usdt-krw", 1390.0, gT3, changed = gT1), // same price, same change, seen later
+            gEntry("upbit", "usdt-krw", 1380.0, gT0), // older
+            gEntry("upbit", "usdt-krw", 1385.0, gT4, changed = gT1) // same change time, other price
+        )
+
+        val offersBefore = h.offers.size
+
+        sent.forEach {
+            h.wire.deliver(gTether(listOf(it)))
+            advanceTimeBy(1)
+        }
+
+        assertEquals(
+            "GOBS-05 every entry, as sent",
+            listOf(
+                listOf(gQuote("upbit", "usdt-krw", 1390.0, gT2, changed = gT1)),
+                listOf(gQuote("upbit", "usdt-krw", 1390.0, gT3, changed = gT1)),
+                listOf(gQuote("upbit", "usdt-krw", 1380.0, gT0)),
+                listOf(gQuote("upbit", "usdt-krw", 1385.0, gT4, changed = gT1))
+            ),
+            g.observations.map { it.candidates }
+        )
+        val shown = h.coordinator.rates.value.quotes.values.single()
+        assertEquals("GOBS-05 the display kept the first", 1390.0, shown.rate, 0.0)
+        assertEquals("GOBS-05 at its change time", Instant.parse(gT1), shown.at)
+        assertEquals("GOBS-05 only the adopted change is offered for saving", offersBefore + 1, h.offers.size)
+        assertEquals("GOBS-05 four socket deliveries", 4L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-06 one payload with the same key twice hands both over in order, and is still one delivery`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1), gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+
+        assertEquals(
+            "GOBS-06 both, in order, in one hand-over",
+            listOf(gQuote("upbit", "usdt-krw", 1390.0, gT1), gQuote("upbit", "usdt-krw", 1391.0, gT2)),
+            g.observations.single().candidates
+        )
+        assertEquals("GOBS-06 one delivery", 1L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-07 implausible prices are never handed over, and a payload with none left hands over nothing`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+
+        h.wire.deliver(
+            gTether(
+                listOf(
+                    gEntry("upbit", "usdt-krw", 0.0, gT1),
+                    gEntry("bithumb", "usdt-krw", -1.0, gT1),
+                    gEntry("coinone", "usdt-krw", 1.0E9, gT1),
+                    gEntry("korbit", "usdt-krw", 1390.0, gT1)
+                )
+            )
+        )
+        advanceTimeBy(1)
+        assertEquals("GOBS-07 the plausible one only", listOf(gQuote("korbit", "usdt-krw", 1390.0, gT1)), g.observations.single().candidates)
+
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 0.0, gT2), gEntry("coinone", "usdt-krw", 1.0E9, gT2))))
+        advanceTimeBy(1)
+        h.wire.deliver(h.emptyTetherFrame())
+        advanceTimeBy(1)
+
+        assertEquals("GOBS-07 nothing more handed over", 1, g.inputs.size)
+        assertEquals("GOBS-07 and no delivery from them", 1L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-08 KRX is never handed over, by any route, and the filter does not touch the display`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+
+        h.wire.deliver(
+            gTether(
+                listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1)),
+                banks = listOf(
+                    gEntry("krx", "usd-krw-futures", 1385.0, gT1),
+                    gEntry("krx", "usd-krw", 1386.0, gT1),
+                    gEntry("kb", "usd-krw-futures", 1387.0, gT1),
+                    gEntry("kb", "usd-krw", 1388.0, gT1)
+                )
+            )
+        )
+        advanceTimeBy(1)
+        assertEquals(
+            "GOBS-08 KRX left out, the rest kept in order",
+            listOf(gQuote("upbit", "usdt-krw", 1390.0, gT1), gQuote("kb", "usd-krw", 1388.0, gT1)),
+            g.observations.single().candidates
+        )
+        assertEquals("GOBS-08 the display is as before this unit", 5, h.coordinator.rates.value.quotes.size)
+
+        // KRX alone in a general group: no hand-over at all, and the delivery judgement is this unit's to leave alone.
+        h.wire.deliver(gTether(emptyList(), banks = listOf(gEntry("krx", "usd-krw-futures", 1384.0, gT2))))
+        advanceTimeBy(1)
+        assertEquals("GOBS-08 nothing handed over for KRX alone", 1, g.inputs.size)
+        assertEquals("GOBS-08 delivery judged as before this unit", 2L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+
+        // The legacy key and the dedicated topic.
+        h.wire.deliver(
+            """{"type":"snapshot","version":1,"topic":"usdt:krw","data":{"usdt_krw":[],"usd_krw_banks":[],""" +
+                """"usd_krw_futures":[${gEntry("krx", "usd-krw-futures", 1383.0, gT3)}]}}"""
+        )
+        advanceTimeBy(1)
+        h.wire.deliver(
+            """{"type":"snapshot","version":1,"topic":"${TopicCatalogue.KRX_FUTURES}","data":{"usd_krw_futures":""" +
+                """${gEntry("krx", "usd-krw-futures", 1382.0, gT3)}}}"""
+        )
+        advanceTimeBy(1)
+        assertEquals("GOBS-08 nothing handed over for the legacy key or the dedicated topic", 1, g.inputs.size)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-09 the same bank entry on two topics is handed over once under each, with no screen or catalogue filter`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+
+        h.wire.deliver(gTether(emptyList(), banks = listOf(gEntry("kb", "usd-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        h.wire.deliver(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+
+        assertEquals("GOBS-09 the topic each came on", listOf(TETHER, USD), g.observations.map { it.topic })
+        assertEquals(
+            "GOBS-09 each entry as sent",
+            listOf(listOf(gQuote("kb", "usd-krw", 1390.0, gT1)), listOf(gQuote("kb", "usd-krw", 1391.0, gT2))),
+            g.observations.map { it.candidates }
+        )
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-10a a frame the socket does not accept is not handed over - not desired, refused`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+
+        h.wire.deliver(gFx(JPY_TOPIC, listOf(gEntry("kb", "jpy-krw", 910.0, gT1))))
+        advanceTimeBy(1)
+        h.wire.deliver(gDxy(98.5, gT1, "investing"))
+        advanceTimeBy(1)
+        assertNull("GOBS-10a fixture: the undesired index is not shown", h.coordinator.rates.value.dollarIndex)
+        h.wire.deliver(h.ack("r1", active = listOf(USD), rejections = mapOf(TETHER to "topic_unavailable")))
+        advanceTimeBy(1)
+        assertEquals("GOBS-10a fixture: tether refused", TopicRejectionReason.TOPIC_UNAVAILABLE, h.store.snapshot.stateFor(TETHER).rejection)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        assertTrue("GOBS-10a nothing handed over", g.inputs.isEmpty())
+
+        h.wire.deliver(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT1))))
+        advanceTimeBy(1)
+        assertEquals("GOBS-10a control: an accepted topic is handed over", listOf(USD), g.observations.map { it.topic })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-10b a frame after a failed authentication is not handed over`() = runTest {
+        val h = Harness(this)
+        h.refreshed = null
+        val g = graphLive(h)
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("GOBS-10b fixture", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+
+        assertTrue("GOBS-10b nothing handed over", g.inputs.isEmpty())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-10c a frame on an ended socket, or after the account moved without an access input, is not handed over`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+        val ended = h.wire
+        ended.drop()
+        advanceTimeBy(1)
+        ended.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        assertTrue("GOBS-10c nothing from the ended socket", g.inputs.isEmpty())
+
+        advanceTimeBy(5_000)
+        assertEquals("GOBS-10c fixture: reconnected", 2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.liveFence = fence(generation = 2L).identity
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+        assertTrue("GOBS-10c nothing after the account moved", g.inputs.isEmpty())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-11 an answer issued under a grant that was withdrawn and given back is not handed over`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+        val held = CompletableDeferred<Unit>()
+        val issued = h.bootstrapCalls.size
+        h.bootstrapGateFor = { issue -> if (issue == issued) held else null }
+        h.bootstrapOutcome = { issue, _ ->
+            if (issue == issued) h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1)))) else staged()
+        }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertEquals("GOBS-11 fixture: issued", issued + 1, h.bootstrapCalls.size)
+
+        h.setAccess(false, fence())
+        advanceTimeBy(1)
+        h.setAccess(true, fence())
+        advanceTimeBy(100)
+        held.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue("GOBS-11 nothing handed over", g.inputs.isEmpty())
+        assertTrue("GOBS-11 fixture: nothing shown either", h.coordinator.rates.value.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-12 an answer whose use lapsed in a short hold is not handed over`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        // A hold came and went: the grant is the same, the use the issue acquired is not admitted, and only a new one would be.
+        h.authority = object : TopicUseAuthority {
+            override fun acquire(fence: TopicSessionFence) = TopicUseLifetime(fence.grant, 1L)
+            override fun admits(lifetime: TopicUseLifetime) = lifetime.invalidations == 1L
+        }
+        h.bootstrapOutcome = { _, _ -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1)))) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertTrue("GOBS-12 nothing handed over", g.inputs.isEmpty())
+        assertTrue("GOBS-12 fixture: nothing shown either", h.coordinator.rates.value.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-13 a socket ending does not end the REST path, and its late frames stay out`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        val ended = h.wire
+        ended.drop()
+        advanceTimeBy(1)
+
+        h.bootstrapOutcome = { _, _ -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1)))) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+        ended.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+
+        val o = g.observations.single()
+        assertEquals("GOBS-13 the REST answer", TopicGraphPath.REST_BOOTSTRAP, o.path)
+        assertNull("GOBS-13 not tied to the socket", o.connectionGeneration)
+        assertEquals("GOBS-13 as sent", listOf(gQuote("upbit", "usdt-krw", 1390.0, gT1)), o.candidates)
+        assertEquals("GOBS-13 fixture: no reconnect yet", 1, h.wires.size)
+        h.cleanUp()
+    }
+
+    private suspend fun TestScope.sinkFailureKeepsPrices(failure: TopicGraphOffer?, expected: TopicGraphOffer) {
+        val h = Harness(this)
+        val g = graphLive(h)
+        g.answer = { if (failure == null) throw IllegalStateException("sink") else failure }
+        val offersBefore = h.offers.size
+
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+
+        assertEquals("GOBS-14 the price was shown", 1390.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+        assertEquals("GOBS-14 the delivery counted", 1L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
+        assertEquals("GOBS-14 the change offered for saving", offersBefore + 1, h.offers.size)
+        val loss = checkNotNull(h.coordinator.graphLoss.value) { "GOBS-14 a loss is recorded" }
+        val sequence = g.inputs.single().sequence
+        assertEquals("GOBS-14 revision", 1L, loss.revision)
+        assertEquals("GOBS-14 count", 1L, loss.count)
+        assertEquals("GOBS-14 first", sequence, loss.firstSequence)
+        assertEquals("GOBS-14 last", sequence, loss.lastSequence)
+        assertEquals("GOBS-14 reason", setOf(expected), loss.reasons)
+        assertEquals("GOBS-14 topic", setOf(TETHER), loss.topics)
+        assertEquals("GOBS-14 path", setOf(TopicGraphPath.WS), loss.paths)
+
+        // And the loop is still alive for what comes next.
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+        assertEquals("GOBS-14 the next price was shown", 1391.0, h.coordinator.rates.value.quotes.values.single().rate, 0.0)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-14a a full sink loses the hand-over and nothing else`() = runTest {
+        sinkFailureKeepsPrices(TopicGraphOffer.FULL, TopicGraphOffer.FULL)
+    }
+
+    @Test
+    fun `GOBS-14b a closed sink loses the hand-over and nothing else`() = runTest {
+        sinkFailureKeepsPrices(TopicGraphOffer.CLOSED, TopicGraphOffer.CLOSED)
+    }
+
+    @Test
+    fun `GOBS-14c a sink that throws loses the hand-over as a failure and nothing else`() = runTest {
+        sinkFailureKeepsPrices(null, TopicGraphOffer.FAILED)
+    }
+
+    @Test
+    fun `GOBS-15 losses accumulate and a later success does not clear them`() = runTest {
+        val h = Harness(this)
+        val g = graphLive(h)
+        val answers = ArrayDeque(listOf(TopicGraphOffer.FULL, TopicGraphOffer.FULL, TopicGraphOffer.ENQUEUED, TopicGraphOffer.CLOSED))
+        g.answer = { answers.removeFirst() }
+        val seen = mutableListOf<TopicGraphLoss?>()
+
+        listOf(1390.0, 1391.0, 1392.0, 1393.0).forEachIndexed { i, rate ->
+            h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", rate, listOf(gT1, gT2, gT3, gT4)[i]))))
+            advanceTimeBy(1)
+            seen += h.coordinator.graphLoss.value
+        }
+
+        h.bootstrapOutcome = { _, _ -> h.delivered(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT1)))) }
+        answers.addLast(TopicGraphOffer.FULL)
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(100)
+        val afterRest = checkNotNull(h.coordinator.graphLoss.value) { "GOBS-15 the REST loss is recorded" }
+
+        val s = g.inputs.map { it.sequence }
+        assertEquals("GOBS-15 one sequence per hand-over, from 1, contiguous", (1L..5L).toList(), s)
+        assertEquals("GOBS-15 revisions", listOf(1L, 2L, 2L, 3L), seen.map { it?.revision })
+        assertEquals("GOBS-15 counts", listOf(1L, 2L, 2L, 3L), seen.map { it?.count })
+        assertEquals("GOBS-15 first stays", List(4) { s[0] }, seen.map { it?.firstSequence })
+        assertEquals("GOBS-15 last moves with losses only", listOf(s[0], s[1], s[1], s[3]), seen.map { it?.lastSequence })
+        assertEquals("GOBS-15 reasons", setOf(TopicGraphOffer.FULL, TopicGraphOffer.CLOSED), seen.last()?.reasons)
+        assertEquals("GOBS-15 the success did not clear", seen[1], seen[2])
+        assertEquals("GOBS-15 the REST loss revision", 4L, afterRest.revision)
+        assertEquals("GOBS-15 the REST loss is the last", s[4], afterRest.lastSequence)
+        assertEquals("GOBS-15 topics accumulate", setOf(TETHER, USD), afterRest.topics)
+        assertEquals("GOBS-15 paths accumulate", setOf(TopicGraphPath.WS, TopicGraphPath.REST_BOOTSTRAP), afterRest.paths)
+        assertEquals("GOBS-15 reasons accumulate", setOf(TopicGraphOffer.FULL, TopicGraphOffer.CLOSED), afterRest.reasons)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-16 the dormant sink answers dormant, and that is not a loss`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        val answered = mutableListOf<TopicGraphOffer>()
+        h.graphSink = TopicGraphSink { input -> DormantTopicGraphSink.tryOffer(input).also { answered += it } }
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        h.wire.deliver(gDxy(98.5, gT1, "investing"))
+        advanceTimeBy(1)
+        h.bootstrapOutcome = { _, _ -> h.delivered(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT1)))) }
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(100)
+
+        assertEquals("GOBS-16 fixture: prices arrived", 2, h.coordinator.rates.value.quotes.size)
+        assertEquals("GOBS-16 three hand-overs, all dormant", List(3) { TopicGraphOffer.DORMANT }, answered)
+        assertNull("GOBS-16 no loss", h.coordinator.graphLoss.value)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-19 a hand-over carries the use its input was admitted under, never a fresh one`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD, TopicCatalogue.DXY))
+        val g = graphLive(h)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(USD)
+        advanceTimeBy(1)
+
+        // Every use stays admitted, but a new one would now be a different lifetime.
+        h.authority = object : TopicUseAuthority {
+            override fun acquire(fence: TopicSessionFence) = TopicUseLifetime(fence.grant, 7L)
+            override fun admits(lifetime: TopicUseLifetime) = true
+        }
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        h.wire.deliver(gDxy(98.5, gT1, "investing"))
+        advanceTimeBy(1)
+        h.bootstrapOutcome = { _, _ -> h.delivered(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT1)))) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertEquals("GOBS-19 fixture: three hand-overs", listOf(TETHER, TopicCatalogue.DXY, USD), g.observations.map { it.topic })
+        assertEquals(
+            "GOBS-19 each carries the original use",
+            List(3) { TopicUseLifetime(fence().grant, 0L) },
+            g.observations.map { it.attribution.lifetime }
+        )
+        h.cleanUp()
+    }
+
+    /** Everything the price runtime decides that a test can see, minus absolute times and exception identities. */
+    private fun Harness.priceFingerprint() = listOf(
+        coordinator.rates.value,
+        offers.toList(),
+        requests.toList(),
+        store.snapshot,
+        sleeps.toList(),
+        bootstrapCalls.map { it.second },
+        undelivered.map { it.second },
+        coordinator.display.value,
+        topicStates.size,
+        wires.map { it.sent.toList() to it.cancelled },
+        connectCalls
+    )
+
+    @Test
+    fun `GOBS-17 the same trace decides the same things with a dormant, an accepting and a failing sink`() = runTest {
+        val all = setOf(TETHER, USD, TopicCatalogue.DXY)
+        val dormant = Harness(this, desired = all)
+        val accepting = Harness(this, desired = all).also { h -> h.graphSink = GraphRecorder(h) }
+        val failing = Harness(this, desired = all).also { h -> h.graphSink = GraphRecorder(h).apply { answer = { throw IllegalStateException("sink") } } }
+        val hs = listOf(dormant, accepting, failing)
+        suspend fun step(millis: Long = 1, act: (Harness) -> Unit) {
+            hs.forEach(act)
+            advanceTimeBy(millis)
+        }
+        fun same(label: String) {
+            val expected = dormant.priceFingerprint()
+            assertEquals("GOBS-17 $label: accepting", expected, accepting.priceFingerprint())
+            assertEquals("GOBS-17 $label: failing", expected, failing.priceFingerprint())
+        }
+
+        step(100) { it.goLive() }
+        step { it.wire.open() }
+        step { it.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT2, changed = gT1)))) }
+        step { it.wire.deliver(it.ack("r1", active = all.toList())) }
+        step { it.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT3, changed = gT1), gEntry("bithumb", "usdt-krw", 0.0, gT3)))) }
+        step { it.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1380.0, gT0)))) }
+        step { it.wire.deliver(gDxy(98.5, gT1, "investing")) }
+        step { it.wire.deliver(gDxy(98.5, gT1, "investing")) }
+        same("socket")
+
+        hs.forEach { h ->
+            h.bootstrapOutcome = { _, topic ->
+                when (topic) {
+                    USD -> h.delivered(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT2))))
+                    TopicCatalogue.DXY -> h.delivered(gDxy(98.5, gT1, "investing"))
+                    else -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1370.0, gT0))))
+                }
+            }
+        }
+        step(100) { it.coordinator.requestBootstrap(USD) }
+        step(100) { it.coordinator.requestBootstrap(TopicCatalogue.DXY) }
+        step(100) { it.coordinator.requestBootstrap(TETHER) }
+        same("bootstrap")
+
+        // Past D14's window: the quiet question and what follows it.
+        step(46_000) { }
+        same("silence")
+        step { it.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1395.0, gT4)))) }
+        step(1_000) { }
+        same("after silence")
+
+        assertTrue("GOBS-17 fixture: the accepting sink saw hand-overs", (accepting.graphSink as GraphRecorder).observations.size >= 8)
+        assertTrue("GOBS-17 fixture: the failing sink lost them", failing.coordinator.graphLoss.value != null)
+        assertTrue("GOBS-17 fixture: the silence asked a question", dormant.requests.size >= 2)
+        dormant.cleanUp()
+    }
+
+    @Test
+    fun `GOBS-18 a restored seed is never handed over, and only the live entry that follows is`() = runTest {
+        val h = Harness(this)
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        val seed = seedOf(seedQuote("upbit", "usdt-krw", 1400.0, gT0), index = TopicDollarIndex(98.0, Instant.parse(gT0), "investing"))
+        h.restoreProvider = { granted -> TopicLastKnownRestore.Seed(seed, granted, TopicUseLifetime(granted.grant, 0L)) }
+        h.coordinator.start()
+        h.setAccess(true, fence())
+        advanceTimeBy(100)
+        assertEquals("GOBS-18 fixture: the seed is shown", seed, h.coordinator.rates.value)
+        assertTrue("GOBS-18 the seed is not handed over", g.inputs.isEmpty())
+
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+
+        assertEquals("GOBS-18 the live entry only", listOf(gQuote("upbit", "usdt-krw", 1390.0, gT1)), g.observations.single().candidates)
         h.cleanUp()
     }
 }

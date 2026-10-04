@@ -7,6 +7,7 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.HttpExchangeEvidence
 import com.jay.fxi.data.local.TopicLastKnownRestore
+import com.jay.fxi.data.remote.dto.DxySpotEntry
 import com.jay.fxi.data.remote.dto.DxyTopicMessage
 import com.jay.fxi.data.remote.dto.TopicSourceEntry
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
@@ -36,6 +37,7 @@ import com.jay.fxi.domain.model.TopicWholeRequestFailure
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -505,7 +507,9 @@ class TopicSessionCoordinator(
     /** Reads a display seed for a granted fence; null disables restore. */
     private val restoreSeed: (suspend (TopicSessionFence) -> TopicLastKnownRestore)? = null,
     /** Offers adopted live rates synchronously; the sink must return promptly. */
-    private val offerLive: ((uid: String, userAccessEpoch: String, rates: TopicRates) -> Unit)? = null
+    private val offerLive: ((uid: String, userAccessEpoch: String, rates: TopicRates) -> Unit)? = null,
+    /** Offers graph candidates before display merge; dormant until a consumer is explicitly attached. */
+    private val graphSink: TopicGraphSink = DormantTopicGraphSink
 ) : TopicGrantSink {
     /**
      * Copied, so what this session consumes cannot change under it.
@@ -673,6 +677,12 @@ class TopicSessionCoordinator(
 
     /** Everything the topics have said, under the strictly-newer rule. */
     val rates: StateFlow<TopicRates> = _rates.asStateFlow()
+
+    private val _graphLoss = MutableStateFlow<TopicGraphLoss?>(null)
+    private var graphSequence = 0L
+
+    /** Cumulative hand-over losses, independent of the graph sink's queue. */
+    val graphLoss: StateFlow<TopicGraphLoss?> = _graphLoss.asStateFlow()
 
     private val _display = MutableStateFlow(TopicDisplayState.NONE)
     private var displayPublicationDeferred = false
@@ -1138,7 +1148,11 @@ class TopicSessionCoordinator(
                 // The snapshot is protected data: applied only while the use its issue acquired is still admitted, however the
                 // access came back in between.
                 if (!authority.admits(input.lifetime)) return
-                applyBootstrap(input.topic, delivered.frame, input.lifetime)
+                applyBootstrap(
+                    input.topic,
+                    delivered.frame,
+                    TopicUseAttribution(sessionKey, owner, input.grantEpoch, input.lifetime)
+                )
             }
 
             is SessionInput.Transport ->
@@ -1692,7 +1706,8 @@ class TopicSessionCoordinator(
      */
     private fun receive(live: Connection, topic: String, entries: List<TopicSourceEntry>) {
         if (!accepts(live, topic)) return
-        val quotes: List<TopicQuote> = entries.mapNotNull { it.toQuote() }
+        val validated = entries.mapNotNull { entry -> entry.toQuote()?.let { entry to it } }
+        val quotes: List<TopicQuote> = validated.map { it.second }
         // No usable price, no delivery — whichever way the payload got that way. The narrow case
         // that decides it is a tether frame carrying only `usd_krw_futures`: D8 took that field
         // out of the DTO, so it is swallowed as an unknown key and what arrives here is
@@ -1700,6 +1715,13 @@ class TopicSessionCoordinator(
         // satisfy tether delivery, and since the two cannot be told apart, neither counts.
         // Found by review.
         if (quotes.isEmpty()) return
+        offerGraphObservations(
+            topic,
+            TopicGraphPath.WS,
+            TopicUseAttribution(sessionKey, live.fence, grantEpoch, live.lifetime),
+            live.generation,
+            graphQuoteCandidates(validated)
+        )
         val held = _rates.value
         val merged = held.merge(quotes)
         _rates.value = merged
@@ -1714,12 +1736,64 @@ class TopicSessionCoordinator(
         // The index has one slot rather than a list, so "everything failed validation" and
         // "nothing arrived" are the same frame here: either way there is no reading to record.
         val index = message.data.dxy.toDollarIndex() ?: return
+        offerGraphObservations(
+            TopicCatalogue.DXY,
+            TopicGraphPath.WS,
+            TopicUseAttribution(sessionKey, live.fence, grantEpoch, live.lifetime),
+            live.generation,
+            graphIndexCandidates(message.data.dxy)
+        )
         val held = _rates.value
         val merged = held.merge(index)
         _rates.value = merged
         offerAdopted(held, merged)
         store.recordFrame(TopicCatalogue.DXY)
         resolveCachedRefresh(live.lifetime)
+    }
+
+    /** Keep wire order and both clocks; the KRX exclusion belongs only to observations. */
+    private fun graphQuoteCandidates(validated: List<Pair<TopicSourceEntry, TopicQuote>>): List<TopicGraphCandidate> =
+        validated.mapNotNull { (entry, _) ->
+            if (entry.source == "krx" || entry.asset == "usd-krw-futures") null
+            else TopicGraphCandidate.Quote(entry.source, entry.asset, entry.rate, entry.timestamp, entry.rateChangedAt)
+        }
+
+    /** Called only after the same entry passed toDollarIndex; retain its wire clock and supplier. */
+    private fun graphIndexCandidates(entry: DxySpotEntry): List<TopicGraphCandidate> =
+        listOf(TopicGraphCandidate.DollarIndex(entry.rate, entry.timestamp, entry.source))
+
+    /** Only the sink call is guarded: hand-over failure never decides price processing. */
+    private fun offerGraphObservations(
+        topic: String,
+        path: TopicGraphPath,
+        attribution: TopicUseAttribution,
+        connectionGeneration: Long?,
+        candidates: List<TopicGraphCandidate>
+    ) {
+        if (candidates.isEmpty()) return
+        val input = TopicGraphInput.Observations(++graphSequence, topic, path, attribution, connectionGeneration, candidates)
+        val offer = try {
+            graphSink.tryOffer(input)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            TopicGraphOffer.FAILED
+        }
+        when (offer) {
+            TopicGraphOffer.ENQUEUED, TopicGraphOffer.DORMANT -> Unit
+            TopicGraphOffer.FULL, TopicGraphOffer.CLOSED, TopicGraphOffer.FAILED -> {
+                val held = _graphLoss.value
+                _graphLoss.value = TopicGraphLoss(
+                    revision = (held?.revision ?: 0L) + 1L,
+                    count = (held?.count ?: 0L) + 1L,
+                    firstSequence = held?.firstSequence ?: input.sequence,
+                    lastSequence = input.sequence,
+                    reasons = (held?.reasons ?: emptySet()) + offer,
+                    topics = (held?.topics ?: emptySet()) + topic,
+                    paths = (held?.paths ?: emptySet()) + path
+                )
+            }
+        }
     }
 
     /** Keeps only live changes adopted by the display in this grant. */
@@ -2422,20 +2496,27 @@ class TopicSessionCoordinator(
      * never received a frame look like one that did. What a bootstrap does earn is D14's window,
      * which `TopicSilencePolicy` arms from either path.
      */
-    private fun applyBootstrap(topic: String, frame: DecodedTopicFrame, lifetime: TopicUseLifetime) {
+    private fun applyBootstrap(topic: String, frame: DecodedTopicFrame, attribution: TopicUseAttribution) {
         when (frame) {
-            is DecodedTopicFrame.Tether -> applyBootstrapEntries(topic, frame.value.data.allEntries, lifetime)
-            is DecodedTopicFrame.Fx -> applyBootstrapEntries(topic, frame.value.data.allEntries, lifetime)
+            is DecodedTopicFrame.Tether -> applyBootstrapEntries(topic, frame.value.data.allEntries, attribution)
+            is DecodedTopicFrame.Fx -> applyBootstrapEntries(topic, frame.value.data.allEntries, attribution)
 
             // One slot rather than a list, so "everything failed validation" and "nothing arrived"
             // are the same answer here — and it arms nothing either way, exactly as the socket's
             // index path records no delivery.
             is DecodedTopicFrame.Dxy -> frame.value.data.dxy.toDollarIndex()?.let { index ->
+                offerGraphObservations(
+                    topic,
+                    TopicGraphPath.REST_BOOTSTRAP,
+                    attribution,
+                    null,
+                    graphIndexCandidates(frame.value.data.dxy)
+                )
                 val held = _rates.value
                 val merged = held.merge(index)
                 _rates.value = merged
                 offerAdopted(held, merged)
-                if (merged.dollarIndex != held.dollarIndex) resolveCachedRefresh(lifetime)
+                if (merged.dollarIndex != held.dollarIndex) resolveCachedRefresh(attribution.lifetime)
             }
 
             // S6 owns KRX and `desired` cannot name it, so this is unreachable rather than
@@ -2460,15 +2541,17 @@ class TopicSessionCoordinator(
      * satisfying tether delivery. A payload that merged **nothing because everything in it was
      * older** is still a delivery: the server answered, and that is what the window measures.
      */
-    private fun applyBootstrapEntries(topic: String, entries: List<TopicSourceEntry>, lifetime: TopicUseLifetime) {
-        val quotes: List<TopicQuote> = entries.mapNotNull { it.toQuote() }
+    private fun applyBootstrapEntries(topic: String, entries: List<TopicSourceEntry>, attribution: TopicUseAttribution) {
+        val validated = entries.mapNotNull { entry -> entry.toQuote()?.let { entry to it } }
+        val quotes: List<TopicQuote> = validated.map { it.second }
         if (quotes.isEmpty()) return
+        offerGraphObservations(topic, TopicGraphPath.REST_BOOTSTRAP, attribution, null, graphQuoteCandidates(validated))
         val held = _rates.value
         val merged = held.merge(quotes)
         _rates.value = merged
         offerAdopted(held, merged)
         recordDelivery(evidenceFor(topic), clock.nowMillis())
-        resolveCachedRefresh(lifetime)
+        resolveCachedRefresh(attribution.lifetime)
     }
 
     // ---- silence (D14) -----------------------------------------------------------------------
