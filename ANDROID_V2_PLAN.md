@@ -18,7 +18,7 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 S1 발급자 회복 경로와 topic 세션·grant 전달자의 runtime 배선은 C4에서 연결됐다.
                                 C4 완료 판정은 ROOT-REFUSAL 기기 증거 미수집으로 PENDING_EVIDENCE다(동결 후 13번).
                                 C2+b 첫 단위 F2(저장값 배너 해제, S3 'R4-c F2' 항목)는 JVM 계약으로 연결했고 기기
-                                증거는 미수집이다. C2+b-1·C2+b-3 전에는 출시할 수 없다.
+                                증거는 10-05 실기기 확인에서 수집했다(C2+b-3 항목).
                                 C2+b-1은 화면 상태에 owner의 canonical topic snapshot을 싣고, 루프 한 턴의 중간
                                 발행을 보류해 새 owner와 이전 가격·상태가 함께 발행되지 않게 했다(JVM 계약).
                                 C2+b-2a는 탭별 수동 topic 재시도(`retryTopics`)를 세션에 연결했다(JVM 계약, 화면
@@ -27,7 +27,8 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 D14 보류 단위는 인증 FAILED로 시작하지 못한 D14 질문을 연결에 보존하고, 인증을
                                 증명하는 ACK 뒤 한 번 재개한다(JVM 계약, 의도적 iOS 이탈).
                                 C2+b-3은 premium 화면에 topic 배너와 "다시 시도"를 연결했다(JVM·에뮬레이터 계측
-                                계약). F2를 포함한 기기 확인 전에는 출시할 수 없다.
+                                계약). 10-05 SM-F711N 기기 확인에서 F2 저장값 배너의 표시·해제와 오프라인·복귀 동작을
+                                관찰했다. topic 줄 문구는 운영에서 자연 발생하지 않아 기기 미수집이다.
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1247,8 +1248,9 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
     다시 확인한 뒤 그 탭의 수동 재시도로 한 번만 보낸다. 클릭만으로 줄을 숨기거나 진행 중 표시를 만들지 않는다. 버튼
     이름은 시각 문구와 같다(iOS와 같고, 별도 접근성 이름·알림 없음).
   - iOS 이탈: 탭 scope에 KRX가 없다(iOS는 테더·달러 탭에 KRX 포함). KRX 구독은 S6 범위다.
-  - **출시 전 남은 것.** SM-F711N 기기 확인(F2 포함). 운영 서버·시험 계정에서 생기지 않은 문구는 미수집으로 남기고,
-    운영 관찰 증거와 계측 계약을 구분해 적는다
+  - **기기 확인(10-05, 증거 `R4c/C2b/device.r1/report.r2.md`).** F2 저장값 배너의 표시와 사라짐, 오프라인 동안
+    premium·가격 유지, 오프라인 cold start의 premium 미표시와 복귀 뒤 자동 진입을 관찰했다. topic 줄 문구와 "다시 시도"는
+    운영에서 자연 발생하지 않아 미수집이며, 계약 시험(B3-00~10·09c)이 근거다. 해제 원인·순서는 기기에서 볼 수 없다
 - **USD/JPY/EUR 현재가를 topic으로 전환하고 `/api/rates`·legacy WS 소비 제거**. S2의 premium unavailable shell을
   실제 premium Root destination으로 교체한다
 - rate consumer cutover와 같은 변경 세트에서 `fxi_cache`의 legacy `rates`·`rates_timestamp`를 제거하고
