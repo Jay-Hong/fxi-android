@@ -29,6 +29,8 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 C2+b-3은 premium 화면에 topic 배너와 "다시 시도"를 연결했다(JVM·에뮬레이터 계측
                                 계약). 10-05 SM-F711N 기기 확인에서 F2 저장값 배너의 표시·해제와 오프라인·복귀 동작을
                                 관찰했다. topic 줄 문구는 운영에서 자연 발생하지 않아 기기 미수집이다.
+                                S3 그래프 관측 GObs-1(`ffda7b9`)은 네 경로의 후보를 표시 병합 전에 원 시각·권위째
+                                dormant sink로 인계한다(JVM 계약, 운영 배선 없음). 연속성 사건은 GObs-2다.
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1165,6 +1167,10 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   소유이며 연결 추가(dormant)와 runtime 배선을 분리한다. 관측 연결 구현 전 L-4d 권위 토큰·거부 결속,
   L-4c ACK 적용 경계, L-4f bootstrap 발급 제어의 최종 구현을 대조한다. L-4e grant 전달·재개와 live 접근권한
   철회 검증은 runtime 배선 전에 대조한다
+  - 진행(10-05): **GObs-1** `ffda7b9` — 네 경로 후보 인계(원 timestamp·`rate_changed_at`·DXY 공급 source·topic·경로),
+    입력이 허용된 원 use의 `TopicUseAttribution`·WS 회차 귀속, 일반 시세 후보의 KRX 제외, sink 결과의 누적 유실
+    상태(`graphLoss`), 기본 `DormantTopicGraphSink`. 계약 GOBS-01~19. **GObs-2(다음)**: 연속성 사건과 CMD 동기
+    control-fact hook, 사건용 epoch 시계. S3 DoD의 관측 항목은 GObs-2 뒤에 닫힌다
 - **topic last-known disk 계약**: 정화·domain 검증을 통과한 FX/Tether/DXY를 서로 다른
   `(uid,userAccessEpoch,topic-kind)` namespace에 저장하고, fresh server premium 승인 뒤 WS/bootstrap보다 먼저 복원한다.
   restored seed는 `refreshingCached/offline` 표시용일 뿐 ACK/delivery 완료·freshness·silence deadline을 충족시키지 않는다.
@@ -1260,7 +1266,9 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
 - **최종 DoD(P3-i 활성화 뒤 실제 purger로 재검증)**: premium 런타임에서 legacy rate API 호출 0 / REST↔WS 경합에서 오래된 값이 최신을 덮지 못함 /
   3회 공유 budget·시도별 absolute 45초(ACK 비연장)·lease-id hard-expiry·30초 안정 후 reconnect reset / server premium rejection 즉시 무료 전환 /
   최초 delivery watchdog과 persistent-silence owner의 중복 resubscribe 0 / KRX-only가 Tether delivery·freshness를 충족하지 않음 /
-  offline cold start에서 정화된 last-known 복원→`refreshingCached/offline` 표시, 복원 seed가 delivery/freshness로 오인되지 않음 /
+  same-UID clean cold start는 fresh server premium 승인 전 protected last-known read/render 0, 승인 뒤 정화된 last-known을
+  복원해 `refreshingCached`로 표시하고 승인된 동일 프로세스의 오프라인에서는 `offline` 표시를 유지하며, 복원 seed는
+  delivery/freshness 증거가 아님 /
   live-wins·5초 write throttle·UID/epoch 전환 purge / Tether payload와 disk cache의 KRX 오염 폐기(D8) /
   표시 병합이 버린 재관측·역순 입력이 관측 인계에 원 시각째 남음 / 무효 가격·검사 실패·KRX 입력의 관측 0 / 권위 종료 뒤 옛
   권위의 지연 관측·사건 0 / sink 실패·포화에서도 merge·배달·deadline 계속 / 관측 연결 전후 배달·watchdog 결과 동일(동결 후 7번)
