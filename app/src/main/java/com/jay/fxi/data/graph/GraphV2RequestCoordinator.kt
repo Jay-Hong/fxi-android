@@ -20,6 +20,7 @@ import com.jay.fxi.domain.model.GraphTabAdmission
 import com.jay.fxi.domain.model.GraphV2Tab
 import com.jay.fxi.time.AppClock
 import java.io.IOException
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
@@ -91,6 +92,13 @@ internal class GraphV2RequestCoordinator(
 ) {
     private data class RequestContext(val fence: TopicSessionFence, val lifetime: TopicUseLifetime)
 
+    private data class ProtectedSlot(val entry: GraphEntry, val components: GraphV2DiskComponents)
+
+    private data class ProtectedPublication(
+        val context: RequestContext?,
+        val slots: Map<GraphKey, ProtectedSlot>
+    )
+
     private data class SeedRegistration(
         val seedId: Long,
         val catalog: GraphCatalog?
@@ -101,7 +109,8 @@ internal class GraphV2RequestCoordinator(
         val context: RequestContext,
         val key: GraphKey?,
         val originalTab: String,
-        val activityGeneration: Long
+        val activityGeneration: Long,
+        val accessCapture: GraphV2AccessCapture? = null
     ) {
         // The only request-owned mutable value consulted outside the loop. Job completion is
         // not disposal: the response still has to pass the loop's application boundary.
@@ -184,9 +193,11 @@ internal class GraphV2RequestCoordinator(
     private val started = AtomicBoolean(false)
     private val mutableState = MutableStateFlow(GraphRequestState())
     val state: StateFlow<GraphRequestState> = mutableState.asStateFlow()
+    @Volatile private var protectedPublication = ProtectedPublication(null, emptyMap())
 
     // Loop-confined. The transport guard never reads these maps or the active key.
     private var snapshot = GraphRequestState()
+    private var protectedSlots: Map<GraphKey, ProtectedSlot> = emptyMap()
     private var activeKey: GraphKey? = null
     private var context: RequestContext? = null
     private var catalogAt: Instant? = null
@@ -244,6 +255,18 @@ internal class GraphV2RequestCoordinator(
     fun onDeactivated() { inbox.trySend(Event.Deactivate) }
     fun onContextChanged() { inbox.trySend(Event.ContextChanged) }
     fun onRefreshRequested(force: Boolean = false) { inbox.trySend(Event.Refresh(force)) }
+
+    /** A single publication pairs each entry with its components and the current use context. */
+    fun protectedEntry(key: GraphKey): GraphEntry? {
+        val ports = cachePorts ?: return null
+        if (!scope.isActive) return null
+        val publication = protectedPublication
+        val current = publication.context ?: return null
+        val slot = publication.slots[key] ?: return null
+        val captured = ports.gate.bind(current.fence, current.lifetime) ?: return null
+        val joined = ports.gate.joinForExposure(captured, slot.components) ?: return null
+        return GraphEntry(joined.tab, slot.entry.online200At)
+    }
 
     private fun handle(event: Event) {
         val now = clock.now()
@@ -338,7 +361,9 @@ internal class GraphV2RequestCoordinator(
                 seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Seed exposure admission is closed")
                 return
             }
-            snapshot = snapshot.copy(entries = snapshot.entries + (event.key to GraphEntry(joined.tab, online200At = null)))
+            val entry = GraphEntry(joined.tab, online200At = null)
+            snapshot = snapshot.copy(entries = snapshot.entries + (event.key to entry))
+            protectedSlots = protectedSlots + (event.key to ProtectedSlot(entry, GraphV2DiskComponents(general, krx)))
             joined.ignoredKrxReason?.let {
                 seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.KRX, it)
             }
@@ -399,6 +424,7 @@ internal class GraphV2RequestCoordinator(
         discardRequests()
         context = next
         catalogAt = null
+        if (scopeChanged) protectedSlots = emptyMap()
         snapshot = GraphRequestState(
             dataScope = dataScope,
             entries = if (scopeChanged) emptyMap() else snapshot.entries
@@ -485,11 +511,22 @@ internal class GraphV2RequestCoordinator(
 
     private fun startTab(current: RequestContext, key: GraphKey, coldAttempt: Boolean, midnightAttempt: Boolean) {
         // Registration is the logical start; changing the active key does not withdraw a sent request.
-        val registration = Registration(++nextRequestId, current, key, key.tab, activityGeneration)
+        val registration = Registration(
+            ++nextRequestId, current, key, key.tab, activityGeneration, bindRequestAccess(current)
+        )
         tabRequests[key] = registration
         connectCold(registration, coldAttempt)
         connectMidnight(registration, midnightAttempt)
         startCapture(registration)
+    }
+
+    private fun bindRequestAccess(current: RequestContext): GraphV2AccessCapture? = try {
+        cachePorts?.gate?.bind(current.fence, current.lifetime)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        // A failed access input admits no KRX; the GENERAL-only fallback leaves HTTP ownership intact.
+        null
     }
 
     private fun startCapture(registration: Registration) {
@@ -591,10 +628,12 @@ internal class GraphV2RequestCoordinator(
         releaseRegistration(registration)
         when (val outcome = tabOutcome(event.result, event.key)) {
             is TabOutcome.Success -> {
+                val entry = GraphEntry(outcome.tab, now)
                 snapshot = snapshot.copy(
-                    entries = snapshot.entries + (event.key to GraphEntry(outcome.tab, now)),
+                    entries = snapshot.entries + (event.key to entry),
                     failures = snapshot.failures - event.key
                 )
+                replaceOnlineSlot(registration, event.key, entry)
                 endConnectedCold(registration)
                 if (connectedMidnight(registration) != null) finishMidnight(now)
             }
@@ -607,6 +646,32 @@ internal class GraphV2RequestCoordinator(
                 if (outcome.disposition == FailureDisposition.DIAGNOSTIC) onEventFailure(outcome.error)
             }
         }
+    }
+
+    private fun replaceOnlineSlot(registration: Registration, key: GraphKey, entry: GraphEntry) {
+        // A failed conversion must never pair a new raw entry with the previous components.
+        protectedSlots = protectedSlots - key
+        if (cachePorts == null) return
+        val fence = registration.context.fence
+        val epoch = fence.userAccessEpoch ?: return
+        val components = try {
+            when (val split = splitGraphV2ServerTab(
+                entry.tab,
+                GraphV2GeneralKey(fence.identity.uid, epoch, key.tab, key.period.code),
+                registration.accessCapture?.krxCapabilityEpoch,
+                UUID.randomUUID().toString(),
+                snapshot.catalog
+            )) {
+                is GraphV2Validation.Valid -> split.value
+                is GraphV2Validation.Invalid -> return
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            // The slot is already absent: fail closed without changing the adopted entry or retry owners.
+            return
+        }
+        protectedSlots = protectedSlots + (key to ProtectedSlot(entry, components))
     }
 
     /** Classification belongs to the transport/decode/admission boundary, never to cached errors. */
@@ -950,6 +1015,7 @@ internal class GraphV2RequestCoordinator(
 
     private fun publish() {
         snapshot = snapshot.copy(inFlight = tabRequests.keys.toSet())
+        protectedPublication = ProtectedPublication(context, protectedSlots)
         mutableState.value = snapshot
     }
 

@@ -63,7 +63,11 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
 /**
- * Claude-owned S4 B1b-2a-1 contract r1: the request owner seeds an empty slot from the Graph V2 disk store.
+ * Claude-owned S4 B1b-2a-1 contract r4: the request owner seeds an empty slot from the Graph V2 disk store.
+ * S4 B1b-2a-2 contract r1 (rows E01-E10) adds the protected exposure: protectedEntry(key) answers only through the live gate,
+ * from component slots kept beside the entries — a disk seed's own pair, or an online 200 split with the capability epoch
+ * bound when its request started (none when that bind failed). Design: b1b2a_design_codex.r1 §4·§6 and b1b2a_verdict_codex.r1
+ * R3 (two online rows) and R4 (a failed start bind keeps a GENERAL-only slot).
  *
  * Oracles: ANDROID_V2_PLAN.md S4 :1288-1290 (a stored answer is shown unconfirmed under fresh approval; only an online 200
  * records freshness; no disk age), :1318-1319 and :1338 (a late answer never lands); iOS a36682f GraphV2ViewModel.swift
@@ -78,7 +82,7 @@ import org.junit.rules.TemporaryFolder
  * snapshot the gate reads; its facts follow the issuer (standing from the issued and current contexts, one invalidation
  * per loss of the user axis or the standing token). A decorator around the store records each read result and can hold a
  * GENERAL result after the real read returned, so a completion arrives later than the change a row makes.
- * This unit reads raw state.entries only; the protected exposure API is B1b-2a-2.
+ * Rows C01-C17 read raw state.entries; rows E01-E10 read protectedEntry.
  */
 class GraphV2RequestCoordinatorCacheTest {
 
@@ -94,6 +98,7 @@ class GraphV2RequestCoordinatorCacheTest {
         val FENCE = TopicSessionFence(AuthIdentityFence("u1", 1L), "e1", TopicGrantToken(7L))
         val IDS = listOf("hana.usd-krw", "krx.usd-krw-futures", "kb.usd-krw")
         const val ONLINE = "investing.usd-krw"
+        const val KRX_SERIES = "krx.usd-krw-futures"
         val ALL_IDS = IDS + ONLINE
     }
 
@@ -252,7 +257,7 @@ class GraphV2RequestCoordinatorCacheTest {
         }
     }
 
-    private inner class Fixture(test: TestScope, start: Instant = NOON) {
+    private inner class Fixture(test: TestScope, start: Instant = NOON, cache: Boolean = true) {
         init { opened += this }
         val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(test.testScheduler))
         private val base = test.testScheduler.currentTime
@@ -336,11 +341,13 @@ class GraphV2RequestCoordinatorCacheTest {
             },
             rateLimitJitter = { Duration.ZERO },
             onEventFailure = { failures += it },
-            cachePorts = GraphV2CachePorts(store = store, gate = gate, onSeedDiagnostic = {
+            cachePorts = if (!cache) null else GraphV2CachePorts(store = store, gate = gate, onSeedDiagnostic = {
                 diagnostics += it
                 if (observerThrows) throw IllegalStateException("observer")
             })
         )
+
+        fun exposed() = coordinator.protectedEntry(KEY)
 
         val state get() = coordinator.state.value
         fun tabs() = sent.filter { it.admittedAtSend }
@@ -381,6 +388,19 @@ class GraphV2RequestCoordinatorCacheTest {
         period = GraphPeriod.THREE_MONTHS.code,
         series = listOf(GraphV2Series(ONLINE, ONLINE, "krw", "KRW", 2, listOf(GraphV2Point(NOON - 1.days, rate, "x")),
             GraphV2Provenance(false, emptyList()), null)),
+        metadata = GraphV2Metadata(NOON - 1.hours, "1d", GraphV2Range("2026-07-05", "2026-10-05"))
+    )
+
+    /** An online answer with a general and a KRX series. */
+    private fun onlineKrxDto(rate: Double) = GraphV2TabResponse(
+        tab = "usd",
+        period = GraphPeriod.THREE_MONTHS.code,
+        series = listOf(
+            GraphV2Series(ONLINE, ONLINE, "krw", "KRW", 2, listOf(GraphV2Point(NOON - 1.days, rate, "x")),
+                GraphV2Provenance(false, emptyList()), null),
+            GraphV2Series(KRX_SERIES, KRX_SERIES, "krw", "KRW", 1, listOf(GraphV2Point(NOON - 1.days, rate + 5, "krx")),
+                GraphV2Provenance(false, emptyList()), null)
+        ),
         metadata = GraphV2Metadata(NOON - 1.hours, "1d", GraphV2Range("2026-07-05", "2026-10-05"))
     )
 
@@ -793,6 +813,197 @@ class GraphV2RequestCoordinatorCacheTest {
         f.store.release(1); runCurrent()
         assertNull(f.state.entries[KEY])
         assertEquals(emptyList<Throwable>(), f.failures)
+        f.close()
+    }
+
+    // --- E: the protected exposure (B1b-2a-2) --------------------------------------------------------------------
+
+    private fun GraphEntry?.ids() = checkNotNull(this) { "nothing exposed" }.tab.graph.series.map { it.seriesId }
+
+    /** B02-b: an exposed seed or online answer closes at once with the live gate, before any control event; KRX alone closes alone. */
+    @Test fun E01_theExposureFollowsTheLiveGate() = cacheTest {
+        val krxSeed = GraphV2InProgress(NOON - 10.hours, 1302.0, 1300.0, 1301.0, NOON - 1.hours)
+        val c = components(serverTab(inProgress = mapOf(KRX_SERIES to krxSeed)))
+        for (source in listOf("seed", "online")) {
+            val f = Fixture(this)
+            if (source == "seed") f.put(c)
+            f.start(); f.coordinator.onActivated(KEY); runCurrent()
+            if (source == "online") { f.sent.single().tab.complete(ok(onlineKrxDto(1500.0))); runCurrent() }
+            val open = checkNotNull(f.exposed()) { source }
+            assertTrue("$source: KRX shown", KRX_SERIES in open.ids())
+            f.protectedOpen = false
+            assertNull("$source: protected admission closed", f.exposed())
+            f.protectedOpen = true
+            assertEquals("$source: reopened", open, f.exposed())
+            f.snapshot = snap(userBlocks = setOf(TopicAccessBlock.LOSS_CANDIDATE), invalidations = 4L)
+            assertNull("$source: the user axis held", f.exposed())
+            f.close()
+
+            val g = Fixture(this)
+            if (source == "seed") g.put(c)
+            g.start(); g.coordinator.onActivated(KEY); runCurrent()
+            if (source == "online") { g.sent.single().tab.complete(ok(onlineKrxDto(1500.0))); runCurrent() }
+            g.snapshot = snap(capabilityBlocks = setOf(TopicAccessBlock.CONTEXT_UNCERTAIN))
+            val generalOnly = checkNotNull(g.exposed()) { "$source: KRX held" }
+            assertTrue("$source: KRX held, no KRX series", KRX_SERIES !in generalOnly.ids())
+            assertNull("$source: KRX held, no KRX bucket", generalOnly.tab.inProgress[KRX_SERIES])
+            assertEquals("$source: the stamp is the slot's", g.state.entries.getValue(KEY).online200At, generalOnly.online200At)
+            g.close()
+        }
+    }
+
+    /** R3: an online answer's KRX half keeps the epoch its request bound; after a rotation to K2 only a K2 request shows KRX. */
+    @Test fun E02_anOnlineKrxHalfKeepsItsRequestsEpoch() = cacheTest {
+        val f = Fixture(this)
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        f.sent.single().tab.complete(ok(onlineKrxDto(1500.0))); runCurrent()
+        assertTrue(KRX_SERIES in f.exposed().ids())
+        f.snapshot = snap(capabilityBlocks = setOf(TopicAccessBlock.CONTEXT_UNCERTAIN))
+        f.snapshot = snap(krx = "K2", issuedRecord = AccessFence("u1", "e1", "K1"),
+            capabilityBlocks = setOf(TopicAccessBlock.NOT_GRANTED), invalidations = 4L)
+        f.rebind("u1", 1L, "e1", 8L, krx = "K2", generation = 11L, invalidations = 4L)
+        f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("the K1 half is not shown under K2", listOf(ONLINE), f.exposed().ids())
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        f.sent.last().tab.complete(ok(onlineKrxDto(1600.0))); runCurrent()
+        assertEquals("a request bound under K2 shows its KRX half", listOf(ONLINE, KRX_SERIES), f.exposed().ids())
+        f.close()
+    }
+
+    /** R3: a request that started with the capability held keeps no KRX half, even if the capability opens before its answer. */
+    @Test fun E03_theEpochIsBoundWhenTheRequestStarts() = cacheTest {
+        val f = Fixture(this)
+        f.snapshot = snap(capabilityBlocks = setOf(TopicAccessBlock.NOT_GRANTED))
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        f.snapshot = snap()
+        f.sent.single().tab.complete(ok(onlineKrxDto(1500.0))); runCurrent()
+        assertEquals(listOf(ONLINE), f.exposed().ids())
+        f.close()
+    }
+
+    /** R4: a request whose start bind failed keeps a GENERAL-only slot: nothing while closed, the general half once open. */
+    @Test fun E04_aFailedStartBindKeepsAGeneralOnlySlot() = cacheTest {
+        val f = Fixture(this)
+        f.protectedOpen = false
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        f.sent.single().tab.complete(ok(onlineKrxDto(1500.0))); runCurrent()
+        assertNotNull("the request owner adopted it", f.state.entries[KEY])
+        assertNull("closed", f.exposed())
+        f.protectedOpen = true
+        assertEquals("open: the general half only", listOf(ONLINE), f.exposed().ids())
+        f.close()
+
+        // Opened before the answer: a completion that re-bound only because the start bind was null would show KRX.
+        val g = Fixture(this)
+        g.protectedOpen = false
+        g.start(); g.coordinator.onActivated(KEY); runCurrent()
+        g.protectedOpen = true
+        g.sent.single().tab.complete(ok(onlineKrxDto(1500.0))); runCurrent()
+        assertNotNull(g.state.entries[KEY])
+        assertEquals(listOf(ONLINE), g.exposed().ids())
+        g.close()
+    }
+
+    /** Without cache ports nothing is exposed, while the request owner works as before. */
+    @Test fun E05_noCacheExposesNothing() = cacheTest {
+        val f = Fixture(this, cache = false)
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        f.sent.single().tab.complete(ok(onlineKrxDto(1500.0))); runCurrent()
+        assertNotNull(f.state.entries[KEY])
+        assertNull(f.exposed())
+        f.close()
+    }
+
+    /** B08: an exposed seed and an exposed online answer stay exposed through failures and two days, stamps unchanged. */
+    @Test fun E06_lastGoodStaysExposed() = cacheTest {
+        val c = components(serverTab())
+        for (source in listOf("seed", "online")) {
+            val f = Fixture(this)
+            if (source == "seed") f.put(c)
+            f.start(); f.coordinator.onActivated(KEY); runCurrent()
+            if (source == "online") { f.sent.single().tab.complete(ok(onlineKrxDto(1500.0))); runCurrent() }
+            val before = checkNotNull(f.exposed()) { source }
+            f.autoTab = fail503
+            f.sent.filter { !it.tab.isCompleted }.forEach { fail503(it) }
+            runCurrent()
+            f.coordinator.onRefreshRequested(force = true); runCurrent()
+            assertTrue("$source: a graph request failed", f.tabs().size >= 2 && KEY in f.state.failures)
+            step(2.days)
+            assertEquals(source, before, f.exposed())
+            f.close()
+        }
+    }
+
+    /** Within one data scope a new context exposes the kept slot; another USER epoch clears it. */
+    @Test fun E07_theDataScopeDecidesWhatIsKept() = cacheTest {
+        val f = Fixture(this)
+        val c = components(serverTab())
+        f.put(c)
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        val exposed = checkNotNull(f.exposed())
+        f.rebind("u1", 2L, "e1", 8L, generation = 11L)
+        f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("same scope, new context: kept and shown", exposed.tab, f.exposed()?.tab)
+        f.rebind("u1", 2L, "e2", 9L, generation = 12L)
+        f.coordinator.onContextChanged(); runCurrent()
+        assertNull("another USER epoch: not exposed", f.exposed())
+        f.close()
+    }
+
+    /** An online answer replaces the seed's slot as well as its entry. */
+    @Test fun E08_anOnlineAnswerReplacesTheSeedSlot() = cacheTest {
+        val f = Fixture(this)
+        f.put(components(serverTab()))
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        assertEquals(IDS, f.exposed().ids())
+        f.sent.single().tab.complete(ok(onlineKrxDto(1500.0))); runCurrent()
+        val online = checkNotNull(f.exposed())
+        assertEquals(listOf(ONLINE, KRX_SERIES), online.ids())
+        assertNotNull(online.online200At)
+        f.close()
+    }
+
+    /** A user hold that came and went leaves nothing exposed until the request owner takes the new lifetime. */
+    @Test fun E09_aUserHoldRoundTripHidesUntilTheContextMovesOn() = cacheTest {
+        val f = Fixture(this)
+        f.put(components(serverTab()))
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        val exposed = checkNotNull(f.exposed())
+        f.snapshot = snap(userBlocks = setOf(TopicAccessBlock.LOSS_CANDIDATE), invalidations = 4L)
+        f.snapshot = snap(invalidations = 4L)
+        assertNull("the context's lifetime is spent", f.exposed())
+        f.coordinator.onContextChanged(); runCurrent()
+        assertEquals(exposed, f.exposed())
+        f.close()
+    }
+
+    /** A request owner whose scope ended exposes nothing. */
+    @Test fun E10_anEndedScopeExposesNothing() = cacheTest {
+        val f = Fixture(this)
+        f.put(components(serverTab()))
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        assertNotNull(f.exposed())
+        assertNull("a key without a slot exposes nothing", f.coordinator.protectedEntry(GraphKey("usd", GraphPeriod.ONE_YEAR)))
+        f.close()
+        assertNull(f.exposed())
+    }
+
+    /**
+     * A data scope that lapses (no live fence) and returns to the same UID and USER epoch clears the slots with the entries:
+     * an online-only slot is not shown again until a new answer lands (Codex counterexample to the N07 equivalence).
+     */
+    @Test fun E11_aLapsedScopeClearsTheSlots() = cacheTest {
+        val f = Fixture(this)
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        f.sent.single().tab.complete(ok(onlineKrxDto(1500.0))); runCurrent()
+        assertNotNull(f.exposed())
+        f.fence = null
+        f.coordinator.onContextChanged(); runCurrent()
+        assertNull("no live fence", f.exposed())
+        f.fence = FENCE
+        f.coordinator.onContextChanged(); runCurrent()
+        assertNull("the raw entry is gone", f.state.entries[KEY])
+        assertNull("back to the same scope: the slot is gone too", f.exposed())
         f.close()
     }
 
