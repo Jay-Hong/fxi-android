@@ -53,6 +53,9 @@ import org.junit.Test
  * S4 A2b-1 contract r3 (r1 battery survivors B17·B18·B22·B25·B28 closed by fixtures; r2 adds Codex counterexamples
  * to B14·B34·B36) adds the cold retry ladder, failure classification, the shared rate-limit floor and the
  * cancellation of cold timers (A2b1 rows; design a2b_design_codex.r1 A2-09/10/13/14 as trimmed by a2b_review_claude.r1).
+ * S4 A2b-2 contract r3 (r2 fixtures kill P16·P17; r3 adds Codex counterexamples to P22·P23) adds the midnight refresh of fixed-start periods: the next 00:02 KST, the 20/40/80 backoff
+ * of a confirmed key, the cold ladder for an unconfirmed one, joining a request in flight, and its cancellation
+ * (A2b2 rows; design a2b_design_codex.r1 A2-11/12/02 and A2-13/14 midnight rows).
  *
  * Oracles: ANDROID_V2_PLAN.md S4 (:1288 online 200 alone records freshness, :448 D15 TTL ∧ same KST day,
  * :1317-1320 single-flight per scope·authority·tab·period, late answers never applied) and its DoD
@@ -1055,5 +1058,214 @@ class GraphV2RequestCoordinatorTest {
         step(8.seconds)
         assertEquals(secs(1, 4, 10), f.tabTimes(jpy))
         f.close()
+    }
+
+    // --- A2b2-11 the midnight target ---------------------------------------------------------------
+
+    /** 23:50 KST on 2026-10-05, as UTC. */
+    private val BEFORE_MIDNIGHT: Instant = Instant.parse("2026-10-05T14:50:00Z")
+    private val LONG = listOf(GraphPeriod.ONE_WEEK, GraphPeriod.THREE_MONTHS, GraphPeriod.ONE_YEAR)
+
+    /** A confirmed long-period key, started at [start], answering every request with [answer]. */
+    private fun TestScope.confirmed(key: GraphKey, start: Instant, vararg answers: (Sent) -> Unit): Fixture =
+        Fixture(this, start).also { f ->
+            f.autoCatalog = { s -> s.catalog.complete(ok(wideCatalog())) }
+            f.tabSequence(succeed(key), *answers)
+            f.coordinator.start(); runCurrent()
+            f.coordinator.onActivated(key); runCurrent()
+            assertEquals(1, f.admittedTabs(key).size)
+        }
+
+    /** Each fixed-start period refreshes at the next 00:02 KST, then again a day later; a 1d key never schedules. */
+    @Test fun A2b2_11a_theNextZeroZeroTwoAndTheDayAfter() = runTest {
+        for (period in LONG) {
+            val key = GraphKey("usd", period)
+            val f = confirmed(key, BEFORE_MIDNIGHT, succeed(key))
+            step(719999.milliseconds); assertEquals("$period", 1, f.admittedTabs(key).size)
+            step(1.milliseconds); assertEquals("$period 00:02", 2, f.admittedTabs(key).size)
+            step(86400.seconds); assertEquals("$period the next 00:02", 3, f.admittedTabs(key).size)
+            f.close()
+        }
+        val f = confirmed(USD_1D, BEFORE_MIDNIGHT, succeed(USD_1D))
+        step(48.hours)
+        assertEquals("1d never schedules", 1, f.admittedTabs(USD_1D).size)
+        f.close()
+    }
+
+    /** Inside today's window the target is today's 00:02; at 00:02 itself it is tomorrow's. */
+    @Test fun A2b2_11b_todaysWindowIsIncluded() = runTest {
+        val key = GraphKey("usd", GraphPeriod.ONE_WEEK)
+        val f = confirmed(key, Instant.parse("2026-10-05T15:01:00Z"), succeed(key)) // 00:01 KST
+        step(59999.milliseconds); assertEquals(1, f.admittedTabs(key).size)
+        step(1.milliseconds); assertEquals(2, f.admittedTabs(key).size)
+        f.close()
+        val g = confirmed(key, Instant.parse("2026-10-05T15:02:00Z"), succeed(key)) // 00:02 KST exactly
+        step(86399999.milliseconds); assertEquals(1, g.admittedTabs(key).size)
+        step(1.milliseconds); assertEquals(2, g.admittedTabs(key).size)
+        g.close()
+    }
+
+    /** A fixed-start key the catalog does not offer schedules nothing: no midnight request of any kind. */
+    @Test fun A2b2_11d_anUnsupportedKeySchedulesNoMidnight() = runTest {
+        val supported = USD_3M
+        val unsupported = GraphKey("usd", GraphPeriod.ONE_WEEK)
+        val f = Fixture(this, BEFORE_MIDNIGHT)
+        f.autoCatalog = { s -> s.catalog.complete(ok(catalogDto(60, periods = mapOf("3m" to listOf(SERIES))))) }
+        f.tabSequence(succeed(supported))
+        f.coordinator.start(); runCurrent()
+        f.coordinator.onActivated(supported); runCurrent()
+        f.coordinator.onActivated(unsupported); runCurrent()
+        step(1.hours)
+        assertEquals("no catalog refresh at 00:02 for a key that is not offered", 1, f.catalogs().size)
+        assertEquals(0, f.tabs(unsupported).size)
+        f.close()
+    }
+
+    /** A wake that finds the wall clock short of the target waits the rest; it does not fetch early. */
+    @Test fun A2b2_11c_aClockThatFellBackWaitsTheRest() = runTest {
+        val key = GraphKey("usd", GraphPeriod.THREE_MONTHS)
+        val f = confirmed(key, BEFORE_MIDNIGHT, succeed(key))
+        step(60.seconds); f.skew = (-60).seconds
+        step(660.seconds); assertEquals("the virtual deadline passed, the wall clock did not", 1, f.admittedTabs(key).size)
+        step(60.seconds); assertEquals(2, f.admittedTabs(key).size)
+        f.close()
+    }
+
+    // --- A2b2-12 midnight backoff and its owner ------------------------------------------------------
+
+    /** A confirmed key's midnight failures retry at 20, 40 and 80 seconds after each completion, then wait for the next day. */
+    @Test fun A2b2_12a_aConfirmedKeysMidnightBackoff() = runTest {
+        for ((label, fail) in listOf<Pair<String, (Sent) -> Unit>>(
+            "503" to fail503,
+            "404" to { it.tab.complete(status(404)) },
+            "undecodable" to { it.tab.completeExceptionally(decodeFailure()) },
+            "A1 refusal" to { it.tab.complete(ok(tabDto(JPY_3M))) }
+        )) {
+            val key = GraphKey("usd", GraphPeriod.THREE_MONTHS)
+            val f = confirmed(key, BEFORE_MIDNIGHT, fail)
+            step(720.seconds)
+            step(260.seconds) // to 00:06:20
+            assertEquals(label, secs(0, 720, 740, 780, 860), f.tabTimes(key))
+            step(86400.seconds - 260.seconds)
+            assertEquals("$label: the next day", 6, f.admittedTabs(key).size)
+            f.close()
+        }
+    }
+
+    /** A success ends the backoff. */
+    @Test fun A2b2_12b_aSuccessEndsTheBackoff() = runTest {
+        val key = GraphKey("usd", GraphPeriod.ONE_WEEK)
+        val f = confirmed(key, BEFORE_MIDNIGHT, fail503, fail503, succeed(key))
+        step(720.seconds); step(300.seconds)
+        assertEquals(secs(0, 720, 740, 780), f.tabTimes(key))
+        f.close()
+    }
+
+    /**
+     * While the midnight backoff waits, a non-forced refresh does not go out on its own, and a forced refresh that
+     * fails leaves the backoff's schedule and budget as they were.
+     */
+    @Test fun A2b2_12e_theBackoffKeepsItsScheduleAgainstOutsideRefreshes() = runTest {
+        val key = GraphKey("usd", GraphPeriod.THREE_MONTHS)
+        val f = confirmed(key, BEFORE_MIDNIGHT, fail503)
+        step(730.seconds); f.coordinator.onRefreshRequested(force = false); runCurrent()
+        step(300.seconds)
+        assertEquals(secs(0, 720, 740, 780, 860), f.tabTimes(key))
+        f.close()
+
+        val g = confirmed(key, BEFORE_MIDNIGHT, fail503)
+        step(730.seconds); g.coordinator.onRefreshRequested(force = true); runCurrent()
+        step(300.seconds)
+        assertEquals(secs(0, 720, 730, 740, 780, 860), g.tabTimes(key))
+        g.close()
+    }
+
+    /** An unconfirmed key's midnight failure belongs to the cold ladder; there is no midnight backoff on top. */
+    @Test fun A2b2_12c_anUnconfirmedKeysMidnightFailureIsCold() = runTest {
+        val key = GraphKey("usd", GraphPeriod.ONE_YEAR)
+        val f = Fixture(this, BEFORE_MIDNIGHT)
+        f.autoCatalog = { s -> s.catalog.complete(ok(wideCatalog())) }
+        f.tabSequence({ it.tab.complete(status(404)) }, fail503)
+        f.coordinator.start(); runCurrent()
+        f.coordinator.onActivated(key); runCurrent()
+        step(720.seconds); step(300.seconds)
+        assertEquals(secs(0, 720, 723, 729, 741, 765, 813), f.tabTimes(key))
+        // Handing the failure to the cold ladder does not drop the next day's midnight.
+        step(86399999.milliseconds - 300000.milliseconds); assertEquals(7, f.admittedTabs(key).size)
+        step(1.milliseconds); assertEquals(8, f.admittedTabs(key).size)
+        f.close()
+    }
+
+    /** An unconfirmed key whose midnight request is refused outright has no ladder, yet tomorrow's midnight stays. */
+    @Test fun A2b2_12f_anUnconfirmedTerminalMidnightKeepsTomorrow() = runTest {
+        val key = GraphKey("usd", GraphPeriod.ONE_YEAR)
+        val f = Fixture(this, BEFORE_MIDNIGHT)
+        f.autoCatalog = { s -> s.catalog.complete(ok(wideCatalog())) }
+        f.tabSequence({ it.tab.complete(status(404)) })
+        f.coordinator.start(); runCurrent()
+        f.coordinator.onActivated(key); runCurrent()
+        step(720.seconds)
+        assertEquals(secs(0, 720), f.tabTimes(key))
+        step(86399999.milliseconds); assertEquals(2, f.admittedTabs(key).size)
+        step(1.milliseconds); assertEquals(secs(0, 720, 87120), f.tabTimes(key))
+        f.close()
+    }
+
+    /** A header-less 429 at midnight adds this tab's jitter to the midnight interval; a later 503 does not. */
+    @Test fun A2b2_12d_aMidnight429CarriesTheJitter() = runTest {
+        val key = GraphKey("usd", GraphPeriod.THREE_MONTHS)
+        val f = Fixture(this, BEFORE_MIDNIGHT) { 10.seconds }
+        f.autoCatalog = { s -> s.catalog.complete(ok(wideCatalog())) }
+        f.tabSequence(succeed(key), { it.tab.complete(limited(429, null)) }, fail503)
+        f.coordinator.start(); runCurrent()
+        f.coordinator.onActivated(key); runCurrent()
+        step(720.seconds); step(100.seconds)
+        assertEquals(secs(0, 720, 750, 790), f.tabTimes(key))
+        f.close()
+    }
+
+    // --- A2b2-14 midnight timers and their ownership -------------------------------------------------
+
+    /** Deactivating, or switching to 1d, ends a waiting midnight backoff. */
+    @Test fun A2b2_14_aTransitionEndsTheMidnightBackoff() = runTest {
+        val key = GraphKey("usd", GraphPeriod.THREE_MONTHS)
+        val f = confirmed(key, BEFORE_MIDNIGHT, fail503)
+        step(730.seconds); f.coordinator.onDeactivated(); runCurrent()
+        step(300.seconds)
+        assertEquals(secs(0, 720), f.tabTimes(key))
+        f.close()
+
+        val g = confirmed(key, BEFORE_MIDNIGHT, fail503)
+        g.tabSequence(fail503, succeed(USD_1D))
+        step(730.seconds); g.coordinator.onActivated(USD_1D); runCurrent()
+        step(300.seconds)
+        assertEquals(secs(0, 720), g.tabTimes(key))
+        assertEquals(secs(730), g.tabTimes(USD_1D))
+        g.close()
+    }
+
+    // --- A2b2-02 joining a request already in flight -------------------------------------------------
+
+    /** At 00:02 a request already in flight is joined: its success meets today's refresh, its failure starts the backoff from its completion. */
+    @Test fun A2b2_02_midnightJoinsTheRequestInFlight() = runTest {
+        val key = GraphKey("usd", GraphPeriod.THREE_MONTHS)
+        for ((label, after, succeeds) in listOf<Triple<String, Int, Boolean>>(
+            Triple("success at 00:02:05", 5, true),
+            Triple("failure at 00:02:05", 5, false),
+            Triple("failure at 00:02:50", 50, false)
+        )) {
+            val f = confirmed(key, BEFORE_MIDNIGHT, hold, fail503)
+            step(719.seconds); f.coordinator.onRefreshRequested(force = true); runCurrent() // 00:01:59
+            val r = f.admittedTabs(key).last()
+            step(1.seconds) // 00:02:00 due
+            assertEquals("$label: the due joins", 2, f.admittedTabs(key).size)
+            step(after.seconds)
+            if (succeeds) r.tab.complete(ok(tabDto(key))) else r.tab.complete(status(503))
+            runCurrent()
+            step(600.seconds)
+            val expected = if (succeeds) secs(0, 719) else secs(0, 719, 720 + after + 20, 720 + after + 60, 720 + after + 140)
+            assertEquals(label, expected, f.tabTimes(key))
+            f.close()
+        }
     }
 }
