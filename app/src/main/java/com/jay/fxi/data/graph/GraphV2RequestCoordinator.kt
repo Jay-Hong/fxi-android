@@ -92,7 +92,11 @@ internal class GraphV2RequestCoordinator(
 ) {
     private data class RequestContext(val fence: TopicSessionFence, val lifetime: TopicUseLifetime)
 
-    private data class ProtectedSlot(val entry: GraphEntry, val components: GraphV2DiskComponents)
+    private data class ProtectedSlot(
+        val entry: GraphEntry,
+        val components: GraphV2DiskComponents,
+        val supplementGeneration: Long? = null
+    )
 
     private data class ProtectedPublication(
         val context: RequestContext?,
@@ -101,7 +105,12 @@ internal class GraphV2RequestCoordinator(
 
     private data class SeedRegistration(
         val seedId: Long,
-        val catalog: GraphCatalog?
+        val key: GraphKey,
+        val context: RequestContext,
+        val activityGeneration: Long,
+        val catalog: GraphCatalog?,
+        val configuration: GraphV2CapabilityConfiguration,
+        val mode: GraphV2SeedMode
     )
 
     private class WriteTask(
@@ -219,6 +228,8 @@ internal class GraphV2RequestCoordinator(
     // Loop-confined. The transport guard never reads these maps or the active key.
     private var snapshot = GraphRequestState()
     private var protectedSlots: Map<GraphKey, ProtectedSlot> = emptyMap()
+    private var capabilityConfiguration: GraphV2CapabilityConfiguration? = null
+    private var capabilityGeneration = 0L
     private var activeKey: GraphKey? = null
     private var context: RequestContext? = null
     private var catalogAt: Instant? = null
@@ -229,6 +240,7 @@ internal class GraphV2RequestCoordinator(
     private var nextSeedId = 0L
     private var seedRegistration: SeedRegistration? = null
     private var attemptedSeedKey: GraphKey? = null
+    private var attemptedSupplement: GraphV2SeedMode.SupplementOccupied? = null
     private var nextWriteId = 0L
     private val writeTasks = mutableMapOf<GraphV2WriteTicket, WriteTask>()
     private var writePreparationToStart: Job? = null
@@ -312,6 +324,7 @@ internal class GraphV2RequestCoordinator(
                 synchronizeContext()
                 if (activeKey != event.key) cancelActiveDemand()
                 activeKey = event.key
+                synchronizeCapabilityConfiguration()
                 startDiskSeed()
                 requestActive(now, force = false)
             }
@@ -322,11 +335,13 @@ internal class GraphV2RequestCoordinator(
             }
             Event.ContextChanged -> {
                 val changed = synchronizeContext()
+                synchronizeCapabilityConfiguration()
                 startDiskSeed()
                 if (changed) requestActive(now, force = false)
             }
             is Event.Refresh -> {
                 synchronizeContext()
+                synchronizeCapabilityConfiguration()
                 startDiskSeed()
                 requestActive(now, event.force)
             }
@@ -346,23 +361,43 @@ internal class GraphV2RequestCoordinator(
         val ports = cachePorts ?: return
         val key = activeKey ?: return
         val current = context ?: return
-        if (GraphV2Domain.support(snapshot.catalog, key.tab, key.period) == GraphPeriodSupport.Unsupported ||
-            snapshot.entries[key] != null || attemptedSeedKey == key
-        ) return
+        if (!scope.isActive || seedRegistration != null ||
+            GraphV2Domain.support(snapshot.catalog, key.tab, key.period) == GraphPeriodSupport.Unsupported) return
+        val slot = protectedSlots[key]
+        val mode = if (snapshot.entries[key] == null) {
+            if (attemptedSeedKey == key) return
+            GraphV2SeedMode.FillEmpty
+        } else {
+            val occupied = slot ?: return
+            if (occupied.supplementGeneration != capabilityGeneration) return
+            val supplement = GraphV2SeedMode.SupplementOccupied(
+                occupied.components.general.responseId, capabilityConfiguration ?: return, capabilityGeneration
+            )
+            if (attemptedSupplement == supplement) return
+            supplement
+        }
         // A failed bind spends no attempt in this generation, even though IDs are never reused.
         val seedId = Math.incrementExact(nextSeedId)
         nextSeedId = seedId
-        val captured = try {
-            ports.gate.bind(current.fence, current.lifetime)
+        val binding = try {
+            ports.gate.bindWithConfiguration(current.fence, current.lifetime)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Throwable) {
             seedDiagnostic(seedId, key, GraphV2DiskComponent.GENERAL, "Seed access binding failed", failure)
             return
         } ?: return
-        val registration = SeedRegistration(seedId, snapshot.catalog)
+        if (mode is GraphV2SeedMode.SupplementOccupied && binding.configuration != mode.configuration) return
+        val captured = binding.captured
+        val registration = SeedRegistration(
+            seedId, key, current, activityGeneration, snapshot.catalog, binding.configuration, mode
+        )
         seedRegistration = registration
-        attemptedSeedKey = key
+        when (mode) {
+            GraphV2SeedMode.FillEmpty -> attemptedSeedKey = key
+            // Keep the need pending on failure, without looping; a new activation or flip can retry it.
+            is GraphV2SeedMode.SupplementOccupied -> attemptedSupplement = mode
+        }
         scope.launch {
             val result = readGraphV2DiskSeed(ports, key, captured, registration.catalog)
             inbox.trySend(Event.DiskSeedFinished(seedId, key, captured, result))
@@ -371,24 +406,47 @@ internal class GraphV2RequestCoordinator(
 
     /** Cache failures must not enter the event catch that cancels HTTP retry owners. */
     private fun applyDiskSeed(event: Event.DiskSeedFinished) {
+        var released = false
         try {
             val ports = cachePorts ?: return
             val registration = seedRegistration
-            if (registration == null || registration.seedId != event.seedId || !scope.isActive) {
+            if (registration == null || registration.seedId != event.seedId || !scope.isActive ||
+                registration.key != event.key || registration.context != context ||
+                registration.activityGeneration != activityGeneration || activeKey != event.key) {
                 seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Seed ownership expired")
                 return
             }
             // Only this owner is released; an older completion cannot remove a newer one.
             seedRegistration = null
+            released = true
             diagnoseSeedRead(event, GraphV2DiskComponent.GENERAL, event.result.general)
             diagnoseSeedRead(event, GraphV2DiskComponent.KRX, event.result.krx)
             val general = when (val read = event.result.general) {
                 is GraphV2DiskRead.Found -> read.envelope
                 else -> return
             }
-            if (snapshot.entries[event.key] != null) {
+            // FillEmpty must reach the occupancy check even after a same-context capability flip.
+            if (registration.mode == GraphV2SeedMode.FillEmpty && snapshot.entries[event.key] != null) {
                 seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Seed slot is already occupied")
                 return
+            }
+            if (general.key != event.captured.generalKey(event.key)) {
+                seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Seed GENERAL key does not match")
+                return
+            }
+            val mode = registration.mode
+            if (mode is GraphV2SeedMode.SupplementOccupied) {
+                val binding = ports.gate.bindWithConfiguration(event.captured.fence, event.captured.lifetime)
+                if (mode.configurationGeneration != capabilityGeneration ||
+                    binding?.configuration != mode.configuration || capabilityConfiguration != mode.configuration) {
+                    seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Supplement configuration expired")
+                    return
+                }
+                if (general.responseId != mode.expectedGeneralResponseId ||
+                    protectedSlots[event.key]?.components?.general?.responseId != mode.expectedGeneralResponseId) {
+                    seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Supplement response ID does not match")
+                    return
+                }
             }
             val krx = when (val read = event.result.krx) {
                 is GraphV2DiskRead.Found -> read.envelope
@@ -399,16 +457,25 @@ internal class GraphV2RequestCoordinator(
                 seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Seed exposure admission is closed")
                 return
             }
-            val entry = GraphEntry(joined.tab, online200At = null)
-            snapshot = snapshot.copy(entries = snapshot.entries + (event.key to entry))
-            protectedSlots = protectedSlots + (event.key to ProtectedSlot(entry, GraphV2DiskComponents(general, krx)))
             joined.ignoredKrxReason?.let {
                 seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.KRX, it)
             }
+            if (mode is GraphV2SeedMode.SupplementOccupied && !joined.krxJoined) return
+            val stamp = if (mode is GraphV2SeedMode.SupplementOccupied) snapshot.entries[event.key]?.online200At else null
+            val entry = GraphEntry(joined.tab, stamp)
+            val pending = if (mode == GraphV2SeedMode.FillEmpty &&
+                registration.configuration != capabilityConfiguration) capabilityGeneration else null
+            snapshot = snapshot.copy(entries = snapshot.entries + (event.key to entry))
+            protectedSlots = protectedSlots + (event.key to ProtectedSlot(
+                entry, GraphV2DiskComponents(general, krx.takeIf { joined.krxJoined }), pending
+            ))
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Throwable) {
             seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Seed application failed", failure)
+        } finally {
+            // A pending flip waits for the one seed owner; completion never acquires a new use lifetime.
+            if (released) startDiskSeed()
         }
     }
 
@@ -445,6 +512,7 @@ internal class GraphV2RequestCoordinator(
     private fun discardSeed() {
         seedRegistration = null
         attemptedSeedKey = null
+        attemptedSupplement = null
     }
 
     /** Clear ownership and protected context state together, before publishing the new scope. */
@@ -463,12 +531,53 @@ internal class GraphV2RequestCoordinator(
         discardWrites()
         context = next
         catalogAt = null
-        if (scopeChanged) protectedSlots = emptyMap()
+        if (scopeChanged) {
+            protectedSlots = emptyMap()
+            capabilityConfiguration = null
+        }
         snapshot = GraphRequestState(
             dataScope = dataScope,
             entries = if (scopeChanged) emptyMap() else snapshot.entries
         )
         return true
+    }
+
+    /** Admission failure leaves the last comparable configuration intact; it is not a capability revocation. */
+    private fun synchronizeCapabilityConfiguration() {
+        val ports = cachePorts ?: return
+        val current = context ?: return
+        val binding = try {
+            ports.gate.bindWithConfiguration(current.fence, current.lifetime)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            activeKey?.let {
+                seedDiagnostic(nextSeedId, it, GraphV2DiskComponent.GENERAL, "Capability configuration binding failed", failure)
+            }
+            return
+        } ?: return
+        val previous = capabilityConfiguration
+        val next = binding.configuration
+        if (previous == next) return
+        capabilityConfiguration = next
+        if (previous == null) return
+
+        capabilityGeneration = Math.incrementExact(capabilityGeneration)
+        val entries = snapshot.entries.mapValues { (key, entry) ->
+            val general = protectedSlots[key]?.components?.general
+            val tab = if (general != null) joinGraphV2Components(general, null).tab else {
+                // Conversion failures have no protected slot; still remove KRX from the raw fallback.
+                entry.tab.copy(
+                    graph = entry.tab.graph.copy(series = entry.tab.graph.series.filterNot { it.seriesId.startsWith("krx.") }),
+                    inProgress = entry.tab.inProgress.filterKeys { !it.startsWith("krx.") }
+                )
+            }
+            GraphEntry(tab, online200At = null)
+        }
+        protectedSlots = protectedSlots.mapValues { (key, slot) ->
+            ProtectedSlot(entries.getValue(key), slot.components.copy(krx = null), capabilityGeneration)
+        }
+        snapshot = snapshot.copy(entries = entries)
     }
 
     private fun requestActive(
@@ -715,7 +824,10 @@ internal class GraphV2RequestCoordinator(
             // The slot is already absent: fail closed without changing the adopted entry or retry owners.
             return null
         }
-        protectedSlots = protectedSlots + (key to ProtectedSlot(entry, components))
+        // Raw and protected slots both use the request-start split, including a GENERAL-only capture.
+        val adopted = entry.copy(tab = joinGraphV2Components(components.general, components.krx).tab)
+        snapshot = snapshot.copy(entries = snapshot.entries + (key to adopted))
+        protectedSlots = protectedSlots + (key to ProtectedSlot(adopted, components))
         return components
     }
 
@@ -1158,6 +1270,8 @@ internal class GraphV2RequestCoordinator(
         timer = null
         timerDeadline = null
         synchronizeContext()
+        synchronizeCapabilityConfiguration()
+        startDiskSeed()
 
         // Only saved demand is resumed. A floor with no demand never arms a timer or sends a GET.
         val waiting = listOfNotNull(catalogRequest) + tabRequests.values.toList()

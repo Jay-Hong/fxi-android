@@ -38,6 +38,7 @@ import org.junit.Test
  * stands exactly when its issued context is the current one and the user context is certain; a derived seal means the record's
  * epoch on that axis is null; a context-uncertain block comes with its flag; a transition that takes the user axis or the
  * standing token away counts one invalidation; every publication moves the revision.
+ * G17 (B1b-2c-1 contract r1) adds the binding with the record's capability configuration.
  * Some fixtures are synthetic states that isolate a single block (the issuer publishes a seal together with NOT_GRANTED or
  * CONTEXT_UNCERTAIN); they do not claim the issuer publishes that exact combination or reaches it by that transition.
  */
@@ -447,5 +448,54 @@ class GraphV2AccessGateTest {
             judge()
             assertEquals("$label: one read per judgement, two judgements", 2, w.reads)
         }
+    }
+
+    /**
+     * B1b-2c: a binding carries the capture and the record's capability configuration, both from one admitted snapshot. A
+     * capability block keeps the record's epoch in the configuration while the capture has none; a refused admission is null,
+     * never a closed configuration; bind() is the binding's capture.
+     */
+    @Test fun G17_aBindingCarriesTheRecordsCapabilityConfiguration() {
+        val w = world()
+        fun bound(fence: TopicSessionFence, lifetime: TopicUseLifetime): GraphV2AccessBinding? {
+            w.reads = 0
+            val binding = w.gate.bindWithConfiguration(fence, lifetime)
+            if (binding != null) assertEquals("one snapshot read", 1, w.reads) else assertTrue("at most one read", w.reads <= 1)
+            assertEquals("bind() is the binding's capture", binding?.captured, w.gate.bind(fence, lifetime))
+            return binding
+        }
+        fun binding(fence: TopicSessionFence, lifetime: TopicUseLifetime, captured: String?, record: String?, allowed: Boolean) =
+            GraphV2AccessBinding(GraphV2AccessCapture(fence, lifetime, captured), GraphV2CapabilityConfiguration(record, allowed))
+
+        assertEquals("allowed", binding(FENCE7, LIFETIME7, "K1", "K1", true), bound(FENCE7, LIFETIME7))
+        for (block in listOf(TopicAccessBlock.NOT_GRANTED, TopicAccessBlock.LOSS_CANDIDATE, TopicAccessBlock.EXPLICIT_SEAL,
+            TopicAccessBlock.CONTEXT_UNCERTAIN)) {
+            w.snapshot = snap(capabilityBlocks = setOf(block))
+            assertEquals("$block keeps the record's epoch", binding(FENCE7, LIFETIME7, null, "K1", false), bound(FENCE7, LIFETIME7))
+        }
+
+        // G11's fresh approval of the K2 record with KRX still hidden: the configuration names K2, the capture no epoch.
+        val fence8 = TopicSessionFence(ID1, "U1", TopicGrantToken(8L))
+        val lifetime8 = TopicUseLifetime(TopicGrantToken(8L), 4L)
+        w.snapshot = snap(token = 8L, record = RECORD_K2, generation = 11L, capabilityBlocks = setOf(TopicAccessBlock.NOT_GRANTED),
+            invalidations = 4L)
+        w.fence = fence8
+        assertEquals("K2 hidden", binding(fence8, lifetime8, null, "K2", false), bound(fence8, lifetime8))
+        w.snapshot = snap(token = 8L, record = RECORD_K2, generation = 11L, invalidations = 4L)
+        assertEquals("K2 visible", binding(fence8, lifetime8, "K2", "K2", true), bound(fence8, lifetime8))
+
+        // G08b's derived seal: the record has no epoch.
+        w.snapshot = snap(token = 8L, capabilityBlocks = setOf(TopicAccessBlock.DERIVED_SEAL), record = AccessFence("u1", "U1", null),
+            invalidations = 4L)
+        assertEquals("derived seal", binding(fence8, lifetime8, null, null, false), bound(fence8, lifetime8))
+
+        // A refused admission is null.
+        w.protectedOpen = false
+        assertNull("protected closed", bound(fence8, lifetime8))
+        w.protectedOpen = true
+        w.snapshot = snap(token = 8L, record = RECORD_K2, generation = 11L, userBlocks = setOf(TopicAccessBlock.NOT_GRANTED),
+            invalidations = 5L)
+        assertNull("a user hold", bound(fence8, lifetime8))
+        assertNull("another grant's lifetime", bound(fence8, LIFETIME7))
     }
 }

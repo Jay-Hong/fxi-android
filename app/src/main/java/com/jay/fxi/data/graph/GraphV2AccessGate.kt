@@ -13,6 +13,13 @@ internal data class GraphV2AccessCapture(
     val krxCapabilityEpoch: String?
 )
 
+internal data class GraphV2CapabilityConfiguration(val recordEpoch: String?, val allowed: Boolean)
+
+internal data class GraphV2AccessBinding(
+    val captured: GraphV2AccessCapture,
+    val configuration: GraphV2CapabilityConfiguration
+)
+
 /** Memory-only access policy. Every use checks live inputs and one fresh published snapshot. */
 internal class GraphV2AccessGate(
     private val currentIdentity: () -> AuthIdentityFence?,
@@ -20,11 +27,17 @@ internal class GraphV2AccessGate(
     private val snapshot: () -> TopicAccessSnapshot,
     private val protectedAdmission: () -> Boolean
 ) {
-    fun bind(fence: TopicSessionFence, lifetime: TopicUseLifetime): GraphV2AccessCapture? {
+    fun bind(fence: TopicSessionFence, lifetime: TopicUseLifetime): GraphV2AccessCapture? =
+        bindWithConfiguration(fence, lifetime)?.captured
+
+    fun bindWithConfiguration(fence: TopicSessionFence, lifetime: TopicUseLifetime): GraphV2AccessBinding? {
         if (lifetime.grant != fence.grant) return null
         val access = admittedSnapshot(fence, lifetime) ?: return null
-        val epoch = if (access.facts.capabilityAllowed) access.facts.recordFence?.krxCapabilityEpoch else null
-        return GraphV2AccessCapture(fence, lifetime, epoch)
+        val configuration = GraphV2CapabilityConfiguration(
+            access.facts.recordFence?.krxCapabilityEpoch, access.facts.capabilityAllowed
+        )
+        val epoch = configuration.recordEpoch.takeIf { configuration.allowed }
+        return GraphV2AccessBinding(GraphV2AccessCapture(fence, lifetime, epoch), configuration)
     }
 
     fun admits(captured: GraphV2AccessCapture, component: GraphV2DiskComponent): Boolean {

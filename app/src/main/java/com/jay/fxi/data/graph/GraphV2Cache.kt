@@ -68,6 +68,16 @@ internal data class GraphV2DiskSeedResult(
     val krx: GraphV2DiskRead<GraphV2KrxEnvelope>?
 )
 
+internal sealed interface GraphV2SeedMode {
+    data object FillEmpty : GraphV2SeedMode
+
+    data class SupplementOccupied(
+        val expectedGeneralResponseId: String,
+        val configuration: GraphV2CapabilityConfiguration,
+        val configurationGeneration: Long
+    ) : GraphV2SeedMode
+}
+
 internal fun GraphV2AccessCapture.generalKey(key: GraphKey): GraphV2GeneralKey? =
     fence.userAccessEpoch?.let { GraphV2GeneralKey(fence.identity.uid, it, key.tab, key.period.code) }
 
