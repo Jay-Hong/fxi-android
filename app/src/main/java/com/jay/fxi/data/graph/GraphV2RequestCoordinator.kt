@@ -86,9 +86,15 @@ internal class GraphV2RequestCoordinator(
     private val clock: AppClock,
     /** Stable, finite and non-negative for each tab. */
     private val rateLimitJitter: (tab: String) -> Duration,
-    private val onEventFailure: (Throwable) -> Unit
+    private val onEventFailure: (Throwable) -> Unit,
+    private val cachePorts: GraphV2CachePorts? = null
 ) {
     private data class RequestContext(val fence: TopicSessionFence, val lifetime: TopicUseLifetime)
+
+    private data class SeedRegistration(
+        val seedId: Long,
+        val catalog: GraphCatalog?
+    )
 
     private class Registration(
         val requestId: Long,
@@ -166,6 +172,12 @@ internal class GraphV2RequestCoordinator(
             val key: GraphKey,
             val result: Result<AuthenticatedHttpResponse<GraphV2TabResponse>>
         ) : Event
+        data class DiskSeedFinished(
+            val seedId: Long,
+            val key: GraphKey,
+            val captured: GraphV2AccessCapture,
+            val result: GraphV2DiskSeedResult
+        ) : Event
     }
 
     private val inbox = Channel<Event>(Channel.UNLIMITED)
@@ -182,6 +194,9 @@ internal class GraphV2RequestCoordinator(
     private val tabRequests = mutableMapOf<GraphKey, Registration>()
     private var nextRequestId = 0L
     private var activityGeneration = 0L
+    private var nextSeedId = 0L
+    private var seedRegistration: SeedRegistration? = null
+    private var attemptedSeedKey: GraphKey? = null
     private var nextColdGeneration = 0L
     private var coldOwner: ColdOwner? = null
     private var nextMidnightGeneration = 0L
@@ -214,6 +229,7 @@ internal class GraphV2RequestCoordinator(
                     }
                 }
             } finally {
+                discardSeed()
                 cancelTimer()
                 cancelCold()
                 cancelMidnight()
@@ -236,6 +252,7 @@ internal class GraphV2RequestCoordinator(
                 synchronizeContext()
                 if (activeKey != event.key) cancelActiveDemand()
                 activeKey = event.key
+                startDiskSeed()
                 requestActive(now, force = false)
             }
             Event.Deactivate -> {
@@ -243,18 +260,128 @@ internal class GraphV2RequestCoordinator(
                 cancelActiveDemand()
                 activeKey = null
             }
-            Event.ContextChanged -> if (synchronizeContext()) requestActive(now, force = false)
+            Event.ContextChanged -> {
+                val changed = synchronizeContext()
+                startDiskSeed()
+                if (changed) requestActive(now, force = false)
+            }
             is Event.Refresh -> {
                 synchronizeContext()
+                startDiskSeed()
                 requestActive(now, event.force)
             }
             is Event.Captured -> onCaptured(event, now)
             is Event.Wake -> onWake(event, now)
             is Event.CatalogFinished -> applyCatalog(event, now)
             is Event.TabFinished -> applyTab(event, now)
+            is Event.DiskSeedFinished -> applyDiskSeed(event)
         }
         rearmTimer(now)
         publish()
+    }
+
+    /** Independent of HTTP ownership and its Retry-After floor. */
+    private fun startDiskSeed() {
+        val ports = cachePorts ?: return
+        val key = activeKey ?: return
+        val current = context ?: return
+        if (GraphV2Domain.support(snapshot.catalog, key.tab, key.period) == GraphPeriodSupport.Unsupported ||
+            snapshot.entries[key] != null || attemptedSeedKey == key
+        ) return
+        // A failed bind spends no attempt in this generation, even though IDs are never reused.
+        val seedId = Math.incrementExact(nextSeedId)
+        nextSeedId = seedId
+        val captured = try {
+            ports.gate.bind(current.fence, current.lifetime)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            seedDiagnostic(seedId, key, GraphV2DiskComponent.GENERAL, "Seed access binding failed", failure)
+            return
+        } ?: return
+        val registration = SeedRegistration(seedId, snapshot.catalog)
+        seedRegistration = registration
+        attemptedSeedKey = key
+        scope.launch {
+            val result = readGraphV2DiskSeed(ports, key, captured, registration.catalog)
+            inbox.trySend(Event.DiskSeedFinished(seedId, key, captured, result))
+        }
+    }
+
+    /** Cache failures must not enter the event catch that cancels HTTP retry owners. */
+    private fun applyDiskSeed(event: Event.DiskSeedFinished) {
+        try {
+            val ports = cachePorts ?: return
+            val registration = seedRegistration
+            if (registration == null || registration.seedId != event.seedId || !scope.isActive) {
+                seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Seed ownership expired")
+                return
+            }
+            // Only this owner is released; an older completion cannot remove a newer one.
+            seedRegistration = null
+            diagnoseSeedRead(event, GraphV2DiskComponent.GENERAL, event.result.general)
+            diagnoseSeedRead(event, GraphV2DiskComponent.KRX, event.result.krx)
+            val general = when (val read = event.result.general) {
+                is GraphV2DiskRead.Found -> read.envelope
+                else -> return
+            }
+            if (snapshot.entries[event.key] != null) {
+                seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Seed slot is already occupied")
+                return
+            }
+            val krx = when (val read = event.result.krx) {
+                is GraphV2DiskRead.Found -> read.envelope
+                else -> null
+            }
+            val joined = ports.gate.joinForExposure(event.captured, GraphV2DiskComponents(general, krx))
+            if (joined == null) {
+                seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Seed exposure admission is closed")
+                return
+            }
+            snapshot = snapshot.copy(entries = snapshot.entries + (event.key to GraphEntry(joined.tab, online200At = null)))
+            joined.ignoredKrxReason?.let {
+                seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.KRX, it)
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Seed application failed", failure)
+        }
+    }
+
+    private fun diagnoseSeedRead(
+        event: Event.DiskSeedFinished,
+        component: GraphV2DiskComponent,
+        read: GraphV2DiskRead<*>?
+    ) {
+        when (read) {
+            is GraphV2DiskRead.Rejected -> seedDiagnostic(event.seedId, event.key, component, read.reason)
+            is GraphV2DiskRead.Failed -> seedDiagnostic(event.seedId, event.key, component, "Seed read failed", read.cause)
+            else -> Unit // Absence and an unattempted KRX read are normal cache misses.
+        }
+    }
+
+    private fun seedDiagnostic(
+        seedId: Long,
+        key: GraphKey,
+        component: GraphV2DiskComponent,
+        reason: String,
+        cause: Throwable? = null
+    ) {
+        val ports = cachePorts ?: return
+        try {
+            ports.onSeedDiagnostic(GraphV2SeedDiagnostic(seedId, key, component, reason, cause))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            // This observer grants no authority; its failure cannot cancel or change HTTP demand.
+            return
+        }
+    }
+
+    private fun discardSeed() {
+        seedRegistration = null
+        attemptedSeedKey = null
     }
 
     /** Clear ownership and protected context state together, before publishing the new scope. */
@@ -746,6 +873,7 @@ internal class GraphV2RequestCoordinator(
 
     private fun cancelActiveDemand() {
         activityGeneration++
+        discardSeed()
         cancelCold()
         cancelMidnight()
         deferredDemand = null
