@@ -29,8 +29,8 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 C2+b-3은 premium 화면에 topic 배너와 "다시 시도"를 연결했다(JVM·에뮬레이터 계측
                                 계약). 10-05 SM-F711N 기기 확인에서 F2 저장값 배너의 표시·해제와 오프라인·복귀 동작을
                                 관찰했다. topic 줄 문구는 운영에서 자연 발생하지 않아 기기 미수집이다.
-                                S3 그래프 관측 GObs-1(`ffda7b9`)은 네 경로의 후보를 표시 병합 전에 원 시각·권위째
-                                dormant sink로 인계한다(JVM 계약, 운영 배선 없음). 연속성 사건은 GObs-2다.
+                                S3 그래프 관측 인계는 GObs-1(`ffda7b9`, 후보)·2a(`4233c4a`, 권위·재개)·2b-1(`c30d615`,
+                                전달 중단)·2b-2(`b5e6501`, ACK·인증)로 연결했다(JVM 계약, dormant sink, 운영 배선 없음).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1169,8 +1169,17 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   철회 검증은 runtime 배선 전에 대조한다
   - 진행(10-05): **GObs-1** `ffda7b9` — 네 경로 후보 인계(원 timestamp·`rate_changed_at`·DXY 공급 source·topic·경로),
     입력이 허용된 원 use의 `TopicUseAttribution`·WS 회차 귀속, 일반 시세 후보의 KRX 제외, sink 결과의 누적 유실
-    상태(`graphLoss`), 기본 `DormantTopicGraphSink`. 계약 GOBS-01~19. **GObs-2(다음)**: 연속성 사건과 CMD 동기
-    control-fact hook, 사건용 epoch 시계. S3 DoD의 관측 항목은 GObs-2 뒤에 닫힌다
+    상태(`graphLoss`), 기본 `DormantTopicGraphSink`. 계약 GOBS-01~19.
+    **GObs-2a** `4233c4a` — 연속성 사건(`TopicGraphInput.Continuity`, 같은 sink·순번)과 `wallClock`. 권위 시작
+    (INITIAL·ACCESS_RESUMED, 같은 grant에서 lifetime이 바뀐 새 use는 옛 권위 종료 뒤 재개), (topic, 경로)별 공백과
+    첫 유효 후보의 DELIVERY_RESUMED, 캡처한 귀속으로의 AUTHORITY_ENDED(철회·교체[+TOPIC_PURGED]·identity·premium·
+    사용 보류 — 보류는 세션이 처음 보는 지점에서), HANDOVER_ENDED, 유실의 epoch·원 귀속 key. 계약 G2A-01~28.
+    **GObs-2b-1** `c30d615` — 전달 중단: WS_ENDED(cause)·CONNECTION_CREATION_FAILED·LEASE_EXPIRED·SUSPECT(실제
+    변화만)·DEGRADED·REST_UNDELIVERED(8종). 계약 G2B-08~15.
+    **GObs-2b-2** `b5e6501` — ACK 적용 사실(전체 confirmed·rejected, 제거·거절 topic의 WS만 재개방), AUTH_FAILED
+    (INVALID_TOKEN·REFRESH_UNUSABLE — 후자는 CMD의 FAILED 기록 직후 동기 callback), 증명 ACK의 AUTH_RECOVERED.
+    계약 G2B-01·01b·03~07·14b·15b. 최종 DoD의 관측 다섯 항목은 이 JVM 계약으로 검증했다. 최종 DoD 자체의
+    재검증(P3-i 활성화 뒤 실제 purger)은 그대로 남는다
 - **topic last-known disk 계약**: 정화·domain 검증을 통과한 FX/Tether/DXY를 서로 다른
   `(uid,userAccessEpoch,topic-kind)` namespace에 저장하고, fresh server premium 승인 뒤 WS/bootstrap보다 먼저 복원한다.
   restored seed는 `refreshingCached/offline` 표시용일 뿐 ACK/delivery 완료·freshness·silence deadline을 충족시키지 않는다.
