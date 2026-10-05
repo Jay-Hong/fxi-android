@@ -88,7 +88,8 @@ data class FreeGraphPoint(
     val low: Double?,
     val source: String? = null,
     val closeBasis: String? = null,
-    val sourceMethod: String? = null
+    val sourceMethod: String? = null,
+    val contractCode: String? = null
 )
 
 /** Last observation before the visible points; never a synthetic current quote. */
