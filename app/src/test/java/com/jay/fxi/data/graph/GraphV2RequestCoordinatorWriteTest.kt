@@ -41,11 +41,18 @@ import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Delay
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.test.TestResult
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
@@ -62,7 +69,7 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
 /**
- * Claude-owned S4 B1b-2b-1 contract r2: the request owner writes an adopted online answer through to the Graph V2 disk store.
+ * Claude-owned S4 B1b-2b contract (2b-1 r2, 2b-2a r1, 2b-2b r1): the request owner writes an adopted online answer through to the Graph V2 disk store.
  *
  * Oracles: ANDROID_V2_PLAN.md :499 (a namespace's data marker is established before data is stored there), :1289 (only an
  * online 200 records freshness; a store outcome never does), :1294 (a store failure is diagnostic), :1338-1340 (no late
@@ -72,7 +79,12 @@ import org.junit.rules.TemporaryFolder
  * reserves and cancels); a seed is never written back; Ready is the producer's persistence contract and is checked per
  * axis (GENERAL: owner, USER epoch, premium marker; KRX: the same on its own record plus the captured KRX epoch and the KRX
  * marker); a blocked GENERAL stops the whole write, a blocked KRX the KRX half; store outcomes change no entry, stamp,
- * failure, retry owner or request. Contention and lifetime are B1b-2b-2.
+ * failure, retry owner or request. B1b-2b-2a (rows X): admission is live at the preparation start and at the store delegate
+ * (a reserved ticket grants nothing; a protected, capability-only or USER withdrawal before the delegate is honoured without
+ * acquiring a new lifetime), a blocked preparation cancels its ticket, and the preparation starts only after the adoption is
+ * published. B1b-2b-2b (rows Y): reservation follows adoption (a blocked or null-capture later answer still supersedes), a
+ * completion releases only its own writer, a context change cancels pending writers, deactivation keeps them, and a write
+ * completion leaves another key's cold retry and a due Wake untouched.
  *
  * The fixture is the cache contract's: the real request owner, the real FileGraphV2DiskStore with the JSON codec and the real
  * gate over one fake published snapshot that the use authority reads too. A store decorator records reserve, cancel and
@@ -156,6 +168,8 @@ class GraphV2RequestCoordinatorWriteTest {
         }
     }
 
+    private fun rateOf(c: GraphV2DiskComponents) = c.general.component.series.first().series.points.first().rate
+
     private fun isKrx(root: File, file: File) = file.relativeTo(root).invariantSeparatorsPath.startsWith("krx/")
 
     private fun onlineDto(rate: Double) = GraphV2TabResponse(
@@ -193,9 +207,11 @@ class GraphV2RequestCoordinatorWriteTest {
         val prepares = mutableListOf<File>()
         val publishes = mutableListOf<File>()
         var failPublish: (File) -> Boolean = { false }
+        var failPrepare: (File) -> Boolean = { false }
         override fun read(file: File): ByteArray? = real.read(file)
         override fun prepareReplace(target: File, bytes: ByteArray): GraphV2PreparedReplace {
             prepares += target
+            if (failPrepare(target)) throw IOException("prepare refused")
             return PreparedTarget(target, real.prepareReplace(target, bytes))
         }
         override fun publishReplace(prepared: GraphV2PreparedReplace) {
@@ -211,19 +227,55 @@ class GraphV2RequestCoordinatorWriteTest {
 
     private class PreparedTarget(val target: File, val inner: GraphV2PreparedReplace) : GraphV2PreparedReplace
 
+    /**
+     * Behaves like Dispatchers.Main.immediate on its own thread: a task arrives through [queue], and a launch made while a task
+     * runs starts in place. Delays are the test scheduler's.
+     */
+    @OptIn(InternalCoroutinesApi::class)
+    private class InPlaceDispatcher(private val queue: TestDispatcher) : CoroutineDispatcher(), Delay by queue {
+        private var inside = false
+        override fun isDispatchNeeded(context: CoroutineContext): Boolean = !inside
+        override fun dispatch(context: CoroutineContext, block: Runnable) = queue.dispatch(context, Runnable {
+            val outer = inside
+            inside = true
+            try {
+                block.run()
+            } finally {
+                inside = outer
+            }
+        })
+    }
+
     /** The real store, recording what the request owner asks of it. */
     private class WriteStore(private val real: GraphV2DiskStore) : GraphV2DiskStore by real {
         val reserved = mutableListOf<Pair<GraphV2DiskComponents, GraphV2WriteReservation>>()
         val cancelled = mutableListOf<GraphV2WriteTicket>()
         val written = mutableListOf<Pair<GraphV2WriteTicket, GraphV2WriteReport>>()
+        /** Runs inside the write task, after Ready, just before the real store is asked. */
+        var beforeWrite: (() -> Unit)? = null
+        var holdBeforeWrite: CompletableDeferred<Unit>? = null
+        var writeThrows: Throwable? = null
+        /** By write call index: the real store has answered, the completion is not yet returned. */
+        val holdAfterWrite = mutableMapOf<Int, CompletableDeferred<Unit>>()
+        var afterWriteDelay: Duration? = null
+        private var writeCalls = 0
         override fun reserveWrite(components: GraphV2DiskComponents): GraphV2WriteReservation =
             real.reserveWrite(components).also { reserved += components to it }
         override fun cancelWrite(ticket: GraphV2WriteTicket) {
             cancelled += ticket
             real.cancelWrite(ticket)
         }
-        override suspend fun write(ticket: GraphV2WriteTicket, admission: GraphV2IoAdmission): GraphV2WriteReport =
-            real.write(ticket, admission).also { written += ticket to it }
+        override suspend fun write(ticket: GraphV2WriteTicket, admission: GraphV2IoAdmission): GraphV2WriteReport {
+            val index = writeCalls++
+            beforeWrite?.invoke()
+            holdBeforeWrite?.await()
+            writeThrows?.let { throw it }
+            val report = real.write(ticket, admission)
+            written += ticket to report
+            holdAfterWrite[index]?.await()
+            afterWriteDelay?.let { delay(it) }
+            return report
+        }
         val tickets get() = reserved.mapNotNull { (it.second as? GraphV2WriteReservation.Reserved)?.ticket }
     }
 
@@ -242,10 +294,10 @@ class GraphV2RequestCoordinatorWriteTest {
         }
     }
 
-    private inner class Fixture(test: TestScope, writes: Boolean = true) {
+    private inner class Fixture(test: TestScope, writes: Boolean = true, dispatcher: CoroutineDispatcher? = null) {
         init { opened += this }
-        val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(test.testScheduler))
-        private val base = test.testScheduler.currentTime
+        val scope = CoroutineScope(SupervisorJob() + (dispatcher ?: StandardTestDispatcher(test.testScheduler)))
+        val base = test.testScheduler.currentTime
         var fence: TopicSessionFence? = FENCE
         var protectedOpen = true
         var snapshot: TopicAccessSnapshot = snap()
@@ -258,6 +310,11 @@ class GraphV2RequestCoordinatorWriteTest {
 
         /** Preparation: calls are recorded; a result can be held, chosen or thrown. */
         val prepareCalls = mutableListOf<Pair<GraphV2AccessCapture, Boolean>>()
+        var onPrepare: (() -> Unit)? = null
+        var prepareDelay: Duration? = null
+        /** By preparation call index. */
+        val holdCall = mutableMapOf<Int, CompletableDeferred<Unit>>()
+        val answerAt = mutableMapOf<Int, GraphV2WritePreparation>()
         var holdPrepare: CompletableDeferred<Unit>? = null
         var prepareAnswer: (GraphV2AccessCapture, Boolean) -> GraphV2WritePreparation = { _, wantsKrx ->
             GraphV2WritePreparation(GraphV2NamespacePreparation.Ready(M), if (wantsKrx) GraphV2NamespacePreparation.Ready(M) else null)
@@ -267,9 +324,13 @@ class GraphV2RequestCoordinatorWriteTest {
         val writeDiagnostics = mutableListOf<GraphV2WriteDiagnostic>()
         var writeDiagnosticThrows = false
 
+        var acquires = 0
         val uses = object : TopicUseAuthority {
             private val inner = SnapshotTopicUseAuthority { snapshot }
-            override fun acquire(fence: TopicSessionFence): TopicUseLifetime? = inner.acquire(fence)
+            override fun acquire(fence: TopicSessionFence): TopicUseLifetime? {
+                acquires++
+                return inner.acquire(fence)
+            }
             override fun admits(lifetime: TopicUseLifetime): Boolean = inner.admits(lifetime)
         }
 
@@ -300,9 +361,13 @@ class GraphV2RequestCoordinatorWriteTest {
 
         val writePorts = GraphV2WritePorts(
             prepareWrite = GraphV2PrepareWrite { captured, wantsKrx ->
+                val index = prepareCalls.size
                 prepareCalls += captured to wantsKrx
+                onPrepare?.invoke()
+                prepareDelay?.let { delay(it) }
                 holdPrepare?.await()
-                prepareAnswer(captured, wantsKrx)
+                holdCall[index]?.await()
+                answerAt[index] ?: prepareAnswer(captured, wantsKrx)
             },
             onPreparationBlocked = {
                 blocked += it
@@ -526,5 +591,279 @@ class GraphV2RequestCoordinatorWriteTest {
         assertEquals(emptyList<File>(), g.files.prepares)
         assertEquals(emptyList<Throwable>(), g.failures)
         g.close()
+    }
+
+    // --- B1b-2b-2a: admission at the preparation start and at the store delegate --------------------------------
+
+    /** T3: a reserved ticket grants nothing. GENERAL closing before the preparation coroutine runs stops the preparation. */
+    @Test fun X01_aTicketIsNotAuthority() = writeTest {
+        val f = Fixture(this)
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        // The request started under an open gate. The 200 is queued first, the withdrawal after it (A2 does not read it).
+        f.sent.single().tab.complete(ok(onlineDto(1500.0)))
+        f.scope.launch { f.protectedOpen = false }
+        runCurrent()
+        assertEquals("adopted", NOON, f.state.entries[KEY]?.online200At)
+        assertEquals("reserved", 1, f.store.tickets.size)
+        assertEquals("that ticket is cancelled", f.store.tickets.toSet(), f.store.cancelled.toSet())
+        assertEquals("nothing is prepared", 0, f.prepareCalls.size)
+        assertEquals(0, f.store.written.size)
+        assertEquals(emptyList<File>(), f.files.prepares)
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /** B12-s: after Ready the protected gate closes just before the store delegate. The live admission keeps every file closed. */
+    @Test fun X02_aWithdrawalBeforeTheDelegateIsHonoured() = writeTest {
+        val f = Fixture(this)
+        f.store.beforeWrite = { f.protectedOpen = false }
+        f.adopt(this)
+        assertEquals("Ready", 1, f.prepareCalls.size)
+        assertEquals("delegated", 1, f.store.written.size)
+        assertEquals(emptyList<File>(), f.files.prepares)
+        assertNull(f.diskGeneral())
+        assertNull(f.diskKrx())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /** B12-s: only the capability closes just before the delegate (the token and USER lifetime stand): GENERAL is written, KRX is not. */
+    @Test fun X03_aCapabilityOnlyHoldBeforeTheDelegateStopsKrxOnly() = writeTest {
+        val f = Fixture(this)
+        f.store.beforeWrite = { f.snapshot = snap(capabilityBlocks = setOf(TopicAccessBlock.NOT_GRANTED)) }
+        f.adopt(this)
+        assertEquals("delegated", 1, f.store.written.size)
+        assertEquals(1500.0, f.diskGeneral())
+        assertNull(f.diskKrx())
+        assertTrue("no KRX file touched", f.files.prepares.none { isKrx(f.root, it) })
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * CF1: a USER hold and its release land between Ready and the delegate with no context event or new answer (same token and
+     * fence, invalidations 3 -> 4). The adopted writer started under 3 writes nothing, and nothing acquires a new lifetime for
+     * it. Only afterwards, a refresh adopts under 4 and that answer is written.
+     */
+    @Test fun X04_aUserHoldBeforeTheDelegateRetiresTheAdoptedWriter() = writeTest {
+        val f = Fixture(this)
+        var acquiresAtResume = -1
+        f.store.beforeWrite = {
+            f.snapshot = snap(userBlocks = setOf(TopicAccessBlock.NOT_GRANTED), invalidations = 4L)
+            f.snapshot = snap(invalidations = 4L)
+            acquiresAtResume = f.acquires
+        }
+        f.adopt(this)
+        assertEquals("delegated", 1, f.store.written.size)
+        assertEquals(emptyList<File>(), f.files.prepares)
+        assertNull(f.diskGeneral())
+        assertEquals("no acquire after the release", acquiresAtResume, f.acquires)
+
+        f.store.beforeWrite = null
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        f.sent.last().tab.complete(ok(onlineDto(1600.0))); runCurrent()
+        assertEquals("a new lifetime writes", 1600.0, f.diskGeneral())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /** A blocked or failed preparation cancels its own ticket. */
+    @Test fun X05_aBlockedPreparationCancelsItsTicket() = writeTest {
+        val cause = IOException("record unreadable")
+        for ((label, answer) in listOf<Pair<String, (GraphV2AccessCapture, Boolean) -> GraphV2WritePreparation>>(
+            "GENERAL blocked" to { _, _ -> GraphV2WritePreparation(GraphV2NamespacePreparation.Blocked("not durable"), null) },
+            "preparation throws" to { _, _ -> throw cause }
+        )) {
+            val f = Fixture(this)
+            f.prepareAnswer = answer
+            f.adopt(this)
+            assertEquals(label, 1, f.prepareCalls.size)
+            assertEquals(label, 1, f.store.tickets.size)
+            assertEquals("$label: that ticket is cancelled", f.store.tickets.toSet(), f.store.cancelled.toSet())
+            assertEquals(label, 0, f.store.written.size)
+            f.close()
+        }
+    }
+
+    /**
+     * The preparation starts only after the adoption is published. The loop wakes from a dispatched task with the adoption
+     * already buffered (the 200's resumption is dispatched before a control event's), where a launch would start in place.
+     */
+    @Test fun X06_thePreparationSeesThePublishedAdoption() = writeTest {
+        val f = Fixture(this, dispatcher = InPlaceDispatcher(StandardTestDispatcher(testScheduler)))
+        var seenStamp: Instant? = null
+        var seenExposure: GraphEntry? = null
+        f.onPrepare = {
+            seenStamp = f.state.entries[KEY]?.online200At
+            seenExposure = f.coordinator.protectedEntry(KEY)
+        }
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        f.sent.single().tab.complete(ok(onlineDto(1500.0)))
+        f.coordinator.onContextChanged()
+        runCurrent()
+        assertEquals(1, f.prepareCalls.size)
+        assertEquals("the stamp is public", NOON, seenStamp)
+        assertEquals("the exposure is public", NOON, seenExposure?.online200At)
+        assertEquals(1500.0, f.diskGeneral())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    // --- B1b-2b-2b: ordering, ownership, cleanup and schedule contention ----------------------------------------
+
+    private val other = GraphKey("usd", GraphPeriod.ONE_YEAR)
+
+    /** Reservation follows adoption: R2 is reserved, prepared and blocked while R1 waits; R1's Ready then loses to R2. */
+    @Test fun Y01_reservationFollowsAdoption() = writeTest {
+        val f = Fixture(this)
+        f.put(components(serverTab(1200.0)))
+        f.holdCall[0] = CompletableDeferred()
+        f.answerAt[1] = GraphV2WritePreparation(GraphV2NamespacePreparation.Blocked("not durable"), null)
+        f.adopt(this, 1500.0)
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        f.sent.last().tab.complete(ok(onlineDto(1600.0))); runCurrent()
+        assertEquals("R2 was prepared", 2, f.prepareCalls.size)
+        checkNotNull(f.holdCall[0]).complete(Unit); runCurrent()
+        assertEquals("reserved in adoption order", listOf(1500.0, 1600.0), f.store.reserved.map { rateOf(it.first) })
+        assertEquals("R1 was delegated", 1, f.store.written.size)
+        assertEquals(emptyList<File>(), f.files.prepares)
+        assertEquals("the stored answer stays", 1200.0, f.diskGeneral())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /** A later answer whose start capture was null still reserves (and cancels), so the waiting R1 loses to it. */
+    @Test fun Y02_aNullCaptureStillSupersedes() = writeTest {
+        val f = Fixture(this)
+        f.put(components(serverTab(1200.0)))
+        f.holdCall[0] = CompletableDeferred()
+        f.adopt(this, 1500.0)
+        f.protectedOpen = false
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        f.protectedOpen = true
+        f.sent.last().tab.complete(ok(onlineDto(1600.0))); runCurrent()
+        assertEquals("R2 reserved", 2, f.store.tickets.size)
+        assertTrue("and cancelled at once", f.store.tickets[1] in f.store.cancelled)
+        assertEquals("R2 is not prepared", 1, f.prepareCalls.size)
+        checkNotNull(f.holdCall[0]).complete(Unit); runCurrent()
+        assertEquals("R1 was delegated", 1, f.store.written.size)
+        assertEquals(emptyList<File>(), f.files.prepares)
+        assertEquals(1200.0, f.diskGeneral())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /** A completion releases its own writer only: R1's late completion leaves R2 waiting, and R2 is then written. */
+    @Test fun Y03_aCompletionReleasesOnlyItsOwnWriter() = writeTest {
+        val f = Fixture(this)
+        val r1Returns = CompletableDeferred<Unit>()
+        f.store.holdAfterWrite[0] = r1Returns
+        f.holdCall[1] = CompletableDeferred()
+        f.adopt(this, 1500.0)
+        assertEquals("R1 is stored; its completion is not delivered", 1500.0, f.diskGeneral())
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        f.sent.last().tab.complete(ok(onlineDto(1600.0))); runCurrent()
+        assertEquals("R2 waits in preparation", 2, f.prepareCalls.size)
+        val (t1, t2) = f.store.tickets
+        r1Returns.complete(Unit); runCurrent()
+        assertTrue("R1's completion releases R1's ticket", t1 in f.store.cancelled)
+        assertTrue("and not R2's", t2 !in f.store.cancelled)
+        checkNotNull(f.holdCall[1]).complete(Unit); runCurrent()
+        assertEquals(1600.0, f.diskGeneral())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * A real context change (the lifetime moves to invalidations 4) or the scope's end cancels a writer that is preparing or
+     * writing, before any late result. Its job ends: nothing is delegated or written afterwards.
+     */
+    @Test fun Y04_aContextChangeOrScopeEndCancelsPendingWriters() = writeTest {
+        for (end in listOf("context", "scope")) for (stage in listOf("preparing", "writing")) {
+            val label = "$end/$stage"
+            val f = Fixture(this)
+            val hold = CompletableDeferred<Unit>()
+            if (stage == "preparing") f.holdPrepare = hold else f.store.holdBeforeWrite = hold
+            f.adopt(this)
+            val ticket = f.store.tickets.single()
+            assertTrue("$label: not cancelled yet", ticket !in f.store.cancelled)
+            if (end == "context") {
+                // A USER hold came and went: the context's lifetime is now invalidations 4.
+                f.snapshot = snap(invalidations = 4L)
+                f.coordinator.onContextChanged()
+            } else {
+                f.close()
+            }
+            runCurrent()
+            assertTrue("$label: cancelled", ticket in f.store.cancelled)
+            hold.complete(Unit); runCurrent()
+            assertEquals("$label: nothing is delegated", 0, f.store.written.size)
+            assertEquals("$label: nothing is written", emptyList<File>(), f.files.prepares)
+            assertEquals(label, emptyList<Throwable>(), f.failures)
+            f.close()
+        }
+    }
+
+    /** Deactivation or another key's activation keeps an adopted writer: it is written when its preparation is Ready. */
+    @Test fun Y05_deactivationKeepsAnAdoptedWriter() = writeTest {
+        for (how in listOf("deactivate", "another key")) {
+            val f = Fixture(this)
+            f.holdPrepare = CompletableDeferred()
+            f.adopt(this)
+            if (how == "deactivate") f.coordinator.onDeactivated() else f.coordinator.onActivated(other)
+            runCurrent()
+            checkNotNull(f.holdPrepare).complete(Unit); runCurrent()
+            assertEquals(how, 1500.0, f.diskGeneral())
+            assertEquals(how, 1505.0, f.diskKrx())
+            assertEquals(emptyList<Throwable>(), f.failures)
+            f.close()
+        }
+    }
+
+    /** B07 cold: X's write fails at t=2 while Y's cold ladder runs; each failure kind leaves Y's sends and A2's catch alone. */
+    @Test fun Y06_aWriteFailureLeavesAnotherKeysColdRetry() = writeTest {
+        for (failure in listOf("file prepare", "file publish", "store adapter", "diagnostic observer")) {
+            val f = Fixture(this)
+            f.holdPrepare = CompletableDeferred()
+            when (failure) {
+                "file prepare" -> f.files.failPrepare = { true }
+                "file publish" -> f.files.failPublish = { true }
+                "store adapter" -> f.store.writeThrows = IOException("adapter")
+                "diagnostic observer" -> {
+                    f.files.failPublish = { true }
+                    f.writeDiagnosticThrows = true
+                }
+            }
+            fun elapsed() = testScheduler.currentTime - f.base
+            fun ySends() = f.sent.filter { it.key == other }
+            f.adopt(this)
+            step(1.seconds)
+            f.coordinator.onActivated(other); runCurrent()
+            ySends().last().tab.complete(status(503)); runCurrent()
+            step(1.seconds)
+            checkNotNull(f.holdPrepare).complete(Unit); runCurrent()
+            assertTrue("$failure: the write failed and was diagnosed", f.writeDiagnostics.isNotEmpty())
+            for (at in listOf(4_000L, 10_000L, 22_000L, 46_000L, 94_000L)) {
+                advanceTimeBy(at - elapsed()); runCurrent()
+                ySends().last().tab.complete(status(503)); runCurrent()
+            }
+            step(200.seconds)
+            assertEquals(failure, listOf(1_000L, 4_000L, 10_000L, 22_000L, 46_000L, 94_000L), ySends().map { it.atMs })
+            assertEquals(failure, emptyList<Throwable>(), f.failures)
+            f.close()
+        }
+    }
+
+    /**
+     * A write completion does not run the common rearm path. X's completion and Y's floor Wake are due at t=10, X's armed
+     * first, and a deactivation is queued after both: the due Wake sends Y before the deactivation.
+     */
+    @Test fun Y07_aWriteCompletionLeavesTheDueWake() = writeTest {
+        for (completion in listOf("preparation", "disk write")) {
+            val f = Fixture(this)
+            if (completion == "preparation") f.prepareDelay = 10.seconds else f.store.afterWriteDelay = 10.seconds
+            f.adopt(this)
+            step(7.seconds)
+            f.coordinator.onActivated(other); runCurrent()
+            // A 429 without Retry-After: the floor and Y's cold deadline are both t=10.
+            f.sent.last().tab.complete(status(429)); runCurrent()
+            f.scope.launch { delay(3.seconds); f.coordinator.onDeactivated() }
+            step(3.seconds)
+            assertEquals("$completion: Y was sent at t=10", listOf(0L, 7_000L, 10_000L), f.sent.map { it.atMs })
+            assertEquals(emptyList<Throwable>(), f.failures)
+            f.close()
+        }
     }
 }
