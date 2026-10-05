@@ -104,6 +104,18 @@ internal class GraphV2RequestCoordinator(
         val catalog: GraphCatalog?
     )
 
+    private class WriteTask(
+        val writeId: Long,
+        val ticket: GraphV2WriteTicket,
+        val key: GraphKey,
+        val captured: GraphV2AccessCapture,
+        val wantsKrx: Boolean
+    ) {
+        // I/O threads read only this flag, the immutable capture and the live gate.
+        val enabled = AtomicBoolean(true)
+        var job: Job? = null // Loop-confined; independent of HTTP and screen activity.
+    }
+
     private class Registration(
         val requestId: Long,
         val context: RequestContext,
@@ -187,6 +199,15 @@ internal class GraphV2RequestCoordinator(
             val captured: GraphV2AccessCapture,
             val result: GraphV2DiskSeedResult
         ) : Event
+        data class WritePreparationFinished(
+            val ticket: GraphV2WriteTicket,
+            val captured: GraphV2AccessCapture,
+            val result: Result<GraphV2WritePreparation>
+        ) : Event
+        data class DiskWriteFinished(
+            val ticket: GraphV2WriteTicket,
+            val result: Result<GraphV2WriteReport>
+        ) : Event
     }
 
     private val inbox = Channel<Event>(Channel.UNLIMITED)
@@ -208,6 +229,9 @@ internal class GraphV2RequestCoordinator(
     private var nextSeedId = 0L
     private var seedRegistration: SeedRegistration? = null
     private var attemptedSeedKey: GraphKey? = null
+    private var nextWriteId = 0L
+    private val writeTasks = mutableMapOf<GraphV2WriteTicket, WriteTask>()
+    private var writePreparationToStart: Job? = null
     private var nextColdGeneration = 0L
     private var coldOwner: ColdOwner? = null
     private var nextMidnightGeneration = 0L
@@ -240,6 +264,7 @@ internal class GraphV2RequestCoordinator(
                     }
                 }
             } finally {
+                discardWrites()
                 discardSeed()
                 cancelTimer()
                 cancelCold()
@@ -269,6 +294,18 @@ internal class GraphV2RequestCoordinator(
     }
 
     private fun handle(event: Event) {
+        // Store completions own no request state, clock stamp or retry deadline.
+        when (event) {
+            is Event.WritePreparationFinished -> {
+                applyWritePreparation(event)
+                return
+            }
+            is Event.DiskWriteFinished -> {
+                applyDiskWrite(event)
+                return
+            }
+            else -> Unit
+        }
         val now = clock.now()
         when (event) {
             is Event.Activate -> {
@@ -298,6 +335,7 @@ internal class GraphV2RequestCoordinator(
             is Event.CatalogFinished -> applyCatalog(event, now)
             is Event.TabFinished -> applyTab(event, now)
             is Event.DiskSeedFinished -> applyDiskSeed(event)
+            is Event.WritePreparationFinished, is Event.DiskWriteFinished -> Unit // Handled above.
         }
         rearmTimer(now)
         publish()
@@ -422,6 +460,7 @@ internal class GraphV2RequestCoordinator(
 
         cancelActiveDemand()
         discardRequests()
+        discardWrites()
         context = next
         catalogAt = null
         if (scopeChanged) protectedSlots = emptyMap()
@@ -633,7 +672,8 @@ internal class GraphV2RequestCoordinator(
                     entries = snapshot.entries + (event.key to entry),
                     failures = snapshot.failures - event.key
                 )
-                replaceOnlineSlot(registration, event.key, entry)
+                val components = replaceOnlineSlot(registration, event.key, entry)
+                reserveOnlineWrite(registration, event.key, components)
                 endConnectedCold(registration)
                 if (connectedMidnight(registration) != null) finishMidnight(now)
             }
@@ -648,12 +688,16 @@ internal class GraphV2RequestCoordinator(
         }
     }
 
-    private fun replaceOnlineSlot(registration: Registration, key: GraphKey, entry: GraphEntry) {
+    private fun replaceOnlineSlot(
+        registration: Registration,
+        key: GraphKey,
+        entry: GraphEntry
+    ): GraphV2DiskComponents? {
         // A failed conversion must never pair a new raw entry with the previous components.
         protectedSlots = protectedSlots - key
-        if (cachePorts == null) return
+        if (cachePorts == null) return null
         val fence = registration.context.fence
-        val epoch = fence.userAccessEpoch ?: return
+        val epoch = fence.userAccessEpoch ?: return null
         val components = try {
             when (val split = splitGraphV2ServerTab(
                 entry.tab,
@@ -663,15 +707,240 @@ internal class GraphV2RequestCoordinator(
                 snapshot.catalog
             )) {
                 is GraphV2Validation.Valid -> split.value
-                is GraphV2Validation.Invalid -> return
+                is GraphV2Validation.Invalid -> return null
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Throwable) {
             // The slot is already absent: fail closed without changing the adopted entry or retry owners.
-            return
+            return null
         }
         protectedSlots = protectedSlots + (key to ProtectedSlot(entry, components))
+        return components
+    }
+
+    /** Reservation is synchronous: adoption order is the store's supersession order. */
+    private fun reserveOnlineWrite(
+        registration: Registration,
+        key: GraphKey,
+        components: GraphV2DiskComponents?
+    ) {
+        val ports = cachePorts ?: return
+        val writes = ports.writePorts ?: return
+        if (components == null) {
+            // No newer reservation can supersede these candidates when slot conversion failed.
+            writeTasks.values.filter { it.key == key }.forEach { discardWrite(it) }
+            return
+        }
+        val writeId = Math.incrementExact(nextWriteId)
+        nextWriteId = writeId
+        val ticket = try {
+            when (val reservation = ports.store.reserveWrite(components)) {
+                is GraphV2WriteReservation.Reserved -> reservation.ticket
+                is GraphV2WriteReservation.Rejected -> {
+                    writeDiagnostic(writeId, key, GraphV2DiskComponent.GENERAL, reservation.reason)
+                    return
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            writeDiagnostic(writeId, key, GraphV2DiskComponent.GENERAL, "Write reservation failed", failure)
+            return
+        }
+        val captured = registration.accessCapture
+        if (captured == null) {
+            // Cancelling keeps the store's latest sequence; never bind a replacement capture.
+            cancelWriteTicket(writeId, key, ticket)
+            writeDiagnostic(writeId, key, GraphV2DiskComponent.GENERAL, "Missing request-start write capture")
+            return
+        }
+        val task = WriteTask(writeId, ticket, key, captured, components.krx != null)
+        writeTasks[ticket] = task
+        val preparationJob = scope.launch(start = CoroutineStart.LAZY) {
+            val result = runCatching {
+                if (!task.enabled.get() || !scope.isActive ||
+                    !ports.gate.admits(captured, GraphV2DiskComponent.GENERAL)
+                ) throw CancellationException("Write preparation admission is closed")
+                writes.prepareWrite.prepare(captured, task.wantsKrx)
+            }
+            val delivered = inbox.trySend(Event.WritePreparationFinished(ticket, captured, result)).isSuccess
+            if (!delivered || result.exceptionOrNull() is CancellationException) abandonWrite(task)
+            (result.exceptionOrNull() as? CancellationException)?.let { throw it }
+        }
+        task.job = preparationJob
+        writePreparationToStart = preparationJob
+    }
+
+    private fun applyWritePreparation(event: Event.WritePreparationFinished) {
+        val task = writeTasks[event.ticket] ?: return
+        var writing = false
+        try {
+            val ports = cachePorts ?: return
+            if (!task.enabled.get() || !scope.isActive || event.captured != task.captured) return
+            event.result.exceptionOrNull()?.let { failure ->
+                if (failure is CancellationException) return
+                val blocked = GraphV2NamespacePreparation.Blocked("Write preparation failed", failure)
+                preparationBlocked(task, GraphV2DiskComponent.GENERAL, blocked)
+                if (task.wantsKrx) preparationBlocked(task, GraphV2DiskComponent.KRX, blocked)
+                return
+            }
+            val result = event.result.getOrThrow()
+            // Each axis describes its own preparation. GENERAL still controls the whole write.
+            val generalBlock = preparationBlock(result.general, task.captured, GraphV2DiskComponent.GENERAL)
+            val krxBlock = if (task.wantsKrx) {
+                preparationBlock(result.krx, task.captured, GraphV2DiskComponent.KRX)
+            } else null
+            if (generalBlock != null) preparationBlocked(task, GraphV2DiskComponent.GENERAL, generalBlock)
+            if (krxBlock != null) preparationBlocked(task, GraphV2DiskComponent.KRX, krxBlock)
+            if (!task.wantsKrx && result.krx != null) {
+                writeDiagnostic(task.writeId, task.key, GraphV2DiskComponent.KRX, "Ignoring preparation without a KRX candidate")
+            }
+            if (generalBlock != null) return
+
+            val krxReady = task.wantsKrx && krxBlock == null
+            val liveAdmission = ports.gate.ioAdmission(task.captured)
+            val admission = GraphV2IoAdmission { component ->
+                task.enabled.get() && scope.isActive &&
+                    (component == GraphV2DiskComponent.GENERAL || krxReady) && liveAdmission.admits(component)
+            }
+            task.job = scope.launch {
+                val written = runCatching { ports.store.write(task.ticket, admission) }
+                val delivered = inbox.trySend(Event.DiskWriteFinished(task.ticket, written)).isSuccess
+                if (!delivered || written.exceptionOrNull() is CancellationException) abandonWrite(task)
+                (written.exceptionOrNull() as? CancellationException)?.let { throw it }
+            }
+            writing = true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            writeDiagnostic(task.writeId, task.key, GraphV2DiskComponent.GENERAL, "Write preparation application failed", failure)
+        } finally {
+            if (!writing) discardWrite(task)
+        }
+    }
+
+    private fun preparationBlock(
+        preparation: GraphV2NamespacePreparation?,
+        captured: GraphV2AccessCapture,
+        component: GraphV2DiskComponent
+    ): GraphV2NamespacePreparation.Blocked? {
+        val record = when (preparation) {
+            is GraphV2NamespacePreparation.Ready -> preparation.record
+            is GraphV2NamespacePreparation.Blocked -> return preparation
+            null -> return GraphV2NamespacePreparation.Blocked("Missing namespace preparation")
+        }
+        val reason = when {
+            record.ownerUid != captured.fence.identity.uid -> "Prepared owner does not match the capture"
+            captured.fence.userAccessEpoch == null || record.userAccessEpoch != captured.fence.userAccessEpoch ->
+                "Prepared USER epoch does not match the capture"
+            !record.mayContainPremiumData -> "Premium data marker is not prepared"
+            component == GraphV2DiskComponent.KRX &&
+                (captured.krxCapabilityEpoch == null || record.krxCapabilityEpoch != captured.krxCapabilityEpoch) ->
+                "Prepared KRX epoch does not match the capture"
+            component == GraphV2DiskComponent.KRX && !record.mayContainKrxData -> "KRX data marker is not prepared"
+            else -> return null
+        }
+        return GraphV2NamespacePreparation.Blocked(reason)
+    }
+
+    private fun preparationBlocked(
+        task: WriteTask,
+        component: GraphV2DiskComponent,
+        blocked: GraphV2NamespacePreparation.Blocked
+    ) {
+        val writes = cachePorts?.writePorts ?: return
+        try {
+            writes.onPreparationBlocked(
+                GraphV2PreparationBlocked(task.writeId, task.key, task.captured, component, blocked.reason, blocked.cause)
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            // Observing a block grants no authority and cannot change its preparation mask.
+            return
+        }
+    }
+
+    private fun applyDiskWrite(event: Event.DiskWriteFinished) {
+        val task = writeTasks[event.ticket] ?: return
+        try {
+            event.result.exceptionOrNull()?.let { failure ->
+                if (failure !is CancellationException) {
+                    writeDiagnostic(task.writeId, task.key, GraphV2DiskComponent.GENERAL, "Disk write failed", failure)
+                    if (task.wantsKrx) {
+                        writeDiagnostic(task.writeId, task.key, GraphV2DiskComponent.KRX, "Disk write failed", failure)
+                    }
+                }
+                return
+            }
+            val report = event.result.getOrThrow()
+            diagnoseWriteOutcome(task, GraphV2DiskComponent.GENERAL, report.general)
+            report.krx?.let { diagnoseWriteOutcome(task, GraphV2DiskComponent.KRX, it) }
+        } finally {
+            // Ticket ownership, never the key, determines which job this completion releases.
+            discardWrite(task)
+        }
+    }
+
+    private fun diagnoseWriteOutcome(
+        task: WriteTask,
+        component: GraphV2DiskComponent,
+        outcome: GraphV2ComponentWriteOutcome
+    ) {
+        when (outcome) {
+            GraphV2ComponentWriteOutcome.Replaced -> Unit
+            is GraphV2ComponentWriteOutcome.Skipped -> writeDiagnostic(task.writeId, task.key, component, outcome.reason)
+            is GraphV2ComponentWriteOutcome.Failed ->
+                writeDiagnostic(task.writeId, task.key, component, "Disk component write failed", outcome.cause)
+        }
+    }
+
+    private fun writeDiagnostic(
+        writeId: Long,
+        key: GraphKey,
+        component: GraphV2DiskComponent,
+        reason: String,
+        cause: Throwable? = null
+    ) {
+        val writes = cachePorts?.writePorts ?: return
+        try {
+            writes.onWriteDiagnostic(GraphV2WriteDiagnostic(writeId, key, component, reason, cause))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            // Diagnostics must not reach A2's catch or alter HTTP retry owners.
+            return
+        }
+    }
+
+    private fun cancelWriteTicket(writeId: Long, key: GraphKey, ticket: GraphV2WriteTicket) {
+        try {
+            cachePorts?.store?.cancelWrite(ticket)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            writeDiagnostic(writeId, key, GraphV2DiskComponent.GENERAL, "Write ticket cancellation failed", failure)
+        }
+    }
+
+    /** Safe on a child coroutine: no access to the loop-confined registry or job. */
+    private fun abandonWrite(task: WriteTask) {
+        task.enabled.set(false)
+        cancelWriteTicket(task.writeId, task.key, task.ticket)
+    }
+
+    private fun discardWrite(task: WriteTask) {
+        try {
+            abandonWrite(task)
+        } finally {
+            task.job?.cancel()
+            if (writeTasks[task.ticket] === task) writeTasks.remove(task.ticket)
+        }
+    }
+
+    private fun discardWrites() {
+        writeTasks.values.toList().forEach { discardWrite(it) }
     }
 
     /** Classification belongs to the transport/decode/admission boundary, never to cached errors. */
@@ -1017,6 +1286,10 @@ internal class GraphV2RequestCoordinator(
         snapshot = snapshot.copy(inFlight = tabRequests.keys.toSet())
         protectedPublication = ProtectedPublication(context, protectedSlots)
         mutableState.value = snapshot
+        // Even an immediate or multi-thread dispatcher must see the adopted publication first.
+        val preparationJob = writePreparationToStart
+        writePreparationToStart = null
+        preparationJob?.start()
     }
 
     private companion object {

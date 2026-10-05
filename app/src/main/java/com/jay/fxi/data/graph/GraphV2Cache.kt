@@ -1,13 +1,57 @@
 package com.jay.fxi.data.graph
 
+import com.jay.fxi.data.entitlements.AccessEpochRecord
 import com.jay.fxi.domain.model.GraphCatalog
 import kotlinx.coroutines.CancellationException
+
+internal sealed interface GraphV2NamespacePreparation {
+    /** The producer has established persistence of this exact record. */
+    data class Ready(val record: AccessEpochRecord) : GraphV2NamespacePreparation
+
+    data class Blocked(
+        val reason: String,
+        val cause: Throwable? = null
+    ) : GraphV2NamespacePreparation
+}
+
+internal data class GraphV2WritePreparation(
+    val general: GraphV2NamespacePreparation,
+    val krx: GraphV2NamespacePreparation?
+)
+
+internal fun interface GraphV2PrepareWrite {
+    suspend fun prepare(captured: GraphV2AccessCapture, wantsKrx: Boolean): GraphV2WritePreparation
+}
+
+internal data class GraphV2PreparationBlocked(
+    val writeId: Long,
+    val key: GraphKey,
+    val captured: GraphV2AccessCapture,
+    val component: GraphV2DiskComponent,
+    val reason: String,
+    val cause: Throwable? = null
+)
+
+internal data class GraphV2WriteDiagnostic(
+    val writeId: Long,
+    val key: GraphKey,
+    val component: GraphV2DiskComponent,
+    val reason: String,
+    val cause: Throwable? = null
+)
+
+internal data class GraphV2WritePorts(
+    val prepareWrite: GraphV2PrepareWrite,
+    val onPreparationBlocked: (GraphV2PreparationBlocked) -> Unit,
+    val onWriteDiagnostic: (GraphV2WriteDiagnostic) -> Unit
+)
 
 internal data class GraphV2CachePorts(
     val store: GraphV2DiskStore,
     val gate: GraphV2AccessGate,
     /** Non-blocking diagnostic observer; failures are isolated from request ownership. */
-    val onSeedDiagnostic: (GraphV2SeedDiagnostic) -> Unit
+    val onSeedDiagnostic: (GraphV2SeedDiagnostic) -> Unit,
+    val writePorts: GraphV2WritePorts? = null
 )
 
 internal data class GraphV2SeedDiagnostic(
