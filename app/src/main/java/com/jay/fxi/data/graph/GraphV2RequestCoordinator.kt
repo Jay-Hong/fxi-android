@@ -3,7 +3,10 @@ package com.jay.fxi.data.graph
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
+import com.jay.fxi.data.auth.AuthUnavailableException
+import com.jay.fxi.data.free.FreeSnapshotSchedulePolicy
 import com.jay.fxi.data.remote.AuthenticatedApiException
+import com.jay.fxi.data.remote.AuthenticatedBodyDecodingException
 import com.jay.fxi.data.remote.AuthenticatedHttpResponse
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.remote.TopicUseAuthority
@@ -19,9 +22,13 @@ import com.jay.fxi.time.AppClock
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -65,7 +72,7 @@ internal data class GraphRequestState(
     val failures: Map<GraphKey, Throwable> = emptyMap()
 )
 
-/** Request ownership and cache application are confined to one consumer; A2a has no timers. */
+/** Request ownership, cache application and retry deadlines are confined to one consumer. */
 internal class GraphV2RequestCoordinator(
     private val fetcher: GraphV2Fetching,
     private val owners: GraphOwnerSource,
@@ -74,14 +81,56 @@ internal class GraphV2RequestCoordinator(
     private val uses: TopicUseAuthority,
     private val scope: CoroutineScope,
     private val clock: AppClock,
+    /** Stable, finite and non-negative for each tab. */
+    private val rateLimitJitter: (tab: String) -> Duration,
     private val onEventFailure: (Throwable) -> Unit
 ) {
     private data class RequestContext(val fence: TopicSessionFence, val lifetime: TopicUseLifetime)
 
-    private class Registration(val requestId: Long, val context: RequestContext) {
+    private class Registration(
+        val requestId: Long,
+        val context: RequestContext,
+        val key: GraphKey?,
+        val originalTab: String,
+        val activityGeneration: Long
+    ) {
         // The only request-owned mutable value consulted outside the loop. Job completion is
         // not disposal: the response still has to pass the loop's application boundary.
         val disposed = AtomicBoolean(false)
+        // Everything below is loop-confined, including the final capture-to-fetch checkpoint.
+        var capturedOwner: AuthSnapshot? = null
+        var waitingForFloor = false
+        var departed = false
+        var coldGeneration: Long? = null
+        var coldAttempt = false
+    }
+
+    private class ColdOwner(
+        val generation: Long,
+        val activityGeneration: Long,
+        val key: GraphKey,
+        val context: RequestContext,
+        var deadline: Instant?,
+        var rung: Int = 0,
+        var requestId: Long? = null
+    )
+
+    private data class DeferredDemand(
+        val key: GraphKey,
+        val context: RequestContext,
+        val activityGeneration: Long,
+        val force: Boolean
+    )
+
+    private enum class FailureDisposition { RETRYABLE, TERMINAL, WITHDRAWN, DIAGNOSTIC }
+
+    private sealed interface TabOutcome {
+        data class Success(val tab: GraphV2Tab) : TabOutcome
+        data class Failure(
+            val error: Throwable,
+            val disposition: FailureDisposition,
+            val statusCode: Int? = null
+        ) : TabOutcome
     }
 
     private sealed interface Event {
@@ -89,8 +138,11 @@ internal class GraphV2RequestCoordinator(
         data object Deactivate : Event
         data object ContextChanged : Event
         data class Refresh(val force: Boolean) : Event
+        data class Captured(val registration: Registration, val result: Result<AuthSnapshot>) : Event
+        data class Wake(val generation: Long) : Event
         data class CatalogFinished(
             val requestId: Long,
+            val originalTab: String,
             val result: Result<AuthenticatedHttpResponse<GraphV2CatalogResponse>>
         ) : Event
         data class TabFinished(
@@ -113,6 +165,16 @@ internal class GraphV2RequestCoordinator(
     private var catalogRequest: Registration? = null
     private val tabRequests = mutableMapOf<GraphKey, Registration>()
     private var nextRequestId = 0L
+    private var activityGeneration = 0L
+    private var nextColdGeneration = 0L
+    private var coldOwner: ColdOwner? = null
+    private var deferredDemand: DeferredDemand? = null
+    // Written by the loop, also read by the transport's replay guard. Context disposal and
+    // deactivation never reset it; an in-flight answer still uses its separate ownership check.
+    @Volatile private var sharedRetryFloor: Instant? = null
+    private var timer: Job? = null
+    private var timerDeadline: Instant? = null
+    private var timerGeneration = 0L
 
     fun start() {
         if (!started.compareAndSet(false, true)) return
@@ -126,11 +188,15 @@ internal class GraphV2RequestCoordinator(
                     } catch (failure: Throwable) {
                         // A broken completion must not leave its key permanently claimed.
                         releaseCompletion(event)
+                        cancelCold()
+                        cancelTimer()
                         publish()
                         onEventFailure(failure)
                     }
                 }
             } finally {
+                cancelTimer()
+                cancelCold()
                 discardRequests()
                 inbox.close()
                 publish()
@@ -148,11 +214,13 @@ internal class GraphV2RequestCoordinator(
         when (event) {
             is Event.Activate -> {
                 synchronizeContext()
+                if (activeKey != event.key) cancelActiveDemand()
                 activeKey = event.key
                 requestActive(now, force = false)
             }
             Event.Deactivate -> {
                 synchronizeContext()
+                cancelActiveDemand()
                 activeKey = null
             }
             Event.ContextChanged -> if (synchronizeContext()) requestActive(now, force = false)
@@ -160,9 +228,12 @@ internal class GraphV2RequestCoordinator(
                 synchronizeContext()
                 requestActive(now, event.force)
             }
+            is Event.Captured -> onCaptured(event, now)
+            is Event.Wake -> onWake(event, now)
             is Event.CatalogFinished -> applyCatalog(event, now)
             is Event.TabFinished -> applyTab(event, now)
         }
+        rearmTimer(now)
         publish()
     }
 
@@ -177,6 +248,7 @@ internal class GraphV2RequestCoordinator(
         val scopeChanged = snapshot.dataScope != dataScope
         if (!scopeChanged && context == next) return false
 
+        cancelActiveDemand()
         discardRequests()
         context = next
         catalogAt = null
@@ -187,20 +259,36 @@ internal class GraphV2RequestCoordinator(
         return true
     }
 
-    private fun requestActive(now: Instant, force: Boolean) {
+    private fun requestActive(now: Instant, force: Boolean, coldAttempt: Boolean = false) {
         val key = activeKey ?: return
         val current = context ?: return
 
         // Catalog refresh is independent of tab freshness and never blocks the tab request.
         val lastCatalogAt = catalogAt
-        if (catalogRequest == null && (snapshot.catalog == null || lastCatalogAt == null ||
-                now - lastCatalogAt >= GraphV2Domain.ttl(snapshot.catalog))) {
-            startCatalog(current)
+        val needsCatalog = catalogRequest == null && (snapshot.catalog == null || lastCatalogAt == null ||
+            now - lastCatalogAt >= GraphV2Domain.ttl(snapshot.catalog))
+        val supported = GraphV2Domain.support(snapshot.catalog, key.tab, key.period) != GraphPeriodSupport.Unsupported
+        val cold = coldOwner?.takeIf { it.key == key && it.context == current }
+        val needsTab = supported && !tabRequests.containsKey(key) &&
+            (force || (cold == null && !isFresh(snapshot.entries[key], now)))
+
+        if (underFloor(now)) {
+            if (needsCatalog || needsTab) {
+                val previous = deferredDemand
+                deferredDemand = DeferredDemand(key, current, activityGeneration, force || previous?.force == true)
+            }
+            return
         }
-        if (GraphV2Domain.support(snapshot.catalog, key.tab, key.period) == GraphPeriodSupport.Unsupported) return
-        if (tabRequests.containsKey(key)) return
-        if (!force && isFresh(snapshot.entries[key], now)) return
-        startTab(current, key)
+        if (needsCatalog) startCatalog(current, key.tab)
+        if (!supported) {
+            if (coldAttempt) cancelCold()
+            return
+        }
+        tabRequests[key]?.let {
+            if (coldAttempt) connectCold(it, attempt = true)
+            return
+        }
+        if (needsTab) startTab(current, key, coldAttempt)
     }
 
     private fun isFresh(entry: GraphEntry?, now: Instant): Boolean {
@@ -218,6 +306,13 @@ internal class GraphV2RequestCoordinator(
             currentAccessFence() == captured.fence && uses.admits(captured.lifetime)
     }
 
+    private fun sendAdmitted(registration: Registration): Boolean {
+        if (!useAdmitted(registration)) return false
+        val floor = sharedRetryFloor ?: return true
+        // This is the transport's live send checkpoint, separate from the event's captured now.
+        return clock.now() >= floor
+    }
+
     private suspend fun captureOwner(registration: Registration): AuthSnapshot {
         if (!useAdmitted(registration)) throw CancellationException("Graph request use withdrawn")
         val owner = owners.capture(registration.context.fence.identity)
@@ -226,42 +321,97 @@ internal class GraphV2RequestCoordinator(
         return owner
     }
 
-    private fun startCatalog(current: RequestContext) {
-        val registration = Registration(++nextRequestId, current)
+    private fun startCatalog(current: RequestContext, originalTab: String) {
+        val registration = Registration(++nextRequestId, current, null, originalTab, activityGeneration)
         catalogRequest = registration
+        startCapture(registration)
+    }
+
+    private fun startTab(current: RequestContext, key: GraphKey, coldAttempt: Boolean) {
+        // Registration is the logical start; changing the active key does not withdraw a sent request.
+        val registration = Registration(++nextRequestId, current, key, key.tab, activityGeneration)
+        tabRequests[key] = registration
+        connectCold(registration, coldAttempt)
+        startCapture(registration)
+    }
+
+    private fun startCapture(registration: Registration) {
         scope.launch {
-            val result = runCatching {
-                val owner = captureOwner(registration)
-                fetcher.catalog(owner) { useAdmitted(registration) }
-            }
-            inbox.trySend(Event.CatalogFinished(registration.requestId, result))
+            val result = runCatching { captureOwner(registration) }
+            inbox.trySend(Event.Captured(registration, result))
             (result.exceptionOrNull() as? CancellationException)?.let { throw it }
         }
     }
 
-    private fun startTab(current: RequestContext, key: GraphKey) {
-        // Registration is the logical start; changing the active key does not withdraw it.
-        val registration = Registration(++nextRequestId, current)
-        tabRequests[key] = registration
-        scope.launch {
-            val result = runCatching {
-                val owner = captureOwner(registration)
-                fetcher.tab(owner, key) { useAdmitted(registration) }
+    private fun onCaptured(event: Event.Captured, now: Instant) {
+        val registration = event.registration
+        val error = event.result.exceptionOrNull()
+        if (error != null) {
+            // A failed capture can itself carry HTTP evidence after an identity change.
+            if (registration.key == null) {
+                applyCatalog(Event.CatalogFinished(registration.requestId, registration.originalTab, Result.failure(error)), now)
+            } else {
+                applyTab(Event.TabFinished(registration.requestId, registration.key, Result.failure(error)), now)
             }
-            inbox.trySend(Event.TabFinished(registration.requestId, key, result))
-            (result.exceptionOrNull() as? CancellationException)?.let { throw it }
+            return
+        }
+        if (!isRegistered(registration)) return
+        registration.capturedOwner = event.result.getOrThrow()
+        dispatchCaptured(registration, now)
+    }
+
+    private fun isRegistered(registration: Registration): Boolean =
+        if (registration.key == null) catalogRequest === registration
+        else tabRequests[registration.key] === registration
+
+    private fun dispatchCaptured(registration: Registration, now: Instant) {
+        if (!isRegistered(registration) || registration.departed) return
+        if (!useAdmitted(registration)) {
+            releaseRegistration(registration)
+            endConnectedCold(registration)
+            return
+        }
+        val owner = registration.capturedOwner ?: return
+        if (underFloor(now)) {
+            // Deferred sends are demand too: a later key transition must not revive this one.
+            if (registration.activityGeneration != activityGeneration || activeKey == null) {
+                releaseRegistration(registration)
+                endConnectedCold(registration)
+            } else {
+                registration.waitingForFloor = true
+            }
+            return
+        }
+        registration.waitingForFloor = false
+        registration.departed = true
+        // Enter fetch immediately at the loop's final floor checkpoint. No queued child may
+        // slip a new floor between this admission and entering the fetcher after capture.
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            val key = registration.key
+            if (key == null) {
+                val result = runCatching { fetcher.catalog(owner) { sendAdmitted(registration) } }
+                inbox.trySend(Event.CatalogFinished(registration.requestId, registration.originalTab, result))
+                (result.exceptionOrNull() as? CancellationException)?.let { throw it }
+            } else {
+                val result = runCatching { fetcher.tab(owner, key) { sendAdmitted(registration) } }
+                inbox.trySend(Event.TabFinished(registration.requestId, key, result))
+                (result.exceptionOrNull() as? CancellationException)?.let { throw it }
+            }
         }
     }
 
     private fun applyCatalog(event: Event.CatalogFinished, now: Instant) {
+        recordRetryFloor(event.result, event.originalTab, now)
         val registration = catalogRequest?.takeIf { it.requestId == event.requestId } ?: return
         if (event.result.exceptionOrNull() is CancellationException) {
             releaseCompletion(event)
             return
         }
-        if (!useAdmitted(registration)) return
-        catalogRequest = null
-        registration.disposed.set(true)
+        if (!useAdmitted(registration)) {
+            releaseRegistration(registration)
+            return
+        }
+        releaseRegistration(registration)
         val response = event.result.getOrNull() ?: return
         if (response.statusCode != 200) return
         val body = response.body ?: return
@@ -271,47 +421,258 @@ internal class GraphV2RequestCoordinator(
     }
 
     private fun applyTab(event: Event.TabFinished, now: Instant) {
+        recordRetryFloor(event.result, event.key.tab, now)
         val registration = tabRequests[event.key]?.takeIf { it.requestId == event.requestId } ?: return
-        if (event.result.exceptionOrNull() is CancellationException) {
-            releaseCompletion(event)
+        if (!useAdmitted(registration)) {
+            releaseRegistration(registration)
+            endConnectedCold(registration)
             return
         }
-        if (!useAdmitted(registration)) return
-        tabRequests.remove(event.key)
-        registration.disposed.set(true)
-
-        val admitted = event.result.mapCatching { response ->
-            if (response.statusCode != 200) {
-                throw response.failure?.let { AuthenticatedApiException(it) }
-                    ?: IOException("Graph tab returned HTTP ${response.statusCode}; expected 200")
+        releaseRegistration(registration)
+        when (val outcome = tabOutcome(event.result, event.key)) {
+            is TabOutcome.Success -> {
+                snapshot = snapshot.copy(
+                    entries = snapshot.entries + (event.key to GraphEntry(outcome.tab, now)),
+                    failures = snapshot.failures - event.key
+                )
+                endConnectedCold(registration)
             }
-            val body = response.body ?: throw IOException("Graph tab returned an empty 200 body")
-            when (val admission = GraphV2Domain.admit(body, event.key.tab, event.key.period, snapshot.catalog)) {
-                is GraphTabAdmission.Accepted -> admission.tab
-                is GraphTabAdmission.Rejected -> throw IOException(admission.reason)
+            is TabOutcome.Failure -> {
+                if (outcome.disposition != FailureDisposition.WITHDRAWN) {
+                    snapshot = snapshot.copy(failures = snapshot.failures + (event.key to outcome.error))
+                }
+                onColdFailure(registration, outcome, now)
+                if (outcome.disposition == FailureDisposition.DIAGNOSTIC) onEventFailure(outcome.error)
             }
         }
-        val failure = admitted.exceptionOrNull()
-        if (failure == null) {
-            snapshot = snapshot.copy(
-                entries = snapshot.entries + (event.key to GraphEntry(admitted.getOrThrow(), now)),
-                failures = snapshot.failures - event.key
+    }
+
+    /** Classification belongs to the transport/decode/admission boundary, never to cached errors. */
+    private fun tabOutcome(result: Result<AuthenticatedHttpResponse<GraphV2TabResponse>>, key: GraphKey): TabOutcome {
+        result.exceptionOrNull()?.let { error ->
+            return when (error) {
+                is AuthIdentityChangedException, is CancellationException, is AuthUnavailableException ->
+                    TabOutcome.Failure(error, FailureDisposition.WITHDRAWN)
+                is AuthenticatedApiException ->
+                    TabOutcome.Failure(error, httpDisposition(error.failure.statusCode), error.failure.statusCode)
+                is AuthenticatedBodyDecodingException -> {
+                    val response = error.response
+                    TabOutcome.Failure(error, decodeDisposition(response), response.statusCode)
+                }
+                is IOException -> TabOutcome.Failure(error, FailureDisposition.RETRYABLE)
+                else -> TabOutcome.Failure(error, FailureDisposition.DIAGNOSTIC)
+            }
+        }
+        val response = result.getOrThrow()
+        if (response.statusCode != 200) {
+            val error = response.failure?.let { AuthenticatedApiException(it) }
+                ?: IOException("Graph tab returned HTTP ${response.statusCode}; expected 200")
+            return TabOutcome.Failure(error, httpDisposition(response.statusCode), response.statusCode)
+        }
+        val body = response.body ?: return TabOutcome.Failure(
+            IOException("Graph tab returned an empty 200 body"), decodeDisposition(response), 200
+        )
+        return try {
+            when (val admission = GraphV2Domain.admit(body, key.tab, key.period, snapshot.catalog)) {
+                is GraphTabAdmission.Accepted -> TabOutcome.Success(admission.tab)
+                is GraphTabAdmission.Rejected -> TabOutcome.Failure(IOException(admission.reason), FailureDisposition.TERMINAL)
+            }
+        } catch (error: Throwable) {
+            TabOutcome.Failure(error, FailureDisposition.DIAGNOSTIC)
+        }
+    }
+
+    private fun httpDisposition(statusCode: Int): FailureDisposition =
+        if (statusCode == 408 || statusCode == 429 || statusCode in 500..599) FailureDisposition.RETRYABLE
+        else FailureDisposition.TERMINAL
+
+    private fun decodeDisposition(response: AuthenticatedHttpResponse<*>): FailureDisposition =
+        if (response.statusCode != 200) httpDisposition(response.statusCode)
+        else if (response.rawBodyBytes().isEmpty()) FailureDisposition.RETRYABLE
+        else FailureDisposition.TERMINAL
+
+    private fun recordRetryFloor(result: Result<AuthenticatedHttpResponse<*>>, originalTab: String, now: Instant) {
+        val response = result.getOrNull()
+        if (response != null) {
+            recordRetryFloor(response.statusCode, response.retryAfter, originalTab, now)
+            return
+        }
+        when (val error = result.exceptionOrNull()) {
+            is AuthenticatedApiException -> recordRetryFloor(error.failure.statusCode, error.failure.retryAfter, originalTab, now)
+            is AuthenticatedBodyDecodingException -> recordRetryFloor(error.response.statusCode, error.response.retryAfter, originalTab, now)
+            is AuthIdentityChangedException -> {
+                if (error.exchanges.isEmpty()) {
+                    recordRetryFloor(error.statusCode, error.retryAfter, originalTab, now)
+                } else {
+                    // The scalar fields repeat the last exchange; do not count that response twice.
+                    error.exchanges.forEach { recordRetryFloor(it.statusCode, it.retryAfter, originalTab, now) }
+                }
+            }
+        }
+    }
+
+    private fun recordRetryFloor(statusCode: Int?, header: String?, originalTab: String, now: Instant) {
+        // Pass the original header unchanged: all parsing, including HTTP-date, belongs to this policy.
+        val stated = FreeSnapshotSchedulePolicy.retryFloorAfter(now, header)
+            ?: if (statusCode == 429) now + COLD_INTERVALS.first() else return
+        // Instant.plus saturates at its representable bound, including when adding finite jitter.
+        val floor = stated + jitterFor(originalTab)
+        sharedRetryFloor = maxOf(sharedRetryFloor ?: floor, floor)
+        if (underFloor(now)) {
+            // Captures not yet completed must also remember that their demand was deferred.
+            // Otherwise a key switch before capture finishes could revive them after expiry.
+            val pending = listOfNotNull(catalogRequest) + tabRequests.values.toList()
+            pending.filter { !it.departed }.forEach { it.waitingForFloor = true }
+        }
+    }
+
+    private fun jitterFor(tab: String): Duration = rateLimitJitter(tab).also {
+        require(it.isFinite() && it >= Duration.ZERO) { "Graph rate-limit jitter must be finite and non-negative" }
+    }
+
+    private fun underFloor(now: Instant): Boolean = sharedRetryFloor?.let { now < it } == true
+
+    private fun connectCold(registration: Registration, attempt: Boolean) {
+        val cold = coldOwner ?: return
+        if (registration.key != cold.key || registration.context != cold.context ||
+            registration.activityGeneration != cold.activityGeneration) return
+        registration.coldGeneration = cold.generation
+        registration.coldAttempt = attempt
+        cold.requestId = registration.requestId
+        if (attempt) cold.deadline = null
+    }
+
+    private fun connectedCold(registration: Registration): ColdOwner? = coldOwner?.takeIf {
+        it.generation == registration.coldGeneration && it.requestId == registration.requestId &&
+            it.key == registration.key && it.context == registration.context
+    }
+
+    private fun endConnectedCold(registration: Registration) {
+        if (connectedCold(registration) != null) cancelCold()
+    }
+
+    private fun onColdFailure(registration: Registration, failure: TabOutcome.Failure, now: Instant) {
+        val cold = connectedCold(registration)
+        if (failure.disposition != FailureDisposition.RETRYABLE) {
+            if (cold != null) cancelCold()
+            return
+        }
+        val key = registration.key ?: return
+        if (activeKey != key || context != registration.context ||
+            activityGeneration != registration.activityGeneration || snapshot.entries[key]?.online200At != null) {
+            if (cold != null) cancelCold()
+            return
+        }
+        if (cold == null) {
+            // A superseded or unrelated request cannot reset an existing owner.
+            if (coldOwner != null) return
+            coldOwner = ColdOwner(
+                ++nextColdGeneration, activityGeneration, key, registration.context,
+                coldDeadline(now, 0, failure.statusCode, key.tab)
             )
-        } else if (failure !is CancellationException) {
-            snapshot = snapshot.copy(failures = snapshot.failures + (event.key to failure))
+        } else {
+            cold.requestId = null
+            // Outside force failures preserve the original rung and deadline.
+            if (!registration.coldAttempt) return
+            cold.rung++
+            if (cold.rung == COLD_INTERVALS.size) {
+                cancelCold()
+            } else {
+                cold.deadline = coldDeadline(now, cold.rung, failure.statusCode, key.tab)
+            }
+        }
+    }
+
+    private fun coldDeadline(now: Instant, rung: Int, statusCode: Int?, tab: String): Instant =
+        now + COLD_INTERVALS[rung] + if (statusCode == 429) jitterFor(tab) else Duration.ZERO
+
+    private fun onWake(event: Event.Wake, now: Instant) {
+        if (event.generation != timerGeneration) return
+        timer = null
+        timerDeadline = null
+        synchronizeContext()
+
+        // Only saved demand is resumed. A floor with no demand never arms a timer or sends a GET.
+        val waiting = listOfNotNull(catalogRequest) + tabRequests.values.toList()
+        waiting.filter { it.waitingForFloor }.forEach { dispatchCaptured(it, now) }
+        deferredDemand?.let { demand ->
+            deferredDemand = null
+            if (demand.key == activeKey && demand.context == context &&
+                demand.activityGeneration == activityGeneration) requestActive(now, demand.force)
+        }
+
+        val cold = coldOwner ?: return
+        if (cold.key != activeKey || cold.context != context || cold.activityGeneration != activityGeneration ||
+            snapshot.entries[cold.key]?.online200At != null) {
+            cancelCold()
+            return
+        }
+        val deadline = cold.deadline ?: return
+        if (now < deadline || underFloor(now)) return
+        // An outside force request can be joined when due; it is never duplicated.
+        requestActive(now, force = true, coldAttempt = true)
+    }
+
+    private fun cancelCold() { coldOwner = null }
+
+    private fun cancelActiveDemand() {
+        activityGeneration++
+        cancelCold()
+        deferredDemand = null
+        // Already sent requests retain A2a ownership of their own cache entry. Unsent floor
+        // demand belongs to the old activation and must be disposed on a real transition.
+        val waiting = listOfNotNull(catalogRequest) + tabRequests.values.toList()
+        waiting.filter { it.waitingForFloor }.forEach { releaseRegistration(it) }
+    }
+
+    private fun rearmTimer(now: Instant) {
+        val candidates = mutableListOf<Instant>()
+        fun afterFloor(deadline: Instant): Instant = maxOf(deadline, sharedRetryFloor ?: deadline)
+        coldOwner?.takeIf { it.requestId == null }?.deadline?.let { candidates += afterFloor(it) }
+        if (deferredDemand != null) sharedRetryFloor?.let { candidates += it }
+        fun readyAtFloor(registration: Registration): Boolean =
+            registration.waitingForFloor && registration.capturedOwner != null
+        if (catalogRequest?.let { readyAtFloor(it) } == true || tabRequests.values.any { readyAtFloor(it) }) {
+            sharedRetryFloor?.let { candidates += it }
+        }
+        val next = candidates.minOrNull()
+        if (next == timerDeadline && timer?.isActive == true) return
+        cancelTimer()
+        if (next == null) return
+        timerDeadline = next
+        val generation = timerGeneration
+        timer = scope.launch {
+            delay(maxOf(next - now, Duration.ZERO))
+            inbox.trySend(Event.Wake(generation))
+        }
+    }
+
+    private fun cancelTimer() {
+        timerGeneration++
+        timer?.cancel()
+        timer = null
+        timerDeadline = null
+    }
+
+    private fun releaseRegistration(registration: Registration) {
+        registration.disposed.set(true)
+        if (registration.key == null) {
+            if (catalogRequest === registration) catalogRequest = null
+        } else if (tabRequests[registration.key] === registration) {
+            tabRequests.remove(registration.key)
         }
     }
 
     private fun releaseCompletion(event: Event) {
         when (event) {
             is Event.CatalogFinished -> catalogRequest?.takeIf { it.requestId == event.requestId }?.let {
-                it.disposed.set(true)
-                catalogRequest = null
+                releaseRegistration(it)
             }
             is Event.TabFinished -> tabRequests[event.key]?.takeIf { it.requestId == event.requestId }?.let {
-                it.disposed.set(true)
-                tabRequests.remove(event.key)
+                releaseRegistration(it)
+                endConnectedCold(it)
             }
+            is Event.Captured -> if (isRegistered(event.registration)) releaseRegistration(event.registration)
             else -> Unit
         }
     }
@@ -330,5 +691,6 @@ internal class GraphV2RequestCoordinator(
 
     private companion object {
         val KST = TimeZone.of("Asia/Seoul")
+        val COLD_INTERVALS = listOf(3.seconds, 6.seconds, 12.seconds, 24.seconds, 48.seconds)
     }
 }
