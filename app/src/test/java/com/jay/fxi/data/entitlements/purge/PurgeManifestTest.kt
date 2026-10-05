@@ -107,17 +107,18 @@ class PurgeManifestTest {
     }
 
     /**
-     * The only surface classified as this purger's own work is the S3 topic last-known store (S3-R2).
+     * The surfaces classified as this purger's own work are the S3 topic last-known store (S3-R2) and the two S4 Graph V2
+     * disk stores (B1a-2: general per UID and user epoch; KRX per UID, user and capability epoch).
      *
-     * The topic and graph runtimes are still not wired (동결 후 13번); the store landed ahead of them, with its deletion adapter
-     * still owed, so a purge stays Deferred. Any other `DERIVED_HERE` entry means either another runtime landed — and this test
-     * should be updated with it — or a legacy surface was quietly reclassified.
+     * The topic and graph runtimes are still not wired (동결 후 13번); the stores landed ahead of them, with their deletion
+     * adapters not registered in production, so a purge stays Deferred. Any other `DERIVED_HERE` entry means either another
+     * runtime landed — and this test should be updated with it — or a legacy surface was quietly reclassified.
      */
     @Test
-    fun `the only derived target is the topic last-known store`() {
+    fun `the derived targets are the topic last-known store and the graph v2 stores`() {
         assertEquals(
-            listOf("datastore:fxi_topic_last_known"),
-            PurgeManifest.TARGETS.filter { it.classification == PurgeClassification.DERIVED_HERE }.map { it.id }
+            setOf("datastore:fxi_topic_last_known", "file:graph_v2_general", "file:graph_v2_krx"),
+            PurgeManifest.TARGETS.filter { it.classification == PurgeClassification.DERIVED_HERE }.map { it.id }.toSet()
         )
     }
 

@@ -138,6 +138,20 @@ object PurgeManifest {
             note = "`graph_cache_v1_*.json` and the legacy names; read paths still promote into them"
         ),
         PurgeTarget(
+            id = "file:graph_v2_general",
+            classification = PurgeClassification.DERIVED_HERE,
+            scopes = setOf(PurgeScope.USER),
+            owner = "S4",
+            note = "validated server Graph V2 general components per UID/user epoch"
+        ),
+        PurgeTarget(
+            id = "file:graph_v2_krx",
+            classification = PurgeClassification.DERIVED_HERE,
+            scopes = setOf(PurgeScope.USER, PurgeScope.CAPABILITY),
+            owner = "S4",
+            note = "validated server Graph V2 KRX components per UID/user/capability epoch"
+        ),
+        PurgeTarget(
             id = "file:news_cache",
             classification = PurgeClassification.UNDER_REVIEW,
             scopes = setOf(PurgeScope.USER),
