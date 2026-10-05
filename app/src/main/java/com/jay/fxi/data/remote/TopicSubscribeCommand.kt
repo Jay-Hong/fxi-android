@@ -300,7 +300,9 @@ class TopicSubscribeCommand(
     /** A manual obligation's original registration entries, independent of the automatic purpose. */
     private val manualEntry: Map<String, Long>? = null,
     /** Manual targets still owned: they owe a subscribe ACK even when their delivery has already arrived. */
-    private val manualScope: () -> Set<String> = { emptySet() }
+    private val manualScope: () -> Set<String> = { emptySet() },
+    /** Immediately after an admitted refresh result applies InvalidToken because it produced no usable credential. */
+    private val onAuthRefreshUnusable: () -> Unit = {}
 ) {
     init {
         require(purpose != TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION || revalidationEntry != null) {
@@ -534,6 +536,7 @@ class TopicSubscribeCommand(
                                 if (refreshed == null) {
                                     // Back to FAILED, and by the same route it got there.
                                     store.applyWholeFailure(TopicWholeRequestFailure.InvalidToken)
+                                    onAuthRefreshUnusable()
                                     return TopicCommandOutcome.Stopped(
                                         TopicWholeRequestDecision.Stop.Reason.AUTH_REPLAY_SPENT,
                                         // Admitted just above, and nothing has suspended since.

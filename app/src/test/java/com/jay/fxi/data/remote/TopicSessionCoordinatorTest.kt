@@ -14821,7 +14821,7 @@ class TopicSessionCoordinatorTest {
         h.bootstrapGate!!.complete(Unit)
         advanceTimeBy(100)
 
-        assertEquals("G2A-06 order", listOf("INITIAL", "AUTHORITY_ENDED PREMIUM_REFUSED"), g.trace())
+        assertEquals("G2A-06 order", listOf("INITIAL", "AUTHORITY_ENDED PREMIUM_REFUSED"), g.deliveryTrace())
         h.cleanUp()
     }
 
@@ -15067,7 +15067,7 @@ class TopicSessionCoordinatorTest {
         assertEquals(
             "G2A-19 order",
             listOf("INITIAL", "RESUMED usdt:krw/WS", "OBS usdt:krw/WS", "AUTHORITY_ENDED IDENTITY_RETIRED"),
-            g.trace()
+            g.deliveryTrace()
         )
         assertEquals("G2A-19 at the silence", 75_000L, g.events.last().occurredAtEpochMillis)
         assertEquals("G2A-19 the held use", TopicUseLifetime(fence().grant, 0L), g.events.last().authority.lifetime)
@@ -15780,6 +15780,289 @@ class TopicSessionCoordinatorTest {
         assertTrue("G2B-15 fixture: suspect, degraded, REST, socket and lease interruptions were all said",
             listOf("DELIVERY_SUSPECT", "DELIVERY_DEGRADED", "REST_UNDELIVERED", "WS_ENDED", "LEASE_EXPIRED").all { r -> recorded.any { it.endsWith(r) } })
         assertTrue("G2B-15 fixture: the failing sink lost them", failing.coordinator.graphLoss.value != null)
+        dormant.cleanUp()
+    }
+
+    // ---- S3 graph continuity, unit 2b-2 (G2B-01..07, 14b, 15b): acknowledgement and authentication facts ----------------------
+
+    private fun GraphRecorder.acks() = events.filter { it.kind == TopicGraphEventKind.ACK_ACTIVE_SET_CHANGED }
+
+    private fun GraphRecorder.authEvents() =
+        events.filter { it.kind == TopicGraphEventKind.AUTH_FAILED || it.kind == TopicGraphEventKind.AUTH_RECOVERED }
+
+    @Test
+    fun `G2B-01 each applied acknowledgement says the whole confirmed set, a removal reopens only that topic, and the same set again reopens nothing`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD, JPY_TOPIC))
+        val g = continuityLive(h)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        h.wire.deliver(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT1))))
+        advanceTimeBy(1)
+        h.wallMillis = 400_000L
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER, USD), rejections = mapOf(JPY_TOPIC to "topics_disabled")))
+        advanceTimeBy(1)
+
+        val first = g.acks().single()
+        assertEquals(
+            "G2B-01 the whole confirmed set and the refusals",
+            TopicGraphEventPayload.AckApplied(setOf(TETHER, USD), mapOf(JPY_TOPIC to TopicRejectionReason.TOPICS_DISABLED)),
+            first.payload
+        )
+        assertNull("G2B-01 no reason", first.reason)
+        assertEquals("G2B-01 scope", setOf(TETHER, USD, JPY_TOPIC) to setOf(TopicGraphPath.WS), first.topics to first.paths)
+        assertTrue("G2B-01 the socket's generation", first.connectionGeneration != null)
+        assertEquals("G2B-01 when", 400_000L, first.occurredAtEpochMillis)
+
+        // A retry's answer whose active set no longer names USD: USD is no longer confirmed, and its socket path reopens.
+        h.retry(FreeTab.JPY)
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER)))
+        advanceTimeBy(1)
+        assertEquals("G2B-01 the shrunk set", TopicGraphEventPayload.AckApplied(setOf(TETHER), emptyMap()), g.acks().last().payload)
+        h.wire.deliver(gFx(USD, listOf(gEntry("kb", "usd-krw", 1392.0, gT2))))
+        advanceTimeBy(1)
+        val afterRemoval = g.trace()
+        assertEquals(
+            "G2B-01 the removed topic's next candidate resumes it",
+            listOf("ACK_ACTIVE_SET_CHANGED", "RESUMED fx:usd-krw/WS", "OBS fx:usd-krw/WS"),
+            afterRemoval.drop(afterRemoval.lastIndexOf("ACK_ACTIVE_SET_CHANGED")).filterNot { it.startsWith("DELIVERY_INTERRUPTED") }
+        )
+
+        // The same set acknowledged again: a fact, not a removal.
+        h.retry(FreeTab.JPY)
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER)))
+        advanceTimeBy(1)
+        h.wire.deliver(gFx(USD, listOf(gEntry("kb", "usd-krw", 1393.0, gT3))))
+        advanceTimeBy(1)
+        assertEquals("G2B-01 three acknowledgement facts", 3, g.acks().size)
+        val afterRepeat = g.trace().drop(afterRemoval.size)
+        assertTrue("G2B-01 the repeat reopened nothing: ${afterRepeat}", afterRepeat.none { it == "RESUMED fx:usd-krw/WS" })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2B-01b a refusal of a topic that was receiving reopens its socket path, seen once it is accepted again`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        h.wire.deliver(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT1))))
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "topics_disabled")))
+        advanceTimeBy(1)
+        assertEquals("G2B-01b fixture: refused", TopicRejectionReason.TOPICS_DISABLED, h.stateOf(USD).rejection)
+        assertEquals(
+            "G2B-01b the refusal is in the fact",
+            TopicGraphEventPayload.AckApplied(setOf(TETHER), mapOf(USD to TopicRejectionReason.TOPICS_DISABLED)),
+            g.acks().first().payload
+        )
+
+        val sent = h.requests.size
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        assertEquals("G2B-01b fixture: the retry went out", sent + 1, h.requests.size)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertNull("G2B-01b fixture: accepted again", h.stateOf(USD).rejection)
+        h.wire.deliver(gFx(USD, listOf(gEntry("kb", "usd-krw", 1392.0, gT2))))
+        advanceTimeBy(1)
+
+        assertEquals("G2B-01b the socket path resumed again", 2, g.trace().count { it == "RESUMED fx:usd-krw/WS" })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2B-03 an acknowledgement no command owns, or one that cannot be read, says nothing`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        h.wire.deliver(h.ack("rX", active = listOf(TETHER, USD)))
+        h.wire.deliver("""{"type":"subscription_ack","request_id":"r1"}""")
+        advanceTimeBy(1)
+        assertTrue("G2B-03 nothing from either", g.acks().isEmpty())
+
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertEquals("G2B-03 the owned, readable one", 1, g.acks().size)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2B-04 a premium refusal after a failed authentication says the answer, the recovery it proves, then the refusal, and nothing of the socket`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        authFailedOpen(h)
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        val before = g.trace().size
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+
+        assertEquals(
+            "G2B-04 order",
+            listOf("ACK_ACTIVE_SET_CHANGED", "AUTH_RECOVERED", "AUTHORITY_ENDED PREMIUM_REFUSED"),
+            g.trace().drop(before)
+        )
+        assertEquals(
+            "G2B-04 the answer's refusal",
+            TopicGraphEventPayload.AckApplied(setOf(TETHER), mapOf(USD to TopicRejectionReason.PREMIUM_REQUIRED)),
+            g.acks().last().payload
+        )
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2B-05 an invalid token keeps its failure, a usable refresh and an unproving answer recover nothing, and a proving answer recovers once`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        val g = continuityLive(h)
+        h.wallMillis = 410_000L
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("G2B-05 fixture: the replay went out", 2, h.requests.size)
+        h.wire.deliver(h.ack("r2", active = emptyList(), rejections = mapOf(TETHER to "topics_disabled", USD to "topics_disabled")))
+        advanceTimeBy(1)
+        assertEquals("G2B-05 fixture: the unproving answer was applied", 1, g.acks().size)
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER)))
+        advanceTimeBy(1)
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+
+        val auth = g.authEvents()
+        assertEquals("G2B-05 one failure, one recovery", listOf("AUTH_FAILED", "AUTH_RECOVERED"), auth.map { it.kind.name })
+        assertEquals("G2B-05 the failure", TopicGraphEventReason.INVALID_TOKEN, auth[0].reason)
+        assertEquals("G2B-05 seen while refreshing", TopicGraphEventPayload.AuthFailure(TopicAuthResolution.REFRESHING), auth[0].payload)
+        assertEquals("G2B-05 when", 410_000L, auth[0].occurredAtEpochMillis)
+        assertTrue("G2B-05 the recovery follows the proving answer", g.events.indexOf(auth[1]) == g.events.indexOf(g.acks()[1]) + 1)
+        assertTrue("G2B-05 no resumption without data", g.trace().none { it.startsWith("RESUMED") })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2B-06 a replay refused again fails authentication outright, reopens the socket path, and leaves REST alone`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        h.refreshed = AuthSnapshot("u1", 1L, "token-2")
+        val g = continuityLive(h)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        h.bootstrapOutcome = { _, _ -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1389.0, gT1)))) }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        h.wallMillis = 420_000L
+        h.wire.deliver(h.subscriptionError("r2", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("G2B-06 fixture: failed", TopicAuthResolution.FAILED, h.store.snapshot.authResolution)
+
+        val failures = g.authEvents().filter { it.kind == TopicGraphEventKind.AUTH_FAILED }
+        assertEquals(
+            "G2B-06 refreshing first, then failed",
+            listOf(TopicAuthResolution.REFRESHING, TopicAuthResolution.FAILED),
+            failures.map { (it.payload as TopicGraphEventPayload.AuthFailure).resolution }
+        )
+        assertEquals("G2B-06 when", 420_000L, failures.last().occurredAtEpochMillis)
+        assertEquals("G2B-06 scope", setOf(TETHER, USD) to setOf(TopicGraphPath.WS), failures.last().topics to failures.last().paths)
+
+        h.retry(FreeTab.TETHER)
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER)))
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+
+        val trace = g.trace()
+        assertEquals("G2B-06 the socket path resumed once more", 2, trace.count { it == "RESUMED usdt:krw/WS" })
+        assertEquals("G2B-06 the REST path never reopened", 1, trace.count { it == "RESUMED usdt:krw/REST_BOOTSTRAP" })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2B-07 a refresh that comes back unusable is said when it is applied, ahead of a REST answer already queued`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1388.0, gT0))))
+        advanceTimeBy(1)
+        h.refreshed = null
+        h.refreshGate = CompletableDeferred()
+        h.wire.deliver(h.subscriptionError("r1", "invalid_token"))
+        advanceTimeBy(1)
+        assertEquals("G2B-07 fixture: refreshing", TopicAuthResolution.REFRESHING, h.store.snapshot.authResolution)
+        // A frame while refreshing is still delivered, and the refresh did not open the socket path: no resumption.
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1389.0, gT1))))
+        advanceTimeBy(1)
+        h.bootstrapGate = CompletableDeferred()
+        h.bootstrapOutcome = { _, _ -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1)))) }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        h.wallMillis = 430_000L
+        h.bootstrapGate!!.complete(Unit)
+        h.refreshGate!!.complete(Unit)
+        advanceTimeBy(1)
+
+        val trace = g.trace()
+        val unusable = trace.indexOf("AUTH_FAILED REFRESH_UNUSABLE")
+        assertTrue("G2B-07 said", unusable >= 0)
+        assertTrue("G2B-07 ahead of the REST answer: $trace", unusable < trace.indexOf("OBS usdt:krw/REST_BOOTSTRAP"))
+        val failed = g.authEvents().last()
+        assertEquals("G2B-07 failed", TopicGraphEventPayload.AuthFailure(TopicAuthResolution.FAILED), failed.payload)
+        assertEquals("G2B-07 when", 430_000L, failed.occurredAtEpochMillis)
+        assertEquals("G2B-07 the socket path resumed only at its first frame", 1, trace.count { it == "RESUMED usdt:krw/WS" })
+        assertEquals("G2B-07 fixture: both socket frames observed", 2, trace.count { it == "OBS usdt:krw/WS" })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2B-14b an acknowledgement buffered behind a stop says nothing`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        h.coordinator.stop()
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(100)
+        assertEquals("G2B-14b order", listOf("INITIAL", "HANDOVER_ENDED STOPPED"), g.trace())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2B-15b the same acknowledging and authenticating trace decides the same things with a dormant, an accepting and a failing sink`() = runTest {
+        val all = setOf(TETHER, USD)
+        val dormant = Harness(this, inert = true, desired = all)
+        val accepting = Harness(this, inert = true, desired = all).also { h -> h.graphSink = GraphRecorder(h) }
+        val failing = Harness(this, inert = true, desired = all).also { h -> h.graphSink = GraphRecorder(h).apply { answer = { throw IllegalStateException("sink") } } }
+        val hs = listOf(dormant, accepting, failing)
+        hs.forEach { it.refreshed = AuthSnapshot("u1", 1L, "token-2") }
+        suspend fun step(millis: Long = 1, act: (Harness) -> Unit) {
+            hs.forEach(act)
+            advanceTimeBy(millis)
+        }
+        fun same(label: String) {
+            val expected = dormant.priceFingerprint()
+            assertEquals("G2B-15b $label: accepting", expected, accepting.priceFingerprint())
+            assertEquals("G2B-15b $label: failing", expected, failing.priceFingerprint())
+        }
+
+        step(100) { it.goLive() }
+        step { it.wire.open() }
+        step { it.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1)))) }
+        step { it.wire.deliver(it.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "topics_disabled"))) }
+        same("acknowledged")
+        step { it.retry(FreeTab.USD) }
+        step { it.wire.deliver(it.subscriptionError(it.requests.last().requestId, "invalid_token")) }
+        step { it.wire.deliver(it.subscriptionError(it.requests.last().requestId, "invalid_token")) }
+        same("failed")
+        step { it.retry(FreeTab.USD) }
+        step { it.wire.deliver(it.ack(it.requests.last().requestId, active = listOf(TETHER, USD))) }
+        same("recovered")
+
+        val recorded = (accepting.graphSink as GraphRecorder).trace()
+        assertTrue("G2B-15b fixture: the facts were said",
+            listOf("ACK_ACTIVE_SET_CHANGED", "AUTH_FAILED INVALID_TOKEN", "AUTH_RECOVERED").all { it in recorded })
+        assertTrue("G2B-15b fixture: the failing sink lost them", failing.coordinator.graphLoss.value != null)
         dormant.cleanUp()
     }
 }

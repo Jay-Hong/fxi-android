@@ -539,6 +539,8 @@ class TopicSessionCoordinator(
     ) {
         var opened = false
         var ended = false
+        /** Only a proving ACK clears a recorded authentication failure on this connection. */
+        var graphAuthFailurePending = false
         var pongAnswered = false
         val timers = mutableListOf<Job>()
 
@@ -1890,6 +1892,50 @@ class TopicSessionCoordinator(
         )
     }
 
+    private fun offerGraphAcknowledgement(
+        live: Connection,
+        ack: TopicCommandAcknowledgement,
+        before: TopicSubscriptionSnapshot
+    ) {
+        val captured = live.graphAuthority ?: return
+        val after = store.snapshot
+        val confirmed = after.topics.filterValues { it.confirmed }.keys.toSet()
+        val removed = before.topics.filterValues { it.confirmed }.keys - confirmed
+        val refusals = ack.rejected.filterKeys { topic ->
+            !after.stateFor(topic).confirmed
+        }.keys
+        ((removed + refusals) intersect desired).forEach { graphDeliveryGaps += it to TopicGraphPath.WS }
+        offerGraphContinuity(
+            TopicGraphEventKind.ACK_ACTIVE_SET_CHANGED, null, captured,
+            desired, setOf(TopicGraphPath.WS), live.generation,
+            TopicGraphEventPayload.AckApplied(confirmed, ack.rejected.toMap())
+        )
+        if (live.graphAuthFailurePending && ack.provesAuthentication) {
+            live.graphAuthFailurePending = false
+            offerGraphContinuity(
+                TopicGraphEventKind.AUTH_RECOVERED, null, captured,
+                desired, setOf(TopicGraphPath.WS), live.generation
+            )
+        }
+    }
+
+    private fun offerGraphAuthFailure(
+        live: Connection,
+        reason: TopicGraphEventReason,
+        resolution: TopicAuthResolution
+    ) {
+        val captured = live.graphAuthority ?: return
+        live.graphAuthFailurePending = true
+        if (resolution == TopicAuthResolution.FAILED) {
+            desired.forEach { graphDeliveryGaps += it to TopicGraphPath.WS }
+        }
+        offerGraphContinuity(
+            TopicGraphEventKind.AUTH_FAILED, reason, captured,
+            desired, setOf(TopicGraphPath.WS), live.generation,
+            TopicGraphEventPayload.AuthFailure(resolution)
+        )
+    }
+
     private fun offerGraphRestUndelivered(topic: String, outcome: TopicSnapshotOutcome, attribution: TopicUseAttribution) {
         val captured = graphAuthority ?: return
         if (!authority.admits(attribution.lifetime)) {
@@ -2214,6 +2260,9 @@ class TopicSessionCoordinator(
         // that outlived its connection would otherwise write to whichever socket is current, which
         // is a subscribe sent on a connection that never asked for it. Found by review.
         val transport = live.transport
+        // Per command, read at each admission decision and consumed only by an admitted ACK.
+        // A failure or refresh also asks for admission; the ACK's own call replaces that reading.
+        var beforeAnswer: TopicSubscriptionSnapshot? = null
         val command = TopicSubscribeCommand(
             purpose = purpose,
             store = store,
@@ -2252,10 +2301,21 @@ class TopicSessionCoordinator(
                 if (current(live.generation) == null) emptySet()
                 else topics()
             },
-            onAcknowledged = { ack -> onAcknowledged(live, id, ack) },
+            onAcknowledged = { ack ->
+                val before = checkNotNull(beforeAnswer)
+                beforeAnswer = null
+                onAcknowledged(live, id, ack, before)
+            },
             onClassifiedFailure = { onClassifiedFailure(live) },
+            onAuthRefreshUnusable = {
+                offerGraphAuthFailure(live, TopicGraphEventReason.REFRESH_UNUSABLE, TopicAuthResolution.FAILED)
+            },
             onRequestStarted = ::publishState,
-            admitAnswer = { rejected -> admitsAnswer(live, rejected) },
+            admitAnswer = { rejected ->
+                admitsAnswer(live, rejected).also {
+                    beforeAnswer = store.snapshot
+                }
+            },
             revalidationEntry = revalidationEntry?.let { mapOf(TopicCatalogue.TETHER to it) },
             revalidationScope = { if (current(live.generation) == null) emptySet() else revalidationTopics() },
             manualEntry = manual?.entryReceiveGeneration,
@@ -2346,8 +2406,10 @@ class TopicSessionCoordinator(
     private fun onAcknowledged(
         live: Connection,
         commandId: Long,
-        ack: TopicCommandAcknowledgement
+        ack: TopicCommandAcknowledgement,
+        before: TopicSubscriptionSnapshot
     ) {
+        offerGraphAcknowledgement(live, ack, before)
         // The server answered, so the request channel is free — before the delivery wait, which
         // needs nothing another command wants.
         releaseControlLane(live, commandId)
@@ -2393,10 +2455,12 @@ class TopicSessionCoordinator(
 
     /** The command has applied a classified server failure, including any synchronous refresh transition. */
     private fun onClassifiedFailure(live: Connection) {
+        val snapshot = store.snapshot
         // The callback may already see REFRESHING: InvalidToken passed through FAILED before beginAuthRefresh. A question
         // already waiting then needs an ACK even if that refresh later writes RESOLVED. A D14 raised during the refresh is
         // a later question and keeps the existing manual-ending rule (B2-32).
-        if (store.snapshot.wholeFailure == TopicWholeRequestFailure.InvalidToken) {
+        if (snapshot.wholeFailure == TopicWholeRequestFailure.InvalidToken) {
+            offerGraphAuthFailure(live, TopicGraphEventReason.INVALID_TOKEN, snapshot.authResolution)
             live.heldSilenceQuestion?.awaitingAuthenticationAck = true
             if (live.heldSilenceQuestion != null) live.revalidationDeferred = false
         }

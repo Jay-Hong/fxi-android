@@ -1,19 +1,23 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.domain.model.TopicAuthResolution
+import com.jay.fxi.domain.model.TopicRejectionReason
 import kotlinx.datetime.Instant
 
 enum class TopicGraphPath { WS, REST_BOOTSTRAP }
 
 enum class TopicGraphEventKind {
     INITIAL, ACCESS_RESUMED, DELIVERY_RESUMED, AUTHORITY_ENDED, TOPIC_PURGED, HANDOVER_ENDED,
-    DELIVERY_INTERRUPTED, CONNECTION_CREATION_FAILED
+    DELIVERY_INTERRUPTED, CONNECTION_CREATION_FAILED,
+    ACK_ACTIVE_SET_CHANGED, AUTH_FAILED, AUTH_RECOVERED
 }
 
 enum class TopicGraphEventReason {
     GRANT_WITHDRAWN, GRANT_REPLACED, IDENTITY_RETIRED, PREMIUM_REFUSED, USE_WITHHELD,
     CANONICAL_TOPIC_STATE,
     STOPPED, SCOPE_CANCELLED,
-    WS_ENDED, LEASE_EXPIRED, DELIVERY_SUSPECT, DELIVERY_DEGRADED, REST_UNDELIVERED
+    WS_ENDED, LEASE_EXPIRED, DELIVERY_SUSPECT, DELIVERY_DEGRADED, REST_UNDELIVERED,
+    INVALID_TOKEN, REFRESH_UNUSABLE
 }
 
 enum class TopicGraphRestResultKind {
@@ -23,6 +27,11 @@ enum class TopicGraphRestResultKind {
 sealed interface TopicGraphEventPayload {
     data class WsEnded(val cause: TopicDisconnectCause) : TopicGraphEventPayload
     data class RestUndelivered(val resultKind: TopicGraphRestResultKind) : TopicGraphEventPayload
+    data class AckApplied(
+        val confirmedTopics: Set<String>,
+        val rejected: Map<String, TopicRejectionReason>
+    ) : TopicGraphEventPayload
+    data class AuthFailure(val resolution: TopicAuthResolution) : TopicGraphEventPayload
 }
 
 /** Captured continuity ownership; owner and lifetime are null when the session ends without an open authority. */
