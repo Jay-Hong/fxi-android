@@ -533,7 +533,9 @@ class TopicSessionCoordinator(
         /** The use this socket was opened under (L-4e E2a). Every send and application on it asks whether it is still admitted. */
         val lifetime: TopicUseLifetime,
         /** Whether this was the session's first attempt at a socket, which subscribes at once. */
-        val firstAttempt: Boolean
+        val firstAttempt: Boolean,
+        /** The graph authority captured when this socket's attempt started; never rebound to a later use. */
+        val graphAuthority: TopicGraphAuthority?
     ) {
         var opened = false
         var ended = false
@@ -1156,13 +1158,13 @@ class TopicSessionCoordinator(
                 if (owner == refusedFor || owner == identityLostFor) return
                 // No second `desired` check: the set is copied at construction and never changes,
                 // and the issue already refused anything outside it.
+                val attribution = TopicUseAttribution(sessionKey, owner, grantEpoch, input.lifetime)
                 val delivered = input.outcome as? TopicSnapshotOutcome.Delivered
+                if (delivered == null) {
+                    offerGraphRestUndelivered(input.topic, input.outcome, attribution)
                     // A refusal or a failure is handed to its owner whatever the use came to: that is control flow (L-4e E2a).
-                    ?: return onBootstrapUndelivered(
-                        TopicUseAttribution(sessionKey, owner, grantEpoch, input.lifetime),
-                        input.topic,
-                        input.outcome
-                    )
+                    return onBootstrapUndelivered(attribution, input.topic, input.outcome)
+                }
                 // The snapshot is protected data: applied only while the use its issue acquired is still admitted, however the
                 // access came back in between.
                 if (!authority.admits(input.lifetime)) {
@@ -1172,7 +1174,7 @@ class TopicSessionCoordinator(
                 applyBootstrap(
                     input.topic,
                     delivered.frame,
-                    TopicUseAttribution(sessionKey, owner, input.grantEpoch, input.lifetime)
+                    attribution
                 )
             }
 
@@ -1588,6 +1590,7 @@ class TopicSessionCoordinator(
         openGraphAuthority(lifetime)
         recovery = recoveryState
         val number = ++generation
+        val capturedGraphAuthority = graphAuthority
         resetCachedRefresh()
         val firstAttempt = !everAttempted
         everAttempted = true
@@ -1599,12 +1602,22 @@ class TopicSessionCoordinator(
             // exception it rethrows — and counting both would spend two rungs of the ladder for
             // one attempt. Only one of them can reach this session: the transport is never handed
             // back, so nothing collects its events, and the exception is the whole report.
+            if (authority.admits(lifetime)) {
+                offerGraphInterruption(
+                    TopicGraphEventKind.CONNECTION_CREATION_FAILED,
+                    null,
+                    capturedGraphAuthority,
+                    desired,
+                    TopicGraphPath.WS,
+                    number
+                )
+            }
             // Asked again rather than trusting the lifetime just acquired: the issuer can publish while `connect` runs.
             // If that answer withholds a start, a release before publication must not show the failed attempt still connecting.
             if (wanted()) scheduleReconnect() else recovery = TopicRecoveryDisplay.None
             return
         }
-        val live = Connection(number, transport, fence ?: return, lifetime, firstAttempt)
+        val live = Connection(number, transport, fence ?: return, lifetime, firstAttempt, capturedGraphAuthority)
         connection = live
         live.timers += scope.launch {
             transport.events.collect { post(SessionInput.Transport(number, it)) }
@@ -1839,14 +1852,79 @@ class TopicSessionCoordinator(
         authority: TopicGraphAuthority,
         topics: Set<String> = desired,
         paths: Set<TopicGraphPath> = graphPaths,
-        connectionGeneration: Long? = null
+        connectionGeneration: Long? = null,
+        payload: TopicGraphEventPayload? = null
     ) {
         offerGraphInput(
             TopicGraphInput.Continuity(
                 ++graphSequence, kind, reason, topics.toSet(), paths.toSet(), authority,
-                connectionGeneration, wallClock()
+                connectionGeneration, wallClock(), payload
             )
         )
+    }
+
+    /** Open the affected pairs before offering; sink acceptance cannot decide continuity. */
+    private fun offerGraphInterruption(
+        kind: TopicGraphEventKind,
+        reason: TopicGraphEventReason?,
+        captured: TopicGraphAuthority?,
+        topics: Set<String>,
+        path: TopicGraphPath,
+        connectionGeneration: Long?,
+        payload: TopicGraphEventPayload? = null
+    ) {
+        if (captured == null || graphAuthority !== captured) return
+        topics.forEach { graphDeliveryGaps += it to path }
+        offerGraphContinuity(kind, reason, captured, topics, setOf(path), connectionGeneration, payload)
+    }
+
+    private fun offerGraphWsInterruption(
+        live: Connection,
+        reason: TopicGraphEventReason,
+        topics: Set<String>,
+        payload: TopicGraphEventPayload? = null
+    ) {
+        offerGraphInterruption(
+            TopicGraphEventKind.DELIVERY_INTERRUPTED, reason, live.graphAuthority,
+            topics, TopicGraphPath.WS, live.generation, payload
+        )
+    }
+
+    private fun offerGraphRestUndelivered(topic: String, outcome: TopicSnapshotOutcome, attribution: TopicUseAttribution) {
+        val captured = graphAuthority ?: return
+        if (!authority.admits(attribution.lifetime)) {
+            endGraphUse(attribution.lifetime)
+            return
+        }
+        val kind = when (outcome) {
+            is TopicSnapshotOutcome.Delivered -> return
+            TopicSnapshotOutcome.Dormant -> TopicGraphRestResultKind.DORMANT
+            is TopicSnapshotOutcome.Unsupported -> TopicGraphRestResultKind.UNSUPPORTED
+            TopicSnapshotOutcome.Degraded -> TopicGraphRestResultKind.DEGRADED
+            TopicSnapshotOutcome.TemporarilyUnavailable -> TopicGraphRestResultKind.TEMPORARILY_UNAVAILABLE
+            is TopicSnapshotOutcome.Refused -> TopicGraphRestResultKind.REFUSED
+            is TopicSnapshotOutcome.Malformed -> TopicGraphRestResultKind.MALFORMED
+            TopicSnapshotOutcome.TimedOut -> TopicGraphRestResultKind.TIMED_OUT
+            is TopicSnapshotOutcome.Unreachable -> TopicGraphRestResultKind.UNREACHABLE
+        }
+        offerGraphInterruption(
+            TopicGraphEventKind.DELIVERY_INTERRUPTED, TopicGraphEventReason.REST_UNDELIVERED,
+            captured, setOf(topic), TopicGraphPath.REST_BOOTSTRAP, null,
+            TopicGraphEventPayload.RestUndelivered(kind)
+        )
+    }
+
+    private fun markSuspect(live: Connection, topic: String) {
+        val before = store.snapshot.stateFor(topic).deliveryState
+        store.markSuspect(topic)
+        if (store.snapshot.stateFor(topic).deliveryState != before) {
+            offerGraphWsInterruption(live, TopicGraphEventReason.DELIVERY_SUSPECT, setOf(topic))
+        }
+    }
+
+    private fun markDegraded(live: Connection, topic: String) {
+        store.markDegraded(topic)
+        offerGraphWsInterruption(live, TopicGraphEventReason.DELIVERY_DEGRADED, setOf(topic))
     }
 
     private fun offerGraphObservations(
@@ -2041,7 +2119,7 @@ class TopicSessionCoordinator(
         // The command just passed answer admission, and nothing has suspended. Preserve its refusal/lease ordering.
         if (current(live.generation) !== live) return
         (manual.targets intersect ack.missing).forEach { topic ->
-            if (manualResultStillOwed(live, commandId, manual, topic)) store.markDegraded(topic)
+            if (manualResultStillOwed(live, commandId, manual, topic)) markDegraded(live, topic)
         }
         // Rejection and missing ACK results are final for these targets; a later batch may take them immediately.
         (manual.targets intersect (ack.rejected.keys + ack.missing)).forEach { topic ->
@@ -2063,7 +2141,7 @@ class TopicSessionCoordinator(
         manual.targets.forEach { topic ->
             if (manualResultStillOwed(live, commandId, manual, topic)) {
                 when {
-                    topic in degraded -> store.markDegraded(topic)
+                    topic in degraded -> markDegraded(live, topic)
                     abort -> {
                         val previous = manual.previousDelivery[topic]
                         if (previous != null) store.restoreManualRevalidation(topic, previous)
@@ -2403,6 +2481,7 @@ class TopicSessionCoordinator(
         // command's coroutine as well as on the loop, and a listener throwing there would leave
         // the socket standing on a lease that has gone. Found by review.
         try {
+            offerGraphWsInterruption(live, TopicGraphEventReason.LEASE_EXPIRED, expired intersect desired)
             publishIfChanged()
         } finally {
             end(live, TopicDisconnectCause.UNEXPECTED)
@@ -2759,7 +2838,7 @@ class TopicSessionCoordinator(
         }
         if (decision.spendsWindow) silenceHandledWindowMillis = silenceArmedUntilMillis
         if (decision is TopicSilenceDecision.Revalidate && live != null) {
-            store.markSuspect(TopicCatalogue.TETHER)
+            markSuspect(live, TopicCatalogue.TETHER)
             val snapshot = store.snapshot
             val tether = snapshot.stateFor(TopicCatalogue.TETHER)
             if (
@@ -2890,7 +2969,7 @@ class TopicSessionCoordinator(
                 ) {
                     return
                 }
-                if (topic in silent) store.markDegraded(topic) else store.abortRevalidation(topic)
+                if (topic in silent) markDegraded(live, topic) else store.abortRevalidation(topic)
             }
 
             TopicCommandPurpose.LEASE_RENEWAL -> Unit
@@ -3119,7 +3198,7 @@ class TopicSessionCoordinator(
         // left behind by a start that then refuses. The FAILED start guard is not asked: this is the one path a verified recovery
         // reaches, and only an acknowledgement takes the verdict back.
         if (revalidation) {
-            store.markSuspect(TopicCatalogue.TETHER)
+            markSuspect(live, TopicCatalogue.TETHER)
             if (!store.beginRevalidation(TopicCatalogue.TETHER)) return
         }
         val manual = manualTargets.takeIf { it.isNotEmpty() }?.let { beginManual(live, it, manualEntries.toMap()) }
@@ -3190,26 +3269,30 @@ class TopicSessionCoordinator(
     private fun end(live: Connection, cause: TopicDisconnectCause) {
         if (live.ended) return
         live.ended = true
-        clearHeldSilenceQuestion(live)
-        live.manualPending.clear()
-        live.manualOwners.clear()
-        resetCachedRefresh()
-        live.commands.values.forEach { it.job?.cancel() }
-        live.renewalTimer?.cancel()
-        live.expiryTimer?.cancel()
-        live.timers.forEach(Job::cancel)
-        live.transport.cancel()
-        if (connection === live) connection = null
-        // If an unopened connection ends while wanted() is false, a release before publication must not revive Connecting.
-        recovery = TopicRecoveryDisplay.None
+        try {
+            offerGraphWsInterruption(live, TopicGraphEventReason.WS_ENDED, desired, TopicGraphEventPayload.WsEnded(cause))
+        } finally {
+            clearHeldSilenceQuestion(live)
+            live.manualPending.clear()
+            live.manualOwners.clear()
+            resetCachedRefresh()
+            live.commands.values.forEach { it.job?.cancel() }
+            live.renewalTimer?.cancel()
+            live.expiryTimer?.cancel()
+            live.timers.forEach(Job::cancel)
+            live.transport.cancel()
+            if (connection === live) connection = null
+            // If an unopened connection ends while wanted() is false, a release before publication must not revive Connecting.
+            recovery = TopicRecoveryDisplay.None
 
-        // Desired survives a connection; everything the server told us about it does not. Called
-        // at the *end* rather than at the next open, because between the two there is no
-        // subscription — a topic still reading as confirmed there is confirmed on a dead socket.
-        store.clearConnectionState()
+            // Desired survives a connection; everything the server told us about it does not. Called
+            // at the *end* rather than at the next open, because between the two there is no
+            // subscription — a topic still reading as confirmed there is confirmed on a dead socket.
+            store.clearConnectionState()
 
-        if (cause == TopicDisconnectCause.UNEXPECTED && wanted()) scheduleReconnect()
-        publishDisplay()
+            if (cause == TopicDisconnectCause.UNEXPECTED && wanted()) scheduleReconnect()
+            publishDisplay()
+        }
     }
 
     private fun scheduleReconnect() {

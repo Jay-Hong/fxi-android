@@ -4,12 +4,25 @@ import kotlinx.datetime.Instant
 
 enum class TopicGraphPath { WS, REST_BOOTSTRAP }
 
-enum class TopicGraphEventKind { INITIAL, ACCESS_RESUMED, DELIVERY_RESUMED, AUTHORITY_ENDED, TOPIC_PURGED, HANDOVER_ENDED }
+enum class TopicGraphEventKind {
+    INITIAL, ACCESS_RESUMED, DELIVERY_RESUMED, AUTHORITY_ENDED, TOPIC_PURGED, HANDOVER_ENDED,
+    DELIVERY_INTERRUPTED, CONNECTION_CREATION_FAILED
+}
 
 enum class TopicGraphEventReason {
     GRANT_WITHDRAWN, GRANT_REPLACED, IDENTITY_RETIRED, PREMIUM_REFUSED, USE_WITHHELD,
     CANONICAL_TOPIC_STATE,
-    STOPPED, SCOPE_CANCELLED
+    STOPPED, SCOPE_CANCELLED,
+    WS_ENDED, LEASE_EXPIRED, DELIVERY_SUSPECT, DELIVERY_DEGRADED, REST_UNDELIVERED
+}
+
+enum class TopicGraphRestResultKind {
+    DORMANT, UNSUPPORTED, DEGRADED, TEMPORARILY_UNAVAILABLE, REFUSED, MALFORMED, TIMED_OUT, UNREACHABLE
+}
+
+sealed interface TopicGraphEventPayload {
+    data class WsEnded(val cause: TopicDisconnectCause) : TopicGraphEventPayload
+    data class RestUndelivered(val resultKind: TopicGraphRestResultKind) : TopicGraphEventPayload
 }
 
 /** Captured continuity ownership; owner and lifetime are null when the session ends without an open authority. */
@@ -62,7 +75,8 @@ sealed interface TopicGraphInput {
         val paths: Set<TopicGraphPath>,
         val authority: TopicGraphAuthority,
         val connectionGeneration: Long?,
-        val occurredAtEpochMillis: Long
+        val occurredAtEpochMillis: Long,
+        val payload: TopicGraphEventPayload? = null
     ) : TopicGraphInput
 }
 
