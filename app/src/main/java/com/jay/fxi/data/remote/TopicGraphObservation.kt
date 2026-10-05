@@ -4,6 +4,25 @@ import kotlinx.datetime.Instant
 
 enum class TopicGraphPath { WS, REST_BOOTSTRAP }
 
+enum class TopicGraphEventKind { INITIAL, ACCESS_RESUMED, DELIVERY_RESUMED, AUTHORITY_ENDED, TOPIC_PURGED, HANDOVER_ENDED }
+
+enum class TopicGraphEventReason {
+    GRANT_WITHDRAWN, GRANT_REPLACED, IDENTITY_RETIRED, PREMIUM_REFUSED, USE_WITHHELD,
+    CANONICAL_TOPIC_STATE,
+    STOPPED, SCOPE_CANCELLED
+}
+
+/** Captured continuity ownership; owner and lifetime are null when the session ends without an open authority. */
+class TopicGraphAuthority internal constructor(
+    internal val sessionKey: Any,
+    val owner: TopicSessionFence?,
+    internal val grantEpoch: Long,
+    internal val lifetime: TopicUseLifetime?
+)
+
+/** Value-comparable original ownership of a lost hand-over. */
+data class TopicGraphAuthorityKey(val owner: TopicSessionFence?, val grantEpoch: Long)
+
 /** Validated wire observations, before the display chooses which prices to adopt. */
 sealed interface TopicGraphCandidate {
     data class Quote(
@@ -33,6 +52,18 @@ sealed interface TopicGraphInput {
         val connectionGeneration: Long?,
         val candidates: List<TopicGraphCandidate>
     ) : TopicGraphInput
+
+    /** A confirmed continuity fact; attribution alone authorises no deferred protected side effect. */
+    class Continuity(
+        override val sequence: Long,
+        val kind: TopicGraphEventKind,
+        val reason: TopicGraphEventReason?,
+        val topics: Set<String>,
+        val paths: Set<TopicGraphPath>,
+        val authority: TopicGraphAuthority,
+        val connectionGeneration: Long?,
+        val occurredAtEpochMillis: Long
+    ) : TopicGraphInput
 }
 
 enum class TopicGraphOffer { ENQUEUED, DORMANT, FULL, CLOSED, FAILED }
@@ -58,5 +89,8 @@ data class TopicGraphLoss(
     val lastSequence: Long,
     val reasons: Set<TopicGraphOffer>,
     val topics: Set<String>,
-    val paths: Set<TopicGraphPath>
+    val paths: Set<TopicGraphPath>,
+    val firstOccurredAtEpochMillis: Long,
+    val lastOccurredAtEpochMillis: Long,
+    val authorities: Set<TopicGraphAuthorityKey>
 )

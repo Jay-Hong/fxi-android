@@ -509,7 +509,9 @@ class TopicSessionCoordinator(
     /** Offers adopted live rates synchronously; the sink must return promptly. */
     private val offerLive: ((uid: String, userAccessEpoch: String, rates: TopicRates) -> Unit)? = null,
     /** Offers graph candidates before display merge; dormant until a consumer is explicitly attached. */
-    private val graphSink: TopicGraphSink = DormantTopicGraphSink
+    private val graphSink: TopicGraphSink = DormantTopicGraphSink,
+    /** UTC epoch milliseconds for graph continuity and loss facts, independent of monotonic deadlines. */
+    private val wallClock: () -> Long = System::currentTimeMillis
 ) : TopicGrantSink {
     /**
      * Copied, so what this session consumes cannot change under it.
@@ -680,6 +682,11 @@ class TopicSessionCoordinator(
 
     private val _graphLoss = MutableStateFlow<TopicGraphLoss?>(null)
     private var graphSequence = 0L
+    private var graphAuthority: TopicGraphAuthority? = null
+    private var graphAuthorityHasEnded = false
+    private var graphHandoverEnded = false
+    private val graphPaths = setOf(TopicGraphPath.WS, TopicGraphPath.REST_BOOTSTRAP)
+    private val graphDeliveryGaps = mutableSetOf<Pair<String, TopicGraphPath>>()
 
     /** Cumulative hand-over losses, independent of the graph sink's queue. */
     val graphLoss: StateFlow<TopicGraphLoss?> = _graphLoss.asStateFlow()
@@ -1024,6 +1031,11 @@ class TopicSessionCoordinator(
                 // late answer, and only the second is a correctness question. What not cancelling
                 // costs is real and bounded: a request whose grant is over runs to the end of its
                 // ten-second budget before anyone stops paying for it.
+                val endedGraphAuthority = when {
+                    moved -> endGraphAuthority(TopicGraphEventReason.GRANT_REPLACED)
+                    withdrawn -> endGraphAuthority(TopicGraphEventReason.GRANT_WITHDRAWN)
+                    else -> null
+                }
                 if (moved || withdrawn) {
                     grantEpoch++
                     resetCachedRefresh()
@@ -1043,6 +1055,9 @@ class TopicSessionCoordinator(
                     // a user losing interest in a topic has not unseen its frames. A grant change
                     // has — those frames were another session's.
                     store.purge(TopicPurgeScope.All)
+                    endedGraphAuthority?.let {
+                        offerGraphContinuity(TopicGraphEventKind.TOPIC_PURGED, TopicGraphEventReason.CANONICAL_TOPIC_STATE, it)
+                    }
                     // The window is evidence about the grant that is gone, so it goes with it —
                     // the one place `TopicSilencePolicy` says clears these.
                     silenceArmedUntilMillis = null
@@ -1106,7 +1121,10 @@ class TopicSessionCoordinator(
                 if (seed.fence != owner) return
                 if (owner == refusedFor || owner == identityLostFor) return
                 if (!enforceLiveIdentity(owner)) return
-                if (!authority.admits(seed.lifetime)) return
+                if (!authority.admits(seed.lifetime)) {
+                    endGraphUse(seed.lifetime)
+                    return
+                }
 
                 val held = _rates.value
                 val missing = seed.rates.quotes.filterKeys { it !in held.quotes }
@@ -1147,7 +1165,10 @@ class TopicSessionCoordinator(
                     )
                 // The snapshot is protected data: applied only while the use its issue acquired is still admitted, however the
                 // access came back in between.
-                if (!authority.admits(input.lifetime)) return
+                if (!authority.admits(input.lifetime)) {
+                    endGraphUse(input.lifetime)
+                    return
+                }
                 applyBootstrap(
                     input.topic,
                     delivered.frame,
@@ -1284,7 +1305,9 @@ class TopicSessionCoordinator(
                 current(input.generation)?.let { live -> enforceLeaseExpiry(live) }
 
             is SessionInput.AccessWithheldDue ->
-                current(input.generation)?.let { live -> end(live, TopicDisconnectCause.DELIBERATE) }
+                current(input.generation)?.let { live ->
+                    end(live, TopicDisconnectCause.DELIBERATE)
+                }
 
             is SessionInput.DeferredUse -> if (stillOwns(input.attribution)) input.action()
 
@@ -1332,7 +1355,7 @@ class TopicSessionCoordinator(
                 // without suspending — so a stopped session went on to process buffered inputs
                 // and reconnect. Found by review.
                 stopped = true
-                shutDown()
+                shutDown(TopicGraphEventReason.STOPPED)
                 inputs.close()
             }
         }
@@ -1395,6 +1418,7 @@ class TopicSessionCoordinator(
         // premium refusal still latches — but nothing it grants is applied, and the connection ends.
         if (!authority.admits(still.lifetime)) {
             settleRefusal(still, rejected)
+            endGraphUse(still.lifetime)
             end(still, TopicDisconnectCause.DELIBERATE)
             if (rejected.isNotEmpty()) onRejected(still.fence, rejected)
             return TopicAnswerAdmission.Denied(TopicAnswerDenial.ACCESS_WITHHELD)
@@ -1416,6 +1440,7 @@ class TopicSessionCoordinator(
     private fun settleRefusal(live: Connection, rejected: Map<String, TopicRejectionReason>) {
         if (rejected.values.none { it == TopicRejectionReason.PREMIUM_REQUIRED }) return
         refusedFor = live.fence
+        endGraphAuthority(TopicGraphEventReason.PREMIUM_REFUSED)
         end(live, TopicDisconnectCause.DELIBERATE)
         cancelReconnect()
     }
@@ -1436,6 +1461,7 @@ class TopicSessionCoordinator(
     private fun retireIdentity(owner: TopicSessionFence) {
         if (identityLostFor == owner) return
         identityLostFor = owner
+        endGraphAuthority(TopicGraphEventReason.IDENTITY_RETIRED)
         connection?.takeIf { it.fence == owner }?.let {
             end(it, TopicDisconnectCause.DELIBERATE)
         }
@@ -1467,7 +1493,11 @@ class TopicSessionCoordinator(
      * New starts only. An existing connection or bootstrap keeps the lifetime it started with, and a new one succeeding does not
      * make that one valid again.
      */
-    private fun useLifetime(): TopicUseLifetime? = fence?.let(authority::acquire)
+    private fun useLifetime(): TopicUseLifetime? {
+        val lifetime = fence?.let(authority::acquire)
+        if (lifetime == null) endGraphAuthority(TopicGraphEventReason.USE_WITHHELD)
+        return lifetime
+    }
 
     /**
      * Whether a protected use under the session attributed to [attribution] may still run now (L-4e E2a).
@@ -1482,7 +1512,9 @@ class TopicSessionCoordinator(
         if (!access || owner != attribution.owner) return false
         if (owner == refusedFor || owner == identityLostFor) return false
         if (!enforceLiveIdentity(owner)) return false
-        return authority.admits(attribution.lifetime)
+        val admitted = authority.admits(attribution.lifetime)
+        if (!admitted) endGraphUse(attribution.lifetime)
+        return admitted
     }
 
     /** Start once per new allowed Access; its answer is checked on the loop. */
@@ -1512,6 +1544,7 @@ class TopicSessionCoordinator(
         connection?.let { live ->
             // A connection keeps the use it opened under; a new start being possible does not make that one valid again.
             if (authority.admits(live.lifetime)) return
+            endGraphUse(live.lifetime)
             end(live, TopicDisconnectCause.DELIBERATE)
         }
         // A lifecycle transition is a different trigger from the automatic ladder, and starts
@@ -1534,7 +1567,10 @@ class TopicSessionCoordinator(
      */
     private fun reevaluateAccess() {
         connection?.let { live ->
-            if (!authority.admits(live.lifetime)) end(live, TopicDisconnectCause.DELIBERATE)
+            if (!authority.admits(live.lifetime)) {
+                endGraphUse(live.lifetime)
+                end(live, TopicDisconnectCause.DELIBERATE)
+            }
         }
         if (connection == null && reconnectJob == null && wanted()) {
             if (everAttempted || reapprovedEpoch == grantEpoch) scheduleReconnect() else open()
@@ -1549,6 +1585,7 @@ class TopicSessionCoordinator(
             recovery = TopicRecoveryDisplay.None
             return
         }
+        openGraphAuthority(lifetime)
         recovery = recoveryState
         val number = ++generation
         resetCachedRefresh()
@@ -1686,6 +1723,7 @@ class TopicSessionCoordinator(
         // Ended rather than refused, as an identity loss is: refusing frame after frame on a standing socket would starve the
         // delivery evidence and let D14 file a withheld use as a topic gone quiet (L-4e E2a).
         if (!authority.admits(live.lifetime)) {
+            endGraphUse(live.lifetime)
             end(live, TopicDisconnectCause.DELIBERATE)
             return false
         }
@@ -1762,7 +1800,55 @@ class TopicSessionCoordinator(
     private fun graphIndexCandidates(entry: DxySpotEntry): List<TopicGraphCandidate> =
         listOf(TopicGraphCandidate.DollarIndex(entry.rate, entry.timestamp, entry.source))
 
-    /** Only the sink call is guarded: hand-over failure never decides price processing. */
+    /** Only actual starts call this; wanted() probing never opens a graph authority. */
+    private fun openGraphAuthority(lifetime: TopicUseLifetime) {
+        graphAuthority?.let { opened ->
+            if (opened.lifetime == lifetime) return
+            // A different lifetime proves an intervening hold, even if its revision never reached the loop.
+            endGraphAuthority(TopicGraphEventReason.USE_WITHHELD)
+        }
+        val owner = fence ?: return
+        val captured = TopicGraphAuthority(sessionKey, owner, grantEpoch, lifetime)
+        graphAuthority = captured
+        graphDeliveryGaps.clear()
+        desired.forEach { topic -> graphPaths.forEach { path -> graphDeliveryGaps += topic to path } }
+        offerGraphContinuity(
+            if (graphAuthorityHasEnded) TopicGraphEventKind.ACCESS_RESUMED else TopicGraphEventKind.INITIAL,
+            null,
+            captured
+        )
+    }
+
+    /** Close before offering: rejection or failure cannot keep the ended authority open. */
+    private fun endGraphAuthority(reason: TopicGraphEventReason): TopicGraphAuthority? {
+        val captured = graphAuthority ?: return null
+        graphAuthority = null
+        graphAuthorityHasEnded = true
+        offerGraphContinuity(TopicGraphEventKind.AUTHORITY_ENDED, reason, captured)
+        return captured
+    }
+
+    /** A late denial of an old use cannot end the authority a newer use opened. */
+    private fun endGraphUse(lifetime: TopicUseLifetime) {
+        if (graphAuthority?.lifetime == lifetime) endGraphAuthority(TopicGraphEventReason.USE_WITHHELD)
+    }
+
+    private fun offerGraphContinuity(
+        kind: TopicGraphEventKind,
+        reason: TopicGraphEventReason?,
+        authority: TopicGraphAuthority,
+        topics: Set<String> = desired,
+        paths: Set<TopicGraphPath> = graphPaths,
+        connectionGeneration: Long? = null
+    ) {
+        offerGraphInput(
+            TopicGraphInput.Continuity(
+                ++graphSequence, kind, reason, topics.toSet(), paths.toSet(), authority,
+                connectionGeneration, wallClock()
+            )
+        )
+    }
+
     private fun offerGraphObservations(
         topic: String,
         path: TopicGraphPath,
@@ -1771,7 +1857,22 @@ class TopicSessionCoordinator(
         candidates: List<TopicGraphCandidate>
     ) {
         if (candidates.isEmpty()) return
-        val input = TopicGraphInput.Observations(++graphSequence, topic, path, attribution, connectionGeneration, candidates)
+        // The input already passed its original admission. No new authority queries for graph hand-over.
+        if (graphDeliveryGaps.remove(topic to path)) {
+            offerGraphContinuity(
+                TopicGraphEventKind.DELIVERY_RESUMED,
+                null,
+                TopicGraphAuthority(attribution.sessionKey, attribution.owner, attribution.grantEpoch, attribution.lifetime),
+                setOf(topic),
+                setOf(path),
+                connectionGeneration
+            )
+        }
+        offerGraphInput(TopicGraphInput.Observations(++graphSequence, topic, path, attribution, connectionGeneration, candidates))
+    }
+
+    /** Only the sink call is guarded: hand-over failure never decides price processing. */
+    private fun offerGraphInput(input: TopicGraphInput) {
         val offer = try {
             graphSink.tryOffer(input)
         } catch (cancelled: CancellationException) {
@@ -1782,6 +1883,22 @@ class TopicSessionCoordinator(
         when (offer) {
             TopicGraphOffer.ENQUEUED, TopicGraphOffer.DORMANT -> Unit
             TopicGraphOffer.FULL, TopicGraphOffer.CLOSED, TopicGraphOffer.FAILED -> {
+                val occurredAt = wallClock()
+                val topics: Set<String>
+                val paths: Set<TopicGraphPath>
+                val authorityKey: TopicGraphAuthorityKey
+                when (input) {
+                    is TopicGraphInput.Observations -> {
+                        topics = setOf(input.topic)
+                        paths = setOf(input.path)
+                        authorityKey = TopicGraphAuthorityKey(input.attribution.owner, input.attribution.grantEpoch)
+                    }
+                    is TopicGraphInput.Continuity -> {
+                        topics = input.topics
+                        paths = input.paths
+                        authorityKey = TopicGraphAuthorityKey(input.authority.owner, input.authority.grantEpoch)
+                    }
+                }
                 val held = _graphLoss.value
                 _graphLoss.value = TopicGraphLoss(
                     revision = (held?.revision ?: 0L) + 1L,
@@ -1789,8 +1906,11 @@ class TopicSessionCoordinator(
                     firstSequence = held?.firstSequence ?: input.sequence,
                     lastSequence = input.sequence,
                     reasons = (held?.reasons ?: emptySet()) + offer,
-                    topics = (held?.topics ?: emptySet()) + topic,
-                    paths = (held?.paths ?: emptySet()) + path
+                    topics = (held?.topics ?: emptySet()) + topics,
+                    paths = (held?.paths ?: emptySet()) + paths,
+                    firstOccurredAtEpochMillis = held?.firstOccurredAtEpochMillis ?: occurredAt,
+                    lastOccurredAtEpochMillis = occurredAt,
+                    authorities = (held?.authorities ?: emptySet()) + authorityKey
                 )
             }
         }
@@ -1832,6 +1952,7 @@ class TopicSessionCoordinator(
         if (expectedGrantEpoch != grantEpoch || live.fence != fence || !sessionWanted()) return false
         if (!enforceLiveIdentity(live.fence)) return false
         if (!authority.admits(live.lifetime)) {
+            endGraphUse(live.lifetime)
             end(live, TopicDisconnectCause.DELIBERATE)
             return false
         }
@@ -2036,6 +2157,7 @@ class TopicSessionCoordinator(
                         topics().isEmpty() && revalidationTopics().isEmpty() && manualScope(live, id, manual).isEmpty()) -> false
                     // The use first (L-4e E2a): a withheld use is not a lease that ran out, and ending it must not start a ladder.
                     !authority.admits(live.lifetime) -> {
+                        if (current(live.generation) === live) endGraphUse(live.lifetime)
                         post(SessionInput.AccessWithheldDue(live.generation))
                         false
                     }
@@ -2356,6 +2478,7 @@ class TopicSessionCoordinator(
             // Each issue is its own start (L-4e E2a): acquired right before it is taken off what is owed, never carried over from
             // the issue before it, whose job was already enqueued. Refused, nothing is consumed and the plan waits.
             val lifetime = useLifetime() ?: return cancelBootstrapIssue()
+            openGraphAuthority(lifetime)
             unissuedBootstraps.remove(next)
             requestedBootstraps.remove(next)
             bootstrapFirstBatch = if (usesFirstBatch) (batch ?: shown) - next else emptySet()
@@ -2430,6 +2553,7 @@ class TopicSessionCoordinator(
                     // The use was withheld before a send (L-4e E2a): nothing was applied, and what the server had already said
                     // about retrying is still the floor owner's. No outcome — the issue is not asked again by itself.
                     handOverEvidence(withheld.exchanges, statusCode = null, retryAfter = null)
+                    if (!stopped && epoch == grantEpoch) endGraphUse(lifetime)
                     return@launch
                 } catch (moved: AuthIdentityChangedException) {
                     // The answer is refused, the rate limit is not: it was levied on the transport by
@@ -2626,7 +2750,10 @@ class TopicSessionCoordinator(
         // next connection's first delivery owns this silence, and an unspent window would ask again once that effort and its
         // revalidation have ended.
         if (decision is TopicSilenceDecision.Revalidate && live != null && !authority.admits(live.lifetime)) {
-            if (enforceLiveIdentity(live.fence)) end(live, TopicDisconnectCause.DELIBERATE)
+            if (enforceLiveIdentity(live.fence)) {
+                endGraphUse(live.lifetime)
+                end(live, TopicDisconnectCause.DELIBERATE)
+            }
             silenceHandledWindowMillis = silenceArmedUntilMillis
             return
         }
@@ -2790,7 +2917,12 @@ class TopicSessionCoordinator(
 
     /** A hold may have come and gone without its revision reaching this session. */
     private fun invalidateCachedRefresh() {
-        resolvedLifetime?.let { if (!authority.admits(it)) resetCachedRefresh() }
+        resolvedLifetime?.let {
+            if (!authority.admits(it)) {
+                endGraphUse(it)
+                resetCachedRefresh()
+            }
+        }
     }
 
     private fun resolveCachedRefresh(lifetime: TopicUseLifetime) {
@@ -2928,7 +3060,10 @@ class TopicSessionCoordinator(
         if (enforceLeaseExpiry(live)) return
         if (live.fence != fence || !sessionWanted()) return
         if (!enforceLiveIdentity(live.fence)) return
-        if (!authority.admits(live.lifetime)) return
+        if (!authority.admits(live.lifetime)) {
+            endGraphUse(live.lifetime)
+            return
+        }
         // A lane that was just released can still owe a start: `releaseControlLane` only *posts*
         // `ControlLaneFree`. Calls from `CommandDone` and `CredentialRecovered` can run inline,
         // ahead of that queued input. Without the two flags here, a reopen registered
@@ -3098,14 +3233,24 @@ class TopicSessionCoordinator(
      * Shared by `Stop` and by the loop ending for any other reason, so a cancelled scope leaves
      * the same state behind as an orderly stop rather than a socket-shaped hole.
      */
-    private fun shutDown() {
-        connection?.let { end(it, TopicDisconnectCause.DELIBERATE) }
-        cancelReconnect()
-        cancelBootstraps()
-        restoresOut.values.forEach { it.cancel() }
-        restoresOut.clear()
-        silenceTimer?.cancel()
-        silenceTimer = null
+    private fun shutDown(reason: TopicGraphEventReason = TopicGraphEventReason.SCOPE_CANCELLED) {
+        try {
+            if (!graphHandoverEnded) {
+                graphHandoverEnded = true
+                val captured = graphAuthority ?: TopicGraphAuthority(sessionKey, null, grantEpoch, null)
+                graphAuthority = null
+                graphDeliveryGaps.clear()
+                offerGraphContinuity(TopicGraphEventKind.HANDOVER_ENDED, reason, captured)
+            }
+        } finally {
+            connection?.let { end(it, TopicDisconnectCause.DELIBERATE) }
+            cancelReconnect()
+            cancelBootstraps()
+            restoresOut.values.forEach { it.cancel() }
+            restoresOut.clear()
+            silenceTimer?.cancel()
+            silenceTimer = null
+        }
     }
 
     private fun cancelReconnect() {

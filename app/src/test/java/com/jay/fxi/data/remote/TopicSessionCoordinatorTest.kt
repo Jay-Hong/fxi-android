@@ -403,6 +403,9 @@ class TopicSessionCoordinatorTest {
         /** GOBS: where the session's graph hand-over goes — the dormant sink unless a test installs its own. */
         var graphSink: TopicGraphSink = DormantTopicGraphSink
 
+        /** G2A: the wall clock continuity events and losses are stamped with; unrelated to [clock]. */
+        var wallMillis = 1_000_000L
+
         val coordinator = TopicSessionCoordinator(
             scope = scope,
             clock = clock,
@@ -484,7 +487,8 @@ class TopicSessionCoordinatorTest {
             desired = desired,
             restoreSeed = { granted -> restoreCalls += granted; restoreProvider?.invoke(granted) ?: TopicLastKnownRestore.NotAdmitted },
             offerLive = { uid, epoch, rates -> offers += Triple(uid, epoch, rates) },
-            graphSink = TopicGraphSink { input -> graphSink.tryOffer(input) }
+            graphSink = TopicGraphSink { input -> graphSink.tryOffer(input) },
+            wallClock = { wallMillis }
         )
 
         /** R4-b2: every save the session offered, in order. */
@@ -13981,7 +13985,7 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(100)
         h.wire.open()
         advanceTimeBy(1)
-        assertTrue("GOBS fixture: nothing handed over before any price arrived", recorder.inputs.isEmpty())
+        assertTrue("GOBS fixture: nothing observed before any price arrived", recorder.observations.isEmpty())
         return recorder
     }
 
@@ -14001,7 +14005,7 @@ class TopicSessionCoordinatorTest {
         assertEquals("GOBS-01 the socket's own use", TopicUseLifetime(fence().grant, 0L), o.attribution.lifetime)
         assertEquals("GOBS-01 the grant in force", checkNotNull(h.shown().owner).grantEpoch, o.attribution.grantEpoch)
         assertTrue("GOBS-01 a socket generation", o.connectionGeneration != null)
-        assertEquals("GOBS-01 handed over before the merge", TopicRates(), g.ratesAtOffer.single())
+        assertEquals("GOBS-01 handed over before the merge", TopicRates(), g.ratesAtOffer[g.inputs.indexOf(o)])
         assertEquals("GOBS-01 the display still merges on rate_changed_at", Instant.parse(gT1), h.coordinator.rates.value.quotes.values.single().at)
         h.cleanUp()
     }
@@ -14019,7 +14023,7 @@ class TopicSessionCoordinatorTest {
         assertEquals("GOBS-02 path", TopicGraphPath.WS, o.path)
         assertTrue("GOBS-02 a socket generation", o.connectionGeneration != null)
         assertEquals("GOBS-02 supplier and clock", listOf(TopicGraphCandidate.DollarIndex(98.5, Instant.parse(gT2), "cnbc")), o.candidates)
-        assertNull("GOBS-02 handed over before the merge", g.ratesAtOffer.single().dollarIndex)
+        assertNull("GOBS-02 handed over before the merge", g.ratesAtOffer[g.inputs.indexOf(o)].dollarIndex)
         assertEquals("GOBS-02 the display took it", 98.5, checkNotNull(h.coordinator.rates.value.dollarIndex).rate, 0.0)
         h.cleanUp()
     }
@@ -14050,7 +14054,7 @@ class TopicSessionCoordinatorTest {
         assertEquals("GOBS-03 owner", fence(), o.attribution.owner)
         assertEquals("GOBS-03 the issue's use", TopicUseLifetime(fence().grant, 0L), o.attribution.lifetime)
         assertEquals("GOBS-03 the grant in force", checkNotNull(h.shown().owner).grantEpoch, o.attribution.grantEpoch)
-        assertEquals("GOBS-03 handed over before the merge", TopicRates(), g.ratesAtOffer.single())
+        assertEquals("GOBS-03 handed over before the merge", TopicRates(), g.ratesAtOffer[g.inputs.indexOf(o)])
         assertEquals("GOBS-03 the display took both", 2, h.coordinator.rates.value.quotes.size)
         h.cleanUp()
     }
@@ -14156,7 +14160,7 @@ class TopicSessionCoordinatorTest {
         h.wire.deliver(h.emptyTetherFrame())
         advanceTimeBy(1)
 
-        assertEquals("GOBS-07 nothing more handed over", 1, g.inputs.size)
+        assertEquals("GOBS-07 nothing more handed over", 1, g.observations.size)
         assertEquals("GOBS-07 and no delivery from them", 1L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
         h.cleanUp()
     }
@@ -14188,7 +14192,7 @@ class TopicSessionCoordinatorTest {
         // KRX alone in a general group: no hand-over at all, and the delivery judgement is this unit's to leave alone.
         h.wire.deliver(gTether(emptyList(), banks = listOf(gEntry("krx", "usd-krw-futures", 1384.0, gT2))))
         advanceTimeBy(1)
-        assertEquals("GOBS-08 nothing handed over for KRX alone", 1, g.inputs.size)
+        assertEquals("GOBS-08 nothing handed over for KRX alone", 1, g.observations.size)
         assertEquals("GOBS-08 delivery judged as before this unit", 2L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
 
         // The legacy key and the dedicated topic.
@@ -14202,7 +14206,7 @@ class TopicSessionCoordinatorTest {
                 """${gEntry("krx", "usd-krw-futures", 1382.0, gT3)}}}"""
         )
         advanceTimeBy(1)
-        assertEquals("GOBS-08 nothing handed over for the legacy key or the dedicated topic", 1, g.inputs.size)
+        assertEquals("GOBS-08 nothing handed over for the legacy key or the dedicated topic", 1, g.observations.size)
         h.cleanUp()
     }
 
@@ -14240,7 +14244,7 @@ class TopicSessionCoordinatorTest {
         assertEquals("GOBS-10a fixture: tether refused", TopicRejectionReason.TOPIC_UNAVAILABLE, h.store.snapshot.stateFor(TETHER).rejection)
         h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
         advanceTimeBy(1)
-        assertTrue("GOBS-10a nothing handed over", g.inputs.isEmpty())
+        assertTrue("GOBS-10a nothing handed over", g.observations.isEmpty())
 
         h.wire.deliver(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT1))))
         advanceTimeBy(1)
@@ -14260,7 +14264,7 @@ class TopicSessionCoordinatorTest {
         h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
         advanceTimeBy(1)
 
-        assertTrue("GOBS-10b nothing handed over", g.inputs.isEmpty())
+        assertTrue("GOBS-10b nothing handed over", g.observations.isEmpty())
         h.cleanUp()
     }
 
@@ -14273,7 +14277,7 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(1)
         ended.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
         advanceTimeBy(1)
-        assertTrue("GOBS-10c nothing from the ended socket", g.inputs.isEmpty())
+        assertTrue("GOBS-10c nothing from the ended socket", g.observations.isEmpty())
 
         advanceTimeBy(5_000)
         assertEquals("GOBS-10c fixture: reconnected", 2, h.wires.size)
@@ -14282,7 +14286,7 @@ class TopicSessionCoordinatorTest {
         h.liveFence = fence(generation = 2L).identity
         h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
         advanceTimeBy(1)
-        assertTrue("GOBS-10c nothing after the account moved", g.inputs.isEmpty())
+        assertTrue("GOBS-10c nothing after the account moved", g.observations.isEmpty())
         h.cleanUp()
     }
 
@@ -14307,7 +14311,7 @@ class TopicSessionCoordinatorTest {
         held.complete(Unit)
         advanceTimeBy(100)
 
-        assertTrue("GOBS-11 nothing handed over", g.inputs.isEmpty())
+        assertTrue("GOBS-11 nothing handed over", g.observations.isEmpty())
         assertTrue("GOBS-11 fixture: nothing shown either", h.coordinator.rates.value.quotes.isEmpty())
         h.cleanUp()
     }
@@ -14329,7 +14333,7 @@ class TopicSessionCoordinatorTest {
         h.bootstrapGate!!.complete(Unit)
         advanceTimeBy(100)
 
-        assertTrue("GOBS-12 nothing handed over", g.inputs.isEmpty())
+        assertTrue("GOBS-12 nothing handed over", g.observations.isEmpty())
         assertTrue("GOBS-12 fixture: nothing shown either", h.coordinator.rates.value.quotes.isEmpty())
         h.cleanUp()
     }
@@ -14362,7 +14366,11 @@ class TopicSessionCoordinatorTest {
     private suspend fun TestScope.sinkFailureKeepsPrices(failure: TopicGraphOffer?, expected: TopicGraphOffer) {
         val h = Harness(this)
         val g = graphLive(h)
-        g.answer = { if (failure == null) throw IllegalStateException("sink") else failure }
+        g.answer = {
+            if (it !is TopicGraphInput.Observations) TopicGraphOffer.ENQUEUED
+            else if (failure == null) throw IllegalStateException("sink")
+            else failure
+        }
         val offersBefore = h.offers.size
 
         h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
@@ -14372,7 +14380,7 @@ class TopicSessionCoordinatorTest {
         assertEquals("GOBS-14 the delivery counted", 1L, h.store.snapshot.stateFor(TETHER).receiveGeneration)
         assertEquals("GOBS-14 the change offered for saving", offersBefore + 1, h.offers.size)
         val loss = checkNotNull(h.coordinator.graphLoss.value) { "GOBS-14 a loss is recorded" }
-        val sequence = g.inputs.single().sequence
+        val sequence = g.observations.single().sequence
         assertEquals("GOBS-14 revision", 1L, loss.revision)
         assertEquals("GOBS-14 count", 1L, loss.count)
         assertEquals("GOBS-14 first", sequence, loss.firstSequence)
@@ -14408,7 +14416,7 @@ class TopicSessionCoordinatorTest {
         val h = Harness(this)
         val g = graphLive(h)
         val answers = ArrayDeque(listOf(TopicGraphOffer.FULL, TopicGraphOffer.FULL, TopicGraphOffer.ENQUEUED, TopicGraphOffer.CLOSED))
-        g.answer = { answers.removeFirst() }
+        g.answer = { if (it is TopicGraphInput.Observations) answers.removeFirst() else TopicGraphOffer.ENQUEUED }
         val seen = mutableListOf<TopicGraphLoss?>()
 
         listOf(1390.0, 1391.0, 1392.0, 1393.0).forEachIndexed { i, rate ->
@@ -14423,8 +14431,9 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(100)
         val afterRest = checkNotNull(h.coordinator.graphLoss.value) { "GOBS-15 the REST loss is recorded" }
 
-        val s = g.inputs.map { it.sequence }
-        assertEquals("GOBS-15 one sequence per hand-over, from 1, contiguous", (1L..5L).toList(), s)
+        val s = g.observations.map { it.sequence }
+        assertEquals("GOBS-15 five batches", 5, s.size)
+        assertEquals("GOBS-15 one sequence per hand-over, from 1, contiguous", (1L..g.inputs.size.toLong()).toList(), g.inputs.map { it.sequence })
         assertEquals("GOBS-15 revisions", listOf(1L, 2L, 2L, 3L), seen.map { it?.revision })
         assertEquals("GOBS-15 counts", listOf(1L, 2L, 2L, 3L), seen.map { it?.count })
         assertEquals("GOBS-15 first stays", List(4) { s[0] }, seen.map { it?.firstSequence })
@@ -14456,7 +14465,8 @@ class TopicSessionCoordinatorTest {
         advanceTimeBy(100)
 
         assertEquals("GOBS-16 fixture: prices arrived", 2, h.coordinator.rates.value.quotes.size)
-        assertEquals("GOBS-16 three hand-overs, all dormant", List(3) { TopicGraphOffer.DORMANT }, answered)
+        assertTrue("GOBS-16 at least the three batches were offered", answered.size >= 3)
+        assertEquals("GOBS-16 every hand-over dormant", List(answered.size) { TopicGraphOffer.DORMANT }, answered)
         assertNull("GOBS-16 no loss", h.coordinator.graphLoss.value)
         h.cleanUp()
     }
@@ -14581,5 +14591,735 @@ class TopicSessionCoordinatorTest {
 
         assertEquals("GOBS-18 the live entry only", listOf(gQuote("upbit", "usdt-krw", 1390.0, gT1)), g.observations.single().candidates)
         h.cleanUp()
+    }
+
+    // ---- S3 graph continuity, unit 2a (G2A-01..10): authority start/end, delivery resumption, hand-over end, loss scope ------
+    // Delivery interruptions (socket end, lease, SUSPECT/DEGRADED, REST undelivered), ACK sets and auth facts are unit 2b's.
+
+    private val GraphRecorder.events get() = inputs.filterIsInstance<TopicGraphInput.Continuity>()
+
+    /** Each input as a short label: the kind (with topic/path for a resumption), or the topic/path of an observation batch. */
+    private fun GraphRecorder.trace() = inputs.map { input ->
+        when (input) {
+            is TopicGraphInput.Continuity ->
+                if (input.kind == TopicGraphEventKind.DELIVERY_RESUMED) {
+                    "RESUMED ${input.topics.single()}/${input.paths.single()}"
+                } else {
+                    input.kind.name + (input.reason?.let { " $it" } ?: "")
+                }
+            is TopicGraphInput.Observations -> "OBS ${input.topic}/${input.path}"
+        }
+    }
+
+    private val bothPaths = setOf(TopicGraphPath.WS, TopicGraphPath.REST_BOOTSTRAP)
+
+    /** A live, opened socket with [GraphRecorder] installed and nothing yet delivered; the grant's own bootstraps failed unreachable. */
+    private suspend fun TestScope.continuityLive(h: Harness): GraphRecorder {
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        return g
+    }
+
+    @Test
+    fun `G2A-01 the first protected use announces INITIAL once, with the use it acquired and the wall clock, before any observation`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        h.wallMillis = 7_000L
+        h.coordinator.start()
+        h.setAccess(true, fence())
+        advanceTimeBy(100)
+        h.setAccess(true, fence())
+        advanceTimeBy(100)
+        assertTrue("G2A-01 a grant held offline starts no use and says nothing", g.inputs.isEmpty())
+
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        h.wallMillis = 9_000L
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+
+        assertEquals("G2A-01 order", listOf("INITIAL", "RESUMED usdt:krw/WS", "OBS usdt:krw/WS"), g.trace())
+        val initial = g.events.first()
+        assertEquals("G2A-01 owner", fence(), initial.authority.owner)
+        assertEquals("G2A-01 grant", checkNotNull(h.shown().owner).grantEpoch, initial.authority.grantEpoch)
+        assertEquals("G2A-01 the use the socket acquired", TopicUseLifetime(fence().grant, 0L), initial.authority.lifetime)
+        assertEquals("G2A-01 every desired topic", setOf(TETHER, USD), initial.topics)
+        assertEquals("G2A-01 both paths", bothPaths, initial.paths)
+        assertEquals("G2A-01 wall clock when the use started", 7_000L, initial.occurredAtEpochMillis)
+        assertEquals("G2A-01 the resumption's wall clock", 9_000L, g.events[1].occurredAtEpochMillis)
+        assertEquals("G2A-01 sequence shared with observations", (1L..3L).toList(), g.inputs.map { it.sequence })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-02 each topic and path resumes once, on its first valid candidate, and nothing invalid or KRX-only resumes it`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        h.wire.deliver(h.emptyTetherFrame())
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 0.0, gT1))))
+        h.wire.deliver(gTether(emptyList(), banks = listOf(gEntry("krx", "usd-krw-futures", 1385.0, gT1))))
+        advanceTimeBy(1)
+        assertEquals("G2A-02 nothing valid, nothing resumed", listOf("INITIAL"), g.trace())
+
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT2))))
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1380.0, gT0)))) // older: still a valid candidate, no new resumption
+        h.wire.deliver(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT1))))
+        advanceTimeBy(1)
+        h.bootstrapOutcome = { _, _ -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1389.0, gT1)))) }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+
+        assertEquals(
+            "G2A-02 order",
+            listOf(
+                "INITIAL",
+                "RESUMED usdt:krw/WS", "OBS usdt:krw/WS",
+                "OBS usdt:krw/WS",
+                "RESUMED fx:usd-krw/WS", "OBS fx:usd-krw/WS",
+                "RESUMED usdt:krw/REST_BOOTSTRAP", "OBS usdt:krw/REST_BOOTSTRAP"
+            ),
+            g.trace()
+        )
+        val ws = g.events.first { it.kind == TopicGraphEventKind.DELIVERY_RESUMED }
+        val rest = g.events.last()
+        assertTrue("G2A-02 a socket resumption names its generation", ws.connectionGeneration != null)
+        assertNull("G2A-02 a REST resumption has none", rest.connectionGeneration)
+        assertEquals("G2A-02 the input's own use", TopicUseLifetime(fence().grant, 0L), rest.authority.lifetime)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-03 a withdrawal ends the authority it captured, and the next use resumes access with every gap open again`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val before = checkNotNull(h.shown().owner).grantEpoch
+
+        h.wallMillis = 11_000L
+        h.setAccess(false, fence())
+        advanceTimeBy(1)
+        h.setAccess(false, fence())
+        advanceTimeBy(1)
+        val ended = g.events.last()
+        assertEquals("G2A-03 ended once", 1, g.events.count { it.kind == TopicGraphEventKind.AUTHORITY_ENDED })
+        assertEquals("G2A-03 reason", TopicGraphEventReason.GRANT_WITHDRAWN, ended.reason)
+        assertEquals("G2A-03 the authority that ended, not the next", before, ended.authority.grantEpoch)
+        assertEquals("G2A-03 its owner", fence(), ended.authority.owner)
+        assertEquals("G2A-03 its use", TopicUseLifetime(fence().grant, 0L), ended.authority.lifetime)
+        assertEquals("G2A-03 scope", setOf(TETHER, USD) to bothPaths, ended.topics to ended.paths)
+        assertEquals("G2A-03 when", 11_000L, ended.occurredAtEpochMillis)
+
+        h.setAccess(true, fence())
+        advanceTimeBy(5_000)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+
+        assertEquals(
+            "G2A-03 order",
+            listOf(
+                "INITIAL", "RESUMED usdt:krw/WS", "OBS usdt:krw/WS",
+                "AUTHORITY_ENDED GRANT_WITHDRAWN",
+                "ACCESS_RESUMED", "RESUMED usdt:krw/WS", "OBS usdt:krw/WS"
+            ),
+            g.trace()
+        )
+        assertTrue("G2A-03 the new authority is a new grant", g.events.first { it.kind == TopicGraphEventKind.ACCESS_RESUMED }.authority.grantEpoch > before)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-04 a replaced grant ends the old authority and purges its topic state under it, then the new grant resumes`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        val oldEpoch = checkNotNull(h.shown().owner).grantEpoch
+
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+
+        assertEquals(
+            "G2A-04 order",
+            listOf(
+                "INITIAL", "AUTHORITY_ENDED GRANT_REPLACED", "TOPIC_PURGED CANONICAL_TOPIC_STATE",
+                "ACCESS_RESUMED", "RESUMED usdt:krw/WS", "OBS usdt:krw/WS"
+            ),
+            g.trace()
+        )
+        val (ended, purged) = g.events[1] to g.events[2]
+        listOf(ended, purged).forEach {
+            assertEquals("G2A-04 the old owner", fence(), it.authority.owner)
+            assertEquals("G2A-04 the old grant", oldEpoch, it.authority.grantEpoch)
+        }
+        assertEquals("G2A-04 the new owner", fence(grant = 2L), g.events[3].authority.owner)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-05 an identity loss seen at a frame ends the authority once, and nothing of it is said afterwards`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        h.liveFence = fence(generation = 2L).identity
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        h.bootstrapOutcome = { _, _ -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1392.0, gT3)))) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertEquals("G2A-05 order", listOf("INITIAL", "AUTHORITY_ENDED IDENTITY_RETIRED"), g.trace())
+        assertEquals("G2A-05 the retired owner", fence(), g.events.last().authority.owner)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-06 a premium refusal ends the authority once, and a late answer of it says nothing`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        h.goLive()
+        advanceTimeBy(100)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        refuseOnTheWire(h)
+        h.bootstrapOutcome = { _, _ -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1)))) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+
+        assertEquals("G2A-06 order", listOf("INITIAL", "AUTHORITY_ENDED PREMIUM_REFUSED"), g.trace())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-07 a withheld use ends the authority once, the next use resumes access under its own lifetime, and the old use stays silent`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        // A hold came and went: the grant is the same, the socket's use is not admitted, and only a new one would be.
+        h.authority = object : TopicUseAuthority {
+            override fun acquire(fence: TopicSessionFence) = TopicUseLifetime(fence.grant, 1L)
+            override fun admits(lifetime: TopicUseLifetime) = lifetime.invalidations == 1L
+        }
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        h.bootstrapOutcome = { _, _ -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2)))) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(100)
+        // The issuer publishes the release; the session reopens under a new use.
+        h.coordinator.accessRevised()
+        advanceTimeBy(5_000)
+        assertEquals("G2A-07 fixture: reconnected", 2, h.wires.size)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1392.0, gT3))))
+        advanceTimeBy(1)
+
+        val trace = g.trace()
+        assertEquals("G2A-07 begins", listOf("INITIAL", "AUTHORITY_ENDED USE_WITHHELD", "ACCESS_RESUMED"), trace.take(3))
+        assertEquals("G2A-07 ends with the new use's delivery", listOf("RESUMED usdt:krw/WS", "OBS usdt:krw/WS"), trace.takeLast(2))
+        assertEquals("G2A-07 ended once", 1, g.events.count { it.kind == TopicGraphEventKind.AUTHORITY_ENDED })
+        assertEquals("G2A-07 the old use ended", TopicUseLifetime(fence().grant, 0L), g.events[1].authority.lifetime)
+        assertEquals("G2A-07 the new use resumed", TopicUseLifetime(fence().grant, 1L), g.events[2].authority.lifetime)
+        assertTrue("G2A-07 nothing of the old use's answer", g.observations.none { it.attribution.lifetime.invalidations == 0L })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-08 stop ends the hand-over once, after which buffered input says nothing`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        h.wallMillis = 13_000L
+        // A socket frame reaches the loop through its transport's collector, so one delivered in the same instant as `stop()`
+        // queues behind the stop: it is the buffered input this row is about.
+        h.coordinator.stop()
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(100)
+
+        assertEquals("G2A-08 order", listOf("INITIAL", "RESUMED usdt:krw/WS", "OBS usdt:krw/WS", "HANDOVER_ENDED STOPPED"), g.trace())
+        val end = g.events.last()
+        assertEquals("G2A-08 the authority in force", fence(), end.authority.owner)
+        assertEquals("G2A-08 scope", setOf(TETHER, USD) to bothPaths, end.topics to end.paths)
+        assertEquals("G2A-08 when", 13_000L, end.occurredAtEpochMillis)
+        h.cleanUp()
+        runCurrent()
+        assertEquals("G2A-08 the scope's end after a stop says nothing more", 1, g.events.count { it.kind == TopicGraphEventKind.HANDOVER_ENDED })
+    }
+
+    @Test
+    fun `G2A-09 a cancelled scope ends the hand-over once, and a session with no authority says so without an owner`() = runTest {
+        val idle = Harness(this, desired = setOf(TETHER, USD))
+        val gi = GraphRecorder(idle)
+        idle.graphSink = gi
+        idle.coordinator.start()
+        idle.coordinator.stop()
+        advanceTimeBy(1)
+        assertEquals("G2A-09 an idle session's end", listOf("HANDOVER_ENDED STOPPED"), gi.trace())
+        assertNull("G2A-09 no owner", gi.events.single().authority.owner)
+        assertNull("G2A-09 no use", gi.events.single().authority.lifetime)
+
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        h.cleanUp()
+        runCurrent()
+        assertEquals("G2A-09 order", listOf("INITIAL", "HANDOVER_ENDED SCOPE_CANCELLED"), g.trace())
+    }
+
+    @Test
+    fun `G2A-12 a new use under a different lifetime ends the old use's authority and resumes access before its observations`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val access = h.publishedAccess()
+        val g = continuityLive(h)
+        // A hold came and went and its revision never reached the session: the socket's use is no longer admitted, a new one is.
+        access.flicker()
+        h.bootstrapOutcome = { _, _ -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1)))) }
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(100)
+
+        assertEquals(
+            "G2A-12 order",
+            listOf(
+                "INITIAL", "AUTHORITY_ENDED USE_WITHHELD", "ACCESS_RESUMED",
+                "RESUMED usdt:krw/REST_BOOTSTRAP", "OBS usdt:krw/REST_BOOTSTRAP"
+            ),
+            g.trace()
+        )
+        assertEquals("G2A-12 the old use ended", TopicUseLifetime(fence().grant, 0L), g.events[1].authority.lifetime)
+        assertEquals("G2A-12 the new use resumed", TopicUseLifetime(fence().grant, 1L), g.events[2].authority.lifetime)
+
+        // The old socket's late refusal belongs to the use already ended: it does not end the new one.
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+        assertEquals("G2A-12 nothing more", 5, g.inputs.size)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-13 a hold that stays ends the authority when the session first refuses its use, and nothing resumes`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val access = h.publishedAccess()
+        val g = continuityLive(h)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+
+        access.hold()
+        h.wallMillis = 40_000L
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        h.wallMillis = 50_000L
+        h.bootstrapOutcome = { _, _ -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2)))) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(60_000)
+
+        assertEquals("G2A-13 order", listOf("INITIAL", "AUTHORITY_ENDED USE_WITHHELD"), g.trace())
+        assertEquals("G2A-13 at the refusal, not later", 40_000L, g.events.last().occurredAtEpochMillis)
+        assertEquals("G2A-13 the held use", TopicUseLifetime(fence().grant, 0L), g.events.last().authority.lifetime)
+        h.cleanUp()
+    }
+
+    // G2A-14..19: each place the session first sees a withheld use says so then, and a refusal or identity loss seen at the same
+    // place keeps its own reason (설계 판정 r3 A·B: these sites stay separate because their precedence differs).
+
+    /** A live socket under [PublishedAccess], its subscribe sent, nothing delivered: INITIAL only. */
+    private suspend fun TestScope.heldLive(h: Harness): Pair<GraphRecorder, PublishedAccess> {
+        val access = h.publishedAccess()
+        val g = continuityLive(h)
+        assertEquals("G2A fixture: one subscribe sent", 1, h.requests.size)
+        assertEquals("G2A fixture: INITIAL only", listOf("INITIAL"), g.trace())
+        return g to access
+    }
+
+    @Test
+    fun `G2A-14 an acknowledgement for a held use ends the authority as withheld, at the acknowledgement`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val (g, access) = heldLive(h)
+        access.hold()
+        h.wallMillis = 60_000L
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+
+        assertEquals("G2A-14 order", listOf("INITIAL", "AUTHORITY_ENDED USE_WITHHELD"), g.trace())
+        assertEquals("G2A-14 at the acknowledgement", 60_000L, g.events.last().occurredAtEpochMillis)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-15 a premium refusal for a held use ends the authority as refused, not withheld`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val (g, access) = heldLive(h)
+        access.hold()
+        h.wallMillis = 62_000L
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+
+        assertEquals("G2A-15 order", listOf("INITIAL", "AUTHORITY_ENDED PREMIUM_REFUSED"), g.trace())
+        assertEquals("G2A-15 at the acknowledgement", 62_000L, g.events.last().occurredAtEpochMillis)
+        assertEquals("G2A-15 the held use", TopicUseLifetime(fence().grant, 0L), g.events.last().authority.lifetime)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-16 coming back to the foreground under a hold closes the socket and ends the authority as withheld`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val (g, access) = heldLive(h)
+        access.hold()
+        h.wallMillis = 65_000L
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+
+        assertTrue("G2A-16 fixture: the socket closed", h.wire.cancelled)
+        assertEquals("G2A-16 order", listOf("INITIAL", "AUTHORITY_ENDED USE_WITHHELD"), g.trace())
+        assertEquals("G2A-16 at the return", 65_000L, g.events.last().occurredAtEpochMillis)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-17 a revision that withdraws the socket's use ends the authority then, and the new use resumes access later`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val (g, access) = heldLive(h)
+        access.flicker()
+        h.wallMillis = 70_000L
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        h.wallMillis = 80_000L
+        advanceTimeBy(5_000)
+
+        assertEquals("G2A-17 fixture: reconnected", 2, h.wires.size)
+        assertEquals("G2A-17 order", listOf("INITIAL", "AUTHORITY_ENDED USE_WITHHELD", "ACCESS_RESUMED"), g.trace())
+        assertEquals("G2A-17 ended at the revision", 70_000L, g.events[1].occurredAtEpochMillis)
+        assertEquals("G2A-17 resumed at the new start", 80_000L, g.events[2].occurredAtEpochMillis)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-18 a bootstrap answer for a held use ends the authority as withheld, at the answer`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val (g, access) = heldLive(h)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        access.hold()
+        h.wallMillis = 90_000L
+        h.bootstrapOutcome = { _, _ -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1)))) }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(1)
+
+        assertEquals("G2A-18 order", listOf("INITIAL", "AUTHORITY_ENDED USE_WITHHELD"), g.trace())
+        assertEquals("G2A-18 at the answer", 90_000L, g.events.last().occurredAtEpochMillis)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-19 a silence that finds the use held and the account moved ends the authority as retired, not withheld`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val access = h.publishedAccess()
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        silenceReady(h)
+        // Short of the 45-second silence, so its revalidation is the first to look at the held use and the moved account.
+        advanceTimeBy(31_000)
+        assertEquals("G2A-19 fixture: nothing ended yet", 0, g.events.count { it.kind == TopicGraphEventKind.AUTHORITY_ENDED })
+        access.hold()
+        h.liveFence = fence(generation = 2L).identity
+        h.wallMillis = 75_000L
+        advanceTimeBy(15_000)
+
+        assertEquals(
+            "G2A-19 order",
+            listOf("INITIAL", "RESUMED usdt:krw/WS", "OBS usdt:krw/WS", "AUTHORITY_ENDED IDENTITY_RETIRED"),
+            g.trace()
+        )
+        assertEquals("G2A-19 at the silence", 75_000L, g.events.last().occurredAtEpochMillis)
+        assertEquals("G2A-19 the held use", TopicUseLifetime(fence().grant, 0L), g.events.last().authority.lifetime)
+        h.cleanUp()
+    }
+
+    // G2A-20..28: the remaining places that first see a withheld use (Codex survivor judgment r1; bodies as proposed there).
+
+    /** The trace so far plus one withheld end, at [at], of the first authority's owner, grant and original use. */
+    private fun assertWithheldAt(g: GraphRecorder, before: List<String>, at: Long) {
+        assertEquals("G2A withheld order", before + "AUTHORITY_ENDED USE_WITHHELD", g.trace())
+        val ended = g.events.last()
+        assertEquals("G2A withheld when", at, ended.occurredAtEpochMillis)
+        assertEquals("G2A withheld owner", fence(), ended.authority.owner)
+        assertEquals("G2A withheld grant", g.events.first().authority.grantEpoch, ended.authority.grantEpoch)
+        assertEquals("G2A withheld use", TopicUseLifetime(fence().grant, 0L), ended.authority.lifetime)
+    }
+
+    @Test
+    fun `G2A-20 a restore answered for a held use ends the authority as withheld, at the answer`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val gates = h.gatedSeeds(usdSeed())
+        val g = continuityLive(h)
+        val before = g.trace()
+        assertEquals("G2A-20 fixture: one restore held", 1, gates.size)
+
+        access.hold()
+        h.wallMillis = 110_000L
+        gates.single().complete(Unit)
+        advanceTimeBy(1)
+
+        assertWithheldAt(g, before, 110_000L)
+        assertTrue("G2A-20 fixture: the seed was not shown", h.coordinator.rates.value.quotes.isEmpty())
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-21 a deferred continuation that finds its use held ends the authority as withheld`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val g = continuityLive(h)
+        val attribution = h.attributions.last()
+        val before = g.trace()
+        var ran = false
+
+        access.hold()
+        h.wallMillis = 120_000L
+        h.coordinator.runIfStillOwned(attribution) { ran = true }
+        advanceTimeBy(1)
+
+        assertEquals("G2A-21 fixture: the action did not run", false, ran)
+        assertWithheldAt(g, before, 120_000L)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-22 a foreground return ends the socket's withheld use when it sees it, before the new use resumes access`() = runTest {
+        val h = Harness(this)
+        val (g, access) = heldLive(h)
+        access.flicker()
+        h.wallMillis = 130_000L
+        // Time moves between the check that refuses the old use and the acquisition of the new one.
+        access.afterAdmits = {
+            access.afterAcquire = { h.wallMillis = 131_000L }
+        }
+
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+
+        assertEquals("G2A-22 order", listOf("INITIAL", "AUTHORITY_ENDED USE_WITHHELD", "ACCESS_RESUMED"), g.trace())
+        assertEquals("G2A-22 ended when seen", 130_000L, g.events[1].occurredAtEpochMillis)
+        assertEquals("G2A-22 resumed when acquired", 131_000L, g.events[2].occurredAtEpochMillis)
+        assertEquals("G2A-22 the old use", TopicUseLifetime(fence().grant, 0L), g.events[1].authority.lifetime)
+        assertEquals("G2A-22 the new use", TopicUseLifetime(fence().grant, 1L), g.events[2].authority.lifetime)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-23 a manual retry that finds the socket's use held ends the authority as withheld`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        disabledOpen(h, USD)
+        val before = g.trace()
+        val requests = h.requests.size
+
+        access.hold()
+        h.wallMillis = 140_000L
+        h.retry(FreeTab.USD)
+        advanceTimeBy(1)
+
+        assertWithheldAt(g, before, 140_000L)
+        assertEquals("G2A-23 fixture: nothing sent", requests, h.requests.size)
+        assertTrue("G2A-23 fixture: the socket closed", h.wire.cancelled)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-24 a command that sees its use held ends the authority before a stop already queued`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals("G2A-24 fixture", listOf("INITIAL"), g.trace())
+
+        h.onTopicStatePublished = { state ->
+            if (state.controlState == TopicControlState.PENDING) {
+                h.onTopicStatePublished = null
+                access.hold()
+                h.wallMillis = 150_000L
+                h.coordinator.stop()
+            }
+        }
+        h.wire.open()
+        advanceTimeBy(1)
+
+        assertEquals("G2A-24 order", listOf("INITIAL", "AUTHORITY_ENDED USE_WITHHELD", "HANDOVER_ENDED STOPPED"), g.trace())
+        assertEquals("G2A-24 when", 150_000L, g.events[1].occurredAtEpochMillis)
+        assertEquals("G2A-24 the held use", TopicUseLifetime(fence().grant, 0L), g.events[1].authority.lifetime)
+        assertTrue("G2A-24 fixture: no subscribe sent", h.wire.sent.none { it.startsWith("encoded-") })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-25 a bootstrap withheld before its send ends the authority as withheld`() = runTest {
+        val h = Harness(this)
+        val (g, access) = heldLive(h)
+        h.bootstrapGate = CompletableDeferred()
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        val before = g.trace()
+        val handed = h.undelivered.size
+
+        access.hold()
+        h.wallMillis = 160_000L
+        h.bootstrapOutcome = { _, _ ->
+            assertEquals("G2A-25 fixture: the use check refuses", false, h.bootstrapUseChecks.last().invoke())
+            throw TopicUseWithheldException(emptyList())
+        }
+        h.bootstrapGate!!.complete(Unit)
+        advanceTimeBy(1)
+
+        assertWithheldAt(g, before, 160_000L)
+        assertEquals("G2A-25 fixture: no outcome handed over", handed, h.undelivered.size)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-26 a silence that finds the use held under the same account ends the authority as withheld`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        silenceReady(h)
+        advanceTimeBy(31_000)
+        val before = g.trace()
+
+        access.hold()
+        h.wallMillis = 170_000L
+        advanceTimeBy(15_000)
+
+        assertWithheldAt(g, before, 170_000L)
+        assertTrue("G2A-26 fixture: the socket closed", h.wire.cancelled)
+        assertEquals("G2A-26 fixture: no revalidation sent", 1, h.requests.size)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-27 a cached refresh found withheld at a display update ends the authority as withheld`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        releasedOpen(h)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        val before = g.trace()
+
+        access.hold()
+        h.wallMillis = 180_000L
+        h.coordinator.setForeground(false)
+        advanceTimeBy(1)
+
+        assertWithheldAt(g, before, 180_000L)
+        assertEquals("G2A-27 fixture: the release is withdrawn", false, h.released())
+        assertEquals("G2A-27 fixture: the socket stays", false, h.wire.cancelled)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-28 a credential recovery that finds the use held ends the authority as withheld without reopening`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        firstDeliveryCredentialEnded(h)
+        val before = g.trace()
+        val reads = h.credentialReads
+
+        access.hold()
+        h.wallMillis = 190_000L
+        h.coordinator.onCredentialRecovered(h.recovery(episode = 1))
+        advanceTimeBy(1)
+
+        assertWithheldAt(g, before, 190_000L)
+        assertEquals("G2A-28 fixture: no credential read", reads, h.credentialReads)
+        assertTrue("G2A-28 fixture: nothing sent", h.requests.isEmpty())
+        assertEquals("G2A-28 fixture: the socket stays", false, h.wire.cancelled)
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-10 losses keep every authority they came from, their wall clocks, and events share the sequence`() = runTest {
+        val h = Harness(this, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        g.answer = { if (it is TopicGraphInput.Observations || (it as TopicGraphInput.Continuity).kind == TopicGraphEventKind.AUTHORITY_ENDED) TopicGraphOffer.FULL else TopicGraphOffer.ENQUEUED }
+        val first = checkNotNull(h.shown().owner).grantEpoch
+
+        h.wallMillis = 20_000L
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        // Re-approved in the same namespace: the grant moves, the identity and namespace do not.
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(5_000)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wallMillis = 30_000L
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+        val second = checkNotNull(h.shown().owner).grantEpoch
+
+        val loss = checkNotNull(h.coordinator.graphLoss.value)
+        assertEquals("G2A-10 fixture: two grants", true, second > first)
+        assertEquals("G2A-10 three losses: an observation, the authority's end, an observation", 3L, loss.count)
+        assertEquals(
+            "G2A-10 both authorities, by value",
+            setOf(TopicGraphAuthorityKey(fence(), first), TopicGraphAuthorityKey(fence(grant = 2L), second)),
+            loss.authorities
+        )
+        assertEquals("G2A-10 first loss's wall clock", 20_000L, loss.firstOccurredAtEpochMillis)
+        assertEquals("G2A-10 last loss's wall clock", 30_000L, loss.lastOccurredAtEpochMillis)
+        assertEquals("G2A-10 one contiguous sequence", (1L..g.inputs.size.toLong()).toList(), g.inputs.map { it.sequence })
+        h.cleanUp()
+    }
+
+    @Test
+    fun `G2A-11 the same trace with continuity events decides the same things with a dormant or a recording sink`() = runTest {
+        val dormant = Harness(this, desired = setOf(TETHER, USD))
+        val recording = Harness(this, desired = setOf(TETHER, USD)).also { it.graphSink = GraphRecorder(it) }
+        val hs = listOf(dormant, recording)
+        suspend fun step(millis: Long = 1, act: (Harness) -> Unit) {
+            hs.forEach(act)
+            advanceTimeBy(millis)
+        }
+        step(100) { it.goLive() }
+        step { it.wire.open() }
+        step { it.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1)))) }
+        step { it.setAccess(false, fence()) }
+        step(5_000) { it.setAccess(true, fence()) }
+        step { it.wire.open() }
+        step { it.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2)))) }
+        step(100) { it.coordinator.stop() }
+
+        assertTrue("G2A-11 fixture: the recording sink saw a resumption", (recording.graphSink as GraphRecorder).trace().contains("ACCESS_RESUMED"))
+        assertEquals("G2A-11 everything else the runtime decided", dormant.priceFingerprint(), recording.priceFingerprint())
+        dormant.cleanUp()
     }
 }
