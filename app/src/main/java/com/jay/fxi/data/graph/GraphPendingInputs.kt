@@ -16,6 +16,9 @@ internal class GraphPendingInputs private constructor(
     companion object {
         val EMPTY = GraphPendingInputs(emptyList(), emptySet())
 
+        internal fun markLoss(pending: GraphPendingInputs, topics: Set<String>): GraphPendingInputs =
+            if (topics.isEmpty()) pending else GraphPendingInputs(pending.inputs, pending.lostTopics + topics)
+
         internal fun offer(pending: GraphPendingInputs, input: TopicGraphInput): GraphPendingInputs {
             val units = input.pendingUnits()
             if (units == 0) return pending
@@ -40,6 +43,10 @@ internal class GraphPendingInputs private constructor(
 
 internal fun offerGraphPendingInput(pending: GraphPendingInputs, input: TopicGraphInput): GraphPendingInputs =
     GraphPendingInputs.offer(pending, input)
+
+/** Record loss without retaining a refused input or changing the original holding. */
+internal fun markGraphPendingLoss(pending: GraphPendingInputs, topics: Set<String>): GraphPendingInputs =
+    GraphPendingInputs.markLoss(pending, topics)
 
 private fun TopicGraphInput.pendingUnits(): Int = when (this) {
     is TopicGraphInput.Observations -> candidates.size
