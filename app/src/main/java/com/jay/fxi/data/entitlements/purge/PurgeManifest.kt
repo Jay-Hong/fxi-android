@@ -143,7 +143,8 @@ object PurgeManifest {
             classification = PurgeClassification.CUTOVER_OWNED,
             scopes = setOf(PurgeScope.USER),
             owner = "S4",
-            note = "`graph_cache_v1_*.json` and the legacy names; read paths still promote into them"
+            note = "`graph_cache_v1_*.json` and the legacy names; no reader or writer remains — only account-deletion cleanup removes " +
+                "them until the S4 cutover migration (§9.1)"
         ),
         PurgeTarget(
             id = "file:graph_v2_general",

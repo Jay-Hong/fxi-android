@@ -44,8 +44,9 @@ class BackupRulesLedgerTest {
         // device's registration.
         "fxi_push_registration_ledger" to false,
 
-        // `ANDROID_V2_PLAN.md §9.1`: the migration journal is excluded, so the journal marker itself is never restored; the
-        // legacy stores' own backup policy is tracked separately (`fxi_cache`, `fxi_graph_preferences` below).
+        // `ANDROID_V2_PLAN.md §9.1`: the migration journal is excluded, so the journal marker itself is never restored.
+        // The declared legacy stores' backup policy is tracked below (`fxi_cache`); the retired graph preference backing
+        // file still belongs to the S4 cutover, independently of whether a DataStore is declared for it.
         "fxi_migration_journal" to false,
 
         // S3 topic last-known seeds: server-derived prices bound to one UID and user epoch — another install has neither.
@@ -56,11 +57,6 @@ class BackupRulesLedgerTest {
         // cannot help doing exactly that. Excluded here, and deleted outright on start — see
         // `RetiredStores`, and `theRetiredStoresAreAlsoKeptOutOfBackup` below for why both.
         "fxi_bank_preferences" to false,
-
-        // v1, no UID either, and the same shape of problem — but `ANDROID_V2_PLAN.md §9.1` already
-        // hands it to **S4**, with the Graph V2 cutover. Recorded rather than changed here: a slice
-        // that was not asked to own it should not quietly decide it.
-        "fxi_graph_preferences" to true,
 
         // The shared v1 cache: S3 deletes its retired rate keys; last-bank preferences remain.
         // Two slices share it: `ANDROID_V2_PLAN.md` §9.1 gives `rates`/`rates_timestamp` to **S3**

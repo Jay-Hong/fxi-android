@@ -1,6 +1,5 @@
 package com.jay.fxi.di
 
-import com.jay.fxi.data.remote.dto.GraphResponse
 import com.jay.fxi.data.remote.dto.IndicesPayload
 import com.jay.fxi.data.remote.dto.NotificationSettingsResponse
 import com.jay.fxi.data.remote.dto.WebSocketGraphBucket
@@ -84,17 +83,6 @@ class JsonProfilesTest {
     }
 
     @Test
-    fun wireJson_rejectsMissingRequiredGraphFields() {
-        val wireJson = NetworkModule.provideWireJson()
-
-        assertThrows(SerializationException::class.java) {
-            wireJson.decodeFromString<GraphResponse>(
-                """{"pair":"usd-krw","sources":{}}"""
-            )
-        }
-    }
-
-    @Test
     fun wireJson_rejectsMissingRequiredNullableAlertField() {
         val wireJson = NetworkModule.provideWireJson()
 
@@ -112,7 +100,6 @@ class JsonProfilesTest {
 
     @Test
     fun currentWireResponseDefaults_areLimitedToProtocolOptionalFields() {
-        assertOnlyOptional(GraphResponse.serializer().descriptor, setOf("as_of"))
         assertOnlyOptional(AlertSetting.serializer().descriptor, emptySet())
         assertOnlyOptional(NotificationSettingsResponse.serializer().descriptor, emptySet())
         assertOnlyOptional(ExchangeRate.serializer().descriptor, emptySet())

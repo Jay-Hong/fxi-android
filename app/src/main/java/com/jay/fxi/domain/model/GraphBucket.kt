@@ -3,7 +3,6 @@ package com.jay.fxi.domain.model
 import kotlinx.datetime.Instant
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import com.jay.fxi.util.InstantSerializer
 
 /**
  * 그래프 버킷 (10분 단위)
@@ -56,35 +55,4 @@ fun GraphBucket.toGraphPoint(source: GraphSource) = GraphPoint(
     max = max,
     min = min,
     close = close
-)
-
-/**
- * 그래프 캐시 타입
- * Map<currency, Map<source, List<GraphBucket>>>
- */
-typealias GraphCache = Map<String, Map<String, List<GraphBucket>>>
-typealias MutableGraphCache = MutableMap<String, MutableMap<String, MutableList<GraphBucket>>>
-typealias GraphSourceData = Map<String, List<GraphBucket>>
-typealias MutableGraphSourceData = MutableMap<String, MutableList<GraphBucket>>
-typealias PeriodGraphCache = Map<String, Map<String, GraphSourceData>>
-typealias MutablePeriodGraphCache = MutableMap<String, MutableMap<String, GraphSourceData>>
-
-/**
- * 장기 구간 디스크 캐시 엔트리
- */
-@Serializable
-data class PeriodGraphCacheEntry(
-    val sources: GraphSourceData,
-    @Serializable(with = InstantSerializer::class)
-    val freshnessDate: Instant
-)
-
-/**
- * 그래프 REST 응답의 도메인 모델
- */
-data class GraphDataResult(
-    val period: GraphPeriod,
-    val bucketSize: String,
-    val sources: GraphSourceData,
-    val asOf: Instant?
 )

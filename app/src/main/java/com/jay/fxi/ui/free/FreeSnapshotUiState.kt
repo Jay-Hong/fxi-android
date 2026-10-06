@@ -105,7 +105,7 @@ data class FreeSnapshotUiState(
 
     companion object {
         /**
-         * 1일, as on iOS and as on this app's own premium surface (`GraphViewModel.kt:66`).
+         * 1일, as on iOS.
          *
          * The free surface opened on 3달 while everything else opened on 1일 — an inconsistency
          * rather than a decision; nothing recorded a reason for it. It also decided which period

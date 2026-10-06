@@ -37,7 +37,7 @@ class PurgeManifestTest {
         // declared, or an empty result would let this test pass while seeing nothing.
         listOf(
             "fxi_access_epoch", "fxi_push_registration_ledger", "fxi_user_intent", "fxi_free_graph",
-            "fxi_free_tab", "fxi_cache", "fxi_graph_preferences", "fxi_bank_preferences", "fxi_backupable_user_intent"
+            "fxi_free_tab", "fxi_cache", "fxi_bank_preferences", "fxi_backupable_user_intent"
         ).forEach { assertTrue("선언을 못 찾았다: $it (정규식이 코드와 어긋났다)", it in names) }
         val listed = PurgeManifest.TARGETS.map { it.id }.toSet()
         names.forEach { name ->
