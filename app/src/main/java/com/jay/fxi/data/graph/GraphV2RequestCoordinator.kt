@@ -144,6 +144,7 @@ internal class GraphV2RequestCoordinator(
         var coldAttempt = false
         var midnightGeneration: Long? = null
         var midnightAttempt = false
+        var flipGeneration: Long? = null
     }
 
     private class ColdOwner(
@@ -164,6 +165,15 @@ internal class GraphV2RequestCoordinator(
         var deadline: Instant?,
         var cycleStarted: Boolean = false,
         var rung: Int = 0,
+        var requestId: Long? = null
+    )
+
+    private class FlipOwner(
+        val generation: Long,
+        val activityGeneration: Long,
+        val key: GraphKey,
+        val context: RequestContext,
+        var deadline: Instant?,
         var requestId: Long? = null
     )
 
@@ -248,6 +258,8 @@ internal class GraphV2RequestCoordinator(
     private var coldOwner: ColdOwner? = null
     private var nextMidnightGeneration = 0L
     private var midnightOwner: MidnightOwner? = null
+    private var nextFlipGeneration = 0L
+    private var flipOwner: FlipOwner? = null
     private var deferredDemand: DeferredDemand? = null
     // Written by the loop, also read by the transport's replay guard. Context disposal and
     // deactivation never reset it; an in-flight answer still uses its separate ownership check.
@@ -270,6 +282,7 @@ internal class GraphV2RequestCoordinator(
                         releaseCompletion(event)
                         cancelCold()
                         cancelMidnight()
+                        cancelFlip()
                         cancelTimer()
                         publish()
                         onEventFailure(failure)
@@ -281,6 +294,7 @@ internal class GraphV2RequestCoordinator(
                 cancelTimer()
                 cancelCold()
                 cancelMidnight()
+                cancelFlip()
                 discardRequests()
                 inbox.close()
                 publish()
@@ -324,7 +338,7 @@ internal class GraphV2RequestCoordinator(
                 synchronizeContext()
                 if (activeKey != event.key) cancelActiveDemand()
                 activeKey = event.key
-                synchronizeCapabilityConfiguration()
+                synchronizeCapabilityConfiguration(now)
                 startDiskSeed()
                 requestActive(now, force = false)
             }
@@ -335,13 +349,13 @@ internal class GraphV2RequestCoordinator(
             }
             Event.ContextChanged -> {
                 val changed = synchronizeContext()
-                synchronizeCapabilityConfiguration()
+                synchronizeCapabilityConfiguration(now)
                 startDiskSeed()
                 if (changed) requestActive(now, force = false)
             }
             is Event.Refresh -> {
                 synchronizeContext()
-                synchronizeCapabilityConfiguration()
+                synchronizeCapabilityConfiguration(now)
                 startDiskSeed()
                 requestActive(now, event.force)
             }
@@ -543,7 +557,7 @@ internal class GraphV2RequestCoordinator(
     }
 
     /** Admission failure leaves the last comparable configuration intact; it is not a capability revocation. */
-    private fun synchronizeCapabilityConfiguration() {
+    private fun synchronizeCapabilityConfiguration(now: Instant) {
         val ports = cachePorts ?: return
         val current = context ?: return
         val binding = try {
@@ -567,10 +581,7 @@ internal class GraphV2RequestCoordinator(
             val general = protectedSlots[key]?.components?.general
             val tab = if (general != null) joinGraphV2Components(general, null).tab else {
                 // Conversion failures have no protected slot; still remove KRX from the raw fallback.
-                entry.tab.copy(
-                    graph = entry.tab.graph.copy(series = entry.tab.graph.series.filterNot { it.seriesId.startsWith("krx.") }),
-                    inProgress = entry.tab.inProgress.filterKeys { !it.startsWith("krx.") }
-                )
+                generalOnly(entry.tab)
             }
             GraphEntry(tab, online200At = null)
         }
@@ -578,6 +589,7 @@ internal class GraphV2RequestCoordinator(
             ProtectedSlot(entries.getValue(key), slot.components.copy(krx = null), capabilityGeneration)
         }
         snapshot = snapshot.copy(entries = entries)
+        requireFlipConfirmation(now)
     }
 
     private fun requestActive(
@@ -616,6 +628,7 @@ internal class GraphV2RequestCoordinator(
         tabRequests[key]?.let {
             if (coldAttempt) connectCold(it, attempt = true)
             if (midnightAttempt) connectMidnight(it, attempt = true)
+            connectFlip(it)
             return
         }
         if (needsTab) startTab(current, key, coldAttempt, midnightAttempt)
@@ -665,6 +678,7 @@ internal class GraphV2RequestCoordinator(
         tabRequests[key] = registration
         connectCold(registration, coldAttempt)
         connectMidnight(registration, midnightAttempt)
+        connectFlip(registration)
         startCapture(registration)
     }
 
@@ -712,6 +726,7 @@ internal class GraphV2RequestCoordinator(
             releaseRegistration(registration)
             endConnectedCold(registration)
             endConnectedMidnight(registration)
+            endConnectedFlip(registration)
             return
         }
         val owner = registration.capturedOwner ?: return
@@ -721,6 +736,7 @@ internal class GraphV2RequestCoordinator(
                 releaseRegistration(registration)
                 endConnectedCold(registration)
                 endConnectedMidnight(registration)
+                endConnectedFlip(registration)
             } else {
                 registration.waitingForFloor = true
             }
@@ -771,19 +787,38 @@ internal class GraphV2RequestCoordinator(
             releaseRegistration(registration)
             endConnectedCold(registration)
             endConnectedMidnight(registration)
+            endConnectedFlip(registration)
+            return
+        }
+        val outcome = tabOutcome(event.result, event.key)
+        val configuration = if (outcome is TabOutcome.Success) completionConfiguration(registration) else null
+        // The live publisher can withdraw the original context during the completion's configuration read.
+        if (!useAdmitted(registration)) {
+            releaseRegistration(registration)
+            endConnectedCold(registration)
+            endConnectedMidnight(registration)
+            endConnectedFlip(registration)
             return
         }
         releaseRegistration(registration)
-        when (val outcome = tabOutcome(event.result, event.key)) {
+        when (outcome) {
             is TabOutcome.Success -> {
-                val entry = GraphEntry(outcome.tab, now)
+                val confirmed = cachePorts == null || configuration?.let {
+                    !it.allowed || (it.recordEpoch != null && it.recordEpoch == registration.accessCapture?.krxCapabilityEpoch)
+                } == true
+                val entry = GraphEntry(outcome.tab, now.takeIf { confirmed })
                 snapshot = snapshot.copy(
                     entries = snapshot.entries + (event.key to entry),
                     failures = snapshot.failures - event.key
                 )
-                val components = replaceOnlineSlot(registration, event.key, entry)
+                val components = replaceOnlineSlot(registration, event.key, entry, configuration)
                 reserveOnlineWrite(registration, event.key, components)
-                endConnectedCold(registration)
+                if (snapshot.entries[event.key]?.online200At != null) {
+                    endConnectedCold(registration)
+                    endConnectedFlip(registration)
+                } else {
+                    onUnconfirmedSuccess(registration, configuration, now)
+                }
                 if (connectedMidnight(registration) != null) finishMidnight(now)
             }
             is TabOutcome.Failure -> {
@@ -792,19 +827,54 @@ internal class GraphV2RequestCoordinator(
                 }
                 onColdFailure(registration, outcome, now)
                 onMidnightFailure(registration, outcome, now)
+                endConnectedFlip(registration)
                 if (outcome.disposition == FailureDisposition.DIAGNOSTIC) onEventFailure(outcome.error)
             }
         }
     }
 
+    /** Read the completion's configuration once, without acquiring or replacing the start capture. */
+    private fun completionConfiguration(registration: Registration): GraphV2CapabilityConfiguration? = try {
+        cachePorts?.gate?.bindWithConfiguration(registration.context.fence, registration.context.lifetime)?.configuration
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (failure: Throwable) {
+        seedDiagnostic(nextSeedId, checkNotNull(registration.key), GraphV2DiskComponent.GENERAL,
+            "Completion configuration binding failed", failure)
+        null
+    }
+
+    private fun onUnconfirmedSuccess(
+        registration: Registration,
+        configuration: GraphV2CapabilityConfiguration?,
+        now: Instant
+    ) {
+        val flip = connectedFlip(registration)
+        val requestActivity = flip?.activityGeneration ?: connectedMidnight(registration)?.activityGeneration
+            ?: registration.activityGeneration
+        connectedCold(registration)?.let { cold ->
+            cold.requestId = null
+            // An unconfirmed 200 consumes no failure rung and cannot satisfy the existing cold demand.
+            if (cold.deadline == null) cold.deadline = coldDeadline(now, cold.rung, null, cold.key.tab)
+        }
+        endConnectedFlip(registration)
+        // A completed delegated response starts a new wait; the earlier flip deadline no longer applies.
+        // An unavailable configuration alone grants no new capability demand.
+        if ((configuration != null || flip != null) && activeKey == registration.key &&
+            context == registration.context && activityGeneration == requestActivity) requireFlipConfirmation(now)
+    }
+
     private fun replaceOnlineSlot(
         registration: Registration,
         key: GraphKey,
-        entry: GraphEntry
+        entry: GraphEntry,
+        configuration: GraphV2CapabilityConfiguration?
     ): GraphV2DiskComponents? {
         // A failed conversion must never pair a new raw entry with the previous components.
         protectedSlots = protectedSlots - key
         if (cachePorts == null) return null
+        // Until conversion succeeds, retain only an unconfirmed GENERAL fallback.
+        snapshot = snapshot.copy(entries = snapshot.entries + (key to GraphEntry(generalOnly(entry.tab), null)))
         val fence = registration.context.fence
         val epoch = fence.userAccessEpoch ?: return null
         val components = try {
@@ -821,15 +891,24 @@ internal class GraphV2RequestCoordinator(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Throwable) {
-            // The slot is already absent: fail closed without changing the adopted entry or retry owners.
+            // The protected slot is absent and the raw GENERAL fallback remains unconfirmed.
             return null
         }
-        // Raw and protected slots both use the request-start split, including a GENERAL-only capture.
-        val adopted = entry.copy(tab = joinGraphV2Components(components.general, components.krx).tab)
+        // Memory follows the completion configuration; writes retain the original request-start split.
+        val memoryComponents = components.copy(krx = components.krx.takeIf {
+            configuration?.allowed == true && configuration.recordEpoch != null &&
+                configuration.recordEpoch == registration.accessCapture?.krxCapabilityEpoch
+        })
+        val adopted = entry.copy(tab = joinGraphV2Components(memoryComponents.general, memoryComponents.krx).tab)
         snapshot = snapshot.copy(entries = snapshot.entries + (key to adopted))
-        protectedSlots = protectedSlots + (key to ProtectedSlot(adopted, components))
+        protectedSlots = protectedSlots + (key to ProtectedSlot(adopted, memoryComponents))
         return components
     }
+
+    private fun generalOnly(tab: GraphV2Tab): GraphV2Tab = tab.copy(
+        graph = tab.graph.copy(series = tab.graph.series.filterNot { it.seriesId.startsWith("krx.") }),
+        inProgress = tab.inProgress.filterKeys { !it.startsWith("krx.") }
+    )
 
     /** Reservation is synchronous: adoption order is the store's supersession order. */
     private fun reserveOnlineWrite(
@@ -1166,9 +1245,9 @@ internal class GraphV2RequestCoordinator(
             return
         }
         val key = registration.key ?: return
-        // A midnight due may join a still-admitted request sent before a key switch away
-        // and back. Its cold handoff belongs to the current midnight activation.
-        val requestActivity = connectedMidnight(registration)?.activityGeneration ?: registration.activityGeneration
+        // Delegated requests may have been sent in an earlier activation; the current owner receives the handoff.
+        val requestActivity = connectedFlip(registration)?.activityGeneration
+            ?: connectedMidnight(registration)?.activityGeneration ?: registration.activityGeneration
         if (activeKey != key || context != registration.context ||
             activityGeneration != requestActivity || snapshot.entries[key]?.online200At != null) {
             if (cold != null) cancelCold()
@@ -1270,7 +1349,7 @@ internal class GraphV2RequestCoordinator(
         timer = null
         timerDeadline = null
         synchronizeContext()
-        synchronizeCapabilityConfiguration()
+        synchronizeCapabilityConfiguration(now)
         startDiskSeed()
 
         // Only saved demand is resumed. A floor with no demand never arms a timer or sends a GET.
@@ -1284,6 +1363,7 @@ internal class GraphV2RequestCoordinator(
 
         wakeCold(now)
         wakeMidnight(now)
+        wakeFlip(now)
     }
 
     private fun wakeCold(now: Instant) {
@@ -1318,12 +1398,79 @@ internal class GraphV2RequestCoordinator(
 
     private fun cancelCold() { coldOwner = null }
     private fun cancelMidnight() { midnightOwner = null }
+    private fun cancelFlip() { flipOwner = null }
+
+    /** A flip adds one active demand; registration, cold and timer are alternatives in that order. */
+    private fun requireFlipConfirmation(now: Instant) {
+        val key = activeKey ?: return
+        val current = context ?: return
+        if (!scope.isActive || snapshot.entries[key] == null || snapshot.entries[key]?.online200At != null ||
+            GraphV2Domain.support(snapshot.catalog, key.tab, key.period) == GraphPeriodSupport.Unsupported) return
+        val previous = flipOwner?.takeIf {
+            it.key == key && it.context == current && it.activityGeneration == activityGeneration
+        }
+        val flip = previous ?: FlipOwner(++nextFlipGeneration, activityGeneration, key, current, now + FLIP_INTERVAL)
+        flipOwner = flip
+        tabRequests[key]?.takeIf { it.context == current && useAdmitted(it) }?.let {
+            connectFlip(it)
+            return
+        }
+        if (activeCold() != null) {
+            cancelFlip()
+            return
+        }
+        if (flip.deadline == null) flip.deadline = now + FLIP_INTERVAL
+    }
+
+    private fun activeCold(): ColdOwner? = coldOwner?.takeIf {
+        it.key == activeKey && it.context == context && it.activityGeneration == activityGeneration
+    }
+
+    private fun connectFlip(registration: Registration) {
+        val flip = flipOwner ?: return
+        if (flip.key != activeKey || flip.context != context || flip.activityGeneration != activityGeneration ||
+            registration.key != flip.key || registration.context != flip.context || !useAdmitted(registration)) return
+        registration.flipGeneration = flip.generation
+        flip.requestId = registration.requestId
+        flip.deadline = null
+    }
+
+    private fun connectedFlip(registration: Registration): FlipOwner? = flipOwner?.takeIf {
+        it.generation == registration.flipGeneration && it.requestId == registration.requestId &&
+            it.key == registration.key && it.context == registration.context &&
+            it.activityGeneration == activityGeneration
+    }
+
+    private fun endConnectedFlip(registration: Registration) {
+        if (connectedFlip(registration) != null) cancelFlip()
+    }
+
+    private fun wakeFlip(now: Instant) {
+        val flip = flipOwner ?: return
+        if (flip.key != activeKey || flip.context != context || flip.activityGeneration != activityGeneration ||
+            snapshot.entries[flip.key]?.online200At != null ||
+            GraphV2Domain.support(snapshot.catalog, flip.key.tab, flip.key.period) == GraphPeriodSupport.Unsupported) {
+            cancelFlip()
+            return
+        }
+        tabRequests[flip.key]?.takeIf { it.context == flip.context && useAdmitted(it) }?.let {
+            connectFlip(it)
+            return
+        }
+        if (activeCold() != null) {
+            cancelFlip()
+            return
+        }
+        val deadline = flip.deadline ?: return
+        if (now >= deadline && !underFloor(now)) requestActive(now, force = true)
+    }
 
     private fun cancelActiveDemand() {
         activityGeneration++
         discardSeed()
         cancelCold()
         cancelMidnight()
+        cancelFlip()
         deferredDemand = null
         // Already sent requests retain A2a ownership of their own cache entry. Unsent floor
         // demand belongs to the old activation and must be disposed on a real transition.
@@ -1335,6 +1482,7 @@ internal class GraphV2RequestCoordinator(
         val candidates = mutableListOf<Instant>()
         fun afterFloor(deadline: Instant): Instant = maxOf(deadline, sharedRetryFloor ?: deadline)
         coldOwner?.takeIf { it.requestId == null }?.deadline?.let { candidates += afterFloor(it) }
+        flipOwner?.takeIf { it.requestId == null }?.deadline?.let { candidates += afterFloor(it) }
         midnightOwner?.takeIf { it.requestId == null }?.let { midnight ->
             midnight.deadline?.let { deadline ->
                 candidates += if (tabRequests.containsKey(midnight.key)) deadline else afterFloor(deadline)
@@ -1383,6 +1531,7 @@ internal class GraphV2RequestCoordinator(
                 releaseRegistration(it)
                 endConnectedCold(it)
                 endConnectedMidnight(it)
+                endConnectedFlip(it)
             }
             is Event.Captured -> if (isRegistered(event.registration)) releaseRegistration(event.registration)
             else -> Unit
@@ -1408,6 +1557,7 @@ internal class GraphV2RequestCoordinator(
 
     private companion object {
         val KST = TimeZone.of("Asia/Seoul")
+        val FLIP_INTERVAL = 3.seconds
         val COLD_INTERVALS = listOf(3.seconds, 6.seconds, 12.seconds, 24.seconds, 48.seconds)
         val MIDNIGHT_INTERVALS = listOf(20.seconds, 40.seconds, 80.seconds)
     }

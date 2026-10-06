@@ -599,11 +599,13 @@ class GraphV2RequestCoordinatorWriteTest {
     @Test fun X01_aTicketIsNotAuthority() = writeTest {
         val f = Fixture(this)
         f.start(); f.coordinator.onActivated(KEY); runCurrent()
-        // The request started under an open gate. The 200 is queued first, the withdrawal after it (A2 does not read it).
+        // The request started under an open gate. The 200 is queued first, the withdrawal after it: the request's own
+        // admission does not read it, but the completion's configuration read finds it closed (B1b-2c-2: unconfirmed).
         f.sent.single().tab.complete(ok(onlineDto(1500.0)))
         f.scope.launch { f.protectedOpen = false }
         runCurrent()
-        assertEquals("adopted", NOON, f.state.entries[KEY]?.online200At)
+        assertNotNull("adopted", f.state.entries[KEY])
+        assertNull("completion configuration unavailable: unconfirmed", f.state.entries[KEY]?.online200At)
         assertEquals("reserved", 1, f.store.tickets.size)
         assertEquals("that ticket is cancelled", f.store.tickets.toSet(), f.store.cancelled.toSet())
         assertEquals("nothing is prepared", 0, f.prepareCalls.size)
