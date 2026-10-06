@@ -9,6 +9,7 @@ internal fun GraphV2Fullscreen(
     state: GraphV2ScreenState,
     actions: GraphV2UiActions,
     modifier: Modifier = Modifier,
+    hostExposed: Boolean = true,
 ) {
-    GraphV2SurfaceOwner(state, actions, GraphV2Surface.FULLSCREEN, modifier)
+    GraphV2SurfaceOwner(state, actions, GraphV2Surface.FULLSCREEN, modifier, hostExposed)
 }

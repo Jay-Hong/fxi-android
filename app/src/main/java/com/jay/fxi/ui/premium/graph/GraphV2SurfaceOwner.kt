@@ -15,11 +15,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleStartEffect
 import com.jay.fxi.ui.components.PeriodTabBar
 import com.jay.fxi.ui.graph.GraphChart
 import com.jay.fxi.ui.graph.GraphZoomState
@@ -33,7 +38,9 @@ internal fun GraphV2SurfaceOwner(
     actions: GraphV2UiActions,
     surface: GraphV2Surface,
     modifier: Modifier = Modifier,
+    hostExposed: Boolean = true,
 ) {
+    val report by rememberUpdatedState(actions.setSurfaceVisible)
     val fullscreen = surface == GraphV2Surface.FULLSCREEN
     val token = when (surface) {
         GraphV2Surface.INLINE -> state.inlineToken
@@ -44,6 +51,14 @@ internal fun GraphV2SurfaceOwner(
     // Tokens change on context/period transitions and fullscreen reopening, but not selection
     // or data refresh. Keep the zoom alive while a status replaces the chart on the same surface.
     key(token) {
+        var inViewport by remember { mutableStateOf(false) }
+        val shown = hostExposed && inViewport
+        if (token != null) {
+            LifecycleStartEffect(token, shown) {
+                report(token, shown)
+                onStopOrDispose { report(token, false) }
+            }
+        }
         var zoom by rememberSaveable(stateSaver = GraphZoomStateSaver) {
             mutableStateOf(GraphZoomState())
         }
@@ -56,7 +71,10 @@ internal fun GraphV2SurfaceOwner(
                 .windowInsetsPadding(WindowInsets.safeDrawing).padding(horizontal = 16.dp)
         } else modifier.fillMaxWidth()
         Column(
-            modifier = surfaceModifier.testTag(GraphV2UiTags.root(surface)),
+            modifier = surfaceModifier.testTag(GraphV2UiTags.root(surface)).onGloballyPositioned { coordinates ->
+                val bounds = coordinates.boundsInWindow()
+                inViewport = bounds.width > 0f && bounds.height > 0f
+            },
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             GraphV2ToggleHeader(
@@ -79,6 +97,7 @@ internal fun GraphV2SurfaceOwner(
                         zoom = zoom,
                         onZoom = { zoom = it },
                         onSingleTap = onClose,
+                        rightEdgeNow = chart.rightEdgeNow,
                     )
                 }
                 GraphV2CenterKind.STATUS -> GraphV2StatusArea(

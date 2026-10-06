@@ -9,6 +9,7 @@ internal fun GraphV2Section(
     state: GraphV2ScreenState,
     actions: GraphV2UiActions,
     modifier: Modifier = Modifier,
+    hostExposed: Boolean = true,
 ) {
-    GraphV2SurfaceOwner(state, actions, GraphV2Surface.INLINE, modifier)
+    GraphV2SurfaceOwner(state, actions, GraphV2Surface.INLINE, modifier, hostExposed)
 }

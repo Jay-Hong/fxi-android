@@ -9,4 +9,5 @@ internal data class GraphV2UiActions(
     val enterFullscreen: (GraphV2UiToken) -> Unit,
     val exitFullscreen: (GraphV2UiToken) -> Unit,
     val retrySelection: (GraphV2UiToken) -> Unit,
+    val setSurfaceVisible: (GraphV2UiToken, Boolean) -> Unit = { _, _ -> },
 )

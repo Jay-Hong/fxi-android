@@ -271,7 +271,7 @@ private fun PremiumTopicOwnedScreen(
                             if (tab == selectedTab) {
                                 PremiumTopicRates(state.ui, scroll, fullscreen = false, onToggleFullscreen = { fullscreen = true },
                                     onOpenEditor = openEditor, graphContent = if (graph != null && graphActions != null) {
-                                        { GraphV2Section(graph, graphActions) }
+                                        { GraphV2Section(graph, graphActions, hostExposed = overlay == PremiumTopicOverlay.NONE) }
                                     } else null)
                             } else {
                                 Box(Modifier.fillMaxSize())

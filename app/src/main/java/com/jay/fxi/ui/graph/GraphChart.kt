@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSource
 import com.jay.fxi.ui.theme.SecondaryText
+import kotlinx.datetime.Instant
 
 /**
  * One framed chart for every visible series.
@@ -68,14 +69,15 @@ fun GraphChart(
     onZoom: ((GraphZoomState) -> Unit)? = null,
     /** What a lone tap means here, or null if nothing. Fullscreen passes leaving; the card does not. */
     onSingleTap: (() -> Unit)? = null,
-    emptyMessage: String = "표시할 그래프 데이터가 없습니다."
+    emptyMessage: String = "표시할 그래프 데이터가 없습니다.",
+    rightEdgeNow: Instant? = null
 ) {
     // The right edge the zoom follows, resolved the same way the projection resolves it — the
     // unpadded end of the data window, not the padded frame the x scale maps onto.
-    val frame = remember(prepared) { GraphFrame.resolve(prepared) }
-    val window = remember(zoom, frame, prepared.period) { zoom.windowFor(frame, prepared.period) }
-    val plot = remember(prepared, visibleIds, window) {
-        GraphProjection.plot(prepared, visibleIds, window)
+    val frame = remember(prepared, rightEdgeNow) { GraphFrame.resolve(prepared, rightEdgeNow) }
+    val window = remember(zoom, frame, prepared.period, rightEdgeNow) { zoom.windowFor(frame, prepared.period) }
+    val plot = remember(prepared, visibleIds, window, rightEdgeNow) {
+        GraphProjection.plot(prepared, visibleIds, window, rightEdgeNow)
     }
     if (plot == null || plot.isEmpty) {
         // No loop here at all, so the tap is unconditional — including on 1일.
