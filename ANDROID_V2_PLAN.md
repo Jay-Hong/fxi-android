@@ -31,9 +31,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 관찰했다. topic 줄 문구는 운영에서 자연 발생하지 않아 기기 미수집이다.
                                 S3 그래프 관측 인계는 GObs-1(`ffda7b9`, 후보)·2a(`4233c4a`, 권위·재개)·2b-1(`c30d615`,
                                 전달 중단)·2b-2(`b5e6501`, ACK·인증)로 연결했다(JVM 계약, dormant sink, 운영 배선 없음).
-                                S4 Graph V2(FX)는 A1(`0265bdf`)부터 D3(`046d3fa`)까지 25개 commit으로 요청·디스크·
-                                선택·화면·1일 live 봉 모델을 쌓았다(JVM·에뮬레이터 계측 계약, 운영 배선 없음).
-                                남은 단위는 E1·E2·C2·F1·G·F2다(S4 '진행' 항목).
+                                S4 Graph V2(FX)는 A1(`0265bdf`)부터 C2a(`fa15bc2`)까지 구현·테스트 commit 28개로 요청·
+                                디스크·선택·화면·1일 live 봉 모델·관측 어댑터·live projection을 쌓았다(JVM·에뮬레이터
+                                계측 계약, 운영 배선 없음). 남은 단위는 C2b·F1·G·F2다(S4 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1371,7 +1371,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   catalog·화면 전 입력 / 공백 이력≠복구 완료 / sparse 응답·경계 통과 / 크기 한도·미래 시각 / 비동기 purge 완료도
   세 슬라이스의 해당 어댑터에서 검증한다. T21은 catalog가 제공하는 기간만, T22는 장기 교집합·catalog 변경까지,
   T23은 공유 자료의 소비자별 접근 경계까지 포함한다. DXY의 범위·음영 사례 제외 규칙은 그대로 적용한다.
-- 진행(10-05~06, 모두 운영 배선 없음):
+- 진행(10-05~07, 모두 운영 배선 없음):
   **A 요청·갱신** — A1 `0265bdf` catalog·tab 응답의 도메인 경계 · A2a `923c8d0` 타이머 없는 요청·갱신 담당 ·
   A2b-1 `f5f71a6` cold 재시도와 rate-limit 하한 · A2b-2 `74d03ad` fixed_start 자정 갱신.
   **B1 디스크·접근** — B1a-1 `681fac4` 서버 자료의 디스크 envelope 분리·되읽기 · B1a-2 `6fc6e8c` 디스크 저장소·원자
@@ -1387,7 +1387,12 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   **D 1일 live 봉** — D1 `8c9fe29` 관측·봉 순수 모델(관측 식별·close·tip) · D2 `cf4747c` seed·닫힌 봉 적용(서버와 앱
   근거를 따로 보관하고 표시할 때만 합성) · D3 `046d3fa` 봉별 복구 요구·공백 이력·응답 적용 버전, 자료 25h·요구 24h 창,
   봉 합집합 152·식별 ID 4,096 한도.
-  다음: E1(FX 관측→series)·E2(DXY)·C2(live projection·발행)·F1(보존·폐기 제어 소비)·G(v1 소비 제거·migration)·F2
+  **E 관측 어댑터** — E1 `d11f120` FX Quote→series 관측과 catalog 전 입력 보관(512단위, 넘치면 topic 손실 기록) ·
+  E2 `ac8b003` 달러지수 관측과 공급 source 순위(investing > cnbc > yahoo).
+  **C2 live 표시** — C2a `fa15bc2` REST 그래프와 D3 상태를 시계 읽기 없이 합치는 순수 projection(1일은 b−24h~b
+  slot을 서버 점 우선으로 합쳐 다시 빌드, 현재 봉만 now까지, 신선도 600초·hana 1200초 strict, 장기는 tip rate만,
+  달러지수 음영 없음).
+  다음: C2b(350ms 발행·가시성·GraphChart 오른쪽 끝)·F1(보존·폐기 제어 소비)·G(v1 소비 제거·migration)·F2
   (production 연결). S4 DoD 재검증은 F2 연결 뒤 실제 purger를 포함해 한다.
 
 ### S5 — 테더 탭
