@@ -31,6 +31,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 관찰했다. topic 줄 문구는 운영에서 자연 발생하지 않아 기기 미수집이다.
                                 S3 그래프 관측 인계는 GObs-1(`ffda7b9`, 후보)·2a(`4233c4a`, 권위·재개)·2b-1(`c30d615`,
                                 전달 중단)·2b-2(`b5e6501`, ACK·인증)로 연결했다(JVM 계약, dormant sink, 운영 배선 없음).
+                                S4 Graph V2(FX)는 A1(`0265bdf`)부터 D3(`046d3fa`)까지 25개 commit으로 요청·디스크·
+                                선택·화면·1일 live 봉 모델을 쌓았다(JVM·에뮬레이터 계측 계약, 운영 배선 없음).
+                                남은 단위는 E1·E2·C2·F1·G·F2다(S4 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1368,6 +1371,24 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   catalog·화면 전 입력 / 공백 이력≠복구 완료 / sparse 응답·경계 통과 / 크기 한도·미래 시각 / 비동기 purge 완료도
   세 슬라이스의 해당 어댑터에서 검증한다. T21은 catalog가 제공하는 기간만, T22는 장기 교집합·catalog 변경까지,
   T23은 공유 자료의 소비자별 접근 경계까지 포함한다. DXY의 범위·음영 사례 제외 규칙은 그대로 적용한다.
+- 진행(10-05~06, 모두 운영 배선 없음):
+  **A 요청·갱신** — A1 `0265bdf` catalog·tab 응답의 도메인 경계 · A2a `923c8d0` 타이머 없는 요청·갱신 담당 ·
+  A2b-1 `f5f71a6` cold 재시도와 rate-limit 하한 · A2b-2 `74d03ad` fixed_start 자정 갱신.
+  **B1 디스크·접근** — B1a-1 `681fac4` 서버 자료의 디스크 envelope 분리·되읽기 · B1a-2 `6fc6e8c` 디스크 저장소·원자
+  교체·purge adapter · B1b-1 `9f3cbc1` 접근 게이트 · B1b-2a-1 `1444e21` 디스크 seed로 빈 슬롯 채우기 · B1b-2a-2 `c9deb4c`
+  보호 노출과 component 슬롯 · B1b-2b-1 `51e49b5` 채택한 온라인 답의 디스크 쓰기 · B1b-2b-2 `a96f049` 쓰기 경로의
+  admission·철회·순서·소유권 계약 · B1b-2c-1 `dae09d5` capability 구성 변경에 맞춘 슬롯 재필터 · B1b-2c-2 `2767b38`
+  구성 변경 뒤 온라인 한 번 재확인.
+  **B2 선택** — B2a `9c63d5f` series 선택 정책 · B2b-1 `710b7f3` UID별 선택 저장소와 계정 삭제 adapter · B2b-2 `e718260`
+  선택 session.
+  **C1 화면** — C1-1a `c76cefc` presenter · C1-1b `bc8f2cf` 화면 상태 holder · C1-2a `8a52c03` 인라인 화면 · C1-2b-1
+  `1542630` 전체화면 · C1-2b-2 `0aac1c6` 제스처 연결 시험 · C1-3a `d621eea` premium 화면의 FX 그래프 slot과 overlay 배타.
+  C1-3b는 C1 변경의 무료 화면 회귀를 기존 증거로 확인해 닫았다. T25 재실행은 C2/F2에 남는다.
+  **D 1일 live 봉** — D1 `8c9fe29` 관측·봉 순수 모델(관측 식별·close·tip) · D2 `cf4747c` seed·닫힌 봉 적용(서버와 앱
+  근거를 따로 보관하고 표시할 때만 합성) · D3 `046d3fa` 봉별 복구 요구·공백 이력·응답 적용 버전, 자료 25h·요구 24h 창,
+  봉 합집합 152·식별 ID 4,096 한도.
+  다음: E1(FX 관측→series)·E2(DXY)·C2(live projection·발행)·F1(보존·폐기 제어 소비)·G(v1 소비 제거·migration)·F2
+  (production 연결). S4 DoD 재검증은 F2 연결 뒤 실제 purger를 포함해 한다.
 
 ### S5 — 테더 탭
 - 거래소 5 + 참조(kb·hana·investing) 시세 (preference는 S1.5에서 도입, 여기서 테더 표면에 연결)
