@@ -13,7 +13,8 @@ internal enum class GraphV2Content {
 
 internal data class GraphV2ChartModel(
     val prepared: PreparedGraph,
-    val renderedIds: Set<String>
+    val renderedIds: Set<String>,
+    val rightEdgeNow: Instant? = null
 )
 
 internal object GraphV2ScreenPresenter {
@@ -43,8 +44,7 @@ internal object GraphV2ScreenPresenter {
             prepared = chart.prepared,
             visibleIds = chart.renderedIds,
             visibleDomain = zoom,
-            // C1 presents history; the live edge belongs to C2.
-            rightEdgeNow = null
+            rightEdgeNow = chart.rightEdgeNow
         )
     }
 }

@@ -3,6 +3,8 @@ package com.jay.fxi.ui.premium.graph
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.graph.GraphDataScope
 import com.jay.fxi.data.graph.GraphKey
+import com.jay.fxi.data.graph.GraphObservationSeriesKey
+import com.jay.fxi.data.graph.GraphRecoverableState
 import com.jay.fxi.data.graph.GraphRequestState
 import com.jay.fxi.data.graph.GraphSelectionApplyResult
 import com.jay.fxi.data.graph.GraphSelectionBinding
@@ -27,6 +29,8 @@ import com.jay.fxi.domain.model.GraphSelectionChange
 import com.jay.fxi.domain.model.GraphSelectionUniverse
 import com.jay.fxi.domain.model.GraphSeriesSelection
 import com.jay.fxi.domain.model.GraphSeriesSelectionPolicy
+import com.jay.fxi.time.AppClock
+import com.jay.fxi.time.SystemAppClock
 import com.jay.fxi.ui.graph.GraphPreparedBuilder
 import com.jay.fxi.ui.graph.GraphSeriesStyle
 import com.jay.fxi.ui.graph.GraphSeriesStyles
@@ -34,12 +38,15 @@ import com.jay.fxi.ui.graph.PreparedGraph
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.datetime.Instant
 
 internal enum class GraphV2Surface { INLINE, FULLSCREEN }
 
@@ -95,7 +102,7 @@ internal data class GraphV2PreparationKey(
 )
 
 /**
- * C1 holder only; the host starts and owns the shared request coordinator.
+ * The host starts and owns the shared request coordinator.
  * Lifecycle, rendering and workers use the same serial dispatcher as the selection session and coordinator.
  * A renderer observes [state] for invalidation and reads [currentState] immediately before drawing.
  */
@@ -111,7 +118,9 @@ internal class GraphV2ScreenStateHolder(
     private val gate: GraphV2AccessGate,
     private val accessRevisions: StateFlow<Long>,
     scope: CoroutineScope,
-    dispatcher: CoroutineDispatcher
+    dispatcher: CoroutineDispatcher,
+    private val live: StateFlow<Map<GraphObservationSeriesKey, GraphRecoverableState>> = MutableStateFlow(emptyMap()),
+    private val clock: AppClock = SystemAppClock
 ) {
     init {
         require(tab in setOf("usd", "jpy", "eur")) { "Premium FX graph tab required" }
@@ -146,6 +155,11 @@ internal class GraphV2ScreenStateHolder(
 
     private data class RestoreOperation(val id: Long, val binding: GraphSelectionBinding, val confirming: Boolean)
 
+    private data class LivePublication(
+        val prepared: PreparedGraph,
+        val now: Instant
+    )
+
     private enum class Revision { RENDER, CONTEXT_CHANGED }
 
     // The session worker is a sibling, not a child of this Job: close must let its started I/O finish.
@@ -168,6 +182,10 @@ internal class GraphV2ScreenStateHolder(
     private var fullscreenOpen = false
     private var preparationKey: GraphV2PreparationKey? = null
     private var prepared: PreparedGraph? = null
+    private var inlineVisible = false
+    private var fullscreenVisible = false
+    private var livePublication: LivePublication? = null
+    private var livePublishJob: Job? = null
     private var initializationAttempt: InitializationKey? = null
     private var initializing: WriteOperation? = null
     private var restoring: RestoreOperation? = null
@@ -190,6 +208,9 @@ internal class GraphV2ScreenStateHolder(
         observe(accessRevisions, contextChanged = true)
         observe(coordinator.state)
         observe(selectionSession.publication)
+        holderScope.launch {
+            live.collect { scheduleLivePublication() }
+        }
         signal()
     }
 
@@ -202,10 +223,12 @@ internal class GraphV2ScreenStateHolder(
         revisions.trySend(Revision.CONTEXT_CHANGED)
     }
 
-    fun currentState(): GraphV2ScreenState {
+    fun currentState(): GraphV2ScreenState = currentState(publish = false)
+
+    private fun currentState(publish: Boolean): GraphV2ScreenState {
         val capturedContext = context
         val capturedAccess = capturedContext?.let { gate.bindWithConfiguration(it.fence, it.lifetime) }
-        val candidate = render()
+        val candidate = render(publish)
         // Re-read live sources after exposure and preparation, immediately before publication.
         val current = context
         val safe = if (current != null && !isCurrent(current)) {
@@ -213,6 +236,7 @@ internal class GraphV2ScreenStateHolder(
             emptyState(if (activeOwner == null || closed) GraphV2Content.INACTIVE else GraphV2Content.BLOCKED)
         } else if (current != null && gate.bindWithConfiguration(current.fence, current.lifetime) != capturedAccess) {
             clearPreparation()
+            clearSurfaceReports()
             fullscreenOpen = false
             signal()
             emptyState(GraphV2Content.BLOCKED)
@@ -287,7 +311,68 @@ internal class GraphV2ScreenStateHolder(
         if (token.surface != GraphV2Surface.FULLSCREEN || !accepts(token)) return
         fullscreenGeneration = Math.incrementExact(fullscreenGeneration)
         fullscreenOpen = false
+        fullscreenVisible = false
+        if (!surfaceVisible()) dropLivePublication()
         currentState()
+    }
+
+    fun setSurfaceVisible(token: GraphV2UiToken, visible: Boolean) {
+        if (!accepts(token)) return
+        val wasVisible = surfaceVisible()
+        when (token.surface) {
+            GraphV2Surface.INLINE -> inlineVisible = visible
+            GraphV2Surface.FULLSCREEN -> fullscreenVisible = visible
+        }
+        val isVisible = surfaceVisible()
+        if (!wasVisible && isVisible) publishCurrentLive()
+        else if (wasVisible && !isVisible) {
+            dropLivePublication()
+            currentState()
+        }
+    }
+
+    fun onTimeEvent() {
+        publishCurrentLive()
+    }
+
+    private fun surfaceVisible(): Boolean = inlineVisible || fullscreenVisible
+
+    private fun clearSurfaceReports() {
+        inlineVisible = false
+        fullscreenVisible = false
+    }
+
+    private fun cancelLivePublication() {
+        livePublishJob?.cancel()
+        livePublishJob = null
+    }
+
+    private fun dropLivePublication() {
+        cancelLivePublication()
+        livePublication = null
+    }
+
+    private fun scheduleLivePublication() {
+        val screen = currentState()
+        if (!surfaceVisible() || screen.chart == null || livePublishJob != null) return
+        livePublishJob = holderScope.launch {
+            delay(350L)
+            livePublishJob = null
+            publishCurrentLive()
+        }
+    }
+
+    private fun publishCurrentLive() {
+        currentState(publish = true)
+    }
+
+    private fun publishLive(current: Context, key: GraphV2PreparationKey, rest: PreparedGraph) {
+        cancelLivePublication()
+        val now = clock.now()
+        val scope = GraphDataScope(current.binding.identity.uid, checkNotNull(current.fence.userAccessEpoch))
+        livePublication = LivePublication(
+            projectGraphV2Live(key.graph, rest, key.period, scope, live.value, now), now
+        )
     }
 
     fun retrySelection(token: GraphV2UiToken) {
@@ -397,6 +482,7 @@ internal class GraphV2ScreenStateHolder(
     }
 
     private fun retireContext() {
+        clearSurfaceReports()
         val previous = context
         if (previous != null) {
             // Old failures/catalog must not be attributed to a new auth/fence/use before the request loop catches up.
@@ -423,6 +509,7 @@ internal class GraphV2ScreenStateHolder(
     }
 
     private fun clearPreparation() {
+        dropLivePublication()
         preparationKey = null
         prepared = null
     }
@@ -571,11 +658,12 @@ internal class GraphV2ScreenStateHolder(
         return candidate == token(current, candidate.surface)
     }
 
-    private fun render(): GraphV2ScreenState {
+    private fun render(publish: Boolean): GraphV2ScreenState {
         if (!started || closed || activeOwner == null) return emptyState(GraphV2Content.INACTIVE)
         val current = context ?: return emptyState(GraphV2Content.BLOCKED)
         if (gate.bindWithConfiguration(current.fence, current.lifetime) == null) {
             clearPreparation()
+            clearSurfaceReports()
             fullscreenOpen = false
             return emptyState(GraphV2Content.BLOCKED)
         }
@@ -594,12 +682,16 @@ internal class GraphV2ScreenStateHolder(
         val failure = snapshot?.failures?.get(key)
         val chart = if (exposure != null && confirmed != null) {
             val next = GraphV2PreparationKey(screenGeneration, tab, activePeriod, exposure.graph)
-            if (preparationKey != next) {
+            val changed = preparationKey != next
+            if (changed) {
                 prepared = GraphPreparedBuilder.build(next.graph, next.period)
                 preparationKey = next
             }
-            val built = checkNotNull(prepared)
-            GraphV2ChartModel(built, GraphSeriesSelectionPolicy.renderedIds(confirmed, built.bySeries.keys, exposure.krxVisible))
+            if (surfaceVisible() && (changed || publish)) publishLive(current, next, checkNotNull(prepared))
+            val published = livePublication
+            val built = published?.prepared ?: checkNotNull(prepared)
+            GraphV2ChartModel(built,
+                GraphSeriesSelectionPolicy.renderedIds(confirmed, built.bySeries.keys, exposure.krxVisible), published?.now)
         } else {
             if (exposure == null) clearPreparation()
             null
