@@ -36,6 +36,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -51,6 +52,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -63,6 +65,8 @@ import com.jay.fxi.ui.free.RateRowEditor
 import com.jay.fxi.ui.premium.PremiumTopicScreenBanner
 import com.jay.fxi.ui.premium.PremiumTopicScreenState
 import com.jay.fxi.ui.premium.PremiumTopicUiState
+import com.jay.fxi.ui.premium.graph.GraphV2Fullscreen
+import com.jay.fxi.ui.premium.graph.GraphV2Section
 import com.jay.fxi.ui.rates.RateDisplay
 import com.jay.fxi.ui.rates.view.RateBarRow
 import com.jay.fxi.ui.rates.view.RateRowCustomizeSheet
@@ -88,7 +92,8 @@ internal fun PremiumTopicScreen(
     onApplyRows: (owner: TopicDisplayOwner, tab: FreeTab, list: RateRowList, seeded: List<String>, order: List<String>, hidden: Set<String>) -> Unit,
     onOpenSettings: () -> Unit,
     newsContent: @Composable (isTabVisible: Boolean) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    graphSlot: PremiumFxGraphSlot? = null
 ) {
     val owner = state.ui.owner
     val selectedTab = state.ui.selectedTab
@@ -111,13 +116,14 @@ internal fun PremiumTopicScreen(
             // The provider starts a fresh composition per owner key, so nothing remembered crosses owners.
             ownerState.SaveableStateProvider(ownerKey) {
                 PremiumTopicOwnedScreen(state, owner, selectedTab, onUserTabSelected, onRetryConnection,
-                    onRetryTopics, onApplyRows, onOpenSettings, newsContent)
+                    onRetryTopics, onApplyRows, onOpenSettings, newsContent, graphSlot)
             }
         }
     }
 }
 
 private data class PremiumTopicEdit(val owner: TopicDisplayOwner, val tab: FreeTab, val editor: RateRowEditor)
+private enum class PremiumTopicOverlay { NONE, RATES, GRAPH }
 
 @Composable
 private fun PremiumTopicOwnedScreen(
@@ -129,7 +135,8 @@ private fun PremiumTopicOwnedScreen(
     onRetryTopics: (TopicDisplayOwner, FreeTab) -> Unit,
     onApplyRows: (TopicDisplayOwner, FreeTab, RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onOpenSettings: () -> Unit,
-    newsContent: @Composable (Boolean) -> Unit
+    newsContent: @Composable (Boolean) -> Unit,
+    graphSlot: PremiumFxGraphSlot?
 ) {
     val tabs = FreeTab.entries
     val pager = rememberPagerState(initialPage = selectedTab.ordinal) { tabs.size }
@@ -140,6 +147,23 @@ private fun PremiumTopicOwnedScreen(
     var fullscreen by rememberSaveable { mutableStateOf(false) }
     var overlayTab by rememberSaveable { mutableStateOf(selectedTab.name) }
     var editing by remember { mutableStateOf<PremiumTopicEdit?>(null) }
+
+    // Observe only for invalidation; one fresh answer drives this render's graph, overlay and pager.
+    val graph = graphSlot?.let { slot ->
+        val observed by slot.state.collectAsState()
+        observed.let { slot.acceptedState(owner, selectedTab) }
+    }
+    fun overlayFor(graphFullscreen: Boolean): PremiumTopicOverlay = when {
+        graphFullscreen -> PremiumTopicOverlay.GRAPH
+        fullscreen && currentTab.isData -> PremiumTopicOverlay.RATES
+        else -> PremiumTopicOverlay.NONE
+    }
+    val overlay = overlayFor(graph?.fullscreenToken != null)
+    SideEffect {
+        // An externally published graph fullscreen replaces, rather than suspends, the rate layer.
+        if (overlay == PremiumTopicOverlay.GRAPH) fullscreen = false
+    }
+    val graphActions = graphSlot?.actions
 
     LaunchedEffect(pager) {
         var drag: DragInteraction.Start? = null
@@ -191,7 +215,9 @@ private fun PremiumTopicOwnedScreen(
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val metrics = RateLayoutMetrics.fromWindow(maxWidth, maxHeight)
         CompositionLocalProvider(LocalRateLayoutMetrics provides metrics) {
-            Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.statusBars)) {
+            Column(Modifier.fillMaxSize().then(
+                if (overlay != PremiumTopicOverlay.NONE) Modifier.clearAndSetSemantics {} else Modifier
+            ).windowInsetsPadding(WindowInsets.statusBars)) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     tabs.forEach { tab ->
                         val isSelected = selectedTab == tab
@@ -234,7 +260,7 @@ private fun PremiumTopicOwnedScreen(
                     }
                 }
                 HorizontalPager(state = pager, modifier = Modifier.weight(1f).testTag(PremiumTopicTags.PAGER),
-                    key = { tabs[it].name }, userScrollEnabled = !fullscreen && editing == null) { page ->
+                    key = { tabs[it].name }, userScrollEnabled = overlay == PremiumTopicOverlay.NONE && editing == null) { page ->
                     val tab = tabs[page]
                     pages.SaveableStateProvider(tab.name) {
                         if (tab == FreeTab.NEWS) {
@@ -244,7 +270,9 @@ private fun PremiumTopicOwnedScreen(
                             val scroll = rememberScrollState()
                             if (tab == selectedTab) {
                                 PremiumTopicRates(state.ui, scroll, fullscreen = false, onToggleFullscreen = { fullscreen = true },
-                                    onOpenEditor = openEditor)
+                                    onOpenEditor = openEditor, graphContent = if (graph != null && graphActions != null) {
+                                        { GraphV2Section(graph, graphActions) }
+                                    } else null)
                             } else {
                                 Box(Modifier.fillMaxSize())
                             }
@@ -252,7 +280,7 @@ private fun PremiumTopicOwnedScreen(
                     }
                 }
             }
-            if (fullscreen && selectedTab.isData) {
+            if (overlay == PremiumTopicOverlay.RATES) {
                 BackHandler(enabled = editing == null) { fullscreen = false }
                 Surface(Modifier.fillMaxSize().testTag(PremiumTopicTags.FULLSCREEN_LAYER)
                     .pointerInput(Unit) { detectTapGestures(onDoubleTap = { fullscreen = false }) },
@@ -260,6 +288,13 @@ private fun PremiumTopicOwnedScreen(
                     PremiumTopicRates(state.ui, rememberScrollState(), fullscreen = true,
                         onToggleFullscreen = { fullscreen = false }, onOpenEditor = openEditor,
                         modifier = Modifier.windowInsetsPadding(WindowInsets.statusBars))
+                }
+            }
+            if (overlay == PremiumTopicOverlay.GRAPH && graph != null && graphActions != null) {
+                // Non-clickable Surface blocks hits in its margin without adding a dismiss gesture.
+                Surface(Modifier.fillMaxSize().testTag(PremiumTopicTags.GRAPH_LAYER),
+                    color = Background, contentColor = PrimaryText) {
+                    GraphV2Fullscreen(graph, graphActions)
                 }
             }
             editing?.takeIf { it.owner == owner && it.tab == selectedTab }?.let { edit ->
@@ -280,10 +315,12 @@ private fun PremiumTopicRates(
     fullscreen: Boolean,
     onToggleFullscreen: () -> Unit,
     onOpenEditor: (RateRowEditor) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    graphContent: (@Composable () -> Unit)? = null
 ) {
     val metrics = LocalRateLayoutMetrics.current
-    Column(modifier.fillMaxSize()) {
+    Column(modifier.fillMaxSize().then(if (graphContent != null) Modifier.verticalScroll(scroll) else Modifier)) {
+        graphContent?.invoke()
         Row(Modifier.fillMaxWidth().padding(horizontal = metrics.horizontalPadding), verticalAlignment = Alignment.CenterVertically) {
             Text(ui.heading.orEmpty(), modifier = Modifier.weight(1f).then(
                 if (fullscreen) Modifier else Modifier.testTag(PremiumTopicTags.HEADING)),
@@ -294,10 +331,11 @@ private fun PremiumTopicRates(
             }
         }
         Column(
-            Modifier.fillMaxWidth().weight(1f)
+            Modifier.fillMaxWidth().then(if (graphContent == null) Modifier.weight(1f) else Modifier)
                 .then(if (fullscreen) Modifier else Modifier.testTag(PremiumTopicTags.RATES)
                     .pointerInput(Unit) { detectTapGestures(onDoubleTap = { onToggleFullscreen() }) })
-                .verticalScroll(scroll).windowInsetsPadding(WindowInsets.navigationBars)
+                .then(if (graphContent == null) Modifier.verticalScroll(scroll) else Modifier)
+                .windowInsetsPadding(WindowInsets.navigationBars)
                 .padding(horizontal = metrics.horizontalPadding, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(metrics.rowSpacing)
         ) {

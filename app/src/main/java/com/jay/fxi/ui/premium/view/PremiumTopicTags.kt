@@ -18,6 +18,7 @@ internal object PremiumTopicTags {
     fun customize(list: RateRowList) = "premium_customize_${list.name}"
     const val FULLSCREEN = "premium_fullscreen"
     const val FULLSCREEN_LAYER = "premium_fullscreen_layer"
+    const val GRAPH_LAYER = "premium_graph_layer"
     const val FULLSCREEN_CLOSE = "premium_fullscreen_close"
     const val SETTINGS = "premium_settings"
 }
