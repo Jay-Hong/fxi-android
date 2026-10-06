@@ -30,6 +30,11 @@ class BackupRulesLedgerTest {
         "fxi_free_graph" to true,        // which graph series the free surface draws
         "fxi_free_tab" to true,          // the tab to reopen on
 
+        // S4 B2b: graph selections per UID, audience and tab. Named for where it is going - pure, UID-keyed intent that may
+        // travel - but held out for now: the XMLs cannot make a rule depend on a UID inside a file, and turning backup on is
+        // S1's change to verify (R4c/S4 b2_design_codex.r1 §2, "B2 중간 상태의 백업 보류"). Flip it here when S1 does.
+        "fxi_backupable_user_intent" to false,
+
         // Control-plane provenance. An epoch restored onto a different install points cleanup at a
         // namespace that never existed there.
         "fxi_access_epoch" to false,

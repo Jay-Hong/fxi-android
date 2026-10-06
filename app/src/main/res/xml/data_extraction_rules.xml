@@ -9,10 +9,12 @@
    excludes. Converting the whole app to an allowlist changes restore behaviour for existing user
    preferences, so it is a separate change; this file excludes the new control-plane store now.
    The migration journal is also install-local: its marker must not travel apart from legacy data.
+   B2 holds backupable user intent out until S1 verifies UID admission and the backup allowlist.
 -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="file" path="datastore/fxi_access_epoch.preferences_pb" />
+        <exclude domain="file" path="datastore/fxi_backupable_user_intent.preferences_pb" />
         <exclude domain="file" path="datastore/fxi_bank_preferences.preferences_pb" />
         <exclude domain="file" path="datastore/fxi_migration_journal.preferences_pb" />
         <exclude domain="file" path="datastore/fxi_push_registration_ledger.preferences_pb" />
@@ -20,6 +22,7 @@
     </cloud-backup>
     <device-transfer>
         <exclude domain="file" path="datastore/fxi_access_epoch.preferences_pb" />
+        <exclude domain="file" path="datastore/fxi_backupable_user_intent.preferences_pb" />
         <exclude domain="file" path="datastore/fxi_bank_preferences.preferences_pb" />
         <exclude domain="file" path="datastore/fxi_migration_journal.preferences_pb" />
         <exclude domain="file" path="datastore/fxi_push_registration_ledger.preferences_pb" />

@@ -70,7 +70,7 @@ data class PurgeTarget(
 /**
  * The storage surfaces this app's own data code manages, classified.
  *
- * Surveyed from the code rather than from the plan: ten preference DataStores, three
+ * Surveyed from the code rather than from the plan: eleven preference DataStores, three
  * `SharedPreferences` files and the two file shapes under `filesDir`. There is no Room, SQLite or
  * WorkManager state of ours. It is **not** an inventory of what a framework or an SDK persists on
  * its own — `NewsDetailOverlay` turns on WebView DOM storage, for one — and `PurgeManifestTest`
@@ -87,6 +87,14 @@ data class PurgeTarget(
 object PurgeManifest {
 
     val TARGETS: List<PurgeTarget> = listOf(
+        PurgeTarget(
+            id = "datastore:fxi_backupable_user_intent",
+            classification = PurgeClassification.ACCOUNT_DELETION_ONLY,
+            scopes = setOf(PurgeScope.USER),
+            owner = "account deletion obligation",
+            note = "graph selections per UID, audience and tab; deletes only the authorized UID; " +
+                "excluded from backup in B2 pending S1 admission verification"
+        ),
         PurgeTarget(
             id = "datastore:fxi_user_intent",
             classification = PurgeClassification.ACCOUNT_DELETION_ONLY,

@@ -37,7 +37,7 @@ class PurgeManifestTest {
         // declared, or an empty result would let this test pass while seeing nothing.
         listOf(
             "fxi_access_epoch", "fxi_push_registration_ledger", "fxi_user_intent", "fxi_free_graph",
-            "fxi_free_tab", "fxi_cache", "fxi_graph_preferences", "fxi_bank_preferences"
+            "fxi_free_tab", "fxi_cache", "fxi_graph_preferences", "fxi_bank_preferences", "fxi_backupable_user_intent"
         ).forEach { assertTrue("선언을 못 찾았다: $it (정규식이 코드와 어긋났다)", it in names) }
         val listed = PurgeManifest.TARGETS.map { it.id }.toSet()
         names.forEach { name ->
@@ -120,6 +120,22 @@ class PurgeManifestTest {
             setOf("datastore:fxi_topic_last_known", "file:graph_v2_general", "file:graph_v2_krx"),
             PurgeManifest.TARGETS.filter { it.classification == PurgeClassification.DERIVED_HERE }.map { it.id }.toSet()
         )
+    }
+
+    /**
+     * S4 B2b-1 (B2-M01): the graph selection store is the user's own intent - deleted only by an authorised account deletion,
+     * on the user axis, by the adapter that answers for exactly this id.
+     */
+    @Test
+    fun `the backupable intent store is an account deletion obligation on the user axis`() {
+        val matching = PurgeManifest.TARGETS.filter { it.id == "datastore:fxi_backupable_user_intent" }
+        assertEquals("정확히 한 항목", 1, matching.size)
+        val target = matching.single()
+        assertEquals(PurgeClassification.ACCOUNT_DELETION_ONLY, target.classification)
+        assertEquals(setOf(PurgeScope.USER), target.scopes)
+        assertEquals("account deletion obligation", target.owner)
+        assertTrue(target.note.isNotBlank())
+        assertEquals(target.id, GraphSelectionPurgeAdapter.TARGET_ID)
     }
 
     /** The legacy surfaces keep the owners §9.1 gave them. */
