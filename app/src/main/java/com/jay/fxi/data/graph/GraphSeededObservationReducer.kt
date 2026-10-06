@@ -12,6 +12,23 @@ private fun unionGraphBucketRanges(existing: GraphBucketRange?, incoming: GraphB
     )
 
 /**
+ * D2's admission gate and the on-grid closed starts actually supplied by this response.
+ * A valid empty series is distinct from a rejected tab.
+ */
+internal fun graphServerClosedStarts(
+    state: GraphSeededObservationState,
+    scope: GraphDataScope,
+    tab: GraphV2Tab
+): Set<Instant>? {
+    if (scope != state.app.seriesKey.scope || tab.period != GraphPeriod.ONE_DAY || tab.bucketSize != "10min") {
+        return null
+    }
+    val series = tab.graph.series.firstOrNull { it.seriesId == state.app.seriesKey.seriesId } ?: return null
+    return series.points.filter { graphObservationBucketStart(it.timestamp) == it.timestamp }
+        .mapTo(linkedSetOf()) { it.timestamp }
+}
+
+/**
  * Applies an admitted tab in call order. The caller owns access and response-version checks.
  * Server points are closed records; only seed folding uses the device clock.
  */
@@ -21,14 +38,12 @@ internal fun applyGraphServerTab(
     tab: GraphV2Tab,
     now: Instant
 ): GraphSeededObservationState {
-    if (scope != state.app.seriesKey.scope || tab.period != GraphPeriod.ONE_DAY || tab.bucketSize != "10min") {
-        return state
-    }
+    val closedStarts = graphServerClosedStarts(state, scope, tab) ?: return state
     val seriesId = state.app.seriesKey.seriesId
-    val series = tab.graph.series.firstOrNull { it.seriesId == seriesId } ?: return state
+    val series = tab.graph.series.first { it.seriesId == seriesId }
     val buckets = state.serverBuckets.toMutableMap()
     for (point in series.points) {
-        if (graphObservationBucketStart(point.timestamp) == point.timestamp) {
+        if (point.timestamp in closedStarts) {
             buckets[point.timestamp] = GraphServerBucket.Closed(point)
         }
     }
