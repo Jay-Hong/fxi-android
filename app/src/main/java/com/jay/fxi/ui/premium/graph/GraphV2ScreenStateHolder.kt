@@ -249,7 +249,7 @@ internal class GraphV2ScreenStateHolder(
         val catalog = requestState(current)?.catalog
         if (GraphV2Domain.support(catalog, tab, period) == GraphPeriodSupport.Unsupported || period == activePeriod) return
         activePeriod = period
-        advanceScreen()
+        advanceScreen(closeFullscreen = false)
         activateKey(current)
         currentState()
         signal()
@@ -413,10 +413,9 @@ internal class GraphV2ScreenStateHolder(
         signal()
     }
 
-    private fun advanceScreen() {
+    private fun advanceScreen(closeFullscreen: Boolean = true) {
         screenGeneration = Math.incrementExact(screenGeneration)
-        fullscreenGeneration = Math.incrementExact(fullscreenGeneration)
-        fullscreenOpen = false
+        if (closeFullscreen) fullscreenOpen = false
         clearPreparation()
         initializationAttempt = null
         initializing = null

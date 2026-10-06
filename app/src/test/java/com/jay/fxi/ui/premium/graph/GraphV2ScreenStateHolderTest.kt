@@ -91,7 +91,13 @@ import org.junit.rules.TemporaryFolder
  * after independent review, Codex's r2 boundary probes as the L-rows (H02 and H22 among them); L7 expects the opposite of
  * the probe it came from: the same identity's new owner reads the pending save back once instead of waiting forever. r4: H07d
  * also forbids falling back to the first-check state while the uncertain save is confirmed (battery r3 survivor H37). r5
- * (with C1-2a): H07a also checks each toggle carries its protected series' axisGroup.
+ * (with C1-2a): H07a also checks each toggle carries its protected series' axisGroup. r6 (C1-2b-1): H02b also checks the
+ * writes, the catalog requests and the binding instance across the activations and the fullscreen round trip; H08p - a
+ * period chosen in the fullscreen keeps it open with new tokens (iOS a36682f GraphV2Section.swift :445-470); H08r - retire,
+ * deactivation and a closed protected admission remove it for good. r7 (battery r1 survivor K02): H08r also covers a use
+ * invalidation re-acquired at once (closed by the render that the gate refuses first) and a focus that leaves the tab and
+ * comes back - the gate does not see focus, so the render does not close it, and the same owner re-acquires without
+ * onActivated's second retire: only the retire itself closes the fullscreen there.
  *
  * Oracles: ANDROID_V2_PLAN.md :1286 (catalog periods per tab only, server X axis, insufficient history is a 200), :1288-1292
  * (protected reads only under the current access, KRX joined only under the current capability, visible and initialized saved
@@ -542,18 +548,149 @@ class GraphV2ScreenStateHolderTest {
         assertSame(chart.prepared, checkNotNull(f.now().chart).prepared)
 
         val confirms = f.selections.confirms
+        val writes = f.selections.writes
         val sent = f.sent.size
+        val catalogCalls = f.catalogCalls
+        val binding = f.token().binding
         f.holder.onActivated(OWNER_A)
         f.holder.onActivated(OWNER_A)
         f.run()
         f.holder.enterFullscreen(f.token())
         f.run()
         assertTrue(f.now().fullscreenOpen)
+        assertSame("no rebind for the fullscreen", binding, checkNotNull(f.now().fullscreenToken).binding)
         f.holder.exitFullscreen(checkNotNull(f.now().fullscreenToken))
         f.run()
         assertFalse(f.now().fullscreenOpen)
         assertEquals(confirms, f.selections.confirms)
+        assertEquals(writes, f.selections.writes)
         assertEquals(sent, f.sent.size)
+        assertEquals(catalogCalls, f.catalogCalls)
+        assertSame("no rebind for the activations or the round trip", binding, f.token().binding)
+    }
+
+    /**
+     * 08 period: a period chosen in the fullscreen keeps it open - iOS a36682f's fullscreen cover holds its own period bar and
+     * only its close button or a tap dismisses it. Both tokens are new, so the fullscreen token from before the change can
+     * neither close the fullscreen nor change the period, and the new fullscreen token closes it.
+     */
+    @Test fun H08p_aPeriodChosenInTheFullscreenKeepsItOpen() = holderTest {
+        val f = Fixture(this)
+        f.open()
+        f.answer(KEY_1D, fullDay())
+        f.holder.enterFullscreen(f.token())
+        f.run()
+        val before = checkNotNull(f.now().fullscreenToken)
+        val inlineBefore = f.token()
+        f.holder.selectPeriod(before, GraphPeriod.THREE_MONTHS)
+        f.run()
+        assertEquals(GraphPeriod.THREE_MONTHS, f.now().activePeriod)
+        assertTrue("the fullscreen stays open", f.now().fullscreenOpen)
+        val after = checkNotNull(f.now().fullscreenToken) { "the open fullscreen has a token" }
+        assertEquals(GraphPeriod.THREE_MONTHS, after.period)
+        assertTrue("a new screen", after.screenGeneration != before.screenGeneration)
+        assertTrue("a new inline token", f.token() != inlineBefore)
+        f.holder.exitFullscreen(before)
+        f.run()
+        assertTrue("the old fullscreen token cannot close it", f.now().fullscreenOpen)
+        f.holder.selectPeriod(before, GraphPeriod.ONE_DAY)
+        f.run()
+        assertEquals("nor change the period", GraphPeriod.THREE_MONTHS, f.now().activePeriod)
+        f.answer(KEY_3M, quarter(S(X, quarterPts(1400.0)), S(Y, quarterPts(1380.0))))
+        assertEquals(GraphV2Content.READY, f.now().content)
+        assertTrue(f.now().fullscreenOpen)
+        f.holder.exitFullscreen(checkNotNull(f.now().fullscreenToken))
+        f.run()
+        assertFalse("the new fullscreen token closes it", f.now().fullscreenOpen)
+        assertNull(f.now().fullscreenToken)
+    }
+
+    /**
+     * 08 removal: a retired context, a deactivation, a closed protected admission, a use invalidation re-acquired at once and
+     * a focus that leaves and comes back still remove the fullscreen, and the screen published again for the same identity
+     * does not bring it back.
+     */
+    @Test fun H08r_aRetiredDeactivatedOrBlockedScreenDropsTheFullscreen() = holderTest {
+        val g = Fixture(this)
+        g.open()
+        g.answer(KEY_1D, fullDay())
+        g.holder.enterFullscreen(g.token())
+        g.run()
+        assertTrue(g.now().fullscreenOpen)
+        val next = TopicDisplayOwner(A, 2L)
+        g.display.value = TopicDisplayState.NONE.copy(owner = next)
+        g.holder.onContextChanged()
+        g.run()
+        g.holder.onActivated(next)
+        g.run()
+        assertNotNull("premise: the new owner's screen is published", g.now().inlineToken)
+        assertFalse("a retired context removes the fullscreen", g.now().fullscreenOpen)
+        assertNull(g.now().fullscreenToken)
+
+        val h = Fixture(this)
+        h.open()
+        h.answer(KEY_1D, fullDay())
+        h.holder.enterFullscreen(h.token())
+        h.run()
+        h.holder.onDeactivated()
+        h.run()
+        h.holder.onActivated(OWNER_A)
+        h.run()
+        assertNotNull("premise: the reactivated screen is published", h.now().inlineToken)
+        assertFalse("a deactivation removes the fullscreen", h.now().fullscreenOpen)
+        assertNull(h.now().fullscreenToken)
+
+        val k = Fixture(this)
+        k.open()
+        k.answer(KEY_1D, fullDay())
+        k.holder.enterFullscreen(k.token())
+        k.run()
+        k.protectedOpen = false
+        k.accessRevisions.value += 1
+        assertEquals(GraphV2Content.BLOCKED, k.now().content)
+        k.run()
+        assertEquals("still blocked once the revision is handled", GraphV2Content.BLOCKED, k.now().content)
+        k.protectedOpen = true
+        k.accessRevisions.value += 1
+        k.run()
+        assertNotNull("premise: the reopened screen is published", k.now().inlineToken)
+        assertFalse("a closed protected admission removes the fullscreen", k.now().fullscreenOpen)
+        assertNull(k.now().fullscreenToken)
+
+        val u = Fixture(this)
+        u.open()
+        u.answer(KEY_1D, fullDay())
+        u.holder.enterFullscreen(u.token())
+        u.run()
+        assertTrue(u.now().fullscreenOpen)
+        val before = u.token()
+        u.snapshot = snap(invalidations = 4L)
+        assertNull(u.now().fullscreenToken)
+        u.holder.onContextChanged()
+        u.run()
+        assertEquals("premise: the same owner re-acquired a new use", 4L, u.token().lifetime.invalidations)
+        assertEquals("premise: no reactivation was needed", before.owner, u.token().owner)
+        assertFalse("a use invalidation removes the fullscreen", u.now().fullscreenOpen)
+        assertNull(u.now().fullscreenToken)
+
+        val v = Fixture(this)
+        v.open()
+        v.answer(KEY_1D, fullDay())
+        v.holder.enterFullscreen(v.token())
+        v.run()
+        assertTrue(v.now().fullscreenOpen)
+        val shown = v.token()
+        v.focus.value = OwnedTopicFocus(A, FreeTab.JPY)
+        assertNull("the focus left the tab", v.now().inlineToken)
+        v.holder.onContextChanged()
+        v.run()
+        v.focus.value = OwnedTopicFocus(A, FreeTab.USD)
+        v.holder.onContextChanged()
+        v.run()
+        assertNotNull("premise: the same owner re-acquired the tab", v.now().inlineToken)
+        assertEquals("premise: no reactivation was needed", shown.owner, v.token().owner)
+        assertFalse("a focus that left and came back removes the fullscreen", v.now().fullscreenOpen)
+        assertNull(v.now().fullscreenToken)
     }
 
     // --- W03 / W03b / W10h: what the holder hands the shared builder and projection --------------------------------
