@@ -265,6 +265,7 @@ private fun envelopeError(
     for (indexed in component.series) {
         if (indexed.ordinal < 0 || !ordinals.add(indexed.ordinal)) return "Invalid or duplicate ordinal"
         val series = indexed.series
+        if (series.axisGroup == null) return "Missing series axis group"
         if (!ids.add(series.seriesId)) return "Duplicate series ID"
         if (series.seriesId.startsWith("krx.") != (kind == GraphV2DiskComponent.KRX)) {
             return "Series prefix does not match the component"

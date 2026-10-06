@@ -16,6 +16,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -28,11 +29,17 @@ import com.jay.fxi.ui.theme.SecondaryText
 
 private val TabBarBackground = Color(0xFF1A1A1A)
 
+internal object PeriodTabBarTags {
+    fun period(period: GraphPeriod): String = "period_tab:${period.code}"
+}
+
 @Composable
 fun PeriodTabBar(
     activePeriod: GraphPeriod,
     onSelectPeriod: (GraphPeriod) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    periods: List<GraphPeriod> = GraphPeriod.entries,
+    enabled: Boolean = true
 ) {
     Row(
         modifier = modifier
@@ -45,7 +52,7 @@ fun PeriodTabBar(
             .padding(4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        GraphPeriod.entries.forEach { period ->
+        periods.forEach { period ->
             val isActive = period == activePeriod
             val bgColor by animateColorAsState(
                 targetValue = if (isActive) InputBackground else Color.Transparent,
@@ -65,13 +72,14 @@ fun PeriodTabBar(
                 textAlign = TextAlign.Center,
                 modifier = Modifier
                     .weight(1f)
+                    .testTag(PeriodTabBarTags.period(period))
                     .clip(RoundedCornerShape(999.dp))
                     .background(bgColor)
                     // `selectable` rather than `clickable`: it is what tells a screen reader which
                     // period is the chosen one. Disabling the active tab conveys "unavailable"
                     // instead, which is the opposite of what is true. The guard keeps the original
                     // behaviour of not re-asking for a period that is already showing.
-                    .selectable(selected = isActive, role = Role.Tab) {
+                    .selectable(selected = isActive, enabled = enabled, role = Role.Tab) {
                         if (!isActive) onSelectPeriod(period)
                     }
                     .padding(vertical = 2.dp),

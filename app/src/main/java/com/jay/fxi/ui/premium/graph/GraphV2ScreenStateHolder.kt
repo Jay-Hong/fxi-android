@@ -53,7 +53,8 @@ internal data class GraphV2SeriesToggle(
     val seriesId: String,
     val style: GraphSeriesStyle,
     val selected: Boolean,
-    val enabled: Boolean
+    val enabled: Boolean,
+    val axisGroup: String
 )
 
 @ConsistentCopyVisibility
@@ -606,7 +607,8 @@ internal class GraphV2ScreenStateHolder(
         }
         val toggles = exposure?.graph?.series.orEmpty().map {
             GraphV2SeriesToggle(it.seriesId, GraphSeriesStyles.of(it.seriesId, it.label),
-                confirmed?.visibleSeriesIds?.contains(it.seriesId) == true, status == GraphV2SelectionStatus.READY)
+                confirmed?.visibleSeriesIds?.contains(it.seriesId) == true, status == GraphV2SelectionStatus.READY,
+                requireNotNull(it.axisGroup))
         }
         val content = when {
             activePeriod !in periods -> GraphV2Content.UNSUPPORTED

@@ -90,7 +90,8 @@ import org.junit.rules.TemporaryFolder
  * session. r2 adds W03c, H06d, H06e, BToken and two assertions (battery r1 survivors H06, H07, H14, H19, H23, H28). r3 adopts,
  * after independent review, Codex's r2 boundary probes as the L-rows (H02 and H22 among them); L7 expects the opposite of
  * the probe it came from: the same identity's new owner reads the pending save back once instead of waiting forever. r4: H07d
- * also forbids falling back to the first-check state while the uncertain save is confirmed (battery r3 survivor H37).
+ * also forbids falling back to the first-check state while the uncertain save is confirmed (battery r3 survivor H37). r5
+ * (with C1-2a): H07a also checks each toggle carries its protected series' axisGroup.
  *
  * Oracles: ANDROID_V2_PLAN.md :1286 (catalog periods per tab only, server X axis, insufficient history is a 200), :1288-1292
  * (protected reads only under the current access, KRX joined only under the current capability, visible and initialized saved
@@ -752,6 +753,8 @@ class GraphV2ScreenStateHolderTest {
         val toggles = f.now().toggles.associateBy { it.seriesId }
         assertEquals(setOf(X, fresh, DXY), toggles.keys)
         assertEquals(GraphSeriesStyles.of(fresh, fresh), toggles.getValue(fresh).style)
+        assertEquals("each toggle carries its series' axis", mapOf(X to "krw", fresh to "krw", DXY to "index"),
+            toggles.mapValues { it.value.axisGroup })
         assertTrue(toggles.values.all { it.enabled })
         assertEquals(mapOf(X to true, fresh to false, DXY to false), toggles.mapValues { it.value.selected })
         f.holder.toggleSeries(f.token(), fresh)

@@ -17,6 +17,7 @@ import kotlinx.datetime.Instant
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
@@ -30,7 +31,8 @@ import org.junit.Test
 
 /**
  * Claude-owned S4 B1a-1 contract r2 (r1 battery survivors R16·R24·R25·R26·R27 closed by stored-value fixtures): a validated server Graph V2 tab split into its general and KRX disk components,
- * encoded, decoded against the exact key, and joined back.
+ * encoded, decoded against the exact key, and joined back. r3 (C1-2a review): a stored series without its axis group is
+ * refused - the server never sends one, and the premium screen needs it for every toggle.
  *
  * Oracles: ANDROID_V2_PLAN.md S4 :1288-1294 (general key (uid, userAccessEpoch, tab, period); KRX series only under
  * (uid, userAccessEpoch, krxCapabilityEpoch, tab, period); only validated, filtered, namespace-separated server data on
@@ -223,6 +225,10 @@ class GraphV2DiskCodecTest {
         invalid("high under the rate", codec.decodeGeneral(bytes(editPoint(0) { it.with("high", JsonPrimitive(1380.0)) }), gkey, null))
         invalid("decimals out of range", codec.decodeGeneral(bytes(root.editSeries(0) { s ->
             s.edit("series") { it.with("decimals", JsonPrimitive(9)) } }), gkey, null))
+        invalid("axis group null", codec.decodeGeneral(bytes(root.editSeries(0) { s ->
+            s.edit("series") { it.with("axis_group", JsonNull) } }), gkey, null))
+        invalid("axis group null in the KRX component", codec.decodeKrx(bytes(obj(goodKrx).editSeries(0) { s ->
+            s.edit("series") { it.with("axis_group", JsonNull) } }), krxKey(), null))
         invalid("carry-in not before the points", codec.decodeGeneral(bytes(root.editSeries(0) { s ->
             s.edit("series") { ser -> ser.edit("carry_in") { it.with("observed_at", JsonPrimitive(t0.toString())) } } }), gkey, null))
         invalid("seed close above its high", codec.decodeGeneral(bytes(root.edit("component") { comp ->
