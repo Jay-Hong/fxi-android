@@ -64,6 +64,9 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import com.jay.fxi.data.local.TopicLastKnownRestore
+import com.jay.fxi.data.graph.GraphDataScope
+import com.jay.fxi.data.graph.GraphRecorderTopicSink
+import com.jay.fxi.data.graph.GraphTopicInputConsumer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -72,6 +75,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
@@ -14584,6 +14588,89 @@ class TopicSessionCoordinatorTest {
         assertTrue("GOBS-17 fixture: the failing sink lost them", failing.coordinator.graphLoss.value != null)
         assertTrue("GOBS-17 fixture: the silence asked a question", dormant.requests.size >= 2)
         dormant.cleanUp()
+    }
+
+    /** Takes whatever the real graph sink hands over; GOBS-20 looks only at whether it was called. */
+    private class SinkConsumer : GraphTopicInputConsumer {
+        val inputs = mutableListOf<TopicGraphInput>()
+        override fun observe(input: TopicGraphInput.Observations) { inputs += input }
+        override fun observe(input: TopicGraphInput.Continuity) { inputs += input }
+        override fun loseTopics(ownerScope: GraphDataScope, maxInvalidationsByTopic: Map<String, Long>) = Unit
+        override fun close() = Unit
+    }
+
+    /**
+     * F2b-2b T12: the real graph sink, drained as the trace runs or never drained so its 512 units fill, decides the same prices,
+     * deliveries, questions and wire traffic as the dormant sink, at every comparison point of GOBS-17's trace plus a flood of
+     * more than 512 candidates.
+     */
+    @Test
+    fun `GOBS-20 the real graph sink, draining or saturated, leaves the trace a dormant sink leaves`() = runTest {
+        val all = setOf(TETHER, USD, TopicCatalogue.DXY)
+        val dormant = Harness(this, desired = all)
+        val drained = SinkConsumer()
+        val drainScope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val draining = Harness(this, desired = all).also { it.graphSink = GraphRecorderTopicSink(drainScope, drained) }
+        val stuck = SinkConsumer()
+        // Its own scheduler, never advanced: the worker never runs and the queue only fills.
+        val stuckScope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(TestCoroutineScheduler()))
+        val saturated = Harness(this, desired = all).also { it.graphSink = GraphRecorderTopicSink(stuckScope, stuck) }
+        val hs = listOf(dormant, draining, saturated)
+        suspend fun step(millis: Long = 1, act: (Harness) -> Unit) {
+            hs.forEach(act)
+            advanceTimeBy(millis)
+        }
+        fun same(label: String) {
+            val expected = dormant.priceFingerprint()
+            assertEquals("GOBS-20 $label: draining", expected, draining.priceFingerprint())
+            assertEquals("GOBS-20 $label: saturated", expected, saturated.priceFingerprint())
+        }
+
+        step(100) { it.goLive() }
+        step { it.wire.open() }
+        step { it.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT2, changed = gT1)))) }
+        step { it.wire.deliver(it.ack("r1", active = all.toList())) }
+        step { it.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT3, changed = gT1), gEntry("bithumb", "usdt-krw", 0.0, gT3)))) }
+        step { it.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1380.0, gT0)))) }
+        step { it.wire.deliver(gDxy(98.5, gT1, "investing")) }
+        step { it.wire.deliver(gDxy(98.5, gT1, "investing")) }
+        same("socket")
+
+        hs.forEach { h ->
+            h.bootstrapOutcome = { _, topic ->
+                when (topic) {
+                    USD -> h.delivered(gFx(USD, listOf(gEntry("kb", "usd-krw", 1391.0, gT2))))
+                    TopicCatalogue.DXY -> h.delivered(gDxy(98.5, gT1, "investing"))
+                    else -> h.delivered(gTether(listOf(gEntry("upbit", "usdt-krw", 1370.0, gT0))))
+                }
+            }
+        }
+        step(100) { it.coordinator.requestBootstrap(USD) }
+        step(100) { it.coordinator.requestBootstrap(TopicCatalogue.DXY) }
+        step(100) { it.coordinator.requestBootstrap(TETHER) }
+        same("bootstrap")
+
+        step(46_000) { }
+        same("silence")
+        step { it.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1395.0, gT4)))) }
+        step(1_000) { }
+        same("after silence")
+
+        val flood = gTether(listOf("upbit", "bithumb", "coinone", "korbit", "gopax").map { gEntry(it, "usdt-krw", 1396.0, gT4) })
+        repeat(110) { step { it.wire.deliver(flood) } }
+        same("flood")
+
+        assertTrue("GOBS-20 fixture: the draining sink handed inputs over", drained.inputs.isNotEmpty())
+        assertTrue("GOBS-20 fixture: the saturated sink handed nothing over", stuck.inputs.isEmpty())
+        assertEquals(
+            "GOBS-20 fixture: the saturated sink refused as full",
+            setOf(TopicGraphOffer.FULL),
+            saturated.coordinator.graphLoss.value?.reasons
+        )
+        assertEquals("GOBS-20 fixture: the draining sink refused nothing", null, draining.coordinator.graphLoss.value)
+        hs.forEach { it.cleanUp() }
+        drainScope.cancel()
+        stuckScope.cancel()
     }
 
     @Test

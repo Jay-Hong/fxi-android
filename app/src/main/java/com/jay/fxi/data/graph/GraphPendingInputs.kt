@@ -48,7 +48,7 @@ internal fun offerGraphPendingInput(pending: GraphPendingInputs, input: TopicGra
 internal fun markGraphPendingLoss(pending: GraphPendingInputs, topics: Set<String>): GraphPendingInputs =
     GraphPendingInputs.markLoss(pending, topics)
 
-private fun TopicGraphInput.pendingUnits(): Int = when (this) {
+internal fun TopicGraphInput.pendingUnits(): Int = when (this) {
     is TopicGraphInput.Observations -> candidates.size
     is TopicGraphInput.Continuity -> 1
 }

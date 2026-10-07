@@ -42,7 +42,7 @@ import kotlinx.datetime.Instant
  *
  * Response callers must retain the original request, fence and lifetime. Binding a completion to
  * the recorder instance that issued it and a public catalog-adoption replay entry belong to F2d.
- * The topic sink, sending, timers and purge APIs belong to later slices.
+ * Sending, timers and purge APIs belong to later slices.
  */
 internal class GraphRecorder(
     private val scope: CoroutineScope,
@@ -52,7 +52,7 @@ internal class GraphRecorder(
     private val currentCatalog: () -> GraphCatalog?,
     private val gate: GraphV2AccessGate,
     private val clock: AppClock
-) {
+) : GraphTopicInputConsumer {
     private val mutableState = MutableStateFlow(GraphRecorderReducer.empty())
 
     /** Change notifications, tests and purge inspection only; consumers read data through [exposed]. */
@@ -78,7 +78,7 @@ internal class GraphRecorder(
         }
     }
 
-    fun observe(input: TopicGraphInput.Observations) {
+    override fun observe(input: TopicGraphInput.Observations) {
         if (closed) return
         val snapshot = accessSnapshot()
         val fence = currentAccessFence()
@@ -91,7 +91,7 @@ internal class GraphRecorder(
         )
     }
 
-    fun observe(input: TopicGraphInput.Continuity) {
+    override fun observe(input: TopicGraphInput.Continuity) {
         if (closed) return
         val snapshot = accessSnapshot()
         val fence = currentAccessFence()
@@ -106,7 +106,7 @@ internal class GraphRecorder(
      * value, then publishes once. The reducer checks the owner scope and user-end invalidation floor.
      * After [close], no suppliers are read and no work is performed.
      */
-    internal fun loseTopics(ownerScope: GraphDataScope, maxInvalidationsByTopic: Map<String, Long>) {
+    override fun loseTopics(ownerScope: GraphDataScope, maxInvalidationsByTopic: Map<String, Long>) {
         if (closed) return
         val snapshot = accessSnapshot()
         val fence = currentAccessFence()
@@ -181,7 +181,7 @@ internal class GraphRecorder(
         return if (gate.bind(fence, lifetime) != null) candidate else emptyMap()
     }
 
-    fun close() {
+    override fun close() {
         if (closed) return
         closed = true
         collector?.cancel()
