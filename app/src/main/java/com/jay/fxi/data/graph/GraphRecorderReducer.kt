@@ -119,6 +119,16 @@ internal object GraphRecorderReducer {
         return updated(state, series = series, pending = GraphPendingInputs.EMPTY, untransferredSeries = untransferred)
     }
 
+    /**
+     * Syncs access before handling an observation attributed to the held scope. An admitted input is
+     * adopted or held until the catalog arrives. A refused input, including one dropped for a missing
+     * current scope, records HANDOVER_LOSS over its mapped span on existing series, or a topic loss
+     * without times when the catalog is absent. It creates no series or deferred series marker.
+     *
+     * Losses below the snapshot's user-end invalidation floor are discarded; equality passes. Price
+     * adoption relies on the original capture's admission. Pending losses transfer only while the
+     * held scope is current, so a missing scope leaves earlier losses waiting.
+     */
     fun observe(
         state: GraphRecorderState,
         input: TopicGraphInput.Observations,
@@ -129,18 +139,20 @@ internal object GraphRecorderReducer {
         now: Instant
     ): GraphRecorderState {
         val synced = syncAccess(state, snapshot, fence)
-        if (snapshot.revision < state.seenRevision || !scopeContinues(synced, fence)) return synced
+        if (snapshot.revision < state.seenRevision) return synced
         val scope = synced.scope ?: return synced
         // Attribution precedes admission and loss handling: a foreign input belongs to neither path here.
         if (scopeOf(input.attribution.owner) != scope) return synced
-        val allowed = usable(synced, snapshot, fence, admission)
+        val current = scopeContinues(synced, fence)
+        val allowed = current && usable(synced, snapshot, fence, admission)
+        if (!allowed && input.attribution.lifetime.invalidations < snapshot.userEndInvalidationsFloor) return synced
         if (catalog == null) {
             val pending = if (allowed) offerGraphPendingInput(synced.pending, input)
             else markGraphPendingLoss(synced.pending, setOf(input.topic))
             return updated(synced, pending = pending)
         }
 
-        val ready = transferPendingLoss(synced, catalog, now)
+        val ready = if (current) transferPendingLoss(synced, catalog, now) else synced
         val observations = fxGraphObservations(scope, input, catalog) + dxyGraphObservations(scope, input, catalog)
         val series = ready.series.toMutableMap()
         val untransferred = ready.untransferredSeries.toMutableSet()
@@ -166,6 +178,12 @@ internal object GraphRecorderReducer {
         return updated(ready, series = series, untransferredSeries = untransferred)
     }
 
+    /**
+     * Syncs access and transfers eligible pending losses before handling a continuity fact. Only a
+     * DELIVERY_RESUMED from the held scope with an original lifetime at or above the snapshot's
+     * user-end invalidation floor is applied or held. It needs no admission and creates no series.
+     * Resumes wait in order while the catalog or current scope is absent, or earlier inputs are held.
+     */
     fun continuity(
         state: GraphRecorderState,
         input: TopicGraphInput.Continuity,
@@ -180,6 +198,8 @@ internal object GraphRecorderReducer {
         else synced
         val scope = ready.scope ?: return ready
         if (input.kind != TopicGraphEventKind.DELIVERY_RESUMED || scopeOf(input.authority.owner) != scope) return ready
+        val lifetime = input.authority.lifetime ?: return ready
+        if (lifetime.invalidations < snapshot.userEndInvalidationsFloor) return ready
         if (catalog == null || !scopeContinues(ready, fence) || ready.pending.inputs.isNotEmpty()) {
             return updated(ready, pending = offerGraphPendingInput(ready.pending, input))
         }
@@ -193,7 +213,37 @@ internal object GraphRecorderReducer {
         return updated(ready, series = series)
     }
 
-    /** Admissions correspond only to the Observations subsequence of the original holding. */
+    /**
+     * Syncs access before accepting topic losses from [ownerScope]. Each topic's maximum original
+     * lifetime invalidation count must meet the snapshot's user-end floor; equality passes. A stale
+     * snapshot or a foreign scope contributes no loss. Accepted topics carry no observation times.
+     *
+     * With a catalog, a current held scope and no held inputs, losses transfer over the recovery
+     * window to existing mapped series and wait in [GraphRecorderState.untransferredSeries] for
+     * absent ones. Otherwise they remain pending until replay can hand them over.
+     */
+    fun loseTopics(
+        state: GraphRecorderState,
+        ownerScope: GraphDataScope,
+        maxInvalidationsByTopic: Map<String, Long>,
+        catalog: GraphCatalog?,
+        snapshot: TopicAccessSnapshot,
+        fence: TopicSessionFence?,
+        now: Instant
+    ): GraphRecorderState {
+        val synced = syncAccess(state, snapshot, fence)
+        if (snapshot.revision < state.seenRevision || synced.scope != ownerScope) return synced
+        val topics = maxInvalidationsByTopic.filterValues { it >= snapshot.userEndInvalidationsFloor }.keys
+        if (topics.isEmpty()) return synced
+        val marked = updated(synced, pending = markGraphPendingLoss(synced.pending, topics))
+        return if (catalog != null && scopeContinues(marked, fence)) transferPendingLoss(marked, catalog, now) else marked
+    }
+
+    /**
+     * Replays held inputs in order under the same snapshot, applying its user-end floor through
+     * [observe] and [continuity], then transfers their time-free losses. Admissions correspond only
+     * to the Observations subsequence of the original holding. A missing current scope waits.
+     */
     fun replayPending(
         state: GraphRecorderState,
         catalog: GraphCatalog,

@@ -48,8 +48,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Claude-owned S4 F2a contract r3 (JVM; r2 plus F2c-1: the state's `untransferredSeries` in every whole-state comparison, and
- * O12 no longer pins a held input that F2c-1 now replays): the graph recorder's owner around the F1 reducer - one published state, mutations
+ * Claude-owned S4 F2a contract r4 (JVM; r2 plus F2c-1: the state's `untransferredSeries` in every whole-state comparison, and
+ * O12 no longer pins a held input that F2c-1 now replays; r4: F2b-2a turns O11 into row N1's loss): the graph recorder's owner around the F1 reducer - one published state, mutations
  * applied and published before they return, a control collector, a checked read, and close. Only faults the owner itself can
  * make are targeted here; the reducer's own rules stay locked by GraphRecorderReducerTest (F1).
  *
@@ -555,15 +555,27 @@ class GraphRecorderTest {
         assertEquals(7L, rig.state().seenRevision)
     }
 
-    /** O11: with no current fence and no new end, an input from the held scope is neither adopted nor lost; the sync is kept. */
-    @Test fun O11_aMissingFenceAdoptsAndLosesNothing() = recorderTest {
+    /**
+     * O11 (amended by F2b-2a for row N1): with no current fence and no new end, an input from the held scope is not adopted but
+     * lost like a refusal - HANDOVER_LOSS over its span on existing kb; the rest of the state, the sync included, is kept.
+     */
+    @Test fun O11_aMissingFenceAdoptsNothingAndLosesTheInput() = recorderTest {
         val rig = Rig(this).withKb()
         val held = whole(rig.state())
         rig.fence = null
         rig.snapshot = snap(2)
         rig.recorder.observe(batch(1343.0, kst("20:01:40")))
         val now = whole(rig.state())
-        assertEquals(held.copy(seenRevision = 2L), now)
+        assertEquals(held.copy(seenRevision = 2L, series = emptyMap()), now.copy(series = emptyMap()))
+        assertEquals(setOf(kb), now.series.keys)
+        val kbHeld = held.series.getValue(kb)
+        val kbNow = now.series.getValue(kb)
+        assertEquals(
+            "not adopted",
+            kbHeld.copy(demands = kbNow.demands, gaps = kbNow.gaps, generation = kbNow.generation),
+            kbNow
+        )
+        assertTrue(GraphRecoveryReason.HANDOVER_LOSS in kbNow.demands.getValue(b).reasons)
     }
 
     /** O12: every observe reads the catalog supplier: held while absent, mapped once present (the replay order is F2c-1's R7). */

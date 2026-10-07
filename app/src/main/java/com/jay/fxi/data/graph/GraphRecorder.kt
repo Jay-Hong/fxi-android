@@ -16,7 +16,8 @@ import kotlinx.coroutines.launch
 import kotlinx.datetime.Instant
 
 /**
- * Synchronous owner of the F1 reducer's state for one user session data scope.
+ * Synchronous process-lifetime owner of the graph recorder reducer's state. The reducer discards
+ * session data on user ends and data scope changes.
  *
  * The caller must serialize every method and the control collector on the same executor. The [gate]
  * and this owner must share the snapshot and current fence suppliers. Revisions only signal a fresh
@@ -24,9 +25,16 @@ import kotlinx.datetime.Instant
  *
  * Mutations work before [start]. Each reads its suppliers before binding the original input or
  * consumer, then calls the reducer even if admission is refused, and publishes only the final state
- * before returning. Observe and response application each read [clock] once.
- * Both observe paths replay held inputs in order before the new input, using the same suppliers and
- * clock value. Only observations bind their original captures; continuity facts need no admission.
+ * before returning. Observe, response application and [loseTopics] each read [clock] once.
+ * Both observe paths and [loseTopics] replay held inputs in order before the new input or loss,
+ * using the same suppliers and clock value. Only observations bind their original captures;
+ * continuity facts need no admission.
+ *
+ * An observation from the held data scope dropped for a missing current scope records a loss
+ * without adopting prices. Earlier pending losses wait until that scope is current again. The
+ * snapshot's user-end invalidation floor excludes pre-end observation losses, resumes and topic
+ * losses; equality passes. Price adoption relies on the original capture's admission. [loseTopics]
+ * takes each topic's maximum original lifetime invalidation count, preserving its owner scope.
  *
  * [exposed] computes a candidate before the consumer's final bind. This ordering provides no
  * atomicity inside the gate or after it returns. [close] empties the state immediately, cancels only
@@ -34,7 +42,7 @@ import kotlinx.datetime.Instant
  *
  * Response callers must retain the original request, fence and lifetime. Binding a completion to
  * the recorder instance that issued it and a public catalog-adoption replay entry belong to F2d.
- * Session acceptance, external loss consumption, sending, timers and purge APIs belong to later slices.
+ * The topic sink, sending, timers and purge APIs belong to later slices.
  */
 internal class GraphRecorder(
     private val scope: CoroutineScope,
@@ -91,6 +99,23 @@ internal class GraphRecorder(
         val now = clock.now()
         val next = replayPending(mutableState.value, catalog, snapshot, fence, now)
         mutableState.value = GraphRecorderReducer.continuity(next, input, catalog, snapshot, fence, now)
+    }
+
+    /**
+     * Replays held inputs before recording topic losses under the same supplier reads and clock
+     * value, then publishes once. The reducer checks the owner scope and user-end invalidation floor.
+     * After [close], no suppliers are read and no work is performed.
+     */
+    internal fun loseTopics(ownerScope: GraphDataScope, maxInvalidationsByTopic: Map<String, Long>) {
+        if (closed) return
+        val snapshot = accessSnapshot()
+        val fence = currentAccessFence()
+        val catalog = currentCatalog()
+        val now = clock.now()
+        val next = replayPending(mutableState.value, catalog, snapshot, fence, now)
+        mutableState.value = GraphRecorderReducer.loseTopics(
+            next, ownerScope, maxInvalidationsByTopic, catalog, snapshot, fence, now
+        )
     }
 
     /** Sync and replay remain local until the caller publishes its final transition. */

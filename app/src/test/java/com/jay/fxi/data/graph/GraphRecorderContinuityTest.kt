@@ -75,8 +75,12 @@ import org.junit.Test
  *    loss hand-over is attempted. Each call publishes at most one final state; close prevents further work and a regressed
  *    snapshot causes no state change or emission.
  *
- * Not here: consuming the sink's cumulative loss, dropping inputs on a null current fence as a loss (F2b, row N1), the public
- * replay entry for catalog adoption (F2d). The implementation thread reads but does not edit this file.
+ * F2b-2a (r4) adds rows L1-L7 at the end, with their own rules there: an input dropped for a missing current scope is a loss
+ * (row N1), the issuer's user-end floor keeps pre-end inputs and losses out of a later lifetime, and `loseTopics` takes a loss
+ * by topic. O11 in GraphRecorderTest is amended with them.
+ *
+ * Not here: the sink, its queue and its own refusal ledger (F2b-2b), the public replay entry for catalog adoption (F2d). The
+ * implementation thread reads but does not edit this file.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphRecorderContinuityTest {
@@ -114,7 +118,7 @@ class GraphRecorderContinuityTest {
         return (0..144).mapTo(linkedSetOf()) { Instant.fromEpochSeconds(current.epochSeconds - it * 600L) }
     }
 
-    private fun snap(revision: Long, userEnd: Long? = null, invalidations: Long = 3L) = TopicAccessSnapshot(
+    private fun snap(revision: Long, userEnd: Long? = null, invalidations: Long = 3L, floor: Long = 0L) = TopicAccessSnapshot(
         revision = revision,
         facts = TopicAccessFacts.NONE.copy(
             token = grant,
@@ -124,6 +128,7 @@ class GraphRecorderContinuityTest {
             capabilityBlocks = emptySet()
         ),
         userInvalidations = invalidations,
+        userEndInvalidationsFloor = floor,
         lastUserEnd = userEnd?.let {
             TopicAccessEnd(it, TopicAccessEndReason.AUTHORITATIVE_LOSS, EntitlementsIdentity("u1", 1L), "u1", "e1")
         },
@@ -551,5 +556,225 @@ class GraphRecorderContinuityTest {
         assertTrue(lossOnly.state().pending.lostTopics.isEmpty())
         window(noon).forEach { assertTrue("$it", GraphRecoveryReason.HANDOVER_LOSS in lossOnly.reasonsAt(kb, it)) }
         assertEquals(setOf("investing.usd", "hana.usd"), lossOnly.state().untransferredSeries)
+    }
+
+    // === F2b-2a: an input dropped for a missing current scope (N1), the user-end floor, and losses handed in by topic ========
+    //
+    // Rules (F2b design r2/r3 and f2b_review_claude.r1/r2):
+    //  - N1: with a fresh snapshot, no current scope (a null fence or a fence without an epoch), a held scope and an input
+    //    from it, the observation is not adopted and is lost exactly like a refusal in a continuing scope: HANDOVER_LOSS over
+    //    the batch's observed span on each existing mapped series, the topic as a loss without times when there is no
+    //    catalog, nothing for a series that does not exist. No pending loss is handed over on this path; that waits for a
+    //    current scope as in F2c-1.
+    //  - The floor: an input whose original lifetime carries fewer invalidations than the snapshot's
+    //    `userEndInvalidationsFloor` is neither a loss (refusal, N1, no catalog) nor a resume (applied or held), and a loss
+    //    handed in by topic below it is dropped. Equal passes. Price adoption needs no floor: the gate admits a lifetime
+    //    only at the current count, which an end has already moved past the floor.
+    //  - `loseTopics(ownerScope, maxInvalidationsByTopic)`: access sync first (an older snapshot changes nothing); another
+    //    scope than the held one changes nothing; the topics at or above the floor become a loss without times, handed over
+    //    at once when the catalog is there, the held scope is current and nothing is held, otherwise kept until the replay
+    //    hands it over. F2a's owner rules apply to it.
+
+    /** kb from a pre-end (L3) quote, then user end 1 pins floor 4: the end discards it and a post-end (L4) quote re-creates kb. */
+    private fun Rig.afterEnd(): Rig = withKb().apply {
+        snapshot = snap(2, userEnd = 1L, invalidations = 4L, floor = 4L)
+        recorder.observe(kbAt(1342.0, "20:01:10", lifetime = l4))
+        assertEquals(
+            "premise: only the post-end price",
+            setOf(GraphObservationId("kb", "usd-krw", kst("20:01:10"), 1342.0)),
+            series(kb).data.app.observations
+        )
+    }
+
+    /** L1 (N1, existing series): dropped for a missing scope, the batch's bucket keeps a loss, also after the fence is back. */
+    @Test fun L1_anInputDroppedForAMissingScopeIsALoss() = recorderTest {
+        for (missing in listOf<TopicSessionFence?>(null, TopicSessionFence(identity, null, grant))) {
+            val rig = Rig(this).withKb()
+            val pricesBefore = prices(rig.series(kb))
+            rig.fence = missing
+            rig.snapshot = snap(2)
+            rig.recorder.observe(kbAt(1343.0, "20:01:40"))
+            assertEquals("$missing: not adopted", pricesBefore, prices(rig.series(kb)))
+            assertTrue("$missing", GraphRecoveryReason.HANDOVER_LOSS in rig.reasonsAt(kb, b))
+            assertEquals("$missing: the scope is kept", scopeN, rig.state().scope)
+
+            rig.fence = fenceN
+            rig.snapshot = snap(3)
+            rig.recorder.observe(kbAt(1344.0, "20:02:10"))
+            assertTrue("$missing: kept with no resume", GraphRecoveryReason.HANDOVER_LOSS in rig.reasonsAt(kb, b))
+            assertTrue(GraphObservationId("kb", "usd-krw", kst("20:02:10"), 1344.0) in rig.series(kb).data.app.observations)
+        }
+    }
+
+    /**
+     * L2 (N1, no catalog or a waiting loss): without a catalog the topic is a loss without times, handed over only once the scope is
+     * current again; with a catalog and an earlier loss waiting, the new batch marks only its own span and the wait goes on.
+     */
+    @Test fun L2_aDroppedInputWaitsForTheScopeBeforeAnyHandOver() = recorderTest {
+        val rig = Rig(this).withKb()
+        rig.recorder.start()
+        runCurrent()
+        val kbBefore = fingerprint(rig.series(kb))
+        rig.catalogNow = null
+        rig.fence = null
+        rig.snapshot = snap(2)
+        rig.recorder.observe(kbAt(1343.0, "20:01:40"))
+        assertEquals(setOf("fx:usd-krw"), rig.state().pending.lostTopics)
+        assertTrue("not held", rig.state().pending.inputs.isEmpty())
+        assertEquals(kbBefore, fingerprint(rig.series(kb)))
+
+        rig.catalogNow = catalog
+        rig.fence = fenceN
+        rig.publish(snap(3))
+        runCurrent()
+        assertTrue(rig.state().pending.lostTopics.isEmpty())
+        window(noon).forEach { assertTrue("$it", GraphRecoveryReason.HANDOVER_LOSS in rig.reasonsAt(kb, it)) }
+
+        val waiting = Rig(this).withLostTopic()
+        waiting.fence = null
+        waiting.snapshot = snap(2)
+        waiting.recorder.observe(kbAt(1343.5, "20:01:50"))
+        assertEquals("the earlier loss still waits", setOf("fx:usd-krw"), waiting.state().pending.lostTopics)
+        assertEquals("only the batch's bucket", setOf(GraphRecoveryReason.INITIAL_SYNC, GraphRecoveryReason.HANDOVER_LOSS), waiting.reasonsAt(kb, b))
+        assertTrue(waiting.reasonsAt(kb, a).isEmpty())
+    }
+
+    /** L3 (N1, nothing to lose): another scope's input or a series that does not exist leaves no loss. */
+    @Test fun L3_aMissingScopeLosesNothingThatIsNotOurs() = recorderTest {
+        val rig = Rig(this).withKb()
+        val held = whole(rig.state()).copy(seenRevision = 2L)
+        rig.fence = null
+        rig.snapshot = snap(2)
+        rig.recorder.observe(fx(quote("kb", 1343.0, kst("20:01:40")), owner = fenceN2))
+        assertEquals("another scope", held, whole(rig.state()))
+        rig.recorder.observe(fx(quote("hana", 1342.5, kst("20:01:45"))))
+        assertEquals("a series that does not exist", held, whole(rig.state()))
+    }
+
+    /**
+     * L4 (the floor on observations): after the end, a pre-end (L3) input is no loss - refused into the re-created kb, without a
+     * catalog, or with no current scope - while a post-end (L4) one at the floor is, also after a later hold raised the count.
+     */
+    @Test fun L4_anInputFromBeforeTheEndIsNoLoss() = recorderTest {
+        Rig(this).afterEnd().let { rig ->
+            val kbBefore = fingerprint(rig.series(kb))
+            rig.recorder.observe(kbAt(1343.0, "20:01:40"))
+            assertEquals("refused into kb", kbBefore, fingerprint(rig.series(kb)))
+            rig.catalogNow = null
+            rig.recorder.observe(kbAt(1343.1, "20:01:41"))
+            assertTrue("no catalog", rig.state().pending.lostTopics.isEmpty())
+            rig.catalogNow = catalog
+            rig.fence = null
+            rig.recorder.observe(kbAt(1343.2, "20:01:42"))
+            assertEquals("no current scope", kbBefore, fingerprint(rig.series(kb)))
+        }
+        Rig(this).afterEnd().let { rig ->
+            rig.protectedOpen = false
+            rig.recorder.observe(kbAt(1343.5, "20:01:50", lifetime = l4))
+            assertTrue("at the floor", GraphRecoveryReason.HANDOVER_LOSS in rig.reasonsAt(kb, b))
+        }
+        Rig(this).afterEnd().let { rig ->
+            rig.snapshot = snap(3, userEnd = 1L, invalidations = 5L, floor = 4L)
+            rig.fence = null
+            rig.recorder.observe(kbAt(1344.0, "20:01:55", lifetime = l4))
+            assertTrue("a hold after the end keeps the loss", GraphRecoveryReason.HANDOVER_LOSS in rig.reasonsAt(kb, b))
+        }
+    }
+
+    /** L5 (the floor on resumes): a pre-end resume is neither applied nor held; a post-end one marks the window. */
+    @Test fun L5_aResumeFromBeforeTheEndIsNothing() = recorderTest {
+        Rig(this).afterEnd().let { rig ->
+            val kbBefore = fingerprint(rig.series(kb))
+            rig.recorder.observe(resumed(lifetime = l3))
+            assertEquals("not applied", kbBefore, fingerprint(rig.series(kb)))
+            rig.catalogNow = null
+            rig.recorder.observe(resumed(lifetime = l3))
+            assertTrue("not held", rig.state().pending.inputs.isEmpty())
+        }
+        Rig(this).afterEnd().let { rig ->
+            rig.recorder.observe(resumed(lifetime = l4))
+            window(noon).forEach { assertTrue("$it", GraphRecoveryReason.RECEIVE_GAP in rig.reasonsAt(kb, it)) }
+        }
+    }
+
+    /**
+     * L6 (`loseTopics`): handed over at once onto kb with the rest waiting for creation; kept with no current scope and handed over
+     * when it returns; nothing for another scope, below the floor, or from an older snapshot.
+     */
+    @Test fun L6_aLossHandedInByTopic() = recorderTest {
+        Rig(this).withKb().let { rig ->
+            rig.recorder.loseTopics(scopeN, mapOf("fx:usd-krw" to 3L))
+            window(noon).forEach { assertTrue("$it", GraphRecoveryReason.HANDOVER_LOSS in rig.reasonsAt(kb, it)) }
+            assertTrue(rig.state().pending.lostTopics.isEmpty())
+            assertEquals(setOf("investing.usd", "hana.usd"), rig.state().untransferredSeries)
+        }
+        Rig(this).withKb().let { rig ->
+            rig.recorder.start()
+            runCurrent()
+            val kbBefore = fingerprint(rig.series(kb))
+            rig.fence = null
+            rig.recorder.loseTopics(scopeN, mapOf("fx:usd-krw" to 3L))
+            assertEquals(setOf("fx:usd-krw"), rig.state().pending.lostTopics)
+            assertEquals(kbBefore, fingerprint(rig.series(kb)))
+            rig.fence = fenceN
+            rig.publish(snap(2))
+            runCurrent()
+            window(noon).forEach { assertTrue("$it", GraphRecoveryReason.HANDOVER_LOSS in rig.reasonsAt(kb, it)) }
+        }
+        Rig(this).withKb().let { rig ->
+            val held = whole(rig.state())
+            rig.recorder.loseTopics(scopeN2, mapOf("fx:usd-krw" to 3L))
+            assertEquals("another scope", held, whole(rig.state()))
+        }
+        Rig(this).afterEnd().let { rig ->
+            val held = whole(rig.state())
+            rig.recorder.loseTopics(scopeN, mapOf("fx:usd-krw" to 3L))
+            assertEquals("below the floor", held, whole(rig.state()))
+            rig.recorder.loseTopics(scopeN, mapOf("fx:usd-krw" to 4L))
+            window(noon).forEach { assertTrue("at the floor $it", GraphRecoveryReason.HANDOVER_LOSS in rig.reasonsAt(kb, it)) }
+        }
+        Rig(this).withKb().let { rig ->
+            rig.snapshot = snap(5)
+            rig.recorder.observe(kbAt(1341.8, "20:01:10"))
+            rig.snapshot = snap(4)
+            rig.record()
+            val emitted = rig.emissions.size
+            val before = rig.state()
+            rig.recorder.loseTopics(scopeN, mapOf("fx:usd-krw" to 3L))
+            assertSame("an older snapshot", before, rig.state())
+            assertEquals(emitted, rig.emissions.size)
+        }
+    }
+
+    /** L7: F2a's owner rules on `loseTopics` - held inputs replay first, one clock read, one publication, nothing read after close. */
+    @Test fun L7_ownerRulesHoldOnLoseTopics() = recorderTest {
+        Rig(this).let { rig ->
+            rig.catalogNow = null
+            rig.recorder.observe(kbAt(1341.7, "20:01:00"))
+            assertEquals("premise: held", 1, rig.state().pending.inputs.size)
+            rig.catalogNow = catalog
+            rig.record()
+            val emitted = rig.emissions.size
+            rig.recorder.loseTopics(scopeN, mapOf("fx:usd-krw" to 3L))
+            assertEquals("replay and loss publish once", emitted + 1, rig.emissions.size)
+            assertTrue("held inputs replay first", rig.state().pending.inputs.isEmpty())
+            window(noon).forEach { assertTrue("$it", GraphRecoveryReason.HANDOVER_LOSS in rig.reasonsAt(kb, it)) }
+        }
+        Rig(this).withKb().let { rig ->
+            rig.record()
+            val emitted = rig.emissions.size
+            val reads = rig.clockReads
+            rig.recorder.loseTopics(scopeN, mapOf("fx:usd-krw" to 3L))
+            assertEquals("one clock read", reads + 1, rig.clockReads)
+            assertEquals("one publication", emitted + 1, rig.emissions.size)
+        }
+        Rig(this).withKb().let { rig ->
+            rig.recorder.close()
+            val reads = rig.snapshotReads
+            val closed = rig.state()
+            rig.recorder.loseTopics(scopeN, mapOf("fx:usd-krw" to 3L))
+            assertEquals("nothing is read after close", reads, rig.snapshotReads)
+            assertSame(closed, rig.state())
+        }
     }
 }
