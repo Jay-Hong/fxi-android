@@ -31,11 +31,11 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 관찰했다. topic 줄 문구는 운영에서 자연 발생하지 않아 기기 미수집이다.
                                 S3 그래프 관측 인계는 GObs-1(`ffda7b9`, 후보)·2a(`4233c4a`, 권위·재개)·2b-1(`c30d615`,
                                 전달 중단)·2b-2(`b5e6501`, ACK·인증)로 연결했다(JVM 계약, dormant sink, 운영 배선 없음).
-                                S4 Graph V2(FX)는 A1(`0265bdf`)부터 F2e(`169259c`)까지 구현·테스트·정리 commit 40개로
+                                S4 Graph V2(FX)는 A1(`0265bdf`)부터 RT03a(`543b897`)까지 구현·테스트·정리 commit 41개로
                                 요청·디스크·선택·화면·1일 live 봉 모델·관측 어댑터·live projection·발행·표면 가시성·
                                 기록기 보존·폐기·연속성 reducer와 owner·topic sink·요청 복구 인계·holder 검증 읽기·메모리 purge
-                                대상을 쌓고 도달 불가 v1 graph 코드를 지웠다(JVM·에뮬레이터 계측 계약, 운영 배선 없음). 남은 단위는
-                                F2 runtime이다(G의 §9.1 migration 포함, S4 '진행' 항목).
+                                대상·graph REST 송신 guard를 쌓고 도달 불가 v1 graph 코드를 지웠다(JVM·에뮬레이터 계측 계약, 운영 배선
+                                없음). 남은 단위는 F2 runtime 나머지다(G의 §9.1 migration 포함, S4 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -45,9 +45,10 @@ S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반�
                                 PushDelete는 **서버 D21 순서 계약 미결**, backup은 기존 사용자 설정의 restore 동작
                                 변경을 분리한 것. 이 기록은 완료 선언도, 후속 슬라이스로의 이관 승인도 아니다.
                                 명시적 거부 저장 실패의 S1 잔여 S1r-1·S1r-2b·S1r-2a·S1r-2c는 모두 land했다.
-                                봉인·재확인 요구·손실 후보 보류의 process death 지속은 미충족이고, 14번이 더한
-                                선행 복구 의도 저장·미정산 namespace 은퇴도 아직 구현되지 않았다
-                                (동결 후 8·9·10·13·14·15번 기록)
+                                봉인·재확인 요구·손실 후보 보류의 process death 지속과 14번이 더한 선행 복구 의도
+                                저장·미정산 namespace 은퇴는 미충족이다 — P2·P3의 저장·복구 모델은 미배선으로 land했고
+                                운영 활성화는 P3-i다(동결 후 8·9·10·13·14·15·17번 기록). P3-i 전 그래프 runtime의
+                                S1 게이트 범위는 18번이 정한다
 S1.5 확인 필요                : presenter·순서/표시 설정·legacy bank store 삭제는 land. `RateSourceRegistry`와
                                 live/snapshot renderMode 등가까지 포함한 전체 DoD 충족은 미확인
 S2 미충족                     : D26 무료 알림 in-memory 미리보기 미구현 · 마지막 탭은 `(owner_uid, last_tab)` 한 쌍이라
@@ -60,7 +61,7 @@ Android public rollout        : BLOCKED by SV-1 / SV-2 production 배포·검증
 iOS common server gate        : SV-1 / SV-2
 Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 전달 신뢰성 hardening(DEFERRED) · SV-4 cross-device 계정삭제 hardening
 작성                          : 2026-08-29
-최종 보정                     : 2026-09-17
+최종 보정                     : 2026-10-07
 ```
 
 > **`Plan approval`은 구현 착수 승인이 아니다.** 계획을 기준으로 채택했을 뿐이고, 각 슬라이스 착수에는 별도 GO가 필요하다.
@@ -324,6 +325,12 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > P3-i 전까지 운영 purger는 placeholder로 유지한다. R4와 S10의 앞 단계는 각각 준비·소비자 전환과 phase·허가 생산자 준비이며, 실제 purge를 요구하는 최종 DoD 완료가 아니다. S3·S4·S7의 각 cutover는 소비자와 로컬 상태를 바꾸므로 그 단계마다 현재 동작 변화·회귀 0을 별도로 검증한다. 앞 단계의 회귀 검증은 실제 purger를 포함한 최종 DoD 검증을 대신하지 않는다.
 > **P3-i 활성화 필수 시험:** 실제 구버전 저장소에서 시작해 첫 실행·중단·재시작·fresh 서버 승인까지 검증한다. 일곱 키 부재와 기존 4필드 journal의 원문·순서 보존, 두 축 은퇴의 중복 방지, 대상별 삭제·호환 확인과 인계 정산, UID 원본 선호 보존, 미완료 의무에서 protected 사용 0, 정산 확인 뒤 시작한 fresh 승인에서만 재개방을 입증한다. 첫 설치·UID 없음·UID 변경, 미해석 또는 손상된 제어 상태와 저장 실패도 기존 차단·복구 계약대로 시험한다. 이 시험이나 적용 가능한 USER 의무의 정산 경로가 미충족이면 P3-i를 활성화하지 않는다.
 > **유형 판정:** 2형 명시적 개정이다. P3-i의 선행 순서와 R4·S10의 준비/최종 완료 판정을 바꾸기 때문이다. 새 D-결정은 만들지 않고 §9.1의 삭제 소유권, 기존 슬라이스 DoD와 release gate를 완화하지 않는다. 이 기록 자체는 구현·배선·arming·rollout·deploy를 열지 않는다.
+>
+> **동결 후 18번 명시적 개정 기록(2026-10-07, 사용자 결정 위임에 따른 Claude·Codex 설계 합의).** 그래프 runtime 배선 앞의 S1 잔여 게이트를 17번의 활성화 순서와 맞춘다.
+> 8번은 S1 잔여에 봉인의 process death 지속과 실제 purger를 넣고 7번의 선행조건을 완화하지 않는다고 적었다. 9·10·13번은 재확인 요구·손실 후보 보류의 process death 지속도 미충족으로 남겼으며, S4 문단은 그 계약의 확정·검증을 그래프 runtime 배선의 선행조건으로 둔다. 그런데 17번은 지속 writer·재시작 복원·실제 purger·protected admission을 P3-i에서 함께 활성화하고 S4 소비자 cutover를 그보다 앞에 두며, G의 migration은 F2 runtime과 같은 변경 세트다. 두 문언을 그대로 지키면 F2 runtime도 P3-i도 시작할 수 없다.
+> **개정:** P3-i 전 그래프 runtime에 한해 다음 한시적 순서 예외를 둔다. 그래프 runtime 배선의 선행조건은 (1) 프로세스 안 봉인·재확인 요구·P4 보류·`CONTEXT_UNCERTAIN` 계약을 실제 issuer로 구동해 그래프의 protected read/render·가격 채택·실제 송신·옛 완료 적용이 0임을 확인한 통합 계약 — USER 종료·명시적 손실은 폐기된 자료·pending·옛 완료가 부활하지 않고, 종료 없는 P4 보류는 자료와 복구 요구를 보존하되 사용 0이며 해제 뒤 fresh lifetime의 정당한 사용은 허용하고, CAPABILITY만 차단되면 KRX 사용만 막는다(보류 해소를 위한 제어 조회·재검증은 금지하지 않는다), (2) 실제 purger 설계(purger 설계 v3 final, AGREE_DESIGN), (3) 7번 대조 기록이다. process death 지속 저장·선행 의도·미정산 namespace 은퇴·실제 purger의 운영 활성화는 17번대로 P3-i가 맡는다. 이 예외는 8·14·16번의 지속성 계약이나 S1·S4 최종 DoD를 충족했다고 선언하지 않는다. S4 상위 설계 r1의 "F2 연결은 P3-i 뒤" 순서는 이 개정으로 대체된다.
+> **수용하는 잔여 위험(P3-i 전):** 봉인·손실 후보 보류·재확인 요구는 프로세스 메모리에 있다. 명시적 손실의 회전 저장이 실패한 뒤나 미해결 P4 보류 중에 process death가 나면 재시작에서 그 차단 근거를 잃을 수 있고, 옛 epoch가 유지된 채 fresh 승인이 다시 허용되면 그 namespace의 디스크 자료가 재사용될 수 있다. S3 last-known 복원도 C4에서 같은 계열의 조건으로 운영 주입됐지만, 그것만으로 그래프의 재개방 조건이 같다고 입증되지는 않는다. 공개 arming은 D24대로 계속 차단하며 P3-i 전에는 열지 않는다.
+> **유형 판정:** 2형 명시적 개정이다. 그래프 runtime 선행 게이트의 범위를 좁히고 17번과의 모순을 정리하기 때문이다. 새 D-결정은 만들지 않고 §9.1의 삭제 소유권, 슬라이스 DoD와 release gate를 완화하지 않는다. 이 기록 자체는 구현·배선·arming·rollout·deploy를 열지 않는다.
 
 ---
 
@@ -1342,7 +1349,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
     `krx_visible=false`·`krx_entitlement_required`는 KRX만, Resolving·Pending(noGrant)·DeletionPending은 protected read/render·요청 0).
     명시적 철회의 epoch 저장이 실패하거나 결과가 미확정이면 일시 공백으로 취급하지 않으며 해당 범위의 read/render·관측 채택·
     신규 요청·재시도·지연 완료 적용을 봉인한다. 영속 정리는 I4의 persist→cancel/purge→journal 완료 순서를 유지하고, 인계 완료를
-    실제 purge 완료로 보고하지 않는다. 이 봉인·재승인·정리 재개 계약은 S1 잔여에서 확정·검증하며 그래프 runtime 배선의 선행조건이다
+    실제 purge 완료로 보고하지 않는다. 이 봉인·재승인·정리 재개 계약은 S1 잔여에서 확정·검증하며 그래프 runtime 배선의 선행조건이다(P3-i 전 범위는 동결 후 18번)
   - **복귀 직후** 출처 없는 누적·tip을 무효화하고 첫 발행 전에 한 직렬 실행자에서 재구성한다. REST 대기 중에도 수집을 계속한다
   - rollover 10초 tick, foreground 복귀(≥60초, 30초 cooldown)·WS 재연결 시 resync(첫 연결 제외). 실행·복귀·재연결로 생긴 복구
     요구는 ≥60초 조건·TTL·첫 연결 제외로 소멸하지 않고, 첫 연결 중복 요청을 생략할 때도 초기 요청 담당자가 실패·부분 응답
@@ -1433,8 +1440,12 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   모든 epoch를 정리하고, 현재 fence가 선택된 scope면 Failed. 완료 범위는 기록기 상태·sink 큐와 장부·등록된 복구
   capture이고, 진행 중 요청이 붙잡은 해제 등록·coordinator entries와 protected slots·화면 발행·topic 세션 graph loss
   기록은 runtime 정리 몫이다. 세 보유처의 같은 조립·실행자는 RT01에서 확인한다.
-  F2 dormant는 F2e로 끝났다. 다음은 runtime 배선이다(F2 설계 합의 r2). runtime
-  앞에 S1 잔여(봉인·재승인·정리 재개)와 동결 후 7번 대조를 게이트로 둔다(F1 설계 합의 r2). T25는 공용 GraphChart 회귀만 C2b-2에서 확인했고 나머지는 F2에 남는다.
+  F2 dormant는 F2e로 끝났다. 다음은 runtime 배선이다(F2 설계 합의 r2).
+  · RT03a `543b897` graph REST 송신 guard(운영 `GraphV2Fetching` 구현이 호출자의 owner·guard를 그대로 넘기고, graph 두
+  client 메서드가 guard를 transport에 전달해 첫 송신·replay·OkHttp 반복을 송신 전에 거절, coordinator는 필수
+  protectedAdmission을 use 검사마다 읽고 보류 증거의 Retry-After를 원순서로 공유 하한에 반영. 운영 생성 없음).
+  runtime 앞에 S1 잔여(봉인·재승인·정리 재개)와 동결 후 7번 대조를 게이트로 둔다(F1 설계 합의 r2) — P3-i 전 S1
+  잔여의 범위는 18번(실제 issuer 그래프 통합 계약·실제 purger 설계·7번 대조). T25는 공용 GraphChart 회귀만 C2b-2에서 확인했고 나머지는 F2에 남는다.
   실제 purger를 포함한 S4 최종 DoD 재검증은 P3-i 활성화 뒤에 하고, F2에서는 placeholder purger 아래 회귀 0만 본다.
 
 ### S5 — 테더 탭
