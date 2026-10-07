@@ -283,6 +283,7 @@ class GraphV2RecoveryRequestContractTest {
                 currentAccessFence = { fence },
                 uses = uses,
                 protectedAdmission = { true },
+                accessSnapshot = { TopicAccessSnapshot(1L, TopicAccessFacts.NONE, invalidations, null, null) },
                 scope = scope,
                 clock = clock,
                 rateLimitJitter = { Duration.ZERO },

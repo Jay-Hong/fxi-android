@@ -4,6 +4,7 @@ import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.AuthUnavailableException
+import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.free.FreeSnapshotSchedulePolicy
 import com.jay.fxi.data.remote.AuthenticatedApiException
 import com.jay.fxi.data.remote.AuthenticatedBodyDecodingException
@@ -85,6 +86,11 @@ internal data class GraphRequestState(
  *
  * @param protectedAdmission Live admission supplier consulted at each otherwise-admitted use check.
  * It is also invoked on transport threads and must be thread-safe, non-blocking and side-effect free.
+ * @param accessSnapshot Lock-free, live read of the issuer's published topic access snapshot; use
+ * the same supplier function object as the gate and recorder. A new USER end retires request,
+ * write and seed ownership and clears entries, protected slots, catalog and failures even within
+ * the same data scope. Duplicate ends do not discard again; context changes without a new end
+ * retain same-scope entries and protected slots.
  * @param recorder Optional, immutable owner that captures recovery for existing one-day requests,
  * applies their successful responses synchronously and replays held inputs after catalog publication.
  */
@@ -95,6 +101,7 @@ internal class GraphV2RequestCoordinator(
     private val currentAccessFence: () -> TopicSessionFence?,
     private val uses: TopicUseAuthority,
     private val protectedAdmission: () -> Boolean,
+    private val accessSnapshot: () -> TopicAccessSnapshot,
     private val scope: CoroutineScope,
     private val clock: AppClock,
     /** Stable, finite and non-negative for each tab. */
@@ -251,6 +258,7 @@ internal class GraphV2RequestCoordinator(
     @Volatile private var protectedPublication = ProtectedPublication(null, emptyMap())
 
     // Loop-confined. The transport guard never reads these maps or the active key.
+    private var seenUserEnd = accessSnapshot().lastUserEnd?.sequence ?: 0L
     private var snapshot = GraphRequestState()
     private var protectedSlots: Map<GraphKey, ProtectedSlot> = emptyMap()
     private var capabilityConfiguration: GraphV2CapabilityConfiguration? = null
@@ -586,7 +594,10 @@ internal class GraphV2RequestCoordinator(
         val next = if (identityMatches && dataScope != null) {
             uses.acquire(fence!!)?.let { RequestContext(fence, it) }
         } else null
-        val scopeChanged = snapshot.dataScope != dataScope
+        val userEnd = accessSnapshot().lastUserEnd?.sequence ?: 0L
+        val ended = userEnd > seenUserEnd
+        seenUserEnd = maxOf(seenUserEnd, userEnd)
+        val scopeChanged = snapshot.dataScope != dataScope || ended
         if (!scopeChanged && context == next) return false
 
         cancelActiveDemand()

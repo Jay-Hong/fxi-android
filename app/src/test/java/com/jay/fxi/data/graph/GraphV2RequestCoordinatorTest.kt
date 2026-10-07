@@ -5,6 +5,10 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.AuthUnavailableException
 import com.jay.fxi.data.auth.HttpExchangeEvidence
+import com.jay.fxi.data.entitlements.TopicAccessEnd
+import com.jay.fxi.data.entitlements.TopicAccessEndReason
+import com.jay.fxi.data.entitlements.TopicAccessFacts
+import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.remote.AuthenticatedBodyDecodingException
 import com.jay.fxi.data.remote.AuthenticatedFailureKind
 import com.jay.fxi.data.remote.AuthenticatedHttpFailure
@@ -115,6 +119,8 @@ class GraphV2RequestCoordinatorTest {
         /** The protected-admission supplier the coordinator reads on every use check (S4 RT03a). */
         var protectedOpen = true
         var invalidations = 0L
+        /** The issuer's latest user end the coordinator reads (S4 RT01-A1); null before any end. */
+        var userEnd: Long? = null
         var skew: Duration = Duration.ZERO
         var captureGate: CompletableDeferred<Unit>? = null
         /** The live credential session when it differs from the access fence (the fence can lag behind it). */
@@ -181,6 +187,12 @@ class GraphV2RequestCoordinatorTest {
             currentAccessFence = { fence },
             uses = uses,
             protectedAdmission = { protectedOpen },
+            accessSnapshot = {
+                TopicAccessSnapshot(
+                    0L, TopicAccessFacts.NONE, invalidations,
+                    userEnd?.let { TopicAccessEnd(it, TopicAccessEndReason.IDENTITY_CHANGED, null, null, null) }, null
+                )
+            },
             scope = scope,
             clock = AppClock { start + (test.testScheduler.currentTime - base).milliseconds + skew },
             rateLimitJitter = jitter,
@@ -418,6 +430,40 @@ class GraphV2RequestCoordinatorTest {
             }
             assertNull(label, f.state.catalog)
             assertEquals(label, emptyMap<GraphKey, Throwable>(), f.state.failures)
+            f.close()
+        }
+    }
+
+    /**
+     * A2a03c (S4 RT01-A1): a new user end retires the coordinator's entries, catalog and failures even when the data scope
+     * stays the same - with a new generation, or with only the use lifetime moved. The same end seen again retires nothing
+     * more: a later context change without a new end keeps what was adopted since (A2a03b).
+     */
+    @Test fun A2a03c_aUserEndRetiresTheSameDataScopeOnce() = runTest {
+        for ((label, move) in listOf<Pair<String, Fixture.() -> Unit>>(
+            "a new generation" to { fence = sessionFence(generation = 2) },
+            "only the lifetime" to { invalidations += 1 }
+        )) {
+            val f = started()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            f.catalogs().single().catalog.complete(ok(catalogDto(3600, periods = mapOf("3m" to listOf(SERIES))))); runCurrent()
+            f.tabs(USD_3M).single().tab.complete(ok(tabDto(USD_3M, rate = 1390.0))); runCurrent()
+            f.coordinator.onRefreshRequested(force = true); runCurrent()
+            f.tabs(USD_3M).last().tab.complete(status(503)); runCurrent()
+            assertTrue(label, f.state.failures.containsKey(USD_3M) && f.state.catalog != null)
+
+            f.userEnd = 1L
+            f.move()
+            f.coordinator.onContextChanged(); runCurrent()
+            assertEquals(label, emptyMap<GraphKey, GraphEntry>(), f.state.entries)
+            assertNull(label, f.state.catalog)
+            assertEquals(label, emptyMap<GraphKey, Throwable>(), f.state.failures)
+
+            f.catalogs().last().catalog.complete(ok(catalogDto(3600, periods = mapOf("3m" to listOf(SERIES))))); runCurrent()
+            f.tabs(USD_3M).last().tab.complete(ok(tabDto(USD_3M, rate = 1391.0))); runCurrent()
+            assertEquals("$label: premise, adopted again", 1391.0, rateOf(f, USD_3M), 0.0)
+            f.fence = sessionFence(generation = 3); f.coordinator.onContextChanged(); runCurrent()
+            assertEquals("$label: the same end retires nothing more", 1391.0, rateOf(f, USD_3M), 0.0)
             f.close()
         }
     }

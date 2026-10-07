@@ -353,6 +353,7 @@ class GraphV2ScreenStateHolderTest {
             currentAccessFence = { fence },
             uses = uses,
             protectedAdmission = { true },
+            accessSnapshot = { snapshot },
             scope = scope,
             clock = AppClock { start + (test.testScheduler.currentTime - base).milliseconds },
             rateLimitJitter = { kotlin.time.Duration.ZERO },

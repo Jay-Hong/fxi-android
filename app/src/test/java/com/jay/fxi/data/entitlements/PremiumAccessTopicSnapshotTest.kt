@@ -1456,7 +1456,8 @@ class PremiumAccessTopicSnapshotTest {
         private val scheduler = test.testScheduler
         val dispatcher = StandardTestDispatcher(scheduler)
         val scope = CoroutineScope(processJob + dispatcher)
-        val live = AuthIdentityFence(OWNER, 1L)
+        /** The live auth session; a row moves it to a new generation of the same user (S4 RT01-A1). */
+        var live = AuthIdentityFence(OWNER, 1L)
         var fence: TopicSessionFence? = null
         var catalog: GraphCatalog? = null
         val sent = mutableListOf<Sent>()
@@ -1495,6 +1496,7 @@ class PremiumAccessTopicSnapshotTest {
             currentAccessFence = { fence },
             uses = uses,
             protectedAdmission = { true },
+            accessSnapshot = snapshot,
             scope = scope,
             clock = clock,
             rateLimitJitter = { Duration.ZERO },
@@ -2105,6 +2107,60 @@ class PremiumAccessTopicSnapshotTest {
         assertTrue("the fresh fetch is admitted", tab.guard())
         tab.tab.complete(ok(g.threeMonthTab())); runCurrent()
         assertTrue("a fresh protected fetch restores the KRX half", showsKrx(g.coordinator.protectedEntry(KEY_3M)))
+    }
+
+    /**
+     * The same user signs in again under a new auth generation: the issuer records an IDENTITY_CHANGED user end and keeps
+     * the namespace, and a fresh premium answer grants again. Returns the approved state from before the change.
+     */
+    private suspend fun TestScope.sameUserNewGeneration(): Triple<Harness, GraphRig, Approved> {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        val before = h.snapshot
+        val epoch = h.store.record.userAccessEpoch
+        h.coordinator.onIdentityChanged(AuthIdentityFence(OWNER, 2L))
+        h.source.identity = EntitlementsIdentity(OWNER, 2L)
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        settle()
+        val end = checkNotNull(h.snapshot.lastUserEnd) { "premise: a user end" }
+        assertEquals("premise: an identity change", TopicAccessEndReason.IDENTITY_CHANGED, end.reason)
+        assertTrue("premise: a new user end", end.sequence > (before.lastUserEnd?.sequence ?: 0L))
+        assertEquals("premise: the namespace is kept", epoch, h.store.record.userAccessEpoch)
+        assertEquals(PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)
+        g.live = AuthIdentityFence(OWNER, 2L)
+        return Triple(h, g, a)
+    }
+
+    /** The coordinator after the new grant: nothing it held before the user end is kept or applied. */
+    private fun TestScope.assertRetiredByTheUserEnd(label: String, g: GraphRig, a: Approved, renewed: TopicSessionFence) {
+        assertEquals("$label: the same data scope", a.kb, g.kb(renewed))
+        assertFalse("$label: no 3m entry is kept", g.coordinator.state.value.entries.containsKey(KEY_3M))
+        assertNull("$label: no protected entry", g.coordinator.protectedEntry(KEY_3M))
+        assertFalse("$label: kb is discarded", a.kb in g.series())
+        a.day.tab.complete(ok(g.dayTab())); runCurrent()
+        assertFalse("$label: the old 1d answer applies nothing", g.coordinator.state.value.entries.containsKey(KEY_1D))
+    }
+
+    /**
+     * graphA05 (S4 RT01-A1): a same-user IDENTITY_CHANGED end retires the coordinator's memory of that data scope alike
+     * whether the end reaches the graph on its own - the fence withdrawn, then the new grant published - or together with
+     * the new grant, as the deliverer sends an end and a grant it reads in one pull. The recorder already goes by the user
+     * end; the coordinator must too, since the data scope does not change.
+     */
+    @Test
+    fun graphA05_aSameUserIdentityChangeRetiresTheScopeAlikeWhetherOrNotTheEndArrivesAlone() = snapshotTest {
+        run {
+            val (_, g, a) = sameUserNewGeneration()
+            g.withdraw(); runCurrent()
+            val renewed = g.publishIssued(); runCurrent()
+            assertRetiredByTheUserEnd("end alone", g, a, renewed)
+        }
+        run {
+            val (_, g, a) = sameUserNewGeneration()
+            val renewed = g.publishIssued(); runCurrent()
+            assertRetiredByTheUserEnd("end with the new grant", g, a, renewed)
+        }
     }
 
     /**

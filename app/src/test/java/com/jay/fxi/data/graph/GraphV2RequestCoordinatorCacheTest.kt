@@ -332,6 +332,7 @@ class GraphV2RequestCoordinatorCacheTest {
             currentAccessFence = { fence },
             uses = uses,
             protectedAdmission = { true },
+            accessSnapshot = { snapshot },
             scope = scope,
             clock = AppClock {
                 if (cancelAtNextEvent) {
