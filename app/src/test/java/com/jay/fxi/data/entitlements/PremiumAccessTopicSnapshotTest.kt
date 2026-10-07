@@ -77,16 +77,26 @@ import okhttp3.Headers
  *
  * S4 U1a (동결 후 18번 (1); design R4c/S4 u1_design_codex.r1 cut down by u1_review_claude.r1 and agreed in
  * u1_design_codex.r2) adds rows graphI01-graphI08 and graphI06b: the graph consumers wired to this real issuer, for the
- * user axis. The
- * graph reads `accessSnapshot` afresh on every question; its fence is only ever one `topicGrantResult()` actually issued,
- * kept through a hold and withdrawn, where a row does so, only after a user end; the coordinator, the recorder and their suppliers share one executor;
- * the recorder's catalog is the last one the coordinator adopted in the current scope. "Closed" means no price adopted,
- * nothing exposed, the kept guard refused, the gate binding nothing, the kept capture reading neither GENERAL nor KRX and
- * the protected entry withheld. graphI02, graphI05, graphI07 and graphI08 check it with the fence still published and the
- * coordinator not yet told, so the snapshot alone must close it; graphI03 checks it after a user end the session has
- * already carried. Refused prices may still leave a loss demand, and a refused capture consumes no demand. A send refused by the guard reaching the wire is TopicUseHttpBoundaryTest GW1-GW4's;
- * a refused admission reaching the disk is GraphV2DiskStoreTest's. This is in-process evidence only: it claims nothing
- * about process death, the real purger or RT01's production assembly.
+ * user axis. The graph reads `accessSnapshot` afresh on every question; its fence is only ever one `topicGrantResult()`
+ * actually issued, kept through a hold and withdrawn, where a row does so, only after a user end; the coordinator, the
+ * recorder and their suppliers share one executor; the recorder's catalog is the last one the coordinator adopted in
+ * the current scope. "Closed" means no price adopted, nothing exposed, the kept guard refused, the gate binding
+ * nothing, the kept capture reading neither GENERAL nor KRX and the protected entry withheld. graphI02, graphI05,
+ * graphI07 and graphI08 check it with the fence still published and the coordinator not yet told, so the snapshot alone
+ * must close it; graphI03 checks it after a user end the session has already carried. Refused prices may still leave a
+ * loss demand, and a refused capture consumes no demand.
+ *
+ * S4 U1b (the same design's I09-I10) adds graphI09a-graphI09c and graphI10 on the same assembly, for the capability
+ * axis. A capability hold, a capability write in doubt and an explicit capability seal each leave the user axis and the
+ * token standing: every GENERAL use stays open and only KRX is refused, checked before the coordinator is told; told,
+ * the coordinator strips the KRX half and keeps GENERAL. A landed capability rotation takes the token away without
+ * touching the user scope: the old use is refused before the session publishes anything, kb keeps its demand, and the
+ * reissued grant reopens GENERAL only.
+ *
+ * A send refused by the guard reaching the wire is TopicUseHttpBoundaryTest GW1-GW4's; a refused admission reaching the
+ * disk is GraphV2DiskStoreTest's; a KRX-only refusal keeping a seed off the KRX file is
+ * GraphV2RequestCoordinatorCacheTest C10's. This is in-process evidence only: it claims nothing about process death,
+ * the real purger or RT01's production assembly.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class PremiumAccessTopicSnapshotTest {
@@ -1856,6 +1866,182 @@ class PremiumAccessTopicSnapshotTest {
         settle()
         refreshing.join()
         assertNull("still closed until a fresh approval", g.uses.acquire(a.fence))
+    }
+
+    // --- S4 U1b: the same graph consumers, capability axis --------------------------------------------------------------
+
+    /**
+     * Only KRX refuses [a]'s use: the kept guard, the gate's binding and GENERAL read, exposure, a new use and a new price stay
+     * open; the kept capture's KRX read is refused and the protected entry keeps its GENERAL half without its KRX half.
+     */
+    private fun assertOnlyKrxClosed(label: String, g: GraphRig, a: Approved, rate: Double) {
+        assertTrue("$label: the kept 1d guard", a.day.guard())
+        assertNotNull("$label: the gate binds", g.access.bind(a.fence, a.lifetime))
+        assertTrue("$label: GENERAL read", g.access.ioAdmission(a.capture).admits(GraphV2DiskComponent.GENERAL))
+        assertFalse("$label: KRX read", g.access.admits(a.capture, GraphV2DiskComponent.KRX))
+        assertTrue("$label: kb exposed", a.kb in g.recorder.exposed(a.fence, a.lifetime))
+        val entry = checkNotNull(g.coordinator.protectedEntry(KEY_3M)) { "$label: no protected entry" }
+        assertTrue("$label: its GENERAL half", entry.tab.graph.series.any { it.seriesId == ONLINE })
+        assertFalse("$label: without its KRX half", entry.tab.graph.series.any { it.seriesId == KRX_SERIES })
+        assertNotNull("$label: a new use starts", g.uses.acquire(a.fence))
+        g.recorder.observe(g.quote(rate, a.fence, a.lifetime))
+        assertTrue("$label: the price is adopted", g.adopted(a.kb, rate))
+    }
+
+    /**
+     * The common body of graphI09a-c, with the capability blocked and the coordinator not yet told: the user axis, the token
+     * and the user end are untouched, only KRX is closed, kb keeps its demand and a 1d completion applies it. Told afterwards,
+     * the coordinator strips the KRX half from its entry and keeps serving GENERAL.
+     */
+    private fun TestScope.assertCapabilityOnly(label: String, h: Harness, g: GraphRig, a: Approved, before: TopicAccessSnapshot, rate: Double) {
+        assertTrue("$label: the user axis", h.facts.userAllowed)
+        assertTrue("$label: the token still stands", h.facts.tokenStanding && h.facts.token == a.fence.grant)
+        assertFalse(h.facts.capabilityAllowed)
+        assertEquals("$label: no user end", before.lastUserEnd, h.snapshot.lastUserEnd)
+        val demands = g.series().getValue(a.kb).pending.keys
+        assertTrue("premise: kb has a demand", demands.isNotEmpty())
+        assertOnlyKrxClosed(label, g, a, rate)
+        assertTrue("$label: kb keeps its demand", g.series().getValue(a.kb).pending.keys.containsAll(demands))
+        a.day.tab.complete(ok(g.dayTab())); runCurrent()
+        assertTrue("$label: the 1d completion applies", g.coordinator.state.value.entries.containsKey(KEY_1D))
+        assertEquals("$label: with kb's recovery", 1L, g.series().getValue(a.kb).lastAppliedVersion)
+        g.coordinator.onContextChanged(); runCurrent()
+        val kept = checkNotNull(g.coordinator.state.value.entries[KEY_3M]) { "$label: the coordinator dropped its entry" }
+        assertTrue("$label: told, it keeps GENERAL", kept.tab.graph.series.any { it.seriesId == ONLINE })
+        assertFalse("$label: and strips KRX", kept.tab.graph.series.any { it.seriesId == KRX_SERIES })
+        val entry = checkNotNull(g.coordinator.protectedEntry(KEY_3M)) { "$label: told, no protected entry" }
+        assertFalse("$label: told, the protected entry has no KRX half", entry.tab.graph.series.any { it.seriesId == KRX_SERIES })
+        assertTrue("$label: kb is kept", a.kb in g.series())
+    }
+
+    /** graphI09a: a capability hold - a KRX loss whose decision read failed - closes KRX only. */
+    @Test
+    fun graphI09a_aCapabilityHoldClosesOnlyKrx() = snapshotTest {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        val before = h.snapshot
+        h.source.next = { active(krx = false) }
+        h.source.afterFetch = { h.store.loadFailures = 2 }
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        runCurrent()
+        assertTrue("premise: a capability hold", TopicAccessBlock.LOSS_CANDIDATE in h.facts.capabilityBlocks)
+        assertCapabilityOnly("capability hold", h, g, a, before, 1401.0)
+    }
+
+    /**
+     * graphI09b: a KRX loss whose rotation write is in doubt closes KRX only, while the write is still parked. Nothing here
+     * waits on the issuer's lock.
+     */
+    @Test
+    fun graphI09b_aCapabilityWriteInDoubtClosesOnlyKrx() = snapshotTest {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        val before = h.snapshot
+        h.store.rotationGate = gate()
+        h.source.next = { active(krx = false) }
+        launch { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+        assertTrue("premise: the rotation is parked", h.store.rotationParked.isCompleted)
+        assertTrue("premise: the capability is in doubt", TopicAccessBlock.CONTEXT_UNCERTAIN in h.facts.capabilityBlocks)
+        assertCapabilityOnly("capability in doubt", h, g, a, before, 1402.0)
+    }
+
+    /**
+     * graphI09c: an explicit capability seal - a KRX loss whose rotation keeps failing - closes KRX only, and a KRX-visible
+     * answer while sealed, fetched before the coordinator is told, does not open KRX again.
+     */
+    @Test
+    fun graphI09c_anExplicitCapabilitySealClosesOnlyKrx() = snapshotTest {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        val before = h.snapshot
+        h.store.rotationFailures = Int.MAX_VALUE
+        h.source.next = { active(krx = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        runCurrent()
+        assertTrue("premise: sealed", TopicAccessBlock.EXPLICIT_SEAL in h.facts.capabilityBlocks)
+        assertOnlyKrxClosed("capability sealed", g, a, 1403.0)
+        h.source.next = { active(krx = true) }
+        val asked = h.source.freshRequests.size
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        runCurrent()
+        assertTrue("premise: the KRX-visible answer was fetched", h.source.freshRequests.size > asked)
+        assertTrue("still sealed", TopicAccessBlock.EXPLICIT_SEAL in h.facts.capabilityBlocks)
+        // Still untold, the coordinator's slot keeps its KRX half, so only the snapshot can withhold it here.
+        assertCapabilityOnly("sealed, after a KRX-visible answer", h, g, a, before, 1403.5)
+        val fresh = checkNotNull(g.uses.acquire(a.fence)) { "GENERAL still starts a use" }
+        assertNull("nor binds a KRX epoch", checkNotNull(g.access.bind(a.fence, fresh)).krxCapabilityEpoch)
+    }
+
+    /**
+     * graphI10: once the parked capability rotation lands, the old token no longer stands: the old grant starts no new use
+     * and the old lifetime, guard, capture and 1d completion are refused before the session publishes anything, with the
+     * user epoch and user end unchanged and kb kept with its demand. The reissued grant opens GENERAL only - a fresh use is shown the kept kb and adopts a price,
+     * its own 1d request is admitted and its completion applies, and kb keeps its demand - while KRX stays refused.
+     */
+    @Test
+    fun graphI10_aLandedCapabilityRotationReopensGeneralOnly() = snapshotTest {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        val before = h.snapshot
+        val parked = gate()
+        h.store.rotationGate = parked
+        h.source.next = { active(krx = false) }
+        val refreshing = launch { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+        assertTrue("premise: the rotation is parked", h.store.rotationParked.isCompleted)
+        parked.complete(Unit)
+        settle()
+        refreshing.join()
+        assertNotNull("premise: approved with a KRX epoch", a.capture.krxCapabilityEpoch)
+        assertNotEquals("premise: the capability epoch moved", a.capture.krxCapabilityEpoch, h.store.record.krxCapabilityEpoch)
+        assertEquals("the user epoch stays", a.fence.userAccessEpoch, h.store.record.userAccessEpoch)
+        assertEquals("no user end", before.lastUserEnd, h.snapshot.lastUserEnd)
+        assertFalse("premise: the old token no longer stands", h.facts.tokenStanding)
+        val demands = g.series().getValue(a.kb).pending.keys
+        assertTrue("premise: kb has a demand", demands.isNotEmpty())
+
+        assertNull("the old grant starts no new use", g.uses.acquire(a.fence))
+        assertFalse("the old lifetime", g.uses.admits(a.lifetime))
+        assertFalse("the kept guard", a.day.guard())
+        assertNull("the gate binds nothing for it", g.access.bind(a.fence, a.lifetime))
+        assertFalse("the old capture reads nothing", g.access.ioAdmission(a.capture).admits(GraphV2DiskComponent.GENERAL))
+        assertTrue("nothing exposed to it", g.recorder.exposed(a.fence, a.lifetime).isEmpty())
+        g.recorder.observe(g.quote(1404.0, a.fence, a.lifetime))
+        assertFalse("its price is not adopted", g.adopted(a.kb, 1404.0))
+        a.day.tab.complete(ok(g.dayTab())); runCurrent()
+        assertFalse("the old 1d completion applies no entry", g.coordinator.state.value.entries.containsKey(KEY_1D))
+        assertNull("nor kb's recovery", g.series().getValue(a.kb).lastAppliedVersion)
+        assertTrue("kb is kept", a.kb in g.series())
+        assertTrue("with its demand", g.series().getValue(a.kb).pending.keys.containsAll(demands))
+
+        val sentBefore = g.sent.size
+        val renewed = g.publishIssued()
+        runCurrent()
+        assertNotEquals("a new grant", a.fence.grant, renewed.grant)
+        assertEquals("in the same user scope", a.kb, g.kb(renewed))
+        val fresh = checkNotNull(g.uses.acquire(renewed)) { "a fresh use under the new grant" }
+        val capture = checkNotNull(g.access.bind(renewed, fresh)) { "the gate binds the fresh use" }
+        assertTrue("GENERAL read", g.access.ioAdmission(capture).admits(GraphV2DiskComponent.GENERAL))
+        assertFalse("KRX stays refused", g.access.admits(capture, GraphV2DiskComponent.KRX))
+        assertTrue("the kept kb is shown to the fresh use", a.kb in g.recorder.exposed(renewed, fresh))
+        g.recorder.observe(g.quote(1405.0, renewed, fresh))
+        assertTrue("a fresh price is adopted into it", g.adopted(a.kb, 1405.0))
+        val sent = g.sent.drop(sentBefore)
+        sent.single { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
+        val day = sent.single { it.kind == "tab" && it.key == KEY_1D }
+        assertTrue("the new 1d guard", day.guard())
+        day.tab.complete(ok(g.dayTab())); runCurrent()
+        assertTrue("the new 1d completion applies", g.coordinator.state.value.entries.containsKey(KEY_1D))
+        // The context change dropped the coordinator's catalog, so this request started with none, before the refetched one
+        // was adopted, and carries no recovery; kb keeps its demand for a later request.
+        assertTrue("kb keeps its demand", g.series().getValue(a.kb).pending.keys.containsAll(demands))
+        val entry = checkNotNull(g.coordinator.protectedEntry(KEY_3M)) { "no protected entry under the new grant" }
+        assertTrue("its GENERAL half", entry.tab.graph.series.any { it.seriesId == ONLINE })
     }
 
     private companion object {
