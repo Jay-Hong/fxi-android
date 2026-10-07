@@ -2,6 +2,40 @@ package com.jay.fxi.data.entitlements
 
 import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentityFence
+import com.jay.fxi.data.auth.AuthSnapshot
+import com.jay.fxi.data.graph.DefaultGraphV2AtomicFileIo
+import com.jay.fxi.data.graph.FileGraphV2DiskStore
+import com.jay.fxi.data.graph.GraphDataScope
+import com.jay.fxi.data.graph.GraphKey
+import com.jay.fxi.data.graph.GraphObservationSeriesKey
+import com.jay.fxi.data.graph.GraphOwnerSource
+import com.jay.fxi.data.graph.GraphRecorder
+import com.jay.fxi.data.graph.GraphV2AccessCapture
+import com.jay.fxi.data.graph.GraphV2AccessGate
+import com.jay.fxi.data.graph.GraphV2CachePorts
+import com.jay.fxi.data.graph.GraphV2DiskComponent
+import com.jay.fxi.data.graph.GraphV2Fetching
+import com.jay.fxi.data.graph.GraphV2RequestCoordinator
+import com.jay.fxi.data.graph.JsonGraphV2EnvelopeCodec
+import com.jay.fxi.data.remote.AuthenticatedHttpResponse
+import com.jay.fxi.data.remote.TopicGraphCandidate
+import com.jay.fxi.data.remote.TopicGraphInput
+import com.jay.fxi.data.remote.TopicGraphPath
+import com.jay.fxi.data.remote.TopicSessionFence
+import com.jay.fxi.data.remote.TopicUseAttribution
+import com.jay.fxi.data.remote.TopicUseLifetime
+import com.jay.fxi.data.remote.dto.GraphV2CatalogPeriod
+import com.jay.fxi.data.remote.dto.GraphV2CatalogResponse
+import com.jay.fxi.data.remote.dto.GraphV2CatalogTab
+import com.jay.fxi.data.remote.dto.GraphV2Metadata
+import com.jay.fxi.data.remote.dto.GraphV2Point
+import com.jay.fxi.data.remote.dto.GraphV2Provenance
+import com.jay.fxi.data.remote.dto.GraphV2Range
+import com.jay.fxi.data.remote.dto.GraphV2Series
+import com.jay.fxi.data.remote.dto.GraphV2TabResponse
+import com.jay.fxi.domain.model.GraphCatalog
+import com.jay.fxi.domain.model.GraphPeriod
+import com.jay.fxi.time.AppClock
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -22,8 +56,17 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.days
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.datetime.Instant
+import okhttp3.Headers
 
 /**
  * L-4e E1: the topic access snapshot the issuer publishes (`l4e_e1_design_v3.md`, `ANDROID_V2_PLAN.md` 동결 후 12번).
@@ -31,11 +74,26 @@ import kotlin.time.Duration.Companion.seconds
  * Each test checks the facts against a recomputation after its steps ([PremiumAccessCoordinator.accessFactsAreCurrent]),
  * but that check alone cannot see order: the ordering and in-doubt tests read the snapshot while the change is still
  * under way — inside a state collector, or with a write parked.
+ *
+ * S4 U1a (동결 후 18번 (1); design R4c/S4 u1_design_codex.r1 cut down by u1_review_claude.r1 and agreed in
+ * u1_design_codex.r2) adds rows graphI01-graphI08 and graphI06b: the graph consumers wired to this real issuer, for the
+ * user axis. The
+ * graph reads `accessSnapshot` afresh on every question; its fence is only ever one `topicGrantResult()` actually issued,
+ * kept through a hold and withdrawn, where a row does so, only after a user end; the coordinator, the recorder and their suppliers share one executor;
+ * the recorder's catalog is the last one the coordinator adopted in the current scope. "Closed" means no price adopted,
+ * nothing exposed, the kept guard refused, the gate binding nothing, the kept capture reading neither GENERAL nor KRX and
+ * the protected entry withheld. graphI02, graphI05, graphI07 and graphI08 check it with the fence still published and the
+ * coordinator not yet told, so the snapshot alone must close it; graphI03 checks it after a user end the session has
+ * already carried. Refused prices may still leave a loss demand, and a refused capture consumes no demand. A send refused by the guard reaching the wire is TopicUseHttpBoundaryTest GW1-GW4's;
+ * a refused admission reaching the disk is GraphV2DiskStoreTest's. This is in-process evidence only: it claims nothing
+ * about process death, the real purger or RT01's production assembly.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class PremiumAccessTopicSnapshotTest {
 
     private val processJob = SupervisorJob()
+
+    @get:Rule val folder = TemporaryFolder()
 
     private class Store(private val ids: EpochIdGenerator) : AccessEpochStore {
         var record = AccessEpochRecord()
@@ -141,10 +199,21 @@ class PremiumAccessTopicSnapshotTest {
         /** Runs once, after the answer is formed and before it returns: where the decision read is made to fail. */
         var afterFetch: () -> Unit = {}
 
+        /** When set, parks the next answer after it is formed, until completed (S4 U1a). */
+        var fetchGate: CompletableDeferred<Unit>? = null
+
+        /** Whether each fetch asked for a fresh premium answer (S4 U1a). */
+        val freshRequests = mutableListOf<Boolean>()
+
         override suspend fun fetch(freshPremium: Boolean): EntitlementsResult {
+            freshRequests += freshPremium
             val outcome = next()
             val owner = checkNotNull(identity)
             afterFetch().also { afterFetch = {} }
+            fetchGate?.let { gate ->
+                fetchGate = null
+                gate.await()
+            }
             return EntitlementsResult.Answered(owner, outcome)
         }
         override suspend fun currentIdentity() = identity
@@ -1334,10 +1403,473 @@ class PremiumAccessTopicSnapshotTest {
         h.assertCurrent("sealed")
     }
 
+    // --- S4 U1a: the graph consumers on this real issuer, user axis -----------------------------------------------------
+
+    /** One graph request the fake fetcher received, with the guard it was actually handed. */
+    private class Sent(val kind: String, val key: GraphKey?, val guard: () -> Boolean) {
+        val tab = CompletableDeferred<AuthenticatedHttpResponse<GraphV2TabResponse>>()
+        val catalog = CompletableDeferred<AuthenticatedHttpResponse<GraphV2CatalogResponse>>()
+    }
+
+    /** The graph side on the issuer of [h]; see the class KDoc for the assembly rules. */
+    private inner class GraphRig(test: TestScope, val h: Harness, startRecorder: Boolean = true) {
+        private val scheduler = test.testScheduler
+        val dispatcher = StandardTestDispatcher(scheduler)
+        val scope = CoroutineScope(processJob + dispatcher)
+        val live = AuthIdentityFence(OWNER, 1L)
+        var fence: TopicSessionFence? = null
+        var catalog: GraphCatalog? = null
+        val sent = mutableListOf<Sent>()
+        val failures = mutableListOf<Throwable>()
+        private val snapshot: () -> TopicAccessSnapshot = { h.coordinator.accessSnapshot }
+        val uses = SnapshotTopicUseAuthority(snapshot)
+        val access = GraphV2AccessGate({ live }, { fence }, snapshot, { true })
+        val clock = AppClock { GRAPH_NOON + scheduler.currentTime.milliseconds }
+        val recorder = GraphRecorder(scope, h.coordinator.accessRevisions, snapshot, { fence }, { catalog }, access, clock)
+        val coordinator = GraphV2RequestCoordinator(
+            fetcher = object : GraphV2Fetching {
+                override suspend fun catalog(
+                    owner: AuthSnapshot,
+                    useAdmitted: () -> Boolean
+                ): AuthenticatedHttpResponse<GraphV2CatalogResponse> {
+                    val s = Sent("catalog", null, useAdmitted)
+                    sent += s
+                    return s.catalog.await()
+                }
+
+                override suspend fun tab(
+                    owner: AuthSnapshot,
+                    key: GraphKey,
+                    useAdmitted: () -> Boolean
+                ): AuthenticatedHttpResponse<GraphV2TabResponse> {
+                    val s = Sent("tab", key, useAdmitted)
+                    sent += s
+                    return s.tab.await()
+                }
+            },
+            owners = object : GraphOwnerSource {
+                override fun currentIdentity(): AuthIdentityFence = live
+                override suspend fun capture(expected: AuthIdentityFence) =
+                    AuthSnapshot(expected.uid, expected.authGeneration, "token")
+            },
+            currentAccessFence = { fence },
+            uses = uses,
+            protectedAdmission = { true },
+            scope = scope,
+            clock = clock,
+            rateLimitJitter = { Duration.ZERO },
+            onEventFailure = { failures += it },
+            cachePorts = GraphV2CachePorts(
+                FileGraphV2DiskStore(folder.newFolder(), JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), dispatcher),
+                access,
+                onSeedDiagnostic = {}
+            ),
+            recorder = recorder
+        )
+
+        init {
+            coordinator.start()
+            if (startRecorder) recorder.start()
+        }
+
+        fun now(): Instant = clock.now()
+        fun tabs(key: GraphKey) = sent.filter { it.kind == "tab" && it.key == key }
+        fun series() = recorder.state.value.series
+        fun kb(fence: TopicSessionFence) = GraphObservationSeriesKey(GraphDataScope(OWNER, checkNotNull(fence.userAccessEpoch)), KB)
+
+        /** A usd quote from kb owned by [owner] under [lifetime]. */
+        fun quote(rate: Double, owner: TopicSessionFence, lifetime: TopicUseLifetime) = TopicGraphInput.Observations(
+            1L, "fx:usd-krw", TopicGraphPath.WS, TopicUseAttribution(Any(), owner, 1L, lifetime), 1L,
+            listOf(TopicGraphCandidate.Quote("kb", "usd-krw", rate, now() - 1.seconds, null))
+        )
+
+        fun adopted(key: GraphObservationSeriesKey, rate: Double): Boolean =
+            series()[key]?.data?.app?.observations?.any { it.rate == rate } == true
+
+        /** Publishes the fence the issuer issues now - never one built here - and tells the coordinator. */
+        suspend fun publishIssued(): TopicSessionFence {
+            val issued = checkNotNull(h.coordinator.topicGrantResult().fence) { "no grant was issued" }
+            fence = issued
+            coordinator.onContextChanged()
+            return issued
+        }
+
+        /** A user end as the session would carry it: the fence is withdrawn and the catalog slot empties. */
+        fun withdraw() {
+            fence = null
+            catalog = null
+            coordinator.onContextChanged()
+        }
+
+        fun threeMonthTab() = GraphV2TabResponse(
+            tab = "usd",
+            period = GraphPeriod.THREE_MONTHS.code,
+            series = listOf(
+                GraphV2Series(ONLINE, ONLINE, "krw", "KRW", 2, listOf(GraphV2Point(now() - 1.days, 1390.0, "x")),
+                    GraphV2Provenance(false, emptyList()), null),
+                GraphV2Series(KRX_SERIES, KRX_SERIES, "krw", "KRW", 1, listOf(GraphV2Point(now() - 1.days, 1395.0, "krx")),
+                    GraphV2Provenance(false, emptyList()), null)
+            ),
+            metadata = GraphV2Metadata(now() - 1.hours, "1d", GraphV2Range("2026-07-05", "2026-10-05"))
+        )
+
+        /** A 10-minute usd 1d answer with a closed kb point. */
+        fun dayTab(): GraphV2TabResponse {
+            val bucket = Instant.fromEpochMilliseconds((now() - 30.minutes).toEpochMilliseconds() / 600_000L * 600_000L)
+            return GraphV2TabResponse(
+                tab = "usd",
+                period = GraphPeriod.ONE_DAY.code,
+                series = listOf(GraphV2Series(KB, KB, "krw", "KRW", 2, listOf(GraphV2Point(bucket, 1390.0, "x")),
+                    GraphV2Provenance(false, emptyList()), null)),
+                metadata = GraphV2Metadata(now() - 1.hours, "10min", GraphV2Range("2026-10-04", "2026-10-05"))
+            )
+        }
+    }
+
+    private fun <T> ok(body: T) = AuthenticatedHttpResponse(200, Headers.headersOf(), body, null, byteArrayOf(1))
+
+    /** usd: 3m lists the online and the KRX series, 1d lists kb; valid for two days. */
+    private fun graphCatalog() = GraphV2CatalogResponse(
+        tabs = listOf(GraphV2CatalogTab("usd", "usd", emptyMap(), mapOf(
+            GraphPeriod.THREE_MONTHS.code to GraphV2CatalogPeriod(listOf(ONLINE, KRX_SERIES), listOf(ONLINE)),
+            GraphPeriod.ONE_DAY.code to GraphV2CatalogPeriod(listOf(KB), listOf(KB))
+        ))),
+        version = "2026-05-27",
+        supportedPeriods = listOf("1w", "3m", "1y"),
+        cacheTtlSeconds = 172800
+    )
+
+    /** What an approved graph holds before a row blocks it. */
+    private class Approved(
+        val fence: TopicSessionFence,
+        val lifetime: TopicUseLifetime,
+        val capture: GraphV2AccessCapture,
+        val kb: GraphObservationSeriesKey,
+        /** A 1d request still out, carrying kb's recovery capture. */
+        val day: Sent
+    )
+
+    /**
+     * The approved start of every row: the issued grant published, a 3m catalog and tab adopted with their general and KRX
+     * halves, kb adopted with its recovery demand, and a 1d request out carrying kb's capture.
+     */
+    private suspend fun TestScope.approve(g: GraphRig): Approved {
+        val fence = g.publishIssued()
+        runCurrent()
+        val lifetime = checkNotNull(g.uses.acquire(fence)) { "premise: a use under the issued fence" }
+        g.coordinator.onActivated(KEY_3M); runCurrent()
+        val catalogSent = g.sent.single { it.kind == "catalog" }
+        assertTrue("premise: the catalog guard admits an approved use", catalogSent.guard())
+        catalogSent.catalog.complete(ok(graphCatalog())); runCurrent()
+        g.tabs(KEY_3M).single().tab.complete(ok(g.threeMonthTab())); runCurrent()
+        g.catalog = checkNotNull(g.coordinator.state.value.catalog) { "premise: the catalog was adopted" }
+        val kb = g.kb(fence)
+        g.recorder.observe(g.quote(1390.0, fence, lifetime))
+        assertTrue("premise: kb adopted with a demand", g.adopted(kb, 1390.0) && g.series().getValue(kb).pending.isNotEmpty())
+        g.coordinator.onActivated(KEY_1D); runCurrent()
+        val day = g.tabs(KEY_1D).single()
+        assertEquals("premise: the 1d request captured kb's recovery", 1L, g.recorder.state.value.nextVersion)
+        val capture = checkNotNull(g.access.bind(fence, lifetime)) { "premise: the gate binds" }
+        return Approved(fence, lifetime, capture, kb, day)
+    }
+
+    /** Every graph consumer refuses [a]'s use; a refused price may still add a loss demand, which this does not check. */
+    private fun assertClosed(label: String, g: GraphRig, a: Approved, rate: Double) {
+        assertFalse("$label: the kept 1d guard", a.day.guard())
+        assertNull("$label: the gate binds nothing", g.access.bind(a.fence, a.lifetime))
+        assertFalse("$label: GENERAL read", g.access.ioAdmission(a.capture).admits(GraphV2DiskComponent.GENERAL))
+        assertFalse("$label: KRX read", g.access.admits(a.capture, GraphV2DiskComponent.KRX))
+        assertTrue("$label: nothing exposed", g.recorder.exposed(a.fence, a.lifetime).isEmpty())
+        assertNull("$label: no protected entry", g.coordinator.protectedEntry(KEY_3M))
+        g.recorder.observe(g.quote(rate, a.fence, a.lifetime))
+        assertFalse("$label: the price is not adopted", g.adopted(a.kb, rate))
+    }
+
+    /** Sealed: an explicit user loss whose rotation keeps failing, then the session's withdrawal. */
+    private suspend fun TestScope.sealed(): Triple<Harness, GraphRig, Approved> {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        h.store.rotationFailures = Int.MAX_VALUE
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertTrue("premise: sealed", TopicAccessBlock.EXPLICIT_SEAL in h.facts.userBlocks)
+        g.withdraw(); runCurrent()
+        return Triple(h, g, a)
+    }
+
+    /**
+     * Held: a loss answer whose decision read failed, so a P4 candidate holds the user axis. The fence stays published and the
+     * coordinator is not told: once told it drops its context and request, which alone would refuse the kept guard and the
+     * protected entry. Unless [startRecorder], the recorder does not collect either.
+     */
+    private suspend fun TestScope.held(startRecorder: Boolean = true): Triple<Harness, GraphRig, Approved> {
+        val h = granted()
+        val g = GraphRig(this, h, startRecorder)
+        val a = approve(g)
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.source.afterFetch = { h.store.loadFailures = 2 }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertTrue("premise: held", TopicAccessBlock.LOSS_CANDIDATE in h.facts.userBlocks)
+        return Triple(h, g, a)
+    }
+
+    /**
+     * graphI01: approved by the real issuer, every graph consumer is open - a price is adopted and exposed, the kept guard and
+     * the gate's GENERAL and KRX reads are admitted, the protected entry carries its KRX half, and a 1d answer applies kb's
+     * recovery.
+     */
+    @Test
+    fun graphI01_anApprovedUseOpensEveryGraphConsumer() = snapshotTest {
+        val g = GraphRig(this, granted())
+        val a = approve(g)
+        assertTrue("the kept 1d guard", a.day.guard())
+        assertTrue("GENERAL read", g.access.ioAdmission(a.capture).admits(GraphV2DiskComponent.GENERAL))
+        assertTrue("KRX read", g.access.admits(a.capture, GraphV2DiskComponent.KRX))
+        assertTrue("kb exposed", a.kb in g.recorder.exposed(a.fence, a.lifetime))
+        val entry = checkNotNull(g.coordinator.protectedEntry(KEY_3M)) { "no protected entry" }
+        assertTrue("with its KRX half", entry.tab.graph.series.any { it.seriesId == KRX_SERIES })
+        g.recorder.observe(g.quote(1391.0, a.fence, a.lifetime))
+        assertTrue("a new price is adopted", g.adopted(a.kb, 1391.0))
+        a.day.tab.complete(ok(g.dayTab())); runCurrent()
+        assertEquals("kb's recovery is applied", 1L, g.series().getValue(a.kb).lastAppliedVersion)
+        assertTrue(g.coordinator.state.value.entries.containsKey(KEY_1D))
+    }
+
+    /**
+     * graphI02: an explicit user loss whose rotation keeps failing seals the user axis. Before the session withdraws anything
+     * every graph consumer already refuses on the snapshot alone, and the user end discards kb with its demand. Once the
+     * fence is withdrawn the coordinator's entries go, the late 1d answer applies nothing and a new activation sends nothing.
+     * A premium answer while sealed opens no use.
+     */
+    @Test
+    fun graphI02_anExplicitUserSealClosesEveryGraphConsumer() = snapshotTest {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        h.store.rotationFailures = Int.MAX_VALUE
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertTrue("premise: sealed", TopicAccessBlock.EXPLICIT_SEAL in h.facts.userBlocks)
+        assertFalse("the user end discarded kb before any input", a.kb in g.series())
+        assertClosed("sealed, fence still published", g, a, 1392.0)
+        g.withdraw(); runCurrent()
+        assertTrue("the coordinator's entries went with the scope", g.coordinator.state.value.entries.isEmpty())
+        a.day.tab.complete(ok(g.dayTab())); runCurrent()
+        assertFalse("the late 1d answer applied nothing", g.coordinator.state.value.entries.containsKey(KEY_1D))
+        val sends = g.sent.size
+        g.coordinator.onActivated(KEY_3M); runCurrent()
+        assertEquals("a new activation sends nothing", sends, g.sent.size)
+        h.source.next = { active(krx = true) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertTrue("still sealed", TopicAccessBlock.EXPLICIT_SEAL in h.facts.userBlocks)
+        assertNull("a premium answer while sealed opens no use", g.uses.acquire(a.fence))
+    }
+
+    /**
+     * graphI03: once the failing rotation lands the seal lifts, but nothing opens until a fresh premium answer: the recovery
+     * really asks for one, and while that answer is out no use is admitted.
+     */
+    @Test
+    fun graphI03_aLandedRecoveryAloneOpensNothing() = snapshotTest {
+        val (h, g, a) = sealed()
+        h.store.rotationFailures = 0
+        h.source.next = { active(krx = true) }
+        h.source.fetchGate = gate()
+        val asked = h.source.freshRequests.size
+        advanceTimeBy(RETRY * 2); runCurrent()
+        assertNotEquals("premise: the rotation landed", a.fence.userAccessEpoch, h.store.record.userAccessEpoch)
+        assertFalse("the seal lifted", TopicAccessBlock.EXPLICIT_SEAL in h.facts.userBlocks)
+        assertTrue("a fresh premium answer was asked for", true in h.source.freshRequests.drop(asked))
+        assertFalse(h.facts.userAllowed)
+        assertNull("no use under the old fence", g.uses.acquire(a.fence))
+        assertClosed("recovered, answer out", g, a, 1393.0)
+    }
+
+    /**
+     * graphI04: the fresh premium answer re-approves. The new grant opens new use - a price is adopted under the new scope -
+     * but nothing discarded comes back and nothing captured before the end applies: the old lifetime, guard and capture stay
+     * refused and the late 1d answer applies nothing.
+     */
+    @Test
+    fun graphI04_reapprovalOpensOnlyFreshUse() = snapshotTest {
+        val (h, g, a) = sealed()
+        h.store.rotationFailures = 0
+        h.source.next = { active(krx = true) }
+        val answer = gate()
+        h.source.fetchGate = answer
+        advanceTimeBy(RETRY * 2); runCurrent()
+        answer.complete(Unit)
+        settle()
+        assertEquals(PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)
+        val renewed = g.publishIssued()
+        runCurrent()
+        assertNotEquals("a new grant", a.fence, renewed)
+        val fresh = checkNotNull(g.uses.acquire(renewed)) { "a fresh use under the new grant" }
+        g.coordinator.onActivated(KEY_3M); runCurrent()
+        g.sent.last { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
+        g.catalog = checkNotNull(g.coordinator.state.value.catalog) { "premise: the new scope adopted a catalog" }
+        val kbNew = g.kb(renewed)
+        g.recorder.observe(g.quote(1394.0, renewed, fresh))
+        assertTrue("a fresh price is adopted under the new scope", g.adopted(kbNew, 1394.0))
+        assertFalse("the discarded series does not come back", a.kb in g.series())
+        assertFalse("the old use stays refused", g.uses.admits(a.lifetime))
+        assertFalse("the old guard stays refused", a.day.guard())
+        assertFalse("the old capture reads nothing", g.access.ioAdmission(a.capture).admits(GraphV2DiskComponent.GENERAL))
+        a.day.tab.complete(ok(g.dayTab())); runCurrent()
+        assertFalse("the late 1d answer applied nothing", g.coordinator.state.value.entries.containsKey(KEY_1D))
+        assertFalse("nor revived the discarded series", a.kb in g.series())
+        g.recorder.observe(g.quote(1395.0, a.fence, a.lifetime))
+        assertFalse("an old-scope price adopts nothing", g.adopted(a.kb, 1395.0))
+    }
+
+    /**
+     * graphI05: a P4 hold closes every use but keeps what the scope holds - no user end, no rotation; kb and its demand stay,
+     * a refused capture consumes no demand, and the coordinator, told of the hold only after those checks, keeps its entry.
+     * The token still stands, so only the user axis keeps a new use from starting.
+     */
+    @Test
+    fun graphI05_aUserHoldClosesUseAndKeepsTheData() = snapshotTest {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        val before = h.snapshot
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.source.afterFetch = { h.store.loadFailures = 2 }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertTrue("premise: held", TopicAccessBlock.LOSS_CANDIDATE in h.facts.userBlocks)
+        assertEquals("no user end", before.lastUserEnd, h.snapshot.lastUserEnd)
+        assertEquals("no rotation", a.fence.userAccessEpoch, h.store.record.userAccessEpoch)
+        assertTrue("premise: the token still stands", h.facts.tokenStanding && h.facts.token == a.fence.grant)
+        assertNull("no use starts while held", g.uses.acquire(a.fence))
+        val demands = g.series().getValue(a.kb).pending.keys
+        assertClosed("held", g, a, 1396.0)
+        assertTrue("kb is kept", a.kb in g.series())
+        assertTrue("its demand is kept", g.series().getValue(a.kb).pending.keys.containsAll(demands))
+        assertTrue("a refused capture issues nothing", g.recorder.captureRequests(setOf(a.kb), a.fence, a.lifetime).isEmpty())
+        assertTrue("and consumes no demand", g.series().getValue(a.kb).pending.keys.containsAll(demands))
+        g.coordinator.onContextChanged()
+        runCurrent()
+        assertTrue("the coordinator, told of the hold, keeps its entry", g.coordinator.state.value.entries.containsKey(KEY_3M))
+    }
+
+    /**
+     * graphI06: a stale hold is released with no user end and the same token, yet the old lifetime, guard and capture stay
+     * refused - a price or a recovery capture under the old lifetime is neither adopted nor issued; a fresh lifetime under the
+     * kept fence is admitted, kb keeps its demand and a fresh capture issues it, and once the context moves on the protected
+     * entry is exposed again. The coordinator is told only after the release.
+     */
+    @Test
+    fun graphI06_aStaleHoldReleasesOnlyFreshUse() = snapshotTest {
+        val (h, g, a) = held()
+        val before = h.snapshot
+        h.store.loadFailures = 0
+        h.source.identity = EntitlementsIdentity(OWNER, 2L)
+        advanceTimeBy(RETRY); runCurrent()
+        assertEquals("premise: released", 0, h.coordinator.heldLossCandidateCount())
+        assertEquals("no user end", before.lastUserEnd, h.snapshot.lastUserEnd)
+        assertEquals("the same token", a.fence.grant, h.facts.token)
+        assertFalse("the old lifetime stays refused", g.uses.admits(a.lifetime))
+        assertFalse("the old guard stays refused", a.day.guard())
+        assertFalse("the old capture reads nothing", g.access.admits(a.capture, GraphV2DiskComponent.GENERAL))
+        assertTrue("kb keeps its demand through the release", g.series().getValue(a.kb).pending.isNotEmpty())
+        g.recorder.observe(g.quote(1396.5, a.fence, a.lifetime))
+        assertFalse("an old-lifetime price is not adopted", g.adopted(a.kb, 1396.5))
+        val demands = g.series().getValue(a.kb).pending.keys
+        assertTrue("an old-lifetime capture issues nothing", g.recorder.captureRequests(setOf(a.kb), a.fence, a.lifetime).isEmpty())
+        assertEquals("and consumes no demand", demands, g.series().getValue(a.kb).pending.keys)
+        val fresh = checkNotNull(g.uses.acquire(a.fence)) { "a fresh use under the kept fence" }
+        assertNotEquals(a.lifetime, fresh)
+        assertNotNull(g.access.bind(a.fence, fresh))
+        assertTrue("kb is usable again", a.kb in g.recorder.exposed(a.fence, fresh))
+        assertTrue("which a fresh capture issues", g.recorder.captureRequests(setOf(a.kb), a.fence, fresh).isNotEmpty())
+        g.recorder.observe(g.quote(1397.0, a.fence, fresh))
+        assertTrue("a fresh price is adopted into the kept series", g.adopted(a.kb, 1397.0))
+        g.coordinator.onContextChanged(); runCurrent()
+        assertNotNull("the protected entry is exposed again", g.coordinator.protectedEntry(KEY_3M))
+    }
+
+    /**
+     * graphI06b: a hold the graph never saw - its recorder not yet collecting and its coordinator never told - still leaves
+     * the old lifetime, guard and capture refused once released; only a fresh lifetime is admitted.
+     */
+    @Test
+    fun graphI06b_aHoldTheGraphNeverSawStillRefusesTheOldUse() = snapshotTest {
+        val (h, g, a) = held(startRecorder = false)
+        h.source.identity = EntitlementsIdentity(OWNER, 2L)
+        advanceTimeBy(RETRY); runCurrent()
+        assertEquals("premise: released", 0, h.coordinator.heldLossCandidateCount())
+        assertTrue(h.facts.userAllowed)
+        assertFalse("the old guard", a.day.guard())
+        assertNull("the old lifetime binds nothing", g.access.bind(a.fence, a.lifetime))
+        assertFalse("the old capture reads no GENERAL", g.access.ioAdmission(a.capture).admits(GraphV2DiskComponent.GENERAL))
+        assertFalse("nor KRX", g.access.admits(a.capture, GraphV2DiskComponent.KRX))
+        assertTrue("the old lifetime is shown nothing", g.recorder.exposed(a.fence, a.lifetime).isEmpty())
+        val fresh = checkNotNull(g.uses.acquire(a.fence))
+        assertTrue("a fresh lifetime is shown kb", a.kb in g.recorder.exposed(a.fence, fresh))
+    }
+
+    /**
+     * graphI07: a hold confirmed as a real loss ends the user scope: every consumer refuses, kb is discarded and, with the fence
+     * still published, the late 1d answer applies nothing.
+     */
+    @Test
+    fun graphI07_aConfirmedHoldEndsTheUserScope() = snapshotTest {
+        val (h, g, a) = held()
+        val before = h.snapshot
+        h.store.loadFailures = 0
+        advanceTimeBy(RETRY); runCurrent()
+        assertEquals("premise: decided", 0, h.coordinator.heldLossCandidateCount())
+        assertNotEquals("a user end", before.lastUserEnd, h.snapshot.lastUserEnd)
+        assertFalse("kb is discarded before any input", a.kb in g.series())
+        assertClosed("decided", g, a, 1398.0)
+        a.day.tab.complete(ok(g.dayTab())); runCurrent()
+        assertFalse("the late 1d answer applied nothing", g.coordinator.state.value.entries.containsKey(KEY_1D))
+    }
+
+    /**
+     * graphI08: a user loss whose write is in doubt closes every consumer while the state still reads PremiumConfirmed, and
+     * its user end discards kb; after the write the use stays closed until a fresh approval. Nothing here waits on the
+     * issuer's lock.
+     */
+    @Test
+    fun graphI08_aUserLossInDoubtClosesEveryGraphConsumer() = snapshotTest {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        val parked = gate()
+        h.store.rotationGate = parked
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        val refreshing = launch { h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+        runCurrent()
+        assertTrue("premise: the rotation is parked", h.store.rotationParked.isCompleted)
+        assertEquals(PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)
+        assertTrue(TopicAccessBlock.CONTEXT_UNCERTAIN in h.facts.userBlocks)
+        assertFalse("the user end discarded kb before any input", a.kb in g.series())
+        assertClosed("in doubt", g, a, 1399.0)
+        parked.complete(Unit)
+        settle()
+        refreshing.join()
+        assertNull("still closed until a fresh approval", g.uses.acquire(a.fence))
+    }
+
     private companion object {
         const val OWNER = "user-a"
         const val OTHER = "user-b"
         const val RETRY = 1_000L
         const val SETTLE = 60 * 60 * 1_000L
+
+        /** 2026-10-05 12:00 KST, the graph clock's origin. */
+        val GRAPH_NOON: Instant = Instant.parse("2026-10-05T03:00:00Z")
+        val KEY_3M = GraphKey("usd", GraphPeriod.THREE_MONTHS)
+        val KEY_1D = GraphKey("usd", GraphPeriod.ONE_DAY)
+        const val ONLINE = "investing.usd-krw"
+        const val KRX_SERIES = "krx.usd-krw-futures"
+        const val KB = "kb.usd"
     }
 }
