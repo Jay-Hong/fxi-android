@@ -31,11 +31,11 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 관찰했다. topic 줄 문구는 운영에서 자연 발생하지 않아 기기 미수집이다.
                                 S3 그래프 관측 인계는 GObs-1(`ffda7b9`, 후보)·2a(`4233c4a`, 권위·재개)·2b-1(`c30d615`,
                                 전달 중단)·2b-2(`b5e6501`, ACK·인증)로 연결했다(JVM 계약, dormant sink, 운영 배선 없음).
-                                S4 Graph V2(FX)는 A1(`0265bdf`)부터 F2b-2b(`9656686`)까지 구현·테스트·정리 commit 37개로
+                                S4 Graph V2(FX)는 A1(`0265bdf`)부터 F2e(`169259c`)까지 구현·테스트·정리 commit 40개로
                                 요청·디스크·선택·화면·1일 live 봉 모델·관측 어댑터·live projection·발행·표면 가시성·
-                                기록기 보존·폐기·연속성 reducer와 owner·topic sink를 쌓고 도달 불가 v1 graph 코드를 지웠다(JVM·에뮬레이터
-                                계측 계약, 운영 배선 없음). 남은 단위는 F2 dormant 나머지와 F2 runtime이다(G의 §9.1 migration
-                                포함, S4 '진행' 항목).
+                                기록기 보존·폐기·연속성 reducer와 owner·topic sink·요청 복구 인계·holder 검증 읽기·메모리 purge
+                                대상을 쌓고 도달 불가 v1 graph 코드를 지웠다(JVM·에뮬레이터 계측 계약, 운영 배선 없음). 남은 단위는
+                                F2 runtime이다(G의 §9.1 migration 포함, S4 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1421,8 +1421,19 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   (Codex r1을 4관점 검증과 r2·r3로 줄임)에 따라 coordinator·`TopicGraphLoss`는 바꾸지 않고 coordinator 누적 graphLoss도
   소비하지 않는다. sink와 기록기는 프로세스 수명이고 자료 수명은 reducer 폐기가 맡는다. 한 sink에 coordinator 하나, 기록기와
   gate의 공급자 공유, 같은 fence 철회가 end 또는 invalidations를 올린다는 deliverer 계약은 RT01에서 다시 확인한다.
-  다음: F2 dormant 나머지는 F2d(요청 capture·응답 동기
-  인계) → F2f(holder 검증 읽기) → F2e(기록기 purge adapter) 순서이고, 그 뒤 runtime 배선이다(F2 설계 합의 r2). runtime
+  · F2d `8c12749` 요청 coordinator의 선택적 recorder(startTab에서만 recorder·1d key·채택된 catalog가 있을 때 그 탭의
+  1d allSeries를 등록 자신의 fence·lifetime으로 한 번 capture해 등록에 보관, 성공 완료는 coordinator 채택 뒤·발행 전에
+  원 fence·lifetime으로 적용, catalog 채택 발행 직후 `replayPending`, recorder 호출 실패는 호출마다 격리해
+  `onEventFailure`로 보고. 복구 요청의 발송·재시도 시점은 RT03/RT05)
+  · F2f `2f14da6` 화면 holder의 선택적 recorder(recorder.state는 변경 알림으로만 구독하고 발행 때 현재 소비자의
+  fence·lifetime으로 `exposed`를 읽음. live와 합치지 않고 빈 결과도 live로 채우지 않으며, holder는 recorder를
+  start·close하지 않음)
+  · F2e `169259c` 메모리 purge 대상 `memory:graph_recorder`(DERIVED_HERE·USER 축만, adapter는 시험 fixture에서만 등록).
+  adapter가 대상·축·owner·현재 epoch 검증 뒤 공통 직렬 실행자에서 기록기·sink·coordinator 순서로 그 owner의 현재 아닌
+  모든 epoch를 정리하고, 현재 fence가 선택된 scope면 Failed. 완료 범위는 기록기 상태·sink 큐와 장부·등록된 복구
+  capture이고, 진행 중 요청이 붙잡은 해제 등록·coordinator entries와 protected slots·화면 발행·topic 세션 graph loss
+  기록은 runtime 정리 몫이다. 세 보유처의 같은 조립·실행자는 RT01에서 확인한다.
+  F2 dormant는 F2e로 끝났다. 다음은 runtime 배선이다(F2 설계 합의 r2). runtime
   앞에 S1 잔여(봉인·재승인·정리 재개)와 동결 후 7번 대조를 게이트로 둔다(F1 설계 합의 r2). T25는 공용 GraphChart 회귀만 C2b-2에서 확인했고 나머지는 F2에 남는다.
   실제 purger를 포함한 S4 최종 DoD 재검증은 P3-i 활성화 뒤에 하고, F2에서는 placeholder purger 아래 회귀 0만 본다.
 
