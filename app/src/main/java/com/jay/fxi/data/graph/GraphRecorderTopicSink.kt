@@ -43,6 +43,11 @@ internal interface GraphTopicInputConsumer {
  * stops acceptance and discards pending work, including cancellation before its body ever runs.
  * CLOSED is returned before reading an input. A conflated wake send needs no failure handling:
  * it succeeds while open, and a closed channel belongs to an already ended pipeline.
+ *
+ * [purge] removes only selected scopes from the queue and ledger, preserving inputs without a
+ * scope and the order of survivors. It refunds cached units and answers whether any item was
+ * removed, judged by count rather than units, so a zero-unit input counts. Call it on the serial executor outside consumer calls: a dequeued
+ * input or a handed-over ledger is no longer held here. It calls no consumer and does not close.
  */
 internal class GraphRecorderTopicSink(
     scope: CoroutineScope,
@@ -84,6 +89,21 @@ internal class GraphRecorderTopicSink(
             wake.trySend(Unit)
             TopicGraphOffer.FAILED
         }
+    }
+
+    /** Scans and commits under one lock; a throwing selector leaves both holdings unchanged. */
+    fun purge(selects: (GraphDataScope) -> Boolean): Boolean = synchronized(lock) {
+        if (closed) return false
+        val kept = queue.filter { queued -> ownerScope(queued.input)?.let(selects) != true }
+        val keptLedger = ledger.filterKeys { !selects(it) }
+        val removed = kept.size != queue.size || keptLedger.size != ledger.size
+        if (removed) {
+            queue.clear()
+            queue.addAll(kept)
+            usedUnits = kept.sumOf { it.units }
+            ledger = keptLedger.toMutableMap()
+        }
+        removed
     }
 
     fun close() {
@@ -149,12 +169,17 @@ internal class GraphRecorderTopicSink(
         wake.close()
     }
 
-    private fun recordLocked(input: TopicGraphInput) {
+    private fun ownerScope(input: TopicGraphInput): GraphDataScope? {
         val owner = when (input) {
             is TopicGraphInput.Observations -> input.attribution.owner
             is TopicGraphInput.Continuity -> input.authority.owner
-        } ?: return
-        val epoch = owner.userAccessEpoch ?: return
+        } ?: return null
+        val epoch = owner.userAccessEpoch ?: return null
+        return GraphDataScope(owner.identity.uid, epoch)
+    }
+
+    private fun recordLocked(input: TopicGraphInput) {
+        val owner = ownerScope(input) ?: return
         val invalidations = when (input) {
             is TopicGraphInput.Observations -> input.attribution.lifetime.invalidations
             is TopicGraphInput.Continuity -> input.authority.lifetime?.invalidations
@@ -163,7 +188,7 @@ internal class GraphRecorderTopicSink(
             is TopicGraphInput.Observations -> setOf(input.topic)
             is TopicGraphInput.Continuity -> input.topics
         }
-        val byTopic = ledger.getOrPut(GraphDataScope(owner.identity.uid, epoch)) { mutableMapOf() }
+        val byTopic = ledger.getOrPut(owner) { mutableMapOf() }
         for (topic in topics) {
             byTopic[topic] = maxOf(byTopic[topic] ?: invalidations, invalidations)
         }

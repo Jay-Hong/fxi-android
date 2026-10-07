@@ -107,17 +107,20 @@ class PurgeManifestTest {
     }
 
     /**
-     * The surfaces classified as this purger's own work are the S3 topic last-known store (S3-R2) and the two S4 Graph V2
-     * disk stores (B1a-2: general per UID and user epoch; KRX per UID, user and capability epoch).
+     * The surfaces classified as this purger's own work are the S3 topic last-known store (S3-R2), the two S4 Graph V2
+     * disk stores (B1a-2: general per UID and user epoch; KRX per UID, user and capability epoch) and the S4 session-memory
+     * graph recorder (F2e: its state, its sink's queue and ledger and the request coordinator's registered captures).
      *
-     * The topic and graph runtimes are still not wired (동결 후 13번); the stores landed ahead of them, with their deletion
-     * adapters not registered in production, so a purge stays Deferred. Any other `DERIVED_HERE` entry means either another
-     * runtime landed — and this test should be updated with it — or a legacy surface was quietly reclassified.
+     * The topic and graph runtimes are still not wired (동결 후 13번); the stores and the recorder landed ahead of them, with
+     * their deletion adapters not registered in production, so a purge stays Deferred. The memory target is a process holder,
+     * not a storage surface, so the source walks above cannot see it; it is pinned here by name. Any other `DERIVED_HERE` entry
+     * means either another runtime landed — and this test should be updated with it — or a legacy surface was quietly
+     * reclassified.
      */
     @Test
-    fun `the derived targets are the topic last-known store and the graph v2 stores`() {
+    fun `the derived targets are the topic last-known store, the graph v2 stores and the graph recorder`() {
         assertEquals(
-            setOf("datastore:fxi_topic_last_known", "file:graph_v2_general", "file:graph_v2_krx"),
+            setOf("datastore:fxi_topic_last_known", "file:graph_v2_general", "file:graph_v2_krx", "memory:graph_recorder"),
             PurgeManifest.TARGETS.filter { it.classification == PurgeClassification.DERIVED_HERE }.map { it.id }.toSet()
         )
     }
@@ -136,6 +139,22 @@ class PurgeManifestTest {
         assertEquals("account deletion obligation", target.owner)
         assertTrue(target.note.isNotBlank())
         assertEquals(target.id, GraphSelectionPurgeAdapter.TARGET_ID)
+    }
+
+    /**
+     * S4 F2e (A3): the session-memory graph recorder is one derived target on the user axis alone, apart from the general disk
+     * store, deleted by the adapter that answers for exactly this id.
+     */
+    @Test
+    fun `the graph recorder memory target is derived on the user axis`() {
+        val matching = PurgeManifest.TARGETS.filter { it.id == "memory:graph_recorder" }
+        assertEquals("정확히 한 항목", 1, matching.size)
+        val target = matching.single()
+        assertEquals(PurgeClassification.DERIVED_HERE, target.classification)
+        assertEquals(setOf(PurgeScope.USER), target.scopes)
+        assertEquals("S4", target.owner)
+        assertTrue(target.note.isNotBlank())
+        assertEquals(target.id, GraphRecorderPurgeAdapter.TARGET_ID)
     }
 
     /** The legacy surfaces keep the owners §9.1 gave them. */

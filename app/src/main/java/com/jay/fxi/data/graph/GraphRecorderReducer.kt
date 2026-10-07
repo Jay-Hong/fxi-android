@@ -60,6 +60,23 @@ internal object GraphRecorderReducer {
         it.userAccessEpoch?.let { epoch -> GraphDataScope(it.identity.uid, epoch) }
     }
 
+    /**
+     * Clears the selected held scope without synchronizing access. The seen values and nextVersion stay; versionFloor becomes
+     * nextVersion, as on a discard.
+     */
+    fun purge(state: GraphRecorderState, selects: (GraphDataScope) -> Boolean): GraphRecorderState {
+        val held = state.scope ?: return state
+        if (!selects(held)) return state
+        return updated(
+            state,
+            scope = null,
+            series = emptyMap(),
+            pending = GraphPendingInputs.EMPTY,
+            untransferredSeries = emptySet(),
+            versionFloor = state.nextVersion
+        )
+    }
+
     fun syncAccess(
         state: GraphRecorderState,
         snapshot: TopicAccessSnapshot,

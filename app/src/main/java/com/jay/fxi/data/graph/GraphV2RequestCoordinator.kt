@@ -141,12 +141,13 @@ internal class GraphV2RequestCoordinator(
         val originalTab: String,
         val activityGeneration: Long,
         val accessCapture: GraphV2AccessCapture? = null,
-        val recoveryRequests: List<GraphRecoveryRequest> = emptyList()
+        recoveryRequests: List<GraphRecoveryRequest> = emptyList()
     ) {
         // The only request-owned mutable value consulted outside the loop. Job completion is
         // not disposal: the response still has to pass the loop's application boundary.
         val disposed = AtomicBoolean(false)
         // Everything below is loop-confined, including the final capture-to-fetch checkpoint.
+        var recoveryRequests: List<GraphRecoveryRequest> = recoveryRequests
         var capturedOwner: AuthSnapshot? = null
         var waitingForFloor = false
         var departed = false
@@ -316,6 +317,27 @@ internal class GraphV2RequestCoordinator(
     fun onDeactivated() { inbox.trySend(Event.Deactivate) }
     fun onContextChanged() { inbox.trySend(Event.ContextChanged) }
     fun onRefreshRequested(force: Boolean = false) { inbox.trySend(Event.Refresh(force)) }
+
+    /**
+     * Drops selected recovery captures from registered tab requests, without suspension. It must run
+     * on the coordinator's serial executor between loop events: it reads and writes loop-confined
+     * state directly and does not dispatch. Only the selected captures go: nothing is released,
+     * cancelled or published, and the coordinator handles each answer as before. A purge covers only
+     * the captures registered now; a released registration still held by an in-flight request, and
+     * the coordinator's entries and protected slots, are runtime cleanup.
+     */
+    fun purgeRecoveryCaptures(selects: (GraphDataScope) -> Boolean): Boolean {
+        var removed = false
+        for (registration in tabRequests.values) {
+            val before = registration.recoveryRequests
+            val kept = before.filterNot { selects(it.seriesKey.scope) }
+            if (kept.size != before.size) {
+                registration.recoveryRequests = kept
+                removed = true
+            }
+        }
+        return removed
+    }
 
     /** A single publication pairs each entry with its components and the current use context. */
     fun protectedEntry(key: GraphKey): GraphEntry? {

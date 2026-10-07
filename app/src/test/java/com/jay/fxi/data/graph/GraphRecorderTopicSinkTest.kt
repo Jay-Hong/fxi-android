@@ -23,6 +23,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.datetime.Instant
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -54,6 +55,14 @@ import org.junit.Test
  *
  * Not here: the recorder's own rules (above), the S3 coordinator's traces with a real sink (TopicSessionCoordinatorTest
  * GOBS-20). The implementation thread reads but does not edit this file.
+ *
+ * r2 adds the S4 F2e purge row K07 (design R4c/S4 f2e_design_codex.r1, cut down by f2e_review_claude.r1 and agreed in
+ * f2e_design_codex.r2; oracle ANDROID_V2_PLAN.md :1025):
+ *  - `purge(selects)` removes the queued inputs and ledger scopes whose original owner scope (uid, epoch) is selected, derived
+ *    as the ledger derives it. An input without an owner or an epoch has no scope and is never selected. Removed inputs give
+ *    back their cached units; the rest keep their order. It answers whether anything was removed, judged by count, not by
+ *    units. It neither wakes nor closes anything, and a closed sink answers false. It is called on the sink's executor,
+ *    outside any consumer call.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphRecorderTopicSinkTest {
@@ -64,6 +73,8 @@ class GraphRecorderTopicSinkTest {
     private val fenceN = TopicSessionFence(identity, "e1", grant)
     private val fenceN2 = TopicSessionFence(identity, "e2", grant)
     private val noEpoch = TopicSessionFence(identity, null, grant)
+    private val fenceN3 = TopicSessionFence(identity, "e3", grant)
+    private val fenceU2 = TopicSessionFence(AuthIdentityFence("u2", 1L), "e1", grant)
     private val scopeN = GraphDataScope("u1", "e1")
     private val scopeN2 = GraphDataScope("u1", "e2")
     private val l3 = TopicUseLifetime(grant, 3L)
@@ -313,6 +324,56 @@ class GraphRecorderTopicSinkTest {
                 assertEquals("$failOnLoss: nothing retried", expected, consumer.calls)
                 assertTrue("$failOnLoss", scope.isActive)
             }
+        }
+    }
+
+    /**
+     * K07 (F2e C3): a purge removes exactly the selected queued inputs and ledger scopes - never one without an owner or an
+     * epoch - gives their units back, keeps the rest in order and says whether anything went, also for a zero-unit input; a
+     * second purge and a closed sink answer false.
+     */
+    @Test fun K07_aPurgeRemovesTheSelectedScopesOnly() = sinkTest {
+        val retired: (GraphDataScope) -> Boolean = { it.uid == "u1" && it.userAccessEpoch != "e2" }
+        Rig(this).run {
+            val o1 = obs(300)
+            val o2 = obs(10, owner = fenceU2)
+            val o3 = obs(10, owner = fenceN2)
+            val c4 = fact(owner = fenceN3)
+            val c5 = fact(owner = null)
+            val o6 = obs(5, owner = noEpoch)
+            listOf(o1, o2, o3, c4, c5, o6).forEach { assertEquals(TopicGraphOffer.ENQUEUED, sink.tryOffer(it)) }
+            listOf(fenceN, fenceU2, fenceN2).forEach { assertEquals(TopicGraphOffer.FULL, sink.tryOffer(obs(513, owner = it))) }
+            assertTrue(sink.purge(retired))
+            assertFalse("nothing selected is left", sink.purge(retired))
+            val fill = obs(486, owner = fenceN2)
+            assertEquals("the refund fits exactly", TopicGraphOffer.ENQUEUED, sink.tryOffer(fill))
+            assertEquals("and no more", TopicGraphOffer.FULL, sink.tryOffer(fact(owner = null)))
+            assertTrue("a purge calls nothing", consumer.calls.isEmpty())
+            runCurrent()
+            assertEquals(
+                "the rest, in order",
+                listOf(Call.Obs(o2), Call.Obs(o3), Call.Cont(c5), Call.Obs(o6), Call.Obs(fill)),
+                consumer.calls.filter { it !is Call.Lose }
+            )
+            val losses = consumer.calls.filterIsInstance<Call.Lose>()
+            assertEquals(2, losses.size)
+            assertEquals(
+                setOf(Call.Lose(GraphDataScope("u2", "e1"), mapOf("fx:usd-krw" to 3L)), Call.Lose(scopeN2, mapOf("fx:usd-krw" to 3L))),
+                losses.toSet()
+            )
+        }
+        Rig(this).run {
+            assertEquals(TopicGraphOffer.ENQUEUED, sink.tryOffer(obs(0)))
+            assertTrue("a zero-unit input counts", sink.purge(retired))
+            runCurrent()
+            assertTrue(consumer.calls.isEmpty())
+        }
+        Rig(this).run {
+            sink.tryOffer(obs(1))
+            sink.close()
+            assertFalse(sink.purge(retired))
+            runCurrent()
+            assertEquals(listOf<Call>(Call.Close), consumer.calls)
         }
     }
 }

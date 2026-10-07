@@ -8,7 +8,9 @@ import com.jay.fxi.data.entitlements.TopicAccessEndReason
 import com.jay.fxi.data.entitlements.TopicAccessFacts
 import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.remote.TopicGrantToken
+import com.jay.fxi.data.remote.TopicGraphAuthority
 import com.jay.fxi.data.remote.TopicGraphCandidate
+import com.jay.fxi.data.remote.TopicGraphEventKind
 import com.jay.fxi.data.remote.TopicGraphInput
 import com.jay.fxi.data.remote.TopicGraphPath
 import com.jay.fxi.data.remote.TopicSessionFence
@@ -73,8 +75,22 @@ import org.junit.Test
  *  - The catalog is read from its supplier on every observe.
  *  - Serial execution is the caller's duty; the gate and the recorder share the snapshot and fence suppliers.
  *
- * Not here: continuity, replay, session acceptance, sending, timers, purge (F2b-F2f), and binding a request to the recorder
- * instance that issued it (F2d). The implementation thread reads but does not edit this file.
+ * Not here: continuity, replay, session acceptance, sending, timers, and binding a request to the recorder instance that issued
+ * it (F2d). The implementation thread reads but does not edit this file.
+ *
+ * r5 adds the S4 F2e purge rows C1 and C2 (design R4c/S4 f2e_design_codex.r1, cut down by f2e_review_claude.r1 after a five-lens
+ * verification and agreed in f2e_design_codex.r2; oracles ANDROID_V2_PLAN.md :1025 (the user purge covers the session-memory
+ * graph recorder) and ScopePurger.kt (Completed means gone or proven absent)):
+ *  - `purge(selects)` is a deletion, not a close and not an access decision. It reads no snapshot, no catalog and no clock and
+ *    does not sync. After a close it reads nothing and answers NOTHING_TO_REMOVE.
+ *  - It reads the current fence once, first: when that fence's (uid, epoch) is selected it changes nothing and answers
+ *    LIVE_SCOPE_SELECTED - the next sync would adopt that scope again, so clearing it would be a false completion. A null fence
+ *    or a null epoch goes on.
+ *  - A selected held scope loses its series, held inputs, lost topics and untransferred markers and becomes null; seenRevision,
+ *    seenUserEnd and nextVersion stay and versionFloor becomes nextVersion (the discard branch's rule; `empty()` is not used).
+ *    The new state is published once. The answer is judged on the state before the call: REMOVED when any of those four held
+ *    something, otherwise NOTHING_TO_REMOVE - a selected scope with nothing left is still cleared. An unselected or null scope
+ *    is the same instance, unpublished.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphRecorderTest {
@@ -222,7 +238,10 @@ class GraphRecorderTest {
             return if (queue.size > 1) queue.removeFirst() else queue.first()
         }
 
+        var fenceReads = 0
+
         private fun readFence(): TopicSessionFence? {
+            fenceReads++
             val queue = fenceSequence ?: return fence
             return if (queue.size > 1) queue.removeFirst() else queue.first()
         }
@@ -250,7 +269,35 @@ class GraphRecorderTest {
             recorder.observe(batch(1341.7, kst("20:01:00")))
             assertTrue("premise: kb adopted", kb in state().series)
         }
+
+        /**
+         * Scope N holding all four kinds of data: kb with an issued request, untransferred markers from a topic loss, an input
+         * held without a catalog and a topic lost without one. The catalog supplier is left absent.
+         */
+        fun loaded(): Rig = apply {
+            withKb()
+            assertEquals(1, recorder.captureRequests(setOf(kb), fenceN, l3).size)
+            recorder.loseTopics(scopeN, mapOf("fx:usd-krw" to 3L))
+            catalogNow = null
+            recorder.observe(batch(1341.8, kst("20:01:10")))
+            protectedOpen = false
+            recorder.observe(batch(1341.9, kst("20:01:20")))
+            protectedOpen = true
+            val s = state()
+            assertTrue("premise: every kind held", s.series.isNotEmpty() && s.pending.inputs.isNotEmpty() &&
+                s.pending.lostTopics.isNotEmpty() && s.untransferredSeries.isNotEmpty())
+            assertTrue("premise: a version issued", s.nextVersion > s.versionFloor)
+        }
     }
+
+    /** A DELIVERY_RESUMED fact for usd from [owner] under [lifetime]. */
+    private fun resumed(owner: TopicSessionFence, lifetime: TopicUseLifetime = l3) = TopicGraphInput.Continuity(
+        1L, TopicGraphEventKind.DELIVERY_RESUMED, null, setOf("fx:usd-krw"), setOf(TopicGraphPath.WS),
+        TopicGraphAuthority(Any(), owner, 1L, lifetime), 1L, kst("20:01:30").toEpochMilliseconds()
+    )
+
+    /** The purge of user u1 keeping epoch e2. */
+    private val retired: (GraphDataScope) -> Boolean = { it.uid == "u1" && it.userAccessEpoch != "e2" }
 
     private fun Rig.children() = scope.coroutineContext[kotlinx.coroutines.Job]!!.children.count()
 
@@ -642,6 +689,141 @@ class GraphRecorderTest {
             rig.sequence = ArrayDeque(listOf(snap(1), snap(2, invalidations = 4L)))
             rig.recorder.applyResponse(request, tab(listOf(closed(b, 1341.5))), fenceN, l3)
             assertNull(rig.state().series.getValue(kb).lastAppliedVersion)
+        }
+    }
+
+    // --- F2e C1-C2: purge ------------------------------------------------------------------------------------------------
+
+    /**
+     * C1: a selected held scope is cleared - all four kinds of data and the scope itself - while the control values stay and the
+     * response floor reaches the last issued version, published once and judged on the state before the call. The current fence
+     * is read once and first; nothing else is read, so a stale snapshot does not stop it and nothing is synced. A selected scope
+     * that is still current is refused untouched; unselected, absent and closed scopes are left alone; a selected scope already
+     * emptied by an end is still cleared.
+     */
+    @Test fun C1_purgeClearsTheSelectedHeldScope() = recorderTest {
+        Rig(this).loaded().let { rig ->
+            rig.fence = fenceN2
+            rig.snapshot = snap(0)
+            rig.record()
+            val held = whole(rig.state())
+            val count = rig.emissions.size
+            val snapshotReads = rig.snapshotReads
+            val catalogReads = rig.catalogReads
+            val clockReads = rig.clockReads
+            val fenceReads = rig.fenceReads
+            assertEquals(GraphRecorderPurge.REMOVED, rig.recorder.purge(retired))
+            assertEquals(
+                held.copy(
+                    scope = null, series = emptyMap(), pendingInputs = emptyList(), lostTopics = emptySet(),
+                    untransferred = emptySet(), versionFloor = held.nextVersion
+                ),
+                whole(rig.state())
+            )
+            assertEquals("published once", count + 1, rig.emissions.size)
+            assertEquals("no snapshot read", snapshotReads, rig.snapshotReads)
+            assertEquals("no catalog read", catalogReads, rig.catalogReads)
+            assertEquals("no clock read", clockReads, rig.clockReads)
+            assertEquals("the fence read once", fenceReads + 1, rig.fenceReads)
+        }
+        Rig(this).loaded().let { rig ->
+            rig.record()
+            val before = rig.state()
+            val count = rig.emissions.size
+            assertEquals("the held scope is still current", GraphRecorderPurge.LIVE_SCOPE_SELECTED, rig.recorder.purge(retired))
+            assertSame(before, rig.state())
+            assertEquals(count, rig.emissions.size)
+        }
+        Rig(this).loaded().let { rig ->
+            rig.fence = TopicSessionFence(identity, null, grant)
+            assertEquals("a fence without an epoch names no scope", GraphRecorderPurge.REMOVED, rig.recorder.purge(retired))
+        }
+        Rig(this).let { rig ->
+            rig.fence = fenceN2
+            rig.recorder.observe(batch(1341.7, kst("20:01:00"), owner = fenceN2))
+            assertTrue("premise: the kept scope holds kb", kbN2 in rig.state().series)
+            rig.record()
+            val before = rig.state()
+            val count = rig.emissions.size
+            assertEquals(GraphRecorderPurge.NOTHING_TO_REMOVE, rig.recorder.purge(retired))
+            assertSame("the kept scope", before, rig.state())
+            assertEquals(count, rig.emissions.size)
+        }
+        Rig(this).loaded().let { rig ->
+            rig.fence = null
+            val before = rig.state()
+            assertEquals(GraphRecorderPurge.NOTHING_TO_REMOVE, rig.recorder.purge { it.uid == "u2" })
+            assertSame("another user's purge", before, rig.state())
+        }
+        Rig(this).let { rig ->
+            rig.fence = null
+            val before = rig.state()
+            assertEquals(GraphRecorderPurge.NOTHING_TO_REMOVE, rig.recorder.purge(retired))
+            assertSame("no scope", before, rig.state())
+        }
+        Rig(this).withKb().let { rig ->
+            rig.snapshot = snap(2, userEnd = 1)
+            rig.recorder.replayPending()
+            assertEquals("premise: the end emptied the held scope", scopeN, rig.state().scope)
+            assertTrue(rig.state().series.isEmpty())
+            rig.fence = null
+            rig.record()
+            val held = whole(rig.state())
+            val count = rig.emissions.size
+            assertEquals(GraphRecorderPurge.NOTHING_TO_REMOVE, rig.recorder.purge(retired))
+            assertEquals("cleared all the same", held.copy(scope = null), whole(rig.state()))
+            assertEquals(count + 1, rig.emissions.size)
+        }
+        Rig(this).loaded().let { rig ->
+            rig.recorder.close()
+            val closed = rig.state()
+            val fenceReads = rig.fenceReads
+            assertEquals(GraphRecorderPurge.NOTHING_TO_REMOVE, rig.recorder.purge(retired))
+            assertEquals("nothing read after close", fenceReads, rig.fenceReads)
+            assertSame(closed, rig.state())
+        }
+    }
+
+    /**
+     * C2: with no current fence and no new end, late inputs from a purged scope at or above the floor - an observation without a
+     * catalog, a DELIVERY_RESUMED and a topic loss - leave nothing, although the same inputs leave a loss, a held resume and a
+     * lost topic on a recorder that was not purged; a later scope is then recorded as usual.
+     */
+    @Test fun C2_aPurgedScopeStaysSealedAndTheRecorderStaysInUse() = recorderTest {
+        Rig(this).withKb().let { control ->
+            control.fence = null
+            control.catalogNow = null
+            control.recorder.observe(batch(1342.0, kst("20:01:40")))
+            assertEquals("control: the observation is lost", setOf("fx:usd-krw"), control.state().pending.lostTopics)
+            control.recorder.observe(resumed(fenceN))
+            assertEquals("control: the resume is held", 1, control.state().pending.inputs.size)
+            control.recorder.loseTopics(scopeN, mapOf("fx:jpy-krw" to 3L))
+            assertTrue("control: the topic is lost", "fx:jpy-krw" in control.state().pending.lostTopics)
+        }
+        Rig(this).loaded().let { rig ->
+            rig.fence = null
+            assertEquals(GraphRecorderPurge.REMOVED, rig.recorder.purge(retired))
+            // syncAccess builds a new state on every call, so these compare fields rather than instances.
+            fun assertSealed(label: String) {
+                val s = rig.state()
+                assertNull(label, s.scope)
+                assertTrue(label, s.series.isEmpty())
+                assertTrue(label, s.pending.inputs.isEmpty())
+                assertTrue(label, s.pending.lostTopics.isEmpty())
+                assertTrue(label, s.untransferredSeries.isEmpty())
+            }
+            rig.recorder.observe(batch(1342.0, kst("20:01:40")))
+            assertSealed("observation")
+            rig.recorder.observe(resumed(fenceN))
+            assertSealed("resume")
+            rig.recorder.loseTopics(scopeN, mapOf("fx:jpy-krw" to 3L))
+            assertSealed("topic loss")
+
+            rig.fence = fenceN2
+            rig.catalogNow = catalog
+            rig.recorder.observe(batch(1342.5, kst("20:01:50"), owner = fenceN2))
+            assertEquals(scopeN2, rig.state().scope)
+            assertTrue("a later scope is recorded", kbN2 in rig.state().series)
         }
     }
 }

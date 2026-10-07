@@ -4,15 +4,28 @@ import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.entitlements.EntitlementsIdentity
+import com.jay.fxi.data.entitlements.PendingPurge
+import com.jay.fxi.data.entitlements.PurgeNamespace
+import com.jay.fxi.data.entitlements.PurgeResult
+import com.jay.fxi.data.entitlements.PurgeScope
 import com.jay.fxi.data.entitlements.TopicAccessBlock
 import com.jay.fxi.data.entitlements.TopicAccessFacts
 import com.jay.fxi.data.entitlements.TopicAccessSnapshot
+import com.jay.fxi.data.entitlements.purge.GraphRecorderPurgeAdapter
+import com.jay.fxi.data.entitlements.purge.ManifestScopePurger
+import com.jay.fxi.data.entitlements.purge.PurgeCause
+import com.jay.fxi.data.entitlements.purge.PurgeClassification
+import com.jay.fxi.data.entitlements.purge.PurgeManifest
+import com.jay.fxi.data.entitlements.purge.PurgeRequest
+import com.jay.fxi.data.entitlements.purge.PurgeTarget
+import com.jay.fxi.data.entitlements.purge.TargetOutcome
 import com.jay.fxi.data.remote.AuthenticatedFailureKind
 import com.jay.fxi.data.remote.AuthenticatedHttpFailure
 import com.jay.fxi.data.remote.AuthenticatedHttpResponse
 import com.jay.fxi.data.remote.TopicGrantToken
 import com.jay.fxi.data.remote.TopicGraphCandidate
 import com.jay.fxi.data.remote.TopicGraphInput
+import com.jay.fxi.data.remote.TopicGraphOffer
 import com.jay.fxi.data.remote.TopicGraphPath
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.remote.TopicUseAttribution
@@ -39,6 +52,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -54,6 +68,7 @@ import okhttp3.Headers
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -88,6 +103,27 @@ import org.junit.Test
  *
  * Not here: when recovery requests are triggered, retried or scheduled (RT03/RT05), the recorder's own rules (F1-F2b
  * contracts). The implementation thread reads but does not edit this file.
+ *
+ * r2 adds the S4 F2e purge rows R6-R9 (design R4c/S4 f2e_design_codex.r1, cut down by f2e_review_claude.r1 after a five-lens
+ * verification and agreed in f2e_design_codex.r2; oracles ANDROID_V2_PLAN.md :1025 (the user purge covers the session-memory
+ * graph recorder and its recovery requests), :323-324, ScopePurger.kt and ManifestScopePurger.kt). They live in this file so
+ * the real coordinator, recorder and gate of its fixture are reused rather than copied:
+ *  - `purgeRecoveryCaptures(selects)` drops each registered tab request's captures whose series scope is selected and says
+ *    whether any went. It releases, cancels and publishes nothing, and runs on the coordinator's executor.
+ *  - `GraphRecorderPurgeAdapter(recorder, sink, coordinator, serialDispatcher)` answers for the manifest target
+ *    `memory:graph_recorder` (DERIVED_HERE, user axis only). Before touching anything it answers Failed for a target other
+ *    than the manifest's own (compared whole), an axis other than USER or an entry without USER, a null or blank owner or a
+ *    namespace owner that differs, and a retired epoch equal to a non-null kept one. A blank epoch is not refused.
+ *  - Then it enters `serialDispatcher` with `withContext` - from that executor this does not dispatch again - and, in one
+ *    block without suspension, asks the recorder, then the sink, then the coordinator with one selector: the entry's owner and
+ *    any epoch but the namespace's current one (every epoch when there is none); the entry's own epoch narrows nothing. A
+ *    recorder refusal for a live selected scope is Failed with the sink and the coordinator untouched. Each holder's answer is
+ *    taken on its own: Removed when any removed something, NothingToRemove otherwise. Exceptions are not caught; the manifest
+ *    purger turns a throw into Failed and lets a cancellation through.
+ *  - The three holders come from one assembly on one executor; nothing checks that at run time (RT01 does).
+ *  - Completion covers the recorder state, the sink's queue and ledger and the registered captures at that moment. A released
+ *    registration still held by an in-flight request, the coordinator's entries and protected slots, a screen holder's
+ *    publication and the topic session's graph loss record are runtime cleanup, not this target.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphV2RecoveryRequestContractTest {
@@ -124,7 +160,8 @@ class GraphV2RecoveryRequestContractTest {
 
     /** GraphV2RequestCoordinatorTest's fixture, field for field, plus a recorder on the same suppliers and executor. */
     private class Fixture(test: TestScope, start: Instant = NOON, withRecorder: Boolean = true) {
-        val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(test.testScheduler))
+        val dispatcher = StandardTestDispatcher(test.testScheduler)
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
         /** Virtual time already spent by earlier fixtures in the same test; this fixture's clock starts at [start]. */
         private val base = test.testScheduler.currentTime
         var fence: TopicSessionFence? = sessionFence()
@@ -253,6 +290,10 @@ class GraphV2RecoveryRequestContractTest {
             )
         }
 
+        /** Built on first use only, so rows without a purge keep their executor queue as it was. */
+        val sink by lazy { GraphRecorderTopicSink(scope, recorder) }
+        val adapter by lazy { GraphRecorderPurgeAdapter(recorder, sink, coordinator, dispatcher) }
+
         val state get() = coordinator.state.value
         fun tabs(key: GraphKey? = null) = sent.filter { it.kind == "tab" && (key == null || it.key == key) }
         fun catalogs() = sent.filter { it.kind == "catalog" }
@@ -268,6 +309,13 @@ class GraphV2RecoveryRequestContractTest {
                 TopicUseAttribution(Any(), checkNotNull(fence), 1L, lifetime()), 1L,
                 listOf(TopicGraphCandidate.Quote(source, "$currency-krw", rate, at, null))
             )
+
+        /** A usd quote of [source] owned by [owner], with the lifetime the fixture would give that owner now. */
+        fun quoteAs(owner: TopicSessionFence, source: String, at: Instant, rate: Double = 1390.0) = TopicGraphInput.Observations(
+            1L, "fx:usd-krw", TopicGraphPath.WS,
+            TopicUseAttribution(Any(), owner, 1L, TopicUseLifetime(owner.grant, invalidations)), 1L,
+            listOf(TopicGraphCandidate.Quote(source, "usd-krw", rate, at, null))
+        )
 
         /** The gate refuses the quote, so an existing series keeps a HANDOVER_LOSS for its bucket. */
         fun lose(source: String, at: Instant) {
@@ -524,6 +572,272 @@ class GraphV2RecoveryRequestContractTest {
             assertEquals(1, f.failures.size)
             advanceTimeBy(3_000); runCurrent()
             assertEquals("the cold retry still runs", 2, f.tabs(USD_1D).size)
+        }
+    }
+
+    // --- F2e: purge ----------------------------------------------------------------------------------------------------
+
+    private val memoryTarget: PurgeTarget get() = checkNotNull(PurgeManifest.byId(GraphRecorderPurgeAdapter.TARGET_ID))
+
+    /** A user-axis request retiring u1's e1 while e2 is current, unless told otherwise. */
+    private fun request(
+        owner: String? = "u1",
+        keep: String? = "e2",
+        pendingEpoch: String? = "e1",
+        axis: PurgeScope = PurgeScope.USER,
+        scopes: Set<PurgeScope> = setOf(PurgeScope.USER),
+        namespaceOwner: String? = owner,
+        target: PurgeTarget = memoryTarget
+    ) = PurgeRequest(
+        target, axis, PurgeCause.UNKNOWN,
+        PurgeNamespace(namespaceOwner, keep, null, PendingPurge(owner, pendingEpoch, null, scopes))
+    )
+
+    /**
+     * Offers [inputs] and then purges with each of [requests] in one task on the fixture's executor, so the sink's worker, woken
+     * by the offers, runs only after them.
+     */
+    private fun TestScope.inOneTurn(
+        f: Fixture,
+        vararg requests: PurgeRequest,
+        inputs: List<TopicGraphInput> = emptyList()
+    ): List<TargetOutcome> {
+        val run = f.scope.async {
+            inputs.forEach { assertEquals(TopicGraphOffer.ENQUEUED, f.sink.tryOffer(it)) }
+            requests.map { f.adapter.purge(it) }
+        }
+        runCurrent()
+        return run.getCompleted()
+    }
+
+    // --- R6 ----------------------------------------------------------------------------------------------------------
+
+    /**
+     * R6 (F2e C4): a purge drops the registered captures whose series scope is selected and nothing else - the registration,
+     * its in-flight key and the coordinator's own adoption stay, and the recorder gets nothing applied; an unselected purge drops
+     * nothing and the capture is applied as usual; a coordinator without a recorder has nothing to drop.
+     */
+    @Test fun R6_aPurgeDropsTheSelectedCapturesOnly() = recoveryTest {
+        ready().let { f ->
+            f.coordinator.onActivated(USD_1D); runCurrent()
+            assertEquals("premise: sent", 1, f.tabs(USD_1D).size)
+            assertTrue(f.coordinator.purgeRecoveryCaptures { it == SCOPE })
+            assertFalse("nothing selected is left", f.coordinator.purgeRecoveryCaptures { it == SCOPE })
+            assertEquals("no new request", 1, f.tabs(USD_1D).size)
+            assertTrue("still in flight", USD_1D in f.state.inFlight)
+            f.tabs(USD_1D).single().tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1))))); runCurrent()
+            assertTrue("the coordinator still adopts its answer", USD_1D in f.state.entries)
+            assertTrue("nothing applied to the recorder", B1 in f.series(KB).pending)
+        }
+        ready().let { f ->
+            f.coordinator.onActivated(USD_1D); runCurrent()
+            assertFalse(f.coordinator.purgeRecoveryCaptures { it.userAccessEpoch == "e2" })
+            f.tabs(USD_1D).single().tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1))))); runCurrent()
+            assertFalse("applied as usual", B1 in f.series(KB).pending)
+        }
+        ready(withRecorder = false).let { f ->
+            f.coordinator.onActivated(USD_1D); runCurrent()
+            assertFalse(f.coordinator.purgeRecoveryCaptures { true })
+        }
+    }
+
+    // --- R7 ----------------------------------------------------------------------------------------------------------
+
+    /**
+     * R7 (F2e A1): another or a forged target, another axis, an entry without the user axis, a missing, blank or mismatched
+     * owner, or a retired epoch equal to the kept one is refused before any holder is touched. A current fence naming a selected
+     * scope - read when the purge runs on the executor, not when it is called - is refused before the sink is touched. Each time
+     * a valid purge afterwards still finds what was there.
+     */
+    @Test fun R7_refusalsTouchNothing() = recoveryTest {
+        val refused = listOf(
+            "another target" to request(target = checkNotNull(PurgeManifest.byId("file:graph_v2_general"))),
+            "a forged target" to request(target = memoryTarget.copy(classification = PurgeClassification.NOT_USER_DATA)),
+            "the capability axis" to request(axis = PurgeScope.CAPABILITY),
+            "an entry without the user axis" to request(scopes = setOf(PurgeScope.CAPABILITY)),
+            "no owner" to request(owner = null),
+            "an empty owner" to request(owner = ""),
+            "a blank owner" to request(owner = " "),
+            "another namespace owner" to request(namespaceOwner = "u2"),
+            "the kept epoch as retired" to request(keep = "e2", pendingEpoch = "e2")
+        )
+        // Only the sink holds e1.
+        Fixture(this).also { opened += it }.let { f ->
+            f.fence = null
+            for ((label, bad) in refused) {
+                val (first, second) = inOneTurn(f, bad, request(), inputs = listOf(f.quoteAs(sessionFence(), "kb", NOON - 5.seconds)))
+                assertTrue("$label: refused, was $first", first is TargetOutcome.Failed)
+                assertEquals("$label: the sink kept its input", TargetOutcome.Removed, second)
+            }
+        }
+        // Only the recorder holds e1.
+        ready().let { f ->
+            f.fence = null
+            val before = f.rec()
+            for ((label, bad) in refused) {
+                assertTrue(label, inOneTurn(f, bad).single() is TargetOutcome.Failed)
+                assertSame("$label: the recorder is untouched", before, f.rec())
+            }
+            assertEquals(listOf(TargetOutcome.Removed), inOneTurn(f, request()))
+        }
+        // Only a registered capture holds e1.
+        ready().let { f ->
+            f.coordinator.onActivated(USD_1D); runCurrent()
+            f.fence = sessionFence(epoch = "e2")
+            f.recorder.replayPending()
+            assertTrue("premise: the recorder moved to e2 with nothing",
+                f.rec().scope == GraphDataScope("u1", "e2") && f.rec().series.isEmpty())
+            for ((label, bad) in refused) assertTrue(label, inOneTurn(f, bad).single() is TargetOutcome.Failed)
+            assertEquals("the capture outlived every refusal", listOf(TargetOutcome.Removed), inOneTurn(f, request()))
+        }
+        // The current fence still names e1, or any epoch of u1 when nothing is kept.
+        Fixture(this).also { opened += it }.let { f ->
+            val item = f.quoteAs(sessionFence(), "kb", NOON - 5.seconds)
+            val run = f.scope.async {
+                assertEquals(TopicGraphOffer.ENQUEUED, f.sink.tryOffer(item))
+                val live = f.adapter.purge(request())
+                val noKeep = f.adapter.purge(request(keep = null, pendingEpoch = "e0"))
+                f.fence = null
+                listOf(live, noKeep, f.adapter.purge(request()))
+            }
+            runCurrent()
+            val (live, noKeep, after) = run.getCompleted()
+            assertTrue("a live retired scope, was $live", live is TargetOutcome.Failed)
+            assertTrue("a live scope of the owner with nothing kept, was $noKeep", noKeep is TargetOutcome.Failed)
+            assertEquals("the sink kept its input", TargetOutcome.Removed, after)
+        }
+        // The fence turns live after the call and before the purge runs on the executor.
+        Fixture(this).also { opened += it }.let { f ->
+            f.fence = null
+            f.scope.launch { f.fence = sessionFence() }
+            val call = async(UnconfinedTestDispatcher(testScheduler)) { f.adapter.purge(request()) }
+            assertFalse("premise: the purge waits for the executor", call.isCompleted)
+            runCurrent()
+            assertTrue("judged when it ran, was ${call.getCompleted()}", call.getCompleted() is TargetOutcome.Failed)
+        }
+    }
+
+    // --- R8 ----------------------------------------------------------------------------------------------------------
+
+    /**
+     * R8 (F2e A2): one purge answers for the recorder, the sink and the registered captures together. It removes what any of
+     * them holds for any retired epoch of the owner - the entry's named epoch or not, and every one for an entry without an epoch
+     * - and keeps the current one: Removed when anything went, NothingToRemove otherwise. An immediate second purge finds
+     * nothing, so no holder was skipped.
+     */
+    @Test fun R8_onePurgeAnswersForAllThreeHolders() = recoveryTest {
+        val e2 = sessionFence(epoch = "e2")
+        val kbE2 = GraphObservationSeriesKey(GraphDataScope("u1", "e2"), "kb.usd")
+        val twice = listOf(TargetOutcome.Removed, TargetOutcome.NothingToRemove)
+        // All three hold e1 and there is no current fence.
+        ready().let { f ->
+            f.coordinator.onActivated(USD_1D); runCurrent()
+            val item = f.quoteAs(sessionFence(), "hana", NOON - 2.seconds)
+            f.fence = null
+            assertEquals(twice, inOneTurn(f, request(), request(), inputs = listOf(item)))
+            assertNull(f.rec().scope)
+            assertTrue(f.rec().series.isEmpty())
+            assertTrue("the registration stays", USD_1D in f.state.inFlight)
+        }
+        // Only the sink holds e1; the recorder's e2 data is not touched.
+        ready().let { f ->
+            f.fence = e2
+            f.recorder.observe(f.quote("kb", NOON - 1.seconds))
+            assertTrue("premise: kb under e2", kbE2 in f.rec().series)
+            val before = f.rec()
+            assertEquals(twice, inOneTurn(f, request(), request(), inputs = listOf(f.quoteAs(sessionFence(), "kb", NOON - 1.seconds))))
+            assertSame(before, f.rec())
+        }
+        // Only a registered capture holds e1.
+        ready().let { f ->
+            f.coordinator.onActivated(USD_1D); runCurrent()
+            f.fence = e2
+            f.recorder.replayPending()
+            assertTrue("premise: the recorder moved to e2 with nothing",
+                f.rec().scope == GraphDataScope("u1", "e2") && f.rec().series.isEmpty())
+            assertEquals(twice, inOneTurn(f, request(), request()))
+            assertTrue("the registration stays", USD_1D in f.state.inFlight)
+        }
+        // Nothing of a retired epoch anywhere.
+        ready().let { f ->
+            f.fence = e2
+            f.recorder.observe(f.quote("kb", NOON - 1.seconds))
+            val before = f.rec()
+            assertEquals(listOf(TargetOutcome.NothingToRemove), inOneTurn(f, request()))
+            assertSame(before, f.rec())
+        }
+        // The entry names e1 but the recorder holds e3.
+        ready().let { f ->
+            f.fence = sessionFence(epoch = "e3")
+            f.recorder.observe(f.quote("kb", NOON - 1.seconds))
+            f.fence = null
+            assertEquals(twice, inOneTurn(f, request(), request()))
+            assertNull(f.rec().scope)
+        }
+        // A blank retired epoch is not refused; it narrows nothing either.
+        ready().let { f ->
+            f.fence = null
+            assertEquals(listOf(TargetOutcome.Removed), inOneTurn(f, request(pendingEpoch = " ")))
+            assertNull(f.rec().scope)
+        }
+        // The current fence belongs to another user: not a scope this purge selects, so it goes on.
+        Fixture(this).also { opened += it }.let { f ->
+            f.fence = sessionFence(uid = "u2")
+            val item = f.quoteAs(sessionFence(), "kb", NOON - 5.seconds)
+            assertEquals(listOf(TargetOutcome.Removed), inOneTurn(f, request(), inputs = listOf(item)))
+        }
+        // An entry without an epoch: e1 goes; the current e2 and another user's input stay.
+        ready().let { f ->
+            f.fence = e2
+            f.recorder.observe(f.quote("kb", NOON - 3.seconds))
+            val unnamed = request(pendingEpoch = null)
+            val inputs = listOf(
+                f.quoteAs(sessionFence(), "kb", NOON - 2.seconds),
+                f.quoteAs(e2, "kb", NOON - 1.seconds, rate = 1391.0),
+                f.quoteAs(sessionFence(uid = "u2"), "kb", NOON - 1.seconds)
+            )
+            assertEquals(twice, inOneTurn(f, unnamed, unnamed, inputs = inputs))
+            assertTrue("the kept input was delivered",
+                f.rec().series.getValue(kbE2).data.app.observations.any { it.rate == 1391.0 })
+        }
+    }
+
+    // --- R9 ----------------------------------------------------------------------------------------------------------
+
+    /**
+     * R9 (F2e A3): the manifest purger counts the memory target for itself only. Beside an unregistered disk target the user
+     * purge stays Deferred, naming the disk target and not this one, while this target's data is gone; alone it completes; the
+     * capability axis never reaches it.
+     */
+    @Test fun R9_theManifestPurgerCountsTheMemoryTargetForItselfOnly() = recoveryTest {
+        val general = checkNotNull(PurgeManifest.byId("file:graph_v2_general"))
+        val namespace = request().namespace
+        ready().let { f ->
+            f.fence = null
+            val result = ManifestScopePurger(mapOf(GraphRecorderPurgeAdapter.TARGET_ID to f.adapter), listOf(memoryTarget, general))
+                .purgeUserScope(namespace)
+            assertTrue("deferred, was $result", result is PurgeResult.Deferred)
+            val reason = (result as PurgeResult.Deferred).reason
+            assertTrue(reason, "file:graph_v2_general(no adapter)" in reason)
+            assertFalse(reason, GraphRecorderPurgeAdapter.TARGET_ID in reason)
+            assertNull("this target's data is gone", f.rec().scope)
+        }
+        ready().let { f ->
+            f.fence = null
+            assertEquals(
+                PurgeResult.Completed,
+                ManifestScopePurger(mapOf(GraphRecorderPurgeAdapter.TARGET_ID to f.adapter), listOf(memoryTarget)).purgeUserScope(namespace)
+            )
+        }
+        ready().let { f ->
+            f.fence = null
+            val before = f.rec()
+            val both = namespace.copy(
+                pending = namespace.pending.copy(krxCapabilityEpoch = "k1", scopes = setOf(PurgeScope.USER, PurgeScope.CAPABILITY))
+            )
+            val result = ManifestScopePurger(mapOf(GraphRecorderPurgeAdapter.TARGET_ID to f.adapter)).purgeCapabilityScope(both)
+            assertTrue("not a failure, was $result", result !is PurgeResult.Failed)
+            assertSame("the capability axis never reaches the recorder", before, f.rec())
         }
     }
 }

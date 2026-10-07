@@ -15,6 +15,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.datetime.Instant
 
+internal enum class GraphRecorderPurge { REMOVED, NOTHING_TO_REMOVE, LIVE_SCOPE_SELECTED }
+
 /**
  * Synchronous process-lifetime owner of the graph recorder reducer's state. The reducer discards
  * session data on user ends and data scope changes.
@@ -42,8 +44,12 @@ import kotlinx.datetime.Instant
  *
  * Response callers must retain the original request, fence and lifetime and apply the completion
  * to the recorder instance that issued it. After publishing an adopted catalog, callers use
- * [replayPending] to replay held inputs with the current suppliers. Sending, timers and purge APIs
- * belong to later slices.
+ * [replayPending] to replay held inputs with the current suppliers. Sending and timers belong to later slices.
+ *
+ * [purge] deletes selected held data without closing the recorder or deciding access. It reads only
+ * the current fence, once and before any change, and refuses a live selected scope untouched.
+ * Apart from LIVE_SCOPE_SELECTED, which reflects only the fence, its result describes data held
+ * before the call; after [close], it reads nothing.
  */
 internal class GraphRecorder(
     private val scope: CoroutineScope,
@@ -184,6 +190,21 @@ internal class GraphRecorder(
         val currentFence = currentAccessFence()
         val candidate = GraphRecorderReducer.exposed(mutableState.value, snapshot, currentFence, admission = true)
         return if (gate.bind(fence, lifetime) != null) candidate else emptyMap()
+    }
+
+    /** Deletes without access synchronization; even an empty selected scope is cleared and published. */
+    fun purge(selects: (GraphDataScope) -> Boolean): GraphRecorderPurge {
+        if (closed) return GraphRecorderPurge.NOTHING_TO_REMOVE
+        val fence = currentAccessFence()
+        val live = fence?.userAccessEpoch?.let { GraphDataScope(fence.identity.uid, it) }
+        if (live != null && selects(live)) return GraphRecorderPurge.LIVE_SCOPE_SELECTED
+        val before = mutableState.value
+        val next = GraphRecorderReducer.purge(before, selects)
+        if (next === before) return GraphRecorderPurge.NOTHING_TO_REMOVE
+        val removed = before.series.isNotEmpty() || before.pending.inputs.isNotEmpty() ||
+            before.pending.lostTopics.isNotEmpty() || before.untransferredSeries.isNotEmpty()
+        mutableState.value = next
+        return if (removed) GraphRecorderPurge.REMOVED else GraphRecorderPurge.NOTHING_TO_REMOVE
     }
 
     override fun close() {

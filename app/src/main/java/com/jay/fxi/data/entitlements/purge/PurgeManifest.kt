@@ -79,6 +79,8 @@ data class PurgeTarget(
  *
  * A surface missing from this list is the failure this list exists to prevent, which is why
  * `PurgeManifestTest` pins the set rather than the classifications alone.
+ * The list also holds process-memory targets, which are not storage surfaces: the test's source
+ * walk cannot see them, so it pins them by name.
  *
  * The S3 topic last-known store is classified as `DERIVED_HERE`, but its deletion adapter is not
  * wired. A user-axis purge therefore remains Deferred until that adapter exists; see
@@ -145,6 +147,14 @@ object PurgeManifest {
             owner = "S4",
             note = "`graph_cache_v1_*.json` and the legacy names; no reader or writer remains — only account-deletion cleanup removes " +
                 "them until the S4 cutover migration (§9.1)"
+        ),
+        PurgeTarget(
+            id = "memory:graph_recorder",
+            classification = PurgeClassification.DERIVED_HERE,
+            scopes = setOf(PurgeScope.USER),
+            owner = "S4",
+            note = "recorder state, sink queue and ledger, and registered recovery captures per UID/user epoch; " +
+                "holds no KRX series — add the CAPABILITY axis if S6 puts KRX in the recorder"
         ),
         PurgeTarget(
             id = "file:graph_v2_general",
