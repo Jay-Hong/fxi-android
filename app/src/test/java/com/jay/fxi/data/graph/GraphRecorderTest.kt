@@ -48,7 +48,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Claude-owned S4 F2a contract r2 (JVM; r1 plus O4's null-then-current fence read, from the r1 battery's G04): the graph recorder's owner around the F1 reducer - one published state, mutations
+ * Claude-owned S4 F2a contract r3 (JVM; r2 plus F2c-1: the state's `untransferredSeries` in every whole-state comparison, and
+ * O12 no longer pins a held input that F2c-1 now replays): the graph recorder's owner around the F1 reducer - one published state, mutations
  * applied and published before they return, a control collector, a checked read, and close. Only faults the owner itself can
  * make are targeted here; the reducer's own rules stay locked by GraphRecorderReducerTest (F1).
  *
@@ -171,6 +172,7 @@ class GraphRecorderTest {
         val series: Map<GraphObservationSeriesKey, Print>,
         val pendingInputs: List<TopicGraphInput>,
         val lostTopics: Set<String>,
+        val untransferred: Set<String>,
         val seenUserEnd: Long,
         val seenRevision: Long,
         val nextVersion: Long,
@@ -178,7 +180,7 @@ class GraphRecorderTest {
     )
 
     private fun whole(s: GraphRecorderState) = Whole(
-        s.scope, s.series.mapValues { fingerprint(it.value) }, s.pending.inputs, s.pending.lostTopics,
+        s.scope, s.series.mapValues { fingerprint(it.value) }, s.pending.inputs, s.pending.lostTopics, s.untransferredSeries,
         s.seenUserEnd, s.seenRevision, s.nextVersion, s.versionFloor
     )
 
@@ -564,7 +566,7 @@ class GraphRecorderTest {
         assertEquals(held.copy(seenRevision = 2L), now)
     }
 
-    /** O12: every observe reads the catalog supplier: held while absent, mapped once present. */
+    /** O12: every observe reads the catalog supplier: held while absent, mapped once present (the replay order is F2c-1's R7). */
     @Test fun O12_theCatalogIsReadOnEveryObserve() = recorderTest {
         val rig = Rig(this)
         rig.catalogNow = null
@@ -575,8 +577,6 @@ class GraphRecorderTest {
         rig.catalogNow = catalog
         rig.recorder.observe(batch(1341.9, kst("20:01:20")))
         assertEquals(setOf(kb), rig.state().series.keys)
-        assertEquals(setOf(GraphObservationId("kb", "usd-krw", kst("20:01:20"), 1341.9)), rig.state().series.getValue(kb).data.app.observations)
-        assertSame("the held input stays for F2c", first, rig.state().pending.inputs.single())
     }
 
     /** O13: a lifetime of another grant than the fence's is refused even when the snapshot admits it - bind checks the grant. */

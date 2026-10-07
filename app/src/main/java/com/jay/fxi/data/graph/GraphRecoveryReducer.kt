@@ -108,6 +108,17 @@ internal fun requireGraphRecovery(
     return transition.finish()
 }
 
+/** Demand the entire retained recovery window, including the current bucket but no future one. */
+internal fun requireGraphRecoveryWindow(
+    state: GraphRecoverableState,
+    reason: GraphRecoveryReason,
+    now: Instant
+): GraphRecoverableState {
+    val transition = RecoveryTransition(state, now)
+    transition.demandSpan(transition.demandLower, transition.current, reason)
+    return transition.finish()
+}
+
 internal fun captureGraphRecoveryRequest(state: GraphRecoverableState, applicationVersion: Long): GraphRecoveryRequest =
     GraphRecoveryRequest(state.data.app.seriesKey, applicationVersion, state.generation)
 
