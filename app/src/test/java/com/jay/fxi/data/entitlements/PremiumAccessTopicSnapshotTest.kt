@@ -10,6 +10,7 @@ import com.jay.fxi.data.graph.GraphEntry
 import com.jay.fxi.data.graph.GraphKey
 import com.jay.fxi.data.graph.GraphObservationSeriesKey
 import com.jay.fxi.data.graph.GraphOwnerSource
+import com.jay.fxi.data.graph.GraphProtectedAdmission
 import com.jay.fxi.data.graph.GraphRecorder
 import com.jay.fxi.data.graph.GraphSeriesSelectionSession
 import com.jay.fxi.data.graph.GraphV2AccessCapture
@@ -1452,7 +1453,13 @@ class PremiumAccessTopicSnapshotTest {
     }
 
     /** The graph side on the issuer of [h]; see the class KDoc for the assembly rules. */
-    private inner class GraphRig(test: TestScope, val h: Harness, startRecorder: Boolean = true) {
+    private inner class GraphRig(
+        test: TestScope,
+        val h: Harness,
+        startRecorder: Boolean = true,
+        /** The protected admission the coordinator and the gate share; one function object (S4 RT01-A2). */
+        admission: (() -> Boolean)? = null
+    ) {
         private val scheduler = test.testScheduler
         val dispatcher = StandardTestDispatcher(scheduler)
         val scope = CoroutineScope(processJob + dispatcher)
@@ -1464,7 +1471,8 @@ class PremiumAccessTopicSnapshotTest {
         val failures = mutableListOf<Throwable>()
         private val snapshot: () -> TopicAccessSnapshot = { h.coordinator.accessSnapshot }
         val uses = SnapshotTopicUseAuthority(snapshot)
-        val access = GraphV2AccessGate({ live }, { fence }, snapshot, { true })
+        val protectedAdmission: () -> Boolean = admission ?: { true }
+        val access = GraphV2AccessGate({ live }, { fence }, snapshot, protectedAdmission)
         val clock = AppClock { GRAPH_NOON + scheduler.currentTime.milliseconds }
         val recorder = GraphRecorder(scope, h.coordinator.accessRevisions, snapshot, { fence }, { catalog }, access, clock)
         val coordinator = GraphV2RequestCoordinator(
@@ -1495,7 +1503,7 @@ class PremiumAccessTopicSnapshotTest {
             },
             currentAccessFence = { fence },
             uses = uses,
-            protectedAdmission = { true },
+            protectedAdmission = protectedAdmission,
             accessSnapshot = snapshot,
             scope = scope,
             clock = clock,
@@ -2161,6 +2169,74 @@ class PremiumAccessTopicSnapshotTest {
             val renewed = g.publishIssued(); runCurrent()
             assertRetiredByTheUserEnd("end with the new grant", g, a, renewed)
         }
+    }
+
+    /** An approved graph whose coordinator and gate share the graph admission over [deletions] (S4 RT01-A2). */
+    private suspend fun TestScope.approvedWithDeletions(deletions: DeletionAdmissionStore): Triple<Harness, GraphRig, Approved> {
+        val h = granted()
+        lateinit var rig: GraphRig
+        val admission = GraphProtectedAdmission({ rig.live }, deletions)
+        rig = GraphRig(this, h, admission = admission)
+        return Triple(h, rig, approve(rig))
+    }
+
+    /**
+     * graphA07 (S4 RT01-A2): a deletion about to leave for the server closes every graph consumer, GENERAL and KRX, for that
+     * user at any auth generation, and stays closed once the server confirms it. Another user's deletion closes nothing here.
+     * The issuer's snapshot is untouched: the closure is the shared graph admission's alone.
+     */
+    @Test
+    fun graphA07_aPendingDeletionClosesEveryGraphConsumer() = snapshotTest {
+        val deletions = DeletionAdmissionStore()
+        val (h, g, a) = approvedWithDeletions(deletions)
+        deletions.begin(AuthIdentityFence("user-b", 1L), "op-b")
+        assertTrue("another user's deletion closes nothing", a.day.guard())
+        assertNotNull(g.access.bind(a.fence, a.lifetime))
+        deletions.begin(AuthIdentityFence(OWNER, 2L), "op-a")
+        assertTrue("premise: the issuer still allows the user", h.facts.userAllowed && h.facts.tokenStanding)
+        assertTrue("premise: the use is still the issuer's", g.uses.admits(a.lifetime))
+        assertClosed("deletion requested", g, a, 1420.0)
+        a.day.tab.complete(ok(g.dayTab())); runCurrent()
+        assertFalse("the 1d answer applies no entry", g.coordinator.state.value.entries.containsKey(KEY_1D))
+        assertNull("nor kb's recovery", g.series().getValue(a.kb).lastAppliedVersion)
+        deletions.serverDeleted("op-a")
+        assertClosed("deletion confirmed", g, a, 1421.0)
+    }
+
+    /**
+     * graphA07b (S4 RT01-A2): a deletion request proven not to have left is released, and the graph opens again for the
+     * same use, which the issuer never withdrew.
+     */
+    @Test
+    fun graphA07b_aProvenUnsentDeletionReopensTheGraph() = snapshotTest {
+        val deletions = DeletionAdmissionStore()
+        val (_, g, a) = approvedWithDeletions(deletions)
+        deletions.begin(g.live, "op-a")
+        assertFalse("premise: closed", a.day.guard())
+        deletions.releaseUnsent("op-a")
+        assertTrue("the kept guard admits again", a.day.guard())
+        assertNotNull("the gate binds again", g.access.bind(a.fence, a.lifetime))
+        g.recorder.observe(g.quote(1422.0, a.fence, a.lifetime))
+        assertTrue("a price is adopted again", g.adopted(a.kb, 1422.0))
+    }
+
+    /**
+     * graphA08 (S4 RT01-A2): while the graph is closed by a pending deletion, the issuer's own control queries go on - a
+     * refresh really asks for an answer - because the graph admission gates only graph use.
+     */
+    @Test
+    fun graphA08_aClosedGraphDoesNotStopEntitlementControlQueries() = snapshotTest {
+        val deletions = DeletionAdmissionStore()
+        val (h, g, a) = approvedWithDeletions(deletions)
+        deletions.begin(g.live, "op-a")
+        assertFalse("premise: the graph is closed", a.day.guard())
+        val asked = h.source.freshRequests.size
+        h.source.next = { active(krx = true) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertTrue("the refresh really asked", h.source.freshRequests.size > asked)
+        assertEquals(PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)
+        assertFalse("and the graph stays closed", a.day.guard())
     }
 
     /**
