@@ -76,7 +76,15 @@ internal data class GraphRequestState(
     val failures: Map<GraphKey, Throwable> = emptyMap()
 )
 
-/** Request ownership, cache application and retry deadlines are confined to one consumer. */
+/**
+ * Request ownership, cache application and retry deadlines are confined to one consumer.
+ *
+ * When [recorder] is supplied, the coordinator loop, every recorder method, the control collector
+ * and the sink worker must use the same serial executor. RT01 must verify this wiring.
+ *
+ * @param recorder Optional, immutable owner that captures recovery for existing one-day requests,
+ * applies their successful responses synchronously and replays held inputs after catalog publication.
+ */
 internal class GraphV2RequestCoordinator(
     private val fetcher: GraphV2Fetching,
     private val owners: GraphOwnerSource,
@@ -88,7 +96,8 @@ internal class GraphV2RequestCoordinator(
     /** Stable, finite and non-negative for each tab. */
     private val rateLimitJitter: (tab: String) -> Duration,
     private val onEventFailure: (Throwable) -> Unit,
-    private val cachePorts: GraphV2CachePorts? = null
+    private val cachePorts: GraphV2CachePorts? = null,
+    private val recorder: GraphRecorder? = null
 ) {
     private data class RequestContext(val fence: TopicSessionFence, val lifetime: TopicUseLifetime)
 
@@ -131,7 +140,8 @@ internal class GraphV2RequestCoordinator(
         val key: GraphKey?,
         val originalTab: String,
         val activityGeneration: Long,
-        val accessCapture: GraphV2AccessCapture? = null
+        val accessCapture: GraphV2AccessCapture? = null,
+        val recoveryRequests: List<GraphRecoveryRequest> = emptyList()
     ) {
         // The only request-owned mutable value consulted outside the loop. Job completion is
         // not disposal: the response still has to pass the loop's application boundary.
@@ -333,6 +343,7 @@ internal class GraphV2RequestCoordinator(
             else -> Unit
         }
         val now = clock.now()
+        var catalogAdopted = false
         when (event) {
             is Event.Activate -> {
                 synchronizeContext()
@@ -361,13 +372,25 @@ internal class GraphV2RequestCoordinator(
             }
             is Event.Captured -> onCaptured(event, now)
             is Event.Wake -> onWake(event, now)
-            is Event.CatalogFinished -> applyCatalog(event, now)
+            is Event.CatalogFinished -> catalogAdopted = applyCatalog(event, now)
             is Event.TabFinished -> applyTab(event, now)
             is Event.DiskSeedFinished -> applyDiskSeed(event)
             is Event.WritePreparationFinished, is Event.DiskWriteFinished -> Unit // Handled above.
         }
         rearmTimer(now)
         publish()
+        if (catalogAdopted) replayRecorder()
+    }
+
+    private fun replayRecorder() {
+        val recorder = recorder ?: return
+        try {
+            recorder.replayPending()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            onEventFailure(failure)
+        }
     }
 
     /** Independent of HTTP ownership and its Retry-After floor. */
@@ -673,13 +696,36 @@ internal class GraphV2RequestCoordinator(
     private fun startTab(current: RequestContext, key: GraphKey, coldAttempt: Boolean, midnightAttempt: Boolean) {
         // Registration is the logical start; changing the active key does not withdraw a sent request.
         val registration = Registration(
-            ++nextRequestId, current, key, key.tab, activityGeneration, bindRequestAccess(current)
+            ++nextRequestId, current, key, key.tab, activityGeneration, bindRequestAccess(current),
+            captureRecovery(current, key)
         )
         tabRequests[key] = registration
         connectCold(registration, coldAttempt)
         connectMidnight(registration, midnightAttempt)
         connectFlip(registration)
         startCapture(registration)
+    }
+
+    private fun captureRecovery(current: RequestContext, key: GraphKey): List<GraphRecoveryRequest> {
+        val recorder = recorder ?: return emptyList()
+        if (key.period != GraphPeriod.ONE_DAY) return emptyList()
+        val ids = snapshot.catalog?.tabs?.get(key.tab)?.periods?.get(GraphPeriod.ONE_DAY)?.allSeries
+            ?: return emptyList()
+        if (ids.isEmpty()) return emptyList()
+        val epoch = current.fence.userAccessEpoch ?: return emptyList()
+        val dataScope = GraphDataScope(current.fence.identity.uid, epoch)
+        return try {
+            recorder.captureRequests(
+                ids.mapTo(linkedSetOf()) { GraphObservationSeriesKey(dataScope, it) },
+                current.fence, current.lifetime
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            // Recovery is optional; a failed capture leaves HTTP ownership and retries intact.
+            onEventFailure(failure)
+            emptyList()
+        }
     }
 
     private fun bindRequestAccess(current: RequestContext): GraphV2AccessCapture? = try {
@@ -760,24 +806,25 @@ internal class GraphV2RequestCoordinator(
         }
     }
 
-    private fun applyCatalog(event: Event.CatalogFinished, now: Instant) {
+    private fun applyCatalog(event: Event.CatalogFinished, now: Instant): Boolean {
         recordRetryFloor(event.result, event.originalTab, now)
-        val registration = catalogRequest?.takeIf { it.requestId == event.requestId } ?: return
+        val registration = catalogRequest?.takeIf { it.requestId == event.requestId } ?: return false
         if (event.result.exceptionOrNull() is CancellationException) {
             releaseCompletion(event)
-            return
+            return false
         }
         if (!useAdmitted(registration)) {
             releaseRegistration(registration)
-            return
+            return false
         }
         releaseRegistration(registration)
-        val response = event.result.getOrNull() ?: return
-        if (response.statusCode != 200) return
-        val body = response.body ?: return
+        val response = event.result.getOrNull() ?: return false
+        if (response.statusCode != 200) return false
+        val body = response.body ?: return false
         snapshot = snapshot.copy(catalog = GraphV2Domain.catalog(body))
         catalogAt = now
         // No pump on completion: failure or absence alone must never start another request.
+        return true
     }
 
     private fun applyTab(event: Event.TabFinished, now: Instant) {
@@ -811,6 +858,7 @@ internal class GraphV2RequestCoordinator(
                     entries = snapshot.entries + (event.key to entry),
                     failures = snapshot.failures - event.key
                 )
+                applyRecovery(registration, outcome.tab)
                 val components = replaceOnlineSlot(registration, event.key, entry, configuration)
                 reserveOnlineWrite(registration, event.key, components)
                 if (snapshot.entries[event.key]?.online200At != null) {
@@ -829,6 +877,19 @@ internal class GraphV2RequestCoordinator(
                 onMidnightFailure(registration, outcome, now)
                 endConnectedFlip(registration)
                 if (outcome.disposition == FailureDisposition.DIAGNOSTIC) onEventFailure(outcome.error)
+            }
+        }
+    }
+
+    private fun applyRecovery(registration: Registration, tab: GraphV2Tab) {
+        val recorder = recorder ?: return
+        for (request in registration.recoveryRequests) {
+            try {
+                recorder.applyResponse(request, tab, registration.context.fence, registration.context.lifetime)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                onEventFailure(failure)
             }
         }
     }

@@ -40,9 +40,10 @@ import kotlinx.datetime.Instant
  * atomicity inside the gate or after it returns. [close] empties the state immediately, cancels only
  * this owner's collector, and permanently ends all use without cancelling the supplied [scope].
  *
- * Response callers must retain the original request, fence and lifetime. Binding a completion to
- * the recorder instance that issued it and a public catalog-adoption replay entry belong to F2d.
- * Sending, timers and purge APIs belong to later slices.
+ * Response callers must retain the original request, fence and lifetime and apply the completion
+ * to the recorder instance that issued it. After publishing an adopted catalog, callers use
+ * [replayPending] to replay held inputs with the current suppliers. Sending, timers and purge APIs
+ * belong to later slices.
  */
 internal class GraphRecorder(
     private val scope: CoroutineScope,
@@ -68,14 +69,18 @@ internal class GraphRecorder(
         started = true
         collector = scope.launch {
             accessRevisions.collect {
-                if (!closed) {
-                    val snapshot = accessSnapshot()
-                    val fence = currentAccessFence()
-                    val catalog = currentCatalog()
-                    mutableState.value = replayPending(mutableState.value, catalog, snapshot, fence)
-                }
+                replayPending()
             }
         }
+    }
+
+    /** Replays held inputs using current suppliers and publishes once; after [close], reads nothing. */
+    fun replayPending() {
+        if (closed) return
+        val snapshot = accessSnapshot()
+        val fence = currentAccessFence()
+        val catalog = currentCatalog()
+        mutableState.value = replayPending(mutableState.value, catalog, snapshot, fence)
     }
 
     override fun observe(input: TopicGraphInput.Observations) {
