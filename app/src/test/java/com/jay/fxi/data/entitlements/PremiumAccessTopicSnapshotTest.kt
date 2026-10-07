@@ -11,6 +11,7 @@ import com.jay.fxi.data.graph.GraphKey
 import com.jay.fxi.data.graph.GraphObservationSeriesKey
 import com.jay.fxi.data.graph.GraphOwnerSource
 import com.jay.fxi.data.graph.GraphRecorder
+import com.jay.fxi.data.graph.GraphSeriesSelectionSession
 import com.jay.fxi.data.graph.GraphV2AccessCapture
 import com.jay.fxi.data.graph.GraphV2AccessGate
 import com.jay.fxi.data.graph.GraphV2CachePorts
@@ -18,7 +19,16 @@ import com.jay.fxi.data.graph.GraphV2DiskComponent
 import com.jay.fxi.data.graph.GraphV2Fetching
 import com.jay.fxi.data.graph.GraphV2RequestCoordinator
 import com.jay.fxi.data.graph.JsonGraphV2EnvelopeCodec
+import com.jay.fxi.data.local.GraphSelectionAudience
+import com.jay.fxi.data.local.GraphSelectionKey
+import com.jay.fxi.data.local.GraphSelectionReadResult
+import com.jay.fxi.data.local.GraphSelectionRecord
+import com.jay.fxi.data.local.GraphSelectionStore
+import com.jay.fxi.data.local.GraphSelectionWriteResult
 import com.jay.fxi.data.remote.AuthenticatedHttpResponse
+import com.jay.fxi.data.remote.OwnedTopicFocus
+import com.jay.fxi.data.remote.TopicDisplayOwner
+import com.jay.fxi.data.remote.TopicDisplayState
 import com.jay.fxi.data.remote.TopicGraphCandidate
 import com.jay.fxi.data.remote.TopicGraphInput
 import com.jay.fxi.data.remote.TopicGraphPath
@@ -34,15 +44,27 @@ import com.jay.fxi.data.remote.dto.GraphV2Provenance
 import com.jay.fxi.data.remote.dto.GraphV2Range
 import com.jay.fxi.data.remote.dto.GraphV2Series
 import com.jay.fxi.data.remote.dto.GraphV2TabResponse
+import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphCatalog
 import com.jay.fxi.domain.model.GraphPeriod
+import com.jay.fxi.domain.model.GraphSeriesSelection
 import com.jay.fxi.time.AppClock
+import com.jay.fxi.ui.premium.graph.GraphV2Content
+import com.jay.fxi.ui.premium.graph.GraphV2ScreenState
+import com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder
 import java.io.IOException
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.days
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
@@ -50,6 +72,8 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.datetime.Instant
+import okhttp3.Headers
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -60,14 +84,6 @@ import org.junit.Assert.fail
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
-import kotlin.time.Duration
-import kotlin.time.Duration.Companion.days
-import kotlin.time.Duration.Companion.hours
-import kotlin.time.Duration.Companion.milliseconds
-import kotlin.time.Duration.Companion.minutes
-import kotlin.time.Duration.Companion.seconds
-import kotlinx.datetime.Instant
-import okhttp3.Headers
 
 /**
  * L-4e E1: the topic access snapshot the issuer publishes (`l4e_e1_design_v3.md`, `ANDROID_V2_PLAN.md` 동결 후 12번).
@@ -98,6 +114,14 @@ import okhttp3.Headers
  * after its release and in doubt - and it applies neither an entry nor a recovery. graphI09d and graphI09e release a
  * capability hold: untold, the coordinator's kept KRX half is shown again; told, memory does not restore it and, with
  * no disk write port in this assembly, only a fresh protected fetch does.
+ *
+ * S4 U1d (freeze-7 record r2 §2 A3) puts a usd screen holder on the same assembly - its own selection session, the
+ * issuer's access revisions, display and focus fixed to the owner - and has it draw a chart with a live price scheduled
+ * for publication. graphH0 shows that publication draws the live price when nothing blocks it; under a seal, a P4 hold
+ * and a loss in doubt the holder itself reports BLOCKED and neither the current state nor that publication draws
+ * anything; after a stale release it draws again under a fresh lifetime and the publication from before the hold is not
+ * revived. The closed rows are also closed by the coordinator's protected entry, so the holder's own use check is told
+ * apart only on the resume. The production display, focus and DI wiring are RT01's.
  *
  * A send refused by the guard reaching the wire is TopicUseHttpBoundaryTest GW1-GW4's; a refused admission reaching the
  * disk is GraphV2DiskStoreTest's; a KRX-only refusal keeping a seed off the KRX file is
@@ -1542,6 +1566,21 @@ class PremiumAccessTopicSnapshotTest {
         }
     }
 
+    /** A 1d answer a screen can draw: six closed kb points on today's KST rolling domain (S4 U1d). */
+    private fun GraphRig.drawableDayTab(): GraphV2TabResponse {
+        val day0 = Instant.parse("2026-10-04T15:00:00Z")
+        val points = (0 until 6).map { GraphV2Point(day0 + 1.hours + (it * 10).minutes, 1390.0 + it, "x") }
+        return GraphV2TabResponse(
+            tab = "usd",
+            period = GraphPeriod.ONE_DAY.code,
+            series = listOf(GraphV2Series(KB, KB, "krw", "KRW", 2, points, GraphV2Provenance(false, emptyList()), null)),
+            metadata = GraphV2Metadata(
+                now() - 1.minutes, "10min", GraphV2Range("2026-10-05", "2026-10-05"),
+                domainStartAt = day0, domainEndAt = day0 + 24.hours, liveDomainMode = "rolling"
+            )
+        )
+    }
+
     private fun <T> ok(body: T) = AuthenticatedHttpResponse(200, Headers.headersOf(), body, null, byteArrayOf(1))
 
     /** usd: 3m lists the online and the KRX series, 1d lists kb; valid for two days. */
@@ -2135,6 +2174,183 @@ class PremiumAccessTopicSnapshotTest {
         assertTrue("kb keeps its demand", g.series().getValue(a.kb).pending.keys.containsAll(demands))
         val entry = checkNotNull(g.coordinator.protectedEntry(KEY_3M)) { "no protected entry under the new grant" }
         assertTrue("its GENERAL half", entry.tab.graph.series.any { it.seriesId == ONLINE })
+    }
+
+    // --- S4 U1d: the screen holder on this real issuer ------------------------------------------------------------------
+
+    /** Selections that commit at once; nothing here depends on how they are kept. */
+    private class HolderSelections : GraphSelectionStore {
+        private val committed = mutableMapOf<GraphSelectionKey, GraphSeriesSelection>()
+
+        private fun current(key: GraphSelectionKey) = committed[key]?.let {
+            GraphSelectionReadResult.Present(
+                GraphSelectionRecord(1, key.uid, key.audience, key.tab, it.visibleSeriesIds, it.initializedSeries)
+            )
+        } ?: GraphSelectionReadResult.Absent
+
+        override suspend fun confirmGraphSelection(key: GraphSelectionKey) = current(key)
+        override suspend fun readGraphSelection(key: GraphSelectionKey) = current(key)
+        override suspend fun writeGraphSelection(key: GraphSelectionKey, selection: GraphSeriesSelection): GraphSelectionWriteResult {
+            committed[key] = selection
+            return GraphSelectionWriteResult.Committed
+        }
+    }
+
+    /**
+     * A usd screen holder over [g]: the same coordinator, recorder, gate, use authority, fence supplier, executor and the issuer's
+     * own access revisions. The display and focus are fixed to the owner; the holder drives its own activation.
+     */
+    private inner class HolderRig(test: TestScope, val g: GraphRig) {
+        val owner = TopicDisplayOwner(g.live, 1L)
+        val display = MutableStateFlow(TopicDisplayState.NONE.copy(owner = owner))
+        val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(g.live, FreeTab.USD))
+        val holder = GraphV2ScreenStateHolder(
+            tab = "usd",
+            coordinator = g.coordinator,
+            selectionSession = GraphSeriesSelectionSession(
+                HolderSelections(), GraphSelectionAudience.PREMIUM, "usd", g.scope, g.dispatcher
+            ),
+            liveIdentity = { g.live },
+            display = display,
+            focus = focus,
+            currentAccessFence = { g.fence },
+            uses = g.uses,
+            gate = g.access,
+            accessRevisions = g.h.coordinator.accessRevisions,
+            scope = g.scope,
+            dispatcher = g.dispatcher,
+            clock = g.clock,
+            recorder = g.recorder
+        )
+        val published = mutableListOf<GraphV2ScreenState>()
+
+        init {
+            holder.start()
+            test.backgroundScope.launch(UnconfinedTestDispatcher(test.testScheduler)) { holder.state.collect { published += it } }
+        }
+
+        fun chartShown(): Boolean = holder.currentState().chart != null
+        fun chartsPublishedSince(mark: Int) = published.drop(mark).count { it.chart != null }
+    }
+
+    /** What a ready holder holds before a row blocks it. */
+    private class Shown(val fence: TopicSessionFence, val lifetime: TopicUseLifetime)
+
+    /**
+     * The holder made ready on the issued grant: it activated 1d, the catalog and a kb 1d answer arrived, the chart is drawn
+     * and shown, and a live kb price has just scheduled a 350 ms publication that has not yet run.
+     */
+    private suspend fun TestScope.showHolder(hr: HolderRig): Shown {
+        val g = hr.g
+        val fence = g.publishIssued()
+        runCurrent()
+        hr.holder.onActivated(hr.owner); runCurrent()
+        g.sent.single { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
+        g.tabs(KEY_1D).single().tab.complete(ok(g.drawableDayTab())); runCurrent()
+        g.catalog = checkNotNull(g.coordinator.state.value.catalog) { "premise: the catalog was adopted" }
+        val state = hr.holder.currentState()
+        assertEquals("premise: the chart is ready", GraphV2Content.READY, state.content)
+        hr.holder.setSurfaceVisible(checkNotNull(state.inlineToken) { "premise: an inline token" }, true); runCurrent()
+        val lifetime = checkNotNull(g.uses.acquire(fence)) { "premise: a use under the issued fence" }
+        g.recorder.observe(g.quote(1410.0, fence, lifetime))
+        assertTrue("premise: kb adopted the live price", g.adopted(g.kb(fence), 1410.0))
+        runCurrent()
+        return Shown(fence, lifetime)
+    }
+
+    /**
+     * After a block: the holder draws no chart now and reports BLOCKED with no token, and nothing drawable is published once
+     * the publication scheduled before the block was due.
+     */
+    private fun TestScope.assertHolderClosed(label: String, hr: HolderRig, mark: Int) {
+        assertFalse("$label: no chart is drawn", hr.chartShown())
+        val blocked = hr.holder.currentState()
+        assertEquals("$label: the holder itself blocks", GraphV2Content.BLOCKED, blocked.content)
+        assertNull("$label: no token under the refused use", blocked.inlineToken)
+        advanceTimeBy(400); runCurrent()
+        assertFalse("$label: still none once the scheduled publication was due", hr.chartShown())
+        assertEquals("$label: nothing drawable was published", 0, hr.chartsPublishedSince(mark))
+    }
+
+    /** graphH0, the window the rows below close: left open, the scheduled publication does draw the live price. */
+    @Test
+    fun graphH0_anOpenHolderPublishesItsScheduledLivePrice() = snapshotTest {
+        val hr = HolderRig(this, GraphRig(this, granted()))
+        showHolder(hr)
+        val mark = hr.published.size
+        advanceTimeBy(400); runCurrent()
+        assertTrue("the scheduled publication drew the live price", hr.published.drop(mark).any { s ->
+            s.chart?.prepared?.bySeries?.get(KB)?.linePoints?.any { it.rate == 1410.0 } == true
+        })
+        assertTrue(hr.chartShown())
+    }
+
+    /** graphH1: under an explicit user seal the holder draws nothing, now or from the publication it had scheduled. */
+    @Test
+    fun graphH1_aSealedUserAxisRendersNothing() = snapshotTest {
+        val h = granted()
+        val hr = HolderRig(this, GraphRig(this, h))
+        showHolder(hr)
+        val mark = hr.published.size
+        h.store.rotationFailures = Int.MAX_VALUE
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertTrue("premise: sealed", TopicAccessBlock.EXPLICIT_SEAL in h.facts.userBlocks)
+        assertHolderClosed("sealed", hr, mark)
+    }
+
+    /**
+     * graphH2: under a P4 hold the holder draws nothing; once the hold is released as stale it draws again under a fresh
+     * lifetime - the use acquired before the hold stays refused - and the live publication scheduled before the hold is not
+     * revived.
+     */
+    @Test
+    fun graphH2_aHeldUserAxisRendersNothingAndResumesOnlyFresh() = snapshotTest {
+        val h = granted()
+        val hr = HolderRig(this, GraphRig(this, h))
+        val shown = showHolder(hr)
+        val mark = hr.published.size
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.source.afterFetch = { h.store.loadFailures = 2 }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertTrue("premise: held", TopicAccessBlock.LOSS_CANDIDATE in h.facts.userBlocks)
+        assertHolderClosed("held", hr, mark)
+        h.source.identity = EntitlementsIdentity(OWNER, 2L)
+        advanceTimeBy(RETRY); runCurrent()
+        assertEquals("premise: released", 0, h.coordinator.heldLossCandidateCount())
+        assertTrue("premise: released as stale, the user axis allowed", h.facts.userAllowed)
+        assertFalse("the use from before the hold stays refused", hr.g.uses.admits(shown.lifetime))
+        hr.g.sent.single { it.kind == "catalog" && !it.catalog.isCompleted }.catalog.complete(ok(graphCatalog()))
+        runCurrent()
+        val again = hr.holder.currentState()
+        assertNotNull("the holder draws again", again.chart)
+        val resumed = checkNotNull(again.inlineToken) { "premise: a token after the release" }
+        assertNotEquals("under a fresh lifetime, not the one from before the hold", shown.lifetime, resumed.lifetime)
+        assertTrue("the fresh lifetime is admitted", hr.g.uses.admits(resumed.lifetime))
+        assertNull("no live publication is shown, so none from before the hold is revived", again.chart?.rightEdgeNow)
+    }
+
+    /** graphH3: while a user loss's write is in doubt the holder draws nothing, and it stays closed once the write lands. */
+    @Test
+    fun graphH3_aUserLossInDoubtRendersNothing() = snapshotTest {
+        val h = granted()
+        val hr = HolderRig(this, GraphRig(this, h))
+        showHolder(hr)
+        val mark = hr.published.size
+        val parked = gate()
+        h.store.rotationGate = parked
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        val refreshing = launch { h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+        runCurrent()
+        assertTrue("premise: the rotation is parked", h.store.rotationParked.isCompleted)
+        assertTrue(TopicAccessBlock.CONTEXT_UNCERTAIN in h.facts.userBlocks)
+        assertHolderClosed("in doubt", hr, mark)
+        parked.complete(Unit)
+        settle()
+        refreshing.join()
+        assertFalse("still closed after the write", hr.chartShown())
     }
 
     private companion object {
