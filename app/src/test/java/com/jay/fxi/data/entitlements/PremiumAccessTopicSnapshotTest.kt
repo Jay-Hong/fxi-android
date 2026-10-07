@@ -867,6 +867,262 @@ class PremiumAccessTopicSnapshotTest {
         assertNull("the end named another owner's namespace", end.namespace)
     }
 
+    // --- the user-end invalidations floor (F2b-1 T13) ---------------------------------------------------------------------
+    //
+    // A lifetime acquired before a user end carries fewer invalidations than the floor that end pins, and one acquired after
+    // it carries at least as many — however late the snapshot is read. Every published snapshot is checked as a revision
+    // collector reads it (T13-08 is part of every walk).
+
+    /** Every snapshot published from now on, read when its revision is announced. */
+    private fun TestScope.publishedFrom(h: Harness): List<TopicAccessSnapshot> {
+        val published = mutableListOf<TopicAccessSnapshot>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            h.coordinator.accessRevisions.collect { published += h.coordinator.accessSnapshot }
+        }
+        return published
+    }
+
+    /** A new user end pins the floor to its own publication's invalidations; any other publication keeps the floor. */
+    private fun assertFloorsPinned(what: String, start: TopicAccessSnapshot, published: List<TopicAccessSnapshot>) {
+        assertTrue("$what: nothing was published", published.isNotEmpty())
+        var previous = start
+        for (next in published) {
+            if (next.lastUserEnd?.sequence != previous.lastUserEnd?.sequence) {
+                assertEquals(
+                    "$what: the end at revision ${next.revision} did not pin its own publication's invalidations",
+                    next.userInvalidations,
+                    next.userEndInvalidationsFloor
+                )
+            } else {
+                assertEquals(
+                    "$what: the floor moved at revision ${next.revision} without a new user end",
+                    previous.userEndInvalidationsFloor,
+                    next.userEndInvalidationsFloor
+                )
+            }
+            previous = next
+        }
+    }
+
+    /** T13-01. */
+    @Test
+    fun theUserEndFloor_isZeroUntilTheFirstUserEnd_whateverIsInvalidated() = snapshotTest {
+        assertEquals(0L, TopicAccessSnapshot.INITIAL.userEndInvalidationsFloor)
+        val h = build()
+        val start = h.snapshot
+        val published = publishedFrom(h)
+        h.coordinator.onIdentityChanged(AuthIdentityFence(OWNER, 1L))
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        settle()
+        h.store.record = h.store.record.copy(mayContainPremiumData = true, mayContainKrxData = true)
+        checkNotNull(h.coordinator.topicGrantResult().fence) { "no grant was issued" }
+
+        // A capability rotation takes the token away.
+        h.source.next = { active(krx = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        settle()
+        checkNotNull(h.coordinator.topicGrantResult().fence) { "no grant was reissued" }
+        // A user hold that comes and goes.
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.source.afterFetch = { h.store.loadFailures = 2 }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        h.source.identity = EntitlementsIdentity(OWNER, 2L)
+        advanceTimeBy(RETRY)
+        runCurrent()
+
+        assertNull("this walk recorded a user end", h.snapshot.lastUserEnd)
+        assertTrue("nothing was invalidated", h.snapshot.userInvalidations > 0L)
+        assertFloorsPinned("before any end", start, published)
+        assertEquals(0L, h.snapshot.userEndInvalidationsFloor)
+    }
+
+    /** T13-02 (identity boundary) and T13-08. */
+    @Test
+    fun aSignOut_pinsTheFloorToTheInvalidationsItsOwnPublicationCounted() = snapshotTest {
+        val h = granted()
+        val before = h.snapshot
+        assertNull(before.lastUserEnd)
+        assertTrue(before.facts.userAllowed && before.facts.tokenStanding)
+        val published = publishedFrom(h)
+
+        h.coordinator.onSignedOut(AuthIdentityFence(OWNER, 1L))
+        runCurrent()
+
+        val first = published.first { it.lastUserEnd != null }
+        assertEquals(TopicAccessEndReason.SIGNED_OUT, first.lastUserEnd?.reason)
+        assertEquals("both axes fell with the end, which counts once", before.userInvalidations + 1, first.userInvalidations)
+        assertEquals(first.userInvalidations, first.userEndInvalidationsFloor)
+        assertTrue(
+            "a lifetime acquired before the end is not below the floor",
+            before.userInvalidations < first.userEndInvalidationsFloor
+        )
+        assertFloorsPinned("signed out", before, published)
+    }
+
+    /** T13-02 (authoritative loss) and T13-08. */
+    @Test
+    fun anAuthoritativeLoss_pinsTheFloorToTheInvalidationsItsOwnPublicationCounted() = snapshotTest {
+        val h = granted()
+        val before = h.snapshot
+        assertNull(before.lastUserEnd)
+        val published = publishedFrom(h)
+
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        settle()
+
+        val first = published.first { it.lastUserEnd != null }
+        assertEquals(TopicAccessEndReason.AUTHORITATIVE_LOSS, first.lastUserEnd?.reason)
+        assertEquals("both axes fell with the end, which counts once", before.userInvalidations + 1, first.userInvalidations)
+        assertEquals(first.userInvalidations, first.userEndInvalidationsFloor)
+        assertFloorsPinned("lost", before, published)
+    }
+
+    /** T13-03, then T13-06 for a later end. */
+    @Test
+    fun theFloor_holdsThroughReapprovalAHoldAndItsRelease_andMovesOnlyWithTheNextEnd() = snapshotTest {
+        val h = granted()
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        settle()
+        val end = checkNotNull(h.snapshot.lastUserEnd)
+        val floor = h.snapshot.userEndInvalidationsFloor
+        val start = h.snapshot
+        val published = publishedFrom(h)
+
+        h.source.next = { active(krx = true) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        settle()
+        assertEquals(PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)
+        checkNotNull(h.coordinator.topicGrantResult().fence) { "no grant after re-approval" }
+        assertTrue("a lifetime acquired after the end is below the floor", h.snapshot.userInvalidations >= floor)
+
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.source.afterFetch = { h.store.loadFailures = 2 }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        h.source.identity = EntitlementsIdentity(OWNER, 2L)
+        advanceTimeBy(RETRY)
+        runCurrent()
+
+        assertEquals("a hold or a re-approval replaced the end", end, h.snapshot.lastUserEnd)
+        assertTrue("the hold left no invalidation", h.snapshot.userInvalidations > floor)
+        assertEquals(floor, h.snapshot.userEndInvalidationsFloor)
+        assertFloorsPinned("held after the end", start, published)
+
+        val held = h.snapshot
+        h.coordinator.onSignedOut(AuthIdentityFence(OWNER, 1L))
+        runCurrent()
+        val next = published.first { it.lastUserEnd?.sequence != end.sequence }
+        assertEquals(TopicAccessEndReason.SIGNED_OUT, next.lastUserEnd?.reason)
+        assertTrue("the next end kept the old floor", next.userEndInvalidationsFloor > floor)
+        assertTrue(next.userEndInvalidationsFloor >= held.userInvalidations)
+        assertFloorsPinned("ended again", start, published)
+    }
+
+    /** T13-04. */
+    @Test
+    fun theFloor_ignoresCapabilityEndsAndTokenInvalidations() = snapshotTest {
+        val h = granted()
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        settle()
+        h.source.next = { active(krx = true) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        settle()
+        assertEquals(PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)
+        h.store.record = h.store.record.copy(mayContainPremiumData = true, mayContainKrxData = true)
+        checkNotNull(h.coordinator.topicGrantResult().fence) { "no grant after re-approval" }
+        val end = checkNotNull(h.snapshot.lastUserEnd)
+        // Move the count past the floor without an end, so a capability end that re-pinned it would show.
+        val owned = h.store.record
+        h.store.record = owned.copy(ownerUid = "someone-else")
+        assertNull(h.coordinator.topicGrantResult().fence)
+        h.store.record = owned
+        checkNotNull(h.coordinator.topicGrantResult().fence) { "no grant after the owner came back" }
+        assertEquals("blocking the axes recorded a user end", end, h.snapshot.lastUserEnd)
+        assertTrue(
+            "the count did not move past the floor before the capability end",
+            h.snapshot.userInvalidations > h.snapshot.userEndInvalidationsFloor
+        )
+        val start = h.snapshot
+        val published = publishedFrom(h)
+
+        h.source.next = { active(krx = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        settle()
+        checkNotNull(h.coordinator.topicGrantResult().fence) { "no grant was reissued" }
+
+        assertEquals(TopicAccessEndReason.CAPABILITY_REVOKED, h.snapshot.lastCapabilityEnd?.reason)
+        assertEquals("a capability end was recorded as a user end", end, h.snapshot.lastUserEnd)
+        assertTrue("the rotation left no invalidation", h.snapshot.userInvalidations > start.userInvalidations)
+        assertEquals(start.userEndInvalidationsFloor, h.snapshot.userEndInvalidationsFloor)
+        assertFloorsPinned("capability rotated", start, published)
+    }
+
+    /** T13-05. */
+    @Test
+    fun anEndWhileAlreadyBlocked_pinsTheCurrentCount_withoutCountingAnotherInvalidation() = snapshotTest {
+        val h = granted()
+        val n = h.snapshot.userInvalidations
+        h.store.record = h.store.record.copy(ownerUid = "someone-else")
+        assertNull(h.coordinator.topicGrantResult().fence)
+        val blocked = h.snapshot
+        assertFalse(blocked.facts.userAllowed)
+        assertFalse(blocked.facts.tokenStanding)
+        assertEquals(n + 1, blocked.userInvalidations)
+        assertNull("blocking the axes recorded a user end", blocked.lastUserEnd)
+        assertEquals(0L, blocked.userEndInvalidationsFloor)
+        val published = publishedFrom(h)
+
+        h.coordinator.onSignedOut(AuthIdentityFence(OWNER, 1L))
+        runCurrent()
+
+        val first = published.first { it.lastUserEnd != null }
+        assertEquals("an end with both axes already down counted an invalidation", n + 1, first.userInvalidations)
+        assertEquals(n + 1, first.userEndInvalidationsFloor)
+        assertFloorsPinned("ended while blocked", blocked, published)
+    }
+
+    /** T13-06 (an authoritative loss and the seal recorded after it). */
+    @Test
+    fun aLossAndItsSeal_eachPinTheirOwnFloor() = snapshotTest {
+        val h = granted()
+        val before = h.snapshot
+        val published = publishedFrom(h)
+        h.store.rotationFailures = 1
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        // Checked before loss recovery gets to run, as in the sealing test above.
+
+        val reasons = published.mapNotNull { it.lastUserEnd }.distinct().map { it.reason }
+        assertEquals(
+            listOf(TopicAccessEndReason.AUTHORITATIVE_LOSS, TopicAccessEndReason.SEALED),
+            reasons.takeLast(2)
+        )
+        assertFloorsPinned("sealed", before, published)
+    }
+
+    /** T13-07. */
+    @Test
+    fun afterAnEnd_anUnchangedRepeat_stillPublishesNothing() = snapshotTest {
+        val h = granted()
+        h.coordinator.onSignedOut(AuthIdentityFence(OWNER, 1L))
+        settle()
+        val settled = h.snapshot
+        checkNotNull(settled.lastUserEnd)
+        val published = publishedFrom(h)
+
+        repeat(3) { h.coordinator.topicGrantResult() }
+        runCurrent()
+
+        assertTrue("the current snapshot was not read", published.isNotEmpty())
+        assertEquals("an unchanged repeat published", listOf(settled), published.distinct())
+        assertTrue("an unchanged repeat replaced the snapshot", settled === h.snapshot)
+        assertEquals(settled.revision, h.coordinator.accessRevisions.value)
+    }
+
     // --- a loss write's boundaries ------------------------------------------------------------------------------------------
 
     /** The axis a loss write is for. A user loss rotates both epochs; a KRX false edge rotates the capability only. */

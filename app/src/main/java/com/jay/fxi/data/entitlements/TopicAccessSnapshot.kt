@@ -129,13 +129,19 @@ internal data class TopicAccessFacts(
  * [userInvalidations] counts transitions that took the user axis or the standing token away. It is the use-lifetime
  * marker a session keeps with each request: a hold that came and went between a request and its answer leaves it
  * changed even though the token is the same again.
+ *
+ * [userEndInvalidationsFloor] is [userInvalidations] as it stood when the latest user end was first published, counted
+ * after that publication's own invalidation, and kept until the next user end. A use lifetime acquired before that end
+ * carries fewer invalidations and one acquired after it at least as many, however late a reader takes the snapshot.
+ * It is zero until the first user end.
  */
 internal data class TopicAccessSnapshot(
     val revision: Long,
     val facts: TopicAccessFacts,
     val userInvalidations: Long,
     val lastUserEnd: TopicAccessEnd?,
-    val lastCapabilityEnd: TopicAccessEnd?
+    val lastCapabilityEnd: TopicAccessEnd?,
+    val userEndInvalidationsFloor: Long = 0L
 ) {
     companion object {
         val INITIAL = TopicAccessSnapshot(

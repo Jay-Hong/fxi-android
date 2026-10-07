@@ -2553,12 +2553,19 @@ class PremiumAccessCoordinator(
         val invalidated = (previous.facts.userAllowed && !facts.userAllowed) ||
             (previous.facts.tokenStanding && !facts.tokenStanding)
         if (invalidated) userAccessInvalidations += 1
+        val userEndInvalidationsFloor =
+            if (lastUserEnd?.sequence != previous.lastUserEnd?.sequence) {
+                userAccessInvalidations
+            } else {
+                previous.userEndInvalidationsFloor
+            }
         val next = TopicAccessSnapshot(
             revision = previous.revision,
             facts = facts,
             userInvalidations = userAccessInvalidations,
             lastUserEnd = lastUserEnd,
-            lastCapabilityEnd = lastCapabilityEnd
+            lastCapabilityEnd = lastCapabilityEnd,
+            userEndInvalidationsFloor = userEndInvalidationsFloor
         )
         if (next == previous) return
         val published = next.copy(revision = previous.revision + 1)
