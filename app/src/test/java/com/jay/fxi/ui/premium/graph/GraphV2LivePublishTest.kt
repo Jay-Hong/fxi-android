@@ -365,6 +365,7 @@ class GraphV2LivePublishTest {
             owners = owners,
             currentAccessFence = { FENCE_A },
             uses = uses,
+            protectedAdmission = { true },
             scope = scope,
             clock = clock,
             rateLimitJitter = { kotlin.time.Duration.ZERO },

@@ -158,14 +158,14 @@ class GraphV2WireContractTest {
         server.enqueue(MockResponse().setResponseCode(403).setBody("""{"detail":"Premium subscription required"}"""))
         server.enqueue(MockResponse().setResponseCode(503).setBody("""{"detail":"Subscription status pending. Retry later."}"""))
         val c = client()
-        assertEquals("2026-05-27", c.getGraphV2Catalog(c.captureSnapshot()).requireBody("catalog").version)
-        assertEquals("usd", c.getGraphV2Tab(c.captureSnapshot(), "usd", "1y").requireBody("tab").tab)
+        assertEquals("2026-05-27", c.getGraphV2Catalog(c.captureSnapshot()) { true }.requireBody("catalog").version)
+        assertEquals("usd", c.getGraphV2Tab(c.captureSnapshot(), "usd", "1y") { true }.requireBody("tab").tab)
         val first = server.takeRequest(); val second = server.takeRequest()
         assertEquals("GET /api/v2/graph/catalog", "${first.method} ${first.requestUrl!!.encodedPath}")
         assertEquals("GET /api/v2/graph/tab", "${second.method} ${second.requestUrl!!.encodedPath}")
         assertEquals("usd" to "1y", second.requestUrl!!.queryParameter("tab") to second.requestUrl!!.queryParameter("period"))
         for (r in listOf(first, second)) assertEquals("Bearer credential", r.getHeader("Authorization"))
-        assertEquals(AuthenticatedFailureKind.KNOWN_AUTHORIZATION, c.getGraphV2Tab(c.captureSnapshot(), "usd", "1w").failure?.kind)
-        assertEquals(AuthenticatedFailureKind.OTHER_HTTP, c.getGraphV2Catalog(c.captureSnapshot()).failure?.kind)
+        assertEquals(AuthenticatedFailureKind.KNOWN_AUTHORIZATION, c.getGraphV2Tab(c.captureSnapshot(), "usd", "1w") { true }.failure?.kind)
+        assertEquals(AuthenticatedFailureKind.OTHER_HTTP, c.getGraphV2Catalog(c.captureSnapshot()) { true }.failure?.kind)
     }
 }

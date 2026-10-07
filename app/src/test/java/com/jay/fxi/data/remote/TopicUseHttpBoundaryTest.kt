@@ -7,7 +7,10 @@ import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.auth.AuthTokenSource
 import com.jay.fxi.data.auth.HttpExchangeEvidence
+import com.jay.fxi.data.graph.AuthenticatedGraphV2Fetcher
+import com.jay.fxi.data.graph.GraphKey
 import com.jay.fxi.di.NetworkModule
+import com.jay.fxi.domain.model.GraphPeriod
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
@@ -43,6 +46,11 @@ import retrofit2.Retrofit
  * The socket tests run on the real clock, as `TopicSnapshotBootstrapServiceTest` does, over a client built the way the
  * protected one is. A misdirected 421 is repeated by OkHttp only on a coalesced HTTP/2 connection, which this fixture does
  * not set up; that chain is exercised on the interceptor directly instead, and says so.
+ *
+ * S4 RT03a (design R4c/S4 rt_next_codex.r1) adds the graph reads: `AuthenticatedGraphV2Fetcher` hands the caller's owner and
+ * guard to the two graph calls of `AuthenticatedApiClient`, which pass the guard to `executeRead` unchanged. So the catalog
+ * and every period's tab are refused at the wire like a topic snapshot, keeping what was seen, and the fetcher neither
+ * re-acquires the owner, retries nor converts a failure.
  */
 class TopicUseHttpBoundaryTest {
 
@@ -246,6 +254,102 @@ class TopicUseHttpBoundaryTest {
         assertEquals(200, response.statusCode)
         assertEquals(2, server.requestCount)
         assertEquals("the request did not keep its credential", "Bearer old-token", server.takeRequest(1, TimeUnit.SECONDS)!!.getHeader("Authorization"))
+    }
+
+    // --- the graph reads (S4 RT03a) --------------------------------------------------------------------------------------
+
+    /** Both graph reads, named for messages, against one client. */
+    private fun graphReads(api: AuthenticatedApiClient, owner: AuthSnapshot): List<Pair<String, suspend (() -> Boolean) -> Any?>> {
+        val fetcher = AuthenticatedGraphV2Fetcher(api)
+        return listOf(
+            "catalog" to { use -> fetcher.catalog(owner, use) },
+            "tab" to { use -> fetcher.tab(owner, GraphKey("usd", GraphPeriod.THREE_MONTHS), use) }
+        )
+    }
+
+    /** GW1: the given owner goes out unchanged and the guard is checked at the wire, for the catalog, every period and the key's tab. */
+    @Test
+    fun `the graph reads send the given owner and check the use at the wire`() = runBlocking {
+        val fetcher = AuthenticatedGraphV2Fetcher(api())
+        val owner = AuthSnapshot("user-a", 1, "given-token")
+        server.enqueue(MockResponse().setResponseCode(200).setBody(GRAPH_CATALOG))
+        val catalogUse = UseAnswers(true)
+        assertEquals(200, fetcher.catalog(owner, catalogUse::next).statusCode)
+        val catalogRequest = server.takeRequest(1, TimeUnit.SECONDS)!!
+        assertEquals("GET /api/v2/graph/catalog", "${catalogRequest.method} ${catalogRequest.requestUrl!!.encodedPath}")
+        assertEquals("Bearer given-token", catalogRequest.getHeader("Authorization"))
+        assertEquals("the catalog's send was checked", 1, catalogUse.calls)
+        for (period in GraphPeriod.entries) {
+            server.enqueue(MockResponse().setResponseCode(200).setBody(graphTab(period.code)))
+            val use = UseAnswers(true)
+            val response = fetcher.tab(owner, GraphKey("usd", period), use::next)
+            assertEquals(period.code, 200, response.statusCode)
+            assertEquals("decoded", period.code, response.body?.period)
+            val request = server.takeRequest(1, TimeUnit.SECONDS)!!
+            assertEquals("GET /api/v2/graph/tab", "${request.method} ${request.requestUrl!!.encodedPath}")
+            assertEquals("usd" to period.code, request.requestUrl!!.queryParameter("tab") to request.requestUrl!!.queryParameter("period"))
+            assertEquals(period.code, "Bearer given-token", request.getHeader("Authorization"))
+            assertEquals("the ${period.code} send was checked", 1, use.calls)
+        }
+        server.enqueue(MockResponse().setResponseCode(200).setBody(graphTab("1y")))
+        fetcher.tab(owner, GraphKey("jpy", GraphPeriod.ONE_YEAR), UseAnswers(true)::next)
+        val other = server.takeRequest(1, TimeUnit.SECONDS)!!
+        assertEquals("the key's own tab", "jpy", other.requestUrl!!.queryParameter("tab"))
+    }
+
+    /** GW2: withheld before the first send, neither graph read reaches the server and nothing was seen. */
+    @Test
+    fun `a graph read is not written once the use is withheld`() = runBlocking {
+        val api = api()
+        for ((label, read) in graphReads(api, api.captureSnapshot(api.captureIdentityFence()))) {
+            val refused = runCatching { read(UseAnswers(false)::next) }.exceptionOrNull()
+            assertTrue("$label: not refused: $refused", refused is TopicUseWithheldException)
+            assertEquals(label, emptyList<HttpExchangeEvidence>(), (refused as TopicUseWithheldException).exchanges)
+        }
+        assertEquals("a withheld graph read reached the server", 0, server.requestCount)
+    }
+
+    /**
+     * A fresh server, credential source and client for one graph read, so a response one read never asked for cannot reach
+     * the next and an earlier refresh does not leave the token already rotated.
+     */
+    private suspend fun freshGraphRead(label: String): suspend (() -> Boolean) -> Any? {
+        server.shutdown()
+        server = MockWebServer().also { it.start() }
+        source = FakeAuthTokenSource()
+        provider = AuthTokenProvider(source, orders = AccessOrderSequence())
+        val api = api()
+        return graphReads(api, api.captureSnapshot(api.captureIdentityFence())).single { it.first == label }.second
+    }
+
+    /** GW3: a graph replay the refresh made possible is not sent once the use is withheld, and carries the 401. */
+    @Test
+    fun `a graph replay is not sent once the use is withheld, and carries the 401`() = runBlocking {
+        for (label in listOf("catalog", "tab")) {
+            val read = freshGraphRead(label)
+            server.enqueue(unauthorized(retryAfter = "5"))
+            server.enqueue(MockResponse().setResponseCode(200).setBody(GRAPH_CATALOG))
+            val use = UseAnswers(true, false)
+            val refused = runCatching { read(use::next) }.exceptionOrNull()
+            assertTrue("$label: the replay was not refused: $refused", refused is TopicUseWithheldException)
+            assertEquals(label, listOf(HttpExchangeEvidence(1, 1, 401, "5")), (refused as TopicUseWithheldException).exchanges)
+            assertEquals("$label: the withheld replay reached the server", 1, server.requestCount)
+            assertEquals(label, 2, use.calls)
+        }
+    }
+
+    /** GW4: a graph 503 that asks for an immediate repeat does not get it once the use is withheld. */
+    @Test
+    fun `a graph 503 that asks for an immediate repeat does not get it once the use is withheld`() = runBlocking {
+        for (label in listOf("catalog", "tab")) {
+            val read = freshGraphRead(label)
+            server.enqueue(MockResponse().setResponseCode(503).setHeader("Retry-After", "0"))
+            server.enqueue(MockResponse().setResponseCode(200).setBody(GRAPH_CATALOG))
+            val refused = runCatching { read(UseAnswers(true, false)::next) }.exceptionOrNull()
+            assertTrue("$label: the repeat was not refused: $refused", refused is TopicUseWithheldException)
+            assertEquals(label, listOf(HttpExchangeEvidence(1, 1, 503, "0")), (refused as TopicUseWithheldException).exchanges)
+            assertEquals("$label: OkHttp's repeat reached the server", 1, server.requestCount)
+        }
     }
 
     // --- the interceptor on its own -------------------------------------------------------------------------------------
@@ -464,5 +568,10 @@ class TopicUseHttpBoundaryTest {
     private companion object {
         const val TETHER = "usdt:krw"
         const val TETHER_SNAPSHOT = """{"type":"snapshot","topic":"usdt:krw","data":{"sources":[]}}"""
+        const val GRAPH_CATALOG = """{"version":"2026-05-27","supported_periods":["1w","3m","1y"],"cache_ttl_seconds":3600,"tabs":[]}"""
+
+        fun graphTab(period: String) =
+            """{"tab":"usd","period":"$period","series":[],"metadata":{"fetched_at":"2026-09-29T10:00:00+09:00",""" +
+                """"bucket_size":"1d","range":{"start":"2026-06-29","end":"2026-09-29"}}}"""
     }
 }

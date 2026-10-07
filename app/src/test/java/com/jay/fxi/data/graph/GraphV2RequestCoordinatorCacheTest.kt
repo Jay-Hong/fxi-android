@@ -331,6 +331,7 @@ class GraphV2RequestCoordinatorCacheTest {
             owners = owners,
             currentAccessFence = { fence },
             uses = uses,
+            protectedAdmission = { true },
             scope = scope,
             clock = AppClock {
                 if (cancelAtNextEvent) {

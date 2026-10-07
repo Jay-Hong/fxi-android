@@ -343,6 +343,7 @@ class GraphV2RequestCoordinatorReGateTest {
             owners = owners,
             currentAccessFence = { fence },
             uses = uses,
+            protectedAdmission = { true },
             scope = scope,
             clock = AppClock { start + (test.testScheduler.currentTime - base).milliseconds },
             rateLimitJitter = { Duration.ZERO },

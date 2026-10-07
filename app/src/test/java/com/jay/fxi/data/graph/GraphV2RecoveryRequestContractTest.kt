@@ -282,6 +282,7 @@ class GraphV2RecoveryRequestContractTest {
                 owners = owners,
                 currentAccessFence = { fence },
                 uses = uses,
+                protectedAdmission = { true },
                 scope = scope,
                 clock = clock,
                 rateLimitJitter = { Duration.ZERO },

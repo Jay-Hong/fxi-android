@@ -384,6 +384,7 @@ class GraphV2RequestCoordinatorWriteTest {
             owners = owners,
             currentAccessFence = { fence },
             uses = uses,
+            protectedAdmission = { true },
             scope = scope,
             clock = AppClock { NOON + (test.testScheduler.currentTime - base).milliseconds },
             rateLimitJitter = { Duration.ZERO },

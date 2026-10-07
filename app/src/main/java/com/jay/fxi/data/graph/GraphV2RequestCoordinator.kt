@@ -11,6 +11,7 @@ import com.jay.fxi.data.remote.AuthenticatedHttpResponse
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.remote.TopicUseAuthority
 import com.jay.fxi.data.remote.TopicUseLifetime
+import com.jay.fxi.data.remote.TopicUseWithheldException
 import com.jay.fxi.data.remote.dto.GraphV2CatalogResponse
 import com.jay.fxi.data.remote.dto.GraphV2TabResponse
 import com.jay.fxi.domain.model.GraphCatalog
@@ -82,6 +83,8 @@ internal data class GraphRequestState(
  * When [recorder] is supplied, the coordinator loop, every recorder method, the control collector
  * and the sink worker must use the same serial executor. RT01 must verify this wiring.
  *
+ * @param protectedAdmission Live admission supplier consulted at each otherwise-admitted use check.
+ * It is also invoked on transport threads and must be thread-safe, non-blocking and side-effect free.
  * @param recorder Optional, immutable owner that captures recovery for existing one-day requests,
  * applies their successful responses synchronously and replays held inputs after catalog publication.
  */
@@ -91,6 +94,7 @@ internal class GraphV2RequestCoordinator(
     /** Published access fence, read from the loop and from transport threads. */
     private val currentAccessFence: () -> TopicSessionFence?,
     private val uses: TopicUseAuthority,
+    private val protectedAdmission: () -> Boolean,
     private val scope: CoroutineScope,
     private val clock: AppClock,
     /** Stable, finite and non-negative for each tab. */
@@ -691,7 +695,7 @@ internal class GraphV2RequestCoordinator(
         val captured = registration.context
         return !registration.disposed.get() && scope.isActive &&
             owners.currentIdentity() == captured.fence.identity &&
-            currentAccessFence() == captured.fence && uses.admits(captured.lifetime)
+            currentAccessFence() == captured.fence && uses.admits(captured.lifetime) && protectedAdmission()
     }
 
     private fun sendAdmitted(registration: Registration): Boolean {
@@ -1270,6 +1274,7 @@ internal class GraphV2RequestCoordinator(
         when (val error = result.exceptionOrNull()) {
             is AuthenticatedApiException -> recordRetryFloor(error.failure.statusCode, error.failure.retryAfter, originalTab, now)
             is AuthenticatedBodyDecodingException -> recordRetryFloor(error.response.statusCode, error.response.retryAfter, originalTab, now)
+            is TopicUseWithheldException -> error.exchanges.forEach { recordRetryFloor(it.statusCode, it.retryAfter, originalTab, now) }
             is AuthIdentityChangedException -> {
                 if (error.exchanges.isEmpty()) {
                     recordRetryFloor(error.statusCode, error.retryAfter, originalTab, now)

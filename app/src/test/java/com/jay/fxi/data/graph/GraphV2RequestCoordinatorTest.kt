@@ -4,6 +4,7 @@ import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.AuthUnavailableException
+import com.jay.fxi.data.auth.HttpExchangeEvidence
 import com.jay.fxi.data.remote.AuthenticatedBodyDecodingException
 import com.jay.fxi.data.remote.AuthenticatedFailureKind
 import com.jay.fxi.data.remote.AuthenticatedHttpFailure
@@ -12,6 +13,7 @@ import com.jay.fxi.data.remote.TopicGrantToken
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.remote.TopicUseAuthority
 import com.jay.fxi.data.remote.TopicUseLifetime
+import com.jay.fxi.data.remote.TopicUseWithheldException
 import com.jay.fxi.data.remote.dto.GraphV2CatalogPeriod
 import com.jay.fxi.data.remote.dto.GraphV2CatalogResponse
 import com.jay.fxi.data.remote.dto.GraphV2CatalogTab
@@ -69,6 +71,12 @@ import org.junit.Test
  *
  * The fake transport records what `useAdmitted()` answered at the moment of each send. A send it recorded
  * as refused is one the production transport would not have put on the wire.
+ *
+ * S4 RT03a (design R4c/S4 rt_next_codex.r1, agreed from rt_next_request.r1) adds rows RT03a1·RT03a2: a required
+ * `protectedAdmission` supplier joins every use check - the credential capture, the send guard and the completion - and
+ * is read live on each check. A send the transport withheld (`TopicUseWithheldException`) raises the shared floor from
+ * each response it had already seen, in order, as an identity refusal does; with nothing seen there is no floor. The other
+ * coordinator fixtures pass an always-open supplier; the production supplier, shared with the gate, is RT01's assembly.
  */
 class GraphV2RequestCoordinatorTest {
 
@@ -104,6 +112,8 @@ class GraphV2RequestCoordinatorTest {
         private val base = test.testScheduler.currentTime
         var fence: TopicSessionFence? = sessionFence()
         var allowed = true
+        /** The protected-admission supplier the coordinator reads on every use check (S4 RT03a). */
+        var protectedOpen = true
         var invalidations = 0L
         var skew: Duration = Duration.ZERO
         var captureGate: CompletableDeferred<Unit>? = null
@@ -170,6 +180,7 @@ class GraphV2RequestCoordinatorTest {
             owners = owners,
             currentAccessFence = { fence },
             uses = uses,
+            protectedAdmission = { protectedOpen },
             scope = scope,
             clock = AppClock { start + (test.testScheduler.currentTime - base).milliseconds + skew },
             rateLimitJitter = jitter,
@@ -1265,6 +1276,70 @@ class GraphV2RequestCoordinatorTest {
             step(600.seconds)
             val expected = if (succeeds) secs(0, 719) else secs(0, 719, 720 + after + 20, 720 + after + 60, 720 + after + 140)
             assertEquals(label, expected, f.tabTimes(key))
+            f.close()
+        }
+    }
+
+    // --- S4 RT03a: protected admission and withheld evidence --------------------------------------------------------
+
+    /**
+     * RT03a1: protected admission is part of every use check and is read live. Closed at activation, nothing is captured
+     * or sent, catalog included. Closed while a catalog and a tab are out, the wire guard refuses both and their late
+     * answers are not adopted.
+     */
+    @Test fun RT03a1_protectedAdmissionGatesEveryUseCheck() = runTest {
+        run {
+            val f = started()
+            f.protectedOpen = false
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            assertEquals(emptyList<Sent>(), f.sent)
+            assertEquals("no credential is captured", 0, f.captures)
+            f.close()
+        }
+        run {
+            val f = started()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            val c = f.catalogs().single()
+            val t = f.tabs(USD_3M).single()
+            assertTrue("premise: both admitted while open", c.admittedAtSend && t.admittedAtSend)
+            f.protectedOpen = false
+            assertFalse("the catalog's wire guard reads it live", c.useAdmitted())
+            assertFalse("the tab's wire guard reads it live", t.useAdmitted())
+            c.catalog.complete(ok(wideCatalog()))
+            t.tab.complete(ok(tabDto(USD_3M)))
+            runCurrent()
+            assertNull("no catalog adopted", f.state.catalog)
+            assertNull("no tab adopted", f.state.entries[USD_3M])
+            f.close()
+        }
+    }
+
+    /**
+     * RT03a2: a withheld send hands over the responses it had already seen, and each one's Retry-After raises the shared
+     * floor in order - here only the 429's 120 seconds counts, plus jitter, past the earlier 401 and under the later 503's
+     * shorter wait. With nothing seen, a withheld send leaves no floor.
+     */
+    @Test fun RT03a2_aWithheldSendRaisesTheFloorFromWhatItSaw() = runTest {
+        run {
+            val f = ladder(jitter = 10.seconds)
+            val seen = listOf(
+                HttpExchangeEvidence(1, 1, 401, null),
+                HttpExchangeEvidence(2, 1, 429, "120"),
+                HttpExchangeEvidence(2, 2, 503, "5")
+            )
+            f.tabSequence({ it.tab.completeExceptionally(TopicUseWithheldException(seen)) }, succeed(JPY_3M))
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            step(1.seconds); f.coordinator.onActivated(JPY_3M); runCurrent()
+            step(128999.milliseconds); assertEquals("nothing under the floor", 1, f.tabs().size)
+            step(1.milliseconds); assertEquals(listOf(USD_3M, JPY_3M), f.tabs().map { it.key })
+            f.close()
+        }
+        run {
+            val f = ladder(jitter = 10.seconds)
+            f.tabSequence({ it.tab.completeExceptionally(TopicUseWithheldException(emptyList())) }, succeed(JPY_3M))
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            step(1.seconds); f.coordinator.onActivated(JPY_3M); runCurrent()
+            assertEquals("nothing seen, no floor", listOf(USD_3M, JPY_3M), f.tabs().map { it.key })
             f.close()
         }
     }

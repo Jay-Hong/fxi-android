@@ -344,21 +344,33 @@ class AuthenticatedApiClient internal constructor(
             .preserve(AuthenticatedEndpoint.COMPARISON_NOTIFICATION_LOGS)
             .decodeSuccess(wireJson)
 
-    /** GET /api/v2/graph/catalog (premium; KRX series only when the user may see them). */
+    /**
+     * GET /api/v2/graph/catalog (premium; KRX series only when the user may see them).
+     *
+     * Passes [useAdmitted] unchanged to the transport. It can be invoked on transport threads and
+     * must be thread-safe, non-blocking and side-effect free.
+     */
     suspend fun getGraphV2Catalog(
-        owner: AuthSnapshot
+        owner: AuthSnapshot,
+        useAdmitted: () -> Boolean
     ): AuthenticatedHttpResponse<GraphV2CatalogResponse> =
-        transport.executeRead(owner) { service.getGraphV2Catalog(it) }
+        transport.executeRead(owner, useAdmitted) { service.getGraphV2Catalog(it) }
             .preserve(AuthenticatedEndpoint.GRAPH_V2_CATALOG)
             .decodeSuccess(wireJson)
 
-    /** GET /api/v2/graph/tab?tab=&period= (premium; period "1d" / "1w" / "3m" / "1y"). */
+    /**
+     * GET /api/v2/graph/tab?tab=&period= (premium; period "1d" / "1w" / "3m" / "1y").
+     *
+     * Passes [useAdmitted] unchanged to the transport. It can be invoked on transport threads and
+     * must be thread-safe, non-blocking and side-effect free.
+     */
     suspend fun getGraphV2Tab(
         owner: AuthSnapshot,
         tab: String,
-        period: String
+        period: String,
+        useAdmitted: () -> Boolean
     ): AuthenticatedHttpResponse<GraphV2TabResponse> =
-        transport.executeRead(owner) { service.getGraphV2Tab(it, tab, period) }
+        transport.executeRead(owner, useAdmitted) { service.getGraphV2Tab(it, tab, period) }
             .preserve(AuthenticatedEndpoint.GRAPH_V2_TAB)
             .decodeSuccess(wireJson)
 
