@@ -70,6 +70,8 @@ internal interface GraphV2Fetching {
 
 internal data class GraphEntry(val tab: GraphV2Tab, val online200At: Instant?)
 
+internal enum class GraphRuntimeRetirement { REMOVED, NOTHING_TO_REMOVE, LIVE_SCOPE_SELECTED }
+
 internal data class GraphRequestState(
     val dataScope: GraphDataScope? = null,
     val catalog: GraphCatalog? = null,
@@ -84,8 +86,9 @@ internal data class GraphRequestState(
  * When [recorder] is supplied, the coordinator loop, every recorder method, the control collector
  * and the sink worker must use the same serial executor. RT01 must verify this wiring.
  *
- * [start] and [close] must run on the loop's serial executor whether or not [recorder] is supplied,
- * because [close] mutates loop-confined state (in the assembly, its injected always-dispatching Main).
+ * [start], [close] and [retireScopes] must run on the loop's serial executor whether or not
+ * [recorder] is supplied, because they mutate loop-confined state (in the assembly, its injected
+ * always-dispatching Main).
  * [close] ends input and releases ownership synchronously, even before the loop's first dispatch.
  * The loop's finally uses the same idempotent cleanup; the supplied scope is not cancelled.
  *
@@ -172,6 +175,9 @@ internal class GraphV2RequestCoordinator(
         var midnightGeneration: Long? = null
         var midnightAttempt = false
         var flipGeneration: Long? = null
+        // Includes an enqueued completion until the loop consumes it, not just a running coroutine.
+        var completionPending = false
+        var handlingCompletion = false
     }
 
     private class ColdOwner(
@@ -275,6 +281,7 @@ internal class GraphV2RequestCoordinator(
     private var catalogAt: Instant? = null
     private var catalogRequest: Registration? = null
     private val tabRequests = mutableMapOf<GraphKey, Registration>()
+    private val pendingReleased = mutableMapOf<Long, Registration>()
     private var nextRequestId = 0L
     private var activityGeneration = 0L
     private var nextSeedId = 0L
@@ -342,6 +349,11 @@ internal class GraphV2RequestCoordinator(
         cancelFlip()
         deferredDemand = null
         discardRequests()
+        pendingReleased.values.forEach {
+            it.completionPending = false
+            dropCaptures(it)
+        }
+        pendingReleased.clear()
         publish()
         loop?.cancel()
     }
@@ -371,6 +383,104 @@ internal class GraphV2RequestCoordinator(
         }
         return removed
     }
+
+    /**
+     * Retires selected USER data scopes synchronously on the loop's serial executor, between events.
+     * The caller must establish that every selected epoch really ended, never reuse it or publish
+     * its fence again. A null or temporarily held fence alone does not establish retirement; same-
+     * epoch USER ends continue through the existing [seenUserEnd] context synchronization path.
+     *
+     * The non-null scope of [currentAccessFence] at entry is the live scope, independent of local
+     * context or credential admission. It joins the distinct scopes held by the snapshot, context,
+     * registered and released pending requests (including recovery captures), protected GENERAL
+     * slots, seed and writes. [selects] runs exactly once per candidate unless it throws. All
+     * selection and change planning precede mutation: a selector exception propagates unchanged;
+     * selecting the live scope returns [GraphRuntimeRetirement.LIVE_SCOPE_SELECTED] without changes.
+     * This port does not synchronize or acquire a context.
+     *
+     * Selected request contexts lose registration and capture references; other contexts lose only
+     * selected recovery captures. Released requests remain tracked while capture/fetch work or an
+     * unhandled completion remains, including after coroutine exit or enqueue. Handling the
+     * completion ends tracking, and [close] ends all of it - also for a completion it leaves
+     * undelivered or a request cancelled before its body, which arise only with [close] (directly,
+     * or through the scope cancellation that ends the loop through it). A released floor waiter with
+     * no work ends immediately. Completion lookup
+     * uses requestId/object identity, never a key alone, and grants no renewed application authority.
+     * Normal success retains release-before-applyRecovery, then clears references in completion
+     * finally after recovery application and handling finish.
+     *
+     * A selected snapshot becomes an empty [GraphRequestState], including null dataScope. Selected
+     * local context, catalog time, capability configuration and retry demand are discarded; selected
+     * slots, seed attempts and writes are removed. Writes disable admission, cancel their ticket and
+     * job, and release any pending preparation-start reference. Unselected scopes remain intact.
+     * Changes to publication/inFlight are published before returning, without starting write
+     * preparation, requests or seeds. [activeKey] survives for the next normal context change.
+     * [sharedRetryFloor] survives too; late completions delivered to the open inbox still record
+     * Retry-After before registration lookup or application rejection.
+     *
+     * [GraphRuntimeRetirement.REMOVED] means data, references or ownership were newly removed or
+     * retired. An already disposed, capture-free request retained only for completion does not count;
+     * repeated retirement returns [GraphRuntimeRetirement.NOTHING_TO_REMOVE].
+     */
+    fun retireScopes(selects: (GraphDataScope) -> Boolean): GraphRuntimeRetirement {
+        val live = currentAccessFence()?.let { scopeOf(it) }
+        val registrations = (listOfNotNull(catalogRequest) + tabRequests.values + pendingReleased.values).distinct()
+        val candidates = linkedSetOf<GraphDataScope>()
+        live?.let { candidates += it }
+        snapshot.dataScope?.let { candidates += it }
+        context?.let { scopeOf(it.fence) }?.let { candidates += it }
+        for (registration in registrations) {
+            scopeOf(registration.context.fence)?.let { candidates += it }
+            registration.recoveryRequests.forEach { candidates += it.seriesKey.scope }
+        }
+        protectedSlots.values.forEach { candidates += scopeOf(it.components.general.key) }
+        seedRegistration?.let { scopeOf(it.context.fence) }?.let { candidates += it }
+        writeTasks.values.forEach { scopeOf(it.captured.fence)?.let { held -> candidates += held } }
+
+        val selected = candidates.filter(selects).toSet()
+        val retiredRequests = registrations.filter { scopeOf(it.context.fence) in selected }
+        val captureUpdates = registrations.filterNot { it in retiredRequests }.map { registration ->
+            registration to registration.recoveryRequests.filterNot { it.seriesKey.scope in selected }
+        }.filter { (registration, kept) -> kept.size != registration.recoveryRequests.size }
+        val keptSlots = protectedSlots.filterValues { scopeOf(it.components.general.key) !in selected }
+        val retireSnapshot = snapshot.dataScope?.let { it in selected } == true
+        val retireContext = context?.let { scopeOf(it.fence) in selected } == true
+        val retireSeed = seedRegistration?.let { scopeOf(it.context.fence) in selected } == true
+        val retiredWrites = writeTasks.values.filter { scopeOf(it.captured.fence) in selected }
+        val removed = retireSnapshot || retireContext || retireSeed || retiredWrites.isNotEmpty() ||
+            keptSlots.size != protectedSlots.size || captureUpdates.isNotEmpty() || retiredRequests.any {
+                isRegistered(it) || !it.disposed.get() || it.recoveryRequests.isNotEmpty() || it.capturedOwner != null
+            }
+        if (live != null && live in selected) return GraphRuntimeRetirement.LIVE_SCOPE_SELECTED
+        if (!removed) return GraphRuntimeRetirement.NOTHING_TO_REMOVE
+
+        for (registration in retiredRequests) {
+            releaseRegistration(registration)
+            dropCaptures(registration)
+        }
+        captureUpdates.forEach { (registration, kept) -> registration.recoveryRequests = kept }
+        if (retireSnapshot || retireSeed) discardSeed()
+        retiredWrites.forEach { discardWrite(it) }
+        protectedSlots = keptSlots
+        if (retireSnapshot) snapshot = GraphRequestState()
+        if (retireSnapshot || retireContext) {
+            context = null
+            catalogAt = null
+            capabilityConfiguration = null
+            cancelCold()
+            cancelMidnight()
+            cancelFlip()
+            cancelTimer()
+            deferredDemand = null
+        }
+        publishState()
+        return GraphRuntimeRetirement.REMOVED
+    }
+
+    private fun scopeOf(fence: TopicSessionFence): GraphDataScope? =
+        fence.userAccessEpoch?.let { GraphDataScope(fence.identity.uid, it) }
+
+    private fun scopeOf(key: GraphV2GeneralKey): GraphDataScope = GraphDataScope(key.uid, key.userAccessEpoch)
 
     /** A single publication pairs each entry with its components and the current use context. */
     fun protectedEntry(key: GraphKey): GraphEntry? {
@@ -796,14 +906,41 @@ internal class GraphV2RequestCoordinator(
     }
 
     private fun startCapture(registration: Registration) {
-        scope.launch {
+        launchRequestCompletion(registration) {
             val result = runCatching { captureOwner(registration) }
-            inbox.trySend(Event.Captured(registration, result))
-            (result.exceptionOrNull() as? CancellationException)?.let { throw it }
+            Event.Captured(registration, result)
+        }
+    }
+
+    /**
+     * The completion stays pending until the loop handles it; coroutine exit or enqueue alone never
+     * ends it. An undelivered completion or a request cancelled before its body arises only with
+     * [close], which ends all pending tracking.
+     */
+    private fun launchRequestCompletion(
+        registration: Registration,
+        start: CoroutineStart = CoroutineStart.DEFAULT,
+        completion: suspend () -> Event
+    ) {
+        registration.completionPending = true
+        scope.launch(start = start) {
+            val event = completion()
+            inbox.trySend(event)
+            val error = when (event) {
+                is Event.Captured -> event.result.exceptionOrNull()
+                is Event.CatalogFinished -> event.result.exceptionOrNull()
+                is Event.TabFinished -> event.result.exceptionOrNull()
+                else -> error("Expected a graph request completion")
+            }
+            if (error is CancellationException) throw error
         }
     }
 
     private fun onCaptured(event: Event.Captured, now: Instant) {
+        handleRequestCompletion(event.registration) { applyCaptured(event, now) }
+    }
+
+    private fun applyCaptured(event: Event.Captured, now: Instant) {
         val registration = event.registration
         val error = event.result.exceptionOrNull()
         if (error != null) {
@@ -850,23 +987,27 @@ internal class GraphV2RequestCoordinator(
         registration.departed = true
         // Enter fetch immediately at the loop's final floor checkpoint. No queued child may
         // slip a new floor between this admission and entering the fetcher after capture.
-        scope.launch(start = CoroutineStart.UNDISPATCHED) {
+        launchRequestCompletion(registration, CoroutineStart.UNDISPATCHED) {
             val key = registration.key
             if (key == null) {
                 val result = runCatching { fetcher.catalog(owner) { sendAdmitted(registration) } }
-                inbox.trySend(Event.CatalogFinished(registration.requestId, registration.originalTab, result))
-                (result.exceptionOrNull() as? CancellationException)?.let { throw it }
+                Event.CatalogFinished(registration.requestId, registration.originalTab, result)
             } else {
                 val result = runCatching { fetcher.tab(owner, key) { sendAdmitted(registration) } }
-                inbox.trySend(Event.TabFinished(registration.requestId, key, result))
-                (result.exceptionOrNull() as? CancellationException)?.let { throw it }
+                Event.TabFinished(registration.requestId, key, result)
             }
         }
     }
 
     private fun applyCatalog(event: Event.CatalogFinished, now: Instant): Boolean {
         recordRetryFloor(event.result, event.originalTab, now)
-        val registration = catalogRequest?.takeIf { it.requestId == event.requestId } ?: return false
+        val registration = completionRegistration(event) ?: return false
+        return handleRequestCompletion(registration) {
+            if (isRegistered(registration)) applyRegisteredCatalog(registration, event, now) else false
+        }
+    }
+
+    private fun applyRegisteredCatalog(registration: Registration, event: Event.CatalogFinished, now: Instant): Boolean {
         if (event.result.exceptionOrNull() is CancellationException) {
             releaseCompletion(event)
             return false
@@ -887,7 +1028,13 @@ internal class GraphV2RequestCoordinator(
 
     private fun applyTab(event: Event.TabFinished, now: Instant) {
         recordRetryFloor(event.result, event.key.tab, now)
-        val registration = tabRequests[event.key]?.takeIf { it.requestId == event.requestId } ?: return
+        val registration = completionRegistration(event) ?: return
+        handleRequestCompletion(registration) {
+            if (isRegistered(registration)) applyRegisteredTab(registration, event, now)
+        }
+    }
+
+    private fun applyRegisteredTab(registration: Registration, event: Event.TabFinished, now: Instant) {
         if (!useAdmitted(registration)) {
             releaseRegistration(registration)
             endConnectedCold(registration)
@@ -1244,6 +1391,7 @@ internal class GraphV2RequestCoordinator(
         try {
             abandonWrite(task)
         } finally {
+            if (writePreparationToStart === task.job) writePreparationToStart = null
             task.job?.cancel()
             if (writeTasks[task.ticket] === task) writeTasks.remove(task.ticket)
         }
@@ -1640,35 +1788,68 @@ internal class GraphV2RequestCoordinator(
         } else if (tabRequests[registration.key] === registration) {
             tabRequests.remove(registration.key)
         }
+        if (registration.completionPending || registration.handlingCompletion) {
+            pendingReleased[registration.requestId] = registration
+        } else {
+            settleRegistration(registration)
+        }
+    }
+
+    /** Resolving a released completion is only for cleanup; response application still requires registration. */
+    private fun completionRegistration(event: Event): Registration? = when (event) {
+        is Event.Captured -> event.registration
+        is Event.CatalogFinished -> catalogRequest?.takeIf { it.requestId == event.requestId }
+            ?: pendingReleased[event.requestId]
+        is Event.TabFinished -> tabRequests[event.key]?.takeIf { it.requestId == event.requestId }
+            ?: pendingReleased[event.requestId]
+        else -> null
+    }
+
+    private inline fun <T> handleRequestCompletion(registration: Registration, apply: () -> T): T {
+        val alreadyHandling = registration.handlingCompletion // Capture failures delegate to response handling.
+        registration.completionPending = false
+        registration.handlingCompletion = true
+        try {
+            return apply()
+        } finally {
+            registration.handlingCompletion = alreadyHandling
+            settleRegistration(registration)
+        }
+    }
+
+    private fun settleRegistration(registration: Registration) {
+        if (registration.completionPending || registration.handlingCompletion) return
+        if (pendingReleased[registration.requestId] === registration) pendingReleased.remove(registration.requestId)
+        if (registration.disposed.get()) dropCaptures(registration)
+    }
+
+    private fun dropCaptures(registration: Registration) {
+        registration.recoveryRequests = emptyList()
+        registration.capturedOwner = null
     }
 
     private fun releaseCompletion(event: Event) {
-        when (event) {
-            is Event.CatalogFinished -> catalogRequest?.takeIf { it.requestId == event.requestId }?.let {
-                releaseRegistration(it)
-            }
-            is Event.TabFinished -> tabRequests[event.key]?.takeIf { it.requestId == event.requestId }?.let {
-                releaseRegistration(it)
-                endConnectedCold(it)
-                endConnectedMidnight(it)
-                endConnectedFlip(it)
-            }
-            is Event.Captured -> if (isRegistered(event.registration)) releaseRegistration(event.registration)
-            else -> Unit
+        completionRegistration(event)?.let {
+            it.completionPending = false
+            releaseRegistration(it)
+            endConnectedCold(it)
+            endConnectedMidnight(it)
+            endConnectedFlip(it)
         }
     }
 
     private fun discardRequests() {
-        catalogRequest?.disposed?.set(true)
-        catalogRequest = null
-        tabRequests.values.forEach { it.disposed.set(true) }
-        tabRequests.clear()
+        (listOfNotNull(catalogRequest) + tabRequests.values.toList()).forEach { releaseRegistration(it) }
     }
 
-    private fun publish() {
+    private fun publishState() {
         snapshot = snapshot.copy(inFlight = tabRequests.keys.toSet())
         protectedPublication = ProtectedPublication(context, protectedSlots)
         mutableState.value = snapshot
+    }
+
+    private fun publish() {
+        publishState()
         // Even an immediate or multi-thread dispatcher must see the adopted publication first.
         val preparationJob = writePreparationToStart
         writePreparationToStart = null

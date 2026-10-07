@@ -13,7 +13,9 @@ import com.jay.fxi.data.graph.GraphObservationSeriesKey
 import com.jay.fxi.data.graph.GraphOwnerSource
 import com.jay.fxi.data.graph.GraphProtectedAdmission
 import com.jay.fxi.data.graph.GraphRecorder
+import com.jay.fxi.data.graph.GraphRequestState
 import com.jay.fxi.data.graph.GraphRuntimeAssembly
+import com.jay.fxi.data.graph.GraphRuntimeRetirement
 import com.jay.fxi.data.graph.GraphSeriesSelectionSession
 import com.jay.fxi.data.graph.GraphV2AccessCapture
 import com.jay.fxi.data.graph.GraphV2AccessGate
@@ -3062,6 +3064,62 @@ class PremiumAccessTopicSnapshotTest {
         r.a.recorder.observe(r.quote(1391.0, other, otherLifetime))
         assertFalse("the old scope's catalog is not lent to the new one", r.adopted(r.kb(other), 1391.0))
         assertEquals("the new user's input is held instead", 1, r.held())
+    }
+
+    // --- S4 RT01-B2a: retiring a user data scope from the coordinator -----------------------------------------------
+
+    /**
+     * graphB2a01 (S4 RT01-B2a): over the real issuer, with the fence withdrawn and the coordinator not yet told, a caller
+     * that has established that this USER epoch ended (a null fence alone is not that evidence) retires the scope the
+     * coordinator still holds. Everything it held for it goes at once - entries, the catalog, the protected slot and the 1d
+     * request carrying kb's recovery capture - published before the call returns; once the late 1d answer is handled
+     * nothing holds the scope any more.
+     */
+    @Test
+    fun graphB2a01_retiringAHeldScopeRemovesItsEntriesAndRequestsAtOnce() = snapshotTest {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        val scope = a.kb.scope
+        assertNotNull("premise: a protected entry", g.coordinator.protectedEntry(KEY_3M))
+        g.fence = null
+        val seen = mutableListOf<GraphDataScope>()
+        assertEquals(GraphRuntimeRetirement.REMOVED, g.coordinator.retireScopes { seen += it; it == scope })
+        assertEquals(listOf(scope), seen)
+        assertEquals("emptied, data scope included", GraphRequestState(), g.coordinator.state.value)
+        assertNull("no protected entry (the gate alone already refuses a withdrawn fence)", g.coordinator.protectedEntry(KEY_3M))
+        a.day.tab.complete(ok(g.dayTab())); runCurrent()
+        assertEquals("the late 1d answer lands nowhere", GraphRequestState(), g.coordinator.state.value)
+        seen.clear()
+        assertEquals("nothing is left to remove", GraphRuntimeRetirement.NOTHING_TO_REMOVE, g.coordinator.retireScopes { seen += it; it == scope })
+        assertTrue("nothing holds the scope any more, its protected slot included", seen.isEmpty())
+        assertTrue(g.failures.isEmpty())
+    }
+
+    /**
+     * graphB2a02 (S4 RT01-B2a): a 1d request released by a context change still holds kb's recovery capture while its
+     * answer is pending. Retiring kb's scope removes that capture; retiring again removes nothing more, though the request
+     * keeps the scope a candidate until its answer is handled. Afterwards nothing holds the scope.
+     */
+    @Test
+    fun graphB2a02_aReleasedRequestsCaptureIsRemoved_andTheScopeLeavesWithItsAnswer() = snapshotTest {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        val scope = a.kb.scope
+        g.withdraw(); runCurrent()
+        assertNull("premise: the coordinator let the scope go", g.coordinator.state.value.dataScope)
+        val seen = mutableListOf<GraphDataScope>()
+        assertEquals("the released request held kb's capture", GraphRuntimeRetirement.REMOVED, g.coordinator.retireScopes { seen += it; it == scope })
+        assertEquals(listOf(scope), seen)
+        seen.clear()
+        assertEquals("nothing more to remove", GraphRuntimeRetirement.NOTHING_TO_REMOVE, g.coordinator.retireScopes { seen += it; it == scope })
+        assertEquals("still a candidate while its answer is pending", listOf(scope), seen)
+        a.day.tab.complete(ok(g.dayTab())); runCurrent()
+        seen.clear()
+        assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, g.coordinator.retireScopes { seen += it; it == scope })
+        assertTrue("gone once its answer is handled", seen.isEmpty())
+        assertTrue(g.failures.isEmpty())
     }
 
     private companion object {

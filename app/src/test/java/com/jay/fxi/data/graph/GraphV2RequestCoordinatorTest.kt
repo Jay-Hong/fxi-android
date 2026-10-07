@@ -41,6 +41,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
@@ -51,6 +52,7 @@ import okhttp3.Headers
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -1450,5 +1452,414 @@ class GraphV2RequestCoordinatorTest {
             assertTrue("$label: no failure is reported", f.failures.isEmpty())
             f.close()
         }
+    }
+
+    // --- S4 RT01-B2a: retiring user data scopes ------------------------------------------------------
+    //
+    // Agreed in R4c/S4 rt01b2a_api_agreed.r2 (r1 proposal plus Codex's supplements). retireScopes runs on the loop's serial
+    // executor between events, and its caller must have established that each selected USER epoch really ended: a null or
+    // held fence alone is not that evidence. Effects no row can observe while that precondition holds, recorded as
+    // equivalent for the mutation battery (rt01b2a contract review, api-fit-F15):
+    //  (a) a capture of a selected scope under an unselected context cannot occur: captures take the request's own scope;
+    //  (b) the context, registered requests, slots, the seed and writes always share the snapshot's data scope, since every scope
+    //      change discards or clears them, so listing them beside the snapshot adds no candidate; only released leftovers do,
+    //      which the rows below check (B2a09 holds the snapshot's own candidate, with no context left);
+    //  (c) clearing attemptedSeedKey/attemptedSupplement has no later effect: a new seed passes a context change first;
+    //  (d) publishState and publish behave alike between events, since no write preparation is pending then;
+    //  (e) the disposed flag and a write's enabled flag are masked by the fence checks of the send guard and the gate;
+    //  (f) rebuilding protectedPublication and dropping the context: protectedEntry asks the gate, which refuses a non-live fence;
+    //  (g) catalogAt, capabilityConfiguration, deferredDemand and the cold, midnight and flip owners are reset by the next scope
+    //      change, and before it a wake - which synchronizes first - refuses an owner or a demand whose context is not current;
+    //  (h) dropping capture references once a registration settles (its answer handled, or released with nothing pending) is
+    //      visible only in memory; the release-before-recovery order is held by existing rows (PremiumAccessTopicSnapshotTest's
+    //      approved start, GraphV2RecoveryRequestContractTest R2);
+    //  (i) a late answer's registration check is also held by the use check that applying makes first: every released
+    //      registration is disposed;
+    //  (j) an undelivered completion and a request cancelled before its body arise only with close: the inbox is cancelled only
+    //      by close, and a request job only with the scope, whose cancellation ends the loop through close - so the disposal
+    //      close makes covers them, and handling them separately changes nothing a row can see;
+    //  (k) a capture failure's delegated answer handling is its last step, so restoring or clearing the handling flag after it
+    //      settles alike;
+    //  (l) a discarded write's pending preparation-start reference: its job is cancelled with it, and starting a cancelled lazy
+    //      job runs nothing.
+
+    private val scopeE1 = GraphDataScope("u1", "e1")
+    private val scopeE2 = GraphDataScope("u1", "e2")
+    private val scopeE3 = GraphDataScope("u1", "e3")
+
+    /** What one retirement passes to its selector, and what it answers; the selector picks [picks]. */
+    private fun Fixture.retire(picks: Set<GraphDataScope>): Pair<Set<GraphDataScope>, GraphRuntimeRetirement> {
+        val seen = mutableListOf<GraphDataScope>()
+        val result = coordinator.retireScopes { seen += it; it in picks }
+        assertEquals("each candidate once: $seen", seen.size, seen.toSet().size)
+        return seen.toSet() to result
+    }
+
+    /**
+     * B2a01 (S4 RT01-B2a): the published fence alone decides the live scope, which is always a candidate; selecting it
+     * refuses the whole call before anything goes - nothing held, an entry and a request in flight that then lands, or a
+     * stale scope selected together with it. With no fence and nothing held there is nothing to retire.
+     */
+    @Test fun B2a01_aLiveScopeIsRefusedBeforeAnythingGoes() = runTest {
+        val idle = started()
+        assertEquals(setOf(scopeE1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, idle.retire(setOf(scopeE1)))
+        idle.liveIdentity = AuthIdentityFence("u1", 2L)
+        assertEquals("the fence alone decides, as in GraphRecorder.purge", setOf(scopeE1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, idle.retire(setOf(scopeE1)))
+        idle.liveIdentity = null
+        idle.fence = null
+        assertEquals(emptySet<GraphDataScope>() to GraphRuntimeRetirement.NOTHING_TO_REMOVE, idle.retire(setOf(scopeE1)))
+        idle.close()
+
+        val f = ladder()
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        f.tabs(USD_3M).single().tab.complete(ok(tabDto(USD_3M))); runCurrent()
+        f.coordinator.onActivated(USD_1Y); runCurrent()
+        val out = f.tabs(USD_1Y).single()
+        val before = f.state
+        assertTrue("premise: an entry and a request in flight under e1", USD_3M in before.entries && USD_1Y in before.inFlight)
+        assertEquals(setOf(scopeE1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, f.retire(setOf(scopeE1)))
+        assertEquals("untouched", before, f.state)
+        out.tab.complete(ok(tabDto(USD_1Y))); runCurrent()
+        assertTrue("the request in flight still lands beside the kept entry", USD_1Y in f.state.entries && USD_3M in f.state.entries)
+        val sends = f.sent.size
+        f.coordinator.onRefreshRequested(); runCurrent()
+        assertEquals("nothing was emptied behind the publication: nothing is fetched again", sends, f.sent.size)
+        assertEquals("the catalog was not asked for again", 1, f.catalogs().size)
+        f.close()
+
+        val g = ladder()
+        g.coordinator.onActivated(USD_3M); runCurrent()
+        g.fence = sessionFence(epoch = "e2"); g.coordinator.onContextChanged(); runCurrent()
+        val held = g.state
+        assertEquals(setOf(scopeE1, scopeE2) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, g.retire(setOf(scopeE1, scopeE2)))
+        assertEquals("untouched", held, g.state)
+        assertEquals("the stale request still holds its credential", setOf(scopeE1, scopeE2) to GraphRuntimeRetirement.REMOVED, g.retire(setOf(scopeE1)))
+        g.close()
+    }
+
+    /**
+     * B2a02 (S4 RT01-B2a): with the fence already moved to a new USER epoch (which a caller may take as the old one's end)
+     * and the coordinator not yet told, the scope it still holds is retired at once - an empty state, data scope included,
+     * published before the call returns. A late answer for that scope applies nothing but its Retry-After still floors the
+     * next request, which the following context change sends under the new scope for the screen's active key.
+     */
+    @Test fun B2a02_aLaggingScopeIsRetiredAtOnce_andALateAnswerOnlyKeepsItsFloor() = runTest {
+        val f = ladder()
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        f.tabs(USD_3M).single().tab.complete(ok(tabDto(USD_3M))); runCurrent()
+        f.coordinator.onActivated(JPY_3M); runCurrent()
+        f.tabs(JPY_3M).single().tab.complete(status(503)); runCurrent()
+        f.coordinator.onActivated(USD_1Y); runCurrent()
+        val out = f.tabs(USD_1Y).single()
+        assertTrue(
+            "premise: an entry, a failure, a catalog and a request in flight under e1",
+            USD_3M in f.state.entries && JPY_3M in f.state.failures && f.state.catalog != null &&
+                USD_1Y in f.state.inFlight && f.state.dataScope == scopeE1
+        )
+
+        f.fence = sessionFence(epoch = "e2")
+        assertEquals(setOf(scopeE1, scopeE2) to GraphRuntimeRetirement.REMOVED, f.retire(setOf(scopeE1)))
+        assertEquals("emptied and published before the call returns", GraphRequestState(), f.state)
+
+        out.tab.complete(limited(429, "120")); runCurrent()
+        assertEquals("the late answer applies nothing", GraphRequestState(), f.state)
+        val sends = f.sent.size
+        f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("the new scope is taken up", scopeE2, f.state.dataScope)
+        step(119.seconds)
+        assertEquals("nothing goes out under the late answer's floor", sends, f.sent.size)
+        step(2.seconds)
+        assertEquals(
+            "then the screen's active key is asked for again, admitted under e2",
+            listOf(USD_1Y to true), f.sent.drop(sends).filter { it.kind == "tab" }.map { it.key to it.admittedAtSend }
+        )
+        assertTrue(f.failures.isEmpty())
+        f.close()
+    }
+
+    /**
+     * B2a03 (S4 RT01-B2a): a second retirement before the late answer removes nothing more, though the released request
+     * still holds the old scope - it remains a candidate until that answer is handled. Afterwards the old scope is no
+     * longer a candidate at all.
+     */
+    @Test fun B2a03_retiringAgainIsIdempotent_andTheOldScopeLeavesWithItsLastAnswer() = runTest {
+        val f = ladder()
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        val out = f.tabs(USD_3M).single()
+        f.fence = sessionFence(epoch = "e2")
+        assertEquals(GraphRuntimeRetirement.REMOVED, f.retire(setOf(scopeE1)).second)
+        assertEquals(setOf(scopeE1, scopeE2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retire(setOf(scopeE1)))
+        out.tab.complete(ok(tabDto(USD_3M))); runCurrent()
+        assertEquals("only the live scope is left", setOf(scopeE2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retire(setOf(scopeE1)))
+        f.close()
+    }
+
+    /**
+     * B2a04 (S4 RT01-B2a): a selector that throws - here on its second call - leaves everything as it was, also behind the
+     * publication: republishing e1 (nothing has been retired yet) a refresh fetches nothing again, and a later retirement
+     * still finds the scope to remove. A selector that picks nothing removes nothing, and each candidate is passed once.
+     */
+    @Test fun B2a04_aThrowingSelectorChangesNothing() = runTest {
+        val f = ladder()
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        f.tabs(USD_3M).single().tab.complete(ok(tabDto(USD_3M))); runCurrent()
+        f.fence = sessionFence(epoch = "e2")
+        val before = f.state
+        val boom = IllegalStateException("selector")
+        var calls = 0
+        assertEquals(boom, assertThrows(IllegalStateException::class.java) {
+            f.coordinator.retireScopes { if (++calls == 2) throw boom else true }
+        })
+        assertEquals("untouched", before, f.state)
+        val sends = f.sent.size
+        f.fence = sessionFence(); f.coordinator.onRefreshRequested(); runCurrent()
+        assertEquals("nothing changed behind the publication either: nothing is fetched again", sends, f.sent.size)
+        assertEquals(before, f.state)
+        f.fence = sessionFence(epoch = "e2")
+        assertEquals(setOf(scopeE1, scopeE2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retire(emptySet()))
+        assertEquals(before, f.state)
+        assertEquals("the scope is still there to remove", GraphRuntimeRetirement.REMOVED, f.retire(setOf(scopeE1)).second)
+        f.close()
+    }
+
+    /**
+     * B2a05 (S4 RT01-B2a): a request released by a context change keeps its old scope a candidate while it still has work
+     * or an unhandled answer - a capture held, a fetch out, its answer queued but not yet handled, a catalog fetch out -
+     * and drops out once that answer is handled. One released while it waits for the floor has no work left and drops out
+     * at its release; an answer handled while still registered leaves nothing behind; one whose answer fails to be handled
+     * drops out too; close drops every one, and so does the scope's end before a capture body ever ran.
+     */
+    @Test fun B2a05_aReleasedRequestStaysACandidateOnlyWhileItsAnswerIsPending() = runTest {
+        run {
+            val f = Fixture(this)
+            f.autoCatalog = { s -> s.catalog.complete(ok(wideCatalog())) }
+            f.captureGate = CompletableDeferred()
+            f.coordinator.start(); runCurrent()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            f.fence = sessionFence(epoch = "e2"); f.coordinator.onContextChanged(); runCurrent()
+            assertEquals("a capture held", setOf(scopeE1, scopeE2), f.retire(emptySet()).first)
+            f.captureGate!!.complete(Unit)
+            var queued: Pair<Set<GraphDataScope>, Int>? = null
+            f.scope.launch { queued = f.retire(emptySet()).first to f.sent.size } // after the captures enqueue, before the loop runs
+            runCurrent()
+            assertEquals("its capture answered, the answer not yet handled", setOf(scopeE1, scopeE2) to 0, queued)
+            assertEquals("its answer handled", setOf(scopeE2), f.retire(emptySet()).first)
+            f.close()
+        }
+        run {
+            val f = ladder()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            val out = f.tabs(USD_3M).single()
+            f.fence = sessionFence(epoch = "e2"); f.coordinator.onContextChanged(); runCurrent()
+            assertEquals("a fetch out", setOf(scopeE1, scopeE2), f.retire(emptySet()).first)
+            f.tabs(USD_3M).last().tab.complete(ok(tabDto(USD_3M)))
+            out.tab.complete(ok(tabDto(USD_3M)))
+            var queued: Pair<Set<GraphDataScope>, Boolean>? = null
+            f.scope.launch { queued = f.retire(emptySet()).first to (USD_3M in f.state.entries) } // both answers queued
+            runCurrent()
+            assertEquals("its answer queued, not yet handled", setOf(scopeE1, scopeE2) to false, queued)
+            assertEquals("its answer handled", setOf(scopeE2), f.retire(emptySet()).first)
+            f.close()
+        }
+        run {
+            val f = ladder()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            f.holdCaptureNumber = f.captures + 1
+            f.coordinator.onActivated(JPY_3M); runCurrent()
+            f.tabs(USD_3M).single().tab.complete(limited(429, "120")); runCurrent()
+            f.heldCapture.complete(Unit); runCurrent()
+            assertEquals("premise: JPY waits for the floor", 1, f.tabs().size)
+            assertTrue("premise: JPY is a captured registration, not merely deferred", JPY_3M in f.state.inFlight)
+            f.fence = sessionFence(epoch = "e2"); f.coordinator.onContextChanged(); runCurrent()
+            assertEquals("released while waiting for the floor, it has no work left", setOf(scopeE2), f.retire(emptySet()).first)
+            f.close()
+        }
+        run {
+            val f = ladder()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            f.tabs(USD_3M).single().tab.complete(limited(429, "120")); runCurrent()
+            f.fence = sessionFence(epoch = "e2"); f.coordinator.onContextChanged(); runCurrent()
+            assertEquals("an answer handled while registered leaves nothing behind", setOf(scopeE2), f.retire(emptySet()).first)
+            f.close()
+        }
+        run {
+            val f = Fixture(this, jitter = { throw IllegalStateException("jitter") })
+            f.autoCatalog = { s -> s.catalog.complete(ok(wideCatalog())) }
+            f.coordinator.start(); runCurrent()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            val out = f.tabs(USD_3M).single()
+            f.fence = sessionFence(epoch = "e2"); f.coordinator.onContextChanged(); runCurrent()
+            out.tab.complete(limited(429, null)); runCurrent()
+            assertEquals("premise: handling the answer failed", 1, f.failures.size)
+            assertEquals("a failed handling still ends it", setOf(scopeE2), f.retire(emptySet()).first)
+            f.close()
+        }
+        for (answer in listOf("ok", "failed handling")) run {
+            val f = Fixture(this, jitter = { throw IllegalStateException("jitter") })
+            f.coordinator.start(); runCurrent()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            val catalog = f.catalogs().single()
+            val tab = f.tabs(USD_3M).single()
+            f.fence = sessionFence(epoch = "e2"); f.coordinator.onContextChanged(); runCurrent()
+            tab.tab.complete(ok(tabDto(USD_3M))); runCurrent()
+            assertEquals("$answer: a catalog fetch out", setOf(scopeE1, scopeE2), f.retire(emptySet()).first)
+            catalog.catalog.complete(if (answer == "ok") ok(wideCatalog()) else limited<GraphV2CatalogResponse>(429, null)); runCurrent()
+            assertEquals("$answer: its answer handled", setOf(scopeE2), f.retire(emptySet()).first)
+            assertEquals(answer, if (answer == "ok") 0 else 1, f.failures.size)
+            f.close()
+        }
+        run {
+            val f = ladder()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            f.fence = sessionFence(epoch = "e2"); f.coordinator.onContextChanged(); runCurrent()
+            assertEquals(setOf(scopeE1, scopeE2), f.retire(emptySet()).first)
+            f.coordinator.close()
+            assertEquals("close ends it", setOf(scopeE2), f.retire(emptySet()).first)
+            f.fence = null
+            assertEquals(GraphRuntimeRetirement.REMOVED, f.retire(setOf(scopeE2)).second)
+            assertEquals("nothing close released stays behind", emptySet<GraphDataScope>() to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retire(setOf(scopeE2)))
+            f.close()
+        }
+        run {
+            val f = ladder()
+            f.coordinator.onActivated(USD_3M)
+            launch { f.scope.cancel() } // after the loop's Activate handle, before the captures it launched are dispatched
+            runCurrent()
+            assertEquals("premise: no capture body was entered", 0, f.captures)
+            f.fence = null
+            assertEquals(GraphRuntimeRetirement.REMOVED, f.retire(setOf(scopeE1)).second)
+            assertEquals("cancelled before its body, nothing tracks e1", emptySet<GraphDataScope>(), f.retire(emptySet()).first)
+        }
+    }
+
+    /**
+     * B2a06 (S4 RT01-B2a): retiring a stale scope that only a released request still holds leaves the live scope untouched -
+     * its entry, catalog, request in flight and published state - while the released request's credential goes, so the
+     * call says REMOVED; a second call removes nothing, the live request still lands and the stale answer lands nowhere.
+     * With a terminal failure and nothing in flight, the retirement starts nothing, though the active key could be asked for.
+     */
+    @Test fun B2a06_retiringAStaleScopeLeavesTheLiveScopeUntouched_andStartsNothing() = runTest {
+        run {
+            val f = ladder()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            val stale = f.tabs(USD_3M).single()
+            f.fence = sessionFence(epoch = "e2"); f.coordinator.onContextChanged(); runCurrent()
+            f.tabs(USD_3M).last().tab.complete(ok(tabDto(USD_3M, rate = 1400.0))); runCurrent()
+            f.coordinator.onActivated(JPY_3M); runCurrent()
+            val live = f.tabs(JPY_3M).single()
+            val before = f.state
+            assertTrue(
+                "premise: e2 holds an entry, a catalog and a request in flight",
+                before.dataScope == scopeE2 && USD_3M in before.entries && before.catalog != null && JPY_3M in before.inFlight
+            )
+            assertEquals(setOf(scopeE1, scopeE2) to GraphRuntimeRetirement.REMOVED, f.retire(setOf(scopeE1)))
+            assertEquals("the live scope is untouched", before, f.state)
+            assertEquals("nothing more to remove", setOf(scopeE1, scopeE2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retire(setOf(scopeE1)))
+            live.tab.complete(ok(tabDto(JPY_3M))); runCurrent()
+            assertTrue("the live request still lands", JPY_3M in f.state.entries)
+            stale.tab.complete(ok(tabDto(USD_3M, rate = 1300.0))); runCurrent()
+            assertEquals("the stale answer lands nowhere", 1400.0, rateOf(f, USD_3M), 0.0)
+            assertEquals("only the live scope is left", setOf(scopeE2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retire(setOf(scopeE1)))
+            assertTrue(f.failures.isEmpty())
+            f.close()
+        }
+        run {
+            val f = ladder()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            val old = f.tabs(USD_3M).single()
+            f.fence = sessionFence(epoch = "e2"); f.coordinator.onContextChanged(); runCurrent()
+            f.tabs(USD_3M).last().tab.complete(status(404)); runCurrent()
+            val before = f.state
+            val sends = f.sent.size
+            assertTrue(
+                "premise: e2 adopted, a terminal failure, nothing in flight",
+                before.dataScope == scopeE2 && USD_3M in before.failures && before.inFlight.isEmpty()
+            )
+            assertEquals(setOf(scopeE1, scopeE2) to GraphRuntimeRetirement.REMOVED, f.retire(setOf(scopeE1)))
+            assertEquals("the adopted scope is untouched", before, f.state)
+            runCurrent()
+            assertEquals("nothing is started", sends, f.sent.size)
+            old.tab.complete(ok(tabDto(USD_3M))); runCurrent()
+            assertEquals("the old answer applies nothing", before, f.state)
+            assertEquals(setOf(scopeE2), f.retire(emptySet()).first)
+            assertTrue(f.failures.isEmpty())
+            f.close()
+        }
+    }
+
+    /**
+     * B2a07 (S4 RT01-B2a): a Retry-After floor recorded before a retirement survives it - the shared floor is not reset - and
+     * holds the request the following context change asks for under the new scope. A cold retry the retired scope had armed
+     * does not fire: nothing takes up any scope before the context change.
+     */
+    @Test fun B2a07_theFloorSurvives_andTheRetiredScopesTimersDoNotFire() = runTest {
+        run {
+            val f = ladder()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            f.tabs(USD_3M).single().tab.complete(limited(429, "120")); runCurrent()
+            f.fence = sessionFence(epoch = "e2")
+            assertEquals(setOf(scopeE1, scopeE2) to GraphRuntimeRetirement.REMOVED, f.retire(setOf(scopeE1)))
+            val sends = f.sent.size
+            f.coordinator.onContextChanged(); runCurrent()
+            assertEquals("the new scope is taken up", scopeE2, f.state.dataScope)
+            step(119.seconds)
+            assertEquals("the earlier floor still holds", sends, f.sent.size)
+            step(2.seconds)
+            assertEquals("then the active key is asked for", listOf(USD_3M), f.sent.drop(sends).filter { it.kind == "tab" }.map { it.key })
+            assertTrue(f.failures.isEmpty())
+            f.close()
+        }
+        run {
+            val f = ladder()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            f.tabs(USD_3M).single().tab.complete(status(503)); runCurrent() // a cold retry is due at +3 s
+            f.fence = sessionFence(epoch = "e2")
+            assertEquals(GraphRuntimeRetirement.REMOVED, f.retire(setOf(scopeE1)).second)
+            step(10.seconds)
+            assertEquals("no retry timer takes anything up before the context change", GraphRequestState(), f.state)
+            assertEquals(1, f.tabs().size)
+            f.close()
+        }
+    }
+
+    /** B2a08 (S4 RT01-B2a): of two released requests for one key, an answer ends only its own and applies nothing. */
+    @Test fun B2a08_aLateAnswerEndsOnlyItsOwnReleasedRequest() = runTest {
+        val f = ladder()
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        val first = f.tabs(USD_3M).single()
+        f.fence = sessionFence(epoch = "e2"); f.coordinator.onContextChanged(); runCurrent()
+        val second = f.tabs(USD_3M).last()
+        f.fence = sessionFence(epoch = "e3"); f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("premise: two released requests for one key", setOf(scopeE1, scopeE2, scopeE3), f.retire(emptySet()).first)
+        second.tab.complete(ok(tabDto(USD_3M))); runCurrent()
+        assertEquals("the e2 answer ends only its own request", setOf(scopeE1, scopeE3), f.retire(emptySet()).first)
+        assertFalse("and applies nothing", USD_3M in f.state.entries)
+        assertEquals("the key's current request is untouched", setOf(USD_3M), f.state.inFlight)
+        first.tab.complete(ok(tabDto(USD_3M))); runCurrent()
+        assertEquals(setOf(scopeE3), f.retire(emptySet()).first)
+        f.close()
+    }
+
+    /**
+     * B2a09 (S4 RT01-B2a): a scope that only the published state still holds - its use withdrawn, so no context, request,
+     * slot, seed or write is left, yet its entry stays for the same scope - is a candidate of its own and is retired with
+     * that entry once the fence has moved on.
+     */
+    @Test fun B2a09_aScopeHeldOnlyByThePublishedStateIsRetired() = runTest {
+        val f = ladder()
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        f.tabs(USD_3M).single().tab.complete(ok(tabDto(USD_3M))); runCurrent()
+        f.allowed = false
+        f.coordinator.onContextChanged(); runCurrent()
+        assertTrue(
+            "premise: e1's entry kept with its use withdrawn and nothing in flight",
+            USD_3M in f.state.entries && f.state.dataScope == scopeE1 && f.state.inFlight.isEmpty()
+        )
+
+        f.fence = sessionFence(epoch = "e2")
+        assertEquals(setOf(scopeE1, scopeE2) to GraphRuntimeRetirement.REMOVED, f.retire(setOf(scopeE1)))
+        assertEquals("the entry and the scope go together", GraphRequestState(), f.state)
+        assertTrue(f.failures.isEmpty())
+        f.close()
     }
 }

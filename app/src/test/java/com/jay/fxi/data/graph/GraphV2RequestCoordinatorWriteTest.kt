@@ -771,12 +771,13 @@ class GraphV2RequestCoordinatorWriteTest {
     }
 
     /**
-     * A real context change (the lifetime moves to invalidations 4), the scope's end or close() cancels a writer that is
-     * preparing or writing, before any late result. Its job ends: nothing is delegated or written afterwards. close() cancels
-     * it before it returns (S4 RT01-A3).
+     * A real context change (the lifetime moves to invalidations 4), the scope's end, close() or retiring its data scope
+     * cancels a writer that is preparing or writing, before any late result. Its job ends: nothing is delegated or written
+     * afterwards. close() (S4 RT01-A3) and retireScopes (S4 RT01-B2a; the fence already moved on, the coordinator not yet
+     * told) cancel it before they return.
      */
     @Test fun Y04_aContextChangeOrScopeEndCancelsPendingWriters() = writeTest {
-        for (end in listOf("context", "scope", "close")) for (stage in listOf("preparing", "writing")) {
+        for (end in listOf("context", "scope", "close", "retire")) for (stage in listOf("preparing", "writing")) {
             val label = "$end/$stage"
             val f = Fixture(this)
             val hold = CompletableDeferred<Unit>()
@@ -791,6 +792,17 @@ class GraphV2RequestCoordinatorWriteTest {
             } else if (end == "close") {
                 f.coordinator.close()
                 assertTrue("$label: cancelled before close returns", ticket in f.store.cancelled)
+            } else if (end == "retire") {
+                f.fence = FENCE.copy(userAccessEpoch = "e-next")
+                assertEquals(
+                    label, GraphRuntimeRetirement.REMOVED,
+                    f.coordinator.retireScopes { it == GraphDataScope(FENCE.identity.uid, checkNotNull(FENCE.userAccessEpoch)) }
+                )
+                assertTrue("$label: cancelled before retireScopes returns", ticket in f.store.cancelled)
+                assertEquals(
+                    "$label: nothing of the scope is left to remove", GraphRuntimeRetirement.NOTHING_TO_REMOVE,
+                    f.coordinator.retireScopes { it == GraphDataScope(FENCE.identity.uid, checkNotNull(FENCE.userAccessEpoch)) }
+                )
             } else {
                 f.close()
             }

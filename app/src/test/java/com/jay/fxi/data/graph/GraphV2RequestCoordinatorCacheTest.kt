@@ -1048,4 +1048,58 @@ class GraphV2RequestCoordinatorCacheTest {
         assertEquals("the floor and the ladder after it", secs(0, 120, 126, 138, 162, 210), g.tabTimes())
         g.close()
     }
+
+    /**
+     * CB2a (S4 RT01-B2a): retiring a lagging scope while its seed read and its fetch are both out: once the fetch is
+     * answered nothing holds the scope, and the held read, released, installs nothing. The seed's own share is not isolated
+     * here - its context always equals the held one, so the snapshot and the request already make the scope a candidate,
+     * and the held read is refused by its ownership check and the moved fence as well (C02).
+     */
+    @Test fun CB2a_retiringALaggingScopeWithASeedOut() = cacheTest {
+        val f = Fixture(this)
+        val old = GraphDataScope("u1", "e1")
+        val next = GraphDataScope("u1", "e2")
+        f.put(components(serverTab(rate = 1300.0)))
+        f.store.hold[1] = CompletableDeferred()
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        assertEquals("premise: the seed read is out", 1, f.store.generalReads.size)
+        f.fence = FENCE.copy(userAccessEpoch = "e2")
+        val seen = mutableSetOf<GraphDataScope>()
+        assertEquals(GraphRuntimeRetirement.REMOVED, f.coordinator.retireScopes { seen += it; it == old })
+        assertEquals(setOf(old, next), seen)
+        f.sent.single().tab.complete(ok(onlineDto(1500.0))); runCurrent()
+        seen.clear()
+        assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.coordinator.retireScopes { seen += it; it == old })
+        assertEquals("nothing holds the old scope, the seed included if it is enumerated", setOf(next), seen)
+        f.store.release(1); runCurrent()
+        assertNull("the held read installs nothing (also refused by ownership and the moved fence)", f.state.entries[KEY])
+        assertTrue(f.failures.isEmpty())
+        f.close()
+    }
+
+    /**
+     * CB2a2 (S4 RT01-B2a): retiring a stale scope that only a released request still holds keeps the live scope's
+     * protected slot and state exactly as they were; the stale answer then installs nothing.
+     */
+    @Test fun CB2a2_retiringAStaleScopeKeepsTheLiveScopesSlot() = cacheTest {
+        val f = Fixture(this)
+        val old = GraphDataScope("u1", "e1")
+        val next = GraphDataScope("u1", "e2")
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        val stale = f.sent.single()
+        f.rebind("u1", 1L, "e2", 8L)
+        f.coordinator.onContextChanged(); runCurrent()
+        f.sent.last().tab.complete(ok(onlineKrxDto(1600.0))); runCurrent()
+        val shown = checkNotNull(f.exposed()) { "premise: the live scope exposes its slot" }
+        val before = f.state
+        val seen = mutableSetOf<GraphDataScope>()
+        assertEquals(GraphRuntimeRetirement.REMOVED, f.coordinator.retireScopes { seen += it; it == old })
+        assertEquals(setOf(old, next), seen)
+        assertEquals("the live scope's state is untouched", before, f.state)
+        assertEquals("and so is its protected entry", shown, f.exposed())
+        stale.tab.complete(ok(onlineKrxDto(1500.0))); runCurrent()
+        assertEquals("the stale answer installs nothing", shown, f.exposed())
+        assertTrue(f.failures.isEmpty())
+        f.close()
+    }
 }
