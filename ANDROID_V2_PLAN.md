@@ -31,11 +31,12 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 관찰했다. topic 줄 문구는 운영에서 자연 발생하지 않아 기기 미수집이다.
                                 S3 그래프 관측 인계는 GObs-1(`ffda7b9`, 후보)·2a(`4233c4a`, 권위·재개)·2b-1(`c30d615`,
                                 전달 중단)·2b-2(`b5e6501`, ACK·인증)로 연결했다(JVM 계약, dormant sink, 운영 배선 없음).
-                                S4 Graph V2(FX)는 A1(`0265bdf`)부터 RT03a(`543b897`)까지 구현·테스트·정리 commit 41개로
+                                S4 Graph V2(FX)는 A1(`0265bdf`)부터 U1d(`355af6c`)까지 구현·테스트·정리 commit 45개로
                                 요청·디스크·선택·화면·1일 live 봉 모델·관측 어댑터·live projection·발행·표면 가시성·
                                 기록기 보존·폐기·연속성 reducer와 owner·topic sink·요청 복구 인계·holder 검증 읽기·메모리 purge
-                                대상·graph REST 송신 guard를 쌓고 도달 불가 v1 graph 코드를 지웠다(JVM·에뮬레이터 계측 계약, 운영 배선
-                                없음). 남은 단위는 F2 runtime 나머지다(G의 §9.1 migration 포함, S4 '진행' 항목).
+                                대상·graph REST 송신 guard·실제 issuer 그래프 통합 계약(U1a~U1d)을 쌓고 도달 불가 v1 graph 코드를
+                                지웠다(JVM·에뮬레이터 계측 계약, 운영 배선 없음). 18번의 세 선행조건이 충족되어(동결 후 7번 대조 완료
+                                10-08) 남은 단위는 RT01부터의 F2 runtime 나머지다(G의 §9.1 migration 포함, S4 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -61,7 +62,7 @@ Android public rollout        : BLOCKED by SV-1 / SV-2 production 배포·검증
 iOS common server gate        : SV-1 / SV-2
 Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 전달 신뢰성 hardening(DEFERRED) · SV-4 cross-device 계정삭제 hardening
 작성                          : 2026-08-29
-최종 보정                     : 2026-10-07
+최종 보정                     : 2026-10-08
 ```
 
 > **`Plan approval`은 구현 착수 승인이 아니다.** 계획을 기준으로 채택했을 뿐이고, 각 슬라이스 착수에는 별도 GO가 필요하다.
@@ -1178,7 +1179,8 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   따른다(§7 S4 보존·폐기). last-known 복원 seed는 관측이 아니다. KRX 분기는 S6 전까지 소비 0. 소비자(기록기)와 어댑터는 S4
   소유이며 연결 추가(dormant)와 runtime 배선을 분리한다. 관측 연결 구현 전 L-4d 권위 토큰·거부 결속,
   L-4c ACK 적용 경계, L-4f bootstrap 발급 제어의 최종 구현을 대조한다. L-4e grant 전달·재개와 live 접근권한
-  철회 검증은 runtime 배선 전에 대조한다
+  철회 검증은 runtime 배선 전에 대조한다(대조 완료 10-08: `R4c/S4/freeze7_record.r1/record_final.r3.md`, 최종 HEAD
+  `355af6c`, 종결 조건은 §7 S4 F2 항목)
   - 진행(10-05): **GObs-1** `ffda7b9` — 네 경로 후보 인계(원 timestamp·`rate_changed_at`·DXY 공급 source·topic·경로),
     입력이 허용된 원 use의 `TopicUseAttribution`·WS 회차 귀속, 일반 시세 후보의 KRX 제외, sink 결과의 누적 유실
     상태(`graphLoss`), 기본 `DormantTopicGraphSink`. 계약 GOBS-01~19.
@@ -1444,8 +1446,27 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   · RT03a `543b897` graph REST 송신 guard(운영 `GraphV2Fetching` 구현이 호출자의 owner·guard를 그대로 넘기고, graph 두
   client 메서드가 guard를 transport에 전달해 첫 송신·replay·OkHttp 반복을 송신 전에 거절, coordinator는 필수
   protectedAdmission을 use 검사마다 읽고 보류 증거의 Retry-After를 원순서로 공유 하한에 반영. 운영 생성 없음).
+  · U1a `c57528c`·U1b `da833dc`·U1c `8218d02`·U1d `355af6c` 실제 issuer 그래프 통합 계약(18번 (1), 시험 전용,
+  PremiumAccessTopicSnapshotTest). 사용자 축 봉인·회전 복구·재승인·P4 보류·stale 해제·확정 손실·불확실, CAPABILITY 축
+  보류·불확실·봉인·회전 완료와 보류 해제의 KRX 복원 경로(디스크 쓰기 포트 없는 조립), fence 공개 상태의 옛 완료 적용 0,
+  실제 issuer 위 화면 holder의 render 0과 fresh lifetime 재개. 사용자 축 차단은 조정자·기록기 판정도 같은 snapshot으로
+  닫으므로 holder 자체 사용 판정은 재개에서만 판별된다.
+  · 동결 후 7번 대조(`R4c/S4/freeze7_record.r1/record_final.r3.md`, Claude·Codex AGREE_DESIGN, 최종 HEAD `355af6c`):
+  L-4e grant 전달·재승인·보류와 종료의 구분, 같은 fence 보류 왕복의 옛 lifetime 무효, 기록기·sink 귀속과 holder 읽기,
+  송신 guard·하한 인계, placeholder 아래 정리 인계를 대조했다. 종결 조건으로 넘긴 것:
+  RT01 — 운영 조립·DI와 세 보유처·holder가 같은 snapshot·fence 공급자·직렬 실행자를 쓰는지, `currentAccessFence`의
+  종료 의미(같은 UID 신원 변경의 보존·폐기는 종료와 새 grant가 합쳐져 전달되든 따로 전달되든 같은 결과로 운영 배선 전에
+  확정), 같은 fence의 철회·복원에 종료나 무효화가 따르는 전달 계약, 조정자와 게이트가 공유하는 하나의 실시간·스레드 안전·비차단
+  protectedAdmission 공급자(D23의 Resolving·Pending(noGrant)·DeletionPending 포함), 보류 해소용 제어 조회를 그래프 닫힘이 막지 않음, runtime 정리 4종과 CAPABILITY
+  은퇴 시 조정자 메모리 KRX 절반 정리, WS 거절 → issuer 결정 사이 창(issuer 공개가 그래프 무효화 경계이며 세션 권위
+  종료와 구분) 전후 시험, 기록기의 catalog 공급자는 현재 범위에서 조정자가 채택한 마지막 catalog, 쓰기 포트가 있는 조립에서
+  디스크 supplement seed의 KRX 복원, holder 운영 표시·focus 배선 /
+  RT03b·RT05 — 같은 범위 문맥 변경 뒤 남은 복구 요구를 다시 실을 요청의 계기·시점·담당과 문맥 변경마다의 catalog 재요청을
+  동결 후 12번 (3)·(4)와 맞추는 일(두 단위 사이 단일 담당은 구현 전 고정) / P3-i — 실제 purger 연결·정산(메모리·디스크
+  대상, CAPABILITY 메모리 KRX 절반 포함) / S6 — KRX 관측 소비.
   runtime 앞에 S1 잔여(봉인·재승인·정리 재개)와 동결 후 7번 대조를 게이트로 둔다(F1 설계 합의 r2) — P3-i 전 S1
-  잔여의 범위는 18번(실제 issuer 그래프 통합 계약·실제 purger 설계·7번 대조). T25는 공용 GraphChart 회귀만 C2b-2에서 확인했고 나머지는 F2에 남는다.
+  잔여의 범위는 18번(실제 issuer 그래프 통합 계약·실제 purger 설계·7번 대조)이며, 세 선행조건은 U1a~U1d·purger 설계
+  v3 final·7번 대조 기록으로 충족했다(10-08). T25는 공용 GraphChart 회귀만 C2b-2에서 확인했고 나머지는 F2에 남는다.
   실제 purger를 포함한 S4 최종 DoD 재검증은 P3-i 활성화 뒤에 하고, F2에서는 placeholder purger 아래 회귀 0만 본다.
 
 ### S5 — 테더 탭
