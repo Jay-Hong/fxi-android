@@ -63,6 +63,11 @@ import org.junit.Test
  *    back their cached units; the rest keep their order. It answers whether anything was removed, judged by count, not by
  *    units. It neither wakes nor closes anything, and a closed sink answers false. It is called on the sink's executor,
  *    outside any consumer call.
+ *
+ * r3 adds the S4 RT01-A3 row K08 (API agreed in R4c/S4 rt01a3_api_codex.r3): an opt-in deferred worker. Built with
+ * `startImmediately = false`, the sink accepts and keeps inputs as before but runs no worker until `start()`, which is
+ * idempotent and does nothing after close or once the worker has ended. The default still starts the worker on construction,
+ * so every other row here runs unchanged.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphRecorderTopicSinkTest {
@@ -151,10 +156,11 @@ class GraphRecorderTopicSinkTest {
         }
     }
 
-    private inner class Rig(test: TestScope) {
+    private inner class Rig(test: TestScope, startImmediately: Boolean = true) {
         val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(test.testScheduler)).also { scopes += it }
         val consumer = Consumer()
-        val sink = GraphRecorderTopicSink(scope, consumer)
+        val sink = if (startImmediately) GraphRecorderTopicSink(scope, consumer)
+        else GraphRecorderTopicSink(scope, consumer, startImmediately = false)
     }
 
     /** K01: 512 units, whole batches, no eviction, and a dequeued input's units free again before its call. */
@@ -374,6 +380,48 @@ class GraphRecorderTopicSinkTest {
             assertFalse(sink.purge(retired))
             runCurrent()
             assertEquals(listOf<Call>(Call.Close), consumer.calls)
+        }
+    }
+
+    /**
+     * K08 (S4 RT01-A3): a deferred sink keeps what it accepts and delivers nothing until start(), then hands it over in order;
+     * after a second start() each input is still delivered once (a duplicate worker would not be seen here: the queue hands
+     * each input out once). Closed before start, it closes the consumer once and delivers nothing. With its scope ended before
+     * start, it answers CLOSED. The default sink needs no start().
+     */
+    @Test fun K08_aDeferredWorkerRunsOnlyFromStart() = sinkTest {
+        Rig(this, startImmediately = false).run {
+            val o1 = obs(1)
+            val c2 = fact()
+            assertEquals(TopicGraphOffer.ENQUEUED, sink.tryOffer(o1))
+            assertEquals(TopicGraphOffer.ENQUEUED, sink.tryOffer(c2))
+            runCurrent()
+            assertTrue("nothing is delivered before start", consumer.calls.isEmpty())
+            sink.start(); runCurrent()
+            assertEquals(listOf(Call.Obs(o1), Call.Cont(c2)), consumer.calls)
+            sink.start(); runCurrent()
+            val o3 = obs(1)
+            assertEquals(TopicGraphOffer.ENQUEUED, sink.tryOffer(o3)); runCurrent()
+            assertEquals("each input once, in order", listOf(Call.Obs(o1), Call.Cont(c2), Call.Obs(o3)), consumer.calls)
+        }
+        Rig(this, startImmediately = false).run {
+            sink.tryOffer(obs(1))
+            sink.close()
+            sink.start(); runCurrent()
+            assertEquals("closed before start", listOf<Call>(Call.Close), consumer.calls)
+            assertEquals(TopicGraphOffer.CLOSED, sink.tryOffer(obs(1)))
+        }
+        Rig(this, startImmediately = false).run {
+            sink.tryOffer(obs(1))
+            scope.cancel(); runCurrent()
+            assertEquals("the scope ended before start", TopicGraphOffer.CLOSED, sink.tryOffer(obs(1)))
+            sink.start(); runCurrent()
+            assertTrue(consumer.calls.isEmpty())
+        }
+        Rig(this).run {
+            val o = obs(1)
+            sink.tryOffer(o); runCurrent()
+            assertEquals("the default starts at once", listOf<Call>(Call.Obs(o)), consumer.calls)
         }
     }
 }

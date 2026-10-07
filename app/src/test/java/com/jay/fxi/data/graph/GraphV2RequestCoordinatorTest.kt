@@ -40,6 +40,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
@@ -81,6 +82,13 @@ import org.junit.Test
  * is read live on each check. A send the transport withheld (`TopicUseWithheldException`) raises the shared floor from
  * each response it had already seen, in order, as an identity refusal does; with nothing seen there is no floor. The other
  * coordinator fixtures pass an always-open supplier; the production supplier, shared with the gate, is RT01's assembly.
+ *
+ * S4 RT01-A3 (API agreed in R4c/S4 rt01a3_api_codex.r3 from rt01a3_api_proposal.r3) adds rows A3c1·A3c2: an idempotent
+ * `close()`, called on the coordinator's serial executor, that works whether or not the loop was ever entered. It refuses later
+ * events, discards pending ones, and releases requests, writes, the seed and timer owners, publishing before it returns.
+ * The runtime assembly calls it before cancelling its own job, since a cancelled launch may never run its finally. These rows
+ * also fix that close() is not suspending and does not cancel the supplied scope, and that start() after close() returns
+ * normally. GraphV2RequestCoordinatorWriteTest Y04 adds that close() cancels a pending writer before it returns.
  */
 class GraphV2RequestCoordinatorTest {
 
@@ -1386,6 +1394,60 @@ class GraphV2RequestCoordinatorTest {
             f.coordinator.onActivated(USD_3M); runCurrent()
             step(1.seconds); f.coordinator.onActivated(JPY_3M); runCurrent()
             assertEquals("nothing seen, no floor", listOf(USD_3M, JPY_3M), f.tabs().map { it.key })
+            f.close()
+        }
+    }
+
+    /**
+     * A3c1 (S4 RT01-A3): close() on the serial executor ends a running coordinator at once - before it returns and with no
+     * dispatch, the request in flight is refused at the send guard and is gone from the published state - and a late answer
+     * applies nothing. A second close, and the loop's own finally running after it, change nothing more and report no
+     * failure; no later event is acted on; the supplied scope is not cancelled.
+     */
+    @Test fun A3c1_closeReleasesARunningCoordinatorAtOnce() = runTest {
+        val f = started()
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        f.catalogs().single().catalog.complete(ok(catalogDto(3600, periods = mapOf("3m" to listOf(SERIES))))); runCurrent()
+        val out = f.tabs(USD_3M).single()
+        assertTrue("premise: a request in flight, admitted", USD_3M in f.state.inFlight && out.useAdmitted())
+
+        f.coordinator.close()
+        assertFalse("refused at the send guard before close returns", out.useAdmitted())
+        assertTrue("published before close returns", f.state.inFlight.isEmpty())
+        f.coordinator.close()
+        out.tab.complete(ok(tabDto(USD_3M))); runCurrent()
+        assertFalse("a late answer applies nothing", f.state.entries.containsKey(USD_3M))
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        assertEquals("no later event is acted on - not even a new request for the released key", 1, f.tabs().size)
+        assertTrue("no failure is reported", f.failures.isEmpty())
+        assertTrue("close does not cancel the supplied scope", f.scope.isActive)
+        f.close()
+    }
+
+    /**
+     * A3c2 (S4 RT01-A3): close() ends the input whether or not the loop has run. An event enqueued before close is discarded
+     * - with the loop never started, and with it started but not yet dispatched - and an event offered after close is never
+     * taken, even by a loop that had been started before close. An event taken would publish the context it read, so the
+     * published data scope stays empty. start() after close is used here only to give a loop the chance to take an event.
+     */
+    @Test fun A3c2_closeEndsTheInputWhetherOrNotTheLoopRan() = runTest {
+        for ((label, steps) in listOf<Pair<String, Fixture.() -> Unit>>(
+            "enqueued, never started" to {
+                coordinator.onActivated(USD_3M); coordinator.close(); coordinator.start()
+            },
+            "started, enqueued before the first dispatch" to {
+                coordinator.start(); coordinator.onActivated(USD_3M); coordinator.close()
+            },
+            "started, offered after close" to {
+                coordinator.start(); coordinator.close(); coordinator.onActivated(USD_3M)
+            }
+        )) {
+            val f = Fixture(this)
+            f.steps(); runCurrent()
+            assertNull("$label: no event was handled - not even the context it would have read", f.state.dataScope)
+            assertTrue("$label: nothing is sent", f.sent.isEmpty())
+            assertTrue("$label: nothing is in flight", f.state.inFlight.isEmpty())
+            assertTrue("$label: no failure is reported", f.failures.isEmpty())
             f.close()
         }
     }

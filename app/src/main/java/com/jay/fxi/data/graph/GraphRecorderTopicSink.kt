@@ -5,6 +5,7 @@ import com.jay.fxi.data.remote.TopicGraphOffer
 import com.jay.fxi.data.remote.TopicGraphSink
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
@@ -26,7 +27,7 @@ internal interface GraphTopicInputConsumer {
  * Throwables outside Exception are not caught. Queue acceptance authorizes no deferred adoption.
  *
  * The supplied [scope] must use a serial executor that always dispatches the worker; Unconfined and
- * immediate execution are forbidden. The caller must run [close] and all other consumer use on that
+ * immediate execution are forbidden. The caller must run [start], [close] and all other consumer use on that
  * same executor. Consumer methods are synchronous and non-suspending. One worker delivers the same
  * input objects in order, one at a time, releasing each input's units before calling the consumer.
  * After each input, and even with an empty queue, it swaps the loss ledger and calls [consumer]'s
@@ -48,10 +49,16 @@ internal interface GraphTopicInputConsumer {
  * scope and the order of survivors. It refunds cached units and answers whether any item was
  * removed, judged by count rather than units, so a zero-unit input counts. Call it on the serial executor outside consumer calls: a dequeued
  * input or a handed-over ledger is no longer held here. It calls no consumer and does not close.
+ *
+ * The worker starts on construction by default. With [startImmediately] false, inputs and losses
+ * are kept without delivery until [start]. Starting is idempotent and cannot restart a closed or
+ * completed worker. The worker belongs to [scope] even before start, so scope completion closes
+ * acceptance and drops pending work without calling the consumer off its executor.
  */
 internal class GraphRecorderTopicSink(
     scope: CoroutineScope,
-    private val consumer: GraphTopicInputConsumer
+    private val consumer: GraphTopicInputConsumer,
+    startImmediately: Boolean = true
 ) : TopicGraphSink {
     private class QueuedInput(val input: TopicGraphInput, val units: Int)
 
@@ -62,9 +69,18 @@ internal class GraphRecorderTopicSink(
     private var closed = false
     private var consumerClosed = false
     private val wake = Channel<Unit>(Channel.CONFLATED)
-    private val worker: Job = scope.launch { drain() }.also { job ->
+    private val worker: Job = scope.launch(start = CoroutineStart.LAZY) { drain() }.also { job ->
         // A finally in the worker body cannot cover cancellation before the first dispatch.
         job.invokeOnCompletion { synchronized(lock) { dropLocked() } }
+    }
+
+    init {
+        if (startImmediately) start()
+    }
+
+    /** Starts the sole worker, once, on the supplied serial executor; after close this is a no-op. */
+    fun start() {
+        worker.start()
     }
 
     override fun tryOffer(input: TopicGraphInput): TopicGraphOffer {

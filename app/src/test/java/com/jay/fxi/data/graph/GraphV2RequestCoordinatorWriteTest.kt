@@ -771,11 +771,12 @@ class GraphV2RequestCoordinatorWriteTest {
     }
 
     /**
-     * A real context change (the lifetime moves to invalidations 4) or the scope's end cancels a writer that is preparing or
-     * writing, before any late result. Its job ends: nothing is delegated or written afterwards.
+     * A real context change (the lifetime moves to invalidations 4), the scope's end or close() cancels a writer that is
+     * preparing or writing, before any late result. Its job ends: nothing is delegated or written afterwards. close() cancels
+     * it before it returns (S4 RT01-A3).
      */
     @Test fun Y04_aContextChangeOrScopeEndCancelsPendingWriters() = writeTest {
-        for (end in listOf("context", "scope")) for (stage in listOf("preparing", "writing")) {
+        for (end in listOf("context", "scope", "close")) for (stage in listOf("preparing", "writing")) {
             val label = "$end/$stage"
             val f = Fixture(this)
             val hold = CompletableDeferred<Unit>()
@@ -787,6 +788,9 @@ class GraphV2RequestCoordinatorWriteTest {
                 // A USER hold came and went: the context's lifetime is now invalidations 4.
                 f.snapshot = snap(invalidations = 4L)
                 f.coordinator.onContextChanged()
+            } else if (end == "close") {
+                f.coordinator.close()
+                assertTrue("$label: cancelled before close returns", ticket in f.store.cancelled)
             } else {
                 f.close()
             }

@@ -5,6 +5,7 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.graph.DefaultGraphV2AtomicFileIo
 import com.jay.fxi.data.graph.FileGraphV2DiskStore
+import com.jay.fxi.data.graph.GraphAccessFenceBridge
 import com.jay.fxi.data.graph.GraphDataScope
 import com.jay.fxi.data.graph.GraphEntry
 import com.jay.fxi.data.graph.GraphKey
@@ -12,26 +13,37 @@ import com.jay.fxi.data.graph.GraphObservationSeriesKey
 import com.jay.fxi.data.graph.GraphOwnerSource
 import com.jay.fxi.data.graph.GraphProtectedAdmission
 import com.jay.fxi.data.graph.GraphRecorder
+import com.jay.fxi.data.graph.GraphRuntimeAssembly
 import com.jay.fxi.data.graph.GraphSeriesSelectionSession
 import com.jay.fxi.data.graph.GraphV2AccessCapture
 import com.jay.fxi.data.graph.GraphV2AccessGate
 import com.jay.fxi.data.graph.GraphV2CachePorts
 import com.jay.fxi.data.graph.GraphV2DiskComponent
+import com.jay.fxi.data.graph.GraphV2DiskRead
+import com.jay.fxi.data.graph.GraphV2DiskStore
 import com.jay.fxi.data.graph.GraphV2Fetching
+import com.jay.fxi.data.graph.GraphV2GeneralEnvelope
+import com.jay.fxi.data.graph.GraphV2GeneralKey
+import com.jay.fxi.data.graph.GraphV2IoAdmission
 import com.jay.fxi.data.graph.GraphV2RequestCoordinator
 import com.jay.fxi.data.graph.JsonGraphV2EnvelopeCodec
+import com.jay.fxi.data.graph.graphRecorderCatalog
 import com.jay.fxi.data.local.GraphSelectionAudience
 import com.jay.fxi.data.local.GraphSelectionKey
 import com.jay.fxi.data.local.GraphSelectionReadResult
 import com.jay.fxi.data.local.GraphSelectionRecord
 import com.jay.fxi.data.local.GraphSelectionStore
 import com.jay.fxi.data.local.GraphSelectionWriteResult
+import com.jay.fxi.data.remote.AuthenticatedFailureKind
+import com.jay.fxi.data.remote.AuthenticatedHttpFailure
 import com.jay.fxi.data.remote.AuthenticatedHttpResponse
 import com.jay.fxi.data.remote.OwnedTopicFocus
 import com.jay.fxi.data.remote.TopicDisplayOwner
 import com.jay.fxi.data.remote.TopicDisplayState
+import com.jay.fxi.data.remote.TopicGrantOrigin
 import com.jay.fxi.data.remote.TopicGraphCandidate
 import com.jay.fxi.data.remote.TopicGraphInput
+import com.jay.fxi.data.remote.TopicGraphOffer
 import com.jay.fxi.data.remote.TopicGraphPath
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.remote.TopicUseAttribution
@@ -54,6 +66,10 @@ import com.jay.fxi.ui.premium.graph.GraphV2Content
 import com.jay.fxi.ui.premium.graph.GraphV2ScreenState
 import com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder
 import java.io.IOException
+import kotlin.coroutines.ContinuationInterceptor
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.hours
@@ -62,24 +78,37 @@ import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Delay
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.InternalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.Runnable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import kotlinx.datetime.Instant
 import okhttp3.Headers
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Rule
@@ -123,6 +152,16 @@ import org.junit.rules.TemporaryFolder
  * anything; after a stale release it draws again under a fresh lifetime and the publication from before the hold is not
  * revived. The closed rows are also closed by the coordinator's protected entry, so the holder's own use check is told
  * apart only on the resume. The production display, focus and DI wiring are RT01's.
+ *
+ * S4 RT01-A3 (API agreed in R4c/S4 rt01a3_api_codex.r3 from rt01a3_api_proposal.r3) adds graphA01a-graphA01e, graphA02,
+ * graphA03, graphA09a and graphA09b on the unwired runtime assembly over this issuer. That assembly owns one fence bridge,
+ * gate, recorder, coordinator and deferred sink on one injected main and under its own job beneath a parent. The rows
+ * cover its life - nothing runs before start(); close() on main at every stage; the parent's cancellation; a failed
+ * construction - and the suppliers its parts read. They check that every part runs on that main, that the bridge
+ * publishes only what is handed over and the gate takes no grant the issuer issued but did not deliver, and that the
+ * recorder's catalog is the coordinator's in the current data scope only. The rows fix the names
+ * `GraphRuntimeAssembly`, `GraphAccessFenceBridge` (with `current` and `close()`) and `graphRecorderCatalog`. Production
+ * suppliers, the deliverer's fan-out and the TopicRuntime wiring are the cutover's.
  *
  * A send refused by the guard reaching the wire is TopicUseHttpBoundaryTest GW1-GW4's; a refused admission reaching the
  * disk is GraphV2DiskStoreTest's; a KRX-only refusal keeping a seed off the KRX file is
@@ -2483,6 +2522,546 @@ class PremiumAccessTopicSnapshotTest {
         settle()
         refreshing.join()
         assertFalse("still closed after the write", hr.chartShown())
+    }
+
+    // --- S4 RT01-A3: the unwired runtime assembly ----------------------------------------------------------------------
+
+    /**
+     * Runs every dispatched block through [queue], the test scheduler, and marks it while it runs, so a supplier can tell
+     * whether it was read on this dispatcher. It always dispatches, as Main without immediate does. Delays are the scheduler's.
+     */
+    @OptIn(InternalCoroutinesApi::class)
+    private class MarkingDispatcher(private val queue: TestDispatcher) : CoroutineDispatcher(), Delay by queue {
+        var marked = false
+            private set
+
+        override fun isDispatchNeeded(context: CoroutineContext): Boolean = true
+        override fun dispatch(context: CoroutineContext, block: Runnable) = queue.dispatch(context, Runnable {
+            val outer = marked
+            marked = true
+            try {
+                block.run()
+            } finally {
+                marked = outer
+            }
+        })
+    }
+
+    /**
+     * The RT01-A3 assembly on the issuer of [h] and nothing else: its own [parent] under the process job, a marking main
+     * dispatcher, a fake transport that records each send, and the issuer's snapshot behind a supplier that notes whether
+     * each read ran on that dispatcher. Every read made while the assembly is being built is dropped; only reads after
+     * construction are kept. The protected admission, the owner source's identity and the jitter are the rig's to change.
+     * With [disk], the cache ports the assembly asks for wrap a real file store and count its reads; without, there are none,
+     * so no disk work reads the snapshot off main. A tab send notes the coordinator's published in-flight keys at the moment
+     * a cancellation reaches it, before any dispatched cleanup.
+     */
+    private inner class AssemblyRig(
+        test: TestScope,
+        val h: Harness,
+        private val disk: Boolean = true,
+        val parent: Job = Job(processJob),
+        jitter: (String) -> Duration = { Duration.ZERO },
+        cachePorts: ((GraphV2AccessGate) -> GraphV2CachePorts?)? = null
+    ) {
+        private val scheduler = test.testScheduler
+        private val queue = StandardTestDispatcher(scheduler)
+        val main = MarkingDispatcher(queue)
+        var live = AuthIdentityFence(OWNER, 1L)
+        /** When set, the owner source reports this identity instead of [live]. */
+        var ownerOverride: AuthIdentityFence? = null
+        var admitted = true
+        val sent = mutableListOf<Sent>()
+        /** Per send: whether it ran on [main], with [main] as its dispatcher. */
+        val sendsOnMain = mutableListOf<Boolean>()
+        /** Per read of the issuer snapshot through the assembly's supplier: whether it ran on [main]. */
+        val snapshotReads = mutableListOf<Boolean>()
+        /** Per tab send a cancellation reached: the coordinator's published in-flight keys at that moment. */
+        val inFlightAtCancel = mutableListOf<Set<GraphKey>>()
+        val failures = mutableListOf<Throwable>()
+        var portsGate: GraphV2AccessGate? = null
+        var diskReads = 0
+        val uses = SnapshotTopicUseAuthority { h.coordinator.accessSnapshot }
+        val clock = AppClock { GRAPH_NOON + scheduler.currentTime.milliseconds }
+
+        private suspend fun record(kind: String, key: GraphKey?, useAdmitted: () -> Boolean): Sent {
+            sendsOnMain += main.marked && currentCoroutineContext()[ContinuationInterceptor] === main
+            return Sent(kind, key, useAdmitted).also { sent += it }
+        }
+
+        private fun ports(gate: GraphV2AccessGate): GraphV2CachePorts? {
+            portsGate = gate
+            if (!disk) return null
+            val real = FileGraphV2DiskStore(folder.newFolder(), JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), queue)
+            val counted = object : GraphV2DiskStore by real {
+                override suspend fun readGeneral(
+                    key: GraphV2GeneralKey,
+                    catalog: GraphCatalog?,
+                    admission: GraphV2IoAdmission
+                ): GraphV2DiskRead<GraphV2GeneralEnvelope> {
+                    diskReads++
+                    return real.readGeneral(key, catalog, admission)
+                }
+            }
+            return GraphV2CachePorts(counted, gate, onSeedDiagnostic = {})
+        }
+
+        val a: GraphRuntimeAssembly = GraphRuntimeAssembly(
+            accessSnapshot = { snapshotReads += main.marked; h.coordinator.accessSnapshot },
+            accessRevisions = h.coordinator.accessRevisions,
+            liveIdentity = { live },
+            uses = uses,
+            protectedAdmission = { admitted },
+            fetcher = object : GraphV2Fetching {
+                override suspend fun catalog(owner: AuthSnapshot, useAdmitted: () -> Boolean) =
+                    record("catalog", null, useAdmitted).catalog.await()
+
+                override suspend fun tab(
+                    owner: AuthSnapshot,
+                    key: GraphKey,
+                    useAdmitted: () -> Boolean
+                ): AuthenticatedHttpResponse<GraphV2TabResponse> {
+                    val s = record("tab", key, useAdmitted)
+                    return suspendCancellableCoroutine { continuation ->
+                        // Runs inside the cancel that reaches this send, before any dispatched cleanup.
+                        continuation.invokeOnCancellation { inFlightAtCancel += a.coordinator.state.value.inFlight }
+                        s.tab.invokeOnCompletion { cause ->
+                            if (cause == null) continuation.resume(s.tab.getCompleted())
+                            else continuation.resumeWithException(cause)
+                        }
+                    }
+                }
+            },
+            owners = object : GraphOwnerSource {
+                override fun currentIdentity(): AuthIdentityFence = ownerOverride ?: live
+                override suspend fun capture(expected: AuthIdentityFence) =
+                    AuthSnapshot(expected.uid, expected.authGeneration, "token")
+            },
+            cachePorts = cachePorts ?: ::ports,
+            main = main,
+            parent = parent,
+            clock = clock,
+            rateLimitJitter = jitter,
+            onEventFailure = { failures += it }
+        ).also { snapshotReads.clear() }
+
+        fun now(): Instant = clock.now()
+
+        /** Hands the assembly's bridge the grant the issuer issues now, as the deliverer would; never one built here. */
+        suspend fun deliverIssued(): TopicSessionFence {
+            val issued = checkNotNull(h.coordinator.topicGrantResult().fence) { "no grant was issued" }
+            a.fences.setAccess(true, issued, TopicGrantOrigin.NewContext)
+            return issued
+        }
+
+        /** A usd quote from kb owned by [owner] under [lifetime]. */
+        fun quote(rate: Double, owner: TopicSessionFence, lifetime: TopicUseLifetime) = TopicGraphInput.Observations(
+            1L, "fx:usd-krw", TopicGraphPath.WS, TopicUseAttribution(Any(), owner, 1L, lifetime), 1L,
+            listOf(TopicGraphCandidate.Quote("kb", "usd-krw", rate, now() - 1.seconds, null))
+        )
+
+        fun kb(fence: TopicSessionFence) =
+            GraphObservationSeriesKey(GraphDataScope(fence.identity.uid, checkNotNull(fence.userAccessEpoch)), KB)
+
+        fun adopted(key: GraphObservationSeriesKey, rate: Double): Boolean =
+            a.recorder.state.value.series[key]?.data?.app?.observations?.any { it.rate == rate } == true
+
+        fun held(): Int = a.recorder.state.value.pending.inputs.size
+    }
+
+    /** The issuer grants a new generation of the same user, recording a user end; returns the grant it now issues. */
+    private suspend fun TestScope.renewGeneration(h: Harness): TopicSessionFence {
+        h.coordinator.onIdentityChanged(AuthIdentityFence(OWNER, 2L))
+        h.source.identity = EntitlementsIdentity(OWNER, 2L)
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        settle()
+        assertNotNull("premise: a user end", h.snapshot.lastUserEnd)
+        return checkNotNull(h.coordinator.topicGrantResult().fence) { "premise: a new grant" }
+    }
+
+    /** A 429 with no Retry-After, as the authenticated transport hands it over. */
+    private fun <T> rateLimited(): AuthenticatedHttpResponse<T> {
+        val headers = Headers.headersOf()
+        return AuthenticatedHttpResponse(
+            429, headers, null,
+            AuthenticatedHttpFailure(429, headers, byteArrayOf(), null, null, AuthenticatedFailureKind.OTHER_HTTP),
+            byteArrayOf(1)
+        )
+    }
+
+    /**
+     * graphA01a (S4 RT01-A3): an assembly runs nothing until start() - no send, no coordinator context, no recorder read
+     * from a worker or a collector, no disk read - while its sink and bridge already take what they are handed. start() runs
+     * the coordinator, the recorder's collector and the sink's worker: the kept input reaches the recorder, and the cache
+     * ports are built from the assembly's own gate. A second start() changes nothing.
+     */
+    @Test
+    fun graphA01a_theAssemblyRunsNothingUntilStart() = snapshotTest {
+        val r = AssemblyRig(this, granted())
+        val issued = r.deliverIssued()
+        val lifetime = checkNotNull(r.uses.acquire(issued))
+        assertEquals(TopicGraphOffer.ENQUEUED, r.a.sink.tryOffer(r.quote(1390.0, issued, lifetime)))
+        r.a.coordinator.onActivated(KEY_3M)
+        runCurrent()
+        assertTrue("no send before start", r.sent.isEmpty())
+        assertNull("the coordinator has not run", r.a.coordinator.state.value.dataScope)
+        assertTrue("nothing read the snapshot: no worker, no collector", r.snapshotReads.isEmpty())
+        assertEquals("no disk read", 0, r.diskReads)
+        assertEquals("nothing reached the recorder", 0, r.held())
+
+        r.a.start(); runCurrent()
+        assertEquals("the coordinator runs: the catalog and the tab are asked for", setOf("catalog", "tab"), r.sent.map { it.kind }.toSet())
+        val sends = r.sent.size
+        assertEquals(GraphDataScope(OWNER, checkNotNull(issued.userAccessEpoch)), r.a.coordinator.state.value.dataScope)
+        assertEquals("the input kept before start reaches the recorder", 1, r.held())
+        assertSame("the cache ports are built from the assembly's own gate", r.a.gate, r.portsGate)
+        assertTrue("and are the coordinator's", r.diskReads > 0)
+
+        r.a.start(); runCurrent()
+        assertEquals("a second start sends nothing more", sends, r.sent.size)
+        assertEquals(1, r.held())
+        assertTrue(r.failures.isEmpty())
+    }
+
+    /**
+     * graphA01b (S4 RT01-A3): close() on main ends the assembly the same way before start, after start but before the first
+     * dispatch (start and close in one main frame), and with a request out and an input held by the recorder. When it
+     * returns - also a second close called while the first is still waiting - the assembly's job, which was under the parent,
+     * is gone while the parent and its other children live on; the request out is refused and nothing is in flight; and the
+     * coordinator had published its release before the cancellation reached the send. Neither close nor anything after it
+     * reads the snapshot. After it, start() runs nothing, the sink refuses input, a late answer adopts no catalog, the
+     * recorder holds nothing and the bridge publishes no handed-over fence.
+     */
+    @Test
+    fun graphA01b_closeEndsTheAssemblyAtEveryStage() = snapshotTest {
+        for (stage in listOf("before start", "started, before the first dispatch", "running, with a request out")) {
+            val r = AssemblyRig(this, granted())
+            val sibling = Job(r.parent)
+            var out: Sent? = null
+            lateinit var issued: TopicSessionFence
+            lateinit var lifetime: TopicUseLifetime
+            if (stage == "running, with a request out") {
+                r.a.start()
+                issued = r.deliverIssued(); runCurrent()
+                lifetime = checkNotNull(r.uses.acquire(issued))
+                r.a.coordinator.onActivated(KEY_3M); runCurrent()
+                out = r.sent.single { it.kind == "catalog" }
+                assertTrue("$stage: premise, the send is admitted", out.guard())
+                assertEquals(TopicGraphOffer.ENQUEUED, r.a.sink.tryOffer(r.quote(1390.0, issued, lifetime))); runCurrent()
+                assertEquals("$stage: premise, the recorder holds the input", 1, r.held())
+            }
+            var reads = 0
+            var sends = 0
+            var atFirstReturn: List<Job>? = null
+            var atSecondReturn: List<Job>? = null
+            withContext(r.main) {
+                if (out == null) {
+                    if (stage == "started, before the first dispatch") r.a.start()
+                    issued = r.deliverIssued()
+                    lifetime = checkNotNull(r.uses.acquire(issued))
+                    r.a.coordinator.onActivated(KEY_3M)
+                    assertEquals(TopicGraphOffer.ENQUEUED, r.a.sink.tryOffer(r.quote(1390.0, issued, lifetime)))
+                    assertTrue("$stage: premise, nothing has run yet", r.snapshotReads.isEmpty() && r.sent.isEmpty())
+                }
+                assertEquals("$stage: premise, the assembly's job is under the parent", 2, r.parent.children.count())
+                reads = r.snapshotReads.size
+                sends = r.sent.size
+                val first = launch(start = CoroutineStart.UNDISPATCHED) {
+                    r.a.close()
+                    atFirstReturn = r.parent.children.toList()
+                }
+                r.a.close()
+                atSecondReturn = r.parent.children.toList()
+                first.join()
+            }
+            assertEquals("$stage: the assembly's job is gone when the first close returns", listOf(sibling), atFirstReturn)
+            assertEquals("$stage: and when a second close returns", listOf(sibling), atSecondReturn)
+            assertTrue("$stage: the parent and its other child live on", r.parent.isActive && sibling.isActive)
+            out?.let { assertFalse("$stage: the request out is refused", it.guard()) }
+            assertTrue("$stage: nothing in flight", r.a.coordinator.state.value.inFlight.isEmpty())
+            if (out != null) {
+                assertEquals(
+                    "$stage: the coordinator was released before the cancellation reached its send",
+                    listOf(emptySet<GraphKey>()), r.inFlightAtCancel
+                )
+            }
+
+            r.a.start()
+            out?.catalog?.complete(ok(graphCatalog()))
+            r.a.coordinator.onActivated(KEY_1D)
+            val later = issued.copy(userAccessEpoch = "handed over after close")
+            r.a.fences.setAccess(true, later, TopicGrantOrigin.NewContext)
+            assertEquals("$stage: no input is taken", TopicGraphOffer.CLOSED, r.a.sink.tryOffer(r.quote(1391.0, issued, lifetime)))
+            runCurrent()
+            assertEquals("$stage: nothing more is sent", sends, r.sent.size)
+            assertEquals("$stage: neither close nor anything after it reads the snapshot", reads, r.snapshotReads.size)
+            assertNull("$stage: no catalog is adopted", r.a.coordinator.state.value.catalog)
+            assertEquals("$stage: the recorder holds nothing", 0, r.held())
+            assertNotSame("$stage: the bridge publishes nothing after close", later, r.a.fences.current())
+            assertTrue("$stage: no failure", r.failures.isEmpty())
+            sibling.cancel()
+        }
+    }
+
+    /** graphA01c (S4 RT01-A3): the parent's cancellation reaches the assembly - the request out is refused, the sink closed. */
+    @Test
+    fun graphA01c_theParentsCancellationEndsTheAssembly() = snapshotTest {
+        val r = AssemblyRig(this, granted())
+        r.a.start()
+        val issued = r.deliverIssued(); runCurrent()
+        val lifetime = checkNotNull(r.uses.acquire(issued))
+        r.a.coordinator.onActivated(KEY_3M); runCurrent()
+        val out = r.sent.single { it.kind == "catalog" }
+        assertTrue("premise: the send is admitted", out.guard())
+        r.parent.cancel(); runCurrent()
+        assertFalse("the request out is refused", out.guard())
+        assertEquals("the sink is closed", TopicGraphOffer.CLOSED, r.a.sink.tryOffer(r.quote(1390.0, issued, lifetime)))
+        withContext(r.main) { r.a.close() }
+        assertTrue(r.failures.isEmpty())
+    }
+
+    /**
+     * graphA01d (S4 RT01-A3): a construction that fails rethrows its failure and leaves nothing of the assembly under the
+     * parent, checked at once: nothing of it had started.
+     */
+    @Test
+    fun graphA01d_aFailedConstructionLeavesNothingRunning() = snapshotTest {
+        val h = granted()
+        val parent = Job(processJob)
+        val boom = IllegalStateException("cache ports")
+        val thrown = assertThrows(IllegalStateException::class.java) {
+            AssemblyRig(this, h, parent = parent, cachePorts = { throw boom })
+        }
+        assertSame(boom, thrown)
+        assertTrue("nothing of the assembly is left under the parent", parent.children.none())
+        assertTrue("the parent lives on", parent.isActive)
+    }
+
+    /**
+     * graphA01e (S4 RT01-A3): the parts read what the assembly is given. The send guard and the gate read the injected
+     * protected admission; the gate reads the injected live identity, not the owner source; a bridge call tells the
+     * coordinator of a context change, not a refresh, so a revision with an unchanged context asks for nothing; and the
+     * coordinator uses the injected jitter and reports an event failure to the injected sink.
+     */
+    @Test
+    fun graphA01e_thePartsReadWhatTheAssemblyIsGiven() = snapshotTest {
+        run {
+            val r = AssemblyRig(this, granted(), disk = false)
+            r.a.start()
+            val issued = r.deliverIssued(); runCurrent()
+            val lifetime = checkNotNull(r.uses.acquire(issued))
+            r.a.coordinator.onActivated(KEY_3M); runCurrent()
+            val out = r.sent.single { it.kind == "catalog" }
+            assertTrue("premise: the send is admitted", out.guard())
+            assertNotNull("premise: the gate binds", r.a.gate.bind(issued, lifetime))
+            r.admitted = false
+            assertFalse("the send guard reads the injected admission", out.guard())
+            assertNull("the gate reads the injected admission", r.a.gate.bind(issued, lifetime))
+            r.admitted = true
+            r.ownerOverride = r.live
+            r.live = AuthIdentityFence(OWNER, 2L)
+            assertNull("the gate reads the injected live identity, not the owner source", r.a.gate.bind(issued, lifetime))
+            r.live = issued.identity
+            r.ownerOverride = null
+
+            out.catalog.completeExceptionally(IOException("catalog down")); runCurrent()
+            val asked = r.sent.count { it.kind == "catalog" }
+            r.a.fences.accessRevised(); runCurrent()
+            assertEquals("a revision with an unchanged context asks for nothing", asked, r.sent.count { it.kind == "catalog" })
+            assertTrue(r.failures.isEmpty())
+            withContext(r.main) { r.a.close() }
+        }
+        run {
+            val boom = IllegalStateException("jitter")
+            val r = AssemblyRig(this, granted(), disk = false, jitter = { throw boom })
+            r.a.start()
+            r.deliverIssued(); runCurrent()
+            r.a.coordinator.onActivated(KEY_3M); runCurrent()
+            r.sent.single { it.kind == "catalog" }.catalog.complete(rateLimited()); runCurrent()
+            assertEquals("the injected jitter is used and its failure reaches the injected sink", listOf<Throwable>(boom), r.failures)
+            withContext(r.main) { r.a.close() }
+        }
+    }
+
+    /**
+     * graphA02 (S4 RT01-A3): every part runs on the injected main - the recorder's collector, also for an issuer revision
+     * alone, the coordinator's loop and its sends, and the sink's worker calling the recorder - each seen through the
+     * snapshot reads it makes, or the send it makes, while the dispatcher marks it. No cache ports here, so no disk work
+     * reads the snapshot elsewhere.
+     */
+    @Test
+    fun graphA02_everyPartRunsOnTheInjectedMain() = snapshotTest {
+        val r = AssemblyRig(this, granted(), disk = false)
+        r.a.start(); runCurrent()
+        assertTrue("the collector, on main: ${r.snapshotReads}", r.snapshotReads.isNotEmpty() && r.snapshotReads.all { it })
+        r.snapshotReads.clear()
+        val issued = r.deliverIssued(); runCurrent()
+        assertTrue("the loop, on main: ${r.snapshotReads}", r.snapshotReads.isNotEmpty() && r.snapshotReads.all { it })
+        r.snapshotReads.clear()
+        r.a.coordinator.onActivated(KEY_3M); runCurrent()
+        assertTrue("its sends, on main and under main: ${r.sendsOnMain}", r.sendsOnMain.isNotEmpty() && r.sendsOnMain.all { it })
+        assertTrue("the loop, on main: ${r.snapshotReads}", r.snapshotReads.isNotEmpty() && r.snapshotReads.all { it })
+        r.snapshotReads.clear()
+        val lifetime = checkNotNull(r.uses.acquire(issued))
+        assertEquals(TopicGraphOffer.ENQUEUED, r.a.sink.tryOffer(r.quote(1390.0, issued, lifetime))); runCurrent()
+        assertEquals("premise: the worker handed it to the recorder", 1, r.held())
+        assertTrue("the worker, on main: ${r.snapshotReads}", r.snapshotReads.isNotEmpty() && r.snapshotReads.all { it })
+
+        r.snapshotReads.clear()
+        val revision = r.h.coordinator.accessRevisions.value
+        r.h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        r.h.source.afterFetch = { r.h.store.loadFailures = 2 }
+        r.h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM); runCurrent()
+        assertNotEquals("premise: the issuer published a revision", revision, r.h.coordinator.accessRevisions.value)
+        assertTrue("a revision alone reaches the collector, on main: ${r.snapshotReads}", r.snapshotReads.isNotEmpty() && r.snapshotReads.all { it })
+    }
+
+    /**
+     * graphA03 (S4 RT01-A3): the fence bridge publishes exactly what it is handed and never a fence of its own. On its own,
+     * over the real issuer's grants: the delivered grant itself; an end delivered withdraws it; a grant handed over as a
+     * re-approval is published as handed over, whether the bridge was empty or held another; the host is told once per call,
+     * after the publication; a hold revision keeps the delivered fence; the same grant handed again tells the host again; and
+     * a closed bridge tells the host nothing more. In the assembly, while the issuer has issued a grant that has not been
+     * delivered, the gate takes no use under it; once it is delivered, the same use binds.
+     */
+    @Test
+    fun graphA03_theBridgePublishesOnlyWhatIsDelivered() = snapshotTest {
+        run {
+            val h = granted()
+            var told = 0
+            val seen = mutableListOf<TopicSessionFence?>()
+            lateinit var bridge: GraphAccessFenceBridge
+            bridge = GraphAccessFenceBridge { told++; seen += bridge.current() }
+            val first = checkNotNull(h.coordinator.topicGrantResult().fence)
+            bridge.setAccess(true, first, TopicGrantOrigin.NewContext)
+            assertSame("the delivered grant itself", first, bridge.current())
+            val renewed = renewGeneration(h)
+            assertNotEquals("premise: a new grant", first, renewed)
+            bridge.setAccess(false, first, TopicGrantOrigin.NewContext)
+            assertNull("the end delivered withdraws it", bridge.current())
+            bridge.setAccess(true, renewed, TopicGrantOrigin.Reapproval(first.grant))
+            assertSame("a re-approval into an empty bridge is published as handed over", renewed, bridge.current())
+            bridge.setAccess(true, first, TopicGrantOrigin.Reapproval(renewed.grant))
+            assertSame("a re-approval over a held grant is published as handed over, not kept", first, bridge.current())
+            assertEquals("each call tells the host once", 4, told)
+            assertEquals("the host is told after the publication", listOf(first, null, renewed, first), seen)
+        }
+        run {
+            val h = granted()
+            var told = 0
+            val bridge = GraphAccessFenceBridge { told++ }
+            val issued = checkNotNull(h.coordinator.topicGrantResult().fence)
+            bridge.setAccess(true, issued, TopicGrantOrigin.NewContext)
+            h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+            h.source.afterFetch = { h.store.loadFailures = 2 }
+            h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+            runCurrent()
+            assertTrue("premise: held", TopicAccessBlock.LOSS_CANDIDATE in h.facts.userBlocks)
+            bridge.accessRevised()
+            assertSame("a hold revision keeps the delivered fence", issued, bridge.current())
+            assertEquals("each call tells the host once", 2, told)
+            bridge.setAccess(true, issued, TopicGrantOrigin.NewContext)
+            assertEquals("the same grant handed again tells the host again", 3, told)
+        }
+        run {
+            val h = granted()
+            var told = 0
+            val bridge = GraphAccessFenceBridge { told++ }
+            val issued = checkNotNull(h.coordinator.topicGrantResult().fence)
+            bridge.setAccess(true, issued, TopicGrantOrigin.NewContext)
+            bridge.close()
+            val later = issued.copy(userAccessEpoch = "handed over after close")
+            bridge.setAccess(true, later, TopicGrantOrigin.NewContext)
+            assertNotSame("a closed bridge publishes nothing handed over", later, bridge.current())
+            bridge.setAccess(false, issued, TopicGrantOrigin.NewContext)
+            bridge.accessRevised()
+            assertEquals("a closed bridge tells the host nothing", 1, told)
+        }
+        run {
+            val r = AssemblyRig(this, granted(), disk = false)
+            val first = r.deliverIssued()
+            val renewed = renewGeneration(r.h)
+            assertNotEquals("premise: a new grant", first, renewed)
+            r.live = renewed.identity
+            val lifetime = checkNotNull(r.uses.acquire(renewed)) { "premise: a use under the new grant" }
+            assertNull("the assembly's gate takes no use under a grant issued but not delivered", r.a.gate.bind(renewed, lifetime))
+            r.a.fences.setAccess(true, renewed, TopicGrantOrigin.NewContext)
+            assertNotNull("once delivered, the same use binds", r.a.gate.bind(renewed, lifetime))
+            withContext(r.main) { r.a.close() }
+        }
+    }
+
+    /**
+     * graphA09a (S4 RT01-A3): the recorder's catalog supplier answers the coordinator's adopted catalog only while the
+     * published fence's data scope is the coordinator's: nothing before adoption, nothing for another epoch, a fence with no
+     * epoch, another user or no fence - even before the coordinator moves - nothing after a context change until a catalog
+     * is adopted again, then that new catalog.
+     */
+    @Test
+    fun graphA09a_theRecorderCatalogIsTheCoordinatorsInItsScopeOnly() = snapshotTest {
+        val r = AssemblyRig(this, granted())
+        r.a.start()
+        val issued = r.deliverIssued(); runCurrent()
+        val supply = graphRecorderCatalog({ r.a.coordinator }, r.a.fences.current)
+        r.a.coordinator.onActivated(KEY_3M); runCurrent()
+        assertNull("nothing before a catalog is adopted", supply())
+        r.sent.single { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
+        val adopted = checkNotNull(r.a.coordinator.state.value.catalog) { "premise: adopted" }
+        assertSame("the same scope reads the adopted catalog", adopted, supply())
+
+        r.a.fences.setAccess(true, issued.copy(userAccessEpoch = "another"), TopicGrantOrigin.NewContext)
+        assertNull("another epoch reads nothing, before the coordinator moves", supply())
+        r.a.fences.setAccess(true, issued.copy(userAccessEpoch = null), TopicGrantOrigin.NewContext)
+        assertNull("a fence with no epoch reads nothing", supply())
+        r.a.fences.setAccess(true, issued.copy(identity = AuthIdentityFence(OTHER, 1L)), TopicGrantOrigin.NewContext)
+        assertNull("another user reads nothing", supply())
+        r.a.fences.setAccess(false, issued, TopicGrantOrigin.NewContext)
+        assertNull("no fence reads nothing", supply())
+        assertSame("premise: the coordinator still holds it", adopted, r.a.coordinator.state.value.catalog)
+        runCurrent()
+        r.a.fences.setAccess(true, issued, TopicGrantOrigin.NewContext); runCurrent()
+        assertNull("after a context change, nothing until a catalog is adopted again", supply())
+        val asked = r.sent.filter { it.kind == "catalog" }
+        assertEquals("premise: a new catalog is asked for", 2, asked.size)
+        asked.last().catalog.complete(ok(graphCatalog())); runCurrent()
+        val again = checkNotNull(r.a.coordinator.state.value.catalog)
+        assertNotSame("premise: a new catalog", adopted, again)
+        assertSame("the new catalog is read", again, supply())
+    }
+
+    /**
+     * graphA09b (S4 RT01-A3): in the assembly, an input the recorder held for want of a catalog is adopted as soon as the
+     * coordinator publishes one, and the coordinator's 1d request then captures the recorder's recovery - the recorder is
+     * the coordinator's own. A grant for another user handed over before the coordinator is told does not borrow the old
+     * scope's catalog: the recorder holds the new user's input instead of adopting it.
+     */
+    @Test
+    fun graphA09b_theAssemblysRecorderReplaysWithTheCatalogJustAdopted() = snapshotTest {
+        val r = AssemblyRig(this, granted())
+        r.a.start()
+        val issued = r.deliverIssued(); runCurrent()
+        val lifetime = checkNotNull(r.uses.acquire(issued))
+        r.a.coordinator.onActivated(KEY_3M); runCurrent()
+        assertEquals(TopicGraphOffer.ENQUEUED, r.a.sink.tryOffer(r.quote(1390.0, issued, lifetime))); runCurrent()
+        assertTrue("premise: held without a catalog", r.held() == 1 && !r.adopted(r.kb(issued), 1390.0))
+        r.sent.single { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
+        assertTrue("adopted as soon as the catalog is published", r.adopted(r.kb(issued), 1390.0))
+        assertEquals(0, r.held())
+        r.a.coordinator.onActivated(KEY_1D); runCurrent()
+        assertEquals("the coordinator's 1d request captures the recorder's recovery", 1L, r.a.recorder.state.value.nextVersion)
+
+        r.h.source.identity = EntitlementsIdentity(OTHER, 1L)
+        r.h.coordinator.onIdentityChanged(AuthIdentityFence(OTHER, 1L))
+        r.h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        settle()
+        val other = checkNotNull(r.h.coordinator.topicGrantResult().fence) { "premise: a grant for the other user" }
+        assertNotNull("premise: the coordinator still holds the old scope's catalog", r.a.coordinator.state.value.catalog)
+        r.live = AuthIdentityFence(OTHER, 1L)
+        r.a.fences.setAccess(true, other, TopicGrantOrigin.NewContext)
+        val otherLifetime = checkNotNull(r.uses.acquire(other)) { "premise: a use for the other user" }
+        r.a.recorder.observe(r.quote(1391.0, other, otherLifetime))
+        assertFalse("the old scope's catalog is not lent to the new one", r.adopted(r.kb(other), 1391.0))
+        assertEquals("the new user's input is held instead", 1, r.held())
     }
 
     private companion object {

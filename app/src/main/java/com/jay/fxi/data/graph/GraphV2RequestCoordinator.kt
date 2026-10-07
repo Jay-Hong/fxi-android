@@ -84,6 +84,11 @@ internal data class GraphRequestState(
  * When [recorder] is supplied, the coordinator loop, every recorder method, the control collector
  * and the sink worker must use the same serial executor. RT01 must verify this wiring.
  *
+ * [start] and [close] must run on the loop's serial executor whether or not [recorder] is supplied,
+ * because [close] mutates loop-confined state (in the assembly, its injected always-dispatching Main).
+ * [close] ends input and releases ownership synchronously, even before the loop's first dispatch.
+ * The loop's finally uses the same idempotent cleanup; the supplied scope is not cancelled.
+ *
  * @param protectedAdmission Live admission supplier consulted at each otherwise-admitted use check.
  * It is also invoked on transport threads and must be thread-safe, non-blocking and side-effect free.
  * @param accessSnapshot Lock-free, live read of the issuer's published topic access snapshot; use
@@ -253,6 +258,8 @@ internal class GraphV2RequestCoordinator(
 
     private val inbox = Channel<Event>(Channel.UNLIMITED)
     private val started = AtomicBoolean(false)
+    private var closed = false
+    private var loop: Job? = null
     private val mutableState = MutableStateFlow(GraphRequestState())
     val state: StateFlow<GraphRequestState> = mutableState.asStateFlow()
     @Volatile private var protectedPublication = ProtectedPublication(null, emptyMap())
@@ -292,8 +299,8 @@ internal class GraphV2RequestCoordinator(
     private var timerGeneration = 0L
 
     fun start() {
-        if (!started.compareAndSet(false, true)) return
-        scope.launch {
+        if (closed || !started.compareAndSet(false, true)) return
+        loop = scope.launch {
             try {
                 for (event in inbox) {
                     try {
@@ -312,17 +319,31 @@ internal class GraphV2RequestCoordinator(
                     }
                 }
             } finally {
-                discardWrites()
-                discardSeed()
-                cancelTimer()
-                cancelCold()
-                cancelMidnight()
-                cancelFlip()
-                discardRequests()
-                inbox.close()
-                publish()
+                close()
             }
         }
+    }
+
+    /**
+     * Ends acceptance, discards queued events and releases request, write, seed and timer ownership
+     * before returning. Calls and the loop's finally share this idempotent cleanup on the serial
+     * executor. No supplier is read, no later event is handled, and [scope] itself stays alive.
+     */
+    fun close() {
+        if (closed) return
+        closed = true
+        inbox.cancel()
+        discardWrites()
+        writePreparationToStart = null
+        discardSeed()
+        cancelTimer()
+        cancelCold()
+        cancelMidnight()
+        cancelFlip()
+        deferredDemand = null
+        discardRequests()
+        publish()
+        loop?.cancel()
     }
 
     fun onActivated(key: GraphKey) { inbox.trySend(Event.Activate(key)) }
