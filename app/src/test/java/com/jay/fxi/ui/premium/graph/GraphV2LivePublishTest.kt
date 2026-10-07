@@ -6,6 +6,8 @@ import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.entitlements.AccessFence
 import com.jay.fxi.data.entitlements.EntitlementsIdentity
 import com.jay.fxi.data.entitlements.SnapshotTopicUseAuthority
+import com.jay.fxi.data.entitlements.TopicAccessEnd
+import com.jay.fxi.data.entitlements.TopicAccessEndReason
 import com.jay.fxi.data.entitlements.TopicAccessFacts
 import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.entitlements.TopicGrantContext
@@ -18,6 +20,7 @@ import com.jay.fxi.data.graph.GraphObservationId
 import com.jay.fxi.data.graph.GraphObservationOrder
 import com.jay.fxi.data.graph.GraphObservationSeriesKey
 import com.jay.fxi.data.graph.GraphOwnerSource
+import com.jay.fxi.data.graph.GraphRecorder
 import com.jay.fxi.data.graph.GraphRecoverableState
 import com.jay.fxi.data.graph.GraphSeriesSelectionSession
 import com.jay.fxi.data.graph.GraphV2AccessGate
@@ -41,7 +44,11 @@ import com.jay.fxi.data.remote.OwnedTopicFocus
 import com.jay.fxi.data.remote.TopicDisplayOwner
 import com.jay.fxi.data.remote.TopicDisplayState
 import com.jay.fxi.data.remote.TopicGrantToken
+import com.jay.fxi.data.remote.TopicGraphCandidate
+import com.jay.fxi.data.remote.TopicGraphInput
+import com.jay.fxi.data.remote.TopicGraphPath
 import com.jay.fxi.data.remote.TopicSessionFence
+import com.jay.fxi.data.remote.TopicUseAttribution
 import com.jay.fxi.data.remote.dto.GraphV2CatalogPeriod
 import com.jay.fxi.data.remote.dto.GraphV2CatalogResponse
 import com.jay.fxi.data.remote.dto.GraphV2CatalogTab
@@ -126,6 +133,11 @@ import org.junit.rules.TemporaryFolder
  * r5 (Codex's counterexamples to two r4 battery classifications, B06 and B19): V26 - a change made while hidden leaves no
  * deadline behind a re-exposure that finds the chart withheld; V27 - an access block first found by the check after
  * rendering also clears the reports, inline and fullscreen. The holder's clock can run a hook on a read.
+ * r6 (S4 F2f, design f2f_design_codex.r1): rows W01-W05 at the end. The holder takes an optional trailing
+ * `recorder: GraphRecorder? = null`; with it, each publication reads `recorder.exposed(context fence, context lifetime)` in
+ * place of `live.value`, the recorder's state is subscribed only as a change signal, live is not subscribed, and the holder
+ * neither starts nor closes the recorder. The fixture gains a recorder on its own suppliers and executor, a mutable access
+ * snapshot and a second holder over the same coordinator and recorder.
  *
  * Android additions, not iOS 89e866d behaviour: every time event publishes at once (iOS only on a detected rollover);
  * hiding drops the published result; the right edge moves on a time event even when the projection is unchanged. iOS's
@@ -196,6 +208,7 @@ class GraphV2LivePublishTest {
         const val Y = "kb.usd"
         val SCOPE = GraphDataScope("u1", "e1")
         val KY = GraphObservationSeriesKey(SCOPE, Y)
+        val KX = GraphObservationSeriesKey(SCOPE, X)
     }
 
     private fun snap(): TopicAccessSnapshot {
@@ -300,7 +313,7 @@ class GraphV2LivePublishTest {
         val answer = CompletableDeferred<AuthenticatedHttpResponse<GraphV2TabResponse>>()
     }
 
-    private inner class Fixture(val test: TestScope, private val start: Instant = NOON) {
+    private inner class Fixture(val test: TestScope, private val start: Instant = NOON, withRecorder: Boolean = false) {
         init { opened += this }
         val dispatcher = StandardTestDispatcher(test.testScheduler)
         val scope = CoroutineScope(SupervisorJob() + dispatcher)
@@ -317,7 +330,7 @@ class GraphV2LivePublishTest {
         val accessRevisions = MutableStateFlow(0L)
         val live = MutableStateFlow<Map<GraphObservationSeriesKey, GraphRecoverableState>>(emptyMap())
         val sent = mutableListOf<Sent>()
-        private val snapshot = snap()
+        var snapshot: TopicAccessSnapshot = snap()
         val uses = SnapshotTopicUseAuthority { snapshot }
 
         val owners = object : GraphOwnerSource {
@@ -369,8 +382,35 @@ class GraphV2LivePublishTest {
             clock.now() + offset
         }
 
+        /** F2f: the graph recorder on this fixture's suppliers and executor; the holder reads it only when [withRecorder]. */
+        var recorderReads = 0
+        val recorder = GraphRecorder(
+            scope, MutableStateFlow(0L), { recorderReads++; snapshot }, { recorderReads++; FENCE_A },
+            { recorderReads++; coordinator.state.value.catalog }, gate, AppClock { recorderReads++; clock.now() }
+        )
+        private val readsRecorder = withRecorder
+
         val selections = FakeSelectionStore()
         val session = GraphSeriesSelectionSession(selections, GraphSelectionAudience.PREMIUM, "usd", scope, dispatcher)
+
+        /** Another screen over the same coordinator and recorder, with its own selection session. */
+        fun newHolder() = GraphV2ScreenStateHolder(
+            tab = "usd",
+            coordinator = coordinator,
+            selectionSession = GraphSeriesSelectionSession(selections, GraphSelectionAudience.PREMIUM, "usd", scope, dispatcher),
+            liveIdentity = { A },
+            display = display,
+            focus = focus,
+            currentAccessFence = { FENCE_A },
+            uses = uses,
+            gate = gate,
+            accessRevisions = accessRevisions,
+            scope = scope,
+            dispatcher = dispatcher,
+            live = live,
+            clock = holderClock,
+            recorder = recorder
+        )
 
         val holder = GraphV2ScreenStateHolder(
             tab = "usd",
@@ -386,7 +426,8 @@ class GraphV2LivePublishTest {
             scope = scope,
             dispatcher = dispatcher,
             live = live,
-            clock = holderClock
+            clock = holderClock,
+            recorder = if (readsRecorder) recorder else null
         )
 
         val published = mutableListOf<GraphV2ScreenState>()
@@ -471,6 +512,23 @@ class GraphV2LivePublishTest {
 
         fun expected(key: GraphKey, at: Instant, allowed: Set<String> = setOf(X, Y)): PreparedGraph =
             projectGraphV2Live(exposed(key, allowed), rest(key, allowed), key.period, SCOPE, live.value, at)
+
+        val lifetime get() = checkNotNull(uses.acquire(FENCE_A))
+
+        /** A kb quote handed to the recorder as the topic sink would hand it over. */
+        fun record(rate: Double, at: Instant = clock.now()) {
+            recorder.observe(
+                TopicGraphInput.Observations(
+                    1L, "fx:usd-krw", TopicGraphPath.WS, TopicUseAttribution(Any(), FENCE_A, 1L, lifetime), 1L,
+                    listOf(TopicGraphCandidate.Quote("kb", "usd-krw", rate, at, null))
+                )
+            )
+            run()
+        }
+
+        /** The projection a publication at [at] makes from the recorder's checked read. */
+        fun fromRecorder(key: GraphKey, at: Instant): PreparedGraph =
+            projectGraphV2Live(exposed(key), rest(key), key.period, SCOPE, recorder.exposed(FENCE_A, lifetime), at)
 
         fun close() = scope.cancel()
     }
@@ -1362,5 +1420,149 @@ class GraphV2LivePublishTest {
             assertNotNull("fullscreen=$fullscreen premise: reopened", f.now().chart)
             assertNull("fullscreen=$fullscreen: a fresh report is needed", f.edge())
         }
+    }
+
+    // === F2f: the holder reads the graph recorder (r6) =======================================================================
+    //
+    // With a recorder the holder subscribes to its state only as a change signal and, inside each publication, reads
+    // `recorder.exposed(context fence, context lifetime)` in place of `live.value` - never merged with live, never filled from
+    // it, never the raw state. The holder neither starts nor closes the recorder; its own end leaves the recorder recording.
+
+    /** W01: a recorder change is published on the 350 ms deadline with the recorder's latest checked read, not the first one. */
+    @Test fun W01_aRecorderChangeIsPublishedWithItsLatestEvidence() = holderTest {
+        val f = Fixture(this, withRecorder = true)
+        f.ready()
+        val t0 = f.clock.now()
+        f.show()
+        f.record(1341.1)
+        f.advance(100)
+        f.record(1345.5, f.clock.now())
+        f.advance(249)
+        assertEquals("349 ms: still the first publication", t0, f.edge())
+        f.advance(1)
+        val t1 = t0 + 350.milliseconds
+        assertEquals(t1, f.edge())
+        assertEquals(f.fromRecorder(KEY_1D, t1), f.chart().prepared)
+    }
+
+    /** W02: with a recorder, live is neither subscribed nor merged; an empty recorder read is not filled from live. */
+    @Test fun W02_theRecorderReplacesLive() = holderTest {
+        Fixture(this, withRecorder = true).let { f ->
+            f.ready()
+            val t0 = f.clock.now()
+            f.show()
+            f.push(t0 to 1360.0)
+            f.push(t0 to 1370.0, key = KX)
+            f.advance(400)
+            assertEquals("a live change schedules nothing", listOf(t0), f.edges())
+            f.record(1341.1)
+            f.advance(350)
+            val t1 = checkNotNull(f.edge())
+            assertEquals("recorder only", f.fromRecorder(KEY_1D, t1), f.chart().prepared)
+        }
+        Fixture(this, withRecorder = true).let { f ->
+            f.ready()
+            f.show()
+            f.push(f.clock.now() to 1360.0)
+            f.advance(10)
+            f.holder.onTimeEvent()
+            f.run()
+            val at = checkNotNull(f.edge())
+            assertTrue("premise: the recorder has nothing", f.recorder.exposed(FENCE_A, f.lifetime).isEmpty())
+            assertEquals(
+                "nothing from live", projectGraphV2Live(f.exposed(KEY_1D), f.rest(KEY_1D), GraphPeriod.ONE_DAY, SCOPE, emptyMap(), at),
+                f.chart().prepared
+            )
+        }
+    }
+
+    /** W03: data the recorder still holds but its checked read refuses (an unsynced user end) is never drawn. */
+    @Test fun W03_rawRecorderStateIsNeverDrawn() = holderTest {
+        val f = Fixture(this, withRecorder = true)
+        f.ready()
+        f.show()
+        f.record(1341.1)
+        f.advance(350)
+        f.snapshot = f.snapshot.copy(
+            lastUserEnd = TopicAccessEnd(1L, TopicAccessEndReason.SIGNED_OUT, EntitlementsIdentity("u1", 1L), "u1", "e1")
+        )
+        assertTrue("premise: the raw state still holds it", KY in f.recorder.state.value.series)
+        assertTrue("premise: the checked read refuses it", f.recorder.exposed(FENCE_A, f.lifetime).isEmpty())
+        f.advance(10)
+        f.holder.onTimeEvent()
+        f.run()
+        val at = checkNotNull(f.edge()) { "premise: the holder still shows the chart" }
+        assertEquals(f.expected(KEY_1D, at), f.chart().prepared)
+    }
+
+    /** W04: hiding, deactivating, leaving the fullscreen and closing the holder keep the recorder's data and its recording. */
+    @Test fun W04_aScreenEndLeavesTheRecorderRecording() = holderTest {
+        for (end in listOf("hide", "deactivate", "fullscreen", "close")) {
+            val f = Fixture(this, withRecorder = true)
+            f.ready()
+            f.show()
+            f.record(1341.1)
+            val held = f.recorder.state.value.series.getValue(KY)
+            when (end) {
+                "hide" -> f.hide()
+                "deactivate" -> {
+                    f.holder.onDeactivated()
+                    f.run()
+                }
+                "fullscreen" -> {
+                    f.holder.enterFullscreen(f.token())
+                    f.run()
+                    val fs = checkNotNull(f.now().fullscreenToken)
+                    f.holder.setSurfaceVisible(fs, true)
+                    f.run()
+                    f.holder.exitFullscreen(fs)
+                    f.run()
+                }
+                "close" -> {
+                    val closing = async { f.holder.close() }
+                    f.run()
+                    assertTrue("$end premise", closing.isCompleted)
+                }
+            }
+            assertSame("$end: the data is kept", held, f.recorder.state.value.series[KY])
+            f.advance(1_000)
+            val at = f.clock.now()
+            f.record(1342.2, at)
+            assertTrue(
+                "$end: the recorder still records",
+                GraphObservationId("kb", "usd-krw", at, 1342.2) in f.recorder.state.value.series.getValue(KY).data.app.observations
+            )
+        }
+    }
+
+    /** W05: starting a holder does not start the recorder; a new holder with its own session reads the same recorder later. */
+    @Test fun W05_theHolderNeverStartsTheRecorderAndANewHolderReadsIt() = holderTest {
+        val f = Fixture(this, withRecorder = true)
+        f.ready()
+        assertEquals("the holder read nothing of the recorder before showing", 0, f.recorderReads)
+        f.recorder.start()
+        f.run()
+        assertTrue("the host started it", f.recorderReads > 0)
+        f.record(1341.1)
+        val closing = async { f.holder.close() }
+        f.run()
+        assertTrue(closing.isCompleted)
+
+        f.advance(1_000)
+        f.record(1342.2, f.clock.now())
+        val next = f.newHolder()
+        next.start()
+        f.run()
+        next.onActivated(OWNER_A)
+        f.run()
+        val token = checkNotNull(next.currentState().inlineToken) { "no inline token in ${next.currentState()}" }
+        next.setSurfaceVisible(token, true)
+        f.run()
+        val at = checkNotNull(next.currentState().chart?.rightEdgeNow)
+        assertEquals("the kept and the later evidence", f.fromRecorder(KEY_1D, at), next.currentState().chart?.prepared)
+        assertTrue(f.recorder.state.value.series.getValue(KY).data.app.observations.map { it.rate }.containsAll(listOf(1341.1, 1342.2)))
+        val ending = async { next.close() }
+        f.run()
+        assertTrue(ending.isCompleted)
     }
 }

@@ -4,6 +4,7 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.graph.GraphDataScope
 import com.jay.fxi.data.graph.GraphKey
 import com.jay.fxi.data.graph.GraphObservationSeriesKey
+import com.jay.fxi.data.graph.GraphRecorder
 import com.jay.fxi.data.graph.GraphRecoverableState
 import com.jay.fxi.data.graph.GraphRequestState
 import com.jay.fxi.data.graph.GraphSelectionApplyResult
@@ -103,6 +104,8 @@ internal data class GraphV2PreparationKey(
 
 /**
  * The host starts and owns the shared request coordinator.
+ * The host also owns the optional recorder; this holder neither starts nor closes it.
+ * Recorder state is only a change signal; publications read its data through [GraphRecorder.exposed].
  * Lifecycle, rendering and workers use the same serial dispatcher as the selection session and coordinator.
  * A renderer observes [state] for invalidation and reads [currentState] immediately before drawing.
  */
@@ -120,7 +123,8 @@ internal class GraphV2ScreenStateHolder(
     scope: CoroutineScope,
     dispatcher: CoroutineDispatcher,
     private val live: StateFlow<Map<GraphObservationSeriesKey, GraphRecoverableState>> = MutableStateFlow(emptyMap()),
-    private val clock: AppClock = SystemAppClock
+    private val clock: AppClock = SystemAppClock,
+    private val recorder: GraphRecorder? = null
 ) {
     init {
         require(tab in setOf("usd", "jpy", "eur")) { "Premium FX graph tab required" }
@@ -209,7 +213,11 @@ internal class GraphV2ScreenStateHolder(
         observe(coordinator.state)
         observe(selectionSession.publication)
         holderScope.launch {
-            live.collect { scheduleLivePublication() }
+            if (recorder != null) {
+                recorder.state.collect { scheduleLivePublication() }
+            } else {
+                live.collect { scheduleLivePublication() }
+            }
         }
         signal()
     }
@@ -370,8 +378,13 @@ internal class GraphV2ScreenStateHolder(
         cancelLivePublication()
         val now = clock.now()
         val scope = GraphDataScope(current.binding.identity.uid, checkNotNull(current.fence.userAccessEpoch))
+        val source = if (recorder != null) {
+            recorder.exposed(current.fence, current.lifetime)
+        } else {
+            live.value
+        }
         livePublication = LivePublication(
-            projectGraphV2Live(key.graph, rest, key.period, scope, live.value, now), now
+            projectGraphV2Live(key.graph, rest, key.period, scope, source, now), now
         )
     }
 
