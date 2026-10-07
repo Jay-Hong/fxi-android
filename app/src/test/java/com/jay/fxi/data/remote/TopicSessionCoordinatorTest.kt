@@ -15405,6 +15405,159 @@ class TopicSessionCoordinatorTest {
         h.cleanUp()
     }
 
+    /**
+     * S4 RT01-B1: answers as [script] decides and feeds the graph-loss ledger exactly what the session hands over, at the
+     * session's own wall clock. A null answer stands for a thrown Exception, which the session records as FAILED: the ledger
+     * gets FAILED first, then the sink throws. The live session's graphLoss storage is unchanged; these rows only prove the
+     * independent ledger reproduces its view.
+     */
+    private class LedgerMirror(private val h: Harness, private val g: GraphRecorder) {
+        val ledger = TopicGraphLossLedger()
+        var script: (TopicGraphInput) -> TopicGraphOffer? = { TopicGraphOffer.ENQUEUED }
+
+        init {
+            g.answer = { input ->
+                val offer = script(input)
+                ledger.record(input, offer ?: TopicGraphOffer.FAILED, h.wallMillis)
+                offer ?: throw IllegalStateException("sink")
+            }
+        }
+
+        fun same(step: String) = assertEquals("B07 $step", h.coordinator.graphLoss.value, ledger.view)
+    }
+
+    /**
+     * B07a (S4 RT01-B1): through a whole trace the ledger holds the session's graphLoss view after every step - a batch of
+     * two prices as one FULL loss, a dormant answer as none, a thrown Exception as FAILED at a wall clock that went back,
+     * the first grant's authority ending as CLOSED with a loss time later than the continuity's own clock, and a CLOSED
+     * observation under a second grant in another data scope at a clock earlier still, so first and last come from
+     * different scopes by sequence, not by time.
+     */
+    @Test
+    fun `B07a the graph loss ledger holds the session's view after every step`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        val m = LedgerMirror(h, g)
+        m.same("nothing lost yet")
+
+        m.script = { if (it is TopicGraphInput.Observations) TopicGraphOffer.FULL else TopicGraphOffer.ENQUEUED }
+        h.wallMillis = 20_000L
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1), gEntry("bithumb", "usdt-krw", 1391.0, gT1))))
+        advanceTimeBy(1)
+        m.same("a batch of two prices is one FULL loss")
+
+        m.script = { if (it is TopicGraphInput.Observations) TopicGraphOffer.DORMANT else TopicGraphOffer.ENQUEUED }
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1392.0, gT2))))
+        advanceTimeBy(1)
+        m.same("a dormant answer is no loss")
+
+        m.script = { if (it is TopicGraphInput.Observations) null else TopicGraphOffer.ENQUEUED }
+        h.wallMillis = 15_000L
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1393.0, gT2))))
+        advanceTimeBy(1)
+        m.same("a thrown Exception is FAILED, at a wall clock that went back")
+
+        val ended = mutableListOf<TopicGraphInput.Continuity>()
+        m.script = { input ->
+            when {
+                input is TopicGraphInput.Continuity && input.kind == TopicGraphEventKind.AUTHORITY_ENDED -> {
+                    ended += input
+                    h.wallMillis = 26_000L
+                    TopicGraphOffer.CLOSED
+                }
+                input is TopicGraphInput.Observations -> TopicGraphOffer.CLOSED
+                else -> TopicGraphOffer.ENQUEUED
+            }
+        }
+        h.wallMillis = 25_000L
+        h.setAccess(true, fence(grant = 2L, epoch = "epoch-2"))
+        advanceTimeBy(5_000)
+        h.wire.open()
+        advanceTimeBy(1)
+        m.same("the first grant's authority ends as CLOSED")
+        assertEquals("B07a fixture: the authority's end was created before its loss time", listOf(25_000L), ended.map { it.occurredAtEpochMillis })
+        assertEquals("B07a fixture: lost at the later wall clock", 26_000L, checkNotNull(m.ledger.view).lastOccurredAtEpochMillis)
+
+        h.wallMillis = 12_000L
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1394.0, gT2))))
+        advanceTimeBy(1)
+        m.same("an observation under the second grant, in another scope, at an earlier clock")
+
+        val view = checkNotNull(m.ledger.view)
+        assertEquals("B07a fixture: FULL, FAILED, the authority's end and the last observation", 4L, view.count)
+        assertEquals("B07a fixture: every loss reason", setOf(TopicGraphOffer.FULL, TopicGraphOffer.FAILED, TopicGraphOffer.CLOSED), view.reasons)
+        assertEquals("B07a fixture: two data scopes", setOf("epoch-1", "epoch-2"), view.authorities.map { it.owner?.userAccessEpoch }.toSet())
+        assertEquals("B07a fixture: the last loss is the later sequence at the earlier clock", 12_000L, view.lastOccurredAtEpochMillis)
+        h.cleanUp()
+    }
+
+    /**
+     * B07b (S4 RT01-B1): an idle session's end with no owner, lost as CLOSED, and a loss under a grant with no epoch both
+     * reach the ledger as the session records them.
+     */
+    @Test
+    fun `B07b a loss with no owner or no epoch is held as the session holds it`() = runTest {
+        val idle = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val gi = GraphRecorder(idle)
+        idle.graphSink = gi
+        val mi = LedgerMirror(idle, gi)
+        mi.script = { TopicGraphOffer.CLOSED }
+        idle.wallMillis = 40_000L
+        idle.coordinator.start()
+        idle.coordinator.stop()
+        advanceTimeBy(1)
+        mi.same("an idle session's end")
+        assertEquals("B07b fixture: lost without an owner", listOf<TopicSessionFence?>(null), checkNotNull(mi.ledger.view).authorities.map { it.owner })
+
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        val m = LedgerMirror(h, g)
+        val noEpoch = TopicSessionFence(AuthIdentityFence("u1", 1L), null, TopicGrantToken(3L))
+        h.coordinator.start()
+        h.setAccess(true, noEpoch)
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        m.script = { if (it is TopicGraphInput.Observations) TopicGraphOffer.FULL else TopicGraphOffer.ENQUEUED }
+        h.wallMillis = 50_000L
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        m.same("a loss under a grant with no epoch")
+        assertEquals("B07b fixture: owned by the grant with no epoch", setOf(noEpoch), checkNotNull(m.ledger.view).authorities.map { it.owner }.toSet())
+        h.cleanUp()
+    }
+
+    /**
+     * B07c (S4 RT01-B1): a CancellationException from the sink propagates - it ends the session, which hands over its end -
+     * and is no loss: the view both sides held before it is unchanged, and the ledger, still attached, records nothing.
+     */
+    @Test
+    fun `B07c a cancellation from the sink records no loss`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        val m = LedgerMirror(h, g)
+        m.script = { if (it is TopicGraphInput.Observations) TopicGraphOffer.FULL else TopicGraphOffer.ENQUEUED }
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        m.same("a loss before the cancellation")
+        val held = checkNotNull(h.coordinator.graphLoss.value)
+
+        m.script = { if (it is TopicGraphInput.Observations) throw kotlinx.coroutines.CancellationException("sink") else TopicGraphOffer.ENQUEUED }
+        val handed = g.observations.size
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+        assertEquals("B07c fixture: the observation reached the sink", handed + 1, g.observations.size)
+        assertTrue(
+            "B07c the cancellation propagated and ended the session",
+            g.inputs.any { it is TopicGraphInput.Continuity && it.kind == TopicGraphEventKind.HANDOVER_ENDED }
+        )
+        assertEquals("B07c no loss for the session", held, h.coordinator.graphLoss.value)
+        m.same("and none in the ledger")
+        h.cleanUp()
+    }
+
     @Test
     fun `G2A-11 the same trace with continuity events decides the same things with a dormant or a recording sink`() = runTest {
         val dormant = Harness(this, inert = true, desired = setOf(TETHER, USD))
