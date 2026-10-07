@@ -31,9 +31,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 관찰했다. topic 줄 문구는 운영에서 자연 발생하지 않아 기기 미수집이다.
                                 S3 그래프 관측 인계는 GObs-1(`ffda7b9`, 후보)·2a(`4233c4a`, 권위·재개)·2b-1(`c30d615`,
                                 전달 중단)·2b-2(`b5e6501`, ACK·인증)로 연결했다(JVM 계약, dormant sink, 운영 배선 없음).
-                                S4 Graph V2(FX)는 A1(`0265bdf`)부터 F2c-1(`6e6bab8`)까지 구현·테스트·정리 commit 34개로
+                                S4 Graph V2(FX)는 A1(`0265bdf`)부터 F2b-2b(`9656686`)까지 구현·테스트·정리 commit 37개로
                                 요청·디스크·선택·화면·1일 live 봉 모델·관측 어댑터·live projection·발행·표면 가시성·
-                                기록기 보존·폐기·연속성 reducer와 owner를 쌓고 도달 불가 v1 graph 코드를 지웠다(JVM·에뮬레이터
+                                기록기 보존·폐기·연속성 reducer와 owner·topic sink를 쌓고 도달 불가 v1 graph 코드를 지웠다(JVM·에뮬레이터
                                 계측 계약, 운영 배선 없음). 남은 단위는 F2 dormant 나머지와 F2 runtime이다(G의 §9.1 migration
                                 포함, S4 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
@@ -1411,7 +1411,17 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   보관 입력이 없으면 매핑되는 기존 series에 요구 창 전체 [current−24h, current] RECEIVE_GAP, 아니면 보관), 보관 입력 원순서
   재생(관측은 원 capture 재bind)과 시각 없는 손실 인계(기존 series와 뒤에 생성되는 series에 요구 창 전체 HANDOVER_LOSS).
   현재 fence가 null이라 버린 같은 scope 관측의 손실(F2c 합의 N1)은 F2b에서 고정한다.
-  다음: F2 dormant 나머지는 F2b-1(issuer 종료 하한) → F2b-2(sink·자기 거절 장부, N1 포함) → F2d(요청 capture·응답 동기
+  · F2b-1 `8d4d90c` entitlements snapshot의 `userEndInvalidationsFloor`(마지막 user end의 최초 발행에서 그 발행의 무효화
+  계산 뒤 고정하고 다음 end까지 유지. 그 end 전에 acquire한 lifetime은 이보다 작고 뒤에 acquire한 lifetime은 이 이상)
+  · F2b-2a `f15053f` 기록기 N1(현재 scope가 없어 버린 보유 scope 관측을 거절과 같은 손실로 남기고, 앞선 보관 손실 인계는
+  scope 복귀까지 대기), 하한 비교(원 lifetime이 하한 미만인 입력은 손실·재개·topic 손실로 쓰지 않음. 가격 채택은 gate가
+  현재 count와 같은 lifetime만 받아 따로 비교하지 않음), `loseTopics`(원 owner scope의 topic별 최대 invalidations)
+  · F2b-2b `9656686` topic sink(512단위 FIFO, batch 전체 수락 또는 FULL, 자기 FULL·FAILED를 원 scope별 장부로 입력 하나마다
+  `loseTopics` 인계, close·소비자 예외 시 파이프라인 종료, S3 GOBS-20 실제 sink 정상·포화 trace 동등). F2b 설계 합의
+  (Codex r1을 4관점 검증과 r2·r3로 줄임)에 따라 coordinator·`TopicGraphLoss`는 바꾸지 않고 coordinator 누적 graphLoss도
+  소비하지 않는다. sink와 기록기는 프로세스 수명이고 자료 수명은 reducer 폐기가 맡는다. 한 sink에 coordinator 하나, 기록기와
+  gate의 공급자 공유, 같은 fence 철회가 end 또는 invalidations를 올린다는 deliverer 계약은 RT01에서 다시 확인한다.
+  다음: F2 dormant 나머지는 F2d(요청 capture·응답 동기
   인계) → F2f(holder 검증 읽기) → F2e(기록기 purge adapter) 순서이고, 그 뒤 runtime 배선이다(F2 설계 합의 r2). runtime
   앞에 S1 잔여(봉인·재승인·정리 재개)와 동결 후 7번 대조를 게이트로 둔다(F1 설계 합의 r2). T25는 공용 GraphChart 회귀만 C2b-2에서 확인했고 나머지는 F2에 남는다.
   실제 purger를 포함한 S4 최종 DoD 재검증은 P3-i 활성화 뒤에 하고, F2에서는 placeholder purger 아래 회귀 0만 본다.
