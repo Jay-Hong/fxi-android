@@ -166,9 +166,14 @@ jobs:
           python3 tools/performance/benchmark_gate.py check-fixtures \
             tools/performance/fixtures/gate-cases.json
 
+      # 세 변형을 한 호출에 두면 시험 컴파일 세 태스크가 수 초 간격으로 로그에 기록된다(동시 컴파일로 추정). 6g 로 올린 뒤에도 그 직후
+      # 무출력으로 45분 job 제한 도달 시점에 취소된 기록이 두 번 더 있다(제한에 따른 취소로 추정)(37563185963·37569952754 각 attempt 1, OOM 기록은
+      # 없음). 원인은 동시 컴파일의 메모리 압박으로 추정하며, 호출을 나눠 한 번에 한 변형만 컴파일한다.
       - name: Unit tests
         run: |
-          ./gradlew testDebugUnitTest testCiMinifiedUnitTest testBenchmarkUnitTest
+          ./gradlew testDebugUnitTest
+          ./gradlew testCiMinifiedUnitTest
+          ./gradlew testBenchmarkUnitTest
 
       - name: Lint
         run: ./gradlew lintDebug
