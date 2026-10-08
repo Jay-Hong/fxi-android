@@ -121,7 +121,9 @@ internal data class GraphRequestState(
  * budget per (data scope, tab) (S4 RT03b-1b): it reads the recorder's demand on the loop, issues its
  * own forced rounds at most six times, 3/6/12/24/48 s after each completion, and holds back unforced
  * requests of its key while it waits. It survives Deactivate, key switches and a missing data scope;
- * a USER end, another non-null data scope, a selecting [retireScopes] and [close] discard it.
+ * a USER end, another non-null data scope, a selecting [retireScopes] and [close] discard it. A context
+ * change within the data scope of the last context since the last USER end asks for no catalog
+ * (S4 RT03b-2a); another scope, a USER end and the first context still do.
  * Other periods, and a coordinator without a recorder, keep the cold, flip and midnight owners.
  */
 internal class GraphV2RequestCoordinator(
@@ -263,7 +265,12 @@ internal class GraphV2RequestCoordinator(
         val key: GraphKey,
         val context: RequestContext,
         val activityGeneration: Long,
-        val force: Boolean
+        val force: Boolean,
+        /**
+         * S4 RT03b-2a: a same-scope context change's demand, resumed without a catalog. It is always deferred alone,
+         * since its synchronization has just cleared the deferred demand; a later demand of the same context replaces it.
+         */
+        val catalogSilent: Boolean = false
     )
 
     private enum class FailureDisposition { RETRYABLE, TERMINAL, WITHDRAWN, DIAGNOSTIC }
@@ -348,6 +355,16 @@ internal class GraphV2RequestCoordinator(
     private var flipOwner: FlipOwner? = null
     private var deferredDemand: DeferredDemand? = null
     private val recoveryBudgets = mutableMapOf<RecoveryKey, RecoveryBudget>()
+    /**
+     * S4 RT03b-2a: the data scope of the last synchronization since the last USER end that obtained a context. One without
+     * a context keeps it only for its own scope, and one without a scope keeps it. It classifies catalog issue only.
+     */
+    private var lastDataScope: GraphDataScope? = null
+    /**
+     * Written by every synchronization that changes the context: whether it obtained a context within [lastDataScope], with
+     * a recorder. Only the ContextChanged handling of the same event reads it.
+     */
+    private var sameScopeChange = false
     private var nextRecoveryRound = 0L
     // Written by the loop, also read by the transport's replay guard. Context disposal and
     // deactivation never reset it; an in-flight answer still uses its separate ownership check.
@@ -717,7 +734,7 @@ internal class GraphV2RequestCoordinator(
                 val changed = synchronizeContext()
                 synchronizeCapabilityConfiguration(now)
                 startDiskSeed()
-                if (changed) requestActive(now, force = false)
+                if (changed) requestActive(now, force = false, catalogSilent = sameScopeChange)
             }
             is Event.Refresh -> {
                 synchronizeContext()
@@ -919,7 +936,10 @@ internal class GraphV2RequestCoordinator(
         val ended = userEnd > seenUserEnd
         seenUserEnd = maxOf(seenUserEnd, userEnd)
         val scopeChanged = snapshot.dataScope != dataScope || ended
+        if (ended) lastDataScope = null
         if (!scopeChanged && context == next) return false
+        sameScopeChange = recorder != null && next != null && dataScope == lastDataScope
+        if (dataScope != null) lastDataScope = if (next != null) dataScope else lastDataScope?.takeIf { it == dataScope }
 
         if (ended) recoveryBudgets.clear() else if (dataScope != null) recoveryBudgets.keys.retainAll { it.scope == dataScope }
         cancelActiveDemand()
@@ -980,7 +1000,8 @@ internal class GraphV2RequestCoordinator(
         force: Boolean,
         coldAttempt: Boolean = false,
         midnightAttempt: Boolean = false,
-        recovery: RecoveryRound? = null
+        recovery: RecoveryRound? = null,
+        catalogSilent: Boolean = false
     ) {
         val key = activeKey ?: return
         val current = context ?: return
@@ -988,7 +1009,7 @@ internal class GraphV2RequestCoordinator(
 
         // Catalog refresh is independent of tab freshness and never blocks the tab request.
         val lastCatalogAt = catalogAt
-        val needsCatalog = catalogRequest == null && (snapshot.catalog == null || lastCatalogAt == null ||
+        val needsCatalog = !catalogSilent && catalogRequest == null && (snapshot.catalog == null || lastCatalogAt == null ||
             now - lastCatalogAt >= GraphV2Domain.ttl(snapshot.catalog))
         val supported = GraphV2Domain.support(snapshot.catalog, key.tab, key.period) != GraphPeriodSupport.Unsupported
         val cold = coldOwner?.takeIf { it.key == key && it.context == current }
@@ -1000,7 +1021,7 @@ internal class GraphV2RequestCoordinator(
         if (underFloor(now)) {
             if (needsCatalog || needsTab) {
                 val previous = deferredDemand
-                deferredDemand = DeferredDemand(key, current, activityGeneration, force || previous?.force == true)
+                deferredDemand = DeferredDemand(key, current, activityGeneration, force || previous?.force == true, catalogSilent)
             }
             return
         }
@@ -1844,7 +1865,9 @@ internal class GraphV2RequestCoordinator(
         deferredDemand?.let { demand ->
             deferredDemand = null
             if (demand.key == activeKey && demand.context == context &&
-                demand.activityGeneration == activityGeneration) requestActive(now, demand.force)
+                demand.activityGeneration == activityGeneration) {
+                requestActive(now, demand.force, catalogSilent = demand.catalogSilent)
+            }
         }
 
         wakeCold(now)

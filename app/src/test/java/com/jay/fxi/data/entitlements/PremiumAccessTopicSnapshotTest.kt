@@ -2377,8 +2377,11 @@ class PremiumAccessTopicSnapshotTest {
         g.recorder.observe(g.quote(1405.0, renewed, fresh))
         assertTrue("a fresh price is adopted into it", g.adopted(a.kb, 1405.0))
         val sent = g.sent.drop(sentBefore)
-        sent.single { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
+        assertTrue("a same-scope grant renewal asks for no catalog (S4 RT03b-2a)", sent.none { it.kind == "catalog" })
         val day = sent.single { it.kind == "tab" && it.key == KEY_1D }
+        // A catalog adopted after the 1d tab was registered: the tab still carries no recovery capture.
+        g.coordinator.onRefreshRequested(); runCurrent()
+        g.sent.drop(sentBefore).single { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
         assertTrue("the new 1d guard", day.guard())
         day.tab.complete(ok(g.dayTab())); runCurrent()
         assertTrue("the new 1d completion applies", g.coordinator.state.value.entries.containsKey(KEY_1D))
@@ -3082,8 +3085,10 @@ class PremiumAccessTopicSnapshotTest {
         runCurrent()
         r.a.fences.setAccess(true, issued, TopicGrantOrigin.NewContext); runCurrent()
         assertNull("after a context change, nothing until a catalog is adopted again", supply())
+        assertEquals("a same-scope return asks for no catalog (S4 RT03b-2a)", 1, r.sent.count { it.kind == "catalog" })
+        r.a.coordinator.onRefreshRequested(); runCurrent()
         val asked = r.sent.filter { it.kind == "catalog" }
-        assertEquals("premise: a new catalog is asked for", 2, asked.size)
+        assertEquals("premise: a refresh asks for a new catalog", 2, asked.size)
         asked.last().catalog.complete(ok(graphCatalog())); runCurrent()
         val again = checkNotNull(r.a.coordinator.state.value.catalog)
         assertNotSame("premise: a new catalog", adopted, again)

@@ -53,6 +53,7 @@ import kotlinx.datetime.Instant
 import okhttp3.Headers
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -93,9 +94,14 @@ import org.junit.Test
  *    otherwise goes on, counted only for its own round, never for a newer budget of the key.
  *  - The test clock fails a row whose timer re-arms more than 1000 times within one virtual millisecond.
  *
- * Not here: catalog recovery and its deadline (RT03b-2), RT05 triggers and a new cycle after a stop (RT03b-3), the unconfirmed
- * 200 of a cache-port coordinator (P09, in GraphV2RequestCoordinatorReGateTest). The implementation thread reads but does not
- * edit this file.
+ * S4 RT03b-2a (rows K01-K06, rt03b2_api_agreed.r2 §2.1): with a recorder, a context change within the data scope of the
+ * last context since the last USER end asks for no catalog, now or deferred to the floor; another scope, a USER end and the
+ * first context keep the initial request. A synchronization without a context keeps that scope only for its own scope, so a
+ * scope seen first without a context stays initial. Without a recorder a context change still asks, as before.
+ *
+ * Not here: a round waiting for its catalog and the catalog's deadline (RT03b-2b), RT05 triggers and a new cycle after a
+ * stop (RT03b-3), the unconfirmed 200 of a cache-port coordinator (P09, in GraphV2RequestCoordinatorReGateTest). The
+ * implementation thread reads but does not edit this file.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphRecoveryBudgetContractTest {
@@ -416,6 +422,217 @@ class GraphRecoveryBudgetContractTest {
         f.coordinator.onContextChanged(); runCurrent()
     }
 
+    // --- S4 RT03b-2a: catalogs on a context change (rows K01-K06, rt03b2_api_agreed.r2 §2.1) ---------------------------
+
+    /**
+     * K01: a context change within the last data scope - a P4 round trip, a new grant, a scope gone and back - asks for no
+     * catalog; a later Refresh does. Without a recorder a context change still asks, as before.
+     */
+    @Test fun K01_aSameScopeContextChangeAsksNoCatalog() = budgetTest {
+        val f = ready()
+        val before = f.catalogTimes().size
+        roundTrip(f)
+        f.fence = sessionFence(grant = 8); f.coordinator.onContextChanged(); runCurrent()
+        f.fence = null; f.coordinator.onContextChanged(); runCurrent()
+        f.fence = sessionFence(grant = 8); f.coordinator.onContextChanged(); runCurrent()
+        // Two steps without a context in a row (the use withheld, then no fence) keep the scope too.
+        f.allowed = false; f.coordinator.onContextChanged(); runCurrent()
+        f.fence = null; f.coordinator.onContextChanged(); runCurrent()
+        f.allowed = true; f.fence = sessionFence(grant = 9); f.coordinator.onContextChanged(); runCurrent()
+        assertNull("premise: the catalog was dropped", f.state.catalog)
+        assertEquals("no catalog from a same-scope change", before, f.catalogTimes().size)
+        f.coordinator.onRefreshRequested(force = false); runCurrent()
+        assertEquals("a refresh asks for it", before + 1, f.catalogTimes().size)
+
+        val none = ready(withRecorder = false)
+        val n = none.catalogTimes().size
+        roundTrip(none)
+        assertEquals("without a recorder a context change still asks", n + 1, none.catalogTimes().size)
+    }
+
+    /**
+     * K02: another non-null scope, a USER end - also one read while no scope is published - and the first context keep the
+     * initial request with its catalog.
+     */
+    @Test fun K02_aNewScopeAUserEndAndTheFirstContextAskForTheCatalog() = budgetTest {
+        // Grant renewals change the context in one synchronization, so they show which scope was kept.
+        val f = ready()
+        val n0 = f.catalogTimes().size
+        f.fence = sessionFence(epoch = "e2"); f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("another scope", n0 + 1, f.catalogTimes().size)
+        f.fence = sessionFence(epoch = "e2", grant = 8); f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("then a grant renewal within it", n0 + 1, f.catalogTimes().size)
+        f.fence = sessionFence(epoch = "e1"); f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("an earlier scope again is another scope", n0 + 2, f.catalogTimes().size)
+        f.userEnd = 1L; f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("a USER end in the same scope", n0 + 3, f.catalogTimes().size)
+        f.fence = sessionFence(epoch = "e1", grant = 9); f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("the scope is kept again after a USER end", n0 + 3, f.catalogTimes().size)
+        f.fence = null; f.coordinator.onContextChanged(); runCurrent()
+        assertNull("premise: no scope before the USER end", f.state.dataScope)
+        f.userEnd = 2L; f.coordinator.onContextChanged(); runCurrent()
+        f.fence = sessionFence(epoch = "e1"); f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("a USER end read while no scope resets the earlier same scope", n0 + 4, f.catalogTimes().size)
+        f.fence = sessionFence(epoch = "e1", grant = 10); f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("and that scope is kept", n0 + 4, f.catalogTimes().size)
+
+        val g = Fixture(this, withRecorder = true).also { opened += it }
+        g.autoCatalog = catalogOk
+        g.fence = null
+        g.coordinator.start(); runCurrent()
+        g.coordinator.onActivated(USD_3M); runCurrent()
+        assertEquals("premise: nothing without a context", 0, g.catalogTimes().size)
+        g.fence = sessionFence(); g.coordinator.onContextChanged(); runCurrent()
+        assertEquals("the first context", 1, g.catalogTimes().size)
+        g.fence = sessionFence(grant = 8); g.coordinator.onContextChanged(); runCurrent()
+        assertEquals("the first context's scope is kept", 1, g.catalogTimes().size)
+    }
+
+    /**
+     * K03: a same-scope context change under the floor defers its tab only: the Wake at the floor sends no catalog. An
+     * unforced Refresh deferred after it under the same floor brings the catalog back.
+     */
+    @Test fun K03_aSameScopeChangeUnderTheFloorDefersNoCatalog() = budgetTest {
+        val f = shortCatalog()
+        f.catalogSequence(
+            { it.catalog.complete(ok(catalog(ttlSeconds = 1))) },
+            { it.catalog.complete(status(429, "5")) },
+            { it.catalog.complete(ok(catalog(ttlSeconds = 1))) }
+        )
+        f.autoTab = { it.tab.complete(ok(threeMonthTab())) }
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        step(1_500.milliseconds)
+        f.coordinator.onRefreshRequested(force = false); runCurrent()
+        assertEquals("premise: the refresh's catalog met a 429 (floor at 6.5 s)", listOf(0L, 1_500L), f.catalogTimes())
+        step(1_500.milliseconds)
+        // The scope gone and back clears the entry, so the same-scope change needs the tab (deferred to the floor).
+        f.fence = null; f.coordinator.onContextChanged(); runCurrent()
+        f.fence = sessionFence(); f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("premise: nothing under the floor", listOf(0L, 1_500L), f.tabTimes(USD_3M))
+        step(4.seconds)
+        assertEquals("the deferred tab at the floor", listOf(0L, 1_500L, 6_500L), f.tabTimes(USD_3M))
+        assertEquals("without a catalog", listOf(0L, 1_500L), f.catalogTimes())
+        f.coordinator.onRefreshRequested(force = false); runCurrent()
+        assertEquals("a refresh asks for it", listOf(0L, 1_500L, 7_000L), f.catalogTimes())
+
+        // An unforced Refresh deferred after it under the same floor brings the catalog back into the deferred demand.
+        val g = shortCatalog()
+        g.catalogSequence(
+            { it.catalog.complete(ok(catalog(ttlSeconds = 1))) },
+            { it.catalog.complete(status(429, "5")) },
+            { it.catalog.complete(ok(catalog(ttlSeconds = 1))) }
+        )
+        g.autoTab = { it.tab.complete(ok(threeMonthTab())) }
+        g.coordinator.onActivated(USD_3M); runCurrent()
+        step(1_500.milliseconds)
+        g.coordinator.onRefreshRequested(force = false); runCurrent()
+        step(1_500.milliseconds)
+        g.fence = null; g.coordinator.onContextChanged(); runCurrent()
+        g.fence = sessionFence(); g.coordinator.onContextChanged(); runCurrent()
+        step(500.milliseconds)
+        g.coordinator.onRefreshRequested(force = false); runCurrent()
+        step(3_500.milliseconds)
+        assertEquals("the merged demand at the floor", listOf(0L, 1_500L, 6_500L), g.tabTimes(USD_3M))
+        assertEquals("with the Refresh's catalog", listOf(0L, 1_500L, 6_500L), g.catalogTimes())
+
+        // With the tab still fresh, a round trip under the floor defers nothing at all.
+        val h = ready()
+        h.coordinator.onRefreshRequested(force = true); runCurrent()
+        h.tabs(USD_3M).last().tab.complete(status(429, "2")); runCurrent()
+        roundTrip(h)
+        val c = h.catalogTimes()
+        step(3.seconds)
+        assertEquals("no catalog at the floor", c, h.catalogTimes())
+    }
+
+    /** K04: repeated round trips ask for no catalog; the budget's next round asks for one in its own slot. */
+    @Test fun K04_roundTripsAskNoCatalogAndARoundUsesItsSlot() = budgetTest {
+        val f = ready()
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        val n0 = f.catalogTimes().size
+        step(1.seconds)
+        repeat(5) { roundTrip(f) }
+        assertEquals("no catalog storm", n0, f.catalogTimes().size)
+        step(2.seconds)
+        assertEquals("the round's own catalog", n0 + 1, f.catalogTimes().size)
+        assertEquals("at the round", 3_000L, f.catalogTimes().last())
+        assertEquals(secs(0, 3), f.tabTimes())
+    }
+
+    /**
+     * K05: only the context change notification is silent. An Activate after it, and a Refresh or a budget round's Wake that
+     * synchronizes the change itself, ask for the catalog under their own conditions.
+     */
+    @Test fun K05_otherTriggersStillAskForTheCatalog() = budgetTest {
+        val f = ready()
+        val n = f.catalogTimes().size
+        roundTrip(f)
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        assertEquals("an Activate after a silent change", n + 1, f.catalogTimes().size)
+
+        val g = ready()
+        val m = g.catalogTimes().size
+        g.fence = sessionFence(grant = 8); g.coordinator.onRefreshRequested(force = false); runCurrent()
+        assertEquals("a Refresh that reads the change itself", m + 1, g.catalogTimes().size)
+        g.coordinator.onContextChanged(); runCurrent()
+        assertEquals("the later notification finds nothing changed", m + 1, g.catalogTimes().size)
+
+        val h = ready()
+        h.tabSequence(fail503)
+        h.coordinator.onActivated(USD_1D); runCurrent()
+        val k = h.catalogTimes().size
+        step(1.seconds)
+        h.invalidations++
+        step(2.seconds)
+        assertEquals("a round whose Wake reads the change", k + 1, h.catalogTimes().size)
+        assertEquals(secs(0, 3), h.tabTimes())
+    }
+
+    /**
+     * K06: only a synchronization that obtains a context records its scope. A scope first seen while the use is withheld, a
+     * USER end read while it is withheld, and another scope seen only without a context leave the next context initial. A
+     * withheld step of the kept scope keeps it (K01).
+     */
+    @Test fun K06_aScopeSeenWithoutAContextLeavesTheNextContextInitial() = budgetTest {
+        val f = Fixture(this, withRecorder = true).also { opened += it }
+        f.autoCatalog = catalogOk
+        f.allowed = false
+        f.coordinator.start(); runCurrent()
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        assertEquals("premise: the scope is published", SCOPE, f.state.dataScope)
+        assertNull("premise: without a context", f.state.source)
+        assertEquals("premise: nothing without a context", 0, f.catalogTimes().size)
+        f.allowed = true; f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("the first context of a scope seen without one", 1, f.catalogTimes().size)
+        f.fence = sessionFence(grant = 8); f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("then that scope is kept", 1, f.catalogTimes().size)
+
+        val g = ready()
+        val n = g.catalogTimes().size
+        g.allowed = false; g.userEnd = 1L; g.coordinator.onContextChanged(); runCurrent()
+        assertEquals("premise: the scope is published", SCOPE, g.state.dataScope)
+        assertNull("premise: the USER end read without a context", g.state.source)
+        g.allowed = true; g.invalidations++; g.coordinator.onContextChanged(); runCurrent()
+        assertEquals("a USER end read while the use is withheld", n + 1, g.catalogTimes().size)
+        g.fence = sessionFence(grant = 8); g.coordinator.onContextChanged(); runCurrent()
+        assertEquals("then that scope is kept", n + 1, g.catalogTimes().size)
+
+        val h = ready()
+        val m = h.catalogTimes().size
+        h.allowed = false; h.fence = sessionFence(epoch = "e2"); h.coordinator.onContextChanged(); runCurrent()
+        assertNull("premise: e2 seen without a context", h.state.source)
+        h.allowed = true; h.coordinator.onContextChanged(); runCurrent()
+        assertEquals("another scope seen first without a context", m + 1, h.catalogTimes().size)
+        // e2 is the kept scope; e1 seen without a context in between makes the next e2 context initial again.
+        h.allowed = false; h.fence = sessionFence(epoch = "e1"); h.coordinator.onContextChanged(); runCurrent()
+        assertNull("premise: e1 seen without a context", h.state.source)
+        h.allowed = true; h.fence = sessionFence(epoch = "e2", grant = 9); h.coordinator.onContextChanged(); runCurrent()
+        assertEquals("the kept scope again after another seen without a context", m + 2, h.catalogTimes().size)
+        h.fence = sessionFence(epoch = "e2", grant = 10); h.coordinator.onContextChanged(); runCurrent()
+        assertEquals("then that scope is kept", m + 2, h.catalogTimes().size)
+    }
+
     // --- P01 -----------------------------------------------------------------------------------------------------
 
     /**
@@ -577,7 +794,8 @@ class GraphRecoveryBudgetContractTest {
         step(500.seconds)
         assertEquals("the same round at the floor; six in all", secs(0, 33, 39, 51, 75, 123), w.tabTimes())
 
-        // Captures: 1 the first tab, 2 round 2's tab, 3 the context's own catalog, 4 round 3's tab.
+        // Captures: 1 the first tab, 2 round 2's tab, 3 round 3's own catalog (the round trip dropped the catalog and a
+        // same-scope change asks for none, S4 RT03b-2a), 4 round 3's tab.
         val v = ready()
         v.coordinator.onActivated(USD_1D); runCurrent()
         v.tabs()[0].tab.complete(status(503)); runCurrent()
@@ -586,6 +804,7 @@ class GraphRecoveryBudgetContractTest {
         val late = v.hold(4)
         roundTrip(v)
         assertEquals("premise: round 3's tab capture is held", 4, v.captures)
+        assertEquals("premise: round 3's own catalog went", listOf(0L, 3_000L), v.catalogTimes())
         v.tabs()[1].tab.complete(status(429, "30")); runCurrent()
         late.complete(Unit); runCurrent()
         assertTrue("premise: round 3's tab waits for the floor", USD_1D in v.state.inFlight)
@@ -595,7 +814,10 @@ class GraphRecoveryBudgetContractTest {
         assertTrue("premise: withdrawn by the key switch", USD_1D !in v.state.inFlight)
         v.coordinator.onActivated(USD_1D); runCurrent()
         step(500.seconds)
-        assertEquals("round 3 again at the floor, uncounted until then", secs(0, 3, 33, 39, 51, 75), v.tabTimes())
+        assertEquals(
+            "round 3's tab again at the floor, the round counted once by its catalog",
+            secs(0, 3, 33, 39, 51, 75), v.tabTimes()
+        )
     }
 
     /**
@@ -960,14 +1182,9 @@ class GraphRecoveryBudgetContractTest {
         val f = bare()
         f.tabSequence(fail503)
         f.coordinator.onActivated(USD_1D); runCurrent()
-        // Captures: 1-2 the first catalog and tab, 3-4 the second round's; 5 the context change's own catalog.
-        f.captureFails = { n ->
-            when (n) {
-                4 -> AuthUnavailableException("offline")
-                5 -> IOException("reset")
-                else -> null
-            }
-        }
+        // Captures: 1-2 the first catalog and tab, 3-4 the second round's. A same-scope context change asks for no catalog
+        // (S4 RT03b-2a), so the catalog stays absent when the round's tab goes again.
+        f.captureFails = { n -> if (n == 4) AuthUnavailableException("offline") else null }
         step(3.seconds)
         assertEquals("premise: the round's catalog went, its tab did not", secs(0, 3), f.catalogTimes())
         assertEquals(listOf(0L), f.tabTimes())
@@ -1186,16 +1403,18 @@ class GraphRecoveryBudgetContractTest {
     }
 
     /**
-     * P17: a Wake for another reason - a context change's catalog demand deferred to the floor - issues no round that the
+     * P17: a Wake for another reason - a dropped catalog's demand deferred to the floor - issues no round that the
      * budget's own timer would not: not (i) before its deadline, (ii) once stopped, or (iii) while held.
      */
     @Test fun P17_anotherWakeIssuesNoRoundTheBudgetWouldNot() = budgetTest {
-        // A forced outside request's 429 sets the floor; a round trip under it defers the dropped catalog's request.
+        // A forced outside request's 429 sets the floor; after a round trip drops the catalog, an unforced Refresh under the
+        // floor defers the catalog's request (a same-scope context change itself asks for none, S4 RT03b-2a).
         fun TestScope.deferUnderTheFloor(f: Fixture, retryAfter: String) {
             f.coordinator.onRefreshRequested(force = true); runCurrent()
             f.tabs().last().tab.complete(status(429, retryAfter)); runCurrent()
             step(500.milliseconds)
             roundTrip(f)
+            f.coordinator.onRefreshRequested(force = false); runCurrent()
         }
 
         val i = ready()
@@ -1365,6 +1584,7 @@ class GraphRecoveryBudgetContractTest {
         step(1.seconds)
         g.autoCatalog = { it.catalog.complete(ok(catalog(usdOneDay = false, ttlSeconds = 1))) }
         roundTrip(g)
+        g.coordinator.onRefreshRequested(force = false); runCurrent()
         assertTrue("premise: usd 1d is unsupported",
             GraphPeriod.ONE_DAY !in g.state.catalog!!.tabs.getValue("usd").periods)
 
