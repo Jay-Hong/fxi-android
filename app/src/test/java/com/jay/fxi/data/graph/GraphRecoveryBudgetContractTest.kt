@@ -14,6 +14,7 @@ import com.jay.fxi.data.remote.AuthenticatedFailureKind
 import com.jay.fxi.data.remote.AuthenticatedHttpFailure
 import com.jay.fxi.data.remote.AuthenticatedHttpResponse
 import com.jay.fxi.data.remote.TopicGrantToken
+import com.jay.fxi.data.remote.TopicGraphRecoveryPermit
 import com.jay.fxi.data.remote.TopicGraphCandidate
 import com.jay.fxi.data.remote.TopicGraphInput
 import com.jay.fxi.data.remote.TopicGraphPath
@@ -21,6 +22,7 @@ import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.remote.TopicUseAttribution
 import com.jay.fxi.data.remote.TopicUseAuthority
 import com.jay.fxi.data.remote.TopicUseLifetime
+import com.jay.fxi.data.remote.TopicUseWithheldException
 import com.jay.fxi.data.remote.dto.GraphV2CatalogPeriod
 import com.jay.fxi.data.remote.dto.GraphV2CatalogResponse
 import com.jay.fxi.data.remote.dto.GraphV2CatalogTab
@@ -52,6 +54,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.datetime.Instant
 import okhttp3.Headers
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -122,7 +125,19 @@ import org.junit.Test
  * held). A trigger sends nothing itself. A first round that joins an outside tab keeps rung 0 and uses the first gap; an old
  * cycle's departed tab still out is joined the same way (its answer settles that round as a join).
  *
- * Not here: the P7 permit (RT03b-3b), the unconfirmed 200 of a cache-port coordinator (P09,
+ * S4 RT03b-3b (rows PM01-PM11, rt03b3_api_agreed.r4 §4): with a permit supplier installed, a round is issued, and its own
+ * requests are sent and replayed, only while the live permit admits them: it exists, it is automatic, its fence is the
+ * published fence and the request's context fence, and under a re-approval a live Connection's lifetime is the context's
+ * and admitted. The due round reads its demand first (None still removes the budget). A round's own request refused before
+ * its send is withdrawn uncounted; one refused by the transport after its departure spends its slot. Either way the budget
+ * waits on the publication that refused it - (session, revision, context) - without a timer loop, and goes on, with its
+ * deadline and counters kept, once a notice finds the publication changed or the context changes. A budget parked on the
+ * permit does not hold back its key's unforced requests of the same context; a context change ends the wait, so that
+ * change's own unforced request is held back until the next due Wake judges the permit for the new context (and is not
+ * issued again if the budget parks again). Initial, Refresh and Activate requests and requests the round did
+ * not issue are not gated; neither is applying a sent answer; close reads no permit. Without a supplier nothing changes.
+ *
+ * Not here: the unconfirmed 200 of a cache-port coordinator (P09,
  * in GraphV2RequestCoordinatorReGateTest). The implementation thread reads but does not edit this file.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -143,13 +158,14 @@ class GraphRecoveryBudgetContractTest {
             TopicSessionFence(AuthIdentityFence("u1", 1L), epoch, TopicGrantToken(grant))
     }
 
-    private class Sent(val kind: String, val key: GraphKey?, val admittedAtSend: Boolean, val atMs: Long) {
+    /** [recheck] is the transport's send check, asked again later as a replay would. */
+    private class Sent(val kind: String, val key: GraphKey?, val admittedAtSend: Boolean, val atMs: Long, val recheck: () -> Boolean) {
         val tab = CompletableDeferred<AuthenticatedHttpResponse<GraphV2TabResponse>>()
         val catalog = CompletableDeferred<AuthenticatedHttpResponse<GraphV2CatalogResponse>>()
     }
 
     /** GraphV2RecoveryRequestContractTest's fixture with one access supplier for all three readers, plus capture control. */
-    private class Fixture(test: TestScope, withRecorder: Boolean) {
+    private class Fixture(test: TestScope, withRecorder: Boolean, withPermit: Boolean = false) {
         val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(test.testScheduler))
         private val base = test.testScheduler.currentTime
         var fence: TopicSessionFence? = sessionFence()
@@ -157,6 +173,11 @@ class GraphRecoveryBudgetContractTest {
         var invalidations = 0L
         var userEnd: Long? = null
         var jitter: Duration = Duration.ZERO
+        /** The session's P7 permit, read live when the coordinator was built with a permit supplier. */
+        var permit: TopicGraphRecoveryPermit? = null
+        /** Reads of the permit supplier; [onPermitRead] runs inside each read, after the value is taken. */
+        var permitReads = 0
+        var onPermitRead: (() -> Unit)? = null
         /** The recorder's admission alone; the coordinator's protected admission stays open. */
         var recorderOpen = true
         /** The coordinator's next access read throws once, failing that event's handling. */
@@ -204,7 +225,7 @@ class GraphRecoveryBudgetContractTest {
                 owner: AuthSnapshot,
                 useAdmitted: () -> Boolean
             ): AuthenticatedHttpResponse<GraphV2CatalogResponse> {
-                val s = Sent("catalog", null, useAdmitted(), now())
+                val s = Sent("catalog", null, useAdmitted(), now(), useAdmitted)
                 sent += s
                 autoCatalog?.invoke(s)
                 return s.catalog.await()
@@ -215,7 +236,7 @@ class GraphRecoveryBudgetContractTest {
                 key: GraphKey,
                 useAdmitted: () -> Boolean
             ): AuthenticatedHttpResponse<GraphV2TabResponse> {
-                val s = Sent("tab", key, useAdmitted(), now())
+                val s = Sent("tab", key, useAdmitted(), now(), useAdmitted)
                 sent += s
                 autoTab?.invoke(s)
                 return s.tab.await()
@@ -289,7 +310,17 @@ class GraphRecoveryBudgetContractTest {
                 clock = clock,
                 rateLimitJitter = { jitter },
                 onEventFailure = { failures += it },
-                recorder = if (withRecorder) recorder else null
+                recorder = if (withRecorder) recorder else null,
+                recoveryPermit = if (withPermit) {
+                    {
+                        permitReads++
+                        val p = permit
+                        onPermitRead?.invoke()
+                        p
+                    }
+                } else {
+                    null
+                }
             )
         }
 
@@ -412,21 +443,22 @@ class GraphRecoveryBudgetContractTest {
     }
 
     /** Started, with the catalog adopted through a settled usd 3m request; kb exists with closed losses at B1 and B2. */
-    private fun TestScope.ready(withRecorder: Boolean = true, catalogTtl: Int = 172800): Fixture = Fixture(this, withRecorder).also { f ->
-        opened += f
-        f.autoCatalog = { it.catalog.complete(ok(catalog(ttlSeconds = catalogTtl))) }
-        f.coordinator.start(); runCurrent()
-        f.coordinator.onActivated(USD_3M); runCurrent()
-        f.tabs(USD_3M).single().tab.complete(ok(threeMonthTab())); runCurrent()
-        assertNotNull("premise: catalog adopted", f.state.catalog)
-        f.recorder.observe(f.quote("kb", NOON - 5.seconds))
-        f.lose("kb", B1 + 60.seconds)
-        f.lose("kb", B2 + 60.seconds)
-        assertTrue("premise: kb has losses at B1 and B2", B1 in f.series(KB).pending && B2 in f.series(KB).pending)
-        // The rows number captures from their own first request.
-        f.captures = 0
-        f.captureTimes.clear()
-    }
+    private fun TestScope.ready(withRecorder: Boolean = true, catalogTtl: Int = 172800, withPermit: Boolean = false): Fixture =
+        Fixture(this, withRecorder, withPermit).also { f ->
+            opened += f
+            f.autoCatalog = { it.catalog.complete(ok(catalog(ttlSeconds = catalogTtl))) }
+            f.coordinator.start(); runCurrent()
+            f.coordinator.onActivated(USD_3M); runCurrent()
+            f.tabs(USD_3M).single().tab.complete(ok(threeMonthTab())); runCurrent()
+            assertNotNull("premise: catalog adopted", f.state.catalog)
+            f.recorder.observe(f.quote("kb", NOON - 5.seconds))
+            f.lose("kb", B1 + 60.seconds)
+            f.lose("kb", B2 + 60.seconds)
+            assertTrue("premise: kb has losses at B1 and B2", B1 in f.series(KB).pending && B2 in f.series(KB).pending)
+            // The rows number captures from their own first request.
+            f.captures = 0
+            f.captureTimes.clear()
+        }
 
     /** Started with a recorder and no catalog; every catalog fails with 503 unless the row says otherwise. */
     private fun TestScope.bare(): Fixture = Fixture(this, withRecorder = true).also { f ->
@@ -1401,6 +1433,375 @@ class GraphRecoveryBudgetContractTest {
         assertEquals("its completion lets the new round go", 105_000L, f.tabTimes().last())
         step(200.seconds)
         assertEquals(secs(0, 3, 9, 21, 45, 105, 108, 114, 126, 150, 198), f.tabTimes())
+    }
+
+    // --- S4 RT03b-3b: the P7 permit (rows PM01-PM11, rt03b3_api_agreed.r4 §4) -----------------------------------------
+
+    private val session = Any()
+
+    /** An automatic permit of [session] for [f]'s published fence and a grant that is not re-approved, unless overridden. */
+    private fun permit(
+        f: Fixture,
+        revision: Long,
+        automatic: Boolean = true,
+        reapproved: Boolean = false,
+        connection: TopicUseLifetime? = null,
+        fence: TopicSessionFence = checkNotNull(f.fence),
+        sessionKey: Any = session
+    ) = TopicGraphRecoveryPermit(sessionKey, revision, fence, 1L, reapproved, connection?.let { 1L }, connection, automatic)
+
+    /** Publishes [p] and tells the coordinator, as the session's collector will. */
+    private fun TestScope.publish(f: Fixture, p: TopicGraphRecoveryPermit?) {
+        f.permit = p
+        f.coordinator.onRecoveryPermitChanged(); runCurrent()
+    }
+
+    /**
+     * PM01: with a permit supplier installed, a round is issued only while the permit admits it. A null permit parks the
+     * budget without a request or a timer loop, while the key's initial request and a forced Refresh go ungated. Once the
+     * permit opens, the round goes with its kept deadline and counters.
+     */
+    @Test fun PM01_aRoundWaitsForThePermit() = budgetTest {
+        val f = ready(withPermit = true)
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        step(60.seconds)
+        assertEquals("the initial request went; the round waits", listOf(0L), f.tabTimes())
+        assertEquals("the round was not issued: no capture of its own", 1, f.captures)
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        assertEquals("a forced Refresh is not gated", secs(0, 60), f.tabTimes())
+        publish(f, permit(f, 1))
+        assertEquals("the round at once: its 3 s deadline is past", secs(0, 60, 60), f.tabTimes())
+        step(10.seconds)
+        assertEquals("its kept rung: the next round 6 s later", secs(0, 60, 60, 66), f.tabTimes())
+    }
+
+    /** PM02: only an automatic permit for the published fence admits. */
+    @Test fun PM02_onlyAnAutomaticPermitOfTheCurrentFenceAdmits() = budgetTest {
+        val f = ready(withPermit = true)
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        publish(f, permit(f, 1, fence = sessionFence(grant = 8)))
+        step(10.seconds)
+        publish(f, permit(f, 2, automatic = false))
+        step(10.seconds)
+        assertEquals("another fence or not automatic: no round", listOf(0L), f.tabTimes())
+        publish(f, permit(f, 3))
+        assertEquals(secs(0, 20), f.tabTimes())
+
+        // A wait belongs to its context: reaching the permit's fence lets the round go without a notice.
+        val g = ready(withPermit = true)
+        g.tabSequence(fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        publish(g, permit(g, 1, fence = sessionFence(grant = 8)))
+        step(10.seconds)
+        assertEquals("premise: waiting", listOf(0L), g.tabTimes())
+        g.fence = sessionFence(grant = 8); g.coordinator.onContextChanged(); runCurrent()
+        assertEquals("the new context's round goes", secs(0, 10), g.tabTimes())
+
+        // Each fence check alone, at a transport check: the published fence moves while the permit is read.
+        val k = ready(withPermit = true)
+        publish(k, permit(k, 1))
+        k.tabSequence(fail503)
+        k.coordinator.onActivated(USD_1D); runCurrent()
+        k.autoTab = null
+        step(3.seconds)
+        val round = k.tabs().last()
+        k.onPermitRead = { k.fence = sessionFence(grant = 8) }
+        assertFalse("a permit of the round's fence while the published fence moved", round.recheck())
+        k.fence = sessionFence()
+        k.permit = permit(k, 2, fence = sessionFence(grant = 8))
+        assertFalse("a permit of the published fence, not the round's", round.recheck())
+        k.onPermitRead = null
+        k.fence = sessionFence()
+    }
+
+    /**
+     * PM03 (Q05): under a re-approval only a live Connection of the current grant whose lifetime is the round's context
+     * admits. No Connection (backoff, offline, a refused connect) waits; a Connection made before a P4 round trip does not
+     * admit; a Connection that ends closes the permit for the next round.
+     */
+    @Test fun PM03_aReapprovalWaitsForItsConnection() = budgetTest {
+        val f = ready(withPermit = true)
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        publish(f, permit(f, 1, reapproved = true))
+        step(10.seconds)
+        assertEquals("no Connection: no round", listOf(0L), f.tabTimes())
+        val old = f.lifetime()
+        roundTrip(f)
+        publish(f, permit(f, 2, reapproved = true, connection = old))
+        step(10.seconds)
+        assertEquals(
+            "a Connection of the use before the round trip does not admit, and the round trip's own request is held back",
+            listOf(0L), f.tabTimes()
+        )
+        publish(f, permit(f, 3, reapproved = true, connection = f.lifetime()))
+        assertEquals("the current use's Connection admits", secs(0, 20), f.tabTimes())
+        publish(f, permit(f, 4, reapproved = true))
+        step(30.seconds)
+        assertEquals("the Connection ended: the next round waits", secs(0, 20), f.tabTimes())
+
+        // Under a re-approval the Connection's use must still be admitted when the permit is read.
+        val g = ready(withPermit = true)
+        g.tabSequence(fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        publish(g, permit(g, 1, reapproved = true, connection = g.lifetime()))
+        g.autoTab = null
+        step(3.seconds)
+        val round = g.tabs().last()
+        assertTrue("premise: the round's tab went", round.admittedAtSend && round.recheck())
+        g.onPermitRead = { g.allowed = false }
+        assertFalse("a use withheld while the permit is read is refused", round.recheck())
+        g.onPermitRead = null
+        g.allowed = true
+    }
+
+    /**
+     * PM04: a round's own request is checked again at the send boundary. A permit closed while its capture ran withdraws it
+     * unsent and uncounted, and the budget waits on the permit, not on the context: a permit opening again lets the same
+     * round send it. A withdrawal with the permit open is still an ordinary withdrawal hold.
+     */
+    @Test fun PM04_aClosedPermitWithdrawsAtTheBoundary() = budgetTest {
+        val f = ready(withPermit = true)
+        f.tabSequence(fail503)
+        publish(f, permit(f, 1))
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        val held = f.hold(2)
+        step(3.seconds)
+        f.permit = null
+        held.complete(Unit); runCurrent()
+        assertEquals("withdrawn unsent", listOf(0L), f.tabTimes())
+        step(30.seconds)
+        assertEquals("waiting on the permit", listOf(0L), f.tabTimes())
+        publish(f, permit(f, 2))
+        step(200.seconds)
+        assertEquals("six counted rounds: the withdrawn one did not count", secs(0, 33, 39, 51, 75, 123), f.tabTimes())
+
+        val g = ready(withPermit = true)
+        g.tabSequence(fail503)
+        publish(g, permit(g, 1))
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        g.captureFails = { n -> if (n == 2) AuthUnavailableException("offline") else null }
+        step(3.seconds)
+        assertEquals("premise: the round's capture went offline", 2, g.captures)
+        publish(g, permit(g, 2))
+        step(30.seconds)
+        assertEquals("a withdrawal with the permit open is not released by a permit change", 2, g.captures)
+    }
+
+    /**
+     * PM05: the transport checks the permit at every send and replay of a round's own request; the round's answer is still
+     * applied once the permit closes (the permit is no apply authority). A request the round did not issue is not gated.
+     */
+    @Test fun PM05_theTransportChecksThePermitAtEverySend() = budgetTest {
+        val f = ready(withPermit = true)
+        publish(f, permit(f, 1))
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        f.autoTab = null
+        step(3.seconds)
+        val round = f.tabs().last()
+        assertTrue("premise: the round's tab went", round.admittedAtSend && round.recheck())
+        f.permit = null
+        assertFalse("a replay of the round's own tab is refused", round.recheck())
+        round.tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1, B2))))); runCurrent()
+        assertTrue("its answer is still applied", B2 !in f.series(KB).pending)
+
+        val g = ready(withPermit = true)
+        g.autoTab = null
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        val initial = g.tabs().single()
+        assertTrue("the initial request is not gated, nor its replay", initial.admittedAtSend && initial.recheck())
+
+        // The round's own request stays its own even when a resumed round joins it (RT03b-3a): still gated.
+        val m = ready(withPermit = true)
+        publish(m, permit(m, 1))
+        m.tabSequence(fail503)
+        m.coordinator.onActivated(USD_1D); runCurrent()
+        step(3.seconds)
+        m.autoTab = null
+        step(6.seconds)
+        val cut = m.tabs().last()
+        assertTrue("premise: the third round's tab is out", cut.atMs == 9_000L && cut.recheck())
+        m.accessThrowsOnce = true
+        m.coordinator.onRefreshRequested(force = false); runCurrent()
+        fire(m, 1)
+        assertEquals("premise: the resumed round joined it", secs(0, 3, 9), m.tabTimes())
+        m.permit = null
+        assertFalse("still a round's own request", cut.recheck())
+
+        // An outside request a round joined keeps its own conditions.
+        val h = ready(withPermit = true)
+        publish(h, permit(h, 1))
+        h.tabSequence(fail503)
+        h.coordinator.onActivated(USD_1D); runCurrent()
+        h.autoTab = null
+        step(2.seconds)
+        h.coordinator.onRefreshRequested(force = true); runCurrent()
+        val outside = h.tabs().last()
+        step(1.seconds)
+        assertEquals("premise: the round joined the outside tab", secs(0, 2), h.tabTimes())
+        h.permit = null
+        assertTrue("a joined outside request is not gated", outside.recheck())
+    }
+
+    /** PM06: a budget waiting on the permit reads it again when another session publishes, even with the same revision. */
+    @Test fun PM06_anotherSessionsPermitIsNewWithTheSameRevision() = budgetTest {
+        val f = ready(withPermit = true)
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        publish(f, permit(f, 1, automatic = false))
+        step(10.seconds)
+        assertEquals(listOf(0L), f.tabTimes())
+        publish(f, permit(f, 1, sessionKey = Any()))
+        assertEquals("a new session's permit with the same revision lets the round go", secs(0, 10), f.tabTimes())
+    }
+
+    /**
+     * PM07: a round's own request refused by the transport after its departure spends its slot and waits on the
+     * publication that refused it, even when a newer permit is already out by the time its completion is handled.
+     */
+    @Test fun PM07_aTransportRefusalSpendsItsSlotAndWaitsOnThePermit() = budgetTest {
+        val f = ready(withPermit = true)
+        publish(f, permit(f, 1))
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        f.autoTab = null
+        step(3.seconds)
+        val round = f.tabs().last()
+        f.permit = null
+        assertFalse("premise: its replay is refused", round.recheck())
+        publish(f, permit(f, 2))
+        f.autoTab = fail503
+        round.tab.completeExceptionally(TopicUseWithheldException(emptyList())); runCurrent()
+        step(200.seconds)
+        assertEquals("the refused round spent its slot; the next goes at once", secs(0, 3, 3, 9, 21, 45), f.tabTimes())
+
+        val g = ready(withPermit = true)
+        publish(g, permit(g, 1))
+        g.tabSequence(fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        g.autoTab = null
+        step(3.seconds)
+        val r = g.tabs().last()
+        g.permit = null
+        assertFalse("premise: its replay is refused", r.recheck())
+        g.autoTab = fail503
+        r.tab.completeExceptionally(TopicUseWithheldException(emptyList())); runCurrent()
+        step(30.seconds)
+        assertEquals("waiting on the permit", secs(0, 3), g.tabTimes())
+        publish(g, permit(g, 2))
+        step(200.seconds)
+        assertEquals("a departed slot is not returned", secs(0, 3, 33, 39, 51, 75), g.tabTimes())
+    }
+
+    /** PM08: close reads no permit, even with a round's own request registered. */
+    @Test fun PM08_closeReadsNoPermit() = budgetTest {
+        val f = ready(withPermit = true)
+        publish(f, permit(f, 1))
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        f.hold(2)
+        step(3.seconds)
+        assertEquals("premise: the round's capture is held", 2, f.captures)
+        val reads = f.permitReads
+        f.coordinator.close()
+        assertEquals(reads, f.permitReads)
+    }
+
+    /**
+     * PM09: a judgment reads the permit once. A publication that arrives during that read is not swallowed (its notice lets
+     * the round go), and the wait a budget records is the publication that refused it, so a newer one found before the next
+     * Wake does not count as parked.
+     */
+    @Test fun PM09_aPublicationRacingTheJudgmentIsNotSwallowed() = budgetTest {
+        val f = ready(withPermit = true)
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        f.onPermitRead = {
+            f.onPermitRead = null
+            f.permit = permit(f, 1)
+            f.coordinator.onRecoveryPermitChanged()
+        }
+        step(5.seconds)
+        assertEquals(secs(0, 3), f.tabTimes())
+
+        // The wait key is the one judgment's read: a closed publication and an Activate queued during that read find the
+        // budget not yet parked on the new publication, so the Activate is held back until the next Wake parks it.
+        val g = ready(withPermit = true)
+        g.tabSequence(fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        g.onPermitRead = {
+            g.onPermitRead = null
+            g.permit = permit(g, 1, automatic = false)
+            g.coordinator.onActivated(USD_1D)
+        }
+        step(5.seconds)
+        assertEquals("the queued Activate is held back", listOf(0L), g.tabTimes())
+
+        // The first refusal recorded on a request is its wait: a later closed revision does not park it early.
+        val h = ready(withPermit = true)
+        publish(h, permit(h, 1))
+        h.tabSequence(fail503)
+        h.coordinator.onActivated(USD_1D); runCurrent()
+        h.autoTab = null
+        step(3.seconds)
+        val round = h.tabs().last()
+        h.permit = permit(h, 2, automatic = false)
+        assertFalse("premise: refused at revision 2", round.recheck())
+        h.permit = permit(h, 3, automatic = false)
+        assertFalse("premise: refused at revision 3", round.recheck())
+        h.onPermitRead = {
+            h.onPermitRead = null
+            h.coordinator.onActivated(USD_1D)
+        }
+        h.autoTab = fail503
+        round.tab.completeExceptionally(TopicUseWithheldException(emptyList())); runCurrent()
+        assertEquals("waiting on revision 2 while 3 is out: the queued Activate is held back", secs(0, 3), h.tabTimes())
+    }
+
+    /** PM10: the due round reads its demand before the permit: None behind a closed permit still removes the budget. */
+    @Test fun PM10_noneBehindAClosedPermitRemovesTheBudget() = budgetTest {
+        val f = ready(withPermit = true)
+        f.tabSequence(partial, full)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        step(1.seconds)
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        step(10.seconds)
+        f.lose("kb", Instant.parse("2026-10-05T02:41:00Z"))
+        publish(f, permit(f, 1))
+        step(300.seconds)
+        assertEquals("None at the due round removed the budget behind the closed permit", secs(0, 1), f.tabTimes())
+    }
+
+    /** PM11: a budget parked on the permit does not hold back its key's unforced requests: a new activation fetches. */
+    @Test fun PM11_aParkedBudgetDoesNotHoldBackUnforcedRequests() = budgetTest {
+        val f = ready(withPermit = true)
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        step(10.seconds)
+        assertEquals("premise: parked", listOf(0L), f.tabTimes())
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        assertEquals("the key's own request goes", secs(0, 10), f.tabTimes())
+
+        // A settled round ends the permit wait: until its next due round the budget holds back unforced requests again.
+        val g = ready(withPermit = true)
+        publish(g, permit(g, 1))
+        g.tabSequence(fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        g.autoTab = null
+        step(3.seconds)
+        val round = g.tabs().last()
+        g.permit = null
+        assertFalse("premise: its replay is refused", round.recheck())
+        round.tab.complete(status(503)); runCurrent()
+        step(1.seconds)
+        g.coordinator.onActivated(USD_3M); runCurrent()
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        assertEquals("settled: the next round (9 s) is not yet known to wait, so the Activate is held back", secs(0, 3),
+            g.tabTimes())
     }
 
     // --- P01 -----------------------------------------------------------------------------------------------------

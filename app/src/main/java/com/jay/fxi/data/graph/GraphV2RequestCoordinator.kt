@@ -9,6 +9,7 @@ import com.jay.fxi.data.free.FreeSnapshotSchedulePolicy
 import com.jay.fxi.data.remote.AuthenticatedApiException
 import com.jay.fxi.data.remote.AuthenticatedBodyDecodingException
 import com.jay.fxi.data.remote.AuthenticatedHttpResponse
+import com.jay.fxi.data.remote.TopicGraphRecoveryPermit
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.remote.TopicUseAuthority
 import com.jay.fxi.data.remote.TopicUseLifetime
@@ -24,6 +25,7 @@ import com.jay.fxi.time.AppClock
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.seconds
@@ -134,7 +136,7 @@ internal data class GraphRequestState(
  * budget per (data scope, tab) (S4 RT03b-1b): it reads the recorder's demand on the loop, issues its
  * own forced rounds at most six times per cycle, 3/6/12/24/48 s after each completion (a valid RT05 trigger
  * resumes, reopens or opens a cycle, S4 RT03b-3a), and holds back unforced
- * requests of its key while it waits. A round that needs a catalog waits for the one already out or asks
+ * requests of its key while it waits (not while parked on the S4 RT03b-3b permit for the same context). A round that needs a catalog waits for the one already out or asks
  * for its own once; its tab goes after an applicable completion of that catalog, or once its catalog slot
  * is spent and no catalog is out, unless an outside tab it joined settles it first (S4 RT03b-2b). It survives
  * Deactivate, key switches and a missing data scope; a USER end, another non-null data scope, a
@@ -157,7 +159,12 @@ internal class GraphV2RequestCoordinator(
     private val rateLimitJitter: (tab: String) -> Duration,
     private val onEventFailure: (Throwable) -> Unit,
     private val cachePorts: GraphV2CachePorts? = null,
-    private val recorder: GraphRecorder? = null
+    private val recorder: GraphRecorder? = null,
+    /**
+     * S4 RT03b-3b: the session's live P7 permit, read on the loop and on transport threads (thread-safe, non-blocking).
+     * Null keeps every automatic recovery ungated, as before; an installed supplier that returns null closes it.
+     */
+    private val recoveryPermit: (() -> TopicGraphRecoveryPermit?)? = null
 ) {
     private data class RequestContext(val fence: TopicSessionFence, val lifetime: TopicUseLifetime)
 
@@ -204,11 +211,15 @@ internal class GraphV2RequestCoordinator(
         val activityGeneration: Long,
         /** Loop-confined; capability retirement replaces only its KRX epoch. */
         var accessCapture: GraphV2AccessCapture? = null,
-        recoveryRequests: List<GraphRecoveryRequest> = emptyList()
+        recoveryRequests: List<GraphRecoveryRequest> = emptyList(),
+        /** S4 RT03b-3b: issued directly by a recovery round; immutable, so transport threads may read it. */
+        val automaticRecovery: Boolean = false
     ) {
-        // The only request-owned mutable value consulted outside the loop. Job completion is
-        // not disposal: the response still has to pass the loop's application boundary.
+        // Request-owned mutable values touched outside the loop: [disposed] (read) and [permitRefusal] (set once by a
+        // refusing check). Job completion is not disposal: the response still has to pass the loop's application boundary.
         val disposed = AtomicBoolean(false)
+        /** S4 RT03b-3b: the first permit publication that refused this request, set by the refusing check on any thread. */
+        val permitRefusal = AtomicReference<PermitWait?>(null)
         // Everything below is loop-confined, including the final capture-to-fetch checkpoint.
         var recoveryRequests: List<GraphRecoveryRequest> = recoveryRequests
         var capturedOwner: AuthSnapshot? = null
@@ -282,7 +293,12 @@ internal class GraphV2RequestCoordinator(
         var stop: RecoveryStop? = null
         var round: RecoveryRound? = null
         var hold: RecoveryHold? = null
+        /** S4 RT03b-3b: waiting for the permit, until its publication or the context changes. */
+        var permitWait: PermitWait? = null
     }
+
+    /** S4 RT03b-3b: the permit publication a budget waits on (null session and revision: no permit) and its context. */
+    private data class PermitWait(val sessionKey: Any?, val revision: Long?, val context: RequestContext)
 
     private enum class RecoveryStop { EXHAUSTED, TERMINAL, PAUSED }
 
@@ -325,6 +341,7 @@ internal class GraphV2RequestCoordinator(
         data object ContextChanged : Event
         data class Refresh(val force: Boolean) : Event
         data class RecoveryTrigger(val trigger: GraphRecoveryTrigger) : Event
+        data object RecoveryPermitChanged : Event
         data class Captured(val registration: Registration, val result: Result<AuthSnapshot>) : Event
         data class Wake(val generation: Long) : Event
         data class CatalogFinished(
@@ -475,6 +492,8 @@ internal class GraphV2RequestCoordinator(
      * RT05 delivers a context change before a trigger built from it (otherwise that trigger is spent invalid).
      */
     fun onRecoveryTrigger(trigger: GraphRecoveryTrigger) { inbox.trySend(Event.RecoveryTrigger(trigger)) }
+    /** S4 RT03b-3b: the permit publication changed; the timer is re-armed from a fresh read. No production caller yet. */
+    fun onRecoveryPermitChanged() { inbox.trySend(Event.RecoveryPermitChanged) }
 
     /**
      * Drops selected recovery captures from registered tab requests, without suspension. It must run
@@ -788,6 +807,7 @@ internal class GraphV2RequestCoordinator(
             is Event.Captured -> onCaptured(event, now)
             is Event.Wake -> onWake(event, now)
             is Event.RecoveryTrigger -> onTrigger(event.trigger, now)
+            Event.RecoveryPermitChanged -> Unit // The common re-arm below reads the permit afresh.
             is Event.CatalogFinished -> catalogAdopted = applyCatalog(event, now)
             is Event.TabFinished -> applyTab(event, now)
             is Event.DiskSeedFinished -> applyDiskSeed(event)
@@ -1110,6 +1130,7 @@ internal class GraphV2RequestCoordinator(
 
     private fun sendAdmitted(registration: Registration): Boolean {
         if (!useAdmitted(registration)) return false
+        if (permitRefuses(registration)) return false
         val floor = sharedRetryFloor ?: return true
         // This is the transport's live send checkpoint, separate from the event's captured now.
         return clock.now() >= floor
@@ -1124,7 +1145,9 @@ internal class GraphV2RequestCoordinator(
     }
 
     private fun startCatalog(current: RequestContext, originalTab: String, recovery: RecoveryRound? = null) {
-        val registration = Registration(++nextRequestId, current, null, originalTab, activityGeneration)
+        val registration = Registration(
+            ++nextRequestId, current, null, originalTab, activityGeneration, automaticRecovery = recovery != null
+        )
         recovery?.let { bindRecovery(registration, it, attempt = true) }
         catalogRequest = registration
         startCapture(registration)
@@ -1140,7 +1163,7 @@ internal class GraphV2RequestCoordinator(
         // Registration is the logical start; changing the active key does not withdraw a sent request.
         val registration = Registration(
             ++nextRequestId, current, key, key.tab, activityGeneration, bindRequestAccess(current),
-            captureRecovery(current, key)
+            captureRecovery(current, key), automaticRecovery = recovery != null
         )
         tabRequests[key] = registration
         recovery?.let { bindRecovery(registration, it, attempt = true) }
@@ -1260,7 +1283,7 @@ internal class GraphV2RequestCoordinator(
             return
         }
         registration.waitingForFloor = false
-        if (!departRecovery(registration)) {
+        if (permitRefuses(registration) || !departRecovery(registration)) {
             releaseRegistration(registration)
             endConnectedCold(registration)
             endConnectedMidnight(registration)
@@ -1976,7 +1999,10 @@ internal class GraphV2RequestCoordinator(
     }
 
     private fun recoveryWaiting(key: GraphKey, current: RequestContext): Boolean =
-        absorbs(key) && recoveryKey(current, key.tab)?.let { recoveryBudgets[it] }?.let { it.stop == null } == true
+        absorbs(key) && recoveryKey(current, key.tab)?.let { recoveryBudgets[it] }?.let {
+            // S4 RT03b-3b: a budget parked on the permit may never fetch, so its key's unforced requests are not held back.
+            it.stop == null && !permitHeld(it, current)
+        } == true
 
     private fun recoveryNeed(key: GraphKey, current: RequestContext, now: Instant): RecoveryNeed {
         if (snapshot.entries[key]?.online200At == null) return RecoveryNeed.REMAINS
@@ -2085,12 +2111,14 @@ internal class GraphV2RequestCoordinator(
                 budget.stop = RecoveryStop.TERMINAL
                 budget.round = null
                 budget.hold = null
+                budget.permitWait = null
                 return
             }
             else -> Unit
         }
         budget.round = null
         budget.hold = null
+        budget.permitWait = null
         if (recoveryNeed(key, registration.context, now) == RecoveryNeed.NONE) {
             recoveryBudgets.remove(budgetKey)
             return
@@ -2105,6 +2133,36 @@ internal class GraphV2RequestCoordinator(
         }
     }
 
+    /**
+     * S4 RT03b-3b: null when the live permit lets an automatic recovery request of [context] be issued or sent - it exists,
+     * it is automatic, its fence is both [context]'s and the published fence, and under a re-approval its live Connection's
+     * lifetime is [context]'s and still admitted - and otherwise the publication that refuses it. One read of the
+     * supplier; without one nothing is refused. Safe on transport threads.
+     */
+    private fun permitRefusal(context: RequestContext): PermitWait? {
+        val supplier = recoveryPermit ?: return null
+        val permit = supplier()
+        val admits = permit != null && permit.automatic && permit.fence == context.fence &&
+            permit.fence == currentAccessFence() && (!permit.reapproved || permit.connectionGeneration != null &&
+            permit.connectionLifetime == context.lifetime && uses.admits(context.lifetime))
+        return if (admits) null else PermitWait(permit?.sessionKey, permit?.revision, context)
+    }
+
+    /** S4 RT03b-3b: a request the round issued itself, refused by the live permit; the refusal is kept for its release. */
+    private fun permitRefuses(registration: Registration): Boolean {
+        if (!registration.automaticRecovery) return false
+        val refusal = permitRefusal(registration.context) ?: return false
+        registration.permitRefusal.compareAndSet(null, refusal)
+        return true
+    }
+
+    /** S4 RT03b-3b: a budget waiting on the permit stays parked while the publication and its context are unchanged. */
+    private fun permitHeld(budget: RecoveryBudget, current: RequestContext): Boolean {
+        val wait = budget.permitWait ?: return false
+        val permit = recoveryPermit?.invoke()
+        return wait == PermitWait(permit?.sessionKey, permit?.revision, current)
+    }
+
     private fun recoveryHeld(budget: RecoveryBudget, current: RequestContext): Boolean =
         budget.hold?.let { it.context == current && it.activityGeneration == activityGeneration } == true
 
@@ -2115,7 +2173,9 @@ internal class GraphV2RequestCoordinator(
         val budget = activeRecovery() ?: return null
         val key = checkNotNull(activeKey)
         val current = checkNotNull(context)
-        if (budget.stop != null || recoveryHeld(budget, current) || !recoverySupported(key)) return null
+        if (budget.stop != null || recoveryHeld(budget, current) || permitHeld(budget, current) || !recoverySupported(key)) {
+            return null
+        }
         if (budget.round?.let { roundInFlight(it, key) } == true) return null
         return budget.deadline
     }
@@ -2124,7 +2184,7 @@ internal class GraphV2RequestCoordinator(
         val budget = activeRecovery() ?: return
         val key = checkNotNull(activeKey)
         val current = checkNotNull(context)
-        if (budget.stop != null || recoveryHeld(budget, current) || !recoverySupported(key)) return
+        if (budget.stop != null || recoveryHeld(budget, current) || permitHeld(budget, current) || !recoverySupported(key)) return
         val deadline = budget.deadline ?: return
         if (now < deadline || underFloor(now)) return
         budget.round?.let { open ->
@@ -2142,7 +2202,12 @@ internal class GraphV2RequestCoordinator(
         when (recoveryNeed(key, current, now)) {
             RecoveryNeed.NONE -> recoveryBudgets.remove(budget.key)
             RecoveryNeed.UNREADABLE -> budget.hold = RecoveryHold(current, activityGeneration, RecoveryHold.Cause.UNREADABLE)
-            RecoveryNeed.REMAINS -> requestActive(now, force = true, recovery = round)
+            RecoveryNeed.REMAINS -> {
+                // S4 RT03b-3b: only a round with demand left is judged (a join included); None removes the budget and
+                // Unreadable holds it above.
+                budget.permitWait = permitRefusal(current)
+                if (budget.permitWait == null) requestActive(now, force = true, recovery = round)
+            }
         }
     }
 
@@ -2342,12 +2407,19 @@ internal class GraphV2RequestCoordinator(
     }
 
     private fun releaseRegistration(registration: Registration) {
+        // S4 RT03b-3b: a request the permit refused waits on that publication; it reads no supplier here.
+        val refusal = registration.permitRefusal.get()
+        fun withdrawn(budget: RecoveryBudget) {
+            if (refusal != null) {
+                budget.permitWait = refusal
+            } else {
+                budget.hold = RecoveryHold(registration.context, registration.activityGeneration, RecoveryHold.Cause.WITHDRAWN)
+            }
+        }
         registration.recoveryRound?.let { round ->
             // An application clears this again; only a withdrawal of the current round's tab, or of a catalog a current
             // round awaits (below), keeps it.
-            if (round.budget.round === round && round.tabRequestId == registration.requestId) {
-                round.budget.hold = RecoveryHold(registration.context, registration.activityGeneration, RecoveryHold.Cause.WITHDRAWN)
-            }
+            if (round.budget.round === round && round.tabRequestId == registration.requestId) withdrawn(round.budget)
         }
         // S4 RT03b-2b: a catalog withdrawn before an applicable completion leaves its waiting rounds' check open, held
         // like a withdrawn tab so that no past deadline re-arms the timer in the same context and activation.
@@ -2355,7 +2427,7 @@ internal class GraphV2RequestCoordinator(
             val round = budget.round ?: return@forEach
             if (round.awaitedCatalogId != registration.requestId) return@forEach
             round.awaitedCatalogId = null
-            budget.hold = RecoveryHold(registration.context, registration.activityGeneration, RecoveryHold.Cause.WITHDRAWN)
+            withdrawn(budget)
         }
         registration.disposed.set(true)
         if (registration.key == null) {
