@@ -79,8 +79,9 @@ import org.junit.Test
  *  - A round is counted when its first request (tab or catalog) passes the send boundary, always on the budget that issued
  *    it; it has at most one tab and one catalog. A request withdrawn before it is sent frees its slot in the same round. A
  *    sent request withdrawn later spends its slot and moves no rung. A request of a round not yet counted is withdrawn at
- *    the boundary once its budget counts six. A round's tab withdrawn without an applicable completion in the same context
- *    and activation holds the budget there.
+ *    the boundary once its budget counts six (since RT03b-2b no row reaches it: a newer round waits for an older round's
+ *    catalog). A round's tab withdrawn without an applicable completion in the same context and activation holds the
+ *    budget there.
  *  - An applicable completion of the round's tab settles it: a success or retryable failure moves the rung (a join with an
  *    outside request does not) and sets the next deadline from that completion; a terminal or diagnostic answer stops the
  *    budget. Six counted rounds or six settled rungs stop it with the demand kept. A stopped budget issues nothing more.
@@ -94,14 +95,25 @@ import org.junit.Test
  *    otherwise goes on, counted only for its own round, never for a newer budget of the key.
  *  - The test clock fails a row whose timer re-arms more than 1000 times within one virtual millisecond.
  *
- * S4 RT03b-2a (rows K01-K06, rt03b2_api_agreed.r2 §2.1): with a recorder, a context change within the data scope of the
+ * S4 RT03b-2a (rows K01-K06, rt03b2_api_agreed.r3 §2.1): with a recorder, a context change within the data scope of the
  * last context since the last USER end asks for no catalog, now or deferred to the floor; another scope, a USER end and the
  * first context keep the initial request. A synchronization without a context keeps that scope only for its own scope, so a
  * scope seen first without a context stays initial. Without a recorder a context change still asks, as before.
  *
- * Not here: a round waiting for its catalog and the catalog's deadline (RT03b-2b), RT05 triggers and a new cycle after a
- * stop (RT03b-3), the unconfirmed 200 of a cache-port coordinator (P09, in GraphV2RequestCoordinatorReGateTest). The
- * implementation thread reads but does not edit this file.
+ * S4 RT03b-2b (rows C01, C03, C04, C06-C09, rt03b2_api_agreed.r4 §2.2-§2.3): a round whose catalog is absent or past its
+ * TTL sends no tab until a catalog check ends. It joins the catalog already out without sending, counting or binding it,
+ * or sends its own once. The check ends with an applicable completion of that catalog - an adopted one lets the tab
+ * capture, a failed one lets it go without (or with a kept older catalog) - or with the round's catalog slot already spent
+ * while no catalog is out; it is not repeated in the round. The tab then goes at the next Wake, no earlier than the
+ * round's deadline, after the catalog is published and the demand read again. A catalog withdrawn before an applicable
+ * completion - including the failures that withdraw a tab (offline, identity change) - holds the budget in that context
+ * and activation, like a withdrawn tab.
+ * While it waits, the round still joins an outside tab already out (1b), which can settle it before its own catalog goes.
+ * Other periods do not wait. Known limitation, not pinned: a check ended by an adopted catalog is not reopened when a
+ * same-scope context change drops that catalog, so that round's tab goes without captures.
+ *
+ * Not here: RT05 triggers and a new cycle after a stop (RT03b-3), the unconfirmed 200 of a cache-port coordinator (P09,
+ * in GraphV2RequestCoordinatorReGateTest). The implementation thread reads but does not edit this file.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphRecoveryBudgetContractTest {
@@ -390,9 +402,9 @@ class GraphRecoveryBudgetContractTest {
     }
 
     /** Started, with the catalog adopted through a settled usd 3m request; kb exists with closed losses at B1 and B2. */
-    private fun TestScope.ready(withRecorder: Boolean = true): Fixture = Fixture(this, withRecorder).also { f ->
+    private fun TestScope.ready(withRecorder: Boolean = true, catalogTtl: Int = 172800): Fixture = Fixture(this, withRecorder).also { f ->
         opened += f
-        f.autoCatalog = catalogOk
+        f.autoCatalog = { it.catalog.complete(ok(catalog(ttlSeconds = catalogTtl))) }
         f.coordinator.start(); runCurrent()
         f.coordinator.onActivated(USD_3M); runCurrent()
         f.tabs(USD_3M).single().tab.complete(ok(threeMonthTab())); runCurrent()
@@ -422,7 +434,7 @@ class GraphRecoveryBudgetContractTest {
         f.coordinator.onContextChanged(); runCurrent()
     }
 
-    // --- S4 RT03b-2a: catalogs on a context change (rows K01-K06, rt03b2_api_agreed.r2 §2.1) ---------------------------
+    // --- S4 RT03b-2a: catalogs on a context change (rows K01-K06, rt03b2_api_agreed.r3 §2.1) ---------------------------
 
     /**
      * K01: a context change within the last data scope - a P4 round trip, a new grant, a scope gone and back - asks for no
@@ -631,6 +643,345 @@ class GraphRecoveryBudgetContractTest {
         assertEquals("the kept scope again after another seen without a context", m + 2, h.catalogTimes().size)
         h.fence = sessionFence(epoch = "e2", grant = 10); h.coordinator.onContextChanged(); runCurrent()
         assertEquals("then that scope is kept", m + 2, h.catalogTimes().size)
+    }
+
+    // --- S4 RT03b-2b: a round's catalog first (rows C01, C03, C04, C06-C09, rt03b2_api_agreed.r4 §2.2-§2.3) ----------
+
+    /**
+     * ready(), with the catalog then dropped by a same-scope context change that asks for none (RT03b-2a). Catalogs are
+     * answered by the row; the next Activate asks for one with its tab.
+     */
+    private fun TestScope.dropped(): Fixture = ready().also { f ->
+        f.autoCatalog = null
+        f.fence = sessionFence(grant = 8); f.coordinator.onContextChanged(); runCurrent()
+        assertNull("premise: the catalog was dropped", f.state.catalog)
+    }
+
+    private fun Fixture.catalogs() = sent.filter { it.kind == "catalog" }
+
+    /** A usd 1d answer supplying kb at B1 and B2: a captured request meets the closed demand. */
+    private val full: (Sent) -> Unit = { it.tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1, B2))))) }
+
+    /**
+     * C01 (Q01): a first 1d request out without a catalog cannot meet the demand. (a) A catalog adopted while it is out lets
+     * the next round, 3 s after its completion, go with captures and meet it. (b) A catalog still out at the round's
+     * deadline is joined: the round's tab goes right after its adoption, or at the deadline if adopted earlier.
+     */
+    @Test fun C01_aRoundAfterALateCatalogGoesWithCaptures() = budgetTest {
+        val f = dropped()
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        val activation = f.catalogTimes().size
+        step(1.seconds)
+        f.catalogs().last().catalog.complete(ok(catalog())); runCurrent()
+        step(1.seconds)
+        f.tabs().single().tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1, B2))))); runCurrent()
+        assertTrue("premise: the first tab had no captures", B2 in f.series(KB).pending)
+        f.autoTab = full
+        step(3.seconds)
+        assertEquals("(a) the round 3 s after the first completion", secs(0, 5), f.tabTimes())
+        assertTrue("(a) with captures", B1 !in f.series(KB).pending && B2 !in f.series(KB).pending)
+        step(500.seconds)
+        assertEquals(secs(0, 5), f.tabTimes())
+        assertEquals("(a) a fresh catalog: the round asks for none", activation, f.catalogTimes().size)
+
+        for (adoptAt in listOf(5_000L, 1_000L)) {
+            val label = "(b) adopted at $adoptAt ms"
+            val g = dropped()
+            g.coordinator.onActivated(USD_1D); runCurrent()
+            val n = g.catalogTimes().size
+            g.tabs().single().tab.complete(status(503)); runCurrent()
+            g.autoTab = full
+            step(adoptAt.milliseconds)
+            assertEquals("$label premise: nothing before the adoption", listOf(0L), g.tabTimes())
+            g.catalogs().last().catalog.complete(ok(catalog())); runCurrent()
+            assertEquals("$label: the round sent no catalog of its own", n, g.catalogTimes().size)
+            step(5.seconds)
+            assertEquals(label, listOf(0L, maxOf(adoptAt, 3_000L)), g.tabTimes())
+            assertTrue("$label: with captures", B2 !in g.series(KB).pending)
+        }
+    }
+
+    /**
+     * C03: a round that needs a catalog sends it alone; its tab waits for that catalog's completion and then goes with
+     * captures. The round counts once.
+     */
+    @Test fun C03_aRoundSendsItsCatalogFirst() = budgetTest {
+        val f = dropped()
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        val n = f.catalogTimes().size
+        f.catalogs().last().catalog.complete(status(503)); runCurrent()
+        step(3.seconds)
+        assertEquals("the round's catalog alone", 3_000L, f.catalogTimes().last())
+        assertEquals(n + 1, f.catalogTimes().size)
+        assertEquals("its tab waits", listOf(0L), f.tabTimes())
+        step(2.seconds)
+        assertEquals(listOf(0L), f.tabTimes())
+        f.autoTab = full
+        f.catalogs().last().catalog.complete(ok(catalog())); runCurrent()
+        assertEquals("then its tab", secs(0, 5), f.tabTimes())
+        assertTrue("with captures", B2 !in f.series(KB).pending)
+        step(500.seconds)
+        assertEquals(secs(0, 5), f.tabTimes())
+        assertEquals(n + 1, f.catalogTimes().size)
+    }
+
+    /**
+     * C04: the catalog check ends once per round. (a) The round's own catalog failing: its tab goes at once without
+     * captures and the round asks for no second catalog; the next round asks again. (b) A joined catalog failing: the round
+     * sends no catalog of its own. (c) The round's catalog capture failing before its send: no catalog goes, the tab goes
+     * at once, and the round counts once, at the tab. (d) An existing catalog past its TTL whose refresh fails stays, so
+     * the round's tab captures with it.
+     */
+    @Test fun C04_aFailedCatalogEndsTheRoundsCheck() = budgetTest {
+        val f = dropped()
+        f.tabSequence(fail503)
+        f.catalogSequence(catalog503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        val n = f.catalogTimes().size
+        f.autoTab = { it.tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1, B2))))) }
+        step(3.seconds)
+        assertEquals("(a) the round's catalog and then its tab", secs(0, 3), f.tabTimes())
+        assertTrue("(a) without captures", B2 in f.series(KB).pending)
+        f.autoTab = fail503
+        step(500.seconds)
+        assertEquals("(a) one catalog per round", n + 5, f.catalogTimes().size)
+        assertEquals(secs(0, 3, 9, 21, 45, 93), f.tabTimes())
+
+        val g = dropped()
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        val m = g.catalogTimes().size
+        g.tabs().single().tab.complete(status(503)); runCurrent()
+        g.autoTab = fail503
+        step(4.seconds)
+        g.catalogs().last().catalog.complete(status(503)); runCurrent()
+        assertEquals("(b) the round's tab after the joined catalog failed", secs(0, 4), g.tabTimes())
+        assertEquals("(b) no catalog of its own", m, g.catalogTimes().size)
+        step(6.seconds)
+        assertEquals("(b) the next round, 6 s after, asks again", 10_000L, g.catalogTimes().last())
+
+        val h = dropped()
+        h.tabSequence(fail503)
+        h.catalogSequence(catalog503)
+        h.coordinator.onActivated(USD_1D); runCurrent()
+        val k = h.catalogTimes().size
+        // Captures: 1-2 the Activate's catalog and tab, 3 the round's catalog.
+        h.captureFails = { c -> if (c == 3) IOException("reset") else null }
+        step(3.seconds)
+        assertEquals("(c) no catalog went", k, h.catalogTimes().size)
+        assertEquals("(c) the tab at once", secs(0, 3), h.tabTimes())
+        h.captureFails = { null }
+        step(500.seconds)
+        assertEquals("(c) counted once per round: six tabs", secs(0, 3, 9, 21, 45, 93), h.tabTimes())
+        assertEquals("(c) the later rounds' catalogs", k + 4, h.catalogTimes().size)
+
+        val e = ready(catalogTtl = 1)
+        e.autoCatalog = catalog503
+        e.tabSequence(fail503, full)
+        val c = e.catalogTimes().size
+        e.coordinator.onActivated(USD_1D); runCurrent()
+        step(3.seconds)
+        assertEquals("(d) the round asked for the stale catalog first", c + 1, e.catalogTimes().size)
+        assertEquals(3_000L, e.catalogTimes().last())
+        assertNotNull("premise: the stale catalog stays after a failed refresh", e.state.catalog)
+        assertEquals(secs(0, 3), e.tabTimes())
+        assertTrue("(d) the round's tab captured with it", B2 !in e.series(KB).pending)
+    }
+
+    /**
+     * C06: only an absorbed 1d round waits for its catalog. A 3m request does not wait for the catalog that is out, and a
+     * 1d budget asks for nothing while 3m is active.
+     */
+    @Test fun C06_aLongPeriodDoesNotWaitForTheCatalog() = budgetTest {
+        val f = dropped()
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        f.catalogs().last().catalog.complete(status(503)); runCurrent()
+        step(1.seconds)
+        f.autoTab = { it.tab.complete(ok(threeMonthTab())) }
+        val n = f.catalogTimes().size
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        assertEquals("3m: its catalog", n + 1, f.catalogTimes().size)
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        assertEquals("a forced 3m tab while that catalog is out", 1_000L, f.tabTimes(USD_3M).last())
+        f.catalogs().last().catalog.complete(ok(catalog())); runCurrent()
+        step(500.seconds)
+        assertEquals("the 1d budget asks for nothing meanwhile", n + 1, f.catalogTimes().size)
+        assertEquals(listOf(0L), f.tabTimes())
+    }
+
+    /**
+     * C07: a round's catalog withdrawn before an applicable completion - at its capture or at its completion, its own or
+     * one it joined - holds the budget in that context (no timer loop); after a round trip the round asks for its catalog
+     * again, an unsent slot being free. A sent catalog lost in a round trip spends its slot: the round's tab then goes
+     * without a catalog. A capture that goes offline withdraws like a tab's (not an applicable failure).
+     */
+    @Test fun C07_aWithdrawnRoundCatalogHoldsTheBudget() = budgetTest {
+        val f = dropped()
+        f.tabSequence(fail503)
+        f.catalogSequence(catalog503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        val n = f.catalogTimes().size
+        // Captures: 1-2 the Activate's catalog and tab, 3 the round's catalog, withdrawn by the use going away unseen.
+        val held = f.hold(3)
+        step(3.seconds)
+        f.allowed = false
+        held.complete(Unit); runCurrent()
+        f.allowed = true
+        step(30.seconds)
+        assertEquals("held: nothing more in the same context", n, f.catalogTimes().size)
+        assertEquals(listOf(0L), f.tabTimes())
+        roundTrip(f)
+        assertEquals("the round's catalog again after a round trip", n + 1, f.catalogTimes().size)
+        assertEquals("then its tab", secs(0, 33), f.tabTimes())
+
+        val g = dropped()
+        g.tabSequence(fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        g.catalogs().last().catalog.complete(status(503)); runCurrent()
+        val m = g.catalogTimes().size
+        step(3.seconds)
+        assertEquals("premise: the round's catalog went", m + 1, g.catalogTimes().size)
+        step(1.seconds)
+        roundTrip(g)
+        assertEquals("a spent catalog slot: no catalog again", m + 1, g.catalogTimes().size)
+        assertEquals("the round's tab without one", secs(0, 4), g.tabTimes())
+
+        // (c) A joined catalog withdrawn at its completion holds the round too; joining spent no slot.
+        val h = dropped()
+        h.tabSequence(fail503)
+        h.coordinator.onActivated(USD_1D); runCurrent()
+        val k = h.catalogTimes().size
+        step(3.seconds)
+        assertEquals("premise: the round joined the Activate's catalog", k, h.catalogTimes().size)
+        h.allowed = false
+        h.catalogs().last().catalog.complete(ok(catalog())); runCurrent()
+        h.allowed = true
+        assertNull("premise: withdrawn at its completion, not adopted", h.state.catalog)
+        step(30.seconds)
+        assertEquals("held", listOf(0L), h.tabTimes())
+        h.autoCatalog = catalog503
+        roundTrip(h)
+        assertEquals("then the round's own catalog", k + 1, h.catalogTimes().size)
+        assertEquals(secs(0, 33), h.tabTimes())
+
+        // (d) The failures that withdraw a tab withdraw the round's catalog capture as well: offline or an identity change
+        // holds the round, and after a round trip it asks for its catalog again. Captures: 1-2 the Activate's catalog and
+        // tab, 3 the round's.
+        for (failure in listOf<Throwable>(AuthUnavailableException("offline"), AuthIdentityChangedException())) {
+            val label = "(d) ${failure::class.simpleName}"
+            val e = dropped()
+            e.tabSequence(fail503)
+            e.catalogSequence(catalog503)
+            e.coordinator.onActivated(USD_1D); runCurrent()
+            val q = e.catalogTimes().size
+            e.captureFails = { c -> if (c == 3) failure else null }
+            step(3.seconds)
+            assertEquals("$label premise: the round's catalog capture failed", 3, e.captures)
+            step(30.seconds)
+            assertEquals("$label held: no tab without its catalog", listOf(0L), e.tabTimes())
+            roundTrip(e)
+            assertEquals("$label its catalog again", q + 1, e.catalogTimes().size)
+            assertEquals(label, secs(0, 33), e.tabTimes())
+        }
+
+        // (e) The hold belongs to the withdrawn catalog's own activation. The round's catalog capture is held across a key
+        // switch and back; an outside tab's 429 then makes it wait for the floor, and its capture ending under the floor in
+        // another activation withdraws it. In the current activation the round is not held: it asks again at the floor.
+        // Captures: 1-2 the Activate's catalog and tab, 3 the round's catalog, 4 the forced tab.
+        val r = dropped()
+        r.tabSequence(fail503)
+        r.catalogSequence(catalog503)
+        r.coordinator.onActivated(USD_1D); runCurrent()
+        val w = r.catalogTimes().size
+        val capture = r.hold(3)
+        step(3.seconds)
+        r.coordinator.onActivated(USD_3M); runCurrent()
+        r.coordinator.onActivated(USD_1D); runCurrent()
+        r.autoTab = { it.tab.complete(status(429, "2")) }
+        r.coordinator.onRefreshRequested(force = true); runCurrent()
+        assertEquals("(e) premise: the forced tab met the 429 (floor at 5 s)", secs(0, 3), r.tabTimes())
+        r.autoTab = fail503
+        capture.complete(Unit); runCurrent()
+        assertEquals("(e) premise: the round's catalog was withdrawn unsent", w, r.catalogTimes().size)
+        step(2.seconds)
+        assertEquals("(e) the round's catalog again at the floor", 5_000L, r.catalogTimes().last())
+        assertEquals("(e) then its tab", secs(0, 3, 5), r.tabTimes())
+    }
+
+    /**
+     * C08: after an applicable catalog completion the round is evaluated again at its Wake, after the catalog is published:
+     * a demand the adopted catalog shows to be None removes the budget without a tab; a round of a key no longer active
+     * waits until its key is active again.
+     */
+    @Test fun C08_aRoundReadsItsDemandAgainAfterItsCatalog() = budgetTest {
+        val f = bare()
+        f.tabSequence({ it.tab.complete(ok(dayTab(emptyMap()))) })
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        assertNotNull("premise: a fresh entry", f.state.entries.getValue(USD_1D).online200At)
+        f.autoCatalog = null
+        step(3.seconds)
+        assertEquals("premise: the round's catalog alone (CatalogRequired remained)", secs(0, 3), f.catalogTimes())
+        assertEquals(listOf(0L), f.tabTimes())
+        f.catalogs().last().catalog.complete(ok(catalog())); runCurrent()
+        step(500.seconds)
+        assertEquals("None once the catalog is published: no tab", listOf(0L), f.tabTimes())
+        assertEquals(secs(0, 3), f.catalogTimes())
+
+        val g = dropped()
+        g.tabSequence(fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        g.catalogs().last().catalog.complete(status(503)); runCurrent()
+        step(3.seconds)
+        assertEquals("premise: the round's own catalog is out", 3_000L, g.catalogTimes().last())
+        g.autoTab = { it.tab.complete(ok(threeMonthTab())) }
+        g.coordinator.onActivated(USD_3M); runCurrent()
+        g.catalogs().last().catalog.complete(ok(catalog())); runCurrent()
+        step(10.seconds)
+        assertEquals("not while usd 3m is active", listOf(0L), g.tabTimes())
+        g.autoTab = full
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        assertEquals("the round's tab once its key is active", secs(0, 13), g.tabTimes())
+        assertTrue("with captures", B2 !in g.series(KB).pending)
+    }
+
+    /**
+     * C09: a round whose own catalog slot is spent (sent and then lost) still waits for a catalog already out; but once its
+     * check has ended with no catalog out, it does not wait for a later catalog in that round.
+     */
+    @Test fun C09_aSpentSlotWaitsOnlyForACatalogAlreadyOut() = budgetTest {
+        val f = dropped()
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        f.catalogs().last().catalog.complete(status(503)); runCurrent()
+        step(3.seconds)
+        assertEquals("premise: the round's own catalog went", 3_000L, f.catalogTimes().last())
+        step(1.seconds)
+        // A round trip whose second half is a Refresh: the sent catalog is lost, and the Refresh asks for a catalog.
+        f.allowed = false; f.coordinator.onContextChanged(); runCurrent()
+        f.allowed = true; f.invalidations++; f.coordinator.onRefreshRequested(force = false); runCurrent()
+        assertEquals("premise: the Refresh's catalog is out", 4_000L, f.catalogTimes().last())
+        assertEquals("(a) a spent slot still waits for the catalog out", listOf(0L), f.tabTimes())
+        f.autoTab = full
+        f.catalogs().last().catalog.complete(ok(catalog())); runCurrent()
+        assertEquals("(a) then its tab", secs(0, 4), f.tabTimes())
+        assertTrue("(a) with captures", B2 !in f.series(KB).pending)
+
+        // Captures: 1-2 the Activate's catalog and tab, 3 the round's catalog, 4 its tab (offline), 5 the Refresh's catalog.
+        val g = dropped()
+        g.tabSequence(fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        g.catalogs().last().catalog.complete(status(503)); runCurrent()
+        step(3.seconds)
+        step(1.seconds)
+        g.captureFails = { c -> if (c == 4) AuthUnavailableException("offline") else null }
+        roundTrip(g)
+        assertEquals("premise: the round's tab went offline after its check ended", 4, g.captures)
+        assertEquals(listOf(0L), g.tabTimes())
+        g.allowed = false; g.coordinator.onContextChanged(); runCurrent()
+        g.allowed = true; g.invalidations++; g.coordinator.onRefreshRequested(force = false); runCurrent()
+        assertEquals("premise: the Refresh's catalog is out", 4_000L, g.catalogTimes().last())
+        assertEquals("(b) the ended check does not wait for it", secs(0, 4), g.tabTimes())
     }
 
     // --- P01 -----------------------------------------------------------------------------------------------------
@@ -1124,15 +1475,23 @@ class GraphRecoveryBudgetContractTest {
         step(500.seconds)
         assertEquals(listOf(0L), h.tabTimes())
 
+        // (c) A round whose own catalog capture is held joins an outside tab, whose 404 stops the budget; the held catalog is
+        // then withdrawn at the send boundary. Captures: 1-2 the first catalog and tab, 3-4 the forced Refresh's catalog and
+        // tab, 5 the round's catalog.
         val c = bare()
-        c.tabSequence(fail503, { it.tab.complete(status(404)) })
+        c.tabSequence(fail503)
         c.coordinator.onActivated(USD_1D); runCurrent()
-        val held = c.hold(3)
-        step(3.seconds)
-        assertEquals("premise: the round's tab answered 404, its catalog capture held", secs(0, 3), c.tabTimes())
+        c.autoTab = null
+        step(2_500.milliseconds)
+        c.coordinator.onRefreshRequested(force = true); runCurrent()
+        val held = c.hold(5)
+        step(500.milliseconds)
+        assertEquals("premise: the round's catalog capture is held", 5, c.captures)
+        c.tabs().last().tab.complete(status(404)); runCurrent()
         held.complete(Unit); runCurrent()
         step(500.seconds)
-        assertEquals("the stopped round's catalog is not sent", listOf(0L), c.catalogTimes())
+        assertEquals("the stopped round's catalog is not sent", listOf(0L, 2_500L), c.catalogTimes())
+        assertEquals(listOf(0L, 2_500L), c.tabTimes())
     }
 
     /** P08b: a withdrawn or diagnostic first completion, or one of a key no longer active, creates no budget. */
@@ -1198,84 +1557,80 @@ class GraphRecoveryBudgetContractTest {
     }
 
     /**
-     * P10c: a catalog whose round was settled by a retryable capture failure, sent later, counts for that round: with every
-     * later round lost in a round trip, five tabs go in all.
+     * P10c: a round whose own catalog capture is held joins an outside tab, which settles it first. That catalog, sent later,
+     * counts for that round only: with every later round lost in a round trip, the budget stops after six counts.
      */
     @Test fun P10c_aLateCatalogCountsForItsOwnRound() = budgetTest {
+        // Captures: 1-2 the first catalog and tab, 3-4 the forced Refresh's catalog and tab, 5 round 2's catalog.
         val f = bare()
-        f.catalogSequence(catalog503, catalogOk)
+        f.catalogSequence(catalog503, catalog503, catalogOk)
         f.coordinator.onActivated(USD_1D); runCurrent()
         f.tabs().single().tab.complete(status(503)); runCurrent()
-        val catalog = f.hold(3)
-        f.captureFails = { n -> if (n == 4) IOException("reset") else null }
-        step(3.seconds)
-        assertEquals("premise: the round settled without a send", listOf(0L), f.tabTimes())
+        step(2_500.milliseconds)
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        val catalog = f.hold(5)
+        step(500.milliseconds)
+        assertEquals("premise: round 2's catalog capture is held", 5, f.captures)
+        f.tabs().last().tab.complete(status(503)); runCurrent()
         step(2.seconds)
         catalog.complete(Unit); runCurrent()
-        assertEquals("premise: the late catalog went", secs(0, 5), f.catalogTimes())
-        step(4.seconds)
-        assertEquals("premise: the next round is out", secs(0, 9), f.tabTimes())
+        assertEquals("premise: the late catalog went", 5_000L, f.catalogTimes().last())
+        step(1.seconds)
+        assertEquals("premise: round 3, 3 s after the joined completion, is out", listOf(0L, 2_500L, 6_000L), f.tabTimes())
         // The fourth round trip finds six counted rounds and stops.
         repeat(4) { roundTrip(f) }
-        assertEquals(listOf(0L) + List(4) { 9_000L }, f.tabTimes())
+        assertEquals(listOf(0L, 2_500L) + List(4) { 6_000L }, f.tabTimes())
     }
 
     /**
-     * P10d: six counts on one side of a late catalog. (a) The late catalog of a round settled unsent goes first and makes
-     * six: the next round's tab is withdrawn at the send boundary, and that uncounted round is not issued again - the budget
-     * stops, so the key's own requests go. (b) The next round's tab goes first and makes six: the late catalog is withdrawn
-     * at the send boundary and counts nothing.
+     * P10d: the late catalog of a round settled by a joined outside tab goes while the next round waits for it, and makes
+     * six: that next round, still uncounted, is not issued - the budget stops, so the key's own requests go. (The next round
+     * cannot send first: a newer round of the key waits for that same catalog, RT03b-2b.)
      */
     @Test fun P10d_theSixthCountWithdrawsAnUncountedRound() = budgetTest {
-        for (catalogFirst in listOf(true, false)) {
-            val label = if (catalogFirst) "(a)" else "(b)"
-            val f = bare()
-            f.coordinator.onActivated(USD_1D); runCurrent()
-            f.tabs()[0].tab.complete(status(503)); runCurrent()
-            step(3.seconds)
-            f.tabs()[1].tab.complete(status(503)); runCurrent()
-            step(6.seconds)
-            assertEquals("$label premise: round 3 is out", secs(0, 3, 9), f.tabTimes())
-            roundTrip(f)
-            roundTrip(f)
-            assertEquals("$label premise: rounds 3 and 4 lost, round 5 out", secs(0, 3, 9, 9, 9), f.tabTimes())
-            f.tabs()[4].tab.complete(status(503)); runCurrent()
-            val first = f.captures
-            val catalog = f.hold(first + 1)
-            f.captureFails = { n -> if (n == first + 2) IOException("reset") else null }
-            step(12.seconds)
-            assertEquals("$label premise: round 6 settled unsent", secs(0, 3, 9, 9, 9), f.tabTimes())
-            if (catalogFirst) {
-                val tab = f.hold(first + 3)
-                step(24.seconds)
-                assertEquals("(a) premise: round 7's tab capture is held", first + 3, f.captures)
-                catalog.complete(Unit); runCurrent()
-                assertEquals("(a) premise: round 6's late catalog went", 45_000L, f.catalogTimes().last())
-                tab.complete(Unit); runCurrent()
-                assertEquals("(a) the sixth count withdraws round 7's tab", secs(0, 3, 9, 9, 9), f.tabTimes())
-                f.coordinator.onActivated(USD_3M); runCurrent()
-                f.coordinator.onActivated(USD_1D); runCurrent()
-                f.coordinator.onRefreshRequested(force = false); runCurrent()
-                assertEquals("(a) stopped: the key's own request goes", secs(0, 3, 9, 9, 9, 45), f.tabTimes())
-            } else {
-                step(24.seconds)
-                assertEquals("(b) premise: round 7's tab went and counts six", secs(0, 3, 9, 9, 9, 45), f.tabTimes())
-                val before = f.catalogTimes()
-                catalog.complete(Unit); runCurrent()
-                assertEquals("(b) round 6's late catalog is withdrawn", before, f.catalogTimes())
-            }
-        }
+        val f = bare()
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        f.tabs()[0].tab.complete(status(503)); runCurrent()
+        step(3.seconds)
+        f.tabs()[1].tab.complete(status(503)); runCurrent()
+        step(6.seconds)
+        assertEquals("premise: round 3 is out", secs(0, 3, 9), f.tabTimes())
+        roundTrip(f)
+        roundTrip(f)
+        assertEquals("premise: rounds 3 and 4 lost, round 5 out", secs(0, 3, 9, 9, 9), f.tabTimes())
+        f.tabs()[4].tab.complete(status(503)); runCurrent()
+        step(11_500.milliseconds)
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        val catalog = f.hold(f.captures + 1)
+        step(500.milliseconds)
+        assertEquals("premise: round 6 joined the forced tab at 20.5 s", 20_500L, f.tabTimes().last())
+        f.tabs().last().tab.complete(status(503)); runCurrent()
+        f.autoCatalog = catalogOk
+        step(12.seconds)
+        assertEquals("premise: round 7 waits for round 6's catalog", listOf(0L, 3_000L, 9_000L, 9_000L, 9_000L, 20_500L),
+            f.tabTimes())
+        catalog.complete(Unit); runCurrent()
+        assertEquals("premise: round 6's late catalog went", 33_000L, f.catalogTimes().last())
+        assertEquals("the sixth count stops round 7 before its tab", listOf(0L, 3_000L, 9_000L, 9_000L, 9_000L, 20_500L),
+            f.tabTimes())
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        f.coordinator.onRefreshRequested(force = false); runCurrent()
+        assertEquals("stopped: the key's own request goes", 33_000L, f.tabTimes().last())
     }
 
-    /** P10e: a round whose catalog capture still runs is in progress: its withdrawn tab waits for that catalog. */
+    /**
+     * P10e: a round whose own catalog capture still runs sends no tab, across a key switch; its tab goes once that catalog
+     * completes.
+     */
     @Test fun P10e_aRoundWaitsForItsOwnCatalog() = budgetTest {
         val f = bare()
         f.autoTab = byKey503
         f.coordinator.onActivated(USD_1D); runCurrent()
         val catalog = f.hold(3)
-        f.captureFails = { n -> if (n == 4) AuthUnavailableException("offline") else null }
         step(3.seconds)
-        assertEquals("premise: round 2's tab withdrawn, its catalog held", listOf(0L), f.tabTimes())
+        assertEquals("premise: only the round's catalog is captured", 3, f.captures)
+        assertEquals(listOf(0L), f.tabTimes())
         f.coordinator.onActivated(USD_3M); runCurrent()
         f.coordinator.onActivated(USD_1D); runCurrent()
         step(10.seconds)
@@ -1310,12 +1665,17 @@ class GraphRecoveryBudgetContractTest {
         step(500.seconds)
         assertEquals("an outside request, no ladder", secs(0, 4, 504), f.tabTimes())
 
+        // The round's catalog fails, so its tab goes; while that tab's capture is held, a Refresh's own catalog meets a 429
+        // and the tab, captured after it, waits registered for the floor. Captures: 1-2 the first catalog and tab, 3 the
+        // round's catalog, 4 its tab, 5 the Refresh's catalog.
         val g = bare()
         g.tabSequence(fail503)
-        g.catalogSequence(catalog503, { it.catalog.complete(status(429, "10")) })
+        g.catalogSequence(catalog503, catalog503, { it.catalog.complete(status(429, "10")) })
         g.coordinator.onActivated(USD_1D); runCurrent()
         val tab = g.hold(4)
         step(3.seconds)
+        g.coordinator.onRefreshRequested(force = false); runCurrent()
+        assertEquals("premise: the Refresh's catalog met the 429", secs(0, 3, 3), g.catalogTimes())
         tab.complete(Unit); runCurrent()
         assertEquals("premise: the tab waits for the floor", listOf(0L), g.tabTimes())
         assertTrue("premise: registered while it waits", USD_1D in g.state.inFlight)
@@ -1502,26 +1862,30 @@ class GraphRecoveryBudgetContractTest {
     }
 
     /**
-     * P13: (a) a budget satisfied while its round's catalog capture is held leaves that catalog to go, and its key's own
-     * requests go again; (b) a newer budget's rounds are not changed by an old round's late catalog; (c) a failed event
-     * handling withdraws such a catalog even so.
+     * P13: (a) a budget satisfied, through an outside tab its round joined, while that round's catalog capture is held
+     * leaves that catalog to go, and its key's own requests go again; (b) a newer budget's rounds are not changed by an old
+     * round's late catalog; (c) a failed event handling withdraws such a catalog even so.
      */
     @Test fun P13_aSatisfiedBudgetsCatalog() = budgetTest {
-        // Captures: 1-2 the first catalog and tab, 3-4 the second round's catalog and tab.
+        // Captures: 1-2 the first catalog and tab, 3-4 the forced Refresh's catalog and tab, 5 the round's catalog.
         val f = shortCatalog()
-        f.tabSequence(fail503, { it.tab.complete(ok(dayTab(emptyMap()))) })
+        f.tabSequence(fail503)
         f.coordinator.onActivated(USD_1D); runCurrent()
         assertNotNull("premise: catalog adopted", f.state.catalog)
-        val a = f.hold(3)
-        step(3.seconds)
-        assertEquals("premise: the round's tab satisfied it", secs(0, 3), f.tabTimes())
+        f.autoTab = null
+        step(1_500.milliseconds)
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        val a = f.hold(5)
+        step(1_500.milliseconds)
+        assertEquals("premise: the round's catalog capture is held", 5, f.captures)
+        f.tabs().last().tab.complete(ok(dayTab(emptyMap()))); runCurrent()
         step(1.seconds)
         a.complete(Unit); runCurrent()
-        assertEquals("(a) the catalog goes", secs(0, 4), f.catalogTimes())
+        assertEquals("(a) the catalog goes", listOf(0L, 1_500L, 4_000L), f.catalogTimes())
         f.coordinator.onRefreshRequested(force = false); runCurrent()
-        assertEquals("no budget waits: the stale entry's own request goes", secs(0, 3, 4), f.tabTimes())
+        assertEquals("no budget waits: the stale entry's own request goes", listOf(0L, 1_500L, 4_000L), f.tabTimes())
         step(500.seconds)
-        assertEquals(secs(0, 3, 4), f.tabTimes())
+        assertEquals(listOf(0L, 1_500L, 4_000L), f.tabTimes())
 
         // (b) The old round joined an outside tab and holds its own catalog, so the old round is still uncounted when a newer
         // budget exists. Captures: 1-2 the first catalog and tab, 3 the forced tab, 4 the round's catalog, 5 the newer tab.
@@ -1574,6 +1938,8 @@ class GraphRecoveryBudgetContractTest {
         f.sent.single { it.kind == "catalog" }.catalog.complete(ok(catalog(usdOneDay = false))); runCurrent()
         step(59.seconds)
         assertEquals(listOf(0L), f.tabTimes())
+        // The round trip drops the catalog; each later round's own catalog fails, so its tab goes without one.
+        f.autoCatalog = catalog503
         roundTrip(f)
         step(200.seconds)
         assertEquals(secs(0, 60, 66, 78, 102, 150), f.tabTimes())

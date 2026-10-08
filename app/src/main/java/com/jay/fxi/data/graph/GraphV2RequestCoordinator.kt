@@ -120,10 +120,13 @@ internal data class GraphRequestState(
  * With a recorder, a one-day key's cold ladder and independent flip check give way to a recovery
  * budget per (data scope, tab) (S4 RT03b-1b): it reads the recorder's demand on the loop, issues its
  * own forced rounds at most six times, 3/6/12/24/48 s after each completion, and holds back unforced
- * requests of its key while it waits. It survives Deactivate, key switches and a missing data scope;
- * a USER end, another non-null data scope, a selecting [retireScopes] and [close] discard it. A context
- * change within the data scope of the last context since the last USER end asks for no catalog
- * (S4 RT03b-2a); another scope, a USER end and the first context still do.
+ * requests of its key while it waits. A round that needs a catalog waits for the one already out or asks
+ * for its own once; its tab goes after an applicable completion of that catalog, or once its catalog slot
+ * is spent and no catalog is out, unless an outside tab it joined settles it first (S4 RT03b-2b). It survives
+ * Deactivate, key switches and a missing data scope; a USER end, another non-null data scope, a
+ * selecting [retireScopes] and [close] discard it. A context change within the data scope of the last
+ * context since the last USER end asks for no catalog (S4 RT03b-2a); another scope, a USER end and the
+ * first context still do.
  * Other periods, and a coordinator without a recorder, keep the cold, flip and midnight owners.
  */
 internal class GraphV2RequestCoordinator(
@@ -248,6 +251,13 @@ internal class GraphV2RequestCoordinator(
         var catalogRequestId: Long? = null
         var catalogSent = false
         var counted = false
+        /** S4 RT03b-2b: the catalog request this round waits for, its own or one it joined without binding it. */
+        var awaitedCatalogId: Long? = null
+        /**
+         * True once the round's catalog check ended: an applicable completion of the awaited catalog, or its catalog slot
+         * spent while no catalog is out.
+         */
+        var catalogChecked = false
     }
 
     private class RecoveryBudget(val key: RecoveryKey) {
@@ -1007,7 +1017,7 @@ internal class GraphV2RequestCoordinator(
         val current = context ?: return
         scheduleMidnight(now)
 
-        // Catalog refresh is independent of tab freshness and never blocks the tab request.
+        // Outside a recovery round, a catalog refresh is independent of tab freshness and never blocks the tab request.
         val lastCatalogAt = catalogAt
         val needsCatalog = !catalogSilent && catalogRequest == null && (snapshot.catalog == null || lastCatalogAt == null ||
             now - lastCatalogAt >= GraphV2Domain.ttl(snapshot.catalog))
@@ -1025,7 +1035,15 @@ internal class GraphV2RequestCoordinator(
             }
             return
         }
-        if (needsCatalog && recovery?.catalogSent != true) startCatalog(current, key.tab, recovery)
+        if (recovery != null && awaitRoundCatalog(now, current, key, recovery)) {
+            // S4 RT03b-2b: the round's tab waits for its catalog; an outside tab already out is still joined.
+            tabRequests[key]?.let {
+                bindRecovery(it, recovery, attempt = false)
+                connectFlip(it)
+            }
+            return
+        }
+        if (needsCatalog && recovery == null) startCatalog(current, key.tab)
         if (!supported) {
             if (coldAttempt) cancelCold()
             if (midnightAttempt) cancelMidnight()
@@ -1247,6 +1265,9 @@ internal class GraphV2RequestCoordinator(
             releaseRegistration(registration)
             return false
         }
+        // S4 RT03b-2b: going offline withdraws a tab, so it leaves a waiting round's catalog check open (released below);
+        // an identity change already returned above as a cancellation.
+        if (event.result.exceptionOrNull() !is AuthUnavailableException) endCatalogWaits(registration)
         releaseRegistration(registration)
         val response = event.result.getOrNull() ?: return false
         if (response.statusCode != 200) return false
@@ -1949,13 +1970,54 @@ internal class GraphV2RequestCoordinator(
 
     private fun roundInFlight(round: RecoveryRound, key: GraphKey): Boolean =
         (round.tabRequestId != null && tabRequests[key]?.requestId == round.tabRequestId) ||
-            (round.catalogRequestId != null && catalogRequest?.requestId == round.catalogRequestId)
+            (round.catalogRequestId != null && catalogRequest?.requestId == round.catalogRequestId) ||
+            (round.awaitedCatalogId != null && catalogRequest?.requestId == round.awaitedCatalogId)
+
+    /**
+     * S4 RT03b-2b: true while [round] waits for a catalog. A round needing one (absent or past its TTL) joins the catalog
+     * already registered, or issues its own once; its catalog check ends with an applicable completion of that catalog, or
+     * with its catalog slot spent while no catalog is out, and its tab goes only after that. Known limitation: a check
+     * ended by an adopted catalog is not reopened when a same-scope context change drops that catalog, so the round's tab
+     * then goes without captures and spends the round; a next round, if the budget has one left, asks again.
+     */
+    private fun awaitRoundCatalog(now: Instant, current: RequestContext, key: GraphKey, round: RecoveryRound): Boolean {
+        if (round.catalogChecked) return false
+        round.awaitedCatalogId?.let { if (catalogRequest?.requestId == it) return true }
+        round.awaitedCatalogId = null
+        val lastCatalogAt = catalogAt
+        if (snapshot.catalog != null && lastCatalogAt != null && now - lastCatalogAt < GraphV2Domain.ttl(snapshot.catalog)) {
+            return false
+        }
+        catalogRequest?.let {
+            round.awaitedCatalogId = it.requestId
+            return true
+        }
+        if (round.catalogSent) {
+            round.catalogChecked = true
+            return false
+        }
+        startCatalog(current, key.tab, round)
+        round.awaitedCatalogId = checkNotNull(catalogRequest).requestId
+        return true
+    }
+
+    /** S4 RT03b-2b: an applicable completion of [catalog] ends the catalog check of every round waiting for it. */
+    private fun endCatalogWaits(catalog: Registration) {
+        recoveryBudgets.values.forEach { budget ->
+            val round = budget.round ?: return@forEach
+            if (round.awaitedCatalogId != catalog.requestId) return@forEach
+            round.awaitedCatalogId = null
+            round.catalogChecked = true
+        }
+    }
 
     /** False withdraws a directly issued recovery request before it is sent. */
     private fun departRecovery(registration: Registration): Boolean {
         if (!registration.recoveryAttempt) return true
         val round = registration.recoveryRound ?: return true
         val budget = round.budget
+        // Since S4 RT03b-2b the count clause is defensive: a newer round waits for an older round's catalog, so nothing of an
+        // uncounted round departs once six are counted.
         if (budget.stopped || (!round.counted && budget.rounds >= MAX_RECOVERY_ROUNDS)) return false
         if (registration.key == null) round.catalogSent = true else round.tabSent = true
         if (!round.counted) {
@@ -2193,10 +2255,19 @@ internal class GraphV2RequestCoordinator(
 
     private fun releaseRegistration(registration: Registration) {
         registration.recoveryRound?.let { round ->
-            // An application clears this again; only a withdrawal of the current round's tab keeps it.
+            // An application clears this again; only a withdrawal of the current round's tab, or of a catalog a current
+            // round awaits (below), keeps it.
             if (round.budget.round === round && round.tabRequestId == registration.requestId) {
                 round.budget.hold = registration.context to registration.activityGeneration
             }
+        }
+        // S4 RT03b-2b: a catalog withdrawn before an applicable completion leaves its waiting rounds' check open, held
+        // like a withdrawn tab so that no past deadline re-arms the timer in the same context and activation.
+        if (registration.key == null) recoveryBudgets.values.forEach { budget ->
+            val round = budget.round ?: return@forEach
+            if (round.awaitedCatalogId != registration.requestId) return@forEach
+            round.awaitedCatalogId = null
+            budget.hold = registration.context to registration.activityGeneration
         }
         registration.disposed.set(true)
         if (registration.key == null) {

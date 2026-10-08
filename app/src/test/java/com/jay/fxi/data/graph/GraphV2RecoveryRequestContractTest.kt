@@ -94,7 +94,8 @@ import org.junit.Test
  *    applied with the adopted tab and the original fence and lifetime, one call per request. Cache hits, failures,
  *    rejections and cancellation apply nothing.
  *  - After an event that adopted a catalog, right after the coordinator publishes it, the recorder's `replayPending()` runs.
- *    A catalog completion sends no extra request. `replayPending()` on a closed recorder reads nothing and changes nothing.
+ *    A catalog completion sends no extra request itself (a recovery round waiting for it goes at its own Wake, S4 RT03b-2b in
+ *    GraphRecoveryBudgetContractTest). `replayPending()` on a closed recorder reads nothing and changes nothing.
  *  - A recorder failure is isolated per call: a failed capture becomes an empty list and the request goes on; a failed apply
  *    does not stop the coordinator's adoption, its publish or the next request; a failed replay does not undo the catalog.
  *    Each is reported through `onEventFailure`; none cancels the coordinator's retry owners.
