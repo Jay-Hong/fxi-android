@@ -5,6 +5,7 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.AuthUnavailableException
 import com.jay.fxi.data.auth.HttpExchangeEvidence
+import com.jay.fxi.data.entitlements.AccessFence
 import com.jay.fxi.data.entitlements.TopicAccessEnd
 import com.jay.fxi.data.entitlements.TopicAccessEndReason
 import com.jay.fxi.data.entitlements.TopicAccessFacts
@@ -19,6 +20,7 @@ import com.jay.fxi.data.remote.TopicUseAuthority
 import com.jay.fxi.data.remote.TopicUseLifetime
 import com.jay.fxi.data.remote.TopicUseWithheldException
 import com.jay.fxi.data.remote.dto.GraphV2CatalogPeriod
+import com.jay.fxi.data.remote.dto.GraphV2InProgressSeed
 import com.jay.fxi.data.remote.dto.GraphV2CatalogResponse
 import com.jay.fxi.data.remote.dto.GraphV2CatalogTab
 import com.jay.fxi.data.remote.dto.GraphV2Metadata
@@ -34,6 +36,7 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -191,6 +194,9 @@ class GraphV2RequestCoordinatorTest {
             }
         }
 
+        /** The issuer's namespace record; none unless a row names one (S4 RT01-B2b-1). */
+        var recordFence: AccessFence? = null
+
         val coordinator = GraphV2RequestCoordinator(
             fetcher = fetcher,
             owners = owners,
@@ -199,7 +205,7 @@ class GraphV2RequestCoordinatorTest {
             protectedAdmission = { protectedOpen },
             accessSnapshot = {
                 TopicAccessSnapshot(
-                    0L, TopicAccessFacts.NONE, invalidations,
+                    0L, TopicAccessFacts.NONE.copy(recordFence = recordFence), invalidations,
                     userEnd?.let { TopicAccessEnd(it, TopicAccessEndReason.IDENTITY_CHANGED, null, null, null) }, null
                 )
             },
@@ -1861,5 +1867,72 @@ class GraphV2RequestCoordinatorTest {
         assertEquals("the entry and the scope go together", GraphRequestState(), f.state)
         assertTrue(f.failures.isEmpty())
         f.close()
+    }
+
+    // --- S4 RT01-B2b-1: KRX the request owner cannot attribute --------------------------------------------------------
+
+    private val krxId = "krx.usd-krw-futures"
+
+    private fun krxCatalog() = GraphV2CatalogResponse(
+        tabs = listOf("usd", "jpy").map { tab ->
+            GraphV2CatalogTab(tab, tab, emptyMap(), listOf("3m", "1y").associateWith { GraphV2CatalogPeriod(listOf(SERIES, krxId), listOf(SERIES)) })
+        },
+        version = "2026-05-27",
+        supportedPeriods = listOf("1w", "3m", "1y"),
+        cacheTtlSeconds = 172800
+    )
+
+    private fun bucket(rate: Double) = GraphV2InProgressSeed(NOON - 10.minutes, rate + 2, rate - 2, rate, NOON - 5.minutes)
+
+    /** What one capability retirement passes to its selector - each candidate once - and what it answers. */
+    private fun Fixture.retireK(selects: (GraphCapabilityScope) -> Boolean): Pair<Set<GraphCapabilityScope>, GraphRuntimeRetirement> {
+        val seen = mutableListOf<GraphCapabilityScope>()
+        val result = coordinator.retireCapabilities { seen += it; selects(it) }
+        assertEquals("each candidate once: $seen", seen.size, seen.toSet().size)
+        return seen.toSet() to result
+    }
+
+    /**
+     * B2b04 (S4 RT01-B2b-1, B03): without cache ports no KRX half carries an epoch, so the owner's raw KRX is one candidate
+     * with a null epoch. The adapter's sweep - `it.uid == owner && (keep == null || it.krxCapabilityEpoch != keep)` - picks it
+     * whether it keeps the record's live K2 (itself a candidate, not picked) or keeps nothing, and it leaves every key's KRX
+     * series and current bucket and nothing else; a repeat finds only the live epoch. GENERAL alone, a current bucket
+     * included, is no candidate.
+     */
+    @Test fun B2b04_withoutCachePortsRawKrxIsOneUnattributedCandidate() = runTest {
+        val unattributed = GraphCapabilityScope("u1", null)
+        for (keep in listOf("K2", null)) {
+            val f = Fixture(this).also { it.autoCatalog = { s -> s.catalog.complete(ok(krxCatalog())) }; it.coordinator.start(); runCurrent() }
+            f.recordFence = keep?.let { AccessFence("u1", "e1", it) }
+            val live = setOfNotNull(keep?.let { GraphCapabilityScope("u1", it) })
+            for (key in listOf(USD_3M, JPY_3M)) {
+                f.coordinator.onActivated(key); runCurrent()
+                f.tabs(key).single().tab.complete(ok(tabDto(key, ids = listOf(SERIES, krxId))
+                    .copy(inProgress = mapOf(SERIES to bucket(1390.0), krxId to bucket(1395.0))))); runCurrent()
+                assertEquals("premise: $key", listOf(SERIES, krxId), f.state.entries.getValue(key).tab.graph.series.map { it.seriesId })
+            }
+            val before = f.state
+            val sweep: (GraphCapabilityScope) -> Boolean = { it.uid == "u1" && (keep == null || it.krxCapabilityEpoch != keep) }
+            assertEquals("keep=$keep", live + unattributed to GraphRuntimeRetirement.REMOVED, f.retireK(sweep))
+            assertEquals("keep=$keep: only the KRX series and buckets go", before.copy(entries = before.entries.mapValues { (_, e) ->
+                e.copy(tab = e.tab.copy(
+                    graph = e.tab.graph.copy(series = e.tab.graph.series.filter { it.seriesId == SERIES }),
+                    inProgress = e.tab.inProgress.filterKeys { it == SERIES }
+                ))
+            }), f.state)
+            assertEquals("keep=$keep", live to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retireK(sweep))
+            assertTrue(f.failures.isEmpty())
+            f.close()
+        }
+
+        val g = Fixture(this).also { it.autoCatalog = { s -> s.catalog.complete(ok(krxCatalog())) }; it.coordinator.start(); runCurrent() }
+        g.coordinator.onActivated(USD_3M); runCurrent()
+        g.tabs(USD_3M).single().tab.complete(ok(tabDto(USD_3M).copy(inProgress = mapOf(SERIES to bucket(1390.0))))); runCurrent()
+        assertEquals("premise: a GENERAL bucket", setOf(SERIES), g.state.entries.getValue(USD_3M).tab.inProgress.keys)
+        val before = g.state
+        assertEquals(emptySet<GraphCapabilityScope>() to GraphRuntimeRetirement.NOTHING_TO_REMOVE, g.retireK { true })
+        assertEquals(before, g.state)
+        assertTrue(g.failures.isEmpty())
+        g.close()
     }
 }

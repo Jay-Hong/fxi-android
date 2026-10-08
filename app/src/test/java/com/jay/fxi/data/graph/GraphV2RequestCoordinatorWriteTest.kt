@@ -886,4 +886,83 @@ class GraphV2RequestCoordinatorWriteTest {
             f.close()
         }
     }
+
+    // --- S4 RT01-B2b-1: a request started with a retired epoch ------------------------------------------------------
+
+    private val CK1 = GraphCapabilityScope("u1", "K1")
+    private val CK2 = GraphCapabilityScope("u1", "K2")
+
+    /** The P3-i adapter's sweep for owner u1: every epoch but [keep]. */
+    private fun sweep(keep: String): (GraphCapabilityScope) -> Boolean = { it.uid == "u1" && it.krxCapabilityEpoch != keep }
+
+    /** What one capability retirement passes to its selector - each candidate once - and what it answers. */
+    private fun Fixture.retireK(selects: (GraphCapabilityScope) -> Boolean): Pair<Set<GraphCapabilityScope>, GraphRuntimeRetirement> {
+        val seen = mutableListOf<GraphCapabilityScope>()
+        val result = coordinator.retireCapabilities { seen += it; selects(it) }
+        assertEquals("each candidate once: $seen", seen.size, seen.toSet().size)
+        return seen.toSet() to result
+    }
+
+    /** The record names [k]; this fixture's standing does not follow the record, so the use stays admitted. */
+    private fun TopicAccessSnapshot.recordK(k: String) = copy(facts = facts.copy(recordFence = AccessFence("u1", "e1", k)))
+
+    /**
+     * B2b06 (S4 RT01-B2b-1): retiring K1 takes only the K epoch from a request started with it; its fence, lifetime and
+     * general half stay. The first part goes beyond the agreed premise on purpose - the record moves to K2 while the use stays
+     * admitted - so the effect is visible: the answer takes its general half alone and writes it with no KRX candidate,
+     * unconfirmed when the completion's configuration is open and confirmed when it is closed. With the issuer's rotation
+     * (the lifetime invalidated) the same answer adopts, reserves and prepares nothing.
+     */
+    @Test fun B2b06_aRequestStartedWithTheEpochKeepsOnlyItsGeneralHalf() = writeTest {
+        for (open in listOf(true, false)) {
+            val f = Fixture(this)
+            f.start(); f.coordinator.onActivated(KEY); runCurrent()
+            val out = f.sent.single()
+            f.snapshot = snap(capabilityBlocks = if (open) emptySet() else setOf(TopicAccessBlock.NOT_GRANTED)).recordK("K2")
+            assertEquals("open=$open", setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+            out.tab.complete(ok(onlineDto(1500.0))); runCurrent()
+            val entry = f.state.entries.getValue(KEY)
+            assertEquals("open=$open: the general half alone", listOf(ONLINE), entry.tab.graph.series.map { it.seriesId })
+            assertEquals("open=$open: the stamp", if (open) null else NOON, entry.online200At)
+            assertNull("open=$open: no KRX candidate", f.store.reserved.single().first.krx)
+            val (captured, wantsKrx) = f.prepareCalls.single()
+            assertEquals("open=$open: the same fence", FENCE, captured.fence)
+            assertNull("open=$open", captured.krxCapabilityEpoch)
+            assertEquals(false, wantsKrx)
+            assertEquals(1500.0, f.diskGeneral())
+            assertNull(f.diskKrx())
+            assertEquals("open=$open", setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retireK(sweep("K2")))
+            assertEquals(emptyList<Throwable>(), f.failures)
+        }
+
+        val f = Fixture(this)
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        val out = f.sent.single()
+        f.snapshot = snap(invalidations = 4L).recordK("K2")
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        out.tab.complete(ok(onlineDto(1500.0))); runCurrent()
+        assertNull("nothing adopted", f.state.entries[KEY])
+        assertTrue("nothing reserved", f.store.reserved.isEmpty())
+        assertTrue("nothing prepared", f.prepareCalls.isEmpty())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * B2b06b (S4 RT01-B2b-1): a write already reserved for the answer is B2b-2's to settle; the port leaves it alone - no ticket
+     * is cancelled - and its general half is still written. (What happens to its KRX candidate is B2b-2's; the live
+     * capability is closed here so nothing of it is written either way.)
+     */
+    @Test fun B2b06b_aReservedWriteSurvivesTheRetirement() = writeTest {
+        val f = Fixture(this)
+        val held = CompletableDeferred<Unit>()
+        f.holdPrepare = held
+        f.adopt(this)
+        assertEquals("premise: the K1 write is preparing with its KRX candidate", true, f.prepareCalls.single().second)
+        f.snapshot = snap(capabilityBlocks = setOf(TopicAccessBlock.NOT_GRANTED)).recordK("K2")
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        assertTrue("the port cancels no ticket", f.store.cancelled.isEmpty())
+        held.complete(Unit); runCurrent()
+        assertEquals("the general half is still written", 1500.0, f.diskGeneral())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
 }

@@ -21,6 +21,7 @@ import com.jay.fxi.data.remote.dto.GraphV2CatalogPeriod
 import com.jay.fxi.data.remote.dto.GraphV2CatalogResponse
 import com.jay.fxi.data.remote.dto.GraphV2CatalogTab
 import com.jay.fxi.data.remote.dto.GraphV2Metadata
+import com.jay.fxi.data.remote.dto.GraphV2InProgressSeed
 import com.jay.fxi.data.remote.dto.GraphV2Point
 import com.jay.fxi.data.remote.dto.GraphV2Provenance
 import com.jay.fxi.data.remote.dto.GraphV2Range
@@ -39,6 +40,7 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -56,6 +58,7 @@ import okhttp3.Headers
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -274,6 +277,8 @@ class GraphV2RequestCoordinatorReGateTest {
         private val base = test.testScheduler.currentTime
         var fence: TopicSessionFence? = FENCE
         var protectedOpen = true
+        /** The catalog's tabs; usd alone unless a row lists more before its first request. */
+        var tabs = listOf("usd")
         private var revision = 100L
         var snapshot: TopicAccessSnapshot = snap()
             set(value) {
@@ -286,6 +291,11 @@ class GraphV2RequestCoordinatorReGateTest {
         var gateReads = 0
         private val gateHooks = mutableMapOf<Int, () -> Unit>()
         fun atGateRead(n: Int, action: () -> Unit) { gateHooks[n] = action }
+        /** Request-owner snapshot reads so far; a hook runs just before the read with its number (S4 RT01-B2b-1). */
+        var accessReads = 0
+        private val accessHooks = mutableMapOf<Int, () -> Unit>()
+        fun atAccessRead(n: Int, action: () -> Unit) { accessHooks[n] = action }
+        fun clearAccessHooks() = accessHooks.clear()
         val root: File = folder.newFolder()
         val files = RecordingFiles()
         val store = HeldStore(FileGraphV2DiskStore(root, codec, files, StandardTestDispatcher(test.testScheduler)))
@@ -325,7 +335,7 @@ class GraphV2RequestCoordinatorReGateTest {
             override suspend fun catalog(
                 owner: AuthSnapshot,
                 useAdmitted: () -> Boolean
-            ): AuthenticatedHttpResponse<GraphV2CatalogResponse> = ok(catalog())
+            ): AuthenticatedHttpResponse<GraphV2CatalogResponse> = ok(catalog(tabs))
 
             override suspend fun tab(
                 owner: AuthSnapshot,
@@ -344,7 +354,11 @@ class GraphV2RequestCoordinatorReGateTest {
             currentAccessFence = { fence },
             uses = uses,
             protectedAdmission = { true },
-            accessSnapshot = { snapshot },
+            accessSnapshot = {
+                accessReads++
+                accessHooks.remove(accessReads)?.invoke()
+                snapshot
+            },
             scope = scope,
             clock = AppClock { start + (test.testScheduler.currentTime - base).milliseconds },
             rateLimitJitter = { Duration.ZERO },
@@ -396,18 +410,28 @@ class GraphV2RequestCoordinatorReGateTest {
             AuthenticatedHttpFailure(code, headers, byteArrayOf(), null, null, AuthenticatedFailureKind.OTHER_HTTP), byteArrayOf(1))
     }
 
-    private fun catalog() = GraphV2CatalogResponse(
-        tabs = listOf(GraphV2CatalogTab("usd", "usd", emptyMap(),
-            listOf("1d", "1w", "3m", "1y").associateWith { GraphV2CatalogPeriod(ALL_IDS, ALL_IDS) })),
+    private fun catalog(tabs: List<String> = listOf("usd")) = GraphV2CatalogResponse(
+        tabs = tabs.map { tab -> GraphV2CatalogTab(tab, tab, emptyMap(),
+            listOf("1d", "1w", "3m", "1y").associateWith { GraphV2CatalogPeriod(ALL_IDS, ALL_IDS) }) },
         version = "2026-05-27",
         supportedPeriods = listOf("1w", "3m", "1y"),
         cacheTtlSeconds = 172800
     )
 
-    /** An online answer with a general and a KRX series; [krx] false leaves the KRX series out, [empty] every series. */
-    private fun onlineDto(rate: Double, period: GraphPeriod = GraphPeriod.THREE_MONTHS, krx: Boolean = true, empty: Boolean = false) =
+    /**
+     * An online answer with a general and a KRX series; [krx] false leaves the KRX series out, [empty] every series, and
+     * [inProgress] adds a current bucket to each series it keeps.
+     */
+    private fun onlineDto(
+        rate: Double,
+        period: GraphPeriod = GraphPeriod.THREE_MONTHS,
+        krx: Boolean = true,
+        empty: Boolean = false,
+        tab: String = "usd",
+        inProgress: Boolean = false
+    ) =
         GraphV2TabResponse(
-            tab = "usd",
+            tab = tab,
             period = period.code,
             series = if (empty) emptyList() else listOfNotNull(
                 GraphV2Series(ONLINE, ONLINE, "krw", "KRW", 2, listOf(GraphV2Point(NOON - 1.days, rate, "x")),
@@ -415,7 +439,10 @@ class GraphV2RequestCoordinatorReGateTest {
                 if (!krx) null else GraphV2Series(KRX_SERIES, KRX_SERIES, "krw", "KRW", 1,
                     listOf(GraphV2Point(NOON - 1.days, rate + 5, "krx")), GraphV2Provenance(false, emptyList()), null)
             ),
-            metadata = GraphV2Metadata(NOON - 1.hours, "1d", GraphV2Range("2026-07-05", "2026-10-05"))
+            metadata = GraphV2Metadata(NOON - 1.hours, "1d", GraphV2Range("2026-07-05", "2026-10-05")),
+            inProgress = if (!inProgress || empty) null else listOfNotNull(ONLINE, KRX_SERIES.takeIf { krx }).associateWith {
+                GraphV2InProgressSeed(NOON - 10.minutes, rate + 2, rate - 2, rate, NOON - 5.minutes)
+            }
         )
 
     private fun TestScope.step(d: Duration) {
@@ -1122,5 +1149,468 @@ class GraphV2RequestCoordinatorReGateTest {
         val sends = f.tabTimes()
         step(10.seconds)
         assertEquals("no check follows", sends, f.tabTimes())
+    }
+
+    // --- S4 RT01-B2b-1: retiring a KRX capability epoch ---------------------------------------------------------------
+    //
+    // Agreed in R4c/S4 rt01b2b_api_agreed.r2 (r1 proposal plus Codex's replacements). retireCapabilities runs on the loop's
+    // serial executor between events. Its caller has established that every selected named epoch really ended: it is never
+    // reused or published again. With the real issuer a K rotation also ends the old use lifetime - standing compares the
+    // issued context with the record, and losing it counts one user invalidation - and this fixture's snapshot follows that
+    // rule, so [rotate] below is the issuer's rotation as published inside its lock, before any new grant. The live epoch is
+    // the record's (owner, K) from one snapshot read, whatever the capability's admission: a hold is not a retirement.
+    //
+    // Under that premise some effects are visible only beyond it, so two parts leave it on purpose and say so: B2b05's
+    // `admitted` (the port starts no seed, its discarded attempt lets a normal start retry) and WriteTest's B2b06 (a request
+    // keeps its general half alone). The real issuer's rotation, renewal and re-approval are PremiumAccessTopicSnapshotTest's
+    // graphB2b01 (HTTP, the null-K capture) and graphB2b02 (a pending FillEmpty seed); a pending SupplementOccupied across the
+    // rotation is B2b05's `supplement` over this fixture, whose rejection takes the same gate path (the dead lifetime binds
+    // nothing). Recorded as equivalent for the mutation battery (rt01b2b1 contract): publishState and publish behave alike
+    // between events, since no write preparation is pending then (B2a's (d)).
+
+    private val CK1 = GraphCapabilityScope("u1", "K1")
+    private val CK2 = GraphCapabilityScope("u1", "K2")
+    private val JPY = GraphKey("jpy", GraphPeriod.THREE_MONTHS)
+
+    /** The P3-i adapter's sweep for owner u1: every epoch but [keep]; with no keep, every one. */
+    private fun sweep(keep: String?): (GraphCapabilityScope) -> Boolean =
+        { it.uid == "u1" && (keep == null || it.krxCapabilityEpoch != keep) }
+
+    /** What one retirement passes to its selector - each candidate once - and what it answers. */
+    private fun Fixture.retireK(selects: (GraphCapabilityScope) -> Boolean): Pair<Set<GraphCapabilityScope>, GraphRuntimeRetirement> {
+        val seen = mutableListOf<GraphCapabilityScope>()
+        val result = coordinator.retireCapabilities { seen += it; selects(it) }
+        assertEquals("each candidate once: $seen", seen.size, seen.toSet().size)
+        return seen.toSet() to result
+    }
+
+    /** The issuer's K1 -> K2 rotation inside its lock: K1's token stops standing, one invalidation, no new grant yet. */
+    private fun Fixture.rotate() {
+        snapshot = snap(krx = "K2", issuedRecord = AccessFence("u1", "e1", "K1"),
+            capabilityBlocks = setOf(TopicAccessBlock.NOT_GRANTED), invalidations = 4L)
+    }
+
+    private fun GraphEntry.withoutKrx() = copy(tab = tab.copy(
+        graph = tab.graph.copy(series = tab.graph.series.filterNot { it.seriesId.startsWith("krx.") }),
+        inProgress = tab.inProgress.filterKeys { !it.startsWith("krx.") }
+    ))
+
+    private fun Fixture.seedReasons() = diagnostics.filter { it.component == GraphV2DiskComponent.GENERAL }.map { it.reason }
+
+    /**
+     * B2b01 (S4 RT01-B2b-1): the record's epoch is live and always a candidate, even with nothing held for it; selecting it
+     * refuses the call before anything goes. One snapshot read names it, with the record's own owner - not the binding's, the
+     * grant's or the session's, and with or without a session. A capability hold does not make it retirable: a request
+     * started with it still takes its KRX half when the capability reopens.
+     */
+    @Test fun B2b01_theRecordsEpochIsRefused_alsoWhileHeld() = flipTest {
+        val idle = Fixture(this)
+        assertEquals("live though nothing is held", setOf(CK1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, idle.retireK { true })
+
+        val f = Fixture(this)
+        f.adopt(this, onlineDto(1500.0))
+        val before = f.state
+        assertEquals(setOf(CK1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, f.retireK { true })
+        assertEquals("nothing goes", before, f.state)
+        assertEquals(listOf(ONLINE, KRX_SERIES), f.exposedIds())
+
+        f.atAccessRead(f.accessReads + 2) { f.snapshot = snap(uid = "u2", krx = "K9") }
+        assertEquals("one snapshot read", setOf(CK1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, f.retireK { it == CK1 })
+        f.clearAccessHooks()
+        f.snapshot = snap(uid = "u2").let { it.copy(facts = it.facts.copy(recordFence = AccessFence("u1", "e1", "K1"))) }
+        f.fence = TopicSessionFence(AuthIdentityFence("u2", 1L), "e1", TopicGrantToken(7L))
+        assertEquals("the record's owner, not the binding's, the grant's or the session's",
+            setOf(CK1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, f.retireK { it == CK1 })
+        f.fence = null
+        assertEquals("nor with no session", setOf(CK1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, f.retireK { it == CK1 })
+        f.snapshot = snap()
+        f.fence = FENCE
+        assertEquals(before, f.state)
+
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        val inFlight = f.sent.last()
+        f.flip(this, snap(capabilityBlocks = HELD))
+        val held = f.state
+        assertEquals("held, still live", setOf(CK1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, f.retireK { it == CK1 })
+        assertEquals(held, f.state)
+        step(1.seconds); f.flip(this, snap())
+        inFlight.tab.complete(ok(onlineDto(1600.0))); runCurrent()
+        assertEquals("the request kept its epoch", listOf(ONLINE, KRX_SERIES), f.ids())
+        assertEquals(listOf(ONLINE, KRX_SERIES), f.exposedIds())
+        assertEquals(emptyList<Throwable>(), f.failures)
+        assertEquals(emptyList<Throwable>(), idle.failures)
+    }
+
+    /**
+     * B2b02 (S4 RT01-B2b-1, B03): retired before the request owner hears of the rotation, K1's half leaves every key - the
+     * active one with its current bucket, an inactive long period and an inactive tab - at once and nothing else does:
+     * the general halves, the stamps, the catalog and the configuration stay. The invalidated reader sees nothing; the kept
+     * configuration lets the next sync clear the stamps as before, and nothing of K1 is left to retire.
+     */
+    @Test fun B2b02_aRetiredEpochLeavesEveryKeyBeforeTheRotationIsHeard() = flipTest {
+        val f = Fixture(this)
+        f.tabs = listOf("usd", "jpy")
+        f.adopt(this, onlineDto(1400.0, period = GraphPeriod.ONE_YEAR), key = OTHER)
+        f.coordinator.onActivated(JPY); runCurrent()
+        f.sent.last().tab.complete(ok(onlineDto(1200.0, tab = "jpy"))); runCurrent()
+        f.coordinator.onActivated(KEY); runCurrent()
+        f.sent.last().tab.complete(ok(onlineDto(1500.0, inProgress = true))); runCurrent()
+        listOf(KEY, OTHER, JPY).forEach { assertEquals("premise: $it", listOf(ONLINE, KRX_SERIES), f.ids(it)) }
+        assertEquals("premise", setOf(ONLINE, KRX_SERIES), f.entry().tab.inProgress.keys)
+        val before = f.state
+
+        f.rotate()
+        assertEquals("no token stands, yet the record's epoch is live", setOf(CK2, CK1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED,
+            f.retireK { it == CK2 })
+        assertEquals(before, f.state)
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        assertEquals("only the KRX half goes, from every key", before.copy(entries = before.entries.mapValues { it.value.withoutKrx() }),
+            f.state)
+        assertEquals(setOf(ONLINE), f.entry().tab.inProgress.keys)
+        assertNull("the invalidated reader sees nothing", f.exposed())
+        assertEquals("nothing of K1 is left", setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retireK(sweep("K2")))
+        assertEquals("the record's closed epoch alone is still refused", setOf(CK2) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED,
+            f.retireK { true })
+
+        f.rebind(token = 8L, krx = "K2", invalidations = 4L)
+        f.coordinator.onContextChanged(); runCurrent()
+        assertNull("the next sync clears the stamp", f.entry().online200At)
+        assertNull(f.entry(OTHER).online200At)
+        listOf(KEY, OTHER, JPY).forEach { assertEquals(listOf(ONLINE), f.ids(it)) }
+        assertEquals(listOf(ONLINE), f.exposedIds())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * B2b03 (S4 RT01-B2b-1, B03): the port needs none of what the configuration strip needs. It removes K1's half when the
+     * rotation was heard without a context (the old grant acquires nothing), when a new context's binding is closed, when
+     * the record names no epoch at all - then nothing is live - and when the slot was adopted before any configuration was
+     * set: its epoch is the slot's own.
+     */
+    @Test fun B2b03_itWorksWhereTheConfigurationStripDoesNot() = flipTest {
+        val noContext = Fixture(this)
+        noContext.adopt(this, onlineDto(1500.0))
+        noContext.rotate()
+        noContext.coordinator.onContextChanged(); runCurrent()
+        assertEquals("premise: the strip did not run", listOf(ONLINE, KRX_SERIES), noContext.ids())
+        val stamp = noContext.entry().online200At
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, noContext.retireK(sweep("K2")))
+        assertEquals(listOf(ONLINE), noContext.ids())
+        assertEquals(1500.0, noContext.rate())
+        assertEquals(stamp, noContext.entry().online200At)
+
+        val closed = Fixture(this)
+        closed.adopt(this, onlineDto(1500.0))
+        closed.protectedOpen = false
+        closed.rebind(token = 8L, krx = "K2", invalidations = 4L)
+        closed.coordinator.onContextChanged(); runCurrent()
+        assertEquals("premise: the strip did not run", listOf(ONLINE, KRX_SERIES), closed.ids())
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, closed.retireK(sweep("K2")))
+        assertEquals(listOf(ONLINE), closed.ids())
+
+        val sealed = Fixture(this)
+        sealed.adopt(this, onlineDto(1500.0))
+        sealed.snapshot = snap(krx = null, issuedRecord = AccessFence("u1", "e1", "K1"),
+            capabilityBlocks = setOf(TopicAccessBlock.DERIVED_SEAL), invalidations = 4L)
+        assertEquals("no epoch, nothing live", setOf(CK1) to GraphRuntimeRetirement.REMOVED, sealed.retireK { it == CK1 })
+        assertEquals(listOf(ONLINE), sealed.ids())
+
+        val unset = Fixture(this)
+        unset.atGateRead(1) { unset.snapshot = snap(userBlocks = setOf(TopicAccessBlock.NOT_GRANTED)) }
+        unset.atGateRead(2) { unset.snapshot = snap() }
+        unset.adopt(this, onlineDto(1500.0))
+        assertEquals("premise: K1's half, adopted with no configuration to compare", listOf(ONLINE, KRX_SERIES), unset.ids())
+        unset.rotate()
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, unset.retireK(sweep("K2")))
+        assertEquals(listOf(ONLINE), unset.ids())
+        listOf(noContext, closed, sealed, unset).forEach { assertEquals(emptyList<Throwable>(), it.failures) }
+    }
+
+    /**
+     * B2b05 (S4 RT01-B2b-1, B03): a seed or a supplement out for K1 is given up - its own registration, not just its KRX half:
+     * its answer applies nothing and ends as an expired owner. A later normal start takes a new binding under the new grant,
+     * and K1's stored half is not joined to it. The seed and a spent supplement's attempt are candidates of their own. Beyond
+     * the premise, with the old use still admitted: the port itself starts no seed, and its discarded attempt lets a normal
+     * start retry. A seed or a supplement attempt made under a closed configuration owns no KRX and is no candidate.
+     */
+    @Test fun B2b05_aSeedOrSupplementOutForTheEpochIsGivenUp() = flipTest {
+        val c = components(serverTab(1300.0))
+        val fill = Fixture(this)
+        fill.put(c)
+        fill.store.hold[1] = CompletableDeferred()
+        fill.start(); fill.coordinator.onActivated(KEY); runCurrent()
+        assertEquals("premise: the seed is out", 1, fill.store.generalReads.size)
+        fill.rotate()
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, fill.retireK(sweep("K2")))
+        fill.store.release(1); runCurrent()
+        assertNull("its answer applies nothing", fill.state.entries[KEY])
+        assertEquals(listOf("Seed ownership expired"), fill.seedReasons())
+        assertEquals("the port starts no seed", 1, fill.store.generalReads.size)
+        assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, fill.retireK(sweep("K2")))
+        fill.rebind(token = 8L, krx = "K2", invalidations = 4L)
+        fill.coordinator.onContextChanged(); runCurrent()
+        assertEquals("a new start, general only", GraphEntry(joined(c, withKrx = false), null), fill.state.entries[KEY])
+
+        val supplement = Fixture(this)
+        supplement.put(c)
+        supplement.snapshot = snap(capabilityBlocks = HELD)
+        supplement.start(); supplement.coordinator.onActivated(KEY); runCurrent()
+        assertEquals("premise: seeded general only", GraphEntry(joined(c, withKrx = false), null), supplement.state.entries[KEY])
+        supplement.store.hold[2] = CompletableDeferred()
+        supplement.flip(this, snap())
+        assertEquals("premise: the supplement is out", 2, supplement.store.generalReads.size)
+        supplement.rotate()
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, supplement.retireK(sweep("K2")))
+        supplement.store.release(2); runCurrent()
+        assertEquals("its answer applies nothing", GraphEntry(joined(c, withKrx = false), null), supplement.state.entries[KEY])
+        assertEquals(listOf("Seed ownership expired"), supplement.seedReasons())
+        assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, supplement.retireK(sweep("K2")))
+
+        // The seed alone holds K1 once its request has failed.
+        val alone = Fixture(this)
+        alone.put(c)
+        alone.store.hold[1] = CompletableDeferred()
+        alone.start(); alone.coordinator.onActivated(KEY); runCurrent()
+        alone.sent.single().tab.complete(status(503)); runCurrent()
+        assertTrue("premise: the request has ended", alone.state.inFlight.isEmpty())
+        alone.rotate()
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, alone.retireK(sweep("K2")))
+        alone.store.release(1); runCurrent()
+        assertEquals(listOf("Seed ownership expired"), alone.seedReasons())
+
+        // A spent supplement that joined no KRX half leaves only its (K1, open) attempt.
+        val spent = Fixture(this)
+        spent.putGeneral(c.general)
+        spent.snapshot = snap(capabilityBlocks = HELD)
+        spent.start(); spent.coordinator.onActivated(KEY); runCurrent()
+        spent.flip(this, snap())
+        assertEquals("premise: the supplement ran and joined nothing", 2, spent.store.generalReads.size)
+        assertEquals(GraphEntry(joined(c, withKrx = false), null), spent.state.entries[KEY])
+        spent.rotate()
+        assertEquals("the attempt is a candidate of its own", setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, spent.retireK(sweep("K2")))
+        assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, spent.retireK(sweep("K2")))
+
+        // Beyond the agreed premise on purpose, as B2b06: the record moves to K2 while the old use stays admitted, so a seed
+        // the port started, or a kept attempt, would show.
+        val admitted = Fixture(this)
+        admitted.put(c)
+        admitted.store.hold[1] = CompletableDeferred()
+        admitted.start(); admitted.coordinator.onActivated(KEY); runCurrent()
+        admitted.snapshot = snap(krx = "K2")
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, admitted.retireK(sweep("K2")))
+        runCurrent()
+        assertEquals("the port starts no seed, though the kept context could bind one", 1, admitted.store.generalReads.size)
+        admitted.store.release(1); runCurrent()
+        assertNull(admitted.state.entries[KEY])
+        assertEquals(listOf("Seed ownership expired"), admitted.seedReasons())
+        admitted.coordinator.onRefreshRequested(); runCurrent()
+        assertEquals("the discarded attempt lets a normal start retry", GraphEntry(joined(c, withKrx = false), null),
+            admitted.state.entries[KEY])
+        // Made under a closed configuration, a seed or a supplement attempt holds no KRX ownership and is no candidate.
+        val closedSeed = Fixture(this)
+        closedSeed.put(c)
+        closedSeed.snapshot = snap(capabilityBlocks = HELD)
+        closedSeed.store.hold[1] = CompletableDeferred()
+        closedSeed.start(); closedSeed.coordinator.onActivated(KEY); runCurrent()
+        assertEquals("premise: the closed seed is out", 1, closedSeed.store.generalReads.size)
+        closedSeed.rotate()
+        assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, closedSeed.retireK(sweep("K2")))
+        closedSeed.store.release(1); runCurrent()
+        assertEquals("it ends at the closed gate, not as a discarded owner", listOf("Seed exposure admission is closed"),
+            closedSeed.seedReasons())
+
+        val closedAttempt = Fixture(this)
+        closedAttempt.adopt(this, onlineDto(1500.0))
+        closedAttempt.flip(this, snap(capabilityBlocks = HELD))
+        assertEquals("premise: the closed supplement ran", 2, closedAttempt.store.generalReads.size)
+        closedAttempt.rotate()
+        assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, closedAttempt.retireK(sweep("K2")))
+        listOf(fill, supplement, alone, spent, admitted, closedSeed, closedAttempt).forEach {
+            assertEquals(emptyList<Throwable>(), it.failures)
+        }
+    }
+
+    /**
+     * B2b07 (S4 RT01-B2b-1): K1 left only in a request released by the new grant; K2's half adopted since, a K2 supplement
+     * and a K2 request still out. Selecting the live K2 with K1 refuses everything; a selector that throws on its second call
+     * changes nothing; the K1 capture then goes, K2's half and stamp stay, and a repeat removes nothing. The released
+     * request's late answer applies nothing, K2's supplement ends unharmed, and K2's request keeps its epoch.
+     */
+    @Test fun B2b07_anUnselectedEpochStays_andAThrowingSelectorChangesNothing() = flipTest {
+        val f = Fixture(this)
+        f.adopt(this, onlineDto(1500.0))
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        val old = f.sent.last()
+        f.store.hold[2] = CompletableDeferred() // K2's supplement stays out over the ports
+        f.rotate()
+        f.rebind(token = 8L, krx = "K2", invalidations = 4L)
+        f.coordinator.onContextChanged(); runCurrent()
+        step(3.seconds)
+        f.sent.last().tab.complete(ok(onlineDto(1600.0))); runCurrent()
+        assertEquals("premise: K2's half", listOf(ONLINE, KRX_SERIES), f.exposedIds())
+        assertEquals("premise: K2's supplement is out", 2, f.store.generalReads.size)
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        val k2Out = f.sent.last()
+        assertTrue("premise: a request started with K2 is out", k2Out !== old && KEY in f.state.inFlight)
+        val adopted = f.state
+
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, f.retireK { true })
+        assertEquals(adopted, f.state)
+        val boom = IllegalStateException("selector")
+        var calls = 0
+        assertEquals(boom, assertThrows(IllegalStateException::class.java) {
+            f.coordinator.retireCapabilities { if (++calls == 2) throw boom else it == CK1 }
+        })
+        assertEquals(adopted, f.state)
+
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        assertEquals("K2's half and stamp stay", adopted, f.state)
+        assertEquals(listOf(ONLINE, KRX_SERIES), f.exposedIds())
+        assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retireK(sweep("K2")))
+        old.tab.complete(ok(onlineDto(1700.0))); runCurrent()
+        assertEquals("the late answer applies nothing", adopted, f.state)
+        f.store.release(2); runCurrent()
+        assertEquals("K2's supplement was not given up", emptyList<String>(), f.seedReasons())
+        k2Out.tab.complete(ok(onlineDto(1800.0))); runCurrent()
+        assertEquals("K2's request kept its epoch", listOf(ONLINE, KRX_SERIES), f.ids())
+        assertEquals("and confirms K2", f.at(3_000), f.entry().online200At)
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * B2b09 (S4 RT01-B2b-1): both axes end together (user epoch e1 -> e2 and K1 -> K2, the session already on e2). Retiring
+     * e1 and K1 in either order leaves the same state, the late answer applies nothing, and neither port finds anything
+     * after it. Return values are not compared: the user retirement leaves a released request's K capture to the other.
+     */
+    @Test fun B2b09_bothAxesInEitherOrderLeaveTheSameState() = flipTest {
+        val e1 = GraphDataScope("u1", "e1")
+        fun TestScope.ended(userFirst: Boolean): GraphRequestState {
+            val f = Fixture(this)
+            f.adopt(this, onlineDto(1500.0))
+            f.coordinator.onRefreshRequested(force = true); runCurrent()
+            val old = f.sent.last()
+            f.fence = TopicSessionFence(AuthIdentityFence("u1", 1L), "e2", TopicGrantToken(8L))
+            f.snapshot = snap(epoch = "e2", krx = "K2", issuedRecord = AccessFence("u1", "e1", "K1"),
+                capabilityBlocks = setOf(TopicAccessBlock.NOT_GRANTED), invalidations = 4L)
+            val user = { assertEquals(GraphRuntimeRetirement.REMOVED, f.coordinator.retireScopes { it == e1 }) }
+            val capability = {
+                assertEquals("userFirst=$userFirst: the released request's K1 capture goes",
+                    setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+            }
+            if (userFirst) { user(); capability() } else { capability(); user() }
+            val retired = f.state
+            old.tab.complete(ok(onlineDto(1700.0))); runCurrent()
+            assertEquals("userFirst=$userFirst: the late answer applies nothing", retired, f.state)
+            assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.coordinator.retireScopes { it == e1 })
+            assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retireK(sweep("K2")))
+            assertEquals(emptyList<Throwable>(), f.failures)
+            return retired
+        }
+        val userFirst = ended(userFirst = true)
+        assertEquals(GraphRequestState(), userFirst)
+        assertEquals(userFirst, ended(userFirst = false))
+    }
+
+    /**
+     * B2b08 (S4 RT01-B2b-1): two ended epochs - K1 in a released request, K2's half adopted and unheard ended in turn - and K3
+     * live. A selector that throws after it has selected changes nothing. An exact selection of K1 leaves K2's half, then an
+     * exact selection of K2 takes it.
+     */
+    @Test fun B2b08_anExactSelectionKeepsAnotherEndedEpoch() = flipTest {
+        val ck3 = GraphCapabilityScope("u1", "K3")
+        val f = Fixture(this)
+        f.adopt(this, onlineDto(1500.0))
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        f.rotate()
+        f.rebind(token = 8L, krx = "K2", invalidations = 4L)
+        f.coordinator.onContextChanged(); runCurrent()
+        step(3.seconds)
+        f.sent.last().tab.complete(ok(onlineDto(1600.0))); runCurrent()
+        assertEquals("premise: K2's half", listOf(ONLINE, KRX_SERIES), f.exposedIds())
+        f.snapshot = snap(token = 8L, krx = "K3", issuedRecord = AccessFence("u1", "e1", "K2"),
+            capabilityBlocks = setOf(TopicAccessBlock.NOT_GRANTED), invalidations = 5L)
+        val before = f.state
+        val (all, none) = f.retireK { false }
+        assertEquals(setOf(ck3, CK2, CK1) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, all to none)
+
+        val boom = IllegalStateException("after a selection")
+        var calls = 0
+        assertEquals(boom, assertThrows(IllegalStateException::class.java) {
+            f.coordinator.retireCapabilities { if (++calls == all.size) throw boom else it != ck3 }
+        })
+        assertEquals("nothing goes before the throw", before, f.state)
+        assertEquals(setOf(ck3, CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK { it == CK1 })
+        assertEquals("K2's half is not selected", before, f.state)
+        assertEquals(setOf(ck3, CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retireK { it == CK1 })
+        assertEquals(setOf(ck3, CK2) to GraphRuntimeRetirement.REMOVED, f.retireK { it == CK2 })
+        assertEquals(before.copy(entries = before.entries.mapValues { it.value.withoutKrx() }), f.state)
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * B2b10 (S4 RT01-B2b-1): under the live K2, a failed re-check leaves a failure and a cold retry. Retiring K1 (held by a
+     * released request) keeps both: the failure stays published and the cold retry goes out on time.
+     */
+    @Test fun B2b10_theLiveEpochsFailureAndColdRetryStay() = flipTest {
+        val f = Fixture(this)
+        f.adopt(this, onlineDto(1500.0))
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        f.rotate()
+        f.rebind(token = 8L, krx = "K2", invalidations = 4L)
+        f.coordinator.onContextChanged(); runCurrent()
+        step(3.seconds)
+        f.sent.last().tab.complete(status(503)); runCurrent()
+        val failed = f.state
+        assertTrue("premise: a failure", KEY in failed.failures)
+        val sends = f.sent.size
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        assertEquals("the failure stays", failed, f.state)
+        step(3.seconds)
+        assertEquals("the cold retry still goes out", sends + 1, f.sent.size)
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * B2b11 (S4 RT01-B2b-1): under the live K2, a capability hold arms the re-check of the active key. Retiring K1 (held by a
+     * released request) keeps it: the re-check goes out three seconds after the hold.
+     */
+    @Test fun B2b11_theLiveEpochsReCheckStays() = flipTest {
+        val f = Fixture(this)
+        f.adopt(this, onlineDto(1500.0))
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        f.rotate()
+        f.rebind(token = 8L, krx = "K2", invalidations = 4L)
+        f.coordinator.onContextChanged(); runCurrent()
+        step(3.seconds)
+        f.sent.last().tab.complete(ok(onlineDto(1600.0))); runCurrent()
+        val sends = f.tabTimes()
+        f.flip(this, snap(token = 8L, krx = "K2", invalidations = 4L, capabilityBlocks = HELD))
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        step(3.seconds)
+        assertEquals("the re-check armed before the port still goes out", sends + 6_000L, f.tabTimes())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * B2b12 (S4 RT01-B2b-1, D6): the port keeps the capability generation. A stored answer seeded under K1 (its general half;
+     * the disk holds K2's half, not K1's) waits for K2's supplement after the new grant, while the K1 request released by
+     * that grant still holds K1. Retiring K1 meanwhile leaves the supplement valid, and it joins K2's stored half.
+     */
+    @Test fun B2b12_anUnselectedEpochsSupplementStaysValid() = flipTest {
+        val c = components(serverTab(1300.0), krx = "K2")
+        val f = Fixture(this)
+        f.put(c)
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        assertEquals("premise: seeded general only", GraphEntry(joined(c, withKrx = false), null), f.state.entries[KEY])
+        f.store.hold[2] = CompletableDeferred()
+        f.rotate()
+        f.rebind(token = 8L, krx = "K2", invalidations = 4L)
+        f.coordinator.onContextChanged(); runCurrent()
+        assertEquals("premise: K2's supplement is out", 2, f.store.generalReads.size)
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        f.store.release(2); runCurrent()
+        assertEquals("the supplement joins K2's half", GraphEntry(joined(c), null), f.state.entries[KEY])
+        assertEquals(emptyList<String>(), f.seedReasons())
+        assertEquals(emptyList<Throwable>(), f.failures)
     }
 }

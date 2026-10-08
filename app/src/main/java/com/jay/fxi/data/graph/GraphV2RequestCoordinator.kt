@@ -72,6 +72,9 @@ internal data class GraphEntry(val tab: GraphV2Tab, val online200At: Instant?)
 
 internal enum class GraphRuntimeRetirement { REMOVED, NOTHING_TO_REMOVE, LIVE_SCOPE_SELECTED }
 
+/** A KRX capability namespace; a null epoch names raw KRX the coordinator cannot attribute. */
+internal data class GraphCapabilityScope(val uid: String, val krxCapabilityEpoch: String?)
+
 internal data class GraphRequestState(
     val dataScope: GraphDataScope? = null,
     val catalog: GraphCatalog? = null,
@@ -86,9 +89,9 @@ internal data class GraphRequestState(
  * When [recorder] is supplied, the coordinator loop, every recorder method, the control collector
  * and the sink worker must use the same serial executor. RT01 must verify this wiring.
  *
- * [start], [close] and [retireScopes] must run on the loop's serial executor whether or not
- * [recorder] is supplied, because they mutate loop-confined state (in the assembly, its injected
- * always-dispatching Main).
+ * [start], [close], [retireScopes] and [retireCapabilities] must run on the loop's serial executor
+ * whether or not [recorder] is supplied, because they mutate loop-confined state (in the assembly,
+ * its injected always-dispatching Main).
  * [close] ends input and releases ownership synchronously, even before the loop's first dispatch.
  * The loop's finally uses the same idempotent cleanup; the supplied scope is not cancelled.
  *
@@ -159,7 +162,8 @@ internal class GraphV2RequestCoordinator(
         val key: GraphKey?,
         val originalTab: String,
         val activityGeneration: Long,
-        val accessCapture: GraphV2AccessCapture? = null,
+        /** Loop-confined; capability retirement replaces only its KRX epoch. */
+        var accessCapture: GraphV2AccessCapture? = null,
         recoveryRequests: List<GraphRecoveryRequest> = emptyList()
     ) {
         // The only request-owned mutable value consulted outside the loop. Job completion is
@@ -476,6 +480,119 @@ internal class GraphV2RequestCoordinator(
         publishState()
         return GraphRuntimeRetirement.REMOVED
     }
+
+    /**
+     * Retires selected KRX capability scopes synchronously on the loop's serial executor, between
+     * events. It does not dispatch or suspend. The caller must establish that each selected named
+     * epoch really ended, and must never reuse or republish it. The gate, [uses] and coordinator
+     * must read the same actual issuer's live snapshot: its capability rotation invalidates the
+     * old use lifetime. Changing K while keeping that lifetime admitted is outside this contract.
+     * A capability hold alone does not establish retirement.
+     *
+     * Live is the non-null (ownerUid, krxCapabilityEpoch) pair from the recordFence in exactly one
+     * [accessSnapshot] read. Both values come from that record, regardless of admission, standing
+     * token, binding, session or local context. Live is always a candidate. Other distinct
+     * candidates are protected-slot KRX keys, non-null KRX epochs in registered and pendingReleased
+     * access captures, and allowed, non-null record epochs in seed registrations and supplement
+     * attempt markers. Seeds use their context owner; markers use the snapshot data-scope owner.
+     * Without cache ports, raw entries containing a krx. seriesId or inProgress key additionally
+     * contribute (data-scope uid, null). This null means unattributed KRX, not a named epoch or the
+     * null-epoch sweep request in a purge journal. Configuration and existing writes are not candidates.
+     *
+     * [selects] runs exactly once per distinct candidate unless it throws. All selection and change
+     * planning precede mutation. A selector exception propagates unchanged with no state changes;
+     * selecting live returns [GraphRuntimeRetirement.LIVE_SCOPE_SELECTED] with no state changes.
+     * This port neither synchronizes nor acquires a context or a replacement capture.
+     *
+     * (a) Selected slots lose only their KRX components. Their raw and protected entries are rebuilt
+     * from the same GENERAL envelope, preserving responseId, stamp and supplement generation, across
+     * every tab and period, including inactive keys.
+     * (b) Selecting the unattributed candidate strips krx. series and current buckets from all raw entries.
+     * (c) Selected request captures retain their USER fence and lifetime; only the KRX epoch becomes
+     * null. Later admitted completions can adopt and reserve GENERAL only, using the existing
+     * configuration confirmation rules. An invalidated lifetime still admits no response or recovery.
+     * (d) A selected seed loses its registration and both attempt markers. Its late completion applies
+     * neither GENERAL nor KRX. A selected supplement marker alone is cleared without discarding an
+     * unselected seed. No seed starts here; normal seed paths may retry with a fresh binding when
+     * live admission, context, support and occupancy permit.
+     * (e) GENERAL data, capabilityConfiguration, capabilityGeneration, online200At, catalog, context,
+     * active demand, retry owners, timer, floor, failures, writeTasks and recovery captures survive.
+     * Subsequent normal configuration synchronization retains its existing strip/generation/flip
+     * behavior; this port invalidates no stamp and creates no flip, timer or request. Existing write
+     * candidates and preparation/commit races belong to B2b-2.
+     * (f) Changes are published through [publishState] before returning, without starting preparation.
+     *
+     * [GraphRuntimeRetirement.REMOVED] means KRX data, a capture epoch or seed/supplement ownership
+     * was newly removed. Unless live is selected, a call that newly removes nothing, including a
+     * repeated call, returns [GraphRuntimeRetirement.NOTHING_TO_REMOVE].
+     */
+    fun retireCapabilities(selects: (GraphCapabilityScope) -> Boolean): GraphRuntimeRetirement {
+        val record = accessSnapshot().facts.recordFence
+        val live = record?.ownerUid?.let { uid ->
+            record.krxCapabilityEpoch?.let { GraphCapabilityScope(uid, it) }
+        }
+        val registrations = (listOfNotNull(catalogRequest) + tabRequests.values + pendingReleased.values).distinct()
+        fun captureScope(registration: Registration): GraphCapabilityScope? = registration.accessCapture?.let { captured ->
+            captured.krxCapabilityEpoch?.let { GraphCapabilityScope(captured.fence.identity.uid, it) }
+        }
+        fun slotScope(slot: ProtectedSlot): GraphCapabilityScope? = slot.components.krx?.key?.let {
+            GraphCapabilityScope(it.uid, it.krxCapabilityEpoch)
+        }
+        val seedScope = seedRegistration?.let { seed ->
+            seed.configuration.recordEpoch?.takeIf { seed.configuration.allowed }?.let {
+                GraphCapabilityScope(seed.context.fence.identity.uid, it)
+            }
+        }
+        val supplementScope = attemptedSupplement?.configuration?.takeIf { it.allowed }?.recordEpoch?.let { epoch ->
+            snapshot.dataScope?.uid?.let { GraphCapabilityScope(it, epoch) }
+        }
+        val unattributed = if (cachePorts != null) null else snapshot.dataScope?.uid?.takeIf {
+            snapshot.entries.values.any { hasKrx(it.tab) }
+        }?.let { GraphCapabilityScope(it, null) }
+
+        val candidates = linkedSetOf<GraphCapabilityScope>()
+        live?.let { candidates += it }
+        protectedSlots.values.forEach { slot -> slotScope(slot)?.let { candidates += it } }
+        registrations.forEach { registration -> captureScope(registration)?.let { candidates += it } }
+        seedScope?.let { candidates += it }
+        supplementScope?.let { candidates += it }
+        unattributed?.let { candidates += it }
+
+        val selected = candidates.filter(selects).toSet()
+        if (live != null && live in selected) return GraphRuntimeRetirement.LIVE_SCOPE_SELECTED
+        val slotKeys = protectedSlots.filterValues { slotScope(it) in selected }.keys
+        val captureUpdates = registrations.filter { captureScope(it) in selected }.map { registration ->
+            registration to checkNotNull(registration.accessCapture).copy(krxCapabilityEpoch = null)
+        }
+        val retireSeed = seedScope != null && seedScope in selected
+        val retireSupplement = supplementScope != null && supplementScope in selected
+        val stripRaw = unattributed != null && unattributed in selected
+        if (slotKeys.isEmpty() && captureUpdates.isEmpty() && !retireSeed && !retireSupplement && !stripRaw) {
+            return GraphRuntimeRetirement.NOTHING_TO_REMOVE
+        }
+
+        var entries = snapshot.entries
+        var slots = protectedSlots
+        for (key in slotKeys) {
+            val slot = slots.getValue(key)
+            val tab = joinGraphV2Components(slot.components.general, null).tab
+            val entry = entries.getValue(key).copy(tab = tab)
+            entries = entries + (key to entry)
+            slots = slots + (key to slot.copy(entry = entry, components = slot.components.copy(krx = null)))
+        }
+        if (stripRaw) entries = entries.mapValues { (_, entry) -> entry.copy(tab = generalOnly(entry.tab)) }
+        val nextSnapshot = snapshot.copy(entries = entries)
+
+        captureUpdates.forEach { (registration, captured) -> registration.accessCapture = captured }
+        if (retireSeed) discardSeed() else if (retireSupplement) attemptedSupplement = null
+        protectedSlots = slots
+        snapshot = nextSnapshot
+        publishState()
+        return GraphRuntimeRetirement.REMOVED
+    }
+
+    private fun hasKrx(tab: GraphV2Tab): Boolean =
+        tab.graph.series.any { it.seriesId.startsWith("krx.") } || tab.inProgress.keys.any { it.startsWith("krx.") }
 
     private fun scopeOf(fence: TopicSessionFence): GraphDataScope? =
         fence.userAccessEpoch?.let { GraphDataScope(fence.identity.uid, it) }
@@ -1160,7 +1277,8 @@ internal class GraphV2RequestCoordinator(
             // The protected slot is absent and the raw GENERAL fallback remains unconfirmed.
             return null
         }
-        // Memory follows the completion configuration; writes retain the original request-start split.
+        // Memory follows the completion configuration; writes use the request capture's split (its start
+        // epoch, or none once capability retirement cleared it).
         val memoryComponents = components.copy(krx = components.krx.takeIf {
             configuration?.allowed == true && configuration.recordEpoch != null &&
                 configuration.recordEpoch == registration.accessCapture?.krxCapabilityEpoch

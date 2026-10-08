@@ -6,6 +6,7 @@ import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.graph.DefaultGraphV2AtomicFileIo
 import com.jay.fxi.data.graph.FileGraphV2DiskStore
 import com.jay.fxi.data.graph.GraphAccessFenceBridge
+import com.jay.fxi.data.graph.GraphCapabilityScope
 import com.jay.fxi.data.graph.GraphDataScope
 import com.jay.fxi.data.graph.GraphEntry
 import com.jay.fxi.data.graph.GraphKey
@@ -23,13 +24,18 @@ import com.jay.fxi.data.graph.GraphV2CachePorts
 import com.jay.fxi.data.graph.GraphV2DiskComponent
 import com.jay.fxi.data.graph.GraphV2DiskRead
 import com.jay.fxi.data.graph.GraphV2DiskStore
+import com.jay.fxi.data.graph.GraphV2Domain
 import com.jay.fxi.data.graph.GraphV2Fetching
 import com.jay.fxi.data.graph.GraphV2GeneralEnvelope
 import com.jay.fxi.data.graph.GraphV2GeneralKey
 import com.jay.fxi.data.graph.GraphV2IoAdmission
 import com.jay.fxi.data.graph.GraphV2RequestCoordinator
+import com.jay.fxi.data.graph.GraphV2Validation
+import com.jay.fxi.data.graph.GraphV2WriteReservation
 import com.jay.fxi.data.graph.JsonGraphV2EnvelopeCodec
 import com.jay.fxi.data.graph.graphRecorderCatalog
+import com.jay.fxi.data.graph.joinGraphV2Components
+import com.jay.fxi.data.graph.splitGraphV2ServerTab
 import com.jay.fxi.data.local.GraphSelectionAudience
 import com.jay.fxi.data.local.GraphSelectionKey
 import com.jay.fxi.data.local.GraphSelectionReadResult
@@ -63,6 +69,7 @@ import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphCatalog
 import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSeriesSelection
+import com.jay.fxi.domain.model.GraphTabAdmission
 import com.jay.fxi.time.AppClock
 import com.jay.fxi.ui.premium.graph.GraphV2Content
 import com.jay.fxi.ui.premium.graph.GraphV2ScreenState
@@ -1499,7 +1506,9 @@ class PremiumAccessTopicSnapshotTest {
         val h: Harness,
         startRecorder: Boolean = true,
         /** The protected admission the coordinator and the gate share; one function object (S4 RT01-A2). */
-        admission: (() -> Boolean)? = null
+        admission: (() -> Boolean)? = null,
+        /** The disk store; an empty one of its own unless a row passes one (S4 RT01-B2b-1). */
+        store: GraphV2DiskStore? = null
     ) {
         private val scheduler = test.testScheduler
         val dispatcher = StandardTestDispatcher(scheduler)
@@ -1551,7 +1560,7 @@ class PremiumAccessTopicSnapshotTest {
             rateLimitJitter = { Duration.ZERO },
             onEventFailure = { failures += it },
             cachePorts = GraphV2CachePorts(
-                FileGraphV2DiskStore(folder.newFolder(), JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), dispatcher),
+                store ?: FileGraphV2DiskStore(folder.newFolder(), JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), dispatcher),
                 access,
                 onSeedDiagnostic = {}
             ),
@@ -3119,6 +3128,164 @@ class PremiumAccessTopicSnapshotTest {
         seen.clear()
         assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, g.coordinator.retireScopes { seen += it; it == scope })
         assertTrue("gone once its answer is handled", seen.isEmpty())
+        assertTrue(g.failures.isEmpty())
+    }
+
+    private fun GraphRig.krxIn3m(): Boolean =
+        coordinator.state.value.entries[KEY_3M]?.tab?.graph?.series?.any { it.seriesId == KRX_SERIES } == true
+
+    /**
+     * graphB2b01 (S4 RT01-B2b-1, B04): over the real issuer. The capability rotation lands closed (K1 -> K2); the P3-i sweep
+     * retires everything of the owner but the record's K2, and K1's half leaves the 3m entry. Nothing old rejoins: the 3m
+     * and 1d requests started with K1 apply nothing when they answer, and a use renewed while K2 is closed binds no epoch and
+     * gains none when the issuer re-approves K2 under the same lifetime - nor does a request it started. Only a capture taken
+     * after the re-approval carries K2, and only a request started with it takes a KRX half. A second sweep finds no K1. The
+     * sweep takes only the K epoch from a request: the 1d request keeps kb's recovery capture.
+     */
+    @Test
+    fun graphB2b01_aReapprovedEpochIsTheOnlyKrxAfterARetiredOne() = snapshotTest {
+        val h = granted()
+        val g = GraphRig(this, h)
+        val a = approve(g)
+        val k1 = checkNotNull(a.capture.krxCapabilityEpoch) { "premise: approved with a KRX epoch" }
+        g.coordinator.onActivated(KEY_3M); runCurrent()
+        g.coordinator.onRefreshRequested(force = true); runCurrent()
+        val old3m = g.tabs(KEY_3M).last()
+        assertTrue("premise: K1's half in the 3m entry", g.krxIn3m())
+
+        val parked = gate()
+        h.store.rotationGate = parked
+        h.source.next = { active(krx = false) }
+        val refreshing = launch { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+        parked.complete(Unit)
+        settle()
+        refreshing.join()
+        val k2 = checkNotNull(h.store.record.krxCapabilityEpoch) { "premise: a new epoch" }
+        assertNotEquals("premise: the capability epoch moved", k1, k2)
+        assertFalse("premise: the old token no longer stands", h.facts.tokenStanding)
+
+        val keepK2: (GraphCapabilityScope) -> Boolean = { it.uid == OWNER && it.krxCapabilityEpoch != k2 }
+        val seen = mutableListOf<GraphCapabilityScope>()
+        assertEquals(GraphRuntimeRetirement.REMOVED, g.coordinator.retireCapabilities { seen += it; keepK2(it) })
+        assertEquals(setOf(GraphCapabilityScope(OWNER, k2), GraphCapabilityScope(OWNER, k1)), seen.toSet())
+        assertFalse("K1's half left the 3m entry", g.krxIn3m())
+        val recovery = mutableListOf<GraphDataScope>()
+        assertFalse(g.coordinator.purgeRecoveryCaptures { recovery += it; false })
+        assertTrue("the 1d request keeps kb's recovery capture", recovery.isNotEmpty())
+        val retired = g.coordinator.state.value.entries
+        old3m.tab.complete(ok(g.threeMonthTab()))
+        a.day.tab.complete(ok(g.dayTab())); runCurrent()
+        assertEquals("the K1 requests apply nothing", retired, g.coordinator.state.value.entries)
+
+        val renewed = g.publishIssued(); runCurrent()
+        g.sent.filter { it.kind == "catalog" && !it.catalog.isCompleted }.forEach { it.catalog.complete(ok(graphCatalog())) }
+        runCurrent()
+        val fresh = checkNotNull(g.uses.acquire(renewed)) { "a fresh use under the new grant" }
+        val closed = checkNotNull(g.access.bind(renewed, fresh)) { "the gate binds the fresh use" }
+        assertNull("bound while K2 is closed", closed.krxCapabilityEpoch)
+        val closedTab = g.tabs(KEY_3M).last()
+        assertTrue("premise: a 3m request started while K2 is closed", closedTab !== old3m && closedTab.guard())
+
+        h.source.next = { active(krx = true) }
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        settle()
+        assertEquals("premise: the same K2 reopened", k2, h.store.record.krxCapabilityEpoch)
+        assertTrue("premise: the same lifetime", g.uses.admits(fresh))
+        assertFalse("the closed capture gains nothing", g.access.admits(closed, GraphV2DiskComponent.KRX))
+        val reopened = checkNotNull(g.access.bind(renewed, fresh))
+        assertEquals("a new capture carries K2", k2, reopened.krxCapabilityEpoch)
+        g.coordinator.onContextChanged(); runCurrent()
+        closedTab.tab.complete(ok(g.threeMonthTab())); runCurrent()
+        assertFalse("nor does a request it started", g.krxIn3m())
+
+        g.coordinator.onRefreshRequested(force = true); runCurrent()
+        val reopenedTab = g.tabs(KEY_3M).last()
+        assertTrue("premise: a request started after the re-approval", reopenedTab !== closedTab)
+        reopenedTab.tab.complete(ok(g.threeMonthTab())); runCurrent()
+        assertTrue("it takes K2's half", g.krxIn3m())
+        val exposed = checkNotNull(g.coordinator.protectedEntry(KEY_3M)) { "exposed to the fresh use" }
+        assertTrue(exposed.tab.graph.series.any { it.seriesId == KRX_SERIES })
+
+        seen.clear()
+        assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, g.coordinator.retireCapabilities { seen += it; keepK2(it) })
+        assertEquals("only K2 is held", setOf(GraphCapabilityScope(OWNER, k2)), seen.toSet())
+        assertTrue(g.failures.isEmpty())
+    }
+
+    /** The real store, with GENERAL reads counted and held after the real read returned when a row asks (S4 RT01-B2b-1). */
+    private class HeldReads(private val real: GraphV2DiskStore) : GraphV2DiskStore by real {
+        var reads = 0
+        val hold = mutableMapOf<Int, CompletableDeferred<Unit>>()
+
+        override suspend fun readGeneral(
+            key: GraphV2GeneralKey,
+            catalog: GraphCatalog?,
+            admission: GraphV2IoAdmission
+        ): GraphV2DiskRead<GraphV2GeneralEnvelope> {
+            val result = real.readGeneral(key, catalog, admission)
+            hold[++reads]?.await()
+            return result
+        }
+    }
+
+    /**
+     * graphB2b02 (S4 RT01-B2b-1, B04): over the real issuer, a FillEmpty seed for K1's stored answer is out when the capability
+     * rotation lands closed. The P3-i sweep retires K1, the use is renewed while K2 is closed, and K2 is re-approved under the
+     * same lifetime; only then does the K1 seed answer. It applies nothing and K1's stored half never joins: the new context
+     * seeds the stored general half alone, nothing is exposed with a KRX half, and the 3m entry carries none.
+     */
+    @Test
+    fun graphB2b02_aSeedOutForARetiredEpochRejoinsNothing() = snapshotTest {
+        val h = granted()
+        val k1 = checkNotNull(h.store.record.krxCapabilityEpoch) { "premise: a KRX epoch" }
+        val epoch = checkNotNull(h.store.record.userAccessEpoch) { "premise: a user epoch" }
+        val held = HeldReads(FileGraphV2DiskStore(folder.newFolder(), JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(),
+            StandardTestDispatcher(testScheduler)))
+        val g = GraphRig(this, h, store = held)
+        val tab = (GraphV2Domain.admit(g.threeMonthTab(), "usd", GraphPeriod.THREE_MONTHS, null) as GraphTabAdmission.Accepted).tab
+        val stored = (splitGraphV2ServerTab(tab, GraphV2GeneralKey(OWNER, epoch, "usd", GraphPeriod.THREE_MONTHS.code), k1, "stored", null)
+            as GraphV2Validation.Valid).value
+        val ticket = (held.reserveWrite(stored) as GraphV2WriteReservation.Reserved).ticket
+        held.write(ticket) { true }
+        held.hold[1] = gate()
+        g.publishIssued(); runCurrent()
+        g.coordinator.onActivated(KEY_3M); runCurrent()
+        assertEquals("premise: the K1 seed is out", 1, held.reads)
+        assertNull(g.coordinator.state.value.entries[KEY_3M])
+
+        val parked = gate()
+        h.store.rotationGate = parked
+        h.source.next = { active(krx = false) }
+        val refreshing = launch { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        runCurrent()
+        parked.complete(Unit)
+        settle()
+        refreshing.join()
+        val k2 = checkNotNull(h.store.record.krxCapabilityEpoch) { "premise: a new epoch" }
+        assertNotEquals("premise: the capability epoch moved", k1, k2)
+        val seen = mutableListOf<GraphCapabilityScope>()
+        assertEquals(GraphRuntimeRetirement.REMOVED, g.coordinator.retireCapabilities {
+            seen += it; it.uid == OWNER && it.krxCapabilityEpoch != k2
+        })
+        assertEquals("the seed held K1", setOf(GraphCapabilityScope(OWNER, k2), GraphCapabilityScope(OWNER, k1)), seen.toSet())
+
+        val renewed = g.publishIssued(); runCurrent()
+        g.sent.filter { it.kind == "catalog" && !it.catalog.isCompleted }.forEach { it.catalog.complete(ok(graphCatalog())) }
+        runCurrent()
+        h.source.next = { active(krx = true) }
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        settle()
+        assertEquals("premise: the same K2 reopened", k2, h.store.record.krxCapabilityEpoch)
+        val fresh = checkNotNull(g.uses.acquire(renewed)) { "premise: the renewed use" }
+        assertEquals("premise: a capture now carries K2", k2, checkNotNull(g.access.bind(renewed, fresh)).krxCapabilityEpoch)
+        g.coordinator.onContextChanged(); runCurrent()
+        checkNotNull(held.hold[1]).complete(Unit); runCurrent()
+
+        assertEquals("the stored general half alone", GraphEntry(joinGraphV2Components(stored.general, null).tab, null),
+            g.coordinator.state.value.entries[KEY_3M])
+        val exposed = g.coordinator.protectedEntry(KEY_3M)
+        assertTrue("nothing exposed with a KRX half", exposed == null || exposed.tab.graph.series.none { it.seriesId == KRX_SERIES })
         assertTrue(g.failures.isEmpty())
     }
 
