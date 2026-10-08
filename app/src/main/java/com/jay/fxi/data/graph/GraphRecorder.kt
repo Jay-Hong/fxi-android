@@ -28,6 +28,7 @@ internal enum class GraphRecorderPurge { REMOVED, NOTHING_TO_REMOVE, LIVE_SCOPE_
  * Mutations work before [start]. Each reads its suppliers before binding the original input or
  * consumer, then calls the reducer even if admission is refused, and publishes only the final state
  * before returning. Observe, response application and [loseTopics] each read [clock] once.
+ * [retain] reads only the clock, once, and syncs nothing.
  * Both observe paths and [loseTopics] replay held inputs in order before the new input or loss,
  * using the same suppliers and clock value. Only observations bind their original captures;
  * continuity facts need no admission.
@@ -209,6 +210,15 @@ internal class GraphRecorder(
         val currentFence = currentAccessFence()
         val candidate = GraphRecorderReducer.exposed(mutableState.value, snapshot, currentFence, admission = true)
         return if (gate.bind(fence, lifetime) != null) candidate else emptyMap()
+    }
+
+    /**
+     * S4 RT05a: retention at one clock read for every series, published once - an empty recorder too. It adds no observation,
+     * syncs no access and replays nothing; after [close], it reads nothing.
+     */
+    fun retain() {
+        if (closed) return
+        mutableState.value = GraphRecorderReducer.retain(mutableState.value, clock.now())
     }
 
     /** Deletes without access synchronization; even an empty selected scope is cleared and published. */

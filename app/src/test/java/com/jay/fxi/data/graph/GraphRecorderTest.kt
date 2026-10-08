@@ -96,6 +96,11 @@ import org.junit.Test
  * fence read and binds the gate with the consumer's own fence and lifetime; it stores and publishes nothing - also on a
  * discard - judges without a replay, and does not read the clock; a refused admission and a closed recorder are Unreadable.
  * The reducer's judgement is GraphTabRecoveryDemandTest's.
+ *
+ * S4 RT05a (rt05_api_agreed.r2 §4-e) adds R01: `retain()` reads the clock once and replaces every series with
+ * `retainGraphRecoverable` at that one time - the retention rules themselves stay GraphRecoverableStateTest's F10-F30 - and
+ * keeps the scope, held inputs, lost topics, untransferred markers, seen values and versions. It publishes once, also with
+ * nothing held, adds no observation and replays nothing; after close it reads nothing.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphRecorderTest {
@@ -885,5 +890,69 @@ class GraphRecorderTest {
             heldOnly.recorder.recoveryDemand("usd", fenceN, l3, noon))
         rig.recorder.close()
         assertEquals("a closed recorder", GraphTabRecoveryDemand.Unreadable, rig.recorder.recoveryDemand("usd", fenceN, l3, noon))
+    }
+
+    /** A hana quote at [at] from scope N under L3. */
+    private fun hanaBatch(rate: Double, at: Instant) = TopicGraphInput.Observations(
+        1L, "fx:usd-krw", TopicGraphPath.WS, attribution(fenceN, l3), 1L,
+        listOf(TopicGraphCandidate.Quote("hana", "usd-krw", rate, at, null))
+    )
+
+    /**
+     * R01 (RT05a E02/E09/E13): retain() reads the clock once and no other supplier, and replaces every series with
+     * retainGraphRecoverable at that time; every other field stays. It publishes once, also when nothing is held. A reversal
+     * raises a generation once and a second retain at that same time raises none; after close it reads nothing.
+     */
+    @Test fun R01_retainAppliesRetentionToEverySeriesAtOneClockRead() = recorderTest {
+        val rig = Rig(this)
+        rig.recorder.observe(hanaBatch(1351.2, kst("19:55:00")))
+        rig.loaded()
+        val hana = GraphObservationSeriesKey(scopeN, "hana.usd")
+        val before = rig.state()
+        assertEquals("premise: two series", setOf(kb, hana), before.series.keys)
+        rig.record()
+        runCurrent()
+        val emitted = rig.emissions.size
+        val reads = rig.clockReads
+        // 26 hours on, both series' buckets are outside the 25 h window.
+        val later = noon + 26.hours
+        rig.clockNow = later
+        val supplierReads = Triple(rig.snapshotReads, rig.fenceReads, rig.catalogReads)
+        rig.recorder.retain()
+        assertEquals("one clock read", reads + 1, rig.clockReads)
+        assertEquals("no access sync, no admission, no replay: no supplier read", supplierReads,
+            Triple(rig.snapshotReads, rig.fenceReads, rig.catalogReads))
+        assertEquals("published once", emitted + 1, rig.emissions.size)
+        val after = rig.state()
+        assertEquals(before.series.keys, after.series.keys)
+        for ((key, series) in before.series) {
+            assertEquals("$key at the one read time", fingerprint(retainGraphRecoverable(series, later)),
+                fingerprint(after.series.getValue(key)))
+            assertNotEquals("premise: retention changed $key", fingerprint(series), fingerprint(after.series.getValue(key)))
+        }
+        assertEquals("every other field kept", whole(before).copy(series = emptyMap()), whole(after).copy(series = emptyMap()))
+        rig.clockNow = later - 2.hours
+        rig.recorder.retain()
+        val reversed = rig.state()
+        assertEquals("premise: the reversal raised kb's generation", after.series.getValue(kb).generation + 1,
+            reversed.series.getValue(kb).generation)
+        rig.recorder.retain()
+        assertEquals("again at the reversed time: no further generation", reversed.series.mapValues { fingerprint(it.value) },
+            rig.state().series.mapValues { fingerprint(it.value) })
+
+        val empty = Rig(this)
+        empty.record()
+        runCurrent()
+        val first = empty.emissions.size
+        empty.recorder.retain()
+        assertEquals("an empty recorder publishes once", first + 1, empty.emissions.size)
+        assertTrue(empty.state().series.isEmpty())
+
+        rig.recorder.close()
+        val closedReads = rig.clockReads
+        val closedState = rig.state()
+        rig.recorder.retain()
+        assertEquals("closed: no clock read", closedReads, rig.clockReads)
+        assertSame(closedState, rig.state())
     }
 }

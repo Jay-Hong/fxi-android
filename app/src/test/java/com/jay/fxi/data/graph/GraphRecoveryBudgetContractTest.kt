@@ -137,6 +137,14 @@ import org.junit.Test
  * issued again if the budget parks again). Initial, Refresh and Activate requests and requests the round did
  * not issue are not gated; neither is applying a sent answer; close reads no permit. Without a supplier nothing changes.
  *
+ * S4 RT05a (rows E07, E08, E10, rt05_api_agreed.r2 §6): the recovery event adapter on this coordinator's executor and clock,
+ * reading the published context, delivers its BOUNDARY_600S as a valid trigger: at a bucket change an exhausted budget opens a
+ * new cycle, a boundary during that cycle's round joins it, and a terminal budget stays closed. Nothing is sent while another
+ * period or no key is active; a budget a boundary reopened waits while another period of its tab is active (another tab's
+ * budget: T07). An answer captured before a boundary releases only what it supplied, and the cycle the boundary opened by
+ * joining its request keeps rung 0. The other effects of a trigger are T02-T06's: a trigger acts the same whatever its
+ * kind.
+ *
  * Not here: the unconfirmed 200 of a cache-port coordinator (P09,
  * in GraphV2RequestCoordinatorReGateTest). The implementation thread reads but does not edit this file.
  */
@@ -2840,5 +2848,101 @@ class GraphRecoveryBudgetContractTest {
         step(1.seconds)
         g.coordinator.onRefreshRequested(force = false); runCurrent()
         assertEquals("None at the due round removed it", secs(0, 3), g.tabTimes())
+    }
+
+    // --- S4 RT05a: the adapter's boundary on the real coordinator (rows E07, E08, E10, rt05_api_agreed.r2 §6) -------------
+
+    /** The RT05a adapter over [f]'s coordinator and recorder, on its executor and clock, started in the foreground. */
+    private fun TestScope.events(f: Fixture): GraphRecoveryEvents =
+        GraphRecoveryEvents(f.scope, f.clock, { f.state.source }, f.coordinator::onRecoveryTrigger, f.recorder::retain, {})
+            .also {
+                it.onForeground(true)
+                runCurrent()
+            }
+
+    /**
+     * E07 (RT05-T04): the adapter's boundary is a valid trigger on the coordinator - its sequence, the published fence and the
+     * context's lifetime - so an exhausted budget opens a new cycle at 12:10; a boundary during that cycle's round sends
+     * nothing more, and the ladder goes on from the round's completion; a terminal budget stays closed (T04 pins that with a
+     * direct trigger; here the boundary's trigger reaches the same coordinator).
+     */
+    @Test fun E07_theBoundaryReachesTheCoordinatorAsAValidTrigger() = budgetTest {
+        val f = exhausted()
+        val e = events(f)
+        f.tabSequence({ })
+        step(399.seconds)
+        assertEquals("premise: no boundary before 12:10", secs(0, 3, 9, 21, 45, 93), f.tabTimes())
+        step(1.seconds)
+        assertEquals("12:10 opens a new cycle at once", secs(0, 3, 9, 21, 45, 93, 600), f.tabTimes())
+        step(600.seconds)
+        assertEquals("12:20 during the round sends nothing", secs(0, 3, 9, 21, 45, 93, 600), f.tabTimes())
+        f.tabs().last().tab.complete(status(503)); runCurrent()
+        step(3.seconds)
+        assertEquals("the round settled and the ladder goes on", secs(0, 3, 9, 21, 45, 93, 600, 1203), f.tabTimes())
+        e.close()
+
+        val g = ready()
+        g.tabSequence(fail503, { it.tab.complete(status(404)) }, fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        step(3.seconds)
+        assertEquals("premise: the round's 404 stopped it", secs(0, 3), g.tabTimes())
+        events(g)
+        step(600.seconds)
+        assertEquals("a terminal budget stays closed at a boundary", secs(0, 3), g.tabTimes())
+    }
+
+    /**
+     * E08 (RT05-T04): an answer captured before a boundary and applied after it releases only what it supplied: kb's B1 goes,
+     * B2 (not supplied) stays, and so does the 12:00 loss recorded after the capture, which the boundary closed; the remaining
+     * demand is asked again. The boundary joins the request already out, so its cycle starts at rung 0 and the gap after the
+     * next round is 3 s. A demand born after a capture is a new generation (GraphRecoverableStateTest F03); a seed folds only
+     * into the bucket current at its own time and releases nothing (GraphSeededObservationTest E09, GraphRecoverableStateTest
+     * F04); a closed point is the server's word on the grid only (GraphSeededObservationTest E11).
+     */
+    @Test fun E08_anAnswerCapturedBeforeABoundaryReleasesOnlyWhatItSupplied() = budgetTest {
+        val f = ready()
+        events(f)
+        f.tabSequence({ })
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        assertEquals("premise: the activation's request is out", listOf(0L), f.tabTimes())
+        f.lose("kb", NOON + 60.seconds)
+        assertTrue("premise: a loss in the current 12:00 bucket", NOON in f.series(KB).pending)
+        step(600.seconds)
+        assertEquals("the boundary joins the request out", listOf(0L), f.tabTimes())
+        f.tabs().single().tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1))))); runCurrent()
+        val after = f.series(KB)
+        assertFalse("B1 supplied and released", B1 in after.pending)
+        assertTrue("B2 not supplied", B2 in after.pending)
+        assertTrue("12:00, closed by the boundary after the capture, stays", NOON in after.pending)
+        f.tabSequence(fail503)
+        step(3.seconds)
+        assertEquals("the remaining demand is asked again", secs(0, 603), f.tabTimes())
+        step(3.seconds)
+        assertEquals("the boundary's cycle: the join kept rung 0, so the next gap is 3 s", secs(0, 603, 606), f.tabTimes())
+    }
+
+    /**
+     * E10 (RT05-T04): a boundary sends nothing while 3m is active or no key is; a budget it reopens waits while another period
+     * of its tab is active, and its key's activation then sends one round of the new cycle, whose ladder goes on (another
+     * tab's budget: T07, a trigger acting the same whatever its kind).
+     */
+    @Test fun E10_aBoundaryOutsideAnActiveDaySendsNothing() = budgetTest {
+        val f = ready()
+        events(f)
+        step(600.seconds)
+        assertTrue("3m active: no 1d request at 12:10", f.tabs(USD_1D).isEmpty())
+        f.coordinator.onDeactivated(); runCurrent()
+        step(600.seconds)
+        assertTrue("no active key: none at 12:20", f.tabs(USD_1D).isEmpty())
+
+        val g = exhausted()
+        g.coordinator.onActivated(USD_3M); runCurrent()
+        events(g)
+        step(600.seconds)
+        assertEquals("the reopened budget waits while 3m is active", secs(0, 3, 9, 21, 45, 93), g.tabTimes())
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        assertEquals("the activation sends one round", secs(0, 3, 9, 21, 45, 93, 800), g.tabTimes())
+        step(3.seconds)
+        assertEquals("of a new cycle: its 503 moves the ladder on", secs(0, 3, 9, 21, 45, 93, 800, 803), g.tabTimes())
     }
 }

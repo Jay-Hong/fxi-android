@@ -22,6 +22,7 @@ import com.jay.fxi.data.graph.GraphObservationSeriesKey
 import com.jay.fxi.data.graph.GraphOwnerSource
 import com.jay.fxi.data.graph.GraphRecorder
 import com.jay.fxi.data.graph.GraphRecoverableState
+import com.jay.fxi.data.graph.GraphRecoveryEvents
 import com.jay.fxi.data.graph.GraphSeriesSelectionSession
 import com.jay.fxi.data.graph.GraphV2AccessGate
 import com.jay.fxi.data.graph.GraphV2CachePorts
@@ -179,6 +180,15 @@ import org.junit.rules.TemporaryFolder
  *    exposure in hand and a catalog fetched again unchanged publish nothing, keep the published result and leave a pending
  *    deadline in place.
  *  - The holder has no timer of its own: time passing changes nothing until onTimeEvent() (F2 produces those events).
+ *
+ * S4 RT05a (rt05_api_agreed.r2 §4-b, §5 item 2, rows E03 and E06): the recovery event adapter on the fixture's executor,
+ * coordinator and recorder, emitting into this holder's onTimeEvent, with the holder's clock. Its 30 s freshness tick moves
+ * a long chart's right end; a recorder tip ends it only while younger than its freshness (600 s, hana 1200 s), and its expiry
+ * drops only that end, adding no recorder bucket (the 1d current bucket's band reaching a time event's now is V07's). A return
+ * retains before its time event: shown through the return, that time event draws the retained record; hidden, the re-show
+ * flush after the return does. Past a day nothing of the old window is drawn, and after a clock reversal that evicts the
+ * furthest-future buckets the end is the re-chosen tip, not the one an unretained record would draw. Only the prepared
+ * projection and its right edge are judged here, not the presenter's final clipping.
  *
  * Owed by C2b-2: each surface reports through key(token) - visible while shown under a token, not visible when that token
  * changes or disappears or the surface leaves - so a block (tokens become null) and a period change are followed by a fresh
@@ -386,9 +396,11 @@ class GraphV2LivePublishTest {
 
         /** F2f: the graph recorder on this fixture's suppliers and executor; the holder reads it only when [withRecorder]. */
         var recorderReads = 0
+        /** RT05a: the recorder's wall time moved apart from the virtual clock, as the holder's [offset] is. */
+        var recorderOffset: Duration = Duration.ZERO
         val recorder = GraphRecorder(
             scope, MutableStateFlow(0L), { recorderReads++; snapshot }, { recorderReads++; FENCE_A },
-            { recorderReads++; coordinator.state.value.catalog }, gate, AppClock { recorderReads++; clock.now() }
+            { recorderReads++; coordinator.state.value.catalog }, gate, AppClock { recorderReads++; clock.now() + recorderOffset }
         )
         private val readsRecorder = withRecorder
 
@@ -517,15 +529,29 @@ class GraphV2LivePublishTest {
 
         val lifetime get() = checkNotNull(uses.acquire(FENCE_A))
 
-        /** A kb quote handed to the recorder as the topic sink would hand it over. */
-        fun record(rate: Double, at: Instant = clock.now()) {
+        /** A quote of [source] (kb unless given) handed to the recorder as the topic sink would hand it over. */
+        fun record(rate: Double, at: Instant = clock.now(), source: String = "kb") {
             recorder.observe(
                 TopicGraphInput.Observations(
                     1L, "fx:usd-krw", TopicGraphPath.WS, TopicUseAttribution(Any(), FENCE_A, 1L, lifetime), 1L,
-                    listOf(TopicGraphCandidate.Quote("kb", "usd-krw", rate, at, null))
+                    listOf(TopicGraphCandidate.Quote(source, "usd-krw", rate, at, null))
                 )
             )
             run()
+        }
+
+        /** RT05a: the recovery event adapter over this fixture, emitting into [holder]; its clock is the holder's wall time. */
+        fun events() = GraphRecoveryEvents(
+            scope, AppClock { clock.now() + offset }, { coordinator.state.value.source }, coordinator::onRecoveryTrigger,
+            recorder::retain, holder::onTimeEvent
+        )
+
+        /** Shows the chart and selects 3m, answered with X and Y quarter series. */
+        fun quarter() {
+            show()
+            holder.selectPeriod(token(), GraphPeriod.THREE_MONTHS)
+            run()
+            answer(KEY_3M, ok(dto(GraphPeriod.THREE_MONTHS, S(X, quarterPts(1400.0)), S(Y, quarterPts(1380.0)))))
         }
 
         /** The projection a publication at [at] makes from the recorder's checked read. */
@@ -1566,5 +1592,124 @@ class GraphV2LivePublishTest {
         val ending = async { next.close() }
         f.run()
         assertTrue(ending.isCompleted)
+    }
+
+    // --- S4 RT05a: the adapter's time events and return (rows E03, E06, rt05_api_agreed.r2 §6) --------------------------
+
+    /** One E03 case: [id]'s recorder tip at t0 + [late] ms on a 3m chart, judged by the adapter's ticks around [freshness] s. */
+    private fun TestScope.freshnessCase(id: String, source: String, freshness: Int, late: Long) {
+        val f = Fixture(this, withRecorder = true)
+        f.ready()
+        f.quarter()
+        val key = GraphObservationSeriesKey(SCOPE, id)
+        val t0 = f.clock.now()
+        f.record(1341.7, t0 + late.milliseconds, source)
+        f.events().onForeground(true)
+        f.run()
+        val buckets = f.recorder.state.value.series.getValue(key).data.app.buckets
+        val rest = f.rest(KEY_3M).bySeries.getValue(id)
+        fun series() = f.chart().prepared.bySeries.getValue(id)
+        val case = "$id at +$late ms"
+
+        f.advance((freshness - 30) * 1_000L)
+        val before = t0 + (freshness - 30).seconds
+        assertEquals("$case: the tick moved the edge", before, f.edge())
+        assertEquals(case, LinePoint(before, 1341.7), series().linePoints.last())
+        f.advance(30_000)
+        val at = t0 + freshness.seconds
+        assertEquals(case, at, f.edge())
+        if (late == 0L) {
+            assertEquals("$case: at its freshness only the end goes; REST closes and extrema stay", rest, series())
+        } else {
+            assertEquals("$case: 1 ms younger than its freshness", LinePoint(at, 1341.7), series().linePoints.last())
+            f.advance(30_000)
+            assertEquals("$case: then it goes", rest, series())
+        }
+        assertEquals("$case: no recorder bucket added", buckets, f.recorder.state.value.series.getValue(key).data.app.buckets)
+    }
+
+    /**
+     * E03 (RT05-T01): the adapter's freshness tick moves a 3m chart's right end. A recorder tip ends it while younger than its
+     * freshness - 600 s, hana 1200 s - and at that age the tick drops only the end; REST closes and extrema stay and no
+     * recorder bucket is added.
+     */
+    @Test fun E03_theFreshnessTickEndsOnlyAStaleTip() = holderTest {
+        for (late in listOf(0L, 1L)) {
+            freshnessCase(Y, "kb", 600, late)
+            freshnessCase(X, "hana", 1200, late)
+        }
+    }
+
+    /**
+     * E06 (RT05-T02, §5 item 2): a return retains before its time event. Hidden through it, the re-show flush projects the
+     * retained record: past a day nothing of the old window or tip is drawn, and after a clock reversal of two hours that evicts
+     * the five furthest-future buckets of a full record the 3m end is the re-chosen tip - the one an unretained record would
+     * not draw. Shown through it, the return's own time event already draws the re-chosen tip.
+     */
+    @Test fun E06_theFirstPublicationAfterAReturnProjectsTheRetainedRecord() = holderTest {
+        val f = Fixture(this, withRecorder = true)
+        f.ready()
+        f.show()
+        f.record(1341.7)
+        f.advance(350)
+        val e = f.events()
+        e.onForeground(true)
+        f.run()
+        f.hide()
+        e.onForeground(false)
+        f.run()
+        f.offset = 26.hours
+        f.recorderOffset = 26.hours
+        val mark = f.published.size
+        e.onForeground(true)
+        f.run()
+        assertEquals("the return's time event publishes nothing while hidden", mark, f.published.size)
+        assertTrue("retained before the flush: 12:00 is outside 25 h",
+            f.recorder.state.value.series.getValue(KY).data.app.buckets.isEmpty())
+        f.show()
+        val later = f.clock.now() + f.offset
+        assertEquals(later, f.edge())
+        assertEquals(f.fromRecorder(KEY_1D, later), f.chart().prepared)
+        assertTrue("no old point and no tip end", 1341.7 !in f.y().values())
+
+        val g = Fixture(this, withRecorder = true)
+        g.ready()
+        g.quarter()
+        // 151 kb buckets, one per 10 minutes from 25 h before 12:00, oldest first: the tip is 12:00's 1450.0.
+        for (i in 150 downTo 0) g.record(1450.0 - i, NOON - (i * 10).minutes)
+        val r = g.events()
+        r.onForeground(true)
+        g.run()
+        g.hide()
+        r.onForeground(false)
+        g.run()
+        g.offset = (-2).hours
+        g.recorderOffset = (-2).hours
+        val at = g.clock.now() + g.offset
+        assertEquals("premise: an unretained record ends at 12:00's tip", LinePoint(at, 1450.0),
+            g.fromRecorder(KEY_3M, at).bySeries.getValue(Y).linePoints.last())
+        r.onForeground(true)
+        g.run()
+        g.show()
+        assertEquals(at, g.edge())
+        assertEquals("the tip re-chosen after the eviction", LinePoint(at, 1445.0), g.y().linePoints.last())
+        assertEquals(g.fromRecorder(KEY_3M, at), g.chart().prepared)
+
+        val h = Fixture(this, withRecorder = true)
+        h.ready()
+        h.quarter()
+        for (i in 150 downTo 0) h.record(1450.0 - i, NOON - (i * 10).minutes)
+        val v = h.events()
+        v.onForeground(true)
+        h.run()
+        v.onForeground(false)
+        h.run()
+        h.offset = (-2).hours
+        h.recorderOffset = (-2).hours
+        v.onForeground(true)
+        h.run()
+        val back = h.clock.now() + h.offset
+        assertEquals("shown through the return", back, h.edge())
+        assertEquals("its own time event draws the re-chosen tip", LinePoint(back, 1445.0), h.y().linePoints.last())
     }
 }

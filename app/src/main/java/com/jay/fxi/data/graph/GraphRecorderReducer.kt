@@ -78,6 +78,10 @@ internal object GraphRecorderReducer {
         )
     }
 
+    /** S4 RT05a: retention at [now] for every series, one common time; every other field is kept. */
+    fun retain(state: GraphRecorderState, now: Instant): GraphRecorderState =
+        updated(state, series = state.series.mapValues { (_, series) -> retainGraphRecoverable(series, now) })
+
     fun syncAccess(
         state: GraphRecorderState,
         snapshot: TopicAccessSnapshot,
