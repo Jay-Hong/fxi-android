@@ -472,7 +472,10 @@ class GraphV2RecoveryRequestContractTest {
 
     // --- R3 ----------------------------------------------------------------------------------------------------------
 
-    /** R3: a cache hit, a network failure, HTTP 500, a rejected tab and a cancellation apply nothing to the recorder. */
+    /**
+     * R3: a cache hit, a network failure, HTTP 500, a rejected tab and a cancellation apply nothing to the recorder. The cache
+     * hit leaves only a current-bucket demand: a closed one would arm a recovery round (S4 RT03b-1b, decision 6).
+     */
     @Test fun R3_noSuccessNoApplication() = recoveryTest {
         for ((label, fail) in listOf<Pair<String, (Sent) -> Unit>>(
             "network" to { it.tab.completeExceptionally(IOException("reset")) },
@@ -489,14 +492,17 @@ class GraphV2RecoveryRequestContractTest {
 
         val f = ready()
         f.coordinator.onActivated(USD_1D); runCurrent()
-        f.tabs(USD_1D).single().tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1))))); runCurrent()
-        f.lose("kb", B3 + 60.seconds)
+        f.tabs(USD_1D).single().tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1, B2))))); runCurrent()
+        f.lose("kb", NOON)
+        assertTrue("premise: a current-bucket demand", NOON in f.series(KB).pending)
         f.coordinator.onActivated(USD_3M); runCurrent()
         val beforeHit = f.rec()
         val sends = f.tabs(USD_1D).size
         f.coordinator.onActivated(USD_1D); runCurrent()
         assertEquals("premise: a fresh entry, no request", sends, f.tabs(USD_1D).size)
         assertSame("a cache hit", beforeHit, f.rec())
+        advanceTimeBy(300_000); runCurrent()
+        assertEquals("no recovery round follows", sends, f.tabs(USD_1D).size)
     }
 
     // --- R4 ----------------------------------------------------------------------------------------------------------

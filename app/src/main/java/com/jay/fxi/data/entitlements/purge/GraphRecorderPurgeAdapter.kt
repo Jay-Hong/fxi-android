@@ -24,8 +24,8 @@ import kotlinx.coroutines.withContext
  *
  * Completion covers recorder state, the sink's queue and ledger, and registered recovery captures
  * at that moment. These remain runtime cleanup obligations: a released registration still held by
- * an in-flight request; the coordinator's entries and protected slots; screen publications; and the
- * topic session's graph loss record. This target answers for none of those or any disk target.
+ * an in-flight request; the coordinator's entries, protected slots and 1d recovery budgets; screen
+ * publications; and the topic session's graph loss record. This target answers for none of those or any disk target.
  */
 internal class GraphRecorderPurgeAdapter(
     private val recorder: GraphRecorder,

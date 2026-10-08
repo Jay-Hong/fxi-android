@@ -265,13 +265,14 @@ class GraphV2RequestCoordinatorReGateTest {
     private fun flipTest(body: suspend TestScope.() -> Unit): TestResult = runTest {
         try {
             body()
+            opened.forEach { assertEquals("a timer loop", null, it.loopAt) }
         } finally {
             opened.forEach { it.close() }
             opened.clear()
         }
     }
 
-    private inner class Fixture(test: TestScope, private val start: Instant = NOON) {
+    private inner class Fixture(test: TestScope, private val start: Instant = NOON, withRecorder: Boolean = false) {
         init { opened += this }
         val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(test.testScheduler))
         private val base = test.testScheduler.currentTime
@@ -348,19 +349,45 @@ class GraphV2RequestCoordinatorReGateTest {
             }
         }
 
-        val coordinator = GraphV2RequestCoordinator(
+        /** S4 RT03b-1b: a recorder on the gate and snapshot, so a 1d key's cold ladder becomes a recovery budget. */
+        val recorder: GraphRecorder? = if (!withRecorder) null else GraphRecorder(
+            scope, kotlinx.coroutines.flow.MutableStateFlow(1L), { snapshot }, { fence }, { coordinator.state.value.catalog }, gate,
+            AppClock { start + (test.testScheduler.currentTime - base).milliseconds }
+        )
+        /** With a recorder, the clock fails a timer that re-arms over 1000 times within one virtual millisecond. */
+        private val loopGuard = withRecorder
+        var loopAt: Long? = null
+        private var readsAt = -1L
+        private var reads = 0
+        private val guardedNow: () -> Instant = {
+            val at = test.testScheduler.currentTime - base
+            if (loopGuard) {
+                if (at != readsAt) {
+                    readsAt = at
+                    reads = 0
+                }
+                if (++reads > 1_000) {
+                    loopAt = at
+                    throw IllegalStateException("timer loop at $at ms")
+                }
+            }
+            start + at.milliseconds
+        }
+
+        val coordinator: GraphV2RequestCoordinator = GraphV2RequestCoordinator(
             fetcher = fetcher,
             owners = owners,
             currentAccessFence = { fence },
             uses = uses,
             protectedAdmission = { true },
+            recorder = recorder,
             accessSnapshot = {
                 accessReads++
                 accessHooks.remove(accessReads)?.invoke()
                 snapshot
             },
             scope = scope,
-            clock = AppClock { start + (test.testScheduler.currentTime - base).milliseconds },
+            clock = AppClock { guardedNow() },
             rateLimitJitter = { Duration.ZERO },
             onEventFailure = { failures += it },
             cachePorts = GraphV2CachePorts(store = store, gate = gate, onSeedDiagnostic = {
@@ -1149,6 +1176,56 @@ class GraphV2RequestCoordinatorReGateTest {
         val sends = f.tabTimes()
         step(10.seconds)
         assertEquals("no check follows", sends, f.tabTimes())
+    }
+
+    // --- S4 RT03b-1b P09: unconfirmed 200s under a recovery budget -------------------------------------------------------
+    //
+    // Agreed in R4c/S4 rt03b1b_api_agreed.r3 (row P09). With a recorder, a 1d key's unconfirmed answers belong to its recovery
+    // budget: they climb its ladder like failures and stop at six; the key starts no flip of its own while the budget waits or
+    // after it stopped, also for an outside request's unconfirmed answer. Each request here starts under a capability hold
+    // (no KRX epoch in its capture) and lands after the capability opened, so its 200 is unconfirmed (T19's construction).
+
+    /** P09: unconfirmed 200s run the budget's six rounds at 0/3/9/21/45/93 s, and no flip follows them or a later one. */
+    @Test fun P09_unconfirmedAnswersRunTheBudgetAndStartNoFlip() = flipTest {
+        val day = GraphKey("usd", GraphPeriod.ONE_DAY)
+        val f = Fixture(this, withRecorder = true)
+        f.snapshot = snap(capabilityBlocks = HELD)
+        f.start(); f.coordinator.onActivated(day); runCurrent()
+        val due = listOf(0, 3, 9, 21, 45, 93)
+        for ((i, at) in due.withIndex()) {
+            if (i > 0) step((at - due[i - 1]).seconds)
+            assertEquals("round ${i + 1}", due.take(i + 1).map { it * 1000L }, f.tabTimes(day))
+            f.flip(this, snap())
+            f.sent.last().tab.complete(ok(onlineDto(1500.0 + i, period = GraphPeriod.ONE_DAY))); runCurrent()
+            assertNull("unconfirmed", f.entry(day).online200At)
+            f.flip(this, snap(capabilityBlocks = HELD))
+        }
+        step(300.seconds)
+        assertEquals("stopped at six", due.map { it * 1000L }, f.tabTimes(day))
+
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        assertEquals(7, f.tabTimes(day).size)
+        f.flip(this, snap())
+        f.sent.last().tab.complete(ok(onlineDto(1600.0, period = GraphPeriod.ONE_DAY))); runCurrent()
+        assertNull("premise: unconfirmed again", f.entry(day).online200At)
+        step(30.seconds)
+        assertEquals("no flip after the outside answer", 7, f.tabTimes(day).size)
+    }
+
+    /** P09b: a usd 1d budget does not hold back usd 3m's flip check: long periods keep their flip. */
+    @Test fun P09b_aLongPeriodKeepsItsFlipBesideA1dBudget() = flipTest {
+        val day = GraphKey("usd", GraphPeriod.ONE_DAY)
+        val f = Fixture(this, withRecorder = true)
+        f.start(); f.coordinator.onActivated(day); runCurrent()
+        f.sent.last().tab.complete(status(503)); runCurrent()
+        f.coordinator.onActivated(KEY); runCurrent()
+        f.sent.last().tab.complete(ok(onlineDto(1500.0))); runCurrent()
+        assertTrue("premise: confirmed", f.entry().online200At != null)
+        step(1.seconds)
+        f.flip(this, snap(capabilityBlocks = HELD))
+        assertNull("premise: the flip stripped the stamp", f.entry().online200At)
+        step(3.seconds)
+        assertEquals("3m's flip check at +3 s", listOf(0L, 4_000L), f.tabTimes(KEY))
     }
 
     // --- S4 RT01-B2b-1: retiring a KRX capability epoch ---------------------------------------------------------------

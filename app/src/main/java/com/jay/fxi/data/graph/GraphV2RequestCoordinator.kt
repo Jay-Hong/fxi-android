@@ -112,11 +112,17 @@ internal data class GraphRequestState(
  * It is also invoked on transport threads and must be thread-safe, non-blocking and side-effect free.
  * @param accessSnapshot Lock-free, live read of the issuer's published topic access snapshot; use
  * the same supplier function object as the gate and recorder. A new USER end retires request,
- * write and seed ownership and clears entries, protected slots, catalog and failures even within
- * the same data scope. Duplicate ends do not discard again; context changes without a new end
- * retain same-scope entries and protected slots.
+ * write and seed ownership and clears entries, protected slots, catalog, failures and every 1d
+ * recovery budget even within the same data scope. Duplicate ends do not discard again; context
+ * changes without a new end retain same-scope entries, protected slots and recovery budgets.
  * @param recorder Optional, immutable owner that captures recovery for existing one-day requests,
  * applies their successful responses synchronously and replays held inputs after catalog publication.
+ * With a recorder, a one-day key's cold ladder and independent flip check give way to a recovery
+ * budget per (data scope, tab) (S4 RT03b-1b): it reads the recorder's demand on the loop, issues its
+ * own forced rounds at most six times, 3/6/12/24/48 s after each completion, and holds back unforced
+ * requests of its key while it waits. It survives Deactivate, key switches and a missing data scope;
+ * a USER end, another non-null data scope, a selecting [retireScopes] and [close] discard it.
+ * Other periods, and a coordinator without a recorder, keep the cold, flip and midnight owners.
  */
 internal class GraphV2RequestCoordinator(
     private val fetcher: GraphV2Fetching,
@@ -194,6 +200,8 @@ internal class GraphV2RequestCoordinator(
         var midnightGeneration: Long? = null
         var midnightAttempt = false
         var flipGeneration: Long? = null
+        var recoveryRound: RecoveryRound? = null
+        var recoveryAttempt = false
         // Includes an enqueued completion until the loop consumes it, not just a running coroutine.
         var completionPending = false
         var handlingCompletion = false
@@ -228,6 +236,28 @@ internal class GraphV2RequestCoordinator(
         var deadline: Instant?,
         var requestId: Long? = null
     )
+
+    /** S4 RT03b-1b: the 1d recovery budget of one data scope and tab, kept only with a recorder. */
+    private data class RecoveryKey(val scope: GraphDataScope, val tab: String)
+
+    private class RecoveryRound(val roundId: Long, val budget: RecoveryBudget) {
+        var tabRequestId: Long? = null
+        var tabSent = false
+        var catalogRequestId: Long? = null
+        var catalogSent = false
+        var counted = false
+    }
+
+    private class RecoveryBudget(val key: RecoveryKey) {
+        var rounds = 0
+        var completionRung = 0
+        var deadline: Instant? = null
+        var stopped = false
+        var round: RecoveryRound? = null
+        var hold: Pair<RequestContext, Long>? = null
+    }
+
+    private enum class RecoveryNeed { NONE, UNREADABLE, REMAINS }
 
     private data class DeferredDemand(
         val key: GraphKey,
@@ -317,6 +347,8 @@ internal class GraphV2RequestCoordinator(
     private var nextFlipGeneration = 0L
     private var flipOwner: FlipOwner? = null
     private var deferredDemand: DeferredDemand? = null
+    private val recoveryBudgets = mutableMapOf<RecoveryKey, RecoveryBudget>()
+    private var nextRecoveryRound = 0L
     // Written by the loop, also read by the transport's replay guard. Context disposal and
     // deactivation never reset it; an in-flight answer still uses its separate ownership check.
     @Volatile private var sharedRetryFloor: Instant? = null
@@ -334,6 +366,7 @@ internal class GraphV2RequestCoordinator(
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (failure: Throwable) {
+                        pauseRecovery()
                         // A broken completion must not leave its key permanently claimed.
                         releaseCompletion(event)
                         cancelCold()
@@ -351,8 +384,8 @@ internal class GraphV2RequestCoordinator(
     }
 
     /**
-     * Ends acceptance, discards queued events and releases request, write, seed and timer ownership
-     * before returning. Calls and the loop's finally share this idempotent cleanup on the serial
+     * Ends acceptance, discards queued events and recovery budgets, and releases request, write, seed
+     * and timer ownership before returning. Calls and the loop's finally share this idempotent cleanup on the serial
      * executor. No supplier is read, no later event is handled, and [scope] itself stays alive.
      */
     fun close() {
@@ -367,6 +400,7 @@ internal class GraphV2RequestCoordinator(
         cancelMidnight()
         cancelFlip()
         deferredDemand = null
+        recoveryBudgets.clear()
         discardRequests()
         pendingReleased.values.forEach {
             it.completionPending = false
@@ -388,7 +422,7 @@ internal class GraphV2RequestCoordinator(
      * state directly and does not dispatch. Only the selected captures go: nothing is released,
      * cancelled or published, and the coordinator handles each answer as before. A purge covers only
      * the captures registered now; a released registration still held by an in-flight request, and
-     * the coordinator's entries and protected slots, are runtime cleanup.
+     * the coordinator's entries, protected slots and recovery budgets, are runtime cleanup.
      */
     fun purgeRecoveryCaptures(selects: (GraphDataScope) -> Boolean): Boolean {
         var removed = false
@@ -412,7 +446,8 @@ internal class GraphV2RequestCoordinator(
      * The non-null scope of [currentAccessFence] at entry is the live scope, independent of local
      * context or credential admission. It joins the distinct scopes held by the snapshot, context,
      * registered and released pending requests (including recovery captures), protected GENERAL
-     * slots, seed and writes. [selects] runs exactly once per candidate unless it throws. All
+     * slots, seed, writes and 1d recovery budgets. [selects] runs exactly once per candidate unless it
+     * throws. All
      * selection and change planning precede mutation: a selector exception propagates unchanged;
      * selecting the live scope returns [GraphRuntimeRetirement.LIVE_SCOPE_SELECTED] without changes.
      * This port does not synchronize or acquire a context.
@@ -430,7 +465,8 @@ internal class GraphV2RequestCoordinator(
      *
      * A selected snapshot becomes an empty [GraphRequestState], including null dataScope. Selected
      * local context, catalog time, capability configuration and retry demand are discarded; selected
-     * slots, seed attempts and writes are removed. Writes disable admission, cancel their ticket and
+     * slots, seed attempts, writes and recovery budgets are removed; a budget held alone still counts
+     * as a removal. Writes disable admission, cancel their ticket and
      * job, and release any pending preparation-start reference. Unselected scopes remain intact.
      * Changes to publication/inFlight are published before returning, without starting write
      * preparation, requests or seeds. [activeKey] survives for the next normal context change.
@@ -455,6 +491,7 @@ internal class GraphV2RequestCoordinator(
         protectedSlots.values.forEach { candidates += scopeOf(it.components.general.key) }
         seedRegistration?.let { scopeOf(it.context.fence) }?.let { candidates += it }
         writeTasks.values.forEach { scopeOf(it.captured.fence)?.let { held -> candidates += held } }
+        recoveryBudgets.keys.forEach { candidates += it.scope }
 
         val selected = candidates.filter(selects).toSet()
         val retiredRequests = registrations.filter { scopeOf(it.context.fence) in selected }
@@ -466,7 +503,8 @@ internal class GraphV2RequestCoordinator(
         val retireContext = context?.let { scopeOf(it.fence) in selected } == true
         val retireSeed = seedRegistration?.let { scopeOf(it.context.fence) in selected } == true
         val retiredWrites = writeTasks.values.filter { scopeOf(it.captured.fence) in selected }
-        val removed = retireSnapshot || retireContext || retireSeed || retiredWrites.isNotEmpty() ||
+        val retiredBudgets = recoveryBudgets.keys.filter { it.scope in selected }
+        val removed = retireSnapshot || retireContext || retireSeed || retiredWrites.isNotEmpty() || retiredBudgets.isNotEmpty() ||
             keptSlots.size != protectedSlots.size || captureUpdates.isNotEmpty() || retiredRequests.any {
                 isRegistered(it) || !it.disposed.get() || it.recoveryRequests.isNotEmpty() || it.capturedOwner != null
             }
@@ -478,6 +516,7 @@ internal class GraphV2RequestCoordinator(
             dropCaptures(registration)
         }
         captureUpdates.forEach { (registration, kept) -> registration.recoveryRequests = kept }
+        retiredBudgets.forEach { recoveryBudgets.remove(it) }
         if (retireSnapshot || retireSeed) discardSeed()
         retiredWrites.forEach { discardWrite(it) }
         protectedSlots = keptSlots
@@ -882,6 +921,7 @@ internal class GraphV2RequestCoordinator(
         val scopeChanged = snapshot.dataScope != dataScope || ended
         if (!scopeChanged && context == next) return false
 
+        if (ended) recoveryBudgets.clear() else if (dataScope != null) recoveryBudgets.keys.retainAll { it.scope == dataScope }
         cancelActiveDemand()
         discardRequests()
         discardWrites()
@@ -939,7 +979,8 @@ internal class GraphV2RequestCoordinator(
         now: Instant,
         force: Boolean,
         coldAttempt: Boolean = false,
-        midnightAttempt: Boolean = false
+        midnightAttempt: Boolean = false,
+        recovery: RecoveryRound? = null
     ) {
         val key = activeKey ?: return
         val current = context ?: return
@@ -953,7 +994,8 @@ internal class GraphV2RequestCoordinator(
         val cold = coldOwner?.takeIf { it.key == key && it.context == current }
         val midnight = midnightOwner?.takeIf { it.key == key && it.context == current }
         val needsTab = supported && !tabRequests.containsKey(key) &&
-            (force || (cold == null && midnight?.cycleStarted != true && !isFresh(snapshot.entries[key], now)))
+            (force || (cold == null && midnight?.cycleStarted != true && !recoveryWaiting(key, current) &&
+                !isFresh(snapshot.entries[key], now)))
 
         if (underFloor(now)) {
             if (needsCatalog || needsTab) {
@@ -962,7 +1004,7 @@ internal class GraphV2RequestCoordinator(
             }
             return
         }
-        if (needsCatalog) startCatalog(current, key.tab)
+        if (needsCatalog && recovery?.catalogSent != true) startCatalog(current, key.tab, recovery)
         if (!supported) {
             if (coldAttempt) cancelCold()
             if (midnightAttempt) cancelMidnight()
@@ -971,10 +1013,11 @@ internal class GraphV2RequestCoordinator(
         tabRequests[key]?.let {
             if (coldAttempt) connectCold(it, attempt = true)
             if (midnightAttempt) connectMidnight(it, attempt = true)
+            if (recovery != null) bindRecovery(it, recovery, attempt = false)
             connectFlip(it)
             return
         }
-        if (needsTab) startTab(current, key, coldAttempt, midnightAttempt)
+        if (needsTab) startTab(current, key, coldAttempt, midnightAttempt, recovery)
     }
 
     private fun isFresh(entry: GraphEntry?, now: Instant): Boolean {
@@ -1007,19 +1050,27 @@ internal class GraphV2RequestCoordinator(
         return owner
     }
 
-    private fun startCatalog(current: RequestContext, originalTab: String) {
+    private fun startCatalog(current: RequestContext, originalTab: String, recovery: RecoveryRound? = null) {
         val registration = Registration(++nextRequestId, current, null, originalTab, activityGeneration)
+        recovery?.let { bindRecovery(registration, it, attempt = true) }
         catalogRequest = registration
         startCapture(registration)
     }
 
-    private fun startTab(current: RequestContext, key: GraphKey, coldAttempt: Boolean, midnightAttempt: Boolean) {
+    private fun startTab(
+        current: RequestContext,
+        key: GraphKey,
+        coldAttempt: Boolean,
+        midnightAttempt: Boolean,
+        recovery: RecoveryRound? = null
+    ) {
         // Registration is the logical start; changing the active key does not withdraw a sent request.
         val registration = Registration(
             ++nextRequestId, current, key, key.tab, activityGeneration, bindRequestAccess(current),
             captureRecovery(current, key)
         )
         tabRequests[key] = registration
+        recovery?.let { bindRecovery(registration, it, attempt = true) }
         connectCold(registration, coldAttempt)
         connectMidnight(registration, midnightAttempt)
         connectFlip(registration)
@@ -1136,6 +1187,13 @@ internal class GraphV2RequestCoordinator(
             return
         }
         registration.waitingForFloor = false
+        if (!departRecovery(registration)) {
+            releaseRegistration(registration)
+            endConnectedCold(registration)
+            endConnectedMidnight(registration)
+            endConnectedFlip(registration)
+            return
+        }
         registration.departed = true
         // Enter fetch immediately at the loop's final floor checkpoint. No queued child may
         // slip a new floor between this admission and entering the fetcher after capture.
@@ -1218,6 +1276,7 @@ internal class GraphV2RequestCoordinator(
                 applyRecovery(registration, outcome.tab)
                 val components = replaceOnlineSlot(registration, event.key, entry, configuration)
                 reserveOnlineWrite(registration, event.key, components)
+                settleRecovery(registration, null, now)
                 if (snapshot.entries[event.key]?.online200At != null) {
                     endConnectedCold(registration)
                     endConnectedFlip(registration)
@@ -1230,6 +1289,7 @@ internal class GraphV2RequestCoordinator(
                 if (outcome.disposition != FailureDisposition.WITHDRAWN) {
                     snapshot = snapshot.copy(failures = snapshot.failures + (event.key to outcome.error))
                 }
+                settleRecovery(registration, outcome, now)
                 onColdFailure(registration, outcome, now)
                 onMidnightFailure(registration, outcome, now)
                 endConnectedFlip(registration)
@@ -1664,6 +1724,7 @@ internal class GraphV2RequestCoordinator(
     }
 
     private fun onColdFailure(registration: Registration, failure: TabOutcome.Failure, now: Instant) {
+        if (absorbs(registration.key)) return
         val cold = connectedCold(registration)
         if (failure.disposition != FailureDisposition.RETRYABLE) {
             if (cold != null) cancelCold()
@@ -1787,6 +1848,7 @@ internal class GraphV2RequestCoordinator(
         }
 
         wakeCold(now)
+        wakeRecovery(now)
         wakeMidnight(now)
         wakeFlip(now)
     }
@@ -1821,14 +1883,180 @@ internal class GraphV2RequestCoordinator(
         if (!underFloor(now)) requestActive(now, force = true, midnightAttempt = true)
     }
 
+    // --- S4 RT03b-1b: the 1d recovery budget ----------------------------------------------------------------------
+
+    private fun absorbs(key: GraphKey?): Boolean = recorder != null && key?.period == GraphPeriod.ONE_DAY
+
+    private fun recoveryKey(current: RequestContext, tab: String): RecoveryKey? =
+        scopeOf(current.fence)?.let { RecoveryKey(it, tab) }
+
+    /** The budget of the active absorbed key in the current context, whatever its state. */
+    private fun activeRecovery(): RecoveryBudget? {
+        val key = activeKey?.takeIf { absorbs(it) } ?: return null
+        val current = context ?: return null
+        return recoveryKey(current, key.tab)?.let { recoveryBudgets[it] }
+    }
+
+    private fun recoveryWaiting(key: GraphKey, current: RequestContext): Boolean =
+        absorbs(key) && recoveryKey(current, key.tab)?.let { recoveryBudgets[it] }?.stopped == false
+
+    private fun recoveryNeed(key: GraphKey, current: RequestContext, now: Instant): RecoveryNeed {
+        if (snapshot.entries[key]?.online200At == null) return RecoveryNeed.REMAINS
+        val demand = try {
+            checkNotNull(recorder).recoveryDemand(key.tab, current.fence, current.lifetime, now)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            onEventFailure(failure)
+            return RecoveryNeed.REMAINS
+        }
+        return when (demand) {
+            GraphTabRecoveryDemand.None -> RecoveryNeed.NONE
+            GraphTabRecoveryDemand.Unreadable -> RecoveryNeed.UNREADABLE
+            else -> RecoveryNeed.REMAINS
+        }
+    }
+
+    private fun bindRecovery(registration: Registration, round: RecoveryRound, attempt: Boolean) {
+        registration.recoveryRound = round
+        registration.recoveryAttempt = attempt
+        if (registration.key == null) round.catalogRequestId = registration.requestId
+        else round.tabRequestId = registration.requestId
+    }
+
+    private fun roundInFlight(round: RecoveryRound, key: GraphKey): Boolean =
+        (round.tabRequestId != null && tabRequests[key]?.requestId == round.tabRequestId) ||
+            (round.catalogRequestId != null && catalogRequest?.requestId == round.catalogRequestId)
+
+    /** False withdraws a directly issued recovery request before it is sent. */
+    private fun departRecovery(registration: Registration): Boolean {
+        if (!registration.recoveryAttempt) return true
+        val round = registration.recoveryRound ?: return true
+        val budget = round.budget
+        if (budget.stopped || (!round.counted && budget.rounds >= MAX_RECOVERY_ROUNDS)) return false
+        if (registration.key == null) round.catalogSent = true else round.tabSent = true
+        if (!round.counted) {
+            round.counted = true
+            budget.rounds++
+        }
+        return true
+    }
+
+    private fun settleRecovery(registration: Registration, failure: TabOutcome.Failure?, now: Instant) {
+        val key = registration.key ?: return
+        if (!absorbs(key)) return
+        val budgetKey = recoveryKey(registration.context, key.tab) ?: return
+        val budget = recoveryBudgets[budgetKey]
+        if (budget == null) {
+            if (failure != null && failure.disposition != FailureDisposition.RETRYABLE) return
+            if (key != activeKey || registration.context != context) return
+            if (recoveryNeed(key, registration.context, now) == RecoveryNeed.NONE) return
+            recoveryBudgets[budgetKey] = RecoveryBudget(budgetKey).also {
+                it.rounds = if (registration.departed) 1 else 0
+                it.completionRung = 1
+                it.deadline = coldDeadline(now, 0, failure?.statusCode, key.tab)
+            }
+            return
+        }
+        val round = registration.recoveryRound
+        if (round == null || budget.round !== round || round.tabRequestId != registration.requestId) return
+        when (failure?.disposition) {
+            FailureDisposition.WITHDRAWN -> return
+            FailureDisposition.TERMINAL, FailureDisposition.DIAGNOSTIC -> {
+                budget.stopped = true
+                budget.round = null
+                budget.hold = null
+                return
+            }
+            else -> Unit
+        }
+        budget.round = null
+        budget.hold = null
+        if (recoveryNeed(key, registration.context, now) == RecoveryNeed.NONE) {
+            recoveryBudgets.remove(budgetKey)
+            return
+        }
+        if (registration.recoveryAttempt) budget.completionRung++
+        if (budget.rounds >= MAX_RECOVERY_ROUNDS || budget.completionRung >= MAX_RECOVERY_ROUNDS) {
+            budget.stopped = true
+            budget.deadline = null
+        } else {
+            budget.deadline = coldDeadline(now, budget.completionRung - 1, failure?.statusCode, key.tab)
+        }
+    }
+
+    private fun recoveryHeld(budget: RecoveryBudget, current: RequestContext): Boolean =
+        budget.hold == (current to activityGeneration)
+
+    private fun recoverySupported(key: GraphKey): Boolean =
+        GraphV2Domain.support(snapshot.catalog, key.tab, key.period) != GraphPeriodSupport.Unsupported
+
+    private fun recoveryDue(): Instant? {
+        val budget = activeRecovery() ?: return null
+        val key = checkNotNull(activeKey)
+        val current = checkNotNull(context)
+        if (budget.stopped || recoveryHeld(budget, current) || !recoverySupported(key)) return null
+        if (budget.round?.let { roundInFlight(it, key) } == true) return null
+        return budget.deadline
+    }
+
+    private fun wakeRecovery(now: Instant) {
+        val budget = activeRecovery() ?: return
+        val key = checkNotNull(activeKey)
+        val current = checkNotNull(context)
+        if (budget.stopped || recoveryHeld(budget, current) || !recoverySupported(key)) return
+        val deadline = budget.deadline ?: return
+        if (now < deadline || underFloor(now)) return
+        budget.round?.let { open ->
+            if (roundInFlight(open, key)) return
+            // A round whose tab was sent and then lost is spent without a rung; one that sent only its
+            // catalog stays open and uses its empty tab slot again.
+            if (open.tabSent) budget.round = null
+        }
+        val round = budget.round ?: RecoveryRound(++nextRecoveryRound, budget).also { budget.round = it }
+        if (!round.counted && (budget.rounds >= MAX_RECOVERY_ROUNDS || budget.completionRung >= MAX_RECOVERY_ROUNDS)) {
+            budget.stopped = true
+            budget.round = null
+            return
+        }
+        when (recoveryNeed(key, current, now)) {
+            RecoveryNeed.NONE -> recoveryBudgets.remove(budget.key)
+            RecoveryNeed.UNREADABLE -> budget.hold = current to activityGeneration
+            RecoveryNeed.REMAINS -> requestActive(now, force = true, recovery = round)
+        }
+    }
+
+    /** An event failure stops every budget and withdraws the unsent requests the budgets issued themselves. */
+    private fun pauseRecovery() {
+        recoveryBudgets.values.forEach {
+            it.stopped = true
+            it.round = null
+        }
+        (listOfNotNull(catalogRequest) + tabRequests.values.toList())
+            .filter { it.recoveryAttempt && !it.departed }
+            .forEach {
+                releaseRegistration(it)
+                endConnectedCold(it)
+                endConnectedMidnight(it)
+                endConnectedFlip(it)
+            }
+    }
+
     private fun cancelCold() { coldOwner = null }
     private fun cancelMidnight() { midnightOwner = null }
     private fun cancelFlip() { flipOwner = null }
 
-    /** A flip adds one active demand; registration, cold and timer are alternatives in that order. */
+    /**
+     * A recovery budget of the active key, in any state, cancels the flip instead. Otherwise a flip adds
+     * one active demand; registration, cold and timer are alternatives in that order.
+     */
     private fun requireFlipConfirmation(now: Instant) {
         val key = activeKey ?: return
         val current = context ?: return
+        if (activeRecovery() != null) {
+            cancelFlip()
+            return
+        }
         if (!scope.isActive || snapshot.entries[key] == null || snapshot.entries[key]?.online200At != null ||
             GraphV2Domain.support(snapshot.catalog, key.tab, key.period) == GraphPeriodSupport.Unsupported) return
         val previous = flipOwner?.takeIf {
@@ -1874,7 +2102,8 @@ internal class GraphV2RequestCoordinator(
         val flip = flipOwner ?: return
         if (flip.key != activeKey || flip.context != context || flip.activityGeneration != activityGeneration ||
             snapshot.entries[flip.key]?.online200At != null ||
-            GraphV2Domain.support(snapshot.catalog, flip.key.tab, flip.key.period) == GraphPeriodSupport.Unsupported) {
+            GraphV2Domain.support(snapshot.catalog, flip.key.tab, flip.key.period) == GraphPeriodSupport.Unsupported ||
+            activeRecovery() != null) {
             cancelFlip()
             return
         }
@@ -1913,6 +2142,7 @@ internal class GraphV2RequestCoordinator(
                 candidates += if (tabRequests.containsKey(midnight.key)) deadline else afterFloor(deadline)
             }
         }
+        recoveryDue()?.let { candidates += afterFloor(it) }
         if (deferredDemand != null) sharedRetryFloor?.let { candidates += it }
         fun readyAtFloor(registration: Registration): Boolean =
             registration.waitingForFloor && registration.capturedOwner != null
@@ -1939,6 +2169,12 @@ internal class GraphV2RequestCoordinator(
     }
 
     private fun releaseRegistration(registration: Registration) {
+        registration.recoveryRound?.let { round ->
+            // An application clears this again; only a withdrawal of the current round's tab keeps it.
+            if (round.budget.round === round && round.tabRequestId == registration.requestId) {
+                round.budget.hold = registration.context to registration.activityGeneration
+            }
+        }
         registration.disposed.set(true)
         if (registration.key == null) {
             if (catalogRequest === registration) catalogRequest = null
@@ -1983,6 +2219,7 @@ internal class GraphV2RequestCoordinator(
     private fun dropCaptures(registration: Registration) {
         registration.recoveryRequests = emptyList()
         registration.capturedOwner = null
+        registration.recoveryRound = null
     }
 
     private fun releaseCompletion(event: Event) {
@@ -2018,5 +2255,6 @@ internal class GraphV2RequestCoordinator(
         val FLIP_INTERVAL = 3.seconds
         val COLD_INTERVALS = listOf(3.seconds, 6.seconds, 12.seconds, 24.seconds, 48.seconds)
         val MIDNIGHT_INTERVALS = listOf(20.seconds, 40.seconds, 80.seconds)
+        val MAX_RECOVERY_ROUNDS = COLD_INTERVALS.size + 1
     }
 }
