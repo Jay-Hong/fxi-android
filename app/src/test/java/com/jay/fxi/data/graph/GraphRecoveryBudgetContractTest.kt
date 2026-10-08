@@ -145,6 +145,12 @@ import org.junit.Test
  * joining its request keeps rung 0. The other effects of a trigger are T02-T06's: a trigger acts the same whatever its
  * kind.
  *
+ * S4 RT05b (rows F04 and F06, rt05_api_agreed.r2 §7): a reconnect under a grant the coordinator has not synchronized yet
+ * delivers that context change before its trigger, so the trigger is valid in the new context: an exhausted budget opens a
+ * new cycle beside the change's own request. A budget parked on the permit sends one round: the change ends the wait and its
+ * own unforced request is held back until the round judges the new permit (rt03b3_api_agreed.r5). A short return asks
+ * nothing and keeps the closed demand for the next boundary.
+ *
  * Not here: the unconfirmed 200 of a cache-port coordinator (P09,
  * in GraphV2RequestCoordinatorReGateTest). The implementation thread reads but does not edit this file.
  */
@@ -2852,10 +2858,15 @@ class GraphRecoveryBudgetContractTest {
 
     // --- S4 RT05a: the adapter's boundary on the real coordinator (rows E07, E08, E10, rt05_api_agreed.r2 §6) -------------
 
-    /** The RT05a adapter over [f]'s coordinator and recorder, on its executor and clock, started in the foreground. */
+    /**
+     * The RT05 adapter over [f]'s coordinator and recorder, on its executor and clock, reading [f]'s permit, started in the
+     * foreground.
+     */
     private fun TestScope.events(f: Fixture): GraphRecoveryEvents =
-        GraphRecoveryEvents(f.scope, f.clock, { f.state.source }, f.coordinator::onRecoveryTrigger, f.recorder::retain, {})
-            .also {
+        GraphRecoveryEvents(
+            f.scope, f.clock, { f.state.source }, f.coordinator::onRecoveryTrigger, f.recorder::retain, {}, { f.permit },
+            f.coordinator::onContextChanged
+        ).also {
                 it.onForeground(true)
                 runCurrent()
             }
@@ -2944,5 +2955,70 @@ class GraphRecoveryBudgetContractTest {
         assertEquals("the activation sends one round", secs(0, 3, 9, 21, 45, 93, 800), g.tabTimes())
         step(3.seconds)
         assertEquals("of a new cycle: its 503 moves the ladder on", secs(0, 3, 9, 21, 45, 93, 800, 803), g.tabTimes())
+    }
+
+    // --- S4 RT05b: reconnects and returns on the real coordinator (rows F04, F06, rt05_api_agreed.r2 §7) -------------------
+
+    /** A permit of [session] naming Connection [generation] under [fence] with [lifetime]. */
+    private fun connection(generation: Long, fence: TopicSessionFence, lifetime: TopicUseLifetime, automatic: Boolean = true) =
+        TopicGraphRecoveryPermit(session, generation, fence, 1L, false, generation, lifetime, automatic)
+
+    /**
+     * F04 (RT05-T03): a reconnect under grant 8 (G -> no Connection -> a later G), which the coordinator has not synchronized,
+     * delivers the context change before its trigger, so the trigger is valid in the new context. With an exhausted budget,
+     * the change's own request goes and the reconnect opens a new cycle that joins it, whose ladder goes on from its
+     * completion. With a budget parked on grant 8's permit published before the coordinator had grant 8 - and no other notice -
+     * only the adapter's context change ends the wait, and one round goes (that the change's own unforced request is held back
+     * is PM03's).
+     */
+    @Test fun F04_aReconnectDeliversItsContextBeforeItsTrigger() = budgetTest {
+        val f = exhausted()
+        val e = events(f)
+        f.permit = connection(1, checkNotNull(f.fence), f.lifetime())
+        e.onPermitChanged(); runCurrent()
+        f.permit = TopicGraphRecoveryPermit(session, 2L, checkNotNull(f.fence), 1L, false, null, null, true)
+        e.onPermitChanged(); runCurrent()
+        f.tabSequence({ })
+        f.fence = sessionFence(grant = 8)
+        f.permit = connection(3, checkNotNull(f.fence), f.lifetime())
+        e.onPermitChanged(); runCurrent()
+        assertEquals("the context change's own request", secs(0, 3, 9, 21, 45, 93, 200), f.tabTimes())
+        f.tabSequence(fail503)
+        f.tabs().last().tab.complete(status(503)); runCurrent()
+        step(3.seconds)
+        assertEquals("the reconnect's new cycle joined it and goes on", secs(0, 3, 9, 21, 45, 93, 200, 203), f.tabTimes())
+
+        val g = ready(withPermit = true)
+        g.tabSequence(fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        val h = events(g)
+        publish(g, connection(1, checkNotNull(g.fence), g.lifetime(), automatic = false))
+        h.onPermitChanged(); runCurrent()
+        step(10.seconds)
+        assertEquals("premise: the round waits on the permit", listOf(0L), g.tabTimes())
+        val grant8 = sessionFence(grant = 8)
+        publish(g, connection(2, grant8, TopicUseLifetime(grant8.grant, g.invalidations)))
+        assertEquals("premise: grant 8's permit before the coordinator has grant 8 parks the round again", listOf(0L),
+            g.tabTimes())
+        g.fence = grant8
+        h.onPermitChanged(); runCurrent()
+        assertEquals("one round, judged on grant 8's permit", secs(0, 10), g.tabTimes())
+    }
+
+    /**
+     * F06 (RT05-T02, T04): a 30 s return within the bucket asks nothing and sends nothing; the closed demand stays, and the next
+     * boundary recovers it.
+     */
+    @Test fun F06_aShortReturnAsksNothingAndKeepsTheClosedDemand() = budgetTest {
+        val f = exhausted()
+        val e = events(f)
+        e.onForeground(false); runCurrent()
+        step(30.seconds)
+        e.onForeground(true); runCurrent()
+        step(1.seconds)
+        assertEquals("a 30 s return within 12:00 sends nothing", secs(0, 3, 9, 21, 45, 93), f.tabTimes())
+        assertTrue("the closed demand is kept", B1 in f.series(KB).pending && B2 in f.series(KB).pending)
+        step(369.seconds)
+        assertEquals("12:10 recovers it", secs(0, 3, 9, 21, 45, 93, 600), f.tabTimes())
     }
 }

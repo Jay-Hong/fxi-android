@@ -540,10 +540,13 @@ class GraphV2LivePublishTest {
             run()
         }
 
-        /** RT05a: the recovery event adapter over this fixture, emitting into [holder]; its clock is the holder's wall time. */
+        /**
+         * RT05: the recovery event adapter over this fixture, emitting into [holder], with no permit; its clock is the holder's
+         * wall time.
+         */
         fun events() = GraphRecoveryEvents(
             scope, AppClock { clock.now() + offset }, { coordinator.state.value.source }, coordinator::onRecoveryTrigger,
-            recorder::retain, holder::onTimeEvent
+            recorder::retain, holder::onTimeEvent, { null }, coordinator::onContextChanged
         )
 
         /** Shows the chart and selects 3m, answered with X and Y quarter series. */
