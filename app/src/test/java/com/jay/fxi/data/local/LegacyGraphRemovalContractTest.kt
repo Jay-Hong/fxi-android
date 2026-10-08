@@ -34,6 +34,7 @@ class LegacyGraphRemovalContractTest {
     private val cachePath = "com/jay/fxi/data/local/CacheService.kt"
     private val journalPath = "com/jay/fxi/data/local/LocalMigrationJournal.kt"
     private val manifestPath = "com/jay/fxi/data/entitlements/purge/PurgeManifest.kt"
+    private val migrationPath = "com/jay/fxi/data/local/GraphCacheMigration.kt"
 
     /** GA01a: no v1 endpoint, repository, view model, DTO, preference store, cache model, cache reader/writer or promotion. */
     @Test fun GA01a_noV1GraphConsumerRemains() {
@@ -61,12 +62,16 @@ class LegacyGraphRemovalContractTest {
     }
 
     /**
-     * GA01b: v1 graph file names survive only where they are deleted (CacheService) or named as obligations (the migration
-     * journal and the purge manifest). In CacheService every use of the two name helpers deletes the file it names.
+     * GA01b: v1 graph file names survive only where they are deleted (CacheService and, since S4 RT07, the dormant
+     * GraphCacheMigration sweep) or named as obligations (the migration journal and the purge manifest). In CacheService every
+     * use of the two name helpers deletes the file it names.
      */
     @Test fun GA01b_v1GraphFileNamesSurviveOnlyForDeletionAndObligations() {
         val all = sources()
-        assertEquals(setOf(cachePath, journalPath, manifestPath), all.filterValues { it.contains("graph_cache_") }.keys)
+        assertEquals(
+            setOf(cachePath, journalPath, manifestPath, migrationPath),
+            all.filterValues { it.contains("graph_cache_") }.keys
+        )
         val cache = all.getValue(cachePath)
         val uses = Regex("""(?<!fun )\b(graphCacheFile|legacyGraphCacheFile)\(([^()]*)\)(\.\w+\(\))?""").findAll(cache).toList()
         assertEquals("premise: both helpers are still used by the account-deletion cleanup",
