@@ -6,6 +6,7 @@ import com.jay.fxi.data.graph.GraphKey
 import com.jay.fxi.data.graph.GraphObservationSeriesKey
 import com.jay.fxi.data.graph.GraphRecorder
 import com.jay.fxi.data.graph.GraphRecoverableState
+import com.jay.fxi.data.graph.GraphRequestSource
 import com.jay.fxi.data.graph.GraphRequestState
 import com.jay.fxi.data.graph.GraphSelectionApplyResult
 import com.jay.fxi.data.graph.GraphSelectionBinding
@@ -195,8 +196,6 @@ internal class GraphV2ScreenStateHolder(
     private var restoring: RestoreOperation? = null
     private var operationId = 0L
     private var notice: GraphV2Notice? = null
-    private var retiredRequestState: GraphRequestState? = null
-    private var retiredContext: Context? = null
     private val mutableState = MutableStateFlow(emptyState(GraphV2Content.INACTIVE))
     val state: StateFlow<GraphV2ScreenState> = mutableState.asStateFlow()
 
@@ -397,58 +396,32 @@ internal class GraphV2ScreenStateHolder(
 
     /**
      * S4 RT01-B3: on [dispatcher], after the coordinator's USER retirement, including NOTHING_TO_REMOVE.
-     * The selected epochs must have ended permanently. [selects] must be pure and give the same answer
-     * throughout the port call. Each distinct non-null scope of this holder's context and retired context
-     * is evaluated at most once, before any change; a selector exception leaves this holder unchanged.
-     *
-     * A selected context retires explicitly. Every call then publishes synchronously and clears guards
-     * only where removal changes no later refusal. Activation release and reacquisition stay with the
-     * next reconcile; this call neither rebinds the selection session nor reacquires a context.
+     * The selected epochs must have ended permanently. [selects] must be pure. Only the current context's
+     * non-null scope is evaluated, at most once and before any change; a selector exception leaves this
+     * holder unchanged. A selected context retires explicitly. After a normal evaluation the current state is
+     * always published, selected or not and with or without a context. Activation release and reacquisition
+     * stay with the next reconcile; this call neither rebinds the selection session nor reacquires a context.
      */
     internal fun retireScopes(selects: (GraphDataScope) -> Boolean) {
-        val selected = listOfNotNull(context?.let(::scopeOf), retiredContext?.let(::scopeOf))
-            .distinct().filter(selects).toSet()
         val current = context
-        if (current != null && scopeOf(current) in selected) retireContext()
+        val selected = current?.let(::scopeOf)?.let(selects) == true
+        if (selected) retireContext()
         currentState()
-        clearRetiredGuards(selected)
     }
 
     /**
      * S4 RT01-B3: on [dispatcher], after the coordinator's CAPABILITY retirement, including NOTHING_TO_REMOVE.
-     * Publishes the current state and clears dead guards without forcing a context retirement. An invalid
-     * lifetime retires lazily. A context that stays current is not retired and keeps its period; it keeps
-     * its fullscreen and chart only while the gate admits it, since a gate refusal (a closed protected
-     * admission, for one) publishes BLOCKED and closes the fullscreen as any render does.
+     * Publishes the current state without forcing a context retirement. An invalid lifetime retires lazily.
+     * A context that stays current is not retired and keeps its period; it keeps its fullscreen and chart only
+     * while the gate admits it, since a gate refusal (a closed protected admission, for one) publishes BLOCKED
+     * and closes the fullscreen as any render does.
      */
     internal fun retireCapabilities() {
         currentState()
-        clearRetiredGuards()
-    }
-
-    /** S4 RT01-B3 read-only probe on [dispatcher]: whether either retired guard reference remains for [scope], or any. */
-    internal fun holdsRetiredGuard(scope: GraphDataScope? = null): Boolean {
-        if (scope == null) return retiredRequestState != null || retiredContext != null
-        return retiredRequestState?.dataScope == scope || retiredContext?.let(::scopeOf) == scope
     }
 
     private fun scopeOf(context: Context): GraphDataScope? =
         context.fence.userAccessEpoch?.let { GraphDataScope(context.binding.identity.uid, it) }
-
-    /**
-     * An old snapshot object never becomes current again, and a snapshot without a data scope never
-     * reaches the identity guard in [requestState]: both references can go. A current scoped snapshot
-     * stays; only a selected, permanently retired USER context goes alone, since its fence cannot return.
-     */
-    private fun clearRetiredGuards(retiredUserScopes: Set<GraphDataScope> = emptySet()) {
-        val retired = retiredRequestState
-        if (retired == null || retired.dataScope == null || retired !== coordinator.state.value) {
-            retiredRequestState = null
-            retiredContext = null
-        } else if (retiredContext?.let(::scopeOf)?.let { it in retiredUserScopes } == true) {
-            retiredContext = null
-        }
-    }
 
     suspend fun close() {
         if (closed) {
@@ -553,9 +526,6 @@ internal class GraphV2ScreenStateHolder(
         clearSurfaceReports()
         val previous = context
         if (previous != null) {
-            // Old failures/catalog must not be attributed to a new auth/fence/use before the request loop catches up.
-            retiredRequestState = coordinator.state.value
-            retiredContext = previous
             context = null
             activePeriod = GraphPeriod.ONE_DAY
             contextGeneration = Math.incrementExact(contextGeneration)
@@ -599,8 +569,8 @@ internal class GraphV2ScreenStateHolder(
         val snapshot = coordinator.state.value
         val epoch = current.fence.userAccessEpoch ?: return null
         if (snapshot.dataScope != GraphDataScope(current.binding.identity.uid, epoch)) return null
-        if (snapshot === retiredRequestState &&
-            (current.fence != retiredContext?.fence || current.lifetime != retiredContext?.lifetime)) return null
+        // Old failures/catalog must not be attributed to a new auth/fence/use before the request loop catches up.
+        if (snapshot.source != GraphRequestSource(current.fence, current.lifetime)) return null
         return snapshot
     }
 

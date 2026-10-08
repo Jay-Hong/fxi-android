@@ -75,12 +75,22 @@ internal enum class GraphRuntimeRetirement { REMOVED, NOTHING_TO_REMOVE, LIVE_SC
 /** A KRX capability namespace; a null epoch names raw KRX the coordinator cannot attribute. */
 internal data class GraphCapabilityScope(val uid: String, val krxCapabilityEpoch: String?)
 
+/** S4 RT03b-0: the request context a scoped snapshot's catalog, failures and in-flight keys belong to. */
+internal data class GraphRequestSource(val fence: TopicSessionFence, val lifetime: TopicUseLifetime)
+
+/**
+ * When a context synchronization builds a new snapshot, [source] is the request context it acquired, or null when it
+ * acquired none (no fence or epoch, an identity mismatch, or a refused use), even with a non-null [dataScope]. Every
+ * copy keeps it; the retirement's empty snapshot has none. Entries are exposed through
+ * [GraphV2RequestCoordinator.protectedEntry] and the live gate, whatever the source.
+ */
 internal data class GraphRequestState(
     val dataScope: GraphDataScope? = null,
     val catalog: GraphCatalog? = null,
     val entries: Map<GraphKey, GraphEntry> = emptyMap(),
     val inFlight: Set<GraphKey> = emptySet(),
-    val failures: Map<GraphKey, Throwable> = emptyMap()
+    val failures: Map<GraphKey, Throwable> = emptyMap(),
+    val source: GraphRequestSource? = null
 )
 
 /**
@@ -883,7 +893,8 @@ internal class GraphV2RequestCoordinator(
         }
         snapshot = GraphRequestState(
             dataScope = dataScope,
-            entries = if (scopeChanged) emptyMap() else snapshot.entries
+            entries = if (scopeChanged) emptyMap() else snapshot.entries,
+            source = next?.let { GraphRequestSource(it.fence, it.lifetime) }
         )
         return true
     }

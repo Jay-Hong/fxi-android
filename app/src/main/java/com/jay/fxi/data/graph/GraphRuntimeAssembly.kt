@@ -58,18 +58,25 @@ internal class GraphAccessFenceBridge(private val onChanged: () -> Unit) : Topic
 /**
  * Reads one adopted coordinator publication on the recorder's serial executor. Its catalog is
  * returned only if the delivered fence has an epoch and its (uid, userAccessEpoch) exactly matches
- * that publication's data scope. Missing fences, missing epochs and other scopes return null;
- * there is no fallback to a catalog from a previous scope. [coordinator] is late-bound because the
- * recorder is constructed first.
+ * that publication's data scope, and the publication's source has that fence and a lifetime [uses]
+ * still admits (S4 RT03b-0): a catalog adopted under an earlier use of the same fence is not
+ * returned before the coordinator synchronizes. Missing fences, missing epochs, missing sources and
+ * other scopes return null; there is no fallback to a catalog from a previous scope. [coordinator]
+ * is late-bound because the recorder is constructed first.
  */
 internal fun graphRecorderCatalog(
     coordinator: () -> GraphV2RequestCoordinator,
-    fence: () -> TopicSessionFence?
+    fence: () -> TopicSessionFence?,
+    uses: TopicUseAuthority
 ): () -> GraphCatalog? = supply@{
     val current = fence() ?: return@supply null
     val epoch = current.userAccessEpoch ?: return@supply null
     val publication = coordinator().state.value
-    publication.catalog.takeIf { publication.dataScope == GraphDataScope(current.identity.uid, epoch) }
+    val source = publication.source ?: return@supply null
+    publication.catalog.takeIf {
+        publication.dataScope == GraphDataScope(current.identity.uid, epoch) && source.fence == current &&
+            uses.admits(source.lifetime)
+    }
 }
 
 /**
@@ -134,7 +141,7 @@ internal class GraphRuntimeAssembly(
             gate = GraphV2AccessGate(liveIdentity, fences.current, accessSnapshot, protectedAdmission)
             recorder = GraphRecorder(
                 scope, accessRevisions, accessSnapshot, fences.current,
-                graphRecorderCatalog({ requests }, fences.current), gate, clock
+                graphRecorderCatalog({ requests }, fences.current, uses), gate, clock
             ).also { createdRecorder = it }
             coordinator = GraphV2RequestCoordinator(
                 fetcher = fetcher,

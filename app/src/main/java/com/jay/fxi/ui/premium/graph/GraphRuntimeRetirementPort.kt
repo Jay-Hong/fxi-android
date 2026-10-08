@@ -11,8 +11,8 @@ import kotlinx.coroutines.withContext
  * S4 RT01-B3 dormant port: retires coordinator memory first, then the screen holders supplied by the
  * mount, in one block without suspension on [main]. LIVE_SCOPE_SELECTED returns without accessing
  * [holders]. Otherwise it walks a copy of the holder collection and returns the coordinator's result
- * unchanged. NOTHING_TO_REMOVE means only that the coordinator newly removed nothing; holder
- * publication and guard cleanup still run.
+ * unchanged. NOTHING_TO_REMOVE means only that the coordinator newly removed nothing; the holders'
+ * publication still runs.
  *
  * Caller preconditions: coordinator and holders belong to the same assembly, and holders use its
  * main dispatcher, fence supplier, gate and recorder. Selected named epochs must have ended permanently

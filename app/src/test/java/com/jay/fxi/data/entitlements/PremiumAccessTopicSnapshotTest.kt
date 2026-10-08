@@ -57,12 +57,14 @@ import com.jay.fxi.data.remote.OwnedTopicFocus
 import com.jay.fxi.data.remote.TopicDisplayOwner
 import com.jay.fxi.data.remote.TopicDisplayState
 import com.jay.fxi.data.remote.TopicGrantOrigin
+import com.jay.fxi.data.remote.TopicGrantToken
 import com.jay.fxi.data.remote.TopicGraphCandidate
 import com.jay.fxi.data.remote.TopicGraphInput
 import com.jay.fxi.data.remote.TopicGraphOffer
 import com.jay.fxi.data.remote.TopicGraphPath
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.remote.TopicUseAttribution
+import com.jay.fxi.data.remote.TopicUseAuthority
 import com.jay.fxi.data.remote.TopicUseLifetime
 import com.jay.fxi.data.remote.dto.GraphV2CatalogPeriod
 import com.jay.fxi.data.remote.dto.GraphV2CatalogResponse
@@ -3036,20 +3038,38 @@ class PremiumAccessTopicSnapshotTest {
      * graphA09a (S4 RT01-A3): the recorder's catalog supplier answers the coordinator's adopted catalog only while the
      * published fence's data scope is the coordinator's: nothing before adoption, nothing for another epoch, a fence with no
      * epoch, another user or no fence - even before the coordinator moves - nothing after a context change until a catalog
-     * is adopted again, then that new catalog.
+     * is adopted again, then that new catalog. S4 RT03b-0: the context synchronization sets the publication's source before
+     * any catalog; the supplier reads nothing for another grant of the same scope before the coordinator moves (the source's
+     * fence), nor once the use authority, renewed under the same fence, admits only the next lifetime (the source's
+     * lifetime is no longer admitted).
      */
     @Test
     fun graphA09a_theRecorderCatalogIsTheCoordinatorsInItsScopeOnly() = snapshotTest {
         val r = AssemblyRig(this, granted())
         r.a.start()
         val issued = r.deliverIssued(); runCurrent()
-        val supply = graphRecorderCatalog({ r.a.coordinator }, r.a.fences.current)
+        val supply = graphRecorderCatalog({ r.a.coordinator }, r.a.fences.current, r.uses)
         r.a.coordinator.onActivated(KEY_3M); runCurrent()
+        assertEquals("the context sync sets the source before any catalog", issued, r.a.coordinator.state.value.source?.fence)
         assertNull("nothing before a catalog is adopted", supply())
         r.sent.single { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
         val adopted = checkNotNull(r.a.coordinator.state.value.catalog) { "premise: adopted" }
         assertSame("the same scope reads the adopted catalog", adopted, supply())
+        // A same-fence use invalidation, modelled: once renewed, only the next lifetime is acquired and admitted.
+        var renewed: TopicUseLifetime? = null
+        val gated = graphRecorderCatalog({ r.a.coordinator }, r.a.fences.current, object : TopicUseAuthority {
+            override fun acquire(fence: TopicSessionFence) = renewed ?: r.uses.acquire(fence)
+            override fun admits(lifetime: TopicUseLifetime) = renewed?.let { it == lifetime } ?: r.uses.admits(lifetime)
+        })
+        assertSame("premise: an admitted source lifetime reads it", adopted, gated())
+        val source = checkNotNull(r.a.coordinator.state.value.source) { "premise: the snapshot carries its source" }
+        assertEquals("premise: the source is the delivered fence", issued, source.fence)
+        renewed = source.lifetime.copy(invalidations = source.lifetime.invalidations + 1)
+        assertNull("the source's lifetime no longer admitted reads nothing, before the coordinator moves", gated())
+        assertSame("premise: the coordinator still holds it", adopted, r.a.coordinator.state.value.catalog)
 
+        r.a.fences.setAccess(true, issued.copy(grant = TopicGrantToken(issued.grant.value + 100)), TopicGrantOrigin.NewContext)
+        assertNull("another grant of the same scope reads nothing, before the coordinator moves (S4 RT03b-0)", supply())
         r.a.fences.setAccess(true, issued.copy(userAccessEpoch = "another"), TopicGrantOrigin.NewContext)
         assertNull("another epoch reads nothing, before the coordinator moves", supply())
         r.a.fences.setAccess(true, issued.copy(userAccessEpoch = null), TopicGrantOrigin.NewContext)
@@ -3598,12 +3618,13 @@ class PremiumAccessTopicSnapshotTest {
      * screen - and changes neither the coordinator nor the holder; the purge answers Failed and its journal stays. The
      * holder empties its screen itself on the issuer's revision. The user is approved again and the issuer's next grant,
      * of a new epoch, is delivered once its lock is released; the holder takes the new scope. The issuer's retry then runs
-     * the port: whatever the coordinator still had, the holder step drops the retired scope's guard references in the same
-     * main block and keeps the new scope's screen. The journal clears. Once the new scope draws, the late answer of a
-     * retired request, the old token and the publication scheduled before change nothing.
+     * the port: whatever the coordinator still had, the holder - holding the new scope at that moment - keeps that screen as
+     * it was in the same main block (that the holder step runs at all is graphB301's and B3H02's). The journal clears. Once
+     * the new scope draws, the late answer of a retired request, the old token and the publication scheduled before change
+     * nothing.
      */
     @Test
-    fun graphB302_aUserPurgeRefusedWhileLiveDropsTheRetiredReferencesOnItsRetry() = snapshotTest {
+    fun graphB302_aUserPurgeRefusedWhileLiveRunsAgainOnItsRetryAndKeepsTheNewScope() = snapshotTest {
         val h = granted()
         val r = AssemblyRig(this, h)
         r.a.start()
@@ -3618,14 +3639,12 @@ class PremiumAccessTopicSnapshotTest {
         val results = mutableListOf<GraphRuntimeRetirement>()
         var refusedUnchanged: Boolean? = null
         var firstRefusalDrawn: Boolean? = null
-        var guardBeforeRetry: Boolean? = null
-        var guardAtReturn: Boolean? = null
         var keptAcrossRetry: Boolean? = null
+        var fenceAtRetry: TopicSessionFence? = null
         h.purger.onUser = { namespace ->
             withContext(r.main) {
                 val snapshotBefore = r.a.coordinator.state.value
                 val stateBefore = ah.holder.state.value
-                val guardBefore = ah.holder.holdsRetiredGuard(retired)
                 val result = ah.port.retireScopes {
                     it.uid == namespace.ownerUid && it.userAccessEpoch != namespace.currentUserAccessEpoch
                 }
@@ -3633,11 +3652,10 @@ class PremiumAccessTopicSnapshotTest {
                 if (result == GraphRuntimeRetirement.LIVE_SCOPE_SELECTED) {
                     if (firstRefusalDrawn == null) firstRefusalDrawn = stateBefore.chart != null
                     refusedUnchanged = (refusedUnchanged ?: true) && snapshotBefore === r.a.coordinator.state.value &&
-                        stateBefore === ah.holder.state.value && guardBefore == ah.holder.holdsRetiredGuard(retired)
+                        stateBefore === ah.holder.state.value
                     PurgeResult.Failed(IllegalStateException("a selected graph scope is still live"))
                 } else {
-                    guardBeforeRetry = guardBefore
-                    guardAtReturn = ah.holder.holdsRetiredGuard(retired)
+                    fenceAtRetry = stateBefore.inlineToken?.fence
                     keptAcrossRetry = stateBefore === ah.holder.state.value
                     PurgeResult.Completed
                 }
@@ -3662,15 +3680,16 @@ class PremiumAccessTopicSnapshotTest {
         assertNotEquals("premise: a new user scope", retired.userAccessEpoch, next.userAccessEpoch)
         r.sent.filter { it.kind == "catalog" && !it.catalog.isCompleted }.forEach { it.catalog.complete(ok(graphCatalog())) }
         runCurrent()
+        val newScope = withContext(r.main) { checkNotNull(ah.holder.currentState().inlineToken) { "premise: the holder holds a scope" } }
+        assertEquals("premise: the holder holds the new scope before the retry", next, newScope.fence)
         for (attempt in 1..60) {
             if (results.size > refusals) break
             advanceTimeBy(RETRY); runCurrent()
         }
         assertEquals("the retry ran the port once more: $results", refusals + 1, results.size)
         assertTrue("the retry was not refused", results.last() != GraphRuntimeRetirement.LIVE_SCOPE_SELECTED)
-        assertEquals("premise: the retired scope's references were there", true, guardBeforeRetry)
-        assertEquals("the holder step dropped them in the port's block", false, guardAtReturn)
-        assertEquals("and kept the new scope's screen", true, keptAcrossRetry)
+        assertEquals("premise: the holder held the new scope at the retry", next, fenceAtRetry)
+        assertEquals("the new scope's screen is kept", true, keptAcrossRetry)
         assertTrue("the journal clears", h.store.record.pendingPurges.isEmpty())
 
         r.sent.filter { it !== late && it.kind == "tab" && !it.tab.isCompleted }

@@ -79,6 +79,7 @@ import kotlinx.datetime.Instant
 import okhttp3.Headers
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
@@ -102,11 +103,16 @@ import org.junit.rules.TemporaryFolder
  * invalidation re-acquired at once (closed by the render that the gate refuses first) and a focus that leaves the tab and
  * comes back - the gate does not see focus, so the render does not close it, and the same owner re-acquires without
  * onActivated's second retire: only the retire itself closes the fullscreen there. r8 (S4 RT01-B3, API agreed in R4c/S4
- * rt01b3_api_agreed.r2): B3H01-B3H06 drive the runtime port (coordinator first, then this holder, one block on the
- * fixture's dispatcher) and the holder's retirement calls - the screen empty at the port's return, the retired-snapshot
- * guard's references dropped only where that changes no answer (read through holdsRetiredGuard), KRX retirement without
- * a forced retire, the port's failures and its walk over a copy of the holder list. The explicit retire of a selected context is equivalent here: holder and coordinator share one fence
- * supplier, so the render retires the same context (PT graphB301 fixes that supplier in the assembly).
+ * rt01b3_api_agreed.r2): B3H01, B3H02 and B3H04-B3H06 drive the runtime port (coordinator first, then this holder, one
+ * block on the fixture's dispatcher) and the holder's retirement calls - the screen empty at the port's return, KRX
+ * retirement without a forced retire, the port's failures and its walk over a copy of the holder list. The explicit
+ * retire of a selected context is equivalent here: holder and coordinator share one fence supplier, so the render
+ * retires the same context (PT graphB301 fixes that supplier in the assembly). r9 (S4 RT03b-0, API agreed in R4c/S4
+ * rt03b0_api_agreed.r2): the retired-snapshot guard and its probe are removed - a code-review point, since no row can
+ * observe their absence; the holder reads a request snapshot's catalog and failure only under the use it was
+ * synchronized for (its source), so B3H03 - which drives the coordinator and the holder's activation, not the port -
+ * holds a new use of the same scope and fence, and another fence with the same lifetime, off the old use's catalog and
+ * failure while the coordinator has not moved (U4).
  *
  * Oracles: ANDROID_V2_PLAN.md :1286 (catalog periods per tab only, server X axis, insufficient history is a 200), :1288-1292
  * (protected reads only under the current access, KRX joined only under the current capability, visible and initialized saved
@@ -1460,9 +1466,8 @@ class GraphV2ScreenStateHolderTest {
 
     /**
      * B3H01 (B02): a retired USER scope leaves the screen inside the port's block - BLOCKED with no chart, toggles,
-     * selection or token, and no guard reference to the retired snapshot or context (read in the same block; a holder
-     * called before the coordinator would keep the retired snapshot). As end-state checks of the epoch boundary, not of
-     * the port alone: the old token writes nothing, and a late e1 answer leaves e2's drawn chart in place.
+     * selection or token. As end-state checks of the epoch boundary, not of the port alone: the old token writes nothing,
+     * and a late e1 answer leaves e2's drawn chart in place.
      */
     @Test fun B3H01_aRetiredUserScopeLeavesTheScreenBeforeThePortReturns() = holderTest {
         val f = Fixture(this)
@@ -1475,10 +1480,11 @@ class GraphV2ScreenStateHolderTest {
         val writes = f.selections.writes
         f.endEpochE1()
         assertEquals("premise: nothing was handled", GraphV2Content.READY, f.holder.state.value.content)
-        val (result, at, guard) = f.onMain {
+        val (result, at) = f.onMain {
             val r = f.port().retireScopes { it == S1 }
             assertNull("the coordinator retired e1 in the port's block", f.coordinator.state.value.dataScope)
-            Triple(r, f.holder.state.value, f.holder.holdsRetiredGuard())
+            assertNull("the empty snapshot has no source", f.coordinator.state.value.source)
+            r to f.holder.state.value
         }
         assertEquals(GraphRuntimeRetirement.REMOVED, result)
         assertEquals(GraphV2Content.BLOCKED, at.content)
@@ -1486,7 +1492,6 @@ class GraphV2ScreenStateHolderTest {
         assertEquals(emptyList<GraphV2SeriesToggle>(), at.toggles)
         assertNull(at.selection)
         assertNull(at.inlineToken)
-        assertFalse("no guard reference remains at the port's return", guard)
         f.holder.toggleSeries(old, Y)
         f.run()
         assertEquals("the old token writes nothing", writes, f.selections.writes)
@@ -1498,17 +1503,15 @@ class GraphV2ScreenStateHolderTest {
         pending.first().answer.complete(fullDay(1500.0))
         f.run()
         assertSame("the late e1 answer draws nothing over e2", drawn.prepared, checkNotNull(f.now().chart).prepared)
-        assertFalse(f.holder.holdsRetiredGuard(S1))
     }
 
     /**
      * B3H02: an unselected holder keeps its preparation (read through currentState: state.value would keep an equal old
-     * instance), and is still re-rendered - a closed admission nobody told it about is published at the port's return.
-     * When the current snapshot belongs to another scope, a retired USER scope's context reference goes alone while the
-     * other scope's snapshot guard stays, and the holders run although the coordinator had nothing left to remove; an
-     * unselected USER call and a capability call keep that context.
+     * instance), and is still re-rendered although the coordinator had nothing to remove - a closed admission nobody told
+     * it about is published at the port's return. A scope the coordinator synchronizes without a context (another user's
+     * fence while its owner source still reports u1) carries no source.
      */
-    @Test fun B3H02_anUnselectedScopeIsKeptAndOnlyTheRetiredContextGoes() = holderTest {
+    @Test fun B3H02_anUnselectedScopeIsKeptAndStillReRendered() = holderTest {
         val f = Fixture(this)
         f.open()
         f.answer(KEY_1D, fullDay())
@@ -1529,55 +1532,89 @@ class GraphV2ScreenStateHolderTest {
         val g = Fixture(this)
         g.open()
         g.answer(KEY_1D, fullDay())
-        val t = GraphDataScope("u2", "e2")
-        // The coordinator alone moves to u2's scope (its owner source still reports u1, so it holds no context and starts
-        // nothing); the holder then retires e1's context while u2's empty snapshot is current.
         g.fence = FENCE_B
         g.coordinator.onContextChanged()
         g.run()
-        assertEquals("premise: the coordinator moved", t, g.coordinator.state.value.dataScope)
-        assertTrue("premise: the guard holds u2's snapshot", g.holder.holdsRetiredGuard(t))
-        assertTrue("premise: and e1's context", g.holder.holdsRetiredGuard(S1))
-        g.onMain { g.port().retireScopes { it.userAccessEpoch == "e0" } }
-        assertTrue("an unselected USER call keeps e1's context", g.holder.holdsRetiredGuard(S1))
-        g.onMain { g.port().retireCapabilities { false } }
-        assertTrue("so does a capability call", g.holder.holdsRetiredGuard(S1))
-        val result = g.onMain { g.port().retireScopes { it == S1 } }
-        assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, result)
-        assertFalse("e1's context reference is gone", g.holder.holdsRetiredGuard(S1))
-        assertTrue("u2's snapshot guard stays", g.holder.holdsRetiredGuard(t))
+        assertEquals("premise: the coordinator moved", GraphDataScope("u2", "e2"), g.coordinator.state.value.dataScope)
+        assertNull("a scope synchronized without a context has no source", g.coordinator.state.value.source)
     }
 
     /**
-     * B3H03: a guard that can still refuse stays - a current snapshot with a scope, retired lazily by a use invalidation,
-     * keeps its references through a CAPABILITY call and an unselected USER call. With the holder called before the
-     * coordinator, the retired scope's snapshot stays too, which is why the port retires the coordinator first.
+     * B3H03 (U4, S4 RT03b-0): one use of a scope ends with a refresh failure on screen; the holder retires it and takes
+     * the next use of the same scope at once, and the coordinator publishes a copy (a capability retirement) before it
+     * hears of the new use. Until it does, the new use reads neither the old use's catalog (the four fallback periods, also
+     * when a period is chosen) nor its failure. Once the coordinator moves, a catalog adopted for the new use is read.
+     * Another fence with the same lifetime (u1's next auth generation under the same grant) reads none of the old catalog
+     * either.
      */
-    @Test fun B3H03_aLiveGuardStaysAndTheOrderMatters() = holderTest {
+    @Test fun B3H03_aNewUseOfTheSameScopeReadsNothingOfTheOldOne() = holderTest {
         val f = Fixture(this)
+        f.catalogDto = catalog("usd" to mapOf(
+            "1d" to period(listOf(X, KRX), listOf(X, KRX)),
+            "3m" to period(listOf(X, KRX), listOf(X, KRX))
+        ))
         f.open()
-        f.answer(KEY_1D, fullDay())
-        f.snapshot = snap(invalidations = 4L)
-        assertNull(f.now().chart)
-        assertTrue("premise: the lazy retire took the current snapshot", f.holder.holdsRetiredGuard(S1))
-        f.holder.retireCapabilities()
-        assertTrue("CAPABILITY keeps a live guard", f.holder.holdsRetiredGuard(S1))
-        f.holder.retireScopes { false }
-        assertTrue("an unselected USER call keeps it", f.holder.holdsRetiredGuard(S1))
+        f.answer(KEY_1D, day(S(X, pts(6, 1400.0)), S(KRX, pts(6, 1405.0))))
+        f.coordinator.onRefreshRequested(force = true)
+        f.run()
+        f.answer(KEY_1D, status(500))
+        assertNotNull("premise: a failure of the first use", f.now().requestFailure)
+        val catalogPeriods = listOf(GraphPeriod.ONE_DAY, GraphPeriod.THREE_MONTHS)
+        assertEquals("premise: the catalog's periods", catalogPeriods, f.now().periods)
+        val oldSource = checkNotNull(f.coordinator.state.value.source) { "premise: the snapshot carries its source" }
+        // One block without suspension: nothing runs until f.run().
+        f.snapshot = snap(krx = "K2", invalidations = 4L)
+        assertNull("premise: the lazy retire", f.now().chart)
+        f.holder.onActivated(OWNER_A)
+        assertEquals("premise: the next use", 4L, f.token().lifetime.invalidations)
+        assertEquals("premise: a copy published without a sync", GraphRuntimeRetirement.REMOVED,
+            f.coordinator.retireCapabilities { it.krxCapabilityEpoch == "K1" })
+        assertEquals("premise: the coordinator has not moved", oldSource, f.coordinator.state.value.source)
+        val oldCatalog = checkNotNull(f.coordinator.state.value.catalog) { "premise: the copy keeps the old catalog" }
+        assertNotNull("premise: and the old use's failure", f.coordinator.state.value.failures[KEY_1D])
+        assertEquals("premise: in the holder's scope", S1, f.coordinator.state.value.dataScope)
+        val window = f.now()
+        assertEquals("the old use's catalog is not read", GraphPeriod.entries.toList(), window.periods)
+        assertNull("nor its failure", window.requestFailure)
+        f.holder.selectPeriod(f.token(), GraphPeriod.ONE_WEEK)
+        assertEquals("a period outside the old catalog is chosen as with no catalog", GraphPeriod.ONE_WEEK, f.now().activePeriod)
+        f.run()
+        assertNotEquals("premise: the coordinator moved", oldSource, f.coordinator.state.value.source)
+        assertNotSame("premise: a catalog adopted for the new use", oldCatalog, f.coordinator.state.value.catalog)
+        assertEquals("the new use's catalog is read", catalogPeriods, f.now().periods)
 
+        // Another fence, the same lifetime: u1's next auth generation keeps grant 7 and invalidations 3. Deactivated, the
+        // holder rebinds without telling the coordinator, then takes the new context before the coordinator hears of it.
         val g = Fixture(this)
         g.open()
         g.answer(KEY_1D, fullDay())
-        g.endEpochE1()
-        g.holder.retireScopes { it == S1 }
-        assertEquals(GraphRuntimeRetirement.REMOVED, g.coordinator.retireScopes { it == S1 })
-        assertTrue("holder-first keeps e1's snapshot", g.holder.holdsRetiredGuard(S1))
+        assertEquals("premise: the catalog's periods", catalogPeriods, g.now().periods)
+        val gSource = checkNotNull(g.coordinator.state.value.source) { "premise: the snapshot carries its source" }
+        g.holder.onDeactivated()
+        g.run()
+        val a2 = AuthIdentityFence("u1", 2L)
+        val renewed = TopicSessionFence(a2, "e1", TopicGrantToken(7L))
+        g.identity = a2
+        g.fence = renewed
+        g.snapshot = snap(gen = 2L)
+        g.display.value = TopicDisplayState.NONE.copy(owner = TopicDisplayOwner(a2, 1L))
+        g.focus.value = OwnedTopicFocus(a2, FreeTab.USD)
+        g.run()
+        assertEquals("premise: the coordinator was not told", gSource, g.coordinator.state.value.source)
+        g.holder.onActivated(TopicDisplayOwner(a2, 1L))
+        val renewedToken = g.token()
+        assertEquals("premise: another fence", renewed, renewedToken.fence)
+        assertEquals("premise: the same lifetime", gSource.lifetime, renewedToken.lifetime)
+        assertEquals("another fence with the same lifetime reads none of the old catalog",
+            GraphPeriod.entries.toList(), g.now().periods)
+        g.run()
+        assertEquals("once the coordinator moves, its catalog is read", catalogPeriods, g.now().periods)
     }
 
     /**
      * B3H04 (B03): a KRX retirement. When the rotation ends the use, the screen is BLOCKED inside the port's block; the
-     * renewed use draws only GENERAL - the raw selection keeps KRX - until a fresh answer under the new epoch brings it back,
-     * and a later capability call drops the guard references that can no longer refuse. When the context stays current
+     * renewed use draws only GENERAL - the raw selection keeps KRX - until a fresh answer under the new epoch brings it back.
+     * When the context stays current
      * (outside the contract), the 3m period, the fullscreen and GENERAL stay and only KRX leaves.
      */
     @Test fun B3H04_aKrxRetirementLeavesOnlyGeneral() = holderTest {
@@ -1602,10 +1639,6 @@ class GraphV2ScreenStateHolderTest {
         assertEquals("the renewed use draws GENERAL alone", setOf(X), checkNotNull(f.now().chart).renderedIds)
         assertEquals(listOf(X), f.now().toggles.map { it.seriesId })
         assertEquals("the raw selection keeps KRX", sel(setOf(X, KRX), setOf(X, KRX)), f.selections.committed[key("u1")])
-        assertTrue("premise: a guard reference from the lazy retire", f.holder.holdsRetiredGuard())
-        val again = f.onMain { f.port().retireCapabilities { it.krxCapabilityEpoch == "K0" } }
-        assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, again)
-        assertFalse("a capability call drops the guard that can no longer refuse", f.holder.holdsRetiredGuard())
         f.coordinator.onRefreshRequested(force = true)
         f.run()
         f.sent.filter { it.key == KEY_1D && !it.answer.isCompleted }.forEach { it.answer.complete(krxDay(1500.0)) }
@@ -1632,12 +1665,14 @@ class GraphV2ScreenStateHolderTest {
         assertEquals(GraphV2Content.READY, kept.content)
         assertTrue("the fullscreen stays", kept.fullscreenOpen)
         assertEquals("the period stays", GraphPeriod.THREE_MONTHS, kept.activePeriod)
+        assertEquals("the same context still reads the catalog through the copy",
+            listOf(GraphPeriod.ONE_DAY, GraphPeriod.THREE_MONTHS), kept.periods)
         assertEquals("KRX left at the publication", setOf(X), checkNotNull(kept.chart).renderedIds)
     }
 
     /**
      * B3H05: the same identity's next epoch - the holder rebinds nothing and draws e2; retiring e1 then keeps e2's
-     * preparation, binding and saves, and drops the lazily retired e1 references it held before the port.
+     * preparation, binding and saves.
      */
     @Test fun B3H05_anotherEpochOfTheSameIdentityIsUntouched() = holderTest {
         val f = Fixture(this)
@@ -1650,7 +1685,6 @@ class GraphV2ScreenStateHolderTest {
         f.answer(KEY_1D, fullDay(1500.0))
         assertEquals("premise: e2 draws", GraphV2Content.READY, f.now().content)
         assertSame("premise: no rebind", binding, f.token().binding)
-        assertTrue("premise: the lazily retired e1 references", f.holder.holdsRetiredGuard(S1))
         val confirms = f.selections.confirms
         val writes = f.selections.writes
         val before = f.now()
@@ -1663,17 +1697,18 @@ class GraphV2ScreenStateHolderTest {
         assertEquals(confirms, f.selections.confirms)
         assertEquals(writes, f.selections.writes)
         assertSame(binding, f.token().binding)
-        assertFalse(f.holder.holdsRetiredGuard(S1))
     }
 
     /**
-     * B3H06: failures and lists. A live selected scope - USER or capability - touches no holder. A selector throw changes
-     * nothing in the holder, also when it throws on a second scope after selecting the first and while a re-render would
-     * publish something new. Through the port a coordinator-step throw propagates before any holder runs, and a
-     * holder-step throw propagates without rolling back the coordinator's retirement. The port walks a copy of the list:
-     * a closed holder ahead of an active one is INACTIVE without a throw and drops the references its close() left, and
-     * the active one is retired even though the mount drops it from the list on publication. A repeated call on the
-     * closed holder changes nothing. The context and the retired context of one scope are evaluated once.
+     * B3H06: failures and lists. A live selected scope - USER or capability - touches no holder (the capability case with
+     * a closed admission, so that a wrongly run re-render would publish). A selector throw changes nothing in the holder,
+     * and evaluates the held context's scope rather than the delivered fence's; also when it throws on the current e2
+     * scope while a closed admission would change the re-render. Through the port a coordinator-step throw propagates
+     * before any holder runs, and a holder-step throw propagates without rolling back the coordinator's retirement. The
+     * port walks a copy of the list: a closed holder ahead of an active one is INACTIVE without a throw, and the active one
+     * is retired even though the mount drops it from the list on publication. A repeated call on the closed holder changes
+     * nothing. Only the current context's non-null scope is evaluated - once, and not at all without a context, not even
+     * the coordinator's scope - and without a context the call still publishes.
      */
     @Test fun B3H06_failuresAndLists() = holderTest {
         val f = Fixture(this)
@@ -1686,7 +1721,6 @@ class GraphV2ScreenStateHolderTest {
         assertThrows(IllegalStateException::class.java) { f.holder.retireScopes { throw IllegalStateException("selector") } }
         assertSame(before, f.holder.state.value)
         assertSame(checkNotNull(before.chart).prepared, checkNotNull(f.now().chart).prepared)
-        assertFalse(f.holder.holdsRetiredGuard())
         var calls = 0
         val (coordinatorThrow, untouched) = f.onMain {
             runCatching {
@@ -1704,15 +1738,16 @@ class GraphV2ScreenStateHolderTest {
         k.accessRevisions.value += 1
         k.run()
         k.answer(KEY_1D, fullDay(1500.0))
-        assertTrue("premise: context e2, retired context e1", k.holder.holdsRetiredGuard(S1) && k.now().chart != null)
+        assertEquals("premise: the context is e2's", "e2", k.token().fence.userAccessEpoch)
         val shown = k.holder.state.value
         val shownPrepared = checkNotNull(shown.chart).prepared
         k.protectedOpen = false
+        val evaluated = mutableListOf<GraphDataScope>()
         assertThrows(IllegalStateException::class.java) {
-            k.holder.retireScopes { if (it == S1) throw IllegalStateException("second scope") else it == E2 }
+            k.holder.retireScopes { evaluated += it; if (it == E2) throw IllegalStateException("current scope") else false }
         }
+        assertEquals("the current scope was the one evaluated", listOf(E2), evaluated)
         assertSame("nothing was published", shown, k.holder.state.value)
-        assertTrue(k.holder.holdsRetiredGuard(S1))
         k.protectedOpen = true
         assertSame("nor prepared again", shownPrepared, checkNotNull(k.now().chart).prepared)
 
@@ -1721,6 +1756,11 @@ class GraphV2ScreenStateHolderTest {
         h.answer(KEY_1D, fullDay())
         h.endEpochE1()
         val shownBefore = h.holder.state.value
+        val evaluatedStale = mutableListOf<GraphDataScope>()
+        assertThrows(IllegalStateException::class.java) {
+            h.holder.retireScopes { evaluatedStale += it; throw IllegalStateException("context scope") }
+        }
+        assertEquals("the held context's scope, not the delivered fence's", listOf(S1), evaluatedStale)
         val (holderThrow, unchanged) = h.onMain {
             runCatching {
                 // The coordinator evaluates every candidate before it publishes; this throws only at the holder step.
@@ -1744,7 +1784,6 @@ class GraphV2ScreenStateHolderTest {
         assertNotNull("premise: the other holder holds e1", other.currentState().inlineToken)
         g.holder.close()
         g.run()
-        assertTrue("premise: close() left e1's references", g.holder.holdsRetiredGuard(S1))
         g.endEpochE1()
         val mounted = mutableListOf(g.holder, other)
         // The mount drops a holder once it shows nothing, mutating the list while the port walks it.
@@ -1757,30 +1796,50 @@ class GraphV2ScreenStateHolderTest {
             g.holder.state.value to other.state.value
         }
         assertEquals(GraphV2Content.INACTIVE, closed.content)
-        assertFalse("the closed holder drops its references", g.holder.holdsRetiredGuard())
         assertEquals("the holder after the closed one is retired too", GraphV2Content.BLOCKED, mixed.content)
         assertNull(mixed.inlineToken)
-        assertFalse(other.holdsRetiredGuard())
         val again = g.onMain {
             assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, g.port().retireScopes { it == S1 })
             g.holder.state.value
         }
         assertSame("a repeat on the closed holder changes nothing", closed, again)
-        assertFalse(g.holder.holdsRetiredGuard())
+        val noContext = mutableListOf<GraphDataScope>()
+        g.holder.retireScopes { noContext += it; true }
+        assertEquals("no context, no evaluation", emptyList<GraphDataScope>(), noContext)
 
         val j = Fixture(this)
         j.open()
         j.answer(KEY_1D, fullDay())
-        j.snapshot = snap(invalidations = 4L)
-        j.holder.onContextChanged()
-        j.run()
-        assertEquals("premise: e1 again under a new use", 4L, j.token().lifetime.invalidations)
-        assertTrue("premise: the retired context is e1's too", j.holder.holdsRetiredGuard(S1))
-        val liveCapability = j.onMain { j.port().retireCapabilities { it.krxCapabilityEpoch == "K1" } }
-        assertEquals(GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, liveCapability)
-        assertTrue("a live capability touches no holder", j.holder.holdsRetiredGuard(S1))
+        val drawn = j.holder.state.value
+        j.protectedOpen = false
+        val liveCapability = j.onMain { j.port().retireCapabilities { it.krxCapabilityEpoch == "K1" } to j.holder.state.value }
+        assertEquals(GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, liveCapability.first)
+        assertSame("a live capability touches no holder", drawn, liveCapability.second)
+        j.protectedOpen = true
         val seen = mutableListOf<GraphDataScope>()
         j.holder.retireScopes { seen += it; false }
-        assertEquals("one evaluation per distinct scope", listOf(S1), seen)
+        assertEquals("the current context's scope, once", listOf(S1), seen)
+        val selectedOnce = mutableListOf<GraphDataScope>()
+        j.holder.retireScopes { selectedOnce += it; true }
+        assertEquals("selected, it is still evaluated once", listOf(S1), selectedOnce)
+        j.snapshot = snap(invalidations = 4L)
+        assertNull("premise: no context is left", j.now().inlineToken)
+        assertEquals("premise: the coordinator still offers e1", S1, j.coordinator.state.value.dataScope)
+        val none = mutableListOf<GraphDataScope>()
+        j.holder.retireScopes { none += it; true }
+        assertEquals("no context, no evaluation - not of the coordinator's scope either", emptyList<GraphDataScope>(), none)
+
+        val n = Fixture(this)
+        n.open()
+        n.answer(KEY_1D, fullDay())
+        n.holder.onDeactivated()
+        assertNotEquals("premise: bound", GraphV2SelectionStatus.UNBOUND, n.holder.state.value.selectionStatus)
+        n.session.bind(B) // the selection session moves on; the holder has not handled it
+        val unevaluated = mutableListOf<GraphDataScope>()
+        n.holder.retireScopes { unevaluated += it; true }
+        assertEquals("premise: no context, no evaluation", emptyList<GraphDataScope>(), unevaluated)
+        assertEquals("without a context the call still publishes", GraphV2SelectionStatus.UNBOUND,
+            n.holder.state.value.selectionStatus)
     }
+
 }
