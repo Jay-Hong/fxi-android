@@ -61,8 +61,10 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.datetime.Instant
 import okhttp3.Headers
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -172,9 +174,9 @@ class GraphV2RequestCoordinatorWriteTest {
 
     private fun isKrx(root: File, file: File) = file.relativeTo(root).invariantSeparatorsPath.startsWith("krx/")
 
-    private fun onlineDto(rate: Double) = GraphV2TabResponse(
+    private fun onlineDto(rate: Double, period: GraphPeriod = GraphPeriod.THREE_MONTHS) = GraphV2TabResponse(
         tab = "usd",
-        period = GraphPeriod.THREE_MONTHS.code,
+        period = period.code,
         series = listOf(
             GraphV2Series(ONLINE, ONLINE, "krw", "KRW", 2, listOf(GraphV2Point(NOON - 1.days, rate, "x")),
                 GraphV2Provenance(false, emptyList()), null),
@@ -259,11 +261,31 @@ class GraphV2RequestCoordinatorWriteTest {
         val holdAfterWrite = mutableMapOf<Int, CompletableDeferred<Unit>>()
         var afterWriteDelay: Duration? = null
         private var writeCalls = 0
+        /** Writes that reached this store, held or not (S4 RT01-B2b-2). */
+        val entered get() = writeCalls
+        /** Runs once a reservation is made, inside the event that made it (S4 RT01-B2b-2). */
+        var afterReserve: (() -> Unit)? = null
         override fun reserveWrite(components: GraphV2DiskComponents): GraphV2WriteReservation =
-            real.reserveWrite(components).also { reserved += components to it }
+            real.reserveWrite(components).also {
+                reserved += components to it
+                afterReserve?.invoke()
+            }
         override fun cancelWrite(ticket: GraphV2WriteTicket) {
             cancelled += ticket
             real.cancelWrite(ticket)
+        }
+        /**
+         * Every KRX withdrawal asked of the store, in order; the one with this number (1-based) throws before the store is
+         * asked. Each answer is kept; without delegation the store is not asked and answers false (S4 RT01-B2b-2).
+         */
+        val withdrawals = mutableListOf<GraphV2WriteTicket>()
+        val withdrawResults = mutableListOf<Boolean>()
+        var withdrawThrowsOn: Int? = null
+        var withdrawDelegates = true
+        override fun withdrawKrx(ticket: GraphV2WriteTicket): Boolean {
+            withdrawals += ticket
+            if (withdrawals.size == withdrawThrowsOn) throw IllegalStateException("withdraw")
+            return (if (withdrawDelegates) real.withdrawKrx(ticket) else false).also { withdrawResults += it }
         }
         override suspend fun write(ticket: GraphV2WriteTicket, admission: GraphV2IoAdmission): GraphV2WriteReport {
             val index = writeCalls++
@@ -963,6 +985,230 @@ class GraphV2RequestCoordinatorWriteTest {
         assertTrue("the port cancels no ticket", f.store.cancelled.isEmpty())
         held.complete(Unit); runCurrent()
         assertEquals("the general half is still written", 1500.0, f.diskGeneral())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    // --- S4 RT01-B2b-2: a write's KRX candidate withdrawn by capability retirement --------------------------------------
+    //
+    // Agreed in R4c/S4 rt01b2b2_api_agreed.r2. These rows go beyond the agreed premise on purpose, as B2b06 does: the record
+    // moves to K2 while the use stays admitted, so the withdrawal itself is visible. The issuer's real rotation is
+    // PremiumAccessTopicSnapshotTest's graphB2b03, and the store's own linearization is GraphV2DiskStoreTest's WK02/WK03.
+    // Recorded as equivalent for the mutation battery (rt01b2b2 contract): deriving krxReady from the original candidate
+    // rather than the ownership read changes nothing, since ownership only ever goes from true to false and the commit
+    // admission reads it again.
+
+    private val year = GraphKey("usd", GraphPeriod.ONE_YEAR)
+
+    private fun Fixture.writeDiagnosticsOf(component: GraphV2DiskComponent) = writeDiagnostics.filter { it.component == component }.map { it.reason }
+
+    /**
+     * Starts the answer's write with K1's split and memory under K2: the request starts with K1, the record then names K2
+     * while the use stays admitted, so the answer keeps no KRX half in memory and its write holds K1 alone.
+     */
+    private fun Fixture.k1WriteUnderK2(test: TestScope, beforeAnswer: () -> Unit = {}) {
+        start(); coordinator.onActivated(KEY); test.runCurrent()
+        snapshot = snap().recordK("K2")
+        beforeAnswer()
+        sent.single().tab.complete(ok(onlineDto(1500.0))); test.runCurrent()
+    }
+
+    /**
+     * W2b01 (S4 RT01-B2b-2): retired after its reservation but before its preparation starts - a task queued on the loop's
+     * executor by the reserving event runs ahead of the preparation it published - the write asks no KRX preparation:
+     * GENERAL is written, nothing of KRX. The store's half is withdrawn too.
+     */
+    @Test fun W2b01_retiredBeforeItsPreparationTheWriteAsksNoKrx() = writeTest {
+        val f = Fixture(this)
+        var retired: Pair<Set<GraphCapabilityScope>, GraphRuntimeRetirement>? = null
+        f.k1WriteUnderK2(this) {
+            f.store.afterReserve = {
+                f.store.afterReserve = null
+                f.scope.launch { retired = f.retireK(sweep("K2")) }
+            }
+        }
+        assertEquals("the write alone held K1", setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, retired)
+        val (captured, wantsKrx) = f.prepareCalls.single()
+        assertEquals("K1", captured.krxCapabilityEpoch)
+        assertEquals("no KRX preparation", false, wantsKrx)
+        assertEquals(f.store.tickets, f.store.withdrawals)
+        assertEquals(1500.0, f.diskGeneral())
+        assertNull(f.diskKrx())
+        assertEquals("the write went on to the store", GraphV2ComponentWriteOutcome.Replaced, f.store.written.single().second.general)
+        assertTrue("no KRX block", f.blocked.none { it.component == GraphV2DiskComponent.KRX })
+        assertEquals(listOf("Graph namespace is retired"), f.writeDiagnosticsOf(GraphV2DiskComponent.KRX))
+        assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retireK(sweep("K2")))
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * W2b02 (S4 RT01-B2b-2): retired while its preparation is out, with KRX asked. The KRX answer that comes back - one an
+     * owning task would report blocked - is ignored with its own diagnostic and no block notice; GENERAL is written, nothing
+     * of KRX. A repeat finds only the live epoch.
+     */
+    @Test fun W2b02_retiredDuringItsPreparationTheKrxReadyIsIgnored() = writeTest {
+        val f = Fixture(this)
+        val held = CompletableDeferred<Unit>()
+        f.holdPrepare = held
+        // A KRX answer an owning task would report blocked (its record names another epoch).
+        f.answerAt[0] = GraphV2WritePreparation(GraphV2NamespacePreparation.Ready(M),
+            GraphV2NamespacePreparation.Ready(M.copy(krxCapabilityEpoch = "K9")))
+        f.k1WriteUnderK2(this)
+        assertEquals("premise: KRX preparation asked", true, f.prepareCalls.single().second)
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retireK(sweep("K2")))
+        held.complete(Unit); runCurrent()
+        assertEquals(1500.0, f.diskGeneral())
+        assertNull(f.diskKrx())
+        assertTrue("no KRX block", f.blocked.none { it.component == GraphV2DiskComponent.KRX })
+        assertEquals(listOf("KRX candidate withdrawn by capability retirement", "Graph namespace is retired"),
+            f.writeDiagnosticsOf(GraphV2DiskComponent.KRX))
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * W2b03 (S4 RT01-B2b-2): retired after Ready, just before the store is asked to write. The store's half is withdrawn,
+     * so its final check skips KRX as retired (not as a closed admission); GENERAL is written.
+     */
+    @Test fun W2b03_retiredBeforeTheStoreWriteTheStoreSkipsKrx() = writeTest {
+        val f = Fixture(this)
+        val held = CompletableDeferred<Unit>()
+        f.store.holdBeforeWrite = held
+        f.k1WriteUnderK2(this)
+        assertEquals("premise: the write is at the store", 1 to 0, f.store.entered to f.store.written.size)
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        assertEquals(f.store.tickets, f.store.withdrawals)
+        held.complete(Unit); runCurrent()
+        val report = f.store.written.single().second
+        assertEquals(GraphV2ComponentWriteOutcome.Replaced, report.general)
+        assertEquals("Graph namespace is retired", (report.krx as? GraphV2ComponentWriteOutcome.Skipped)?.reason)
+        assertEquals(1500.0, f.diskGeneral())
+        assertNull(f.diskKrx())
+        assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retireK(sweep("K2")))
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * W2b04 (S4 RT01-B2b-2): K1's write on the 3m key and K2's on the 1y key both wait at the store. Selecting the live K2
+     * refuses everything; the sweep keeping K2 withdraws K1's half alone, and K2's half is written.
+     */
+    @Test fun W2b04_anUnselectedEpochsWriteKeepsItsKrxHalf() = writeTest {
+        val f = Fixture(this)
+        val held = CompletableDeferred<Unit>()
+        f.store.holdBeforeWrite = held
+        f.answerAt[1] = GraphV2WritePreparation(GraphV2NamespacePreparation.Ready(M.copy(krxCapabilityEpoch = "K2")),
+            GraphV2NamespacePreparation.Ready(M.copy(krxCapabilityEpoch = "K2")))
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        val k1 = f.sent.single()
+        f.snapshot = snap().recordK("K2")
+        f.coordinator.onActivated(year); runCurrent()
+        val k2 = f.sent.last()
+        k1.tab.complete(ok(onlineDto(1500.0))); runCurrent()
+        k2.tab.complete(ok(onlineDto(1600.0, GraphPeriod.ONE_YEAR))); runCurrent()
+        assertEquals("premise: K1 then K2", listOf("K1", "K2"), f.prepareCalls.map { it.first.krxCapabilityEpoch })
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.LIVE_SCOPE_SELECTED, f.retireK { it == CK2 })
+        assertTrue(f.store.withdrawals.isEmpty())
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        assertEquals(listOf(f.store.tickets.first()), f.store.withdrawals)
+        held.complete(Unit); runCurrent()
+        assertNull("K1's half is not written", f.diskKrx())
+        val k2Half = f.real.readKrx(GraphV2KrxKey("u1", "e1", "K2", "usd", GraphPeriod.ONE_YEAR.code), null) { true }
+        assertTrue("K2's half is written", k2Half is GraphV2DiskRead.Found)
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * W2b05 (S4 RT01-B2b-2): two K1 writes wait at the store and K1's halves are still in memory. The store's second
+     * withdrawal throws: the exception propagates and no coordinator change is made - not even behind the publication: the
+     * memory keeps K1's halves, a K1 request still out keeps its capture's epoch and both writes stay candidates - while the
+     * first store withdrawal is not undone. A retry then removes everything, and a repeat nothing.
+     */
+    @Test fun W2b05_aStoreExceptionPropagatesAndKeepsTheCandidates() = writeTest {
+        val f = Fixture(this)
+        val held = CompletableDeferred<Unit>()
+        f.store.holdBeforeWrite = held
+        f.start(); f.coordinator.onActivated(KEY); runCurrent()
+        f.sent.single().tab.complete(ok(onlineDto(1500.0))); runCurrent()
+        f.coordinator.onActivated(year); runCurrent()
+        f.sent.last().tab.complete(ok(onlineDto(1600.0, GraphPeriod.ONE_YEAR))); runCurrent()
+        assertEquals("premise: two K1 writes", 2, f.store.tickets.size)
+        assertTrue("premise: K1's half in memory", f.state.entries.getValue(KEY).tab.graph.series.any { it.seriesId == KRX_SERIES })
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        val inFlight = f.sent.last()
+        assertFalse("premise: a K1 request is still out", inFlight.tab.isCompleted)
+        f.snapshot = snap().recordK("K2")
+        val before = f.state
+        f.store.withdrawThrowsOn = 2
+        assertEquals("withdraw", assertThrows(IllegalStateException::class.java) { f.coordinator.retireCapabilities(sweep("K2")) }.message)
+        assertEquals("no coordinator change", before, f.state)
+        f.coordinator.onDeactivated(); runCurrent()
+        assertEquals("none behind the publication either", before.entries, f.state.entries)
+        inFlight.tab.complete(ok(onlineDto(1700.0, GraphPeriod.ONE_YEAR))); runCurrent()
+        assertNotNull("the request kept its K1 capture: its write still holds a KRX candidate", f.store.reserved.last().first.krx)
+        f.store.withdrawThrowsOn = null
+        assertEquals("both writes are still candidates", setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        assertFalse(f.state.entries.getValue(KEY).tab.graph.series.any { it.seriesId == KRX_SERIES })
+        assertEquals("the first store withdrawal is not undone", listOf(true, false, true, true), f.store.withdrawResults)
+        assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retireK(sweep("K2")))
+        held.complete(Unit); runCurrent()
+        assertNull(f.diskKrx())
+        assertEquals(1500.0, f.diskGeneral())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * W2b06 (S4 RT01-B2b-2): the store answers false - it withdrew nothing - for a write already at it, whose K1 half the
+     * live gate would still admit. The coordinator's own ownership withdraws it anyway: REMOVED, a repeat finds only the
+     * live epoch, and the coordinator's commit admission closes KRX (not the store's retirement).
+     */
+    @Test fun W2b06_theCoordinatorWithdrawsEvenWhenTheStoreAnswersFalse() = writeTest {
+        val f = Fixture(this)
+        val held = CompletableDeferred<Unit>()
+        f.store.holdBeforeWrite = held
+        f.store.withdrawDelegates = false
+        f.k1WriteUnderK2(this)
+        assertTrue("premise: the live gate admits K1's half", f.gate.ioAdmission(f.prepareCalls.single().first).admits(GraphV2DiskComponent.KRX))
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        assertEquals(listOf(false), f.store.withdrawResults)
+        assertEquals(setOf(CK2) to GraphRuntimeRetirement.NOTHING_TO_REMOVE, f.retireK(sweep("K2")))
+        held.complete(Unit); runCurrent()
+        val report = f.store.written.single().second
+        assertEquals(GraphV2ComponentWriteOutcome.Replaced, report.general)
+        assertEquals("Graph I/O admission is closed", (report.krx as? GraphV2ComponentWriteOutcome.Skipped)?.reason)
+        assertNull(f.diskKrx())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * W2b07 (S4 RT01-B2b-2): a write that never had a KRX candidate - its request's K was retired before the answer - still
+     * reports a KRX preparation it did not ask for with the existing diagnostic, not the withdrawal's.
+     */
+    @Test fun W2b07_aWriteWithoutAKrxCandidateKeepsTheIgnoringDiagnostic() = writeTest {
+        val f = Fixture(this)
+        f.answerAt[0] = GraphV2WritePreparation(GraphV2NamespacePreparation.Ready(M), GraphV2NamespacePreparation.Ready(M))
+        f.k1WriteUnderK2(this) {
+            assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        }
+        assertEquals("premise: no KRX candidate", false, f.prepareCalls.single().second)
+        assertEquals(listOf("Ignoring preparation without a KRX candidate"), f.writeDiagnosticsOf(GraphV2DiskComponent.KRX))
+        assertEquals(1500.0, f.diskGeneral())
+        assertEquals(emptyList<Throwable>(), f.failures)
+    }
+
+    /**
+     * W2b08 (S4 RT01-B2b-2): retired while its preparation is out, and the preparation then fails as a whole: only GENERAL
+     * is reported blocked - the withdrawn KRX half is not - and nothing is written.
+     */
+    @Test fun W2b08_aFailedPreparationAfterTheWithdrawalBlocksOnlyGeneral() = writeTest {
+        val f = Fixture(this)
+        val held = CompletableDeferred<Unit>()
+        f.holdPrepare = held
+        f.k1WriteUnderK2(this)
+        assertEquals(setOf(CK2, CK1) to GraphRuntimeRetirement.REMOVED, f.retireK(sweep("K2")))
+        f.prepareAnswer = { _, _ -> throw IOException("record unreadable") }
+        held.complete(Unit); runCurrent()
+        assertEquals(listOf(GraphV2DiskComponent.GENERAL), f.blocked.map { it.component })
+        assertEquals(emptyList<String>(), f.writeDiagnosticsOf(GraphV2DiskComponent.KRX))
+        assertNull(f.diskGeneral())
         assertEquals(emptyList<Throwable>(), f.failures)
     }
 }

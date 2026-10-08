@@ -61,6 +61,18 @@ internal data class GraphV2WriteReport(
 internal interface GraphV2DiskStore {
     fun reserveWrite(components: GraphV2DiskComponents): GraphV2WriteReservation
     fun cancelWrite(ticket: GraphV2WriteTicket)
+    /**
+     * Withdraws this reservation's valid KRX candidate, including while its write is claimed.
+     * Returns true only for a newly withdrawn candidate; absent, GENERAL-only, already withdrawn,
+     * completed and cancelled tickets return false. GENERAL validity, latest/sequence and namespace
+     * retirement remain unchanged. Performs no I/O, dispatch or external callback.
+     *
+     * Shares the lock of the final KRX check and publish. Withdrawal before that check prevents
+     * publish; a publish holding the lock finishes before withdrawal returns. No KRX publish for
+     * this ticket starts or continues after a successful return. A file already published may
+     * remain after return; removing it belongs to disk purge.
+     */
+    fun withdrawKrx(ticket: GraphV2WriteTicket): Boolean
     suspend fun write(ticket: GraphV2WriteTicket, admission: GraphV2IoAdmission): GraphV2WriteReport
     suspend fun readGeneral(
         key: GraphV2GeneralKey,
@@ -229,6 +241,13 @@ internal class FileGraphV2DiskStore(
 
     override fun cancelWrite(ticket: GraphV2WriteTicket) {
         synchronized(stateLock) { reservations.remove(ticket) }
+    }
+
+    override fun withdrawKrx(ticket: GraphV2WriteTicket): Boolean = synchronized(stateLock) {
+        val reservation = reservations[ticket] ?: return@synchronized false
+        if (reservation.components.krx == null || !reservation.krxValid) return@synchronized false
+        reservation.krxValid = false
+        true
     }
 
     override suspend fun write(ticket: GraphV2WriteTicket, admission: GraphV2IoAdmission): GraphV2WriteReport {

@@ -21,6 +21,7 @@ import com.jay.fxi.data.graph.GraphSeriesSelectionSession
 import com.jay.fxi.data.graph.GraphV2AccessCapture
 import com.jay.fxi.data.graph.GraphV2AccessGate
 import com.jay.fxi.data.graph.GraphV2CachePorts
+import com.jay.fxi.data.graph.GraphV2ComponentWriteOutcome
 import com.jay.fxi.data.graph.GraphV2DiskComponent
 import com.jay.fxi.data.graph.GraphV2DiskRead
 import com.jay.fxi.data.graph.GraphV2DiskStore
@@ -29,9 +30,16 @@ import com.jay.fxi.data.graph.GraphV2Fetching
 import com.jay.fxi.data.graph.GraphV2GeneralEnvelope
 import com.jay.fxi.data.graph.GraphV2GeneralKey
 import com.jay.fxi.data.graph.GraphV2IoAdmission
+import com.jay.fxi.data.graph.GraphV2KrxKey
+import com.jay.fxi.data.graph.GraphV2NamespacePreparation
+import com.jay.fxi.data.graph.GraphV2PrepareWrite
 import com.jay.fxi.data.graph.GraphV2RequestCoordinator
 import com.jay.fxi.data.graph.GraphV2Validation
+import com.jay.fxi.data.graph.GraphV2WritePorts
+import com.jay.fxi.data.graph.GraphV2WritePreparation
+import com.jay.fxi.data.graph.GraphV2WriteReport
 import com.jay.fxi.data.graph.GraphV2WriteReservation
+import com.jay.fxi.data.graph.GraphV2WriteTicket
 import com.jay.fxi.data.graph.JsonGraphV2EnvelopeCodec
 import com.jay.fxi.data.graph.graphRecorderCatalog
 import com.jay.fxi.data.graph.joinGraphV2Components
@@ -277,8 +285,13 @@ class PremiumAccessTopicSnapshotTest {
     }
 
     private class Purger : UserScopePurger, CapabilityScopePurger {
+        /** Runs inside the issuer's capability purge, under its lock, before it completes (S4 RT01-B2b-2). */
+        var onCapability: suspend (PurgeNamespace) -> Unit = {}
         override suspend fun purgeUserScope(namespace: PurgeNamespace) = PurgeResult.Completed
-        override suspend fun purgeCapabilityScope(namespace: PurgeNamespace) = PurgeResult.Completed
+        override suspend fun purgeCapabilityScope(namespace: PurgeNamespace): PurgeResult {
+            onCapability(namespace)
+            return PurgeResult.Completed
+        }
     }
 
     private class Source(var next: () -> EntitlementsOutcome) : EntitlementsSource {
@@ -317,7 +330,8 @@ class PremiumAccessTopicSnapshotTest {
         val store: Store,
         val source: Source,
         val coordinator: PremiumAccessCoordinator,
-        val hooks: Hooks
+        val hooks: Hooks,
+        val purger: Purger
     ) {
         val snapshot: TopicAccessSnapshot get() = coordinator.accessSnapshot
         val facts: TopicAccessFacts get() = snapshot.facts
@@ -336,11 +350,12 @@ class PremiumAccessTopicSnapshotTest {
         val store = Store(ids())
         val source = Source { active(krx = true) }
         val hooks = Hooks()
+        val purger = Purger()
         val coordinator = PremiumAccessCoordinator(
             source = source,
             store = store,
-            userPurger = Purger(),
-            capabilityPurger = Purger(),
+            userPurger = purger,
+            capabilityPurger = purger,
             scope = CoroutineScope(processJob + StandardTestDispatcher(testScheduler)),
             clock = { testScheduler.currentTime },
             jitter = ProbeJitter.None,
@@ -349,7 +364,7 @@ class PremiumAccessTopicSnapshotTest {
             onLossReapprovalScheduled = { _, _ -> hooks.onReapproval() },
             orders = AccessOrderSequence()
         )
-        return Harness(store, source, coordinator, hooks)
+        return Harness(store, source, coordinator, hooks, purger)
     }
 
     /** A bound owner with a confirmed grant, KRX visible, markers standing so a loss asks to rotate, and a grant issued. */
@@ -3211,6 +3226,139 @@ class PremiumAccessTopicSnapshotTest {
         assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, g.coordinator.retireCapabilities { seen += it; keepK2(it) })
         assertEquals("only K2 is held", setOf(GraphCapabilityScope(OWNER, k2)), seen.toSet())
         assertTrue(g.failures.isEmpty())
+    }
+
+    /** The real store; a write can wait just before the store is asked, and its reports, cancels and withdrawals are kept. */
+    private class HeldWrites(private val real: GraphV2DiskStore) : GraphV2DiskStore by real {
+        var holdBeforeWrite: CompletableDeferred<Unit>? = null
+        var writesEntered = 0
+        val reports = mutableListOf<GraphV2WriteReport>()
+        val cancelled = mutableListOf<GraphV2WriteTicket>()
+        val withdrawals = mutableListOf<GraphV2WriteTicket>()
+        override fun cancelWrite(ticket: GraphV2WriteTicket) {
+            cancelled += ticket
+            real.cancelWrite(ticket)
+        }
+        override fun withdrawKrx(ticket: GraphV2WriteTicket): Boolean {
+            withdrawals += ticket
+            return real.withdrawKrx(ticket)
+        }
+        override suspend fun write(ticket: GraphV2WriteTicket, admission: GraphV2IoAdmission): GraphV2WriteReport {
+            writesEntered++
+            holdBeforeWrite?.await()
+            return real.write(ticket, admission).also { reports += it }
+        }
+    }
+
+    private fun threeMonthTabAt(now: Instant) = GraphV2TabResponse(
+        tab = "usd",
+        period = GraphPeriod.THREE_MONTHS.code,
+        series = listOf(
+            GraphV2Series(ONLINE, ONLINE, "krw", "KRW", 2, listOf(GraphV2Point(now - 1.days, 1390.0, "x")),
+                GraphV2Provenance(false, emptyList()), null),
+            GraphV2Series(KRX_SERIES, KRX_SERIES, "krw", "KRW", 1, listOf(GraphV2Point(now - 1.days, 1395.0, "krx")),
+                GraphV2Provenance(false, emptyList()), null)
+        ),
+        metadata = GraphV2Metadata(now - 1.hours, "1d", GraphV2Range("2026-07-05", "2026-10-05"))
+    )
+
+    /**
+     * graphB2b03 (S4 RT01-B2b-2, B04): over the real issuer and the assembly, with write ports. A K1 answer's write waits in
+     * its preparation, or after Ready just before the store, when the capability rotation lands. The sweep runs where the
+     * issuer purges (under its lock, on the assembly's main) and withdraws the store's KRX half without cancelling the
+     * write; then the old capture lands nothing at all. After the new grant and K2's re-approval, a write started with a
+     * fresh capture publishes K2's half; K1's never appears. No disk purge runs.
+     */
+    @Test
+    fun graphB2b03_aWriteStartedWithARetiredEpochLandsNothingOfIt() = snapshotTest {
+        for (stage in listOf("preparing", "ready")) {
+            val h = granted()
+            val k1 = checkNotNull(h.store.record.krxCapabilityEpoch) { "premise: a KRX epoch" }
+            val epoch = checkNotNull(h.store.record.userAccessEpoch) { "premise: a user epoch" }
+            val held = HeldWrites(FileGraphV2DiskStore(folder.newFolder(), JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(),
+                StandardTestDispatcher(testScheduler)))
+            val prepareCalls = mutableListOf<Pair<String?, Boolean>>()
+            var holdPrepare: CompletableDeferred<Unit>? = null
+            val writes = GraphV2WritePorts(
+                prepareWrite = GraphV2PrepareWrite { captured, wantsKrx ->
+                    prepareCalls += captured.krxCapabilityEpoch to wantsKrx
+                    holdPrepare?.await()
+                    // A stand-in producer: the namespace record made durable for exactly this capture.
+                    val record = AccessEpochRecord(captured.fence.identity.uid, captured.fence.userAccessEpoch,
+                        captured.krxCapabilityEpoch, mayContainPremiumData = true, mayContainKrxData = true)
+                    GraphV2WritePreparation(GraphV2NamespacePreparation.Ready(record),
+                        if (wantsKrx) GraphV2NamespacePreparation.Ready(record) else null)
+                },
+                onPreparationBlocked = {},
+                onWriteDiagnostic = {}
+            )
+            val r = AssemblyRig(this, h, cachePorts = { gate -> GraphV2CachePorts(held, gate, onSeedDiagnostic = {}, writePorts = writes) })
+            r.a.start()
+            r.deliverIssued(); runCurrent()
+            r.a.coordinator.onActivated(KEY_3M); runCurrent()
+            r.sent.single { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
+            val hold = gate()
+            if (stage == "preparing") holdPrepare = hold else held.holdBeforeWrite = hold
+            r.sent.single { it.kind == "tab" && it.key == KEY_3M }.tab.complete(ok(threeMonthTabAt(r.now()))); runCurrent()
+            assertEquals("$stage: premise: K1's write asks KRX", listOf(k1 to true), prepareCalls)
+            assertEquals("$stage: premise: where it waits", if (stage == "ready") 1 else 0, held.writesEntered)
+            val ticket = held.withdrawals.size
+
+            var retired: GraphRuntimeRetirement? = null
+            var cancelledAtReturn = -1
+            h.purger.onCapability = { namespace ->
+                withContext(r.main) {
+                    retired = r.a.coordinator.retireCapabilities {
+                        it.uid == namespace.ownerUid && it.krxCapabilityEpoch != namespace.currentKrxCapabilityEpoch
+                    }
+                    cancelledAtReturn = held.cancelled.size
+                }
+            }
+            val parked = gate()
+            h.store.rotationGate = parked
+            h.source.next = { active(krx = false) }
+            val refreshing = launch { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+            runCurrent()
+            parked.complete(Unit)
+            settle()
+            refreshing.join()
+            h.purger.onCapability = {}
+            assertNotEquals("$stage: premise: the capability epoch moved", k1, h.store.record.krxCapabilityEpoch)
+            assertEquals("$stage: the sweep at the issuer's purge", GraphRuntimeRetirement.REMOVED, retired)
+            assertEquals("$stage: it withdrew the write's KRX half", ticket + 1, held.withdrawals.size)
+            assertEquals("$stage: and cancelled nothing", 0, cancelledAtReturn)
+            hold.complete(Unit); runCurrent()
+            assertTrue("$stage: nothing of the old capture lands",
+                held.reports.none { it.general == GraphV2ComponentWriteOutcome.Replaced || it.krx == GraphV2ComponentWriteOutcome.Replaced })
+            val k1Key = GraphV2KrxKey(OWNER, epoch, k1, "usd", GraphPeriod.THREE_MONTHS.code)
+            assertFalse("$stage: no K1 file", held.readKrx(k1Key, null) { true } is GraphV2DiskRead.Found)
+
+            r.deliverIssued(); runCurrent()
+            r.sent.filter { it.kind == "catalog" && !it.catalog.isCompleted }.forEach { it.catalog.complete(ok(graphCatalog())) }
+            runCurrent()
+            val closedTab = r.sent.last { it.kind == "tab" && it.key == KEY_3M }
+            assertFalse("$stage: premise: a request started while K2 is closed", closedTab.tab.isCompleted)
+            h.source.next = { active(krx = true) }
+            h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+            settle()
+            val k2 = checkNotNull(h.store.record.krxCapabilityEpoch)
+            closedTab.tab.complete(ok(threeMonthTabAt(r.now()))); runCurrent()
+            assertEquals("$stage: the closed-time capture writes without KRX", null to false, prepareCalls.last())
+            for (attempt in 1..3) {
+                advanceTimeBy(3_100); runCurrent()
+                r.sent.filter { it.kind == "tab" && it.key == KEY_3M && !it.tab.isCompleted }.forEach {
+                    it.tab.complete(ok(threeMonthTabAt(r.now())))
+                }
+                runCurrent()
+                if (prepareCalls.last() == (k2 to true)) break
+            }
+            assertEquals("$stage: a fresh write with K2", k2 to true, prepareCalls.last())
+            val k2Key = GraphV2KrxKey(OWNER, epoch, k2, "usd", GraphPeriod.THREE_MONTHS.code)
+            assertTrue("$stage: K2's half is published", held.readKrx(k2Key, null) { true } is GraphV2DiskRead.Found)
+            assertFalse("$stage: K1's never", held.readKrx(k1Key, null) { true } is GraphV2DiskRead.Found)
+            assertTrue(r.failures.isEmpty())
+            r.a.close()
+        }
     }
 
     /** The real store, with GENERAL reads counted and held after the real read returned when a row asks (S4 RT01-B2b-1). */

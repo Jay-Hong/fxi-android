@@ -91,7 +91,10 @@ internal data class GraphRequestState(
  *
  * [start], [close], [retireScopes] and [retireCapabilities] must run on the loop's serial executor
  * whether or not [recorder] is supplied, because they mutate loop-confined state (in the assembly,
- * its injected always-dispatching Main).
+ * its injected always-dispatching Main). Retirement runs between events, without re-entering a
+ * loop operation from a supplier or callback. Write children launch on this same executor; store
+ * I/O may run elsewhere and reads only atomic ownership flags, the coordinator scope's active state,
+ * immutable captured values and the live gate.
  * [close] ends input and releases ownership synchronously, even before the loop's first dispatch.
  * The loop's finally uses the same idempotent cleanup; the supplied scope is not cancelled.
  *
@@ -151,8 +154,10 @@ internal class GraphV2RequestCoordinator(
         val captured: GraphV2AccessCapture,
         val wantsKrx: Boolean
     ) {
-        // I/O threads read only this flag, the immutable capture and the live gate.
+        // I/O threads read only these flags, the scope's active state, immutable captured values and the live gate.
         val enabled = AtomicBoolean(true)
+        // Capability retirement ends only KRX ownership, which is never restored on this task.
+        val krxOwned = AtomicBoolean(wantsKrx)
         var job: Job? = null // Loop-confined; independent of HTTP and screen activity.
     }
 
@@ -497,12 +502,18 @@ internal class GraphV2RequestCoordinator(
      * attempt markers. Seeds use their context owner; markers use the snapshot data-scope owner.
      * Without cache ports, raw entries containing a krx. seriesId or inProgress key additionally
      * contribute (data-scope uid, null). This null means unattributed KRX, not a named epoch or the
-     * null-epoch sweep request in a purge journal. Configuration and existing writes are not candidates.
+     * null-epoch sweep request in a purge journal. Existing writes with wantsKrx && krxOwned contribute
+     * their captured (uid, krxCapabilityEpoch). Configuration is not a candidate; writes whose KRX
+     * ownership was already withdrawn do not contribute again.
      *
      * [selects] runs exactly once per distinct candidate unless it throws. All selection and change
      * planning precede mutation. A selector exception propagates unchanged with no state changes;
      * selecting live returns [GraphRuntimeRetirement.LIVE_SCOPE_SELECTED] with no state changes.
      * This port neither synchronizes nor acquires a context or a replacement capture.
+     * All selected writes' store KRX candidates are withdrawn before any coordinator change is
+     * applied or published. False store returns still end coordinator KRX ownership. Any store
+     * exception, including CancellationException, propagates unchanged: coordinator state and KRX
+     * ownership remain intact for retry, but earlier store withdrawals are not rolled back.
      *
      * (a) Selected slots lose only their KRX components. Their raw and protected entries are rebuilt
      * from the same GENERAL envelope, preserving responseId, stamp and supplement generation, across
@@ -516,14 +527,17 @@ internal class GraphV2RequestCoordinator(
      * unselected seed. No seed starts here; normal seed paths may retry with a fresh binding when
      * live admission, context, support and occupancy permit.
      * (e) GENERAL data, capabilityConfiguration, capabilityGeneration, online200At, catalog, context,
-     * active demand, retry owners, timer, floor, failures, writeTasks and recovery captures survive.
+     * active demand, retry owners, timer, floor, failures and recovery captures survive. Selected
+     * writes keep their ticket, job, capture and GENERAL half; only their store KRX validity and
+     * coordinator KRX ownership end. Preparation starts with effective KRX ownership; preparation
+     * application reads it once for KRX validation/readiness, and commit admission reads it again.
      * Subsequent normal configuration synchronization retains its existing strip/generation/flip
-     * behavior; this port invalidates no stamp and creates no flip, timer or request. Existing write
-     * candidates and preparation/commit races belong to B2b-2.
+     * behavior; this port invalidates no stamp and creates no flip, timer or request.
      * (f) Changes are published through [publishState] before returning, without starting preparation.
      *
      * [GraphRuntimeRetirement.REMOVED] means KRX data, a capture epoch or seed/supplement ownership
-     * was newly removed. Unless live is selected, a call that newly removes nothing, including a
+     * was newly removed, or a write's KRX ownership newly ended, regardless of the store's Boolean.
+     * Unless live is selected, a call that newly removes nothing, including a
      * repeated call, returns [GraphRuntimeRetirement.NOTHING_TO_REMOVE].
      */
     fun retireCapabilities(selects: (GraphCapabilityScope) -> Boolean): GraphRuntimeRetirement {
@@ -557,6 +571,7 @@ internal class GraphV2RequestCoordinator(
         seedScope?.let { candidates += it }
         supplementScope?.let { candidates += it }
         unattributed?.let { candidates += it }
+        writeTasks.values.forEach { task -> writeScope(task)?.let { candidates += it } }
 
         val selected = candidates.filter(selects).toSet()
         if (live != null && live in selected) return GraphRuntimeRetirement.LIVE_SCOPE_SELECTED
@@ -567,7 +582,9 @@ internal class GraphV2RequestCoordinator(
         val retireSeed = seedScope != null && seedScope in selected
         val retireSupplement = supplementScope != null && supplementScope in selected
         val stripRaw = unattributed != null && unattributed in selected
-        if (slotKeys.isEmpty() && captureUpdates.isEmpty() && !retireSeed && !retireSupplement && !stripRaw) {
+        val withdrawnWrites = writeTasks.values.filter { writeScope(it) in selected }
+        if (slotKeys.isEmpty() && captureUpdates.isEmpty() && !retireSeed && !retireSupplement && !stripRaw &&
+            withdrawnWrites.isEmpty()) {
             return GraphRuntimeRetirement.NOTHING_TO_REMOVE
         }
 
@@ -583,6 +600,9 @@ internal class GraphV2RequestCoordinator(
         if (stripRaw) entries = entries.mapValues { (_, entry) -> entry.copy(tab = generalOnly(entry.tab)) }
         val nextSnapshot = snapshot.copy(entries = entries)
 
+        // Store first: an exception preserves all coordinator state and ownership for retry.
+        withdrawnWrites.forEach { checkNotNull(cachePorts).store.withdrawKrx(it.ticket) }
+        withdrawnWrites.forEach { it.krxOwned.set(false) }
         captureUpdates.forEach { (registration, captured) -> registration.accessCapture = captured }
         if (retireSeed) discardSeed() else if (retireSupplement) attemptedSupplement = null
         protectedSlots = slots
@@ -590,6 +610,10 @@ internal class GraphV2RequestCoordinator(
         publishState()
         return GraphRuntimeRetirement.REMOVED
     }
+
+    private fun writeScope(task: WriteTask): GraphCapabilityScope? =
+        if (!task.wantsKrx || !task.krxOwned.get()) null
+        else task.captured.krxCapabilityEpoch?.let { GraphCapabilityScope(task.captured.fence.identity.uid, it) }
 
     private fun hasKrx(tab: GraphV2Tab): Boolean =
         tab.graph.series.any { it.seriesId.startsWith("krx.") } || tab.inProgress.keys.any { it.startsWith("krx.") }
@@ -1337,7 +1361,7 @@ internal class GraphV2RequestCoordinator(
                 if (!task.enabled.get() || !scope.isActive ||
                     !ports.gate.admits(captured, GraphV2DiskComponent.GENERAL)
                 ) throw CancellationException("Write preparation admission is closed")
-                writes.prepareWrite.prepare(captured, task.wantsKrx)
+                writes.prepareWrite.prepare(captured, task.wantsKrx && task.krxOwned.get())
             }
             val delivered = inbox.trySend(Event.WritePreparationFinished(ticket, captured, result)).isSuccess
             if (!delivered || result.exceptionOrNull() is CancellationException) abandonWrite(task)
@@ -1353,31 +1377,35 @@ internal class GraphV2RequestCoordinator(
         try {
             val ports = cachePorts ?: return
             if (!task.enabled.get() || !scope.isActive || event.captured != task.captured) return
+            val owned = task.wantsKrx && task.krxOwned.get()
             event.result.exceptionOrNull()?.let { failure ->
                 if (failure is CancellationException) return
                 val blocked = GraphV2NamespacePreparation.Blocked("Write preparation failed", failure)
                 preparationBlocked(task, GraphV2DiskComponent.GENERAL, blocked)
-                if (task.wantsKrx) preparationBlocked(task, GraphV2DiskComponent.KRX, blocked)
+                if (owned) preparationBlocked(task, GraphV2DiskComponent.KRX, blocked)
                 return
             }
             val result = event.result.getOrThrow()
             // Each axis describes its own preparation. GENERAL still controls the whole write.
             val generalBlock = preparationBlock(result.general, task.captured, GraphV2DiskComponent.GENERAL)
-            val krxBlock = if (task.wantsKrx) {
+            val krxBlock = if (owned) {
                 preparationBlock(result.krx, task.captured, GraphV2DiskComponent.KRX)
             } else null
             if (generalBlock != null) preparationBlocked(task, GraphV2DiskComponent.GENERAL, generalBlock)
             if (krxBlock != null) preparationBlocked(task, GraphV2DiskComponent.KRX, krxBlock)
+            if (task.wantsKrx && !owned && result.krx != null) {
+                writeDiagnostic(task.writeId, task.key, GraphV2DiskComponent.KRX, "KRX candidate withdrawn by capability retirement")
+            }
             if (!task.wantsKrx && result.krx != null) {
                 writeDiagnostic(task.writeId, task.key, GraphV2DiskComponent.KRX, "Ignoring preparation without a KRX candidate")
             }
             if (generalBlock != null) return
 
-            val krxReady = task.wantsKrx && krxBlock == null
+            val krxReady = owned && krxBlock == null
             val liveAdmission = ports.gate.ioAdmission(task.captured)
             val admission = GraphV2IoAdmission { component ->
                 task.enabled.get() && scope.isActive &&
-                    (component == GraphV2DiskComponent.GENERAL || krxReady) && liveAdmission.admits(component)
+                    (component == GraphV2DiskComponent.GENERAL || (krxReady && task.krxOwned.get())) && liveAdmission.admits(component)
             }
             task.job = scope.launch {
                 val written = runCatching { ports.store.write(task.ticket, admission) }

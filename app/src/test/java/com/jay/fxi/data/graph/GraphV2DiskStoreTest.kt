@@ -71,6 +71,13 @@ class GraphV2DiskStoreTest {
         @Volatile var failPublish: (File) -> Boolean = { false }
         @Volatile var holdPrepare: CountDownLatch? = null
         val prepareHeld = CountDownLatch(1)
+        /** Which staged files [holdPrepare] holds; every one unless a row narrows it (S4 RT01-B2b-2). */
+        @Volatile var holdPrepareOf: (File) -> Boolean = { true }
+        /** Holds a publish inside the store's lock, before the real rename (S4 RT01-B2b-2). */
+        @Volatile var holdPublish: CountDownLatch? = null
+        @Volatile var holdPublishOf: (File) -> Boolean = { true }
+        val publishHeld = CountDownLatch(1)
+        val published: MutableList<File> = java.util.Collections.synchronizedList(mutableListOf())
         @Volatile var refuseDelete: (File) -> Boolean = { false }
         @Volatile var enumerateFailure: Throwable? = null
         /** Every read and staging call that reached the file boundary, in order. */
@@ -86,7 +93,7 @@ class GraphV2DiskStoreTest {
             prepares += target
             if (failPrepare(target)) throw IOException("prepare refused")
             val prepared = Prepared(target, real.prepareReplace(target, bytes))
-            holdPrepare?.let { latch ->
+            holdPrepare?.takeIf { holdPrepareOf(target) }?.let { latch ->
                 prepareHeld.countDown()
                 check(latch.await(10, TimeUnit.SECONDS)) { "held prepare was never released" }
             }
@@ -96,7 +103,12 @@ class GraphV2DiskStoreTest {
         override fun publishReplace(prepared: GraphV2PreparedReplace) {
             val p = prepared as Prepared
             if (failPublish(p.target)) throw IOException("publish refused")
+            holdPublish?.takeIf { holdPublishOf(p.target) }?.let { latch ->
+                publishHeld.countDown()
+                check(latch.await(10, TimeUnit.SECONDS)) { "held publish was never released" }
+            }
             real.publishReplace(p.inner)
+            published += p.target
         }
 
         override fun discardReplace(prepared: GraphV2PreparedReplace) = real.discardReplace((prepared as Prepared).inner)
@@ -695,6 +707,99 @@ class GraphV2DiskStoreTest {
         assertEquals(GraphV2ComponentWriteOutcome.Replaced, w2.general)
         assertFalse(w2.krx == GraphV2ComponentWriteOutcome.Replaced)
         assertTrue("a closed KRX admission stages no KRX file", f.prepares.none { isKrx(it) })
+        assertEquals(1391.0, s.krx(c))
+    }
+
+    // --- S4 RT01-B2b-2: withdrawing a reservation's KRX half ---------------------------------------------------------
+
+    private fun reason(o: GraphV2ComponentWriteOutcome?) = (o as? GraphV2ComponentWriteOutcome.Skipped)?.reason
+
+    /**
+     * WK01 (S4 RT01-B2b-2): a reservation's valid KRX half is withdrawn once. Its GENERAL half, its place in the order and
+     * the namespace stay: the write lands GENERAL alone, a newer reservation of the same namespace still writes KRX, another
+     * open reservation in that namespace keeps its KRX half, and withdrawing the newest does not let an older one land. A
+     * GENERAL-only, cancelled, written or unknown ticket answers false.
+     */
+    @Test fun WK01_aWithdrawnKrxHalfLeavesTheGeneralHalfTheOrderAndTheNamespace() = runBlocking {
+        val s = store()
+        val c = components(rate = 1390.0)
+        val t = reserved(s, c)
+        assertTrue(s.withdrawKrx(t))
+        assertFalse("once", s.withdrawKrx(t))
+        val w = s.write(t, open)
+        assertEquals(GraphV2ComponentWriteOutcome.Replaced, w.general)
+        assertEquals("Graph namespace is retired", reason(w.krx))
+        assertEquals(1390.0, s.general(c))
+        assertNull(s.krx(c))
+        assertFalse("GENERAL only", s.withdrawKrx(reserved(s, components(krx = null, response = "g"))))
+        val cancelled = reserved(s, components(response = "x"))
+        s.cancelWrite(cancelled)
+        assertFalse("cancelled", s.withdrawKrx(cancelled))
+        assertFalse("unknown", s.withdrawKrx(GraphV2WriteTicket()))
+        val againTicket = reserved(s, components(response = "r3", rate = 1500.0))
+        val again = s.write(againTicket, open)
+        assertEquals("the namespace is not retired", GraphV2ComponentWriteOutcome.Replaced, again.krx)
+        assertEquals(1501.0, s.krx(c))
+        assertFalse("a written ticket", s.withdrawKrx(againTicket))
+
+        val sibling = reserved(s, components(tab = "eur", rate = 1300.0))
+        val kept = reserved(s, components(tab = "eur", period = GraphPeriod.ONE_YEAR, rate = 1400.0))
+        assertTrue(s.withdrawKrx(sibling))
+        assertEquals("the withdrawal is the ticket's alone", GraphV2ComponentWriteOutcome.Replaced, s.write(kept, open).krx)
+
+        val older = reserved(s, components(tab = "jpy", rate = 1100.0))
+        val newer = reserved(s, components(tab = "jpy", response = "n", rate = 1200.0))
+        assertTrue(s.withdrawKrx(newer))
+        skipped("the older still loses", s.write(older, open).general)
+        assertEquals(GraphV2ComponentWriteOutcome.Replaced, s.write(newer, open).general)
+        assertEquals(1200.0, s.general(components(tab = "jpy")))
+        assertNull(s.krx(components(tab = "jpy")))
+    }
+
+    /**
+     * WK02 (S4 RT01-B2b-2): withdrawn while its write is under way - claimed, its GENERAL half published and its KRX file
+     * staged - the KRX half is stopped at the final check: nothing of it lands and no staged file stays.
+     */
+    @Test fun WK02_aWithdrawalBeforeTheFinalCheckStopsTheKrxPublish() = runBlocking {
+        val f = Files().apply { holdPrepareOf = { isKrx(it) }; holdPrepare = CountDownLatch(1) }
+        val s = store(f)
+        val c = components()
+        val t = reserved(s, c)
+        val w = async(Dispatchers.IO) { s.write(t, open) }
+        check(f.prepareHeld.await(10, TimeUnit.SECONDS))
+        assertTrue("premise: the GENERAL half is published", f.published.none { isKrx(it) } && f.published.isNotEmpty())
+        assertTrue("the claimed reservation's KRX half is withdrawn", s.withdrawKrx(t))
+        val latch = checkNotNull(f.holdPrepare)
+        f.holdPrepare = null
+        latch.countDown()
+        val report = withTimeout(10_000) { w.await() }
+        assertEquals(GraphV2ComponentWriteOutcome.Replaced, report.general)
+        assertEquals("Graph namespace is retired", reason(report.krx))
+        assertNull(s.krx(c))
+        assertTrue("no KRX file, staged or published", files().none { isKrx(it) })
+    }
+
+    /**
+     * WK03 (S4 RT01-B2b-2): a KRX publish that already holds the store's lock finishes first; the withdrawal waits for it,
+     * and the published file stays (removing it is the disk purge's).
+     */
+    @Test fun WK03_aWithdrawalWaitsForAPublishInProgress() = runBlocking {
+        val f = Files().apply { holdPublishOf = { isKrx(it) }; holdPublish = CountDownLatch(1) }
+        val s = store(f)
+        val c = components()
+        val t = reserved(s, c)
+        val w = async(Dispatchers.IO) { s.write(t, open) }
+        check(f.publishHeld.await(10, TimeUnit.SECONDS))
+        val publishedAtReturn = java.util.concurrent.atomic.AtomicReference<Boolean>()
+        val withdrawer = Thread { s.withdrawKrx(t); publishedAtReturn.set(f.published.any { isKrx(it) }) }
+        withdrawer.start()
+        withTimeout(10_000) { while (withdrawer.state != Thread.State.BLOCKED) delay(5) }
+        val latch = checkNotNull(f.holdPublish)
+        f.holdPublish = null
+        latch.countDown()
+        withdrawer.join(10_000)
+        assertEquals("the withdrawal returned after the publish", true, publishedAtReturn.get())
+        assertEquals(GraphV2ComponentWriteOutcome.Replaced, withTimeout(10_000) { w.await() }.krx)
         assertEquals(1391.0, s.krx(c))
     }
 }
