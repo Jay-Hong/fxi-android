@@ -84,7 +84,8 @@ import org.junit.Test
  *    budget there.
  *  - An applicable completion of the round's tab settles it: a success or retryable failure moves the rung (a join with an
  *    outside request does not) and sets the next deadline from that completion; a terminal or diagnostic answer stops the
- *    budget. Six counted rounds or six settled rungs stop it with the demand kept. A stopped budget issues nothing more.
+ *    budget. Six counted rounds or six settled rungs stop it with the demand kept. A stopped budget issues nothing more
+ *    until a valid RT05 trigger (RT03b-3a).
  *  - While a budget waits, unforced requests of its key are not sent and its key starts no independent flip; a stopped
  *    budget still lets outside requests go, which neither restart the ladder nor start a flip of their own.
  *  - The budget survives a temporarily absent context or fence, a new lifetime, grant or capability of the same data scope,
@@ -112,7 +113,16 @@ import org.junit.Test
  * Other periods do not wait. Known limitation, not pinned: a check ended by an adopted catalog is not reopened when a
  * same-scope context change drops that catalog, so that round's tab goes without captures.
  *
- * Not here: RT05 triggers and a new cycle after a stop (RT03b-3), the unconfirmed 200 of a cache-port coordinator (P09,
+ * S4 RT03b-3a (rows T01-T08, rt03b3_api_agreed.r2 §3): an RT05 trigger is valid only with a sequence above every one handled
+ * before, for the published fence and the synchronized context's fence and lifetime, with an admitted use; its sequence
+ * counts even when invalid. A valid trigger acts on the current scope's budgets: it releases an Unreadable hold of a waiting
+ * one (no reset), resumes a paused one with its counters and deadline (a new cycle once a counter reached six), opens a new
+ * six-round cycle in a new budget for an exhausted one and leaves a terminal one; a failed event pauses only a waiting
+ * budget. With no budget for the active absorbed key, a remaining demand opens one due at once (an Unreadable one opens it
+ * held). A trigger sends nothing itself. A first round that joins an outside tab keeps rung 0 and uses the first gap; an old
+ * cycle's departed tab still out is joined the same way (its answer settles that round as a join).
+ *
+ * Not here: the P7 permit (RT03b-3b), the unconfirmed 200 of a cache-port coordinator (P09,
  * in GraphV2RequestCoordinatorReGateTest). The implementation thread reads but does not edit this file.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -982,6 +992,415 @@ class GraphRecoveryBudgetContractTest {
         g.allowed = true; g.invalidations++; g.coordinator.onRefreshRequested(force = false); runCurrent()
         assertEquals("premise: the Refresh's catalog is out", 4_000L, g.catalogTimes().last())
         assertEquals("(b) the ended check does not wait for it", secs(0, 4), g.tabTimes())
+    }
+
+    // --- S4 RT03b-3a: triggers and cycles (rows T01-T08, rt03b3_api_agreed.r2 §3) --------------------------------------
+
+    /** Delivers an RT05 trigger for [f]'s published fence and current use unless the row says otherwise. */
+    private fun TestScope.fire(
+        f: Fixture,
+        sequence: Long,
+        fence: TopicSessionFence = checkNotNull(f.fence),
+        lifetime: TopicUseLifetime = f.lifetime()
+    ) {
+        f.coordinator.onRecoveryTrigger(GraphRecoveryTrigger(GraphRecoveryTrigger.Kind.FOREGROUND_RETURN, sequence, fence, lifetime))
+        runCurrent()
+    }
+
+    /** ready(), with usd 1d's budget exhausted after six failed rounds at 0/3/9/21/45/93 s; the clock stands at 200 s. */
+    private fun TestScope.exhausted(): Fixture = ready().also { f ->
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        step(200.seconds)
+        assertEquals("premise: six rounds, then exhausted", secs(0, 3, 9, 21, 45, 93), f.tabTimes())
+    }
+
+    /**
+     * T01: a trigger is valid only with a sequence above every one handled before, for the published fence and the
+     * synchronized context's fence and lifetime, with an admitted use. An invalid one changes nothing, but its sequence
+     * still counts: a duplicate or an older one is ignored later.
+     */
+    @Test fun T01_onlyAValidTriggerActs() = budgetTest {
+        val f = exhausted()
+        fire(f, 1, fence = sessionFence(grant = 8))
+        fire(f, 2, lifetime = TopicUseLifetime(checkNotNull(f.fence).grant, f.invalidations + 1))
+        f.allowed = false
+        fire(f, 3)
+        f.allowed = true
+        // Published but not yet synchronized: the context still holds grant 7.
+        f.fence = sessionFence(grant = 8)
+        fire(f, 4)
+        // Each check alone: a regenerated identity with the same grant keeps the lifetime equal and admitted.
+        val regenerated = TopicSessionFence(AuthIdentityFence("u1", 2L), "e1", TopicGrantToken(7))
+        f.fence = regenerated
+        fire(f, 5, fence = sessionFence())
+        fire(f, 6)
+        f.fence = sessionFence()
+        f.invalidations++
+        fire(f, 7)
+        f.invalidations--
+        step(30.seconds)
+        assertEquals("invalid triggers open nothing", secs(0, 3, 9, 21, 45, 93), f.tabTimes())
+        fire(f, 7)
+        assertEquals("a sequence an invalid trigger used is ignored", 6, f.tabTimes().size)
+        fire(f, 8)
+        assertEquals("a valid one opens a new cycle at once", 230_000L, f.tabTimes().last())
+        step(200.seconds)
+        assertEquals(secs(0, 3, 9, 21, 45, 93, 230, 233, 239, 251, 275, 323), f.tabTimes())
+        fire(f, 8)
+        fire(f, 3)
+        fire(f, 5)
+        step(30.seconds)
+        assertEquals("a duplicate or an older sequence is ignored, whatever came between", 12, f.tabTimes().size)
+        fire(f, 9)
+        assertEquals("the next one opens again", 460_000L, f.tabTimes().last())
+
+        // Without a context the trigger is invalid, and its sequence still counts.
+        val g = exhausted()
+        g.allowed = false; g.coordinator.onContextChanged(); runCurrent()
+        fire(g, 1)
+        g.allowed = true; g.coordinator.onContextChanged(); runCurrent()
+        val n = g.tabTimes().size
+        fire(g, 1)
+        step(30.seconds)
+        assertEquals("a sequence handled without a context is ignored", n, g.tabTimes().size)
+        fire(g, 2)
+        assertEquals(230_000L, g.tabTimes().last())
+    }
+
+    /**
+     * T02: a trigger resumes a budget paused by a failed event with its counters and deadline (a hold left before the pause
+     * goes too); the round cut off by the failure is not restored. A paused budget with six counted opens a new cycle in a
+     * new budget; its first round joins the cut-off round's tab still out (rung 0, first gap), and the new cycle still sends
+     * six counted rounds of its own.
+     */
+    @Test fun T02_aTriggerResumesAPausedBudget() = budgetTest {
+        val f = ready()
+        f.tabSequence(fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        step(4.seconds)
+        f.accessThrowsOnce = true
+        f.coordinator.onRefreshRequested(force = false); runCurrent()
+        assertEquals("premise: the handling failed", 1, f.failures.size)
+        step(30.seconds)
+        assertEquals("premise: paused", secs(0, 3), f.tabTimes())
+        fire(f, 1)
+        assertEquals("resumed at once: its deadline (9 s) is past", secs(0, 3, 34), f.tabTimes())
+        step(200.seconds)
+        assertEquals("the remaining rounds of the same budget", secs(0, 3, 34, 46, 70, 118), f.tabTimes())
+
+        val g = ready()
+        g.tabSequence(fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        step(45.seconds)
+        g.autoTab = null
+        step(48.seconds)
+        assertEquals("premise: the sixth round is out", secs(0, 3, 9, 21, 45, 93), g.tabTimes())
+        g.accessThrowsOnce = true
+        g.coordinator.onRefreshRequested(force = false); runCurrent()
+        step(10.seconds)
+        fire(g, 1)
+        assertEquals("six counted: the new cycle's first round joins the cut-off tab still out", 6, g.tabTimes().size)
+        g.autoTab = fail503
+        g.tabs()[5].tab.complete(status(503)); runCurrent()
+        step(200.seconds)
+        assertEquals("then six rounds of its own, the first 3 s after the joined answer",
+            secs(0, 3, 9, 21, 45, 93, 106, 109, 115, 127, 151, 199), g.tabTimes())
+
+        val h = ready()
+        h.tabSequence(fail503)
+        h.coordinator.onActivated(USD_1D); runCurrent()
+        h.captureFails = { n -> if (n == 2) AuthUnavailableException("offline") else null }
+        step(3.seconds)
+        assertEquals("premise: the round's capture went offline (held)", 2, h.captures)
+        h.accessThrowsOnce = true
+        h.coordinator.onRefreshRequested(force = false); runCurrent()
+        step(30.seconds)
+        fire(h, 1)
+        assertEquals("the hold left before the pause goes with it", secs(0, 33), h.tabTimes())
+
+        val k = ready()
+        k.tabSequence(fail503)
+        k.coordinator.onActivated(USD_1D); runCurrent()
+        step(4.seconds)
+        k.accessThrowsOnce = true
+        k.coordinator.onRefreshRequested(force = false); runCurrent()
+        fire(k, 1)
+        assertEquals("resumed, not before its kept deadline", secs(0, 3), k.tabTimes())
+        step(5.seconds)
+        assertEquals(secs(0, 3, 9), k.tabTimes())
+
+        // The fifth round's tab is out when the failure cuts it off; the resumed budget's next round joins it.
+        val m = ready()
+        m.tabSequence(fail503)
+        m.coordinator.onActivated(USD_1D); runCurrent()
+        step(21.seconds)
+        m.autoTab = null
+        step(24.seconds)
+        assertEquals("premise: the fifth round is out", secs(0, 3, 9, 21, 45), m.tabTimes())
+        m.accessThrowsOnce = true
+        m.coordinator.onRefreshRequested(force = false); runCurrent()
+        step(10.seconds)
+        fire(m, 1)
+        m.autoTab = fail503
+        m.tabs()[4].tab.complete(status(503)); runCurrent()
+        step(100.seconds)
+        assertEquals("its answer settles the resumed round as a join", secs(0, 3, 9, 21, 45, 79), m.tabTimes())
+    }
+
+    /**
+     * T03: an exhausted budget opens a new six-round cycle only on a valid trigger; a Refresh or an Activate sends its own
+     * request without restarting the ladder.
+     */
+    @Test fun T03_onlyATriggerOpensANewCycle() = budgetTest {
+        val f = exhausted()
+        f.coordinator.onRefreshRequested(force = false); runCurrent()
+        f.coordinator.onActivated(USD_3M); runCurrent()
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        step(300.seconds)
+        assertEquals("their own requests, no ladder", secs(0, 3, 9, 21, 45, 93, 200, 200), f.tabTimes())
+        fire(f, 1)
+        step(200.seconds)
+        assertEquals(secs(0, 3, 9, 21, 45, 93, 200, 200, 500, 503, 509, 521, 545, 593), f.tabTimes())
+    }
+
+    /** T04: a terminal budget is not opened by a trigger, not even after a failed event that pauses waiting budgets. */
+    @Test fun T04_aTerminalBudgetStaysClosed() = budgetTest {
+        val f = ready()
+        f.tabSequence(fail503, { it.tab.complete(status(404)) }, fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        step(3.seconds)
+        assertEquals("premise: the round's 404 stopped it", secs(0, 3), f.tabTimes())
+        fire(f, 1)
+        step(100.seconds)
+        assertEquals(secs(0, 3), f.tabTimes())
+        f.accessThrowsOnce = true
+        f.coordinator.onRefreshRequested(force = false); runCurrent()
+        assertEquals("premise: the handling failed", 1, f.failures.size)
+        fire(f, 2)
+        step(100.seconds)
+        assertEquals("a failure does not turn it into a paused one", secs(0, 3), f.tabTimes())
+    }
+
+    /**
+     * T05: a trigger does not reset a waiting budget. It releases only an Unreadable hold, so the due round reads its demand
+     * again and the budget goes on from its second round; a hold left by a withdrawal stays until the activation changes.
+     */
+    @Test fun T05_aWaitingBudgetIsNotReset() = budgetTest {
+        val f = ready()
+        f.tabSequence(partial)
+        f.recorderOpen = false
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        step(60.seconds)
+        assertEquals("premise: held at the due round (Unreadable)", listOf(0L), f.tabTimes())
+        f.recorderOpen = true
+        fire(f, 1)
+        assertEquals("released: the second round goes", secs(0, 60), f.tabTimes())
+        step(200.seconds)
+        assertEquals("the same budget goes on", secs(0, 60, 66, 78, 102, 150), f.tabTimes())
+
+        val g = ready()
+        g.tabSequence(fail503)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        g.captureFails = { n -> if (n == 2) AuthUnavailableException("offline") else null }
+        step(3.seconds)
+        assertEquals("premise: the round's capture went offline (held)", 2, g.captures)
+        fire(g, 1)
+        step(60.seconds)
+        assertEquals("a withdrawal's hold stays", 2, g.captures)
+        g.coordinator.onActivated(USD_3M); runCurrent()
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        assertEquals("until the activation changes", secs(0, 63), g.tabTimes())
+
+        // Neither the round out nor the kept deadline is reset.
+        val k = ready()
+        k.tabSequence(fail503)
+        k.coordinator.onActivated(USD_1D); runCurrent()
+        k.autoTab = null
+        step(3.seconds)
+        fire(k, 1)
+        k.autoTab = fail503
+        k.tabs()[1].tab.complete(status(503)); runCurrent()
+        step(1.seconds)
+        fire(k, 2)
+        assertEquals("neither trigger adds a request", secs(0, 3), k.tabTimes())
+        step(5.seconds)
+        assertEquals("the round out settles as its own; the kept deadline holds", secs(0, 3, 9), k.tabTimes())
+
+        // A withdrawn catalog's hold is a withdrawal too. Captures: 1-2 the Activate's catalog and tab, 3 the round's.
+        val c = dropped()
+        c.tabSequence(fail503)
+        c.catalogSequence(catalog503)
+        c.coordinator.onActivated(USD_1D); runCurrent()
+        c.captureFails = { n -> if (n == 3) AuthUnavailableException("offline") else null }
+        step(3.seconds)
+        assertEquals("premise: the round's catalog capture went offline", 3, c.captures)
+        fire(c, 1)
+        step(30.seconds)
+        assertEquals("a withdrawn catalog's hold stays", 3, c.captures)
+    }
+
+    /**
+     * T06: with no budget, a trigger opens one for the active absorbed key when a demand remains, its first round due at once;
+     * None opens nothing, and an Unreadable demand opens it held until a later trigger. A first round that joins an outside
+     * tab keeps rung 0 and uses the first 3 s gap.
+     */
+    @Test fun T06_aTriggerOpensTheFirstRecovery() = budgetTest {
+        val f = ready()
+        f.tabSequence({ it.tab.complete(status(404)) }, fail503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        step(30.seconds)
+        assertEquals("premise: a 404 first answer creates no budget", listOf(0L), f.tabTimes())
+        fire(f, 1)
+        assertEquals("the first round at once", secs(0, 30), f.tabTimes())
+        step(200.seconds)
+        assertEquals("six rounds from there", secs(0, 30, 33, 39, 51, 75, 123), f.tabTimes())
+
+        val g = ready()
+        g.tabSequence(full)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        assertTrue("premise: met at once", B2 !in g.series(KB).pending)
+        fire(g, 1)
+        step(100.seconds)
+        assertEquals("None: nothing", listOf(0L), g.tabTimes())
+
+        val h = ready()
+        h.coordinator.onActivated(USD_1D); runCurrent()
+        h.coordinator.onActivated(USD_3M); runCurrent()
+        h.tabs().single().tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1))))); runCurrent()
+        h.coordinator.onActivated(USD_1D); runCurrent()
+        assertEquals("premise: answered while usd 3m was active, so no budget; fresh", listOf(0L), h.tabTimes())
+        h.recorderOpen = false
+        fire(h, 1)
+        step(30.seconds)
+        assertEquals("Unreadable opens it held", listOf(0L), h.tabTimes())
+        h.recorderOpen = true
+        h.autoTab = partial
+        fire(h, 2)
+        assertEquals("a later trigger releases the hold", secs(0, 30), h.tabTimes())
+
+        // The held budget exists: its key's own unforced requests wait, and a new activation releases the round.
+        val k = ready()
+        k.coordinator.onActivated(USD_1D); runCurrent()
+        k.coordinator.onActivated(USD_3M); runCurrent()
+        k.tabs().single().tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1))))); runCurrent()
+        k.coordinator.onActivated(USD_1D); runCurrent()
+        k.recorderOpen = false
+        fire(k, 1)
+        k.recorderOpen = true
+        k.autoTab = partial
+        step(30.seconds)
+        assertEquals("premise: held", listOf(0L), k.tabTimes())
+        k.coordinator.onActivated(USD_3M); runCurrent()
+        k.coordinator.onActivated(USD_1D); runCurrent()
+        assertEquals("a new activation releases the held budget's round", secs(0, 30), k.tabTimes())
+
+        // Under a floor the difference shows. None opens nothing, so the stale entry's own Refresh is deferred to the floor.
+        val q = shortCatalog()
+        q.autoTab = { it.tab.complete(ok(dayTab(emptyMap()))) }
+        q.coordinator.onActivated(USD_1D); runCurrent()
+        step(2.seconds)
+        q.autoTab = { it.tab.complete(status(429, "10")) }
+        q.coordinator.onRefreshRequested(force = true); runCurrent()
+        q.autoTab = { it.tab.complete(ok(dayTab(emptyMap()))) }
+        fire(q, 1)
+        q.coordinator.onRefreshRequested(force = false); runCurrent()
+        step(10.seconds)
+        assertEquals("None: the key's own request goes at the floor", secs(0, 2, 12), q.tabTimes())
+
+        // An Unreadable demand opens the budget held: a demand readable again by the floor sends nothing there.
+        val u = ready()
+        u.coordinator.onActivated(USD_1D); runCurrent()
+        u.coordinator.onActivated(USD_3M); runCurrent()
+        u.tabs().single().tab.complete(ok(dayTab(mapOf("kb.usd" to listOf(B1))))); runCurrent()
+        u.autoTab = { it.tab.complete(status(429, "10")) }
+        u.coordinator.onRefreshRequested(force = true); runCurrent()
+        u.coordinator.onActivated(USD_1D); runCurrent()
+        u.recorderOpen = false
+        fire(u, 1)
+        u.recorderOpen = true
+        u.autoTab = partial
+        step(20.seconds)
+        assertEquals("held: nothing at the floor though the demand is readable again", listOf(0L), u.tabTimes())
+
+        val j = ready()
+        j.tabSequence({ it.tab.complete(status(404)) })
+        j.coordinator.onActivated(USD_1D); runCurrent()
+        j.autoTab = null
+        step(10.seconds)
+        j.coordinator.onRefreshRequested(force = true); runCurrent()
+        fire(j, 1)
+        assertEquals("premise: the first round joined the outside tab", secs(0, 10), j.tabTimes())
+        j.autoTab = fail503
+        step(2.seconds)
+        j.tabs().last().tab.complete(status(503)); runCurrent()
+        step(3.seconds)
+        assertEquals("the next round 3 s after the joined completion", secs(0, 10, 15), j.tabTimes())
+        assertEquals("no failure from a rung-0 settlement", 0, j.failures.size)
+    }
+
+    /** T07: a trigger sends nothing itself: the new cycle's first round waits for the floor, and for its key to be active. */
+    @Test fun T07_aTriggerSendsNothingItself() = budgetTest {
+        val f = exhausted()
+        f.autoTab = { it.tab.complete(status(429, "10")) }
+        f.coordinator.onRefreshRequested(force = true); runCurrent()
+        f.autoTab = fail503
+        fire(f, 1)
+        assertEquals("nothing under the floor", 7, f.tabTimes().size)
+        step(10.seconds)
+        assertEquals("the first round at the floor", 210_000L, f.tabTimes().last())
+
+        val g = exhausted()
+        g.coordinator.onActivated(USD_3M); runCurrent()
+        fire(g, 1)
+        step(30.seconds)
+        assertEquals("not while usd 3m is active", 6, g.tabTimes().size)
+        g.coordinator.onActivated(USD_1D); runCurrent()
+        assertEquals("then at once", 230_000L, g.tabTimes().last())
+        step(5.seconds)
+        assertEquals("a round of the new cycle, not the key's own request", 233_000L, g.tabTimes().last())
+
+        // A trigger reopens another tab's budget of the scope as well.
+        val j = ready()
+        j.tabSequence(fail503)
+        j.coordinator.onActivated(JPY_1D); runCurrent()
+        step(200.seconds)
+        assertEquals("premise: jpy exhausted", secs(0, 3, 9, 21, 45, 93), j.tabTimes(JPY_1D))
+        j.coordinator.onActivated(USD_3M); runCurrent()
+        fire(j, 1)
+        step(30.seconds)
+        j.coordinator.onActivated(JPY_1D); runCurrent()
+        step(5.seconds)
+        assertEquals("another tab's budget reopened too", secs(0, 3, 9, 21, 45, 93, 230, 233), j.tabTimes(JPY_1D))
+    }
+
+    /**
+     * T08: a new cycle is apart from the old one's requests. The old sixth round's catalog, sent before the pause, is out
+     * when the new cycle's first round needs a catalog: the new round joins it, its completion lets the new round's tab go,
+     * and the new cycle still has six rounds of its own.
+     */
+    @Test fun T08_aNewCycleIsApartFromTheOldRequests() = budgetTest {
+        val f = dropped()
+        f.tabSequence(fail503)
+        f.catalogSequence(catalog503)
+        f.coordinator.onActivated(USD_1D); runCurrent()
+        step(45.seconds)
+        f.autoCatalog = null
+        step(48.seconds)
+        assertEquals("premise: the sixth round's catalog is out, counted", 93_000L, f.catalogTimes().last())
+        assertEquals(secs(0, 3, 9, 21, 45), f.tabTimes())
+        f.accessThrowsOnce = true
+        f.coordinator.onRefreshRequested(force = false); runCurrent()
+        step(7.seconds)
+        val catalogs = f.catalogTimes().size
+        fire(f, 1)
+        assertEquals("the new round joined the old catalog: none of its own", catalogs, f.catalogTimes().size)
+        assertEquals(secs(0, 3, 9, 21, 45), f.tabTimes())
+        step(5.seconds)
+        f.catalogs().last().catalog.complete(ok(catalog())); runCurrent()
+        assertEquals("its completion lets the new round go", 105_000L, f.tabTimes().last())
+        step(200.seconds)
+        assertEquals(secs(0, 3, 9, 21, 45, 105, 108, 114, 126, 150, 198), f.tabTimes())
     }
 
     // --- P01 -----------------------------------------------------------------------------------------------------

@@ -79,6 +79,19 @@ internal data class GraphCapabilityScope(val uid: String, val krxCapabilityEpoch
 internal data class GraphRequestSource(val fence: TopicSessionFence, val lifetime: TopicUseLifetime)
 
 /**
+ * S4 RT03b-3a: an RT05 trigger that may resume or reopen 1d recovery. One producer per coordinator numbers all kinds with
+ * one strictly increasing [sequence] from 1; it is valid only for the current fence and use it names.
+ */
+internal data class GraphRecoveryTrigger(
+    val kind: Kind,
+    val sequence: Long,
+    val fence: TopicSessionFence,
+    val lifetime: TopicUseLifetime
+) {
+    enum class Kind { FOREGROUND_RETURN, RECONNECT, BOUNDARY_600S }
+}
+
+/**
  * When a context synchronization builds a new snapshot, [source] is the request context it acquired, or null when it
  * acquired none (no fence or epoch, an identity mismatch, or a refused use), even with a non-null [dataScope]. Every
  * copy keeps it; the retirement's empty snapshot has none. Entries are exposed through
@@ -119,7 +132,8 @@ internal data class GraphRequestState(
  * applies their successful responses synchronously and replays held inputs after catalog publication.
  * With a recorder, a one-day key's cold ladder and independent flip check give way to a recovery
  * budget per (data scope, tab) (S4 RT03b-1b): it reads the recorder's demand on the loop, issues its
- * own forced rounds at most six times, 3/6/12/24/48 s after each completion, and holds back unforced
+ * own forced rounds at most six times per cycle, 3/6/12/24/48 s after each completion (a valid RT05 trigger
+ * resumes, reopens or opens a cycle, S4 RT03b-3a), and holds back unforced
  * requests of its key while it waits. A round that needs a catalog waits for the one already out or asks
  * for its own once; its tab goes after an applicable completion of that catalog, or once its catalog slot
  * is spent and no catalog is out, unless an outside tab it joined settles it first (S4 RT03b-2b). It survives
@@ -264,9 +278,20 @@ internal class GraphV2RequestCoordinator(
         var rounds = 0
         var completionRung = 0
         var deadline: Instant? = null
-        var stopped = false
+        /** S4 RT03b-3a: why the budget stopped; null while it waits. */
+        var stop: RecoveryStop? = null
         var round: RecoveryRound? = null
-        var hold: Pair<RequestContext, Long>? = null
+        var hold: RecoveryHold? = null
+    }
+
+    private enum class RecoveryStop { EXHAUSTED, TERMINAL, PAUSED }
+
+    /**
+     * S4 RT03b-3a: a hold in one context and activation, with its cause. A valid trigger releases only an UNREADABLE hold of
+     * a waiting budget; resuming a PAUSED budget clears either.
+     */
+    private data class RecoveryHold(val context: RequestContext, val activityGeneration: Long, val cause: Cause) {
+        enum class Cause { UNREADABLE, WITHDRAWN }
     }
 
     private enum class RecoveryNeed { NONE, UNREADABLE, REMAINS }
@@ -299,6 +324,7 @@ internal class GraphV2RequestCoordinator(
         data object Deactivate : Event
         data object ContextChanged : Event
         data class Refresh(val force: Boolean) : Event
+        data class RecoveryTrigger(val trigger: GraphRecoveryTrigger) : Event
         data class Captured(val registration: Registration, val result: Result<AuthSnapshot>) : Event
         data class Wake(val generation: Long) : Event
         data class CatalogFinished(
@@ -376,6 +402,8 @@ internal class GraphV2RequestCoordinator(
      */
     private var sameScopeChange = false
     private var nextRecoveryRound = 0L
+    /** S4 RT03b-3a: the highest trigger sequence handled, valid or not. */
+    private var lastTriggerSequence = 0L
     // Written by the loop, also read by the transport's replay guard. Context disposal and
     // deactivation never reset it; an in-flight answer still uses its separate ownership check.
     @Volatile private var sharedRetryFloor: Instant? = null
@@ -442,6 +470,11 @@ internal class GraphV2RequestCoordinator(
     fun onDeactivated() { inbox.trySend(Event.Deactivate) }
     fun onContextChanged() { inbox.trySend(Event.ContextChanged) }
     fun onRefreshRequested(force: Boolean = false) { inbox.trySend(Event.Refresh(force)) }
+    /**
+     * S4 RT03b-3a: delivered by RT05; no production caller yet. It is judged against the context already synchronized, so
+     * RT05 delivers a context change before a trigger built from it (otherwise that trigger is spent invalid).
+     */
+    fun onRecoveryTrigger(trigger: GraphRecoveryTrigger) { inbox.trySend(Event.RecoveryTrigger(trigger)) }
 
     /**
      * Drops selected recovery captures from registered tab requests, without suspension. It must run
@@ -754,6 +787,7 @@ internal class GraphV2RequestCoordinator(
             }
             is Event.Captured -> onCaptured(event, now)
             is Event.Wake -> onWake(event, now)
+            is Event.RecoveryTrigger -> onTrigger(event.trigger, now)
             is Event.CatalogFinished -> catalogAdopted = applyCatalog(event, now)
             is Event.TabFinished -> applyTab(event, now)
             is Event.DiskSeedFinished -> applyDiskSeed(event)
@@ -1942,7 +1976,7 @@ internal class GraphV2RequestCoordinator(
     }
 
     private fun recoveryWaiting(key: GraphKey, current: RequestContext): Boolean =
-        absorbs(key) && recoveryKey(current, key.tab)?.let { recoveryBudgets[it] }?.stopped == false
+        absorbs(key) && recoveryKey(current, key.tab)?.let { recoveryBudgets[it] }?.let { it.stop == null } == true
 
     private fun recoveryNeed(key: GraphKey, current: RequestContext, now: Instant): RecoveryNeed {
         if (snapshot.entries[key]?.online200At == null) return RecoveryNeed.REMAINS
@@ -2018,7 +2052,7 @@ internal class GraphV2RequestCoordinator(
         val budget = round.budget
         // Since S4 RT03b-2b the count clause is defensive: a newer round waits for an older round's catalog, so nothing of an
         // uncounted round departs once six are counted.
-        if (budget.stopped || (!round.counted && budget.rounds >= MAX_RECOVERY_ROUNDS)) return false
+        if (budget.stop != null || (!round.counted && budget.rounds >= MAX_RECOVERY_ROUNDS)) return false
         if (registration.key == null) round.catalogSent = true else round.tabSent = true
         if (!round.counted) {
             round.counted = true
@@ -2048,7 +2082,7 @@ internal class GraphV2RequestCoordinator(
         when (failure?.disposition) {
             FailureDisposition.WITHDRAWN -> return
             FailureDisposition.TERMINAL, FailureDisposition.DIAGNOSTIC -> {
-                budget.stopped = true
+                budget.stop = RecoveryStop.TERMINAL
                 budget.round = null
                 budget.hold = null
                 return
@@ -2063,15 +2097,16 @@ internal class GraphV2RequestCoordinator(
         }
         if (registration.recoveryAttempt) budget.completionRung++
         if (budget.rounds >= MAX_RECOVERY_ROUNDS || budget.completionRung >= MAX_RECOVERY_ROUNDS) {
-            budget.stopped = true
+            budget.stop = RecoveryStop.EXHAUSTED
             budget.deadline = null
         } else {
-            budget.deadline = coldDeadline(now, budget.completionRung - 1, failure?.statusCode, key.tab)
+            // A cycle opened by a trigger starts at rung 0: a joined first completion keeps it there and uses the first gap.
+            budget.deadline = coldDeadline(now, maxOf(budget.completionRung - 1, 0), failure?.statusCode, key.tab)
         }
     }
 
     private fun recoveryHeld(budget: RecoveryBudget, current: RequestContext): Boolean =
-        budget.hold == (current to activityGeneration)
+        budget.hold?.let { it.context == current && it.activityGeneration == activityGeneration } == true
 
     private fun recoverySupported(key: GraphKey): Boolean =
         GraphV2Domain.support(snapshot.catalog, key.tab, key.period) != GraphPeriodSupport.Unsupported
@@ -2080,7 +2115,7 @@ internal class GraphV2RequestCoordinator(
         val budget = activeRecovery() ?: return null
         val key = checkNotNull(activeKey)
         val current = checkNotNull(context)
-        if (budget.stopped || recoveryHeld(budget, current) || !recoverySupported(key)) return null
+        if (budget.stop != null || recoveryHeld(budget, current) || !recoverySupported(key)) return null
         if (budget.round?.let { roundInFlight(it, key) } == true) return null
         return budget.deadline
     }
@@ -2089,7 +2124,7 @@ internal class GraphV2RequestCoordinator(
         val budget = activeRecovery() ?: return
         val key = checkNotNull(activeKey)
         val current = checkNotNull(context)
-        if (budget.stopped || recoveryHeld(budget, current) || !recoverySupported(key)) return
+        if (budget.stop != null || recoveryHeld(budget, current) || !recoverySupported(key)) return
         val deadline = budget.deadline ?: return
         if (now < deadline || underFloor(now)) return
         budget.round?.let { open ->
@@ -2100,21 +2135,74 @@ internal class GraphV2RequestCoordinator(
         }
         val round = budget.round ?: RecoveryRound(++nextRecoveryRound, budget).also { budget.round = it }
         if (!round.counted && (budget.rounds >= MAX_RECOVERY_ROUNDS || budget.completionRung >= MAX_RECOVERY_ROUNDS)) {
-            budget.stopped = true
+            budget.stop = RecoveryStop.EXHAUSTED
             budget.round = null
             return
         }
         when (recoveryNeed(key, current, now)) {
             RecoveryNeed.NONE -> recoveryBudgets.remove(budget.key)
-            RecoveryNeed.UNREADABLE -> budget.hold = current to activityGeneration
+            RecoveryNeed.UNREADABLE -> budget.hold = RecoveryHold(current, activityGeneration, RecoveryHold.Cause.UNREADABLE)
             RecoveryNeed.REMAINS -> requestActive(now, force = true, recovery = round)
         }
     }
 
-    /** An event failure stops every budget and withdraws the unsent requests the budgets issued themselves. */
+    /**
+     * S4 RT03b-3a: a valid trigger acts on every budget of the current data scope: it releases an UNREADABLE hold of a
+     * waiting budget, resumes a PAUSED one with its counters and deadline, clearing its hold (or opens a new cycle once a
+     * counter reached six), opens a new cycle in a new budget object for an EXHAUSTED one and leaves a TERMINAL one. With no
+     * budget for the active absorbed key, a remaining demand opens one due now (an unreadable one opens it held); opening
+     * the active key's budget cancels its flip. It sends nothing itself.
+     */
+    private fun onTrigger(trigger: GraphRecoveryTrigger, now: Instant) {
+        val fresh = trigger.sequence > lastTriggerSequence
+        lastTriggerSequence = maxOf(lastTriggerSequence, trigger.sequence)
+        val current = context ?: return
+        if (!fresh || trigger.fence != currentAccessFence() || trigger.fence != current.fence ||
+            trigger.lifetime != current.lifetime || !uses.admits(trigger.lifetime)) return
+        val dataScope = scopeOf(current.fence) ?: return
+        recoveryBudgets.values.filter { it.key.scope == dataScope }.forEach { budget ->
+            when (budget.stop) {
+                null -> if (budget.hold?.cause == RecoveryHold.Cause.UNREADABLE) budget.hold = null
+                RecoveryStop.PAUSED ->
+                    if (budget.rounds < MAX_RECOVERY_ROUNDS && budget.completionRung < MAX_RECOVERY_ROUNDS) {
+                        budget.stop = null
+                        budget.hold = null
+                    } else {
+                        openCycle(budget.key, now)
+                    }
+                RecoveryStop.EXHAUSTED -> openCycle(budget.key, now)
+                RecoveryStop.TERMINAL -> Unit
+            }
+        }
+        val key = activeKey?.takeIf { absorbs(it) } ?: return
+        val budgetKey = RecoveryKey(dataScope, key.tab)
+        if (budgetKey in recoveryBudgets) return
+        when (recoveryNeed(key, current, now)) {
+            RecoveryNeed.NONE -> return
+            RecoveryNeed.UNREADABLE -> openCycle(budgetKey, now).hold =
+                RecoveryHold(current, activityGeneration, RecoveryHold.Cause.UNREADABLE)
+            RecoveryNeed.REMAINS -> openCycle(budgetKey, now)
+        }
+        cancelFlip()
+    }
+
+    /**
+     * S4 RT03b-3a: installs a new budget object due now. Registrations of a replaced cycle stay bound to its stopped object, so
+     * none departs or counts in the new cycle; only a join rebinds an old sent tab to a new round (agreed r3 C).
+     */
+    private fun openCycle(key: RecoveryKey, now: Instant): RecoveryBudget =
+        RecoveryBudget(key).also {
+            it.deadline = now
+            recoveryBudgets[key] = it
+        }
+
+    /**
+     * An event failure pauses every waiting budget (a terminal or exhausted one keeps its cause) and withdraws the unsent
+     * requests the budgets issued themselves.
+     */
     private fun pauseRecovery() {
         recoveryBudgets.values.forEach {
-            it.stopped = true
+            if (it.stop == null) it.stop = RecoveryStop.PAUSED
             it.round = null
         }
         (listOfNotNull(catalogRequest) + tabRequests.values.toList())
@@ -2258,7 +2346,7 @@ internal class GraphV2RequestCoordinator(
             // An application clears this again; only a withdrawal of the current round's tab, or of a catalog a current
             // round awaits (below), keeps it.
             if (round.budget.round === round && round.tabRequestId == registration.requestId) {
-                round.budget.hold = registration.context to registration.activityGeneration
+                round.budget.hold = RecoveryHold(registration.context, registration.activityGeneration, RecoveryHold.Cause.WITHDRAWN)
             }
         }
         // S4 RT03b-2b: a catalog withdrawn before an applicable completion leaves its waiting rounds' check open, held
@@ -2267,7 +2355,7 @@ internal class GraphV2RequestCoordinator(
             val round = budget.round ?: return@forEach
             if (round.awaitedCatalogId != registration.requestId) return@forEach
             round.awaitedCatalogId = null
-            budget.hold = registration.context to registration.activityGeneration
+            budget.hold = RecoveryHold(registration.context, registration.activityGeneration, RecoveryHold.Cause.WITHDRAWN)
         }
         registration.disposed.set(true)
         if (registration.key == null) {
