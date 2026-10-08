@@ -79,9 +79,11 @@ import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSeriesSelection
 import com.jay.fxi.domain.model.GraphTabAdmission
 import com.jay.fxi.time.AppClock
+import com.jay.fxi.ui.premium.graph.GraphRuntimeRetirementPort
 import com.jay.fxi.ui.premium.graph.GraphV2Content
 import com.jay.fxi.ui.premium.graph.GraphV2ScreenState
 import com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder
+import com.jay.fxi.ui.premium.graph.GraphV2SeriesToggle
 import java.io.IOException
 import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
@@ -179,6 +181,15 @@ import org.junit.rules.TemporaryFolder
  * recorder's catalog is the coordinator's in the current data scope only. The rows fix the names
  * `GraphRuntimeAssembly`, `GraphAccessFenceBridge` (with `current` and `close()`) and `graphRecorderCatalog`. Production
  * suppliers, the deliverer's fan-out and the TopicRuntime wiring are the cutover's.
+ *
+ * S4 RT01-B3 (API agreed in R4c/S4 rt01b3_api_agreed.r2) adds graphB301-graphB303: a usd screen holder built from the
+ * assembly's own gate, fence supplier, recorder and coordinator, on its main, with the runtime retirement port listing
+ * it. Each change the holder publishes and each selection store call is made on main in all three rows; graphB301 also
+ * calls both port retirements from off main and sees their coordinator steps and holder steps on main. This carries
+ * PA's same-assembly obligation to the holder (ANDROID_V2_PLAN.md :1457); the coordinator, recorder and sink parts are
+ * graphA02's. The issuer's user purge - refused while the retired fence is still delivered, then retried after the next
+ * epoch's grant - and its capability purge both run the port under the issuer's lock; the topic session's graph loss is
+ * not part of it.
  *
  * A send refused by the guard reaching the wire is TopicUseHttpBoundaryTest GW1-GW4's; a refused admission reaching the
  * disk is GraphV2DiskStoreTest's; a KRX-only refusal keeping a seed off the KRX file is
@@ -287,7 +298,9 @@ class PremiumAccessTopicSnapshotTest {
     private class Purger : UserScopePurger, CapabilityScopePurger {
         /** Runs inside the issuer's capability purge, under its lock, before it completes (S4 RT01-B2b-2). */
         var onCapability: suspend (PurgeNamespace) -> Unit = {}
-        override suspend fun purgeUserScope(namespace: PurgeNamespace) = PurgeResult.Completed
+        /** Runs inside the issuer's user purge, under its lock, and answers it (S4 RT01-B3). */
+        var onUser: suspend (PurgeNamespace) -> PurgeResult = { PurgeResult.Completed }
+        override suspend fun purgeUserScope(namespace: PurgeNamespace) = onUser(namespace)
         override suspend fun purgeCapabilityScope(namespace: PurgeNamespace): PurgeResult {
             onCapability(namespace)
             return PurgeResult.Completed
@@ -1642,7 +1655,9 @@ class PremiumAccessTopicSnapshotTest {
     }
 
     /** A 1d answer a screen can draw: six closed kb points on today's KST rolling domain (S4 U1d). */
-    private fun GraphRig.drawableDayTab(): GraphV2TabResponse {
+    private fun GraphRig.drawableDayTab(): GraphV2TabResponse = drawableDayTabAt(now())
+
+    private fun drawableDayTabAt(now: Instant): GraphV2TabResponse {
         val day0 = Instant.parse("2026-10-04T15:00:00Z")
         val points = (0 until 6).map { GraphV2Point(day0 + 1.hours + (it * 10).minutes, 1390.0 + it, "x") }
         return GraphV2TabResponse(
@@ -1650,7 +1665,7 @@ class PremiumAccessTopicSnapshotTest {
             period = GraphPeriod.ONE_DAY.code,
             series = listOf(GraphV2Series(KB, KB, "krw", "KRW", 2, points, GraphV2Provenance(false, emptyList()), null)),
             metadata = GraphV2Metadata(
-                now() - 1.minutes, "10min", GraphV2Range("2026-10-05", "2026-10-05"),
+                now - 1.minutes, "10min", GraphV2Range("2026-10-05", "2026-10-05"),
                 domainStartAt = day0, domainEndAt = day0 + 24.hours, liveDomainMode = "rolling"
             )
         )
@@ -3435,6 +3450,316 @@ class PremiumAccessTopicSnapshotTest {
         val exposed = g.coordinator.protectedEntry(KEY_3M)
         assertTrue("nothing exposed with a KRX half", exposed == null || exposed.tab.graph.series.none { it.seriesId == KRX_SERIES })
         assertTrue(g.failures.isEmpty())
+    }
+
+    // --- S4 RT01-B3: the runtime port and the screen holder on the assembly ---------------------------------------
+
+    /**
+     * A usd screen holder built from [r]'s assembly - its coordinator, gate, fence supplier and recorder - with the rig's use
+     * authority, the issuer's access revisions and the assembly's main, under a scope beneath the rig's parent (outside the
+     * assembly's job, which knows no holder). Its selection store notes whether each call ran on main, and each publication
+     * the flow emits (a change of the published state) notes whether it was made on main; an equal re-publication emits
+     * nothing. The runtime port lists this holder alone. Rows call the holder only on main.
+     */
+    private inner class AssemblyHolder(test: TestScope, val r: AssemblyRig) {
+        val owner = TopicDisplayOwner(r.live, 1L)
+        val display = MutableStateFlow(TopicDisplayState.NONE.copy(owner = owner))
+        val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(r.live, FreeTab.USD))
+        val selectionsOnMain = mutableListOf<Boolean>()
+        private val scope = CoroutineScope(r.parent + r.main)
+        val holder = GraphV2ScreenStateHolder(
+            tab = "usd",
+            coordinator = r.a.coordinator,
+            selectionSession = GraphSeriesSelectionSession(
+                MarkedSelections(HolderSelections()) { selectionsOnMain += r.main.marked },
+                GraphSelectionAudience.PREMIUM, "usd", scope, r.main
+            ),
+            liveIdentity = { r.live },
+            display = display,
+            focus = focus,
+            currentAccessFence = r.a.fences.current,
+            uses = r.uses,
+            gate = r.a.gate,
+            accessRevisions = r.h.coordinator.accessRevisions,
+            scope = scope,
+            dispatcher = r.main,
+            clock = r.clock,
+            recorder = r.a.recorder
+        )
+        val port = GraphRuntimeRetirementPort(r.a.coordinator, { listOf(holder) }, r.main)
+        val published = mutableListOf<GraphV2ScreenState>()
+        /** Per publication after the first collected value: whether it was made on main. */
+        val publishedOnMain = mutableListOf<Boolean>()
+
+        init {
+            var first = true
+            test.backgroundScope.launch(UnconfinedTestDispatcher(test.testScheduler)) {
+                holder.state.collect {
+                    published += it
+                    if (first) first = false else publishedOnMain += r.main.marked
+                }
+            }
+        }
+
+        fun chartsPublishedSince(mark: Int) = published.drop(mark).count { it.chart != null }
+    }
+
+    /** A selection store that notes each call before delegating. */
+    private class MarkedSelections(private val real: GraphSelectionStore, private val note: () -> Unit) : GraphSelectionStore {
+        override suspend fun confirmGraphSelection(key: GraphSelectionKey): GraphSelectionReadResult {
+            note()
+            return real.confirmGraphSelection(key)
+        }
+
+        override suspend fun readGraphSelection(key: GraphSelectionKey): GraphSelectionReadResult {
+            note()
+            return real.readGraphSelection(key)
+        }
+
+        override suspend fun writeGraphSelection(key: GraphSelectionKey, selection: GraphSeriesSelection): GraphSelectionWriteResult {
+            note()
+            return real.writeGraphSelection(key, selection)
+        }
+    }
+
+    /**
+     * The holder made ready on the delivered grant, every holder call on main: started, activated, 1d drawn and shown, and a
+     * live kb price adopted on main has just scheduled a 350 ms publication that has not yet run.
+     */
+    private suspend fun TestScope.showOnAssembly(ah: AssemblyHolder): Shown {
+        val r = ah.r
+        val fence = r.deliverIssued(); runCurrent()
+        withContext(r.main) { ah.holder.start() }; runCurrent()
+        withContext(r.main) { ah.holder.onActivated(ah.owner) }; runCurrent()
+        r.sent.single { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
+        r.sent.single { it.kind == "tab" && it.key == KEY_1D }.tab.complete(ok(drawableDayTabAt(r.now()))); runCurrent()
+        val state = withContext(r.main) { ah.holder.currentState() }
+        assertEquals("premise: the chart is ready", GraphV2Content.READY, state.content)
+        withContext(r.main) { ah.holder.setSurfaceVisible(checkNotNull(state.inlineToken) { "premise: an inline token" }, true) }
+        runCurrent()
+        val lifetime = checkNotNull(r.uses.acquire(fence)) { "premise: a use under the issued fence" }
+        withContext(r.main) { r.a.recorder.observe(r.quote(1410.0, fence, lifetime)) }
+        assertTrue("premise: kb adopted the live price", r.adopted(r.kb(fence), 1410.0))
+        runCurrent()
+        return Shown(fence, lifetime)
+    }
+
+    /**
+     * graphB301 (S4 RT01-B3; PA's same-assembly obligation, carried to the holder): a screen holder built from the
+     * assembly's own gate, fence supplier, recorder and coordinator runs on the assembly's main. Called from off main, both
+     * of the port's coordinator steps evaluate their selector on main, and each change the holder publishes - starting,
+     * activating, drawing, and inside both port retirements - is made on main, as is every selection store call. A closed
+     * protected admission nobody told the holder about is first published by the capability step. Then the bridge's
+     * access is withdrawn (no issuer end: this row checks executors only) and the USER retirement is called before
+     * anything handles it; the coordinator, dispatched first, already dropped the scope (NOTHING_TO_REMOVE), and the port's
+     * holder step still publishes the empty screen.
+     */
+    @Test
+    fun graphB301_theScreenAndThePortRunOnTheAssemblysMain() = snapshotTest {
+        val r = AssemblyRig(this, granted())
+        r.a.start()
+        val ah = AssemblyHolder(this, r)
+        val shown = showOnAssembly(ah)
+        assertTrue("premise: the holder published", ah.publishedOnMain.isNotEmpty())
+        assertTrue("premise: the selection store was used", ah.selectionsOnMain.isNotEmpty())
+        // While the scope is live each coordinator step evaluates the live candidate and removes nothing; from off main,
+        // the port must have entered main before the coordinator runs.
+        val evaluatedOnMain = mutableListOf<Boolean>()
+        assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, ah.port.retireScopes { evaluatedOnMain += r.main.marked; false })
+        assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE,
+            ah.port.retireCapabilities { evaluatedOnMain += r.main.marked; false })
+        assertTrue("the coordinator steps ran on main: $evaluatedOnMain", evaluatedOnMain.size >= 2 && evaluatedOnMain.all { it })
+        val capabilityMark = ah.publishedOnMain.size
+        r.admitted = false
+        assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, ah.port.retireCapabilities { false })
+        assertTrue("the capability step published", ah.publishedOnMain.size > capabilityMark)
+        assertEquals(GraphV2Content.BLOCKED, ah.holder.state.value.content)
+        r.admitted = true
+        withContext(r.main) { ah.holder.currentState() }
+        assertEquals("premise: drawn again", GraphV2Content.READY, ah.holder.state.value.content)
+        val retired = GraphDataScope(OWNER, checkNotNull(shown.fence.userAccessEpoch))
+        val mark = ah.publishedOnMain.size
+        r.a.fences.setAccess(false, shown.fence, TopicGrantOrigin.NewContext)
+        assertEquals("premise: nothing handled the withdrawal yet", GraphV2Content.READY, ah.holder.state.value.content)
+        assertEquals(GraphRuntimeRetirement.NOTHING_TO_REMOVE, ah.port.retireScopes { it == retired })
+        assertTrue("the USER step published", ah.publishedOnMain.size > mark)
+        assertEquals("the empty screen", GraphV2Content.BLOCKED, ah.holder.state.value.content)
+        assertNull(ah.holder.state.value.chart)
+        runCurrent()
+        assertTrue("every publication on main: ${ah.publishedOnMain}", ah.publishedOnMain.all { it })
+        assertTrue("every selection call on main: ${ah.selectionsOnMain}", ah.selectionsOnMain.all { it })
+        assertTrue(r.failures.isEmpty())
+        withContext(r.main) { r.a.close() }
+    }
+
+    /**
+     * graphB302 (S4 RT01-B3, B02): the real issuer's user purge runs the runtime port under its lock, on main. While the
+     * retired epoch's fence is still delivered every call refuses (LIVE_SCOPE_SELECTED) - the first one meets the drawn
+     * screen - and changes neither the coordinator nor the holder; the purge answers Failed and its journal stays. The
+     * holder empties its screen itself on the issuer's revision. The user is approved again and the issuer's next grant,
+     * of a new epoch, is delivered once its lock is released; the holder takes the new scope. The issuer's retry then runs
+     * the port: whatever the coordinator still had, the holder step drops the retired scope's guard references in the same
+     * main block and keeps the new scope's screen. The journal clears. Once the new scope draws, the late answer of a
+     * retired request, the old token and the publication scheduled before change nothing.
+     */
+    @Test
+    fun graphB302_aUserPurgeRefusedWhileLiveDropsTheRetiredReferencesOnItsRetry() = snapshotTest {
+        val h = granted()
+        val r = AssemblyRig(this, h)
+        r.a.start()
+        val ah = AssemblyHolder(this, r)
+        val shown = showOnAssembly(ah)
+        val retired = GraphDataScope(OWNER, checkNotNull(shown.fence.userAccessEpoch))
+        val old = withContext(r.main) { checkNotNull(ah.holder.currentState().inlineToken) }
+        withContext(r.main) { r.a.coordinator.onRefreshRequested(force = true) }; runCurrent()
+        val late = r.sent.last { it.kind == "tab" && it.key == KEY_1D }
+        assertFalse("premise: a request of the retired scope is out", late.tab.isCompleted)
+
+        val results = mutableListOf<GraphRuntimeRetirement>()
+        var refusedUnchanged: Boolean? = null
+        var firstRefusalDrawn: Boolean? = null
+        var guardBeforeRetry: Boolean? = null
+        var guardAtReturn: Boolean? = null
+        var keptAcrossRetry: Boolean? = null
+        h.purger.onUser = { namespace ->
+            withContext(r.main) {
+                val snapshotBefore = r.a.coordinator.state.value
+                val stateBefore = ah.holder.state.value
+                val guardBefore = ah.holder.holdsRetiredGuard(retired)
+                val result = ah.port.retireScopes {
+                    it.uid == namespace.ownerUid && it.userAccessEpoch != namespace.currentUserAccessEpoch
+                }
+                results += result
+                if (result == GraphRuntimeRetirement.LIVE_SCOPE_SELECTED) {
+                    if (firstRefusalDrawn == null) firstRefusalDrawn = stateBefore.chart != null
+                    refusedUnchanged = (refusedUnchanged ?: true) && snapshotBefore === r.a.coordinator.state.value &&
+                        stateBefore === ah.holder.state.value && guardBefore == ah.holder.holdsRetiredGuard(retired)
+                    PurgeResult.Failed(IllegalStateException("a selected graph scope is still live"))
+                } else {
+                    guardBeforeRetry = guardBefore
+                    guardAtReturn = ah.holder.holdsRetiredGuard(retired)
+                    keptAcrossRetry = stateBefore === ah.holder.state.value
+                    PurgeResult.Completed
+                }
+            }
+        }
+        h.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        assertNotEquals("premise: the user epoch moved", retired.userAccessEpoch, h.store.record.userAccessEpoch)
+        assertTrue("the purge met the delivered fence: $results",
+            results.isNotEmpty() && results.all { it == GraphRuntimeRetirement.LIVE_SCOPE_SELECTED })
+        assertEquals("premise: the first refusal met the drawn screen", true, firstRefusalDrawn)
+        assertEquals("and changed nothing", true, refusedUnchanged)
+        assertTrue("its journal stays", h.store.record.pendingPurges.isNotEmpty())
+        assertNull("the holder emptied the screen itself", withContext(r.main) { ah.holder.currentState() }.chart)
+        val refusals = results.size
+
+        h.source.next = { active(krx = true) }
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        runCurrent()
+        val next = r.deliverIssued(); runCurrent()
+        assertNotEquals("premise: a new user scope", retired.userAccessEpoch, next.userAccessEpoch)
+        r.sent.filter { it.kind == "catalog" && !it.catalog.isCompleted }.forEach { it.catalog.complete(ok(graphCatalog())) }
+        runCurrent()
+        for (attempt in 1..60) {
+            if (results.size > refusals) break
+            advanceTimeBy(RETRY); runCurrent()
+        }
+        assertEquals("the retry ran the port once more: $results", refusals + 1, results.size)
+        assertTrue("the retry was not refused", results.last() != GraphRuntimeRetirement.LIVE_SCOPE_SELECTED)
+        assertEquals("premise: the retired scope's references were there", true, guardBeforeRetry)
+        assertEquals("the holder step dropped them in the port's block", false, guardAtReturn)
+        assertEquals("and kept the new scope's screen", true, keptAcrossRetry)
+        assertTrue("the journal clears", h.store.record.pendingPurges.isEmpty())
+
+        r.sent.filter { it !== late && it.kind == "tab" && !it.tab.isCompleted }
+            .forEach { it.tab.complete(ok(drawableDayTabAt(r.now()))) }
+        runCurrent()
+        val drawn = withContext(r.main) { ah.holder.currentState() }
+        assertNotNull("premise: the new scope draws", drawn.chart)
+        late.tab.complete(ok(drawableDayTabAt(r.now()))); runCurrent()
+        withContext(r.main) { ah.holder.toggleSeries(old, KB) }; runCurrent()
+        advanceTimeBy(400); runCurrent()
+        val after = withContext(r.main) { ah.holder.currentState() }
+        assertSame("the late answer, the old token and the old publication change nothing",
+            checkNotNull(drawn.chart).prepared, checkNotNull(after.chart).prepared)
+        assertEquals(drawn.inlineToken, after.inlineToken)
+        assertTrue("every publication on main", ah.publishedOnMain.all { it })
+        assertTrue("every selection call on main", ah.selectionsOnMain.all { it })
+        assertTrue(r.failures.isEmpty())
+        h.purger.onUser = { PurgeResult.Completed }
+        withContext(r.main) { r.a.close() }
+    }
+
+    /**
+     * graphB303 (S4 RT01-B3, B03): the real issuer's capability purge runs the runtime port under its lock, on main, while
+     * the holder still shows 3m with the KRX toggle. In that main block the coordinator drops K1's half (REMOVED) and the
+     * holder's publication at the port's return has no KRX toggle or rendered id. After the new grant and K2's
+     * re-approval, choosing 3m again shows the kept GENERAL entry without the KRX toggle; only a fresh answer under K2
+     * brings the toggle back.
+     */
+    @Test
+    fun graphB303_aCapabilityPurgeLeavesTheScreenWithoutKrxUntilAFreshAnswer() = snapshotTest {
+        val h = granted()
+        val k1 = checkNotNull(h.store.record.krxCapabilityEpoch) { "premise: a KRX epoch" }
+        val r = AssemblyRig(this, h)
+        r.a.start()
+        val ah = AssemblyHolder(this, r)
+        showOnAssembly(ah)
+        val day = withContext(r.main) { checkNotNull(ah.holder.currentState().inlineToken) }
+        withContext(r.main) { ah.holder.selectPeriod(day, GraphPeriod.THREE_MONTHS) }; runCurrent()
+        r.sent.last { it.kind == "tab" && it.key == KEY_3M }.tab.complete(ok(threeMonthTabAt(r.now()))); runCurrent()
+        val shown = withContext(r.main) { ah.holder.currentState() }
+        assertTrue("premise: the KRX toggle is shown", shown.toggles.any { it.seriesId == KRX_SERIES })
+
+        val results = mutableListOf<GraphRuntimeRetirement>()
+        var atReturn: GraphV2ScreenState? = null
+        var krxAtEntry: Boolean? = null
+        h.purger.onCapability = { namespace ->
+            withContext(r.main) {
+                krxAtEntry = ah.holder.state.value.toggles.any { it.seriesId == KRX_SERIES }
+                results += ah.port.retireCapabilities {
+                    it.uid == namespace.ownerUid && it.krxCapabilityEpoch != namespace.currentKrxCapabilityEpoch
+                }
+                atReturn = ah.holder.state.value
+            }
+        }
+        h.source.next = { active(krx = false) }
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        settle()
+        h.purger.onCapability = {}
+        assertNotEquals("premise: the capability epoch moved", k1, h.store.record.krxCapabilityEpoch)
+        assertEquals(listOf(GraphRuntimeRetirement.REMOVED), results)
+        val at = checkNotNull(atReturn)
+        assertEquals("premise: the holder still showed the KRX toggle when the port began", true, krxAtEntry)
+        assertTrue("no KRX toggle at the port's return", at.toggles.none { it.seriesId == KRX_SERIES })
+        assertTrue("no KRX drawn at the port's return", at.chart?.renderedIds?.contains(KRX_SERIES) != true)
+
+        r.deliverIssued(); runCurrent()
+        r.sent.filter { it.kind == "catalog" && !it.catalog.isCompleted }.forEach { it.catalog.complete(ok(graphCatalog())) }
+        runCurrent()
+        h.source.next = { active(krx = true) }
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        settle()
+        val k2 = checkNotNull(h.store.record.krxCapabilityEpoch)
+        assertNotEquals(k1, k2)
+        r.sent.filter { it.kind == "tab" && !it.tab.isCompleted }.forEach { it.tab.complete(ok(drawableDayTabAt(r.now()))) }
+        runCurrent()
+        val token = withContext(r.main) { checkNotNull(ah.holder.currentState().inlineToken) { "premise: shown again" } }
+        withContext(r.main) { ah.holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }; runCurrent()
+        val before = withContext(r.main) { ah.holder.currentState() }
+        assertTrue("premise: the kept GENERAL 3m entry is shown", before.chart != null && before.toggles.any { it.seriesId == ONLINE })
+        assertTrue("KRX does not come back before a fresh answer", before.toggles.none { it.seriesId == KRX_SERIES })
+        val fresh = r.sent.last { it.kind == "tab" && it.key == KEY_3M }
+        assertFalse("premise: a 3m request after the re-approval", fresh.tab.isCompleted)
+        fresh.tab.complete(ok(threeMonthTabAt(r.now()))); runCurrent()
+        val after = withContext(r.main) { ah.holder.currentState() }
+        assertTrue("a fresh answer under K2 brings the KRX toggle", after.toggles.any { it.seriesId == KRX_SERIES })
+        assertTrue("every publication on main", ah.publishedOnMain.all { it })
+        assertTrue("every selection call on main", ah.selectionsOnMain.all { it })
+        assertTrue(r.failures.isEmpty())
+        withContext(r.main) { r.a.close() }
     }
 
     private companion object {

@@ -395,6 +395,61 @@ internal class GraphV2ScreenStateHolder(
         currentState()
     }
 
+    /**
+     * S4 RT01-B3: on [dispatcher], after the coordinator's USER retirement, including NOTHING_TO_REMOVE.
+     * The selected epochs must have ended permanently. [selects] must be pure and give the same answer
+     * throughout the port call. Each distinct non-null scope of this holder's context and retired context
+     * is evaluated at most once, before any change; a selector exception leaves this holder unchanged.
+     *
+     * A selected context retires explicitly. Every call then publishes synchronously and clears guards
+     * only where removal changes no later refusal. Activation release and reacquisition stay with the
+     * next reconcile; this call neither rebinds the selection session nor reacquires a context.
+     */
+    internal fun retireScopes(selects: (GraphDataScope) -> Boolean) {
+        val selected = listOfNotNull(context?.let(::scopeOf), retiredContext?.let(::scopeOf))
+            .distinct().filter(selects).toSet()
+        val current = context
+        if (current != null && scopeOf(current) in selected) retireContext()
+        currentState()
+        clearRetiredGuards(selected)
+    }
+
+    /**
+     * S4 RT01-B3: on [dispatcher], after the coordinator's CAPABILITY retirement, including NOTHING_TO_REMOVE.
+     * Publishes the current state and clears dead guards without forcing a context retirement. An invalid
+     * lifetime retires lazily. A context that stays current is not retired and keeps its period; it keeps
+     * its fullscreen and chart only while the gate admits it, since a gate refusal (a closed protected
+     * admission, for one) publishes BLOCKED and closes the fullscreen as any render does.
+     */
+    internal fun retireCapabilities() {
+        currentState()
+        clearRetiredGuards()
+    }
+
+    /** S4 RT01-B3 read-only probe on [dispatcher]: whether either retired guard reference remains for [scope], or any. */
+    internal fun holdsRetiredGuard(scope: GraphDataScope? = null): Boolean {
+        if (scope == null) return retiredRequestState != null || retiredContext != null
+        return retiredRequestState?.dataScope == scope || retiredContext?.let(::scopeOf) == scope
+    }
+
+    private fun scopeOf(context: Context): GraphDataScope? =
+        context.fence.userAccessEpoch?.let { GraphDataScope(context.binding.identity.uid, it) }
+
+    /**
+     * An old snapshot object never becomes current again, and a snapshot without a data scope never
+     * reaches the identity guard in [requestState]: both references can go. A current scoped snapshot
+     * stays; only a selected, permanently retired USER context goes alone, since its fence cannot return.
+     */
+    private fun clearRetiredGuards(retiredUserScopes: Set<GraphDataScope> = emptySet()) {
+        val retired = retiredRequestState
+        if (retired == null || retired.dataScope == null || retired !== coordinator.state.value) {
+            retiredRequestState = null
+            retiredContext = null
+        } else if (retiredContext?.let(::scopeOf)?.let { it in retiredUserScopes } == true) {
+            retiredContext = null
+        }
+    }
+
     suspend fun close() {
         if (closed) {
             closeCompleted.await()
