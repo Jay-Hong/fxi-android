@@ -36,7 +36,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 기록기 보존·폐기·연속성 reducer와 owner·topic sink·요청 복구 인계·holder 검증 읽기·메모리 purge
                                 대상·graph REST 송신 guard·실제 issuer 그래프 통합 계약(U1a~U1d)을 쌓고 도달 불가 v1 graph 코드를
                                 지웠다(JVM·에뮬레이터 계측 계약, 운영 배선 없음). 18번의 세 선행조건이 충족되어(동결 후 7번 대조 완료
-                                10-08) 남은 단위는 RT01부터의 F2 runtime 나머지다(G의 §9.1 migration 포함, S4 '진행' 항목).
+                                10-08) RT01-A1(`6c6cadb`)부터 RT07(`43b72d8`)까지 commit 18개로 runtime 조립·은퇴 포트·
+                                복구 예산·시간 계기·§9.1 migration을 dormant로 준비했다. 남은 단위는 통합(운영 공급자·실제
+                                HTTP stack 위 graph 포함 예산)과 critical cutover다(S4 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1468,6 +1470,27 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   잔여의 범위는 18번(실제 issuer 그래프 통합 계약·실제 purger 설계·7번 대조)이며, 세 선행조건은 U1a~U1d·purger 설계
   v3 final·7번 대조 기록으로 충족했다(10-08). T25는 공용 GraphChart 회귀만 C2b-2에서 확인했고 나머지는 F2에 남는다.
   실제 purger를 포함한 S4 최종 DoD 재검증은 P3-i 활성화 뒤에 하고, F2에서는 placeholder purger 아래 회귀 0만 본다.
+  · RT01 runtime 조립과 정리 포트(dormant): A1 `6c6cadb` 같은 data scope에서도 새 USER 종료를 보면 조정자 메모리 은퇴,
+  A2 `e531e10` 계정 삭제 admission 저장소와 그래프 protectedAdmission 공급자, A3 `be8bf74` 그래프 runtime 조립·fence
+  bridge·catalog 공급자와 조정자 close·sink 지연 시작(운영 factory·startup·route 연결, 전달자 fan-out, TopicRuntime 주입은
+  cutover 몫), B1 `f2185c0` topic graph loss의 scope별 독립 장부와 선택 정리, B2a `b31f3b0` 끝난 USER data scope 선택 은퇴,
+  B2b-1 `72693f4` 끝난 KRX capability epoch 선택 은퇴, B2b-2 `224be58` KRX capability 은퇴가 쓰기 작업의 KRX 후보를 store와
+  함께 철회, B3 `6566768` runtime 정리 포트가 coordinator 정리 뒤 holder의 USER 선택 은퇴 또는 CAPABILITY 상태 재발행을 수행.
+  · RT03b 복구 요청(dormant): 0 `7b4c490` 요청 snapshot 출처 표지(같은 scope의 새 use가 옛 catalog·failure를 읽지 않음),
+  1a `d0ce86a` recorder가 한 탭 1d의 보존 창 내 닫힌 봉 요구·매핑/인계 대기 및 접근·catalog 상태를 변경 없이 답하는 질의(현재·미래 봉 요구 제외), 1b `1c6efb3` recorder가 있는 조정자의 1d cold 사다리를
+  (data scope, tab) 복구 예산으로 흡수, 2a `4df3ebe` recorder가 있는 조정자는 새 USER 종료 없이 이어지는 같은 data scope의 ContextChanged 통지만으로 catalog를 재요청하지 않음,
+  2b `ca2dcb9` 복구 회차의 tab 발급 앞에 catalog 확인 단계를 둠(성공 수신 보장은 없으며, 확인 종료 뒤 같은 scope 문맥 변경으로 catalog가 사라져도 재확인하지 않는 한계 유지), 3a `45d6708` RT05 계기가 1d 복구 예산을
+  재개·재개방·최초 개방, 3b `86facb4` P7 permit 공급자를 주입한 구성에서 복구 회차가 직접 발급하는 자동 요청은 permit이 허락할 때만 발급·송신(미주입 구성은 P7 검사 없음; 운영 publisher·조립 배선은 cutover 몫).
+  위 RT03b·RT05 종결 조건의 단일 담당은 이렇게 고정했다: 복구 예산과 회차는 요청 조정자(RT03b), 계기는 시간 경로(RT05).
+  · RT05 계기·시간 사건(dormant): a `06c4c1c` foreground의 10초 tick과 복귀에서 600초 봉 변화를 감지하면
+  보존·시간 사건과 공개 문맥의 경계 계기를 전달(복귀는 봉 변화가 없어도 보존·시간 사건, 30초 tick은 시간 사건만).
+  b `323437f` 공개 문맥이 있는 60초 이상 복귀와 foreground에서 관찰한 세션의 새 Connection이 복구 계기를 냄
+  (생산자가 처음 관찰한 Connection 제외, 두 계기는 30초 cooldown 공유; background에서 관찰한 Connection은 복귀 때 재전달하지 않음).
+  · RT07 `43b72d8` §9.1 v1 graph cache와 graph 선호 저장소를 대상별 journal로 은퇴시키는 migration(dormant). 대상마다
+  기록된 단계부터 재개하고, 삭제는 decode 없는 물리 sweep이며 다시 읽은 목록이 비어야 완료다. 운영 readiness 구현·
+  startup 실행·backup 제외는 cutover 몫이다.
+  다음은 통합(운영 공급자·실제 HTTP stack 위에서 graph를 포함한 예산, CUT-C02)이고, 그 뒤 critical cutover(runtime·sink·
+  화면·쓰기·시간·migration·permit 배선, CUT-C01·CUT-C03·T25)와 P3-i다.
 
 ### S5 — 테더 탭
 - 거래소 5 + 참조(kb·hana·investing) 시세 (preference는 S1.5에서 도입, 여기서 테더 표면에 연결)
