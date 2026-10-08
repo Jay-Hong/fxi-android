@@ -14,7 +14,7 @@ import kotlinx.datetime.Instant
  * that move retention and line use. Closing it does not allow a replacement producer to restart sequence at 1 on that
  * coordinator. It creates no observation, sends nothing and owns no budget; the coordinator owns every send (RT03b).
  * Every method and port runs on the coordinator's serial executor, and no port or supplier may call back into this producer.
- * Dormant: no production code constructs it yet.
+ * Dormant: only [GraphRuntimeAssembly] constructs it (S4 CUT-P1), and no production code constructs the assembly yet.
  *
  * RT05a, the time path: while the process is in the foreground a rollover tick every 10 s finds a change of the 600 s
  * bucket - forward or back, however many buckets apart - and then retains, issues BOUNDARY_600S for the coordinator's

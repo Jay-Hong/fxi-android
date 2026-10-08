@@ -4,6 +4,7 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.remote.TopicGrantOrigin
 import com.jay.fxi.data.remote.TopicGrantSink
+import com.jay.fxi.data.remote.TopicGraphRecoveryPermit
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.remote.TopicUseAuthority
 import com.jay.fxi.domain.model.GraphCatalog
@@ -87,14 +88,15 @@ internal fun graphRecorderCatalog(
  * that Main; neither method hops executors.
  * Snapshot, live identity and protected admission suppliers must support transport-thread reads.
  *
- * Construction creates the bridge, then gate -> recorder -> coordinator -> deferred sink. The
- * catalog supplier and bridge callback are late-bound to that coordinator. No collector, loop or
- * worker starts during construction. On construction failure, already-created components are
+ * Construction creates the bridge, then gate -> recorder -> coordinator -> deferred sink -> recovery
+ * events. The catalog supplier and bridge callback are late-bound to that coordinator. No collector,
+ * loop or worker starts during construction, and the recovery events tick only once told the process
+ * is in the foreground (S4 CUT-P1). On construction failure, already-created components are
  * closed, the assembly job is cancelled, and the original exception is rethrown. [start] starts
  * coordinator -> recorder collector -> sink worker once; the bridge and sink accept inputs earlier.
  *
- * [close] first closes the bridge, then sink (which closes the recorder), then coordinator, before
- * cancelAndJoin on the assembly job. Explicit component cleanup works even before first dispatch;
+ * [close] first closes the recovery events, then the bridge, then sink (which closes the recorder), then
+ * coordinator, before cancelAndJoin on the assembly job. Explicit component cleanup works even before first dispatch;
  * cancelAndJoin is completion waiting, not a guarantee that a launch body or finally has run. A close
  * call, including one concurrent with a prior close's wait, returns normally only after all assembly
  * children have ended. The wait is cancellable: a caller that is already cancelled, or is itself an
@@ -119,7 +121,15 @@ internal class GraphRuntimeAssembly(
     parent: Job,
     clock: AppClock,
     rateLimitJitter: (String) -> Duration,
-    onEventFailure: (Throwable) -> Unit
+    onEventFailure: (Throwable) -> Unit,
+    /**
+     * S4 CUT-P1: the session's live P7 permit, handed as the same function to the coordinator and the recovery events.
+     * Null keeps automatic recovery ungated and gives the events no Connection; an installed supplier that returns null
+     * closes it.
+     */
+    recoveryPermit: (() -> TopicGraphRecoveryPermit?)? = null,
+    /** S4 CUT-P1: the recovery events' time event, the fan-out to the mounted holders; nothing by default. */
+    timeEvent: () -> Unit = {}
 ) {
     private val assemblyJob = SupervisorJob(parent)
     private val scope = CoroutineScope(assemblyJob + main)
@@ -131,6 +141,8 @@ internal class GraphRuntimeAssembly(
     val recorder: GraphRecorder
     val coordinator: GraphV2RequestCoordinator
     val sink: GraphRecorderTopicSink
+    /** S4 CUT-P1: the RT05 producer, on this assembly's scope and clock, wired to its coordinator and recorder. */
+    val events: GraphRecoveryEvents
 
     init {
         lateinit var requests: GraphV2RequestCoordinator
@@ -155,9 +167,21 @@ internal class GraphRuntimeAssembly(
                 rateLimitJitter = rateLimitJitter,
                 onEventFailure = onEventFailure,
                 cachePorts = cachePorts(gate),
-                recorder = recorder
+                recorder = recorder,
+                recoveryPermit = recoveryPermit
             ).also { requests = it; createdCoordinator = it }
             sink = GraphRecorderTopicSink(scope, recorder, startImmediately = false)
+            // Last: nothing after it can fail, so a failed construction never leaves recovery events behind.
+            events = GraphRecoveryEvents(
+                scope = scope,
+                clock = clock,
+                context = { requests.state.value.source },
+                trigger = requests::onRecoveryTrigger,
+                retain = recorder::retain,
+                timeEvent = timeEvent,
+                permit = recoveryPermit ?: { null },
+                contextChanged = requests::onContextChanged
+            )
         } catch (failure: Throwable) {
             fences.close()
             // No component has started; each cleanup is synchronous and needs no completion wait.
@@ -180,6 +204,7 @@ internal class GraphRuntimeAssembly(
         try {
             if (!closed) {
                 closed = true
+                events.close()
                 fences.close()
                 sink.close()
                 coordinator.close()

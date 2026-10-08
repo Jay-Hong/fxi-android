@@ -135,6 +135,9 @@ import org.junit.Assert.fail
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import com.jay.fxi.data.remote.TopicGraphRecoveryPermit
+import com.jay.fxi.data.graph.GraphRequestSource
+import java.io.File
 
 /**
  * L-4e E1: the topic access snapshot the issuer publishes (`l4e_e1_design_v3.md`, `ANDROID_V2_PLAN.md` 동결 후 12번).
@@ -2608,7 +2611,9 @@ class PremiumAccessTopicSnapshotTest {
         private val disk: Boolean = true,
         val parent: Job = Job(processJob),
         jitter: (String) -> Duration = { Duration.ZERO },
-        cachePorts: ((GraphV2AccessGate) -> GraphV2CachePorts?)? = null
+        cachePorts: ((GraphV2AccessGate) -> GraphV2CachePorts?)? = null,
+        recoveryPermit: (() -> TopicGraphRecoveryPermit?)? = null,
+        timeEvent: () -> Unit = {}
     ) {
         private val scheduler = test.testScheduler
         private val queue = StandardTestDispatcher(scheduler)
@@ -2688,7 +2693,9 @@ class PremiumAccessTopicSnapshotTest {
             parent = parent,
             clock = clock,
             rateLimitJitter = jitter,
-            onEventFailure = { failures += it }
+            onEventFailure = { failures += it },
+            recoveryPermit = recoveryPermit,
+            timeEvent = timeEvent
         ).also { snapshotReads.clear() }
 
         fun now(): Instant = clock.now()
@@ -3799,5 +3806,106 @@ class PremiumAccessTopicSnapshotTest {
         const val ONLINE = "investing.usd-krw"
         const val KRX_SERIES = "krx.usd-krw-futures"
         const val KB = "kb.usd"
+    }
+
+    // --- S4 CUT-P1: the assembly's recovery events and permit (cut_api_agreed.r2 §3) ----------------------------------------
+
+    private fun field(owner: Any, name: String): Any? =
+        owner.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(owner)
+
+    /**
+     * graphP1a (S4 CUT-P1): with the defaults the coordinator holds no permit supplier, so automatic recovery stays ungated as
+     * before, and the recovery events read none: their permit answers null, so no Connection ever triggers.
+     */
+    @Test
+    fun graphP1a_theDefaultsLeaveRecoveryUngated() = snapshotTest {
+        val r = AssemblyRig(this, granted())
+        assertNull("the coordinator holds no permit supplier", field(r.a.coordinator, "recoveryPermit"))
+        @Suppress("UNCHECKED_CAST")
+        val permit = field(r.a.events, "permit") as () -> TopicGraphRecoveryPermit?
+        assertNull("the events read no permit", permit())
+        withContext(r.main) { r.a.close() }
+        assertTrue(r.failures.isEmpty())
+    }
+
+    /**
+     * graphP1b (S4 CUT-P1): an installed supplier is the same function for the coordinator and the events, which read it once
+     * per permit change - installed but answering null, then a publication - and the events' ports are this assembly's: its
+     * coordinator's trigger, context change and published source, its recorder's retain, its clock, and the time event it was
+     * given, which the freshness tick reaches once the process is in the foreground.
+     */
+    @Test
+    fun graphP1b_thePermitAndTheEventsAreThisAssemblys() = snapshotTest {
+        var reads = 0
+        var publication: TopicGraphRecoveryPermit? = null
+        val supplier: () -> TopicGraphRecoveryPermit? = { reads++; publication }
+        var timeEvents = 0
+        val r = AssemblyRig(this, granted(), recoveryPermit = supplier, timeEvent = { timeEvents++ })
+        assertSame("the coordinator's supplier", supplier, field(r.a.coordinator, "recoveryPermit"))
+        assertSame("the events' supplier", supplier, field(r.a.events, "permit"))
+        assertEquals(r.a.coordinator::onRecoveryTrigger, field(r.a.events, "trigger"))
+        assertEquals(r.a.coordinator::onContextChanged, field(r.a.events, "contextChanged"))
+        assertEquals(r.a.recorder::retain, field(r.a.events, "retain"))
+        assertSame(r.clock, field(r.a.events, "clock"))
+        r.a.start()
+        val issued = r.deliverIssued(); runCurrent()
+        @Suppress("UNCHECKED_CAST")
+        val context = field(r.a.events, "context") as () -> GraphRequestSource?
+        assertEquals("premise: a published source", issued, r.a.coordinator.state.value.source?.fence)
+        assertEquals("the events read the coordinator's published source", r.a.coordinator.state.value.source, context())
+        val before = reads
+        withContext(r.main) { r.a.events.onPermitChanged() }
+        assertEquals("installed, answering null: read once", before + 1, reads)
+        publication = TopicGraphRecoveryPermit(Any(), 1L, issued, 1L, false, 1L, checkNotNull(r.uses.acquire(issued)), true)
+        withContext(r.main) { r.a.events.onPermitChanged() }
+        assertEquals("a publication: read once", before + 2, reads)
+        withContext(r.main) { r.a.events.onForeground(true) }
+        advanceTimeBy(30_001); runCurrent()
+        assertTrue("the freshness tick reaches the time event it was given", timeEvents >= 1)
+        withContext(r.main) { r.a.close() }
+        assertTrue(r.failures.isEmpty())
+    }
+
+    /**
+     * graphP1c (S4 CUT-P1): close() ends the recovery events with the rest - while they tick, and before start - so no time
+     * event follows, even when told of a foreground again.
+     */
+    @Test
+    fun graphP1c_closeEndsTheRecoveryEvents() = snapshotTest {
+        for (stage in listOf("ticking", "before start")) {
+            var timeEvents = 0
+            val r = AssemblyRig(this, granted(), timeEvent = { timeEvents++ })
+            if (stage == "ticking") {
+                r.a.start()
+                withContext(r.main) { r.a.events.onForeground(true) }
+                advanceTimeBy(30_001); runCurrent()
+                assertTrue("$stage: premise, ticking", timeEvents >= 1)
+            }
+            withContext(r.main) { r.a.close() }
+            assertEquals("$stage: the events are closed", true, field(r.a.events, "closed"))
+            val after = timeEvents
+            withContext(r.main) {
+                r.a.events.onForeground(false)
+                r.a.events.onForeground(true)
+            }
+            advanceTimeBy(300_000); runCurrent()
+            assertEquals("$stage: no time event after close", after, timeEvents)
+            assertTrue("$stage: no failure", r.failures.isEmpty())
+        }
+    }
+
+    /** graphP1d (S4 CUT-P1): dormant - only the assembly constructs the recovery events, and no production code the assembly. */
+    @Test
+    fun graphP1d_theRecoveryEventsAreConstructedOnlyByTheDormantAssembly() {
+        val main = File("src/main/java")
+        val all = main.walkTopDown().filter { it.isFile && it.extension == "kt" }
+            .associate { it.relativeTo(main).invariantSeparatorsPath to it.readText() }
+        val events = "com/jay/fxi/data/graph/GraphRecoveryEvents.kt"
+        val assembly = "com/jay/fxi/data/graph/GraphRuntimeAssembly.kt"
+        assertTrue("premise: the scan sees both files", events in all && assembly in all && all.size > 100)
+        assertEquals("only the assembly names the recovery events' constructor", setOf(events, assembly),
+            all.filter { (_, text) -> Regex("""\bGraphRecoveryEvents\(""").containsMatchIn(text) }.keys)
+        assertEquals("no production code constructs the assembly", setOf(assembly),
+            all.filter { (_, text) -> Regex("""\bGraphRuntimeAssembly\(""").containsMatchIn(text) }.keys)
     }
 }
