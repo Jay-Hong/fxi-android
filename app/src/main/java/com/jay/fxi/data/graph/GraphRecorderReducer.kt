@@ -5,6 +5,7 @@ import com.jay.fxi.data.remote.TopicGraphEventKind
 import com.jay.fxi.data.remote.TopicGraphInput
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.domain.model.GraphCatalog
+import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphV2Tab
 import java.util.Collections
 import kotlinx.datetime.Instant
@@ -342,6 +343,40 @@ internal object GraphRecorderReducer {
         val previous = synced.series[request.seriesKey] ?: return synced
         val applied = applyGraphRecoveryResponse(previous, scope, request, tab, now)
         return updated(synced, series = synced.series + (request.seriesKey to applied))
+    }
+
+    /**
+     * S4 RT03b-1a: the closed-bucket demands and mapping or handover waits [state] holds for [tab]'s 1d series, computed on a
+     * discarded access synchronization and never stored. Access that is not usable is [GraphTabRecoveryDemand.Unreadable];
+     * a catalog that does not resolve the tab's 1d series is [GraphTabRecoveryDemand.CatalogRequired], whatever is held.
+     * Otherwise closed demands of the retained window and mapping or handover waits that map to those series decide
+     * [GraphTabRecoveryDemand.Pending].
+     */
+    fun recoveryDemand(
+        state: GraphRecorderState,
+        tab: String,
+        catalog: GraphCatalog?,
+        snapshot: TopicAccessSnapshot,
+        fence: TopicSessionFence?,
+        admission: Boolean,
+        now: Instant
+    ): GraphTabRecoveryDemand {
+        val synced = syncAccess(state, snapshot, fence)
+        if (!usable(synced, snapshot, fence, admission)) return GraphTabRecoveryDemand.Unreadable
+        val ids = catalog?.tabs?.get(tab)?.periods?.get(GraphPeriod.ONE_DAY)?.allSeries?.toSet()
+            ?: return GraphTabRecoveryDemand.CatalogRequired
+        val scope = checkNotNull(synced.scope) { "usable access has a scope" }
+        val closed = ids.any { id ->
+            synced.series[GraphObservationSeriesKey(scope, id)]?.let { hasClosedGraphRecoveryDemand(it, now) } == true
+        }
+        val heldTopics = synced.pending.inputs.flatMapTo(linkedSetOf()) {
+            when (it) {
+                is TopicGraphInput.Observations -> setOf(it.topic)
+                is TopicGraphInput.Continuity -> it.topics
+            }
+        } + synced.pending.lostTopics
+        val mappingWait = seriesIds(heldTopics, catalog).any { it in ids } || synced.untransferredSeries.any { it in ids }
+        return if (closed || mappingWait) GraphTabRecoveryDemand.Pending(closed, mappingWait) else GraphTabRecoveryDemand.None
     }
 
     fun exposed(

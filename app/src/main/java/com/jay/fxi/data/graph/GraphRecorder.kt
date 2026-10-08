@@ -181,6 +181,25 @@ internal class GraphRecorder(
         )
     }
 
+    /**
+     * S4 RT03b-1a: the closed-bucket demands and mapping or handover waits held for [tab]'s 1d series (current- and
+     * later-bucket demands are not reported), judged on the current suppliers with admission from [fence] and [lifetime],
+     * and never stored: no replay, retention, version or publication. A closed recorder is unreadable.
+     */
+    fun recoveryDemand(
+        tab: String,
+        fence: TopicSessionFence,
+        lifetime: TopicUseLifetime,
+        now: Instant
+    ): GraphTabRecoveryDemand {
+        if (closed) return GraphTabRecoveryDemand.Unreadable
+        val snapshot = accessSnapshot()
+        val currentFence = currentAccessFence()
+        val catalog = currentCatalog()
+        val admission = gate.bind(fence, lifetime) != null
+        return GraphRecorderReducer.recoveryDemand(mutableState.value, tab, catalog, snapshot, currentFence, admission, now)
+    }
+
     fun exposed(
         fence: TopicSessionFence,
         lifetime: TopicUseLifetime

@@ -91,6 +91,11 @@ import org.junit.Test
  *    The new state is published once. The answer is judged on the state before the call: REMOVED when any of those four held
  *    something, otherwise NOTHING_TO_REMOVE - a selected scope with nothing left is still cleared. An unselected or null scope
  *    is the same instance, unpublished.
+ *
+ * S4 RT03b-1a (rt03b1a_api_agreed.r2) adds Q1a01: `recoveryDemand(tab, fence, lifetime, now)` hands the reducer the current
+ * fence read and binds the gate with the consumer's own fence and lifetime; it stores and publishes nothing - also on a
+ * discard - judges without a replay, and does not read the clock; a refused admission and a closed recorder are Unreadable.
+ * The reducer's judgement is GraphTabRecoveryDemandTest's.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphRecorderTest {
@@ -825,5 +830,60 @@ class GraphRecorderTest {
             assertEquals(scopeN2, rig.state().scope)
             assertTrue("a later scope is recorded", kbN2 in rig.state().series)
         }
+    }
+
+    /** Q1a01 (S4 RT03b-1a): the recorder's query changes nothing it holds and needs a usable admission and an open recorder. */
+    @Test
+    fun Q1a01_theQueryStoresNothing() = recorderTest {
+        val rig = Rig(this).loaded()
+        rig.catalogNow = catalog
+        rig.record()
+        runCurrent()
+        val before = rig.state()
+        val emitted = rig.emissions.size
+        val clock = rig.clockReads
+        val answer = rig.recorder.recoveryDemand("usd", fenceN, l3, noon)
+        assertEquals("kb's handover window is closed demand; held inputs, lost topics and untransferred series wait",
+            GraphTabRecoveryDemand.Pending(closed = true, mappingWait = true), answer)
+        assertSame("nothing stored", before, rig.state())
+        assertEquals("nothing published", emitted, rig.emissions.size)
+        assertTrue("no replay with a catalog present", rig.state().pending.inputs.isNotEmpty())
+        assertEquals("no clock read", clock, rig.clockReads)
+        assertEquals("the same answer again", answer, rig.recorder.recoveryDemand("usd", fenceN, l3, noon))
+        assertSame(before, rig.state())
+
+        rig.protectedOpen = false
+        assertEquals("a refused admission", GraphTabRecoveryDemand.Unreadable, rig.recorder.recoveryDemand("usd", fenceN, l3, noon))
+        rig.protectedOpen = true
+        rig.fenceSequence = ArrayDeque(listOf(null, fenceN))
+        assertEquals("the reducer gets the current fence read, not the consumer's", GraphTabRecoveryDemand.Unreadable,
+            rig.recorder.recoveryDemand("usd", fenceN, l3, noon))
+        rig.fenceSequence = ArrayDeque(listOf(fenceN, null))
+        assertEquals("the current fence is read, not taken from the consumer", GraphTabRecoveryDemand.Unreadable,
+            rig.recorder.recoveryDemand("usd", fenceN, l3, noon))
+        rig.fenceSequence = null
+        assertEquals("the gate binds the consumer's own fence", GraphTabRecoveryDemand.Unreadable,
+            rig.recorder.recoveryDemand("usd", TopicSessionFence(identity2, "e1", grant), l3, noon))
+        assertSame("an Unreadable answer stores nothing either", before, rig.state())
+        assertEquals(emitted, rig.emissions.size)
+        rig.fence = fenceN2
+        rig.snapshot = snap(2)
+        assertEquals("a new scope's discard is judged, not stored", GraphTabRecoveryDemand.None,
+            rig.recorder.recoveryDemand("usd", fenceN2, l3, noon))
+        assertSame(before, rig.state())
+        rig.fence = fenceN
+        rig.snapshot = snap(1)
+
+        val heldOnly = Rig(this)
+        heldOnly.catalogNow = null
+        heldOnly.recorder.observe(batch(1341.7, kst("20:01:00")))
+        assertTrue("premise: only an input is held", heldOnly.state().series.isEmpty() &&
+            heldOnly.state().pending.inputs.isNotEmpty() && heldOnly.state().untransferredSeries.isEmpty())
+        heldOnly.catalogNow = catalog
+        assertEquals("the held input still waits: the answer is not computed on a replay",
+            GraphTabRecoveryDemand.Pending(closed = false, mappingWait = true),
+            heldOnly.recorder.recoveryDemand("usd", fenceN, l3, noon))
+        rig.recorder.close()
+        assertEquals("a closed recorder", GraphTabRecoveryDemand.Unreadable, rig.recorder.recoveryDemand("usd", fenceN, l3, noon))
     }
 }

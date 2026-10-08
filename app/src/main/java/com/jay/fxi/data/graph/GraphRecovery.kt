@@ -46,3 +46,28 @@ internal data class GraphRecoveryRequest(
 )
 
 internal data class GraphRecoverableReduction(val state: GraphRecoverableState, val outcomes: List<GraphObservationOutcome>)
+
+/**
+ * S4 RT03b-1a: whether the recorder holds a closed-bucket demand of the retained window, or a mapping or handover wait, for
+ * one tab's 1d series, read without any change. Demands on the current or a later bucket are not reported.
+ */
+internal sealed interface GraphTabRecoveryDemand {
+    /** Access cannot be decided or is not usable for this fence and lifetime; says nothing about completion. */
+    data object Unreadable : GraphTabRecoveryDemand
+
+    /** The tab's 1d series cannot be resolved from the supplied catalog; says nothing about completion. */
+    data object CatalogRequired : GraphTabRecoveryDemand
+
+    /**
+     * No closed demand in the retained window and no mapping or handover wait for the tab's 1d series. Demands on the current
+     * or a later bucket may still be held, and a capture still requests them.
+     */
+    data object None : GraphTabRecoveryDemand
+
+    /** At least one of [closed] and [mappingWait] is true. */
+    data class Pending(val closed: Boolean, val mappingWait: Boolean) : GraphTabRecoveryDemand {
+        init {
+            require(closed || mappingWait) { "Pending needs a closed demand or a mapping wait" }
+        }
+    }
+}

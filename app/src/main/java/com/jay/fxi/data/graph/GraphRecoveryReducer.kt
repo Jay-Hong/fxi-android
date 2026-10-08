@@ -119,6 +119,13 @@ internal fun requireGraphRecoveryWindow(
     return transition.finish()
 }
 
+/** S4 RT03b-1a: a demand on a closed bucket of the retained window, from 24 h before the current bucket up to it. */
+internal fun hasClosedGraphRecoveryDemand(state: GraphRecoverableState, now: Instant): Boolean {
+    val current = graphObservationBucketStart(now)
+    val lower = current.offsetSeconds(-RECOVERY_DEMAND_SECONDS)
+    return state.pending.keys.any { it >= lower && it < current }
+}
+
 internal fun captureGraphRecoveryRequest(state: GraphRecoverableState, applicationVersion: Long): GraphRecoveryRequest =
     GraphRecoveryRequest(state.data.app.seriesKey, applicationVersion, state.generation)
 
