@@ -11,7 +11,7 @@ import com.jay.fxi.data.remote.dto.GraphV2TabResponse
  *
  * This adapter does not reacquire the owner, retry requests or convert exceptions. The transport
  * can invoke the guard from its threads, so the guard must be thread-safe, non-blocking and
- * side-effect free.
+ * side-effect free, except for the production auth identity read documented on GraphOwnerSource.
  */
 internal class AuthenticatedGraphV2Fetcher(private val api: AuthenticatedApiClient) : GraphV2Fetching {
     override suspend fun catalog(

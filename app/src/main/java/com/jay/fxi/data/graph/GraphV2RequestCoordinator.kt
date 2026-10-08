@@ -50,7 +50,18 @@ internal data class GraphKey(val tab: String, val period: GraphPeriod)
 
 internal data class GraphDataScope(val uid: String, val userAccessEpoch: String)
 
-/** Both live sources used by the send guard must be thread-safe, non-blocking reads. */
+/**
+ * Synchronous live suppliers used by the send guard must be thread-safe and must
+ * not wait on I/O or this coordinator. Suppliers other than the production auth
+ * identity read remain non-blocking and side-effect free.
+ *
+ * The production auth identity read may observe a generation transition, drain
+ * queued auth deliveries, and contend on the identity and delivery-pump monitors.
+ * It is not lock-free and has no guaranteed latency bound.
+ * Auth listeners must enqueue and return without blocking or synchronously
+ * calling the source or graph coordinator; see AuthFenceStream and
+ * AuthSessionGenerationTracker.drainOutbox.
+ */
 internal interface GraphOwnerSource {
     fun currentIdentity(): AuthIdentityFence?
     suspend fun capture(expected: AuthIdentityFence): AuthSnapshot
@@ -124,7 +135,8 @@ internal data class GraphRequestState(
  * The loop's finally uses the same idempotent cleanup; the supplied scope is not cancelled.
  *
  * @param protectedAdmission Live admission supplier consulted at each otherwise-admitted use check.
- * It is also invoked on transport threads and must be thread-safe, non-blocking and side-effect free.
+ * It is also invoked on transport threads and must be thread-safe, non-blocking and side-effect free, except for the
+ * production auth identity read documented on GraphOwnerSource.
  * @param accessSnapshot Lock-free, live read of the issuer's published topic access snapshot; use
  * the same supplier function object as the gate and recorder. A new USER end retires request,
  * write and seed ownership and clears entries, protected slots, catalog, failures and every 1d

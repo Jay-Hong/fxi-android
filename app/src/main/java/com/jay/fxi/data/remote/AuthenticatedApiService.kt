@@ -348,7 +348,8 @@ class AuthenticatedApiClient internal constructor(
      * GET /api/v2/graph/catalog (premium; KRX series only when the user may see them).
      *
      * Passes [useAdmitted] unchanged to the transport. It can be invoked on transport threads and
-     * must be thread-safe, non-blocking and side-effect free.
+     * must be thread-safe, non-blocking and side-effect free, except for the production auth identity read documented on
+     * GraphOwnerSource.
      */
     suspend fun getGraphV2Catalog(
         owner: AuthSnapshot,
@@ -362,7 +363,8 @@ class AuthenticatedApiClient internal constructor(
      * GET /api/v2/graph/tab?tab=&period= (premium; period "1d" / "1w" / "3m" / "1y").
      *
      * Passes [useAdmitted] unchanged to the transport. It can be invoked on transport threads and
-     * must be thread-safe, non-blocking and side-effect free.
+     * must be thread-safe, non-blocking and side-effect free, except for the production auth identity read documented on
+     * GraphOwnerSource.
      */
     suspend fun getGraphV2Tab(
         owner: AuthSnapshot,

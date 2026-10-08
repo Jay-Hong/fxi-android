@@ -49,7 +49,10 @@ internal class TopicUseContext(private val useAdmitted: () -> Boolean) {
     private val observed = mutableListOf<HttpExchangeEvidence>()
     private val exchangesPerSend = mutableMapOf<Int, Int>()
 
-    /** Reads the issuer's published access; side-effect free and safe on any thread. */
+    /**
+     * Asks the caller's use guard; safe on any thread. Side-effect free except for the production auth identity read
+     * documented on GraphOwnerSource.
+     */
     fun admitted(): Boolean = useAdmitted()
 
     fun nextExchange(send: Int): Int = synchronized(lock) {
