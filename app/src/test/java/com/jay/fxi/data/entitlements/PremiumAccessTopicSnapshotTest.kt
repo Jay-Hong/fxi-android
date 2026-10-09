@@ -1,8 +1,10 @@
 package com.jay.fxi.data.entitlements
 
+import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
+import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.graph.DefaultGraphV2AtomicFileIo
 import com.jay.fxi.data.graph.FileGraphV2DiskStore
 import com.jay.fxi.data.free.InstallSeedSource
@@ -125,6 +127,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import kotlinx.datetime.Instant
 import okhttp3.Headers
+import okhttp3.MediaType.Companion.toMediaType
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -2891,7 +2894,13 @@ class PremiumAccessTopicSnapshotTest {
         /** The detach suspends once, as the real one does on the session's dispatcher, and notes when it is done. */
         private val detachSuspends: Boolean = false,
         /** When set, the detach waits for it: a cleanup held mid-way. */
-        private val detachGate: CompletableDeferred<Unit>? = null
+        private val detachGate: CompletableDeferred<Unit>? = null,
+        /** Catch what escapes the starter's scope into [uncaught]; otherwise runTest fails on it, as it should (S4 CUT-CC4b). */
+        captureUncaught: Boolean = false,
+        /** The detach throws this after noting itself (S4 CUT-CC4b). */
+        private val detachFailure: Throwable? = null,
+        /** The assembly's close runs, then this is thrown (S4 CUT-CC4b). */
+        private val closeFailure: Throwable? = null
     ) {
         val readers = mutableListOf<String>()
         var timeEvents = 0
@@ -2906,7 +2915,12 @@ class PremiumAccessTopicSnapshotTest {
         val trace = mutableListOf<String>()
         val reports = mutableListOf<Throwable>()
         val scopeJob = SupervisorJob(processJob)
-        val starter = com.jay.fxi.data.graph.ProcessGraphStarter(r.a, seeds, seed, permitSlot, CoroutineScope(scopeJob + r.main)) { failure ->
+        /** What escaped the starter's scope, as the process's uncaught handler would see it (S4 CUT-CC4b). */
+        val uncaught = mutableListOf<Throwable>()
+        private val handler = kotlinx.coroutines.CoroutineExceptionHandler { _, failure -> uncaught += failure }
+        val starter = com.jay.fxi.data.graph.ProcessGraphStarter(r.a, seeds, seed, permitSlot,
+            CoroutineScope(scopeJob + r.main + (if (captureUncaught) handler else kotlin.coroutines.EmptyCoroutineContext)),
+            closeAssembly = { a -> a.close(); closeFailure?.let { throw it } }) { failure ->
             trace += "report(active=${assemblyActive()})"
             reports += failure
             reportFailure?.let { throw it }
@@ -2917,6 +2931,7 @@ class PremiumAccessTopicSnapshotTest {
                 trace += "detach(active=${assemblyActive()})"
                 if (detachSuspends) { yield(); trace += "detached" }
                 detachGate?.let { it.await(); trace += "detached" }
+                detachFailure?.let { throw it }
             }
         }
 
@@ -3188,6 +3203,189 @@ class PremiumAccessTopicSnapshotTest {
             assertFalse("CC4a-P12 $mode: closed", s.assemblyActive())
             assertNull("CC4a-P12 $mode: never published", s.starter.runtimeReady.value)
             assertEquals("CC4a-P12 $mode: the attempt's failure, once", IOException::class.java, s.reports.single().javaClass)
+        }
+    }
+
+    /**
+     * CC4b-P13 (S4 CUT-CC4b): an Error in the attempt is cleaned up after in full — detach, close — but is not a recoverable
+     * graph failure: it is not reported and it escapes the starter's scope.
+     */
+    @Test
+    fun `CC4b-P13 an Error is cleaned up after, unreported, and rethrown`() = snapshotTest {
+        val error = AssertionError("seed read broke")
+        val s = StarterRig(this, granted(), seedRead = { throw error }, captureUncaught = true)
+        s.starter.start(); runCurrent()
+        assertEquals("CC4b-P13 cleaned up", listOf("detach(active=true)"), s.trace)
+        assertFalse("CC4b-P13 closed", s.assemblyActive())
+        assertTrue("CC4b-P13 not reported", s.reports.isEmpty())
+        assertEquals("CC4b-P13 it escapes", AssertionError::class.java to "seed read broke", s.uncaught.single().let { it.javaClass to it.message })
+        assertNull("CC4b-P13 never published", s.starter.runtimeReady.value)
+    }
+
+    /**
+     * CC4b-D9 (S4 CUT-CC4b, `cut_api_agreed.r3.md` D9): the deliverer follows every setAccess with accessRevised, and the bridge
+     * enqueues a context change for each. With the live state unchanged between them — a loaded 3M key, real disk store and
+     * write ports — a delivery's second notice adds no graph request, no write preparation, no disk read, no disk write and no
+     * recovery budget over the first notice alone.
+     */
+    @Test
+    fun `CC4b-D9 the bridge's second notice of a delivery adds no request, preparation or disk work`() = snapshotTest {
+        val counts = mutableMapOf<String, List<Int>>()
+        for (variant in listOf("setAccess", "setAccess then accessRevised")) {
+            var prepares = 0
+            var writes = 0
+            val store = FileGraphV2DiskStore(folder.newFolder().let { dir -> { dir } }, JsonGraphV2EnvelopeCodec(),
+                DefaultGraphV2AtomicFileIo(), StandardTestDispatcher(testScheduler))
+            val counted = object : GraphV2DiskStore by store {
+                override suspend fun write(ticket: GraphV2WriteTicket, admission: GraphV2IoAdmission): GraphV2WriteReport {
+                    writes++
+                    return store.write(ticket, admission)
+                }
+            }
+            var reads = 0
+            val readCounted = object : GraphV2DiskStore by counted {
+                override suspend fun readGeneral(key: GraphV2GeneralKey, catalog: GraphCatalog?, admission: GraphV2IoAdmission):
+                    GraphV2DiskRead<GraphV2GeneralEnvelope> { reads++; return counted.readGeneral(key, catalog, admission) }
+                override suspend fun write(ticket: GraphV2WriteTicket, admission: GraphV2IoAdmission) = counted.write(ticket, admission)
+            }
+            val ports = GraphV2WritePorts(
+                prepareWrite = { captured, wantsKrx ->
+                    prepares++
+                    val record = AccessEpochRecord(captured.fence.identity.uid, captured.fence.userAccessEpoch,
+                        captured.krxCapabilityEpoch, mayContainPremiumData = true, mayContainKrxData = true)
+                    GraphV2WritePreparation(GraphV2NamespacePreparation.Ready(record),
+                        if (wantsKrx) GraphV2NamespacePreparation.Ready(record) else null)
+                },
+                onPreparationBlocked = {},
+                onWriteDiagnostic = {}
+            )
+            val r = AssemblyRig(this, granted(), cachePorts = { gate -> GraphV2CachePorts(readCounted, gate, onSeedDiagnostic = {}, writePorts = ports) })
+            r.a.start()
+            val issued = r.deliverIssued(); runCurrent()
+            r.a.coordinator.onActivated(KEY_3M); runCurrent()
+            r.sent.single { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
+            r.sent.single { it.kind == "tab" && it.key == KEY_3M }.tab.complete(ok(threeMonthTabAt(r.now()))); runCurrent()
+            settle()
+            assertTrue("CC4b-D9 $variant fixture: the key was written once", writes == 1 && prepares == 1)
+            fun budgets() = (field(r.a.coordinator, "recoveryBudgets") as Map<*, *>).size
+            val before = listOf(r.sent.size, prepares, reads, writes, budgets())
+            r.a.fences.setAccess(true, issued, TopicGrantOrigin.NewContext)
+            if (variant != "setAccess") r.a.fences.accessRevised()
+            runCurrent(); settle()
+            counts[variant] = listOf(r.sent.size, prepares, reads, writes, budgets()).zip(before) { a, b -> a - b }
+            withContext(r.main) { r.a.close() }
+        }
+        assertEquals("CC4b-D9 the second notice adds nothing over the first: [requests, preparations, disk reads, disk writes, recovery budgets]",
+            counts.getValue("setAccess"), counts.getValue("setAccess then accessRevised"))
+    }
+
+    /**
+     * CC4b-B01 (S4 CUT-CC4b): the production builder resolves nothing when constructed and each of its five providers exactly
+     * once inside build(), before the assembly exists. The assembly it builds takes the CC1 use authority the providers hand
+     * it — the very instance — the disk store in its cache ports, the given parent, the permit through the given slot (a read
+     * fails until bound, then answers the bound supplier), the jitter from the seed slot (fails until set, then the scheduler's
+     * per-install jitter) and the given time event. Nothing of it starts.
+     */
+    @Test
+    fun `CC4b-B01 the production builder resolves its providers in build and wires the shared pieces`() = snapshotTest {
+        val h = granted()
+        val resolved = mutableListOf<String>()
+        val disk = FileGraphV2DiskStore(folder.newFolder().let { dir -> { dir } }, JsonGraphV2EnvelopeCodec(),
+            DefaultGraphV2AtomicFileIo(), StandardTestDispatcher(testScheduler))
+        val deletions = DeletionAdmissionStore()
+        val seeds = com.jay.fxi.data.free.InstallSeedSource({ "seed-x" }, StandardTestDispatcher(testScheduler))
+        val authority = SnapshotTopicUseAuthority { h.coordinator.accessSnapshot }
+        val tokens = AuthTokenProvider(object : com.jay.fxi.data.auth.AuthTokenSource {
+            override fun currentIdentity(): com.jay.fxi.data.auth.AuthIdentity = com.jay.fxi.data.auth.AuthIdentity(OWNER, 1)
+            override suspend fun fetchToken(identity: com.jay.fxi.data.auth.AuthIdentity, forceRefresh: Boolean) = "token"
+        }, orders = com.jay.fxi.data.auth.AccessOrderSequence())
+        val api = com.jay.fxi.data.remote.AuthenticatedApiClient(
+            retrofit2.Retrofit.Builder().baseUrl("http://localhost/")
+                .addConverterFactory(com.jay.fxi.di.NetworkModule.provideWireJson().asConverterFactory("application/json".toMediaType()))
+                .build().create(com.jay.fxi.data.remote.AuthenticatedApiService::class.java),
+            com.jay.fxi.data.remote.AuthenticatedTransport(tokens, admitted = { true }),
+            com.jay.fxi.di.NetworkModule.provideWireJson()
+        )
+        fun <T> provider(name: String, value: T) = javax.inject.Provider { resolved += name; value }
+        val builder = com.jay.fxi.data.graph.AppProcessGraphBuilder(
+            provider("disk", disk), provider("deletions", deletions), provider("seeds", seeds), provider("api", api),
+            provider("uses", authority), h.coordinator, tokens
+        )
+        assertTrue("CC4b-B01 constructing it resolves nothing", resolved.isEmpty())
+        val permit = com.jay.fxi.data.graph.LateBound<() -> TopicGraphRecoveryPermit?>("permit")
+        val seed = com.jay.fxi.data.graph.LateBound<String>("seed")
+        var timeEvents = 0
+        val parent = Job(processJob)
+        val parts = builder.build(permit, seed, { timeEvents++ }, parent)
+        assertEquals("CC4b-B01 each provider once, in build", listOf("seeds", "disk", "deletions", "api", "uses"), resolved)
+        val a = parts.assembly
+        assertSame("CC4b-B01 the seed source it resolved", seeds, parts.seeds)
+        assertSame("CC4b-B01 the shared use authority, the very instance", authority, field(a.coordinator, "uses"))
+        assertSame("CC4b-B01 the disk store in the cache ports", disk, (field(a.coordinator, "cachePorts") as GraphV2CachePorts).store)
+        assertTrue("CC4b-B01 a child of the given parent", parent.children.toList().isNotEmpty())
+        @Suppress("UNCHECKED_CAST")
+        val read = field(a.events, "permit") as () -> TopicGraphRecoveryPermit?
+        assertThrows("CC4b-B01 the permit read fails until bound", IllegalStateException::class.java) { read() }
+        val bound = TopicGraphRecoveryPermit(Any(), 1L, checkNotNull(h.coordinator.topicGrantResult().fence), 1L, false, null, null, true)
+        permit.set { bound }
+        assertSame("CC4b-B01 then answers the bound supplier", bound, read())
+        @Suppress("UNCHECKED_CAST")
+        val jitter = field(a.coordinator, "rateLimitJitter") as (String) -> kotlin.time.Duration
+        assertThrows("CC4b-B01 the jitter fails until the seed is set", IllegalStateException::class.java) { jitter("usd") }
+        seed.set("seed-x")
+        assertEquals("CC4b-B01 then the per-install jitter", com.jay.fxi.data.free.FreeSnapshotSchedulePolicy.jitterFor("seed-x", "usd"), jitter("usd"))
+        @Suppress("UNCHECKED_CAST")
+        (field(a.events, "timeEvent") as () -> Unit)()
+        assertEquals("CC4b-B01 the given time event", 1, timeEvents)
+        @Suppress("UNCHECKED_CAST")
+        val admission = field(a.coordinator, "protectedAdmission") as () -> Boolean
+        assertTrue("CC4b-B01 fixture: the live owner is admitted", admission())
+        deletions.begin(AuthIdentityFence(OWNER, 1L), "op-1")
+        assertFalse("CC4b-B01 the admission reads the deletion store it resolved", admission())
+        assertNull("CC4b-B01 nothing started: the coordinator has not run", a.coordinator.state.value.dataScope)
+        a.close()
+
+        // Each provider that throws ends the build before the assembly exists: its failure propagates, the providers after it
+        // are not resolved and no child is left.
+        val order = listOf("seeds", "disk", "deletions", "api", "uses")
+        for (broken in order) {
+            resolved.clear()
+            val failure = IllegalStateException("$broken unavailable")
+            fun <T> maybe(name: String, value: T) = javax.inject.Provider { resolved += name; if (name == broken) throw failure; value }
+            val failing = com.jay.fxi.data.graph.AppProcessGraphBuilder(
+                maybe("disk", disk), maybe("deletions", deletions), maybe("seeds", seeds), maybe("api", api),
+                maybe("uses", authority), h.coordinator, tokens
+            )
+            val failedParent = Job(processJob)
+            val thrown = runCatching {
+                failing.build(com.jay.fxi.data.graph.LateBound("permit"), com.jay.fxi.data.graph.LateBound("seed"), {}, failedParent)
+            }.exceptionOrNull()
+            assertSame("CC4b-B01 $broken: its failure propagates", failure, thrown)
+            assertEquals("CC4b-B01 $broken: resolved up to it, none after", order.subList(0, order.indexOf(broken) + 1), resolved)
+            assertTrue("CC4b-B01 $broken: no assembly child was left", failedParent.children.toList().isEmpty())
+        }
+    }
+
+    /**
+     * CC4b-P14 (S4 CUT-CC4b): a cleanup whose detach throws, or whose close throws, keeps that failure suppressed on the
+     * original one, still runs the rest of the cleanup — a failed detach does not skip the close — and reports the original
+     * failure once.
+     */
+    @Test
+    fun `CC4b-P14 a failed detach or close is kept suppressed and the cleanup goes on`() = snapshotTest {
+        for (step in listOf("detach", "close")) {
+            val broke = IllegalStateException("$step failed")
+            val s = StarterRig(this, granted(), seedRead = { throw IOException("seed failed") },
+                detachFailure = if (step == "detach") broke else null, closeFailure = if (step == "close") broke else null)
+            s.starter.start(); runCurrent()
+            assertEquals("CC4b-P14 $step: detach, then the report after the close",
+                listOf("detach(active=true)", "report(active=false)"), s.trace)
+            assertFalse("CC4b-P14 $step: closed", s.assemblyActive())
+            val reported = s.reports.single()
+            assertEquals("CC4b-P14 $step: the original failure", IOException::class.java, reported.javaClass)
+            assertEquals("CC4b-P14 $step: the cleanup failure suppressed on it", listOf("$step failed"), reported.suppressed.map { it.message })
+            s.starter.abandon(IllegalStateException("later"))
+            assertEquals("CC4b-P14 $step: reported once", 1, s.reports.size)
         }
     }
 
@@ -4384,7 +4582,7 @@ class PremiumAccessTopicSnapshotTest {
 
     /** graphP1d (S4 CUT-P1): dormant - only the assembly constructs the recovery events, and no production code the assembly. */
     @Test
-    fun graphP1d_theRecoveryEventsAreConstructedOnlyByTheDormantAssembly() {
+    fun graphP1d_theRecoveryEventsAreConstructedOnlyByTheAssembly_whichOnlyTheGraphBuilderConstructs() {
         val main = File("src/main/java")
         val all = main.walkTopDown().filter { it.isFile && it.extension == "kt" }
             .associate { it.relativeTo(main).invariantSeparatorsPath to it.readText() }
@@ -4393,8 +4591,10 @@ class PremiumAccessTopicSnapshotTest {
         assertTrue("premise: the scan sees both files", events in all && assembly in all && all.size > 100)
         assertEquals("only the assembly names the recovery events' constructor", setOf(events, assembly),
             all.filter { (_, text) -> Regex("""\bGraphRecoveryEvents\(""").containsMatchIn(text) }.keys)
-        assertEquals("no production code constructs the assembly", setOf(assembly),
-            all.filter { (_, text) -> Regex("""\bGraphRuntimeAssembly\(""").containsMatchIn(text) }.keys)
+        // S4 CUT-CC4b: the process graph builder constructs the assembly, once.
+        val builder = "com/jay/fxi/data/graph/ProcessGraphBuilder.kt"
+        assertEquals("only the graph builder constructs the assembly, once", mapOf(assembly to 1, builder to 1),
+            all.mapValues { (_, text) -> Regex("""\bGraphRuntimeAssembly\(""").findAll(text).count() }.filterValues { it > 0 })
     }
 
     // --- S4 CUT-P2: the issuer's graph write marking (cut_p2_agreed.r2 §1-§2) --------------------------------------------

@@ -53,6 +53,8 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -309,6 +311,86 @@ class TopicRuntimeFactoryTest {
             grants.accessRevised()
             assertTrue("CC4a-RT1 $stage: nothing reached either target", offered.isEmpty() && granted.isEmpty())
         }
+    }
+
+    private fun field(owner: Any, name: String): Any? =
+        owner.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(owner)
+
+    /** A grant sink that notes every call it receives. */
+    private class Grants : TopicGrantSink {
+        val calls = mutableListOf<String>()
+        override fun setAccess(allowed: Boolean, fence: TopicSessionFence?, origin: TopicGrantOrigin) {
+            calls += "set:$allowed:${fence?.grant?.value}"
+        }
+        override fun accessRevised() { calls += "revised" }
+    }
+
+    /**
+     * CC4b-F01 (S4 CUT-CC4b): the factory's four combinations. With the defaults the session's graph sink is the dormant one,
+     * the deliverer's sink is the session and neither connection is installed. A non-dormant graph sink reaches the session
+     * wrapped detachable around it; an extra grant sink becomes the fan-out's second connection, wrapped detachable, after the
+     * session, which is not wrapped. The runtime holds exactly the wrappers it installed.
+     */
+    @Test
+    fun CC4bF01_theFactorysFourCombinations() = runTest {
+        val h = Harness(this)
+        val sink = TopicGraphSink { TopicGraphOffer.ENQUEUED }
+        val extra = Grants()
+        for ((label, args) in listOf<Pair<String, Pair<TopicGraphSink, TopicGrantSink?>>>(
+            "defaults" to (DormantTopicGraphSink to null),
+            "graph sink only" to (sink to null),
+            "extra grant only" to (DormantTopicGraphSink to extra),
+            "both" to (sink to extra)
+        )) {
+            val runtime = if (label == "defaults") h.factory.create() else h.factory.create(args.first, args.second)
+            val session = field(runtime, "session") as TopicSessionCoordinator
+            val inputs = field(runtime, "graphInputs")
+            val grants = field(runtime, "graphGrants")
+            if (args.first === DormantTopicGraphSink) {
+                assertNull("CC4b-F01 $label: no graph input", inputs)
+                assertSame("CC4b-F01 $label: the session's sink is dormant", DormantTopicGraphSink, field(session, "graphSink"))
+            } else {
+                assertTrue("CC4b-F01 $label: a detachable graph input", inputs is DetachableTopicGraphSink)
+                assertSame("CC4b-F01 $label: the session gets the installed wrapper", inputs, field(session, "graphSink"))
+                assertSame("CC4b-F01 $label: around the given sink", sink, field(inputs!!, "target"))
+            }
+            val delivered = field(field(runtime, "deliverer")!!, "sink")
+            if (args.second == null) {
+                assertNull("CC4b-F01 $label: no grant connection", grants)
+                assertSame("CC4b-F01 $label: the deliverer's sink is the session", session, delivered)
+            } else {
+                assertTrue("CC4b-F01 $label: a detachable grant connection", grants is DetachableTopicGrantSink)
+                assertSame("CC4b-F01 $label: around the given sink", extra, field(grants!!, "target"))
+                assertTrue("CC4b-F01 $label: the deliverer fans out", delivered is FanOutTopicGrantSink)
+                assertSame("CC4b-F01 $label: to the session first, unwrapped", session, field(delivered!!, "first"))
+                assertSame("CC4b-F01 $label: then the installed wrapper", grants, field(delivered, "second"))
+            }
+        }
+    }
+
+    /**
+     * CC4b-F02 (S4 CUT-CC4b): a live runtime with an extra grant sink delivers each grant to it after the session; once
+     * detachGraph() completes, a new grant still reaches the session — its permit names the new fence — and nothing reaches
+     * the extra sink.
+     */
+    @Test
+    fun CC4bF02_afterDetachTheSessionKeepsItsGrantsAndTheExtraSinkGetsNone() = runTest {
+        val h = Harness(this)
+        val extra = Grants()
+        val runtime = h.factory.create(DormantTopicGraphSink, extra)
+        runtime.start(); runtime.setOnline(true)
+        advanceTimeBy(5_000)
+        assertTrue("CC4b-F02 fixture: the extra sink got the grant", extra.calls.contains("set:true:1"))
+        assertEquals("CC4b-F02 fixture: the session processed it", F1, runtime.graphRecoveryPermit()?.fence)
+        runtime.detachGraph()
+        val seen = extra.calls.toList()
+        val f2 = TopicSessionFence(F1.identity, F1.userAccessEpoch, TopicGrantToken(2L))
+        h.issuer.grant = f2
+        h.issuer.revisions.value += 1
+        advanceTimeBy(5_000)
+        assertEquals("CC4b-F02 the session still gets its grants", f2, runtime.graphRecoveryPermit()?.fence)
+        assertEquals("CC4b-F02 the extra sink gets nothing more", seen, extra.calls)
+        runtime.stop()
     }
 
     @Test

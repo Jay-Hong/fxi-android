@@ -109,7 +109,15 @@ internal class TopicRuntimeFactory internal constructor(
         lastKnown = lastKnown
     )
 
-    fun create(): TopicRuntime {
+    /**
+     * S4 CUT-CC4b: with the defaults the session's graph sink is [DormantTopicGraphSink], the deliverer's sink is the session
+     * and neither graph connection is installed. A non-dormant [graphSink] reaches the session wrapped detachable; an
+     * [extraGrantSink] is the fan-out's second connection, wrapped detachable, after the session's, which is never wrapped.
+     * The runtime's detachGraph() cuts both.
+     */
+    fun create(graphSink: TopicGraphSink = DormantTopicGraphSink, extraGrantSink: TopicGrantSink? = null): TopicRuntime {
+        val graphInputs = if (graphSink === DormantTopicGraphSink) null else DetachableTopicGraphSink(graphSink)
+        val graphGrants = extraGrantSink?.let { DetachableTopicGrantSink(it) }
         val scope = newScope()
         val floor = newBootstrapFloor(clock)
         val restoreGate = lastKnown?.let { TopicLastKnownRestoreGate(it, authority, liveFence) }
@@ -138,19 +146,20 @@ internal class TopicRuntimeFactory internal constructor(
             offerLive = offerLive,
             onBootstrapHttpEvidence = floor::record,
             bootstrapNotBeforeMillis = floor::notBeforeMillis,
-            onRejected = { owner, rejected -> deliverer.forwardRejection(owner, rejected) }
+            onRejected = { owner, rejected -> deliverer.forwardRejection(owner, rejected) },
+            graphSink = graphInputs ?: DormantTopicGraphSink
         )
         val dispatcher = scope.coroutineContext[ContinuationInterceptor] as CoroutineDispatcher
         deliverer = TopicGrantDeliverer(
             issuer = issuer,
-            sink = session,
+            sink = graphGrants?.let { FanOutTopicGrantSink(session, it) } ?: session,
             fences = fences,
             scope = scope,
             clock = clock,
             deliveryDispatcher = dispatcher
         )
         val focus = TopicFocusProvider(scope, fences, liveFence, tabs, session::setFocus)
-        return TopicRuntime(scope, session, deliverer, focus, recoveries)
+        return TopicRuntime(scope, session, deliverer, focus, recoveries, graphInputs, graphGrants)
     }
 }
 
@@ -172,7 +181,7 @@ internal class TopicRuntime internal constructor(
     private val deliverer: TopicGrantDeliverer,
     private val focusProvider: TopicFocusProvider,
     private val recoveries: AuthCredentialRecoveryStream,
-    /** S4 CUT-CC4a: the session's graph input and the graph's grant delivery as installed, each detachable; none until CC4b. */
+    /** S4 CUT-CC4a: the session's graph input and the graph's grant delivery as installed, each detachable; null when none. */
     private val graphInputs: DetachableTopicGraphSink? = null,
     private val graphGrants: DetachableTopicGrantSink? = null
 ) {

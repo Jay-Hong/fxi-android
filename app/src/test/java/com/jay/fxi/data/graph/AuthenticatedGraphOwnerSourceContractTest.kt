@@ -243,7 +243,10 @@ class AuthenticatedGraphOwnerSourceContractTest {
             path in all && all.size > 100 && all.keys.any { it.startsWith("benchmark/") })
         val name = Regex("""\bAuthenticatedGraphOwnerSource\b""")
         val referencing = all.filter { (p, text) -> p != path && name.containsMatchIn(text) }.keys
-        assertEquals("no other production file names it", emptySet<String>(), referencing)
+        // S4 CUT-CC4b: the process graph builder constructs it once, inside build().
+        val builder = "main/java/com/jay/fxi/data/graph/ProcessGraphBuilder.kt"
+        assertEquals("no other production file names it but the graph builder", setOf(builder), referencing)
+        assertEquals("the graph builder constructs it once", 1, Regex("""\bAuthenticatedGraphOwnerSource\(""").findAll(all.getValue(builder)).count())
         val code = all.getValue(path).replace(Regex("""/\*[\s\S]*?\*/"""), "").replace(Regex("""//[^\n]*"""), "")
         assertEquals("its own file only declares it: no factory, typealias or construction", 1, name.findAll(code).count())
         // A trip-wire over regex-stripped text, not a Kotlin parser. Comment markers inside strings can hide code;

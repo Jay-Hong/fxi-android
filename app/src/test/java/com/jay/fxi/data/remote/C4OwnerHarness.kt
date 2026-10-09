@@ -15,6 +15,7 @@ import com.jay.fxi.data.entitlements.TopicGrantIssuer
 import com.jay.fxi.data.entitlements.TopicGrantResult
 import com.jay.fxi.data.entitlements.TopicRejectionLedger
 import com.jay.fxi.data.entitlements.TopicRejectionReservation
+import com.jay.fxi.data.graph.ProcessGraphBuilder
 import com.jay.fxi.data.local.FreeTabStore
 import com.jay.fxi.data.local.RateRowPreferenceStore
 import com.jay.fxi.data.local.TopicLastKnownStore
@@ -67,8 +68,12 @@ internal class ManualMain : CoroutineDispatcher() {
     private val executing = ThreadLocal.withInitial { false }
     val isExecuting: Boolean get() = executing.get()
 
+    /** Called on every dispatch, synchronously, before the task is queued: a probe at the dispatching call (S4 CUT-CC4b). */
+    var onDispatch: (() -> Unit)? = null
+
     override fun dispatch(context: CoroutineContext, block: Runnable) {
         dispatched += 1
+        onDispatch?.invoke()
         queue.addLast(block)
     }
 
@@ -224,7 +229,18 @@ internal class C4OwnerHarness(
     issuer: TopicGrantIssuer? = null,
     authority: TopicUseAuthority? = null,
     /** The first runtime creation throws, as a failing owner start would. */
-    failFirstCreate: Boolean = false
+    failFirstCreate: Boolean = false,
+    /** S4 CUT-CC4b: the owner's process graph builder; none by default, as before the graph was wired. */
+    graphBuilder: ProcessGraphBuilder? = null,
+    /** S4 CUT-CC4b: where the owner reports a graph failure. */
+    reportGraph: (Throwable) -> Unit = {},
+    /** S4 CUT-CC4b: identity forwarding's registration throws, a topic failure after the runtime exists. */
+    failFenceObserve: Boolean = false,
+    /**
+     * S4 CUT-CC4b: the process's foreground at registration, which the stream delivers then, as its contract now says; null
+     * keeps the older fake, which delivers nothing until told.
+     */
+    initialForeground: Boolean? = null
 ) {
     companion object {
         const val URL = "http://localhost/ws"
@@ -279,6 +295,11 @@ internal class C4OwnerHarness(
     var bootstrapOutcome: (String) -> TopicSnapshotOutcome = { TopicSnapshotOutcome.Degraded }
     /** Bootstraps of these topics park on their gate before answering. */
     val bootstrapGates = mutableMapOf<String, CompletableDeferred<Unit>>()
+    /** The use authority the factory shares; the graph's must be this one too (S4 CUT-CC4b). */
+    val authority: TopicUseAuthority = authority ?: object : TopicUseAuthority {
+        override fun acquire(fence: TopicSessionFence) = TopicUseLifetime(fence.grant, 0L)
+        override fun admits(lifetime: TopicUseLifetime) = true
+    }
     private var ids = 0
     private var createFailures = if (failFirstCreate) 1 else 0
     private val clock = object : TopicCommandClock {
@@ -313,10 +334,7 @@ internal class C4OwnerHarness(
             override suspend fun recordRejectionEvidence(credential: AuthSnapshot) = Unit
         },
         orders = AccessOrderSequence(),
-        authority = authority ?: object : TopicUseAuthority {
-            override fun acquire(fence: TopicSessionFence) = TopicUseLifetime(fence.grant, 0L)
-            override fun admits(lifetime: TopicUseLifetime) = true
-        },
+        authority = this.authority,
         clock = clock,
         newBootstrapFloor = {
             object : TopicBootstrapFloor {
@@ -340,14 +358,16 @@ internal class C4OwnerHarness(
     val owner = TopicRuntimeOwner(
         factory = factory,
         online = this.online,
-        foreground = TopicForegroundStream { foregroundObservers += it },
-        fences = fences.stream,
+        foreground = TopicForegroundStream { observer -> foregroundObservers += observer; initialForeground?.let(observer) },
+        fences = if (failFenceObserve) AuthFenceStream { throw IllegalStateException("identity forwarding failed") } else fences.stream,
         liveIdentity = {
             consumerIdentityReadsOnMain += main.isExecuting
             this.live
         },
         rowPreferenceStore = prefs,
-        main = CoroutineScope(SupervisorJob() + main)
+        main = CoroutineScope(SupervisorJob() + main),
+        graphBuilder = graphBuilder,
+        reportGraph = reportGraph
     )
 
     /** The platform reporting the process coming to (true) or leaving (false) the foreground. */

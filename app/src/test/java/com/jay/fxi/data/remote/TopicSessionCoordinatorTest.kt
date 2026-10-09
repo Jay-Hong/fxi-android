@@ -16561,7 +16561,7 @@ class TopicSessionCoordinatorTest {
         h.cleanUp()
     }
 
-    /** CC2b-B09: nothing in production reads the permit beyond the runtime handing it through (CC4 wires it). */
+    /** CC2b-B09: nothing in production reads the permit beyond the runtime handing it through and, from CC4b, the owner binding it. */
     @Test
     fun `CC2b-B09 no production code reads the permit yet`() {
         val main = File("src/main/java")
@@ -16571,12 +16571,13 @@ class TopicSessionCoordinatorTest {
             }.map { file.name to it.trim() }
         }.toList()
         assertEquals(
-            "CC2b-B09 only the runtime's two hand-throughs",
+            "CC2b-B09 only the runtime's two hand-throughs and the owner's binding",
             listOf(
                 "TopicRuntime.kt" to "internal val graphRecoveryPermit: () -> TopicGraphRecoveryPermit? = session.recoveryPermit",
-                "TopicRuntime.kt" to "internal val graphRecoveryPermitRevisions: StateFlow<Long> = session.recoveryPermitRevisions"
+                "TopicRuntime.kt" to "internal val graphRecoveryPermitRevisions: StateFlow<Long> = session.recoveryPermitRevisions",
+                "TopicRuntimeOwner.kt" to "starter?.bindRuntime(runtime.graphRecoveryPermit, runtime.graphRecoveryPermitRevisions, runtime::detachGraph)"
             ),
-            hits
+            hits.sortedWith(compareBy({ it.first }, { it.second }))
         )
     }
 

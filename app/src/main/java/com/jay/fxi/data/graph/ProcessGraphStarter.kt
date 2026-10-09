@@ -7,6 +7,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -44,12 +45,12 @@ internal class LateBound<T : Any>(private val name: String) {
  * seed, a cancellation check, the assembly's start, then on Main without a
  * suspension the initial hand-over — the last process foreground to the recovery events, the permit to both consumers, a
  * collector notifying both on every observed publication — and only then publishes [runtimeReady]. Any failure from the
- * seed to that publication, or an [abandon] before it, detaches the graph from the runtime, ends the collector, closes the
- * assembly and waits for it, all non-cancellably on Main, then reports once; [runtimeReady] stays null for good. A
- * cancellation runs the same cleanup and is not reported, even one before the attempt's first dispatch with the seed already
- * in memory. A failed report does not escape. An [abandon] while that cleanup runs returns only once it is done, even when its
- * caller is cancelled. Migration
- * readiness is not marked here (CC5).
+ * seed to that publication, or an [abandon] before it, detaches the graph from the runtime, ends the collector and waits for
+ * it, closes the assembly and waits for it, all non-cancellably on Main, then reports an Exception once; [runtimeReady] stays
+ * null for good. A cancellation runs the same cleanup, is not reported and is rethrown, even one before the attempt's first
+ * dispatch with the seed already in memory; an Error is cleaned up after, not reported and rethrown (S4 CUT-CC4b). A failed
+ * report does not escape. An [abandon] while that cleanup runs returns only once it is done, even when its caller is
+ * cancelled. Migration readiness is not marked here (CC5).
  */
 internal class ProcessGraphStarter(
     private val assembly: GraphRuntimeAssembly,
@@ -57,6 +58,8 @@ internal class ProcessGraphStarter(
     private val seed: LateBound<String>,
     private val permit: LateBound<() -> TopicGraphRecoveryPermit?>,
     private val scope: CoroutineScope,
+    /** How the assembly is closed in the cleanup; its close() unless a test injects a failure (S4 CUT-CC4b). */
+    private val closeAssembly: suspend (GraphRuntimeAssembly) -> Unit = { it.close() },
     private val report: (Throwable) -> Unit
 ) {
     private val ready = MutableStateFlow<GraphRuntimeAssembly?>(null)
@@ -106,13 +109,17 @@ internal class ProcessGraphStarter(
                 ready.value = assembly
             } catch (failure: Throwable) {
                 cleanUp(failure)
-                if (failure is CancellationException) throw failure
+                // Cleaned up either way; only an Exception other than a cancellation is a recoverable graph failure.
+                if (failure is CancellationException || failure !is Exception) throw failure
             }
         }
     }
 
-    /** A failure on the owner's side before [start] ran its course: the same cleanup and report, once. */
-    suspend fun abandon(cause: Throwable) {
+    /**
+     * A failure on the owner's side before [start] ran its course: the same cleanup, and the report once unless [report] is
+     * false — a topic failure the owner rethrows is not a graph failure (S4 CUT-CC4b).
+     */
+    suspend fun abandon(cause: Throwable, report: Boolean = true) {
         if (ready.value != null) return
         if (finished) {
             // Not even the caller's cancellation lets it return before the cleanup under way has closed and reported.
@@ -120,7 +127,7 @@ internal class ProcessGraphStarter(
             return
         }
         attempt?.cancel()
-        cleanUp(cause)
+        cleanUp(cause, report)
     }
 
     private fun notifyPermit() {
@@ -128,16 +135,16 @@ internal class ProcessGraphStarter(
         assembly.coordinator.onRecoveryPermitChanged()
     }
 
-    private suspend fun cleanUp(failure: Throwable) {
+    private suspend fun cleanUp(failure: Throwable, reportFailure: Boolean = true) {
         if (finished) return
         finished = true
         try {
             withContext(NonCancellable) {
                 detach?.let { cut -> runCatching { cut() }.exceptionOrNull()?.let { failure.addSuppressed(it) } }
-                collector?.cancel()
-                runCatching { assembly.close() }.exceptionOrNull()?.let { failure.addSuppressed(it) }
+                collector?.cancelAndJoin()
+                runCatching { closeAssembly(assembly) }.exceptionOrNull()?.let { failure.addSuppressed(it) }
             }
-            if (failure !is CancellationException) runCatching { report(failure) }
+            if (reportFailure && failure is Exception && failure !is CancellationException) runCatching { report(failure) }
         } finally {
             cleaned.complete(Unit)
         }

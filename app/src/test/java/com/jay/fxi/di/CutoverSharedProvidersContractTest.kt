@@ -564,10 +564,10 @@ class CutoverSharedProvidersContractTest {
         assertTrue("premise: the scan reaches the benchmark source set", all.keys.any { it.startsWith("benchmark/") })
         val allowed = mapOf(
             "DeletionAdmissionStore" to setOf(main("data/entitlements/DeletionAdmissionStore.kt"), main("data/graph/GraphProtectedAdmission.kt"), graphModule,
-                main("ui/settings/SettingsViewModel.kt")),
+                main("ui/settings/SettingsViewModel.kt"), main("data/graph/ProcessGraphBuilder.kt")),
             "GraphSelectionStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/graph/GraphSeriesSelectionSession.kt"), graphModule),
             "BackupableUserIntentStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt"), graphModule),
-            "FileGraphV2DiskStore" to setOf(main("data/graph/GraphV2DiskStore.kt"), graphModule)
+            "FileGraphV2DiskStore" to setOf(main("data/graph/GraphV2DiskStore.kt"), graphModule, main("data/graph/ProcessGraphBuilder.kt"))
         )
         for ((type, files) in allowed) {
             assertEquals("only the allowed files name $type", files,
@@ -578,10 +578,10 @@ class CutoverSharedProvidersContractTest {
         // parameter or its provider needs, so a further field, parameter, Provider or resolution in that file shows up.
         val counts = mapOf(
             "DeletionAdmissionStore" to mapOf(main("data/entitlements/DeletionAdmissionStore.kt") to 1, main("data/graph/GraphProtectedAdmission.kt") to 2, graphModule to 3,
-                main("ui/settings/SettingsViewModel.kt") to 4),
+                main("ui/settings/SettingsViewModel.kt") to 4, main("data/graph/ProcessGraphBuilder.kt") to 2),
             "GraphSelectionStore" to mapOf(main("data/graph/GraphSeriesSelectionSession.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 2, graphModule to 2),
             "BackupableUserIntentStore" to mapOf(main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 1, graphModule to 2),
-            "FileGraphV2DiskStore" to mapOf(main("data/graph/GraphV2DiskStore.kt") to 1, graphModule to 4)
+            "FileGraphV2DiskStore" to mapOf(main("data/graph/GraphV2DiskStore.kt") to 1, graphModule to 4, main("data/graph/ProcessGraphBuilder.kt") to 1)
         )
         for ((type, expected) in counts) {
             assertEquals("$type is named exactly where and as often as allowed", expected,
@@ -597,9 +597,11 @@ class CutoverSharedProvidersContractTest {
                 Regex("""(?<!class )\b(DeletionAdmissionStore|BackupableUserIntentStore|FileGraphV2DiskStore)\s*\(""").findAll(text).count()
             }.filterValues { it > 0 })
         // The dormant classes that take them are constructed nowhere in production, their own files included, and carry no binding.
+        // S4 CUT-CC4b: the process graph builder constructs the admission and the cache ports, once each, inside build().
         for (type in listOf("GraphProtectedAdmission", "GraphSeriesSelectionSession", "GraphSelectionPurgeAdapter", "GraphV2CachePorts", "GraphV2PurgeAdapter")) {
-            val constructing = stripped.filter { (_, text) -> Regex("""(?<!class )\b$type\s*\(""").containsMatchIn(text) }.keys
-            assertEquals("$type is constructed nowhere in production", emptySet<String>(), constructing)
+            val expected = if (type == "GraphProtectedAdmission" || type == "GraphV2CachePorts") mapOf(main("data/graph/ProcessGraphBuilder.kt") to 1) else emptyMap()
+            assertEquals("$type is constructed only where CC4b builds the graph", expected,
+                stripped.mapValues { (_, text) -> Regex("""(?<!class )\b$type\s*\(""").findAll(text).count() }.filterValues { it > 0 })
         }
         for (path in listOf("data/graph/GraphProtectedAdmission.kt", "data/graph/GraphSeriesSelectionSession.kt",
                 "data/entitlements/purge/GraphSelectionPurgeAdapter.kt", "data/entitlements/DeletionAdmissionStore.kt", "data/graph/GraphV2DiskStore.kt",

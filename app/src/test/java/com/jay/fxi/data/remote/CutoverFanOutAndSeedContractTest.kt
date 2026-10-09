@@ -367,9 +367,12 @@ class CutoverFanOutAndSeedContractTest {
         assertTrue("premise: the scan sees the files", fanOut in all && seed in all && module in all && all.size > 100)
         assertTrue("premise: the scan reaches the benchmark source set", all.keys.any { it.startsWith("benchmark/") })
         assertTrue("premise: the scan skips the test source sets", all.keys.none { it.startsWith("test/") || it.startsWith("androidTest/") })
+        // S4 CUT-CC4b: the factory builds the fan-out once, over the session and the detachable graph grant connection.
+        val factoryFile = "main/java/com/jay/fxi/data/remote/TopicRuntime.kt"
+        assertEquals("the factory names FanOutTopicGrantSink once", mapOf(fanOut to 1, factoryFile to 1),
+            code.mapValues { (_, text) -> Regex("""\bFanOutTopicGrantSink\b""").findAll(text).count() }.filterValues { it > 0 })
+        assertTrue("the factory fans out to the session, then the graph", Regex("""FanOutTopicGrantSink\(session, it\)""").containsMatchIn(code.getValue(factoryFile)))
         for ((path, name) in listOf(fanOut to "FanOutTopicGrantSink")) {
-            assertEquals("only its own file names $name", setOf(path),
-                code.filter { (_, text) -> Regex("""\b$name\b""").containsMatchIn(text) }.keys)
             val text = code.getValue(path)
             assertEquals("$path: $name is named only by its declaration", 1, Regex("""\b$name\b""").findAll(text).count())
             assertTrue("$path: declares $name", Regex("""\bclass\s+$name\s*\(""").containsMatchIn(text))
@@ -377,13 +380,18 @@ class CutoverFanOutAndSeedContractTest {
         }
         val seedModule = "main/java/com/jay/fxi/di/InstallSeedModule.kt"
         val prefetch = "main/java/com/jay/fxi/data/free/InstallSeedPrefetch.kt"
-        // S4 CUT-CC4a: the dormant graph starter reads the seed; nothing in production constructs the starter yet (CC4b).
+        // S4 CUT-CC4a: the graph starter reads the seed. S4 CUT-CC4b: the graph builder resolves it for the starter, and the owner
+        // constructs the starter, once.
         val starter = "main/java/com/jay/fxi/data/graph/ProcessGraphStarter.kt"
-        assertEquals("the seed is named by its declaration, its module, the prefetch, the scheduler module and the graph starter only",
-            setOf(seed, seedModule, prefetch, module, starter),
+        val builder = "main/java/com/jay/fxi/data/graph/ProcessGraphBuilder.kt"
+        val owner = "main/java/com/jay/fxi/data/remote/TopicRuntimeOwner.kt"
+        assertEquals("the seed is named by its declaration, its module, the prefetch, the scheduler module, the graph starter and builder only",
+            setOf(seed, seedModule, prefetch, module, starter, builder),
             code.filter { (_, t) -> Regex("""\bInstallSeedSource\b""").containsMatchIn(t) }.keys)
-        assertEquals("CC4a: only its own file names ProcessGraphStarter", setOf(starter),
+        assertEquals("CC4b: only the starter's file and the owner name ProcessGraphStarter", setOf(starter, owner),
             code.filter { (_, t) -> Regex("""\bProcessGraphStarter\b""").containsMatchIn(t) }.keys)
+        assertEquals("CC4b: ProcessGraphStarter is declared in its file and constructed once by the owner", mapOf(starter to 1, owner to 1),
+            code.mapValues { (_, t) -> Regex("""\bProcessGraphStarter\(""").findAll(t).count() }.filterValues { it > 0 })
         val seedText = code.getValue(seed)
         assertEquals("$seed names its class only in its declaration", 1, Regex("""\bInstallSeedSource\b""").findAll(seedText).count())
         assertFalse("$seed carries no DI annotation", Regex("""@(?:[A-Za-z_][\w.]*\.)?(Inject|AssistedInject|Singleton|Module|Provides|Binds|InstallIn|EntryPoint)\b""").containsMatchIn(seedText))

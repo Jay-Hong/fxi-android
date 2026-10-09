@@ -116,9 +116,12 @@ class IssuerGraphWritePreparationContractTest {
         assertTrue("premise: the scan sees both files", adapter in all && issuer in all && all.size > 100)
         assertTrue("premise: the issuer declares it", Regex("""fun markGraphData\(""").containsMatchIn(all.getValue(issuer)))
         val code = all.mapValues { (_, text) -> text.replace(Regex("""/\*[\s\S]*?\*/"""), "").replace(Regex("""//[^\n]*"""), "") }
-        assertEquals("only the adapter names its class, constructor references included", setOf(adapter),
-            code.filter { (_, text) -> Regex("""\bIssuerGraphWritePreparation\b""").containsMatchIn(text) }.keys)
-        assertEquals("only the issuer's declaration names the marking", mapOf(issuer to 1),
+        // S4 CUT-CC4b: the process graph builder constructs it once, over the issuer's marking, inside build().
+        val builder = "com/jay/fxi/data/graph/ProcessGraphBuilder.kt"
+        assertEquals("only the adapter and the graph builder name its class", mapOf(adapter to 1, builder to 1),
+            code.mapValues { (_, text) -> Regex("""\bIssuerGraphWritePreparation\b""").findAll(text).count() }.filterValues { it > 0 })
+        assertEquals("the issuer's declaration and the builder's one reference name the marking", mapOf(issuer to 1, builder to 1),
             code.mapValues { (_, text) -> Regex("""\bmarkGraphData\b""").findAll(text).count() }.filterValues { it > 0 })
+        assertTrue("the builder hands it the issuer's marking", Regex("""IssuerGraphWritePreparation\(coordinator::markGraphData\)""").containsMatchIn(code.getValue(builder)))
     }
 }
