@@ -6,6 +6,7 @@ import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.HttpExchangeEvidence
+import com.jay.fxi.data.graph.GraphDataScope
 import com.jay.fxi.data.local.TopicLastKnownRestore
 import com.jay.fxi.data.remote.dto.DxySpotEntry
 import com.jay.fxi.data.remote.dto.DxyTopicMessage
@@ -38,6 +39,7 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -328,6 +330,13 @@ private sealed interface SessionInput {
 
     /** The token provider saw the signed-in identity acquire a usable credential again after a failure (L-4e E6b). */
     data class CredentialRecovered(val recovery: AuthCredentialRecovery) : SessionInput
+
+    /** S4 CUT-CC2a: a topic graph-loss retirement, answered on the loop; its retirement collections are copies it owns. */
+    class GraphLossPurge(
+        val selects: (GraphDataScope) -> Boolean,
+        val retirement: GraphLossRetirement,
+        val reply: CompletableDeferred<Boolean>
+    ) : SessionInput
 
     data object Stop : SessionInput
 }
@@ -676,7 +685,18 @@ class TopicSessionCoordinator(
             manual?.targets.isNullOrEmpty()
     }
 
-    private val inputs = Channel<SessionInput>(Channel.UNLIMITED)
+    /**
+     * A retirement the loop never handles is answered false here, from whatever context undelivers it: one still queued when
+     * the loop's ending cancels the channel, or one taken off it while the loop was being cancelled. Nothing else is done
+     * there (S4 CUT-CC2a).
+     */
+    private val inputs = Channel<SessionInput>(
+        capacity = Channel.UNLIMITED,
+        onUndeliveredElement = { input -> if (input is SessionInput.GraphLossPurge) input.reply.complete(false) }
+    )
+
+    /** Raised as the loop body's first statement, never lowered: a body that never ran has no `finally` to answer from. */
+    @Volatile private var purgeOpen = false
 
     private val _rates = MutableStateFlow(TopicRates())
     private var liveRates = TopicRates()
@@ -685,6 +705,8 @@ class TopicSessionCoordinator(
     val rates: StateFlow<TopicRates> = _rates.asStateFlow()
 
     private val _graphLoss = MutableStateFlow<TopicGraphLoss?>(null)
+    /** Read and written only on the session's serial scope. Before any purge it holds exactly the former cumulative view. */
+    private val graphLossLedger = TopicGraphLossLedger()
     private var graphSequence = 0L
     private var graphAuthority: TopicGraphAuthority? = null
     private var graphAuthorityHasEnded = false
@@ -864,14 +886,21 @@ class TopicSessionCoordinator(
         if (loop != null) return
         loop = scope.launch {
             try {
+                purgeOpen = true
                 for (input in inputs) handle(input)
             } finally {
                 // Reached when the scope is cancelled too. Cancelling the socket alone was not
                 // enough: the store went on reading as confirmed on a connection that no longer
                 // existed, which is the thing `end` exists to prevent. Found by review.
                 stopped = true
-                shutDown()
-                publishDisplay()
+                try {
+                    shutDown()
+                    publishDisplay()
+                } finally {
+                    // Every ending cancels the queue, not only Stop's close: each input still in it goes to the undelivered
+                    // handler, which answers a retirement false, and a later post is refused instead of held (S4 CUT-CC2a).
+                    inputs.cancel()
+                }
             }
         }
     }
@@ -942,6 +971,24 @@ class TopicSessionCoordinator(
 
     fun stop() = post(SessionInput.Stop)
 
+    /**
+     * S4 CUT-CC2a: retires topic graph losses on the session loop and answers whether records were removed; false can still mean
+     * boundaries were installed or raised. A selector exception or a retirement the ledger rejects completes the answer with that
+     * same exception and changes nothing. Before the loop body runs, after it ends, or when the request cannot be delivered, it
+     * answers false without touching the ledger. The caller's own cancellation stays the caller's; a request already accepted
+     * may still run. [selects] must return promptly and must not mutate the ledger or re-enter it, and the loop's own turn must
+     * not wait for this answer. Dormant: no production caller until P3-i registers the topic purger.
+     */
+    internal suspend fun purgeGraphLoss(selects: (GraphDataScope) -> Boolean, retirement: GraphLossRetirement): Boolean {
+        val request = SessionInput.GraphLossPurge(
+            selects,
+            GraphLossRetirement(retirement.retiredScopes.toSet(), retirement.endedUseFloors.toMap()),
+            CompletableDeferred()
+        )
+        if (!purgeOpen || inputs.trySend(request).isFailure) return false
+        return request.reply.await()
+    }
+
     private fun post(input: SessionInput) {
         inputs.trySend(input)
     }
@@ -949,7 +996,11 @@ class TopicSessionCoordinator(
     // ---- the loop -------------------------------------------------------------------------
 
     private suspend fun handle(input: SessionInput) {
-        if (stopped) return
+        if (stopped) {
+            // Drained after Stop: answered, not dropped, so no caller waits on a loop that has ended.
+            if (input is SessionInput.GraphLossPurge) input.reply.complete(false)
+            return
+        }
         // Publish each loop turn only after all of its synchronous work has finished.
         // This also keeps a new Access owner from carrying the old prices and topic facts.
         displayPublicationDeferred = true
@@ -1352,6 +1403,8 @@ class TopicSessionCoordinator(
             }
 
             is SessionInput.RetryTopics -> retryTopicsOnLoop(input.owner, input.tab)
+
+            is SessionInput.GraphLossPurge -> purgeGraphLossOnLoop(input)
 
             SessionInput.Stop -> {
                 // A flag, not only a cancellation. `Job.cancel()` takes effect at the next
@@ -1995,6 +2048,21 @@ class TopicSessionCoordinator(
         offerGraphInput(TopicGraphInput.Observations(++graphSequence, topic, path, attribution, connectionGeneration, candidates))
     }
 
+    /**
+     * The ledger's own all-or-nothing purge, then the view it leaves (S4 CUT-CC2a). A selector exception or a rejected
+     * retirement goes back to the caller and leaves the session running; the ledger has changed nothing.
+     */
+    private fun purgeGraphLossOnLoop(input: SessionInput.GraphLossPurge) {
+        val removed = try {
+            graphLossLedger.purge(input.selects, input.retirement)
+        } catch (failure: Throwable) {
+            input.reply.completeExceptionally(failure)
+            return
+        }
+        _graphLoss.value = graphLossLedger.view
+        input.reply.complete(removed)
+    }
+
     /** Only the sink call is guarded: hand-over failure never decides price processing. */
     private fun offerGraphInput(input: TopicGraphInput) {
         val offer = try {
@@ -2007,35 +2075,9 @@ class TopicSessionCoordinator(
         when (offer) {
             TopicGraphOffer.ENQUEUED, TopicGraphOffer.DORMANT -> Unit
             TopicGraphOffer.FULL, TopicGraphOffer.CLOSED, TopicGraphOffer.FAILED -> {
-                val occurredAt = wallClock()
-                val topics: Set<String>
-                val paths: Set<TopicGraphPath>
-                val authorityKey: TopicGraphAuthorityKey
-                when (input) {
-                    is TopicGraphInput.Observations -> {
-                        topics = setOf(input.topic)
-                        paths = setOf(input.path)
-                        authorityKey = TopicGraphAuthorityKey(input.attribution.owner, input.attribution.grantEpoch)
-                    }
-                    is TopicGraphInput.Continuity -> {
-                        topics = input.topics
-                        paths = input.paths
-                        authorityKey = TopicGraphAuthorityKey(input.authority.owner, input.authority.grantEpoch)
-                    }
-                }
-                val held = _graphLoss.value
-                _graphLoss.value = TopicGraphLoss(
-                    revision = (held?.revision ?: 0L) + 1L,
-                    count = (held?.count ?: 0L) + 1L,
-                    firstSequence = held?.firstSequence ?: input.sequence,
-                    lastSequence = input.sequence,
-                    reasons = (held?.reasons ?: emptySet()) + offer,
-                    topics = (held?.topics ?: emptySet()) + topics,
-                    paths = (held?.paths ?: emptySet()) + paths,
-                    firstOccurredAtEpochMillis = held?.firstOccurredAtEpochMillis ?: occurredAt,
-                    lastOccurredAtEpochMillis = occurredAt,
-                    authorities = (held?.authorities ?: emptySet()) + authorityKey
-                )
+                // S4 CUT-CC2a: before any purge every loss here is recorded — sequences only rise — so the view is the
+                // former cumulative one, field for field.
+                if (graphLossLedger.record(input, offer, wallClock())) _graphLoss.value = graphLossLedger.view
             }
         }
     }

@@ -68,10 +68,19 @@ import com.jay.fxi.data.graph.GraphDataScope
 import com.jay.fxi.data.graph.GraphRecorderTopicSink
 import com.jay.fxi.data.graph.GraphTopicInputConsumer
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CopyableThrowable
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import java.io.File
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -176,7 +185,9 @@ class TopicSessionCoordinatorTest {
          * G2A/G2B: answer every bootstrap nobody staged with a delivery that carries no usable price, instead of a failure. Since 2b-1 a
          * REST failure is a continuity fact, and the grant's own bootstraps would put one per topic into every continuity trace.
          */
-        inert: Boolean = false
+        inert: Boolean = false,
+        /** S4 CUT-CC2a: the session's own scope, for a test that cancels it or watches it fail; `runTest`'s background scope otherwise. */
+        sessionScope: CoroutineScope? = null
     ) {
         val scheduler = test.testScheduler
         /**
@@ -189,7 +200,7 @@ class TopicSessionCoordinatorTest {
          * `advanceTimeBy`, which does run background work; `advanceUntilIdle` would not, and that
          * is the trap recorded for this repo. Patch from review.
          */
-        val scope = test.backgroundScope
+        val scope = sessionScope ?: test.backgroundScope
         val store = TopicSubscriptionStateStore()
         /** Every wait asked for, which is how a command's deadline windows are seen from here. */
         val sleeps = mutableListOf<Duration>()
@@ -15555,6 +15566,785 @@ class TopicSessionCoordinatorTest {
         )
         assertEquals("B07c no loss for the session", held, h.coordinator.graphLoss.value)
         m.same("and none in the ledger")
+        h.cleanUp()
+    }
+
+    // ---- S4 CUT-CC2a: the session's graph-loss ledger and its purge input (`cut_cc2_agreed.r2.md` §2, §4) -----------------
+
+    /**
+     * CC2a A01's independent reference: the session's former cumulative graphLoss, re-derived here without the ledger. It
+     * answers as [script] decides and folds exactly what the session hands over, at the session's wall clock; a null answer
+     * stands for a thrown Exception, which the session records as FAILED.
+     */
+    private class LegacyLossFold(private val h: Harness, g: GraphRecorder) {
+        var view: TopicGraphLoss? = null
+        var script: (TopicGraphInput) -> TopicGraphOffer? = { TopicGraphOffer.ENQUEUED }
+
+        init {
+            g.answer = { input ->
+                val offer = script(input)
+                val lost = offer ?: TopicGraphOffer.FAILED
+                if (lost == TopicGraphOffer.FULL || lost == TopicGraphOffer.CLOSED || lost == TopicGraphOffer.FAILED) {
+                    fold(input, lost, h.wallMillis)
+                }
+                offer ?: throw IllegalStateException("sink")
+            }
+        }
+
+        private fun fold(input: TopicGraphInput, offer: TopicGraphOffer, at: Long) {
+            val topics: Set<String>
+            val paths: Set<TopicGraphPath>
+            val authority: TopicGraphAuthorityKey
+            when (input) {
+                is TopicGraphInput.Observations -> {
+                    topics = setOf(input.topic)
+                    paths = setOf(input.path)
+                    authority = TopicGraphAuthorityKey(input.attribution.owner, input.attribution.grantEpoch)
+                }
+                is TopicGraphInput.Continuity -> {
+                    topics = input.topics.toSet()
+                    paths = input.paths.toSet()
+                    authority = TopicGraphAuthorityKey(input.authority.owner, input.authority.grantEpoch)
+                }
+            }
+            val held = view
+            view = TopicGraphLoss(
+                revision = (held?.revision ?: 0L) + 1L,
+                count = (held?.count ?: 0L) + 1L,
+                firstSequence = held?.firstSequence ?: input.sequence,
+                lastSequence = input.sequence,
+                reasons = (held?.reasons ?: emptySet()) + offer,
+                topics = (held?.topics ?: emptySet()) + topics,
+                paths = (held?.paths ?: emptySet()) + paths,
+                firstOccurredAtEpochMillis = held?.firstOccurredAtEpochMillis ?: at,
+                lastOccurredAtEpochMillis = at,
+                authorities = (held?.authorities ?: emptySet()) + authority
+            )
+        }
+    }
+
+    /** A selector failure that keeps its identity across the coroutine boundary (no stack-trace copy). */
+    private class SelectorFailure : RuntimeException("selector"), CopyableThrowable<SelectorFailure> {
+        override fun createCopy(): SelectorFailure? = null
+    }
+
+    /** The same, as an Error rather than an Exception. */
+    private class SelectorError : Error("selector"), CopyableThrowable<SelectorError> {
+        override fun createCopy(): SelectorError? = null
+    }
+
+    /**
+     * A session scope of the test's own, on the test scheduler, whose failures are collected instead of failing the test. A
+     * child of `runTest`'s background scope, so a failed assertion cannot leave its keep-alive scheduling for ever; cancelling
+     * it leaves the background scope alive.
+     */
+    private class OwnScope(test: TestScope) {
+        val caught = mutableListOf<Throwable>()
+        val scope = CoroutineScope(
+            SupervisorJob(test.backgroundScope.coroutineContext[Job]) + StandardTestDispatcher(test.testScheduler) +
+                CoroutineExceptionHandler { _, failure -> caught += failure }
+        )
+    }
+
+    private val cc2Scope1 = GraphDataScope("u1", "epoch-1")
+    private val cc2Scope2 = GraphDataScope("u1", "epoch-2")
+
+    /**
+     * Calls the purge as a caller outside the session would: from `runTest`'s background scope, past its enqueue before this
+     * returns. The answer is the call's Result, so a refusal is read rather than failing the background scope.
+     */
+    private fun TestScope.purge(
+        h: Harness,
+        selects: (GraphDataScope) -> Boolean,
+        retirement: GraphLossRetirement
+    ): Deferred<Result<Boolean>> =
+        backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { runCatching { h.coordinator.purgeGraphLoss(selects, retirement) } }
+
+    /** The purge's answer, which must already be in: a pending one fails here instead of waiting on later timers. */
+    private fun Deferred<Result<Boolean>>.answered(label: String): Result<Boolean> {
+        assertTrue("$label: answered", isCompleted)
+        return getCompleted()
+    }
+
+    private fun inputsOf(h: Harness): Channel<*> {
+        val field = TopicSessionCoordinator::class.java.getDeclaredField("inputs").apply { isAccessible = true }
+        return field.get(h.coordinator) as Channel<*>
+    }
+
+    /** The session's real input channel: closed and holding nothing. */
+    @OptIn(DelicateCoroutinesApi::class)
+    private fun closedAndEmpty(h: Harness): Boolean = inputsOf(h).isClosedForReceive
+
+    /** The session's real input channel: open and holding nothing (an element handed to a waiting receiver is not held). */
+    private fun openAndEmpty(h: Harness): Boolean = inputsOf(h).isEmpty
+
+    /** A loss for every price handed over; nothing else is lost. */
+    private fun lossesForPrices(g: GraphRecorder) {
+        g.answer = { if (it is TopicGraphInput.Observations) TopicGraphOffer.FULL else TopicGraphOffer.ENQUEUED }
+    }
+
+    /**
+     * CC2a-A01: before any purge the session's graphLoss is the former cumulative view after every step — twelve seeded traces
+     * of FULL, CLOSED, FAILED (a thrown Exception), ENQUEUED and DORMANT answers to single prices and two-price batches, at
+     * wall clocks that go back between recorded losses, with a grant move whose continuity inputs are answered the same way.
+     * The coverage flags count only answers drawn while that trace is being compared.
+     */
+    @Test
+    fun `CC2a-A01 before any purge graphLoss is the former cumulative view after every step`() = runTest {
+        val answers = listOf<TopicGraphOffer?>(
+            TopicGraphOffer.ENQUEUED, TopicGraphOffer.DORMANT, TopicGraphOffer.FULL, TopicGraphOffer.CLOSED, TopicGraphOffer.FAILED, null
+        )
+        val drawn = mutableSetOf<TopicGraphOffer?>()
+        var continuityLost = false
+        var lossClockWentBack = false
+        for (seed in 0 until 12) {
+            // Each trace on a scope of its own: cleaning up the shared background scope would stop every later trace.
+            val own = OwnScope(this)
+            val h = Harness(this, inert = true, desired = setOf(TETHER, USD), sessionScope = own.scope)
+            val g = continuityLive(h)
+            val fold = LegacyLossFold(h, g)
+            val random = java.util.Random(seed.toLong())
+            var comparing = true
+            fold.script = { input ->
+                answers[random.nextInt(answers.size)].also {
+                    if (comparing) {
+                        drawn += it
+                        if (input is TopicGraphInput.Continuity && it != TopicGraphOffer.ENQUEUED && it != TopicGraphOffer.DORMANT) {
+                            continuityLost = true
+                        }
+                    }
+                }
+            }
+            var previous: TopicGraphLoss? = null
+            fun same(step: String) {
+                assertEquals("CC2a-A01 seed $seed $step", fold.view, h.coordinator.graphLoss.value)
+                val now = fold.view
+                val before = previous
+                if (now != null && before != null && now.revision > before.revision &&
+                    now.lastOccurredAtEpochMillis < before.lastOccurredAtEpochMillis
+                ) {
+                    lossClockWentBack = true
+                }
+                previous = now
+            }
+            same("before anything")
+            for (step in 0 until 10) {
+                h.wallMillis = 10_000L + random.nextInt(40_000)
+                val rate = 1390.0 + step
+                val entries = if (random.nextBoolean()) {
+                    listOf(gEntry("upbit", "usdt-krw", rate, gT2))
+                } else {
+                    listOf(gEntry("upbit", "usdt-krw", rate, gT2), gEntry("bithumb", "usdt-krw", rate, gT2))
+                }
+                h.wire.deliver(gTether(entries))
+                advanceTimeBy(1)
+                same("step $step")
+                if (step == 5) {
+                    h.setAccess(true, fence(grant = 2L, epoch = "epoch-2"))
+                    advanceTimeBy(5_000)
+                    h.wire.open()
+                    advanceTimeBy(1)
+                    same("after the grant moved")
+                }
+            }
+            comparing = false
+            assertEquals("CC2a-A01 seed $seed fixture: the session did not fail", emptyList<Throwable>(), own.caught)
+            h.cleanUp()
+        }
+        assertEquals("CC2a-A01 fixture: every answer was drawn", answers.toSet(), drawn)
+        assertTrue("CC2a-A01 fixture: a continuity input was lost too", continuityLost)
+        assertTrue("CC2a-A01 fixture: a recorded loss came at an earlier wall clock than the one before", lossClockWentBack)
+    }
+
+    /** CC2a-A02: an ENQUEUED or a DORMANT answer leaves graphLoss the very same publication. */
+    @Test
+    fun `CC2a-A02 an ENQUEUED or DORMANT answer leaves graphLoss unchanged`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val held = checkNotNull(h.coordinator.graphLoss.value) { "CC2a-A02 fixture: a loss" }
+        for (answer in listOf(TopicGraphOffer.ENQUEUED, TopicGraphOffer.DORMANT)) {
+            val handed = g.observations.size
+            g.answer = { answer }
+            h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+            advanceTimeBy(1)
+            assertEquals("CC2a-A02 fixture: $answer was handed over", handed + 1, g.observations.size)
+            assertSame("CC2a-A02 $answer", held, h.coordinator.graphLoss.value)
+        }
+        h.cleanUp()
+    }
+
+    /** CC2a-A03: a purge runs on the loop, not in the caller, and answers with what it removed and leaves the remaining view. */
+    @Test
+    fun `CC2a-A03 a purge runs on the loop and leaves the remaining view`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        assertEquals("CC2a-A03 fixture: one loss", 1L, checkNotNull(h.coordinator.graphLoss.value).count)
+
+        val offered = mutableListOf<GraphDataScope>()
+        val answer = purge(h, { offered += it; it == cc2Scope1 }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        assertTrue("CC2a-A03 nothing ran in the caller", offered.isEmpty() && !answer.isCompleted)
+        advanceTimeBy(1)
+        assertEquals("CC2a-A03 records were removed", true, answer.answered("CC2a-A03").getOrThrow())
+        assertEquals("CC2a-A03 the held scope was offered once", listOf(cc2Scope1), offered)
+        assertNull("CC2a-A03 nothing remains", h.coordinator.graphLoss.value)
+        h.cleanUp()
+    }
+
+    /**
+     * CC2a-A03 (order): the loop publishes the view before it answers — a caller resumed inside the answer already reads it —
+     * and publishes it itself: with a caller that never resumes, the view is still published.
+     */
+    @Test
+    fun `CC2a-A03 the loop publishes the view before it answers, without the caller`() = runTest {
+        // Two sessions in one test, each on a scope of its own: cleaning up the shared background scope would stop the second.
+        val own = OwnScope(this)
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD), sessionScope = own.scope)
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val seenAtAnswer = backgroundScope.async(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+            h.coordinator.purgeGraphLoss({ it == cc2Scope1 }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+            h.coordinator.graphLoss.value
+        }
+        advanceTimeBy(1)
+        assertTrue("CC2a-A03 fixture: answered", seenAtAnswer.isCompleted)
+        assertNull("CC2a-A03 the view was published before the answer", seenAtAnswer.getCompleted())
+        h.cleanUp()
+
+        val own2 = OwnScope(this)
+        val h2 = Harness(this, inert = true, desired = setOf(TETHER, USD), sessionScope = own2.scope)
+        val g2 = continuityLive(h2)
+        lossesForPrices(g2)
+        h2.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val parked = CoroutineScope(StandardTestDispatcher(TestCoroutineScheduler())).async(start = CoroutineStart.UNDISPATCHED) {
+            h2.coordinator.purgeGraphLoss({ it == cc2Scope1 }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        }
+        advanceTimeBy(1)
+        assertTrue("CC2a-A03 fixture: the caller never resumed", !parked.isCompleted)
+        assertNull("CC2a-A03 the loop published the view itself", h2.coordinator.graphLoss.value)
+        parked.cancel()
+        assertEquals("CC2a-A03 fixture: neither session failed", emptyList<Throwable>(), own.caught + own2.caught)
+        h2.cleanUp()
+    }
+
+    /**
+     * CC2a-A04: a selector exception reaches the caller as the same object and a retirement the ledger rejects as the ledger's
+     * own IllegalArgumentException; neither changes records, boundaries or the revision, and the next purge still runs.
+     */
+    @Test
+    fun `CC2a-A04 a failed purge reaches the caller and changes nothing, and the next one runs`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val held = checkNotNull(h.coordinator.graphLoss.value)
+
+        val failure = SelectorFailure()
+        val thrown = purge(h, { throw failure }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        advanceTimeBy(1)
+        assertSame("CC2a-A04 the selector's own exception", failure, thrown.answered("CC2a-A04 selector").exceptionOrNull())
+        assertSame("CC2a-A04 nothing changed by the selector failure", held, h.coordinator.graphLoss.value)
+
+        val refused = purge(h, { false }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        advanceTimeBy(1)
+        val refusal = refused.answered("CC2a-A04 refusal").exceptionOrNull()
+        // Stack-trace recovery may hand back a copy whose cause is the original; read the original.
+        val original = refusal?.cause?.takeIf { it.javaClass == refusal.javaClass && it.message == refusal.message } ?: refusal
+        assertTrue("CC2a-A04 the ledger's refusal", original is IllegalArgumentException)
+        assertEquals("CC2a-A04 as the ledger worded it", "A retirement names an unselected scope", original?.message)
+        assertNull("CC2a-A04 not wrapped", original?.cause)
+        assertSame("CC2a-A04 nothing changed by the refusal", held, h.coordinator.graphLoss.value)
+
+        // Neither installed a boundary: a later loss in that scope is still recorded, one revision on.
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+        val later = checkNotNull(h.coordinator.graphLoss.value)
+        assertEquals("CC2a-A04 no boundary was installed", held.count + 1, later.count)
+        assertEquals("CC2a-A04 nor was the revision moved", held.revision + 1, later.revision)
+
+        val next = purge(h, { it == cc2Scope1 }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        advanceTimeBy(1)
+        assertEquals("CC2a-A04 the next purge runs", true, next.answered("CC2a-A04 next").getOrThrow())
+        assertNull("CC2a-A04 and removes", h.coordinator.graphLoss.value)
+        h.cleanUp()
+    }
+
+    /** CC2a-A04 (Error): a selector that throws an Error is answered with it like any failure, and the session goes on. */
+    @Test
+    fun `CC2a-A04 a selector Error is answered like any failure and the session goes on`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD), sessionScope = own.scope)
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val held = checkNotNull(h.coordinator.graphLoss.value)
+        val error = SelectorError()
+        val thrown = purge(h, { throw error }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        advanceTimeBy(1)
+        assertSame("CC2a-A04 the selector's own Error", error, thrown.answered("CC2a-A04 Error").exceptionOrNull())
+        assertEquals("CC2a-A04 the session did not fail", emptyList<Throwable>(), own.caught)
+        assertSame("CC2a-A04 nothing changed", held, h.coordinator.graphLoss.value)
+        val next = purge(h, { it == cc2Scope1 }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        advanceTimeBy(1)
+        assertEquals("CC2a-A04 the next purge runs", true, next.answered("CC2a-A04 next").getOrThrow())
+        own.scope.cancel()
+    }
+
+    /** CC2a-A05: after the loop stopped a purge answers false at once, never asks the selector, and leaves graphLoss. */
+    @Test
+    fun `CC2a-A05 after the loop stopped a purge answers false and touches nothing`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        h.coordinator.stop()
+        advanceTimeBy(1)
+        val held = checkNotNull(h.coordinator.graphLoss.value)
+        var asked = false
+        val answer = purge(h, { asked = true; true }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        assertEquals("CC2a-A05 false at once", false, answer.answered("CC2a-A05").getOrThrow())
+        assertTrue("CC2a-A05 the selector was not asked", !asked)
+        assertSame("CC2a-A05 nothing changed", held, h.coordinator.graphLoss.value)
+        h.cleanUp()
+    }
+
+    /**
+     * CC2a-A06: no production code refers to the purge yet — no call and no function reference; P3-i registers the topic
+     * purger. The name occurs once in production sources, at its declaration.
+     */
+    @Test
+    fun `CC2a-A06 no production code refers to the purge`() {
+        val main = File("src/main/java")
+        val hits = main.walkTopDown().filter { it.isFile && (it.extension == "kt" || it.extension == "java") }.flatMap { file ->
+            file.readLines().filter { Regex("""\bpurgeGraphLoss\b""").containsMatchIn(it) }.map { file.name to it.trim() }
+        }.toList()
+        assertEquals("CC2a-A06 one occurrence in production code", 1, hits.size)
+        assertEquals("CC2a-A06 in the session", "TopicSessionCoordinator.kt", hits.single().first)
+        assertTrue("CC2a-A06 and it is the declaration", hits.single().second.startsWith("internal suspend fun purgeGraphLoss("))
+    }
+
+    /** CC2a-A07: a sink that throws an Exception loses the whole batch as one FAILED loss (a cancellation is B07c). */
+    @Test
+    fun `CC2a-A07 a sink exception loses the whole batch as one FAILED loss`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        g.answer = { if (it is TopicGraphInput.Observations) throw IllegalStateException("sink") else TopicGraphOffer.ENQUEUED }
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1), gEntry("bithumb", "usdt-krw", 1391.0, gT1))))
+        advanceTimeBy(1)
+        val loss = checkNotNull(h.coordinator.graphLoss.value)
+        assertEquals("CC2a-A07 one loss for the batch", 1L, loss.count)
+        assertEquals("CC2a-A07 lost as FAILED", setOf(TopicGraphOffer.FAILED), loss.reasons)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1392.0, gT2))))
+        advanceTimeBy(1)
+        assertEquals("CC2a-A07 the next batch is the next loss", 2L, checkNotNull(h.coordinator.graphLoss.value).count)
+        h.cleanUp()
+    }
+
+    /**
+     * CC2a-A08 (retirement): only the selected scope's records go — another scope's and the unscoped bucket stay — and a later
+     * loss in the retired scope is refused. The selector is offered each scope that holds losses, never the unscoped bucket.
+     */
+    @Test
+    fun `CC2a-A08 a retirement removes only its scope and refuses that scope's later losses`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        lossesForPrices(g)
+        h.coordinator.start()
+        h.setAccess(true, fence(grant = 2L, epoch = "epoch-2"))
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val unscoped = TopicSessionFence(AuthIdentityFence("u1", 1L), null, TopicGrantToken(3L))
+        h.setAccess(true, unscoped)
+        advanceTimeBy(5_000)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT1))))
+        advanceTimeBy(1)
+        h.setAccess(true, fence(grant = 4L))
+        advanceTimeBy(5_000)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1392.0, gT1))))
+        advanceTimeBy(1)
+        assertEquals("CC2a-A08 fixture: three losses", 3L, checkNotNull(h.coordinator.graphLoss.value).count)
+
+        val offered = mutableListOf<GraphDataScope>()
+        val answer = purge(h, { offered += it; it == cc2Scope1 }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        advanceTimeBy(1)
+        assertEquals("CC2a-A08 removed", true, answer.answered("CC2a-A08").getOrThrow())
+        assertEquals("CC2a-A08 offered each scope holding losses", setOf(cc2Scope1, cc2Scope2), offered.toSet())
+        val left = checkNotNull(h.coordinator.graphLoss.value)
+        assertEquals("CC2a-A08 two remain", 2L, left.count)
+        assertEquals(
+            "CC2a-A08 the other scope and the unscoped bucket remain",
+            setOf<String?>("epoch-2", null),
+            left.authorities.map { it.owner?.userAccessEpoch }.toSet()
+        )
+
+        val handed = g.observations.size
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1393.0, gT2))))
+        advanceTimeBy(1)
+        assertEquals("CC2a-A08 fixture: the late price was handed over", handed + 1, g.observations.size)
+        assertSame("CC2a-A08 the retired scope's later loss is refused", left, h.coordinator.graphLoss.value)
+        h.cleanUp()
+    }
+
+    /**
+     * CC2a-A08 (floor) and A09 (continuation): an ended-use floor removes the scope's older use and refuses its late losses,
+     * while a fresh use of the same epoch is recorded again; after the full removal the view is null, and the next accepted
+     * loss continues the revision and starts at the handed input's own sequence.
+     */
+    @Test
+    fun `CC2a-A08 a floor admits a fresh use of the same epoch, and A09 the next loss continues the revision`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val before = checkNotNull(h.coordinator.graphLoss.value)
+
+        val answer = purge(h, { it == cc2Scope1 }, GraphLossRetirement(endedUseFloors = mapOf(cc2Scope1 to 1L)))
+        advanceTimeBy(1)
+        assertEquals("CC2a-A08 the older use was removed", true, answer.answered("CC2a-A08").getOrThrow())
+        assertNull("CC2a-A09 the full removal leaves no view", h.coordinator.graphLoss.value)
+
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+        assertNull("CC2a-A08 a late loss of the older use is refused", h.coordinator.graphLoss.value)
+
+        h.authority = object : TopicUseAuthority {
+            override fun acquire(fence: TopicSessionFence) = TopicUseLifetime(fence.grant, 1L)
+            override fun admits(lifetime: TopicUseLifetime) = true
+        }
+        h.wire.drop()
+        advanceTimeBy(5_000)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1392.0, gT2))))
+        advanceTimeBy(1)
+        val fresh = checkNotNull(h.coordinator.graphLoss.value) { "CC2a-A08 a fresh use of the same epoch is recorded" }
+        val handed = g.observations.last()
+        assertEquals("CC2a-A08 fixture: under the fresh use", 1L, handed.attribution.lifetime.invalidations)
+        assertEquals("CC2a-A08 one loss", 1L, fresh.count)
+        assertEquals("CC2a-A09 the revision continues past the removal", before.revision + 2, fresh.revision)
+        assertEquals("CC2a-A09 the view starts at the handed input", handed.sequence, fresh.firstSequence)
+        h.cleanUp()
+    }
+
+    /** CC2a-A09 (boundary only): a purge that removes nothing answers false, yet its boundary refuses the scope's later losses. */
+    @Test
+    fun `CC2a-A09 a boundary-only purge answers false and still refuses later losses`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        val answer = purge(h, { it == cc2Scope1 }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        advanceTimeBy(1)
+        assertEquals("CC2a-A09 nothing removed", false, answer.answered("CC2a-A09").getOrThrow())
+        val handed = g.observations.size
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        assertEquals("CC2a-A09 fixture: the price was handed over", handed + 1, g.observations.size)
+        assertNull("CC2a-A09 the boundary refused it", h.coordinator.graphLoss.value)
+        h.cleanUp()
+    }
+
+    /**
+     * CC2a-A10: before the loop body has run — not started, started on a cancelled scope, cancelled before the body ran, or
+     * started with the body not yet dispatched — a purge answers false at once and leaves nothing queued: a loop that runs
+     * afterwards never asks its selector.
+     */
+    @Test
+    fun `CC2a-A10 a purge before the loop body runs answers false at once and leaves nothing queued`() = runTest {
+        var asked = 0
+        val retire = GraphLossRetirement(retiredScopes = setOf(cc2Scope1))
+
+        val notStarted = Harness(this, sessionScope = OwnScope(this).scope)
+        val a = purge(notStarted, { asked++; true }, retire)
+        assertEquals("CC2a-A10 not started: false at once", false, a.answered("CC2a-A10 not started").getOrThrow())
+        assertTrue("CC2a-A10 not started: nothing queued", openAndEmpty(notStarted))
+        notStarted.coordinator.start()
+        advanceTimeBy(1)
+
+        val cancelledFirst = OwnScope(this)
+        val b = Harness(this, sessionScope = cancelledFirst.scope)
+        cancelledFirst.scope.cancel()
+        b.coordinator.start()
+        advanceTimeBy(1)
+        val bAnswer = purge(b, { asked++; true }, retire)
+        assertEquals("CC2a-A10 started on a cancelled scope: false at once", false, bAnswer.answered("CC2a-A10 cancelled scope").getOrThrow())
+        assertTrue("CC2a-A10 started on a cancelled scope: nothing queued", openAndEmpty(b))
+
+        val cancelledBeforeBody = OwnScope(this)
+        val c = Harness(this, sessionScope = cancelledBeforeBody.scope)
+        c.coordinator.start()
+        cancelledBeforeBody.scope.cancel()
+        advanceTimeBy(1)
+        val cAnswer = purge(c, { asked++; true }, retire)
+        assertEquals("CC2a-A10 cancelled before the body ran: false at once", false, cAnswer.answered("CC2a-A10 cancelled before body").getOrThrow())
+        assertTrue("CC2a-A10 cancelled before the body ran: nothing queued", openAndEmpty(c))
+
+        val notYetDispatched = OwnScope(this)
+        val d = Harness(this, sessionScope = notYetDispatched.scope)
+        d.coordinator.start()
+        val dAnswer = purge(d, { asked++; true }, retire)
+        assertEquals("CC2a-A10 body not yet dispatched: false at once", false, dAnswer.answered("CC2a-A10 not dispatched").getOrThrow())
+        assertTrue("CC2a-A10 body not yet dispatched: nothing queued", openAndEmpty(d))
+        advanceTimeBy(1)
+
+        assertEquals("CC2a-A10 no loop ever asked the selector", 0, asked)
+        notStarted.cleanUp()
+        d.cleanUp()
+    }
+
+    /**
+     * CC2a-A10 (open from the body's first statement): on a loop whose body is running but has handled no input yet, a purge
+     * is accepted and run — its selector is asked — not refused at the door.
+     */
+    @Test
+    fun `CC2a-A10 a purge on a started loop that has handled nothing yet is run`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, sessionScope = own.scope)
+        h.coordinator.start()
+        advanceTimeBy(1)
+        var asked = 0
+        val answer = purge(h, { asked++; it == cc2Scope1 }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        assertTrue("CC2a-A10 fixture: accepted and pending", !answer.isCompleted)
+        advanceTimeBy(1)
+        assertEquals("CC2a-A10 run: nothing held, so nothing removed", false, answer.answered("CC2a-A10 idle loop").getOrThrow())
+        assertEquals("CC2a-A10 its selector was asked", 1, asked)
+        own.scope.cancel()
+    }
+
+    /**
+     * CC2a-A10 (Stop): a purge queued ahead of Stop runs; one queued behind it, before Stop is handled, is answered false on
+     * the drained loop without asking the selector; and after the loop ended the channel is closed and empty (A12).
+     */
+    @Test
+    fun `CC2a-A10 a purge queued behind Stop is answered false and one ahead of it runs`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        var askedBehind = false
+        val ahead = purge(h, { it == cc2Scope1 }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        h.coordinator.stop()
+        val behind = purge(h, { askedBehind = true; true }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        assertTrue("CC2a-A10 fixture: both were queued", !ahead.isCompleted && !behind.isCompleted)
+        advanceTimeBy(1)
+        assertEquals("CC2a-A10 ahead of Stop it ran", true, ahead.answered("CC2a-A10 ahead").getOrThrow())
+        assertEquals("CC2a-A10 behind Stop: false", false, behind.answered("CC2a-A10 behind").getOrThrow())
+        assertTrue("CC2a-A10 behind Stop: the selector was not asked", !askedBehind)
+        assertTrue("CC2a-A12 after Stop the channel is closed and empty", closedAndEmpty(h))
+        h.cleanUp()
+    }
+
+    /**
+     * CC2a-A10 (dispatch failure) and A12: a purge accepted behind an input whose handling throws, with an ordinary input
+     * queued after it, is answered false when the loop ends, without asking the selector; the only failure is the turn's own;
+     * the channel is then closed and empty, and stays so after a later post.
+     */
+    @Test
+    fun `CC2a-A10 a purge queued behind a failing turn is answered false and the channel stays closed`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD), sessionScope = own.scope)
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val held = checkNotNull(h.coordinator.graphLoss.value)
+        val boom = IllegalStateException("turn")
+        h.coordinator.runIfStillOwned(g.observations.last().attribution) { throw boom }
+        var asked = false
+        val answer = purge(h, { asked = true; true }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        h.coordinator.setOnline(false)
+        assertTrue("CC2a-A10 fixture: accepted and pending", !answer.isCompleted)
+        advanceTimeBy(1)
+        assertEquals("CC2a-A10 the only failure is the turn's own", listOf<Throwable>(boom), own.caught)
+        assertEquals("CC2a-A10 false", false, answer.answered("CC2a-A10 failing turn").getOrThrow())
+        assertTrue("CC2a-A10 the selector was not asked", !asked)
+        assertSame("CC2a-A10 nothing changed", held, h.coordinator.graphLoss.value)
+        assertTrue("CC2a-A12 closed and empty after the failure", closedAndEmpty(h))
+        h.coordinator.setOnline(true)
+        assertTrue("CC2a-A12 a later post is not held", closedAndEmpty(h))
+        val after = purge(h, { asked = true; true }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        assertEquals("CC2a-A12 a later purge: false at once", false, after.answered("CC2a-A12 later").getOrThrow())
+        own.scope.cancel()
+    }
+
+    /**
+     * CC2a-A10 (the ending's own shutdown throws): a purge accepted behind a failing turn is still answered false when the
+     * loop's own `shutDown` throws — here the sink cancels the hand-over's end — and the channel is closed and empty.
+     */
+    @Test
+    fun `CC2a-A10 a purge is answered even when the ending's shutdown throws`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD), sessionScope = own.scope)
+        val g = continuityLive(h)
+        g.answer = {
+            when {
+                it is TopicGraphInput.Observations -> TopicGraphOffer.FULL
+                it is TopicGraphInput.Continuity && it.kind == TopicGraphEventKind.HANDOVER_ENDED ->
+                    throw kotlinx.coroutines.CancellationException("sink")
+                else -> TopicGraphOffer.ENQUEUED
+            }
+        }
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        h.coordinator.runIfStillOwned(g.observations.last().attribution) { throw IllegalStateException("turn") }
+        var asked = false
+        val answer = purge(h, { asked = true; true }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        assertTrue("CC2a-A10 fixture: accepted and pending", !answer.isCompleted)
+        advanceTimeBy(1)
+        assertTrue(
+            "CC2a-A10 fixture: the ending's shutdown reached the sink",
+            g.inputs.any { it is TopicGraphInput.Continuity && it.kind == TopicGraphEventKind.HANDOVER_ENDED }
+        )
+        assertEquals("CC2a-A10 false", false, answer.answered("CC2a-A10 shutdown throws").getOrThrow())
+        assertTrue("CC2a-A10 the selector was not asked", !asked)
+        assertTrue("CC2a-A12 closed and empty", closedAndEmpty(h))
+        own.scope.cancel()
+    }
+
+    /**
+     * CC2a-A12 (still queued): on a loop that has already handled input, a purge accepted behind an input the waiting loop
+     * was resumed with, and ahead of another ordinary input, is answered false by the ending's cancel of the channel when the
+     * session scope is cancelled before the loop runs again; nothing fails, and the channel is closed and empty afterwards,
+     * staying so after a later post.
+     */
+    @Test
+    fun `CC2a-A12 a purge still queued when the scope is cancelled is answered false`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, sessionScope = own.scope)
+        h.coordinator.start()
+        h.coordinator.setOnline(true)
+        advanceTimeBy(1)
+        h.coordinator.setOnline(false)
+        var asked = false
+        val answer = purge(h, { asked = true; true }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        h.coordinator.setOnline(true)
+        assertTrue("CC2a-A12 fixture: accepted and pending", !answer.isCompleted)
+        assertTrue("CC2a-A12 fixture: held in the channel", !openAndEmpty(h))
+        own.scope.cancel()
+        advanceTimeBy(1)
+        assertEquals("CC2a-A12 false", false, answer.answered("CC2a-A12 still queued").getOrThrow())
+        assertTrue("CC2a-A12 the selector was not asked", !asked)
+        assertEquals("CC2a-A12 nothing failed", emptyList<Throwable>(), own.caught)
+        assertTrue("CC2a-A12 closed and empty after the cancellation", closedAndEmpty(h))
+        h.coordinator.setOnline(false)
+        assertTrue("CC2a-A12 a later post is not held", closedAndEmpty(h))
+    }
+
+    /**
+     * CC2a-A12 (taken by the waiting loop): on a loop that has already handled input, a purge handed straight to the loop's
+     * suspended `hasNext` — accepted, and held nowhere in the channel — is answered false as undelivered when the session
+     * scope is cancelled before the loop resumes, without the selector and without any failure.
+     */
+    @Test
+    fun `CC2a-A12 a purge handed to the waiting loop before a cancellation is answered false`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, sessionScope = own.scope)
+        h.coordinator.start()
+        h.coordinator.setOnline(true)
+        advanceTimeBy(1)
+        var asked = false
+        val answer = purge(h, { asked = true; true }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        assertTrue("CC2a-A12 fixture: accepted and pending", !answer.isCompleted)
+        assertTrue("CC2a-A12 fixture: handed to the waiting loop, not held", openAndEmpty(h))
+        own.scope.cancel()
+        advanceTimeBy(1)
+        assertEquals("CC2a-A12 false", false, answer.answered("CC2a-A12 handed").getOrThrow())
+        assertTrue("CC2a-A12 the selector was not asked", !asked)
+        assertEquals("CC2a-A12 nothing failed", emptyList<Throwable>(), own.caught)
+    }
+
+    /**
+     * CC2a-A12 (settled once): purges answered by the loop — one with a result, one with a selector failure — are answered
+     * before the ending and keep those answers through it; each selector ran once.
+     */
+    @Test
+    fun `CC2a-A12 an answered purge keeps its answer through the ending`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD), sessionScope = own.scope)
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        var asked = 0
+        val answer = purge(h, { asked++; it == cc2Scope1 }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        var failedAsked = 0
+        val failure = SelectorFailure()
+        val failed = purge(h, { failedAsked++; throw failure }, GraphLossRetirement(retiredScopes = setOf(cc2Scope2)))
+        advanceTimeBy(1)
+        assertTrue("CC2a-A12 both were answered by the loop, before the ending", answer.isCompleted && failed.isCompleted)
+        own.scope.cancel()
+        advanceTimeBy(1)
+        assertEquals("CC2a-A12 the answer stands", true, answer.answered("CC2a-A12 answer").getOrThrow())
+        assertSame("CC2a-A12 the failure stands", failure, failed.answered("CC2a-A12 failure").exceptionOrNull())
+        assertEquals("CC2a-A12 each selector ran once", listOf(1, 1), listOf(asked, failedAsked))
+    }
+
+    /**
+     * CC2a-A11: the request owns copies of the retirement's collections — clearing the caller's scopes or lowering its floor
+     * after the call changes nothing — and a caller that stops waiting gets no answer of its own and does not end the session.
+     */
+    @Test
+    fun `CC2a-A11 the request owns its retirement, and a caller that stops waiting does not end the session`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = continuityLive(h)
+        lossesForPrices(g)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val floors = mutableMapOf(cc2Scope1 to 1L)
+        val byFloor = purge(h, { it == cc2Scope1 }, GraphLossRetirement(endedUseFloors = floors))
+        floors[cc2Scope1] = 0L
+        advanceTimeBy(1)
+        assertEquals("CC2a-A11 the floor given at the call applied", true, byFloor.answered("CC2a-A11 floor").getOrThrow())
+
+        h.authority = object : TopicUseAuthority {
+            override fun acquire(fence: TopicSessionFence) = TopicUseLifetime(fence.grant, 1L)
+            override fun admits(lifetime: TopicUseLifetime) = true
+        }
+        h.wire.drop()
+        advanceTimeBy(5_000)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+        assertEquals("CC2a-A11 fixture: a loss under the fresh use", 1L, checkNotNull(h.coordinator.graphLoss.value).count)
+        val scopes = mutableSetOf(cc2Scope1)
+        val byScope = purge(h, { it == cc2Scope1 }, GraphLossRetirement(retiredScopes = scopes))
+        scopes.clear()
+        advanceTimeBy(1)
+        assertEquals("CC2a-A11 the scopes given at the call applied", true, byScope.answered("CC2a-A11 scopes").getOrThrow())
+
+        var returned: Boolean? = null
+        val waiting = backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            returned = h.coordinator.purgeGraphLoss({ it == cc2Scope2 }, GraphLossRetirement(retiredScopes = setOf(cc2Scope2)))
+        }
+        waiting.cancel()
+        val handed = g.observations.size
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1392.0, gT2))))
+        advanceTimeBy(1)
+        assertTrue("CC2a-A11 the cancelled caller finished", waiting.isCompleted)
+        assertNull("CC2a-A11 and got no answer of its own", returned)
+        assertEquals("CC2a-A11 the session still handles input", handed + 1, g.observations.size)
         h.cleanUp()
     }
 
