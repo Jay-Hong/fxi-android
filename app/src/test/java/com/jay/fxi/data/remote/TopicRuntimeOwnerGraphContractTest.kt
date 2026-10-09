@@ -135,10 +135,47 @@ class TopicRuntimeOwnerGraphContractTest {
                 rateLimitJitter = { seed.require(); Duration.ZERO },
                 onEventFailure = { eventFailures += it },
                 recoveryPermit = { permit.require()() },
-                timeEvent = { timeEvents++; timeEvent() }
+                timeEvent = { timeEvents++; timeEvent() }.also { timeEventHandedOver = timeEvent }
             )
             assembly = built
-            ProcessGraphParts(built, seeds)
+            ProcessGraphParts(built, seeds) { tab, display, focus, scope ->
+                holderArgs += Triple(display, focus, scope)
+                holderFailure?.let { (failing, failure) -> if (failing == tab) throw failure }
+                val session = com.jay.fxi.data.graph.GraphSeriesSelectionSession(
+                    selections, com.jay.fxi.data.local.GraphSelectionAudience.PREMIUM, tab, scope, h.main)
+                com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder(
+                    tab, built.coordinator, session, { h.live }, display, focus, built.fences.current, h.authority, built.gate,
+                    h.fakeIssuer.revisions, scope, h.main, recorder = built.recorder
+                ).also { holders += it }
+            }
+        }
+
+        /** What each holder build was handed: display, focus, scope. */
+        val holderArgs = mutableListOf<Triple<Any, Any, Any>>()
+        /** Every holder the rig built, in order. */
+        val holders = mutableListOf<com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder>()
+        /** Holders the host forwarded a time event to. */
+        val timeForwarded = mutableListOf<com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder>()
+        /** When set, building a holder for this tab throws it. */
+        var holderFailure: Pair<String, Throwable>? = null
+        /** When set, making the host throws it. */
+        var hostFailure: Throwable? = null
+        var hostsMade = 0
+        /** The time event the builder was handed, as the recovery events would call it. */
+        var timeEventHandedOver: (() -> Unit)? = null
+        val newGraphHost: (kotlinx.coroutines.CoroutineScope, (String) -> com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder, (Throwable) -> Unit) ->
+            com.jay.fxi.ui.premium.graph.GraphScreenHost = { scope, create, onFailure ->
+            hostsMade++
+            hostFailure?.let { throw it }
+            com.jay.fxi.ui.premium.graph.GraphScreenHost(scope, create, onFailure, forwardTimeEvent = { timeForwarded += it })
+        }
+        val selections = object : com.jay.fxi.data.local.GraphSelectionStore {
+            override suspend fun readGraphSelection(key: com.jay.fxi.data.local.GraphSelectionKey) =
+                com.jay.fxi.data.local.GraphSelectionReadResult.Absent
+            override suspend fun writeGraphSelection(key: com.jay.fxi.data.local.GraphSelectionKey, selection: com.jay.fxi.domain.model.GraphSeriesSelection) =
+                com.jay.fxi.data.local.GraphSelectionWriteResult.Committed
+            override suspend fun confirmGraphSelection(key: com.jay.fxi.data.local.GraphSelectionKey) =
+                com.jay.fxi.data.local.GraphSelectionReadResult.Absent
         }
 
         fun snapshot() = TopicAccessSnapshot.INITIAL.copy(
@@ -151,12 +188,13 @@ class TopicRuntimeOwnerGraphContractTest {
             online: Boolean = true,
             failFirstCreate: Boolean = false,
             failFenceObserve: Boolean = false,
-            initialForeground: Boolean? = null
+            initialForeground: Boolean? = null,
+            captureUncaught: Boolean = false
         ) =
             C4OwnerHarness(
                 test, online = online, failFirstCreate = failFirstCreate, failFenceObserve = failFenceObserve,
                 graphBuilder = builder, reportGraph = { reports += it; if (reportFails) error("report failed") },
-                initialForeground = initialForeground
+                initialForeground = initialForeground, newGraphHost = newGraphHost, captureUncaught = captureUncaught
             ).also { h = it; it.tabs.stored["u1"] = FreeTab.TETHER }
 
         /** Closes the assembly on the owner's Main and drains, so no recovery-event timer outlives the row. */
@@ -375,6 +413,154 @@ class TopicRuntimeOwnerGraphContractTest {
         g.close()
     }
 
+    // ---- S4 CUT-CC5-2: the process screen host (`cut_cc5_agreed.r1.md`) ------------------------------------------------
+
+    /**
+     * CC5-2-H01: no host before the graph's publication; right after it, on Main, the host is made, the starter's time events
+     * go to it and it is published. A mount opened on it gets one started holder per FX tab, and a time event reaches each.
+     */
+    @Test
+    fun `CC5-2-H01 the host is installed after the publication and receives the time events`() = runTest {
+        val io = HeldDispatcher()
+        val g = GraphRig(this, seedIo = io)
+        val h = g.harness(this)
+        h.owner.start()
+        h.settle(100)
+        assertNull("CC5-2-H01 no host before the publication", h.owner.graphHost.value)
+        assertEquals("CC5-2-H01 none made", 0, g.hostsMade)
+        io.release()
+        h.settle(100)
+        val host = checkNotNull(h.owner.graphHost.value) { "CC5-2-H01 published after the publication" }
+        assertEquals("CC5-2-H01 made once", 1, g.hostsMade)
+        val mount = host.open()
+        h.settle(100)
+        assertEquals("CC5-2-H01 one started holder per tab", setOf("usd", "jpy", "eur"), mount.holders.value.keys)
+        val runtime = h.runtime()
+        assertTrue("CC5-2-H01 each over the runtime's display and focus, on the owner's Main scope", g.holderArgs.all { (display, focus, scope) ->
+            display === runtime.display && focus === runtime.focus && scope === h.ownerMain })
+        checkNotNull(g.timeEventHandedOver).invoke()
+        assertEquals("CC5-2-H01 the time event reaches each mounted holder", mount.holders.value.values.toSet(), g.timeForwarded.toSet())
+        mount.close()
+        h.settle(100)
+        g.close()
+    }
+
+    /**
+     * CC5-2-H02: making the host fails after the publication: nothing is published, the time events go nowhere, the graph is
+     * detached from the runtime and the assembly closed and waited for; the failure is reported once and the topic stays ready.
+     */
+    @Test
+    fun `CC5-2-H02 a failed host install runs the terminal cleanup and keeps the topic`() = runTest {
+        val g = GraphRig(this)
+        val h = g.harness(this)
+        val boom = IllegalStateException("host failed")
+        g.hostFailure = boom
+        h.owner.start()
+        h.settle(100)
+        h.owner.requireReady()
+        assertNull("CC5-2-H02 nothing published", h.owner.graphHost.value)
+        assertSame("CC5-2-H02 reported once", boom, g.reports.single())
+        assertEquals("CC5-2-H02 detached", TopicGraphOffer.DORMANT,
+            (h.runtime().part("graphInputs") as DetachableTopicGraphSink).tryOffer(probe))
+        assertTrue("CC5-2-H02 the assembly is closed and waited for", g.assemblyEnded())
+        checkNotNull(g.timeEventHandedOver).invoke()
+        assertTrue("CC5-2-H02 the time events go nowhere", g.timeForwarded.isEmpty())
+    }
+
+    /** CC5-2-H03: an Error making the host runs the same cleanup, is not reported and escapes. */
+    @Test
+    fun `CC5-2-H03 an Error installing the host is cleaned up after and escapes`() = runTest {
+        val g = GraphRig(this)
+        val h = g.harness(this, captureUncaught = true)
+        g.hostFailure = AssertionError("host broke")
+        h.owner.start()
+        h.settle(100)
+        assertEquals("CC5-2-H03 it escapes the owner's scope", listOf("host broke"), h.uncaught.map { it.message })
+        assertNull("CC5-2-H03 nothing published", h.owner.graphHost.value)
+        assertTrue("CC5-2-H03 not reported", g.reports.isEmpty())
+        assertTrue("CC5-2-H03 the assembly is closed", g.assemblyEnded())
+    }
+
+    /** CC5-2-H04: a graph given up before its publication — a failed binding — installs no host, ever. */
+    @Test
+    fun `CC5-2-H04 a graph given up before the publication installs no host`() = runTest {
+        val g = GraphRig(this)
+        val h = g.harness(this)
+        g.presetPermit = true
+        h.owner.start()
+        h.settle(1_000)
+        assertNull("CC5-2-H04 no host", h.owner.graphHost.value)
+        assertEquals("CC5-2-H04 none made", 0, g.hostsMade)
+    }
+
+    /**
+     * CC5-2-H06: the host's own failures — a holder it could not build — go to the owner's graph report; the other tabs
+     * still mount.
+     */
+    @Test
+    fun `CC5-2-H06 a holder the host could not build is reported`() = runTest {
+        val g = GraphRig(this)
+        val h = g.harness(this)
+        val boom = IllegalStateException("jpy holder failed")
+        g.holderFailure = "jpy" to boom
+        h.owner.start()
+        h.settle(100)
+        val mount = checkNotNull(h.owner.graphHost.value).open()
+        h.settle(100)
+        assertSame("CC5-2-H06 reported to the owner's graph report", boom, g.reports.single())
+        assertEquals("CC5-2-H06 the other tabs mount", setOf("usd", "eur"), mount.holders.value.keys)
+        mount.close()
+        h.settle(100)
+        g.close()
+    }
+
+    /**
+     * CC5-2-H07: a cancellation making the host runs the same terminal cleanup, is not reported and publishes nothing.
+     */
+    @Test
+    fun `CC5-2-H07 a cancellation installing the host is cleaned up after unreported`() = runTest {
+        val g = GraphRig(this)
+        val h = g.harness(this, captureUncaught = true)
+        g.hostFailure = kotlinx.coroutines.CancellationException("host cancelled")
+        h.owner.start()
+        h.settle(100)
+        assertNull("CC5-2-H07 nothing published", h.owner.graphHost.value)
+        assertTrue("CC5-2-H07 not reported", g.reports.isEmpty())
+        assertTrue("CC5-2-H07 nothing escapes as a failure", h.uncaught.isEmpty())
+        assertTrue("CC5-2-H07 the assembly is closed", g.assemblyEnded())
+        assertEquals("CC5-2-H07 detached", TopicGraphOffer.DORMANT,
+            (h.runtime().part("graphInputs") as DetachableTopicGraphSink).tryOffer(probe))
+    }
+
+    /**
+     * CC5-2-H08: a graph that fails inside its start — the seed read — installs no host and leaves no waiter behind: the
+     * owner's Main scope keeps only the topic's own work.
+     */
+    @Test
+    fun `CC5-2-H08 a graph failing in its start leaves no host waiter behind`() = runTest {
+        val noGraph = C4OwnerHarness(this, online = true)
+        noGraph.owner.start()
+        noGraph.settle(100)
+        val baseline = noGraph.ownerMain.coroutineContext[kotlinx.coroutines.Job]!!.children.count { it.isActive }
+        val g = GraphRig(this, seedRead = { throw java.io.IOException("seed failed") })
+        val h = g.harness(this)
+        h.owner.start()
+        h.settle(100)
+        assertNull("CC5-2-H08 no host", h.owner.graphHost.value)
+        assertEquals("CC5-2-H08 none made", 0, g.hostsMade)
+        assertEquals("CC5-2-H08 no waiter left: as many active children as a process with no graph", baseline,
+            h.ownerMain.coroutineContext[kotlinx.coroutines.Job]!!.children.count { it.isActive })
+    }
+
+    /** CC5-2-H05: with no builder there is never a host. */
+    @Test
+    fun `CC5-2-H05 with no builder there is no host`() = runTest {
+        val h = C4OwnerHarness(this, online = true)
+        h.owner.start()
+        h.settle(1_000)
+        assertNull("CC5-2-H05 no host", h.owner.graphHost.value)
+    }
+
     /** CC4b-O10: with no builder a topic failure is rethrown as before and reports nothing. */
     @Test
     fun `CC4b-O10 with no builder a topic failure reports nothing`() = runTest {
@@ -475,7 +661,8 @@ class TopicRuntimeOwnerGraphContractTest {
 
     /**
      * CC4b-O09: constructing the production owner resolves no graph dependency: its builder takes each of them as a Provider —
-     * the disk store, the deletion admission, the seed source, the authenticated client and the use authority — and holds
+     * the disk store, the deletion admission, the seed source, the authenticated client, the use authority and (S4 CUT-CC5-2)
+     * the selection store — and holds
      * nothing else to resolve; the owner takes that builder. A D24-off or no-data process never calls start(), so it builds,
      * resolves and starts no graph.
      */
@@ -486,7 +673,8 @@ class TopicRuntimeOwnerGraphContractTest {
             .filter { it.rawType == javax.inject.Provider::class.java }
             .map { (it.actualTypeArguments.single() as Class<*>).simpleName }
         assertEquals("CC4b-O09 the graph dependencies come as Providers",
-            listOf("FileGraphV2DiskStore", "DeletionAdmissionStore", "InstallSeedSource", "AuthenticatedApiClient", "TopicUseAuthority"),
+            listOf("FileGraphV2DiskStore", "DeletionAdmissionStore", "InstallSeedSource", "AuthenticatedApiClient", "TopicUseAuthority",
+                "GraphSelectionStore"),
             providers)
         assertEquals("CC4b-O09 and the two process singletons it already shares", listOf("PremiumAccessCoordinator", "AuthTokenProvider"),
             ctor.parameterTypes.filterNot { it == javax.inject.Provider::class.java }.map { it.simpleName })

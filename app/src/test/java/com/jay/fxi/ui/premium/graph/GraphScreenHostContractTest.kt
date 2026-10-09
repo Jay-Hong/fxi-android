@@ -718,7 +718,10 @@ class GraphScreenHostContractTest {
             Regex("""forwardTimeEvent\s*:\s*\(\s*GraphV2ScreenStateHolder\s*\)\s*->\s*Unit\s*=\s*\{\s*it\.onTimeEvent\(\)\s*}""").containsMatchIn(code))
     }
 
-    /** D01: nothing outside the test source sets constructs the host or a mount, or wires either into DI. */
+    /**
+     * D01: outside the test source sets only the topic owner constructs the host (S4 CUT-CC5-2), once, and nothing constructs
+     * a mount but the host or wires either into DI; only the host and the owner name the host, only the host names a mount.
+     */
     @Test fun D01_dormant() {
         val src = File("src")
         val all = src.walkTopDown()
@@ -729,10 +732,14 @@ class GraphScreenHostContractTest {
         val host = "main/java/com/jay/fxi/ui/premium/graph/GraphScreenHost.kt"
         assertTrue("premise: the scan sees the host", host in all && all.size > 100)
         assertTrue("premise: the scan reaches the benchmark source set", all.keys.any { it.startsWith("benchmark/") })
-        for (name in listOf("GraphScreenHost", "GraphScreenMount")) {
-            assertEquals("only the host file names $name", setOf(host),
-                code.filter { (_, text) -> Regex("""\b$name\b""").containsMatchIn(text) }.keys)
-        }
+        val owner = "main/java/com/jay/fxi/data/remote/TopicRuntimeOwner.kt"
+        assertEquals("only the host file and the owner name GraphScreenHost", setOf(host, owner),
+            code.filter { (_, text) -> Regex("""\bGraphScreenHost\b""").containsMatchIn(text) }.keys)
+        assertEquals("only the host file names GraphScreenMount", setOf(host),
+            code.filter { (_, text) -> Regex("""\bGraphScreenMount\b""").containsMatchIn(text) }.keys)
+        assertEquals("the owner constructs the host once", mapOf(owner to 1),
+            code.filterKeys { it != host }.mapValues { (_, t) -> Regex("""\bGraphScreenHost\s*\(""").findAll(t).count() }.filterValues { it > 0 })
+        assertFalse("the owner carries no DI annotation on the host", Regex("""@(?:[A-Za-z_][\w.]*\.)?(Provides|Binds|Module)\b""").containsMatchIn(code.getValue(owner)))
         val text = code.getValue(host)
         assertFalse("no DI annotation", Regex("""@(?:[A-Za-z_][\w.]*\.)?(Inject|AssistedInject|Singleton|Module|Provides|Binds|InstallIn|EntryPoint)\b""").containsMatchIn(text))
         assertFalse("the host file constructs no host", Regex("""\bGraphScreenHost\s*\(""").findAll(text).count() > 1)

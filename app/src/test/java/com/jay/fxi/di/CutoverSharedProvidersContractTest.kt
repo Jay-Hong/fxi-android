@@ -565,7 +565,8 @@ class CutoverSharedProvidersContractTest {
         val allowed = mapOf(
             "DeletionAdmissionStore" to setOf(main("data/entitlements/DeletionAdmissionStore.kt"), main("data/graph/GraphProtectedAdmission.kt"), graphModule,
                 main("ui/settings/SettingsViewModel.kt"), main("data/graph/ProcessGraphBuilder.kt")),
-            "GraphSelectionStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/graph/GraphSeriesSelectionSession.kt"), graphModule),
+            "GraphSelectionStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/graph/GraphSeriesSelectionSession.kt"), graphModule,
+                main("data/graph/ProcessGraphBuilder.kt")),
             "BackupableUserIntentStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt"), graphModule),
             "FileGraphV2DiskStore" to setOf(main("data/graph/GraphV2DiskStore.kt"), graphModule, main("data/graph/ProcessGraphBuilder.kt"))
         )
@@ -579,7 +580,8 @@ class CutoverSharedProvidersContractTest {
         val counts = mapOf(
             "DeletionAdmissionStore" to mapOf(main("data/entitlements/DeletionAdmissionStore.kt") to 1, main("data/graph/GraphProtectedAdmission.kt") to 2, graphModule to 3,
                 main("ui/settings/SettingsViewModel.kt") to 4, main("data/graph/ProcessGraphBuilder.kt") to 2),
-            "GraphSelectionStore" to mapOf(main("data/graph/GraphSeriesSelectionSession.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 2, graphModule to 2),
+            "GraphSelectionStore" to mapOf(main("data/graph/GraphSeriesSelectionSession.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 2, graphModule to 2,
+                main("data/graph/ProcessGraphBuilder.kt") to 2),
             "BackupableUserIntentStore" to mapOf(main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 1, graphModule to 2),
             "FileGraphV2DiskStore" to mapOf(main("data/graph/GraphV2DiskStore.kt") to 1, graphModule to 4, main("data/graph/ProcessGraphBuilder.kt") to 1)
         )
@@ -598,8 +600,9 @@ class CutoverSharedProvidersContractTest {
             }.filterValues { it > 0 })
         // The dormant classes that take them are constructed nowhere in production, their own files included, and carry no binding.
         // S4 CUT-CC4b: the process graph builder constructs the admission and the cache ports, once each, inside build().
+        // S4 CUT-CC5-2: and, in its holder factory, one selection session per holder.
         for (type in listOf("GraphProtectedAdmission", "GraphSeriesSelectionSession", "GraphSelectionPurgeAdapter", "GraphV2CachePorts", "GraphV2PurgeAdapter")) {
-            val expected = if (type == "GraphProtectedAdmission" || type == "GraphV2CachePorts") mapOf(main("data/graph/ProcessGraphBuilder.kt") to 1) else emptyMap()
+            val expected = if (type in setOf("GraphProtectedAdmission", "GraphV2CachePorts", "GraphSeriesSelectionSession")) mapOf(main("data/graph/ProcessGraphBuilder.kt") to 1) else emptyMap()
             assertEquals("$type is constructed only where CC4b builds the graph", expected,
                 stripped.mapValues { (_, text) -> Regex("""(?<!class )\b$type\s*\(""").findAll(text).count() }.filterValues { it > 0 })
         }

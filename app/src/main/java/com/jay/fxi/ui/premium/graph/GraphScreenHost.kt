@@ -25,7 +25,7 @@ import kotlinx.coroutines.launch
  * selection key at once. "Finished" requires normal return from both holder.close() and [closeHolder].
  * A failed, cancelled or unexecuted close never permits a new holder for that tab. At most one mount is open: opening one closes the open one first.
  * [holders] lists the open mount's started holders, never a closing one; it feeds the time-event fan-out and the retirement
- * port. Dormant: nothing in production constructs it.
+ * port. The topic owner constructs the process's one host (S4 CUT-CC5-2).
  */
 internal class GraphScreenHost(
     private val scope: CoroutineScope,

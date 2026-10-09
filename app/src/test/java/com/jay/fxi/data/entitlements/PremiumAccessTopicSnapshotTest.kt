@@ -111,6 +111,10 @@ import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Runnable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.job
@@ -2915,12 +2919,14 @@ class PremiumAccessTopicSnapshotTest {
         val trace = mutableListOf<String>()
         val reports = mutableListOf<Throwable>()
         val scopeJob = SupervisorJob(processJob)
+        /** Per close: whether every coroutine of the starter's scope — the permit collector — had completed by then. */
+        val collectorDoneAtClose = mutableListOf<Boolean>()
         /** What escaped the starter's scope, as the process's uncaught handler would see it (S4 CUT-CC4b). */
         val uncaught = mutableListOf<Throwable>()
         private val handler = kotlinx.coroutines.CoroutineExceptionHandler { _, failure -> uncaught += failure }
         val starter = com.jay.fxi.data.graph.ProcessGraphStarter(r.a, seeds, seed, permitSlot,
             CoroutineScope(scopeJob + r.main + (if (captureUncaught) handler else kotlin.coroutines.EmptyCoroutineContext)),
-            closeAssembly = { a -> a.close(); closeFailure?.let { throw it } }) { failure ->
+            closeAssembly = { a -> collectorDoneAtClose += scopeJob.children.all { it.isCompleted }; a.close(); closeFailure?.let { throw it } }) { failure ->
             trace += "report(active=${assemblyActive()})"
             reports += failure
             reportFailure?.let { throw it }
@@ -3307,9 +3313,10 @@ class PremiumAccessTopicSnapshotTest {
             com.jay.fxi.di.NetworkModule.provideWireJson()
         )
         fun <T> provider(name: String, value: T) = javax.inject.Provider { resolved += name; value }
+        val selections = HolderSelections()
         val builder = com.jay.fxi.data.graph.AppProcessGraphBuilder(
             provider("disk", disk), provider("deletions", deletions), provider("seeds", seeds), provider("api", api),
-            provider("uses", authority), h.coordinator, tokens
+            provider("uses", authority), provider("selections", selections), h.coordinator, tokens
         )
         assertTrue("CC4b-B01 constructing it resolves nothing", resolved.isEmpty())
         val permit = com.jay.fxi.data.graph.LateBound<() -> TopicGraphRecoveryPermit?>("permit")
@@ -3317,7 +3324,7 @@ class PremiumAccessTopicSnapshotTest {
         var timeEvents = 0
         val parent = Job(processJob)
         val parts = builder.build(permit, seed, { timeEvents++ }, parent)
-        assertEquals("CC4b-B01 each provider once, in build", listOf("seeds", "disk", "deletions", "api", "uses"), resolved)
+        assertEquals("CC4b-B01 each provider once, in build", listOf("seeds", "disk", "deletions", "api", "uses", "selections"), resolved)
         val a = parts.assembly
         assertSame("CC4b-B01 the seed source it resolved", seeds, parts.seeds)
         assertSame("CC4b-B01 the shared use authority, the very instance", authority, field(a.coordinator, "uses"))
@@ -3343,18 +3350,66 @@ class PremiumAccessTopicSnapshotTest {
         deletions.begin(AuthIdentityFence(OWNER, 1L), "op-1")
         assertFalse("CC4b-B01 the admission reads the deletion store it resolved", admission())
         assertNull("CC4b-B01 nothing started: the coordinator has not run", a.coordinator.state.value.dataScope)
+
+        // S4 CUT-CC5-2: newHolder builds an unstarted holder over this assembly, the given display and focus, the same
+        // authority and the issuer's revisions, on the given scope and Main; a holder that fails to build closes its session.
+        val main = StandardTestDispatcher(testScheduler)
+        Dispatchers.setMain(main)
+        try {
+            val holderScope = CoroutineScope(SupervisorJob(processJob) + main)
+            val display = MutableStateFlow(TopicDisplayState.NONE)
+            val focus = MutableStateFlow<OwnedTopicFocus?>(null)
+            val resolvedBefore = resolved.toList()
+            val childrenBefore = holderScope.coroutineContext[Job]!!.children.count { it.isActive }
+            val holder = parts.newHolder("usd", display, focus, holderScope)
+            assertEquals("CC5-2-B01 the holder's session works on the given scope: one more active child there", childrenBefore + 1,
+                holderScope.coroutineContext[Job]!!.children.count { c -> c.isActive && c !== field(holder, "holderJob") })
+            assertEquals("CC5-2-B01 a holder resolves no provider again", resolvedBefore, resolved)
+            assertSame("CC5-2-B01 the assembly's coordinator", a.coordinator, field(holder, "coordinator"))
+            assertSame("CC5-2-B01 the shared authority", authority, field(holder, "uses"))
+            assertSame("CC5-2-B01 the assembly's gate", a.gate, field(holder, "gate"))
+            assertSame("CC5-2-B01 the assembly's recorder", a.recorder, field(holder, "recorder"))
+            assertSame("CC5-2-B01 the bridge's fence", a.fences.current, field(holder, "currentAccessFence"))
+            assertSame("CC5-2-B01 the given display", display, field(holder, "display"))
+            assertSame("CC5-2-B01 the given focus", focus, field(holder, "focus"))
+            assertSame("CC5-2-B01 the issuer's revisions", h.coordinator.accessRevisions, field(holder, "accessRevisions"))
+            val session = field(holder, "selectionSession") as com.jay.fxi.data.graph.GraphSeriesSelectionSession
+            assertEquals("CC5-2-B01 a PREMIUM session for the tab", com.jay.fxi.data.local.GraphSelectionAudience.PREMIUM, field(session, "audience"))
+            assertSame("CC5-2-B01 over the resolved selection store", selections, field(session, "store"))
+            assertNull("CC5-2-B01 unstarted: no binding yet", field(holder, "binding"))
+            assertEquals("CC5-2-B01 the holder's tab", "usd", field(holder, "tab"))
+            assertEquals("CC5-2-B01 the session's tab", "usd", field(session, "tab"))
+            val jpy = parts.newHolder("jpy", display, focus, holderScope)
+            assertEquals("CC5-2-B01 a jpy holder", "jpy", field(jpy, "tab"))
+            assertEquals("CC5-2-B01 over a jpy session", "jpy",
+                field(field(jpy, "selectionSession") as com.jay.fxi.data.graph.GraphSeriesSelectionSession, "tab"))
+            jpy.close()
+
+            val sessionsBefore = holderScope.coroutineContext[Job]!!.children.count()
+            assertThrows("CC5-2-B01 a holder that fails to build rethrows", IllegalArgumentException::class.java) {
+                parts.newHolder("krw", display, focus, holderScope)
+            }
+            runCurrent()
+            assertEquals("CC5-2-B01 and its session's worker has ended: closed", sessionsBefore,
+                holderScope.coroutineContext[Job]!!.children.count { it.isActive })
+            holder.close()
+            holderScope.cancel()
+            runCurrent()
+        } finally {
+            Dispatchers.resetMain()
+        }
         a.close()
 
         // Each provider that throws ends the build before the assembly exists: its failure propagates, the providers after it
         // are not resolved and no child is left.
-        val order = listOf("seeds", "disk", "deletions", "api", "uses")
+        val order = listOf("seeds", "disk", "deletions", "api", "uses", "selections")
         for (broken in order) {
             resolved.clear()
             val failure = IllegalStateException("$broken unavailable")
             fun <T> maybe(name: String, value: T) = javax.inject.Provider { resolved += name; if (name == broken) throw failure; value }
             val failing = com.jay.fxi.data.graph.AppProcessGraphBuilder(
                 maybe("disk", disk), maybe("deletions", deletions), maybe("seeds", seeds), maybe("api", api),
-                maybe("uses", authority), h.coordinator, tokens
+                maybe("uses", authority), maybe("selections", selections), h.coordinator, tokens
             )
             val failedParent = Job(processJob)
             val thrown = runCatching {
@@ -3364,6 +3419,37 @@ class PremiumAccessTopicSnapshotTest {
             assertEquals("CC4b-B01 $broken: resolved up to it, none after", order.subList(0, order.indexOf(broken) + 1), resolved)
             assertTrue("CC4b-B01 $broken: no assembly child was left", failedParent.children.toList().isEmpty())
         }
+    }
+
+    /**
+     * CC5-2-P15 (S4 CUT-CC5-2): retire() after the publication runs the terminal cleanup — detach, the permit collector ended
+     * and waited for, the assembly closed and waited for — then reports an Exception once; a second retire() or abandon()
+     * reports nothing more. Before the publication it is abandon(). An Error retires unreported.
+     */
+    @Test
+    fun `CC5-2-P15 retire after the publication ends the collector and closes`() = snapshotTest {
+        for (cause in listOf<Throwable>(IllegalStateException("host failed"), AssertionError("host broke"))) {
+            val s = StarterRig(this, granted())
+            s.starter.start(); runCurrent()
+            assertSame("CC5-2-P15 fixture: published", s.r.a, s.starter.runtimeReady.value)
+            assertTrue("CC5-2-P15 fixture: the collector runs", s.scopeJob.children.any { it.isActive })
+            s.starter.retire(cause)
+            assertEquals("CC5-2-P15 $cause: detach, then the report after the close",
+                if (cause is Exception) listOf("detach(active=true)", "report(active=false)") else listOf("detach(active=true)"), s.trace)
+            assertEquals("CC5-2-P15 $cause: the collector ended and was waited for before the close", listOf(true), s.collectorDoneAtClose)
+            assertFalse("CC5-2-P15 $cause: closed", s.assemblyActive())
+            assertNull("CC5-2-P15 $cause: no longer published", s.starter.runtimeReady.value)
+            s.starter.retire(IllegalStateException("again"))
+            s.starter.abandon(IllegalStateException("later"))
+            assertEquals("CC5-2-P15 $cause: reported at most once", if (cause is Exception) 1 else 0, s.reports.size)
+        }
+        val io = HeldDispatcher()
+        val pending = StarterRig(this, granted(), seedIo = io)
+        pending.starter.start(); runCurrent()
+        pending.starter.retire(IllegalStateException("before"))
+        assertEquals("CC5-2-P15 before the publication it is abandon()", listOf("detach(active=true)", "report(active=false)"), pending.trace)
+        io.release(); runCurrent()
+        assertNull("CC5-2-P15 the attempt was cancelled: the seed is never set", pending.seed.get())
     }
 
     /**

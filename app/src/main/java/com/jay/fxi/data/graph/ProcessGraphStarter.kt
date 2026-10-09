@@ -64,13 +64,15 @@ internal class ProcessGraphStarter(
 ) {
     private val ready = MutableStateFlow<GraphRuntimeAssembly?>(null)
 
-    /** The started assembly once the initial hand-over is done; null before and, after a failure, for good. */
+    /** The started assembly once the initial hand-over is done; null before, after a failure for good, and after [retire]. */
     val runtimeReady: StateFlow<GraphRuntimeAssembly?> = ready.asStateFlow()
 
     /** The recovery events' time events go here; a no-op until the screen host sets it. */
     @Volatile var timeEventTarget: () -> Unit = {}
 
     private val cleaned = CompletableDeferred<Unit>()
+    /** S4 CUT-CC5-2: the attempt's outcome — the published assembly, or null once the graph was given up first. */
+    private val outcome = CompletableDeferred<GraphRuntimeAssembly?>()
     private var revisions: StateFlow<Long>? = null
     private var detach: (suspend () -> Unit)? = null
     private var attempt: Job? = null
@@ -107,6 +109,7 @@ internal class ProcessGraphStarter(
                 notifyPermit()
                 collector = scope.launch { bound.collect { notifyPermit() } }
                 ready.value = assembly
+                outcome.complete(assembly)
             } catch (failure: Throwable) {
                 cleanUp(failure)
                 // Cleaned up either way; only an Exception other than a cancellation is a recoverable graph failure.
@@ -130,6 +133,24 @@ internal class ProcessGraphStarter(
         cleanUp(cause, report)
     }
 
+    /**
+     * S4 CUT-CC5-2: gives up the graph at any time, also after the publication: before it, the same as [abandon]; after it,
+     * the terminal cleanup — [runtimeReady] back to null, detach the graph from the runtime, cancel the permit collector and
+     * wait for it, close the assembly and wait for it, non-cancellably — then the report once unless [report] is false. Once:
+     * a later call is an [abandon], which waits for that cleanup and does nothing more.
+     */
+    suspend fun retire(cause: Throwable, report: Boolean = true) {
+        if (ready.value == null) return abandon(cause, report)
+        ready.value = null
+        cleanUp(cause, report)
+    }
+
+    /**
+     * S4 CUT-CC5-2: suspends until the attempt's outcome: the published assembly, or null once the graph was given up — a
+     * failure, a cancellation or an abandon before the publication — so a waiter never outlives a failed graph.
+     */
+    suspend fun awaitOutcome(): GraphRuntimeAssembly? = outcome.await()
+
     private fun notifyPermit() {
         assembly.events.onPermitChanged()
         assembly.coordinator.onRecoveryPermitChanged()
@@ -146,6 +167,7 @@ internal class ProcessGraphStarter(
             }
             if (reportFailure && failure is Exception && failure !is CancellationException) runCatching { report(failure) }
         } finally {
+            outcome.complete(null)
             cleaned.complete(Unit)
         }
     }

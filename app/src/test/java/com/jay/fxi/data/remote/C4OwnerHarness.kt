@@ -240,7 +240,12 @@ internal class C4OwnerHarness(
      * S4 CUT-CC4b: the process's foreground at registration, which the stream delivers then, as its contract now says; null
      * keeps the older fake, which delivers nothing until told.
      */
-    initialForeground: Boolean? = null
+    initialForeground: Boolean? = null,
+    /** S4 CUT-CC5-2: what escapes the owner's Main scope is collected in [uncaught] instead of failing the test. */
+    captureUncaught: Boolean = false,
+    /** S4 CUT-CC5-2: how the owner makes the screen host; the production host when null. */
+    newGraphHost: ((CoroutineScope, (String) -> com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder, (Throwable) -> Unit) ->
+        com.jay.fxi.ui.premium.graph.GraphScreenHost)? = null
 ) {
     companion object {
         const val URL = "http://localhost/ws"
@@ -276,6 +281,8 @@ internal class C4OwnerHarness(
     }
 
     val scheduler = test.testScheduler
+    /** What escaped the owner's Main scope, when [captureUncaught]. */
+    val uncaught = mutableListOf<Throwable>()
     private val parent = test.backgroundScope.coroutineContext[Job]
     val main = ManualMain()
     val consumerIdentityReadsOnMain = mutableListOf<Boolean>()
@@ -355,6 +362,10 @@ internal class C4OwnerHarness(
         lastKnown = if (withLastKnown) lastKnownOver(memory) else null
     )
 
+    /** The owner's Main scope (S4 CUT-CC5-2: rows check what is left running on it). */
+    val ownerMain: CoroutineScope = CoroutineScope(SupervisorJob() + main +
+        (if (captureUncaught) kotlinx.coroutines.CoroutineExceptionHandler { _, e -> uncaught += e } else kotlin.coroutines.EmptyCoroutineContext))
+
     val owner = TopicRuntimeOwner(
         factory = factory,
         online = this.online,
@@ -365,9 +376,10 @@ internal class C4OwnerHarness(
             this.live
         },
         rowPreferenceStore = prefs,
-        main = CoroutineScope(SupervisorJob() + main),
+        main = ownerMain,
         graphBuilder = graphBuilder,
-        reportGraph = reportGraph
+        reportGraph = reportGraph,
+        newGraphHost = newGraphHost ?: { scope, create, onFailure -> com.jay.fxi.ui.premium.graph.GraphScreenHost(scope, create, onFailure) }
     )
 
     /** The platform reporting the process coming to (true) or leaving (false) the foreground. */
