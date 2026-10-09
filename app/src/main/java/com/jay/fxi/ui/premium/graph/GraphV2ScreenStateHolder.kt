@@ -178,6 +178,12 @@ internal class GraphV2ScreenStateHolder(
     private var boundIdentity: AuthIdentityFence? = null
     private var binding: GraphSelectionBinding? = null
     private var activeOwner: TopicDisplayOwner? = null
+    /**
+     * S4 CUT-CC5-1: the owner the route last asked to activate, kept apart from access: an activation whose context could not
+     * be acquired yet is re-evaluated after each identity rebind and display, focus or access change, and becomes active only
+     * once the live checks pass. Cleared by [onDeactivated] and [close].
+     */
+    private var requestedOwner: TopicDisplayOwner? = null
     private var context: Context? = null
     private var activation: Activation? = null
     private var activePeriod = GraphPeriod.ONE_DAY
@@ -254,8 +260,17 @@ internal class GraphV2ScreenStateHolder(
 
     fun onActivated(owner: TopicDisplayOwner) {
         if (!started || closed) return
+        requestedOwner = owner
         currentState()
-        val next = acquireContext(owner) ?: return
+        val next = acquireContext(owner)
+        if (next == null) {
+            // Kept as a request, reconciled later; whatever was active before is released now.
+            activeOwner = null
+            retireContext()
+            releaseActivation()
+            currentState()
+            return
+        }
         activeOwner = owner
         if (context != next) {
             retireContext()
@@ -268,6 +283,7 @@ internal class GraphV2ScreenStateHolder(
 
     fun onDeactivated() {
         if (closed) return
+        requestedOwner = null
         activeOwner = null
         retireContext()
         releaseActivation()
@@ -429,6 +445,7 @@ internal class GraphV2ScreenStateHolder(
             return
         }
         closed = true
+        requestedOwner = null
         activeOwner = null
         retireContext()
         releaseActivation()
@@ -458,8 +475,10 @@ internal class GraphV2ScreenStateHolder(
         if (activeOwner != null && (notifyCoordinator || identityChanged || previous != context || context == null)) {
             coordinator.onContextChanged()
         }
-        val owner = activeOwner
-        if (owner != null && context == null) context = acquireContext(owner)
+        val owner = activeOwner ?: requestedOwner
+        if (owner != null && context == null) {
+            context = acquireContext(owner)?.also { activeOwner = owner }
+        }
         val current = context
         if (current == null) releaseActivation() else activateKey(current)
         if (current != null) {

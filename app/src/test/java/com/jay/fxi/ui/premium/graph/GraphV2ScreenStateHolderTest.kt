@@ -1842,4 +1842,120 @@ class GraphV2ScreenStateHolderTest {
             n.holder.state.value.selectionStatus)
     }
 
+
+    // --- S4 CUT-CC5-1: an activation request kept apart from access (`cut_cc5_agreed.r1.md`) --------------------------------
+
+    /** Starts both owners without activating the holder. */
+    private fun Fixture.startOnly() {
+        coordinator.start()
+        holder.start()
+        test.backgroundScope.launch(UnconfinedTestDispatcher(test.testScheduler)) { holder.state.collect { published += it } }
+        run()
+    }
+
+    /**
+     * CC5-1-A01: an activation asked for while the focus is on another tab acquires nothing — the screen stays inactive and
+     * nothing is requested — and becomes active, with no further call, once the focus reaches this tab.
+     */
+    @Test fun CC51_A01_anActivationBeforeTheFocusArrivesBecomesActiveWhenItDoes() = holderTest {
+        val f = Fixture(this)
+        f.focus.value = OwnedTopicFocus(A, FreeTab.JPY)
+        f.startOnly()
+        f.holder.onActivated(OWNER_A)
+        f.run()
+        assertEquals("CC5-1-A01 not yet: inactive", GraphV2Content.INACTIVE, f.now().content)
+        assertEquals("CC5-1-A01 not yet: nothing requested", 0, f.sentFor(KEY_1D))
+        f.focus.value = OwnedTopicFocus(A, FreeTab.USD)
+        f.run()
+        assertTrue("CC5-1-A01 active once the focus arrives: the day is requested", f.sentFor(KEY_1D) > 0)
+        f.answer(KEY_1D, fullDay())
+        assertNotNull("CC5-1-A01 and the screen is published", f.now().inlineToken)
+    }
+
+    /**
+     * CC5-1-A02: an activation for a new identity whose change was only enqueued — live identity, fence, display and focus
+     * already moved, the holder not yet rebound — fails at first and becomes active after the rebind, with no further call.
+     */
+    @Test fun CC51_A02_anActivationBeforeTheRebindBecomesActiveAfterIt() = holderTest {
+        val f = Fixture(this)
+        f.startOnly()
+        val ownerB = TopicDisplayOwner(B, 1L)
+        f.identity = B
+        f.fence = FENCE_B
+        f.snapshot = snap(uid = "u2", token = 8L, epoch = "e2")
+        f.display.value = TopicDisplayState.NONE.copy(owner = ownerB)
+        f.focus.value = OwnedTopicFocus(B, FreeTab.USD)
+        f.holder.onActivated(ownerB)
+        assertEquals("CC5-1-A02 premise: before the rebind the activation acquires nothing", GraphV2Content.INACTIVE, f.now().content)
+        f.run()
+        assertTrue("CC5-1-A02 after the rebind it is active: the day is requested", f.sentFor(KEY_1D) > 0)
+        f.answer(KEY_1D, fullDay())
+        assertEquals("CC5-1-A02 for the new owner", ownerB, f.token().owner)
+    }
+
+    /** CC5-1-A03: a stale owner's request never activates, whatever changes later: nothing is requested or written. */
+    @Test fun CC51_A03_aStaleOwnersRequestNeverActivates() = holderTest {
+        val f = Fixture(this)
+        f.startOnly()
+        f.holder.onActivated(TopicDisplayOwner(A, 9L))
+        f.run()
+        f.accessRevisions.value += 1
+        f.focus.value = OwnedTopicFocus(A, FreeTab.USD)
+        f.run()
+        assertEquals("CC5-1-A03 inactive", GraphV2Content.INACTIVE, f.now().content)
+        assertEquals("CC5-1-A03 nothing requested", 0, f.sentFor(KEY_1D))
+        assertEquals("CC5-1-A03 nothing written", 0, f.selections.writes)
+    }
+
+    /**
+     * CC5-1-A04: a request made while access is blocked requests nothing and becomes active once access returns and is
+     * reported, with no further call.
+     */
+    @Test fun CC51_A04_aRequestWhileBlockedActivatesWhenAccessReturns() = holderTest {
+        val f = Fixture(this)
+        f.fence = null
+        f.startOnly()
+        f.holder.onActivated(OWNER_A)
+        f.run()
+        assertEquals("CC5-1-A04 blocked: nothing requested", 0, f.sentFor(KEY_1D))
+        f.fence = FENCE_A
+        f.accessRevisions.value += 1
+        f.run()
+        assertTrue("CC5-1-A04 active once access returns", f.sentFor(KEY_1D) > 0)
+    }
+
+    /** CC5-1-A05: onDeactivated, and close, clear a pending request: a later change activates nothing. */
+    @Test fun CC51_A05_deactivationAndCloseClearAPendingRequest() = holderTest {
+        for (clear in listOf("deactivated", "closed")) {
+            val f = Fixture(this)
+            f.focus.value = OwnedTopicFocus(A, FreeTab.JPY)
+            f.startOnly()
+            f.holder.onActivated(OWNER_A)
+            f.run()
+            if (clear == "deactivated") f.holder.onDeactivated() else f.holder.close()
+            f.run()
+            f.focus.value = OwnedTopicFocus(A, FreeTab.USD)
+            f.run()
+            assertEquals("CC5-1-A05 $clear: inactive", GraphV2Content.INACTIVE, f.now().content)
+            assertEquals("CC5-1-A05 $clear: nothing requested", 0, f.sentFor(KEY_1D))
+        }
+    }
+
+    /**
+     * CC5-1-A06: an activation that fails releases what was active before: an active screen asked to activate an owner that
+     * cannot be acquired becomes inactive at once and drops its activation; the earlier owner does not come back by itself.
+     */
+    @Test fun CC51_A06_aFailedActivationReleasesThePreviousOne() = holderTest {
+        val f = Fixture(this)
+        f.open()
+        f.answer(KEY_1D, fullDay())
+        assertNotNull("CC5-1-A06 premise: active", f.now().inlineToken)
+        f.holder.onActivated(TopicDisplayOwner(A, 9L))
+        f.run()
+        assertEquals("CC5-1-A06 released at once", GraphV2Content.INACTIVE, f.now().content)
+        assertNull("CC5-1-A06 no token", f.now().inlineToken)
+        f.accessRevisions.value += 1
+        f.run()
+        assertEquals("CC5-1-A06 the earlier owner does not come back by itself", GraphV2Content.INACTIVE, f.now().content)
+    }
 }
