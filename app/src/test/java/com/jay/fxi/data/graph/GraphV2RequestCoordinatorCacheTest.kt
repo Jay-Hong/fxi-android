@@ -520,6 +520,7 @@ class GraphV2RequestCoordinatorCacheTest {
         assertEquals("while a seed waits", 1, f.store.generalReads.size)
         f.store.release(1); runCurrent()
         assertTrue(f.store.generalReads.single() is GraphV2DiskRead.Absent)
+        assertNull("a missing file seeds nothing", f.state.entries[KEY])
         triggers(); runCurrent()
         assertEquals("after a missing file", 1, f.store.generalReads.size)
         f.coordinator.onDeactivated(); f.coordinator.onActivated(KEY); runCurrent()

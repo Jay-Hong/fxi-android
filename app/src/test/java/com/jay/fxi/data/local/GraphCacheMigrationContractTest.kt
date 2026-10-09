@@ -750,6 +750,62 @@ class GraphCacheMigrationContractTest {
         }
     }
 
+    // --- P3c R04: the real readiness -------------------------------------------------------------------------------------
+
+    /**
+     * P3c R04 (`cut_p3c_agreed.r3.md` §4): the real [GraphConsumerReadiness] before and after markReady, for every pair of start
+     * stages. Before: a target at none or DETECTED fails with the readiness's IllegalStateException, ends DETECTED and keeps its
+     * legacy bytes with no delete call; a target at CONSUMER_CUTOVER or LEGACY_DELETED does not ask and deletes or sweeps again.
+     * After markReady, running the same migration again finishes both.
+     */
+    @Test fun P3cR04_theRealReadinessHoldsTheCutoverUntilMarked() = runBlocking {
+        val starts = listOf(null, DETECTED, CONSUMER_CUTOVER, LEGACY_DELETED)
+        fun asks(start: LegacyMigrationStage?) = start == null || start == DETECTED
+        for (cacheStart in starts) for (prefStart in starts) {
+            val name = "p3c-${cacheStart ?: "none"}-${prefStart ?: "none"}"
+            val files = filesDir(name)
+            val cache = put(files, versioned[0])
+            val pref = put(File(files, "datastore"), prefs)
+            val journal = open(name)
+            for ((target, start) in listOf(GRAPH_CACHE_FILES to cacheStart, GRAPH_PREFERENCES to prefStart)) {
+                if (start == null) continue
+                journal.detect(target)
+                if (start >= CONSUMER_CUTOVER) journal.cutover(target) {}
+                if (start == LEGACY_DELETED) journal.deleteLegacy(target) {}
+            }
+            val readiness = GraphConsumerReadiness()
+            deleteCalls.clear()
+            val failure = failureOf { migration(open(name), files, readiness, deleter()).run() }
+            val asking = buildSet {
+                if (asks(cacheStart)) add(GRAPH_CACHE_FILES)
+                if (asks(prefStart)) add(GRAPH_PREFERENCES)
+            }
+            assertEquals(name, asking, failure?.failures?.keys.orEmpty())
+            for (cause in failure?.failures?.values.orEmpty()) {
+                assertTrue("$name: $cause", cause is IllegalStateException && cause.message == "Graph runtime and screen host are not ready")
+            }
+            assertEquals(name, (if (asks(cacheStart)) DETECTED else LEGACY_DELETED) to (if (asks(prefStart)) DETECTED else LEGACY_DELETED),
+                stages(name))
+            if (asks(cacheStart)) {
+                assertTrue("$name: cache bytes kept", cache.readBytes().contentEquals(versioned[0].toByteArray()))
+                assertFalse("$name: no cache delete call", versioned[0] in deleteCalls)
+            } else {
+                assertFalse("$name: cache swept", cache.exists())
+            }
+            if (asks(prefStart)) {
+                assertTrue("$name: preference bytes kept", pref.readBytes().contentEquals(prefs.toByteArray()))
+                assertFalse("$name: no preference delete call", prefs in deleteCalls)
+            } else {
+                assertFalse("$name: preference swept", pref.exists())
+            }
+
+            readiness.markReady()
+            migration(open(name), files, readiness, deleter()).run()
+            assertEquals(name, LEGACY_DELETED to LEGACY_DELETED, stages(name))
+            assertFalse(name, cache.exists() || pref.exists())
+        }
+    }
+
     // --- D: dormancy -----------------------------------------------------------------------------------------------------
 
     private val main = File("src/main/java")
@@ -758,32 +814,57 @@ class GraphCacheMigrationContractTest {
         .associate { it.relativeTo(main).invariantSeparatorsPath to it.readText() }
 
     /**
-     * D: no production code constructs the runner or the launcher, neither carries a DI annotation, and constructing them
-     * touches no file and no journal.
+     * D (P3c `cut_p3c_agreed.r3.md` §2 and §4): no production code constructs the runner, the launcher or the readiness; only
+     * the readiness's own file names it, and it names neither the runner nor the launcher; none carries a DI annotation; and
+     * constructing them with the real readiness touches no file and no journal.
      */
     @Test fun D_dormantUntilTheCutover() = runBlocking {
         val all = sources()
         val migrationPath = "com/jay/fxi/data/local/GraphCacheMigration.kt"
         val cutoverPath = "com/jay/fxi/data/local/GraphCacheCutover.kt"
-        assertTrue("premise: the scan sees both files", migrationPath in all && cutoverPath in all && all.size > 100)
+        val readinessPath = "com/jay/fxi/data/local/GraphConsumerReadiness.kt"
+        val three = setOf(migrationPath, cutoverPath, readinessPath)
+        assertTrue("premise: the scan sees the three files", three.all { it in all } && all.size > 100)
         val referencing = all.filter { (path, text) ->
-            path != migrationPath && path != cutoverPath && Regex("""\bGraph(CacheMigration|CacheCutover|MigrationReadiness)\b""").containsMatchIn(text)
+            path !in three && Regex("""\bGraph(CacheMigration|CacheCutover|MigrationReadiness)\b""").containsMatchIn(text)
         }.keys
         assertEquals("no other production file names them", emptySet<String>(), referencing)
-        for (path in listOf(migrationPath, cutoverPath)) {
-            assertFalse(path, Regex("""@(Inject|AssistedInject|Singleton|Module|InstallIn|EntryPoint|Provides|Binds|HiltViewModel)\b""")
+        assertFalse("the readiness names neither the runner nor the launcher",
+            Regex("""\bGraphCache(Migration|Cutover)\b""").containsMatchIn(all.getValue(readinessPath)))
+        assertEquals("only its own file names the readiness", setOf(readinessPath),
+            all.filter { (_, text) -> Regex("""\bGraphConsumerReadiness\b""").containsMatchIn(text) }.keys)
+        for (path in three) {
+            // A qualified annotation (@javax.inject.Singleton) counts too.
+            assertFalse(path, Regex("""@(?:[A-Za-z_][\w.]*\.)?(Inject|AssistedInject|Singleton|Module|InstallIn|EntryPoint|Provides|Binds|HiltViewModel)\b""")
                 .containsMatchIn(all.getValue(path)))
         }
         assertEquals("the v1 file prefix appears once, as the sweep's constant", 1,
             Regex("graph_cache_").findAll(all.getValue(migrationPath)).count())
-        assertFalse(Regex("""GraphCache(Migration|Cutover)""").containsMatchIn(all.getValue("com/jay/fxi/FXiApplication.kt")))
+        assertFalse(Regex("""GraphCache(Migration|Cutover)|Graph(Migration|Consumer)Readiness""")
+            .containsMatchIn(all.getValue("com/jay/fxi/FXiApplication.kt")))
+        val others = File("src").walkTopDown()
+            .onEnter { it.parentFile?.name != "src" || it.name !in setOf("main", "test", "androidTest") }
+            .filter { it.isFile && it.extension == "kt" }.toList()
+        assertTrue("premise: the other source sets hold Kotlin (benchmark)", others.isNotEmpty())
+        assertEquals("no other source set names them", emptyList<String>(), others.filter {
+            Regex("""\bGraph(CacheMigration|CacheCutover|MigrationReadiness|ConsumerReadiness)\b""").containsMatchIn(it.readText())
+        }.map { it.path })
 
         val files = filesDir("files")
-        put(files, versioned[0])
+        val datastore = File(files, "datastore")
+        val legacy = listOf(
+            put(files, versioned[0], corrupt),
+            put(datastore, prefs, corrupt)
+        ).associateWith { it.readBytes() }
         val journal = open()
-        val m = migration(journal, files, never, deleter())
+        val m = migration(journal, files, GraphConsumerReadiness(), deleter())
         GraphCacheCutover(m, CoroutineScope(Dispatchers.IO + SupervisorJob())) { fail("reported") }
-        assertEquals(listOf(versioned[0]), names(files))
+        assertEquals(listOf("datastore", versioned[0]).sorted(), names(files))
+        assertEquals(listOf(prefs), names(datastore))
+        legacy.forEach { (file, bytes) ->
+            assertTrue("${file.path}: legacy bytes unchanged",
+                file.isFile && bytes.contentEquals(file.readBytes()))
+        }
         assertEquals(emptyList<String>(), deleteCalls)
         assertEquals(null to null, open().let { it.stage(GRAPH_CACHE_FILES) to it.stage(GRAPH_PREFERENCES) })
     }
