@@ -296,8 +296,37 @@ class PremiumAccessTopicSnapshotTest {
             AccessEpochTransitions.completePurges(record, completed).also { record = it }
         override suspend fun journalRetired(obligation: LossObligation) =
             AccessEpochTransitions.journalRetired(record, obligation).also { record = it }
-        override suspend fun markMayContainData(premium: Boolean, krx: Boolean) =
-            AccessEpochTransitions.markMayContainData(record, premium, krx).also { record = it }
+        /** Every marking asked for, as (premium, krx) (S4 CUT-P2). */
+        val markCalls = mutableListOf<Pair<Boolean, Boolean>>()
+
+        /** Parks the next marking before it writes. */
+        var markGate: CompletableDeferred<Unit>? = null
+        val markParked = CompletableDeferred<Unit>()
+
+        /** The next marking throws this before writing. */
+        var markFailsBefore: Throwable? = null
+
+        /** The next marking writes and then throws this. */
+        var markFailsAfter: Throwable? = null
+
+        override suspend fun markMayContainData(premium: Boolean, krx: Boolean): AccessEpochRecord {
+            markCalls += premium to krx
+            markGate?.let { gate ->
+                markGate = null
+                markParked.complete(Unit)
+                gate.await()
+            }
+            markFailsBefore?.let {
+                markFailsBefore = null
+                throw it
+            }
+            record = AccessEpochTransitions.markMayContainData(record, premium, krx)
+            markFailsAfter?.let {
+                markFailsAfter = null
+                throw it
+            }
+            return record
+        }
     }
 
     private class Purger : UserScopePurger, CapabilityScopePurger {
@@ -3907,5 +3936,361 @@ class PremiumAccessTopicSnapshotTest {
             all.filter { (_, text) -> Regex("""\bGraphRecoveryEvents\(""").containsMatchIn(text) }.keys)
         assertEquals("no production code constructs the assembly", setOf(assembly),
             all.filter { (_, text) -> Regex("""\bGraphRuntimeAssembly\(""").containsMatchIn(text) }.keys)
+    }
+
+    // --- S4 CUT-P2: the issuer's graph write marking (cut_p2_agreed.r2 §1-§2) --------------------------------------------
+
+    /** A bound owner with a confirmed grant and KRX visible, as granted(), but with no marker yet; its grant and use. */
+    private suspend fun TestScope.markable(): Triple<Harness, TopicSessionFence, TopicUseLifetime> {
+        val h = build()
+        h.coordinator.onIdentityChanged(AuthIdentityFence(OWNER, 1L))
+        h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        settle()
+        assertEquals(PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)
+        val fence = checkNotNull(h.coordinator.topicGrantResult().fence) { "no grant was issued" }
+        val lifetime = checkNotNull(h.snapshot.acquireUse(fence)) { "the grant is not usable" }
+        assertFalse("premise: no marker yet", h.store.record.mayContainPremiumData || h.store.record.mayContainKrxData)
+        assertTrue("premise: KRX allowed", h.facts.capabilityAllowed)
+        return Triple(h, fence, lifetime)
+    }
+
+    private fun Harness.krxEpoch(): String = checkNotNull(store.record.krxCapabilityEpoch) { "no KRX epoch" }
+
+    /** graphP2a: the premium marker is persisted before any answer, and the answer is the store's own record after the edit. */
+    @Test
+    fun graphP2a_theMarkerIsPersistedBeforeTheAnswer() = snapshotTest {
+        val (h, fence, lifetime) = markable()
+        val gate = CompletableDeferred<Unit>()
+        h.store.markGate = gate
+        val loads = h.store.loadCalls
+        var answer: GraphDataMarking? = null
+        launch { answer = h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = false) }
+        runCurrent()
+        assertTrue("premise: parked inside the store", h.store.markParked.isCompleted)
+        assertNull("no answer before the marker is persisted", answer)
+        assertFalse(h.store.record.mayContainPremiumData)
+        gate.complete(Unit); runCurrent()
+        val marked = answer as GraphDataMarking.Marked
+        assertSame("the store's own record after the edit", h.store.record, marked.record)
+        assertTrue(marked.record.mayContainPremiumData)
+        assertEquals(listOf(true to false), h.store.markCalls)
+        assertEquals("the record is the confirmed one, not a read", loads, h.store.loadCalls)
+    }
+
+    /**
+     * graphP2b: with KRX allowed, the marking asks for the KRX marker only when KRX is asked for the record's own non-null KRX
+     * epoch; otherwise it asks for the premium marker alone.
+     */
+    @Test
+    fun graphP2b_theKrxMarkerIsAskedOnlyForTheRecordsOwnEpoch() = snapshotTest {
+        for (asked in listOf(false, true)) for (epochCase in listOf("current", "other", "null")) {
+            val (h, fence, lifetime) = markable()
+            val epoch = when (epochCase) {
+                "current" -> h.krxEpoch()
+                "other" -> "another-krx-epoch"
+                else -> null
+            }
+            val marked = h.coordinator.markGraphData(fence, lifetime, epoch, asked) as GraphDataMarking.Marked
+            val expectKrx = asked && epochCase == "current"
+            assertEquals("asked=$asked epoch=$epochCase", listOf(true to expectKrx), h.store.markCalls)
+            assertEquals("asked=$asked epoch=$epochCase", expectKrx, marked.record.mayContainKrxData)
+        }
+    }
+
+    /**
+     * graphP2c: with KRX not allowed the marking asks for the premium marker alone, and a KRX marker already standing is not
+     * taken back by a marking that does not ask for it.
+     */
+    @Test
+    fun graphP2c_noKrxMarkingWithoutTheCapability_andAStandingMarkerStays() = snapshotTest {
+        run {
+            val (h, _, _) = markable()
+            h.source.next = { active(krx = false) }
+            h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+            settle()
+            assertFalse("premise: KRX not allowed", h.facts.capabilityAllowed)
+            val fence = checkNotNull(h.coordinator.topicGrantResult().fence)
+            val lifetime = checkNotNull(h.snapshot.acquireUse(fence))
+            h.coordinator.markGraphData(fence, lifetime, h.store.record.krxCapabilityEpoch, krx = true)
+            assertEquals("premium alone", listOf(true to false), h.store.markCalls)
+        }
+        run {
+            val (h, fence, lifetime) = markable()
+            h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = true)
+            val again = h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = false) as GraphDataMarking.Marked
+            assertEquals(listOf(true to true, true to false), h.store.markCalls)
+            assertTrue("a standing KRX marker stays", again.record.mayContainKrxData)
+        }
+        run {
+            val (h, fence, lifetime) = markable()
+            h.source.next = { active(krx = false) }
+            h.source.afterFetch = { h.store.loadFailures = 2 }
+            h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+            runCurrent()
+            assertTrue("premise: a capability hold", TopicAccessBlock.LOSS_CANDIDATE in h.facts.capabilityBlocks)
+            h.store.loadFailures = 0
+            assertEquals("premise: the same grant, read with a confirmed load", fence, h.coordinator.topicGrantResult().fence)
+            assertFalse("premise: confirmed again", h.facts.recordUnconfirmed)
+            assertTrue("premise: still held", TopicAccessBlock.LOSS_CANDIDATE in h.facts.capabilityBlocks)
+            assertFalse("premise: held, not hidden", TopicAccessBlock.NOT_GRANTED in h.facts.capabilityBlocks)
+            assertTrue("premise: the use stands", h.snapshot.admitsUse(lifetime))
+            val held = h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = true) as GraphDataMarking.Marked
+            assertEquals("a capability hold: premium alone", listOf(true to false), h.store.markCalls)
+            assertFalse(held.record.mayContainKrxData)
+        }
+    }
+
+    /**
+     * graphP2d: a use that does not stand for the confirmed record is refused with nothing marked - another grant, a lifetime
+     * of another grant or invalidation, the same user at another auth generation, no USER epoch, another USER epoch, and a
+     * USER hold.
+     */
+    @Test
+    fun graphP2d_aUseThatDoesNotStandMarksNothing() = snapshotTest {
+        val inputs: List<Pair<String, (TopicSessionFence, TopicUseLifetime) -> Pair<TopicSessionFence, TopicUseLifetime>>> = listOf(
+            "another grant" to { f, l -> f.copy(grant = TopicGrantToken(f.grant.value + 99)) to l },
+            "a lifetime of another grant" to { f, l -> f to l.copy(grant = TopicGrantToken(l.grant.value + 99)) },
+            "an invalidated lifetime" to { f, l -> f to l.copy(invalidations = l.invalidations + 1) },
+            "another auth generation" to { f, l -> f.copy(identity = AuthIdentityFence(OWNER, f.identity.authGeneration + 1)) to l },
+            "no USER epoch" to { f, l -> f.copy(userAccessEpoch = null) to l },
+            "another USER epoch" to { f, l -> f.copy(userAccessEpoch = "another-user-epoch") to l },
+            "another owner" to { f, l -> f.copy(identity = AuthIdentityFence("another-owner", f.identity.authGeneration)) to l }
+        )
+        for ((label, change) in inputs) {
+            val (h, fence, lifetime) = markable()
+            val (f, l) = change(fence, lifetime)
+            val answer = h.coordinator.markGraphData(f, l, h.krxEpoch(), krx = true)
+            assertEquals("$label: refused", GraphDataMarking.Refused("access"), answer)
+            assertEquals("$label: nothing marked", emptyList<Pair<Boolean, Boolean>>(), h.store.markCalls)
+        }
+        val (h, _, a) = held()
+        assertTrue("premise: the hold's failed read left the store unconfirmed", h.facts.recordUnconfirmed)
+        val answer = h.coordinator.markGraphData(a.fence, a.lifetime, h.store.record.krxCapabilityEpoch, krx = true)
+        assertEquals("a USER hold: refused at the first step", GraphDataMarking.Refused("unconfirmed"), answer)
+        assertEquals("a USER hold: nothing marked", emptyList<Pair<Boolean, Boolean>>(), h.store.markCalls)
+        run {
+            val (s, sf, sl) = markable()
+            s.store.rotationFailures = Int.MAX_VALUE
+            s.source.next = { EntitlementsOutcome.StableInactive(krxVisible = false) }
+            s.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+            runCurrent()
+            assertTrue("premise: sealed", TopicAccessBlock.EXPLICIT_SEAL in s.facts.userBlocks)
+            val expected = GraphDataMarking.Refused(if (s.facts.recordUnconfirmed) "unconfirmed" else "access")
+            assertEquals("a USER seal: refused", expected, s.coordinator.markGraphData(sf, sl, s.krxEpoch(), krx = true))
+            assertEquals("a USER seal: nothing marked", emptyList<Pair<Boolean, Boolean>>(), s.store.markCalls)
+        }
+    }
+
+    /**
+     * graphP2e: after a failed marking the store is unconfirmed: although the snapshot still admits the use, the next marking is
+     * refused without a load or a marking; once a load confirms the record again, the same input is judged afresh.
+     */
+    @Test
+    fun graphP2e_anUnconfirmedStoreRefusesWithoutLoadingOrMarking() = snapshotTest {
+        val (h, fence, lifetime) = markable()
+        h.store.markFailsBefore = IOException("write")
+        assertTrue(h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = false) is GraphDataMarking.Refused)
+        assertTrue("premise: unconfirmed is published", h.facts.recordUnconfirmed)
+        assertTrue("premise: the snapshot still admits the use", h.snapshot.admitsUse(lifetime))
+        val loads = h.store.loadCalls
+        val refused = h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = false)
+        assertEquals(GraphDataMarking.Refused("unconfirmed"), refused)
+        assertEquals("no load", loads, h.store.loadCalls)
+        assertEquals("no further marking", 1, h.store.markCalls.size)
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+        settle()
+        assertFalse("premise: a load confirmed the record again", h.facts.recordUnconfirmed)
+        assertEquals("premise: the same input", lifetime, checkNotNull(h.snapshot.acquireUse(fence)))
+        val again = h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = false)
+        assertTrue("judged afresh: $again", again is GraphDataMarking.Marked)
+    }
+
+    /**
+     * graphP2f: a store failure before the write and one after it are both refused with the very cause and leave the store
+     * unconfirmed when the answer comes; a marker written before the failure is not taken back.
+     */
+    @Test
+    fun graphP2f_aStoreFailureRefusesWithItsCause() = snapshotTest {
+        for (after in listOf(false, true)) {
+            val (h, fence, lifetime) = markable()
+            val cause = IOException(if (after) "after" else "before")
+            if (after) h.store.markFailsAfter = cause else h.store.markFailsBefore = cause
+            val answer = h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = false) as GraphDataMarking.Refused
+            assertEquals("store", answer.reason)
+            assertSame("after=$after: the very cause", cause, answer.cause)
+            assertTrue("after=$after: unconfirmed is published", h.facts.recordUnconfirmed)
+            assertEquals("after=$after: the marker as the store left it", after, h.store.record.mayContainPremiumData)
+        }
+        run {
+            val (h, fence, lifetime) = markable()
+            val error = object : Error("store error") {}
+            h.store.markFailsBefore = error
+            val thrown = try {
+                h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = false)
+                null
+            } catch (t: Throwable) {
+                t
+            }
+            assertSame("an Error is not a store refusal", error, thrown)
+            assertTrue(h.facts.recordUnconfirmed)
+        }
+    }
+
+    /**
+     * graphP2g: a marking cancelled while it waits for the issuer lock marks nothing; one cancelled inside the store leaves the
+     * store unconfirmed and ends as cancelled.
+     */
+    @Test
+    fun graphP2g_cancellation() = snapshotTest {
+        run {
+            val (h, fence, lifetime) = markable()
+            val rotation = CompletableDeferred<Unit>()
+            h.store.rotationGate = rotation
+            h.source.next = { active(krx = false) }
+            launch { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+            runCurrent()
+            assertTrue("premise: a rotation holds the lock", h.store.rotationParked.isCompleted)
+            val job = launch { h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = false) }
+            runCurrent()
+            assertTrue("premise: waiting for the lock", job.isActive && h.store.markCalls.isEmpty())
+            job.cancel()
+            rotation.complete(Unit); settle()
+            assertTrue(job.isCancelled)
+            assertEquals("waiting for the lock: nothing marked", emptyList<Pair<Boolean, Boolean>>(), h.store.markCalls)
+        }
+        run {
+            val (h, fence, lifetime) = markable()
+            val first = CompletableDeferred<Unit>()
+            h.store.markGate = first
+            launch { h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = false) }
+            runCurrent()
+            assertTrue("premise: a marking that leaves the use standing holds the lock", h.store.markParked.isCompleted)
+            var thrown: Throwable? = null
+            val job = launch {
+                try {
+                    h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = true)
+                } catch (t: Throwable) {
+                    thrown = t
+                    throw t
+                }
+            }
+            runCurrent()
+            assertTrue("premise: waiting for the lock", job.isActive)
+            job.cancel(); runCurrent()
+            assertTrue("waiting for the lock: the call ended in cancellation, $thrown", thrown is CancellationException)
+            first.complete(Unit); settle()
+            assertTrue("premise: the use still stands after the first marking", h.snapshot.admitsUse(lifetime))
+            assertEquals("waiting for the lock: only the first marking reached the store", listOf(true to false), h.store.markCalls)
+        }
+        run {
+            val (h, fence, lifetime) = markable()
+            h.store.markGate = CompletableDeferred()
+            var thrown: Throwable? = null
+            var unconfirmedAtThrow = false
+            val job = launch {
+                try {
+                    h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = false)
+                } catch (t: Throwable) {
+                    thrown = t
+                    unconfirmedAtThrow = h.facts.recordUnconfirmed
+                    throw t
+                }
+            }
+            runCurrent()
+            assertTrue("premise: inside the store", h.store.markParked.isCompleted)
+            job.cancel(); runCurrent()
+            assertTrue("inside the store: cancelled", job.isCancelled)
+            assertTrue("inside the store: the call itself ended in cancellation, not an answer: $thrown", thrown is CancellationException)
+            assertTrue("inside the store: unconfirmed was published before the cancellation reached the caller", unconfirmedAtThrow)
+            assertTrue("inside the store: unconfirmed is published", h.facts.recordUnconfirmed)
+        }
+        run {
+            val (h, fence, lifetime) = markable()
+            val cancelled = CancellationException("the store's own cancellation")
+            h.store.markFailsBefore = cancelled
+            val thrown = try {
+                h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = false)
+                null
+            } catch (t: CancellationException) {
+                t
+            }
+            assertSame("the very cancellation propagates", cancelled, thrown)
+            assertTrue("unconfirmed is published", h.facts.recordUnconfirmed)
+        }
+    }
+
+    /**
+     * graphP2h: the marking and a KRX rotation are serialised. A marking first lands its KRX marker, so the rotation that
+     * follows hands the old KRX namespace to the purge; a rotation first leaves the old use standing for nothing, so the late
+     * marking is refused and marks nothing.
+     */
+    @Test
+    fun graphP2h_theMarkingAndARotationAreSerialised() = snapshotTest {
+        run {
+            val (h, fence, lifetime) = markable()
+            val purged = mutableListOf<PurgeNamespace>()
+            h.purger.onCapability = { purged += it }
+            val oldKrx = h.krxEpoch()
+            val gate = CompletableDeferred<Unit>()
+            h.store.markGate = gate
+            var answer: GraphDataMarking? = null
+            launch { answer = h.coordinator.markGraphData(fence, lifetime, oldKrx, krx = true) }
+            runCurrent()
+            assertTrue("premise: the marking is parked inside the store", h.store.markParked.isCompleted)
+            h.source.next = { active(krx = false) }
+            launch { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+            runCurrent()
+            assertEquals("marking first: no rotation while the marking holds the lock", oldKrx, h.store.record.krxCapabilityEpoch)
+            assertTrue("marking first: no purge yet", purged.isEmpty())
+            gate.complete(Unit); settle()
+            val marked = answer as GraphDataMarking.Marked
+            assertTrue("marking first: marked, $answer", marked.record.mayContainKrxData)
+            assertEquals("marking first: the marker landed on the old KRX namespace", oldKrx, marked.record.krxCapabilityEpoch)
+            assertNotEquals("marking first: the rotation followed", oldKrx, h.store.record.krxCapabilityEpoch)
+            assertFalse("marking first: the live KRX namespace carries no marker", h.store.record.mayContainKrxData)
+            assertTrue("marking first: the old KRX namespace went to the purge",
+                purged.isNotEmpty() && purged.all { it.pending.krxCapabilityEpoch == oldKrx })
+        }
+        run {
+            val (h, fence, lifetime) = markable()
+            val rotation = CompletableDeferred<Unit>()
+            h.store.rotationGate = rotation
+            h.source.next = { active(krx = false) }
+            launch { h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+            runCurrent()
+            assertTrue("premise: the rotation holds the lock", h.store.rotationParked.isCompleted)
+            val krxEpoch = h.krxEpoch()
+            var answer: GraphDataMarking? = null
+            launch { answer = h.coordinator.markGraphData(fence, lifetime, krxEpoch, krx = true) }
+            runCurrent()
+            rotation.complete(Unit); settle()
+            assertTrue("rotation first: refused, $answer", answer is GraphDataMarking.Refused)
+            assertEquals("rotation first: nothing marked", emptyList<Pair<Boolean, Boolean>>(), h.store.markCalls)
+        }
+    }
+
+    /** graphP2i: marking again keeps the markers and changes neither owner, epochs, journal, grant nor use. */
+    @Test
+    fun graphP2i_aRepeatedMarkingChangesNothingElse() = snapshotTest {
+        val (h, fence, lifetime) = markable()
+        h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = true)
+        val first = h.store.record
+        val again = h.coordinator.markGraphData(fence, lifetime, h.krxEpoch(), krx = true) as GraphDataMarking.Marked
+        assertEquals("the same record", first, again.record)
+        assertTrue(again.record.mayContainPremiumData && again.record.mayContainKrxData)
+        assertEquals("the same grant", fence, h.coordinator.topicGrantResult().fence)
+        assertTrue("the same use", h.snapshot.admitsUse(lifetime))
+        assertEquals("each marking asks the store", listOf(true to true, true to true), h.store.markCalls)
+    }
+
+    /** graphP2j: with no confirmed record the marking refuses before any read or marking (cut_p2_agreed.r2 §1 step 1). */
+    @Test
+    fun graphP2j_noConfirmedRecordRefusesWithoutLoadingOrMarking() = snapshotTest {
+        val h = build()
+        val fence = TopicSessionFence(AuthIdentityFence(OWNER, 1L), "any-user-epoch", TopicGrantToken(1L))
+        val answer = h.coordinator.markGraphData(fence, TopicUseLifetime(fence.grant, 0L), "any-krx-epoch", krx = true)
+        assertEquals(GraphDataMarking.Refused("record"), answer)
+        assertEquals("no load", 0, h.store.loadCalls)
+        assertEquals("nothing marked", emptyList<Pair<Boolean, Boolean>>(), h.store.markCalls)
     }
 }

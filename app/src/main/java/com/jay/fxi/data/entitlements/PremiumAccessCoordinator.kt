@@ -5,6 +5,7 @@ import com.jay.fxi.data.auth.AuthCredentialRecovery
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.remote.TopicGrantToken
 import com.jay.fxi.data.remote.TopicSessionFence
+import com.jay.fxi.data.remote.TopicUseLifetime
 import com.jay.fxi.domain.model.TopicRejectionReason
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -1640,6 +1641,43 @@ class PremiumAccessCoordinator(
      * Wiring this to a session's `setAccess` is not done here.
      */
     internal suspend fun topicGrant(): TopicSessionFence? = topicGrantResult().fence
+
+    /**
+     * S4 CUT-P2: before the graph's first protected disk write under [fence] and [lifetime], persists the premium marker - and,
+     * when [krx] is asked and admitted for a non-null matching [krxCapabilityEpoch], the KRX marker - on the current
+     * namespace, under the issuer lock and through the observed store.
+     *
+     * An unconfirmed store or no confirmed record refuses, and so does a lifetime the snapshot does not admit, a grant other
+     * than the facts' token, a binding other than the fence's identity, or a USER epoch or owner other than the confirmed
+     * record's; none of these marks anything, and this never loads to recover confirmation. A store failure (an Exception)
+     * refuses with its cause and is not proof that nothing was persisted; cancellation and an Error propagate. Dormant: no
+     * caller until the cutover.
+     */
+    internal suspend fun markGraphData(
+        fence: TopicSessionFence,
+        lifetime: TopicUseLifetime,
+        krxCapabilityEpoch: String?,
+        krx: Boolean
+    ): GraphDataMarking = mutex.withLock {
+        if (store.unconfirmed) return@withLock GraphDataMarking.Refused("unconfirmed")
+        val record = lossSeals.lastConfirmed ?: return@withLock GraphDataMarking.Refused("record")
+        val snapshot = accessSnapshot
+        val facts = snapshot.facts
+        val epoch = fence.userAccessEpoch
+        if (!snapshot.admitsUse(lifetime) || facts.token != fence.grant ||
+            facts.binding != EntitlementsIdentity(fence.identity.uid, fence.identity.authGeneration) ||
+            epoch == null || record.ownerUid != fence.identity.uid || record.userAccessEpoch != epoch
+        ) return@withLock GraphDataMarking.Refused("access")
+        val markKrx = krx && facts.capabilityAllowed && krxCapabilityEpoch != null &&
+            record.krxCapabilityEpoch == krxCapabilityEpoch
+        try {
+            GraphDataMarking.Marked(store.markMayContainData(premium = true, krx = markKrx))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            GraphDataMarking.Refused("store", failure)
+        }
+    }
 
     /**
      * [topicGrant] together with the access snapshot published by the same lock hold (L-4e E1).
