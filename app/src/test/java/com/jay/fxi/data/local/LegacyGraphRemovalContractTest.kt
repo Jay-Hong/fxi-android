@@ -100,4 +100,63 @@ class LegacyGraphRemovalContractTest {
             PurgeManifest.TARGETS.single { it.id == "datastore:fxi_graph_preferences" }.note
         )
     }
+
+    /**
+     * GA01d (S4 D8, `cut_d8_agreed.r1.md`): the legacy socket service, its frame types, the v1 graph view and toggles and the
+     * v1 bucket model are gone from every source set's Kotlin and Java, and so is the legacy bucket field name. Three exceptions
+     * only, never a whole file: the four comments citing the iOS service by its `.swift` file, the two legacy frames the topic
+     * decoder test feeds in to show they are refused, and this row's own quoted data. The removed files are absent and the
+     * socket message file declares the message type alone. A static check is a regression guard; later boundary changes are
+     * for diff review.
+     */
+    @Test fun GA01d_theLegacySocketPathAndTheV1GraphViewAreGone() {
+        val names = listOf(
+            "WebSocketService", "WebSocketPing", "WebSocketRatesMessage", "IndicesPayload", "DxyLiveTick", "WebSocketGraphBucket",
+            "WebSocketGraphBuckets", "RateGraphView", "DxyToggleButton", "SourceToggleRow", "GraphBucket", "GraphPoint", "toGraphPoint"
+        )
+        val field = "graph" + "_buckets"
+        val root = File("src")
+        val sets = listOf("main", "debug", "test", "androidTest", "benchmark")
+        val files = sets.flatMap { set ->
+            File(root, set).walkTopDown().filter { it.isFile && (it.extension == "kt" || it.extension == "java") }.toList()
+        }.associate { it.relativeTo(root).invariantSeparatorsPath to it.readText() }
+        val self = "test/java/com/jay/fxi/data/local/LegacyGraphRemovalContractTest.kt"
+        val decoderTest = "test/java/com/jay/fxi/data/remote/TopicFrameDecoderTest.kt"
+        assertTrue("premise: the scan sees every source set holding code",
+            self in files && decoderTest in files && listOf("main/", "test/", "androidTest/", "benchmark/").all { p -> files.keys.any { it.startsWith(p) } })
+        val swiftCitations = mapOf(
+            "main/java/com/jay/fxi/data/remote/TopicSessionCoordinator.kt" to 3,
+            "main/java/com/jay/fxi/domain/model/TopicRequestPolicy.kt" to 1
+        )
+        val legacyFrame = "\"" + field + "\":{}"
+        val swift = names[0] + ".swift"
+        assertEquals("premise: the decoder test refuses two legacy frames", 2, Regex(Regex.escape(legacyFrame)).findAll(files.getValue(decoderTest)).count())
+        val hits = files.flatMap { (path, original) ->
+            var text = original
+            swiftCitations[path]?.let { n ->
+                assertEquals("$path: the iOS citations", n, Regex(Regex.escape(swift)).findAll(text).count())
+                text = text.replace(swift, "")
+            }
+            if (path == decoderTest) text = text.replace(legacyFrame, "")
+            if (path == self) names.forEach {
+                assertEquals("this row names $it once, as data", 1, Regex(Regex.escape("\"$it\"")).findAll(text).count())
+                text = text.replace("\"$it\"", "")
+            }
+            // ASCII boundaries: a name followed by Korean text in a comment still counts.
+            names.filter { Regex("""(?<![A-Za-z0-9_])$it(?![A-Za-z0-9_])""").containsMatchIn(text) }.map { "$path: $it" } +
+                listOfNotNull("$path: $field".takeIf { field in text })
+        }
+        assertEquals(emptyList<String>(), hits)
+        // No file of any removed name, nor the old service admission test, comes back in any source set, in Kotlin or Java.
+        val removedNames = names.toSet() + (names.first() + "AdmissionTest")
+        assertEquals("the removed files are absent", emptyList<String>(),
+            files.keys.filter { File(it).nameWithoutExtension in removedNames })
+        // Column-0 lines of the socket message file, past its package line, imports, comments and closing braces.
+        val message = files.getValue("main/java/com/jay/fxi/data/remote/dto/WebSocketMessage.kt")
+        val topLevel = message.lines().filter { line ->
+            line.isNotBlank() && !line[0].isWhitespace() && !line.startsWith("package ") && !line.startsWith("import ") &&
+                !line.startsWith("/") && !line.startsWith("*") && line != "}"
+        }
+        assertEquals("the socket message file declares the message type alone", listOf("object WebSocketMessageType {"), topLevel)
+    }
 }

@@ -1,12 +1,8 @@
 package com.jay.fxi.di
 
-import com.jay.fxi.data.remote.dto.IndicesPayload
 import com.jay.fxi.data.remote.dto.NotificationSettingsResponse
-import com.jay.fxi.data.remote.dto.WebSocketGraphBucket
-import com.jay.fxi.data.remote.dto.WebSocketRatesMessage
 import com.jay.fxi.domain.model.AlertSetting
 import com.jay.fxi.domain.model.ExchangeRate
-import com.jay.fxi.domain.model.GraphBucket
 import com.jay.fxi.domain.model.NewsItem
 import com.jay.fxi.domain.model.NewsMetadata
 import com.jay.fxi.domain.model.NewsResponse
@@ -103,16 +99,9 @@ class JsonProfilesTest {
         assertOnlyOptional(AlertSetting.serializer().descriptor, emptySet())
         assertOnlyOptional(NotificationSettingsResponse.serializer().descriptor, emptySet())
         assertOnlyOptional(ExchangeRate.serializer().descriptor, emptySet())
-        assertOnlyOptional(GraphBucket.serializer().descriptor, emptySet())
         assertOnlyOptional(NewsResponse.serializer().descriptor, emptySet())
         assertOnlyOptional(NewsMetadata.serializer().descriptor, emptySet())
         assertOnlyOptional(NewsItem.serializer().descriptor, setOf("link"))
-        assertOnlyOptional(
-            WebSocketRatesMessage.serializer().descriptor,
-            setOf("graph_buckets")
-        )
-        assertOnlyOptional(IndicesPayload.serializer().descriptor, setOf("dxy"))
-        assertOnlyOptional(WebSocketGraphBucket.serializer().descriptor, emptySet())
     }
 
     private fun assertOnlyOptional(descriptor: SerialDescriptor, expected: Set<String>) {

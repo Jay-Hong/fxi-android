@@ -79,9 +79,9 @@ private suspend fun AwaitPointerEventScope.awaitNextDownWithin(
  * (`GraphV2Section.swift:1182` enables the pan recogniser only when `isZoomedOrPanned`).
  * Swallowing it earlier would trap the user on one tab, because the chart fills the page.
  *
- * A hand-rolled loop rather than `detectTransformGestures` + `detectTapGestures`, for the reason
- * the paid graph records at `RateGraphView.kt:452`: once the pan branch consumes an event, a
- * chained tap detector never sees it. Everything has to be decided in one pass.
+ * A hand-rolled loop rather than `detectTransformGestures` + `detectTapGestures`: once the pan
+ * branch consumes an event, a chained tap detector never sees it. Everything has to be decided in
+ * one pass.
  */
 @Composable
 internal fun rememberGraphZoomGestures(
