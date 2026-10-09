@@ -10,7 +10,8 @@ import kotlinx.coroutines.withContext
 /**
  * S4 CUT-P3a: the install's stable spread seed (`free_snapshot/install_seed`), read - and created once if absent - off the
  * main thread on first [get], then held in memory. [current] reads only volatile memory: null until a successful value is published, then that value even before a waiting [get] returns.
- * Dormant: nothing in production constructs it; the free scheduler's own private reader is unchanged until CC1.
+ * Since S4 CUT-CC1 the seed module provides it as a process singleton, read ahead by the app start and shared by the free
+ * scheduler; the graph runtime takes the same instance from CC4.
  *
  * [get] serialises read attempts per instance, so at most one [read] runs at a time, and reads on [io] only while nothing is
  * cached. Concurrent calls that neither fail nor are cancelled share one read and one value. A failed read reaches only the

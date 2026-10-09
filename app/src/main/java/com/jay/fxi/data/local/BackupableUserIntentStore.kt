@@ -15,6 +15,7 @@ import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.util.Base64
 import javax.inject.Inject
+import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -89,7 +90,11 @@ sealed interface GraphSelectionDeleteResult {
     data class Uncertain(val cause: Throwable) : GraphSelectionDeleteResult
 }
 
-/** One atomic record per UID/audience/tab. B2 holds this file out of backup until S1 verifies admission. */
+/**
+ * One atomic record per UID/audience/tab. B2 holds this file out of backup until S1 verifies admission. A process singleton
+ * (S4 CUT-CC1), so the concrete type and the GraphSelectionStore interface are one object with one store mutex.
+ */
+@Singleton
 class BackupableUserIntentStore internal constructor(private val dataStore: DataStore<Preferences>) : GraphSelectionStore {
     @Inject
     constructor(@ApplicationContext context: Context) : this(context.backupableUserIntentDataStore)

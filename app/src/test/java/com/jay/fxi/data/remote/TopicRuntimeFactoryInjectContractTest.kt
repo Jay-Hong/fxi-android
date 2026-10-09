@@ -11,6 +11,7 @@ import com.jay.fxi.data.entitlements.AccessEpochStore
 import com.jay.fxi.data.entitlements.CapabilityScopePurger
 import com.jay.fxi.data.entitlements.EntitlementsSource
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
+import com.jay.fxi.data.entitlements.SnapshotTopicUseAuthority
 import com.jay.fxi.data.entitlements.UserScopePurger
 import com.jay.fxi.data.local.FreeTabStore
 import com.jay.fxi.data.local.TopicLastKnownStore
@@ -59,14 +60,18 @@ class TopicRuntimeFactoryInjectContractTest {
         val json = NetworkModule.provideWireJson()
         val api = AuthenticatedApiClient(untouched<AuthenticatedApiService>(), AuthenticatedTransport(tokens) { false }, json)
         val store = TopicLastKnownStore(untouched<DataStore<Preferences>>(), { 0L }, 1L, scope)
+        // S4 CUT-CC1-01: the authority is the shared provider's, handed in rather than built here.
+        val authority = SnapshotTopicUseAuthority { coordinator.accessSnapshot }
         calls.clear()
 
         val factory = TopicRuntimeFactory(tokens, orders, untouched<AuthFenceStream>(), untouched<AuthCredentialRecoveryStream>(),
             coordinator, TopicSnapshotBootstrapService(api, TopicFrameDecoder(json), 10.seconds), TopicFrameDecoder(json),
-            untouched<FreeTabStore>(), json, store)
+            untouched<FreeTabStore>(), json, store, authority)
 
         val held = TopicRuntimeFactory::class.java.getDeclaredField("lastKnown").apply { isAccessible = true }.get(factory)
         assertSame("C1-1 the factory holds the injected store", store, held)
+        val heldAuthority = TopicRuntimeFactory::class.java.getDeclaredField("authority").apply { isAccessible = true }.get(factory)
+        assertSame("CC1-01 the factory holds the injected authority", authority, heldAuthority)
         assertEquals("C1-1 construction called no dependency", emptyList<String>(), calls)
     }
 }

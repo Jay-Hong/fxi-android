@@ -16,6 +16,7 @@ import com.revenuecat.purchases.Purchases
 import com.revenuecat.purchases.PurchasesConfiguration
 import com.jay.fxi.data.entitlements.AuthAccessBinder
 import com.jay.fxi.data.free.FreeSnapshotScheduler
+import com.jay.fxi.data.free.InstallSeedPrefetch
 import com.jay.fxi.data.local.LegacyStorePurge
 import com.jay.fxi.data.local.RatesCacheCutover
 import com.jay.fxi.data.remote.TopicRuntimeOwner
@@ -37,15 +38,17 @@ internal fun shouldEnableCrashlytics(
 /**
  * Everything an admitted process starts, in one place that can be called without an `Application`.
  *
- * Written as a function taking the five starts rather than as statements in `onCreate`,
- * because one of them is silent when it does not happen. A missing [bindAccess] or
+ * Written as a function taking the six starts rather than as statements in `onCreate`,
+ * because some of them are silent when they do not happen. A missing [bindAccess] or
  * [startFreeSnapshots] shows up as an app that never signs in or never refreshes; a missing
- * [purgeRetiredStores] looks exactly like a phone that had nothing left to delete. Grouping them
- * makes the quiet one fail the same way as the loud ones — all five run, or the list is wrong and
+ * [purgeRetiredStores] looks exactly like a phone that had nothing left to delete, and a missing
+ * [prefetchInstallSeed] only moves the seed read to the scheduler's first use. Grouping them
+ * makes the quiet ones fail the same way as the loud ones — all six run, or the list is wrong and
  * `FXiApplicationStartTest` says so.
  */
 internal fun startAppOwnedServices(
     bindAccess: () -> Unit,
+    prefetchInstallSeed: () -> Unit,
     startFreeSnapshots: () -> Unit,
     startTopicOwner: () -> Unit,
     launchRateMigration: () -> Unit,
@@ -54,6 +57,9 @@ internal fun startAppOwnedServices(
     // The single process-wide auth -> access-state funnel. Identity only: it binds the owner and
     // retries a journalled purge, and issues no entitlement query of its own.
     bindAccess()
+
+    // Reads the install seed ahead on IO and returns at once (S4 CUT-CC1); creates it on a fresh install.
+    prefetchInstallSeed()
 
     // The single owner of every free-snapshot refresh. Starting it only binds identity and arms
     // deadlines; nothing is fetched until a screen says which tab is on show.
@@ -82,6 +88,10 @@ class FXiApplication : Application() {
     /** A [Provider] for the same reason: it observes `FirebaseAuth`. */
     @Inject
     lateinit var freeSnapshotScheduler: Provider<FreeSnapshotScheduler>
+
+    /** A [Provider]: its failure report resolves Crashlytics, so it is resolved after admission and Firebase. */
+    @Inject
+    internal lateinit var installSeedPrefetch: Provider<InstallSeedPrefetch>
 
     /** Resolve only after admission and Firebase initialization, like the other identity owners. */
     @Inject
@@ -116,6 +126,7 @@ class FXiApplication : Application() {
 
         startAppOwnedServices(
             bindAccess = { authAccessBinder.get().start() },
+            prefetchInstallSeed = { installSeedPrefetch.get().launch() },
             startFreeSnapshots = { freeSnapshotScheduler.get().start() },
             startTopicOwner = { topicRuntimeOwner.get().start() },
             launchRateMigration = { ratesCacheCutover.get().launch() },

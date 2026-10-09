@@ -18,6 +18,7 @@ import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -348,8 +349,10 @@ class CutoverFanOutAndSeedContractTest {
     // --- dormancy ---------------------------------------------------------------------------------------------------------
 
     /**
-     * D01: nothing outside the test source sets constructs either class or wires it into DI; each file names its class only in
-     * its declaration; the free scheduler keeps its own private seed reader.
+     * D01: nothing outside the test source sets constructs the fan-out or wires it into DI, and its file names it only in its
+     * declaration. Since S4 CUT-CC1-13 the seed has one production binding: the seed module provides it, the free scheduler
+     * module hands it to the scheduler through its one reader, and the prefetch start reads it ahead; the old lazy reader is
+     * gone.
      */
     @Test fun D01_dormant() {
         val src = File("src")
@@ -364,7 +367,7 @@ class CutoverFanOutAndSeedContractTest {
         assertTrue("premise: the scan sees the files", fanOut in all && seed in all && module in all && all.size > 100)
         assertTrue("premise: the scan reaches the benchmark source set", all.keys.any { it.startsWith("benchmark/") })
         assertTrue("premise: the scan skips the test source sets", all.keys.none { it.startsWith("test/") || it.startsWith("androidTest/") })
-        for ((path, name) in listOf(fanOut to "FanOutTopicGrantSink", seed to "InstallSeedSource")) {
+        for ((path, name) in listOf(fanOut to "FanOutTopicGrantSink")) {
             assertEquals("only its own file names $name", setOf(path),
                 code.filter { (_, text) -> Regex("""\b$name\b""").containsMatchIn(text) }.keys)
             val text = code.getValue(path)
@@ -372,7 +375,18 @@ class CutoverFanOutAndSeedContractTest {
             assertTrue("$path: declares $name", Regex("""\bclass\s+$name\s*\(""").containsMatchIn(text))
             assertTrue("$path: no DI annotation", !Regex("""@(Inject|AssistedInject|Singleton|Module|Provides|Binds|InstallIn|EntryPoint)\b""").containsMatchIn(text))
         }
-        assertTrue("the free scheduler keeps its own reader",
-            Regex("""installId\s*=\s*lazy\s*\{\s*installSeed\(context\)\s*}\s*::\s*value""").containsMatchIn(code.getValue(module)))
+        val seedModule = "main/java/com/jay/fxi/di/InstallSeedModule.kt"
+        val prefetch = "main/java/com/jay/fxi/data/free/InstallSeedPrefetch.kt"
+        assertEquals("the seed is named by its declaration, its module, the prefetch and the scheduler module only",
+            setOf(seed, seedModule, prefetch, module),
+            code.filter { (_, t) -> Regex("""\bInstallSeedSource\b""").containsMatchIn(t) }.keys)
+        val seedText = code.getValue(seed)
+        assertEquals("$seed names its class only in its declaration", 1, Regex("""\bInstallSeedSource\b""").findAll(seedText).count())
+        assertFalse("$seed carries no DI annotation", Regex("""@(?:[A-Za-z_][\w.]*\.)?(Inject|AssistedInject|Singleton|Module|Provides|Binds|InstallIn|EntryPoint)\b""").containsMatchIn(seedText))
+        assertEquals("one seed provider", 1, Regex("""fun \w+\([^)]*\)\s*:\s*InstallSeedSource\s*=""").findAll(code.getValue(seedModule)).count())
+        val scheduler = code.getValue(module)
+        assertTrue("the scheduler gets the shared source through its one reader",
+            Regex("""installId\s*=\s*freeSchedulerInstallId\(seeds\)""").containsMatchIn(scheduler))
+        assertFalse("the old lazy reader is gone", Regex("""\blazy\s*\{|\binstallSeed\(""").containsMatchIn(scheduler))
     }
 }

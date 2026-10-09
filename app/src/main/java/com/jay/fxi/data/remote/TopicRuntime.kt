@@ -9,7 +9,6 @@ import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.PremiumAccessTopicGrantIssuer
-import com.jay.fxi.data.entitlements.SnapshotTopicUseAuthority
 import com.jay.fxi.data.entitlements.TopicGrantDeliverer
 import com.jay.fxi.data.entitlements.TopicGrantIssuer
 import com.jay.fxi.data.free.FreeSnapshotSchedulePolicy
@@ -83,7 +82,8 @@ internal class TopicRuntimeFactory internal constructor(
         decoder: TopicFrameDecoder,
         tabs: FreeTabStore,
         @WireJson json: Json,
-        lastKnown: TopicLastKnownStore
+        lastKnown: TopicLastKnownStore,
+        authority: TopicUseAuthority
     ) : this(
         webSocketFactory = ::buildWebSocketClient,
         webSocketUrl = ApiConfig.WS_URL,
@@ -96,7 +96,7 @@ internal class TopicRuntimeFactory internal constructor(
         tabs = tabs,
         credentials = AuthTokenTopicCommandCredentials(tokenProvider),
         orders = orders,
-        authority = SnapshotTopicUseAuthority { coordinator.accessSnapshot },
+        authority = authority,
         clock = ElapsedRealtimeTopicCommandClock(),
         newBootstrapFloor = { clock -> TopicBootstrapRetryFloor(clock) { Clock.System.now() } },
         newScope = { CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1)) },

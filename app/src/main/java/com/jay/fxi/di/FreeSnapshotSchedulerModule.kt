@@ -1,10 +1,10 @@
 package com.jay.fxi.di
 
-import android.content.Context
 import com.google.firebase.crashlytics.FirebaseCrashlytics
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.entitlements.AuthUidStream
 import com.jay.fxi.data.free.FreeSnapshotScheduler
+import com.jay.fxi.data.free.InstallSeedSource
 import com.jay.fxi.data.local.DataStoreFreeTabStore
 import com.jay.fxi.data.local.DataStoreFreeVisibleSeriesStore
 import com.jay.fxi.data.local.DataStoreRateRowPreferenceStore
@@ -15,13 +15,12 @@ import com.jay.fxi.domain.repository.FreeSnapshotFetching
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
-import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
-import java.util.UUID
 import javax.inject.Singleton
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.runBlocking
 import kotlinx.datetime.Clock
 
 @Module
@@ -30,11 +29,11 @@ object FreeSnapshotSchedulerModule {
 
     @Provides
     @Singleton
-    fun provideFreeSnapshotScheduler(
+    internal fun provideFreeSnapshotScheduler(
         fetcher: FreeSnapshotFetching,
         uidStream: AuthUidStream,
         tokenProvider: AuthTokenProvider,
-        @ApplicationContext context: Context
+        seeds: InstallSeedSource
     ): FreeSnapshotScheduler = FreeSnapshotScheduler(
         fetcher = fetcher,
         uidStream = uidStream,
@@ -45,10 +44,9 @@ object FreeSnapshotSchedulerModule {
         onEventFailure = FirebaseCrashlytics.getInstance()::recordException,
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
         clock = Clock.System::now,
-        // `lazy` rather than a value: this provider is resolved from `Application.onCreate`, and
-        // the seed comes off disk. The scheduler asks for it from its own coroutine, after the
-        // first fetch completes — never on the main thread.
-        installId = lazy { installSeed(context) }::value
+        // The scheduler asks for the seed from its own coroutine, after the first fetch completes — never on the main
+        // thread. By then the app start has usually read it ahead on IO (S4 CUT-CC1).
+        installId = freeSchedulerInstallId(seeds)
     )
 
     @Provides
@@ -67,26 +65,12 @@ object FreeSnapshotSchedulerModule {
         store: DataStoreRateRowPreferenceStore
     ): RateRowPreferenceStore = store
 
-    /**
-     * A stable random value, drawn once per install.
-     *
-     * It only ever feeds the jitter that spreads clients across the refresh window, so its single
-     * requirement is that it survive restarts — a value redrawn on every launch would still spread,
-     * but would move this install's slot around and make a herd harder to reason about. It is
-     * deliberately not a device identifier: nothing derives it from the hardware and it does not
-     * leave the process. iOS keeps the same value under `free_snapshot_install_seed` in
-     * `UserDefaults`; this is the same idea in `SharedPreferences`. A device-transfer restore can
-     * copy it, so "per install" is not strict — uniqueness is not a correctness requirement here,
-     * only spread.
-     */
-    private fun installSeed(context: Context): String {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        prefs.getString(KEY_INSTALL_SEED, null)?.let { return it }
-        val seed = UUID.randomUUID().toString()
-        prefs.edit().putString(KEY_INSTALL_SEED, seed).apply()
-        return seed
-    }
-
-    private const val PREFS = "free_snapshot"
-    private const val KEY_INSTALL_SEED = "install_seed"
 }
+
+/**
+ * S4 CUT-CC1: the free scheduler's synchronous seed. Memory only once the seed is published; otherwise this blocks the
+ * scheduler's Default event coroutine until the shared source has read it on IO, serialised with every other call to that
+ * source. The loop handles no other event meanwhile, and a bare runBlocking does not inherit the caller's Job. Only the free
+ * scheduler uses this fallback; Main, the graph jitter and graph initialization never do.
+ */
+internal fun freeSchedulerInstallId(seeds: InstallSeedSource): () -> String = { seeds.current ?: runBlocking { seeds.get() } }

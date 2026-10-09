@@ -72,8 +72,9 @@ class FreeSnapshotScheduler(
     private val scope: CoroutineScope,
     private val clock: () -> Instant,
     /**
-     * Resolved lazily, on the loop coroutine. The seed is read from disk, and the only caller that
-     * could reach it eagerly is `Application.onCreate` on the main thread.
+     * Called on the loop coroutine, never at construction: the only caller that could reach it eagerly is
+     * `Application.onCreate` on the main thread. The app start usually reads the seed ahead on IO (S4 CUT-CC1), so this
+     * reads memory; otherwise it waits for that read.
      */
     private val installId: () -> String
 ) {
