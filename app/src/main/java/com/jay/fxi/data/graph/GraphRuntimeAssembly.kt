@@ -192,12 +192,18 @@ internal class GraphRuntimeAssembly(
         }
     }
 
-    fun start() {
-        if (closed || started || !assemblyJob.isActive) return
+    /**
+     * S4 CUT-CC4a: false, doing nothing, when closed, already started or the assembly job is inactive. True once this call has
+     * made the coordinator -> recorder -> sink start calls and they returned normally; true does not mean the loop has taken
+     * its first dispatch or handled any input.
+     */
+    fun start(): Boolean {
+        if (closed || started || !assemblyJob.isActive) return false
         started = true
         coordinator.start()
         recorder.start()
         sink.start()
+        return true
     }
 
     suspend fun close() {

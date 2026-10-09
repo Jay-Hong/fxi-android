@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.time.Duration.Companion.days
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -125,7 +126,7 @@ class GraphV2DiskStoreTest {
     }
 
     private fun store(files: Files = Files()): GraphV2DiskStore =
-        FileGraphV2DiskStore(folder.root, codec, files, Dispatchers.IO)
+        FileGraphV2DiskStore({ folder.root }, codec, files, Dispatchers.IO)
 
     private fun isKrx(file: File) = file.relativeTo(folder.root).invariantSeparatorsPath.startsWith("krx/")
     private fun files() = folder.root.walk().filter { it.isFile }.toList()
@@ -402,6 +403,127 @@ class GraphV2DiskStoreTest {
         assertNull(s.general(components(epoch = "e1", tab = "usd")))
         assertNull(s.general(components(epoch = "e1", tab = "jpy")))
         assertEquals(1390.0, s.general(components(epoch = "e2")))
+    }
+
+    // --- S4 CUT-CC4a: the root is resolved lazily, on the I/O dispatcher, inside each operation's failure handling ----------
+
+    /** A root supplier that counts its calls, notes their threads, and fails or is cancelled while [fail] is set. */
+    private inner class Root {
+        val threads: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
+        @Volatile var fail: Throwable? = null
+        fun asked() = threads.size
+        val supplier: () -> File = {
+            threads += Thread.currentThread().name
+            fail?.let { throw it }
+            folder.root
+        }
+    }
+
+    private fun ioNamed(name: String) =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, name) }
+
+    /**
+     * CC4a-L01: constructing the store, reserving, cancelling and withdrawing a write, and a purge refused by its own checks
+     * never ask for the root; a purge whose root fails still keeps the invalidation it made before its I/O.
+     */
+    @Test fun CC4aL01_theRootIsNotAskedOutsideTheIo() = runBlocking {
+        val root = Root()
+        val s = FileGraphV2DiskStore(root.supplier, codec, Files(), Dispatchers.IO)
+        val first = reserved(s, components(epoch = "e1"))
+        s.cancelWrite(first)
+        val second = reserved(s, components(epoch = "e1", response = "r2"))
+        assertTrue("CC4a-L01 fixture: a KRX half to withdraw", s.withdrawKrx(second))
+        assertTrue("CC4a-L01 refused purge", s.purge(GraphV2DiskComponent.GENERAL, PurgeScope.USER, ns(null, "e2", null, "e1", null, PurgeScope.USER)) is TargetOutcome.Failed)
+        assertEquals("CC4a-L01 the root was not asked", 0, root.asked())
+        root.fail = IOException("no root")
+        val third = reserved(s, components(epoch = "e1", response = "r3"))
+        assertTrue("CC4a-L01 purge with a failing root", s.purge(GraphV2DiskComponent.GENERAL, PurgeScope.USER, ns("u1", "e2", null, "e1", null, PurgeScope.USER)) is TargetOutcome.Failed)
+        assertEquals("CC4a-L01 the purge asked once", 1, root.asked())
+        root.fail = null
+        skipped("CC4a-L01 the invalidation before the purge's I/O stays", s.write(third, open).general)
+    }
+
+    /** CC4a-L02: the first read, write or purge resolves the root on the I/O dispatcher, once, and the store keeps it. */
+    @Test fun CC4aL02_theRootIsResolvedOnceOnTheIoDispatcher() = runBlocking {
+        for (op in listOf("read", "write", "purge")) {
+            val root = Root()
+            val pool = ioNamed("cc4a-io-$op")
+            try {
+                val s = FileGraphV2DiskStore(root.supplier, codec, Files(), pool.asCoroutineDispatcher())
+                val c = components(epoch = "e1")
+                when (op) {
+                    "read" -> s.readGeneral(c.general.key, null, open)
+                    "write" -> s.save(c)
+                    else -> s.purge(GraphV2DiskComponent.GENERAL, PurgeScope.USER, ns("u1", "e2", null, "e1", null, PurgeScope.USER))
+                }
+                // Coroutine debug mode suffixes the thread name with the coroutine's.
+                assertEquals("CC4a-L02 $op: asked once, on the I/O dispatcher", listOf("cc4a-io-$op"), root.threads.map { it.substringBefore(" @") })
+                // e2 is the live epoch every purge here keeps.
+                s.save(components(epoch = "e2"))
+                assertEquals(1390.0, s.general(components(epoch = "e2")))
+                s.purge(GraphV2DiskComponent.KRX, PurgeScope.USER, ns("u1", "e2", null, "e1", null, PurgeScope.USER))
+                assertEquals("CC4a-L02 $op: the first value is kept", 1, root.asked())
+            } finally {
+                pool.shutdownNow()
+            }
+        }
+    }
+
+    /**
+     * CC4a-L03: a failing root is each operation's own failure — a Failed read, a Failed general half with the KRX half not
+     * written, a Failed purge — nothing is kept, and the next operation asks again and succeeds.
+     */
+    @Test fun CC4aL03_aFailingRootIsTheOperationsFailure_andIsAskedAgain() = runBlocking {
+        for (op in listOf("read", "write", "purge")) {
+            val root = Root()
+            val s = FileGraphV2DiskStore(root.supplier, codec, Files(), Dispatchers.IO)
+            val c = components(epoch = "e1")
+            root.fail = IOException("no root")
+            when (op) {
+                "read" -> assertTrue("CC4a-L03 read", s.readGeneral(c.general.key, null, open) is GraphV2DiskRead.Failed)
+                "write" -> s.save(c).let { failed("CC4a-L03 write general", it.general); skipped("CC4a-L03 write krx", it.krx) }
+                else -> assertTrue("CC4a-L03 purge", s.purge(GraphV2DiskComponent.GENERAL, PurgeScope.USER, ns("u1", "e2", null, "e1", null, PurgeScope.USER)) is TargetOutcome.Failed)
+            }
+            assertEquals("CC4a-L03 $op: no file", emptyList<File>(), files())
+            root.fail = null
+            val again = components(epoch = "e2")
+            assertEquals("CC4a-L03 $op: the next write lands", GraphV2ComponentWriteOutcome.Replaced, s.save(again).general)
+            assertEquals("CC4a-L03 $op: and asked again", 2, root.asked())
+            folder.root.listFiles()?.forEach { it.deleteRecursively() }
+        }
+    }
+
+    /** CC4a-L04: a root supplier cancelled is not a failure: it propagates from a read, a write and a purge. */
+    @Test fun CC4aL04_aCancelledRootPropagates() = runBlocking {
+        for (op in listOf("read", "write", "purge")) {
+            val root = Root()
+            val s = FileGraphV2DiskStore(root.supplier, codec, Files(), Dispatchers.IO)
+            val c = components(epoch = "e1")
+            root.fail = CancellationException("caller left")
+            try {
+                when (op) {
+                    "read" -> s.readGeneral(c.general.key, null, open)
+                    "write" -> s.save(c)
+                    else -> s.purge(GraphV2DiskComponent.GENERAL, PurgeScope.USER, ns("u1", "e2", null, "e1", null, PurgeScope.USER))
+                }
+                fail("CC4a-L04 $op: cancellation was swallowed")
+            } catch (expected: CancellationException) {
+                assertEquals("CC4a-L04 $op", "caller left", expected.message)
+            }
+        }
+        // A purge cancelled at its root keeps the invalidation it made before its I/O.
+        val root = Root()
+        val s = FileGraphV2DiskStore(root.supplier, codec, Files(), Dispatchers.IO)
+        val pending = reserved(s, components(epoch = "e1"))
+        root.fail = CancellationException("caller left")
+        try {
+            s.purge(GraphV2DiskComponent.GENERAL, PurgeScope.USER, ns("u1", "e2", null, "e1", null, PurgeScope.USER))
+            fail("CC4a-L04 purge: cancellation was swallowed")
+        } catch (expected: CancellationException) {
+            assertEquals("caller left", expected.message)
+        }
+        root.fail = null
+        skipped("CC4a-L04 the invalidation before the purge's I/O stays", s.write(pending, open).general)
     }
 
     /** Cancellation is not a failure to report: it propagates. */

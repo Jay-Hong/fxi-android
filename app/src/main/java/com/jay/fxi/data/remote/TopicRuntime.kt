@@ -25,16 +25,19 @@ import com.jay.fxi.util.ApiConfig
 import java.util.UUID
 import javax.inject.Inject
 import kotlin.coroutines.ContinuationInterceptor
+import kotlin.coroutines.CoroutineContext
 import kotlin.random.Random
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.withContext
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlinx.serialization.encodeToString
@@ -151,13 +154,27 @@ internal class TopicRuntimeFactory internal constructor(
     }
 }
 
+/**
+ * S4 CUT-CC4a: detaches [inputs] and [grants] as one task on the session's serial dispatcher [serial], non-cancellably — after
+ * any graph offer already queued or running there, its recorded loss included. [TopicRuntime.detachGraph]'s whole work.
+ */
+internal suspend fun detachGraphOn(serial: CoroutineContext, inputs: DetachableTopicGraphSink?, grants: DetachableTopicGrantSink?) {
+    withContext(serial + NonCancellable) {
+        inputs?.detach()
+        grants?.detach()
+    }
+}
+
 /** Owns one session and its inputs for a single start-to-stop lifetime. */
 internal class TopicRuntime internal constructor(
     private val scope: CoroutineScope,
     private val session: TopicSessionCoordinator,
     private val deliverer: TopicGrantDeliverer,
     private val focusProvider: TopicFocusProvider,
-    private val recoveries: AuthCredentialRecoveryStream
+    private val recoveries: AuthCredentialRecoveryStream,
+    /** S4 CUT-CC4a: the session's graph input and the graph's grant delivery as installed, each detachable; none until CC4b. */
+    private val graphInputs: DetachableTopicGraphSink? = null,
+    private val graphGrants: DetachableTopicGrantSink? = null
 ) {
     private var started = false
     private var stopped = false
@@ -182,6 +199,19 @@ internal class TopicRuntime internal constructor(
 
     /** The screen's read-only view of this session. */
     val display: StateFlow<TopicDisplayState> = session.display
+
+    /**
+     * S4 CUT-CC4a: cuts the graph off this session for good. Runs on the session's own serial dispatcher, so any graph offer
+     * already under way — its hand-over and the loss it records — has finished first; once this returns, no new input or grant
+     * reaches the failed sink or bridge and no new input loss is recorded. Losses already recorded stay. It depends on neither
+     * the session's inbox nor a job of this runtime's scope, so it completes before start and after stop as well. Repeating it
+     * is harmless. Call it from Main's non-cancellable cleanup.
+     */
+    internal suspend fun detachGraph() {
+        if (graphInputs == null && graphGrants == null) return
+        detachGraphOn(checkNotNull(scope.coroutineContext[ContinuationInterceptor]) { "The session scope has no dispatcher" },
+            graphInputs, graphGrants)
+    }
 
     /** S4 CUT-CC2b: the session's own P7 permit supplier, handed through unchanged. Dormant: read from CC4. */
     internal val graphRecoveryPermit: () -> TopicGraphRecoveryPermit? = session.recoveryPermit

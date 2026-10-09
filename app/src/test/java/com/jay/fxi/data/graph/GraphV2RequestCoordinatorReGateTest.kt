@@ -299,7 +299,7 @@ class GraphV2RequestCoordinatorReGateTest {
         fun clearAccessHooks() = accessHooks.clear()
         val root: File = folder.newFolder()
         val files = RecordingFiles()
-        val store = HeldStore(FileGraphV2DiskStore(root, codec, files, StandardTestDispatcher(test.testScheduler)))
+        val store = HeldStore(FileGraphV2DiskStore({ root }, codec, files, StandardTestDispatcher(test.testScheduler)))
         val diagnostics = mutableListOf<GraphV2SeedDiagnostic>()
         val failures = mutableListOf<Throwable>()
         val sent = mutableListOf<Sent>()

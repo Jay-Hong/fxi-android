@@ -20,6 +20,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.emptyPreferences
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import com.jay.fxi.data.remote.dto.SubscriptionAck
@@ -257,6 +258,57 @@ class TopicRuntimeFactoryTest {
         runtime.start()
         runtime.setOnline(true)
         return h to runtime
+    }
+
+    /** Runs nothing until [release]: the session's dispatcher held, to see whether a task waits for it. */
+    private class HeldDispatcher : kotlinx.coroutines.CoroutineDispatcher() {
+        private val held = mutableListOf<Runnable>()
+        override fun dispatch(context: kotlin.coroutines.CoroutineContext, block: Runnable) { held += block }
+        fun release() { val blocks = held.toList(); held.clear(); blocks.forEach { it.run() } }
+    }
+
+    /**
+     * CC4a-RT1 (S4 CUT-CC4a): detachGraph() runs on the runtime scope's dispatcher — it does not complete until that dispatcher
+     * runs it — and detaches both installed connections; it completes before start and again after stop.
+     */
+    @Test
+    fun CC4aRT1_detachGraphRunsOnTheSessionDispatcher_beforeStartAndAfterStop() = runTest {
+        val h = Harness(this)
+        val made = h.factory.create()
+        fun <T> part(name: String): T {
+            val f = TopicRuntime::class.java.getDeclaredField(name).apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST") return f.get(made) as T
+        }
+        for (stage in listOf("before start", "after stop")) {
+            val held = HeldDispatcher()
+            val offered = mutableListOf<TopicGraphInput>()
+            val inputs = DetachableTopicGraphSink { offered += it; TopicGraphOffer.ENQUEUED }
+            val granted = mutableListOf<String>()
+            val grants = DetachableTopicGrantSink(object : TopicGrantSink {
+                override fun setAccess(allowed: Boolean, fence: TopicSessionFence?, origin: TopicGrantOrigin) { granted += "set" }
+                override fun accessRevised() { granted += "revised" }
+            })
+            val runtime = TopicRuntime(
+                kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + held),
+                part("session"), part("deliverer"), part("focusProvider"), part("recoveries"), inputs, grants
+            )
+            if (stage == "after stop") runtime.stop()
+            var done = false
+            val detaching = backgroundScope.launch(kotlinx.coroutines.test.StandardTestDispatcher(testScheduler)) {
+                runtime.detachGraph(); done = true
+            }
+            runCurrent()
+            assertFalse("CC4a-RT1 $stage: waits for the session's dispatcher", done)
+            held.release(); runCurrent()
+            assertTrue("CC4a-RT1 $stage: completes", done && detaching.isCompleted)
+            val probe = TopicGraphInput.Continuity(
+                1L, TopicGraphEventKind.INITIAL, null, emptySet(), emptySet(),
+                TopicGraphAuthority(Any(), F1, 1L, null), null, 0L
+            )
+            assertEquals("CC4a-RT1 $stage: inputs detached", TopicGraphOffer.DORMANT, inputs.tryOffer(probe))
+            grants.accessRevised()
+            assertTrue("CC4a-RT1 $stage: nothing reached either target", offered.isEmpty() && granted.isEmpty())
+        }
     }
 
     @Test

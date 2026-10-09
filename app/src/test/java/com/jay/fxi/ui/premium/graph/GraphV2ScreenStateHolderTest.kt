@@ -348,7 +348,7 @@ class GraphV2ScreenStateHolderTest {
         )
 
         val root: File = folder.newFolder()
-        val store = FileGraphV2DiskStore(root, JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), dispatcher)
+        val store = FileGraphV2DiskStore({ root }, JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), dispatcher)
 
         val fetcher = object : GraphV2Fetching {
             override suspend fun catalog(owner: AuthSnapshot, useAdmitted: () -> Boolean): AuthenticatedHttpResponse<GraphV2CatalogResponse> {

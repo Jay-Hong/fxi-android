@@ -17153,6 +17153,84 @@ class TopicSessionCoordinatorTest {
         own.scope.cancel()
     }
 
+    // ---- S4 CUT-CC4a: detaching the graph from the session (`cut_cc4_agreed.r1.md`) -----------------------------------
+
+    /**
+     * CC4a-D01: a detach asked for while a graph offer is inside the sink completes only after that offer's loss is recorded —
+     * it runs as its own task on the session's serial dispatcher — and from then on no input reaches the sink and no loss is
+     * recorded; losses already recorded stay.
+     */
+    @Test
+    fun `CC4a-D01 a detach completes after the offer under way has recorded its loss, and nothing follows it`() = runTest {
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD))
+        val g = GraphRecorder(h)
+        val detachable = DetachableTopicGraphSink(g)
+        val grantCalls = mutableListOf<String>()
+        val grants = DetachableTopicGrantSink(object : TopicGrantSink {
+            override fun setAccess(allowed: Boolean, fence: TopicSessionFence?, origin: TopicGrantOrigin) { grantCalls += "set" }
+            override fun accessRevised() { grantCalls += "revised" }
+        })
+        h.graphSink = detachable
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val serial = checkNotNull(h.scope.coroutineContext[kotlin.coroutines.ContinuationInterceptor])
+        var lossAtDetach: Long? = -1L
+        var detachDone = false
+        g.answer = { input ->
+            if (input is TopicGraphInput.Observations && !detachDone) {
+                // From another dispatcher, as the starter on Main: the detach is its own task on the serial dispatcher.
+                backgroundScope.launch(kotlinx.coroutines.test.StandardTestDispatcher(testScheduler), CoroutineStart.UNDISPATCHED) {
+                    detachGraphOn(serial, detachable, grants)
+                    detachDone = true
+                    lossAtDetach = h.coordinator.graphLoss.value?.revision
+                }
+            }
+            if (input is TopicGraphInput.Observations) TopicGraphOffer.FULL else TopicGraphOffer.ENQUEUED
+        }
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        assertTrue("CC4a-D01 fixture: detached", detachDone)
+        val recorded = checkNotNull(h.coordinator.graphLoss.value) { "CC4a-D01 fixture: the offer under way was a loss" }
+        assertEquals("CC4a-D01 the loss was recorded before the detach completed", recorded.revision, lossAtDetach)
+        val handed = g.inputs.size
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1391.0, gT2))))
+        advanceTimeBy(1)
+        assertEquals("CC4a-D01 nothing reaches the sink after the detach", handed, g.inputs.size)
+        assertSame("CC4a-D01 no loss after the detach, and the earlier one stays", recorded, h.coordinator.graphLoss.value)
+        grants.setAccess(true, null, TopicGrantOrigin.NewContext)
+        grants.accessRevised()
+        assertTrue("CC4a-D01 the grant connection is detached with it", grantCalls.isEmpty())
+        h.cleanUp()
+    }
+
+    /** CC4a-D02: a detach asked for by a caller already cancelled still detaches both connections — it is non-cancellable. */
+    @Test
+    fun `CC4a-D02 a detach from a cancelled caller still completes`() = runTest {
+        val inputs = DetachableTopicGraphSink { TopicGraphOffer.FULL }
+        val grantCalls = mutableListOf<String>()
+        val grants = DetachableTopicGrantSink(object : TopicGrantSink {
+            override fun setAccess(allowed: Boolean, fence: TopicSessionFence?, origin: TopicGrantOrigin) { grantCalls += "set" }
+            override fun accessRevised() { grantCalls += "revised" }
+        })
+        val serial = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler)
+        val caller = launch {
+            coroutineContext[kotlinx.coroutines.Job]!!.cancel()
+            detachGraphOn(serial, inputs, grants)
+        }
+        runCurrent()
+        assertTrue("CC4a-D02 fixture: the caller ended", caller.isCompleted)
+        val probe = TopicGraphInput.Continuity(
+            1L, TopicGraphEventKind.INITIAL, null, emptySet(), emptySet(),
+            TopicGraphAuthority(Any(), TopicSessionFence(AuthIdentityFence("u1", 1L), "epoch-1", TopicGrantToken(1L)), 1L, null),
+            null, 0L
+        )
+        assertEquals("CC4a-D02 the input connection is detached", TopicGraphOffer.DORMANT, inputs.tryOffer(probe))
+        grants.accessRevised()
+        assertTrue("CC4a-D02 the grant connection is detached", grantCalls.isEmpty())
+    }
+
     @Test
     fun `G2A-11 the same trace with continuity events decides the same things with a dormant or a recording sink`() = runTest {
         val dormant = Harness(this, inert = true, desired = setOf(TETHER, USD))

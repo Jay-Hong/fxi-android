@@ -5,6 +5,7 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.graph.DefaultGraphV2AtomicFileIo
 import com.jay.fxi.data.graph.FileGraphV2DiskStore
+import com.jay.fxi.data.free.InstallSeedSource
 import com.jay.fxi.data.graph.GraphAccessFenceBridge
 import com.jay.fxi.data.graph.GraphCapabilityScope
 import com.jay.fxi.data.graph.GraphDataScope
@@ -110,6 +111,7 @@ import kotlinx.coroutines.Runnable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -120,6 +122,7 @@ import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import kotlinx.datetime.Instant
 import okhttp3.Headers
 import org.junit.Assert.assertEquals
@@ -1622,7 +1625,7 @@ class PremiumAccessTopicSnapshotTest {
             rateLimitJitter = { Duration.ZERO },
             onEventFailure = { failures += it },
             cachePorts = GraphV2CachePorts(
-                store ?: FileGraphV2DiskStore(folder.newFolder(), JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), dispatcher),
+                store ?: FileGraphV2DiskStore(folder.newFolder().let { dir -> { dir } }, JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), dispatcher),
                 access,
                 onSeedDiagnostic = {}
             ),
@@ -2672,7 +2675,7 @@ class PremiumAccessTopicSnapshotTest {
         private fun ports(gate: GraphV2AccessGate): GraphV2CachePorts? {
             portsGate = gate
             if (!disk) return null
-            val real = FileGraphV2DiskStore(folder.newFolder(), JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), queue)
+            val real = FileGraphV2DiskStore(folder.newFolder().let { dir -> { dir } }, JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), queue)
             val counted = object : GraphV2DiskStore by real {
                 override suspend fun readGeneral(
                     key: GraphV2GeneralKey,
@@ -2761,6 +2764,16 @@ class PremiumAccessTopicSnapshotTest {
         return checkNotNull(h.coordinator.topicGrantResult().fence) { "premise: a new grant" }
     }
 
+    /** A 503, as the authenticated transport hands it over. */
+    private fun <T> unavailable(): AuthenticatedHttpResponse<T> {
+        val headers = Headers.headersOf()
+        return AuthenticatedHttpResponse(
+            503, headers, null,
+            AuthenticatedHttpFailure(503, headers, byteArrayOf(), null, null, AuthenticatedFailureKind.OTHER_HTTP),
+            byteArrayOf(1)
+        )
+    }
+
     /** A 429 with no Retry-After, as the authenticated transport hands it over. */
     private fun <T> rateLimited(): AuthenticatedHttpResponse<T> {
         val headers = Headers.headersOf()
@@ -2803,6 +2816,452 @@ class PremiumAccessTopicSnapshotTest {
         assertEquals("a second start sends nothing more", sends, r.sent.size)
         assertEquals(1, r.held())
         assertTrue(r.failures.isEmpty())
+    }
+
+    /**
+     * CC4a-S01 (S4 CUT-CC4a): start() answers whether it started the assembly — true once, and the coordinator runs; false,
+     * running nothing, on a second call, after close(), and when the assembly's job is no longer active (its parent cancelled).
+     */
+    @Test
+    fun `CC4a-S01 start answers true once and false when closed, already started or the job is inactive`() = snapshotTest {
+        for (case in listOf("fresh", "closed", "parent cancelled")) {
+            val r = AssemblyRig(this, granted())
+            r.deliverIssued()
+            r.a.coordinator.onActivated(KEY_3M)
+            when (case) {
+                "closed" -> r.a.close()
+                "parent cancelled" -> r.parent.cancel()
+            }
+            runCurrent()
+            val started = r.a.start()
+            runCurrent()
+            if (case == "fresh") {
+                assertTrue("CC4a-S01 $case: true", started)
+                assertTrue("CC4a-S01 $case: the coordinator runs", r.sent.isNotEmpty())
+                val sends = r.sent.size
+                assertFalse("CC4a-S01 $case: a second start is false", r.a.start())
+                runCurrent()
+                assertEquals("CC4a-S01 $case: and sends nothing more", sends, r.sent.size)
+            } else {
+                assertFalse("CC4a-S01 $case: false", started)
+                assertTrue("CC4a-S01 $case: nothing runs", r.sent.isEmpty())
+                assertNull("CC4a-S01 $case: the coordinator has not run", r.a.coordinator.state.value.dataScope)
+            }
+            r.a.close()
+        }
+    }
+
+    // ---- S4 CUT-CC4a: ProcessGraphStarter (`cut_cc4_agreed.r1.md`) -------------------------------------------------------
+
+    /** Runs nothing until [release]; then runs what it holds, in order, on the caller's thread. A seed read held mid-flight. */
+    private class HeldDispatcher : CoroutineDispatcher() {
+        private val held = mutableListOf<Runnable>()
+        override fun dispatch(context: CoroutineContext, block: Runnable) { held += block }
+        fun release() {
+            val blocks = held.toList()
+            held.clear()
+            blocks.forEach { it.run() }
+        }
+    }
+
+    /** Which graph component read the session's permit: told apart by the reading call's stack. */
+    private fun permitReader(): String {
+        val stack = Throwable().stackTrace
+        return when {
+            stack.any { it.className.startsWith("com.jay.fxi.data.graph.GraphRecoveryEvents") } -> "events"
+            stack.any { it.className.startsWith("com.jay.fxi.data.graph.GraphV2RequestCoordinator") } -> "coordinator"
+            else -> "other"
+        }
+    }
+
+    /**
+     * An [AssemblyRig] and the starter that owns it, on the rig's main dispatcher under its own job. [seedIo] runs the install
+     * seed read; [seedRead] is that read. Each permit read is noted by reader, each time event counted (the recovery events'
+     * freshness tick fires one every 30 s while the process is foreground). The detach and the report note, in [trace], whether
+     * the assembly's job was still active at that moment.
+     */
+    private inner class StarterRig(
+        test: TestScope,
+        h: Harness,
+        seedIo: CoroutineDispatcher = StandardTestDispatcher(test.testScheduler),
+        seedRead: () -> String = { "seed-1" },
+        reportFailure: Throwable? = null,
+        bind: Boolean = true,
+        permit: (() -> TopicGraphRecoveryPermit?)? = null,
+        /** The detach suspends once, as the real one does on the session's dispatcher, and notes when it is done. */
+        private val detachSuspends: Boolean = false,
+        /** When set, the detach waits for it: a cleanup held mid-way. */
+        private val detachGate: CompletableDeferred<Unit>? = null
+    ) {
+        val readers = mutableListOf<String>()
+        var timeEvents = 0
+        /** The slot the assembly reads its permit through: unbound until [ProcessGraphStarter.bindRuntime], and then a read throws. */
+        val permitSlot = com.jay.fxi.data.graph.LateBound<() -> TopicGraphRecoveryPermit?>("permit")
+        val permitFunction: () -> TopicGraphRecoveryPermit? = permit ?: { readers += permitReader(); null }
+        val r = AssemblyRig(test, h, recoveryPermit = { permitSlot.require()() }, timeEvent = { timeEvents++ })
+        var seedReads = 0
+        val seeds = InstallSeedSource({ seedReads++; seedRead() }, seedIo)
+        val seed = com.jay.fxi.data.graph.LateBound<String>("seed")
+        val revisions = MutableStateFlow(0L)
+        val trace = mutableListOf<String>()
+        val reports = mutableListOf<Throwable>()
+        val scopeJob = SupervisorJob(processJob)
+        val starter = com.jay.fxi.data.graph.ProcessGraphStarter(r.a, seeds, seed, permitSlot, CoroutineScope(scopeJob + r.main)) { failure ->
+            trace += "report(active=${assemblyActive()})"
+            reports += failure
+            reportFailure?.let { throw it }
+        }
+
+        init {
+            if (bind) starter.bindRuntime(permitFunction, revisions) {
+                trace += "detach(active=${assemblyActive()})"
+                if (detachSuspends) { yield(); trace += "detached" }
+                detachGate?.let { it.await(); trace += "detached" }
+            }
+        }
+
+        /** Whether the assembly's job has yet to complete: false only once a close has been waited for. */
+        fun assemblyActive(): Boolean = r.parent.children.any { !it.isCompleted }
+        fun reads(who: String) = readers.count { it == who }
+    }
+
+    /**
+     * CC4a-P01: with the seed already in memory, one main frame sets it, starts the assembly, hands the permit to the recovery
+     * events — read before the runtime is published — and only then publishes it. The seed is not read again, nothing is
+     * reported, and a second start() is refused. (The coordinator's notice at the hand-over has no effect to observe: it has
+     * no recovery budget yet, the only state that reads the permit. CC4a-P03 observes its notices after the hand-over.)
+     */
+    @Test
+    fun `CC4a-P01 with the seed ready one frame starts, hands over and only then publishes`() = snapshotTest {
+        val s = StarterRig(this, granted())
+        backgroundScope.launch(StandardTestDispatcher(testScheduler)) { s.seeds.get() }
+        runCurrent()
+        assertEquals("CC4a-P01 fixture: the seed is in memory", "seed-1", s.seeds.current)
+        var atReady: List<String>? = null
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            s.starter.runtimeReady.collect { if (it != null && atReady == null) atReady = s.readers.toList() }
+        }
+        s.starter.start()
+        assertNull("CC4a-P01 nothing before the first dispatch", s.seed.get())
+        runCurrent()
+        assertEquals("CC4a-P01 the seed is set", "seed-1", s.seed.get())
+        assertSame("CC4a-P01 the runtime is published", s.r.a, s.starter.runtimeReady.value)
+        assertEquals("CC4a-P01 the events had read the permit before the publication", listOf("events"), checkNotNull(atReady).filter { it == "events" })
+        assertFalse("CC4a-P01 the assembly was started", s.r.a.start())
+        assertEquals("CC4a-P01 the seed was read once, by the prefetch", 1, s.seedReads)
+        assertTrue("CC4a-P01 nothing reported", s.reports.isEmpty())
+        assertTrue("CC4a-P01 and nothing detached", s.trace.isEmpty())
+        assertThrows(IllegalStateException::class.java) { s.starter.start() }
+        s.r.a.close()
+    }
+
+    /**
+     * CC4a-P02: while the seed is being read nothing starts; the process foreground given meanwhile is kept, the last one wins,
+     * and is forwarded at the hand-over; after it each foreground is forwarded at once. Observed by the time events, which run
+     * only while the recovery events are foreground.
+     */
+    @Test
+    fun `CC4a-P02 the seed pending starts nothing, and the last foreground is forwarded at the hand-over`() = snapshotTest {
+        for (last in listOf(true, false)) {
+            val io = HeldDispatcher()
+            val s = StarterRig(this, granted(), seedIo = io)
+            s.r.deliverIssued()
+            s.r.a.coordinator.onActivated(KEY_3M)
+            s.starter.start()
+            runCurrent()
+            s.starter.onForeground(!last)
+            s.starter.onForeground(last)
+            advanceTimeBy(31.seconds); runCurrent()
+            assertNull("CC4a-P02 last=$last: no seed yet", s.seed.get())
+            assertNull("CC4a-P02 last=$last: not published", s.starter.runtimeReady.value)
+            assertTrue("CC4a-P02 last=$last: nothing sent", s.r.sent.isEmpty())
+            assertNull("CC4a-P02 last=$last: the coordinator has not run", s.r.a.coordinator.state.value.dataScope)
+            assertEquals("CC4a-P02 last=$last: no time event before the hand-over", 0, s.timeEvents)
+            assertTrue("CC4a-P02 last=$last: no permit read before the hand-over", s.readers.isEmpty())
+
+            io.release(); runCurrent()
+            assertSame("CC4a-P02 last=$last: published", s.r.a, s.starter.runtimeReady.value)
+            assertTrue("CC4a-P02 last=$last: the coordinator runs", s.r.sent.isNotEmpty())
+            advanceTimeBy(31.seconds); runCurrent()
+            assertEquals("CC4a-P02 last=$last: the kept foreground was forwarded", last, s.timeEvents > 0)
+            if (!last) {
+                s.starter.onForeground(true)
+                advanceTimeBy(31.seconds); runCurrent()
+                assertTrue("CC4a-P02 after the hand-over a foreground is forwarded at once", s.timeEvents > 0)
+            }
+            s.r.a.close()
+        }
+    }
+
+    /**
+     * CC4a-P03: after the hand-over every permit revision notifies both consumers: the events read the permit once more, and a
+     * recovery the coordinator had parked on a refusing permit goes once the permit admits it — but only when a revision is
+     * published, not when the publication merely changes.
+     */
+    @Test
+    fun `CC4a-P03 after the hand-over each permit revision notifies the events and the coordinator`() = snapshotTest {
+        var publication: TopicGraphRecoveryPermit? = null
+        val readers = mutableListOf<String>()
+        val s = StarterRig(this, granted(), permit = { readers += permitReader(); publication })
+        s.starter.start(); runCurrent()
+        val issued = s.r.deliverIssued(); runCurrent()
+        // A 1-day key: its failed load opens the recovery budget a refusing permit parks.
+        s.r.a.coordinator.onActivated(KEY_1D); runCurrent()
+        s.r.sent.single { it.kind == "catalog" }.catalog.complete(ok(graphCatalog())); runCurrent()
+        s.r.sent.single { it.kind == "tab" }.tab.complete(unavailable()); runCurrent()
+        advanceTimeBy(60.seconds); runCurrent()
+        val parked = s.r.sent.size
+        assertTrue("CC4a-P03 premise: the coordinator read the refusing permit", readers.contains("coordinator"))
+
+        publication = TopicGraphRecoveryPermit(Any(), 1L, issued, 1L, false, null, null, true)
+        advanceTimeBy(60.seconds); runCurrent()
+        assertEquals("CC4a-P03 a changed publication alone wakes nothing", parked, s.r.sent.size)
+        val events = readers.count { it == "events" }
+        s.revisions.value = 1L; runCurrent()
+        assertEquals("CC4a-P03 the events read it once", events + 1, readers.count { it == "events" })
+        assertEquals("CC4a-P03 the parked recovery goes", listOf("tab"), s.r.sent.drop(parked).map { it.kind })
+        s.r.a.close()
+    }
+
+    /**
+     * CC4a-P04: a failing seed read, an assembly that does not start, and a report that throws: the graph is detached while
+     * the assembly is still live (unless its job had already ended), the assembly is closed before the one report, the runtime
+     * is never published, nothing more is forwarded or notified, and a later abandon reports nothing more. A failed report does
+     * not escape.
+     */
+    @Test
+    fun `CC4a-P04 a failure detaches, closes, reports once and publishes nothing`() = snapshotTest {
+        for (case in listOf("seed fails", "assembly does not start", "report throws")) {
+            val seedFailure = IOException("seed failed")
+            val s = StarterRig(
+                this, granted(),
+                seedRead = { if (case == "report throws" || case == "seed fails") throw seedFailure else "seed-1" },
+                reportFailure = if (case == "report throws") IllegalStateException("report failed") else null
+            )
+            if (case == "assembly does not start") { s.r.parent.cancel(); runCurrent() }
+            s.starter.start(); runCurrent()
+            val live = case != "assembly does not start"
+            assertEquals("CC4a-P04 $case: detach, then the report after the close",
+                listOf("detach(active=$live)", "report(active=false)"), s.trace)
+            val reported = s.reports.single()
+            if (case == "assembly does not start") {
+                assertTrue("CC4a-P04 $case: what was reported", reported is IllegalStateException)
+            } else {
+                // Stack-trace recovery may hand over a copy: the same class and message.
+                assertEquals("CC4a-P04 $case: what was reported", IOException::class.java to "seed failed", reported.javaClass to reported.message)
+            }
+            assertNull("CC4a-P04 $case: never published", s.starter.runtimeReady.value)
+            val events = s.reads("events")
+            s.starter.onForeground(true)
+            s.revisions.value = 1L
+            advanceTimeBy(31.seconds); runCurrent()
+            assertEquals("CC4a-P04 $case: nothing forwarded", 0, s.timeEvents)
+            assertEquals("CC4a-P04 $case: nothing notified", events, s.reads("events"))
+            s.starter.abandon(IllegalStateException("later"))
+            assertEquals("CC4a-P04 $case: reported once", 1, s.reports.size)
+        }
+    }
+
+    /**
+     * CC4a-P05: abandon() while the seed is being read cancels the attempt, detaches, closes and reports its cause once; the
+     * seed arriving later publishes nothing. After the publication abandon() does nothing.
+     */
+    @Test
+    fun `CC4a-P05 abandon before the publication cleans up and reports once, after it does nothing`() = snapshotTest {
+        val io = HeldDispatcher()
+        val s = StarterRig(this, granted(), seedIo = io)
+        s.starter.start(); runCurrent()
+        val cause = IllegalStateException("owner failed")
+        s.starter.abandon(cause)
+        assertEquals("CC4a-P05 cleaned up", listOf("detach(active=true)", "report(active=false)"), s.trace)
+        assertSame("CC4a-P05 its cause, once", cause, s.reports.single())
+        io.release(); runCurrent()
+        assertNull("CC4a-P05 the attempt was cancelled: the seed is never set", s.seed.get())
+        assertNull("CC4a-P05 the seed arriving later publishes nothing", s.starter.runtimeReady.value)
+        assertEquals("CC4a-P05 and reports nothing more", 1, s.reports.size)
+        assertEquals("CC4a-P05 nor cleans up again", listOf("detach(active=true)", "report(active=false)"), s.trace)
+
+        val after = StarterRig(this, granted())
+        after.starter.start(); runCurrent()
+        after.starter.abandon(IllegalStateException("too late"))
+        assertSame("CC4a-P05 after the publication: still published", after.r.a, after.starter.runtimeReady.value)
+        assertTrue("CC4a-P05 nothing detached or reported", after.trace.isEmpty())
+        assertTrue("CC4a-P05 the assembly lives", after.assemblyActive())
+        after.r.a.close()
+    }
+
+    /**
+     * CC4a-P06: the starter's scope cancelled before the attempt's first dispatch — also with the seed already in memory, when
+     * nothing in the attempt suspends — or while the seed is read: the attempt still runs its cleanup — detach and close —
+     * reports nothing, and starts and publishes nothing.
+     */
+    @Test
+    fun `CC4a-P06 a cancellation cleans up without a report`() = snapshotTest {
+        for (case in listOf("before the first dispatch", "while the seed is read", "before the first dispatch, the seed in memory")) {
+            val io = HeldDispatcher()
+            val s = StarterRig(this, granted(), seedIo = if (case.endsWith("in memory")) StandardTestDispatcher(testScheduler) else io)
+            if (case.endsWith("in memory")) {
+                backgroundScope.launch(StandardTestDispatcher(testScheduler)) { s.seeds.get() }
+                runCurrent()
+                assertNotNull("CC4a-P06 fixture: the seed is in memory", s.seeds.current)
+            }
+            s.starter.start()
+            if (case == "while the seed is read") runCurrent()
+            s.scopeJob.cancel()
+            runCurrent(); io.release(); runCurrent()
+            assertEquals("CC4a-P06 $case: detached", listOf("detach(active=true)"), s.trace)
+            assertFalse("CC4a-P06 $case: closed", s.assemblyActive())
+            assertTrue("CC4a-P06 $case: nothing reported", s.reports.isEmpty())
+            assertNull("CC4a-P06 $case: never published", s.starter.runtimeReady.value)
+            assertTrue("CC4a-P06 $case: no permit read", s.readers.isEmpty())
+        }
+    }
+
+    /**
+     * CC4a-P08: abandon() called from a caller already cancelled still detaches, closes the assembly and waits for it before
+     * the one report — the cleanup is non-cancellable — and the cancellation reaches the caller afterwards.
+     */
+    @Test
+    fun `CC4a-P08 abandon from a cancelled caller still cleans up in full before the report`() = snapshotTest {
+        val io = HeldDispatcher()
+        val s = StarterRig(this, granted(), seedIo = io, detachSuspends = true)
+        s.starter.start(); runCurrent()
+        val cause = IllegalStateException("owner failed")
+        var reached: Throwable? = null
+        val caller = launch(s.r.main) {
+            try {
+                coroutineContext.job.cancel()
+                s.starter.abandon(cause)
+                yield()
+            } catch (cancelled: CancellationException) {
+                reached = cancelled
+            }
+        }
+        runCurrent()
+        assertTrue("CC4a-P08 fixture: the caller finished", caller.isCompleted)
+        assertEquals("CC4a-P08 cleaned up in full", listOf("detach(active=true)", "detached", "report(active=false)"), s.trace)
+        assertSame("CC4a-P08 its cause, once", cause, s.reports.single())
+        assertTrue("CC4a-P08 the caller saw its cancellation", reached is CancellationException)
+        io.release(); runCurrent()
+    }
+
+    /**
+     * CC4a-P12: an abandon() whose caller is already cancelled, or is cancelled while it waits, still does not return before a
+     * cleanup already under way has closed the assembly and reported; its caller then sees the cancellation.
+     */
+    @Test
+    fun `CC4a-P12 cancelled abandon waits for cleanup already under way`() = snapshotTest {
+        for (mode in listOf("already cancelled", "cancel while waiting")) {
+            val gate = CompletableDeferred<Unit>()
+            val s = StarterRig(this, granted(), seedRead = { throw IOException("seed failed") }, detachGate = gate)
+            s.starter.start(); runCurrent()
+            assertEquals("CC4a-P12 $mode fixture: the cleanup is held in its detach", listOf("detach(active=true)"), s.trace)
+
+            var cancellation: CancellationException? = null
+            val caller = launch(s.r.main) {
+                try {
+                    if (mode == "already cancelled") coroutineContext.job.cancel()
+                    s.starter.abandon(IllegalStateException("owner failed"))
+                    yield()
+                } catch (cancelled: CancellationException) {
+                    cancellation = cancelled
+                } finally {
+                    s.trace += "caller-ended"
+                }
+            }
+            runCurrent()
+            if (mode == "cancel while waiting") {
+                caller.cancel()
+                runCurrent()
+            }
+
+            assertFalse("CC4a-P12 $mode: waits despite cancellation", caller.isCompleted)
+            assertEquals("CC4a-P12 $mode: nothing more yet", listOf("detach(active=true)"), s.trace)
+            assertTrue("CC4a-P12 $mode: the assembly is not yet closed", s.assemblyActive())
+            assertTrue("CC4a-P12 $mode: not yet reported", s.reports.isEmpty())
+
+            gate.complete(Unit); runCurrent()
+            assertTrue("CC4a-P12 $mode: the caller ended", caller.isCompleted)
+            assertNotNull("CC4a-P12 $mode: and saw its cancellation", cancellation)
+            assertEquals("CC4a-P12 $mode: it ended after the cleanup",
+                listOf("detach(active=true)", "detached", "report(active=false)", "caller-ended"), s.trace)
+            assertFalse("CC4a-P12 $mode: closed", s.assemblyActive())
+            assertNull("CC4a-P12 $mode: never published", s.starter.runtimeReady.value)
+            assertEquals("CC4a-P12 $mode: the attempt's failure, once", IOException::class.java, s.reports.single().javaClass)
+        }
+    }
+
+    /**
+     * CC4a-P11: a failure after the hand-over — the first permit read throws — while its cleanup is held in the detach: a
+     * process foreground given in that window is not forwarded, so no time event follows; the failure is reported once.
+     */
+    @Test
+    fun `CC4a-P11 a foreground given while a cleanup runs is not forwarded`() = snapshotTest {
+        val gate = CompletableDeferred<Unit>()
+        val boom = IllegalStateException("permit read failed")
+        val s = StarterRig(this, granted(), permit = { throw boom }, detachGate = gate)
+        s.starter.start(); runCurrent()
+        assertEquals("CC4a-P11 fixture: the cleanup is held in its detach", listOf("detach(active=true)"), s.trace)
+        s.starter.onForeground(true)
+        advanceTimeBy(31.seconds); runCurrent()
+        assertEquals("CC4a-P11 not forwarded", 0, s.timeEvents)
+        gate.complete(Unit); runCurrent()
+        assertEquals("CC4a-P11 cleaned up and reported", listOf("detach(active=true)", "detached", "report(active=false)"), s.trace)
+        assertEquals("CC4a-P11 the failure, once", boom.message, s.reports.single().message)
+    }
+
+    /**
+     * CC4a-P07: start() before the runtime is bound is refused and leaves the permit slot unbound; binding fills the slot with
+     * the runtime's supplier, once; a second binding is refused. The time event target is a no-op until set, then receives.
+     */
+    @Test
+    fun `CC4a-P07 start needs the runtime bound, once, and the time event target starts as a no-op`() = snapshotTest {
+        val s = StarterRig(this, granted(), bind = false)
+        assertThrows(IllegalStateException::class.java) { s.starter.start() }
+        assertNull("CC4a-P07 the permit slot is unbound", s.permitSlot.get())
+        s.starter.bindRuntime(s.permitFunction, s.revisions) {}
+        assertSame("CC4a-P07 binding fills the slot with the runtime's supplier", s.permitFunction, s.permitSlot.get())
+        assertThrows(IllegalStateException::class.java) { s.starter.bindRuntime(s.permitFunction, s.revisions) {} }
+        s.starter.timeEventTarget()
+        var received = 0
+        s.starter.timeEventTarget = { received++ }
+        s.starter.timeEventTarget()
+        assertEquals("CC4a-P07 a set target receives", 1, received)
+        s.r.a.close()
+    }
+
+    /**
+     * CC4a-P09: abandon() before the runtime is bound and before start() closes the assembly and reports its cause once; it
+     * publishes nothing and a later start() is still refused for want of a binding.
+     */
+    @Test
+    fun `CC4a-P09 abandon before binding and start closes and reports once`() = snapshotTest {
+        val s = StarterRig(this, granted(), bind = false)
+        val cause = IllegalStateException("factory failed")
+        s.starter.abandon(cause)
+        assertFalse("CC4a-P09 closed", s.assemblyActive())
+        assertEquals("CC4a-P09 reported once, after the close", listOf("report(active=false)"), s.trace)
+        assertSame("CC4a-P09 its cause", cause, s.reports.single())
+        assertNull("CC4a-P09 never published", s.starter.runtimeReady.value)
+    }
+
+    /**
+     * CC4a-P10: an abandon() made while a failed attempt's cleanup is held in its detach does not return until that cleanup
+     * has closed the assembly and reported; the report is the attempt's failure, once.
+     */
+    @Test
+    fun `CC4a-P10 abandon waits for a cleanup already under way`() = snapshotTest {
+        val gate = CompletableDeferred<Unit>()
+        val s = StarterRig(this, granted(), seedRead = { throw IOException("seed failed") }, detachGate = gate)
+        s.starter.start(); runCurrent()
+        assertEquals("CC4a-P10 fixture: the cleanup is held in its detach", listOf("detach(active=true)"), s.trace)
+        val abandoning = launch(s.r.main) { s.starter.abandon(IllegalStateException("owner failed")); s.trace += "abandoned" }
+        runCurrent()
+        assertFalse("CC4a-P10 abandon waits", abandoning.isCompleted)
+        gate.complete(Unit); runCurrent()
+        assertEquals("CC4a-P10 it returns after the cleanup",
+            listOf("detach(active=true)", "detached", "report(active=false)", "abandoned"), s.trace)
+        assertEquals("CC4a-P10 the attempt's failure, once", IOException::class.java, s.reports.single().javaClass)
     }
 
     /**
@@ -3351,7 +3810,7 @@ class PremiumAccessTopicSnapshotTest {
             val h = granted()
             val k1 = checkNotNull(h.store.record.krxCapabilityEpoch) { "premise: a KRX epoch" }
             val epoch = checkNotNull(h.store.record.userAccessEpoch) { "premise: a user epoch" }
-            val held = HeldWrites(FileGraphV2DiskStore(folder.newFolder(), JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(),
+            val held = HeldWrites(FileGraphV2DiskStore(folder.newFolder().let { dir -> { dir } }, JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(),
                 StandardTestDispatcher(testScheduler)))
             val prepareCalls = mutableListOf<Pair<String?, Boolean>>()
             var holdPrepare: CompletableDeferred<Unit>? = null
@@ -3464,7 +3923,7 @@ class PremiumAccessTopicSnapshotTest {
         val h = granted()
         val k1 = checkNotNull(h.store.record.krxCapabilityEpoch) { "premise: a KRX epoch" }
         val epoch = checkNotNull(h.store.record.userAccessEpoch) { "premise: a user epoch" }
-        val held = HeldReads(FileGraphV2DiskStore(folder.newFolder(), JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(),
+        val held = HeldReads(FileGraphV2DiskStore(folder.newFolder().let { dir -> { dir } }, JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(),
             StandardTestDispatcher(testScheduler)))
         val g = GraphRig(this, h, store = held)
         val tab = (GraphV2Domain.admit(g.threeMonthTab(), "usd", GraphPeriod.THREE_MONTHS, null) as GraphTabAdmission.Accepted).tab

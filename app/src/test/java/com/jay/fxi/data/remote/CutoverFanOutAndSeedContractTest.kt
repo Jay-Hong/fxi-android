@@ -377,9 +377,13 @@ class CutoverFanOutAndSeedContractTest {
         }
         val seedModule = "main/java/com/jay/fxi/di/InstallSeedModule.kt"
         val prefetch = "main/java/com/jay/fxi/data/free/InstallSeedPrefetch.kt"
-        assertEquals("the seed is named by its declaration, its module, the prefetch and the scheduler module only",
-            setOf(seed, seedModule, prefetch, module),
+        // S4 CUT-CC4a: the dormant graph starter reads the seed; nothing in production constructs the starter yet (CC4b).
+        val starter = "main/java/com/jay/fxi/data/graph/ProcessGraphStarter.kt"
+        assertEquals("the seed is named by its declaration, its module, the prefetch, the scheduler module and the graph starter only",
+            setOf(seed, seedModule, prefetch, module, starter),
             code.filter { (_, t) -> Regex("""\bInstallSeedSource\b""").containsMatchIn(t) }.keys)
+        assertEquals("CC4a: only its own file names ProcessGraphStarter", setOf(starter),
+            code.filter { (_, t) -> Regex("""\bProcessGraphStarter\b""").containsMatchIn(t) }.keys)
         val seedText = code.getValue(seed)
         assertEquals("$seed names its class only in its declaration", 1, Regex("""\bInstallSeedSource\b""").findAll(seedText).count())
         assertFalse("$seed carries no DI annotation", Regex("""@(?:[A-Za-z_][\w.]*\.)?(Inject|AssistedInject|Singleton|Module|Provides|Binds|InstallIn|EntryPoint)\b""").containsMatchIn(seedText))

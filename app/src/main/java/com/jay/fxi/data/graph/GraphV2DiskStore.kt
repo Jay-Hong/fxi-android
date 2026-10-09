@@ -161,9 +161,15 @@ internal class DefaultGraphV2AtomicFileIo : GraphV2AtomicFileIo {
     override fun deleteIfExists(file: File): Boolean = Files.deleteIfExists(file.toPath())
 }
 
-/** Writer and purge adapters for a root must share this instance. The caller supplies a backup-excluded root. */
+/**
+ * Writer and purge adapters for a root must share this instance. The caller supplies a backup-excluded root.
+ *
+ * S4 CUT-CC4a: [root] is resolved on first use inside an I/O section, never on construction or by the synchronous
+ * reservation calls; its first success is kept and a failure is not, and it fails a read, write or purge as their own
+ * failures do.
+ */
 internal class FileGraphV2DiskStore(
-    private val root: File,
+    root: () -> File,
     private val codec: GraphV2EnvelopeCodec,
     private val files: GraphV2AtomicFileIo,
     private val ioDispatcher: CoroutineDispatcher
@@ -199,6 +205,7 @@ internal class FileGraphV2DiskStore(
         var krxValid = true
     }
 
+    private val rootDir: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED, root)
     private val stateLock = Any()
     private val mutationMutex = Mutex()
     private var sequence = 0L
@@ -259,12 +266,12 @@ internal class FileGraphV2DiskStore(
                 mutationMutex.withLock {
                     val c = reservation.components
                     val general = replace(ticket, reservation, GraphV2DiskComponent.GENERAL, admission,
-                        generalFile(c.general.key)) { codec.encodeGeneral(c.general) }
+                        { generalFile(c.general.key) }) { codec.encodeGeneral(c.general) }
                     val krx = c.krx?.let {
                         if (general != GraphV2ComponentWriteOutcome.Replaced) {
                             GraphV2ComponentWriteOutcome.Skipped("General component was not replaced")
                         } else {
-                            replace(ticket, reservation, GraphV2DiskComponent.KRX, admission, krxFile(it.key)) {
+                            replace(ticket, reservation, GraphV2DiskComponent.KRX, admission, { krxFile(it.key) }) {
                                 codec.encodeKrx(it)
                             }
                         }
@@ -282,7 +289,7 @@ internal class FileGraphV2DiskStore(
         reservation: Reservation,
         component: GraphV2DiskComponent,
         admission: GraphV2IoAdmission,
-        target: File,
+        target: () -> File,
         encode: () -> GraphV2Validation<ByteArray>
     ): GraphV2ComponentWriteOutcome {
         return try {
@@ -294,7 +301,7 @@ internal class FileGraphV2DiskStore(
             synchronized(stateLock) { skipReason(ticket, reservation, component, admission) }?.let {
                 return GraphV2ComponentWriteOutcome.Skipped(it)
             }
-            val prepared = files.prepareReplace(target, bytes)
+            val prepared = files.prepareReplace(target(), bytes)
             var primaryFailure: Throwable? = null
             try {
                 coroutineContext.ensureActive()
@@ -351,7 +358,7 @@ internal class FileGraphV2DiskStore(
         admission: GraphV2IoAdmission
     ): GraphV2DiskRead<GraphV2GeneralEnvelope> {
         keyError(key)?.let { return GraphV2DiskRead.Rejected(it) }
-        return read(GraphV2DiskComponent.GENERAL, generalFile(key), admission) { codec.decodeGeneral(it, key, catalog) }
+        return read(GraphV2DiskComponent.GENERAL, { generalFile(key) }, admission) { codec.decodeGeneral(it, key, catalog) }
     }
 
     override suspend fun readKrx(
@@ -360,12 +367,12 @@ internal class FileGraphV2DiskStore(
         admission: GraphV2IoAdmission
     ): GraphV2DiskRead<GraphV2KrxEnvelope> {
         keyError(key)?.let { return GraphV2DiskRead.Rejected(it) }
-        return read(GraphV2DiskComponent.KRX, krxFile(key), admission) { codec.decodeKrx(it, key, catalog) }
+        return read(GraphV2DiskComponent.KRX, { krxFile(key) }, admission) { codec.decodeKrx(it, key, catalog) }
     }
 
     private suspend fun <T> read(
         component: GraphV2DiskComponent,
-        file: File,
+        file: () -> File,
         admission: GraphV2IoAdmission,
         decode: (ByteArray) -> GraphV2Validation<T>
     ): GraphV2DiskRead<T> = withContext(ioDispatcher) {
@@ -373,7 +380,7 @@ internal class FileGraphV2DiskStore(
             try {
                 coroutineContext.ensureActive()
                 if (!admission.admits(component)) return@withLock GraphV2DiskRead.Rejected("Graph I/O admission is closed")
-                val bytes = files.read(file) ?: return@withLock GraphV2DiskRead.Absent
+                val bytes = files.read(file()) ?: return@withLock GraphV2DiskRead.Absent
                 when (val decoded = decode(bytes)) {
                     is GraphV2Validation.Valid -> GraphV2DiskRead.Found(decoded.value)
                     is GraphV2Validation.Invalid -> GraphV2DiskRead.Rejected(decoded.reason)
@@ -431,7 +438,7 @@ internal class FileGraphV2DiskStore(
             mutationMutex.withLock {
                 try {
                     var removed = invalidated
-                    val ownerRoot = File(File(root, component.directory()), sweep.uid)
+                    val ownerRoot = File(File(rootDir, component.directory()), sweep.uid)
                     files.enumerateFiles(ownerRoot).forEach { file ->
                         coroutineContext.ensureActive()
                         val n = namespaceOf(file, ownerRoot, component, sweep.uid)
@@ -482,10 +489,10 @@ internal class FileGraphV2DiskStore(
     private fun GraphV2KrxKey.namespace() = DiskNamespace(GraphV2DiskComponent.KRX, hex(uid), hex(userAccessEpoch), hex(krxCapabilityEpoch))
 
     private fun generalFile(key: GraphV2GeneralKey) =
-        File(root, "general/${hex(key.uid)}/${hex(key.userAccessEpoch)}/${hex(key.tab)}/${key.period}.json")
+        File(rootDir, "general/${hex(key.uid)}/${hex(key.userAccessEpoch)}/${hex(key.tab)}/${key.period}.json")
 
     private fun krxFile(key: GraphV2KrxKey) =
-        File(root, "krx/${hex(key.uid)}/${hex(key.userAccessEpoch)}/${hex(key.krxCapabilityEpoch)}/${hex(key.tab)}/${key.period}.json")
+        File(rootDir, "krx/${hex(key.uid)}/${hex(key.userAccessEpoch)}/${hex(key.krxCapabilityEpoch)}/${hex(key.tab)}/${key.period}.json")
 }
 
 /** Prepared for fixture registration only; production wiring is outside B1a-2. */

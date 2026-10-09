@@ -436,16 +436,18 @@ class CutoverSharedProvidersContractTest {
     @Test fun CC1_08_theDiskHelperCreatesNoDirectory_andTheProviderRootIsNoBackupGraphV2() {
         val parent = folder.newFolder("nobackup")
         val root = File(parent, "graph_v2")
-        graphV2DiskStoreAt(root)
+        var asked = 0
+        graphV2DiskStoreAt { asked += 1; root }
+        assertEquals("S4 CUT-CC4a: constructing never asks for the root", 0, asked)
         assertFalse("no root created", root.exists())
         assertEquals("nothing created under the parent", emptyList<String>(), parent.list()!!.toList())
         val all = production()
         val module = stripComments(all.getValue(graphModule))
         assertTrue("the helper body", Regex(
-            """fun graphV2DiskStoreAt\(root: File\): FileGraphV2DiskStore\s*=\s*FileGraphV2DiskStore\(root,\s*JsonGraphV2EnvelopeCodec\(\),\s*DefaultGraphV2AtomicFileIo\(\),\s*Dispatchers\.IO\)"""
+            """fun graphV2DiskStoreAt\(root: \(\) -> File\): FileGraphV2DiskStore\s*=\s*FileGraphV2DiskStore\(root,\s*JsonGraphV2EnvelopeCodec\(\),\s*DefaultGraphV2AtomicFileIo\(\),\s*Dispatchers\.IO\)"""
         ).containsMatchIn(module))
         assertTrue("the provider root", Regex(
-            """graphV2DiskStoreAt\(File\(context\.noBackupFilesDir,\s*"graph_v2"\)\)"""
+            """graphV2DiskStoreAt\s*\{\s*File\(context\.noBackupFilesDir,\s*"graph_v2"\)\s*}"""
         ).containsMatchIn(module))
         // The construction path: the three classes run nothing at construction beyond these known initializers.
         val disk = stripComments(all.getValue(main("data/graph/GraphV2DiskStore.kt")))
