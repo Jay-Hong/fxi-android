@@ -15,8 +15,10 @@ import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.OAuthProvider
 import com.jay.fxi.BuildConfig
 import com.jay.fxi.R
+import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
+import com.jay.fxi.data.entitlements.DeletionAdmissionStore
 import com.jay.fxi.data.local.CacheService
 import com.jay.fxi.data.remote.AuthenticatedApiClient
 import com.jay.fxi.data.remote.AuthenticatedHttpResponse
@@ -28,6 +30,7 @@ import com.revenuecat.purchases.interfaces.ReceiveCustomerInfoCallback
 import dagger.hilt.android.lifecycle.HiltViewModel
 import java.io.IOException
 import java.util.Locale
+import java.util.UUID
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,16 +42,27 @@ enum class DeletionStep {
     REAUTH, SERVER_DELETE, REVENUECAT_LOGOUT, FIREBASE_DELETE, LOCAL_CLEANUP
 }
 
-/** Keeps account-delete response application in the same owner-bound call stack. */
+/**
+ * Keeps account-delete response application in the same owner-bound call stack.
+ *
+ * S4 CUT-CC3: also publishes the deletion admission. Once the owner's snapshot is captured, the owner's UID is blocked
+ * before the request leaves; that operation's 204 advances it to SERVER_DELETED, including a 204 the transport refused
+ * because the session moved meanwhile. Every other outcome — another status, IO failure, timeout, cancellation — keeps the
+ * request standing. Nothing here releases it: no unsent request is proven at this point. The owner check and the
+ * application follow the publication, so a late answer records the server's deletion yet changes nothing on screen.
+ */
 internal class AccountDeletionServerStage(
     private val captureSnapshot: suspend (AuthIdentityFence) -> AuthSnapshot,
     private val deleteUser: suspend (AuthSnapshot) -> AuthenticatedHttpResponse<Unit>,
-    private val requireCurrent: (AuthIdentityFence) -> Unit
+    private val requireCurrent: (AuthIdentityFence) -> Unit,
+    private val deletions: DeletionAdmissionStore,
+    private val newOperationId: () -> String = { UUID.randomUUID().toString() }
 ) {
-    constructor(api: AuthenticatedApiClient) : this(
+    constructor(api: AuthenticatedApiClient, deletions: DeletionAdmissionStore) : this(
         captureSnapshot = { owner -> api.captureSnapshot(owner) },
         deleteUser = api::deleteUser,
-        requireCurrent = api::requireCurrent
+        requireCurrent = api::requireCurrent,
+        deletions = deletions
     )
 
     suspend fun <T> execute(
@@ -56,20 +70,31 @@ internal class AccountDeletionServerStage(
         apply: (AuthenticatedHttpResponse<Unit>) -> T
     ): T {
         val snapshot = captureSnapshot(owner)
-        val response = deleteUser(snapshot)
+        val operation = newOperationId()
+        deletions.begin(owner, operation)
+        val response = try {
+            deleteUser(snapshot)
+        } catch (changed: AuthIdentityChangedException) {
+            if (changed.statusCode == 204) {
+                deletions.serverDeleted(operation)
+            }
+            throw changed
+        }
+        if (response.statusCode == 204) deletions.serverDeleted(operation)
         requireCurrent(owner)
         return apply(response)
     }
 }
 
 @HiltViewModel
-class SettingsViewModel @Inject constructor(
+class SettingsViewModel @Inject internal constructor(
     private val auth: FirebaseAuth,
     private val apiService: AuthenticatedApiClient,
     private val cacheService: CacheService,
-    private val pushNotificationManager: PushNotificationManager
+    private val pushNotificationManager: PushNotificationManager,
+    deletions: DeletionAdmissionStore
 ) : ViewModel() {
-    private val accountDeletionServerStage = AccountDeletionServerStage(apiService)
+    private val accountDeletionServerStage = AccountDeletionServerStage(apiService, deletions)
 
     private val _isDeleting = MutableStateFlow(false)
     val isDeleting: StateFlow<Boolean> = _isDeleting.asStateFlow()

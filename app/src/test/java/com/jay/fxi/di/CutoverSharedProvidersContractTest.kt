@@ -553,12 +553,16 @@ class CutoverSharedProvidersContractTest {
 
     // --- CC1-D ------------------------------------------------------------------------------------------------------------
 
-    /** CC1-D: the three stores have no production consumer yet; only their declarations, dormant parameters and providers name them. */
+    /**
+     * CC1-D: the three stores have no production consumer yet; only their declarations, dormant parameters and providers name
+     * them. From CUT-CC3 the deletion store also has its one producer, the settings screen's deletion stage (CC3-W02).
+     */
     @Test fun CC1_D_theThreeStoresAreProvidedButConsumedNowhere() {
         val all = production()
         assertTrue("premise: the scan reaches the benchmark source set", all.keys.any { it.startsWith("benchmark/") })
         val allowed = mapOf(
-            "DeletionAdmissionStore" to setOf(main("data/entitlements/DeletionAdmissionStore.kt"), main("data/graph/GraphProtectedAdmission.kt"), graphModule),
+            "DeletionAdmissionStore" to setOf(main("data/entitlements/DeletionAdmissionStore.kt"), main("data/graph/GraphProtectedAdmission.kt"), graphModule,
+                main("ui/settings/SettingsViewModel.kt")),
             "GraphSelectionStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/graph/GraphSeriesSelectionSession.kt"), graphModule),
             "BackupableUserIntentStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt"), graphModule),
             "FileGraphV2DiskStore" to setOf(main("data/graph/GraphV2DiskStore.kt"), graphModule)
@@ -571,7 +575,8 @@ class CutoverSharedProvidersContractTest {
         // File:symbol granularity: in each allowed file the code names the type exactly as often as its declaration, its dormant
         // parameter or its provider needs, so a further field, parameter, Provider or resolution in that file shows up.
         val counts = mapOf(
-            "DeletionAdmissionStore" to mapOf(main("data/entitlements/DeletionAdmissionStore.kt") to 1, main("data/graph/GraphProtectedAdmission.kt") to 2, graphModule to 3),
+            "DeletionAdmissionStore" to mapOf(main("data/entitlements/DeletionAdmissionStore.kt") to 1, main("data/graph/GraphProtectedAdmission.kt") to 2, graphModule to 3,
+                main("ui/settings/SettingsViewModel.kt") to 4),
             "GraphSelectionStore" to mapOf(main("data/graph/GraphSeriesSelectionSession.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 2, graphModule to 2),
             "BackupableUserIntentStore" to mapOf(main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 1, graphModule to 2),
             "FileGraphV2DiskStore" to mapOf(main("data/graph/GraphV2DiskStore.kt") to 1, graphModule to 4)
@@ -618,5 +623,38 @@ class CutoverSharedProvidersContractTest {
             val text = all.getValue(path)
             for (name in graphNames) assertFalse("$path names $name", Regex("""\b$name\b""").containsMatchIn(text))
         }
+    }
+
+    // --- CUT-CC3 ----------------------------------------------------------------------------------------------------------
+
+    /**
+     * CC3-W01/W03: the settings screen takes the injected deletion store through an internal @Inject constructor and hands that
+     * same instance to its deletion stage; nothing in production releases a request, and the only reader of the store remains
+     * the dormant graph admission, which is still constructed nowhere (CC1-D). A regression device on the source; real DI
+     * identity stays with CUT-C03.
+     */
+    @Test fun CC3_W01_W03_theSettingsScreenPublishesThroughTheInjectedStoreAndReleasesNothing() {
+        val all = production().mapValues { (_, text) -> stripComments(text) }
+        val vm = all.getValue(main("ui/settings/SettingsViewModel.kt"))
+        assertTrue("CC3-W01 the screen's constructor takes the store",
+            Regex("""class SettingsViewModel @Inject internal constructor\([^)]*\bdeletions: DeletionAdmissionStore\s*\)""").containsMatchIn(vm))
+        assertTrue("CC3-W01 and hands that store to the stage",
+            vm.contains("private val accountDeletionServerStage = AccountDeletionServerStage(apiService, deletions)"))
+        assertEquals("CC3-W01 the stage is built only there", mapOf(main("ui/settings/SettingsViewModel.kt") to 1),
+            all.mapValues { (_, text) -> Regex("""(?<!class )\bAccountDeletionServerStage\(""").findAll(text).count() }.filterValues { it > 0 })
+        // Counted on the raw text too: a string holding "//" would hide the rest of its line from the stripped copy.
+        val raw = production()
+        assertEquals("CC3-W03 no production call releases a request", mapOf(main("data/entitlements/DeletionAdmissionStore.kt") to 1),
+            raw.mapValues { (_, text) -> Regex("""\breleaseUnsent\b""").findAll(text).count() }.filterValues { it > 0 })
+        assertEquals("CC3-W02 the only blocks call is the dormant graph admission's", mapOf(
+            main("data/entitlements/DeletionAdmissionStore.kt") to 1, main("data/graph/GraphProtectedAdmission.kt") to 1
+        ), raw.mapValues { (_, text) -> Regex("""\bblocks\s*\(|::blocks\b""").findAll(text).count() }.filterValues { it > 0 })
+        assertEquals("CC3-W02 nothing in production reads the diagnostic records", emptyMap<String, Int>(),
+            raw.mapValues { (_, text) -> Regex("""\.records\b""").findAll(text).count() }.filterValues { it > 0 })
+        // The screen's file names its store exactly where the wiring needs it, and touches it only through the stage's three writes.
+        assertEquals("CC3-W02 the screen's file names `deletions` as often as the wiring needs", 9,
+            Regex("""\bdeletions\b""").findAll(vm).count())
+        assertEquals("CC3-W02 the screen's file writes the store only through the stage", listOf("begin", "serverDeleted", "serverDeleted"),
+            Regex("""\bdeletions\s*(?:\.|::)\s*(\w+)""").findAll(vm).map { it.groupValues[1] }.toList())
     }
 }
