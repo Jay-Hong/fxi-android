@@ -283,6 +283,29 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
 }
 
+// S4 CUT-C01·C02: the production-composition cutover acceptance runs on the real clock for many minutes, so no ordinary
+// unit-test task runs it; its own task runs it once per candidate in a required CI job, which checks the exact case list.
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    if (name != "testCutoverAcceptance") {
+        filter.excludeTestsMatching("*.PremiumGraphCutoverAcceptanceTest")
+    }
+}
+tasks.register<org.gradle.api.tasks.testing.Test>("testCutoverAcceptance") {
+    val debugUnitTestForAcceptance = tasks.named<org.gradle.api.tasks.testing.Test>("testDebugUnitTest")
+    group = "verification"
+    description = "Runs only the S4 cutover acceptance harness (production composition, real clock)"
+    dependsOn("compileDebugUnitTestKotlin", "compileDebugUnitTestJavaWithJavac", "processDebugUnitTestJavaRes")
+    testClassesDirs = files(debugUnitTestForAcceptance.map { it.testClassesDirs })
+    classpath = files(debugUnitTestForAcceptance.map { it.classpath })
+    filter.includeTestsMatching("*.PremiumGraphCutoverAcceptanceTest")
+    filter.isFailOnNoMatchingTests = true
+    reports.junitXml.outputLocation.set(layout.buildDirectory.dir("test-results/cutoverAcceptance"))
+    reports.html.outputLocation.set(layout.buildDirectory.dir("reports/tests/cutoverAcceptance"))
+    // Every candidate runs it again: its evidence is the physical sends of this run, never a cached result.
+    outputs.upToDateWhen { false }
+    testLogging.showStandardStreams = true
+}
+
 // The accumulation suite is deliberately opt-in; keep the shared manifest setup above intact.
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
     if (name != "testRotationAccumulation") {

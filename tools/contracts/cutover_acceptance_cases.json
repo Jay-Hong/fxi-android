@@ -1,0 +1,25 @@
+{
+  "class": "com.jay.fxi.budget.PremiumGraphCutoverAcceptanceTest",
+  "note": "S4 CUT-C01·C02 required acceptance rows (cut_c0102_agreed.r1.md). Every name must run once and pass; none may be skipped, replaced or added unlisted.",
+  "cases": [
+    "A01 the production cold start with a tab 401 and its replay stays inside the budget",
+    "A01c the production cold start with a catalog 401 and its replay stays inside the budget",
+    "A02a every tab 503 walks the whole ladder and stops",
+    "A02b every catalog and tab 503 walks the whole ladder and stops",
+    "A03a six re-confirmations of the same grant change nothing",
+    "A03b six real re-approvals spend the connection ladder and then open nothing",
+    "A04a a new connection issues one reconnect trigger and one inside the cooldown issues none",
+    "A04b offline makes the recovery wait on the permit and online resumes it on its original deadline",
+    "A04c a return after a minute in the background issues one foreground-return trigger",
+    "A04d a re-approved grant's recovery waits for its connection and goes before it opens",
+    "A05a an applied tab is written through the production write ports with no further send",
+    "A05b a refused write keeps the chart and adds no send",
+    "A06 a tab 429 with a long Retry-After holds every graph send through the window (floor preparation)",
+    "A07a no screen opened sends nothing",
+    "A07b the screen on News sends nothing",
+    "A07c only the active usd key is fetched",
+    "A08 a failed catalog lets the tab go and the round adopts its catalog with no needless tab",
+    "A09 a real closed demand survives two partial 200s and the third meets it",
+    "A10 a same-scope context change from the issuer overlaps the old tab's body with the new tab"
+  ]
+}
