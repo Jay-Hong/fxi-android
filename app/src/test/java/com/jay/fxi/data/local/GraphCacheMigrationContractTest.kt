@@ -814,25 +814,35 @@ class GraphCacheMigrationContractTest {
         .associate { it.relativeTo(main).invariantSeparatorsPath to it.readText() }
 
     /**
-     * D (P3c `cut_p3c_agreed.r3.md` §2 and §4): no production code constructs the runner, the launcher or the readiness; only
-     * the readiness's own file names it, and it names neither the runner nor the launcher; none carries a DI annotation; and
-     * constructing them with the real readiness touches no file and no journal.
+     * D (P3c `cut_p3c_agreed.r3.md` §2 and §4; S4 CUT-CC5-4 `cut_cc5_agreed.r1.md`): only the process's AppGraphCacheCutover
+     * constructs the runner, the launcher and the readiness, and only the topic owner names it; the three carry no DI
+     * annotation and the readiness names neither the runner nor the launcher; the Application and the other source sets name
+     * none of them; and constructing them with the real readiness touches no file and no journal.
      */
     @Test fun D_dormantUntilTheCutover() = runBlocking {
         val all = sources()
         val migrationPath = "com/jay/fxi/data/local/GraphCacheMigration.kt"
         val cutoverPath = "com/jay/fxi/data/local/GraphCacheCutover.kt"
         val readinessPath = "com/jay/fxi/data/local/GraphConsumerReadiness.kt"
+        val appPath = "com/jay/fxi/data/local/AppGraphCacheCutover.kt"
+        val ownerPath = "com/jay/fxi/data/remote/TopicRuntimeOwner.kt"
         val three = setOf(migrationPath, cutoverPath, readinessPath)
-        assertTrue("premise: the scan sees the three files", three.all { it in all } && all.size > 100)
+        assertTrue("premise: the scan sees the four files", (three + appPath).all { it in all } && all.size > 100)
         val referencing = all.filter { (path, text) ->
             path !in three && Regex("""\bGraph(CacheMigration|CacheCutover|MigrationReadiness)\b""").containsMatchIn(text)
         }.keys
-        assertEquals("no other production file names them", emptySet<String>(), referencing)
+        assertEquals("only the process cutover names them outside their files", setOf(appPath), referencing)
         assertFalse("the readiness names neither the runner nor the launcher",
             Regex("""\bGraphCache(Migration|Cutover)\b""").containsMatchIn(all.getValue(readinessPath)))
-        assertEquals("only its own file names the readiness", setOf(readinessPath),
+        assertEquals("the readiness is named by its file, the process cutover and the runner's KDoc", setOf(readinessPath, appPath, migrationPath),
             all.filter { (_, text) -> Regex("""\bGraphConsumerReadiness\b""").containsMatchIn(text) }.keys)
+        for ((type, path) in listOf("GraphCacheMigration" to migrationPath, "GraphCacheCutover" to cutoverPath,
+                "GraphConsumerReadiness" to readinessPath)) {
+            assertEquals("only the process cutover constructs $type", setOf(appPath),
+                all.filter { (p, text) -> p != path && Regex("""\b$type\s*\(""").containsMatchIn(text) }.keys)
+        }
+        assertEquals("beside the three it serves, only the owner names the process cutover", setOf(appPath, ownerPath),
+            all.filter { (path, text) -> path !in three && Regex("""\bAppGraphCacheCutover\b""").containsMatchIn(text) }.keys)
         for (path in three) {
             // A qualified annotation (@javax.inject.Singleton) counts too.
             assertFalse(path, Regex("""@(?:[A-Za-z_][\w.]*\.)?(Inject|AssistedInject|Singleton|Module|InstallIn|EntryPoint|Provides|Binds|HiltViewModel)\b""")
@@ -840,14 +850,14 @@ class GraphCacheMigrationContractTest {
         }
         assertEquals("the v1 file prefix appears once, as the sweep's constant", 1,
             Regex("graph_cache_").findAll(all.getValue(migrationPath)).count())
-        assertFalse(Regex("""GraphCache(Migration|Cutover)|Graph(Migration|Consumer)Readiness""")
+        assertFalse(Regex("""GraphCache(Migration|Cutover)|Graph(Migration|Consumer)Readiness|AppGraphCacheCutover""")
             .containsMatchIn(all.getValue("com/jay/fxi/FXiApplication.kt")))
         val others = File("src").walkTopDown()
             .onEnter { it.parentFile?.name != "src" || it.name !in setOf("main", "test", "androidTest") }
             .filter { it.isFile && it.extension == "kt" }.toList()
         assertTrue("premise: the other source sets hold Kotlin (benchmark)", others.isNotEmpty())
         assertEquals("no other source set names them", emptyList<String>(), others.filter {
-            Regex("""\bGraph(CacheMigration|CacheCutover|MigrationReadiness|ConsumerReadiness)\b""").containsMatchIn(it.readText())
+            Regex("""\b(Graph(CacheMigration|CacheCutover|MigrationReadiness|ConsumerReadiness)|AppGraphCacheCutover)\b""").containsMatchIn(it.readText())
         }.map { it.path })
 
         val files = filesDir("files")
@@ -859,6 +869,7 @@ class GraphCacheMigrationContractTest {
         val journal = open()
         val m = migration(journal, files, GraphConsumerReadiness(), deleter())
         GraphCacheCutover(m, CoroutineScope(Dispatchers.IO + SupervisorJob())) { fail("reported") }
+        AppGraphCacheCutover(GraphConsumerReadiness(), journal, files, CoroutineScope(Dispatchers.IO + SupervisorJob()), { fail("reported") }, deleter())
         assertEquals(listOf("datastore", versioned[0]).sorted(), names(files))
         assertEquals(listOf(prefs), names(datastore))
         legacy.forEach { (file, bytes) ->
@@ -867,5 +878,80 @@ class GraphCacheMigrationContractTest {
         }
         assertEquals(emptyList<String>(), deleteCalls)
         assertEquals(null to null, open().let { it.stage(GRAPH_CACHE_FILES) to it.stage(GRAPH_PREFERENCES) })
+    }
+
+    // --- S4 CUT-CC5-4: the process's graph cache migration (`cut_cc5_agreed.r1.md`) ------------------------------------
+
+    private fun appCutover(
+        readiness: GraphConsumerReadiness,
+        journal: LocalMigrationJournal,
+        files: File,
+        reports: MutableList<Throwable>
+    ) = AppGraphCacheCutover(readiness, journal, files, CoroutineScope(Dispatchers.IO + SupervisorJob()), { reports += it }, deleter())
+
+    /**
+     * CC5-4-C01: marking and launching runs the migration over the very readiness it marked — another readiness would refuse
+     * the cutover — so both v1 graph targets are deleted and journalled, reporting nothing; a repeat returns the same job and
+     * deletes nothing more.
+     */
+    @Test fun `CC5-4-C01 markReadyAndLaunch marks the migration's own readiness, then launches it once`() = runBlocking {
+        val files = filesDir("files")
+        put(files, versioned[0], corrupt)
+        put(File(files, "datastore"), prefs, corrupt)
+        val readiness = GraphConsumerReadiness()
+        val reports = mutableListOf<Throwable>()
+        val app = appCutover(readiness, open(), files, reports)
+        val job = app.markReadyAndLaunch()
+        job.join()
+        assertEquals("CC5-4-C01 nothing reported", emptyList<Throwable>(), reports)
+        readiness.requireReady()
+        assertEquals("CC5-4-C01 both targets deleted", listOf("datastore"), names(files))
+        assertEquals(emptyList<String>(), names(File(files, "datastore")))
+        val deletes = deleteCalls.toList()
+        assertSame("CC5-4-C01 a repeat returns the same job", job, app.markReadyAndLaunch())
+        assertEquals("CC5-4-C01 and deletes nothing more", deletes, deleteCalls)
+        close()
+        assertEquals(LEGACY_DELETED to LEGACY_DELETED, stages())
+    }
+
+    /**
+     * CC5-4-C02: a journal past its cutover resumes at the deletion; an unreadable stage of one target is reported once and
+     * keeps that target's value, while the other target is still migrated.
+     */
+    @Test fun `CC5-4-C02 resumes from the journal and reports a failed target once`() = runBlocking {
+        val files = filesDir("files")
+        put(files, versioned[0], corrupt)
+        put(File(files, "datastore"), prefs, corrupt)
+        val journal = open()
+        checkNotNull(store).edit { it[stringPreferencesKey(GRAPH_CACHE_FILES.key)] = "BOGUS" }
+        journal.detect(GRAPH_PREFERENCES)
+        journal.cutover(GRAPH_PREFERENCES) {}
+        val reports = mutableListOf<Throwable>()
+        appCutover(GraphConsumerReadiness(), journal, files, reports).markReadyAndLaunch().join()
+        val failure = reports.single() as GraphCacheMigrationFailure
+        assertEquals("CC5-4-C02 the unreadable target alone failed", setOf(GRAPH_CACHE_FILES), failure.failures.keys)
+        assertEquals("CC5-4-C02 its value kept", "BOGUS", rawValue(GRAPH_CACHE_FILES.key))
+        assertEquals("CC5-4-C02 the cache file stays", listOf("datastore", versioned[0]).sorted(), names(files))
+        assertEquals("CC5-4-C02 the preferences resumed at the deletion", emptyList<String>(), names(File(files, "datastore")))
+        assertEquals(LEGACY_DELETED, journal.stage(GRAPH_PREFERENCES))
+    }
+
+    /**
+     * CC5-4-C03: the readiness is marked before the migration is launched: when the launch reaches its dispatcher, the
+     * readiness already answers.
+     */
+    @Test fun `CC5-4-C03 the readiness is marked before the launch is dispatched`() = runBlocking {
+        val readiness = GraphConsumerReadiness()
+        val seen = java.util.Collections.synchronizedList(mutableListOf<Boolean>())
+        val recording = object : kotlinx.coroutines.CoroutineDispatcher() {
+            override fun dispatch(context: kotlin.coroutines.CoroutineContext, block: Runnable) {
+                seen += runCatching { runBlocking { readiness.requireReady() } }.isSuccess
+                Dispatchers.IO.dispatch(context, block)
+            }
+        }
+        val app = AppGraphCacheCutover(readiness, open(), filesDir("files"), CoroutineScope(recording + SupervisorJob()),
+            { fail("reported: $it") }, deleter())
+        app.markReadyAndLaunch().join()
+        assertEquals("CC5-4-C03 the launch's first dispatch finds the readiness marked", true, seen.firstOrNull())
     }
 }

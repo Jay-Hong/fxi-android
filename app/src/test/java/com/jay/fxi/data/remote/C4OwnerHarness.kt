@@ -245,7 +245,9 @@ internal class C4OwnerHarness(
     captureUncaught: Boolean = false,
     /** S4 CUT-CC5-2: how the owner makes the screen host; the production host when null. */
     newGraphHost: ((CoroutineScope, (String) -> com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder, (Throwable) -> Unit) ->
-        com.jay.fxi.ui.premium.graph.GraphScreenHost)? = null
+        com.jay.fxi.ui.premium.graph.GraphScreenHost)? = null,
+    /** S4 CUT-CC5-4: how the owner resolves the graph cache migration; none when null. */
+    graphCutover: (() -> com.jay.fxi.data.local.AppGraphCacheCutover)? = null
 ) {
     companion object {
         const val URL = "http://localhost/ws"
@@ -379,7 +381,8 @@ internal class C4OwnerHarness(
         main = ownerMain,
         graphBuilder = graphBuilder,
         reportGraph = reportGraph,
-        newGraphHost = newGraphHost ?: { scope, create, onFailure -> com.jay.fxi.ui.premium.graph.GraphScreenHost(scope, create, onFailure) }
+        newGraphHost = newGraphHost ?: { scope, create, onFailure -> com.jay.fxi.ui.premium.graph.GraphScreenHost(scope, create, onFailure) },
+        graphCutover = graphCutover
     )
 
     /** The platform reporting the process coming to (true) or leaving (false) the foreground. */

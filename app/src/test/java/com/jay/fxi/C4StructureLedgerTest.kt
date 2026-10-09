@@ -99,4 +99,35 @@ class C4StructureLedgerTest {
             assertTrue("$type is resolved before admission and Firebase: $reads", reads.all { it > firebase })
         }
     }
+
+    /**
+     * S4 CUT-CC5-4: the graph cache migration is no Application service: the owner takes it as a Provider and resolves it on
+     * its host install, after the host and its time events and before the host's publication, which comes before the
+     * readiness is marked and the migration launched.
+     */
+    @Test
+    fun `C4-J-START-ADMISSION the graph migration is resolved by the owner after its host, never by the Application`() {
+        assertFalse("the Application names it", "AppGraphCacheCutover" in file("FXiApplication.kt"))
+        assertTrue("it is a singleton", "@Singleton" in file("AppGraphCacheCutover.kt"))
+        val owner = file("TopicRuntimeOwner.kt")
+        // The injected constructor names the Provider twice — its parameter and the bare method reference it hands over —
+        // and does nothing else with it.
+        val injected = owner.substring(owner.indexOf("    @Inject\n    constructor("), owner.indexOf("    private var attempted"))
+        assertTrue("the owner's injected constructor takes the Provider", "        graphCutover: Provider<AppGraphCacheCutover>\n" in injected)
+        assertTrue("and hands it over unresolved", "        graphCutover = graphCutover::get\n" in injected)
+        assertEquals("and touches it nowhere else", 3, Regex("""\bgraphCutover\b""").findAll(injected).count())
+        // The install function exactly: from its signature to the closing brace at its own indent, comment lines dropped.
+        val start = owner.indexOf("    private suspend fun install(")
+        val install = owner.substring(start, owner.indexOf("\n    }\n", start) + 6).lines()
+            .filterNot { it.trimStart().startsWith("//") }.joinToString("\n")
+        val order = listOf("val host = newGraphHost(", "starter.timeEventTarget = host::onTimeEvent",
+            "graphCutover?.invoke().also { graphHost.value = host }", "cutover?.markReadyAndLaunch()").map { install.indexOf(it) }
+        assertTrue("host, time events, resolution then publication, then mark and launch: $order", order.all { it >= 0 } && order == order.sorted())
+        assertEquals("one mark and launch", 1, Regex("""markReadyAndLaunch\(""").findAll(install).count())
+        val catchStart = install.indexOf("        } catch (failure: Throwable) {")
+        val catchEnd = install.indexOf("\n        }\n", catchStart)
+        assertTrue("the try and its catch end before the mark and launch: $catchStart $catchEnd ${order.last()}",
+            install.indexOf("val cutover = try {") in 0 until catchStart && catchEnd in catchStart until order.last())
+        assertTrue("a failed install returns", Regex("""\n\s*return\n""").containsMatchIn(install.substring(catchStart, catchEnd + 1)))
+    }
 }

@@ -7,8 +7,7 @@ import kotlinx.coroutines.launch
 
 /**
  * S4 RT07: launches [GraphCacheMigration.run] at most once per GraphCacheCutover instance, returning the same Job after
- * success, failure, or cancellation. Critical cutover wiring must provide one process-owned instance. Dormant: nothing in
- * production constructs it.
+ * success, failure, or cancellation. The process's one instance is [AppGraphCacheCutover]'s (S4 CUT-CC5-4).
  *
  * A failure goes to [report] once and is never treated as done; the journal keeps the last completed step for the next
  * process. A cancellation is not reported and propagates. There is no retry timer. [scope] must run on an IO dispatcher: the

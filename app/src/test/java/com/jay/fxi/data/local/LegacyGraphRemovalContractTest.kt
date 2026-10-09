@@ -62,8 +62,8 @@ class LegacyGraphRemovalContractTest {
     }
 
     /**
-     * GA01b: v1 graph file names survive only where they are deleted (CacheService and, since S4 RT07, the dormant
-     * GraphCacheMigration sweep) or named as obligations (the migration journal and the purge manifest). In CacheService every
+     * GA01b: v1 graph file names survive only where they are deleted (CacheService and, since S4 RT07, the GraphCacheMigration
+     * sweep, which S4 CUT-CC5-4 launches) or named as obligations (the migration journal and the purge manifest). In CacheService every
      * use of the two name helpers deletes the file it names.
      */
     @Test fun GA01b_v1GraphFileNamesSurviveOnlyForDeletionAndObligations() {
@@ -91,8 +91,8 @@ class LegacyGraphRemovalContractTest {
             assertEquals(id, "S4", target.owner)
         }
         assertEquals(
-            "`graph_cache_v1_*.json` and the legacy names; no reader or writer remains — only account-deletion cleanup removes " +
-                "them until the S4 cutover migration (§9.1)",
+            "`graph_cache_v1_*.json` and the legacy names; no reader or writer remains — the S4 cutover migration deletes " +
+                "them once the graph runtime and screen host are ready (§9.1); account-deletion cleanup also removes them",
             PurgeManifest.TARGETS.single { it.id == "file:graph_cache" }.note
         )
         assertEquals(

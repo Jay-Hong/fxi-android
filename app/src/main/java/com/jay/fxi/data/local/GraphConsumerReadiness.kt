@@ -5,7 +5,8 @@ package com.jay.fxi.data.local
  * assembled and started on Main, its initial inputs handed over, and the screen host installed, so the v2 consumers are
  * authoritative and read absence as default (an empty disk store, an absent selection). Otherwise it throws
  * IllegalStateException at once; it never waits, since the launcher starts the migration only after [markReady]. A process
- * whose graph runtime failed never marks it. Dormant: nothing in production constructs it.
+ * whose graph runtime failed never marks it. The process's one instance is [AppGraphCacheCutover]'s, which marks it and hands it
+ * to the migration (S4 CUT-CC5-4).
  */
 internal class GraphConsumerReadiness : GraphMigrationReadiness {
     @Volatile private var ready = false

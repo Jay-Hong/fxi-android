@@ -30,6 +30,7 @@ import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
 import kotlinx.datetime.Instant
+import kotlinx.coroutines.cancelAndJoin
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -161,6 +162,8 @@ class TopicRuntimeOwnerGraphContractTest {
         /** When set, making the host throws it. */
         var hostFailure: Throwable? = null
         var hostsMade = 0
+        /** The last host made, whether or not it was published. */
+        var lastHost: com.jay.fxi.ui.premium.graph.GraphScreenHost? = null
         /** The time event the builder was handed, as the recovery events would call it. */
         var timeEventHandedOver: (() -> Unit)? = null
         val newGraphHost: (kotlinx.coroutines.CoroutineScope, (String) -> com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder, (Throwable) -> Unit) ->
@@ -168,6 +171,7 @@ class TopicRuntimeOwnerGraphContractTest {
             hostsMade++
             hostFailure?.let { throw it }
             com.jay.fxi.ui.premium.graph.GraphScreenHost(scope, create, onFailure, forwardTimeEvent = { timeForwarded += it })
+                .also { lastHost = it }
         }
         val selections = object : com.jay.fxi.data.local.GraphSelectionStore {
             override suspend fun readGraphSelection(key: com.jay.fxi.data.local.GraphSelectionKey) =
@@ -189,12 +193,15 @@ class TopicRuntimeOwnerGraphContractTest {
             failFirstCreate: Boolean = false,
             failFenceObserve: Boolean = false,
             initialForeground: Boolean? = null,
-            captureUncaught: Boolean = false
+            captureUncaught: Boolean = false,
+            live: AuthIdentityFence? = C4OwnerHarness.U1,
+            graphCutover: (() -> com.jay.fxi.data.local.AppGraphCacheCutover)? = null
         ) =
             C4OwnerHarness(
-                test, online = online, failFirstCreate = failFirstCreate, failFenceObserve = failFenceObserve,
+                test, live = live, online = online, failFirstCreate = failFirstCreate, failFenceObserve = failFenceObserve,
                 graphBuilder = builder, reportGraph = { reports += it; if (reportFails) error("report failed") },
-                initialForeground = initialForeground, newGraphHost = newGraphHost, captureUncaught = captureUncaught
+                initialForeground = initialForeground, newGraphHost = newGraphHost, captureUncaught = captureUncaught,
+                graphCutover = graphCutover
             ).also { h = it; it.tabs.stored["u1"] = FreeTab.TETHER }
 
         /** Closes the assembly on the owner's Main and drains, so no recovery-event timer outlives the row. */
@@ -663,8 +670,9 @@ class TopicRuntimeOwnerGraphContractTest {
      * CC4b-O09: constructing the production owner resolves no graph dependency: its builder takes each of them as a Provider —
      * the disk store, the deletion admission, the seed source, the authenticated client, the use authority and (S4 CUT-CC5-2)
      * the selection store — and holds
-     * nothing else to resolve; the owner takes that builder. A D24-off or no-data process never calls start(), so it builds,
-     * resolves and starts no graph.
+     * nothing else to resolve; the owner takes that builder and (S4 CUT-CC5-4) the graph cache migration as a Provider of its
+     * own, which constructing it does not resolve. A D24-off or no-data process never calls start(), so it builds, resolves and
+     * starts no graph and launches no migration.
      */
     @Test
     fun `CC4b-O09 constructing the owner resolves no graph provider`() {
@@ -682,7 +690,13 @@ class TopicRuntimeOwnerGraphContractTest {
         assertFalse("CC4b-O09 the builder resolves nothing when constructed", Regex("""\binit\s*\{|\bby\s+lazy\b""").containsMatchIn(source))
         val owner = TopicRuntimeOwner::class.java.declaredConstructors.single { c -> c.isAnnotationPresent(javax.inject.Inject::class.java) }
         assertTrue("CC4b-O09 the owner takes the builder", owner.parameterTypes.contains(com.jay.fxi.data.graph.AppProcessGraphBuilder::class.java))
-        assertTrue("CC4b-O09 and no graph Provider of its own", owner.parameterTypes.none { it == javax.inject.Provider::class.java })
+        val ownProviders = owner.genericParameterTypes.filterIsInstance<java.lang.reflect.ParameterizedType>()
+            .filter { it.rawType == javax.inject.Provider::class.java }.map { (it.actualTypeArguments.single() as Class<*>).simpleName }
+        assertEquals("CC5-4-O09 and one Provider of its own, the graph cache migration", listOf("AppGraphCacheCutover"), ownProviders)
+        var resolved = 0
+        val u = C4OwnerHarness(kotlinx.coroutines.test.TestScope(), graphCutover = { resolved++; error("resolved") })
+        checkNotNull(u.owner)
+        assertEquals("CC5-4-O09 constructing the owner does not resolve it", 0, resolved)
     }
 
     /**
@@ -700,5 +714,207 @@ class TopicRuntimeOwnerGraphContractTest {
         assertEquals("CC4b-O08 detached", TopicGraphOffer.DORMANT,
             (h.runtime().part("graphInputs") as DetachableTopicGraphSink).tryOffer(probe))
         assertTrue("CC4b-O08 closed", g.assemblyEnded())
+    }
+
+    // ---- S4 CUT-CC5-4: readiness and the graph cache migration (`cut_cc5_agreed.r1.md`) --------------------------------
+
+    /**
+     * A filesDir holding one v1 graph cache file and the v1 graph preference store, with a real migration journal beside it,
+     * and the process's graph cache migration over both, launching on its own IO scope. Each resolution of [provider] is
+     * counted, with the owner's published host and the hosts made at that moment.
+     */
+    private class Legacy(private val g: GraphRig) {
+        val root: java.io.File = kotlin.io.path.createTempDirectory("cc54").toFile()
+        val files = java.io.File(root, "files").also { it.mkdirs() }
+        val cache = java.io.File(files, "graph_cache_v1_usd-krw.json").also { it.writeText("v1") }
+        val prefs = java.io.File(files, "datastore/fxi_graph_preferences.preferences_pb").also { it.parentFile!!.mkdirs(); it.writeText("v1") }
+        private val storeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob())
+        val journal = com.jay.fxi.data.local.LocalMigrationJournal(
+            androidx.datastore.preferences.core.PreferenceDataStoreFactory.create(scope = storeScope) { java.io.File(root, "journal.preferences_pb") })
+        val launchScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob())
+        val reports = mutableListOf<Throwable>()
+        /** Each resolution: whether a host was published then, and how many hosts had been made. */
+        val resolutions = mutableListOf<Pair<Boolean, Int>>()
+        var failure: Throwable? = null
+        val cutover by lazy { com.jay.fxi.data.local.AppGraphCacheCutover(com.jay.fxi.data.local.GraphConsumerReadiness(), journal, files, launchScope, { reports += it }) }
+        val provider: () -> com.jay.fxi.data.local.AppGraphCacheCutover = {
+            resolutions += (g.h.owner.graphHost.value != null) to g.hostsMade
+            failure?.let { throw it }
+            cutover
+        }
+
+        /** Waits for every migration this process launched. */
+        suspend fun joinLaunched() = launchScope.coroutineContext[kotlinx.coroutines.Job]!!.children.toList().forEach { it.join() }
+
+        suspend fun stages() = journal.stage(com.jay.fxi.data.local.LegacyMigrationTarget.GRAPH_CACHE_FILES) to
+            journal.stage(com.jay.fxi.data.local.LegacyMigrationTarget.GRAPH_PREFERENCES)
+
+        fun intact() = cache.readText() == "v1" && prefs.readText() == "v1"
+
+        fun close() = kotlinx.coroutines.runBlocking {
+            launchScope.coroutineContext[kotlinx.coroutines.Job]!!.cancelAndJoin()
+            storeScope.coroutineContext[kotlinx.coroutines.Job]!!.cancelAndJoin()
+            root.deleteRecursively()
+        }
+    }
+
+    /**
+     * CC5-4-K01: signed out and with no screen opened, the graph's publication installs the host, then resolves the migration
+     * — after the host is made, before it is published — then marks the readiness and launches: both v1 graph targets are
+     * deleted and journalled. A second start launches nothing more.
+     */
+    @Test
+    fun `CC5-4-K01 after the host the migration is resolved, marked ready and launched, signed out and unvisited`() = runTest {
+        val g = GraphRig(this)
+        val legacy = Legacy(g)
+        try {
+            val h = g.harness(this, live = null, graphCutover = legacy.provider)
+            h.owner.start()
+            h.settle(100)
+            h.owner.start()
+            h.settle(100)
+            assertEquals("CC5-4-K01 resolved once, after the host was made and before it was published", listOf(false to 1), legacy.resolutions)
+            assertNotNull("CC5-4-K01 the host is published", h.owner.graphHost.value)
+            legacy.joinLaunched()
+            assertTrue("CC5-4-K01 no failure reported: ${legacy.reports}", legacy.reports.isEmpty())
+            assertFalse("CC5-4-K01 the v1 graph files are deleted", legacy.cache.exists() || legacy.prefs.exists())
+            assertEquals("CC5-4-K01 journalled", com.jay.fxi.data.local.LegacyMigrationStage.LEGACY_DELETED to
+                com.jay.fxi.data.local.LegacyMigrationStage.LEGACY_DELETED, legacy.stages())
+            g.close()
+        } finally {
+            legacy.close()
+        }
+    }
+
+    /**
+     * CC5-4-K02: resolving the migration fails: nothing is published, the time events go back to a no-op even for a mounted
+     * host, nothing is marked or launched — a journal already at CONSUMER_CUTOVER deletes nothing — and the graph is detached
+     * and closed; reported once, the topic ready.
+     */
+    @Test
+    fun `CC5-4-K02 a failed migration resolution publishes nothing, launches nothing and cleans up`() = runTest {
+        val g = GraphRig(this)
+        val legacy = Legacy(g)
+        try {
+            for (target in com.jay.fxi.data.local.LegacyMigrationTarget.entries.filter { it.key.startsWith("graph_") }) {
+                legacy.journal.detect(target)
+                legacy.journal.cutover(target) {}
+            }
+            val boom = IllegalStateException("cutover failed")
+            legacy.failure = boom
+            val h = g.harness(this, graphCutover = legacy.provider)
+            h.owner.start()
+            h.settle(100)
+            h.owner.requireReady()
+            assertEquals("CC5-4-K02 resolved once", 1, legacy.resolutions.size)
+            assertNull("CC5-4-K02 nothing published", h.owner.graphHost.value)
+            assertSame("CC5-4-K02 reported once", boom, g.reports.single())
+            assertEquals("CC5-4-K02 detached", TopicGraphOffer.DORMANT,
+                (h.runtime().part("graphInputs") as DetachableTopicGraphSink).tryOffer(probe))
+            assertTrue("CC5-4-K02 the assembly is closed and waited for", g.assemblyEnded())
+            val mount = checkNotNull(g.lastHost).open()
+            h.settle(100)
+            assertTrue("CC5-4-K02 premise: the made host mounts holders", mount.holders.value.isNotEmpty())
+            checkNotNull(g.timeEventHandedOver).invoke()
+            assertTrue("CC5-4-K02 the time events go nowhere", g.timeForwarded.isEmpty())
+            mount.close()
+            h.settle(100)
+            legacy.joinLaunched()
+            assertTrue("CC5-4-K02 nothing deleted", legacy.intact())
+            assertEquals("CC5-4-K02 the journal is where it was", com.jay.fxi.data.local.LegacyMigrationStage.CONSUMER_CUTOVER to
+                com.jay.fxi.data.local.LegacyMigrationStage.CONSUMER_CUTOVER, legacy.stages())
+        } finally {
+            legacy.close()
+        }
+    }
+
+    /**
+     * CC5-4-K03: an Error, or a cancellation, resolving the migration runs the same cleanup, is not reported and is rethrown —
+     * an Error escapes the owner's scope — and launches nothing.
+     */
+    @Test
+    fun `CC5-4-K03 an Error or a cancellation resolving the migration is cleaned up after and rethrown`() = runTest {
+        for (thrown in listOf<Throwable>(AssertionError("cutover broke"), kotlinx.coroutines.CancellationException("cutover cancelled"))) {
+            val g = GraphRig(this)
+            val legacy = Legacy(g)
+            try {
+                legacy.failure = thrown
+                val h = g.harness(this, captureUncaught = true, graphCutover = legacy.provider)
+                h.owner.start()
+                h.settle(100)
+                h.owner.requireReady()
+                val escaped = if (thrown is Error) listOf(thrown.message) else emptyList()
+                assertEquals("CC5-4-K03 ${thrown.message}: what escapes the owner's scope", escaped, h.uncaught.map { it.message })
+                assertEquals("CC5-4-K03 ${thrown.message}: premise, resolved once", 1, legacy.resolutions.size)
+                assertNull("CC5-4-K03 ${thrown.message}: nothing published", h.owner.graphHost.value)
+                assertTrue("CC5-4-K03 ${thrown.message}: not reported", g.reports.isEmpty())
+                assertTrue("CC5-4-K03 ${thrown.message}: the assembly is closed", g.assemblyEnded())
+                legacy.joinLaunched()
+                assertTrue("CC5-4-K03 ${thrown.message}: nothing deleted", legacy.intact())
+            } finally {
+                legacy.close()
+            }
+        }
+    }
+
+    /**
+     * CC5-4-K04: a graph that fails before its publication — a failed seed read — and a host that cannot be made never resolve
+     * the migration: nothing is marked, launched or deleted, with the journal at CONSUMER_CUTOVER or LEGACY_DELETED.
+     */
+    @Test
+    fun `CC5-4-K04 a failed graph never resolves or launches the migration`() = runTest {
+        for (fail in listOf("seed", "host")) for (deleted in listOf(false, true)) {
+            val g = if (fail == "seed") GraphRig(this, seedRead = { throw java.io.IOException("seed failed") }) else GraphRig(this)
+            if (fail == "host") g.hostFailure = IllegalStateException("host failed")
+            val legacy = Legacy(g)
+            try {
+                // The journal is past its cutover, or past its deletion with the v1 files written back.
+                for (target in com.jay.fxi.data.local.LegacyMigrationTarget.entries.filter { it.key.startsWith("graph_") }) {
+                    legacy.journal.detect(target)
+                    legacy.journal.cutover(target) {}
+                    if (deleted) legacy.journal.deleteLegacy(target) {}
+                }
+                val h = g.harness(this, graphCutover = legacy.provider)
+                h.owner.start()
+                h.settle(100)
+                h.owner.requireReady()
+                assertTrue("CC5-4-K04 $fail/$deleted: premise, the graph failed", g.reports.isNotEmpty())
+                assertTrue("CC5-4-K04 $fail/$deleted: never resolved", legacy.resolutions.isEmpty())
+                legacy.joinLaunched()
+                assertTrue("CC5-4-K04 $fail/$deleted: nothing deleted", legacy.intact())
+            } finally {
+                legacy.close()
+            }
+        }
+    }
+
+    /**
+     * CC5-4-K05: a D24-off or no-data process never starts the owner (`FXiApplicationStartTest` C4-J-START-ADMISSION, the
+     * gate of app-owned services). Constructed and left unstarted while time passes, the owner builds no graph and resolves,
+     * marks and launches no migration: with the journal at CONSUMER_CUTOVER or LEGACY_DELETED, the v1 files and the stages stay.
+     */
+    @Test
+    fun `CC5-4-K05 an owner never started builds, resolves and launches nothing`() = runTest {
+        for (deleted in listOf(false, true)) {
+            val g = GraphRig(this)
+            val legacy = Legacy(g)
+            try {
+                for (target in com.jay.fxi.data.local.LegacyMigrationTarget.entries.filter { it.key.startsWith("graph_") }) {
+                    legacy.journal.detect(target)
+                    legacy.journal.cutover(target) {}
+                    if (deleted) legacy.journal.deleteLegacy(target) {}
+                }
+                val before = legacy.stages()
+                val h = g.harness(this, graphCutover = legacy.provider)
+                h.settle(60_000)
+                assertEquals("CC5-4-K05 $deleted: no graph built", 0, g.builds)
+                assertTrue("CC5-4-K05 $deleted: never resolved", legacy.resolutions.isEmpty())
+                legacy.joinLaunched()
+                assertTrue("CC5-4-K05 $deleted: the v1 files stay", legacy.intact())
+                assertEquals("CC5-4-K05 $deleted: the stages stay", before, legacy.stages())
+            } finally {
+                legacy.close()
+            }
+        }
     }
 }

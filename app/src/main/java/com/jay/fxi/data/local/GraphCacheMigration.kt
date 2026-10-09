@@ -12,7 +12,7 @@ import kotlinx.coroutines.sync.withLock
  * S4 RT07: the consumer readiness the graph cutover step waits on. Returning asserts that the v2 store's required commit, or
  * its explicitly verified absence-as-default contract, and the consumer cutover have succeeded. Readiness must not depend on
  * login, premium approval, catalog fetch success, or graph screen visitation. It runs inside this migration's lock and the
- * journal's cutover step, so it must not wait for this migration. No production implementation is supplied by RT07.
+ * journal's cutover step, so it must not wait for this migration. The production implementation is [GraphConsumerReadiness] (S4 CUT-P3c).
  */
 internal fun interface GraphMigrationReadiness {
     suspend fun requireReady()
@@ -42,8 +42,8 @@ internal class GraphCacheMigrationFailure(val failures: Map<LegacyMigrationTarge
 
 /**
  * S4 RT07: retires the v1 graph cache files and the v1 graph preference store (`ANDROID_V2_PLAN.md` §9.1), each through its
- * own journal target, under one mutex. Its file work blocks: callers run it on an IO dispatcher. Dormant: nothing in
- * production constructs it.
+ * own journal target, under one mutex. Its file work blocks: callers run it on an IO dispatcher. [AppGraphCacheCutover]
+ * constructs the process's one instance (S4 CUT-CC5-4).
  *
  * Each target resumes from the stage it last recorded: from none, detect, cut over and delete; from DETECTED, cut over and
  * delete; from CONSUMER_CUTOVER, delete; from LEGACY_DELETED, sweep again without writing the journal, because a downgrade can

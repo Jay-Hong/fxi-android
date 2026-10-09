@@ -145,8 +145,8 @@ object PurgeManifest {
             classification = PurgeClassification.CUTOVER_OWNED,
             scopes = setOf(PurgeScope.USER),
             owner = "S4",
-            note = "`graph_cache_v1_*.json` and the legacy names; no reader or writer remains — only account-deletion cleanup removes " +
-                "them until the S4 cutover migration (§9.1)"
+            note = "`graph_cache_v1_*.json` and the legacy names; no reader or writer remains — the S4 cutover migration deletes " +
+                "them once the graph runtime and screen host are ready (§9.1); account-deletion cleanup also removes them"
         ),
         PurgeTarget(
             id = "memory:graph_recorder",

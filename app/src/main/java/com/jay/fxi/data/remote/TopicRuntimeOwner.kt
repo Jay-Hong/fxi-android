@@ -13,12 +13,14 @@ import com.jay.fxi.data.graph.ProcessGraphParts
 import com.jay.fxi.data.graph.ProcessGraphBuilder
 import com.jay.fxi.data.graph.ProcessGraphStarter
 import com.jay.fxi.data.graph.reportGraphFailure
+import com.jay.fxi.data.local.AppGraphCacheCutover
 import com.jay.fxi.data.local.RateRowPreferenceStore
 import com.jay.fxi.data.network.NetworkMonitor
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.graph.GraphScreenHost
 import com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder
 import javax.inject.Inject
+import javax.inject.Provider
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -60,7 +62,9 @@ internal class TopicRuntimeOwner internal constructor(
     private val reportGraph: (Throwable) -> Unit = {},
     /** S4 CUT-CC5-2: how the screen host is made; the production host unless a test injects a failure. */
     private val newGraphHost: (CoroutineScope, (String) -> GraphV2ScreenStateHolder, (Throwable) -> Unit) -> GraphScreenHost =
-        { scope, create, onFailure -> GraphScreenHost(scope, create, onFailure) }
+        { scope, create, onFailure -> GraphScreenHost(scope, create, onFailure) },
+    /** S4 CUT-CC5-4: resolves the process's graph cache migration once the host is installed; null launches none. */
+    private val graphCutover: (() -> AppGraphCacheCutover)? = null
 ) {
     @Inject
     constructor(
@@ -69,7 +73,8 @@ internal class TopicRuntimeOwner internal constructor(
         authTokenProvider: AuthTokenProvider,
         fences: AuthFenceStream,
         rowPreferenceStore: RateRowPreferenceStore,
-        graphBuilder: AppProcessGraphBuilder
+        graphBuilder: AppProcessGraphBuilder,
+        graphCutover: Provider<AppGraphCacheCutover>
     ) : this(
         factory,
         networkMonitor.isConnected,
@@ -79,7 +84,8 @@ internal class TopicRuntimeOwner internal constructor(
         rowPreferenceStore,
         CoroutineScope(Dispatchers.Main + SupervisorJob()),
         graphBuilder,
-        ::reportGraphFailure
+        ::reportGraphFailure,
+        graphCutover = graphCutover::get
     )
 
     private var attempted = false
@@ -98,7 +104,8 @@ internal class TopicRuntimeOwner internal constructor(
      * On the Main thread, once per process: builds the process graph and its starter, creates the runtime with the graph's
      * sink and bridge, binds the runtime to the starter, starts the runtime and the consumer on [main], installs network,
      * foreground and identity forwarding, starts the graph, then records readiness (S4 CUT-CC4b, `cut_cc4b_agreed.r1.md` §2).
-     * After the graph's publication the screen host is installed and published as [graphHost] (S4 CUT-CC5-2).
+     * After the graph's publication the screen host is installed and published as [graphHost] (S4 CUT-CC5-2), then the graph
+     * cache migration's readiness is marked and the migration launched (S4 CUT-CC5-4).
      * Online input stays false until the first foreground, whose callback passes the current [online] value directly. A graph
      * failure is reported once and gives up the graph alone; the topic goes on. A topic failure first secures the graph's
      * cleanup, then rethrows and leaves the owner not ready. Later calls do nothing.
@@ -106,7 +113,7 @@ internal class TopicRuntimeOwner internal constructor(
     fun start() {
         if (attempted) return
         attempted = true
-        val graph = ProcessGraphStartup(graphBuilder, main, reportGraph, graphHostState, newGraphHost)
+        val graph = ProcessGraphStartup(graphBuilder, main, reportGraph, graphHostState, newGraphHost, graphCutover)
         graph.assemble()
         val runtime = try {
             factory.create(graph.sink, graph.grants)
@@ -213,7 +220,8 @@ private class ProcessGraphStartup(
     private val main: CoroutineScope,
     private val report: (Throwable) -> Unit,
     private val graphHost: MutableStateFlow<GraphScreenHost?>,
-    private val newGraphHost: (CoroutineScope, (String) -> GraphV2ScreenStateHolder, (Throwable) -> Unit) -> GraphScreenHost
+    private val newGraphHost: (CoroutineScope, (String) -> GraphV2ScreenStateHolder, (Throwable) -> Unit) -> GraphScreenHost,
+    private val graphCutover: (() -> AppGraphCacheCutover)?
 ) {
     private val permit = LateBound<() -> TopicGraphRecoveryPermit?>("graph permit")
     private val seed = LateBound<String>("install seed")
@@ -267,23 +275,29 @@ private class ProcessGraphStartup(
     }
 
     /**
-     * S4 CUT-CC5-2: on Main right after the graph's publication, with no suspension: the host, then the starter's time events
-     * to it, then its publication. Making the host is the one step that can fail, before either is set, so nothing is
-     * published and the time events stay a no-op; the starter's retirement then runs the terminal cleanup — the runtime's graph
-     * detachment, the permit collector ended and waited for, the assembly closed and waited for — non-cancellably, reporting an
-     * Exception other than a cancellation once; a cancellation or an Error is rethrown unreported.
+     * S4 CUT-CC5-2/CC5-4: on Main right after the graph's publication, with no suspension: the host, then the starter's time
+     * events to it, then the graph cache migration resolved, then the host's publication, then the migration's readiness
+     * marked and the migration launched. Making the host and resolving the migration are the steps that can fail, both before
+     * the publication: nothing is published, the time events go back to a no-op, and nothing is marked or launched; the
+     * starter's retirement then runs the terminal cleanup — the runtime's graph detachment, the permit collector ended and
+     * waited for, the assembly closed and waited for — non-cancellably, reporting an Exception other than a cancellation once;
+     * a cancellation or an Error is rethrown unreported.
      */
     private suspend fun install(starter: ProcessGraphStarter) {
         val runtime = checkNotNull(runtime)
         val parts = checkNotNull(parts)
-        try {
+        val cutover = try {
             val host = newGraphHost(main, { tab -> parts.newHolder(tab, runtime.display, runtime.focus, main) }, report)
             starter.timeEventTarget = host::onTimeEvent
-            graphHost.value = host
+            graphCutover?.invoke().also { graphHost.value = host }
         } catch (failure: Throwable) {
+            starter.timeEventTarget = {}
             withContext(NonCancellable) { starter.retire(failure) }
             if (failure is CancellationException || failure !is Exception) throw failure
+            return
         }
+        // Past the publication the graph has succeeded: nothing here is undone as a graph failure.
+        cutover?.markReadyAndLaunch()
     }
 
     /**
