@@ -183,6 +183,12 @@ internal class TopicRuntime internal constructor(
     /** The screen's read-only view of this session. */
     val display: StateFlow<TopicDisplayState> = session.display
 
+    /** S4 CUT-CC2b: the session's own P7 permit supplier, handed through unchanged. Dormant: read from CC4. */
+    internal val graphRecoveryPermit: () -> TopicGraphRecoveryPermit? = session.recoveryPermit
+
+    /** S4 CUT-CC2b: the session's own permit revision flow, handed through unchanged. Dormant: collected from CC4. */
+    internal val graphRecoveryPermitRevisions: StateFlow<Long> = session.recoveryPermitRevisions
+
     fun setOnline(value: Boolean) = session.setOnline(value)
 
     fun setForeground(value: Boolean) = session.setForeground(value)

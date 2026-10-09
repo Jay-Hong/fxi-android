@@ -144,8 +144,14 @@ class TopicSessionCoordinatorTest {
          */
         var autoPong = true
 
+        /** S4 CUT-CC2b: thrown from the socket's cancel, after it is recorded, to stand for a cancel that fails. */
+        var cancelFailure: Throwable? = null
+
         private val socket = object : WebSocket {
-            override fun cancel() { cancelled = true }
+            override fun cancel() {
+                cancelled = true
+                cancelFailure?.let { throw it }
+            }
             override fun close(code: Int, reason: String?) = true
             override fun queueSize() = 0L
             override fun request() = Request.Builder().url(URL).build()
@@ -16346,6 +16352,805 @@ class TopicSessionCoordinatorTest {
         assertNull("CC2a-A11 and got no answer of its own", returned)
         assertEquals("CC2a-A11 the session still handles input", handed + 1, g.observations.size)
         h.cleanUp()
+    }
+
+    // ---- S4 CUT-CC2b: the session's P7 permit publisher (`cut_cc2_agreed.r2.md` §3, §4 B rows) --------------------------
+
+    private fun Harness.permit(): TopicGraphRecoveryPermit? = coordinator.recoveryPermit()
+    private fun Harness.permitRevision(): Long = coordinator.recoveryPermitRevisions.value
+
+    /** The session's current connection, read by reflection: null when there is none, else whether it has ended. */
+    private fun connectionEnded(h: Harness): Boolean? {
+        val field = TopicSessionCoordinator::class.java.getDeclaredField("connection").apply { isAccessible = true }
+        val live = field.get(h.coordinator) ?: return null
+        return live.javaClass.getDeclaredField("ended").apply { isAccessible = true }.getBoolean(live)
+    }
+
+    /** CC2b-B01: no permit while no fence is processed; the first and repeated nulls are not changes. */
+    @Test
+    fun `CC2b-B01 no permit while no fence is processed`() = runTest {
+        val h = Harness(this)
+        assertNull("CC2b-B01 before start", h.permit())
+        h.coordinator.start()
+        h.coordinator.setOnline(true)
+        advanceTimeBy(1)
+        assertNull("CC2b-B01 online alone", h.permit())
+        assertEquals("CC2b-B01 the first nulls are no change", 0L, h.permitRevision())
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        assertEquals("CC2b-B01 a fence publishes", 1L, checkNotNull(h.permit()).revision)
+        h.coordinator.setAccess(false, null, TopicGrantOrigin.NewContext)
+        advanceTimeBy(1)
+        assertNull("CC2b-B01 no fence again", h.permit())
+        assertEquals("CC2b-B01 that is one change", 2L, h.permitRevision())
+        h.coordinator.setOnline(false)
+        advanceTimeBy(1)
+        assertEquals("CC2b-B01 a null after null is no change", 2L, h.permitRevision())
+        h.cleanUp()
+    }
+
+    /**
+     * CC2b-B02/B03: the permit names this session, the fence and grant epoch it processed and its own Access decision; a
+     * Connection made under the fence is published with its generation and lifetime before Opened, and cleared when it ends.
+     */
+    @Test
+    fun `CC2b-B02 B03 the permit names the grant and its live connection before Opened, and clears it at the end`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        assertEquals("CC2b-B03 fixture: one socket, not opened", 1, h.wires.size)
+        val p = checkNotNull(h.permit())
+        assertEquals("CC2b-B02 the processed fence", fence(), p.fence)
+        assertEquals("CC2b-B02 the grant epoch in force", checkNotNull(h.shown().owner).grantEpoch, p.grantEpoch)
+        assertTrue("CC2b-B02 not re-approved", !p.reapproved)
+        assertEquals("CC2b-B03 the connection's generation, before Opened", 1L, p.connectionGeneration)
+        assertEquals("CC2b-B03 and its use", TopicUseLifetime(fence().grant, 0L), p.connectionLifetime)
+        assertTrue("CC2b-B02 automatic", p.automatic)
+        assertSame("CC2b-B02 one publication reads as one object", p, h.permit())
+
+        h.wire.open()
+        advanceTimeBy(1)
+        assertSame("CC2b-B03 Opened changes nothing", p, h.permit())
+
+        h.wire.drop()
+        advanceTimeBy(1)
+        val ended = checkNotNull(h.permit())
+        assertNull("CC2b-B03 no generation once it ended", ended.connectionGeneration)
+        assertNull("CC2b-B03 no lifetime once it ended", ended.connectionLifetime)
+        assertTrue("CC2b-B11 a plain grant does not wait for a connection", ended.automatic)
+        assertSame("CC2b-B02 the session key stays", p.sessionKey, ended.sessionKey)
+
+        advanceTimeBy(5_000)
+        assertEquals("CC2b-B03 the next connection's generation", 2L, checkNotNull(h.permit()).connectionGeneration)
+        h.cleanUp()
+    }
+
+    /** CC2b-B04: automatic follows online and access; foreground changes nothing at all. */
+    @Test
+    fun `CC2b-B04 automatic follows online and access, never foreground`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val held = checkNotNull(h.permit())
+        assertTrue("CC2b-B04 automatic", held.automatic)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        h.coordinator.setForeground(false)
+        advanceTimeBy(1)
+        assertSame("CC2b-B04 foreground is not a condition", held, h.permit())
+
+        h.coordinator.setOnline(false)
+        advanceTimeBy(1)
+        assertTrue("CC2b-B04 offline closes it", !checkNotNull(h.permit()).automatic)
+        h.coordinator.setOnline(true)
+        advanceTimeBy(100)
+        assertTrue("CC2b-B04 online again opens it", checkNotNull(h.permit()).automatic)
+
+        h.setAccess(false, fence())
+        advanceTimeBy(1)
+        val withdrawn = checkNotNull(h.permit())
+        assertTrue("CC2b-B04 a withdrawal closes it", !withdrawn.automatic)
+        assertEquals("CC2b-B04 for the same fence", fence(), withdrawn.fence)
+        h.cleanUp()
+    }
+
+    /** CC2b-B05: a turn that changes no meaning keeps the object and the revision; a change raises the revision by one. */
+    @Test
+    fun `CC2b-B05 the same meaning keeps the publication and a change raises the revision by one`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val held = checkNotNull(h.permit())
+        val revision = h.permitRevision()
+        h.wire.deliver(h.tetherFrame(1400.0))
+        advanceTimeBy(1)
+        h.coordinator.requestBootstrap(TETHER)
+        advanceTimeBy(1)
+        assertSame("CC2b-B05 the same meaning keeps the object", held, h.permit())
+        assertEquals("CC2b-B05 and the revision", revision, h.permitRevision())
+        h.coordinator.setOnline(false)
+        advanceTimeBy(1)
+        assertEquals("CC2b-B05 a change is one step", revision + 1, h.permitRevision())
+        assertEquals("CC2b-B05 carried by the publication", revision + 1, checkNotNull(h.permit()).revision)
+        h.cleanUp()
+    }
+
+    /**
+     * CC2b-B06: inside a turn the previous complete publication is read — here by a collector run in place when a grant move
+     * clears the prices, after the old connection's own end — and the turn's own publication follows it.
+     */
+    @Test
+    fun `CC2b-B06 inside a turn the previous publication is read, and the turn publishes after`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.tetherFrame(1400.0))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B06 fixture: a price is held", h.coordinator.rates.value.quotes.isNotEmpty())
+        val before = checkNotNull(h.permit())
+        // A grant move ends the connection — whose own end would publish outside a turn — and only then clears the prices,
+        // still inside the turn; a collector run in place at that clearing reads what was published then.
+        val seen = mutableListOf<TopicGraphRecoveryPermit?>()
+        backgroundScope.launch(Dispatchers.Unconfined) {
+            h.coordinator.rates.collect { if (it.quotes.isEmpty()) seen += h.permit() }
+        }
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B06 fixture: the prices were cleared inside the turn", seen.isNotEmpty())
+        assertSame("CC2b-B06 inside the turn: the previous publication", before, seen.first())
+        assertEquals("CC2b-B06 after it: the new grant", fence(grant = 2L), checkNotNull(h.permit()).fence)
+        h.cleanUp()
+    }
+
+    /**
+     * CC2b-B06 (placement): the publication is the first thing `publishDisplay` does after its deferral check, ahead of the
+     * display's own derivation, and the loop's ending publishes once more before it cancels the queue. A regression device on
+     * the source; later changes to these lines need their own review.
+     */
+    @Test
+    fun `CC2b-B06 the permit is published right after the deferral check and in the ending`() {
+        val code = File("src/main/java/com/jay/fxi/data/remote/TopicSessionCoordinator.kt").readText()
+            .replace(Regex("""//[^\n]*"""), "")
+        assertTrue(
+            "CC2b-B06 right after the deferral check",
+            Regex("""if \(displayPublicationDeferred\) return\s+publishPermit\(\)""").containsMatchIn(code)
+        )
+        assertTrue(
+            "CC2b-B06 in the ending, before the queue is cancelled",
+            Regex("""\}\s*finally\s*\{\s*publishPermit\(\)\s+inputs\.cancel\(\)""").containsMatchIn(code)
+        )
+        assertTrue(
+            "CC2b-B08 the publication is a volatile field (freshness across threads is not testable here)",
+            code.contains("@Volatile private var permit: TopicGraphRecoveryPermit? = null")
+        )
+    }
+
+    /** CC2b-B07: Stop is published once — the fence kept, automatic closed, no connection — and the ending adds nothing. */
+    @Test
+    fun `CC2b-B07 Stop publishes the end once`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val revision = h.permitRevision()
+        h.coordinator.stop()
+        advanceTimeBy(1)
+        val stopped = checkNotNull(h.permit())
+        assertEquals("CC2b-B07 the fence is kept", fence(), stopped.fence)
+        assertTrue("CC2b-B07 automatic closed", !stopped.automatic)
+        assertNull("CC2b-B07 no connection", stopped.connectionGeneration)
+        assertEquals("CC2b-B13 Stop and the ending are one change", revision + 1, h.permitRevision())
+        h.cleanUp()
+    }
+
+    /** CC2b-B08: another thread reads the supplier without blocking or throwing, and sees the same complete publication. */
+    @Test
+    fun `CC2b-B08 another thread reads the latest publication`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        val held = checkNotNull(h.permit())
+        var read: Any? = null
+        val reader = Thread { read = runCatching { h.coordinator.recoveryPermit() }.getOrElse { it } }
+        reader.start()
+        reader.join(5_000)
+        assertSame("CC2b-B08 the same publication from another thread", held, read)
+        h.cleanUp()
+    }
+
+    /** CC2b-B09: nothing in production reads the permit beyond the runtime handing it through (CC4 wires it). */
+    @Test
+    fun `CC2b-B09 no production code reads the permit yet`() {
+        val main = File("src/main/java")
+        val hits = main.walkTopDown().filter { it.isFile && (it.extension == "kt" || it.extension == "java") }.flatMap { file ->
+            file.readLines().filter {
+                Regex("""(\.|::)recoveryPermit(Revisions)?\b|\bgraphRecoveryPermit(Revisions)?\b""").containsMatchIn(it)
+            }.map { file.name to it.trim() }
+        }.toList()
+        assertEquals(
+            "CC2b-B09 only the runtime's two hand-throughs",
+            listOf(
+                "TopicRuntime.kt" to "internal val graphRecoveryPermit: () -> TopicGraphRecoveryPermit? = session.recoveryPermit",
+                "TopicRuntime.kt" to "internal val graphRecoveryPermitRevisions: StateFlow<Long> = session.recoveryPermitRevisions"
+            ),
+            hits
+        )
+    }
+
+    /**
+     * CC2b-B10: `reapproved` is the session's own Access decision — a Reapproval origin alone does not make it, the same
+     * identity and epoch and a moved fence do; a repeated Access changes nothing, and a withdrawal of the same fence ends it
+     * with the grant epoch moved.
+     */
+    @Test
+    fun `CC2b-B10 reapproved is the session's own Access decision`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.setAccess(true, fence(grant = 2L, epoch = "epoch-2"), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B10 another epoch is not inherited", !checkNotNull(h.permit()).reapproved)
+        h.setAccess(true, fence(generation = 2L, grant = 3L, epoch = "epoch-2"), TopicGrantOrigin.Reapproval(TopicGrantToken(2L)))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B10 another identity is not inherited", !checkNotNull(h.permit()).reapproved)
+        h.setAccess(true, fence(generation = 2L, grant = 4L, epoch = "epoch-2"), TopicGrantOrigin.Reapproval(TopicGrantToken(3L)))
+        advanceTimeBy(1)
+        val inherited = checkNotNull(h.permit())
+        assertTrue("CC2b-B10 the same identity and epoch, moved: inherited", inherited.reapproved)
+        h.setAccess(true, fence(generation = 2L, grant = 4L, epoch = "epoch-2"), TopicGrantOrigin.NewContext)
+        advanceTimeBy(1)
+        assertSame("CC2b-B10 a repeated Access changes nothing", inherited, h.permit())
+        h.setAccess(false, fence(generation = 2L, grant = 4L, epoch = "epoch-2"))
+        advanceTimeBy(1)
+        val withdrawn = checkNotNull(h.permit())
+        assertTrue("CC2b-B10 a withdrawal ends the inheritance", !withdrawn.reapproved)
+        assertEquals("CC2b-B10 with the grant epoch moved", inherited.grantEpoch + 1, withdrawn.grantEpoch)
+        h.setAccess(true, fence(generation = 2L, grant = 4L, epoch = "epoch-2"), TopicGrantOrigin.Reapproval(TopicGrantToken(4L)))
+        advanceTimeBy(1)
+        val regranted = checkNotNull(h.permit())
+        assertTrue("CC2b-B10 the same fence given back is not moved, so not inherited", !regranted.reapproved)
+        assertEquals("CC2b-B10 a re-grant does not move the epoch", withdrawn.grantEpoch, regranted.grantEpoch)
+        assertTrue("CC2b-B10 and is automatic again", regranted.automatic)
+        h.cleanUp()
+    }
+
+    /**
+     * CC2b-B11: under a re-approval, automatic waits — through a backoff and a failed connect — for a Connection of this
+     * grant, opens when it is created before Opened, and closes again when it ends.
+     */
+    @Test
+    fun `CC2b-B11 under a re-approval automatic waits for a connection of this grant`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.failConnects = 1
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(1)
+        val waiting = checkNotNull(h.permit())
+        assertTrue("CC2b-B11 fixture: re-approved", waiting.reapproved)
+        assertNull("CC2b-B11 the old grant's connection ended with the move", waiting.connectionGeneration)
+        assertTrue("CC2b-B11 closed during the backoff", !waiting.automatic)
+        advanceTimeBy(firstRungMillis)
+        assertEquals("CC2b-B11 fixture: the first rung's connect threw", 2, h.connectCalls)
+        assertTrue("CC2b-B11 closed after a connect threw", !checkNotNull(h.permit()).automatic)
+        advanceTimeBy(firstRungMillis * 2)
+        assertEquals("CC2b-B11 fixture: a connection, not opened", 2, h.wires.size)
+        val live = checkNotNull(h.permit())
+        assertTrue("CC2b-B11 opened by the connection, before Opened", live.automatic)
+        assertEquals("CC2b-B11 its generation", 3L, live.connectionGeneration)
+        h.wire.drop()
+        advanceTimeBy(1)
+        assertTrue("CC2b-B11 closed again when it ended", !checkNotNull(h.permit()).automatic)
+        h.cleanUp()
+    }
+
+    /**
+     * CC2b-B12: a premium refusal or an identity retirement closes automatic while access stays granted; foreground does not
+     * open it again, and a new fence is told apart from the latched one.
+     */
+    @Test
+    fun `CC2b-B12 a latch closes automatic with access still granted`() = runTest {
+        // Two sessions in one test, each on a scope of its own: cleaning up the shared background scope would stop the second.
+        val h = Harness(this, sessionScope = OwnScope(this).scope)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B12 refused: closed", !checkNotNull(h.permit()).automatic)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        assertTrue("CC2b-B12 foreground does not reopen it", !checkNotNull(h.permit()).automatic)
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B12 a new fence is not the latched one", checkNotNull(h.permit()).automatic)
+        val firstKey = checkNotNull(h.permit()).sessionKey
+        h.cleanUp()
+
+        val retired = Harness(this, sessionScope = OwnScope(this).scope)
+        retired.goLive()
+        advanceTimeBy(100)
+        retired.wire.open()
+        advanceTimeBy(1)
+        retired.liveFence = null
+        retired.wire.deliver(retired.tetherFrame(1400.0))
+        advanceTimeBy(1)
+        val lost = checkNotNull(retired.permit())
+        assertTrue("CC2b-B12 identity lost: closed", !lost.automatic)
+        assertEquals("CC2b-B12 fixture: access still granted to that fence", fence(), lost.fence)
+        retired.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        assertTrue("CC2b-B12 identity lost: foreground does not reopen it", !checkNotNull(retired.permit()).automatic)
+        retired.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B12 identity lost: a new fence is not the latched one", checkNotNull(retired.permit()).automatic)
+        assertNotEquals("CC2b-B02 each session has its own key", firstKey, checkNotNull(retired.permit()).sessionKey)
+        retired.cleanUp()
+    }
+
+    /**
+     * CC2b-B13 (the ending's sink cancels, nothing else publishes): with no connection to end, a turn that fails ends the loop
+     * and its shutdown is cancelled by the sink — only the ending's own publication closes automatic.
+     */
+    @Test
+    fun `CC2b-B13 the ending publishes even when its shutdown is cancelled and nothing else would`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD), sessionScope = own.scope)
+        val g = continuityLive(h)
+        h.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val attribution = g.observations.last().attribution
+        assertSame("CC2b-B02 the permit's key is the session's own", attribution.sessionKey, checkNotNull(h.permit()).sessionKey)
+        h.failConnects = 100
+        h.wire.drop()
+        advanceTimeBy(1)
+        assertTrue("CC2b-B13 fixture: no connection, still automatic", checkNotNull(h.permit()).let { it.automatic && it.connectionGeneration == null })
+        g.answer = {
+            if (it is TopicGraphInput.Continuity && it.kind == TopicGraphEventKind.HANDOVER_ENDED) {
+                throw kotlinx.coroutines.CancellationException("sink")
+            }
+            TopicGraphOffer.ENQUEUED
+        }
+        h.coordinator.runIfStillOwned(attribution) { throw IllegalStateException("turn") }
+        val answer = purge(h, { true }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B13 fixture: the ending reached the sink", g.inputs.any { it is TopicGraphInput.Continuity && it.kind == TopicGraphEventKind.HANDOVER_ENDED })
+        assertTrue("CC2b-B13 the ending closed automatic", !checkNotNull(h.permit()).automatic)
+        assertEquals("CC2b-B13 a pending purge is answered", false, answer.answered("CC2b-B13").getOrThrow())
+        assertEquals("CC2b-B13 the ending's cancellation replaced the turn's failure, as before", emptyList<Throwable>(), own.caught)
+        own.scope.cancel()
+    }
+
+    /**
+     * CC2b-B13 (failures that end the loop): a turn whose dispatch throws, a state observer that throws, and a shutdown whose
+     * socket cancel throws each still end with automatic closed, and each failure still reaches the scope as before; an
+     * ended connection the failed cancel left behind is not published.
+     */
+    @Test
+    fun `CC2b-B13 a failing turn, observer or shutdown still ends with automatic closed`() = runTest {
+        val turn = OwnScope(this)
+        val a = Harness(this, inert = true, desired = setOf(TETHER, USD), sessionScope = turn.scope)
+        val ga = continuityLive(a)
+        a.wire.deliver(gTether(listOf(gEntry("upbit", "usdt-krw", 1390.0, gT1))))
+        advanceTimeBy(1)
+        val boom = IllegalStateException("turn")
+        a.coordinator.runIfStillOwned(ga.observations.last().attribution) { throw boom }
+        advanceTimeBy(1)
+        assertEquals("CC2b-B13 the turn's failure propagates", listOf<Throwable>(boom), turn.caught)
+        assertTrue("CC2b-B13 a failed turn: closed", !checkNotNull(a.permit()).automatic)
+        turn.scope.cancel()
+
+        // A price on an acknowledged connection is published by the loop's own turn, not by a command.
+        val observer = OwnScope(this)
+        val b = Harness(this, sessionScope = observer.scope)
+        b.goLive()
+        advanceTimeBy(100)
+        b.wire.open()
+        advanceTimeBy(1)
+        b.wire.deliver(b.ack("r1", active = listOf(TETHER, USD)))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B13 fixture: acknowledged and automatic", checkNotNull(b.permit()).automatic)
+        val failure = IllegalStateException("observer")
+        lateinit var observerAnswer: Deferred<Result<Boolean>>
+        b.onTopicStatePublished = {
+            observerAnswer = purge(b, { true }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+            assertTrue("CC2b-B13 fixture: a purge pending at the observer's failure", !observerAnswer.isCompleted)
+            throw failure
+        }
+        b.wire.deliver(b.tetherFrame(1400.0))
+        advanceTimeBy(1)
+        assertEquals("CC2b-B13 the observer's failure propagates", listOf<Throwable>(failure), observer.caught)
+        assertTrue("CC2b-B13 a failed observer: closed", !checkNotNull(b.permit()).automatic)
+        assertEquals("CC2b-B13 a failed observer: the pending purge is answered", false, observerAnswer.answered("CC2b-B13 observer").getOrThrow())
+        assertTrue("CC2b-B13 a failed observer: closed and empty", closedAndEmpty(b))
+        observer.scope.cancel()
+
+        val shutdown = OwnScope(this)
+        val c = Harness(this, sessionScope = shutdown.scope)
+        c.goLive()
+        advanceTimeBy(100)
+        c.wire.open()
+        advanceTimeBy(1)
+        val cancelFailure = IllegalStateException("cancel")
+        c.wire.cancelFailure = cancelFailure
+        shutdown.scope.cancel()
+        val shutdownAnswer = purge(c, { true }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        assertTrue("CC2b-B13 fixture: a purge pending at the shutdown", !shutdownAnswer.isCompleted)
+        advanceTimeBy(1)
+        assertTrue("CC2b-B13 fixture: the socket's cancel was attempted", c.wire.cancelled)
+        val ended = checkNotNull(c.permit())
+        assertTrue("CC2b-B13 a failed shutdown: closed", !ended.automatic)
+        assertNull("CC2b-B13 the ended connection it left is not published", ended.connectionGeneration)
+        assertEquals("CC2b-B13 fixture: it was left behind, ended", true, connectionEnded(c))
+        assertEquals("CC2b-B13 the shutdown's failure propagates", listOf<Throwable>(cancelFailure), shutdown.caught)
+        assertEquals("CC2b-B13 a failed shutdown: the pending purge is answered", false, shutdownAnswer.answered("CC2b-B13 shutdown").getOrThrow())
+        assertTrue("CC2b-B13 a failed shutdown: closed and empty", closedAndEmpty(c))
+    }
+
+    /**
+     * CC2b-B13 (the display's derivation cancels): after a REST answer with no socket a use is resolved; a hold then makes the
+     * display's derivation end that use, and the sink cancels it — the permit for the offline turn is already published when it
+     * throws, the ending adds no change, and a pending purge is answered (Codex r1).
+     */
+    @Test
+    fun `CC2b-B13 display derivation can cancel after a socketless REST answer`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, sessionScope = own.scope)
+        val access = h.publishedAccess()
+        val g = GraphRecorder(h)
+        h.graphSink = g
+        releasedWithoutSocket(h)
+
+        val before = checkNotNull(h.permit())
+        assertTrue("CC2b-B13 fixture: automatic", before.automatic)
+        assertNull("CC2b-B13 fixture: no connection", connectionEnded(h))
+        val failure = kotlinx.coroutines.CancellationException("display")
+        var atFailure: TopicGraphRecoveryPermit? = null
+        var completedWith: Throwable? = null
+        val loopField = TopicSessionCoordinator::class.java.getDeclaredField("loop").apply { isAccessible = true }
+        val loop = loopField.get(h.coordinator) as Job
+        loop.invokeOnCompletion { completedWith = it }
+
+        g.answer = { input ->
+            if (input is TopicGraphInput.Continuity &&
+                input.kind == TopicGraphEventKind.AUTHORITY_ENDED &&
+                input.reason == TopicGraphEventReason.USE_WITHHELD
+            ) {
+                atFailure = h.permit()
+                throw failure
+            }
+            TopicGraphOffer.ENQUEUED
+        }
+        access.hold()
+        h.coordinator.setOnline(false)
+        var selected = false
+        val answer = purge(h, { selected = true; true }, GraphLossRetirement(retiredScopes = setOf(cc2Scope1)))
+        assertTrue("CC2b-B13 fixture: pending", !answer.isCompleted)
+        advanceTimeBy(1)
+
+        val seen = checkNotNull(atFailure) { "CC2b-B13 fixture: the derivation reached the sink" }
+        assertTrue("CC2b-B13 the offline permit was published before the derivation threw", !seen.automatic)
+        assertEquals("CC2b-B13 as the next revision", before.revision + 1, seen.revision)
+        assertNull("CC2b-B13 no connection", seen.connectionGeneration)
+        assertNull("CC2b-B13 no use", seen.connectionLifetime)
+        assertSame("CC2b-B13 the ending added no change", seen, h.permit())
+        assertEquals("CC2b-B13 one revision in all", before.revision + 1, h.permitRevision())
+        assertSame("CC2b-B13 the loop ended with the sink's cancellation", failure, completedWith)
+        assertEquals("CC2b-B13 the pending purge is answered", false, answer.answered("CC2b-B13 display").getOrThrow())
+        assertTrue("CC2b-B13 its selector was not asked", !selected)
+        assertTrue("CC2b-B13 closed and empty", closedAndEmpty(h))
+        assertEquals("CC2b-B13 nothing reported", emptyList<Throwable>(), own.caught)
+        own.scope.cancel()
+    }
+
+    /**
+     * CC2b-B14: the revision runs on through null — permit, null, permit — one step per change; each new publication is stored
+     * before the flow announces it, so a collector reading the supplier on the announcement sees that publication.
+     */
+    @Test
+    fun `CC2b-B14 revisions run on through null and each is stored before it is announced`() = runTest {
+        val h = Harness(this)
+        h.coordinator.start()
+        advanceTimeBy(1)
+        val read = mutableListOf<Pair<Long, Long?>>()
+        backgroundScope.launch(Dispatchers.Unconfined) {
+            h.coordinator.recoveryPermitRevisions.collect { read += it to h.coordinator.recoveryPermit()?.revision }
+        }
+        h.setAccess(true, fence())
+        advanceTimeBy(1)
+        h.coordinator.setAccess(false, null, TopicGrantOrigin.NewContext)
+        advanceTimeBy(1)
+        h.setAccess(true, fence(grant = 2L))
+        advanceTimeBy(1)
+        assertEquals("CC2b-B14 one step per change, through null", 3L, h.permitRevision())
+        assertEquals(
+            "CC2b-B14 each announcement finds its own publication stored",
+            listOf(0L to null, 1L to 1L, 2L to null, 3L to 3L),
+            read
+        )
+        h.cleanUp()
+    }
+
+    /** CC2b-B14 (runtime): the runtime hands the session's own supplier and flow through, unchanged. */
+    @Test
+    fun `CC2b-B14 the runtime hands the session's own supplier and flow through`() {
+        val code = File("src/main/java/com/jay/fxi/data/remote/TopicRuntime.kt").readText()
+        assertTrue(
+            "CC2b-B14 the session's supplier",
+            code.contains("internal val graphRecoveryPermit: () -> TopicGraphRecoveryPermit? = session.recoveryPermit\n")
+        )
+        assertTrue(
+            "CC2b-B14 the session's flow",
+            code.contains("internal val graphRecoveryPermitRevisions: StateFlow<Long> = session.recoveryPermitRevisions\n")
+        )
+    }
+
+    /**
+     * CC2b-B15: a command's premium refusal — under a withheld use in its admission, or in an admitted acknowledgement — is
+     * published before the refusal is handed on, with no loop input after it.
+     */
+    @Test
+    fun `CC2b-B15 a command's premium refusal is published before it is handed on`() = runTest {
+        for (withheld in listOf(true, false)) {
+            val h = Harness(this, sessionScope = OwnScope(this).scope)
+            val access = if (withheld) h.publishedAccess() else null
+            h.goLive()
+            advanceTimeBy(100)
+            h.wire.open()
+            advanceTimeBy(1)
+            val atRefusal = mutableListOf<TopicGraphRecoveryPermit?>()
+            h.refusalSink = { _, _ -> atRefusal += h.permit() }
+            access?.flicker()
+            h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+            advanceTimeBy(1)
+            val seen = checkNotNull(atRefusal.singleOrNull()) { "CC2b-B15 withheld=$withheld fixture: one refusal handed on" }
+            assertTrue("CC2b-B15 withheld=$withheld closed when handed on", !seen.automatic)
+            assertNull("CC2b-B15 withheld=$withheld its connection gone", seen.connectionGeneration)
+            assertEquals("CC2b-B15 withheld=$withheld fixture: the branch taken", if (withheld) 0 else 1, h.acknowledgements.size)
+            h.cleanUp()
+        }
+    }
+
+    /**
+     * CC2b-B15 (a connection ended by a command, no latch): the connection's fields clear; a plain grant stays automatic and a
+     * re-approved grant closes.
+     */
+    @Test
+    fun `CC2b-B15 a connection a command ends clears it, and only a re-approved grant closes`() = runTest {
+        val plain = Harness(this, sessionScope = OwnScope(this).scope)
+        val plainAccess = plain.publishedAccess()
+        plain.goLive()
+        advanceTimeBy(100)
+        plain.wire.open()
+        advanceTimeBy(1)
+        plainAccess.flicker()
+        plain.wire.deliver(plain.ackWithLease("r1", TETHER, 900L))
+        advanceTimeBy(1)
+        val p = checkNotNull(plain.permit())
+        assertTrue("CC2b-B15 plain fixture: the command ended it", plain.wires.last().cancelled)
+        assertNull("CC2b-B15 plain: no connection", p.connectionGeneration)
+        assertTrue("CC2b-B15 plain: still automatic", p.automatic)
+        plain.cleanUp()
+
+        val again = Harness(this, sessionScope = OwnScope(this).scope)
+        val access = again.publishedAccess()
+        again.goLive()
+        advanceTimeBy(100)
+        again.wire.open()
+        advanceTimeBy(1)
+        access.rotate(2L)
+        again.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        // One past the rung: a task due exactly at the end of an advance is not run by it.
+        advanceTimeBy(firstRungMillis + 1)
+        assertEquals("CC2b-B15 re-approved fixture: its own connection", 2, again.wires.size)
+        again.wire.open()
+        advanceTimeBy(1)
+        assertTrue("CC2b-B15 fixture: re-approved and automatic on its connection", checkNotNull(again.permit()).let { it.reapproved && it.automatic })
+        val id = again.requests.last().requestId
+        access.flicker()
+        again.wire.deliver(again.ackWithLease(id, TETHER, 900L))
+        advanceTimeBy(1)
+        val r = checkNotNull(again.permit())
+        assertTrue("CC2b-B15 re-approved fixture: the command ended it", again.wire.cancelled)
+        assertNull("CC2b-B15 re-approved: no connection", r.connectionGeneration)
+        assertTrue("CC2b-B15 re-approved: closed", !r.automatic)
+        again.cleanUp()
+    }
+
+    /**
+     * CC2b-B16: when the socket's cancel throws a cancellation inside a command's `end()`, the ended connection stays
+     * referenced but is not published; after the command's own CommandDone turn the fields are null, and the loop goes on.
+     */
+    @Test
+    fun `CC2b-B16 an ended connection left by a cancelled command is not published and the loop goes on`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, sessionScope = own.scope)
+        val access = h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.wire.cancelFailure = kotlinx.coroutines.CancellationException("cancel")
+        access.flicker()
+        h.wire.deliver(h.ackWithLease("r1", TETHER, 900L))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B16 fixture: the cancel was attempted", h.wire.cancelled)
+        assertEquals("CC2b-B16 fixture: the connection is still referenced, ended", true, connectionEnded(h))
+        val left = checkNotNull(h.permit())
+        assertNull("CC2b-B16 the ended connection is not published", left.connectionGeneration)
+        assertNull("CC2b-B16 nor its use", left.connectionLifetime)
+        val revision = h.permitRevision()
+        h.setAccess(false, fence())
+        advanceTimeBy(1)
+        assertEquals("CC2b-B16 the loop goes on", revision + 1, h.permitRevision())
+        assertEquals("CC2b-B16 nothing failed", emptyList<Throwable>(), own.caught)
+        own.scope.cancel()
+    }
+
+    /**
+     * CC2b-B17: a latch set before the authority's end is cancelled by the sink never reaches `end()`; after the command's
+     * CommandDone turn automatic is closed and the still-live connection is published as it is.
+     */
+    @Test
+    fun `CC2b-B17 a latch whose ending is cancelled still closes automatic after the command's turn`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, inert = true, desired = setOf(TETHER, USD), sessionScope = own.scope)
+        val g = continuityLive(h)
+        g.answer = {
+            if (it is TopicGraphInput.Continuity && it.kind == TopicGraphEventKind.AUTHORITY_ENDED) {
+                throw kotlinx.coroutines.CancellationException("sink")
+            }
+            TopicGraphOffer.ENQUEUED
+        }
+        val generation = checkNotNull(checkNotNull(h.permit()).connectionGeneration)
+        h.wire.deliver(h.ack(h.requests.last().requestId, active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+        advanceTimeBy(1)
+        assertTrue(
+            "CC2b-B17 fixture: the authority's end reached the sink",
+            g.inputs.any { it is TopicGraphInput.Continuity && it.kind == TopicGraphEventKind.AUTHORITY_ENDED }
+        )
+        assertTrue("CC2b-B17 fixture: end() was not reached", !h.wire.cancelled)
+        val latched = checkNotNull(h.permit())
+        assertTrue("CC2b-B17 closed", !latched.automatic)
+        assertEquals("CC2b-B17 the live connection as it is", generation, latched.connectionGeneration)
+        own.scope.cancel()
+    }
+
+    /**
+     * CC2b-B04 (issuer): the permit reads session fields only. A flickered or held use the session has not acted on changes
+     * nothing — the connection keeps the use it opened under and no issuer is asked — and only the session's own reaction to
+     * the hold, an accessRevised that ends the connection, is published: no connection, still automatic on a plain grant.
+     */
+    @Test
+    fun `CC2b-B04 the permit asks no issuer`() = runTest {
+        val h = Harness(this)
+        val access = h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        val held = checkNotNull(h.permit())
+        assertEquals("CC2b-B04 fixture: opened under the first use", TopicUseLifetime(fence().grant, 0L), held.connectionLifetime)
+        access.flicker()
+        h.coordinator.setForeground(false)
+        advanceTimeBy(1)
+        assertSame("CC2b-B04 a flickered use the session has not acted on", held, h.permit())
+        val asked = access.events.size
+        access.hold()
+        h.coordinator.setForeground(false)
+        advanceTimeBy(1)
+        assertSame("CC2b-B04 a held use the session has not acted on", held, h.permit())
+        assertEquals("CC2b-B04 fixture: no issuer question in that turn", asked, access.events.size)
+        h.coordinator.accessRevised()
+        advanceTimeBy(1)
+        val revised = checkNotNull(h.permit())
+        assertNull("CC2b-B04 the session ended the held use's connection", revised.connectionGeneration)
+        assertTrue("CC2b-B04 a plain grant stays automatic under a hold", revised.automatic)
+        h.cleanUp()
+    }
+
+    /**
+     * CC2b-B06/B15 (order): at every display publication — a premium refusal, an identity loss seen at an acknowledgement, a
+     * withdrawal — the permit already belongs to that state: on a plain online grant automatic is exactly "the display has an
+     * owner", read by a collector run in place at each publication.
+     */
+    @Test
+    fun `CC2b-B06 every display publication already carries its permit`() = runTest {
+        for (case in listOf("refusal", "identity", "withdrawal")) {
+            val own = OwnScope(this)
+            val h = Harness(this, sessionScope = own.scope)
+            h.goLive()
+            advanceTimeBy(100)
+            h.wire.open()
+            advanceTimeBy(1)
+            val seen = mutableListOf<Pair<Boolean, Boolean?>>()
+            val collector = backgroundScope.launch(Dispatchers.Unconfined) {
+                h.coordinator.display.collect { seen += (it.owner != null) to h.permit()?.automatic }
+            }
+            when (case) {
+                "refusal" -> h.wire.deliver(h.ack("r1", active = listOf(TETHER), rejections = mapOf(USD to "premium_required")))
+                "identity" -> {
+                    h.liveFence = null
+                    h.wire.deliver(h.ack("r1", active = listOf(TETHER)))
+                }
+                else -> h.setAccess(false, fence())
+            }
+            advanceTimeBy(1)
+            assertTrue("CC2b-B06 $case fixture: closed", !checkNotNull(h.permit()).automatic)
+            assertTrue("CC2b-B06 $case fixture: a publication without an owner", seen.any { !it.first })
+            seen.forEach { (owned, automatic) -> assertEquals("CC2b-B06 $case each display carries its permit", owned, automatic) }
+            collector.cancel()
+            own.scope.cancel()
+        }
+    }
+
+    /**
+     * CC2b-B11 (foreground, exhaustion): under a re-approval, foreground does not stand in for a connection — through the
+     * backoff and through an exhausted ladder automatic stays closed.
+     */
+    @Test
+    fun `CC2b-B11 under a re-approval foreground and an exhausted ladder do not open automatic`() = runTest {
+        val h = Harness(this)
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        h.coordinator.setForeground(true)
+        advanceTimeBy(1)
+        h.failConnects = 100
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B11 fixture: re-approved", checkNotNull(h.permit()).reapproved)
+        assertTrue("CC2b-B11 foreground does not open the backoff", !checkNotNull(h.permit()).automatic)
+        for (rung in 1..TopicReconnectPolicy.MAX_ATTEMPTS) advanceTimeBy(firstRungMillis * rung + 10)
+        assertEquals("CC2b-B11 fixture: exhausted", TopicRecoveryDisplay.Exhausted, h.recovery())
+        assertTrue("CC2b-B11 exhaustion does not open it", !checkNotNull(h.permit()).automatic)
+        h.cleanUp()
+    }
+
+    /**
+     * CC2b-B16 (re-approved): when the socket's cancel throws a cancellation in a command's `end()` under a re-approved grant,
+     * the ended connection stays referenced but neither is published nor counts as this grant's connection: automatic is
+     * closed after the command's turn, and the loop goes on.
+     */
+    @Test
+    fun `CC2b-B16 under a re-approval an ended connection left behind does not keep automatic open`() = runTest {
+        val own = OwnScope(this)
+        val h = Harness(this, sessionScope = own.scope)
+        val access = h.publishedAccess()
+        h.goLive()
+        advanceTimeBy(100)
+        h.wire.open()
+        advanceTimeBy(1)
+        access.rotate(2L)
+        h.setAccess(true, fence(grant = 2L), TopicGrantOrigin.Reapproval(TopicGrantToken(1L)))
+        advanceTimeBy(firstRungMillis + 1)
+        h.wire.open()
+        advanceTimeBy(1)
+        assertTrue("CC2b-B16 fixture: re-approved and automatic on its connection", checkNotNull(h.permit()).let { it.reapproved && it.automatic })
+        h.wire.cancelFailure = kotlinx.coroutines.CancellationException("cancel")
+        access.flicker()
+        h.wire.deliver(h.ackWithLease(h.requests.last().requestId, TETHER, 900L))
+        advanceTimeBy(1)
+        assertTrue("CC2b-B16 fixture: the cancel was attempted", h.wire.cancelled)
+        assertEquals("CC2b-B16 fixture: the connection is still referenced, ended", true, connectionEnded(h))
+        val left = checkNotNull(h.permit())
+        assertTrue("CC2b-B16 still re-approved", left.reapproved)
+        assertNull("CC2b-B16 the ended connection is not published", left.connectionGeneration)
+        assertNull("CC2b-B16 nor its use", left.connectionLifetime)
+        assertTrue("CC2b-B16 and is not this grant's connection: closed", !left.automatic)
+        val revision = h.permitRevision()
+        h.setAccess(false, fence(grant = 2L))
+        advanceTimeBy(1)
+        assertEquals("CC2b-B16 the loop goes on", revision + 1, h.permitRevision())
+        assertEquals("CC2b-B16 nothing failed", emptyList<Throwable>(), own.caught)
+        own.scope.cancel()
     }
 
     @Test

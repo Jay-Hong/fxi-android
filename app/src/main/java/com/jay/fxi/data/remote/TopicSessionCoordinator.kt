@@ -717,6 +717,21 @@ class TopicSessionCoordinator(
     /** Cumulative hand-over losses, independent of the graph sink's queue. */
     val graphLoss: StateFlow<TopicGraphLoss?> = _graphLoss.asStateFlow()
 
+    /** S4 CUT-CC2b: the last publication; written on the serial scope only, read from any thread. */
+    @Volatile private var permit: TopicGraphRecoveryPermit? = null
+    /** Session-wide and never reset: it goes on through null publications, one step per change of meaning. */
+    private var permitRevision = 0L
+    private val _permitRevisions = MutableStateFlow(0L)
+
+    /**
+     * S4 CUT-CC2b: the session's P7 permit for automatic graph recovery — thread-safe, non-blocking and never throwing; null
+     * while no fence is processed. Dormant: no production reader until CC4 wires it into the graph assembly.
+     */
+    internal val recoveryPermit: () -> TopicGraphRecoveryPermit? = { permit }
+
+    /** Raised after each new publication is stored; a collector reads [recoveryPermit] for the latest one. */
+    internal val recoveryPermitRevisions: StateFlow<Long> = _permitRevisions.asStateFlow()
+
     private val _display = MutableStateFlow(TopicDisplayState.NONE)
     private var displayPublicationDeferred = false
 
@@ -897,6 +912,9 @@ class TopicSessionCoordinator(
                     shutDown()
                     publishDisplay()
                 } finally {
+                    // The ending's permit even when shutDown or the display throws — a sink's cancellation does not end
+                    // the process, and nothing else would close an automatic permit then (S4 CUT-CC2b).
+                    publishPermit()
                     // Every ending cancels the queue, not only Stop's close: each input still in it goes to the undelivered
                     // handler, which answers a retirement false, and a later post is refused instead of held (S4 CUT-CC2a).
                     inputs.cancel()
@@ -3115,12 +3133,44 @@ class TopicSessionCoordinator(
     }
 
     /**
+     * S4 CUT-CC2b: publishes the P7 permit when its meaning changed (`cut_cc2_agreed.r2.md` §3). Reads session fields only —
+     * no issuer, sink or display work — and does not throw. A re-approved grant is automatic only with a live Connection of
+     * this fence; foreground is not a condition. The revision counts changes of meaning, null and back included.
+     */
+    private fun publishPermit() {
+        val held = fence
+        val next = held?.let { current ->
+            val reapproved = reapprovedEpoch == grantEpoch
+            val live = connection?.takeIf { !it.ended && it.fence == current }
+            TopicGraphRecoveryPermit(
+                sessionKey = sessionKey,
+                revision = 0L,
+                fence = current,
+                grantEpoch = grantEpoch,
+                reapproved = reapproved,
+                connectionGeneration = live?.generation,
+                connectionLifetime = live?.lifetime,
+                automatic = !stopped && online && access && current != refusedFor && current != identityLostFor &&
+                    (!reapproved || live != null)
+            )
+        }
+        val published = permit
+        val changed = if (next == null) published != null else published?.copy(revision = 0L) != next
+        if (!changed) return
+        permitRevision += 1
+        permit = next?.copy(revision = permitRevision)
+        _permitRevisions.value = permitRevision
+    }
+
+    /**
      * Derives the screen's view from the current grant, held prices and transport. Called after every handled input,
      * when a connection ends (including from command callbacks), and when the loop ends. A runtime stop may cancel
      * the scope before its Stop input is handled.
      */
     private fun publishDisplay(topicState: TopicSubscriptionSnapshot = store.snapshot) {
         if (displayPublicationDeferred) return
+        // Before the display is derived, so a derivation that throws does not keep the permit back (S4 CUT-CC2b).
+        publishPermit()
         val owner = fence?.takeIf { access && !stopped && it != refusedFor && it != identityLostFor }
             ?.let { TopicDisplayOwner(it.identity, grantEpoch) }
         val shown = if (owner == null) TopicRates() else _rates.value
