@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -187,13 +188,16 @@ private fun ArmedRootScreen(
                     LocalContext.current.applicationContext,
                     PremiumTopicOwnerEntryPoint::class.java
                 ).topicRuntimeOwner()
+                // S4 CUT-CC5-3: the process graph screen host, once the graph runtime has started; null until then.
+                val graphHost by owner.graphHost.collectAsState()
                 PremiumTopicRoute(
                     consumer = owner.consumer,
                     identity = AuthIdentityFence(checkNotNull(ownedAccess.uid), checkNotNull(ownedAccess.authGeneration)),
                     isActive = true,
                     newsViewModel = hiltViewModel(),
                     userInfo = (authState as? AuthState.SignedIn)?.user,
-                    onSignOut = { authViewModel.signOut() }
+                    onSignOut = { authViewModel.signOut() },
+                    graphHost = graphHost
                 )
             }
         }

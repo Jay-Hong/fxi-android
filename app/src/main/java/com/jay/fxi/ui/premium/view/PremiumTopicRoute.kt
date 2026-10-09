@@ -22,16 +22,29 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.PremiumTopicScreenState
+import com.jay.fxi.ui.premium.graph.GraphScreenHost
+import com.jay.fxi.ui.premium.graph.GraphScreenMount
+import com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder
+import com.jay.fxi.ui.premium.graph.GraphV2UiActions
 import com.jay.fxi.ui.screen.NewsDetailOverlay
 import com.jay.fxi.ui.screen.NewsTabContent
 import com.jay.fxi.ui.settings.SettingsScreen
 import com.jay.fxi.ui.theme.Background
 import com.jay.fxi.ui.theme.PrimaryText
 import com.jay.fxi.ui.viewmodel.NewsViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 /**
  * R4-c C3c-2: connects [PremiumTopicScreen] to its consumer, the news view model and settings. The host owns the consumer and its
  * main-thread scope; this route neither creates nor stops the topic runtime. Root mounts it for a current premium grant.
+ *
+ * S4 CUT-CC5-3: with a [graphHost], the route opens one mount of it in an effect and closes it on dispose or when the host
+ * changes; the mount, a Compose state, never outlives its host. The host starts and closes the holders. The active target is
+ * the holder of the selected usd/jpy/eur tab for the fresh screen's owner while the route is active: a new target
+ * deactivates the previous holder before activating the new one; TETHER, NEWS, no owner, inactive and dispose release it,
+ * and recomposition, graph updates and inline/fullscreen switches do not. A new identity or a new set of mounted holders is
+ * enqueued to each holder as a context change. The graph slot carries that holder's state, fresh reads and actions.
  */
 @Composable
 internal fun PremiumTopicRoute(
@@ -44,7 +57,8 @@ internal fun PremiumTopicRoute(
     modifier: Modifier = Modifier,
     settingsContent: @Composable (userInfo: UserInfo?, onSignOut: () -> Unit, onDismiss: () -> Unit) -> Unit = { u, s, d ->
         SettingsScreen(userInfo = u, onSignOut = s, onDismiss = d)
-    }
+    },
+    graphHost: GraphScreenHost? = null
 ) {
     LaunchedEffect(consumer) { consumer.start() }
     LaunchedEffect(consumer, identity) { consumer.onIdentityChanged() }
@@ -55,6 +69,44 @@ internal fun PremiumTopicRoute(
     val signOutNow by rememberUpdatedState(onSignOut)
     val userNow by rememberUpdatedState(userInfo)
     val owner = screen.ui.owner
+
+    var mount by remember { mutableStateOf<GraphScreenMount?>(null) }
+    DisposableEffect(graphHost) {
+        val opened = graphHost?.open()
+        mount = opened
+        onDispose {
+            mount = null
+            opened?.close()
+        }
+    }
+    // Keyed by the mount, so a new mount never shows the previous one's holders for a frame.
+    val holders = key(mount) { (mount?.holders ?: NO_HOLDERS).collectAsState().value }
+    LaunchedEffect(identity, holders) { holders.values.forEach { it.onContextChanged() } }
+    // Only usd, jpy and eur have holders, so TETHER and NEWS find none.
+    val holder = screen.ui.selectedTab?.serverTab?.let { holders[it] }
+    // An inactive route draws NONE, so it has no owner and no target.
+    val target = if (owner != null && holder != null) holder to owner else null
+    DisposableEffect(target) {
+        target?.let { (h, o) -> h.onActivated(o) }
+        onDispose { target?.first?.onDeactivated() }
+    }
+    val graphSlot = target?.let { (h, o) ->
+        remember(h, o) {
+            PremiumFxGraphSlot(
+                owner = o,
+                state = h.state,
+                currentState = h::currentState,
+                actions = GraphV2UiActions(
+                    selectPeriod = h::selectPeriod,
+                    toggleSeries = h::toggleSeries,
+                    enterFullscreen = h::enterFullscreen,
+                    exitFullscreen = h::exitFullscreen,
+                    retrySelection = h::retrySelection,
+                    setSurfaceVisible = h::setSurfaceVisible
+                )
+            )
+        }
+    }
 
     Box(modifier.fillMaxSize()) {
         if (owner != null && screen.ui.selectedTab != null) {
@@ -118,7 +170,8 @@ internal fun PremiumTopicRoute(
                             onRetry = { if (visibleNow && allowed()) newsViewModel.retry(isPremium = true) },
                             onDetailOpen = { url -> if (visibleNow && allowed()) detailUrl = url }
                         )
-                    }
+                    },
+                    graphSlot = graphSlot
                 )
                 if (settingsOpen) {
                     BackHandler { settingsOpen = false }
@@ -137,3 +190,5 @@ internal fun PremiumTopicRoute(
         }
     }
 }
+
+private val NO_HOLDERS: StateFlow<Map<String, GraphV2ScreenStateHolder>> = MutableStateFlow(emptyMap())

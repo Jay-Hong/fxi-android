@@ -720,7 +720,9 @@ class GraphScreenHostContractTest {
 
     /**
      * D01: outside the test source sets only the topic owner constructs the host (S4 CUT-CC5-2), once, and nothing constructs
-     * a mount but the host or wires either into DI; only the host and the owner name the host, only the host names a mount.
+     * a mount but the host or wires either into DI; only the host, the owner and the premium route (S4 CUT-CC5-3) name the
+     * host, and only the host and the route name a mount; the route opens it in an effect keyed by the host and closes it only
+     * on that effect's dispose.
      */
     @Test fun D01_dormant() {
         val src = File("src")
@@ -733,10 +735,19 @@ class GraphScreenHostContractTest {
         assertTrue("premise: the scan sees the host", host in all && all.size > 100)
         assertTrue("premise: the scan reaches the benchmark source set", all.keys.any { it.startsWith("benchmark/") })
         val owner = "main/java/com/jay/fxi/data/remote/TopicRuntimeOwner.kt"
-        assertEquals("only the host file and the owner name GraphScreenHost", setOf(host, owner),
+        // S4 CUT-CC5-3: the premium route takes the host and holds its one mount.
+        val route = "main/java/com/jay/fxi/ui/premium/view/PremiumTopicRoute.kt"
+        assertEquals("only the host file, the owner and the route name GraphScreenHost", setOf(host, owner, route),
             code.filter { (_, text) -> Regex("""\bGraphScreenHost\b""").containsMatchIn(text) }.keys)
-        assertEquals("only the host file names GraphScreenMount", setOf(host),
+        assertEquals("only the host file and the route name GraphScreenMount", setOf(host, route),
             code.filter { (_, text) -> Regex("""\bGraphScreenMount\b""").containsMatchIn(text) }.keys)
+        val routeCode = code.getValue(route)
+        assertEquals("the route opens the one mount", 1, Regex("""\.open\(\)""").findAll(routeCode).count())
+        assertTrue("it opens it in an effect keyed by the host",
+            Regex("""DisposableEffect\(graphHost\)\s*\{\s*val opened = graphHost\?\.open\(\)""").containsMatchIn(routeCode))
+        assertTrue("and closes it only in that effect's dispose",
+            Regex("""onDispose\s*\{\s*mount = null\s*opened\?\.close\(\)\s*}""").containsMatchIn(routeCode) &&
+                Regex("""\.close\(\)""").findAll(routeCode).count() == 1)
         assertEquals("the owner constructs the host once", mapOf(owner to 1),
             code.filterKeys { it != host }.mapValues { (_, t) -> Regex("""\bGraphScreenHost\s*\(""").findAll(t).count() }.filterValues { it > 0 })
         assertFalse("the owner carries no DI annotation on the host", Regex("""@(?:[A-Za-z_][\w.]*\.)?(Provides|Binds|Module)\b""").containsMatchIn(code.getValue(owner)))

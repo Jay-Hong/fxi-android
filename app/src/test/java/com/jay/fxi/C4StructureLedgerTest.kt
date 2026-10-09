@@ -62,6 +62,11 @@ class C4StructureLedgerTest {
         val premium = root.substring(branch)
         for (part in listOf("ownedAccess.uid", "ownedAccess.authGeneration", "isActive = true"))
             assertTrue("the premium branch lacks $part", part in premium)
+        // S4 CUT-CC5-3: the branch hands the route the owner's graph screen host, collected as state.
+        assertTrue("the premium branch collects the owner's graph host",
+            Regex("""val graphHost by owner\.graphHost\.collectAsState\(\)""").containsMatchIn(premium.substring(0, calls.single() - branch)))
+        val call = premium.substring(calls.single() - branch).substringBefore("\n                )")
+        assertEquals("the one route call passes that host, once", 1, Regex("""\bgraphHost = graphHost\b""").findAll(call).count())
     }
 
     @Test
