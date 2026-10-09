@@ -2,6 +2,7 @@ package com.jay.fxi.data.entitlements
 
 import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.auth.AuthIdentityFence
+import com.jay.fxi.data.remote.FanOutTopicGrantSink
 import com.jay.fxi.data.remote.TopicCommandClock
 import com.jay.fxi.data.remote.TopicGrantOrigin
 import com.jay.fxi.data.remote.TopicGrantSink
@@ -30,6 +31,7 @@ import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -655,5 +657,65 @@ class TopicGrantDelivererTest {
         runCurrent()
         val waits = times.zipWithNext { a, b -> b - a }
         assertEquals(listOf(2_000L, 4_000L, 8_000L, 16_000L, 32_000L, 60_000L, 60_000L), waits)
+    }
+
+    /**
+     * S4 CUT-P3a (`cut_p3a_agreed.r2.md`): over the real deliverer, [FanOutTopicGrantSink] hands each call to the first delegate and
+     * then the second, unchanged - a new grant, a re-approval with its origin, a hold that goes over as a revision alone, and an end
+     * carrying the very fence it ends.
+     */
+    @Test
+    fun aFanOutSink_handsBothDelegatesTheDeliverersCalls_firstThenSecond() = deliverTest { s ->
+        val log = mutableListOf<String>()
+        class Recorder(val name: String) : TopicGrantSink {
+            /** One entry per call; null is [accessRevised]. */
+            val calls = mutableListOf<Triple<Boolean, TopicSessionFence?, TopicGrantOrigin>?>()
+            override fun setAccess(allowed: Boolean, fence: TopicSessionFence?, origin: TopicGrantOrigin) {
+                log += "$name.access:$allowed:${fence?.grant?.value}"
+                calls += Triple(allowed, fence, origin)
+            }
+
+            override fun accessRevised() {
+                log += "$name.revised"
+                calls += null
+            }
+        }
+        val first = Recorder("first")
+        val second = Recorder("second")
+        val deliverer = TopicGrantDeliverer(
+            s.issuer, FanOutTopicGrantSink(first, second), s.fences, s.scope, s.clock,
+            deliveryDispatcher = StandardTestDispatcher(testScheduler)
+        )
+        val context = TopicGrantContext(EntitlementsIdentity("u1", 1L), AccessFence("u1", "epoch-1", "krx-1"), 1L)
+        fun TestScope.deliver(result: () -> TopicGrantResult) {
+            s.issuer.answer = { result() }
+            s.issuer.revisions.value += 1
+            runCurrent()
+        }
+
+        s.issuer.answer = { s.issuer.result(f1, issuedFor = context, cause = TopicGrantCause.Context) }
+        deliverer.start()
+        runCurrent()
+        deliver { s.issuer.result(f2, issuedFor = context, cause = TopicGrantCause.RefusalReapproval(f1.grant, 1L, 2L)) }
+        deliver { s.issuer.result(null, userAllowed = false) }
+        deliver { s.issuer.result(null, userAllowed = false, endSequence = 1L) }
+
+        val expected = listOf(
+            Triple(true, f1, TopicGrantOrigin.NewContext), null,
+            Triple(true, f2, TopicGrantOrigin.Reapproval(f1.grant)), null,
+            null,
+            Triple(false, f2, TopicGrantOrigin.NewContext), null
+        )
+        for (recorder in listOf(first, second)) {
+            assertEquals(recorder.name, expected, recorder.calls)
+            recorder.calls.zip(expected).forEach { (got, want) ->
+                if (want != null) assertSame("${recorder.name}: the deliverer's own fence object", want.second, got!!.second)
+            }
+        }
+        val expectedLog = expected.flatMap { call ->
+            val tag = if (call == null) "revised" else "access:${call.first}:${call.second?.grant?.value}"
+            listOf("first.$tag", "second.$tag")
+        }
+        assertEquals("first then second, call by call", expectedLog, log)
     }
 }
