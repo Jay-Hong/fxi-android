@@ -1,6 +1,6 @@
 {
   "class": "com.jay.fxi.budget.PremiumGraphCutoverAcceptanceTest",
-  "note": "S4 CUT-C01·C02 required acceptance rows (cut_c0102_agreed.r1.md; precedence rows cut_c01_pre_agreed.r1.md; batch 1 rows cut_c01_b1_agreed.r1.md). Every name must run once and pass; none may be skipped, replaced or added unlisted.",
+  "note": "S4 CUT-C01·C02 required acceptance rows (cut_c0102_agreed.r1.md; precedence rows cut_c01_pre_agreed.r1.md; batch 1 rows cut_c01_b1_agreed.r1.md; batch 2 rows cut_c01_b2_agreed.r1.md). Every name must run once and pass; none may be skipped, replaced or added unlisted.",
   "cases": [
     "A01 the production cold start with a tab 401 and its replay stays inside the budget",
     "A01b a repeated start, a recreated route and tab moves keep one process graph and the closed screen leaves the recorder open",
@@ -42,6 +42,20 @@
     "RT01-A07 pending with no grant blocks every graph use",
     "RT01-A07 resolving blocks every graph use",
     "RT01-A08 a held user keeps its control queries and floor while the graph stays unused",
-    "RT01-A10 a parked refusal leaves the graph allowed until the issuer publishes the user end and nothing after it"
+    "RT01-A09a inputs held before the catalog replay in their order once it is adopted",
+    "RT01-A09b a same-scope catalog loss holds the WS input and the readoption replays it",
+    "RT01-A09c a new user epoch never reads the previous scope's catalog",
+    "RT01-A10 a parked refusal leaves the graph allowed until the issuer publishes the user end and nothing after it",
+    "RT03b-Q01a a catalog adopted while the first tab is in flight leaves the demand to one follow-up with its capture",
+    "RT03b-Q01b a catalog adopted after the round was due sends the follow-up at once",
+    "RT03b-Q01c a catalog adopted before the round was due sends the follow-up at the round",
+    "RT03b-Q02 a failure, a partial 200 and a new gap release only what was given and keep the new generation",
+    "RT03b-Q03a a real closed demand walks the whole ladder, stops at the cap and keeps the demand",
+    "RT03b-Q03b a Retry-After longer than the rung holds the next round until the floor",
+    "RT03b-Q06a a round falling due while another tab is active waits for usd and goes once on the return",
+    "RT03b-Q06b a round falling due while usd 3m is active waits for usd 1d and goes once on the return",
+    "RT03b-Q06c a terminal answer stops the cycle, keeps the demand and no trigger reopens it",
+    "RT03b-Q06d a round released by a same-scope context change applies nothing and the next asks the catalog once",
+    "RT03b-Q06e rounds inside the catalog TTL ask no catalog and the first after it asks one"
   ]
 }

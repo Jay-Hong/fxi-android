@@ -164,6 +164,8 @@ class PremiumGraphCutoverAcceptanceTest {
     private val wire = Json { ignoreUnknownKeys = true }
     /** While set, the usd topic's REST bootstrap answers a current kb quote (a real delivery); otherwise 404 as before. */
     @Volatile private var usdSnapshotLive = false
+    /** The usd REST bootstrap body while [usdSnapshotLive]: one kb quote stamped now, unless a row sets it. */
+    @Volatile private var usdBootstrap: () -> String = { usdSnapshot() }
 
     private fun fixture(name: String) = File(GRAPH, name).readText()
     private fun ok(body: String) = MockResponse().setResponseCode(200).setBody(body)
@@ -188,6 +190,8 @@ class PremiumGraphCutoverAcceptanceTest {
 
     /** Every topic named by a subscription the server received, in order (B06b). */
     private val subscribed: MutableList<String> = Collections.synchronizedList(mutableListOf())
+    /** Batch 2a: each socket on which the server has sent an acknowledgement admitting the usd topic, after the send. */
+    private val usdAcked: MutableList<WebSocket> = Collections.synchronizedList(mutableListOf())
 
     /** The server side of the topic socket: answers pings and acknowledges every subscription with all its topics active. */
     private val socketServer = object : WebSocketListener() {
@@ -213,6 +217,7 @@ class PremiumGraphCutoverAcceptanceTest {
                 afterRefusal?.invoke(webSocket)
             } else {
                 webSocket.send(C4OwnerHarness.ack(id, topics, emptyMap()))
+                if (usd in topics) usdAcked += webSocket
             }
         }
     }
@@ -238,7 +243,7 @@ class PremiumGraphCutoverAcceptanceTest {
                     }
                     "/api/user/me" -> onDelete(request)
                     "/api/v2/topics/snapshot" ->
-                        if (url.queryParameter("topic") == "fx:usd-krw" && usdSnapshotLive) ok(usdSnapshot())
+                        if (url.queryParameter("topic") == "fx:usd-krw" && usdSnapshotLive) ok(usdBootstrap())
                         else if (url.queryParameter("topic") == TETHER && tetherCalls.getAndIncrement() == 0) unauthorized()
                         else MockResponse().setResponseCode(404).setBody("""{"error":"topic_unavailable"}""")
                     "/api/v2/graph/catalog" -> onCatalog(request)
@@ -2655,14 +2660,24 @@ class PremiumGraphCutoverAcceptanceTest {
         val start = nowMillis()
         val deadline = start + 180_000
         entitlements += unauthorized()
-        val unavailable = { MockResponse().setResponseCode(503).setBody("""{"detail":"unavailable"}""") }
         if (catalogFails) onCatalog = { unavailable() }
-        onTab = { unavailable() }
         val rig = Rig()
+        // RT03b-Q03 (agreed b2 r3): each tab's registration as it is sent — no catalog adopted, no recovery capture.
+        val registrations = Collections.synchronizedList(mutableListOf<TabRegistrationView>())
+        onTab = {
+            if (catalogFails) registrations += runBlocking { rig.usdTabRegistration() }
+            unavailable()
+        }
         rig.row {
             rig.coldStart(deadline)
             awaitTrue("six tab rounds completed", deadline) { tabs().size == 6 && tabs().all { it.bodyEnd != null } }
             rig.awaitTopics(deadline)
+            if (catalogFails) {
+                awaitTrue("$label: the cycle is exhausted", deadline) { rig.usdBudget()?.stop?.toString() == "EXHAUSTED" }
+                val budget = checkNotNull(rig.usdBudget())
+                assertEquals("$label: one cycle of six rounds ($budget)", 6, budget.rounds)
+                assertEquals("$label: the catalog requirement is kept", com.jay.fxi.data.graph.GraphTabRecoveryDemand.CatalogRequired, rig.usdDemand())
+            }
             quiet(label, 49_000)
         }
         assertTrue("within the row deadline", nowMillis() - start <= 180_000)
@@ -2674,8 +2689,22 @@ class PremiumGraphCutoverAcceptanceTest {
                 gap >= ladder[i] - 50)
             assertTrue("$label: and without a needless delay (gap $gap)\n${sends.timeline()}", gap <= ladder[i] + 2_000)
         }
-        if (catalogFails) assertTrue("$label: every catalog failed", statuses(catalogs()).all { it == 503 })
-        else assertEquals("$label: the catalog once", listOf(200), statuses(catalogs()))
+        if (catalogFails) {
+            assertEquals("$label: every catalog failed, one per round with the initial one (six)\n${sends.timeline()}", List(6) { 503 }, statuses(catalogs()))
+            val registered = synchronized(registrations) { registrations.toList() }
+            assertEquals("$label: every tab was registered with no catalog and no recovery capture: $registered",
+                List(6) { TabRegistrationView(false, emptyList()) }, registered)
+            // Each later round issues at most one catalog and one tab: between two tab sends, at most one catalog send.
+            val c = catalogs()
+            for (i in 0 until 5) {
+                val between = c.filter { it.start > checkNotNull(t[i].bodyEnd) && it.start <= t[i + 1].start }
+                assertTrue("$label: round ${i + 2} issued at most one catalog (${between.size})\n${sends.timeline()}", between.size <= 1)
+                // C03/C04: the round's catalog goes alone and ends before its tab.
+                between.forEach {
+                    assertTrue("$label: round ${i + 2}'s catalog ended before its tab\n${sends.timeline()}", checkNotNull(it.bodyEnd) <= t[i + 1].start)
+                }
+            }
+        } else assertEquals("$label: the catalog once", listOf(200), statuses(catalogs()))
         assertTopicSide(label)
         assertEquals(emptyList<Throwable>(), rig.reports)
         ColdStartBudget.assertWithin(judgeRow(label))
@@ -2688,6 +2717,893 @@ class PremiumGraphCutoverAcceptanceTest {
     /** A02b: every catalog and tab 503 through the whole ladder, then exhausted. */
     @Test
     fun `A02b every catalog and tab 503 walks the whole ladder and stops`() = ladderRow("A02b", catalogFails = true)
+
+    // --- CUT-C01 batch 2a: RT03b-Q01 (cut_c01_b2_agreed.r1.md) ---------------------------------------------------------------
+
+    /** Waits for a socket newer than [before] sockets whose usd subscription the server has acknowledged (a data frame sent after
+     *  it on that socket reaches the client after the acknowledgement). */
+    private suspend fun awaitUsdAcknowledged(label: String, before: Int, deadline: Long) =
+        awaitTrue("$label: a new socket with the usd topic acknowledged", deadline) {
+            openSockets.size > before && synchronized(usdAcked) { usdAcked.any { it === openSockets.last() } }
+        }
+
+    /**
+     * Ends a row whose topic session was replaced: every topic snapshot of the new session since [since] has been answered,
+     * every graph body has ended, the server and the recorder agree, and nothing more goes for a second.
+     */
+    private suspend fun settleNewSession(label: String, since: Long, deadline: Long) {
+        awaitTrue("$label: the new session's topic snapshots", deadline) {
+            DESIRED.all { topic -> sends.all().any { it.param("topic") == topic && it.start >= since && it.bodyEnd != null } }
+        }
+        awaitTrue("$label: every graph body ended", deadline) { graph().all { it.bodyEnd != null } }
+        awaitTrue("$label: the server and the recorder agree", deadline) {
+            synchronized(received) { received.toList() }.sorted() == sends.all().map { it.key }.sorted()
+        }
+        quiet(label, 1_000)
+    }
+
+    /** The recorder's held inputs, read on Main. */
+    private suspend fun Rig.pendingInputs(): List<com.jay.fxi.data.remote.TopicGraphInput> = onMain {
+        assembly.recorder.state.value.pending.inputs
+    }
+
+    private fun com.jay.fxi.data.remote.TopicGraphInput.isObservation(path: com.jay.fxi.data.remote.TopicGraphPath) =
+        this is com.jay.fxi.data.remote.TopicGraphInput.Observations && this.path == path
+
+    /** The coordinator's catalog adoption instant, read on Main. */
+    private suspend fun Rig.catalogAt(): kotlinx.datetime.Instant? = onMain { privateField(assembly.coordinator, "catalogAt") as kotlinx.datetime.Instant? }
+
+    private enum class AdoptionCase { IN_FLIGHT, LATE, EARLY }
+
+    /**
+     * RT03b-Q01 (agreed b2 r3): the first usd 1d goes with no catalog and so no recovery capture; the REST bootstrap observation
+     * and a current WS snapshot are held for the catalog. [AdoptionCase.IN_FLIGHT]: the catalog is adopted while the first tab
+     * is held, its inputs replay into a closed demand, and the first tab's full answer releases none of it. [AdoptionCase.LATE]:
+     * the first tab completes (the demand is CatalogRequired), and the catalog is adopted after the 3 s round was due.
+     * [AdoptionCase.EARLY]: the catalog is adopted before it. In every case one follow-up tab carries the capture — at the round's
+     * deadline (first completion + 3 s), or at the late adoption — and releases what it gives; one catalog, two tabs, and no
+     * third tab for 5 s. Times are judged on the coordinator's own instants (deadline, catalogAt) mapped to the send clock.
+     */
+    private fun catalogAdoptionRow(label: String, case: AdoptionCase) = runBlocking {
+        val prepared = clearOfBoundary(60_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 45_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        fun rel(instant: kotlinx.datetime.Instant) = instant.toEpochMilliseconds() - wallAtOrigin
+        entitlements += unauthorized()
+        val holdCatalog = java.util.concurrent.CountDownLatch(1)
+        val holdFirst = java.util.concurrent.CountDownLatch(1)
+        val holdFollow = java.util.concurrent.CountDownLatch(1)
+        val firstRegistration = java.util.concurrent.atomic.AtomicReference<TabRegistrationView?>(null)
+        val followRegistration = java.util.concurrent.atomic.AtomicReference<TabRegistrationView?>(null)
+        val starts = closedStarts()
+        val calls = AtomicInteger()
+        val rig = Rig()
+        try {
+            rig.row {
+                usdSnapshotLive = true
+                onCatalog = { holdCatalog.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("catalog-krx-hidden.json")) }
+                onTab = {
+                    when (calls.getAndIncrement()) {
+                        0 -> {
+                            firstRegistration.set(runBlocking { rig.usdTabRegistration() })
+                            holdFirst.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(usdTab(starts))
+                        }
+                        1 -> {
+                            followRegistration.set(runBlocking { rig.usdTabRegistration() })
+                            holdFollow.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(usdTab(starts.take(96)))
+                        }
+                        else -> ok(usdTab(starts))
+                    }
+                }
+                rig.coldStart(deadline)
+                awaitTrue("$label: the first tab is in flight", deadline) { tabs().size == 1 }
+                awaitTrue("$label: the REST observation is held for the catalog", deadline) {
+                    rig.pendingInputs().any { it.isObservation(com.jay.fxi.data.remote.TopicGraphPath.REST_BOOTSTRAP) }
+                }
+                usdSnapshotLive = false
+                awaitTrue("$label: an acknowledged socket", deadline) { openSockets.isNotEmpty() }
+                openSockets.last().send(usdSnapshot())
+                awaitTrue("$label: the WS observation is held after it", deadline) {
+                    rig.pendingInputs().let { inputs ->
+                        val rest = inputs.indexOfFirst { it.isObservation(com.jay.fxi.data.remote.TopicGraphPath.REST_BOOTSTRAP) }
+                        val ws = inputs.indexOfFirst { it.isObservation(com.jay.fxi.data.remote.TopicGraphPath.WS) }
+                        rest >= 0 && ws > rest
+                    }
+                }
+                assertFalse("$label: no kb series before the catalog", rig.hasKbSeries())
+                awaitTrue("$label: the first tab's registration was read at its send", deadline) { firstRegistration.get() != null }
+                assertEquals("$label: the first tab went with no catalog and no recovery capture",
+                    TabRegistrationView(false, emptyList()), firstRegistration.get())
+
+                when (case) {
+                    AdoptionCase.IN_FLIGHT -> {
+                        holdCatalog.countDown()
+                        awaitTrue("$label: the catalog is adopted and the held inputs replay", deadline) {
+                            rig.catalogAdopted() && rig.pendingInputs().isEmpty() && rig.hasKbSeries()
+                        }
+                        awaitTrue("$label: a closed demand from the replay", deadline) {
+                            rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.Pending(closed = true, mappingWait = false)
+                        }
+                        assertEquals("$label: premise: every closed start is demanded", starts.toSet(), rig.kbClosedPending())
+                        assertTrue("$label: premise: the first tab is still held", tabs()[0].bodyEnd == null)
+                        holdFirst.countDown()
+                    }
+                    AdoptionCase.LATE, AdoptionCase.EARLY -> holdFirst.countDown()
+                }
+                awaitTrue("$label: the first tab completed and a budget opened", deadline) {
+                    tabs()[0].bodyEnd != null && rig.usdBudget()?.deadline != null
+                }
+                val roundDue = rel(checkNotNull(checkNotNull(rig.usdBudget()).deadline))
+                val firstEnd = checkNotNull(tabs()[0].bodyEnd)
+                println("CUT-C01 $label: first tab body end $firstEnd ms, the round due $roundDue ms")
+                when (case) {
+                    AdoptionCase.IN_FLIGHT -> {
+                        delay(300)
+                        assertEquals("$label: the first completion released none of the demand (it carried no capture)",
+                            starts.toSet(), rig.kbClosedPending())
+                    }
+                    AdoptionCase.LATE -> {
+                        assertEquals("$label: the demand needs the catalog", com.jay.fxi.data.graph.GraphTabRecoveryDemand.CatalogRequired, rig.usdDemand())
+                        while (nowMillis() < maxOf(roundDue, firstEnd + 3_000) + 1_500) {
+                            assertEquals("$label: no tab while the round waits for the catalog\n${sends.timeline()}", 1, tabs().size)
+                            delay(50)
+                        }
+                        holdCatalog.countDown()
+                        awaitTrue("$label: the catalog is adopted", deadline) { rig.catalogAdopted() }
+                        assertTrue("$label: premise: adopted after the 3 s round was due (physical)",
+                            rel(checkNotNull(rig.catalogAt())) >= firstEnd + 3_000)
+                    }
+                    AdoptionCase.EARLY -> {
+                        assertEquals("$label: the demand needs the catalog", com.jay.fxi.data.graph.GraphTabRecoveryDemand.CatalogRequired, rig.usdDemand())
+                        holdCatalog.countDown()
+                        awaitTrue("$label: the catalog is adopted", deadline) { rig.catalogAdopted() }
+                        assertTrue("$label: premise: adopted before the round was due", rel(checkNotNull(rig.catalogAt())) < roundDue)
+                    }
+                }
+                if (case != AdoptionCase.IN_FLIGHT) {
+                    awaitTrue("$label: the replay made a closed demand after the adoption", deadline) {
+                        rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.Pending(closed = true, mappingWait = false)
+                    }
+                }
+                awaitTrue("$label: the follow-up tab went", deadline) { tabs().size == 2 }
+                awaitTrue("$label: the follow-up's registration was read at its send", deadline) { followRegistration.get() != null }
+                val follow = tabs()[1]
+                val adopted = rel(checkNotNull(rig.catalogAt()))
+                println("CUT-C01 $label: catalog adopted $adopted ms, follow-up sent ${follow.start} ms")
+                when (case) {
+                    AdoptionCase.IN_FLIGHT, AdoptionCase.EARLY -> {
+                        assertTrue("$label: the follow-up goes at the round's deadline, not before (${follow.start} vs $roundDue)\n${sends.timeline()}",
+                            follow.start >= roundDue - 50)
+                        assertTrue("$label: and without a needless delay (${follow.start} vs $roundDue)", follow.start <= roundDue + 2_000)
+                        assertTrue("$label: 3 s after the first completed (physical, ${follow.start} vs $firstEnd)", follow.start >= firstEnd + 3_000 - 50)
+                        assertTrue("$label: and not later than the 3 s rung allows (physical, ${follow.start} vs $firstEnd)", follow.start <= firstEnd + 5_000)
+                    }
+                    AdoptionCase.LATE -> {
+                        assertTrue("$label: the follow-up goes after the late adoption (${follow.start} vs $adopted)\n${sends.timeline()}",
+                            follow.start >= adopted - 50)
+                        assertTrue("$label: with no new interval (${follow.start} vs $adopted)", follow.start <= adopted + 2_000)
+                    }
+                }
+                val captures = followRegistration.get()?.captures.orEmpty()
+                assertTrue("$label: the follow-up carries kb.usd's recovery capture: $captures", captures.any { it.seriesKey.seriesId == "kb.usd" })
+                assertEquals("$label: the demand is kept while the follow-up is held", starts.toSet(), rig.kbClosedPending())
+                holdFollow.countDown()
+                awaitTrue("$label: the follow-up applied", deadline) { tabs()[1].bodyEnd != null && rig.kbClosedPending().size < 144 }
+                assertEquals("$label: the follow-up released exactly the starts it gave", starts.drop(96).toSet(), rig.kbClosedPending())
+                // Nothing else until 5 s after the follow-up completed; then the next round, at its 6 s rung, meets the rest.
+                val followEnd = checkNotNull(tabs()[1].bodyEnd)
+                quiet(label, followEnd + 5_000 - nowMillis())
+                assertEquals("$label: one catalog", listOf(200), statuses(catalogs()))
+                assertEquals("$label: two tabs until then", 2, tabs().size)
+                awaitTrue("$label: the next round met the rest", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                assertTrue("$label: at its 6 s rung (${tabs()[2].start} vs $followEnd)", tabs()[2].start >= followEnd + 6_000 - 50)
+                assertEquals("$label: three tabs in all", 3, tabs().size)
+            }
+        } finally {
+            holdCatalog.countDown(); holdFirst.countDown(); holdFollow.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 45_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    @Test
+    fun `RT03b-Q01a a catalog adopted while the first tab is in flight leaves the demand to one follow-up with its capture`() =
+        catalogAdoptionRow("RT03b-Q01a", AdoptionCase.IN_FLIGHT)
+
+    @Test
+    fun `RT03b-Q01b a catalog adopted after the round was due sends the follow-up at once`() =
+        catalogAdoptionRow("RT03b-Q01b", AdoptionCase.LATE)
+
+    @Test
+    fun `RT03b-Q01c a catalog adopted before the round was due sends the follow-up at the round`() =
+        catalogAdoptionRow("RT03b-Q01c", AdoptionCase.EARLY)
+
+    // --- CUT-C01 batch 2a: RT03b-Q02 (cut_c01_b2_agreed.r1.md) ---------------------------------------------------------------
+
+    /** kb.usd's recoverable state in the recorder, read on Main. */
+    private suspend fun Rig.kbState(): com.jay.fxi.data.graph.GraphRecoverableState? = onMain {
+        assembly.recorder.state.value.series.entries.firstOrNull { it.key.seriesId == "kb.usd" }?.value
+    }
+
+    /**
+     * RT03b-Q02: a failure releases nothing, a partial 200 only what it gave, and a new gap during a held round keeps its new
+     * generation. A reconnect opens the cycle: round 1 answers 503, round 2 half the window. While round 3 is held, a second
+     * drop inside the reconnect cooldown (no trigger) and a current WS snapshot re-demand the whole window under a newer
+     * generation, and the screen's 1d→3m→1d joins the 1d request in flight. Round 3's full answer is applied yet releases
+     * nothing of the newer demand; round 4 meets it.
+     */
+    @Test
+    fun `RT03b-Q02 a failure, a partial 200 and a new gap release only what was given and keep the new generation`() = runBlocking {
+        val label = "RT03b-Q02"
+        val prepared = clearOfBoundary(70_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 60_000
+        entitlements += unauthorized()
+        val hold3 = java.util.concurrent.CountDownLatch(1)
+        val rig = Rig()
+        try {
+            rig.row {
+                rig.prepareClosedDemand(deadline)
+                val holder = checkNotNull(rig.onMain { rig.mount?.holders?.value?.get("usd") })
+                val starts = closedStarts()
+                val baseline = tabs().size
+                val oneDay = AtomicInteger()
+                onTab = { request ->
+                    if (request.requestUrl!!.queryParameter("period") == "3m") ok(fixture("usd-3m-krx-hidden.json"))
+                    else when (oneDay.getAndIncrement()) {
+                        0 -> unavailable()
+                        1 -> ok(usdTab(starts.take(48)))
+                        2 -> { hold3.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(usdTab(starts)) }
+                        else -> ok(usdTab(starts))
+                    }
+                }
+                val oneDayTabs = { tabs().drop(baseline).filter { it.param("period") == "1d" } }
+                assertEquals("$label: premise: every closed start is demanded", starts.toSet(), rig.kbClosedPending())
+                val socketsBefore = openSockets.size
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: round 1 (503) completed", deadline) { oneDayTabs().size == 1 && oneDayTabs()[0].bodyEnd != null }
+                assertEquals("$label: a failure releases nothing", starts.toSet(), rig.kbClosedPending())
+                awaitTrue("$label: round 2 (half) applied", deadline) { oneDayTabs().size == 2 && oneDayTabs()[1].bodyEnd != null && rig.kbClosedPending().size < 144 }
+                assertEquals("$label: a partial 200 releases exactly the starts it gave", starts.drop(48).toSet(), rig.kbClosedPending())
+
+                // Round 3 held: its captures, then a new gap.
+                awaitTrue("$label: round 3 in flight", deadline) { oneDayTabs().size == 3 }
+                val captured = checkNotNull(rig.usdTabRegistration().captures).single { it.seriesKey.seriesId == "kb.usd" }.capturedGeneration
+                val versionBefore = rig.kbState()?.lastAppliedVersion
+                awaitTrue("$label: the reconnected socket", deadline) { openSockets.size > socketsBefore }
+                val triggersBefore = rig.triggers()
+                val socketsMid = openSockets.size
+                openSockets.last().close(1011, "server restart")
+                awaitUsdAcknowledged(label, socketsMid, deadline)
+                openSockets.last().send(usdSnapshot())
+                awaitTrue("$label: the new gap re-demands the window under a newer generation", deadline) {
+                    rig.kbClosedPending() == starts.toSet() && rig.kbState()?.pending
+                        ?.filterKeys { it.epochSeconds in starts }?.values?.all { it.generation > captured } == true
+                }
+                assertEquals("$label: the second drop inside the cooldown issued no trigger", triggersBefore, rig.triggers())
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the 3m tab applied", deadline) { tabs().drop(baseline).any { it.param("period") == "3m" && it.bodyEnd != null } }
+                awaitTrue("$label: the screen offers a 3m token", deadline) { rig.onMain { holder.currentState().inlineToken?.period == GraphPeriod.THREE_MONTHS } }
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.ONE_DAY) }
+                delay(1_000)
+                assertEquals("$label: the return to 1d joins the request in flight (one 1d request)\n${sends.timeline()}", 3, oneDayTabs().size)
+                assertEquals("$label: one 3m tab", 1, tabs().drop(baseline).count { it.param("period") == "3m" })
+
+                hold3.countDown()
+                awaitTrue("$label: round 3 completed", deadline) { oneDayTabs()[2].bodyEnd != null }
+                awaitTrue("$label: round 3's data applied", deadline) {
+                    val v = rig.kbState()?.lastAppliedVersion
+                    v != null && (versionBefore == null || v > versionBefore)
+                }
+                delay(500)
+                assertEquals("$label: round 3 released nothing of the newer demand", starts.toSet(), rig.kbClosedPending())
+                awaitTrue("$label: round 4 met the demand", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                assertEquals("$label: four rounds", 4, oneDayTabs().size)
+                quiet(label, 3_000)
+            }
+        } finally {
+            hold3.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 60_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- CUT-C01 batch 2a: RT01-A09 (cut_c01_b2_agreed.r1.md) ----------------------------------------------------------------
+
+    /** The recorder's own catalog supplier, invoked directly (observation only; production calls it on its serial executor). */
+    private fun Rig.recorderCatalog(): Any? {
+        @Suppress("UNCHECKED_CAST")
+        val supply = privateField(assembly.recorder, "currentCatalog") as () -> Any?
+        return supply()
+    }
+
+    /**
+     * RT01-A09a: inputs held before the catalog replay in their order. The REST bootstrap observation (kb at T1) and two WS
+     * observations at the same later T2 with different values are held, in that sequence, with no kb series. Once the catalog
+     * is adopted they replay: the pending inputs empty, the first WS value keeps the T2 tie, and the WS resume — replayed after
+     * the REST observation created kb — marks the closed window with RECEIVE_GAP under one generation. A closed demand alone is
+     * not taken as the evidence of order.
+     */
+    @Test
+    fun `RT01-A09a inputs held before the catalog replay in their order once it is adopted`() = runBlocking {
+        val label = "RT01-A09a"
+        val prepared = clearOfBoundary(60_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += unauthorized()
+        val holdCatalog = java.util.concurrent.CountDownLatch(1)
+        val holdFirst = java.util.concurrent.CountDownLatch(1)
+        val now = System.currentTimeMillis() / 1000
+        val t1 = now - 60
+        val t2 = now - 30
+        val rig = Rig()
+        try {
+            rig.row {
+                usdSnapshotLive = true
+                usdBootstrap = { usdSnapshotAt(1390.0, t1) }
+                onCatalog = { holdCatalog.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("catalog-krx-hidden.json")) }
+                val starts = closedStarts()
+                onTab = { holdFirst.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(usdTab(starts)) }
+                rig.coldStart(deadline)
+                awaitTrue("$label: the REST observation is held", deadline) {
+                    rig.pendingInputs().any { it.isObservation(com.jay.fxi.data.remote.TopicGraphPath.REST_BOOTSTRAP) }
+                }
+                usdSnapshotLive = false
+                awaitTrue("$label: an acknowledged socket", deadline) { openSockets.isNotEmpty() }
+                openSockets.last().send(usdSnapshotAt(1391.0, t2))
+                openSockets.last().send(usdSnapshotAt(1392.0, t2))
+                awaitTrue("$label: both WS observations are held", deadline) {
+                    rig.pendingInputs().count { it.isObservation(com.jay.fxi.data.remote.TopicGraphPath.WS) } == 2
+                }
+                val held = rig.pendingInputs()
+                println("CUT-C01 $label held: " + held.joinToString { input ->
+                    when (input) {
+                        is com.jay.fxi.data.remote.TopicGraphInput.Observations -> "#${input.sequence} obs ${input.path}"
+                        is com.jay.fxi.data.remote.TopicGraphInput.Continuity -> "#${input.sequence} ${input.kind} ${input.paths}"
+                        else -> "#${input.sequence} ${input.javaClass.simpleName}"
+                    }
+                })
+                assertEquals("$label: held in sequence order", held.map { it.sequence }.sorted(), held.map { it.sequence })
+                val rest = held.indexOfFirst { it.isObservation(com.jay.fxi.data.remote.TopicGraphPath.REST_BOOTSTRAP) }
+                val ws = held.withIndex().filter { it.value.isObservation(com.jay.fxi.data.remote.TopicGraphPath.WS) }.map { it.index }
+                // The WS path's resume (a REST path resume may come first, before kb exists, and marks nothing).
+                val resume = held.indexOfFirst {
+                    it is com.jay.fxi.data.remote.TopicGraphInput.Continuity && it.kind == com.jay.fxi.data.remote.TopicGraphEventKind.DELIVERY_RESUMED &&
+                        com.jay.fxi.data.remote.TopicGraphPath.WS in it.paths
+                }
+                assertTrue("$label: REST, then the WS resume, then the two WS observations (rest $rest, resume $resume, ws $ws)",
+                    rest >= 0 && resume > rest && ws.size == 2 && ws[0] > resume && ws[1] > ws[0])
+                assertFalse("$label: no kb series before the catalog", rig.hasKbSeries())
+
+                holdCatalog.countDown()
+                awaitTrue("$label: the held inputs replayed", deadline) { rig.pendingInputs().isEmpty() && rig.hasKbSeries() }
+                val kb = checkNotNull(rig.kbState())
+                val tip = checkNotNull(kb.data.app.tip)
+                assertEquals("$label: the first WS value keeps the T2 tie", 1391.0, tip.rate, 0.0)
+                assertEquals("$label: at T2", t2, tip.observedAt.epochSeconds)
+                val closed = kb.pending.filterKeys { it.epochSeconds in starts }
+                assertEquals("$label: the resume marked every closed start", starts.toSet(), closed.keys.map { it.epochSeconds }.toSet())
+                assertTrue("$label: as a receive gap under one generation (${closed.values.map { it.generation }.toSet()})",
+                    closed.values.all { com.jay.fxi.data.graph.GraphRecoveryReason.RECEIVE_GAP in it.reasons } &&
+                        closed.values.map { it.generation }.toSet().size == 1)
+                holdFirst.countDown()
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: the tabs settle", deadline) { tabs().all { it.bodyEnd != null } }
+            }
+        } finally {
+            holdCatalog.countDown(); holdFirst.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-A09b: the same scope loses its catalog. With kb recorded, a capability rotation (KRX hidden, a new grant on the same
+     * user epoch) leaves no catalog until the new one is answered; that answer is held. A WS frame in the meantime is held
+     * (pending inputs grow, kb's tip unchanged); once the catalog is adopted again it replays into kb.
+     */
+    @Test
+    fun `RT01-A09b a same-scope catalog loss holds the WS input and the readoption replays it`() = runBlocking {
+        val label = "RT01-A09b"
+        val prepared = clearOfBoundary(60_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val holdNewCatalog = java.util.concurrent.CountDownLatch(1)
+        val krxVisible = java.util.concurrent.atomic.AtomicBoolean(true)
+        val rig = Rig()
+        try {
+            rig.row {
+                rig.prepareClosedDemand(deadline, krx = true)
+                val starts = closedStarts()
+                onCatalog = {
+                    if (krxVisible.get()) ok(fixture("catalog-krx-visible.json"))
+                    else { holdNewCatalog.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("catalog-krx-hidden.json")) }
+                }
+                // Let the cold start settle before the rotation, as RT01-A05 does (back to back it crowds the API budget).
+                rig.awaitTopics(deadline)
+                delay(3_500)
+                onTab = { ok(fixture(if (krxVisible.get()) "usd-1d-krx-visible.json" else "usd-1d-krx-hidden.json")) }
+                val tipBefore = checkNotNull(rig.kbState()?.data?.app?.tip)
+                val f1 = checkNotNull(rig.bridge())
+                val socketsBefore = openSockets.size
+                val rotatedAt = nowMillis()
+                krxVisible.set(false)
+                entitlements += ok(PREMIUM_HIDDEN)
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("$label: premise: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                assertNotEquals("$label: premise: a new grant", f1.grant, f2.grant)
+                awaitTrue("$label: the new context is consumed with no catalog", deadline) {
+                    rig.assembly.coordinator.state.value.source?.fence == f2 && !rig.catalogAdopted()
+                }
+                awaitTrue("$label: the new catalog is asked and held", deadline) { catalogs().any { it.end == null } }
+                // The frame comes on the new grant's connection (one on the old connection would be refused at replay).
+                awaitUsdAcknowledged(label, socketsBefore, deadline)
+                val heldBefore = rig.pendingInputs().size
+                val later = System.currentTimeMillis() / 1000
+                openSockets.last().send(usdSnapshotAt(1395.0, later))
+                awaitTrue("$label: the WS input is held", deadline) { rig.pendingInputs().size > heldBefore }
+                val describe = { inputs: List<com.jay.fxi.data.remote.TopicGraphInput> -> inputs.joinToString { input ->
+                    when (input) {
+                        is com.jay.fxi.data.remote.TopicGraphInput.Observations -> "#${input.sequence} obs ${input.path} ${input.attribution.lifetime}"
+                        is com.jay.fxi.data.remote.TopicGraphInput.Continuity -> "#${input.sequence} ${input.kind} ${input.paths}"
+                        else -> "#${input.sequence} ${input.javaClass.simpleName}"
+                    }
+                } }
+                println("CUT-C01 $label held after the frame: ${describe(rig.pendingInputs())}; bridge ${rig.bridge()}")
+                assertEquals("$label: kb's tip unchanged while the catalog is missing", tipBefore, rig.kbState()?.data?.app?.tip)
+                holdNewCatalog.countDown()
+                awaitTrue("$label: the catalog is adopted again", deadline) { rig.catalogAdopted() }
+                delay(1_000)
+                println("CUT-C01 $label after readoption: held ${describe(rig.pendingInputs())}; tip ${rig.kbState()?.data?.app?.tip}; source ${rig.assembly.coordinator.state.value.source}")
+                awaitTrue("$label: the held input replays into kb", deadline) {
+                    rig.pendingInputs().isEmpty() && rig.kbState()?.data?.app?.tip?.rate == 1395.0
+                }
+                assertEquals("$label: at the frame's time", later, checkNotNull(rig.kbState()?.data?.app?.tip).observedAt.epochSeconds)
+                // End cleanly: the next round meets the closed demand, and the new session settles.
+                onTab = { ok(usdTab(starts)) }
+                awaitTrue("$label: the closed demand is met", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                settleNewSession(label, rotatedAt, deadline)
+            }
+        } finally {
+            holdNewCatalog.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-A09c: another scope never gets the previous scope's catalog. A real StableInactive answer ends the user (new user
+     * epoch) and a FORCE_PREMIUM answer re-grants on the new epoch, with Main and the topic executor held as in RT01-A05
+     * merged; the topic executor is released first. While Main is held the coordinator's publication still carries the old
+     * scope's catalog and the bridge already has the new epoch's fence: the recorder's catalog supplier returns null.
+     */
+    @Test
+    fun `RT01-A09c a new user epoch never reads the previous scope's catalog`() = runBlocking {
+        val label = "RT01-A09c"
+        val prepared = clearOfBoundary(40_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            rig.prepareClosedDemand(deadline)
+            // prepareClosedDemand's tab script waits for a catalog; the new scope's tabs answer at once.
+            onTab = { ok(fixture("usd-1d-krx-hidden.json")) }
+            rig.awaitTopics(deadline)
+            // Let the cold start settle before the identity churn, as RT01-A05 does.
+            delay(3_500)
+            val f1 = checkNotNull(rig.bridge())
+            assertNotNull("$label: premise: the recorder reads the catalog in its scope", rig.recorderCatalog())
+            val tabsBefore = tabs().size
+            val churnAt = nowMillis()
+            val mainHold = holdMain()
+            try {
+                val runtimeHold = rig.holdRuntime()
+                try {
+                    entitlements += ok("""{"krx_visible":false,"premium_active":false,"premium_pending":false}""")
+                    kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                    entitlements += ok(PREMIUM_HIDDEN)
+                    kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                } finally {
+                    runtimeHold.release()
+                }
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence) { "$label: no re-grant after the user end" }
+                assertNotEquals("$label: premise: a new user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                awaitTrue("$label: the bridge has the new epoch's fence while Main is held", deadline) { rig.bridge() == f2 }
+                val publication = rig.assembly.coordinator.state.value
+                assertNotNull("$label: premise: the publication still carries the old scope's catalog", publication.catalog)
+                assertEquals("$label: premise: of the old scope", f1.userAccessEpoch, publication.dataScope?.userAccessEpoch)
+                assertNull("$label: the recorder's supplier returns no catalog for the new scope", rig.recorderCatalog())
+            } finally {
+                mainHold.release()
+            }
+            awaitTrue("$label: the new scope's context is consumed", deadline) {
+                rig.assembly.coordinator.state.value.source?.fence == rig.bridge()
+            }
+            // The new scope starts its own requests; the row ends once they have reached the server and settled.
+            awaitTrue("$label: the new scope's tab applied", deadline) {
+                tabs().size > tabsBefore && tabs().all { it.bodyEnd != null } && rig.usdApplied()
+            }
+            settleNewSession(label, churnAt, deadline)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- CUT-C01 batch 2a: RT03b-Q06 (cut_c01_b2_agreed.r1.md) ---------------------------------------------------------------
+
+    /**
+     * RT03b-Q06 (i-a)/(i-b): an open cycle whose round falls due while usd 1d is not the active key — the screen on JPY
+     * ([longPeriod] false) or on usd 3m (true). Past the deadline nothing for the budget is sent (no usd 1d tab, no catalog)
+     * and the demand is unchanged; back on usd 1d, exactly one usd 1d tab goes at once and meets it.
+     */
+    private fun inactiveRoundRow(label: String, longPeriod: Boolean) = runBlocking {
+        val prepared = clearOfBoundary(70_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 50_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            rig.prepareClosedDemand(deadline)
+            val holder = checkNotNull(rig.onMain { rig.mount?.holders?.value?.get("usd") })
+            val starts = closedStarts()
+            val baseline = tabs().size
+            val usdOneDayCalls = AtomicInteger()
+            onTab = { request ->
+                val url = request.requestUrl!!
+                when {
+                    url.queryParameter("tab") == "jpy" -> ok(jpyTab())
+                    url.queryParameter("period") == "3m" -> ok(fixture("usd-3m-krx-hidden.json"))
+                    usdOneDayCalls.getAndIncrement() == 0 -> unavailable()
+                    else -> ok(usdTab(starts))
+                }
+            }
+            val usdOneDay = { tabs().drop(baseline).filter { it.param("tab") == "usd" && it.param("period") == "1d" } }
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: round 1 (503) completed", deadline) { usdOneDay().size == 1 && usdOneDay()[0].bodyEnd != null }
+            // The cycle's first deadline is its opening; wait for the one round 1's completion set.
+            val firstEnd = checkNotNull(usdOneDay()[0].bodyEnd)
+            awaitTrue("$label: the next round is scheduled after round 1", deadline) {
+                rig.usdBudget()?.deadline?.let { it.toEpochMilliseconds() - wallAtOrigin > firstEnd } == true
+            }
+            val due = checkNotNull(checkNotNull(rig.usdBudget()).deadline).toEpochMilliseconds() - wallAtOrigin
+            val away = if (longPeriod) {
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the 3m tab applied", deadline) { tabs().drop(baseline).any { it.param("period") == "3m" && it.bodyEnd != null } }
+                holder
+            } else {
+                rig.moveTo(FreeTab.JPY, holder, deadline)
+            }
+            assertTrue("$label: premise: usd 1d left before the round was due (${nowMillis()} vs $due)", nowMillis() < due)
+            awaitTrue("$label: the away key's request settled", deadline) { graph().all { it.bodyEnd != null } }
+            val graphAway = graph().size
+            while (nowMillis() < due + 4_000) {
+                assertEquals("$label: no usd 1d tab while it is not active\n${sends.timeline()}", 1, usdOneDay().size)
+                assertEquals("$label: no graph send at all for the budget while away\n${sends.timeline()}", graphAway, graph().size)
+                delay(50)
+            }
+            assertEquals("$label: the demand is unchanged", starts.toSet(), rig.kbClosedPending())
+            val back = nowMillis()
+            if (longPeriod) {
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.ONE_DAY) }
+            } else {
+                rig.moveTo(FreeTab.USD, away, deadline)
+            }
+            awaitTrue("$label: one usd 1d tab on the return", deadline) { usdOneDay().size == 2 }
+            assertTrue("$label: at once (${usdOneDay()[1].start - back} ms after the return)\n${sends.timeline()}", usdOneDay()[1].start - back <= 1_500)
+            awaitTrue("$label: it met the demand", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+            quiet(label, 3_000)
+            assertEquals("$label: exactly one usd 1d tab on the return", 2, usdOneDay().size)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 50_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    @Test
+    fun `RT03b-Q06a a round falling due while another tab is active waits for usd and goes once on the return`() =
+        inactiveRoundRow("RT03b-Q06a", longPeriod = false)
+
+    @Test
+    fun `RT03b-Q06b a round falling due while usd 3m is active waits for usd 1d and goes once on the return`() =
+        inactiveRoundRow("RT03b-Q06b", longPeriod = true)
+
+    /**
+     * RT03b-Q06c: a terminal answer (404) stops the cycle as TERMINAL with the demand kept; nothing is sent for 10 s, and a
+     * reconnect past the cooldown, which issues a trigger, reopens nothing.
+     */
+    @Test
+    fun `RT03b-Q06c a terminal answer stops the cycle, keeps the demand and no trigger reopens it`() = runBlocking {
+        val label = "RT03b-Q06c"
+        val prepared = clearOfBoundary(80_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 70_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            rig.prepareClosedDemand(deadline)
+            val starts = closedStarts()
+            val baseline = tabs().size
+            onTab = { MockResponse().setResponseCode(404).setBody("""{"detail":"not found"}""") }
+            val sockets = openSockets.size
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: the reconnected socket", deadline) { openSockets.size > sockets }
+            val reconnectedAt = nowMillis()
+            awaitTrue("$label: round 1 (404) completed", deadline) { tabs().size == baseline + 1 && tabs().last().bodyEnd != null }
+            awaitTrue("$label: the cycle stopped as terminal", deadline) { rig.usdBudget()?.stop?.toString() == "TERMINAL" }
+            assertEquals("$label: the demand is kept", starts.toSet(), rig.kbClosedPending())
+            assertEquals("$label: the recorder still demands",
+                com.jay.fxi.data.graph.GraphTabRecoveryDemand.Pending(closed = true, mappingWait = false), rig.usdDemand())
+            quiet(label, 10_000)
+            while (nowMillis() < reconnectedAt + 31_000) delay(100)
+            val triggersBefore = rig.triggers()
+            val socketsMid = openSockets.size
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: a reconnect past the cooldown", deadline) { openSockets.size > socketsMid }
+            awaitTrue("$label: it issued a trigger", deadline) { rig.triggers() > triggersBefore }
+            quiet(label, 5_000)
+            assertEquals("$label: still terminal", "TERMINAL", rig.usdBudget()?.stop?.toString())
+            assertEquals("$label: one recovery round only", 1, tabs().size - baseline)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 70_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT03b-Q06d: a round cancelled by a same-scope context change. Round 1 is held; a capability rotation (KRX hidden) gives
+     * a new grant on the same user epoch; the old round's full answer then completes released and applies nothing (the
+     * demand is unchanged). The next round asks the catalog once and its answer meets the demand.
+     */
+    @Test
+    fun `RT03b-Q06d a round released by a same-scope context change applies nothing and the next asks the catalog once`() = runBlocking {
+        val label = "RT03b-Q06d"
+        val prepared = clearOfBoundary(70_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 50_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val holdOld = java.util.concurrent.CountDownLatch(1)
+        // Every request after the change waits until the old round's release has been judged.
+        val holdNew = java.util.concurrent.CountDownLatch(1)
+        val krxVisible = java.util.concurrent.atomic.AtomicBoolean(true)
+        val rig = Rig()
+        try {
+            rig.row {
+                rig.prepareClosedDemand(deadline, krx = true)
+                val starts = closedStarts()
+                val baseline = tabs().size
+                onCatalog = {
+                    if (krxVisible.get()) ok(fixture("catalog-krx-visible.json"))
+                    else { holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("catalog-krx-hidden.json")) }
+                }
+                // Let the cold start settle before the reconnect and rotation, as RT01-A05 does.
+                rig.awaitTopics(deadline)
+                delay(3_500)
+                val calls = AtomicInteger()
+                // Each later tab's registration as it is sent: the one that meets the demand must carry the capture.
+                val laterRegistrations = Collections.synchronizedList(mutableListOf<TabRegistrationView>())
+                val laterFromRound = Collections.synchronizedList(mutableListOf<Boolean?>())
+                onTab = {
+                    if (calls.getAndIncrement() == 0) holdOld.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                    else {
+                        laterRegistrations += runBlocking { rig.usdTabRegistration() }
+                        laterFromRound += runBlocking { rig.usdTabFromRound() }
+                        holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                    }
+                    ok(usdTab(starts))
+                }
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: round 1 in flight", deadline) { tabs().size == baseline + 1 }
+                val captured = checkNotNull(rig.usdTabRegistration().captures)
+                assertTrue("$label: premise: round 1 carries kb.usd's capture: $captured", captured.any { it.seriesKey.seriesId == "kb.usd" })
+                val f1 = checkNotNull(rig.bridge())
+                krxVisible.set(false)
+                entitlements += ok(PREMIUM_HIDDEN)
+                val catalogsBefore = catalogs().size
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("$label: premise: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                assertNotEquals("$label: premise: a new grant", f1.grant, f2.grant)
+                awaitTrue("$label: the new context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == f2 }
+                holdOld.countDown()
+                awaitTrue("$label: the old round's body ended", deadline) { tabs()[baseline].bodyEnd != null }
+                assertEquals("$label: premise: the old round's full answer was delivered", 200, tabs()[baseline].status)
+                delay(500)
+                assertEquals("$label: the released round applied nothing (the demand is unchanged)", starts.toSet(), rig.kbClosedPending())
+                assertTrue("$label: premise: nothing after the change has completed yet",
+                    tabs().drop(baseline + 1).none { it.bodyEnd != null } && catalogs().drop(catalogsBefore).none { it.bodyEnd != null })
+                holdNew.countDown()
+                awaitTrue("$label: a later round met the demand", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                quiet(label, 3_000)
+                val after = catalogs().drop(catalogsBefore)
+                assertEquals("$label: one catalog after the change\n${sends.timeline()}", listOf(200), statuses(after))
+                val later = synchronized(laterRegistrations) { laterRegistrations.toList() }
+                val fromRound = synchronized(laterFromRound) { laterFromRound.toList() }
+                val laterTabs = tabs().drop(baseline + 1)
+                println("CUT-C01 $label later tabs: ${laterTabs.map { it.start }}; registrations $later; from a round $fromRound")
+                // The next round, and nothing else: one tab after the change, sent after the catalog ended, with the capture.
+                assertEquals("$label: exactly one tab after the change\n${sends.timeline()}", 1, laterTabs.size)
+                assertEquals("$label: exactly one later registration: $later", 1, later.size)
+                assertTrue("$label: the catalog ended before the later tab\n${sends.timeline()}",
+                    checkNotNull(after.single().bodyEnd) <= laterTabs.single().start)
+                assertTrue("$label: the sole later tab carried kb.usd's capture: $later",
+                    later.single().captures.orEmpty().any { it.seriesKey.seriesId == "kb.usd" })
+                assertEquals("$label: and was issued by the recovery round", listOf<Boolean?>(true), fromRound)
+            }
+        } finally {
+            holdOld.countDown()
+            holdNew.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 50_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /** The catalog fixture with its cache TTL replaced by [seconds]. */
+    private fun catalogWithTtl(seconds: Int): String {
+        val base = wire.parseToJsonElement(fixture("catalog-krx-hidden.json")).jsonObject
+        return kotlinx.serialization.json.JsonObject(base + ("cache_ttl_seconds" to kotlinx.serialization.json.JsonPrimitive(seconds))).toString()
+    }
+
+    /**
+     * RT03b-Q06e: a catalog whose TTL is 20 s. Rounds that start inside the TTL send no catalog; the first round after it
+     * sends exactly one catalog before its tab. Every round answers 503 until the round after the TTL, whose answer meets
+     * the demand.
+     */
+    @Test
+    fun `RT03b-Q06e rounds inside the catalog TTL ask no catalog and the first after it asks one`() = runBlocking {
+        val label = "RT03b-Q06e"
+        val prepared = clearOfBoundary(80_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 60_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        onCatalog = { ok(catalogWithTtl(20)) }
+        val rig = Rig()
+        rig.row {
+            rig.prepareClosedDemand(deadline)
+            val starts = closedStarts()
+            val baseline = tabs().size
+            val adoptedAt = checkNotNull(rig.catalogAt()).toEpochMilliseconds() - wallAtOrigin
+            val expiresAt = adoptedAt + 20_000
+            // Decided as each round arrives: inside the TTL 503, the first one after it the full answer.
+            onTab = { if (nowMillis() >= expiresAt) ok(usdTab(starts)) else unavailable() }
+            val catalogsBefore = catalogs().size
+            openSockets.last().close(1011, "server restart")
+            // Rounds until one starts after the TTL; that one is answered in full.
+            awaitTrue("$label: a round starts after the TTL", deadline) { tabs().drop(baseline).any { it.start >= expiresAt } }
+            awaitTrue("$label: the demand is met", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+            quiet(label, 3_000)
+            val rounds = tabs().drop(baseline)
+            val inside = rounds.filter { it.start < expiresAt }
+            val first = rounds.first { it.start >= expiresAt }
+            val newCatalogs = catalogs().drop(catalogsBefore)
+            println("CUT-C01 $label: catalog adopted $adoptedAt ms, expires $expiresAt ms; rounds ${rounds.map { it.start }}; catalogs ${newCatalogs.map { it.start }}")
+            assertTrue("$label: premise: at least two rounds inside the TTL (${inside.size})", inside.size >= 2)
+            assertTrue("$label: no catalog during the rounds inside the TTL\n${sends.timeline()}",
+                newCatalogs.none { it.start <= checkNotNull(inside.last().bodyEnd) })
+            assertEquals("$label: exactly one catalog for the first round after the TTL, before its tab\n${sends.timeline()}",
+                1, newCatalogs.count { it.start > checkNotNull(inside.last().bodyEnd) && it.start <= first.start })
+            assertEquals("$label: no other catalog\n${sends.timeline()}", 1, newCatalogs.size)
+            assertTrue("$label: that catalog ended before the round's tab\n${sends.timeline()}", checkNotNull(newCatalogs.single().bodyEnd) <= first.start)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 60_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- CUT-C01 batch 2a: RT03b-Q03 (cut_c01_b2_agreed.r1.md) ---------------------------------------------------------------
+
+    /**
+     * RT03b-Q03a: the recovery ladder over a real closed demand. A reconnect opens the cycle; every round answers 503: six
+     * rounds at most, each next round [ladder] after the previous completed; then the budget stops EXHAUSTED with the demand
+     * kept (every closed start still pending, the recorder still demanding), and nothing is sent for 49 s.
+     */
+    @Test
+    fun `RT03b-Q03a a real closed demand walks the whole ladder, stops at the cap and keeps the demand`() = runBlocking {
+        val label = "RT03b-Q03a"
+        val prepared = clearOfBoundary(200_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 190_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            rig.prepareClosedDemand(deadline)
+            val starts = closedStarts()
+            val baseline = tabs().size
+            onTab = { unavailable() }
+            assertEquals("$label: premise: every closed start is demanded", starts.toSet(), rig.kbClosedPending())
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: six recovery rounds completed", deadline) { tabs().size == baseline + 6 && tabs().all { it.bodyEnd != null } }
+            val r = tabs().drop(baseline)
+            for (i in 0 until 5) {
+                val gap = r[i + 1].start - checkNotNull(r[i].bodyEnd)
+                assertTrue("$label: round ${i + 2} goes ${ladder[i]} ms after round ${i + 1} completed, not before (gap $gap)\n${sends.timeline()}",
+                    gap >= ladder[i] - 50)
+                assertTrue("$label: and without a needless delay (gap $gap)\n${sends.timeline()}", gap <= ladder[i] + 2_000)
+            }
+            awaitTrue("$label: the cycle is exhausted", deadline) { rig.usdBudget()?.stop?.toString() == "EXHAUSTED" }
+            assertEquals("$label: six rounds in the cycle", 6, checkNotNull(rig.usdBudget()).rounds)
+            assertEquals("$label: every closed start is still demanded", starts.toSet(), rig.kbClosedPending())
+            assertEquals("$label: the recorder still demands the closed buckets",
+                com.jay.fxi.data.graph.GraphTabRecoveryDemand.Pending(closed = true, mappingWait = false), rig.usdDemand())
+            quiet(label, 49_000)
+            assertEquals("$label: still exhausted after the quiet window", "EXHAUSTED", rig.usdBudget()?.stop?.toString())
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 190_000)
+        assertEquals("$label: every recovery round answered 503", List(6) { 503 }, statuses(tabs()).takeLast(6))
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT03b-Q03b: a stated floor longer than the rung. The second round answers 503 with Retry-After 30 s; the third round,
+     * due 6 s after it, waits for the floor (30 s + the usd jitter of 10 s) and nothing else is sent before; it then meets the
+     * demand.
+     */
+    @Test
+    fun `RT03b-Q03b a Retry-After longer than the rung holds the next round until the floor`() = runBlocking {
+        val label = "RT03b-Q03b"
+        assertEquals("premise: J = 10 s for usd", 10.seconds, FreeSnapshotSchedulePolicy.jitterFor(SEED, "usd"))
+        val prepared = clearOfBoundary(90_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 80_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            rig.prepareClosedDemand(deadline)
+            val starts = closedStarts()
+            val baseline = tabs().size
+            val calls = AtomicInteger()
+            onTab = {
+                when (calls.getAndIncrement()) {
+                    0 -> unavailable()
+                    1 -> unavailable(retryAfter = 30)
+                    else -> ok(usdTab(starts))
+                }
+            }
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: the second round completed", deadline) { tabs().size == baseline + 2 && tabs().last().bodyEnd != null }
+            val second = tabs()[baseline + 1]
+            val secondEnd = checkNotNull(second.bodyEnd)
+            awaitTrue("$label: the third round went", deadline) { tabs().size == baseline + 3 }
+            val third = tabs()[baseline + 2]
+            val graphBetween = graph().filter { it.start > secondEnd && it.start < third.start }
+            assertTrue("$label: the third round waits for the floor, not the 6 s rung (${third.start - secondEnd} ms)\n${sends.timeline()}",
+                third.start >= secondEnd + 40_000 - 50)
+            assertTrue("$label: and goes at the floor (${third.start - secondEnd} ms)\n${sends.timeline()}", third.start <= secondEnd + 42_000)
+            assertEquals("$label: nothing else sent under the floor\n${sends.timeline()}", emptyList<SendRecorder.Exchange>(), graphBetween)
+            awaitTrue("$label: the third round met the demand", deadline) {
+                rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None
+            }
+            quiet(label, 5_000)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 80_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
 
     private fun Rig.writtenFiles(): List<String> =
         if (diskRoot.isDirectory) diskRoot.walkTopDown().filter { it.isFile }.map { it.relativeTo(diskRoot).path }.toList() else emptyList()
@@ -2915,14 +3831,17 @@ class PremiumGraphCutoverAcceptanceTest {
     private fun isoAt(epochSecond: Long) = isoKst.format(java.time.Instant.ofEpochSecond(epochSecond).atOffset(kst))
 
     /** The usd topic snapshot (contract fixture envelope) with one kb quote stamped now and nothing else. */
-    private fun usdSnapshot(rate: Double = 1390.0): String {
+    private fun usdSnapshot(rate: Double = 1390.0): String = usdSnapshotAt(rate, System.currentTimeMillis() / 1000)
+
+    /** The usd topic snapshot (contract fixture envelope) with one kb quote stamped at [epochSecond] and nothing else. */
+    private fun usdSnapshotAt(rate: Double, epochSecond: Long): String {
         val base = wire.parseToJsonElement(File("src/test/resources/contracts/v2/topic/snapshot-fx-usd-krw.json").readText()).jsonObject
         val data = base.getValue("data").jsonObject
         val kb = kotlinx.serialization.json.buildJsonObject {
             put("asset", kotlinx.serialization.json.JsonPrimitive("usd-krw"))
             put("rate", kotlinx.serialization.json.JsonPrimitive(rate))
             put("source", kotlinx.serialization.json.JsonPrimitive("kb"))
-            put("timestamp", kotlinx.serialization.json.JsonPrimitive(isoAt(System.currentTimeMillis() / 1000)))
+            put("timestamp", kotlinx.serialization.json.JsonPrimitive(isoAt(epochSecond)))
         }
         // One kb quote and nothing else (no reference): the recorder gets kb.usd alone.
         val newData = kotlinx.serialization.json.JsonObject(
@@ -3067,11 +3986,36 @@ class PremiumGraphCutoverAcceptanceTest {
         val c = assembly.coordinator
         @Suppress("UNCHECKED_CAST")
         val budgets = c.javaClass.getDeclaredField("recoveryBudgets").apply { isAccessible = true }.get(c) as Map<Any, Any>
-        budgets.values.singleOrNull()?.let { b ->
+        budgets.entries.singleOrNull { privateField(it.key, "tab") == "usd" }?.value?.let { b ->
             fun f(name: String) = b.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(b)
             BudgetView(f("rounds") as Int, f("completionRung") as Int, f("deadline") as kotlinx.datetime.Instant?, f("permitWait") != null, f("stop"))
         }
     }
+
+    /** The usd tab's registered 1d request as seen at its send: whether a catalog was adopted, and its recovery captures. */
+    private data class TabRegistrationView(val catalogAdopted: Boolean, val captures: List<com.jay.fxi.data.graph.GraphRecoveryRequest>?)
+
+    /** Read on Main; [captures] is null when no usd 1d request is registered. */
+    private suspend fun Rig.usdTabRegistration(): TabRegistrationView = onMain {
+        val c = assembly.coordinator
+        @Suppress("UNCHECKED_CAST")
+        val requests = privateField(c, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
+        @Suppress("UNCHECKED_CAST")
+        val captures = requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period.code == "1d" }
+            ?.value?.let { privateField(it, "recoveryRequests") as List<com.jay.fxi.data.graph.GraphRecoveryRequest> }
+        TabRegistrationView(c.state.value.catalog != null, captures)
+    }
+
+    /** Whether the registered usd 1d request was issued by a recovery round; read on Main, null when none is registered. */
+    private suspend fun Rig.usdTabFromRound(): Boolean? = onMain {
+        @Suppress("UNCHECKED_CAST")
+        val requests = privateField(assembly.coordinator, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
+        requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period.code == "1d" }?.value?.let { privateField(it, "automaticRecovery") as Boolean }
+    }
+
+    /** A 503 the graph endpoints answer; with [retryAfter], its Retry-After header (seconds). */
+    private fun unavailable(retryAfter: Int? = null): MockResponse =
+        MockResponse().setResponseCode(503).setBody("""{"detail":"unavailable"}""").also { r -> retryAfter?.let { r.setHeader("Retry-After", it) } }
 
     /**
      * A04b: the recovery waits on the production permit and resumes it as it was. After two partial 200s the budget's next
