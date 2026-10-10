@@ -1151,7 +1151,7 @@ class PremiumGraphCutoverAcceptanceTest {
                 // A WS snapshot: the recorder publication that carries its value.
                 delay(1_100)
                 openSockets.last().send(usdSnapshot(1391.0))
-                awaitTrue("the snapshot's recorder publication", deadline) { recorderSeen.any { it.second == 1391.0 } }
+                awaitTrue("the snapshot's recorder publication", deadline) { synchronized(recorderSeen) { recorderSeen.any { it.second == 1391.0 } } }
 
                 // A series toggle: a real selection change, then the holder publication that carries it. Read from the published
                 // state off Main: currentState() would itself publish.
@@ -1159,12 +1159,12 @@ class PremiumGraphCutoverAcceptanceTest {
                 val token = checkNotNull(published.inlineToken)
                 val selected = checkNotNull(kbSelected(published))
                 rig.onMain { holder.toggleSeries(token, "kb.usd") }
-                awaitTrue("the holder published the changed selection", deadline) { holderSeen.any { it.second == !selected } }
+                awaitTrue("the holder published the changed selection", deadline) { synchronized(holderSeen) { holderSeen.any { it.second == !selected } } }
 
                 // A period change: the graph coordinator's request and the publication that carries it.
                 rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
                 awaitTrue("the 3m tab applied", deadline) { has3m() && tabs().all { it.bodyEnd != null } }
-                awaitTrue("the coordinator published it", deadline) { coordinatorSeen.any { it.second } }
+                awaitTrue("the coordinator published it", deadline) { synchronized(coordinatorSeen) { coordinatorSeen.any { it.second } } }
 
                 // Fresh reads on Main.
                 val fence = checkNotNull(rig.coordinator.topicGrantResult().fence)
@@ -1194,7 +1194,7 @@ class PremiumGraphCutoverAcceptanceTest {
                 } finally {
                     release.countDown()
                 }
-                awaitTrue("the recorder takes it once Main is free", deadline) { recorderSeen.any { it.second == 1392.0 } }
+                awaitTrue("the recorder takes it once Main is free", deadline) { synchronized(recorderSeen) { recorderSeen.any { it.second == 1392.0 } } }
             } finally {
                 observers.forEach { it.cancelAndJoin() }
             }
@@ -3689,7 +3689,7 @@ class PremiumGraphCutoverAcceptanceTest {
                 assertEquals("$label: the same user epoch", first.userAccessEpoch, reapproved.userAccessEpoch)
                 // The last connection: after the second refusal, its 101 held.
                 awaitTrue("$label: the re-approved grant's connection reaches the server", deadline) { wsArrivals.size >= arrivalsAtClose + 3 }
-                val connections = wsArrivals.drop(arrivalsAtClose).take(3)
+                val connections = synchronized(wsArrivals) { wsArrivals.drop(arrivalsAtClose).take(3) }
                 // Each connection as the client started it (its WebSocket call, before any TCP connect): the time its own first
                 // sends are measured against.
                 awaitTrue("$label: the client started the three connections", deadline) { handshakes().size >= handshakesAtClose + 3 }
@@ -4112,7 +4112,7 @@ class PremiumGraphCutoverAcceptanceTest {
                 // The next 3m request captures E2 and only it uses the KRX half (the screen back on 3m if a new context reset it).
                 if (rig.onMain { holder.currentState().activePeriod } != GraphPeriod.THREE_MONTHS) selectThreeMonths(rig, holder, label, deadline)
                 awaitTrue("$label: a 3m request with the E2 capture is sent", deadline) {
-                    threeMonthEpochs.drop(callsHidden).any { it == (true to e2) }
+                    synchronized(threeMonthEpochs) { threeMonthEpochs.drop(callsHidden).any { it == (true to e2) } }
                 }
                 awaitTrue("$label: its KRX is written under E2", deadline) { krxDir(e2) in rig.writtenFiles() }
                 awaitTrue("$label: the slot's KRX key is E2 and the protected read has KRX", deadline) {
@@ -4129,9 +4129,9 @@ class PremiumGraphCutoverAcceptanceTest {
                 }
                 assertTrue("$label: the protected read's KRX is the E2 answer's ($readKrx)",
                     readKrx.isNotEmpty() && readKrx.all { it in krxOf(e2Body) } && readKrx.none { it in krxOf(controlBody) })
-                println("CUT-C01 $label 3m capture epochs:${threeMonthEpochs.map { it.second?.let { e -> if (e == e1) "E1" else if (e == e2) "E2" else "other" } ?: "null" }}")
+                println("CUT-C01 $label 3m capture epochs:${synchronized(threeMonthEpochs) { threeMonthEpochs.toList() }.map { it.second?.let { e -> if (e == e1) "E1" else if (e == e2) "E2" else "other" } ?: "null" }}")
                 assertTrue("$label: no 3m request after the rotation captured E1",
-                    threeMonthEpochs.drop(calls3m).none { it.second == e1 })
+                    synchronized(threeMonthEpochs) { threeMonthEpochs.drop(calls3m).none { it.second == e1 } })
                 rig.awaitTopics(deadline)
                 awaitTrue("$label: the tabs settle", deadline) { graph().all { it.bodyEnd != null } }
                 awaitTrue("$label: the server and the recorder agree", deadline) {
