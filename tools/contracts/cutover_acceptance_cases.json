@@ -28,8 +28,20 @@
     "B06c two concurrent closes both return and nothing after them sends, records or reports",
     "B06d a worker failure closes the sink pipeline and nothing else",
     "RT01-A03 the published fence follows the delivery from before issuance through a held delivery to an end delivered alone",
+    "RT01-A04 observed a user P4 hold keeps the data and demand unused and its release resumes on a new lifetime",
+    "RT01-A04 unobserved a user P4 hold the consumers never see resumes on a new lifetime the same way",
     "RT01-A05 merged a same-user end merged into its new grant discards the old context the same way",
     "RT01-A05 separate a same-user end delivered apart from its new grant discards the old context",
+    "RT01-A07 a capability P4 hold blocks KRX alone",
+    "RT01-A07 a confirmed deletion blocks every graph use",
+    "RT01-A07 a deletion being requested blocks every graph use",
+    "RT01-A07 a pending answer keeps the grant and its capability",
+    "RT01-A07 a user P4 hold blocks every graph use",
+    "RT01-A07 an explicit capability seal blocks KRX alone",
+    "RT01-A07 an undecidable 5xx keeps the grant and its capability",
+    "RT01-A07 pending with no grant blocks every graph use",
+    "RT01-A07 resolving blocks every graph use",
+    "RT01-A08 a held user keeps its control queries and floor while the graph stays unused",
     "RT01-A10 a parked refusal leaves the graph allowed until the issuer publishes the user end and nothing after it"
   ]
 }

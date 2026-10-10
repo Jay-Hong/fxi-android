@@ -102,6 +102,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotSame
@@ -307,6 +308,8 @@ class PremiumGraphCutoverAcceptanceTest {
      */
     private class TargetedFault {
         private val armed = java.util.concurrent.atomic.AtomicReference<Pair<Exception, (StackTraceElement) -> Boolean>?>(null)
+        /** B1 seal: while true, every matching call fails (until [disarm]); otherwise the first one only. */
+        @Volatile private var persistent = false
         val hits: MutableList<String> = Collections.synchronizedList(mutableListOf())
         val thrown: MutableList<Throwable> = Collections.synchronizedList(mutableListOf())
         val spent: Boolean get() = armed.get() == null
@@ -315,10 +318,20 @@ class PremiumGraphCutoverAcceptanceTest {
             check(armed.compareAndSet(null, failure to frame)) { "already armed" }
         }
 
+        fun armPersistent(failure: Exception, frame: (StackTraceElement) -> Boolean) {
+            persistent = true
+            arm(failure, frame)
+        }
+
+        fun disarm() {
+            persistent = false
+            armed.set(null)
+        }
+
         fun throwIfTargeted() {
             val current = armed.get() ?: return
             val frames = Thread.currentThread().stackTrace
-            if (frames.any(current.second) && armed.compareAndSet(current, null)) {
+            if (frames.any(current.second) && (persistent || armed.compareAndSet(current, null))) {
                 hits += Thread.currentThread().name + ": " +
                     frames.take(18).joinToString(" < ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
                 thrown += current.first
@@ -395,9 +408,11 @@ class PremiumGraphCutoverAcceptanceTest {
         val storeRotationFault = TargetedFault()
         /** B1: while false, only the issuer's candidate recovery reads no live identity; its answer decisions read it as usual. */
         @Volatile var recoveryIdentityReadable = true
+        /** B1: how many candidate recovery identity reads that fault answered unreadable (the recovery's IdentityUnknown). */
+        val recoveryIdentityDenials = AtomicInteger()
         /** The issuer on its production scope: a SupervisorJob on Default, independent of Main. */
         val coordinator = budgetCoordinator(api, provider, CoroutineScope(issuerJob + Dispatchers.Default), epochStore,
-            { issuerIdentityReadable }, { recoveryIdentityReadable })
+            { issuerIdentityReadable }, { recoveryIdentityReadable }, { recoveryIdentityDenials.incrementAndGet() })
         val uses = SnapshotTopicUseAuthority { coordinator.accessSnapshot }
         val tabs = Tabs(FreeTab.USD)
         val reports: MutableList<Throwable> = Collections.synchronizedList(mutableListOf())
@@ -585,7 +600,8 @@ class PremiumGraphCutoverAcceptanceTest {
         scope: CoroutineScope,
         store: AccessEpochStore,
         identityReadable: () -> Boolean,
-        recoveryIdentityReadable: () -> Boolean = { true }
+        recoveryIdentityReadable: () -> Boolean = { true },
+        onRecoveryDenied: () -> Unit = {}
     ): PremiumAccessCoordinator {
         // The production binding for both purgers: it answers Deferred, so every journal entry stays owed.
         val purger = UnimplementedScopePurger()
@@ -598,7 +614,7 @@ class PremiumGraphCutoverAcceptanceTest {
                         !identityReadable() -> null
                         // Read before any suspension, so the stack is the caller's: the candidate recovery's own check only.
                         !recoveryIdentityReadable() &&
-                            Thread.currentThread().stackTrace.any { it.methodName == "checkCandidateLocked" } -> null
+                            Thread.currentThread().stackTrace.any { it.methodName == "checkCandidateLocked" } -> null.also { onRecoveryDenied() }
                         else -> real.currentIdentity()
                     }
                 }
@@ -1969,6 +1985,634 @@ class PremiumGraphCutoverAcceptanceTest {
         ColdStartBudget.assertWithin(judgeRow("RT01-A10"))
     }
 
+    // --- CUT-C01 batch 1b: RT01-A04 (cut_c01_b1_agreed.r1.md) ---------------------------------------------------------------
+
+    private val premiumKrxVisible = """{"krx_visible":true,"premium_active":true}"""
+
+    /** The issuer's own answer decision, by name or as its resumed continuation. */
+    private fun isIssuerDecision(frame: StackTraceElement) =
+        frame.className.startsWith("com.jay.fxi.data.entitlements.PremiumAccessCoordinator") &&
+            (frame.methodName == "apply" || frame.className.contains("\$apply\$"))
+
+    /**
+     * RT01-A04 (cut_c01_b1_agreed.r1.md A04): a USER P4 hold and its release without a USER end. From KRX VISIBLE with data and
+     * an unmet closed recovery demand, a USER loss answer is decided with the issuer's identity unreadable and the decision's
+     * store read failing once: the loss is held as a candidate (LOSS_CANDIDATE). Only the candidate recovery's identity read
+     * then stays unreadable, so the hold stands while answers decide again; a FORCE_PREMIUM answer that keeps premium and drops
+     * KRX rotates the capability epoch, and the candidate, whose record fence moved, is released without a USER end. The
+     * release is reported as one that came with a capability rotation, never as a pure round trip on the same fence and token.
+     * [observed]: the consumers see the hold (no use, data and demand kept, a late answer not applied). Not [observed]: Main and
+     * the topic executor are held from the hold's start to its release, and the consumers never process a hold revision.
+     * Both: after it, a new lifetime only (the old one refused, the invalidations raised), GENERAL kept and KRX removed, the
+     * old 3m answer never applied.
+     */
+    private fun userHoldRow(label: String, observed: Boolean) = runBlocking {
+        val prepared = clearOfBoundary(70_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 60_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val hold3m = java.util.concurrent.CountDownLatch(1)
+        // From the capture before the hold until the preservation is compared after the release, every new catalog, 1d and
+        // 3m answer (a refill, the holder's active period re-requested, a recovery) waits here; the old 3m answer apart.
+        val gateRefill = java.util.concurrent.atomic.AtomicBoolean(false)
+        val refillGate = java.util.concurrent.CountDownLatch(1)
+        val threeMonthCalls = AtomicInteger()
+        val krxVisible = java.util.concurrent.atomic.AtomicBoolean(true)
+        val rig = Rig()
+        try {
+            rig.row {
+                rig.prepareClosedDemand(deadline, krx = true)
+                onCatalog = {
+                    if (gateRefill.get()) refillGate.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                    ok(fixture(if (krxVisible.get()) "catalog-krx-visible.json" else "catalog-krx-hidden.json"))
+                }
+                onTab = { request ->
+                    if (request.requestUrl!!.queryParameter("period") == "3m" && threeMonthCalls.getAndIncrement() == 0) {
+                        hold3m.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("usd-3m-krx-visible.json"))
+                    } else {
+                        if (gateRefill.get()) refillGate.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                        val period = if (request.requestUrl!!.queryParameter("period") == "3m") "3m" else "1d"
+                        ok(fixture("usd-$period-krx-${if (krxVisible.get()) "visible" else "hidden"}.json"))
+                    }
+                }
+                val holder = checkNotNull(rig.onMain { rig.mount?.holders?.value?.get("usd") })
+                val f1 = checkNotNull(rig.bridge())
+                val lifetime1 = checkNotNull(rig.uses.acquire(f1))
+                val pendingBefore = rig.kbClosedPending()
+                assertTrue("premise: an unmet closed demand", pendingBefore.isNotEmpty())
+                val recordBefore = rig.epochStore.load()
+                val endsBefore = rig.coordinator.accessSnapshot.lastUserEnd?.sequence ?: 0L
+                val capEndsBefore = rig.coordinator.accessSnapshot.lastCapabilityEnd?.sequence ?: 0L
+                val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+                rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the old lifetime's 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.end == null } }
+                // The screen action under the hold uses the 3m token the screen offers just before it (a period change renews it).
+                awaitTrue("$label: the screen offers a 3m token", deadline) {
+                    rig.onMain { holder.currentState().inlineToken?.period == GraphPeriod.THREE_MONTHS }
+                }
+                // From here no new answer is applied until the comparison after the release.
+                gateRefill.set(true)
+                val token3m = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+                val usd1d = rig.onMain { rig.assembly.coordinator.state.value.entries.keys.single { it.tab == "usd" && it.period.code == "1d" } }
+                val generalBefore = rig.onMain {
+                    checkNotNull(rig.assembly.coordinator.protectedEntry(usd1d)).tab.graph.series.filterNot { it.seriesId.startsWith("krx.") }
+                }
+                assertTrue("$label: premise: GENERAL content with kb.usd before the hold", generalBefore.any { it.seriesId == "kb.usd" })
+                val slotBefore = checkNotNull(rig.onMain { rig.slotComponents(usd1d) })
+                assertNotNull("$label: premise: the 1d slot holds KRX before the hold", slotBefore.krx)
+                val pendingAtHold = rig.kbClosedPending()
+                assertEquals("$label: premise: the closed demand is the prepared one", pendingBefore, pendingAtHold)
+                // Answers completed apart from the old 3m: none may complete between this capture and the comparison.
+                val answersCompleted = {
+                    tabs().count { it.bodyEnd != null } - (if (tabs().first { it.param("period") == "3m" }.bodyEnd != null) 1 else 0) +
+                        catalogs().count { it.bodyEnd != null }
+                }
+                val answersAtCapture = answersCompleted()
+                val graphBeforeHold = graph().size
+                // Every request source the graph coordinator publishes from here: a consumer that processes the hold publishes
+                // none (no use can be acquired under it).
+                val sourcesSinceHold = Collections.synchronizedList(mutableListOf<Any?>())
+                val sourceCollector = rig.onMain {
+                    CoroutineScope(rig.ownerJob + Dispatchers.Unconfined).launch {
+                        rig.assembly.coordinator.state.drop(1).collect { sourcesSinceHold += it.source?.fence }
+                    }
+                }
+
+                assertEquals("$label: premise: the 3m token is the screen's just before the hold", token3m,
+                    rig.onMain { holder.currentState().inlineToken })
+                // Unobserved: the consumers are held from before the hold to after its release.
+                val mainHold = if (observed) null else holdMain()
+                val runtimeHold = if (observed) null else try { rig.holdRuntime() } catch (failure: Throwable) { mainHold?.release(); throw failure }
+                try {
+                    // The hold: a USER loss decided while the identity cannot be read, its decision's store read failing once.
+                    val failure = java.io.IOException("access record unreadable")
+                    rig.storeLoadFault.arm(failure) { isIssuerDecision(it) }
+                    rig.issuerIdentityReadable = false
+                    entitlements += ok("""{"krx_visible":true,"premium_active":false,"premium_pending":false}""")
+                    kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                    assertEquals("$label: the decision's read failed once, as that instance: ${rig.storeLoadFault.hits}",
+                        listOf<Throwable>(failure), rig.storeLoadFault.thrown.toList())
+                    assertTrue("$label: inside the issuer's decision", rig.storeLoadFault.hits.single().contains("apply"))
+                    assertEquals("$label: one candidate held", 1, rig.coordinator.heldLossCandidateCount())
+                    assertTrue("$label: the snapshot holds the user", com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in
+                        rig.coordinator.accessSnapshot.facts.userBlocks)
+                    // Only the candidate recovery stays blind; answers decide with the identity again. A recovery round must
+                    // actually meet the unreadable identity (its IdentityUnknown) and leave the hold standing.
+                    val deniedBefore = rig.recoveryIdentityDenials.get()
+                    rig.recoveryIdentityReadable = false
+                    rig.issuerIdentityReadable = true
+                    awaitTrue("$label: a candidate recovery round met the unreadable identity", deadline) {
+                        rig.recoveryIdentityDenials.get() > deniedBefore
+                    }
+                    assertEquals("$label: the hold stands after the recovery's IdentityUnknown", 1, rig.coordinator.heldLossCandidateCount())
+                    assertTrue("$label: the snapshot still holds the user", com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in
+                        rig.coordinator.accessSnapshot.facts.userBlocks)
+
+                    if (observed) {
+                        // The consumers see the hold: no use, no render, nothing applied; data and demand kept.
+                        rig.onMain {
+                            assertNull("$label: no protected read under the hold",
+                                rig.assembly.coordinator.state.value.entries.keys.firstNotNullOfOrNull { rig.assembly.coordinator.protectedEntry(it) })
+                            assertNull("$label: nothing renders under the hold", holder.currentState().chart)
+                            assertNull("$label: the screen offers no token under the hold", holder.currentState().inlineToken)
+                            holder.selectPeriod(token3m, GraphPeriod.ONE_WEEK)
+                        }
+                        hold3m.countDown()
+                        awaitTrue("$label: the old 3m answer ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                        val until = nowMillis() + 1_500
+                        while (nowMillis() < until) {
+                            assertEquals("$label: no graph send under the hold\n${sends.timeline()}", graphBeforeHold, graph().size)
+                            assertTrue("$label: the old 3m answer is not applied under the hold",
+                                rig.assembly.coordinator.state.value.entries.keys.none { it.period.code == "3m" })
+                            delay(50)
+                        }
+                        assertEquals("$label: the closed demand is kept under the hold", pendingBefore, rig.kbClosedPending())
+                        // The positive control, taken before the release: the consumer processed the hold itself.
+                        val duringHold = synchronized(sourcesSinceHold) { sourcesSinceHold.toList() }
+                        assertTrue("$label: the consumer saw the hold before the release (a source-less publication): $duringHold",
+                            null in duringHold)
+                    }
+
+                    // The release: premium kept, KRX dropped — the capability epoch rotates and the candidate goes stale.
+                    krxVisible.set(false)
+                    entitlements += ok(PREMIUM_HIDDEN)
+                    kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                    awaitTrue("$label: the candidate was released", deadline) {
+                        rig.coordinator.heldLossCandidateCount() == 0 &&
+                            com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE !in rig.coordinator.accessSnapshot.facts.userBlocks
+                    }
+                    if (!observed) {
+                        // The topic executor first, until the final grant is delivered; only then Main, so the consumers see the
+                        // final state alone.
+                        checkNotNull(runtimeHold).release()
+                        val final = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                        awaitTrue("$label: the final grant is delivered while Main is held", deadline) { rig.bridge() == final }
+                        checkNotNull(mainHold).release()
+                    }
+                } finally {
+                    rig.recoveryIdentityReadable = true
+                    rig.issuerIdentityReadable = true
+                    try {
+                        runtimeHold?.release()
+                    } finally {
+                        mainHold?.release()
+                        hold3m.countDown()
+                    }
+                }
+                val snapshot = rig.coordinator.accessSnapshot
+                val recordAfter = rig.epochStore.load()
+                assertEquals("$label: no USER end", endsBefore, snapshot.lastUserEnd?.sequence ?: 0L)
+                assertEquals("$label: the USER epoch is unchanged", recordBefore.userAccessEpoch, recordAfter.userAccessEpoch)
+                assertNotEquals("$label: the capability epoch rotated", recordBefore.krxCapabilityEpoch, recordAfter.krxCapabilityEpoch)
+                assertTrue("$label: a capability end was recorded", (snapshot.lastCapabilityEnd?.sequence ?: 0L) > capEndsBefore)
+
+                // After it: a new lifetime only; GENERAL kept, KRX removed; the old 3m answer never applied.
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                awaitTrue("$label: the new grant's context is consumed", deadline) {
+                    rig.bridge() == f2 && rig.assembly.coordinator.state.value.source?.fence == f2
+                }
+                val lifetime2 = checkNotNull(rig.uses.acquire(f2))
+                assertNotEquals("$label: a new lifetime", lifetime1, lifetime2)
+                sourceCollector.cancelAndJoin()
+                val published = synchronized(sourcesSinceHold) { sourcesSinceHold.toList() }
+                assertTrue("$label: the consumer published the new grant's source: $published", f2 in published)
+                if (!observed) {
+                    assertFalse("$label: the consumer never processed a hold revision (no source-less publication): $published", null in published)
+                }
+                assertTrue("$label: the invalidations rose (${lifetime1.invalidations} -> ${snapshot.userInvalidations})",
+                    snapshot.userInvalidations > lifetime1.invalidations)
+                assertFalse("$label: the old lifetime is refused", rig.uses.admits(lifetime1))
+                awaitTrue("$label: the old 3m answer ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                val until = nowMillis() + 1_000
+                while (nowMillis() < until) {
+                    assertTrue("$label: the old 3m answer is never applied (a new 3m request, if any, is still held)",
+                        rig.assembly.coordinator.state.value.entries.keys.none { it.period.code == "3m" })
+                    delay(20)
+                }
+                // Before any refill: the GENERAL content captured before the hold, unchanged; KRX removed; the closed demand kept.
+                awaitTrue("$label: the new lifetime reads the 1d entry with KRX removed", deadline) {
+                    rig.onMain {
+                        rig.assembly.coordinator.protectedEntry(usd1d)?.tab?.graph?.series?.none { it.seriesId.startsWith("krx.") } == true
+                    }
+                }
+                val generalAfter = rig.onMain { checkNotNull(rig.assembly.coordinator.protectedEntry(usd1d)).tab.graph.series }
+                assertEquals("$label: GENERAL kept as it was before the hold (no refill yet)", generalBefore, generalAfter)
+                val (entryKept, slotAfter) = rig.onMain { (usd1d in rig.assembly.coordinator.state.value.entries) to rig.slotComponents(usd1d) }
+                assertTrue("$label: the 1d entry stays in the coordinator (no drop and reload)", entryKept)
+                assertSame("$label: the in-memory GENERAL component is the one from before the hold", slotBefore.general, slotAfter?.general)
+                assertNull("$label: the in-memory KRX component is removed", slotAfter?.krx)
+                assertEquals("$label: the closed demand kept as it was before the hold", pendingBefore, rig.kbClosedPending())
+                assertEquals("$label: no new answer completed between the capture and the comparison\n${sends.timeline()}",
+                    answersAtCapture, answersCompleted())
+                gateRefill.set(false)
+                refillGate.countDown()
+                assertTrue("$label: the recorder keeps kb.usd", rig.hasKbSeries())
+                rig.awaitTopics(deadline)
+                quiet("$label settle", 1_000)
+            }
+        } finally {
+            hold3m.countDown()
+            refillGate.countDown()
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 60_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    @Test
+    fun `RT01-A04 observed a user P4 hold keeps the data and demand unused and its release resumes on a new lifetime`() =
+        userHoldRow("RT01-A04 observed", observed = true)
+
+    @Test
+    fun `RT01-A04 unobserved a user P4 hold the consumers never see resumes on a new lifetime the same way`() =
+        userHoldRow("RT01-A04 unobserved", observed = false)
+
+    // --- CUT-C01 batch 1b: RT01-A07 (cut_c01_b1_agreed.r1.md A07) --------------------------------------------------------
+
+    /**
+     * What the graph does in one access state: GENERAL/KRX protected read; the screen's GENERAL and KRX render (renderedIds) and
+     * whether its prepared data still holds KRX; a screen action's send; the components applied.
+     */
+    private data class AccessMatrix(
+        val generalRead: Boolean, val krxRead: Boolean, val generalRender: Boolean, val krxRender: Boolean, val krxPrepared: Boolean,
+        val send: Boolean, val generalApplied: Boolean, val krxApplied: Boolean,
+        /** The recorder's exposure under the pre-state fence and lifetime (its data is kept under a hold). */
+        val recorderRead: Boolean,
+        /** Whether the topic use authority lets a new use start under the delivered fence (deletion is the graph's admission, not this). */
+        val useStarts: Boolean,
+        /** Whether the released 3m answer's KRX component reached the disk. */
+        val krxWritten: Boolean,
+        /** The in-state (released 3m) answer: its KRX in a protected read, and the screen moved to 3m rendering GENERAL and KRX. */
+        val krxInStateRead: Boolean, val generalInStateRender: Boolean, val krxInStateRender: Boolean
+    )
+
+    private enum class AccessCase {
+        RESOLVING, PENDING_NO_GRANT, KEPT_PENDING, KEPT_5XX, DELETION_REQUESTING, DELETION_DELETED, USER_P4, CAPABILITY_P4, CAPABILITY_SEAL
+    }
+
+    /** The design §4 table: blocked; kept grant allowed with its capability; capability-only blocks KRX alone. */
+    private fun expected(case: AccessCase): AccessMatrix = when (case) {
+        AccessCase.KEPT_PENDING, AccessCase.KEPT_5XX -> AccessMatrix(true, true, true, true, true, true, true, true,
+            recorderRead = true, useStarts = true, krxWritten = true, krxInStateRead = true, generalInStateRender = true, krxInStateRender = true)
+        AccessCase.CAPABILITY_P4, AccessCase.CAPABILITY_SEAL -> AccessMatrix(true, false, true, false, false, true, true, false,
+            recorderRead = true, useStarts = true, krxWritten = false, krxInStateRead = false, generalInStateRender = true, krxInStateRender = false)
+        AccessCase.DELETION_REQUESTING, AccessCase.DELETION_DELETED -> AccessMatrix(false, false, false, false, false, false, false, false,
+            recorderRead = false, useStarts = true, krxWritten = false, krxInStateRead = false, generalInStateRender = false, krxInStateRender = false)
+        else -> AccessMatrix(false, false, false, false, false, false, false, false,
+            recorderRead = false, useStarts = false, krxWritten = false, krxInStateRead = false, generalInStateRender = false, krxInStateRender = false)
+    }
+
+    /**
+     * RT01-A07: one access state on the production composition. From KRX VISIBLE with an applied usd 1d (GENERAL and KRX), KRX
+     * selected on the screen by a real toggle and rendered, and a 3m tab in flight with its answer held, the state is entered by
+     * real inputs (and, for P4 and the seal, the agreed targeted store faults); then: GENERAL and KRX protected reads of the 1d,
+     * the screen's GENERAL and KRX render and its prepared KRX data, a send for a screen action with the pre-state token (a
+     * never-fetched period), and — once the held 3m answer is released inside the state — whether its GENERAL entry and its KRX
+     * component were applied. The result is compared with the design §4 table. The seal's rotation write fault stays armed to
+     * the end; each failure is attributed to the first decision or to the seal-keeping recovery.
+     */
+    private fun accessStateRow(case: AccessCase) = runBlocking {
+        val label = "RT01-A07 $case"
+        val start = nowMillis()
+        val deadline = start + 50_000
+        entitlements += ok(premiumKrxVisible)
+        val hold3m = java.util.concurrent.CountDownLatch(1)
+        val holdDelete = java.util.concurrent.CountDownLatch(1)
+        onCatalog = { ok(fixture("catalog-krx-visible.json")) }
+        onTab = { request ->
+            when (request.requestUrl!!.queryParameter("period")) {
+                "3m" -> { hold3m.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("usd-3m-krx-visible.json")) }
+                "1w" -> ok(fixture("usd-3m-krx-visible.json")) // a screen action's send: counted, its answer not judged
+                else -> ok(fixture("usd-1d-krx-visible.json"))
+            }
+        }
+        val rig = Rig()
+        val deletion = java.util.concurrent.atomic.AtomicReference<Job?>(null)
+        val resolving = java.util.concurrent.atomic.AtomicReference<Job?>(null)
+        val sealFailure = java.io.IOException("access record write failed")
+        try {
+            rig.row {
+                val holder = checkNotNull(rig.coldStart(deadline))
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: catalog and the usd tab applied", deadline) { rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+                val usd1d = rig.onMain { rig.assembly.coordinator.state.value.entries.keys.single { it.tab == "usd" && it.period.code == "1d" } }
+                rig.onMain {
+                    val ids = checkNotNull(rig.assembly.coordinator.protectedEntry(usd1d)).tab.graph.series.map { it.seriesId }
+                    assertTrue("$label: premise: GENERAL and KRX readable before the state: $ids", "kb.usd" in ids && "krx.usd-krw-futures" in ids)
+                }
+                // Each screen action uses the token the screen shows at that moment (a period change renews it).
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.end == null } }
+                awaitTrue("$label: the screen offers a 3m token", deadline) {
+                    rig.onMain { holder.currentState().inlineToken?.period == GraphPeriod.THREE_MONTHS }
+                }
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.ONE_DAY) }
+                awaitTrue("$label: the screen is back on the 1d chart", deadline) {
+                    rig.onMain { holder.currentState().let { it.activePeriod == GraphPeriod.ONE_DAY && it.chart != null && it.inlineToken?.period == GraphPeriod.ONE_DAY } }
+                }
+                // KRX selected by a real screen action and rendered, so its render can be judged in the state.
+                val krxId = "krx.usd-krw-futures"
+                rig.onMain { holder.toggleSeries(checkNotNull(holder.currentState().inlineToken), krxId) }
+                awaitTrue("$label: premise: the toggled KRX is rendered and prepared beside GENERAL", deadline) {
+                    rig.onMain {
+                        holder.currentState().chart?.let { chart ->
+                            krxId in chart.renderedIds && chart.renderedIds.any { !it.startsWith("krx.") } && krxId in chart.prepared.bySeries
+                        } == true
+                    }
+                }
+                // The token, fence and lifetime valid just before the state; the recorder's data under them.
+                val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+                awaitTrue("$label: an acknowledged socket", deadline) { openSockets.isNotEmpty() }
+                openSockets.last().send(usdSnapshot(1390.0))
+                awaitTrue("$label: the WS delivery recorded kb.usd", deadline) { rig.hasKbSeries() }
+                val fenceBefore = checkNotNull(rig.bridge())
+                val lifetimeBefore = checkNotNull(rig.uses.acquire(fenceBefore))
+                val userEndsBefore = rig.coordinator.accessSnapshot.lastUserEnd?.sequence ?: 0L
+                val capEndsBefore = rig.coordinator.accessSnapshot.lastCapabilityEnd?.sequence ?: 0L
+
+                // Enter the state.
+                when (case) {
+                    AccessCase.RESOLVING, AccessCase.PENDING_NO_GRANT -> {
+                        entitlementsGate = java.util.concurrent.CountDownLatch(1)
+                        val next = rig.firebase.nextGeneration()
+                        rig.coordinator.onIdentityChanged(next)
+                        if (case == AccessCase.PENDING_NO_GRANT) {
+                            entitlementsGate?.countDown(); entitlementsGate = null
+                            entitlements += ok("""{"krx_visible":true,"premium_pending":true,"retry_after_seconds":60}""")
+                            kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                            assertTrue("$label: premise: pending with no grant (${rig.coordinator.state.value.state})",
+                                rig.coordinator.state.value.state is PremiumAccessState.Pending && rig.coordinator.topicGrantResult().fence == null)
+                        } else {
+                            // Resolving: the new identity's decision is in flight, its answer held at the server.
+                            entitlements += ok(premiumKrxVisible)
+                            resolving.set(CoroutineScope(rig.ioJob + Dispatchers.IO).launch {
+                                runCatching { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                            })
+                            awaitTrue("$label: the new identity's entitlements answer is held", deadline) { entitlementsHeld.get() >= 1 }
+                            assertEquals("$label: premise: resolving", PremiumAccessState.NoGrant, rig.coordinator.state.value.state)
+                        }
+                    }
+                    AccessCase.KEPT_PENDING, AccessCase.KEPT_5XX -> {
+                        entitlements += if (case == AccessCase.KEPT_PENDING) ok("""{"krx_visible":true,"premium_pending":true,"retry_after_seconds":60}""")
+                        else MockResponse().setResponseCode(503).setBody("""{"detail":"unavailable"}""")
+                        kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                        assertEquals("$label: premise: the grant is kept", PremiumAccessState.PremiumConfirmed, rig.coordinator.state.value.state)
+                    }
+                    AccessCase.DELETION_REQUESTING, AccessCase.DELETION_DELETED -> {
+                        onDelete = {
+                            if (case == AccessCase.DELETION_REQUESTING) holdDelete.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                            MockResponse().setResponseCode(204)
+                        }
+                        val owner = checkNotNull(rig.provider.currentIdentityFence())
+                        deletion.set(CoroutineScope(rig.ioJob + Dispatchers.IO).launch {
+                            runCatching { com.jay.fxi.ui.settings.AccountDeletionServerStage(rig.api, rig.deletions).execute(owner) { it } }
+                        })
+                        val phase = if (case == AccessCase.DELETION_REQUESTING) com.jay.fxi.data.entitlements.DeletionAdmissionPhase.REQUESTING_SERVER
+                        else com.jay.fxi.data.entitlements.DeletionAdmissionPhase.SERVER_DELETED
+                        awaitTrue("$label: the deletion admission is $phase", deadline) { rig.deletions.records.any { it.phase == phase } }
+                    }
+                    AccessCase.USER_P4, AccessCase.CAPABILITY_P4 -> {
+                        val failure = java.io.IOException("access record unreadable")
+                        rig.storeLoadFault.arm(failure) { isIssuerDecision(it) }
+                        rig.issuerIdentityReadable = false
+                        entitlements += if (case == AccessCase.USER_P4) ok("""{"krx_visible":true,"premium_active":false,"premium_pending":false}""")
+                        else ok(PREMIUM_HIDDEN)
+                        kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                        assertEquals("$label: the decision's read failed once", listOf<Throwable>(failure), rig.storeLoadFault.thrown.toList())
+                        assertEquals("$label: one candidate held", 1, rig.coordinator.heldLossCandidateCount())
+                        val deniedBefore = rig.recoveryIdentityDenials.get()
+                        rig.recoveryIdentityReadable = false
+                        rig.issuerIdentityReadable = true
+                        awaitTrue("$label: a candidate recovery round met the unreadable identity", deadline) {
+                            rig.recoveryIdentityDenials.get() > deniedBefore
+                        }
+                        val facts = rig.coordinator.accessSnapshot.facts
+                        val blocks = if (case == AccessCase.USER_P4) facts.userBlocks else facts.capabilityBlocks
+                        assertTrue("$label: premise: the hold is published ($facts)", com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in blocks)
+                    }
+                    AccessCase.CAPABILITY_SEAL -> {
+                        rig.storeRotationFault.armPersistent(sealFailure) { it.methodName == "beginRotation" || it.className.contains("\$beginRotation\$") }
+                        entitlements += ok(PREMIUM_HIDDEN)
+                        kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                        val facts = rig.coordinator.accessSnapshot.facts
+                        assertEquals("$label: the first rotation write failed in the decision",
+                            listOf(SealPath.DECISION), rig.storeRotationFault.hits.toList().map(::sealPath).take(1))
+                        assertTrue("$label: premise: the capability is explicitly sealed ($facts)",
+                            com.jay.fxi.data.entitlements.TopicAccessBlock.EXPLICIT_SEAL in facts.capabilityBlocks && facts.userAllowed)
+                    }
+                }
+
+                // Measure.
+                rig.onMain {
+                    val st = holder.currentState()
+                    println("CUT-C01 $label holder: content=${st.content} chart=${st.chart != null} inline=${st.inlineToken} preStateToken=$token period=${st.activePeriod} refreshing=${st.refreshing} owner=${rig.owner.consumer.currentState().ui.owner != null}")
+                }
+                val (generalRead, krxRead) = rig.onMain {
+                    val ids = rig.assembly.coordinator.protectedEntry(usd1d)?.tab?.graph?.series?.map { it.seriesId }.orEmpty()
+                    ("kb.usd" in ids) to ids.any { it.startsWith("krx.") }
+                }
+                val (generalRender, krxRender, krxPrepared) = rig.onMain {
+                    val chart = holder.currentState().chart
+                    Triple(chart != null && chart.renderedIds.any { !it.startsWith("krx.") }, chart?.renderedIds?.contains(krxId) == true,
+                        chart?.prepared?.bySeries?.keys?.any { it.startsWith("krx.") } == true)
+                }
+                val recorderRead = rig.onMain { rig.assembly.recorder.exposed(fenceBefore, lifetimeBefore).isNotEmpty() }
+                val useStarts = rig.bridge()?.let { rig.uses.acquire(it) } != null
+                val graphBefore = graph().size
+                rig.onMain { holder.selectPeriod(token, GraphPeriod.ONE_WEEK) }
+                delay(1_500)
+                val send = graph().drop(graphBefore).any { it.param("period") == "1w" }
+                val krx3m = { rig.writtenFiles().any { it.startsWith("krx/") && it.endsWith("/757364/3m.json") } }
+                assertFalse("$label: premise: no KRX 3m file before the answer", krx3m())
+                hold3m.countDown()
+                awaitTrue("$label: the held 3m answer ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                delay(1_000)
+                val (generalApplied, krxApplied, krxInStateRead) = rig.onMain {
+                    val c = rig.assembly.coordinator
+                    val key = c.state.value.entries.keys.firstOrNull { it.tab == "usd" && it.period.code == "3m" }
+                    val components = key?.let { rig.slotComponents(it) }
+                    val read = key?.let { c.protectedEntry(it) }?.tab?.graph?.series?.any { it.seriesId.startsWith("krx.") } == true
+                    Triple(key != null, components?.krx != null, read)
+                }
+                // The in-state answer on the screen: move to 3m with the token the screen offers now, if it offers one.
+                val moved = rig.onMain {
+                    holder.currentState().inlineToken?.let { holder.selectPeriod(it, GraphPeriod.THREE_MONTHS); true } ?: false
+                }
+                val inStateChart = if (!moved) null else {
+                    val until = nowMillis() + 2_000
+                    var chart: com.jay.fxi.ui.premium.graph.GraphV2ChartModel? = null
+                    while (chart == null && nowMillis() < until) {
+                        chart = rig.onMain { holder.currentState().takeIf { it.activePeriod == GraphPeriod.THREE_MONTHS }?.chart }
+                        if (chart == null) delay(20)
+                    }
+                    chart
+                }
+                val generalInStateRender = inStateChart?.renderedIds?.any { !it.startsWith("krx.") } == true
+                val krxInStateRender = inStateChart?.renderedIds?.contains(krxId) == true
+                val measured = AccessMatrix(generalRead, krxRead, generalRender, krxRender, krxPrepared, send, generalApplied, krxApplied,
+                    recorderRead, useStarts, krx3m(), krxInStateRead, generalInStateRender, krxInStateRender)
+                println("CUT-C01 $label matrix: $measured")
+                assertEquals("$label: the design §4 matrix", expected(case), measured)
+                if (case == AccessCase.CAPABILITY_SEAL) {
+                    // To the end of the measurement, after the late answer and the write check: still sealed, the user allowed.
+                    val facts = rig.coordinator.accessSnapshot.facts
+                    assertTrue("$label: the seal holds to the end ($facts)",
+                        com.jay.fxi.data.entitlements.TopicAccessBlock.EXPLICIT_SEAL in facts.capabilityBlocks && facts.userAllowed)
+                    val hits = rig.storeRotationFault.hits.toList()
+                    val thrown = rig.storeRotationFault.thrown.toList()
+                    val paths = hits.map(::sealPath)
+                    println("CUT-C01 $label rotation write failures: ${paths.groupingBy { it }.eachCount()} of ${hits.size}\n" + hits.joinToString("\n"))
+                    assertEquals("$label: every failure recorded once with its call path", hits.size, thrown.size)
+                    assertTrue("$label: every failure is the armed instance", thrown.all { it === sealFailure })
+                    assertTrue("$label: every failure is on the decision or the seal-keeping recovery: $hits", SealPath.OTHER !in paths)
+                    assertEquals("$label: the decision failed once, first", 1, paths.count { it == SealPath.DECISION })
+                }
+                if (case == AccessCase.USER_P4 || case == AccessCase.CAPABILITY_P4) {
+                    // To the end of the measurement: still a held candidate, not a confirmed loss.
+                    val snapshot = rig.coordinator.accessSnapshot
+                    val blocks = if (case == AccessCase.USER_P4) snapshot.facts.userBlocks else snapshot.facts.capabilityBlocks
+                    println("CUT-C01 $label recovery identity denials: ${rig.recoveryIdentityDenials.get()}")
+                    assertEquals("$label: the candidate is still held at the end", 1, rig.coordinator.heldLossCandidateCount())
+                    assertTrue("$label: the hold is still published at the end (${snapshot.facts})",
+                        com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in blocks)
+                    assertEquals("$label: no USER end", userEndsBefore, snapshot.lastUserEnd?.sequence ?: 0L)
+                    assertEquals("$label: no capability end", capEndsBefore, snapshot.lastCapabilityEnd?.sequence ?: 0L)
+                }
+                // Release what the state held before the row's close joins the IO work.
+                entitlementsGate?.countDown(); entitlementsGate = null
+                holdDelete.countDown()
+                deletion.get()?.join()
+                resolving.get()?.join()
+            }
+        } finally {
+            hold3m.countDown()
+            holdDelete.countDown()
+            entitlementsGate?.countDown(); entitlementsGate = null
+            rig.storeRotationFault.disarm()
+            deletion.get()?.join()
+            resolving.get()?.join()
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 50_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    private enum class SealPath { DECISION, RECOVERY, OTHER }
+
+    /** The production caller of a failed rotation write: the loss decision's first write, or a loss recovery round. */
+    private fun sealPath(hit: String): SealPath = when {
+        "rotateLossTargetsLocked" in hit && "lossRecoveryRoundLocked" !in hit -> SealPath.DECISION
+        "lossRecoveryRoundLocked" in hit && "rotateLossTargetsLocked" !in hit -> SealPath.RECOVERY
+        else -> SealPath.OTHER
+    }
+
+    @Test fun `RT01-A07 resolving blocks every graph use`() = accessStateRow(AccessCase.RESOLVING)
+    @Test fun `RT01-A07 pending with no grant blocks every graph use`() = accessStateRow(AccessCase.PENDING_NO_GRANT)
+    @Test fun `RT01-A07 a pending answer keeps the grant and its capability`() = accessStateRow(AccessCase.KEPT_PENDING)
+    @Test fun `RT01-A07 an undecidable 5xx keeps the grant and its capability`() = accessStateRow(AccessCase.KEPT_5XX)
+    @Test fun `RT01-A07 a deletion being requested blocks every graph use`() = accessStateRow(AccessCase.DELETION_REQUESTING)
+    @Test fun `RT01-A07 a confirmed deletion blocks every graph use`() = accessStateRow(AccessCase.DELETION_DELETED)
+    @Test fun `RT01-A07 a user P4 hold blocks every graph use`() = accessStateRow(AccessCase.USER_P4)
+    @Test fun `RT01-A07 a capability P4 hold blocks KRX alone`() = accessStateRow(AccessCase.CAPABILITY_P4)
+    @Test fun `RT01-A07 an explicit capability seal blocks KRX alone`() = accessStateRow(AccessCase.CAPABILITY_SEAL)
+
+    // --- CUT-C01 batch 1b: RT01-A08 (cut_c01_b1_agreed.r1.md A08) --------------------------------------------------------
+
+    /**
+     * RT01-A08: under a USER P4 hold kept with the issuer's identity unreadable, a separate real entitlements query answers
+     * pending with KRX visible and an 8 s retry floor. The answer cannot be decided, so the issuer owes a re-check at that floor;
+     * the candidate recovery keeps re-checking on its own (counted apart). The scheduled entitlements send does not go before
+     * the floor and does go after it, and all along the graph reads, renders, sends and applies nothing.
+     */
+    @Test
+    fun `RT01-A08 a held user keeps its control queries and floor while the graph stays unused`() = runBlocking {
+        val label = "RT01-A08"
+        val start = nowMillis()
+        val deadline = start + 50_000
+        entitlements += ok(premiumKrxVisible)
+        val hold3m = java.util.concurrent.CountDownLatch(1)
+        onCatalog = { ok(fixture("catalog-krx-visible.json")) }
+        onTab = { request ->
+            when (request.requestUrl!!.queryParameter("period")) {
+                "3m" -> { hold3m.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("usd-3m-krx-visible.json")) }
+                "1w" -> ok(fixture("usd-3m-krx-visible.json"))
+                else -> ok(fixture("usd-1d-krx-visible.json"))
+            }
+        }
+        val rig = Rig()
+        try {
+            rig.row {
+                val holder = checkNotNull(rig.coldStart(deadline))
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: catalog and the usd tab applied", deadline) { rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+                val usd1d = rig.onMain { rig.assembly.coordinator.state.value.entries.keys.single { it.tab == "usd" && it.period.code == "1d" } }
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.end == null } }
+                awaitTrue("$label: the screen offers a 3m token", deadline) { rig.onMain { holder.currentState().inlineToken?.period == GraphPeriod.THREE_MONTHS } }
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.ONE_DAY) }
+                awaitTrue("$label: back on the 1d chart", deadline) {
+                    rig.onMain { holder.currentState().let { it.activePeriod == GraphPeriod.ONE_DAY && it.chart != null && it.inlineToken?.period == GraphPeriod.ONE_DAY } }
+                }
+                val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+
+                // The USER P4 hold, kept: the identity stays unreadable for every issuer read.
+                val failure = java.io.IOException("access record unreadable")
+                rig.storeLoadFault.arm(failure) { isIssuerDecision(it) }
+                rig.issuerIdentityReadable = false
+                entitlements += ok("""{"krx_visible":true,"premium_active":false,"premium_pending":false}""")
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                assertEquals("$label: the decision's read failed once", listOf<Throwable>(failure), rig.storeLoadFault.thrown.toList())
+                assertEquals("$label: the user is held", 1, rig.coordinator.heldLossCandidateCount())
+                val attemptsBefore = privateField(rig.coordinator, "candidateRecoveryAttempts") as Int
+
+                // A separate real query: pending, KRX visible, an 8 s floor. Undecidable while the identity is unreadable.
+                entitlements += ok("""{"krx_visible":true,"premium_pending":true,"retry_after_seconds":8}""")
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                val answeredAt = checkNotNull(sends.all().last { it.path == "/api/entitlements" }.bodyEnd)
+                val sentBefore = sends.all().count { it.path == "/api/entitlements" }
+                assertEquals("$label: the issuer owes a re-check of that query", RefreshIntent.FORCE_ENTITLEMENTS,
+                    rig.coordinator.recheckDiagnostics().owedIntent)
+                assertEquals("$label: still held", 1, rig.coordinator.heldLossCandidateCount())
+
+                // All along: no graph read, render, send or apply.
+                val graphBefore = graph().size
+                rig.onMain {
+                    assertNull("$label: no protected read", rig.assembly.coordinator.protectedEntry(usd1d))
+                    assertNull("$label: nothing renders", holder.currentState().chart)
+                    holder.selectPeriod(token, GraphPeriod.ONE_WEEK)
+                }
+                hold3m.countDown()
+                awaitTrue("$label: the held 3m answer ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+
+                // The floor: no scheduled send before it, one after it.
+                val floorAt = answeredAt + 8_000
+                while (nowMillis() < floorAt - 300) {
+                    assertEquals("$label: no entitlements send before the floor\n${sends.timeline()}",
+                        sentBefore, sends.all().count { it.path == "/api/entitlements" })
+                    assertEquals("$label: no graph send\n${sends.timeline()}", graphBefore, graph().size)
+                    delay(50)
+                }
+                awaitTrue("$label: the scheduled re-check is sent after the floor", deadline) {
+                    sends.all().count { it.path == "/api/entitlements" } > sentBefore
+                }
+                val scheduled = sends.all().filter { it.path == "/api/entitlements" }.drop(sentBefore).first()
+                assertTrue("$label: not before the floor (${scheduled.start} >= ${floorAt - 50})", scheduled.start >= floorAt - 50)
+                val attemptsAfter = privateField(rig.coordinator, "candidateRecoveryAttempts") as Int
+                println("CUT-C01 $label candidate recovery attempts $attemptsBefore -> $attemptsAfter; entitlements sends ${sends.all().filter { it.path == "/api/entitlements" }.map { it.start }}")
+                assertTrue("$label: the candidate recovery kept re-checking ($attemptsBefore -> $attemptsAfter)", attemptsAfter > attemptsBefore)
+                assertEquals("$label: still held after the floor", 1, rig.coordinator.heldLossCandidateCount())
+                assertEquals("$label: no graph send all along\n${sends.timeline()}", graphBefore, graph().size)
+                assertTrue("$label: the held 3m answer is never applied",
+                    rig.assembly.coordinator.state.value.entries.keys.none { it.period.code == "3m" })
+                rig.onMain { assertNull("$label: still no protected read", rig.assembly.coordinator.protectedEntry(usd1d)) }
+            }
+        } finally {
+            hold3m.countDown()
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 50_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
     /** Waits, before anything starts, until the next 600-second bucket boundary is more than [millis] away. */
     private suspend fun clearOfBoundary(millis: Long): Long {
         val before = nowMillis()
@@ -2303,6 +2947,14 @@ class PremiumGraphCutoverAcceptanceTest {
         return onMain { assembly.recorder.recoveryDemand("usd", fence, lifetime, kotlinx.datetime.Clock.System.now()) }
     }
 
+    /** The graph coordinator's in-memory protected components for [key] (its slot), or null; read on Main. */
+    private fun Rig.slotComponents(key: com.jay.fxi.data.graph.GraphKey): com.jay.fxi.data.graph.GraphV2DiskComponents? {
+        val c = assembly.coordinator
+        @Suppress("UNCHECKED_CAST")
+        val slot = (privateField(c, "protectedSlots") as Map<Any, Any>)[key] ?: return null
+        return privateField(slot, "components") as com.jay.fxi.data.graph.GraphV2DiskComponents
+    }
+
     /** kb.usd's pending closed starts (epoch seconds), read on Main. */
     private suspend fun Rig.kbClosedPending(): Set<Long> = onMain {
         val now = System.currentTimeMillis() / 1000
@@ -2320,8 +2972,9 @@ class PremiumGraphCutoverAcceptanceTest {
      * the first current-time WS snapshot on the acknowledged socket resumes that path, which demands the last 24 h of closed
      * buckets.
      */
-    private suspend fun Rig.prepareClosedDemand(deadline: Long) {
+    private suspend fun Rig.prepareClosedDemand(deadline: Long, krx: Boolean = false) {
         usdSnapshotLive = true
+        if (krx) onCatalog = { ok(fixture("catalog-krx-visible.json")) }
         // The first tab answers only once the catalog is adopted, so no cold recovery budget is left from the start and the
         // reconnect opens the cycle at its first round (a tab completing before the catalog would leave one with a 3 s deadline).
         onTab = {
@@ -2330,7 +2983,7 @@ class PremiumGraphCutoverAcceptanceTest {
                 if (System.nanoTime() > until) break
                 Thread.sleep(10)
             }
-            ok(fixture("usd-1d-krx-hidden.json"))
+            ok(fixture(if (krx) "usd-1d-krx-visible.json" else "usd-1d-krx-hidden.json"))
         }
         coldStart(deadline)
         awaitTrue("catalog adopted", deadline) { catalogAdopted() }
