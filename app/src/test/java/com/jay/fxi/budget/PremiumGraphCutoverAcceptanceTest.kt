@@ -141,6 +141,8 @@ class PremiumGraphCutoverAcceptanceTest {
         const val NOTICE = "body 기준 수치는 클라이언트가 관측한 body 수명의 계량이며, close/실패 뒤 서버 작업까지 끝났다는 증거는 " +
             "아닙니다. per-host 5는 동일 Dispatcher의 비동기 호출 제한으로 표시하고, body 기준 in-flight ≤5의 증명으로 사용하지 않습니다."
         const val PREMIUM_HIDDEN = """{"krx_visible":false,"premium_active":true}"""
+        /** The test-only request header [permitAtSend] fills. */
+        const val PERMIT_HEADER = "X-Cut-Permit"
     }
 
     @get:Rule val folder = TemporaryFolder()
@@ -160,6 +162,11 @@ class PremiumGraphCutoverAcceptanceTest {
     private val entitlements = ConcurrentLinkedQueue<MockResponse>()
     @Volatile private var onCatalog: (RecordedRequest) -> MockResponse = { ok(fixture("catalog-krx-hidden.json")) }
     @Volatile private var onTab: (RecordedRequest) -> MockResponse = { ok(fixture("usd-1d-krx-hidden.json")) }
+    /**
+     * While set, read on the client's thread as each graph REST request goes out — after the coordinator's send checkpoint —
+     * and sent with it as [PERMIT_HEADER], so a server hook knows what held when it was sent.
+     */
+    @Volatile private var permitAtSend: (() -> String?)? = null
     private val tetherCalls = AtomicInteger()
     private val wire = Json { ignoreUnknownKeys = true }
     /** While set, the usd topic's REST bootstrap answers a current kb quote (a real delivery); otherwise 404 as before. */
@@ -360,6 +367,11 @@ class PremiumGraphCutoverAcceptanceTest {
             .apply {
                 check(interceptors()[0] is ReleaseAdmissionInterceptor) { "premise: D24 is the first application interceptor" }
                 interceptors()[0] = ReleaseAdmissionInterceptor(admitted = { true })
+            }
+            .addNetworkInterceptor { chain ->
+                val request = chain.request()
+                val tag = if (request.url.encodedPath.startsWith("/api/v2/graph/")) permitAtSend?.invoke() else null
+                chain.proceed(if (tag == null) request else request.newBuilder().header(PERMIT_HEADER, tag).build())
             }
             .addNetworkInterceptor(sends.interceptor)
             .build()
@@ -3244,6 +3256,1083 @@ class PremiumGraphCutoverAcceptanceTest {
         ColdStartBudget.assertWithin(judgeRow(label))
     }
 
+    // --- CUT-C01 batch 2b: RT03b-Q04 (cut_c01_b2_agreed.r1.md) ---------------------------------------------------------------
+
+    /** The usd recovery budget object itself (identity, not a view), read on Main. */
+    private suspend fun Rig.usdBudgetObject(): Any? = onMain {
+        @Suppress("UNCHECKED_CAST")
+        val budgets = privateField(assembly.coordinator, "recoveryBudgets") as Map<Any, Any>
+        budgets.entries.singleOrNull { privateField(it.key, "tab") == "usd" }?.value
+    }
+
+    /** In one Main step: the usd budget object, its stop, and the trigger sequence. */
+    private suspend fun Rig.budgetSample(): Triple<Any?, Any?, Long> = onMain {
+        @Suppress("UNCHECKED_CAST")
+        val budgets = privateField(assembly.coordinator, "recoveryBudgets") as Map<Any, Any>
+        val budget = budgets.entries.singleOrNull { privateField(it.key, "tab") == "usd" }?.value
+        val events = assembly.events
+        Triple(budget, budget?.let { privateField(it, "stop") },
+            events.javaClass.getDeclaredField("sequence").apply { isAccessible = true }.get(events) as Long)
+    }
+
+    /**
+     * Who issued a graph request and under what permit: [byRound] is the in-flight registration's `automaticRecovery` as the
+     * coordinator holds it when the server takes the request (null when none is registered then); [permitOpen] is the live
+     * recovery permit's `automatic` as the client read it sending the request ([permitAtSend]; null when untagged).
+     */
+    private data class SendOrigin(val at: Long, val kind: String, val byRound: Boolean?, val permitOpen: Boolean?)
+
+    /** The [permitAtSend] reader of a row: the live permit's `automatic`, read off Main (the session publishes it volatile). */
+    private fun Rig.permitTag(): () -> String? = { if (permitSlot?.get()?.invoke()?.automatic == true) "open" else "closed" }
+
+    /** From a server hook, in one Main step: the in-flight catalog ([catalog]) or usd 1d tab registration; the permit from [request]. */
+    private suspend fun Rig.sendOrigin(catalog: Boolean, request: RecordedRequest): SendOrigin = onMain {
+        val c = assembly.coordinator
+        val registration = if (catalog) privateField(c, "catalogRequest") else {
+            @Suppress("UNCHECKED_CAST")
+            val requests = privateField(c, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
+            requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period.code == "1d" }?.value
+        }
+        SendOrigin(nowMillis(), if (catalog) "catalog" else "tab", registration?.let { privateField(it, "automaticRecovery") as Boolean },
+            when (request.getHeader(PERMIT_HEADER)) { "open" -> true; "closed" -> false; else -> null })
+    }
+
+    /**
+     * RT03b-Q04: one open recovery cycle over a real closed demand (prepared KRX-visible) survives three offline holds, two
+     * real re-approvals (each a refused subscription and a new grant on the same user epoch) and a capability reissue (KRX
+     * approved visible again, then hidden: a rotation and a new grant). Every round answers part of the window, so the demand
+     * stays. After each event the usd budget is the same object, its rounds and rung never go down, and a hold keeps its
+     * deadline and issues no round. Past RT05's 30 s cooldown a reconnect on the same grant issues a trigger on the running
+     * cycle. Sampled every 10 ms in between, the budget stays that object and never stops, so every trigger lands on the
+     * running cycle (no exhausted or capped cycle a trigger could reopen). Catalogs by issuer: the initial one at most one;
+     * since the cycle opened, the rounds' own at most the rounds, the screen's own activation at most one per grant change and
+     * none outside one, none in a hold, overall at most the rounds plus the grant changes. Every request a round issued goes
+     * with the permit open, as the client read it sending the request. (An event failure goes to Crashlytics, not
+     * `rig.reports`; its effect on the cycle, a stop, is what the sampling sees.)
+     */
+    @Test
+    fun `RT03b-Q04 repeated holds, re-approvals and a capability reissue keep one budget with its counters and deadline`() = runBlocking {
+        val label = "RT03b-Q04"
+        val prepared = clearOfBoundary(130_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 120_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val rig = Rig()
+        val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            while (true) {
+                if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
+                delay(20)
+            }
+        }
+        var sampler: kotlinx.coroutines.Job? = null
+        try {
+            rig.row {
+                rig.prepareClosedDemand(deadline, krx = true)
+                val starts = closedStarts()
+                val rounds = AtomicInteger()
+                // Each round gives a further eighth of the window: the demand stays for the whole row.
+                val origins = Collections.synchronizedList(mutableListOf<SendOrigin>())
+                permitAtSend = rig.permitTag()
+                onCatalog = { request -> origins += runBlocking { rig.sendOrigin(catalog = true, request) }; ok(fixture("catalog-krx-visible.json")) }
+                onTab = { request -> origins += runBlocking { rig.sendOrigin(catalog = false, request) }; ok(usdTab(starts.take(8 * (rounds.incrementAndGet())), "usd-1d-krx-visible.json")) }
+                rig.awaitTopics(deadline)
+                delay(3_500)
+                val baseline = tabs().size
+                val catalogsAtOpen = catalogs().size
+                val catalogOriginsAtOpen = synchronized(origins) { origins.count { it.kind == "catalog" } }
+                val triggersAtOpen = rig.triggers()
+                val openedAt = nowMillis()
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: round 1 completed", deadline) { tabs().size == baseline + 1 && tabs().last().bodyEnd != null }
+                awaitTrue("$label: the budget waits for its next round", deadline) { rig.usdBudget()?.deadline != null }
+                val budget = checkNotNull(rig.usdBudgetObject())
+                // Between the checks as well: the budget stays this object and never stops, so no trigger can reopen a cycle;
+                // every trigger the row sees lands on this running budget. The grant tokens are recorded with their times.
+                val violations = Collections.synchronizedList(mutableListOf<String>())
+                val triggerSteps = Collections.synchronizedList(mutableListOf<String>())
+                val grantChanges = Collections.synchronizedList(mutableListOf<Long>())
+                sampler = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                    var previous = rig.budgetSample()
+                    var token = rig.coordinator.accessSnapshot.facts.token
+                    while (true) {
+                        delay(10)
+                        val sample = rig.budgetSample()
+                        val at = nowMillis()
+                        if (sample.first !== budget) violations += "$at: the budget is ${sample.first}"
+                        if (sample.second != null) violations += "$at: the budget stopped: ${sample.second}"
+                        if (sample.third > previous.third) {
+                            triggerSteps += "$at: ${previous.third} -> ${sample.third}"
+                            if (previous.first !== budget || previous.second != null) violations += "$at: a trigger after ${previous.second}"
+                        }
+                        previous = sample
+                        val now = rig.coordinator.accessSnapshot.facts.token
+                        if (now != null && now != token) { token = now; grantChanges += at }
+                    }
+                }
+                val holdWindows = mutableListOf<Pair<Long, Long>>()
+                val grantWindows = mutableListOf<Triple<String, Long, Long>>()
+                var last = checkNotNull(rig.usdBudget())
+                val log = mutableListOf<String>()
+                suspend fun check(event: String) {
+                    val now = checkNotNull(rig.usdBudget()) { "$label: no usd budget after $event" }
+                    log += "$event: $now"
+                    assertSame("$label: the same budget object after $event", budget, rig.usdBudgetObject())
+                    assertTrue("$label: rounds never go down after $event ($last -> $now)", now.rounds >= last.rounds)
+                    assertTrue("$label: the rung never goes down after $event ($last -> $now)", now.completionRung >= last.completionRung)
+                    assertNull("$label: the cycle has not stopped after $event ($now)", now.stop)
+                    assertTrue("$label: the demand stays after $event", rig.kbClosedPending().isNotEmpty())
+                    last = now
+                }
+                check("round 1")
+
+                // Three offline holds: the deadline is kept while the permit is closed.
+                repeat(3) { i ->
+                    // Entered with the next round at least 0.5 s away: no round can leave between this check and the permit closing.
+                    awaitTrue("$label: hold ${i + 1}: no round in flight and the next not imminent", deadline) {
+                        tabs().all { it.bodyEnd != null } &&
+                            rig.usdBudget()?.deadline?.let { it.toEpochMilliseconds() - wallAtOrigin - nowMillis() >= 500 } == true
+                    }
+                    val offlineAt = nowMillis()
+                    rig.online.value = false
+                    awaitTrue("$label: hold ${i + 1}: the permit closed", deadline) {
+                        rig.onMain { checkNotNull(rig.permitSlot).require()() }?.automatic != true
+                    }
+                    // Read once the permit is closed: a round that left just before is already counted.
+                    val before = checkNotNull(rig.usdBudget())
+                    delay(1_500)
+                    val during = checkNotNull(rig.usdBudget())
+                    assertEquals("$label: hold ${i + 1} keeps the deadline", before.deadline, during.deadline)
+                    assertEquals("$label: hold ${i + 1}: no round while held", before.rounds, during.rounds)
+                    rig.online.value = true
+                    awaitTrue("$label: hold ${i + 1}: the permit is automatic again", deadline) {
+                        rig.onMain { checkNotNull(rig.permitSlot).require()() }?.automatic == true
+                    }
+                    check("hold ${i + 1}")
+                    holdWindows += offlineAt to nowMillis()
+                }
+
+                // Two re-approvals: the reconnect's subscription is refused once, the issuer re-approves on a new grant.
+                repeat(2) { i ->
+                    awaitTrue("$label: re-approval ${i + 1}: no round in flight", deadline) { tabs().all { it.bodyEnd != null } }
+                    val grantBefore = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                    val refusalsBefore = refusals.get()
+                    refuseUsd = {
+                        refuseUsd = null
+                        rig.issuerIdentityReadable = false
+                    }
+                    val closeAt = nowMillis()
+                    openSockets.last().close(1011, "server restart")
+                    awaitTrue("$label: re-approval ${i + 1}: a new grant", deadline) {
+                        rig.coordinator.topicGrantResult().fence?.grant?.let { it != grantBefore.grant } == true
+                    }
+                    val grantAfter = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                    assertEquals("$label: re-approval ${i + 1}: the same user epoch", grantBefore.userAccessEpoch, grantAfter.userAccessEpoch)
+                    assertTrue("$label: re-approval ${i + 1}: premise: refused", refusals.get() > refusalsBefore)
+                    awaitTrue("$label: re-approval ${i + 1}: its context is consumed", deadline) {
+                        rig.assembly.coordinator.state.value.source?.fence == grantAfter
+                    }
+                    delay(2_000)
+                    check("re-approval ${i + 1}")
+                    grantWindows += Triple("re-approval ${i + 1}", closeAt, nowMillis())
+                }
+
+                // A capability reissue: KRX approved visible again, then hidden (a rotation and a new grant on the same user epoch).
+                awaitTrue("$label: reissue: no round in flight", deadline) { tabs().all { it.bodyEnd != null } }
+                val reissueAt = nowMillis()
+                val beforeReissue = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                entitlements += ok(premiumKrxVisible)
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                val epochOpen = rig.epochStore.load().krxCapabilityEpoch
+                entitlements += ok(PREMIUM_HIDDEN)
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                val reissued = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertNotEquals("$label: reissue: a new grant", beforeReissue.grant, reissued.grant)
+                assertEquals("$label: reissue: the same user epoch", beforeReissue.userAccessEpoch, reissued.userAccessEpoch)
+                assertNotEquals("$label: reissue: the capability epoch rotated", epochOpen, rig.epochStore.load().krxCapabilityEpoch)
+                awaitTrue("$label: reissue: its context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == reissued }
+                delay(2_000)
+                check("capability reissue")
+                grantWindows += Triple("capability reissue", reissueAt, nowMillis())
+
+                // A trigger on the running cycle: past RT05's 30 s cooldown since the cycle's opening RECONNECT, a reconnect on the same
+                // grant issues one more. It lands on this budget (the sampler checks every trigger step) and resets nothing.
+                while (nowMillis() < openedAt + 31_000) delay(50)
+                awaitTrue("$label: late reconnect: no round in flight", deadline) { tabs().all { it.bodyEnd != null } }
+                val triggersBefore = rig.triggers()
+                val grantBeforeLate = checkNotNull(rig.coordinator.topicGrantResult().fence).grant
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: late reconnect: one trigger", deadline) { rig.triggers() > triggersBefore }
+                delay(2_000)
+                assertEquals("$label: late reconnect: premise: the same grant", grantBeforeLate, rig.coordinator.topicGrantResult().fence?.grant)
+                check("late reconnect")
+                sampler?.cancel()
+
+                println("CUT-C01 $label budget after each event:\n" + log.joinToString("\n"))
+                val changes = synchronized(grantChanges) { grantChanges.toList() }
+                val catalogTimes = catalogs().drop(catalogsAtOpen).map { it.start }
+                println("CUT-C01 $label triggers ${triggersAtOpen} -> ${rig.triggers()} (${synchronized(triggerSteps) { triggerSteps.toList() }}); " +
+                    "grant changes $changes; catalogs since open $catalogTimes; holds $holdWindows; grant windows $grantWindows; rounds ${last.rounds}")
+                assertTrue("$label: premise: the cycle has rounds left (${last.rounds} < 6)", last.rounds < 6)
+                assertTrue("$label: premise: a trigger landed while the cycle ran", synchronized(triggerSteps) { triggerSteps.isNotEmpty() })
+                assertEquals("$label: between the checks the budget stayed this running object", emptyList<String>(), synchronized(violations) { violations.toList() })
+                // Catalogs by issuer (cut_c01_b2b_catalog.r1), each send paired with who issued it (one catalog is in flight at a time,
+                // so both lists are in send order) and judged on the client's clock: the initial one at most one; since the cycle
+                // opened, the rounds' own at most the rounds, the screen's own activation at most one per grant change (the reissue's
+                // intermediate change counted) and none outside one, none in a hold on the same grant; overall at most the rounds plus
+                // the grant changes.
+                val sent = synchronized(origins) { origins.toList() }
+                val catalogOrigins = sent.filter { it.kind == "catalog" }.drop(catalogOriginsAtOpen)
+                println("CUT-C01 $label origins $sent")
+                assertTrue("$label: the initial catalog is at most one ($catalogsAtOpen)", catalogsAtOpen <= 1)
+                assertEquals("$label: premise: every catalog since the cycle opened is attributed", catalogTimes.size, catalogOrigins.size)
+                assertTrue("$label: premise: every catalog has its registration", catalogOrigins.all { it.byRound != null })
+                val pairs = catalogTimes.zip(catalogOrigins)
+                assertTrue("$label: the rounds' own catalogs are at most the rounds (${last.rounds})\n${sends.timeline()}",
+                    pairs.count { it.second.byRound == true } <= last.rounds)
+                holdWindows.forEachIndexed { i, (from, until) ->
+                    assertEquals("$label: premise: hold ${i + 1} keeps the grant", 0, changes.count { it in from..until })
+                    assertEquals("$label: no catalog in hold ${i + 1}\n${sends.timeline()}", 0, catalogTimes.count { it in from..until })
+                }
+                grantWindows.forEach { (name, from, until) ->
+                    val inWindow = changes.count { it in from..until }
+                    assertTrue("$label: premise: $name changed the grant", inWindow >= 1)
+                    assertTrue("$label: the activation's own catalogs in $name are at most its grant changes ($inWindow)\n${sends.timeline()}",
+                        pairs.count { (at, o) -> o.byRound == false && at in from..until } <= inWindow)
+                }
+                assertEquals("$label: no activation catalog outside a grant change\n${sends.timeline()}", emptyList<Long>(),
+                    pairs.filter { (at, o) -> o.byRound == false && grantWindows.none { (_, from, until) -> at in from..until } }.map { it.first })
+                assertTrue("$label: catalogs since the cycle opened (${catalogTimes.size}) are at most rounds + grant changes " +
+                    "(${last.rounds} + ${changes.size})\n${sends.timeline()}", catalogTimes.size <= last.rounds + changes.size)
+                // Every request a round issued went with the permit open, as the client read it sending the request.
+                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                assertEquals("$label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
+                    sent.filter { it.byRound == true && it.permitOpen != true })
+                // End cleanly: the rest of the window, then the new session settles.
+                onTab = { ok(usdTab(starts, "usd-1d-krx-visible.json")) }
+                awaitTrue("$label: the demand is met", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                awaitTrue("$label: the tabs settle", deadline) { graph().all { it.bodyEnd != null } }
+                awaitTrue("$label: the server and the recorder agree", deadline) {
+                    synchronized(received) { received.toList() }.sorted() == sends.all().map { it.key }.sorted()
+                }
+                quiet(label, 1_000)
+            }
+        } finally {
+            restorer.cancel()
+            sampler?.cancel()
+            permitAtSend = null
+            refuseUsd = null
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 120_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- CUT-C01 batch 2b: RT03b-Q05 (cut_c01_b2_agreed.r1.md) ---------------------------------------------------------------
+
+    /** Topic snapshot (REST bootstrap) sends, in order. */
+    private fun bootstraps() = sends.all().filter { it.path == "/api/v2/topics/snapshot" }
+
+    /**
+     * RT03b-Q05a: re-approval recovery under a real D3 backoff. With an open cycle over a closed demand, the reconnect's
+     * subscription is refused twice in a row, so the session re-approves twice and reconnects under D3 (its reconnection
+     * display past the first attempt). From each re-approval — its entitlements answer as the client recorded it — until that
+     * grant's connection started, no tab and no topic bootstrap goes; the screen's owner-following activation may send at most one
+     * catalog (cut_c01_b2b_catalog.r1), never the round's. The second window has the round owed in it. The last connection's
+     * 101 is held 4 s: the waiting round goes once the connection exists, promptly and before it opens. Closing that socket one
+     * second before the next round falls due, with the demand still there, nothing goes until the next connection, and then the
+     * round goes at once. Every request a round issued went with the permit open, as the client read it sending the request.
+     */
+    @Test
+    fun `RT03b-Q05a re-approvals under a D3 backoff send no round or bootstrap until the grant's connection and the round goes before it opens`() = runBlocking {
+        val label = "RT03b-Q05a"
+        val prepared = clearOfBoundary(80_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 70_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        val rig = Rig()
+        val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            while (true) {
+                if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
+                delay(20)
+            }
+        }
+        // Each grant change (re-approval) as it is observed, with the usd budget at that moment; the session's reconnection attempts.
+        val grantChanges = Collections.synchronizedList(mutableListOf<Triple<Long, String, BudgetView?>>())
+        val attempts = Collections.synchronizedList(mutableListOf<Pair<Long, Int>>())
+        // Who issued each graph request, read when the server takes it.
+        val origins = Collections.synchronizedList(mutableListOf<SendOrigin>())
+        var grantWatch: kotlinx.coroutines.Job? = null
+        try {
+            rig.row {
+                rig.prepareClosedDemand(deadline)
+                val starts = closedStarts()
+                val rounds = AtomicInteger()
+                // A sixth of the demand per round: it stays through the tail.
+                val catalogsAtHook = catalogs().size
+                permitAtSend = rig.permitTag()
+                onCatalog = { request -> origins += runBlocking { rig.sendOrigin(catalog = true, request) }; ok(fixture("catalog-krx-hidden.json")) }
+                onTab = { request -> origins += runBlocking { rig.sendOrigin(catalog = false, request) }; ok(usdTab(starts.take(24 * rounds.incrementAndGet()))) }
+                rig.awaitTopics(deadline)
+                delay(3_500)
+                val first = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                @Suppress("UNCHECKED_CAST")
+                val display = rig.onMain { privateField(rig.owner.consumer, "display") } as StateFlow<TopicDisplayState>
+                grantWatch = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                    var seen = first.grant
+                    var attempt = 0
+                    while (true) {
+                        val now = rig.coordinator.accessSnapshot.facts.token
+                        if (now != null && now != seen) {
+                            seen = now
+                            val at = nowMillis()
+                            grantChanges += Triple(at, "$now owner ${rig.onMain { rig.owner.consumer.currentState().ui.owner }}", rig.usdBudget())
+                        }
+                        val recovery = display.value.recovery
+                        if (recovery is com.jay.fxi.data.remote.TopicRecoveryDisplay.Reconnecting && recovery.attempt != attempt) {
+                            attempt = recovery.attempt
+                            attempts += nowMillis() to attempt
+                        }
+                        delay(5)
+                    }
+                }
+                // Two refusals in a row; the connection after the second re-approval has its 101 held.
+                val refusalsLeft = AtomicInteger(2)
+                refuseUsd = {
+                    if (refusalsLeft.decrementAndGet() <= 0) {
+                        refuseUsd = null
+                        holdHandshakeMillis.set(4_000L)
+                    }
+                    rig.issuerIdentityReadable = false
+                }
+                val arrivalsAtClose = wsArrivals.size
+                val handshakesAtClose = handshakes().size
+                val tabsAtClose = tabs().size
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: two refusals", deadline) { refusals.get() >= 2 }
+                awaitTrue("$label: the second re-approval", deadline) {
+                    rig.coordinator.topicGrantResult().fence?.let { it.grant != first.grant } == true && refuseUsd == null
+                }
+                val reapproved = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("$label: the same user epoch", first.userAccessEpoch, reapproved.userAccessEpoch)
+                // The last connection: after the second refusal, its 101 held.
+                awaitTrue("$label: the re-approved grant's connection reaches the server", deadline) { wsArrivals.size >= arrivalsAtClose + 3 }
+                val connections = wsArrivals.drop(arrivalsAtClose).take(3)
+                // Each connection as the client started it (its WebSocket call, before any TCP connect): the time its own first
+                // sends are measured against.
+                awaitTrue("$label: the client started the three connections", deadline) { handshakes().size >= handshakesAtClose + 3 }
+                val wsStarts = handshakes().drop(handshakesAtClose).take(3).map { it.start }
+                val changes = synchronized(grantChanges) { grantChanges.toList() }
+                println("CUT-C01 $label: connections $connections; grant changes $changes; attempts ${synchronized(attempts) { attempts.toList() }}; " +
+                    "bootstraps ${bootstraps().map { "${it.param("topic")}@${it.start}" }}; catalogs ${catalogs().map { it.start }}")
+                assertEquals("$label: premise: two re-approvals observed", 2, changes.size)
+                assertTrue("$label: premise: D3 is backing off (an attempt past the first before the last connection)",
+                    synchronized(attempts) { attempts.toList() }.any { it.second >= 2 && it.first < wsStarts[2] })
+                assertEquals("$label: premise: the round is owed at the first re-approval, waiting for the permit", true, changes[0].third?.waitingPermit)
+                val connectionAt = wsStarts[2]
+                val entitlementEnds = sends.all().filter { it.path == "/api/entitlements" }.mapNotNull { it.bodyEnd }
+                // Catalog sends paired with who issued them (one catalog is in flight at a time, so both lists are in send order).
+                val catalogPairs = { catalogs().drop(catalogsAtHook).zip(synchronized(origins) { origins.toList() }.filter { it.kind == "catalog" }) }
+                // Each re-approval's window, on the client's clock: from its entitlements answer as the client recorded it (the grant
+                // cannot change before it) until that grant's connection started (the 2nd and 3rd), less 50 ms for the connection's
+                // own first sends, which go out with it.
+                listOf(changes[0].first to wsStarts[1], changes[1].first to wsStarts[2]).forEachIndexed { i, (seen, until) ->
+                    val from = checkNotNull(entitlementEnds.filter { it <= seen }.maxOrNull()) { "$label: re-approval ${i + 1}'s entitlements answer" }
+                    assertTrue("$label: premise: that answer is re-approval ${i + 1}'s ($from, seen at $seen)", seen - from < 1_000)
+                    assertTrue("$label: premise: re-approval ${i + 1} came before its connection ($from, $until)", from < until - 50)
+                    assertEquals("$label: no tab in re-approval ${i + 1}'s window\n${sends.timeline()}", 0,
+                        tabs().count { it.start in from until (until - 50) })
+                    assertEquals("$label: no topic bootstrap in re-approval ${i + 1}'s window\n${sends.timeline()}", 0,
+                        bootstraps().count { it.start in from until (until - 50) })
+                    val window = catalogPairs().filter { (exchange, _) -> exchange.start in from until until }
+                    println("CUT-C01 $label: catalogs in re-approval ${i + 1}'s window ($from..$until): ${window.map { (e, o) -> "${e.start} $o" }}")
+                    // The one catalog allowed is the screen's own activation request, never the round's (cut_c01_b2b_catalog.r1).
+                    assertTrue("$label: premise: each catalog in the window has its registration", window.all { it.second.byRound != null })
+                    assertTrue("$label: at most one catalog in re-approval ${i + 1}'s window\n${sends.timeline()}", window.size <= 1)
+                    assertEquals("$label: no round-issued catalog in re-approval ${i + 1}'s window", emptyList<SendOrigin>(),
+                        window.map { it.second }.filter { it.byRound == true })
+                }
+                // The second window has the round owed in it: due before that grant's connection.
+                val due2 = checkNotNull(changes[1].third?.deadline) { "$label: premise: a round deadline at the second re-approval" }
+                    .toEpochMilliseconds() - wallAtOrigin
+                assertTrue("$label: premise: the round is owed in the second window (due $due2, connection ${wsStarts[2]})", due2 < wsStarts[2] - 100)
+                // The round goes once the connection exists, promptly, before the held socket opens.
+                awaitTrue("$label: the waiting round goes", deadline) { tabs().drop(tabsAtClose).any { it.start >= connectionAt - 50 } }
+                val round = tabs().drop(tabsAtClose).first { it.start >= connectionAt - 50 }
+                assertTrue("$label: the round goes promptly (${round.start} vs connection $connectionAt, due $due2)\n${sends.timeline()}",
+                    round.start <= maxOf(connectionAt, due2) + 1_000)
+                awaitTrue("$label: the held socket opens", deadline) { handshakes().last().end != null }
+                val opened = checkNotNull(handshakes().last().end)
+                assertTrue("$label: the round goes before the held socket opens (${round.start} vs $opened)\n${sends.timeline()}", round.start < opened)
+                awaitTrue("$label: the round completed", deadline) { tabs().all { it.bodyEnd != null } }
+
+                // The tail: the next round falls due one second after the socket closes, with the demand still there.
+                awaitTrue("$label: the next round is scheduled", deadline) { rig.usdBudget()?.deadline != null }
+                val tailDue = checkNotNull(rig.usdBudget()?.deadline).toEpochMilliseconds() - wallAtOrigin
+                assertTrue("$label: premise: the next round is not due yet ($tailDue)", tailDue - nowMillis() >= 1_500)
+                while (nowMillis() < tailDue - 1_000) delay(20)
+                assertTrue("$label: premise: the demand is still there", rig.kbClosedPending().isNotEmpty())
+                assertEquals("$label: premise: the deadline has not moved", tailDue,
+                    checkNotNull(rig.usdBudget()?.deadline).toEpochMilliseconds() - wallAtOrigin)
+                val handshakesBefore = handshakes().size
+                val graphBefore = graph().size
+                // The round after the next connection meets the rest of the demand, so the row ends on it.
+                onTab = { request -> origins += runBlocking { rig.sendOrigin(catalog = false, request) }; ok(usdTab(starts)) }
+                val closedAt = nowMillis()
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: the client saw the close: the permit closed", deadline) {
+                    rig.permitSlot?.get()?.invoke()?.automatic != true
+                }
+                assertTrue("$label: premise: the permit closed before the round fell due (${nowMillis()} vs $tailDue)", nowMillis() < tailDue)
+                awaitTrue("$label: the next connection", deadline) { handshakes().size > handshakesBefore }
+                val nextConnection = handshakes()[handshakesBefore].start
+                println("CUT-C01 $label: tail closed $closedAt, due $tailDue, next connection started $nextConnection")
+                assertTrue("$label: premise: the round fell due while the socket was gone ($tailDue, $closedAt..$nextConnection)",
+                    tailDue in (closedAt + 100) until (nextConnection - 100))
+                assertEquals("$label: no graph request between the close and the next connection\n${sends.timeline()}", 0,
+                    graph().drop(graphBefore).count { it.start < nextConnection - 50 })
+                awaitTrue("$label: the round goes on the next connection", deadline) { tabs().any { it.start >= closedAt } }
+                val tailRound = tabs().first { it.start >= closedAt }
+                assertTrue("$label: at once (${tailRound.start} vs $nextConnection)\n${sends.timeline()}", tailRound.start <= nextConnection + 1_000)
+                // End cleanly.
+                awaitTrue("$label: the demand is met", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                awaitTrue("$label: the tabs settle", deadline) { graph().all { it.bodyEnd != null } }
+                awaitTrue("$label: the server and the recorder agree", deadline) {
+                    synchronized(received) { received.toList() }.sorted() == sends.all().map { it.key }.sorted()
+                }
+                quiet(label, 1_000)
+                // Attributed at the server, with no time boundary: every request a round issued went with the permit open.
+                val sent = synchronized(origins) { origins.toList() }
+                println("CUT-C01 $label origins $sent")
+                assertEquals("$label: premise: every catalog since the hook is attributed", catalogs().size - catalogsAtHook, sent.count { it.kind == "catalog" })
+                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                assertEquals("$label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
+                    sent.filter { it.byRound == true && it.permitOpen != true })
+            }
+        } finally {
+            refuseUsd = null
+            permitAtSend = null
+            restorer.cancel()
+            grantWatch?.cancel()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 70_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT03b-Q05b, the contrast on the same grant: offline closes the permit while the next round falls due; back online the
+     * budget resumes on its preserved deadline at once, and no topic already bootstrapped under this grant is bootstrapped
+     * again. (This row is not counted as evidence for a general P4 release.)
+     */
+    @Test
+    fun `RT03b-Q05b on the same grant an offline round resumes on its deadline and no bootstrap is issued again`() = runBlocking {
+        val label = "RT03b-Q05b"
+        val prepared = clearOfBoundary(60_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 45_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            rig.prepareClosedDemand(deadline)
+            val starts = closedStarts()
+            val rounds = AtomicInteger()
+            onTab = { ok(usdTab(starts.take(48 * rounds.incrementAndGet()))) }
+            rig.awaitTopics(deadline)
+            delay(3_500)
+            val grant = checkNotNull(rig.coordinator.topicGrantResult().fence)
+            val baseline = tabs().size
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: round 1 completed", deadline) { tabs().size == baseline + 1 && tabs().last().bodyEnd != null }
+            awaitTrue("$label: the reconnected topics settle", deadline) { bootstraps().all { it.bodyEnd != null } && openSockets.isNotEmpty() }
+            delay(500)
+            val firstEnd = checkNotNull(tabs().last().bodyEnd)
+            val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+            awaitTrue("$label: the next round is scheduled after round 1", deadline) {
+                rig.usdBudget()?.deadline?.let { it.toEpochMilliseconds() - wallAtOrigin > firstEnd } == true
+            }
+            val before = checkNotNull(rig.usdBudget())
+            val due = checkNotNull(before.deadline).toEpochMilliseconds() - wallAtOrigin
+            val bootstrapsBefore = bootstraps().size
+            rig.online.value = false
+            awaitTrue("$label: the permit closed", deadline) { rig.onMain { checkNotNull(rig.permitSlot).require()() }?.automatic != true }
+            assertTrue("$label: premise: the permit closed before the deadline (${nowMillis()} vs $due)", nowMillis() < due)
+            assertEquals("$label: premise: nothing went before the permit closed", baseline + 1, tabs().size)
+            while (nowMillis() < due + 2_000) {
+                assertEquals("$label: nothing sent past the deadline while offline", baseline + 1, tabs().size)
+                delay(50)
+            }
+            assertEquals("$label: the deadline is kept", before.deadline, checkNotNull(rig.usdBudget()).deadline)
+            val back = nowMillis()
+            rig.online.value = true
+            awaitTrue("$label: the next round", deadline) { tabs().size == baseline + 2 }
+            assertTrue("$label: at once on the preserved deadline (${tabs().last().start - back} ms)\n${sends.timeline()}", tabs().last().start - back < 3_000)
+            assertEquals("$label: premise: the same grant", grant.grant, rig.coordinator.topicGrantResult().fence?.grant)
+            delay(3_000)
+            val reissued = bootstraps().drop(bootstrapsBefore)
+            assertEquals("$label: no topic bootstrapped again on the same grant: ${reissued.map { it.param("topic") }}\n${sends.timeline()}",
+                emptyList<String?>(), reissued.map { it.param("topic") })
+            onTab = { ok(usdTab(starts)) }
+            awaitTrue("$label: the demand is met", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+            awaitTrue("$label: the tabs settle", deadline) { graph().all { it.bodyEnd != null } }
+            quiet(label, 1_000)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 45_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- CUT-C01 batch 2b: RT01-B04 (cut_c01_b2_agreed.r1.md) ----------------------------------------------------------------
+
+    /** Lowercase hex of [value]'s UTF-8 bytes, as the graph disk store names its directories. */
+    private fun diskHex(value: String): String = value.encodeToByteArray().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+    /** Every KRX file on disk with the SHA-256 of its bytes. */
+    private fun Rig.krxFiles(): Map<String, String> = writtenFiles().filter { it.startsWith("krx/") }.associateWith { path ->
+        java.security.MessageDigest.getInstance("SHA-256").digest(File(diskRoot, path).readBytes()).joinToString("") { "%02x".format(it) }
+    }
+
+    /** KRX files new or changed since [before] (a file the purger removed is neither). */
+    private fun Rig.krxWrittenSince(before: Map<String, String>): Set<String> =
+        krxFiles().filter { (path, hash) -> before[path] != hash }.keys
+
+    /** Waits until the coordinator holds no write task, read on Main. */
+    private suspend fun Rig.awaitWritesDrained(label: String, deadline: Long) = awaitTrue("$label: the graph writes drained", deadline) {
+        onMain { (privateField(assembly.coordinator, "writeTasks") as Map<*, *>).isEmpty() }
+    }
+
+    /** The registered usd request for [period] as sent: whether one is registered, and its capture's KRX epoch. Read on Main. */
+    private suspend fun Rig.usdCaptureEpoch(period: String): Pair<Boolean, String?> = onMain {
+        @Suppress("UNCHECKED_CAST")
+        val requests = privateField(assembly.coordinator, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
+        val registration = requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period.code == period }?.value
+            ?: return@onMain false to null
+        val capture = privateField(registration, "accessCapture") as com.jay.fxi.data.graph.GraphV2AccessCapture?
+        true to capture?.krxCapabilityEpoch
+    }
+
+    /** Selects 3m on [holder] with the token the screen offers once it offers one for the current context. */
+    private suspend fun selectThreeMonths(rig: Rig, holder: GraphV2ScreenStateHolder, label: String, deadline: Long) {
+        // A token of the delivered grant's context, read and used in one Main step (an older context's token can still be
+        // offered just before the screen retires it).
+        awaitTrue("$label: the screen goes to 3m on the current context", deadline) {
+            val fence = rig.bridge()
+            rig.onMain {
+                val token = holder.currentState().inlineToken
+                if (token != null && fence != null && token.fence == fence) {
+                    holder.selectPeriod(token, GraphPeriod.THREE_MONTHS)
+                }
+                holder.currentState().let { it.activePeriod == GraphPeriod.THREE_MONTHS && fence != null && it.inlineToken?.fence == fence }
+            }
+        }
+    }
+
+    /** The usd entry key for [period], read on Main. */
+    private suspend fun Rig.usdKey(period: String): com.jay.fxi.data.graph.GraphKey? = onMain {
+        assembly.coordinator.state.value.entries.keys.firstOrNull { it.tab == "usd" && it.period.code == period }
+    }
+
+    /**
+     * RT01-B04a: a request carrying the old KRX epoch completes released. Under KRX VISIBLE (epoch E1) a 3m tab is sent with
+     * an E1 capture and held; a capability rotation (KRX hidden) moves the epoch and gives a new grant on the same user epoch,
+     * and the new context's requests are held. The old 3m then completes (200, KRX-visible values no other answer carries):
+     * nothing of it is applied — no 3m entry, no slot — and no KRX file is written.
+     */
+    @Test
+    fun `RT01-B04a a request carrying the old KRX epoch completes released and applies and writes nothing`() = runBlocking {
+        val label = "RT01-B04a"
+        val prepared = clearOfBoundary(60_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 45_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val holdOld = java.util.concurrent.CountDownLatch(1)
+        val holdNew = java.util.concurrent.CountDownLatch(1)
+        val krxVisible = java.util.concurrent.atomic.AtomicBoolean(true)
+        val oldBody = shiftedTab(fixture("usd-3m-krx-visible.json"), 7.0)
+        val oldAll = tabValues(oldBody).values.flatten().toSet()
+        val threeMonthCalls = AtomicInteger()
+        onCatalog = {
+            if (krxVisible.get()) ok(fixture("catalog-krx-visible.json"))
+            else { holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("catalog-krx-hidden.json")) }
+        }
+        onTab = { request ->
+            val threeMonth = request.requestUrl!!.queryParameter("period") == "3m"
+            when {
+                threeMonth && threeMonthCalls.getAndIncrement() == 0 -> { holdOld.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(oldBody) }
+                krxVisible.get() -> ok(fixture("usd-1d-krx-visible.json"))
+                else -> {
+                    holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                    ok(fixture(if (threeMonth) "usd-3m-krx-hidden.json" else "usd-1d-krx-hidden.json"))
+                }
+            }
+        }
+        val rig = Rig()
+        try {
+            rig.row {
+                val holder = checkNotNull(rig.coldStart(deadline))
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: catalog and the usd tab applied", deadline) {
+                    rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null }
+                }
+                quiet("$label settle", 3_500)
+                val e1 = checkNotNull(rig.epochStore.load().krxCapabilityEpoch)
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.bodyEnd == null } }
+                assertEquals("$label: premise: the 3m request carries the E1 capture", true to e1, rig.usdCaptureEpoch("3m"))
+                val krxBefore = rig.krxFiles()
+                val f1 = checkNotNull(rig.bridge())
+                val rotatedAt = nowMillis()
+                krxVisible.set(false)
+                entitlements += ok(PREMIUM_HIDDEN)
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("$label: premise: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                assertNotEquals("$label: premise: the KRX epoch moved", e1, rig.epochStore.load().krxCapabilityEpoch)
+                awaitTrue("$label: the new context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == f2 }
+                assertEquals("$label: the old 3m request is released (no 3m registered)", false to null as String?, rig.usdCaptureEpoch("3m"))
+
+                holdOld.countDown()
+                awaitTrue("$label: the old 3m body ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                assertEquals("$label: premise: the old answer was a 200", 200, tabs().first { it.param("period") == "3m" }.status)
+                delay(500)
+                val key = rig.usdKey("3m")
+                assertNull("$label: no 3m entry from the old answer", key)
+                assertTrue("$label: no old value anywhere in the entries", rig.onMain {
+                    rig.assembly.coordinator.state.value.entries.values
+                        .flatMap { e -> e.tab.graph.series.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } } }
+                        .toSet().intersect(oldAll).isEmpty()
+                })
+                rig.awaitWritesDrained(label, deadline)
+                assertEquals("$label: no KRX file written or changed by the old answer", emptySet<String>(), rig.krxWrittenSince(krxBefore))
+                holdNew.countDown()
+                settleNewSession(label, rotatedAt, deadline)
+                rig.awaitWritesDrained(label, deadline)
+                // Everything after the rotation is KRX-hidden, so a late write of the old answer is the only way a KRX file appears.
+                assertEquals("$label: still no KRX file written or changed at the end", emptySet<String>(), rig.krxWrittenSince(krxBefore))
+            }
+        } finally {
+            holdOld.countDown()
+            holdNew.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 45_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-B04b: only a capture of the new KRX epoch uses the new KRX half. Under KRX VISIBLE (epoch E1) the 3m tab is applied,
+     * written under E1 and exposed with KRX (the E1 control). A capability rotation hides KRX (the epoch moves to E2); the
+     * re-requested 3m captures no KRX epoch and is held, answered with KRX-visible data (the catalog stays KRX-visible, so no
+     * catalog filtering removes KRX). A re-approval makes KRX visible on E2. The held answer then completes and is applied —
+     * its own GENERAL values reach the entry and a protected read — with no KRX in its slot or the read, the entry unconfirmed,
+     * and, once the writes drain, no KRX file written or changed (the next request's answer is held meanwhile). Each phase's
+     * answer carries its own values. The next 3m request captures E2: its slot's KRX key is E2, a KRX file is written under
+     * E2, and the protected read's KRX values are the E2 answer's, none of the E1 control's, while the E1 file stays on disk.
+     */
+    @Test
+    fun `RT01-B04b under a hidden capability the tab captures no KRX epoch and after the re-approval only the new epoch is used`() = runBlocking {
+        val label = "RT01-B04b"
+        val prepared = clearOfBoundary(60_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 50_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        // 0 = visible, 1 = hidden (3m answers held), 2 = re-approved.
+        val phase = AtomicInteger(0)
+        val holdHidden = java.util.concurrent.CountDownLatch(1)
+        // The re-approved phase's 3m answers wait until the held answer is judged, so no legitimate E2 write mixes in.
+        val holdE2 = java.util.concurrent.CountDownLatch(1)
+        val threeMonthEpochs = Collections.synchronizedList(mutableListOf<Pair<Boolean, String?>>())
+        // Each phase's 3m answer carries values no other phase's does (all KRX-visible): which answer a value came from is
+        // readable from the value itself.
+        val controlBody = fixture("usd-3m-krx-visible.json")
+        val heldBody = shiftedTab(controlBody, 3.0)
+        val e2Body = shiftedTab(controlBody, 5.0)
+        val generalOf = { body: String -> tabValues(body).filterKeys { !it.startsWith("krx.") }.values.flatten().toSet() }
+        val krxOf = { body: String -> tabValues(body).filterKeys { it.startsWith("krx.") }.values.flatten().toSet() }
+        onCatalog = { ok(fixture("catalog-krx-visible.json")) }
+        val rig = Rig()
+        onTab = { request ->
+            if (request.requestUrl!!.queryParameter("period") == "3m") {
+                threeMonthEpochs += runBlocking { rig.usdCaptureEpoch("3m") }
+                // The answer is decided when the request arrives: the held one stays the hidden phase's answer.
+                when (phase.get()) {
+                    0 -> ok(controlBody)
+                    1 -> { holdHidden.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(heldBody) }
+                    else -> { holdE2.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(e2Body) }
+                }
+            } else ok(fixture("usd-1d-krx-visible.json"))
+        }
+        try {
+            rig.row {
+                val holder = checkNotNull(rig.coldStart(deadline))
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: catalog and the usd tab applied", deadline) {
+                    rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null }
+                }
+                quiet("$label settle", 3_500)
+                val record = rig.epochStore.load()
+                val e1 = checkNotNull(record.krxCapabilityEpoch)
+                val f1 = checkNotNull(rig.bridge())
+                val krxDir = { epoch: String -> "krx/${diskHex(f1.identity.uid)}/${diskHex(checkNotNull(f1.userAccessEpoch))}/${diskHex(epoch)}/${diskHex("usd")}/3m.json" }
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the 3m tab applied under E1", deadline) { krxDir(e1) in rig.writtenFiles() }
+                val key = checkNotNull(rig.usdKey("3m"))
+                assertTrue("$label: premise: the E1 control is exposed with KRX", rig.onMain {
+                    rig.assembly.coordinator.protectedEntry(key)?.tab?.graph?.series?.any { it.seriesId.startsWith("krx.") } == true
+                })
+                assertEquals("$label: premise: its slot's KRX key is E1", e1, rig.onMain { rig.slotComponents(key)?.krx?.key?.krxCapabilityEpoch })
+
+                // Hidden: the epoch moves; the re-requested 3m captures no KRX epoch and is held.
+                phase.set(1)
+                val calls3m = threeMonthEpochs.size
+                entitlements += ok(PREMIUM_HIDDEN)
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                val e2 = checkNotNull(rig.epochStore.load().krxCapabilityEpoch)
+                assertNotEquals("$label: premise: the KRX epoch moved", e1, e2)
+                // The new grant's context starts the screen on 1d; the screen goes back to 3m.
+                selectThreeMonths(rig, holder, label, deadline)
+                awaitTrue("$label: the hidden 3m request is sent", deadline) { threeMonthEpochs.size > calls3m }
+                assertEquals("$label: it captures no KRX epoch", true to null as String?, threeMonthEpochs[calls3m])
+                // Re-approved: KRX visible on E2.
+                entitlements += ok(premiumKrxVisible)
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                assertEquals("$label: premise: the re-approval keeps E2", e2, rig.epochStore.load().krxCapabilityEpoch)
+                assertTrue("$label: premise: KRX is allowed again", rig.coordinator.accessSnapshot.facts.capabilityAllowed)
+                phase.set(2)
+                val callsHidden = threeMonthEpochs.size
+                val krxBeforeHeld = rig.krxFiles()
+                holdHidden.countDown()
+                awaitTrue("$label: the held answer completed", deadline) {
+                    tabs().filter { it.param("period") == "3m" }.let { t -> t.size >= 2 && t[1].bodyEnd != null }
+                }
+                val heldGeneral = generalOf(heldBody)
+                // The null-capture answer is applied: its own GENERAL values reach the entry (not the E1 control's).
+                awaitTrue("$label: the held answer's GENERAL is applied", deadline) {
+                    rig.onMain {
+                        rig.assembly.coordinator.state.value.entries[key]?.tab?.graph?.series.orEmpty()
+                            .filterNot { it.seriesId.startsWith("krx.") }.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } }
+                            .let { values -> values.isNotEmpty() && values.all { it in heldGeneral } }
+                    }
+                }
+                rig.awaitWritesDrained(label, deadline)
+                val afterHidden = rig.onMain {
+                    val slot = rig.slotComponents(key)
+                    val entry = rig.assembly.coordinator.state.value.entries[key]
+                    val read = rig.assembly.coordinator.protectedEntry(key)?.tab?.graph?.series.orEmpty()
+                    Triple(slot?.krx, entry?.online200At, read)
+                }
+                val readIds = afterHidden.third.map { it.seriesId }
+                val readGeneral = afterHidden.third.filterNot { it.seriesId.startsWith("krx.") }
+                    .flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } }
+                println("CUT-C01 $label after the null-capture answer: slot krx ${afterHidden.first?.key}; entry confirmed ${afterHidden.second}; read $readIds")
+                assertNull("$label: no KRX in the slot from the null capture", afterHidden.first)
+                assertTrue("$label: no KRX in a protected read", readIds.none { it.startsWith("krx.") })
+                assertTrue("$label: the protected read's GENERAL is the held answer's", readGeneral.isNotEmpty() && readGeneral.all { it in heldGeneral })
+                assertNull("$label: the entry is unconfirmed", afterHidden.second)
+                assertEquals("$label: no KRX file written or changed by the null-capture answer", emptySet<String>(), rig.krxWrittenSince(krxBeforeHeld))
+                holdE2.countDown()
+
+                // The next 3m request captures E2 and only it uses the KRX half (the screen back on 3m if a new context reset it).
+                if (rig.onMain { holder.currentState().activePeriod } != GraphPeriod.THREE_MONTHS) selectThreeMonths(rig, holder, label, deadline)
+                awaitTrue("$label: a 3m request with the E2 capture is sent", deadline) {
+                    threeMonthEpochs.drop(callsHidden).any { it == (true to e2) }
+                }
+                awaitTrue("$label: its KRX is written under E2", deadline) { krxDir(e2) in rig.writtenFiles() }
+                awaitTrue("$label: the slot's KRX key is E2 and the protected read has KRX", deadline) {
+                    rig.onMain {
+                        rig.slotComponents(key)?.krx?.key?.krxCapabilityEpoch == e2 &&
+                            rig.assembly.coordinator.protectedEntry(key)?.tab?.graph?.series?.any { it.seriesId.startsWith("krx.") } == true
+                    }
+                }
+                assertTrue("$label: the E1 file stays on disk", krxDir(e1) in rig.writtenFiles())
+                // Never joined with E1: the protected read's KRX values are the E2 answer's, none of the E1 control's.
+                val readKrx = rig.onMain {
+                    rig.assembly.coordinator.protectedEntry(key)?.tab?.graph?.series.orEmpty().filter { it.seriesId.startsWith("krx.") }
+                        .flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } }
+                }
+                assertTrue("$label: the protected read's KRX is the E2 answer's ($readKrx)",
+                    readKrx.isNotEmpty() && readKrx.all { it in krxOf(e2Body) } && readKrx.none { it in krxOf(controlBody) })
+                println("CUT-C01 $label 3m capture epochs:${threeMonthEpochs.map { it.second?.let { e -> if (e == e1) "E1" else if (e == e2) "E2" else "other" } ?: "null" }}")
+                assertTrue("$label: no 3m request after the rotation captured E1",
+                    threeMonthEpochs.drop(calls3m).none { it.second == e1 })
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: the tabs settle", deadline) { graph().all { it.bodyEnd != null } }
+                awaitTrue("$label: the server and the recorder agree", deadline) {
+                    synchronized(received) { received.toList() }.sorted() == sends.all().map { it.key }.sorted()
+                }
+                quiet(label, 1_000)
+            }
+        } finally {
+            holdHidden.countDown()
+            holdE2.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 50_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- CUT-C01 batch 2b: RT01-B05 (cut_c01_b2_agreed.r1.md) ----------------------------------------------------------------
+
+    /** [json] (a graph tab) with every point's rate, high and low raised by [delta]: values no other answer carries. */
+    private fun shiftedTab(json: String, delta: Double): String {
+        val base = wire.parseToJsonElement(json).jsonObject
+        val fields = setOf("rate", "high", "low")
+        val series = kotlinx.serialization.json.JsonArray(base.getValue("series").jsonArray.map { element ->
+            val obj = element.jsonObject
+            val data = obj["data"]?.jsonArray ?: return@map obj
+            kotlinx.serialization.json.JsonObject(obj + ("data" to kotlinx.serialization.json.JsonArray(data.map { point ->
+                kotlinx.serialization.json.JsonObject(point.jsonObject.mapValues { (key, value) ->
+                    val number = (value as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()
+                    if (key in fields && number != null) kotlinx.serialization.json.JsonPrimitive(number + delta) else value
+                })
+            })))
+        })
+        return kotlinx.serialization.json.JsonObject(base + ("series" to series)).toString()
+    }
+
+    /** Every rate, high and low a graph tab answer carries, by series id. */
+    private fun tabValues(json: String): Map<String, Set<Double>> =
+        wire.parseToJsonElement(json).jsonObject.getValue("series").jsonArray.associate { element ->
+            val obj = element.jsonObject
+            obj.getValue("id").jsonPrimitive.content to obj["data"]?.jsonArray.orEmpty().flatMap { point ->
+                listOf("rate", "high", "low").mapNotNull { point.jsonObject[it]?.jsonPrimitive?.content?.toDoubleOrNull() }
+            }.toSet()
+        }
+
+    /** The coordinator's shared retry floor, read on Main. */
+    private suspend fun Rig.retryFloor(): kotlinx.datetime.Instant? = onMain {
+        privateField(assembly.coordinator, "sharedRetryFloor") as kotlinx.datetime.Instant?
+    }
+
+    /**
+     * RT01-B05a: a late old completion with a Retry-After, after a same-scope context change. A closed demand's round
+     * (carrying kb.usd's capture) is held; a capability rotation (KRX hidden) gives a new grant on the same user epoch, and the
+     * new context's requests are held too. The old round then completes: 200, KRX-visible data covering the whole demand
+     * (kb.usd at every closed start) with values no other answer carries, and Retry-After 20. None of it is applied — not to
+     * the entries, the protected read or the recorder, and the demand is unchanged — yet its floor (20 s + the usd jitter of
+     * 10 s) is kept: once the new context's held requests are answered, a 3m selection is not sent before the floor (nor
+     * before the old body end + 30 s), nor is any other graph request.
+     */
+    @Test
+    fun `RT01-B05a a late old completion after a context change applies nothing and its Retry-After floor holds the new context`() = runBlocking {
+        val label = "RT01-B05a"
+        assertEquals("premise: J = 10 s for usd", 10.seconds, FreeSnapshotSchedulePolicy.jitterFor(SEED, "usd"))
+        val prepared = clearOfBoundary(90_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 80_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val holdOld = java.util.concurrent.CountDownLatch(1)
+        val holdNew = java.util.concurrent.CountDownLatch(1)
+        val krxVisible = java.util.concurrent.atomic.AtomicBoolean(true)
+        val rig = Rig()
+        try {
+            rig.row {
+                rig.prepareClosedDemand(deadline, krx = true)
+                val starts = closedStarts()
+                // The old answer covers the whole demand (kb.usd at every closed start), KRX-visible, every value shifted: applied
+                // as a recovery it would release the demand and move the recorder's tip.
+                val oldBody = shiftedTab(usdTab(starts, "usd-1d-krx-visible.json"), 7.0)
+                val oldValues = tabValues(oldBody)
+                assertEquals("premise: the old answer's kb.usd covers the demand", starts.size,
+                    wire.parseToJsonElement(oldBody).jsonObject.getValue("series").jsonArray
+                        .first { it.jsonObject.getValue("id").jsonPrimitive.content == "kb.usd" }.jsonObject.getValue("data").jsonArray.size)
+                val holder = checkNotNull(rig.onMain { rig.mount?.holders?.value?.get("usd") })
+                onCatalog = {
+                    if (krxVisible.get()) ok(fixture("catalog-krx-visible.json"))
+                    else { holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("catalog-krx-hidden.json")) }
+                }
+                val calls = AtomicInteger()
+                onTab = { request ->
+                    if (calls.getAndIncrement() == 0) {
+                        holdOld.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                        ok(oldBody).setHeader("Retry-After", 20)
+                    } else {
+                        holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                        if (request.requestUrl!!.queryParameter("period") == "3m") ok(fixture("usd-3m-krx-hidden.json"))
+                        else ok(fixture("usd-1d-krx-hidden.json"))
+                    }
+                }
+                rig.awaitTopics(deadline)
+                delay(3_500)
+                val baseline = tabs().size
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: the round is in flight", deadline) { tabs().size == baseline + 1 }
+                val captured = checkNotNull(rig.usdTabRegistration().captures)
+                assertTrue("$label: premise: the old round carries kb.usd's capture: $captured", captured.any { it.seriesKey.seriesId == "kb.usd" })
+                val f1 = checkNotNull(rig.bridge())
+                val rotatedAt = nowMillis()
+                krxVisible.set(false)
+                entitlements += ok(PREMIUM_HIDDEN)
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("$label: premise: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                assertNotEquals("$label: premise: a new grant", f1.grant, f2.grant)
+                awaitTrue("$label: the new context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == f2 }
+                assertNull("$label: premise: no floor yet", rig.retryFloor())
+
+                holdOld.countDown()
+                awaitTrue("$label: the old round's body ended", deadline) { tabs()[baseline].bodyEnd != null }
+                val oldEnd = checkNotNull(tabs()[baseline].bodyEnd)
+                assertEquals("$label: premise: the old answer was a 200", 200, tabs()[baseline].status)
+                awaitTrue("$label: the old answer's floor is recorded", deadline) { rig.retryFloor() != null }
+                val floorAt = checkNotNull(rig.retryFloor()).toEpochMilliseconds() - wallAtOrigin
+                println("CUT-C01 $label: old body end $oldEnd ms, floor at $floorAt ms")
+                assertTrue("$label: the floor is the Retry-After plus the jitter ($floorAt vs $oldEnd)", floorAt >= oldEnd + 30_000 - 50 && floorAt <= oldEnd + 31_000)
+                delay(300)
+                // None of the old answer is applied.
+                assertEquals("$label: the demand is unchanged", starts.toSet(), rig.kbClosedPending())
+                val applied = rig.onMain {
+                    rig.assembly.coordinator.state.value.entries.values.flatMap { e -> e.tab.graph.series.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } } }.toSet()
+                }
+                val protected = rig.onMain {
+                    rig.assembly.coordinator.state.value.entries.keys.mapNotNull { rig.assembly.coordinator.protectedEntry(it) }
+                        .flatMap { e -> e.tab.graph.series.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } } }.toSet()
+                }
+                val oldAll = oldValues.values.flatten().toSet()
+                assertTrue("$label: no old value in the entries", applied.intersect(oldAll).isEmpty())
+                assertTrue("$label: no old value in a protected read", protected.intersect(oldAll).isEmpty())
+                val recorded = rig.kbState()?.data?.app?.tip?.rate
+                assertFalse("$label: no old value in the recorder (tip $recorded)", recorded != null && recorded in oldAll)
+
+                // The floor holds the new context: its held requests answered, a 3m selection waits for the floor.
+                holdNew.countDown()
+                awaitTrue("$label: the new context's held requests are answered", deadline) { graph().all { it.bodyEnd != null } }
+                val graphBefore = graph().size
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the 3m tab went", deadline) { tabs().any { it.param("period") == "3m" } }
+                val threeMonth = tabs().first { it.param("period") == "3m" }
+                println("CUT-C01 $label: 3m sent ${threeMonth.start} ms")
+                assertTrue("$label: the 3m send waits for the floor (${threeMonth.start} vs $floorAt)\n${sends.timeline()}", threeMonth.start >= floorAt - 50)
+                assertTrue("$label: and for the old body end + 30 s (${threeMonth.start} vs $oldEnd)", threeMonth.start >= oldEnd + 30_000 - 50)
+                assertTrue("$label: within 2 s of it (${threeMonth.start} vs $oldEnd)", threeMonth.start <= oldEnd + 32_000)
+                assertTrue("$label: and goes at it (${threeMonth.start} vs $floorAt)", threeMonth.start <= floorAt + 2_000)
+                assertEquals("$label: no other graph send under the floor\n${sends.timeline()}", emptyList<SendRecorder.Exchange>(),
+                    graph().drop(graphBefore).filter { it.start < floorAt - 50 })
+                awaitTrue("$label: the 3m tab applied", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                settleNewSession(label, rotatedAt, deadline)
+            }
+        } finally {
+            holdOld.countDown()
+            holdNew.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 80_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-B05b: a late old completion with a Retry-After, after the same user's end (RT01-A05 separate). A 3m tab is in
+     * flight; the user signs in again and the new approval's answer is held, so the end is delivered alone and the old context
+     * is disposed. The old 3m then completes on the old token (200, values no other answer carries, Retry-After 20): nothing of
+     * it is applied, and its floor is recorded before the new approval is released. The new context's refill (catalog and
+     * tab) is not sent before that floor, and goes once it passes.
+     */
+    @Test
+    fun `RT01-B05b a late old completion after the user's end keeps its floor over the new context's refill`() = runBlocking {
+        val label = "RT01-B05b"
+        assertEquals("premise: J = 10 s for usd", 10.seconds, FreeSnapshotSchedulePolicy.jitterFor(SEED, "usd"))
+        val prepared = clearOfBoundary(90_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 80_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        val holdOld = java.util.concurrent.CountDownLatch(1)
+        val oldBody = shiftedTab(fixture("usd-3m-krx-hidden.json"), 7.0)
+        val oldAll = tabValues(oldBody).values.flatten().toSet()
+        onCatalog = { ok(fixture("catalog-krx-hidden.json")) }
+        onTab = { request ->
+            if (request.requestUrl!!.queryParameter("period") == "3m") {
+                holdOld.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                ok(oldBody).setHeader("Retry-After", 20)
+            } else ok(fixture("usd-1d-krx-hidden.json"))
+        }
+        val rig = Rig()
+        try {
+            rig.row {
+                val holder = checkNotNull(rig.coldStart(deadline))
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: catalog and the usd tab applied", deadline) {
+                    rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null }
+                }
+                val f1 = checkNotNull(rig.bridge())
+                quiet("$label settle", 3_500)
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.bodyEnd == null } }
+
+                val endAt = nowMillis()
+                entitlementsGate = java.util.concurrent.CountDownLatch(1)
+                val approval = CoroutineScope(rig.issuerJob + Dispatchers.Default).launch {
+                    val next = rig.firebase.nextGeneration()
+                    rig.coordinator.onIdentityChanged(next)
+                    rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+                }
+                var oldEnd = 0L
+                var floorAt = 0L
+                var releasedAt = 0L
+                try {
+                    awaitTrue("$label: the end alone was delivered", deadline) { rig.bridge() == null }
+                    awaitTrue("$label: the old context is disposed", deadline) { rig.assembly.coordinator.state.value.source == null }
+                    assertNull("$label: premise: no floor yet", rig.retryFloor())
+                    holdOld.countDown()
+                    awaitTrue("$label: the old 3m body ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                    oldEnd = checkNotNull(tabs().first { it.param("period") == "3m" }.bodyEnd)
+                    awaitTrue("$label: the old answer's floor is recorded", deadline) { rig.retryFloor() != null }
+                    floorAt = checkNotNull(rig.retryFloor()).toEpochMilliseconds() - wallAtOrigin
+                    println("CUT-C01 $label: old 3m body end $oldEnd ms, floor at $floorAt ms")
+                    assertTrue("$label: the floor is the Retry-After plus the jitter ($floorAt vs $oldEnd)",
+                        floorAt >= oldEnd + 30_000 - 50 && floorAt <= oldEnd + 31_000)
+                    delay(300)
+                    assertTrue("$label: nothing of the old answer is applied", rig.onMain {
+                        rig.assembly.coordinator.state.value.entries.values
+                            .flatMap { e -> e.tab.graph.series.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } } }
+                            .toSet().intersect(oldAll).isEmpty()
+                    })
+                } finally {
+                    releasedAt = nowMillis()
+                    entitlementsGate?.countDown()
+                    entitlementsGate = null
+                }
+                approval.join()
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("$label: premise: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                awaitTrue("$label: the new grant is delivered", deadline) { rig.bridge() == f2 }
+                awaitTrue("$label: the new context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == f2 }
+                // The refill waits for the floor, then goes.
+                awaitTrue("$label: the refill went", deadline) { graph().any { it.start > releasedAt } }
+                val refill = graph().filter { it.start > releasedAt }
+                println("CUT-C01 $label: refill ${refill.map { "${it.path.substringAfterLast('/')} ${it.start}" }}")
+                assertTrue("$label: no refill before the floor ($floorAt)\n${sends.timeline()}", refill.all { it.start >= floorAt - 50 })
+                assertTrue("$label: the refill goes at the floor (${refill.first().start} vs $floorAt)", refill.first().start <= floorAt + 2_000)
+                awaitTrue("$label: the refill applied", deadline) { rig.usdApplied() && graph().all { it.bodyEnd != null } }
+                assertTrue("$label: still nothing of the old answer", rig.onMain {
+                    rig.assembly.coordinator.state.value.entries.values
+                        .flatMap { e -> e.tab.graph.series.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } } }
+                        .toSet().intersect(oldAll).isEmpty()
+                })
+                settleNewSession(label, endAt, deadline)
+            }
+        } finally {
+            holdOld.countDown()
+            entitlementsGate?.countDown(); entitlementsGate = null
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 80_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
     // --- CUT-C01 batch 2a: RT03b-Q06 (cut_c01_b2_agreed.r1.md) ---------------------------------------------------------------
 
     /**
@@ -3862,9 +4951,9 @@ class PremiumGraphCutoverAcceptanceTest {
         return (1..144).map { current - it * 600L }.reversed()
     }
 
-    /** A usd 1d tab whose kb.usd holds a point at each of [starts], stamped from the test's clock. */
-    private fun usdTab(starts: List<Long>): String {
-        val base = wire.parseToJsonElement(fixture("usd-1d-krx-hidden.json")).jsonObject
+    /** A usd 1d tab (from the fixture [from]) whose kb.usd holds a point at each of [starts], stamped from the test's clock. */
+    private fun usdTab(starts: List<Long>, from: String = "usd-1d-krx-hidden.json"): String {
+        val base = wire.parseToJsonElement(fixture(from)).jsonObject
         val now = System.currentTimeMillis() / 1000
         val current = now - now % 600
         val points = kotlinx.serialization.json.JsonArray(starts.map { s ->
