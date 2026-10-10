@@ -45,6 +45,7 @@ import com.jay.fxi.data.remote.C4OwnerHarness
 import com.jay.fxi.data.remote.TopicBootstrapRetryFloor
 import com.jay.fxi.data.remote.TopicCatalogue
 import com.jay.fxi.data.remote.TopicCommandClock
+import com.jay.fxi.data.remote.TopicDisplayState
 import com.jay.fxi.data.remote.TopicForegroundStream
 import com.jay.fxi.data.remote.TopicFrameDecoder
 import com.jay.fxi.data.remote.TopicRuntimeFactory
@@ -54,6 +55,7 @@ import com.jay.fxi.data.remote.TopicUseNetworkInterceptor
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
 import com.jay.fxi.di.NetworkModule
 import com.jay.fxi.domain.model.FreeTab
+import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.RateRowList
 import com.jay.fxi.domain.model.RateRowPreference
 import com.jay.fxi.ui.premium.graph.GraphScreenMount
@@ -70,11 +72,15 @@ import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.resetMain
@@ -96,6 +102,11 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -166,6 +177,8 @@ class PremiumGraphCutoverAcceptanceTest {
     /** Every server-side socket opened, in order; the last is the live one. */
     private val openSockets = Collections.synchronizedList(mutableListOf<WebSocket>())
     private val refusals = AtomicInteger()
+    /** Every topic named by a subscription the server received, in order (B06b). */
+    private val subscribed: MutableList<String> = Collections.synchronizedList(mutableListOf())
 
     /** The server side of the topic socket: answers pings and acknowledges every subscription with all its topics active. */
     private val socketServer = object : WebSocketListener() {
@@ -181,6 +194,7 @@ class PremiumGraphCutoverAcceptanceTest {
             val request = runCatching { wire.parseToJsonElement(text).jsonObject }.getOrNull() ?: return
             val id = request["request_id"]?.jsonPrimitive?.content ?: return
             val topics = request["topics"]?.jsonArray?.map { it.jsonPrimitive.content }.orEmpty()
+            subscribed += topics
             val refuse = refuseUsd
             val usd = "fx:usd-krw"
             if (refuse != null && usd in topics) {
@@ -234,7 +248,26 @@ class PremiumGraphCutoverAcceptanceTest {
     private class Firebase(@Volatile var identity: AuthIdentity?) : AuthTokenSource, AuthFenceStream {
         @Volatile private var token = "old-token"
         private val observers = Collections.synchronizedList(mutableListOf<(AuthIdentityFence?) -> Unit>())
-        override fun currentIdentity(): AuthIdentity? = identity
+        /** B06d: once armed, the one identity read made inside the sink worker's recorder observe throws this instance. */
+        val fault = java.util.concurrent.atomic.AtomicReference<RuntimeException?>(null)
+        /** Where the armed fault was thrown: the thread and the top of its stack, one entry per throw. */
+        val faultHits: MutableList<String> = Collections.synchronizedList(mutableListOf())
+        /** Each instance the armed fault threw. */
+        val faultThrown: MutableList<Throwable> = Collections.synchronizedList(mutableListOf())
+        override fun currentIdentity(): AuthIdentity? {
+            fault.get()?.let { armed ->
+                val frames = Thread.currentThread().stackTrace
+                val inObserve = frames.any { it.className == "com.jay.fxi.data.graph.GraphRecorder" && it.methodName == "observe" }
+                val inWorker = frames.any { it.className.startsWith("com.jay.fxi.data.graph.GraphRecorderTopicSink") }
+                if (inObserve && inWorker && fault.compareAndSet(armed, null)) {
+                    faultHits += Thread.currentThread().name + ": " +
+                        frames.take(16).joinToString(" < ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
+                    faultThrown += armed
+                    throw armed
+                }
+            }
+            return identity
+        }
         override suspend fun fetchToken(identity: AuthIdentity, forceRefresh: Boolean): String {
             if (forceRefresh) token = "fresh-token-${System.nanoTime()}"
             return token
@@ -321,12 +354,22 @@ class PremiumGraphCutoverAcceptanceTest {
         )
         /** What the production builder built, kept for observation only; the builder itself is the production one. */
         @Volatile var parts: com.jay.fxi.data.graph.ProcessGraphParts? = null
+        /** How many times the graph boundary built; the production owner builds once per process. */
+        val builds = AtomicInteger()
+        /** The assembly's SupervisorJob: the parent's one new child across the production build, kept for observation only. */
+        @Volatile var assemblyJob: Job? = null
+        /** The runtime display flow the owner hands every new holder, kept for observation only (read off Main). */
+        @Volatile var runtimeDisplay: StateFlow<TopicDisplayState>? = null
+        /** What the production install seed source reads: the platform's seed file, replaced (B06a·b). */
+        @Volatile var readSeed: () -> String = { SEED }
+        /** The route's owner-following collector from [openScreen]; a recreated route ends it first (A01b). */
+        var routeJob: Job? = null
         /** The permit slot the production builder was handed, kept for observation only. */
         @Volatile var permitSlot: com.jay.fxi.data.graph.LateBound<() -> com.jay.fxi.data.remote.TopicGraphRecoveryPermit?>? = null
         val production = AppProcessGraphBuilder(
             disk = Provider { disk },
             deletions = Provider { DeletionAdmissionStore() },
-            seeds = Provider { InstallSeedSource({ SEED }, Dispatchers.IO) },
+            seeds = Provider { InstallSeedSource({ readSeed() }, Dispatchers.IO) },
             api = Provider { api },
             uses = Provider { uses },
             selections = Provider { selections },
@@ -335,7 +378,15 @@ class PremiumGraphCutoverAcceptanceTest {
         )
         val builder = com.jay.fxi.data.graph.ProcessGraphBuilder { permit, seed, timeEvent, parent ->
             permitSlot = permit
-            production.build(permit, seed, timeEvent, parent).also { parts = it }
+            builds.incrementAndGet()
+            val before = parent.children.toSet()
+            val built = production.build(permit, seed, timeEvent, parent)
+            assemblyJob = (parent.children.toSet() - before).singleOrNull()
+            // The holder factory stays the production one; the wrapper only keeps the display flow it is handed.
+            com.jay.fxi.data.graph.ProcessGraphParts(built.assembly, built.seeds) { tab, display, focus, scope ->
+                runtimeDisplay = display
+                built.newHolder(tab, display, focus, scope)
+            }.also { parts = it }
         }
         val assembly get() = checkNotNull(parts) { "no graph built" }.assembly
         lateinit var owner: TopicRuntimeOwner
@@ -413,7 +464,7 @@ class PremiumGraphCutoverAcceptanceTest {
                 var active = checkNotNull(owner.consumer.currentState().ui.owner)
                 holder.onActivated(active)
                 // As the route does: a new screen owner moves the activation to it (deactivate, then activate).
-                CoroutineScope(ownerJob + main).launch {
+                routeJob = CoroutineScope(ownerJob + main).launch {
                     owner.consumer.state.collect {
                         val next = owner.consumer.currentState().ui.owner ?: return@collect
                         if (next != active) {
@@ -784,6 +835,516 @@ class PremiumGraphCutoverAcceptanceTest {
         ColdStartBudget.assertWithin(judgeRow("A10"))
     }
 
+    // --- CUT-C01 precedence: A01b, A02, B06a-d (cut_c01_pre_agreed.r1.md) ----------------------------------------
+
+    /**
+     * A01b (RT01-A01, cut_c01_pre_agreed.r1.md P01): one process graph. A repeated owner start, a recreated route (the old
+     * route's collector ended, its mount and holders closed) and tab moves through the real selection path (usd → jpy → usd)
+     * keep one build, one assembly child and the same host, parts, recorder, sink and coordinator; closing the screen leaves
+     * the recorder's data, readability and the catalog in place, and the reopened screen's recorder takes the next WS value.
+     */
+    @Test
+    fun `A01b a repeated start, a recreated route and tab moves keep one process graph and the closed screen leaves the recorder open`() = runBlocking {
+        val prepared = clearOfBoundary(60_000)
+        println("CUT-C01 A01b: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 45_000
+        onTab = { request ->
+            if (request.requestUrl!!.queryParameter("tab") == "jpy") ok(jpyTab()) else ok(fixture("usd-1d-krx-hidden.json"))
+        }
+        val rig = Rig()
+        rig.row {
+            val holder = checkNotNull(rig.coldStart(deadline))
+            rig.awaitTopics(deadline)
+            awaitTrue("catalog and the usd tab applied", deadline) { rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+            awaitTrue("an acknowledged socket", deadline) { openSockets.isNotEmpty() }
+            openSockets.last().send(usdSnapshot(1390.0))
+            awaitTrue("the WS delivery recorded kb.usd", deadline) { rig.hasKbSeries() }
+            awaitTrue("the usd chart is shown", deadline) { rig.onMain { holder.currentState().chart != null } }
+            val first = rig.instances()
+            assertEquals("one build", 1, rig.builds.get())
+            val assemblyJob = checkNotNull(rig.assemblyJob) { "the build added exactly one child to the owner's job" }
+
+            // (a) a repeated start does nothing.
+            rig.onMain { rig.owner.start() }
+            assertEquals("a repeated start builds nothing", 1, rig.builds.get())
+            assertEquals("a repeated start keeps every instance", first, rig.instances())
+
+            // (b) a recreated route: the old route's collector ended, its mount closed and each holder's close completed.
+            checkNotNull(rig.routeJob).cancelAndJoin()
+            val closing = rig.onMain { checkNotNull(rig.mount).let { m -> m.holders.value.values.toList().also { m.close() } } }
+            // The mount's close itself takes its holders out of the host and closes them. The test waits until the host has
+            // started each close, then joins it (close() on a closed holder only waits for its completion).
+            val stillMounted = rig.onMain { checkNotNull(rig.owner.graphHost.value).holders() }
+            assertTrue("the mount's close took its holders out of the host", closing.none { it in stillMounted })
+            awaitTrue("the host closed each old holder", deadline) { rig.onMain { closing.all { privateFlag(it, "closed") } } }
+            withContext(main) { closing.forEach { it.close() } }
+            val fence = checkNotNull(rig.coordinator.topicGrantResult().fence)
+            val lifetime = checkNotNull(rig.uses.acquire(fence))
+            rig.onMain {
+                val recorder = rig.assembly.recorder
+                assertTrue("the closed screen left kb.usd in the recorder", recorder.state.value.series.keys.any { it.seriesId == "kb.usd" })
+                assertNotEquals("the recorder is still readable", com.jay.fxi.data.graph.GraphTabRecoveryDemand.Unreadable,
+                    recorder.recoveryDemand("usd", fence, lifetime, kotlinx.datetime.Clock.System.now()))
+                assertTrue("the recorder still exposes its data", recorder.exposed(fence, lifetime).isNotEmpty())
+                assertNotNull("the catalog is kept", rig.assembly.coordinator.state.value.catalog)
+            }
+            val reopened = rig.openScreen(deadline)
+            rig.showSurface(reopened, deadline)
+            assertNotSame("the recreated route has a new holder", holder, reopened)
+            assertEquals("premise: kb.usd's tip is the first snapshot", 1390.0, rig.kbTipRate())
+            delay(1_100) // the next snapshot's second-resolution timestamp is later than the first
+            openSockets.last().send(usdSnapshot(1391.0))
+            awaitTrue("the process recorder took the next WS value", deadline) { rig.kbTipRate() == 1391.0 }
+
+            // (c) tab moves through the real selection path.
+            checkNotNull(rig.routeJob).cancelAndJoin()
+            val jpy = rig.moveTo(FreeTab.JPY, from = reopened, deadline)
+            awaitTrue("the jpy tab applied", deadline) {
+                rig.assembly.coordinator.state.value.entries.keys.any { it.tab == "jpy" } && tabs().all { it.bodyEnd != null }
+            }
+            rig.moveTo(FreeTab.USD, from = jpy, deadline)
+            assertEquals("tab moves build nothing", 1, rig.builds.get())
+            assertEquals("tab moves keep every instance", first, rig.instances())
+            assertTrue("the assembly is still running", assemblyJob.isActive)
+            quiet("A01b", 5_000)
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 45_000)
+        assertEquals(emptyList<Throwable>(), rig.reports)
+        ColdStartBudget.assertWithin(judgeRow("A01b"))
+    }
+
+    private data class Instances(val host: Any?, val parts: Any?, val assembly: Any, val recorder: Any, val sink: Any, val coordinator: Any) {
+        override fun equals(other: Any?) = other is Instances && host === other.host && parts === other.parts &&
+            assembly === other.assembly && recorder === other.recorder && sink === other.sink && coordinator === other.coordinator
+        override fun hashCode() = System.identityHashCode(assembly)
+    }
+    private suspend fun Rig.instances() = onMain {
+        Instances(owner.graphHost.value, parts, assembly, assembly.recorder, assembly.sink, assembly.coordinator)
+    }
+
+    /**
+     * A02 (RT01-A02, P02 — PARTIAL by agreement: purge waits for the production purge wiring). Observed publications of the
+     * recorder, the graph coordinator and the usd holder after real inputs (a WS snapshot, a series toggle) all come from
+     * Main; fresh reads on Main read the holder and the recorder; and a WS snapshot the runtime has taken off Main — its quote
+     * already in the runtime's own display — leaves the recorder unchanged while Main is held, and lands once Main is free.
+     */
+    @Test
+    fun `A02 graph publications and fresh reads run on Main and the topic reaches the recorder only through the sink queue`() = runBlocking {
+        val start = nowMillis()
+        val deadline = start + 30_000
+        onTab = { request ->
+            if (request.requestUrl!!.queryParameter("period") == "3m") ok(fixture("usd-3m-krx-hidden.json")) else ok(fixture("usd-1d-krx-hidden.json"))
+        }
+        val rig = Rig()
+        rig.row {
+            val holder = checkNotNull(rig.coldStart(deadline))
+            rig.awaitTopics(deadline)
+            awaitTrue("catalog and the usd tab applied", deadline) { rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+            awaitTrue("an acknowledged socket", deadline) { openSockets.isNotEmpty() }
+            openSockets.last().send(usdSnapshot(1390.0))
+            awaitTrue("the WS delivery recorded kb.usd", deadline) { rig.hasKbSeries() }
+            awaitTrue("the usd chart is shown", deadline) { rig.onMain { holder.currentState().chart != null } }
+            val display = checkNotNull(rig.runtimeDisplay) { "the holder factory was handed the runtime display" }
+
+            // Each collector records, without suspending, the thread a publication resumed it on and the value it carried; the
+            // initial replay is dropped. Inputs are paired with the publications carrying their effect, by value.
+            val recorderSeen = Collections.synchronizedList(mutableListOf<Pair<String, Double?>>())
+            val coordinatorSeen = Collections.synchronizedList(mutableListOf<Pair<String, Boolean>>())
+            val holderSeen = Collections.synchronizedList(mutableListOf<Pair<String, Boolean?>>())
+            val kbSelected = { state: com.jay.fxi.ui.premium.graph.GraphV2ScreenState -> state.toggles.firstOrNull { it.seriesId == "kb.usd" }?.selected }
+            val has3m = { rig.assembly.coordinator.state.value.entries.keys.any { it.tab == "usd" && it.period.code == "3m" } }
+            val observers = rig.onMain {
+                val scope = CoroutineScope(rig.ownerJob + Dispatchers.Unconfined)
+                listOf(
+                    scope.launch { rig.assembly.recorder.state.drop(1).collect { recorderSeen += threadName() to kbTipRate(it) } },
+                    scope.launch {
+                        rig.assembly.coordinator.state.drop(1).collect { c ->
+                            coordinatorSeen += threadName() to c.entries.keys.any { it.tab == "usd" && it.period.code == "3m" }
+                        }
+                    },
+                    scope.launch { holder.state.drop(1).collect { holderSeen += threadName() to kbSelected(it) } }
+                )
+            }
+            try {
+                // A WS snapshot: the recorder publication that carries its value.
+                delay(1_100)
+                openSockets.last().send(usdSnapshot(1391.0))
+                awaitTrue("the snapshot's recorder publication", deadline) { recorderSeen.any { it.second == 1391.0 } }
+
+                // A series toggle: a real selection change, then the holder publication that carries it. Read from the published
+                // state off Main: currentState() would itself publish.
+                val published = holder.state.value
+                val token = checkNotNull(published.inlineToken)
+                val selected = checkNotNull(kbSelected(published))
+                rig.onMain { holder.toggleSeries(token, "kb.usd") }
+                awaitTrue("the holder published the changed selection", deadline) { holderSeen.any { it.second == !selected } }
+
+                // A period change: the graph coordinator's request and the publication that carries it.
+                rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
+                awaitTrue("the 3m tab applied", deadline) { has3m() && tabs().all { it.bodyEnd != null } }
+                awaitTrue("the coordinator published it", deadline) { coordinatorSeen.any { it.second } }
+
+                // Fresh reads on Main.
+                val fence = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                val lifetime = checkNotNull(rig.uses.acquire(fence))
+                rig.onMain {
+                    assertEquals("fresh reads run on Main", "acceptance-main", threadName())
+                    assertNotNull("the holder's fresh state has a chart", holder.currentState().chart)
+                    assertTrue("the recorder exposes kb.usd", rig.assembly.recorder.exposed(fence, lifetime).keys.any { it.seriesId == "kb.usd" })
+                    assertNotEquals("the recorder is readable", com.jay.fxi.data.graph.GraphTabRecoveryDemand.Unreadable,
+                        rig.assembly.recorder.recoveryDemand("usd", fence, lifetime, kotlinx.datetime.Clock.System.now()))
+                }
+
+                // The queue boundary: Main held, the runtime takes the snapshot, the recorder waits for Main.
+                val entered = java.util.concurrent.CountDownLatch(1)
+                val release = java.util.concurrent.CountDownLatch(1)
+                delay(1_100)
+                mainExecutor.execute { entered.countDown(); release.await() }
+                try {
+                    assertTrue("Main is held", entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    val recorderBefore = rig.assembly.recorder.state.value
+                    assertEquals("premise: the recorder holds the earlier snapshot", 1391.0, kbTipRate(recorderBefore))
+                    openSockets.last().send(usdSnapshot(1392.0))
+                    awaitTrue("the runtime display shows the new quote while Main is held", deadline) { kbUsdShown(display, 1392.0) }
+                    assertSame("the recorder state is unchanged while Main is held",
+                        recorderBefore, rig.assembly.recorder.state.value)
+                    assertEquals("the recorder has not taken it while Main is held", 1391.0, rig.kbTipRate())
+                } finally {
+                    release.countDown()
+                }
+                awaitTrue("the recorder takes it once Main is free", deadline) { recorderSeen.any { it.second == 1392.0 } }
+            } finally {
+                observers.forEach { it.cancelAndJoin() }
+            }
+            for ((name, seen) in listOf("recorder" to recorderSeen.map { it.first }, "coordinator" to coordinatorSeen.map { it.first },
+                "holder" to holderSeen.map { it.first })) {
+                assertEquals("every observed $name publication came from Main: $seen", setOf("acceptance-main"), seen.toSet())
+            }
+            quiet("A02", 3_000)
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 30_000)
+        ColdStartBudget.assertWithin(judgeRow("A02"))
+    }
+
+    /**
+     * B06a (RT01-B06, P03): a cancellation before the graph starts. The owner's Main scope is cancelled while the production
+     * install seed source's read is held on IO (before the assembly starts); the read is released by the live test caller and
+     * really ends. The starter's cleanup closes the assembly: no host, no report (a cancellation), the recorder unreadable, no
+     * graph send.
+     */
+    @Test
+    fun `B06a a cancellation before the graph starts closes the assembly with no host, no report and no graph send`() = runBlocking {
+        val start = nowMillis()
+        val deadline = start + 20_000
+        val rig = Rig()
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val ended = java.util.concurrent.CountDownLatch(1)
+        rig.readSeed = {
+            entered.countDown()
+            try { release.await(15, java.util.concurrent.TimeUnit.SECONDS) } finally { ended.countDown() }
+            SEED
+        }
+        rig.row {
+            rig.coldStart(deadline, activate = false)
+            try {
+                awaitTrue("the seed read is held", deadline) { entered.count == 0L }
+                val assemblyJob = checkNotNull(rig.assemblyJob)
+                assertNull("no host before the start", rig.onMain { rig.owner.graphHost.value })
+                rig.ownerJob.cancel()
+            } finally {
+                release.countDown()
+            }
+            awaitTrue("the seed read ended", deadline) { ended.count == 0L }
+            rig.ownerJob.join()
+            val assemblyJob = checkNotNull(rig.assemblyJob)
+            awaitTrue("the assembly's job completed", deadline) { assemblyJob.isCompleted }
+            assertNull("no host", rig.onMain { rig.owner.graphHost.value })
+            assertEquals("a cancellation is not reported", emptyList<Throwable>(), rig.reports)
+            rig.assertRecorderClosed()
+            assertEquals("no graph send", emptyList<SendRecorder.Exchange>(), graph())
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 20_000)
+        ColdStartBudget.assertWithin(judgeRow("B06a"))
+    }
+
+    /**
+     * B06b (P03, the start-failure auxiliary row — not RT01-B06's worker failure): the production install seed source's read
+     * throws one IOException. It is reported once, as that instance; no host ever; the assembly closed; no graph send; the
+     * topic goes on (every desired topic, a handshake).
+     */
+    @Test
+    fun `B06b a seed read failure gives up the graph once, reported, and the topic goes on`() = runBlocking {
+        val start = nowMillis()
+        val deadline = start + 20_000
+        val failure = java.io.IOException("install seed unreadable")
+        val rig = Rig()
+        rig.readSeed = { throw failure }
+        rig.row {
+            rig.coldStart(deadline, activate = false)
+            awaitTrue("the graph failure reported", deadline) { rig.reports.isNotEmpty() }
+            val assemblyJob = checkNotNull(rig.assemblyJob)
+            awaitTrue("the assembly's job completed", deadline) { assemblyJob.isCompleted }
+            rig.awaitTopics(deadline)
+            // After the failure the topic still delivers: a new WS snapshot reaches the runtime display (read from the consumer,
+            // since no holder was ever made).
+            awaitTrue("an acknowledged socket", deadline) { openSockets.isNotEmpty() }
+            @Suppress("UNCHECKED_CAST")
+            val runtimeDisplay = rig.onMain { privateField(rig.owner.consumer, "display") } as StateFlow<TopicDisplayState>
+            delay(1_100)
+            openSockets.last().send(usdSnapshot(1391.0))
+            awaitTrue("after the failure the topic still delivers", deadline) { kbUsdShown(runtimeDisplay, 1391.0) }
+            quiet("B06b", 3_000)
+            assertEquals("one connection", 1, handshakes().size)
+            assertTrue("a usd subscription was sent: $subscribed", "fx:usd-krw" in subscribed)
+            assertEquals("reported once", 1, rig.reports.size)
+            // kotlinx.coroutines' debug-mode stack-trace recovery (on in this test JVM, off in a release build) may hand over a copy
+            // whose cause chain holds the read's own instance.
+            val reported = rig.reports.single()
+            val chain = generateSequence(reported) { it.cause }.toList()
+            assertTrue("the read's own failure, as itself or in the cause chain $chain", chain.any { it === failure })
+            assertEquals("of the read's type and message", failure.javaClass to failure.message, reported.javaClass to reported.message)
+            assertNull("no host", rig.onMain { rig.owner.graphHost.value })
+            rig.assertRecorderClosed()
+            assertEquals("no graph send", emptyList<SendRecorder.Exchange>(), graph())
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 20_000)
+        ColdStartBudget.assertWithin(judgeRow("B06b"))
+    }
+
+    /**
+     * The recorder after its own close: its closed flag set and its state emptied (GraphRecorder.close), then nothing exposed
+     * and every demand unreadable. The last two alone would also follow from the assembly's bridge closing first. Read on Main.
+     */
+    private suspend fun Rig.assertRecorderClosed() {
+        val fence = checkNotNull(coordinator.topicGrantResult().fence)
+        val lifetime = checkNotNull(uses.acquire(fence))
+        onMain {
+            val recorder = assembly.recorder
+            assertTrue("the recorder itself is closed", privateFlag(recorder, "closed"))
+            assertTrue("the recorder's state was emptied", recorder.state.value.series.isEmpty())
+            assertEquals("the recorder is unreadable", com.jay.fxi.data.graph.GraphTabRecoveryDemand.Unreadable,
+                recorder.recoveryDemand("usd", fence, lifetime, kotlinx.datetime.Clock.System.now()))
+            assertTrue("the recorder exposes nothing", recorder.exposed(fence, lifetime).isEmpty())
+        }
+    }
+
+    /**
+     * B06c (P03): a duplicate close and nothing after it. With a usable usd UI token and recorder data in hand, two closes
+     * started together by a live caller on Main both return normally and the assembly's job completes. After that baseline,
+     * the token's period selection and retry, a real WS snapshot (seen by the runtime display) and a foreground return add no
+     * graph send, no recorder change and no report for 5 s.
+     */
+    @Test
+    fun `B06c two concurrent closes both return and nothing after them sends, records or reports`() = runBlocking {
+        val start = nowMillis()
+        val deadline = start + 30_000
+        onTab = { request ->
+            if (request.requestUrl!!.queryParameter("period") == "3m") ok(fixture("usd-3m-krx-hidden.json")) else ok(fixture("usd-1d-krx-hidden.json"))
+        }
+        val rig = Rig()
+        rig.row {
+            val holder = checkNotNull(rig.coldStart(deadline))
+            rig.awaitTopics(deadline)
+            awaitTrue("catalog and the usd tab applied", deadline) { rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+            awaitTrue("an acknowledged socket", deadline) { openSockets.isNotEmpty() }
+            openSockets.last().send(usdSnapshot(1390.0))
+            awaitTrue("the WS delivery recorded kb.usd", deadline) { rig.hasKbSeries() }
+            val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+            // The token is usable before the close: its period selection sends and applies.
+            rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
+            awaitTrue("the token's 3m selection applied", deadline) {
+                rig.assembly.coordinator.state.value.entries.keys.any { it.tab == "usd" && it.period.code == "3m" } && tabs().all { it.bodyEnd != null }
+            }
+            val display = checkNotNull(rig.runtimeDisplay)
+            val assemblyJob = checkNotNull(rig.assemblyJob)
+
+            // Each close reports whether the assembly's job had completed at the moment it returned.
+            val completedAtReturn = withContext(main) {
+                val first = async { rig.assembly.close(); assemblyJob.isCompleted }
+                val second = async { rig.assembly.close(); assemblyJob.isCompleted }
+                listOf(first.await(), second.await())
+            }
+            assertEquals("each close returned only after the assembly's job completed", listOf(true, true), completedAtReturn)
+            rig.assertRecorderClosed()
+            val graphBefore = graph().size
+            val recorderBefore = rig.onMain { rig.assembly.recorder.state.value }
+            val reportsBefore = rig.reports.size
+
+            // A period this holder never fetched: an open coordinator would have to send for it.
+            rig.onMain {
+                holder.selectPeriod(token, GraphPeriod.ONE_WEEK)
+                holder.retrySelection(token)
+            }
+            delay(1_100)
+            openSockets.last().send(usdSnapshot(1391.0))
+            awaitTrue("the runtime took the snapshot", deadline) { kbUsdShown(display, 1391.0) }
+            rig.foreground.value = false
+            delay(200)
+            rig.foreground.value = true
+            val until = nowMillis() + 5_000
+            while (nowMillis() < until) {
+                assertEquals("no graph send after the close\n${sends.timeline()}", graphBefore, graph().size)
+                assertSame("no recorder change after the close", recorderBefore, rig.onMain { rig.assembly.recorder.state.value })
+                assertEquals("no report after the close", reportsBefore, rig.reports.size)
+                delay(100)
+            }
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 30_000)
+        ColdStartBudget.assertWithin(judgeRow("B06c"))
+    }
+
+    /**
+     * B06d (RT01-B06's worker failure, P03 + agreed question 1): after real WS data is recorded and the start has settled, one
+     * Firebase identity read — only the one made inside the sink worker's recorder observe, once, as one instance — throws.
+     * The sink closes its pipeline: the recorder unreadable and empty, the sink answering CLOSED, the worker and the recorder's
+     * collector (their jobs held before) completed, the other assembly children still running. The topic goes on (the next
+     * snapshot reaches the runtime display, the recorder stays closed) and the coordinator still serves a period change. An
+     * explicit close from a live Main caller then returns and every assembly child completes.
+     */
+    @Test
+    fun `B06d a worker failure closes the sink pipeline and nothing else`() = runBlocking {
+        val start = nowMillis()
+        val deadline = start + 30_000
+        onTab = { request ->
+            if (request.requestUrl!!.queryParameter("period") == "3m") ok(fixture("usd-3m-krx-hidden.json")) else ok(fixture("usd-1d-krx-hidden.json"))
+        }
+        val failure = RuntimeException("firebase identity read failed")
+        val rig = Rig()
+        rig.row {
+            val holder = checkNotNull(rig.coldStart(deadline))
+            rig.awaitTopics(deadline)
+            awaitTrue("catalog and the usd tab applied", deadline) { rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+            awaitTrue("an acknowledged socket", deadline) { openSockets.isNotEmpty() }
+            openSockets.last().send(usdSnapshot(1390.0))
+            awaitTrue("the WS delivery recorded kb.usd", deadline) { rig.hasKbSeries() }
+            quiet("B06d settle", 1_000)
+            val display = checkNotNull(rig.runtimeDisplay)
+            val assemblyJob = checkNotNull(rig.assemblyJob)
+            val (worker, collector) = rig.onMain { rig.privateJob(rig.assembly.sink, "worker") to rig.privateJob(rig.assembly.recorder, "collector") }
+            val children = assemblyJob.children.toList()
+            assertTrue("the worker and the recorder collector are assembly children", worker in children && collector in children)
+            assertTrue("both run before the fault", worker.isActive && collector.isActive)
+
+            rig.firebase.fault.set(failure)
+            delay(1_100)
+            openSockets.last().send(usdSnapshot(1391.0))
+            awaitTrue("the fault was taken", deadline) { rig.firebase.faultHits.isNotEmpty() }
+            awaitTrue("the worker and the collector completed", deadline) { worker.isCompleted && collector.isCompleted }
+            assertNull("the fault is spent", rig.firebase.fault.get())
+            assertEquals("taken exactly once: ${rig.firebase.faultHits}", 1, rig.firebase.faultHits.size)
+            assertSame("the armed instance was thrown", failure, rig.firebase.faultThrown.single())
+            assertTrue("inside the recorder's observe", "GraphRecorder.observe" in rig.firebase.faultHits.single())
+            rig.assertRecorderClosed()
+            val closedState = rig.assembly.recorder.state.value
+            val offer = rig.onMain { rig.assembly.sink.tryOffer(rig.anyGraphInput()) }
+            assertEquals("the sink answers closed", com.jay.fxi.data.remote.TopicGraphOffer.CLOSED, offer)
+            // The coordinator's loop and the recovery events' ticks, identified by reflection, still run; the events still take
+            // input: a background and foreground return replaces their ticks.
+            val loop = rig.onMain { privateField(rig.assembly.coordinator, "loop") as Job }
+            assertTrue("the coordinator's loop still runs", loop.isActive)
+            @Suppress("UNCHECKED_CAST")
+            val ticksBefore = rig.onMain { (privateField(rig.assembly.events, "ticks") as List<Job>).toList() }
+            assertTrue("the events' ticks still run", ticksBefore.isNotEmpty() && ticksBefore.all { it.isActive })
+            rig.foreground.value = false
+            delay(200)
+            rig.foreground.value = true
+            awaitTrue("the events took the foreground return", deadline) {
+                @Suppress("UNCHECKED_CAST")
+                val now = rig.onMain { (privateField(rig.assembly.events, "ticks") as List<Job>).toList() }
+                now.isNotEmpty() && now.none { it in ticksBefore } && now.all { it.isActive }
+            }
+
+            delay(1_100)
+            openSockets.last().send(usdSnapshot(1392.0))
+            awaitTrue("the topic goes on", deadline) { kbUsdShown(display, 1392.0) }
+            assertSame("the closed recorder took nothing more", closedState, rig.assembly.recorder.state.value)
+            val tabsBefore = tabs().size
+            val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+            rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
+            awaitTrue("the coordinator still serves a period change", deadline) {
+                tabs().size > tabsBefore && tabs().all { it.bodyEnd != null } &&
+                    rig.assembly.coordinator.state.value.entries.keys.any { it.period.code == "3m" }
+            }
+            withContext(main) { rig.assembly.close() }
+            assertTrue("every assembly child completed", assemblyJob.isCompleted && assemblyJob.children.none())
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 30_000)
+        ColdStartBudget.assertWithin(judgeRow("B06d"))
+    }
+
+    /** A private Job field of a production component, read by reflection for observation only (B06d). */
+    private fun Rig.privateJob(owner: Any, name: String): Job =
+        owner.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(owner) as Job
+
+    /** Any graph input: a closed sink answers CLOSED before reading one (GraphRecorderTopicSink.tryOffer). */
+    private fun Rig.anyGraphInput(): com.jay.fxi.data.remote.TopicGraphInput = com.jay.fxi.data.remote.TopicGraphInput.Continuity(
+        sequence = 0, kind = com.jay.fxi.data.remote.TopicGraphEventKind.INITIAL, reason = null, topics = emptySet(), paths = emptySet(),
+        authority = com.jay.fxi.data.remote.TopicGraphAuthority(Any(), null, 0L, null), connectionGeneration = null, occurredAtEpochMillis = 0L
+    )
+
+    /**
+     * A jpy 1d tab derived from the usd contract fixture by one declared mapping — tab `jpy`, every series id and in-progress
+     * key `.usd` → `.jpy`, `dxy` removed — which yields exactly the corpus's jpy 1d ids (registry/allowed-identifiers.json).
+     */
+    private fun jpyTab(): String {
+        val base = wire.parseToJsonElement(fixture("usd-1d-krx-hidden.json")).jsonObject
+        fun jpy(id: String) = id.removeSuffix(".usd") + ".jpy"
+        val series = kotlinx.serialization.json.JsonArray(base.getValue("series").jsonArray
+            .filter { it.jsonObject.getValue("id").jsonPrimitive.content != "dxy" }
+            .map { element ->
+                val obj = element.jsonObject
+                kotlinx.serialization.json.JsonObject(obj + ("id" to kotlinx.serialization.json.JsonPrimitive(jpy(obj.getValue("id").jsonPrimitive.content))))
+            })
+        val inProgress = kotlinx.serialization.json.JsonObject(base.getValue("in_progress").jsonObject
+            .filterKeys { it != "dxy" }.mapKeys { jpy(it.key) })
+        return kotlinx.serialization.json.JsonObject(base + mapOf(
+            "tab" to kotlinx.serialization.json.JsonPrimitive("jpy"), "series" to series, "in_progress" to inProgress
+        )).toString()
+    }
+
+    /** kb.usd's latest recorded observation rate, or null; a StateFlow read, safe off Main. */
+    private fun Rig.kbTipRate(): Double? = kbTipRate(assembly.recorder.state.value)
+
+    private fun kbTipRate(state: com.jay.fxi.data.graph.GraphRecorderState): Double? =
+        state.series.entries.firstOrNull { it.key.seriesId == "kb.usd" }?.value?.data?.app?.tip?.rate
+
+    /** A private Boolean field of a production component, read by reflection for observation only. */
+    private fun privateFlag(owner: Any, name: String): Boolean =
+        owner.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(owner) as Boolean
+
+    /** A private field of a production component, read by reflection for observation only. */
+    private fun privateField(owner: Any, name: String): Any? =
+        owner.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(owner)
+
+    /** The current thread's name without the " @coroutine#n" suffix kotlinx.coroutines' debug mode appends. */
+    private fun threadName(): String = Thread.currentThread().name.substringBefore(" @coroutine")
+
+    private fun kbUsdShown(display: StateFlow<TopicDisplayState>, rate: Double) =
+        display.value.rates.quotes[com.jay.fxi.domain.model.TopicQuoteKey("kb", "usd-krw")]?.rate == rate
+
+    /**
+     * As the route does on a tab tap: select it through the consumer, then — once the screen shows it for an owner and its
+     * holder is mounted — hide the old surface, move the activation to that tab's holder and report its surface shown.
+     */
+    private suspend fun Rig.moveTo(tab: FreeTab, from: GraphV2ScreenStateHolder, deadline: Long): GraphV2ScreenStateHolder {
+        val key = checkNotNull(tab.serverTab)
+        val screenOwner = onMain { checkNotNull(owner.consumer.currentState().ui.owner) }
+        onMain { owner.consumer.onUserTabSelected(screenOwner, tab) }
+        awaitTrue("the screen shows $key for an owner", deadline) {
+            onMain { owner.consumer.currentState().ui.let { it.selectedTab == tab && it.owner != null } }
+        }
+        awaitTrue("the $key holder is mounted", deadline) { onMain { checkNotNull(mount).holders.value.containsKey(key) } }
+        val target = onMain {
+            from.currentState().inlineToken?.let { from.setSurfaceVisible(it, false) }
+            from.onDeactivated()
+            checkNotNull(mount).holders.value.getValue(key).also { it.onActivated(checkNotNull(owner.consumer.currentState().ui.owner)) }
+        }
+        showSurface(target, deadline)
+        return target
+    }
+
     /** Waits, before anything starts, until the next 600-second bucket boundary is more than [millis] away. */
     private suspend fun clearOfBoundary(millis: Long): Long {
         val before = nowMillis()
@@ -1064,12 +1625,12 @@ class PremiumGraphCutoverAcceptanceTest {
     private fun isoAt(epochSecond: Long) = isoKst.format(java.time.Instant.ofEpochSecond(epochSecond).atOffset(kst))
 
     /** The usd topic snapshot (contract fixture envelope) with one kb quote stamped now and nothing else. */
-    private fun usdSnapshot(): String {
+    private fun usdSnapshot(rate: Double = 1390.0): String {
         val base = wire.parseToJsonElement(File("src/test/resources/contracts/v2/topic/snapshot-fx-usd-krw.json").readText()).jsonObject
         val data = base.getValue("data").jsonObject
         val kb = kotlinx.serialization.json.buildJsonObject {
             put("asset", kotlinx.serialization.json.JsonPrimitive("usd-krw"))
-            put("rate", kotlinx.serialization.json.JsonPrimitive(1390.0))
+            put("rate", kotlinx.serialization.json.JsonPrimitive(rate))
             put("source", kotlinx.serialization.json.JsonPrimitive("kb"))
             put("timestamp", kotlinx.serialization.json.JsonPrimitive(isoAt(System.currentTimeMillis() / 1000)))
         }
