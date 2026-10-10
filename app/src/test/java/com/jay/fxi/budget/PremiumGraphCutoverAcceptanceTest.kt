@@ -3288,7 +3288,12 @@ class PremiumGraphCutoverAcceptanceTest {
                 awaitTrue("$label: the 3m tab applied", deadline) { tabs().drop(baseline).any { it.param("period") == "3m" && it.bodyEnd != null } }
                 holder
             } else {
-                rig.moveTo(FreeTab.JPY, holder, deadline)
+                rig.moveTo(FreeTab.JPY, holder, deadline).also {
+                    // The jpy key's own activation request can follow the move: it is sent and answered before the away window.
+                    awaitTrue("$label: the jpy tab applied", deadline) {
+                        tabs().drop(baseline).any { t -> t.param("tab") == "jpy" && t.bodyEnd != null }
+                    }
+                }
             }
             assertTrue("$label: premise: usd 1d left before the round was due (${nowMillis()} vs $due)", nowMillis() < due)
             awaitTrue("$label: the away key's request settled", deadline) { graph().all { it.bodyEnd != null } }
