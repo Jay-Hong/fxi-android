@@ -2280,14 +2280,27 @@ class PremiumGraphCutoverAcceptanceTest {
         val hold3m = java.util.concurrent.CountDownLatch(1)
         val holdDelete = java.util.concurrent.CountDownLatch(1)
         onCatalog = { ok(fixture("catalog-krx-visible.json")) }
+        val rigRef = java.util.concurrent.atomic.AtomicReference<Rig?>(null)
+        val catalogSeen = java.util.concurrent.atomic.AtomicBoolean(false)
         onTab = { request ->
             when (request.requestUrl!!.queryParameter("period")) {
                 "3m" -> { hold3m.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("usd-3m-krx-visible.json")) }
                 "1w" -> ok(fixture("usd-3m-krx-visible.json")) // a screen action's send: counted, its answer not judged
-                else -> ok(fixture("usd-1d-krx-visible.json"))
+                else -> {
+                    // The first 1d answer waits for the catalog's adoption, so the screen initializes its selection from the
+                    // catalog's defaults (without a catalog it would show every admitted series, KRX included).
+                    val until = System.nanoTime() + 10_000_000_000L
+                    while (!catalogSeen.get() && System.nanoTime() < until) {
+                        if (rigRef.get()?.let { it.parts != null && it.assembly.coordinator.state.value.catalog != null } == true) {
+                            catalogSeen.set(true)
+                        } else Thread.sleep(10)
+                    }
+                    ok(fixture("usd-1d-krx-visible.json"))
+                }
             }
         }
         val rig = Rig()
+        rigRef.set(rig)
         val deletion = java.util.concurrent.atomic.AtomicReference<Job?>(null)
         val resolving = java.util.concurrent.atomic.AtomicReference<Job?>(null)
         val sealFailure = java.io.IOException("access record write failed")
@@ -2311,12 +2324,21 @@ class PremiumGraphCutoverAcceptanceTest {
                 awaitTrue("$label: the screen is back on the 1d chart", deadline) {
                     rig.onMain { holder.currentState().let { it.activePeriod == GraphPeriod.ONE_DAY && it.chart != null && it.inlineToken?.period == GraphPeriod.ONE_DAY } }
                 }
-                // KRX selected by a real screen action and rendered, so its render can be judged in the state.
+                // KRX selected by a real screen action and rendered, so its render can be judged in the state. Before it, the
+                // confirmed selection (the catalog's defaults) holds no KRX and the toggle is offered.
                 val krxId = "krx.usd-krw-futures"
-                rig.onMain { holder.toggleSeries(checkNotNull(holder.currentState().inlineToken), krxId) }
-                awaitTrue("$label: premise: the toggled KRX is rendered and prepared beside GENERAL", deadline) {
+                val ready = com.jay.fxi.ui.premium.graph.GraphV2SelectionStatus.READY
+                rig.onMain {
+                    val st = holder.currentState()
+                    assertTrue("$label: premise: a ready selection without KRX, its toggle offered (${st.selectionStatus} ${st.selection})",
+                        st.selectionStatus == ready && st.selection?.visibleSeriesIds?.contains(krxId) == false &&
+                            st.toggles.any { it.seriesId == krxId && it.enabled && !it.selected })
+                    holder.toggleSeries(checkNotNull(st.inlineToken), krxId)
+                }
+                awaitTrue("$label: premise: the toggle committed KRX to the confirmed selection and it renders beside GENERAL", deadline) {
                     rig.onMain {
-                        holder.currentState().chart?.let { chart ->
+                        val st = holder.currentState()
+                        st.selectionStatus == ready && st.selection?.visibleSeriesIds?.contains(krxId) == true && st.chart?.let { chart ->
                             krxId in chart.renderedIds && chart.renderedIds.any { !it.startsWith("krx.") } && krxId in chart.prepared.bySeries
                         } == true
                     }
