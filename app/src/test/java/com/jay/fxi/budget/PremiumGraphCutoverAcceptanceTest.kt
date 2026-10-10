@@ -168,6 +168,8 @@ class PremiumGraphCutoverAcceptanceTest {
     private fun ok(body: String) = MockResponse().setResponseCode(200).setBody(body)
     private fun unauthorized() = MockResponse().setResponseCode(401).setBody("""{"detail":"expired"}""")
 
+    /** RT01-A10: run on the same socket right after a refusal's acknowledgement was sent (before the client can act on it). */
+    @Volatile private var afterRefusal: ((WebSocket) -> Unit)? = null
     /** While set, each subscription naming the usd topic is acknowledged with that topic refused, after this hook runs. */
     @Volatile private var refuseUsd: (() -> Unit)? = null
     /** When each WebSocket request reached the server (the client's Connection exists by then), in order. */
@@ -177,6 +179,12 @@ class PremiumGraphCutoverAcceptanceTest {
     /** Every server-side socket opened, in order; the last is the live one. */
     private val openSockets = Collections.synchronizedList(mutableListOf<WebSocket>())
     private val refusals = AtomicInteger()
+    /** While set, each entitlements answer waits for this gate (B1); [entitlementsHeld] counts the requests that waited. */
+    @Volatile private var entitlementsGate: java.util.concurrent.CountDownLatch? = null
+    private val entitlementsHeld = AtomicInteger()
+    /** The account deletion route (B1 DeletionPending): 404 until a row scripts it. */
+    @Volatile private var onDelete: (RecordedRequest) -> MockResponse = { MockResponse().setResponseCode(404) }
+
     /** Every topic named by a subscription the server received, in order (B06b). */
     private val subscribed: MutableList<String> = Collections.synchronizedList(mutableListOf())
 
@@ -201,6 +209,7 @@ class PremiumGraphCutoverAcceptanceTest {
                 refuse()
                 refusals.incrementAndGet()
                 webSocket.send(C4OwnerHarness.ack(id, topics - usd, mapOf(usd to "premium_required")))
+                afterRefusal?.invoke(webSocket)
             } else {
                 webSocket.send(C4OwnerHarness.ack(id, topics, emptyMap()))
             }
@@ -221,7 +230,12 @@ class PremiumGraphCutoverAcceptanceTest {
                         holdHandshakeMillis.getAndSet(0L).takeIf { it > 0 }?.let { Thread.sleep(it) }
                         MockResponse().withWebSocketUpgrade(socketServer)
                     }
-                    "/api/entitlements" -> entitlements.poll() ?: ok(PREMIUM_HIDDEN)
+                    "/api/entitlements" -> {
+                        // A held answer waits here, on the server's thread, until the test opens the gate (B1).
+                        entitlementsGate?.let { gate -> entitlementsHeld.incrementAndGet(); gate.await(30, java.util.concurrent.TimeUnit.SECONDS) }
+                        entitlements.poll() ?: ok(PREMIUM_HIDDEN)
+                    }
+                    "/api/user/me" -> onDelete(request)
                     "/api/v2/topics/snapshot" ->
                         if (url.queryParameter("topic") == "fx:usd-krw" && usdSnapshotLive) ok(usdSnapshot())
                         else if (url.queryParameter("topic") == TETHER && tetherCalls.getAndIncrement() == 0) unauthorized()
@@ -275,6 +289,41 @@ class PremiumGraphCutoverAcceptanceTest {
         override fun observe(onFence: (AuthIdentityFence?) -> Unit) {
             observers += onFence
             onFence(identity?.let { AuthIdentityFence(it.uid, it.authGeneration) })
+        }
+
+        /** The same user signed in again: the live identity moves to the next auth generation and every observer is told. */
+        fun nextGeneration(): AuthIdentityFence {
+            val next = checkNotNull(identity).let { it.copy(authGeneration = it.authGeneration + 1) }
+            identity = next
+            val fence = AuthIdentityFence(next.uid, next.authGeneration)
+            synchronized(observers) { observers.toList() }.forEach { it(fence) }
+            return fence
+        }
+    }
+
+    /**
+     * B1: a one-shot fault for one call path. [arm] takes the exception and the frame that must be on the caller's stack; the
+     * first matching call takes it by compare-and-set and throws it, recording where; every other call goes through.
+     */
+    private class TargetedFault {
+        private val armed = java.util.concurrent.atomic.AtomicReference<Pair<Exception, (StackTraceElement) -> Boolean>?>(null)
+        val hits: MutableList<String> = Collections.synchronizedList(mutableListOf())
+        val thrown: MutableList<Throwable> = Collections.synchronizedList(mutableListOf())
+        val spent: Boolean get() = armed.get() == null
+
+        fun arm(failure: Exception, frame: (StackTraceElement) -> Boolean) {
+            check(armed.compareAndSet(null, failure to frame)) { "already armed" }
+        }
+
+        fun throwIfTargeted() {
+            val current = armed.get() ?: return
+            val frames = Thread.currentThread().stackTrace
+            if (frames.any(current.second) && armed.compareAndSet(current, null)) {
+                hits += Thread.currentThread().name + ": " +
+                    frames.take(18).joinToString(" < ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
+                thrown += current.first
+                throw current.first
+            }
         }
     }
 
@@ -331,10 +380,24 @@ class PremiumGraphCutoverAcceptanceTest {
             object : AccessEpochStore by real {
                 override suspend fun markMayContainData(premium: Boolean, krx: Boolean) =
                     real.markMayContainData(premium, krx).also { marks.incrementAndGet() }
+                override suspend fun load(): com.jay.fxi.data.entitlements.AccessEpochRecord {
+                    storeLoadFault.throwIfTargeted()
+                    return real.load()
+                }
+                override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean): com.jay.fxi.data.entitlements.AccessEpochRecord {
+                    storeRotationFault.throwIfTargeted()
+                    return real.beginRotation(rotateUser, rotateKrx)
+                }
             }
         }
+        /** B1: the store's read and rotation write, each failing once on the call path a row arms; every other call is real. */
+        val storeLoadFault = TargetedFault()
+        val storeRotationFault = TargetedFault()
+        /** B1: while false, only the issuer's candidate recovery reads no live identity; its answer decisions read it as usual. */
+        @Volatile var recoveryIdentityReadable = true
         /** The issuer on its production scope: a SupervisorJob on Default, independent of Main. */
-        val coordinator = budgetCoordinator(api, provider, CoroutineScope(issuerJob + Dispatchers.Default), epochStore, { issuerIdentityReadable })
+        val coordinator = budgetCoordinator(api, provider, CoroutineScope(issuerJob + Dispatchers.Default), epochStore,
+            { issuerIdentityReadable }, { recoveryIdentityReadable })
         val uses = SnapshotTopicUseAuthority { coordinator.accessSnapshot }
         val tabs = Tabs(FreeTab.USD)
         val reports: MutableList<Throwable> = Collections.synchronizedList(mutableListOf())
@@ -354,6 +417,12 @@ class PremiumGraphCutoverAcceptanceTest {
         )
         /** What the production builder built, kept for observation only; the builder itself is the production one. */
         @Volatile var parts: com.jay.fxi.data.graph.ProcessGraphParts? = null
+        /** The process's one deletion admission store: the graph's protected admission and the account deletion stage share it (B1). */
+        val deletions = DeletionAdmissionStore()
+        /** Every grant result the deliverer pulled from the production issuer, in order, kept for observation only (B1). */
+        val pulls: MutableList<com.jay.fxi.data.entitlements.TopicGrantResult> = Collections.synchronizedList(mutableListOf())
+        /** The runtime's serial scope, from the factory's newScope, kept so a row can hold its executor (B1). */
+        @Volatile var runtimeScope: CoroutineScope? = null
         /** How many times the graph boundary built; the production owner builds once per process. */
         val builds = AtomicInteger()
         /** The assembly's SupervisorJob: the parent's one new child across the production build, kept for observation only. */
@@ -368,7 +437,7 @@ class PremiumGraphCutoverAcceptanceTest {
         @Volatile var permitSlot: com.jay.fxi.data.graph.LateBound<() -> com.jay.fxi.data.remote.TopicGraphRecoveryPermit?>? = null
         val production = AppProcessGraphBuilder(
             disk = Provider { disk },
-            deletions = Provider { DeletionAdmissionStore() },
+            deletions = Provider { deletions },
             seeds = Provider { InstallSeedSource({ readSeed() }, Dispatchers.IO) },
             api = Provider { api },
             uses = Provider { uses },
@@ -412,7 +481,11 @@ class PremiumGraphCutoverAcceptanceTest {
                 webSocketUrl = server.url("/ws").toString(),
                 decode = TopicFrameDecoder(wireJson)::decode,
                 bootstrap = { fence, topic, useAdmitted -> service.bootstrap(fence, topic, useAdmitted) },
-                issuer = PremiumAccessTopicGrantIssuer(coordinator),
+                issuer = PremiumAccessTopicGrantIssuer(coordinator).let { real ->
+                    object : com.jay.fxi.data.entitlements.TopicGrantIssuer by real {
+                        override suspend fun topicGrantResult() = real.topicGrantResult().also { pulls += it }
+                    }
+                },
                 fences = firebase,
                 liveFence = provider::currentIdentityFence,
                 recoveries = provider,
@@ -422,7 +495,7 @@ class PremiumGraphCutoverAcceptanceTest {
                 authority = uses,
                 clock = clock,
                 newBootstrapFloor = { TopicBootstrapRetryFloor(it) { Clock.System.now() } },
-                newScope = { CoroutineScope(runtimeJob + Dispatchers.Default.limitedParallelism(1)) },
+                newScope = { CoroutineScope(runtimeJob + Dispatchers.Default.limitedParallelism(1)).also { runtimeScope = it } },
                 encode = { wireJson.encodeToString(TopicSubscribeRequest.serializer(), it) },
                 newRequestId = { java.util.UUID.randomUUID().toString() },
                 jitter = { 0.0 }
@@ -511,7 +584,8 @@ class PremiumGraphCutoverAcceptanceTest {
         provider: AuthTokenProvider,
         scope: CoroutineScope,
         store: AccessEpochStore,
-        identityReadable: () -> Boolean
+        identityReadable: () -> Boolean,
+        recoveryIdentityReadable: () -> Boolean = { true }
     ): PremiumAccessCoordinator {
         // The production binding for both purgers: it answers Deferred, so every journal entry stays owed.
         val purger = UnimplementedScopePurger()
@@ -520,7 +594,13 @@ class PremiumGraphCutoverAcceptanceTest {
             source = AuthenticatedEntitlementsSource(api).let { real ->
                 object : com.jay.fxi.data.entitlements.EntitlementsSource {
                     override suspend fun fetch(freshPremium: Boolean) = real.fetch(freshPremium)
-                    override suspend fun currentIdentity() = if (identityReadable()) real.currentIdentity() else null
+                    override suspend fun currentIdentity() = when {
+                        !identityReadable() -> null
+                        // Read before any suspension, so the stack is the caller's: the candidate recovery's own check only.
+                        !recoveryIdentityReadable() &&
+                            Thread.currentThread().stackTrace.any { it.methodName == "checkCandidateLocked" } -> null
+                        else -> real.currentIdentity()
+                    }
                 }
             },
             store = store,
@@ -1318,6 +1398,66 @@ class PremiumGraphCutoverAcceptanceTest {
     private fun privateField(owner: Any, name: String): Any? =
         owner.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(owner)
 
+    /**
+     * B1: one blocking task holding an executor. [holdOn] returns once the task has entered; [release] opens it and waits for
+     * the task to end. A suspend wait would not hold the executor's thread.
+     */
+    private class ExecutorHold(
+        private val gate: java.util.concurrent.CountDownLatch,
+        private val ended: java.util.concurrent.CountDownLatch,
+        private val expired: java.util.concurrent.atomic.AtomicBoolean
+    ) {
+        fun release() {
+            gate.countDown()
+            check(ended.await(5, java.util.concurrent.TimeUnit.SECONDS)) { "the held executor did not finish its hold" }
+            // A hold that gave up on its own (a forgotten release) did not hold for as long as the row assumed.
+            check(!expired.get()) { "the hold expired before it was released" }
+        }
+    }
+
+    /** Runs [block] under [hold] and always releases it; a release failure is attached to the block's own failure, never hides it. */
+    private suspend fun <T> holding(hold: ExecutorHold, block: suspend () -> T): T {
+        var failure: Throwable? = null
+        try {
+            return block()
+        } catch (thrown: Throwable) {
+            failure = thrown
+            throw thrown
+        } finally {
+            try {
+                hold.release()
+            } catch (released: Throwable) {
+                failure?.addSuppressed(released) ?: throw released
+            }
+        }
+    }
+
+    private fun holdOn(submit: (Runnable) -> Unit): ExecutorHold {
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val gate = java.util.concurrent.CountDownLatch(1)
+        val ended = java.util.concurrent.CountDownLatch(1)
+        val expired = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            submit(Runnable {
+                entered.countDown()
+                // Bounded so a lost release cannot wedge the executor for good; the release reports the expiry.
+                try { if (!gate.await(60, java.util.concurrent.TimeUnit.SECONDS)) expired.set(true) } finally { ended.countDown() }
+            })
+            check(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)) { "the executor did not take the hold" }
+        } catch (failure: Throwable) {
+            // A task that starts late must not hold the executor for good.
+            gate.countDown()
+            throw failure
+        }
+        return ExecutorHold(gate, ended, expired)
+    }
+
+    /** Holds the runtime's serial executor (the session and the grant deliverer). */
+    private fun Rig.holdRuntime(): ExecutorHold = holdOn { task -> checkNotNull(runtimeScope).launch { task.run() } }
+
+    /** Holds the process Main. */
+    private fun holdMain(): ExecutorHold = holdOn { mainExecutor.execute(it) }
+
     /** The current thread's name without the " @coroutine#n" suffix kotlinx.coroutines' debug mode appends. */
     private fun threadName(): String = Thread.currentThread().name.substringBefore(" @coroutine")
 
@@ -1343,6 +1483,490 @@ class PremiumGraphCutoverAcceptanceTest {
         }
         showSurface(target, deadline)
         return target
+    }
+
+    // --- CUT-C01 batch 1a: RT01-A03, RT01-A05 (cut_c01_b1_agreed.r1.md) -------------------------------------------------
+
+    private fun Rig.bridge(): com.jay.fxi.data.remote.TopicSessionFence? = assembly.fences.current()
+    private fun Rig.permitFence(): com.jay.fxi.data.remote.TopicSessionFence? = permitSlot?.get()?.invoke()?.fence
+
+    /** Samples the bridge every 5 ms off Main (auxiliary evidence only: a change between two samples is not seen). */
+    private class BridgeSampler(scope: CoroutineScope, read: () -> Any?) {
+        val seen: MutableList<Any?> = Collections.synchronizedList(mutableListOf())
+        private val job = scope.launch(Dispatchers.Default) {
+            while (true) {
+                val value = read()
+                synchronized(seen) { if (seen.isEmpty() || seen.last() != value) seen += value }
+                delay(5)
+            }
+        }
+        suspend fun stop(): List<Any?> { job.cancelAndJoin(); return synchronized(seen) { seen.toList() } }
+    }
+
+    /**
+     * RT01-A03 (PARTIAL by agreement): the published fence against the actual delivery. Before any issuance the bridge
+     * publishes nothing and the graph sends nothing; the first approval's grant F1 is published once delivered; a grant F2 the
+     * issuer issues while the runtime executor is held is not published and nothing is sent for it until the hold ends, then
+     * it is; an end delivered alone withdraws it and nothing is sent after. "No synthesized snapshot over the whole run" stays
+     * unverified: the 5 ms samples are auxiliary.
+     */
+    @Test
+    fun `RT01-A03 the published fence follows the delivery from before issuance through a held delivery to an end delivered alone`() = runBlocking {
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += ok("""{"krx_visible":true,"premium_active":true}""")
+        val catalogCalls = AtomicInteger()
+        onCatalog = { if (catalogCalls.getAndIncrement() == 0) ok(fixture("catalog-krx-visible.json")) else ok(fixture("catalog-krx-hidden.json")) }
+        val tabCalls = AtomicInteger()
+        onTab = { if (tabCalls.getAndIncrement() == 0) ok(fixture("usd-1d-krx-visible.json")) else ok(fixture("usd-1d-krx-hidden.json")) }
+        val rig = Rig()
+        rig.row {
+            // (i) Before issuance: the owner and its graph run, nothing is issued.
+            rig.startOwner()
+            awaitTrue("the host is published", deadline) { rig.onMain { rig.owner.graphHost.value != null } }
+            val sampler = BridgeSampler(CoroutineScope(rig.ownerJob)) { rig.bridge() }
+            // Auxiliary: the request sources the graph coordinator consumed and published (it re-reads the bridge when it runs).
+            val sources = Collections.synchronizedList(mutableListOf<Any?>())
+            val sourceCollector = rig.onMain {
+                CoroutineScope(rig.ownerJob + Dispatchers.Unconfined).launch {
+                    rig.assembly.coordinator.state.collect { sources += it.source?.fence }
+                }
+            }
+            quiet("RT01-A03 before issuance", 2_000)
+            assertNull("nothing issued, nothing published", rig.bridge())
+            assertEquals("no graph send before issuance", 0, graph().size)
+
+            // Issued and delivered: F1.
+            rig.approve()
+            val f1 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+            val holder = rig.openScreen(deadline)
+            rig.showSurface(holder, deadline)
+            awaitTrue("F1 delivered and published", deadline) { rig.bridge() == f1 && rig.permitFence() == f1 }
+            rig.awaitTopics(deadline)
+            awaitTrue("the usd tab applied under F1", deadline) { rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+
+            // (ii) Issued but not delivered: F2 issued while the runtime executor is held.
+            val graphBefore = graph().size
+            val f2 = holding(rig.holdRuntime()) {
+                entitlements += ok(PREMIUM_HIDDEN)
+                // Bounded: a deliverer that took the issuer's lock just before the hold would keep it until the hold ends.
+                val issued = kotlinx.coroutines.withTimeout(10_000) {
+                    rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+                    checkNotNull(rig.coordinator.topicGrantResult().fence)
+                }
+                assertNotEquals("premise: a new grant was issued", f1, issued)
+                val until = nowMillis() + 1_000
+                while (nowMillis() < until) {
+                    assertEquals("held: the bridge still publishes F1", f1, rig.bridge())
+                    assertEquals("held: no graph send for the undelivered grant\n${sends.timeline()}", graphBefore, graph().size)
+                    delay(20)
+                }
+                issued
+            }
+
+            // (iii) Delivered: F2 published, the same fence the session holds.
+            awaitTrue("F2 delivered and published", deadline) { rig.bridge() == f2 && rig.permitFence() == f2 }
+            awaitTrue("the new context's tab applied", deadline) {
+                rig.assembly.coordinator.state.value.source?.fence == f2 && rig.usdApplied() && tabs().all { it.bodyEnd != null }
+            }
+
+            // (iv) An end delivered alone: the same user's next auth generation and its approval query, whose answer is held.
+            val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+            entitlementsGate = java.util.concurrent.CountDownLatch(1)
+            val approval = CoroutineScope(rig.issuerJob + Dispatchers.Default).launch {
+                val next = rig.firebase.nextGeneration()
+                rig.coordinator.onIdentityChanged(next)
+                rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+            }
+            val sampled: List<Any?>
+            val consumed: List<Any?>
+            try {
+                awaitTrue("the new approval's answer is held", deadline) { entitlementsHeld.get() >= 1 }
+                awaitTrue("the end alone was delivered", deadline) { rig.bridge() == null }
+                assertTrue("the session's permit names no grant use", rig.onMain { checkNotNull(rig.permitSlot).require()() }?.automatic != true)
+                val graphAtEnd = graph().size
+                // A stimulus: the screen's own action with its earlier token.
+                rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
+                val until = nowMillis() + 3_000
+                while (nowMillis() < until) {
+                    assertNull("after the end nothing is published", rig.bridge())
+                    assertEquals("after the end no graph send\n${sends.timeline()}", graphAtEnd, graph().size)
+                    delay(50)
+                }
+                // The records end here: the held answer, released next, issues a third grant outside this row's question.
+                sampled = sampler.stop()
+                sourceCollector.cancelAndJoin()
+                consumed = synchronized(sources) { sources.toList() }
+            } finally {
+                entitlementsGate?.countDown()
+                entitlementsGate = null
+            }
+            approval.join()
+            // The released answer issues a third grant; its context settles before the row ends, so every send it makes has
+            // reached the server when the budget is judged.
+            val f3 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+            awaitTrue("the third grant's context settled", deadline) {
+                rig.bridge() == f3 && rig.assembly.coordinator.state.value.source?.fence == f3 && rig.usdApplied() &&
+                    tabs().all { it.bodyEnd != null } && sends.all().filter { it.zone == "api" }.all { it.bodyEnd != null }
+            }
+            quiet("RT01-A03 settle", 2_000)
+            assertTrue("auxiliary: every sampled publication was a delivered grant or nothing: $sampled",
+                sampled.all { it == null || it == f1 || it == f2 })
+            assertTrue("auxiliary: every request source the coordinator published was a delivered grant or none: $consumed",
+                consumed.all { it == null || it == f1 || it == f2 })
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow("RT01-A03"))
+    }
+
+    /**
+     * What survives of the old context after a same-user end, read on Main once the new grant's context is consumed and before
+     * any graph answer of it: old entry, protected slot and request instances (by identity), the catalog, failures, writes. A
+     * seed from the kept disk namespace may already have refilled entries; those are counted apart, never as survivors.
+     */
+    private data class DiscardView(
+        val oldEntriesKept: Int, val oldSlotsKept: Int, val oldRequestsKept: Int, val catalog: Boolean, val failures: Int, val writes: Int
+    )
+
+    private class OldContext(val entries: List<Any>, val slots: List<Any>, val requests: List<Any>)
+
+    private suspend fun Rig.oldContext(): OldContext = onMain {
+        val c = assembly.coordinator
+        @Suppress("UNCHECKED_CAST")
+        OldContext(
+            entries = c.state.value.entries.values.toList(),
+            slots = (privateField(c, "protectedSlots") as Map<Any, Any>).values.toList(),
+            requests = (privateField(c, "tabRequests") as Map<Any, Any>).values.toList()
+        )
+    }
+
+    private suspend fun Rig.discardView(f2: Any, old: OldContext): Pair<DiscardView, String> = onMain {
+        val c = assembly.coordinator
+        val state = c.state.value
+        assertEquals("the coordinator consumed the new grant's context", f2, state.source?.fence)
+        @Suppress("UNCHECKED_CAST")
+        val slots = (privateField(c, "protectedSlots") as Map<Any, Any>).values
+        @Suppress("UNCHECKED_CAST")
+        val requests = (privateField(c, "tabRequests") as Map<Any, Any>).values
+        val view = DiscardView(
+            oldEntriesKept = state.entries.values.count { e -> old.entries.any { it === e } },
+            oldSlotsKept = slots.count { s -> old.slots.any { it === s } },
+            oldRequestsKept = requests.count { r -> old.requests.any { it === r } },
+            catalog = state.catalog != null,
+            failures = state.failures.size,
+            writes = (privateField(c, "writeTasks") as Map<*, *>).size
+        )
+        view to "refilled entries ${state.entries.values.map { it.online200At }} (online200At; null = not an online 200), slots ${slots.size}"
+    }
+
+    /**
+     * RT01-A05: the same user's real IDENTITY_CHANGED end with the same user epoch, delivered [merged] or not. Before the
+     * end a 3m tab is in flight with a delayed body. After the new grant's context is consumed, with its own graph answers
+     * held, entries, the catalog, failures and protected slots are gone and the old request is no longer owned; the old 3m
+     * body then ends and is never applied; released, the new context refills.
+     */
+    private fun identityChangedRow(label: String, merged: Boolean) = runBlocking {
+        val start = nowMillis()
+        val deadline = start + 40_000
+        val holdNewTabs = java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CountDownLatch?>(null)
+        onCatalog = {
+            holdNewTabs.get()?.await(20, java.util.concurrent.TimeUnit.SECONDS)
+            ok(fixture("catalog-krx-hidden.json"))
+        }
+        onTab = { request ->
+            holdNewTabs.get()?.await(20, java.util.concurrent.TimeUnit.SECONDS)
+            if (request.requestUrl!!.queryParameter("period") == "3m") ok(fixture("usd-3m-krx-hidden.json")).setBodyDelay(8, java.util.concurrent.TimeUnit.SECONDS)
+            else ok(fixture("usd-1d-krx-hidden.json"))
+        }
+        val rig = Rig()
+        rig.row {
+            val holder = checkNotNull(rig.coldStart(deadline))
+            rig.awaitTopics(deadline)
+            awaitTrue("catalog and the usd tab applied", deadline) { rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+            val f1 = checkNotNull(rig.bridge())
+            // The cold start's burst settles first: an identity change 1.6 s after it exceeds the budget on its own
+            // (cut_c0102_observations/RT01-A05_merged_identity_change_1600ms_after_cold_start.md), which is not this row's contract.
+            quiet("$label settle", 3_500)
+            val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+            rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
+            awaitTrue("the 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.bodyEnd == null } }
+            val old = rig.oldContext()
+            assertTrue("premise: the old context has entries, slots and the 3m request",
+                old.entries.isNotEmpty() && old.slots.isNotEmpty() && old.requests.isNotEmpty())
+            val epochBefore = f1.userAccessEpoch
+
+            lateinit var f2: com.jay.fxi.data.remote.TopicSessionFence
+            try {
+            f2 = if (!merged) {
+                // Separate: the end is delivered alone (the answer held), then the new grant.
+                entitlementsGate = java.util.concurrent.CountDownLatch(1)
+                val approval = CoroutineScope(rig.issuerJob + Dispatchers.Default).launch {
+                    val next = rig.firebase.nextGeneration()
+                    rig.coordinator.onIdentityChanged(next)
+                    rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+                }
+                try {
+                    awaitTrue("$label: the end alone was delivered", deadline) { rig.bridge() == null }
+                    holdNewTabs.set(java.util.concurrent.CountDownLatch(1))
+                } finally {
+                    entitlementsGate?.countDown()
+                    entitlementsGate = null
+                }
+                approval.join()
+                checkNotNull(rig.coordinator.topicGrantResult().fence).also { f ->
+                    awaitTrue("$label: F2 delivered", deadline) { rig.bridge() == f }
+                }
+            } else {
+                // Merged: the end, the new approval and the new grant all happen while the topic executor and Main are held.
+                val pullsBefore = rig.pulls.size
+                holding(holdMain()) {
+                    val issued = holding(rig.holdRuntime()) {
+                        // Bounded: a deliverer that took the issuer's lock just before the hold would keep it until the hold ends.
+                        kotlinx.coroutines.withTimeout(10_000) {
+                            val next = rig.firebase.nextGeneration()
+                            rig.coordinator.onIdentityChanged(next)
+                            rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+                            checkNotNull(rig.coordinator.topicGrantResult().fence)
+                        }
+                    }
+                    awaitTrue("$label: F2 delivered while Main is held", deadline) { rig.bridge() == issued }
+                    holdNewTabs.set(java.util.concurrent.CountDownLatch(1))
+                    // Auxiliary (pulls are not the delivery sequence): after the hold the deliverer pulled the new grant, no end-only result.
+                    val seen = synchronized(rig.pulls) { rig.pulls.drop(pullsBefore) }
+                    println("CUT-C01 $label pulls after the hold: ${seen.map { it.fence?.grant }}")
+                    assertTrue("$label: auxiliary: no pull after the hold returned an end without a grant: ${seen.map { it.fence?.grant }}",
+                        seen.isNotEmpty() && seen.all { it.fence != null })
+                    issued
+                }
+            }
+                assertEquals("$label: premise: the same user epoch", epochBefore, f2.userAccessEpoch)
+                awaitTrue("$label: the new context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == f2 }
+                val (view, refill) = rig.discardView(f2, old)
+                println("CUT-C01 $label discard: $view; $refill")
+                assertEquals("$label: nothing of the old context survives before any graph answer of the new one ($refill)",
+                    DiscardView(oldEntriesKept = 0, oldSlotsKept = 0, oldRequestsKept = 0, catalog = false, failures = 0, writes = 0), view)
+                awaitTrue("$label: the old 3m body ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                val until = nowMillis() + 1_000
+                while (nowMillis() < until) {
+                    assertTrue("$label: the old 3m payload is never applied",
+                        rig.assembly.coordinator.state.value.entries.keys.none { it.period.code == "3m" })
+                    delay(20)
+                }
+            } finally {
+                holdNewTabs.getAndSet(null)?.countDown()
+            }
+            awaitTrue("$label: the new context refills", deadline) {
+                rig.assembly.coordinator.state.value.source?.fence == f2 && rig.usdApplied() && tabs().all { it.bodyEnd != null }
+            }
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    @Test
+    fun `RT01-A05 separate a same-user end delivered apart from its new grant discards the old context`() = identityChangedRow("RT01-A05 separate", merged = false)
+
+    @Test
+    fun `RT01-A05 merged a same-user end merged into its new grant discards the old context the same way`() = identityChangedRow("RT01-A05 merged", merged = true)
+
+    /** The jpy topic snapshot (contract fixture envelope) with one kb quote stamped now. */
+    private fun jpySnapshot(rate: Double): String {
+        val base = wire.parseToJsonElement(File("src/test/resources/contracts/v2/topic/snapshot-fx-jpy-krw.json").readText()).jsonObject
+        val data = base.getValue("data").jsonObject
+        val kb = kotlinx.serialization.json.buildJsonObject {
+            put("asset", kotlinx.serialization.json.JsonPrimitive("jpy-krw"))
+            put("rate", kotlinx.serialization.json.JsonPrimitive(rate))
+            put("source", kotlinx.serialization.json.JsonPrimitive("kb"))
+            put("timestamp", kotlinx.serialization.json.JsonPrimitive(isoAt(System.currentTimeMillis() / 1000)))
+        }
+        val newData = kotlinx.serialization.json.JsonObject(
+            data.filterKeys { it != "reference" } + ("banks" to kotlinx.serialization.json.JsonArray(listOf(kb)))
+        )
+        return kotlinx.serialization.json.JsonObject(base + ("data" to newData)).toString()
+    }
+
+    private fun kbJpy(display: StateFlow<TopicDisplayState>): Double? =
+        display.value.rates.quotes[com.jay.fxi.domain.model.TopicQuoteKey("kb", "jpy-krw")]?.rate
+
+    /**
+     * RT01-A10 (cut_c01_b1a_contract.r1/codex_contract.r1.md F1 (b)·F2): a WS refusal the issuer cannot decide (its identity read
+     * fails) parks the issuer, which owes a FORCE_PREMIUM re-check whose answer is held. Two tabs are in flight across it, their
+     * answers held at the server: a usd 3m released inside the window before the publication, and a jpy 1d released after it.
+     * The refusal boundary is where the session settles it: the permit stays on F1 with no automatic use and no Connection, and
+     * the display and screen owners are gone. In that window the issuer still allows (token, standing, USER and CAPABILITY), the
+     * graph's protected reads give GENERAL and KRX data and the released 3m's GENERAL and KRX components are applied, while the
+     * active jpy holder exposes no chart or token and a screen action with its pre-refusal token sends nothing. After the issuer
+     * publishes the StableInactive USER end nothing is adopted or sent, the old fence and lifetime read nothing, and the jpy answer
+     * is not applied. Not verified here: that an old-connection input after the refusal was settled reaches the processing
+     * boundary and adds nothing (the refusal closes the connection); a frame taken before it is settled is allowed and recorded.
+     */
+    @Test
+    fun `RT01-A10 a parked refusal leaves the graph allowed until the issuer publishes the user end and nothing after it`() = runBlocking {
+        val start = nowMillis()
+        val deadline = start + 60_000
+        entitlements += ok("""{"krx_visible":true,"premium_active":true}""")
+        onCatalog = { ok(fixture("catalog-krx-visible.json")) }
+        // The derived jpy answer was accepted under the krx-hidden catalog (A01b); the krx-visible catalog's jpy entry is the same.
+        val jpyIn = { name: String -> wire.parseToJsonElement(fixture(name)).jsonObject.getValue("tabs").jsonArray
+            .single { it.jsonObject.getValue("id").jsonPrimitive.content == "jpy" }.toString() }
+        assertEquals("premise: the jpy catalog entry does not depend on KRX", jpyIn("catalog-krx-hidden.json"), jpyIn("catalog-krx-visible.json"))
+        val hold3m = java.util.concurrent.CountDownLatch(1)
+        val holdJpy = java.util.concurrent.CountDownLatch(1)
+        onTab = { request ->
+            when {
+                request.requestUrl!!.queryParameter("tab") == "jpy" -> { holdJpy.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(jpyTab()) }
+                request.requestUrl!!.queryParameter("period") == "3m" -> { hold3m.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("usd-3m-krx-visible.json")) }
+                else -> ok(fixture("usd-1d-krx-visible.json"))
+            }
+        }
+        val rig = Rig()
+        try {
+            rig.row {
+                val holder = checkNotNull(rig.coldStart(deadline))
+                rig.awaitTopics(deadline)
+                awaitTrue("catalog and the usd tab applied", deadline) { rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+                awaitTrue("an acknowledged socket", deadline) { openSockets.isNotEmpty() }
+                openSockets.last().send(usdSnapshot(1390.0))
+                awaitTrue("the WS delivery recorded kb.usd", deadline) { rig.hasKbSeries() }
+                val display = checkNotNull(rig.runtimeDisplay)
+                val endsBefore = rig.coordinator.accessSnapshot.lastUserEnd?.sequence ?: 0L
+                lateinit var fenceBefore: com.jay.fxi.data.remote.TopicSessionFence
+                lateinit var lifetimeBefore: com.jay.fxi.data.remote.TopicUseLifetime
+
+                // Two tabs in flight across the refusal, their answers held.
+                val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+                rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
+                awaitTrue("the 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.end == null } }
+                checkNotNull(rig.routeJob).cancelAndJoin()
+                val jpy = rig.moveTo(FreeTab.JPY, from = holder, deadline)
+                awaitTrue("the jpy tab is in flight", deadline) { tabs().any { it.param("tab") == "jpy" && it.end == null } }
+                val jpyToken = checkNotNull(rig.onMain { jpy.currentState().inlineToken }) { "the active jpy holder has a token" }
+                val usd1d = rig.onMain { rig.assembly.coordinator.state.value.entries.keys.single { it.tab == "usd" && it.period.code == "1d" } }
+
+                // The refusal under a held runtime, a late usd frame right after its acknowledgement on the same socket, and the
+                // owed re-check's answer held at the server with an inactive answer queued.
+                entitlementsGate = java.util.concurrent.CountDownLatch(1)
+                try {
+                    entitlements += ok("""{"krx_visible":true,"premium_active":false,"premium_pending":false}""")
+                    val heldAtRefusal = java.util.concurrent.atomic.AtomicReference<ExecutorHold?>(null)
+                    val lateFrameSent = java.util.concurrent.atomic.AtomicReference<Boolean?>(null)
+                    refuseUsd = {
+                        // One refusal only: a second subscription inside the window must not take a second hold.
+                        refuseUsd = null
+                        rig.issuerIdentityReadable = false
+                        heldAtRefusal.set(rig.holdRuntime())
+                    }
+                    afterRefusal = { socket ->
+                        afterRefusal = null
+                        lateFrameSent.set(socket.send(usdSnapshot(1395.0)))
+                    }
+                    val socketsBefore = openSockets.size
+                    openSockets.last().close(1011, "server restart")
+                    try {
+                        awaitTrue("the usd subscription was refused", deadline) {
+                            refusals.get() >= 1 && openSockets.size > socketsBefore && lateFrameSent.get() != null
+                        }
+                        assertEquals("the late usd frame was handed to the refusing connection's open socket", true, lateFrameSent.get())
+                    } finally {
+                        refuseUsd = null
+                        afterRefusal = null
+                        heldAtRefusal.getAndSet(null)?.release()
+                    }
+                    awaitTrue("the issuer owes a FORCE_PREMIUM re-check", deadline) {
+                        rig.coordinator.recheckDiagnostics().owedIntent == RefreshIntent.FORCE_PREMIUM
+                    }
+                    assertTrue("premise: the issuer still allows the user", rig.coordinator.accessSnapshot.facts.userAllowed)
+                    delay(500)
+                    // A frame taken before the refusal was settled is allowed (F1 (b)); recorded, not asserted.
+                    println("CUT-C01 RT01-A10 F1 late frame after the refusal on the wire: kb.usd tip ${rig.kbTipRate()} (1390 = not taken, 1395 = taken)")
+
+                    // The refusal boundary: settled by the session.
+                    val fence = checkNotNull(rig.bridge()) { "the delivered fence stands" }
+                    awaitTrue("the session settled the refusal", deadline) {
+                        val permit = rig.permitFence()
+                        val published = rig.onMain { checkNotNull(rig.permitSlot).require()() }
+                        permit == fence && published?.automatic == false && published.connectionGeneration == null &&
+                            display.value.owner == null
+                    }
+                    val facts = rig.coordinator.accessSnapshot.facts
+                    assertTrue("the issuer still allows: token, standing, USER and CAPABILITY ($facts)",
+                        facts.token == fence.grant && facts.tokenStanding && facts.userAllowed && facts.capabilityAllowed)
+                    val lifetime = checkNotNull(rig.uses.acquire(fence)) { "the issuer still admits a use under it" }
+
+                    // In the window: protected reads give GENERAL and KRX; the screen exposes nothing and its action sends nothing.
+                    val graphInWindow = graph().size
+                    val handshakesInWindow = handshakes().size
+                    val writtenBefore = rig.writtenFiles()
+                    rig.onMain {
+                        assertNull("no screen owner", rig.owner.consumer.currentState().ui.owner)
+                        val read = checkNotNull(rig.assembly.coordinator.protectedEntry(usd1d)) { "the protected usd 1d read is allowed" }
+                        val ids = read.tab.graph.series.map { it.seriesId }
+                        assertTrue("GENERAL protected read: $ids", "kb.usd" in ids)
+                        assertTrue("KRX protected read: $ids", "krx.usd-krw-futures" in ids)
+                        val st = jpy.currentState()
+                        assertTrue("the active jpy holder exposes no chart or token: $st",
+                            st.chart == null && st.inlineToken == null && st.fullscreenToken == null)
+                        jpy.selectPeriod(jpyToken, GraphPeriod.THREE_MONTHS)
+                        jpy.retrySelection(jpyToken)
+                    }
+                    delay(1_000)
+                    assertEquals("a screen action with the pre-refusal token sends nothing\n${sends.timeline()}", graphInWindow, graph().size)
+                    hold3m.countDown()
+                    awaitTrue("the released 3m answer was applied before the publication", deadline) {
+                        rig.assembly.coordinator.state.value.entries.keys.any { it.tab == "usd" && it.period.code == "3m" }
+                    }
+                    rig.onMain {
+                        val key = rig.assembly.coordinator.state.value.entries.keys.single { it.tab == "usd" && it.period.code == "3m" }
+                        val ids = checkNotNull(rig.assembly.coordinator.protectedEntry(key)).tab.graph.series.map { it.seriesId }
+                        assertTrue("the 3m answer's GENERAL and KRX components applied: $ids", "hana.usd" in ids && "krx.usd-krw-futures" in ids)
+                    }
+                    assertEquals("no new connection in the window", handshakesInWindow, handshakes().size)
+                    println("CUT-C01 RT01-A10 F2 disk files before/after the 3m applied in the window: $writtenBefore / ${rig.writtenFiles()}")
+                    awaitTrue("the re-check reached the server", deadline) { entitlementsHeld.get() >= 1 }
+                    fenceBefore = fence
+                    lifetimeBefore = lifetime
+                    rig.issuerIdentityReadable = true
+                } finally {
+                    entitlementsGate?.countDown()
+                    entitlementsGate = null
+                }
+                awaitTrue("the issuer published the user end", deadline) {
+                    val snapshot = rig.coordinator.accessSnapshot
+                    !snapshot.facts.userAllowed && (snapshot.lastUserEnd?.sequence ?: 0L) > endsBefore
+                }
+
+                // After the publication: no read, render, send or old completion. No connection exists after the refusal, so a new
+                // price arriving after the end cannot be put to the session here: price adoption after the end stays unverified.
+                val graphAfter = graph().size
+                val recorderAfter = rig.assembly.recorder.state.value
+                holdJpy.countDown()
+                awaitTrue("the held jpy answer ended", deadline) { tabs().first { it.param("tab") == "jpy" }.bodyEnd != null }
+                rig.onMain { jpy.selectPeriod(jpyToken, GraphPeriod.ONE_WEEK) }
+                val until = nowMillis() + 3_000
+                while (nowMillis() < until) {
+                    assertEquals("after the end no graph send\n${sends.timeline()}", graphAfter, graph().size)
+                    assertSame("after the end the recorder takes nothing", recorderAfter, rig.assembly.recorder.state.value)
+                    delay(50)
+                }
+                assertTrue("the jpy answer released after the end is never applied",
+                    rig.assembly.coordinator.state.value.entries.keys.none { it.tab == "jpy" })
+                rig.onMain {
+                    assertNull("after the end nothing renders", holder.currentState().chart)
+                    assertNull("after the end nothing renders on jpy", jpy.currentState().chart)
+                    assertTrue("after the end the old fence and lifetime read nothing from the recorder",
+                        rig.assembly.recorder.exposed(fenceBefore, lifetimeBefore).isEmpty())
+                    assertNull("after the end the gate admits nothing under the old fence", rig.assembly.gate.bind(fenceBefore, lifetimeBefore))
+                    val keys = rig.assembly.coordinator.state.value.entries.keys
+                    assertTrue("after the end no protected entry is read", (keys + usd1d).all { rig.assembly.coordinator.protectedEntry(it) == null })
+                }
+                assertNull("after the end no use can start under the old fence", rig.uses.acquire(fenceBefore))
+            }
+        } finally {
+            hold3m.countDown()
+            holdJpy.countDown()
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 60_000)
+        ColdStartBudget.assertWithin(judgeRow("RT01-A10"))
     }
 
     /** Waits, before anything starts, until the next 600-second bucket boundary is more than [millis] away. */

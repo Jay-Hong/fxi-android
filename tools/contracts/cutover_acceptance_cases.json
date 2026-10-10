@@ -1,6 +1,6 @@
 {
   "class": "com.jay.fxi.budget.PremiumGraphCutoverAcceptanceTest",
-  "note": "S4 CUT-C01·C02 required acceptance rows (cut_c0102_agreed.r1.md; precedence rows cut_c01_pre_agreed.r1.md). Every name must run once and pass; none may be skipped, replaced or added unlisted.",
+  "note": "S4 CUT-C01·C02 required acceptance rows (cut_c0102_agreed.r1.md; precedence rows cut_c01_pre_agreed.r1.md; batch 1 rows cut_c01_b1_agreed.r1.md). Every name must run once and pass; none may be skipped, replaced or added unlisted.",
   "cases": [
     "A01 the production cold start with a tab 401 and its replay stays inside the budget",
     "A01b a repeated start, a recreated route and tab moves keep one process graph and the closed screen leaves the recorder open",
@@ -26,6 +26,10 @@
     "B06a a cancellation before the graph starts closes the assembly with no host, no report and no graph send",
     "B06b a seed read failure gives up the graph once, reported, and the topic goes on",
     "B06c two concurrent closes both return and nothing after them sends, records or reports",
-    "B06d a worker failure closes the sink pipeline and nothing else"
+    "B06d a worker failure closes the sink pipeline and nothing else",
+    "RT01-A03 the published fence follows the delivery from before issuance through a held delivery to an end delivered alone",
+    "RT01-A05 merged a same-user end merged into its new grant discards the old context the same way",
+    "RT01-A05 separate a same-user end delivered apart from its new grant discards the old context",
+    "RT01-A10 a parked refusal leaves the graph allowed until the issuer publishes the user end and nothing after it"
   ]
 }

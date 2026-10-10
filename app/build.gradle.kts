@@ -295,8 +295,10 @@ tasks.register<org.gradle.api.tasks.testing.Test>("testCutoverAcceptance") {
     group = "verification"
     description = "Runs only the S4 cutover acceptance harness (production composition, real clock)"
     dependsOn("compileDebugUnitTestKotlin", "compileDebugUnitTestJavaWithJavac", "processDebugUnitTestJavaRes")
-    testClassesDirs = files(debugUnitTestForAcceptance.map { it.testClassesDirs })
-    classpath = files(debugUnitTestForAcceptance.map { it.classpath })
+    // Read from the configured unit test task, not mapped from its provider: a mapped task provider carries a dependency on
+    // that task, which would run the whole unit suite before this one. These collections depend only on what compiles them.
+    testClassesDirs = debugUnitTestForAcceptance.get().testClassesDirs
+    classpath = debugUnitTestForAcceptance.get().classpath
     filter.includeTestsMatching("*.PremiumGraphCutoverAcceptanceTest")
     filter.isFailOnNoMatchingTests = true
     reports.junitXml.outputLocation.set(layout.buildDirectory.dir("test-results/cutoverAcceptance"))
