@@ -352,9 +352,26 @@ class PremiumGraphCutoverAcceptanceTest {
         }
     }
 
-    /** The stored last tab: usd, so the focus provider restores usd for the live identity. */
+    /**
+     * The stored last tab: usd, so the focus provider restores usd for the live identity. A row can script `lastTab` call by
+     * call ([script]: a value, a non-cancellation failure, or a suspend gate then a value; gates suspend, so the runtime's serial
+     * executor is never blocked); every call's entry and its return or failure are logged.
+     */
     private class Tabs(@Volatile var tab: FreeTab) : FreeTabStore {
-        override suspend fun lastTab(uid: String): FreeTab = tab
+        val script = ConcurrentLinkedQueue<suspend () -> FreeTab>()
+        val log: MutableList<String> = Collections.synchronizedList(mutableListOf())
+        override suspend fun lastTab(uid: String): FreeTab {
+            log += "enter"
+            val step = script.poll()
+            val result = try {
+                step?.invoke() ?: tab
+            } catch (failure: Exception) {
+                if (failure !is kotlinx.coroutines.CancellationException) log += "throw"
+                throw failure
+            }
+            log += "return $result"
+            return result
+        }
         override suspend fun remember(uid: String, tab: FreeTab) {
             this.tab = tab
         }
@@ -376,7 +393,7 @@ class PremiumGraphCutoverAcceptanceTest {
             .addNetworkInterceptor(sends.interceptor)
             .build()
 
-    private inner class Rig(identity: AuthIdentity? = AuthIdentity("user-a", 1), blockDisk: Boolean = false) {
+    private inner class Rig(identity: AuthIdentity? = AuthIdentity("user-a", 1), blockDisk: Boolean = false, blockKrx: Boolean = false) {
         val firebase = Firebase(identity)
         val provider = AuthTokenProvider(firebase, orders = accessOrders)
         private val wireJson = NetworkModule.provideWireJson()
@@ -438,7 +455,21 @@ class PremiumGraphCutoverAcceptanceTest {
         /** The platform's network input the owner forwards to the runtime. */
         val online = MutableStateFlow(true)
         /** The graph's disk root; a regular file in its place when [blockDisk], so every write fails. */
-        val diskRoot = File(root, "graph_v2").also { if (blockDisk) it.writeText("not a directory") }
+        val diskRoot = File(root, "graph_v2").also {
+            if (blockDisk) it.writeText("not a directory")
+            // S4 C01 3b: only the KRX tree blocked, so KRX writes fail while general writes go on.
+            if (blockKrx) File(it.apply { mkdirs() }, "krx").writeText("not a directory")
+        }
+        /**
+         * S4 C01 3b: the next socket factory call throws once; [thrownConnect] is that call's number in [connectCalls]. The
+         * number is the session's attempt (generation) number: `++generation` happens only before `connect(number)`
+         * (TopicSessionCoordinator.kt:1665-1671), whose `connect` calls the factory once (TopicRuntime.kt:131-134), and a rig
+         * has one owner, one runtime and one session.
+         */
+        @Volatile var throwNextConnect = false
+        @Volatile var thrownConnect: Long? = null
+        /** S4 C01 3b: socket factory calls so far. */
+        val connectCalls = AtomicInteger(0)
         val disk = FileGraphV2DiskStore({ diskRoot }, JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), Dispatchers.IO)
         val selections = BackupableUserIntentStore(PreferenceDataStoreFactory.create(scope = io) { File(root, "intent.preferences_pb") })
         val filesDir = File(root, "files").also { it.mkdirs() }
@@ -509,7 +540,15 @@ class PremiumGraphCutoverAcceptanceTest {
             }
             val ws = OkHttpClient.Builder().addInterceptor(sends.interceptor).build()
             val factory = TopicRuntimeFactory(
-                webSocketFactory = { ws },
+                webSocketFactory = {
+                    val call = connectCalls.incrementAndGet()
+                    if (throwNextConnect) {
+                        throwNextConnect = false
+                        thrownConnect = call.toLong()
+                        throw java.io.IOException("the row refuses this connect")
+                    }
+                    ws
+                },
                 webSocketUrl = server.url("/ws").toString(),
                 decode = TopicFrameDecoder(wireJson)::decode,
                 bootstrap = { fence, topic, useAdmitted -> service.bootstrap(fence, topic, useAdmitted) },
@@ -5119,6 +5158,608 @@ class PremiumGraphCutoverAcceptanceTest {
         }
         assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
         assertTrue("within the row deadline", nowMillis() - start <= 70_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- CUT-C01 batch 3b: RT01-H01, RT05-T03(b)(c), RT01-S02(b)(d), RT05-T01a (cut_c01_b3b_agreed.r1.md) -----------------------
+
+    /**
+     * Calls the selection callback the process consumer is bound to — the runtime's selectTab (TopicRuntimeOwner.kt:142,
+     * PremiumTopicConsumer.kt:79) — on Main. The owner keeps no runtime field.
+     */
+    @Suppress("UNCHECKED_CAST")
+    private suspend fun Rig.consumerSelect(identity: AuthIdentityFence, tab: FreeTab) = onMain {
+        (privateField(owner.consumer, "selectTab") as (AuthIdentityFence, FreeTab) -> Unit)(identity, tab)
+    }
+
+    /** The focus a mounted holder reads (the focus provider's), read on Main. */
+    @Suppress("UNCHECKED_CAST")
+    private suspend fun Rig.focusNow(): com.jay.fxi.data.remote.OwnedTopicFocus? = onMain {
+        (privateField(checkNotNull(checkNotNull(mount).holders.value["usd"]), "focus") as StateFlow<com.jay.fxi.data.remote.OwnedTopicFocus?>).value
+    }
+
+    /** The batch 3 route's current target tab (null when none), read on Main. */
+    private suspend fun Rig.routeTargetTab(route: RouteStandIn): String? = onMain {
+        val target = route.target?.first ?: return@onMain null
+        checkNotNull(mount).holders.value.entries.firstOrNull { it.value === target }?.key
+    }
+
+    /**
+     * RT01-H01(a): a failed restore falls back to USD. The stored last tab's read throws; the focus becomes USD for the live
+     * identity, the route's target is the usd holder and only usd's graph tab goes; the jpy and eur holders stay inactive.
+     */
+    @Test
+    fun `RT01-H01a a failed restore falls back to usd and only the usd holder is active`() = runBlocking {
+        val label = "RT01-H01a"
+        val prepared = clearOfBoundary(40_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 30_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.tabs.script += { throw IllegalStateException("the stored tab cannot be read") }
+        rig.row {
+            val (route, holder) = rig.coldStartRoute(deadline)
+            awaitTrue("$label: the usd tab applied", deadline) { rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+            assertEquals("$label: premise: the restore was tried and failed", listOf("enter", "throw"), synchronized(rig.tabs.log) { rig.tabs.log.toList() })
+            val identity = checkNotNull(rig.provider.currentIdentityFence())
+            assertEquals("$label: the focus falls back to usd", com.jay.fxi.data.remote.OwnedTopicFocus(identity, FreeTab.USD), rig.focusNow())
+            assertEquals("$label: the route targets the usd holder", "usd", rig.routeTargetTab(route))
+            assertEquals("$label: only usd's graph tab went", setOf("usd"), tabs().map { it.param("tab") }.toSet())
+            assertEquals("$label: one usd 1d tab", listOf("usd" to "1d"), tabs().map { it.param("tab") to it.param("period") })
+            assertEquals("$label: the jpy and eur holders are inactive", listOf(GraphV2Content.INACTIVE, GraphV2Content.INACTIVE),
+                rig.onMain { listOf("jpy", "eur").map { checkNotNull(rig.mount).holders.value.getValue(it).currentState().content } })
+            assertEquals("$label: premise: the usd holder is ready", GraphV2Content.READY, rig.onMain { holder.currentState().content })
+            quiet(label, 1_000)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 30_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-H01(b): a selection wins over a pending restore. The first stored-tab read is held (suspended). With the focus null
+     * and no screen owner, the production runtime selection — the callback the consumer is bound to — selects JPY for the live
+     * identity: the focus becomes JPY and the route targets the jpy holder. The restore is then released with USD: the focus
+     * stays JPY and only jpy's graph tab goes; asked directly, the usd holder gets no context, token or activation (INACTIVE) and
+     * sends nothing. (Not evidence that the consumer's UI can select before a restore.)
+     */
+    @Test
+    fun `RT01-H01b a selection made while the restore is pending wins over it`() = runBlocking {
+        val label = "RT01-H01b"
+        val prepared = clearOfBoundary(40_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 30_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        onTab = { request ->
+            if (request.requestUrl!!.queryParameter("tab") == "jpy") ok(jpyTab()) else ok(fixture("usd-1d-krx-hidden.json"))
+        }
+        val restore = kotlinx.coroutines.CompletableDeferred<FreeTab>()
+        rig.tabs.script += { restore.await() }
+        try {
+            rig.row {
+                rig.approve()
+                rig.startOwner()
+                val route = rig.openRoute(deadline)
+                awaitTrue("$label: the restore is entered and held", deadline) { synchronized(rig.tabs.log) { rig.tabs.log.toList() } == listOf("enter") }
+                assertNull("$label: premise: no focus yet", rig.focusNow())
+                assertNull("$label: premise: no screen owner yet", rig.onMain { rig.owner.consumer.currentState().ui.owner })
+                val identity = checkNotNull(rig.provider.currentIdentityFence())
+                rig.consumerSelect(identity, FreeTab.JPY)
+                awaitTrue("$label: the focus is jpy and the route targets the jpy holder", deadline) {
+                    rig.focusNow() == com.jay.fxi.data.remote.OwnedTopicFocus(identity, FreeTab.JPY) && rig.routeTargetTab(route) == "jpy"
+                }
+                restore.complete(FreeTab.USD)
+                awaitTrue("$label: the restore returned", deadline) { synchronized(rig.tabs.log) { rig.tabs.log.toList() } == listOf("enter", "return USD") }
+                delay(500)
+                assertEquals("$label: the focus stays jpy", com.jay.fxi.data.remote.OwnedTopicFocus(identity, FreeTab.JPY), rig.focusNow())
+                assertEquals("$label: the route still targets the jpy holder", "jpy", rig.routeTargetTab(route))
+                awaitTrue("$label: the jpy tab applied", deadline) {
+                    rig.onMain { rig.assembly.coordinator.state.value.entries.keys.any { it.tab == "jpy" } } && tabs().all { it.bodyEnd != null }
+                }
+                val usd = rig.onMain { checkNotNull(rig.mount).holders.value.getValue("usd") }
+                val screenOwner = checkNotNull(rig.onMain { rig.owner.consumer.currentState().ui.owner })
+                val graphBefore = graph().size
+                val asked = rig.onMain {
+                    usd.onActivated(screenOwner)
+                    val s = usd.currentState()
+                    listOf(privateField(usd, "context"), privateField(usd, "activation"), s.inlineToken, s.content)
+                }
+                assertEquals("$label: asked directly, the usd holder gets no context, activation or token and stays inactive",
+                    listOf(null, null, null, GraphV2Content.INACTIVE), asked)
+                delay(1_000)
+                assertEquals("$label: and sends nothing", 0, graph().drop(graphBefore).size)
+                assertEquals("$label: a second later the usd holder is still inactive", GraphV2Content.INACTIVE, rig.onMain { usd.currentState().content })
+                rig.onMain { usd.onDeactivated() }
+                assertEquals("$label: only jpy's graph tab went", setOf("jpy"), tabs().map { it.param("tab") }.toSet())
+                assertEquals("$label: the focus is still jpy at the end", com.jay.fxi.data.remote.OwnedTopicFocus(identity, FreeTab.JPY), rig.focusNow())
+                quiet(label, 1_000)
+            }
+        } finally {
+            restore.complete(FreeTab.USD)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 30_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-H01(c): a restore of an older generation is refused. The first restore (generation 1) is held; the same user signs in
+     * again (a new generation, re-approved on the same user epoch) and the second restore returns USD at once: the focus is
+     * (generation 2, USD). Then the first restore returns JPY: the focus stays (generation 2, USD), the route never targets the
+     * jpy holder and no jpy graph tab goes.
+     */
+    @Test
+    fun `RT01-H01c a restore of an older generation is refused after the same user's new generation`() = runBlocking {
+        val label = "RT01-H01c"
+        val prepared = clearOfBoundary(50_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        val first = kotlinx.coroutines.CompletableDeferred<FreeTab>()
+        rig.tabs.script += { first.await() }
+        rig.tabs.script += { FreeTab.USD }
+        val targets = Collections.synchronizedList(mutableListOf<String?>())
+        var watch: Job? = null
+        try {
+            rig.row {
+                rig.approve()
+                rig.startOwner()
+                val route = rig.openRoute(deadline)
+                watch = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                    while (true) { targets += rig.routeTargetTab(route); delay(10) }
+                }
+                awaitTrue("$label: the first restore is entered and held", deadline) { synchronized(rig.tabs.log) { rig.tabs.log.toList() } == listOf("enter") }
+                val generation1 = checkNotNull(rig.provider.currentIdentityFence())
+                awaitSendsQuietly(rig, deadline)
+                val approval = CoroutineScope(rig.issuerJob + Dispatchers.Default).launch {
+                    val next = rig.firebase.nextGeneration()
+                    rig.coordinator.onIdentityChanged(next)
+                    rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+                }
+                approval.join()
+                val generation2 = checkNotNull(rig.provider.currentIdentityFence())
+                assertNotEquals("$label: premise: a new generation", generation1, generation2)
+                assertEquals("$label: premise: of the same user", generation1.uid, generation2.uid)
+                awaitTrue("$label: the second restore focuses usd for the new generation", deadline) {
+                    rig.focusNow() == com.jay.fxi.data.remote.OwnedTopicFocus(generation2, FreeTab.USD) && rig.routeTargetTab(route) == "usd"
+                }
+                first.complete(FreeTab.JPY)
+                awaitTrue("$label: the first restore returned", deadline) { synchronized(rig.tabs.log) { rig.tabs.log.toList() }.contains("return JPY") }
+                delay(1_000)
+                assertEquals("$label: the focus stays the new generation's usd", com.jay.fxi.data.remote.OwnedTopicFocus(generation2, FreeTab.USD), rig.focusNow())
+                watch?.cancel()
+                assertFalse("$label: the route never targeted the jpy holder", synchronized(targets) { targets.toList() }.contains("jpy"))
+                assertEquals("$label: no jpy graph tab", 0, tabs().count { it.param("tab") == "jpy" })
+                awaitTrue("$label: the usd tab applied", deadline) { rig.usdApplied() && graph().all { it.bodyEnd != null } }
+                quiet(label, 1_000)
+            }
+        } finally {
+            watch?.cancel()
+            first.complete(FreeTab.JPY)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /** Lets every send end and settle for 3.5 s before an identity change (as RT01-A05 does, for the api budget). */
+    private suspend fun awaitSendsQuietly(rig: Rig, deadline: Long) {
+        awaitTrue("every send ended", deadline) { sends.all().all { it.bodyEnd != null } }
+        delay(3_500)
+    }
+
+    /** The live recovery permit, read off Main (the session publishes it volatile). */
+    private fun Rig.permitNow(): com.jay.fxi.data.remote.TopicGraphRecoveryPermit? = permitSlot?.get()?.invoke()
+
+    /**
+     * RT05-T03(b): a first connect that throws. The socket factory throws on the first attempt (its call number is the
+     * attempt's generation). With the runtime held right after it — so no retry can publish — the events are notified on Main
+     * with the real permit supplier, which then names a fence but no Connection: no baseline, no trigger. (Consuming such a
+     * permit leaves no state, GraphRecoveryEvents.kt:107, so the row drives the consumption instead of waiting for it.) The
+     * first real Connection's generation is above the failed attempt's (no permit ever names the failed attempt as a
+     * Connection); it becomes the baseline and issues nothing. In the same 600 s bucket and the foreground, a later drop
+     * issues exactly one RECONNECT.
+     */
+    @Test
+    fun `RT05-T03b a first connect that throws leaves no connection and the first real one is the baseline`() = runBlocking {
+        val label = "RT05-T03b"
+        val prepared = clearOfBoundary(50_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.throwNextConnect = true
+        val seenConnections = Collections.synchronizedSet(mutableSetOf<Long>())
+        var sampler: Job? = null
+        try {
+            rig.row {
+                sampler = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                    while (true) { rig.permitNow()?.connectionGeneration?.let { seenConnections += it }; delay(5) }
+                }
+                rig.coldStartRoute(deadline)
+                awaitTrue("$label: the first connect threw", deadline) { rig.thrownConnect != null }
+                val failed = checkNotNull(rig.thrownConnect)
+                val consumed = holding(rig.holdRuntime()) {
+                    rig.onMain {
+                        val published = rig.permitNow()
+                        rig.assembly.events.onPermitChanged()
+                        listOf(published?.fence != null, published?.connectionGeneration, privateField(rig.assembly.events, "connection"),
+                            rig.triggersOnMain())
+                    }
+                }
+                assertEquals("$label: notified with a permit naming a fence and no Connection, the events keep no baseline and issue nothing",
+                    listOf(true, null, null, 0L), consumed)
+                awaitTrue("$label: the first real Connection is consumed as the baseline", deadline) { rig.eventsConnection() != null }
+                val baseline = checkNotNull(rig.eventsConnection())
+                assertTrue("$label: its generation is above the failed attempt's (${baseline.second} > $failed)", baseline.second > failed)
+                assertEquals("$label: premise: the failed attempt was the first factory call and the baseline is the next one",
+                    listOf(1L, 2L), listOf(failed, baseline.second))
+                assertEquals("$label: it is the live permit's", baseline.second, rig.permitNow()?.connectionGeneration)
+                assertEquals("$label: the baseline issues nothing", 0L, rig.triggers())
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: the tab applied", deadline) { rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+                val bucket = System.currentTimeMillis() / 600_000
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: one RECONNECT", deadline) { rig.triggers() == 1L }
+                delay(2_000)
+                assertEquals("$label: exactly one", 1L, rig.triggers())
+                assertEquals("$label: premise: the same 600 s bucket", bucket, System.currentTimeMillis() / 600_000)
+                assertEquals("$label: premise: in the foreground", true, rig.eventsForeground())
+                sampler?.cancel()
+                assertFalse("$label: no permit ever named the failed attempt as a Connection (${synchronized(seenConnections) { seenConnections.toList() }})",
+                    synchronized(seenConnections) { seenConnections.contains(failed) })
+            }
+        } finally {
+            sampler?.cancel()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /** The trigger sequence, read on Main (from inside an [Rig.onMain] block). */
+    private fun Rig.triggersOnMain(): Long {
+        val e = assembly.events
+        return e.javaClass.getDeclaredField("sequence").apply { isAccessible = true }.get(e) as Long
+    }
+
+    /**
+     * RT05-T03(c): a delayed old permit revision is read as the latest permit. In the foreground the first real Connection is
+     * the baseline (no resync yet, no trigger); notifying the events again with the same permit changes nothing. With Main held,
+     * the server drops the socket twice in turn, each reconnect seen on the runtime's permit (same session key, a higher
+     * generation) before the next drop. Released, the events' Connection is the latest recorded one and exactly one RECONNECT is
+     * issued (same 600 s bucket, foreground, cooldown passed); a further notification issues nothing more.
+     */
+    @Test
+    fun `RT05-T03c revisions delayed behind Main are read as the latest permit and resync once`() = runBlocking {
+        val label = "RT05-T03c"
+        val prepared = clearOfBoundary(50_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            rig.coldStartRoute(deadline)
+            rig.awaitTopics(deadline)
+            awaitTrue("$label: the tab applied", deadline) { rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+            awaitTrue("$label: the first real Connection is the baseline", deadline) { rig.eventsConnection() != null }
+            val baseline = checkNotNull(rig.eventsConnection())
+            assertNull("$label: premise: no resync yet", rig.onMain { privateField(rig.assembly.events, "lastResync") })
+            assertEquals("$label: premise: no trigger", 0L, rig.triggers())
+            rig.onMain { rig.assembly.events.onPermitChanged() }
+            assertEquals("$label: a repeated notification keeps the baseline", baseline, rig.eventsConnection())
+            assertEquals("$label: and issues nothing", 0L, rig.triggers())
+            val bucket = System.currentTimeMillis() / 600_000
+            var latest: com.jay.fxi.data.remote.TopicGraphRecoveryPermit? = null
+            holding(holdMain()) {
+                var previous = baseline.second
+                repeat(2) { i ->
+                    val sockets = openSockets.size
+                    openSockets.last().close(1011, "server restart")
+                    awaitTrue("$label: reconnect ${i + 1} is on the runtime's permit while Main is held", deadline) {
+                        rig.permitNow()?.let { it.sessionKey == baseline.first && (it.connectionGeneration ?: 0L) > previous } == true
+                    }
+                    previous = checkNotNull(rig.permitNow()?.connectionGeneration)
+                    awaitTrue("$label: the server opened its socket", deadline) { openSockets.size > sockets }
+                }
+                latest = rig.permitNow()
+                assertEquals("$label: premise: no trigger while Main is held", 0L, rig.triggersOffMain())
+            }
+            val last = checkNotNull(latest)
+            awaitTrue("$label: the events' Connection is the latest recorded one", deadline) {
+                rig.eventsConnection() == (last.sessionKey to checkNotNull(last.connectionGeneration))
+            }
+            awaitTrue("$label: one RECONNECT", deadline) { rig.triggers() == 1L }
+            delay(1_000)
+            assertEquals("$label: exactly one", 1L, rig.triggers())
+            assertEquals("$label: premise: the same 600 s bucket", bucket, System.currentTimeMillis() / 600_000)
+            assertEquals("$label: premise: in the foreground", true, rig.eventsForeground())
+            rig.onMain { rig.assembly.events.onPermitChanged() }
+            delay(500)
+            assertEquals("$label: a further notification issues nothing more", 1L, rig.triggers())
+            rig.awaitTopics(deadline)
+            awaitTrue("$label: the topics settle", deadline) { sends.all().all { it.bodyEnd != null } }
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /** The trigger sequence read without Main (a plain field read; only while Main is held, where nothing else writes it). */
+    private fun Rig.triggersOffMain(): Long = triggersOnMain()
+
+    /** The coordinator's entry for usd 1d and whether its slot has a KRX component, read on Main. */
+    private suspend fun Rig.usd1dEntryView(): Triple<com.jay.fxi.data.graph.GraphEntry?, Boolean, Set<Double>> = onMain {
+        val c = assembly.coordinator
+        val key = c.state.value.entries.keys.firstOrNull { it.tab == "usd" && it.period.code == "1d" }
+        val entry = key?.let { c.state.value.entries[it] }
+        val krx = key?.let { slotComponents(it)?.krx } != null
+        val values = entry?.tab?.graph?.series.orEmpty().filterNot { it.seriesId.startsWith("krx.") }
+            .flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } }.toSet()
+        Triple(entry, krx, values)
+    }
+
+    /** The same user signs in again (a new generation; the end delivered, then the new grant on the same user epoch). */
+    private suspend fun Rig.signInAgain(label: String, deadline: Long): com.jay.fxi.data.remote.TopicSessionFence {
+        val epoch = checkNotNull(coordinator.topicGrantResult().fence).userAccessEpoch
+        val approval = CoroutineScope(issuerJob + Dispatchers.Default).launch {
+            val next = firebase.nextGeneration()
+            coordinator.onIdentityChanged(next)
+            coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+        }
+        approval.join()
+        val fence = checkNotNull(coordinator.topicGrantResult().fence)
+        assertEquals("$label: premise: the same user epoch", epoch, fence.userAccessEpoch)
+        awaitTrue("$label: the new context is consumed", deadline) { assembly.coordinator.state.value.source?.fence == fence }
+        return fence
+    }
+
+    /**
+     * RT01-S02: after a same-user sign-in, KRX is still allowed and the capability epoch — a segment of the KRX file path — is
+     * still [epoch], so the restore looks at the KRX file the row prepared. (The rig answers an entitlements call with no
+     * scripted response with KRX hidden, so each sign-in scripts a KRX-visible answer.)
+     */
+    private suspend fun Rig.assertKrxKept(label: String, epoch: Any?) {
+        assertTrue("$label: premise: KRX is allowed under the new grant", coordinator.accessSnapshot.facts.capabilityAllowed)
+        assertEquals("$label: premise: the same capability epoch (the KRX file path)", epoch, epochStore.load().krxCapabilityEpoch)
+    }
+
+    /**
+     * RT01-S02(b): a KRX file of another response is not joined (FillEmpty). KRX-visible, response 1 is applied and written and
+     * its KRX file kept aside; a same-user sign-in refills from disk and its network answer, response 2 (other values), is
+     * applied and written over the same paths. Response 1's KRX file is then put back, so GENERAL and KRX carry different
+     * response IDs. A second same-user sign-in, its answers held: once its seed was tried and finished, the entry holds response
+     * 2's GENERAL only — no KRX series, no KRX in the slot, no stamp, only response 2's values including one response 1 does
+     * not have — and its tab goes, captured under the same KRX epoch. Both sign-ins keep KRX allowed under the same capability
+     * epoch, so the paths stay the same. The response ID is the only join clause that fails: the shift changes series values
+     * only, so key, server metadata and ordinals match (GraphV2Disk.kt:207-211).
+     */
+    @Test
+    fun `RT01-S02b a KRX file of another response is not joined to the restored general file`() = runBlocking {
+        val label = "RT01-S02b"
+        val prepared = clearOfBoundary(70_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 60_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val response1 = fixture("usd-1d-krx-visible.json")
+        val response2 = shiftedTab(response1, 3.0)
+        val phase = AtomicInteger(1)
+        val holdThird = java.util.concurrent.CountDownLatch(1)
+        onCatalog = {
+            if (phase.get() == 3) holdThird.await(30, java.util.concurrent.TimeUnit.SECONDS)
+            ok(fixture("catalog-krx-visible.json"))
+        }
+        onTab = {
+            when (phase.get()) {
+                1 -> ok(response1)
+                2 -> ok(response2)
+                else -> { holdThird.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(response2) }
+            }
+        }
+        val rig = Rig()
+        try {
+            rig.row {
+                rig.coldStartRoute(deadline)
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: response 1 applied", deadline) { rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+                rig.awaitWritesDrained(label, deadline)
+                val krx1 = checkNotNull(rig.writtenFiles().singleOrNull { it.startsWith("krx/") && it.endsWith("1d.json") }) {
+                    "$label: premise: one 1d KRX file after response 1 (${rig.writtenFiles()})"
+                }
+                val kept = File(rig.diskRoot, krx1).readBytes()
+                val krxEpoch = rig.epochStore.load().krxCapabilityEpoch
+                awaitSendsQuietly(rig, deadline)
+                phase.set(2)
+                entitlements += ok(premiumKrxVisible)
+                rig.signInAgain(label, deadline)
+                rig.assertKrxKept(label, krxEpoch)
+                val values1 = tabValues(response1).values.flatten().toSet()
+                val values2 = tabValues(response2).values.flatten().toSet()
+                awaitTrue("$label: response 2 applied (its values only)", deadline) {
+                    val values = rig.usd1dEntryView().third
+                    values.isNotEmpty() && values.all { it in values2 } && values.any { it !in values1 } && graph().all { it.bodyEnd != null }
+                }
+                rig.awaitWritesDrained(label, deadline)
+                assertFalse("$label: premise: response 2 rewrote the KRX file", File(rig.diskRoot, krx1).readBytes().contentEquals(kept))
+                File(rig.diskRoot, krx1).writeBytes(kept)
+                awaitSendsQuietly(rig, deadline)
+                phase.set(3)
+                val tabsBefore = tabs().size
+                entitlements += ok(premiumKrxVisible)
+                rig.signInAgain(label, deadline)
+                rig.assertKrxKept(label, krxEpoch)
+                awaitTrue("$label: the seed was tried and finished", deadline) { rig.usdSeedFinished() }
+                val (entry, krxInSlot, values) = rig.usd1dEntryView()
+                assertNotNull("$label: the general file is restored", entry)
+                assertNull("$label: with no stamp", entry?.online200At)
+                assertTrue("$label: no KRX series", entry!!.tab.graph.series.none { it.seriesId.startsWith("krx.") })
+                assertFalse("$label: no KRX in the slot", krxInSlot)
+                assertTrue("$label: response 2's general values only, one of them not response 1's ($values)",
+                    values.isNotEmpty() && values.all { it in values2 } && values.any { it !in values1 })
+                awaitTrue("$label: its tab goes", deadline) { tabs().size > tabsBefore }
+                assertEquals("$label: premise: the held tab is captured under the same KRX epoch", true to krxEpoch, rig.usdCaptureEpoch("1d"))
+                holdThird.countDown()
+                awaitTrue("$label: settled", deadline) { graph().all { it.bodyEnd != null } && rig.usdApplied() }
+                quiet(label, 1_000)
+            }
+        } finally {
+            holdThird.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 60_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-S02(d): a KRX write that fails leaves the general file. The disk's `krx` directory is blocked by a regular file;
+     * a KRX-visible answer writes its general file and no KRX file. The blocking file is then removed, so the seed finds no KRX
+     * file (Absent) as after a failed write, not a read error. A same-user sign-in with KRX still allowed under the same
+     * capability epoch, its answers held: once its seed was tried and finished, the entry holds the general part only (no KRX
+     * series or slot KRX) with no stamp, and its held tab is captured under the same KRX epoch.
+     */
+    @Test
+    fun `RT01-S02d a failed KRX write leaves the general file to restore alone`() = runBlocking {
+        val label = "RT01-S02d"
+        val prepared = clearOfBoundary(50_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val second = java.util.concurrent.atomic.AtomicBoolean(false)
+        val holdSecond = java.util.concurrent.CountDownLatch(1)
+        onCatalog = {
+            if (second.get()) holdSecond.await(30, java.util.concurrent.TimeUnit.SECONDS)
+            ok(fixture("catalog-krx-visible.json"))
+        }
+        onTab = {
+            if (second.get()) holdSecond.await(30, java.util.concurrent.TimeUnit.SECONDS)
+            ok(fixture("usd-1d-krx-visible.json"))
+        }
+        val rig = Rig(blockKrx = true)
+        try {
+            rig.row {
+                rig.coldStartRoute(deadline)
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: the answer applied", deadline) { rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+                rig.awaitWritesDrained(label, deadline)
+                assertTrue("$label: premise: the general 1d file was written (${rig.writtenFiles()})", rig.writtenFiles().any { it.startsWith("general/") && it.endsWith("1d.json") })
+                assertTrue("$label: premise: with KRX visible", rig.onMain {
+                    rig.assembly.coordinator.state.value.entries.values.any { e -> e.tab.graph.series.any { it.seriesId.startsWith("krx.") } }
+                })
+                assertEquals("$label: premise: no KRX file", emptyList<String>(), rig.writtenFiles().filter { it.startsWith("krx/") })
+                assertTrue("$label: premise: the blocking file is removed", File(rig.diskRoot, "krx").let { it.isFile && it.delete() })
+                val krxEpoch = rig.epochStore.load().krxCapabilityEpoch
+                awaitSendsQuietly(rig, deadline)
+                second.set(true)
+                val tabsBefore = tabs().size
+                entitlements += ok(premiumKrxVisible)
+                rig.signInAgain(label, deadline)
+                rig.assertKrxKept(label, krxEpoch)
+                awaitTrue("$label: the seed was tried and finished", deadline) { rig.usdSeedFinished() }
+                val (entry, krxInSlot, _) = rig.usd1dEntryView()
+                assertNotNull("$label: the general file is restored", entry)
+                assertNull("$label: with no stamp", entry?.online200At)
+                assertTrue("$label: no KRX series", entry!!.tab.graph.series.none { it.seriesId.startsWith("krx.") })
+                assertFalse("$label: no KRX in the slot", krxInSlot)
+                awaitTrue("$label: its tab goes", deadline) { tabs().size > tabsBefore }
+                assertEquals("$label: premise: the held tab is captured under the same KRX epoch", true to krxEpoch, rig.usdCaptureEpoch("1d"))
+                holdSecond.countDown()
+                awaitTrue("$label: settled", deadline) { graph().all { it.bodyEnd != null } && rig.usdApplied() }
+                quiet(label, 1_000)
+            }
+        } finally {
+            holdSecond.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT05-T01(a): time alone changes no observation. With preparation and observation inside one 600 s bucket: cold start,
+     * catalog and tab applied, a real kb tip from a WS value, topic deliveries acknowledged, graph requests done, the screen
+     * READY, visible, nothing pending.
+     *
+     * Excluded stretch (reported, not counted as time alone): this server never delivers tether, so the first subscription's
+     * delivery deadline (45 s, TopicRequestPolicy.kt:91) hands tether to a revalidation (TopicSessionCoordinator.kt:3086) — a
+     * tether-only subscribe whose acknowledgement is a continuity input to the recorder (ACK_ACTIVE_SET_CHANGED, :1966-1983) —
+     * and that revalidation's own deadline degrades tether (:3096) with a DELIVERY_INTERRUPTED input (:2042-2045). The row waits
+     * for the revalidation subscribe and the DEGRADED display, then 2 s.
+     *
+     * From then, for 65 s sampled every 20 ms on Main: the right edge moves two or three times, 25 to 35 s apart (30 s
+     * freshness ticks, no 10 s publication), while the recorder state object, the coordinator's entries instance, the 1d entry
+     * object and the kb tip stay the same, tether stays DEGRADED, and no subscription, graph request or other REST send goes.
+     * (A tether value from the server would not avoid the stretch: it arms the D14 silence window, whose expiry suspects and
+     * revalidates tether the same way, TopicSessionCoordinator.kt:2910-2975.)
+     */
+    @Test
+    fun `RT05-T01a time alone moves the right edge on the freshness tick and changes no observation`() = runBlocking {
+        val label = "RT05-T01a"
+        val prepared = clearOfBoundary(185_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 175_000
+        val bucket = System.currentTimeMillis() / 600_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            val (_, holder) = rig.prepareLive(label, deadline)
+            rig.awaitReadyToSend(holder, label, deadline)
+            @Suppress("UNCHECKED_CAST")
+            val display = rig.onMain { privateField(rig.owner.consumer, "display") } as StateFlow<TopicDisplayState>
+            fun tetherState() = display.value.topicState.stateFor(TETHER).deliveryState
+            awaitTrue("$label: the excluded stretch: tether's revalidation subscribe went", deadline) {
+                synchronized(subscribed) { subscribed.count { it == TETHER } } >= 2
+            }
+            awaitTrue("$label: the excluded stretch ends with tether DEGRADED", deadline) {
+                tetherState() == com.jay.fxi.domain.model.TopicDeliveryState.DEGRADED
+            }
+            println("CUT-C01 $label: excluded stretch (tether first-delivery watchdog, revalidation, degrade) ended at ${nowMillis() - start} ms")
+            delay(2_000)
+            fun sample() = listOf(holder.state.value.chart?.rightEdgeNow, rig.assembly.recorder.state.value,
+                rig.assembly.coordinator.state.value.entries,
+                rig.assembly.coordinator.state.value.entries.values.firstOrNull { it.tab.period == GraphPeriod.ONE_DAY })
+            val base = rig.onMain { sample() + rig.kbTipNow() }
+            assertNotNull("$label: premise: a 1d entry", base[3])
+            assertNotNull("$label: premise: a kb tip", base[4])
+            assertNull("$label: premise: no live publication pending", rig.onMain { holder.livePublishJob() })
+            val graphBefore = graph().size
+            val sendsBefore = sends.all().size
+            val subscribedBefore = synchronized(subscribed) { subscribed.size }
+            val edges = mutableListOf<Long>()
+            var edge = base[0]
+            val windowStart = nowMillis()
+            val until = windowStart + 65_000
+            while (nowMillis() < until) {
+                val now = rig.onMain { sample() + rig.kbTipNow() }
+                if (now[0] != edge) { edge = now[0]; edges += nowMillis() }
+                assertSame("$label: the recorder state object stays", base[1], now[1])
+                assertSame("$label: the coordinator's entries instance stays", base[2], now[2])
+                assertSame("$label: the 1d entry object stays", base[3], now[3])
+                assertEquals("$label: the kb tip stays", base[4], now[4])
+                assertEquals("$label: tether stays DEGRADED", com.jay.fxi.domain.model.TopicDeliveryState.DEGRADED, tetherState())
+                assertEquals("$label: no subscription is sent", subscribedBefore, synchronized(subscribed) { subscribed.size })
+                assertEquals("$label: no graph request\n${sends.timeline()}", graphBefore, graph().size)
+                assertEquals("$label: no other send\n${sends.timeline()}", sendsBefore, sends.all().size)
+                delay(20)
+            }
+            println("CUT-C01 $label: right edge moved at ${edges.map { it - windowStart }} ms into the window")
+            assertTrue("$label: the right edge moved two or three times ($edges)", edges.size in 2..3)
+            assertTrue("$label: 25 to 35 s apart ($edges)", edges.zipWithNext().all { (a, b) -> b - a in 25_000..35_000 })
+            assertEquals("$label: premise: the same 600 s bucket", bucket, System.currentTimeMillis() / 600_000)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 175_000)
         ColdStartBudget.assertWithin(judgeRow(label))
     }
 

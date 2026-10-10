@@ -51,12 +51,17 @@
     "RT01-B04b under a hidden capability the tab captures no KRX epoch and after the re-approval only the new epoch is used",
     "RT01-B05a a late old completion after a context change applies nothing and its Retry-After floor holds the new context",
     "RT01-B05b a late old completion after the user's end keeps its floor over the new context's refill",
+    "RT01-H01a a failed restore falls back to usd and only the usd holder is active",
+    "RT01-H01b a selection made while the restore is pending wins over it",
+    "RT01-H01c a restore of an older generation is refused after the same user's new generation",
     "RT01-H02a a live value is published when its wait ends and hiding inside the wait cancels it",
     "RT01-H02b closing the route inside a pending wait cancels it and the old token's actions do nothing",
     "RT01-H02c a wait pending across a grant change publishes nothing under the old token and its actions do nothing",
     "RT01-H02d the fullscreen token shares the owner and publishes while inline is hidden and is refused after the exit",
     "RT01-S02a with no file on disk the seed restores nothing and the screen waits for the network",
+    "RT01-S02b a KRX file of another response is not joined to the restored general file",
     "RT01-S02c a new user epoch does not restore the previous epoch's files still on disk",
+    "RT01-S02d a failed KRX write leaves the general file to restore alone",
     "RT03b-Q01a a catalog adopted while the first tab is in flight leaves the demand to one follow-up with its capture",
     "RT03b-Q01b a catalog adopted after the round was due sends the follow-up at once",
     "RT03b-Q01c a catalog adopted before the round was due sends the follow-up at the round",
@@ -71,6 +76,9 @@
     "RT03b-Q06c a terminal answer stops the cycle, keeps the demand and no trigger reopens it",
     "RT03b-Q06d a round released by a same-scope context change applies nothing and the next asks the catalog once",
     "RT03b-Q06e rounds inside the catalog TTL ask no catalog and the first after it asks one",
-    "RT05-T03a a connection change in the background only moves the baseline and the next foreground drop reconnects once"
+    "RT05-T01a time alone moves the right edge on the freshness tick and changes no observation",
+    "RT05-T03a a connection change in the background only moves the baseline and the next foreground drop reconnects once",
+    "RT05-T03b a first connect that throws leaves no connection and the first real one is the baseline",
+    "RT05-T03c revisions delayed behind Main are read as the latest permit and resync once"
   ]
 }
