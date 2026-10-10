@@ -583,6 +583,35 @@ class PremiumGraphCutoverAcceptanceTest {
             }
         }
 
+        /**
+         * S4 C01 batch 3 (cut_c01_b3_agreed.r1.md §4-2): the premium route's target rule (PremiumTopicRoute.kt:86-92) — the
+         * selected tab's mounted holder with the screen owner. A target change deactivates the previous holder before
+         * activating the next, a null target only deactivates, and [RouteStandIn.close] ends the route (its target
+         * deactivated) and then closes the mount, as the route's effects are disposed. Rows before batch 3 keep [openScreen].
+         */
+        suspend fun openRoute(deadline: Long): RouteStandIn {
+            awaitTrue("the host is published", deadline) { onMain { owner.graphHost.value != null } }
+            return onMain {
+                val opened = checkNotNull(owner.graphHost.value).open()
+                mount = opened
+                val route = RouteStandIn(opened)
+                route.job = CoroutineScope(ownerJob + main).launch {
+                    kotlinx.coroutines.flow.combine(owner.consumer.state, opened.holders) { _, holders -> holders }.collect { holders ->
+                        val ui = owner.consumer.currentState().ui
+                        val holder = ui.selectedTab?.serverTab?.let { holders[it] }
+                        val screenOwner = ui.owner
+                        val next = if (screenOwner != null && holder != null) holder to screenOwner else null
+                        if (next != route.target) {
+                            route.target?.first?.onDeactivated()
+                            route.target = next
+                            next?.let { (h, o) -> h.onActivated(o) }
+                        }
+                    }
+                }
+                route
+            }
+        }
+
         /** The inline surface reports itself shown, as its lifecycle start effect does, once the holder has a token. */
         suspend fun showSurface(holder: GraphV2ScreenStateHolder, deadline: Long) {
             awaitTrue("the holder has an inline token", deadline) { onMain { holder.currentState().inlineToken != null } }
@@ -4330,6 +4359,766 @@ class PremiumGraphCutoverAcceptanceTest {
         }
         assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
         assertTrue("within the row deadline", nowMillis() - start <= 80_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- CUT-C01 batch 3a: RT01-A06, RT01-S02 (cut_c01_b3_agreed.r1.md) -----------------------------------------------------
+
+    /** The coordinator's request publication, read on Main. */
+    private suspend fun Rig.requestState(): com.jay.fxi.data.graph.GraphRequestState = onMain { assembly.coordinator.state.value }
+
+    /** The coordinator's protected slot object for [key] (the object itself, not its components), read on Main. */
+    private suspend fun Rig.slotObject(key: com.jay.fxi.data.graph.GraphKey): Any? = onMain {
+        (privateField(assembly.coordinator, "protectedSlots") as Map<*, *>)[key]
+    }
+
+    /** Whether the usd 1d disk seed was tried and has finished (no seed registration left), read on Main. */
+    private suspend fun Rig.usdSeedFinished(): Boolean = onMain {
+        val c = assembly.coordinator
+        val tried = privateField(c, "attemptedSeedKey") as com.jay.fxi.data.graph.GraphKey?
+        tried?.tab == "usd" && tried.period.code == "1d" && privateField(c, "seedRegistration") == null
+    }
+
+    /** Every file of the graph disk store with the SHA-256 of its bytes. */
+    private fun Rig.diskFiles(): Map<String, String> = writtenFiles().associateWith { path ->
+        java.security.MessageDigest.getInstance("SHA-256").digest(File(diskRoot, path).readBytes()).joinToString("") { "%02x".format(it) }
+    }
+
+    /** The last real observation of every series on the screen's last published chart (its state, not a new render), on Main. */
+    private suspend fun Rig.shownLast(holder: GraphV2ScreenStateHolder): Map<String, com.jay.fxi.ui.graph.LinePoint?>? = onMain {
+        holder.state.value.chart?.prepared?.bySeries?.mapValues { it.value.lastObservation }
+    }
+
+    /**
+     * RT01-A06: a grant change with no end keeps the last good entry (the A2a03b contract, in the production composition). A
+     * real 3m 503 leaves one failure and a second 3m request is sent and held; the screen is back on a confirmed 1d. A refused
+     * subscription makes the issuer re-approve on a new grant (same identity, user epoch, KRX epoch, no USER or capability
+     * end), and the new context's graph answers are held. Once the new context is consumed: the 1d entry and its stamp and the
+     * protected slot are the same objects, the catalog and failures are dropped, the old 3m request is released and its late
+     * 200 is never applied; the screen (through the batch 3 route) shows the kept entry under the new owner. The entry is fresh
+     * (TTL 3600 s with no catalog, same KST date), the recorder holds no series and no trigger or recovery cycle occurs in the
+     * window: the screen's own activation sends the one catalog, then for a second and until the release no tab goes; the
+     * kept objects are checked again just before the release and the old 200 again at the end. The auth-generation half is
+     * structurally excluded: the issuer records an IDENTITY_CHANGED USER end on every identity change
+     * (PremiumAccessCoordinator.kt:454), which is RT01-A05.
+     */
+    @Test
+    fun `RT01-A06 a re-approval with no end keeps the last good entry and slot and drops the old requests`() = runBlocking {
+        val label = "RT01-A06"
+        val prepared = clearOfBoundary(60_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 50_000
+        entitlements += unauthorized()
+        val hold3m = java.util.concurrent.CountDownLatch(1)
+        val holdNew = java.util.concurrent.CountDownLatch(1)
+        val afterReapproval = java.util.concurrent.atomic.AtomicBoolean(false)
+        val threeMonthCalls = AtomicInteger()
+        val oldBody = shiftedTab(fixture("usd-3m-krx-hidden.json"), 7.0)
+        val oldAll = tabValues(oldBody).values.flatten().toSet()
+        onCatalog = {
+            if (afterReapproval.get()) holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS)
+            ok(fixture("catalog-krx-hidden.json"))
+        }
+        onTab = { request ->
+            if (request.requestUrl!!.queryParameter("period") == "3m") {
+                when (threeMonthCalls.getAndIncrement()) {
+                    0 -> unavailable()
+                    1 -> { hold3m.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(oldBody) }
+                    else -> { holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("usd-3m-krx-hidden.json")) }
+                }
+            } else {
+                if (afterReapproval.get()) holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                ok(fixture("usd-1d-krx-hidden.json"))
+            }
+        }
+        val rig = Rig()
+        val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            while (true) {
+                if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
+                delay(20)
+            }
+        }
+        try {
+            rig.row {
+                val (_, holder) = rig.coldStartRoute(deadline)
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: catalog and the usd tab applied", deadline) {
+                    rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null }
+                }
+                quiet("$label settle", 3_500)
+                // A real failure: the first 3m answer is a 503.
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the 3m 503 is applied as a failure", deadline) {
+                    rig.requestState().failures.keys.any { it.tab == "usd" && it.period.code == "3m" }
+                }
+                assertEquals("$label: premise: exactly one failure", 1, rig.requestState().failures.size)
+                // A separate 3m request: away to 1d and back to 3m, sent, registered and its body held.
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.ONE_DAY) }
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the separate 3m request is sent and registered", deadline) {
+                    tabs().count { it.param("period") == "3m" } == 2 && rig.usdCaptureEpoch("3m").first
+                }
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.ONE_DAY) }
+                awaitTrue("$label: back on 1d", deadline) { rig.onMain { holder.currentState().activePeriod == GraphPeriod.ONE_DAY } }
+                val key1d = checkNotNull(rig.usdKey("1d"))
+                assertTrue("$label: premise: the 3m request is still registered after the return", rig.usdCaptureEpoch("3m").first)
+                assertNull("$label: premise: its body is held", tabs().filter { it.param("period") == "3m" }[1].bodyEnd)
+                val before = rig.requestState()
+                assertNotNull("$label: premise: a catalog is adopted", before.catalog)
+                val entry = checkNotNull(before.entries[key1d]) { "$label: premise: a 1d entry" }
+                val stamp = checkNotNull(entry.online200At) { "$label: premise: the 1d entry is confirmed" }
+                assertEquals("$label: premise: the failure is still there", 1, before.failures.size)
+                val slot = checkNotNull(rig.slotObject(key1d)) { "$label: premise: a protected slot" }
+                assertEquals("$label: premise: the active key is usd 1d", key1d, rig.onMain { privateField(rig.assembly.coordinator, "activeKey") })
+                val shownBefore = checkNotNull(rig.shownLast(holder)) { "$label: premise: the screen shows the 1d entry" }
+                assertEquals("$label: premise: no recovery demand", com.jay.fxi.data.graph.GraphTabRecoveryDemand.None, rig.usdDemand())
+                val epoch = rig.epochStore.load().krxCapabilityEpoch
+                val userEnds = rig.coordinator.accessSnapshot.lastUserEnd?.sequence ?: 0L
+                val capabilityEnds = rig.coordinator.accessSnapshot.lastCapabilityEnd?.sequence ?: 0L
+                val f1 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                val tabsBefore = tabs().size
+                val catalogsBefore = catalogs().size
+
+                // The re-approval: the reconnect's subscription is refused once and the issuer re-approves on a new grant.
+                afterReapproval.set(true)
+                refuseUsd = {
+                    refuseUsd = null
+                    rig.issuerIdentityReadable = false
+                }
+                val reapprovalAt = nowMillis()
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: a re-approval on a new grant", deadline) {
+                    rig.coordinator.topicGrantResult().fence?.grant?.let { it != f1.grant } == true
+                }
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("$label: premise: the same identity", f1.identity, f2.identity)
+                assertEquals("$label: premise: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                awaitTrue("$label: its context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == f2 }
+                // The window: from here until the held answers are released, no trigger and no recovery cycle.
+                val triggersInWindow = rig.triggers()
+                val noBudgets = suspend { rig.onMain { (privateField(rig.assembly.coordinator, "recoveryBudgets") as Map<*, *>).isEmpty() } }
+                assertTrue("$label: premise: no recovery cycle is open", noBudgets())
+                // The entry is fresh for the coordinator: with no catalog the TTL is GraphV2Domain.ttl(null), 3600 s, on the same KST date.
+                val age = kotlinx.datetime.Clock.System.now() - stamp
+                assertTrue("$label: premise: the 1d entry is fresh ($age)", age < 3600.seconds)
+                assertEquals("$label: premise: on the same KST date",
+                    java.time.Instant.ofEpochMilli(stamp.toEpochMilliseconds()).atOffset(kst).toLocalDate(), java.time.LocalDate.now(kst))
+                // Every new graph answer is still held: what the coordinator holds now is what the grant change left.
+                val after = rig.requestState()
+                assertSame("$label: the 1d entry is the same object", entry, after.entries[key1d])
+                assertEquals("$label: with the same stamp", stamp, after.entries[key1d]?.online200At)
+                assertSame("$label: the protected slot is the same object", slot, rig.slotObject(key1d))
+                assertNull("$label: the catalog is dropped", after.catalog)
+                assertEquals("$label: the failures are dropped", emptyMap<com.jay.fxi.data.graph.GraphKey, Throwable>(), after.failures)
+                assertEquals("$label: the old 3m request is released", false to null as String?, rig.usdCaptureEpoch("3m"))
+                awaitTrue("$label: the screen shows the kept entry under the new owner", deadline) {
+                    rig.onMain { holder.currentState().let { it.content == GraphV2Content.READY && it.inlineToken?.fence == f2 } }
+                }
+                assertEquals("$label: with the same values", shownBefore, rig.shownLast(holder))
+                // With the catalog dropped the recorder's demand reads CatalogRequired whatever it holds; no closed demand exists,
+                // since the recorder holds no series (no kb delivery in this row), and no trigger can open a cycle in the window.
+                assertTrue("$label: premise: the recorder holds no series (no closed demand)",
+                    rig.onMain { rig.assembly.recorder.state.value.series.isEmpty() })
+                // The screen's own activation sends the one catalog (the catalog is null, so it is needed); then for a second no tab.
+                awaitTrue("$label: the screen's activation catalog is sent", deadline) { catalogs().size == catalogsBefore + 1 }
+                val windowEnd = nowMillis() + 1_000
+                while (nowMillis() < windowEnd) {
+                    assertEquals("$label: no new tab sent\n${sends.timeline()}", tabsBefore, tabs().size)
+                    delay(50)
+                }
+                assertEquals("$label: premise: the same KRX epoch", epoch, rig.epochStore.load().krxCapabilityEpoch)
+                assertEquals("$label: premise: no USER end", userEnds, rig.coordinator.accessSnapshot.lastUserEnd?.sequence ?: 0L)
+                assertEquals("$label: premise: no capability end", capabilityEnds, rig.coordinator.accessSnapshot.lastCapabilityEnd?.sequence ?: 0L)
+
+                // The old 3m completes late: nothing of it is applied.
+                val oldValuesApplied = suspend {
+                    rig.onMain {
+                        rig.assembly.coordinator.state.value.entries.values
+                            .flatMap { e -> e.tab.graph.series.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } } }
+                            .toSet().intersect(oldAll).isNotEmpty()
+                    }
+                }
+                hold3m.countDown()
+                awaitTrue("$label: the old 3m body ended", deadline) { tabs().filter { it.param("period") == "3m" }[1].bodyEnd != null }
+                assertEquals("$label: premise: the old answer was a 200", 200, tabs().filter { it.param("period") == "3m" }[1].status)
+                delay(500)
+                assertNull("$label: no 3m entry from the old answer", rig.usdKey("3m"))
+                assertFalse("$label: no old value in the entries", oldValuesApplied())
+                // Just before the new answers are released, the window still holds.
+                val beforeRelease = rig.requestState()
+                assertSame("$label: still the same 1d entry", entry, beforeRelease.entries[key1d])
+                assertEquals("$label: still the same stamp", stamp, beforeRelease.entries[key1d]?.online200At)
+                assertSame("$label: still the same slot", slot, rig.slotObject(key1d))
+                assertNull("$label: still no catalog", beforeRelease.catalog)
+                assertEquals("$label: still no new tab\n${sends.timeline()}", tabsBefore, tabs().size)
+                assertEquals("$label: still the one catalog\n${sends.timeline()}", catalogsBefore + 1, catalogs().size)
+                assertEquals("$label: no trigger in the window", triggersInWindow, rig.triggers())
+                assertTrue("$label: and no recovery cycle", noBudgets())
+                holdNew.countDown()
+                settleNewSession(label, reapprovalAt, deadline)
+                assertNull("$label: at the end, still no 3m entry", rig.usdKey("3m"))
+                assertFalse("$label: and no old value in the entries", oldValuesApplied())
+            }
+        } finally {
+            hold3m.countDown()
+            holdNew.countDown()
+            refuseUsd = null
+            restorer.cancel()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 50_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-S02a: with no file on disk the seed restores nothing. On an empty disk the cold start tries the usd 1d seed and it
+     * finishes; with the network answer held, the coordinator has no entry and no slot (so no stamp) and the screen waits.
+     */
+    @Test
+    fun `RT01-S02a with no file on disk the seed restores nothing and the screen waits for the network`() = runBlocking {
+        val label = "RT01-S02a"
+        val prepared = clearOfBoundary(40_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 30_000
+        entitlements += unauthorized()
+        val holdTab = java.util.concurrent.CountDownLatch(1)
+        onTab = { holdTab.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("usd-1d-krx-hidden.json")) }
+        val rig = Rig()
+        try {
+            rig.row {
+                assertEquals("$label: premise: the graph disk is empty", emptyList<String>(), rig.writtenFiles())
+                val (_, holder) = rig.coldStartRoute(deadline)
+                awaitTrue("$label: the 1d tab is sent and held", deadline) { tabs().any { it.param("period") == "1d" && it.bodyEnd == null } }
+                awaitTrue("$label: the 1d seed was tried and finished", deadline) { rig.usdSeedFinished() }
+                val state = rig.requestState()
+                assertEquals("$label: no entry", emptyMap<com.jay.fxi.data.graph.GraphKey, Any>(), state.entries)
+                assertEquals("$label: no protected slot", emptyMap<Any, Any>(),
+                    rig.onMain { (privateField(rig.assembly.coordinator, "protectedSlots") as Map<*, *>).toMap() })
+                assertEquals("$label: the screen waits for the network", GraphV2Content.LOADING, rig.onMain { holder.currentState().content })
+                assertEquals("$label: still nothing on disk", emptyList<String>(), rig.writtenFiles())
+                holdTab.countDown()
+                awaitTrue("$label: the network answer applied", deadline) { rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+                awaitTrue("$label: the server and the recorder agree", deadline) {
+                    synchronized(received) { received.toList() }.sorted() == sends.all().map { it.key }.sorted()
+                }
+                quiet(label, 1_000)
+            }
+        } finally {
+            holdTab.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 30_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-S02c: a new user epoch never restores the previous epoch's files. The 1d answer is applied and written (writes
+     * drained, its files recorded). A real StableInactive answer ends the user and a FORCE_PREMIUM answer re-grants on a new
+     * user epoch; the new scope's graph answers are held. Once the new context is consumed and its seed tried and finished: the
+     * previous epoch's files are still on disk unchanged (a precondition), yet the coordinator has no entry and no slot.
+     */
+    @Test
+    fun `RT01-S02c a new user epoch does not restore the previous epoch's files still on disk`() = runBlocking {
+        val label = "RT01-S02c"
+        val prepared = clearOfBoundary(50_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += unauthorized()
+        val holdNew = java.util.concurrent.CountDownLatch(1)
+        val newScope = java.util.concurrent.atomic.AtomicBoolean(false)
+        onCatalog = {
+            if (newScope.get()) holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS)
+            ok(fixture("catalog-krx-hidden.json"))
+        }
+        onTab = {
+            if (newScope.get()) holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS)
+            ok(fixture("usd-1d-krx-hidden.json"))
+        }
+        val rig = Rig()
+        try {
+            rig.row {
+                rig.coldStartRoute(deadline)
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: catalog and the usd tab applied", deadline) {
+                    rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null }
+                }
+                rig.awaitWritesDrained(label, deadline)
+                val f1 = checkNotNull(rig.bridge())
+                val filesBefore = rig.diskFiles()
+                val epochDir = diskHex(checkNotNull(f1.userAccessEpoch))
+                assertTrue("$label: premise: the 1d answer was written under the first user epoch ($filesBefore)",
+                    filesBefore.keys.any { it.contains("/$epochDir/") && it.endsWith("1d.json") })
+                quiet("$label settle", 3_500)
+                val churnAt = nowMillis()
+                newScope.set(true)
+                entitlements += ok("""{"krx_visible":false,"premium_active":false,"premium_pending":false}""")
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                entitlements += ok(PREMIUM_HIDDEN)
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence) { "$label: no re-grant after the user end" }
+                assertNotEquals("$label: premise: a new user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                awaitTrue("$label: the new scope's context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == f2 }
+                awaitTrue("$label: the new scope's 1d seed was tried and finished", deadline) { rig.usdSeedFinished() }
+                // A precondition (the composition's purger defers): the previous epoch's files are still there to be misread.
+                assertEquals("$label: premise: the previous epoch's files are on disk unchanged", filesBefore,
+                    rig.diskFiles().filterKeys { it in filesBefore.keys })
+                val state = rig.requestState()
+                assertEquals("$label: no entry in the new scope", emptyMap<com.jay.fxi.data.graph.GraphKey, Any>(), state.entries)
+                assertEquals("$label: no protected slot in the new scope", emptyMap<Any, Any>(),
+                    rig.onMain { (privateField(rig.assembly.coordinator, "protectedSlots") as Map<*, *>).toMap() })
+                holdNew.countDown()
+                awaitTrue("$label: the new scope's tab applied", deadline) { rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+                settleNewSession(label, churnAt, deadline)
+            }
+        } finally {
+            holdNew.countDown()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- CUT-C01 batch 3a: RT05-T03a (cut_c01_b3_agreed.r1.md) --------------------------------------------------------------
+
+    /** The recovery events' consumed Connection as (session key, generation), or null; read on Main. */
+    private suspend fun Rig.eventsConnection(): Pair<Any?, Long>? = onMain {
+        privateField(assembly.events, "connection")?.let { privateField(it, "sessionKey") to (privateField(it, "generation") as Long) }
+    }
+
+    /** The foreground the recovery events have consumed, read on Main. */
+    private suspend fun Rig.eventsForeground(): Boolean? = onMain { privateField(assembly.events, "foreground") as Boolean? }
+
+    /**
+     * RT05-T03(a): a Connection change consumed in the background only moves the baseline. Once the events have consumed the
+     * background, the server drops the socket: the session's next Connection (same session key, a higher generation) is
+     * consumed as the baseline and issues nothing. Back in the foreground within 60 s and in the same 600 s bucket, the return
+     * issues nothing either. A foreground drop then brings a Connection consumed past the cooldown (no resync yet), which
+     * issues exactly one RECONNECT.
+     */
+    @Test
+    fun `RT05-T03a a connection change in the background only moves the baseline and the next foreground drop reconnects once`() = runBlocking {
+        val label = "RT05-T03a"
+        val prepared = clearOfBoundary(60_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 50_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            rig.coldStart(deadline)
+            rig.awaitTopics(deadline)
+            awaitTrue("$label: the tab applied", deadline) { rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+            awaitTrue("$label: the first Connection is the baseline", deadline) { rig.eventsConnection() != null }
+            val baseline = checkNotNull(rig.eventsConnection())
+            assertEquals("$label: premise: the baseline issued nothing", 0L, rig.triggers())
+            val bucket = System.currentTimeMillis() / 600_000
+            rig.foreground.value = false
+            awaitTrue("$label: the events consumed the background", deadline) { rig.eventsForeground() == false }
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: the background Connection is consumed as the baseline", deadline) {
+                rig.eventsConnection()?.let { it.first == baseline.first && it.second > baseline.second } == true
+            }
+            val background = checkNotNull(rig.eventsConnection())
+            assertEquals("$label: it is the live permit's Connection", background.second,
+                rig.permitSlot?.get()?.invoke()?.connectionGeneration)
+            assertEquals("$label: no trigger in the background", 0L, rig.triggers())
+            rig.foreground.value = true
+            awaitTrue("$label: the events consumed the return", deadline) { rig.eventsForeground() == true }
+            delay(1_000)
+            assertEquals("$label: the return within 60 s issues nothing", 0L, rig.triggers())
+            assertEquals("$label: premise: the same 600 s bucket", bucket, System.currentTimeMillis() / 600_000)
+            assertNull("$label: premise: no resync yet, so the cooldown has passed", rig.onMain { privateField(rig.assembly.events, "lastResync") })
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: the foreground Connection is consumed", deadline) {
+                rig.eventsConnection()?.let { it.first == baseline.first && it.second > background.second } == true
+            }
+            awaitTrue("$label: one RECONNECT", deadline) { rig.triggers() == 1L }
+            delay(2_000)
+            assertEquals("$label: exactly one", 1L, rig.triggers())
+            assertEquals("$label: premise: still the same 600 s bucket", bucket, System.currentTimeMillis() / 600_000)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 50_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- CUT-C01 batch 3a: RT01-H02 (cut_c01_b3_agreed.r1.md) ----------------------------------------------------------------
+
+    /** The batch 3 route stand-in ([Rig.openRoute]); its fields are read and written on Main. */
+    private class RouteStandIn(val mount: GraphScreenMount) {
+        var job: Job? = null
+        var target: Pair<GraphV2ScreenStateHolder, com.jay.fxi.data.remote.TopicDisplayOwner>? = null
+
+        /** As the route's disposal (call on Main): its effect stops, its target is deactivated, then the mount closes. */
+        fun close() {
+            job?.cancel()
+            target?.first?.onDeactivated()
+            target = null
+            mount.close()
+        }
+    }
+
+    /** The wall second the last [sendUsdFrame] was stamped with. */
+    @Volatile private var lastFrameSecond = 0L
+
+    /**
+     * Sends the usd snapshot with [rate] on the current socket, stamped in a wall second after the previous frame's: the topic
+     * merge ignores a quote carrying the same timestamp as the one it holds.
+     */
+    private suspend fun sendUsdFrame(rate: Double) {
+        while (System.currentTimeMillis() / 1000 <= lastFrameSecond) delay(10)
+        val second = System.currentTimeMillis() / 1000
+        lastFrameSecond = second
+        openSockets.last().send(usdSnapshotAt(rate, second))
+    }
+
+    /** The holder's pending live publication, read on Main. */
+    private fun GraphV2ScreenStateHolder.livePublishJob(): Job? = privateField(this, "livePublishJob") as Job?
+
+    /** kb.usd's last real observation on the holder's last published chart (its state, not a new render), read on Main. */
+    private fun GraphV2ScreenStateHolder.chartKb(): Double? =
+        state.value.chart?.prepared?.bySeries?.get("kb.usd")?.lastObservation?.rate
+
+    /** The recorder's kb.usd tip, read on Main. */
+    private fun Rig.kbTipNow(): Double? =
+        assembly.recorder.state.value.series.entries.firstOrNull { it.key.seriesId == "kb.usd" }?.value?.data?.app?.tip?.rate
+
+    /** Approves, starts the owner and opens the batch 3 route; returns it with its usd holder once targeted and shown. */
+    private suspend fun Rig.coldStartRoute(deadline: Long): Pair<RouteStandIn, GraphV2ScreenStateHolder> {
+        approve()
+        startOwner()
+        val route = openRoute(deadline)
+        awaitTrue("the route targets the usd holder", deadline) {
+            onMain { route.target?.first?.let { it === mount?.holders?.value?.get("usd") } == true }
+        }
+        val holder = onMain { checkNotNull(route.target).first }
+        showSurface(holder, deadline)
+        return route to holder
+    }
+
+    /**
+     * Waits for a publication the row did not cause — a 30 s freshness tick: a new right edge with the recorder's tip unchanged,
+     * no publication pending and no graph request in flight — so the next tick is about 30 s away.
+     */
+    private suspend fun Rig.awaitFreshnessTick(holder: GraphV2ScreenStateHolder, label: String, deadline: Long) {
+        val (edge, tip) = onMain { holder.state.value.chart?.rightEdgeNow to kbTipNow() }
+        awaitTrue("$label: a freshness tick publishes", deadline) {
+            onMain { holder.state.value.chart?.rightEdgeNow != edge && kbTipNow() == tip && holder.livePublishJob() == null } &&
+                graph().all { it.bodyEnd != null }
+        }
+    }
+
+    /** Waits until the screen is ready to take a live value: READY, no publication pending, no graph request in flight. */
+    private suspend fun Rig.awaitReadyToSend(holder: GraphV2ScreenStateHolder, label: String, deadline: Long) =
+        awaitTrue("$label: ready, nothing pending, no graph request in flight", deadline) {
+            onMain { holder.state.value.content == GraphV2Content.READY && holder.livePublishJob() == null } &&
+                graph().all { it.bodyEnd != null }
+        }
+
+    /**
+     * RT01-H02's live screen through the batch 3 route: a REST delivery creates kb.usd in the recorder; on an acknowledged
+     * socket a warm-up WS value (1395) is published; then a freshness tick is seen, so the next one is far away.
+     */
+    private suspend fun Rig.prepareLive(label: String, deadline: Long): Pair<RouteStandIn, GraphV2ScreenStateHolder> {
+        usdSnapshotLive = true
+        val (route, holder) = coldStartRoute(deadline)
+        awaitTrue("$label: catalog and the usd tab applied", deadline) { catalogAdopted() && usdApplied() && tabs().all { it.bodyEnd != null } }
+        awaitTrue("$label: the REST delivery created kb.usd", deadline) { hasKbSeries() }
+        usdSnapshotLive = false
+        awaitTopics(deadline)
+        awaitUsdAcknowledged(label, 0, deadline)
+        quiet("$label settle", 3_500)
+        sendUsdFrame(1395.0)
+        awaitTrue("$label: the warm-up value is published", deadline) {
+            onMain { holder.chartKb() == 1395.0 && holder.livePublishJob() == null }
+        }
+        awaitFreshnessTick(holder, label, deadline)
+        return route to holder
+    }
+
+    /**
+     * Sends a value on the current socket and, in the Main step that first sees the recorder take it with its publication
+     * scheduled, checks it is not shown yet and runs [then]; returns the pending publication and the value. If a stalled poll
+     * finds the value already published (its wait missed), it tries again with [rate] + 0.25 and + 0.5, logging the miss.
+     */
+    private suspend fun Rig.sendAndCatchWait(
+        holder: GraphV2ScreenStateHolder, rate: Double, label: String, deadline: Long, then: () -> Unit = {}
+    ): Pair<Job, Double> {
+        repeat(3) { attempt ->
+            val value = rate + 0.25 * attempt
+            var caught: Job? = null
+            sendUsdFrame(value)
+            awaitTrue("$label: the recorder takes $value with its publication scheduled", deadline) {
+                onMain {
+                    val job = holder.livePublishJob()
+                    when {
+                        kbTipNow() == value && job != null -> {
+                            check(holder.chartKb() != value) { "$label: $value was published before its wait ended" }
+                            then()
+                            caught = job
+                            true
+                        }
+                        kbTipNow() == value && job == null && holder.chartKb() == value -> true
+                        else -> false
+                    }
+                }
+            }
+            caught?.let { return it to value }
+            println("CUT-C01 $label: the wait of $value was missed (attempt ${attempt + 1})")
+        }
+        fail("$label: three waits missed in a row")
+        error("unreachable")
+    }
+
+    /**
+     * RT01-H02(a): a live value waits for its scheduled publication. Ready, visible, nothing pending and no graph request in
+     * flight, a WS value is taken by the recorder and its publication is scheduled; until that wait ends the value is not
+     * shown, and once it ends it is (sample times are logged as auxiliary evidence, every 20 ms). A next value whose wait is
+     * pending is hidden in the same Main step: the wait is cancelled, the value is not shown while hidden, and shown again it
+     * is published at once.
+     */
+    @Test
+    fun `RT01-H02a a live value is published when its wait ends and hiding inside the wait cancels it`() = runBlocking {
+        val label = "RT01-H02a"
+        val prepared = clearOfBoundary(80_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 70_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            val (_, holder) = rig.prepareLive(label, deadline)
+            rig.awaitReadyToSend(holder, label, deadline)
+            val sentAt = nowMillis()
+            val (wait, first) = rig.sendAndCatchWait(holder, 1401.0, label, deadline)
+            val scheduledAt = nowMillis()
+            while (rig.onMain {
+                    if (!wait.isCompleted) check(holder.chartKb() != first) { "$label: $first was published during its wait" }
+                    !wait.isCompleted
+                }) delay(20)
+            val endedAt = nowMillis()
+            assertFalse("$label: the wait ran to its end", wait.isCancelled)
+            assertEquals("$label: once the wait ended, $first is published", first, rig.onMain { holder.chartKb() })
+            println("CUT-C01 $label: sent $sentAt, schedule seen $scheduledAt, end seen $endedAt (20 ms samples)")
+            rig.awaitReadyToSend(holder, label, deadline)
+            var hiddenAt = 0L
+            val (hidden, second) = rig.sendAndCatchWait(holder, 1402.0, label, deadline) {
+                holder.setSurfaceVisible(checkNotNull(holder.currentState().inlineToken), false)
+                hiddenAt = nowMillis()
+            }
+            assertTrue("$label: the hidden wait is cancelled", hidden.isCancelled)
+            val hiddenUntil = nowMillis() + 600
+            while (nowMillis() < hiddenUntil) {
+                assertTrue("$label: hidden, $second is not shown and nothing is pending",
+                    rig.onMain { holder.chartKb() != second && holder.livePublishJob() == null })
+                delay(20)
+            }
+            assertTrue("$label: the hidden wait has completed", hidden.isCompleted)
+            rig.onMain { holder.setSurfaceVisible(checkNotNull(holder.currentState().inlineToken), true) }
+            assertEquals("$label: shown again, $second is published at once", second, rig.onMain { holder.chartKb() })
+            println("CUT-C01 $label: hidden at $hiddenAt")
+            quiet(label, 1_000)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 70_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-H02(b): the route ends inside a pending wait. In the Main step that sees a WS value's publication pending, the route
+     * stand-in ends (its target deactivated, the mount closed): the wait is cancelled and completes, so the value is never
+     * published; the old token's period selection and series toggle send nothing and change nothing (refused because the
+     * screen has no context); the recorder takes the next value.
+     */
+    @Test
+    fun `RT01-H02b closing the route inside a pending wait cancels it and the old token's actions do nothing`() = runBlocking {
+        val label = "RT01-H02b"
+        val prepared = clearOfBoundary(80_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 70_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            val (route, holder) = rig.prepareLive(label, deadline)
+            rig.awaitReadyToSend(holder, label, deadline)
+            val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+            val (wait, _) = rig.sendAndCatchWait(holder, 1403.0, label, deadline) { route.close() }
+            assertTrue("$label: the pending wait is cancelled", wait.isCancelled)
+            delay(600)
+            assertTrue("$label: and has completed", wait.isCompleted)
+            val closed = rig.onMain { holder.currentState() }
+            val tabsBefore = tabs().size
+            rig.onMain {
+                holder.selectPeriod(token, GraphPeriod.THREE_MONTHS)
+                holder.toggleSeries(token, "kb.usd")
+            }
+            delay(1_000)
+            assertEquals("$label: the old token's selection sends nothing", 0, tabs().drop(tabsBefore).count { it.param("period") == "3m" })
+            assertEquals("$label: and changes nothing", closed, rig.onMain { holder.currentState() })
+            sendUsdFrame(1404.0)
+            awaitTrue("$label: the recorder takes the next value", deadline) { rig.onMain { rig.kbTipNow() == 1404.0 } }
+            quiet(label, 1_000)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 70_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-H02(c): a wait pending when the grant changes. A WS value's publication is pending; Main is held at once. While it
+     * is held the wait's timer fires (its resume queued behind the hold), a probe is queued right after it, and then a refused
+     * subscription makes the issuer re-approve on a new grant (same identity and user epoch) and the holder's display moves to
+     * it. Released, the old wait runs first, after the transition was published, and the probe right after it sees that it
+     * published nothing: no state shows the value, the state is not the old token's and no live publication is kept. The holder
+     * then runs under the new owner, and the old token's period selection and series toggle send nothing and change neither
+     * the period nor the selection.
+     */
+    @Test
+    fun `RT01-H02c a wait pending across a grant change publishes nothing under the old token and its actions do nothing`() = runBlocking {
+        val label = "RT01-H02c"
+        val prepared = clearOfBoundary(90_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 80_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            while (true) {
+                if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
+                delay(20)
+            }
+        }
+        try {
+            rig.row {
+                val (_, holder) = rig.prepareLive(label, deadline)
+                rig.awaitReadyToSend(holder, label, deadline)
+                val oldToken = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+                val f1 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                // The display the holder was built with.
+                val display = checkNotNull(rig.runtimeDisplay)
+                // The warm-up WS value after the REST delivery left a closed demand; the reconnect's recovery round meets it whole.
+                onTab = { ok(usdTab(closedStarts())) }
+                refuseUsd = {
+                    refuseUsd = null
+                    rig.issuerIdentityReadable = false
+                }
+                val (wait, value) = rig.sendAndCatchWait(holder, 1405.0, label, deadline)
+                val caughtAt = nowMillis()
+                val hold = holdMain()
+                val reapprovalAt = nowMillis()
+                // Read in the Main step right after the old wait's: the passive published state and the live publication.
+                var probe: List<Any?>? = null
+                holding(hold) {
+                    // Once the wait's timer has fired its resume is queued behind the hold; a probe queued now runs right after it,
+                    // before anything the grant change queues.
+                    while (nowMillis() - caughtAt < 400) delay(10)
+                    mainExecutor.execute {
+                        probe = listOf(holder.state.value.inlineToken, holder.chartKb(), privateField(holder, "livePublication"),
+                            wait.isCompleted, wait.isCancelled)
+                    }
+                    openSockets.last().close(1011, "server restart")
+                    awaitTrue("$label: a re-approval on a new grant while Main is held", deadline) {
+                        rig.coordinator.topicGrantResult().fence?.grant?.let { it != f1.grant } == true
+                    }
+                    awaitTrue("$label: the screen's display moved to the new grant while Main is held", deadline) {
+                        display.value.owner?.let { it.grantEpoch != oldToken.owner.grantEpoch } == true
+                    }
+                    assertTrue("$label: premise: the wait came due during the hold (${nowMillis() - caughtAt} ms)", nowMillis() - caughtAt > 400)
+                    assertFalse("$label: premise: it has not run yet", wait.isCompleted)
+                }
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("$label: premise: the same identity", f1.identity, f2.identity)
+                assertEquals("$label: premise: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                awaitTrue("$label: the probe ran", deadline) { probe != null }
+                val seen = checkNotNull(probe)
+                println("CUT-C01 $label: probe after the old wait: token ${seen[0]}, kb ${seen[1]}, live ${seen[2]}, completed ${seen[3]}, cancelled ${seen[4]}")
+                assertEquals("$label: the old wait ran before the probe, not cancelled", true to false, seen[3] to seen[4])
+                assertFalse("$label: it published nothing: no state shows $value", seen[1] == value)
+                assertNotEquals("$label: and the published state is not the old token's", oldToken, seen[0])
+                assertNull("$label: and no live publication is kept", seen[2])
+                awaitTrue("$label: the holder runs under the new owner, ready with toggles", deadline) {
+                    rig.onMain { holder.currentState().let { it.inlineToken?.fence == f2 && it.content == GraphV2Content.READY && it.toggles.isNotEmpty() } }
+                }
+                val periodBefore = rig.onMain { holder.currentState().activePeriod }
+                val selectionBefore = rig.onMain { holder.currentState().toggles.map { it.seriesId to it.selected } }
+                val tabsBefore = tabs().size
+                rig.onMain {
+                    holder.selectPeriod(oldToken, GraphPeriod.THREE_MONTHS)
+                    holder.toggleSeries(oldToken, "kb.usd")
+                }
+                delay(1_000)
+                assertEquals("$label: the old token's selection sends nothing", 0, tabs().drop(tabsBefore).count { it.param("period") == "3m" })
+                assertEquals("$label: and changes not the period", periodBefore, rig.onMain { holder.currentState().activePeriod })
+                assertEquals("$label: nor the selection", selectionBefore, rig.onMain { holder.currentState().toggles.map { it.seriesId to it.selected } })
+                awaitTrue("$label: the recovery demand is met", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                settleNewSession(label, reapprovalAt, deadline)
+            }
+        } finally {
+            refuseUsd = null
+            restorer.cancel()
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 80_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-H02(d): inline and fullscreen share one owner. The fullscreen token shares the inline token's owner, fence, lifetime
+     * and binding; with inline hidden and fullscreen shown, a WS value's wait runs and the value is published. After the exit,
+     * the old fullscreen token is refused: it shows no surface, reopens nothing and selects nothing.
+     */
+    @Test
+    fun `RT01-H02d the fullscreen token shares the owner and publishes while inline is hidden and is refused after the exit`() = runBlocking {
+        val label = "RT01-H02d"
+        val prepared = clearOfBoundary(80_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 70_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            val (_, holder) = rig.prepareLive(label, deadline)
+            val inline = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+            rig.onMain { holder.enterFullscreen(inline) }
+            val full = checkNotNull(rig.onMain { holder.currentState().fullscreenToken }) { "$label: no fullscreen token" }
+            assertEquals("$label: the fullscreen surface", com.jay.fxi.ui.premium.graph.GraphV2Surface.FULLSCREEN, full.surface)
+            assertEquals("$label: the same owner", inline.owner, full.owner)
+            assertEquals("$label: the same fence", inline.fence, full.fence)
+            assertEquals("$label: the same lifetime", inline.lifetime, full.lifetime)
+            assertEquals("$label: the same binding", inline.binding, full.binding)
+            rig.onMain {
+                holder.setSurfaceVisible(full, true)
+                holder.setSurfaceVisible(checkNotNull(holder.currentState().inlineToken), false)
+            }
+            assertEquals("$label: premise: shown through fullscreen only", false to true,
+                rig.onMain { (privateField(holder, "inlineVisible") as Boolean) to (privateField(holder, "fullscreenVisible") as Boolean) })
+            rig.awaitReadyToSend(holder, label, deadline)
+            val (wait, value) = rig.sendAndCatchWait(holder, 1406.0, label, deadline)
+            awaitTrue("$label: the wait ends", deadline) { wait.isCompleted }
+            assertFalse("$label: the wait ran to its end", wait.isCancelled)
+            assertEquals("$label: $value is published through fullscreen", value, rig.onMain { holder.chartKb() })
+            rig.onMain { holder.exitFullscreen(full) }
+            val exited = rig.onMain { holder.currentState() }
+            assertFalse("$label: the fullscreen is closed", exited.fullscreenOpen)
+            assertNull("$label: with no fullscreen token", exited.fullscreenToken)
+            val tabsBefore = tabs().size
+            rig.onMain {
+                holder.setSurfaceVisible(full, true)
+                holder.enterFullscreen(full)
+                holder.selectPeriod(full, GraphPeriod.THREE_MONTHS)
+            }
+            delay(1_000)
+            assertEquals("$label: the old fullscreen token selects nothing", 0, tabs().drop(tabsBefore).count { it.param("period") == "3m" })
+            assertFalse("$label: reopens nothing", rig.onMain { holder.currentState().fullscreenOpen })
+            assertFalse("$label: and shows no surface", rig.onMain { privateField(holder, "fullscreenVisible") as Boolean })
+            quiet(label, 1_000)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 70_000)
         ColdStartBudget.assertWithin(judgeRow(label))
     }
 
