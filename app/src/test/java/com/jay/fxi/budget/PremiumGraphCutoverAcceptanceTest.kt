@@ -444,9 +444,22 @@ class PremiumGraphCutoverAcceptanceTest {
         @Volatile var recoveryIdentityReadable = true
         /** B1: how many candidate recovery identity reads that fault answered unreadable (the recovery's IdentityUnknown). */
         val recoveryIdentityDenials = AtomicInteger()
+        /**
+         * S4 C01 3d D3 (cut_c01_b3d_agreed.r1.md): while armed, the issuer's candidate recovery check (`checkCandidateLocked`)
+         * reads this different identity once; every other identity read, and that check afterwards, is real.
+         */
+        val differentRecoveryIdentity = java.util.concurrent.atomic.AtomicReference<com.jay.fxi.data.entitlements.EntitlementsIdentity?>(null)
+        /** S4 C01 3d D3: each read D3 answered, as "thread: Class.method" of its `checkCandidateLocked` frame. */
+        val differentRecoveryHits: MutableList<String> = Collections.synchronizedList(mutableListOf())
         /** The issuer on its production scope: a SupervisorJob on Default, independent of Main. */
         val coordinator = budgetCoordinator(api, provider, CoroutineScope(issuerJob + Dispatchers.Default), epochStore,
-            { issuerIdentityReadable }, { recoveryIdentityReadable }, { recoveryIdentityDenials.incrementAndGet() })
+            { issuerIdentityReadable }, { recoveryIdentityReadable }, { recoveryIdentityDenials.incrementAndGet() },
+            {
+                differentRecoveryIdentity.getAndSet(null)?.also {
+                    val frame = Thread.currentThread().stackTrace.first { f -> f.methodName == "checkCandidateLocked" }
+                    differentRecoveryHits += "${Thread.currentThread().name}: ${frame.className.substringAfterLast('.')}.${frame.methodName}"
+                }
+            })
         val uses = SnapshotTopicUseAuthority { coordinator.accessSnapshot }
         val tabs = Tabs(FreeTab.USD)
         val reports: MutableList<Throwable> = Collections.synchronizedList(mutableListOf())
@@ -686,7 +699,8 @@ class PremiumGraphCutoverAcceptanceTest {
         store: AccessEpochStore,
         identityReadable: () -> Boolean,
         recoveryIdentityReadable: () -> Boolean = { true },
-        onRecoveryDenied: () -> Unit = {}
+        onRecoveryDenied: () -> Unit = {},
+        differentRecoveryIdentityOnce: () -> com.jay.fxi.data.entitlements.EntitlementsIdentity? = { null }
     ): PremiumAccessCoordinator {
         // The production binding for both purgers: it answers Deferred, so every journal entry stays owed.
         val purger = UnimplementedScopePurger()
@@ -695,12 +709,14 @@ class PremiumGraphCutoverAcceptanceTest {
             source = AuthenticatedEntitlementsSource(api).let { real ->
                 object : com.jay.fxi.data.entitlements.EntitlementsSource {
                     override suspend fun fetch(freshPremium: Boolean) = real.fetch(freshPremium)
-                    override suspend fun currentIdentity() = when {
-                        !identityReadable() -> null
+                    override suspend fun currentIdentity(): com.jay.fxi.data.entitlements.EntitlementsIdentity? {
+                        if (!identityReadable()) return null
                         // Read before any suspension, so the stack is the caller's: the candidate recovery's own check only.
-                        !recoveryIdentityReadable() &&
-                            Thread.currentThread().stackTrace.any { it.methodName == "checkCandidateLocked" } -> null.also { onRecoveryDenied() }
-                        else -> real.currentIdentity()
+                        val inRecovery = Thread.currentThread().stackTrace.any { it.methodName == "checkCandidateLocked" }
+                        // S4 C01 3d D3: in that check only, a different identity once while armed.
+                        if (inRecovery) differentRecoveryIdentityOnce()?.let { return it }
+                        if (inRecovery && !recoveryIdentityReadable()) return null.also { onRecoveryDenied() }
+                        return real.currentIdentity()
                     }
                 }
             },
@@ -6157,6 +6173,514 @@ class PremiumGraphCutoverAcceptanceTest {
             } finally {
                 release.countDown()
             }
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 70_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- CUT-C01 batch 3d: RT01-S01 (A)(U)(C-A)(C-U), RT01-S02(b′) (cut_c01_b3d_agreed.r1.md) --------------------------------
+
+    /** The usd 1d key of the coordinator's entries, read on Main. */
+    private suspend fun Rig.usd1dKey(): com.jay.fxi.data.graph.GraphKey = onMain {
+        checkNotNull(assembly.coordinator.state.value.entries.keys.firstOrNull { it.tab == "usd" && it.period.code == "1d" })
+    }
+
+    /** The coordinator's capability configuration generation (GraphV2RequestCoordinator.kt:399), read on Main. */
+    private suspend fun Rig.capabilityGeneration(): Long = onMain { privateField(assembly.coordinator, "capabilityGeneration") as Long }
+
+    /** The supplement seed state: the last SupplementOccupied attempted, whether a seed is registered, and the last seed id. */
+    private data class SupplementView(
+        val attempted: com.jay.fxi.data.graph.GraphV2SeedMode.SupplementOccupied?,
+        val registered: Boolean,
+        val lastSeedId: Long
+    )
+
+    private fun Rig.supplementViewHere(): SupplementView {
+        val c = assembly.coordinator
+        return SupplementView(
+            privateField(c, "attemptedSupplement") as com.jay.fxi.data.graph.GraphV2SeedMode.SupplementOccupied?,
+            privateField(c, "seedRegistration") != null,
+            privateField(c, "nextSeedId") as Long
+        )
+    }
+
+    private suspend fun Rig.supplementView(): SupplementView = onMain { supplementViewHere() }
+
+    /** In one Main step: the coordinator's capability configuration generation and configuration, its active key, and the supplement state. */
+    private data class CapabilityProbe(
+        val generation: Long,
+        val configuration: com.jay.fxi.data.graph.GraphV2CapabilityConfiguration?,
+        val activeKey: com.jay.fxi.data.graph.GraphKey?,
+        val supplement: SupplementView
+    )
+
+    private fun Rig.capabilityProbeHere(): CapabilityProbe {
+        val c = assembly.coordinator
+        return CapabilityProbe(
+            privateField(c, "capabilityGeneration") as Long,
+            privateField(c, "capabilityConfiguration") as com.jay.fxi.data.graph.GraphV2CapabilityConfiguration?,
+            privateField(c, "activeKey") as com.jay.fxi.data.graph.GraphKey?,
+            supplementViewHere()
+        )
+    }
+
+    private suspend fun Rig.capabilityProbe(): CapabilityProbe = onMain { capabilityProbeHere() }
+
+    /**
+     * What every S01/S02(b′) comparison keeps (agreed r3 §2): the live identity, the USER and KRX epochs, the USER and
+     * capability end sequences, the published grant token and the graph request source (fence and lifetime). Read without Main
+     * and without any issuer call that could issue (`topicGrantResult` can).
+     */
+    private data class Namespace3d(
+        val identity: Any?, val userEpoch: String?, val krxEpoch: String?, val userEnd: Long, val capEnd: Long, val grant: Any?, val source: Any?
+    )
+
+    private suspend fun Rig.namespace3d(): Namespace3d {
+        val record = epochStore.load()
+        val snapshot = coordinator.accessSnapshot
+        return Namespace3d(
+            provider.currentIdentityFence(), record.userAccessEpoch, record.krxCapabilityEpoch,
+            snapshot.lastUserEnd?.sequence ?: 0L, snapshot.lastCapabilityEnd?.sequence ?: 0L,
+            snapshot.facts.token, assembly.coordinator.state.value.source
+        )
+    }
+
+    /** The coordinator's raw usd 1d entry, its slot components and a fresh protected read, in one Main step. */
+    private data class Usd1dView(
+        val entry: com.jay.fxi.data.graph.GraphEntry?,
+        val slot: Any?,
+        val components: com.jay.fxi.data.graph.GraphV2DiskComponents?,
+        /** The fresh protected read shows a non-KRX series. */
+        val protectedGeneral: Boolean,
+        /** The fresh protected read shows KRX, in its series or its in-progress buckets (GraphV2RequestCoordinator.kt:758-759). */
+        val protectedKrx: Boolean
+    )
+
+    private suspend fun Rig.usd1dView(key: com.jay.fxi.data.graph.GraphKey): Usd1dView = onMain { usd1dViewHere(key) }
+
+    /** [usd1dView] in the caller's thread: only on Main, or while Main is held (nothing else then touches the coordinator). */
+    private fun Rig.usd1dViewHere(key: com.jay.fxi.data.graph.GraphKey): Usd1dView {
+        val c = assembly.coordinator
+        val read = c.protectedEntry(key)
+        return Usd1dView(
+            c.state.value.entries[key],
+            (privateField(c, "protectedSlots") as Map<*, *>)[key],
+            slotComponents(key),
+            read?.tab?.graph?.series.orEmpty().any { !it.seriesId.startsWith("krx.") },
+            read != null && (read.tab.graph.series.any { it.seriesId.startsWith("krx.") } || read.tab.inProgress.keys.any { it.startsWith("krx.") })
+        )
+    }
+
+    /** The usd 1d KRX file under KRX epoch [epoch], or null (the store hex-encodes the namespace and the tab). */
+    private fun Rig.usd1dKrxFile(epoch: String): String? =
+        krxFiles().keys.singleOrNull { it.endsWith("/${diskHex("usd")}/1d.json") && "/${diskHex(epoch)}/" in it }
+
+    /** The usd 1d GENERAL file, or null. */
+    private fun Rig.usd1dGeneralFile(): String? =
+        writtenFiles().singleOrNull { it.startsWith("general/") && it.endsWith("/${diskHex("usd")}/1d.json") }
+
+    /**
+     * RT01-S01/S02(b′): new graph answers (catalog and tab) are held at the server until [GraphGate.open]; a wait that expires
+     * fails the row ([GraphGate.expired]) and returns no 200. Sends are not stopped; new answers, and the writes after them, are.
+     */
+    private class GraphGate {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val expired = java.util.concurrent.atomic.AtomicBoolean(false)
+        @Volatile var installedAt = Long.MAX_VALUE
+        fun open() = latch.countDown()
+    }
+
+    private fun installGraphGate(gate: GraphGate, tabAnswer: () -> String = { fixture("usd-1d-krx-visible.json") }) {
+        gate.installedAt = nowMillis()
+        onCatalog = {
+            if (gate.latch.await(40, java.util.concurrent.TimeUnit.SECONDS)) ok(fixture("catalog-krx-visible.json"))
+            else { gate.expired.set(true); MockResponse().setResponseCode(503) }
+        }
+        onTab = {
+            if (gate.latch.await(40, java.util.concurrent.TimeUnit.SECONDS)) ok(tabAnswer())
+            else { gate.expired.set(true); MockResponse().setResponseCode(503) }
+        }
+    }
+
+    /**
+     * RT01-S01 common preparation (agreed r3 §2): a KRX-visible cold start through the route stand-in, catalog and usd 1d
+     * applied, the writes drained and the sends settled; then a KRX 1d file under the record's KRX epoch, memory KRX, a stamped
+     * entry, a graph-data mark and `mayContainKrxData`.
+     */
+    private suspend fun Rig.prepare3d(label: String, deadline: Long) {
+        onCatalog = { ok(fixture("catalog-krx-visible.json")) }
+        onTab = { ok(fixture("usd-1d-krx-visible.json")) }
+        coldStartRoute(deadline)
+        awaitTopics(deadline)
+        awaitTrue("$label: catalog and usd 1d applied", deadline) { catalogAdopted() && usdApplied() && tabs().all { it.bodyEnd != null } }
+        awaitWritesDrained(label, deadline)
+        awaitSendsQuietly(this, deadline)
+        val key = usd1dKey()
+        val record = epochStore.load()
+        val epoch = checkNotNull(record.krxCapabilityEpoch) { "$label: premise: a KRX capability epoch" }
+        assertNotNull("$label: premise: the usd 1d KRX file under epoch E ($epoch = ${diskHex(epoch)}; ${krxFiles().keys})", usd1dKrxFile(epoch))
+        val view = usd1dView(key)
+        assertNotNull("$label: premise: memory KRX", view.components?.krx)
+        assertNotNull("$label: premise: a stamped 1d entry", view.entry?.online200At)
+        assertTrue("$label: premise: the issuer marked graph data", marks.get() >= 1)
+        assertTrue("$label: premise: the record may contain KRX data", record.mayContainKrxData)
+    }
+
+    /**
+     * RT01-S01: the A07 CAPABILITY_P4 entry (harness RT01-A07): a KRX-hidden answer whose decision read fails once holds one
+     * capability loss candidate, and its recovery round meets an unreadable identity; the hold is published. No Main step.
+     */
+    private suspend fun Rig.enterCapabilityHold(label: String, deadline: Long) {
+        val failure = java.io.IOException("access record unreadable")
+        storeLoadFault.arm(failure) { isIssuerDecision(it) }
+        issuerIdentityReadable = false
+        entitlements += ok(PREMIUM_HIDDEN)
+        kotlinx.coroutines.withTimeout(10_000) { coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        assertEquals("$label: the decision's read failed once", listOf<Throwable>(failure), storeLoadFault.thrown.toList())
+        assertEquals("$label: one candidate held", 1, coordinator.heldLossCandidateCount())
+        val deniedBefore = recoveryIdentityDenials.get()
+        recoveryIdentityReadable = false
+        issuerIdentityReadable = true
+        awaitTrue("$label: a candidate recovery round met the unreadable identity", deadline) { recoveryIdentityDenials.get() > deniedBefore }
+        val facts = coordinator.accessSnapshot.facts
+        assertTrue("$label: premise: the capability hold is published ($facts)",
+            com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in facts.capabilityBlocks && !facts.capabilityAllowed)
+    }
+
+    /**
+     * RT01-S01: releases the hold through D3: the candidate recovery's next identity read gives a different identity of the
+     * same uid once, so its check is Stale and only the candidate is released; KRX is allowed again. KRX-visible answers are
+     * queued for any later entitlements call (an unscripted call answers KRX hidden). No Main step.
+     */
+    private suspend fun Rig.releaseCapabilityHoldByD3(label: String, deadline: Long) {
+        val live = checkNotNull(provider.currentIdentityFence())
+        val hitsBefore = synchronized(differentRecoveryHits) { differentRecoveryHits.size }
+        repeat(3) { entitlements += ok(premiumKrxVisible) }
+        differentRecoveryIdentity.set(com.jay.fxi.data.entitlements.EntitlementsIdentity(live.uid, live.authGeneration + 1))
+        recoveryIdentityReadable = true
+        awaitTrue("$label: the candidate is released", deadline) { coordinator.heldLossCandidateCount() == 0 }
+        awaitTrue("$label: KRX is allowed again", deadline) { coordinator.accessSnapshot.facts.capabilityAllowed }
+        val hits = synchronized(differentRecoveryHits) { differentRecoveryHits.drop(hitsBefore) }
+        assertEquals("$label: D3 answered exactly once ($hits)", 1, hits.size)
+        assertTrue("$label: inside the issuer's candidate check ($hits)", hits.single().endsWith(": PremiumAccessCoordinator.checkCandidateLocked"))
+        assertFalse("$label: not on Main ($hits)", hits.single().startsWith("acceptance-main"))
+        assertNull("$label: D3 is spent", differentRecoveryIdentity.get())
+    }
+
+    /** The baseline an announced S01 row compares against. */
+    private data class Baseline3d(
+        val key: com.jay.fxi.data.graph.GraphKey,
+        val namespace: Namespace3d,
+        val generation: Long,
+        val view: Usd1dView,
+        val seed: SupplementView,
+        val disk: Map<String, String>
+    )
+
+    private suspend fun Rig.baseline3d(): Baseline3d {
+        val key = usd1dKey()
+        return Baseline3d(key, namespace3d(), capabilityGeneration(), usd1dView(key), supplementView(), diskFiles())
+    }
+
+    /**
+     * RT01-S01 announced half: under the hold the coordinator takes (E, false) — generation + 1, GENERAL kept, no stamp, no
+     * slot or protected-read KRX; released by D3 it takes (E, true) — generation + 2 — and the SupplementOccupied seed for
+     * (E, true), the GENERAL response and that generation is attempted and finished with a new seed id. Returns the view after.
+     */
+    private suspend fun Rig.announcedRoundTrip(label: String, deadline: Long, base: Baseline3d): Usd1dView {
+        val general0 = checkNotNull(base.view.components).general
+        enterCapabilityHold(label, deadline)
+        awaitTrue("$label: the coordinator took a new configuration", deadline) { capabilityGeneration() == base.generation + 1 }
+        val (heldProbe, held) = onMain { capabilityProbeHere() to usd1dViewHere(base.key) }
+        assertEquals("$label: the configuration it took is (E, false)",
+            com.jay.fxi.data.graph.GraphV2CapabilityConfiguration(base.namespace.krxEpoch, false), heldProbe.configuration)
+        assertEquals("$label: under the hold, GENERAL kept", general0, held.components?.general)
+        assertNull("$label: under the hold, no stamp", held.entry?.online200At)
+        assertNull("$label: under the hold, no slot KRX", held.components?.krx)
+        assertTrue("$label: under the hold, GENERAL in the protected read", held.protectedGeneral)
+        assertFalse("$label: under the hold, no KRX in the protected read", held.protectedKrx)
+        releaseCapabilityHoldByD3(label, deadline)
+        val expected = com.jay.fxi.data.graph.GraphV2SeedMode.SupplementOccupied(
+            general0.responseId,
+            com.jay.fxi.data.graph.GraphV2CapabilityConfiguration(base.namespace.krxEpoch, true),
+            base.generation + 2
+        )
+        awaitTrue("$label: the coordinator took (E, true) and its supplement finished", deadline) {
+            capabilityProbe().let { it.generation == base.generation + 2 && it.supplement.attempted == expected && !it.supplement.registered }
+        }
+        val (doneProbe, after) = onMain { capabilityProbeHere() to usd1dViewHere(base.key) }
+        assertEquals("$label: the configuration is (E, true)",
+            com.jay.fxi.data.graph.GraphV2CapabilityConfiguration(base.namespace.krxEpoch, true), doneProbe.configuration)
+        assertEquals("$label: for the usd 1d key", base.key, doneProbe.activeKey)
+        assertTrue("$label: a seed id after the one under the hold", doneProbe.supplement.lastSeedId > heldProbe.supplement.lastSeedId)
+        assertNotSame("$label: a slot object other than the one under the hold", held.slot, after.slot)
+        return after
+    }
+
+    /** The comparison's common end (agreed r3 §2): namespace kept, KRX allowed, no new answer applied or written. */
+    private suspend fun Rig.assertKept3d(label: String, base: Baseline3d) {
+        assertEquals("$label: identity, epochs, end sequences, grant and graph source kept", base.namespace, namespace3d())
+        assertTrue("$label: KRX allowed", coordinator.accessSnapshot.facts.capabilityAllowed)
+        assertEquals("$label: no new graph answer written", base.disk, diskFiles())
+    }
+
+    /**
+     * The row's end: the gate opens, the sends and writes settle; then no expired gate wait, and every graph send made under
+     * the gate was answered 200 (a client that gave up at its 15 s read timeout would leave it unanswered).
+     */
+    private suspend fun Rig.finish3d(label: String, gate: GraphGate, deadline: Long) {
+        gate.open()
+        awaitTrue("$label: settled", deadline) { sends.all().all { it.bodyEnd != null } }
+        awaitWritesDrained(label, deadline)
+        assertFalse("$label: no gate wait expired", gate.expired.get())
+        val held = graph().filter { it.start >= gate.installedAt }
+        assertTrue("$label: every graph send under the gate was answered 200\n${sends.timeline()}", held.all { it.status == 200 })
+    }
+
+    /**
+     * RT01-S01(A): an announced capability hold round trip restores KRX from the disk supplement. After the common preparation,
+     * with new graph answers held: under the A07 capability hold the coordinator takes (E, false); released by D3 (a different
+     * identity once in the candidate check, so Stale) it takes (E, true) and the SupplementOccupied seed for that configuration
+     * generation is attempted and finished (for the usd 1d key, a seed id after the one under the hold). GENERAL is kept; the
+     * slot's KRX is the decoded disk envelope — another object than the memory KRX before — with GENERAL and KRX of one
+     * response and epoch E; no stamp; a slot object other than the one under the hold; KRX in the protected read. No new graph
+     * answer is applied or written, and identity, epochs, end sequences, grant token and graph source are kept. Graph sends
+     * made while the gate holds (e.g. a flip) are counted in the budget and must all be answered 200 when it opens.
+     */
+    @Test
+    fun `RT01-S01a an announced capability hold round trip restores KRX from the disk supplement`() = runBlocking {
+        val label = "RT01-S01a"
+        val prepared = clearOfBoundary(70_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 60_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val rig = Rig()
+        val gate = GraphGate()
+        rig.row {
+            try {
+                rig.prepare3d(label, deadline)
+                installGraphGate(gate)
+                val base = rig.baseline3d()
+                val general0 = checkNotNull(base.view.components).general
+                val krx0 = checkNotNull(base.view.components?.krx)
+                val krxFile = checkNotNull(rig.usd1dKrxFile(checkNotNull(base.namespace.krxEpoch)))
+                val catalog = rig.onMain { rig.assembly.coordinator.state.value.catalog }
+                val diskKrx = (com.jay.fxi.data.graph.JsonGraphV2EnvelopeCodec().decodeKrx(File(rig.diskRoot, krxFile).readBytes(), krx0.key, catalog)
+                    as com.jay.fxi.data.graph.GraphV2Validation.Valid).value
+                val after = rig.announcedRoundTrip(label, deadline, base)
+                assertEquals("$label: GENERAL kept", general0, after.components?.general)
+                assertEquals("$label: the slot KRX is the disk envelope", diskKrx, after.components?.krx)
+                assertNotSame("$label: a KRX object other than the one in memory before", krx0, after.components?.krx)
+                assertEquals("$label: GENERAL and KRX of one response", after.components?.general?.responseId, after.components?.krx?.responseId)
+                assertEquals("$label: KRX epoch E", base.namespace.krxEpoch, after.components?.krx?.key?.krxCapabilityEpoch)
+                assertNull("$label: no stamp", after.entry?.online200At)
+                assertNotSame("$label: a new slot object", base.view.slot, after.slot)
+                assertTrue("$label: KRX in the protected read", after.protectedKrx)
+                rig.assertKept3d(label, base)
+            } finally {
+                gate.open()
+            }
+            rig.finish3d(label, gate, deadline)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 60_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-S01(U): an unannounced round trip keeps the memory slot. After the common preparation and every Main read, Main is
+     * held from before the A07 capability hold until D3 released it and KRX is allowed again: the coordinator never takes
+     * (E, false). While held, a fresh protected read (Main held, so nothing else touches the coordinator) shows GENERAL and no
+     * KRX. Released: the same raw entry, slot object (with its KRX) and non-null stamp, the generation and the supplement
+     * attempt unchanged, KRX back in the protected read, and identity, epochs, end sequences, grant token and graph source kept.
+     */
+    @Test
+    fun `RT01-S01u an unannounced capability hold round trip keeps the memory slot and its KRX`() = unannouncedRow("RT01-S01u", deleteKrxFile = false)
+
+    /**
+     * RT01-S01(C-U): the control of (U) without the KRX file. The usd 1d KRX file is deleted before the hold: while held, no KRX
+     * in the protected read (GENERAL shown); released, the same raw entry, slot (with its KRX) and non-null stamp, KRX shown again
+     * from memory, the generation and the supplement attempt unchanged.
+     */
+    @Test
+    fun `RT01-S01cu an unannounced round trip without the KRX file still shows the memory KRX`() = unannouncedRow("RT01-S01cu", deleteKrxFile = true)
+
+    private fun unannouncedRow(label: String, deleteKrxFile: Boolean) = runBlocking {
+        val prepared = clearOfBoundary(70_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 60_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val rig = Rig()
+        val gate = GraphGate()
+        rig.row {
+            try {
+                rig.prepare3d(label, deadline)
+                installGraphGate(gate)
+                if (deleteKrxFile) {
+                    val file = checkNotNull(rig.usd1dKrxFile(checkNotNull(rig.epochStore.load().krxCapabilityEpoch)))
+                    assertTrue("$label: premise: the KRX 1d file is deleted", File(rig.diskRoot, file).delete())
+                    assertNull("$label: premise: no KRX 1d file", rig.usd1dKrxFile(checkNotNull(rig.epochStore.load().krxCapabilityEpoch)))
+                }
+                val base = rig.baseline3d()
+                assertTrue("$label: premise: KRX in the protected read before the hold", base.view.protectedKrx)
+                val stamp = checkNotNull(base.view.entry?.online200At)
+                val underHold = holding(holdMain()) {
+                    rig.enterCapabilityHold(label, deadline)
+                    val view = rig.usd1dViewHere(base.key)
+                    rig.releaseCapabilityHoldByD3(label, deadline)
+                    view
+                }
+                assertTrue("$label: under the hold, GENERAL in the protected read", underHold.protectedGeneral)
+                assertFalse("$label: under the hold, no KRX in the protected read", underHold.protectedKrx)
+                delay(1_000)
+                val after = rig.usd1dView(base.key)
+                assertSame("$label: the same raw entry", base.view.entry, after.entry)
+                assertSame("$label: the same slot object", base.view.slot, after.slot)
+                assertEquals("$label: the same stamp", stamp, after.entry?.online200At)
+                assertNotNull("$label: slot KRX present", after.components?.krx)
+                assertTrue("$label: KRX back in the protected read", after.protectedKrx)
+                assertEquals("$label: the generation unchanged", base.generation, rig.capabilityGeneration())
+                assertEquals("$label: the supplement attempt unchanged", base.seed, rig.supplementView())
+                rig.assertKept3d(label, base)
+            } finally {
+                gate.open()
+            }
+            rig.finish3d(label, gate, deadline)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 60_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-S01(C-A): the control of (A) without the KRX file. The GENERAL file stays and the usd 1d KRX file is deleted before
+     * the hold; the announced round trip attempts and finishes the SupplementOccupied seed for (E, true), and GENERAL is kept with
+     * no stamp, no slot KRX, and a protected read showing GENERAL but no KRX.
+     */
+    @Test
+    fun `RT01-S01ca an announced round trip without the KRX file restores no KRX`() = runBlocking {
+        val label = "RT01-S01ca"
+        val prepared = clearOfBoundary(70_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 60_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val rig = Rig()
+        val gate = GraphGate()
+        rig.row {
+            try {
+                rig.prepare3d(label, deadline)
+                installGraphGate(gate)
+                val epoch = checkNotNull(rig.epochStore.load().krxCapabilityEpoch)
+                assertNotNull("$label: premise: a GENERAL 1d file", rig.usd1dGeneralFile())
+                assertTrue("$label: premise: the KRX 1d file is deleted", File(rig.diskRoot, checkNotNull(rig.usd1dKrxFile(epoch))).delete())
+                assertNull("$label: premise: no KRX 1d file", rig.usd1dKrxFile(epoch))
+                val base = rig.baseline3d()
+                val general0 = checkNotNull(base.view.components).general
+                val after = rig.announcedRoundTrip(label, deadline, base)
+                assertEquals("$label: GENERAL kept", general0, after.components?.general)
+                assertNull("$label: no stamp", after.entry?.online200At)
+                assertNull("$label: no slot KRX", after.components?.krx)
+                assertTrue("$label: GENERAL in the protected read", after.protectedGeneral)
+                assertFalse("$label: no KRX in the protected read", after.protectedKrx)
+                rig.assertKept3d(label, base)
+            } finally {
+                gate.open()
+            }
+            rig.finish3d(label, gate, deadline)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 60_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT01-S02(b′): a supplement whose KRX file is another response's is not joined. KRX-visible, response 1 is applied and
+     * written and its KRX file kept; a same-user sign-in (KRX allowed, the same epoch) applies and writes response 2 (other
+     * values). With new graph answers held, response 1's KRX file is put back: memory GENERAL = disk GENERAL = response 2's ID,
+     * the KRX file response 1's; both decode as valid envelopes with one common key tuple and server metadata and disjoint
+     * ordinals, so the response ID is the clause that fails. The announced round trip attempts and finishes the
+     * SupplementOccupied seed for (E, true) and response 2's GENERAL ID: GENERAL content and ID are kept, no slot KRX, a
+     * protected read showing GENERAL but no KRX, no stamp, the disk bytes unchanged, and identity, epochs, end sequences, grant
+     * token and graph source kept.
+     */
+    @Test
+    fun `RT01-S02bprime a supplement whose KRX file is another response's is not joined`() = runBlocking {
+        val label = "RT01-S02bprime"
+        val prepared = clearOfBoundary(80_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 70_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val response1 = fixture("usd-1d-krx-visible.json")
+        val response2 = shiftedTab(response1, 3.0)
+        val phase = AtomicInteger(1)
+        val rig = Rig()
+        val gate = GraphGate()
+        rig.row {
+            try {
+                onCatalog = { ok(fixture("catalog-krx-visible.json")) }
+                onTab = { ok(if (phase.get() == 1) response1 else response2) }
+                rig.coldStartRoute(deadline)
+                rig.awaitTopics(deadline)
+                awaitTrue("$label: response 1 applied", deadline) { rig.catalogAdopted() && rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+                rig.awaitWritesDrained(label, deadline)
+                val epoch = checkNotNull(rig.epochStore.load().krxCapabilityEpoch)
+                val krxFile = checkNotNull(rig.usd1dKrxFile(epoch))
+                val kept = File(rig.diskRoot, krxFile).readBytes()
+                awaitSendsQuietly(rig, deadline)
+                phase.set(2)
+                entitlements += ok(premiumKrxVisible)
+                rig.signInAgain(label, deadline)
+                rig.assertKrxKept(label, epoch)
+                val values1 = tabValues(response1).values.flatten().toSet()
+                val values2 = tabValues(response2).values.flatten().toSet()
+                awaitTrue("$label: response 2 applied (its values only)", deadline) {
+                    val values = rig.usd1dEntryView().third
+                    values.isNotEmpty() && values.all { it in values2 } && values.any { it !in values1 } && graph().all { it.bodyEnd != null }
+                }
+                rig.awaitWritesDrained(label, deadline)
+                awaitSendsQuietly(rig, deadline)
+                installGraphGate(gate) { response2 }
+                File(rig.diskRoot, krxFile).writeBytes(kept)
+                val key = rig.usd1dKey()
+                val (memoryGeneral, catalog) = rig.onMain { checkNotNull(rig.slotComponents(key)).general to rig.assembly.coordinator.state.value.catalog }
+                val memoryKrxKey = checkNotNull(rig.onMain { rig.slotComponents(key)?.krx?.key })
+                val generalFile = checkNotNull(rig.usd1dGeneralFile())
+                val codec = com.jay.fxi.data.graph.JsonGraphV2EnvelopeCodec()
+                val diskGeneral = (codec.decodeGeneral(File(rig.diskRoot, generalFile).readBytes(), memoryGeneral.key, catalog)
+                    as com.jay.fxi.data.graph.GraphV2Validation.Valid).value
+                val diskKrx = (codec.decodeKrx(File(rig.diskRoot, krxFile).readBytes(), memoryKrxKey, catalog)
+                    as com.jay.fxi.data.graph.GraphV2Validation.Valid).value
+                assertEquals("$label: premise: memory GENERAL ID = disk GENERAL ID", memoryGeneral.responseId, diskGeneral.responseId)
+                assertNotEquals("$label: premise: the KRX file is another response's", diskGeneral.responseId, diskKrx.responseId)
+                assertEquals("$label: premise: one common key tuple", diskGeneral.key,
+                    diskKrx.key.let { com.jay.fxi.data.graph.GraphV2GeneralKey(it.uid, it.userAccessEpoch, it.tab, it.period) })
+                assertEquals("$label: premise: the same server metadata", diskGeneral.component.metadata, diskKrx.component.metadata)
+                assertTrue("$label: premise: disjoint ordinals",
+                    diskGeneral.component.series.map { it.ordinal }.toSet().intersect(diskKrx.component.series.map { it.ordinal }.toSet()).isEmpty())
+                assertEquals("$label: premise: the join fails on the response ID",
+                    "Response ID does not match", com.jay.fxi.data.graph.joinGraphV2Components(diskGeneral, diskKrx).ignoredKrxReason)
+                val base = rig.baseline3d()
+                val general0 = checkNotNull(base.view.components).general
+                val after = rig.announcedRoundTrip(label, deadline, base)
+                assertEquals("$label: GENERAL content and ID kept", general0, after.components?.general)
+                assertNull("$label: no slot KRX", after.components?.krx)
+                assertTrue("$label: GENERAL in the protected read", after.protectedGeneral)
+                assertFalse("$label: no KRX in the protected read", after.protectedKrx)
+                assertNull("$label: no stamp", after.entry?.online200At)
+                rig.assertKept3d(label, base)
+            } finally {
+                gate.open()
+            }
+            rig.finish3d(label, gate, deadline)
         }
         assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
         assertTrue("within the row deadline", nowMillis() - start <= 70_000)

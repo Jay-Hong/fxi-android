@@ -83,6 +83,11 @@
     "RT05-T02a a return under 60 s issues nothing and keeps the closed demand",
     "RT05-T02b a return after 60 s issues one trigger and its cooldown holds a reconnect for 30 s",
     "RT05-T04a a boundary issues one trigger and its retain moves only the window",
-    "RT05-T04b a boundary during a held recovery response keeps the round and sends no second tab"
+    "RT05-T04b a boundary during a held recovery response keeps the round and sends no second tab",
+    "RT01-S01a an announced capability hold round trip restores KRX from the disk supplement",
+    "RT01-S01u an unannounced capability hold round trip keeps the memory slot and its KRX",
+    "RT01-S01cu an unannounced round trip without the KRX file still shows the memory KRX",
+    "RT01-S01ca an announced round trip without the KRX file restores no KRX",
+    "RT01-S02bprime a supplement whose KRX file is another response's is not joined"
   ]
 }
