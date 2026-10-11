@@ -194,6 +194,11 @@ class PremiumGraphCutoverAcceptanceTest {
     /** Every server-side socket opened, in order; the last is the live one. */
     private val openSockets = Collections.synchronizedList(mutableListOf<WebSocket>())
     private val refusals = AtomicInteger()
+    /**
+     * S4 C02 M1·G1: while set, each entitlements request is answered by this on the server's thread (it may wait), in place of
+     * the queue and [entitlementsGate].
+     */
+    @Volatile private var entitlementsHook: ((RecordedRequest) -> MockResponse)? = null
     /** While set, each entitlements answer waits for this gate (B1); [entitlementsHeld] counts the requests that waited. */
     @Volatile private var entitlementsGate: java.util.concurrent.CountDownLatch? = null
     private val entitlementsHeld = AtomicInteger()
@@ -265,7 +270,7 @@ class PremiumGraphCutoverAcceptanceTest {
                         holdHandshakeMillis.getAndSet(0L).takeIf { it > 0 }?.let { Thread.sleep(it) }
                         MockResponse().withWebSocketUpgrade(socketServer)
                     }
-                    "/api/entitlements" -> {
+                    "/api/entitlements" -> entitlementsHook?.invoke(request) ?: run {
                         // A held answer waits here, on the server's thread, until the test opens the gate (B1).
                         entitlementsGate?.let { gate -> entitlementsHeld.incrementAndGet(); gate.await(30, java.util.concurrent.TimeUnit.SECONDS) }
                         entitlements.poll() ?: ok(PREMIUM_HIDDEN)
@@ -4831,6 +4836,7 @@ class PremiumGraphCutoverAcceptanceTest {
             val bucket = System.currentTimeMillis() / 600_000
             rig.foreground.value = false
             awaitTrue("$label: the events consumed the background", deadline) { rig.eventsForeground() == false }
+            awaitTrue("$label: the server opened its socket", deadline) { openSockets.isNotEmpty() }
             openSockets.last().close(1011, "server restart")
             awaitTrue("$label: the background Connection is consumed as the baseline", deadline) {
                 rig.eventsConnection()?.let { it.first == baseline.first && it.second > baseline.second } == true
@@ -5480,6 +5486,7 @@ class PremiumGraphCutoverAcceptanceTest {
                 rig.awaitTopics(deadline)
                 awaitTrue("$label: the tab applied", deadline) { rig.usdApplied() && tabs().all { it.bodyEnd != null } }
                 val bucket = System.currentTimeMillis() / 600_000
+                awaitTrue("$label: the server opened its socket", deadline) { openSockets.isNotEmpty() }
                 openSockets.last().close(1011, "server restart")
                 awaitTrue("$label: one RECONNECT", deadline) { rig.triggers() == 1L }
                 delay(2_000)
@@ -5533,6 +5540,7 @@ class PremiumGraphCutoverAcceptanceTest {
             assertEquals("$label: and issues nothing", 0L, rig.triggers())
             val bucket = System.currentTimeMillis() / 600_000
             var latest: com.jay.fxi.data.remote.TopicGraphRecoveryPermit? = null
+            awaitTrue("$label: the server opened its socket", deadline) { openSockets.isNotEmpty() }
             holding(holdMain()) {
                 var previous = baseline.second
                 repeat(2) { i ->
@@ -7283,6 +7291,7 @@ class PremiumGraphCutoverAcceptanceTest {
             rig.awaitTopics(deadline)
             assertEquals("the first connection is the baseline: no trigger", 0L, rig.triggers())
             val tabsBefore = tabs().size
+            awaitTrue("A04a: the server opened its socket", deadline) { openSockets.isNotEmpty() }
             openSockets.last().close(1011, "server restart")
             awaitTrue("a second connection", deadline) { handshakes().size == 2 }
             awaitTrue("one reconnect trigger", deadline) { rig.triggers() == 1L }
@@ -8119,6 +8128,316 @@ class PremiumGraphCutoverAcceptanceTest {
             binderJob.cancelAndJoin()
         }
         assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- S4 CUT-C02 (b′) measurement bundle 4: M1a·M1b·G1 with the real binder (cut_c02_m2_agreed.r1.md 2, cut_c02_bprime_agreed.r1.md)
+
+    /**
+     * S4 C02 M1·G1: per-arrival holds for entitlements requests, installed as [entitlementsHook]. Each request waits on the
+     * server's thread for its own release (30 s at most; a wait that runs out is counted in [timedOut], and a row asserts none)
+     * and gets the body it was released with. Arrival numbers follow the server's dispatch order; each arrival's time and URL are
+     * kept so a number is tied to its exchange. OkHttp's 5-per-host limit caps how many can be held together.
+     */
+    private inner class ArrivalHolds {
+        private val latches = java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.CountDownLatch>()
+        private val bodies = java.util.concurrent.ConcurrentHashMap<Int, String>()
+        private val next = AtomicInteger()
+        val timedOut = AtomicInteger()
+        val arrivals: MutableList<Triple<Int, Long, String>> = Collections.synchronizedList(mutableListOf())
+        /** Once set by [releaseAll], no arrival waits and each gets this body unless released with its own. */
+        @Volatile private var open: String? = null
+        val arrived: Int get() = next.get()
+        private fun latch(i: Int) = latches.getOrPut(i) { java.util.concurrent.CountDownLatch(1) }
+
+        fun answer(request: RecordedRequest): MockResponse {
+            val i = next.getAndIncrement()
+            arrivals += Triple(i, nowMillis(), request.requestUrl.toString())
+            if (open == null) {
+                val l = latch(i)
+                // Checked again after the latch exists: a releaseAll between the two checks may have missed it.
+                if (open == null && !l.await(30, java.util.concurrent.TimeUnit.SECONDS)) timedOut.incrementAndGet()
+            }
+            return MockResponse().setResponseCode(200).setBody(bodies[i] ?: open ?: STABLE_INACTIVE)
+        }
+
+        fun release(i: Int, body: String) {
+            bodies[i] = body
+            latch(i).countDown()
+        }
+
+        /** Releases every arrival so far, and every later one at once, with [body] unless one was released with its own. */
+        fun releaseAll(body: String) {
+            open = body
+            latches.values.forEach { it.countDown() }
+        }
+    }
+
+    /** The highest number of entitlements exchanges in flight together (start to body end). */
+    private fun entitlementsConcurrency(): Int {
+        val ex = sends.all().filter { it.path == "/api/entitlements" }
+        return ex.maxOfOrNull { a -> ex.count { b -> b.start <= a.start && (b.bodyEnd ?: Long.MAX_VALUE) > a.start } } ?: 0
+    }
+
+    private fun entitlementsExchanges() = sends.all().filter { it.path == "/api/entitlements" }
+
+    /**
+     * S4 C02 M1: the production binder from the first identity observation: a real AuthAccessBinder over the harness Firebase
+     * (which replays the current fence on subscription, as production does) and the production provider for recoveries, its
+     * automatic recovery on. No approve(): its own bind asks the server once, answered StableInactive, settling FreeConfirmed.
+     */
+    private suspend fun Rig.bindThroughBinder(label: String, deadline: Long, binderJob: Job) {
+        entitlements += ok(STABLE_INACTIVE)
+        com.jay.fxi.data.entitlements.AuthAccessBinder(
+            coordinator, CoroutineScope(binderJob + Dispatchers.Default), fenceStream = firebase, recoveryStream = provider
+        ).start()
+        awaitTrue("$label: the binder bound A and its one ask settled FreeConfirmed", deadline) {
+            coordinator.state.value.state == PremiumAccessState.FreeConfirmed && entitlementsSends() == 1 &&
+                sends.all().all { it.bodyEnd != null }
+        }
+    }
+
+    /**
+     * C02M-M1a (cut_c02_m2_agreed.r1.md 2): through the real binder, FreeConfirmed and 3.5 s; a purchase/restore signal; once the
+     * existing binding's probe fetch (fresh_premium) has gone out and its body is unfinished, a same-uid generation change is
+     * handed to the binder (delivered within 2 s of that send). Every answer is 200 StableInactive (none 401, Pending or error).
+     * The new binding's ask is the second arrival: fresh_premium, sent after the change, while the probe's fetch has not returned
+     * and the state is the new generation's NoGrant; the probe epoch rose. Old answer not applied: the probe's answer is released
+     * alone first while the ask is still held; its body ends but its fetch never returns (the transport discards an answer whose
+     * owner moved while its token was in use, AuthIdentityChangedException, EntitlementsSource.kt:62-67), and 1 s later the state
+     * is still the new generation's NoGrant; then the ask is released, and the first FreeConfirmed of the new generation comes
+     * only after that. Then the latest binding settles, no request goes after the release (the probe
+     * ended) and none in a 25 s tail; nothing is owed; no answer carried Retry-After, so no floor existed and none merged. Fetches,
+     * sends, how many ran together and the diagnostics are recorded; the whole row is judged against the budget; no count is
+     * asserted as a cap.
+     */
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-M1a a purchase probe in flight then a same-user generation change within 2 s through the binder are measured`() = runBlocking {
+        val label = "C02M-M1a"
+        val start = nowMillis()
+        val deadline = start + 100_000
+        val rig = Rig()
+        val binderJob = SupervisorJob()
+        val holds = ArrivalHolds()
+        val states: MutableList<Pair<Long, com.jay.fxi.data.entitlements.OwnedPremiumAccess>> = Collections.synchronizedList(mutableListOf())
+        rig.row {
+            try {
+                rig.bindThroughBinder(label, deadline, binderJob)
+                quiet("$label settle", 3_500)
+                CoroutineScope(binderJob + Dispatchers.Default).launch { rig.coordinator.state.collect { states += nowMillis() to it } }
+                val before = entitlementsSends()
+                val fetchesBefore = rig.fetchReturns.size
+                val d0 = rig.coordinator.recheckDiagnostics()
+                entitlementsHook = { holds.answer(it) }
+                val signalAt = nowMillis()
+                rig.coordinator.onLocalPremiumSignal()
+                awaitTrue("$label: the probe's fetch went out and is held", deadline) { holds.arrived >= 1 }
+                val probeSend = entitlementsExchanges().drop(before).first()
+                assertEquals("$label: premise: the probe asks fresh premium", "true", probeSend.param("fresh_premium"))
+                assertNull("$label: premise: the probe's body is unfinished", probeSend.bodyEnd)
+                val next = rig.firebase.nextGeneration()
+                val deliveredAt = nowMillis()
+                assertTrue("$label: the change was delivered within 2 s of the probe's send (${deliveredAt - probeSend.start} ms)",
+                    deliveredAt - probeSend.start <= 2_000)
+                awaitTrue("$label: the new binding's ask went out", deadline) { holds.arrived >= 2 }
+                val askSend = entitlementsExchanges().drop(before)[1]
+                assertEquals("$label: the second arrival asks fresh premium", "true", askSend.param("fresh_premium"))
+                assertTrue("$label: the second arrival went after the change", askSend.start >= deliveredAt - 1)
+                assertEquals("$label: the probe's fetch has not returned yet", fetchesBefore, rig.fetchReturns.size)
+                val noGrant = com.jay.fxi.data.entitlements.OwnedPremiumAccess(next.uid, next.authGeneration, PremiumAccessState.NoGrant)
+                awaitTrue("$label: the change was accepted (the new generation's NoGrant)", deadline) { synchronized(states) { states.any { it.second == noGrant } } }
+                val dHeld = rig.coordinator.recheckDiagnostics()
+                assertTrue("$label: the probe epoch rose at the change (${d0.bindingEpoch} -> ${dHeld.bindingEpoch})", dHeld.bindingEpoch > d0.bindingEpoch)
+                val heldTogether = entitlementsConcurrency()
+                // Old answer not applied: the probe's answer alone, while the new binding's ask is still held.
+                holds.release(0, STABLE_INACTIVE)
+                awaitTrue("$label: the probe's answer body ended", deadline) { probeSend.bodyEnd != null }
+                delay(1_000)
+                val stateAfterOldAnswer = rig.coordinator.state.value
+                val fetchesAfterOldAnswer = rig.fetchReturns.size
+                val askReleasedAt = nowMillis()
+                holds.release(1, STABLE_INACTIVE)
+                holds.releaseAll(STABLE_INACTIVE)
+                val settled = com.jay.fxi.data.entitlements.OwnedPremiumAccess(next.uid, next.authGeneration, PremiumAccessState.FreeConfirmed)
+                awaitTrue("$label: the latest binding settled FreeConfirmed", deadline) {
+                    rig.coordinator.state.value == settled && sends.all().all { it.bodyEnd != null }
+                }
+                while (nowMillis() < signalAt + 40_000) delay(500)
+                val sendsAtTail = entitlementsSends()
+                while (nowMillis() < signalAt + 65_000) delay(500)
+                val dEnd = rig.coordinator.recheckDiagnostics()
+                val all = entitlementsExchanges().drop(before)
+                val firstSettled = synchronized(states) { states.firstOrNull { it.second == settled } }
+                println("C02M-M1 $label: signal @$signalAt, probe send @${probeSend.start}, change delivered @$deliveredAt (gen ${next.authGeneration}), " +
+                    "ask @${askSend.start}, state after the old answer $stateAfterOldAnswer, ask released @$askReleasedAt, first settled @${firstSettled?.first}; " +
+                    "entitlements ${all.map { "${it.start}ms fresh=${it.param("fresh_premium")} ${it.status} end@${it.bodyEnd}" }}; " +
+                    "arrivals ${holds.arrivals.toList()}; fetch returns ${rig.fetchReturns.toList()}; held together $heldTogether, max ${entitlementsConcurrency()}; " +
+                    "diagnostics before $d0, held $dHeld, end $dEnd; floor: none (no Retry-After in any answer), so no merge; states ${synchronized(states) { states.toList() }}")
+                assertEquals("$label: the probe's old answer was not applied (still the new generation's NoGrant)", noGrant, stateAfterOldAnswer)
+                assertEquals("$label: the probe's fetch never returned (its answer was discarded before any apply)", fetchesBefore, fetchesAfterOldAnswer)
+                assertTrue("$label: the first FreeConfirmed of the new generation came after the ask's release",
+                    firstSettled != null && firstSettled.first >= askReleasedAt)
+                assertEquals("$label: no request after the release (the probe ended)", 2, all.size)
+                assertEquals("$label: still the latest binding's FreeConfirmed", settled, rig.coordinator.state.value)
+                assertEquals("$label: no entitlements request in the 25 s tail", sendsAtTail, entitlementsSends())
+                assertNull("$label: nothing owed at the end", dEnd.owedIntent)
+                assertTrue("$label: every answer 200", all.all { it.status == 200 })
+                assertEquals("$label: no hold ran out", 0, holds.timedOut.get())
+            } finally {
+                entitlementsHook = null
+                holds.releaseAll(STABLE_INACTIVE)
+                binderJob.cancelAndJoin()
+            }
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 100_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * C02M-M1b (cut_c02_m2_agreed.r1.md 2): through the real binder, FreeConfirmed and 3.5 s, with no entitlements exchange in
+     * flight (so no older-generation answer exists to be applied here); a same-uid generation change handed to the binder; once
+     * the new binding's FORCE_PREMIUM fetch (fresh_premium) has gone out and its body is unfinished, a purchase/restore signal
+     * within 2 s. Every answer is 200 StableInactive. The probe's first tick meets the held ask's latch and returns without a send:
+     * the ask is the only registered query before the release, and the probe's first send comes about one 2 s delay after the
+     * signal. Then every hold is released; the latest binding settles; after the probe's last tick, 25 s of nothing; nothing is
+     * owed; no Retry-After, so no floor and no merge. Fetches, sends, how many ran together and the diagnostics are recorded; the
+     * whole row is judged against the budget; no count is asserted as a cap.
+     */
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-M1b a same-user generation change's binder query in flight then a purchase signal within 2 s are measured`() = runBlocking {
+        val label = "C02M-M1b"
+        val start = nowMillis()
+        val deadline = start + 110_000
+        val rig = Rig()
+        val binderJob = SupervisorJob()
+        val holds = ArrivalHolds()
+        val states: MutableList<Pair<Long, com.jay.fxi.data.entitlements.OwnedPremiumAccess>> = Collections.synchronizedList(mutableListOf())
+        rig.row {
+            try {
+                rig.bindThroughBinder(label, deadline, binderJob)
+                quiet("$label settle", 3_500)
+                CoroutineScope(binderJob + Dispatchers.Default).launch { rig.coordinator.state.collect { states += nowMillis() to it } }
+                val before = entitlementsSends()
+                val d0 = rig.coordinator.recheckDiagnostics()
+                assertTrue("$label: premise: no entitlements exchange in flight at the change", sends.all().all { it.bodyEnd != null })
+                entitlementsHook = { holds.answer(it) }
+                val next = rig.firebase.nextGeneration()
+                val changeAt = nowMillis()
+                awaitTrue("$label: the new binding's ask went out and is held", deadline) { holds.arrived >= 1 }
+                val askSend = entitlementsExchanges().drop(before).first()
+                assertNull("$label: premise: the ask's body is unfinished", askSend.bodyEnd)
+                assertEquals("$label: premise: the ask is fresh premium", "true", askSend.param("fresh_premium"))
+                rig.coordinator.onLocalPremiumSignal()
+                val signalAt = nowMillis()
+                assertTrue("$label: the signal was delivered within 2 s of the ask's send (${signalAt - askSend.start} ms)",
+                    signalAt - askSend.start <= 2_000)
+                delay(500)
+                val dHeld = rig.coordinator.recheckDiagnostics()
+                val heldTogether = entitlementsConcurrency()
+                val arrivedWhileHeld = holds.arrived
+                holds.releaseAll(STABLE_INACTIVE)
+                val settled = com.jay.fxi.data.entitlements.OwnedPremiumAccess(next.uid, next.authGeneration, PremiumAccessState.FreeConfirmed)
+                awaitTrue("$label: the latest binding settled FreeConfirmed", deadline) {
+                    rig.coordinator.state.value == settled && sends.all().all { it.bodyEnd != null }
+                }
+                while (nowMillis() < signalAt + 40_000) delay(500)
+                val lastStart = entitlementsExchanges().last().start
+                val tailFrom = maxOf(nowMillis(), lastStart + 1_000)
+                while (nowMillis() < tailFrom) delay(100)
+                val sendsAtTail = entitlementsSends()
+                while (nowMillis() < tailFrom + 25_000) delay(500)
+                val dEnd = rig.coordinator.recheckDiagnostics()
+                val all = entitlementsExchanges().drop(before)
+                val firstProbe = all.drop(1).firstOrNull()
+                println("C02M-M1 $label: change @$changeAt (gen ${next.authGeneration}), ask send @${askSend.start}, signal @$signalAt, " +
+                    "arrived while held $arrivedWhileHeld, first probe send @${firstProbe?.start}; entitlements " +
+                    "${all.map { "${it.start}ms fresh=${it.param("fresh_premium")} ${it.status} end@${it.bodyEnd}" }}; arrivals ${holds.arrivals.toList()}; " +
+                    "fetch returns ${rig.fetchReturns.toList()}; held together $heldTogether, max ${entitlementsConcurrency()}; " +
+                    "diagnostics before $d0, held $dHeld, end $dEnd; floor: none (no Retry-After in any answer), so no merge; " +
+                    "old answer: none in flight at the change; states ${synchronized(states) { states.toList() }}")
+                assertEquals("$label: before the release the held ask was the only registered query (the probe's tick met the latch)",
+                    1, dHeld.registeredQueryCount)
+                assertTrue("$label: the probe's first send came one delay after the signal (${firstProbe?.start?.minus(signalAt)} ms)",
+                    firstProbe != null && firstProbe.start - signalAt in 1_900..3_000)
+                assertEquals("$label: still the latest binding's FreeConfirmed", settled, rig.coordinator.state.value)
+                assertEquals("$label: no entitlements request in the 25 s tail (probe and retries ended)", sendsAtTail, entitlementsSends())
+                assertNull("$label: nothing owed at the end", dEnd.owedIntent)
+                assertTrue("$label: every answer 200", all.all { it.status == 200 })
+                assertEquals("$label: no hold ran out", 0, holds.timedOut.get())
+            } finally {
+                entitlementsHook = null
+                holds.releaseAll(STABLE_INACTIVE)
+                binderJob.cancelAndJoin()
+            }
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 110_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * C02M-G1 (cut_c02_bprime.r2/proposal.md §1): through the real binder with its first entitlements body held, the same uid's
+     * generation changes three times, each only after the binder's ask for it has gone out and the previous body is still
+     * unfinished; the row has exactly four asks, so arrivals 0..3 are generations 1..4 in order. The latest binding's answer is
+     * released first (StableInactive: A's fourth generation settles FreeConfirmed) and the three older ones after it, each
+     * answered premium (premium_active=true): if any older answer were applied the state would become PremiumConfirmed. After
+     * every body ended and no query is registered, the row asserts the four asks were in flight together, there were four and
+     * no more, only the latest ask's fetch returned (the transport discards an answer whose owner moved while its token was in
+     * use, AuthIdentityChangedException, EntitlementsSource.kt:62-67, so the older premium answers never reach the apply), the
+     * final state is still the latest binding's FreeConfirmed and no hold ran out; records the arrivals; and judges the row
+     * against the budget.
+     */
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-G1 three identity generations over held bodies apply only the latest and are measured`() = runBlocking {
+        val label = "C02M-G1"
+        val start = nowMillis()
+        val deadline = start + 60_000
+        val rig = Rig()
+        val binderJob = SupervisorJob()
+        val holds = ArrivalHolds()
+        rig.row {
+            try {
+                val fetchesBefore = rig.fetchReturns.size
+                entitlementsHook = { holds.answer(it) }
+                com.jay.fxi.data.entitlements.AuthAccessBinder(
+                    rig.coordinator, CoroutineScope(binderJob + Dispatchers.Default), fenceStream = rig.firebase, recoveryStream = rig.provider
+                ).start()
+                awaitTrue("$label: the first binding's ask went out and is held", deadline) { holds.arrived >= 1 }
+                val generations = mutableListOf<Long>()
+                repeat(3) { n ->
+                    val previous = entitlementsExchanges().last()
+                    assertNull("$label: premise: the previous body is unfinished before change ${n + 1}", previous.bodyEnd)
+                    generations += rig.firebase.nextGeneration().authGeneration
+                    awaitTrue("$label: the binder's ask for change ${n + 1} went out", deadline) { holds.arrived >= n + 2 }
+                }
+                val heldTogether = entitlementsConcurrency()
+                val latest = com.jay.fxi.data.entitlements.OwnedPremiumAccess("user-a", generations.last(), PremiumAccessState.FreeConfirmed)
+                holds.release(3, STABLE_INACTIVE)
+                awaitTrue("$label: the latest binding settled FreeConfirmed", deadline) { rig.coordinator.state.value == latest }
+                (0..2).forEach { holds.release(it, PREMIUM_HIDDEN) }
+                awaitTrue("$label: every body ended and no query is registered", deadline) {
+                    sends.all().all { it.bodyEnd != null } && rig.coordinator.recheckDiagnostics().registeredQueryCount == 0
+                }
+                delay(500)
+                val fetched = synchronized(rig.fetchReturns) { rig.fetchReturns.drop(fetchesBefore) }
+                val all = entitlementsExchanges()
+                println("C02M-G1 $label: generations $generations; entitlements " +
+                    "${all.map { "${it.start}ms fresh=${it.param("fresh_premium")} ${it.status} end@${it.bodyEnd}" }}; arrivals ${holds.arrivals.toList()}; " +
+                    "held together $heldTogether; fetch returns $fetched; state ${rig.coordinator.state.value}")
+                assertEquals("$label: the four asks were in flight together", 4, heldTogether)
+                assertEquals("$label: four asks, no more", 4, all.size)
+                assertEquals("$label: only the latest ask's fetch returned (the older answers were discarded before any apply)", 1, fetched.size)
+                assertEquals("$label: still the latest binding's FreeConfirmed (no older premium answer applied)", latest, rig.coordinator.state.value)
+                assertEquals("$label: no hold ran out", 0, holds.timedOut.get())
+            } finally {
+                entitlementsHook = null
+                holds.releaseAll(STABLE_INACTIVE)
+                binderJob.cancelAndJoin()
+            }
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 60_000)
         ColdStartBudget.assertWithin(judgeRow(label))
     }
 
