@@ -28,7 +28,8 @@ API_EXCESS_FAILURE = re.compile(r"api excess (\d+) > 10000")
 ORDER_ROWS = {"C02M-L1b": "순서 미확보"}
 ORDER_LINE = "C02M-ORDER"
 TIMING_PREFIX = "C02M-A05t"
-TIMING_FAILURE = "of its target"
+# A05t misses its target; A05tpre misses the window right after its preconditions.
+TIMING_FAILURES = ("of its target", "of its preconditions")
 
 
 def label_of(name):
@@ -102,7 +103,7 @@ def row(name, runs):
         evidence = "순서 미확보" if ORDER_ROWS[label] in message or junit != "pass" or not ordered else "순서 확보"
     elif label.startswith(TIMING_PREFIX):
         timed = f"C02M-TIMING {label}:" in out
-        evidence = "시점 미확보" if TIMING_FAILURE in message or not timed else "시점 확보"
+        evidence = "시점 미확보" if any(f in message for f in TIMING_FAILURES) or not timed else "시점 확보"
     else:
         evidence = "해당 없음"
     ok = junit == "pass" and budget == "통과" and timeline != "누락" and evidence in ("해당 없음", "순서 확보", "시점 확보")

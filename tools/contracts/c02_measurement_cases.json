@@ -2,7 +2,7 @@
   "class": "com.jay.fxi.budget.PremiumGraphCutoverAcceptanceTest",
   "note": "S4 CUT-C02 (b′) measurement rows (cut_c02_bprime_agreed.r1.md, cut_c02_m1_agreed.r1.md, cut_c02_m2_agreed.r1.md). Run by testC02Measurement only. Every name must run once and pass; a row over the budget fails as it is, and a listed row not yet written is missing, which leaves C02 not passed.",
   "cases": [
-    "C02M-A05t1600 a same-user change merged 1_6 s after the cold start's first send is measured",
+    "C02M-A05tpre a same-user change merged right after the cold start's preconditions is measured",
     "C02M-A05t2000 a same-user change merged 2_0 s after the cold start's first send is measured",
     "C02M-A05t2500 a same-user change merged 2_5 s after the cold start's first send is measured",
     "C02M-A05t3000 a same-user change merged 3_0 s after the cold start's first send is measured",

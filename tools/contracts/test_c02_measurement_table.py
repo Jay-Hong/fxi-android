@@ -155,6 +155,17 @@ class C02MeasurementTableTest(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("시점 미확보", self.row(text, "C02M-A05t1600 timed"))
 
+    def test_pre_timing_not_secured_fails(self):
+        rows = self.good()
+        # A05tpre: its timing line is printed, but the change started too long after its preconditions.
+        rows[2] = ("C02M-A05t1600 timed",
+                   out("C02M-A05t1600", extra="C02M-TIMING C02M-A05t1600: T0=8 preconditionsDone=+1650 generationChange=+1800"),
+                   '<failure message="C02M-A05t1600: the change started within 100 ms of its preconditions (preconditions +1650, changed +1800)"/>')
+        self.write(rows)
+        passed, text = self.run_table()
+        self.assertFalse(passed)
+        self.assertIn("시점 미확보", self.row(text, "C02M-A05t1600 timed"))
+
     def test_each_row_reads_only_its_own_output(self):
         rows = self.good()
         # The L1a case carries the L1b verdict only: L1a must not borrow it, and L1b must not borrow L1a's.

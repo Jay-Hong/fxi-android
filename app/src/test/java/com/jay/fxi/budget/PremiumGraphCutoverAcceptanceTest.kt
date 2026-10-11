@@ -1830,9 +1830,11 @@ class PremiumGraphCutoverAcceptanceTest {
      * held, entries, the catalog, failures and protected slots are gone and the old request is no longer owned; the old 3m
      * body then ends and is never applied; released, the new context refills.
      */
-    private fun identityChangedRow(label: String, merged: Boolean, changeAt: Long? = null) = runBlocking {
+    private fun identityChangedRow(label: String, merged: Boolean, changeAt: Long? = null, afterPreconditions: Boolean = false) = runBlocking {
         // S4 C02 A05t (cut_c02_m1_agreed.r1.md): [changeAt] times a merged change from the cold start's first send (T0).
         require(changeAt == null || merged) { "A05t times the merged delivery only" }
+        // S4 C02 A05tpre (cut_c02_resolution_agreed.r1.md): [afterPreconditions] changes right after the preconditions, no target.
+        require(!afterPreconditions || (merged && changeAt == null)) { "A05tpre is a merged change with no target time" }
         val start = nowMillis()
         val deadline = start + 40_000
         val holdNewTabs = java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CountDownLatch?>(null)
@@ -1853,8 +1855,8 @@ class PremiumGraphCutoverAcceptanceTest {
             val f1 = checkNotNull(rig.bridge())
             // The cold start's burst settles first: an identity change 1.6 s after it exceeds the budget on its own
             // (cut_c0102_observations/RT01-A05_merged_identity_change_1600ms_after_cold_start.md), which is not this row's contract.
-            // A C02 A05t measurement row has no settle: it changes the identity at T0 + changeAt below.
-            if (changeAt == null) quiet("$label settle", 3_500)
+            // A C02 A05t measurement row has no settle: it changes the identity at T0 + changeAt below (A05tpre: right away).
+            if (changeAt == null && !afterPreconditions) quiet("$label settle", 3_500)
             val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
             rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
             awaitTrue("the 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.bodyEnd == null } }
@@ -1897,6 +1899,8 @@ class PremiumGraphCutoverAcceptanceTest {
                         nowMillis() <= target)
                     while (nowMillis() < target) delay(1)
                 }
+                // A05tpre: the preconditions end here; the holds below are taken before the change starts and count against it.
+                val preconditionsDoneAt = nowMillis()
                 holding(holdMain()) {
                     val issued = holding(rig.holdRuntime()) {
                         // Bounded: a deliverer that took the issuer's lock just before the hold would keep it until the hold ends.
@@ -1917,6 +1921,7 @@ class PremiumGraphCutoverAcceptanceTest {
                     assertTrue("$label: auxiliary: no pull after the hold returned an end without a grant: ${seen.map { it.fence?.grant }}",
                         seen.isNotEmpty() && seen.all { it.fence != null })
                     if (target != null) reportA05tTiming(label, t0, target, changedAt.get(), identityAt.get())
+                    if (afterPreconditions) reportA05tPreTiming(label, t0, preconditionsDoneAt, changedAt.get(), identityAt.get())
                     issued
                 }
             }
@@ -7714,6 +7719,20 @@ class PremiumGraphCutoverAcceptanceTest {
     }
 
     /**
+     * S4 C02 A05tpre: the change right after the preconditions, against T0 — the preconditions' end, the generation change's
+     * start, the onIdentityChanged call and the first entitlements send after it. No target time is claimed; a change starting
+     * more than the tolerance after the preconditions leaves the timing unmet.
+     */
+    private fun reportA05tPreTiming(label: String, t0: Long, preconditionsDone: Long, changed: Long, identityCalled: Long) {
+        val send = sends.all().filter { it.path == "/api/entitlements" && it.start >= changed }.minOfOrNull { it.start }
+        println("C02M-TIMING $label: T0=$t0 preconditionsDone=+${preconditionsDone - t0} generationChange=+${changed - t0} " +
+            "onIdentityChanged=+${identityCalled - t0} entitlements=${send?.let { "+${it - t0}" }}")
+        assertTrue("$label: the change started within $A05T_TOLERANCE_MS ms of its preconditions (preconditions +${preconditionsDone - t0}, changed +${changed - t0})",
+            changed >= preconditionsDone && changed - preconditionsDone <= A05T_TOLERANCE_MS)
+        assertNotNull("$label: the change's entitlements send was recorded", send)
+    }
+
+    /**
      * S4 C02 L1(b): one named single-thread lane for a coroutine, so its store reads are told apart by thread and its thread
      * shows whether it is still running coordinator code or parked outside it (a suspended coroutine leaves no frame).
      */
@@ -8441,12 +8460,13 @@ class PremiumGraphCutoverAcceptanceTest {
         ColdStartBudget.assertWithin(judgeRow(label))
     }
 
-    /** C02M-A05t: RT01-A05 merged with the same-user change aimed at the cold start's first send + t, instead of after a settle. */
+    /** C02M-A05tpre: the same-user change merged right after the cold start's preconditions (the kept 10.206 observation's case). */
     @Test
     @Category(C02Measurement::class)
-    fun `C02M-A05t1600 a same-user change merged 1_6 s after the cold start's first send is measured`() =
-        identityChangedRow("C02M-A05t1600", merged = true, changeAt = 1_600)
+    fun `C02M-A05tpre a same-user change merged right after the cold start's preconditions is measured`() =
+        identityChangedRow("C02M-A05tpre", merged = true, afterPreconditions = true)
 
+    /** C02M-A05t: RT01-A05 merged with the same-user change aimed at the cold start's first send + t, instead of after a settle. */
     @Test
     @Category(C02Measurement::class)
     fun `C02M-A05t2000 a same-user change merged 2_0 s after the cold start's first send is measured`() =
