@@ -37,8 +37,8 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 대상·graph REST 송신 guard·실제 issuer 그래프 통합 계약(U1a~U1d)을 쌓고 도달 불가 v1 graph 코드를
                                 지웠다(JVM·에뮬레이터 계측 계약, 운영 배선 없음). 18번의 세 선행조건이 충족되어(동결 후 7번 대조 완료
                                 10-08) RT01-A1(`6c6cadb`)부터 RT07(`43b72d8`)까지 commit 18개로 runtime 조립·은퇴 포트·
-                                복구 예산·시간 계기·§9.1 migration을 dormant로 준비했다. 남은 단위는 통합(운영 공급자·실제
-                                HTTP stack 위 graph 포함 예산)과 critical cutover다(S4 '진행' 항목).
+                                복구 예산·시간 계기·§9.1 migration을 dormant로 준비했다. 이어 통합과 critical cutover 배선(CC1~CC5-4)·
+                                인수 하네스를 land했다. 인수 판정은 C01 조건부 통과·C02 통과·C03 1차 실행 완료/T25 대기다(S4 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -51,7 +51,13 @@ S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반�
                                 봉인·재확인 요구·손실 후보 보류의 process death 지속과 14번이 더한 선행 복구 의도
                                 저장·미정산 namespace 은퇴는 미충족이다 — P2·P3의 저장·복구 모델은 미배선으로 land했고
                                 운영 활성화는 P3-i다(동결 후 8·9·10·13·14·15·17번 기록). P3-i 전 그래프 runtime의
-                                S1 게이트 범위는 18번이 정한다
+                                S1 게이트 범위는 18번이 정한다.
+                                후속 확인(S4 CUT-C02 B1 관찰, 10-11): sign-out 복구 barrier가 해제됐는데도
+                                `recoverSignOut`이 `CLOSED`를 돌려줄 수 있다 — barrier 자신의 해제가 시도를 지운 신호가
+                                응답보다 먼저 도착하는 경합(`AuthAccessBinder.awaitBarrier`). `runRecovery`는 같은 ticket의 시도가 아직 열려 있을 때만 결과를
+                                복구 상태의 outcome으로 공개한다. barrier 해제로 시도가 지워진 경로에서는 복구 상태도
+                                지워져 이 `CLOSED` 결과는 공개되지 않는다. 화면·후속 처리 전반은 확인하지 않았고,
+                                이 관측만으로 운영 결함을 확정하지 않는다
 S1.5 확인 필요                : presenter·순서/표시 설정·legacy bank store 삭제는 land. `RateSourceRegistry`와
                                 live/snapshot renderMode 등가까지 포함한 전체 DoD 충족은 미확인
 S2 미충족                     : D26 무료 알림 in-memory 미리보기 미구현 · 마지막 탭은 `(owner_uid, last_tab)` 한 쌍이라
@@ -1489,8 +1495,20 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   · RT07 `43b72d8` §9.1 v1 graph cache와 graph 선호 저장소를 대상별 journal로 은퇴시키는 migration(dormant). 대상마다
   기록된 단계부터 재개하고, 삭제는 decode 없는 물리 sweep이며 다시 읽은 목록이 비어야 완료다. 운영 readiness 구현·
   startup 실행·backup 제외는 cutover 몫이다.
-  다음은 통합(운영 공급자·실제 HTTP stack 위에서 graph를 포함한 예산, CUT-C02)이고, 그 뒤 critical cutover(runtime·sink·
-  화면·쓰기·시간·migration·permit 배선, CUT-C01·CUT-C03·T25)와 P3-i다.
+  · 통합(dormant): INT-a `66e059d` graph 요청의 owner 확인을 운영 인증 위에 둠, INT-b `3645a04` 실제 issuer·운영
+  protected client 위의 cold start 예산 준비 harness.
+  · critical cutover: dormant 준비 P1 `b8f7fd7`·P2 `f97373a`·P3a `28a5662`·P3c `3ea0b6f`·P3b `2343273` 뒤 운영 배선
+  CC1 `145e155`·CC2a `69ba821`·CC2b `007cdef`·CC3 `04d094e`·CC4a `0114d37`·CC4b `a52ecec`·CC5-1 `a299092`·CC5-2 `671e51a`·
+  CC5-3 `12df28e`·CC5-4 `9cf3079`. CC5-3부터 armed 프로세스의 premium FX 탭이 graph REST·cache를 쓰고, CC5-4부터 graph 초기화 뒤
+  v1 graph 파일을 은퇴시킨다(배포·공개 arming 아님). D8 `095adf5` v1 graph 잔재 제거.
+  · 인수: 운영 조립 인수 하네스·필수 CI job `83a16ea`, C01 묶음 `9785df7`…`553f760`, C02 (b′) 계량 `26ccb45`…`e3073f6`, 추가 검증
+  `0a1adf2`·`d3349e9`·`5a8e801`. CUT-C01은 조건부 통과(사용자 결정 B·r2 — PASS 18, 조건부 예외 승인 10, P3-i 뒤 검증 의무 2;
+  개별 예외 12건·구조적 제외 5건은 PASS가 아니다; 대응표 `R4c/S4/cut_c01_final_progress.r2/c01_mapping.md`). CUT-C02는 최종 후보
+  `5a8e801`의 CI 계량 13행 통과(L1c는 결정 A로 조건부 제외 — S6 KRX 구독이나 FORCE_ENTITLEMENTS 직접 호출자 추가 전에 재판정).
+  CUT-C03(실기기)은 1차 실행 완료·T25 대기(근거: `R4c/S4/cut_c03_run.r1/result.r2.md`, 판정 합의 `R4c/S4/cut_c03_result_agreed.r1.md`).
+  관측 한계 예외는 개별 기록하며 PASS와 구분한다. S4 소비자 cutover 인수 판정은 T25 실행·판정까지 대기한다.
+  남은 것: T25(무료 화면 회귀) 기기 실행·판정 — S4 소비자 cutover 인수 판정의 선행, P3-i(실제 purger·지속 저장 활성화 뒤
+  B01·B02·B03·A02 purge 분기 검증), 3e(시계 주입 — T01·T02·T04 예외의 종결 조건), 공개 arming·release 게이트.
 
 ### S5 — 테더 탭
 - 거래소 5 + 참조(kb·hana·investing) 시세 (preference는 S1.5에서 도입, 여기서 테더 표면에 연결)
