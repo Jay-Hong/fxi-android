@@ -24,6 +24,8 @@ import com.jay.fxi.data.entitlements.RefreshIntent
 import com.jay.fxi.data.entitlements.SnapshotTopicUseAuthority
 import com.jay.fxi.data.entitlements.UnimplementedScopePurger
 import com.jay.fxi.data.entitlements.accessEpochCorruptionHandler
+import com.jay.fxi.data.entitlements.acquireUse
+import com.jay.fxi.data.entitlements.admitsUse
 import com.jay.fxi.data.free.FreeSnapshotSchedulePolicy
 import com.jay.fxi.data.free.InstallSeedSource
 import com.jay.fxi.data.graph.AppProcessGraphBuilder
@@ -180,6 +182,8 @@ class PremiumGraphCutoverAcceptanceTest {
     @Volatile private var usdBootstrap: () -> String = { usdSnapshot() }
     /** C01 (다): while set, the usd REST bootstrap's live answer waits on this at the server (a held real delivery). */
     @Volatile private var usdBootstrapHold: java.util.concurrent.CountDownLatch? = null
+    /** C01 (라): while set, the dxy topic bootstrap answers 429 with this Retry-After (a real bootstrap floor). */
+    @Volatile private var dxyBootstrapRetryAfter: String? = null
 
     private fun fixture(name: String) = File(GRAPH, name).readText()
     private fun ok(body: String) = MockResponse().setResponseCode(200).setBody(body)
@@ -283,6 +287,9 @@ class PremiumGraphCutoverAcceptanceTest {
                             usdBootstrapHold?.await(30, java.util.concurrent.TimeUnit.SECONDS)
                             ok(usdBootstrap())
                         }
+                        else if (url.queryParameter("topic") == TopicCatalogue.DXY && dxyBootstrapRetryAfter != null)
+                            MockResponse().setResponseCode(429).setHeader("Retry-After", checkNotNull(dxyBootstrapRetryAfter))
+                                .setBody("""{"detail":"rate limited"}""")
                         else if (url.queryParameter("topic") == TETHER && tetherCalls.getAndIncrement() == 0) unauthorized()
                         else MockResponse().setResponseCode(404).setBody("""{"error":"topic_unavailable"}""")
                     "/api/v2/graph/catalog" -> onCatalog(request)
@@ -3956,6 +3963,208 @@ class PremiumGraphCutoverAcceptanceTest {
         ColdStartBudget.assertWithin(judgeRow(label))
     }
 
+    /** C01 (라): what a same-grant hold must leave alone, read from the session (on its executor) and the issuer. */
+    private data class GrantInvariant(val fence: Any?, val grantEpoch: Long, val krxEpoch: Any?, val userEnd: Long)
+
+    private suspend fun Rig.grantInvariant(session: com.jay.fxi.data.remote.TopicSessionCoordinator): GrantInvariant {
+        val (fence, epoch) = onRuntime { privateField(session, "fence") to privateField(session, "grantEpoch") as Long }
+        return GrantInvariant(fence, epoch, epochStore.load().krxCapabilityEpoch, coordinator.accessSnapshot.lastUserEnd?.sequence ?: 0L)
+    }
+
+    /**
+     * RT03b-Q04u (cut_c01_xd.r2/proposal.md, #17·#22·#23): an open recovery cycle over a real closed demand (KRX visible) through
+     * two USER P4 holds (the A07 USER_P4 entry), each released on the same grant through D3 (a Stale candidate check, no USER
+     * end). The cold start's dxy bootstrap answers 429 with Retry-After 25 (the usd one answers 200 and makes the demand; tether
+     * answers 404 here like jpy and eur), so the bootstraps still owed under the grant wait on the bootstrap floor. Across each
+     * hold the session's fence and grant epoch, the KRX epoch and the USER end sequence stay the same. In a hold: the USER loss
+     * candidate is published, the user disallowed, no new use acquired and the old one no longer admitted, the connection ended;
+     * no tab, catalog or bootstrap goes and the budget keeps its object, rounds, rung and deadline. The first hold outlasts the
+     * floor and the owed bootstraps still wait. After each release the same budget runs on (rounds and rung never down, never
+     * stopped, sampled every 10 ms); after the first, exactly the bootstraps owed at its entry go, once each, and none issued
+     * before goes again. Catalogs since the cycle opened: none in a hold, the screen's activation at most one per release (the
+     * use's new lifetime) and none elsewhere, the rounds' own at most the rounds. Every round-issued request went with the permit open as the client read it.
+     */
+    @Test
+    fun `RT03b-Q04u two user P4 holds released on the same grant keep the budget and the grant and resume only the owed bootstraps`() = runBlocking {
+        val label = "RT03b-Q04u"
+        val prepared = clearOfBoundary(130_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 120_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        tetherCalls.set(1)
+        dxyBootstrapRetryAfter = "25"
+        val rig = Rig()
+        var sampler: kotlinx.coroutines.Job? = null
+        try {
+            rig.row {
+                rig.prepareClosedDemand(deadline, krx = true)
+                val session = rig.session()
+                val dxy = bootstraps().filter { it.param("topic") == TopicCatalogue.DXY }
+                assertEquals("$label: premise: one dxy bootstrap, answered 429", listOf<Int?>(429), dxy.map { it.status })
+                val floorAt = checkNotNull(dxy.single().bodyEnd) + 25_000
+                val starts = closedStarts()
+                val rounds = AtomicInteger()
+                val origins = Collections.synchronizedList(mutableListOf<SendOrigin>())
+                permitAtSend = rig.permitTag()
+                onCatalog = { request -> origins += runBlocking { rig.sendOrigin(catalog = true, request) }; ok(fixture("catalog-krx-visible.json")) }
+                onTab = { request -> origins += runBlocking { rig.sendOrigin(catalog = false, request) }; ok(usdTab(starts.take(8 * (rounds.incrementAndGet())), "usd-1d-krx-visible.json")) }
+                delay(3_500)
+                val baseline = tabs().size
+                val catalogsAtOpen = catalogs().size
+                val catalogOriginsAtOpen = synchronized(origins) { origins.count { it.kind == "catalog" } }
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: round 1 completed", deadline) { tabs().size == baseline + 1 && tabs().last().bodyEnd != null }
+                awaitTrue("$label: the budget waits for its next round", deadline) { rig.usdBudget()?.deadline != null }
+                val budget = checkNotNull(rig.usdBudgetObject())
+                val invariant = rig.grantInvariant(session)
+                assertNotNull("$label: premise: a session fence", invariant.fence)
+                val violations = Collections.synchronizedList(mutableListOf<String>())
+                sampler = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                    while (true) {
+                        delay(10)
+                        val sample = rig.budgetSample()
+                        val at = nowMillis()
+                        if (sample.first !== budget) violations += "$at: the budget is ${sample.first}"
+                        if (sample.second != null) violations += "$at: the budget stopped: ${sample.second}"
+                    }
+                }
+                val holdWindows = mutableListOf<Pair<Long, Long>>()
+                val releaseWindows = mutableListOf<Pair<Long, Long>>()
+                var last = checkNotNull(rig.usdBudget())
+                val log = mutableListOf<String>()
+                suspend fun check(event: String) {
+                    val now = checkNotNull(rig.usdBudget()) { "$label: no usd budget after $event" }
+                    log += "$event: $now"
+                    assertSame("$label: the same budget object after $event", budget, rig.usdBudgetObject())
+                    assertTrue("$label: rounds never go down after $event ($last -> $now)", now.rounds >= last.rounds)
+                    assertTrue("$label: the rung never goes down after $event ($last -> $now)", now.completionRung >= last.completionRung)
+                    assertNull("$label: the cycle has not stopped after $event ($now)", now.stop)
+                    assertTrue("$label: the demand stays after $event", rig.kbClosedPending().isNotEmpty())
+                    last = now
+                }
+                check("round 1")
+
+                // One same-grant USER hold; [holdUntil], read once the hold is published, says until when it stands.
+                suspend fun userHold(name: String, holdUntil: () -> Long) {
+                    val fence = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                    val oldUse = checkNotNull(rig.coordinator.accessSnapshot.acquireUse(fence)) { "$label: $name: premise: a use before the hold" }
+                    val heldAt = nowMillis()
+                    rig.enterUserHold("$label: $name", deadline)
+                    val snapshot = rig.coordinator.accessSnapshot
+                    assertNull("$label: $name: no new use is acquired in the hold", snapshot.acquireUse(fence))
+                    assertFalse("$label: $name: the use from before the hold is no longer admitted", snapshot.admitsUse(oldUse))
+                    awaitTrue("$label: $name: the connection ended", deadline) { rig.onRuntime { privateField(session, "connection") == null } }
+                    // Read once the hold is published and nothing is in flight: a round that left just before is already counted.
+                    awaitTrue("$label: $name: nothing in flight", deadline) { graph().all { it.bodyEnd != null } && bootstraps().all { it.bodyEnd != null } }
+                    val before = checkNotNull(rig.usdBudget())
+                    val sentBefore = Triple(tabs().size, catalogs().size, bootstraps().size)
+                    val until = holdUntil()
+                    while (nowMillis() < until) delay(50)
+                    val during = checkNotNull(rig.usdBudget())
+                    assertSame("$label: $name keeps the budget object", budget, rig.usdBudgetObject())
+                    assertEquals("$label: $name keeps the deadline", before.deadline, during.deadline)
+                    assertEquals("$label: $name: no round while held", before.rounds, during.rounds)
+                    assertEquals("$label: $name keeps the rung", before.completionRung, during.completionRung)
+                    assertEquals("$label: $name: no tab, catalog or bootstrap while held\n${sends.timeline()}", sentBefore,
+                        Triple(tabs().size, catalogs().size, bootstraps().size))
+                    assertEquals("$label: $name: the grant and epochs while held", invariant, rig.grantInvariant(session))
+                    val releasedAt = nowMillis()
+                    holdWindows += heldAt to releasedAt
+                    rig.releaseUserHoldByD3("$label: $name", deadline)
+                    assertEquals("$label: $name: the grant and epochs after the release", invariant, rig.grantInvariant(session))
+                    assertEquals("$label: $name: the issuer's grant is the session's", invariant.fence, rig.coordinator.topicGrantResult().fence)
+                    releaseWindows += releasedAt to nowMillis() + 1_000
+                }
+
+                // Hold 1 (#22): entered while bootstraps are still owed under the floor; it outlasts the floor.
+                awaitTrue("$label: hold 1: no round in flight and the next not imminent", deadline) {
+                    tabs().all { it.bodyEnd != null } &&
+                        rig.usdBudget()?.deadline?.let { it.toEpochMilliseconds() - wallAtOrigin - nowMillis() >= 500 } == true
+                }
+                val owed = rig.onRuntime { (privateField(session, "unissuedBootstraps") as Set<*>).map { it as String }.toSet() }
+                val inFlight = rig.onRuntime { (privateField(session, "bootstrapsOut") as Map<*, *>).size }
+                val issuedBefore = bootstraps().mapNotNull { it.param("topic") }
+                println("CUT-C01 $label at hold 1: owed $owed, issued $issuedBefore, in flight $inFlight, floor in ${floorAt - nowMillis()} ms")
+                assertTrue("$label: premise: bootstraps are still owed at hold 1", owed.isNotEmpty())
+                assertTrue("$label: premise: none owed was sent ($owed, $issuedBefore)", owed.none { it in issuedBefore })
+                assertEquals("$label: premise: no bootstrap in flight", 0, inFlight)
+                assertTrue("$label: premise: the floor is still ahead", nowMillis() < floorAt)
+                userHold("hold 1") { maxOf(floorAt + 1_500, nowMillis() + 1_500) }
+                awaitTrue("$label: after hold 1 the owed bootstraps went", deadline) {
+                    bootstraps().drop(issuedBefore.size).mapNotNull { it.param("topic") }.toSet() == owed && bootstraps().all { it.bodyEnd != null }
+                }
+                delay(1_500)
+                val resumed = bootstraps().drop(issuedBefore.size).mapNotNull { it.param("topic") }
+                assertEquals("$label: after hold 1 each owed bootstrap went once and nothing else", owed.sorted(), resumed.sorted())
+                check("hold 1")
+
+                // Hold 2 (#17·#23): the same budget held and released again on the same grant.
+                awaitTrue("$label: hold 2: no round in flight and the next not imminent", deadline) {
+                    tabs().all { it.bodyEnd != null } &&
+                        rig.usdBudget()?.deadline?.let { it.toEpochMilliseconds() - wallAtOrigin - nowMillis() >= 500 } == true
+                }
+                val bootstrapsBeforeHold2 = bootstraps().size
+                userHold("hold 2") { nowMillis() + 2_000 }
+                delay(2_000)
+                assertEquals("$label: after hold 2 no bootstrap goes again", bootstrapsBeforeHold2, bootstraps().size)
+                check("hold 2")
+                sampler?.cancel()
+
+                println("CUT-C01 $label budget after each event:\n" + log.joinToString("\n"))
+                val catalogTimes = catalogs().drop(catalogsAtOpen).map { it.start }
+                val sent = synchronized(origins) { origins.toList() }
+                val catalogOrigins = sent.filter { it.kind == "catalog" }.drop(catalogOriginsAtOpen)
+                println("CUT-C01 $label catalogs since open $catalogTimes; holds $holdWindows; releases $releaseWindows; rounds ${last.rounds}; origins $sent")
+                assertTrue("$label: premise: the cycle has rounds left (${last.rounds} < 6)", last.rounds < 6)
+                assertEquals("$label: between the checks the budget stayed this running object", emptyList<String>(), synchronized(violations) { violations.toList() })
+                assertEquals("$label: premise: every catalog since the cycle opened is attributed", catalogTimes.size, catalogOrigins.size)
+                val pairs = catalogTimes.zip(catalogOrigins)
+                holdWindows.forEachIndexed { i, (from, until) ->
+                    assertEquals("$label: no catalog in hold ${i + 1}\n${sends.timeline()}", 0, catalogTimes.count { it in from..until })
+                }
+                // The screen's own activation: a release gives the use a new lifetime (the hold withdrew the old one), so the holder
+                // activates again and may send its own catalog (the same-scope ContextChanged itself is catalog-silent): at most one
+                // per release, inside its window, and none elsewhere (counted apart, cut_c01_b2b_catalog.r1).
+                releaseWindows.forEachIndexed { i, (from, until) ->
+                    assertTrue("$label: the activation's own catalogs after release ${i + 1} are at most one\n${sends.timeline()}",
+                        pairs.count { (at, o) -> o.byRound == false && at in from..until } <= 1)
+                }
+                assertEquals("$label: no activation catalog outside a release\n${sends.timeline()}", emptyList<Long>(),
+                    pairs.filter { (at, o) -> o.byRound == false && releaseWindows.none { (from, until) -> at in from..until } }.map { it.first })
+                assertTrue("$label: the rounds' own catalogs are at most the rounds (${last.rounds})\n${sends.timeline()}",
+                    pairs.count { it.second.byRound == true } <= last.rounds)
+                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                assertEquals("$label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
+                    sent.filter { it.byRound == true && it.permitOpen != true })
+                // End cleanly: the rest of the window, then the session settles.
+                onTab = { ok(usdTab(starts, "usd-1d-krx-visible.json")) }
+                awaitTrue("$label: the demand is met", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                awaitTrue("$label: the tabs settle", deadline) { graph().all { it.bodyEnd != null } }
+                awaitTrue("$label: the server and the recorder agree", deadline) {
+                    synchronized(received) { received.toList() }.sorted() == sends.all().map { it.key }.sorted()
+                }
+                quiet(label, 1_000)
+            }
+        } finally {
+            sampler?.cancel()
+            permitAtSend = null
+            dxyBootstrapRetryAfter = null
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 120_000)
+        // The budget judgement of A06's shape: the one injected 429 (the dxy bootstrap) is the row's device, not a budget miss.
+        val verdict = judgeRow(label)
+        assertEquals("only the injected dxy bootstrap answered 429", listOf(TopicCatalogue.DXY),
+            sends.all().filter { it.status == 429 }.map { it.param("topic") })
+        assertTrue("api excess ${verdict.apiExcessMilli}", verdict.apiExcessMilli <= ColdStartBudget.MAX_EXCESS_MILLI)
+        assertTrue("ws excess ${verdict.wsExcessMilli}", verdict.wsExcessMilli <= ColdStartBudget.MAX_EXCESS_MILLI)
+        assertEquals("the model refused a send", emptyList<Int>(), verdict.refused)
+        assertTrue("api in flight ${verdict.apiInFlight}", verdict.apiInFlight <= ColdStartBudget.MAX_API_IN_FLIGHT)
+    }
+
     // --- CUT-C01 batch 2b: RT03b-Q05 (cut_c01_b2_agreed.r1.md) ---------------------------------------------------------------
 
     /** Topic snapshot (REST bootstrap) sends, in order. */
@@ -4210,6 +4419,287 @@ class PremiumGraphCutoverAcceptanceTest {
         }
         assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
         assertTrue("within the row deadline", nowMillis() - start <= 45_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT03b-Q05c (cut_c01_xd.r2/proposal.md, #19·#21): connect throw, then offline, under one re-approved grant. With a closed
+     * demand, closing the socket opens the cycle; the reconnect's usd subscription is refused (the issuer's identity unreadable)
+     * and the refusal hook arms a throw for the next connect. The issuer re-approves a new grant (same identity and user epoch)
+     * whose first connect throws. Until that grant's first real connection started: no tab and no topic bootstrap, at most one
+     * catalog and that the screen's activation, never the round's. The round's preserved deadline passed before that connection;
+     * once it exists the waiting round goes once, promptly, and its partial answer leaves the demand. With this grant's
+     * automatic bootstraps all issued and settled, offline before the next round falls due: past it no graph or bootstrap send,
+     * and the budget keeps its object, rounds, rung and deadline, the demand staying. Online, the re-approved grant's next
+     * connection resumes the round on the preserved deadline, and no topic bootstrapped under this grant goes again. Every
+     * request a round issued went with the permit open, as the client read it sending the request.
+     */
+    @Test
+    fun `RT03b-Q05c a re-approved grant whose first connect throws sends nothing until its connection and its offline round resumes on the deadline`() = runBlocking {
+        val label = "RT03b-Q05c"
+        val prepared = clearOfBoundary(100_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 90_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        val rig = Rig()
+        val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            while (true) {
+                if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
+                delay(20)
+            }
+        }
+        val origins = Collections.synchronizedList(mutableListOf<SendOrigin>())
+        // The first grant change, when the client saw it, with the usd budget at that moment; then the budget every 5 ms.
+        val grantSeen = java.util.concurrent.atomic.AtomicReference<Pair<Long, BudgetView?>?>(null)
+        val budgetSamples = Collections.synchronizedList(mutableListOf<Pair<Long, BudgetView?>>())
+        var grantWatch: kotlinx.coroutines.Job? = null
+        try {
+            rig.row {
+                rig.prepareClosedDemand(deadline)
+                val starts = closedStarts()
+                val rounds = AtomicInteger()
+                val catalogsAtHook = catalogs().size
+                permitAtSend = rig.permitTag()
+                onCatalog = { request -> origins += runBlocking { rig.sendOrigin(catalog = true, request) }; ok(fixture("catalog-krx-hidden.json")) }
+                onTab = { request -> origins += runBlocking { rig.sendOrigin(catalog = false, request) }; ok(usdTab(starts.take(24 * rounds.incrementAndGet()))) }
+                rig.awaitTopics(deadline)
+                delay(3_500)
+                val first = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                grantWatch = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                    while (grantSeen.get() == null) {
+                        val now = rig.coordinator.accessSnapshot.facts.token
+                        if (now != null && now != first.grant) grantSeen.set(nowMillis() to rig.usdBudget())
+                        delay(5)
+                    }
+                    while (true) {
+                        budgetSamples += nowMillis() to rig.usdBudget()
+                        delay(5)
+                    }
+                }
+                refuseUsd = {
+                    refuseUsd = null
+                    rig.throwNextConnect = true
+                    rig.issuerIdentityReadable = false
+                }
+                val connectsAtClose = rig.connectCalls.get()
+                val handshakesAtClose = handshakes().size
+                val tabsAtClose = tabs().size
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: the reconnect's subscription was refused", deadline) { refuseUsd == null && refusals.get() >= 1 }
+                awaitTrue("$label: a re-approved grant", deadline) { grantSeen.get() != null }
+                val reapproved = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                val cause = rig.coordinator.topicGrantResult().cause
+                assertTrue("$label: premise: a refusal re-approval: $cause", cause is com.jay.fxi.data.entitlements.TopicGrantCause.RefusalReapproval)
+                assertEquals("$label: the same identity", first.identity, reapproved.identity)
+                assertEquals("$label: the same user epoch", first.userAccessEpoch, reapproved.userAccessEpoch)
+                awaitTrue("$label: that grant's first real connection started", deadline) { handshakes().size >= handshakesAtClose + 2 }
+                assertEquals("$label: premise: that grant's first connect threw (the refused reconnect was call ${connectsAtClose + 1})",
+                    (connectsAtClose + 2).toLong(), rig.thrownConnect)
+                val connectionAt = handshakes()[handshakesAtClose + 1].start
+                val (seen, budgetAtGrant) = checkNotNull(grantSeen.get())
+                val from = checkNotNull(sends.all().filter { it.path == "/api/entitlements" }.mapNotNull { it.bodyEnd }.filter { it <= seen }.maxOrNull()) {
+                    "$label: the re-approval's entitlements answer"
+                }
+                println("CUT-C01 $label: re-approval answer $from (seen $seen), budget then $budgetAtGrant, thrown call ${rig.thrownConnect}, " +
+                    "connection $connectionAt; bootstraps ${bootstraps().map { "${it.param("topic")}@${it.start}" }}")
+                assertTrue("$label: premise: that answer is the re-approval's ($from, seen at $seen)", seen - from < 1_000)
+                assertTrue("$label: premise: the re-approval came before its connection ($from, $connectionAt)", from < connectionAt - 50)
+                assertEquals("$label: no tab from the re-approval to its connection\n${sends.timeline()}", 0,
+                    tabs().count { it.start in from until (connectionAt - 50) })
+                assertEquals("$label: no topic bootstrap from the re-approval to its connection\n${sends.timeline()}", 0,
+                    bootstraps().count { it.start in from until (connectionAt - 50) })
+                val window = catalogs().drop(catalogsAtHook).zip(synchronized(origins) { origins.toList() }.filter { it.kind == "catalog" })
+                    .filter { (exchange, _) -> exchange.start in from until connectionAt }
+                assertTrue("$label: premise: each catalog in the window has its registration", window.all { it.second.byRound != null })
+                assertTrue("$label: at most one catalog from the re-approval to its connection\n${sends.timeline()}", window.size <= 1)
+                assertEquals("$label: no round-issued catalog in that window", emptyList<SendOrigin>(), window.map { it.second }.filter { it.byRound == true })
+                val due = checkNotNull(budgetAtGrant?.deadline) { "$label: premise: a round deadline at the re-approval" }.toEpochMilliseconds() - wallAtOrigin
+                assertTrue("$label: premise: the preserved deadline passed before the connection (due $due, connection $connectionAt)", due < connectionAt - 100)
+                // Whether round 1 went on the refused reconnect before the refusal settled or was owed at the re-approval, the round
+                // falling due before this grant's connection waits for the permit until then.
+                val waited = synchronized(budgetSamples) { budgetSamples.toList() }.filter { (at, b) -> at in (due + 1) until connectionAt && b?.waitingPermit == true }
+                grantWatch?.cancel()
+                assertTrue("$label: premise: between the deadline and the connection the budget waits for the permit", waited.isNotEmpty())
+                awaitTrue("$label: the waiting round goes", deadline) { tabs().drop(tabsAtClose).any { it.start >= connectionAt - 50 } }
+                val round = tabs().drop(tabsAtClose).first { it.start >= connectionAt - 50 }
+                assertTrue("$label: the round goes promptly (${round.start} vs connection $connectionAt)\n${sends.timeline()}",
+                    round.start <= connectionAt + 1_000)
+                awaitTrue("$label: the round completed", deadline) { tabs().all { it.bodyEnd != null } }
+                assertEquals("$label: the round went once", 1, tabs().drop(tabsAtClose).count { it.start >= connectionAt - 50 && it.start <= round.start + 500 })
+                assertTrue("$label: its partial answer leaves the demand", rig.kbClosedPending().isNotEmpty())
+
+                // This grant's automatic bootstraps, all issued and settled; then offline before the next round falls due.
+                awaitTrue("$label: this grant's bootstraps all went and settled", deadline) {
+                    bootstraps().filter { it.start >= connectionAt - 50 }.mapNotNull { it.param("topic") }.toSet() == DESIRED &&
+                        bootstraps().all { it.bodyEnd != null }
+                }
+                awaitTrue("$label: no round in flight and the next not imminent", deadline) {
+                    tabs().all { it.bodyEnd != null } &&
+                        rig.usdBudget()?.deadline?.let { it.toEpochMilliseconds() - wallAtOrigin - nowMillis() >= 700 } == true
+                }
+                val budget = checkNotNull(rig.usdBudgetObject())
+                val before = checkNotNull(rig.usdBudget())
+                val due2 = checkNotNull(before.deadline).toEpochMilliseconds() - wallAtOrigin
+                val graphBefore = graph().size
+                val bootstrapsBefore = bootstraps().size
+                rig.online.value = false
+                awaitTrue("$label: the permit closed", deadline) { rig.onMain { checkNotNull(rig.permitSlot).require()() }?.automatic != true }
+                assertTrue("$label: premise: the permit closed before the round fell due (${nowMillis()} vs $due2)", nowMillis() < due2)
+                while (nowMillis() < due2 + 2_000) {
+                    assertEquals("$label: no graph send past the deadline while offline\n${sends.timeline()}", graphBefore, graph().size)
+                    assertEquals("$label: no bootstrap while offline", bootstrapsBefore, bootstraps().size)
+                    delay(50)
+                }
+                val during = checkNotNull(rig.usdBudget())
+                assertSame("$label: offline keeps the budget object", budget, rig.usdBudgetObject())
+                assertEquals("$label: offline keeps the deadline", before.deadline, during.deadline)
+                assertEquals("$label: offline keeps the rounds", before.rounds, during.rounds)
+                assertEquals("$label: offline keeps the rung", before.completionRung, during.completionRung)
+                assertNull("$label: offline: not stopped", during.stop)
+                assertTrue("$label: offline: the demand stays", rig.kbClosedPending().isNotEmpty())
+                val handshakesBefore = handshakes().size
+                rig.online.value = true
+                awaitTrue("$label: the re-approved grant's next connection", deadline) { handshakes().size > handshakesBefore }
+                val nextConnection = handshakes()[handshakesBefore].start
+                awaitTrue("$label: the round resumes", deadline) { tabs().any { it.start >= nextConnection - 50 } }
+                val resumed = tabs().first { it.start >= nextConnection - 50 }
+                assertTrue("$label: at once on the preserved deadline (${resumed.start} vs connection $nextConnection)\n${sends.timeline()}",
+                    resumed.start <= nextConnection + 1_000)
+                assertEquals("$label: premise: the same re-approved grant", reapproved.grant, rig.coordinator.topicGrantResult().fence?.grant)
+                assertSame("$label: the same budget object resumes", budget, rig.usdBudgetObject())
+                delay(3_000)
+                assertEquals("$label: no topic bootstrapped again on this grant: ${bootstraps().drop(bootstrapsBefore).map { it.param("topic") }}",
+                    bootstrapsBefore, bootstraps().size)
+                val sent = synchronized(origins) { origins.toList() }
+                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                assertEquals("$label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
+                    sent.filter { it.byRound == true && it.permitOpen != true })
+                onTab = { request -> origins += runBlocking { rig.sendOrigin(catalog = false, request) }; ok(usdTab(starts)) }
+                awaitTrue("$label: the demand is met", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                awaitTrue("$label: the tabs settle", deadline) { graph().all { it.bodyEnd != null } }
+                quiet(label, 1_000)
+            }
+        } finally {
+            refuseUsd = null
+            restorer.cancel()
+            grantWatch?.cancel()
+            permitAtSend = null
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 90_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT03b-Q05d (cut_c01_xd.r2/proposal.md, #20): the D3 ladder spent with a real graph demand left. With a closed demand and an
+     * open cycle (the screen open), every usd subscription from the reconnect on is refused (the issuer's identity unreadable
+     * until it owes the re-check), so the session re-approves and reconnects under D3 until the ladder is spent; the preparation's
+     * own rungs count, so the number of re-approvals is not fixed. The reconnection display ends Exhausted and the graph consumes
+     * the last re-approved grant. Catalogs since the close: the screen's activation at most one per grant change, never the
+     * round's. Past the remaining round's preserved deadline the budget waits for the permit, not stopped, and the closed demand
+     * stays; from then on, for 10 s, no connect attempt, no topic bootstrap and no graph send. No lifecycle or manual reset.
+     */
+    @Test
+    fun `RT03b-Q05d a spent D3 ladder with a real demand left waits for the permit and sends nothing`() = runBlocking {
+        val label = "RT03b-Q05d"
+        val prepared = clearOfBoundary(170_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 160_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        val rig = Rig()
+        val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            while (true) {
+                if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
+                delay(20)
+            }
+        }
+        val origins = Collections.synchronizedList(mutableListOf<SendOrigin>())
+        val grantChanges = Collections.synchronizedList(mutableListOf<Long>())
+        var grantWatch: kotlinx.coroutines.Job? = null
+        try {
+            rig.row {
+                rig.prepareClosedDemand(deadline)
+                val starts = closedStarts()
+                val rounds = AtomicInteger()
+                val catalogsAtHook = catalogs().size
+                permitAtSend = rig.permitTag()
+                onCatalog = { request -> origins += runBlocking { rig.sendOrigin(catalog = true, request) }; ok(fixture("catalog-krx-hidden.json")) }
+                onTab = { request -> origins += runBlocking { rig.sendOrigin(catalog = false, request) }; ok(usdTab(starts.take(12 * rounds.incrementAndGet()))) }
+                rig.awaitTopics(deadline)
+                delay(3_500)
+                val session = rig.session()
+                val attemptAtClose = rig.onRuntime { privateField(session, "reconnectAttempt") as Int }
+                val first = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                @Suppress("UNCHECKED_CAST")
+                val display = rig.onMain { privateField(rig.owner.consumer, "display") } as StateFlow<TopicDisplayState>
+                grantWatch = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                    var seen = first.grant
+                    while (true) {
+                        val now = rig.coordinator.accessSnapshot.facts.token
+                        if (now != null && now != seen) { seen = now; grantChanges += nowMillis() }
+                        delay(5)
+                    }
+                }
+                // Every usd subscription from here on is refused while the issuer cannot read the identity.
+                refuseUsd = { rig.issuerIdentityReadable = false }
+                val closedAt = nowMillis()
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: the ladder is spent", deadline) { display.value.recovery == com.jay.fxi.data.remote.TopicRecoveryDisplay.Exhausted }
+                val last = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertTrue("$label: premise: the last grant is a refusal re-approval: ${rig.coordinator.topicGrantResult().cause}",
+                    rig.coordinator.topicGrantResult().cause is com.jay.fxi.data.entitlements.TopicGrantCause.RefusalReapproval)
+                assertEquals("$label: the same identity", first.identity, last.identity)
+                assertEquals("$label: the same user epoch", first.userAccessEpoch, last.userAccessEpoch)
+                awaitTrue("$label: the graph consumed the last re-approved grant", deadline) { rig.assembly.coordinator.state.value.source?.fence == last }
+                val attemptAtEnd = rig.onRuntime { privateField(session, "reconnectAttempt") as Int }
+                val changes = synchronized(grantChanges) { grantChanges.toList() }
+                println("CUT-C01 $label: reconnect attempts $attemptAtClose -> $attemptAtEnd, refusals ${refusals.get()}, grant changes $changes, " +
+                    "connections ${handshakes().map { it.start }.filter { it >= closedAt }}")
+                assertEquals("$label: premise: the ladder's last rung is used", com.jay.fxi.domain.model.TopicReconnectPolicy.MAX_ATTEMPTS, attemptAtEnd)
+                assertTrue("$label: premise: re-approvals happened", changes.isNotEmpty())
+                // The remaining round: past its preserved deadline the budget waits for the permit.
+                val budgetNow = checkNotNull(rig.usdBudget()) { "$label: premise: the cycle is still open" }
+                budgetNow.deadline?.let { due -> while (nowMillis() < due.toEpochMilliseconds() - wallAtOrigin + 500) delay(50) }
+                awaitTrue("$label: the graph settles", deadline) { graph().all { it.bodyEnd != null } && bootstraps().all { it.bodyEnd != null } }
+                val waiting = checkNotNull(rig.usdBudget())
+                assertTrue("$label: the budget waits for the permit ($waiting)", waiting.waitingPermit)
+                assertNull("$label: the budget has not stopped ($waiting)", waiting.stop)
+                assertTrue("$label: the closed demand stays", rig.kbClosedPending().isNotEmpty())
+                val connects = rig.connectCalls.get()
+                val bootstrapsBefore = bootstraps().size
+                val graphBefore = graph().size
+                val until = nowMillis() + 10_000
+                while (nowMillis() < until) {
+                    assertEquals("$label: no connect attempt after the spent ladder", connects, rig.connectCalls.get())
+                    assertEquals("$label: no topic bootstrap after the spent ladder", bootstrapsBefore, bootstraps().size)
+                    assertEquals("$label: no graph send after the spent ladder\n${sends.timeline()}", graphBefore, graph().size)
+                    delay(50)
+                }
+                assertEquals("$label: still Exhausted", com.jay.fxi.data.remote.TopicRecoveryDisplay.Exhausted, display.value.recovery)
+                val sent = synchronized(origins) { origins.toList() }
+                val catalogPairs = catalogs().drop(catalogsAtHook).zip(sent.filter { it.kind == "catalog" })
+                println("CUT-C01 $label: catalogs ${catalogPairs.map { (e, o) -> "${e.start} $o" }}; rounds ${waiting.rounds}")
+                assertTrue("$label: premise: each catalog has its registration", catalogPairs.all { it.second.byRound != null })
+                assertTrue("$label: the activation's own catalogs are at most the grant changes (${changes.size})\n${sends.timeline()}",
+                    catalogPairs.count { it.second.byRound == false } <= changes.size)
+                assertTrue("$label: the rounds' own catalogs are at most the rounds (${waiting.rounds})",
+                    catalogPairs.count { it.second.byRound == true } <= waiting.rounds)
+                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                assertEquals("$label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
+                    sent.filter { it.byRound == true && it.permitOpen != true })
+            }
+        } finally {
+            refuseUsd = null
+            restorer.cancel()
+            grantWatch?.cancel()
+            permitAtSend = null
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 160_000)
         ColdStartBudget.assertWithin(judgeRow(label))
     }
 
@@ -6524,6 +7014,119 @@ class PremiumGraphCutoverAcceptanceTest {
         ColdStartBudget.assertWithin(judgeRow(label))
     }
 
+    /**
+     * RT05-T04c (cut_c01_xe.r2/proposal.md, #29): a boundary opens a new recovery cycle whose first round joins a general request
+     * already out. From a real closed demand (KRX visible, the route stand-in), a general forced refresh before B applies every
+     * closed start: no demand, no closed pending, no budget, nothing in flight, while the current bucket C keeps its pending. At
+     * B − 3.2 s the production coordinator's `onRefreshRequested(force = true)` sends a general usd 1d request R, held at the
+     * server (not attributed to the screen): no budget, R registered, not issued by a round, no round bound, carrying a kb.usd
+     * recovery capture. After B one more trigger, the bucket moved to B, the Connection and foreground unchanged; once the
+     * coordinator consumed it the closed demand is back (C's pending now closed, no demand generation added since R's capture),
+     * a new budget is installed, R is bound to its current round (the round's tab request id is R's) and no second 1d tab goes.
+     * Released with a tab built after B, the demand is met, kb.usd has no closed pending start and the budget is gone; 5 s later
+     * still no other tab and still one trigger after B. A direct acceptance observation is not claimed (#30).
+     */
+    @Test
+    fun `RT05-T04c a boundary opens a new cycle whose first round joins a held general request and sends no second tab`() = runBlocking {
+        val label = "RT05-T04c"
+        // The events' 10 s rollover tick runs on the cold start's phase: from B − 35 s it falls at about B − 5 s and B + 5 s, so B is
+        // seen about 8 s after R goes at B − 3.2 s (from B − 30 s it fell 0.1 s before B and B was seen only at B + 9.9 s).
+        val boundary = alignToBoundary(label, 35_000)
+        val start = nowMillis()
+        val deadline = start + 70_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val rig = Rig()
+        val release = java.util.concurrent.CountDownLatch(1)
+        rig.row {
+            try {
+                rig.prepareClosedDemand(deadline, krx = true, route = true)
+                awaitTrue("$label: the initial sends ended", deadline) { sends.all().all { it.bodyEnd != null } }
+                assertNull("$label: premise: no recovery budget", rig.usdBudgetObject())
+                val c = boundary / 1000 - 600
+                // A general forced refresh meets every closed start before B.
+                val tabsBeforeRefresh = tabs().size
+                onTab = { ok(usdTab(closedStarts(), "usd-1d-krx-visible.json")) }
+                rig.onMain { rig.assembly.coordinator.onRefreshRequested(force = true) }
+                awaitTrue("$label: the general refresh applied", deadline) {
+                    tabs().size == tabsBeforeRefresh + 1 && tabs().all { it.bodyEnd != null } && rig.usdTabRequestObject() == null
+                }
+                awaitTrue("$label: the demand is met before B", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                assertEquals("$label: premise: no closed pending start before B", emptySet<Long>(), rig.kbClosedPending())
+                assertNull("$label: premise: still no budget", rig.usdBudgetObject())
+                assertTrue("$label: premise: C keeps its pending (C $c, ${rig.kbPendingAll()})", c in rig.kbPendingAll())
+                val base = rig.eventsView()
+                assertNotNull("$label: premise: a Connection baseline", base.connection)
+                assertEquals("$label: premise: in the foreground", true, base.foreground)
+
+                // R: a general request at B − 3.2 s, held at the server.
+                val answer = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                onTab = { release.await(14, java.util.concurrent.TimeUnit.SECONDS); ok(answer.get() ?: usdTab(closedStarts(), "usd-1d-krx-visible.json")) }
+                val tabsBase = tabs().size
+                assertTrue("$label: premise: prepared before B − 3.2 s", System.currentTimeMillis() < boundary - 3_200)
+                untilEpoch(boundary - 3_200)
+                rig.onMain { rig.assembly.coordinator.onRefreshRequested(force = true) }
+                awaitTrue("$label: R is registered and sent", deadline) { tabs().size == tabsBase + 1 && rig.usdTabRequestObject() != null }
+                val sent = tabs().last()
+                val request = checkNotNull(rig.usdTabRequestObject())
+                val (requestId, automatic, roundBefore) = rig.onMain {
+                    Triple(privateField(request, "requestId") as Long, privateField(request, "automaticRecovery") as Boolean, privateField(request, "recoveryRound"))
+                }
+                val captures = checkNotNull(rig.usdTabRegistration().captures)
+                val captured = checkNotNull(captures.firstOrNull { it.seriesKey.seriesId == "kb.usd" }) { "$label: premise: R carries a kb.usd capture ($captures)" }
+                    .capturedGeneration
+                // Checked after the samples, so they were all taken before B.
+                assertTrue("$label: premise: R sent, held and sampled before B", System.currentTimeMillis() < boundary && sent.bodyEnd == null)
+                assertEquals("$label: premise: R is not issued by a round", false, automatic)
+                assertNull("$label: premise: no round bound to R", roundBefore)
+                assertNull("$label: premise: no budget with R out", rig.usdBudgetObject())
+                assertEquals("$label: premise: no trigger before B", base.sequence, rig.triggers())
+
+                awaitTrue("$label: one trigger after B", sent.start + 13_000) { rig.triggers() == base.sequence + 1 }
+                val after = rig.eventsView()
+                assertEquals("$label: the bucket moved to B", boundary / 1000, after.bucket?.epochSeconds)
+                assertEquals("$label: the Connection is unchanged", base.connection, after.connection)
+                assertEquals("$label: in the foreground", true, after.foreground)
+                awaitTrue("$label: the coordinator consumed it", sent.start + 13_500) { rig.coordinatorTriggerSequence() >= after.sequence }
+                awaitTrue("$label: the closed demand is back", sent.start + 13_500) {
+                    rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.Pending(closed = true, mappingWait = false)
+                }
+                awaitTrue("$label: a new budget", sent.start + 13_500) { rig.usdBudgetObject() != null }
+                val budget = checkNotNull(rig.usdBudgetObject())
+                val (bound, roundBudget, roundTab) = rig.onMain {
+                    val round = privateField(request, "recoveryRound")
+                    Triple(round, round?.let { privateField(it, "budget") }, round?.let { privateField(it, "tabRequestId") as Long? })
+                }
+                println("CUT-C01 $label: R $requestId sent ${sent.start}, B at ${boundary - System.currentTimeMillis() + nowMillis()}, " +
+                    "budget ${rig.usdBudget()}, round bound $bound")
+                assertSame("$label: R is the same registration", request, rig.usdTabRequestObject())
+                assertNotNull("$label: R is bound to a round", bound)
+                assertSame("$label: that round is the new budget's", budget, roundBudget)
+                assertSame("$label: the budget's current round is R's", bound, rig.onMain { privateField(budget, "round") })
+                assertEquals("$label: the round's tab request is R", requestId, roundTab)
+                assertEquals("$label: no second 1d tab", tabsBase + 1, tabs().size)
+                assertEquals("$label: no demand generation added since R's capture", captured, checkNotNull(rig.kbState()).generation)
+                val starts = closedStarts()
+                assertTrue("$label: premise: the answer gives C", c in starts)
+                answer.set(usdTab(starts, "usd-1d-krx-visible.json"))
+                assertTrue("$label: premise: released within 14 s of the send", nowMillis() - sent.start < 14_000)
+                release.countDown()
+                awaitTrue("$label: released, the demand is met", deadline) { rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                assertEquals("$label: no closed pending start", emptySet<Long>(), rig.kbClosedPending())
+                awaitTrue("$label: the budget is gone", deadline) { rig.usdBudgetObject() == null }
+                assertEquals("$label: premise: R was answered", 200, tabs()[tabsBase].status)
+                quiet(label, 5_000)
+                assertEquals("$label: still no other tab", tabsBase + 1, tabs().size)
+                assertEquals("$label: still one trigger after B", base.sequence + 1, rig.triggers())
+            } finally {
+                release.countDown()
+            }
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 70_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
     // --- CUT-C01 batch 3d: RT01-S01 (A)(U)(C-A)(C-U), RT01-S02(b′) (cut_c01_b3d_agreed.r1.md) --------------------------------
 
     /** The usd 1d key of the coordinator's entries, read on Main. */
@@ -6710,6 +7313,50 @@ class PremiumGraphCutoverAcceptanceTest {
         assertEquals("$label: D3 answered exactly once ($hits)", 1, hits.size)
         assertTrue("$label: inside the issuer's candidate check ($hits)", hits.single().endsWith(": PremiumAccessCoordinator.checkCandidateLocked"))
         assertFalse("$label: not on Main ($hits)", hits.single().startsWith("acceptance-main"))
+        assertNull("$label: D3 is spent", differentRecoveryIdentity.get())
+    }
+
+    /**
+     * C01 (라): the A07 USER_P4 entry (harness RT01-A07) as a helper: a USER loss answer (KRX visible) whose decision read fails
+     * once holds one USER loss candidate, and its recovery round meets an unreadable identity; the hold is published. Answers
+     * left queued (an earlier release's) are dropped first, so the decision answers the loss: a non-loss answer whose read fails
+     * is rethrown (PremiumAccessCoordinator.holdUnreadableLossLocked). No Main step.
+     */
+    private suspend fun Rig.enterUserHold(label: String, deadline: Long) {
+        val failure = java.io.IOException("access record unreadable")
+        val thrownBefore = storeLoadFault.thrown.size
+        entitlements.clear()
+        storeLoadFault.arm(failure) { isIssuerDecision(it) }
+        issuerIdentityReadable = false
+        entitlements += ok("""{"krx_visible":true,"premium_active":false,"premium_pending":false}""")
+        kotlinx.coroutines.withTimeout(10_000) { coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+        assertEquals("$label: the decision's read failed once", listOf<Throwable>(failure), storeLoadFault.thrown.toList().drop(thrownBefore))
+        assertEquals("$label: one candidate held", 1, coordinator.heldLossCandidateCount())
+        val deniedBefore = recoveryIdentityDenials.get()
+        recoveryIdentityReadable = false
+        issuerIdentityReadable = true
+        awaitTrue("$label: a candidate recovery round met the unreadable identity", deadline) { recoveryIdentityDenials.get() > deniedBefore }
+        val facts = coordinator.accessSnapshot.facts
+        assertTrue("$label: premise: the USER hold is published ($facts)",
+            com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in facts.userBlocks && !facts.userAllowed)
+    }
+
+    /**
+     * C01 (라): releases a USER hold through D3 (the 3d device of [releaseCapabilityHoldByD3]): the candidate's check reads a
+     * different identity of the same uid once, so it is Stale and only the candidate is released; the user is allowed again.
+     * Premium KRX-visible answers are queued for any later entitlements call. No Main step.
+     */
+    private suspend fun Rig.releaseUserHoldByD3(label: String, deadline: Long) {
+        val live = checkNotNull(provider.currentIdentityFence())
+        val hitsBefore = synchronized(differentRecoveryHits) { differentRecoveryHits.size }
+        repeat(3) { entitlements += ok(premiumKrxVisible) }
+        differentRecoveryIdentity.set(com.jay.fxi.data.entitlements.EntitlementsIdentity(live.uid, live.authGeneration + 1))
+        recoveryIdentityReadable = true
+        awaitTrue("$label: the candidate is released", deadline) { coordinator.heldLossCandidateCount() == 0 }
+        awaitTrue("$label: the user is allowed again", deadline) { coordinator.accessSnapshot.facts.userAllowed }
+        val hits = synchronized(differentRecoveryHits) { differentRecoveryHits.drop(hitsBefore) }
+        assertEquals("$label: D3 answered exactly once ($hits)", 1, hits.size)
+        assertTrue("$label: inside the issuer's candidate check ($hits)", hits.single().endsWith(": PremiumAccessCoordinator.checkCandidateLocked"))
         assertNull("$label: D3 is spent", differentRecoveryIdentity.get())
     }
 
