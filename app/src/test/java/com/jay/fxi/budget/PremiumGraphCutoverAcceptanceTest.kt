@@ -113,6 +113,7 @@ import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
+import org.junit.experimental.categories.Category
 import org.junit.rules.TemporaryFolder
 import retrofit2.Retrofit
 
@@ -143,6 +144,8 @@ class PremiumGraphCutoverAcceptanceTest {
         const val PREMIUM_HIDDEN = """{"krx_visible":false,"premium_active":true}"""
         /** The test-only request header [permitAtSend] fills. */
         const val PERMIT_HEADER = "X-Cut-Permit"
+        /** S4 C02 A05t: how late after its target the identity change may start and still count as that row's time. */
+        const val A05T_TOLERANCE_MS = 100L
     }
 
     @get:Rule val folder = TemporaryFolder()
@@ -429,6 +432,16 @@ class PremiumGraphCutoverAcceptanceTest {
                     real.markMayContainData(premium, krx).also { marks.incrementAndGet() }
                 override suspend fun load(): com.jay.fxi.data.entitlements.AccessEpochRecord {
                     storeLoadFault.throwIfTargeted()
+                    // S4 C02 L1(b): logged on the caller's thread before any suspension, then held once on the armed thread. The
+                    // thread name without the " @name#n" that coroutine debug mode appends while a coroutine runs on it.
+                    val thread = Thread.currentThread().name.substringBefore(" @")
+                    if (loadLogOn) loadLog += thread to nowMillis()
+                    loadHold.get()?.let { armed ->
+                        if (thread == armed.first && loadHold.compareAndSet(armed, null)) {
+                            loadHoldHit.complete(Unit)
+                            armed.second.await()
+                        }
+                    }
                     return real.load()
                 }
                 override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean): com.jay.fxi.data.entitlements.AccessEpochRecord {
@@ -440,6 +453,14 @@ class PremiumGraphCutoverAcceptanceTest {
         /** B1: the store's read and rotation write, each failing once on the call path a row arms; every other call is real. */
         val storeLoadFault = TargetedFault()
         val storeRotationFault = TargetedFault()
+        /** S4 C02 L1(b): while on, every store read as (thread, time), in order. */
+        @Volatile var loadLogOn = false
+        val loadLog: MutableList<Pair<String, Long>> = Collections.synchronizedList(mutableListOf())
+        /** S4 C02 L1(b): while set, the first store read on that thread name suspends until the deferred completes. */
+        val loadHold = java.util.concurrent.atomic.AtomicReference<Pair<String, kotlinx.coroutines.CompletableDeferred<Unit>>?>(null)
+        val loadHoldHit = kotlinx.coroutines.CompletableDeferred<Unit>()
+        /** S4 C02 L1(b): each production fetch's return, as (thread, time). */
+        val fetchReturns: MutableList<Pair<String, Long>> = Collections.synchronizedList(mutableListOf())
         /** B1: while false, only the issuer's candidate recovery reads no live identity; its answer decisions read it as usual. */
         @Volatile var recoveryIdentityReadable = true
         /** B1: how many candidate recovery identity reads that fault answered unreadable (the recovery's IdentityUnknown). */
@@ -459,7 +480,8 @@ class PremiumGraphCutoverAcceptanceTest {
                     val frame = Thread.currentThread().stackTrace.first { f -> f.methodName == "checkCandidateLocked" }
                     differentRecoveryHits += "${Thread.currentThread().name}: ${frame.className.substringAfterLast('.')}.${frame.methodName}"
                 }
-            })
+            },
+            { fetchReturns += Thread.currentThread().name.substringBefore(" @") to nowMillis() })
         val uses = SnapshotTopicUseAuthority { coordinator.accessSnapshot }
         val tabs = Tabs(FreeTab.USD)
         val reports: MutableList<Throwable> = Collections.synchronizedList(mutableListOf())
@@ -700,7 +722,9 @@ class PremiumGraphCutoverAcceptanceTest {
         identityReadable: () -> Boolean,
         recoveryIdentityReadable: () -> Boolean = { true },
         onRecoveryDenied: () -> Unit = {},
-        differentRecoveryIdentityOnce: () -> com.jay.fxi.data.entitlements.EntitlementsIdentity? = { null }
+        differentRecoveryIdentityOnce: () -> com.jay.fxi.data.entitlements.EntitlementsIdentity? = { null },
+        /** S4 C02 L1(b): called on the querying coroutine's thread right after the production fetch returns. */
+        onFetchReturned: () -> Unit = {}
     ): PremiumAccessCoordinator {
         // The production binding for both purgers: it answers Deferred, so every journal entry stays owed.
         val purger = UnimplementedScopePurger()
@@ -708,7 +732,7 @@ class PremiumGraphCutoverAcceptanceTest {
             // The production source; only its identity read can be held unreadable, as Firebase can be for the issuer alone.
             source = AuthenticatedEntitlementsSource(api).let { real ->
                 object : com.jay.fxi.data.entitlements.EntitlementsSource {
-                    override suspend fun fetch(freshPremium: Boolean) = real.fetch(freshPremium)
+                    override suspend fun fetch(freshPremium: Boolean) = real.fetch(freshPremium).also { onFetchReturned() }
                     override suspend fun currentIdentity(): com.jay.fxi.data.entitlements.EntitlementsIdentity? {
                         if (!identityReadable()) return null
                         // Read before any suspension, so the stack is the caller's: the candidate recovery's own check only.
@@ -1782,7 +1806,9 @@ class PremiumGraphCutoverAcceptanceTest {
      * held, entries, the catalog, failures and protected slots are gone and the old request is no longer owned; the old 3m
      * body then ends and is never applied; released, the new context refills.
      */
-    private fun identityChangedRow(label: String, merged: Boolean) = runBlocking {
+    private fun identityChangedRow(label: String, merged: Boolean, changeAt: Long? = null) = runBlocking {
+        // S4 C02 A05t (cut_c02_m1_agreed.r1.md): [changeAt] times a merged change from the cold start's first send (T0).
+        require(changeAt == null || merged) { "A05t times the merged delivery only" }
         val start = nowMillis()
         val deadline = start + 40_000
         val holdNewTabs = java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CountDownLatch?>(null)
@@ -1803,7 +1829,8 @@ class PremiumGraphCutoverAcceptanceTest {
             val f1 = checkNotNull(rig.bridge())
             // The cold start's burst settles first: an identity change 1.6 s after it exceeds the budget on its own
             // (cut_c0102_observations/RT01-A05_merged_identity_change_1600ms_after_cold_start.md), which is not this row's contract.
-            quiet("$label settle", 3_500)
+            // A C02 A05t measurement row has no settle: it changes the identity at T0 + changeAt below.
+            if (changeAt == null) quiet("$label settle", 3_500)
             val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
             rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
             awaitTrue("the 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.bodyEnd == null } }
@@ -1836,11 +1863,23 @@ class PremiumGraphCutoverAcceptanceTest {
             } else {
                 // Merged: the end, the new approval and the new grant all happen while the topic executor and Main are held.
                 val pullsBefore = rig.pulls.size
+                // S4 C02 A05t: T0 is the cold start's first physical send (not the timeline's origin); the change is aimed at T0 + t.
+                val t0 = sends.all().minOf { it.start }
+                val target = changeAt?.let { t0 + it }
+                val changedAt = java.util.concurrent.atomic.AtomicLong(-1)
+                val identityAt = java.util.concurrent.atomic.AtomicLong(-1)
+                if (target != null) {
+                    assertTrue("$label: premise: the change time is still ahead (now ${nowMillis()}, T0 $t0, target $target)\n${sends.timeline()}",
+                        nowMillis() <= target)
+                    while (nowMillis() < target) delay(1)
+                }
                 holding(holdMain()) {
                     val issued = holding(rig.holdRuntime()) {
                         // Bounded: a deliverer that took the issuer's lock just before the hold would keep it until the hold ends.
                         kotlinx.coroutines.withTimeout(10_000) {
+                            changedAt.set(nowMillis())
                             val next = rig.firebase.nextGeneration()
+                            identityAt.set(nowMillis())
                             rig.coordinator.onIdentityChanged(next)
                             rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
                             checkNotNull(rig.coordinator.topicGrantResult().fence)
@@ -1853,6 +1892,7 @@ class PremiumGraphCutoverAcceptanceTest {
                     println("CUT-C01 $label pulls after the hold: ${seen.map { it.fence?.grant }}")
                     assertTrue("$label: auxiliary: no pull after the hold returned an end without a grant: ${seen.map { it.fence?.grant }}",
                         seen.isNotEmpty() && seen.all { it.fence != null })
+                    if (target != null) reportA05tTiming(label, t0, target, changedAt.get(), identityAt.get())
                     issued
                 }
             }
@@ -7625,4 +7665,258 @@ class PremiumGraphCutoverAcceptanceTest {
         assertTrue("within the row deadline", nowMillis() - start <= 40_000)
         ColdStartBudget.assertWithin(judgeRow("A04d"))
     }
+
+    // --- S4 CUT-C02 (b′) measurement bundle 1 (cut_c02_bprime_agreed.r1.md, cut_c02_m1_agreed.r1.md) ---------------------------
+    // These rows run only in testC02Measurement. Each judges every physical send of its run against the existing budget and
+    // fails over it as it is; the list is tools/contracts/c02_measurement_cases.json, the table c02_measurement_table.py.
+
+    private fun entitlementsSends() = sends.all().count { it.path == "/api/entitlements" }
+
+    /**
+     * S4 C02 A05t: the change's timing against T0 — the generation change's start, the onIdentityChanged call and the first
+     * entitlements send after it, each from T0; a change starting later than the tolerance leaves the target time unmet.
+     */
+    private fun reportA05tTiming(label: String, t0: Long, target: Long, changed: Long, identityCalled: Long) {
+        val send = sends.all().filter { it.path == "/api/entitlements" && it.start >= changed }.minOfOrNull { it.start }
+        println("C02M-TIMING $label: T0=$t0 target=+${target - t0} generationChange=+${changed - t0} " +
+            "onIdentityChanged=+${identityCalled - t0} entitlements=${send?.let { "+${it - t0}" }}")
+        assertTrue("$label: the change started within $A05T_TOLERANCE_MS ms of its target (target +${target - t0}, changed +${changed - t0})",
+            changed >= target && changed - target <= A05T_TOLERANCE_MS)
+        assertNotNull("$label: the change's entitlements send was recorded", send)
+    }
+
+    /**
+     * S4 C02 L1(b): one named single-thread lane for a coroutine, so its store reads are told apart by thread and its thread
+     * shows whether it is still running coordinator code or parked outside it (a suspended coroutine leaves no frame).
+     */
+    private class Lane(val name: String) : AutoCloseable {
+        private val thread = java.util.concurrent.atomic.AtomicReference<Thread?>(null)
+        private val executor = Executors.newSingleThreadExecutor { r -> Thread(r, name).also { thread.set(it) } }
+        val dispatcher = executor.asCoroutineDispatcher()
+
+        /** The lane's thread waits for work and no coordinator frame is on it. */
+        fun parkedOutsideCoordinator(): Boolean {
+            val t = thread.get() ?: return false
+            val waiting = t.state == Thread.State.WAITING || t.state == Thread.State.TIMED_WAITING
+            return waiting && t.stackTrace.none { it.className.startsWith("com.jay.fxi.data.entitlements.PremiumAccessCoordinator") }
+        }
+
+        override fun close() {
+            executor.shutdownNow()
+        }
+    }
+
+    /** The common preparation of the L1 rows: an approved cold start whose sends have settled, as in A05. */
+    private suspend fun Rig.prepareL1(label: String, deadline: Long) {
+        coldStart(deadline)
+        awaitTrue("$label: the tab applied", deadline) { usdApplied() }
+        awaitTopics(deadline)
+        quiet("$label settle", 3_500)
+    }
+
+    /**
+     * C02M-L1a: with the first FORCE_PREMIUM's answer held at the server, five more for the same owner each reach the latch
+     * check (each logs its admission store read, the read just before the latch, PremiumAccessCoordinator.kt:1572-1576) and
+     * return while the first is still held, sending nothing; once released the first finishes: one physical send in all,
+     * answered 200 with no 401 replay.
+     */
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-L1a five more forced premium calls while the first fetch is held send nothing`() = runBlocking {
+        val label = "C02M-L1a"
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        val lanes = (1..6).map { Lane("c02m-l1a-$it") }
+        try {
+            rig.row {
+                rig.prepareL1(label, deadline)
+                val before = entitlementsSends()
+                val heldBefore = entitlementsHeld.get()
+                val returnsBefore = rig.fetchReturns.size
+                rig.loadLogOn = true
+                entitlementsGate = java.util.concurrent.CountDownLatch(1)
+                val first = async(lanes[0].dispatcher) { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                awaitTrue("$label: the first request reached the server", deadline) { entitlementsHeld.get() == heldBefore + 1 }
+                val others = lanes.drop(1).map { lane -> async(lane.dispatcher) { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) } }
+                kotlinx.coroutines.withTimeout(10_000) { others.forEach { it.await() } }
+                val othersReturnedAt = nowMillis()
+                val held = sends.all().filter { it.path == "/api/entitlements" }.drop(before)
+                assertFalse("$label: the first is still held when the five returned", first.isCompleted)
+                assertTrue("$label: the held exchange has not ended and the first lane's fetch has not returned: $held",
+                    held.size == 1 && held.single().end == null &&
+                        synchronized(rig.fetchReturns) { rig.fetchReturns.drop(returnsBefore) }.none { it.first == lanes[0].name })
+                val reads = synchronized(rig.loadLog) { rig.loadLog.toList() }
+                lanes.drop(1).forEach { lane ->
+                    assertEquals("$label: ${lane.name} reached the latch check (one admission store read)", 1, reads.count { it.first == lane.name })
+                }
+                assertEquals("$label: the five sent nothing", before + 1, entitlementsSends())
+                entitlementsGate?.countDown()
+                entitlementsGate = null
+                kotlinx.coroutines.withTimeout(10_000) { first.await() }
+                awaitTrue("$label: settled", deadline) { sends.all().all { it.bodyEnd != null } }
+                val firstLane = synchronized(rig.loadLog) { rig.loadLog.filter { it.first == lanes[0].name } }
+                val returns = synchronized(rig.fetchReturns) { rig.fetchReturns.drop(returnsBefore) }
+                println("C02M-ORDER $label: others returned @$othersReturnedAt; first lane store reads (admission, then apply) $firstLane; " +
+                    "fetch returns $returns")
+                assertEquals("$label: one physical send in all, answered 200 (no 401 replay)", listOf<Int?>(200),
+                    sends.all().filter { it.path == "/api/entitlements" }.drop(before).map { it.status })
+            }
+        } finally {
+            rig.loadLogOn = false
+            entitlementsGate?.countDown()
+            entitlementsGate = null
+            lanes.forEach { it.close() }
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * C02M-L1b: a FORCE_PREMIUM entering after the first's latch is released but before the first's answer is applied is
+     * admitted and sends its own request. The order is forced, not timed: an occupier ([PremiumAccessCoordinator.topicGrantResult],
+     * its store read held) owns the coordinator's lock while the first fetch returns, so the first's release waits for the lock;
+     * the second is queued behind it; the lock is first-come first-served. The order is then read, not assumed: inside the
+     * lock the second's first store read comes before the first's apply read, and after the gate exactly one fetch returned on
+     * each of the two lanes and nothing else, both answered 200 — so the second passed the latch (a second turned away there
+     * reads the store too, PremiumAccessCoordinator.kt:1572-1576, but fetches nothing). The budget is judged before the order
+     * is asserted, so a run whose order is not secured ("순서 미확보") still keeps its verdict.
+     */
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-L1b a forced premium call entering between the latch release and the apply sends a second request`() = runBlocking {
+        val label = "C02M-L1b"
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        val first = Lane("c02m-l1b-first")
+        val occupier = Lane("c02m-l1b-occupier")
+        val second = Lane("c02m-l1b-second")
+        val occupy = kotlinx.coroutines.CompletableDeferred<Unit>()
+        var orderSecured = false
+        var orderEvidence = "the row ended before the order was read"
+        try {
+            rig.row {
+                rig.prepareL1(label, deadline)
+                val grant = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                val before = entitlementsSends()
+                val heldBefore = entitlementsHeld.get()
+                rig.loadLogOn = true
+                entitlementsGate = java.util.concurrent.CountDownLatch(1)
+                val a = async(first.dispatcher) { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                awaitTrue("$label: the first request reached the server", deadline) { entitlementsHeld.get() == heldBefore + 1 }
+                rig.loadHold.set(occupier.name to occupy)
+                val x = async(occupier.dispatcher) { rig.coordinator.topicGrantResult() }
+                awaitTrue("$label: the occupier holds the lock in its store read", deadline) { rig.loadHoldHit.isCompleted }
+                val returnsBefore = rig.fetchReturns.size
+                val readsBefore = synchronized(rig.loadLog) { rig.loadLog.size }
+                entitlementsGate?.countDown()
+                entitlementsGate = null
+                awaitTrue("$label: the first fetch returned on its lane", deadline) {
+                    synchronized(rig.fetchReturns) { rig.fetchReturns.drop(returnsBefore) }.any { it.first == first.name }
+                }
+                // After the fetch returns, the first's next suspension is its release's lock: parked means queued there.
+                awaitTrue("$label: the first's release waits for the lock (its lane parked outside the coordinator)", deadline) {
+                    first.parkedOutsideCoordinator()
+                }
+                assertFalse("$label: the first has not finished", a.isCompleted)
+                assertFalse("$label: the occupier still holds the lock", x.isCompleted)
+                val secondEntered = java.util.concurrent.atomic.AtomicBoolean(false)
+                val b = async(second.dispatcher) {
+                    secondEntered.set(true)
+                    rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+                }
+                // The second's first suspension is refresh's lock (PremiumAccessCoordinator.kt:1534): parked means queued there.
+                awaitTrue("$label: the second waits for the lock behind the release", deadline) {
+                    secondEntered.get() && second.parkedOutsideCoordinator() && !b.isCompleted
+                }
+                occupy.complete(Unit)
+                kotlinx.coroutines.withTimeout(10_000) {
+                    x.await()
+                    a.await()
+                    b.await()
+                }
+                awaitTrue("$label: settled", deadline) { sends.all().all { it.bodyEnd != null } }
+                val reads = synchronized(rig.loadLog) { rig.loadLog.drop(readsBefore) }
+                val secondRead = reads.indexOfFirst { it.first == second.name }
+                val firstApplyRead = reads.indexOfFirst { it.first == first.name }
+                val returns = synchronized(rig.fetchReturns) { rig.fetchReturns.drop(returnsBefore) }.map { it.first }
+                val statuses = sends.all().filter { it.path == "/api/entitlements" }.drop(before).map { it.status }
+                orderSecured = secondRead >= 0 && firstApplyRead >= 0 && secondRead < firstApplyRead &&
+                    returns.sorted() == listOf(first.name, second.name).sorted() && statuses == listOf<Int?>(200, 200)
+                orderEvidence = "second's first read #$secondRead, first's apply read #$firstApplyRead (store reads after the gate " +
+                    "${reads.filter { it.first.startsWith("c02m-") }}), fetch returns after the gate $returns, entitlements statuses $statuses"
+                println("C02M-ORDER $label: $orderEvidence")
+                assertEquals("$label: the same grant", grant, rig.coordinator.topicGrantResult().fence)
+            }
+        } finally {
+            occupy.complete(Unit)
+            rig.loadHold.set(null)
+            rig.loadLogOn = false
+            entitlementsGate?.countDown()
+            entitlementsGate = null
+            listOf(first, occupier, second).forEach { it.close() }
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        val verdict = judgeRow(label)
+        assertTrue("$label: 순서 미확보 — $orderEvidence", orderSecured)
+        ColdStartBudget.assertWithin(verdict)
+    }
+
+    /**
+     * C02M-L1c: A03a's failing condition as it was: six FORCE_ENTITLEMENTS re-confirmations of the same grant right after the
+     * cold start, one after another with no added gap (A03a itself is the spaced control), with A03a's checks: the grant kept,
+     * the six sent, no graph send and one connection. Kept failing evidence: cut_c0102_observations/A03a_burst_excess.xml.
+     */
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-L1c six back-to-back forced entitlements calls are measured against the budget`() = runBlocking {
+        val label = "C02M-L1c"
+        val start = nowMillis()
+        val deadline = start + 30_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            rig.coldStart(deadline)
+            awaitTrue("$label: the tab applied", deadline) { rig.usdApplied() }
+            rig.awaitTopics(deadline)
+            val grant = checkNotNull(rig.coordinator.topicGrantResult().fence)
+            val graphBefore = graph().size
+            val before = entitlementsSends()
+            repeat(6) {
+                rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+                assertEquals("$label: re-confirmation ${it + 1} keeps the grant", grant, rig.coordinator.topicGrantResult().fence)
+            }
+            assertEquals("$label: the six re-confirmations were sent", before + 6, entitlementsSends())
+            quiet(label, 5_000)
+            assertEquals("$label: no graph send for a re-confirmation", graphBefore, graph().size)
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 30_000)
+        val verdict = judgeRow(label)
+        assertEquals("$label: one connection", 1, handshakes().size)
+        ColdStartBudget.assertWithin(verdict)
+    }
+
+    /** C02M-A05t: RT01-A05 merged with the same-user change aimed at the cold start's first send + t, instead of after a settle. */
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-A05t1600 a same-user change merged 1_6 s after the cold start's first send is measured`() =
+        identityChangedRow("C02M-A05t1600", merged = true, changeAt = 1_600)
+
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-A05t2000 a same-user change merged 2_0 s after the cold start's first send is measured`() =
+        identityChangedRow("C02M-A05t2000", merged = true, changeAt = 2_000)
+
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-A05t2500 a same-user change merged 2_5 s after the cold start's first send is measured`() =
+        identityChangedRow("C02M-A05t2500", merged = true, changeAt = 2_500)
+
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-A05t3000 a same-user change merged 3_0 s after the cold start's first send is measured`() =
+        identityChangedRow("C02M-A05t3000", merged = true, changeAt = 3_000)
 }

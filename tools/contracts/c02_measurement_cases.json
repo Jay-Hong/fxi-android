@@ -1,0 +1,21 @@
+{
+  "class": "com.jay.fxi.budget.PremiumGraphCutoverAcceptanceTest",
+  "note": "S4 CUT-C02 (b′) measurement rows (cut_c02_bprime_agreed.r1.md, cut_c02_m1_agreed.r1.md). Run by testC02Measurement only. Every name must run once and pass; a row over the budget fails as it is, and a listed row not yet written is missing, which leaves C02 not passed.",
+  "cases": [
+    "C02M-A05t1600 a same-user change merged 1_6 s after the cold start's first send is measured",
+    "C02M-A05t2000 a same-user change merged 2_0 s after the cold start's first send is measured",
+    "C02M-A05t2500 a same-user change merged 2_5 s after the cold start's first send is measured",
+    "C02M-A05t3000 a same-user change merged 3_0 s after the cold start's first send is measured",
+    "C02M-B1 a sign-out recovery barrier release asks the server once and is measured",
+    "C02M-G1 three identity generations over held bodies apply only the latest and are measured",
+    "C02M-K1a a socket KRX refusal against KRX-visible entitlements answers is measured for 60 s",
+    "C02M-K1b repeated KRX-required entitlements answers after a socket refusal are measured for 60 s",
+    "C02M-K1c a refusal that re-arms during a running scheduled query is measured",
+    "C02M-L1a five more forced premium calls while the first fetch is held send nothing",
+    "C02M-L1b a forced premium call entering between the latch release and the apply sends a second request",
+    "C02M-L1c six back-to-back forced entitlements calls are measured against the budget",
+    "C02M-M1a a sign-in change, a purchase signal and a KRX refusal within 2 s with the scheduled query first are measured",
+    "C02M-M1b a sign-in change, a purchase signal and a KRX refusal within 2 s with the identity change first are measured",
+    "C02M-P1 a purchase probe against inactive answers sends five ticks and joins further signals"
+  ]
+}

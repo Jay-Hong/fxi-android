@@ -286,7 +286,7 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
 // S4 CUT-C01·C02: the production-composition cutover acceptance runs on the real clock for many minutes, so no ordinary
 // unit-test task runs it; its own task runs it once per candidate in a required CI job, which checks the exact case list.
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
-    if (name != "testCutoverAcceptance") {
+    if (name != "testCutoverAcceptance" && name != "testC02Measurement") {
         filter.excludeTestsMatching("*.PremiumGraphCutoverAcceptanceTest")
     }
 }
@@ -303,7 +303,28 @@ tasks.register<org.gradle.api.tasks.testing.Test>("testCutoverAcceptance") {
     filter.isFailOnNoMatchingTests = true
     reports.junitXml.outputLocation.set(layout.buildDirectory.dir("test-results/cutoverAcceptance"))
     reports.html.outputLocation.set(layout.buildDirectory.dir("reports/tests/cutoverAcceptance"))
+    // S4 CUT-C02 (b′): the same class's measurement rows run only in testC02Measurement, so this list stays the cutover's.
+    useJUnit { excludeCategories("com.jay.fxi.budget.C02Measurement") }
     // Every candidate runs it again: its evidence is the physical sends of this run, never a cached result.
+    outputs.upToDateWhen { false }
+    testLogging.showStandardStreams = true
+}
+// S4 CUT-C02 (b′) (cut_c02_bprime_agreed.r1.md, cut_c02_m1_agreed.r1.md): the measurement rows of the same harness, on the
+// real clock. Each row passes or fails on its own budget; its list and table are tools/contracts/c02_measurement_*.
+tasks.register<org.gradle.api.tasks.testing.Test>("testC02Measurement") {
+    val debugUnitTestForMeasurement = tasks.named<org.gradle.api.tasks.testing.Test>("testDebugUnitTest")
+    group = "verification"
+    description = "Runs only the S4 CUT-C02 measurement rows (production composition, real clock)"
+    dependsOn("compileDebugUnitTestKotlin", "compileDebugUnitTestJavaWithJavac", "processDebugUnitTestJavaRes")
+    testClassesDirs = debugUnitTestForMeasurement.get().testClassesDirs
+    classpath = debugUnitTestForMeasurement.get().classpath
+    filter.includeTestsMatching("*.PremiumGraphCutoverAcceptanceTest")
+    filter.isFailOnNoMatchingTests = true
+    useJUnit { includeCategories("com.jay.fxi.budget.C02Measurement") }
+    reports.junitXml.outputLocation.set(layout.buildDirectory.dir("test-results/c02Measurement"))
+    // Each row's own output sits in its testcase element, so the table links a row to its timeline and verdict.
+    reports.junitXml.isOutputPerTestCase = true
+    reports.html.outputLocation.set(layout.buildDirectory.dir("reports/tests/c02Measurement"))
     outputs.upToDateWhen { false }
     testLogging.showStandardStreams = true
 }
