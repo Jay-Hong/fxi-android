@@ -470,6 +470,12 @@ class PremiumGraphCutoverAcceptanceTest {
                 }
                 override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean): com.jay.fxi.data.entitlements.AccessEpochRecord {
                     storeRotationFault.throwIfTargeted()
+                    // C01 (가) USER_UNCERTAIN: one armed hold parks this write before the real store call (suspending, not blocking).
+                    storeRotationHold.getAndSet(null)?.let { (entered, release) ->
+                        entered.complete(RotationHoldHit(rotateUser, rotateKrx, Thread.currentThread().stackTrace.take(24)
+                            .joinToString(" < ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }))
+                        release.await()
+                    }
                     return real.beginRotation(rotateUser, rotateKrx)
                 }
             }
@@ -477,6 +483,9 @@ class PremiumGraphCutoverAcceptanceTest {
         /** B1: the store's read and rotation write, each failing once on the call path a row arms; every other call is real. */
         val storeLoadFault = TargetedFault()
         val storeRotationFault = TargetedFault()
+        /** C01 (가): a one-shot hold on the store's rotation write — completed with the call when it parks, released by the row. */
+        val storeRotationHold = java.util.concurrent.atomic.AtomicReference<
+            Pair<kotlinx.coroutines.CompletableDeferred<RotationHoldHit>, kotlinx.coroutines.CompletableDeferred<Unit>>?>(null)
         /** S4 C02 L1(b): while on, every store read as (thread, time), in order. */
         @Volatile var loadLogOn = false
         val loadLog: MutableList<Pair<String, Long>> = Collections.synchronizedList(mutableListOf())
@@ -2418,7 +2427,8 @@ class PremiumGraphCutoverAcceptanceTest {
     )
 
     private enum class AccessCase {
-        RESOLVING, PENDING_NO_GRANT, KEPT_PENDING, KEPT_5XX, DELETION_REQUESTING, DELETION_DELETED, USER_P4, CAPABILITY_P4, CAPABILITY_SEAL
+        RESOLVING, PENDING_NO_GRANT, KEPT_PENDING, KEPT_5XX, DELETION_REQUESTING, DELETION_DELETED, USER_P4, CAPABILITY_P4, CAPABILITY_SEAL,
+        USER_UNCERTAIN, USER_SEAL
     }
 
     /** The design §4 table: blocked; kept grant allowed with its capability; capability-only blocks KRX alone. */
@@ -2523,153 +2533,214 @@ class PremiumGraphCutoverAcceptanceTest {
                 val userEndsBefore = rig.coordinator.accessSnapshot.lastUserEnd?.sequence ?: 0L
                 val capEndsBefore = rig.coordinator.accessSnapshot.lastCapabilityEnd?.sequence ?: 0L
 
-                // Enter the state.
-                when (case) {
-                    AccessCase.RESOLVING, AccessCase.PENDING_NO_GRANT -> {
-                        entitlementsGate = java.util.concurrent.CountDownLatch(1)
-                        val next = rig.firebase.nextGeneration()
-                        rig.coordinator.onIdentityChanged(next)
-                        if (case == AccessCase.PENDING_NO_GRANT) {
-                            entitlementsGate?.countDown(); entitlementsGate = null
-                            entitlements += ok("""{"krx_visible":true,"premium_pending":true,"retry_after_seconds":60}""")
-                            kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
-                            assertTrue("$label: premise: pending with no grant (${rig.coordinator.state.value.state})",
-                                rig.coordinator.state.value.state is PremiumAccessState.Pending && rig.coordinator.topicGrantResult().fence == null)
-                        } else {
-                            // Resolving: the new identity's decision is in flight, its answer held at the server.
-                            entitlements += ok(premiumKrxVisible)
-                            resolving.set(CoroutineScope(rig.ioJob + Dispatchers.IO).launch {
-                                runCatching { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                // C01 (가): a parked rotation write is released inside the row, before anything waits on the IO work or finish().
+                val rotationRelease = kotlinx.coroutines.CompletableDeferred<Unit>()
+                val uncertainRefresh = java.util.concurrent.atomic.AtomicReference<Job?>(null)
+                try {
+                    // Enter the state.
+                    when (case) {
+                        AccessCase.RESOLVING, AccessCase.PENDING_NO_GRANT -> {
+                            entitlementsGate = java.util.concurrent.CountDownLatch(1)
+                            val next = rig.firebase.nextGeneration()
+                            rig.coordinator.onIdentityChanged(next)
+                            if (case == AccessCase.PENDING_NO_GRANT) {
+                                entitlementsGate?.countDown(); entitlementsGate = null
+                                entitlements += ok("""{"krx_visible":true,"premium_pending":true,"retry_after_seconds":60}""")
+                                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                                assertTrue("$label: premise: pending with no grant (${rig.coordinator.state.value.state})",
+                                    rig.coordinator.state.value.state is PremiumAccessState.Pending && rig.coordinator.topicGrantResult().fence == null)
+                            } else {
+                                // Resolving: the new identity's decision is in flight, its answer held at the server.
+                                entitlements += ok(premiumKrxVisible)
+                                resolving.set(CoroutineScope(rig.ioJob + Dispatchers.IO).launch {
+                                    runCatching { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                                })
+                                awaitTrue("$label: the new identity's entitlements answer is held", deadline) { entitlementsHeld.get() >= 1 }
+                                assertEquals("$label: premise: resolving", PremiumAccessState.NoGrant, rig.coordinator.state.value.state)
+                            }
+                        }
+                        AccessCase.KEPT_PENDING, AccessCase.KEPT_5XX -> {
+                            entitlements += if (case == AccessCase.KEPT_PENDING) ok("""{"krx_visible":true,"premium_pending":true,"retry_after_seconds":60}""")
+                            else MockResponse().setResponseCode(503).setBody("""{"detail":"unavailable"}""")
+                            kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                            assertEquals("$label: premise: the grant is kept", PremiumAccessState.PremiumConfirmed, rig.coordinator.state.value.state)
+                        }
+                        AccessCase.DELETION_REQUESTING, AccessCase.DELETION_DELETED -> {
+                            onDelete = {
+                                if (case == AccessCase.DELETION_REQUESTING) holdDelete.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                                MockResponse().setResponseCode(204)
+                            }
+                            val owner = checkNotNull(rig.provider.currentIdentityFence())
+                            deletion.set(CoroutineScope(rig.ioJob + Dispatchers.IO).launch {
+                                runCatching { com.jay.fxi.ui.settings.AccountDeletionServerStage(rig.api, rig.deletions).execute(owner) { it } }
                             })
-                            awaitTrue("$label: the new identity's entitlements answer is held", deadline) { entitlementsHeld.get() >= 1 }
-                            assertEquals("$label: premise: resolving", PremiumAccessState.NoGrant, rig.coordinator.state.value.state)
+                            val phase = if (case == AccessCase.DELETION_REQUESTING) com.jay.fxi.data.entitlements.DeletionAdmissionPhase.REQUESTING_SERVER
+                            else com.jay.fxi.data.entitlements.DeletionAdmissionPhase.SERVER_DELETED
+                            awaitTrue("$label: the deletion admission is $phase", deadline) { rig.deletions.records.any { it.phase == phase } }
+                        }
+                        AccessCase.USER_P4, AccessCase.CAPABILITY_P4 -> {
+                            val failure = java.io.IOException("access record unreadable")
+                            rig.storeLoadFault.arm(failure) { isIssuerDecision(it) }
+                            rig.issuerIdentityReadable = false
+                            entitlements += if (case == AccessCase.USER_P4) ok("""{"krx_visible":true,"premium_active":false,"premium_pending":false}""")
+                            else ok(PREMIUM_HIDDEN)
+                            kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                            assertEquals("$label: the decision's read failed once", listOf<Throwable>(failure), rig.storeLoadFault.thrown.toList())
+                            assertEquals("$label: one candidate held", 1, rig.coordinator.heldLossCandidateCount())
+                            val deniedBefore = rig.recoveryIdentityDenials.get()
+                            rig.recoveryIdentityReadable = false
+                            rig.issuerIdentityReadable = true
+                            awaitTrue("$label: a candidate recovery round met the unreadable identity", deadline) {
+                                rig.recoveryIdentityDenials.get() > deniedBefore
+                            }
+                            val facts = rig.coordinator.accessSnapshot.facts
+                            val blocks = if (case == AccessCase.USER_P4) facts.userBlocks else facts.capabilityBlocks
+                            assertTrue("$label: premise: the hold is published ($facts)", com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in blocks)
+                        }
+                        AccessCase.CAPABILITY_SEAL -> {
+                            rig.storeRotationFault.armPersistent(sealFailure) { it.methodName == "beginRotation" || it.className.contains("\$beginRotation\$") }
+                            entitlements += ok(PREMIUM_HIDDEN)
+                            kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                            val facts = rig.coordinator.accessSnapshot.facts
+                            assertEquals("$label: the first rotation write failed in the decision",
+                                listOf(SealPath.DECISION), rig.storeRotationFault.hits.toList().map(::sealPath).take(1))
+                            assertTrue("$label: premise: the capability is explicitly sealed ($facts)",
+                                com.jay.fxi.data.entitlements.TopicAccessBlock.EXPLICIT_SEAL in facts.capabilityBlocks && facts.userAllowed)
+                        }
+                        AccessCase.USER_UNCERTAIN -> {
+                            // A loss answer whose USER rotation write is parked before the real store call.
+                            val entered = kotlinx.coroutines.CompletableDeferred<RotationHoldHit>()
+                            rig.storeRotationHold.set(entered to rotationRelease)
+                            entitlements += ok(USER_LOSS_KRX_VISIBLE)
+                            uncertainRefresh.set(CoroutineScope(rig.ioJob + Dispatchers.IO).launch {
+                                runCatching { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                            })
+                            val hit = kotlinx.coroutines.withTimeout(10_000) { entered.await() }
+                            assertTrue("$label: premise: the parked write rotates USER on the decision path (${hit.rotateUser} ${sealPath(hit.stack)})",
+                                hit.rotateUser && sealPath(hit.stack) == SealPath.DECISION)
+                            assertUncertaintyHeld(label, rig, uncertainRefresh.get(), rotationRelease)
+                        }
+                        AccessCase.USER_SEAL -> {
+                            val seal = com.jay.fxi.data.entitlements.TopicAccessBlock.EXPLICIT_SEAL
+                            rig.storeRotationFault.armPersistent(sealFailure) { it.methodName == "beginRotation" || it.className.contains("\$beginRotation\$") }
+                            entitlements += ok(USER_LOSS_KRX_VISIBLE)
+                            kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                            assertEquals("$label: the first rotation write failed in the decision",
+                                listOf(SealPath.DECISION), rig.storeRotationFault.hits.toList().map(::sealPath).take(1))
+                            assertTrue("$label: premise: USER is explicitly sealed (${rig.coordinator.accessSnapshot.facts})",
+                                seal in rig.coordinator.accessSnapshot.facts.userBlocks)
+                            // The re-opening control: a fresh premium answer is sent, answered and decided, yet no grant is published.
+                            val asksBefore = entitlementsExchanges().size
+                            entitlements += ok(premiumKrxVisible)
+                            kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                            val asks = entitlementsExchanges().drop(asksBefore)
+                            assertTrue("$label: premise: the fresh premium ask went and was answered 200 (${asks.map { "${it.param("fresh_premium")} ${it.status}" }})",
+                                asks.any { it.param("fresh_premium") == "true" && it.status == 200 && it.bodyEnd != null })
+                            val facts = rig.coordinator.accessSnapshot.facts
+                            assertTrue("$label: the seal holds after the premium answer ($facts)", seal in facts.userBlocks)
+                            assertEquals("$label: the published state stays FreeConfirmed", PremiumAccessState.FreeConfirmed, rig.coordinator.state.value.state)
+                            assertEquals("$label: KRX stays hidden", com.jay.fxi.data.entitlements.KrxCapabilityState.HIDDEN, rig.coordinator.krx.value)
+                            assertNull("$label: no grant is issued", rig.coordinator.topicGrantResult().fence)
                         }
                     }
-                    AccessCase.KEPT_PENDING, AccessCase.KEPT_5XX -> {
-                        entitlements += if (case == AccessCase.KEPT_PENDING) ok("""{"krx_visible":true,"premium_pending":true,"retry_after_seconds":60}""")
-                        else MockResponse().setResponseCode(503).setBody("""{"detail":"unavailable"}""")
-                        kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
-                        assertEquals("$label: premise: the grant is kept", PremiumAccessState.PremiumConfirmed, rig.coordinator.state.value.state)
-                    }
-                    AccessCase.DELETION_REQUESTING, AccessCase.DELETION_DELETED -> {
-                        onDelete = {
-                            if (case == AccessCase.DELETION_REQUESTING) holdDelete.await(30, java.util.concurrent.TimeUnit.SECONDS)
-                            MockResponse().setResponseCode(204)
-                        }
-                        val owner = checkNotNull(rig.provider.currentIdentityFence())
-                        deletion.set(CoroutineScope(rig.ioJob + Dispatchers.IO).launch {
-                            runCatching { com.jay.fxi.ui.settings.AccountDeletionServerStage(rig.api, rig.deletions).execute(owner) { it } }
-                        })
-                        val phase = if (case == AccessCase.DELETION_REQUESTING) com.jay.fxi.data.entitlements.DeletionAdmissionPhase.REQUESTING_SERVER
-                        else com.jay.fxi.data.entitlements.DeletionAdmissionPhase.SERVER_DELETED
-                        awaitTrue("$label: the deletion admission is $phase", deadline) { rig.deletions.records.any { it.phase == phase } }
-                    }
-                    AccessCase.USER_P4, AccessCase.CAPABILITY_P4 -> {
-                        val failure = java.io.IOException("access record unreadable")
-                        rig.storeLoadFault.arm(failure) { isIssuerDecision(it) }
-                        rig.issuerIdentityReadable = false
-                        entitlements += if (case == AccessCase.USER_P4) ok("""{"krx_visible":true,"premium_active":false,"premium_pending":false}""")
-                        else ok(PREMIUM_HIDDEN)
-                        kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
-                        assertEquals("$label: the decision's read failed once", listOf<Throwable>(failure), rig.storeLoadFault.thrown.toList())
-                        assertEquals("$label: one candidate held", 1, rig.coordinator.heldLossCandidateCount())
-                        val deniedBefore = rig.recoveryIdentityDenials.get()
-                        rig.recoveryIdentityReadable = false
-                        rig.issuerIdentityReadable = true
-                        awaitTrue("$label: a candidate recovery round met the unreadable identity", deadline) {
-                            rig.recoveryIdentityDenials.get() > deniedBefore
-                        }
-                        val facts = rig.coordinator.accessSnapshot.facts
-                        val blocks = if (case == AccessCase.USER_P4) facts.userBlocks else facts.capabilityBlocks
-                        assertTrue("$label: premise: the hold is published ($facts)", com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in blocks)
-                    }
-                    AccessCase.CAPABILITY_SEAL -> {
-                        rig.storeRotationFault.armPersistent(sealFailure) { it.methodName == "beginRotation" || it.className.contains("\$beginRotation\$") }
-                        entitlements += ok(PREMIUM_HIDDEN)
-                        kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
-                        val facts = rig.coordinator.accessSnapshot.facts
-                        assertEquals("$label: the first rotation write failed in the decision",
-                            listOf(SealPath.DECISION), rig.storeRotationFault.hits.toList().map(::sealPath).take(1))
-                        assertTrue("$label: premise: the capability is explicitly sealed ($facts)",
-                            com.jay.fxi.data.entitlements.TopicAccessBlock.EXPLICIT_SEAL in facts.capabilityBlocks && facts.userAllowed)
-                    }
-                }
 
-                // Measure.
-                rig.onMain {
-                    val st = holder.currentState()
-                    println("CUT-C01 $label holder: content=${st.content} chart=${st.chart != null} inline=${st.inlineToken} preStateToken=$token period=${st.activePeriod} refreshing=${st.refreshing} owner=${rig.owner.consumer.currentState().ui.owner != null}")
-                }
-                val (generalRead, krxRead) = rig.onMain {
-                    val ids = rig.assembly.coordinator.protectedEntry(usd1d)?.tab?.graph?.series?.map { it.seriesId }.orEmpty()
-                    ("kb.usd" in ids) to ids.any { it.startsWith("krx.") }
-                }
-                val (generalRender, krxRender, krxPrepared) = rig.onMain {
-                    val chart = holder.currentState().chart
-                    Triple(chart != null && chart.renderedIds.any { !it.startsWith("krx.") }, chart?.renderedIds?.contains(krxId) == true,
-                        chart?.prepared?.bySeries?.keys?.any { it.startsWith("krx.") } == true)
-                }
-                val recorderRead = rig.onMain { rig.assembly.recorder.exposed(fenceBefore, lifetimeBefore).isNotEmpty() }
-                val useStarts = rig.bridge()?.let { rig.uses.acquire(it) } != null
-                val graphBefore = graph().size
-                rig.onMain { holder.selectPeriod(token, GraphPeriod.ONE_WEEK) }
-                delay(1_500)
-                val send = graph().drop(graphBefore).any { it.param("period") == "1w" }
-                val krx3m = { rig.writtenFiles().any { it.startsWith("krx/") && it.endsWith("/757364/3m.json") } }
-                assertFalse("$label: premise: no KRX 3m file before the answer", krx3m())
-                hold3m.countDown()
-                awaitTrue("$label: the held 3m answer ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
-                delay(1_000)
-                val (generalApplied, krxApplied, krxInStateRead) = rig.onMain {
-                    val c = rig.assembly.coordinator
-                    val key = c.state.value.entries.keys.firstOrNull { it.tab == "usd" && it.period.code == "3m" }
-                    val components = key?.let { rig.slotComponents(it) }
-                    val read = key?.let { c.protectedEntry(it) }?.tab?.graph?.series?.any { it.seriesId.startsWith("krx.") } == true
-                    Triple(key != null, components?.krx != null, read)
-                }
-                // The in-state answer on the screen: move to 3m with the token the screen offers now, if it offers one.
-                val moved = rig.onMain {
-                    holder.currentState().inlineToken?.let { holder.selectPeriod(it, GraphPeriod.THREE_MONTHS); true } ?: false
-                }
-                val inStateChart = if (!moved) null else {
-                    val until = nowMillis() + 2_000
-                    var chart: com.jay.fxi.ui.premium.graph.GraphV2ChartModel? = null
-                    while (chart == null && nowMillis() < until) {
-                        chart = rig.onMain { holder.currentState().takeIf { it.activePeriod == GraphPeriod.THREE_MONTHS }?.chart }
-                        if (chart == null) delay(20)
+                    // Measure.
+                    rig.onMain {
+                        val st = holder.currentState()
+                        println("CUT-C01 $label holder: content=${st.content} chart=${st.chart != null} inline=${st.inlineToken} preStateToken=$token period=${st.activePeriod} refreshing=${st.refreshing} owner=${rig.owner.consumer.currentState().ui.owner != null}")
                     }
-                    chart
-                }
-                val generalInStateRender = inStateChart?.renderedIds?.any { !it.startsWith("krx.") } == true
-                val krxInStateRender = inStateChart?.renderedIds?.contains(krxId) == true
-                val measured = AccessMatrix(generalRead, krxRead, generalRender, krxRender, krxPrepared, send, generalApplied, krxApplied,
-                    recorderRead, useStarts, krx3m(), krxInStateRead, generalInStateRender, krxInStateRender)
-                println("CUT-C01 $label matrix: $measured")
-                assertEquals("$label: the design §4 matrix", expected(case), measured)
-                if (case == AccessCase.CAPABILITY_SEAL) {
-                    // To the end of the measurement, after the late answer and the write check: still sealed, the user allowed.
-                    val facts = rig.coordinator.accessSnapshot.facts
-                    assertTrue("$label: the seal holds to the end ($facts)",
-                        com.jay.fxi.data.entitlements.TopicAccessBlock.EXPLICIT_SEAL in facts.capabilityBlocks && facts.userAllowed)
-                    val hits = rig.storeRotationFault.hits.toList()
-                    val thrown = rig.storeRotationFault.thrown.toList()
-                    val paths = hits.map(::sealPath)
-                    println("CUT-C01 $label rotation write failures: ${paths.groupingBy { it }.eachCount()} of ${hits.size}\n" + hits.joinToString("\n"))
-                    assertEquals("$label: every failure recorded once with its call path", hits.size, thrown.size)
-                    assertTrue("$label: every failure is the armed instance", thrown.all { it === sealFailure })
-                    assertTrue("$label: every failure is on the decision or the seal-keeping recovery: $hits", SealPath.OTHER !in paths)
-                    assertEquals("$label: the decision failed once, first", 1, paths.count { it == SealPath.DECISION })
-                }
-                if (case == AccessCase.USER_P4 || case == AccessCase.CAPABILITY_P4) {
-                    // To the end of the measurement: still a held candidate, not a confirmed loss.
-                    val snapshot = rig.coordinator.accessSnapshot
-                    val blocks = if (case == AccessCase.USER_P4) snapshot.facts.userBlocks else snapshot.facts.capabilityBlocks
-                    println("CUT-C01 $label recovery identity denials: ${rig.recoveryIdentityDenials.get()}")
-                    assertEquals("$label: the candidate is still held at the end", 1, rig.coordinator.heldLossCandidateCount())
-                    assertTrue("$label: the hold is still published at the end (${snapshot.facts})",
-                        com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in blocks)
-                    assertEquals("$label: no USER end", userEndsBefore, snapshot.lastUserEnd?.sequence ?: 0L)
-                    assertEquals("$label: no capability end", capEndsBefore, snapshot.lastCapabilityEnd?.sequence ?: 0L)
+                    val (generalRead, krxRead) = rig.onMain {
+                        val ids = rig.assembly.coordinator.protectedEntry(usd1d)?.tab?.graph?.series?.map { it.seriesId }.orEmpty()
+                        ("kb.usd" in ids) to ids.any { it.startsWith("krx.") }
+                    }
+                    val (generalRender, krxRender, krxPrepared) = rig.onMain {
+                        val chart = holder.currentState().chart
+                        Triple(chart != null && chart.renderedIds.any { !it.startsWith("krx.") }, chart?.renderedIds?.contains(krxId) == true,
+                            chart?.prepared?.bySeries?.keys?.any { it.startsWith("krx.") } == true)
+                    }
+                    val recorderRead = rig.onMain { rig.assembly.recorder.exposed(fenceBefore, lifetimeBefore).isNotEmpty() }
+                    val useStarts = rig.bridge()?.let { rig.uses.acquire(it) } != null
+                    val graphBefore = graph().size
+                    rig.onMain { holder.selectPeriod(token, GraphPeriod.ONE_WEEK) }
+                    delay(1_500)
+                    val send = graph().drop(graphBefore).any { it.param("period") == "1w" }
+                    val krx3m = { rig.writtenFiles().any { it.startsWith("krx/") && it.endsWith("/757364/3m.json") } }
+                    assertFalse("$label: premise: no KRX 3m file before the answer", krx3m())
+                    hold3m.countDown()
+                    awaitTrue("$label: the held 3m answer ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                    delay(1_000)
+                    val (generalApplied, krxApplied, krxInStateRead) = rig.onMain {
+                        val c = rig.assembly.coordinator
+                        val key = c.state.value.entries.keys.firstOrNull { it.tab == "usd" && it.period.code == "3m" }
+                        val components = key?.let { rig.slotComponents(it) }
+                        val read = key?.let { c.protectedEntry(it) }?.tab?.graph?.series?.any { it.seriesId.startsWith("krx.") } == true
+                        Triple(key != null, components?.krx != null, read)
+                    }
+                    // The in-state answer on the screen: move to 3m with the token the screen offers now, if it offers one.
+                    val moved = rig.onMain {
+                        holder.currentState().inlineToken?.let { holder.selectPeriod(it, GraphPeriod.THREE_MONTHS); true } ?: false
+                    }
+                    val inStateChart = if (!moved) null else {
+                        val until = nowMillis() + 2_000
+                        var chart: com.jay.fxi.ui.premium.graph.GraphV2ChartModel? = null
+                        while (chart == null && nowMillis() < until) {
+                            chart = rig.onMain { holder.currentState().takeIf { it.activePeriod == GraphPeriod.THREE_MONTHS }?.chart }
+                            if (chart == null) delay(20)
+                        }
+                        chart
+                    }
+                    val generalInStateRender = inStateChart?.renderedIds?.any { !it.startsWith("krx.") } == true
+                    val krxInStateRender = inStateChart?.renderedIds?.contains(krxId) == true
+                    val measured = AccessMatrix(generalRead, krxRead, generalRender, krxRender, krxPrepared, send, generalApplied, krxApplied,
+                        recorderRead, useStarts, krx3m(), krxInStateRead, generalInStateRender, krxInStateRender)
+                    println("CUT-C01 $label matrix: $measured")
+                    assertEquals("$label: the design §4 matrix", expected(case), measured)
+                    if (case == AccessCase.CAPABILITY_SEAL || case == AccessCase.USER_SEAL) {
+                        // To the end of the measurement, after the late answer and the write check: still sealed (the capability seal
+                        // with the user allowed; the USER seal on the user axis).
+                        val facts = rig.coordinator.accessSnapshot.facts
+                        if (case == AccessCase.CAPABILITY_SEAL) {
+                            assertTrue("$label: the seal holds to the end ($facts)",
+                                com.jay.fxi.data.entitlements.TopicAccessBlock.EXPLICIT_SEAL in facts.capabilityBlocks && facts.userAllowed)
+                        } else {
+                            assertTrue("$label: the USER seal holds to the end ($facts)",
+                                com.jay.fxi.data.entitlements.TopicAccessBlock.EXPLICIT_SEAL in facts.userBlocks)
+                        }
+                        val hits = rig.storeRotationFault.hits.toList()
+                        val thrown = rig.storeRotationFault.thrown.toList()
+                        val paths = hits.map(::sealPath)
+                        println("CUT-C01 $label rotation write failures: ${paths.groupingBy { it }.eachCount()} of ${hits.size}\n" + hits.joinToString("\n"))
+                        assertEquals("$label: every failure recorded once with its call path", hits.size, thrown.size)
+                        assertTrue("$label: every failure is the armed instance", thrown.all { it === sealFailure })
+                        assertTrue("$label: every failure is on the decision or the seal-keeping recovery: $hits", SealPath.OTHER !in paths)
+                        assertEquals("$label: the decision failed once, first", 1, paths.count { it == SealPath.DECISION })
+                    }
+                    if (case == AccessCase.USER_UNCERTAIN) {
+                        // To the end of the measurement: still parked, uncertain, the published state still granting; then released.
+                        assertUncertaintyHeld(label, rig, uncertainRefresh.get(), rotationRelease)
+                        rotationRelease.complete(Unit)
+                        val refresh = checkNotNull(uncertainRefresh.get())
+                        kotlinx.coroutines.withTimeout(10_000) { refresh.join() }
+                        val facts = rig.coordinator.accessSnapshot.facts
+                        assertNotEquals("$label: after the release the loss is published", PremiumAccessState.PremiumConfirmed, rig.coordinator.state.value.state)
+                        assertTrue("$label: after the release the uncertainty is cleared ($facts)",
+                            com.jay.fxi.data.entitlements.TopicAccessBlock.CONTEXT_UNCERTAIN !in facts.userBlocks)
+                    }
+                    if (case == AccessCase.USER_P4 || case == AccessCase.CAPABILITY_P4) {
+                        // To the end of the measurement: still a held candidate, not a confirmed loss.
+                        val snapshot = rig.coordinator.accessSnapshot
+                        val blocks = if (case == AccessCase.USER_P4) snapshot.facts.userBlocks else snapshot.facts.capabilityBlocks
+                        println("CUT-C01 $label recovery identity denials: ${rig.recoveryIdentityDenials.get()}")
+                        assertEquals("$label: the candidate is still held at the end", 1, rig.coordinator.heldLossCandidateCount())
+                        assertTrue("$label: the hold is still published at the end (${snapshot.facts})",
+                            com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in blocks)
+                        assertEquals("$label: no USER end", userEndsBefore, snapshot.lastUserEnd?.sequence ?: 0L)
+                        assertEquals("$label: no capability end", capEndsBefore, snapshot.lastCapabilityEnd?.sequence ?: 0L)
+                    }
+                } finally {
+                    rotationRelease.complete(Unit)
+                    rig.storeRotationHold.set(null)
+                    uncertainRefresh.get()?.let { kotlinx.coroutines.withTimeoutOrNull(15_000) { it.join() } }
                 }
                 // Release what the state held before the row's close joins the IO work.
                 entitlementsGate?.countDown(); entitlementsGate = null
@@ -2691,6 +2762,29 @@ class PremiumGraphCutoverAcceptanceTest {
 
     private enum class SealPath { DECISION, RECOVERY, OTHER }
 
+    /** C01 (가): the rotation write a hold parked — its axes and its call path (for [sealPath]). */
+    private data class RotationHoldHit(val rotateUser: Boolean, val rotateKrx: Boolean, val stack: String)
+
+    /** C01 (가): a USER loss answer with KRX visible (the USER P4 row's answer). */
+    private val USER_LOSS_KRX_VISIBLE = """{"krx_visible":true,"premium_active":false,"premium_pending":false}"""
+
+    /**
+     * C01 (가) USER_UNCERTAIN premises, read without the issuer's mutex (the parked decision holds it): the write still parked
+     * and the refresh unfinished; the published state still PremiumConfirmed; USER CONTEXT_UNCERTAIN with no NOT_GRANTED,
+     * LOSS_CANDIDATE or EXPLICIT_SEAL.
+     */
+    private fun assertUncertaintyHeld(label: String, rig: Rig, refresh: Job?, release: kotlinx.coroutines.CompletableDeferred<Unit>) {
+        val facts = rig.coordinator.accessSnapshot.facts
+        val uncertain = com.jay.fxi.data.entitlements.TopicAccessBlock.CONTEXT_UNCERTAIN
+        val others = listOf(com.jay.fxi.data.entitlements.TopicAccessBlock.NOT_GRANTED,
+            com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE, com.jay.fxi.data.entitlements.TopicAccessBlock.EXPLICIT_SEAL)
+        assertFalse("$label: premise: the write is still parked", release.isCompleted)
+        assertTrue("$label: premise: the decision's refresh is unfinished", refresh != null && !refresh.isCompleted)
+        assertEquals("$label: premise: the published state still grants", PremiumAccessState.PremiumConfirmed, rig.coordinator.state.value.state)
+        assertTrue("$label: premise: USER uncertain, not ended, held or sealed ($facts)",
+            uncertain in facts.userBlocks && others.none { it in facts.userBlocks })
+    }
+
     /** The production caller of a failed rotation write: the loss decision's first write, or a loss recovery round. */
     private fun sealPath(hit: String): SealPath = when {
         "rotateLossTargetsLocked" in hit && "lossRecoveryRoundLocked" !in hit -> SealPath.DECISION
@@ -2707,6 +2801,8 @@ class PremiumGraphCutoverAcceptanceTest {
     @Test fun `RT01-A07 a user P4 hold blocks every graph use`() = accessStateRow(AccessCase.USER_P4)
     @Test fun `RT01-A07 a capability P4 hold blocks KRX alone`() = accessStateRow(AccessCase.CAPABILITY_P4)
     @Test fun `RT01-A07 an explicit capability seal blocks KRX alone`() = accessStateRow(AccessCase.CAPABILITY_SEAL)
+    @Test fun `RT01-A07 a user rotation in doubt blocks every graph use while the published state still grants`() = accessStateRow(AccessCase.USER_UNCERTAIN)
+    @Test fun `RT01-A07 an explicit user seal blocks every graph use and keeps a fresh premium answer from granting`() = accessStateRow(AccessCase.USER_SEAL)
 
     // --- CUT-C01 batch 1b: RT01-A08 (cut_c01_b1_agreed.r1.md A08) --------------------------------------------------------
 

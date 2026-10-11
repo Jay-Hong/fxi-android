@@ -39,6 +39,8 @@
     "RT01-A07 a pending answer keeps the grant and its capability",
     "RT01-A07 a user P4 hold blocks every graph use",
     "RT01-A07 an explicit capability seal blocks KRX alone",
+    "RT01-A07 a user rotation in doubt blocks every graph use while the published state still grants",
+    "RT01-A07 an explicit user seal blocks every graph use and keeps a fresh premium answer from granting",
     "RT01-A07 an undecidable 5xx keeps the grant and its capability",
     "RT01-A07 pending with no grant blocks every graph use",
     "RT01-A07 resolving blocks every graph use",
