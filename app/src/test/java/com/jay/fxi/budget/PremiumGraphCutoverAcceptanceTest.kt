@@ -202,8 +202,19 @@ class PremiumGraphCutoverAcceptanceTest {
     private val subscribed: MutableList<String> = Collections.synchronizedList(mutableListOf())
     /** Batch 2a: each socket on which the server has sent an acknowledgement admitting the usd topic, after the send. */
     private val usdAcked: MutableList<WebSocket> = Collections.synchronizedList(mutableListOf())
+    /**
+     * S4 C02 K1x: while true, a subscription naming the KRX topic is acknowledged with it refused (krx_entitlement_required),
+     * unless [refuseUsd] also applies to it (that branch wins and admits the rest).
+     */
+    @Volatile private var refuseKrx = false
+    private val krxRefusals = AtomicInteger()
+    /** S4 C02 K1x: the topics each acknowledgement the server sent (send accepted) admitted, in order, over every socket. */
+    private val ackedTopics: MutableList<List<String>> = Collections.synchronizedList(mutableListOf())
 
-    /** The server side of the topic socket: answers pings and acknowledges every subscription with all its topics active. */
+    /**
+     * The server side of the topic socket: answers pings and acknowledges every subscription, all its topics active unless a
+     * row arms [refuseUsd] or [refuseKrx].
+     */
     private val socketServer = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             openSockets += webSocket
@@ -220,14 +231,20 @@ class PremiumGraphCutoverAcceptanceTest {
             subscribed += topics
             val refuse = refuseUsd
             val usd = "fx:usd-krw"
+            val krx = TopicCatalogue.KRX_FUTURES
             if (refuse != null && usd in topics) {
                 refuse()
                 refusals.incrementAndGet()
-                webSocket.send(C4OwnerHarness.ack(id, topics - usd, mapOf(usd to "premium_required")))
+                val sent = webSocket.send(C4OwnerHarness.ack(id, topics - usd, mapOf(usd to "premium_required")))
                 afterRefusal?.invoke(webSocket)
+                if (sent) ackedTopics += topics - usd
+            } else if (refuseKrx && krx in topics) {
+                krxRefusals.incrementAndGet()
+                if (webSocket.send(C4OwnerHarness.ack(id, topics - krx, mapOf(krx to "krx_entitlement_required")))) ackedTopics += topics - krx
             } else {
-                webSocket.send(C4OwnerHarness.ack(id, topics, emptyMap()))
+                val sent = webSocket.send(C4OwnerHarness.ack(id, topics, emptyMap()))
                 if (usd in topics) usdAcked += webSocket
+                if (sent) ackedTopics += topics
             }
         }
     }
@@ -7897,6 +7914,76 @@ class PremiumGraphCutoverAcceptanceTest {
         val verdict = judgeRow(label)
         assertEquals("$label: one connection", 1, handshakes().size)
         ColdStartBudget.assertWithin(verdict)
+    }
+
+    /**
+     * C02M-K1x (cut_c02_m2_agreed.r1.md): this build has no K1 source. The harness is armed to refuse the KRX topic
+     * (krx_entitlement_required) the moment a subscription names it. A KRX-visible approval (HTTP 200 StableActive,
+     * krx_visible=true: PremiumConfirmed, the capability allowed) over the production subscription set (not overridden), with
+     * the server admitting FX, TETHER and DXY, then 60 s: from the start to the end no subscription names the KRX topic and no
+     * KRX refusal is sent (checked in every wait, so a build that subscribes KRX fails on this check at once), no entitlements
+     * request goes out in the 60 s and the whole row's entitlements are the approval's 401 then 200 (so none derived from a
+     * refusal), and nothing is owed. The premises are checked again at the end, and the whole row is judged against the budget.
+     * A build that subscribes KRX fails this row: the agreed signal to re-review K1a·K1c and M1's KRX stimulus and to re-agree
+     * K1b, never to delete or skip it.
+     */
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-K1x the production build subscribes no KRX topic and draws no KRX refusal`() = runBlocking {
+        val label = "C02M-K1x"
+        val start = nowMillis()
+        val deadline = start + 100_000
+        val premiseTopics = (TopicCatalogue.FX + listOf(TopicCatalogue.TETHER, TopicCatalogue.DXY)).toSet()
+        fun noKrx(stage: String) {
+            val topics = synchronized(subscribed) { subscribed.toList() }
+            assertTrue("$label: no subscription named the KRX topic ($stage): ${topics.toSet()}", TopicCatalogue.KRX_FUTURES !in topics)
+            assertEquals("$label: no KRX refusal ($stage)", 0, krxRefusals.get())
+        }
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        onCatalog = { ok(fixture("catalog-krx-visible.json")) }
+        onTab = { ok(fixture("usd-1d-krx-visible.json")) }
+        refuseKrx = true
+        val rig = Rig()
+        try {
+            rig.row {
+                rig.coldStart(deadline)
+                noKrx("after the cold start")
+                awaitTrue("$label: the tab applied", deadline) { noKrx("preparation"); rig.usdApplied() }
+                awaitTrue("$label: the premise topics' snapshots and a handshake", deadline) {
+                    noKrx("preparation")
+                    snapshotTopics().containsAll(premiseTopics) && sends.all().any { it.zone == "ws" }
+                }
+                awaitTrue("$label: premise: the server admitted FX, TETHER and DXY", deadline) {
+                    noKrx("preparation")
+                    synchronized(ackedTopics) { ackedTopics.flatten().toSet() }.containsAll(premiseTopics)
+                }
+                assertEquals("$label: premise: PremiumConfirmed", PremiumAccessState.PremiumConfirmed, rig.coordinator.state.value.state)
+                assertTrue("$label: premise: the KRX-visible answer was applied (capability allowed)",
+                    rig.coordinator.accessSnapshot.facts.capabilityAllowed)
+                val observedFrom = nowMillis()
+                val entitlementsBefore = entitlementsSends()
+                while (nowMillis() < observedFrom + 60_000) {
+                    noKrx("the 60 s")
+                    delay(500)
+                }
+                assertEquals("$label: no entitlements send in the 60 s", 0, entitlementsSends() - entitlementsBefore)
+                assertNull("$label: nothing owed", rig.coordinator.recheckDiagnostics().owedIntent)
+                assertEquals("$label: still PremiumConfirmed at the end", PremiumAccessState.PremiumConfirmed, rig.coordinator.state.value.state)
+                assertTrue("$label: the capability still allowed at the end", rig.coordinator.accessSnapshot.facts.capabilityAllowed)
+            }
+            noKrx("after the row finished")
+            assertEquals("$label: the whole row's entitlements are the approval's 401 then 200 (none from a refusal)",
+                listOf<Int?>(401, 200), statuses(sends.all().filter { it.path == "/api/entitlements" }))
+        } finally {
+            refuseKrx = false
+            println("C02M-K1X $label: subscribed ${synchronized(subscribed) { subscribed.toSet() }}, " +
+                "admitted ${synchronized(ackedTopics) { ackedTopics.flatten().toSet() }}, KRX refusals ${krxRefusals.get()}, entitlements " +
+                "${sends.all().filter { it.path == "/api/entitlements" }.map { "${it.start}ms ${it.status}" }}, " +
+                "owed ${rig.coordinator.recheckDiagnostics().owedIntent}")
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 100_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
     }
 
     /** C02M-A05t: RT01-A05 merged with the same-user change aimed at the cold start's first send + t, instead of after a settle. */
