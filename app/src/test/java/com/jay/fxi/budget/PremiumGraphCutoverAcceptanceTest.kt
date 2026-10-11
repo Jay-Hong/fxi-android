@@ -142,6 +142,8 @@ class PremiumGraphCutoverAcceptanceTest {
         const val NOTICE = "body 기준 수치는 클라이언트가 관측한 body 수명의 계량이며, close/실패 뒤 서버 작업까지 끝났다는 증거는 " +
             "아닙니다. per-host 5는 동일 Dispatcher의 비동기 호출 제한으로 표시하고, body 기준 in-flight ≤5의 증명으로 사용하지 않습니다."
         const val PREMIUM_HIDDEN = """{"krx_visible":false,"premium_active":true}"""
+        /** S4 C02 P1: a stable inactive answer (StableInactive → FreeConfirmed). */
+        const val STABLE_INACTIVE = """{"krx_visible":false,"premium_active":false}"""
         /** The test-only request header [permitAtSend] fills. */
         const val PERMIT_HEADER = "X-Cut-Permit"
         /** S4 C02 A05t: how late after its target the identity change may start and still count as that row's time. */
@@ -7983,6 +7985,140 @@ class PremiumGraphCutoverAcceptanceTest {
                 "owed ${rig.coordinator.recheckDiagnostics().owedIntent}")
         }
         assertTrue("within the row deadline", nowMillis() - start <= 100_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    // --- S4 CUT-C02 (b′) measurement bundle 3: P1·B1 (cut_c02_bprime_agreed.r1.md §1, cut_c02_m2_agreed.r1.md 4) ---------------
+
+
+    /**
+     * C02M-P1: the purchase/restore propagation probe against inactive answers. The owner is settled at FreeConfirmed (exactly one
+     * HTTP 200 StableInactive); then [PremiumAccessCoordinator.onLocalPremiumSignal]. Every probe answer is 200 StableInactive
+     * with a 300 ms body delay (no 401, Pending, error or identity change). Two more purchase/restore signals after the second
+     * tick join it. The probe sends five ticks, each one fetch and one physical send (fresh_premium=true); each later tick starts
+     * no earlier than its nominal delay (the harness's ProbeJitter.None: 2/5/10/20 s) after the previous tick's fetch returned —
+     * with the body delay a schedule counted from each send would start about 300 ms earlier and fail. The further signals add
+     * no tick and no window (nothing in the 25 s after the fifth answer); the row's entitlements are the settle's one and the five
+     * ticks only; the whole row is judged against the budget.
+     */
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-P1 a purchase probe against inactive answers sends five ticks and joins further signals`() = runBlocking {
+        val label = "C02M-P1"
+        val start = nowMillis()
+        val deadline = start + 90_000
+        val rig = Rig()
+        rig.row {
+            entitlements += ok(STABLE_INACTIVE)
+            rig.coordinator.onIdentityChanged(checkNotNull(rig.provider.currentIdentityFence()))
+            rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+            assertEquals("$label: premise: FreeConfirmed", PremiumAccessState.FreeConfirmed, rig.coordinator.state.value.state)
+            assertEquals("$label: premise: the settle sent one entitlements request, answered 200", listOf<Int?>(200),
+                statuses(sends.all().filter { it.path == "/api/entitlements" }))
+            quiet("$label settle", 3_500)
+            val before = entitlementsSends()
+            val fetchesBefore = rig.fetchReturns.size
+            repeat(5) { entitlements += ok(STABLE_INACTIVE).setBodyDelay(300, java.util.concurrent.TimeUnit.MILLISECONDS) }
+            val signalAt = nowMillis()
+            rig.coordinator.onLocalPremiumSignal()
+            awaitTrue("$label: the second tick went", deadline) { entitlementsSends() >= before + 2 }
+            val joinAt = listOf(nowMillis().also { rig.coordinator.onLocalPremiumSignal() }, nowMillis().also { rig.coordinator.onLocalPremiumSignal() })
+            awaitTrue("$label: five ticks", deadline) { entitlementsSends() >= before + 5 && sends.all().all { it.bodyEnd != null } }
+            val fifthEnd = checkNotNull(sends.all().filter { it.path == "/api/entitlements" }.last().bodyEnd)
+            while (nowMillis() < fifthEnd + 25_000) delay(500)
+            val ticks = sends.all().filter { it.path == "/api/entitlements" }.drop(before)
+            val fetches = synchronized(rig.fetchReturns) { rig.fetchReturns.drop(fetchesBefore) }.map { it.second }
+            println("C02M-PROBE $label: signal @$signalAt, joining signals @$joinAt; ticks " +
+                "${ticks.map { "${it.start}ms fresh=${it.param("fresh_premium")} ${it.status} end@${it.bodyEnd}" }}; fetch returns $fetches")
+            assertEquals("$label: five probe ticks, each one physical send", 5, ticks.size)
+            assertEquals("$label: five probe fetches", 5, fetches.size)
+            assertTrue("$label: the joining signals came while the probe ran (after tick 2 started, before tick 3)",
+                joinAt.all { it >= ticks[1].start && it < ticks[2].start })
+            assertTrue("$label: every tick asked fresh premium", ticks.all { it.param("fresh_premium") == "true" })
+            assertTrue("$label: every tick answered 200 (no 401 replay)", ticks.all { it.status == 200 })
+            assertEquals("$label: the row's entitlements are the settle's one and the five ticks only", 1 + 5, entitlementsSends())
+            val nominal = listOf(2_000L, 5_000L, 10_000L, 20_000L)
+            (1 until 5).forEach { i ->
+                assertTrue("$label: tick ${i + 1} starts no earlier than ${nominal[i - 1]} ms after tick $i's fetch returned " +
+                    "(${ticks[i].start} - ${fetches[i - 1]})", ticks[i].start - fetches[i - 1] >= nominal[i - 1] - 1)
+            }
+            assertEquals("$label: still FreeConfirmed", PremiumAccessState.FreeConfirmed, rig.coordinator.state.value.state)
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 90_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * C02M-B1: the sign-out recovery barrier's binder source (cut_c02_bprime_agreed.r1.md §1). A real AuthAccessBinder on its
+     * own scope, its recovery stream the production provider and its fence stream one that does not replay (the production
+     * stream replays the current fence on subscription; a replay here would bind A and ask the server first), automatic recovery
+     * off with the run driven here, and no approve(): with A live, beginSignOut(A) needs recovery; recoverSignOut runs the
+     * barrier, which binds the live candidate and releases with a decision generation; the binder then asks the server
+     * (FORCE_PREMIUM pinned to that generation). The run itself may return CLOSED instead of FINISHED: bindBarrierLocked clears
+     * the attempt before runBarrier completes its reply, and when that signal reaches the run first it stops with CLOSED
+     * (AuthAccessBinder.awaitBarrier). The pinned request is the only path that can send in this row (no observed fence, no
+     * supervisor, nothing owed). The row records the run's outcome, whether the request went at once or a floor held it first
+     * (a held caller raises owedIntent before any send; no entitlements answer preceded the barrier, so no floor could exist),
+     * when it went, fresh_premium and the answer; asserts it is the row's only entitlements request, the attempt closed (no
+     * ATTEMPT_OPEN) and the answer applied as A's PremiumConfirmed under the released generation; and judges the row against the
+     * budget.
+     */
+    @Test
+    @Category(C02Measurement::class)
+    fun `C02M-B1 a sign-out recovery barrier release asks the server once and is measured`() = runBlocking {
+        val label = "C02M-B1"
+        val start = nowMillis()
+        val deadline = start + 40_000
+        val rig = Rig()
+        val binderJob = SupervisorJob()
+        try {
+            rig.row {
+                val live = checkNotNull(rig.provider.currentIdentityFence())
+                val binder = com.jay.fxi.data.entitlements.AuthAccessBinder(
+                    rig.coordinator,
+                    CoroutineScope(binderJob + Dispatchers.Default),
+                    fenceStream = { },
+                    recoveryStream = rig.provider,
+                    recoverAutomatically = false
+                )
+                binder.start()
+                delay(500)
+                assertEquals("$label: premise: nothing asked before the barrier (no replay, no approve)", 0, entitlementsSends())
+                val begun = kotlinx.coroutines.withTimeout(10_000) { binder.beginSignOut(live) }
+                val ticket = (begun as? com.jay.fxi.data.entitlements.SignOutStart.RecoveryRequired)?.ticket
+                assertNotNull("$label: premise: the sign-out needs recovery ($begun)", ticket)
+                val recoveredAt = nowMillis()
+                val outcome = kotlinx.coroutines.withTimeout(10_000) { binder.recoverSignOut(checkNotNull(ticket)) }
+                assertTrue("$label: the run ended FINISHED, or CLOSED by the barrier's own release ($outcome)",
+                    outcome == com.jay.fxi.data.entitlements.RecoveryOutcome.FINISHED || outcome == com.jay.fxi.data.entitlements.RecoveryOutcome.CLOSED)
+                var floorHeld = false
+                awaitTrue("$label: the request went or a floor held it", deadline) {
+                    if (entitlementsSends() >= 1) true
+                    else if (rig.coordinator.recheckDiagnostics().owedIntent != null) { floorHeld = true; true } else false
+                }
+                awaitTrue("$label: the binder asked the server", deadline) {
+                    entitlementsSends() >= 1 && sends.all().all { it.bodyEnd != null }
+                }
+                val until = nowMillis() + 5_000
+                while (nowMillis() < until) delay(100)
+                val asked = sends.all().filter { it.path == "/api/entitlements" }
+                val state = rig.coordinator.state.value
+                val facts = rig.coordinator.accessSnapshot.facts
+                println("C02M-B1 $label: fence stream not replaying, automatic recovery off (run driven here); recovered @$recoveredAt " +
+                    "($outcome); floor held first: $floorHeld; entitlements " +
+                    "${asked.map { "${it.start}ms (+${it.start - recoveredAt}) fresh=${it.param("fresh_premium")} ${it.status}" }}; " +
+                    "state $state; user blocks ${facts.userBlocks}")
+                assertEquals("$label: the barrier's one request, fresh premium, answered 200 — the row's only entitlements request",
+                    listOf<Pair<String?, Int?>>("true" to 200), asked.map { it.param("fresh_premium") to it.status })
+                assertTrue("$label: the attempt closed (no ATTEMPT_OPEN)",
+                    com.jay.fxi.data.entitlements.TopicAccessBlock.ATTEMPT_OPEN !in facts.userBlocks)
+                assertEquals("$label: the answer applied as A's PremiumConfirmed under the released generation",
+                    com.jay.fxi.data.entitlements.OwnedPremiumAccess(live.uid, live.authGeneration, PremiumAccessState.PremiumConfirmed), state)
+            }
+        } finally {
+            binderJob.cancelAndJoin()
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
         ColdStartBudget.assertWithin(judgeRow(label))
     }
 
