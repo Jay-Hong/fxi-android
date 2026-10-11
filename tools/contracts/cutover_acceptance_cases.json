@@ -49,6 +49,8 @@
     "RT01-A09b a same-scope catalog loss holds the WS input and the readoption replays it",
     "RT01-A09c a new user epoch never reads the previous scope's catalog",
     "RT01-A10 a parked refusal leaves the graph allowed until the issuer publishes the user end and nothing after it",
+    "RT01-A09d a real sink FULL is recorded by the session and handed to the recorder as a loss",
+    "RT01-A10b a price bootstrap started before a refusal and answered after the user end is not adopted",
     "RT01-B04a a request carrying the old KRX epoch completes released and applies and writes nothing",
     "RT01-B04b under a hidden capability the tab captures no KRX epoch and after the re-approval only the new epoch is used",
     "RT01-B05a a late old completion after a context change applies nothing and its Retry-After floor holds the new context",

@@ -178,6 +178,8 @@ class PremiumGraphCutoverAcceptanceTest {
     @Volatile private var usdSnapshotLive = false
     /** The usd REST bootstrap body while [usdSnapshotLive]: one kb quote stamped now, unless a row sets it. */
     @Volatile private var usdBootstrap: () -> String = { usdSnapshot() }
+    /** C01 (다): while set, the usd REST bootstrap's live answer waits on this at the server (a held real delivery). */
+    @Volatile private var usdBootstrapHold: java.util.concurrent.CountDownLatch? = null
 
     private fun fixture(name: String) = File(GRAPH, name).readText()
     private fun ok(body: String) = MockResponse().setResponseCode(200).setBody(body)
@@ -277,7 +279,10 @@ class PremiumGraphCutoverAcceptanceTest {
                     }
                     "/api/user/me" -> onDelete(request)
                     "/api/v2/topics/snapshot" ->
-                        if (url.queryParameter("topic") == "fx:usd-krw" && usdSnapshotLive) ok(usdBootstrap())
+                        if (url.queryParameter("topic") == "fx:usd-krw" && usdSnapshotLive) {
+                            usdBootstrapHold?.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                            ok(usdBootstrap())
+                        }
                         else if (url.queryParameter("topic") == TETHER && tetherCalls.getAndIncrement() == 0) unauthorized()
                         else MockResponse().setResponseCode(404).setBody("""{"error":"topic_unavailable"}""")
                     "/api/v2/graph/catalog" -> onCatalog(request)
@@ -554,6 +559,9 @@ class PremiumGraphCutoverAcceptanceTest {
         val pulls: MutableList<com.jay.fxi.data.entitlements.TopicGrantResult> = Collections.synchronizedList(mutableListOf())
         /** The runtime's serial scope, from the factory's newScope, kept so a row can hold its executor (B1). */
         @Volatile var runtimeScope: CoroutineScope? = null
+        /** C01 (다): each REST bootstrap's (topic, outcome) as the production service returned it, in order. */
+        val bootstrapOutcomes: MutableList<Pair<String, com.jay.fxi.data.remote.TopicSnapshotOutcome>> =
+            Collections.synchronizedList(mutableListOf())
         /** How many times the graph boundary built; the production owner builds once per process. */
         val builds = AtomicInteger()
         /** The assembly's SupervisorJob: the parent's one new child across the production build, kept for observation only. */
@@ -619,7 +627,7 @@ class PremiumGraphCutoverAcceptanceTest {
                 },
                 webSocketUrl = server.url("/ws").toString(),
                 decode = TopicFrameDecoder(wireJson)::decode,
-                bootstrap = { fence, topic, useAdmitted -> service.bootstrap(fence, topic, useAdmitted) },
+                bootstrap = { fence, topic, useAdmitted -> service.bootstrap(fence, topic, useAdmitted).also { bootstrapOutcomes += topic to it } },
                 issuer = PremiumAccessTopicGrantIssuer(coordinator).let { real ->
                     object : com.jay.fxi.data.entitlements.TopicGrantIssuer by real {
                         override suspend fun topicGrantResult() = real.topicGrantResult().also { pulls += it }
@@ -1982,6 +1990,175 @@ class PremiumGraphCutoverAcceptanceTest {
 
     private fun kbJpy(display: StateFlow<TopicDisplayState>): Double? =
         display.value.rates.quotes[com.jay.fxi.domain.model.TopicQuoteKey("kb", "jpy-krw")]?.rate
+
+    /**
+     * C01 (나)·(다): the live topic session, for observation only (never driven): the permit supplier the graph was built with
+     * is the session's own `{ permit }` (TopicRuntime.graphRecoveryPermit = session.recoveryPermit), which captures it.
+     */
+    private fun Rig.session(): com.jay.fxi.data.remote.TopicSessionCoordinator {
+        val supplier = checkNotNull(checkNotNull(permitSlot) { "no graph built" }.get()) { "no permit supplier" }
+        val field = supplier.javaClass.declaredFields.single { com.jay.fxi.data.remote.TopicSessionCoordinator::class.java.isAssignableFrom(it.type) }
+        return field.apply { isAccessible = true }.get(supplier) as com.jay.fxi.data.remote.TopicSessionCoordinator
+    }
+
+    /** C01 (다): runs [block] on the runtime's serial executor, where the session's loop-confined state lives. */
+    private suspend fun <T> Rig.onRuntime(block: () -> T): T =
+        withContext(checkNotNull(checkNotNull(runtimeScope).coroutineContext[kotlinx.coroutines.CoroutineDispatcher])) { block() }
+
+    /**
+     * C01 (다) #12 (cut_c01_xc.r3/proposal.md): a real usd price bootstrap started before a refusal and answered after the USER
+     * end is published. The bootstrap is held at the server from the cold start. After the cold start the server drops the
+     * socket and refuses the usd subscription of the reconnect, and the issuer publishes the USER end. The held bootstrap then
+     * answers a fresh marker price: the production service returns Delivered, the session settles that request while the
+     * runtime still runs, the marker is adopted neither into the session's rates nor (read once) by the recorder, and no graph
+     * send follows the end for 2 s.
+     */
+    @Test
+    fun `RT01-A10b a price bootstrap started before a refusal and answered after the user end is not adopted`() = runBlocking {
+        val label = "RT01-A10b"
+        val start = nowMillis()
+        val deadline = start + 40_000
+        val marker = 1401.7
+        val hold = java.util.concurrent.CountDownLatch(1)
+        val refusedAt = java.util.concurrent.atomic.AtomicLong(-1)
+        usdSnapshotLive = true
+        usdBootstrap = { usdSnapshot(marker) }
+        usdBootstrapHold = hold
+        val rig = Rig()
+        try {
+            rig.row {
+                try {
+                    rig.coldStart(deadline)
+                    val usdBootstrapSend = { bootstraps().firstOrNull { it.param("topic") == "fx:usd-krw" } }
+                    awaitTrue("$label: the usd bootstrap went and is held", deadline) { usdBootstrapSend()?.bodyEnd == null && usdBootstrapSend() != null }
+                    awaitTrue("$label: the server opened its socket", deadline) { openSockets.isNotEmpty() }
+                    val endsBefore = rig.coordinator.accessSnapshot.lastUserEnd?.sequence ?: 0L
+                    refuseUsd = {
+                        refuseUsd = null
+                        refusedAt.set(nowMillis())
+                    }
+                    openSockets.last().close(1011, "server restart")
+                    awaitTrue("$label: the reconnect's usd subscription was refused", deadline) { refusedAt.get() > 0 }
+                    val bootstrap = checkNotNull(usdBootstrapSend())
+                    assertTrue("$label: premise: the bootstrap started before the refusal (${bootstrap.start} < ${refusedAt.get()})",
+                        bootstrap.start < refusedAt.get())
+                    assertNull("$label: premise: the bootstrap is still held at the refusal", bootstrap.bodyEnd)
+                    awaitTrue("$label: the issuer published the user end", deadline) {
+                        val s = rig.coordinator.accessSnapshot
+                        !s.facts.userAllowed && (s.lastUserEnd?.sequence ?: 0L) > endsBefore
+                    }
+                    val session = rig.session()
+                    val graphAfterEnd = graph().size
+                    val outcomesBefore = rig.bootstrapOutcomes.size
+                    hold.countDown()
+                    awaitTrue("$label: the held bootstrap answered 200 and its body ended", deadline) {
+                        usdBootstrapSend()?.let { it.status == 200 && it.bodyEnd != null } == true
+                    }
+                    awaitTrue("$label: the production service returned Delivered for usd", deadline) {
+                        synchronized(rig.bootstrapOutcomes) { rig.bootstrapOutcomes.drop(outcomesBefore) }
+                            .any { it.first == "fx:usd-krw" && it.second is com.jay.fxi.data.remote.TopicSnapshotOutcome.Delivered }
+                    }
+                    awaitTrue("$label: the session settled that request while it still runs", deadline) {
+                        rig.onRuntime {
+                            val out = privateField(session, "bootstrapsOut") as Map<*, *>
+                            privateField(session, "stopped") == false && out.values.none { privateField(it!!, "topic") == "fx:usd-krw" }
+                        }
+                    }
+                    val quote = session.rates.value.quotes[com.jay.fxi.domain.model.TopicQuoteKey("kb", "usd-krw")]?.rate
+                    assertNotEquals("$label: the marker is not adopted into the session's rates", marker, quote)
+                    assertNotEquals("$label: the recorder takes no observation of the marker", marker, rig.kbTipRate())
+                    val until = nowMillis() + 2_000
+                    while (nowMillis() < until) {
+                        assertEquals("$label: no graph send after the user end\n${sends.timeline()}", graphAfterEnd, graph().size)
+                        delay(50)
+                    }
+                } finally {
+                    hold.countDown()
+                    refuseUsd = null
+                    entitlementsGate?.countDown(); entitlementsGate = null
+                    usdBootstrapHold = null
+                }
+            }
+        } finally {
+            hold.countDown()
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 40_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * C01 (나) #8 (cut_c01_xb.r2/proposal.md): a real sink FULL handed to the recorder as a loss. From a closed demand made by
+     * real deliveries (KRX visible, catalog adopted, kb.usd created, the WS path resumed) with the sink idle, Main is held so the
+     * sink worker cannot drain; 512 one-quote usd frames on the acknowledged socket fill the sink to 512 units with no loss,
+     * and the 513th is refused FULL: the session records one FULL loss of fx:usd-krw on the WS path under the delivered fence,
+     * while the recorder has no handover loss yet. Released, the worker hands the loss over: every closed start of kb.usd's last
+     * 24 h gains HANDOVER_LOSS under one generation and the recorder's held losses are empty. The recovery demand is the
+     * auxiliary record; no HTTP re-query or recovery completion is claimed.
+     */
+    @Test
+    fun `RT01-A09d a real sink FULL is recorded by the session and handed to the recorder as a loss`() = runBlocking {
+        val label = "RT01-A09d"
+        val prepared = clearOfBoundary(150_000)
+        println("CUT-C01 $label: waited $prepared ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 120_000
+        entitlements += ok(premiumKrxVisible)
+        val rig = Rig()
+        rig.row {
+            rig.prepareClosedDemand(deadline, krx = true)
+            awaitTrue("$label: the bootstraps settled", deadline) { bootstraps().all { it.bodyEnd != null } }
+            val session = rig.session()
+            val sink = rig.assembly.sink
+            val sinkLock = checkNotNull(privateField(sink, "lock"))
+            val sinkCost = { synchronized(sinkLock) { (privateField(sink, "queue") as ArrayDeque<*>).size to (privateField(sink, "usedUnits") as Int) } }
+            val handover = com.jay.fxi.data.graph.GraphRecoveryReason.HANDOVER_LOSS
+            val kbPending = { rig.assembly.recorder.state.value.series.entries.single { it.key.seriesId == "kb.usd" }.value.pending }
+            awaitTrue("$label: premise: the sink is idle", deadline) { sinkCost() == (0 to 0) }
+            assertNull("$label: premise: no session graph loss", session.graphLoss.value)
+            assertTrue("$label: premise: no handover loss on kb.usd", kbPending().values.none { handover in it.reasons })
+            val held = rig.assembly.recorder.state.value.pending
+            assertTrue("$label: premise: no held inputs or losses in the recorder", held.inputs.isEmpty() && held.lostTopics.isEmpty())
+            val fence = checkNotNull(rig.bridge())
+            val socket = openSockets.last()
+            val second = System.currentTimeMillis() / 1000
+            var hold: ExecutorHold? = holdMain()
+            try {
+                assertEquals("$label: premise: the sink is still idle under the Main hold", 0 to 0, sinkCost())
+                repeat(512) { i -> assertTrue("$label: frame ${i + 1} handed to the socket", socket.send(usdSnapshotAt(1390.0 + (i % 10) * 0.1, second))) }
+                awaitTrue("$label: 512 units queued", deadline) { sinkCost().second == 512 }
+                assertNull("$label: no loss at 512 units", session.graphLoss.value)
+                assertTrue("$label: frame 513 handed to the socket", socket.send(usdSnapshotAt(1391.5, second)))
+                awaitTrue("$label: the session recorded the FULL", deadline) { session.graphLoss.value != null }
+                val loss = checkNotNull(session.graphLoss.value)
+                val grantEpoch = privateField(session, "grantEpoch") as Long
+                assertEquals("$label: one loss", 1L, loss.count)
+                assertEquals("$label: refused FULL", setOf(com.jay.fxi.data.remote.TopicGraphOffer.FULL), loss.reasons)
+                assertEquals("$label: of the usd topic", setOf("fx:usd-krw"), loss.topics)
+                assertEquals("$label: on the WS path", setOf(com.jay.fxi.data.remote.TopicGraphPath.WS), loss.paths)
+                assertEquals("$label: under the delivered fence and grant", setOf(com.jay.fxi.data.remote.TopicGraphAuthorityKey(fence, grantEpoch)), loss.authorities)
+                assertEquals("$label: the sink still holds 512 units", 512, sinkCost().second)
+                assertTrue("$label: the recorder has no handover loss yet", kbPending().values.none { handover in it.reasons })
+                checkNotNull(hold).release()
+                hold = null
+            } finally {
+                hold?.release()
+            }
+            val starts = closedStarts().toSet()
+            awaitTrue("$label: every closed start gained HANDOVER_LOSS", deadline) {
+                rig.onMain { kbPending().filterKeys { it.epochSeconds in starts }.let { c -> c.keys.size == starts.size && c.values.all { handover in it.reasons } } }
+            }
+            rig.onMain {
+                val closed = kbPending().filterKeys { it.epochSeconds in starts }
+                assertEquals("$label: every closed start of the last 24 h", starts, closed.keys.map { it.epochSeconds }.toSet())
+                assertEquals("$label: the handover under one generation (${closed.values.map { it.generation }.toSet()})",
+                    1, closed.values.filter { handover in it.reasons }.map { it.generation }.toSet().size)
+                assertTrue("$label: the recorder's held losses were handed over", rig.assembly.recorder.state.value.pending.lostTopics.isEmpty())
+            }
+            println("CUT-C01 $label recovery demand after the handover: ${rig.usdDemand()}")
+        }
+        assertTrue("within the row deadline", nowMillis() - start <= 120_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
 
     /**
      * RT01-A10 (cut_c01_b1a_contract.r1/codex_contract.r1.md F1 (b)·F2): a WS refusal the issuer cannot decide (its identity read
