@@ -238,7 +238,8 @@ jobs:
   # own job so the build job keeps its time. Required: a failed, skipped, missing, duplicated or unlisted case fails the job.
   cutover-acceptance:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # 45 → 75 (S4 CUT-C01 batch 3c, cut_c01_b3c_agreed.r1.md §1 A): the 600 s boundary rows each wait up to about 10 minutes.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
 

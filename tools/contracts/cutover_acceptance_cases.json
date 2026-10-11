@@ -79,6 +79,10 @@
     "RT05-T01a time alone moves the right edge on the freshness tick and changes no observation",
     "RT05-T03a a connection change in the background only moves the baseline and the next foreground drop reconnects once",
     "RT05-T03b a first connect that throws leaves no connection and the first real one is the baseline",
-    "RT05-T03c revisions delayed behind Main are read as the latest permit and resync once"
+    "RT05-T03c revisions delayed behind Main are read as the latest permit and resync once",
+    "RT05-T02a a return under 60 s issues nothing and keeps the closed demand",
+    "RT05-T02b a return after 60 s issues one trigger and its cooldown holds a reconnect for 30 s",
+    "RT05-T04a a boundary issues one trigger and its retain moves only the window",
+    "RT05-T04b a boundary during a held recovery response keeps the round and sends no second tab"
   ]
 }

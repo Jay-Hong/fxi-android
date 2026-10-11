@@ -5763,6 +5763,406 @@ class PremiumGraphCutoverAcceptanceTest {
         ColdStartBudget.assertWithin(judgeRow(label))
     }
 
+    // --- CUT-C01 batch 3c: RT05-T02(a)(b), RT05-T04(a)(+T01b)(b) (cut_c01_b3c_agreed.r1.md) ------------------------------------
+
+    /**
+     * RT05-T04: before the rig starts, picks the next epoch 600 s boundary B — B + 600 s when B − lead − 500 ms is already past
+     * — and waits until B − lead − 500 ms on the epoch clock. Returns B in epoch milliseconds and prints the wait (on the
+     * monotonic clock), the return time and what is left. The wait is not part of the row deadline.
+     */
+    private suspend fun alignToBoundary(label: String, leadMillis: Long): Long {
+        val waitStart = nowMillis()
+        var boundary = (System.currentTimeMillis() / 600_000 + 1) * 600_000
+        if (boundary - leadMillis - 500 <= System.currentTimeMillis()) boundary += 600_000
+        while (true) {
+            val left = boundary - leadMillis - 500 - System.currentTimeMillis()
+            if (left <= 0) break
+            delay(minOf(left, 1_000))
+        }
+        val now = System.currentTimeMillis()
+        println("CUT-C01 $label: aligned to the boundary ${java.time.Instant.ofEpochMilli(boundary)} after ${nowMillis() - waitStart} ms; " +
+            "returned at ${java.time.Instant.ofEpochMilli(now)}, ${boundary - now} ms before it")
+        return boundary
+    }
+
+    /** Waits until the epoch clock reaches [epochMillis]. */
+    private suspend fun untilEpoch(epochMillis: Long) {
+        while (true) {
+            val left = epochMillis - System.currentTimeMillis()
+            if (left <= 0) return
+            delay(minOf(left, 200))
+        }
+    }
+
+    /** The recovery events' attribution fields (RT05), read in one Main step. */
+    private data class EventsView(
+        val sequence: Long,
+        val bucket: kotlinx.datetime.Instant?,
+        val connection: Pair<Any?, Long>?,
+        val foreground: Boolean?,
+        val lastResync: kotlinx.datetime.Instant?,
+        val backgroundAt: kotlinx.datetime.Instant?
+    )
+
+    private suspend fun Rig.eventsView(): EventsView = onMain {
+        val e = assembly.events
+        EventsView(
+            triggersOnMain(),
+            privateField(e, "bucket") as kotlinx.datetime.Instant?,
+            privateField(e, "connection")?.let { privateField(it, "sessionKey") to (privateField(it, "generation") as Long) },
+            privateField(e, "foreground") as Boolean?,
+            privateField(e, "lastResync") as kotlinx.datetime.Instant?,
+            privateField(e, "backgroundAt") as kotlinx.datetime.Instant?
+        )
+    }
+
+    /** The highest trigger sequence the graph coordinator has handled (GraphV2RequestCoordinator.kt:2234-2235), read on Main. */
+    private suspend fun Rig.coordinatorTriggerSequence(): Long = onMain { privateField(assembly.coordinator, "lastTriggerSequence") as Long }
+
+    /** Every kb.usd pending start (the current bucket's included), in epoch seconds, read on Main. */
+    private suspend fun Rig.kbPendingAll(): Set<Long> = onMain {
+        assembly.recorder.state.value.series.entries.single { it.key.seriesId == "kb.usd" }.value.pending.keys.map { it.epochSeconds }.toSet()
+    }
+
+    /** kb.usd's app observations: the tip, the observation set and the buckets with their high/low/close, read on Main. */
+    private suspend fun Rig.kbApp(): Triple<Any?, Set<Any>, Map<Any, Any>> = onMain {
+        val app = assembly.recorder.state.value.series.entries.single { it.key.seriesId == "kb.usd" }.value.data.app
+        Triple(app.tip, app.observations.toSet<Any>(), app.buckets.toMap<Any, Any>())
+    }
+
+    /** The registered usd 1d request object (identity), or null, read on Main. */
+    private suspend fun Rig.usdTabRequestObject(): Any? = onMain {
+        @Suppress("UNCHECKED_CAST")
+        val requests = privateField(assembly.coordinator, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
+        requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period.code == "1d" }?.value
+    }
+
+    /**
+     * RT05-T02/T04 common preparation (agreed r3 §3): a real closed demand through the route stand-in, the initial sends ended,
+     * `Pending(closed = true, mappingWait = false)`, no recovery budget, a Connection baseline and no resync yet (so the 30 s
+     * cooldown is met without a wait). Returns the usd holder.
+     */
+    private suspend fun Rig.prepare3c(label: String, deadline: Long): GraphV2ScreenStateHolder {
+        val holder = checkNotNull(prepareClosedDemand(deadline, route = true))
+        awaitTrue("$label: the initial sends ended", deadline) { sends.all().all { it.bodyEnd != null } }
+        assertEquals("$label: premise: a closed demand",
+            com.jay.fxi.data.graph.GraphTabRecoveryDemand.Pending(closed = true, mappingWait = false), usdDemand())
+        assertNull("$label: premise: no recovery budget", usdBudgetObject())
+        val view = eventsView()
+        assertNotNull("$label: premise: a Connection baseline", view.connection)
+        assertNull("$label: premise: no resync yet, so the cooldown is met", view.lastResync)
+        assertEquals("$label: premise: in the foreground", true, view.foreground)
+        return holder
+    }
+
+    /**
+     * RT05-T02(a): a return under 60 s. Within one 600 s bucket, after the common preparation, the events take the background,
+     * about 50 s pass and the screen returns; from the background to the observed return less than 60 s passed. The background
+     * and the return issue no trigger, open no recovery round and send no graph request; within 1 s of the events taking the
+     * return the right edge is refreshed (the next freshness tick restarts only then; a direct time event and the 350 ms
+     * publication after the return's retain are not told apart). The closed demand and kb.usd's pending starts are as before
+     * and no recovery budget exists (the demand is kept although the condition is not met; no budget object or rounds are
+     * claimed kept). The Connection is unchanged, the events are in the foreground and a request source (context) exists, so
+     * the absence of a trigger is not for want of a context.
+     */
+    @Test
+    fun `RT05-T02a a return under 60 s issues nothing and keeps the closed demand`() = runBlocking {
+        val label = "RT05-T02a"
+        val prepared = clearOfBoundary(100_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 90_000
+        val bucket = System.currentTimeMillis() / 600_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            val holder = rig.prepare3c(label, deadline)
+            onTab = { ok(usdTab(closedStarts())) }
+            val base = rig.eventsView()
+            val pendingBefore = rig.kbPendingAll()
+            val closedBefore = rig.kbClosedPending()
+            val graphBefore = graph().size
+            rig.foreground.value = false
+            awaitTrue("$label: the events took the background", deadline) { rig.eventsView().foreground == false }
+            val backgroundAt = checkNotNull(rig.eventsView().backgroundAt)
+            delay(50_000)
+            assertEquals("$label: the background issues nothing", base.sequence, rig.triggers())
+            val edgeBefore = rig.onMain { holder.state.value.chart?.rightEdgeNow }
+            rig.foreground.value = true
+            awaitTrue("$label: the events took the return", deadline) { rig.eventsView().foreground == true }
+            val taken = nowMillis()
+            val elapsed = kotlinx.datetime.Clock.System.now() - backgroundAt
+            assertTrue("$label: premise: under 60 s from the background to the return ($elapsed)", elapsed < 60.seconds)
+            awaitTrue("$label: the right edge is refreshed within 1 s of the return", taken + 1_000) {
+                rig.onMain { holder.state.value.chart?.rightEdgeNow } != edgeBefore
+            }
+            delay(3_000)
+            val after = rig.eventsView()
+            assertEquals("$label: the return issues nothing", base.sequence, after.sequence)
+            assertNull("$label: no recovery budget, no round", rig.usdBudgetObject())
+            assertEquals("$label: no graph request\n${sends.timeline()}", graphBefore, graph().size)
+            assertEquals("$label: the closed demand is kept",
+                com.jay.fxi.data.graph.GraphTabRecoveryDemand.Pending(closed = true, mappingWait = false), rig.usdDemand())
+            assertEquals("$label: kb.usd's pending starts are as before", pendingBefore, rig.kbPendingAll())
+            assertEquals("$label: and its closed ones", closedBefore, rig.kbClosedPending())
+            assertEquals("$label: premise: the Connection is unchanged", base.connection, after.connection)
+            assertEquals("$label: premise: in the foreground", true, after.foreground)
+            assertNotNull("$label: premise: a request source (context) exists", rig.onMain { rig.assembly.coordinator.state.value.source })
+            assertEquals("$label: premise: the same 600 s bucket", bucket, System.currentTimeMillis() / 600_000)
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 90_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT05-T02(b): a return after 60 s and the cooldown it starts. After the common preparation the events take the background,
+     * at least 61 s pass and the screen returns: with at least 60 s between the background and the return's resync, the same
+     * bucket and the Connection unchanged, exactly one trigger is issued (attributed by exclusion). The server then drops the
+     * socket at once: the events take a newer Connection less than 30 s after that resync and issue nothing, the resync
+     * unchanged. More than 31 s after the resync the server drops it again: a newer Connection of the same session is taken and
+     * one more trigger is issued, its resync at least 30 s after the first. The return's trigger opens a recovery round whose
+     * 1d tab is answered with every closed start: by the end the demand is met.
+     */
+    @Test
+    fun `RT05-T02b a return after 60 s issues one trigger and its cooldown holds a reconnect for 30 s`() = runBlocking {
+        val label = "RT05-T02b"
+        val prepared = clearOfBoundary(150_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 140_000
+        val bucket = System.currentTimeMillis() / 600_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        rig.row {
+            rig.prepare3c(label, deadline)
+            onTab = { ok(usdTab(closedStarts())) }
+            val base = rig.eventsView()
+            val baseConnection = checkNotNull(base.connection)
+            val tabsBase = tabs().size
+            rig.foreground.value = false
+            awaitTrue("$label: the events took the background", deadline) { rig.eventsView().foreground == false }
+            val backgroundAt = checkNotNull(rig.eventsView().backgroundAt)
+            delay(61_000)
+            assertEquals("$label: the background issues nothing", base.sequence, rig.triggers())
+            rig.foreground.value = true
+            awaitTrue("$label: one trigger on the return", deadline) { rig.triggers() == base.sequence + 1 }
+            val back = rig.eventsView()
+            val resync = checkNotNull(back.lastResync)
+            assertTrue("$label: premise: at least 60 s from the background to the return (${resync - backgroundAt})",
+                resync - backgroundAt >= 60.seconds)
+            assertEquals("$label: premise: the Connection is unchanged by the return", base.connection, back.connection)
+            assertEquals("$label: premise: in the foreground", true, back.foreground)
+            // Inside the cooldown: a drop right after the return.
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: a newer Connection is taken inside the cooldown", deadline) {
+                rig.eventsView().connection?.let { it.first == baseConnection.first && it.second > baseConnection.second } == true
+            }
+            val inside = kotlinx.datetime.Clock.System.now() - resync
+            assertTrue("$label: premise: taken less than 30 s after the return's resync ($inside)", inside < 30.seconds)
+            val held = rig.eventsView()
+            assertEquals("$label: no trigger inside the cooldown", base.sequence + 1, held.sequence)
+            assertEquals("$label: the resync is unchanged", resync, held.lastResync)
+            val heldConnection = checkNotNull(held.connection)
+            // After the cooldown.
+            untilEpoch(resync.toEpochMilliseconds() + 31_000)
+            awaitTrue("$label: the live socket acknowledged usd", deadline) { synchronized(usdAcked) { usdAcked.lastOrNull() } === openSockets.last() }
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: a newer Connection of the same session is taken after the cooldown", deadline) {
+                rig.eventsView().connection?.let { it.first == heldConnection.first && it.second > heldConnection.second } == true
+            }
+            awaitTrue("$label: one more trigger", deadline) { rig.triggers() == base.sequence + 2 }
+            val later = rig.eventsView()
+            val second = checkNotNull(later.lastResync)
+            assertTrue("$label: taken at least 30 s after the first resync (${second - resync})", second - resync >= 30.seconds)
+            assertEquals("$label: premise: in the foreground", true, later.foreground)
+            assertEquals("$label: premise: the same 600 s bucket", bucket, System.currentTimeMillis() / 600_000)
+            awaitTrue("$label: the live socket acknowledged usd", deadline) { synchronized(usdAcked) { usdAcked.lastOrNull() } === openSockets.last() }
+            awaitTrue("$label: settled", deadline) { sends.all().all { it.bodyEnd != null } }
+            delay(1_000)
+            assertEquals("$label: exactly two triggers", base.sequence + 2, rig.triggers())
+            assertTrue("$label: the return's round sent a 1d tab", tabs().size > tabsBase)
+            assertEquals("$label: the demand is met", com.jay.fxi.data.graph.GraphTabRecoveryDemand.None, rig.usdDemand())
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 140_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT05-T04(a) with RT05-T01(b): a boundary passes. Aligned 45 s before a 600 s boundary B, after the common preparation the
+     * next recovery round's 1d tab is held at the server. Up to 1 s before B no trigger is issued. After B exactly one trigger
+     * is issued within B + 15 s and handled by the coordinator, the events' Connection and foreground unchanged and their
+     * bucket moved from C (= B − 600 s) to B. Retention (T01b), sampled once that trigger is seen — the boundary's retain runs
+     * before it in the same step, and before any response is applied: before B, 144 closed pending starts and C pending;
+     * after, the closed pending starts are (before − the oldest) ∪ {C}, 144, B is not pending, kb.usd's demand generation is
+     * unchanged and C keeps its demand (no new generation). While the answer is held, kb.usd's tip, observations and buckets
+     * (each with its high, low and close) are as before B, and the boundary round sends exactly one 1d tab. Released with every
+     * closed start, the demand is met; at the end there is still exactly one trigger and one 1d tab after the preparation.
+     */
+    @Test
+    fun `RT05-T04a a boundary issues one trigger and its retain moves only the window`() = runBlocking {
+        val label = "RT05-T04a"
+        val boundary = alignToBoundary(label, 45_000)
+        val start = nowMillis()
+        val deadline = start + 80_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        val release = java.util.concurrent.CountDownLatch(1)
+        rig.row {
+            try {
+                rig.prepare3c(label, deadline)
+                val answer = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                onTab = { release.await(14, java.util.concurrent.TimeUnit.SECONDS); ok(answer.get() ?: usdTab(closedStarts())) }
+                val base = rig.eventsView()
+                val tabsBase = tabs().size
+                val c = boundary / 1000 - 600
+                assertTrue("$label: premise: prepared before B − 2 s", System.currentTimeMillis() < boundary - 2_000)
+                untilEpoch(boundary - 1_000)
+                val beforeView = rig.eventsView()
+                assertEquals("$label: no trigger up to 1 s before B", base.sequence, beforeView.sequence)
+                assertEquals("$label: premise: the events' bucket is C", c, beforeView.bucket?.epochSeconds)
+                val closedBefore = rig.kbClosedPending()
+                assertEquals("$label: premise: 144 closed pending starts before B", 144, closedBefore.size)
+                assertTrue("$label: premise: C is pending before B", c in rig.kbPendingAll())
+                val appBefore = rig.kbApp()
+                val stateBefore = checkNotNull(rig.kbState())
+                val triggerBy = nowMillis() + (boundary + 15_000 - System.currentTimeMillis())
+                awaitTrue("$label: one trigger after B", triggerBy) { rig.triggers() == base.sequence + 1 }
+                val after = rig.eventsView()
+                val closedAfter = rig.kbClosedPending()
+                val pendingAfter = rig.kbPendingAll()
+                val stateAfter = checkNotNull(rig.kbState())
+                assertEquals("$label: exactly one", base.sequence + 1, after.sequence)
+                assertEquals("$label: the bucket moved to B", boundary / 1000, after.bucket?.epochSeconds)
+                assertEquals("$label: the Connection is unchanged", base.connection, after.connection)
+                assertEquals("$label: in the foreground", true, after.foreground)
+                awaitTrue("$label: the coordinator handled it", deadline) { rig.coordinatorTriggerSequence() >= after.sequence }
+                assertEquals("$label: T01b: the closed pending starts are (before − the oldest) ∪ {C}",
+                    (closedBefore - closedBefore.min()) + c, closedAfter)
+                assertEquals("$label: T01b: 144 of them", 144, closedAfter.size)
+                assertFalse("$label: T01b: B is not pending", boundary / 1000 in pendingAfter)
+                assertEquals("$label: T01b: no new demand generation", stateBefore.generation, stateAfter.generation)
+                assertEquals("$label: T01b: C keeps its demand",
+                    stateBefore.pending.entries.single { it.key.epochSeconds == c }.value,
+                    stateAfter.pending.entries.single { it.key.epochSeconds == c }.value)
+                awaitTrue("$label: the boundary round sends its 1d tab", deadline) { tabs().size > tabsBase }
+                delay(500)
+                assertEquals("$label: exactly one 1d tab in the boundary round (held)",
+                    listOf("usd" to "1d"), tabs().drop(tabsBase).map { it.param("tab") to it.param("period") })
+                assertEquals("$label: premise: still held", null, tabs().last().bodyEnd)
+                assertEquals("$label: kb.usd's tip, observations and buckets are as before B", appBefore, rig.kbApp())
+                answer.set(usdTab(closedStarts()))
+                release.countDown()
+                awaitTrue("$label: released, the demand is met", deadline) {
+                    rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None
+                }
+                awaitTrue("$label: settled", deadline) { sends.all().all { it.bodyEnd != null } }
+                quiet(label, 1_000)
+                assertEquals("$label: at the end, still exactly one trigger", base.sequence + 1, rig.triggers())
+                assertEquals("$label: at the end, still exactly one 1d tab after the preparation", tabsBase + 1, tabs().size)
+            } finally {
+                release.countDown()
+            }
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 80_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
+    /**
+     * RT05-T04(b): a boundary moves while a recovery response is held. Aligned 30 s before B, after the common preparation the
+     * next round's 1d tab is held at the server (an operational 15 s read timeout bounds the hold, so the drop comes at B − 3.2 s
+     * — with the rig's zero jitter the first reconnect of the first socket waits 1.6 s (TopicReconnectPolicy, attempt 1) — and
+     * the hold is checked under 14 s; the boundary may be seen up to one 10 s tick after B). The server drops the first socket:
+     * the events take a newer Connection and issue one trigger (RECONNECT, the cooldown met), and its round's 1d tab is
+     * registered, sent and held. The request registration, recovery budget, rounds, capture generation and request source are
+     * sampled, and then, still before B, no further trigger and the coordinator not past it. After B exactly one more trigger,
+     * the Connection and foreground unchanged since the reconnect and the bucket moved from C to B. Once the coordinator has
+     * consumed it (its acceptance is not observed directly; the request source is the one that took the reconnect), the same
+     * request registration, recovery budget and rounds remain and no second 1d tab goes ("an in-flight recovery round kept,
+     * duplicates suppressed"; a new round rebound to the request is not exercised). Released with a tab built after B — every
+     * closed start, C included — with no demand generation added since the capture, the demand is met, kb.usd has no closed
+     * pending start and the budget is gone; 5 s later still no other tab and still two triggers.
+     */
+    @Test
+    fun `RT05-T04b a boundary during a held recovery response keeps the round and sends no second tab`() = runBlocking {
+        val label = "RT05-T04b"
+        val boundary = alignToBoundary(label, 30_000)
+        val start = nowMillis()
+        val deadline = start + 70_000
+        entitlements += unauthorized()
+        val rig = Rig()
+        val release = java.util.concurrent.CountDownLatch(1)
+        rig.row {
+            try {
+                rig.prepare3c(label, deadline)
+                val answer = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                onTab = { release.await(14, java.util.concurrent.TimeUnit.SECONDS); ok(answer.get() ?: usdTab(closedStarts())) }
+                val base = rig.eventsView()
+                val baseConnection = checkNotNull(base.connection)
+                val tabsBase = tabs().size
+                val c = boundary / 1000 - 600
+                assertTrue("$label: premise: prepared before B − 3.2 s", System.currentTimeMillis() < boundary - 3_200)
+                untilEpoch(boundary - 3_200)
+                assertEquals("$label: premise: the first socket (its reconnect is attempt 1)", 1, openSockets.size)
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: a newer Connection and one trigger", deadline) {
+                    rig.eventsView().let { v ->
+                        v.sequence == base.sequence + 1 && v.connection?.let { it.first == baseConnection.first && it.second > baseConnection.second } == true
+                    }
+                }
+                val reconnected = rig.eventsView()
+                awaitTrue("$label: the round's 1d tab is registered and sent", deadline) {
+                    tabs().size == tabsBase + 1 && rig.usdTabRegistration().captures != null
+                }
+                val sent = tabs().last()
+                assertEquals("$label: premise: the events' bucket is C", c, reconnected.bucket?.epochSeconds)
+                val request = checkNotNull(rig.usdTabRequestObject())
+                val budget = checkNotNull(rig.usdBudgetObject())
+                val rounds = checkNotNull(rig.usdBudget()).rounds
+                val captured = checkNotNull(rig.usdTabRegistration().captures).first { it.seriesKey.seriesId == "kb.usd" }.capturedGeneration
+                val source = checkNotNull(rig.onMain { rig.assembly.coordinator.state.value.source })
+                // Checked after the samples, so they were all taken before B.
+                assertTrue("$label: premise: registered, sent, held and sampled before B", System.currentTimeMillis() < boundary && sent.bodyEnd == null)
+                assertEquals("$label: premise: no further trigger before B", base.sequence + 1, rig.triggers())
+                assertTrue("$label: premise: the coordinator is not past the reconnect", rig.coordinatorTriggerSequence() <= base.sequence + 1)
+                awaitTrue("$label: one trigger after B", sent.start + 13_000) { rig.triggers() == base.sequence + 2 }
+                val after = rig.eventsView()
+                assertEquals("$label: the bucket moved to B", boundary / 1000, after.bucket?.epochSeconds)
+                assertEquals("$label: the Connection is unchanged since the reconnect", reconnected.connection, after.connection)
+                assertEquals("$label: in the foreground", true, after.foreground)
+                awaitTrue("$label: the coordinator consumed it", sent.start + 13_500) { rig.coordinatorTriggerSequence() >= after.sequence }
+                assertEquals("$label: premise: the request source is the one that took the reconnect", source,
+                    rig.onMain { rig.assembly.coordinator.state.value.source })
+                assertSame("$label: the same request registration", request, rig.usdTabRequestObject())
+                assertSame("$label: the same recovery budget", budget, rig.usdBudgetObject())
+                assertEquals("$label: the same rounds", rounds, checkNotNull(rig.usdBudget()).rounds)
+                assertEquals("$label: no second 1d tab", tabsBase + 1, tabs().size)
+                assertEquals("$label: no demand generation added since the capture", captured, checkNotNull(rig.kbState()).generation)
+                val starts = closedStarts()
+                assertTrue("$label: premise: the answer gives C", c in starts)
+                answer.set(usdTab(starts))
+                assertTrue("$label: premise: released within 14 s of the send", nowMillis() - sent.start < 14_000)
+                release.countDown()
+                awaitTrue("$label: released, the demand is met", deadline) {
+                    rig.usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None
+                }
+                assertEquals("$label: no closed pending start", emptySet<Long>(), rig.kbClosedPending())
+                awaitTrue("$label: the budget is gone", deadline) { rig.usdBudgetObject() == null }
+                assertEquals("$label: premise: the held tab was answered", 200, tabs()[tabsBase].status)
+                quiet(label, 5_000)
+                assertEquals("$label: still no other tab", tabsBase + 1, tabs().size)
+                assertEquals("$label: still two triggers", base.sequence + 2, rig.triggers())
+            } finally {
+                release.countDown()
+            }
+        }
+        assertEquals("no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("within the row deadline", nowMillis() - start <= 70_000)
+        ColdStartBudget.assertWithin(judgeRow(label))
+    }
+
     // --- CUT-C01 batch 2a: RT03b-Q06 (cut_c01_b2_agreed.r1.md) ---------------------------------------------------------------
 
     /**
@@ -6435,9 +6835,10 @@ class PremiumGraphCutoverAcceptanceTest {
     /**
      * The common preparation (codex §3-2 ①–④): a real REST bootstrap of the usd topic creates kb.usd in the recorder, then
      * the first current-time WS snapshot on the acknowledged socket resumes that path, which demands the last 24 h of closed
-     * buckets.
+     * buckets. With [route] (batch 3, cut_c01_b3_agreed.r1.md §4-2) the screen is opened through the route stand-in instead
+     * of [Rig.openScreen]. Returns the usd holder.
      */
-    private suspend fun Rig.prepareClosedDemand(deadline: Long, krx: Boolean = false) {
+    private suspend fun Rig.prepareClosedDemand(deadline: Long, krx: Boolean = false, route: Boolean = false): GraphV2ScreenStateHolder? {
         usdSnapshotLive = true
         if (krx) onCatalog = { ok(fixture("catalog-krx-visible.json")) }
         // The first tab answers only once the catalog is adopted, so no cold recovery budget is left from the start and the
@@ -6450,7 +6851,7 @@ class PremiumGraphCutoverAcceptanceTest {
             }
             ok(fixture(if (krx) "usd-1d-krx-visible.json" else "usd-1d-krx-hidden.json"))
         }
-        coldStart(deadline)
+        val holder = if (route) coldStartRoute(deadline).second else coldStart(deadline)
         awaitTrue("catalog adopted", deadline) { catalogAdopted() }
         awaitTrue("the first tab applied", deadline) { usdApplied() && tabs().all { it.bodyEnd != null } }
         awaitTrue("the REST delivery created kb.usd", deadline) { hasKbSeries() }
@@ -6460,6 +6861,7 @@ class PremiumGraphCutoverAcceptanceTest {
         awaitTrue("a closed demand from the resumed WS path", deadline) {
             usdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.Pending(closed = true, mappingWait = false)
         }
+        return holder
     }
 
     /**
