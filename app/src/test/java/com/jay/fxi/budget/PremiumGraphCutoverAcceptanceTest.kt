@@ -1006,7 +1006,7 @@ class PremiumGraphCutoverAcceptanceTest {
         val rig = Rig()
         rig.row {
             rig.coldStart(deadline)
-            assertEquals("premise: every FX holder mounted", setOf("usd", "jpy", "eur"), rig.onMain { checkNotNull(rig.mount).holders.value.keys })
+            assertEquals("premise: every graph holder mounted (S5-2a: tether too)", setOf("usd", "jpy", "eur", "tether"), rig.onMain { checkNotNull(rig.mount).holders.value.keys })
             awaitTrue("the tab applied", deadline) { rig.usdApplied() }
             rig.awaitTopics(deadline)
             quiet("A07c", 5_000)

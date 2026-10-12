@@ -19,7 +19,7 @@ internal data class PremiumFxGraphSlot(
 
 /** The mount owner is not an access grant; currentState() performs the holder's live checks. */
 internal fun PremiumFxGraphSlot.acceptedState(owner: TopicDisplayOwner, tab: FreeTab): GraphV2ScreenState? {
-    if (this.owner != owner || tab !in listOf(FreeTab.USD, FreeTab.JPY, FreeTab.EUR)) return null
+    if (this.owner != owner || tab !in listOf(FreeTab.USD, FreeTab.JPY, FreeTab.EUR, FreeTab.TETHER)) return null
     val fresh = currentState()
     if (fresh.tab != tab.serverTab) return null
     if (fresh.inlineToken?.let { it.owner != owner || it.tab != fresh.tab } == true ||

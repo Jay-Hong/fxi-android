@@ -441,7 +441,7 @@ class TopicRuntimeOwnerGraphContractTest {
         assertEquals("CC5-2-H01 made once", 1, g.hostsMade)
         val mount = host.open()
         h.settle(100)
-        assertEquals("CC5-2-H01 one started holder per tab", setOf("usd", "jpy", "eur"), mount.holders.value.keys)
+        assertEquals("CC5-2-H01 one started holder per tab (S5-2a: tether too)", setOf("usd", "jpy", "eur", "tether"), mount.holders.value.keys)
         val runtime = h.runtime()
         assertTrue("CC5-2-H01 each over the runtime's display and focus, on the owner's Main scope", g.holderArgs.all { (display, focus, scope) ->
             display === runtime.display && focus === runtime.focus && scope === h.ownerMain })
@@ -515,7 +515,7 @@ class TopicRuntimeOwnerGraphContractTest {
         val mount = checkNotNull(h.owner.graphHost.value).open()
         h.settle(100)
         assertSame("CC5-2-H06 reported to the owner's graph report", boom, g.reports.single())
-        assertEquals("CC5-2-H06 the other tabs mount", setOf("usd", "eur"), mount.holders.value.keys)
+        assertEquals("CC5-2-H06 the other tabs mount", setOf("usd", "eur", "tether"), mount.holders.value.keys)
         mount.close()
         h.settle(100)
         g.close()

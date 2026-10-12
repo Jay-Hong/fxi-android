@@ -20,7 +20,7 @@ import kotlinx.coroutines.launch
  * Scope cancellation is terminal for this host; open() rejects an inactive scope by returning an already-closed mount.
  * Its holder map stays empty and close() is a no-op; no holder creation is scheduled and cancellation is not reported to [onFailure].
  *
- * A mount holds one holder per FX tab (usd, jpy, eur), shared by its inline and fullscreen surfaces. A holder for a tab is
+ * A mount holds one holder per graph tab (usd, jpy, eur, tether), shared by its inline and fullscreen surfaces. A holder for a tab is
  * created and started only after the previous holder for that tab has finished closing, so two holders never hold the same
  * selection key at once. "Finished" requires normal return from both holder.close() and [closeHolder].
  * A failed, cancelled or unexecuted close never permits a new holder for that tab. At most one mount is open: opening one closes the open one first.
@@ -114,7 +114,7 @@ internal class GraphScreenHost(
     }
 
     private companion object {
-        val TABS = listOf("usd", "jpy", "eur")
+        val TABS = listOf("usd", "jpy", "eur", "tether")
     }
 }
 

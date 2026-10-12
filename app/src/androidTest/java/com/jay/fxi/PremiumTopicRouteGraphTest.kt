@@ -246,26 +246,30 @@ class PremiumTopicRouteGraphTest {
         val built = newBuilt()
         host = newHost(built)
         show()
-        until("CC5-3-R01 three holders mounted") { onMain { built.toList().count { !it.closed() } } == 3 }
-        until("CC5-3-R01 only the usd holder, for o1") { requests(built) == mapOf("usd" to o1, "jpy" to null, "eur" to null) }
+        until("CC5-3-R01 four holders mounted") { onMain { built.toList().count { !it.closed() } } == 4 }
+        until("CC5-3-R01 only the usd holder, for o1") { requests(built) == mapOf("usd" to o1, "jpy" to null, "eur" to null, "tether" to null) }
         focus.value = OwnedTopicFocus(a1, FreeTab.JPY); rule.waitForIdle()
-        until("CC5-3-R01 moved to jpy, usd released") { requests(built) == mapOf("usd" to null, "jpy" to o1, "eur" to null) }
+        until("CC5-3-R01 moved to jpy, usd released") { requests(built) == mapOf("usd" to null, "jpy" to o1, "eur" to null, "tether" to null) }
         focus.value = OwnedTopicFocus(a1, FreeTab.EUR); rule.waitForIdle()
-        until("CC5-3-R01 moved to eur") { requests(built) == mapOf("usd" to null, "jpy" to null, "eur" to o1) }
+        until("CC5-3-R01 moved to eur") { requests(built) == mapOf("usd" to null, "jpy" to null, "eur" to o1, "tether" to null) }
+        focus.value = OwnedTopicFocus(a1, FreeTab.TETHER); rule.waitForIdle()
+        until("CC5-3-R01 moved to tether") { requests(built) == mapOf("usd" to null, "jpy" to null, "eur" to null, "tether" to o1) }
     }
 
-    /** CC5-3-R02: TETHER and NEWS release the activation; coming back to usd activates it again. */
-    @Test fun cc53_R02_tetherAndNewsReleaseTheActivation() {
+    /** CC5-3-R02 (S5-2a): NEWS releases the activation while TETHER moves it to the tether holder; back on usd it returns. */
+    @Test fun cc53_R02_newsReleasesTheActivationAndTetherTakesIt() {
         val built = newBuilt()
         host = newHost(built)
         show()
         until("CC5-3-R02 premise: usd active") { requests(built)["usd"] == o1 }
-        for (tab in listOf(FreeTab.TETHER, FreeTab.NEWS)) {
-            focus.value = OwnedTopicFocus(a1, tab); rule.waitForIdle()
-            until("CC5-3-R02 $tab releases it") { requests(built).values.all { it == null } }
-            focus.value = OwnedTopicFocus(a1, FreeTab.USD); rule.waitForIdle()
-            until("CC5-3-R02 back on usd after $tab") { requests(built)["usd"] == o1 }
-        }
+        focus.value = OwnedTopicFocus(a1, FreeTab.TETHER); rule.waitForIdle()
+        until("CC5-3-R02 tether takes it") { requests(built) == mapOf("usd" to null, "jpy" to null, "eur" to null, "tether" to o1) }
+        focus.value = OwnedTopicFocus(a1, FreeTab.USD); rule.waitForIdle()
+        until("CC5-3-R02 back on usd after tether") { requests(built)["usd"] == o1 && requests(built)["tether"] == null }
+        focus.value = OwnedTopicFocus(a1, FreeTab.NEWS); rule.waitForIdle()
+        until("CC5-3-R02 news releases it") { requests(built).values.all { it == null } }
+        focus.value = OwnedTopicFocus(a1, FreeTab.USD); rule.waitForIdle()
+        until("CC5-3-R02 back on usd after news") { requests(built)["usd"] == o1 }
     }
 
     /** CC5-3-R03: an inactive route releases the activation and an active one takes it back; a new owner moves it to that owner. */
@@ -289,7 +293,7 @@ class PremiumTopicRouteGraphTest {
         show()
         until("CC5-3-R04 premise: usd active") { requests(built)["usd"] == o1 }
         shown = false; rule.waitForIdle()
-        until("CC5-3-R04 every holder closed") { onMain { built.size == 3 && built.toList().all { it.closed() } } }
+        until("CC5-3-R04 every holder closed") { onMain { built.size == 4 && built.toList().all { it.closed() } } }
     }
 
     /**
@@ -300,7 +304,7 @@ class PremiumTopicRouteGraphTest {
         val built = newBuilt()
         host = newHost(built)
         show()
-        until("CC5-3-R06 premise: three holders bound to A") { onMain { built.size == 3 && built.toList().all { it.field("boundIdentity") == a1 } } }
+        until("CC5-3-R06 premise: four holders bound to A") { onMain { built.size == 4 && built.toList().all { it.field("boundIdentity") == a1 } } }
         val b1 = AuthIdentityFence("B", 1L)
         live = b1
         identity = b1; rule.waitForIdle()
@@ -355,7 +359,7 @@ class PremiumTopicRouteGraphTest {
         until("CC5-3-R09 premise: usd active") { requests(built)["usd"] == o1 }
         shown = false; rule.waitForIdle()
         shown = true; rule.waitForIdle()
-        until("CC5-3-R09 a new set of three holders") { onMain { built.size == 6 && built.toList().take(3).all { it.closed() } } }
+        until("CC5-3-R09 a new set of four holders") { onMain { built.size == 8 && built.toList().take(4).all { it.closed() } } }
         until("CC5-3-R09 the new usd holder is active") { requests(built)["usd"] == o1 }
     }
 
@@ -374,14 +378,14 @@ class PremiumTopicRouteGraphTest {
         until("CC5-3-R05 the second host's usd active") { requests(second)["usd"] == o1 }
         host = null; rule.waitForIdle()
         until("CC5-3-R05 a null host: the mount closed") { onMain { second.toList().all { it.closed() } } }
-        assertEquals("CC5-3-R05 nothing more mounted", 3, second.size)
+        assertEquals("CC5-3-R05 nothing more mounted", 4, second.size)
     }
 
     /** Answers at once: a catalog of two KRW series per FX tab and period (only [x] shown by default) and their data. */
     private fun answering(): GraphV2Fetching = object : GraphV2Fetching {
         private fun <T> ok(body: T) = AuthenticatedHttpResponse(200, okhttp3.Headers.headersOf(), body, null, byteArrayOf(1))
         override suspend fun catalog(owner: AuthSnapshot, useAdmitted: () -> Boolean) = ok(GraphV2CatalogResponse(
-            tabs = listOf("usd", "jpy", "eur").map { tab ->
+            tabs = listOf("usd", "jpy", "eur", "tether").map { tab ->
                 GraphV2CatalogTab(tab, tab, emptyMap(), GraphPeriod.entries.associate {
                     it.code to GraphV2CatalogPeriod(listOf(x(tab), y(tab)), listOf(x(tab)))
                 })

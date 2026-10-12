@@ -172,11 +172,17 @@ class PremiumTopicPresenterTest {
         assertEquals("C3b-09 every arrival offered", setOf("investing", "kb", "upbit", "bithumb"), entries.map { it.code }.toSet())
         assertEquals("C3b-09 hidden ones", setOf("investing", "kb", "upbit"), entries.filterNot { it.visible }.map { it.code }.toSet())
         assertTrue("C3b-09 nothing temporary while one is shown", entries.none { it.projected })
+        assertEquals("C3b-09 the rows drawn", listOf("bithumb"),
+            present(FreeTab.TETHER, display(r), prefs).rateSections.flatMap { it.rows }.map { it.id })
 
         val allHidden = mapOf(RateRowList.TETHER_EXCHANGES to RateRowPreference(hidden = setOf("investing", "kb", "upbit", "bithumb")))
         val rescued = present(FreeTab.TETHER, display(r), allHidden).rowEditors.single { it.list == RateRowList.TETHER_EXCHANGES }.entries
         assertEquals("C3b-09 one temporary", 1, rescued.count { it.projected })
         assertEquals("C3b-09 the temporary one is still a hidden choice", false, rescued.single { it.projected }.visible)
+        assertEquals("C3b-09 the temporary one is upbit", "upbit", rescued.single { it.projected }.code)
+        val shown = present(FreeTab.TETHER, display(r), allHidden)
+        assertEquals("C3b-09 the all-hidden list draws the temporary row", listOf("upbit"), shown.rateSections.flatMap { it.rows }.map { it.id })
+        assertEquals("C3b-09 the raw hidden choice is untouched", setOf("investing", "kb", "upbit", "bithumb"), allHidden.getValue(RateRowList.TETHER_EXCHANGES).hidden)
     }
 
     @Test fun `C3b-10 an unarrived source keeps its seat and its hidden choice, and a new one keeps the place given`() {
@@ -187,6 +193,21 @@ class PremiumTopicPresenterTest {
             order = listOf("investing", "hana", "kb"),
             hidden = setOf("kb"))
         assertEquals("C3b-10", RateRowPreference(order = listOf("investing", "sc", "hana", "bs", "kb"), hidden = setOf("sc", "kb")), next)
+    }
+
+    /** S5-2a: the same raw-preference keeping for the tether list - an unarrived exchange keeps its seat and its hidden choice. */
+    @Test fun `C3b-10t the tether list keeps an unarrived exchange's seat and hidden choice`() {
+        val next = PremiumTopicPresenter.nextRowPreference(
+            RateRowList.TETHER_EXCHANGES,
+            stored = RateRowPreference(order = listOf("upbit", "gopax", "bithumb", "kb", "korbit"), hidden = setOf("gopax", "korbit")),
+            seeded = listOf("upbit", "bithumb", "kb", "investing"),
+            order = listOf("investing", "bithumb", "upbit", "kb"),
+            hidden = setOf("upbit"))
+        assertEquals(
+            "C3b-10t",
+            RateRowPreference(order = listOf("investing", "gopax", "bithumb", "upbit", "korbit", "kb"), hidden = setOf("gopax", "korbit", "upbit")),
+            next
+        )
     }
 
     @Test fun `C3b-11 an unchanged order is not recorded, and hidden choices outside the sheet are kept`() {

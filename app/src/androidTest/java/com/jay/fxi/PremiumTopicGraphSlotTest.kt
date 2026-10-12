@@ -2,6 +2,11 @@ package com.jay.fxi
 
 import androidx.activity.ComponentActivity
 import androidx.compose.material3.Text
+import androidx.compose.ui.test.swipeUp
+import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.height
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -161,6 +166,7 @@ class PremiumTopicGraphSlotTest {
 
     private var state by mutableStateOf(PremiumTopicScreenState.NONE)
     private var slot by mutableStateOf<PremiumFxGraphSlot?>(null)
+    private var below by mutableStateOf<(@androidx.compose.runtime.Composable (FreeTab) -> Unit)?>(null)
     private val selections = mutableListOf<Pair<TopicDisplayOwner, FreeTab>>()
 
     private fun show(initial: PremiumTopicScreenState, initialSlot: PremiumFxGraphSlot?) {
@@ -175,7 +181,8 @@ class PremiumTopicGraphSlotTest {
                 onApplyRows = { _, _, _, _, _, _ -> },
                 onOpenSettings = {},
                 newsContent = { visible -> Text(if (visible) "뉴스 보임" else "뉴스 숨김") },
-                graphSlot = slot
+                graphSlot = slot,
+                belowRates = below
             )
         }
         rule.waitForIdle()
@@ -195,11 +202,11 @@ class PremiumTopicGraphSlotTest {
 
     // --- 11a / 11b: where the graph is drawn -------------------------------------------------------------------------
 
-    /** S1: on each FX tab the graph is drawn once, above the tab's rates; the rate fullscreen carries no graph. */
-    @Test fun S1_onEachFxTabTheGraphIsAboveTheRatesAndNotInTheRateFullscreen() {
+    /** S1: on each FX tab and the tether tab the graph is drawn once, above the tab's rates; the rate fullscreen carries no graph. */
+    @Test fun S1_onEachGraphTabTheGraphIsAboveTheRatesAndNotInTheRateFullscreen() {
         val fake = FakeSlot(graph("usd"))
         show(screen(FreeTab.USD), fake.slot)
-        for ((tab, code) in listOf(FreeTab.USD to "usd", FreeTab.JPY to "jpy", FreeTab.EUR to "eur")) {
+        for ((tab, code) in listOf(FreeTab.USD to "usd", FreeTab.JPY to "jpy", FreeTab.EUR to "eur", FreeTab.TETHER to "tether")) {
             fake.publish(graph(code))
             state = screen(tab)
             rule.waitForIdle()
@@ -214,14 +221,66 @@ class PremiumTopicGraphSlotTest {
         assertEquals(0, countUnder(fullRoot, PremiumTopicTags.FULLSCREEN_LAYER))
     }
 
-    /** S2: tether and news draw no graph even with a slot; a null slot leaves the screen as it was on every tab. */
-    @Test fun S2_tetherNewsAndANullSlotDrawNoGraph() {
+    /**
+     * S8 (S5-2a): the slot below the rates comes after the graph and the rates in the same page, on an FX tab and on the tether
+     * tab alike; the rate fullscreen does not carry it, and without content there is no slot at all.
+     */
+    @Test fun S8_theSlotBelowTheRatesComesAfterTheGraphAndTheRates() {
+        val fake = FakeSlot(graph("usd"))
+        below = { tab -> Text("below:${tab.name}", Modifier.testTag("below_marker")) }
+        show(screen(FreeTab.USD), fake.slot)
+        for ((tab, code) in listOf(FreeTab.USD to "usd", FreeTab.TETHER to "tether")) {
+            fake.publish(graph(code))
+            state = screen(tab)
+            rule.waitForIdle()
+            assertEquals("$tab: one slot", 1, count(PremiumTopicTags.BELOW_RATES))
+            assertEquals("$tab: its content inside the slot", 1, countUnder("below_marker", PremiumTopicTags.BELOW_RATES))
+            val graphTop = node(inlineRoot).fetchSemanticsNode().boundsInRoot.top
+            val ratesBottom = node(PremiumTopicTags.RATES).fetchSemanticsNode().boundsInRoot.bottom
+            val slotTop = node(PremiumTopicTags.BELOW_RATES).fetchSemanticsNode().boundsInRoot.top
+            assertTrue("$tab: graph, then rates, then the slot", graphTop < ratesBottom && ratesBottom <= slotTop)
+        }
+        node(PremiumTopicTags.FULLSCREEN).performClick(); rule.waitForIdle()
+        assertEquals("not in the rate fullscreen", 0, countUnder(PremiumTopicTags.BELOW_RATES, PremiumTopicTags.FULLSCREEN_LAYER))
+        node(PremiumTopicTags.FULLSCREEN_CLOSE).performClick(); rule.waitForIdle()
+        below = null; rule.waitForIdle()
+        assertEquals("no content, no slot", 0, count(PremiumTopicTags.BELOW_RATES))
+    }
+
+    /**
+     * S9 (S5-2a): without a graph, a slot below the rates still scrolls with them as one page - the heading and the slot's far end
+     * move up together - instead of staying fixed under a separately scrolling rate list.
+     */
+    @Test fun S9_withoutAGraphTheSlotScrollsWithTheRates() {
+        below = { _ ->
+            androidx.compose.foundation.layout.Column {
+                androidx.compose.foundation.layout.Spacer(Modifier.height(1500.dp))
+                Text("end", Modifier.testTag("below_end"))
+            }
+        }
+        show(screen(FreeTab.TETHER), null)
+        assertEquals("no graph", 0, count(inlineRoot))
+        // Unclipped positions: boundsInRoot is clipped to the screen and does not move for a node below it.
+        val headingBefore = node(PremiumTopicTags.HEADING).fetchSemanticsNode().positionInRoot.y
+        val endBefore = node("below_end").fetchSemanticsNode().positionInRoot.y
+        node(PremiumTopicTags.HEADING).performTouchInput { swipeUp() }
+        rule.waitForIdle()
+        val headingAfter = node(PremiumTopicTags.HEADING).fetchSemanticsNode().positionInRoot.y
+        val endAfter = node("below_end").fetchSemanticsNode().positionInRoot.y
+        assertTrue("the page moved: heading $headingBefore -> $headingAfter", headingAfter < headingBefore)
+        assertEquals("the slot moved with it", headingBefore - headingAfter, endBefore - endAfter, 1f)
+    }
+
+    /**
+     * S2 (S5-2a): the tether tab draws the tether graph; another tab's graph published to it draws nothing, news draws nothing
+     * even with a slot, and a null slot leaves the screen as it was on every tab.
+     */
+    @Test fun S2_tetherDrawsItsOwnGraph_newsAndANullSlotDrawNone() {
         val fake = FakeSlot(graph("usd"))
         show(screen(FreeTab.TETHER), fake.slot)
-        assertEquals("tether", 0, count(inlineRoot))
-        // Even a graph of the tether tab itself: this slot is the FX graph's, not a tether graph.
+        assertEquals("tether with the usd graph", 0, count(inlineRoot))
         fake.publish(graph("tether"))
-        assertEquals("tether with a tether graph", 0, count(inlineRoot))
+        assertEquals("tether with a tether graph", 1, count(inlineRoot))
         state = screen(FreeTab.NEWS); rule.waitForIdle()
         assertEquals("news", 0, count(inlineRoot))
         slot = null

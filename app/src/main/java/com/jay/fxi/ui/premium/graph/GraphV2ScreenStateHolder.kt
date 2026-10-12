@@ -128,7 +128,7 @@ internal class GraphV2ScreenStateHolder(
     private val recorder: GraphRecorder? = null
 ) {
     init {
-        require(tab in setOf("usd", "jpy", "eur")) { "Premium FX graph tab required" }
+        require(tab in setOf("usd", "jpy", "eur", "tether")) { "Premium graph tab required" }
     }
 
     private data class Context(
@@ -501,7 +501,7 @@ internal class GraphV2ScreenStateHolder(
         restoring = null
         binding = selectionSession.bind(identity)?.also {
             require(it.key.audience == GraphSelectionAudience.PREMIUM && it.key.tab == tab) {
-                "Selection session must belong to this premium FX tab"
+                "Selection session must belong to this premium graph tab"
             }
         }
         notice = null

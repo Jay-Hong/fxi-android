@@ -93,7 +93,8 @@ internal fun PremiumTopicScreen(
     onOpenSettings: () -> Unit,
     newsContent: @Composable (isTabVisible: Boolean) -> Unit,
     modifier: Modifier = Modifier,
-    graphSlot: PremiumFxGraphSlot? = null
+    graphSlot: PremiumFxGraphSlot? = null,
+    belowRates: (@Composable (FreeTab) -> Unit)? = null
 ) {
     val owner = state.ui.owner
     val selectedTab = state.ui.selectedTab
@@ -116,7 +117,7 @@ internal fun PremiumTopicScreen(
             // The provider starts a fresh composition per owner key, so nothing remembered crosses owners.
             ownerState.SaveableStateProvider(ownerKey) {
                 PremiumTopicOwnedScreen(state, owner, selectedTab, onUserTabSelected, onRetryConnection,
-                    onRetryTopics, onApplyRows, onOpenSettings, newsContent, graphSlot)
+                    onRetryTopics, onApplyRows, onOpenSettings, newsContent, graphSlot, belowRates)
             }
         }
     }
@@ -136,7 +137,8 @@ private fun PremiumTopicOwnedScreen(
     onApplyRows: (TopicDisplayOwner, FreeTab, RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onOpenSettings: () -> Unit,
     newsContent: @Composable (Boolean) -> Unit,
-    graphSlot: PremiumFxGraphSlot?
+    graphSlot: PremiumFxGraphSlot?,
+    belowRates: (@Composable (FreeTab) -> Unit)?
 ) {
     val tabs = FreeTab.entries
     val pager = rememberPagerState(initialPage = selectedTab.ordinal) { tabs.size }
@@ -272,7 +274,7 @@ private fun PremiumTopicOwnedScreen(
                                 PremiumTopicRates(state.ui, scroll, fullscreen = false, onToggleFullscreen = { fullscreen = true },
                                     onOpenEditor = openEditor, graphContent = if (graph != null && graphActions != null) {
                                         { GraphV2Section(graph, graphActions, hostExposed = overlay == PremiumTopicOverlay.NONE) }
-                                    } else null)
+                                    } else null, belowRates = belowRates?.let { content -> { content(tab) } })
                             } else {
                                 Box(Modifier.fillMaxSize())
                             }
@@ -316,10 +318,14 @@ private fun PremiumTopicRates(
     onToggleFullscreen: () -> Unit,
     onOpenEditor: (RateRowEditor) -> Unit,
     modifier: Modifier = Modifier,
-    graphContent: (@Composable () -> Unit)? = null
+    graphContent: (@Composable () -> Unit)? = null,
+    /** S5: the stable slot after the rates in the same scroll flow (S8/S9 fill it); the rate fullscreen never gets it. */
+    belowRates: (@Composable () -> Unit)? = null
 ) {
     val metrics = LocalRateLayoutMetrics.current
-    Column(modifier.fillMaxSize().then(if (graphContent != null) Modifier.verticalScroll(scroll) else Modifier)) {
+    // With anything above or below the rates, the whole page scrolls as one; otherwise the rates scroll on their own.
+    val pageScrolls = graphContent != null || belowRates != null
+    Column(modifier.fillMaxSize().then(if (pageScrolls) Modifier.verticalScroll(scroll) else Modifier)) {
         graphContent?.invoke()
         Row(Modifier.fillMaxWidth().padding(horizontal = metrics.horizontalPadding), verticalAlignment = Alignment.CenterVertically) {
             Text(ui.heading.orEmpty(), modifier = Modifier.weight(1f).then(
@@ -331,10 +337,10 @@ private fun PremiumTopicRates(
             }
         }
         Column(
-            Modifier.fillMaxWidth().then(if (graphContent == null) Modifier.weight(1f) else Modifier)
+            Modifier.fillMaxWidth().then(if (!pageScrolls) Modifier.weight(1f) else Modifier)
                 .then(if (fullscreen) Modifier else Modifier.testTag(PremiumTopicTags.RATES)
                     .pointerInput(Unit) { detectTapGestures(onDoubleTap = { onToggleFullscreen() }) })
-                .then(if (graphContent == null) Modifier.verticalScroll(scroll) else Modifier)
+                .then(if (!pageScrolls) Modifier.verticalScroll(scroll) else Modifier)
                 .windowInsetsPadding(WindowInsets.navigationBars)
                 .padding(horizontal = metrics.horizontalPadding, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(metrics.rowSpacing)
@@ -361,5 +367,6 @@ private fun PremiumTopicRates(
                     style = MaterialTheme.typography.bodyMedium)
             }
         }
+        belowRates?.let { content -> Box(Modifier.fillMaxWidth().testTag(PremiumTopicTags.BELOW_RATES)) { content() } }
     }
 }

@@ -64,6 +64,10 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphScreenHostContractTest {
 
+    /** S5-2a: the host's tabs, tether included (s5_2_scope_proposal.r3). */
+    private val tabs = listOf("usd", "jpy", "eur", "tether")
+    private fun others(vararg except: String) = (tabs - except.toSet()).toSet()
+
     private class Pause {
         val reached = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
@@ -267,16 +271,16 @@ class GraphScreenHostContractTest {
     @Test fun H01_openCreatesAndStartsOneHolderPerTab() = hostTest { r ->
         val mount = r.host.open()
         r.run()
-        assertEquals(setOf("usd", "jpy", "eur"), r.created.map { it.first }.toSet())
-        assertEquals("each tab once", 3, r.created.size)
+        assertEquals(tabs.toSet(), r.created.map { it.first }.toSet())
+        assertEquals("each tab once", tabs.size, r.created.size)
         val holders = r.created.map { it.second }
         assertEquals(r.created.toMap(), mount.holders.value)
         assertEquals(holders.toSet(), r.host.holders().toSet())
-        assertEquals(3, r.host.holders().size)
+        assertEquals(tabs.size, r.host.holders().size)
         for (holder in holders) {
             assertTrue("started: its selection restored", r.publication(holder) is GraphSelectionPublication.Restored)
         }
-        assertEquals(setOf("confirm:usd", "confirm:jpy", "confirm:eur"), r.store.log.toSet())
+        assertEquals(tabs.map { "confirm:$it" }.toSet(), r.store.log.toSet())
         assertEquals(emptyList<Throwable>(), r.failures)
     }
 
@@ -289,11 +293,11 @@ class GraphScreenHostContractTest {
         assertEquals("out of the mount at once", emptyMap<String, GraphV2ScreenStateHolder>(), mount.holders.value)
         r.run()
         assertEquals(holders.toSet(), r.closeCalls.toSet())
-        assertEquals(3, r.closeCalls.size)
+        assertEquals(tabs.size, r.closeCalls.size)
         for (holder in holders) assertEquals("really closed", GraphSelectionPublication.Unbound, r.publication(holder))
         mount.close()
         r.run()
-        assertEquals("a second close does nothing", 3, r.closeCalls.size)
+        assertEquals("a second close does nothing", tabs.size, r.closeCalls.size)
         assertTrue("closing a mount never ends the host scope", r.hostJob.isActive)
     }
 
@@ -306,7 +310,7 @@ class GraphScreenHostContractTest {
         r.run()
         val b = r.host.open()
         r.run()
-        assertEquals("jpy and eur go ahead", setOf("jpy", "eur"), b.holders.value.keys)
+        assertEquals("the other tabs go ahead", others("usd"), b.holders.value.keys)
         assertEquals("no second usd while the first still closes", 1, r.createdCount("usd"))
         assertFalse("premise: the old usd close is still waiting", r.events.contains("closed:usd"))
         write.release.complete(Unit)
@@ -331,10 +335,10 @@ class GraphScreenHostContractTest {
         r.run()
         assertEquals(old.toSet(), r.closeCalls.toSet())
         val new = b.holders.value.values.toSet()
-        assertEquals(3, new.size)
+        assertEquals(tabs.size, new.size)
         assertTrue("new holders", new.none { it in old })
         assertEquals(new, r.host.holders().toSet())
-        for (tab in listOf("usd", "jpy", "eur")) {
+        for (tab in tabs) {
             assertBefore(r.events, "closed:$tab", "create:$tab")
         }
     }
@@ -346,17 +350,17 @@ class GraphScreenHostContractTest {
         a.close()
         val b = r.host.open()
         r.run()
-        assertEquals(setOf("jpy", "eur"), b.holders.value.keys)
+        assertEquals(others("usd"), b.holders.value.keys)
         b.close()
         val c = r.host.open()
         r.run()
-        assertEquals("c still waits for a's usd", setOf("jpy", "eur"), c.holders.value.keys)
+        assertEquals("c still waits for a's usd", others("usd"), c.holders.value.keys)
         write.release.complete(Unit)
         r.run()
-        assertEquals(setOf("usd", "jpy", "eur"), c.holders.value.keys)
+        assertEquals(tabs.toSet(), c.holders.value.keys)
         assertEquals("closed b made no usd", 2, r.createdCount("usd"))
         assertEquals(emptyMap<String, GraphV2ScreenStateHolder>(), b.holders.value)
-        for (tab in listOf("jpy", "eur")) {
+        for (tab in others("usd")) {
             val lastClosed = r.events.indexOfLast { it == "closed:$tab" }
             val lastCreated = r.events.indexOfLast { it.startsWith("create:$tab") }
             assertTrue("c's $tab only after b's $tab close, the latest, returned: ${r.events}", lastClosed in 0 until lastCreated)
@@ -370,15 +374,15 @@ class GraphScreenHostContractTest {
         r.run()
         r.host.onTimeEvent()
         assertEquals(a.holders.value.values.toSet(), r.forwarded.toSet())
-        assertEquals(3, r.forwarded.size)
+        assertEquals(tabs.size, r.forwarded.size)
         val write = r.holdWrite(a.holders.value.getValue("usd"))
         a.close()
         val b = r.host.open()
         r.run()
         r.forwarded.clear()
         r.host.onTimeEvent()
-        assertEquals("b's jpy and eur only: not a's closing usd, not b's missing usd", b.holders.value.values.toSet(), r.forwarded.toSet())
-        assertEquals(2, r.forwarded.size)
+        assertEquals("b's other tabs only: not a's closing usd, not b's missing usd", b.holders.value.values.toSet(), r.forwarded.toSet())
+        assertEquals(tabs.size - 1, r.forwarded.size)
         write.release.complete(Unit)
         r.run()
     }
@@ -389,7 +393,7 @@ class GraphScreenHostContractTest {
         val a = r.host.open()
         r.run()
         assertEquals(listOf<Throwable>(createFailure), r.failures)
-        assertEquals("the other tabs go ahead", setOf("usd", "eur"), a.holders.value.keys)
+        assertEquals("the other tabs go ahead", others("jpy"), a.holders.value.keys)
         val closeFailure = IOException("after close")
         r.closeHook = { holder ->
             holder.close()
@@ -401,12 +405,12 @@ class GraphScreenHostContractTest {
         r.closeHook = { it.close() }
         val b = r.host.open()
         r.run()
-        assertEquals("usd does not come back; jpy and eur do", setOf("jpy", "eur"), b.holders.value.keys)
+        assertEquals("usd does not come back; the others do", others("usd"), b.holders.value.keys)
         assertEquals(1, r.createdCount("usd"))
         assertEquals("the abandoned usd creation has ended", emptyList<Job>(), r.hostJob.children.toList())
         val c = r.host.open()
         r.run()
-        assertEquals("later mounts keep usd out too", setOf("jpy", "eur"), c.holders.value.keys)
+        assertEquals("later mounts keep usd out too", others("usd"), c.holders.value.keys)
         assertEquals(1, r.createdCount("usd"))
         assertEquals("nothing else reported", 2, r.failures.size)
         assertEquals(emptyList<Throwable>(), r.uncaught)
@@ -428,7 +432,7 @@ class GraphScreenHostContractTest {
         r.closeHook = { it.close() }
         val b = r.host.open()
         r.run()
-        assertEquals("usd does not come back; jpy and eur do", setOf("jpy", "eur"), b.holders.value.keys)
+        assertEquals("usd does not come back; the others do", others("usd"), b.holders.value.keys)
         assertEquals(1, r.createdCount("usd"))
         assertEquals(emptyList<Throwable>(), r.failures)
     }
@@ -443,7 +447,7 @@ class GraphScreenHostContractTest {
         val calls = r.events.filter {
             it.startsWith("create:") || it.startsWith("start:") || it.startsWith("close:") || it.startsWith("time:")
         }
-        assertEquals(12, calls.size)
+        assertEquals("create, start, time and close per tab", 4 * tabs.size, calls.size)
         assertTrue("all on the host dispatcher: $calls", calls.all { it.endsWith(":true") })
     }
 
@@ -468,17 +472,17 @@ class GraphScreenHostContractTest {
         val a = r.host.open()
         r.run()
         val failed = r.created.first { it.first == "usd" }.second
-        assertEquals("not registered", setOf("jpy", "eur"), a.holders.value.keys)
+        assertEquals("not registered", others("usd"), a.holders.value.keys)
         assertFalse(failed in r.host.holders())
         assertEquals("cleaned up once", listOf(failed), r.closeCalls.filter { it === failed })
         a.close()
         val b = r.host.open()
         r.run()
-        assertEquals("no usd while the cleanup close waits", setOf("jpy", "eur"), b.holders.value.keys)
+        assertEquals("no usd while the cleanup close waits", others("usd"), b.holders.value.keys)
         assertEquals(1, r.createdCount("usd"))
         cleanupGate.complete(Unit)
         r.run()
-        assertEquals(setOf("usd", "jpy", "eur"), b.holders.value.keys)
+        assertEquals(tabs.toSet(), b.holders.value.keys)
         val usd = b.holders.value.getValue("usd")
         assertTrue("the new usd restored", r.publication(usd) is GraphSelectionPublication.Restored)
         assertBefore(r.events, "closed:usd", "create:usd")
@@ -504,16 +508,16 @@ class GraphScreenHostContractTest {
         assertTrue("host scope alive", r.hostJob.isActive)
         val b = r.host.open()
         r.run()
-        assertEquals("usd does not come back; the others do", setOf("jpy", "eur"), b.holders.value.keys)
+        assertEquals("usd does not come back; the others do", others("usd"), b.holders.value.keys)
         write.release.complete(Unit)
         r.run()
         assertTrue("premise: the session worker lived and finished the write", r.store.log.contains("wrote:usd"))
-        assertEquals("still no usd", setOf("jpy", "eur"), b.holders.value.keys)
+        assertEquals("still no usd", others("usd"), b.holders.value.keys)
         assertEquals(1, r.createdCount("usd"))
         assertEquals("the abandoned usd creation has ended", emptyList<Job>(), r.hostJob.children.toList())
         val c = r.host.open()
         r.run()
-        assertEquals("later mounts keep usd out too", setOf("jpy", "eur"), c.holders.value.keys)
+        assertEquals("later mounts keep usd out too", others("usd"), c.holders.value.keys)
         assertEquals(1, r.createdCount("usd"))
         assertEquals("cancellation is not reported", emptyList<Throwable>(), r.failures)
         assertEquals(emptyList<Throwable>(), r.uncaught)
@@ -524,7 +528,7 @@ class GraphScreenHostContractTest {
         r.run()
         a.close()
         val closes = r.hostJob.children.toList()
-        assertEquals("premise: three closes scheduled", 3, closes.size)
+        assertEquals("premise: a close per tab scheduled", tabs.size, closes.size)
         closes.forEach { it.cancel() }
         r.run()
         assertEquals("no close ran", emptyList<GraphV2ScreenStateHolder>(), r.closeCalls)
@@ -532,7 +536,7 @@ class GraphScreenHostContractTest {
         val b = r.host.open()
         r.run()
         assertEquals("an unexecuted close is not a normal close", emptyMap<String, GraphV2ScreenStateHolder>(), b.holders.value)
-        assertEquals(3, r.created.size)
+        assertEquals(tabs.size, r.created.size)
         assertEquals(emptyList<Throwable>(), r.failures)
         assertEquals(emptyList<Throwable>(), r.uncaught)
     }
@@ -567,7 +571,7 @@ class GraphScreenHostContractTest {
         a.close()
         val b = r.host.open()
         r.run()
-        assertEquals(setOf("jpy", "eur"), b.holders.value.keys)
+        assertEquals(others("usd"), b.holders.value.keys)
         r.hostScope.cancel()
         write.release.complete(Unit)
         r.run()
@@ -593,7 +597,7 @@ class GraphScreenHostContractTest {
         a.close()
         val b = r.host.open()
         r.run()
-        assertEquals(setOf("jpy", "eur"), b.holders.value.keys)
+        assertEquals(others("usd"), b.holders.value.keys)
         write.release.complete(Unit)
         r.run()
         assertTrue("premise: the usd close returned normally", r.events.contains("closed:usd"))
@@ -615,7 +619,7 @@ class GraphScreenHostContractTest {
         assertSame(map, b.holders.value)
         assertEquals(list, r.host.holders())
         assertEquals(closes, r.closeCalls.size)
-        assertEquals(3, closes)
+        assertEquals(tabs.size, closes)
     }
 
     @Test fun H14_eachTabsPreviousCloseCarriesThroughAClosedMount() = hostTest { r ->
@@ -623,6 +627,7 @@ class GraphScreenHostContractTest {
         r.run()
         val usdWrite = r.holdWrite(a.holders.value.getValue("usd"))
         val eurWrite = r.holdWrite(a.holders.value.getValue("eur"))
+        val tetherWrite = r.holdWrite(a.holders.value.getValue("tether"))
         a.close()
         val b = r.host.open()
         r.run()
@@ -641,12 +646,16 @@ class GraphScreenHostContractTest {
         eurWrite.release.complete(Unit)
         r.run()
         assertEquals(setOf("jpy", "eur"), c.holders.value.keys)
+        tetherWrite.release.complete(Unit)
+        r.run()
+        assertEquals("tether waits for a's tether close like the others", setOf("jpy", "eur", "tether"), c.holders.value.keys)
         usdWrite.release.complete(Unit)
         r.run()
-        assertEquals(setOf("usd", "jpy", "eur"), c.holders.value.keys)
+        assertEquals(tabs.toSet(), c.holders.value.keys)
         assertEquals(emptyMap<String, GraphV2ScreenStateHolder>(), b.holders.value)
         assertEquals("usd: a and c", 2, r.createdCount("usd"))
         assertEquals("eur: a and c", 2, r.createdCount("eur"))
+        assertEquals("tether: a and c", 2, r.createdCount("tether"))
         assertEquals("jpy: a, b and c", 3, r.createdCount("jpy"))
     }
 
@@ -660,18 +669,18 @@ class GraphScreenHostContractTest {
         val map = b.holders.value
         val list = r.host.holders()
         assertEquals(map.values.toSet(), list.toSet())
-        assertEquals(2, list.size)
+        assertEquals(tabs.size - 1, list.size)
         write.release.complete(Unit)
         r.run()
-        assertEquals("an earlier map copy is unchanged", setOf("jpy", "eur"), map.keys)
-        assertEquals("an earlier list copy is unchanged", 2, list.size)
+        assertEquals("an earlier map copy is unchanged", others("usd"), map.keys)
+        assertEquals("an earlier list copy is unchanged", tabs.size - 1, list.size)
         assertEquals(b.holders.value.values.toSet(), r.host.holders().toSet())
-        assertEquals(3, r.host.holders().size)
+        assertEquals(tabs.size, r.host.holders().size)
         val full = r.host.holders()
         b.close()
         assertEquals(emptyMap<String, GraphV2ScreenStateHolder>(), b.holders.value)
-        assertEquals("copies survive a close", 3, full.size)
-        assertEquals(2, list.size)
+        assertEquals("copies survive a close", tabs.size, full.size)
+        assertEquals(tabs.size - 1, list.size)
     }
 
     @Test fun H16_cancellationAndErrorFromCreateOrStartAreNotReported_andAStartedHolderIsCleanedUp() = hostTest { r ->
@@ -679,20 +688,25 @@ class GraphScreenHostContractTest {
         val error = InjectedError("create")
         val startCancelled = CancellationException("start")
         val startError = InjectedError("start")
+        val tetherStartError = InjectedError("start tether")
         r.createFailure["usd"] = cancelled
         r.createFailure["jpy"] = error
         r.startFailure["eur"] = startCancelled
+        r.startFailure["tether"] = tetherStartError
         val a = r.host.open()
         val aJobs = r.hostJob.children.toList()
-        assertEquals("premise: one creation job per tab", 3, aJobs.size)
+        assertEquals("premise: one creation job per tab", tabs.size, aJobs.size)
         r.run()
         assertTrue("each cancellation and Error ended its creation job, not swallowed", aJobs.all { it.isCancelled })
         assertEquals(emptyMap<String, GraphV2ScreenStateHolder>(), a.holders.value)
         val eur = r.created.single { it.first == "eur" }.second
-        assertEquals("the started eur holder is cleaned up", listOf(eur), r.closeCalls)
+        val tether = r.created.single { it.first == "tether" }.second
+        assertEquals("the started eur and tether holders are cleaned up", setOf(eur, tether), r.closeCalls.toSet())
+        assertEquals(2, r.closeCalls.size)
         assertEquals("its session is closed: a closed session binds nothing", null, r.sessions.getValue(eur).bind(r.identity))
+        assertEquals("tether's too", null, r.sessions.getValue(tether).bind(r.identity))
         assertEquals(emptyList<Throwable>(), r.failures)
-        assertEquals("the Error propagates to the host scope", listOf<Throwable>(error), r.uncaught)
+        assertEquals("the Errors propagate to the host scope", listOf<Throwable>(error, tetherStartError), r.uncaught)
         a.close()
         r.startFailure["usd"] = startError
         val b = r.host.open()
@@ -700,12 +714,44 @@ class GraphScreenHostContractTest {
         val usd = r.created.last { it.first == "usd" }.second
         assertTrue("the started usd holder is cleaned up", usd in r.closeCalls)
         assertEquals("its session is closed", null, r.sessions.getValue(usd).bind(r.identity))
-        assertEquals("jpy is created now; eur follows its normal cleanup close", setOf("jpy", "eur"), b.holders.value.keys)
+        assertEquals("jpy is created now; eur and tether follow their normal cleanup close", setOf("jpy", "eur", "tether"), b.holders.value.keys)
         assertEquals(emptyList<Throwable>(), r.failures)
-        assertEquals(listOf<Throwable>(error, startError), r.uncaught)
+        assertEquals(listOf<Throwable>(error, tetherStartError, startError), r.uncaught)
     }
 
     /** H17: the host's source touches no activation and no coordinator or recorder; its seams default to the real calls. */
+    /**
+     * H19 (S5-2a): the tether tab is a failure target like the others. Its create failure is reported once while the other
+     * tabs go ahead; a failed close of its holder keeps tether from coming back on later mounts, and the other tabs return.
+     */
+    @Test fun H19_theTetherTabFailsLikeTheOthers() = hostTest { r ->
+        val createFailure = IllegalStateException("create tether")
+        r.createFailure["tether"] = createFailure
+        val a = r.host.open()
+        r.run()
+        assertEquals(listOf<Throwable>(createFailure), r.failures)
+        assertEquals("the other tabs go ahead", others("tether"), a.holders.value.keys)
+        a.close()
+        r.run()
+        val b = r.host.open()
+        r.run()
+        assertEquals("a failed creation leaves no close to wait for", tabs.toSet(), b.holders.value.keys)
+        val closeFailure = IOException("after close")
+        r.closeHook = { holder ->
+            holder.close()
+            if (r.tabOf(holder) == "tether") throw closeFailure
+        }
+        b.close()
+        r.run()
+        assertEquals(listOf(createFailure, closeFailure), r.failures)
+        r.closeHook = { it.close() }
+        val c = r.host.open()
+        r.run()
+        assertEquals("tether does not come back; the others do", others("tether"), c.holders.value.keys)
+        assertEquals(1, r.createdCount("tether"))
+        assertEquals(emptyList<Throwable>(), r.uncaught)
+    }
+
     @Test fun H17_theHostManagesLifetimesOnly() {
         val text = File("src/main/java/com/jay/fxi/ui/premium/graph/GraphScreenHost.kt").readText()
         val code = text.replace(Regex("""/\*[\s\S]*?\*/"""), "").replace(Regex("""//[^\n]*"""), "")

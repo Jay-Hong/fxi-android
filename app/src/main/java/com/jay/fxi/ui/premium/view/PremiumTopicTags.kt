@@ -15,6 +15,8 @@ internal object PremiumTopicTags {
     const val RATES = "premium_rates"
     fun row(id: String) = "premium_row_$id"
     const val DXY = "premium_dxy"
+    /** S5: the stable slot after the rates (S8/S9 sections). */
+    const val BELOW_RATES = "premium_below_rates"
     fun customize(list: RateRowList) = "premium_customize_${list.name}"
     const val FULLSCREEN = "premium_fullscreen"
     const val FULLSCREEN_LAYER = "premium_fullscreen_layer"

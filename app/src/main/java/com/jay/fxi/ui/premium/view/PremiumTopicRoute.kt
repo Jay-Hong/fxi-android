@@ -41,8 +41,8 @@ import kotlinx.coroutines.flow.StateFlow
  *
  * S4 CUT-CC5-3: with a [graphHost], the route opens one mount of it in an effect and closes it on dispose or when the host
  * changes; the mount, a Compose state, never outlives its host. The host starts and closes the holders. The active target is
- * the holder of the selected usd/jpy/eur tab for the fresh screen's owner while the route is active: a new target
- * deactivates the previous holder before activating the new one; TETHER, NEWS, no owner, inactive and dispose release it,
+ * the holder of the selected usd/jpy/eur/tether tab for the fresh screen's owner while the route is active: a new target
+ * deactivates the previous holder before activating the new one; NEWS, no owner, inactive and dispose release it,
  * and recomposition, graph updates and inline/fullscreen switches do not. A new identity or a new set of mounted holders is
  * enqueued to each holder as a context change. The graph slot carries that holder's state, fresh reads and actions.
  */
@@ -82,7 +82,7 @@ internal fun PremiumTopicRoute(
     // Keyed by the mount, so a new mount never shows the previous one's holders for a frame.
     val holders = key(mount) { (mount?.holders ?: NO_HOLDERS).collectAsState().value }
     LaunchedEffect(identity, holders) { holders.values.forEach { it.onContextChanged() } }
-    // Only usd, jpy and eur have holders, so TETHER and NEWS find none.
+    // usd, jpy, eur and tether have holders; NEWS finds none.
     val holder = screen.ui.selectedTab?.serverTab?.let { holders[it] }
     // An inactive route draws NONE, so it has no owner and no target.
     val target = if (owner != null && holder != null) holder to owner else null
