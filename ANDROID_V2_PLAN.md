@@ -38,7 +38,8 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 지웠다(JVM·에뮬레이터 계측 계약, 운영 배선 없음). 18번의 세 선행조건이 충족되어(동결 후 7번 대조 완료
                                 10-08) RT01-A1(`6c6cadb`)부터 RT07(`43b72d8`)까지 commit 18개로 runtime 조립·은퇴 포트·
                                 복구 예산·시간 계기·§9.1 migration을 dormant로 준비했다. 이어 통합과 critical cutover 배선(CC1~CC5-4)·
-                                인수 하네스를 land했다. 인수 판정은 C01 조건부 통과·C02 통과·C03 1차 실행 완료/T25 대기다(S4 '진행' 항목).
+                                인수 하네스를 land했다. 인수 판정은 C01 조건부 통과·C02 통과·C03 조건부 통과로 S4 소비자 cutover 인수 조건부
+                                통과다(S4 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1505,10 +1506,13 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   `0a1adf2`·`d3349e9`·`5a8e801`. CUT-C01은 조건부 통과(사용자 결정 B·r2 — PASS 18, 조건부 예외 승인 10, P3-i 뒤 검증 의무 2;
   개별 예외 12건·구조적 제외 5건은 PASS가 아니다; 대응표 `R4c/S4/cut_c01_final_progress.r2/c01_mapping.md`). CUT-C02는 최종 후보
   `5a8e801`의 CI 계량 13행 통과(L1c는 결정 A로 조건부 제외 — S6 KRX 구독이나 FORCE_ENTITLEMENTS 직접 호출자 추가 전에 재판정).
-  CUT-C03(실기기)은 1차 실행 완료·T25 대기(근거: `R4c/S4/cut_c03_run.r1/result.r2.md`, 판정 합의 `R4c/S4/cut_c03_result_agreed.r1.md`).
-  관측 한계 예외는 개별 기록하며 PASS와 구분한다. S4 소비자 cutover 인수 판정은 T25 실행·판정까지 대기한다.
-  남은 것: T25(무료 화면 회귀) 기기 실행·판정 — S4 소비자 cutover 인수 판정의 선행, P3-i(실제 purger·지속 저장 활성화 뒤
-  B01·B02·B03·A02 purge 분기 검증), 3e(시계 주입 — T01·T02·T04 예외의 종결 조건), 공개 arming·release 게이트.
+  CUT-C03(실기기 SM-F711N)은 조건부 통과 — PASS 후보 5건(Hilt·Context 경로, 프리미엄 화면 회귀, v1 graph 파일·선호 삭제 완료,
+  크래시 미관측, T25 무료 화면 회귀), 관측 한계 개별 예외 4건(generation 교체·watchdog 동등성·부분 중단·Crashlytics 전달,
+  PASS 아님; 근거 `R4c/S4/cut_c03_run.r1/result.r2.md`·`R4c/S4/cut_c03_run.r2/result.r2.md`, 판정 합의
+  `R4c/S4/cut_c03_final_agreed.r1.md`). T25 PASS는 화면 회귀 범위이며 iOS T25 원정의의 데이터·요청 불변성 전체 PASS가 아니다.
+  이로써 S4 소비자 cutover 인수는 조건부 통과다.
+  남은 것: P3-i(실제 purger·지속 저장 활성화 뒤 B01·B02·B03·A02 purge 분기 검증), 3e(시계 주입 — T01·T02·T04 예외의 종결
+  조건), C01·C03 개별 예외의 후속·종결 조건, 공개 arming·release 게이트.
 
 ### S5 — 테더 탭
 - 거래소 5 + 참조(kb·hana·investing) 시세 (preference는 S1.5에서 도입, 여기서 테더 표면에 연결)
