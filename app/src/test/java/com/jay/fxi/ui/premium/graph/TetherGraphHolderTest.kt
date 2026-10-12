@@ -51,6 +51,22 @@ import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphPeriod
 import com.jay.fxi.domain.model.GraphSeriesSelection
 import com.jay.fxi.time.AppClock
+import com.jay.fxi.ui.premium.graph.TetherGraphData.B
+import com.jay.fxi.ui.premium.graph.TetherGraphData.A
+import com.jay.fxi.ui.premium.graph.TetherGraphData.REFERENCES
+import com.jay.fxi.ui.premium.graph.TetherGraphData.KRX
+import com.jay.fxi.ui.premium.graph.TetherGraphData.USD_1D
+import com.jay.fxi.ui.premium.graph.TetherGraphData.TETHER_1D
+import com.jay.fxi.ui.premium.graph.TetherGraphData.LONG_USD
+import com.jay.fxi.ui.premium.graph.TetherGraphData.LONG_TETHER
+import com.jay.fxi.ui.premium.graph.TetherGraphData.catalog
+import com.jay.fxi.ui.premium.graph.TetherGraphData.series
+import com.jay.fxi.ui.premium.graph.TetherGraphData.dayPoints
+import com.jay.fxi.ui.premium.graph.TetherGraphData.day
+import com.jay.fxi.ui.premium.graph.TetherGraphData.seed
+import com.jay.fxi.ui.premium.graph.TetherGraphData.longPoints
+import com.jay.fxi.ui.premium.graph.TetherGraphData.long
+import com.jay.fxi.ui.premium.graph.TetherGraphData.linesOf
 import com.jay.fxi.ui.graph.GraphProjection
 import com.jay.fxi.ui.graph.PreparedSeries
 import kotlin.time.Duration
@@ -96,91 +112,7 @@ class TetherGraphHolderTest {
 
     @get:Rule val folder = TemporaryFolder()
 
-    private companion object {
-        /** 12:00 KST, the start of B. */
-        val B: Instant = Instant.parse("2026-10-05T03:00:00Z")
-        val DAY0: Instant = Instant.parse("2026-10-04T15:00:00Z")
-        val A = AuthIdentityFence("u1", 1L)
-        val FENCE_A = TopicSessionFence(A, "e1", TopicGrantToken(7L))
-        val OWNER_A = TopicDisplayOwner(A, 1L)
-        val EXCHANGES = listOf("upbit", "bithumb", "coinone", "korbit", "gopax")
-        val REFERENCES = listOf("investing.usd", "kb.usd", "hana.usd")
-        const val KRX = "krx.usd-krw-futures"
-        val USD_1D = listOf("investing.usd", "kb.usd", "hana.usd", "dxy")
-        val TETHER_1D = EXCHANGES.map { "$it.usdt-krw" } + KRX + REFERENCES + "dxy" + "dxy_futures"
-        val LONG_USD = listOf("investing.usd", KRX, "hana.usd", "dxy")
-        val LONG_TETHER = listOf("bithumb.usdt-krw", KRX, "investing.usd", "hana.usd", "dxy")
-    }
-
-    private fun <T> ok(body: T) = AuthenticatedHttpResponse(200, Headers.headersOf(), body, null, byteArrayOf(1))
-
-    private fun catalog(tetherOneDay: List<String> = TETHER_1D, ttlSeconds: Int = 172800) = GraphV2CatalogResponse(
-        tabs = listOf(
-            GraphV2CatalogTab("usd", "usd", emptyMap(), mapOf(
-                "1d" to GraphV2CatalogPeriod(USD_1D, listOf("investing.usd", "hana.usd")),
-                "3m" to GraphV2CatalogPeriod(LONG_USD, listOf("investing.usd", "hana.usd"))
-            )),
-            GraphV2CatalogTab("tether", "tether", emptyMap(), mapOf(
-                "1d" to GraphV2CatalogPeriod(tetherOneDay, listOf("upbit.usdt-krw", "bithumb.usdt-krw", "hana.usd", KRX)),
-                "1w" to GraphV2CatalogPeriod(LONG_TETHER, listOf("bithumb.usdt-krw", "hana.usd", KRX)),
-                "3m" to GraphV2CatalogPeriod(LONG_TETHER, listOf("bithumb.usdt-krw", "hana.usd", KRX)),
-                "1y" to GraphV2CatalogPeriod(LONG_TETHER, listOf("bithumb.usdt-krw", "hana.usd", KRX))
-            ))
-        ),
-        version = "2026-10-05",
-        supportedPeriods = listOf("1w", "3m", "1y"),
-        cacheTtlSeconds = ttlSeconds
-    )
-
-    private fun series(id: String, points: List<GraphV2Point>) = GraphV2Series(
-        id, id, if (id.startsWith("dxy")) "index" else "krw", if (id.startsWith("dxy")) "pt" else "KRW", 2, points,
-        GraphV2Provenance(false, emptyList())
-    )
-
-    /** Six closed 10-minute points from 01:00 KST, the same for a series id in every tab. */
-    private fun dayPoints(id: String): List<GraphV2Point> {
-        val base = if (id.startsWith("dxy")) 104.0 else 1340.0 + id.length
-        return List(6) { i -> GraphV2Point(DAY0 + 1.hours + 10.minutes * i, base + i, "x", base + i + 1, base + i - 1) }
-    }
-
-    private fun quarterPoints(id: String): List<GraphV2Point> {
-        val base = if (id.startsWith("dxy")) 103.0 else 1330.0 + id.length
-        return List(6) { i -> GraphV2Point(DAY0 - 240.hours + 24.hours * i, base + i, "x", base + i + 1, base + i - 1) }
-    }
-
-    private fun day(tab: String, ids: List<String>, seeds: Map<String, GraphV2InProgressSeed> = emptyMap()) = ok(GraphV2TabResponse(
-        tab = tab, period = "1d",
-        series = ids.map { series(it, dayPoints(it)) },
-        metadata = GraphV2Metadata(B - 1.minutes, "10min", GraphV2Range("2026-10-05", "2026-10-05"),
-            domainStartAt = DAY0, domainEndAt = DAY0 + 24.hours, liveDomainMode = "rolling"),
-        inProgress = seeds
-    ))
-
-    private fun quarter(tab: String, ids: List<String>) = ok(GraphV2TabResponse(
-        tab = tab, period = "3m", series = ids.map { series(it, quarterPoints(it)) },
-        metadata = GraphV2Metadata(B - 1.minutes, "1d", GraphV2Range("2026-07-05", "2026-10-05"))
-    ))
-
-    private fun seed(low: Double, high: Double, close: Double) = GraphV2InProgressSeed(B, high, low, close, B + 30.seconds)
-
-    private class FakeSelectionStore : GraphSelectionStore {
-        val committed = mutableMapOf<GraphSelectionKey, GraphSeriesSelection>()
-        private fun current(key: GraphSelectionKey) = committed[key]?.let {
-            GraphSelectionReadResult.Present(GraphSelectionRecord(1, key.uid, key.audience, key.tab, it.visibleSeriesIds, it.initializedSeries))
-        } ?: GraphSelectionReadResult.Absent
-        override suspend fun confirmGraphSelection(key: GraphSelectionKey): GraphSelectionReadResult = current(key)
-        override suspend fun readGraphSelection(key: GraphSelectionKey): GraphSelectionReadResult = current(key)
-        override suspend fun writeGraphSelection(key: GraphSelectionKey, selection: GraphSeriesSelection): GraphSelectionWriteResult {
-            committed[key] = selection
-            return GraphSelectionWriteResult.Committed
-        }
-    }
-
-    private class Sent(val key: GraphKey) {
-        val answer = CompletableDeferred<AuthenticatedHttpResponse<GraphV2TabResponse>>()
-    }
-
-    private val opened = mutableListOf<Fixture>()
+    private val opened = mutableListOf<TetherGraphFixture>()
 
     private fun holderTest(body: suspend TestScope.() -> Unit): TestResult = runTest {
         try {
@@ -191,123 +123,11 @@ class TetherGraphHolderTest {
         }
     }
 
-    private inner class Fixture(val test: TestScope, krxCapability: Boolean = true, catalogTtlSeconds: Int = 172800) {
-        init { opened += this }
-        val dispatcher = StandardTestDispatcher(test.testScheduler)
-        val scope = CoroutineScope(SupervisorJob() + dispatcher)
-        private val base = test.testScheduler.currentTime
-        /** Starts at B + 1 min. */
-        val clock = AppClock { B + 1.minutes + (test.testScheduler.currentTime - base).milliseconds }
+    /** A fixture this test closes at its end. */
+    private fun Fixture(test: TestScope, krxCapability: Boolean = true, catalogTtlSeconds: Int = 172800) =
+        TetherGraphFixture(test, folder, krxCapability = krxCapability, catalogTtlSeconds = catalogTtlSeconds).also { opened += it }
 
-        var catalogDto: GraphV2CatalogResponse = catalog(ttlSeconds = catalogTtlSeconds)
-        val display = MutableStateFlow(TopicDisplayState.NONE.copy(owner = OWNER_A))
-        val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(A, FreeTab.USD))
-        val accessRevisions = MutableStateFlow(0L)
-        val sent = mutableListOf<Sent>()
-        val snapshot: TopicAccessSnapshot = run {
-            val binding = EntitlementsIdentity("u1", 1L)
-            val record = AccessFence("u1", "e1", "K1")
-            TopicAccessSnapshot.INITIAL.copy(
-                revision = 100L,
-                facts = TopicAccessFacts.NONE.copy(
-                    token = TopicGrantToken(7L), issuedFor = TopicGrantContext(binding, record, 10L), binding = binding,
-                    recordFence = record, decisionGeneration = 10L, tokenStanding = true, userBlocks = emptySet(),
-                    capabilityBlocks = if (krxCapability) emptySet() else setOf(TopicAccessBlock.NOT_GRANTED)
-                ),
-                userInvalidations = 3L
-            )
-        }
-        val uses = SnapshotTopicUseAuthority { snapshot }
-        val owners = object : GraphOwnerSource {
-            override fun currentIdentity(): AuthIdentityFence = A
-            override suspend fun capture(expected: AuthIdentityFence): AuthSnapshot {
-                if (expected != A) throw AuthIdentityChangedException()
-                return AuthSnapshot(expected.uid, expected.authGeneration, "token")
-            }
-        }
-        val gate = GraphV2AccessGate({ A }, { FENCE_A }, { snapshot }, { true })
-        val store = FileGraphV2DiskStore({ folder.newFolder() }, JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), dispatcher)
-        val fetcher = object : GraphV2Fetching {
-            override suspend fun catalog(owner: AuthSnapshot, useAdmitted: () -> Boolean) = ok(catalogDto)
-            override suspend fun tab(owner: AuthSnapshot, key: GraphKey, useAdmitted: () -> Boolean): AuthenticatedHttpResponse<GraphV2TabResponse> {
-                val s = Sent(key)
-                sent += s
-                return s.answer.await()
-            }
-        }
-        lateinit var coordinator: GraphV2RequestCoordinator
-        val recorder = GraphRecorder(scope, MutableStateFlow(0L), { snapshot }, { FENCE_A }, { coordinator.state.value.catalog }, gate, clock)
-        init {
-            coordinator = GraphV2RequestCoordinator(
-                fetcher = fetcher, owners = owners, currentAccessFence = { FENCE_A }, uses = uses, protectedAdmission = { true },
-                accessSnapshot = { snapshot }, scope = scope, clock = clock, rateLimitJitter = { Duration.ZERO }, onEventFailure = {},
-                cachePorts = GraphV2CachePorts(store = store, gate = gate, onSeedDiagnostic = {}), recorder = recorder
-            )
-        }
-        val selections = FakeSelectionStore()
-        val holders = listOf("usd", "tether").associateWith { tab ->
-            GraphV2ScreenStateHolder(
-                tab = tab, coordinator = coordinator,
-                selectionSession = GraphSeriesSelectionSession(selections, GraphSelectionAudience.PREMIUM, tab, scope, dispatcher),
-                liveIdentity = { A }, display = display, focus = focus, currentAccessFence = { FENCE_A }, uses = uses, gate = gate,
-                accessRevisions = accessRevisions, scope = scope, dispatcher = dispatcher, clock = clock, recorder = recorder
-            )
-        }
-
-        fun run() = test.runCurrent()
-        fun advance(ms: Long) {
-            test.advanceTimeBy(ms)
-            test.runCurrent()
-        }
-
-        fun start() {
-            coordinator.start()
-            holders.values.forEach { it.start() }
-            run()
-        }
-
-        /** Moves the focus to [tab] and activates its holder alone, as the route does. */
-        fun activate(tab: String) {
-            holders.filterKeys { it != tab }.values.forEach { it.onDeactivated() }
-            focus.value = OwnedTopicFocus(A, if (tab == "usd") FreeTab.USD else FreeTab.TETHER)
-            run()
-            holders.getValue(tab).onActivated(OWNER_A)
-            run()
-        }
-
-        fun state(tab: String) = holders.getValue(tab).currentState()
-        fun token(tab: String) = checkNotNull(state(tab).inlineToken) { "no inline token for $tab in ${state(tab)}" }
-        fun show(tab: String) {
-            holders.getValue(tab).setSurfaceVisible(token(tab), true)
-            run()
-        }
-        fun prepared(tab: String) = checkNotNull(state(tab).chart) { "no chart for $tab in ${state(tab)}" }.prepared
-        fun seriesOf(tab: String, id: String): PreparedSeries = prepared(tab).bySeries.getValue(id)
-
-        fun answer(key: GraphKey, response: AuthenticatedHttpResponse<GraphV2TabResponse>) {
-            sent.first { it.key == key && !it.answer.isCompleted }.answer.complete(response)
-            run()
-        }
-
-        val lifetime get() = checkNotNull(uses.acquire(FENCE_A))
-        private fun observe(topic: String, candidate: TopicGraphCandidate) {
-            recorder.observe(
-                TopicGraphInput.Observations(1L, topic, TopicGraphPath.WS, TopicUseAttribution(Any(), FENCE_A, 1L, lifetime), 1L, listOf(candidate))
-            )
-            run()
-        }
-        /** A USD row of [source] by `fx:usd-krw`. */
-        fun fx(source: String, rate: Double, at: Instant) = observe("fx:usd-krw", TopicGraphCandidate.Quote(source, "usd-krw", rate, at, null))
-        /** The same row carried by the tether topic. */
-        fun tetherRow(source: String, rate: Double, at: Instant) = observe("usdt:krw", TopicGraphCandidate.Quote(source, "usd-krw", rate, at, null))
-        fun exchange(source: String, rate: Double, at: Instant) =
-            observe("usdt:krw", TopicGraphCandidate.Quote(source, "usdt-krw", rate, at, at))
-        fun dxy(rate: Double, at: Instant) = observe("dxy:spot", TopicGraphCandidate.DollarIndex(rate, at, "investing"))
-
-        fun close() = scope.cancel()
-    }
-
-    private fun Fixture.openTether() {
+    private fun TetherGraphFixture.openTether() {
         start()
         activate("tether")
         answer(GraphKey("tether", GraphPeriod.ONE_DAY), day("tether", TETHER_1D))
@@ -319,24 +139,6 @@ class TetherGraphHolderTest {
     // --- catalog, selection and KRX gate ---------------------------------------------------------------------------------
 
     /** Distinct per period in both time and price, so one period's points can never pass for another's. */
-    private fun longPoints(id: String, period: GraphPeriod): List<GraphV2Point> {
-        val offset = when (period) { GraphPeriod.ONE_WEEK -> 0.0; GraphPeriod.THREE_MONTHS -> 20.0; else -> 40.0 }
-        val base = (if (id.startsWith("dxy")) 103.0 else 1330.0 + id.length) + offset / (if (id.startsWith("dxy")) 10.0 else 1.0)
-        val (start, step) = when (period) {
-            GraphPeriod.ONE_WEEK -> (B - 7.hours) to 1.hours
-            GraphPeriod.THREE_MONTHS -> (DAY0 - 240.hours) to 24.hours
-            else -> (DAY0 - 3000.hours) to 24.hours
-        }
-        return List(6) { i -> GraphV2Point(start + step * i, base + i, "x", base + i + 1, base + i - 1) }
-    }
-
-    private fun long(tab: String, period: GraphPeriod, ids: List<String>) = ok(GraphV2TabResponse(
-        tab = tab, period = period.code, series = ids.map { series(it, longPoints(it, period)) },
-        metadata = GraphV2Metadata(B - 1.minutes, if (period == GraphPeriod.ONE_WEEK) "1h" else "1d", GraphV2Range("2026-07-05", "2026-10-05"))
-    ))
-
-    private fun linesOf(points: List<GraphV2Point>) = points.map { com.jay.fxi.ui.graph.LinePoint(it.ts, it.rate) }
-
     /**
      * TH01: the tether holder offers the catalog's four periods; for 1w, 3m and 1y each it asks the tether tab for that period and
      * exposes only that period's catalog series - upbit and KB, absent from the long-term catalog, are not synthesized even when
@@ -425,7 +227,7 @@ class TetherGraphHolderTest {
 
     // --- T22 ---------------------------------------------------------------------------------------------------------------
 
-    private fun Fixture.answerAll(tab: String, ids: List<String>, seeds: Map<String, GraphV2InProgressSeed>) {
+    private fun TetherGraphFixture.answerAll(tab: String, ids: List<String>, seeds: Map<String, GraphV2InProgressSeed>) {
         sent.filter { it.key == GraphKey(tab, GraphPeriod.ONE_DAY) && !it.answer.isCompleted }.forEach { it.answer.complete(day(tab, ids, seeds)) }
         run()
     }
@@ -567,7 +369,7 @@ class TetherGraphHolderTest {
     // --- T17 / T18 for the tether consumer ---------------------------------------------------------------------------------
 
     /** Reads [id] in both tabs at one virtual time. */
-    private fun Fixture.bothTabs(id: String): Pair<PreparedSeries, PreparedSeries> {
+    private fun TetherGraphFixture.bothTabs(id: String): Pair<PreparedSeries, PreparedSeries> {
         activate("usd"); answerAll("usd", USD_1D, emptyMap()); show("usd")
         val usd = seriesOf("usd", id)
         activate("tether"); answerAll("tether", TETHER_1D, emptyMap()); show("tether")
