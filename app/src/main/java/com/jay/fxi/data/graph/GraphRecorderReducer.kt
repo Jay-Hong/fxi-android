@@ -116,7 +116,7 @@ internal object GraphRecorderReducer {
         scopeContinues(state, fence) && snapshot.facts.userAllowed && admission
 
     private fun seriesIds(topics: Set<String>, catalog: GraphCatalog): Set<String> = topics.flatMapTo(linkedSetOf()) {
-        fxGraphSeriesIds(it, catalog) + dxyGraphSeriesIds(it, catalog)
+        fxGraphSeriesIds(it, catalog) + dxyGraphSeriesIds(it, catalog) + tetherGraphSeriesIds(it, catalog)
     }
 
     /** Held inputs must finish before their time-free losses are handed over. */
@@ -175,7 +175,9 @@ internal object GraphRecorderReducer {
         }
 
         val ready = if (current) transferPendingLoss(synced, catalog, now) else synced
-        val observations = fxGraphObservations(scope, input, catalog) + dxyGraphObservations(scope, input, catalog)
+        val tether = tetherGraphMapping(scope, input, catalog)
+        val observations = fxGraphObservations(scope, input, catalog) + dxyGraphObservations(scope, input, catalog) +
+            tether.observations
         val series = ready.series.toMutableMap()
         val untransferred = ready.untransferredSeries.toMutableSet()
         for ((key, batch) in observations.groupBy { it.seriesKey }) {
@@ -185,7 +187,10 @@ internal object GraphRecorderReducer {
                     GraphRecoverableState.empty(key, if (key.seriesId == "dxy") DXY_GRAPH_OBSERVATION_ORDER else fxOrder),
                     now, now, GraphRecoveryReason.INITIAL_SYNC, now
                 )
-                val observed = observeRecoverable(initial, batch, now).state
+                val observed = observeRecoverable(initial, batch, now).state.let {
+                    // An evidence time dropped before D3 still leaves its recovery demand (plan :1345).
+                    if (key in tether.anomalies) requireGraphRecovery(it, now, now, GraphRecoveryReason.TIME_ANOMALY, now) else it
+                }
                 series[key] = if (previous == null && untransferred.remove(key.seriesId)) {
                     requireGraphRecoveryWindow(observed, GraphRecoveryReason.HANDOVER_LOSS, now)
                 } else observed

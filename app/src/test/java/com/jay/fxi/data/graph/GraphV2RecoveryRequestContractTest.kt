@@ -125,6 +125,8 @@ import org.junit.Test
  *  - Completion covers the recorder state, the sink's queue and ledger and the registered captures at that moment. A released
  *    registration still held by an in-flight request, the coordinator's entries and protected slots, a screen holder's
  *    publication and the topic session's graph loss record are runtime cleanup, not this target.
+ * S5-1 adds R6t: the same capture purge for each exchange's series under a tether 1d registration (R4c/S5
+ * s5_1_rule_correction.r2, assignment in s5_1_commit_candidate.r2/codex_commit.r2.md item 2).
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GraphV2RecoveryRequestContractTest {
@@ -134,6 +136,8 @@ class GraphV2RecoveryRequestContractTest {
         val NOON: Instant = Instant.parse("2026-10-05T03:00:00Z")
         val USD_1D = GraphKey("usd", GraphPeriod.ONE_DAY)
         val USD_3M = GraphKey("usd", GraphPeriod.THREE_MONTHS)
+        val TETHER_1D = GraphKey("tether", GraphPeriod.ONE_DAY)
+        val EXCHANGES = listOf("upbit", "bithumb", "coinone", "korbit", "gopax")
         val B1: Instant = Instant.parse("2026-10-05T02:20:00Z")
         val B2: Instant = Instant.parse("2026-10-05T02:30:00Z")
         val B3: Instant = Instant.parse("2026-10-05T02:40:00Z")
@@ -320,6 +324,13 @@ class GraphV2RecoveryRequestContractTest {
             listOf(TopicGraphCandidate.Quote(source, "usd-krw", rate, at, null))
         )
 
+        /** S5-1: an exchange's tether quote at [at] (timestamp only), under the current fence and lifetime. */
+        fun tetherQuote(source: String, at: Instant, rate: Double = 1480.0) = TopicGraphInput.Observations(
+            1L, "usdt:krw", TopicGraphPath.WS,
+            TopicUseAttribution(Any(), checkNotNull(fence), 1L, lifetime()), 1L,
+            listOf(TopicGraphCandidate.Quote(source, "usdt-krw", rate, at, null))
+        )
+
         /** The gate refuses the quote, so an existing series keeps a HANDOVER_LOSS for its bucket. */
         fun lose(source: String, at: Instant) {
             protectedOpen = false
@@ -350,16 +361,20 @@ class GraphV2RecoveryRequestContractTest {
                     "3m" to GraphV2CatalogPeriod(listOf("kb.usd"), listOf("kb.usd"))
                 )
             ),
-            GraphV2CatalogTab("jpy", "jpy", emptyMap(), mapOf("1d" to GraphV2CatalogPeriod(listOf("kb.jpy"), listOf("kb.jpy"))))
+            GraphV2CatalogTab("jpy", "jpy", emptyMap(), mapOf("1d" to GraphV2CatalogPeriod(listOf("kb.jpy"), listOf("kb.jpy")))),
+            GraphV2CatalogTab(
+                "tether", "tether", emptyMap(),
+                mapOf("1d" to GraphV2CatalogPeriod(EXCHANGES.map { "$it.usdt-krw" }, listOf("upbit.usdt-krw")))
+            )
         ),
         version = "2026-05-27",
         supportedPeriods = listOf("1w", "3m", "1y"),
         cacheTtlSeconds = 172800
     )
 
-    /** A 10-minute usd 1d tab whose series carry closed points at the given starts. */
-    private fun dayTab(points: Map<String, List<Instant>>) = GraphV2TabResponse(
-        tab = "usd",
+    /** A 10-minute 1d tab (usd unless named) whose series carry closed points at the given starts. */
+    private fun dayTab(points: Map<String, List<Instant>>, tab: String = "usd") = GraphV2TabResponse(
+        tab = tab,
         period = GraphPeriod.ONE_DAY.code,
         series = points.map { (id, starts) ->
             GraphV2Series(
@@ -647,6 +662,30 @@ class GraphV2RecoveryRequestContractTest {
         ready(withRecorder = false).let { f ->
             f.coordinator.onActivated(USD_1D); runCurrent()
             assertFalse(f.coordinator.purgeRecoveryCaptures { true })
+        }
+    }
+
+    /**
+     * R6t (S5-1, each exchange): a tether 1d registration made by direct activation captures the exchange's series with its
+     * demand; a purge of the selected scope drops that capture, so the answer applies nothing to the recorder, while an
+     * unselected purge leaves it to be applied as usual.
+     */
+    @Test fun R6t_aPurgeDropsEachExchangesTetherCapture() = recoveryTest {
+        for (source in EXCHANGES) {
+            val key = GraphObservationSeriesKey(SCOPE, "$source.usdt-krw")
+            for (selected in listOf(true, false)) {
+                val f = ready()
+                f.recorder.observe(f.tetherQuote(source, NOON - 5.seconds))
+                f.protectedOpen = false
+                f.recorder.observe(f.tetherQuote(source, B1 + 60.seconds))
+                f.protectedOpen = true
+                assertTrue("$source premise: B1 owed", B1 in f.series(key).pending)
+                f.coordinator.onActivated(TETHER_1D); runCurrent()
+                assertEquals("$source premise: sent", 1, f.tabs(TETHER_1D).size)
+                assertEquals("$source $selected", selected, f.coordinator.purgeRecoveryCaptures { selected && it == SCOPE })
+                f.tabs(TETHER_1D).single().tab.complete(ok(dayTab(mapOf("$source.usdt-krw" to listOf(B1)), tab = "tether"))); runCurrent()
+                assertEquals("$source $selected applied only when not purged", selected, B1 in f.series(key).pending)
+            }
         }
     }
 
