@@ -1,5 +1,6 @@
 package com.jay.fxi.s5fixture
 
+import com.jay.fxi.data.remote.TopicCatalogue
 import com.jay.fxi.data.remote.dto.SubscriptionAck
 import com.jay.fxi.data.remote.dto.SubscriptionAckTopic
 import com.jay.fxi.di.ServerEndpoints
@@ -29,7 +30,7 @@ import okio.Buffer
  * close is shut down at once. After [close], no call returns an address. Payloads are read once while starting. The server keeps no request queue and records at most
  * [RECORD_LIMIT] recent requests as method, path and query names and values; headers and bodies (tokens) are never recorded or
  * reported. [unexpectedCount] keeps counting after the record drops an entry, and counts unreadable socket frames too. Each
- * socket connection keeps its own subscriptions.
+ * socket connection keeps its own subscriptions and is sent each subscribed topic's snapshot once.
  */
 internal class S5FixtureServer(
     private val load: (String) -> ByteArray,
@@ -72,6 +73,7 @@ internal class S5FixtureServer(
     private fun start(): ServerEndpoints {
         for (name in listOf("catalog.json", "tether-1d.json", "tether-1w.json", "usd-1d.json")) payloads[name] = load(name)
         payloads[S5FixtureRoutes.ENTITLEMENTS] = S5FixtureRoutes.ENTITLEMENTS_BODY.encodeToByteArray()
+        payloads[S5FixtureRoutes.TETHER_SNAPSHOT] = S5FixtureRoutes.TOPIC_SNAPSHOTS.getValue(TopicCatalogue.TETHER).encodeToByteArray()
         server.dispatcher = dispatcher
         server.start(InetAddress.getByName("127.0.0.1"), 0)
         onBound(server.port)
@@ -118,7 +120,10 @@ internal class S5FixtureServer(
         }
     }
 
-    /** One per connection. Acknowledges every subscribe and unsubscribe as fully accepted, answers ping with pong, sends no live frame. */
+    /**
+     * One per connection. Acknowledges every subscribe and unsubscribe as fully accepted, then sends each newly subscribed topic's
+     * snapshot once; answers ping with pong; sends no live frame.
+     */
     private fun newSocketListener() = object : WebSocketListener() {
         private val active = linkedSetOf<String>()
 
@@ -148,6 +153,8 @@ internal class S5FixtureServer(
                 activeSubscriptions = now
             )
             webSocket.send(json.encodeToString(SubscriptionAck.serializer(), ack).replaceFirst("{", """{"type":"subscription_ack","""))
+            // After the acknowledgement, each accepted topic's snapshot once: its first delivery (S5-4 slice 4d).
+            if (type == "subscribe") for (topic in topics) S5FixtureRoutes.TOPIC_SNAPSHOTS[topic]?.let { webSocket.send(it) }
         }
 
         /** Answers the peer's close, so the connection ends and the server can shut down. */

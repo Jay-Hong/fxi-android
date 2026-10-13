@@ -1,5 +1,8 @@
 package com.jay.fxi.s5fixture
 
+import com.jay.fxi.data.remote.TopicCatalogue
+import java.io.File
+import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -17,7 +20,8 @@ class S5FixtureRoutesTest {
         assertEquals(S5Route.Ok("tether-1d.json"), route("GET", "/api/v2/graph/tab", "tab" to "tether", "period" to "1d"))
         assertEquals(S5Route.Ok("tether-1w.json"), route("GET", "/api/v2/graph/tab", "period" to "1w", "tab" to "tether"))
         assertEquals(S5Route.Ok("usd-1d.json"), route("GET", "/api/v2/graph/tab", "tab" to "usd", "period" to "1d"))
-        for (topic in listOf("fx:usd-krw", "fx:jpy-krw", "fx:eur-krw", "usdt:krw", "dxy:spot"))
+        assertEquals(S5Route.Ok(S5FixtureRoutes.TETHER_SNAPSHOT), route("GET", "/api/v2/topics/snapshot", "topic" to "usdt:krw"))
+        for (topic in listOf("fx:usd-krw", "fx:jpy-krw", "fx:eur-krw", "dxy:spot"))
             assertEquals(topic, S5Route.Expected404, route("GET", "/api/v2/topics/snapshot", "topic" to topic))
         for (tab in listOf("usd", "jpy", "eur", "tether")) for (period in listOf("1d", "1w", "3m", "1y"))
             assertEquals("$tab $period", S5Route.Expected404, route("GET", "/api/v2/free/snapshot", "tab" to tab, "period" to period))
@@ -38,6 +42,8 @@ class S5FixtureRoutesTest {
             route("GET", "/api/v2/graph/tab", "tab" to "tether", "period" to "1d", "extra" to "1"),
             route("GET", "/api/v2/topics/snapshot", "topic" to "krx:usd-krw-futures"),
             route("GET", "/api/v2/topics/snapshot"),
+            route("GET", "/api/v2/topics/snapshot", "topic" to "usdt:krw", "topic" to "usdt:krw"),
+            route("GET", "/api/v2/topics/snapshot", "topic" to "usdt:krw", "x" to "1"),
             route("GET", "/api/v2/free/snapshot", "tab" to "krw", "period" to "1d"),
             route("GET", "/api/v2/free/snapshot", "tab" to "usd", "period" to "2d"),
             route("DELETE", "/api/user/me"),
@@ -47,5 +53,20 @@ class S5FixtureRoutesTest {
             route("GET", "/ws", "x" to "1", upgrade = true)
         )
         cases.forEachIndexed { index, actual -> assertEquals("case $index", S5Route.Unexpected, actual) }
+    }
+
+    @Test
+    fun `S5-4 4d the topic snapshots are the contract's JSON, one for each topic the session asks for`() {
+        val contract = mapOf(
+            "usdt:krw" to "topic/snapshot-tether.json",
+            "dxy:spot" to "topic/snapshot-dxy.json",
+            "fx:usd-krw" to "topic/snapshot-fx-usd-krw.json",
+            "fx:jpy-krw" to "topic/snapshot-fx-jpy-krw.json",
+            "fx:eur-krw" to "topic/snapshot-fx-eur-krw.json"
+        )
+        fun json(path: String) = Json.parseToJsonElement(File("src/test/resources/contracts/v2/$path").readText())
+        assertEquals(TopicCatalogue.DESIRED, S5FixtureRoutes.TOPIC_SNAPSHOTS.keys)
+        for ((topic, path) in contract) assertEquals(topic, json(path), Json.parseToJsonElement(S5FixtureRoutes.TOPIC_SNAPSHOTS.getValue(topic)))
+        assertEquals(json("http/topic-snapshot-tether-200.json"), Json.parseToJsonElement(S5FixtureRoutes.TOPIC_SNAPSHOTS.getValue("usdt:krw")))
     }
 }

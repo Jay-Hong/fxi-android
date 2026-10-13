@@ -109,6 +109,7 @@ class S5FixtureServerTest {
         val unavailable = """{"error":"topic_unavailable"}"""
         assertEquals(200 to premium, get(base + "api/entitlements"))
         assertEquals(200 to premium, get(base + "api/entitlements?fresh_premium=true"))
+        assertEquals(200 to S5FixtureRoutes.TOPIC_SNAPSHOTS.getValue("usdt:krw"), get(base + "api/v2/topics/snapshot?topic=usdt:krw"))
         assertEquals(404 to unavailable, get(base + "api/v2/topics/snapshot?topic=fx:usd-krw"))
         assertEquals(404 to unavailable, get(base + "api/v2/free/snapshot?tab=usd&period=1d"))
         assertEquals(0, server.unexpectedCount)
@@ -171,7 +172,11 @@ class S5FixtureServerTest {
             ended.countDown()
         }
         fun next(): String = checkNotNull(frames.poll(10, TimeUnit.SECONDS)) { "no frame" }
+        /** Nothing more arrives in a short wait; frames the server sent are already queued by then. */
+        fun none() = assertEquals(null, frames.poll(500, TimeUnit.MILLISECONDS))
     }
+
+    private fun snapshot(topic: String) = S5FixtureRoutes.TOPIC_SNAPSHOTS.getValue(topic)
 
     private fun open(url: String, frames: Frames): WebSocket = client.newWebSocket(Request.Builder().url(url).build(), frames)
 
@@ -194,9 +199,13 @@ class S5FixtureServerTest {
             val ack = frames.next()
             assertTrue(ack, ack.startsWith("""{"type":"subscription_ack","request_id":"r1","operation":"subscribe""""))
             assertTrue(ack, ack.contains(""""accepted_topics":[{"topic":"fx:usd-krw"},{"topic":"usdt:krw"}]"""))
+            assertEquals("after the ACK, each accepted topic's snapshot once, in order", snapshot("fx:usd-krw"), frames.next())
+            assertEquals(snapshot("usdt:krw"), frames.next())
+            frames.none()
             socket.send("""{"type":"unsubscribe","request_id":"r2","topics":["usdt:krw"]}""")
             val removed = frames.next()
             assertTrue(removed, removed.contains(""""removed_topics":["usdt:krw"]""") && removed.contains(""""active_subscriptions":[{"topic":"fx:usd-krw"}]"""))
+            frames.none()
             assertFalse((server.recentRequests() + reports.toList()).any { "secret-token-2" in it })
             assertEquals(0, server.unexpectedCount)
         } finally {
@@ -214,12 +223,16 @@ class S5FixtureServerTest {
         val second = open(url, b)
         first.send("""{"type":"subscribe","request_id":"a1","topics":["fx:usd-krw"]}""")
         assertTrue(a.next().contains(""""active_subscriptions":[{"topic":"fx:usd-krw"}]"""))
+        assertEquals(snapshot("fx:usd-krw"), a.next())
         second.send("""{"type":"subscribe","request_id":"b1","topics":["usdt:krw"]}""")
         assertTrue("the other connection's topic is not in this one", b.next().contains(""""active_subscriptions":[{"topic":"usdt:krw"}]"""))
+        assertEquals("only this connection's new topic", snapshot("usdt:krw"), b.next())
         second.send("""{"type":"unsubscribe","request_id":"b2","topics":["fx:usd-krw"]}""")
         assertTrue(b.next().contains(""""active_subscriptions":[{"topic":"usdt:krw"}]"""))
         first.send("""{"type":"subscribe","request_id":"a2","topics":[]}""")
         assertTrue("an unsubscribe elsewhere leaves this one", a.next().contains(""""active_subscriptions":[{"topic":"fx:usd-krw"}]"""))
+        a.none()
+        b.none()
         shut(first, a)
         shut(second, b)
         val c = Frames()
@@ -227,6 +240,7 @@ class S5FixtureServerTest {
         try {
             third.send("""{"type":"subscribe","request_id":"c1","topics":["krx:usd-krw-futures"]}""")
             assertTrue("a reconnect starts empty", c.next().contains(""""active_subscriptions":[{"topic":"krx:usd-krw-futures"}]"""))
+            c.none()
         } finally {
             shut(third, c)
         }

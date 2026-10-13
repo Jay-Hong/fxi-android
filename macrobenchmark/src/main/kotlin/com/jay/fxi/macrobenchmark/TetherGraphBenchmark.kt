@@ -10,6 +10,7 @@ import androidx.benchmark.macro.junit4.MacrobenchmarkRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.Direction
+import androidx.test.uiautomator.StaleObjectException
 import androidx.test.uiautomator.UiObject2
 import androidx.test.uiautomator.Until
 import org.junit.Assert.assertEquals
@@ -20,12 +21,12 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * S5-4 D (compile-verified only): the three tether graph journeys the S5 gate measures (ANDROID_V2_PLAN.md :1527-1539; agreed
+ * S5-4 D: the three tether graph journeys the S5 gate measures (ANDROID_V2_PLAN.md :1527-1539; agreed
  * plan R4c/S5 s5_4d_plan.r2.md). Class and method names are the judge's identities and the selectors its expectations
  * (tools/performance/benchmark_gate.py EXPECTED_BENCHMARK_IDENTITIES, EXPECTED_BEHAVIOR).
  *
- * Not run yet. [enterPremiumUsd] needs the D24 ON benchmark artifact and the fixture runtime (S5-4 E, a separate user GO), and
- * measuring needs the fixed device (S5-4 F, a separate approval). The behavior record writer, run ids and the phase of each
+ * Run so far only as emulator dry runs of the s5Benchmark fixture build (S5-4 E 4d); measuring needs the fixed device (S5-4 F,
+ * a separate approval). The behavior record writer, run ids and the phase of each
  * execution also belong to E: here a journey that does not behave as agreed fails its assertion at once.
  *
  * The series observation reads the inline chart's description (GraphChart.kt GraphPlot.describe(): a prefix, the labels of the
@@ -90,13 +91,14 @@ class TetherGraphBenchmark {
         )
 
     /**
-     * Opens the premium USD screen. Unverified until S5-4 E: the D24 OFF benchmark build cannot show it, and the fixture's
-     * entry is decided there.
+     * Opens the premium USD screen. With WARM the rule runs one unmeasured setup and measure before the measured ones (S5-4 E
+     * 4d dry run), so a later setup reopens on the tab the earlier pass left, tether: it chooses USD again then.
      */
     private fun MacrobenchmarkScope.enterPremiumUsd() {
         startActivityAndWait()
         assertTrue("premium USD tab", device.wait(Until.hasObject(By.res(USD_TAB)), ENTRY_TIMEOUT_MS))
-        assertTrue("premium USD selected", single(USD_TAB).isSelected)
+        if (!isChecked(USD_TAB)) clickOnce(USD_TAB)
+        assertTrue("premium USD selected", awaitChecked(USD_TAB))
     }
 
     /** The one object with [tag]; any other count fails (a missing bridge, a stale tag or a duplicate). */
@@ -126,18 +128,35 @@ class TetherGraphBenchmark {
         var observed: List<String>? = null
         while (SystemClock.uptimeMillis() < deadline) {
             observed = chartLabels()
-            if (observed == labels && isSelected(TETHER_TAB) && isSelected("period_tab:$period")) return
+            if (observed == labels && isChecked(TETHER_TAB) && isSelected("period_tab:$period")) return
             SystemClock.sleep(POLL_MS)
         }
         fail("tether $period not drawn as agreed: labels $observed, expected $labels")
     }
 
     private fun MacrobenchmarkScope.isSelected(tag: String) =
-        device.findObjects(By.res(tag)).singleOrNull()?.isSelected == true
+        fresh { device.findObjects(By.res(tag)).singleOrNull()?.isSelected } == true
+
+    /** A premium tab's choice: its `selected` semantics has no tab role, so accessibility reports it as checked. */
+    private fun MacrobenchmarkScope.isChecked(tag: String) =
+        fresh { device.findObjects(By.res(tag)).singleOrNull()?.isChecked } == true
+
+    /** Polls [isChecked] until [ENTRY_TIMEOUT_MS]: each read is fresh from the node found, which a selector wait was not. */
+    private fun MacrobenchmarkScope.awaitChecked(tag: String): Boolean {
+        val deadline = SystemClock.uptimeMillis() + ENTRY_TIMEOUT_MS
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (isChecked(tag)) return true
+            SystemClock.sleep(POLL_MS)
+        }
+        return false
+    }
+
+    /** A node replaced between the lookup and the read is not there yet; the caller polls again. */
+    private inline fun <T> fresh(read: () -> T?): T? = try { read() } catch (_: StaleObjectException) { null }
 
     /** The labels in the one inline chart's description, or null when the chart or the description is not of that shape. */
     private fun MacrobenchmarkScope.chartLabels(): List<String>? {
-        val text = device.findObjects(By.res(CHART)).singleOrNull()?.contentDescription ?: return null
+        val text = fresh { device.findObjects(By.res(CHART)).singleOrNull()?.contentDescription } ?: return null
         if (!text.startsWith(DESCRIPTION_PREFIX)) return null
         val rest = text.removePrefix(DESCRIPTION_PREFIX)
         val end = rest.indexOf('.')
