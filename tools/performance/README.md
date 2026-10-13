@@ -25,9 +25,11 @@ python3 tools/performance/benchmark_gate.py evaluate-runs run-set.json \
 ```
 
 The run-set must contain exactly `tab-entry`, `period-switch`, and `scroll`; each records
-AndroidX's separate `className` and method `name` fields plus three distinct result JSON
-paths. Result/preflight/postflight/trace artifacts
-may not be reused across runs or journeys, so one lucky invocation cannot masquerade as
+AndroidX's separate `className` and method `name` fields plus three runs, each
+`{runId, result, behavior}`: a distinct result JSON path and that run's behavior record (each
+journey selector looked up exactly once, the expected start and end screen state, the action
+completed, and for scroll the observed move and return). Result/behavior/preflight/postflight/trace
+artifacts may not be reused across runs or journeys, so one lucky invocation cannot masquerade as
 three independent runs. Raw `context.build` must match the frozen model/fingerprint/API,
 and `context.compilationMode` must be AndroidX's resolved `speed-profile` value for the
 planned Partial compilation. Each journey also carries a 3-to-5-entry attempt ledger;
@@ -35,7 +37,10 @@ ordinals are consecutive, attempt IDs are globally unique, exactly three `valid`
 run IDs must equal the three evaluated runs, and the third valid attempt ends the ledger.
 Invalid attempts are limited to machine-checked `environment-invalid` run evidence or a
 `result-malformed` AndroidX document that the strict parser actually rejects. A structurally
-valid threshold miss cannot be relabelled invalid. Until the functional S5 runner writes the
+valid threshold miss cannot be relabelled invalid. A `behavior-failed` attempt carries a
+well-formed behavior record of that attempt that misses an expectation; it fails the journey in
+both S5 and S11 whatever the metrics, and later valid runs cannot win it back. Until the functional
+S5 runner writes the
 ledger append-only, this makes declared retries bounded and auditable; it does not prove that
 an operator disclosed an attempt that was never recorded.
 For S11, `--golden` and `--golden-artifact-root` are mandatory; B99 cannot be supplied as

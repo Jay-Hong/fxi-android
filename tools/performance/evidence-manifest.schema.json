@@ -66,7 +66,15 @@
         "type": "object",
         "required": ["id", "medianP95Ms", "medianP99Ms", "frameCount", "verdict", "runs", "attempts"],
         "properties": {
-          "runs": {"type": "array", "minItems": 3, "maxItems": 3},
+          "runs": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {
+              "type": "object",
+              "required": ["runId", "result", "behavior", "preflight", "postflight", "traces"]
+            }
+          },
           "attempts": {
             "type": "array",
             "minItems": 3,
@@ -77,8 +85,9 @@
               "properties": {
                 "attemptId": {"type": "string", "minLength": 1},
                 "ordinal": {"type": "integer", "minimum": 1, "maximum": 5},
-                "outcome": {"enum": ["valid", "invalid"]},
-                "reason": {"enum": ["environment-invalid", "result-malformed"]}
+                "outcome": {"enum": ["valid", "invalid", "behavior-failed"]},
+                "reason": {"enum": ["environment-invalid", "result-malformed"]},
+                "evidence": {"type": "object", "required": ["path", "sha256"]}
               }
             }
           }

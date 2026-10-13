@@ -105,6 +105,42 @@ S11_PROTECTED_ARTIFACT_KEYS = {
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+RUN_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+
+# S5-4 B: the behavior evidence each valid run carries (plan :1538-1539 - each tag's UIAutomator lookup exactly once, the
+# expected screen state and the action completed). The harness records it; this parser only checks the document. It cannot
+# prove that the observations themselves are true, nor that a behavior failure was not recorded under another reason.
+BEHAVIOR_SCHEMA_VERSION = 1
+CHART_TAG = "graph_v2:inline:chart"
+PAGE_SCROLL_TAG = "premium_page_scroll"
+BEHAVIOR_STATE_KEYS = {"tab", "period", "ready", "seriesShown", "scroll"}
+BEHAVIOR_SCROLL_VALUES = {"top", "moved", "na"}
+BEHAVIOR_ACTIONS = {"completed", "failed", "none"}
+BEHAVIOR_PHASES = ["warmup"] * EXPECTED_WARMUPS + ["measured"] * EXPECTED_ITERATIONS
+BEHAVIOR_INDICES = list(range(EXPECTED_WARMUPS)) + list(range(EXPECTED_ITERATIONS))
+_TETHER_ONE_DAY = {"tab": "TETHER", "period": "1d", "ready": True, "seriesShown": 11}
+# Per journey: the selectors looked up, the state values compared before and after, and the scroll observed in between
+# (None: no "during" entry). The tab-entry start compares only its tab - the usd screen's data is not part of the fixture.
+EXPECTED_BEHAVIOR: dict[str, dict[str, Any]] = {
+    "tab-entry": {
+        "lookups": {"premium_tab_TETHER", CHART_TAG},
+        "before": {"tab": "USD"},
+        "after": {**_TETHER_ONE_DAY, "scroll": "na"},
+        "during": None,
+    },
+    "period-switch": {
+        "lookups": {"period_tab:1d", CHART_TAG},
+        "before": {"tab": "TETHER", "period": "1w", "ready": True, "seriesShown": 5, "scroll": "na"},
+        "after": {**_TETHER_ONE_DAY, "scroll": "na"},
+        "during": None,
+    },
+    "scroll": {
+        "lookups": {PAGE_SCROLL_TAG, CHART_TAG},
+        "before": {**_TETHER_ONE_DAY, "scroll": "top"},
+        "after": {**_TETHER_ONE_DAY, "scroll": "top"},
+        "during": {"scroll": "moved"},
+    },
+}
 
 
 class InvalidEvidence(ValueError):
@@ -327,6 +363,100 @@ def extract_macrobenchmark_run(
     return RunMetrics(reported_p95, reported_p99, sum(normalized_counts))
 
 
+def _whole(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise InvalidEvidence(f"{label} must be a non-negative whole number")
+    return value
+
+
+def _check_behavior_state(value: Any, label: str) -> None:
+    if not isinstance(value, dict) or set(value) != BEHAVIOR_STATE_KEYS:
+        raise InvalidEvidence(f"{label} must contain exactly {sorted(BEHAVIOR_STATE_KEYS)}")
+    for key in ("tab", "period"):
+        if not isinstance(value[key], str) or not value[key]:
+            raise InvalidEvidence(f"{label}.{key} must be a non-empty string")
+    if not isinstance(value["ready"], bool):
+        raise InvalidEvidence(f"{label}.ready must be a boolean")
+    _whole(value["seriesShown"], f"{label}.seriesShown")
+    if not isinstance(value["scroll"], str) or value["scroll"] not in BEHAVIOR_SCROLL_VALUES:
+        raise InvalidEvidence(f"{label}.scroll must be one of {sorted(BEHAVIOR_SCROLL_VALUES)}")
+
+
+def check_behavior_structure(document: Any, *, run_id: str, journey_id: str, label: str) -> None:
+    """Shape, types and identity of one run's behavior record; anything else is not a record of that run at all."""
+    expected = EXPECTED_BEHAVIOR.get(journey_id)
+    if expected is None:
+        raise InvalidEvidence(f"{label} has no behavior contract for journey {journey_id!r}")
+    if not isinstance(document, dict) or set(document) != {"schemaVersion", "runId", "journey", "iterations"}:
+        raise InvalidEvidence(f"{label} must contain exactly schemaVersion, runId, journey and iterations")
+    if _whole(document["schemaVersion"], f"{label}.schemaVersion") != BEHAVIOR_SCHEMA_VERSION:
+        raise InvalidEvidence(f"{label}.schemaVersion must be {BEHAVIOR_SCHEMA_VERSION}")
+    if document["runId"] != run_id:
+        raise InvalidEvidence(f"{label}.runId does not match {run_id!r}")
+    if document["journey"] != journey_id:
+        raise InvalidEvidence(f"{label}.journey does not match {journey_id!r}")
+    iterations = document["iterations"]
+    if not isinstance(iterations, list) or len(iterations) != len(BEHAVIOR_PHASES):
+        raise InvalidEvidence(f"{label}.iterations must contain {len(BEHAVIOR_PHASES)} entries")
+    keys = {"phase", "index", "lookups", "before", "after", "action"}
+    if expected["during"] is not None:
+        keys.add("during")
+    for position, iteration in enumerate(iterations):
+        item = f"{label}.iterations[{position}]"
+        if not isinstance(iteration, dict) or set(iteration) != keys:
+            raise InvalidEvidence(f"{item} must contain exactly {sorted(keys)}")
+        if iteration["phase"] != BEHAVIOR_PHASES[position]:
+            raise InvalidEvidence(f"{item}.phase must be {BEHAVIOR_PHASES[position]}")
+        if _whole(iteration["index"], f"{item}.index") != BEHAVIOR_INDICES[position]:
+            raise InvalidEvidence(f"{item}.index must be {BEHAVIOR_INDICES[position]}")
+        lookups = iteration["lookups"]
+        if not isinstance(lookups, dict) or set(lookups) != expected["lookups"]:
+            raise InvalidEvidence(f"{item}.lookups must record exactly {sorted(expected['lookups'])}")
+        for tag, count in lookups.items():
+            _whole(count, f"{item}.lookups[{tag}]")
+        _check_behavior_state(iteration["before"], f"{item}.before")
+        _check_behavior_state(iteration["after"], f"{item}.after")
+        if expected["during"] is not None:
+            during = iteration["during"]
+            if (
+                not isinstance(during, dict)
+                or set(during) != {"scroll"}
+                or not isinstance(during["scroll"], str)
+                or during["scroll"] not in BEHAVIOR_SCROLL_VALUES
+            ):
+                raise InvalidEvidence(f"{item}.during must be a scroll observation")
+        if not isinstance(iteration["action"], str) or iteration["action"] not in BEHAVIOR_ACTIONS:
+            raise InvalidEvidence(f"{item}.action must be one of {sorted(BEHAVIOR_ACTIONS)}")
+
+
+def behavior_failures(document: Mapping[str, Any], journey_id: str) -> list[str]:
+    """Every expectation a structurally checked record misses; empty when the journey behaved as agreed."""
+    expected = EXPECTED_BEHAVIOR[journey_id]
+    failures: list[str] = []
+    for position, iteration in enumerate(document["iterations"]):
+        item = f"iterations[{position}]"
+        for tag in sorted(expected["lookups"]):
+            if iteration["lookups"][tag] != 1:
+                failures.append(f"{item} looked {tag} up {iteration['lookups'][tag]} times")
+        for phase in ("before", "after"):
+            for key, value in expected[phase].items():
+                if iteration[phase][key] != value:
+                    failures.append(f"{item}.{phase}.{key} is {iteration[phase][key]!r}, expected {value!r}")
+        if expected["during"] is not None and iteration["during"] != expected["during"]:
+            failures.append(f"{item}.during is {iteration['during']!r}, expected {expected['during']!r}")
+        if iteration["action"] != "completed":
+            failures.append(f"{item}.action is {iteration['action']!r}")
+    return failures
+
+
+def validate_behavior(document: Any, *, run_id: str, journey_id: str, label: str) -> None:
+    """A valid run's behavior record: well formed for that run and journey, and every expectation met."""
+    check_behavior_structure(document, run_id=run_id, journey_id=journey_id, label=label)
+    failures = behavior_failures(document, journey_id)
+    if failures:
+        raise InvalidEvidence(f"{label} does not show the agreed behavior: " + "; ".join(failures[:3]))
+
+
 def s11_p99_limit(b99: float) -> float:
     return min(S5_P99_LIMIT_MS, max(0.0, _finite_number(b99, "B99") + 2.0))
 
@@ -523,12 +653,13 @@ def validate_manifest(manifest: Mapping[str, Any], artifact_root: Path) -> None:
             run_id = run.get("runId")
             if (
                 not isinstance(run_id, str)
-                or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", run_id)
+                or not RUN_ID_RE.fullmatch(run_id)
                 or run_id in seen_run_ids
             ):
                 raise InvalidEvidence(f"{label}.runId must be globally unique and stable")
             seen_run_ids.add(run_id)
             result_path = validate_artifact_ref(run.get("result"), artifact_root, f"{label}.result")
+            behavior_path = validate_artifact_ref(run.get("behavior"), artifact_root, f"{label}.behavior")
             preflight_path = validate_artifact_ref(
                 run.get("preflight"), artifact_root, f"{label}.preflight"
             )
@@ -557,7 +688,7 @@ def validate_manifest(manifest: Mapping[str, Any], artifact_root: Path) -> None:
             ]
             if len({path.resolve() for path in trace_paths}) != len(trace_paths):
                 raise InvalidEvidence(f"{label}.traces must be unique")
-            run_artifacts = [result_path, preflight_path, postflight_path, *trace_paths]
+            run_artifacts = [result_path, behavior_path, preflight_path, postflight_path, *trace_paths]
             for path in run_artifacts:
                 resolved_path = path.resolve()
                 if resolved_path in used_run_artifacts:
@@ -581,6 +712,9 @@ def validate_manifest(manifest: Mapping[str, Any], artifact_root: Path) -> None:
             evidence_trace_names = [path.name for path in trace_paths]
             if raw_trace_names != evidence_trace_names:
                 raise InvalidEvidence(f"{label}.traces do not match profilerOutputs filenames")
+            validate_behavior(
+                load_json(behavior_path), run_id=run_id, journey_id=journey_id, label=f"{label}.behavior"
+            )
             extracted.append(extracted_run)
 
         calculated = evaluate_triplet(extracted, mode="s5")
@@ -590,14 +724,11 @@ def validate_manifest(manifest: Mapping[str, Any], artifact_root: Path) -> None:
             raise InvalidEvidence(f"journey medianP99Ms is inconsistent: {journey_id}")
         if reported.frame_count != sum(run.frame_count for run in extracted):
             raise InvalidEvidence(f"journey frameCount is inconsistent: {journey_id}")
-        if manifest.get("gate") == "S5":
-            if journey.get("verdict") != calculated.verdict:
-                raise InvalidEvidence(f"S5 journey verdict is inconsistent: {journey_id}")
-            journey_verdicts.append(calculated.verdict)
         attempts = journey.get("attempts")
         if not isinstance(attempts, list) or not 3 <= len(attempts) <= 5:
             raise InvalidEvidence(f"journeys[{index}].attempts must contain 3 to 5 attempts")
         valid_attempt_runs: set[str] = set()
+        behavior_failed = False
         for attempt_index, attempt in enumerate(attempts):
             attempt_label = f"journeys[{index}].attempts[{attempt_index}]"
             if not isinstance(attempt, dict):
@@ -618,9 +749,7 @@ def validate_manifest(manifest: Mapping[str, Any], artifact_root: Path) -> None:
                 attempt_run_id = attempt.get("runId")
                 if set(attempt) != {"attemptId", "ordinal", "outcome", "runId"}:
                     raise InvalidEvidence(f"{attempt_label} valid shape is invalid")
-                if not isinstance(attempt_run_id, str) or not re.fullmatch(
-                    r"[a-z0-9][a-z0-9._-]{0,63}", attempt_run_id
-                ):
+                if not isinstance(attempt_run_id, str) or not RUN_ID_RE.fullmatch(attempt_run_id):
                     raise InvalidEvidence(f"{attempt_label}.runId must be a stable string")
                 if attempt_run_id in valid_attempt_runs:
                     raise InvalidEvidence(f"{attempt_label} repeats a valid runId")
@@ -682,8 +811,28 @@ def validate_manifest(manifest: Mapping[str, Any], artifact_root: Path) -> None:
                             f"{attempt_label} result-malformed evidence is structurally valid; "
                             "a threshold miss is a valid measured run"
                         )
+            elif outcome == "behavior-failed":
+                # The journey ran and did not behave as agreed: not an environment retry. It fails the journey below.
+                if set(attempt) != {"attemptId", "ordinal", "outcome", "evidence"}:
+                    raise InvalidEvidence(f"{attempt_label} behavior-failed shape is invalid")
+                failed_path = validate_artifact_ref(
+                    attempt.get("evidence"), artifact_root, f"{attempt_label}.evidence"
+                )
+                digest = sha256_file(failed_path)
+                if digest in used_run_digests:
+                    raise InvalidEvidence(f"attempt evidence is byte-reused: {failed_path}")
+                used_run_digests.add(digest)
+                failed_document = load_json(failed_path)
+                check_behavior_structure(
+                    failed_document, run_id=attempt_id, journey_id=journey_id, label=f"{attempt_label}.evidence"
+                )
+                if not behavior_failures(failed_document, journey_id):
+                    raise InvalidEvidence(f"{attempt_label} behavior-failed evidence shows no behavior failure")
+                behavior_failed = True
             else:
-                raise InvalidEvidence(f"{attempt_label}.outcome must be valid or invalid")
+                raise InvalidEvidence(
+                    f"{attempt_label}.outcome must be valid, invalid or behavior-failed"
+                )
         journey_run_ids = {run["runId"] for run in runs}
         if valid_attempt_runs != journey_run_ids or len(valid_attempt_runs) != 3:
             raise InvalidEvidence(
@@ -693,6 +842,12 @@ def validate_manifest(manifest: Mapping[str, Any], artifact_root: Path) -> None:
             raise InvalidEvidence(
                 f"journeys[{index}] must stop when the third valid run is obtained"
             )
+        # A behavior failure fails the journey whatever its metrics, and later valid runs cannot win it back.
+        expected_verdict = "fail" if behavior_failed else calculated.verdict
+        if manifest.get("gate") == "S5":
+            if journey.get("verdict") != expected_verdict:
+                raise InvalidEvidence(f"S5 journey verdict is inconsistent: {journey_id}")
+            journey_verdicts.append(expected_verdict)
     if seen != EXPECTED_JOURNEY_IDS:
         raise InvalidEvidence(
             f"journey ids must equal {sorted(EXPECTED_JOURNEY_IDS)}, got {sorted(seen)}"
@@ -743,9 +898,14 @@ def validate_s11_against_golden(
         expected = evaluate_triplet(
             [candidate_metrics, candidate_metrics, candidate_metrics], mode="s11", b99=b99
         )
-        if journey.get("verdict") != expected.verdict:
+        attempts = journey.get("attempts")
+        behavior_failed = isinstance(attempts, list) and any(
+            isinstance(attempt, dict) and attempt.get("outcome") == "behavior-failed" for attempt in attempts
+        )
+        expected_verdict = "fail" if behavior_failed else expected.verdict
+        if journey.get("verdict") != expected_verdict:
             raise InvalidEvidence(f"S11 journey verdict is inconsistent: {journey_id}")
-        candidate_verdicts.append(expected.verdict)
+        candidate_verdicts.append(expected_verdict)
     aggregate = "pass" if candidate_verdicts and all(v == "pass" for v in candidate_verdicts) else "fail"
     if candidate.get("verdict") != aggregate:
         raise InvalidEvidence("S11 manifest verdict is inconsistent with journey verdicts")
@@ -842,6 +1002,7 @@ def evaluate_run_set(
         raise InvalidEvidence(f"unsupported gate mode: {mode}")
 
     seen: set[str] = set()
+    seen_run_ids: set[str] = set()
     used_results: set[Path] = set()
     used_result_digests: set[str] = set()
     results: list[dict[str, Any]] = []
@@ -861,28 +1022,40 @@ def evaluate_run_set(
         if benchmark_identity != EXPECTED_BENCHMARK_IDENTITIES.get(journey_id):
             raise InvalidEvidence(f"run-set benchmark identity does not match journey {journey_id}")
         seen.add(journey_id)
-        run_paths = journey.get("runs")
-        if not isinstance(run_paths, list) or len(run_paths) != EXPECTED_VALID_RUNS:
-            raise InvalidEvidence(f"{journey_id} must reference exactly {EXPECTED_VALID_RUNS} results")
+        runs = journey.get("runs")
+        if not isinstance(runs, list) or len(runs) != EXPECTED_VALID_RUNS:
+            raise InvalidEvidence(f"{journey_id} must reference exactly {EXPECTED_VALID_RUNS} runs")
         metrics: list[RunMetrics] = []
-        for run_index, relative in enumerate(run_paths):
-            result_path = _safe_artifact(
-                artifact_root, relative, f"{journey_id}.runs[{run_index}]"
-            )
-            if not result_path.is_file():
-                raise InvalidEvidence(f"run result does not exist: {relative}")
-            resolved_result = result_path.resolve()
-            if resolved_result in used_results:
-                raise InvalidEvidence("three independent runs may not reuse a result JSON")
-            used_results.add(resolved_result)
-            result_digest = sha256_file(result_path)
-            if result_digest in used_result_digests:
-                raise InvalidEvidence("three independent runs may not reuse byte-identical results")
-            used_result_digests.add(result_digest)
-            raw = load_json(result_path)
+        for run_index, run in enumerate(runs):
+            label = f"{journey_id}.runs[{run_index}]"
+            if not isinstance(run, dict) or set(run) != {"runId", "result", "behavior"}:
+                raise InvalidEvidence(f"{label} must contain exactly runId, result and behavior")
+            run_id = run["runId"]
+            if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id) or run_id in seen_run_ids:
+                raise InvalidEvidence(f"{label}.runId must be globally unique and stable")
+            seen_run_ids.add(run_id)
+            paths: dict[str, Path] = {}
+            for role in ("result", "behavior"):
+                relative = run[role]
+                path = _safe_artifact(artifact_root, relative, f"{label}.{role}")
+                if not path.is_file():
+                    raise InvalidEvidence(f"run {role} does not exist: {relative}")
+                resolved = path.resolve()
+                if resolved in used_results:
+                    raise InvalidEvidence(f"three independent runs may not reuse a {role} JSON")
+                used_results.add(resolved)
+                digest = sha256_file(path)
+                if digest in used_result_digests:
+                    raise InvalidEvidence(f"three independent runs may not reuse byte-identical {role} evidence")
+                used_result_digests.add(digest)
+                paths[role] = path
+            raw = load_json(paths["result"])
             if not isinstance(raw, dict):
-                raise InvalidEvidence(f"run result root must be an object: {relative}")
+                raise InvalidEvidence(f"run result root must be an object: {run['result']}")
             metrics.append(extract_macrobenchmark_run(raw, expected_identity=benchmark_identity))
+            validate_behavior(
+                load_json(paths["behavior"]), run_id=run_id, journey_id=journey_id, label=f"{label}.behavior"
+            )
         b99 = None
         if mode == "s11":
             golden_journey = golden_by_id.get(journey_id)
