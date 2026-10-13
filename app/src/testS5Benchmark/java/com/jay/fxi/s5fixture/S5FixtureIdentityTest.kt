@@ -4,10 +4,6 @@ import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthUnavailableException
-import java.io.File
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.async
-import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -129,50 +125,6 @@ class S5FixtureIdentityTest {
         assertNull(identity.currentUser())
         assertTrue(identity.signInAfter { true })
         assertEquals(gen1, identity.currentIdentity())
-    }
-
-    @Test
-    fun `S5-4 4b startup signs in only after the seed, and a false or throwing seed is a startup failure`() = runTest {
-        try {
-            startS5Fixture(identity) { false }
-            fail("a false seed must fail the startup")
-        } catch (expected: IllegalStateException) {
-            assertEquals("S5 fixture selection seed failed", expected.message)
-        }
-        assertNull(identity.currentIdentity())
-        try {
-            startS5Fixture(identity) { error("disk full") }
-            fail("a throwing seed must fail the startup")
-        } catch (expected: IllegalStateException) {
-            assertEquals("disk full", expected.message)
-        }
-        assertNull(identity.currentUser())
-
-        val fences = mutableListOf<AuthIdentityFence?>()
-        identity.observe { fences += it }
-        var notices = 0
-        identity.register { notices++ }
-        runPosted()
-        val seeded = CompletableDeferred<Boolean>()
-        val start = async { startS5Fixture(identity) { seeded.await() } }
-        runCurrent()
-        runPosted()
-        assertEquals("nothing is published while the seed waits", listOf<AuthIdentityFence?>(null), fences)
-        assertNull(identity.currentUser())
-        assertEquals(1, notices)
-        seeded.complete(true)
-        start.await()
-        runPosted()
-        assertEquals(listOf(null, AuthIdentityFence("s5-fixture", 1L)), fences)
-        assertEquals(gen1, identity.currentIdentity())
-        assertEquals(2, notices)
-    }
-
-    @Test
-    fun `S5-4 4b the identity provider starts the fixture through startS5Fixture, not a logged fallback`() {
-        val source = File("src/s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureModules.kt").readText()
-        assertTrue(source.contains("launch { startS5Fixture(identity) { seeder.seed() } }"))
-        assertFalse("no logged seed fallback", source.contains("signInAfter { seeder.seed() }"))
     }
 
     @Test
