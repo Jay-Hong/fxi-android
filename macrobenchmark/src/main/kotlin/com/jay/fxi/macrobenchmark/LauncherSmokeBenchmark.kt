@@ -66,7 +66,7 @@ class LauncherSmokeBenchmark {
         const val TARGET_PACKAGE = "com.jay.fxi"
         const val EXPECTED_MODEL = "SM-F711N"
         const val EXPECTED_FINGERPRINT =
-            "samsung/b2qksx/b2q:15/AP3A.240905.015.A2/F711NKSSEKZE1:user/release-keys"
+            "samsung/b2qksx/b2q:15/AP3A.240905.015.A2/F711NKSSFKZH5:user/release-keys"
         const val BENCHMARK_ACTION = "com.jay.fxi.action.BENCHMARK_SMOKE"
         const val BENCHMARK_URI = "fxi-benchmark://smoke/launcher"
         const val READY_RESOURCE = "benchmark_smoke_ready"

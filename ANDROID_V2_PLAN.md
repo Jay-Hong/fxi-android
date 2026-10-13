@@ -487,7 +487,7 @@ I1의 legacy rates=S3·legacy graph=S4, I8=S7~S9, I6=S11부터 회귀 금지다.
 | D28 | foreground app-owned 처리와 tap callback은 현재 authenticated premium/KRX 상태를 재확인하고 실패하면 local state update/refetch를 하지 않는다. tap은 앱을 여는 현재 동작과 family state 동기화까지만 하며 section deep-link/focus는 iOS TODO와 맞춰 v2.0에 추가하지 않는다. background OS-rendered visible push는 client가 선필터할 수 없으므로 **SV-1의 send-time 권한 gate가 정본 방어선**이다. payload binding·암호화 quarantine은 v2.0에 추가하지 않는다 | Android notification message의 background 표시 특성; iOS `PushNotificationService.swift:669-769` |
 | D29 | legacy queue 28일 drain·강제 data-only cutover는 **v2.0 release gate에서 제외**한다. 이미 broker에 수락된 메시지를 client가 완전히 회수하지 못하는 한계는 iOS와 동일한 known risk로 기록하고, 실제 stale-delivery/계정교차 사건이 확인될 때 후속 설계를 연다 | `ANDROID_NOTIFICATION_RELIABILITY_FOLLOWUP.md` |
 | D30 | SV-1의 subprocess premium 판정은 **single-owner loopback IPC(B-IPC)**로 통일한다. FastAPI main의 `AlertPremiumCoordinator`가 기존 5분 fresh/총 age 1시간 availability cache·UID single-flight·webhook generation을 소유하고, async sender는 direct await, main sync worker는 bounded main-loop bridge, crawler child만 인증된 localhost batch endpoint를 사용한다. Redis/DB 공유 observation은 도입하지 않는다. 이 결정은 **FastAPI worker=1 · app replica=1**인 현재 production topology에서만 유효하다. v2.0은 이를 Dockerfile·Compose 구조 테스트와 배포 inventory로 증명하며, 자동 분산-owner 검출을 새로 만들지 않는다. topology를 증명하지 못하거나 scale-out/canary budget 위반이 생기면 rollout을 막고 Redis shared-store ADR 또는 SV-0을 다시 연다 | `Dockerfile:131`, `docker-compose.yml:103-124`; subprocess process-local cache 공백을 migration 없이 닫는 최소안 |
-| D31 | S5/S11 Graph 성능 gate는 **Macrobenchmark로 확정**한다. S0에서 같은 AGP의 `com.android.test` 기반 `:macrobenchmark` 모듈, release 유사 `benchmark` variant, 결과 JSON 판정기를 만들고 S5에서 실제 `MainActivity → Tether` 사용자 여정을 고정 fixture·stable semantics tag로 완성한다. `androidx.benchmark:benchmark-macro-junit4:1.4.1`, `androidx.profileinstaller:profileinstaller:1.4.1`을 version catalog에 pin한다. 기준 장비는 **Samsung SM-F711N / Android 15(API 35) / 펼친 main display / 120Hz 고정**이며 S0 fingerprint를 S11까지 유지한다. S5 절대 gate는 각 여정의 3개 유효 run 중앙값이 **`frameOverrunMs P95 ≤ 0ms ∧ P99 ≤ 8.33ms`**인 것이고, 이를 통과한 artifact만 S11 회귀 golden을 만든다. `dumpsys gfxinfo framestats`는 triage 보조일 뿐 release pass/fail 대체물이 아니다 | Android 공식 Macrobenchmark setup·`FrameTimingMetric`·physical-device 권고; 2026-08-30 ADB 실측으로 API 35·1080×2640·120/96/60/48Hz 지원 확인 |
+| D31 | S5/S11 Graph 성능 gate는 **Macrobenchmark로 확정**한다. S0에서 같은 AGP의 `com.android.test` 기반 `:macrobenchmark` 모듈, release 유사 `benchmark` variant, 결과 JSON 판정기를 만들고 S5에서 실제 `MainActivity → Tether` 사용자 여정을 고정 fixture·stable semantics tag로 완성한다. `androidx.benchmark:benchmark-macro-junit4:1.4.1`, `androidx.profileinstaller:profileinstaller:1.4.1`을 version catalog에 pin한다. 기준 장비는 **Samsung SM-F711N / Android 15(API 35) / 펼친 main display / 120Hz 고정**이며 2026-10-13 관측으로 개정한 단일 fingerprint 계약(:983-984)을 새 펌웨어 S0-f 봉인과 S5/S11에 적용한다. S5 절대 gate는 각 여정의 3개 유효 run 중앙값이 **`frameOverrunMs P95 ≤ 0ms ∧ P99 ≤ 8.33ms`**인 것이고, 이를 통과한 artifact만 S11 회귀 golden을 만든다. `dumpsys gfxinfo framestats`는 triage 보조일 뿐 release pass/fail 대체물이 아니다 | Android 공식 Macrobenchmark setup·`FrameTimingMetric`·physical-device 권고; 2026-08-30 ADB 실측으로 API 35·1080×2640·120/96/60/48Hz 지원 확인 |
 
 #### D23 상태 전이 (S1 소유, S2 Root가 소비)
 
@@ -980,8 +980,8 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
     hosted Linux CI는 target/test APK assemble과 결과-parser fixture를 검증한다. 계측 smoke·숫자 gate는 hosted runner나
     emulator가 아니라, 현재 Mac에 연결한 API 34+ **고정 실기기의 로컬 manual device-only lane**에서 실행한다.
     이를 위해 별도 macOS CI/self-hosted runner를 요구하지 않는다
-  - v2 기준 실기기는 **Samsung SM-F711N**으로 고정한다. S0 기준 fingerprint는
-    `samsung/b2qksx/b2q:15/AP3A.240905.015.A2/F711NKSSEKZE1:user/release-keys`이며 serial은 기록하지 않는다.
+  - v2 기준 실기기는 **Samsung SM-F711N**으로 고정한다. 기준 fingerprint는 2026-10-13 OTA 관측으로 개정한
+    `samsung/b2qksx/b2q:15/AP3A.240905.015.A2/F711NKSSFKZH5:user/release-keys`이며 serial은 기록하지 않는다. S0-f·S0-g 봉인 당시 계약(`…/F711NKSSEKZE1:user/release-keys`)의 evidence는 과거 계약의 기록으로 보존하고 새 계약의 측정 기준으로 쓰지 않으며, 현재 검사기로 재검증하지 않는다(재검증은 봉인 commit의 검사기로 한다). 새 펌웨어 S0-f는 E·runner 확정 뒤 다시 봉인한다(slice 7).
     preflight는 device state `OPENED`, inner display 1080×2640 portrait, min/peak 120Hz, animation scale 3종 1.0,
     low-power OFF, 충전 전원 OFF, battery ≥30%, Android thermal status `NONE(0)`를 assert한다. 설정 변경은 원값을
     캡처한 뒤 `finally`에서 복원하고, fingerprint·display/posture 조건이 다르면 측정하지 않는다
@@ -1540,7 +1540,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   각 tag의 UIAutomator lookup 정확히 1건, 기대 화면 상태와 action 완료·`frameCount>0`을 함께 assert해
   bridge/tag 누락·selector miss·무프레임 false-green을 막는다.
   이를 “dropped frame 0”으로 바꿔 쓰지 않는다.
-  고정 SM-F711N 실기기의 model/build fingerprint/OPENED posture/120Hz가 S0 evidence와 다르거나
+  고정 SM-F711N 실기기의 model/build fingerprint/OPENED posture/120Hz가 개정된 현재 기기 계약(:983-987) 및 그 계약으로 새로 봉인한 S0-f evidence와 다르거나
   thermal throttling·metric 누락이 있으면
   해당 run을 무효화한다. 여정별 최대 5회 시도 안에 3개 유효 run을 얻지 못하면 환경 gate 실패이며 무한 재실행하지 않는다.
   각 유효 run 사이에는 thermal `NONE(0)` 복귀를 기다리고 세 여정을 한 invocation으로 묶지 않는다.

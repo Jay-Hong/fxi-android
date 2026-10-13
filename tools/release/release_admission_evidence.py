@@ -205,7 +205,7 @@ def _device(value: Any, label: str) -> Mapping[str, Any]:
         "model": "SM-F711N",
         "fingerprint": (
             "samsung/b2qksx/b2q:15/AP3A.240905.015.A2/"
-            "F711NKSSEKZE1:user/release-keys"
+            "F711NKSSFKZH5:user/release-keys"
         ),
         "api": 35,
         "posture": "OPENED",

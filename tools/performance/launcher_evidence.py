@@ -105,7 +105,7 @@ EXPECTED_MODEL = "SM-F711N"
 EXPECTED_API = 35
 EXPECTED_FINGERPRINT = (
     "samsung/b2qksx/b2q:15/AP3A.240905.015.A2/"
-    "F711NKSSEKZE1:user/release-keys"
+    "F711NKSSFKZH5:user/release-keys"
 )
 EXPECTED_SIZE = "1080x2640"
 LAUNCHER_CLASS = "com.jay.fxi.macrobenchmark.LauncherSmokeBenchmark"
