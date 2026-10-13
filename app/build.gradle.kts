@@ -135,6 +135,34 @@ val publicReleaseGoogleServicesShadows =
     publicReleaseGoogleServicesCandidates.filterNot { candidate ->
         candidate == productionGoogleServicesPath
     }
+// S5-4 slice 4b: the local s5Benchmark fixture must resolve the checked-in non-production CI Firebase fixture. The plugin takes
+// the first regular file among these candidates; a missing, shadowed, linked or different file fails the build before the
+// plugin reads it.
+val s5BenchmarkGoogleServicesCandidates =
+    com.google.gms.googleservices.GoogleServicesPlugin.getJsonFiles(
+        "s5Benchmark",
+        emptyList(),
+        project.projectDir
+    ).map { candidate -> candidate.toPath().toAbsolutePath().normalize() }.distinct()
+val s5BenchmarkGoogleServicesPath = project.file("src/s5Benchmark/google-services.json").toPath().toAbsolutePath().normalize()
+val ciFirebaseFixturePath = rootProject.file("ci/google-services.ci-fixture.json").toPath().toAbsolutePath().normalize()
+check(s5BenchmarkGoogleServicesPath in s5BenchmarkGoogleServicesCandidates) {
+    "google-services plugin no longer resolves src/s5Benchmark/google-services.json for s5Benchmark; review the S5 fixture."
+}
+val verifyS5BenchmarkFirebaseFixture = tasks.register("verifyS5BenchmarkFirebaseFixture") {
+    doLast {
+        val selected = s5BenchmarkGoogleServicesCandidates.firstOrNull { candidate ->
+            Files.isRegularFile(candidate, LinkOption.NOFOLLOW_LINKS)
+        }
+        check(selected == s5BenchmarkGoogleServicesPath) {
+            "s5Benchmark would resolve $selected, not its own non-production Firebase fixture"
+        }
+        check(Files.readAllBytes(selected).contentEquals(Files.readAllBytes(ciFirebaseFixturePath))) {
+            "src/s5Benchmark/google-services.json is not ci/google-services.ci-fixture.json"
+        }
+    }
+}
+tasks.matching { it.name == "processS5BenchmarkGoogleServices" }.configureEach { dependsOn(verifyS5BenchmarkFirebaseFixture) }
 val hasCompleteReleaseSigning = releaseKeystoreFile.exists() &&
     listOf("KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD").all { key ->
         localProperties.getProperty(key, "").isNotBlank()
@@ -260,6 +288,25 @@ android {
                 mappingFileUploadEnabled = false
             }
         }
+        // S5-4 slice 4b: the local S5 Macrobenchmark fixture. Release R8 rules with debug signing and not debuggable, D24 ON and
+        // data-on; its own source set binds a loopback fixture server, one fixture identity and a fixed graph clock in place of
+        // src/productionBindings. Crash collection stays closed and test tags become resource ids for the benchmark selectors.
+        // Built locally only: never uploaded or published. Its name holds no "release", so release authorization does not apply.
+        create("s5Benchmark") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+            isDebuggable = false
+            matchingFallbacks += listOf("release")
+            buildConfigField("String", "REVENUECAT_API_KEY", "\"\"")
+            buildConfigField("boolean", "BENCHMARK_NO_DATA_MODE", "false")
+            buildConfigField("boolean", "TOPIC_V2_RELEASE_ON", "true")
+            manifestPlaceholders["topicV2ReleaseOn"] = true
+            buildConfigField("boolean", "CRASH_COLLECTION_ALLOWED", "false")
+            buildConfigField("boolean", "SEMANTICS_RESOURCE_IDS", "true")
+            configure<com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsExtension> {
+                mappingFileUploadEnabled = false
+            }
+        }
     }
     // S5-4 slice 2: bindings that a fixture build type replaces with its own. The four existing build types take them, and
     // their unit tests the matching tests, from these shared directories; a build type without a binding fails Hilt's compile.
@@ -268,6 +315,8 @@ android {
             getByName(type).java.srcDir("src/productionBindings/java")
             getByName("test" + type.replaceFirstChar { it.uppercase() }).java.srcDir("src/testProductionBindings/java")
         }
+        // S5-4 slice 4b: the S5 fixture reads the one frozen fixture source by reference; nothing is copied.
+        getByName("s5Benchmark").assets.srcDir("src/benchmark/assets/s5_4")
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -282,15 +331,16 @@ android {
     }
 }
 
-// Owner structure tests inspect all three merged manifests, including library declarations.
+// Owner structure tests inspect all four merged manifests (S5-4 slice 4b added s5Benchmark), including library declarations.
 // Build their current inputs even when only one unit-test variant is requested, and invalidate
 // cached test results when any merged manifest changes. This does not assemble the other variants.
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
-    dependsOn("processDebugManifest", "processBenchmarkManifest", "processCiMinifiedManifest")
+    dependsOn("processDebugManifest", "processBenchmarkManifest", "processCiMinifiedManifest", "processS5BenchmarkManifest")
     inputs.files(
         layout.buildDirectory.file("intermediates/merged_manifests/debug/processDebugManifest/AndroidManifest.xml"),
         layout.buildDirectory.file("intermediates/merged_manifests/benchmark/processBenchmarkManifest/AndroidManifest.xml"),
-        layout.buildDirectory.file("intermediates/merged_manifests/ciMinified/processCiMinifiedManifest/AndroidManifest.xml")
+        layout.buildDirectory.file("intermediates/merged_manifests/ciMinified/processCiMinifiedManifest/AndroidManifest.xml"),
+        layout.buildDirectory.file("intermediates/merged_manifests/s5Benchmark/processS5BenchmarkManifest/AndroidManifest.xml")
     ).withPropertyName("controlOwnerMergedManifests")
         .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
 }
@@ -591,6 +641,9 @@ dependencies {
     // S0-f D31: the target benchmark APK must contain ProfileInstaller 1.4.1 as a
     // real resolved dependency. A catalog pin alone does not satisfy the gate.
     add("benchmarkImplementation", libs.androidx.profileinstaller)
+    // S5-4 slice 4b: the S5 fixture's own runtime: ProfileInstaller as in benchmark, and the loopback fixture server.
+    add("s5BenchmarkImplementation", libs.androidx.profileinstaller)
+    add("s5BenchmarkImplementation", libs.okhttp.mockwebserver)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
 }

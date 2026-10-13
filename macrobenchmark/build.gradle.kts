@@ -22,6 +22,12 @@ android {
             signingConfig = signingConfigs.getByName("debug")
             matchingFallbacks += listOf("release")
         }
+        // S5-4 slice 4b: the test APK for the app's s5Benchmark fixture build type, matched by name.
+        create("s5Benchmark") {
+            isDebuggable = true
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
     }
 
     compileOptions {

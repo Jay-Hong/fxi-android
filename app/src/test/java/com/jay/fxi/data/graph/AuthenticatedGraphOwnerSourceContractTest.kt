@@ -231,7 +231,7 @@ class AuthenticatedGraphOwnerSourceContractTest {
      */
     @Test fun O06_dormant_noProductionFileNamesIt_andNoDiAnnotation() {
         val roots = File("src").listFiles().orEmpty()
-            .filter { it.isDirectory && it.name !in setOf("test", "androidTest", "testFixtures") }
+            .filter { it.isDirectory && it.name !in setOf("test", "androidTest", "testFixtures", "testProductionBindings", "testS5Benchmark") }
             .flatMap { set -> listOf("java", "kotlin").map { File(set, it) } }
             .filter { it.isDirectory }
         val all = roots.flatMap { root ->

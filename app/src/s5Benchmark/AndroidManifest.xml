@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application>
+        <!-- S5-4 slice 4b: the local S5 Macrobenchmark fixture build type only. Shell profiling for the benchmark; never in
+             release or public artifacts. -->
+        <profileable
+            android:shell="true"
+            tools:targetApi="29" />
+
+        <!-- The fixture process is admitted and carries data, so these flags (with CRASH_COLLECTION_ALLOWED=false) keep
+             Analytics, Crashlytics and FCM auto-init off. The build supplies only the non-production CI Firebase fixture. -->
+        <meta-data
+            android:name="firebase_analytics_collection_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="firebase_crashlytics_collection_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="firebase_messaging_auto_init_enabled"
+            android:value="false" />
+    </application>
+</manifest>

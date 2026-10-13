@@ -773,7 +773,7 @@ class GraphScreenHostContractTest {
     @Test fun D01_dormant() {
         val src = File("src")
         val all = src.walkTopDown()
-            .onEnter { it == src || it.parentFile != src || it.name !in setOf("test", "androidTest") }
+            .onEnter { it == src || it.parentFile != src || it.name !in setOf("test", "androidTest", "testProductionBindings", "testS5Benchmark") }
             .filter { it.isFile && it.extension == "kt" }
             .associate { it.relativeTo(src).invariantSeparatorsPath to it.readText() }
         val code = all.mapValues { (_, text) -> text.replace(Regex("""/\*[\s\S]*?\*/"""), "").replace(Regex("""//[^\n]*"""), "") }

@@ -56,7 +56,7 @@ class CutoverSharedProvidersContractTest {
 
     /** Every Kotlin and Java file outside the test source sets, keyed by its path under src/. */
     private fun production(): Map<String, String> = src.walkTopDown()
-        .onEnter { it == src || it.parentFile != src || it.name !in setOf("test", "androidTest") }
+        .onEnter { it == src || it.parentFile != src || it.name !in setOf("test", "androidTest", "testProductionBindings", "testS5Benchmark") }
         .filter { it.isFile && (it.extension == "kt" || it.extension == "java") }
         .associate { it.relativeTo(src).invariantSeparatorsPath to it.readText() }
 
@@ -65,6 +65,8 @@ class CutoverSharedProvidersContractTest {
     private fun main(path: String) = "main/java/com/jay/fxi/$path"
 
     private val graphModule = main("di/GraphRuntimeModule.kt")
+    /** S5-4 slice 4b: the S5 fixture's selection seeder, the one fixture file that names the selection store (write and confirm). */
+    private val S5_SEEDER = "s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureSelectionSeeder.kt"
     private val seedModule = main("di/InstallSeedModule.kt")
     private val schedulerModule = main("di/FreeSnapshotSchedulerModule.kt")
     private val prefetchFile = main("data/free/InstallSeedPrefetch.kt")
@@ -566,7 +568,7 @@ class CutoverSharedProvidersContractTest {
             "DeletionAdmissionStore" to setOf(main("data/entitlements/DeletionAdmissionStore.kt"), main("data/graph/GraphProtectedAdmission.kt"), graphModule,
                 main("ui/settings/SettingsViewModel.kt"), main("data/graph/ProcessGraphBuilder.kt")),
             "GraphSelectionStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/graph/GraphSeriesSelectionSession.kt"), graphModule,
-                main("data/graph/ProcessGraphBuilder.kt")),
+                main("data/graph/ProcessGraphBuilder.kt"), S5_SEEDER),
             "BackupableUserIntentStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt"), graphModule),
             "FileGraphV2DiskStore" to setOf(main("data/graph/GraphV2DiskStore.kt"), graphModule, main("data/graph/ProcessGraphBuilder.kt"))
         )
@@ -581,7 +583,7 @@ class CutoverSharedProvidersContractTest {
             "DeletionAdmissionStore" to mapOf(main("data/entitlements/DeletionAdmissionStore.kt") to 1, main("data/graph/GraphProtectedAdmission.kt") to 2, graphModule to 3,
                 main("ui/settings/SettingsViewModel.kt") to 4, main("data/graph/ProcessGraphBuilder.kt") to 2),
             "GraphSelectionStore" to mapOf(main("data/graph/GraphSeriesSelectionSession.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 2, graphModule to 2,
-                main("data/graph/ProcessGraphBuilder.kt") to 2),
+                main("data/graph/ProcessGraphBuilder.kt") to 2, S5_SEEDER to 2),
             "BackupableUserIntentStore" to mapOf(main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 1, graphModule to 2),
             "FileGraphV2DiskStore" to mapOf(main("data/graph/GraphV2DiskStore.kt") to 1, graphModule to 4, main("data/graph/ProcessGraphBuilder.kt") to 1)
         )
@@ -589,6 +591,15 @@ class CutoverSharedProvidersContractTest {
             assertEquals("$type is named exactly where and as often as allowed", expected,
                 stripped.mapValues { (_, text) -> Regex("""\b$type\b""").findAll(text).count() }.filterValues { it > 0 })
         }
+        // S5-4 slice 4b: the seeder only writes and confirms through the store it is given, by method reference. Its store is named
+        // only by the declaration and those two references, so an alias cannot carry a further call.
+        assertEquals(
+            "the seeder names its injected store only for its declaration and two method references",
+            3,
+            Regex("""\bstore\b""").findAll(stripped.getValue(S5_SEEDER)).count()
+        )
+        assertEquals("the seeder's store calls", listOf("store::confirmGraphSelection", "store::writeGraphSelection"),
+            Regex("""\bstore\s*(::|\.)\s*\w+""").findAll(stripped.getValue(S5_SEEDER)).map { it.value.replace(" ", "") }.sorted().toList())
         // The dormant providers are declared and never called or referenced; the disk helper is called by its provider only.
         for ((name, expected) in listOf("provideDeletionAdmissionStore" to 1, "provideGraphSelectionStore" to 1, "provideGraphV2DiskStore" to 1, "graphV2DiskStoreAt" to 2)) {
             assertEquals("$name is used only as declared", mapOf(graphModule to expected),

@@ -101,10 +101,10 @@ class ControlIssuanceStructureTest {
 
     @Test fun allProductionSourceSetsAndLanguagesAreScannedButTestSetsAreExcluded() {
         val root = sourceTree(folder.newFolder("source-sets"))
-        val included = listOf("main", "debug", "benchmark", "ciMinified", "release", "custom")
+        val included = listOf("main", "debug", "benchmark", "ciMinified", "release", "s5Benchmark", "custom")
             .flatMap { set -> listOf("$set/java/Probe.kt", "$set/kotlin/Probe.kt") }
         for (path in included) writeSource(root, path, "registerPrepared")
-        for (set in listOf("test", "androidTest", "testFixtures")) {
+        for (set in listOf("test", "androidTest", "testFixtures", "testProductionBindings", "testS5Benchmark")) {
             for (language in listOf("java", "kotlin")) writeSource(root, "$set/$language/Probe.kt", "excluded")
         }
         writeSource(root, "main/java/JavaProbe.java", "java-source")
@@ -249,7 +249,7 @@ internal object SealSourceTripwire {
 
     fun read(root: File): Map<String, String> {
         requireSourceRoot(root)
-        val sourceSets = root.listFiles().orEmpty().filter { it.isDirectory && it.name !in setOf("test", "androidTest", "testFixtures") }
+        val sourceSets = root.listFiles().orEmpty().filter { it.isDirectory && it.name !in setOf("test", "androidTest", "testFixtures", "testProductionBindings", "testS5Benchmark") }
         val roots = sourceSets.flatMap { set -> listOf(File(set, "java"), File(set, "kotlin")) }.filter { it.isDirectory }
         check(roots.isNotEmpty()) { "production source directories are empty: ${root.path}" }
         val files = roots.flatMap { dir -> dir.walkTopDown().filter { it.isFile && it.extension in setOf("kt", "java") }.toList() }

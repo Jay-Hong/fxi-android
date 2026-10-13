@@ -148,10 +148,11 @@ jobs:
       # build-type 전용 경로만 사용하므로 release variant는 이 fixture를 볼 수 없다.
       - name: Supply non-production google-services.json
         run: |
-          mkdir -p app/src/debug app/src/ciMinified app/src/benchmark
+          mkdir -p app/src/debug app/src/ciMinified app/src/benchmark app/src/s5Benchmark
           cp ci/google-services.ci-fixture.json app/src/debug/google-services.json
           cp ci/google-services.ci-fixture.json app/src/ciMinified/google-services.json
           cp ci/google-services.ci-fixture.json app/src/benchmark/google-services.json
+          cp ci/google-services.ci-fixture.json app/src/s5Benchmark/google-services.json
 
       # Pure-stdlib tests for the manual contract refresh tool. They do not
       # import the server or require the sibling Python repository.
@@ -257,10 +258,11 @@ jobs:
 
       - name: Supply non-production google-services.json
         run: |
-          mkdir -p app/src/debug app/src/ciMinified app/src/benchmark
+          mkdir -p app/src/debug app/src/ciMinified app/src/benchmark app/src/s5Benchmark
           cp ci/google-services.ci-fixture.json app/src/debug/google-services.json
           cp ci/google-services.ci-fixture.json app/src/ciMinified/google-services.json
           cp ci/google-services.ci-fixture.json app/src/benchmark/google-services.json
+          cp ci/google-services.ci-fixture.json app/src/s5Benchmark/google-services.json
 
       - name: Cutover acceptance
         run: ./gradlew :app:testCutoverAcceptance

@@ -9,7 +9,7 @@ class ReleaseAdmissionVariantTest {
     fun `compiled admission matches the fixed variant matrix`() {
         val expected = when (BuildConfig.BUILD_TYPE) {
             "debug", "benchmark" -> false
-            "ciMinified", "release" -> true
+            "ciMinified", "release", "s5Benchmark" -> true
             else -> error("Unclassified build type: ${BuildConfig.BUILD_TYPE}")
         }
 

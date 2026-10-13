@@ -116,14 +116,14 @@ class LegacyGraphRemovalContractTest {
         )
         val field = "graph" + "_buckets"
         val root = File("src")
-        val sets = listOf("main", "debug", "test", "androidTest", "benchmark")
+        val sets = listOf("main", "debug", "test", "androidTest", "benchmark", "s5Benchmark", "testS5Benchmark")
         val files = sets.flatMap { set ->
             File(root, set).walkTopDown().filter { it.isFile && (it.extension == "kt" || it.extension == "java") }.toList()
         }.associate { it.relativeTo(root).invariantSeparatorsPath to it.readText() }
         val self = "test/java/com/jay/fxi/data/local/LegacyGraphRemovalContractTest.kt"
         val decoderTest = "test/java/com/jay/fxi/data/remote/TopicFrameDecoderTest.kt"
         assertTrue("premise: the scan sees every source set holding code",
-            self in files && decoderTest in files && listOf("main/", "test/", "androidTest/", "benchmark/").all { p -> files.keys.any { it.startsWith(p) } })
+            self in files && decoderTest in files && listOf("main/", "test/", "androidTest/", "benchmark/", "s5Benchmark/", "testS5Benchmark/").all { p -> files.keys.any { it.startsWith(p) } })
         val swiftCitations = mapOf(
             "main/java/com/jay/fxi/data/remote/TopicSessionCoordinator.kt" to 3,
             "main/java/com/jay/fxi/domain/model/TopicRequestPolicy.kt" to 1

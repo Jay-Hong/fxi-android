@@ -28,11 +28,12 @@ class ControlOwnerStructureTest {
         assertTrue("app build script missing: $file", file.isFile)
         val expected = """
             tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
-                dependsOn("processDebugManifest", "processBenchmarkManifest", "processCiMinifiedManifest")
+                dependsOn("processDebugManifest", "processBenchmarkManifest", "processCiMinifiedManifest", "processS5BenchmarkManifest")
                 inputs.files(
                     layout.buildDirectory.file("intermediates/merged_manifests/debug/processDebugManifest/AndroidManifest.xml"),
                     layout.buildDirectory.file("intermediates/merged_manifests/benchmark/processBenchmarkManifest/AndroidManifest.xml"),
-                    layout.buildDirectory.file("intermediates/merged_manifests/ciMinified/processCiMinifiedManifest/AndroidManifest.xml")
+                    layout.buildDirectory.file("intermediates/merged_manifests/ciMinified/processCiMinifiedManifest/AndroidManifest.xml"),
+                    layout.buildDirectory.file("intermediates/merged_manifests/s5Benchmark/processS5BenchmarkManifest/AndroidManifest.xml")
                 ).withPropertyName("controlOwnerMergedManifests")
                     .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
             }
@@ -46,7 +47,8 @@ class ControlOwnerStructureTest {
         val sourceManifests = root.walkTopDown().filter { it.isFile && it.name == "AndroidManifest.xml" }.toList()
         assertTrue(sourceManifests.isNotEmpty())
         for (file in sourceManifests) assertFalse(file.path, Regex("android:process\\s*=").containsMatchIn(file.readText()))
-        val outputs = listOf("debug/processDebugManifest", "benchmark/processBenchmarkManifest", "ciMinified/processCiMinifiedManifest")
+        val outputs = listOf("debug/processDebugManifest", "benchmark/processBenchmarkManifest", "ciMinified/processCiMinifiedManifest",
+            "s5Benchmark/processS5BenchmarkManifest")
         for (output in outputs) {
             val file = File(root.parentFile, "build/intermediates/merged_manifests/$output/AndroidManifest.xml")
             assertTrue("merged manifest missing: $file", file.isFile)

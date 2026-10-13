@@ -853,7 +853,7 @@ class GraphCacheMigrationContractTest {
         assertFalse(Regex("""GraphCache(Migration|Cutover)|Graph(Migration|Consumer)Readiness|AppGraphCacheCutover""")
             .containsMatchIn(all.getValue("com/jay/fxi/FXiApplication.kt")))
         val others = File("src").walkTopDown()
-            .onEnter { it.parentFile?.name != "src" || it.name !in setOf("main", "test", "androidTest") }
+            .onEnter { it.parentFile?.name != "src" || it.name !in setOf("main", "test", "androidTest", "testProductionBindings", "testS5Benchmark") }
             .filter { it.isFile && it.extension == "kt" }.toList()
         assertTrue("premise: the other source sets hold Kotlin (benchmark)", others.isNotEmpty())
         assertEquals("no other source set names them", emptyList<String>(), others.filter {
