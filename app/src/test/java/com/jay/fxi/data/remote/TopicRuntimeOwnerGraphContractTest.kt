@@ -672,7 +672,9 @@ class TopicRuntimeOwnerGraphContractTest {
      * the selection store — and holds
      * nothing else to resolve; the owner takes that builder and (S4 CUT-CC5-4) the graph cache migration as a Provider of its
      * own, which constructing it does not resolve. A D24-off or no-data process never calls start(), so it builds, resolves and
-     * starts no graph and launches no migration.
+     * starts no graph and launches no migration. S5-4 slice 2: the builder also takes the graph wall clock, a value marked
+     * @GraphWallClock; binding it hands over an object and calls no now(), does no I/O and starts nothing, so taking it is not
+     * resolving a graph dependency.
      */
     @Test
     fun `CC4b-O09 constructing the owner resolves no graph provider`() {
@@ -684,9 +686,12 @@ class TopicRuntimeOwnerGraphContractTest {
             listOf("FileGraphV2DiskStore", "DeletionAdmissionStore", "InstallSeedSource", "AuthenticatedApiClient", "TopicUseAuthority",
                 "GraphSelectionStore"),
             providers)
-        assertEquals("CC4b-O09 and the two process singletons it already shares", listOf("PremiumAccessCoordinator", "AuthTokenProvider"),
+        assertEquals("CC4b-O09 and the two process singletons it already shares, then the graph clock",
+            listOf("PremiumAccessCoordinator", "AuthTokenProvider", "AppClock"),
             ctor.parameterTypes.filterNot { it == javax.inject.Provider::class.java }.map { it.simpleName })
         val source = java.io.File("src/main/java/com/jay/fxi/data/graph/ProcessGraphBuilder.kt").readText()
+        assertTrue("S5-4 slice 2 the clock is the qualified graph clock",
+            Regex("""@GraphWallClock\s+private\s+val\s+clock:\s*AppClock\b""").containsMatchIn(source))
         assertFalse("CC4b-O09 the builder resolves nothing when constructed", Regex("""\binit\s*\{|\bby\s+lazy\b""").containsMatchIn(source))
         val owner = TopicRuntimeOwner::class.java.declaredConstructors.single { c -> c.isAnnotationPresent(javax.inject.Inject::class.java) }
         assertTrue("CC4b-O09 the owner takes the builder", owner.parameterTypes.contains(com.jay.fxi.data.graph.AppProcessGraphBuilder::class.java))

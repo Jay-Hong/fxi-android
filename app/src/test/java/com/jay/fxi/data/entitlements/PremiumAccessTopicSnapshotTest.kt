@@ -3290,7 +3290,8 @@ class PremiumAccessTopicSnapshotTest {
      * once inside build(), before the assembly exists. The assembly it builds takes the CC1 use authority the providers hand
      * it — the very instance — the disk store in its cache ports, the given parent, the permit through the given slot (a read
      * fails until bound, then answers the bound supplier), the jitter from the seed slot (fails until set, then the scheduler's
-     * per-install jitter) and the given time event. Nothing of it starts.
+     * per-install jitter) and the given time event. Nothing of it starts. S5-4 slice 2: the assembly's coordinator, recorder
+     * and recovery events and every holder it makes hold the one graph clock the builder was given, the very instance.
      */
     @Test
     fun `CC4b-B01 the production builder resolves its providers in build and wires the shared pieces`() = snapshotTest {
@@ -3314,9 +3315,10 @@ class PremiumAccessTopicSnapshotTest {
         )
         fun <T> provider(name: String, value: T) = javax.inject.Provider { resolved += name; value }
         val selections = HolderSelections()
+        val graphClock = AppClock { Instant.parse("2026-10-05T03:01:00Z") }
         val builder = com.jay.fxi.data.graph.AppProcessGraphBuilder(
             provider("disk", disk), provider("deletions", deletions), provider("seeds", seeds), provider("api", api),
-            provider("uses", authority), provider("selections", selections), h.coordinator, tokens
+            provider("uses", authority), provider("selections", selections), h.coordinator, tokens, graphClock
         )
         assertTrue("CC4b-B01 constructing it resolves nothing", resolved.isEmpty())
         val permit = com.jay.fxi.data.graph.LateBound<() -> TopicGraphRecoveryPermit?>("permit")
@@ -3330,6 +3332,9 @@ class PremiumAccessTopicSnapshotTest {
         assertSame("CC4b-B01 the shared use authority, the very instance", authority, field(a.coordinator, "uses"))
         assertSame("CC4b-B01 the disk store in the cache ports", disk, (field(a.coordinator, "cachePorts") as GraphV2CachePorts).store)
         assertTrue("CC4b-B01 a child of the given parent", parent.children.toList().isNotEmpty())
+        assertSame("S5-4 slice 2 the coordinator's clock is the graph clock", graphClock, field(a.coordinator, "clock"))
+        assertSame("S5-4 slice 2 the recorder's clock is the graph clock", graphClock, field(a.recorder, "clock"))
+        assertSame("S5-4 slice 2 the recovery events' clock is the graph clock", graphClock, field(a.events, "clock"))
         @Suppress("UNCHECKED_CAST")
         val read = field(a.events, "permit") as () -> TopicGraphRecoveryPermit?
         assertThrows("CC4b-B01 the permit read fails until bound", IllegalStateException::class.java) { read() }
@@ -3373,6 +3378,7 @@ class PremiumAccessTopicSnapshotTest {
             assertSame("CC5-2-B01 the given display", display, field(holder, "display"))
             assertSame("CC5-2-B01 the given focus", focus, field(holder, "focus"))
             assertSame("CC5-2-B01 the issuer's revisions", h.coordinator.accessRevisions, field(holder, "accessRevisions"))
+            assertSame("S5-4 slice 2 the holder's clock is the graph clock", graphClock, field(holder, "clock"))
             val session = field(holder, "selectionSession") as com.jay.fxi.data.graph.GraphSeriesSelectionSession
             assertEquals("CC5-2-B01 a PREMIUM session for the tab", com.jay.fxi.data.local.GraphSelectionAudience.PREMIUM, field(session, "audience"))
             assertSame("CC5-2-B01 over the resolved selection store", selections, field(session, "store"))
@@ -3409,7 +3415,7 @@ class PremiumAccessTopicSnapshotTest {
             fun <T> maybe(name: String, value: T) = javax.inject.Provider { resolved += name; if (name == broken) throw failure; value }
             val failing = com.jay.fxi.data.graph.AppProcessGraphBuilder(
                 maybe("disk", disk), maybe("deletions", deletions), maybe("seeds", seeds), maybe("api", api),
-                maybe("uses", authority), maybe("selections", selections), h.coordinator, tokens
+                maybe("uses", authority), maybe("selections", selections), h.coordinator, tokens, graphClock
             )
             val failedParent = Job(processJob)
             val thrown = runCatching {

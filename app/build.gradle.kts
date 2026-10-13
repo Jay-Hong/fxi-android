@@ -257,6 +257,14 @@ android {
             }
         }
     }
+    // S5-4 slice 2: bindings that a fixture build type replaces with its own. The four existing build types take them, and
+    // their unit tests the matching tests, from these shared directories; a build type without a binding fails Hilt's compile.
+    sourceSets {
+        listOf("debug", "release", "ciMinified", "benchmark").forEach { type ->
+            getByName(type).java.srcDir("src/productionBindings/java")
+            getByName("test" + type.replaceFirstChar { it.uppercase() }).java.srcDir("src/testProductionBindings/java")
+        }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

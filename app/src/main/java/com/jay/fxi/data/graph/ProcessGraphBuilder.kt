@@ -14,7 +14,8 @@ import com.jay.fxi.data.remote.OwnedTopicFocus
 import com.jay.fxi.data.remote.TopicDisplayState
 import com.jay.fxi.data.remote.TopicGraphRecoveryPermit
 import com.jay.fxi.data.remote.TopicUseAuthority
-import com.jay.fxi.time.SystemAppClock
+import com.jay.fxi.di.GraphWallClock
+import com.jay.fxi.time.AppClock
 import com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder
 import javax.inject.Inject
 import javax.inject.Provider
@@ -63,6 +64,10 @@ internal fun interface ProcessGraphBuilder {
  * topic factory shares and (S4 CUT-CC5-2) the selection store — and only then constructs the assembly, whose holders capture
  * that same authority, whose own constructor cleans up after its failures. Event
  * failures go to Crashlytics; diagnostics log only their component and reason, never a key, fence or cause.
+ *
+ * S5-4 slice 2 (limited 3e): [clock] is the graph's one wall clock, a value rather than a Provider: the assembly and every
+ * holder [build] makes take this same instance. Its binding only hands over an object, so constructing the builder still calls
+ * no now(), does no I/O and starts nothing.
  */
 internal class AppProcessGraphBuilder @Inject constructor(
     private val disk: Provider<FileGraphV2DiskStore>,
@@ -72,7 +77,8 @@ internal class AppProcessGraphBuilder @Inject constructor(
     private val uses: Provider<TopicUseAuthority>,
     private val selections: Provider<GraphSelectionStore>,
     private val coordinator: PremiumAccessCoordinator,
-    private val tokens: AuthTokenProvider
+    private val tokens: AuthTokenProvider,
+    @GraphWallClock private val clock: AppClock
 ) : ProcessGraphBuilder {
 
     override fun build(
@@ -109,7 +115,7 @@ internal class AppProcessGraphBuilder @Inject constructor(
             },
             main = Dispatchers.Main,
             parent = parent,
-            clock = SystemAppClock,
+            clock = clock,
             rateLimitJitter = { tab -> FreeSnapshotSchedulePolicy.jitterFor(seed.require(), tab) },
             onEventFailure = ::reportGraphFailure,
             recoveryPermit = { permit.require()() },
@@ -131,7 +137,8 @@ internal class AppProcessGraphBuilder @Inject constructor(
                     accessRevisions = coordinator.accessRevisions,
                     scope = scope,
                     dispatcher = Dispatchers.Main,
-                    recorder = assembly.recorder
+                    recorder = assembly.recorder,
+                    clock = clock
                 )
             } catch (failure: Throwable) {
                 scope.launch(start = CoroutineStart.ATOMIC) {

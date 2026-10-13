@@ -589,7 +589,8 @@ class PremiumGraphCutoverAcceptanceTest {
             uses = Provider { uses },
             selections = Provider { selections },
             coordinator = coordinator,
-            tokens = provider
+            tokens = provider,
+            clock = com.jay.fxi.time.SystemAppClock
         )
         val builder = com.jay.fxi.data.graph.ProcessGraphBuilder { permit, seed, timeEvent, parent ->
             permitSlot = permit
