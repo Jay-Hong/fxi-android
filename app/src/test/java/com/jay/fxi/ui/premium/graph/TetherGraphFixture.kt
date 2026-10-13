@@ -15,7 +15,9 @@ import com.jay.fxi.data.graph.FileGraphV2DiskStore
 import com.jay.fxi.data.graph.GraphKey
 import com.jay.fxi.data.graph.GraphObservationSeriesKey
 import com.jay.fxi.data.graph.GraphOwnerSource
+import com.jay.fxi.data.entitlements.purge.GraphRecorderPurgeAdapter
 import com.jay.fxi.data.graph.GraphRecorder
+import com.jay.fxi.data.graph.GraphRecorderTopicSink
 import com.jay.fxi.data.graph.GraphRecorderState
 import com.jay.fxi.data.graph.GraphRecoverableState
 import com.jay.fxi.data.graph.GraphRecoveryEvents
@@ -196,7 +198,7 @@ internal class TetherFakeSelectionStore : GraphSelectionStore {
     }
 }
 
-internal class TetherSent(val key: GraphKey, val id: Int = 0, val atMs: Long = 0L) {
+internal class TetherSent(val key: GraphKey, val id: Int = 0, val atMs: Long = 0L, val ownerUid: String? = null) {
     val answer = CompletableDeferred<AuthenticatedHttpResponse<GraphV2TabResponse>>()
 }
 
@@ -228,7 +230,9 @@ internal class TetherGraphFixture(
      * S5-2b-2 C2 (opt-in): one mutable permit read by both the coordinator and the recovery events. Off keeps the coordinator
      * without a permit supplier and the events reading none, as before (an installed supplier returning null closes recovery).
      */
-    sharedPermit: Boolean = false
+    sharedPermit: Boolean = false,
+    /** S5-2b-3 (opt-in): the recorder's access collector runs on [accessRevisions], as the assembly wires it; off as before. */
+    private val recorderCollects: Boolean = false
 ) {
     val dispatcher = StandardTestDispatcher(test.testScheduler)
     val scope = CoroutineScope(SupervisorJob() + dispatcher)
@@ -247,14 +251,23 @@ internal class TetherGraphFixture(
     val elapsedMs get() = test.testScheduler.currentTime - base
     /** S5-2b-2: the virtual time of each owner capture, and a hook run before it succeeds (default none: it succeeds). */
     val captures = mutableListOf<Long>()
+    /** S5-2b-3: the uid each capture was for, index for index with [captures]. */
+    val captureOwners = mutableListOf<String>()
     var captureHook: (suspend (call: Int) -> Unit)? = null
     /** S5-2b-2: the shared gate's protected admission (default open). */
     var protectedOpen = true
+    /** S5-2b-3: every admission read; with [admissionClosesAfter] set, reads after that count see it closed (default never). */
+    var admissionReads = 0
+    var admissionClosesAfter: Int? = null
     var permitValue: TopicGraphRecoveryPermit? = null
     private val permitSupplier: (() -> TopicGraphRecoveryPermit?)? = if (sharedPermit) ({ permitValue }) else null
     /** S5-2b-2: every trigger the recovery events issued, in order. */
     val triggers = mutableListOf<GraphRecoveryTrigger>()
-    val snapshot: TopicAccessSnapshot = run {
+    /** S5-2b-3: the live identity and delivered fence every component reads (defaults as before). */
+    var identity: AuthIdentityFence? = A
+    var fence: TopicSessionFence? = FENCE_A
+    /** The published access every component reads; replacing it notifies nobody (S5-2b-3 separates that). */
+    var snapshot: TopicAccessSnapshot = run {
         val binding = EntitlementsIdentity("u1", 1L)
         val record = AccessFence("u1", "e1", "K1")
         TopicAccessSnapshot.INITIAL.copy(
@@ -269,32 +282,41 @@ internal class TetherGraphFixture(
     }
     val uses = SnapshotTopicUseAuthority { snapshot }
     val owners = object : GraphOwnerSource {
-        override fun currentIdentity(): AuthIdentityFence = A
+        override fun currentIdentity(): AuthIdentityFence? = identity
         override suspend fun capture(expected: AuthIdentityFence): AuthSnapshot {
-            if (expected != A) throw AuthIdentityChangedException()
+            if (expected != identity) throw AuthIdentityChangedException()
             captures += elapsedMs
+            captureOwners += expected.uid
             captureHook?.invoke(captures.size)
+            // A hook may hold the capture across an identity change; the real source reads the identity it returns for.
+            if (expected != identity) throw AuthIdentityChangedException()
             return AuthSnapshot(expected.uid, expected.authGeneration, "token")
         }
     }
-    val gate = GraphV2AccessGate({ A }, { FENCE_A }, { snapshot }, { protectedOpen })
+    val gate = GraphV2AccessGate({ identity }, { fence }, { snapshot }, {
+        admissionReads++
+        protectedOpen && admissionClosesAfter.let { it == null || admissionReads <= it }
+    })
     /** The disk root; empty unless a test writes a stored answer into it (S5-2b-2 D). */
     val root: File = folder.newFolder()
     val store = TetherHeldStore(FileGraphV2DiskStore({ root }, JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), dispatcher))
     val fetcher = object : GraphV2Fetching {
         override suspend fun catalog(owner: AuthSnapshot, useAdmitted: () -> Boolean) = ok(catalogDto)
         override suspend fun tab(owner: AuthSnapshot, key: GraphKey, useAdmitted: () -> Boolean): AuthenticatedHttpResponse<GraphV2TabResponse> {
-            val s = TetherSent(key, sent.size + 1, elapsedMs)
+            val s = TetherSent(key, sent.size + 1, elapsedMs, owner.uid)
             sent += s
             autoTab?.invoke(s)
             return s.answer.await()
         }
     }
     lateinit var coordinator: GraphV2RequestCoordinator
-    val recorder = GraphRecorder(scope, MutableStateFlow(0L), { snapshot }, { FENCE_A }, { coordinator.state.value.catalog }, gate, clock)
+    val recorder = GraphRecorder(
+        scope, if (recorderCollects) accessRevisions else MutableStateFlow(0L), { snapshot }, { fence },
+        { coordinator.state.value.catalog }, gate, clock
+    )
     init {
         coordinator = GraphV2RequestCoordinator(
-            fetcher = fetcher, owners = owners, currentAccessFence = { FENCE_A }, uses = uses, protectedAdmission = { true },
+            fetcher = fetcher, owners = owners, currentAccessFence = { fence }, uses = uses, protectedAdmission = { true },
             accessSnapshot = { snapshot }, scope = scope, clock = clock, rateLimitJitter = { Duration.ZERO }, onEventFailure = {},
             cachePorts = GraphV2CachePorts(store = store, gate = gate, onSeedDiagnostic = {}), recorder = recorder,
             recoveryPermit = permitSupplier
@@ -306,7 +328,7 @@ internal class TetherGraphFixture(
     private fun newHolder(tab: String) = GraphV2ScreenStateHolder(
         tab = tab, coordinator = coordinator,
         selectionSession = GraphSeriesSelectionSession(selections, GraphSelectionAudience.PREMIUM, tab, scope, dispatcher),
-        liveIdentity = { A }, display = display, focus = focus, currentAccessFence = { FENCE_A }, uses = uses, gate = gate,
+        liveIdentity = { identity }, display = display, focus = focus, currentAccessFence = { fence }, uses = uses, gate = gate,
         accessRevisions = accessRevisions, scope = scope, dispatcher = dispatcher, live = live, clock = clock, recorder = recorder
     )
     /** The current holder per tab; [replaceTether] swaps the tether one (S5-2b-2 H). Every helper reads it at call time. */
@@ -334,6 +356,9 @@ internal class TetherGraphFixture(
         { holders.values.forEach { it.onTimeEvent() } }, permitSupplier ?: { null }, coordinator::onContextChanged
     )
 
+    /** S5-2b-3: another started holder of [tab] over the same coordinator, recorder and suppliers; not in [holders]. */
+    fun extraHolder(tab: String): GraphV2ScreenStateHolder = newHolder(tab).also { it.start(); run() }
+
     /** Publications of each tether holder made by [replaceTether], apart from [published] of the first holders. */
     val publishedBy = mutableMapOf<GraphV2ScreenStateHolder, MutableList<GraphV2ScreenState>>()
 
@@ -360,6 +385,7 @@ internal class TetherGraphFixture(
     }
 
     fun start() {
+        if (recorderCollects) recorder.start()
         coordinator.start()
         holders.values.forEach { it.start() }
         run()
@@ -395,11 +421,11 @@ internal class TetherGraphFixture(
     /** Fails the pending request of [key] with [code] (S5-2b T21). */
     fun fail(key: GraphKey, code: Int = 503) = answer(key, TetherGraphData.status(code))
 
-    val lifetime get() = checkNotNull(uses.acquire(FENCE_A))
-    private fun observe(topic: String, candidate: TopicGraphCandidate) {
-        recorder.observe(
-            TopicGraphInput.Observations(1L, topic, TopicGraphPath.WS, TopicUseAttribution(Any(), FENCE_A, 1L, lifetime), 1L, listOf(candidate))
-        )
+    val lifetime get() = checkNotNull(uses.acquire(checkNotNull(fence)))
+    /** The current owner and use, kept by a test to replay an old frame after access ends (S5-2b-3). */
+    fun attribution() = TopicUseAttribution(Any(), checkNotNull(fence), 1L, lifetime)
+    private fun observe(topic: String, candidate: TopicGraphCandidate, attribution: TopicUseAttribution = attribution()) {
+        recorder.observe(TopicGraphInput.Observations(1L, topic, TopicGraphPath.WS, attribution, 1L, listOf(candidate)))
         run()
     }
     /** A USD row of [source] by `fx:usd-krw`. */
@@ -408,6 +434,9 @@ internal class TetherGraphFixture(
     fun tetherRow(source: String, rate: Double, at: Instant) = observe("usdt:krw", TopicGraphCandidate.Quote(source, "usd-krw", rate, at, null))
     fun exchange(source: String, rate: Double, at: Instant, changed: Instant? = at) =
         observe("usdt:krw", TopicGraphCandidate.Quote(source, "usdt-krw", rate, at, changed))
+    /** S5-2b-3: an exchange frame under a kept [attribution] (an old frame arriving after access ended). */
+    fun exchangeAs(attribution: TopicUseAttribution, source: String, rate: Double, at: Instant) =
+        observe("usdt:krw", TopicGraphCandidate.Quote(source, "usdt-krw", rate, at, at), attribution)
     fun dxy(rate: Double, at: Instant) = observe("dxy:spot", TopicGraphCandidate.DollarIndex(rate, at, "investing"))
 
     /**
@@ -416,7 +445,7 @@ internal class TetherGraphFixture(
      */
     fun lose(source: String, at: Instant, rate: Double = 1339.0) {
         val input = TopicGraphInput.Observations(
-            1L, "usdt:krw", TopicGraphPath.WS, TopicUseAttribution(Any(), FENCE_A, 1L, lifetime), 1L,
+            1L, "usdt:krw", TopicGraphPath.WS, attribution(), 1L,
             listOf(TopicGraphCandidate.Quote(source, "usdt-krw", rate, at, at))
         )
         protectedOpen = false
@@ -432,10 +461,15 @@ internal class TetherGraphFixture(
     fun resumed(topic: String = "usdt:krw") {
         recorder.observe(TopicGraphInput.Continuity(
             9L, TopicGraphEventKind.DELIVERY_RESUMED, null, setOf(topic), setOf(TopicGraphPath.WS),
-            TopicGraphAuthority(Any(), FENCE_A, 1L, lifetime), 1L, clock.now().toEpochMilliseconds()
+            TopicGraphAuthority(Any(), checkNotNull(fence), 1L, lifetime), 1L, clock.now().toEpochMilliseconds()
         ))
         run()
     }
+
+    /** S5-2b-3 (built on first use only): the same assembly's topic sink, recorder purge adapter and runtime port. */
+    val sink by lazy { GraphRecorderTopicSink(scope, recorder) }
+    val purgeAdapter by lazy { GraphRecorderPurgeAdapter(recorder, sink, coordinator, dispatcher) }
+    val port by lazy { GraphRuntimeRetirementPort(coordinator, { holders.values }, dispatcher) }
 
     fun close() = scope.cancel()
 }
