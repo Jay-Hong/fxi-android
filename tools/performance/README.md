@@ -188,3 +188,14 @@ and absence of profileable or benchmark admission in the public-like `ciMinified
 It also consumes `dependencyInsight` output and requires the selected ProfileInstaller
 version to be exactly 1.4.1; component presence alone is not sufficient because older
 transitive versions also merge the same components.
+
+`verify_s5_benchmark_artifacts.py` (S5-4 4c) does the same for the S5 fixture build type. It
+requires an ON, non-debuggable, profileable, debug-signed `s5Benchmark` target with the three
+Firebase flags off, Firebase identifiers equal to the checked-in CI fixture (compared, never
+printed), a network config that allows cleartext to `127.0.0.1` only (followed from the
+manifest reference, because R8 renames the resource file), the five approved fixture assets by
+SHA-256, ProfileInstaller 1.4.1 and a self-instrumenting test APK. For the public-like
+`ciMinified` APK it requires the base network config with only the KB image exception and none
+of the fixture: no fixture source root or file (listed from the `sourceSets` report, symlinks
+followed), no MockWebServer dependency, no fixture asset, and no fixture class in the R8
+mapping or the DEX. `ciMinified` is public-like evidence only; the public AAB is proven in S11.

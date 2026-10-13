@@ -20,7 +20,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # S5-4 4c adds the s5Benchmark unit tests, assemble and artifact checks (about 8 minutes) to a job that took 21-32 minutes.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -175,6 +176,7 @@ jobs:
           ./gradlew testDebugUnitTest
           ./gradlew testCiMinifiedUnitTest
           ./gradlew testBenchmarkUnitTest
+          ./gradlew testS5BenchmarkUnitTest
 
       - name: Lint
         run: ./gradlew lintDebug
@@ -192,7 +194,9 @@ jobs:
       # not execute device tests; the local S0-f smoke enters only the benchmark no-data
       # Activity. MainActivity/Root functional journeys still wait for S0-g/S5 admission.
       - name: Macrobenchmark target and test APK compile (no device execution)
-        run: ./gradlew :app:assembleBenchmark :macrobenchmark:assembleBenchmark
+        run: |
+          ./gradlew :app:assembleBenchmark :macrobenchmark:assembleBenchmark
+          ./gradlew :app:assembleS5Benchmark :macrobenchmark:assembleS5Benchmark
 
       # R8 lane 을 S11 로 미루지 않는 이유: kotlinx-serialization + R8 은
       # keep 규칙 누락으로 실제로 깨지는 조합이다(계획 §7 S0 각주).
@@ -222,7 +226,44 @@ jobs:
             --aapt2 "$AAPT2" \
             --artifact debug=off=app/build/outputs/apk/debug/app-debug.apk \
             --artifact ciMinified=on=app/build/outputs/apk/ciMinified/app-ciMinified.apk \
-            --artifact benchmark=off=app/build/outputs/apk/benchmark/app-benchmark.apk
+            --artifact benchmark=off=app/build/outputs/apk/benchmark/app-benchmark.apk \
+            --artifact s5Benchmark=on=app/build/outputs/apk/s5Benchmark/app-s5Benchmark.apk
+
+      # S5-4 4c: the S5 fixture APKs are checked from what is packaged, and the public-like ciMinified APK must carry none of the
+      # fixture (source inputs, dependency, assets, network exception, mapping names, DEX classes). Firebase values are compared
+      # with the CI fixture and never printed. ciMinified is public-like evidence; the public AAB is proven in S11.
+      - name: Verify S5 benchmark artifacts
+        run: |
+          mkdir -p build/reports/s5
+          ./gradlew :app:dependencyInsight \
+            --configuration s5BenchmarkRuntimeClasspath \
+            --dependency androidx.profileinstaller:profileinstaller \
+            --console=plain > build/reports/s5/profileinstaller.txt
+          ./gradlew :app:dependencyInsight \
+            --configuration ciMinifiedRuntimeClasspath \
+            --dependency com.squareup.okhttp3:mockwebserver \
+            --console=plain > build/reports/s5/ci-minified-mockwebserver.txt
+          ./gradlew -q :app:sourceSets --console=plain > build/reports/s5/sourcesets.txt
+          python3 tools/performance/verify_s5_benchmark_artifacts.py collect-source-files \
+            --repo-root . \
+            --ci-minified-source-report build/reports/s5/sourcesets.txt \
+            --out build/reports/s5/ci-minified-source-files.txt
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d -print | sort -V | tail -1)"
+          python3 tools/performance/verify_s5_benchmark_artifacts.py verify \
+            --aapt2 "$BUILD_TOOLS/aapt2" \
+            --apksigner "$BUILD_TOOLS/apksigner" \
+            --dexdump "$BUILD_TOOLS/dexdump" \
+            --repo-root . \
+            --s5-target-apk app/build/outputs/apk/s5Benchmark/app-s5Benchmark.apk \
+            --s5-test-apk macrobenchmark/build/outputs/apk/s5Benchmark/macrobenchmark-s5Benchmark.apk \
+            --ci-minified-apk app/build/outputs/apk/ciMinified/app-ciMinified.apk \
+            --ci-minified-mapping app/build/outputs/mapping/ciMinified/mapping.txt \
+            --firebase-fixture ci/google-services.ci-fixture.json \
+            --s5-dependency-report build/reports/s5/profileinstaller.txt \
+            --ci-minified-dependency-report build/reports/s5/ci-minified-mockwebserver.txt \
+            --ci-minified-source-report build/reports/s5/sourcesets.txt \
+            --ci-minified-source-files build/reports/s5/ci-minified-source-files.txt \
+            --benchmark-source macrobenchmark/src/main/kotlin/com/jay/fxi/macrobenchmark/TetherGraphBenchmark.kt
 
       - name: Upload reports on failure
         if: failure()
