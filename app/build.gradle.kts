@@ -283,6 +283,13 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
 }
 
+// S5-4 A: the benchmark's tether fixture has a single source under src/benchmark/assets, which the unit tests read by path.
+// Invalidate cached test results when it changes; it is never copied into main or debug assets.
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    inputs.dir(layout.projectDirectory.dir("src/benchmark/assets/s5_4")).withPropertyName("s54BenchmarkFixture")
+        .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+}
+
 // S4 CUT-C01·C02: the production-composition cutover acceptance runs on the real clock for many minutes, so no ordinary
 // unit-test task runs it; its own task runs it once per candidate in a required CI job, which checks the exact case list.
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {

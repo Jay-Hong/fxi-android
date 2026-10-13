@@ -1,0 +1,288 @@
+{
+  "cache_ttl_seconds": 3600,
+  "supported_periods": [
+    "3m",
+    "1y",
+    "1w"
+  ],
+  "tabs": [
+    {
+      "axis_groups": {
+        "index": {
+          "decimals": 3,
+          "side": "right",
+          "unit": "INDEX"
+        },
+        "krw": {
+          "decimals": 2,
+          "side": "left",
+          "unit": "KRW"
+        }
+      },
+      "id": "usd",
+      "label": "달러",
+      "periods": {
+        "1d": {
+          "all_series": [
+            "investing.usd",
+            "krx.usd-krw-futures",
+            "kb.usd",
+            "hana.usd",
+            "shinhan.usd",
+            "woori.usd",
+            "ibk.usd",
+            "nh.usd",
+            "sc.usd",
+            "bs.usd",
+            "dxy"
+          ],
+          "default_visible_series": [
+            "investing.usd",
+            "hana.usd"
+          ]
+        },
+        "1w": {
+          "all_series": [
+            "investing.usd",
+            "krx.usd-krw-futures",
+            "hana.usd",
+            "dxy"
+          ],
+          "default_visible_series": [
+            "investing.usd",
+            "hana.usd",
+            "dxy"
+          ]
+        },
+        "1y": {
+          "all_series": [
+            "investing.usd",
+            "krx.usd-krw-futures",
+            "hana.usd",
+            "dxy"
+          ],
+          "default_visible_series": [
+            "investing.usd",
+            "hana.usd",
+            "dxy"
+          ]
+        },
+        "3m": {
+          "all_series": [
+            "investing.usd",
+            "krx.usd-krw-futures",
+            "hana.usd",
+            "dxy"
+          ],
+          "default_visible_series": [
+            "investing.usd",
+            "hana.usd",
+            "dxy"
+          ]
+        }
+      }
+    },
+    {
+      "axis_groups": {
+        "krw": {
+          "decimals": 2,
+          "side": "left",
+          "unit": "KRW"
+        }
+      },
+      "id": "jpy",
+      "label": "엔",
+      "periods": {
+        "1d": {
+          "all_series": [
+            "investing.jpy",
+            "kb.jpy",
+            "hana.jpy",
+            "shinhan.jpy",
+            "woori.jpy",
+            "ibk.jpy",
+            "nh.jpy",
+            "sc.jpy",
+            "bs.jpy"
+          ],
+          "default_visible_series": [
+            "investing.jpy",
+            "hana.jpy"
+          ]
+        },
+        "1w": {
+          "all_series": [
+            "investing.jpy",
+            "hana.jpy"
+          ],
+          "default_visible_series": [
+            "investing.jpy",
+            "hana.jpy"
+          ]
+        },
+        "1y": {
+          "all_series": [
+            "investing.jpy",
+            "hana.jpy"
+          ],
+          "default_visible_series": [
+            "investing.jpy",
+            "hana.jpy"
+          ]
+        },
+        "3m": {
+          "all_series": [
+            "investing.jpy",
+            "hana.jpy"
+          ],
+          "default_visible_series": [
+            "investing.jpy",
+            "hana.jpy"
+          ]
+        }
+      }
+    },
+    {
+      "axis_groups": {
+        "krw": {
+          "decimals": 2,
+          "side": "left",
+          "unit": "KRW"
+        }
+      },
+      "id": "eur",
+      "label": "유로",
+      "periods": {
+        "1d": {
+          "all_series": [
+            "investing.eur",
+            "kb.eur",
+            "hana.eur",
+            "shinhan.eur",
+            "woori.eur",
+            "ibk.eur",
+            "nh.eur",
+            "sc.eur",
+            "bs.eur"
+          ],
+          "default_visible_series": [
+            "investing.eur",
+            "hana.eur"
+          ]
+        },
+        "1w": {
+          "all_series": [
+            "investing.eur",
+            "hana.eur"
+          ],
+          "default_visible_series": [
+            "investing.eur",
+            "hana.eur"
+          ]
+        },
+        "1y": {
+          "all_series": [
+            "investing.eur",
+            "hana.eur"
+          ],
+          "default_visible_series": [
+            "investing.eur",
+            "hana.eur"
+          ]
+        },
+        "3m": {
+          "all_series": [
+            "investing.eur",
+            "hana.eur"
+          ],
+          "default_visible_series": [
+            "investing.eur",
+            "hana.eur"
+          ]
+        }
+      }
+    },
+    {
+      "axis_groups": {
+        "index": {
+          "decimals": 3,
+          "side": "right",
+          "unit": "INDEX"
+        },
+        "krw": {
+          "decimals": 2,
+          "side": "left",
+          "unit": "KRW"
+        }
+      },
+      "id": "tether",
+      "label": "테더",
+      "periods": {
+        "1d": {
+          "all_series": [
+            "upbit.usdt-krw",
+            "bithumb.usdt-krw",
+            "coinone.usdt-krw",
+            "korbit.usdt-krw",
+            "gopax.usdt-krw",
+            "krx.usd-krw-futures",
+            "investing.usd",
+            "kb.usd",
+            "hana.usd",
+            "dxy",
+            "dxy_futures"
+          ],
+          "default_visible_series": [
+            "upbit.usdt-krw",
+            "bithumb.usdt-krw",
+            "hana.usd",
+            "krx.usd-krw-futures"
+          ]
+        },
+        "1w": {
+          "all_series": [
+            "bithumb.usdt-krw",
+            "krx.usd-krw-futures",
+            "investing.usd",
+            "hana.usd",
+            "dxy"
+          ],
+          "default_visible_series": [
+            "bithumb.usdt-krw",
+            "hana.usd",
+            "krx.usd-krw-futures"
+          ]
+        },
+        "1y": {
+          "all_series": [
+            "bithumb.usdt-krw",
+            "krx.usd-krw-futures",
+            "investing.usd",
+            "hana.usd",
+            "dxy"
+          ],
+          "default_visible_series": [
+            "bithumb.usdt-krw",
+            "hana.usd",
+            "krx.usd-krw-futures"
+          ]
+        },
+        "3m": {
+          "all_series": [
+            "bithumb.usdt-krw",
+            "krx.usd-krw-futures",
+            "investing.usd",
+            "hana.usd",
+            "dxy"
+          ],
+          "default_visible_series": [
+            "bithumb.usdt-krw",
+            "hana.usd",
+            "krx.usd-krw-futures"
+          ]
+        }
+      }
+    }
+  ],
+  "version": "2026-07-26"
+}

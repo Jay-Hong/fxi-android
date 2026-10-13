@@ -1,0 +1,33 @@
+{
+  "krx_visible": true,
+  "now": "2026-10-05T12:01:00+09:00",
+  "selection": {
+    "initialized_series": [
+      "upbit.usdt-krw",
+      "bithumb.usdt-krw",
+      "coinone.usdt-krw",
+      "korbit.usdt-krw",
+      "gopax.usdt-krw",
+      "krx.usd-krw-futures",
+      "investing.usd",
+      "kb.usd",
+      "hana.usd",
+      "dxy",
+      "dxy_futures"
+    ],
+    "visible_series_ids": [
+      "upbit.usdt-krw",
+      "bithumb.usdt-krw",
+      "coinone.usdt-krw",
+      "korbit.usdt-krw",
+      "gopax.usdt-krw",
+      "krx.usd-krw-futures",
+      "investing.usd",
+      "kb.usd",
+      "hana.usd",
+      "dxy",
+      "dxy_futures"
+    ]
+  },
+  "tab": "tether"
+}
