@@ -37,12 +37,28 @@ ordinals are consecutive, attempt IDs are globally unique, exactly three `valid`
 run IDs must equal the three evaluated runs, and the third valid attempt ends the ledger.
 Invalid attempts are limited to machine-checked `environment-invalid` run evidence or a
 `result-malformed` AndroidX document that the strict parser actually rejects. A structurally
-valid threshold miss cannot be relabelled invalid. A `behavior-failed` attempt carries a
-well-formed behavior record of that attempt that misses an expectation; it fails the journey in
-both S5 and S11 whatever the metrics, and later valid runs cannot win it back. Until the functional
+valid threshold miss cannot be relabelled invalid. A journey that does not behave as agreed is
+not a manifest attempt: no manifest accepts a `behavior-failed` outcome. Until the functional
 S5 runner writes the
 ledger append-only, this makes declared retries bounded and auditable; it does not prove that
 an operator disclosed an attempt that was never recorded.
+
+A behavior failure is terminal. The journey stops at once and the gate fails without other
+journeys, a manifest or a golden. The failing attempt's record keeps the eight planned slots: the
+slots before the failure completed and met every expectation, the failed slot holds what was
+observed (null where nothing was) with the stage, kind and reason of the failure, and the slots
+after it are `not-run`. A mismatch must show in the declared stage's own observations; an
+operation error names the operation; an action failure is recorded as `action: failed`. The
+terminal report binds that record to the attempt's preflight and postflight:
+
+```bash
+python3 tools/performance/benchmark_gate.py validate-failure failure-report.json \
+  --artifact-root evidence/
+```
+
+A valid report prints `"verdict": "fail"` and exits 1; a defective one exits 2; there is no
+passing outcome. The report does not carry earlier attempts, so it cannot prove that none was
+hidden or that nothing ran after the failure; that is the runner's append-only journal.
 For S11, `--golden` and `--golden-artifact-root` are mandatory; B99 cannot be supplied as
 a free CLI number and is read only from a validated, explicitly approved S5 manifest.
 

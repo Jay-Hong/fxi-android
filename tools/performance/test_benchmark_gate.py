@@ -22,6 +22,8 @@ from benchmark_gate import (
     percentile,
     s11_p99_limit,
     sha256_file,
+    check_failure_record,
+    validate_failure_report,
     validate_manifest,
     validate_s11_against_golden,
 )
@@ -116,6 +118,102 @@ def behavior_doc(journey_id, run_id):
             item["during"] = dict(during)
         iterations.append(item)
     return {"schemaVersion": 1, "runId": run_id, "journey": journey_id, "iterations": iterations}
+
+
+DEVICE_SNAPSHOT = {
+    "model": "SM-F711N",
+    "fingerprint": EXPECTED_MEASUREMENT_CONTRACT["fingerprint"],
+    "api": 35,
+    "posture": "OPENED",
+    "physicalSize": "1080x2640",
+    "overrideSize": None,
+    "orientation": 0,
+    "supports120Hz": True,
+    "lowPower": False,
+    "batteryLevel": 73,
+    "powered": {
+        "ac powered": False,
+        "usb powered": False,
+        "wireless powered": False,
+        "dock powered": False,
+    },
+    "thermalStatus": 0,
+    "settings": {
+        "system/peak_refresh_rate": "120.0",
+        "system/min_refresh_rate": "120.0",
+        "global/window_animation_scale": "1.0",
+        "global/transition_animation_scale": "1.0",
+        "global/animator_duration_scale": "1.0",
+    },
+    "serialRecorded": False,
+}
+
+
+def failure_doc(journey_id, run_id, *, slot, stage, kind, reason="observed failure", failed=None):
+    """S5-4 slice 1a: a terminal failure record. The slots before [slot] completed as agreed, [slot] failed with the
+    observations in [failed] (everything else null) and the slots after it never ran."""
+    document = behavior_doc(journey_id, run_id)
+    for position, iteration in enumerate(document["iterations"]):
+        if position < slot:
+            iteration["status"] = "completed"
+            continue
+        iteration["status"] = "failed" if position == slot else "not-run"
+        for key in list(iteration):
+            if key not in ("phase", "index", "status"):
+                iteration[key] = None
+    document["iterations"][slot].update(failed or {})
+    document["status"] = "failed"
+    document["failure"] = {"slot": slot, "stage": stage, "kind": kind, "reason": reason}
+    return document
+
+
+def _state(**values):
+    """A partial state observation: the keys not given were not observed."""
+    return {key: values.get(key) for key in ("tab", "period", "ready", "seriesShown", "scroll")}
+
+
+_TAB_ENTRY_START = {"tab": "USD", "period": "1d", "ready": True, "seriesShown": 4, "scroll": "na"}
+_ONE_WEEK = {"tab": "TETHER", "period": "1w", "ready": True, "seriesShown": 5, "scroll": "na"}
+_ONE_DAY_TOP = {"tab": "TETHER", "period": "1d", "ready": True, "seriesShown": 11, "scroll": "top"}
+_CHART = "graph_v2:inline:chart"
+# Failures the harness can report, one per stage and slot position (journey, description, failure_doc arguments).
+VALID_FAILURES = [
+    ("tab-entry", "first warmup: chart missing", dict(
+        slot=0, stage="lookup", kind="expectation-mismatch",
+        failed={"lookups": {"premium_tab_TETHER": 1, _CHART: 0}, "before": _TAB_ENTRY_START, "action": "completed"})),
+    ("tab-entry", "first warmup: tab missing, chart not looked up", dict(
+        slot=0, stage="lookup", kind="expectation-mismatch",
+        failed={"lookups": {"premium_tab_TETHER": 0, _CHART: None}, "before": _TAB_ENTRY_START})),
+    ("tab-entry", "first warmup: ten series", dict(
+        slot=0, stage="after", kind="expectation-mismatch",
+        failed={"lookups": {"premium_tab_TETHER": 1, _CHART: 1}, "before": _TAB_ENTRY_START, "action": "completed",
+                "after": {"tab": "TETHER", "period": "1d", "ready": True, "seriesShown": 10, "scroll": "na"}})),
+    ("tab-entry", "setup threw", dict(
+        slot=3, stage="setup", kind="operation-error", reason="enterPremiumUsd: premium USD tab not found in 10 s")),
+    ("tab-entry", "setup saw the wrong start", dict(slot=0, stage="setup", kind="expectation-mismatch")),
+    ("tab-entry", "measured start already on tether", dict(
+        slot=5, stage="before", kind="expectation-mismatch", failed={"before": _state(tab="TETHER")})),
+    ("tab-entry", "end state could not be read", dict(
+        slot=5, stage="after", kind="operation-error", reason="chart description: StaleObjectException",
+        failed={"lookups": {"premium_tab_TETHER": 1, _CHART: None}, "before": _TAB_ENTRY_START, "action": "completed"})),
+    ("period-switch", "last slot: the click threw", dict(
+        slot=7, stage="action", kind="operation-error", reason="click period_tab:1d: StaleObjectException",
+        failed={"lookups": {"period_tab:1d": 1, _CHART: None}, "before": _ONE_WEEK, "action": "failed"})),
+    ("period-switch", "ended on one week", dict(
+        slot=4, stage="after", kind="expectation-mismatch",
+        failed={"lookups": {"period_tab:1d": 1, _CHART: 1}, "before": _ONE_WEEK, "action": "completed",
+                "after": _state(tab="TETHER", period="1w")})),
+    ("scroll", "the page did not move", dict(
+        slot=6, stage="during", kind="expectation-mismatch",
+        failed={"lookups": {"premium_page_scroll": 1, _CHART: None}, "before": _ONE_DAY_TOP, "action": "completed",
+                "during": {"scroll": "top"}})),
+    ("scroll", "chart lookup threw", dict(
+        slot=2, stage="lookup", kind="operation-error", reason="findObjects graph_v2:inline:chart: timeout")),
+    ("scroll", "zero series is an observation", dict(
+        slot=1, stage="after", kind="expectation-mismatch",
+        failed={"lookups": {"premium_page_scroll": 1, _CHART: 1}, "before": _ONE_DAY_TOP, "action": "completed",
+                "during": {"scroll": "moved"}, "after": _state(seriesShown=0)})),
+]
 
 
 def write_run_set(root):
@@ -264,33 +362,7 @@ class EvidenceManifestTest(unittest.TestCase):
                 else key.encode("utf-8")
             )
             artifacts[key] = {"path": path.name, "sha256": sha256_file(path)}
-        preflight_snapshot = {
-            "model": "SM-F711N",
-            "fingerprint": EXPECTED_MEASUREMENT_CONTRACT["fingerprint"],
-            "api": 35,
-            "posture": "OPENED",
-            "physicalSize": "1080x2640",
-            "overrideSize": None,
-            "orientation": 0,
-            "supports120Hz": True,
-            "lowPower": False,
-            "batteryLevel": 73,
-            "powered": {
-                "ac powered": False,
-                "usb powered": False,
-                "wireless powered": False,
-                "dock powered": False,
-            },
-            "thermalStatus": 0,
-            "settings": {
-                "system/peak_refresh_rate": "120.0",
-                "system/min_refresh_rate": "120.0",
-                "global/window_animation_scale": "1.0",
-                "global/transition_animation_scale": "1.0",
-                "global/animator_duration_scale": "1.0",
-            },
-            "serialRecorded": False,
-        }
+        preflight_snapshot = copy.deepcopy(DEVICE_SNAPSHOT)
         journeys = []
         for journey_id in ("tab-entry", "period-switch", "scroll"):
             benchmark_name = {
@@ -531,34 +603,6 @@ class EvidenceManifestTest(unittest.TestCase):
         run["behavior"] = self._write_behavior(name, document)
         return broken
 
-    def _with_behavior_failure(self, journey_id, mutate, name, *, journey_verdict, manifest_verdict, extra=None):
-        """The manifest whose [journey_id] starts with a behavior-failed attempt (record changed by [mutate])."""
-        manifest = copy.deepcopy(self.manifest)
-        journey = manifest["journeys"][self.JOURNEY_INDEX[journey_id]]
-        attempt_id = f"{journey_id}-attempt-failed"
-        document = behavior_doc(journey_id, attempt_id)
-        mutate(document)
-        failed = {
-            "attemptId": attempt_id,
-            "ordinal": 1,
-            "outcome": "behavior-failed",
-            "evidence": self._write_behavior(name, document),
-            **(extra or {}),
-        }
-        journey["attempts"] = [failed] + [
-            {**attempt, "ordinal": attempt["ordinal"] + 1} for attempt in journey["attempts"]
-        ]
-        journey["verdict"] = journey_verdict
-        manifest["verdict"] = manifest_verdict
-        return manifest
-
-    def _validate_by_command(self, manifest, name):
-        path = self.root / name
-        path.write_text(json.dumps(manifest), encoding="utf-8")
-        with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
-            code = benchmark_gate.main(["validate-manifest", str(path), "--artifact-root", str(self.root)])
-        return code, output.getvalue()
-
     def test_behavior_record_is_required_and_independent(self):
         missing = copy.deepcopy(self.manifest)
         del missing["journeys"][0]["runs"][0]["behavior"]
@@ -663,100 +707,308 @@ class EvidenceManifestTest(unittest.TestCase):
             with self.subTest(description), self.assertRaisesRegex(InvalidEvidence, "agreed behavior"):
                 validate_manifest(broken, self.root)
 
-    def test_behavior_failed_attempt_fails_the_s5_journey(self):
-        def no_chart(document):
-            document["iterations"][5]["lookups"]["graph_v2:inline:chart"] = 0
+    def test_manifest_rejects_a_behavior_failed_attempt(self):
+        """S5-4 slice 1a: a behavior failure is terminal and has its own report, so no S5 or S11 manifest carries it."""
+        for gate in ("S5", "S11"):
+            manifest = copy.deepcopy(self.manifest)
+            manifest["gate"] = gate
+            journey = manifest["journeys"][0]
+            attempt_id = "tab-entry-attempt-failed"
+            document = failure_doc("tab-entry", attempt_id, slot=5, stage="lookup", kind="expectation-mismatch",
+                                   failed={"lookups": {"premium_tab_TETHER": 0, _CHART: None}})
+            journey["attempts"] = [
+                {"attemptId": attempt_id, "ordinal": 1, "outcome": "behavior-failed",
+                 "evidence": self._write_behavior(f"failed-{gate}.json", document)}
+            ] + [{**attempt, "ordinal": attempt["ordinal"] + 1} for attempt in journey["attempts"]]
+            journey["verdict"] = "fail"
+            manifest["verdict"] = "fail"
+            with self.subTest(gate=gate), self.assertRaisesRegex(InvalidEvidence, "terminal"):
+                validate_manifest(manifest, self.root)
 
-        failed = self._with_behavior_failure(
-            "tab-entry", no_chart, "failed-s5.json", journey_verdict="fail", manifest_verdict="fail"
-        )
-        validate_manifest(failed, self.root)
-        code, output = self._validate_by_command(failed, "failed-s5-manifest.json")
-        self.assertEqual(1, code)
-        self.assertEqual("fail", json.loads(output)["verdict"])
 
-        for journey_verdict, manifest_verdict in (("pass", "pass"), ("fail", "pass")):
-            claimed = self._with_behavior_failure(
-                "tab-entry",
-                no_chart,
-                f"failed-s5-{journey_verdict}-{manifest_verdict}.json",
-                journey_verdict=journey_verdict,
-                manifest_verdict=manifest_verdict,
-            )
-            with self.subTest(journey=journey_verdict, manifest=manifest_verdict):
-                with self.assertRaisesRegex(InvalidEvidence, "verdict"):
-                    validate_manifest(claimed, self.root)
-                code, _ = self._validate_by_command(claimed, f"claimed-{journey_verdict}-{manifest_verdict}.json")
-                self.assertEqual(2, code)
+class FailureRecordTest(unittest.TestCase):
+    """S5-4 slice 1a: the record a journey that stops at its first behavior failure leaves."""
 
-    def test_behavior_failed_evidence_must_be_a_failing_record_of_that_attempt(self):
-        def no_tab(document):
-            document["iterations"][2]["lookups"]["premium_tab_TETHER"] = 0
+    def test_each_reportable_failure_is_a_valid_record(self):
+        for journey_id, description, arguments in VALID_FAILURES:
+            run_id = f"{journey_id}-attempt-1"
+            with self.subTest(description):
+                check_failure_record(
+                    failure_doc(journey_id, run_id, **arguments), run_id=run_id, journey_id=journey_id, label="behavior"
+                )
+
+    def test_inconsistent_or_malformed_failure_records_are_invalid(self):
+        run_id = "tab-entry-attempt-1"
+
+        def base():
+            # Slot 5 failed on the chart lookup.
+            return failure_doc("tab-entry", run_id, slot=5, stage="lookup", kind="expectation-mismatch",
+                               failed={"lookups": {"premium_tab_TETHER": 1, _CHART: 0},
+                                       "before": dict(_TAB_ENTRY_START), "action": "completed"})
+
+        def at(position, *keys_and_value):
+            *keys, last, value = keys_and_value
+
+            def mutate(document):
+                target = document["iterations"][position]
+                for key in keys:
+                    target = target[key]
+                target[last] = value
+
+            return mutate
+
+        def failure(key, value):
+            return lambda document: document["failure"].__setitem__(key, value)
+
+        def both(*mutations):
+            return lambda document: [mutate(document) for mutate in mutations]
 
         cases = [
-            ("passing record", lambda d: None, None),
-            ("another run", lambda d: (no_tab(d), d.__setitem__("runId", "tab-entry-attempt-other")), None),
-            ("another journey", lambda d: (no_tab(d), d.__setitem__("journey", "scroll")), None),
-            ("malformed record", lambda d: (no_tab(d), d["iterations"].pop()), None),
-            ("schemaVersion float", lambda d: (no_tab(d), d.__setitem__("schemaVersion", 1.0)), None),
-            ("extra attempt key", no_tab, {"reason": "environment-invalid"}),
+            ("slot before not run", at(2, "status", "not-run")),
+            ("slot before failed", at(1, "status", "failed")),
+            ("slot before missed a lookup", at(2, "lookups", _CHART, 2)),
+            ("slot before did nothing", at(4, "action", "none")),
+            ("slot before partly unobserved", at(1, "after", "ready", None)),
+            ("slot after observed an action", at(6, "action", "completed")),
+            ("slot after observed lookups", at(7, "lookups", {"premium_tab_TETHER": 1, _CHART: 1})),
+            ("slot after completed", at(6, "status", "completed")),
+            ("failed slot completed", at(5, "status", "completed")),
+            ("lookup failure meets its expectation", at(5, "lookups", _CHART, 1)),
+            ("lookup failure not observed", at(5, "lookups", None)),
+            ("unobserved lookup is not a mismatch", at(5, "lookups", {"premium_tab_TETHER": 1, _CHART: None})),
+            ("unobserved start is not a mismatch",
+             both(failure("stage", "before"), at(5, "lookups", _CHART, 1), at(5, "before", None))),
+            ("start met its expectation",
+             both(failure("stage", "before"), at(5, "lookups", _CHART, 1), at(5, "before", _state(tab="USD")))),
+            ("another stage's mismatch is not a start failure", failure("stage", "before")),
+            ("unobserved end is not a mismatch",
+             both(failure("stage", "after"), at(5, "lookups", _CHART, 1), at(5, "after", _state(tab="TETHER")))),
+            ("end met its expectation", both(
+                failure("stage", "after"), at(5, "lookups", _CHART, 1),
+                at(5, "after", {"tab": "TETHER", "period": "1d", "ready": True, "seriesShown": 11, "scroll": "na"}))),
+            ("failed slot end ready 1", both(failure("kind", "operation-error"), at(5, "after", _state(ready=1)))),
+            ("slot before start ready 1", at(1, "before", "ready", 1)),
+            ("no action is not a lookup failure", both(at(5, "lookups", _CHART, 1), at(5, "action", "none"))),
+            ("another stage's mismatch", both(
+                at(5, "lookups", _CHART, 1),
+                at(5, "after", {"tab": "TETHER", "period": "1d", "ready": True, "seriesShown": 10, "scroll": "na"}))),
+            ("action failure as a mismatch", both(failure("stage", "action"), at(5, "action", "failed"))),
+            ("action failure without a failed action",
+             both(failure("stage", "action"), failure("kind", "operation-error"))),
+            ("failed action outside the action stage", at(5, "action", "failed")),
+            ("during outside scroll", both(failure("stage", "during"), failure("kind", "operation-error"))),
+            ("slot past the end", failure("slot", 8)),
+            ("eight completed slots then a failure", lambda d: (
+                d["iterations"].clear(),
+                d["iterations"].extend({**item, "status": "completed"}
+                                       for item in behavior_doc("tab-entry", run_id)["iterations"]),
+                d["failure"].update(slot=8, kind="operation-error"))),
+            ("negative slot", failure("slot", -1)),
+            ("slot true", failure("slot", True)),
+            ("slot float", failure("slot", 5.0)),
+            ("unknown stage", both(failure("stage", "teardown"), failure("kind", "operation-error"))),
+            ("unknown kind", failure("kind", "error")),
+            ("empty reason", failure("reason", "")),
+            ("blank reason", failure("reason", "   ")),
+            ("reason not text", failure("reason", 5)),
+            ("extra record key", lambda d: d.__setitem__("note", "x")),
+            ("missing failure key", lambda d: d["failure"].pop("reason")),
+            ("extra failure key", failure("note", "x")),
+            ("extra iteration key", at(5, "note", "x")),
+            ("missing iteration status", lambda d: d["iterations"][3].pop("status")),
+            ("record status passed", lambda d: d.__setitem__("status", "passed")),
+            ("iteration status skipped", at(6, "status", "skipped")),
+            ("partial state key set", at(5, "before", {"tab": "USD"})),
+            ("partial state ready 1", at(5, "before", "ready", 1)),
+            ("partial state ready 0", at(5, "before", "ready", 0)),
+            ("partial state seriesShown true", at(5, "before", "seriesShown", True)),
+            ("partial state seriesShown false", at(5, "before", "seriesShown", False)),
+            ("partial state empty tab", at(5, "before", "tab", "")),
+            ("partial state period number", at(5, "before", "period", 5)),
+            ("partial state unknown scroll", at(5, "before", "scroll", "bottom")),
+            ("partial state empty scroll", at(5, "before", "scroll", "")),
+            ("partial lookups other tags", at(5, "lookups", {"premium_rates": 1, _CHART: 0})),
+            ("partial lookup true", at(5, "lookups", _CHART, True)),
+            ("partial lookup true in an operation error",
+             both(failure("kind", "operation-error"), at(5, "lookups", _CHART, True))),
+            ("partial lookup false in an operation error",
+             both(failure("kind", "operation-error"), at(5, "lookups", _CHART, False))),
+            ("partial lookup negative", at(5, "lookups", _CHART, -1)),
+            ("partial lookup float", at(5, "lookups", _CHART, 0.0)),
+            ("unknown action", at(5, "action", "done")),
+            ("schemaVersion float", lambda d: d.__setitem__("schemaVersion", 1.0)),
+            ("schemaVersion true", lambda d: d.__setitem__("schemaVersion", True)),
+            ("schemaVersion 2", lambda d: d.__setitem__("schemaVersion", 2)),
+            ("another run", lambda d: d.__setitem__("runId", "tab-entry-attempt-9")),
+            ("another journey", lambda d: d.__setitem__("journey", "scroll")),
+            ("seven iterations", lambda d: d["iterations"].pop()),
+            ("phase order", lambda d: d["iterations"].insert(3, d["iterations"].pop(2))),
+            ("wrong index", at(6, "index", 4)),
+            ("a success record", lambda d: d.clear() or d.update(behavior_doc("tab-entry", run_id))),
         ]
-        for index, (description, mutate, extra) in enumerate(cases):
-            broken = self._with_behavior_failure(
-                "tab-entry",
-                mutate,
-                f"failed-evidence-{index}.json",
-                journey_verdict="fail",
-                manifest_verdict="fail",
-                extra=extra,
-            )
+        for description, mutate in cases:
+            document = base()
+            mutate(document)
             with self.subTest(description), self.assertRaises(InvalidEvidence):
-                validate_manifest(broken, self.root)
+                check_failure_record(document, run_id=run_id, journey_id="tab-entry", label="behavior")
+        check_failure_record(base(), run_id=run_id, journey_id="tab-entry", label="behavior")
+        no_contract = base()
+        no_contract["journey"] = "news"
+        with self.subTest("journey without a contract"), self.assertRaises(InvalidEvidence):
+            check_failure_record(no_contract, run_id=run_id, journey_id="news", label="behavior")
 
-        aliased = self._with_behavior_failure(
-            "tab-entry", no_tab, "failed-evidence-alias.json", journey_verdict="fail", manifest_verdict="fail"
-        )
-        aliased["artifacts"]["fixturePayload"] = copy.deepcopy(aliased["journeys"][0]["attempts"][0]["evidence"])
-        with self.subTest("evidence is also a top-level artifact"), self.assertRaisesRegex(InvalidEvidence, "byte-reused"):
-            validate_manifest(aliased, self.root)
-
-    def test_behavior_failure_without_three_valid_runs_is_invalid(self):
-        def no_tab(document):
-            document["iterations"][2]["lookups"]["premium_tab_TETHER"] = 0
-
-        manifest = self._with_behavior_failure(
-            "tab-entry", no_tab, "failed-short.json", journey_verdict="fail", manifest_verdict="fail"
-        )
-        attempts = manifest["journeys"][0]["attempts"]
-        # valid, behavior-failed, valid: two valid runs evaluated against three listed runs.
-        manifest["journeys"][0]["attempts"] = [
-            {**attempts[1], "ordinal": 1},
-            {**attempts[0], "ordinal": 2},
-            {**attempts[2], "ordinal": 3},
+    def test_scroll_during_observation_is_checked(self):
+        run_id = "scroll-attempt-1"
+        arguments = next(a for j, d, a in VALID_FAILURES if d == "the page did not move")
+        cases = [
+            ("malformed scroll", lambda d: d["iterations"][6].__setitem__("during", {"scroll": 5})),
+            ("during scroll zero is not null", lambda d: d["iterations"][6].__setitem__("during", {"scroll": 0})),
+            ("during scroll false is not null", lambda d: d["iterations"][6].__setitem__("during", {"scroll": False})),
+            ("during scroll empty is not null", lambda d: d["iterations"][6].__setitem__("during", {"scroll": ""})),
+            ("extra during key", lambda d: d["iterations"][6].__setitem__("during", {"scroll": "top", "x": 1})),
+            ("during missing", lambda d: d["iterations"][6].pop("during")),
+            ("during met its expectation", lambda d: d["iterations"][6].__setitem__("during", {"scroll": "moved"})),
+            ("during not observed", lambda d: d["iterations"][6].__setitem__("during", None)),
+            ("during scroll not observed", lambda d: d["iterations"][6].__setitem__("during", {"scroll": None})),
         ]
-        with self.assertRaisesRegex(InvalidEvidence, "three valid attempts"):
-            validate_manifest(manifest, self.root)
+        for description, mutate in cases:
+            document = failure_doc("scroll", run_id, **arguments)
+            mutate(document)
+            with self.subTest(description), self.assertRaises(InvalidEvidence):
+                check_failure_record(document, run_id=run_id, journey_id="scroll", label="behavior")
+        tab_entry = failure_doc("tab-entry", "tab-entry-attempt-1", slot=3, stage="setup", kind="operation-error")
+        tab_entry["iterations"][3]["during"] = None
+        with self.subTest("during on a journey without one"), self.assertRaises(InvalidEvidence):
+            check_failure_record(tab_entry, run_id="tab-entry-attempt-1", journey_id="tab-entry", label="behavior")
 
-    def test_behavior_failed_attempt_fails_the_s11_journey(self):
-        def no_chart(document):
-            document["iterations"][5]["lookups"]["graph_v2:inline:chart"] = 0
 
-        golden_path = self.root / "golden-behavior.json"
-        golden_path.write_text(json.dumps(self.manifest, sort_keys=True), encoding="utf-8")
-        golden_sha = sha256_file(golden_path)
-        for verdict, valid in (("fail", True), ("pass", False)):
-            candidate = self._with_behavior_failure(
-                "scroll", no_chart, f"failed-s11-{verdict}.json", journey_verdict=verdict, manifest_verdict=verdict
+class FailureReportTest(unittest.TestCase):
+    """S5-4 slice 1a: the terminal report of a behavior failure; a valid one always fails the gate (exit 1)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.count = 0
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write(self, name, document):
+        path = self.root / name
+        path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+        return {"path": path.name, "sha256": sha256_file(path)}
+
+    def _snapshot(self, run_id, phase, observed_at, **changes):
+        self.count += 1
+        snapshot = {**copy.deepcopy(DEVICE_SNAPSHOT), "runId": run_id, "phase": phase, "observedAt": observed_at}
+        snapshot.update(changes)
+        return self._write(f"{phase}-{self.count}.json", snapshot)
+
+    def _report(self, journey_id="tab-entry", arguments=None, gate="S5", attempt_id=None):
+        attempt_id = attempt_id or f"{journey_id}-attempt-2"
+        arguments = arguments or dict(
+            slot=5, stage="lookup", kind="expectation-mismatch",
+            failed={"lookups": {"premium_tab_TETHER": 0, _CHART: None}, "before": _TAB_ENTRY_START},
+        )
+        self.count += 1
+        return {
+            "schemaVersion": 1,
+            "kind": "terminal-behavior-failure",
+            "gate": gate,
+            "sourceCommit": "b" * 40,
+            "journey": journey_id,
+            "attemptId": attempt_id,
+            "ordinal": 3,
+            "behavior": self._write(f"behavior-{self.count}.json", failure_doc(journey_id, attempt_id, **arguments)),
+            "preflight": self._snapshot(attempt_id, "preflight", "2026-09-01T00:00:00Z"),
+            "postflight": self._snapshot(attempt_id, "postflight", "2026-09-01T00:00:30+00:00"),
+            "verdict": "fail",
+        }
+
+    def _command(self, report):
+        self.count += 1
+        path = self.root / f"report-{self.count}.json"
+        path.write_text(json.dumps(report), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
+            code = benchmark_gate.main(["validate-failure", str(path), "--artifact-root", str(self.root)])
+        return code, output.getvalue()
+
+    def test_valid_report_exits_one_for_every_stage_and_both_gates(self):
+        for gate in ("S5", "S11"):
+            for journey_id, description, arguments in VALID_FAILURES:
+                report = self._report(journey_id, arguments, gate)
+                with self.subTest(gate=gate, failure=description):
+                    validate_failure_report(report, self.root)
+                    code, output = self._command(report)
+                    self.assertEqual(1, code)
+                    self.assertEqual({"valid": True, "gate": gate, "journey": journey_id, "verdict": "fail"},
+                                     json.loads(output))
+
+    def test_report_defects_exit_two(self):
+        attempt_id = "tab-entry-attempt-2"
+
+        def put(key, value):
+            return lambda report: report.__setitem__(key, value)
+
+        def snapshot(role, phase, observed_at, **changes):
+            return lambda report: report.__setitem__(
+                role, self._snapshot(attempt_id, phase, observed_at, **changes)
             )
-            candidate["gate"] = "S11"
-            candidate["goldenManifestSha256"] = golden_sha
-            with self.subTest(verdict=verdict):
-                validate_manifest(candidate, self.root)
-                if valid:
-                    validate_s11_against_golden(candidate, self.manifest, golden_bytes_sha256=golden_sha)
-                else:
-                    with self.assertRaisesRegex(InvalidEvidence, "S11 journey verdict"):
-                        validate_s11_against_golden(candidate, self.manifest, golden_bytes_sha256=golden_sha)
+
+        def copy_of(source, role):
+            def mutate(report):
+                path = self.root / f"copy-{role}-{self.count}.json"
+                path.write_bytes((self.root / report[source]["path"]).read_bytes())
+                report[role] = {"path": path.name, "sha256": sha256_file(path)}
+            return mutate
+
+        cases = [
+            ("record of another attempt", put("attemptId", "tab-entry-attempt-9")),
+            ("record of another journey", put("journey", "scroll")),
+            ("unknown journey", put("journey", "news")),
+            ("journey not text", put("journey", ["tab-entry"])),
+            ("preflight of another run", snapshot("preflight", "preflight", "2026-09-01T00:00:00Z", runId="other")),
+            ("phases swapped", lambda r: (r.__setitem__("tmp", r["preflight"]), r.__setitem__("preflight", r["postflight"]),
+                                          r.__setitem__("postflight", r.pop("tmp")))),
+            ("postflight at the same time", snapshot("postflight", "postflight", "2026-09-01T00:00:00+00:00")),
+            ("postflight earlier", snapshot("postflight", "postflight", "2026-08-31T23:59:59Z")),
+            ("malformed timestamp", snapshot("postflight", "postflight", "2026-09-01T25:00:00Z")),
+            ("another device", snapshot("preflight", "preflight", "2026-09-01T00:00:00Z", fingerprint="other")),
+            ("charging", snapshot("postflight", "postflight", "2026-09-01T00:00:30Z",
+                                  powered={**DEVICE_SNAPSHOT["powered"], "usb powered": True})),
+            ("one file twice", lambda r: r.__setitem__("postflight", copy.deepcopy(r["preflight"]))),
+            ("same bytes twice", copy_of("behavior", "postflight")),
+            ("claims a pass", put("verdict", "pass")),
+            ("unknown gate", put("gate", "S6")),
+            ("uppercase commit", put("sourceCommit", "B" * 40)),
+            ("short commit", put("sourceCommit", "b" * 39)),
+            ("ordinal 0", put("ordinal", 0)),
+            ("ordinal 6", put("ordinal", 6)),
+            ("ordinal true", put("ordinal", True)),
+            ("ordinal float", put("ordinal", 3.0)),
+            ("another kind", put("kind", "behavior-failure")),
+            ("extra key", put("note", "x")),
+            ("missing key", lambda r: r.pop("verdict")),
+            ("schemaVersion 2", put("schemaVersion", 2)),
+            ("schemaVersion true", put("schemaVersion", True)),
+            ("bad hash", lambda r: r["behavior"].__setitem__("sha256", "0" * 64)),
+            ("path escape", lambda r: r["behavior"].__setitem__("path", "../behavior.json")),
+            ("a success record", lambda r: r.__setitem__(
+                "behavior", self._write(f"success-{self.count}.json", behavior_doc("tab-entry", attempt_id)))),
+        ]
+        for description, mutate in cases:
+            report = self._report()
+            mutate(report)
+            with self.subTest(description):
+                with self.assertRaises(InvalidEvidence):
+                    validate_failure_report(report, self.root)
+                self.assertEqual(2, self._command(report)[0])
+        with self.subTest("not an object"), self.assertRaises(InvalidEvidence):
+            validate_failure_report([], self.root)
+        # Consistent everywhere, so only the id rule can reject it.
+        unstable = self._report(attempt_id="Bad Id")
+        with self.subTest("malformed attempt id"), self.assertRaises(InvalidEvidence):
+            validate_failure_report(unstable, self.root)
 
 
 class RunSetBehaviorTest(unittest.TestCase):

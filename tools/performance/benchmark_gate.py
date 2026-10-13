@@ -382,6 +382,59 @@ def _check_behavior_state(value: Any, label: str) -> None:
         raise InvalidEvidence(f"{label}.scroll must be one of {sorted(BEHAVIOR_SCROLL_VALUES)}")
 
 
+def _iteration_keys(expected: Mapping[str, Any]) -> set[str]:
+    keys = {"phase", "index", "lookups", "before", "after", "action"}
+    if expected["during"] is not None:
+        keys.add("during")
+    return keys
+
+
+def _check_slot_position(iteration: Mapping[str, Any], position: int, item: str) -> None:
+    if iteration["phase"] != BEHAVIOR_PHASES[position]:
+        raise InvalidEvidence(f"{item}.phase must be {BEHAVIOR_PHASES[position]}")
+    if _whole(iteration["index"], f"{item}.index") != BEHAVIOR_INDICES[position]:
+        raise InvalidEvidence(f"{item}.index must be {BEHAVIOR_INDICES[position]}")
+
+
+def _check_success_iteration(iteration: Mapping[str, Any], expected: Mapping[str, Any], item: str) -> None:
+    """A fully observed slot: every observation present and of its type (phase and index are checked apart)."""
+    lookups = iteration["lookups"]
+    if not isinstance(lookups, dict) or set(lookups) != expected["lookups"]:
+        raise InvalidEvidence(f"{item}.lookups must record exactly {sorted(expected['lookups'])}")
+    for tag, count in lookups.items():
+        _whole(count, f"{item}.lookups[{tag}]")
+    _check_behavior_state(iteration["before"], f"{item}.before")
+    _check_behavior_state(iteration["after"], f"{item}.after")
+    if expected["during"] is not None:
+        during = iteration["during"]
+        if (
+            not isinstance(during, dict)
+            or set(during) != {"scroll"}
+            or not isinstance(during["scroll"], str)
+            or during["scroll"] not in BEHAVIOR_SCROLL_VALUES
+        ):
+            raise InvalidEvidence(f"{item}.during must be a scroll observation")
+    if not isinstance(iteration["action"], str) or iteration["action"] not in BEHAVIOR_ACTIONS:
+        raise InvalidEvidence(f"{item}.action must be one of {sorted(BEHAVIOR_ACTIONS)}")
+
+
+def _iteration_failures(iteration: Mapping[str, Any], expected: Mapping[str, Any], item: str) -> list[str]:
+    """Every expectation a fully observed slot misses."""
+    failures: list[str] = []
+    for tag in sorted(expected["lookups"]):
+        if iteration["lookups"][tag] != 1:
+            failures.append(f"{item} looked {tag} up {iteration['lookups'][tag]} times")
+    for phase in ("before", "after"):
+        for key, value in expected[phase].items():
+            if iteration[phase][key] != value:
+                failures.append(f"{item}.{phase}.{key} is {iteration[phase][key]!r}, expected {value!r}")
+    if expected["during"] is not None and iteration["during"] != expected["during"]:
+        failures.append(f"{item}.during is {iteration['during']!r}, expected {expected['during']!r}")
+    if iteration["action"] != "completed":
+        failures.append(f"{item}.action is {iteration['action']!r}")
+    return failures
+
+
 def check_behavior_structure(document: Any, *, run_id: str, journey_id: str, label: str) -> None:
     """Shape, types and identity of one run's behavior record; anything else is not a record of that run at all."""
     expected = EXPECTED_BEHAVIOR.get(journey_id)
@@ -398,35 +451,13 @@ def check_behavior_structure(document: Any, *, run_id: str, journey_id: str, lab
     iterations = document["iterations"]
     if not isinstance(iterations, list) or len(iterations) != len(BEHAVIOR_PHASES):
         raise InvalidEvidence(f"{label}.iterations must contain {len(BEHAVIOR_PHASES)} entries")
-    keys = {"phase", "index", "lookups", "before", "after", "action"}
-    if expected["during"] is not None:
-        keys.add("during")
+    keys = _iteration_keys(expected)
     for position, iteration in enumerate(iterations):
         item = f"{label}.iterations[{position}]"
         if not isinstance(iteration, dict) or set(iteration) != keys:
             raise InvalidEvidence(f"{item} must contain exactly {sorted(keys)}")
-        if iteration["phase"] != BEHAVIOR_PHASES[position]:
-            raise InvalidEvidence(f"{item}.phase must be {BEHAVIOR_PHASES[position]}")
-        if _whole(iteration["index"], f"{item}.index") != BEHAVIOR_INDICES[position]:
-            raise InvalidEvidence(f"{item}.index must be {BEHAVIOR_INDICES[position]}")
-        lookups = iteration["lookups"]
-        if not isinstance(lookups, dict) or set(lookups) != expected["lookups"]:
-            raise InvalidEvidence(f"{item}.lookups must record exactly {sorted(expected['lookups'])}")
-        for tag, count in lookups.items():
-            _whole(count, f"{item}.lookups[{tag}]")
-        _check_behavior_state(iteration["before"], f"{item}.before")
-        _check_behavior_state(iteration["after"], f"{item}.after")
-        if expected["during"] is not None:
-            during = iteration["during"]
-            if (
-                not isinstance(during, dict)
-                or set(during) != {"scroll"}
-                or not isinstance(during["scroll"], str)
-                or during["scroll"] not in BEHAVIOR_SCROLL_VALUES
-            ):
-                raise InvalidEvidence(f"{item}.during must be a scroll observation")
-        if not isinstance(iteration["action"], str) or iteration["action"] not in BEHAVIOR_ACTIONS:
-            raise InvalidEvidence(f"{item}.action must be one of {sorted(BEHAVIOR_ACTIONS)}")
+        _check_slot_position(iteration, position, item)
+        _check_success_iteration(iteration, expected, item)
 
 
 def behavior_failures(document: Mapping[str, Any], journey_id: str) -> list[str]:
@@ -434,18 +465,7 @@ def behavior_failures(document: Mapping[str, Any], journey_id: str) -> list[str]
     expected = EXPECTED_BEHAVIOR[journey_id]
     failures: list[str] = []
     for position, iteration in enumerate(document["iterations"]):
-        item = f"iterations[{position}]"
-        for tag in sorted(expected["lookups"]):
-            if iteration["lookups"][tag] != 1:
-                failures.append(f"{item} looked {tag} up {iteration['lookups'][tag]} times")
-        for phase in ("before", "after"):
-            for key, value in expected[phase].items():
-                if iteration[phase][key] != value:
-                    failures.append(f"{item}.{phase}.{key} is {iteration[phase][key]!r}, expected {value!r}")
-        if expected["during"] is not None and iteration["during"] != expected["during"]:
-            failures.append(f"{item}.during is {iteration['during']!r}, expected {expected['during']!r}")
-        if iteration["action"] != "completed":
-            failures.append(f"{item}.action is {iteration['action']!r}")
+        failures.extend(_iteration_failures(iteration, expected, f"iterations[{position}]"))
     return failures
 
 
@@ -455,6 +475,189 @@ def validate_behavior(document: Any, *, run_id: str, journey_id: str, label: str
     failures = behavior_failures(document, journey_id)
     if failures:
         raise InvalidEvidence(f"{label} does not show the agreed behavior: " + "; ".join(failures[:3]))
+
+
+# S5-4 slice 1a: a journey that does not behave as agreed stops at once. Its record keeps the planned eight slots: the
+# slots before the failure completed and met every expectation, the failed slot holds what was observed (null where
+# nothing was), and the slots after it never ran. The parser checks the record's form and consistency; it cannot prove
+# that an exception or an observation actually happened.
+FAILURE_STAGES = {"setup", "lookup", "before", "action", "during", "after"}
+FAILURE_KINDS = {"expectation-mismatch", "operation-error"}
+FAILURE_RECORD_KEYS = {"schemaVersion", "runId", "journey", "status", "failure", "iterations"}
+FAILURE_DETAIL_KEYS = {"slot", "stage", "kind", "reason"}
+
+
+def _check_partial_lookups(value: Any, tags: set[str], label: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != tags:
+        raise InvalidEvidence(f"{label} must be null or record exactly {sorted(tags)}")
+    for tag, count in value.items():
+        if count is not None:
+            _whole(count, f"{label}[{tag}]")
+
+
+def _check_partial_state(value: Any, label: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != BEHAVIOR_STATE_KEYS:
+        raise InvalidEvidence(f"{label} must be null or contain exactly {sorted(BEHAVIOR_STATE_KEYS)}")
+    for key in ("tab", "period"):
+        if value[key] is not None and (not isinstance(value[key], str) or not value[key]):
+            raise InvalidEvidence(f"{label}.{key} must be null or a non-empty string")
+    if value["ready"] is not None and not isinstance(value["ready"], bool):
+        raise InvalidEvidence(f"{label}.ready must be null or a boolean")
+    if value["seriesShown"] is not None:
+        _whole(value["seriesShown"], f"{label}.seriesShown")
+    scroll = value["scroll"]
+    if scroll is not None and (not isinstance(scroll, str) or scroll not in BEHAVIOR_SCROLL_VALUES):
+        raise InvalidEvidence(f"{label}.scroll must be null or one of {sorted(BEHAVIOR_SCROLL_VALUES)}")
+
+
+def _check_partial_during(value: Any, label: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {"scroll"}:
+        raise InvalidEvidence(f"{label} must be null or a scroll observation")
+    scroll = value["scroll"]
+    if scroll is not None and (not isinstance(scroll, str) or scroll not in BEHAVIOR_SCROLL_VALUES):
+        raise InvalidEvidence(f"{label}.scroll must be null or one of {sorted(BEHAVIOR_SCROLL_VALUES)}")
+
+
+def _stage_mismatch(stage: str, iteration: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    """Whether the declared stage's own non-null observations miss an expectation."""
+    if stage == "lookup":
+        lookups = iteration["lookups"]
+        return lookups is not None and any(count is not None and count != 1 for count in lookups.values())
+    if stage in ("before", "after"):
+        state = iteration[stage]
+        return state is not None and any(
+            state[key] is not None and state[key] != value for key, value in expected[stage].items()
+        )
+    if stage == "during":
+        during = iteration["during"]
+        return during is not None and during["scroll"] is not None and during["scroll"] != expected["during"]["scroll"]
+    return False
+
+
+def check_failure_record(document: Any, *, run_id: str, journey_id: str, label: str) -> None:
+    """A terminal behavior failure record of that attempt, consistent with the slot and stage it declares."""
+    expected = EXPECTED_BEHAVIOR.get(journey_id)
+    if expected is None:
+        raise InvalidEvidence(f"{label} has no behavior contract for journey {journey_id!r}")
+    if not isinstance(document, dict) or set(document) != FAILURE_RECORD_KEYS:
+        raise InvalidEvidence(f"{label} must contain exactly {sorted(FAILURE_RECORD_KEYS)}")
+    if _whole(document["schemaVersion"], f"{label}.schemaVersion") != BEHAVIOR_SCHEMA_VERSION:
+        raise InvalidEvidence(f"{label}.schemaVersion must be {BEHAVIOR_SCHEMA_VERSION}")
+    if document["runId"] != run_id:
+        raise InvalidEvidence(f"{label}.runId does not match {run_id!r}")
+    if document["journey"] != journey_id:
+        raise InvalidEvidence(f"{label}.journey does not match {journey_id!r}")
+    if document["status"] != "failed":
+        raise InvalidEvidence(f"{label}.status must be failed")
+    failure = document["failure"]
+    if not isinstance(failure, dict) or set(failure) != FAILURE_DETAIL_KEYS:
+        raise InvalidEvidence(f"{label}.failure must contain exactly {sorted(FAILURE_DETAIL_KEYS)}")
+    slot = _whole(failure["slot"], f"{label}.failure.slot")
+    if slot >= len(BEHAVIOR_PHASES):
+        raise InvalidEvidence(f"{label}.failure.slot must be below {len(BEHAVIOR_PHASES)}")
+    stage, kind, reason = failure["stage"], failure["kind"], failure["reason"]
+    if not isinstance(stage, str) or stage not in FAILURE_STAGES:
+        raise InvalidEvidence(f"{label}.failure.stage must be one of {sorted(FAILURE_STAGES)}")
+    if not isinstance(kind, str) or kind not in FAILURE_KINDS:
+        raise InvalidEvidence(f"{label}.failure.kind must be one of {sorted(FAILURE_KINDS)}")
+    if not isinstance(reason, str) or not reason.strip():
+        raise InvalidEvidence(f"{label}.failure.reason must say what failed")
+    if stage == "during" and expected["during"] is None:
+        raise InvalidEvidence(f"{label}.failure.stage during does not exist for journey {journey_id}")
+    iterations = document["iterations"]
+    if not isinstance(iterations, list) or len(iterations) != len(BEHAVIOR_PHASES):
+        raise InvalidEvidence(f"{label}.iterations must contain {len(BEHAVIOR_PHASES)} entries")
+    observation_keys = _iteration_keys(expected) - {"phase", "index"}
+    keys = _iteration_keys(expected) | {"status"}
+    for position, iteration in enumerate(iterations):
+        item = f"{label}.iterations[{position}]"
+        if not isinstance(iteration, dict) or set(iteration) != keys:
+            raise InvalidEvidence(f"{item} must contain exactly {sorted(keys)}")
+        _check_slot_position(iteration, position, item)
+        status = iteration["status"]
+        if position < slot:
+            if status != "completed":
+                raise InvalidEvidence(f"{item}.status must be completed before the failed slot")
+            _check_success_iteration(iteration, expected, item)
+            missed = _iteration_failures(iteration, expected, item)
+            if missed:
+                raise InvalidEvidence(f"{item} completed before the failure but misses an expectation: {missed[0]}")
+        elif position == slot:
+            if status != "failed":
+                raise InvalidEvidence(f"{item}.status must be failed at the declared slot")
+            _check_partial_lookups(iteration["lookups"], expected["lookups"], f"{item}.lookups")
+            _check_partial_state(iteration["before"], f"{item}.before")
+            _check_partial_state(iteration["after"], f"{item}.after")
+            if expected["during"] is not None:
+                _check_partial_during(iteration["during"], f"{item}.during")
+            action = iteration["action"]
+            if action is not None and (not isinstance(action, str) or action not in BEHAVIOR_ACTIONS):
+                raise InvalidEvidence(f"{item}.action must be null or one of {sorted(BEHAVIOR_ACTIONS)}")
+            if action == "failed" and stage != "action":
+                raise InvalidEvidence(f"{item}.action is failed only when the action stage failed")
+            if stage == "action" and (kind != "operation-error" or action != "failed"):
+                raise InvalidEvidence(f"{item} an action failure is an operation error recorded as action=failed")
+            if kind == "expectation-mismatch" and stage not in ("setup", "action"):
+                if not _stage_mismatch(stage, iteration, expected):
+                    raise InvalidEvidence(f"{item} shows no {stage} expectation mismatch")
+        else:
+            if status != "not-run":
+                raise InvalidEvidence(f"{item}.status must be not-run after the failed slot")
+            if any(iteration[key] is not None for key in observation_keys):
+                raise InvalidEvidence(f"{item} never ran, so it observes nothing")
+
+
+FAILURE_REPORT_KEYS = {
+    "schemaVersion", "kind", "gate", "sourceCommit", "journey", "attemptId", "ordinal",
+    "behavior", "preflight", "postflight", "verdict",
+}
+
+
+def validate_failure_report(report: Any, artifact_root: Path) -> None:
+    """A terminal behavior failure report: the failing attempt's record and its pre/postflight. It always fails the gate.
+    It does not prove that no earlier attempt was hidden or that nothing ran after it; the runner's journal owns that."""
+    if not isinstance(report, dict) or set(report) != FAILURE_REPORT_KEYS:
+        raise InvalidEvidence(f"failure report must contain exactly {sorted(FAILURE_REPORT_KEYS)}")
+    if _whole(report["schemaVersion"], "schemaVersion") != SCHEMA_VERSION:
+        raise InvalidEvidence(f"schemaVersion must be {SCHEMA_VERSION}")
+    if report["kind"] != "terminal-behavior-failure":
+        raise InvalidEvidence("kind must be terminal-behavior-failure")
+    gate = report["gate"]
+    if not isinstance(gate, str) or gate not in {"S5", "S11"}:
+        raise InvalidEvidence("gate must be S5 or S11")
+    commit = report["sourceCommit"]
+    if not isinstance(commit, str) or not GIT_SHA_RE.fullmatch(commit):
+        raise InvalidEvidence("sourceCommit must be a lowercase 40-hex Git SHA")
+    journey_id = report["journey"]
+    if not isinstance(journey_id, str) or journey_id not in EXPECTED_JOURNEY_IDS:
+        raise InvalidEvidence(f"journey must be one of {sorted(EXPECTED_JOURNEY_IDS)}")
+    attempt_id = report["attemptId"]
+    if not isinstance(attempt_id, str) or not RUN_ID_RE.fullmatch(attempt_id):
+        raise InvalidEvidence("attemptId must be a stable id")
+    ordinal = _whole(report["ordinal"], "ordinal")
+    if not 1 <= ordinal <= EXPECTED_MEASUREMENT_CONTRACT["maxAttempts"]:
+        raise InvalidEvidence(f"ordinal must be 1 to {EXPECTED_MEASUREMENT_CONTRACT['maxAttempts']}")
+    if report["verdict"] != "fail":
+        raise InvalidEvidence("a terminal behavior failure report can only fail")
+    # No separate reuse check: one file cannot serve two roles, because a failure record has an exact key set without the
+    # device fields and the two snapshots differ in their phase.
+    paths = {role: validate_artifact_ref(report[role], artifact_root, role) for role in ("behavior", "preflight", "postflight")}
+    check_failure_record(load_json(paths["behavior"]), run_id=attempt_id, journey_id=journey_id, label="behavior")
+    pre_observed = validate_preflight_snapshot(paths["preflight"], "preflight", run_id=attempt_id, phase="preflight")
+    post_observed = validate_preflight_snapshot(paths["postflight"], "postflight", run_id=attempt_id, phase="postflight")
+    try:
+        pre_at = datetime.fromisoformat(pre_observed.replace("Z", "+00:00"))
+        post_at = datetime.fromisoformat(post_observed.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise InvalidEvidence("failure report has malformed observation timestamps") from error
+    if pre_at >= post_at:
+        raise InvalidEvidence("postflight must be later than preflight")
 
 
 def s11_p99_limit(b99: float) -> float:
@@ -728,7 +931,6 @@ def validate_manifest(manifest: Mapping[str, Any], artifact_root: Path) -> None:
         if not isinstance(attempts, list) or not 3 <= len(attempts) <= 5:
             raise InvalidEvidence(f"journeys[{index}].attempts must contain 3 to 5 attempts")
         valid_attempt_runs: set[str] = set()
-        behavior_failed = False
         for attempt_index, attempt in enumerate(attempts):
             attempt_label = f"journeys[{index}].attempts[{attempt_index}]"
             if not isinstance(attempt, dict):
@@ -812,27 +1014,11 @@ def validate_manifest(manifest: Mapping[str, Any], artifact_root: Path) -> None:
                             "a threshold miss is a valid measured run"
                         )
             elif outcome == "behavior-failed":
-                # The journey ran and did not behave as agreed: not an environment retry. It fails the journey below.
-                if set(attempt) != {"attemptId", "ordinal", "outcome", "evidence"}:
-                    raise InvalidEvidence(f"{attempt_label} behavior-failed shape is invalid")
-                failed_path = validate_artifact_ref(
-                    attempt.get("evidence"), artifact_root, f"{attempt_label}.evidence"
-                )
-                digest = sha256_file(failed_path)
-                if digest in used_run_digests:
-                    raise InvalidEvidence(f"attempt evidence is byte-reused: {failed_path}")
-                used_run_digests.add(digest)
-                failed_document = load_json(failed_path)
-                check_behavior_structure(
-                    failed_document, run_id=attempt_id, journey_id=journey_id, label=f"{attempt_label}.evidence"
-                )
-                if not behavior_failures(failed_document, journey_id):
-                    raise InvalidEvidence(f"{attempt_label} behavior-failed evidence shows no behavior failure")
-                behavior_failed = True
-            else:
                 raise InvalidEvidence(
-                    f"{attempt_label}.outcome must be valid, invalid or behavior-failed"
+                    f"{attempt_label} a behavior failure is terminal: report it with validate-failure, not as a manifest attempt"
                 )
+            else:
+                raise InvalidEvidence(f"{attempt_label}.outcome must be valid or invalid")
         journey_run_ids = {run["runId"] for run in runs}
         if valid_attempt_runs != journey_run_ids or len(valid_attempt_runs) != 3:
             raise InvalidEvidence(
@@ -842,12 +1028,10 @@ def validate_manifest(manifest: Mapping[str, Any], artifact_root: Path) -> None:
             raise InvalidEvidence(
                 f"journeys[{index}] must stop when the third valid run is obtained"
             )
-        # A behavior failure fails the journey whatever its metrics, and later valid runs cannot win it back.
-        expected_verdict = "fail" if behavior_failed else calculated.verdict
         if manifest.get("gate") == "S5":
-            if journey.get("verdict") != expected_verdict:
+            if journey.get("verdict") != calculated.verdict:
                 raise InvalidEvidence(f"S5 journey verdict is inconsistent: {journey_id}")
-            journey_verdicts.append(expected_verdict)
+            journey_verdicts.append(calculated.verdict)
     if seen != EXPECTED_JOURNEY_IDS:
         raise InvalidEvidence(
             f"journey ids must equal {sorted(EXPECTED_JOURNEY_IDS)}, got {sorted(seen)}"
@@ -898,14 +1082,9 @@ def validate_s11_against_golden(
         expected = evaluate_triplet(
             [candidate_metrics, candidate_metrics, candidate_metrics], mode="s11", b99=b99
         )
-        attempts = journey.get("attempts")
-        behavior_failed = isinstance(attempts, list) and any(
-            isinstance(attempt, dict) and attempt.get("outcome") == "behavior-failed" for attempt in attempts
-        )
-        expected_verdict = "fail" if behavior_failed else expected.verdict
-        if journey.get("verdict") != expected_verdict:
+        if journey.get("verdict") != expected.verdict:
             raise InvalidEvidence(f"S11 journey verdict is inconsistent: {journey_id}")
-        candidate_verdicts.append(expected_verdict)
+        candidate_verdicts.append(expected.verdict)
     aggregate = "pass" if candidate_verdicts and all(v == "pass" for v in candidate_verdicts) else "fail"
     if candidate.get("verdict") != aggregate:
         raise InvalidEvidence("S11 manifest verdict is inconsistent with journey verdicts")
@@ -1182,6 +1361,13 @@ def _command_evaluate(args: argparse.Namespace) -> int:
     return 0 if verdict == "pass" else 1
 
 
+def _command_validate_failure(args: argparse.Namespace) -> int:
+    report = load_json(args.report)
+    validate_failure_report(report, args.artifact_root)
+    print(json.dumps({"valid": True, "gate": report["gate"], "journey": report["journey"], "verdict": "fail"}, sort_keys=True))
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1201,6 +1387,12 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--golden", type=Path)
     evaluate.add_argument("--golden-artifact-root", type=Path)
     evaluate.set_defaults(handler=_command_evaluate)
+    failure = subparsers.add_parser(
+        "validate-failure", help="validate a terminal behavior failure report (a valid report exits 1: the gate fails)"
+    )
+    failure.add_argument("report", type=Path)
+    failure.add_argument("--artifact-root", type=Path, required=True)
+    failure.set_defaults(handler=_command_validate_failure)
     return parser
 
 

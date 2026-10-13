@@ -85,7 +85,7 @@
               "properties": {
                 "attemptId": {"type": "string", "minLength": 1},
                 "ordinal": {"type": "integer", "minimum": 1, "maximum": 5},
-                "outcome": {"enum": ["valid", "invalid", "behavior-failed"]},
+                "outcome": {"enum": ["valid", "invalid"]},
                 "reason": {"enum": ["environment-invalid", "result-malformed"]},
                 "evidence": {"type": "object", "required": ["path", "sha256"]}
               }
