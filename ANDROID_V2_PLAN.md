@@ -40,9 +40,10 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 복구 예산·시간 계기·§9.1 migration을 dormant로 준비했다. 이어 통합과 critical cutover 배선(CC1~CC5-4)·
                                 인수 하네스를 land했다. 인수 판정은 C01 조건부 통과·C02 통과·C03 조건부 통과로 S4 소비자 cutover 인수 조건부
                                 통과다(S4 '진행' 항목).
-                                S5는 S5-1·S5-2a·S5-2b·S5-3의 구현·시험 commit 6개(`1096d68`~`cbaad54`)가
-                                land했다(2026-10-13). S5-3 실기기 화면 회귀·S5-4 성능·DoD 대조 마감 판정은
-                                남아 있으며, S5 완료 선언은 아니다(S5 '진행' 항목).
+                                S5는 S5-1·S5-2a·S5-2b·S5-3의 구현·시험 commit 6개(`1096d68`~`cbaad54`)와
+                                S5-4 준비 commit 4개(`67f6fb6`~`fcbb6e8`: fixture·판정기·selector bridge·여정 소스)가
+                                land했다(2026-10-13). S5-3 실기기 화면 회귀, S5-4의 ON artifact 실행과 실기기 측정,
+                                DoD 대조 마감 판정은 남아 있으며, S5 완료 선언은 아니다(S5 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1568,8 +1569,15 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   화면별 접근은 대표 1회, purge 뒤 runtime 정리도 검증.
   · S5-3 `cbaad54` T25 무료 회귀의 단위 시험과 에뮬레이터 화면 회귀. 실기기 화면 회귀는 아직 하지 않았다. 어느 결과도
   iOS T25 원정의 전체 PASS가 아니다.
-  · 남은 것: S5-3 실기기 화면 회귀(사용자), S5-4 성능(Tether 11-series fixture·selector·세 측정 여정 — D24 별도
-  ON-artifact 승인과 고정 SM-F711N 필요), 위 결과를 이 절의 DoD에 대조한 S5 마감 판정.
+  · S5-4 준비(사용자 GO 전 범위): `67f6fb6` A 테더 benchmark fixture를 benchmark 소스 세트 asset 한 곳에 동결
+  (1d 11 series×144점+현재 봉, 1w 5 series×180점, 11-series 선택 seed)하고 실제 holder에서 11→5→11 표시를 검증.
+  `be9ea33` B 판정기가 유효 run마다 행동 기록(selector lookup 정확히 1회·시작/끝 상태·action·scroll 이동)을 요구하고,
+  behavior-failed attempt는 S5·S11 모두 지표와 무관하게 fail. `4f04f7d` C 페이지 스크롤 container tag
+  `premium_page_scroll`과 resource-id bridge를 에뮬레이터에서 실증(lookup 1건·기간 click·스크롤 이동/복귀).
+  `fcbb6e8` D 세 측정 여정의 Macrobenchmark 소스(컴파일 검증뿐, 실행 전).
+  · 남은 것: S5-3 실기기 화면 회귀(사용자). S5-4 E — D24 ON benchmark artifact, fixture runtime·Root 연결,
+  행동 기록 writer(별도 ON-artifact GO). S5-4 F — 고정 SM-F711N 측정과 golden(기기 사용 승인). 위 결과를 이 절의
+  DoD에 대조한 S5 마감 판정.
 
 ### S6 — KRX positive lifecycle
 - `krx_visible` flip → `krx:usd-krw-futures` desired/REST bootstrap 시작·중단, 표시 표면 노출. KRX bootstrap만
