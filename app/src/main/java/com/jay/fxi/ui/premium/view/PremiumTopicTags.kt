@@ -17,6 +17,8 @@ internal object PremiumTopicTags {
     const val DXY = "premium_dxy"
     /** S5: the stable slot after the rates (S8/S9 sections). */
     const val BELOW_RATES = "premium_below_rates"
+    /** S5-4: the page container that scrolls as one when a graph or the slot is present (benchmark scroll selector). */
+    const val PAGE_SCROLL = "premium_page_scroll"
     fun customize(list: RateRowList) = "premium_customize_${list.name}"
     const val FULLSCREEN = "premium_fullscreen"
     const val FULLSCREEN_LAYER = "premium_fullscreen_layer"

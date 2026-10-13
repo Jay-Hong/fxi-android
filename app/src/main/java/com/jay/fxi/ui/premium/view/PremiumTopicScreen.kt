@@ -325,7 +325,9 @@ private fun PremiumTopicRates(
     val metrics = LocalRateLayoutMetrics.current
     // With anything above or below the rates, the whole page scrolls as one; otherwise the rates scroll on their own.
     val pageScrolls = graphContent != null || belowRates != null
-    Column(modifier.fillMaxSize().then(if (pageScrolls) Modifier.verticalScroll(scroll) else Modifier)) {
+    Column(modifier.fillMaxSize()
+        .then(if (pageScrolls && !fullscreen) Modifier.testTag(PremiumTopicTags.PAGE_SCROLL) else Modifier)
+        .then(if (pageScrolls) Modifier.verticalScroll(scroll) else Modifier)) {
         graphContent?.invoke()
         Row(Modifier.fillMaxWidth().padding(horizontal = metrics.horizontalPadding), verticalAlignment = Alignment.CenterVertically) {
             Text(ui.heading.orEmpty(), modifier = Modifier.weight(1f).then(

@@ -574,6 +574,8 @@ dependencies {
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    // S5-4 C: the resource-id bridge test looks the page tags up through UIAutomator (same 2.4.0 as :macrobenchmark).
+    androidTestImplementation(libs.androidx.uiautomator)
     // S0-f D31: the target benchmark APK must contain ProfileInstaller 1.4.1 as a
     // real resolved dependency. A catalog pin alone does not satisfy the gate.
     add("benchmarkImplementation", libs.androidx.profileinstaller)
