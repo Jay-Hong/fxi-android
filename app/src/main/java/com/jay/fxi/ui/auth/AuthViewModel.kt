@@ -19,6 +19,7 @@ import com.jay.fxi.R
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.auth.AuthTransitionCoordinator
+import com.jay.fxi.data.auth.AuthUserObservation
 import com.jay.fxi.data.entitlements.AuthAccessBinder
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.SignOutStart
@@ -49,8 +50,9 @@ import java.util.Locale
 import javax.inject.Inject
 
 @HiltViewModel
-class AuthViewModel @Inject constructor(
+class AuthViewModel @Inject internal constructor(
     private val auth: FirebaseAuth,
+    private val users: AuthUserObservation,
     private val authTokenProvider: AuthTokenProvider,
     private val authTransitionCoordinator: AuthTransitionCoordinator,
     private val subscriptionManager: SubscriptionManager,
@@ -68,9 +70,10 @@ class AuthViewModel @Inject constructor(
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
 
-    private val authListener = FirebaseAuth.AuthStateListener { firebaseAuth ->
+    // S5-4 slice 3: the user comes from the observation port; sign-in and sign-out below stay on FirebaseAuth.
+    private val onUserChanged: () -> Unit = {
         viewModelScope.launch {
-            val user = firebaseAuth.currentUser
+            val user = users.currentUser()
             if (user != null) {
                 if (BuildConfig.REVENUECAT_API_KEY.isNotBlank()) {
                     val session = subscriptionManager.beginAuthSession(user.uid)
@@ -97,18 +100,18 @@ class AuthViewModel @Inject constructor(
                     subscriptionManager.onAuthCompleted()
                 }
 
-                val providerId = user.providerData.firstOrNull { it.providerId != "firebase" }?.providerId
-                val provider = when (providerId) {
+                val profile = user.readProfile()
+                val provider = when (profile.providerId) {
                     "apple.com" -> AuthProvider.APPLE
                     else -> AuthProvider.GOOGLE
                 }
 
                 _authState.value = AuthState.SignedIn(
                     UserInfo(
-                        uid = user.uid,
-                        email = user.email,
-                        displayName = user.displayName,
-                        photoUrl = user.photoUrl?.toString(),
+                        uid = profile.uid,
+                        email = profile.email,
+                        displayName = profile.displayName,
+                        photoUrl = profile.photoUrl,
                         provider = provider
                     )
                 )
@@ -139,9 +142,7 @@ class AuthViewModel @Inject constructor(
         }
     }
 
-    init {
-        auth.addAuthStateListener(authListener)
-    }
+    private val userRegistration: AutoCloseable = users.register(onUserChanged)
 
     fun signInWithGoogle(activity: Activity) {
         viewModelScope.launch {
@@ -240,7 +241,7 @@ class AuthViewModel @Inject constructor(
     }
 
     override fun onCleared() {
-        auth.removeAuthStateListener(authListener)
+        userRegistration.close()
         super.onCleared()
     }
 

@@ -5,9 +5,7 @@ import com.google.firebase.crashlytics.FirebaseCrashlytics
 import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthCredentialRecoveryStream
 import com.jay.fxi.data.auth.AuthTokenProvider
-import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.auth.AuthTokenSource
-import com.jay.fxi.data.auth.FirebaseAuthTokenSource
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -17,6 +15,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import javax.inject.Singleton
 
+/**
+ * S5-4 slice 3: the token source, the fence stream and the user observation are bound per build type
+ * (`src/productionBindings/java/com/jay/fxi/di/AuthBindingsModule.kt`), so that a fixture build type can replace them together.
+ */
 @Module
 @InstallIn(SingletonComponent::class)
 object AuthModule {
@@ -24,20 +26,6 @@ object AuthModule {
     @Provides
     @Singleton
     fun provideFirebaseAuth(): FirebaseAuth = FirebaseAuth.getInstance()
-
-    @Provides
-    @Singleton
-    internal fun provideAuthTokenSource(source: FirebaseAuthTokenSource): AuthTokenSource = source
-
-    /**
-     * The **same** singleton as the token source, deliberately.
-     *
-     * Two bindings over two instances would be two trackers, and two trackers are two answers to
-     * "which generation is this" — the shape this stream exists to collapse.
-     */
-    @Provides
-    @Singleton
-    internal fun provideAuthFenceStream(source: FirebaseAuthTokenSource): AuthFenceStream = source
 
     /** One order for the token provider and the premium issuer to compare (S1 recovery signal §3). */
     @Provides
