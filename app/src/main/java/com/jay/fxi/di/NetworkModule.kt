@@ -12,7 +12,6 @@ import com.jay.fxi.data.remote.FXiApiService
 import com.jay.fxi.data.remote.MutationOneShotInterceptor
 import com.jay.fxi.data.remote.TopicFrameDecoder
 import com.jay.fxi.data.remote.TopicUseNetworkInterceptor
-import com.jay.fxi.util.ApiConfig
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import dagger.Module
 import dagger.Provides
@@ -94,16 +93,18 @@ object NetworkModule {
     @PublicRest
     fun providePublicRetrofit(
         @PublicRest okHttpClient: OkHttpClient,
-        @WireJson json: Json
-    ): Retrofit = retrofit(okHttpClient, json)
+        @WireJson json: Json,
+        endpoints: ServerEndpoints
+    ): Retrofit = retrofit(okHttpClient, json, endpoints.restBaseUrl)
 
     @Provides
     @Singleton
     @ProtectedRest
     internal fun provideProtectedRetrofit(
         @ProtectedRest okHttpClient: OkHttpClient,
-        @WireJson json: Json
-    ): Retrofit = retrofit(okHttpClient, json)
+        @WireJson json: Json,
+        endpoints: ServerEndpoints
+    ): Retrofit = retrofit(okHttpClient, json, endpoints.restBaseUrl)
 
     @Provides
     @Singleton
@@ -146,10 +147,10 @@ object NetworkModule {
         .readTimeout(15, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
 
-    private fun retrofit(okHttpClient: OkHttpClient, json: Json): Retrofit {
+    private fun retrofit(okHttpClient: OkHttpClient, json: Json, baseUrl: String): Retrofit {
         val contentType = "application/json".toMediaType()
         return Retrofit.Builder()
-            .baseUrl(ApiConfig.BASE_URL)
+            .baseUrl(baseUrl)
             .client(okHttpClient)
             .addConverterFactory(json.asConverterFactory(contentType))
             .build()

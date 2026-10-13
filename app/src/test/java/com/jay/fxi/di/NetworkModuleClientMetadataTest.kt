@@ -90,7 +90,8 @@ class NetworkModuleClientMetadataTest {
 
         val protectedRetrofit = NetworkModule.provideProtectedRetrofit(
             client,
-            NetworkModule.provideWireJson()
+            NetworkModule.provideWireJson(),
+            ServerEndpoints("https://rest.invalid/", "wss://socket.invalid/ws")
         )
         assertSame(
             "protected Retrofit must retain the hardened protected OkHttp client",

@@ -17,11 +17,11 @@ import com.jay.fxi.data.local.TopicLastKnownOwner
 import com.jay.fxi.data.local.TopicLastKnownRestoreGate
 import com.jay.fxi.data.local.TopicLastKnownStore
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
+import com.jay.fxi.di.ServerEndpoints
 import com.jay.fxi.di.WireJson
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.TopicRates
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
-import com.jay.fxi.util.ApiConfig
 import java.util.UUID
 import javax.inject.Inject
 import kotlin.coroutines.ContinuationInterceptor
@@ -86,10 +86,11 @@ internal class TopicRuntimeFactory internal constructor(
         tabs: FreeTabStore,
         @WireJson json: Json,
         lastKnown: TopicLastKnownStore,
-        authority: TopicUseAuthority
+        authority: TopicUseAuthority,
+        endpoints: ServerEndpoints
     ) : this(
         webSocketFactory = ::buildWebSocketClient,
-        webSocketUrl = ApiConfig.WS_URL,
+        webSocketUrl = endpoints.webSocketUrl,
         decode = decoder::decode,
         bootstrap = { owner, topic, useAdmitted -> bootstrapService.bootstrap(owner, topic, useAdmitted) },
         issuer = PremiumAccessTopicGrantIssuer(coordinator),

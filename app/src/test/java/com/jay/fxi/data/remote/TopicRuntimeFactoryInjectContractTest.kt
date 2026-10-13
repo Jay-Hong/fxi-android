@@ -16,6 +16,7 @@ import com.jay.fxi.data.entitlements.UserScopePurger
 import com.jay.fxi.data.local.FreeTabStore
 import com.jay.fxi.data.local.TopicLastKnownStore
 import com.jay.fxi.di.NetworkModule
+import com.jay.fxi.di.ServerEndpoints
 import java.lang.reflect.Proxy
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CoroutineScope
@@ -66,12 +67,14 @@ class TopicRuntimeFactoryInjectContractTest {
 
         val factory = TopicRuntimeFactory(tokens, orders, untouched<AuthFenceStream>(), untouched<AuthCredentialRecoveryStream>(),
             coordinator, TopicSnapshotBootstrapService(api, TopicFrameDecoder(json), 10.seconds), TopicFrameDecoder(json),
-            untouched<FreeTabStore>(), json, store, authority)
+            untouched<FreeTabStore>(), json, store, authority, ServerEndpoints("https://rest.invalid/", "wss://socket.invalid/ws"))
 
         val held = TopicRuntimeFactory::class.java.getDeclaredField("lastKnown").apply { isAccessible = true }.get(factory)
         assertSame("C1-1 the factory holds the injected store", store, held)
         val heldAuthority = TopicRuntimeFactory::class.java.getDeclaredField("authority").apply { isAccessible = true }.get(factory)
         assertSame("CC1-01 the factory holds the injected authority", authority, heldAuthority)
+        val heldUrl = TopicRuntimeFactory::class.java.getDeclaredField("webSocketUrl").apply { isAccessible = true }.get(factory)
+        assertEquals("S5-4 4a the factory connects to the bound WebSocket address", "wss://socket.invalid/ws", heldUrl)
         assertEquals("C1-1 construction called no dependency", emptyList<String>(), calls)
     }
 }
