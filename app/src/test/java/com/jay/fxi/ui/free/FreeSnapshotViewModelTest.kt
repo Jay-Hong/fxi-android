@@ -45,7 +45,12 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import com.jay.fxi.ui.premium.graph.TetherGraphData
+import com.jay.fxi.ui.premium.graph.TetherGraphFixture
+import kotlin.time.Duration.Companion.seconds
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class FreeSnapshotViewModelTest {
@@ -728,6 +733,225 @@ class FreeSnapshotViewModelTest {
             assertTrue(vm.uiState.value.seriesToggles.isEmpty())
         }
     }
+    // --- S5-3 T25 (tether): the free snapshot keeps its as_of and server data ---------------------------------------
+
+    @get:Rule val folder = TemporaryFolder()
+
+    private val tetherPeriods = listOf(GraphPeriod.ONE_DAY, GraphPeriod.ONE_WEEK, GraphPeriod.THREE_MONTHS, GraphPeriod.ONE_YEAR)
+    private val tetherIds = listOf("upbit.usdt-krw", "hana.usd")
+
+    /**
+     * Each period's as_of lies in the current publish slot (11:30 KST, `FreeSnapshotSchedulePolicy.basisOf`), a minute apart,
+     * so none is query-stale and each shows its own label.
+     */
+    private fun tetherAsOf(period: GraphPeriod) = basis + tetherPeriods.indexOf(period).minutes
+
+    /** A tether snapshot of [period] whose as_of and values differ by period: upbit and hana.usd, two readings each. */
+    private fun tetherSnapshot(period: GraphPeriod): FreeSnapshot {
+        val i = tetherPeriods.indexOf(period)
+        val asOf = tetherAsOf(period)
+        val step = when (period) {
+            GraphPeriod.ONE_DAY -> 10.minutes
+            GraphPeriod.ONE_WEEK -> 1.hours
+            else -> 24.hours
+        }
+        fun series(id: String, base: Double) = FreeGraphSeries(id, listOf(
+            FreeGraphPoint(asOf - step, base + i, null, null),
+            FreeGraphPoint(asOf, base + i + 1, base + i + 1.5, base + i + 0.5)
+        ), axisGroup = "krw")
+        return FreeSnapshot(
+            tab = "tether", period = period, asOf = asOf, generatedAt = asOf + 1.minutes, refreshNotBefore = basis + 48.hours,
+            rate = FreeRate.Grouped("usdt-krw", emptyList(), emptyList(), null),
+            graph = FreeGraph(
+                bucketSize = null,
+                series = listOf(series("upbit.usdt-krw", 1380.0), series("hana.usd", 1350.0)),
+                domainStartAt = asOf - step * 2,
+                domainEndAt = asOf,
+                liveDomainMode = if (period == GraphPeriod.ONE_DAY) "rolling" else "fixed_start"
+            )
+        )
+    }
+
+    private fun tetherReads() = FreeSnapshotReadState("u1", tetherPeriods.associate {
+        FreeSnapshotKey("tether", it) to FreeSnapshotEntry(tetherSnapshot(it), FreeSnapshotFreshness.FRESH)
+    })
+
+    /** The KST label the screen shows for [at] (the existing format, e.g. "2026.09.06 11:30 KST"). */
+    private fun label(at: Instant): String {
+        val local = at.plus(9.hours).toString()
+        return "${local.substring(0, 4)}.${local.substring(5, 7)}.${local.substring(8, 10)} ${local.substring(11, 16)} KST"
+    }
+
+    /** The selected tether period shows its own snapshot: its key, as_of label, last reading and nothing else. */
+    private fun assertShowsTetherSnapshot(label: String, state: FreeSnapshotUiState, period: GraphPeriod, foreign: Set<Double>) {
+        val snapshot = tetherSnapshot(period)
+        assertEquals("$label: the key", FreeSnapshotKey("tether", period), state.dataKey)
+        assertEquals("$label: the as_of label", label(snapshot.asOf), state.asOfLabel)
+        val graph = checkNotNull(state.graph)
+        assertEquals("$label: graph period", period, graph.period)
+        assertEquals("$label: series order", tetherIds, graph.order)
+        assertEquals("$label: no extra series", tetherIds.toSet(), graph.bySeries.keys)
+        val domain = checkNotNull(graph.domain)
+        assertEquals("$label: domain start", snapshot.graph.domainStartAt, domain.start)
+        assertEquals("$label: domain end", snapshot.graph.domainEndAt, domain.end)
+        assertEquals("$label: domain mode",
+            if (period == GraphPeriod.ONE_DAY) com.jay.fxi.ui.graph.LiveDomainMode.ROLLING
+            else com.jay.fxi.ui.graph.LiveDomainMode.FIXED_START,
+            domain.mode)
+        val stamps = snapshot.graph.series.flatMap { s -> s.points.map { it.timestamp } }
+        val bounds = checkNotNull(graph.dataBounds)
+        assertEquals("$label: data start", stamps.minOrNull(), bounds.start)
+        assertEquals("$label: data end", stamps.maxOrNull(), bounds.end)
+        for (id in tetherIds) {
+            val raw = snapshot.graph.series.single { it.seriesId == id }.points
+            val points = state.pointsOf(id)
+            val prepared = graph.bySeries.getValue(id)
+            assertEquals("$label $id: exactly the server points",
+                raw.map { LinePoint(it.timestamp, it.rate) }, points)
+            assertEquals("$label $id: server high/low",
+                raw.mapNotNull { p ->
+                    val low = p.low
+                    val high = p.high
+                    if (low == null || high == null) null
+                    else com.jay.fxi.ui.graph.BandPoint(p.timestamp, low, high)
+                }, prepared.bandPoints)
+            val values = raw.flatMap { listOfNotNull(it.rate, it.low, it.high) }
+            assertEquals("$label $id: server extrema", values.min()..values.max(), prepared.extrema)
+            assertEquals("$label $id: ends at the last reading, no tail", LinePoint(raw.last().timestamp, raw.last().rate), points.last())
+            assertEquals("$label $id: starts at the first reading", raw.first().timestamp, points.first().ts)
+            assertTrue("$label $id: only server values ${points.map { it.rate }}", points.all { it.rate in raw.map { r -> r.rate } })
+            assertTrue("$label $id: no foreign value", points.none { it.rate in foreign })
+        }
+    }
+
+    /**
+     * U1 (S5-3, T25 tether): the free tether tab with four distinct period snapshots. A real recorder adopts an exchange and
+     * a reference observation (the positive control: the producer did update). Through 1d -> 1w -> 3m -> 1y -> 1d and a tab
+     * round trip, each period shows its own server data and as_of with no observation, new bucket or tail, and the last 1d
+     * equals the first. The free view model has no recorder link today, so this records isolation under synthetic inputs; it
+     * does not prove causal detection of a recorder leak.
+     */
+    @Test
+    fun u1_tetherSnapshotKeepsItsServerDataAcrossObservationsPeriodsAndReturns() =
+        withViewModel(FakeTabStore("u1" to FreeTab.TETHER)) { vm, reads ->
+            reads.value = tetherReads()
+            vm.bind("u1")
+            testScheduler.runCurrent()
+            val foreign = setOf(1999.0, 1888.0)
+            assertShowsTetherSnapshot("1d first", vm.uiState.value, GraphPeriod.ONE_DAY, foreign)
+            val firstDay = checkNotNull(vm.uiState.value.graph)
+
+            val producer = TetherGraphFixture(this, folder)
+            try {
+                producer.start()
+                producer.activate("tether")
+                producer.exchange("upbit", 1999.0, TetherGraphData.B + 30.seconds)
+                producer.tetherRow("hana", 1888.0, TetherGraphData.B + 30.seconds)
+                val adopted = producer.recorder.state.value.series.keys.map { it.seriesId }.toSet()
+                assertTrue("premise: the recorder adopted both observations: $adopted", adopted.containsAll(tetherIds))
+                testScheduler.runCurrent()
+
+                for (period in tetherPeriods.drop(1) + GraphPeriod.ONE_DAY) {
+                    vm.selectPeriod(period)
+                    testScheduler.runCurrent()
+                    assertShowsTetherSnapshot("$period", vm.uiState.value, period, foreign)
+                }
+                assertEquals("the last 1d equals the first", firstDay, vm.uiState.value.graph)
+                vm.selectTab(FreeTab.USD); testScheduler.runCurrent()
+                vm.selectTab(FreeTab.TETHER); testScheduler.runCurrent()
+                assertShowsTetherSnapshot("after the tab round trip", vm.uiState.value, GraphPeriod.ONE_DAY, foreign)
+                assertEquals("the same 1d after the tab round trip", firstDay, vm.uiState.value.graph)
+            } finally {
+                producer.close()
+            }
+        }
+
+    /**
+     * U2 (S5-3, T25 tether): the real scheduler, view model and activity coordinator over a recording fetch and a wall clock
+     * the test can move. After the four periods warm up, within the freshness bound and before any period's refresh is due,
+     * several 10-minute boundaries, the clock moved forward and back, deactivation and return, foreground loss and return,
+     * and the four period switches each keep the shown snapshot and as_of and ask for nothing more. (The absence of a premium
+     * graph request path is structural and is not measured here.)
+     */
+    @Test
+    fun u2_tetherSnapshotAsksNothingMoreAcrossTimeReturnsAndPeriods() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val calls = mutableListOf<FreeSnapshotKey>()
+        var wallOffset = 0.minutes
+        var lastClockReading: Instant? = null
+        val scheduler = FreeSnapshotScheduler(
+            fetcher = object : FreeSnapshotFetching {
+                override suspend fun fetch(tab: String, period: GraphPeriod): FreeSnapshot {
+                    calls += FreeSnapshotKey(tab, period)
+                    return if (tab == "tether") tetherSnapshot(period) else snapshot(FreeSnapshotKey(tab, period))
+                }
+            },
+            uidStream = AuthUidStream { it("u1") },
+            authFence = { AuthIdentityFence("u1", 1L) },
+            scope = scope,
+            clock = {
+                (basis + 5.minutes + testScheduler.currentTime.milliseconds + wallOffset)
+                    .also { lastClockReading = it }
+            },
+            installId = { "test-install" }
+        )
+        val vm = FreeSnapshotViewModel(scheduler, FakeTabStore("u1" to FreeTab.TETHER), FakeSeriesStore(), FakeRowStore())
+        val coordinator = vm.activityCoordinator
+        fun step(ms: Long = 1_000) { testScheduler.advanceTimeBy(ms); testScheduler.runCurrent() }
+        try {
+            scheduler.start()
+            vm.bind("u1")
+            coordinator.update("u1", "tether", GraphPeriod.ONE_DAY, true, true)
+            testScheduler.runCurrent()
+            step(60_000)
+            assertEquals("premise: the four periods warmed up once each",
+                tetherPeriods.associate { FreeSnapshotKey("tether", it) to 1 },
+                calls.groupingBy { it }.eachCount())
+            val baseline = calls.size
+            val foreign = emptySet<Double>()
+            assertShowsTetherSnapshot("warm", vm.uiState.value, GraphPeriod.ONE_DAY, foreign)
+
+            step(25.minutes.inWholeMilliseconds)
+            assertEquals("10-minute boundaries ask nothing", baseline, calls.size)
+            assertShowsTetherSnapshot("after 25 min", vm.uiState.value, GraphPeriod.ONE_DAY, foreign)
+
+            fun assertAfterClockMove(label: String) {
+                val expectedNow = basis + 5.minutes + testScheduler.currentTime.milliseconds + wallOffset
+                scheduler.onActivated("tether", GraphPeriod.ONE_DAY)
+                testScheduler.runCurrent()
+                assertEquals("$label: the scheduler observed the moved clock",
+                    expectedNow, lastClockReading)
+                assertEquals("$label: no additional request", baseline, calls.size)
+                assertShowsTetherSnapshot(label, vm.uiState.value, GraphPeriod.ONE_DAY, foreign)
+            }
+
+            wallOffset += 5.minutes; step()
+            assertAfterClockMove("after the clock moves forward")
+            wallOffset -= 8.minutes; step()
+            assertAfterClockMove("after the clock moves backward")
+
+            coordinator.update("u1", "tether", GraphPeriod.ONE_DAY, true, false); step()
+            coordinator.update("u1", "tether", GraphPeriod.ONE_DAY, true, true); step()
+            coordinator.update("u1", "tether", GraphPeriod.ONE_DAY, false, true); step(70_000)
+            coordinator.update("u1", "tether", GraphPeriod.ONE_DAY, true, true); step()
+            assertEquals("deactivation, background and return ask nothing", baseline, calls.size)
+            assertShowsTetherSnapshot("after the return", vm.uiState.value, GraphPeriod.ONE_DAY, foreign)
+
+            for (period in tetherPeriods.drop(1) + GraphPeriod.ONE_DAY) {
+                vm.selectPeriod(period)
+                coordinator.update("u1", "tether", period, true, true); step()
+                assertShowsTetherSnapshot("$period", vm.uiState.value, period, foreign)
+            }
+            assertEquals("period switches ask nothing", baseline, calls.size)
+            assertEquals(FreeSnapshotAvailability.FRESH, vm.uiState.value.availability)
+        } finally {
+            vm.viewModelScope.cancel()
+            scope.cancel()
+            Dispatchers.resetMain()
+        }
+    }
+
 }
 
 /**
