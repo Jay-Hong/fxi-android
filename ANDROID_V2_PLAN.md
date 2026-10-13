@@ -40,6 +40,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 복구 예산·시간 계기·§9.1 migration을 dormant로 준비했다. 이어 통합과 critical cutover 배선(CC1~CC5-4)·
                                 인수 하네스를 land했다. 인수 판정은 C01 조건부 통과·C02 통과·C03 조건부 통과로 S4 소비자 cutover 인수 조건부
                                 통과다(S4 '진행' 항목).
+                                S5는 S5-1·S5-2a·S5-2b·S5-3의 구현·시험 commit 6개(`1096d68`~`cbaad54`)가
+                                land했다(2026-10-13). S5-3 실기기 화면 회귀·S5-4 성능·DoD 대조 마감 판정은
+                                남아 있으며, S5 완료 선언은 아니다(S5 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1549,6 +1552,24 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   여정별 `median(P95/P99)`를 이름이 구분된 필드로 봉인한다. 이 승인된 manifest의 여정별 `median(P99)`만
   S11 비교용 **`B99` golden**이며 S5 합격선을 만드는 데 사용하지 않는다.
   최종 Graph→시세→거래소 가격알림→김프→비교 순서는 S9에서 검증
+- **진행(2026-10-13, 근거 `R4c/S5/`)**
+  · S5-1 `1096d68` 테더 topic 관측을 그래프 기록기에 연결. 거래소5는 재관측 timestamp와 rate_changed_at을 각각 관측
+  후보로 내고, rate_changed_at이 timestamp+5초 이상이면 그 후보만 버리고 현재 봉에 TIME_ANOMALY를 남긴다. 같은 topic의
+  kb·hana·investing USD 행은 `<source>.usd`(timestamp만), 매핑은 tether 1d catalog exact allowlist다. 거래소5 각각
+  T01·T02·T03/T03-L·T04·T06/T06-L·T07/T07-L·T10/T10-L, recorder 경로의 T08/T08-L·T11(capture·미응답 부분)·
+  T12(recorder 부분)·T14·T15, 참조 T17·T18, T19(거래소5·참조3·hana USD/JPY/EUR), T23 테더 부분.
+  · S5-2a `24b1710` 테더 탭 holder·화면 연결과 시세 뒤 순서 고정 slot. catalog 4기간 채택·합성 0, T17·T18,
+  T22 비-KRX 부분, T24, 거래소5+참조 effective projection.
+  · S5-2b(시험만) `6a28918` 거래소5 각각 T05/T05-L·T09·T16/T16-L, T21 장기는 catalog가 제공하는
+  bithumb 1w·3m·1y, 600초 strict 경계는 거래소5 각각의 1d와 bithumb 장기.
+  `e8b6b76` T11 요청 조정자 부분: 거래소5 각각 진행 중·부분 응답·다음 활성 주체, 대표 gopax에서 실제 복귀·
+  cache hit·disk seed·복귀/재연결 cooldown·Retry-After floor·503·철회.
+  `1c85f59` T12(로그아웃·UID 교체·premium 상실·KRX 취소 대조)는 한 fixture의 거래소5 각각을 단언,
+  화면별 접근은 대표 1회, purge 뒤 runtime 정리도 검증.
+  · S5-3 `cbaad54` T25 무료 회귀의 단위 시험과 에뮬레이터 화면 회귀. 실기기 화면 회귀는 아직 하지 않았다. 어느 결과도
+  iOS T25 원정의 전체 PASS가 아니다.
+  · 남은 것: S5-3 실기기 화면 회귀(사용자), S5-4 성능(Tether 11-series fixture·selector·세 측정 여정 — D24 별도
+  ON-artifact 승인과 고정 SM-F711N 필요), 위 결과를 이 절의 DoD에 대조한 S5 마감 판정.
 
 ### S6 — KRX positive lifecycle
 - `krx_visible` flip → `krx:usd-krw-futures` desired/REST bootstrap 시작·중단, 표시 표면 노출. KRX bootstrap만
