@@ -32,8 +32,9 @@ internal fun shouldStartAppOwnedServices(
 internal fun shouldEnableCrashlytics(
     debug: Boolean,
     benchmarkNoData: Boolean,
-    releaseAdmissionOpen: Boolean
-): Boolean = !debug && shouldStartAppOwnedServices(releaseAdmissionOpen, benchmarkNoData)
+    releaseAdmissionOpen: Boolean,
+    crashCollectionAllowed: Boolean
+): Boolean = crashCollectionAllowed && !debug && shouldStartAppOwnedServices(releaseAdmissionOpen, benchmarkNoData)
 
 /**
  * Everything an admitted process starts, in one place that can be called without an `Application`.
@@ -138,7 +139,8 @@ class FXiApplication : Application() {
                 shouldEnableCrashlytics(
                     debug = BuildConfig.DEBUG,
                     benchmarkNoData = BuildConfig.BENCHMARK_NO_DATA_MODE,
-                    releaseAdmissionOpen = releaseAdmissionOpen
+                    releaseAdmissionOpen = releaseAdmissionOpen,
+                    crashCollectionAllowed = BuildConfig.CRASH_COLLECTION_ALLOWED
                 )
             )
         }

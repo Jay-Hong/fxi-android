@@ -27,16 +27,20 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.jay.fxi.BuildConfig
 import com.jay.fxi.R
 import com.jay.fxi.admission.ReleaseAdmission
 import com.jay.fxi.data.auth.AuthIdentityFence
@@ -69,6 +73,7 @@ internal interface PremiumTopicOwnerEntryPoint {
     fun topicRuntimeOwner(): TopicRuntimeOwner
 }
 
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun RootScreen(
     subscriptionManagerProvider: Provider<SubscriptionManager>,
@@ -81,12 +86,20 @@ fun RootScreen(
         return
     }
 
-    ArmedRootScreen(
-        subscriptionManager = subscriptionManagerProvider.get(),
-        pendingAlertEvent = pendingAlertEvent,
-        onPendingAlertEventConsumed = onPendingAlertEventConsumed,
-        alertEventBus = alertEventBusProvider.get()
-    )
+    val armed = @Composable {
+        ArmedRootScreen(
+            subscriptionManager = subscriptionManagerProvider.get(),
+            pendingAlertEvent = pendingAlertEvent,
+            onPendingAlertEventConsumed = onPendingAlertEventConsumed,
+            alertEventBus = alertEventBusProvider.get()
+        )
+    }
+    if (BuildConfig.SEMANTICS_RESOURCE_IDS) {
+        // S5-4 slice 4b: the S5 fixture build type alone. Its benchmark selectors find test tags as resource ids.
+        Box(Modifier.semantics { testTagsAsResourceId = true }) { armed() }
+    } else {
+        armed()
+    }
 }
 
 @Composable

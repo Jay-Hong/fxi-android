@@ -204,6 +204,10 @@ android {
         // this, but every new build type inherits OFF unless it opts in explicitly.
         buildConfigField("boolean", "TOPIC_V2_RELEASE_ON", "false")
         manifestPlaceholders["topicV2ReleaseOn"] = false
+        // S5-4 slice 4b: crash collection may open only where the other gates allow it; the local S5 fixture build type keeps it
+        // closed. The fixture's benchmark selectors read test tags as resource ids; no other build type exposes them.
+        buildConfigField("boolean", "CRASH_COLLECTION_ALLOWED", "true")
+        buildConfigField("boolean", "SEMANTICS_RESOURCE_IDS", "false")
     }
 
     buildTypes {
