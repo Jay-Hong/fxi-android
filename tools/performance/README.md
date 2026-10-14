@@ -89,6 +89,22 @@ Artifact hashes must refer to a single file. For a directory or a set of R8 inpu
 create a canonical manifest consisting of sorted relative paths and each file's SHA-256,
 then hash that manifest. A raw directory hash is not a reproducible identity.
 
+`s5_artifacts.py collect` builds the five non-APK top-level artifacts this way from one built
+source snapshot: the snapshot's own `benchmark_gate.py`; the fixture payload (every file under
+`app/src/s5Benchmark` and `app/src/benchmark/assets/s5_4`, plus
+`ci/google-services.ci-fixture.json`, whose s5Benchmark build copy must be the same bytes and
+is not listed itself); the `:macrobenchmark` `s5BenchmarkRuntimeClasspath` and `:app`
+`releaseRuntimeClasspath` dependency reports, normalized, failing on an unresolved entry or a
+host path; and the R8 rule-input manifest, one line per rule file AGP listed in the s5Benchmark
+`configuration.txt`, hashed from the file's own bytes, which must still be the section the
+build used. Gradle transform inputs are labelled without their cache hash. Nothing is published
+until all five are built and checked, and nothing existing is overwritten.
+
+```bash
+python3 tools/performance/s5_artifacts.py collect --build-root <snapshot> \
+  --gradle-home <temporary-gradle-home> --gradle-home ~/.gradle --out evidence/
+```
+
 For S11, pass both `--golden approved-s5.json` and the golden's own
 `--golden-artifact-root`. The golden must be an explicitly approved, passing S5 manifest.
 Test APK, deterministic fixture, parser, harness dependency graph, pinned library versions,
