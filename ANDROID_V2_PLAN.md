@@ -45,8 +45,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 land했다(2026-10-13). S5-4 E(측정 도구·s5Benchmark fixture runtime·runner,
                                 `7a05035`~`225d1b0`)와 cutover acceptance 하네스 대기 조건(`8b7de72`)이 이어
                                 land했다(2026-10-14). 새 펌웨어 S0-f는 `launcher-smoke-a074f3c-r1`(source `a074f3c`)로
-                                다시 봉인했다(2026-10-15, slice 7). S5-4의 실기기 측정·golden(slice 8)과
-                                DoD 대조 마감 판정은 남아 있으며, S5 완료 선언은 아니다(S5 '진행' 항목).
+                                다시 봉인했다(2026-10-15, slice 7). slice 8 정식 측정 `s5-23bbe3f-r1`은 세 여정 모두
+                                합격선 미달(verdict fail)로 끝나 S5는 미완료다. 성능 개선 범위와 측정 계약은
+                                사용자 결정 대기다(S5 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1591,8 +1592,30 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   · S5-4 slice 7(2026-10-15): 새 펌웨어 S0-f를 고정 SM-F711N에서 clean source `a074f3c`로 봉인했다
   (`launcher-smoke-a074f3c-r1`, 도구·검사기 pass, 설정·임시 패키지 복원). 무선 adb·USB 분리 상태였고, 기존
   `com.jay.fxi` 설치는 사용자 선택으로 제거했다.
-  · 남은 것: S5-4 slice 8 — S5 rehearsal·정식 측정·golden(고정 SM-F711N, 사용자 손: USB 분리·무선 adb·OPENED·
-  잠금 해제 유지). 위 결과를 이 절의 DoD에 대조한 S5 마감 판정.
+  · S5-4 slice 8(2026-10-15): rehearsal `s5-9d39ad4-rh1`은 tab-entry 5회가 모두 invalid로 분류되어
+  attempts-exhausted로 종료했다(period-switch·scroll 미실행). 이 검토에서 파서와 thermal 대기 구현의 두 결함을 확인했다.
+  `6202cf1` 8b — 파서가 결과 JSON `context.compilationMode`(self-instrumenting test APK 자신의 ART 상태)를 대상 앱의
+  Partial 컴파일 결과로 오해해 모든 결과를 거부했다. 그 검사를 지우고 Partial은 `warmupIterations`로 확인한다.
+  `23bbe3f` 8a — DoD의 '유효 run 사이 thermal NONE(0) 복귀 대기'를 runner가 구현하지 않았다. attempt마다 900초
+  예산 안에서 폴링하고 `thermal-waits.jsonl`에 기록한다(대기는 attempt를 판정하지 않는다).
+  정식 측정 `s5-23bbe3f-r1`(source `23bbe3f`, 9 attempt 모두 valid, thermal 대기 9회 모두 0)은 complete·verdict
+  fail이다: tab-entry median P95 41.24 / P99 42.70 ms, period-switch 34.69 / 34.81 ms, scroll 12.98 / 15.23 ms
+  (합격선 P95 ≤ 0.0, P99 ≤ 8.33). 계획대로 golden 없음·통과 목적 재실행 없음·기준 유지로 S5 미완료다. 원시
+  Perfetto trace에는 폰의 Wi-Fi 사설 IP가 시스템 trace 표시로 들어 있어 비공개로 보관한다(serial은 없음).
+  · 원인 분석(trace·코드·측정 정의, 반박 검증 포함; 확정 아님): tab-entry에서는 탭 전환의 `pager.scrollToPage` 경로와
+  일치하는 프레임 밖 강제 재측정(11.8~14.3 ms)이 관측됐다(호출 스택 증명 없음). 다음 프레임의 전체 시작 지연은
+  17.8~25.7 ms이며 큰 지연 프레임의 가장 큰 성분이다. 여기에는 앞선 프레임 작업과 원인 미확인 시간도 포함된다. period-switch에는 클릭
+  처리와 그래프 표면 재생성이 관여하며, 전환 프레임의 deadline 초과량은 22.45~37.03 ms(중앙값 31.99)다.
+  그래프 기록이 3회 일어난다. 모든 여정에서 반복의
+  첫 RenderThread 프레임의 `eglSwapBuffers` 안에 D-state 대기 약 3~4.5 ms가 관측됐다(전체 호출 시간과 구별).
+  확인한 press 프레임에는 Runnable 대기도 0.4~2.3 ms 포함된다. 원인은 미확인이며 높은 클럭에서도 남는다.
+  이 첫 프레임 비용을 줄이지 못하면 전환 여정의 P95 ≤ 0은 매우 어렵다. scroll 프레임의 약 89%는 측정 블록 안의 맨 위로 되돌리는 스와이프(늘이기
+  오버스크롤)에서 나온다(여정 설계 문제). AndroidX 1.4.1 FrameTimingMetric은 tab-entry에서 프레임 12개를 조용히
+  빠뜨렸다(다시 세어도 판정은 같다).
+  · 남은 것: 사용자 결정 — 측정 계약(합격선·첫 프레임 처리·기기/주사율/클럭·지표), 여정 내 polling·되돌리기 동작,
+  누락 프레임의 판정기 처리 유지 또는 변경. 제품/UX 절충(비활성 탭·holder 활성화, ripple·overscroll·zoom 의미),
+  개선 투자·trace 계측 범위, 개선/재측정과 계약 재검토의 순서도 결정해야 한다. 결정한 범위의 개선 구현과 새 정식
+  측정(현재 기기 계약을 유지하면 고정 SM-F711N, 사용자 손: USB 분리·잠금 해제) 뒤, 이 절의 DoD에 대조해 S5를 마감 판정한다.
 
 ### S6 — KRX positive lifecycle
 - `krx_visible` flip → `krx:usd-krw-futures` desired/REST bootstrap 시작·중단, 표시 표면 노출. KRX bootstrap만
