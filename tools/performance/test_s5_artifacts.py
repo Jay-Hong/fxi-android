@@ -246,11 +246,20 @@ class S5ArtifactsTest(unittest.TestCase):
         self.assertEqual(sorted([hashlib.sha256(b"-dontwarn x").hexdigest(), hashlib.sha256(b"-dontwarn y").hexdigest()]), twins)
 
     def test_paths_spelled_through_a_resolved_folder_get_the_same_labels(self):
+        # The second spelling is an explicit symlink, not the platform's temporary folder (macOS reaches it through
+        # /var -> /private/var; Linux /tmp is no symlink). Both directions: listed through the symlink, and root through it.
+        base = Path(self.temp.name)
+        alias = base / "alias"
+        alias.symlink_to(base.resolve(), target_is_directory=True)
+        through = [(alias / path.resolve().relative_to(base.resolve()), path.read_bytes()) for path in self.snap.rules]
         resolved = [(path.resolve(), path.read_bytes()) for path in self.snap.rules]
-        self.assertNotEqual(str(self.snap.rules[0]), str(resolved[0][0]), "the temporary folder is reached through a symlink")
+        self.assertNotEqual(str(through[0][0]), str(through[0][0].resolve()), "the listed spelling goes through the symlink")
         expected = self.r8()
-        self.snap.configure(resolved)
+        self.snap.configure(through)
         self.assertEqual(expected, self.r8())
+        self.snap.configure(resolved)
+        configuration = (self.snap.root / artifacts.CONFIGURATION_PATH).read_bytes().decode()
+        self.assertEqual(expected, artifacts.r8_rules(configuration, alias / "snapshot", [alias / "gradle-home"]))
 
     def test_r8_configuration_defects_fail(self):
         start, end = artifacts.SECTION_START, artifacts.SECTION_END
