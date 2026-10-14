@@ -42,7 +42,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 통과다(S4 '진행' 항목).
                                 S5는 S5-1·S5-2a·S5-2b·S5-3의 구현·시험 commit 6개(`1096d68`~`cbaad54`)와
                                 S5-4 준비 commit 4개(`67f6fb6`~`fcbb6e8`: fixture·판정기·selector bridge·여정 소스)가
-                                land했다(2026-10-13). S5-3 실기기 화면 회귀, S5-4의 ON artifact 실행과 실기기 측정,
+                                land했다(2026-10-13). S5-4 E(측정 도구·s5Benchmark fixture runtime·runner,
+                                `7a05035`~`225d1b0`)와 cutover acceptance 하네스 대기 조건(`8b7de72`)이 이어
+                                land했다(2026-10-14). S5-4의 새 펌웨어 S0-f 봉인과 실기기 측정·golden(slice 7·8),
                                 DoD 대조 마감 판정은 남아 있으며, S5 완료 선언은 아니다(S5 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
@@ -1567,7 +1569,9 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   cache hit·disk seed·복귀/재연결 cooldown·Retry-After floor·503·철회.
   `1c85f59` T12(로그아웃·UID 교체·premium 상실·KRX 취소 대조)는 한 fixture의 거래소5 각각을 단언,
   화면별 접근은 대표 1회, purge 뒤 runtime 정리도 검증.
-  · S5-3 `cbaad54` T25 무료 회귀의 단위 시험과 에뮬레이터 화면 회귀. 실기기 화면 회귀는 아직 하지 않았다. 어느 결과도
+  · S5-3 `cbaad54` T25 무료 회귀의 단위 시험과 에뮬레이터 화면 회귀. 실기기 화면 회귀(D1, 2026-10-13 SM-F711N)는 무료
+  테더 표면(기간·시리즈·전체화면·확대·탭 왕복·백그라운드 복귀 뒤 상태 유지, 크래시·ANR 0) 범위의 PASS 후보로 기록했다.
+  요청 수·여러 10분 경계를 포함한 U2 전체의 실기기 재현은 아니다. 어느 결과도
   iOS T25 원정의 전체 PASS가 아니다.
   · S5-4 준비(사용자 GO 전 범위): `67f6fb6` A 테더 benchmark fixture를 benchmark 소스 세트 asset 한 곳에 동결
   (1d 11 series×144점+현재 봉, 1w 5 series×180점, 11-series 선택 seed)하고 실제 holder에서 11→5→11 표시를 검증.
@@ -1575,9 +1579,17 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   behavior-failed attempt는 S5·S11 모두 지표와 무관하게 fail. `4f04f7d` C 페이지 스크롤 container tag
   `premium_page_scroll`과 resource-id bridge를 에뮬레이터에서 실증(lookup 1건·기간 click·스크롤 이동/복귀).
   `fcbb6e8` D 세 측정 여정의 Macrobenchmark 소스(컴파일 검증뿐, 실행 전).
-  · 남은 것: S5-3 실기기 화면 회귀(사용자). S5-4 E — D24 ON benchmark artifact, fixture runtime·Root 연결,
-  행동 기록 writer(별도 ON-artifact GO). S5-4 F — 고정 SM-F711N 측정과 golden(기기 사용 승인). 위 결과를 이 절의
-  DoD에 대조한 S5 마감 판정.
+  · S5-4 E(사용자 승인 범위: 로컬 ON artifact 생성·fixture runtime·Root 연결·행동 기록 writer, 2026-10-14):
+  `7a05035` 1a 실패 terminal 보고서와 판정기, `f165aa8` 1b 기기 계약 개정(새 펌웨어 fingerprint), `ce990c5` 2 graph
+  시계 바인딩, `3d3e2dd` 3 인증 사용자 관찰 port, `1cc213a`·`26e2842`·`2d4735c`·`4594543` 4a~4b s5Benchmark build
+  type·loopback fixture runtime·자기 검사, `d78d250` 4c fixture APK 패키지 검사기와 CI, `36d6e6f` 4d-1 fixture 시세 행·
+  여정 탭 읽기(에뮬레이터 dry-run 봉인 통과), `8438a43` 5 행동 기록 writer(슬롯 배정·실패 기록·호스트 시험),
+  `b71e967` 6a attempt ledger와 manifest·실패 보고서 조립기, `1f386c6` 6b 정본 입력 산출기, `225d1b0` 6c 기기 runner
+  (가짜 기기 시험뿐, 실기기 실행 전). S5 밖 `8b7de72`는 cutover acceptance 다섯 곳(B06a·RT01-A03·RT03b-Q05d·RT01-H01a·RT01-A04 두
+  변형)이 관측을 끝까지 기다리게 한 하네스 대기 조건 수정이다(단언·예산 불변).
+  · 남은 것: S5-4 slice 7 — 새 펌웨어 S0-f 봉인, slice 8 — S5 rehearsal·정식 측정·golden(고정 SM-F711N, 사용자 손:
+  USB 분리·무선 adb·OPENED·잠금 해제 유지, 기존 `com.jay.fxi` 설치 제거). 위 결과를 이 절의 DoD에 대조한 S5 마감
+  판정.
 
 ### S6 — KRX positive lifecycle
 - `krx_visible` flip → `krx:usd-krw-futures` desired/REST bootstrap 시작·중단, 표시 표면 노출. KRX bootstrap만
