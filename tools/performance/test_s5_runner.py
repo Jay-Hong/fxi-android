@@ -1,8 +1,10 @@
 import copy
 import io
 import json
+import re
 import subprocess
 import tempfile
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -55,6 +57,8 @@ class FakeDevice:
         self.restore_fails = False
         self.interrupt_on = None
         self.on_pin = None
+        self.thermal = []                # scripted thermal reads (int, None or an exception); empty reads 0
+        self.thermal_timeouts = []
 
     def _code(self):
         return self.current[1] if self.current else None
@@ -97,6 +101,14 @@ class FakeDevice:
 
     def wait_120hz(self):
         self.calls.append("wait120")
+
+    def thermal_status(self, timeout):
+        self.thermal_timeouts.append(timeout)
+        self.calls.append("thermal")
+        value = self.thermal.pop(0) if self.thermal else 0
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
     def install(self, apk):
         package = dp.TARGET_PACKAGE if apk.name.startswith("app-") else dp.TEST_PACKAGE
@@ -194,6 +206,25 @@ class FakeDevice:
         return True
 
 
+class FakeClock:
+    """monotonic/sleep for the thermal wait: a read may cost time (``read_cost(timeout)``) when the device calls ``read``."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+        self.reads = []
+        self.sleep_error = None
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        if self.sleep_error is not None:
+            raise self.sleep_error
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 class RunnerHarness:
     """Runs runner.run with the real ledger, assembler and gate, a FakeDevice, a fake build output and no global lock."""
 
@@ -208,6 +239,7 @@ class RunnerHarness:
         self.ledger_lines_at_pin = None
         self.device.on_pin = lambda: setattr(self, "ledger_lines_at_pin", self.lines())
         self.clock = 0
+        self.fake_clock = FakeClock()  # the thermal wait never sleeps for real in a whole run
 
     def lines(self):
         path = self.root / ledger.LEDGER_NAME
@@ -252,6 +284,8 @@ class RunnerHarness:
                 unittest.mock.patch.object(runner, "prepare_artifacts", self.fake_prepare), \
                 unittest.mock.patch.object(runner, "run_attempt", attempt), \
                 unittest.mock.patch.object(runner, "_utc_now", self.tick), \
+                unittest.mock.patch.object(runner, "_monotonic", self.fake_clock.monotonic), \
+                unittest.mock.patch.object(runner, "_sleep", self.fake_clock.sleep), \
                 unittest.mock.patch("sys.stdout", out):
             try:
                 code = runner.run(self.root, self.root.name, device=self.device, source_state=lambda: dict(self.source))
@@ -681,6 +715,251 @@ class S5RunnerTest(unittest.TestCase):
             code, summary = h.run()
         self.assertEqual(2, code)
         self.assertIn("disk full", summary["error"])
+
+
+class ThermalWaitTest(unittest.TestCase):
+    """S5-4 slice 8a: the wait before each attempt (budget, read timeout, records) on a fake device and clock."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.clock = FakeClock()
+        self.device = FakeDevice({})
+        self.cost = 0.0
+        original = self.device.thermal_status
+
+        def read(timeout):
+            self.clock.reads.append((self.clock.now, timeout))
+            value = original(timeout)
+            self.clock.now += min(self.cost, timeout)
+            return value
+
+        self.device.thermal_status = read
+        self.session = types.SimpleNamespace(root=self.root, run_id="s5-run-1", device=self.device)
+        for name, value in (("_monotonic", self.clock.monotonic), ("_sleep", self.clock.sleep),
+                            ("_utc_now", lambda: "2026-10-15T00:00:00+00:00")):
+            patcher = unittest.mock.patch.object(runner, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def wait(self):
+        return runner.wait_for_thermal_none(self.session, "tab-entry", 2)
+
+    def records(self):
+        return [json.loads(line) for line in (self.root / runner.THERMAL_WAITS_NAME).read_text().splitlines()]
+
+    def test_a_cool_device_is_read_once_and_the_attempt_follows_at_once(self):
+        record = self.wait()
+        self.assertEqual(("zero", 1, [0], 0, []), (record["outcome"], record["polls"], record["statuses"], record["final"], self.clock.sleeps))
+        self.assertEqual([10], self.device.thermal_timeouts)
+        self.assertEqual([record], self.records())
+        self.assertEqual("s5-run-1-tab-entry-a2", record["attemptId"])
+
+    def test_a_warm_device_is_polled_every_ten_seconds_until_none(self):
+        self.device.thermal = [2, 2, 1, 0]
+        record = self.wait()
+        self.assertEqual(("zero", 4, [2, 1, 0], 0), (record["outcome"], record["polls"], record["statuses"], record["final"]))
+        self.assertEqual([10, 10, 10], self.clock.sleeps)
+
+    def test_the_budget_ends_the_wait_without_deciding_the_attempt(self):
+        self.device.thermal = [1] * 500
+        record = self.wait()
+        self.assertEqual(("limit", 90, [1], 1), (record["outcome"], record["polls"], record["statuses"], record["final"]))
+        self.assertEqual(900.0, self.clock.now)
+        self.assertTrue(all(started < 900 for started, _ in self.clock.reads), "no read starts at or after the deadline")
+
+    def test_reads_count_against_the_budget_and_never_pass_the_deadline(self):
+        self.device.thermal = [1] * 500
+        self.cost = 3.0  # reads start at 0, 13, ..., 897 s: the last one has 3 s left
+        record = self.wait()
+        self.assertEqual("limit", record["outcome"])
+        self.assertLessEqual(self.clock.now, 900.0)
+        for started, timeout in self.clock.reads:
+            self.assertLess(started, 900)
+            self.assertEqual(min(10, 900 - started), timeout, "each read gets min(10 s, the budget left)")
+        self.assertTrue(any(timeout < 10 for _, timeout in self.clock.reads), "the last read is cut to the budget left")
+        for sleep in self.clock.sleeps:
+            self.assertGreater(sleep, 0)
+            self.assertLessEqual(sleep, 10)
+        self.assertEqual(len(self.clock.reads), record["polls"])
+
+    def test_a_sleep_is_cut_to_the_budget_left(self):
+        self.device.thermal = [1] * 500
+        self.cost = 7.0  # reads at 0, 17, ..., 884 s: after the last one 9 s are left
+        record = self.wait()
+        self.assertEqual("limit", record["outcome"])
+        self.assertEqual(900.0, self.clock.now, "the wait ends exactly at the deadline")
+        self.assertEqual(9.0, self.clock.sleeps[-1])
+        self.assertTrue(all(started < 900 for started, _ in self.clock.reads))
+
+    def test_an_unreadable_status_is_recorded_and_the_attempt_follows(self):
+        self.device.thermal = [3, None]
+        record = self.wait()
+        self.assertEqual(("unreadable", 2, [3], None), (record["outcome"], record["polls"], record["statuses"], record["final"]))
+        self.assertEqual([10], self.clock.sleeps)
+
+    def test_the_device_read_times_out_or_fails_as_unreadable(self):
+        class Adb:
+            def __init__(self, result=None, error=None):
+                self.result, self.error, self.calls = result, error, []
+
+            def run(self, *arguments, check=True, timeout=None):
+                self.calls.append((arguments, check, timeout))
+                if self.error:
+                    raise self.error
+                return self.result
+
+        ops = runner.DeviceOps()
+        cases = [
+            (Adb(error=dp.PreflightError("adb command timed out (shell dumpsys thermalservice)")), None),
+            (Adb(subprocess.CompletedProcess([], 1, "Thermal Status: 0", "")), None),
+            (Adb(subprocess.CompletedProcess([], 0, "no status here", "")), None),
+            (Adb(subprocess.CompletedProcess([], 0, "IsStatusOverride: false\nThermal Status: 2\n", "")), 2),
+            (Adb(subprocess.CompletedProcess([], 0, "thermal status: 0", "")), 0),
+        ]
+        for adb, expected in cases:
+            ops.adb = adb
+            with self.subTest(expected=expected, adb=adb.result):
+                self.assertEqual(expected, ops.thermal_status(3.5))
+                self.assertEqual([(("shell", "dumpsys", "thermalservice"), False, 3.5)], adb.calls)
+
+    def test_a_record_that_cannot_be_written_is_an_evidence_defect(self):
+        self.session.root = self.root / "missing"
+        with self.assertRaises(runner.EvidenceIOError):
+            self.wait()
+
+    def test_an_interruption_while_waiting_reaches_the_caller(self):
+        self.device.thermal = [1, 1]
+        self.clock.sleep_error = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.wait()
+        self.assertFalse((self.root / runner.THERMAL_WAITS_NAME).exists())
+
+    def test_the_status_pattern_is_the_one_device_preflight_checks(self):
+        source = Path(dp.__file__).read_text(encoding="utf-8")
+        self.assertEqual(1, source.count('re.search(r"Thermal Status:\\s*(\\d+)", thermal_dump, re.IGNORECASE)'))
+        self.assertEqual(r"Thermal Status:\s*(\d+)", runner.THERMAL_STATUS_RE.pattern)
+        self.assertTrue(runner.THERMAL_STATUS_RE.flags & re.IGNORECASE)
+
+        identity = {"model": dp.EXPECTED_MODEL, "fingerprint": dp.EXPECTED_FINGERPRINT, "api": int(dp.EXPECTED_API)}
+        with unittest.mock.patch.multiple(
+                dp,
+                read_identity=unittest.mock.Mock(return_value=identity),
+                parse_device_state_name=unittest.mock.Mock(return_value="OPENED"),
+                parse_wm_size=unittest.mock.Mock(return_value=(dp.EXPECTED_SIZE, None)),
+                parse_active_internal_viewport=unittest.mock.Mock(return_value=(0, dp.EXPECTED_SIZE)),
+                collect_active_refresh_rates=unittest.mock.Mock(return_value={"surfaceFlingerHz": 120.0}),
+                setting_get=unittest.mock.Mock(return_value="0"),
+                parse_battery=unittest.mock.Mock(return_value={"level": 80, "powered": {"USB": False}})):
+            samples = [
+                ("Thermal Status: 0", 0),
+                ("thermal status: 0", 0),
+                ("IsStatusOverride: false\nThermal Status: 2\n", 2),
+                ("Thermal Status: 01", 1),
+                ("no status here", None),
+                ("Thermal Status: 00", None),
+                ("Thermal Status: \u0660", None),
+            ]
+            for thermal_dump, expected in samples:
+                with self.subTest(thermal_dump=thermal_dump):
+                    adb = unittest.mock.Mock()
+                    adb.run.return_value = subprocess.CompletedProcess([], 0, thermal_dump, "")
+                    adb.shell.side_effect = lambda *args, **kwargs: (
+                        thermal_dump if args == ("dumpsys", "thermalservice") else "fps=120.0")
+                    ops = runner.DeviceOps()
+                    ops.adb = adb
+                    status = ops.thermal_status(10)
+                    self.assertEqual(expected, status)
+                    try:
+                        dp.collect_immutable_preflight(adb)
+                    except dp.PreflightError as error:
+                        self.assertEqual("thermal status must be NONE(0)", str(error))
+                        preflight_accepts = False
+                    else:
+                        preflight_accepts = True
+                    self.assertEqual(preflight_accepts, status == 0)
+
+
+class ThermalWaitRunTest(unittest.TestCase):
+    """The wait inside whole runs (RunnerHarness): before every attempt, recorded, never deciding, failures as before."""
+
+    assertClean = S5RunnerTest.assertClean
+    assertAborted = S5RunnerTest.assertAborted
+
+    def run_with_clock(self, h):
+        return h.run()  # RunnerHarness always runs the wait on its own FakeClock (h.fake_clock)
+
+    def waits(self, h):
+        return [json.loads(line) for line in (h.root / runner.THERMAL_WAITS_NAME).read_text().splitlines()]
+
+    def test_every_attempt_follows_its_own_wait(self):
+        h = RunnerHarness(self, ALL_VALID)
+        code, summary = self.run_with_clock(h)
+        self.assertEqual((0, "pass"), (code, summary["verdict"]))
+        starts = [entry for entry in h.entries() if entry["type"] == "attempt-start"]
+        waits = self.waits(h)
+        self.assertEqual([start["attemptId"] for start in starts], [wait["attemptId"] for wait in waits])
+        self.assertEqual(["zero"] * 9, [wait["outcome"] for wait in waits])
+        order = ["thermal" if call == "thermal" else "instrument" for call in h.device.calls
+                 if call == "thermal" or call.startswith("instrument")]
+        self.assertEqual(["thermal", "instrument"] * 9, order, "each attempt is preceded by its own wait")
+        self.assertLess(h.device.calls.index("wait120"), h.device.calls.index("thermal"))
+
+    def test_a_wait_at_its_limit_leaves_the_attempt_to_its_own_checks(self):
+        h = RunnerHarness(self, ALL_VALID)
+        h.device.thermal = [1] * 90
+        code, summary = self.run_with_clock(h)
+        self.assertEqual((0, "pass"), (code, summary["verdict"]), "the fake device's snapshot passes, so the attempt is valid")
+        self.assertEqual(["limit"] + ["zero"] * 8, [wait["outcome"] for wait in self.waits(h)])
+        self.assertEqual(9, len(h.attempts()))
+
+    def test_a_wait_at_its_limit_then_a_warm_snapshot_makes_the_attempt_environment_invalid(self):
+        h = RunnerHarness(self, ALL_VALID)
+        h.device.thermal = [1] * 90
+        contract = h.device.contract
+        warm = {"left": 1}
+
+        def snapshot(*, require_active_120hz):
+            if h.device.current is not None and warm["left"]:
+                warm["left"] -= 1
+                raise dp.PreflightError("thermal status must be NONE(0)")
+            return contract(require_active_120hz=require_active_120hz)
+
+        h.device.contract = snapshot
+        code, summary = self.run_with_clock(h)
+        self.assertEqual((0, "pass"), (code, summary["verdict"]))
+        first = h.attempts("tab-entry")[0][1]
+        self.assertEqual(("invalid", "environment-invalid"), (first["outcome"], first["reason"]))
+        self.assertEqual("limit", self.waits(h)[0]["outcome"])
+        self.assertEqual(10, len(h.attempts()), "the invalid attempt counts against the journey's budget as before")
+
+    def test_an_unreadable_wait_then_a_cool_snapshot_is_classified_as_before(self):
+        h = RunnerHarness(self, ALL_VALID)
+        h.device.thermal = [None]
+        code, summary = self.run_with_clock(h)
+        self.assertEqual((0, "pass"), (code, summary["verdict"]))
+        self.assertEqual("unreadable", self.waits(h)[0]["outcome"])
+        self.assertEqual("valid", h.attempts("tab-entry")[0][1]["outcome"])
+
+    def test_a_wait_record_that_cannot_be_written_ends_the_run_with_exit_two(self):
+        h = RunnerHarness(self, ALL_VALID)
+
+        def broken(path, text):
+            raise runner.EvidenceIOError(f"cannot write evidence {path.name} (OSError)")
+
+        with unittest.mock.patch.object(runner, "_append_line", broken):
+            code, summary = self.run_with_clock(h)
+        self.assertEqual(2, code)
+        self.assertNotEqual("end", ledger.read_ledger(h.root)[-1]["type"], "after an evidence defect nothing more is added")
+        self.assertClean(h)
+
+    def test_an_interruption_while_waiting_aborts_after_cleanup(self):
+        h = RunnerHarness(self, ALL_VALID)
+        h.device.thermal = [1]
+        h.fake_clock.sleep_error = KeyboardInterrupt()
+        code, summary = self.run_with_clock(h)
+        self.assertAborted(h, code, summary, "interrupted during attempts")
 
 
 class PrepareArtifactsTest(unittest.TestCase):

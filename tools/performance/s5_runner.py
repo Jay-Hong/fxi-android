@@ -9,7 +9,7 @@ read-back helpers by import and never changes that module.
 Order (s6c_plan.r2.md §2): lock -> stale settings recovery (a recovery ends the run before any measurement) -> clean source ->
 evidence root -> packages absent -> read-only device contract -> committed snapshot, Firebase build copy, s5Benchmark build,
 staged APKs, the five canonical inputs (s5_artifacts) -> session line -> settings pinned, read back, 120 Hz -> attempts by
-s5_ledger.next_step -> cleanup and settings restore read back -> end line -> assemble. Before the session line a failure exits 2
+s5_ledger.next_step, each after a thermal NONE(0) wait recorded in thermal-waits.jsonl (S5-4 slice 8a) -> cleanup and settings restore read back -> end line -> assemble. Before the session line a failure exits 2
 with no ledger; after it, an interruption, a cleanup or restore failure or an unclassifiable state ends the run as aborted.
 """
 from __future__ import annotations
@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,15 @@ UNINSTALL_TIMEOUT_SECONDS = 180
 EXPECTED_SETTINGS = {f"{namespace}/{key}": value for namespace, key, value in dp.SETTING_KEYS}
 METHODS = {journey: method for journey, (_, method) in gate.EXPECTED_BENCHMARK_IDENTITIES.items()}
 PACKAGES = (dp.TARGET_PACKAGE, dp.TEST_PACKAGE)
+THERMAL_WAITS_NAME = "thermal-waits.jsonl"
+THERMAL_WAIT_LIMIT_SECONDS = 900
+THERMAL_POLL_SECONDS = 10
+THERMAL_READ_TIMEOUT_SECONDS = 10
+# The pattern device_preflight's contract check applies (test_s5_runner locks the two together). device_preflight is the S0-f
+# bound runner, so it is not changed to share it.
+THERMAL_STATUS_RE = re.compile(r"Thermal Status:\s*(\d+)", re.IGNORECASE)
+_monotonic = time.monotonic
+_sleep = time.sleep
 NOT_INVOKED, INVOKED, UNKNOWN = "not-invoked", "invoked", "unknown"
 
 
@@ -222,6 +232,20 @@ class DeviceOps:
     def wait_120hz(self) -> None:
         dp.wait_for_active_120hz(self.adb)
 
+    def thermal_status(self, timeout: float) -> Optional[int]:
+        """The thermal status dumpsys reports, or None when it cannot be read within ``timeout`` seconds."""
+        try:
+            result = self.adb.run("shell", "dumpsys", "thermalservice", check=False, timeout=timeout)
+        except dp.PreflightError:
+            return None
+        match = THERMAL_STATUS_RE.search(result.stdout) if result.returncode == 0 else None
+        if match is None:
+            return None
+        raw_status = match.group(1)
+        status = int(raw_status)
+        # device_preflight accepts NONE only when the captured text is exactly "0".
+        return None if status == 0 and raw_status != "0" else status
+
     def install(self, apk: Path) -> None:
         dp.install_apk(self.adb, apk)
 
@@ -302,6 +326,21 @@ def write_json_new(path: Path, value: Any) -> None:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _append_line(path: Path, text: str) -> None:
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            data = text.encode("utf-8")
+            written = 0
+            while written < len(data):
+                written += os.write(descriptor, data[written:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise EvidenceIOError(f"cannot write evidence {path.name} ({type(error).__name__})") from error
 
 
 # --------------------------------------------------------------------------------------------------------------------------
@@ -400,6 +439,42 @@ def cleanup_attempt(session: Session, attempt_id: str) -> Optional[str]:
         except Exception as error:  # noqa: BLE001 - recorded as a cleanup failure
             errors.append(_safe("removing the device output", error, session.device.serial))
     return "; ".join(errors) or None
+
+
+def wait_for_thermal_none(session: Session, journey: str, ordinal: int) -> dict[str, Any]:
+    """Before an attempt (S5 DoD: thermal NONE(0) between runs), poll until the status reads 0 within a budget of
+    THERMAL_WAIT_LIMIT_SECONDS that counts the reads and the sleeps: each read gets min(THERMAL_READ_TIMEOUT_SECONDS, the budget
+    left), no read starts after the deadline and no sleep passes it. The wait never decides the attempt: on the limit or an
+    unreadable status it records that and the attempt's own preflight snapshot classifies as before. The record is appended
+    to thermal-waits.jsonl beside the ledger; a write failure is an evidence defect."""
+    attempt_id = f"{session.run_id}-{journey}-a{ordinal}"
+    started_at = _utc_now()
+    deadline = _monotonic() + THERMAL_WAIT_LIMIT_SECONDS
+    statuses: list[int] = []
+    polls, final, outcome = 0, None, "limit"
+    while True:
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            break
+        polls += 1
+        status = session.device.thermal_status(min(THERMAL_READ_TIMEOUT_SECONDS, remaining))
+        if status is None:
+            final, outcome = None, "unreadable"
+            break
+        if not statuses or statuses[-1] != status:
+            statuses.append(status)
+        final = status
+        if status == 0:
+            outcome = "zero"
+            break
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            break
+        _sleep(min(THERMAL_POLL_SECONDS, remaining))
+    record = {"journey": journey, "ordinal": ordinal, "attemptId": attempt_id, "startedAt": started_at, "endedAt": _utc_now(),
+              "polls": polls, "statuses": statuses, "final": final, "outcome": outcome}
+    _append_line(session.root / THERMAL_WAITS_NAME, json.dumps(record, sort_keys=True) + "\n")
+    return record
 
 
 def run_attempt(session: Session, journey: str, ordinal: int) -> Outcome:
@@ -630,6 +705,7 @@ def run(root: Path, run_id: str, *, device: Optional[DeviceOps] = None, run_proc
             if step.status is not None:
                 candidate = step.status
                 break
+            wait_for_thermal_none(session, step.journey, step.ordinal)
             outcome = run_attempt(session, step.journey, step.ordinal)
             if outcome.kind == "aborted":
                 aborted = outcome.reason

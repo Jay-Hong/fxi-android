@@ -259,6 +259,14 @@ cleanup or settings-restore failure, or an interruption ends the run as `aborted
 diagnostic. The end line is written after cleanup and the restore read-back, then the ledger is
 assembled. Before the session line a failure exits 2 with no ledger.
 
+Before each attempt the runner waits for thermal status NONE(0) (S5 DoD: thermal NONE(0) between runs). It polls
+`dumpsys thermalservice` every 10 s within a 900 s budget that counts the reads and the sleeps; each read times out at
+min(10 s, the budget left), and no read starts or sleep runs past the deadline. Each wait is appended to
+`thermal-waits.jsonl` beside the ledger (journey, ordinal, attempt id, start and end time, polls, observed statuses, final
+status, outcome `zero`, `limit` or `unreadable`); the ledger schema does not change. The wait never classifies the attempt:
+after the limit or an unreadable status the attempt runs and its own preflight snapshot decides as before. The status pattern
+is the one `device_preflight` checks, kept in the runner because `device_preflight` is the S0-f bound runner.
+
 ```bash
 python3 tools/performance/s5_runner.py run --run-id s5-<sha7>-r1 \
   --evidence-root build/s5/s5-<sha7>-r1
