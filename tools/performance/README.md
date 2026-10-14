@@ -72,6 +72,19 @@ python3 tools/performance/benchmark_gate.py validate-manifest evidence.json \
   --artifact-root evidence/
 ```
 
+`s5_ledger.py` defines the append-only attempt ledger the S5 runner keeps in the evidence
+root (`ledger.jsonl`: one session line with the seven artifacts, an `attempt-start` before
+each attempt touches the device and its `attempt-end`, one `end` line; each line carries the
+SHA-256 of the line before it). It assembles a finished ledger into this manifest, or a
+behavior-failed one into the terminal failure report, checks the document with this judge and
+publishes it without overwriting anything. `attempts-exhausted` and `aborted` runs get no
+document. The chain catches an edited, dropped or reordered line, not a deliberate rewrite
+of the whole file.
+
+```bash
+python3 tools/performance/s5_ledger.py assemble --root evidence/
+```
+
 Artifact hashes must refer to a single file. For a directory or a set of R8 inputs, first
 create a canonical manifest consisting of sorted relative paths and each file's SHA-256,
 then hash that manifest. A raw directory hash is not a reproducible identity.
