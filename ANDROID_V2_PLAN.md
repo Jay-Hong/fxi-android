@@ -44,7 +44,8 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 S5-4 준비 commit 4개(`67f6fb6`~`fcbb6e8`: fixture·판정기·selector bridge·여정 소스)가
                                 land했다(2026-10-13). S5-4 E(측정 도구·s5Benchmark fixture runtime·runner,
                                 `7a05035`~`225d1b0`)와 cutover acceptance 하네스 대기 조건(`8b7de72`)이 이어
-                                land했다(2026-10-14). S5-4의 새 펌웨어 S0-f 봉인과 실기기 측정·golden(slice 7·8),
+                                land했다(2026-10-14). 새 펌웨어 S0-f는 `launcher-smoke-a074f3c-r1`(source `a074f3c`)로
+                                다시 봉인했다(2026-10-15, slice 7). S5-4의 실기기 측정·golden(slice 8)과
                                 DoD 대조 마감 판정은 남아 있으며, S5 완료 선언은 아니다(S5 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
@@ -983,7 +984,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
     emulator가 아니라, 현재 Mac에 연결한 API 34+ **고정 실기기의 로컬 manual device-only lane**에서 실행한다.
     이를 위해 별도 macOS CI/self-hosted runner를 요구하지 않는다
   - v2 기준 실기기는 **Samsung SM-F711N**으로 고정한다. 기준 fingerprint는 2026-10-13 OTA 관측으로 개정한
-    `samsung/b2qksx/b2q:15/AP3A.240905.015.A2/F711NKSSFKZH5:user/release-keys`이며 serial은 기록하지 않는다. S0-f·S0-g 봉인 당시 계약(`…/F711NKSSEKZE1:user/release-keys`)의 evidence는 과거 계약의 기록으로 보존하고 새 계약의 측정 기준으로 쓰지 않으며, 현재 검사기로 재검증하지 않는다(재검증은 봉인 commit의 검사기로 한다). 새 펌웨어 S0-f는 E·runner 확정 뒤 다시 봉인한다(slice 7).
+    `samsung/b2qksx/b2q:15/AP3A.240905.015.A2/F711NKSSFKZH5:user/release-keys`이며 serial은 기록하지 않는다. S0-f·S0-g 봉인 당시 계약(`…/F711NKSSEKZE1:user/release-keys`)의 evidence는 과거 계약의 기록으로 보존하고 새 계약의 측정 기준으로 쓰지 않으며, 현재 검사기로 재검증하지 않는다(재검증은 봉인 commit의 검사기로 한다). 새 펌웨어 S0-f는 2026-10-15 `evidence/android-v2/s0-f/launcher-smoke/launcher-smoke-a074f3c-r1/`(source `a074f3c`)로 다시 봉인했다(slice 7). S0-g는 과거 계약의 기록으로 유지한다.
     preflight는 device state `OPENED`, inner display 1080×2640 portrait, min/peak 120Hz, animation scale 3종 1.0,
     low-power OFF, 충전 전원 OFF, battery ≥30%, Android thermal status `NONE(0)`를 assert한다. 설정 변경은 원값을
     캡처한 뒤 `finally`에서 복원하고, fingerprint·display/posture 조건이 다르면 측정하지 않는다
@@ -1587,9 +1588,11 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   `b71e967` 6a attempt ledger와 manifest·실패 보고서 조립기, `1f386c6` 6b 정본 입력 산출기, `225d1b0` 6c 기기 runner
   (가짜 기기 시험뿐, 실기기 실행 전). S5 밖 `8b7de72`는 cutover acceptance 다섯 곳(B06a·RT01-A03·RT03b-Q05d·RT01-H01a·RT01-A04 두
   변형)이 관측을 끝까지 기다리게 한 하네스 대기 조건 수정이다(단언·예산 불변).
-  · 남은 것: S5-4 slice 7 — 새 펌웨어 S0-f 봉인, slice 8 — S5 rehearsal·정식 측정·golden(고정 SM-F711N, 사용자 손:
-  USB 분리·무선 adb·OPENED·잠금 해제 유지, 기존 `com.jay.fxi` 설치 제거). 위 결과를 이 절의 DoD에 대조한 S5 마감
-  판정.
+  · S5-4 slice 7(2026-10-15): 새 펌웨어 S0-f를 고정 SM-F711N에서 clean source `a074f3c`로 봉인했다
+  (`launcher-smoke-a074f3c-r1`, 도구·검사기 pass, 설정·임시 패키지 복원). 무선 adb·USB 분리 상태였고, 기존
+  `com.jay.fxi` 설치는 사용자 선택으로 제거했다.
+  · 남은 것: S5-4 slice 8 — S5 rehearsal·정식 측정·golden(고정 SM-F711N, 사용자 손: USB 분리·무선 adb·OPENED·
+  잠금 해제 유지). 위 결과를 이 절의 DoD에 대조한 S5 마감 판정.
 
 ### S6 — KRX positive lifecycle
 - `krx_visible` flip → `krx:usd-krw-futures` desired/REST bootstrap 시작·중단, 표시 표면 노출. KRX bootstrap만

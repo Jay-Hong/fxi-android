@@ -1,0 +1,201 @@
+{
+  "activeRefreshAfterSmoke": {
+    "displayManagerHz": 120.00001,
+    "observedAt": "2026-10-14T15:35:40.137742+00:00",
+    "surfaceFlingerHz": 120.0
+  },
+  "activeRefreshBeforeSmoke": {
+    "displayManagerHz": 120.00001,
+    "observedAt": "2026-10-14T15:34:56.442422+00:00",
+    "surfaceFlingerHz": 120.0
+  },
+  "artifacts": {
+    "benchmarkFirebaseInput": {
+      "path": "app/src/benchmark/google-services.json",
+      "sha256": "fad52dabbe0466b9d120c17aa71a305eb79066dc89bed7103b9cdb7fde32554f",
+      "size": 800
+    },
+    "canonicalFirebaseFixture": {
+      "path": "ci/google-services.ci-fixture.json",
+      "sha256": "fad52dabbe0466b9d120c17aa71a305eb79066dc89bed7103b9cdb7fde32554f",
+      "size": 800
+    },
+    "devicePreflight": {
+      "path": "tools/performance/device_preflight.py",
+      "sha256": "704dc0c3171f84b0ab9f2c505da79593b2c774fcf085ea957b759670d19fcfea",
+      "size": 60924
+    },
+    "macrobenchmarkTestApk": {
+      "path": "macrobenchmark/build/outputs/apk/benchmark/macrobenchmark-benchmark.apk",
+      "sha256": "62e96d1d829c8ea1f5d8dde99d4ed16b8ae4c0df47fe0ca83ed671f26c621bd9",
+      "size": 46280166
+    },
+    "targetBenchmarkApk": {
+      "path": "app/build/outputs/apk/benchmark/app-benchmark.apk",
+      "sha256": "6e8419c4fd1032efcada9e7bf8e8d159124dc5631f946ab922f136ee1df4d1de",
+      "size": 4821871
+    }
+  },
+  "artifactsAfterSmoke": {
+    "benchmarkFirebaseInput": {
+      "path": "app/src/benchmark/google-services.json",
+      "sha256": "fad52dabbe0466b9d120c17aa71a305eb79066dc89bed7103b9cdb7fde32554f",
+      "size": 800
+    },
+    "macrobenchmarkTestApk": {
+      "path": "macrobenchmark/build/outputs/apk/benchmark/macrobenchmark-benchmark.apk",
+      "sha256": "62e96d1d829c8ea1f5d8dde99d4ed16b8ae4c0df47fe0ca83ed671f26c621bd9",
+      "size": 46280166
+    },
+    "targetBenchmarkApk": {
+      "path": "app/build/outputs/apk/benchmark/app-benchmark.apk",
+      "sha256": "6e8419c4fd1032efcada9e7bf8e8d159124dc5631f946ab922f136ee1df4d1de",
+      "size": 4821871
+    }
+  },
+  "artifactsBeforeSmoke": {
+    "benchmarkFirebaseInput": {
+      "path": "app/src/benchmark/google-services.json",
+      "sha256": "fad52dabbe0466b9d120c17aa71a305eb79066dc89bed7103b9cdb7fde32554f",
+      "size": 800
+    },
+    "macrobenchmarkTestApk": {
+      "path": "macrobenchmark/build/outputs/apk/benchmark/macrobenchmark-benchmark.apk",
+      "sha256": "62e96d1d829c8ea1f5d8dde99d4ed16b8ae4c0df47fe0ca83ed671f26c621bd9",
+      "size": 46280166
+    },
+    "targetBenchmarkApk": {
+      "path": "app/build/outputs/apk/benchmark/app-benchmark.apk",
+      "sha256": "6e8419c4fd1032efcada9e7bf8e8d159124dc5631f946ab922f136ee1df4d1de",
+      "size": 4821871
+    }
+  },
+  "artifactsStableAcrossSmoke": true,
+  "benchmarkBuildReturnCode": 0,
+  "deviceInstalledArtifacts": {
+    "macrobenchmarkTestApk": {
+      "matchesStagedArtifact": true,
+      "sha256": "62e96d1d829c8ea1f5d8dde99d4ed16b8ae4c0df47fe0ca83ed671f26c621bd9",
+      "size": 46280166
+    },
+    "targetBenchmarkApk": {
+      "matchesStagedArtifact": true,
+      "sha256": "6e8419c4fd1032efcada9e7bf8e8d159124dc5631f946ab922f136ee1df4d1de",
+      "size": 4821871
+    }
+  },
+  "deviceOutputRemoved": true,
+  "evidenceDirectory": "launcher-smoke-a074f3c-r1",
+  "evidenceFiles": {
+    "launcher-result.xml": {
+      "sha256": "5bed33201636b8df5d21f079b8c7e55d4535861005e8480f9c41830ad168b048",
+      "size": 278
+    },
+    "postflight.json": {
+      "sha256": "76b0559233def0abce6a82367255e1292e0b850585058d3115453ef2c420eb0e",
+      "size": 863
+    },
+    "preflight.json": {
+      "sha256": "eaa51e6690d4183698ba360c302d90c4308f2b8a5f352654d9ca2eb83d96b28b",
+      "size": 862
+    }
+  },
+  "exitCode": 0,
+  "finishedAt": "2026-10-14T15:35:52.809298+00:00",
+  "launcherResult": {
+    "class": "com.jay.fxi.macrobenchmark.LauncherSmokeBenchmark",
+    "errors": 0,
+    "failures": 0,
+    "method": "launcherSmoke",
+    "result": {
+      "path": "launcher-result.xml",
+      "sha256": "5bed33201636b8df5d21f079b8c7e55d4535861005e8480f9c41830ad168b048",
+      "size": 278,
+      "sourceSha256": "663c09e3f9e9900498a2858781f1b269a9117c24e6d764572d9074d40905d60a"
+    },
+    "skipped": 0,
+    "task": "adb-am-instrument",
+    "tests": 1
+  },
+  "launcherSmokeAttempted": true,
+  "launcherSmokeReturnCode": 0,
+  "postflight": {
+    "activeRefreshRateHz": 120.0,
+    "api": 35,
+    "batteryLevel": 100,
+    "fingerprint": "samsung/b2qksx/b2q:15/AP3A.240905.015.A2/F711NKSSFKZH5:user/release-keys",
+    "lowPower": false,
+    "model": "SM-F711N",
+    "orientation": 0,
+    "overrideSize": null,
+    "physicalSize": "1080x2640",
+    "posture": "OPENED",
+    "powered": {
+      "ac powered": false,
+      "dock powered": false,
+      "usb powered": false,
+      "wireless powered": false
+    },
+    "supports120Hz": true,
+    "thermalStatus": 0
+  },
+  "preflight": {
+    "activeRefreshRateHz": 120.0,
+    "api": 35,
+    "batteryLevel": 100,
+    "fingerprint": "samsung/b2qksx/b2q:15/AP3A.240905.015.A2/F711NKSSFKZH5:user/release-keys",
+    "lowPower": false,
+    "model": "SM-F711N",
+    "orientation": 0,
+    "overrideSize": null,
+    "physicalSize": "1080x2640",
+    "posture": "OPENED",
+    "powered": {
+      "ac powered": false,
+      "dock powered": false,
+      "usb powered": false,
+      "wireless powered": false
+    },
+    "supports120Hz": true,
+    "thermalStatus": 0
+  },
+  "runId": "launcher-smoke-a074f3c-r1",
+  "schemaVersion": 1,
+  "serialRecorded": false,
+  "settingsAfter": {
+    "global/animator_duration_scale": "1.0",
+    "global/transition_animation_scale": "1.0",
+    "global/window_animation_scale": "1.0",
+    "system/min_refresh_rate": "null",
+    "system/peak_refresh_rate": "null"
+  },
+  "settingsBefore": {
+    "global/animator_duration_scale": "1.0",
+    "global/transition_animation_scale": "1.0",
+    "global/window_animation_scale": "1.0",
+    "system/min_refresh_rate": "null",
+    "system/peak_refresh_rate": "null"
+  },
+  "settingsDuring": {
+    "global/animator_duration_scale": "1.0",
+    "global/transition_animation_scale": "1.0",
+    "global/window_animation_scale": "1.0",
+    "system/min_refresh_rate": "120.0",
+    "system/peak_refresh_rate": "120.0"
+  },
+  "settingsRestored": true,
+  "sourceAtEnd": {
+    "commit": "a074f3c22a9fad2a6bfcdc0e1a83bc3a8b8221df",
+    "worktreeClean": true
+  },
+  "sourceAtStart": {
+    "commit": "a074f3c22a9fad2a6bfcdc0e1a83bc3a8b8221df",
+    "worktreeClean": true
+  },
+  "startedAt": "2026-10-14T15:31:49.529424+00:00",
+  "temporaryFirebaseFixtureRemoved": true,
+  "temporaryPackagesRemoved": true,
+  "temporarySourceSnapshotRemoved": true,
+  "temporaryStagingRemoved": true,
+  "verdict": "pass"
+}

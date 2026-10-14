@@ -182,9 +182,13 @@ commit. Raw UTP/instrumentation output must not be promoted because it can conta
 serial, device paths, and local absolute paths.
 
 The current sealed S0-f launcher baseline is
-`evidence/android-v2/s0-f/launcher-smoke/launcher-smoke-b477c22-r1/`, produced from
-source commit `b477c22b597a1e5f5101e62cdd2b6a2cb8296c99`. The earlier
-`launcher-smoke-8c18667-r2` bundle remains historical evidence for the initial runner.
+`evidence/android-v2/s0-f/launcher-smoke/launcher-smoke-a074f3c-r1/`, produced on the device
+contract revised in S5-4 slice 1b (`…/F711NKSSFKZH5:user/release-keys`) from source commit
+`a074f3c22a9fad2a6bfcdc0e1a83bc3a8b8221df` (2026-10-15). The earlier
+`launcher-smoke-b477c22-r1` and `launcher-smoke-8c18667-r2` bundles remain historical evidence
+of the previous firmware contract (`…/F711NKSSEKZE1:user/release-keys`). They are not
+revalidated with the current validator, whose device contract is the revised one; revalidate
+them with the validator of their sealing commit.
 The validator requires that recorded commit to exist, requires clean and identical source
 state at both ends, and re-hashes the bound runner/Firebase blobs from that commit. It
 deliberately does not require the recorded source commit to equal the current `HEAD`,
