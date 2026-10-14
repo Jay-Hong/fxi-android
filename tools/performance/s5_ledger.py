@@ -91,15 +91,19 @@ class LedgerWriter:
     def create(cls, root: Path, *, source_commit: str, artifacts: Mapping[str, Any]) -> "LedgerWriter":
         path = root / LEDGER_NAME
         writer = cls(path, os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600))
-        writer.append(
-            "session",
-            schemaVersion=SCHEMA_VERSION,
-            gate="S5",
-            sourceCommit=source_commit,
-            libraries=dict(gate.EXPECTED_LIBRARIES),
-            measurementContract=dict(gate.EXPECTED_MEASUREMENT_CONTRACT),
-            artifacts=dict(artifacts),
-        )
+        try:
+            writer.append(
+                "session",
+                schemaVersion=SCHEMA_VERSION,
+                gate="S5",
+                sourceCommit=source_commit,
+                libraries=dict(gate.EXPECTED_LIBRARIES),
+                measurementContract=dict(gate.EXPECTED_MEASUREMENT_CONTRACT),
+                artifacts=dict(artifacts),
+            )
+        except BaseException:
+            writer.close()
+            raise
         return writer
 
     def append(self, entry_type: str, **fields: Any) -> dict[str, Any]:

@@ -552,6 +552,21 @@ class S5LedgerTest(unittest.TestCase):
         self.assertFalse((self.root / "elsewhere.json").exists())
         self.assertEqual([], [p.name for p in self.root.iterdir() if p.name.endswith(".tmp")])
 
+    def test_a_session_line_that_cannot_be_written_closes_the_descriptor(self):
+        real_close = os.close
+        closed = []
+
+        def close(descriptor):
+            closed.append(descriptor)
+            return real_close(descriptor)
+
+        with unittest.mock.patch.object(ledger.os, "fsync", side_effect=OSError("disk full")), \
+                unittest.mock.patch.object(ledger.os, "close", close):
+            with self.assertRaises(OSError):
+                ledger.LedgerWriter.create(self.root, source_commit="a" * 40, artifacts=self.bench.artifacts())
+        self.assertEqual(1, len(closed))
+        self.assertTrue((self.root / ledger.LEDGER_NAME).exists(), "the partial ledger is kept, not deleted")
+
     def test_the_writer_refuses_an_existing_ledger_and_appends_whole_lines(self):
         writer = self.bench.run({}, end=False)
         with self.assertRaises(FileExistsError):

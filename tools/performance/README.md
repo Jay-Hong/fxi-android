@@ -228,3 +228,31 @@ SHA-256, ProfileInstaller 1.4.1 and a self-instrumenting test APK. For the publi
 of the fixture: no fixture source root or file (listed from the `sourceSets` report, symlinks
 followed), no MockWebServer dependency, no fixture asset, and no fixture class in the R8
 mapping or the DEX. `ciMinified` is public-like evidence only; the public AAB is proven in S11.
+
+## S5 runner
+
+`s5_runner.py run` measures the three `TetherGraphBenchmark` journeys on the frozen SM-F711N
+into a new evidence root whose name is the run id (at most 40 characters). It never runs on an
+emulator and has no option to relax the device contract. It reuses `device_preflight.py` by
+import (lock, restore journal, device checks, install, read-back) and changes nothing in it.
+
+It takes the lock and recovers stale settings first; a recovery ends the run without
+measuring. A clean source, the absent packages and the read-only device contract follow, then
+the committed snapshot is built once (`s5Benchmark`, the CI Firebase fixture copied in, a private
+Gradle home on the real caches), both APKs are staged read-only and `s5_artifacts.py collect`
+writes the other five artifacts. Only then is the ledger's session line written, and only after
+it are settings pinned. Each attempt (by `s5_ledger.next_step`) installs both APKs, reads them
+back, takes a preflight snapshot, runs the one journey with `am instrument` and the
+`s5.runId`/`additionalTestOutputDir` arguments, takes a postflight snapshot, collects the
+AndroidX result, its five traces and the behavior record, reads the APKs back again and removes
+what it installed. A valid behavior failure is terminal; a confirmed environment failure before
+the instrumentation, or after it with a successful behavior record, is `environment-invalid`;
+an object the strict parser refuses is `result-malformed`; anything it cannot classify, a
+cleanup or settings-restore failure, or an interruption ends the run as `aborted` with a
+diagnostic. The end line is written after cleanup and the restore read-back, then the ledger is
+assembled. Before the session line a failure exits 2 with no ledger.
+
+```bash
+python3 tools/performance/s5_runner.py run --run-id s5-<sha7>-r1 \
+  --evidence-root build/s5/s5-<sha7>-r1
+```
