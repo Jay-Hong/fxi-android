@@ -317,6 +317,25 @@ class RawMacrobenchmarkResultTest(unittest.TestCase):
             with self.subTest(document=document), self.assertRaises(InvalidEvidence):
                 extract_macrobenchmark_run(document)
 
+    def test_compilation_mode_is_the_test_apk_state_and_is_not_judged(self):
+        # AndroidX records the self-instrumenting test APK's own ART state here, not the measured app's Partial result.
+        for value in ("run-from-apk", "speed-profile", None):
+            document = macro_result()
+            if value is None:
+                del document["context"]["compilationMode"]
+            else:
+                document["context"]["compilationMode"] = value
+            with self.subTest(value=value):
+                extract_macrobenchmark_run(document)
+
+    def test_warmup_iterations_carry_the_partial_compilation(self):
+        # Macrobenchmark writes warmupIterations only for CompilationMode.Partial (otherwise 0).
+        for value in (0, 2, 4):
+            document = macro_result()
+            document["benchmarks"][0]["warmupIterations"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(InvalidEvidence, "warmupIterations must be 3"):
+                extract_macrobenchmark_run(document)
+
     def test_nonfinite_and_duplicate_json_are_invalid(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "bad.json"

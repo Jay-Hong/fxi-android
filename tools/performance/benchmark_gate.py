@@ -33,7 +33,6 @@ EXPECTED_BENCHMARK_IDENTITIES = {
     "period-switch": ("com.jay.fxi.macrobenchmark.TetherGraphBenchmark", "periodSwitch"),
     "scroll": ("com.jay.fxi.macrobenchmark.TetherGraphBenchmark", "scroll"),
 }
-EXPECTED_RAW_COMPILATION_MODE = "speed-profile"
 REQUIRED_FIXTURE_CASE_IDS = {
     "s5-exact-boundary-pass",
     "s5-p95-epsilon-fail",
@@ -290,8 +289,6 @@ def extract_macrobenchmark_run(
         raise InvalidEvidence("Macrobenchmark context fingerprint differs from D31")
     if version.get("sdk") != EXPECTED_MEASUREMENT_CONTRACT["api"]:
         raise InvalidEvidence("Macrobenchmark context SDK differs from D31")
-    if context.get("compilationMode") != EXPECTED_RAW_COMPILATION_MODE:
-        raise InvalidEvidence("Macrobenchmark compilationMode differs from measurement contract")
     if benchmark.get("repeatIterations") != EXPECTED_ITERATIONS:
         raise InvalidEvidence(f"repeatIterations must be {EXPECTED_ITERATIONS}")
     if benchmark.get("warmupIterations") != EXPECTED_WARMUPS:

@@ -30,9 +30,12 @@ AndroidX's separate `className` and method `name` fields plus three runs, each
 journey selector looked up exactly once, the expected start and end screen state, the action
 completed, and for scroll the observed move and return). Result/behavior/preflight/postflight/trace
 artifacts may not be reused across runs or journeys, so one lucky invocation cannot masquerade as
-three independent runs. Raw `context.build` must match the frozen model/fingerprint/API,
-and `context.compilationMode` must be AndroidX's resolved `speed-profile` value for the
-planned Partial compilation. Each journey also carries a 3-to-5-entry attempt ledger;
+three independent runs. Raw `context.build` must match the frozen model/fingerprint/API.
+Raw `context.compilationMode` is not judged: AndroidX writes there the ART state of the
+instrumentation's target context, which for this self-instrumenting module is the test APK
+itself (observed `run-from-apk` on the device), not the measured app. The planned Partial
+compilation is carried by `warmupIterations`, which Macrobenchmark writes only for
+`CompilationMode.Partial` (3 here, otherwise 0). Each journey also carries a 3-to-5-entry attempt ledger;
 ordinals are consecutive, attempt IDs are globally unique, exactly three `valid` attempt
 run IDs must equal the three evaluated runs, and the third valid attempt ends the ledger.
 Invalid attempts are limited to machine-checked `environment-invalid` run evidence or a
