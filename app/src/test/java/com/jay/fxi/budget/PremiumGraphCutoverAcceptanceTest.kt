@@ -1313,7 +1313,10 @@ class PremiumGraphCutoverAcceptanceTest {
         val ended = java.util.concurrent.CountDownLatch(1)
         rig.readSeed = {
             entered.countDown()
-            try { release.await(15, java.util.concurrent.TimeUnit.SECONDS) } finally { ended.countDown() }
+            try {
+                // A hold that runs out is not a released read: it must not hand over the seed as if the caller let it go.
+                check(release.await(15, java.util.concurrent.TimeUnit.SECONDS)) { "B06a: the held seed read was never released" }
+            } finally { ended.countDown() }
             SEED
         }
         rig.row {
@@ -1322,6 +1325,17 @@ class PremiumGraphCutoverAcceptanceTest {
                 awaitTrue("the seed read is held", deadline) { entered.count == 0L }
                 val assemblyJob = checkNotNull(rig.assemblyJob)
                 assertNull("no host before the start", rig.onMain { rig.owner.graphHost.value })
+                // The topic side does not wait for the seed. Let its initial bootstrap finish (each 401's replay included) and
+                // every send reach the server and end, so the cancellation cannot fall between the recorder and the server.
+                rig.awaitTopics(deadline)
+                awaitTrue("the initial topic bootstraps completed", deadline) {
+                    synchronized(rig.bootstrapOutcomes) { rig.bootstrapOutcomes.map { it.first }.toSet() } == DESIRED
+                }
+                awaitTrue("every send so far reached the server and ended", deadline) {
+                    val all = sends.all()
+                    all.all { it.end != null && (it.zone != "api" || it.bodyEnd != null) } &&
+                        synchronized(received) { received.toList() }.sorted() == all.map { it.key }.sorted()
+                }
                 rig.ownerJob.cancel()
             } finally {
                 release.countDown()
@@ -1770,6 +1784,8 @@ class PremiumGraphCutoverAcceptanceTest {
             }
             val sampled: List<Any?>
             val consumed: List<Any?>
+            val catalogsBeforeF3: Int
+            val tabsBeforeF3: Int
             try {
                 awaitTrue("the new approval's answer is held", deadline) { entitlementsHeld.get() >= 1 }
                 awaitTrue("the end alone was delivered", deadline) { rig.bridge() == null }
@@ -1787,6 +1803,8 @@ class PremiumGraphCutoverAcceptanceTest {
                 sampled = sampler.stop()
                 sourceCollector.cancelAndJoin()
                 consumed = synchronized(sources) { sources.toList() }
+                catalogsBeforeF3 = catalogs().size
+                tabsBeforeF3 = tabs().size
             } finally {
                 entitlementsGate?.countDown()
                 entitlementsGate = null
@@ -1797,7 +1815,8 @@ class PremiumGraphCutoverAcceptanceTest {
             val f3 = checkNotNull(rig.coordinator.topicGrantResult().fence)
             awaitTrue("the third grant's context settled", deadline) {
                 rig.bridge() == f3 && rig.assembly.coordinator.state.value.source?.fence == f3 && rig.usdApplied() &&
-                    tabs().all { it.bodyEnd != null } && sends.all().filter { it.zone == "api" }.all { it.bodyEnd != null }
+                    tabs().all { it.bodyEnd != null } && sends.all().filter { it.zone == "api" }.all { it.bodyEnd != null } &&
+                    catalogs().size > catalogsBeforeF3 && tabs().size > tabsBeforeF3
             }
             quiet("RT01-A03 settle", 2_000)
             assertTrue("auxiliary: every sampled publication was a delivered grant or nothing: $sampled",
@@ -2539,6 +2558,10 @@ class PremiumGraphCutoverAcceptanceTest {
                 }
                 val lifetime2 = checkNotNull(rig.uses.acquire(f2))
                 assertNotEquals("$label: a new lifetime", lifetime1, lifetime2)
+                // The collector records only after the state already reads f2: stop it once it has recorded f2 (within the deadline).
+                awaitTrue("$label: the source collector recorded the new grant's source", deadline) {
+                    f2 in synchronized(sourcesSinceHold) { sourcesSinceHold.toList() }
+                }
                 sourceCollector.cancelAndJoin()
                 val published = synchronized(sourcesSinceHold) { sourcesSinceHold.toList() }
                 assertTrue("$label: the consumer published the new grant's source: $published", f2 in published)
@@ -4637,11 +4660,13 @@ class PremiumGraphCutoverAcceptanceTest {
                 val first = checkNotNull(rig.coordinator.topicGrantResult().fence)
                 @Suppress("UNCHECKED_CAST")
                 val display = rig.onMain { privateField(rig.owner.consumer, "display") } as StateFlow<TopicDisplayState>
+                // What the watcher has recorded, published only after the list holds it.
+                val watched = java.util.concurrent.atomic.AtomicReference<Any?>(first.grant)
                 grantWatch = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
                     var seen = first.grant
                     while (true) {
                         val now = rig.coordinator.accessSnapshot.facts.token
-                        if (now != null && now != seen) { seen = now; grantChanges += nowMillis() }
+                        if (now != null && now != seen) { seen = now; grantChanges += nowMillis(); watched.set(now) }
                         delay(5)
                     }
                 }
@@ -4656,6 +4681,8 @@ class PremiumGraphCutoverAcceptanceTest {
                 assertEquals("$label: the same identity", first.identity, last.identity)
                 assertEquals("$label: the same user epoch", first.userAccessEpoch, last.userAccessEpoch)
                 awaitTrue("$label: the graph consumed the last re-approved grant", deadline) { rig.assembly.coordinator.state.value.source?.fence == last }
+                // The watcher polls every 5 ms: copy its list only once it has recorded the last grant (earlier misses stay missed).
+                awaitTrue("$label: the grant watcher recorded the last grant", deadline) { watched.get() == last.grant }
                 val attemptAtEnd = rig.onRuntime { privateField(session, "reconnectAttempt") as Int }
                 val changes = synchronized(grantChanges) { grantChanges.toList() }
                 println("CUT-C01 $label: reconnect attempts $attemptAtClose -> $attemptAtEnd, refusals ${refusals.get()}, grant changes $changes, " +
@@ -6051,6 +6078,8 @@ class PremiumGraphCutoverAcceptanceTest {
         rig.row {
             val (route, holder) = rig.coldStartRoute(deadline)
             awaitTrue("$label: the usd tab applied", deadline) { rig.usdApplied() && tabs().all { it.bodyEnd != null } }
+            // A tab entry and its finished body do not make the selection ready; wait for READY within the deadline.
+            awaitTrue("$label: the usd holder is ready", deadline) { rig.onMain { holder.currentState().content } == GraphV2Content.READY }
             assertEquals("$label: premise: the restore was tried and failed", listOf("enter", "throw"), synchronized(rig.tabs.log) { rig.tabs.log.toList() })
             val identity = checkNotNull(rig.provider.currentIdentityFence())
             assertEquals("$label: the focus falls back to usd", com.jay.fxi.data.remote.OwnedTopicFocus(identity, FreeTab.USD), rig.focusNow())
