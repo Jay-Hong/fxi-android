@@ -28,8 +28,13 @@ internal object GraphV2ScreenPresenter {
         }
         if (renderedIds.isEmpty()) return GraphV2Content.NO_SELECTION
 
-        val plot = project(GraphV2ChartModel(prepared, renderedIds))
-        return if (plot == null || plot.isEmpty) GraphV2Content.NO_DATA else GraphV2Content.READY
+        // The full projection's emptiness, decided without building one: this runs several times
+        // per tab entry and period switch, and only the chart itself needs the axes and ticks.
+        return if (GraphProjection.hasDrawableLine(prepared, renderedIds)) {
+            GraphV2Content.READY
+        } else {
+            GraphV2Content.NO_DATA
+        }
     }
 
     fun project(

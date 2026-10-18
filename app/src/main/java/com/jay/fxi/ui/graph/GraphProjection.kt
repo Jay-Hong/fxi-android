@@ -142,7 +142,7 @@ object GraphProjection {
             ?.let { TimeFrame(it.start, it.endInclusive) }
             ?: rendered
 
-        val visible = prepared.order.mapNotNull { prepared.bySeries[it] }.filter { it.seriesId in visibleIds }
+        val visible = visibleSeries(prepared, visibleIds)
         val rates = visible.filter { it.axisGroup != INDEX_AXIS }
         val indices = visible.filter { it.axisGroup == INDEX_AXIS }
 
@@ -219,6 +219,39 @@ object GraphProjection {
             valueTicks = rateRange?.let { GraphAxis.valueTicks(it.start, it.endInclusive) }.orEmpty(),
             indexTicks = ownIndexRange?.let { GraphAxis.indexLabels(it.start, it.endInclusive) }.orEmpty()
         )
+    }
+
+    /**
+     * The series a chart showing [visibleIds] draws: the answer's wire order, each matched by its
+     * own id.
+     *
+     * The order is the one lines are painted and read out in, so it is never the order of the ids.
+     * [plot] draws exactly this list and [hasDrawableLine] decides over it, so the two cannot
+     * disagree about what is on.
+     */
+    fun visibleSeries(prepared: PreparedGraph, visibleIds: Set<String>): List<PreparedSeries> =
+        prepared.order.mapNotNull { prepared.bySeries[it] }.filter { it.seriesId in visibleIds }
+
+    /**
+     * Whether the chart would draw anything, without building the projection — no axes, ticks,
+     * folding or bands. It answers
+     * `plot(prepared, visibleIds, null, rightEdgeNow)?.isEmpty == false`.
+     *
+     * The same by construction. [plot] is null exactly when the frame does not resolve; its lines
+     * are [visibleSeries] one-to-one, each carrying [GraphFrame.lineWithTrailing]'s points; and
+     * folding an index onto the rate scale moves points without dropping any, so every line keeps
+     * its point count. The zoom window is not an input — it narrows what is displayed, never
+     * which points a line has.
+     */
+    fun hasDrawableLine(
+        prepared: PreparedGraph,
+        visibleIds: Set<String>,
+        rightEdgeNow: Instant? = null
+    ): Boolean {
+        val data = GraphFrame.resolve(prepared, rightEdgeNow) ?: return false
+        return visibleSeries(prepared, visibleIds).any {
+            GraphFrame.lineWithTrailing(it, prepared.period, data).isNotEmpty()
+        }
     }
 
     private fun foldOntoRates(
