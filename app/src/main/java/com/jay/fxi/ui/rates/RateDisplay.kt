@@ -33,10 +33,19 @@ object RateDisplay {
         return formatter().parse(format(value))?.toDouble() ?: value
     }
 
-    /** `NumberFormat` is not thread-safe, so callers get their own — the same reason the domain model does. */
-    private fun formatter(): NumberFormat = NumberFormat.getNumberInstance(Locale.KOREA).apply {
-        isGroupingUsed = false
-        minimumFractionDigits = FRACTION_DIGITS
-        maximumFractionDigits = FRACTION_DIGITS
+    /**
+     * This thread's formatter, built on its first use and reused after.
+     *
+     * `NumberFormat` is not thread-safe, so each thread keeps its own rather than sharing one.
+     * Callers on one thread share one instance; never hand it to another thread.
+     */
+    internal fun formatter(): NumberFormat = perThread.get()!! // the initializer never yields null
+
+    private val perThread: ThreadLocal<NumberFormat> = ThreadLocal.withInitial {
+        NumberFormat.getNumberInstance(Locale.KOREA).apply {
+            isGroupingUsed = false
+            minimumFractionDigits = FRACTION_DIGITS
+            maximumFractionDigits = FRACTION_DIGITS
+        }
     }
 }
