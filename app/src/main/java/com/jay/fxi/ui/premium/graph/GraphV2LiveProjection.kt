@@ -30,6 +30,20 @@ internal fun projectGraphV2Live(
     scope: GraphDataScope,
     live: Map<GraphObservationSeriesKey, GraphRecoverableState>,
     now: Instant
+): PreparedGraph = projectGraphV2Live(graph, { prepared }, period, scope, live, now)
+
+/**
+ * As above with the REST build read lazily: 1d builds only the merged graph through [prepare] and never reads [rest];
+ * other periods read [rest] as the base.
+ */
+internal fun projectGraphV2Live(
+    graph: FreeGraph,
+    rest: () -> PreparedGraph,
+    period: GraphPeriod,
+    scope: GraphDataScope,
+    live: Map<GraphObservationSeriesKey, GraphRecoverableState>,
+    now: Instant,
+    prepare: (FreeGraph, GraphPeriod) -> PreparedGraph = GraphPreparedBuilder::build
 ): PreparedGraph {
     val current = graphObservationBucketStart(now)
     val unreplacedBySeries = mutableMapOf<String, Map<Instant, GraphComposedBucket.Unreplaced>>()
@@ -56,7 +70,7 @@ internal fun projectGraphV2Live(
             series.copy(points = series.points + additions)
         })
     } else graph
-    val base = if (period == GraphPeriod.ONE_DAY) GraphPreparedBuilder.build(merged, period) else prepared
+    val base = if (period == GraphPeriod.ONE_DAY) prepare(merged, period) else rest()
     val mergedBySeries = merged.series.associateBy { it.seriesId }
 
     return base.copy(bySeries = base.bySeries.mapValues { (id, original) ->

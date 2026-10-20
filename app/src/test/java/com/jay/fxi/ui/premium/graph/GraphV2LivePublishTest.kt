@@ -156,7 +156,8 @@ import org.junit.rules.TemporaryFolder
  *
  * Semantics:
  *  - A publication reads `clock.now()` exactly once and stores, for the current preparation key, projectGraphV2Live(exposed
- *    graph, the REST build the holder keeps for that same key, period, GraphDataScope(uid, user access epoch) of the current
+ *    graph, the REST build for that same key, computed only when read and then kept for that key (a 1d projection reads
+ *    none; S5 A3 C1, design.r3 D2), period, GraphDataScope(uid, user access epoch) of the current
  *    context, live.value, now), and emits the resulting state itself. While that key is current the chart is that result
  *    with rightEdgeNow = now; otherwise the chart is the REST build with rightEdgeNow null, as in C1. No other path reads
  *    the clock.

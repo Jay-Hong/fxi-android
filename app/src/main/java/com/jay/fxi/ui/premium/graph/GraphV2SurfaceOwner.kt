@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -24,7 +25,10 @@ import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LifecycleStartEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.jay.fxi.ui.components.PeriodTabBar
 import com.jay.fxi.ui.graph.GraphChart
 import com.jay.fxi.ui.graph.GraphZoomState
@@ -51,12 +55,30 @@ internal fun GraphV2SurfaceOwner(
     // Tokens change on context/period transitions and fullscreen reopening, but not selection
     // or data refresh. Keep the zoom alive while a status replaces the chart on the same surface.
     key(token) {
-        var inViewport by remember { mutableStateOf(false) }
-        val shown = hostExposed && inViewport
+        // Null until the first onGloballyPositioned measures the surface.
+        var inViewport by remember { mutableStateOf<Boolean?>(null) }
+        val shown = hostExposed && inViewport == true
         if (token != null) {
-            LifecycleStartEffect(token, shown) {
-                report(token, shown)
-                onStopOrDispose { report(token, false) }
+            // Ends the token with false on stop or disposal even before the first measurement; it never reports a start.
+            val lifecycleOwner = LocalLifecycleOwner.current
+            DisposableEffect(token, lifecycleOwner) {
+                val observer = LifecycleEventObserver { _, event ->
+                    if (event == Lifecycle.Event.ON_STOP) report(token, false)
+                }
+                lifecycleOwner.lifecycle.addObserver(observer)
+                onDispose {
+                    lifecycleOwner.lifecycle.removeObserver(observer)
+                    report(token, false)
+                }
+            }
+            // An exposed surface omits its start reports until it is measured (the observer above still ends it with false),
+            // so the holder keeps what it already knows; a surface that is not host-exposed reports false on lifecycle start
+            // even before measurement.
+            if (!hostExposed || inViewport != null) {
+                LifecycleStartEffect(token, shown) {
+                    report(token, shown)
+                    onStopOrDispose { report(token, false) }
+                }
             }
         }
         var zoom by rememberSaveable(stateSaver = GraphZoomStateSaver) {

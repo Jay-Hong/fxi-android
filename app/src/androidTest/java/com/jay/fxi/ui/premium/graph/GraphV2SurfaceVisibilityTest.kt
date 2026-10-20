@@ -76,12 +76,16 @@ import org.junit.Test
  * foreground, and an inline surface actually exposed or the fullscreen - not mount or tab selection alone, and not an inline
  * surface under the rate overlay; reported in status states too) and c2b2_design_codex.r1 section 2, rows N03-N10 reduced:
  *  - a drawn surface with a token installs, inside key(token) and outside the chart/status branches, one
- *    LifecycleStartEffect(token, shown) with `shown = hostExposed ∧ inViewport`; the effect reports (token, shown) on start
- *    and (token, false) on stop or dispose, so lifecycle >= STARTED is the effect's own part. inViewport comes from one
+ *    LifecycleStartEffect(token, shown) with `shown = hostExposed ∧ inViewport` (S5 A3 C1: composed only while the surface is
+ *    not host-exposed or has been measured; a separate observer keyed by token and lifecycle owner reports (token, false) on
+ *    ON_STOP and disposal from composition onward); the effect reports (token, shown) on start and (token, false) on stop or
+ *    dispose, so lifecycle >= STARTED is the effect's own part. inViewport comes from one
  *    onGloballyPositioned on the surface root - the whole section, status or chart - and is boundsInWindow() with positive
- *    width and height; it is false before the first measurement, and a zero area (out of view, or touching the viewport's
- *    edge) is false. A null token installs nothing; a token change or a surface that stops drawing ends the old report with
- *    false under the old token. Duplicate falses are allowed; a missing false for a token that left is not. The callback is
+ *    width and height; before the first measurement an exposed surface omits only its initial start report; stop or
+ *    disposal still reports false under that token. A surface that is not host-exposed reports false on lifecycle start
+ *    even before measurement (S5 A3 C1, design.r3 D1). A zero area (out of view, or touching the viewport's edge) is
+ *    false. A null token installs nothing; a token change or a surface that stops drawing ends the old report with false
+ *    under the old token. Duplicate falses are allowed; a missing false for a token that left is not. The callback is
  *    the newest one passed; the actions object is not an effect key.
  *  - GraphV2UiActions gains a last `setSurfaceVisible: (GraphV2UiToken, Boolean) -> Unit` defaulting to nothing; GraphV2Section
  *    and GraphV2Fullscreen gain a last `hostExposed: Boolean = true`. PremiumTopicScreen passes the inline surface

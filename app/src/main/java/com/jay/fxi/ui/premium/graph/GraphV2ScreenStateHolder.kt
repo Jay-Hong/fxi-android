@@ -125,7 +125,8 @@ internal class GraphV2ScreenStateHolder(
     dispatcher: CoroutineDispatcher,
     private val live: StateFlow<Map<GraphObservationSeriesKey, GraphRecoverableState>> = MutableStateFlow(emptyMap()),
     private val clock: AppClock = SystemAppClock,
-    private val recorder: GraphRecorder? = null
+    private val recorder: GraphRecorder? = null,
+    private val prepare: (FreeGraph, GraphPeriod) -> PreparedGraph = GraphPreparedBuilder::build
 ) {
     init {
         require(tab in setOf("usd", "jpy", "eur", "tether")) { "Premium graph tab required" }
@@ -389,7 +390,7 @@ internal class GraphV2ScreenStateHolder(
         currentState(publish = true)
     }
 
-    private fun publishLive(current: Context, key: GraphV2PreparationKey, rest: PreparedGraph) {
+    private fun publishLive(current: Context, key: GraphV2PreparationKey, rest: () -> PreparedGraph) {
         cancelLivePublication()
         val now = clock.now()
         val scope = GraphDataScope(current.binding.identity.uid, checkNotNull(current.fence.userAccessEpoch))
@@ -399,7 +400,7 @@ internal class GraphV2ScreenStateHolder(
             live.value
         }
         livePublication = LivePublication(
-            projectGraphV2Live(key.graph, rest, key.period, scope, source, now), now
+            projectGraphV2Live(key.graph, rest, key.period, scope, source, now, prepare), now
         )
     }
 
@@ -741,12 +742,18 @@ internal class GraphV2ScreenStateHolder(
             val next = GraphV2PreparationKey(screenGeneration, tab, activePeriod, exposure.graph)
             val changed = preparationKey != next
             if (changed) {
-                prepared = GraphPreparedBuilder.build(next.graph, next.period)
+                prepared = null
                 preparationKey = next
             }
-            if (surfaceVisible() && (changed || publish)) publishLive(current, next, checkNotNull(prepared))
+            // The REST build is computed only when read, then kept for this key; a 1d projection reads none.
+            val rest = { prepared ?: prepare(next.graph, next.period).also { prepared = it } }
+            if (surfaceVisible() && (changed || publish)) {
+                // Outside 1d the REST build is the projection's base: finish it before the clock and evidence reads.
+                if (next.period != GraphPeriod.ONE_DAY) rest()
+                publishLive(current, next, rest)
+            }
             val published = livePublication
-            val built = published?.prepared ?: checkNotNull(prepared)
+            val built = published?.prepared ?: rest()
             GraphV2ChartModel(built,
                 GraphSeriesSelectionPolicy.renderedIds(confirmed, built.bySeries.keys, exposure.krxVisible), published?.now)
         } else {
