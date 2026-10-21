@@ -48,6 +48,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 다시 봉인했다(2026-10-15, slice 7). slice 8 정식 측정 `s5-23bbe3f-r1`은 세 여정 모두
                                 합격선 미달(verdict fail)로 끝나 S5는 미완료다. 성능 개선 범위와 측정 계약은
                                 사용자 결정 대기다(S5 '진행' 항목).
+                                S6은 S6-1(`f7232fc`: KRX 관측 어댑터·프리미엄 KRX 행 projection)과 S6-2a(`5a7a0f1`: topic
+                                bootstrap 재시도·분류 순수 정책)를 land했다(JVM 계약, 운영 호출자 0). P1(a) 미충족이라 KRX
+                                구독·FORCE_ENTITLEMENTS 호출자·S6-2b 이후는 보류다(S6 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1692,6 +1695,21 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   KRX 관측 인계 연결과 합성 입력 T01·T02·T03·T04~T16·T21·T22(KRX 부분)·T23(KRX 부분),
   저가 대칭 T03-L·T05-L·T06-L·T07-L·T08-L·T10-L·T16-L 통과. T12/T23은 KRX 취소를 포함한다(동결 후 7번) /
   승인 없으면 inventory의 구현 완료 표면에서 선택지·빈자리·placeholder·semantics도 없음 / 재승인 시 raw preference와 서버 row 복원
+- **진행(2026-10-21, 근거 `R4c/S6/`)**
+  · 범위·계약: S6-0 범위 문서(r6)와 P1(a) 제안서를 Codex와 합의했다. P1(a) 제안서 합의는 P1(a) 통과가 아니다.
+  S6-0b 계약은 트리 밖 manifest(r1~r3)로 잠그고, 슬라이스마다 구현 전에 다음 판을 더한다.
+  · S6-1 `f7232fc` KRX 관측 어댑터: timestamp·rate_changed_at 두 시각을 원래 값으로 내고 5초 상한, tether 1d ∪ usd 1d
+  catalog 승인, 시계 입력 없음. 프리미엄 KRX 행 projection: 판정된 gate만 입력으로 받고, roster 적용 전에 krx를 맨 앞에 넣고, 저장된 KRX 위치가 있으면 그 순서를 따른다. 테더 탭은
+  tetherReceived가 있어야 하고 gate 기준 hana 기본 숨김은 rescue하지 않는다. D17 정책 시험과 운영 호출자 0 scan도 함께다.
+  T01·T02·T03/T03-L·T04와 T06/T06-L·T07/T07-L·T10/T10-L의 KRX 순수 부분, 공통 경계 입력 중 S6-1 몫, KRX 시각 의미 fixture K01~K27(K23 다는
+  S6-2b·S6-5 몫).
+  · S6-2a `5a7a0f1` topic bootstrap 재시도·분류 순수 정책: 총 3회, 0.5·1.5초 ±20%, 시도별 10초 예산 참조, 404 세 종류
+  분리, 401·403 종료, 408·429·5xx·temporarily_unavailable·네트워크·토큰 실패 재시도, snapshot 선도착 조기 종료,
+  Retry-After 하한. 운영 호출자 0.
+  · 보류: KRX 구독·FORCE_ENTITLEMENTS 호출자·S6-2b 이후는 P1(a) 통과 전까지 넣지 않는다. 그 전에 KRX 축 반복 고리
+  상한 설계(critical)가 필요하고, P1(a) 제안서 5절 D1(정상 서버 계약 한정 해석 = 결정 A 연장 여부)을 사용자에게 먼저
+  묻는다. S6C3의 'KRX 총 3회·비-KRX 1회' 선택은 S6-2b 필수 계약으로 넘겼다. S6 완료 판정은 P3-i 실제 purge 증거 뒤에만
+  한다.
 
 ### S7 — 은행 알림 (repeat · history · `rate_alert`)
 - `repeat_interval_sec` 허용값 `{60,300,600,1800,3600,7200,14400,21600,43200,86400}` + null,
