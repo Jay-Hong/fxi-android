@@ -1718,8 +1718,9 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   · 보류: KRX 구독·FORCE_ENTITLEMENTS 호출자·허가 소비·스위치 켬은 S6-2b-1(예약 표지·허가 판정·REST 예약)과
   S6-2b-2(세션 허가 소비·송신 경로·스위치 켬) 몫이다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
   A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
-  답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)이며 남은 조건은 다음 D4 판의 A2 r8·A1 r9 반영, 2b-2 계약의
-  CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. S6C3의 'KRX 총 3회·비-KRX 1회' 선택은 S6-2b 필수 계약으로 넘겼다. S6 완료
+  답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)다. 다음 D4 판 조건은 D4 r6(A2 r8·A1 r9 반영, 트리 밖
+  manifest r7)으로 채웠고, 남은 조건은 2b-2 계약의 CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. S6-2b 계약 잠금 전에는
+  scope U10(CUT-C01 근거 행 전제 변경 보고·재검토)을 처리한다. S6C3의 'KRX 총 3회·비-KRX 1회' 선택은 S6-2b 필수 계약으로 넘겼다. S6 완료
   판정은 P3-i 실제 purge 증거 뒤에만 한다.
 
 ### S7 — 은행 알림 (repeat · history · `rate_alert`)
