@@ -49,8 +49,10 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 합격선 미달(verdict fail)로 끝나 S5는 미완료다. 성능 개선 범위와 측정 계약은
                                 사용자 결정 대기다(S5 '진행' 항목).
                                 S6은 S6-1(`f7232fc`: KRX 관측 어댑터·프리미엄 KRX 행 projection)과 S6-2a(`5a7a0f1`: topic
-                                bootstrap 재시도·분류 순수 정책)를 land했다(JVM 계약, 운영 호출자 0). P1(a) 미충족이라 KRX
-                                구독·FORCE_ENTITLEMENTS 호출자·S6-2b 이후는 보류다(S6 '진행' 항목).
+                                bootstrap 재시도·분류 순수 정책)를 land했다(JVM 계약, 운영 호출자 0). 이어 S6-2b0a(`e0eef8e`: KRX
+                                경합 상한 순수 정책, 운영 호출자 0, 2026-10-22)와 S6-2b0b(`f102623`: 그 상한의 PAC 배선, 스위치 기본
+                                꺼짐, 2026-10-23)를 land했다. KRX 구독·FORCE_ENTITLEMENTS 호출자·스위치 켬은 S6-2b-1·S6-2b-2 몫이다
+                                (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1706,10 +1708,19 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   · S6-2a `5a7a0f1` topic bootstrap 재시도·분류 순수 정책: 총 3회, 0.5·1.5초 ±20%, 시도별 10초 예산 참조, 404 세 종류
   분리, 401·403 종료, 408·429·5xx·temporarily_unavailable·네트워크·토큰 실패 재시도, snapshot 선도착 조기 종료,
   Retry-After 하한. 운영 호출자 0.
-  · 보류: KRX 구독·FORCE_ENTITLEMENTS 호출자·S6-2b 이후는 P1(a) 통과 전까지 넣지 않는다. 그 전에 KRX 축 반복 고리
-  상한 설계(critical)가 필요하고, P1(a) 제안서 5절 D1(정상 서버 계약 한정 해석 = 결정 A 연장 여부)을 사용자에게 먼저
-  묻는다. S6C3의 'KRX 총 3회·비-KRX 1회' 선택은 S6-2b 필수 계약으로 넘겼다. S6 완료 판정은 P3-i 실제 purge 증거 뒤에만
-  한다.
+  · S6-2b0a `e0eef8e` KRX 경합 상한 순수 정책(KrxContestPolicy): phase NONE·AWAITING·HOLD·OPEN, OPEN 전이마다 permitSeq
+  증가, barrier 이하 응답은 STALE_ANSWER, n = 2..6 hold 5·10·20·40·60초(그 뒤 60초), 마지막 단계 뒤 QUIET 600초가 지나면 n을 0부터 다시 센다. 운영 호출자 0.
+  · S6-2b0b `f102623` 그 상한의 PAC 배선(계약 설계 r9·시험 r6, 트리 밖 manifest r6): KrxContestSwitch 기본 OFF,
+  운영 생성 지점 무변경. 스위치 켬(시험 전용)에서 키(binding·identity·userAccessEpoch·decisionGeneration)·사건 연결·
+  hold 타이머·S1·QH 후속·같은 키 Stale 해제 FE, `KRX_CONTESTED`·`krxPermitSeq`, R13‴ 재승인(G1~G8,
+  KrxReapprovalEvidence)을 둔다. 꺼짐 경로는 HEAD에서 뽑은 기록 상수 8개 시나리오로 대조한다. 사전 변이 76개 중
+  KILLED 71, 보류 1(C_guard_024: 단일 스레드 harness로 강제할 수 없는 타이머 발화 경합).
+  · 보류: KRX 구독·FORCE_ENTITLEMENTS 호출자·허가 소비·스위치 켬은 S6-2b-1(예약 표지·허가 판정·REST 예약)과
+  S6-2b-2(세션 허가 소비·송신 경로·스위치 켬) 몫이다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
+  A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
+  답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)이며 남은 조건은 다음 D4 판의 A2 r8·A1 r9 반영, 2b-2 계약의
+  CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. S6C3의 'KRX 총 3회·비-KRX 1회' 선택은 S6-2b 필수 계약으로 넘겼다. S6 완료
+  판정은 P3-i 실제 purge 증거 뒤에만 한다.
 
 ### S7 — 은행 알림 (repeat · history · `rate_alert`)
 - `repeat_interval_sec` 허용값 `{60,300,600,1800,3600,7200,14400,21600,43200,86400}` + null,
