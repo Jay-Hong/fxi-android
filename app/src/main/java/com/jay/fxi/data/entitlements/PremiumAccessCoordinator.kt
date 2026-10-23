@@ -33,6 +33,23 @@ private const val DEFAULT_PERSISTENCE_RETRY_DELAY_MILLIS = 2_000L
 /** The longest a loss recovery round waits before trying the disk again. */
 private const val LOSS_RECOVERY_MAX_DELAY_MILLIS = 300_000L
 
+data class KrxContestSwitch(val enabled: Boolean) {
+    companion object { val OFF = KrxContestSwitch(false) }
+}
+
+internal data class KrxContestKey(
+    val binding: Long,
+    val identity: EntitlementsIdentity?,
+    val userAccessEpoch: String?,
+    val decisionGeneration: Long
+)
+
+internal data class KrxContestView(
+    val state: KrxContestState,
+    val key: KrxContestKey?,
+    val reapproval: KrxReapprovalEvidence
+)
+
 /**
  * Owns the D23 access state and serialises every input that can change it.
  *
@@ -77,9 +94,29 @@ class PremiumAccessCoordinator(
      * Test barrier at the start of the arming an unreadable-identity refusal's demand is protected by (L-4e E4a R1′), inside
      * that protection and under [mutex]. Production leaves it empty.
      */
-    private val beforeRejectionRecheckArmed: suspend () -> Unit = {}
+    private val beforeRejectionRecheckArmed: suspend () -> Unit = {},
+    private val krxContest: KrxContestSwitch = KrxContestSwitch.OFF
 ) {
     private val mutex = Mutex()
+
+    /** Contest state exists only with the dormant switch enabled. All mutable inputs are mutex-owned. */
+    private var contestState: KrxContestState? = if (krxContest.enabled) KrxContestState.INITIAL else null
+    private var contestKey: KrxContestKey? = null
+    private var reapprovalEvidence: KrxReapprovalEvidence? = if (krxContest.enabled) KrxReapprovalEvidence.EMPTY else null
+    private var reapprovalDebtRegistered = false
+    private var holdTimer: Job? = null
+    private var reapprovalTimer: Job? = null
+    private var reapprovalTimerDeadline: Long? = null
+    private var lastEntitlementsStartedAt: Long? = null
+    private var batchingContestPublication = false
+
+    @Volatile internal var krxContestView: KrxContestView? =
+        contestState?.let { KrxContestView(it, null, checkNotNull(reapprovalEvidence)) }
+        private set
+
+    internal var onQueryStartedForTest:
+        ((order: Long, atMillis: Long, origin: QueryOrigin, intent: RefreshIntent, reapprovalOnly: Boolean) -> Unit)? = null
+    internal var onAccessPublishedForTest: ((TopicAccessSnapshot) -> Unit)? = null
 
     /**
      * The topic access snapshot, replaced whole under [mutex] and read without it (L-4e E1). Published before any state flow
@@ -210,7 +247,7 @@ class PremiumAccessCoordinator(
         var value: T = initial
             set(next) {
                 field = next
-                republishEffectiveLocked()
+                if (!batchingContestPublication) republishEffectiveLocked()
             }
     }
 
@@ -822,7 +859,7 @@ class PremiumAccessCoordinator(
                 _lastEffects.value = emptyList()
                 // After the bind's confirmed record was observed: a seal still standing for this owner is owed to
                 // this binding too, before any answer reaches it (S1r-2b §7.2).
-                lossSeals.registerReapproval(probeEpoch, work.fence.uid)
+                registerLossReapprovalLocked(work.fence.uid)
                 if (!lossSeals.isEmpty) kickLossRecoveryLocked()
             }
             is IdentityWork.End, IdentityWork.UnverifiedStart -> completedBinding = null
@@ -1246,7 +1283,7 @@ class PremiumAccessCoordinator(
         }) { store.bindOwner(candidate.uid) } ?: return barrierOutcome(BarrierStep.HELD)
         completedBinding = candidate
         _krx.value = KrxCapabilityState.HIDDEN
-        lossSeals.registerReapproval(probeEpoch, candidate.uid)
+        registerLossReapprovalLocked(candidate.uid)
         if (!lossSeals.isEmpty) kickLossRecoveryLocked()
         if (!cleanupLocked()) return barrierOutcome(BarrierStep.CLEANUP_FAILED)
         // Read after the last suspension.
@@ -1412,6 +1449,15 @@ class PremiumAccessCoordinator(
         probeRunningForOwner = null
         // A binding's re-check state and query registrations end with it (S1r-2a §2.1).
         inFlightQueries.clear()
+        if (krxContest.enabled) {
+            holdTimer?.cancel()
+            holdTimer = null
+            cancelReapprovalTimerLocked()
+            lastEntitlementsStartedAt = null
+            reapprovalEvidence = KrxReapprovalEvidence.EMPTY
+            reapprovalDebtRegistered = false
+            publishContestViewLocked()
+        }
         recheckDemand = null
         authStopped = false
         authStateOrder = 0L
@@ -1551,6 +1597,7 @@ class PremiumAccessCoordinator(
                 // A timer serves the demand: with nothing owed it asks nothing, it runs at the demand's current strength, and a
                 // query already running at that strength answers for it.
                 val demand = recheckDemand ?: return
+                if (krxContest.enabled && !reapprovalMayProceedLocked()) return
                 queryIntent = maxOf(intent, demand.intent)
                 if (inFlightCoversLocked(probeEpoch, queryIntent)) return
             }
@@ -1580,7 +1627,12 @@ class PremiumAccessCoordinator(
             }
             schedule.recordQueryStarted()
             val order = nextOrder()
+            val startedAt = clock.elapsedMillis()
+            if (krxContest.enabled) lastEntitlementsStartedAt = startedAt
             inFlightQueries[order] = InFlightQuery(probeEpoch, queryIntent)
+            onQueryStartedForTest?.invoke(
+                order, startedAt, origin, queryIntent, krxContest.enabled && recheckDemand?.reapprovalOnly == true
+            )
             StartedQuery(
                 record.fence(), decisionGeneration, boundIdentityLocked(), order, probeEpoch, queryIntent, userAccessInvalidations
             )
@@ -1828,12 +1880,27 @@ class PremiumAccessCoordinator(
             val grant = reservation.grant
             mutex.withLock {
                 val context = issuedTopicGrant?.takeIf { it.token == grant }?.context ?: return
-                if (!accessAdmittedLocked()) return
+                if (!accessAdmittedLocked()) {
+                    // D4 H1′/I8: only a refusal ending under the current key is hide evidence.
+                    if (krxContest.enabled && rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED &&
+                        context.generation == decisionGeneration && context.identity == boundIdentityLocked() &&
+                        context.access.userAccessEpoch == lossSeals.lastConfirmed?.userAccessEpoch
+                    ) hideKrxContestLocked(reservation.order)
+                    return
+                }
                 if (context.generation != decisionGeneration) return
                 val record = try {
                     store.load()
                 } catch (failed: Exception) {
-                    holdUnreadableLossLocked(outcome, CandidateProvenance.Topic(grant, context), failed) { current = true }
+                    val contest = if (rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED) {
+                        krxTopicCandidateStampLocked()
+                    } else null
+                    holdUnreadableLossLocked(
+                        outcome, CandidateProvenance.Topic(grant, context, contest?.first, contest?.second), failed
+                    ) {
+                        current = true
+                        if (rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED) hideKrxContestLocked(reservation.order)
+                    }
                     return
                 }
                 if (record.fence() != context.access) return
@@ -1853,6 +1920,7 @@ class PremiumAccessCoordinator(
                     }
                     raiseDemandLocked(intent, independent = true)
                     current = true
+                    if (rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED) hideKrxContestLocked(reservation.order)
                     // The demand stands; a cancellation waiting on the schedule's lock must not leave it with nothing to run it.
                     withContext(NonCancellable) {
                         beforeRejectionRecheckArmed()
@@ -1863,7 +1931,10 @@ class PremiumAccessCoordinator(
                     return
                 }
                 if (live != context.identity) return
-                val decision = decideLocked(record, RefreshIntent.FORCE_ENTITLEMENTS, outcome) { current = true }
+                val decision = decideLocked(record, RefreshIntent.FORCE_ENTITLEMENTS, outcome) {
+                    current = true
+                    if (rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED) hideKrxContestLocked(reservation.order)
+                }
                 // Not a query's answer, so it answers no demand; a re-check it asks for is a new requirement (S1r-2a §2.1).
                 val recheck = decision.recheck
                 if (recheck != null) {
@@ -1917,7 +1988,15 @@ class PremiumAccessCoordinator(
     )
 
     /** What the current binding still owes: a query at least [intent] strong that starts after [raisedAt]. */
-    private data class RecheckDemand(val binding: Long, val intent: RefreshIntent, val raisedAt: Long)
+    private data class RecheckDemand(
+        val binding: Long, val intent: RefreshIntent, val raisedAt: Long, val reapprovalOnly: Boolean = false
+    )
+
+    /** Captured after the answer's validity checks, before any contest transition raises its barrier. */
+    private data class KrxQueryPublication(val started: StartedQuery, val stale: Boolean, val candidate: Boolean) {
+        var clearedReapproval: Boolean = false
+        var clearedSlot: RecheckDemand? = null
+    }
 
     private data class InFlightQuery(val binding: Long, val intent: RefreshIntent)
 
@@ -1965,9 +2044,14 @@ class PremiumAccessCoordinator(
                 }
                 reapproval = attemptTopicReapprovalLocked(issuing)
             }
+            var publication: KrxQueryPublication? = null
+            suspend fun decideAnswer(): AccessDecision {
+                publication = krxQueryPublicationLocked(started, candidate = false)
+                return decideLocked(record, intent, outcome, publication, followUp)
+            }
             // Null means the answer was held back rather than decided.
             val decision: AccessDecision? = if (answeredAs == null) {
-                decideLocked(record, intent, outcome, followUp)
+                decideAnswer()
             } else {
                 if (answeredAs.ownerUid != record.ownerUid) return
                 // ...and the session the binding was standing on, which the live check above
@@ -1976,7 +2060,7 @@ class PremiumAccessCoordinator(
                 if (started.boundIdentity != null && answeredAs != started.boundIdentity) return
                 val live = source.currentIdentity()
                 when {
-                    live == answeredAs -> decideLocked(record, intent, outcome, followUp)
+                    live == answeredAs -> decideAnswer()
                     // A *different* session superseded this answer, and whatever established it
                     // owns the schedule from here.
                     live != null -> return
@@ -1988,7 +2072,21 @@ class PremiumAccessCoordinator(
             }
 
             if (decision != null) {
-                settleDemandLocked(started, outcome, decision.recheck, checkNotNull(reapproval))
+                if (krxContest.enabled) {
+                    withContext(NonCancellable) {
+                        val attempt = checkNotNull(reapproval)
+                        settleDemandLocked(
+                            started, outcome, decision.recheck, attempt,
+                            preserveServerFloor = publication?.clearedSlot?.let {
+                                !started.answersDemand(it, outcome, attempt)
+                            } == true,
+                            clearedReapproval = publication?.clearedReapproval == true
+                        )
+                        if (publication?.stale == true) ensureContestFollowUpLocked()
+                    }
+                } else {
+                    settleDemandLocked(started, outcome, decision.recheck, checkNotNull(reapproval))
+                }
             } else {
                 // Held back, not decided. The answer stays out of the state, but the query is
                 // retried at its own strength so an eventual identity reaches the same conclusion.
@@ -2021,7 +2119,11 @@ class PremiumAccessCoordinator(
         outcome: EntitlementsOutcome,
         recheck: RecheckRequest?,
         /** What the answer did about a re-approval: a blocked one answers no demand (L-4e E4b §3.3). */
-        reapproval: TopicReapprovalAttempt
+        reapproval: TopicReapprovalAttempt,
+        /** G3 ended a slot this answer could not settle under HEAD's conditions. */
+        preserveServerFloor: Boolean = false,
+        /** Cancel G3's old schedule even when this answer asks for another re-check. */
+        clearedReapproval: Boolean = false
     ) {
         val authentication =
             outcome is EntitlementsOutcome.Indeterminate && outcome.reason == IndeterminateReason.AUTHENTICATION
@@ -2037,18 +2139,12 @@ class PremiumAccessCoordinator(
         }
         val demand = recheckDemand
         val blocked = reapproval == TopicReapprovalAttempt.Blocked
-        val answered = demand != null &&
-            !blocked &&
-            started.binding == demand.binding &&
-            started.order > demand.raisedAt &&
-            started.intent >= demand.intent &&
-            outcome.settlesDemandFor(demand.intent)
+        val answered = demand != null && started.answersDemand(demand, outcome, reapproval)
         if (demand == null || answered) {
             recheckDemand = null
             unreportedReapproval = null
-            if (recheck == null) {
-                schedule.cancel()
-            } else {
+            if (recheck == null || clearedReapproval) schedule.cancel(preserveServerFloor = preserveServerFloor)
+            if (recheck != null) {
                 raiseDemandLocked(recheck.intent, independent = true)
                 armRecheckLocked(recheck)
             }
@@ -2073,6 +2169,18 @@ class PremiumAccessCoordinator(
         }
     }
 
+    /** The same HEAD settlement conditions govern a live slot and the slot G3 just cleared. */
+    private fun StartedQuery.answersDemand(
+        demand: RecheckDemand,
+        outcome: EntitlementsOutcome,
+        reapproval: TopicReapprovalAttempt
+    ): Boolean =
+        reapproval != TopicReapprovalAttempt.Blocked &&
+            binding == demand.binding &&
+            order > demand.raisedAt &&
+            intent >= demand.intent &&
+            outcome.settlesDemandFor(demand.intent)
+
     private fun EntitlementsOutcome.settlesDemandFor(demand: RefreshIntent): Boolean = when (this) {
         is EntitlementsOutcome.StableActive, is EntitlementsOutcome.StableInactive, is EntitlementsOutcome.PremiumRequired -> true
         // The premium axis is left as it was, so a premium demand is still owed.
@@ -2084,14 +2192,25 @@ class PremiumAccessCoordinator(
      * Records a demand for the current binding. A retry of the one owed keeps its order unless it asks more strongly; an
      * independent event always takes a new one (S1r-2a §2.1). Callers hold [mutex].
      */
-    private fun raiseDemandLocked(intent: RefreshIntent, independent: Boolean) {
+    private fun raiseDemandLocked(intent: RefreshIntent, independent: Boolean, fromReapproval: Boolean = false) {
         val current = recheckDemand
+        val reapprovalOnly = if (!krxContest.enabled) false else reapprovalOnlyAfter(
+            current?.reapprovalOnly,
+            when {
+                fromReapproval && current == null -> KrxDemandMerge.REAPPROVAL_INTO_EMPTY
+                fromReapproval && current?.reapprovalOnly == true -> KrxDemandMerge.REAPPROVAL_INTO_REAPPROVAL_ONLY
+                fromReapproval -> KrxDemandMerge.REAPPROVAL_INTO_OTHER
+                current == null || independent || intent > current.intent -> KrxDemandMerge.OTHER_INDEPENDENT
+                else -> KrxDemandMerge.RETRY
+            }
+        )
         recheckDemand = when {
-            current == null -> RecheckDemand(probeEpoch, intent, nextOrder())
+            current == null -> RecheckDemand(probeEpoch, intent, nextOrder(), reapprovalOnly)
             independent || intent > current.intent ->
-                RecheckDemand(probeEpoch, maxOf(intent, current.intent), nextOrder())
+                RecheckDemand(probeEpoch, maxOf(intent, current.intent), nextOrder(), reapprovalOnly)
             else -> current
         }
+        if (krxContest.enabled && !reapprovalOnly) cancelReapprovalTimerLocked()
     }
 
     /** Arms [recheck] as before, unless an authentication answer stopped re-queries: then only its floor is kept. */
@@ -2105,6 +2224,7 @@ class PremiumAccessCoordinator(
      * [mutex]; the schedule's lock is taken inside it, never the other way round, and no job is awaited.
      */
     private suspend fun ensureDemandArmedLocked() {
+        if (krxContest.enabled && !reapprovalMayProceedLocked()) return
         val demand = recheckDemand ?: return
         if (demand.binding != probeEpoch || !accessAdmittedLocked() || authStopped) return
         // A query at least as strong is still running, whenever it started: its end looks again.
@@ -2182,17 +2302,28 @@ class PremiumAccessCoordinator(
         record: AccessEpochRecord,
         intent: RefreshIntent,
         outcome: EntitlementsOutcome,
+        queryPublication: KrxQueryPublication? = null,
         /**
          * Runs once the decision is published, before a cancellation after publishing goes through — for a caller whose own
          * follow-up must not be lost with it (S1r-2c §2.3). Protected from cancellation itself.
          */
         onPublished: (suspend (AccessDecision) -> Unit)? = null
     ): AccessDecision {
-        val decision = PremiumAccessReducer.reduce(
+        val reduced = PremiumAccessReducer.reduce(
             current = record.toSnapshotFacts(_state.value.state, _krx.value),
             intent = intent,
             outcome = outcome
         )
+        val decision = if (queryPublication?.stale == true && !queryPublication.candidate &&
+            (outcome is EntitlementsOutcome.StableActive || outcome is EntitlementsOutcome.Pending)
+        ) {
+            reduced.copy(
+                krx = _krx.value,
+                effects = reduced.effects.filterNot {
+                    it == AccessEffect.RotateKrxEpoch || it == AccessEffect.PurgeCapabilityScope
+                }
+            )
+        } else reduced
         // AccessEffect.PushDelete is intentionally not executed; see the class KDoc.
         // AccessEffect.StartForcePremiumSingleFlight is carried out by the scheduled recheck.
         val targets = buildList {
@@ -2229,7 +2360,7 @@ class PremiumAccessCoordinator(
                 publishAccessSnapshotLocked()
             }
 
-            publishLocked(record.ownerUid, decision.state, decision.krx, decision.effects)
+            publishLocked(record.ownerUid, decision.state, decision.krx, decision.effects, outcome, queryPublication)
             landed
         } finally {
             if (doubtsUser) userContextUncertain = false
@@ -2296,7 +2427,7 @@ class PremiumAccessCoordinator(
             recordCapabilityEndLocked(TopicAccessEndReason.SEALED, boundIdentityLocked(), target.ownerUid(), target.epoch())
         }
         publishAccessSnapshotLocked()
-        lossSeals.registerReapproval(probeEpoch, record.ownerUid)
+        registerLossReapprovalLocked(record.ownerUid, rotationOnly = true)
         return false
     }
 
@@ -2309,7 +2440,9 @@ class PremiumAccessCoordinator(
         ownerUid: String?,
         state: PremiumAccessState,
         krx: KrxCapabilityState,
-        effects: List<AccessEffect>
+        effects: List<AccessEffect>,
+        outcome: EntitlementsOutcome,
+        queryPublication: KrxQueryPublication?
     ) {
         val sealed = lossSeals.sealedAxes(ownerUid)
         var published = state
@@ -2317,15 +2450,36 @@ class PremiumAccessCoordinator(
         if (PurgeScope.USER in sealed) {
             if (state.grantsPremiumRuntime) {
                 published = _state.value.state.takeUnless { it.grantsPremiumRuntime } ?: PremiumAccessState.NoGrant
-                lossSeals.registerReapproval(probeEpoch, ownerUid)
+                registerLossReapprovalLocked(ownerUid)
             }
             visibleKrx = KrxCapabilityState.HIDDEN
         }
         if (PurgeScope.CAPABILITY in sealed) visibleKrx = KrxCapabilityState.HIDDEN
         // The generation was published when this owner was bound and does not move while they
         // stay bound — an answer for anyone else never reaches here, `apply` refuses it first.
-        _state.value = OwnedPremiumAccess(ownerUid, _state.value.authGeneration, published)
-        _krx.value = visibleKrx
+        // On the enabled path, install the decision and its contest transition before exposing either one.
+        // In particular, no VISIBLE snapshot may escape between a true answer and its HOLD transition.
+        if (krxContest.enabled) batchingContestPublication = true
+        try {
+            _state.value = OwnedPremiumAccess(ownerUid, _state.value.authGeneration, published)
+            _krx.value = visibleKrx
+        } finally {
+            batchingContestPublication = false
+        }
+        if (krxContest.enabled) {
+            syncContestKeyLocked()
+            queryPublication?.let { answerKrxContestLocked(it, outcome) }
+            if (visibleKrx == KrxCapabilityState.VISIBLE) stepContestLocked(KrxContestEvent.KrxVisiblePublished)
+            recordKrxEvidenceLocked(queryPublication, outcome, sealed, krx, visibleKrx)
+            publishContestViewLocked()
+            republishEffectiveLocked()
+            val slot = recheckDemand
+            val cleared = endUnneededReapprovalSlotLocked()
+            if (queryPublication != null) {
+                queryPublication.clearedReapproval = cleared
+                if (cleared) queryPublication.clearedSlot = slot
+            }
+        }
         _lastEffects.value = effects
     }
 
@@ -2435,10 +2589,19 @@ class PremiumAccessCoordinator(
             lossSeals.takeReapproval(probeEpoch, _state.value.uid)?.let { axes ->
                 val intent =
                     if (PurgeScope.USER in axes) RefreshIntent.FORCE_PREMIUM else RefreshIntent.FORCE_ENTITLEMENTS
-                // Handed to the demand before the next suspension; reported once something is armed for it (S1r-2a §2.5).
-                raiseDemandLocked(intent, independent = true)
-                unreportedReapproval = unreportedReapproval?.let { maxOf(it, intent) } ?: intent
-                ensureDemandArmedLocked()
+                val dedicated = krxContest.enabled && axes == setOf(PurgeScope.CAPABILITY) &&
+                    reapprovalEvidence?.debtFromRotationOnly == true
+                if (krxContest.enabled) {
+                    reapprovalDebtRegistered = false
+                    reapprovalEvidence = checkNotNull(reapprovalEvidence).copy(debtFromRotationOnly = false)
+                    publishContestViewLocked()
+                }
+                if (!dedicated || checkNotNull(reapprovalEvidence).needed()) {
+                    // Handed to the demand before the next suspension; reported once something is armed for it.
+                    raiseDemandLocked(intent, independent = true, fromReapproval = dedicated)
+                    unreportedReapproval = unreportedReapproval?.let { maxOf(it, intent) } ?: intent
+                    ensureDemandArmedLocked()
+                }
             }
             if (lossCleanupOwed) lossCleanupOwed = !resumePendingPurgesLocked()
         } catch (failed: Exception) {
@@ -2478,6 +2641,232 @@ class PremiumAccessCoordinator(
                 }
             )
 
+    // --- Dormant KRX contest wiring (D4; R13‴) -------------------------------------------------------------------------
+
+    private fun publishContestViewLocked() {
+        val state = contestState ?: return
+        krxContestView = KrxContestView(state, contestKey, checkNotNull(reapprovalEvidence))
+    }
+
+    /** Delayed C0 comparison. Capability epoch and grant token deliberately do not participate. */
+    private fun syncContestKeyLocked() {
+        if (!krxContest.enabled) return
+        val key = KrxContestKey(probeEpoch, boundIdentityLocked(), lossSeals.lastConfirmed?.userAccessEpoch, decisionGeneration)
+        if (key == contestKey) return
+        contestKey = key
+        stepContestLocked(KrxContestEvent.KeyChanged(
+            openOnEntry = _krx.value == KrxCapabilityState.VISIBLE && _state.value.state.grantsPremiumRuntime
+        ))
+        publishContestViewLocked()
+    }
+
+    /** Applies policy state only; the enclosing event publishes the resulting snapshot and effective flows together. */
+    private fun stepContestLocked(event: KrxContestEvent) {
+        val before = contestState ?: return
+        when (val step = KrxContestPolicy.next(before, event, clock.elapsedMillis())) {
+            is KrxContestStep.Ignored -> Unit
+            is KrxContestStep.Applied -> {
+                val after = step.state
+                contestState = after
+                if (after.phase != KrxContestPhase.HOLD || after.holdExpired) {
+                    holdTimer?.cancel()
+                    holdTimer = null
+                } else if (after.holdSeq != before.holdSeq || after.holdUntilMillis != before.holdUntilMillis) {
+                    holdTimer?.cancel()
+                    val key = contestKey
+                    val seq = after.holdSeq
+                    val deadline = checkNotNull(after.holdUntilMillis)
+                    holdTimer = scope.launch {
+                        delay((deadline - clock.elapsedMillis()).coerceAtLeast(0L))
+                        mutex.withLock {
+                            syncContestKeyLocked()
+                            val current = checkNotNull(contestState)
+                            if (contestKey == key && current.holdSeq == seq && current.holdUntilMillis == deadline &&
+                                clock.elapsedMillis() >= deadline
+                            ) {
+                                stepContestLocked(KrxContestEvent.HoldTimerFired(
+                                    seq, _krx.value == KrxCapabilityState.VISIBLE && _state.value.state.grantsPremiumRuntime
+                                ))
+                            }
+                            publishContestViewLocked()
+                            republishEffectiveLocked()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun hideKrxContestLocked(order: Long) {
+        if (!krxContest.enabled) return
+        syncContestKeyLocked()
+        stepContestLocked(KrxContestEvent.HideEvidence(order))
+        publishContestViewLocked()
+        republishEffectiveLocked()
+    }
+
+    private fun krxTopicCandidateStampLocked(): Pair<KrxContestKey?, Long>? {
+        if (!krxContest.enabled) return null
+        syncContestKeyLocked()
+        return contestKey to checkNotNull(contestState).permitSeq
+    }
+
+    private fun krxQueryPublicationLocked(started: StartedQuery, candidate: Boolean): KrxQueryPublication? {
+        if (!krxContest.enabled) return null
+        syncContestKeyLocked()
+        publishContestViewLocked()
+        republishEffectiveLocked()
+        val stale = contestState?.barrier?.let { started.order <= it } ?: false
+        return KrxQueryPublication(started, stale, candidate)
+    }
+
+    private fun answerKrxContestLocked(publication: KrxQueryPublication, outcome: EntitlementsOutcome) {
+        val kind = when (outcome) {
+            is EntitlementsOutcome.StableActive ->
+                if (outcome.krxVisible) KrxAnswerKind.STABLE_TRUE else KrxAnswerKind.STABLE_FALSE
+            is EntitlementsOutcome.Pending ->
+                if (outcome.krxVisible) KrxAnswerKind.PENDING_TRUE else KrxAnswerKind.PENDING_FALSE
+            else -> return // Authoritative premium losses have already changed the key (C0).
+        }
+        stepContestLocked(KrxContestEvent.Answer(publication.started.order, kind, _state.value.state.grantsPremiumRuntime))
+    }
+
+    private fun recordKrxEvidenceLocked(
+        publication: KrxQueryPublication?,
+        outcome: EntitlementsOutcome,
+        sealed: Set<PurgeScope>,
+        decidedKrx: KrxCapabilityState,
+        publishedKrx: KrxCapabilityState
+    ) {
+        if (publication == null) return
+        // D4 S1 neutralises only stale direct StableActive/Pending answers in decideLocked.
+        if (publication.stale && !publication.candidate &&
+            (outcome is EntitlementsOutcome.StableActive || outcome is EntitlementsOutcome.Pending)
+        ) return
+        val evidence = checkNotNull(reapprovalEvidence)
+        val order = publication.started.order
+        reapprovalEvidence = when {
+            outcome is EntitlementsOutcome.StableActive && outcome.krxVisible &&
+                PurgeScope.CAPABILITY in sealed && decidedKrx == KrxCapabilityState.VISIBLE &&
+                publishedKrx == KrxCapabilityState.HIDDEN -> evidence.onSuppressedTrue(order)
+            (outcome is EntitlementsOutcome.StableActive || outcome is EntitlementsOutcome.StableInactive) &&
+                decidedKrx == publishedKrx -> evidence.onTruthfulStable(order)
+            else -> evidence // Pending, discarded answers and topic refusals are not stable evidence.
+        }
+    }
+
+    /** Provenance follows the ledger's actual debt cycle, so a later rotation cannot overwrite a mixed origin. */
+    private fun registerLossReapprovalLocked(ownerUid: String?, rotationOnly: Boolean = false) {
+        lossSeals.registerReapproval(probeEpoch, ownerUid)
+        if (!krxContest.enabled) return
+        val axes = lossSeals.explicitSealedAxes(ownerUid)
+        if (axes.isEmpty()) return
+        val evidence = checkNotNull(reapprovalEvidence)
+        val eligible = rotationOnly && axes == setOf(PurgeScope.CAPABILITY)
+        reapprovalEvidence = evidence.copy(
+            debtFromRotationOnly = eligible && (!reapprovalDebtRegistered || evidence.debtFromRotationOnly)
+        )
+        reapprovalDebtRegistered = true
+        publishContestViewLocked()
+    }
+
+    private fun cancelReapprovalTimerLocked() {
+        reapprovalTimer?.cancel()
+        reapprovalTimer = null
+        reapprovalTimerDeadline = null
+    }
+
+    /** G3 also runs for a weaker truthful answer that HEAD demand settlement cannot use. */
+    private suspend fun clearUnneededReapprovalLocked(): Boolean {
+        if (!endUnneededReapprovalSlotLocked()) return false
+        schedule.cancel(preserveServerFloor = true)
+        return true
+    }
+
+    /** G3 bookkeeping only; publication's following settlement cancels the schedule in the same lock hold. */
+    private fun endUnneededReapprovalSlotLocked(): Boolean {
+        if (recheckDemand?.reapprovalOnly != true || checkNotNull(reapprovalEvidence).needed()) return false
+        recheckDemand = null
+        unreportedReapproval = null
+        cancelReapprovalTimerLocked()
+        return true
+    }
+
+    /** G6 is shared by arming and SCHEDULED admission, under the same mutex as query start. */
+    private suspend fun reapprovalMayProceedLocked(): Boolean {
+        val demand = recheckDemand
+        if (demand?.reapprovalOnly != true) {
+            cancelReapprovalTimerLocked()
+            return true
+        }
+        if (clearUnneededReapprovalLocked()) return false
+        if (demand.binding != probeEpoch || !accessAdmittedLocked() || authStopped) {
+            cancelReapprovalTimerLocked()
+            return false
+        }
+        val evidence = checkNotNull(reapprovalEvidence)
+        val heldNewerQuery = lossCandidates.any { candidate ->
+            val query = candidate.provenance as? CandidateProvenance.Query
+            candidate.binding == probeEpoch && PurgeScope.CAPABILITY in candidate.axes &&
+                query != null && evidence.blocksOnCandidate(query.started.order)
+        }
+        if (heldNewerQuery) {
+            cancelReapprovalTimerLocked()
+            return false
+        }
+        val lastStart = lastEntitlementsStartedAt
+        val deadline = lastStart?.let { if (it > Long.MAX_VALUE - 5_000L) Long.MAX_VALUE else it + 5_000L }
+        if (deadline != null && clock.elapsedMillis() < deadline) {
+            if (reapprovalTimer == null || reapprovalTimerDeadline != deadline) {
+                cancelReapprovalTimerLocked()
+                val binding = probeEpoch
+                reapprovalTimerDeadline = deadline
+                reapprovalTimer = scope.launch {
+                    val self = currentCoroutineContext()[Job]
+                    delay((deadline - clock.elapsedMillis()).coerceAtLeast(0L))
+                    mutex.withLock {
+                        if (reapprovalTimer !== self) return@withLock
+                        reapprovalTimer = null
+                        reapprovalTimerDeadline = null
+                        if (binding == probeEpoch && recheckDemand?.reapprovalOnly == true) {
+                            // The current demand and latest start can differ from the ones that installed this timer.
+                            ensureDemandArmedLocked()
+                        }
+                    }
+                }
+            }
+            return false
+        }
+        cancelReapprovalTimerLocked()
+        return true
+    }
+
+    private fun candidateContestKeyLocked(candidate: LossCandidate): KrxContestKey? = when (val p = candidate.provenance) {
+        is CandidateProvenance.Query -> with(p.started) {
+            KrxContestKey(binding, boundIdentity, fence.userAccessEpoch, generation)
+        }
+        is CandidateProvenance.Topic -> p.contestKey
+    }
+
+    /** D4 S1 / QH safety net, after HEAD settlement and (for QH) release of the candidate's hold. */
+    private suspend fun ensureContestFollowUpLocked(queryCandidate: Boolean = false) {
+        syncContestKeyLocked()
+        val state = checkNotNull(contestState)
+        if (recheckDemand != null) return
+        val topicOwnsFollowUp = lossCandidates.any {
+            val topic = it.provenance as? CandidateProvenance.Topic
+            topic != null && topic.contestKey == contestKey && topic.contestPermitSeq == state.permitSeq
+        }
+        val awaiting = state.phase == KrxContestPhase.AWAITING && !topicOwnsFollowUp
+        val hiddenCandidate = queryCandidate &&
+            (state.phase == KrxContestPhase.OPEN || state.phase == KrxContestPhase.HOLD) &&
+            _krx.value == KrxCapabilityState.HIDDEN
+        if (awaiting || hiddenCandidate) {
+            raiseDemandLocked(RefreshIntent.FORCE_ENTITLEMENTS, independent = true)
+            ensureDemandArmedLocked()
+        }
+    }
+
     // --- S1r-2c: a loss answer whose record could not be read ------------------------------------------------------------
 
     /** Where a loss candidate came from, kept as it was so recovery checks it the way the original path would have. */
@@ -2486,7 +2875,10 @@ class PremiumAccessCoordinator(
         data class Query(val started: StartedQuery, val answeredAs: EntitlementsIdentity?) : CandidateProvenance
 
         /** A WebSocket refusal: the grant it refused and the context that grant was issued in. No query order is made up. */
-        data class Topic(val grant: TopicGrantToken, val context: TopicGrantContext) : CandidateProvenance
+        data class Topic(
+            val grant: TopicGrantToken, val context: TopicGrantContext,
+            val contestKey: KrxContestKey? = null, val contestPermitSeq: Long? = null
+        ) : CandidateProvenance
     }
 
     private class LossCandidate(
@@ -2557,6 +2949,9 @@ class PremiumAccessCoordinator(
             if (owner != null && PurgeScope.CAPABILITY in explicit) add(TopicAccessBlock.EXPLICIT_SEAL)
             if (ownRecord != null && ownRecord.krxCapabilityEpoch == null) add(TopicAccessBlock.DERIVED_SEAL)
             if (capabilityContextUncertain) add(TopicAccessBlock.CONTEXT_UNCERTAIN)
+            if (krxContest.enabled && _krx.value == KrxCapabilityState.VISIBLE &&
+                contestState?.phase != KrxContestPhase.OPEN
+            ) add(TopicAccessBlock.KRX_CONTESTED)
         }
         val issued = issuedTopicGrant
         val current = if (binding != null && record != null) TopicGrantContext(binding, record.fence(), decisionGeneration) else null
@@ -2603,11 +2998,13 @@ class PremiumAccessCoordinator(
             userInvalidations = userAccessInvalidations,
             lastUserEnd = lastUserEnd,
             lastCapabilityEnd = lastCapabilityEnd,
-            userEndInvalidationsFloor = userEndInvalidationsFloor
+            userEndInvalidationsFloor = userEndInvalidationsFloor,
+            krxPermitSeq = if (krxContest.enabled) checkNotNull(contestState).permitSeq else 0L
         )
         if (next == previous) return
         val published = next.copy(revision = previous.revision + 1)
         accessSnapshotValue = published
+        onAccessPublishedForTest?.invoke(published)
         _accessRevision.value = published.revision
     }
 
@@ -2677,7 +3074,9 @@ class PremiumAccessCoordinator(
         // KRX opens only under a premium runtime (PremiumAccessReducer). Following that here too keeps a boundary — NoGrant
         // written before HIDDEN — from showing KRX again in between once it has dropped the holds.
         _effectiveKrx.value =
-            if (!decided.state.grantsPremiumRuntime || lossCandidates.any { PurgeScope.CAPABILITY in it.axes }) {
+            if (!decided.state.grantsPremiumRuntime || lossCandidates.any { PurgeScope.CAPABILITY in it.axes } ||
+                (krxContest.enabled && contestState?.phase != KrxContestPhase.OPEN)
+            ) {
                 KrxCapabilityState.HIDDEN
             } else {
                 _krx.value
@@ -2777,7 +3176,7 @@ class PremiumAccessCoordinator(
                 return RecoveryNext.AwaitAdmission(attemptSignal.value, _persistenceSignal.value)
             }
             if (knownStaleWithoutRecordLocked(candidate.provenance, candidate.binding)) {
-                releaseCandidateLocked(candidate)
+                releaseCandidateLocked(candidate, stale = true)
                 continue
             }
             val check = try {
@@ -2789,7 +3188,7 @@ class PremiumAccessCoordinator(
                 return RecoveryNext.Retry
             }
             when (check) {
-                CandidateCheck.Stale -> releaseCandidateLocked(candidate)
+                CandidateCheck.Stale -> releaseCandidateLocked(candidate, stale = true)
                 CandidateCheck.IdentityUnknown -> {
                     candidateRecoveryAttempts += 1
                     return RecoveryNext.Retry
@@ -2839,13 +3238,24 @@ class PremiumAccessCoordinator(
             is CandidateProvenance.Query -> provenance.started.intent
             is CandidateProvenance.Topic -> RefreshIntent.FORCE_ENTITLEMENTS
         }
-        decideLocked(record, intent, candidate.outcome) { decision ->
+        val publication = (provenance as? CandidateProvenance.Query)?.let {
+            krxQueryPublicationLocked(it.started, candidate = true)
+        }
+        decideLocked(record, intent, candidate.outcome, publication) { decision ->
             try {
                 val recheck = decision.recheck?.remainingOf(candidate)
                 when (provenance) {
                     // Never issues: the approving query's last checks belong to its own answer. What is still owed stays owed.
-                    is CandidateProvenance.Query ->
-                        settleDemandLocked(provenance.started, candidate.outcome, recheck, attemptTopicReapprovalLocked(null))
+                    is CandidateProvenance.Query -> {
+                        val reapproval = attemptTopicReapprovalLocked(null)
+                        settleDemandLocked(
+                            provenance.started, candidate.outcome, recheck, reapproval,
+                            preserveServerFloor = publication?.clearedSlot?.let {
+                                !provenance.started.answersDemand(it, candidate.outcome, reapproval)
+                            } == true,
+                            clearedReapproval = publication?.clearedReapproval == true
+                        )
+                    }
                     // Not a query's answer, so it answers no demand; a re-check it asks for is a new requirement (S1r-2a §2.1).
                     is CandidateProvenance.Topic ->
                         if (recheck != null) {
@@ -2855,9 +3265,15 @@ class PremiumAccessCoordinator(
                             schedule.cancel()
                         }
                 }
-                ensureDemandArmedLocked()
+                if (!krxContest.enabled) ensureDemandArmedLocked()
             } finally {
                 releaseCandidateLocked(candidate)
+                if (krxContest.enabled) {
+                    if (publication?.stale == true && candidateContestKeyLocked(candidate) == contestKey) {
+                        ensureContestFollowUpLocked(queryCandidate = true)
+                    }
+                    ensureDemandArmedLocked()
+                }
             }
         }
     }
@@ -2868,8 +3284,20 @@ class PremiumAccessCoordinator(
         return copy(minDelayMillis = (notBefore - clock.elapsedMillis()).coerceAtLeast(0L))
     }
 
-    private fun releaseCandidateLocked(candidate: LossCandidate) {
-        if (lossCandidates.remove(candidate)) republishEffectiveLocked()
+    private suspend fun releaseCandidateLocked(candidate: LossCandidate, stale: Boolean = false) {
+        if (krxContest.enabled) syncContestKeyLocked()
+        if (!lossCandidates.remove(candidate)) return
+        republishEffectiveLocked()
+        if (krxContest.enabled) {
+            if (stale && candidateContestKeyLocked(candidate) == contestKey &&
+                (candidate.provenance !is CandidateProvenance.Topic ||
+                    candidate.provenance.contestPermitSeq == contestState?.permitSeq) &&
+                contestState?.phase == KrxContestPhase.AWAITING
+            ) {
+                if (recheckDemand == null) raiseDemandLocked(RefreshIntent.FORCE_ENTITLEMENTS, independent = true)
+            }
+            ensureDemandArmedLocked()
+        }
     }
 
     private sealed interface RecoveryNext {

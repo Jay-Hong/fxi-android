@@ -38,7 +38,10 @@ internal enum class TopicAccessBlock {
     DERIVED_SEAL,
 
     /** A loss rotation that can change this axis's epoch is running, or the decision it serves is not yet published. */
-    CONTEXT_UNCERTAIN
+    CONTEXT_UNCERTAIN,
+
+    /** KRX is visible in the decision but its contest permit is withheld. */
+    KRX_CONTESTED
 }
 
 /** What ended access on an axis. Kept apart from the blocks: an end outlives the hold or seal that may follow it. */
@@ -141,7 +144,8 @@ internal data class TopicAccessSnapshot(
     val userInvalidations: Long,
     val lastUserEnd: TopicAccessEnd?,
     val lastCapabilityEnd: TopicAccessEnd?,
-    val userEndInvalidationsFloor: Long = 0L
+    val userEndInvalidationsFloor: Long = 0L,
+    val krxPermitSeq: Long = 0L
 ) {
     companion object {
         val INITIAL = TopicAccessSnapshot(

@@ -15,6 +15,10 @@ import org.junit.Test
  * with comments stripped, and a positive control for every zero (the same pattern finds a file outside the policy).
  *
  * This test is amended by agreement when S6-2b0b deliberately adds a caller; deleting, skipping or assuming it away is not allowed.
+ *
+ * Amended by S6-2b0b (`R4c/S6/s6_2b0b/s6_2b0b_contracts.r2.md` 1.1 #10, scope r7a 6.1): PD-01 now allows exactly one production
+ * caller, PAC, which wires the policy behind a switch that production leaves off (`KrxContestWiringContractTest` KW-02). PD-02..PD-05
+ * are unchanged.
  */
 class KrxContestDormancyContractTest {
 
@@ -84,9 +88,16 @@ class KrxContestDormancyContractTest {
         assertEquals("premise: no two files read share a key", read.size, code.size)
     }
 
-    /** PD-01: no caller. Each of the seven names is found in the declaring file only. Catches early wiring. */
-    @Test fun PD01_policyHasNoCaller() {
-        for (name in NAMES) assertEquals("\\b$name\\b", setOf(POLICY), files(Regex("""\b$name\b""")))
+    /**
+     * PD-01 (amended by S6-2b0b): the only production caller is PAC. Each of the seven names is found in the declaring file and
+     * PAC only, and PAC actually uses the policy. Catches a second caller and a dropped wiring.
+     */
+    @Test fun PD01_policyHasOnlyPacAsCaller() {
+        for (name in NAMES) {
+            val found = files(Regex("""\b$name\b"""))
+            assertTrue("\\b$name\\b only in policy/PAC, found $found", found.all { it == POLICY || it == PAC })
+        }
+        assertTrue("PAC uses the policy", Regex("""\bKrxContestPolicy\b""").containsMatchIn(code.getValue(PAC)))
     }
 
     /** PD-02: purity. Catches a clock, coroutine, lock, randomness or mutable state inside the policy. */
