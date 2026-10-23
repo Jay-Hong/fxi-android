@@ -51,7 +51,8 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 S6은 S6-1(`f7232fc`: KRX 관측 어댑터·프리미엄 KRX 행 projection)과 S6-2a(`5a7a0f1`: topic
                                 bootstrap 재시도·분류 순수 정책)를 land했다(JVM 계약, 운영 호출자 0). 이어 S6-2b0a(`e0eef8e`: KRX
                                 경합 상한 순수 정책, 운영 호출자 0, 2026-10-22)와 S6-2b0b(`f102623`: 그 상한의 PAC 배선, 스위치 기본
-                                꺼짐, 2026-10-23)를 land했다. KRX 구독·FORCE_ENTITLEMENTS 호출자·스위치 켬은 S6-2b-1·S6-2b-2 몫이다
+                                꺼짐, 2026-10-23), S6-2b-1a(`159cbbf`: KRX 허가 판정·예약 표지의 PAC 배선, 스위치 꺼짐, 2026-10-24)를
+                                land했다. KRX 구독·FORCE_ENTITLEMENTS 호출자·스위치 켬은 S6-2b-1b·S6-2b-2 몫이다
                                 (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
@@ -1715,12 +1716,22 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   hold 타이머·S1·QH 후속·같은 키 Stale 해제 FE, `KRX_CONTESTED`·`krxPermitSeq`, R13‴ 재승인(G1~G8,
   KrxReapprovalEvidence)을 둔다. 꺼짐 경로는 HEAD에서 뽑은 기록 상수 8개 시나리오로 대조한다. 사전 변이 76개 중
   KILLED 71, 보류 1(C_guard_024: 단일 스레드 harness로 강제할 수 없는 타이머 발화 경합).
-  · 보류: KRX 구독·FORCE_ENTITLEMENTS 호출자·허가 소비·스위치 켬은 S6-2b-1(예약 표지·허가 판정·REST 예약)과
+  · S6-2b-1a `159cbbf` KRX 허가 판정·예약 표지(계약 설계 r3·D4 r7·scope r10·시험 r8, 트리 밖 manifest r15):
+  KrxSendMarker(epoch·permitSeq, 값을 채우는 송신 경로는 S6-2b-1b)와 예약의 선택 필드, 운영 생성 지점 무변경. 스위치
+  켬(시험 전용)에서 KRX 거절을 허가 단위로 판정(rejectedPermit, epoch 가드 두 위치, 판정 전 지연 C0 반영)하고 W1~W3·
+  reopenOwed·H1 후속 등록·무장의 취소 보호, A1(KRX epoch 제외 투영), capabilityInvalidations(켬에서만)를 둔다. 꺼짐
+  경로는 DormantTrace D1~D8·KW07과 꺼짐 회귀 잠금(OffPreservation)으로 대조한다. 사전 변이 88개 중 KILLED 83·다른
+  시험으로 KILLED 2, 생존 3은 시험 추가(C17 → C0b~C0f, OFF_guard_031 → OffPreservation)와 증거 종결(OFF_guard_011:
+  그 자리 꺼짐 코드가 HEAD와 같음)로 처리했다.
+  · 보류: KRX 구독·FORCE_ENTITLEMENTS 호출자·허가 소비·스위치 켬은 S6-2b-1b(소비자: C-1 KRX 사용권, 그래프 gate,
+  송신 시점 표지 캡처와 운반, REST unknown_topic 예약)와
   S6-2b-2(세션 허가 소비·송신 경로·스위치 켬) 몫이다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
   A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
   답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)다. 다음 D4 판 조건은 D4 r6(A2 r8·A1 r9 반영, 트리 밖
-  manifest r7)으로 채웠고, 남은 조건은 2b-2 계약의 CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. S6-2b 계약 잠금 전에는
-  scope U10(CUT-C01 근거 행 전제 변경 보고·재검토)을 처리한다. S6C3의 'KRX 총 3회·비-KRX 1회' 선택은 S6-2b 필수 계약으로 넘겼다. S6 완료
+  manifest r7)으로 채웠고, 남은 조건은 2b-2 계약의 CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. scope U10(CUT-C01
+  근거 행 전제 변경 보고·재검토)은 조건부이고 S6-2b-1b 켬 짝 시험 뒤 확정한다(2b-1a는 A1·C-1을 꺼진 스위치 뒤에
+  두어 CUT-C01 행을 바꾸지 않는다, OD-1 (가)). U12(상한이 만드는 사용자에게 보이는 지연, D2)는 2b-2 스위치 켬 전에
+  사용자 결정이 필요하다(scope r10 2.l). S6C3의 'KRX 총 3회·비-KRX 1회' 선택은 S6-2b 필수 계약으로 넘겼다. S6 완료
   판정은 P3-i 실제 purge 증거 뒤에만 한다.
 
 ### S7 — 은행 알림 (repeat · history · `rate_alert`)
