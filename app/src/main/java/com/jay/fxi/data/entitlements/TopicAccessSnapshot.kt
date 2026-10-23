@@ -145,7 +145,9 @@ internal data class TopicAccessSnapshot(
     val lastUserEnd: TopicAccessEnd?,
     val lastCapabilityEnd: TopicAccessEnd?,
     val userEndInvalidationsFloor: Long = 0L,
-    val krxPermitSeq: Long = 0L
+    val krxPermitSeq: Long = 0L,
+    /** OD-2: counts capabilityAllowed transitions from allowed to blocked only when enabled; otherwise zero. */
+    val capabilityInvalidations: Long = 0L
 ) {
     companion object {
         val INITIAL = TopicAccessSnapshot(

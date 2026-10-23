@@ -1,6 +1,21 @@
 package com.jay.fxi
 
+import com.jay.fxi.data.entitlements.KrxHarnessDefaults
+import com.jay.fxi.data.entitlements.KrxSendMarker
+import com.jay.fxi.data.entitlements.grantedKrxVisible
+import com.jay.fxi.data.entitlements.issueGrant
+import com.jay.fxi.data.entitlements.krxHarness
+import com.jay.fxi.data.entitlements.settleKrx
+import com.jay.fxi.data.entitlements.step
 import java.io.File
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -22,6 +37,8 @@ class KrxContestWiringContractTest {
         const val EVIDENCE = "${M}data/entitlements/KrxReapprovalEvidence.kt"
         const val TAS = "${M}data/entitlements/TopicAccessSnapshot.kt"
         const val MODULE = "${M}di/EntitlementsModule.kt"
+        const val MARKER = "${M}data/entitlements/KrxSendMarker.kt"
+        const val LEDGER = "${M}data/entitlements/TopicRejectionLedger.kt"
 
         val read: List<Pair<String, String>> by lazy {
             ROOTS.flatMap { root ->
@@ -111,5 +128,61 @@ class KrxContestWiringContractTest {
         assertEquals("KRX_CONTESTED in production", setOf(TAS, PAC), found)
         assertTrue("positive control: capabilityAllowed is read outside TAS",
             files(Regex("""\bcapabilityAllowed\b""")).any { it != TAS })
+    }
+
+    /**
+     * KW-06 (S6-2b-1a, 설계 r2 4절): 새 상태는 0a 밖(PAC 비공개)에 있다 — 정책 파일은 표지·인계·막힘·재개 의무를 모르고, 새 타입은 선언 파일과
+     * PAC(표지는 예약을 든 ledger 포함)에서만 쓰인다. `capabilityInvalidations`는 선언(TAS)과 생산자(PAC)에만 있다(소비자는 2b-1b).
+     * 2b-1b가 소비자를 더하면 이 집합을 그 판에서 개정한다.
+     */
+    @Test fun KW06_newStateStaysOutOf0aAndInsidePac() {
+        val policy = code.getValue(POLICY)
+        for (name in listOf("rejectedPermit", "withheld", "reopenOwed", "KrxSendMarker", "KrxWithheld", "KrxReopenOwed", "capabilityInvalidations")) {
+            assertTrue("0a 정책이 $name 을 안다", !Regex("""\b$name\b""").containsMatchIn(policy))
+        }
+        assertEquals("KrxSendMarker 참조", setOf(MARKER, PAC, LEDGER), files(Regex("""\bKrxSendMarker\b""")))
+        for (name in listOf("KrxWithheld", "KrxReopenOwed")) {
+            assertEquals("$name 참조", setOf(MARKER, PAC), files(Regex("""\b$name\b""")))
+        }
+        assertEquals("capabilityInvalidations 운영 참조", setOf(TAS, PAC), files(Regex("""\bcapabilityInvalidations\b""")))
+        assertTrue("positive control: PAC가 표지를 쓴다", Regex("""\bKrxSendMarker\b""").containsMatchIn(code.getValue(PAC)))
+    }
+
+    /**
+     * KW-07 (S6-2b-1a, 설계 r2 3.3·4절): 스위치 꺼짐에서는 '끝난 예약 평가' 작업을 PAC scope에 띄우지 않는다 — abandon과 잠금 대기 중 취소
+     * 직후, PAC scope(StandardTestDispatcher)가 아무것도 디스패치하기 전에 processJob의 자식 수가 그대로다. 잠금 대기 중인 처리 작업은
+     * UnconfinedTestDispatcher로 띄워 취소의 finally가 cancel() 안에서 바로 돌게 한다(디스패치 뒤에 세면 '띄운 뒤 본문에서 스위치를 보고 바로
+     * 끝나는' 누수가 가려진다 — 시험 r1 내부 검토 C-3). 켬의 평가 발화는 PermitTest P4·P6이 잡는다(양성 쪽).
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun KW07_offLaunchesNoEndedReservationEvaluation() = runTest {
+        val processJob = SupervisorJob()
+        try {
+            val h = krxHarness(processJob)
+            h.grantedKrxVisible()
+            settleKrx()
+            val grant = h.issueGrant()
+            val marker = KrxSendMarker(h.store.record.krxCapabilityEpoch, 1L)
+            val baseline = processJob.children.count()
+            h.coordinator.abandonRejection(h.coordinator.reserveRejection(grant, KrxHarnessDefaults.KRX_REFUSAL, marker))
+            assertEquals("꺼짐 abandon은 PAC scope 작업을 띄우지 않는다", baseline, processJob.children.count())
+
+            val loadGate = CompletableDeferred<Unit>()
+            h.store.loadGate = loadGate
+            val holder = async(start = CoroutineStart.UNDISPATCHED) { h.coordinator.topicGrantResult() }
+            assertTrue("premise: 발급이 잠금 안 load에서 멈췄다", h.store.loadGate == null && holder.isActive)
+            val r = h.coordinator.reserveRejection(grant, KrxHarnessDefaults.KRX_REFUSAL, marker)
+            val rejection = launch(UnconfinedTestDispatcher(testScheduler)) { h.coordinator.onTopicRejected(r) }
+            assertTrue("premise: 거절 처리가 mutex를 기다린다", rejection.isActive)
+            rejection.cancel()
+            assertTrue("premise: 취소의 finally가 cancel() 안에서 끝났다(디스패치 전)", rejection.isCompleted)
+            assertEquals("꺼짐 잠금 대기 취소는 PAC scope 작업을 띄우지 않는다(디스패치 전)", baseline, processJob.children.count())
+            step(0)
+            assertEquals("디스패치 뒤에도 그대로", baseline, processJob.children.count())
+            loadGate.complete(Unit)
+            holder.await()
+        } finally {
+            processJob.cancel()
+        }
     }
 }

@@ -1,6 +1,7 @@
 package com.jay.fxi.data.entitlements
 
 import com.jay.fxi.data.auth.AuthIdentityFence
+import com.jay.fxi.domain.model.TopicRejectionReason
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -109,8 +110,9 @@ class PremiumAccessKrxContestTest {
 
     /**
      * CAP-K02: (거절 → FE true) × 7. 허가는 해당 FE 답 적용 시각에서 0·5·10·20·40·60·60초 뒤다. 보류 중 effective HIDDEN과
-     * `KRX_CONTESTED`, 사용자 축(GENERAL)과 premium 상태는 그대로다. 같은 키이면 KRX epoch·grant 토큰이 바뀌어도 n이 이어진다.
-     * 잡을 변이: epoch를 키에 넣음, 토큰 키, hold를 RS로, 보류를 사용자 축에 걸음.
+     * `KRX_CONTESTED`, 사용자 축(GENERAL)과 premium 상태는 그대로다. 같은 키이면 KRX epoch가 바뀌어도 n이 이어진다(S6-2b-1a 개정: 켬에서는
+     * A1로 KRX 회전이 grant 토큰을 바꾸지 않는다 — 토큰이 바뀌는 같은 키 입력과 '토큰 키' 변이는 K03 (iv-b)가 맡는다).
+     * 잡을 변이: epoch를 키에 넣음, hold를 RS로, 보류를 사용자 축에 걸음.
      */
     @Test fun K02_sevenRounds_permitOffsetsFollowTheCooldown() = contestTest {
         val h = on()
@@ -223,18 +225,49 @@ class PremiumAccessKrxContestTest {
         assertEquals("hold 해제", null, h.view().state.holdUntilMillis)
     }
 
-    /** CAP-K03 (iv) grant 토큰만 바뀌는 HEAD 회전(H1 회전 성공): n이 이어진다. 잡을 변이: 토큰을 키로 사용. */
-    @Test fun K03_tokenOnlyRotation_keepsTheStreak() = contestTest {
+    /**
+     * CAP-K03 (iv-a) (S6-2b-1a 개정, 설계 r2 4절 R1): H1의 KRX 회전은 epoch를 실제로 바꾸지만 A1이라 grant 토큰도 contest 키도 그대로이고
+     * n이 이어진다.
+     */
+    @Test fun K03_krxRotation_keepsTokenKeyAndStreak() = contestTest {
         val h = on()
         h.grantedKrxVisible()
         val tokenBefore = h.issueGrant()
+        val epochBefore = h.store.record.krxCapabilityEpoch
         round(h)
-        val tokenAfter = h.issueGrant()
-        assertTrue("H1 회전이 grant 토큰을 바꾼다", tokenAfter != tokenBefore)
+        assertTrue("premise: H1이 KRX epoch를 회전했다", h.store.record.krxCapabilityEpoch != epochBefore)
+        assertEquals("A1: 토큰 그대로", tokenBefore, h.issueGrant())
         val keyAfterFirst = h.view().key
         round(h)
         assertEquals("키는 그대로", keyAfterFirst, h.view().key)
         assertEquals("n이 이어진다", 2, h.streak())
+    }
+
+    /**
+     * CAP-K03 (iv-b) (S6-2b-1a 개정, 설계 r2 4절 R1): n = 1·OPEN에서 PREMIUM_REQUIRED 거절을 live 판독 실패로 인계하고, 5초 floor 뒤
+     * FORCE_PREMIUM의 StableActive(true)로 같은 문맥의 거절 재승인을 만든다. 실제 새 토큰이 나오지만 contest 키와 n은 그대로이고, 다음
+     * KRX 거절 → true에서 n = 2다. 잡을 변이: 토큰을 contest 키로 사용(키가 바뀌어 n이 초기화).
+     */
+    @Test fun K03_refusalReapprovalNewToken_keepsKeyAndStreak() = contestTest {
+        val h = on()
+        h.grantedKrxVisible()
+        round(h)
+        assertEquals("premise: n = 1", 1, h.streak())
+        assertEquals(KrxContestPhase.OPEN, h.phase())
+        val key = h.view().key
+        val token = h.issueGrant()
+        h.source.identityNulls = 1
+        h.coordinator.onTopicRejected(token, listOf(TopicRejectionReason.PREMIUM_REQUIRED))
+        assertEquals("premise: 판정 못 한 premium 거절이 FORCE_PREMIUM 요구를 남긴다", RefreshIntent.FORCE_PREMIUM, h.owed())
+        step(5_010)   // 5초 floor만 넘긴다. QUIET(600초)를 넘기면 다음 T2에서 n이 0부터 다시 센다
+        val result = h.coordinator.topicGrantResult()
+        val reissued = checkNotNull(result.fence).grant
+        assertTrue("premise: 거절 재승인이 실제 새 토큰을 냈다", reissued != token)
+        assertEquals("premise: 재승인의 원래 토큰", token, (result.cause as TopicGrantCause.RefusalReapproval).from)
+        assertEquals("새 토큰에도 contest 키 그대로", key, h.view().key)
+        assertEquals("새 토큰에도 n 그대로", 1, h.streak())
+        round(h)
+        assertEquals("다음 KRX 거절 → true에서 n이 이어진다", 2, h.streak())
     }
 
     /**
@@ -388,7 +421,7 @@ class PremiumAccessKrxContestTest {
         for (h in listOf(on, off)) round(h)
         for (h in listOf(on, off)) round(h)
         assertEquals(KrxContestPhase.HOLD, on.phase())
-        val grantBefore = on.issueGrant()   // 발급이 tokenStanding을 바꿀 수 있어(H1 회전 뒤 낡은 문맥, PAC:1695-1699) 먼저 한다
+        val grantBefore = on.issueGrant()   // 꺼짐(HEAD)에서는 발급이 tokenStanding을 바꿀 수 있어(H1 회전 뒤 낡은 문맥, PAC:1695-1699) 먼저 한다. 켬은 A1로 KRX 회전이 문맥을 바꾸지 않는다(S6-2b-1a)
         val factsBefore = on.coordinator.accessSnapshot.facts
 
         val sentBefore = on.source.calls.size to off.source.calls.size
@@ -620,16 +653,23 @@ class PremiumAccessKrxContestTest {
     }
 
     /**
-     * CAP-K13 (ii): H1′(5초 floor) → 1초 뒤 H1 결정(회전) → 그 인계 FE가 RS floor로 held back → floor 만료에 CALLER FP 먼저 → CALLER FE
-     * Pending(false) → FP true(S1, demand 정산) → 후속 FE 1. H1′만으로는 만들 수 없다: 회전이 없어 KRX 자료 표지가 남고, CALLER FE의
-     * Pending(false)가 HEAD false edge로 KRX epoch를 회전시켜 먼저 시작한 FP 답이 fence(PAC:1957)로 버려진다(일회용 HEAD 탐침으로 확인).
+     * CAP-K13 (ii): premium 거절의 live 판독 실패(FORCE_PREMIUM 요구, 5초 floor) → 1초 뒤 KRX H1 결정(회전) → 그 인계 FE가 RS floor로 held
+     * back → floor 만료에 CALLER FP 먼저 → CALLER FE Pending(false) → FP true(S1, demand 정산) → 후속 FE 1. KRX H1′만으로는 만들 수 없다:
+     * 회전이 없어 KRX 자료 표지가 남고, CALLER FE의 Pending(false)가 HEAD false edge로 KRX epoch를 회전시켜 먼저 시작한 FP 답이
+     * fence(PAC:1957)로 버려진다(일회용 HEAD 탐침으로 확인).
+     * (S6-2b-1a 개정, 설계 r2 4절: floor를 만드는 앞 거절을 KRX H1′에서 premium H1′로 바꿨다. 같은 허가의 두 번째 KRX 거절은 허가 판정으로
+     * 부적격이라 H1 결정이 나지 않는다. premium 거절은 contest와 KRX 허가를 건드리지 않으므로 0b·2b-1a 모두에서 같은 입력이다.)
      */
     @Test fun K13_heldBackFe_staleAnswer_keepsAFollowUpFe() = contestTest {
         val h = on()
         h.grantedKrxVisible()
         val permit = h.permit()
         val streak = h.streak()
-        h.undecidedRejection()
+        val premiumGrant = h.issueGrant()
+        h.source.identityNulls = 1
+        h.coordinator.onTopicRejected(premiumGrant, listOf(TopicRejectionReason.PREMIUM_REQUIRED))
+        assertEquals("premise: premium H1′은 FORCE_PREMIUM 요구", RefreshIntent.FORCE_PREMIUM, h.owed())
+        assertEquals("premise: premium 거절은 contest를 건드리지 않는다", KrxContestPhase.OPEN, h.phase())
         step(1_000)
         val sent = h.source.calls.size
         h.rejectNow()
@@ -668,11 +708,16 @@ class PremiumAccessKrxContestTest {
 
     // --- CAP-K13 (iii) · O-7 ------------------------------------------------------------------------------------------
 
-    /** K13 (i)의 앞부분 + 토픽 후보(현재 grant의 거절, store.load 실패, PAC:1833-1837). 첫 복구 라운드는 신원 미확인으로 후보를 남긴다. */
+    /**
+     * K13 (iv)처럼 KRX 거절 없는 H2로 AWAITING + 토픽 후보(현재 grant의 거절, store.load 실패, PAC:1833-1837). 첫 복구 라운드는 신원 미확인으로
+     * 후보를 남긴다. (S6-2b-1a 개정, 설계 r2 4절: 앞부분을 H1에서 H2로 바꿨다. H1으로 들어가면 뒤의 거절이 같은 허가의 두 번째 거절이라
+     * 허가 판정으로 부적격이 되어 후보가 생기지 않는다. H2는 허가를 인계하지 않으므로 이 거절이 첫 인계다 — 0b·2b-1a 모두 같은 입력.)
+     */
     private suspend fun TestScope.topicCandidateDuringStaleCaller(h: KrxHarness, callerIntent: RefreshIntent): Pair<Job, CompletableDeferred<EntitlementsOutcome>> {
         h.source.next = { pendingFalse }
-        h.rejectNow()
+        h.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
         step(100)
+        assertEquals("premise: KRX 거절 없는 H2", KrxContestPhase.AWAITING, h.phase())
         val gate = CompletableDeferred<EntitlementsOutcome>()
         val (caller, _) = callerThenBarrierAtFloor(h, gate, callerIntent)
         val grant = h.issueGrant()
@@ -686,7 +731,9 @@ class PremiumAccessKrxContestTest {
 
     /**
      * CAP-K13 (iii) = O-7 Stale: 토픽 후보가 남은 동안 S1 CALLER FP true가 demand를 정산 → 후속 FE 0 → 후보가 같은 키 Stale로 해제
-     * (capability epoch만 이동, PAC:2820 → :2792 → :2871) → 후속 FE 정확히 1 → T2. 잡을 변이: 후보 중에도 FE를 냄, 해제 뒤 FE 없음.
+     * (복구 라운드의 live 신원이 문맥과 다름 → 후보 검사의 마지막 분기 → 해제) → 후속 FE 정확히 1 → T2. 잡을 변이: 후보 중에도 FE를 냄,
+     * 해제 뒤 FE 없음. (S6-2b-1a 개정, 설계 r2 3.2 A1-4: 켬에서는 토픽 후보의 fence 비교가 KRX epoch를 빼므로 capability epoch만 옮기면
+     * Stale이 되지 않는다. 같은 키 Stale을 live 신원 불일치로 만든다 — 0b·2b-1a 모두 같은 분기.)
      */
     @Test fun O7_topicCandidate_staleRelease_followUpExactlyOnce() = contestTest {
         val h = on()
@@ -704,11 +751,17 @@ class PremiumAccessKrxContestTest {
         assertEquals("O-7: 후보가 남은 동안 S1 정산 뒤 FE 0", sent, h.source.calls.size)
         assertNull("후속 FE 요구 없음", h.owed())
 
-        h.store.beginRotation(rotateUser = false, rotateKrx = true)
+        val followUp = CompletableDeferred<EntitlementsOutcome>()
+        h.source.gates.addLast(followUp)
+        val bound = h.source.identity
+        h.source.identity = EntitlementsIdentity(KrxHarnessDefaults.OWNER, 2L)
         step(KrxHarnessDefaults.RETRY)
+        h.source.identity = bound
         assertEquals("premise: 후보 해제", 0, h.held())
         assertEquals("O-7: 해제 뒤 후속 FE 정확히 1", sent + 1, h.source.calls.size)
         assertFalse(h.source.calls.last().freshPremium)
+        followUp.complete(active)
+        step(0)
         assertEquals(permit + 1, h.permit())
         assertEquals(streak + 1, h.streak())
         assertEquals(KrxContestPhase.OPEN, h.phase())
@@ -1013,19 +1066,21 @@ class PremiumAccessKrxContestTest {
 
     /**
      * CAP-G01 HOLD 중 true 반복: 만료 전 CALLER true 두 번은 조회·적용되지만 allowed 전이는 0이다. 변화 없는 재계산은 발행하지 않으므로
-     * (PAC:2608, TAS:126-127) 그 두 답의 발행 0건도 허용한다. 관측기가 HOLD 중 발행을 받는지는 HOLD 중 토큰 교체 발행으로 따로 확인한다.
+     * (PAC:2608, TAS:126-127) 그 두 답의 발행 0건도 허용한다. 관측기가 allowed false 구간의 발행을 받는지는 HOLD 진입 발행으로 따로 확인한다.
+     * (S6-2b-1a 개정, 설계 r2 4절: 켬에서는 A1로 KRX 회전이 grant 문맥을 바꾸지 않아 HOLD 중 발급이 토큰 교체 발행을 내지 않는다. 그래서
+     * 관측기를 둘째 바퀴의 거절 뒤·FE 답 전에 달고, T2로 HOLD에 들어가는 발행(allowed false 유지)을 관측 확인에 쓴다.)
      */
     @Test fun G01_trueRepeatsDuringHold_noTransitions() = contestTest {
         val h = on()
         h.grantedKrxVisible()
         round(h)
-        round(h)
-        assertEquals(KrxContestPhase.HOLD, h.phase())
+        h.rejectNow()
         val published = h.recordPublished()
         val start = h.currentPublished()
-        assertFalse(start.allowed)
-        h.issueGrant()   // HOLD 중 토큰 교체 발행 1건(allowed false, PAC:1695-1699): 관측기가 HOLD 중 발행을 받는지 확인
-        assertTrue("premise: HOLD 중 발행이 관측된다", published.isNotEmpty())
+        assertFalse("premise: 둘째 거절 뒤 allowed false", start.allowed)
+        step(100)
+        assertEquals(KrxContestPhase.HOLD, h.phase())
+        assertTrue("premise: allowed false 구간의 발행(HOLD 진입)이 관측된다", published.isNotEmpty())
         val sent = h.source.calls.size
         repeat(2) {
             h.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)

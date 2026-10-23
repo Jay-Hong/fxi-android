@@ -49,7 +49,11 @@ internal class KrxHarnessStore(private val ids: EpochIdGenerator) : AccessEpochS
     var loads = 0
     var rotationAttempts = 0
 
+    /** S6-2b-1a: 다음 load 한 번을 이 gate가 끝날 때까지 멈춘다(PAC 잠금 안에서 mutex를 붙잡아 두는 용도). 기본 null이면 기존과 같다. */
+    var loadGate: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+
     override suspend fun load(): AccessEpochRecord {
+        loadGate?.let { gate -> loadGate = null; gate.await() }
         loads += 1
         if (loadFailures > 0 && loadSkipsBeforeFailure > 0) {
             loadSkipsBeforeFailure -= 1
@@ -78,14 +82,30 @@ internal class KrxHarnessStore(private val ids: EpochIdGenerator) : AccessEpochS
         AccessEpochTransitions.retireUnverifiedStart(record, ids).also { record = it }
     override suspend fun beginSignOut(uid: String): AccessEpochRecord =
         AccessEpochTransitions.beginSignOut(record, uid).also { record = it }
+    /** S6-2b-1a: 다음 회전 시도 한 번을 이 gate가 끝날 때까지 멈춘다(결정 게시 전 취소 시점을 만드는 용도). 기본 null이면 기존과 같다. */
+    var rotationGate: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+
     override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean): AccessEpochRecord {
+        rotationGate?.let { gate -> rotationGate = null; gate.await() }
         rotationAttempts += 1
         if (rotationFailures > 0) {
             rotationFailures -= 1
             throw IOException("rotation")
         }
-        return AccessEpochTransitions.rotate(record, rotateUser, rotateKrx, ids).also { record = it }
+        val landed = AccessEpochTransitions.rotate(record, rotateUser, rotateKrx, ids).also { record = it }
+        landedGate?.let { gate -> landedGate = null; gate.await() }
+        if (rotationLandsThenCancels > 0) {
+            rotationLandsThenCancels -= 1
+            throw kotlin.coroutines.cancellation.CancellationException("the store's own scope ended")
+        }
+        return landed
     }
+
+    /** S6-2b-1a: 다음 회전 한 번이 착지한 뒤 반환 전에 이 gate가 끝날 때까지 멈춘다(PATST parkedAfterLanding의 ON 짝). 기본 null이면 기존과 같다. */
+    var landedGate: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+
+    /** S6-2b-1a: 다음 회전 n번이 착지한 뒤 store 자신의 취소로 끝난다(PATST cancelledAfterLanding의 ON 짝). 기본 0이면 기존과 같다. */
+    var rotationLandsThenCancels = 0
     override suspend fun completePurges(completed: Collection<PendingPurge>): AccessEpochRecord =
         AccessEpochTransitions.completePurges(record, completed).also { record = it }
     override suspend fun journalRetired(obligation: LossObligation): AccessEpochRecord =
@@ -137,7 +157,11 @@ internal class KrxHarnessSource(
         }
         return EntitlementsResult.Answered(checkNotNull(identity), outcome)
     }
+    /** S6-2b-1a: 다음 currentIdentity 한 번을 이 gate가 끝날 때까지 멈춘다(잠금 안 live 판독 중 취소를 만드는 용도). 기본 null이면 기존과 같다. */
+    var identityGate: CompletableDeferred<Unit>? = null
+
     override suspend fun currentIdentity(): EntitlementsIdentity? {
+        identityGate?.let { gate -> identityGate = null; gate.await() }
         if (identityNulls > 0) {
             identityNulls -= 1
             return null
@@ -254,6 +278,13 @@ internal suspend fun KrxHarness.undecidedRejection(): TopicRejectionReservation 
     return reservation
 }
 
+/** S6-2b-1a: PAC의 private `recheckDemand`(순번·intent·reapprovalOnly)를 읽기 전용으로 꺼낸다. 상태 변화 0 비교용. */
+internal fun KrxHarness.recheckDemandSnapshot(): Any? {
+    val field = PremiumAccessCoordinator::class.java.getDeclaredField("recheckDemand")
+    field.isAccessible = true
+    return field.get(coordinator)
+}
+
 /** PAC의 private `schedule`을 읽기 전용으로 꺼낸다(RS 운영 파일은 바꾸지 않는다). */
 internal fun KrxHarness.recheckSchedule(): RecheckSchedule {
     val field = PremiumAccessCoordinator::class.java.getDeclaredField("schedule")
@@ -299,4 +330,24 @@ internal fun KrxHarness.traceLine(label: String): String {
         "intent=${schedule.readPrivate("pendingIntent")}",
         "rsRev=${schedule.readPrivate("revision")}"
     ).joinToString(" | ")
+}
+
+/**
+ * S6-2b-1a 합성 상태(설계 r2 3.4·Codex 시험 3회차 판단 6): 같은 키·기존 grant를 그대로 둔 채 승인을 닫는다. 시작 정리(resumeStartupPurge)의
+ * 첫 store.load를 실패시키면 cleanupOrHoldLocked가 CleanupPending 보류를 연다(PAC:833-845) — generation·binding을 바꾸지 않으므로 contest 키와
+ * 발급된 grant가 남고 `accessAdmittedLocked()`만 거짓이 된다(PAC:351-352). 운영에서 시작 정리 보류는 첫 신원 처리 전에만 열리므로(AAB:176) 이것은
+ * 운영 도달 경로가 아니다. 돌려주는 보류는 [reopenApproval]로 실제 재개 경로(resumePersistence → cleanupAndFinishLocked, PAC:890-891)를 태운다.
+ */
+internal suspend fun KrxHarness.closeApprovalOnTheSameKey(): IdentityStep.AwaitPersistence {
+    store.loadFailures = 1
+    val held = coordinator.resumeStartupPurge().heldByPersistence("시작 정리 보류(합성)")
+    assertEquals("premise: 보류를 연 실패가 소비됐다", 0, store.loadFailures)
+    return held
+}
+
+/** [closeApprovalOnTheSameKey]의 보류를 실제 재개 경로로 푼다. 보류의 다음 시도 시각까지 가상 시계를 옮긴다. */
+internal suspend fun KrxHarness.reopenApproval(held: IdentityStep.AwaitPersistence) {
+    val wait = (held.nextAttemptAt ?: test.testScheduler.currentTime) - test.testScheduler.currentTime
+    if (wait > 0) test.step(wait)
+    coordinator.resumePersistence(held.id).applied("같은 키 승인 재개(합성)")
 }

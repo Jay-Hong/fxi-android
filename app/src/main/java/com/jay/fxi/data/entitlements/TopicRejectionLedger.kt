@@ -13,7 +13,9 @@ internal class TopicRejectionReservation internal constructor(
     internal val owner: TopicRejectionLedger,
     val order: Long,
     val grant: TopicGrantToken,
-    val reasons: List<TopicRejectionReason>
+    val reasons: List<TopicRejectionReason>,
+    /** Epoch and permit captured together at send time; null means no send marker. */
+    val marker: KrxSendMarker? = null
 ) {
     /** Whether the refusal is about access at all; one that is not leaves no history. */
     val aboutAccess: Boolean get() = TopicRejection.of(reasons) != null
@@ -82,9 +84,9 @@ internal class TopicRejectionLedger(
     private var latestCurrent: Long? = null
     private var latestPremiumCurrent: Long? = null
 
-    fun reserve(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>): TopicRejectionReservation =
+    fun reserve(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>, marker: KrxSendMarker? = null): TopicRejectionReservation =
         synchronized(lock) {
-            val reservation = TopicRejectionReservation(this, nextOrder(), grant, reasons.toList())
+            val reservation = TopicRejectionReservation(this, nextOrder(), grant, reasons.toList(), marker)
             open += reservation
             if (reservation.aboutAccess && grant == summaryGrant) latestReported = maxOf(latestReported ?: 0L, reservation.order)
             reservation
@@ -153,6 +155,9 @@ internal class TopicRejectionLedger(
     }
 
     fun owns(reservation: TopicRejectionReservation): Boolean = reservation.owner === this
+
+    /** Immutable pending reservations, read under one monitor hold; eligibility is PAC's decision. */
+    fun pendingReservations(): List<TopicRejectionReservation> = synchronized(lock) { open.toList() }
 
     fun view(grant: TopicGrantToken): TopicRejectionView = synchronized(lock) {
         val summarised = grant == summaryGrant

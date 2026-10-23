@@ -47,7 +47,11 @@ internal data class KrxContestKey(
 internal data class KrxContestView(
     val state: KrxContestState,
     val key: KrxContestKey?,
-    val reapproval: KrxReapprovalEvidence
+    val reapproval: KrxReapprovalEvidence,
+    // D4 3.2: handover and follow-up state belongs to PAC, outside the locked 0a policy.
+    val rejectedPermit: Long = 0L,
+    val withheld: KrxWithheld? = null,
+    val reopenOwed: KrxReopenOwed? = null
 )
 
 /**
@@ -109,6 +113,15 @@ class PremiumAccessCoordinator(
     private var reapprovalTimerDeadline: Long? = null
     private var lastEntitlementsStartedAt: Long? = null
     private var batchingContestPublication = false
+    private class KrxHandoverState {
+        var rejectedPermit = 0L
+        var withheld: KrxWithheld? = null
+        var reopenOwed: KrxReopenOwed? = null
+        /** Report order of the refusal whose same-key admission reopening owes a query. */
+        var reopenAfterOrder: Long? = null
+    }
+
+    private val krxHandoverState: KrxHandoverState? = if (krxContest.enabled) KrxHandoverState() else null
 
     @Volatile internal var krxContestView: KrxContestView? =
         contestState?.let { KrxContestView(it, null, checkNotNull(reapprovalEvidence)) }
@@ -1772,8 +1785,12 @@ class PremiumAccessCoordinator(
         // Checked against the record just confirmed, not a value computed before it (S1r-2b §5).
         if (PurgeScope.USER in lossSeals.sealedAxes(bound.ownerUid)) return null
         if (source.currentIdentity() != bound) return null
-        return TopicGrantContext(bound, record.fence(), decisionGeneration)
+        return TopicGrantContext(bound, grantFence(record.fence()), decisionGeneration)
     }
+
+    /** A1: grant contexts omit only the capability epoch when enabled; query fences stay whole (OD-3). */
+    private fun grantFence(fence: AccessFence): AccessFence =
+        if (krxContest.enabled) fence.copy(krxCapabilityEpoch = null) else fence
 
     /**
      * Whether the answer just published re-approves the grant a session is latched on, and if so issues it (L-4e E4b §2, §3).
@@ -1818,7 +1835,7 @@ class PremiumAccessCoordinator(
         return context == standing.context &&
             started.generation == decisionGeneration &&
             started.binding == probeEpoch &&
-            started.fence == context.access &&
+            grantFence(started.fence) == context.access &&
             started.boundIdentity == context.identity
     }
 
@@ -1826,12 +1843,17 @@ class PremiumAccessCoordinator(
      * Numbers a refusal a session is reporting, at the moment it reports it (L-4e E4a §3.5). Never suspends and never waits on
      * [mutex], so a session's serial scope can call it; the reservation is then handed to [onTopicRejected] or [abandonRejection].
      */
-    internal fun reserveRejection(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>): TopicRejectionReservation =
-        rejectionLedger.reserve(grant, reasons)
+    internal fun reserveRejection(
+        grant: TopicGrantToken,
+        reasons: Collection<TopicRejectionReason>,
+        marker: KrxSendMarker? = null
+    ): TopicRejectionReservation = rejectionLedger.reserve(grant, reasons, marker)
 
     /** Ends a reservation that will not reach [onTopicRejected]. The record of its having been reported stays. */
     internal fun abandonRejection(reservation: TopicRejectionReservation) {
-        if (rejectionLedger.owns(reservation)) rejectionLedger.abandon(reservation)
+        if (!rejectionLedger.owns(reservation)) return
+        rejectionLedger.abandon(reservation)
+        evaluateEndedRejection(reservation)
     }
 
     /** Diagnostic: the refusals recorded for [grant] (L-4e E4a). */
@@ -1871,6 +1893,7 @@ class PremiumAccessCoordinator(
     internal suspend fun onTopicRejected(reservation: TopicRejectionReservation) {
         if (!rejectionLedger.owns(reservation)) return
         var current = false
+        var completedInLock = false
         try {
             val rejection = TopicRejection.of(reservation.reasons) ?: return
             val outcome = when (rejection) {
@@ -1879,75 +1902,106 @@ class PremiumAccessCoordinator(
             }
             val grant = reservation.grant
             mutex.withLock {
-                val context = issuedTopicGrant?.takeIf { it.token == grant }?.context ?: return
-                if (!accessAdmittedLocked()) {
-                    // D4 H1′/I8: only a refusal ending under the current key is hide evidence.
-                    if (krxContest.enabled && rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED &&
-                        context.generation == decisionGeneration && context.identity == boundIdentityLocked() &&
-                        context.access.userAccessEpoch == lossSeals.lastConfirmed?.userAccessEpoch
-                    ) hideKrxContestLocked(reservation.order)
-                    return
-                }
-                if (context.generation != decisionGeneration) return
-                val record = try {
-                    store.load()
-                } catch (failed: Exception) {
-                    val contest = if (rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED) {
-                        krxTopicCandidateStampLocked()
+                try {
+                    val context = issuedTopicGrant?.takeIf { it.token == grant }?.context ?: return
+                    val krxPermit = if (krxContest.enabled && rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED) {
+                        syncContestKeyLocked()
+                        publishContestViewLocked()
+                        republishEffectiveLocked()
+                        if (!krxHandoverEligibleLocked(context, reservation.marker)) return
+                        checkNotNull(contestState).permitSeq
                     } else null
-                    holdUnreadableLossLocked(
-                        outcome, CandidateProvenance.Topic(grant, context, contest?.first, contest?.second), failed
-                    ) {
+                    if (!accessAdmittedLocked()) {
+                        if (krxPermit != null) {
+                            handOverKrxLocked(reservation.order, krxPermit)
+                            val handover = checkNotNull(krxHandoverState)
+                            handover.reopenOwed = KrxReopenOwed(checkNotNull(contestKey), krxPermit)
+                            handover.reopenAfterOrder = reservation.order
+                            publishContestViewLocked()
+                        }
+                        return
+                    }
+                    if (context.generation != decisionGeneration) return
+                    val record = try {
+                        store.load()
+                    } catch (failed: Exception) {
+                        val contest = if (rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED) {
+                            krxTopicCandidateStampLocked(krxPermit)
+                        } else null
+                        holdUnreadableLossLocked(
+                            outcome, CandidateProvenance.Topic(grant, context, contest?.first, contest?.second, reservation.marker), failed
+                        ) {
+                            current = true
+                            if (krxPermit != null) handOverKrxLocked(reservation.order, krxPermit)
+                        }
+                        return
+                    }
+                    // Second epoch guard: the just-confirmed record may differ from the memory checked before load.
+                    if (krxPermit != null && !krxEpochMatches(reservation.marker, record.krxCapabilityEpoch)) return
+                    if (grantFence(record.fence()) != context.access) return
+                    if (boundIdentityLocked() != context.identity) return
+                    val live = try {
+                        source.currentIdentity()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (live == null) {
+                        // A refusal for this grant whose session cannot be told: not decided, and not dropped either (L-4e E4a R1′).
+                        val intent = when (rejection) {
+                            TopicRejection.PREMIUM_REQUIRED -> RefreshIntent.FORCE_PREMIUM
+                            TopicRejection.KRX_ENTITLEMENT_REQUIRED -> RefreshIntent.FORCE_ENTITLEMENTS
+                        }
+                        raiseDemandLocked(intent, independent = true)
                         current = true
-                        if (rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED) hideKrxContestLocked(reservation.order)
+                        if (krxPermit != null) handOverKrxLocked(reservation.order, krxPermit)
+                        // The demand stands; a cancellation waiting on the schedule's lock must not leave it with nothing to run it.
+                        withContext(NonCancellable) {
+                            beforeRejectionRecheckArmed()
+                            armRecheckLocked(RecheckRequest(intent, minDelayMillis = PremiumAccessReducer.DEFAULT_BACKOFF_FLOOR_MILLIS))
+                            ensureDemandArmedLocked()
+                        }
+                        currentCoroutineContext().ensureActive()
+                        return
                     }
-                    return
-                }
-                if (record.fence() != context.access) return
-                if (boundIdentityLocked() != context.identity) return
-                val live = try {
-                    source.currentIdentity()
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    null
-                }
-                if (live == null) {
-                    // A refusal for this grant whose session cannot be told: not decided, and not dropped either (L-4e E4a R1′).
-                    val intent = when (rejection) {
-                        TopicRejection.PREMIUM_REQUIRED -> RefreshIntent.FORCE_PREMIUM
-                        TopicRejection.KRX_ENTITLEMENT_REQUIRED -> RefreshIntent.FORCE_ENTITLEMENTS
+                    if (live != context.identity) return
+                    val decision = decideLocked(record, RefreshIntent.FORCE_ENTITLEMENTS, outcome) { published ->
+                        current = true
+                        if (krxPermit != null) {
+                            handOverKrxLocked(reservation.order, krxPermit)
+                            // I9: publishing H1 also owns its demand, even if cancellation follows the rotation.
+                            followUpTopicDecisionLocked(published)
+                        }
                     }
-                    raiseDemandLocked(intent, independent = true)
-                    current = true
-                    if (rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED) hideKrxContestLocked(reservation.order)
-                    // The demand stands; a cancellation waiting on the schedule's lock must not leave it with nothing to run it.
-                    withContext(NonCancellable) {
-                        beforeRejectionRecheckArmed()
-                        armRecheckLocked(RecheckRequest(intent, minDelayMillis = PremiumAccessReducer.DEFAULT_BACKOFF_FLOOR_MILLIS))
-                        ensureDemandArmedLocked()
+                    // Not a query's answer, so it answers no demand; a re-check it asks for is a new requirement (S1r-2a §2.1).
+                    if (krxPermit == null) followUpTopicDecisionLocked(decision)
+                } finally {
+                    // Normal and early returns finish under the same lock. Cancellation finishes outside it below.
+                    if (krxContest.enabled && currentCoroutineContext().isActive) {
+                        rejectionLedger.complete(reservation, current)
+                        completedInLock = true
+                        withContext(NonCancellable) { evaluateEndedRejectionLocked(reservation) }
                     }
-                    currentCoroutineContext().ensureActive()
-                    return
                 }
-                if (live != context.identity) return
-                val decision = decideLocked(record, RefreshIntent.FORCE_ENTITLEMENTS, outcome) {
-                    current = true
-                    if (rejection == TopicRejection.KRX_ENTITLEMENT_REQUIRED) hideKrxContestLocked(reservation.order)
-                }
-                // Not a query's answer, so it answers no demand; a re-check it asks for is a new requirement (S1r-2a §2.1).
-                val recheck = decision.recheck
-                if (recheck != null) {
-                    raiseDemandLocked(recheck.intent, independent = true)
-                    armRecheckLocked(recheck)
-                } else if (recheckDemand == null) {
-                    schedule.cancel()
-                }
-                ensureDemandArmedLocked()
             }
         } finally {
-            rejectionLedger.complete(reservation, current)
+            if (!completedInLock) {
+                rejectionLedger.complete(reservation, current)
+                evaluateEndedRejection(reservation)
+            }
         }
+    }
+
+    private suspend fun followUpTopicDecisionLocked(decision: AccessDecision) {
+        val recheck = decision.recheck
+        if (recheck != null) {
+            raiseDemandLocked(recheck.intent, independent = true)
+            armRecheckLocked(recheck)
+        } else if (recheckDemand == null) {
+            schedule.cancel()
+        }
+        ensureDemandArmedLocked()
     }
 
     /** The session the published binding is standing on, or null before anything is bound. */
@@ -2224,6 +2278,7 @@ class PremiumAccessCoordinator(
      * [mutex]; the schedule's lock is taken inside it, never the other way round, and no job is awaited.
      */
     private suspend fun ensureDemandArmedLocked() {
+        if (krxContest.enabled) resumeKrxReopenLocked()
         if (krxContest.enabled && !reapprovalMayProceedLocked()) return
         val demand = recheckDemand ?: return
         if (demand.binding != probeEpoch || !accessAdmittedLocked() || authStopped) return
@@ -2645,15 +2700,106 @@ class PremiumAccessCoordinator(
 
     private fun publishContestViewLocked() {
         val state = contestState ?: return
-        krxContestView = KrxContestView(state, contestKey, checkNotNull(reapprovalEvidence))
+        val handover = checkNotNull(krxHandoverState)
+        krxContestView = KrxContestView(
+            state, contestKey, checkNotNull(reapprovalEvidence), handover.rejectedPermit, handover.withheld, handover.reopenOwed
+        )
+    }
+
+    private fun currentContestKeyLocked(): KrxContestKey =
+        KrxContestKey(probeEpoch, boundIdentityLocked(), lossSeals.lastConfirmed?.userAccessEpoch, decisionGeneration)
+
+    private fun contextMatchesContestKeyLocked(context: TopicGrantContext): Boolean =
+        context.identity == boundIdentityLocked() && context.generation == decisionGeneration &&
+            context.access == lossSeals.lastConfirmed?.fence()?.let(::grantFence)
+
+    /** An absent marker is fail-closed; an explicit marker with a null epoch still has to match. */
+    private fun krxEpochMatches(marker: KrxSendMarker?, epoch: String?): Boolean =
+        marker == null || marker.krxCapabilityEpoch == epoch
+
+    /** Permit and first epoch guard, before admission and any suspending read (D4 I3/I8). */
+    private fun krxHandoverEligibleLocked(context: TopicGrantContext, marker: KrxSendMarker?): Boolean {
+        val state = checkNotNull(contestState)
+        return contextMatchesContestKeyLocked(context) &&
+            (marker?.permitSeq ?: state.permitSeq) == state.permitSeq &&
+            checkNotNull(krxHandoverState).rejectedPermit < state.permitSeq &&
+            krxEpochMatches(marker, lossSeals.lastConfirmed?.krxCapabilityEpoch)
+    }
+
+    /** Lineage is accepted only for blocking and held candidates, never for processing a retired token's refusal. */
+    private fun krxBlockersLocked(afterOrder: Long): List<TopicRejectionReservation> {
+        val issued = issuedTopicGrant ?: return emptyList()
+        if (!contextMatchesContestKeyLocked(issued.context)) return emptyList()
+        return rejectionLedger.pendingReservations().filter {
+            it.order > afterOrder && issued.issuedFor(it.grant) &&
+                TopicRejection.of(it.reasons) == TopicRejection.KRX_ENTITLEMENT_REQUIRED &&
+                krxHandoverEligibleLocked(issued.context, it.marker)
+        }
+    }
+
+    /** H1/H1′ and W2: recording the first handover is inseparable from its hide evidence. */
+    private fun handOverKrxLocked(order: Long, permit: Long) {
+        val handover = checkNotNull(krxHandoverState)
+        handover.rejectedPermit = permit
+        handover.withheld = null
+        hideKrxContestLocked(order)
+    }
+
+    /** Abandon and cancellation cannot wait for the PAC mutex on the session's serial scope. OFF launches nothing. */
+    private fun evaluateEndedRejection(reservation: TopicRejectionReservation) {
+        if (!krxContest.enabled) return
+        scope.launch { mutex.withLock { evaluateEndedRejectionLocked(reservation) } }
+    }
+
+    private suspend fun evaluateEndedRejectionLocked(reservation: TopicRejectionReservation) {
+        val handover = krxHandoverState ?: return
+        val waiting = handover.withheld ?: return
+        // An originally ineligible reservation cannot become a new W3 reason just by ending (I8).
+        if (reservation.order !in waiting.blockingOrders) return
+        syncContestKeyLocked()
+        republishEffectiveLocked()
+        if (handover.withheld !== waiting) return
+        val state = checkNotNull(contestState)
+        if (state.phase != KrxContestPhase.AWAITING || handover.rejectedPermit >= state.permitSeq || recheckDemand != null) return
+        if (rejectionLedger.pendingReservations().any { it.order in waiting.blockingOrders }) return
+        // W3 owns the permit's one handover, without replaying a refused or stale decision.
+        handover.rejectedPermit = state.permitSeq
+        handover.withheld = null
+        raiseDemandLocked(RefreshIntent.FORCE_ENTITLEMENTS, independent = true)
+        publishContestViewLocked()
+        ensureDemandArmedLocked()
+    }
+
+    /** Reopening first observes C0, then joins an unsent demand or lets an already-new-enough query answer for it. */
+    private fun resumeKrxReopenLocked() {
+        val handover = krxHandoverState ?: return
+        syncContestKeyLocked()
+        val owed = handover.reopenOwed
+        if (owed != null && accessAdmittedLocked()) {
+            val reportOrder = checkNotNull(handover.reopenAfterOrder)
+            handover.reopenOwed = null
+            handover.reopenAfterOrder = null
+            if (owed.key == contestKey && owed.permitSeq == contestState?.permitSeq &&
+                inFlightQueries.none { (order, query) ->
+                    order > reportOrder && query.binding == probeEpoch && query.intent >= RefreshIntent.FORCE_ENTITLEMENTS
+                }
+            ) {
+                raiseDemandLocked(RefreshIntent.FORCE_ENTITLEMENTS, independent = true)
+            }
+        }
+        publishContestViewLocked()
+        republishEffectiveLocked()
     }
 
     /** Delayed C0 comparison. Capability epoch and grant token deliberately do not participate. */
     private fun syncContestKeyLocked() {
-        if (!krxContest.enabled) return
-        val key = KrxContestKey(probeEpoch, boundIdentityLocked(), lossSeals.lastConfirmed?.userAccessEpoch, decisionGeneration)
+        val handover = krxHandoverState ?: return
+        val key = currentContestKeyLocked()
         if (key == contestKey) return
         contestKey = key
+        handover.withheld = null
+        handover.reopenOwed = null
+        handover.reopenAfterOrder = null
         stepContestLocked(KrxContestEvent.KeyChanged(
             openOnEntry = _krx.value == KrxCapabilityState.VISIBLE && _state.value.state.grantsPremiumRuntime
         ))
@@ -2668,6 +2814,12 @@ class PremiumAccessCoordinator(
             is KrxContestStep.Applied -> {
                 val after = step.state
                 contestState = after
+                if (after.permitSeq != before.permitSeq) {
+                    val handover = checkNotNull(krxHandoverState)
+                    handover.withheld = null
+                    handover.reopenOwed = null
+                    handover.reopenAfterOrder = null
+                }
                 if (after.phase != KrxContestPhase.HOLD || after.holdExpired) {
                     holdTimer?.cancel()
                     holdTimer = null
@@ -2705,10 +2857,10 @@ class PremiumAccessCoordinator(
         republishEffectiveLocked()
     }
 
-    private fun krxTopicCandidateStampLocked(): Pair<KrxContestKey?, Long>? {
+    private fun krxTopicCandidateStampLocked(permit: Long?): Pair<KrxContestKey?, Long>? {
         if (!krxContest.enabled) return null
         syncContestKeyLocked()
-        return contestKey to checkNotNull(contestState).permitSeq
+        return contestKey to checkNotNull(permit)
     }
 
     private fun krxQueryPublicationLocked(started: StartedQuery, candidate: Boolean): KrxQueryPublication? {
@@ -2728,6 +2880,22 @@ class PremiumAccessCoordinator(
                 if (outcome.krxVisible) KrxAnswerKind.PENDING_TRUE else KrxAnswerKind.PENDING_FALSE
             else -> return // Authoritative premium losses have already changed the key (C0).
         }
+        val state = checkNotNull(contestState)
+        val handover = checkNotNull(krxHandoverState)
+        if (!publication.stale && kind == KrxAnswerKind.STABLE_TRUE && _state.value.state.grantsPremiumRuntime) {
+            val blockers = krxBlockersLocked(publication.started.order)
+            if (blockers.isNotEmpty()) {
+                if (state.phase == KrxContestPhase.AWAITING) {
+                    handover.withheld = KrxWithheld(publication.started.order, blockers.map { it.order })
+                    return // W1 leaves HEAD demand settlement intact, but never enters 0a Answer.
+                }
+                if (state.phase == KrxContestPhase.OPEN ||
+                    (state.phase == KrxContestPhase.HOLD && !state.holdExpired)
+                ) return // T3
+            }
+            if (state.phase == KrxContestPhase.AWAITING) handover.withheld = null // T2, including HOLD entry.
+        }
+        if (!publication.stale && kind == KrxAnswerKind.STABLE_FALSE) handover.withheld = null // C1
         stepContestLocked(KrxContestEvent.Answer(publication.started.order, kind, _state.value.state.grantsPremiumRuntime))
     }
 
@@ -2857,7 +3025,8 @@ class PremiumAccessCoordinator(
             val topic = it.provenance as? CandidateProvenance.Topic
             topic != null && topic.contestKey == contestKey && topic.contestPermitSeq == state.permitSeq
         }
-        val awaiting = state.phase == KrxContestPhase.AWAITING && !topicOwnsFollowUp
+        val awaiting = state.phase == KrxContestPhase.AWAITING && !topicOwnsFollowUp &&
+            checkNotNull(krxHandoverState).reopenOwed == null
         val hiddenCandidate = queryCandidate &&
             (state.phase == KrxContestPhase.OPEN || state.phase == KrxContestPhase.HOLD) &&
             _krx.value == KrxCapabilityState.HIDDEN
@@ -2877,7 +3046,8 @@ class PremiumAccessCoordinator(
         /** A WebSocket refusal: the grant it refused and the context that grant was issued in. No query order is made up. */
         data class Topic(
             val grant: TopicGrantToken, val context: TopicGrantContext,
-            val contestKey: KrxContestKey? = null, val contestPermitSeq: Long? = null
+            val contestKey: KrxContestKey? = null, val contestPermitSeq: Long? = null,
+            val marker: KrxSendMarker? = null
         ) : CandidateProvenance
     }
 
@@ -2954,7 +3124,7 @@ class PremiumAccessCoordinator(
             ) add(TopicAccessBlock.KRX_CONTESTED)
         }
         val issued = issuedTopicGrant
-        val current = if (binding != null && record != null) TopicGrantContext(binding, record.fence(), decisionGeneration) else null
+        val current = if (binding != null && record != null) TopicGrantContext(binding, grantFence(record.fence()), decisionGeneration) else null
         return TopicAccessFacts(
             token = issued?.token,
             issuedFor = issued?.context,
@@ -2999,7 +3169,9 @@ class PremiumAccessCoordinator(
             lastUserEnd = lastUserEnd,
             lastCapabilityEnd = lastCapabilityEnd,
             userEndInvalidationsFloor = userEndInvalidationsFloor,
-            krxPermitSeq = if (krxContest.enabled) checkNotNull(contestState).permitSeq else 0L
+            krxPermitSeq = if (krxContest.enabled) checkNotNull(contestState).permitSeq else 0L,
+            capabilityInvalidations = if (!krxContest.enabled) 0L else previous.capabilityInvalidations +
+                if (previous.facts.capabilityAllowed && !facts.capabilityAllowed) 1L else 0L
         )
         if (next == previous) return
         val published = next.copy(revision = previous.revision + 1)
@@ -3175,6 +3347,17 @@ class PremiumAccessCoordinator(
             if (!accessAdmittedLocked()) {
                 return RecoveryNext.AwaitAdmission(attemptSignal.value, _persistenceSignal.value)
             }
+            if (krxContest.enabled && candidate.provenance is CandidateProvenance.Topic &&
+                candidate.provenance.contestPermitSeq != null
+            ) {
+                syncContestKeyLocked()
+                if (candidate.provenance.contestPermitSeq != contestState?.permitSeq ||
+                    contestState?.phase == KrxContestPhase.HOLD
+                ) {
+                    releaseCandidateLocked(candidate)
+                    continue
+                }
+            }
             if (knownStaleWithoutRecordLocked(candidate.provenance, candidate.binding)) {
                 releaseCandidateLocked(candidate, stale = true)
                 continue
@@ -3215,8 +3398,11 @@ class PremiumAccessCoordinator(
             }
             is CandidateProvenance.Topic -> {
                 val context = provenance.context
+                if (krxContest.enabled && provenance.contestPermitSeq != null &&
+                    !krxEpochMatches(provenance.marker, record.krxCapabilityEpoch)
+                ) return CandidateCheck.Stale
                 if (issuedTopicGrant?.takeIf { it.issuedFor(provenance.grant) }?.context != context) return CandidateCheck.Stale
-                if (context.generation != decisionGeneration || record.fence() != context.access) return CandidateCheck.Stale
+                if (context.generation != decisionGeneration || grantFence(record.fence()) != context.access) return CandidateCheck.Stale
                 if (boundIdentityLocked() != context.identity) return CandidateCheck.Stale
                 return when (source.currentIdentity()) {
                     context.identity -> CandidateCheck.Valid(record)
@@ -3292,7 +3478,7 @@ class PremiumAccessCoordinator(
             if (stale && candidateContestKeyLocked(candidate) == contestKey &&
                 (candidate.provenance !is CandidateProvenance.Topic ||
                     candidate.provenance.contestPermitSeq == contestState?.permitSeq) &&
-                contestState?.phase == KrxContestPhase.AWAITING
+                contestState?.phase == KrxContestPhase.AWAITING && checkNotNull(krxHandoverState).reopenOwed == null
             ) {
                 if (recheckDemand == null) raiseDemandLocked(RefreshIntent.FORCE_ENTITLEMENTS, independent = true)
             }
