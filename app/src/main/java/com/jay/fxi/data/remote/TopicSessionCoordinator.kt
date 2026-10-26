@@ -6,6 +6,10 @@ import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.HttpExchangeEvidence
+import com.jay.fxi.data.entitlements.KrxSendAdmission
+import com.jay.fxi.data.entitlements.KrxSendMarker
+import com.jay.fxi.data.entitlements.KrxSendReadAuthority
+import com.jay.fxi.data.entitlements.krxConsumerGuard
 import com.jay.fxi.data.graph.GraphDataScope
 import com.jay.fxi.data.local.TopicLastKnownRestore
 import com.jay.fxi.data.remote.dto.DxySpotEntry
@@ -66,6 +70,12 @@ object TopicCatalogue {
 
     /** Named so S6 has one place to add it, and so nothing else reaches for the string. */
     const val KRX_FUTURES = "krx:usd-krw-futures"
+
+    /**
+     * Whether [topic] is the KRX one: the single predicate the session's KRX paths ask (S6-2b-1b design r5 §6.3, D-13) — the WebSocket
+     * attempt that carries it, the REST issue that reads its marker, and the REST hand-over of its `unknown_topic`.
+     */
+    internal fun carriesKrx(topic: String): Boolean = topic == KRX_FUTURES
 }
 
 /**
@@ -205,7 +215,9 @@ private sealed interface SessionInput {
         val topic: String,
         val outcome: TopicSnapshotOutcome,
         /** The use its issue acquired (L-4e E2a). A delivered snapshot is applied only while this is still admitted. */
-        val lifetime: TopicUseLifetime
+        val lifetime: TopicUseLifetime,
+        /** The KRX issue's send marker, kept across transport's 401 replay; absent for other topics or without a reader. */
+        val marker: KrxSendMarker?
     ) : SessionInput
 
     /** A display seed returned to the grant that started its read. */
@@ -533,6 +545,82 @@ class TopicSessionCoordinator(
 
     /** This instance, as the attributions it hands out name it: another session's grant epoch can be the same number. */
     private val sessionKey = Any()
+
+    /**
+     * The KRX send read and the refusal channel that carries a send marker (S6-2b-1b design r5 §3, OD-B06 (a), D-8). Both types are
+     * internal, so the public constructor cannot name them: only the internal one sets these, and they stay null otherwise.
+     */
+    private var krxSendReader: KrxSendReadAuthority? = null
+    private var onRejectedWithMarker: ((TopicSessionFence, Map<String, TopicRejectionReason>, KrxSendMarker?) -> Unit)? = null
+
+    /**
+     * The public constructor with the KRX send read and the marker refusal channel added (S6-2b-1b design r5 §3, OD-B06 (a)).
+     *
+     * Every other parameter, its order and its default are the public constructor's, documented there. [krxSendReader] is required
+     * (no default), so a call that does not name it always resolves to the public constructor; [onRejectedWithMarker] defaults to null,
+     * the absent channel of D-8. A null [krxSendReader] is the reader-less session of E-07/E-35, the same as one built by the public
+     * constructor: a KRX attempt reads `authority` alone and captures no marker. Reader and channel are separate: with a channel and no
+     * reader, a WebSocket refusal still goes to the channel with marker = null, and a REST Unsupported is not handed to the issuer.
+     */
+    internal constructor(
+        scope: CoroutineScope,
+        clock: TopicCommandClock,
+        connect: (generation: Long) -> TopicTransport,
+        credentials: TopicCommandCredentials,
+        orders: AccessOrderSequence,
+        authority: TopicUseAuthority,
+        bootstrap: suspend (owner: AuthIdentityFence, topic: String, useAdmitted: () -> Boolean) -> TopicSnapshotOutcome,
+        store: TopicSubscriptionStateStore,
+        encode: (TopicSubscribeRequest) -> String,
+        newRequestId: () -> String,
+        jitter: () -> Double,
+        liveIdentity: () -> AuthIdentityFence?,
+        onBootstrapHttpEvidence: (statusCode: Int?, retryAfter: String?) -> Unit = { _, _ -> },
+        bootstrapNotBeforeMillis: () -> Long = { 0L },
+        bootstrapIssueGap: Duration = TopicBootstrapOrder.ISSUE_GAP,
+        onRejected: (owner: TopicSessionFence, rejected: Map<String, TopicRejectionReason>) -> Unit = { _, _ -> },
+        onAcknowledgement: (TopicCommandAcknowledgement) -> Unit = {},
+        onUndecodable: (length: Int, failure: String) -> Unit = { _, _ -> },
+        onTopicState: (TopicSubscriptionSnapshot) -> Unit = {},
+        onBootstrapUndelivered: (attribution: TopicUseAttribution, topic: String, outcome: TopicSnapshotOutcome) -> Unit =
+            { _, _, _ -> },
+        desired: Set<String> = TopicCatalogue.DESIRED,
+        restoreSeed: (suspend (TopicSessionFence) -> TopicLastKnownRestore)? = null,
+        offerLive: ((uid: String, userAccessEpoch: String, rates: TopicRates) -> Unit)? = null,
+        graphSink: TopicGraphSink = DormantTopicGraphSink,
+        wallClock: () -> Long = System::currentTimeMillis,
+        krxSendReader: KrxSendReadAuthority?,
+        onRejectedWithMarker: ((TopicSessionFence, Map<String, TopicRejectionReason>, KrxSendMarker?) -> Unit)? = null
+    ) : this(
+        scope = scope,
+        clock = clock,
+        connect = connect,
+        credentials = credentials,
+        orders = orders,
+        authority = authority,
+        bootstrap = bootstrap,
+        store = store,
+        encode = encode,
+        newRequestId = newRequestId,
+        jitter = jitter,
+        liveIdentity = liveIdentity,
+        onBootstrapHttpEvidence = onBootstrapHttpEvidence,
+        bootstrapNotBeforeMillis = bootstrapNotBeforeMillis,
+        bootstrapIssueGap = bootstrapIssueGap,
+        onRejected = onRejected,
+        onAcknowledgement = onAcknowledgement,
+        onUndecodable = onUndecodable,
+        onTopicState = onTopicState,
+        onBootstrapUndelivered = onBootstrapUndelivered,
+        desired = desired,
+        restoreSeed = restoreSeed,
+        offerLive = offerLive,
+        graphSink = graphSink,
+        wallClock = wallClock
+    ) {
+        this.krxSendReader = krxSendReader
+        this.onRejectedWithMarker = onRejectedWithMarker
+    }
 
     private class Connection(
         val generation: Long,
@@ -1232,6 +1320,15 @@ class TopicSessionCoordinator(
                 val attribution = TopicUseAttribution(sessionKey, owner, grantEpoch, input.lifetime)
                 val delivered = input.outcome as? TopicSnapshotOutcome.Delivered
                 if (delivered == null) {
+                    // KRX unknown_topic goes through the marker channel before observers, even if the general use was withdrawn.
+                    // The public undelivered policy still observes it; it must not reserve this refusal a second time.
+                    val marker = input.marker
+                    if (input.outcome is TopicSnapshotOutcome.Unsupported && TopicCatalogue.carriesKrx(input.topic) &&
+                        marker != null && krxConsumerGuard(marker.permitSeq)
+                    ) {
+                        onRejectedWithMarker?.invoke(attribution.owner,
+                            mapOf(input.topic to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED), marker)
+                    }
                     offerGraphRestUndelivered(input.topic, input.outcome, attribution)
                     // A refusal or a failure is handed to its owner whatever the use came to: that is control flow (L-4e E2a).
                     return onBootstrapUndelivered(attribution, input.topic, input.outcome)
@@ -1483,7 +1580,11 @@ class TopicSessionCoordinator(
      * [TopicAnswerDenial.ENDED_CONNECTION] and [TopicAnswerDenial.LATCHED] are defensive: an ended connection has already
      * cancelled its commands, and both latches end their connection as they are set.
      */
-    private fun admitsAnswer(live: Connection, rejected: Map<String, TopicRejectionReason>): TopicAnswerAdmission {
+    private fun admitsAnswer(
+        live: Connection,
+        rejected: Map<String, TopicRejectionReason>,
+        marker: KrxSendMarker?
+    ): TopicAnswerAdmission {
         val still = current(live.generation) ?: return TopicAnswerAdmission.Denied(TopicAnswerDenial.ENDED_CONNECTION)
         if (still.fence == refusedFor || still.fence == identityLostFor) {
             return TopicAnswerAdmission.Denied(TopicAnswerDenial.LATCHED)
@@ -1495,7 +1596,10 @@ class TopicSessionCoordinator(
             settleRefusal(still, rejected)
             endGraphUse(still.lifetime)
             end(still, TopicDisconnectCause.DELIBERATE)
-            if (rejected.isNotEmpty()) onRejected(still.fence, rejected)
+            if (rejected.isNotEmpty()) {
+                val channel = onRejectedWithMarker
+                if (channel != null) channel(still.fence, rejected, marker) else onRejected(still.fence, rejected)
+            }
             return TopicAnswerAdmission.Denied(TopicAnswerDenial.ACCESS_WITHHELD)
         }
         val refusesPremium = rejected.values.any { it == TopicRejectionReason.PREMIUM_REQUIRED }
@@ -2323,13 +2427,20 @@ class TopicSessionCoordinator(
         // Per command, read at each admission decision and consumed only by an admitted ACK.
         // A failure or refresh also asks for admission; the ACK's own call replaces that reading.
         var beforeAnswer: TopicSubscriptionSnapshot? = null
+        // Reset by encode for every attempt, including a credential replay. Both use and marker belong to its one send read.
+        var attemptRequest: TopicSubscribeRequest? = null
+        var attemptAdmission: KrxSendAdmission? = null
         val command = TopicSubscribeCommand(
             purpose = purpose,
             store = store,
             credentials = boundTo(live.fence),
             orders = orders,
             clock = clock,
-            encode = encode,
+            encode = { request ->
+                attemptRequest = request
+                attemptAdmission = null
+                encode(request)
+            },
             // Refuses the send and asks the loop to enforce the expiry. Ending the connection
             // from here would cancel this command's own coroutine, so the teardown stays with the
             // loop — but the discovery must not stay here: without the message the socket lives on
@@ -2343,7 +2454,13 @@ class TopicSessionCoordinator(
                     manual != null && (!manualAdmitted(live, manual.grantEpoch) ||
                         topics().isEmpty() && revalidationTopics().isEmpty() && manualScope(live, id, manual).isEmpty()) -> false
                     // The use first (L-4e E2a): a withheld use is not a lease that ran out, and ending it must not start a ladder.
-                    !authority.admits(live.lifetime) -> {
+                    !run {
+                        val read = if (attemptRequest?.topics?.any(TopicCatalogue::carriesKrx) == true) {
+                            krxSendReader?.admitsWithKrx(live.lifetime)
+                        } else null
+                        attemptAdmission = read
+                        read?.admitted ?: authority.admits(live.lifetime)
+                    } -> {
                         if (current(live.generation) === live) endGraphUse(live.lifetime)
                         post(SessionInput.AccessWithheldDue(live.generation))
                         false
@@ -2364,7 +2481,7 @@ class TopicSessionCoordinator(
             onAcknowledged = { ack ->
                 val before = checkNotNull(beforeAnswer)
                 beforeAnswer = null
-                onAcknowledged(live, id, ack, before)
+                onAcknowledged(live, id, ack, before, attemptAdmission?.marker)
             },
             onClassifiedFailure = { onClassifiedFailure(live) },
             onAuthRefreshUnusable = {
@@ -2372,7 +2489,7 @@ class TopicSessionCoordinator(
             },
             onRequestStarted = ::publishState,
             admitAnswer = { rejected ->
-                admitsAnswer(live, rejected).also {
+                admitsAnswer(live, rejected, attemptAdmission?.marker).also {
                     beforeAnswer = store.snapshot
                 }
             },
@@ -2467,7 +2584,8 @@ class TopicSessionCoordinator(
         live: Connection,
         commandId: Long,
         ack: TopicCommandAcknowledgement,
-        before: TopicSubscriptionSnapshot
+        before: TopicSubscriptionSnapshot,
+        marker: KrxSendMarker?
     ) {
         offerGraphAcknowledgement(live, ack, before)
         // The server answered, so the request channel is free — before the delivery wait, which
@@ -2505,7 +2623,10 @@ class TopicSessionCoordinator(
         // Reported before the two observers below (L-4e E4a): the refusal is settled and its leases handled, and an observer that
         // throws must not keep the grant's refusal from the issuer. `live.fence`, not the session's current one: the refusal
         // above may already have ended this connection, and the grant it answered is the one this connection was opened under.
-        if (ack.rejected.isNotEmpty()) onRejected(live.fence, ack.rejected)
+        if (ack.rejected.isNotEmpty()) {
+            val channel = onRejectedWithMarker
+            if (channel != null) channel(live.fence, ack.rejected, marker) else onRejected(live.fence, ack.rejected)
+        }
         // The acknowledgement's own store writes happen inside the command, not on the loop, so
         // the turn-boundary publication would not carry them until something else arrives.
         publishState()
@@ -2680,13 +2801,21 @@ class TopicSessionCoordinator(
             }
             // Each issue is its own start (L-4e E2a): acquired right before it is taken off what is owed, never carried over from
             // the issue before it, whose job was already enqueued. Refused, nothing is consumed and the plan waits.
-            val lifetime = useLifetime() ?: return cancelBootstrapIssue()
+            val read = if (TopicCatalogue.carriesKrx(next)) {
+                fence?.let { krxSendReader?.acquireWithKrx(it) }
+            } else null
+            val lifetime = if (read != null) {
+                read.lifetime.also {
+                    if (it == null) endGraphAuthority(TopicGraphEventReason.USE_WITHHELD)
+                }
+            } else useLifetime()
+            if (lifetime == null) return cancelBootstrapIssue()
             openGraphAuthority(lifetime)
             unissuedBootstraps.remove(next)
             requestedBootstraps.remove(next)
             bootstrapFirstBatch = if (usesFirstBatch) (batch ?: shown) - next else emptySet()
             lastBootstrapIssuedAtMillis = now
-            startBootstrap(next, lifetime)
+            startBootstrap(next, lifetime, read?.marker)
         }
     }
 
@@ -2741,7 +2870,7 @@ class TopicSessionCoordinator(
      * The job reports that it ended from `finally`, apart from its answer: the identity-change path posts no answer, and a
      * cancelled job posts none either, and both must still leave [bootstrapsOut].
      */
-    private fun startBootstrap(topic: String, lifetime: TopicUseLifetime) {
+    private fun startBootstrap(topic: String, lifetime: TopicUseLifetime, marker: KrxSendMarker?) {
         // The session's own conditions only: the use was acquired in this turn and the topic already taken off what is owed, so
         // a live re-read here could only drop the topic silently.
         if (!sessionWanted() || topic !in desired) return
@@ -2774,7 +2903,7 @@ class TopicSessionCoordinator(
                 (outcome as? TopicSnapshotOutcome.Refused)?.failure?.let { failure ->
                     onBootstrapHttpEvidence(failure.statusCode, failure.retryAfter)
                 }
-                post(SessionInput.BootstrapAnswered(epoch, topic, outcome, lifetime))
+                post(SessionInput.BootstrapAnswered(epoch, topic, outcome, lifetime, marker))
             } finally {
                 post(SessionInput.BootstrapSettled(requestId))
             }

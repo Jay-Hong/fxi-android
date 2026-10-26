@@ -3,14 +3,21 @@ package com.jay.fxi.data.graph
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.entitlements.admitsUse
+import com.jay.fxi.data.entitlements.krxConsumerGuard
 import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.remote.TopicUseLifetime
 
-/** The caller's session and use lifetime, with the capability epoch allowed when bound. */
+/**
+ * The caller's session and use lifetime, with the capability epoch allowed when bound.
+ *
+ * [capabilityInvalidations] is the snapshot's count when bound (S6-2b-1b design r5 §3, D-27), zero while the contest is off. The
+ * default keeps three-argument constructions as they are.
+ */
 internal data class GraphV2AccessCapture(
     val fence: TopicSessionFence,
     val lifetime: TopicUseLifetime,
-    val krxCapabilityEpoch: String?
+    val krxCapabilityEpoch: String?,
+    val capabilityInvalidations: Long = 0L
 )
 
 internal data class GraphV2CapabilityConfiguration(val recordEpoch: String?, val allowed: Boolean)
@@ -37,7 +44,7 @@ internal class GraphV2AccessGate(
             access.facts.recordFence?.krxCapabilityEpoch, access.facts.capabilityAllowed
         )
         val epoch = configuration.recordEpoch.takeIf { configuration.allowed }
-        return GraphV2AccessBinding(GraphV2AccessCapture(fence, lifetime, epoch), configuration)
+        return GraphV2AccessBinding(GraphV2AccessCapture(fence, lifetime, epoch, access.capabilityInvalidations), configuration)
     }
 
     fun admits(captured: GraphV2AccessCapture, component: GraphV2DiskComponent): Boolean {
@@ -52,9 +59,14 @@ internal class GraphV2AccessGate(
     fun ioAdmission(captured: GraphV2AccessCapture): GraphV2IoAdmission =
         GraphV2IoAdmission { component -> admits(captured, component) }
 
+    /**
+     * [krxCapabilityInvalidations] is the count the KRX component is attributed to: the capture's own by default, the original
+     * request's or seed's when memory is exposed under a freshly bound capture (S6-2b-1b design r5 §3, D-6).
+     */
     fun joinForExposure(
         captured: GraphV2AccessCapture,
-        components: GraphV2DiskComponents
+        components: GraphV2DiskComponents,
+        krxCapabilityInvalidations: Long = captured.capabilityInvalidations
     ): GraphV2ComponentJoin? {
         val access = admittedSnapshot(captured.fence, captured.lifetime) ?: return null
         val general = components.general
@@ -62,7 +74,7 @@ internal class GraphV2AccessGate(
             general.key.userAccessEpoch != captured.fence.userAccessEpoch
         ) return null
         val krx = components.krx?.takeIf {
-            admitsKrx(captured, access) && it.key.krxCapabilityEpoch == captured.krxCapabilityEpoch
+            admitsKrx(captured, access, krxCapabilityInvalidations) && it.key.krxCapabilityEpoch == captured.krxCapabilityEpoch
         }
         return joinGraphV2Components(general, krx)
     }
@@ -76,6 +88,13 @@ internal class GraphV2AccessGate(
         return access.takeIf { it.admitsUse(lifetime) }
     }
 
-    private fun admitsKrx(captured: GraphV2AccessCapture, access: TopicAccessSnapshot): Boolean =
-        captured.krxCapabilityEpoch != null && access.facts.capabilityAllowed
+    private fun admitsKrx(
+        captured: GraphV2AccessCapture,
+        access: TopicAccessSnapshot,
+        krxCapabilityInvalidations: Long = captured.capabilityInvalidations
+    ): Boolean =
+        captured.krxCapabilityEpoch != null && access.facts.capabilityAllowed &&
+            (!krxConsumerGuard(access.krxPermitSeq) ||
+                captured.krxCapabilityEpoch == access.facts.recordFence?.krxCapabilityEpoch &&
+                krxCapabilityInvalidations == access.capabilityInvalidations)
 }

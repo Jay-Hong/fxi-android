@@ -34,6 +34,8 @@ import org.junit.Test
  *
  * This test is amended by agreement when S6-2a, S6-2b, S6-3, S6-4 or S6-5 deliberately adds a caller; deleting, skipping or
  * assuming it away is not allowed (`scope.r4.md:596`).
+ *
+ * Z05 amended by **S6-2b-1b-α contract tests r1** (design `s6_2b1b_contracts.r5.md` §6.3, §8.2, §13 T.8).
  */
 class KrxS6DormancyContractTest {
 
@@ -137,17 +139,89 @@ class KrxS6DormancyContractTest {
     /**
      * Z05: the KRX topic name. Catches MZ-04 (the subscribe/desired side reaching for KRX_FUTURES, a new literal) and one more
      * literal inside the two files that already hold one (which a file set would let through).
+     *
+     * Amended by agreement for S6-2b-1b-α (**S6-2b-1b-α contract tests r1**, design `s6_2b1b_contracts.r5.md` §6.3 D-13, §8.2,
+     * §13 T.8): the session must tell a KRX attempt (WS send read, REST marker capture, REST hand-over), so TSC names KRX_FUTURES
+     * twice — the declaration and the body of the single internal predicate in TopicCatalogue (`carriesKrx`, the α stub's name). The
+     * file set and the literal counts are unchanged. Two assertions are added: outside the declaration, KRX_FUTURES appears only in that
+     * predicate body; the predicate is called only from TSC. A third (review) locks the predicate's place: one `fun carriesKrx(` in TSC,
+     * declared `internal` inside the braces of `object TopicCatalogue` (§6.3 "TopicCatalogue 안 internal 술어"). Catches, besides MZ-04:
+     * a second KRX test written inline in TSC, the predicate called from another file (e.g. TopicRuntime, the rejected OD-B08 (가)), and
+     * the predicate moved into the session class or made private there.
      */
     @Test fun Z05_krxTopicNameStaysDeclaredOnceAndUnusedOutsideTheAdapter() {
         val krxFutures = Regex("""\bKRX_FUTURES\b""")
-        assertEquals("KRX_FUTURES files", setOf(TSC, ADAPTER), files(krxFutures))
-        // TopicSessionCoordinator.kt:68 - the declaration only.
-        assertEquals("KRX_FUTURES once in TSC", 1, krxFutures.findAll(code.getValue(TSC)).count())
+        assertEquals("Z05 KRX_FUTURES files", setOf(TSC, ADAPTER), files(krxFutures))
+        val tsc = code.getValue(TSC)
+        assertTrue("Z05 positive control: TopicCatalogue declares the predicate", Regex("""\bfun\s+carriesKrx\s*\(""").containsMatchIn(tsc))
+        // Added (c, review): the predicate is internal and sits inside object TopicCatalogue.
+        val internalPredicate = Regex("""\binternal\s+fun\s+carriesKrx\s*\(""")
+        assertEquals("Z05 (added) one carriesKrx declaration in TSC", 1, Regex("""\bfun\s+carriesKrx\s*\(""").findAll(tsc).count())
+        assertTrue("Z05 (added) the predicate is internal in object TopicCatalogue", internalPredicate.containsMatchIn(catalogueBody(tsc)))
+        val moved = tsc.replaceFirst(internalPredicate, "private fun carriesKrxGone(") +
+            "\nclass Elsewhere { private fun carriesKrx(topic: String): Boolean = topic == TopicCatalogue.KRX_FUTURES }\n"
+        assertTrue("Z05 self-check: a private predicate outside TopicCatalogue is caught", !internalPredicate.containsMatchIn(catalogueBody(moved)))
+        // TopicSessionCoordinator.kt:68 (declaration) + the TopicCatalogue predicate body (S6-2b-1b-α).
+        assertEquals("Z05 KRX_FUTURES twice in TSC (declaration + predicate body)", 2, krxFutures.findAll(tsc).count())
         // TopicFrameDecoder.kt:63, TopicSessionCoordinator.kt:68.
-        assertEquals("topic literal occurrences", mapOf(DECODER to 1, TSC to 1), occurrences(Regex(""""krx:usd-krw-futures"""")))
+        assertEquals("Z05 topic literal occurrences", mapOf(DECODER to 1, TSC to 1), occurrences(Regex(""""krx:usd-krw-futures"""")))
+        // Added (a): outside the one declaration, the one use is the predicate body.
+        assertEquals("Z05 (added) one KRX_FUTURES declaration in TSC", 1, Regex("""\bconst\s+val\s+KRX_FUTURES\s*=""").findAll(tsc).count())
+        val body = predicateBody(tsc)
+        assertEquals("Z05 (added) the predicate body names KRX_FUTURES once", 1, krxFutures.findAll(body).count())
+        assertEquals("Z05 (added) outside the declaration, KRX_FUTURES is used only in the predicate body",
+            krxFutures.findAll(body).count(), krxFutures.findAll(tsc).count() - 1)
+        // Added (b): the predicate's callers.
+        assertEquals("Z05 (added) carriesKrx is called only in TSC", setOf(TSC), carriesKrxCallers(code))
         // Positive control.
-        assertTrue("TopicCatalogue.TETHER is found in at least two files", files(Regex("""\bTopicCatalogue\.TETHER\b""")).size >= 2)
+        assertTrue("Z05 TopicCatalogue.TETHER is found in at least two files", files(Regex("""\bTopicCatalogue\.TETHER\b""")).size >= 2)
+        val elsewhere = code + (RECORDER_REDUCER to code.getValue(RECORDER_REDUCER) + "\nprivate val k = TopicCatalogue.carriesKrx(t)\n")
+        assertEquals("Z05 self-check: a caller in another file is caught", setOf(TSC, RECORDER_REDUCER), carriesKrxCallers(elsewhere) + TSC)
     }
+
+    /** Z05: the text of `fun carriesKrx(…)`'s body — an expression body up to the next declaration line, or a braced block. */
+    private fun predicateBody(text: String): String {
+        val head = checkNotNull(Regex("""\bfun\s+carriesKrx\s*\([^)]*\)\s*(?::\s*[\w.?]+\s*)?""").find(text)) { "Z05 no carriesKrx declaration" }
+        var i = head.range.last + 1
+        while (i < text.length && text[i].isWhitespace()) i++
+        return when (text.getOrNull(i)) {
+            '{' -> {
+                var depth = 0
+                var j = i
+                while (j < text.length) {
+                    if (text[j] == '{') depth++
+                    if (text[j] == '}') { depth--; if (depth == 0) break }
+                    j++
+                }
+                text.substring(i, minOf(j + 1, text.length))
+            }
+            '=' -> {
+                val rest = text.substring(i + 1)
+                val end = Regex("""\n\s*(?:\}|internal\b|private\b|public\b|val\b|var\b|fun\b|const\b|override\b|@)""").find(rest)?.range?.first ?: rest.length
+                rest.substring(0, end)
+            }
+            else -> error("Z05 carriesKrx has no body")
+        }
+    }
+
+    /** Z05: the text between the braces of `object TopicCatalogue` (braces matched; a literal brace inside a string would count). */
+    private fun catalogueBody(text: String): String {
+        val head = checkNotNull(Regex("""\bobject\s+TopicCatalogue\b[^{]*\{""").find(text)) { "Z05 no object TopicCatalogue" }
+        var depth = 0
+        for (i in head.range.last until text.length) {
+            if (text[i] == '{') depth++
+            if (text[i] == '}') { depth--; if (depth == 0) return text.substring(head.range.last + 1, i) }
+        }
+        error("Z05 object TopicCatalogue does not close")
+    }
+
+    /** Z05: files calling `carriesKrx(` (a `fun carriesKrx(` declaration is not a call). */
+    private fun carriesKrxCallers(map: Map<String, String>): Set<String> =
+        map.filterValues { text ->
+            Regex("""\bcarriesKrx\s*\(""").findAll(text).any { match ->
+                !Regex("""\bfun\s+$""").containsMatchIn(text.substring(maxOf(0, match.range.first - 8), match.range.first))
+            }
+        }.keys
 
     /**
      * Z06: no subscribe/unsubscribe command is added. Catches MZ-05 (an unwired KRX subscribe/unsubscribe command, P1(a)), a second

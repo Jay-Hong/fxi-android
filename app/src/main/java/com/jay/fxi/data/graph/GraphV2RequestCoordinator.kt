@@ -183,7 +183,8 @@ internal class GraphV2RequestCoordinator(
     private data class ProtectedSlot(
         val entry: GraphEntry,
         val components: GraphV2DiskComponents,
-        val supplementGeneration: Long? = null
+        val supplementGeneration: Long? = null,
+        val krxCapabilityInvalidations: Long
     )
 
     private data class ProtectedPublication(
@@ -771,7 +772,7 @@ internal class GraphV2RequestCoordinator(
         val current = publication.context ?: return null
         val slot = publication.slots[key] ?: return null
         val captured = ports.gate.bind(current.fence, current.lifetime) ?: return null
-        val joined = ports.gate.joinForExposure(captured, slot.components) ?: return null
+        val joined = ports.gate.joinForExposure(captured, slot.components, slot.krxCapabilityInvalidations) ?: return null
         return GraphEntry(joined.tab, slot.entry.online200At)
     }
 
@@ -952,7 +953,8 @@ internal class GraphV2RequestCoordinator(
                 registration.configuration != capabilityConfiguration) capabilityGeneration else null
             snapshot = snapshot.copy(entries = snapshot.entries + (event.key to entry))
             protectedSlots = protectedSlots + (event.key to ProtectedSlot(
-                entry, GraphV2DiskComponents(general, krx.takeIf { joined.krxJoined }), pending
+                entry, GraphV2DiskComponents(general, krx.takeIf { joined.krxJoined }), pending,
+                event.captured.capabilityInvalidations
             ))
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -1065,7 +1067,8 @@ internal class GraphV2RequestCoordinator(
             GraphEntry(tab, online200At = null)
         }
         protectedSlots = protectedSlots.mapValues { (key, slot) ->
-            ProtectedSlot(entries.getValue(key), slot.components.copy(krx = null), capabilityGeneration)
+            ProtectedSlot(entries.getValue(key), slot.components.copy(krx = null), capabilityGeneration,
+                slot.krxCapabilityInvalidations)
         }
         snapshot = snapshot.copy(entries = entries)
         requireFlipConfirmation(now)
@@ -1491,7 +1494,9 @@ internal class GraphV2RequestCoordinator(
         })
         val adopted = entry.copy(tab = joinGraphV2Components(memoryComponents.general, memoryComponents.krx).tab)
         snapshot = snapshot.copy(entries = snapshot.entries + (key to adopted))
-        protectedSlots = protectedSlots + (key to ProtectedSlot(adopted, memoryComponents))
+        protectedSlots = protectedSlots + (key to ProtectedSlot(
+            adopted, memoryComponents, krxCapabilityInvalidations = registration.accessCapture?.capabilityInvalidations ?: 0L
+        ))
         return components
     }
 

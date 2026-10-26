@@ -510,6 +510,7 @@ class CutoverSharedProvidersContractTest {
         val fns = functions(all)
         val expected = mapOf(
             "TopicUseAuthority" to graphModule,
+            "KrxSendReadAuthority" to graphModule,
             "DeletionAdmissionStore" to graphModule,
             "GraphSelectionStore" to graphModule,
             "FileGraphV2DiskStore" to graphModule,
@@ -519,7 +520,16 @@ class CutoverSharedProvidersContractTest {
         for ((type, path) in expected) {
             val providers = fns.filter { it.returns == type && ("Provides" in it.annotations || "Binds" in it.annotations) }
             assertEquals("$type has exactly one provider, in $path", listOf(path), providers.map { it.file })
-            assertEquals("$type: exactly @Provides @Singleton, no qualifier", setOf("Provides", "Singleton"), providers.single().annotations)
+            if (type in setOf("TopicUseAuthority", "KrxSendReadAuthority")) {
+                assertTrue("$type: one unqualified binding; singleton root and identity are checked by KW14",
+                    providers.single().annotations in setOf(
+                        setOf("Provides"), setOf("Provides", "Singleton"),
+                        setOf("Binds"), setOf("Binds", "Singleton")
+                    ))
+            } else {
+                assertEquals("$type: exactly @Provides @Singleton, no qualifier",
+                    setOf("Provides", "Singleton"), providers.single().annotations)
+            }
         }
         val bindingAnnotation = Regex("""@(?:[\w.]+\.)?(Provides|Binds)\b""")
         for ((file, text) in stripped.filterKeys { it.endsWith(".kt") }) {
@@ -529,7 +539,7 @@ class CutoverSharedProvidersContractTest {
         }
         // The checks read simple names, so an alias of a DI annotation or of a shared type would hide a binding: none is allowed.
         val relevant = setOf("Provides", "Binds", "Module", "InstallIn", "Singleton", "Inject", "Named", "Qualifier",
-            "TopicUseAuthority", "SnapshotTopicUseAuthority", "DeletionAdmissionStore", "GraphSelectionStore", "BackupableUserIntentStore",
+            "TopicUseAuthority", "KrxSendReadAuthority", "SnapshotTopicUseAuthority", "DeletionAdmissionStore", "GraphSelectionStore", "BackupableUserIntentStore",
             "FileGraphV2DiskStore", "InstallSeedSource", "InstallSeedPrefetch")
         for ((file, text) in stripped) {
             for (m in Regex("""(?m)^import ([\w.]+) as (\w+)""").findAll(text)) {
@@ -551,7 +561,9 @@ class CutoverSharedProvidersContractTest {
             """fun provideGraphSelectionStore\(store: BackupableUserIntentStore\): GraphSelectionStore\s*=\s*store\b"""
         ).containsMatchIn(stripped.getValue(graphModule)))
         assertTrue("the authority reads the issuer's snapshot", Regex(
-            """fun provideTopicUseAuthority\(coordinator: PremiumAccessCoordinator\): TopicUseAuthority\s*=\s*SnapshotTopicUseAuthority\s*\{\s*coordinator\.accessSnapshot\s*}"""
+            """fun\s+\w+\(\s*(\w+)\s*:\s*(?:[\w.]+\.)?PremiumAccessCoordinator\s*\)\s*:\s*""" +
+                """(?:[\w.]+\.)?(?:KrxSendReadAuthority|SnapshotTopicUseAuthority)\s*=\s*""" +
+                """(?:[\w.]+\.)?SnapshotTopicUseAuthority\s*\{\s*\1\.accessSnapshot\s*}"""
         ).containsMatchIn(stripped.getValue(graphModule)))
     }
 

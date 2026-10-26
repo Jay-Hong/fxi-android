@@ -31,6 +31,18 @@ internal interface TopicGrantIssuer {
     /** Numbers a refusal as it is reported. Never suspends, never waits on the issuer's lock and never throws. */
     fun reserveRejection(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>): TopicRejectionReservation
 
+    /**
+     * [reserveRejection] with the send marker the session captured (S6-2b-1b design r5 §3, D-21). By default the marker is dropped
+     * and the two-argument reservation is made, so an issuer that implements only that one stays as it is. A wrapper that overrides
+     * the two-argument form to count or intercept reservations overrides this one too: delegation by `by` sends this call to the
+     * delegate without passing through the wrapper's two-argument override.
+     */
+    fun reserveRejection(
+        grant: TopicGrantToken,
+        reasons: Collection<TopicRejectionReason>,
+        marker: KrxSendMarker?
+    ): TopicRejectionReservation = reserveRejection(grant, reasons)
+
     /** Ends a reservation that will not be handed over. Short and synchronous, like [reserveRejection]. */
     fun abandonRejection(reservation: TopicRejectionReservation)
 
@@ -46,6 +58,9 @@ internal class PremiumAccessTopicGrantIssuer(private val coordinator: PremiumAcc
 
     override fun reserveRejection(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>) =
         coordinator.reserveRejection(grant, reasons)
+
+    override fun reserveRejection(grant: TopicGrantToken, reasons: Collection<TopicRejectionReason>, marker: KrxSendMarker?) =
+        coordinator.reserveRejection(grant, reasons, marker)
 
     override fun abandonRejection(reservation: TopicRejectionReservation) = coordinator.abandonRejection(reservation)
 
@@ -138,6 +153,19 @@ internal class TopicGrantDeliverer(
     /** Where the session's refusals go. Never blocks the session; a refusal after the deliverer stopped is numbered and abandoned. */
     fun forwardRejection(owner: TopicSessionFence, reasons: Map<String, TopicRejectionReason>) {
         val reservation = issuer.reserveRejection(owner.grant, reasons.values.toList())
+        forwardReservation(reservation)
+    }
+
+    /**
+     * [forwardRejection] with the send marker the session captured (S6-2b-1b design r5 §3), for the issuer's marker reservation.
+     * Synchronous and never waiting, like the two-argument form.
+     */
+    fun forwardRejection(owner: TopicSessionFence, reasons: Map<String, TopicRejectionReason>, marker: KrxSendMarker?) {
+        val reservation = issuer.reserveRejection(owner.grant, reasons.values.toList(), marker)
+        forwardReservation(reservation)
+    }
+
+    private fun forwardReservation(reservation: TopicRejectionReservation) {
         val sent = try {
             rejections.trySend(reservation).isSuccess
         } catch (failed: Throwable) {

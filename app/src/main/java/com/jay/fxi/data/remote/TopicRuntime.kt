@@ -7,6 +7,7 @@ import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.AuthTokenProvider
+import com.jay.fxi.data.entitlements.KrxSendReadAuthority
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.PremiumAccessTopicGrantIssuer
 import com.jay.fxi.data.entitlements.TopicGrantDeliverer
@@ -72,7 +73,8 @@ internal class TopicRuntimeFactory internal constructor(
     private val newRequestId: () -> String,
     private val jitter: () -> Double,
     /** Optional store for display seeds and adopted live rates. */
-    private val lastKnown: TopicLastKnownStore? = null
+    private val lastKnown: TopicLastKnownStore? = null,
+    private val krxSendReader: KrxSendReadAuthority? = null
 ) {
     @Inject
     constructor(
@@ -86,7 +88,7 @@ internal class TopicRuntimeFactory internal constructor(
         tabs: FreeTabStore,
         @WireJson json: Json,
         lastKnown: TopicLastKnownStore,
-        authority: TopicUseAuthority,
+        authority: KrxSendReadAuthority,
         endpoints: ServerEndpoints
     ) : this(
         webSocketFactory = ::buildWebSocketClient,
@@ -107,7 +109,8 @@ internal class TopicRuntimeFactory internal constructor(
         encode = { json.encodeToString(it) },
         newRequestId = { UUID.randomUUID().toString() },
         jitter = { Random.nextDouble() },
-        lastKnown = lastKnown
+        lastKnown = lastKnown,
+        krxSendReader = authority
     )
 
     /**
@@ -147,7 +150,8 @@ internal class TopicRuntimeFactory internal constructor(
             offerLive = offerLive,
             onBootstrapHttpEvidence = floor::record,
             bootstrapNotBeforeMillis = floor::notBeforeMillis,
-            onRejected = { owner, rejected -> deliverer.forwardRejection(owner, rejected) },
+            krxSendReader = krxSendReader,
+            onRejectedWithMarker = { owner, rejected, marker -> deliverer.forwardRejection(owner, rejected, marker) },
             graphSink = graphInputs ?: DormantTopicGraphSink
         )
         val dispatcher = scope.coroutineContext[ContinuationInterceptor] as CoroutineDispatcher

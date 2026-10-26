@@ -2,6 +2,7 @@ package com.jay.fxi.di
 
 import android.content.Context
 import com.jay.fxi.data.entitlements.DeletionAdmissionStore
+import com.jay.fxi.data.entitlements.KrxSendReadAuthority
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.SnapshotTopicUseAuthority
 import com.jay.fxi.data.graph.DefaultGraphV2AtomicFileIo
@@ -33,8 +34,12 @@ internal object GraphRuntimeModule {
     /** The one use authority of the topic runtime and, from CC4, of the graph runtime. Stateless: it reads the snapshot. */
     @Provides
     @Singleton
-    fun provideTopicUseAuthority(coordinator: PremiumAccessCoordinator): TopicUseAuthority =
+    fun provideKrxSendReadAuthority(coordinator: PremiumAccessCoordinator): KrxSendReadAuthority =
         SnapshotTopicUseAuthority { coordinator.accessSnapshot }
+
+    @Provides
+    @Singleton
+    fun provideTopicUseAuthority(authority: KrxSendReadAuthority): TopicUseAuthority = authority
 
     /** Deletion publication (CC3) and graph admission (CC4) share this one memory-only store. */
     @Provides
