@@ -1,5 +1,6 @@
 package com.jay.fxi
 
+import com.jay.fxi.data.remote.KrxSessionSourceContract
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -127,20 +128,29 @@ class TopicBootstrapRetryDormancyContractTest {
     }
 
     /**
-     * Y02: no caller. Each of the seven names is found in the declaring file only (the positive control is the declaring file
-     * itself). Catches MR-Y01 (TSC or `TopicRuntime` calling the policy, wiring that belongs to S6-2b).
+     * Y02 explicitly amended for α-1a: only TSC.startKrxBootstrap calls the three ladder APIs; unrelated callers remain forbidden.
+     * Method name is kept for the existing test inventory. Stub expectation is RED_CONTRACT.
      */
     @Test fun Y02_policyHasNoCaller() {
-        for (name in listOf(
-            "TopicBootstrapRetryPolicy",
-            "TopicBootstrapLadder",
-            "TopicBootstrapVerdict",
-            "TopicBootstrapRetryKind",
-            "TopicBootstrapStop",
-            "TopicBootstrapGo",
-            "TopicBootstrapNext"
-        )) {
-            assertEquals("\\b$name\\b", setOf(N), files(Regex("""\b$name\b""")))
+        // α-1a explicit amendment: the pure policy's only production caller is the KRX ladder body in TSC.
+        // No other topic, runtime, transport, or auth source receives a policy allowance.
+        val api = Regex("""\bTopicBootstrapRetryPolicy\s*\.\s*(start|beforeAttempt|afterAttempt)\s*[(]""")
+        assertTrue("premise: Y02 policy declares start", policy.contains("fun start("))
+        val probe = "fun startKrxBootstrap() { TopicBootstrapRetryPolicy.start(owner, 0, 0); TopicBootstrapRetryPolicy.beforeAttempt(x); TopicBootstrapRetryPolicy.afterAttempt(x) }"
+        assertEquals("premise: Y02 exact positive call probe", mapOf("start" to 1, "beforeAttempt" to 1, "afterAttempt" to 1), api.findAll(probe).groupingBy { it.groupValues[1] }.eachCount())
+        assertEquals("premise: Y02 one extra caller is detected", 4, api.findAll(probe + "\nfun leak() = TopicBootstrapRetryPolicy.start(owner,0,0)").count())
+        assertEquals("contract(Y02): policy reference files are exactly declaration and TSC", setOf(N, TSC), files(Regex("""\bTopicBootstrapRetryPolicy\b""")))
+        val tsc = code.getValue(TSC)
+        val ladder = KrxSessionSourceContract.function(tsc, "startKrxBootstrap")
+        assertEquals("contract(Y02): exact ladder API call set", mapOf("start" to 1, "beforeAttempt" to 1, "afterAttempt" to 1),
+            api.findAll(ladder).groupingBy { it.groupValues[1] }.eachCount())
+        assertEquals("contract(Y02): no policy call outside the KRX ladder", api.findAll(ladder).count(), api.findAll(tsc).count())
+        val leaked = tsc + "\nfun bypass() = TopicBootstrapRetryPolicy.start(owner, 0, 0)"
+        assertEquals("premise: Y02 one outside-call mutation is caught", api.findAll(ladder).count() + 1, api.findAll(leaked).count())
+        for (name in listOf("TopicBootstrapLadder", "TopicBootstrapVerdict", "TopicBootstrapRetryKind", "TopicBootstrapStop", "TopicBootstrapGo", "TopicBootstrapNext")) {
+            val paths = files(Regex("""\b$name\b"""))
+            assertTrue("premise: Y02 same scan sees $name declaration", N in paths)
+            assertTrue("contract(Y02): $name stays in its declaration or the single TSC caller", (paths - setOf(N, TSC)).isEmpty())
         }
     }
 

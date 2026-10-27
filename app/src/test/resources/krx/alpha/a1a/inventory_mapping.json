@@ -1,0 +1,204 @@
+[
+  {
+    "original": "data/entitlements/PremiumAccessCoordinatorTest.kt.topicGrant_isTheSameTokenWhileItsContextHolds_andANewOneAfterAKrxRotation",
+    "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+    "owned_rows": [],
+    "deferred_acceptance_rows": [
+      "K03/k03_capabilityLoss_preservesGeneralInSameSession",
+      "K04/k04_restoreNeedsNewKrxUse_generalUseSurvives"
+    ],
+    "status": "NEXT_BUNDLE_ACCEPTANCE_PER_BRIEF"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessCoordinatorTest.kt.aKrxRefusalForTheStandingGrant_rotatesTheCapabilityOnlyAndAsksAgain",
+    "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+    "owned_rows": [],
+    "deferred_acceptance_rows": [
+      "K03/k03_capabilityLoss_preservesGeneralInSameSession",
+      "K04/k04_restoreNeedsNewKrxUse_generalUseSurvives"
+    ],
+    "status": "NEXT_BUNDLE_ACCEPTANCE_PER_BRIEF"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessCoordinatorTest.kt.aKrxRefusalWithKrxAlreadyHidden_rotatesNothingButStillAsksAgain",
+    "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+    "owned_rows": [],
+    "deferred_acceptance_rows": [
+      "K03/k03_capabilityLoss_preservesGeneralInSameSession",
+      "K04/k04_restoreNeedsNewKrxUse_generalUseSurvives"
+    ],
+    "status": "NEXT_BUNDLE_ACCEPTANCE_PER_BRIEF"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessCoordinatorTest.kt.aCapabilityHoldForAReapprovedGrant_isResolvedNotReleased",
+    "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+    "owned_rows": [],
+    "deferred_acceptance_rows": [
+      "K03/k03_capabilityLoss_preservesGeneralInSameSession",
+      "K04/k04_restoreNeedsNewKrxUse_generalUseSurvives"
+    ],
+    "status": "NEXT_BUNDLE_ACCEPTANCE_PER_BRIEF"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessCoordinatorTest.kt.aCapabilityCandidate_survivesTwoReapprovals",
+    "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+    "owned_rows": [],
+    "deferred_acceptance_rows": [
+      "K03/k03_capabilityLoss_preservesGeneralInSameSession",
+      "K04/k04_restoreNeedsNewKrxUse_generalUseSurvives"
+    ],
+    "status": "NEXT_BUNDLE_ACCEPTANCE_PER_BRIEF"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessCoordinatorTest.kt.aNewGrant_retiresTheOldSummary_andLateEndingsForTheOldGrantDoNotTouchIt",
+    "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+    "owned_rows": [],
+    "deferred_acceptance_rows": [
+      "K03/k03_capabilityLoss_preservesGeneralInSameSession",
+      "K04/k04_restoreNeedsNewKrxUse_generalUseSurvives"
+    ],
+    "status": "NEXT_BUNDLE_ACCEPTANCE_PER_BRIEF"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessKrxPermitTest.kt.R06_samePermitDuplicates_matrix",
+    "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+    "owned_rows": [
+      "W08b/R06/live/n1/before/prefalse",
+      "W08b/R06/live/n1/before/pretrue",
+      "W08b/R06/live/n1/during/prefalse",
+      "W08b/R06/live/n1/during/pretrue",
+      "W08b/R06/live/n1/after/prefalse",
+      "W08b/R06/live/n1/after/pretrue",
+      "W08b/R06/live/n3/before/prefalse",
+      "W08b/R06/live/n3/before/pretrue",
+      "W08b/R06/live/n3/during/prefalse",
+      "W08b/R06/live/n3/during/pretrue",
+      "W08b/R06/live/n3/after/prefalse",
+      "W08b/R06/live/n3/after/pretrue",
+      "W08b/R06/store/n1/before/prefalse",
+      "W08b/R06/store/n1/before/pretrue",
+      "W08b/R06/store/n1/during/prefalse",
+      "W08b/R06/store/n1/during/pretrue",
+      "W08b/R06/store/n1/after/prefalse",
+      "W08b/R06/store/n1/after/pretrue",
+      "W08b/R06/store/n3/before/prefalse",
+      "W08b/R06/store/n3/before/pretrue",
+      "W08b/R06/store/n3/during/prefalse",
+      "W08b/R06/store/n3/during/pretrue",
+      "W08b/R06/store/n3/after/prefalse",
+      "W08b/R06/store/n3/after/pretrue"
+    ],
+    "deferred_acceptance_rows": [],
+    "status": "MAPPED_A1A"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessKrxPermitTest.kt.N1b_earlierPermitMarkerAfterH2ThenT2_changesNothing",
+    "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+    "owned_rows": [
+      "W08b/N1b/h2-t2-old-marker"
+    ],
+    "deferred_acceptance_rows": [],
+    "status": "MAPPED_A1A"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessKrxPermitTest.kt.N1_earlierPermitMarkerInOpenNext_changesNothing",
+    "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+    "owned_rows": [
+      "W08b/N1/open-next-old-marker"
+    ],
+    "deferred_acceptance_rows": [],
+    "status": "MAPPED_A1A"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessKrxPermitTest.kt.N2_handedOverPermitMarkerDuringHold_changesNothing",
+    "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+    "owned_rows": [
+      "W08b/N2/duplicate-during-HOLD"
+    ],
+    "deferred_acceptance_rows": [],
+    "status": "MAPPED_A1A"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessKrxPermitTest.kt.N3_ineligiblePendingReservations_doNotBlock",
+    "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+    "owned_rows": [
+      "W08b/N3/ineligible-triplet"
+    ],
+    "deferred_acceptance_rows": [],
+    "status": "MAPPED_A1A"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessKrxPermitTest.kt.N4_noneIssuesThePermitDespiteAPendingEligibleReservation",
+    "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+    "owned_rows": [
+      "W08b/N4/stable-true"
+    ],
+    "deferred_acceptance_rows": [],
+    "status": "MAPPED_A1A"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessKrxPermitTest.kt.N4b_nonePendingTrueIssuesThePermitDespiteAPendingEligibleReservation",
+    "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+    "owned_rows": [
+      "W08b/N4/pending-true"
+    ],
+    "deferred_acceptance_rows": [],
+    "status": "MAPPED_A1A"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessKrxPermitTest.kt.N5_handedOverPermitDuplicatePending_doesNotBlock",
+    "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+    "owned_rows": [
+      "W08b/N5/process"
+    ],
+    "deferred_acceptance_rows": [],
+    "status": "MAPPED_A1A"
+  },
+  {
+    "original": "data/entitlements/PremiumAccessKrxPermitTest.kt.N5b_handedOverPermitDuplicateAbandoned_changesNothing",
+    "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+    "owned_rows": [
+      "W08b/N5/abandon"
+    ],
+    "deferred_acceptance_rows": [],
+    "status": "MAPPED_A1A"
+  },
+  {
+    "original": "data/remote/TopicSessionKrxRestMarkerTest.kt.r05_8_restUnknownTopic_handsTheIssueMarkerOver_whateverTheList",
+    "classification": "ON 짝 필요(W01e·R11·K02); 전제1",
+    "owned_rows": [
+      "R11-iv/EXPLICIT",
+      "R11-iv/EXPLICIT/supported-list"
+    ],
+    "deferred_acceptance_rows": [],
+    "status": "MAPPED_A1A"
+  },
+  {
+    "original": "data/remote/TopicSessionKrxRestMarkerTest.kt.r05_14_restIii_aPermitDuringThePacingWait_isReadAtTheIssue",
+    "classification": "ON 짝 필요(W01e·R11·K02); 전제1",
+    "owned_rows": [
+      "R11-iv/G1i/pacing-new-p"
+    ],
+    "deferred_acceptance_rows": [],
+    "status": "MAPPED_A1A"
+  },
+  {
+    "original": "data/remote/TopicSessionKrxRestMarkerTest.kt.r05_20_useWithdrawnBeforeTheAnswer_stillHandsOver",
+    "classification": "ON 짝 필요(W01e·R11·K02); 전제1",
+    "owned_rows": [],
+    "deferred_acceptance_rows": [
+      "K02/k02_restOldEpochRejected_newIssueAccepted",
+      "K02-CANCELRACE/k02_retirementAndNewCapture_bothOrders"
+    ],
+    "status": "NEXT_BUNDLE_ACCEPTANCE_PER_BRIEF"
+  },
+  {
+    "original": "data/remote/TopicSessionKrxSendMarkerTest.kt.r05_3_capR11v_aC1RotationBeforeTheAck_isDroppedByTheEpochGuard",
+    "classification": "ON 짝 필요(W01a·W08·R11·K01); 전제1",
+    "owned_rows": [],
+    "deferred_acceptance_rows": [
+      "K01/k01_wsOldEpochRejected_newCaptureAccepted"
+    ],
+    "status": "NEXT_BUNDLE_ACCEPTANCE_PER_BRIEF"
+  }
+]

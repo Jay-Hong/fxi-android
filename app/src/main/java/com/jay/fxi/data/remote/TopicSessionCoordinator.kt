@@ -6,6 +6,10 @@ import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.HttpExchangeEvidence
+import com.jay.fxi.data.entitlements.KrxAttemptCheck
+import com.jay.fxi.data.entitlements.KrxSessionStamp
+import com.jay.fxi.data.entitlements.KrxUseLifetime
+import com.jay.fxi.data.entitlements.KrxSendAcquisition
 import com.jay.fxi.data.entitlements.KrxSendAdmission
 import com.jay.fxi.data.entitlements.KrxSendMarker
 import com.jay.fxi.data.entitlements.KrxSendReadAuthority
@@ -14,6 +18,7 @@ import com.jay.fxi.data.graph.GraphDataScope
 import com.jay.fxi.data.local.TopicLastKnownRestore
 import com.jay.fxi.data.remote.dto.DxySpotEntry
 import com.jay.fxi.data.remote.dto.DxyTopicMessage
+import com.jay.fxi.data.remote.dto.TopicLease
 import com.jay.fxi.data.remote.dto.TopicSourceEntry
 import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
 import com.jay.fxi.data.remote.dto.toDollarIndex
@@ -39,6 +44,7 @@ import com.jay.fxi.domain.model.TopicSubscriptionState
 import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import com.jay.fxi.domain.model.TopicWholeRequestDecision
 import com.jay.fxi.domain.model.TopicWholeRequestFailure
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -52,6 +58,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 
 /** Which topics this build subscribes to, and the one it does not yet. */
 object TopicCatalogue {
@@ -217,7 +224,8 @@ private sealed interface SessionInput {
         /** The use its issue acquired (L-4e E2a). A delivered snapshot is applied only while this is still admitted. */
         val lifetime: TopicUseLifetime,
         /** The KRX issue's send marker, kept across transport's 401 replay; absent for other topics or without a reader. */
-        val marker: KrxSendMarker?
+        val marker: KrxSendMarker?,
+        val krxIssueId: Long? = null
     ) : SessionInput
 
     /** A display seed returned to the grant that started its read. */
@@ -339,6 +347,10 @@ private sealed interface SessionInput {
 
     /** The issuer published a new access snapshot under the context this session already holds (L-4e E2b). */
     data object AccessRevised : SessionInput
+
+    data object KrxWake : SessionInput
+    data class KrxReprepare(val generation: Long, val commandId: Long, val ready: CompletableDeferred<Unit>) : SessionInput
+    data class KrxLeaseExpired(val generation: Long) : SessionInput
 
     /** The token provider saw the signed-in identity acquire a usable credential again after a failure (L-4e E6b). */
     data class CredentialRecovered(val recovery: AuthCredentialRecovery) : SessionInput
@@ -534,6 +546,476 @@ class TopicSessionCoordinator(
     /** UTC epoch milliseconds for graph continuity and loss facts, independent of monotonic deadlines. */
     private val wallClock: () -> Long = System::currentTimeMillis
 ) : TopicGrantSink {
+    internal var krxAttemptBoundaryDecorator: ((KrxCommandAttemptBoundary) -> KrxCommandAttemptBoundary)? = null
+    private val krxAccessSignals = AtomicLong(0L)
+    private val krxPreparedSignals = mutableMapOf<String, Long>()
+    private var stagedKrxBootstrapSignal = 0L
+    private var krxReconciledSignal: Long? = null
+    private var krxSessionCapabilityObserved = false
+    private var consumedPermit: Long = 0L
+    private var krxSession: KrxSessionStamp? = null
+    private var krxEffectiveUse: KrxUseLifetime? = null
+    private var krxPermitOwed: Long? = null
+    private var krxPermitCommand: Pair<Long, Long>? = null
+    private val krxLaddersStarted = mutableSetOf<Long>()
+    private var krxBootstrapOwed: KrxBootstrapOwed? = null
+    private var stagedKrxBootstrapRead: KrxSendAcquisition? = null
+    private var krxLadderJob: Job? = null
+    // Also completed when this grant's initial slot merges into an actual PERMIT issue.
+    private var krxInitialIssuedGrant: Long? = null
+    private var krxSnapshotRevision = 0L
+    private val krxRestIssues = mutableMapOf<Long, KrxRestIssue>()
+    private val krxRetired = mutableSetOf<KrxSubscriptionRetirement>()
+    private val krxTopic: String? get() = desired.firstOrNull(TopicCatalogue::carriesKrx)
+
+    private fun prepareKrxAttempt(live: Connection, commandId: Long, request: KrxAttemptScope): KrxCommandAttempt? {
+        val stamp = request.read.session ?: return null
+        if (!request.read.admitted || current(live.generation) !== live || live.controlOwner != commandId) return null
+        observeKrxRead(stamp, request.read.krxUse)
+        val topics = request.topics.filterTo(linkedSetOf()) { !TopicCatalogue.carriesKrx(it) || request.read.krxUse != null }
+        if (topics.isEmpty()) return null
+        val hasKrx = topics.any(TopicCatalogue::carriesKrx)
+        val attempt = KrxCommandAttempt(
+            request.requestId, live.generation, commandId, grantEpoch, topics.toSet(), topics.toSet(),
+            (request.watched intersect topics).toSet(), (request.manualTopics intersect topics).toSet(), request.source,
+            live.lifetime, stamp, request.read.marker, request.read.krxUse,
+            stamp.permitSeq.takeIf { hasKrx && request.source in setOf(KrxAttemptSource.FIRST, KrxAttemptSource.PERMIT) }
+        )
+        if (hasKrx) installKrxPending(live, attempt)
+        return attempt
+    }
+
+    private fun checkKrxAttemptBeforeEncode(live: Connection, attempt: KrxCommandAttempt): KrxAttemptCheck {
+        // Count received publication signals, including signals queued during onRequestStarted.
+        // A publication after this comparison remains the N1-03 send window.
+        val currentRevision = krxAccessSignals.get()
+        if (krxPreparedSignals[attempt.requestId] != currentRevision) return KrxAttemptCheck.REPREPARE
+        // The deliverer queues its pull. A snapshot may already have changed before that signal
+        // reaches this session (N1-01/02); keep the WS metadata check for that gap.
+        if (krxSendReader?.currentRevision() != attempt.stamp.revision) return KrxAttemptCheck.REPREPARE
+        if (current(live.generation) !== live || attempt.grantEpoch != grantEpoch || live.controlOwner != attempt.commandId) {
+            return KrxAttemptCheck.NOT_SENT
+        }
+        if (!enforceLiveIdentity(live.fence)) return KrxAttemptCheck.NOT_SENT
+        if (!authority.admits(attempt.generalLifetime)) {
+            post(SessionInput.AccessWithheldDue(live.generation))
+            return KrxAttemptCheck.NOT_SENT
+        }
+        if (live.leases.expiredAt(clock.nowMillis()).isNotEmpty()) {
+            post(SessionInput.LeaseExpiryDue(live.generation))
+            return KrxAttemptCheck.NOT_SENT
+        }
+        val manual = live.commands[attempt.commandId]?.manual
+        if (manual != null && !manualAdmitted(live, manual.grantEpoch)) return KrxAttemptCheck.NOT_SENT
+        return KrxAttemptCheck.READY
+    }
+
+    private fun onKrxAttemptSent(live: Connection, attempt: KrxCommandAttempt) {
+        krxPreparedSignals.remove(attempt.requestId)
+        attempt.consumePermit?.let { p ->
+            consumedPermit = maxOf(consumedPermit, p)
+            if (krxPermitOwed?.let { it <= p } == true) krxPermitOwed = null
+        }
+        markKrxPendingSent(live, attempt.requestId)
+        if (attempt.consumePermit != null) {
+            // capInv can refund a WS send, but never the automatic ladder already started for p.
+            if (attempt.stamp.permitSeq !in krxLaddersStarted) {
+                val origin = if (krxInitialIssuedGrant != grantEpoch) KrxBootstrapOrigin.INITIAL_PLAN else KrxBootstrapOrigin.PERMIT
+                krxBootstrapOwed = KrxBootstrapOwed(attempt.stamp.permitSeq, grantEpoch, origin, checkNotNull(attempt.krxUse))
+            }
+            post(SessionInput.KrxWake)
+        }
+    }
+
+    private fun discardKrxAttempt(live: Connection, attempt: KrxCommandAttempt) {
+        krxPreparedSignals.remove(attempt.requestId)
+        val pending = live.krxPending ?: return
+        if (pending.capture.requestId == attempt.requestId && !pending.sent) live.krxPending = null
+    }
+
+    /** Session-lifetime discovery latch; it grants no use and is never reset by reconnect or reapproval. */
+    private fun observeKrxSessionCapability(capable: Boolean) {
+        if (capable) krxSessionCapabilityObserved = true
+    }
+
+    /** Called only with metadata produced by the same publication as its effective use. */
+    private fun observeKrxRead(stamp: KrxSessionStamp?, use: KrxUseLifetime?) {
+        if (stamp == null) return
+        reconcileKrxSession(stamp, use != null)
+        krxEffectiveUse = use
+    }
+
+    private fun reconcileKrxSession(stamp: KrxSessionStamp, effective: Boolean) {
+        val previous = krxSession
+        val invalidated = previous != null && previous.capabilityInvalidations != stamp.capabilityInvalidations
+        krxSession = stamp
+        if (!effective || invalidated) {
+            consumedPermit = minOf(consumedPermit, stamp.permitSeq - 1L)
+            retireKrxCapture(connection, KrxRetirementReason.CAPABILITY_WITHHELD)
+            cancelKrxBootstraps()
+            krxPermitCommand = null
+        }
+        if (consumedPermit < stamp.permitSeq) krxPermitOwed = stamp.permitSeq
+    }
+
+    private fun reevaluateKrxPermit() {
+        val stamp = krxSession ?: return
+        val use = krxEffectiveUse ?: return
+        val live = connection ?: return
+        val topic = krxTopic ?: return
+        if (!live.opened || !live.firstSubscribeStarted || live.ended || !sessionWanted()) return
+        if (live.controlOwner != null || live.krxPending != null || store.snapshot.authResolution == TopicAuthResolution.FAILED) return
+        if (live.renewalDeferred || live.revalidationDeferred || live.recoveryReopenDeferred || live.manualPending.isNotEmpty()) {
+            post(SessionInput.ControlLaneFree(live.generation))
+            return
+        }
+        if (consumedPermit >= stamp.permitSeq && krxPermitOwed != stamp.permitSeq) return
+        val key = stamp.permitSeq to stamp.capabilityInvalidations
+        if (krxPermitCommand == key || !enforceLiveIdentity(live.fence) || krxSendReader?.admitsKrx(use) != true) return
+        if (enforceLeaseExpiry(live)) return
+        krxPermitCommand = key
+        startCommand(live, TopicCommandPurpose.LEASE_RENEWAL, krxSource = KrxAttemptSource.PERMIT) { setOf(topic) }
+    }
+
+    private data class KrxCapture(
+        val connectionGeneration: Long,
+        val commandId: Long,
+        val requestId: String,
+        val grantEpoch: Long,
+        val stamp: KrxSessionStamp,
+        val use: KrxUseLifetime
+    )
+    private class KrxPending(val capture: KrxCapture, var sent: Boolean = false, var masked: Boolean = false)
+    private enum class KrxBootstrapOrigin { INITIAL_PLAN, PERMIT, EXPLICIT }
+    private data class KrxBootstrapOwed(
+        val permit: Long,
+        val grantEpoch: Long,
+        val origin: KrxBootstrapOrigin,
+        val use: KrxUseLifetime
+    )
+    private data class KrxRestIssue(
+        val requestId: Long,
+        val grantEpoch: Long,
+        val topic: String,
+        val stamp: KrxSessionStamp,
+        val marker: KrxSendMarker,
+        val use: KrxUseLifetime,
+        val origin: KrxBootstrapOrigin,
+        val issuedAtMillis: Long
+    )
+    private sealed interface KrxBootstrapPreparation {
+        data class Ready(val issue: KrxRestIssue) : KrxBootstrapPreparation
+        data object AlreadyStarted : KrxBootstrapPreparation
+        data object Reprepare : KrxBootstrapPreparation
+        data object Blocked : KrxBootstrapPreparation
+    }
+    private enum class KrxRetirementReason {
+        CONTEXT_ENDED, CAPABILITY_WITHHELD, CAPTURE_INVALIDATED,
+        CONNECTION_ENDED, ACK_REJECTED, ATTEMPT_ENDED, LEASE_EXPIRED
+    }
+
+    private fun installKrxPending(live: Connection, attempt: KrxCommandAttempt) {
+        live.krxPending?.let { old ->
+            check(old.capture.commandId == attempt.commandId) { "one KRX pending request per connection" }
+            retireKrxPending(live, old)
+        }
+        live.krxPending = KrxPending(KrxCapture(live.generation, attempt.commandId, attempt.requestId,
+            attempt.grantEpoch, attempt.stamp, checkNotNull(attempt.krxUse)))
+    }
+
+    private fun markKrxPendingSent(live: Connection, requestId: String) {
+        live.krxPending?.takeIf { it.capture.requestId == requestId }?.sent = true
+    }
+
+    private fun validKrxCapture(live: Connection, capture: KrxCapture): Boolean =
+        current(live.generation) === live && capture.connectionGeneration == live.generation && capture.grantEpoch == grantEpoch &&
+            fence == live.fence && capture.use.lifetime == live.lifetime && krxTopic != null &&
+            enforceLiveIdentity(live.fence) && krxSendReader?.admitsKrx(capture.use) == true
+
+    private fun promoteKrxCapture(live: Connection, commandId: Long, requestId: String, accepted: Boolean) {
+        val pending = live.krxPending?.takeIf { it.capture.commandId == commandId && it.capture.requestId == requestId } ?: return
+        live.krxPending = null
+        if (accepted && pending.sent && !pending.masked && validKrxCapture(live, pending.capture)) {
+            // Replacing a capture does not rebind the old use. Its exact tuple is retired first.
+            retireKrxActive(live)
+            live.krxActive = pending.capture
+            live.krxLeaseMasked = false
+        } else {
+            retireKrxPending(live, pending)
+            if (!accepted) retireKrxActive(live)
+        }
+    }
+
+    private fun retireKrxPending(live: Connection, pending: KrxPending) {
+        pending.masked = true
+        if (pending.sent) requestKrxRetirement(pending.capture, null)
+    }
+
+    private fun requestKrxRetirement(capture: KrxCapture, leaseId: String?) {
+        val request = KrxSubscriptionRetirement(capture.connectionGeneration, capture.requestId, leaseId)
+        if (krxRetired.add(request)) retireKrxSubscription(request)
+    }
+
+    private fun retireKrxActive(live: Connection) {
+        val active = live.krxActive ?: return
+        live.krxActive = null
+        live.krxLeaseMasked = true
+        val lease = krxTopic?.let { live.krxLeases.held[it]?.leaseId }
+        live.krxExpiryTimer?.cancel()
+        live.krxRenewalTimer?.cancel()
+        live.krxRenewalScope = emptySet()
+        live.renewalScope = live.renewalScope.filterNotTo(linkedSetOf(), TopicCatalogue::carriesKrx)
+        requestKrxRetirement(active, lease)
+    }
+
+    private fun retireKrxCapture(live: Connection?, reason: KrxRetirementReason) {
+        live ?: return
+        live.krxPending?.let { pending ->
+            retireKrxPending(live, pending)
+            // A permit command carries KRX alone. Withholding that capability ends its control
+            // obligation too; a mixed FIRST/renewal/manual retains its GENERAL ACK obligation.
+            val owner = pending.capture.commandId
+            val running = live.commands[owner]
+            if (running?.krxSource == KrxAttemptSource.PERMIT) {
+                running.job?.cancel()
+                live.krxPending = null
+                releaseControlLane(live, owner)
+            }
+        }
+        retireKrxActive(live)
+        if (reason == KrxRetirementReason.CONNECTION_ENDED || reason == KrxRetirementReason.CONTEXT_ENDED) live.krxPending = null
+    }
+
+    /** Filters the whole-connection ACK before CMD writes confirmed state. Refusals keep their original marker. */
+    private fun admitKrxAcknowledgement(
+        live: Connection, commandId: Long, requestId: String, active: Set<String>, leases: List<TopicLease>, sent: Set<String>
+    ): Set<String> {
+        if (krxSession == null) return active
+        val topic = krxTopic ?: return active.filterNotTo(linkedSetOf(), TopicCatalogue::carriesKrx)
+        val ownPending = live.krxPending?.capture?.let { it.commandId == commandId && it.requestId == requestId } == true
+        if (ownPending) promoteKrxCapture(live, commandId, requestId, topic in active && topic in sent)
+        val capture = live.krxActive
+        val permitted = capture != null && validKrxCapture(live, capture) && topic in active
+        if (!permitted) {
+            retireKrxActive(live)
+            return active - topic
+        }
+        val inputs = leases.filter { it.topic == topic }.map { TopicLeaseInput(it.topic, it.leaseId, it.durationSeconds) }
+        val update = live.krxLeases.apply(clock.nowMillis(), inputs, leaseJitter())
+        live.krxLeaseMasked = false
+        live.krxRenewalScope = update.renewalScope
+        live.krxExpiryTimer?.cancel()
+        live.krxExpiryTimer = live.krxLeases.earliestExpiryMillis()?.let { deadline ->
+            after((deadline - clock.nowMillis()).coerceAtLeast(0).milliseconds) { post(SessionInput.KrxLeaseExpired(live.generation)) }
+        }
+        live.krxRenewalTimer?.cancel()
+        live.krxRenewalTimer = update.renewAfter?.let { wait -> after(wait) { post(SessionInput.RenewalDue(live.generation)) } }
+        if (inputs.isEmpty() || live.krxLeases.expiredAt(clock.nowMillis()).isNotEmpty()) {
+            retireKrxActive(live)
+            return active - topic
+        }
+        return active
+    }
+
+    private fun acceptsKrx(live: Connection, capture: KrxCapture): Boolean {
+        val topic = krxTopic ?: return false
+        if (!accepts(live, topic) || live.krxActive !== capture || !validKrxCapture(live, capture) || live.krxLeaseMasked) return false
+        if (live.krxLeases.expiredAt(clock.nowMillis()).isNotEmpty()) {
+            retireKrxCapture(live, KrxRetirementReason.LEASE_EXPIRED)
+            return false
+        }
+        return topic in live.krxLeases.held
+    }
+
+    private fun krxQuotes(frame: DecodedTopicFrame.Krx): List<TopicQuote> =
+        frame.value.data.allEntries.filter { it.source == "krx" && it.asset == "usd-krw-futures" }.mapNotNull { it.toQuote() }
+
+    private fun receiveKrx(live: Connection, frame: DecodedTopicFrame.Krx) {
+        val capture = live.krxActive ?: return
+        if (!acceptsKrx(live, capture)) return
+        val quotes = krxQuotes(frame)
+        if (quotes.isEmpty()) return
+        _rates.value = _rates.value.merge(quotes)
+        liveRates = liveRates.merge(quotes)
+        store.recordFrame(frame.value.topic)
+        krxSnapshotRevision++
+        cancelKrxBootstraps()
+        recordDelivery(TopicSilenceEvidence.OTHER, clock.nowMillis())
+        resolveCachedRefresh(capture.use.lifetime)
+    }
+
+    private fun issueKrxBootstrap(topic: String, origin: KrxBootstrapOrigin, startsLadder: Boolean): KrxBootstrapPreparation {
+        val prepared = stagedKrxBootstrapRead
+        val signal = if (prepared != null) stagedKrxBootstrapSignal else krxAccessSignals.get()
+        stagedKrxBootstrapRead = null
+        val owner = fence ?: return KrxBootstrapPreparation.Blocked
+        val read = prepared ?: krxSendReader?.acquireWithKrx(owner) ?: return KrxBootstrapPreparation.Blocked
+        observeKrxSessionCapability(read.krxSessionCapable)
+        val stamp = read.session ?: return KrxBootstrapPreparation.Blocked
+        observeKrxRead(stamp, read.krxUse)
+        krxReconciledSignal = signal
+        val use = read.krxUse ?: return KrxBootstrapPreparation.Blocked
+        if (!sessionWanted() || topic !in desired || !enforceLiveIdentity(owner)) return KrxBootstrapPreparation.Blocked
+        // A publication can precede the deliverer's queued signal, just as at WS beforeEncode.
+        if (krxAccessSignals.get() != signal || krxSendReader?.currentRevision() != stamp.revision) {
+            krxReconciledSignal = null
+            post(SessionInput.AccessRevised)
+            return KrxBootstrapPreparation.Reprepare
+        }
+        val permit = stamp.permitSeq
+        if (startsLadder && origin != KrxBootstrapOrigin.EXPLICIT) {
+            if (origin == KrxBootstrapOrigin.PERMIT && krxBootstrapOwed?.permit != permit) {
+                return KrxBootstrapPreparation.Blocked
+            }
+            // Initial plans belong to grants; permit ladders belong to p across grants.
+            val alreadyStarted = when (origin) {
+                KrxBootstrapOrigin.INITIAL_PLAN -> krxInitialIssuedGrant == grantEpoch
+                KrxBootstrapOrigin.PERMIT -> permit in krxLaddersStarted
+                KrxBootstrapOrigin.EXPLICIT -> false
+            }
+            if (krxBootstrapOwed?.let { it.grantEpoch == grantEpoch && it.permit <= permit } == true) {
+                krxBootstrapOwed = null
+            }
+            if (alreadyStarted) return KrxBootstrapPreparation.AlreadyStarted
+            krxLaddersStarted.add(permit)
+            // Either automatic origin fills the one initial slot for this grant at this
+            // logical issue. A later initial plan for the same p joins this issue.
+            krxInitialIssuedGrant = grantEpoch
+        }
+        val issue = KrxRestIssue(++nextBootstrapRequestId, grantEpoch, topic, stamp, read.marker, use,
+            origin, clock.nowMillis())
+        // This is the logical issue boundary, after floor, pacing and revision admission.
+        if (startsLadder && origin == KrxBootstrapOrigin.INITIAL_PLAN) {
+            consumedPermit = maxOf(consumedPermit, permit)
+            // Before any FIRST left this connection, the initial REST issue covers the initial
+            // permit obligation. A newer permit after a physical FIRST still owes its WS send.
+            if (connection?.firstSubscribeSent != true && krxPermitOwed?.let { it <= consumedPermit } == true) {
+                krxPermitOwed = null
+            }
+        }
+        return KrxBootstrapPreparation.Ready(issue)
+    }
+
+    private fun krxIssueContextAdmitted(issue: KrxRestIssue): Boolean =
+        !stopped && issue.grantEpoch == grantEpoch && access && issue.topic in desired &&
+            fence?.let { it != refusedFor && it != identityLostFor && liveIdentity() == it.identity } == true
+
+    private fun krxIssueAdmitted(issue: KrxRestIssue): Boolean =
+        krxIssueContextAdmitted(issue) && authority.admits(issue.use.lifetime) &&
+            krxSendReader?.admitsKrx(issue.use) == true
+
+    private fun cancelKrxBootstraps() {
+        krxLadderJob?.cancel()
+        krxLadderJob = null
+        bootstrapsOut.values.filter { TopicCatalogue.carriesKrx(it.topic) }.forEach { it.job.cancel() }
+    }
+
+    private fun startKrxBootstrap(issue: KrxRestIssue) {
+        val owner = fence?.identity ?: return
+        val topic = issue.topic
+        val epoch = issue.grantEpoch
+        val job = scope.launch {
+            var currentIssue = issue
+            var answerQueued = false
+            var ladder = TopicBootstrapRetryPolicy.start(owner, krxSnapshotRevision, clock.nowMillis())
+            try {
+                while (true) {
+                    if (!krxIssueContextAdmitted(currentIssue)) return@launch
+                    // beforeAttempt reserves a number and replaces dueMillis with now.
+                    // Keep this retry's original due across preparation yields and waits.
+                    val retryDueMillis = ladder.dueMillis
+                    when (val go = TopicBootstrapRetryPolicy.beforeAttempt(ladder, clock.nowMillis(), liveIdentity(),
+                        krxSnapshotRevision, bootstrapNotBeforeMillis())) {
+                        is TopicBootstrapGo.Stop -> return@launch
+                        is TopicBootstrapGo.NotYet -> {
+                            clock.sleep((go.dueMillis - clock.nowMillis()).coerceAtLeast(0).milliseconds)
+                            continue
+                        }
+                        is TopicBootstrapGo.Issue -> ladder = go.ladder
+                    }
+                    if (ladder.attempt > 1) {
+                        while (true) {
+                            if (!krxIssueContextAdmitted(currentIssue) || liveIdentity() != ladder.owner ||
+                                krxSnapshotRevision != ladder.startRevision
+                            ) return@launch
+                            // A GENERAL Retry-After may raise the shared floor during yield
+                            // or sleep. Recheck without reserving another policy attempt.
+                            val retryNotBefore = maxOf(retryDueMillis, bootstrapNotBeforeMillis())
+                            val now = clock.nowMillis()
+                            if (now < retryNotBefore) {
+                                clock.sleep((retryNotBefore - now).milliseconds)
+                                continue
+                            }
+                            when (val preparation = issueKrxBootstrap(topic, issue.origin, startsLadder = false)) {
+                                is KrxBootstrapPreparation.Ready -> {
+                                    currentIssue = preparation.issue
+                                    ladder = ladder.copy(issuedAtMillis = currentIssue.issuedAtMillis)
+                                    break
+                                }
+                                KrxBootstrapPreparation.Reprepare -> yield()
+                                else -> return@launch
+                            }
+                        }
+                        if (!krxIssueContextAdmitted(currentIssue)) return@launch
+                    }
+                    val captured = currentIssue
+                    krxRestIssues[captured.requestId] = captured
+                    val outcome = try {
+                        bootstrap(owner, topic) {
+                            // A 401 replay asks about this exact issue's use, never a replacement use.
+                            captured.grantEpoch == grantEpoch && liveIdentity() == owner &&
+                                authority.admits(captured.use.lifetime) && krxSendReader?.admitsKrx(captured.use) == true
+                        }
+                    } catch (withheld: TopicUseWithheldException) {
+                        handOverEvidence(withheld.exchanges, null, null)
+                        return@launch
+                    } catch (moved: AuthIdentityChangedException) {
+                        handOverEvidence(moved.exchanges, moved.statusCode, moved.retryAfter)
+                        return@launch
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    }
+                    (outcome as? TopicSnapshotOutcome.Refused)?.failure?.let { failure ->
+                        onBootstrapHttpEvidence(failure.statusCode, failure.retryAfter)
+                    }
+                    val next = TopicBootstrapRetryPolicy.afterAttempt(ladder, outcome, clock.nowMillis(), liveIdentity(),
+                        krxSnapshotRevision, bootstrapNotBeforeMillis(), krxIssueAdmitted(captured), jitter())
+                    when (next) {
+                        is TopicBootstrapNext.Retry -> {
+                            krxRestIssues.remove(captured.requestId)
+                            ladder = next.ladder
+                        }
+                        else -> {
+                            answerQueued = true
+                            post(SessionInput.BootstrapAnswered(epoch, topic, outcome, captured.use.lifetime,
+                                captured.marker, captured.requestId))
+                            return@launch
+                        }
+                    }
+                }
+            } finally {
+                if (!answerQueued) krxRestIssues.remove(currentIssue.requestId)
+                post(SessionInput.BootstrapSettled(issue.requestId))
+            }
+        }
+        krxLadderJob = job
+        bootstrapsOut[issue.requestId] = BootstrapOut(epoch, topic, job)
+    }
+
+    private fun applyKrxBootstrap(issue: KrxRestIssue, frame: DecodedTopicFrame.Krx) {
+        if (!krxIssueAdmitted(issue) || clock.nowMillis() - issue.issuedAtMillis >= TopicBootstrapRetryPolicy.ATTEMPT_BUDGET_MILLIS) return
+        val quotes = krxQuotes(frame)
+        if (quotes.isEmpty()) return
+        _rates.value = _rates.value.merge(quotes)
+        liveRates = liveRates.merge(quotes)
+        krxSnapshotRevision++
+        recordDelivery(TopicSilenceEvidence.OTHER, clock.nowMillis())
+        resolveCachedRefresh(issue.use.lifetime)
+    }
+    // Internal-constructor dependency only. Runtime keeps NONE until S6-3 wires its real sink.
+    private var krxRetirer: KrxSubscriptionRetirer = KrxSubscriptionRetirer.NONE
+    private fun retireKrxSubscription(retirement: KrxSubscriptionRetirement) = krxRetirer.retire(retirement)
+
     /**
      * Copied, so what this session consumes cannot change under it.
      *
@@ -561,6 +1043,7 @@ class TopicSessionCoordinator(
      * the absent channel of D-8. A null [krxSendReader] is the reader-less session of E-07/E-35, the same as one built by the public
      * constructor: a KRX attempt reads `authority` alone and captures no marker. Reader and channel are separate: with a channel and no
      * reader, a WebSocket refusal still goes to the channel with marker = null, and a REST Unsupported is not handed to the issuer.
+     * The additional internal krxRetirer dependency defaults to NONE; runtime leaves it there until S6-3 supplies its sink.
      */
     internal constructor(
         scope: CoroutineScope,
@@ -590,7 +1073,8 @@ class TopicSessionCoordinator(
         graphSink: TopicGraphSink = DormantTopicGraphSink,
         wallClock: () -> Long = System::currentTimeMillis,
         krxSendReader: KrxSendReadAuthority?,
-        onRejectedWithMarker: ((TopicSessionFence, Map<String, TopicRejectionReason>, KrxSendMarker?) -> Unit)? = null
+        onRejectedWithMarker: ((TopicSessionFence, Map<String, TopicRejectionReason>, KrxSendMarker?) -> Unit)? = null,
+        krxRetirer: KrxSubscriptionRetirer = KrxSubscriptionRetirer.NONE
     ) : this(
         scope = scope,
         clock = clock,
@@ -620,6 +1104,7 @@ class TopicSessionCoordinator(
     ) {
         this.krxSendReader = krxSendReader
         this.onRejectedWithMarker = onRejectedWithMarker
+        this.krxRetirer = krxRetirer
     }
 
     private class Connection(
@@ -636,6 +1121,15 @@ class TopicSessionCoordinator(
     ) {
         var opened = false
         var ended = false
+        var firstSubscribeStarted = false
+        var firstSubscribeSent = false
+        var krxPending: KrxPending? = null
+        var krxActive: KrxCapture? = null
+        val krxLeases = TopicLeaseRegistry()
+        var krxLeaseMasked = true
+        var krxRenewalScope: Set<String> = emptySet()
+        var krxExpiryTimer: Job? = null
+        var krxRenewalTimer: Job? = null
         /** Only a proving ACK clears a recorded authentication failure on this connection. */
         var graphAuthFailurePending = false
         var pongAnswered = false
@@ -726,7 +1220,8 @@ class TopicSessionCoordinator(
          * command judges its question against this same number, and an authentication ending records it.
          */
         val revalidationEntry: Long?,
-        val manual: ManualRetryContext? = null
+        val manual: ManualRetryContext? = null,
+        val krxSource: KrxAttemptSource
     ) {
         var job: Job? = null
 
@@ -780,7 +1275,13 @@ class TopicSessionCoordinator(
      */
     private val inputs = Channel<SessionInput>(
         capacity = Channel.UNLIMITED,
-        onUndeliveredElement = { input -> if (input is SessionInput.GraphLossPurge) input.reply.complete(false) }
+        onUndeliveredElement = { input ->
+            when (input) {
+                is SessionInput.GraphLossPurge -> input.reply.complete(false)
+                is SessionInput.KrxReprepare -> input.ready.cancel()
+                else -> Unit
+            }
+        }
     )
 
     /** Raised as the loop body's first statement, never lowered: a body that never ran has no `finally` to answer from. */
@@ -870,7 +1371,7 @@ class TopicSessionCoordinator(
      * The REST bootstraps still out, by request, with the grant and topic each was issued for.
      *
      * Held for shutdown, which is the one moment the answers stop having anywhere to go. A grant
-     * change does not cancel them — [grantEpoch] refuses those answers instead — which can leave
+     * change does not cancel GENERAL calls — [grantEpoch] refuses those answers instead — which can leave
      * multiple requests running to the end of their budgets. An entry leaves on its own
      * [SessionInput.BootstrapSettled], by request id, so an older request finishing late cannot take
      * a newer one's entry with it. Touched only on the loop.
@@ -1038,7 +1539,10 @@ class TopicSessionCoordinator(
      * differently. Repeating it is harmless, and it resets no budget — neither the reconnection ladder nor, under a re-approved grant,
      * the wait for a connection before automatic bootstraps (L-4e E5).
      */
-    override fun accessRevised() = post(SessionInput.AccessRevised)
+    override fun accessRevised() {
+        krxAccessSignals.incrementAndGet()
+        post(SessionInput.AccessRevised)
+    }
 
     /**
      * A credential recovery the token provider decided (S1 recovery signal), for this session to reopen what authentication ended
@@ -1105,6 +1609,7 @@ class TopicSessionCoordinator(
         if (stopped) {
             // Drained after Stop: answered, not dropped, so no caller waits on a loop that has ended.
             if (input is SessionInput.GraphLossPurge) input.reply.complete(false)
+            if (input is SessionInput.KrxReprepare) input.ready.cancel()
             return
         }
         // Publish each loop turn only after all of its synchronous work has finished.
@@ -1187,7 +1692,7 @@ class TopicSessionCoordinator(
                 // an answer still in flight does not. Raised before the teardown so nothing
                 // between here and the end of this branch can issue under the old number.
                 //
-                // The bootstraps in flight are deliberately **not** cancelled. Cancelling and
+                // GENERAL bootstraps in flight are deliberately **not** cancelled. Cancelling and
                 // this counter are not alternatives — one frees a socket, the other refuses a
                 // late answer, and only the second is a correctness question. What not cancelling
                 // costs is real and bounded: a request whose grant is over runs to the end of its
@@ -1198,6 +1703,12 @@ class TopicSessionCoordinator(
                     else -> null
                 }
                 if (moved || withdrawn) {
+                    if (krxSession != null) {
+                        retireKrxCapture(connection, KrxRetirementReason.CONTEXT_ENDED)
+                        cancelKrxBootstraps()
+                        krxBootstrapOwed = null
+                        krxPermitCommand = null
+                    }
                     grantEpoch++
                     resetCachedRefresh()
                 }
@@ -1268,7 +1779,17 @@ class TopicSessionCoordinator(
             }
 
             is SessionInput.BootstrapSettled -> {
-                bootstrapsOut.remove(input.requestId)
+                val settled = bootstrapsOut.remove(input.requestId)
+                if (settled != null && settled.grantEpoch == grantEpoch && krxSession != null &&
+                    TopicCatalogue.carriesKrx(settled.topic)
+                ) {
+                    if (krxLadderJob === settled.job) krxLadderJob = null
+                    // An explicit in-flight call may have held an independent automatic obligation.
+                    if (krxInitialIssuedGrant != grantEpoch || krxBootstrapOwed != null) {
+                        unissuedBootstraps += settled.topic
+                        pumpBootstraps()
+                    }
+                }
             }
 
             is SessionInput.RestoreSettled -> restoresOut.remove(input.requestId)
@@ -1296,6 +1817,7 @@ class TopicSessionCoordinator(
             }
 
             is SessionInput.BootstrapAnswered -> {
+                val krxIssue = input.krxIssueId?.let { krxRestIssues.remove(it) }
                 // The grant it was authorised under, against the one this session is on now. The
                 // transport already refused an answer whose account had moved; what it cannot see
                 // is a fence that arrives unchanged across a transition — an access withdrawal
@@ -1339,11 +1861,8 @@ class TopicSessionCoordinator(
                     endGraphUse(input.lifetime)
                     return
                 }
-                applyBootstrap(
-                    input.topic,
-                    delivered.frame,
-                    attribution
-                )
+                if (input.krxIssueId != null && krxIssue == null) return
+                applyBootstrap(input.topic, delivered.frame, attribution, krxIssue)
             }
 
             is SessionInput.Transport ->
@@ -1378,10 +1897,15 @@ class TopicSessionCoordinator(
                 }
                 wakeHeldSilenceQuestion(live)
                 reconsiderRecovery(live)
+                if (krxSession != null) reevaluateKrxPermit()
             }
 
             is SessionInput.CommandDone -> current(input.generation)?.let { live ->
                 val done = live.commands.remove(input.commandId)
+                live.krxPending?.takeIf { it.capture.commandId == input.commandId }?.let {
+                    retireKrxPending(live, it)
+                    live.krxPending = null
+                }
                 if (done?.purpose == TopicCommandPurpose.FIRST_DELIVERY) {
                     firstDeliveryOutstanding = false
                 }
@@ -1403,6 +1927,7 @@ class TopicSessionCoordinator(
                 // arrived may reopen it now. It creates no recovery and no budget.
                 wakeHeldSilenceQuestion(live)
                 reconsiderRecovery(live)
+                if (krxSession != null) reevaluateKrxPermit()
             }
 
             is SessionInput.CommandIdentityChanged -> current(input.generation)?.let { live ->
@@ -1469,6 +1994,7 @@ class TopicSessionCoordinator(
                 // After the two it always resumed, and asking everything again (L-4e E6b).
                 reconsiderRecovery(live)
                 startPendingManual(live)
+                if (krxSession != null) reevaluateKrxPermit()
             }
 
             is SessionInput.LeaseExpiryDue ->
@@ -1476,12 +2002,35 @@ class TopicSessionCoordinator(
 
             is SessionInput.AccessWithheldDue ->
                 current(input.generation)?.let { live ->
+                    if (krxSession != null) cancelKrxBootstraps()
                     end(live, TopicDisconnectCause.DELIBERATE)
                 }
 
             is SessionInput.DeferredUse -> if (stillOwns(input.attribution)) input.action()
 
             SessionInput.AccessRevised -> reevaluateAccess()
+
+            is SessionInput.KrxReprepare -> {
+                if (current(input.generation)?.commands?.containsKey(input.commandId) == true) input.ready.complete(Unit)
+                else input.ready.cancel()
+            }
+
+            SessionInput.KrxWake -> {
+                val owed = krxBootstrapOwed
+                if (owed != null && owed.grantEpoch == grantEpoch && krxSendReader?.admitsKrx(owed.use) == true) {
+                    if (owed.permit !in krxLaddersStarted) krxTopic?.let { topic ->
+                        unissuedBootstraps += topic
+                        pumpBootstraps()
+                    }
+                }
+                if (krxSession != null) reevaluateKrxPermit()
+            }
+
+            is SessionInput.KrxLeaseExpired -> current(input.generation)?.let { live ->
+                if (!live.krxLeaseMasked && live.krxLeases.expiredAt(clock.nowMillis()).isNotEmpty()) {
+                    retireKrxCapture(live, KrxRetirementReason.LEASE_EXPIRED)
+                }
+            }
 
             // Kept for the connection it names, then asked about (L-4e E6b §3). The pure comparison first; the live identity is
             // read only for a recovery that could be this connection's, and a move retires as at every other boundary.
@@ -1619,6 +2168,7 @@ class TopicSessionCoordinator(
     private fun settleRefusal(live: Connection, rejected: Map<String, TopicRejectionReason>) {
         if (rejected.values.none { it == TopicRejectionReason.PREMIUM_REQUIRED }) return
         refusedFor = live.fence
+        if (krxSession != null) cancelKrxBootstraps()
         endGraphAuthority(TopicGraphEventReason.PREMIUM_REFUSED)
         end(live, TopicDisconnectCause.DELIBERATE)
         cancelReconnect()
@@ -1640,6 +2190,7 @@ class TopicSessionCoordinator(
     private fun retireIdentity(owner: TopicSessionFence) {
         if (identityLostFor == owner) return
         identityLostFor = owner
+        if (krxSession != null) cancelKrxBootstraps()
         endGraphAuthority(TopicGraphEventReason.IDENTITY_RETIRED)
         connection?.takeIf { it.fence == owner }?.let {
             end(it, TopicDisconnectCause.DELIBERATE)
@@ -1745,16 +2296,29 @@ class TopicSessionCoordinator(
      * - The plan carries on under the same grant: only what is still owed is issued, each under its own new use.
      */
     private fun reevaluateAccess() {
-        connection?.let { live ->
-            if (!authority.admits(live.lifetime)) {
-                endGraphUse(live.lifetime)
-                end(live, TopicDisconnectCause.DELIBERATE)
+        val live = connection
+        val admitted = live?.let { authority.admits(it.lifetime) }
+        // OFF adds no B pull. The A1 discovery hint also lets an enabled p=0 session
+        // discover its first permit. Reconcile without a WS connection too: its REST
+        // delay/token/body can still be live during reconnect backoff.
+        val signal = krxAccessSignals.get()
+        val owner = fence
+        if ((krxSession != null || krxSessionCapabilityObserved) && owner != null && krxReconciledSignal != signal) {
+            krxSendReader?.acquireWithKrx(owner)?.let {
+                observeKrxSessionCapability(it.krxSessionCapable)
+                observeKrxRead(it.session, it.krxUse)
             }
+            krxReconciledSignal = signal
+        }
+        if (live != null && admitted == false) {
+            endGraphUse(live.lifetime)
+            end(live, TopicDisconnectCause.DELIBERATE)
         }
         if (connection == null && reconnectJob == null && wanted()) {
             if (everAttempted || reapprovedEpoch == grantEpoch) scheduleReconnect() else open()
         }
         pumpBootstraps()
+        if (krxSession != null) reevaluateKrxPermit()
     }
 
     private fun open(recoveryState: TopicRecoveryDisplay = TopicRecoveryDisplay.Connecting) {
@@ -1858,9 +2422,9 @@ class TopicSessionCoordinator(
 
             is DecodedTopicFrame.Dxy -> receiveIndex(live, frame.value)
 
-            // S6 owns turning KRX on. Until then a frame for it is not this session's, and
-            // counting it would let an unentitled topic satisfy a watchdog.
-            is DecodedTopicFrame.Krx -> Unit
+            // OFF keeps the original drop. ON requires a successfully sent, accepted capture;
+            // an early frame is discarded without buffering or receive evidence.
+            is DecodedTopicFrame.Krx -> if (krxSession != null) receiveKrx(live, frame)
 
             // Keep-alive only. The pong deadline is cleared by a pong, and not by any frame that
             // happens to arrive: a server that streams prices while its control plane is wedged
@@ -2112,6 +2676,8 @@ class TopicSessionCoordinator(
     }
 
     private fun offerGraphRestUndelivered(topic: String, outcome: TopicSnapshotOutcome, attribution: TopicUseAttribution) {
+        // Invalid KRX input creates no graph facts before S6-3. Its control callback still runs.
+        if (krxSession != null && TopicCatalogue.carriesKrx(topic) && outcome is TopicSnapshotOutcome.Malformed) return
         val captured = graphAuthority ?: return
         if (!authority.admits(attribution.lifetime)) {
             endGraphUse(attribution.lifetime)
@@ -2215,7 +2781,9 @@ class TopicSessionCoordinator(
 
         val owner = fence ?: return
         val epoch = owner.userAccessEpoch ?: return
-        offerLive?.invoke(owner.identity.uid, epoch, liveRates)
+        val persistent = if (krxSession == null) liveRates else
+            liveRates.copy(quotes = liveRates.quotes.filterKeys { it.source != "krx" && it.asset != "usd-krw-futures" })
+        offerLive?.invoke(owner.identity.uid, epoch, persistent)
     }
 
     // ---- subscribing ----------------------------------------------------------------------
@@ -2225,7 +2793,11 @@ class TopicSessionCoordinator(
         if (owner.identity != held.identity || owner.grantEpoch != grantEpoch) return
         val live = connection ?: return
         val eligible = store.snapshot.manualRetryTopics
-        val requested = TopicBootstrapOrder.shownBy(tab).filterTo(linkedSetOf()) { topic ->
+        val shown = TopicBootstrapOrder.shownBy(tab)
+        val krx = krxTopic?.takeIf {
+            krxSession != null && krxEffectiveUse != null && (tab == FreeTab.USD || tab == FreeTab.TETHER)
+        }
+        val requested = (shown + listOfNotNull(krx)).filterTo(linkedSetOf()) { topic ->
             topic in desired && topic in eligible && !manualAcknowledgementOutstanding(live, topic)
         }
         if (requested.isEmpty()) return
@@ -2369,6 +2941,7 @@ class TopicSessionCoordinator(
     private fun subscribe(live: Connection) {
         if (live.commands.values.any { it.purpose == TopicCommandPurpose.FIRST_DELIVERY }) return
         desired.forEach { store.setDesired(true, it) }
+        live.firstSubscribeStarted = true
         startCommand(live, TopicCommandPurpose.FIRST_DELIVERY) { desired }
     }
 
@@ -2415,6 +2988,11 @@ class TopicSessionCoordinator(
         manual: ManualRetryContext? = null,
         automaticRevalidation: Boolean = manual == null && (purpose == TopicCommandPurpose.REVALIDATION ||
             purpose == TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION),
+        krxSource: KrxAttemptSource = when {
+            manual != null -> KrxAttemptSource.MANUAL
+            purpose == TopicCommandPurpose.FIRST_DELIVERY -> KrxAttemptSource.FIRST
+            else -> KrxAttemptSource.RENEWAL
+        },
         topics: () -> Set<String>
     ) {
         val id = ++commandSerial
@@ -2430,25 +3008,11 @@ class TopicSessionCoordinator(
         // Reset by encode for every attempt, including a credential replay. Both use and marker belong to its one send read.
         var attemptRequest: TopicSubscribeRequest? = null
         var attemptAdmission: KrxSendAdmission? = null
-        val command = TopicSubscribeCommand(
-            purpose = purpose,
-            store = store,
-            credentials = boundTo(live.fence),
-            orders = orders,
-            clock = clock,
-            encode = { request ->
-                attemptRequest = request
-                attemptAdmission = null
-                encode(request)
-            },
-            // Refuses the send and asks the loop to enforce the expiry. Ending the connection
-            // from here would cancel this command's own coroutine, so the teardown stays with the
-            // loop — but the discovery must not stay here: without the message the socket lives on
-            // until the relative timer happens to wake, and this boundary is the one the three
-            // starters cannot cover, because the deadline can pass between the decision and the
-            // send. The handler checks the generation, so a dead connection cannot end a newer one.
-            send = { text ->
-                when {
+        var typedAttempt: KrxCommandAttempt? = null
+        var krxReadSignal = 0L
+        val legacySend: (String) -> Boolean = { text ->
+                val success = when {
+                    typedAttempt?.requestId == attemptRequest?.requestId && typedAttempt != null -> transport.send(text)
                     // A manual scope can empty independently of the base obligation. Its admission still protects the
                     // whole send, including the live identity after the attempt-start publication.
                     manual != null && (!manualAdmitted(live, manual.grantEpoch) ||
@@ -2456,8 +3020,10 @@ class TopicSessionCoordinator(
                     // The use first (L-4e E2a): a withheld use is not a lease that ran out, and ending it must not start a ladder.
                     !run {
                         val read = if (attemptRequest?.topics?.any(TopicCatalogue::carriesKrx) == true) {
+                            krxReadSignal = krxAccessSignals.get()
                             krxSendReader?.admitsWithKrx(live.lifetime)
                         } else null
+                        observeKrxSessionCapability(read?.krxSessionCapable == true)
                         attemptAdmission = read
                         read?.admitted ?: authority.admits(live.lifetime)
                     } -> {
@@ -2469,9 +3035,32 @@ class TopicSessionCoordinator(
                         post(SessionInput.LeaseExpiryDue(live.generation))
                         false
                     }
-                    else -> transport.send(text)
+                    else -> if (attemptAdmission?.session != null) false else transport.send(text)
                 }
+                if (success && purpose == TopicCommandPurpose.FIRST_DELIVERY) live.firstSubscribeSent = true
+                success
+            }
+        val command = TopicSubscribeCommand(
+            purpose = purpose,
+            store = store,
+            credentials = boundTo(live.fence),
+            orders = orders,
+            clock = clock,
+            encode = { request ->
+                attemptRequest = request
+                if (typedAttempt?.requestId != request.requestId) {
+                    typedAttempt = null
+                    attemptAdmission = null
+                }
+                encode(request)
             },
+            // Refuses the send and asks the loop to enforce the expiry. Ending the connection
+            // from here would cancel this command's own coroutine, so the teardown stays with the
+            // loop — but the discovery must not stay here: without the message the socket lives on
+            // until the relative timer happens to wake, and this boundary is the one the three
+            // starters cannot cover, because the deadline can pass between the decision and the
+            // send. The handler checks the generation, so a dead connection cannot end a newer one.
+            send = legacySend,
             newRequestId = newRequestId,
             jitter = jitter,
             scope = {
@@ -2498,8 +3087,33 @@ class TopicSessionCoordinator(
             manualEntry = manual?.entryReceiveGeneration,
             manualScope = { if (manual == null) emptySet() else manualScope(live, id, manual) }
         )
-        val running = RunningCommand(command, purpose, revalidationEntry, manual)
+        val running = RunningCommand(command, purpose, revalidationEntry, manual, krxSource)
         live.commands[id] = running
+        if (krxSendReader != null) {
+            command.installKrxCommandContext(krxSource, reprepare = {
+                val ready = CompletableDeferred<Unit>()
+                post(SessionInput.KrxReprepare(live.generation, id, ready))
+                ready.await()
+            }) { requestId, active, leases, sent ->
+                admitKrxAcknowledgement(live, id, requestId, active, leases, sent)
+            }
+            val boundary = object : KrxCommandAttemptBoundary {
+                override fun prepare(scope: KrxAttemptScope): KrxCommandAttempt? =
+                    prepareKrxAttempt(live, id, scope).also {
+                        typedAttempt = it
+                        if (it != null) krxPreparedSignals[it.requestId] = krxReadSignal
+                        attemptAdmission = scope.read
+                    }
+                override fun beforeEncode(attempt: KrxCommandAttempt): KrxAttemptCheck = checkKrxAttemptBeforeEncode(live, attempt)
+                override fun sent(attempt: KrxCommandAttempt) = onKrxAttemptSent(live, attempt)
+                override fun discard(attempt: KrxCommandAttempt) = discardKrxAttempt(live, attempt)
+            }
+            command.installKrxAttemptBoundary(krxAttemptBoundaryDecorator?.invoke(boundary) ?: boundary) { _, text ->
+                val sent = legacySend(text)
+                val read = attemptAdmission
+                if (read?.session != null && read.admitted) KrxAttemptDispatch.Prepare(read) else KrxAttemptDispatch.Legacy(sent)
+            }
+        }
         live.controlOwner = id
         if (revalidates) {
             live.revalidationOwner = id
@@ -2620,6 +3234,7 @@ class TopicSessionCoordinator(
             wakeHeldSilenceQuestion(live)
         }
         resolveCachedRefresh(live.lifetime)
+        if (krxSession != null) reevaluateKrxPermit()
         // Reported before the two observers below (L-4e E4a): the refusal is settled and its leases handled, and an observer that
         // throws must not keep the grant's refusal from the issuer. `live.fence`, not the session's current one: the refusal
         // above may already have ended this connection, and the grant it answered is the one this connection was opened under.
@@ -2661,12 +3276,12 @@ class TopicSessionCoordinator(
     private fun applyLeases(live: Connection, ack: TopicCommandAcknowledgement) {
         val update = live.leases.apply(
             acknowledgedAtMillis = ack.acknowledgedAtMillis,
-            leases = ack.leases.map {
+            leases = ack.leases.filter { krxSession == null || !TopicCatalogue.carriesKrx(it.topic) }.map {
                 TopicLeaseInput(it.topic, it.leaseId, it.durationSeconds)
             },
             jitter = leaseJitter()
         )
-        live.renewalScope = update.renewalScope
+        live.renewalScope = update.renewalScope + live.krxRenewalScope
         // This answer is the current state of the leases, so what it schedules supersedes a
         // renewal that stood aside for the channel — otherwise the release that follows sends one
         // immediately, moments after the server granted a fresh lease.
@@ -2799,11 +3414,56 @@ class TopicSessionCoordinator(
                 scheduleBootstrapIssue((notBefore - now).milliseconds)
                 return
             }
+            // An automatic obligation can remain owed behind an explicit KRX call. Joining
+            // that call is not another issue preparation or another payload read.
+            if (krxSession != null && TopicCatalogue.carriesKrx(next) &&
+                bootstrapsOut.values.any { it.grantEpoch == grantEpoch && it.topic == next && it.job.isActive }
+            ) return cancelBootstrapIssue()
             // Each issue is its own start (L-4e E2a): acquired right before it is taken off what is owed, never carried over from
             // the issue before it, whose job was already enqueued. Refused, nothing is consumed and the plan waits.
+            val readSignal = krxAccessSignals.get()
             val read = if (TopicCatalogue.carriesKrx(next)) {
                 fence?.let { krxSendReader?.acquireWithKrx(it) }
             } else null
+            observeKrxSessionCapability(read?.krxSessionCapable == true)
+            if (read?.session != null) {
+                val stamp = checkNotNull(read.session)
+                observeKrxRead(stamp, read.krxUse)
+                krxReconciledSignal = readSignal
+                if (read.krxUse == null || read.lifetime == null) return cancelBootstrapIssue()
+                val explicit = next in requestedBootstraps
+                val initial = krxInitialIssuedGrant != grantEpoch
+                val owed = krxBootstrapOwed?.takeIf { it.grantEpoch == grantEpoch }
+                if (!explicit && !initial && owed == null) {
+                    unissuedBootstraps.remove(next)
+                    continue
+                }
+                if (bootstrapsOut.values.any { it.grantEpoch == grantEpoch && it.topic == next && it.job.isActive }) return cancelBootstrapIssue()
+                val origin = when {
+                    explicit -> KrxBootstrapOrigin.EXPLICIT
+                    initial -> KrxBootstrapOrigin.INITIAL_PLAN
+                    else -> checkNotNull(owed).origin
+                }
+                stagedKrxBootstrapRead = read
+                stagedKrxBootstrapSignal = readSignal
+                val issue = when (val preparation = issueKrxBootstrap(next, origin, startsLadder = true)) {
+                    is KrxBootstrapPreparation.Ready -> preparation.issue
+                    KrxBootstrapPreparation.AlreadyStarted -> {
+                        unissuedBootstraps.remove(next)
+                        continue
+                    }
+                    else -> return cancelBootstrapIssue()
+                }
+                unissuedBootstraps.remove(next)
+                requestedBootstraps.remove(next)
+                if (origin == KrxBootstrapOrigin.EXPLICIT && (initial || owed != null)) {
+                    unissuedBootstraps += next
+                }
+                bootstrapFirstBatch = if (usesFirstBatch) (batch ?: shown) - next else emptySet()
+                lastBootstrapIssuedAtMillis = now
+                startKrxBootstrap(issue)
+                continue
+            }
             val lifetime = if (read != null) {
                 read.lifetime.also {
                     if (it == null) endGraphAuthority(TopicGraphEventReason.USE_WITHHELD)
@@ -2828,6 +3488,9 @@ class TopicSessionCoordinator(
      */
     private fun requestBootstrapOnLoop(topic: String) {
         if (!wanted() || topic !in desired) return
+        // Queue admission uses the last reconciled ON state; the logical issue below makes
+        // its one fresh payload read before any HTTP work can start.
+        if (TopicCatalogue.carriesKrx(topic) && krxSession != null && krxEffectiveUse == null) return
         // What is owed is already bound to the current grant here: the counter moves only in `Access`, which pumps in the
         // same turn, and the pump is what rebinds it.
         if (bootstrapsOut.values.any { it.grantEpoch == grantEpoch && it.topic == topic }) return
@@ -2934,6 +3597,8 @@ class TopicSessionCoordinator(
     private fun cancelBootstraps() {
         bootstrapsOut.values.forEach { it.job.cancel() }
         bootstrapsOut.clear()
+        krxLadderJob = null
+        krxRestIssues.clear()
         cancelBootstrapIssue()
         unissuedBootstraps.clear()
     }
@@ -2952,7 +3617,12 @@ class TopicSessionCoordinator(
      * never received a frame look like one that did. What a bootstrap does earn is D14's window,
      * which `TopicSilencePolicy` arms from either path.
      */
-    private fun applyBootstrap(topic: String, frame: DecodedTopicFrame, attribution: TopicUseAttribution) {
+    private fun applyBootstrap(
+        topic: String,
+        frame: DecodedTopicFrame,
+        attribution: TopicUseAttribution,
+        krxIssue: KrxRestIssue? = null
+    ) {
         when (frame) {
             is DecodedTopicFrame.Tether -> applyBootstrapEntries(topic, frame.value.data.allEntries, attribution)
             is DecodedTopicFrame.Fx -> applyBootstrapEntries(topic, frame.value.data.allEntries, attribution)
@@ -2975,9 +3645,9 @@ class TopicSessionCoordinator(
                 if (merged.dollarIndex != held.dollarIndex) resolveCachedRefresh(attribution.lifetime)
             }
 
-            // S6 owns KRX and `desired` cannot name it, so this is unreachable rather than
-            // ignored — but a `when` that stopped being exhaustive is not how it should be found.
-            is DecodedTopicFrame.Krx -> Unit
+            // Typed KRX results go through applyKrxBootstrap with their original issue. The
+            // legacy reader-less/OFF branch keeps its original drop.
+            is DecodedTopicFrame.Krx -> krxIssue?.let { applyKrxBootstrap(it, frame) }
 
             // The service refuses these before they can be an answer, because over one response a
             // non-answer is a failure rather than something to skip.
@@ -3508,6 +4178,7 @@ class TopicSessionCoordinator(
             revalidationTopics = { if (revalidation) owedTether() else emptySet() },
             manual = manual,
             automaticRevalidation = revalidation,
+            krxSource = KrxAttemptSource.RECOVERY,
             topics = baseScope
         )
     }
@@ -3553,6 +4224,9 @@ class TopicSessionCoordinator(
 
     private fun end(live: Connection, cause: TopicDisconnectCause) {
         if (live.ended) return
+        if (krxSession != null) retireKrxCapture(live, KrxRetirementReason.CONNECTION_ENDED)
+        live.krxExpiryTimer?.cancel()
+        live.krxRenewalTimer?.cancel()
         live.ended = true
         try {
             offerGraphWsInterruption(live, TopicGraphEventReason.WS_ENDED, desired, TopicGraphEventPayload.WsEnded(cause))
@@ -3644,5 +4318,18 @@ class TopicSessionCoordinator(
         val PONG_TIMEOUT = 10.seconds
         val RESUBSCRIBE_JITTER_MAX = 2.seconds
         const val PING = "ping"
+    }
+}
+
+internal data class KrxSubscriptionRetirement(
+    val connectionGeneration: Long,
+    val requestId: String,
+    val leaseId: String?
+)
+internal fun interface KrxSubscriptionRetirer {
+    fun retire(retirement: KrxSubscriptionRetirement)
+
+    companion object {
+        val NONE: KrxSubscriptionRetirer = KrxSubscriptionRetirer { }
     }
 }

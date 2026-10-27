@@ -1,0 +1,443 @@
+{
+  "W01a": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01a_firstDelivery_honoursE"
+  ],
+  "W01b": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01b_renewal_honoursE_withoutConsumption"
+  ],
+  "W01c": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01c_recovery_rechecksCurrentPermit"
+  ],
+  "W01d": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01d_manual_honoursE_preservesGeneral"
+  ],
+  "W01e": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01e_explicitRest_honoursE_atEveryBoundary"
+  ],
+  "W01f": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01f_initialPlan_isLast_andConsumesOnlyAtIssue"
+  ],
+  "W01g": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01g_permitSend_startsOneLadder"
+  ],
+  "W01h": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01h_unconsumedPermit_sendsOnce"
+  ],
+  "W06": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w06_firstFlipPermit_bothOrders_merge"
+  ],
+  "W07a": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w07a_reconnectAfterConsumption_includesKrx"
+  ],
+  "W07b": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w07b_disconnectBeforeAck_keepsSessionConsumption"
+  ],
+  "W07c": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w07c_rejectAckBeforePac_oldRefusalAddsNoFe"
+  ],
+  "W07d": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w07d_awaitingReconnect_sendsNoKrx"
+  ],
+  "W07e": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w07e_holdReconnect_sendsNoKrx"
+  ],
+  "W08a": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08a_pendingThenAccept_rechecksNewPermit"
+  ],
+  "W08b": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08c": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08c_pendingThenDisconnect_reconnectsOnce"
+  ],
+  "W13a": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w13a_generalLaneRelease_wakesPermit"
+  ],
+  "W13b": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w13b_authEndAndRecovery_keepPermitOwed"
+  ],
+  "W14a": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w14a_samePermitHideReopen_resendsOnce"
+  ],
+  "W14b": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w14b_rejectAck_doesNotRefundConsumption"
+  ],
+  "W15": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w15_successConsumesTheAttemptPermit"
+  ],
+  "R11-iv": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-vi": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11vi_markerUseAndConsumption_shareOneRead"
+  ],
+  "N1-01": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_hookPublication_repreparesPendingScope"
+  ],
+  "N1-02": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_beforeEncodeRevisionChange_repreparesBeforeWire"
+  ],
+  "N1-03": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_publicationAfterRevisionCheck_reconcilesWithoutLock"
+  ],
+  "N1-04": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_reprepare_dropsOnlyItsOwnTicket"
+  ],
+  "N1-05": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_emptyFinalScope_sendsNothing"
+  ],
+  "N1-06": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_mixedScope_preservesGeneralAckScope"
+  ],
+  "N1-07": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_sendFalse_discardsCaptureWithoutConsumption"
+  ],
+  "N1-08": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_ws401_replayReadsANewAttempt"
+  ],
+  "N2-01": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n2_pacPermitNeverDecreasesAcrossContextChanges"
+  ],
+  "N2-02": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n2_grantReplacement_keepsSessionConsumption"
+  ],
+  "N2-03": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n2_oldAckAndContextChange_bothOrders"
+  ],
+  "O2-01": [
+    "com.jay.fxi.data.remote.TopicSessionKrxOffTraceTest.o2_sessionTrace_matchesHead"
+  ],
+  "O2-02": [
+    "com.jay.fxi.data.remote.TopicSessionKrxOffTraceTest.o2_bootstrapTrace_matchesHead"
+  ],
+  "O2-03": [
+    "com.jay.fxi.data.remote.TopicSessionKrxOffTraceTest.o2_f2AndD14Trace_matchesHead"
+  ],
+  "O2-04": [
+    "com.jay.fxi.data.remote.TopicSessionKrxOffTraceTest.o2_authRecoveryTrace_matchesHead"
+  ],
+  "O2-05": [
+    "com.jay.fxi.data.remote.TopicSessionKrxOffTraceTest.o2_mixedFrameTrace_matchesHead"
+  ],
+  "O2-06": [
+    "com.jay.fxi.data.remote.TopicSessionKrxOffTraceTest.o2_failedSendTrace_matchesHead"
+  ],
+  "O2-07": [
+    "com.jay.fxi.data.remote.TopicSessionKrxOffTraceTest.o2_typedBoundaryIsUnusedOff"
+  ],
+  "O2-08": [
+    "com.jay.fxi.data.remote.TopicSessionKrxOffTraceTest.o2_metadataDoesNotChangeOffRevisions"
+  ],
+  "Z01": [
+    "com.jay.fxi.KrxSessionWiringContractTest.z01_alphaProductionIsOff_withoutKrxProducer"
+  ],
+  "Z02": [
+    "com.jay.fxi.KrxSessionWiringContractTest.z02_allEightPaths_useTheTypedBoundary"
+  ],
+  "Z03": [
+    "com.jay.fxi.KrxSessionWiringContractTest.z03_rejectionInventory_isCompleteAndMapped"
+  ],
+  "Z04": [
+    "com.jay.fxi.KrxSessionWiringContractTest.z04_authorityAndCheckedOn_areActuallyWired"
+  ],
+  "W01c/current-p": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01c_recovery_rechecksCurrentPermit"
+  ],
+  "W01c/old-krx-rejection": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01c_recovery_rechecksCurrentPermit"
+  ],
+  "W01f/visible": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01f_initialPlan_isLast_andConsumesOnlyAtIssue"
+  ],
+  "W01f/hidden-after-plan": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w01f_initialPlan_isLast_andConsumesOnlyAtIssue"
+  ],
+  "W06/ws-first": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w06_firstFlipPermit_bothOrders_merge"
+  ],
+  "W06/rest-first": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w06_firstFlipPermit_bothOrders_merge"
+  ],
+  "W07c/pac-delayed": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w07c_rejectAckBeforePac_oldRefusalAddsNoFe"
+  ],
+  "W07c/ack-delayed": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w07c_rejectAckBeforePac_oldRefusalAddsNoFe"
+  ],
+  "W13a/renewal": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w13a_generalLaneRelease_wakesPermit"
+  ],
+  "W13a/revalidation": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w13a_generalLaneRelease_wakesPermit"
+  ],
+  "W13a/manual": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w13a_generalLaneRelease_wakesPermit"
+  ],
+  "W13b/recovery-before-command-done": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w13b_authEndAndRecovery_keepPermitOwed"
+  ],
+  "W13b/recovery-after-command-done": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w13b_authEndAndRecovery_keepPermitOwed"
+  ],
+  "W14a/boundary-input:LOSS_CANDIDATE": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w14a_samePermitHideReopen_resendsOnce"
+  ],
+  "W14a/boundary-input:DERIVED_SEAL": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w14a_samePermitHideReopen_resendsOnce"
+  ],
+  "W14a/boundary-input:hidden-reconnect": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w14a_samePermitHideReopen_resendsOnce"
+  ],
+  "W14a/boundary-input:conflated": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w14a_samePermitHideReopen_resendsOnce"
+  ],
+  "W15/send-false": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w15_successConsumesTheAttemptPermit"
+  ],
+  "W15/blocked": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w15_successConsumesTheAttemptPermit"
+  ],
+  "W15/success": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w15_successConsumesTheAttemptPermit"
+  ],
+  "W15/rest-issue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w15_successConsumesTheAttemptPermit"
+  ],
+  "N1-03/hidden-in-send": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_publicationAfterRevisionCheck_reconcilesWithoutLock"
+  ],
+  "N1-03/new-p-in-send": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_publicationAfterRevisionCheck_reconcilesWithoutLock"
+  ],
+  "N1-04/replacement-ticket": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_reprepare_dropsOnlyItsOwnTicket"
+  ],
+  "N1-04/stale-ack": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_reprepare_dropsOnlyItsOwnTicket"
+  ],
+  "N1-04/budget-after-reprepare": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n1_reprepare_dropsOnlyItsOwnTicket"
+  ],
+  "N2-03/identity-before": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n2_oldAckAndContextChange_bothOrders"
+  ],
+  "N2-03/identity-after": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n2_oldAckAndContextChange_bothOrders"
+  ],
+  "N2-03/user-before": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n2_oldAckAndContextChange_bothOrders"
+  ],
+  "N2-03/user-after": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n2_oldAckAndContextChange_bothOrders"
+  ],
+  "N2-03/generation-before": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n2_oldAckAndContextChange_bothOrders"
+  ],
+  "N2-03/generation-after": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.n2_oldAckAndContextChange_bothOrders"
+  ],
+  "W08b/N1/open-next-old-marker": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/N1b/h2-t2-old-marker": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/N2/duplicate-during-HOLD": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/N3/ineligible-triplet": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/N4/stable-true": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/N4/pending-true": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/N5/process": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/N5/abandon": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n1/before/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n1/before/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n1/during/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n1/during/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n1/after/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n1/after/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n3/before/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n3/before/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n3/during/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n3/during/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n3/after/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/live/n3/after/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n1/before/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n1/before/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n1/during/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n1/during/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n1/after/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n1/after/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n3/before/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n3/before/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n3/during/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n3/during/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n3/after/prefalse": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/R06/store/n3/after/pretrue": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/RO2/approval-closed/n1/before": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/RO2/approval-closed/n1/during": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/RO2/approval-closed/n1/after": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/RO2/approval-closed/n3/before": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/RO2/approval-closed/n3/during": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "W08b/RO2/approval-closed/n3/after": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.w08b_pendingThenReject_rechecksNewPermit"
+  ],
+  "SCAN-KW06": [
+    "com.jay.fxi.KrxContestWiringContractTest.KW06_newStateStaysOutOf0aAndInsidePac"
+  ],
+  "SCAN-KW12": [
+    "com.jay.fxi.KrxContestWiringContractTest.KW12_theGuardIsDefinedOnceAndCalledByTheThreeConsumers"
+  ],
+  "SCAN-KW15": [
+    "com.jay.fxi.KrxContestWiringContractTest.KW15_newOnTestsKeepThePublicationCheck"
+  ],
+  "SCAN-KW17": [
+    "com.jay.fxi.KrxContestWiringContractTest.KW17_transportCarriesNoMarkerAndTheBootstrapSeamIsHeads"
+  ],
+  "DORM-Z09": [
+    "com.jay.fxi.KrxS6DormancyContractTest.Z09_sessionStillDropsKrxAndClassifiesOnlyTetherAsTetherDelivery"
+  ],
+  "DORM-Y02": [
+    "com.jay.fxi.TopicBootstrapRetryDormancyContractTest.Y02_policyHasNoCaller"
+  ],
+  "O1": [
+    "com.jay.fxi.data.entitlements.PremiumAccessKrxDormantTraceTest.d1_rejectionsAndAnswersAlternating",
+    "com.jay.fxi.data.entitlements.PremiumAccessKrxDormantTraceTest.d2_undecidedRejections",
+    "com.jay.fxi.data.entitlements.PremiumAccessKrxDormantTraceTest.d3_rotationFailureSealAndRelease",
+    "com.jay.fxi.data.entitlements.PremiumAccessKrxDormantTraceTest.d4_intraStepChangeIsCaptured",
+    "com.jay.fxi.data.entitlements.PremiumAccessKrxDormantTraceTest.d5_queryCandidateDecisionAndStaleRelease",
+    "com.jay.fxi.data.entitlements.PremiumAccessKrxDormantTraceTest.d6_zeroDelayRecheckFiresDuringCandidateRelease",
+    "com.jay.fxi.data.entitlements.PremiumAccessKrxDormantTraceTest.k17_laterFalseAfterSuppressedTrue",
+    "com.jay.fxi.data.entitlements.PremiumAccessKrxDormantTraceTest.k18_completionInversion",
+    "com.jay.fxi.data.entitlements.PremiumAccessKrxDormantTraceTest.d7_markedRefusalsDuplicateAndMarkerless_offIgnoresMarkers",
+    "com.jay.fxi.data.entitlements.PremiumAccessKrxDormantTraceTest.d8_earlierPermitAndOldEpochMarkers_offIgnoresMarkers"
+  ],
+  "R11-iv/FIRST": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/RENEWAL": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/RECOVERY": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/MANUAL": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/EXPLICIT": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/G1i": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/G1ii": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/PERMIT": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/CAP-R01/ws-rest/H1": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/CAP-R01/ws-rest/H1prime": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/CAP-R01/rest-ws/H1": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/CAP-R01/rest-ws/H1prime": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/CAP-R04/rest-topics_disabled": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/CAP-R04/rest-topic_unavailable": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/CAP-R04/ws-topic_unavailable": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/CAP-R04/rest-nonkrx-unsupported": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/CAP-R04/rest-503": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/CAP-R04/rest-403": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/EXPLICIT/supported-list": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ],
+  "R11-iv/G1i/pacing-new-p": [
+    "com.jay.fxi.data.remote.TopicSessionKrxPermitConsumptionTest.r11iv_allEightPaths_carryMarkers"
+  ]
+}

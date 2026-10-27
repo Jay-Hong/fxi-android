@@ -3,6 +3,11 @@ package com.jay.fxi.data.remote
 import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.AuthUnavailableException
+import com.jay.fxi.data.entitlements.KrxAttemptCheck
+import com.jay.fxi.data.entitlements.KrxSendAdmission
+import com.jay.fxi.data.entitlements.KrxSendMarker
+import com.jay.fxi.data.entitlements.KrxSessionStamp
+import com.jay.fxi.data.entitlements.KrxUseLifetime
 import com.jay.fxi.data.remote.dto.SubscriptionAck
 import com.jay.fxi.data.remote.dto.SubscriptionError
 import com.jay.fxi.data.remote.dto.TopicLease
@@ -27,6 +32,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 
 /**
  * A monotonic clock and the waits taken against it, as one injectable thing.
@@ -304,6 +310,47 @@ class TopicSubscribeCommand(
     /** Immediately after an admitted refresh result applies InvalidToken because it produced no usable credential. */
     private val onAuthRefreshUnusable: () -> Unit = {}
 ) {
+    // The legacy probe preserves OFF ordering; only Prepare enters the typed path.
+    private var krxAttemptBoundary: KrxCommandAttemptBoundary? = null
+    private var krxAttemptDispatch: ((TopicSubscribeRequest, String) -> KrxAttemptDispatch)? = null
+    private var krxRunStarted = false
+
+    internal fun installKrxAttemptBoundary(
+        boundary: KrxCommandAttemptBoundary,
+        dispatch: (TopicSubscribeRequest, String) -> KrxAttemptDispatch
+    ) {
+        check(!krxRunStarted && krxAttemptBoundary == null)
+        krxAttemptBoundary = boundary
+        krxAttemptDispatch = dispatch
+    }
+
+    private var krxSource = KrxAttemptSource.FIRST
+    private var krxReprepare: suspend () -> Unit = { yield() }
+    private var activeKrxAttempt: KrxCommandAttempt? = null
+    private var krxAckAdmission: ((String, Set<String>, List<TopicLease>, Set<String>) -> Set<String>)? = null
+
+    /** Operational context: ACK filtering runs before any canonical store or lease write. */
+    internal fun installKrxCommandContext(
+        source: KrxAttemptSource,
+        reprepare: suspend () -> Unit,
+        admitAck: (String, Set<String>, List<TopicLease>, Set<String>) -> Set<String>
+    ) {
+        check(!krxRunStarted && krxAckAdmission == null)
+        krxSource = source
+        krxReprepare = reprepare
+        krxAckAdmission = admitAck
+    }
+
+    private fun prepareKrxAttempt(scope: KrxAttemptScope): KrxCommandAttempt? =
+        checkNotNull(krxAttemptBoundary).prepare(scope)
+
+    private fun checkKrxAttemptBeforeEncode(attempt: KrxCommandAttempt): KrxAttemptCheck =
+        checkNotNull(krxAttemptBoundary).beforeEncode(attempt)
+
+    private fun releaseKrxAttempt(attempt: KrxCommandAttempt) {
+        checkNotNull(krxAttemptBoundary).discard(attempt)
+        if (activeKrxAttempt === attempt) activeKrxAttempt = null
+    }
     init {
         require(purpose != TopicCommandPurpose.LEASE_RENEWAL_WITH_REVALIDATION || revalidationEntry != null) {
             "a combined command is judged against the entry its registration read"
@@ -371,6 +418,7 @@ class TopicSubscribeCommand(
 
     suspend fun run(): TopicCommandOutcome =
         try {
+            krxRunStarted = true
             close(drive())
         } finally {
             // Reached on cancellation too, which is safe now that the tickets say whose these are:
@@ -378,6 +426,7 @@ class TopicSubscribeCommand(
             // alone. Without them this had to be skipped, and a cancelled command left `PENDING`
             // standing with nothing behind it — and, cancelled mid-refresh, `REFRESHING` too.
             // Found by review, both of them.
+            activeKrxAttempt?.let(::releaseKrxAttempt)
             ticket?.let(store::releaseRequest)
             authTicket?.let(store::abandonAuthRefresh)
         }
@@ -402,6 +451,7 @@ class TopicSubscribeCommand(
         var attempt = TopicRequestPolicy.nextAttempt(0) ?: return budgetSpent()
         var authReplayUsed = false
         var replayCredential: AuthSnapshot? = null
+        var unsentCredential: Pair<AuthSnapshot, Boolean>? = null
 
         // What each topic's generation was when this command began, as opposed to when its current
         // attempt was sent. A revalidation is judged against this one: a frame that arrived during
@@ -412,14 +462,15 @@ class TopicSubscribeCommand(
         val entry = revalidationEntry ?: scope().associateWith { store.snapshot.stateFor(it).receiveGeneration }
 
         while (true) {
+            activeKrxAttempt?.let(::releaseKrxAttempt)
             when (val before = sendable(entry)) {
                 Sendable.Nothing -> return TopicCommandOutcome.Superseded
                 is Sendable.Recovered -> return TopicCommandOutcome.AlreadyDelivering(before.values)
                 is Sendable.Topics -> Unit
             }
 
-            val replayOfRefresh = replayCredential != null
-            val credential = replayCredential ?: try {
+            val replayOfRefresh = unsentCredential?.second ?: (replayCredential != null)
+            val credential = unsentCredential?.first ?: replayCredential ?: try {
                 credentials.currentSnapshot()
             } catch (unavailable: AuthUnavailableException) {
                 // A preparation failure spends an attempt of its own — three of these leave no
@@ -433,6 +484,7 @@ class TopicSubscribeCommand(
                 }
             }
             replayCredential = null
+            unsentCredential = null
 
             // Asked again after the wait, not only before it: acquiring a credential suspends, and
             // a command that checked only on the way in would send to a scope that emptied while
@@ -444,7 +496,7 @@ class TopicSubscribeCommand(
             }
             val wanted = now.values
 
-            val pending = register(wanted, now.watched, now.manualTopics, credential, replayOfRefresh) ?: return programmingError()
+            var pending = register(wanted, now.watched, now.manualTopics, credential, replayOfRefresh) ?: return programmingError()
             // Before the store is touched, not after. Nothing goes on the wire on behalf of a
             // cancelled command — and a cancelled command must not take the replacement's request
             // with it either, which is what `beginRequest` here would do by claiming the ticket
@@ -453,7 +505,49 @@ class TopicSubscribeCommand(
             currentCoroutineContext().ensureActive()
             ticket = store.beginRequest()
             onRequestStarted()
-            if (!send(encode(subscribe(pending, wanted)))) {
+            val request = subscribe(pending, wanted)
+            val sent = when (val result = krxAttemptDispatch?.invoke(request, encode(request))) {
+                is KrxAttemptDispatch.Legacy -> result.sent
+                is KrxAttemptDispatch.Prepare -> {
+                    // The probe never left. Its ticket and ID cannot answer the typed request.
+                    ticket?.let(store::releaseRequest)
+                    ticket = null
+                    val attemptScope = KrxAttemptScope(
+                        newRequestId(), wanted.toSet(), now.watched.toSet(), now.manualTopics.toSet(), krxSource, result.read
+                    )
+                    val typed = prepareKrxAttempt(attemptScope) ?: return TopicCommandOutcome.Superseded
+                    activeKrxAttempt = typed
+                    pending = register(typed.pendingAckTopics, typed.watched, typed.manualTopics,
+                        credential, replayOfRefresh, typed.requestId) ?: return programmingError()
+                    currentCoroutineContext().ensureActive()
+                    ticket = store.beginRequest()
+                    onRequestStarted()
+                    when (checkKrxAttemptBeforeEncode(typed)) {
+                        KrxAttemptCheck.REPREPARE -> {
+                            // No physical attempt or authentication replay was spent. Let the serial
+                            // session run its queued publication before asking with a fresh ID.
+                            releaseKrxAttempt(typed)
+                            ticket?.let(store::releaseRequest)
+                            ticket = null
+                            unsentCredential = credential to replayOfRefresh
+                            krxReprepare()
+                            continue
+                        }
+                        KrxAttemptCheck.NOT_SENT -> {
+                            releaseKrxAttempt(typed)
+                            false
+                        }
+                        KrxAttemptCheck.READY -> {
+                            val text = encode(subscribe(pending, typed.topics))
+                            val success = send(text)
+                            if (success) krxAttemptBoundary?.sent(typed) else releaseKrxAttempt(typed)
+                            success
+                        }
+                    }
+                }
+                null -> send(encode(request))
+            }
+            if (!sent) {
                 attempt = TopicRequestPolicy.nextAttempt(attempt) ?: return budgetSpent()
                 when (waitBeforeRetry(TopicCommandRetryPolicy.SILENT_RETRY_COOLDOWN)) {
                     WaitResult.PROCEED -> continue
@@ -623,12 +717,13 @@ class TopicSubscribeCommand(
         watched: Set<String>,
         manualTopics: Set<String>,
         credential: AuthSnapshot,
-        replayOfRefresh: Boolean
+        replayOfRefresh: Boolean,
+        requestId: String? = null
     ): Pending? {
         val sentAt = clock.nowMillis()
         val deadlines = TopicRequestPolicy.deadlinesFor(sentAt) ?: return null
         return Pending(
-            requestId = newRequestId(),
+            requestId = requestId ?: newRequestId(),
             topics = wanted,
             watched = watched,
             manualTopics = manualTopics,
@@ -693,8 +788,7 @@ class TopicSubscribeCommand(
 
     /** Applies the acknowledgement, hands it over, then waits out that send's delivery deadline. */
     private suspend fun settle(pending: Pending, answer: Answer.Acked): TopicCommandOutcome {
-        val active = answer.ack.activeSubscriptions.mapTo(mutableSetOf()) { it.topic }
-        val accepted = pending.topics intersect active
+        val reportedActive = answer.ack.activeSubscriptions.mapTo(mutableSetOf()) { it.topic }
         // Narrowed to what this request actually asked for. `active_subscriptions` is the whole
         // connection's final state and is meant to be read that way, but `rejected_topics` is an
         // answer to a question — and a refusal for a topic this request never sent is somebody
@@ -709,6 +803,9 @@ class TopicSubscribeCommand(
         // The same map the session reads for its refusal latch and hands over, so the premium exception and the refusals delivered
         // while a use is withheld are exactly these.
         val admittedAt = admit(rejected)
+        val active = krxAckAdmission?.invoke(pending.requestId, reportedActive, answer.leases, pending.topics) ?: reportedActive
+        val accepted = pending.topics intersect active
+        val leases = if (active == reportedActive) answer.leases else answer.leases.filter { it.topic in active }
         val authenticationProven = provesAuthentication(accepted, rejected)
         store.applyAck(
             activeTopics = active,
@@ -721,7 +818,7 @@ class TopicSubscribeCommand(
                 acknowledgedAtMillis = admittedAt,
                 accepted = accepted,
                 rejected = rejected,
-                leases = answer.leases,
+                leases = leases,
                 provesAuthentication = authenticationProven,
                 missing = pending.manualTopics - active - rejected.keys
             )
@@ -753,7 +850,7 @@ class TopicSubscribeCommand(
             // caller branches on [purpose] too; this is the half that cannot be forgotten.
             // Found by review.
             silent = silentOf(pending, observed) intersect stillWanted,
-            leases = answer.leases,
+            leases = leases,
             purpose = purpose
         )
     }
@@ -845,4 +942,41 @@ class TopicSubscribeCommand(
      */
     private fun programmingError() =
         TopicCommandOutcome.Stopped(TopicWholeRequestDecision.Stop.Reason.PROGRAMMING_ERROR)
+}
+
+// S6-2b-2α typed signatures. Credentials and token strings never belong to these values.
+internal sealed interface KrxAttemptDispatch {
+    data class Legacy(val sent: Boolean) : KrxAttemptDispatch
+    data class Prepare(val read: KrxSendAdmission) : KrxAttemptDispatch
+}
+internal enum class KrxAttemptSource { FIRST, RENEWAL, RECOVERY, MANUAL, PERMIT }
+internal data class KrxAttemptScope(
+    val requestId: String,
+    val topics: Set<String>,
+    val watched: Set<String>,
+    val manualTopics: Set<String>,
+    val source: KrxAttemptSource,
+    val read: KrxSendAdmission
+)
+internal data class KrxCommandAttempt(
+    val requestId: String,
+    val connectionGeneration: Long,
+    val commandId: Long,
+    val grantEpoch: Long,
+    val topics: Set<String>,
+    val pendingAckTopics: Set<String>,
+    val watched: Set<String>,
+    val manualTopics: Set<String>,
+    val source: KrxAttemptSource,
+    val generalLifetime: TopicUseLifetime,
+    val stamp: KrxSessionStamp,
+    val marker: KrxSendMarker,
+    val krxUse: KrxUseLifetime?,
+    val consumePermit: Long?
+)
+internal interface KrxCommandAttemptBoundary {
+    fun prepare(scope: KrxAttemptScope): KrxCommandAttempt?
+    fun beforeEncode(attempt: KrxCommandAttempt): KrxAttemptCheck
+    fun sent(attempt: KrxCommandAttempt)
+    fun discard(attempt: KrxCommandAttempt)
 }

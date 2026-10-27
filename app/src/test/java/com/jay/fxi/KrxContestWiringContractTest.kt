@@ -1,5 +1,6 @@
 package com.jay.fxi
 
+import com.jay.fxi.data.remote.KrxSessionSourceContract
 import com.jay.fxi.data.entitlements.KrxHarnessDefaults
 import com.jay.fxi.data.entitlements.KrxSendMarker
 import com.jay.fxi.data.entitlements.grantedKrxVisible
@@ -82,6 +83,7 @@ class KrxContestWiringContractTest {
         const val SEED = "${M}data/graph/GraphV2Cache.kt"
         const val HOLDER = "${M}ui/premium/graph/GraphV2ScreenStateHolder.kt"
         const val TSC = "${M}data/remote/TopicSessionCoordinator.kt"
+        const val CMD = "${M}data/remote/TopicSubscribeCommand.kt"
         const val TOPIC_USE = "${M}data/remote/TopicUse.kt"
         const val RUNTIME = "${M}data/remote/TopicRuntime.kt"
         const val TRANSPORT = "${M}data/remote/AuthenticatedTransport.kt"
@@ -106,12 +108,14 @@ class KrxContestWiringContractTest {
          * SUA here). capabilityInvalidations: GraphV2RequestCoordinator.kt joins because the OD-B07 ProtectedSlot keeps the original
          * request or seed capture's count, read off `GraphV2AccessCapture.capabilityInvalidations` by name (§3 D-6, T.14).
          */
+        // α-1a seam r2 §1.1: CMD imports/carries KrxSendMarker only in KrxCommandAttempt.
+        // No package-wide allowance; Z02 owns real call wiring, OFF traces own legacy behaviour.
         val MARKER_REQUIRED = setOf(MARKER, PAC, LEDGER, TGD, TSC)
-        val MARKER_UPPER = setOf(MARKER, PAC, LEDGER, TGD, TSC, SUA, TOPIC_USE, RUNTIME)
-        val MARKER_EXACT = setOf(MARKER, PAC, LEDGER, TGD, TSC, SUA)
+        val MARKER_UPPER = setOf(MARKER, PAC, LEDGER, TGD, TSC, SUA, TOPIC_USE, RUNTIME, CMD)
+        val MARKER_EXACT = setOf(MARKER, PAC, LEDGER, TGD, TSC, SUA, CMD)
         val CAP_INV_REQUIRED = setOf(TAS, PAC, SUA, GATE)
-        val CAP_INV_UPPER = setOf(TAS, PAC, SUA, GATE, GV2RC)
-        val CAP_INV_EXACT = setOf(TAS, PAC, SUA, GATE, GV2RC)
+        val CAP_INV_UPPER = setOf(TAS, PAC, SUA, GATE, GV2RC, TSC)
+        val CAP_INV_EXACT = setOf(TAS, PAC, SUA, GATE, GV2RC, TSC)
 
         /** KW12 (design r5 §2 (r4 통합 조정), §8.1 new scan): production files naming `krxPermitSeq`. */
         val PERMIT_FILES = setOf(TAS, PAC, SUA, GATE)
@@ -528,7 +532,7 @@ class KrxContestWiringContractTest {
         assertTrue("KW06 capabilityInvalidations outside the §8.1 upper bound (re-agree the design): ${capInv - CAP_INV_UPPER}", CAP_INV_UPPER.containsAll(capInv))
         assertTrue("KW06 (D-6) the ProtectedSlot attribution in GraphV2RequestCoordinator reads the original capture's capabilityInvalidations",
             GV2RC in capInv)
-        assertEquals("KW06 capabilityInvalidations exact set", CAP_INV_EXACT, capInv)
+        assertEquals("contract(KW06): capabilityInvalidations exact set adds only TSC stamp reconciliation", CAP_INV_EXACT, capInv)
     }
 
     /**
@@ -670,7 +674,7 @@ class KrxContestWiringContractTest {
         val comparison = Regex("""\b(krxP|p)ermitSeq\s*(>=?|<=?|==|!=)|(>=?|<=?|==|!=)\s*[\w.]*\b(krxP|p)ermitSeq\b""")
         val consumers = listOf(GATE, TSC, GV2RC, SEED, HOLDER).associateWith { code.getValue(it) } +
             (SUA to code.getValue(SUA).replace(Regex("""fun\s+krxConsumerGuard\s*\([^)]*\)\s*:\s*Boolean\s*=[^\n]*"""), ""))
-        val copied = consumers + (GATE to consumers.getValue(GATE) + "\nprivate fun copy(s: TopicAccessSnapshot) = s.krxPermitSeq > 0\n")
+        val copied = (consumers - TSC) + (GATE to consumers.getValue(GATE) + "\nprivate fun copy(s: TopicAccessSnapshot) = s.krxPermitSeq > 0\n")
         assertEquals("KW12 self-check: a guard copy in the gate is caught", mapOf(GATE to 1), occurrences(comparison, copied))
         val c1Function = """
             private fun c1(captured: GraphV2AccessCapture, access: TopicAccessSnapshot, n: Long): Boolean =
@@ -722,10 +726,31 @@ class KrxContestWiringContractTest {
         val permit = Regex("""\bkrxPermitSeq\b""")
         assertTrue("KW12 every krxPermitSeq in the gate is a krxConsumerGuard argument", inside(code.getValue(GATE), permit, "krxConsumerGuard"))
         assertTrue("KW12 every krxPermitSeq in SUA is a krxConsumerGuard or KrxSendMarker argument",
-            inside(code.getValue(SUA), permit, "krxConsumerGuard", "KrxSendMarker"))
-        assertTrue("KW12 every permitSeq in TSC is a krxConsumerGuard argument",
-            inside(code.getValue(TSC), Regex("""\b(krxP|p)ermitSeq\b"""), "krxConsumerGuard"))
-        assertEquals("KW12 permit comparisons in consumer files outside the guard body (G-CP)", emptyMap<String, Int>(), occurrences(comparison, consumers))
+            inside(code.getValue(SUA), permit, "krxConsumerGuard", "KrxSendMarker", "KrxSessionStamp"))
+        // α-1a exact amendment: TSC may compare/carry the same read's stamp in the named ledger/issue owners only.
+        // The predicate itself remains SUA's krxConsumerGuard; arbitrary p > 0 copies stay forbidden.
+        val tsc = code.getValue(TSC)
+        val ledgerNames = listOf("prepareKrxAttempt", "reconcileKrxSession", "reevaluateKrxPermit", "onKrxAttemptSent", "issueKrxBootstrap")
+        val ledgerRanges = ledgerNames.map { name ->
+            val body = KrxSessionSourceContract.function(tsc, name)
+            val start = tsc.indexOf(body)
+            start until start + body.length
+        }
+        val guardRanges = Regex("""\bkrxConsumerGuard\s*[(]""").findAll(tsc).map { hit ->
+            val span = checkNotNull(argumentSpan(tsc, hit.range.last))
+            hit.range.first..hit.range.last + span.length + 1
+        }.toList()
+        for (hit in Regex("""\bpermitSeq\b""").findAll(tsc)) {
+            val permitted = ledgerRanges.any { hit.range.first in it } ||
+                guardRanges.any { hit.range.first in it }
+            assertTrue("contract(KW12): TSC permit read belongs to a named ledger owner or the existing guard", permitted)
+        }
+        assertEquals("KW12 copied permit predicates outside TSC ledger", emptyMap<String, Int>(), occurrences(comparison, consumers - TSC))
+        for (hit in comparison.findAll(tsc)) {
+            val line = tsc.substring(tsc.lastIndexOf('\n', hit.range.first - 1) + 1, tsc.indexOf('\n', hit.range.last).let { if (it < 0) tsc.length else it })
+            assertTrue("contract(KW12): session comparison must be inside a ledger owner and compare consumedPermit",
+                ledgerRanges.any { hit.range.first in it } && line.contains("consumedPermit"))
+        }
 
         for (key in listOf(SUA, GATE)) {
             val text = code.getValue(key)
@@ -1162,9 +1187,15 @@ class KrxContestWiringContractTest {
         val headService = "suspend fun bootstrap(owner: AuthIdentityFence, topic: String, useAdmitted: (() -> Boolean)? = null): TopicSnapshotOutcome"
         assertEquals("KW17 the service's bootstrap signature is HEAD's", 1, Regex(Regex.escape(headService)).findAll(service).count())
         val tscRaw = code.getValue(TSC)
-        assertEquals("premise: KW17 the session calls bootstrap(owner, topic) once", 1, Regex("""\bbootstrap\s*\(\s*owner\s*,\s*topic\s*\)""").findAll(tscRaw).count())
+        val krxBody = KrxSessionSourceContract.function(tscRaw, "startKrxBootstrap")
+        val generalRaw = tscRaw.replace(krxBody, "")
+        assertEquals("premise: KW17 the session calls bootstrap(owner, topic) once", 1, Regex("""\bbootstrap\s*\(\s*owner\s*,\s*topic\s*\)""").findAll(generalRaw).count())
         val useAdmitted = Regex("""\bbootstrap\s*\(\s*owner\s*,\s*topic\s*\)\s*\{\s*authority\.admits\s*\(\s*lifetime\s*\)\s*\}""")
-        assertEquals("KW17 the useAdmitted lambda is HEAD's `{ authority.admits(lifetime) }`", 1, useAdmitted.findAll(tscRaw).count())
+        assertEquals("KW17 the useAdmitted lambda is HEAD's `{ authority.admits(lifetime) }`", 1, useAdmitted.findAll(generalRaw).count())
+
+        assertEquals("contract(KW17): one additional protected bootstrap caller, only inside the KRX ladder", 1,
+            Regex("""\bbootstrap\s*[(]""").findAll(krxBody).count())
+        assertTrue("contract(KW17): KRX ladder callback validates the original captured KRX use", krxBody.contains("admitsKrx"))
 
         // Self-checks: a marker in the transport, a widened public bootstrap type, KRX judged inside useAdmitted (U-X).
         val transportLeak = code.getValue(TRANSPORT) + "\nprivate val leak: KrxSendMarker? = null\n"
@@ -1247,7 +1278,7 @@ class KrxContestWiringContractTest {
 
     /**
      * KW22 (added by review, design r5 §3 OD-B06 (a), D-5, D-8): TSC's internal constructor has the public primary constructor's
-     * parameters — same names, order, types and default text — plus the two it adds, `krxSendReader: KrxSendReadAuthority?` (nullable
+     * parameters — same names, order, types and default text — plus the original two, `krxSendReader: KrxSendReadAuthority?` (nullable
      * and required: no default — E-35, Codex tests r2) and `onRejectedWithMarker` with the D-8 signature and `= null`; and its `: this(`
      * delegation passes every public parameter through by its own name. Catches: a default or type drifting between the runtime's and
      * the tests' constructor, a constant (e.g. a KRX desired) substituted in the delegation, which KW21's call scan does not see, and a
@@ -1255,6 +1286,8 @@ class KrxContestWiringContractTest {
      * resolves to the public constructor; a null reader is passed by name (design r6 §3; r7 §3, E-35)). Self-checks apply each mutation
      * to a copy of TSC's text first: the drifted default, the constant desired, and the reader parameter in three shapes (nullable
      * without a default accepted; non-null — the pre-E-35 stub r2 shape — refused; nullable with `= null` refused).
+     * α-1c explicitly adds only krxRetirer: KrxSubscriptionRetirer = KrxSubscriptionRetirer.NONE to the internal constructor.
+     * Method name stays stable for the existing inventory. The public constructor and its delegation remain unchanged.
      */
     @Test fun KW22_theInternalSessionConstructorIsThePublicOnePlusTwo() {
         data class Constructors(val primary: List<Parameter>, val internal: List<Parameter>, val passed: List<Pair<String, String>>)
@@ -1279,7 +1312,8 @@ class KrxContestWiringContractTest {
                 }
             return Constructors(primary, internal, passed)
         }
-        fun publicPart(internal: List<Parameter>) = internal.filter { it.name != READER_PARAMETER && it.name != MARKER_CHANNEL }
+        val retirerName = "krxRetirer"
+        fun publicPart(internal: List<Parameter>) = internal.filter { it.name !in setOf(READER_PARAMETER, MARKER_CHANNEL, retirerName) }
         fun afterInternalHead(tsc: String, old: String, new: String): String {
             val at = checkNotNull(internalHeadPattern.find(tsc)) { "KW22 self-check: no internal constructor" }.range.first
             return tsc.substring(0, at) + tsc.substring(at).replaceFirst(old, new)
@@ -1312,13 +1346,28 @@ class KrxContestWiringContractTest {
             assertEquals("KW22 self-check: the $shape reader parameter is ${if (accepted) "accepted" else "refused"}", accepted, reader.single() == readerExpected)
         }
 
+        val retirerDeclaration = "krxRetirer: KrxSubscriptionRetirer = KrxSubscriptionRetirer.NONE"
+        val retirerExpected = Parameter(retirerName, "KrxSubscriptionRetirer", "KrxSubscriptionRetirer.NONE")
+        for ((declaration, accepted) in listOf(
+            retirerDeclaration to true,
+            "krxRetirer: KrxSubscriptionRetirer" to false,
+            "krxRetirer: KrxSubscriptionRetirer? = null" to false,
+            "krxRetirer: KrxSubscriptionRetirer = other" to false
+        )) {
+            val mutant = afterInternalHead(tsc, retirerDeclaration, declaration)
+            val actual = parse(mutant).internal.single { it.name == retirerName }
+            assertEquals("premise: KW22 exact retirer parameter mutation parsed", parameter(declaration), actual)
+            assertEquals("contract(KW22): only the non-null NONE-default retirer dependency is allowed", accepted, actual == retirerExpected)
+        }
+
         val (primary, internal, passed) = parse(tsc)
         assertTrue("premise: KW22 the primary constructor's parameters are parsed (${primary.size})", primary.size >= 20 && primary.any { it.name == "desired" })
-        val added = internal.filter { it.name == READER_PARAMETER || it.name == MARKER_CHANNEL }
+        val added = internal.filter { it.name in setOf(READER_PARAMETER, MARKER_CHANNEL, retirerName) }
         assertEquals("KW22 the internal constructor = the public one's parameters (names, order, types, defaults)", primary, publicPart(internal))
-        assertEquals("KW22 the two added parameters (E-35: the reader nullable with no default; the channel `= null`)", listOf(
+        assertEquals("contract(KW22): original reader/channel plus only the α-1c NONE-default retirer", listOf(
             readerExpected,
-            Parameter(MARKER_CHANNEL, normalized("((TopicSessionFence, Map<String, TopicRejectionReason>, KrxSendMarker?) -> Unit)?"), "null")
+            Parameter(MARKER_CHANNEL, normalized("((TopicSessionFence, Map<String, TopicRejectionReason>, KrxSendMarker?) -> Unit)?"), "null"),
+            retirerExpected
         ), added)
         assertEquals("KW22 the delegation passes every public parameter through by its own name",
             primary.map { it.name to it.name }, passed)

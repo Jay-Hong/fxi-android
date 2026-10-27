@@ -23,8 +23,13 @@ import com.jay.fxi.domain.model.TopicSubscriptionStateStore
 import kotlin.coroutines.ContinuationInterceptor
 import kotlin.time.Duration
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ChannelResult
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.TestScope
@@ -39,6 +44,11 @@ import okhttp3.WebSocketListener
 
 /**
  * S6-2b-1b-α contract tests r1 — S-3 `TopicSessionKrxHarness` with S-5 (design r5 §13 T.6 harness paragraph, T.14).
+ *
+ * α-2 observation additions: an encoded probe need not reach the wire; revised rows pair it with the next physical typed send.
+ * REST_RECHECK requires both the actual admitsKrx seam frame and a REST validation owner; logical retry acquireWithKrx reads
+ * remain ISSUE. Cancellation records the real Job/exception, and InputGate holds original produced inputs without fabricating any.
+ * The r5 attribution history below describes the original legacy paths; these α-2 distinctions extend it.
  *
  * One session under a real issuer, joined the way runtime wiring joins them (TopicRuntime.kt:128-152), with the KRX send read and the
  * marker refusal channel the α constructor adds (design r5 §3, OD-B06 (a), D-8):
@@ -169,9 +179,15 @@ internal class TopicSessionKrxHarness(
         /** In the send call of the latest encoded attempt (the send lambda `send(encode(…))` hands the encoded text to). */
         SEND,
 
+        /** W01e validation of the original REST use; never a new issue payload. */
+        REST_RECHECK,
+
         /** Anywhere else; never claimed by an attempt or a bootstrap. */
         UNATTRIBUTED
     }
+
+    /** α-3: an orthogonal tag keeps existing ISSUE/SEND/ACK attribution while separating metadata. */
+    enum class ReadKind { PAYLOAD, METADATA }
 
     /**
      * One snapshot supplier B returned (tests r2, Codex tests r1 fix 2, E-17; path and origin tests r5): its place among B's returns,
@@ -187,7 +203,8 @@ internal class TopicSessionKrxHarness(
         val attempt: Attempt?,
         val callsBegun: Int,
         val atMillis: Long,
-        val origin: String?
+        val origin: String?,
+        val kind: ReadKind = ReadKind.PAYLOAD
     ) {
         /** The KRX bootstrap call that claimed this issue read when it entered the fake; null for any other read or an unclaimed one. */
         var claimedBy: BootstrapCall? = null
@@ -198,17 +215,30 @@ internal class TopicSessionKrxHarness(
 
     /** Every snapshot supplier B returned, in order. */
     val readerReturns: List<ReaderRead> get() = readerReturnList
+    val metadataReturns: List<ReaderRead> get() = readerReturnList.filter { it.kind == ReadKind.METADATA }
 
-    /** B's returns made neither in the REST issue path nor in an attempt's send (tests r5), in order. */
+    /** Reads outside payload paths and the separately attributed α-2 REST rechecks. */
     val unattributedReads: List<ReaderRead> get() = readerReturnList.filter { it.path == ReadPath.UNATTRIBUTED }
 
     /** Classifies one return of B by the stack it is made on (tests r5; the rule and its limits are in the class comment). */
     private fun classifyReaderRead(returned: TopicAccessSnapshot): ReaderRead {
-        val split = SessionStack.of(Thread.currentThread().stackTrace)
+        val frames = Thread.currentThread().stackTrace
+        val split = SessionStack.of(frames)
+        val supplierMethod = frames.firstOrNull {
+            it.className == SnapshotTopicUseAuthority::class.java.name && it.methodName in setOf(
+                "currentRevision", "acquire", "admits", "acquireKrx", "admitsKrx", "admitsWithKrx", "acquireWithKrx")
+        }?.methodName
+        val metadata = supplierMethod == "currentRevision"
+        val validatesKrxUse = frames.any {
+            it.className == SnapshotTopicUseAuthority::class.java.name && it.methodName.startsWith("admitsKrx")
+        }
         val latest = attempts.lastOrNull()
         val encoded = latest?.encodeStack
         val path = when {
+            // Existing WS metadata was UNATTRIBUTED. New REST metadata also must not become ISSUE payload.
+            metadata -> ReadPath.UNATTRIBUTED
             split == null -> ReadPath.UNATTRIBUTED
+            validatesKrxUse && split.inRestRecheck() -> ReadPath.REST_RECHECK
             split.inIssuePath() -> ReadPath.ISSUE
             encoded != null && split.below == encoded.below && !split.entersLike(encoded) -> ReadPath.SEND
             else -> ReadPath.UNATTRIBUTED
@@ -217,7 +247,7 @@ internal class TopicSessionKrxHarness(
         else split?.describe() ?: SessionStack.outside(Thread.currentThread().stackTrace)
         return ReaderRead(
             readerReturnList.size, returned, path, latest.takeIf { path == ReadPath.SEND }, bootstrapCalls.size,
-            test.testScheduler.currentTime, origin
+            test.testScheduler.currentTime, origin, if (metadata) ReadKind.METADATA else ReadKind.PAYLOAD
         )
     }
 
@@ -234,9 +264,16 @@ internal class TopicSessionKrxHarness(
 
         /** The run holds `issueOwedBootstraps` and no `startBootstrap` above it (the REST issue path before the bootstrap starts). */
         fun inIssuePath(): Boolean {
-            val issue = run.indexOfFirst { it.isMethod(ISSUE_METHOD) }
+            val issue = run.indexOfFirst { it.isMethod(ISSUE_METHOD) || it.isMethod("issueKrxBootstrap") }
             val start = run.indexOfFirst { it.isMethod(START_METHOD) }
             return issue >= 0 && (start < 0 || start > issue)
+        }
+
+        /** α-2: actual REST guard closures, afterAttempt and protected-data application. */
+        fun inRestRecheck(): Boolean = run.any {
+            it.isMethod("krxIssueAdmitted") || it.isMethod("applyKrxBootstrap") ||
+                it.methodName.startsWith("startKrxBootstrap\$") ||
+                it.className.startsWith("${SESSION_CLASS}\$startKrxBootstrap\$")
         }
 
         fun describe(): String {
@@ -400,6 +437,10 @@ internal class TopicSessionKrxHarness(
         val exchanges = mutableListOf<Boolean>()
         var answered: TopicSnapshotOutcome? = null
         var withheld = false
+        var job: Job? = null
+            internal set
+        var cancellation: CancellationException? = null
+            internal set
     }
 
     val bootstrapCalls = mutableListOf<BootstrapCall>()
@@ -454,14 +495,58 @@ internal class TopicSessionKrxHarness(
         )
         issueReads.forEach { it.claimedBy = call }
         bootstrapCalls += call
-        exchangeGate(call.issue).await()
-        exchange(call)
-        if (unauthorizedReplay(call.issue, topic)) {
-            replayGate(call.issue).await()
+        call.job = currentCoroutineContext()[Job]
+        try {
+            exchangeGate(call.issue).await()
             exchange(call)
+            if (unauthorizedReplay(call.issue, topic)) {
+                replayGate(call.issue).await()
+                exchange(call)
+            }
+            if (holdAnswer(call.issue, topic)) answerGate(call.issue).await()
+            return bootstrapOutcome(call.issue, topic).also { call.answered = it }
+        } catch (cancelled: CancellationException) {
+            call.cancellation = cancelled
+            throw cancelled
         }
-        if (holdAnswer(call.issue, topic)) answerGate(call.issue).await()
-        return bootstrapOutcome(call.issue, topic).also { call.answered = it }
+    }
+
+    /** α-2: hold actual produced inputs, preserving their objects, correlation and FIFO within each kind.
+     * No private input is constructed. Other input kinds continue through the original channel.
+     */
+    inner class InputGate(private val row: String, vararg kinds: String) : AutoCloseable {
+        @Suppress("UNCHECKED_CAST")
+        private val original = KrxSessionIntegrationRig.privateValue(coordinator, "inputs") as Channel<Any>
+        private val held = Channel<Any>(Channel.UNLIMITED)
+        private val pendingKinds = kinds.toMutableSet()
+        private val captured = mutableListOf<Any>()
+        fun count(kind: String): Int = captured.count { it.javaClass.simpleName == kind }
+        init {
+            KrxSessionIntegrationRig.setPrivate(coordinator, "inputs", object : Channel<Any> by original {
+                override fun trySend(element: Any): ChannelResult<Unit> =
+                    if (element.javaClass.simpleName in pendingKinds) {
+                        captured += element
+                        held.trySend(element)
+                    } else original.trySend(element)
+            })
+        }
+        fun release(kind: String) {
+            pendingKinds.remove(kind)
+            val remaining = mutableListOf<Any>()
+            while (true) {
+                val input = held.tryReceive().getOrNull() ?: break
+                if (input.javaClass.simpleName == kind) {
+                    check(original.trySend(input).isSuccess) { "$row premise: InputGate original channel accepts $kind" }
+                } else remaining += input
+            }
+            remaining.forEach { held.trySend(it) }
+        }
+        override fun close() {
+            pendingKinds.clear()
+            while (true) original.trySend(held.tryReceive().getOrNull() ?: break)
+            KrxSessionIntegrationRig.setPrivate(coordinator, "inputs", original)
+            held.close()
+        }
     }
 
     private fun exchange(call: BootstrapCall) {

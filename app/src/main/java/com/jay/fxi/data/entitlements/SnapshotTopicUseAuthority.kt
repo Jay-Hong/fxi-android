@@ -77,13 +77,55 @@ internal fun TopicAccessSnapshot.admitsKrxUse(use: KrxUseLifetime): Boolean =
  */
 private fun TopicAccessSnapshot.krxSendMarker(): KrxSendMarker = KrxSendMarker(facts.recordFence?.krxCapabilityEpoch, krxPermitSeq)
 
+/** Metadata from the same publication as the send judgement, use and marker. */
+internal data class KrxSessionStamp(
+    val revision: Long,
+    val permitSeq: Long,
+    val capabilityInvalidations: Long
+)
+
+internal enum class KrxAttemptCheck { READY, NOT_SENT, REPREPARE }
+
+private fun TopicAccessSnapshot.krxSessionStamp(): KrxSessionStamp? =
+    if (krxConsumerGuard(krxPermitSeq)) KrxSessionStamp(revision, krxPermitSeq, capabilityInvalidations) else null
+
+/**
+ * Discovery only, including before the first permit. Relies on PAC's A1 contract (PremiumAccessCoordinator:1791-1793):
+ * grantFence omits the capability epoch only when the contest is enabled. A standing token's issued context equals the
+ * current context, so its absent epoch alongside this same snapshot's present record epoch proves an enabled session.
+ * This hint never admits a use, applies C-1 or consumes a permit.
+ */
+private fun TopicAccessSnapshot.krxSessionCapable(): Boolean {
+    if (!facts.tokenStanding) return false
+    val issuedFor = facts.issuedFor ?: return false
+    val recordFence = facts.recordFence ?: return false
+    return issuedFor.access.krxCapabilityEpoch == null && recordFence.krxCapabilityEpoch != null
+}
+
 /** What a WebSocket attempt carrying KRX reads at its send (design r5 §5C): three values from one snapshot read (D-4). */
 internal data class KrxSendAdmission(
     /** The general judgement, exactly [TopicUseAuthority.admits]: it alone decides whether the attempt is sent. */
     val admitted: Boolean,
     val krxUse: KrxUseLifetime?,
     val marker: KrxSendMarker
-)
+) {
+    // Discovery and session metadata are outside the legacy value's equality/hash/components.
+    var session: KrxSessionStamp? = null
+        private set
+    var krxSessionCapable: Boolean = false
+        private set
+
+    constructor(
+        admitted: Boolean,
+        krxUse: KrxUseLifetime?,
+        marker: KrxSendMarker,
+        session: KrxSessionStamp?,
+        krxSessionCapable: Boolean = false
+    ) : this(admitted, krxUse, marker) {
+        this.session = session
+        this.krxSessionCapable = krxSessionCapable
+    }
+}
 
 /** What a REST bootstrap issue of KRX reads (design r5 §5B, at the issue): three values from one snapshot read (D-4). */
 internal data class KrxSendAcquisition(
@@ -91,7 +133,24 @@ internal data class KrxSendAcquisition(
     val lifetime: TopicUseLifetime?,
     val krxUse: KrxUseLifetime?,
     val marker: KrxSendMarker
-)
+) {
+    // A copied legacy payload has no attempt correlation; issue/send reads attach it once here.
+    var session: KrxSessionStamp? = null
+        private set
+    var krxSessionCapable: Boolean = false
+        private set
+
+    constructor(
+        lifetime: TopicUseLifetime?,
+        krxUse: KrxUseLifetime?,
+        marker: KrxSendMarker,
+        session: KrxSessionStamp?,
+        krxSessionCapable: Boolean = false
+    ) : this(lifetime, krxUse, marker) {
+        this.session = session
+        this.krxSessionCapable = krxSessionCapable
+    }
+}
 
 /**
  * The issuer's published access as a KRX send asks it (design r5 §3, D-3 (i′)). Internal, so its members may name internal types; the
@@ -100,6 +159,7 @@ internal data class KrxSendAcquisition(
  * Each call reads the published snapshot once and answers from that read alone.
  */
 internal interface KrxSendReadAuthority : TopicUseAuthority {
+    fun currentRevision(): Long
     /** A new KRX use under [fence], or null. */
     fun acquireKrx(fence: TopicSessionFence): KrxUseLifetime?
 
@@ -115,6 +175,7 @@ internal interface KrxSendReadAuthority : TopicUseAuthority {
 
 /** The issuer's published snapshot, read once per question. */
 internal class SnapshotTopicUseAuthority(private val snapshot: () -> TopicAccessSnapshot) : KrxSendReadAuthority {
+    override fun currentRevision(): Long = snapshot().revision
     override fun acquire(fence: TopicSessionFence): TopicUseLifetime? = snapshot().acquireUse(fence)
     override fun admits(lifetime: TopicUseLifetime): Boolean = snapshot().admitsUse(lifetime)
     override fun acquireKrx(fence: TopicSessionFence): KrxUseLifetime? = snapshot().acquireKrxUse(fence)
@@ -122,11 +183,17 @@ internal class SnapshotTopicUseAuthority(private val snapshot: () -> TopicAccess
 
     override fun admitsWithKrx(lifetime: TopicUseLifetime): KrxSendAdmission {
         val read = snapshot()
-        return KrxSendAdmission(read.admitsUse(lifetime), read.krxUseFor(lifetime), read.krxSendMarker())
+        return KrxSendAdmission(
+            read.admitsUse(lifetime), read.krxUseFor(lifetime), read.krxSendMarker(),
+            read.krxSessionStamp(), read.krxSessionCapable()
+        )
     }
 
     override fun acquireWithKrx(fence: TopicSessionFence): KrxSendAcquisition {
         val read = snapshot()
-        return KrxSendAcquisition(read.acquireUse(fence), read.acquireKrxUse(fence), read.krxSendMarker())
+        return KrxSendAcquisition(
+            read.acquireUse(fence), read.acquireKrxUse(fence), read.krxSendMarker(),
+            read.krxSessionStamp(), read.krxSessionCapable()
+        )
     }
 }

@@ -63,12 +63,10 @@ import org.junit.Test
  * `HEAD_FACTORY`. Every assertion names its row. Before a negative assertion the row first asserts that what it judges is inside its
  * window (the attempt was sent, the refusal was reported and processed, the answer reached the session).
  *
- * 'The marker comes from the send read' (tests r2, Codex tests r1 fix 2, E-17) is judged against what supplier B actually returned in
- * that attempt's send ([TopicSessionKrxHarness.Attempt.readerSnapshotsInSend], recorded by S-3; tests r5: attributed by call stack to
- * the session's send call that followed the attempt's encode, a read from any other path left unattributed): B returned exactly one
- * snapshot there (05-4's contract, `contract(05-4):` in other rows) and the carried marker's (epoch, permit) are that snapshot's. The
- * harness's `snapshotAtEncode` is a capture of the published snapshot at the encode; rows still use it for premises and the send-time
- * value.
+ * α-2: revised typed rows pair physical T (reachedWire) with immediately preceding unsent P in the same CMD activation.
+ * B returns exactly once inside P's send dispatch and zero times inside T's physical send. The marker carried by T must be P's
+ * snapshot (epoch, permit); ACK-time reads cannot substitute. Legacy p=0/reader-less rows retain their old send observation.
+ * snapshotAtEncode remains a harness capture of the published snapshot, rather than the payload supplier's return.
  *
  * Observation is the S-3 harness's only: recording issuer (S-5), ledger reservation marker, `krxContestView`, counting suppliers and
  * the snapshots supplier B returned, wire, recording graph sink. No observer is added to the session (KW04).
@@ -125,6 +123,38 @@ internal class TopicSessionKrxSendMarkerTest {
         )
         return readerSnapshotsInSend.single()
     }
+
+    /** α-2: a typed physical send T uses the immediately preceding unsent probe P's one payload read.
+     * Stack tails below CMD drive pin the same activation; the two encode sites may have different line numbers.
+     * ACK-time reads never enter this pairing and cannot replace the captured source.
+     */
+    private fun TopicSessionKrxHarness.typedRead(
+        sent: TopicSessionKrxHarness.Attempt,
+        label: String
+    ): TopicAccessSnapshot {
+        assertTrue("$label physical typed attempt T reached the wire", sent.reachedWire)
+        val index = attempts.indexOf(sent)
+        assertTrue("$label T has an immediately preceding probe P", index > 0)
+        val probe = attempts[index - 1]
+        assertFalse("$label P was not physically sent", probe.reachedWire)
+        assertTrue("$label P and T carry KRX", probe.carriesKrx && sent.carriesKrx)
+        assertNotEquals("$label temporary probe ID cannot answer T", probe.requestId, sent.requestId)
+        assertEquals("$label P and T keep the admitted topics", probe.topics.toSet(), sent.topics.toSet())
+        assertEquals("$label P and T are synchronous", probe.atMillis, sent.atMillis)
+        val pStack = checkNotNull(probe.encodeStack) { "$label premise: P encode has a session stack" }.below
+        val tStack = checkNotNull(sent.encodeStack) { "$label premise: T encode has a session stack" }.below
+        assertTrue("$label premise: both encode stacks reach their CMD caller", pStack.isNotEmpty() && tStack.isNotEmpty())
+        assertEquals("$label P/T have the same CMD caller class", pStack.first().className, tStack.first().className)
+        assertEquals("$label P/T have the same CMD caller method", pStack.first().methodName, tStack.first().methodName)
+        assertEquals("$label P/T have the same command activation stack tail", pStack.drop(1), tStack.drop(1))
+        assertEquals("$label B returns once inside P's send call", 1, probe.readerSnapshotsInSend.size)
+        assertEquals("$label B returns zero times inside T's send call", 0, sent.readerSnapshotsInSend.size)
+        assertEquals("$label T performs no second payload read", 0, sent.readerReadsInSend)
+        assertEquals("$label T's physical send performs no extra GENERAL A read", 0, sent.authorityReadsInSend)
+        return probe.readerSnapshotsInSend.single()
+    }
+
+    private fun TopicSessionKrxHarness.physicalAttempts() = attempts.filter { it.reachedWire }
 
     /** The REST counterpart (05-5): the snapshot B returned for this KRX issue; exactly one is 05-16's contract (§5B, D-4). */
     private fun TopicSessionKrxHarness.BootstrapCall.issueRead(label: String): TopicAccessSnapshot {
@@ -244,7 +274,7 @@ internal class TopicSessionKrxSendMarkerTest {
      * 05-1 WS marker carriage (ON). OPEN(p = 1, K1) → the first subscribe carries KRX → ack refuses KRX with KRX_ENTITLEMENT_REQUIRED,
      * active {TETHER, USD}. The marker channel carries the send read's marker to the deliverer's overload, S-5's three-argument form and
      * the ledger; the PAC hands that permit over. Mutations: I-X, T-X, K-NUL (state alone would not see a null marker — the current permit
-     * hands over the same way). 'From the send read' is judged against the snapshot B returned in that attempt's send (tests r2).
+     * hands over the same way). α-2: 'from the send read' uses T's unsent probe P; a changed post-send B permit exposes ACK-time replacement.
      */
     @Test fun r05_1_wsMarker_isCarriedFromTheSendRead_toTheLedger() = onRig { h, s ->
         val attempt = s.liveFirstKrxAttempt("05-1")
@@ -256,6 +286,11 @@ internal class TopicSessionKrxSendMarkerTest {
         val wiresBefore = s.wires.size
         h.holdNextFetch()
 
+        // Source discriminator: a fresh ACK-time payload would name another permit, while C-1 stays valid.
+        val ackTime = atSend.copy(krxPermitSeq = atSend.krxPermitSeq + 7)
+        assertNotEquals("05-1 premise: a later B payload cannot masquerade as P's marker", sent, ackTime.marker())
+        s.readerSnapshot = { h.coordinator.accessSnapshot.let { it.copy(krxPermitSeq = it.krxPermitSeq + 7) } }
+
         s.wire.deliver(s.ack(attempt.requestId, activeTopics, krxRefused))
         s.step(1)
 
@@ -264,11 +299,11 @@ internal class TopicSessionKrxSendMarkerTest {
             "05-1 premise: the acknowledgement refused KRX",
             mapOf(KRX to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED), s.acknowledgements.single().rejected
         )
-        val read = attempt.sendRead("05-1 contract(05-4):")
+        val read = s.typedRead(attempt, "05-1 contract(05-4):")
         assertEquals("05-1: the marker channel is called once", 1, s.markerRejections.size)
         assertEquals("05-1: the marker channel carries the send-time marker", sent, s.markerRejections.single().marker)
         assertEquals(
-            "05-1: the carried marker's (epoch, permit) are those of the snapshot B returned in the attempt's send (same read)",
+            "05-1: the carried marker's (epoch, permit) are those of the snapshot B returned in T's paired probe P (same read)",
             read.marker(), s.markerRejections.single().marker
         )
         assertEquals("05-1: the public two-argument refusal is not also called", 0, s.publicRejections.size)
@@ -295,6 +330,7 @@ internal class TopicSessionKrxSendMarkerTest {
         assertOnAllowedAt("05-2", "the send", atSend)
         assertEquals("05-2 premise(ON): the send is under permit 1", 1L, atSend.krxPermitSeq)
         val epoch = atSend.facts.recordFence?.krxCapabilityEpoch
+        val originalRead = s.typedRead(attempt, "05-2 contract(05-4):")
 
         val grant = h.issueGrant()
         h.source.identityNulls = 1
@@ -309,7 +345,7 @@ internal class TopicSessionKrxSendMarkerTest {
         assertEquals("05-2 premise: p = 2 before the ack", 2L, before.state.permitSeq)
         assertEquals("05-2 premise: rejectedPermit = 1 before the ack", 1L, before.rejectedPermit)
         assertEquals("05-2 premise: the ack is still owed to that attempt", 0, s.acknowledgements.size)
-        assertEquals("05-2 premise: no other attempt was sent meanwhile", listOf(attempt.requestId), s.attempts.map { it.requestId })
+        assertEquals("05-2 premise: no other attempt was sent meanwhile", listOf(attempt.requestId), s.physicalAttempts().map { it.requestId })
         h.holdNextFetch()
         val fetches = h.source.calls.size
 
@@ -324,6 +360,15 @@ internal class TopicSessionKrxSendMarkerTest {
         assertEquals("05-2: rejectedPermit stays 1", 1L, after.rejectedPermit)
         assertEquals("05-2: no entitlements query", fetches, h.source.calls.size)
         assertEquals("05-2: krx stays VISIBLE", KrxCapabilityState.VISIBLE, h.coordinator.krx.value)
+        assertEquals("05-2: the old refusal keeps the old probe's marker", originalRead.marker(), s.markerRejections.single().marker)
+        assertEquals("05-2: exactly one physical successor follows the ACK", 2, s.physicalAttempts().size)
+        val successor = s.physicalAttempts().last()
+        assertNotEquals("05-2: successor has a fresh request ID", attempt.requestId, successor.requestId)
+        assertTrue("05-2: successor was accepted by the socket", successor.wireAccepted)
+        assertEquals("05-2: successor reads the latest p2", 2L, s.typedRead(successor, "05-2 contract(05-4):").krxPermitSeq)
+        s.coordinator.accessRevised(); s.step(1)
+        assertEquals("05-2: unchanged revision adds no second successor", 2, s.physicalAttempts().size)
+        assertEquals("05-2: successor does not add FE", fetches, h.source.calls.size)
     }
 
     /**
@@ -371,8 +416,9 @@ internal class TopicSessionKrxSendMarkerTest {
      *   is sent; p goes 1 → 2 the 05-2 way while its answer is owed; then a socket `invalid_token` for it, the harness refresh hands
      *   back `token-2` for the same identity, and the replay attempt is sent at once → ack refuses KRX.
      *
-     * In both, the later attempt reads anew: marker (K1, 2), p 2 handed over (AWAITING, FE +1). One send read per attempt and no
-     * `authority.admits` in a KRX attempt (restated: supplier-B / supplier-A reads between each attempt's encode and its socket send).
+     * In both, each physical attempt has a fresh ID and its own probe read: the later marker is (K1, 2), p2 handed over
+     * (AWAITING, FE +1). Each P has one payload read, T has zero payload/A reads inside its physical send. The beforeEncode
+     * GENERAL admission check remains allowed and is outside the final encode-to-wire interval.
      * Mutations: K-1st, RD-2.
      */
     @Test fun r05_4_capR11iii_theSecondAttemptReadsAnew() = runVariants(
@@ -402,10 +448,10 @@ internal class TopicSessionKrxSendMarkerTest {
         assertEquals("$row premise: OPEN with p = 2 before the second attempt", KrxContestPhase.OPEN, h.view(row).state.phase)
         assertEquals("$row premise: p = 2 before the second attempt", 2L, h.view(row).state.permitSeq)
         assertEquals("$row premise: H1′ did not rotate", epoch, h.store.record.krxCapabilityEpoch)
-        assertEquals("$row premise: still one attempt before the retry wait ends", 1, s.attempts.size)
+        assertEquals("$row premise: still one attempt before the retry wait ends", 1, s.physicalAttempts().size)
         s.step(5_000)
-        assertEquals("$row premise: the command sent its second attempt", 2, s.attempts.size)
-        val second = s.attempts.last()
+        assertEquals("$row premise: the command sent its second attempt", 2, s.physicalAttempts().size)
+        val second = s.physicalAttempts().last()
         assertTrue("$row premise: the second attempt carries KRX", second.carriesKrx)
         assertTrue("$row premise: the second attempt was sent", second.wireAccepted)
         assertOnAllowedAt(row, "the second attempt", second.snapshotAtEncode)
@@ -420,9 +466,9 @@ internal class TopicSessionKrxSendMarkerTest {
         val expected = KrxSendMarker(epoch, 2L)
         assertEquals("$row: the marker channel is called once", 1, s.markerRejections.size)
         assertEquals("$row: the second attempt's own marker (K1, 2)", expected, s.markerRejections.single().marker)
-        val read = second.sendRead("$row:")
+        val read = s.typedRead(second, "$row contract(05-4):")
         assertEquals(
-            "$row: the carried marker's (epoch, permit) are those of the snapshot B returned in the second attempt's send (same read)",
+            "$row: the carried marker's (epoch, permit) are those of the snapshot B returned in the second physical attempt's own probe P (same read)",
             read.marker(), s.markerRejections.single().marker
         )
         assertEquals("$row: the issuer's three-argument reservation carries (K1, 2)", listOf(expected), s.issuer.threeArgument.map { it.marker })
@@ -430,8 +476,9 @@ internal class TopicSessionKrxSendMarkerTest {
         assertEquals("$row: AWAITING", KrxContestPhase.AWAITING, h.view(row).state.phase)
         assertEquals("$row: permit 2 handed over", 2L, h.view(row).rejectedPermit)
         assertEquals("$row: FE +1", fetches + 1, h.source.calls.size)
-        assertEquals("$row: one send read in the first attempt", 1, first.readerReadsInSend)
-        assertEquals("$row: one send read in the second attempt", 1, second.readerReadsInSend)
+        assertEquals("$row: first physical attempt has its own p1 probe read", 1L, s.typedRead(first, "$row contract(05-4):").krxPermitSeq)
+        assertNotEquals("$row: retry has a fresh physical request ID", first.requestId, second.requestId)
+        assertTrue("$row: retry respects the 10s jittered cooldown", second.atMillis - first.atMillis >= 10_000L)
         assertEquals("$row: no authority.admits in the first KRX attempt", 0, first.authorityReadsInSend)
         assertEquals("$row: no authority.admits in the second KRX attempt", 0, second.authorityReadsInSend)
     }
@@ -453,16 +500,18 @@ internal class TopicSessionKrxSendMarkerTest {
         assertEquals("$row premise: p = 2 before the replay", 2L, h.view(row).state.permitSeq)
         assertEquals("$row premise: H1′ did not rotate", epoch, h.store.record.krxCapabilityEpoch)
         assertEquals("$row premise: the first attempt's answer is still owed", 0, s.acknowledgements.size)
-        assertEquals("$row premise: no other attempt was sent meanwhile", listOf(first.requestId), s.attempts.map { it.requestId })
+        assertEquals("$row premise: no other attempt was sent meanwhile", listOf(first.requestId), s.physicalAttempts().map { it.requestId })
 
+        val forcedRefreshAt = s.clock.nowMillis()
         s.wire.deliver(s.subscriptionError(first.requestId, "invalid_token"))
         s.step(1)
 
-        assertEquals("$row premise: the forced refresh replayed the subscribe as a new attempt", 2, s.attempts.size)
-        val replay = s.attempts.last()
+        assertEquals("$row premise: the forced refresh replayed the subscribe as a new attempt", 2, s.physicalAttempts().size)
+        val replay = s.physicalAttempts().last()
         assertNotEquals("$row premise: the replay is its own request", first.requestId, replay.requestId)
         assertTrue("$row premise: the replay carries KRX", replay.carriesKrx)
         assertTrue("$row premise: the replay was sent", replay.wireAccepted)
+        assertEquals("$row: forced refresh replays without retry cooldown", forcedRefreshAt, replay.atMillis)
         assertEquals("$row premise: on the same connection", 1, s.wires.size)
         assertOnAllowedAt(row, "the replay", replay.snapshotAtEncode)
         assertEquals("$row premise(ON): the replay is under permit 2", 2L, replay.snapshotAtEncode.krxPermitSeq)
@@ -476,9 +525,9 @@ internal class TopicSessionKrxSendMarkerTest {
         val expected = KrxSendMarker(epoch, 2L)
         assertEquals("$row: the marker channel is called once", 1, s.markerRejections.size)
         assertEquals("$row: the replay's own marker (K1, 2)", expected, s.markerRejections.single().marker)
-        val read = replay.sendRead("$row:")
+        val read = s.typedRead(replay, "$row contract(05-4):")
         assertEquals(
-            "$row: the carried marker's (epoch, permit) are those of the snapshot B returned in the replay's send (same read)",
+            "$row: the carried marker's (epoch, permit) are those of the snapshot B returned in the replay's own probe P (same read)",
             read.marker(), s.markerRejections.single().marker
         )
         assertEquals("$row: the issuer's three-argument reservation carries (K1, 2)", listOf(expected), s.issuer.threeArgument.map { it.marker })
@@ -486,106 +535,116 @@ internal class TopicSessionKrxSendMarkerTest {
         assertEquals("$row: AWAITING", KrxContestPhase.AWAITING, h.view(row).state.phase)
         assertEquals("$row: permit 2 handed over", 2L, h.view(row).rejectedPermit)
         assertEquals("$row: FE +1", fetches + 1, h.source.calls.size)
-        assertEquals("$row: one send read in the first attempt", 1, first.readerReadsInSend)
-        assertEquals("$row: one send read in the replay", 1, replay.readerReadsInSend)
+        assertEquals("$row: first physical attempt has its own p1 probe read", 1L, s.typedRead(first, "$row contract(05-4):").krxPermitSeq)
+        assertEquals("$row: replay uses the forced-refresh credential", "token-2", s.requests.single { it.requestId == replay.requestId }.idToken)
         assertEquals("$row: no authority.admits in the first KRX attempt", 0, first.authorityReadsInSend)
         assertEquals("$row: no authority.admits in the replay (a KRX attempt)", 0, replay.authorityReadsInSend)
     }
 
     private enum class Report { WS, REST }
 
-    /**
-     * 05-5 CAP-R01 (draft RU-11). The same epoch's WS refusal and REST unknown_topic, in both orders, each with the first one handed over
-     * by H1 (rotation) or by H1′ (identityNulls, no rotation): four variants. One entitlements query, the streak +1 once, the first
-     * report handed over (barrier = its order), the second ended without a handover; both markers non-null at their send values; the REST
-     * reason is KRX_ENTITLEMENT_REQUIRED; non-KRX kept. Mutations: R-MAP, a doubled REST reservation, K-NUL, epoch guard and permit
-     * judgement removed together. The expected values do not depend on OD-B05·OD-B08 (no new permit between send and processing).
-     */
+    /** α-2 explicit ON amendment: two produced controls retain their markers; cancel-before-production is separate. */
     @Test fun r05_5_capR01_sameEpochWsAndRestRefusals_handOverOnce() = runVariants(
-        *Report.values().flatMap { first ->
+        *(Report.values().flatMap { first ->
             listOf(false, true).map { byH1Prime ->
-                val row = "05-5[${first} first, ${if (byH1Prime) "H1′" else "H1"}]"
+                val row = "05-5[queued, $first first, ${if (byH1Prime) "H1′" else "H1"}]"
                 row to { onRig { h, s -> capR01(row, h, s, first, byH1Prime) } }
             }
-        }.toTypedArray()
+        } + listOf(false, true).map { byH1Prime ->
+            val row = "05-5[cancel-first, ${if (byH1Prime) "H1′" else "H1"}]"
+            row to { onRig { h, s -> capR01Cancelled(row, h, s, byH1Prime) } }
+        }).toTypedArray()
     )
 
     private fun TestScope.capR01(row: String, h: KrxHarness, s: TopicSessionKrxHarness, first: Report, byH1Prime: Boolean) {
         s.goLive()
         val restIssue = s.bootstrapOf(KRX, row)
-        assertTrue("$row premise: the KRX bootstrap is held before its exchange", restIssue.exchanges.isEmpty())
+        assertTrue("$row premise: KRX REST waits before its exchange", restIssue.exchanges.isEmpty())
         assertOnAllowedAt(row, "the KRX issue", restIssue.snapshotAtCall)
         s.openWire()
         val attempt = s.lastKrxAttempt(row)
-        assertTrue("$row premise: the KRX attempt was sent", attempt.wireAccepted)
-        assertOnAllowedAt(row, "the WS send", attempt.snapshotAtEncode)
-        val sent = attempt.snapshotAtEncode.marker()
-        assertEquals(
-            "$row premise: the harness's issue-time and send-time captures of the published snapshot have the same epoch and permit " +
-                "(captures, not B's returns)",
-            restIssue.snapshotAtCall.marker(), sent
-        )
+        assertTrue("$row premise: the KRX typed attempt was sent", attempt.wireAccepted)
+        val wsRead = s.typedRead(attempt, "$row contract(05-4):")
+        val restRead = restIssue.issueRead("$row contract(05-16):")
+        val sent = wsRead.marker()
+        assertEquals("$row premise: both original reads have the same epoch/permit", sent, restRead.marker())
         val grant = s.granted.last().grant
         val wiresBefore = s.wires.size
         val streak = h.view(row).state.streak
         val fe = h.holdNextFetch()
         val fetches = h.source.calls.size
-        if (byH1Prime) h.source.identityNulls = 1
-
-        fun report(which: Report) = when (which) {
-            Report.WS -> s.wire.deliver(s.ack(attempt.requestId, activeTopics, krxRefused))
-            Report.REST -> {
-                s.releaseBootstrap(KRX, UNKNOWN_TOPIC, row)
-                Unit
-            }
-        }
-        report(first)
-        s.step(1)
-        report(if (first == Report.WS) Report.REST else Report.WS)
-        s.step(1)
-        s.step(H1_PRIME_FLOOR_STEP)
-
+        val gate = s.InputGate(row, "BootstrapAnswered", "Transport")
+        try {
+            s.releaseCall(restIssue, UNKNOWN_TOPIC); s.step(1)
+            s.wire.deliver(s.ack(attempt.requestId, activeTopics, krxRefused)); s.step(1)
+            assertEquals("$row premise: REST actually exchanged before either result is processed", listOf(true), restIssue.exchanges)
+            assertTrue("$row premise: the original REST control was actually produced", restIssue.answered === UNKNOWN_TOPIC)
+            assertEquals("$row premise: one actual REST result is queued", 1, gate.count("BootstrapAnswered"))
+            assertEquals("$row premise: one decoded WS control is queued", 1, gate.count("Transport"))
+            assertEquals("$row premise: neither control has reserved yet", 0, s.issuer.reserved.size)
+            if (byH1Prime) h.source.identityNulls = 1
+            val firstKind = if (first == Report.WS) "Transport" else "BootstrapAnswered"
+            gate.release(firstKind); s.step(1)
+            assertEquals("$row contract(05-5): first queued control reserves once", 1, s.issuer.reserved.size)
+            gate.release(if (first == Report.WS) "BootstrapAnswered" else "Transport"); s.step(1)
+            s.step(H1_PRIME_FLOOR_STEP)
+        } finally { gate.close() }
         assertEquals("$row premise: the acknowledgement was applied", 1, s.acknowledgements.size)
-        assertTrue(
-            "$row premise: the REST answer reached the session's undelivered hand-over",
-            s.undelivered.any { it.second == KRX && it.third == UNKNOWN_TOPIC }
-        )
-        val restRead = restIssue.issueRead("$row contract(05-16):")
-        val wsRead = attempt.sendRead("$row contract(05-4):")
-        assertEquals("$row: both refusals are reserved, in report order", 2, s.issuer.reserved.size)
+        assertTrue("$row contract(05-5): produced REST control reaches undelivered", s.undelivered.any { it.second == KRX && it.third === UNKNOWN_TOPIC })
+        assertEquals("$row contract(05-5): both controls reserve in processing order", 2, s.issuer.reserved.size)
         val (r1, r2) = s.issuer.reserved.sortedBy { it.reservation.order }
         if (byH1Prime) {
-            assertEquals("$row premise(variant): H1′ consumed the live read failure", 0, h.source.identityNulls)
-            assertEquals("$row premise(variant): H1′ did not rotate", sent.krxCapabilityEpoch, h.store.record.krxCapabilityEpoch)
-        } else {
-            assertNotEquals("$row premise(variant): H1 rotated", sent.krxCapabilityEpoch, h.store.record.krxCapabilityEpoch)
-        }
+            assertEquals("$row premise: H1′ consumed the intended identity fault", 0, h.source.identityNulls)
+            assertEquals("$row premise: H1′ keeps epoch", sent.krxCapabilityEpoch, h.store.record.krxCapabilityEpoch)
+        } else assertNotEquals("$row premise: H1 rotates epoch", sent.krxCapabilityEpoch, h.store.record.krxCapabilityEpoch)
         val view = h.view(row)
-        assertEquals("$row: the first report is handed over (barrier)", r1.reservation.order, view.state.barrier)
-        assertEquals("$row: AWAITING while the query is held", KrxContestPhase.AWAITING, view.state.phase)
-        assertEquals("$row: the send permit is handed over", sent.permitSeq, view.rejectedPermit)
-        assertEquals("$row: the first report is the one taken over", r1.reservation.order, h.coordinator.rejectionView(grant).latestCurrent)
-        assertTrue("$row: the second report has ended", r2.reservation.order !in h.coordinator.rejectionView(grant).pendingOrders)
-        assertEquals("$row: one entitlements query", fetches + 1, h.source.calls.size)
-        assertEquals("$row: both reservations carry the send-time marker", listOf(sent, sent), listOf(r1, r2).map { it.reservation.marker })
+        assertEquals("$row: only the first report owns the barrier", r1.reservation.order, view.state.barrier)
+        assertEquals("$row: AWAITING while FE is held", KrxContestPhase.AWAITING, view.state.phase)
+        assertEquals("$row: original permit handed over", sent.permitSeq, view.rejectedPermit)
+        assertEquals("$row: only the first report is taken over", r1.reservation.order, h.coordinator.rejectionView(grant).latestCurrent)
+        assertTrue("$row: second report has ended", r2.reservation.order !in h.coordinator.rejectionView(grant).pendingOrders)
+        assertEquals("$row: FE exactly one", fetches + 1, h.source.calls.size)
         val rest = if (first == Report.REST) r1 else r2
         val ws = if (first == Report.WS) r1 else r2
-        assertEquals(
-            "$row: the WS reservation's marker (epoch, permit) are those of the snapshot B returned in the attempt's send (same read)",
-            wsRead.marker(), ws.reservation.marker
-        )
-        assertEquals(
-            "$row: the REST reservation's marker (epoch, permit) are those of the snapshot B returned at the KRX issue (same read)",
-            restRead.marker(), rest.reservation.marker
-        )
-        assertEquals("$row: the REST reservation's reason", KrxHarnessDefaults.KRX_REFUSAL, rest.reasons)
-
-        fe.complete(active)
-        s.step(1)
-        assertEquals("$row: OPEN after the fresh true", KrxContestPhase.OPEN, h.view(row).state.phase)
-        assertEquals("$row: the streak moved once", streak + 1, h.view(row).state.streak)
-        assertEquals("$row: still one entitlements query", fetches + 1, h.source.calls.size)
+        assertEquals("$row: WS marker is P's one payload", wsRead.marker(), ws.reservation.marker)
+        assertEquals("$row: REST marker is the original issue payload", restRead.marker(), rest.reservation.marker)
+        assertEquals("$row: REST maps to the KRX refusal", KrxHarnessDefaults.KRX_REFUSAL, rest.reasons)
+        fe.complete(active); s.step(1)
+        assertEquals("$row: fresh true opens", KrxContestPhase.OPEN, h.view(row).state.phase)
+        assertEquals("$row: streak advances exactly once", streak + 1, h.view(row).state.streak)
+        assertEquals("$row: second control adds no FE", fetches + 1, h.source.calls.size)
         s.assertNonKrxKept(row, grant, wiresBefore)
+    }
+
+    private fun TestScope.capR01Cancelled(row: String, h: KrxHarness, s: TopicSessionKrxHarness, byH1Prime: Boolean) {
+        val attempt = s.liveFirstKrxAttempt(row)
+        val source = s.typedRead(attempt, "$row contract(05-4):")
+        val rest = s.bootstrapOf(KRX, row)
+        assertTrue("$row premise: old REST job is active and has produced no result", rest.job?.isActive == true && rest.answered == null)
+        val grant = s.granted.last().grant
+        val wires = s.wires.size
+        val streak = h.view(row).state.streak
+        val fetches = h.source.calls.size
+        val fe = h.holdNextFetch()
+        if (byH1Prime) h.source.identityNulls = 1
+        s.wire.deliver(s.ack(attempt.requestId, activeTopics, krxRefused)); s.step(1)
+        assertEquals("$row premise: WS refusal actually reached ACK processing", 1, s.acknowledgements.size)
+        assertTrue("$row contract(05-5): hide actually cancels the held REST job", rest.job?.isCancelled == true && rest.cancellation != null)
+        val reserved = s.issuer.reserved.size
+        assertEquals("$row: only the WS refusal reserves", 1, reserved)
+        assertEquals("$row: WS reservation retains P's original marker", source.marker(), s.issuer.reserved.single().marker)
+        assertTrue("$row: cancelled REST never exchanged", rest.exchanges.isEmpty())
+        assertNull("$row: cancelled REST never produced a result", rest.answered)
+        s.releaseCall(rest, UNKNOWN_TOPIC); s.step(H1_PRIME_FLOOR_STEP)
+        assertNull("$row: opening the cancelled gate cannot produce a result", rest.answered)
+        assertTrue("$row: no REST control reaches handover", s.undelivered.none { it.second == KRX })
+        assertEquals("$row: no additional reservation", reserved, s.issuer.reserved.size)
+        assertEquals("$row: WS alone causes FE1", fetches + 1, h.source.calls.size)
+        if (byH1Prime) assertEquals("$row premise: H1′ consumed the intended fault", 0, h.source.identityNulls)
+        fe.complete(active); s.step(1)
+        assertEquals("$row: streak advances once", streak + 1, h.view(row).state.streak)
+        assertEquals("$row: cancelled result adds no FE", fetches + 1, h.source.calls.size)
+        s.assertNonKrxKept(row, grant, wires)
     }
 
     /**
@@ -626,8 +685,37 @@ internal class TopicSessionKrxSendMarkerTest {
                 s.step(1)
                 assertEquals("$row $label premise: asking again issued KRX once more", issued + 1, s.bootstrapCalls.size)
             }
-            s.releaseBootstrap(KRX, outcome, "$row $label")
-            s.step(1)
+            if (outcome == TopicSnapshotOutcome.TemporarilyUnavailable) {
+                val beforeTerminal = s.undelivered.size
+                val firstCall = s.bootstrapOf(KRX, "$row $label")
+                val ladder = mutableListOf<TopicSessionKrxHarness.BootstrapCall>()
+                repeat(3) { index ->
+                    val call = s.bootstrapOf(KRX, "$row $label")
+                    ladder += call
+                    val answeredAt = s.clock.nowMillis()
+                    s.releaseCall(call, outcome); s.step()
+                    assertEquals("$row $label premise: ladder HTTP ${index + 1} admitted", listOf(true), call.exchanges)
+                    assertEquals("$row $label premise: ladder result ${index + 1} actually produced", outcome, call.answered)
+                    if (index < 2) {
+                        assertEquals("$row $label contract(05-6): no early terminal handover", beforeTerminal, s.undelivered.size)
+                        val wait = if (index == 0) 400L else 1_200L // B02 jitter=0, ceil(500/1500 * .8).
+                        s.step(wait - 1)
+                        assertEquals("$row $label: no retry before design backoff", call.issue, s.bootstrapOf(KRX, "$row $label").issue)
+                        s.step(1)
+                        val next = s.bootstrapOf(KRX, "$row $label")
+                        assertNotEquals("$row $label: next logical attempt exists", call.issue, next.issue)
+                        assertEquals("$row $label: exact design backoff", answeredAt + wait, next.atMillis)
+                    }
+                }
+                assertEquals("$row $label: exactly three physical KRX calls", 3, ladder.map { it.issue }.distinct().size)
+                assertEquals("$row $label: first call belongs to this ladder", firstCall, ladder.first())
+                assertEquals("$row $label contract(05-6): terminal handover once after third 503", beforeTerminal + 1, s.undelivered.size)
+                val countAfterThird = s.bootstrapCalls.count { it.topic == KRX }
+                s.step(1_200)
+                assertEquals("$row $label: exhausted ladder issues no fourth HTTP", countAfterThird, s.bootstrapCalls.count { it.topic == KRX })
+            } else {
+                s.releaseBootstrap(KRX, outcome, "$row $label"); s.step(1)
+            }
             assertTrue(
                 "$row $label premise: the answer reached the session's undelivered hand-over",
                 s.undelivered.any { it.second == KRX && it.third == outcome }
@@ -639,7 +727,7 @@ internal class TopicSessionKrxSendMarkerTest {
             "$row (d) premise: the USD answer reached the session's undelivered hand-over",
             s.undelivered.any { it.second == USD && it.third == UNKNOWN_TOPIC }
         )
-        val read = attempt.sendRead("$row contract(05-4):")
+        val read = s.typedRead(attempt, "$row contract(05-4):")
 
         assertEquals("$row: no entitlements query", fetches, h.source.calls.size)
         assertEquals("$row: the contest state is unchanged", view0.state, h.view(row).state)
@@ -650,32 +738,14 @@ internal class TopicSessionKrxSendMarkerTest {
         assertTrue("$row (c): the PAC ended it", reserved.reservation.order !in h.coordinator.rejectionView(grant).pendingOrders)
         assertEquals("$row (c): the WS reservation carries the send-time marker (non-null)", sent, reserved.reservation.marker)
         assertEquals(
-            "$row (c): the WS reservation's marker (epoch, permit) are those of the snapshot B returned in the attempt's send (same read)",
+            "$row (c): the WS reservation's marker (epoch, permit) are those of the snapshot B returned in T's paired probe P (same read)",
             read.marker(), reserved.reservation.marker
         )
         s.assertNonKrxKept(row, grant, wiresBefore)
     }
 
-    /**
-     * 05-7 CAP-R05 + scope r11:792. In three states — (i) HOLD (a second contradiction within 600 s), the socket dropped and its
-     * reconnection's first subscribe carrying KRX; (ii) after the 05-1 input; (iii) after the 05-8 input — the KRX send still goes out
-     * (the send predicate is the general judgement, §5C ③), the grant and fence stay, the in-flight USD bootstrap (held gate) completes and
-     * applies, the KRX bootstrap's `useAdmitted()` is true, tether and USD frames move the store and prices, and no graph authority ends
-     * (restatement of '`endGraphUse` 0': no AUTHORITY_ENDED/USE_WITHHELD offer). Note (design): a KRX send during HOLD is the α test
-     * desired's result; 2b-2 re-agrees it when effective decides the desired KRX (D4 r7 3.6). Mutations: W-X (WS), U-X.
-     * Windows: (i) HOLD at the send and through the checks; (ii) AWAITING after the WS refusal was handed over; (iii) AWAITING after the
-     * REST unknown_topic was handed over — that hand-over is α behavior (§6.2 (나)), so (iii)'s window is not a premise: it is written
-     * `contract(05-8):` and placed before the row contract (tests r2, E-18), and a session that never hands it over fails (iii) as a
-     * contract failure. In (ii) and (iii) the KRX send under the withheld capability is a reconnection's first subscribe made at the
-     * end of the state (g4-fix). 'A later non-KRX issue reaches the fake bootstrap' shows the issue loop still issues; it does not by
-     * itself witness '`cancelBootstrapIssue` 0' (a W-X issue stop leaves KRX owed while USD, ranked ahead, still goes) — W-X is caught
-     * by the KRX sends under HOLD and AWAITING.
-     */
-    @Test fun r05_7_capR05_holdAndKrxRefusalsKeepEverythingGeneral() = runVariants(
-        "05-7 (i)" to { onRig { h, s -> holdState("05-7 (i)", h, s) } },
-        "05-7 (ii)" to { onRig { h, s -> afterRefusal("05-7 (ii)", h, s, rest = false) } },
-        "05-7 (iii)" to { onRig { h, s -> afterRefusal("05-7 (iii)", h, s, rest = true) } }
-    )
+    /** α-1b explicit ON amendment, seam r2 §4.1; old/new and independent inputs: .alpha_evidence/a1b/on7_revisions.md. */
+    @Test fun r05_7_capR05_holdAndKrxRefusalsKeepEverythingGeneral() = KrxA1bOnRevisions.ws07()
 
     /** The checks every 05-7 state shares, run in that state. */
     private suspend fun TestScope.generalKept(row: String, h: KrxHarness, s: TopicSessionKrxHarness, grant: TopicGrantToken) {

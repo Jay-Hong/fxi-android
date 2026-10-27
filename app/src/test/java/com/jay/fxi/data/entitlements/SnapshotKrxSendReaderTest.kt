@@ -619,4 +619,7 @@ internal class SnapshotKrxSendReaderTest {
             processJob.cancel()
         }
     }
+    /** α-3 additive row; original locked r2 methods are unchanged. */
+    @Test fun a3_sua_sessionStampIsFromThePayloadSnapshot_andCopiesAreAbsent() = com.jay.fxi.data.remote.KrxA3Rows.sua_sessionStampIsFromThePayloadSnapshot_andCopiesAreAbsent()
+
 }

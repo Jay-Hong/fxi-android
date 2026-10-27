@@ -1,6 +1,7 @@
 package com.jay.fxi
 
 import com.jay.fxi.data.remote.TopicCatalogue
+import com.jay.fxi.data.remote.KrxSessionSourceContract
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -288,13 +289,21 @@ class KrxS6DormancyContractTest {
     }
 
     /**
-     * Z09: the session still drops KRX and only tether is TETHER_DELIVERY (S6C5 rule 1, D14). Catches MZ-08 (wiring KRX reception)
+     * Z09 amended by α-1a/seam r2 §5.5: ON routes only to WS/REST KRX guards; OFF drops are O1/O2. Only tether is TETHER_DELIVERY (S6C5 rule 1, D14). Catches MZ-08 (bypassing KRX guards)
      * and MZ-09 (adding KRX to evidenceFor).
      */
     @Test fun Z09_sessionStillDropsKrxAndClassifiesOnlyTetherAsTetherDelivery() {
         val tsc = code.getValue(TSC)
-        // TopicSessionCoordinator.kt:1759, :2851.
-        assertEquals("KRX frames dropped", 2, Regex("""is DecodedTopicFrame\.Krx -> Unit""").findAll(tsc).count())
+        // α-1a explicit amendment: only ON KRX WS/REST acceptance routes change. O1 and O2 keep exact OFF drops.
+        val ws = KrxSessionSourceContract.function(tsc, "onFrame")
+        val rest = KrxSessionSourceContract.function(tsc, "applyBootstrap")
+        assertTrue("premise: Z09 same source still handles GENERAL tether", ws.contains("DecodedTopicFrame.Tether"))
+        val probe = "fun onFrame() { receiveKrx(live, frame) }"
+        val route = Regex("""\breceiveKrx\s*[(]""")
+        assertEquals("premise: Z09 positive route probe", 1, route.findAll(probe).count())
+        assertEquals("premise: Z09 bypass probe", 0, route.findAll(route.replace(probe, "receive(")).count())
+        assertEquals("contract(Z09): WS KRX reaches only receiveKrx", 1, Regex("""\breceiveKrx\s*[(]""").findAll(ws).count())
+        assertEquals("contract(Z09): REST KRX reaches only applyKrxBootstrap", 1, Regex("""\bapplyKrxBootstrap\s*[(]""").findAll(rest).count())
         // TopicSessionCoordinator.kt:1881.
         assertEquals("KRX graph candidates dropped", 1, Regex("""entry\.source == "krx" \|\| entry\.asset == "usd-krw-futures"""").findAll(tsc).count())
         // TopicSessionCoordinator.kt:2893-2898.

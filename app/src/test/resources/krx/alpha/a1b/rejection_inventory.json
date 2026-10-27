@@ -1,0 +1,1294 @@
+{
+  "baseline": [
+    {
+      "file": "KrxConsumerOffContrastTest.kt",
+      "methods": [
+        {
+          "name": "r11_1_suaOff_generalIsHeadsAndNoKrxUseIsIssuedOrAdmitted",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `r11_1_suaOff_generalIsHeadsAndNoKrxUseIsIssuedOrAdmitted` — KrxConsumerOffContrastTest.kt:563 | OFF 유지; 전제1 | 기대 :573 `assertEquals(\"11-1 SUA issues and admits no KRX use at any switch-off publication\", emptyList<String>(), r.part(\"krx\"))` |"
+        },
+        {
+          "name": "r11_2_gateOff_everyAnswerIsHeads",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `r11_2_gateOff_everyAnswerIsHeads` — KrxConsumerOffContrastTest.kt:585 | OFF 유지; 전제1 | 기대 :599 `assertEquals(\"11-2 gate $part = HEAD at every switch-off publication\", emptyList<String>(), r.part(part))` |"
+        },
+        {
+          "name": "r11_3_seedOff_theSeedReadIsHeads",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `r11_3_seedOff_theSeedReadIsHeads` — KrxConsumerOffContrastTest.kt:609 | OFF 유지; 전제1 | 기대 :617 `assertEquals(\"11-3 readGraphV2DiskSeed = HEAD at every switch-off publication\", emptyList<String>(), r.part(\"seed\"))` |"
+        },
+        {
+          "name": "r11_4_sendReadOff_generalIsHeadsNoKrxUseAndTheMarkerIsEpochZero",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `r11_4_sendReadOff_generalIsHeadsNoKrxUseAndTheMarkerIsEpochZero` — KrxConsumerOffContrastTest.kt:626 | OFF 유지; 전제1 | 입력 :649 `* guard missing: off, a p = 0 marker would be handed over and the coordinator would decide KrxEntitlementRequired on HEAD's path),`; 기대 :637 `assertEquals(\"11-4 send read marker = (recordFence.krxCapabilityEpoch, 0), non-null\", emptyList<String>(), r.part(\"marker\"))` |"
+        },
+        {
+          "name": "r11_5_restOff_unknownTopicIsNeverHandedOver",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `r11_5_restOff_unknownTopicIsNeverHandedOver` — KrxConsumerOffContrastTest.kt:653 | OFF 유지; 전제1 | 기대 :717 `assertEquals(\"11-5 no two-argument refusal names KRX in the whole run\", emptyList<Any>(), rest.twoArgument.filter { KRX in it })` |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/KrxContestHarness.kt",
+      "methods": []
+    },
+    {
+      "file": "data/entitlements/PremiumAccessCoordinatorTest.kt",
+      "methods": [
+        {
+          "name": "topicGrant_isTheSameTokenWhileItsContextHolds_andANewOneAfterAKrxRotation",
+          "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+          "source_contract": "| `topicGrant_isTheSameTokenWhileItsContextHolds_andANewOneAfterAKrxRotation` — PremiumAccessCoordinatorTest.kt:1219 | ON 짝 필요(W15·K03/K04); 전제1 | 기대 :1239 `assertNotEquals(\"KRX 가 회전했는데 같은 토큰이다\", g.grant, g.coordinator.issuedGrant())` |"
+        },
+        {
+          "name": "refusals_collapseToOneDecisionPerAcknowledgement_premiumFirst",
+          "classification": "OFF 유지; 전제2",
+          "source_contract": "| `refusals_collapseToOneDecisionPerAcknowledgement_premiumFirst` — PremiumAccessCoordinatorTest.kt:1263 | OFF 유지; 전제2 | 입력 :1266 `val krx = TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED`; 기대 :1299 `assertEquals(\"$order: premium 거부 뒤에 KRX 재조회가 걸렸다\", fetchesBefore, g.fetches())` |"
+        },
+        {
+          "name": "aKrxRefusalForTheStandingGrant_rotatesTheCapabilityOnlyAndAsksAgain",
+          "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+          "source_contract": "| `aKrxRefusalForTheStandingGrant_rotatesTheCapabilityOnlyAndAsksAgain` — PremiumAccessCoordinatorTest.kt:1337 | ON 짝 필요(W15·K03/K04); 전제1 | 입력 :1347 `g.coordinator.onTopicRejected(g.grant, KRX_REFUSAL)`; 기대 :1354 `assertTrue(\"KRX 거부 뒤 재조회가 없었다\", g.fetches() > fetchesBefore)` |"
+        },
+        {
+          "name": "aKrxRefusalWithKrxAlreadyHidden_rotatesNothingButStillAsksAgain",
+          "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+          "source_contract": "| `aKrxRefusalWithKrxAlreadyHidden_rotatesNothingButStillAsksAgain` — PremiumAccessCoordinatorTest.kt:1358 | ON 짝 필요(W15·K03/K04); 전제1 | 입력 :1364 `g.coordinator.onTopicRejected(g.grant, KRX_REFUSAL)`; 기대 :1369 `assertTrue(\"KRX 거부 뒤 재조회가 없었다\", g.fetches() > fetchesBefore)` |"
+        },
+        {
+          "name": "aPremiumRefusalOnItsWay_keepsADemand_butAddsNone",
+          "classification": "OFF 유지; 전제2",
+          "source_contract": "| `aPremiumRefusalOnItsWay_keepsADemand_butAddsNone` — PremiumAccessCoordinatorTest.kt:2317 | OFF 유지; 전제2 | 입력 :2321 `withDemand.coordinator.onTopicRejected(withDemand.grant, KRX_REFUSAL)`; 기대 :2348 `assertNull(without.coordinator.owed())` |"
+        },
+        {
+          "name": "aCapabilityHoldForAReapprovedGrant_isResolvedNotReleased",
+          "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+          "source_contract": "| `aCapabilityHoldForAReapprovedGrant_isResolvedNotReleased` — PremiumAccessCoordinatorTest.kt:2392 | ON 짝 필요(W15·K03/K04); 전제1 | 입력 :2396 `g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)`; 기대 :2414 `assertNotEquals(\"재승인이 옛 grant 의 보류를 stale 로 풀었다\", epoch, g.store.record.krxCapabilityEpoch)` |"
+        },
+        {
+          "name": "aCapabilityCandidate_survivesTwoReapprovals",
+          "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+          "source_contract": "| `aCapabilityCandidate_survivesTwoReapprovals` — PremiumAccessCoordinatorTest.kt:2417 | ON 짝 필요(W15·K03/K04); 전제1 | 입력 :2425 `g.coordinator.onTopicRejected(g.grant, PREMIUM_REFUSAL)`; 기대 :2475 `assertEquals(TopicGrantCause.Context, g.coordinator.topicGrantResult().cause)` |"
+        },
+        {
+          "name": "aRepeatedlyBlockedReapproval_backsOffAlongTheSchedule",
+          "classification": "OFF 유지; 전제2",
+          "source_contract": "| `aRepeatedlyBlockedReapproval_backsOffAlongTheSchedule` — PremiumAccessCoordinatorTest.kt:2555 | OFF 유지; 전제2 | 입력 :2560 `g.coordinator.onTopicRejected(g.grant, KRX_REFUSAL)`; 기대 :2574 `assertEquals(g.grant, g.coordinator.issuedGrant())` |"
+        },
+        {
+          "name": "anUndecidableKrxRefusal_asksAtEntitlementsStrength",
+          "classification": "OFF 유지; 전제2",
+          "source_contract": "| `anUndecidableKrxRefusal_asksAtEntitlementsStrength` — PremiumAccessCoordinatorTest.kt:2620 | OFF 유지; 전제2 | 입력 :2626 `g.coordinator.onTopicRejected(g.grant, KRX_REFUSAL)`; 기대 :2632 `assertEquals(\"KRX 거부가 premium 강도로 물었다\", fresh, g.freshFetches())` |"
+        },
+        {
+          "name": "strengthsJoinWithoutWeakening_andRefusalsNotAboutAccessLeaveNothing",
+          "classification": "OFF 유지; 전제2",
+          "source_contract": "| `strengthsJoinWithoutWeakening_andRefusalsNotAboutAccessLeaveNothing` — PremiumAccessCoordinatorTest.kt:2689 | OFF 유지; 전제2 | 입력 :2693 `a.coordinator.onTopicRejected(a.grant, PREMIUM_REFUSAL)`; 기대 :2717 `assertEquals(TopicRejectionView(emptyList(), null, null), d.coordinator.rejectionView(d.grant))` |"
+        },
+        {
+          "name": "aNewGrant_retiresTheOldSummary_andLateEndingsForTheOldGrantDoNotTouchIt",
+          "classification": "ON 짝 필요(W15·K03/K04); 전제1",
+          "source_contract": "| `aNewGrant_retiresTheOldSummary_andLateEndingsForTheOldGrantDoNotTouchIt` — PremiumAccessCoordinatorTest.kt:2910 | ON 짝 필요(W15·K03/K04); 전제1 | 입력 :2914 `val late = g.coordinator.reserveRejection(g.grant, PREMIUM_REFUSAL)`; 기대 :2927 `assertEquals(listOf(fresh.order), g.coordinator.rejectionView(replacement).pendingOrders)` |"
+        },
+        {
+          "name": "reserving_doesNotWaitOnTheIssuersLockOrAnIdentityRead",
+          "classification": "OFF 유지; 전제2",
+          "source_contract": "| `reserving_doesNotWaitOnTheIssuersLockOrAnIdentityRead` — PremiumAccessCoordinatorTest.kt:2932 | OFF 유지; 전제2 | 입력 :2939 `val reservation = g.coordinator.reserveRejection(g.grant, PREMIUM_REFUSAL)`; 기대 :2958 `assertEquals(emptyList<Long>(), r.coordinator.rejectionView(r.grant).pendingOrders)` |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/PremiumAccessKrxA1Test.kt",
+      "methods": [
+        {
+          "name": "A1_on_krxRotationKeepsTheTokenStanding",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_krxRotationKeepsTheTokenStanding` — PremiumAccessKrxA1Test.kt:75 | 부품만; 전제1 | 입력 :77 `h.grantedKrxVisible()`; 기대 :85 `assertEquals(\"A1: KRX 단독 회전이 userInvalidations를 올리지 않는다\", invalidations, h.coordinator.accessSnapshot.userInvalidations)` |"
+        },
+        {
+          "name": "A1_off_krxRotationIssuesANewToken",
+          "classification": "OFF 유지; 전제2",
+          "source_contract": "| `A1_off_krxRotationIssuesANewToken` — PremiumAccessKrxA1Test.kt:89 | OFF 유지; 전제2 | 입력 :91 `h.grantedKrxVisible()`; 기대 :96 `assertNotEquals(\"OFF: HEAD는 KRX 회전에 새 토큰을 낸다\", token, h.issueGrant())` |"
+        },
+        {
+          "name": "A1_on_afterKrxRotation_premiumRefusalIsVerified_andReapproves",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_afterKrxRotation_premiumRefusalIsVerified_andReapproves` — PremiumAccessKrxA1Test.kt:110 | 부품만; 전제1 | 입력 :112 `h.grantedKrxVisible()`; 기대 :135 `assertTrue(\"A1-5: 재승인 토큰이 standing이다\", h.coordinator.accessSnapshot.facts.tokenStanding)` |"
+        },
+        {
+          "name": "A1_on_krxRotationDoesNotStaleAPremiumTopicCandidate",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_krxRotationDoesNotStaleAPremiumTopicCandidate` — PremiumAccessKrxA1Test.kt:146 | 부품만; 전제1 | 입력 :148 `h.grantedKrxVisible()`; 기대 :165 `assertNotEquals(\"A1-4: premium 상실 적용\", PremiumAccessState.PremiumConfirmed, h.coordinator.state.value.state)` |"
+        },
+        {
+          "name": "A1_on_pair_PACT1220_c1RotationKeepsTheToken",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_PACT1220_c1RotationKeepsTheToken` — PremiumAccessKrxA1Test.kt:172 | 부품만; 전제1 | 입력 :174 `h.grantedKrxVisible()`; 기대 :187 `assertEquals(\"#2: KRX 회전이 토큰을 바꾸지 않는다\", token, h.issueGrant())` |"
+        },
+        {
+          "name": "A1_on_pair_PATST519_c1RotationKeepsTokenAndUserInvalidations",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_PATST519_c1RotationKeepsTokenAndUserInvalidations` — PremiumAccessKrxA1Test.kt:191 | 부품만; 전제1 | 입력 :193 `h.grantedKrxVisible()`; 기대 :207 `assertTrue(\"KRX만 닫힌다\", !after.facts.capabilityAllowed)` |"
+        },
+        {
+          "name": "A1_on_pair_PATST762_confirmedKrxEpochChangeKeepsTheToken",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_PATST762_confirmedKrxEpochChangeKeepsTheToken` — PremiumAccessKrxA1Test.kt:214 | 부품만; 전제1 | 입력 :216 `h.grantedKrxVisible()`; 기대 :239 `assertTrue(\"#22: KRX만 닫힌다\", !facts.capabilityAllowed)` |"
+        },
+        {
+          "name": "A1_on_pair_PATST910_parkedAfterLanding_keepsTheTokenOnTheMovedRecord",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_PATST910_parkedAfterLanding_keepsTheTokenOnTheMovedRecord` — PremiumAccessKrxA1Test.kt:246 | 부품만; 전제1 | krxLossLanding(true), KRX 회전 착지 뒤 gate 대기 → 같은 tokenStanding·userAllowed 유지, capability 재허용0(:255-290) |"
+        },
+        {
+          "name": "A1_on_pair_PATST920_cancelledAfterLanding_keepsTheTokenOnTheMovedRecord",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_PATST920_cancelledAfterLanding_keepsTheTokenOnTheMovedRecord` — PremiumAccessKrxA1Test.kt:251 | 부품만; 전제1 | krxLossLanding(false), 착지 뒤 store 취소 → 재확인된 record에서도 같은 token·사용자 축 유지(:255-290) |"
+        },
+        {
+          "name": "A1_on_pair_PACT1408_premiumRefusalAfterAKrxOnlyRotation_isApplied",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_PACT1408_premiumRefusalAfterAKrxOnlyRotation_isApplied` — PremiumAccessKrxA1Test.kt:298 | 부품만; 전제1 | 입력 :302 `h.grantedKrxVisible()`; 기대 :321 `assertNotEquals(\"$label #24: 사용자 epoch 회전\", userEpoch, h.store.record.userAccessEpoch)` |"
+        },
+        {
+          "name": "A1_on_pair_LossCandidate445_krxOnlyRotationDoesNotReplaceTheGrant",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_LossCandidate445_krxOnlyRotationDoesNotReplaceTheGrant` — PremiumAccessKrxA1Test.kt:330 | 부품만; 전제1 | 입력 :332 `h.grantedKrxVisible()`; 기대 :344 `assertEquals(\"#25(파생): 대체되지 않은 grant의 후보는 판독 실패 동안 남는다\", 1, h.coordinator.heldLossCandidateCount())` |"
+        },
+        {
+          "name": "A1_on_pair_PACT2409_reapprovedGrantCandidate_releasedByThePermitRedecision",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_PACT2409_reapprovedGrantCandidate_releasedByThePermitRedecision` — PremiumAccessKrxA1Test.kt:358 | 부품만; 전제1 | 입력 :360 `h.grantedKrxVisible()`; 기대 :380 `assertTrue(\"ON: 토큰은 같은 문맥 재승인의 것(회전으로 새 문맥이 나지 않음): $cause\", cause is TopicGrantCause.RefusalReapproval && cause.from == grant)` |"
+        },
+        {
+          "name": "A1_on_pair_PACT2409_krxCandidateAcrossS1Reapprovals_isResolved",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_PACT2409_krxCandidateAcrossS1Reapprovals_isResolved` — PremiumAccessKrxA1Test.kt:394 | 부품만; 전제1 | lineageAcrossS1Reapprovals(1/2), H2·후보·S1 재승인 → 후보를 stale로 버리지 않고 permit 재판정으로 해소(:398 이후) |"
+        },
+        {
+          "name": "A1_on_pair_PACT2475_firstReapprovalPermit_releasesTheCandidate_chainContinues",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_PACT2475_firstReapprovalPermit_releasesTheCandidate_chainContinues` — PremiumAccessKrxA1Test.kt:491 | 부품만; 전제1 | 입력 :493 `h.grantedKrxVisible()`; 기대 :517 `assertEquals(\"여전히 회전 없음\", epoch, h.store.record.krxCapabilityEpoch)` |"
+        },
+        {
+          "name": "A1_on_pair_PACT2919_summaryRetirement_withASameOwnerRebind",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_PACT2919_summaryRetirement_withASameOwnerRebind` — PremiumAccessKrxA1Test.kt:525 | 부품만; 전제1 | 입력 :527 `h.grantedKrxVisible()`; 기대 :542 `assertEquals(listOf(fresh.order), h.coordinator.rejectionView(replacement).pendingOrders)` |"
+        },
+        {
+          "name": "A1_on_pair_PACT1281_mixedRefusalCollapsesToOnePremiumDecision",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_pair_PACT1281_mixedRefusalCollapsesToOnePremiumDecision` — PremiumAccessKrxA1Test.kt:550 | 부품만; 전제1 | 입력 :552 `val krx = TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED`; 기대 :572 `assertEquals(\"$order: 조회\", alone.source.calls.size - aloneSends, h.source.calls.size - sends)` |"
+        },
+        {
+          "name": "A1_on_preservation_rsAndUserBlocksMatchTheOffRun",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_preservation_rsAndUserBlocksMatchTheOffRun` — PremiumAccessKrxA1Test.kt:582 | 부품만; 전제1 | 입력 :587 `for (h in listOf(on, off)) h.grantedKrxVisible()`; 기대 :601 `assertTrue(\"$label 사용자 축 허용\", on.coordinator.accessSnapshot.facts.userAllowed)` |"
+        },
+        {
+          "name": "A1_on_premiumLoss_keepsTheFullReset",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `A1_on_premiumLoss_keepsTheFullReset` — PremiumAccessKrxA1Test.kt:609 | 부품만; 전제1 | 입력 :612 `for (h in listOf(on, off)) h.grantedKrxVisible()`; 기대 :628 `assertEquals(\"userInvalidations는 꺼짐과 같다\", b.userInvalidations, a.userInvalidations)` |"
+        },
+        {
+          "name": "OD2_on_eachAllowedToBlockedTransitionCountsOnce",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `OD2_on_eachAllowedToBlockedTransitionCountsOnce` — PremiumAccessKrxA1Test.kt:638 | 부품만; 전제1 | od2Sequence(on(),true): H1′·false·true·H1 → 허용→차단마다 capInv+1, 차단 중 추가막힘+0(:643-685) |"
+        },
+        {
+          "name": "OD2_off_neverCounts",
+          "classification": "OFF 유지; 전제2",
+          "source_contract": "| `OD2_off_neverCounts` — PremiumAccessKrxA1Test.kt:641 | OFF 유지; 전제2 | od2Sequence(off(),false): 같은 왕복 입력의 모든 관측점 capInv=0(:643-685) |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/PremiumAccessKrxDormantTraceTest.kt",
+      "methods": [
+        {
+          "name": "d1_rejectionsAndAnswersAlternating",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `d1_rejectionsAndAnswersAlternating` — PremiumAccessKrxDormantTraceTest.kt:81 | OFF 유지; 전제1 | 입력 :82 `fun d1_rejectionsAndAnswersAlternating() = traceTest(\"D1\", GOLDEN_D1) { out ->`; 기대는 GOLDEN_D1와 동일한 기록 열(traceTest :61-74) |"
+        },
+        {
+          "name": "d2_undecidedRejections",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `d2_undecidedRejections` — PremiumAccessKrxDormantTraceTest.kt:112 | OFF 유지; 전제1 | 입력 :113 `fun d2_undecidedRejections() = traceTest(\"D2\", GOLDEN_D2) { out ->`; 기대는 GOLDEN_D2와 동일한 기록 열(traceTest :61-74) |"
+        },
+        {
+          "name": "d3_rotationFailureSealAndRelease",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `d3_rotationFailureSealAndRelease` — PremiumAccessKrxDormantTraceTest.kt:135 | OFF 유지; 전제1 | 입력 :136 `fun d3_rotationFailureSealAndRelease() = traceTest(\"D3\", GOLDEN_D3) { out ->`; 기대는 GOLDEN_D3와 동일한 기록 열(traceTest :61-74) |"
+        },
+        {
+          "name": "d4_intraStepChangeIsCaptured",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `d4_intraStepChangeIsCaptured` — PremiumAccessKrxDormantTraceTest.kt:157 | OFF 유지; 전제1 | 입력 :158 `fun d4_intraStepChangeIsCaptured() = traceTest(\"D4\", GOLDEN_D4) { out ->`; 기대 :167 `assertTrue( \"같은 단계 안의 HIDDEN이 이력에 남는다: ${history.krx}\", history.krx.windowed(3).any { it == listOf(\"VISIBLE\", \"HIDDEN\", \"VISIBLE\") } )`; 기대는 GOLDEN_D4와 동일한 기록 열(traceTest :61-74) |"
+        },
+        {
+          "name": "d5_queryCandidateDecisionAndStaleRelease",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `d5_queryCandidateDecisionAndStaleRelease` — PremiumAccessKrxDormantTraceTest.kt:179 | OFF 유지; 전제1 | 입력 :180 `fun d5_queryCandidateDecisionAndStaleRelease() = traceTest(\"D5\", GOLDEN_D5) { out ->`; 기대는 GOLDEN_D5와 동일한 기록 열(traceTest :61-74) |"
+        },
+        {
+          "name": "d6_zeroDelayRecheckFiresDuringCandidateRelease",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `d6_zeroDelayRecheckFiresDuringCandidateRelease` — PremiumAccessKrxDormantTraceTest.kt:218 | OFF 유지; 전제1 | 입력 :219 `fun d6_zeroDelayRecheckFiresDuringCandidateRelease() = traceTest(\"D6\", GOLDEN_D6) { out ->`; 기대는 GOLDEN_D6와 동일한 기록 열(traceTest :61-74) |"
+        },
+        {
+          "name": "k17_laterFalseAfterSuppressedTrue",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `k17_laterFalseAfterSuppressedTrue` — PremiumAccessKrxDormantTraceTest.kt:248 | OFF 유지; 전제1 | 입력 :249 `fun k17_laterFalseAfterSuppressedTrue() = traceTest(\"K17\", GOLDEN_K17) { out ->`; 기대는 GOLDEN_K17와 동일한 기록 열(traceTest :61-74) |"
+        },
+        {
+          "name": "k18_completionInversion",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `k18_completionInversion` — PremiumAccessKrxDormantTraceTest.kt:272 | OFF 유지; 전제1 | 입력 :273 `fun k18_completionInversion() = traceTest(\"K18\", GOLDEN_K18) { out ->`; 기대는 GOLDEN_K18와 동일한 기록 열(traceTest :61-74) |"
+        },
+        {
+          "name": "d7_markedRefusalsDuplicateAndMarkerless_offIgnoresMarkers",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `d7_markedRefusalsDuplicateAndMarkerless_offIgnoresMarkers` — PremiumAccessKrxDormantTraceTest.kt:304 | OFF 유지; 전제1 | 입력 :305 `fun d7_markedRefusalsDuplicateAndMarkerless_offIgnoresMarkers() = traceTest(\"D7\", GOLDEN_D7) { out ->`; 기대는 GOLDEN_D7와 동일한 기록 열(traceTest :61-74) |"
+        },
+        {
+          "name": "d8_earlierPermitAndOldEpochMarkers_offIgnoresMarkers",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `d8_earlierPermitAndOldEpochMarkers_offIgnoresMarkers` — PremiumAccessKrxDormantTraceTest.kt:332 | OFF 유지; 전제1 | 입력 :333 `fun d8_earlierPermitAndOldEpochMarkers_offIgnoresMarkers() = traceTest(\"D8\", GOLDEN_D8) { out ->`; 기대는 GOLDEN_D8와 동일한 기록 열(traceTest :61-74) |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/PremiumAccessKrxPermitTest.kt",
+      "methods": [
+        {
+          "name": "P1_samePermitDuplicateAfterHandover_changesNothing",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P1_samePermitDuplicateAfterHandover_changesNothing` — PremiumAccessKrxPermitTest.kt:75 | 부품만; 전제1 | 입력 :77 `h.grantedKrxVisible()`; 기대 :96 `assertEquals(\"그 FE의 true(T2)에서 허가\", p + 1, h.permit())` |"
+        },
+        {
+          "name": "P1c_h1FirstThenSameEpochDuplicate_changesNothing",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P1c_h1FirstThenSameEpochDuplicate_changesNothing` — PremiumAccessKrxPermitTest.kt:103 | 부품만; 전제1 | 입력 :105 `h.grantedKrxVisible()`; 기대 :122 `assertEquals(\"n은 한 번만\", 1, h.view().state.streak)` |"
+        },
+        {
+          "name": "P1d_samePermitPairInReverseOrder_handsOverOnce",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P1d_samePermitPairInReverseOrder_handsOverOnce` — PremiumAccessKrxPermitTest.kt:129 | 부품만; 전제1 | 입력 :133 `h.grantedKrxVisible()`; 기대 :149 `assertEquals(\"$label n은 한 번만\", 1, h.view().state.streak)` |"
+        },
+        {
+          "name": "P1b_samePermitDuplicate_isDecidedBeforeTheStoreRead",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P1b_samePermitDuplicate_isDecidedBeforeTheStoreRead` — PremiumAccessKrxPermitTest.kt:157 | 부품만; 전제1 | 입력 :159 `h.grantedKrxVisible()`; 기대 :170 `assertEquals(\"중복은 후보도 상태 변화도 만들지 않는다\", before, h.full(grant))` |"
+        },
+        {
+          "name": "P2_oldEpochMarkerAfterC1_isDiscardedWithoutHandover",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P2_oldEpochMarkerAfterC1_isDiscardedWithoutHandover` — PremiumAccessKrxPermitTest.kt:179 | 부품만; 전제1 | 입력 :181 `h.grantedKrxVisible()`; 기대 :193 `assertEquals(\"옛 epoch 표지는 상태를 바꾸지 않는다\", before, h.full(grant))` |"
+        },
+        {
+          "name": "P2b_oldEpochMarker_isDiscardedBeforeTheStoreRead",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P2b_oldEpochMarker_isDiscardedBeforeTheStoreRead` — PremiumAccessKrxPermitTest.kt:202 | 부품만; 전제1 | 입력 :204 `h.grantedKrxVisible()`; 기대 :218 `assertEquals(\"옛 epoch 표지는 상태를 바꾸지 않는다\", before, h.full(grant))` |"
+        },
+        {
+          "name": "P3_markerlessRefusal_isJudgedWithTheCurrentPermit",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P3_markerlessRefusal_isJudgedWithTheCurrentPermit` — PremiumAccessKrxPermitTest.kt:228 | 부품만; 전제1 | 입력 :230 `h.grantedKrxVisible()`; 기대 :243 `assertEquals(\"인계된 허가의 null 표지 중복은 상태를 바꾸지 않는다\", before, h.full(grant))` |"
+        },
+        {
+          "name": "P3b_explicitMarkerWithNullEpoch_isAnEpochMismatch",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P3b_explicitMarkerWithNullEpoch_isAnEpochMismatch` — PremiumAccessKrxPermitTest.kt:251 | 부품만; 전제1 | 입력 :253 `h.grantedKrxVisible()`; 기대 :259 `assertEquals(\"null epoch 명시 표지는 상태를 바꾸지 않는다\", before, h.full(grant))` |"
+        },
+        {
+          "name": "P4_blockedTrueIsWithheld_andAnAbandonedBlockerFiresW3",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P4_blockedTrueIsWithheld_andAnAbandonedBlockerFiresW3` — PremiumAccessKrxPermitTest.kt:269 | 부품만; 전제1 | 입력 :271 `h.grantedKrxVisible()`; 기대 :306 `assertEquals(\"FE는 그 하나뿐\", sent + 1, h.source.calls.size)` |"
+        },
+        {
+          "name": "P5_blockerHandedOverByH1_clearsWithheld",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P5_blockerHandedOverByH1_clearsWithheld` — PremiumAccessKrxPermitTest.kt:313 | 부품만; 전제1 | 입력 :315 `h.grantedKrxVisible()`; 기대 :342 `assertEquals(\"그 FE의 true(T2)에서 허가\", p + 1, h.permit())` |"
+        },
+        {
+          "name": "P6_blockerCancelledWhileWaitingForTheLock_firesW3",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P6_blockerCancelledWhileWaitingForTheLock_firesW3` — PremiumAccessKrxPermitTest.kt:372 | 부품만; 전제1 | 입력 :374 `h.grantedKrxVisible()`; 기대 :403 `assertEquals(\"FE는 그 하나뿐\", sent + 1, h.source.calls.size)` |"
+        },
+        {
+          "name": "P8_blockerEndingOnALiveIdentityMismatch_firesW3",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P8_blockerEndingOnALiveIdentityMismatch_firesW3` — PremiumAccessKrxPermitTest.kt:410 | 부품만; 전제1 | 입력 :412 `h.grantedKrxVisible()`; 기대 :432 `assertEquals(\"FE는 그 하나뿐\", sent + 1, h.source.calls.size)` |"
+        },
+        {
+          "name": "P5b_blockerHandedOverByH1Prime_clearsWithheld",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P5b_blockerHandedOverByH1Prime_clearsWithheld` — PremiumAccessKrxPermitTest.kt:440 | 부품만; 전제1 | 입력 :442 `h.grantedKrxVisible()`; 기대 :457 `assertEquals(\"그 FE의 true에서 허가\", p + 1, h.permit())` |"
+        },
+        {
+          "name": "P5c_blockerHeldAsACandidate_clearsWithheld",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P5c_blockerHeldAsACandidate_clearsWithheld` — PremiumAccessKrxPermitTest.kt:466 | 부품만; 전제1 | 입력 :468 `h.grantedKrxVisible()`; 기대 :489 `assertEquals(\"그 true에서 허가\", p + 1, h.permit())` |"
+        },
+        {
+          "name": "P10_retiredTokenBlockerEndingOnGrantMismatch_firesW3",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P10_retiredTokenBlockerEndingOnGrantMismatch_firesW3` — PremiumAccessKrxPermitTest.kt:498 | 부품만; 전제1 | 입력 :500 `h.grantedKrxVisible()`; 기대 :540 `assertEquals(\"FE는 그 하나뿐\", sent + 1, h.source.calls.size)` |"
+        },
+        {
+          "name": "P8b_blockerEndingOnAKnownStaleUnreadableRecord_firesW3",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P8b_blockerEndingOnAKnownStaleUnreadableRecord_firesW3` — PremiumAccessKrxPermitTest.kt:547 | 부품만; 전제1 | 입력 :549 `h.grantedKrxVisible()`; 기대 :569 `assertEquals(\"W3 FE의 true에서 허가\", p + 1, h.permit())` |"
+        },
+        {
+          "name": "P12_noW3WhileADemandStands",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P12_noW3WhileADemandStands` — PremiumAccessKrxPermitTest.kt:577 | 부품만; 전제1 | 입력 :579 `h.grantedKrxVisible()`; 기대 :597 `assertNull(\"허가가 withheld를 지운다\", h.view().withheld)` |"
+        },
+        {
+          "name": "P11_unblockedFreshTrueClearsWithheld_open",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P11_unblockedFreshTrueClearsWithheld_open` — PremiumAccessKrxPermitTest.kt:605 | 부품만; 전제1 | 막던 예약의 부적격 해소·fresh true → T2 OPEN(p+1)·withheld null |"
+        },
+        {
+          "name": "P11b_unblockedFreshTrueClearsWithheld_holdEntry",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P11b_unblockedFreshTrueClearsWithheld_holdEntry` — PremiumAccessKrxPermitTest.kt:607 | 부품만; 전제1 | 같은 열의 2회차 → T2 HOLD·permit 불변·withheld null |"
+        },
+        {
+          "name": "P7_onlyTheLastBlockerEndingFiresW3",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P7_onlyTheLastBlockerEndingFiresW3` — PremiumAccessKrxPermitTest.kt:645 | 부품만; 전제1 | 입력 :647 `h.grantedKrxVisible()`; 기대 :665 `assertEquals(p + 1, h.permit())` |"
+        },
+        {
+          "name": "P9_cancellationAfterPublishingDoesNotUndoTheHandover",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P9_cancellationAfterPublishingDoesNotUndoTheHandover` — PremiumAccessKrxPermitTest.kt:674 | 부품만; 전제1 | 입력 :676 `h.grantedKrxVisible()`; 기대 :698 `assertEquals(\"I7: 같은 허가의 표지 없는 예약은 두 번째 인계가 아니다\", before, h.full(grant))` |"
+        },
+        {
+          "name": "P9b_cancellationAfterPublishingKeepsTheH1FollowUp",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P9b_cancellationAfterPublishingKeepsTheH1FollowUp` — PremiumAccessKrxPermitTest.kt:709 | 부품만; 전제1 | 입력 :711 `h.grantedKrxVisible()`; 기대 :732 `assertEquals(\"그 FE의 true에서 허가 — AWAITING 고착 없음\", p + 1, h.permit())` |"
+        },
+        {
+          "name": "R06_samePermitDuplicates_matrix",
+          "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+          "source_contract": "| `R06_samePermitDuplicates_matrix` — PremiumAccessKrxPermitTest.kt:749 | ON 짝 필요(W07c·W08a/b·W15); 전제2 | r06 행렬: H1′ live/store/승인닫힘, N=1/3·FE 전/중/뒤 → 추가FE0·상태/RS 불변·후속허가 세션 의무(:758 이후) |"
+        },
+        {
+          "name": "C1_freshFalseClearsWithheld_andALaterEndFiresNoW3",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `C1_freshFalseClearsWithheld_andALaterEndFiresNoW3` — PremiumAccessKrxPermitTest.kt:856 | 부품만; 전제1 | 입력 :858 `h.grantedKrxVisible()`; 기대 :871 `assertTrue(\"인계 없음\", h.view().rejectedPermit < p)` |"
+        },
+        {
+          "name": "C0_keyChangeClearsWithheld_andAnOldKeyEndFiresNoW3",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `C0_keyChangeClearsWithheld_andAnOldKeyEndFiresNoW3` — PremiumAccessKrxPermitTest.kt:879 | 부품만; 전제1 | 입력 :881 `h.grantedKrxVisible()`; 기대 :895 `assertNull(\"C0 뒤에도 withheld 없음\", h.view().withheld)` |"
+        },
+        {
+          "name": "C0b_keyChangeWithoutAPermit_clearsWithheld",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `C0b_keyChangeWithoutAPermit_clearsWithheld` — PremiumAccessKrxPermitTest.kt:906 | 부품만; 전제1 | 입력 :908 `h.grantedKrxVisible()`; 기대 :928 `assertNull(\"끝난 뒤에도 withheld 없음\", h.view().withheld)` |"
+        },
+        {
+          "name": "C0c_authoritativeLossKeyChange_clearsWithheld",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `C0c_authoritativeLossKeyChange_clearsWithheld` — PremiumAccessKrxPermitTest.kt:937 | 부품만; 전제1 | 입력 :939 `h.grantedKrxVisible()`; 기대 :955 `assertNull(\"끝난 뒤에도 withheld 없음\", h.view().withheld)` |"
+        },
+        {
+          "name": "C0d_userAccessEpochOnlyKeyChange_clearsWithheld",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `C0d_userAccessEpochOnlyKeyChange_clearsWithheld` — PremiumAccessKrxPermitTest.kt:965 | 부품만; 전제1 | 입력 :967 `h.grantedKrxVisible()`; 기대 :993 `assertNull(\"C0(userAccessEpoch): withheld 비움\", h.view().withheld)` |"
+        },
+        {
+          "name": "C0e_generationOnlyKeyChange_clearsWithheld",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `C0e_generationOnlyKeyChange_clearsWithheld` — PremiumAccessKrxPermitTest.kt:1000 | 부품만; 전제1 | 입력 :1002 `h.grantedKrxVisible()`; 기대 :1015 `assertNull(\"C0(decisionGeneration 단독): withheld 비움\", h.view().withheld)` |"
+        },
+        {
+          "name": "C0f_sealSuppressedTrueAfterKeyChange_oldBlockerEndFiresNoW3",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `C0f_sealSuppressedTrueAfterKeyChange_oldBlockerEndFiresNoW3` — PremiumAccessKrxPermitTest.kt:1024 | 부품만; 전제1 | 입력 :1026 `h.grantedKrxVisible()`; 기대 :1051 `assertEquals(\"W3의 FE 송신 없음\", sent, h.source.calls.size)` |"
+        },
+        {
+          "name": "C0_keepsRejectedPermit",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `C0_keepsRejectedPermit` — PremiumAccessKrxPermitTest.kt:1055 | 부품만; 전제1 | 입력 :1057 `h.grantedKrxVisible()`; 기대 :1068 `assertEquals(\"C0: rejectedPermit 유지\", p, h.view().rejectedPermit)` |"
+        },
+        {
+          "name": "B0_beforeTheFirstPermit_everyKrxRefusalIsIneligible",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `B0_beforeTheFirstPermit_everyKrxRefusalIsIneligible` — PremiumAccessKrxPermitTest.kt:1076 | 부품만; 전제1 | 입력 :1089 `h.coordinator.onTopicRejected(r)`; 기대 :1091 `assertEquals(\"결정·회전 없음\", rotations, h.store.rotationAttempts)` |"
+        },
+        {
+          "name": "G2_recordEpochMovedPastTheMarker_isDiscarded",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `G2_recordEpochMovedPastTheMarker_isDiscarded` — PremiumAccessKrxPermitTest.kt:1100 | 부품만; 전제1 | 입력 :1102 `h.grantedKrxVisible()`; 기대 :1111 `assertEquals(\"결정·회전 없음\", rotations, h.store.rotationAttempts)` |"
+        },
+        {
+          "name": "R10i_earlierPermitCandidate_isReleasedWithoutDeciding",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `R10i_earlierPermitCandidate_isReleasedWithoutDeciding` — PremiumAccessKrxPermitTest.kt:1123 | 부품만; 전제1 | 후보(p) 뒤 새p → 복구 결정/회전/FE0 |"
+        },
+        {
+          "name": "R10v_markerlessCandidate_keepsItsHoldTimePermit",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `R10v_markerlessCandidate_keepsItsHoldTimePermit` — PremiumAccessKrxPermitTest.kt:1125 | 부품만; 전제1 | 표지 없는 후보 → 보류 시점p 귀속·새p 뒤 결정0 |"
+        },
+        {
+          "name": "R10ii_sameKeyStaleRelease_raisesOneFe",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `R10ii_sameKeyStaleRelease_raisesOneFe` — PremiumAccessKrxPermitTest.kt:1160 | 부품만; 전제1 | 입력 :1162 `h.grantedKrxVisible()`; 기대 :1189 `assertEquals(\"FE는 그 하나뿐\", sent + 1, h.source.calls.size)` |"
+        },
+        {
+          "name": "R10vi_samePermitCandidateDuringHold_isReleasedWithoutDeciding",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `R10vi_samePermitCandidateDuringHold_isReleasedWithoutDeciding` — PremiumAccessKrxPermitTest.kt:1197 | 부품만; 전제1 | 입력 :1199 `h.grantedKrxVisible()`; 기대 :1229 `assertEquals(\"허가 p 유지\", p, h.permit())` |"
+        },
+        {
+          "name": "R10iii_samePermitDuringStoreFailure_holdsOneCandidate",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `R10iii_samePermitDuringStoreFailure_holdsOneCandidate` — PremiumAccessKrxPermitTest.kt:1236 | 부품만; 전제1 | 입력 :1238 `h.grantedKrxVisible()`; 기대 :1257 `assertEquals(\"그 true에서 허가\", p + 1, h.permit())` |"
+        },
+        {
+          "name": "P13_blockerCancelledDuringTheLiveRead_firesW3",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P13_blockerCancelledDuringTheLiveRead_firesW3` — PremiumAccessKrxPermitTest.kt:1266 | 부품만; 전제1 | 입력 :1268 `h.grantedKrxVisible()`; 기대 :1292 `assertEquals(\"FE는 그 하나뿐\", sent + 1, h.source.calls.size)` |"
+        },
+        {
+          "name": "P14_blockerEndingOnTheEpochGuard_firesW3",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P14_blockerEndingOnTheEpochGuard_firesW3` — PremiumAccessKrxPermitTest.kt:1300 | 부품만; 전제1 | 입력 :1304 `h.grantedKrxVisible()`; 기대 :1329 `assertEquals(\"$label W3 FE의 true에서 허가\", p + 1, h.permit())` |"
+        },
+        {
+          "name": "P3c_explicitNullEpochMatchingAConfirmedNullEpoch_isEligible",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P3c_explicitNullEpochMatchingAConfirmedNullEpoch_isEligible` — PremiumAccessKrxPermitTest.kt:1338 | 부품만; 전제1 | 입력 :1340 `h.grantedKrxVisible()`; 기대 :1355 `assertEquals(\"인계로 처리됐다(latestCurrent)\", r.order, h.coordinator.rejectionView(token).latestCurrent)` |"
+        },
+        {
+          "name": "N6_unknownTokenReservation_doesNotBlock",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `N6_unknownTokenReservation_doesNotBlock` — PremiumAccessKrxPermitTest.kt:1363 | 부품만; 전제1 | 입력 :1365 `h.grantedKrxVisible()`; 기대 :1382 `assertNull(\"withheld 없음\", h.view().withheld)` |"
+        },
+        {
+          "name": "P15_staleContestKey_isSyncedBeforeTheJudgment",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P15_staleContestKey_isSyncedBeforeTheJudgment` — PremiumAccessKrxPermitTest.kt:1399 | 부품만; 전제1 | USER epoch 변경 뒤 지연C0, 이전p/markerless/store실패/승인닫힘 4열 → key 먼저 sync, 이전p FE0·나머지 현재p 인계/후속FE1(:1403-1462) |"
+        },
+        {
+          "name": "P16_expiredHoldResumesDespiteAPendingEligibleReservation",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `P16_expiredHoldResumesDespiteAPendingEligibleReservation` — PremiumAccessKrxPermitTest.kt:1476 | 부품만; 전제1 | 입력 :1478 `h.grantedKrxVisible()`; 기대 :1526 `assertEquals(\"r은 이전 허가라 상태 변화 0(I8)\", before, h.full(grant))` |"
+        },
+        {
+          "name": "RO1_blockerHandedOverByApprovalClosure_reopenFiresOnce",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `RO1_blockerHandedOverByApprovalClosure_reopenFiresOnce` — PremiumAccessKrxPermitTest.kt:1537 | 부품만; 전제1 | 입력 :1539 `h.grantedKrxVisible()`; 기대 :1565 `assertEquals(\"FE는 그 하나뿐\", sent + 1, h.source.calls.size)` |"
+        },
+        {
+          "name": "RO2_approvalClosureFirstHandover_duplicatesChangeNothing",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `RO2_approvalClosureFirstHandover_duplicatesChangeNothing` — PremiumAccessKrxPermitTest.kt:1574 | 부품만; 전제1 | 입력 :1578 `h.grantedKrxVisible()`; 기대 :1609 `assertEquals(\"$label entitlements 송신 정확히 1\", sends0 + 1, h.source.calls.size)` |"
+        },
+        {
+          "name": "RO3_w3AndApprovalClosureOverlap_sendOnce",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `RO3_w3AndApprovalClosureOverlap_sendOnce` — PremiumAccessKrxPermitTest.kt:1619 | 부품만; 전제1 | 입력 :1623 `h.grantedKrxVisible()`; 기대 :1643 `assertEquals(\"$label n은 한 번\", 1, h.view().state.streak)` |"
+        },
+        {
+          "name": "RO3b_staleAndApprovalClosedBlockers_bothOrdersSendOnce",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `RO3b_staleAndApprovalClosedBlockers_bothOrdersSendOnce` — PremiumAccessKrxPermitTest.kt:1652 | 부품만; 전제1 | 입력 :1656 `h.grantedKrxVisible()`; 기대 :1690 `assertEquals(\"$label 그 true에서 허가\", p + 1, h.permit())` |"
+        },
+        {
+          "name": "RO3c_inFlightQueryCoversTheReopenObligation",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `RO3c_inFlightQueryCoversTheReopenObligation` — PremiumAccessKrxPermitTest.kt:1701 | 부품만; 전제1 | 입력 :1703 `h.grantedKrxVisible()`; 기대 :1732 `assertEquals(\"n은 한 번\", 1, h.view().state.streak)` |"
+        },
+        {
+          "name": "RO5_keyChangeAtReopen_clearsTheReopenObligation",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `RO5_keyChangeAtReopen_clearsTheReopenObligation` — PremiumAccessKrxPermitTest.kt:1742 | 부품만; 전제1 | 입력 :1744 `h.grantedKrxVisible()`; 기대 :1763 `assertEquals(\"C0: permit p+1\", p + 1, h.permit())` |"
+        },
+        {
+          "name": "RO4_earlierPermitCandidateWithApprovalClosureHandover",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `RO4_earlierPermitCandidateWithApprovalClosureHandover` — PremiumAccessKrxPermitTest.kt:1770 | 부품만; 전제1 | 입력 :1772 `h.grantedKrxVisible()`; 기대 :1798 `assertEquals(\"재개 FE의 true에서 허가\", p + 2, h.permit())` |"
+        },
+        {
+          "name": "N1b_earlierPermitMarkerAfterH2ThenT2_changesNothing",
+          "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+          "source_contract": "| `N1b_earlierPermitMarkerAfterH2ThenT2_changesNothing` — PremiumAccessKrxPermitTest.kt:1807 | ON 짝 필요(W07c·W08a/b·W15); 전제2 | 입력 :1809 `h.grantedKrxVisible()`; 기대 :1822 `assertEquals(\"앞 허가 표지는 상태를 바꾸지 않는다\", before, h.full(grant))` |"
+        },
+        {
+          "name": "N1_earlierPermitMarkerInOpenNext_changesNothing",
+          "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+          "source_contract": "| `N1_earlierPermitMarkerInOpenNext_changesNothing` — PremiumAccessKrxPermitTest.kt:1830 | ON 짝 필요(W07c·W08a/b·W15); 전제2 | 입력 :1832 `h.grantedKrxVisible()`; 기대 :1845 `assertEquals(\"앞 허가 표지는 상태를 바꾸지 않는다\", before, h.full(grant))` |"
+        },
+        {
+          "name": "N2_handedOverPermitMarkerDuringHold_changesNothing",
+          "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+          "source_contract": "| `N2_handedOverPermitMarkerDuringHold_changesNothing` — PremiumAccessKrxPermitTest.kt:1853 | ON 짝 필요(W07c·W08a/b·W15); 전제2 | 입력 :1855 `h.grantedKrxVisible()`; 기대 :1865 `assertEquals(\"HOLD 중 인계된 허가의 거절은 상태를 바꾸지 않는다\", before, h.full(grant))` |"
+        },
+        {
+          "name": "N3_ineligiblePendingReservations_doNotBlock",
+          "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+          "source_contract": "| `N3_ineligiblePendingReservations_doNotBlock` — PremiumAccessKrxPermitTest.kt:1873 | ON 짝 필요(W07c·W08a/b·W15); 전제2 | 입력 :1875 `h.grantedKrxVisible()`; 기대 :1900 `assertNull(\"withheld 없음\", h.view().withheld)` |"
+        },
+        {
+          "name": "N3b_premiumMixedReservation_followsTheHeadPremiumPath",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `N3b_premiumMixedReservation_followsTheHeadPremiumPath` — PremiumAccessKrxPermitTest.kt:1911 | 부품만; 전제1 | 입력 :1912 `val results = listOf(on(), krxHarness(processJob, HEAD_FACTORY)).map { h ->`; 기대 :1940 `assertEquals(\"CAP-R09 (iv): 섞인 예약의 처리는 HEAD premium 경로와 같다(상태·userInvalidations·요구·송신)\", results[1], results[0])` |"
+        },
+        {
+          "name": "N4_noneIssuesThePermitDespiteAPendingEligibleReservation",
+          "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+          "source_contract": "| `N4_noneIssuesThePermitDespiteAPendingEligibleReservation` — PremiumAccessKrxPermitTest.kt:1947 | ON 짝 필요(W07c·W08a/b·W15); 전제2 | NONE·더 늦은 적격 예약 대기·stable true → 허가p+1·새 subscribe 의무 |"
+        },
+        {
+          "name": "N4b_nonePendingTrueIssuesThePermitDespiteAPendingEligibleReservation",
+          "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+          "source_contract": "| `N4b_nonePendingTrueIssuesThePermitDespiteAPendingEligibleReservation` — PremiumAccessKrxPermitTest.kt:1950 | ON 짝 필요(W07c·W08a/b·W15); 전제2 | NONE의 Pending(true) → T4 허가p+1; AWAITING의 W1과 구별 |"
+        },
+        {
+          "name": "N5_handedOverPermitDuplicatePending_doesNotBlock",
+          "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+          "source_contract": "| `N5_handedOverPermitDuplicatePending_doesNotBlock` — PremiumAccessKrxPermitTest.kt:1985 | ON 짝 필요(W07c·W08a/b·W15); 전제2 | 인계한p 중복 대기 → T2를 막지 않음·추가FE0 |"
+        },
+        {
+          "name": "N5b_handedOverPermitDuplicateAbandoned_changesNothing",
+          "classification": "ON 짝 필요(W07c·W08a/b·W15); 전제2",
+          "source_contract": "| `N5b_handedOverPermitDuplicateAbandoned_changesNothing` — PremiumAccessKrxPermitTest.kt:1988 | ON 짝 필요(W07c·W08a/b·W15); 전제2 | 인계한p 중복 abandon → 동일 T2/FE/withheld 유지 |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/PremiumAccessLossCandidateTest.kt",
+      "methods": [
+        {
+          "name": "aHeldRefusalWhoseGrantWasReplaced_isDiscardedEvenWhileTheRecordStaysUnreadable",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `aHeldRefusalWhoseGrantWasReplaced_isDiscardedEvenWhileTheRecordStaysUnreadable` — PremiumAccessLossCandidateTest.kt:431 | OFF 유지; 전제1 | 입력 :436 `h.coordinator.onTopicRejected(grant, KRX_REFUSAL)`; 기대 :450 `assertEquals(\"the refusal of a replaced grant stayed held for want of a read\", 0, h.coordinator.heldLossCandidateCount())` |"
+        },
+        {
+          "name": "eachCandidateIsCheckedAgainstARecordReadForIt_notOneAnEarlierCandidateAlreadyRotated",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `eachCandidateIsCheckedAgainstARecordReadForIt_notOneAnEarlierCandidateAlreadyRotated` — PremiumAccessLossCandidateTest.kt:453 | OFF 유지; 전제1 | 입력 :464 `h.coordinator.onTopicRejected(grant, KRX_REFUSAL)`; 기대 :482 `assertEquals(0, h.coordinator.heldLossCandidateCount())` |"
+        },
+        {
+          "name": "aRefusalWhoseLiveSessionIsKnownToBeSomeoneElse_isDiscardedWithoutAHold",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `aRefusalWhoseLiveSessionIsKnownToBeSomeoneElse_isDiscardedWithoutAHold` — PremiumAccessLossCandidateTest.kt:686 | OFF 유지; 전제1 | 입력 :692 `h.coordinator.onTopicRejected(grant, KRX_REFUSAL)`; 기대 :694 `assertEquals(KrxCapabilityState.VISIBLE, h.coordinator.krx.value)` |"
+        },
+        {
+          "name": "theScopeCancelledWhileRecoveryPublishesARefusal_stillLeavesItsRecheckOwed",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `theScopeCancelledWhileRecoveryPublishesARefusal_stillLeavesItsRecheckOwed` — PremiumAccessLossCandidateTest.kt:738 | OFF 유지; 전제1 | 입력 :745 `h.coordinator.onTopicRejected(grant, KRX_REFUSAL)`; 기대 :755 `assertEquals( \"the refusal's re-check was lost with the cancellation\", RefreshIntent.FORCE_ENTITLEMENTS, h.coordinator.recheckDiagnostics().owedIntent )` |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/PremiumAccessRecheckDemandTest.kt",
+      "methods": [
+        {
+          "name": "aKrxRequiredAnswer_doesNotLetAWeakerAnswerCancelThePremiumDemand",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `aKrxRequiredAnswer_doesNotLetAWeakerAnswerCancelThePremiumDemand` — PremiumAccessRecheckDemandTest.kt:551 | OFF 유지; 전제1 | 입력 :559 `h.source.next = { EntitlementsOutcome.KrxEntitlementRequired }`; 기대 :568 `assertEquals(\"the weaker answer did not cancel the owed FP\", fresh + 1, h.freshFetches())` |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/PremiumAccessReducerTest.kt",
+      "methods": [
+        {
+          "name": "krxEntitlementRequired_hidesCapability_withoutRejectingPremium",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `krxEntitlementRequired_hidesCapability_withoutRejectingPremium` — PremiumAccessReducerTest.kt:426 | 부품만; 전제1 | 입력 :434 `EntitlementsOutcome.KrxEntitlementRequired`; 기대 :442 `assertEquals(RefreshIntent.FORCE_ENTITLEMENTS, decision.recheck?.intent)` |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/TopicGrantDelivererTest.kt",
+      "methods": [
+        {
+          "name": "refusals_reachTheIssuerInOrder_pastOneThatFails",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `refusals_reachTheIssuerInOrder_pastOneThatFails` — TopicGrantDelivererTest.kt:432 | 부품만; 전제1 | 입력 :442 `s.deliverer.forwardRejection(f2, mapOf(\"fx:usd-krw\" to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED))`; 기대 :451 `assertEquals( listOf( TopicGrantToken(1L) to listOf(TopicRejectionReason.PREMIUM_REQUIRED), TopicGrantToken(3L) to listOf(TopicRejectionReason.TOPICS_DISABLED) ),` |"
+        },
+        {
+          "name": "aBufferedRefusal_isNotHandedOver_afterTheScopeEnds",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `aBufferedRefusal_isNotHandedOver_afterTheScopeEnds` — TopicGrantDelivererTest.kt:565 | 부품만; 전제1 | 입력 :571 `s.deliverer.forwardRejection(f2, mapOf(\"fx:usd-krw\" to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED))`; 기대 :575 `assertEquals(emptyList<Long>(), s.issuer.ledger.view(f1.grant).pendingOrders)` |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/TopicGrantIssuerMarkerTest.kt",
+      "methods": [
+        {
+          "name": "r06_1_realIssuerThreeArgument_keepsTheMarker_onAndOff",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `r06_1_realIssuerThreeArgument_keepsTheMarker_onAndOff` — TopicGrantIssuerMarkerTest.kt:161 | 부품만; 전제1 | 입력 :162 `h.grantedKrxVisible()`; 기대 :185 `assertEquals(\"06-1: 꺼짐 실제 issuer 3인자의 예약 marker = m\", offMarker, offReservation.marker)` |"
+        },
+        {
+          "name": "r06_2_delivererMarkerOverload_reachesTheIssuersThreeArgumentForm",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `r06_2_delivererMarkerOverload_reachesTheIssuersThreeArgumentForm` — TopicGrantIssuerMarkerTest.kt:199 | 부품만; 전제1 | 입력 :203 `val h = krxHarness(processJob, HEAD_FACTORY)`; 기대 :219 `assertEquals(\"06-2: 그 예약의 marker = m\", m, issuer.threeArg.single().second.marker)` |"
+        },
+        {
+          "name": "r06_3_stoppedDeliverer_markerOverload_abandonsSynchronously",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `r06_3_stoppedDeliverer_markerOverload_abandonsSynchronously` — TopicGrantIssuerMarkerTest.kt:233 | 부품만; 전제1 | 입력 :236 `val h = krxHarness(processJob, HEAD_FACTORY)`; 기대 :267 `assertEquals(\"06-3: PAC scope 자식 수 그대로(디스패치 뒤)\", baseline, childrenAfterDispatch)` |"
+        },
+        {
+          "name": "r06_4_twoArgumentOnlyFake_threeArgumentCallFallsBack",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `r06_4_twoArgumentOnlyFake_threeArgumentCallFallsBack` — TopicGrantIssuerMarkerTest.kt:279 | 부품만; 전제1 | 입력 :281 `val reservation = fake.reserveRejection(TopicGrantToken(7L), KrxHarnessDefaults.KRX_REFUSAL, KrxSendMarker(\"K1\", 1L))`; 기대 :284 `assertNull(\"06-4: 2인자 가짜의 예약 marker는 null(기본 구현이 표지를 버린다)\", reservation.marker)` |"
+        },
+        {
+          "name": "r06_5_byDelegationWrapper_forwardsTheThreeArgumentCall_andKeepsTheMarker",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `r06_5_byDelegationWrapper_forwardsTheThreeArgumentCall_andKeepsTheMarker` — TopicGrantIssuerMarkerTest.kt:295 | 부품만; 전제1 | 입력 :296 `h.grantedKrxVisible()`; 기대 :306 `assertEquals(\"06-5: inner(실제 issuer)의 3인자로 가 표지가 보존된다\", m, reservation.marker)` |"
+        },
+        {
+          "name": "r06_6_onHandoverJudgement_followsTheCarriedMarker",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `r06_6_onHandoverJudgement_followsTheCarriedMarker` — TopicGrantIssuerMarkerTest.kt:358 | 부품만; 전제1 | 기대 :387 `assertEquals(\"06-6 ${run.label}: 인계 — rejectedPermit = p\", run.p, run.rejectedAfter)` |"
+        },
+        {
+          "name": "r06_7_twoArgumentDelivererPath_makesAMarkerlessReservation_judgedAsBefore",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `r06_7_twoArgumentDelivererPath_makesAMarkerlessReservation_judgedAsBefore` — TopicGrantIssuerMarkerTest.kt:402 | 부품만; 전제1 | 입력 :403 `h.grantedKrxVisible()`; 기대 :443 `assertEquals(\"06-7 (i): 그 FE의 true(T2)에서 허가 p + 1\", p + 1, h.view(\"06-7\").state.permitSeq)` |"
+        },
+        {
+          "name": "r06_O1_offPac_markerAndMarkerlessDeliveries_traceTheSame",
+          "classification": "OFF 유지; 전제2",
+          "source_contract": "| `r06_O1_offPac_markerAndMarkerlessDeliveries_traceTheSame` — TopicGrantIssuerMarkerTest.kt:518 | OFF 유지; 전제2 | 기대 :542 `assertEquals(\"06-O1: 발행 열이 같다\", plain.published, marked.published)` |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/TopicRejectionLedgerTest.kt",
+      "methods": [
+        {
+          "name": "nothingIsOwed_withoutAPremiumRefusalTakenOverOrOnItsWay",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `nothingIsOwed_withoutAPremiumRefusalTakenOverOrOnItsWay` — TopicRejectionLedgerTest.kt:113 | 부품만; 전제1 | 기대 :132 `assertEquals(0, tokens.asked)` |"
+        },
+        {
+          "name": "aPremiumRefusalStillOnItsWay_isOwedButBlocks_untilItEnds",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `aPremiumRefusalStillOnItsWay_isOwedButBlocks_untilItEnds` — TopicRejectionLedgerTest.kt:135 | 부품만; 전제1 | 기대 :151 `assertEquals(mixed.order, (attempt as TopicReapprovalAttempt.Issued).issue.refusalOrder)` |"
+        },
+        {
+          "name": "anOwedReapproval_isIssuedOnce_withTheOrdersItConsumed_andMovesTheSummary",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `anOwedReapproval_isIssuedOnce_withTheOrdersItConsumed_andMovesTheSummary` — TopicRejectionLedgerTest.kt:154 | 부품만; 전제1 | 기대 :187 `assertEquals(2, tokens.asked)` |"
+        },
+        {
+          "name": "aQuery_mustHaveStartedAfterEveryAccessRefusalReported_andNoneMayBeOnItsWay",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `aQuery_mustHaveStartedAfterEveryAccessRefusalReported_andNoneMayBeOnItsWay` — TopicRejectionLedgerTest.kt:190 | 부품만; 전제1 | 기대 :209 `assertTrue(\"끝난 거부 뒤의 같은 조회가 회전하지 않았다\", l.rotateForTopicReapproval(g1, query(after), tokens::take) is TopicReapprovalAttempt.Issued)` |"
+        },
+        {
+          "name": "aRotation_waitsForAReservationThatHasItsOrderButIsNotYetVisible",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `aRotation_waitsForAReservationThatHasItsOrderButIsNotYetVisible` — TopicRejectionLedgerTest.kt:227 | 부품만; 전제1 | 기대 :254 `assertEquals(TopicReapprovalAttempt.Blocked, seen)` |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/control/ControlObligationsTest.kt",
+      "methods": [
+        {
+          "name": "hold has five reachable outcomes and exact axes",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `hold has five reachable outcomes and exact axes` — ControlObligationsTest.kt:239 | 부품만; 전제1 | KRX 원시JSON은 CAPABILITY만 허용, 빈축/USER 단독축은 Uninterpretable; 다른 4 outcome 축도 대조(:239-257) |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/control/DemandAuthBacklogContract14Test.kt",
+      "methods": [
+        {
+          "name": "Q09_strict",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `Q09_strict` — DemandAuthBacklogContract14Test.kt:45 | 부품만; 전제1 | KRX 결과+FORCE_PREMIUM+NOT_REQUIRED → 소비=false; 다른 적격 조건은 모두true(:37-46) |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/control/DemandAuthBacklogContract16Test.kt",
+      "methods": [
+        {
+          "name": "S_consumes_krxSettle",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `S_consumes_krxSettle` — DemandAuthBacklogContract16Test.kt:23 | 부품만; 전제1 | 입력 :25 `val d = F.decision(outcome = EntitlementsOutcome.KrxEntitlementRequired)`; 기대 :34 `assertNull(F.atomic(\"S.consumes.krxSettle\"), F.transition.eligibility(p, F.runtime(), F.read(source)))` |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/control/DemandAuthBacklogContract36Test.kt",
+      "methods": [
+        {
+          "name": "Q09",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `Q09` — DemandAuthBacklogContract36Test.kt:66 | 부품만; 전제1 | 정상 stable true 양성 대비 KRX 결과+FORCE_PREMIUM → settles만false·consumes=false(:53-66) |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/control/DemandAuthBacklogContract37Test.kt",
+      "methods": [
+        {
+          "name": "Q09_settle",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `Q09_settle` — DemandAuthBacklogContract37Test.kt:61 | 부품만; 전제1 | 정상 writer는 Confirm, KRX 결과로 FP request 제거 요구 시 remove[r].settles=false·Confirm 아님(:55-61) |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/control/DemandAuthBacklogContractTest.kt",
+      "methods": [
+        {
+          "name": "F_policy_krxIntent",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `F_policy_krxIntent` — DemandAuthBacklogContractTest.kt:371 | 부품만; 전제1 | 입력 :374 `DemandAuthBoundary.retryIntent(weak(EntitlementsOutcome.KrxEntitlementRequired)))`; 기대 :371 `@Test fun F_policy_krxIntent() = assertEquals( F.atomic(\"F.policy.krxIntent\"), RefreshIntent.FORCE_ENTITLEMENTS, DemandAuthBoundary.retryIntent(weak(EntitlementsOutcome.KrxEntitlementRequired)))` |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/control/DemandAuthBoundaryTest.kt",
+      "methods": [
+        {
+          "name": "Q09",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `Q09` — DemandAuthBoundaryTest.kt:85 | 부품만; 전제1 | KRX 결과+FORCE_PREMIUM+NOT_REQUIRED → DemandAuthBoundary.consumes=false(:85); 세션 permit 소비가 아닌 demand 정산 적격성 |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/control/DemandAuthTruthVector.kt",
+      "methods": []
+    },
+    {
+      "file": "data/entitlements/control/HoldRecoveryContractTest.kt",
+      "methods": [
+        {
+          "name": "H01_topicSubjectIsContextAccess",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `H01_topicSubjectIsContextAccess` — HoldRecoveryContractTest.kt:105 | 부품만; 전제1 | 입력 :106 `val node = topicHold(\"A\", \"u0\", \"k0\", bothAxes = true)`; 기대 :111 `assertEquals(eligible(\"H01_topic\"), setOf(USER, CAPABILITY), s.axes)` |"
+        },
+        {
+          "name": "H07f_topicCapabilityUsesAxisRuleOnly",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `H07f_topicCapabilityUsesAxisRuleOnly` — HoldRecoveryContractTest.kt:165 | 부품만; 전제1 | 입력 :166 `val hold = restored(topicHold(\"A\", \"u0\", \"k0\", bothAxes = false))`; 기대 :170 `assertTrue(atomic(\"H07f_positive\"), HoldRecoveryBoundary.intentSatisfies(hold, FORCE_ENTITLEMENTS))` |"
+        },
+        {
+          "name": "topicUserAxisNeedsForcePremium",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `topicUserAxisNeedsForcePremium` — HoldRecoveryContractTest.kt:173 | 부품만; 전제1 | 입력 :174 `val hold = restored(topicHold(\"A\", \"u0\", \"k0\", bothAxes = true))`; 기대 :177 `assertFalse(atomic(\"H07_topicUser\"), HoldRecoveryBoundary.intentSatisfies(hold, FORCE_ENTITLEMENTS))` |"
+        },
+        {
+          "name": "topicSourceUsesTheSameTable",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `topicSourceUsesTheSameTable` — HoldRecoveryContractTest.kt:298 | 부품만; 전제1 | TOPIC·CAPABILITY 원래 k0, 현재 k0 → freshKrx 회전·k0 journal·현재owner request 필수 |"
+        }
+      ]
+    },
+    {
+      "file": "data/entitlements/control/HoldRecoveryFixtures.kt",
+      "methods": []
+    },
+    {
+      "file": "data/remote/TopicSessionCoordinatorTest.kt",
+      "methods": [
+        {
+          "name": "a premium refusal past its lease is still settled as a refusal",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `a premium refusal past its lease is still settled as a refusal` — TopicSessionCoordinatorTest.kt:5164 | OFF 유지; 전제1 | 입력 :5170 `USD to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED`; 기대 :5223 `assertEquals(\"거절받은 grant 로 다시 연결했다\", 1, h.wires.size)` |"
+        },
+        {
+          "name": "a mixed acknowledgement under a withheld use hands its refusal over and applies nothing",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `a mixed acknowledgement under a withheld use hands its refusal over and applies nothing` — TopicSessionCoordinatorTest.kt:6390 | OFF 유지; 전제1 | 기대 :6415 `assertEquals(\"KRX 거부가 grant 를 잠갔다\", 2, h.wires.size)` |"
+        },
+        {
+          "name": "a recovered first delivery excludes a refusal retained from the previous connection",
+          "classification": "OFF 유지; 전제1",
+          "source_contract": "| `a recovered first delivery excludes a refusal retained from the previous connection` — TopicSessionCoordinatorTest.kt:9242 | OFF 유지; 전제1 | 입력 :9268 `TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED,`; 기대 :9275 `assertEquals(listOf(TETHER), h.requests.last().topics)` |"
+        }
+      ]
+    },
+    {
+      "file": "data/remote/TopicSessionKrxRestMarkerTest.kt",
+      "methods": [
+        {
+          "name": "r05_8_restUnknownTopic_handsTheIssueMarkerOver_whateverTheList",
+          "classification": "ON 짝 필요(W01e·R11·K02); 전제1",
+          "source_contract": "| `r05_8_restUnknownTopic_handsTheIssueMarkerOver_whateverTheList` — TopicSessionKrxRestMarkerTest.kt:343 | ON 짝 필요(W01e·R11·K02); 전제1 | OPEN issue→Unsupported([]/[KRX,USD]) → issue marker 인계1·FE1·비KRX 유지(restUnknownTopic :350-388) |"
+        },
+        {
+          "name": "r05_9_restIiPrime_aPermitBetweenIssueAndExchange_isJudgedAsTheIssuePermit",
+          "classification": "명시 개정(α 소유)(W01e·R11·K02); 전제2",
+          "source_contract": "| `r05_9_restIiPrime_aPermitBetweenIssueAndExchange_isJudgedAsTheIssuePermit` — TopicSessionKrxRestMarkerTest.kt:392 | 명시 개정(α 소유)(W01e·R11·K02); 전제2 | 입력 :393 `h.grantedKrxVisible()`; 기대 :427 `assertEquals(\"$row: krx stays VISIBLE\", KrxCapabilityState.VISIBLE, h.coordinator.krx.value)` |"
+        },
+        {
+          "name": "r05_10_onPermitZero_restUnknownTopic_reservesNothing",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_10_onPermitZero_restUnknownTopic_reservesNothing` — TopicSessionKrxRestMarkerTest.kt:436 | OFF 유지; 전제3 | 기대 :464 `assertEquals(\"$row: the ledger sequence was not consumed\", probe + 1, h.parts.orders.next())` |"
+        },
+        {
+          "name": "r05_12_restIi_aPermitAfterTheExchange_isJudgedAsTheIssuePermit",
+          "classification": "명시 개정(α 소유)(W01e·R11·K02); 전제2",
+          "source_contract": "| `r05_12_restIi_aPermitAfterTheExchange_isJudgedAsTheIssuePermit` — TopicSessionKrxRestMarkerTest.kt:471 | 명시 개정(α 소유)(W01e·R11·K02); 전제2 | 기대 :498 `assertEquals(\"$row: FE 0\", fetches, h.source.calls.size)` |"
+        },
+        {
+          "name": "r05_13_restVPrime_aC1RotationBetweenIssueAndExchange_isDroppedByTheEpochGuard",
+          "classification": "명시 개정(α 소유)(W01e·R11·K02); 전제2",
+          "source_contract": "| `r05_13_restVPrime_aC1RotationBetweenIssueAndExchange_isDroppedByTheEpochGuard` — TopicSessionKrxRestMarkerTest.kt:507 | 명시 개정(α 소유)(W01e·R11·K02); 전제2 | 기대 :535 `assertEquals(\"$row: no permit is handed over\", 0L, h.view(row).rejectedPermit)` |"
+        },
+        {
+          "name": "r05_14_restIii_aPermitDuringThePacingWait_isReadAtTheIssue",
+          "classification": "ON 짝 필요(W01e·R11·K02); 전제1",
+          "source_contract": "| `r05_14_restIii_aPermitDuringThePacingWait_isReadAtTheIssue` — TopicSessionKrxRestMarkerTest.kt:546 | ON 짝 필요(W01e·R11·K02); 전제1 | 4초 pacing 동안 p1→H1′→p2 OPEN, KRX issue는 (e,p2) 단일 판독·인계1(:546-571) |"
+        },
+        {
+          "name": "r05_15_restIii401_oneMarkerPerIssue_aReRequestReadsAnew",
+          "classification": "명시 개정(α 소유)(W01e·R11·K02); 전제2",
+          "source_contract": "| `r05_15_restIii401_oneMarkerPerIssue_aReRequestReadsAnew` — TopicSessionKrxRestMarkerTest.kt:579 | 명시 개정(α 소유)(W01e·R11·K02); 전제2 | 기대 :625 `assertEquals( \"$row: the ledger carries one marker per issue\", listOf<KrxSendMarker?>(issued, reissued), s.issuer.threeArgument.map { it.reservation.marker } )` |"
+        },
+        {
+          "name": "r05_16_restI_oneReadPerIssue_markerAndLifetimeFromThatRead",
+          "classification": "명시 개정(α 소유); 전제2",
+          "source_contract": "logical payload ISSUE와 REST_RECHECK를 stack으로 분리; B 일관성·두 번째 A/B lifetime·원 marker 보존; epoch/capInv 별도 transport 거절 및 unchanged HTTP1 양성; W01e/R11/K02; impl r2 TSC:827-940,3317-3363",
+          "classification_before_alpha2": "ON 짝 필요(W01e·R11·K02); 전제1",
+          "source_contract_before_alpha2": "| `r05_16_restI_oneReadPerIssue_markerAndLifetimeFromThatRead` — TopicSessionKrxRestMarkerTest.kt:646 | ON 짝 필요(W01e·R11·K02); 전제1 | 기대 :725 `assertEquals(\"$row: the second answer's lifetime is that read's\", second.acquireUse(fence), answeredAgain.lifetime)` |",
+          "alpha2_old_new": {
+            "old": "전체 B 호출 수=issue수, 첫B 뒤 불일치 snapshot으로 GENERAL A만 확인",
+            "new": "logical payload ISSUE와 REST_RECHECK를 stack으로 분리; B 일관성·두 번째 A/B lifetime·원 marker 보존; epoch/capInv 별도 transport 거절 및 unchanged HTTP1 양성"
+          }
+        },
+        {
+          "name": "harnessSelfCheck_anAcknowledgementTimeBRead_isUnattributed_andLeavesTheKrxIssueReads",
+          "classification": "명시 개정(α 소유); 전제2",
+          "source_contract": "첫 reachedWire&&carriesKrx T와 바로 앞 P를 연결; ACK-time B는 UNATTRIBUTED/unclaimed, KRX payload수는 plain과 동일; S-3; seam r2:159; ACK-time false kill 방지",
+          "classification_before_alpha2": "부품만; 전제4",
+          "source_contract_before_alpha2": "| `harnessSelfCheck_anAcknowledgementTimeBRead_isUnattributed_andLeavesTheKrxIssueReads` — TopicSessionKrxRestMarkerTest.kt:745 | 부품만; 전제4 | 입력 :748 `onRig(gap = 4.seconds) { _, s ->`; 기대 :801 `assertEquals( \"$label: the extra reads do not change the KRX issue's reads (same number as the plain run)\", plain, krx.readerSnapshotsAtIssue.size )` |",
+          "alpha2_old_new": {
+            "old": "attempts.first()를 physical subscribe로 간주",
+            "new": "첫 reachedWire&&carriesKrx T와 바로 앞 P를 연결; ACK-time B는 UNATTRIBUTED/unclaimed, KRX payload수는 plain과 동일"
+          }
+        },
+        {
+          "name": "r05_17_onPermitZero_issueThenFirstPermit_reservesNothing",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_17_onPermitZero_issueThenFirstPermit_reservesNothing` — TopicSessionKrxRestMarkerTest.kt:837 | OFF 유지; 전제3 | 기대 :865 `assertEquals(\"$row: FE 0\", fetches, h.source.calls.size)` |"
+        },
+        {
+          "name": "r05_18_noMarkerChannel_restSendsNoStandIn_wsKeepsTheHeadPath",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_18_noMarkerChannel_restSendsNoStandIn_wsKeepsTheHeadPath` — TopicSessionKrxRestMarkerTest.kt:873 | OFF 유지; 전제3 | 기대 :903 `assertEquals(\"$row: no marker channel call exists\", 0, s.markerRejections.size)` |"
+        },
+        {
+          "name": "r05_19_nullEpochMarker_isCarriedNonNull",
+          "classification": "명시 개정(α 소유)(W01e·R11·K02); 전제2",
+          "source_contract": "| `r05_19_nullEpochMarker_isCarriedNonNull` — TopicSessionKrxRestMarkerTest.kt:912 | 명시 개정(α 소유)(W01e·R11·K02); 전제2 | 기대 :941 `assertEquals(\"$row: the ledger reservation carries it\", marker, s.issuer.threeArgument.singleOrNull()?.reservation?.marker)` |"
+        },
+        {
+          "name": "r05_20_useWithdrawnBeforeTheAnswer_stillHandsOver",
+          "classification": "ON 짝 필요(W01e·R11·K02); 전제1",
+          "source_contract": "| `r05_20_useWithdrawnBeforeTheAnswer_stillHandsOver` — TopicSessionKrxRestMarkerTest.kt:949 | ON 짝 필요(W01e·R11·K02); 전제1 | 기대 :984 `assertEquals( \"$row: the forwarded marker's (epoch, permit) are those of the snapshot B returned at the issue (same read)\", read.marker(), s.markerRejections.single().marker )` |"
+        },
+        {
+          "name": "r05_21_headFilters_comeBeforeTheHandOver",
+          "classification": "명시 개정(α 소유); 전제2",
+          "source_contract": "cancel-first는 실제 job/예외 취소 후 exchange/result/handover0; produced-first는 실제 old BootstrapAnswered 보류 후 전환·HEAD filter0; no-latch 양성; W01e/K02; impl r2 TSC:1738-1781",
+          "classification_before_alpha2": "ON 짝 필요(W01e·R11·K02); 전제1",
+          "source_contract_before_alpha2": "| `r05_21_headFilters_comeBeforeTheHandOver` — TopicSessionKrxRestMarkerTest.kt:997 | ON 짝 필요(W01e·R11·K02); 전제1 | 정상/no-latch 양성 인계1 대비 latch·grantEpoch 변경 열은 인계/예약0(:997-1090) |",
+          "alpha2_old_new": {
+            "old": "latch/grant epoch 뒤 held old HTTP가 승인·생산",
+            "new": "cancel-first는 실제 job/예외 취소 후 exchange/result/handover0; produced-first는 실제 old BootstrapAnswered 보류 후 전환·HEAD filter0; no-latch 양성"
+          }
+        },
+        {
+          "name": "r05_22_nonKrxUnsupported_readsNoMarker_handsNothingOver",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_22_nonKrxUnsupported_readsNoMarker_handsNothingOver` — TopicSessionKrxRestMarkerTest.kt:1092 | OFF 유지; 전제3 | 기대 :1118 `assertEquals(\"$row: no reservation\", reservedBefore, s.issuer.reserved.size)` |"
+        },
+        {
+          "name": "r05_23_restUnderHold_issuesKrx_andTheNextIssueGoesOn",
+          "classification": "명시 개정(α 소유)(W01e·R11·K02); 전제2",
+          "source_contract": "| `r05_23_restUnderHold_issuesKrx_andTheNextIssueGoesOn` — TopicSessionKrxRestMarkerTest.kt:1130 | 명시 개정(α 소유)(W01e·R11·K02); 전제2 | 입력 :1142 `h.rejectKrx(h.issueGrant())`; 기대 :1182 `assertEquals( \"$row: the forwarded marker's (epoch, permit) are those of the snapshot B returned at the HOLD issue (same read)\", read.marker(), s.markerRejections.single().marker )` |"
+        },
+        {
+          "name": "r05_24_rest_publicConstructor_aKrxIssueKeepsTheHeadPath",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_24_rest_publicConstructor_aKrxIssueKeepsTheHeadPath` — TopicSessionKrxRestMarkerTest.kt:1214 | OFF 유지; 전제3 | 공개 constructor·reader/channel 없음 → 기존 issue·GENERAL lifetime·public WS 운반 |"
+        },
+        {
+          "name": "r05_25_rest_readerNull_channelPresent_unsupportedIsNotHandedOver",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_25_rest_readerNull_channelPresent_unsupportedIsNotHandedOver` — TopicSessionKrxRestMarkerTest.kt:1236 | OFF 유지; 전제3 | reader 없음/channel 있음 → HEAD issue·undelivered callback 유지·marker handover0 |"
+        },
+        {
+          "name": "r05_25_rest_readerNull_channelAbsent_unsupportedIsNotHandedOver",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_25_rest_readerNull_channelAbsent_unsupportedIsNotHandedOver` — TopicSessionKrxRestMarkerTest.kt:1241 | OFF 유지; 전제3 | reader/channel 없음 → HEAD issue·undelivered callback 유지·stand-in 거절0 |"
+        },
+        {
+          "name": "r05_O2_restOff_reservesNothing_keepsTheHeadCallback",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_O2_restOff_reservesNothing_keepsTheHeadCallback` — TopicSessionKrxRestMarkerTest.kt:1372 | OFF 유지; 전제3 | 기대 :1419 `assertEquals( \"$row: the supplied snapshot's epoch/permit equal the expected (e, 0)\", KrxSendMarker(krx.snapshotAtCall.facts.recordFence?.krxCapabilityEpoch, 0L), bReadsAtIssue.single().marker() )` |"
+        }
+      ]
+    },
+    {
+      "file": "data/remote/TopicSessionKrxSendMarkerTest.kt",
+      "methods": [
+        {
+          "name": "r05_1_wsMarker_isCarriedFromTheSendRead_toTheLedger",
+          "classification": "명시 개정(α 소유); 전제2",
+          "source_contract": "물리 송신 T와 바로 앞 미송신 P를 같은 CMD stack tail로 짝지음; P의 SEND payload1·T의 payload0, marker는 P의 (epoch,permit); seam r2:159; R11/W01a/K01; ACK-time 읽기로 대체 금지",
+          "classification_before_alpha2": "ON 짝 필요(W01a·W08·R11·K01); 전제1",
+          "source_contract_before_alpha2": "| `r05_1_wsMarker_isCarriedFromTheSendRead_toTheLedger` — TopicSessionKrxSendMarkerTest.kt:249 | ON 짝 필요(W01a·W08·R11·K01); 전제1 | 입력 :265 `mapOf(KRX to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED), s.acknowledgements.single().rejected`; 기대 :283 `assertEquals(\"05-1: the send permit is handed over\", sent.permitSeq, view.rejectedPermit)` |",
+          "alpha2_old_new": {
+            "old": "최종 encode attempt의 send에서 B payload1을 요구",
+            "new": "물리 송신 T와 바로 앞 미송신 P를 같은 CMD stack tail로 짝지음; P의 SEND payload1·T의 payload0, marker는 P의 (epoch,permit)"
+          }
+        },
+        {
+          "name": "r05_2_capR11ii_aNewPermitBeforeTheAck_isJudgedAsThePreviousPermit",
+          "classification": "명시 개정(α 소유); 전제2",
+          "source_contract": "reachedWire 목록으로 ACK 이전 pending1·원 marker 판정, ACK 뒤 최신p2 후속1·추가FE0; seam r2:159; CAP-R11(ii), consumedPermit",
+          "classification_before_alpha2": "ON 짝 필요(W01a·W08·R11·K01); 전제1",
+          "source_contract_before_alpha2": "| `r05_2_capR11ii_aNewPermitBeforeTheAck_isJudgedAsThePreviousPermit` — TopicSessionKrxSendMarkerTest.kt:292 | ON 짝 필요(W01a·W08·R11·K01); 전제1 | 입력 :301 `val other = h.coordinator.reserveRejection(grant, KrxHarnessDefaults.KRX_REFUSAL, KrxSendMarker(epoch, 1L))`; 기대 :326 `assertEquals(\"05-2: krx stays VISIBLE\", KrxCapabilityState.VISIBLE, h.coordinator.krx.value)` |",
+          "alpha2_old_new": {
+            "old": "encode 목록 전체를 물리 송신으로 세어 ACK 이전1을 요구",
+            "new": "reachedWire 목록으로 ACK 이전 pending1·원 marker 판정, ACK 뒤 최신p2 후속1·추가FE0"
+          }
+        },
+        {
+          "name": "r05_3_capR11v_aC1RotationBeforeTheAck_isDroppedByTheEpochGuard",
+          "classification": "ON 짝 필요(W01a·W08·R11·K01); 전제1",
+          "source_contract": "| `r05_3_capR11v_aC1RotationBeforeTheAck_isDroppedByTheEpochGuard` — TopicSessionKrxSendMarkerTest.kt:334 | ON 짝 필요(W01a·W08·R11·K01); 전제1 | 기대 :359 `assertEquals(\"05-3: no permit is handed over\", 0L, h.view(\"05-3\").rejectedPermit)` |"
+        },
+        {
+          "name": "r05_4_capR11iii_theSecondAttemptReadsAnew",
+          "classification": "명시 개정(α 소유); 전제2",
+          "source_contract": "두 열 모두 physical attempt별 새ID와 자신의 P payload, p1 재사용 거부; cooldown·refresh credential 보존; seam r2:159; CAP-R11(iii), RD-2/K-1st",
+          "classification_before_alpha2": "ON 짝 필요(W01a·W08·R11·K01); 전제1",
+          "source_contract_before_alpha2": "| `r05_4_capR11iii_theSecondAttemptReadsAnew` — TopicSessionKrxSendMarkerTest.kt:378 | ON 짝 필요(W01a·W08·R11·K01); 전제1 | send=false 재시도/401 replay 두 열 → 새 attempt의 p/epoch 표지, 첫 시도의 표지 재사용0 |",
+          "alpha2_old_new": {
+            "old": "probe encode 포함 횟수로 재시도/401 physical attempt를 셈",
+            "new": "두 열 모두 physical attempt별 새ID와 자신의 P payload, p1 재사용 거부; cooldown·refresh credential 보존"
+          }
+        },
+        {
+          "name": "r05_5_capR01_sameEpochWsAndRestRefusals_handOverOnce",
+          "classification": "명시 개정(α 소유); 전제2",
+          "source_contract": "이미 생산된 실제 Transport/BootstrapAnswered 입력을 보류해 양 순서×H1/H1prime에서 원 표지2·첫 FE1/streak+1; 별도 WS-first 취소 증인 후 REST 미생산/추가예약0; CAP-R01; W01e/K02; impl r2 TSC:865-936",
+          "classification_before_alpha2": "ON 짝 필요(W01a·W08·R11·K01); 전제1",
+          "source_contract_before_alpha2": "| `r05_5_capR01_sameEpochWsAndRestRefusals_handOverOnce` — TopicSessionKrxSendMarkerTest.kt:504 | ON 짝 필요(W01a·W08·R11·K01); 전제1 | WS/REST 두 순서 × H1/H1′ → 두 표지 예약·첫 인계만FE1·streak+1·GENERAL 보존(capR01 :513-590) |",
+          "alpha2_old_new": {
+            "old": "WS-first/REST-first 모두 held REST가 반드시 완료·인계",
+            "new": "이미 생산된 실제 Transport/BootstrapAnswered 입력을 보류해 양 순서×H1/H1prime에서 원 표지2·첫 FE1/streak+1; 별도 WS-first 취소 증인 후 REST 미생산/추가예약0"
+          }
+        },
+        {
+          "name": "r05_6_capR04_unavailableDisabledAndOtherAnswers_demandNothing",
+          "classification": "명시 개정(α 소유); 전제2",
+          "source_contract": "실제503 세 결과와 jitter0 backoff400/1200ms를 진행해 세 번째 terminal1 먼저 확인; contest/FE0 및 다른 outcome 구분 보존; B01~06; TopicBootstrapRetryPolicy:MAX_ATTEMPTS/BACKOFFS/classify",
+          "classification_before_alpha2": "ON 짝 필요(W01a·W08·R11·K01); 전제1",
+          "source_contract_before_alpha2": "| `r05_6_capR04_unavailableDisabledAndOtherAnswers_demandNothing` — TopicSessionKrxSendMarkerTest.kt:597 | ON 짝 필요(W01a·W08·R11·K01); 전제1 | 기대 :652 `assertEquals( \"$row (c): the WS reservation's marker (epoch, permit) are those of the snapshot B returned in the attempt's send (same read)\", read.marker(), reserved.reservation.marker )` |",
+          "alpha2_old_new": {
+            "old": "첫503이 즉시 terminal callback에 도달",
+            "new": "실제503 세 결과와 jitter0 backoff400/1200ms를 진행해 세 번째 terminal1 먼저 확인; contest/FE0 및 다른 outcome 구분 보존"
+          }
+        },
+        {
+          "name": "r05_7_capR05_holdAndKrxRefusalsKeepEverythingGeneral",
+          "classification": "명시 개정(α 소유)(W01a·W08·R11·K01); 전제2",
+          "source_contract": "| `r05_7_capR05_holdAndKrxRefusalsKeepEverythingGeneral` — TopicSessionKrxSendMarkerTest.kt:674 | 명시 개정(α 소유)(W01a·W08·R11·K01); 전제2 | HOLD/AWAITING 재연결에서 종전 KRX 포함 전제 → §4.1 명시 개정 |"
+        },
+        {
+          "name": "r05_11_onPermitZero_aSendBeforeTheFirstPermit_isNotHandedOver",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_11_onPermitZero_aSendBeforeTheFirstPermit_isNotHandedOver` — TopicSessionKrxSendMarkerTest.kt:847 | OFF 유지; 전제3 | 기대 :896 `assertEquals(\"$row: no entitlements query\", fetches, h.source.calls.size)` |"
+        },
+        {
+          "name": "r05_24_publicConstructor_aKrxAttemptKeepsTheHeadPath",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_24_publicConstructor_aKrxAttemptKeepsTheHeadPath` — TopicSessionKrxSendMarkerTest.kt:915 | OFF 유지; 전제3 | 입력 :938 `mapOf(KRX to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED), s.acknowledgements.single().rejected`; 기대 :949 `assertNull(\"$row: the ledger reservation carries no marker (the HEAD two-argument path)\", s.issuer.reserved.single().reservation.marker)` |"
+        },
+        {
+          "name": "r05_25_ws_readerNull_channelPresent_refusalGoesToTheChannelWithNullMarker",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_25_ws_readerNull_channelPresent_refusalGoesToTheChannelWithNullMarker` — TopicSessionKrxSendMarkerTest.kt:974 | OFF 유지; 전제3 | reader 없음/channel 있음 → 기존 send·channel(null marker)1·public callback0 |"
+        },
+        {
+          "name": "r05_25_ws_readerNull_channelAbsent_refusalKeepsThePublicForm",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_25_ws_readerNull_channelAbsent_refusalKeepsThePublicForm` — TopicSessionKrxSendMarkerTest.kt:980 | OFF 유지; 전제3 | reader/channel 없음 → 기존 send·2인자 callback1·null marker 예약 |"
+        },
+        {
+          "name": "r05_O1_wsOff_markerRunEqualsTheTwoArgumentRun",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_O1_wsOff_markerRunEqualsTheTwoArgumentRun` — TopicSessionKrxSendMarkerTest.kt:1094 | OFF 유지; 전제3 | 기대 :1114 `assertEquals(\"05-O1: the published snapshots are the same\", twoArgument.published, withChannel.published)` |"
+        },
+        {
+          "name": "r05_O3_operatingDesired_offAndOn_keepTheHeadPath",
+          "classification": "OFF 유지; 전제3",
+          "source_contract": "| `r05_O3_operatingDesired_offAndOn_keepTheHeadPath` — TopicSessionKrxSendMarkerTest.kt:1178 | OFF 유지; 전제3 | 입력 :1184 `onRig(desired = TopicCatalogue.DESIRED, markerChannel = true) { h, s -> wired = operating(label, h, s) }`; 기대 :1221 `assertEquals(\"$label: the public two-argument form is not called\", 0, a.publicCount)` |"
+        }
+      ]
+    },
+    {
+      "file": "data/remote/TopicSubscribeCommandTest.kt",
+      "methods": [
+        {
+          "name": "each application is asked with its own answer's refusals of the topics this request sent",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `each application is asked with its own answer's refusals of the topics this request sent` — TopicSubscribeCommandTest.kt:1645 | 부품만; 전제1 | 입력 :1662 `listOf(mapOf(USD to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED, eur to TopicRejectionReason.PREMIUM_REQUIRED)),`; 기대 :1674 `assertEquals( \"실패·갱신 결과의 적용 판정이 거부를 실었다\", listOf(emptyMap<String, TopicRejectionReason>(), emptyMap()), failure.admittedRejections )` |"
+        }
+      ]
+    },
+    {
+      "file": "domain/model/TopicSubscriptionStateTest.kt",
+      "methods": [
+        {
+          "name": "rejection retry triggers preserve canonical scope",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `rejection retry triggers preserve canonical scope` — TopicSubscriptionStateTest.kt:337 | 부품만; 전제1 | 입력 :344 `\"krx\" to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED`; 기대 :366 `assertEquals( setOf(TopicRetryTrigger.EntitlementChange), store.snapshot.rejectionRetryTriggers(\"krx\") )` |"
+        },
+        {
+          "name": "entitlement change opens only the matching authorization rejection",
+          "classification": "부품만; 전제1",
+          "source_contract": "| `entitlement change opens only the matching authorization rejection` — TopicSubscriptionStateTest.kt:372 | 부품만; 전제1 | 입력 :383 `krx to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED`; 기대 :396 `assertEquals( TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED, store.snapshot.stateFor(krx).rejection )` |"
+        }
+      ]
+    }
+  ],
+  "current_search_files": [
+    "KrxConsumerOffContrastTest.kt",
+    "KrxSessionWiringContractTest.kt",
+    "data/entitlements/KrxContestHarness.kt",
+    "data/entitlements/PremiumAccessCoordinatorTest.kt",
+    "data/entitlements/PremiumAccessKrxA1Test.kt",
+    "data/entitlements/PremiumAccessKrxDormantTraceTest.kt",
+    "data/entitlements/PremiumAccessKrxPermitTest.kt",
+    "data/entitlements/PremiumAccessLossCandidateTest.kt",
+    "data/entitlements/PremiumAccessRecheckDemandTest.kt",
+    "data/entitlements/PremiumAccessReducerTest.kt",
+    "data/entitlements/TopicGrantDelivererTest.kt",
+    "data/entitlements/TopicGrantIssuerMarkerTest.kt",
+    "data/entitlements/TopicRejectionLedgerTest.kt",
+    "data/entitlements/control/ControlObligationsTest.kt",
+    "data/entitlements/control/DemandAuthBacklogContract14Test.kt",
+    "data/entitlements/control/DemandAuthBacklogContract16Test.kt",
+    "data/entitlements/control/DemandAuthBacklogContract36Test.kt",
+    "data/entitlements/control/DemandAuthBacklogContract37Test.kt",
+    "data/entitlements/control/DemandAuthBacklogContractTest.kt",
+    "data/entitlements/control/DemandAuthBoundaryTest.kt",
+    "data/entitlements/control/DemandAuthTruthVector.kt",
+    "data/entitlements/control/HoldRecoveryContractTest.kt",
+    "data/entitlements/control/HoldRecoveryFixtures.kt",
+    "data/remote/A1aHeadTopicSessionCoordinator.kt",
+    "data/remote/KrxPermitPendingMatrix.kt",
+    "data/remote/TopicSessionCoordinatorTest.kt",
+    "data/remote/TopicSessionKrxPermitConsumptionTest.kt",
+    "data/remote/TopicSessionKrxRestMarkerTest.kt",
+    "data/remote/TopicSessionKrxSendMarkerTest.kt",
+    "data/remote/TopicSubscribeCommandTest.kt",
+    "domain/model/TopicSubscriptionStateTest.kt"
+  ],
+  "helper_closure": [
+    "| data/entitlements/KrxContestHarness.kt:33 KRX_REFUSAL | 부품만. KRX 단독 사유 상수; production caller 아님 |",
+    "| 같은 파일 :189 HEAD_FACTORY / :222 krxHarness | 부품만. default factory는 OFF. CHECKED_ON을 전역 default로 대체하지 않는다 |",
+    "| 같은 파일 :252 grantedKrxVisible / :262 issueGrant | 부품만. premium·visible 결정 후 standing grant 발급; 테스트 시간은 같은 scheduler |",
+    "| 같은 파일 :265 rejectKrx / :271 undecidedRejection | 부품만. 실제 PAC 직접 거절·live read 실패 H1′ 주입. WS send 성공·permit 소비를 증명하지 못한다 |",
+    "| 같은 파일 :341 closeApprovalOnTheSameKey / :349 reopenApproval | 부품만. 같은 key 승인 닫힘/재개. 세션이 key를 읽지 않고 PAC의 C0 시점을 보존하는 대조에 재사용 |",
+    "| KrxConsumerOffContrastTest.kt:509 a1Sequence / :551 observedSequence | OFF 유지. H1′→C1 false→true→false→true→H1 순서를 고정하여 다섯 소비자 메서드가 공유 |",
+    "| data/entitlements/PremiumAccessCoordinatorTest.kt:125 build / :1160 granted / :1995 refusalTest | 부품만. default PAC constructor·OFF. 기존 token 교체·RS 백오프의 기준. ON 짝은 별도 checked rig |",
+    "| data/entitlements/PremiumAccessLossCandidateTest.kt:140 build / :160 granted / :193 failTheDecisionRead | 부품만. OFF·store.load 실패/RETRY 시각으로 후보 결정/해제를 구별 |",
+    "| data/entitlements/PremiumAccessKrxA1Test.kt:40 on / :41 off / :44 round / :255 krxLossLanding / :398 lineageAcrossS1Reapprovals / :643 od2Sequence | 부품만. 파일 고유 ON/OFF factory·같은 key 재승인·capInv 왕복. 기존 A1/OD2 계약 보존 |",
+    "| data/entitlements/PremiumAccessKrxPermitTest.kt:48 reserve / :57 full / :346 withheldBy / :609 unblockedTrue / :758 r06 / :1127 candidateAfterNewPermit / :1403 staleKey / :1590 processDups / :1954 noneIgnoresBlockers / :1990 handedOverDuplicate | 부품만. marker·order·key·floor·미처리 예약 행렬 생성. 바뀌는 것은 세션 합성 결과뿐 |",
+    "| data/entitlements/PremiumAccessKrxDormantTraceTest.kt:38 collectHistory / :54 historyLines / :61 traceTest | OFF 유지. e0eef8e GOLDEN과 순서·관측 열 비교. typed read metadata를 이유로 GOLDEN을 재추출하지 않는다 |",
+    "| data/entitlements/TopicGrantIssuerMarkerTest.kt:59-98 RecordingIssuer/TwoArgOnlyWrapper/TwoArgOnlyFake / :114 delivery / :150 round / :331 handoverRun / :470 offRun | 부품만. 2/3인자 marker 운반·위임·fallback·원장 예약 소유 확인. null epoch marker의 순수 운반은 여기에 남긴다 |",
+    "| data/entitlements/TopicRejectionLedgerTest.kt:99 krx / :100 both / :102 query | 부품만. premium 재승인 요약·순번·대기 예약 비교. 세션 consume를 원장 reapproval token과 혼동하지 않는다 |",
+    "| data/entitlements/control/DemandAuthBacklogContract14Test.kt:37 consumesNo | 부품만. FORCE_PREMIUM+KRX 결과만 settles=false; reapproval/다른 결과 음성 대조도 이 helper 사용 |",
+    "| data/entitlements/control/DemandAuthBacklogContract36Test.kt:53 settles / :56 con / :59 conNo | 부품만. pure eligibility truth vector. Q09만 KRX 결과 가지, Q07/Q08은 각 다른 조건 |",
+    "| data/entitlements/control/DemandAuthBacklogContract37Test.kt:55 settleOutcome | 부품만. SETTLE_QUERY writer의 제거 적격성; Q09_settle은 FP request를 지울 수 없음 |",
+    "| data/entitlements/control/DemandAuthBacklogContractTest.kt:339 weak | 부품만. weakQuery의 FORCE_ENTITLEMENTS intent가 retryIntent 기대를 정함 |",
+    "| data/entitlements/control/DemandAuthTruthVector.kt:42 settles | 부품만. KRX는 FP를 소비하지 않고 FE는 소비. 이 oracle은 PAC contest 정책이 아니라 보존된 DemandAuth 표 |",
+    "| data/entitlements/control/HoldRecoveryContractTest.kt:51 topicHold / :60 restored / :65 source / :74 planned / :80 assertPlan | 부품만. bothAxes=true는 PREMIUM_REQUIRED, false는 KRX_ENTITLEMENT_REQUIRED. TOPIC context tuple·축·회복 intent/journal 검증 |",
+    "| data/entitlements/control/HoldRecoveryFixtures.kt:30 hold / :45 restart / :46 same / :51 input | 부품만. topic=true와 both=false에서만 KRX outcome. 나머지 가지는 pending/premium. 원시 JSON은 저장 계약 fixture이며 운영 요청 아님 |",
+    "| data/remote/TopicSessionKrxRestMarkerTest.kt:143 onRig / :162 offRig / :177 permitZero / :251 newPermitByH1Prime / :284 assertOneHandOver / :312 assertNonKrxKept | 부품만. checked factory·issue marker·같은 grant/GENERAL 보존. §4.1의 blocked issue 창을 ON 준비 성공으로 계속 가정하면 안 됨 |",
+    "| 같은 파일 :350 restUnknownTopic / :1003 latchVariant / :1044 grantEpochVariant / :1270 readerlessRest | 부품만. []/[KRX,USD] 목록, 기존 latch/epoch 필터, reader 없는 legacy 경계. latter는 typed boundary 없는 공개 API 계약 |",
+    "| data/remote/TopicSessionKrxSendMarkerTest.kt:144 onRig / :157 offRig / :384 retryAttempt / :440 refreshReplay / :513 capR01 | 부품만. 실패 송신/401은 별 시도, WS/REST 두 순서·H1/H1′ 행렬. key 없는 typed read·beforeEncode 비교를 ON rig에 제공(기존 1인자 SUA) |",
+    "| 같은 파일 :681 generalKept / :728 holdState / :777 afterRefusal | 명시 개정(α 소유). §4.1 WS 05-7의 세 helper; old/new와 attribution을 α 계약/다음 manifest에 잠금 |",
+    "| 같은 파일 :986 readerlessWs / :1054 offRun / :1132 operating | OFF 유지. reader/channel 독립성·운영 DESIRED 5개·OFF/ON의 KRX 생산자 부재 비교. typed 분기 때문에 기본 desired에 KRX를 자동 추가하지 않는다 |",
+    "| data/remote/TopicSessionKrxHarness.kt:359-366 encode / :547·571 newRequestId | 부품만(27파일 밖). 현재 requests 목록은 encode 횟수라서 새 ON 무효 시도의 임시 encode도 센다. physical send 계수로 오인 금지. 신규 rig는 provisional/prepared/wire accepted를 구별하고 monotonic ID를 encode 횟수와 분리해야 한다 |",
+    "| data/entitlements/KrxOnPublicationCheck.kt:69 CHECKED_ON / :121 checkedOnTest | 부품만(27파일 밖). 새 stamp 검사와 마지막 assertHeld를 합성. pub hook을 대입해 기존 검사를 지우지 않는다 |"
+  ],
+  "deferred_old_new": [
+    "| REST r05_9 (:392) | AWAITING(p1,E=false)에서 KRX를 발행한 뒤 p2 OPEN, 옛 표지로 unknown_topic 인계1 | blocked issue 자체0. p2에서 새 issue marker=p2. 옛 표지 판정은 이미 성공 발행한 별도 issue→후속 철회 전에 큐에 들어온 control 응답 열로 유지. W01e·K02 |",
+    "| REST r05_12 (:471) | exchange 뒤 H1′/새 permit을 거쳐도 옛 job이 끝나 인계1 | 실제 권한 상실로 cancel되면 옛 완료/인계0; 이미 queued Unsupported의 old marker 판정은 별도 양성. 데이터 적용0, 새 요청은 p2. K02·B07~10 |",
+    "| REST r05_13 (:507) | C1 epoch 철회 뒤에도 미교환 K1 요청을 완료해 epoch 가드의 FE0 관측 | 미교환 K1의 실제 cancel/후속HTTP0. epoch 가드는 이미 queued old outcome으로 별도 증명. K02·B09 |",
+    "| REST r05_15 (:579) | 401 중 H1′ 왕복 후 같은 issue로 두 번째 HTTP가 허용됨 | issue marker 유지 계약은 유지하되 capture가 철회되면 401 replay HTTP0·cancel1. 철회 없는 401만 같은 marker로2 physical sends. 새 logical issue는 새p. R11·B10 |",
+    "| REST r05_19 (:912) | p>0·null epoch 손 snapshot으로 KRX logical issue와 marker(null,p) 인계 | null epoch의 KRX use가 없으므로 ON logical issue0. non-null nullable-epoch marker 운반 자체는 issuer 06-1/06-6 부품에서 보존. W01e·K02 |",
+    "| REST r05_23 (:1130) | HOLD에서 실제 KRX issue+1, 다음 USD issue도+1 | HOLD KRX issue0·HTTP0·marker 인계0, 다음 USD issue+1. W01e·W07e |",
+    "| WS r05_7 (:674; helpers :681/:728/:777) | HOLD/AWAITING 재연결 FIRST가 KRX를 싣고 GENERAL도 보존; generalKept는 옛 KRX bootstrap useAdmitted=true 요구 | HOLD/AWAITING FIRST의 KRX0·GENERAL1; 진행 중 KRX job 취소, GENERAL job/use true. OPEN 복귀 후 현재p 구독1. W01a·W07d/e·K03/04·B07~10 |",
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxSendMarkerTest.kt",
+      "method": "r05_1_wsMarker_isCarriedFromTheSendRead_toTheLedger",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "최종 encode attempt의 send에서 B payload1을 요구",
+      "new": "물리 송신 T와 바로 앞 미송신 P를 같은 CMD stack tail로 짝지음; P의 SEND payload1·T의 payload0, marker는 P의 (epoch,permit)",
+      "source_basis": "seam r2:159; R11/W01a/K01; ACK-time 읽기로 대체 금지"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxSendMarkerTest.kt",
+      "method": "r05_2_capR11ii_aNewPermitBeforeTheAck_isJudgedAsThePreviousPermit",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "encode 목록 전체를 물리 송신으로 세어 ACK 이전1을 요구",
+      "new": "reachedWire 목록으로 ACK 이전 pending1·원 marker 판정, ACK 뒤 최신p2 후속1·추가FE0",
+      "source_basis": "seam r2:159; CAP-R11(ii), consumedPermit"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxSendMarkerTest.kt",
+      "method": "r05_4_capR11iii_theSecondAttemptReadsAnew",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "probe encode 포함 횟수로 재시도/401 physical attempt를 셈",
+      "new": "두 열 모두 physical attempt별 새ID와 자신의 P payload, p1 재사용 거부; cooldown·refresh credential 보존",
+      "source_basis": "seam r2:159; CAP-R11(iii), RD-2/K-1st"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxSendMarkerTest.kt",
+      "method": "r05_5_capR01_sameEpochWsAndRestRefusals_handOverOnce",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "WS-first/REST-first 모두 held REST가 반드시 완료·인계",
+      "new": "이미 생산된 실제 Transport/BootstrapAnswered 입력을 보류해 양 순서×H1/H1prime에서 원 표지2·첫 FE1/streak+1; 별도 WS-first 취소 증인 후 REST 미생산/추가예약0",
+      "source_basis": "CAP-R01; W01e/K02; impl r2 TSC:865-936"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxSendMarkerTest.kt",
+      "method": "r05_6_capR04_unavailableDisabledAndOtherAnswers_demandNothing",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "첫503이 즉시 terminal callback에 도달",
+      "new": "실제503 세 결과와 jitter0 backoff400/1200ms를 진행해 세 번째 terminal1 먼저 확인; contest/FE0 및 다른 outcome 구분 보존",
+      "source_basis": "B01~06; TopicBootstrapRetryPolicy:MAX_ATTEMPTS/BACKOFFS/classify"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxRestMarkerTest.kt",
+      "method": "r05_16_restI_oneReadPerIssue_markerAndLifetimeFromThatRead",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "전체 B 호출 수=issue수, 첫B 뒤 불일치 snapshot으로 GENERAL A만 확인",
+      "new": "logical payload ISSUE와 REST_RECHECK를 stack으로 분리; B 일관성·두 번째 A/B lifetime·원 marker 보존; epoch/capInv 별도 transport 거절 및 unchanged HTTP1 양성",
+      "source_basis": "W01e/R11/K02; impl r2 TSC:827-940,3317-3363"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxRestMarkerTest.kt",
+      "method": "r05_21_headFilters_comeBeforeTheHandOver",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "latch/grant epoch 뒤 held old HTTP가 승인·생산",
+      "new": "cancel-first는 실제 job/예외 취소 후 exchange/result/handover0; produced-first는 실제 old BootstrapAnswered 보류 후 전환·HEAD filter0; no-latch 양성",
+      "source_basis": "W01e/K02; impl r2 TSC:1738-1781"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxRestMarkerTest.kt",
+      "method": "harnessSelfCheck_anAcknowledgementTimeBRead_isUnattributed_andLeavesTheKrxIssueReads",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "attempts.first()를 physical subscribe로 간주",
+      "new": "첫 reachedWire&&carriesKrx T와 바로 앞 P를 연결; ACK-time B는 UNATTRIBUTED/unclaimed, KRX payload수는 plain과 동일",
+      "source_basis": "S-3; seam r2:159; ACK-time false kill 방지"
+    }
+  ],
+  "old_new_execution": "DEFERRED_BY_A1A_BRIEF: original seven ON methods unchanged; next bundle owns their explicit amendment.",
+  "a1a_inventory": "../a1a/rejection_inventory.json (preserved authoring snapshot)",
+  "alpha2_revisions": [
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxSendMarkerTest.kt",
+      "method": "r05_1_wsMarker_isCarriedFromTheSendRead_toTheLedger",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "최종 encode attempt의 send에서 B payload1을 요구",
+      "new": "물리 송신 T와 바로 앞 미송신 P를 같은 CMD stack tail로 짝지음; P의 SEND payload1·T의 payload0, marker는 P의 (epoch,permit)",
+      "source_basis": "seam r2:159; R11/W01a/K01; ACK-time 읽기로 대체 금지"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxSendMarkerTest.kt",
+      "method": "r05_2_capR11ii_aNewPermitBeforeTheAck_isJudgedAsThePreviousPermit",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "encode 목록 전체를 물리 송신으로 세어 ACK 이전1을 요구",
+      "new": "reachedWire 목록으로 ACK 이전 pending1·원 marker 판정, ACK 뒤 최신p2 후속1·추가FE0",
+      "source_basis": "seam r2:159; CAP-R11(ii), consumedPermit"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxSendMarkerTest.kt",
+      "method": "r05_4_capR11iii_theSecondAttemptReadsAnew",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "probe encode 포함 횟수로 재시도/401 physical attempt를 셈",
+      "new": "두 열 모두 physical attempt별 새ID와 자신의 P payload, p1 재사용 거부; cooldown·refresh credential 보존",
+      "source_basis": "seam r2:159; CAP-R11(iii), RD-2/K-1st"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxSendMarkerTest.kt",
+      "method": "r05_5_capR01_sameEpochWsAndRestRefusals_handOverOnce",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "WS-first/REST-first 모두 held REST가 반드시 완료·인계",
+      "new": "이미 생산된 실제 Transport/BootstrapAnswered 입력을 보류해 양 순서×H1/H1prime에서 원 표지2·첫 FE1/streak+1; 별도 WS-first 취소 증인 후 REST 미생산/추가예약0",
+      "source_basis": "CAP-R01; W01e/K02; impl r2 TSC:865-936"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxSendMarkerTest.kt",
+      "method": "r05_6_capR04_unavailableDisabledAndOtherAnswers_demandNothing",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "첫503이 즉시 terminal callback에 도달",
+      "new": "실제503 세 결과와 jitter0 backoff400/1200ms를 진행해 세 번째 terminal1 먼저 확인; contest/FE0 및 다른 outcome 구분 보존",
+      "source_basis": "B01~06; TopicBootstrapRetryPolicy:MAX_ATTEMPTS/BACKOFFS/classify"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxRestMarkerTest.kt",
+      "method": "r05_16_restI_oneReadPerIssue_markerAndLifetimeFromThatRead",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "전체 B 호출 수=issue수, 첫B 뒤 불일치 snapshot으로 GENERAL A만 확인",
+      "new": "logical payload ISSUE와 REST_RECHECK를 stack으로 분리; B 일관성·두 번째 A/B lifetime·원 marker 보존; epoch/capInv 별도 transport 거절 및 unchanged HTTP1 양성",
+      "source_basis": "W01e/R11/K02; impl r2 TSC:827-940,3317-3363"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxRestMarkerTest.kt",
+      "method": "r05_21_headFilters_comeBeforeTheHandOver",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "latch/grant epoch 뒤 held old HTTP가 승인·생산",
+      "new": "cancel-first는 실제 job/예외 취소 후 exchange/result/handover0; produced-first는 실제 old BootstrapAnswered 보류 후 전환·HEAD filter0; no-latch 양성",
+      "source_basis": "W01e/K02; impl r2 TSC:1738-1781"
+    },
+    {
+      "revision": "alpha2",
+      "file": "data/remote/TopicSessionKrxRestMarkerTest.kt",
+      "method": "harnessSelfCheck_anAcknowledgementTimeBRead_isUnattributed_andLeavesTheKrxIssueReads",
+      "classification": "명시 개정(α 소유); 전제2",
+      "old": "attempts.first()를 physical subscribe로 간주",
+      "new": "첫 reachedWire&&carriesKrx T와 바로 앞 P를 연결; ACK-time B는 UNATTRIBUTED/unclaimed, KRX payload수는 plain과 동일",
+      "source_basis": "S-3; seam r2:159; ACK-time false kill 방지"
+    }
+  ],
+  "explicit_amendment_count": 15
+}
