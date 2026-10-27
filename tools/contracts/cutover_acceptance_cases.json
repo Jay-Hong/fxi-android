@@ -96,6 +96,21 @@
     "RT01-S01u an unannounced capability hold round trip keeps the memory slot and its KRX",
     "RT01-S01cu an unannounced round trip without the KRX file still shows the memory KRX",
     "RT01-S01ca an announced round trip without the KRX file restores no KRX",
-    "RT01-S02bprime a supplement whose KRX file is another response's is not joined"
+    "RT01-S02bprime a supplement whose KRX file is another response's is not joined",
+    "S6B ON-C the cutover PAC reaches OPEN with a positive permit",
+    "S6B C01 a capability-only rotation keeps the session and GENERAL",
+    "S6B C02 a same-scope refusal reapproval overlaps the old and new tab bodies",
+    "S6B C03 an old KRX capture after reapproval applies GENERAL alone",
+    "S6B C04 a hidden capture never gains KRX and a fresh K2 capture does",
+    "S6B C05 a released old round keeps its floor and applies nothing",
+    "S6B C06 the bridge follows delivery of a refusal-reapproved grant",
+    "S6B C07 a real context change holds input until catalog readoption",
+    "S6B C08 holds reapprovals and a capability rotation keep one budget",
+    "S6B C09 a released old round cannot satisfy the new contexts demand",
+    "S6B C10 a real closed demand keeps the whole ladder and cap",
+    "S6B C11 a longer Retry-After floor holds the next round",
+    "S6B C12 an old completion after a user end holds the refills floor",
+    "S6B C13 an observed USER hold resumes only on a fresh lifetime",
+    "S6B C14 an unobserved USER hold resumes only on a fresh lifetime"
   ]
 }

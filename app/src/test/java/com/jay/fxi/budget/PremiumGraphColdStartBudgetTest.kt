@@ -878,4 +878,360 @@ class PremiumGraphColdStartBudgetTest {
         assertEquals(emptyList<Throwable>(), rig.failures)
         ColdStartBudget.assertWithin(judgeRow("B06c"))
     }
+    // S6B BEGIN
+    // β ON fixture; in-memory transitions and Completed purgers stay distinct from PGCAT.
+    private inner class S6BetaColdRig(identity: AuthIdentity? = AuthIdentity("user-a", 1)) {
+        val source = TokenSource(identity)
+        val provider = AuthTokenProvider(source, orders = accessOrders)
+        private val wireJson = NetworkModule.provideWireJson()
+        val api = AuthenticatedApiClient(
+            Retrofit.Builder().baseUrl(server.url("/")).client(harnessClient(provider))
+                .addConverterFactory(wireJson.asConverterFactory("application/json".toMediaType())).build()
+                .create(AuthenticatedApiService::class.java),
+            AuthenticatedTransport(provider, admitted = { true }),
+            wireJson
+        )
+        val main = Dispatchers.Default.limitedParallelism(1)
+        val mainJob = SupervisorJob()
+        val runtimeJob = SupervisorJob()
+        val graphParent = Job()
+        var identityReadable = true
+        val pac = s6ColdCoordinator(api, provider, CoroutineScope(mainJob + main)) { identityReadable }
+        val coordinator = pac.coordinator
+        val uses = SnapshotTopicUseAuthority { coordinator.accessSnapshot }
+        val failures: MutableList<Throwable> = Collections.synchronizedList(mutableListOf())
+        val assembly = GraphRuntimeAssembly(
+            accessSnapshot = { coordinator.accessSnapshot },
+            accessRevisions = coordinator.accessRevisions,
+            liveIdentity = provider::currentIdentityFence,
+            uses = uses,
+            protectedAdmission = GraphProtectedAdmission(provider::currentIdentityFence, DeletionAdmissionStore()),
+            fetcher = AuthenticatedGraphV2Fetcher(api),
+            owners = AuthenticatedGraphOwnerSource(provider, api),
+            cachePorts = { null },
+            main = main,
+            parent = graphParent,
+            clock = SystemAppClock,
+            rateLimitJitter = { FreeSnapshotSchedulePolicy.jitterFor(SEED, it) },
+            onEventFailure = { failures += it }
+        )
+        private var topics: TopicRuntimeOwner? = null
+
+        /** S1 order: the issuer approves first (entitlements over this client). */
+        suspend fun approve(intent: RefreshIntent = RefreshIntent.FORCE_PREMIUM) {
+            coordinator.onIdentityChanged(checkNotNull(provider.currentIdentityFence()))
+            coordinator.refresh(intent)
+            s6ColdOpen("ON-B")
+        }
+
+        /** The process owner starts the topic runtime on Main, as C4-J-BUDGET does. */
+        suspend fun startTopics() {
+            val owner = checkNotNull(provider.currentIdentityFence())
+            val wireJson = NetworkModule.provideWireJson()
+            val service = TopicSnapshotBootstrapService(api, TopicFrameDecoder(wireJson), 10.seconds)
+            val clock = object : TopicCommandClock {
+                override fun nowMillis(): Long = this@PremiumGraphColdStartBudgetTest.nowMillis()
+                override suspend fun sleep(duration: Duration) = delay(duration)
+            }
+            val ws = OkHttpClient.Builder().addInterceptor(sends.interceptor).build()
+            val factory = TopicRuntimeFactory(
+                webSocketFactory = { ws },
+                webSocketUrl = server.url("/ws").toString(),
+                decode = TopicFrameDecoder(wireJson)::decode,
+                bootstrap = { fence, topic, useAdmitted -> service.bootstrap(fence, topic, useAdmitted) },
+                issuer = PremiumAccessTopicGrantIssuer(coordinator),
+                fences = AuthFenceStream { it(owner) },
+                liveFence = { owner },
+                recoveries = AuthCredentialRecoveryStream { },
+                tabs = Tabs(FreeTab.TETHER),
+                credentials = AuthTokenTopicCommandCredentials(provider),
+                orders = accessOrders,
+                authority = uses,
+                clock = clock,
+                newBootstrapFloor = { TopicBootstrapRetryFloor(it) { Clock.System.now() } },
+                newScope = { CoroutineScope(runtimeJob + Dispatchers.Default.limitedParallelism(1)) },
+                encode = { wireJson.encodeToString(TopicSubscribeRequest.serializer(), it) },
+                newRequestId = { java.util.UUID.randomUUID().toString() },
+                jitter = { 0.0 }
+            )
+            val owned = TopicRuntimeOwner(
+                factory = factory,
+                online = MutableStateFlow(true),
+                foreground = TopicForegroundStream { onForeground -> onForeground(true) },
+                fences = AuthFenceStream { it(owner) },
+                liveIdentity = { owner },
+                rowPreferenceStore = object : RateRowPreferenceStore {
+                    override suspend fun preferences(uid: String): Map<RateRowList, RateRowPreference> = emptyMap()
+                    override suspend fun remember(uid: String, list: RateRowList, preference: RateRowPreference) = Unit
+                },
+                main = CoroutineScope(mainJob + main)
+            )
+            topics = owned
+            withContext(main) { owned.start() }
+        }
+
+        /** Starts the assembly on Main and hands its bridge [fence] directly (the fixture bridge); activates usd 1d if asked. */
+        suspend fun startGraph(fence: TopicSessionFence?, activate: Boolean) = withContext(main) {
+            assembly.start()
+            assembly.fences.setAccess(fence != null, fence, TopicGrantOrigin.NewContext)
+            if (activate) assembly.coordinator.onActivated(USD_1D)
+        }
+
+        suspend fun issued(): TopicSessionFence = checkNotNull(coordinator.topicGrantResult().fence) { "no grant was issued" }
+
+        suspend fun <T> onMain(block: () -> T): T = withContext(main) { block() }
+
+        /** Ends everything this rig started, then waits for every REST body to end. */
+        suspend fun s6ColdFinish() {
+            try {
+            withContext(main) { assembly.close() }
+            assertTrue("the assembly's children ended", graphParent.children.none { it.isActive })
+            runtimeJob.cancelAndJoin()
+            mainJob.cancelAndJoin()
+            graphParent.cancelAndJoin()
+            awaitTrue("every REST body ended", nowMillis() + 3_000) {
+                sends.all().filter { it.zone == "api" }.all { it.bodyEnd != null }
+            }
+            } finally {
+                assertTrue("contract(ON-B): installed checker", coordinator.onAccessPublishedForTest === pac.check)
+                pac.check.assertHeld()
+                println("S6B cold publications: " + pac.check.published.joinToString("\n"))
+            }
+        }
+    }
+
+    private fun s6ColdCoordinator(api: AuthenticatedApiClient, provider: AuthTokenProvider, scope: CoroutineScope, identityReadable: () -> Boolean): com.jay.fxi.data.entitlements.KrxBetaPac {
+        var n = 0
+        val ids = EpochIdGenerator { "budget-${n++}" }
+        var record = AccessEpochRecord()
+        val store = object : AccessEpochStore {
+            override suspend fun load(): AccessEpochRecord = record
+            override suspend fun bindOwner(uid: String) =
+                AccessEpochTransitions.bindOwner(record, uid, ids).also { record = it }
+            override suspend fun signOut() =
+                AccessEpochTransitions.signOut(record, ids).also { record = it }
+            override suspend fun retireUnverifiedStart() =
+                AccessEpochTransitions.retireUnverifiedStart(record, ids).also { record = it }
+            override suspend fun beginSignOut(uid: String) =
+                AccessEpochTransitions.beginSignOut(record, uid).also { record = it }
+            override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean) =
+                AccessEpochTransitions.rotate(record, rotateUser, rotateKrx, ids).also { record = it }
+            override suspend fun completePurges(completed: Collection<PendingPurge>) =
+                AccessEpochTransitions.completePurges(record, completed).also { record = it }
+            override suspend fun journalRetired(obligation: LossObligation) =
+                AccessEpochTransitions.journalRetired(record, obligation).also { record = it }
+            override suspend fun markMayContainData(premium: Boolean, krx: Boolean) =
+                AccessEpochTransitions.markMayContainData(record, premium, krx).also { record = it }
+        }
+        val purger = object : UserScopePurger, CapabilityScopePurger {
+            override suspend fun purgeUserScope(namespace: PurgeNamespace) = PurgeResult.Completed
+            override suspend fun purgeCapabilityScope(namespace: PurgeNamespace) = PurgeResult.Completed
+        }
+        return com.jay.fxi.data.entitlements.krxBetaPac(
+            source = AuthenticatedEntitlementsSource(api).let { real ->
+                object : com.jay.fxi.data.entitlements.EntitlementsSource {
+                    override suspend fun fetch(freshPremium: Boolean) = real.fetch(freshPremium)
+                    override suspend fun currentIdentity() = if (identityReadable()) real.currentIdentity() else null
+                }
+            },
+            store = store,
+            userPurger = purger,
+            capabilityPurger = purger,
+            scope = scope,
+            clock = { nowMillis() },
+            jitter = ProbeJitter.None,
+            liveFence = provider::currentIdentityFence,
+            orders = accessOrders
+        )
+    }
+
+    private suspend fun S6BetaColdRig.s6ColdStart(activate: Boolean = true): TopicSessionFence {
+        approve()
+        startTopics()
+        val fence = issued()
+        startGraph(fence, activate)
+        return fence
+    }
+
+    private fun S6BetaColdRig.s6ColdCatalogAdopted(): Boolean = assembly.coordinator.state.value.catalog != null
+
+    private suspend fun S6BetaColdRig.s6ColdAwaitTopics(deadline: Long) =
+        awaitTrue("topics and handshake", deadline) { snapshotTopics() == DESIRED && sends.all().any { it.zone == "ws" } }
+
+    private suspend fun S6BetaColdRig.s6ColdRow(body: suspend () -> Unit) {
+        try { body() } catch (failure: Throwable) {
+            runCatching { s6ColdFinish() }.exceptionOrNull()?.let(failure::addSuppressed)
+            throw failure
+        }
+        s6ColdFinish()
+    }
+    private suspend fun S6BetaColdRig.s6ColdOpen(row: String) {
+        // Preparation has its own 10 s deadline; row/quiet/floor/ladder deadlines stay unchanged.
+        val readinessDeadline = nowMillis() + 10_000
+        // PremiumConfirmed does not issue a token. Pull through the same issuer path as the topic runtime.
+        coordinator.topicGrantResult()
+        awaitTrue("contract($row): PremiumConfirmed, OPEN, positive permit, capability allowed, GENERAL allowed and standing (preparation)", readinessDeadline) {
+            val published = pac.check.published.lastOrNull()
+            nowMillis() <= readinessDeadline && published != null && published === coordinator.accessSnapshot &&
+                coordinator.state.value.state == PremiumAccessState.PremiumConfirmed &&
+                coordinator.krxContestView?.state?.phase == com.jay.fxi.data.entitlements.KrxContestPhase.OPEN &&
+                published.krxPermitSeq >= 1 && published.facts.capabilityAllowed &&
+                published.facts.userAllowed && published.facts.tokenStanding
+        }
+        val snap = coordinator.accessSnapshot
+        assertEquals("contract($row): PremiumConfirmed", PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
+        assertEquals("contract($row): OPEN", com.jay.fxi.data.entitlements.KrxContestPhase.OPEN, coordinator.krxContestView?.state?.phase)
+        assertTrue("contract($row): positive permit", snap.krxPermitSeq >= 1)
+        assertTrue("contract($row): capability allowed", snap.facts.capabilityAllowed)
+        assertTrue("contract($row): GENERAL allowed and standing", snap.facts.userAllowed && snap.facts.tokenStanding)
+        assertTrue("contract($row): actual publications", pac.check.published.any { it === snap })
+    }
+    private suspend fun S6BetaColdRig.s6ColdReapprove(): TopicSessionFence {
+        val first = issued()
+        val queriesBefore = sends.all().count { it.path == "/api/entitlements" && it.bodyEnd != null }
+        identityReadable = false
+        try { coordinator.onTopicRejected(first.grant, listOf(com.jay.fxi.domain.model.TopicRejectionReason.PREMIUM_REQUIRED)) }
+        finally { identityReadable = true }
+        entitlements += ok(PREMIUM_VISIBLE)
+        awaitTrue("contract(B01): scheduled refusal reapproval", nowMillis() + 10_000) {
+            sends.all().count { it.path == "/api/entitlements" && it.bodyEnd != null } > queriesBefore &&
+                coordinator.recheckDiagnostics().registeredQueryCount == 0
+        }
+        val result = coordinator.topicGrantResult()
+        assertTrue("contract(B01): RefusalReapproval cause", result.cause is com.jay.fxi.data.entitlements.TopicGrantCause.RefusalReapproval)
+        return checkNotNull(result.fence)
+    }
+
+    @Test
+    fun `S6B B01 a same-scope refusal reapproval overlaps old and new tab bodies`() = runBlocking {
+        val start = nowMillis()
+        entitlements += ok(PREMIUM_VISIBLE)
+        val catalogCalls = AtomicInteger()
+        onCatalog = {
+            if (catalogCalls.getAndIncrement() == 0) ok(fixture("catalog-krx-visible.json")) else ok(fixture("catalog-krx-hidden.json"))
+        }
+        val oldBody = s6ColdShift(fixture("usd-1d-krx-visible.json"), 7.0)
+        val newBody = s6ColdShift(fixture("usd-1d-krx-hidden.json"), 11.0)
+        val tabCalls = AtomicInteger()
+        onTab = {
+            if (tabCalls.getAndIncrement() == 0) ok(oldBody).setBodyDelay(8, TimeUnit.SECONDS)
+            else ok(newBody)
+        }
+        var f2At = Long.MAX_VALUE
+        val rig = S6BetaColdRig()
+        rig.s6ColdRow {
+            val first = rig.s6ColdStart()
+            awaitTrue("catalog adopted", start + ROW_DEADLINE_MS) { rig.s6ColdCatalogAdopted() }
+            awaitTrue("tab1's headers", start + ROW_DEADLINE_MS) { tabs().firstOrNull()?.end != null }
+            // A real refusal reapproval changes the grant with the same identity and USER epoch.
+            val second = rig.s6ColdReapprove()
+            assertEquals("contract(B01): the same user", first.identity.uid, second.identity.uid)
+            assertEquals("contract(B01): the same user epoch", first.userAccessEpoch, second.userAccessEpoch)
+            assertNotEquals("contract(B01): a new grant", first.grant, second.grant)
+            f2At = nowMillis()
+            rig.onMain { rig.assembly.fences.setAccess(true, second, TopicGrantOrigin.NewContext) }
+            awaitTrue("tab2 sent", start + ROW_DEADLINE_MS) { tabs().size >= 2 }
+            awaitTrue("tab1's body ended", start + ROW_DEADLINE_MS) { tabs()[0].bodyEnd != null }
+            awaitTrue("the round's catalog", start + ROW_DEADLINE_MS) { catalogs().size == 2 && catalogs()[1].bodyEnd != null }
+            rig.s6ColdAwaitTopics(start + ROW_DEADLINE_MS)
+            quiet("B01", 5_000)
+            val state = rig.assembly.coordinator.state.value
+            assertEquals("contract(B01): the F2 source holds", second, state.source?.fence)
+            val applied = checkNotNull(state.entries[USD_1D]) { "no usd 1d entry" }.tab.graph.series.map { it.seriesId }.toSet()
+            val hidden = NetworkModule.provideWireJson().parseToJsonElement(fixture("usd-1d-krx-hidden.json")).jsonObject
+                .getValue("series").jsonArray.map { it.jsonObject.getValue("id").jsonPrimitive.content }.toSet()
+            assertEquals("contract(B01): tab2's payload applied, tab1's never", hidden, applied)
+            val expected = s6ColdValues(newBody)
+            val actual = state.entries.values.flatMap { it.tab.graph.series }.flatMap { it.points.flatMap { p -> listOfNotNull(p.rate, p.high, p.low) } }
+            assertTrue("contract(B01): only the unique new answer applied", actual.isNotEmpty() && actual.all { it in expected })
+        }
+        assertTrue("contract(B01): within the row deadline", nowMillis() - start <= ROW_DEADLINE_MS)
+        val (tab1, tab2) = tabs()
+        assertTrue("contract(B01): tab1's headers came before tab2 went\n${sends.timeline()}", checkNotNull(tab1.end) <= tab2.start)
+        assertTrue("contract(B01): tab2 went while tab1's body was still open\n${sends.timeline()}", tab2.start < checkNotNull(tab1.bodyEnd))
+        assertTrue("contract(B01): tab2 went after F2 was handed over\n${sends.timeline()}", tab2.start >= f2At)
+        assertEquals("contract(B01): statuses or reports", listOf(200, 200), statuses(tabs()))
+        assertEquals("contract(B01): statuses or reports", listOf(200, 200), statuses(catalogs()))
+        assertTrue("contract(B01): the round's catalog goes 3 s after tab2 completed\n${sends.timeline()}",
+            catalogs()[1].start >= checkNotNull(tab2.bodyEnd) + 3_000 - 50)
+        assertEquals("contract(B01): statuses or reports", listOf(200, 200), statuses(sends.all().filter { it.path == "/api/entitlements" }))
+        assertTrue("contract(B01): every desired topic", snapshotTopics().containsAll(DESIRED))
+        assertTrue("contract(B01): a handshake", sends.all().any { it.zone == "ws" && it.status == 101 })
+        assertEquals("contract(B01): statuses or reports", emptyList<Throwable>(), rig.failures)
+        s6ColdAssertBudget("B01")
+    }
+
+    @Test
+    fun `S6B ON-B the cold-start PAC reaches OPEN with a positive permit`() = runBlocking {
+        entitlements += ok(PREMIUM_VISIBLE)
+        val rig = S6BetaColdRig()
+        rig.s6ColdRow {
+            rig.approve()
+            rig.s6ColdOpen("ON-B")
+            assertTrue("contract(ON-B): GENERAL use", rig.uses.acquire(rig.issued()) != null)
+        }
+    }
+
+    @Test
+    fun `S6B B02 a capability-only rotation keeps the session and GENERAL`() = runBlocking {
+        val deadline = nowMillis() + ROW_DEADLINE_MS
+        entitlements += ok(PREMIUM_VISIBLE)
+        onCatalog = { ok(fixture("catalog-krx-visible.json")) }
+        onTab = { ok(fixture("usd-1d-krx-visible.json")).setBodyDelay(3, TimeUnit.SECONDS) }
+        val rig = S6BetaColdRig()
+        rig.s6ColdRow {
+            val first = rig.s6ColdStart()
+            rig.s6ColdAwaitTopics(deadline)
+            awaitTrue("premise: original tab body is still open", deadline) { tabs().firstOrNull()?.end != null && tabs().first().bodyEnd == null }
+            val before = rig.coordinator.accessSnapshot
+            val lifetime = checkNotNull(rig.uses.acquire(first))
+            val handshakes = sends.all().count { it.zone == "ws" }
+            val topics = sends.all().filter { it.path == "/api/v2/topics/snapshot" }.toList()
+            entitlements += ok(PREMIUM_HIDDEN)
+            rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+            val after = rig.coordinator.accessSnapshot
+            assertEquals("contract(B02): same grant/session fence", first, rig.issued())
+            assertEquals("contract(B02): U retained", before.userInvalidations, after.userInvalidations)
+            assertEquals("contract(B02): USER end retained", before.lastUserEnd, after.lastUserEnd)
+            assertNotEquals("contract(B02): actual KRX epoch rotated", before.facts.recordFence?.krxCapabilityEpoch, after.facts.recordFence?.krxCapabilityEpoch)
+            assertEquals("contract(B02): C+1", before.capabilityInvalidations + 1, after.capabilityInvalidations)
+            assertTrue("contract(B02): GENERAL use retained", rig.uses.admits(lifetime))
+            rig.onMain { rig.assembly.coordinator.onContextChanged() }
+            awaitTrue("contract(B02): old GENERAL adopted", deadline) { rig.assembly.coordinator.state.value.entries[USD_1D] != null }
+            // This composition has no cache ports (`cachePorts = { null }`), so protectedEntry is always null here; the raw entry
+            // carries the GENERAL adoption, and the KRX exposure contract belongs to the C and G rows, which expose through a gate.
+            val series = checkNotNull(rig.assembly.coordinator.state.value.entries[USD_1D]) { "contract(B02): raw entry" }.tab.graph.series
+            assertTrue("contract(B02): GENERAL present", series.any { !it.seriesId.startsWith("krx.") })
+            quiet("contract(B02)", 5_000)
+            assertEquals("contract(B02): one tab, no rotation refill", 1, tabs().size)
+            assertEquals("contract(B02): no reconnect", handshakes, sends.all().count { it.zone == "ws" })
+            assertEquals("contract(B02): no rebootstrap", topics, sends.all().filter { it.path == "/api/v2/topics/snapshot" })
+            assertTrue("contract(B02): all DESIRED", snapshotTopics().containsAll(DESIRED))
+        }
+        assertEquals("contract(B02): no reports", emptyList<Throwable>(), rig.failures)
+        s6ColdAssertBudget("B02")
+    }
+    private fun s6ColdShift(json: String, delta: Double): String {
+        val base = NetworkModule.provideWireJson().parseToJsonElement(json).jsonObject
+        val fields = setOf("rate", "high", "low")
+        val series = kotlinx.serialization.json.JsonArray(base.getValue("series").jsonArray.map { element ->
+            val obj = element.jsonObject
+            val data = obj["data"]?.jsonArray ?: return@map obj
+            kotlinx.serialization.json.JsonObject(obj + ("data" to kotlinx.serialization.json.JsonArray(data.map { point ->
+                kotlinx.serialization.json.JsonObject(point.jsonObject.mapValues { (key, value) ->
+                    val number = (value as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()
+                    if (key in fields && number != null) kotlinx.serialization.json.JsonPrimitive(number + delta) else value
+                })
+            })))
+        })
+        return kotlinx.serialization.json.JsonObject(base + ("series" to series)).toString()
+    }
+    private fun s6ColdValues(body: String): Set<Double> = NetworkModule.provideWireJson().parseToJsonElement(body).jsonObject
+        .getValue("series").jsonArray.flatMap { it.jsonObject["data"]?.jsonArray.orEmpty() }
+        .flatMap { point -> listOf("rate", "high", "low").mapNotNull { point.jsonObject[it]?.jsonPrimitive?.content?.toDoubleOrNull() } }.toSet()
+    private fun s6ColdAssertBudget(row: String) {
+        try { ColdStartBudget.assertWithin(judgeRow(row)) }
+        catch (failure: AssertionError) { throw AssertionError("contract($row): physical budget", failure) }
+    }
+    // S6B END
 }

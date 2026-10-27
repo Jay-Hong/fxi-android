@@ -117,12 +117,14 @@ class KrxContestWiringContractTest {
         val PERMIT_FILES = setOf(TAS, PAC, SUA, GATE)
 
         /** KW15 extension: the ON factories that predate S-4 (0b / 2b-1a, O-8 — not changed) and S-4 itself. */
+        const val BETA_FACTORY = "${T}data/entitlements/KrxBetaPacRig.kt"
         val ON_SWITCH_FILES = setOf(
             "${T}data/entitlements/PremiumAccessKrxContestTest.kt",
             "${T}data/entitlements/PremiumAccessKrxReapprovalTest.kt",
             "${T}data/entitlements/PremiumAccessKrxA1Test.kt",
             "${T}data/entitlements/PremiumAccessKrxPermitTest.kt",
-            CHECK
+            CHECK,
+            BETA_FACTORY
         )
 
         /**
@@ -1022,6 +1024,63 @@ class KrxContestWiringContractTest {
         assertEquals("KW15 CHECKED_ON files without one assertHeld( per CHECKED_ON", emptySet<String>(), unchecked(tests))
         assertEquals("KW15 check-using files assigning onAccessPublishedForTest directly", emptySet<String>(), assigning(tests))
         assertEquals("KW15 test files switching the contest on (addition: only the pre-S-4 ON factories and S-4)", ON_SWITCH_FILES, files(switchesOn, tests))
+
+        // β r2 §8.1: inspect installation/return and every actual caller (including future budget rigs),
+        // rather than allowing a helper name in place of checking its checker lifecycle.
+        fun betaViolations(map: Map<String, String>): Set<String> {
+            val broken = mutableSetOf<String>()
+            val factory = map[BETA_FACTORY].orEmpty()
+            val constructsCheck = Regex("""\bval\s+check\s*=\s*KrxOnPublicationCheck\s*\(\s*\)""")
+            val installsCheck = Regex("""\bcoordinator\.onAccessPublishedForTest\s*=\s*check\b""")
+            val returnsBoth = Regex("""\breturn\s+KrxBetaPac\s*\(\s*coordinator\s*,\s*check\s*\)""")
+            if (!constructsCheck.containsMatchIn(factory) || !installsCheck.containsMatchIn(factory) ||
+                !returnsBoth.containsMatchIn(factory) || callSpans(factory, "PremiumAccessCoordinator").size != 1 ||
+                !Regex("""\bkrxContest\s*=\s*KrxContestSwitch\s*\(\s*true\s*\)""").containsMatchIn(factory)) {
+                broken += BETA_FACTORY
+            }
+            for ((key, text) in map) {
+                if (key == BETA_FACTORY) continue
+                val calls = callSpans(withoutImports(text), "krxBetaPac")
+                if (calls.isEmpty()) continue
+                // Each factory-owning rig audits its returned checker at teardown, even on a failing body.
+                val finalBodies = Regex("""\bfinally\s*\{""").findAll(text).map { head ->
+                    var depth = 1
+                    var end = head.range.last + 1
+                    while (end < text.length && depth > 0) {
+                        if (text[end] == '{') depth++
+                        if (text[end] == '}') depth--
+                        end++
+                    }
+                    if (depth == 0) text.substring(head.range.last + 1, end - 1) else ""
+                }.toList()
+                val endChecks = finalBodies.sumOf { body -> Regex("""\.check\.assertHeld\s*\(""").findAll(body).count() }
+                if (calls.any { it == null } || endChecks < calls.size || direct.containsMatchIn(text)) broken += key
+            }
+            val wrappers = files(Regex("""\bKrxBetaPac\s*\("""), map)
+            broken += wrappers - BETA_FACTORY
+            return broken
+        }
+        assertTrue("KW15 β positive control: real factory installs and returns its check", BETA_FACTORY in tests)
+        val betaCallers = tests.filter { (key, text) -> key != BETA_FACTORY && callSpans(text, "krxBetaPac").isNotEmpty() }.keys
+        assertTrue("KW15 β positive control: P and probe rigs are scanned", betaCallers.containsAll(setOf(
+            "${T}data/entitlements/PremiumAccessKrxOnConsumerContractTest.kt",
+            "${T}data/entitlements/KrxBetaSameEpochHoldProbeTest.kt")))
+        assertEquals("KW15 β factory installation/return and all caller teardowns/hooks", emptySet<String>(), betaViolations(tests))
+        val factoryText = tests.getValue(BETA_FACTORY)
+        val probeKey = "${T}data/entitlements/KrxBetaSameEpochHoldProbeTest.kt"
+        val probeText = tests.getValue(probeKey)
+        assertEquals("KW15 β negative: checker installation removed", setOf(BETA_FACTORY),
+            betaViolations(tests + (BETA_FACTORY to factoryText.replace("coordinator.onAccessPublishedForTest = check", ""))))
+        assertEquals("KW15 β negative: returned checker replaced", setOf(BETA_FACTORY),
+            betaViolations(tests + (BETA_FACTORY to factoryText.replace("return KrxBetaPac(coordinator, check)", "return KrxBetaPac(coordinator, KrxOnPublicationCheck())"))))
+        assertEquals("KW15 β negative: teardown assertion removed", setOf(probeKey),
+            betaViolations(tests + (probeKey to probeText.replace("pac.check.assertHeld()", "Unit"))))
+        val fakeBeta = "${T}FakeBetaCheckOutsideFinally.kt" to
+            "fun fake() { val pac = krxBetaPac(); try { Unit } finally { Unit }; pac.check.assertHeld() }"
+        assertEquals("KW15 β negative: an end assertion outside finally is not teardown", setOf(fakeBeta.first),
+            betaViolations(tests + fakeBeta))
+        assertEquals("KW15 β negative: observation replaces the checker", setOf(probeKey),
+            betaViolations(tests + (probeKey to (probeText + "\nfun broken() { c.onAccessPublishedForTest = {} }"))))
 
         val fake1 = "${T}FakeUncheckedOnTest.kt" to "fun a() = runTest { val h = krxHarness(job, CHECKED_ON) }"
         val fake2 = "${T}FakeAssigningOnTest.kt" to "fun b() = checkedOnTest { h -> h.coordinator.onAccessPublishedForTest = {} }"

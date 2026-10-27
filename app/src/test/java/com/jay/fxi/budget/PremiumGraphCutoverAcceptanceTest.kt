@@ -9431,4 +9431,1951 @@ class PremiumGraphCutoverAcceptanceTest {
     @Category(C02Measurement::class)
     fun `C02M-A05t3000 a same-user change merged 3_0 s after the cold start's first send is measured`() =
         identityChangedRow("C02M-A05t3000", merged = true, changeAt = 3_000)
+    // S6B BEGIN
+    // β r2 §7/§9/§11: resources are created only when this private ON rig is instantiated.
+    private inner class S6BetaOnRig(identity: AuthIdentity? = AuthIdentity("user-a", 1), blockDisk: Boolean = false, blockKrx: Boolean = false) {
+        val firebase = Firebase(identity)
+        val provider = AuthTokenProvider(firebase, orders = accessOrders)
+        private val wireJson = NetworkModule.provideWireJson()
+        val api = AuthenticatedApiClient(
+            Retrofit.Builder().baseUrl(server.url("/")).client(harnessClient(provider))
+                .addConverterFactory(wireJson.asConverterFactory("application/json".toMediaType())).build()
+                .create(AuthenticatedApiService::class.java),
+            AuthenticatedTransport(provider, admitted = { true }),
+            wireJson
+        )
+        val issuerJob = SupervisorJob()
+        val runtimeJob = SupervisorJob()
+        val ownerJob = SupervisorJob()
+        val ioJob = SupervisorJob()
+        /** Each time the issuer's store marks that graph data may exist (the write ports' preparation). */
+        val marks = AtomicInteger()
+        /** Whether the issuer can read the identity now (A03b holds it unreadable while a refusal is taken over). */
+        @Volatile var issuerIdentityReadable = true
+        private val io = CoroutineScope(ioJob + Dispatchers.IO)
+        private val root = folder.newFolder()
+        /**
+         * The production epoch store over a temporary Preferences DataStore with its production corruption handler; the marking
+         * is observed after the real call returns.
+         */
+        val epochStore: AccessEpochStore = DataStoreAccessEpochStore(
+            PreferenceDataStoreFactory.create(corruptionHandler = accessEpochCorruptionHandler(EpochIdGenerator.Random), scope = io) {
+                File(root, "$ACCESS_EPOCH_STORE_NAME.preferences_pb")
+            },
+            EpochIdGenerator.Random
+        ).let { real ->
+            object : AccessEpochStore by real {
+                override suspend fun markMayContainData(premium: Boolean, krx: Boolean) =
+                    real.markMayContainData(premium, krx).also { marks.incrementAndGet() }
+                override suspend fun load(): com.jay.fxi.data.entitlements.AccessEpochRecord {
+                    storeLoadFault.throwIfTargeted()
+                    // S4 C02 L1(b): logged on the caller's thread before any suspension, then held once on the armed thread. The
+                    // thread name without the " @name#n" that coroutine debug mode appends while a coroutine runs on it.
+                    val thread = Thread.currentThread().name.substringBefore(" @")
+                    if (loadLogOn) loadLog += thread to nowMillis()
+                    loadHold.get()?.let { armed ->
+                        if (thread == armed.first && loadHold.compareAndSet(armed, null)) {
+                            loadHoldHit.complete(Unit)
+                            armed.second.await()
+                        }
+                    }
+                    return real.load()
+                }
+                override suspend fun beginRotation(rotateUser: Boolean, rotateKrx: Boolean): com.jay.fxi.data.entitlements.AccessEpochRecord {
+                    storeRotationFault.throwIfTargeted()
+                    // C01 (가) USER_UNCERTAIN: one armed hold parks this write before the real store call (suspending, not blocking).
+                    storeRotationHold.getAndSet(null)?.let { (entered, release) ->
+                        entered.complete(RotationHoldHit(rotateUser, rotateKrx, Thread.currentThread().stackTrace.take(24)
+                            .joinToString(" < ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }))
+                        release.await()
+                    }
+                    return real.beginRotation(rotateUser, rotateKrx)
+                }
+            }
+        }
+        /** B1: the store's read and rotation write, each failing once on the call path a row arms; every other call is real. */
+        val storeLoadFault = TargetedFault()
+        val storeRotationFault = TargetedFault()
+        /** C01 (가): a one-shot hold on the store's rotation write — completed with the call when it parks, released by the row. */
+        val storeRotationHold = java.util.concurrent.atomic.AtomicReference<
+            Pair<kotlinx.coroutines.CompletableDeferred<RotationHoldHit>, kotlinx.coroutines.CompletableDeferred<Unit>>?>(null)
+        /** S4 C02 L1(b): while on, every store read as (thread, time), in order. */
+        @Volatile var loadLogOn = false
+        val loadLog: MutableList<Pair<String, Long>> = Collections.synchronizedList(mutableListOf())
+        /** S4 C02 L1(b): while set, the first store read on that thread name suspends until the deferred completes. */
+        val loadHold = java.util.concurrent.atomic.AtomicReference<Pair<String, kotlinx.coroutines.CompletableDeferred<Unit>>?>(null)
+        val loadHoldHit = kotlinx.coroutines.CompletableDeferred<Unit>()
+        /** S4 C02 L1(b): each production fetch's return, as (thread, time). */
+        val fetchReturns: MutableList<Pair<String, Long>> = Collections.synchronizedList(mutableListOf())
+        /** B1: while false, only the issuer's candidate recovery reads no live identity; its answer decisions read it as usual. */
+        @Volatile var recoveryIdentityReadable = true
+        /** B1: how many candidate recovery identity reads that fault answered unreadable (the recovery's IdentityUnknown). */
+        val recoveryIdentityDenials = AtomicInteger()
+        /**
+         * S4 C01 3d D3 (cut_c01_b3d_agreed.r1.md): while armed, the issuer's candidate recovery check (`checkCandidateLocked`)
+         * reads this different identity once; every other identity read, and that check afterwards, is real.
+         */
+        val differentRecoveryIdentity = java.util.concurrent.atomic.AtomicReference<com.jay.fxi.data.entitlements.EntitlementsIdentity?>(null)
+        /** S4 C01 3d D3: each read D3 answered, as "thread: Class.method" of its `checkCandidateLocked` frame. */
+        val differentRecoveryHits: MutableList<String> = Collections.synchronizedList(mutableListOf())
+        /** The issuer on its production scope: a SupervisorJob on Default, independent of Main. */
+        val pac = s6BetaOnCoordinator(api, provider, CoroutineScope(issuerJob + Dispatchers.Default), epochStore,
+            { issuerIdentityReadable }, { recoveryIdentityReadable }, { recoveryIdentityDenials.incrementAndGet() },
+            {
+                differentRecoveryIdentity.getAndSet(null)?.also {
+                    val frame = Thread.currentThread().stackTrace.first { f -> f.methodName == "checkCandidateLocked" }
+                    differentRecoveryHits += "${Thread.currentThread().name}: ${frame.className.substringAfterLast('.')}.${frame.methodName}"
+                }
+            },
+            { fetchReturns += Thread.currentThread().name.substringBefore(" @") to nowMillis() })
+        val coordinator = pac.coordinator
+        val uses = SnapshotTopicUseAuthority { coordinator.accessSnapshot }
+        val tabs = Tabs(FreeTab.USD)
+        val reports: MutableList<Throwable> = Collections.synchronizedList(mutableListOf())
+        val migrationReports: MutableList<Throwable> = Collections.synchronizedList(mutableListOf())
+        val foreground = MutableStateFlow(true)
+        /** The platform's network input the owner forwards to the runtime. */
+        val online = MutableStateFlow(true)
+        /** The graph's disk root; a regular file in its place when [blockDisk], so every write fails. */
+        val diskRoot = File(root, "graph_v2").also {
+            if (blockDisk) it.writeText("not a directory")
+            // S4 C01 3b: only the KRX tree blocked, so KRX writes fail while general writes go on.
+            if (blockKrx) File(it.apply { mkdirs() }, "krx").writeText("not a directory")
+        }
+        /**
+         * S4 C01 3b: the next socket factory call throws once; [thrownConnect] is that call's number in [connectCalls]. The
+         * number is the session's attempt (generation) number: `++generation` happens only before `connect(number)`
+         * (TopicSessionCoordinator.kt:1665-1671), whose `connect` calls the factory once (TopicRuntime.kt:131-134), and a rig
+         * has one owner, one runtime and one session.
+         */
+        @Volatile var throwNextConnect = false
+        @Volatile var thrownConnect: Long? = null
+        /** S4 C01 3b: socket factory calls so far. */
+        val connectCalls = AtomicInteger(0)
+        val disk = FileGraphV2DiskStore({ diskRoot }, JsonGraphV2EnvelopeCodec(), DefaultGraphV2AtomicFileIo(), Dispatchers.IO)
+        val selections = BackupableUserIntentStore(PreferenceDataStoreFactory.create(scope = io) { File(root, "intent.preferences_pb") })
+        val filesDir = File(root, "files").also { it.mkdirs() }
+        val cutover = AppGraphCacheCutover(
+            GraphConsumerReadiness(),
+            LocalMigrationJournal(PreferenceDataStoreFactory.create(scope = io) { File(root, "journal.preferences_pb") }),
+            filesDir, io, { migrationReports += it }
+        )
+        /** What the production builder built, kept for observation only; the builder itself is the production one. */
+        @Volatile var parts: com.jay.fxi.data.graph.ProcessGraphParts? = null
+        /** The process's one deletion admission store: the graph's protected admission and the account deletion stage share it (B1). */
+        val deletions = DeletionAdmissionStore()
+        /** Every grant result the deliverer pulled from the production issuer, in order, kept for observation only (B1). */
+        val pulls: MutableList<com.jay.fxi.data.entitlements.TopicGrantResult> = Collections.synchronizedList(mutableListOf())
+        /** The runtime's serial scope, from the factory's newScope, kept so a row can hold its executor (B1). */
+        @Volatile var runtimeScope: CoroutineScope? = null
+        /** C01 (다): each REST bootstrap's (topic, outcome) as the production service returned it, in order. */
+        val bootstrapOutcomes: MutableList<Pair<String, com.jay.fxi.data.remote.TopicSnapshotOutcome>> =
+            Collections.synchronizedList(mutableListOf())
+        /** How many times the graph boundary built; the production owner builds once per process. */
+        val builds = AtomicInteger()
+        /** The assembly's SupervisorJob: the parent's one new child across the production build, kept for observation only. */
+        @Volatile var assemblyJob: Job? = null
+        /** The runtime display flow the owner hands every new holder, kept for observation only (read off Main). */
+        @Volatile var runtimeDisplay: StateFlow<TopicDisplayState>? = null
+        /** What the production install seed source reads: the platform's seed file, replaced (B06a·b). */
+        @Volatile var readSeed: () -> String = { SEED }
+        /** The route's owner-following collector from [openScreen]; a recreated route ends it first (A01b). */
+        var routeJob: Job? = null
+        /** The permit slot the production builder was handed, kept for observation only. */
+        @Volatile var permitSlot: com.jay.fxi.data.graph.LateBound<() -> com.jay.fxi.data.remote.TopicGraphRecoveryPermit?>? = null
+        val production = AppProcessGraphBuilder(
+            disk = Provider { disk },
+            deletions = Provider { deletions },
+            seeds = Provider { InstallSeedSource({ readSeed() }, Dispatchers.IO) },
+            api = Provider { api },
+            uses = Provider { uses },
+            selections = Provider { selections },
+            coordinator = coordinator,
+            tokens = provider,
+            clock = com.jay.fxi.time.SystemAppClock
+        )
+        val builder = com.jay.fxi.data.graph.ProcessGraphBuilder { permit, seed, timeEvent, parent ->
+            permitSlot = permit
+            builds.incrementAndGet()
+            val before = parent.children.toSet()
+            val built = production.build(permit, seed, timeEvent, parent)
+            assemblyJob = (parent.children.toSet() - before).singleOrNull()
+            // The holder factory stays the production one; the wrapper only keeps the display flow it is handed.
+            com.jay.fxi.data.graph.ProcessGraphParts(built.assembly, built.seeds) { tab, display, focus, scope ->
+                runtimeDisplay = display
+                built.newHolder(tab, display, focus, scope)
+            }.also { parts = it }
+        }
+        val assembly get() = checkNotNull(parts) { "no graph built" }.assembly
+        lateinit var owner: TopicRuntimeOwner
+        var mount: GraphScreenMount? = null
+
+        /** S1 order: the issuer approves first (entitlements over this client). */
+        suspend fun approve(intent: RefreshIntent = RefreshIntent.FORCE_PREMIUM) {
+            coordinator.onIdentityChanged(checkNotNull(provider.currentIdentityFence()))
+            coordinator.refresh(intent)
+            s6Open("ON-C")
+        }
+
+        /** The process owner, as the Application starts it once admitted, on Main. */
+        suspend fun startOwner() {
+            val service = TopicSnapshotBootstrapService(api, TopicFrameDecoder(wireJson), 10.seconds)
+            val clock = object : TopicCommandClock {
+                override fun nowMillis(): Long = this@PremiumGraphCutoverAcceptanceTest.nowMillis()
+                override suspend fun sleep(duration: Duration) = delay(duration)
+            }
+            val ws = OkHttpClient.Builder().addInterceptor(sends.interceptor).build()
+            val factory = TopicRuntimeFactory(
+                webSocketFactory = {
+                    val call = connectCalls.incrementAndGet()
+                    if (throwNextConnect) {
+                        throwNextConnect = false
+                        thrownConnect = call.toLong()
+                        throw java.io.IOException("the row refuses this connect")
+                    }
+                    ws
+                },
+                webSocketUrl = server.url("/ws").toString(),
+                decode = TopicFrameDecoder(wireJson)::decode,
+                bootstrap = { fence, topic, useAdmitted -> service.bootstrap(fence, topic, useAdmitted).also { bootstrapOutcomes += topic to it } },
+                issuer = PremiumAccessTopicGrantIssuer(coordinator).let { real ->
+                    object : com.jay.fxi.data.entitlements.TopicGrantIssuer by real {
+                        override suspend fun topicGrantResult() = real.topicGrantResult().also { pulls += it }
+                    }
+                },
+                fences = firebase,
+                liveFence = provider::currentIdentityFence,
+                recoveries = provider,
+                tabs = tabs,
+                credentials = AuthTokenTopicCommandCredentials(provider),
+                orders = accessOrders,
+                authority = uses,
+                clock = clock,
+                newBootstrapFloor = { TopicBootstrapRetryFloor(it) { Clock.System.now() } },
+                newScope = { CoroutineScope(runtimeJob + Dispatchers.Default.limitedParallelism(1)).also { runtimeScope = it } },
+                encode = { wireJson.encodeToString(TopicSubscribeRequest.serializer(), it) },
+                newRequestId = { java.util.UUID.randomUUID().toString() },
+                jitter = { 0.0 }
+            )
+            owner = TopicRuntimeOwner(
+                factory = factory,
+                online = online,
+                foreground = TopicForegroundStream { onForeground -> /* the process lifecycle */
+                    CoroutineScope(ownerJob + main).launch { foreground.collect { onForeground(it) } }
+                    onForeground(foreground.value)
+                },
+                fences = firebase,
+                liveIdentity = provider::currentIdentityFence,
+                rowPreferenceStore = object : RateRowPreferenceStore {
+                    override suspend fun preferences(uid: String): Map<RateRowList, RateRowPreference> = emptyMap()
+                    override suspend fun remember(uid: String, list: RateRowList, preference: RateRowPreference) = Unit
+                },
+                main = CoroutineScope(ownerJob + main),
+                graphBuilder = builder,
+                reportGraph = { reports += it },
+                graphCutover = { cutover }
+            )
+            withContext(main) { owner.start() }
+        }
+
+        /**
+         * What the premium route does once the host is published: opens one mount, and once the usd holder is mounted and the
+         * screen shows the usd tab for an owner, activates that holder for that owner.
+         */
+        suspend fun openScreen(deadline: Long): GraphV2ScreenStateHolder {
+            awaitTrue("the host is published", deadline) { onMain { owner.graphHost.value != null } }
+            onMain { mount = checkNotNull(owner.graphHost.value).open() }
+            awaitTrue("the usd holder is mounted", deadline) { onMain { checkNotNull(mount).holders.value.containsKey("usd") } }
+            awaitTrue("the screen shows usd for an owner", deadline) {
+                onMain { owner.consumer.currentState().ui.let { it.owner != null && it.selectedTab == FreeTab.USD } }
+            }
+            return onMain {
+                val holder = checkNotNull(mount).holders.value.getValue("usd")
+                var active = checkNotNull(owner.consumer.currentState().ui.owner)
+                holder.onActivated(active)
+                // As the route does: a new screen owner moves the activation to it (deactivate, then activate).
+                routeJob = CoroutineScope(ownerJob + main).launch {
+                    owner.consumer.state.collect {
+                        val next = owner.consumer.currentState().ui.owner ?: return@collect
+                        if (next != active) {
+                            holder.onDeactivated()
+                            active = next
+                            holder.onActivated(next)
+                        }
+                    }
+                }
+                holder
+            }
+        }
+
+        /**
+         * S4 C01 batch 3 (cut_c01_b3_agreed.r1.md §4-2): the premium route's target rule (PremiumTopicRoute.kt:86-92) — the
+         * selected tab's mounted holder with the screen owner. A target change deactivates the previous holder before
+         * activating the next, a null target only deactivates, and [RouteStandIn.close] ends the route (its target
+         * deactivated) and then closes the mount, as the route's effects are disposed. Rows before batch 3 keep [openScreen].
+         */
+        suspend fun openRoute(deadline: Long): RouteStandIn {
+            awaitTrue("the host is published", deadline) { onMain { owner.graphHost.value != null } }
+            return onMain {
+                val opened = checkNotNull(owner.graphHost.value).open()
+                mount = opened
+                val route = RouteStandIn(opened)
+                route.job = CoroutineScope(ownerJob + main).launch {
+                    kotlinx.coroutines.flow.combine(owner.consumer.state, opened.holders) { _, holders -> holders }.collect { holders ->
+                        val ui = owner.consumer.currentState().ui
+                        val holder = ui.selectedTab?.serverTab?.let { holders[it] }
+                        val screenOwner = ui.owner
+                        val next = if (screenOwner != null && holder != null) holder to screenOwner else null
+                        if (next != route.target) {
+                            route.target?.first?.onDeactivated()
+                            route.target = next
+                            next?.let { (h, o) -> h.onActivated(o) }
+                        }
+                    }
+                }
+                route
+            }
+        }
+
+        /** The inline surface reports itself shown, as its lifecycle start effect does, once the holder has a token. */
+        suspend fun showSurface(holder: GraphV2ScreenStateHolder, deadline: Long) {
+            awaitTrue("the holder has an inline token", deadline) { onMain { holder.currentState().inlineToken != null } }
+            onMain { holder.setSurfaceVisible(checkNotNull(holder.currentState().inlineToken), true) }
+        }
+
+        suspend fun <T> onMain(block: () -> T): T = withContext(main) { block() }
+
+        /**
+         * Ends everything this rig started, in order: the mount closed and each mounted holder's close completed, the graph's
+         * assembly closed on Main from a live caller (not by cancelling its parent), then the runtime, the issuer and the
+         * stores, and last every REST body.
+         */
+        suspend fun s6Finish() {
+            try {
+            val mounted = onMain { mount?.holders?.value?.values?.toList().orEmpty().also { mount?.close() } }
+            withContext(main) { mounted.forEach { it.close() } }
+            parts?.let { built -> withContext(main) { built.assembly.close() } }
+            ioJob.children.forEach { it.join() }
+            ownerJob.cancelAndJoin()
+            runtimeJob.cancelAndJoin()
+            issuerJob.cancelAndJoin()
+            ioJob.cancelAndJoin()
+            awaitTrue("every REST body ended", nowMillis() + 3_000) {
+                sends.all().filter { it.zone == "api" }.all { it.bodyEnd != null }
+            }
+            } finally {
+                assertSame("contract(ON-C): the installed publication checker", pac.check, coordinator.onAccessPublishedForTest)
+                pac.check.assertHeld()
+                println("S6B publications: " + pac.check.published.joinToString("\n"))
+            }
+        }
+    }
+
+    private fun s6BetaOnCoordinator(
+        api: AuthenticatedApiClient,
+        provider: AuthTokenProvider,
+        scope: CoroutineScope,
+        store: AccessEpochStore,
+        identityReadable: () -> Boolean,
+        recoveryIdentityReadable: () -> Boolean = { true },
+        onRecoveryDenied: () -> Unit = {},
+        differentRecoveryIdentityOnce: () -> com.jay.fxi.data.entitlements.EntitlementsIdentity? = { null },
+        /** S4 C02 L1(b): called on the querying coroutine's thread right after the production fetch returns. */
+        onFetchReturned: () -> Unit = {}
+    ): com.jay.fxi.data.entitlements.KrxBetaPac {
+        // The production binding for both purgers: it answers Deferred, so every journal entry stays owed.
+        val purger = UnimplementedScopePurger()
+        return com.jay.fxi.data.entitlements.krxBetaPac(
+            // The production source; only its identity read can be held unreadable, as Firebase can be for the issuer alone.
+            source = AuthenticatedEntitlementsSource(api).let { real ->
+                object : com.jay.fxi.data.entitlements.EntitlementsSource {
+                    override suspend fun fetch(freshPremium: Boolean) = real.fetch(freshPremium).also { onFetchReturned() }
+                    override suspend fun currentIdentity(): com.jay.fxi.data.entitlements.EntitlementsIdentity? {
+                        if (!identityReadable()) return null
+                        // Read before any suspension, so the stack is the caller's: the candidate recovery's own check only.
+                        val inRecovery = Thread.currentThread().stackTrace.any { it.methodName == "checkCandidateLocked" }
+                        // S4 C01 3d D3: in that check only, a different identity once while armed.
+                        if (inRecovery) differentRecoveryIdentityOnce()?.let { return it }
+                        if (inRecovery && !recoveryIdentityReadable()) return null.also { onRecoveryDenied() }
+                        return real.currentIdentity()
+                    }
+                }
+            },
+            store = store,
+            userPurger = purger,
+            capabilityPurger = purger,
+            scope = scope,
+            clock = { nowMillis() },
+            jitter = ProbeJitter.None,
+            liveFence = provider::currentIdentityFence,
+            orders = accessOrders
+        )
+    }
+
+    private suspend fun S6BetaOnRig.s6Row(body: suspend () -> Unit) {
+        try {
+            body()
+        } catch (failure: Throwable) {
+            runCatching { s6Finish() }.exceptionOrNull()?.let(failure::addSuppressed)
+            throw failure
+        }
+        s6Finish()
+    }
+
+    private suspend fun S6BetaOnRig.s6Open(row: String) {
+        // Preparation has its own 10 s deadline; row/quiet/floor/ladder deadlines stay unchanged.
+        val readinessDeadline = nowMillis() + 10_000
+        // PremiumConfirmed does not issue a token. Pull through the same issuer path as the topic runtime.
+        coordinator.topicGrantResult()
+        awaitTrue("contract($row): PremiumConfirmed, OPEN, positive permit, capability allowed, GENERAL allowed and standing (preparation)", readinessDeadline) {
+            val published = pac.check.published.lastOrNull()
+            nowMillis() <= readinessDeadline && published != null && published === coordinator.accessSnapshot &&
+                coordinator.state.value.state == PremiumAccessState.PremiumConfirmed &&
+                coordinator.krxContestView?.state?.phase == com.jay.fxi.data.entitlements.KrxContestPhase.OPEN &&
+                published.krxPermitSeq >= 1 && published.facts.capabilityAllowed &&
+                published.facts.userAllowed && published.facts.tokenStanding
+        }
+        val snap = coordinator.accessSnapshot
+        assertEquals("contract($row): PremiumConfirmed", PremiumAccessState.PremiumConfirmed, coordinator.state.value.state)
+        assertEquals("contract($row): OPEN", com.jay.fxi.data.entitlements.KrxContestPhase.OPEN, coordinator.krxContestView?.state?.phase)
+        assertTrue("contract($row): positive permit", snap.krxPermitSeq >= 1)
+        assertTrue("contract($row): capability allowed", snap.facts.capabilityAllowed)
+        assertTrue("contract($row): GENERAL allowed and standing", snap.facts.userAllowed && snap.facts.tokenStanding)
+        assertTrue("contract($row): actual publications", pac.check.published.any { it === snap })
+    }
+
+    /** A real PREMIUM_REQUIRED refusal with unreadable identity; the following fresh query must reapprove F1. */
+    private suspend fun S6BetaOnRig.s6RefuseReapprove(row: String): com.jay.fxi.data.remote.TopicSessionFence {
+        val before = checkNotNull(coordinator.topicGrantResult().fence)
+        val queriesBefore = sends.all().count { it.path == "/api/entitlements" && it.bodyEnd != null }
+        issuerIdentityReadable = false
+        try {
+            coordinator.onTopicRejected(before.grant, listOf(com.jay.fxi.domain.model.TopicRejectionReason.PREMIUM_REQUIRED))
+        } finally {
+            issuerIdentityReadable = true
+        }
+        entitlements += ok(premiumKrxVisible)
+        awaitTrue("contract($row): scheduled refusal reapproval", nowMillis() + 10_000) {
+            sends.all().count { it.path == "/api/entitlements" && it.bodyEnd != null } > queriesBefore &&
+                coordinator.recheckDiagnostics().registeredQueryCount == 0
+        }
+        val result = coordinator.topicGrantResult()
+        val after = checkNotNull(result.fence) { "contract($row): reapproved fence" }
+        assertTrue("contract($row): RefusalReapproval cause", result.cause is com.jay.fxi.data.entitlements.TopicGrantCause.RefusalReapproval)
+        assertNotEquals("contract($row): a real new grant", before.grant, after.grant)
+        assertEquals("contract($row): same identity", before.identity, after.identity)
+        assertEquals("contract($row): same USER epoch", before.userAccessEpoch, after.userAccessEpoch)
+        return after
+    }
+
+    private suspend fun S6BetaOnRig.s6AwaitTopics(deadline: Long) =
+        awaitTrue("topics and handshake", deadline) { snapshotTopics() == DESIRED && sends.all().any { it.zone == "ws" } }
+
+    private suspend fun S6BetaOnRig.s6AwaitWritesDrained(label: String, deadline: Long) = awaitTrue("$label: the graph writes drained", deadline) {
+        onMain { (privateField(assembly.coordinator, "writeTasks") as Map<*, *>).isEmpty() }
+    }
+
+    private fun S6BetaOnRig.s6Bridge(): com.jay.fxi.data.remote.TopicSessionFence? = assembly.fences.current()
+
+    private suspend fun S6BetaOnRig.s6BudgetSample(): Triple<Any?, Any?, Long> = onMain {
+        @Suppress("UNCHECKED_CAST")
+        val budgets = privateField(assembly.coordinator, "recoveryBudgets") as Map<Any, Any>
+        val budget = budgets.entries.singleOrNull { privateField(it.key, "tab") == "usd" }?.value
+        val events = assembly.events
+        Triple(budget, budget?.let { privateField(it, "stop") },
+            events.javaClass.getDeclaredField("sequence").apply { isAccessible = true }.get(events) as Long)
+    }
+
+    private fun S6BetaOnRig.s6CatalogAdopted(): Boolean = assembly.coordinator.state.value.catalog != null
+
+    private suspend fun S6BetaOnRig.s6ColdStart(deadline: Long, activate: Boolean = true): GraphV2ScreenStateHolder? {
+        approve()
+        startOwner()
+        if (!activate) return null
+        val holder = openScreen(deadline)
+        showSurface(holder, deadline)
+        return holder
+    }
+
+    private suspend fun S6BetaOnRig.s6ColdStartRoute(deadline: Long): Pair<RouteStandIn, GraphV2ScreenStateHolder> {
+        approve()
+        startOwner()
+        val route = openRoute(deadline)
+        awaitTrue("the route targets the usd holder", deadline) {
+            onMain { route.target?.first?.let { it === mount?.holders?.value?.get("usd") } == true }
+        }
+        val holder = onMain { checkNotNull(route.target).first }
+        showSurface(holder, deadline)
+        return route to holder
+    }
+
+    private suspend fun S6BetaOnRig.s6HasKbSeries(): Boolean = onMain {
+        assembly.recorder.state.value.series.keys.any { it.seriesId == "kb.usd" }
+    }
+
+    private fun S6BetaOnRig.s6HoldRuntime(): ExecutorHold = holdOn { task -> checkNotNull(runtimeScope).launch { task.run() } }
+
+    private suspend fun S6BetaOnRig.s6KbClosedPending(): Set<Long> = onMain {
+        val now = System.currentTimeMillis() / 1000
+        val current = now - now % 600
+        assembly.recorder.state.value.series.filterKeys { it.seriesId == "kb.usd" }.values.single()
+            .pending.keys.map { it.epochSeconds }.filter { it < current }.toSet()
+    }
+
+    private suspend fun S6BetaOnRig.s6KbState(): com.jay.fxi.data.graph.GraphRecoverableState? = onMain {
+        assembly.recorder.state.value.series.entries.firstOrNull { it.key.seriesId == "kb.usd" }?.value
+    }
+
+    private fun S6BetaOnRig.s6KrxFiles(): Map<String, String> = s6WrittenFiles().filter { it.startsWith("krx/") }.associateWith { path ->
+        java.security.MessageDigest.getInstance("SHA-256").digest(File(diskRoot, path).readBytes()).joinToString("") { "%02x".format(it) }
+    }
+
+    private suspend fun <T> S6BetaOnRig.s6OnRuntime(block: () -> T): T =
+        withContext(checkNotNull(checkNotNull(runtimeScope).coroutineContext[kotlinx.coroutines.CoroutineDispatcher])) { block() }
+
+    private suspend fun S6BetaOnRig.s6PendingInputs(): List<com.jay.fxi.data.remote.TopicGraphInput> = onMain {
+        assembly.recorder.state.value.pending.inputs
+    }
+
+    private fun S6BetaOnRig.s6PermitFence(): com.jay.fxi.data.remote.TopicSessionFence? = permitSlot?.get()?.invoke()?.fence
+
+    private fun S6BetaOnRig.s6PermitTag(): () -> String? = { if (permitSlot?.get()?.invoke()?.automatic == true) "open" else "closed" }
+
+    private suspend fun S6BetaOnRig.s6PrepareClosedDemand(deadline: Long, krx: Boolean = false, route: Boolean = false): GraphV2ScreenStateHolder? {
+        usdSnapshotLive = true
+        if (krx) onCatalog = { ok(fixture("catalog-krx-visible.json")) }
+        // The first tab answers only once the catalog is adopted, so no cold recovery budget is left from the start and the
+        // reconnect opens the cycle at its first round (a tab completing before the catalog would leave one with a 3 s deadline).
+        onTab = {
+            val until = System.nanoTime() + 10_000_000_000L
+            while (parts == null || assembly.coordinator.state.value.catalog == null) {
+                if (System.nanoTime() > until) break
+                Thread.sleep(10)
+            }
+            ok(fixture(if (krx) "usd-1d-krx-visible.json" else "usd-1d-krx-hidden.json"))
+        }
+        val holder = if (route) s6ColdStartRoute(deadline).second else s6ColdStart(deadline)
+        awaitTrue("catalog adopted", deadline) { s6CatalogAdopted() }
+        awaitTrue("the first tab applied", deadline) { s6UsdApplied() && tabs().all { it.bodyEnd != null } }
+        awaitTrue("the REST delivery created kb.usd", deadline) { s6HasKbSeries() }
+        usdSnapshotLive = false
+        awaitTrue("an acknowledged socket", deadline) { openSockets.isNotEmpty() }
+        openSockets.last().send(usdSnapshot())
+        awaitTrue("a closed demand from the resumed WS path", deadline) {
+            s6UsdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.Pending(closed = true, mappingWait = false)
+        }
+        return holder
+    }
+
+    private suspend fun S6BetaOnRig.s6RetryFloor(): kotlinx.datetime.Instant? = onMain {
+        privateField(assembly.coordinator, "sharedRetryFloor") as kotlinx.datetime.Instant?
+    }
+
+    private suspend fun S6BetaOnRig.s6SendOrigin(catalog: Boolean, request: RecordedRequest): SendOrigin = onMain {
+        val c = assembly.coordinator
+        val registration = if (catalog) privateField(c, "catalogRequest") else {
+            @Suppress("UNCHECKED_CAST")
+            val requests = privateField(c, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
+            requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period.code == "1d" }?.value
+        }
+        SendOrigin(nowMillis(), if (catalog) "catalog" else "tab", registration?.let { privateField(it, "automaticRecovery") as Boolean },
+            when (request.getHeader(PERMIT_HEADER)) { "open" -> true; "closed" -> false; else -> null })
+    }
+
+    private fun S6BetaOnRig.s6Session(): com.jay.fxi.data.remote.TopicSessionCoordinator {
+        val supplier = checkNotNull(checkNotNull(permitSlot) { "no graph built" }.get()) { "no permit supplier" }
+        val field = supplier.javaClass.declaredFields.single { com.jay.fxi.data.remote.TopicSessionCoordinator::class.java.isAssignableFrom(it.type) }
+        return field.apply { isAccessible = true }.get(supplier) as com.jay.fxi.data.remote.TopicSessionCoordinator
+    }
+
+    private fun S6BetaOnRig.s6SlotComponents(key: com.jay.fxi.data.graph.GraphKey): com.jay.fxi.data.graph.GraphV2DiskComponents? {
+        val c = assembly.coordinator
+        @Suppress("UNCHECKED_CAST")
+        val slot = (privateField(c, "protectedSlots") as Map<Any, Any>)[key] ?: return null
+        return privateField(slot, "components") as com.jay.fxi.data.graph.GraphV2DiskComponents
+    }
+
+    private suspend fun S6BetaOnRig.s6Triggers(): Long = onMain {
+        val e = assembly.events
+        e.javaClass.getDeclaredField("sequence").apply { isAccessible = true }.get(e) as Long
+    }
+
+    private fun S6BetaOnRig.s6UsdApplied(): Boolean = assembly.coordinator.state.value.entries.keys.any { it.tab == "usd" && it.period.code == "1d" }
+
+    private suspend fun S6BetaOnRig.s6UsdBudget(): BudgetView? = onMain {
+        val c = assembly.coordinator
+        @Suppress("UNCHECKED_CAST")
+        val budgets = c.javaClass.getDeclaredField("recoveryBudgets").apply { isAccessible = true }.get(c) as Map<Any, Any>
+        budgets.entries.singleOrNull { privateField(it.key, "tab") == "usd" }?.value?.let { b ->
+            fun f(name: String) = b.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(b)
+            BudgetView(f("rounds") as Int, f("completionRung") as Int, f("deadline") as kotlinx.datetime.Instant?, f("permitWait") != null, f("stop"))
+        }
+    }
+
+    private suspend fun S6BetaOnRig.s6UsdBudgetObject(): Any? = onMain {
+        @Suppress("UNCHECKED_CAST")
+        val budgets = privateField(assembly.coordinator, "recoveryBudgets") as Map<Any, Any>
+        budgets.entries.singleOrNull { privateField(it.key, "tab") == "usd" }?.value
+    }
+
+    private suspend fun S6BetaOnRig.s6UsdCaptureEpoch(period: String): Pair<Boolean, String?> = onMain {
+        @Suppress("UNCHECKED_CAST")
+        val requests = privateField(assembly.coordinator, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
+        val registration = requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period.code == period }?.value
+            ?: return@onMain false to null
+        val capture = privateField(registration, "accessCapture") as com.jay.fxi.data.graph.GraphV2AccessCapture?
+        true to capture?.krxCapabilityEpoch
+    }
+
+    private suspend fun S6BetaOnRig.s6UsdDemand(): com.jay.fxi.data.graph.GraphTabRecoveryDemand {
+        val fence = checkNotNull(coordinator.topicGrantResult().fence)
+        val lifetime = checkNotNull(uses.acquire(fence))
+        return onMain { assembly.recorder.recoveryDemand("usd", fence, lifetime, kotlinx.datetime.Clock.System.now()) }
+    }
+
+    private suspend fun S6BetaOnRig.s6UsdTabFromRound(): Boolean? = onMain {
+        @Suppress("UNCHECKED_CAST")
+        val requests = privateField(assembly.coordinator, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
+        requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period.code == "1d" }?.value?.let { privateField(it, "automaticRecovery") as Boolean }
+    }
+
+    private suspend fun S6BetaOnRig.s6UsdTabRegistration(): TabRegistrationView = onMain {
+        val c = assembly.coordinator
+        @Suppress("UNCHECKED_CAST")
+        val requests = privateField(c, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
+        @Suppress("UNCHECKED_CAST")
+        val captures = requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period.code == "1d" }
+            ?.value?.let { privateField(it, "recoveryRequests") as List<com.jay.fxi.data.graph.GraphRecoveryRequest> }
+        TabRegistrationView(c.state.value.catalog != null, captures)
+    }
+
+    private fun S6BetaOnRig.s6WrittenFiles(): List<String> =
+        if (diskRoot.isDirectory) diskRoot.walkTopDown().filter { it.isFile }.map { it.relativeTo(diskRoot).path }.toList() else emptyList()
+
+    private fun s6UserHoldRow(label: String, observed: Boolean) = runBlocking {
+        val prepared = clearOfBoundary(70_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 60_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val hold3m = java.util.concurrent.CountDownLatch(1)
+        // From the capture before the hold until the preservation is compared after the release, every new catalog, 1d and
+        // 3m answer (a refill, the holder's active period re-requested, a recovery) waits here; the old 3m answer apart.
+        val gateRefill = java.util.concurrent.atomic.AtomicBoolean(false)
+        val refillGate = java.util.concurrent.CountDownLatch(1)
+        val threeMonthCalls = AtomicInteger()
+        val krxVisible = java.util.concurrent.atomic.AtomicBoolean(true)
+        val rig = S6BetaOnRig()
+        try {
+            rig.s6Row {
+                rig.s6PrepareClosedDemand(deadline, krx = true)
+                onCatalog = {
+                    if (gateRefill.get()) refillGate.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                    ok(fixture(if (krxVisible.get()) "catalog-krx-visible.json" else "catalog-krx-hidden.json"))
+                }
+                onTab = { request ->
+                    if (request.requestUrl!!.queryParameter("period") == "3m" && threeMonthCalls.getAndIncrement() == 0) {
+                        hold3m.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("usd-3m-krx-visible.json"))
+                    } else {
+                        if (gateRefill.get()) refillGate.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                        val period = if (request.requestUrl!!.queryParameter("period") == "3m") "3m" else "1d"
+                        ok(fixture("usd-$period-krx-${if (krxVisible.get()) "visible" else "hidden"}.json"))
+                    }
+                }
+                val holder = checkNotNull(rig.onMain { rig.mount?.holders?.value?.get("usd") })
+                val f1 = checkNotNull(rig.s6Bridge())
+                val lifetime1 = checkNotNull(rig.uses.acquire(f1))
+                val pendingBefore = rig.s6KbClosedPending()
+                assertTrue("contract($label): premise: an unmet closed demand", pendingBefore.isNotEmpty())
+                val recordBefore = rig.epochStore.load()
+                val endsBefore = rig.coordinator.accessSnapshot.lastUserEnd?.sequence ?: 0L
+                val capEndsBefore = rig.coordinator.accessSnapshot.lastCapabilityEnd?.sequence ?: 0L
+                val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+                rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the old lifetime's 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.end == null } }
+                // The screen action under the hold uses the 3m token the screen offers just before it (a period change renews it).
+                awaitTrue("$label: the screen offers a 3m token", deadline) {
+                    rig.onMain { holder.currentState().inlineToken?.period == GraphPeriod.THREE_MONTHS }
+                }
+                // From here no new answer is applied until the comparison after the release.
+                gateRefill.set(true)
+                val token3m = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+                val usd1d = rig.onMain { rig.assembly.coordinator.state.value.entries.keys.single { it.tab == "usd" && it.period.code == "1d" } }
+                val generalBefore = rig.onMain {
+                    checkNotNull(rig.assembly.coordinator.protectedEntry(usd1d)).tab.graph.series.filterNot { it.seriesId.startsWith("krx.") }
+                }
+                assertTrue("contract($label): $label: premise: GENERAL content with kb.usd before the hold", generalBefore.any { it.seriesId == "kb.usd" })
+                val slotBefore = checkNotNull(rig.onMain { rig.s6SlotComponents(usd1d) })
+                assertNotNull("contract($label): $label: premise: the 1d slot holds KRX before the hold", slotBefore.krx)
+                val pendingAtHold = rig.s6KbClosedPending()
+                assertEquals("contract($label): $label: premise: the closed demand is the prepared one", pendingBefore, pendingAtHold)
+                // Answers completed apart from the old 3m: none may complete between this capture and the comparison.
+                val answersCompleted = {
+                    tabs().count { it.bodyEnd != null } - (if (tabs().first { it.param("period") == "3m" }.bodyEnd != null) 1 else 0) +
+                        catalogs().count { it.bodyEnd != null }
+                }
+                val answersAtCapture = answersCompleted()
+                val graphBeforeHold = graph().size
+                // Every request source the graph coordinator publishes from here: a consumer that processes the hold publishes
+                // none (no use can be acquired under it).
+                val sourcesSinceHold = Collections.synchronizedList(mutableListOf<Any?>())
+                val sourceCollector = rig.onMain {
+                    CoroutineScope(rig.ownerJob + Dispatchers.Unconfined).launch {
+                        rig.assembly.coordinator.state.drop(1).collect { sourcesSinceHold += it.source?.fence }
+                    }
+                }
+
+                assertEquals("contract($label): $label: premise: the 3m token is the screen's just before the hold", token3m,
+                    rig.onMain { holder.currentState().inlineToken })
+                // Unobserved: the consumers are held from before the hold to after its release.
+                val mainHold = if (observed) null else holdMain()
+                val runtimeHold = if (observed) null else try { rig.s6HoldRuntime() } catch (failure: Throwable) { mainHold?.release(); throw failure }
+                try {
+                    // The hold: a USER loss decided while the identity cannot be read, its decision's store read failing once.
+                    val failure = java.io.IOException("access record unreadable")
+                    rig.storeLoadFault.arm(failure) { isIssuerDecision(it) }
+                    rig.issuerIdentityReadable = false
+                    entitlements += ok("""{"krx_visible":true,"premium_active":false,"premium_pending":false}""")
+                    kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                    assertEquals("contract($label): $label: the decision's read failed once, as that instance: ${rig.storeLoadFault.hits}",
+                        listOf<Throwable>(failure), rig.storeLoadFault.thrown.toList())
+                    assertTrue("contract($label): $label: inside the issuer's decision", rig.storeLoadFault.hits.single().contains("apply"))
+                    assertEquals("contract($label): $label: one candidate held", 1, rig.coordinator.heldLossCandidateCount())
+                    assertTrue("contract($label): $label: the snapshot holds the user", com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in
+                        rig.coordinator.accessSnapshot.facts.userBlocks)
+                    // Only the candidate recovery stays blind; answers decide with the identity again. A recovery round must
+                    // actually meet the unreadable identity (its IdentityUnknown) and leave the hold standing.
+                    val deniedBefore = rig.recoveryIdentityDenials.get()
+                    rig.recoveryIdentityReadable = false
+                    rig.issuerIdentityReadable = true
+                    awaitTrue("$label: a candidate recovery round met the unreadable identity", deadline) {
+                        rig.recoveryIdentityDenials.get() > deniedBefore
+                    }
+                    assertEquals("contract($label): $label: the hold stands after the recovery's IdentityUnknown", 1, rig.coordinator.heldLossCandidateCount())
+                    assertTrue("contract($label): $label: the snapshot still holds the user", com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE in
+                        rig.coordinator.accessSnapshot.facts.userBlocks)
+
+                    if (observed) {
+                        // The consumers see the hold: no use, no render, nothing applied; data and demand kept.
+                        rig.onMain {
+                            assertNull("contract($label): $label: no protected read under the hold",
+                                rig.assembly.coordinator.state.value.entries.keys.firstNotNullOfOrNull { rig.assembly.coordinator.protectedEntry(it) })
+                            assertNull("contract($label): $label: nothing renders under the hold", holder.currentState().chart)
+                            assertNull("contract($label): $label: the screen offers no token under the hold", holder.currentState().inlineToken)
+                            holder.selectPeriod(token3m, GraphPeriod.ONE_WEEK)
+                        }
+                        hold3m.countDown()
+                        awaitTrue("$label: the old 3m answer ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                        val until = nowMillis() + 1_500
+                        while (nowMillis() < until) {
+                            assertEquals("contract($label): $label: no graph send under the hold\n${sends.timeline()}", graphBeforeHold, graph().size)
+                            assertTrue("contract($label): $label: the old 3m answer is not applied under the hold",
+                                rig.assembly.coordinator.state.value.entries.keys.none { it.period.code == "3m" })
+                            delay(50)
+                        }
+                        assertEquals("contract($label): $label: the closed demand is kept under the hold", pendingBefore, rig.s6KbClosedPending())
+                        // The positive control, taken before the release: the consumer processed the hold itself.
+                        val duringHold = synchronized(sourcesSinceHold) { sourcesSinceHold.toList() }
+                        assertTrue("contract($label): $label: the consumer saw the hold before the release (a source-less publication): $duringHold",
+                            null in duringHold)
+                    }
+
+                    // The release: premium kept, KRX dropped — the capability epoch rotates and the candidate goes stale.
+                    krxVisible.set(false)
+                    entitlements += ok(PREMIUM_HIDDEN)
+                    kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM) }
+                    awaitTrue("$label: the candidate was released", deadline) {
+                        rig.coordinator.heldLossCandidateCount() == 0 &&
+                            com.jay.fxi.data.entitlements.TopicAccessBlock.LOSS_CANDIDATE !in rig.coordinator.accessSnapshot.facts.userBlocks
+                    }
+                    if (!observed) {
+                        // The topic executor first, until the final grant is delivered; only then Main, so the consumers see the
+                        // final state alone.
+                        checkNotNull(runtimeHold).release()
+                        val final = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                        awaitTrue("$label: the final grant is delivered while Main is held", deadline) { rig.s6Bridge() == final }
+                        checkNotNull(mainHold).release()
+                    }
+                } finally {
+                    rig.recoveryIdentityReadable = true
+                    rig.issuerIdentityReadable = true
+                    try {
+                        runtimeHold?.release()
+                    } finally {
+                        mainHold?.release()
+                        hold3m.countDown()
+                    }
+                }
+                val snapshot = rig.coordinator.accessSnapshot
+                assertEquals("contract($label): capability rotation adds no extra USER invalidation", lifetime1.invalidations + 1, snapshot.userInvalidations)
+                val recordAfter = rig.epochStore.load()
+                assertEquals("contract($label): $label: no USER end", endsBefore, snapshot.lastUserEnd?.sequence ?: 0L)
+                assertEquals("contract($label): $label: the USER epoch is unchanged", recordBefore.userAccessEpoch, recordAfter.userAccessEpoch)
+                assertNotEquals("contract($label): $label: the capability epoch rotated", recordBefore.krxCapabilityEpoch, recordAfter.krxCapabilityEpoch)
+                assertTrue("contract($label): $label: a capability end was recorded", (snapshot.lastCapabilityEnd?.sequence ?: 0L) > capEndsBefore)
+
+                // After it: a new lifetime only; GENERAL kept, KRX removed; the old 3m answer never applied.
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                awaitTrue("$label: the new grant's context is consumed", deadline) {
+                    rig.s6Bridge() == f2 && rig.assembly.coordinator.state.value.source?.fence == f2
+                }
+                val lifetime2 = checkNotNull(rig.uses.acquire(f2))
+                assertNotEquals("contract($label): $label: a new lifetime", lifetime1, lifetime2)
+                // The collector records only after the state already reads f2: stop it once it has recorded f2 (within the deadline).
+                awaitTrue("$label: the source collector recorded the new grant's source", deadline) {
+                    f2 in synchronized(sourcesSinceHold) { sourcesSinceHold.toList() }
+                }
+                sourceCollector.cancelAndJoin()
+                val published = synchronized(sourcesSinceHold) { sourcesSinceHold.toList() }
+                assertTrue("contract($label): $label: the consumer published the new grant's source: $published", f2 in published)
+                if (!observed) {
+                    assertFalse("contract($label): $label: the consumer never processed a hold revision (no source-less publication): $published", null in published)
+                }
+                assertTrue("contract($label): $label: the invalidations rose (${lifetime1.invalidations} -> ${snapshot.userInvalidations})",
+                    snapshot.userInvalidations > lifetime1.invalidations)
+                assertFalse("contract($label): $label: the old lifetime is refused", rig.uses.admits(lifetime1))
+                awaitTrue("$label: the old 3m answer ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                val until = nowMillis() + 1_000
+                while (nowMillis() < until) {
+                    assertTrue("contract($label): $label: the old 3m answer is never applied (a new 3m request, if any, is still held)",
+                        rig.assembly.coordinator.state.value.entries.keys.none { it.period.code == "3m" })
+                    delay(20)
+                }
+                // Before any refill: the GENERAL content captured before the hold, unchanged; KRX removed; the closed demand kept.
+                awaitTrue("$label: the new lifetime reads the 1d entry with KRX removed", deadline) {
+                    rig.onMain {
+                        rig.assembly.coordinator.protectedEntry(usd1d)?.tab?.graph?.series?.none { it.seriesId.startsWith("krx.") } == true
+                    }
+                }
+                val generalAfter = rig.onMain { checkNotNull(rig.assembly.coordinator.protectedEntry(usd1d)).tab.graph.series }
+                assertEquals("contract($label): $label: GENERAL kept as it was before the hold (no refill yet)", generalBefore, generalAfter)
+                val (entryKept, slotAfter) = rig.onMain { (usd1d in rig.assembly.coordinator.state.value.entries) to rig.s6SlotComponents(usd1d) }
+                assertTrue("contract($label): $label: the 1d entry stays in the coordinator (no drop and reload)", entryKept)
+                assertSame("contract($label): $label: the in-memory GENERAL component is the one from before the hold", slotBefore.general, slotAfter?.general)
+                assertNull("contract($label): $label: the in-memory KRX component is removed", slotAfter?.krx)
+                assertEquals("contract($label): $label: the closed demand kept as it was before the hold", pendingBefore, rig.s6KbClosedPending())
+                assertEquals("contract($label): $label: no new answer completed between the capture and the comparison\n${sends.timeline()}",
+                    answersAtCapture, answersCompleted())
+                gateRefill.set(false)
+                refillGate.countDown()
+                assertTrue("contract($label): $label: the recorder keeps kb.usd", rig.s6HasKbSeries())
+                rig.s6AwaitTopics(deadline)
+                quiet("$label settle", 1_000)
+            }
+        } finally {
+            hold3m.countDown()
+            refillGate.countDown()
+        }
+        assertTrue("contract($label): within the row deadline", nowMillis() - start <= 60_000)
+        s6AssertBudget(label)
+    }
+
+    @Test
+    fun `S6B C02 a same-scope refusal reapproval overlaps the old and new tab bodies`() = runBlocking {
+        val label = "C02"
+        val start = nowMillis()
+        val deadline = start + 20_000
+        entitlements += ok("""{"krx_visible":true,"premium_active":true}""")
+        val catalogCalls = AtomicInteger()
+        onCatalog = { if (catalogCalls.getAndIncrement() == 0) ok(fixture("catalog-krx-visible.json")) else ok(fixture("catalog-krx-hidden.json")) }
+        val oldBody = shiftedTab(fixture("usd-1d-krx-visible.json"), 7.0)
+        val newBody = shiftedTab(fixture("usd-1d-krx-hidden.json"), 11.0)
+        val tabCalls = AtomicInteger()
+        onTab = {
+            if (tabCalls.getAndIncrement() == 0) ok(oldBody).setBodyDelay(8, java.util.concurrent.TimeUnit.SECONDS)
+            else ok(newBody)
+        }
+        var rotatedAt = Long.MAX_VALUE
+        val rig = S6BetaOnRig()
+        rig.s6Row {
+            rig.s6ColdStart(deadline)
+            val first = checkNotNull(rig.coordinator.topicGrantResult().fence)
+            awaitTrue("tab1's headers", deadline) { tabs().firstOrNull()?.end != null }
+            // The real refusal helper supplies the fresh premium answer; KRX epoch is retained.
+            val recordBefore = rig.epochStore.load()
+            rotatedAt = nowMillis()
+            rig.s6RefuseReapprove(label)
+            val second = checkNotNull(rig.coordinator.topicGrantResult().fence)
+            assertEquals("contract(C02): the same user epoch", first.userAccessEpoch, second.userAccessEpoch)
+            assertTrue("contract(C02): a new grant", first.grant != second.grant)
+            awaitTrue("tab2 sent", deadline) { tabs().size >= 2 }
+            awaitTrue("tab1's body ended", deadline) { tabs()[0].bodyEnd != null }
+            awaitTrue("the new context's tab applied", deadline) {
+                rig.assembly.coordinator.state.value.source?.fence == second && rig.s6UsdApplied() && tabs().all { it.bodyEnd != null }
+            }
+            rig.s6AwaitTopics(deadline)
+            quiet("C02", 5_000)
+            val applied = rig.assembly.coordinator.state.value.entries.values.single().tab.graph.series.map { it.seriesId }.toSet()
+            val hidden = NetworkModule.provideWireJson().parseToJsonElement(fixture("usd-1d-krx-hidden.json")).jsonObject
+                .getValue("series").jsonArray.map { it.jsonObject.getValue("id").jsonPrimitive.content }.toSet()
+            assertEquals("contract(C02): tab2's payload applied, tab1's never", hidden, applied)
+            val expected = tabValues(newBody).values.flatten().toSet()
+            val actual = rig.onMain { rig.assembly.coordinator.state.value.entries.values.flatMap { it.tab.graph.series }
+                .flatMap { it.points.flatMap { p -> listOfNotNull(p.rate, p.high, p.low) } } }
+            assertTrue("contract(C02): $label: only the unique new answer applied", actual.isNotEmpty() && actual.all { it in expected })
+        }
+        assertTrue("contract(C02): within the row deadline", nowMillis() - start <= 20_000)
+        val (tab1, tab2) = tabs()
+        assertTrue("contract(C02): tab2 went while tab1's body was still open\n${sends.timeline()}", tab2.start < checkNotNull(tab1.bodyEnd))
+        assertTrue("contract(C02): tab2 went after the real context change\n${sends.timeline()}", tab2.start >= rotatedAt)
+        assertEquals("contract(C02): statuses or reports", listOf(200, 200), statuses(tabs()))
+        s6AssertBudget("C02")
+    }
+
+    @Test
+    fun `S6B C05 a released old round keeps its floor and applies nothing`() = runBlocking {
+        val label = "C05"
+        assertEquals("contract(C05): J = 10 s for usd", 10.seconds, FreeSnapshotSchedulePolicy.jitterFor(SEED, "usd"))
+        val prepared = clearOfBoundary(90_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 80_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val holdOld = java.util.concurrent.CountDownLatch(1)
+        val holdNew = java.util.concurrent.CountDownLatch(1)
+        val krxVisible = java.util.concurrent.atomic.AtomicBoolean(true)
+        val rig = S6BetaOnRig()
+        try {
+            rig.s6Row {
+                rig.s6PrepareClosedDemand(deadline, krx = true)
+                val starts = closedStarts()
+                // The old answer covers the whole demand (kb.usd at every closed start), KRX-visible, every value shifted: applied
+                // as a recovery it would release the demand and move the recorder's tip.
+                val oldBody = shiftedTab(usdTab(starts, "usd-1d-krx-visible.json"), 7.0)
+                val oldValues = tabValues(oldBody)
+                assertEquals("contract(C05): the old answer's kb.usd covers the demand", starts.size,
+                    wire.parseToJsonElement(oldBody).jsonObject.getValue("series").jsonArray
+                        .first { it.jsonObject.getValue("id").jsonPrimitive.content == "kb.usd" }.jsonObject.getValue("data").jsonArray.size)
+                val holder = checkNotNull(rig.onMain { rig.mount?.holders?.value?.get("usd") })
+                onCatalog = {
+                    if (krxVisible.get()) ok(fixture("catalog-krx-visible.json"))
+                    else { holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("catalog-krx-hidden.json")) }
+                }
+                val calls = AtomicInteger()
+                onTab = { request ->
+                    if (calls.getAndIncrement() == 0) {
+                        holdOld.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                        ok(oldBody).setHeader("Retry-After", 20)
+                    } else {
+                        holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                        if (request.requestUrl!!.queryParameter("period") == "3m") ok(fixture("usd-3m-krx-hidden.json"))
+                        else ok(fixture("usd-1d-krx-hidden.json"))
+                    }
+                }
+                rig.s6AwaitTopics(deadline)
+                delay(3_500)
+                val baseline = tabs().size
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: the round is in flight", deadline) { tabs().size == baseline + 1 }
+                val captured = checkNotNull(rig.s6UsdTabRegistration().captures)
+                assertTrue("contract(C05): $label: the old round carries kb.usd's capture: $captured", captured.any { it.seriesKey.seriesId == "kb.usd" })
+                val f1 = checkNotNull(rig.s6Bridge())
+                val rotatedAt = nowMillis()
+                krxVisible.set(false)
+                // The real refusal helper supplies the fresh premium answer; KRX epoch is retained.
+                kotlinx.coroutines.withTimeout(10_000) { rig.s6RefuseReapprove(label) }
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("contract(C05): $label: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                assertNotEquals("contract(C05): $label: a new grant", f1.grant, f2.grant)
+                awaitTrue("$label: the new context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == f2 }
+                assertNull("contract(C05): $label: no floor yet", rig.s6RetryFloor())
+
+                holdOld.countDown()
+                awaitTrue("$label: the old round's body ended", deadline) { tabs()[baseline].bodyEnd != null }
+                val oldEnd = checkNotNull(tabs()[baseline].bodyEnd)
+                assertEquals("contract(C05): $label: the old answer was a 200", 200, tabs()[baseline].status)
+                awaitTrue("$label: the old answer's floor is recorded", deadline) { rig.s6RetryFloor() != null }
+                val floorAt = checkNotNull(rig.s6RetryFloor()).toEpochMilliseconds() - wallAtOrigin
+                println("CUT-C01 $label: old body end $oldEnd ms, floor at $floorAt ms")
+                assertTrue("contract(C05): $label: the floor is the Retry-After plus the jitter ($floorAt vs $oldEnd)", floorAt >= oldEnd + 30_000 - 50 && floorAt <= oldEnd + 31_000)
+                delay(300)
+                // None of the old answer is applied.
+                assertEquals("contract(C05): $label: the demand is unchanged", starts.toSet(), rig.s6KbClosedPending())
+                val applied = rig.onMain {
+                    rig.assembly.coordinator.state.value.entries.values.flatMap { e -> e.tab.graph.series.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } } }.toSet()
+                }
+                val protected = rig.onMain {
+                    rig.assembly.coordinator.state.value.entries.keys.mapNotNull { rig.assembly.coordinator.protectedEntry(it) }
+                        .flatMap { e -> e.tab.graph.series.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } } }.toSet()
+                }
+                val oldAll = oldValues.values.flatten().toSet()
+                assertTrue("contract(C05): $label: no old value in the entries", applied.intersect(oldAll).isEmpty())
+                assertTrue("contract(C05): $label: no old value in a protected read", protected.intersect(oldAll).isEmpty())
+                val recorded = rig.s6KbState()?.data?.app?.tip?.rate
+                assertFalse("contract(C05): $label: no old value in the recorder (tip $recorded)", recorded != null && recorded in oldAll)
+
+                // The floor holds the new context: its held requests answered, a 3m selection waits for the floor.
+                holdNew.countDown()
+                awaitTrue("$label: the new context's held requests are answered", deadline) { graph().all { it.bodyEnd != null } }
+                val graphBefore = graph().size
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the 3m tab went", deadline) { tabs().any { it.param("period") == "3m" } }
+                val threeMonth = tabs().first { it.param("period") == "3m" }
+                println("CUT-C01 $label: 3m sent ${threeMonth.start} ms")
+                assertTrue("contract(C05): $label: the 3m send waits for the floor (${threeMonth.start} vs $floorAt)\n${sends.timeline()}", threeMonth.start >= floorAt - 50)
+                assertTrue("contract(C05): $label: and for the old body end + 30 s (${threeMonth.start} vs $oldEnd)", threeMonth.start >= oldEnd + 30_000 - 50)
+                assertTrue("contract(C05): $label: within 2 s of it (${threeMonth.start} vs $oldEnd)", threeMonth.start <= oldEnd + 32_000)
+                assertTrue("contract(C05): $label: and goes at it (${threeMonth.start} vs $floorAt)", threeMonth.start <= floorAt + 2_000)
+                assertEquals("contract(C05): $label: no other graph send under the floor\n${sends.timeline()}", emptyList<SendRecorder.Exchange>(),
+                    graph().drop(graphBefore).filter { it.start < floorAt - 50 })
+                awaitTrue("$label: the 3m tab applied", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                settleNewSession(label, rotatedAt, deadline)
+            }
+        } finally {
+            holdOld.countDown()
+            holdNew.countDown()
+        }
+        assertEquals("contract(C05): no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("contract(C05): within the row deadline", nowMillis() - start <= 80_000)
+        s6AssertBudget(label)
+    }
+
+    @Test
+    fun `S6B C06 the bridge follows delivery of a refusal-reapproved grant`() = runBlocking {
+        val label = "C06"
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += ok("""{"krx_visible":true,"premium_active":true}""")
+        val catalogCalls = AtomicInteger()
+        onCatalog = { if (catalogCalls.getAndIncrement() == 0) ok(fixture("catalog-krx-visible.json")) else ok(fixture("catalog-krx-hidden.json")) }
+        val tabCalls = AtomicInteger()
+        onTab = { if (tabCalls.getAndIncrement() == 0) ok(fixture("usd-1d-krx-visible.json")) else ok(fixture("usd-1d-krx-hidden.json")) }
+        val rig = S6BetaOnRig()
+        rig.s6Row {
+            // (i) Before issuance: the owner and its graph run, nothing is issued.
+            rig.startOwner()
+            awaitTrue("the host is published", deadline) { rig.onMain { rig.owner.graphHost.value != null } }
+            val sampler = BridgeSampler(CoroutineScope(rig.ownerJob)) { rig.s6Bridge() }
+            // Auxiliary: the request sources the graph coordinator consumed and published (it re-reads the bridge when it runs).
+            val sources = Collections.synchronizedList(mutableListOf<Any?>())
+            val sourceCollector = rig.onMain {
+                CoroutineScope(rig.ownerJob + Dispatchers.Unconfined).launch {
+                    rig.assembly.coordinator.state.collect { sources += it.source?.fence }
+                }
+            }
+            quiet("C06 before issuance", 2_000)
+            assertNull("contract(C06): nothing issued, nothing published", rig.s6Bridge())
+            assertEquals("contract(C06): no graph send before issuance", 0, graph().size)
+
+            // Issued and delivered: F1.
+            rig.approve()
+            val f1 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+            val holder = rig.openScreen(deadline)
+            rig.showSurface(holder, deadline)
+            awaitTrue("F1 delivered and published", deadline) { rig.s6Bridge() == f1 && rig.s6PermitFence() == f1 }
+            rig.s6AwaitTopics(deadline)
+            awaitTrue("the usd tab applied under F1", deadline) { rig.s6UsdApplied() && tabs().all { it.bodyEnd != null } }
+
+            // (ii) Issued but not delivered: F2 issued while the runtime executor is held.
+            val graphBefore = graph().size
+            val f2 = holding(rig.s6HoldRuntime()) {
+                // The real refusal helper supplies the fresh premium answer; KRX epoch is retained.
+                // Bounded: a deliverer that took the issuer's lock just before the hold would keep it until the hold ends.
+                val issued = kotlinx.coroutines.withTimeout(10_000) {
+                    rig.s6RefuseReapprove(label)
+                    checkNotNull(rig.coordinator.topicGrantResult().fence)
+                }
+                assertNotEquals("contract(C06): a new grant was issued", f1, issued)
+                val until = nowMillis() + 1_000
+                while (nowMillis() < until) {
+                    assertEquals("contract(C06): held: the bridge still publishes F1", f1, rig.s6Bridge())
+                    assertEquals("contract(C06): held: no graph send for the undelivered grant\n${sends.timeline()}", graphBefore, graph().size)
+                    delay(20)
+                }
+                issued
+            }
+
+            // (iii) Delivered: F2 published, the same fence the session holds.
+            awaitTrue("F2 delivered and published", deadline) { rig.s6Bridge() == f2 && rig.s6PermitFence() == f2 }
+            awaitTrue("the new context's tab applied", deadline) {
+                rig.assembly.coordinator.state.value.source?.fence == f2 && rig.s6UsdApplied() && tabs().all { it.bodyEnd != null }
+            }
+
+            // (iv) An end delivered alone: the same user's next auth generation and its approval query, whose answer is held.
+            val token = checkNotNull(rig.onMain { holder.currentState().inlineToken })
+            entitlementsGate = java.util.concurrent.CountDownLatch(1)
+            val approval = CoroutineScope(rig.issuerJob + Dispatchers.Default).launch {
+                val next = rig.firebase.nextGeneration()
+                rig.coordinator.onIdentityChanged(next)
+                rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+            }
+            val sampled: List<Any?>
+            val consumed: List<Any?>
+            val catalogsBeforeF3: Int
+            val tabsBeforeF3: Int
+            try {
+                awaitTrue("the new approval's answer is held", deadline) { entitlementsHeld.get() >= 1 }
+                awaitTrue("the end alone was delivered", deadline) { rig.s6Bridge() == null }
+                assertTrue("contract(C06): the session's permit names no grant use", rig.onMain { checkNotNull(rig.permitSlot).require()() }?.automatic != true)
+                val graphAtEnd = graph().size
+                // A stimulus: the screen's own action with its earlier token.
+                rig.onMain { holder.selectPeriod(token, GraphPeriod.THREE_MONTHS) }
+                val until = nowMillis() + 3_000
+                while (nowMillis() < until) {
+                    assertNull("contract(C06): after the end nothing is published", rig.s6Bridge())
+                    assertEquals("contract(C06): after the end no graph send\n${sends.timeline()}", graphAtEnd, graph().size)
+                    delay(50)
+                }
+                // The records end here: the held answer, released next, issues a third grant outside this row's question.
+                sampled = sampler.stop()
+                sourceCollector.cancelAndJoin()
+                consumed = synchronized(sources) { sources.toList() }
+                catalogsBeforeF3 = catalogs().size
+                tabsBeforeF3 = tabs().size
+            } finally {
+                entitlementsGate?.countDown()
+                entitlementsGate = null
+            }
+            approval.join()
+            // The released answer issues a third grant; its context settles before the row ends, so every send it makes has
+            // reached the server when the budget is judged.
+            val f3 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+            awaitTrue("the third grant's context settled", deadline) {
+                rig.s6Bridge() == f3 && rig.assembly.coordinator.state.value.source?.fence == f3 && rig.s6UsdApplied() &&
+                    tabs().all { it.bodyEnd != null } && sends.all().filter { it.zone == "api" }.all { it.bodyEnd != null } &&
+                    catalogs().size > catalogsBeforeF3 && tabs().size > tabsBeforeF3
+            }
+            quiet("C06 settle", 2_000)
+            assertTrue("contract(C06): auxiliary: every sampled publication was a delivered grant or nothing: $sampled",
+                sampled.all { it == null || it == f1 || it == f2 })
+            assertTrue("contract(C06): auxiliary: every request source the coordinator published was a delivered grant or none: $consumed",
+                consumed.all { it == null || it == f1 || it == f2 })
+        }
+        assertTrue("contract(C06): within the row deadline", nowMillis() - start <= 40_000)
+        s6AssertBudget("C06")
+    }
+
+    @Test
+    fun `S6B C07 a real context change holds input until catalog readoption`() = runBlocking {
+        val label = "C07"
+        val prepared = clearOfBoundary(60_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 40_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val holdNewCatalog = java.util.concurrent.CountDownLatch(1)
+        val krxVisible = java.util.concurrent.atomic.AtomicBoolean(true)
+        val rig = S6BetaOnRig()
+        try {
+            rig.s6Row {
+                rig.s6PrepareClosedDemand(deadline, krx = true)
+                val starts = closedStarts()
+                onCatalog = {
+                    if (krxVisible.get()) ok(fixture("catalog-krx-visible.json"))
+                    else { holdNewCatalog.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("catalog-krx-hidden.json")) }
+                }
+                // Let the cold start settle before the rotation, as RT01-A05 does (back to back it crowds the API budget).
+                rig.s6AwaitTopics(deadline)
+                delay(3_500)
+                onTab = { ok(fixture(if (krxVisible.get()) "usd-1d-krx-visible.json" else "usd-1d-krx-hidden.json")) }
+                val tipBefore = checkNotNull(rig.s6KbState()?.data?.app?.tip)
+                val f1 = checkNotNull(rig.s6Bridge())
+                val socketsBefore = openSockets.size
+                val rotatedAt = nowMillis()
+                krxVisible.set(false)
+                // The real refusal helper supplies the fresh premium answer; KRX epoch is retained.
+                kotlinx.coroutines.withTimeout(10_000) { rig.s6RefuseReapprove(label) }
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("contract(C07): $label: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                assertNotEquals("contract(C07): $label: a new grant", f1.grant, f2.grant)
+                awaitTrue("$label: the new context is consumed with no catalog", deadline) {
+                    rig.assembly.coordinator.state.value.source?.fence == f2
+                }
+                assertNull("contract(C07): $label: old catalog discarded in the real new context", rig.assembly.coordinator.state.value.catalog)
+                awaitTrue("$label: the new catalog is asked and held", deadline) { catalogs().any { it.end == null } }
+                // The frame comes on the new grant's connection (one on the old connection would be refused at replay).
+                awaitUsdAcknowledged(label, socketsBefore, deadline)
+                val heldBefore = rig.s6PendingInputs().size
+                val later = System.currentTimeMillis() / 1000
+                openSockets.last().send(usdSnapshotAt(1395.0, later))
+                awaitTrue("$label: the WS input is held", deadline) { rig.s6PendingInputs().size > heldBefore }
+                val describe = { inputs: List<com.jay.fxi.data.remote.TopicGraphInput> -> inputs.joinToString { input ->
+                    when (input) {
+                        is com.jay.fxi.data.remote.TopicGraphInput.Observations -> "#${input.sequence} obs ${input.path} ${input.attribution.lifetime}"
+                        is com.jay.fxi.data.remote.TopicGraphInput.Continuity -> "#${input.sequence} ${input.kind} ${input.paths}"
+                        else -> "#${input.sequence} ${input.javaClass.simpleName}"
+                    }
+                } }
+                println("CUT-C01 $label held after the frame: ${describe(rig.s6PendingInputs())}; bridge ${rig.s6Bridge()}")
+                assertEquals("contract(C07): $label: kb's tip unchanged while the catalog is missing", tipBefore, rig.s6KbState()?.data?.app?.tip)
+                holdNewCatalog.countDown()
+                awaitTrue("$label: the catalog is adopted again", deadline) { rig.s6CatalogAdopted() }
+                delay(1_000)
+                println("CUT-C01 $label after readoption: held ${describe(rig.s6PendingInputs())}; tip ${rig.s6KbState()?.data?.app?.tip}; source ${rig.assembly.coordinator.state.value.source}")
+                awaitTrue("$label: the held input replays into kb", deadline) {
+                    rig.s6PendingInputs().isEmpty() && rig.s6KbState()?.data?.app?.tip?.rate == 1395.0
+                }
+                assertEquals("contract(C07): $label: at the frame's time", later, checkNotNull(rig.s6KbState()?.data?.app?.tip).observedAt.epochSeconds)
+                // End cleanly: the next round meets the closed demand, and the new session settles.
+                onTab = { ok(usdTab(starts)) }
+                awaitTrue("$label: the closed demand is met", deadline) { rig.s6UsdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                settleNewSession(label, rotatedAt, deadline)
+            }
+        } finally {
+            holdNewCatalog.countDown()
+        }
+        assertEquals("contract(C07): no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("contract(C07): within the row deadline", nowMillis() - start <= 40_000)
+        s6AssertBudget(label)
+    }
+
+    @Test
+    fun `S6B C08 holds reapprovals and a capability rotation keep one budget`() = runBlocking {
+        val label = "C08"
+        val prepared = clearOfBoundary(130_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 120_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val rig = S6BetaOnRig()
+        val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            while (true) {
+                if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
+                delay(20)
+            }
+        }
+        var sampler: kotlinx.coroutines.Job? = null
+        try {
+            rig.s6Row {
+                rig.s6PrepareClosedDemand(deadline, krx = true)
+                val starts = closedStarts()
+                val rounds = AtomicInteger()
+                // Each round gives a further eighth of the window: the demand stays for the whole row.
+                val origins = Collections.synchronizedList(mutableListOf<SendOrigin>())
+                permitAtSend = rig.s6PermitTag()
+                onCatalog = { request -> origins += runBlocking { rig.s6SendOrigin(catalog = true, request) }; ok(fixture("catalog-krx-visible.json")) }
+                onTab = { request -> origins += runBlocking { rig.s6SendOrigin(catalog = false, request) }; ok(usdTab(starts.take(8 * (rounds.incrementAndGet())), "usd-1d-krx-visible.json")) }
+                rig.s6AwaitTopics(deadline)
+                delay(3_500)
+                val baseline = tabs().size
+                val catalogsAtOpen = catalogs().size
+                val catalogOriginsAtOpen = synchronized(origins) { origins.count { it.kind == "catalog" } }
+                val triggersAtOpen = rig.s6Triggers()
+                val openedAt = nowMillis()
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: round 1 completed", deadline) { tabs().size == baseline + 1 && tabs().last().bodyEnd != null }
+                awaitTrue("$label: the budget waits for its next round", deadline) { rig.s6UsdBudget()?.deadline != null }
+                val budget = checkNotNull(rig.s6UsdBudgetObject())
+                // Between the checks as well: the budget stays this object and never stops, so no trigger can reopen a cycle;
+                // every trigger the row sees lands on this running budget. The grant tokens are recorded with their times.
+                val violations = Collections.synchronizedList(mutableListOf<String>())
+                val triggerSteps = Collections.synchronizedList(mutableListOf<String>())
+                val grantChanges = Collections.synchronizedList(mutableListOf<Long>())
+                sampler = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                    var previous = rig.s6BudgetSample()
+                    var token = rig.coordinator.accessSnapshot.facts.token
+                    while (true) {
+                        delay(10)
+                        val sample = rig.s6BudgetSample()
+                        val at = nowMillis()
+                        if (sample.first !== budget) violations += "$at: the budget is ${sample.first}"
+                        if (sample.second != null) violations += "$at: the budget stopped: ${sample.second}"
+                        if (sample.third > previous.third) {
+                            triggerSteps += "$at: ${previous.third} -> ${sample.third}"
+                            if (previous.first !== budget || previous.second != null) violations += "$at: a trigger after ${previous.second}"
+                        }
+                        previous = sample
+                        val now = rig.coordinator.accessSnapshot.facts.token
+                        if (now != null && now != token) { token = now; grantChanges += at }
+                    }
+                }
+                val holdWindows = mutableListOf<Pair<Long, Long>>()
+                val grantWindows = mutableListOf<Triple<String, Long, Long>>()
+                var last = checkNotNull(rig.s6UsdBudget())
+                val log = mutableListOf<String>()
+                suspend fun check(event: String) {
+                    assertSame("contract(C08): $label: the same budget object after $event", budget, rig.s6UsdBudgetObject())
+                    val now = checkNotNull(rig.s6UsdBudget()) { "$label: no usd budget after $event" }
+                    log += "$event: $now"
+                    assertTrue("contract(C08): $label: rounds never go down after $event ($last -> $now)", now.rounds >= last.rounds)
+                    assertTrue("contract(C08): $label: the rung never goes down after $event ($last -> $now)", now.completionRung >= last.completionRung)
+                    assertNull("contract(C08): $label: the cycle has not stopped after $event ($now)", now.stop)
+                    assertTrue("contract(C08): $label: the demand stays after $event", rig.s6KbClosedPending().isNotEmpty())
+                    last = now
+                }
+                check("round 1")
+
+                // Three offline holds: the deadline is kept while the permit is closed.
+                repeat(3) { i ->
+                    // Entered with the next round at least 0.5 s away: no round can leave between this check and the permit closing.
+                    awaitTrue("$label: hold ${i + 1}: no round in flight and the next not imminent", deadline) {
+                        tabs().all { it.bodyEnd != null } &&
+                            rig.s6UsdBudget()?.deadline?.let { it.toEpochMilliseconds() - wallAtOrigin - nowMillis() >= 500 } == true
+                    }
+                    val offlineAt = nowMillis()
+                    rig.online.value = false
+                    awaitTrue("$label: hold ${i + 1}: the permit closed", deadline) {
+                        rig.onMain { checkNotNull(rig.permitSlot).require()() }?.automatic != true
+                    }
+                    // Read once the permit is closed: a round that left just before is already counted.
+                    val before = checkNotNull(rig.s6UsdBudget())
+                    delay(1_500)
+                    val during = checkNotNull(rig.s6UsdBudget())
+                    assertEquals("contract(C08): $label: hold ${i + 1} keeps the deadline", before.deadline, during.deadline)
+                    assertEquals("contract(C08): $label: hold ${i + 1}: no round while held", before.rounds, during.rounds)
+                    rig.online.value = true
+                    awaitTrue("$label: hold ${i + 1}: the permit is automatic again", deadline) {
+                        rig.onMain { checkNotNull(rig.permitSlot).require()() }?.automatic == true
+                    }
+                    check("hold ${i + 1}")
+                    holdWindows += offlineAt to nowMillis()
+                }
+
+                // Two re-approvals: the reconnect's subscription is refused once, the issuer re-approves on a new grant.
+                repeat(2) { i ->
+                    awaitTrue("$label: re-approval ${i + 1}: no round in flight", deadline) { tabs().all { it.bodyEnd != null } }
+                    val grantBefore = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                    val capabilityBefore = rig.epochStore.load().krxCapabilityEpoch
+                    // Keep re-approval separate from the capability-only rotation below; the empty queue defaults to hidden.
+                    entitlements += ok(premiumKrxVisible)
+                    val refusalsBefore = refusals.get()
+                    refuseUsd = {
+                        refuseUsd = null
+                        rig.issuerIdentityReadable = false
+                    }
+                    val closeAt = nowMillis()
+                    openSockets.last().close(1011, "server restart")
+                    awaitTrue("$label: re-approval ${i + 1}: a new grant", deadline) {
+                        rig.coordinator.topicGrantResult().fence?.grant?.let { it != grantBefore.grant } == true
+                    }
+                    val grantAfter = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                    assertEquals("contract(C08): $label: re-approval ${i + 1}: the same user epoch", grantBefore.userAccessEpoch, grantAfter.userAccessEpoch)
+                    assertTrue("contract(C08): $label: re-approval ${i + 1}: refused", refusals.get() > refusalsBefore)
+                    awaitTrue("$label: re-approval ${i + 1}: its context is consumed", deadline) {
+                        rig.assembly.coordinator.state.value.source?.fence == grantAfter
+                    }
+                    delay(2_000)
+                    assertEquals("premise(C08): re-approval ${i + 1} keeps the capability epoch", capabilityBefore, rig.epochStore.load().krxCapabilityEpoch)
+                    check("re-approval ${i + 1}")
+                    grantWindows += Triple("re-approval ${i + 1}", closeAt, nowMillis())
+                }
+
+                // A capability-only rotation: same token/U; retain this running budget and deadline.
+                awaitTrue("$label: reissue: no round in flight", deadline) { tabs().all { it.bodyEnd != null } }
+                val reissueAt = nowMillis()
+                val beforeReissue = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                entitlements += ok(premiumKrxVisible)
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                val beforeCapability = rig.coordinator.accessSnapshot
+                val epochOpen = rig.epochStore.load().krxCapabilityEpoch
+                rig.online.value = false
+                awaitTrue("$label: permit held for capability rotation", deadline) { rig.permitSlot?.get()?.invoke()?.automatic != true }
+                val capBudget = checkNotNull(rig.s6UsdBudget())
+                val capGraph = graph().size
+                entitlements += ok(PREMIUM_HIDDEN)
+                kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
+                val reissued = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("contract(C08): $label: reissue: same grant", beforeReissue.grant, reissued.grant)
+                assertEquals("contract(C08): $label: reissue: the same user epoch", beforeReissue.userAccessEpoch, reissued.userAccessEpoch)
+                assertNotEquals("contract(C08): $label: reissue: the capability epoch rotated", epochOpen, rig.epochStore.load().krxCapabilityEpoch)
+                awaitTrue("$label: reissue: its context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == reissued }
+                delay(2_000)
+                check("capability reissue")
+                assertEquals("contract(C08): $label: rotation U", beforeCapability.userInvalidations, rig.coordinator.accessSnapshot.userInvalidations)
+                assertEquals("contract(C08): $label: rotation deadline", capBudget.deadline, rig.s6UsdBudget()?.deadline)
+                assertEquals("contract(C08): $label: rotation rounds", capBudget.rounds, rig.s6UsdBudget()?.rounds)
+                assertEquals("contract(C08): $label: rotation sends while held", capGraph, graph().size)
+                rig.online.value = true
+                awaitTrue("$label: permit reopened after capability rotation", deadline) { rig.permitSlot?.get()?.invoke()?.automatic == true }
+
+                // A trigger on the running cycle: past RT05's 30 s cooldown since the cycle's opening RECONNECT, a reconnect on the same
+                // grant issues one more. It lands on this budget (the sampler checks every trigger step) and resets nothing.
+                while (nowMillis() < openedAt + 31_000) delay(50)
+                awaitTrue("$label: late reconnect: no round in flight", deadline) { tabs().all { it.bodyEnd != null } }
+                val triggersBefore = rig.s6Triggers()
+                val grantBeforeLate = checkNotNull(rig.coordinator.topicGrantResult().fence).grant
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: late reconnect: one trigger", deadline) { rig.s6Triggers() > triggersBefore }
+                delay(2_000)
+                assertEquals("contract(C08): $label: late reconnect: the same grant", grantBeforeLate, rig.coordinator.topicGrantResult().fence?.grant)
+                check("late reconnect")
+                sampler?.cancel()
+
+                println("CUT-C01 $label budget after each event:\n" + log.joinToString("\n"))
+                val changes = synchronized(grantChanges) { grantChanges.toList() }
+                val catalogTimes = catalogs().drop(catalogsAtOpen).map { it.start }
+                println("CUT-C01 $label triggers ${triggersAtOpen} -> ${rig.s6Triggers()} (${synchronized(triggerSteps) { triggerSteps.toList() }}); " +
+                    "grant changes $changes; catalogs since open $catalogTimes; holds $holdWindows; grant windows $grantWindows; rounds ${last.rounds}")
+                assertTrue("contract(C08): $label: the cycle has rounds left (${last.rounds} < 6)", last.rounds < 6)
+                assertTrue("contract(C08): $label: a trigger landed while the cycle ran", synchronized(triggerSteps) { triggerSteps.isNotEmpty() })
+                assertEquals("contract(C08): $label: between the checks the budget stayed this running object", emptyList<String>(), synchronized(violations) { violations.toList() })
+                // Catalogs by issuer (cut_c01_b2b_catalog.r1), each send paired with who issued it (one catalog is in flight at a time,
+                // so both lists are in send order) and judged on the client's clock: the initial one at most one; since the cycle
+                // opened, the rounds' own at most the rounds, the screen's own activation at most one per grant change (the reissue's
+                // intermediate change counted) and none outside one, none in a hold on the same grant; overall at most the rounds plus
+                // the grant changes.
+                val sent = synchronized(origins) { origins.toList() }
+                val catalogOrigins = sent.filter { it.kind == "catalog" }.drop(catalogOriginsAtOpen)
+                println("CUT-C01 $label origins $sent")
+                assertTrue("contract(C08): $label: the initial catalog is at most one ($catalogsAtOpen)", catalogsAtOpen <= 1)
+                assertEquals("contract(C08): $label: every catalog since the cycle opened is attributed", catalogTimes.size, catalogOrigins.size)
+                assertTrue("contract(C08): $label: every catalog has its registration", catalogOrigins.all { it.byRound != null })
+                val pairs = catalogTimes.zip(catalogOrigins)
+                assertTrue("contract(C08): $label: the rounds' own catalogs are at most the rounds (${last.rounds})\n${sends.timeline()}",
+                    pairs.count { it.second.byRound == true } <= last.rounds)
+                holdWindows.forEachIndexed { i, (from, until) ->
+                    assertEquals("contract(C08): $label: hold ${i + 1} keeps the grant", 0, changes.count { it in from..until })
+                    assertEquals("contract(C08): $label: no catalog in hold ${i + 1}\n${sends.timeline()}", 0, catalogTimes.count { it in from..until })
+                }
+                grantWindows.forEach { (name, from, until) ->
+                    val inWindow = changes.count { it in from..until }
+                    assertTrue("contract(C08): $label: $name changed the grant", inWindow >= 1)
+                    assertTrue("contract(C08): $label: the activation's own catalogs in $name are at most its grant changes ($inWindow)\n${sends.timeline()}",
+                        pairs.count { (at, o) -> o.byRound == false && at in from..until } <= inWindow)
+                }
+                assertEquals("contract(C08): $label: no activation catalog outside a grant change\n${sends.timeline()}", emptyList<Long>(),
+                    pairs.filter { (at, o) -> o.byRound == false && grantWindows.none { (_, from, until) -> at in from..until } }.map { it.first })
+                assertTrue("contract(C08): $label: catalogs since the cycle opened (${catalogTimes.size}) are at most rounds + grant changes " +
+                    "(${last.rounds} + ${changes.size})\n${sends.timeline()}", catalogTimes.size <= last.rounds + changes.size)
+                // Every request a round issued went with the permit open, as the client read it sending the request.
+                assertTrue("contract(C08): $label: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                assertEquals("contract(C08): $label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
+                    sent.filter { it.byRound == true && it.permitOpen != true })
+                // End cleanly: the rest of the window, then the new session settles.
+                onTab = { ok(usdTab(starts, "usd-1d-krx-visible.json")) }
+                awaitTrue("$label: the demand is met", deadline) { rig.s6UsdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                awaitTrue("$label: the tabs settle", deadline) { graph().all { it.bodyEnd != null } }
+                awaitTrue("$label: the server and the recorder agree", deadline) {
+                    synchronized(received) { received.toList() }.sorted() == sends.all().map { it.key }.sorted()
+                }
+                quiet(label, 1_000)
+            }
+        } finally {
+            restorer.cancel()
+            sampler?.cancel()
+            permitAtSend = null
+            refuseUsd = null
+        }
+        assertEquals("contract(C08): no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("contract(C08): within the row deadline", nowMillis() - start <= 120_000)
+        s6AssertBudget(label)
+    }
+
+    @Test
+    fun `S6B C09 a released old round cannot satisfy the new contexts demand`() = runBlocking {
+        val label = "C09"
+        val prepared = clearOfBoundary(70_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 50_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible)
+        val holdOld = java.util.concurrent.CountDownLatch(1)
+        // Every request after the change waits until the old round's release has been judged.
+        val holdNew = java.util.concurrent.CountDownLatch(1)
+        val krxVisible = java.util.concurrent.atomic.AtomicBoolean(true)
+        val rig = S6BetaOnRig()
+        try {
+            rig.s6Row {
+                rig.s6PrepareClosedDemand(deadline, krx = true)
+                val starts = closedStarts()
+                val baseline = tabs().size
+                onCatalog = {
+                    if (krxVisible.get()) ok(fixture("catalog-krx-visible.json"))
+                    else { holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fixture("catalog-krx-hidden.json")) }
+                }
+                // Let the cold start settle before the reconnect and rotation, as RT01-A05 does.
+                rig.s6AwaitTopics(deadline)
+                delay(3_500)
+                val calls = AtomicInteger()
+                // Each later tab's registration as it is sent: the one that meets the demand must carry the capture.
+                val laterRegistrations = Collections.synchronizedList(mutableListOf<TabRegistrationView>())
+                val laterFromRound = Collections.synchronizedList(mutableListOf<Boolean?>())
+                onTab = {
+                    if (calls.getAndIncrement() == 0) holdOld.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                    else {
+                        laterRegistrations += runBlocking { rig.s6UsdTabRegistration() }
+                        laterFromRound += runBlocking { rig.s6UsdTabFromRound() }
+                        holdNew.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                    }
+                    ok(usdTab(starts))
+                }
+                openSockets.last().close(1011, "server restart")
+                awaitTrue("$label: round 1 in flight", deadline) { tabs().size == baseline + 1 }
+                val captured = checkNotNull(rig.s6UsdTabRegistration().captures)
+                assertTrue("contract(C09): $label: round 1 carries kb.usd's capture: $captured", captured.any { it.seriesKey.seriesId == "kb.usd" })
+                val f1 = checkNotNull(rig.s6Bridge())
+                krxVisible.set(false)
+                // The real refusal helper supplies the fresh premium answer; KRX epoch is retained.
+                val catalogsBefore = catalogs().size
+                kotlinx.coroutines.withTimeout(10_000) { rig.s6RefuseReapprove(label) }
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("contract(C09): $label: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                assertNotEquals("contract(C09): $label: a new grant", f1.grant, f2.grant)
+                awaitTrue("$label: the new context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == f2 }
+                holdOld.countDown()
+                awaitTrue("$label: the old round's body ended", deadline) { tabs()[baseline].bodyEnd != null }
+                assertEquals("contract(C09): $label: the old round's full answer was delivered", 200, tabs()[baseline].status)
+                delay(500)
+                assertEquals("contract(C09): $label: the released round applied nothing (the demand is unchanged)", starts.toSet(), rig.s6KbClosedPending())
+                assertTrue("contract(C09): $label: nothing after the change has completed yet",
+                    tabs().drop(baseline + 1).none { it.bodyEnd != null } && catalogs().drop(catalogsBefore).none { it.bodyEnd != null })
+                holdNew.countDown()
+                awaitTrue("$label: a later round met the demand", deadline) { rig.s6UsdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None }
+                quiet(label, 3_000)
+                val after = catalogs().drop(catalogsBefore)
+                assertEquals("contract(C09): $label: one catalog after the change\n${sends.timeline()}", listOf(200), statuses(after))
+                val later = synchronized(laterRegistrations) { laterRegistrations.toList() }
+                val fromRound = synchronized(laterFromRound) { laterFromRound.toList() }
+                val laterTabs = tabs().drop(baseline + 1)
+                println("CUT-C01 $label later tabs: ${laterTabs.map { it.start }}; registrations $later; from a round $fromRound")
+                // The next round, and nothing else: one tab after the change, sent after the catalog ended, with the capture.
+                assertEquals("contract(C09): $label: exactly one tab after the change\n${sends.timeline()}", 1, laterTabs.size)
+                assertEquals("contract(C09): $label: exactly one later registration: $later", 1, later.size)
+                assertTrue("contract(C09): $label: the catalog ended before the later tab\n${sends.timeline()}",
+                    checkNotNull(after.single().bodyEnd) <= laterTabs.single().start)
+                assertTrue("contract(C09): $label: the sole later tab carried kb.usd's capture: $later",
+                    later.single().captures.orEmpty().any { it.seriesKey.seriesId == "kb.usd" })
+                assertEquals("contract(C09): $label: and was issued by the recovery round", listOf<Boolean?>(true), fromRound)
+            }
+        } finally {
+            holdOld.countDown()
+            holdNew.countDown()
+        }
+        assertEquals("contract(C09): no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("contract(C09): within the row deadline", nowMillis() - start <= 50_000)
+        s6AssertBudget(label)
+    }
+
+    @Test
+    fun `S6B C10 a real closed demand keeps the whole ladder and cap`() = runBlocking {
+        val label = "C10"
+        val prepared = clearOfBoundary(200_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 190_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible) // The 401 replay must prepare ON/OPEN, rather than the hidden default.
+        val rig = S6BetaOnRig()
+        rig.s6Row {
+            rig.s6PrepareClosedDemand(deadline)
+            val starts = closedStarts()
+            val baseline = tabs().size
+            onTab = { unavailable() }
+            assertEquals("contract(C10): $label: every closed start is demanded", starts.toSet(), rig.s6KbClosedPending())
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: six recovery rounds completed", deadline) { tabs().size == baseline + 6 && tabs().all { it.bodyEnd != null } }
+            val r = tabs().drop(baseline)
+            for (i in 0 until 5) {
+                val gap = r[i + 1].start - checkNotNull(r[i].bodyEnd)
+                assertTrue("contract(C10): $label: round ${i + 2} goes ${ladder[i]} ms after round ${i + 1} completed, not before (gap $gap)\n${sends.timeline()}",
+                    gap >= ladder[i] - 50)
+                assertTrue("contract(C10): $label: and without a needless delay (gap $gap)\n${sends.timeline()}", gap <= ladder[i] + 2_000)
+            }
+            awaitTrue("$label: the cycle is exhausted", deadline) { rig.s6UsdBudget()?.stop?.toString() == "EXHAUSTED" }
+            assertEquals("contract(C10): $label: six rounds in the cycle", 6, checkNotNull(rig.s6UsdBudget()).rounds)
+            assertEquals("contract(C10): $label: every closed start is still demanded", starts.toSet(), rig.s6KbClosedPending())
+            assertEquals("contract(C10): $label: the recorder still demands the closed buckets",
+                com.jay.fxi.data.graph.GraphTabRecoveryDemand.Pending(closed = true, mappingWait = false), rig.s6UsdDemand())
+            quiet(label, 49_000)
+            assertEquals("contract(C10): $label: still exhausted after the quiet window", "EXHAUSTED", rig.s6UsdBudget()?.stop?.toString())
+        }
+        assertEquals("contract(C10): no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("contract(C10): within the row deadline", nowMillis() - start <= 190_000)
+        assertEquals("contract(C10): $label: every recovery round answered 503", List(6) { 503 }, statuses(tabs()).takeLast(6))
+        s6AssertBudget(label)
+    }
+
+    @Test
+    fun `S6B C11 a longer Retry-After floor holds the next round`() = runBlocking {
+        val label = "C11"
+        assertEquals("contract(C11): J = 10 s for usd", 10.seconds, FreeSnapshotSchedulePolicy.jitterFor(SEED, "usd"))
+        val prepared = clearOfBoundary(90_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 80_000
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible) // The 401 replay must prepare ON/OPEN, rather than the hidden default.
+        val rig = S6BetaOnRig()
+        rig.s6Row {
+            rig.s6PrepareClosedDemand(deadline)
+            val starts = closedStarts()
+            val baseline = tabs().size
+            val calls = AtomicInteger()
+            onTab = {
+                when (calls.getAndIncrement()) {
+                    0 -> unavailable()
+                    1 -> unavailable(retryAfter = 30)
+                    else -> ok(usdTab(starts))
+                }
+            }
+            openSockets.last().close(1011, "server restart")
+            awaitTrue("$label: the second round completed", deadline) { tabs().size == baseline + 2 && tabs().last().bodyEnd != null }
+            val second = tabs()[baseline + 1]
+            val secondEnd = checkNotNull(second.bodyEnd)
+            awaitTrue("$label: the third round went", deadline) { tabs().size == baseline + 3 }
+            val third = tabs()[baseline + 2]
+            val graphBetween = graph().filter { it.start > secondEnd && it.start < third.start }
+            assertTrue("contract(C11): $label: the third round waits for the floor, not the 6 s rung (${third.start - secondEnd} ms)\n${sends.timeline()}",
+                third.start >= secondEnd + 40_000 - 50)
+            assertTrue("contract(C11): $label: and goes at the floor (${third.start - secondEnd} ms)\n${sends.timeline()}", third.start <= secondEnd + 42_000)
+            assertEquals("contract(C11): $label: nothing else sent under the floor\n${sends.timeline()}", emptyList<SendRecorder.Exchange>(), graphBetween)
+            awaitTrue("$label: the third round met the demand", deadline) {
+                rig.s6UsdDemand() == com.jay.fxi.data.graph.GraphTabRecoveryDemand.None
+            }
+            quiet(label, 5_000)
+        }
+        assertEquals("contract(C11): no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("contract(C11): within the row deadline", nowMillis() - start <= 80_000)
+        s6AssertBudget(label)
+    }
+
+    @Test
+    fun `S6B C12 an old completion after a user end holds the refills floor`() = runBlocking {
+        val label = "C12"
+        assertEquals("contract(C12): J = 10 s for usd", 10.seconds, FreeSnapshotSchedulePolicy.jitterFor(SEED, "usd"))
+        val prepared = clearOfBoundary(90_000)
+        println("CUT-C01 $label: waited ${prepared} ms before the start to stay clear of a 600 s boundary")
+        val start = nowMillis()
+        val deadline = start + 80_000
+        val wallAtOrigin = System.currentTimeMillis() - nowMillis()
+        entitlements += unauthorized()
+        entitlements += ok(premiumKrxVisible) // The 401 replay must prepare ON/OPEN, rather than the hidden default.
+        val holdOld = java.util.concurrent.CountDownLatch(1)
+        val oldBody = shiftedTab(fixture("usd-3m-krx-hidden.json"), 7.0)
+        val oldAll = tabValues(oldBody).values.flatten().toSet()
+        onCatalog = { ok(fixture("catalog-krx-hidden.json")) }
+        onTab = { request ->
+            if (request.requestUrl!!.queryParameter("period") == "3m") {
+                holdOld.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                ok(oldBody).setHeader("Retry-After", 20)
+            } else ok(fixture("usd-1d-krx-hidden.json"))
+        }
+        val rig = S6BetaOnRig()
+        try {
+            rig.s6Row {
+                val holder = checkNotNull(rig.s6ColdStart(deadline))
+                rig.s6AwaitTopics(deadline)
+                awaitTrue("$label: catalog and the usd tab applied", deadline) {
+                    rig.s6CatalogAdopted() && rig.s6UsdApplied() && tabs().all { it.bodyEnd != null }
+                }
+                val f1 = checkNotNull(rig.s6Bridge())
+                quiet("$label settle", 3_500)
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("$label: the 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.bodyEnd == null } }
+
+                val endAt = nowMillis()
+                entitlementsGate = java.util.concurrent.CountDownLatch(1)
+                val approval = CoroutineScope(rig.issuerJob + Dispatchers.Default).launch {
+                    val next = rig.firebase.nextGeneration()
+                    rig.coordinator.onIdentityChanged(next)
+                    rig.coordinator.refresh(RefreshIntent.FORCE_PREMIUM)
+                }
+                var oldEnd = 0L
+                var floorAt = 0L
+                var releasedAt = 0L
+                try {
+                    awaitTrue("$label: the end alone was delivered", deadline) { rig.s6Bridge() == null }
+                    awaitTrue("$label: the old context is disposed", deadline) { rig.assembly.coordinator.state.value.source == null }
+                    assertNull("contract(C12): $label: no floor yet", rig.s6RetryFloor())
+                    holdOld.countDown()
+                    awaitTrue("$label: the old 3m body ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
+                    oldEnd = checkNotNull(tabs().first { it.param("period") == "3m" }.bodyEnd)
+                    awaitTrue("$label: the old answer's floor is recorded", deadline) { rig.s6RetryFloor() != null }
+                    floorAt = checkNotNull(rig.s6RetryFloor()).toEpochMilliseconds() - wallAtOrigin
+                    println("CUT-C01 $label: old 3m body end $oldEnd ms, floor at $floorAt ms")
+                    assertTrue("contract(C12): $label: the floor is the Retry-After plus the jitter ($floorAt vs $oldEnd)",
+                        floorAt >= oldEnd + 30_000 - 50 && floorAt <= oldEnd + 31_000)
+                    delay(300)
+                    assertTrue("contract(C12): $label: nothing of the old answer is applied", rig.onMain {
+                        rig.assembly.coordinator.state.value.entries.values
+                            .flatMap { e -> e.tab.graph.series.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } } }
+                            .toSet().intersect(oldAll).isEmpty()
+                    })
+                } finally {
+                    releasedAt = nowMillis()
+                    entitlementsGate?.countDown()
+                    entitlementsGate = null
+                }
+                approval.join()
+                val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
+                assertEquals("contract(C12): $label: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
+                awaitTrue("$label: the new grant is delivered", deadline) { rig.s6Bridge() == f2 }
+                awaitTrue("$label: the new context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == f2 }
+                // The refill waits for the floor, then goes.
+                awaitTrue("$label: the refill went", deadline) { graph().any { it.start > releasedAt } }
+                val refill = graph().filter { it.start > releasedAt }
+                println("CUT-C01 $label: refill ${refill.map { "${it.path.substringAfterLast('/')} ${it.start}" }}")
+                assertTrue("contract(C12): $label: no refill before the floor ($floorAt)\n${sends.timeline()}", refill.all { it.start >= floorAt - 50 })
+                assertTrue("contract(C12): $label: the refill goes at the floor (${refill.first().start} vs $floorAt)", refill.first().start <= floorAt + 2_000)
+                awaitTrue("$label: the refill applied", deadline) { rig.s6UsdApplied() && graph().all { it.bodyEnd != null } }
+                assertTrue("contract(C12): $label: still nothing of the old answer", rig.onMain {
+                    rig.assembly.coordinator.state.value.entries.values
+                        .flatMap { e -> e.tab.graph.series.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } } }
+                        .toSet().intersect(oldAll).isEmpty()
+                })
+                settleNewSession(label, endAt, deadline)
+            }
+        } finally {
+            holdOld.countDown()
+            entitlementsGate?.countDown(); entitlementsGate = null
+        }
+        assertEquals("contract(C12): no reported failure", emptyList<Throwable>(), rig.reports)
+        assertTrue("contract(C12): within the row deadline", nowMillis() - start <= 80_000)
+        s6AssertBudget(label)
+    }
+
+    @Test
+    fun `S6B C13 an observed USER hold resumes only on a fresh lifetime`() = s6UserHoldRow("C13", observed = true)
+
+    @Test
+    fun `S6B C14 an unobserved USER hold resumes only on a fresh lifetime`() = s6UserHoldRow("C14", observed = false)
+
+    @Test
+    fun `S6B ON-C the cutover PAC reaches OPEN with a positive permit`() = runBlocking {
+        entitlements += ok(premiumKrxVisible)
+        val rig = S6BetaOnRig()
+        rig.s6Row {
+            rig.approve()
+            val f = checkNotNull(rig.coordinator.topicGrantResult().fence)
+            rig.s6Open("ON-C")
+            assertNotNull("contract(ON-C): GENERAL can be acquired", rig.uses.acquire(f))
+            println("S6B ON-C initial C=" + rig.coordinator.accessSnapshot.capabilityInvalidations)
+        }
+    }
+
+    private data class S6SessionMark(
+        val session: com.jay.fxi.data.remote.TopicSessionCoordinator,
+        val sessionKey: Any?, val connection: Any?, val generation: Any?, val grantEpoch: Any?,
+        val store: Any?, val rates: Any?, val connectCount: Int, val handshakes: Int,
+        val receive: Map<String, Long>, val bootstraps: List<SendRecorder.Exchange>
+    )
+
+    private suspend fun S6BetaOnRig.s6SessionMark(): S6SessionMark {
+        val session = s6Session()
+        return s6OnRuntime {
+            S6SessionMark(session, privateField(session, "sessionKey"), privateField(session, "connection"),
+                privateField(session, "generation"), privateField(session, "grantEpoch"), privateField(session, "store"),
+                privateField(session, "liveRates"), connectCalls.get(), sends.all().count { it.zone == "ws" },
+                (privateField(session, "store") as com.jay.fxi.domain.model.TopicSubscriptionStateStore).snapshot.topics.mapValues { it.value.receiveGeneration },
+                bootstraps().toList())
+        }
+    }
+
+    /** A1 settlement waits for the original bodies, never a fresh set of DESIRED bootstraps. */
+    private suspend fun S6BetaOnRig.s6SettleSameSession(row: String, before: S6SessionMark, deadline: Long) {
+        awaitTrue("contract($row): original topic bodies settled", deadline) { before.bootstraps.all { it.bodyEnd != null } }
+        awaitTrue("contract($row): every graph body ended", deadline) { graph().all { it.bodyEnd != null } }
+        awaitTrue("contract($row): server and physical recorder agree", deadline) {
+            synchronized(received) { received.toList() }.sorted() == sends.all().map { it.key }.sorted()
+        }
+        quiet("contract($row): same-session settlement", 1_000)
+        val after = s6SessionMark()
+        assertSame("contract($row): session", before.session, after.session)
+        assertSame("contract($row): session key", before.sessionKey, after.sessionKey)
+        assertSame("contract($row): wire connection", before.connection, after.connection)
+        assertEquals("contract($row): receive connection generation", before.generation, after.generation)
+        assertEquals("contract($row): grant generation", before.grantEpoch, after.grantEpoch)
+        assertSame("contract($row): subscription store", before.store, after.store)
+        assertTrue("contract($row): receive generations never reset", before.receive.all { (topic, generation) -> (after.receive[topic] ?: -1) >= generation })
+        assertEquals("contract($row): no extra connect", before.connectCount, after.connectCount)
+        assertEquals("contract($row): no extra handshake", before.handshakes, after.handshakes)
+        assertEquals("contract($row): no rotation bootstrap", before.bootstraps, after.bootstraps)
+    }
+
+    @Test
+    fun `S6B C01 a capability-only rotation keeps the session and GENERAL`() = runBlocking {
+        val waited = clearOfBoundary(60_000)
+        println("S6B C01 boundary wait $waited ms")
+        val deadline = nowMillis() + 50_000
+        entitlements += ok(premiumKrxVisible)
+        val holdOld = java.util.concurrent.CountDownLatch(1)
+        val old = shiftedTab(fixture("usd-3m-krx-visible.json"), 7.0)
+        val rig = S6BetaOnRig()
+        try {
+            rig.s6Row {
+                val holder = checkNotNull(rig.s6PrepareClosedDemand(deadline, krx = true))
+                rig.s6AwaitTopics(deadline)
+                quiet("contract(C01): initial settlement", 3_500)
+                val pending = rig.s6KbClosedPending()
+                val tip = rig.s6KbState()?.data?.app?.tip
+                val before = rig.coordinator.accessSnapshot
+                val record = rig.epochStore.load()
+                val f1 = checkNotNull(rig.s6Bridge())
+                val lifetime = checkNotNull(rig.uses.acquire(f1))
+                val session = rig.s6SessionMark()
+                val catalog = rig.assembly.coordinator.state.value.catalog
+                onTab = { request ->
+                    if (request.requestUrl!!.queryParameter("period") == "3m") {
+                        assertTrue("premise: old GENERAL/KRX body is still in its held window", holdOld.count > 0)
+                        holdOld.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                        ok(old)
+                    } else ok(fixture("usd-1d-krx-hidden.json"))
+                }
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                awaitTrue("premise: old 3m body registered and held", deadline) { rig.s6UsdCaptureEpoch("3m").first && tabs().any { it.param("period") == "3m" && it.bodyEnd == null } }
+                entitlements += ok(PREMIUM_HIDDEN)
+                rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+                val after = rig.coordinator.accessSnapshot
+                val next = rig.epochStore.load()
+                assertNotEquals("contract(C01): real K1 to K2", record.krxCapabilityEpoch, next.krxCapabilityEpoch)
+                assertEquals("contract(C01): same token", f1, rig.coordinator.topicGrantResult().fence)
+                assertEquals("contract(C01): same U", before.userInvalidations, after.userInvalidations)
+                assertEquals("contract(C01): same USER end", before.lastUserEnd, after.lastUserEnd)
+                assertTrue("contract(C01): capability end advanced", (after.lastCapabilityEnd?.sequence ?: 0L) > (before.lastCapabilityEnd?.sequence ?: 0L))
+                assertEquals("contract(C01): capability end names K1", record.krxCapabilityEpoch, after.lastCapabilityEnd?.namespace)
+                assertEquals("contract(C01): USER invalidation floor retained", before.userEndInvalidationsFloor, after.userEndInvalidationsFloor)
+                assertEquals("contract(C01): same USER epoch", record.userAccessEpoch, next.userAccessEpoch)
+                assertEquals("contract(C01): first capability edge C+1", before.capabilityInvalidations + 1, after.capabilityInvalidations)
+                assertTrue("contract(C01): old GENERAL use admitted", rig.uses.admits(lifetime))
+                assertTrue("contract(C01): request remains registered", rig.s6UsdCaptureEpoch("3m").first)
+                val owed = { r: com.jay.fxi.data.entitlements.AccessEpochRecord -> r.pendingPurges.filter {
+                    PurgeScope.CAPABILITY in it.scopes && it.krxCapabilityEpoch == record.krxCapabilityEpoch } }
+                assertEquals("contract(C01): journal before 0", 0, owed(record).size)
+                assertEquals("contract(C01): Deferred journal after 1", 1, owed(next).size)
+                assertSame("contract(C01): catalog retained", catalog, rig.assembly.coordinator.state.value.catalog)
+                assertEquals("contract(C01): demand retained", pending, rig.s6KbClosedPending())
+                assertEquals("contract(C01): recorder quote retained", tip, rig.s6KbState()?.data?.app?.tip)
+                val afterRotation = rig.s6SessionMark()
+                assertEquals("contract(C01): live topic rates retained", session.rates, afterRotation.rates)
+                assertEquals("contract(C01): receive generations retained through rotation", session.receive, afterRotation.receive)
+                holdOld.countDown()
+                val general = tabValues(old).filterKeys { !it.startsWith("krx.") }.values.flatten().toSet()
+                val key = com.jay.fxi.data.graph.GraphKey("usd", GraphPeriod.THREE_MONTHS)
+                awaitTrue("contract(C01): valid old GENERAL adopted", deadline) {
+                    rig.onMain { rig.assembly.coordinator.protectedEntry(key)?.tab?.graph?.series.orEmpty().filterNot { it.seriesId.startsWith("krx.") }
+                        .flatMap { it.points.flatMap { p -> listOfNotNull(p.rate, p.high, p.low) } }.let { it.isNotEmpty() && it.all { v -> v in general } } }
+                }
+                assertTrue("contract(C01): old KRX not exposed", rig.onMain {
+                    rig.assembly.coordinator.protectedEntry(key)?.tab?.graph?.series.orEmpty().none { it.seriesId.startsWith("krx.") } })
+                openSockets.last().send(usdSnapshotAt(1397.0, System.currentTimeMillis() / 1000))
+                awaitTrue("contract(C01): same wire still accepts GENERAL", deadline) { rig.s6KbState()?.data?.app?.tip?.rate == 1397.0 }
+                rig.s6SettleSameSession("C01", session, deadline)
+                assertEquals("contract(C01): Deferred remains at end", 1, owed(rig.epochStore.load()).size)
+            }
+        } finally { holdOld.countDown() }
+        assertEquals("contract(C01): reported failures", emptyList<Throwable>(), rig.reports)
+        s6AssertBudget("C01")
+    }
+
+    @Test
+    fun `S6B C03 an old KRX capture after reapproval applies GENERAL alone`() = s6CaptureRow("C03", hiddenCapture = false)
+
+    @Test
+    fun `S6B C04 a hidden capture never gains KRX and a fresh K2 capture does`() = s6CaptureRow("C04", hiddenCapture = true)
+
+    private fun s6CaptureRow(row: String, hiddenCapture: Boolean) = runBlocking {
+        val waited = clearOfBoundary(70_000)
+        println("S6B $row boundary wait $waited ms")
+        val deadline = nowMillis() + 60_000
+        entitlements += ok(premiumKrxVisible)
+        onCatalog = { ok(fixture("catalog-krx-visible.json")) }
+        val phase = AtomicInteger(0)
+        val holdOld = java.util.concurrent.CountDownLatch(1)
+        val holdFresh = java.util.concurrent.CountDownLatch(1)
+        val control = fixture("usd-3m-krx-visible.json")
+        val old = shiftedTab(control, 7.0)
+        val fresh = shiftedTab(control, 11.0)
+        val rig = S6BetaOnRig()
+        val captures = Collections.synchronizedList(mutableListOf<Pair<Boolean, String?>>())
+        onTab = { request ->
+            if (request.requestUrl!!.queryParameter("period") != "3m") ok(fixture("usd-1d-krx-visible.json"))
+            else {
+                captures += runBlocking { rig.s6UsdCaptureEpoch("3m") }
+                when (phase.get()) {
+                    0 -> ok(control)
+                    1 -> { holdOld.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(old) }
+                    else -> { holdFresh.await(30, java.util.concurrent.TimeUnit.SECONDS); ok(fresh) }
+                }
+            }
+        }
+        try {
+            rig.s6Row {
+                val holder = checkNotNull(rig.s6ColdStart(deadline))
+                rig.s6AwaitTopics(deadline)
+                awaitTrue("contract($row): initial tab applied", deadline) { rig.s6CatalogAdopted() && rig.s6UsdApplied() && graph().all { it.bodyEnd != null } }
+                quiet("contract($row): initial settlement", 3_500)
+                val f1 = checkNotNull(rig.s6Bridge())
+                val before = rig.coordinator.accessSnapshot
+                val e1 = checkNotNull(rig.epochStore.load().krxCapabilityEpoch)
+                val key = com.jay.fxi.data.graph.GraphKey("usd", GraphPeriod.THREE_MONTHS)
+                rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
+                val e1Path = "krx/${diskHex(f1.identity.uid)}/${diskHex(checkNotNull(f1.userAccessEpoch))}/${diskHex(e1)}/${diskHex("usd")}/3m.json"
+                awaitTrue("contract($row): E1 file positive control", deadline) { e1Path in rig.s6WrittenFiles() }
+                rig.s6AwaitWritesDrained(row, deadline)
+                val e1Files = rig.s6KrxFiles()
+                assertTrue("contract($row): E1 protected KRX positive", rig.onMain { rig.assembly.coordinator.protectedEntry(key)?.tab?.graph?.series.orEmpty().any { it.seriesId.startsWith("krx.") } })
+                val session = rig.s6SessionMark()
+                suspend fun hide() {
+                    entitlements += ok(PREMIUM_HIDDEN)
+                    rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+                }
+                if (hiddenCapture) hide()
+                phase.set(1)
+                val callsBefore = captures.size
+                rig.onMain { rig.assembly.coordinator.onRefreshRequested(force = true) }
+                awaitTrue("premise: unique old 3m request is held", deadline) { captures.size > callsBefore && tabs().last { it.param("period") == "3m" }.bodyEnd == null }
+                assertEquals("contract($row): original capture", true to (if (hiddenCapture) null else e1), captures.last())
+                val oldRegistration = rig.onMain {
+                    (privateField(rig.assembly.coordinator, "tabRequests") as Map<*, *>)[key]
+                }
+                assertNotNull("premise: registered before K2 approval", oldRegistration)
+                if (!hiddenCapture) hide()
+                val e2 = checkNotNull(rig.epochStore.load().krxCapabilityEpoch)
+                assertNotEquals("contract($row): real epoch rotation", e1, e2)
+                entitlements += ok(premiumKrxVisible)
+                rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS)
+                rig.s6Open(row)
+                assertEquals("contract($row): reapproval preserves K2", e2, rig.epochStore.load().krxCapabilityEpoch)
+                assertEquals("contract($row): same session grant", f1, rig.coordinator.topicGrantResult().fence)
+                assertEquals("contract($row): same U", before.userInvalidations, rig.coordinator.accessSnapshot.userInvalidations)
+                assertEquals("contract($row): C increment counted once", before.capabilityInvalidations + 1, rig.coordinator.accessSnapshot.capabilityInvalidations)
+                assertSame("contract($row): old request is still registered at completion", oldRegistration, rig.onMain {
+                    (privateField(rig.assembly.coordinator, "tabRequests") as Map<*, *>)[key] })
+                // No K2 answer can complete while the old completion is judged.
+                phase.set(2)
+                assertTrue("premise: fresh answer gate remains closed", holdFresh.count > 0)
+                val freshBaseline = captures.size
+                holdOld.countDown()
+                val oldGeneral = tabValues(old).filterKeys { !it.startsWith("krx.") }.values.flatten().toSet()
+                awaitTrue("contract($row): original registered 200 GENERAL applied", deadline) {
+                    rig.onMain { rig.assembly.coordinator.state.value.entries[key]?.tab?.graph?.series.orEmpty().filterNot { it.seriesId.startsWith("krx.") }
+                        .flatMap { it.points.flatMap { p -> listOfNotNull(p.rate, p.high, p.low) } }.let { it.isNotEmpty() && it.all { v -> v in oldGeneral } } }
+                }
+                rig.s6AwaitWritesDrained(row, deadline)
+                rig.onMain {
+                    assertNull("contract($row): old KRX slot absent", rig.s6SlotComponents(key)?.krx)
+                    val read = checkNotNull(rig.assembly.coordinator.protectedEntry(key))
+                    assertTrue("contract($row): old KRX protected read absent", read.tab.graph.series.none { it.seriesId.startsWith("krx.") })
+                    val values = read.tab.graph.series.flatMap { it.points.flatMap { p -> listOfNotNull(p.rate, p.high, p.low) } }
+                    assertTrue("contract($row): protected GENERAL from unique old answer", values.isNotEmpty() && values.all { it in oldGeneral })
+                    assertNull("contract($row): mismatched completion is unconfirmed", rig.assembly.coordinator.state.value.entries[key]?.online200At)
+                }
+                assertEquals("contract($row): no old KRX file added or changed", e1Files, rig.s6KrxFiles())
+                val callsAtOld = freshBaseline
+                rig.onMain { rig.assembly.coordinator.onRefreshRequested(force = true) }
+                awaitTrue("contract($row): fresh K2 capture sent", deadline) { synchronized(captures) { captures.drop(callsAtOld).any { it == (true to e2) } } }
+                assertEquals("contract($row): E1 SHA before fresh completion", e1Files, rig.s6KrxFiles())
+                holdFresh.countDown()
+                val freshKrx = tabValues(fresh).filterKeys { it.startsWith("krx.") }.values.flatten().toSet()
+                awaitTrue("contract($row): only fresh K2 is protected", deadline) {
+                    rig.onMain {
+                        val krx = rig.assembly.coordinator.protectedEntry(key)?.tab?.graph?.series.orEmpty().filter { it.seriesId.startsWith("krx.") }
+                        val values = krx.flatMap { it.points.flatMap { p -> listOfNotNull(p.rate, p.high, p.low) } }
+                        rig.s6SlotComponents(key)?.krx?.key?.krxCapabilityEpoch == e2 && values.isNotEmpty() && values.all { it in freshKrx }
+                    }
+                }
+                rig.s6AwaitWritesDrained(row, deadline)
+                val e2Path = e1Path.replace("/${diskHex(e1)}/", "/${diskHex(e2)}/")
+                assertTrue("contract($row): fresh K2 file written", e2Path in rig.s6KrxFiles())
+                assertEquals("contract($row): all E1 path SHA values preserved at end", e1Files, rig.s6KrxFiles().filterKeys { it in e1Files })
+                rig.s6SettleSameSession(row, session, deadline)
+                println("S6B $row E1 sha $e1Files; final KRX sha ${rig.s6KrxFiles()}; captures $captures")
+            }
+        } finally { holdOld.countDown(); holdFresh.countDown() }
+        assertEquals("contract($row): reported failures", emptyList<Throwable>(), rig.reports)
+        s6AssertBudget(row)
+    }
+
+    private fun s6AssertBudget(row: String) {
+        try { ColdStartBudget.assertWithin(judgeRow(row)) }
+        catch (failure: AssertionError) { throw AssertionError("contract($row): physical budget", failure) }
+    }
+    // S6B END
 }
