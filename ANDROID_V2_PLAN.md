@@ -53,9 +53,10 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 경합 상한 순수 정책, 운영 호출자 0, 2026-10-22)와 S6-2b0b(`f102623`: 그 상한의 PAC 배선, 스위치 기본
                                 꺼짐, 2026-10-23), S6-2b-1a(`159cbbf`: KRX 허가 판정·예약 표지의 PAC 배선, 스위치 꺼짐, 2026-10-24),
                                 S6-2b-1b-α(`da1f293`: KRX 소비자 판정과 송신 표지 운반, 스위치 꺼짐, 2026-10-27),
-                                S6-2b-1b-β(`f79d334`: KRX 소비자 켬 짝 시험·cutover 인수 15행·U10 결론, 시험만, 2026-10-27)를
-                                land했다. KRX 구독·FORCE_ENTITLEMENTS 호출자·스위치 켬은 S6-2b-2 몫이다
-                                (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
+                                S6-2b-1b-β(`f79d334`: KRX 소비자 켬 짝 시험·cutover 인수 15행·U10 결론, 시험만, 2026-10-27),
+                                S6-2b-2α(`48bb96a`: KRX 세션 허가 소비·typed 송신·REST 사다리, 스위치 꺼짐, 2026-10-28)를
+                                land했다. 다음은 scope r14 순서대로 S6-3 → S6-4 기본 꺼짐 준비 → S6-2b-2β(최종 동일 후보의
+                                측정용 켬·P1(b))다 (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1740,8 +1741,19 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   더했다. 시험은 Codex가 쓰고 Claude가 Gradle 원본·변이–행 쌍 단독 실행으로 검증했다(첫 실패가 담당 행 계약
   단언인 경우만 검출로 셈, 평가 불가 3은 제외). 단위 9220/0, cutover 110/0과 검증기 통과. U10은 10개 행군 모두
   기존 판정 유지·사용자 재결정 0으로 종결했다(전제 변경 보고 대상).
-  · 보류: KRX 구독·FORCE_ENTITLEMENTS 호출자·허가 소비·스위치 켬은
-  S6-2b-2(세션 허가 소비·송신 경로·스위치 켬) 몫이다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
+  · S6-2b-2α `48bb96a` KRX 세션 허가 소비·typed 송신·REST 사다리(설계 r2·scope r14·seam r3, 트리 밖 manifest r22):
+  스위치 꺼짐 뒤에 TopicSessionCoordinator·SnapshotTopicUseAuthority·TopicSubscribeCommand를 배선했다. 한 snapshot의
+  표지·permit·use로 typed WS 시도를 준비하고 encode 직전 revision을 비교해 성공 송신의 permit만 소비한다. ACK·frame은
+  store/lease 적용 전에 원래 capture로 검증한다. 숨김·capInv 변화·use 상실은 소비를 되돌리고 KRX capture 격리와
+  bootstrap 취소만 한다(WS 연결이 없어도). REST 사다리는 grant별 initial plan·p별 사다리 이력·시도 진입 floor 판정을
+  따르고, p=0 세션은 같은 snapshot의 hint로 첫 permit을 발견한다. 운영 KRX desired 생산자는 없다. 시험은 Codex 작성
+  스레드가, 참조 구현은 고정된 시험 위에서 Codex 구현 스레드가 썼고, 시험·구현을 쓰지 않은 독립 검토 스레드가 구현
+  (3회 — 9305 통과 뒤에도 계약 누락 5건 지적)·seam r3·commit·push를 판정했다. α 계약 메서드 99개와 기존 메서드 명시
+  개정 18개. 단위 9319/0, 스텁(HEAD 동작) 실패 103 전부 계약 표식, 변이 95종 104쌍에서 모든 변이가 최소 한 행에서
+  계약 검출(원 행 생존 5·전제 1은 보강 행이 검출), CI 세 변형 로컬 통과, hosted CI run `40590710986` green.
+  seam r3가 보장 범위 밖으로 둔 열(token 대기·401 replay 중 floor 재검사 등)은 계약 문서에 명시했다.
+  · 보류: 실제 KRX unsubscribe·purge·늦은 프레임 폐기(S6-3), KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이
+  남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
   A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
   답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)다. 다음 D4 판 조건은 D4 r6(A2 r8·A1 r9 반영, 트리 밖
   manifest r7)으로 채웠고, 남은 조건은 2b-2 계약의 CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. scope U10(CUT-C01
