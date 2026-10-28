@@ -385,7 +385,7 @@ class GraphRecorderReducerTest {
         }
     }
 
-    /** K11: a capability end or capability block changes nothing here, and no krx.* series is ever made. */
+    /** K11: GENERAL-only fixture; capability end/block preserves its scope, floor and values. ON KRX is G04/G07/G16. */
     @Test fun K11_capabilityEndsLeaveTheGeneralScope() {
         val (s0, _) = R.captureRequests(withKb(), setOf(kb), snap(1), fenceN, true)
         val access = snap(2, capabilityEnd = 1, capabilityBlocks = setOf(TopicAccessBlock.NOT_GRANTED))

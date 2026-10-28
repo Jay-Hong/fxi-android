@@ -193,6 +193,7 @@ internal class GraphV2ScreenStateHolder(
     private var fullscreenGeneration = 0L
     private var fullscreenOpen = false
     private var preparationKey: GraphV2PreparationKey? = null
+    private var preparedKrxRevision = 0L
     private var prepared: PreparedGraph? = null
     private var inlineVisible = false
     private var fullscreenVisible = false
@@ -219,6 +220,17 @@ internal class GraphV2ScreenStateHolder(
         observe(coordinator.state)
         observe(selectionSession.publication)
         holderScope.launch {
+            gate.krxGraphRevisions.collect { revision ->
+                // Skip only the initial zero. A late start must still process an already-installed cutoff.
+                if (revision != preparedKrxRevision) {
+                    preparedKrxRevision = revision
+                    clearPreparation()
+                    currentState()
+                    signal()
+                }
+            }
+        }
+        holderScope.launch {
             if (recorder != null) {
                 recorder.state.collect { scheduleLivePublication() }
             } else {
@@ -240,12 +252,17 @@ internal class GraphV2ScreenStateHolder(
     fun currentState(): GraphV2ScreenState = currentState(publish = false)
 
     private fun currentState(publish: Boolean): GraphV2ScreenState {
+        val cutoffRevision = gate.krxGraphRevisions.value
+        if (cutoffRevision != preparedKrxRevision) {
+            preparedKrxRevision = cutoffRevision
+            clearPreparation()
+        }
         val capturedContext = context
         val capturedAccess = capturedContext?.let { gate.bindWithConfiguration(it.fence, it.lifetime) }
         val candidate = render(publish)
         // Re-read live sources after exposure and preparation, immediately before publication.
         val current = context
-        val safe = if (current != null && !isCurrent(current)) {
+        val admitted = if (current != null && !isCurrent(current)) {
             retireContext()
             emptyState(if (activeOwner == null || closed) GraphV2Content.INACTIVE else GraphV2Content.BLOCKED)
         } else if (current != null && gate.bindWithConfiguration(current.fence, current.lifetime) != capturedAccess) {
@@ -255,6 +272,12 @@ internal class GraphV2ScreenStateHolder(
             signal()
             emptyState(GraphV2Content.BLOCKED)
         } else candidate
+        // This must follow the final access bind too: preparation or a supplier can install D1.
+        val safe = if (gate.krxGraphRevisions.value != cutoffRevision) {
+            clearPreparation()
+            signal()
+            emptyState(if (activeOwner == null || closed) GraphV2Content.INACTIVE else GraphV2Content.BLOCKED)
+        } else admitted
         mutableState.value = safe
         return safe
     }

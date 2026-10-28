@@ -1,0 +1,21 @@
+{
+  "head_commit": "24ea81ca8ed9f2dddbd0eb8c05a16420ce601180",
+  "probe_source_sha256": "a164ef2098d6b80fdaba0d39f93eece0617393372253553c2cf48f2f151bbc3c",
+  "command": [
+    "./gradlew",
+    ":app:testDebugUnitTest",
+    "--offline",
+    "--no-daemon",
+    "--rerun-tasks",
+    "--init-script",
+    "/Users/jay/fxi-worktrees/s6-3b1-author/.s63b1_evidence/o03-head-output.init.gradle",
+    "-Ds63b1.o03.headTraceOut=/Users/jay/fxi-worktrees/s6-3b1-author/.s63b1_evidence/claude-r10/actual-head-2/o03_head_trace.json",
+    "--tests",
+    "com.jay.fxi.S6Krx3bO03HeadProbe.writeHeadTraceOnlyWhenRequested"
+  ],
+  "output_sha256": "7d2d3275e1b8c6b604ecbc58d62c1ff68f809879500960fd07342d924751b2a0",
+  "source_output": "/Users/jay/fxi-worktrees/s6-3b1-author/.s63b1_evidence/claude-r10/actual-head-2/o03_head_trace.json",
+  "junit_xml_sha256": "15c618c45fb1c152f0e595315dbccbdb2ded786edb0e7d42d6d1968dadcb81eb",
+  "schema": 1,
+  "immutable_after_initial_capture": true
+}

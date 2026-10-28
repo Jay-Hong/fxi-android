@@ -1102,7 +1102,8 @@
     "data/remote/TopicSessionKrxRestMarkerTest.kt",
     "data/remote/TopicSessionKrxSendMarkerTest.kt",
     "data/remote/TopicSubscribeCommandTest.kt",
-    "domain/model/TopicSubscriptionStateTest.kt"
+    "domain/model/TopicSubscriptionStateTest.kt",
+    "data/remote/S6KrxGraphSessionRig.kt"
   ],
   "helper_closure": [
     "| data/entitlements/KrxContestHarness.kt:33 KRX_REFUSAL | 부품만. KRX 단독 사유 상수; production caller 아님 |",

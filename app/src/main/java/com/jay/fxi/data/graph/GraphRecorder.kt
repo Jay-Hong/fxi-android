@@ -31,7 +31,8 @@ internal enum class GraphRecorderPurge { REMOVED, NOTHING_TO_REMOVE, LIVE_SCOPE_
  * [retain] reads only the clock, once, and syncs nothing.
  * Both observe paths and [loseTopics] replay held inputs in order before the new input or loss,
  * using the same suppliers and clock value. Only observations bind their original captures;
- * continuity facts need no admission.
+ * GENERAL continuity facts need no admission. KRX observations, facts and losses retain their original
+ * source stamp and must pass the live original-use/cutoff gate at consumption.
  *
  * An observation from the held data scope dropped for a missing current scope records a loss
  * without adopting prices. Earlier pending losses wait until that scope is current again. The
@@ -90,6 +91,15 @@ internal class GraphRecorder(
         mutableState.value = replayPending(mutableState.value, catalog, snapshot, fence)
     }
 
+    private fun admitsKrx(stamp: KrxGraphStamp): Boolean =
+        gate.bindKrxGraph(stamp.scope.owner, stamp.scope.use.lifetime, stamp) != null
+
+    private fun observationAdmission(input: TopicGraphInput.Observations): Boolean =
+        if (isKrxGraphTopic(input.topic)) input.krxGraphStamp?.let {
+            gate.bindKrxGraph(input.attribution.owner, input.attribution.lifetime, it) != null
+        } == true
+        else gate.bind(input.attribution.owner, input.attribution.lifetime) != null
+
     override fun observe(input: TopicGraphInput.Observations) {
         if (closed) return
         val snapshot = accessSnapshot()
@@ -97,9 +107,9 @@ internal class GraphRecorder(
         val catalog = currentCatalog()
         val now = clock.now()
         val next = replayPending(mutableState.value, catalog, snapshot, fence, now)
-        val admission = gate.bind(input.attribution.owner, input.attribution.lifetime) != null
+        val admission = observationAdmission(input)
         mutableState.value = GraphRecorderReducer.observe(
-            next, input, catalog, snapshot, fence, admission, now
+            next, input, catalog, snapshot, fence, admission, now, ::admitsKrx
         )
     }
 
@@ -110,7 +120,7 @@ internal class GraphRecorder(
         val catalog = currentCatalog()
         val now = clock.now()
         val next = replayPending(mutableState.value, catalog, snapshot, fence, now)
-        mutableState.value = GraphRecorderReducer.continuity(next, input, catalog, snapshot, fence, now)
+        mutableState.value = GraphRecorderReducer.continuity(next, input, catalog, snapshot, fence, now, ::admitsKrx)
     }
 
     /**
@@ -126,7 +136,19 @@ internal class GraphRecorder(
         val now = clock.now()
         val next = replayPending(mutableState.value, catalog, snapshot, fence, now)
         mutableState.value = GraphRecorderReducer.loseTopics(
-            next, ownerScope, maxInvalidationsByTopic, catalog, snapshot, fence, now
+            next, ownerScope, maxInvalidationsByTopic, catalog, snapshot, fence, now, ::admitsKrx
+        )
+    }
+
+    override fun loseKrxTopics(stampsByTopic: Map<String, Set<KrxGraphStamp>>) {
+        if (closed) return
+        val snapshot = accessSnapshot()
+        val fence = currentAccessFence()
+        val catalog = currentCatalog()
+        val now = clock.now()
+        val next = replayPending(mutableState.value, catalog, snapshot, fence, now)
+        mutableState.value = GraphRecorderReducer.loseKrxTopics(
+            next, stampsByTopic, catalog, snapshot, fence, now, ::admitsKrx
         )
     }
 
@@ -141,13 +163,13 @@ internal class GraphRecorder(
         val synced = GraphRecorderReducer.syncAccess(state, snapshot, fence)
         val currentScope = fence?.userAccessEpoch?.let { GraphDataScope(fence.identity.uid, it) }
         if (snapshot.revision < state.seenRevision || catalog == null || currentScope == null ||
-            currentScope != synced.scope || (synced.pending.inputs.isEmpty() && synced.pending.lostTopics.isEmpty())
+            currentScope != synced.scope || (synced.pending.inputs.isEmpty() && synced.pending.lostTopics.isEmpty() && synced.pending.krxLost.isEmpty())
         ) return synced
         val replayNow = now ?: clock.now()
         val admissions = synced.pending.inputs.filterIsInstance<TopicGraphInput.Observations>().map {
-            gate.bind(it.attribution.owner, it.attribution.lifetime) != null
+            observationAdmission(it)
         }
-        return GraphRecorderReducer.replayPending(synced, catalog, snapshot, fence, admissions, replayNow)
+        return GraphRecorderReducer.replayPending(synced, catalog, snapshot, fence, admissions, replayNow, ::admitsKrx)
     }
 
     fun captureRequests(
@@ -160,7 +182,7 @@ internal class GraphRecorder(
         val currentFence = currentAccessFence()
         val admission = gate.bind(fence, lifetime) != null
         val (next, requests) = GraphRecorderReducer.captureRequests(
-            mutableState.value, keys, snapshot, currentFence, admission
+            mutableState.value, keys, snapshot, currentFence, admission, ::admitsKrx
         )
         mutableState.value = next
         return requests
@@ -178,7 +200,7 @@ internal class GraphRecorder(
         val now = clock.now()
         val admission = gate.bind(fence, lifetime) != null
         mutableState.value = GraphRecorderReducer.applyResponse(
-            mutableState.value, request, tab, snapshot, currentFence, admission, now
+            mutableState.value, request, tab, snapshot, currentFence, admission, now, ::admitsKrx
         )
     }
 
@@ -198,7 +220,7 @@ internal class GraphRecorder(
         val currentFence = currentAccessFence()
         val catalog = currentCatalog()
         val admission = gate.bind(fence, lifetime) != null
-        return GraphRecorderReducer.recoveryDemand(mutableState.value, tab, catalog, snapshot, currentFence, admission, now)
+        return GraphRecorderReducer.recoveryDemand(mutableState.value, tab, catalog, snapshot, currentFence, admission, now, ::admitsKrx)
     }
 
     fun exposed(
@@ -208,8 +230,18 @@ internal class GraphRecorder(
         if (closed) return emptyMap()
         val snapshot = accessSnapshot()
         val currentFence = currentAccessFence()
-        val candidate = GraphRecorderReducer.exposed(mutableState.value, snapshot, currentFence, admission = true)
-        return if (gate.bind(fence, lifetime) != null) candidate else emptyMap()
+        val held = mutableState.value
+        val candidate = GraphRecorderReducer.exposed(held, snapshot, currentFence, admission = true, krxAdmission = { true })
+        val general = candidate.filterKeys { !it.seriesId.startsWith("krx.") }
+        if (general.size == candidate.size) {
+            return if (gate.bind(fence, lifetime) != null) candidate else emptyMap()
+        }
+        // USD and tether share one KRX series/anchor. The final bind admits both axes from one fresh snapshot.
+        val owners = candidate.keys.filter { it.seriesId.startsWith("krx.") }.map { held.krxSeriesOwners[it.seriesId] }
+        val original = owners.distinct().singleOrNull()
+        if (original != null && gate.bindKrxGraph(fence, lifetime, original) != null) return candidate
+        // A refused KRX part grants no GENERAL access; judge that surviving candidate last as well.
+        return if (gate.bind(fence, lifetime) != null) general else emptyMap()
     }
 
     /**
@@ -231,7 +263,8 @@ internal class GraphRecorder(
         val next = GraphRecorderReducer.purge(before, selects)
         if (next === before) return GraphRecorderPurge.NOTHING_TO_REMOVE
         val removed = before.series.isNotEmpty() || before.pending.inputs.isNotEmpty() ||
-            before.pending.lostTopics.isNotEmpty() || before.untransferredSeries.isNotEmpty()
+            before.pending.lostTopics.isNotEmpty() || before.untransferredSeries.isNotEmpty() ||
+            before.pending.krxLost.isNotEmpty() || before.krxUntransferred.isNotEmpty()
         mutableState.value = next
         return if (removed) GraphRecorderPurge.REMOVED else GraphRecorderPurge.NOTHING_TO_REMOVE
     }

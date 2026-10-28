@@ -119,7 +119,7 @@ class KrxS6DormancyContractTest {
     @Test fun Z02_adapterHasNoCaller() {
         for (name in listOf("krxGraphMapping", "krxGraphSeriesIds", "KrxGraphMapping")) {
             // Positive control: the declaring file itself is found.
-            assertEquals("\\b$name\\b", setOf(ADAPTER), files(Regex("""\b$name\b""")))
+            assertEquals("contract(Z02): exact mapper consumers for $name", setOf(ADAPTER, RECORDER_REDUCER), files(Regex("""\b$name\b""")))
         }
     }
 
@@ -312,8 +312,15 @@ class KrxS6DormancyContractTest {
         assertEquals("premise: Z09 bypass probe", 0, route.findAll(route.replace(probe, "receive(")).count())
         assertEquals("contract(Z09): WS KRX reaches only receiveKrx", 1, Regex("""\breceiveKrx\s*[(]""").findAll(ws).count())
         assertEquals("contract(Z09): REST KRX reaches only applyKrxBootstrap", 1, Regex("""\bapplyKrxBootstrap\s*[(]""").findAll(rest).count())
-        // TopicSessionCoordinator.kt:1881.
-        assertEquals("KRX graph candidates dropped", 1, Regex("""entry\.source == "krx" \|\| entry\.asset == "usd-krw-futures"""").findAll(tsc).count())
+        // S6-3b-1: dedicated KRX hand-over; the GENERAL contamination filter stays exact.
+        val offer = Regex("""\bofferKrxGraphObservations\s*[(]""")
+        assertEquals("contract(Z09): dedicated offer declaration and two callers only", 3, offer.findAll(tsc).count())
+        for (caller in listOf("receiveKrx", "applyKrxBootstrap")) {
+            assertEquals("contract(Z09): $caller has exactly one dedicated offer", 1,
+                offer.findAll(KrxSessionSourceContract.function(tsc, caller)).count())
+        }
+        assertEquals("contract(Z09): GENERAL KRX contamination filter remains", 1,
+            Regex("""entry\.source == "krx" \|\| entry\.asset == "usd-krw-futures"""").findAll(tsc).count())
         // TopicSessionCoordinator.kt:2893-2898.
         val evidenceFor = Regex(
             """fun\s+evidenceFor\s*\(\s*topic\s*:\s*String\s*\)\s*:\s*TopicSilenceEvidence\s*=\s*""" +
@@ -325,18 +332,30 @@ class KrxS6DormancyContractTest {
         assertTrue("the same file handles tether frames", Regex("""is DecodedTopicFrame\.Tether""").findAll(tsc).count() >= 1)
     }
 
-    /** Z10: the recorder has no KRX. Catches MZ-01 and a KRX axis slipped into the recorder (bypassing the critical CAPABILITY axis). */
+    /** S6-3b-1 replaces the zero-KRX inventory with exact original-ownership surfaces. */
     @Test fun Z10_recorderHasNoKrx() {
-        val recorderFiles = listOf("GraphRecorderReducer.kt", "GraphRecorder.kt", "GraphRecorderTopicSink.kt", "GraphPendingInputs.kt")
-            .map { "${M}data/graph/$it" }
-        val krx = Regex("""(?i)krx""")
-        for (key in recorderFiles) {
-            assertTrue("premise: the code map has $key", key in code)
-            assertEquals("$key names no KRX", 0, krx.findAll(code.getValue(key)).count())
-        }
-        // Positive control: GraphRecorderReducer.kt:178.
-        assertTrue("tetherGraphMapping is found in the recorder reducer", Regex("""\btetherGraphMapping\b""").containsMatchIn(code.getValue(RECORDER_REDUCER)))
-        // Positive control for the pattern itself: the same scan finds KRX where it is known to be.
-        assertTrue("(?i)krx is found in TopicSessionCoordinator.kt", krx.containsMatchIn(code.getValue(TSC)))
+        val allowed = mapOf(
+            "GraphRecorder.kt" to setOf("KrxGraphStamp", "krxGraphStamp", "krxSeriesOwners", "krxUntransferred", "krxLost", "bindKrxGraph", "loseKrxTopics", "admitsKrx", "isKrxGraphTopic", "krxAdmission", "krx"),
+            "GraphRecorderReducer.kt" to setOf("KrxGraphStamp", "KrxGraphMapping", "krxGraphStamp", "krxSeriesOwners", "krxUntransferred", "krxLost", "krxGraphMapping", "krxGraphSeriesIds", "admitsKrxUse", "copyKrxGraphStamps", "isKrx", "krx", "admitsKrx", "krxAdmission", "krxGraphNamespace", "sameKrxUse", "isKrxGraphTopic", "krxMapping", "krxLoss", "krxIds", "loseKrxTopics", "markGraphPendingKrxLoss", "krxGraphLoss", "krxWaits"),
+            "GraphRecorderTopicSink.kt" to setOf("KrxGraphStamp", "krxGraphStamp", "loseKrxTopics", "krxLost", "krxLedger", "keptKrxLedger", "copyKrxGraphStamps", "krxLoss", "krxGraphLoss"),
+            "GraphPendingInputs.kt" to setOf("KrxGraphStamp", "krxGraphStamp", "krxLost", "KRX_MEMORY_KEY", "copyKrxGraphStamps", "markKrxLoss", "krxLoss", "krxGraphLoss", "markGraphPendingKrxLoss", "isKrxGraphTopic")
+        )
+        val identifiers = Regex("""\b[A-Za-z_][A-Za-z_0-9]*[Kk][Rr][Xx][A-Za-z_0-9]*\b|\b[Kk][Rr][Xx][A-Za-z_0-9]*\b""")
+        fun violations(map: Map<String, String>) = allowed.mapValues { (file, names) ->
+            identifiers.findAll(map.getValue("${M}data/graph/$file")).map { it.value }.toSet() - names
+        }.filterValues { it.isNotEmpty() }
+        assertEquals("contract(Z10): original-sidecar mapper/C-1/cutoff surface only", emptyMap<String, Set<String>>(), violations(code))
+        val recorder = "${M}data/graph/GraphRecorder.kt"
+        val bypass = code + (recorder to code.getValue(recorder) + "\nfun krxBypass() = Unit")
+        assertEquals("contract(Z10): prefix-like bypass inside an allowed file is rejected", mapOf("GraphRecorder.kt" to setOf("krxBypass")), violations(bypass))
+        assertTrue("contract(Z10): REC consumes original through shared gate", code.getValue(recorder).contains("bindKrxGraph"))
+        assertTrue("contract(Z10): RED uses the dedicated pure mapper", code.getValue(RECORDER_REDUCER).contains("krxGraphMapping"))
+        val ingressExpected = setOf("data/graph/KrxGraphFence.kt", "data/remote/TopicSessionCoordinator.kt", "data/remote/TopicRuntime.kt",
+            "data/remote/TopicRuntimeOwner.kt", "data/remote/DetachableGraphSinks.kt", "data/graph/GraphRuntimeAssembly.kt").map { M + it }.toSet()
+        val fenceExpected = setOf("data/graph/KrxGraphFence.kt", "data/graph/GraphV2AccessGate.kt", "data/graph/GraphRuntimeAssembly.kt").map { M + it }.toSet()
+        assertEquals("contract(Z10): exact ingress references across every root", ingressExpected, files(Regex("""\bKrxGraphIngress\b""")))
+        assertEquals("contract(Z10): exact fence references, distinct from stamp/namespace types", fenceExpected, files(Regex("""\bKrxGraphFence\b""")))
+        val injected = code + (recorder to code.getValue(recorder) + "\nval bad: KrxGraphIngress? = null")
+        assertTrue("contract(Z10): same scanner sees an unauthorized ingress reference", files(Regex("""\bKrxGraphIngress\b"""), injected) != ingressExpected)
     }
 }

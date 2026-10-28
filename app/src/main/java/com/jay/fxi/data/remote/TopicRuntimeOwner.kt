@@ -8,9 +8,10 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.graph.AppProcessGraphBuilder
 import com.jay.fxi.data.graph.GraphRuntimeAssembly
+import com.jay.fxi.data.graph.KrxGraphIngress
 import com.jay.fxi.data.graph.LateBound
-import com.jay.fxi.data.graph.ProcessGraphParts
 import com.jay.fxi.data.graph.ProcessGraphBuilder
+import com.jay.fxi.data.graph.ProcessGraphParts
 import com.jay.fxi.data.graph.ProcessGraphStarter
 import com.jay.fxi.data.graph.reportGraphFailure
 import com.jay.fxi.data.local.AppGraphCacheCutover
@@ -116,7 +117,7 @@ internal class TopicRuntimeOwner internal constructor(
         val graph = ProcessGraphStartup(graphBuilder, main, reportGraph, graphHostState, newGraphHost, graphCutover)
         graph.assemble()
         val runtime = try {
-            factory.create(graph.sink, graph.grants)
+            factory.create(graph.sink, graph.grants, graph.krxGraphIngress)
         } catch (failure: Throwable) {
             graph.abandon(failure, graphFailure = false)
             throw failure
@@ -233,6 +234,7 @@ private class ProcessGraphStartup(
 
     val sink: TopicGraphSink get() = assembly?.sink ?: DormantTopicGraphSink
     val grants: TopicGrantSink? get() = assembly?.fences
+    val krxGraphIngress: KrxGraphIngress get() = assembly?.krxGraphIngress ?: KrxGraphIngress.NONE
 
     fun assemble() = guard {
         val built = builder?.build(permit, seed, { starter?.timeEventTarget?.invoke() }, checkNotNull(main.coroutineContext[Job]))

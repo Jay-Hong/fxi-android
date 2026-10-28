@@ -7,12 +7,12 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.HttpExchangeEvidence
 import com.jay.fxi.data.entitlements.KrxAttemptCheck
-import com.jay.fxi.data.entitlements.KrxSessionStamp
-import com.jay.fxi.data.entitlements.KrxUseLifetime
 import com.jay.fxi.data.entitlements.KrxSendAcquisition
 import com.jay.fxi.data.entitlements.KrxSendAdmission
 import com.jay.fxi.data.entitlements.KrxSendMarker
 import com.jay.fxi.data.entitlements.KrxSendReadAuthority
+import com.jay.fxi.data.entitlements.KrxSessionStamp
+import com.jay.fxi.data.entitlements.KrxUseLifetime
 import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.entitlements.krxConsumerGuard
 import com.jay.fxi.data.entitlements.purge.KRX_MEMORY_KEY
@@ -23,6 +23,8 @@ import com.jay.fxi.data.entitlements.purge.KrxMemoryScope
 import com.jay.fxi.data.entitlements.purge.KrxMemorySelection
 import com.jay.fxi.data.entitlements.purge.krxMemorySelections
 import com.jay.fxi.data.graph.GraphDataScope
+import com.jay.fxi.data.graph.KrxGraphIngress
+import com.jay.fxi.data.graph.KrxGraphStamp
 import com.jay.fxi.data.local.TopicLastKnownRestore
 import com.jay.fxi.data.remote.dto.DxySpotEntry
 import com.jay.fxi.data.remote.dto.DxyTopicMessage
@@ -32,15 +34,15 @@ import com.jay.fxi.data.remote.dto.TopicSubscribeRequest
 import com.jay.fxi.data.remote.dto.toDollarIndex
 import com.jay.fxi.data.remote.dto.toQuote
 import com.jay.fxi.domain.model.FreeTab
+import com.jay.fxi.domain.model.TopicAuthResolution
+import com.jay.fxi.domain.model.TopicDeliveryState
 import com.jay.fxi.domain.model.TopicLeaseInput
 import com.jay.fxi.domain.model.TopicLeasePolicy
 import com.jay.fxi.domain.model.TopicLeaseRegistry
-import com.jay.fxi.domain.model.TopicAuthResolution
-import com.jay.fxi.domain.model.TopicDeliveryState
+import com.jay.fxi.domain.model.TopicPurgeScope
 import com.jay.fxi.domain.model.TopicQuote
 import com.jay.fxi.domain.model.TopicRates
 import com.jay.fxi.domain.model.TopicReconnectPolicy
-import com.jay.fxi.domain.model.TopicPurgeScope
 import com.jay.fxi.domain.model.TopicRejectionReason
 import com.jay.fxi.domain.model.TopicRetryTrigger
 import com.jay.fxi.domain.model.TopicSilenceArming
@@ -704,7 +706,8 @@ class TopicSessionCoordinator(
         val requestId: String,
         val grantEpoch: Long,
         val stamp: KrxSessionStamp,
-        val use: KrxUseLifetime
+        val use: KrxUseLifetime,
+        val graphStamp: KrxGraphStamp?
     )
     private class KrxPending(val capture: KrxCapture, var sent: Boolean = false, var masked: Boolean = false)
     private enum class KrxBootstrapOrigin { INITIAL_PLAN, PERMIT, EXPLICIT }
@@ -723,7 +726,8 @@ class TopicSessionCoordinator(
         val marker: KrxSendMarker,
         val use: KrxUseLifetime,
         val origin: KrxBootstrapOrigin,
-        val issuedAtMillis: Long
+        val issuedAtMillis: Long,
+        val graphStamp: KrxGraphStamp?
     )
     private sealed interface KrxBootstrapPreparation {
         data class Ready(val issue: KrxRestIssue) : KrxBootstrapPreparation
@@ -761,7 +765,8 @@ class TopicSessionCoordinator(
 
     private fun installKrxPending(live: Connection, attempt: KrxCommandAttempt) {
         val replacement = KrxCapture(++nextKrxCapture, live.generation, attempt.commandId, attempt.requestId,
-            attempt.grantEpoch, attempt.stamp, checkNotNull(attempt.krxUse))
+            attempt.grantEpoch, attempt.stamp, checkNotNull(attempt.krxUse),
+            krxGraphIngress.capture(krxMemoryScope(live.fence, checkNotNull(attempt.krxUse), attempt.stamp)))
         live.krxPending?.let { old ->
             check(old.capture.commandId == attempt.commandId) { "one KRX pending request per connection" }
             retireKrxPending(live, old, replacement = replacement)
@@ -957,6 +962,9 @@ class TopicSessionCoordinator(
         if (!acceptsKrx(live, capture)) return
         val quotes = krxQuotes(frame)
         if (quotes.isEmpty()) return
+        offerKrxGraphObservations(frame.value.topic, TopicGraphPath.WS,
+            TopicUseAttribution(sessionKey, live.fence, capture.grantEpoch, capture.use.lifetime),
+            live.generation, frame.value.data.allEntries, capture.graphStamp)
         adoptKrxQuotes(quotes, krxMemoryScope(live.fence, capture.use, capture.stamp))
         store.recordFrame(frame.value.topic)
         krxSnapshotRevision++
@@ -1004,7 +1012,8 @@ class TopicSessionCoordinator(
             krxInitialIssuedGrant = grantEpoch
         }
         val issue = KrxRestIssue(++nextBootstrapRequestId, grantEpoch, topic, owner, stamp, read.marker, use,
-            origin, clock.nowMillis())
+            origin, clock.nowMillis(), krxGraphIngress.capture(krxMemoryScope(owner, use, stamp)))
+        rememberKrxGraphSource(issue.graphStamp, issue.owner, issue.grantEpoch, issue.use.lifetime)
         // This is the logical issue boundary, after floor, pacing and revision admission.
         if (startsLadder && origin == KrxBootstrapOrigin.INITIAL_PLAN) {
             consumedPermit = maxOf(consumedPermit, permit)
@@ -1127,6 +1136,9 @@ class TopicSessionCoordinator(
         if (!krxIssueAdmitted(issue) || clock.nowMillis() - issue.issuedAtMillis >= TopicBootstrapRetryPolicy.ATTEMPT_BUDGET_MILLIS) return
         val quotes = krxQuotes(frame)
         if (quotes.isEmpty()) return
+        offerKrxGraphObservations(frame.value.topic, TopicGraphPath.REST_BOOTSTRAP,
+            TopicUseAttribution(sessionKey, issue.owner, issue.grantEpoch, issue.use.lifetime),
+            null, frame.value.data.allEntries, issue.graphStamp)
         adoptKrxQuotes(quotes, krxMemoryScope(issue.owner, issue.use, issue.stamp))
         krxSnapshotRevision++
         recordDelivery(TopicSilenceEvidence.OTHER, clock.nowMillis())
@@ -1219,6 +1231,7 @@ class TopicSessionCoordinator(
     // SESSION is a selection marker; custom/NONE callbacks retain their original tuple-only meaning.
     private var krxRetirer: KrxSubscriptionRetirer = KrxSubscriptionRetirer.NONE
     private var krxMemorySnapshot: (() -> TopicAccessSnapshot)? = null
+    private var krxGraphIngress: KrxGraphIngress = KrxGraphIngress.NONE
     private fun retireKrxSubscription(retirement: KrxSubscriptionRetirement, context: KrxRetirementContext) {
         if (krxRetirer === KrxSubscriptionRetirer.SESSION) completeKrxRetirementOnLoop(retirement, context)
         else krxRetirer.retire(retirement)
@@ -1283,7 +1296,8 @@ class TopicSessionCoordinator(
         krxSendReader: KrxSendReadAuthority?,
         onRejectedWithMarker: ((TopicSessionFence, Map<String, TopicRejectionReason>, KrxSendMarker?) -> Unit)? = null,
         krxRetirer: KrxSubscriptionRetirer = KrxSubscriptionRetirer.NONE,
-        krxMemorySnapshot: (() -> TopicAccessSnapshot)? = null
+        krxMemorySnapshot: (() -> TopicAccessSnapshot)? = null,
+        krxGraphIngress: KrxGraphIngress = KrxGraphIngress.NONE
     ) : this(
         scope = scope,
         clock = clock,
@@ -1315,6 +1329,7 @@ class TopicSessionCoordinator(
         this.onRejectedWithMarker = onRejectedWithMarker
         this.krxRetirer = krxRetirer
         this.krxMemorySnapshot = krxMemorySnapshot
+        this.krxGraphIngress = krxGraphIngress
     }
 
     private class Connection(
@@ -1508,6 +1523,8 @@ class TopicSessionCoordinator(
     private val graphLossLedger = TopicGraphLossLedger()
     private var graphSequence = 0L
     private var graphAuthority: TopicGraphAuthority? = null
+    // Verified source/fact provenance survives without prices, after REST completion and WS retirement.
+    private var graphKrxSource: TopicGraphAuthority? = null
     private var graphAuthorityHasEnded = false
     private var graphHandoverEnded = false
     private val graphPaths = setOf(TopicGraphPath.WS, TopicGraphPath.REST_BOOTSTRAP)
@@ -2064,7 +2081,7 @@ class TopicSessionCoordinator(
                         onRejectedWithMarker?.invoke(attribution.owner,
                             mapOf(input.topic to TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED), marker)
                     }
-                    offerGraphRestUndelivered(input.topic, input.outcome, attribution)
+                    offerGraphRestUndelivered(input.topic, input.outcome, attribution, krxIssue?.graphStamp)
                     // A refusal or a failure is handed to its owner whatever the use came to: that is control flow (L-4e E2a).
                     return onBootstrapUndelivered(attribution, input.topic, input.outcome)
                 }
@@ -2777,6 +2794,9 @@ class TopicSessionCoordinator(
         }
         val owner = fence ?: return
         val captured = TopicGraphAuthority(sessionKey, owner, grantEpoch, lifetime)
+        graphKrxSource = graphKrxSource?.takeIf {
+            it.owner == owner && it.grantEpoch == grantEpoch && it.lifetime == lifetime
+        }
         graphAuthority = captured
         graphDeliveryGaps.clear()
         desired.forEach { topic -> graphPaths.forEach { path -> graphDeliveryGaps += topic to path } }
@@ -2787,10 +2807,54 @@ class TopicSessionCoordinator(
         )
     }
 
+    /** Remember only an already-issued original; source/fact admission stays at the caller's boundary. */
+    private fun rememberKrxGraphSource(
+        stamp: KrxGraphStamp?,
+        owner: TopicSessionFence,
+        sourceGrantEpoch: Long,
+        lifetime: TopicUseLifetime
+    ) {
+        if (stamp == null || stamp.scope.owner != owner || stamp.scope.use.lifetime != lifetime) return
+        val held = graphKrxSource?.krxGraphStamp
+        // Late old ACKs/completions cannot overwrite a later known source, including across lifetimes.
+        if (held != null && stamp.issueSequence <= held.issueSequence) return
+        graphKrxSource = TopicGraphAuthority(sessionKey, owner, sourceGrantEpoch, lifetime, stamp)
+    }
+
+    /** Select already-known sources only from the authority's original owner and use. */
+    private fun originalKrxGraphStamp(original: TopicGraphAuthority, live: Connection?): KrxGraphStamp? {
+        val ws = live?.takeIf {
+            it.graphAuthority === original && it.fence == original.owner && it.lifetime == original.lifetime
+        }?.krxActive?.takeIf { it.grantEpoch == original.grantEpoch }?.graphStamp
+        val knownSource = graphKrxSource?.takeIf {
+            it.owner == original.owner && it.grantEpoch == original.grantEpoch && it.lifetime == original.lifetime
+        }?.krxGraphStamp
+        return listOfNotNull(ws, knownSource).filter {
+            it.scope.owner == original.owner && it.scope.use.lifetime == original.lifetime
+        }.maxByOrNull { it.issueSequence }
+    }
+
+    /** Freeze known sources before releasing pointers; never acquire or infer a replacement use. */
+    private fun withOriginalKrxGraphSource(original: TopicGraphAuthority): TopicGraphAuthority {
+        val stamp = listOfNotNull(originalKrxGraphStamp(original, connection), original.krxGraphStamp).filter {
+            it.scope.owner == original.owner && it.scope.use.lifetime == original.lifetime
+        }.maxByOrNull { it.issueSequence } ?: return original
+        return TopicGraphAuthority(original.sessionKey, original.owner, original.grantEpoch, original.lifetime, stamp)
+    }
+
+    private fun originalKrxGraphWsStamp(live: Connection, topics: Set<String>): KrxGraphStamp? {
+        if (topics.none(TopicCatalogue::carriesKrx)) return null
+        val original = live.graphAuthority ?: return null
+        return originalKrxGraphStamp(original, live)
+    }
+
     /** Close before offering: rejection or failure cannot keep the ended authority open. */
     private fun endGraphAuthority(reason: TopicGraphEventReason): TopicGraphAuthority? {
-        val captured = graphAuthority ?: return null
+        val captured = withOriginalKrxGraphSource(graphAuthority ?: return null)
         graphAuthority = null
+        if (graphKrxSource?.let {
+                it.owner == captured.owner && it.grantEpoch == captured.grantEpoch && it.lifetime == captured.lifetime
+            } == true) graphKrxSource = null
         graphAuthorityHasEnded = true
         offerGraphContinuity(TopicGraphEventKind.AUTHORITY_ENDED, reason, captured)
         return captured
@@ -2808,11 +2872,16 @@ class TopicSessionCoordinator(
         topics: Set<String> = desired,
         paths: Set<TopicGraphPath> = graphPaths,
         connectionGeneration: Long? = null,
-        payload: TopicGraphEventPayload? = null
+        payload: TopicGraphEventPayload? = null,
+        krxGraphStamp: KrxGraphStamp? = authority.krxGraphStamp
     ) {
+        // Only a fact's source may supply provenance; unknown authority is never filled from current captures.
+        val original = if (krxGraphStamp == null || krxGraphStamp == authority.krxGraphStamp) authority
+        else TopicGraphAuthority(authority.sessionKey, authority.owner, authority.grantEpoch,
+            authority.lifetime, krxGraphStamp)
         offerGraphInput(
             TopicGraphInput.Continuity(
-                ++graphSequence, kind, reason, topics.toSet(), paths.toSet(), authority,
+                ++graphSequence, kind, reason, topics.toSet(), paths.toSet(), original,
                 connectionGeneration, wallClock(), payload
             )
         )
@@ -2826,29 +2895,32 @@ class TopicSessionCoordinator(
         topics: Set<String>,
         path: TopicGraphPath,
         connectionGeneration: Long?,
-        payload: TopicGraphEventPayload? = null
+        payload: TopicGraphEventPayload? = null,
+        krxGraphStamp: KrxGraphStamp? = captured?.krxGraphStamp
     ) {
         if (captured == null || graphAuthority !== captured) return
         topics.forEach { graphDeliveryGaps += it to path }
-        offerGraphContinuity(kind, reason, captured, topics, setOf(path), connectionGeneration, payload)
+        offerGraphContinuity(kind, reason, captured, topics, setOf(path), connectionGeneration, payload, krxGraphStamp)
     }
 
     private fun offerGraphWsInterruption(
         live: Connection,
         reason: TopicGraphEventReason,
         topics: Set<String>,
-        payload: TopicGraphEventPayload? = null
+        payload: TopicGraphEventPayload? = null,
+        krxGraphStamp: KrxGraphStamp? = originalKrxGraphWsStamp(live, topics)
     ) {
         offerGraphInterruption(
             TopicGraphEventKind.DELIVERY_INTERRUPTED, reason, live.graphAuthority,
-            topics, TopicGraphPath.WS, live.generation, payload
+            topics, TopicGraphPath.WS, live.generation, payload, krxGraphStamp
         )
     }
 
     private fun offerGraphAcknowledgement(
         live: Connection,
         ack: TopicCommandAcknowledgement,
-        before: TopicSubscriptionSnapshot
+        before: TopicSubscriptionSnapshot,
+        krxGraphStamp: KrxGraphStamp?
     ) {
         val captured = live.graphAuthority ?: return
         val after = store.snapshot
@@ -2861,13 +2933,13 @@ class TopicSessionCoordinator(
         offerGraphContinuity(
             TopicGraphEventKind.ACK_ACTIVE_SET_CHANGED, null, captured,
             desired, setOf(TopicGraphPath.WS), live.generation,
-            TopicGraphEventPayload.AckApplied(confirmed, ack.rejected.toMap())
+            TopicGraphEventPayload.AckApplied(confirmed, ack.rejected.toMap()), krxGraphStamp
         )
         if (live.graphAuthFailurePending && ack.provesAuthentication) {
             live.graphAuthFailurePending = false
             offerGraphContinuity(
                 TopicGraphEventKind.AUTH_RECOVERED, null, captured,
-                desired, setOf(TopicGraphPath.WS), live.generation
+                desired, setOf(TopicGraphPath.WS), live.generation, krxGraphStamp = krxGraphStamp
             )
         }
     }
@@ -2885,13 +2957,19 @@ class TopicSessionCoordinator(
         offerGraphContinuity(
             TopicGraphEventKind.AUTH_FAILED, reason, captured,
             desired, setOf(TopicGraphPath.WS), live.generation,
-            TopicGraphEventPayload.AuthFailure(resolution)
+            TopicGraphEventPayload.AuthFailure(resolution), originalKrxGraphWsStamp(live, desired)
         )
     }
 
-    private fun offerGraphRestUndelivered(topic: String, outcome: TopicSnapshotOutcome, attribution: TopicUseAttribution) {
+    private fun offerGraphRestUndelivered(
+        topic: String,
+        outcome: TopicSnapshotOutcome,
+        attribution: TopicUseAttribution,
+        krxGraphStamp: KrxGraphStamp? = null
+    ) {
         // Invalid KRX input creates no graph facts before S6-3. Its control callback still runs.
         if (krxSession != null && TopicCatalogue.carriesKrx(topic) && outcome is TopicSnapshotOutcome.Malformed) return
+        rememberKrxGraphSource(krxGraphStamp, attribution.owner, attribution.grantEpoch, attribution.lifetime)
         val captured = graphAuthority ?: return
         if (!authority.admits(attribution.lifetime)) {
             endGraphUse(attribution.lifetime)
@@ -2911,7 +2989,7 @@ class TopicSessionCoordinator(
         offerGraphInterruption(
             TopicGraphEventKind.DELIVERY_INTERRUPTED, TopicGraphEventReason.REST_UNDELIVERED,
             captured, setOf(topic), TopicGraphPath.REST_BOOTSTRAP, null,
-            TopicGraphEventPayload.RestUndelivered(kind)
+            TopicGraphEventPayload.RestUndelivered(kind), krxGraphStamp
         )
     }
 
@@ -2926,6 +3004,28 @@ class TopicSessionCoordinator(
     private fun markDegraded(live: Connection, topic: String) {
         store.markDegraded(topic)
         offerGraphWsInterruption(live, TopicGraphEventReason.DELIVERY_DEGRADED, setOf(topic))
+    }
+
+    private fun offerKrxGraphObservations(
+        topic: String,
+        path: TopicGraphPath,
+        attribution: TopicUseAttribution,
+        connectionGeneration: Long?,
+        entries: List<TopicSourceEntry>,
+        stamp: KrxGraphStamp?
+    ) {
+        if (stamp == null) return
+        val candidates = entries.filter { it.source == "krx" && it.asset == "usd-krw-futures" && it.toQuote() != null }
+            .map { TopicGraphCandidate.Quote(it.source, it.asset, it.rate, it.timestamp, it.rateChangedAt) }
+        if (candidates.isEmpty()) return
+        rememberKrxGraphSource(stamp, attribution.owner, attribution.grantEpoch, attribution.lifetime)
+        if (graphDeliveryGaps.remove(topic to path)) {
+            offerGraphContinuity(TopicGraphEventKind.DELIVERY_RESUMED, null,
+                TopicGraphAuthority(attribution.sessionKey, attribution.owner, attribution.grantEpoch,
+                    attribution.lifetime, stamp), setOf(topic), setOf(path), connectionGeneration)
+        }
+        offerGraphInput(TopicGraphInput.Observations(++graphSequence, topic, path, attribution,
+            connectionGeneration, candidates, stamp))
     }
 
     private fun offerGraphObservations(
@@ -3224,6 +3324,7 @@ class TopicSessionCoordinator(
         var attemptAdmission: KrxSendAdmission? = null
         var typedAttempt: KrxCommandAttempt? = null
         var krxAcknowledgedScope: KrxMemoryScope? = null
+        var krxAcknowledgedGraphStamp: KrxGraphStamp? = null
         var krxReadSignal = 0L
         val legacySend: (String) -> Boolean = { text ->
                 val success = when {
@@ -3285,7 +3386,7 @@ class TopicSessionCoordinator(
             onAcknowledged = { ack ->
                 val before = checkNotNull(beforeAnswer)
                 beforeAnswer = null
-                onAcknowledged(live, id, ack, before, attemptAdmission?.marker, krxAcknowledgedScope)
+                onAcknowledged(live, id, ack, before, attemptAdmission?.marker, krxAcknowledgedScope, krxAcknowledgedGraphStamp)
             },
             onClassifiedFailure = { onClassifiedFailure(live) },
             onAuthRefreshUnusable = {
@@ -3310,10 +3411,15 @@ class TopicSessionCoordinator(
                 post(SessionInput.KrxReprepare(live.generation, id, ready))
                 ready.await()
             }) { requestId, active, leases, sent ->
-                krxAcknowledgedScope = live.krxPending?.takeIf {
+                val acknowledged = live.krxPending?.takeIf {
                     it.capture.commandId == id && it.capture.requestId == requestId && it.sent && !it.masked &&
                         validKrxCapture(live, it.capture)
-                }?.capture?.let { krxMemoryScope(live.fence, it.use, it.stamp) }
+                }?.capture
+                krxAcknowledgedScope = acknowledged?.let { krxMemoryScope(live.fence, it.use, it.stamp) }
+                krxAcknowledgedGraphStamp = acknowledged?.graphStamp
+                acknowledged?.let {
+                    rememberKrxGraphSource(it.graphStamp, live.fence, it.grantEpoch, it.use.lifetime)
+                }
                 admitKrxAcknowledgement(live, id, requestId, active, leases, sent)
             }
             val boundary = object : KrxCommandAttemptBoundary {
@@ -3419,7 +3525,8 @@ class TopicSessionCoordinator(
         ack: TopicCommandAcknowledgement,
         before: TopicSubscriptionSnapshot,
         marker: KrxSendMarker?,
-        krxAcknowledgedScope: KrxMemoryScope?
+        krxAcknowledgedScope: KrxMemoryScope?,
+        krxAcknowledgedGraphStamp: KrxGraphStamp?
     ) {
         if (krxSession != null) krxTopic?.let { topic ->
             // CMD has applied this ACK. Never infer provenance from a new snapshot or a later capture.
@@ -3428,10 +3535,13 @@ class TopicSessionCoordinator(
                 krxCanonicalScope = krxAcknowledgedScope
             }
             if (ack.rejected[topic] == TopicRejectionReason.TOPIC_UNAVAILABLE) {
+                if (krxAcknowledgedScope != null && current(live.generation) === live) {
+                    krxGraphIngress.topicUnavailable(krxAcknowledgedScope)
+                }
                 cleanupKrxUnavailable(live, krxAcknowledgedScope)
             }
         }
-        offerGraphAcknowledgement(live, ack, before)
+        offerGraphAcknowledgement(live, ack, before, krxAcknowledgedGraphStamp)
         // The server answered, so the request channel is free — before the delivery wait, which
         // needs nothing another command wants.
         releaseControlLane(live, commandId)
@@ -4454,13 +4564,14 @@ class TopicSessionCoordinator(
 
     private fun end(live: Connection, cause: TopicDisconnectCause) {
         if (live.ended) return
+        val graphStamp = originalKrxGraphWsStamp(live, desired)
         if (krxSession != null) retireKrxCapture(live, KrxRetirementReason.CONNECTION_ENDED)
         live.krxExpiryTimer?.cancel()
         live.krxRenewalTimer?.cancel()
         endKrxRetirements(live)
         live.ended = true
         try {
-            offerGraphWsInterruption(live, TopicGraphEventReason.WS_ENDED, desired, TopicGraphEventPayload.WsEnded(cause))
+            offerGraphWsInterruption(live, TopicGraphEventReason.WS_ENDED, desired, TopicGraphEventPayload.WsEnded(cause), graphStamp)
         } finally {
             clearHeldSilenceQuestion(live)
             live.manualPending.clear()
@@ -4511,8 +4622,10 @@ class TopicSessionCoordinator(
         try {
             if (!graphHandoverEnded) {
                 graphHandoverEnded = true
-                val captured = graphAuthority ?: TopicGraphAuthority(sessionKey, null, grantEpoch, null)
+                val original = graphAuthority ?: TopicGraphAuthority(sessionKey, null, grantEpoch, null)
+                val captured = withOriginalKrxGraphSource(original)
                 graphAuthority = null
+                graphKrxSource = null
                 graphDeliveryGaps.clear()
                 offerGraphContinuity(TopicGraphEventKind.HANDOVER_ENDED, reason, captured)
             }

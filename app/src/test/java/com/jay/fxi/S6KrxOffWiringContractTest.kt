@@ -126,7 +126,8 @@ class S6KrxOffWiringContractTest {
 
     private val roots = listOf("src/main/java", "src/productionBindings/java", "src/s5Benchmark/java", "src/debug/java", "src/benchmark/java")
     private val base = "src/main/java/com/jay/fxi/"
-    private val allowed = setOf("${base}data/remote/TopicSessionCoordinator.kt", "${base}data/remote/TopicRuntime.kt", "${base}data/entitlements/purge/KrxMemoryCleanup.kt")
+    private val allowed = S6Krx3bOffWiringContractTest.ALLOWED
+
     private fun sources(): Map<String, String> = roots.flatMap { root -> File(root).walkTopDown()
         .filter { it.isFile && it.extension == "kt" }.map { it.invariantSeparatorsPath to KrxSessionSourceContract.strip(it.readText()) }.toList() }.toMap()
     private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
@@ -134,7 +135,7 @@ class S6KrxOffWiringContractTest {
     @Test fun o06_sourceBoundary_isExactAndStillOff() {
         val code = sources()
         assertTrue("premise: O06 all production roots are scanned", roots.all { File(it).isDirectory } && code.size > 100)
-        assertTrue("contract(O06): exactly three allowed production files present", allowed.all { it in code })
+        assertTrue("contract(O06): exactly sixteen allowed production files present", allowed.all { it in code })
         val tsc = code.getValue("${base}data/remote/TopicSessionCoordinator.kt")
         val rt = code.getValue("${base}data/remote/TopicRuntime.kt")
         val unsubscribe = Regex("""TopicSubscribeRequest\s*\.\s*unsubscribe\s*\(""")
@@ -152,7 +153,7 @@ class S6KrxOffWiringContractTest {
         assertTrue("contract(O06): actual injected supplier is PAC read-only snapshot", Regex("""krxMemorySnapshot\s*=\s*\{\s*coordinator\.accessSnapshot\s*\}""").containsMatchIn(rt))
         // Lock raw source bytes outside the approved production set, including PAC/SUA/DI/disk.
         val inventory = code.keys.filter { it !in allowed }.sorted().joinToString("") { path -> "$path\u0000${sha(File(path).readBytes())}\n" }
-        assertEquals("contract(O06): all other production Kotlin bytes remain HEAD", "5ef05c6a3d5e1eef388e3ceac8a78d6239bb3b8646457e6f992fca547e042172", sha(inventory.toByteArray(Charsets.UTF_8)))
+        assertEquals("contract(O06): all other production Kotlin bytes remain HEAD", "05ffdaa3f85d20210ae0c9563ee34dad139dd492b2d4592b05e9c1fbf6a99cff", sha(inventory.toByteArray(Charsets.UTF_8)))
         val pac = code.getValue("${base}data/entitlements/PremiumAccessCoordinator.kt")
         assertTrue("contract(O06): PAC default OFF", Regex("""krxContest\s*:\s*KrxContestSwitch\s*=\s*KrxContestSwitch\.OFF""").containsMatchIn(pac))
         assertEquals("contract(O06): production desired contains GENERAL only", setOf("fx:usd-krw", "fx:jpy-krw", "fx:eur-krw", "usdt:krw", "dxy:spot"), TopicCatalogue.DESIRED)

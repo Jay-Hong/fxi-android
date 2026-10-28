@@ -16,6 +16,7 @@ internal interface GraphTopicInputConsumer {
     fun observe(input: TopicGraphInput.Observations)
     fun observe(input: TopicGraphInput.Continuity)
     fun loseTopics(ownerScope: GraphDataScope, maxInvalidationsByTopic: Map<String, Long>)
+    fun loseKrxTopics(stampsByTopic: Map<String, Set<KrxGraphStamp>>) {}
     fun close()
 }
 
@@ -66,6 +67,7 @@ internal class GraphRecorderTopicSink(
     private val queue = ArrayDeque<QueuedInput>()
     private var usedUnits = 0
     private var ledger = mutableMapOf<GraphDataScope, MutableMap<String, Long>>()
+    private var krxLedger = mutableMapOf<String, Set<KrxGraphStamp>>()
     private var closed = false
     private var consumerClosed = false
     private val wake = Channel<Unit>(Channel.CONFLATED)
@@ -112,12 +114,17 @@ internal class GraphRecorderTopicSink(
         if (closed) return false
         val kept = queue.filter { queued -> ownerScope(queued.input)?.let(selects) != true }
         val keptLedger = ledger.filterKeys { !selects(it) }
-        val removed = kept.size != queue.size || keptLedger.size != ledger.size
+        val keptKrxLedger = krxLedger.mapValues { (_, stamps) -> stamps.filterTo(linkedSetOf()) {
+            val owner = it.scope.owner
+            !selects(GraphDataScope(owner.identity.uid, checkNotNull(owner.userAccessEpoch)))
+        } }.filterValues { it.isNotEmpty() }
+        val removed = kept.size != queue.size || keptLedger.size != ledger.size || keptKrxLedger != krxLedger
         if (removed) {
             queue.clear()
             queue.addAll(kept)
             usedUnits = kept.sumOf { it.units }
             ledger = keptLedger.toMutableMap()
+            krxLedger = keptKrxLedger.toMutableMap()
         }
         removed
     }
@@ -155,13 +162,20 @@ internal class GraphRecorderTopicSink(
                 ) return
                 val losses = synchronized(lock) {
                     if (closed) return
-                    ledger.also { ledger = mutableMapOf() }
+                    val originals = ledger to copyKrxGraphStamps(krxLedger)
+                    ledger = mutableMapOf()
+                    krxLedger = mutableMapOf()
+                    originals
                 }
-                for ((owner, topics) in losses) {
+                for ((owner, topics) in losses.first) {
                     if (synchronized(lock) { closed }) return
                     if (!deliver { consumer.loseTopics(owner, topics) }) return
                 }
-                if (next == null && losses.isEmpty()) break
+                if (losses.second.isNotEmpty()) {
+                    if (synchronized(lock) { closed }) return
+                    if (!deliver { consumer.loseKrxTopics(losses.second) }) return
+                }
+                if (next == null && losses.first.isEmpty() && losses.second.isEmpty()) break
                 yield()
             }
         }
@@ -181,6 +195,7 @@ internal class GraphRecorderTopicSink(
         closed = true
         queue.clear()
         ledger = mutableMapOf()
+        krxLedger = mutableMapOf()
         usedUnits = 0
         wake.close()
     }
@@ -195,6 +210,8 @@ internal class GraphRecorderTopicSink(
     }
 
     private fun recordLocked(input: TopicGraphInput) {
+        val krxLoss = input.krxGraphLoss()
+        for ((topic, stamps) in krxLoss) krxLedger[topic] = krxLedger[topic].orEmpty() + stamps
         val owner = ownerScope(input) ?: return
         val invalidations = when (input) {
             is TopicGraphInput.Observations -> input.attribution.lifetime.invalidations
@@ -204,8 +221,10 @@ internal class GraphRecorderTopicSink(
             is TopicGraphInput.Observations -> setOf(input.topic)
             is TopicGraphInput.Continuity -> input.topics
         }
+        val general = topics - krxLoss.keys
+        if (general.isEmpty()) return
         val byTopic = ledger.getOrPut(owner) { mutableMapOf() }
-        for (topic in topics) {
+        for (topic in general) {
             byTopic[topic] = maxOf(byTopic[topic] ?: invalidations, invalidations)
         }
     }

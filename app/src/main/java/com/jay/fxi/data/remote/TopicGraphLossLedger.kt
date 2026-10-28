@@ -1,6 +1,9 @@
 package com.jay.fxi.data.remote
 
 import com.jay.fxi.data.graph.GraphDataScope
+import com.jay.fxi.data.graph.KrxGraphStamp
+import com.jay.fxi.data.graph.copyKrxGraphStamps
+import com.jay.fxi.data.graph.krxGraphLoss
 
 /** Explicit cleanup boundaries; [TopicGraphLossLedger.purge] copies both collections before selecting scopes. */
 internal data class GraphLossRetirement(
@@ -48,7 +51,8 @@ internal class TopicGraphLossLedger {
         val reasons: Set<TopicGraphOffer>,
         val topics: Set<String>,
         val paths: Set<TopicGraphPath>,
-        val authorities: Set<TopicGraphAuthorityKey>
+        val authorities: Set<TopicGraphAuthorityKey>,
+        val krxLost: Map<String, Set<KrxGraphStamp>>
     )
 
     private data class State(
@@ -114,7 +118,8 @@ internal class TopicGraphLossLedger {
             reasons = (previous?.reasons ?: emptySet()) + offer,
             topics = (previous?.topics ?: emptySet()) + topics,
             paths = (previous?.paths ?: emptySet()) + paths,
-            authorities = (previous?.authorities ?: emptySet()) + authority
+            authorities = (previous?.authorities ?: emptySet()) + authority,
+            krxLost = mergeKrxLoss(previous?.krxLost.orEmpty(), input.krxGraphLoss())
         )
         val aggregates = held.aggregates + (key to aggregate)
         val revision = held.revision + 1L
@@ -172,6 +177,13 @@ internal class TopicGraphLossLedger {
         return removed
     }
 
+    private fun mergeKrxLoss(
+        a: Map<String, Set<KrxGraphStamp>>,
+        b: Map<String, Set<KrxGraphStamp>>
+    ): Map<String, Set<KrxGraphStamp>> = copyKrxGraphStamps((a.keys + b.keys).associateWith {
+        a[it].orEmpty() + b[it].orEmpty()
+    })
+
     private fun buildView(aggregates: Map<Key, Aggregate>, revision: Long): TopicGraphLoss? {
         if (aggregates.isEmpty()) return null
         val values = aggregates.values
@@ -187,7 +199,8 @@ internal class TopicGraphLossLedger {
             paths = values.flatMapTo(mutableSetOf()) { it.paths },
             firstOccurredAtEpochMillis = first.firstAt,
             lastOccurredAtEpochMillis = last.lastAt,
-            authorities = values.flatMapTo(mutableSetOf()) { it.authorities }
+            authorities = values.flatMapTo(mutableSetOf()) { it.authorities },
+            krxLost = values.fold(emptyMap()) { originals, aggregate -> mergeKrxLoss(originals, aggregate.krxLost) }
         )
     }
 }

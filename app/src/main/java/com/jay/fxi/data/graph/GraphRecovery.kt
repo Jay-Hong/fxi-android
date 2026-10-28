@@ -42,7 +42,8 @@ internal class GraphRecoverableState private constructor(
 internal data class GraphRecoveryRequest(
     val seriesKey: GraphObservationSeriesKey,
     val applicationVersion: Long,
-    val capturedGeneration: Long
+    val capturedGeneration: Long,
+    val krxGraphStamp: KrxGraphStamp? = null
 )
 
 internal data class GraphRecoverableReduction(val state: GraphRecoverableState, val outcomes: List<GraphObservationOutcome>)

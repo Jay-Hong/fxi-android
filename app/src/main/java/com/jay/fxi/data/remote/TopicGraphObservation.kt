@@ -1,7 +1,10 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.graph.KrxGraphStamp
+import com.jay.fxi.data.graph.copyKrxGraphStamps
 import com.jay.fxi.domain.model.TopicAuthResolution
 import com.jay.fxi.domain.model.TopicRejectionReason
+import java.util.Collections
 import kotlinx.datetime.Instant
 
 enum class TopicGraphPath { WS, REST_BOOTSTRAP }
@@ -39,8 +42,12 @@ class TopicGraphAuthority internal constructor(
     internal val sessionKey: Any,
     val owner: TopicSessionFence?,
     internal val grantEpoch: Long,
-    internal val lifetime: TopicUseLifetime?
-)
+    internal val lifetime: TopicUseLifetime?,
+    internal val krxGraphStamp: KrxGraphStamp?
+) {
+    internal constructor(sessionKey: Any, owner: TopicSessionFence?, grantEpoch: Long, lifetime: TopicUseLifetime?) :
+        this(sessionKey, owner, grantEpoch, lifetime, null)
+}
 
 /** Value-comparable original ownership of a lost hand-over. */
 data class TopicGraphAuthorityKey(val owner: TopicSessionFence?, val grantEpoch: Long)
@@ -73,20 +80,47 @@ sealed interface TopicGraphInput {
         val attribution: TopicUseAttribution,
         val connectionGeneration: Long?,
         val candidates: List<TopicGraphCandidate>
-    ) : TopicGraphInput
+    ) : TopicGraphInput {
+        // The legacy constructor must not inspect the batch; the bounded sink owns that read.
+        private var originalKrxGraphStamp: KrxGraphStamp? = null
+        internal val krxGraphStamp: KrxGraphStamp? get() = originalKrxGraphStamp
+
+        internal constructor(
+            sequence: Long,
+            topic: String,
+            path: TopicGraphPath,
+            attribution: TopicUseAttribution,
+            connectionGeneration: Long?,
+            candidates: List<TopicGraphCandidate>,
+            krxGraphStamp: KrxGraphStamp?
+        ) : this(sequence, topic, path, attribution, connectionGeneration,
+            Collections.unmodifiableList(candidates.toList())) {
+            originalKrxGraphStamp = krxGraphStamp
+        }
+    }
 
     /** A confirmed continuity fact; attribution alone authorises no deferred protected side effect. */
     class Continuity(
         override val sequence: Long,
         val kind: TopicGraphEventKind,
         val reason: TopicGraphEventReason?,
-        val topics: Set<String>,
-        val paths: Set<TopicGraphPath>,
+        topics: Set<String>,
+        paths: Set<TopicGraphPath>,
         val authority: TopicGraphAuthority,
         val connectionGeneration: Long?,
         val occurredAtEpochMillis: Long,
-        val payload: TopicGraphEventPayload? = null
-    ) : TopicGraphInput
+        payload: TopicGraphEventPayload? = null
+    ) : TopicGraphInput {
+        val topics: Set<String> = Collections.unmodifiableSet(topics.toSet())
+        val paths: Set<TopicGraphPath> = Collections.unmodifiableSet(paths.toSet())
+        val payload: TopicGraphEventPayload? = when (payload) {
+            is TopicGraphEventPayload.AckApplied -> TopicGraphEventPayload.AckApplied(
+                Collections.unmodifiableSet(payload.confirmedTopics.toSet()),
+                Collections.unmodifiableMap(payload.rejected.toMap())
+            )
+            else -> payload
+        }
+    }
 }
 
 enum class TopicGraphOffer { ENQUEUED, DORMANT, FULL, CLOSED, FAILED }
@@ -116,4 +150,17 @@ data class TopicGraphLoss(
     val firstOccurredAtEpochMillis: Long,
     val lastOccurredAtEpochMillis: Long,
     val authorities: Set<TopicGraphAuthorityKey>
-)
+) {
+    private var originalKrxLost: Map<String, Set<KrxGraphStamp>> = emptyMap()
+    internal val krxLost: Map<String, Set<KrxGraphStamp>> get() = originalKrxLost
+
+    internal constructor(
+        revision: Long, count: Long, firstSequence: Long, lastSequence: Long,
+        reasons: Set<TopicGraphOffer>, topics: Set<String>, paths: Set<TopicGraphPath>,
+        firstOccurredAtEpochMillis: Long, lastOccurredAtEpochMillis: Long,
+        authorities: Set<TopicGraphAuthorityKey>, krxLost: Map<String, Set<KrxGraphStamp>>
+    ) : this(revision, count, firstSequence, lastSequence, reasons, topics, paths,
+        firstOccurredAtEpochMillis, lastOccurredAtEpochMillis, authorities) {
+        originalKrxLost = copyKrxGraphStamps(krxLost)
+    }
+}

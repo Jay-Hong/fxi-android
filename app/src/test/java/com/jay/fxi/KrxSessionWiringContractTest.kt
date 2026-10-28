@@ -207,6 +207,35 @@ class KrxSessionWiringContractTest {
             """krxMemorySnapshot\s*=\s*\{\s*coordinator\.accessSnapshot\s*\}"""))
         assertTrue("contract(Z04): RT forwards its supplier without evaluating it", found(body(runtime, "create"),
             """krxMemorySnapshot\s*=\s*krxMemorySnapshot\b"""))
+        // S6-3b-1: the existing detachable input wrapper is also the ingress. No independent port.
+        val create = body(runtime, "create")
+        assertEquals("contract(Z04): exactly one TSC ingress argument in RT", 1,
+            Regex("""krxGraphIngress\s*=\s*graphInputs""").findAll(create).count())
+        assertTrue("contract(Z04): wrapper receives actual ingress", found(create,
+            """DetachableTopicGraphSink\s*\(\s*graphSink\s*,\s*krxGraphIngress\s*\)"""))
+        val owner = main("data/remote/TopicRuntimeOwner.kt")
+        assertTrue("contract(Z04): owner connects assembled ingress", found(owner,
+            """factory\.create\s*\(\s*graph\.sink\s*,\s*graph\.grants\s*,\s*graph\.krxGraphIngress\s*\)"""))
+        val detachable = main("data/remote/DetachableGraphSinks.kt")
+        for (method in listOf("capture", "topicUnavailable")) {
+            // The shared parser stops expression bodies at the first newline. Include the synchronized block.
+            val head = Regex("""\bfun\s+$method\s*\(""").find(detachable)
+                ?: throw AssertionError("contract(Z04): missing $method")
+            val range = KrxSessionSourceContract.block(detachable, head.range.first)
+            val implementation = detachable.substring(head.range.first, range.last + 1)
+            assertEquals("contract(Z04): $method lock belongs to this method, not a later declaration", 1,
+                Regex("""\bfun\s+""").findAll(implementation).count())
+            assertTrue("contract(Z04): $method shares existing detach lock", found(implementation, """synchronized\s*\(\s*lock\s*\)"""))
+            val locked = detachable.substring(range)
+            val checksDetached = Regex("""if\s*\(\s*detached\s*\)""")
+            assertTrue("contract(Z04): $method checks detached inside the lock", checksDetached.containsMatchIn(locked))
+            assertFalse("contract(Z04): same scan rejects removed detached check", checksDetached.containsMatchIn(
+                locked.replace(checksDetached, "if (false)")))
+            assertFalse("contract(Z04): same scan rejects a different lock", found(
+                implementation.replace(Regex("""synchronized\s*\(\s*lock\s*\)"""), "synchronized(otherLock)"),
+                """synchronized\s*\(\s*lock\s*\)"""))
+        }
+        assertFalse("contract(Z04): no extra detachable control type", found(runtime + owner + detachable, """\bDetachableKrxGraphControl\b"""))
         assertTrue("contract(Z04): SESSION dispatcher uses object identity", found(body(tsc, "retireKrxSubscription"),
             """krxRetirer\s*===\s*KrxSubscriptionRetirer\.SESSION"""))
         val runtimePath = "src/main/java/com/jay/fxi/data/remote/TopicRuntime.kt"

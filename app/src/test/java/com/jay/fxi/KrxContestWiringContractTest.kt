@@ -1324,7 +1324,8 @@ class KrxContestWiringContractTest {
         }
         val retirerName = "krxRetirer"
         val snapshotName = "krxMemorySnapshot"
-        val addedNames = setOf(READER_PARAMETER, MARKER_CHANNEL, retirerName, snapshotName)
+        val ingressName = "krxGraphIngress"
+        val addedNames = setOf(READER_PARAMETER, MARKER_CHANNEL, retirerName, snapshotName, ingressName)
         fun publicPart(internal: List<Parameter>) = internal.filter { it.name !in addedNames }
         fun afterInternalHead(tsc: String, old: String, new: String): String {
             val at = checkNotNull(internalHeadPattern.find(tsc)) { "KW22 self-check: no internal constructor" }.range.first
@@ -1378,7 +1379,8 @@ class KrxContestWiringContractTest {
             readerExpected,
             Parameter(MARKER_CHANNEL, normalized("((TopicSessionFence, Map<String, TopicRejectionReason>, KrxSendMarker?) -> Unit)?"), "null"),
             retirerExpected,
-            snapshotExpected
+            snapshotExpected,
+            Parameter(ingressName, "KrxGraphIngress", "KrxGraphIngress.NONE")
         )
         fun exactInternal(constructors: Constructors): Boolean = constructors.internal == constructors.primary + expectedAdded
         for ((declaration, accepted) in listOf(
@@ -1404,11 +1406,29 @@ class KrxContestWiringContractTest {
         assertTrue("contract(KW22): the extra-parameter mutation applied", extra != tsc)
         assertTrue("contract(KW22): an additional constructor parameter remains forbidden", !exactInternal(parse(extra)))
 
+        val ingressDeclaration = "krxGraphIngress: KrxGraphIngress = KrxGraphIngress.NONE"
+        for ((declaration, accepted) in listOf(
+            ingressDeclaration to true,
+            "krxGraphIngress: KrxGraphIngress" to false,
+            "krxGraphIngress: KrxGraphIngress? = null" to false,
+            "krxGraphIngress: KrxGraphIngress = injected" to false
+        )) {
+            val mutant = afterInternalHead(tsc, ingressDeclaration, declaration)
+            val actual = parse(mutant)
+            assertEquals("contract(KW22): only exact ingress type/default is accepted", accepted, exactInternal(actual))
+        }
+        val ingressSwapped = afterInternalHead(afterInternalHead(afterInternalHead(tsc,
+            snapshotDeclaration, "__snapshot_parameter__"), ingressDeclaration, snapshotDeclaration),
+            "__snapshot_parameter__", ingressDeclaration)
+        assertTrue("contract(KW22): ingress must immediately follow snapshot", !exactInternal(parse(ingressSwapped)))
+        val extraIngress = afterInternalHead(tsc, ingressDeclaration, "$ingressDeclaration, extraIngress: KrxGraphIngress = KrxGraphIngress.NONE")
+        assertTrue("contract(KW22): extra ingress parameter forbidden", !exactInternal(parse(extraIngress)))
+
         val (primary, internal, passed) = parse(tsc)
         assertTrue("premise: KW22 the primary constructor's parameters are parsed (${primary.size})", primary.size >= 20 && primary.any { it.name == "desired" })
         val added = internal.filter { it.name in addedNames }
         assertEquals("contract(KW22): internal retains all public parameter names, order, types and defaults", primary, publicPart(internal))
-        assertEquals("contract(KW22): original reader/channel/retirer plus the exact memory snapshot supplier", expectedAdded, added)
+        assertEquals("contract(KW22): original four dependencies plus exact ingress", expectedAdded, added)
         assertEquals("contract(KW22): exact full constructor inventory places snapshot immediately after retirer", primary + expectedAdded, internal)
         assertEquals("KW22 the delegation passes every public parameter through by its own name",
             primary.map { it.name to it.name }, passed)

@@ -184,7 +184,8 @@ internal class GraphV2RequestCoordinator(
         val entry: GraphEntry,
         val components: GraphV2DiskComponents,
         val supplementGeneration: Long? = null,
-        val krxCapabilityInvalidations: Long
+        val krxCapabilityInvalidations: Long,
+        val krxGraphStamp: KrxGraphStamp? = null
     )
 
     private data class ProtectedPublication(
@@ -772,7 +773,7 @@ internal class GraphV2RequestCoordinator(
         val current = publication.context ?: return null
         val slot = publication.slots[key] ?: return null
         val captured = ports.gate.bind(current.fence, current.lifetime) ?: return null
-        val joined = ports.gate.joinForExposure(captured, slot.components, slot.krxCapabilityInvalidations) ?: return null
+        val joined = ports.gate.joinForExposure(captured, slot.components, slot.krxCapabilityInvalidations, slot.krxGraphStamp) ?: return null
         return GraphEntry(joined.tab, slot.entry.online200At)
     }
 
@@ -866,7 +867,7 @@ internal class GraphV2RequestCoordinator(
         val seedId = Math.incrementExact(nextSeedId)
         nextSeedId = seedId
         val binding = try {
-            ports.gate.bindWithConfiguration(current.fence, current.lifetime)
+            ports.gate.captureKrxGraph(current.fence, current.lifetime)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Throwable) {
@@ -954,7 +955,7 @@ internal class GraphV2RequestCoordinator(
             snapshot = snapshot.copy(entries = snapshot.entries + (event.key to entry))
             protectedSlots = protectedSlots + (event.key to ProtectedSlot(
                 entry, GraphV2DiskComponents(general, krx.takeIf { joined.krxJoined }), pending,
-                event.captured.capabilityInvalidations
+                event.captured.capabilityInvalidations, event.captured.krxGraphStamp
             ))
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -1068,7 +1069,7 @@ internal class GraphV2RequestCoordinator(
         }
         protectedSlots = protectedSlots.mapValues { (key, slot) ->
             ProtectedSlot(entries.getValue(key), slot.components.copy(krx = null), capabilityGeneration,
-                slot.krxCapabilityInvalidations)
+                slot.krxCapabilityInvalidations, slot.krxGraphStamp)
         }
         snapshot = snapshot.copy(entries = entries)
         requireFlipConfirmation(now)
@@ -1211,7 +1212,7 @@ internal class GraphV2RequestCoordinator(
     }
 
     private fun bindRequestAccess(current: RequestContext): GraphV2AccessCapture? = try {
-        cachePorts?.gate?.bind(current.fence, current.lifetime)
+        cachePorts?.gate?.captureKrxGraph(current.fence, current.lifetime)?.captured
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (_: Throwable) {
@@ -1380,7 +1381,8 @@ internal class GraphV2RequestCoordinator(
         when (outcome) {
             is TabOutcome.Success -> {
                 val confirmed = cachePorts == null || configuration?.let {
-                    !it.allowed || (it.recordEpoch != null && it.recordEpoch == registration.accessCapture?.krxCapabilityEpoch)
+                    !it.allowed || (it.recordEpoch != null && it.recordEpoch == registration.accessCapture?.krxCapabilityEpoch &&
+                        originalKrxAdmitted(registration.accessCapture))
                 } == true
                 val entry = GraphEntry(outcome.tab, now.takeIf { confirmed })
                 snapshot = snapshot.copy(
@@ -1490,15 +1492,21 @@ internal class GraphV2RequestCoordinator(
         // epoch, or none once capability retirement cleared it).
         val memoryComponents = components.copy(krx = components.krx.takeIf {
             configuration?.allowed == true && configuration.recordEpoch != null &&
-                configuration.recordEpoch == registration.accessCapture?.krxCapabilityEpoch
+                configuration.recordEpoch == registration.accessCapture?.krxCapabilityEpoch &&
+                originalKrxAdmitted(registration.accessCapture)
         })
         val adopted = entry.copy(tab = joinGraphV2Components(memoryComponents.general, memoryComponents.krx).tab)
         snapshot = snapshot.copy(entries = snapshot.entries + (key to adopted))
         protectedSlots = protectedSlots + (key to ProtectedSlot(
-            adopted, memoryComponents, krxCapabilityInvalidations = registration.accessCapture?.capabilityInvalidations ?: 0L
+            adopted, memoryComponents, krxCapabilityInvalidations = registration.accessCapture?.capabilityInvalidations ?: 0L,
+            krxGraphStamp = registration.accessCapture?.krxGraphStamp
         ))
-        return components
+        return components.copy(krx = components.krx.takeIf { originalKrxAdmitted(registration.accessCapture) })
     }
+
+    /** Legacy/OFF captures perform no additional supplier read. Original ON provenance always stays guarded. */
+    private fun originalKrxAdmitted(captured: GraphV2AccessCapture?): Boolean =
+        captured?.krxGraphStamp == null || cachePorts?.gate?.admits(captured, GraphV2DiskComponent.KRX) == true
 
     private fun generalOnly(tab: GraphV2Tab): GraphV2Tab = tab.copy(
         graph = tab.graph.copy(series = tab.graph.series.filterNot { it.seriesId.startsWith("krx.") }),
@@ -1548,7 +1556,8 @@ internal class GraphV2RequestCoordinator(
                 if (!task.enabled.get() || !scope.isActive ||
                     !ports.gate.admits(captured, GraphV2DiskComponent.GENERAL)
                 ) throw CancellationException("Write preparation admission is closed")
-                writes.prepareWrite.prepare(captured, task.wantsKrx && task.krxOwned.get())
+                val includeKrx = task.wantsKrx && task.krxOwned.get() && originalKrxAdmitted(captured)
+                writes.prepareWrite.prepare(captured, includeKrx)
             }
             val delivered = inbox.trySend(Event.WritePreparationFinished(ticket, captured, result)).isSuccess
             if (!delivered || result.exceptionOrNull() is CancellationException) abandonWrite(task)
@@ -1564,7 +1573,8 @@ internal class GraphV2RequestCoordinator(
         try {
             val ports = cachePorts ?: return
             if (!task.enabled.get() || !scope.isActive || event.captured != task.captured) return
-            val owned = task.wantsKrx && task.krxOwned.get()
+            val ownsKrx = task.wantsKrx && task.krxOwned.get()
+            val owned = ownsKrx && originalKrxAdmitted(task.captured)
             event.result.exceptionOrNull()?.let { failure ->
                 if (failure is CancellationException) return
                 val blocked = GraphV2NamespacePreparation.Blocked("Write preparation failed", failure)
@@ -1581,7 +1591,9 @@ internal class GraphV2RequestCoordinator(
             if (generalBlock != null) preparationBlocked(task, GraphV2DiskComponent.GENERAL, generalBlock)
             if (krxBlock != null) preparationBlocked(task, GraphV2DiskComponent.KRX, krxBlock)
             if (task.wantsKrx && !owned && result.krx != null) {
-                writeDiagnostic(task.writeId, task.key, GraphV2DiskComponent.KRX, "KRX candidate withdrawn by capability retirement")
+                val reason = if (!ownsKrx) "KRX candidate withdrawn by capability retirement"
+                    else "KRX candidate is no longer admitted"
+                writeDiagnostic(task.writeId, task.key, GraphV2DiskComponent.KRX, reason)
             }
             if (!task.wantsKrx && result.krx != null) {
                 writeDiagnostic(task.writeId, task.key, GraphV2DiskComponent.KRX, "Ignoring preparation without a KRX candidate")

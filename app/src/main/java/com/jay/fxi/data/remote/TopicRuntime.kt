@@ -14,6 +14,7 @@ import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.entitlements.TopicGrantDeliverer
 import com.jay.fxi.data.entitlements.TopicGrantIssuer
 import com.jay.fxi.data.free.FreeSnapshotSchedulePolicy
+import com.jay.fxi.data.graph.KrxGraphIngress
 import com.jay.fxi.data.local.FreeTabStore
 import com.jay.fxi.data.local.TopicLastKnownOwner
 import com.jay.fxi.data.local.TopicLastKnownRestoreGate
@@ -122,8 +123,12 @@ internal class TopicRuntimeFactory internal constructor(
      * [extraGrantSink] is the fan-out's second connection, wrapped detachable, after the session's, which is never wrapped.
      * The runtime's detachGraph() cuts both.
      */
-    fun create(graphSink: TopicGraphSink = DormantTopicGraphSink, extraGrantSink: TopicGrantSink? = null): TopicRuntime {
-        val graphInputs = if (graphSink === DormantTopicGraphSink) null else DetachableTopicGraphSink(graphSink)
+    fun create(
+        graphSink: TopicGraphSink = DormantTopicGraphSink,
+        extraGrantSink: TopicGrantSink? = null,
+        krxGraphIngress: KrxGraphIngress = KrxGraphIngress.NONE
+    ): TopicRuntime {
+        val graphInputs = if (graphSink === DormantTopicGraphSink) null else DetachableTopicGraphSink(graphSink, krxGraphIngress)
         val graphGrants = extraGrantSink?.let { DetachableTopicGrantSink(it) }
         val scope = newScope()
         val floor = newBootstrapFloor(clock)
@@ -156,6 +161,7 @@ internal class TopicRuntimeFactory internal constructor(
             krxSendReader = krxSendReader,
             krxRetirer = KrxSubscriptionRetirer.SESSION,
             krxMemorySnapshot = krxMemorySnapshot,
+            krxGraphIngress = graphInputs ?: KrxGraphIngress.NONE,
             onRejectedWithMarker = { owner, rejected, marker -> deliverer.forwardRejection(owner, rejected, marker) },
             graphSink = graphInputs ?: DormantTopicGraphSink
         )

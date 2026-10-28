@@ -137,6 +137,8 @@ internal class GraphRuntimeAssembly(
     private var closed = false
 
     val fences: GraphAccessFenceBridge
+    private val krxFence = KrxGraphFence()
+    val krxGraphIngress: KrxGraphIngress = krxFence
     val gate: GraphV2AccessGate
     val recorder: GraphRecorder
     val coordinator: GraphV2RequestCoordinator
@@ -150,7 +152,7 @@ internal class GraphRuntimeAssembly(
         var createdRecorder: GraphRecorder? = null
         var createdCoordinator: GraphV2RequestCoordinator? = null
         try {
-            gate = GraphV2AccessGate(liveIdentity, fences.current, accessSnapshot, protectedAdmission)
+            gate = GraphV2AccessGate(liveIdentity, fences.current, accessSnapshot, protectedAdmission, krxFence)
             recorder = GraphRecorder(
                 scope, accessRevisions, accessSnapshot, fences.current,
                 graphRecorderCatalog({ requests }, fences.current, uses), gate, clock
@@ -183,6 +185,7 @@ internal class GraphRuntimeAssembly(
                 contextChanged = requests::onContextChanged
             )
         } catch (failure: Throwable) {
+            krxFence.close()
             fences.close()
             // No component has started; each cleanup is synchronous and needs no completion wait.
             runCatching { createdRecorder?.close() }.exceptionOrNull()?.let { failure.addSuppressed(it) }
@@ -211,6 +214,7 @@ internal class GraphRuntimeAssembly(
             if (!closed) {
                 closed = true
                 events.close()
+                krxFence.close()
                 fences.close()
                 sink.close()
                 coordinator.close()
