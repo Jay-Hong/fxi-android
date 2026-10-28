@@ -55,8 +55,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 S6-2b-1b-α(`da1f293`: KRX 소비자 판정과 송신 표지 운반, 스위치 꺼짐, 2026-10-27),
                                 S6-2b-1b-β(`f79d334`: KRX 소비자 켬 짝 시험·cutover 인수 15행·U10 결론, 시험만, 2026-10-27),
                                 S6-2b-2α(`48bb96a`: KRX 세션 허가 소비·typed 송신·REST 사다리, 스위치 꺼짐, 2026-10-28),
-                                S6-3a(`24ea81c`: KRX 구독 실제 정리·세션 메모리 purge, 스위치 꺼짐, 2026-10-28)를
-                                land했다. 다음은 scope r16 순서대로 S6-3b-1 → S6-3b-2 → S6-3c → S6-4 기본 꺼짐 준비 →
+                                S6-3a(`24ea81c`: KRX 구독 실제 정리·세션 메모리 purge, 스위치 꺼짐, 2026-10-28),
+                                S6-3b-1(`1fff9b8`: 그래프 KRX 원본 귀속·D1 cutoff로 old KRX 접근 차단, 스위치 꺼짐, 2026-10-28)를
+                                land했다. 다음은 scope r16 순서대로 S6-3b-2 → S6-3c → S6-4 기본 꺼짐 준비 →
                                 S6-2b-2β(최종 동일 후보의 측정용 켬·P1(b))다 (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
@@ -1763,7 +1764,17 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   ACK의 귀속 해제, 미확정 판정)을 찾아 보강 행으로 잠갔다. 계약 메서드 33개와 기존 시험 명시 개정 4건. 단위 9352/0,
   스텁 실패 29 전부 계약 표식, 변이 25종 27쌍에서 모든 변이가 최소 한 행에서 계약 검출, CI 세 변형 로컬 통과, hosted
   CI run `40613982278` green. 그래프·recorder(3b), pending tap(3c), 디스크 purge(P3-i)는 포함하지 않는다.
-  · 보류: 그래프 KRX 인계·recorder 보호(S6-3b-1)와 물리 purge(S6-3b-2), pending tap(S6-3c, 착수 전 미분류 탭 처리
+  · S6-3b-1 `1fff9b8` 그래프 KRX 원본 귀속과 D1 cutoff(S6-3b 설계 r4·scope r16·seam r5, 트리 밖 manifest r26):
+  WS prepare·REST issue·graph 요청 시작에서만 원본 stamp를 발급하고, ACK·frame·drain·replay·완료·노출은 그 원본으로
+  C-1을 다시 검사한다. 신규 KrxGraphFence는 유효한 현재 KRX ACK의 topic_unavailable(D1)만 namespace cutoff를 설치하고
+  revision을 올리며, holder는 이를 관찰해 이미 게시한 old KRX를 내린다. 종료·WS 중단 사실은 같은 연결 authority의
+  알려진 원본을 운반한다(가격이 없거나 lease가 먼저 끝나도). 시험·구현은 병행했고, 원본 운반 누락을 독립 검토가
+  2건(종료 사실·가격 없는 종료), 시험 작성 스레드가 1건(WS 중단 사실) 찾아 보강했다. land 검토는 OFF 비교가
+  같은 빌드 consumer를 공유해 독립 HEAD 비교가 아님을 지적했고, O03을 깨끗한 HEAD `24ea81c`에서 실제로 실행해
+  동결한 trace와 비교하도록 바꿨다. 계약 메서드 31개와 기존 시험 명시 개정. 단위 9384/0, 스텁 실패 35 전부 계약
+  표식, 변이 33종 34쌍 전부 해당 행 계약 검출, CI 세 변형 로컬 통과, hosted CI run `40649209381` green.
+  CAPABILITY 물리 purge·recorder target·fake disk 집계(3b-2), pending tap(3c), 디스크 purge(P3-i)는 포함하지 않는다.
+  · 보류: 물리 purge·recorder CAPABILITY target·fake disk 집계(S6-3b-2), pending tap(S6-3c, 착수 전 미분류 탭 처리
   사용자 질문 U5/U7), KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
   A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
   답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)다. 다음 D4 판 조건은 D4 r6(A2 r8·A1 r9 반영, 트리 밖
