@@ -54,9 +54,10 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 꺼짐, 2026-10-23), S6-2b-1a(`159cbbf`: KRX 허가 판정·예약 표지의 PAC 배선, 스위치 꺼짐, 2026-10-24),
                                 S6-2b-1b-α(`da1f293`: KRX 소비자 판정과 송신 표지 운반, 스위치 꺼짐, 2026-10-27),
                                 S6-2b-1b-β(`f79d334`: KRX 소비자 켬 짝 시험·cutover 인수 15행·U10 결론, 시험만, 2026-10-27),
-                                S6-2b-2α(`48bb96a`: KRX 세션 허가 소비·typed 송신·REST 사다리, 스위치 꺼짐, 2026-10-28)를
-                                land했다. 다음은 scope r14 순서대로 S6-3 → S6-4 기본 꺼짐 준비 → S6-2b-2β(최종 동일 후보의
-                                측정용 켬·P1(b))다 (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
+                                S6-2b-2α(`48bb96a`: KRX 세션 허가 소비·typed 송신·REST 사다리, 스위치 꺼짐, 2026-10-28),
+                                S6-3a(`24ea81c`: KRX 구독 실제 정리·세션 메모리 purge, 스위치 꺼짐, 2026-10-28)를
+                                land했다. 다음은 scope r16 순서대로 S6-3b-1 → S6-3b-2 → S6-3c → S6-4 기본 꺼짐 준비 →
+                                S6-2b-2β(최종 동일 후보의 측정용 켬·P1(b))다 (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
 S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반환(실제 purge 없음) · 접근 판정의
@@ -1752,8 +1753,18 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   개정 18개. 단위 9319/0, 스텁(HEAD 동작) 실패 103 전부 계약 표식, 변이 95종 104쌍에서 모든 변이가 최소 한 행에서
   계약 검출(원 행 생존 5·전제 1은 보강 행이 검출), CI 세 변형 로컬 통과, hosted CI run `40590710986` green.
   seam r3가 보장 범위 밖으로 둔 열(token 대기·401 replay 중 floor 재검사 등)은 계약 문서에 명시했다.
-  · 보류: 실제 KRX unsubscribe·purge·늦은 프레임 폐기(S6-3), KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이
-  남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
+  · S6-3a `24ea81c` KRX 구독 실제 정리·세션 메모리 purge(S6-3 설계 r2·scope r15·seam r4, 트리 밖 manifest r24):
+  S6-3은 scope r15에서 3a·3b·3c로, r16에서 3b를 3b-1·3b-2로 나눴다. 3a는 KrxSubscriptionRetirer.SESSION 선택 표지를
+  같은 세션 턴에서 동기 해석해 old KRX registry만 정리하고, 열린 같은 연결·종료 아님·새 capture 선점 없음일 때만 KRX
+  unsubscribe를 한 번 보낸다(토큰·재시도 없음, 실패는 성공으로 바꾸지 않음). 세션 메모리는 명시 capability/USER end·
+  confirmed rotation·WS topic_unavailable을 원래 자료 scope로 구별해 두 rates의 KRX key만 지우고 KRX canonical 상태를
+  expire한다. 단순 보류·REST Degraded는 지우지 않고, 출처 미확정 자료는 지우지 않은 채 미확정으로 기록한다. 시험·
+  구현은 공유 API를 고정한 뒤 두 스레드가 병행했고, 독립 검토가 구현에서 계약 누락 3건(canonical 귀속, GENERAL-only
+  ACK의 귀속 해제, 미확정 판정)을 찾아 보강 행으로 잠갔다. 계약 메서드 33개와 기존 시험 명시 개정 4건. 단위 9352/0,
+  스텁 실패 29 전부 계약 표식, 변이 25종 27쌍에서 모든 변이가 최소 한 행에서 계약 검출, CI 세 변형 로컬 통과, hosted
+  CI run `40613982278` green. 그래프·recorder(3b), pending tap(3c), 디스크 purge(P3-i)는 포함하지 않는다.
+  · 보류: 그래프 KRX 인계·recorder 보호(S6-3b-1)와 물리 purge(S6-3b-2), pending tap(S6-3c, 착수 전 미분류 탭 처리
+  사용자 질문 U5/U7), KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
   A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
   답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)다. 다음 D4 판 조건은 D4 r6(A2 r8·A1 r9 반영, 트리 밖
   manifest r7)으로 채웠고, 남은 조건은 2b-2 계약의 CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. scope U10(CUT-C01
