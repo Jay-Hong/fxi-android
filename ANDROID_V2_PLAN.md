@@ -56,8 +56,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 S6-2b-1b-β(`f79d334`: KRX 소비자 켬 짝 시험·cutover 인수 15행·U10 결론, 시험만, 2026-10-27),
                                 S6-2b-2α(`48bb96a`: KRX 세션 허가 소비·typed 송신·REST 사다리, 스위치 꺼짐, 2026-10-28),
                                 S6-3a(`24ea81c`: KRX 구독 실제 정리·세션 메모리 purge, 스위치 꺼짐, 2026-10-28),
-                                S6-3b-1(`1fff9b8`: 그래프 KRX 원본 귀속·D1 cutoff로 old KRX 접근 차단, 스위치 꺼짐, 2026-10-28)를
-                                land했다. 다음은 scope r16 순서대로 S6-3b-2 → S6-3c → S6-4 기본 꺼짐 준비 →
+                                S6-3b-1(`1fff9b8`: 그래프 KRX 원본 귀속·D1 cutoff로 old KRX 접근 차단, 스위치 꺼짐, 2026-10-28),
+                                S6-3b-2(`0302b58`: 그래프 KRX 선택 물리 purge·CAPABILITY memory target, 스위치 꺼짐, 2026-10-28)를
+                                land했다. 다음은 scope r17 순서대로 S6-3c → S6-4 기본 꺼짐 준비 →
                                 S6-2b-2β(최종 동일 후보의 측정용 켬·P1(b))다 (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
@@ -1774,7 +1775,17 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   동결한 trace와 비교하도록 바꿨다. 계약 메서드 31개와 기존 시험 명시 개정. 단위 9384/0, 스텁 실패 35 전부 계약
   표식, 변이 33종 34쌍 전부 해당 행 계약 검출, CI 세 변형 로컬 통과, hosted CI run `40649209381` green.
   CAPABILITY 물리 purge·recorder target·fake disk 집계(3b-2), pending tap(3c), 디스크 purge(P3-i)는 포함하지 않는다.
-  · 보류: 물리 purge·recorder CAPABILITY target·fake disk 집계(S6-3b-2), pending tap(S6-3c, 착수 전 미분류 탭 처리
+  · S6-3b-2 `0302b58` 그래프 KRX 선택 물리 purge와 CAPABILITY memory target(S6-3b-2 설계 r2·scope r17·seam r6, 트리 밖
+  manifest r27): 3b-1 원본 stamp와 생성 시 동결한 명시 증거(USER/CAP end·확정 rotation·유효 D1 cutoff)로만 지울 대상을
+  고르고, recorder·sink·coordinator·session graph loss·holder cache의 선택분을 실제로 지운다. GENERAL·USER floor·공유
+  recovery budget은 보존하고, 관련 unknown은 지우지 않고 미확정으로 남긴다. memory manifest target에 CAPABILITY를
+  더했고, 명시 fixture의 fake disk 결과와 합친 집계는 모든 target이 끝났을 때만 Completed로 답한다(실패 우선, 미완료는
+  Deferred, 미완료 동안 journal·control 기록 보존). 실제 disk·운영 purger DI는 P3-i다. 독립 검토가 3b-1에서 상속된
+  seam C5-02 누락(WS prepare 원본을 known source로 기억하지 않음)을 찾아 보완했다. Claude는 그 시험 기대(E04)를 코드
+  동작 기준으로 시험 결함이라 판정했다가 철회했다. 상한은 누적 4시간 재산정 뒤 scope r17로 8h → 10h. 계약 메서드
+  21개와 기존 시험 명시 개정 8파일(P07·G32 포함). 단위 9406/0, 스텁 실패 26 전부 계약 표식, 변이 25쌍 전부 해당 행
+  계약 검출, CI 세 변형 로컬 통과, hosted CI run `40695775153` green. pending tap(3c), 디스크 purge(P3-i)는 포함하지 않는다.
+  · 보류: pending tap(S6-3c, 착수 전 미분류 탭 처리
   사용자 질문 U5/U7), KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
   A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
   답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)다. 다음 D4 판 조건은 D4 r6(A2 r8·A1 r9 반영, 트리 밖
