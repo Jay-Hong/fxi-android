@@ -13,7 +13,15 @@ import com.jay.fxi.data.entitlements.KrxSendAcquisition
 import com.jay.fxi.data.entitlements.KrxSendAdmission
 import com.jay.fxi.data.entitlements.KrxSendMarker
 import com.jay.fxi.data.entitlements.KrxSendReadAuthority
+import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.entitlements.krxConsumerGuard
+import com.jay.fxi.data.entitlements.purge.KRX_MEMORY_KEY
+import com.jay.fxi.data.entitlements.purge.KrxMemoryCause
+import com.jay.fxi.data.entitlements.purge.KrxMemoryCleanupEvent
+import com.jay.fxi.data.entitlements.purge.KrxMemoryCleanupResult
+import com.jay.fxi.data.entitlements.purge.KrxMemoryScope
+import com.jay.fxi.data.entitlements.purge.KrxMemorySelection
+import com.jay.fxi.data.entitlements.purge.krxMemorySelections
 import com.jay.fxi.data.graph.GraphDataScope
 import com.jay.fxi.data.local.TopicLastKnownRestore
 import com.jay.fxi.data.remote.dto.DxySpotEntry
@@ -564,8 +572,19 @@ class TopicSessionCoordinator(
     // Also completed when this grant's initial slot merges into an actual PERMIT issue.
     private var krxInitialIssuedGrant: Long? = null
     private var krxSnapshotRevision = 0L
+    private var nextKrxCapture = 0L
     private val krxRestIssues = mutableMapOf<Long, KrxRestIssue>()
-    private val krxRetired = mutableSetOf<KrxSubscriptionRetirement>()
+    private val krxRetired = linkedMapOf<KrxSubscriptionRetirement, KrxRetirementRecord?>()
+    internal val krxRetirementRecords: Map<KrxSubscriptionRetirement, KrxRetirementRecord?> get() = krxRetired.toMap()
+    private val krxMemoryEvents = mutableListOf<KrxMemoryCleanupEvent>()
+    internal val krxMemoryCleanupLog: List<KrxMemoryCleanupEvent> get() = krxMemoryEvents.toList()
+    private var krxDisplayScope: KrxMemoryScope? = null
+    private var krxLiveScope: KrxMemoryScope? = null
+    // Canonical ACK provenance survives capture retirement and a session with no quotes.
+    private var krxCanonicalScope: KrxMemoryScope? = null
+    private var krxMemoryRevision: Long? = null
+    private var krxMemoryUserEnd = 0L
+    private var krxMemoryCapabilityEnd = 0L
     private val krxTopic: String? get() = desired.firstOrNull(TopicCatalogue::carriesKrx)
 
     private fun prepareKrxAttempt(live: Connection, commandId: Long, request: KrxAttemptScope): KrxCommandAttempt? {
@@ -617,6 +636,7 @@ class TopicSessionCoordinator(
             if (krxPermitOwed?.let { it <= p } == true) krxPermitOwed = null
         }
         markKrxPendingSent(live, attempt.requestId)
+        supersedeKrxRetirements(live, attempt.requestId)
         if (attempt.consumePermit != null) {
             // capInv can refund a WS send, but never the automatic ladder already started for p.
             if (attempt.stamp.permitSeq !in krxLaddersStarted) {
@@ -678,6 +698,7 @@ class TopicSessionCoordinator(
     }
 
     private data class KrxCapture(
+        val order: Long,
         val connectionGeneration: Long,
         val commandId: Long,
         val requestId: String,
@@ -697,6 +718,7 @@ class TopicSessionCoordinator(
         val requestId: Long,
         val grantEpoch: Long,
         val topic: String,
+        val owner: TopicSessionFence,
         val stamp: KrxSessionStamp,
         val marker: KrxSendMarker,
         val use: KrxUseLifetime,
@@ -714,13 +736,37 @@ class TopicSessionCoordinator(
         CONNECTION_ENDED, ACK_REJECTED, ATTEMPT_ENDED, LEASE_EXPIRED
     }
 
+    /** Captured before either pointer is cleared; promotion and end have intentional pointer gaps. */
+    private data class KrxRetirementContext(
+        val live: Connection,
+        val ownsRegistry: Boolean,
+        val ending: Boolean,
+        val replacementRequestId: String?
+    )
+
+    private fun krxRetirementContext(
+        live: Connection, capture: KrxCapture, leaseId: String?,
+        replacement: KrxCapture? = null, ending: Boolean = false
+    ): KrxRetirementContext {
+        fun newer(candidate: KrxCapture?): KrxCapture? = candidate?.takeIf {
+            it.order > capture.order && krxSendReader?.admitsKrx(it.use) == true
+        }
+        val successor = newer(replacement) ?: newer(live.krxPending?.takeIf { !it.masked }?.capture)
+            ?: newer(live.krxActive)
+        return KrxRetirementContext(live,
+            ownsRegistry = successor == null && live.krxActive === capture && leaseId != null &&
+                krxTopic?.let { live.krxLeases.held[it]?.leaseId } == leaseId,
+            ending = ending, replacementRequestId = successor?.requestId)
+    }
+
     private fun installKrxPending(live: Connection, attempt: KrxCommandAttempt) {
+        val replacement = KrxCapture(++nextKrxCapture, live.generation, attempt.commandId, attempt.requestId,
+            attempt.grantEpoch, attempt.stamp, checkNotNull(attempt.krxUse))
         live.krxPending?.let { old ->
             check(old.capture.commandId == attempt.commandId) { "one KRX pending request per connection" }
-            retireKrxPending(live, old)
+            retireKrxPending(live, old, replacement = replacement)
         }
-        live.krxPending = KrxPending(KrxCapture(live.generation, attempt.commandId, attempt.requestId,
-            attempt.grantEpoch, attempt.stamp, checkNotNull(attempt.krxUse)))
+        live.krxPending = KrxPending(replacement)
     }
 
     private fun markKrxPendingSent(live: Connection, requestId: String) {
@@ -734,46 +780,65 @@ class TopicSessionCoordinator(
 
     private fun promoteKrxCapture(live: Connection, commandId: Long, requestId: String, accepted: Boolean) {
         val pending = live.krxPending?.takeIf { it.capture.commandId == commandId && it.capture.requestId == requestId } ?: return
+        val promote = accepted && pending.sent && !pending.masked && validKrxCapture(live, pending.capture)
+        // Reserve K2 while pending is still present. retireKrxActive captures this reservation before clearing K1.
+        val old = live.krxActive
+        val context = old?.let {
+            krxRetirementContext(live, it, krxTopic?.let { live.krxLeases.held[it]?.leaseId },
+                replacement = pending.capture.takeIf { promote })
+        }
+        val pendingContext = krxRetirementContext(live, pending.capture, null)
         live.krxPending = null
-        if (accepted && pending.sent && !pending.masked && validKrxCapture(live, pending.capture)) {
-            // Replacing a capture does not rebind the old use. Its exact tuple is retired first.
-            retireKrxActive(live)
+        if (promote) {
+            retireKrxActive(live, context)
             live.krxActive = pending.capture
             live.krxLeaseMasked = false
+            supersedeKrxRetirements(live, pending.capture.requestId)
         } else {
-            retireKrxPending(live, pending)
+            retireKrxPending(live, pending, prepared = pendingContext)
             if (!accepted) retireKrxActive(live)
         }
     }
 
-    private fun retireKrxPending(live: Connection, pending: KrxPending) {
+    private fun retireKrxPending(
+        live: Connection, pending: KrxPending, replacement: KrxCapture? = null, ending: Boolean = false,
+        prepared: KrxRetirementContext? = null
+    ) {
+        val context = prepared ?: krxRetirementContext(live, pending.capture, null, replacement, ending)
         pending.masked = true
-        if (pending.sent) requestKrxRetirement(pending.capture, null)
+        if (pending.sent) requestKrxRetirement(pending.capture, null, context)
     }
 
-    private fun requestKrxRetirement(capture: KrxCapture, leaseId: String?) {
+    private fun requestKrxRetirement(capture: KrxCapture, leaseId: String?, context: KrxRetirementContext) {
         val request = KrxSubscriptionRetirement(capture.connectionGeneration, capture.requestId, leaseId)
-        if (krxRetired.add(request)) retireKrxSubscription(request)
+        if (krxRetired.containsKey(request)) return
+        krxRetired[request] = null
+        retireKrxSubscription(request, context)
     }
 
-    private fun retireKrxActive(live: Connection) {
+    private fun retireKrxActive(live: Connection, prepared: KrxRetirementContext? = null, ending: Boolean = false) {
         val active = live.krxActive ?: return
+        val lease = krxTopic?.let { live.krxLeases.held[it]?.leaseId }
+        val context = prepared ?: krxRetirementContext(live, active, lease, ending = ending)
         live.krxActive = null
         live.krxLeaseMasked = true
-        val lease = krxTopic?.let { live.krxLeases.held[it]?.leaseId }
         live.krxExpiryTimer?.cancel()
         live.krxRenewalTimer?.cancel()
         live.krxRenewalScope = emptySet()
         live.renewalScope = live.renewalScope.filterNotTo(linkedSetOf(), TopicCatalogue::carriesKrx)
-        requestKrxRetirement(active, lease)
+        requestKrxRetirement(active, lease, context)
     }
 
     private fun retireKrxCapture(live: Connection?, reason: KrxRetirementReason) {
         live ?: return
+        val ending = reason == KrxRetirementReason.CONNECTION_ENDED || reason == KrxRetirementReason.CONTEXT_ENDED
+        // Ending intent is fixed before pending/active are changed, including end's !live.ended window.
+        val activeContext = live.krxActive?.let {
+            krxRetirementContext(live, it, krxTopic?.let { live.krxLeases.held[it]?.leaseId }, ending = ending)
+        }
         live.krxPending?.let { pending ->
-            retireKrxPending(live, pending)
-            // A permit command carries KRX alone. Withholding that capability ends its control
-            // obligation too; a mixed FIRST/renewal/manual retains its GENERAL ACK obligation.
+            retireKrxPending(live, pending, ending = ending)
+            // A KRX-only permit relinquishes its lane; mixed commands retain their GENERAL ACK obligation.
             val owner = pending.capture.commandId
             val running = live.commands[owner]
             if (running?.krxSource == KrxAttemptSource.PERMIT) {
@@ -782,8 +847,59 @@ class TopicSessionCoordinator(
                 releaseControlLane(live, owner)
             }
         }
-        retireKrxActive(live)
-        if (reason == KrxRetirementReason.CONNECTION_ENDED || reason == KrxRetirementReason.CONTEXT_ENDED) live.krxPending = null
+        retireKrxActive(live, activeContext, ending)
+        if (ending) live.krxPending = null
+    }
+
+    private fun supersedeKrxRetirements(live: Connection, requestId: String) {
+        if (krxSession == null || live.krxPending?.capture?.requestId != requestId && live.krxActive?.requestId != requestId) return
+        krxRetired.entries.forEach { entry ->
+            val record = entry.value
+            if (entry.key.connectionGeneration == live.generation && entry.key.requestId != requestId &&
+                record?.disposition == KrxRetirementDisposition.OPEN_CONNECTION_BOUND) {
+                entry.setValue(record.copy(disposition = KrxRetirementDisposition.SUPERSEDED_BY_NEW_CAPTURE))
+            }
+        }
+    }
+
+    private fun endKrxRetirements(live: Connection) {
+        krxRetired.entries.forEach { entry ->
+            val record = entry.value
+            if (entry.key.connectionGeneration == live.generation && record != null) {
+                entry.setValue(record.copy(disposition = KrxRetirementDisposition.LOCAL_CONNECTION_ENDED))
+            }
+        }
+    }
+
+    private fun completeKrxRetirementOnLoop(tuple: KrxSubscriptionRetirement, context: KrxRetirementContext) {
+        val live = context.live
+        val local = if (context.ownsRegistry) {
+            live.krxLeases.clear()
+            KrxRetirementLocal.CLEARED_OLD
+        } else KrxRetirementLocal.NO_OWNED_LOCAL
+        val closed = context.ending || live.ended || !live.opened || current(tuple.connectionGeneration) !== live
+        val newer = context.replacementRequestId != null
+        val disposition = when {
+            context.ending || live.ended -> KrxRetirementDisposition.LOCAL_CONNECTION_ENDED
+            newer -> KrxRetirementDisposition.SUPERSEDED_BY_NEW_CAPTURE
+            else -> KrxRetirementDisposition.OPEN_CONNECTION_BOUND
+        }
+        val wire = when {
+            closed -> KrxRetirementWire.SKIPPED_CLOSED
+            newer -> KrxRetirementWire.SKIPPED_NEWER_CAPTURE
+            else -> {
+                val request = TopicSubscribeRequest.unsubscribe(newRequestId(), listOf(checkNotNull(krxTopic)))
+                try {
+                    if (live.transport.send(encode(request))) KrxRetirementWire.ACCEPTED_UNCONFIRMED else KrxRetirementWire.FAILED_FALSE
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    KrxRetirementWire.FAILED_EXCEPTION
+                }
+            }
+        }
+        // Immutable result: neither a queue acceptance nor local end claims a server removal ACK.
+        krxRetired[tuple] = KrxRetirementRecord(local, wire, disposition)
     }
 
     /** Filters the whole-connection ACK before CMD writes confirmed state. Refusals keep their original marker. */
@@ -795,6 +911,12 @@ class TopicSessionCoordinator(
         val ownPending = live.krxPending?.capture?.let { it.commandId == commandId && it.requestId == requestId } == true
         if (ownPending) promoteKrxCapture(live, commandId, requestId, topic in active && topic in sent)
         val capture = live.krxActive
+        // A GENERAL/old command's whole-connection restatement does not own K2's KRX registry.
+        // It can neither re-install an old lease nor remove a newer one during its ACK wait.
+        if (!ownPending && capture != null && validKrxCapture(live, capture) && !live.krxLeaseMasked &&
+            topic in live.krxLeases.held) {
+            return active + topic
+        }
         val permitted = capture != null && validKrxCapture(live, capture) && topic in active
         if (!permitted) {
             retireKrxActive(live)
@@ -835,8 +957,7 @@ class TopicSessionCoordinator(
         if (!acceptsKrx(live, capture)) return
         val quotes = krxQuotes(frame)
         if (quotes.isEmpty()) return
-        _rates.value = _rates.value.merge(quotes)
-        liveRates = liveRates.merge(quotes)
+        adoptKrxQuotes(quotes, krxMemoryScope(live.fence, capture.use, capture.stamp))
         store.recordFrame(frame.value.topic)
         krxSnapshotRevision++
         cancelKrxBootstraps()
@@ -882,7 +1003,7 @@ class TopicSessionCoordinator(
             // logical issue. A later initial plan for the same p joins this issue.
             krxInitialIssuedGrant = grantEpoch
         }
-        val issue = KrxRestIssue(++nextBootstrapRequestId, grantEpoch, topic, stamp, read.marker, use,
+        val issue = KrxRestIssue(++nextBootstrapRequestId, grantEpoch, topic, owner, stamp, read.marker, use,
             origin, clock.nowMillis())
         // This is the logical issue boundary, after floor, pacing and revision admission.
         if (startsLadder && origin == KrxBootstrapOrigin.INITIAL_PLAN) {
@@ -1006,15 +1127,102 @@ class TopicSessionCoordinator(
         if (!krxIssueAdmitted(issue) || clock.nowMillis() - issue.issuedAtMillis >= TopicBootstrapRetryPolicy.ATTEMPT_BUDGET_MILLIS) return
         val quotes = krxQuotes(frame)
         if (quotes.isEmpty()) return
-        _rates.value = _rates.value.merge(quotes)
-        liveRates = liveRates.merge(quotes)
+        adoptKrxQuotes(quotes, krxMemoryScope(issue.owner, issue.use, issue.stamp))
         krxSnapshotRevision++
         recordDelivery(TopicSilenceEvidence.OTHER, clock.nowMillis())
         resolveCachedRefresh(issue.use.lifetime)
     }
-    // Internal-constructor dependency only. Runtime keeps NONE until S6-3 wires its real sink.
+    private fun krxMemoryScope(owner: TopicSessionFence, use: KrxUseLifetime, stamp: KrxSessionStamp) =
+        KrxMemoryScope(owner, use, stamp.revision, krxMemoryUserEnd, krxMemoryCapabilityEnd)
+
+    private fun adoptKrxQuotes(quotes: List<TopicQuote>, original: KrxMemoryScope) {
+        val displayed = _rates.value
+        val adoptedDisplay = displayed.merge(quotes)
+        if (adoptedDisplay.quotes[KRX_MEMORY_KEY] !== displayed.quotes[KRX_MEMORY_KEY]) krxDisplayScope = original
+        _rates.value = adoptedDisplay
+        val heldLive = liveRates
+        val adoptedLive = heldLive.merge(quotes)
+        if (adoptedLive.quotes[KRX_MEMORY_KEY] !== heldLive.quotes[KRX_MEMORY_KEY]) krxLiveScope = original
+        liveRates = adoptedLive
+    }
+
+    private fun reconcileKrxMemory() {
+        // Discovery alone can still be p=0. Before a positive stamp this session owns no typed KRX data.
+        val stamp = krxSession ?: return
+        if (!krxConsumerGuard(stamp.permitSeq)) return
+        val snapshot = krxMemorySnapshot?.invoke() ?: return
+        if (krxMemoryRevision == snapshot.revision) return
+        val live = connection
+        val capture = live?.krxActive
+        val activeScope = if (live != null && capture != null) krxMemoryScope(live.fence, capture.use, capture.stamp) else null
+        val scopes = listOfNotNull(krxDisplayScope, krxLiveScope, krxCanonicalScope, activeScope).toSet()
+        val unknown = hasUnscopedKrxRates()
+        val selections = krxMemorySelections(snapshot, scopes, krxMemoryUserEnd, krxMemoryCapabilityEnd, unknown)
+        selections.forEach(::applyKrxMemoryCleanup)
+        krxMemoryUserEnd = maxOf(krxMemoryUserEnd, snapshot.lastUserEnd?.sequence ?: 0L)
+        krxMemoryCapabilityEnd = maxOf(krxMemoryCapabilityEnd, snapshot.lastCapabilityEnd?.sequence ?: 0L)
+        krxMemoryRevision = snapshot.revision
+    }
+
+    private fun hasUnscopedKrxRates(): Boolean =
+        KRX_MEMORY_KEY in _rates.value.quotes && krxDisplayScope == null ||
+            KRX_MEMORY_KEY in liveRates.quotes && krxLiveScope == null
+
+    private fun applyKrxMemoryCleanup(selection: KrxMemorySelection) {
+        var cleaned = false
+        if (krxDisplayScope != null && krxDisplayScope in selection.scopes) {
+            val held = _rates.value
+            _rates.value = held.copy(quotes = held.quotes - KRX_MEMORY_KEY)
+            krxDisplayScope = null
+            cleaned = true
+        }
+        if (krxLiveScope != null && krxLiveScope in selection.scopes) {
+            liveRates = liveRates.copy(quotes = liveRates.quotes - KRX_MEMORY_KEY)
+            krxLiveScope = null
+            cleaned = true
+        }
+        if (krxCanonicalScope != null && krxCanonicalScope in selection.scopes) {
+            // Only the selected ACK's canonical state is ours; old rates cannot expire K2's state.
+            // expire preserves canonical rejection, desired, receive generation and the GENERAL ticket.
+            val topic = checkNotNull(krxTopic)
+            val state = store.snapshot.stateFor(topic)
+            if (state.confirmed || state.desired && state.deliveryState != TopicDeliveryState.DEGRADED) {
+                store.expire(setOf(topic))
+                cleaned = true
+            }
+            krxCanonicalScope = null
+        }
+        val result = when {
+            selection.unresolved -> KrxMemoryCleanupResult.UNRESOLVED_SCOPE
+            cleaned -> KrxMemoryCleanupResult.SESSION_MEMORY_CLEANED
+            else -> KrxMemoryCleanupResult.NOTHING_SELECTED
+        }
+        krxMemoryEvents += KrxMemoryCleanupEvent(selection.cause, result)
+    }
+
+    private fun cleanupKrxUnavailable(live: Connection, acknowledged: KrxMemoryScope?) {
+        if (krxSession == null || acknowledged == null || current(live.generation) !== live) return
+        // The request's original scope, not the latest access snapshot or whichever capture happens to be active.
+        val candidates = listOfNotNull(krxDisplayScope, krxLiveScope, krxCanonicalScope, acknowledged)
+        val unresolved = hasUnscopedKrxRates() || candidates.any {
+            it.owner.identity.uid.isBlank() || it.owner.userAccessEpoch.isNullOrBlank() ||
+                it.use.krxCapabilityEpoch.isNullOrBlank()
+        }
+        fun sameNamespace(scope: KrxMemoryScope): Boolean =
+            scope.owner.identity.uid.isNotBlank() && scope.owner.identity == acknowledged.owner.identity &&
+                !scope.owner.userAccessEpoch.isNullOrBlank() && scope.owner.userAccessEpoch == acknowledged.owner.userAccessEpoch &&
+                !scope.use.krxCapabilityEpoch.isNullOrBlank() && scope.use.krxCapabilityEpoch == acknowledged.use.krxCapabilityEpoch
+        val selected = candidates.filterTo(linkedSetOf(), ::sameNamespace)
+        applyKrxMemoryCleanup(KrxMemorySelection(KrxMemoryCause.TOPIC_UNAVAILABLE, selected, unresolved))
+    }
+
+    // SESSION is a selection marker; custom/NONE callbacks retain their original tuple-only meaning.
     private var krxRetirer: KrxSubscriptionRetirer = KrxSubscriptionRetirer.NONE
-    private fun retireKrxSubscription(retirement: KrxSubscriptionRetirement) = krxRetirer.retire(retirement)
+    private var krxMemorySnapshot: (() -> TopicAccessSnapshot)? = null
+    private fun retireKrxSubscription(retirement: KrxSubscriptionRetirement, context: KrxRetirementContext) {
+        if (krxRetirer === KrxSubscriptionRetirer.SESSION) completeKrxRetirementOnLoop(retirement, context)
+        else krxRetirer.retire(retirement)
+    }
 
     /**
      * Copied, so what this session consumes cannot change under it.
@@ -1043,7 +1251,7 @@ class TopicSessionCoordinator(
      * the absent channel of D-8. A null [krxSendReader] is the reader-less session of E-07/E-35, the same as one built by the public
      * constructor: a KRX attempt reads `authority` alone and captures no marker. Reader and channel are separate: with a channel and no
      * reader, a WebSocket refusal still goes to the channel with marker = null, and a REST Unsupported is not handed to the issuer.
-     * The additional internal krxRetirer dependency defaults to NONE; runtime leaves it there until S6-3 supplies its sink.
+     * The additional internal krxRetirer dependency defaults to NONE; runtime selects SESSION for private synchronous retirement.
      */
     internal constructor(
         scope: CoroutineScope,
@@ -1074,7 +1282,8 @@ class TopicSessionCoordinator(
         wallClock: () -> Long = System::currentTimeMillis,
         krxSendReader: KrxSendReadAuthority?,
         onRejectedWithMarker: ((TopicSessionFence, Map<String, TopicRejectionReason>, KrxSendMarker?) -> Unit)? = null,
-        krxRetirer: KrxSubscriptionRetirer = KrxSubscriptionRetirer.NONE
+        krxRetirer: KrxSubscriptionRetirer = KrxSubscriptionRetirer.NONE,
+        krxMemorySnapshot: (() -> TopicAccessSnapshot)? = null
     ) : this(
         scope = scope,
         clock = clock,
@@ -1105,6 +1314,7 @@ class TopicSessionCoordinator(
         this.krxSendReader = krxSendReader
         this.onRejectedWithMarker = onRejectedWithMarker
         this.krxRetirer = krxRetirer
+        this.krxMemorySnapshot = krxMemorySnapshot
     }
 
     private class Connection(
@@ -1722,6 +1932,9 @@ class TopicSessionCoordinator(
                     cancelReconnect()
                     _rates.value = TopicRates()
                     liveRates = TopicRates()
+                    krxDisplayScope = null
+                    krxLiveScope = null
+                    krxCanonicalScope = null
                     if (!inherits) everAttempted = false
                     // `setDesired(false)` is not enough: it keeps the receive generation, because
                     // a user losing interest in a topic has not unseen its frames. A grant change
@@ -2303,6 +2516,7 @@ class TopicSessionCoordinator(
         // delay/token/body can still be live during reconnect backoff.
         val signal = krxAccessSignals.get()
         val owner = fence
+        reconcileKrxMemory()
         if ((krxSession != null || krxSessionCapabilityObserved) && owner != null && krxReconciledSignal != signal) {
             krxSendReader?.acquireWithKrx(owner)?.let {
                 observeKrxSessionCapability(it.krxSessionCapable)
@@ -3009,6 +3223,7 @@ class TopicSessionCoordinator(
         var attemptRequest: TopicSubscribeRequest? = null
         var attemptAdmission: KrxSendAdmission? = null
         var typedAttempt: KrxCommandAttempt? = null
+        var krxAcknowledgedScope: KrxMemoryScope? = null
         var krxReadSignal = 0L
         val legacySend: (String) -> Boolean = { text ->
                 val success = when {
@@ -3070,7 +3285,7 @@ class TopicSessionCoordinator(
             onAcknowledged = { ack ->
                 val before = checkNotNull(beforeAnswer)
                 beforeAnswer = null
-                onAcknowledged(live, id, ack, before, attemptAdmission?.marker)
+                onAcknowledged(live, id, ack, before, attemptAdmission?.marker, krxAcknowledgedScope)
             },
             onClassifiedFailure = { onClassifiedFailure(live) },
             onAuthRefreshUnusable = {
@@ -3095,6 +3310,10 @@ class TopicSessionCoordinator(
                 post(SessionInput.KrxReprepare(live.generation, id, ready))
                 ready.await()
             }) { requestId, active, leases, sent ->
+                krxAcknowledgedScope = live.krxPending?.takeIf {
+                    it.capture.commandId == id && it.capture.requestId == requestId && it.sent && !it.masked &&
+                        validKrxCapture(live, it.capture)
+                }?.capture?.let { krxMemoryScope(live.fence, it.use, it.stamp) }
                 admitKrxAcknowledgement(live, id, requestId, active, leases, sent)
             }
             val boundary = object : KrxCommandAttemptBoundary {
@@ -3199,8 +3418,19 @@ class TopicSessionCoordinator(
         commandId: Long,
         ack: TopicCommandAcknowledgement,
         before: TopicSubscriptionSnapshot,
-        marker: KrxSendMarker?
+        marker: KrxSendMarker?,
+        krxAcknowledgedScope: KrxMemoryScope?
     ) {
+        if (krxSession != null) krxTopic?.let { topic ->
+            // CMD has applied this ACK. Never infer provenance from a new snapshot or a later capture.
+            // A GENERAL ACK can clear confirmed while delivery state remains; retain its original scope for cleanup/reset.
+            if (krxAcknowledgedScope != null && (topic in ack.accepted || topic in ack.rejected)) {
+                krxCanonicalScope = krxAcknowledgedScope
+            }
+            if (ack.rejected[topic] == TopicRejectionReason.TOPIC_UNAVAILABLE) {
+                cleanupKrxUnavailable(live, krxAcknowledgedScope)
+            }
+        }
         offerGraphAcknowledgement(live, ack, before)
         // The server answered, so the request channel is free — before the delivery wait, which
         // needs nothing another command wants.
@@ -4227,6 +4457,7 @@ class TopicSessionCoordinator(
         if (krxSession != null) retireKrxCapture(live, KrxRetirementReason.CONNECTION_ENDED)
         live.krxExpiryTimer?.cancel()
         live.krxRenewalTimer?.cancel()
+        endKrxRetirements(live)
         live.ended = true
         try {
             offerGraphWsInterruption(live, TopicGraphEventReason.WS_ENDED, desired, TopicGraphEventPayload.WsEnded(cause))
@@ -4248,6 +4479,7 @@ class TopicSessionCoordinator(
             // at the *end* rather than at the next open, because between the two there is no
             // subscription — a topic still reading as confirmed there is confirmed on a dead socket.
             store.clearConnectionState()
+            krxCanonicalScope = null
 
             if (cause == TopicDisconnectCause.UNEXPECTED && wanted()) scheduleReconnect()
             publishDisplay()
@@ -4331,5 +4563,21 @@ internal fun interface KrxSubscriptionRetirer {
 
     companion object {
         val NONE: KrxSubscriptionRetirer = KrxSubscriptionRetirer { }
+        val SESSION: KrxSubscriptionRetirer = KrxSubscriptionRetirer {
+            error("SESSION must be dispatched by TopicSessionCoordinator")
+        }
     }
+}
+
+internal data class KrxRetirementRecord(
+    val local: KrxRetirementLocal,
+    val wire: KrxRetirementWire,
+    val disposition: KrxRetirementDisposition
+)
+internal enum class KrxRetirementLocal { CLEARED_OLD, NO_OWNED_LOCAL }
+internal enum class KrxRetirementWire {
+    SKIPPED_CLOSED, SKIPPED_NEWER_CAPTURE, ACCEPTED_UNCONFIRMED, FAILED_FALSE, FAILED_EXCEPTION
+}
+internal enum class KrxRetirementDisposition {
+    OPEN_CONNECTION_BOUND, LOCAL_CONNECTION_ENDED, SUPERSEDED_BY_NEW_CAPTURE
 }

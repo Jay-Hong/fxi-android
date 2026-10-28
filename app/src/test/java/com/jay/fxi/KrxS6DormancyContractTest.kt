@@ -224,16 +224,24 @@ class KrxS6DormancyContractTest {
             }
         }.keys
 
-    /**
-     * Z06: no subscribe/unsubscribe command is added. Catches MZ-05 (an unwired KRX subscribe/unsubscribe command, P1(a)), a second
-     * subscribe call inside `TopicSubscribeCommand.kt`, and a call split across lines (`TopicSubscribeRequest\n    .subscribe(`).
-     */
+    /** S6-3a r2 §6: one private real-retirement unsubscribe factory, with bypass positive controls. */
     @Test fun Z06_noSubscribeOrUnsubscribeCommandIsAdded() {
-        // Kotlin's \s includes the newline. TopicSubscribeCommand.kt:650.
-        assertEquals("subscribe calls", mapOf(SUBSCRIBE_COMMAND to 1), occurrences(Regex("""TopicSubscribeRequest\s*\.\s*subscribe\s*\(""")))
-        assertEquals("unsubscribe calls", emptyMap<String, Int>(), occurrences(Regex("""TopicSubscribeRequest\s*\.\s*unsubscribe\s*\(""")))
-        // Positive control: the factory's declaration, TopicMessage.kt:47.
-        assertEquals("fun unsubscribe( in TopicMessage.kt", 1, Regex("""fun\s+unsubscribe\s*\(""").findAll(code.getValue(TOPIC_MESSAGE)).count())
+        val subscribe = Regex("""TopicSubscribeRequest\s*\.\s*subscribe\s*\(""")
+        val unsubscribe = Regex("""TopicSubscribeRequest\s*\.\s*unsubscribe\s*\(""")
+        assertEquals("contract(Z06): original subscribe inventory", mapOf(SUBSCRIBE_COMMAND to 1), occurrences(subscribe))
+        assertEquals("contract(Z06): exactly one real retirement factory", mapOf(TSC to 1), occurrences(unsubscribe))
+        val tsc = code.getValue(TSC)
+        assertTrue("contract(Z06): private real cleanup exists", Regex("""private\s+fun\s+completeKrxRetirementOnLoop\s*\(""").containsMatchIn(tsc))
+        val body = KrxSessionSourceContract.function(tsc, "completeKrxRetirementOnLoop")
+        assertEquals("contract(Z06): sole factory belongs to private synchronous cleanup", 1, unsubscribe.findAll(body).count())
+        assertTrue("contract(Z06): real cleanup remains private", Regex("""private\s+fun\s+completeKrxRetirementOnLoop\s*\(""").containsMatchIn(tsc))
+        assertEquals("contract(Z06): original factory declaration stays single", 1,
+            Regex("""fun\s+unsubscribe\s*\(""").findAll(code.getValue(TOPIC_MESSAGE)).count())
+        val extra = "\nfun bypass() { TopicSubscribeRequest\n .unsubscribe(id, topics) }"
+        for (path in listOf(TSC, RECORDER_REDUCER)) {
+            val mutated = code + (path to code.getValue(path) + extra)
+            assertTrue("contract(Z06): same scan catches bypass in $path", occurrences(unsubscribe, mutated) != mapOf(TSC to 1))
+        }
     }
 
     /** Z07: `DESIRED` has no KRX. Catches MZ-06 (adding KRX to DESIRED), locked here directly apart from S5FixtureRoutesTest :68. */

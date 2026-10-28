@@ -177,7 +177,7 @@ class KrxSessionWiringContractTest {
             """internal\s+var\s+krxAttemptBoundaryDecorator\s*:\s*\(\(KrxCommandAttemptBoundary\)\s*->\s*KrxCommandAttemptBoundary\)\?\s*=\s*null"""))
         val bypass = tsc + "\nfun bad() { krxAttemptBoundaryDecorator = fake }"
         assertEquals("premise: Z04 assignment mutation is detected", 2, assignment.findAll(bypass).count())
-        // α-1c: the new dependency is available to the test rig, but runtime still uses NONE.
+        // S6-3a: explicitly amend alpha NONE runtime inventory to SESSION plus the read-only PAC supplier.
         fun sessionCalls(source: String): List<String> = Regex("""\bTopicSessionCoordinator\s*\(""").findAll(source).mapNotNull { head ->
             if (Regex("""\bclass\s+$""").containsMatchIn(source.substring(0, head.range.first))) null else {
                 var depth = 1
@@ -197,10 +197,24 @@ class KrxSessionWiringContractTest {
         }.filterValues { it > 0 }
         assertEquals("premise: Z04 exact production TSC call inventory", mapOf("src/main/java/com/jay/fxi/data/remote/TopicRuntime.kt" to 1),
             production.mapValues { sessionCalls(it.value).size }.filterValues { it > 0 })
-        assertEquals("contract(Z04): production TSC calls pass no krxRetirer", emptyMap<String, Int>(), runtimeRetirers(production))
+        assertEquals("contract(Z04): exactly RT passes the SESSION dependency", mapOf("src/main/java/com/jay/fxi/data/remote/TopicRuntime.kt" to 1), runtimeRetirers(production))
+        assertTrue("contract(Z04): RT selects SESSION exactly once", Regex("""krxRetirer\s*=\s*KrxSubscriptionRetirer\.SESSION\b""").findAll(runtime).count() == 1)
+        val snapshots = production.mapValues { (_, source) -> sessionCalls(source).count {
+            Regex("""\bkrxMemorySnapshot\s*=(?!=)""").containsMatchIn(it)
+        } }.filterValues { it > 0 }
+        assertEquals("contract(Z04): exactly RT forwards the memory snapshot", mapOf("src/main/java/com/jay/fxi/data/remote/TopicRuntime.kt" to 1), snapshots)
+        assertTrue("contract(Z04): injected RT supplier reads the same PAC snapshot", found(runtime,
+            """krxMemorySnapshot\s*=\s*\{\s*coordinator\.accessSnapshot\s*\}"""))
+        assertTrue("contract(Z04): RT forwards its supplier without evaluating it", found(body(runtime, "create"),
+            """krxMemorySnapshot\s*=\s*krxMemorySnapshot\b"""))
+        assertTrue("contract(Z04): SESSION dispatcher uses object identity", found(body(tsc, "retireKrxSubscription"),
+            """krxRetirer\s*===\s*KrxSubscriptionRetirer\.SESSION"""))
         val runtimePath = "src/main/java/com/jay/fxi/data/remote/TopicRuntime.kt"
-        val injectedRuntime = production.getValue(runtimePath).replaceFirst("TopicSessionCoordinator(", "TopicSessionCoordinator(krxRetirer = injected, ")
-        assertEquals("premise: Z04 same call scan catches a runtime retirer injection", mapOf(runtimePath to 1), runtimeRetirers(production + (runtimePath to injectedRuntime)))
+        val injectedRuntime = production.getValue(runtimePath) + "\nfun bypass() = TopicSessionCoordinator(krxRetirer = injected)"
+        assertEquals("contract(Z04): same scan catches a second runtime retirer injection", mapOf(runtimePath to 2), runtimeRetirers(production + (runtimePath to injectedRuntime)))
+        val elsewhere = production + ("src/main/java/com/jay/fxi/data/remote/Extra.kt" to "fun bad() = TopicSessionCoordinator(krxMemorySnapshot = injected)")
+        assertEquals("contract(Z04): same constructor scan catches external snapshot injection", 2,
+            elsewhere.values.sumOf { source -> sessionCalls(source).count { Regex("""\bkrxMemorySnapshot\s*=""").containsMatchIn(it) } })
         assertTrue("contract(Z04): internal retirer defaults to NONE", found(tsc,
             """krxRetirer\s*:\s*KrxSubscriptionRetirer\s*=\s*KrxSubscriptionRetirer\.NONE"""))
         assertTrue("contract(Z04): public-constructor backing dependency also starts at NONE", found(tsc,

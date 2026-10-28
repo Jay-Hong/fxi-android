@@ -628,15 +628,24 @@ class KrxContestWiringContractTest {
 
     /**
      * KW11 (design r5 §2 ①, D-3): the snapshot is supplied only as `{ coordinator.accessSnapshot }` (GraphRuntimeModule.kt:37,
-     * ProcessGraphBuilder.kt:97), and SnapshotTopicUseAuthority is constructed once (GraphRuntimeModule) — the send read is the same
-     * singleton, so neither count grows. Catches: another snapshot supplier; the topic factory building its own authority (D-3 (ii)).
+     * ProcessGraphBuilder.kt:97). S6-3a adds exactly one TopicRuntime memory-cleanup supplier of the same published value;
+     * SnapshotTopicUseAuthority is still constructed once (GraphRuntimeModule). Catches: any additional snapshot read/supplier,
+     * including a second one inside RT, and the topic factory building its own authority (D-3 (ii)).
      */
     @Test fun KW11_theSnapshotIsSuppliedOnlyByThePublishedValue() {
         for (key in listOf(GRAPH_MODULE, PROCESS_GRAPH, RUNTIME)) assertTrue("premise: KW11 the code map has $key", key in code)
         val read = Regex("""\.accessSnapshot\b""")
-        assertEquals("KW11 `.accessSnapshot` reads in production", mapOf(GRAPH_MODULE to 1, PROCESS_GRAPH to 1), occurrences(read))
-        assertEquals("KW11 both reads are the supply lambda `{ coordinator.accessSnapshot }`",
-            mapOf(GRAPH_MODULE to 1, PROCESS_GRAPH to 1), occurrences(Regex("""\{\s*coordinator\.accessSnapshot\s*\}""")))
+        val supplier = Regex("""\{\s*coordinator\.accessSnapshot\s*\}""")
+        val expectedReads = mapOf(GRAPH_MODULE to 1, PROCESS_GRAPH to 1, RUNTIME to 1)
+        assertEquals("contract(KW11): exact published snapshot reads include only the one RT supplier", expectedReads, occurrences(read))
+        assertEquals("contract(KW11): all three reads are the supply lambda `{ coordinator.accessSnapshot }`",
+            expectedReads, occurrences(supplier))
+        for (path in listOf(RUNTIME, GATE)) {
+            val extra = code + (path to code.getValue(path) + "\nprivate val extraSnapshot = { coordinator.accessSnapshot }\n")
+            val extraReads = expectedReads + (path to ((expectedReads[path] ?: 0) + 1))
+            assertEquals("contract(KW11): the same read scan catches an extra supplier in $path", extraReads, occurrences(read, extra))
+            assertEquals("contract(KW11): the same lambda scan catches an extra supplier in $path", extraReads, occurrences(supplier, extra))
+        }
         val construction = SUA_CONSTRUCTION
         assertEquals("KW11 SnapshotTopicUseAuthority constructions (one singleton)", mapOf(GRAPH_MODULE to 1),
             occurrences(construction).filterKeys { it != SUA })
@@ -1287,6 +1296,7 @@ class KrxContestWiringContractTest {
      * to a copy of TSC's text first: the drifted default, the constant desired, and the reader parameter in three shapes (nullable
      * without a default accepted; non-null — the pre-E-35 stub r2 shape — refused; nullable with `= null` refused).
      * α-1c explicitly adds only krxRetirer: KrxSubscriptionRetirer = KrxSubscriptionRetirer.NONE to the internal constructor.
+     * S6-3a adds krxMemorySnapshot: (() -> TopicAccessSnapshot)? = null immediately after krxRetirer; no other addition is allowed.
      * Method name stays stable for the existing inventory. The public constructor and its delegation remain unchanged.
      */
     @Test fun KW22_theInternalSessionConstructorIsThePublicOnePlusTwo() {
@@ -1313,7 +1323,9 @@ class KrxContestWiringContractTest {
             return Constructors(primary, internal, passed)
         }
         val retirerName = "krxRetirer"
-        fun publicPart(internal: List<Parameter>) = internal.filter { it.name !in setOf(READER_PARAMETER, MARKER_CHANNEL, retirerName) }
+        val snapshotName = "krxMemorySnapshot"
+        val addedNames = setOf(READER_PARAMETER, MARKER_CHANNEL, retirerName, snapshotName)
+        fun publicPart(internal: List<Parameter>) = internal.filter { it.name !in addedNames }
         fun afterInternalHead(tsc: String, old: String, new: String): String {
             val at = checkNotNull(internalHeadPattern.find(tsc)) { "KW22 self-check: no internal constructor" }.range.first
             return tsc.substring(0, at) + tsc.substring(at).replaceFirst(old, new)
@@ -1360,15 +1372,44 @@ class KrxContestWiringContractTest {
             assertEquals("contract(KW22): only the non-null NONE-default retirer dependency is allowed", accepted, actual == retirerExpected)
         }
 
-        val (primary, internal, passed) = parse(tsc)
-        assertTrue("premise: KW22 the primary constructor's parameters are parsed (${primary.size})", primary.size >= 20 && primary.any { it.name == "desired" })
-        val added = internal.filter { it.name in setOf(READER_PARAMETER, MARKER_CHANNEL, retirerName) }
-        assertEquals("KW22 the internal constructor = the public one's parameters (names, order, types, defaults)", primary, publicPart(internal))
-        assertEquals("contract(KW22): original reader/channel plus only the α-1c NONE-default retirer", listOf(
+        val snapshotDeclaration = "krxMemorySnapshot: (() -> TopicAccessSnapshot)? = null"
+        val snapshotExpected = Parameter(snapshotName, normalized("(() -> TopicAccessSnapshot)?"), "null")
+        val expectedAdded = listOf(
             readerExpected,
             Parameter(MARKER_CHANNEL, normalized("((TopicSessionFence, Map<String, TopicRejectionReason>, KrxSendMarker?) -> Unit)?"), "null"),
-            retirerExpected
-        ), added)
+            retirerExpected,
+            snapshotExpected
+        )
+        fun exactInternal(constructors: Constructors): Boolean = constructors.internal == constructors.primary + expectedAdded
+        for ((declaration, accepted) in listOf(
+            snapshotDeclaration to true,
+            "krxMemorySnapshot: (() -> TopicAccessSnapshot)?" to false,
+            "krxMemorySnapshot: () -> TopicAccessSnapshot" to false,
+            "krxMemorySnapshot: (() -> TopicAccessSnapshot?)? = null" to false,
+            "krxMemorySnapshot: (() -> TopicAccessSnapshot)? = { TopicAccessSnapshot.INITIAL }" to false
+        )) {
+            val mutant = afterInternalHead(tsc, snapshotDeclaration, declaration)
+            val parsed = parse(mutant)
+            assertEquals("contract(KW22): exact snapshot parameter mutation parsed", parameter(declaration),
+                parsed.internal.single { it.name == snapshotName })
+            assertEquals("contract(KW22): only the nullable read-only snapshot supplier with null default is allowed",
+                accepted, exactInternal(parsed))
+        }
+        val swapped = afterInternalHead(afterInternalHead(afterInternalHead(tsc,
+            retirerDeclaration, "__retirer_parameter__"), snapshotDeclaration, retirerDeclaration),
+            "__retirer_parameter__", snapshotDeclaration)
+        assertTrue("contract(KW22): the snapshot/retirer order mutation applied", swapped != tsc)
+        assertTrue("contract(KW22): the snapshot supplier must immediately follow retirer", !exactInternal(parse(swapped)))
+        val extra = afterInternalHead(tsc, snapshotDeclaration, "$snapshotDeclaration, extraSnapshot: (() -> TopicAccessSnapshot)? = null")
+        assertTrue("contract(KW22): the extra-parameter mutation applied", extra != tsc)
+        assertTrue("contract(KW22): an additional constructor parameter remains forbidden", !exactInternal(parse(extra)))
+
+        val (primary, internal, passed) = parse(tsc)
+        assertTrue("premise: KW22 the primary constructor's parameters are parsed (${primary.size})", primary.size >= 20 && primary.any { it.name == "desired" })
+        val added = internal.filter { it.name in addedNames }
+        assertEquals("contract(KW22): internal retains all public parameter names, order, types and defaults", primary, publicPart(internal))
+        assertEquals("contract(KW22): original reader/channel/retirer plus the exact memory snapshot supplier", expectedAdded, added)
+        assertEquals("contract(KW22): exact full constructor inventory places snapshot immediately after retirer", primary + expectedAdded, internal)
         assertEquals("KW22 the delegation passes every public parameter through by its own name",
             primary.map { it.name to it.name }, passed)
     }

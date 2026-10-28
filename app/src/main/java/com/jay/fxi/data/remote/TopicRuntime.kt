@@ -10,6 +10,7 @@ import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.entitlements.KrxSendReadAuthority
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.PremiumAccessTopicGrantIssuer
+import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.entitlements.TopicGrantDeliverer
 import com.jay.fxi.data.entitlements.TopicGrantIssuer
 import com.jay.fxi.data.free.FreeSnapshotSchedulePolicy
@@ -74,7 +75,8 @@ internal class TopicRuntimeFactory internal constructor(
     private val jitter: () -> Double,
     /** Optional store for display seeds and adopted live rates. */
     private val lastKnown: TopicLastKnownStore? = null,
-    private val krxSendReader: KrxSendReadAuthority? = null
+    private val krxSendReader: KrxSendReadAuthority? = null,
+    private val krxMemorySnapshot: (() -> TopicAccessSnapshot)? = null
 ) {
     @Inject
     constructor(
@@ -110,7 +112,8 @@ internal class TopicRuntimeFactory internal constructor(
         newRequestId = { UUID.randomUUID().toString() },
         jitter = { Random.nextDouble() },
         lastKnown = lastKnown,
-        krxSendReader = authority
+        krxSendReader = authority,
+        krxMemorySnapshot = { coordinator.accessSnapshot }
     )
 
     /**
@@ -151,6 +154,8 @@ internal class TopicRuntimeFactory internal constructor(
             onBootstrapHttpEvidence = floor::record,
             bootstrapNotBeforeMillis = floor::notBeforeMillis,
             krxSendReader = krxSendReader,
+            krxRetirer = KrxSubscriptionRetirer.SESSION,
+            krxMemorySnapshot = krxMemorySnapshot,
             onRejectedWithMarker = { owner, rejected, marker -> deliverer.forwardRejection(owner, rejected, marker) },
             graphSink = graphInputs ?: DormantTopicGraphSink
         )
