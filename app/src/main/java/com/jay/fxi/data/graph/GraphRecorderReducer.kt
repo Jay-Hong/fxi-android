@@ -90,6 +90,43 @@ internal object GraphRecorderReducer {
         )
     }
 
+    /** Select original KRX holdings without advancing USER floors, versions or shared recovery. */
+    fun purgeKrxMemory(state: GraphRecorderState, plan: KrxGraphPurgePlan): Pair<GraphRecorderState, KrxGraphPurgeOutcome> {
+        val (pending, projected) = state.pending.purgeKrxMemory(plan)
+        var outcome = projected
+        val ids = state.series.keys.map { it.seriesId }.filter { isKrx(it) }.toSet() +
+            state.krxSeriesOwners.keys + state.untransferredSeries.filter { isKrx(it) }
+        val selected = ids.filterTo(linkedSetOf()) { id ->
+            val stamp = state.krxSeriesOwners[id]
+            val decision = if (isKrx(id) && stamp?.scope?.owner?.userAccessEpoch == state.scope?.userAccessEpoch) {
+                plan.classify(stamp, state.scope?.uid)
+            } else if (plan.classify(stamp, state.scope?.uid) != KrxGraphPurgeDecision.KEEP ||
+                plan.classify(null, state.scope?.uid) == KrxGraphPurgeDecision.UNRESOLVED) KrxGraphPurgeDecision.UNRESOLVED
+            else KrxGraphPurgeDecision.KEEP
+            outcome += KrxGraphPurgeOutcome(decision == KrxGraphPurgeDecision.REMOVE,
+                decision == KrxGraphPurgeDecision.UNRESOLVED)
+            decision == KrxGraphPurgeDecision.REMOVE
+        }
+        val losses = state.krxUntransferred.mapValues { (id, originals) -> originals.filterTo(linkedSetOf()) {
+            val decision = if (isKrx(id) && it.scope.owner.userAccessEpoch == state.scope?.userAccessEpoch) {
+                plan.classify(it, state.scope?.uid)
+            } else if (plan.classify(it, state.scope?.uid) != KrxGraphPurgeDecision.KEEP ||
+                plan.classify(null, state.scope?.uid) == KrxGraphPurgeDecision.UNRESOLVED) KrxGraphPurgeDecision.UNRESOLVED
+            else KrxGraphPurgeDecision.KEEP
+            outcome += KrxGraphPurgeOutcome(decision == KrxGraphPurgeDecision.REMOVE,
+                decision == KrxGraphPurgeDecision.UNRESOLVED)
+            decision != KrxGraphPurgeDecision.REMOVE
+        } }.filterValues { it.isNotEmpty() }
+        if (!outcome.removed) return state to outcome
+        return updated(state,
+            series = state.series.filterKeys { it.seriesId !in selected },
+            pending = pending,
+            untransferredSeries = state.untransferredSeries - selected,
+            krxSeriesOwners = state.krxSeriesOwners - selected,
+            krxUntransferred = losses
+        ) to outcome
+    }
+
     /** S4 RT05a: retention at [now] for every series, one common time; every other field is kept. */
     fun retain(state: GraphRecorderState, now: Instant): GraphRecorderState =
         updated(state, series = state.series.mapValues { (_, series) -> retainGraphRecoverable(series, now) })

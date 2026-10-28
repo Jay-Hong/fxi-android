@@ -1,5 +1,6 @@
 package com.jay.fxi.data.graph
 
+import com.jay.fxi.data.entitlements.PurgeNamespace
 import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.remote.TopicGraphInput
 import com.jay.fxi.data.remote.TopicSessionFence
@@ -70,6 +71,7 @@ internal class GraphRecorder(
     private var started = false
     private var closed = false
     private var collector: Job? = null
+    private var purgeSeal = KrxGraphPurgeSeal.EMPTY
 
     /** Starts only the access control collector, at most once. */
     fun start() {
@@ -120,7 +122,10 @@ internal class GraphRecorder(
         val catalog = currentCatalog()
         val now = clock.now()
         val next = replayPending(mutableState.value, catalog, snapshot, fence, now)
-        mutableState.value = GraphRecorderReducer.continuity(next, input, catalog, snapshot, fence, now, ::admitsKrx)
+        val projection: KrxGraphInputProjection = projectKrxGraphInput(input, purgeSeal)
+        val retained = projection.input as TopicGraphInput.Continuity?
+        mutableState.value = if (retained == null) next else
+            GraphRecorderReducer.continuity(next, retained, catalog, snapshot, fence, now, ::admitsKrx)
     }
 
     /**
@@ -269,11 +274,24 @@ internal class GraphRecorder(
         return if (removed) GraphRecorderPurge.REMOVED else GraphRecorderPurge.NOTHING_TO_REMOVE
     }
 
+    fun captureKrxMemoryPurgePlan(namespace: PurgeNamespace): KrxGraphPurgePlan? =
+        if (closed) null else KrxGraphPurgePlan.forCapability(namespace, accessSnapshot())
+
+    fun purgeKrxMemory(plan: KrxGraphPurgePlan): KrxGraphPurgeOutcome {
+        if (closed) return KrxGraphPurgeOutcome(false, false)
+        val seal = purgeSeal.merge(plan)
+        val (next, outcome) = GraphRecorderReducer.purgeKrxMemory(mutableState.value, plan)
+        purgeSeal = seal
+        mutableState.value = next
+        return outcome
+    }
+
     override fun close() {
         if (closed) return
         closed = true
         collector?.cancel()
         collector = null
+        purgeSeal = KrxGraphPurgeSeal.EMPTY
         mutableState.value = GraphRecorderReducer.empty()
     }
 }

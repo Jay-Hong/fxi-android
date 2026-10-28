@@ -606,7 +606,18 @@ class S6KrxRecorderContractTest {
                     }
                     g.yes("inside original-use retirement window before post-drain assertions", retired)
                     g.eq("old mixed loss cannot change raw KRX buckets/demand/version", oldRaw, g.print(g.krx()))
-                    g.eq("no physical loss purge or counter reset is smuggled into cutoff", sessionLoss, g.session.cleanup.session.graphLoss.value)
+                    if (col.endsWith("-hold")) {
+                        g.eq("transient hold preserves current loss", sessionLoss, g.session.cleanup.session.graphLoss.value)
+                    } else {
+                        // Explicit shared ledger API: this isolated ingress fixture does not claim TSC loop publication.
+                        val ledger = field(g.session.cleanup.session, "graphLossLedger") as TopicGraphLossLedger
+                        ledger.purgeKrxMemory(KrxGraphPurgePlan.forSnapshot(g.snapshot, g.session.fence.memoryCutoffs()))
+                        val currentLoss = g.need(ledger.view, "GENERAL loss survives current-ledger cleanup")
+                        g.yes("current selected KRX loss physically removed", currentLoss.krxLost.values.none { old.krxGraphStamp in it })
+                        g.yes("current GENERAL topics survive", general.topic in currentLoss.topics)
+                        g.eq("one revision for selected physical deletion", sessionLoss.revision + 1, currentLoss.revision)
+                        g.yes("detached pre-purge snapshot still owns original", sessionLoss.krxLost.values.any { old.krxGraphStamp in it })
+                    }
                     g.yes("old loss cannot initiate a new KRX request", g.requests().none { it.seriesKey == g.krxKey })
                 }
             } finally { sink.close() }
@@ -743,10 +754,20 @@ class S6KrxRecorderContractTest {
                         g.yes("both tabs publish KRX before actual D1", holder.currentState().chart?.renderedIds?.contains(KRX) == true)
                     }
                     val before = assembly.gate.krxGraphRevisions.value
+                    g.yes("actual assembly owns selected raw original before D1", stamp in assembly.recorder.state.value.krxSeriesOwners.values ||
+                        assembly.recorder.state.value.pending.inputs.any { when (it) {
+                            is TopicGraphInput.Observations -> it.krxGraphStamp == stamp
+                            is TopicGraphInput.Continuity -> it.authority.krxGraphStamp == stamp
+                        } })
                     g.session.d1(); g.test.runCurrent()
                     g.yes("actual verified D1 crosses Owner/factory/TSC into same gate", assembly.gate.krxGraphRevisions.value > before)
                     g.eq("same gate rejects old original", null, assembly.gate.bindKrxGraph(old.attribution.owner, old.attribution.lifetime, stamp))
                     for (holder in mounted) g.yes("actual D1 republishes both mounted tabs without old KRX", holder.state.value.chart?.renderedIds?.contains(KRX) != true)
+                    g.yes("actual assembly physically drops selected raw KRX anchor", stamp !in assembly.recorder.state.value.krxSeriesOwners.values)
+                    g.yes("actual assembly physically drops selected raw KRX pending", assembly.recorder.state.value.pending.inputs.none {
+                        when (it) { is TopicGraphInput.Observations -> it.krxGraphStamp == stamp
+                            is TopicGraphInput.Continuity -> it.authority.krxGraphStamp == stamp }
+                    })
                 } else {
                     if (col == "close") assembly.close() else runtime.detachGraph()
                     val before = assembly.gate.krxGraphRevisions.value
@@ -1042,13 +1063,15 @@ class S6KrxRecorderContractTest {
             original = null
         } else if (col.startsWith("ACK")) {
             g.r.httpFloor = g.r.clock.nowMillis() + 1_000_000
+            val knownSources = S6KrxGraphMemoryPurgeRig(g)
+            knownSources.observeKnownSources()
             g.start(ack = false)
             val first = g.session.cleanup.lastKrxRequest()
             g.session.cleanup.ackKrxLease(first, "g32-K1", krxSeconds = 1)
             val ack = g.need(g.session.inputs.filterIsInstance<TopicGraphInput.Continuity>().lastOrNull {
                 it.kind == TopicGraphEventKind.ACK_ACTIVE_SET_CHANGED && it.authority.krxGraphStamp != null
             }, "actual valid K1 ACK fact")
-            original = g.need(ack.authority.krxGraphStamp, "ACK original K1")
+            val ackOriginal = g.need(ack.authority.krxGraphStamp, "ACK original K1")
             g.yes("actual KRX active before lease expiry", field(g.session.cleanup.live, "krxActive") != null)
             val generalLeases = g.session.cleanup.generalRegistry.held
             g.yes("GENERAL leases outlive the KRX-only lease", generalLeases.isNotEmpty() &&
@@ -1056,6 +1079,13 @@ class S6KrxRecorderContractTest {
             g.r.advance(1_001)
             g.eq("KRX active retired by actual lease expiry", null, field(g.session.cleanup.live, "krxActive"))
             g.eq("GENERAL connection and leases survive", generalLeases, g.session.cleanup.generalRegistry.held)
+            // C5-02: the short lease can prepare a newer, unACKed source before active retirement.
+            // Freeze the actual known maximum before endingLoss triggers the shutdown producer.
+            original = knownSources.knownOriginal(ack.authority, null)
+            g.yes("pre-ending maximum retains the actual newer validated renewal prepare", knownSources.knownWsPrepares.any {
+                it.stamp == original && it.stamp.issueSequence > ackOriginal.issueSequence &&
+                    it.sessionKey === ack.authority.sessionKey && it.grantEpoch == ack.authority.grantEpoch
+            })
             g.yes("lease expiry leaves original capability/use admitted", g.snapshot.admitsKrxUse(original.scope.use))
         } else {
             g.start(ack = false)

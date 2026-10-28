@@ -178,6 +178,18 @@ internal class S6KrxGraphSessionRig(val test: TestScope, val row: String, on: Bo
             override fun topicUnavailable(original: KrxMemoryScope?) = actualIngress.topicUnavailable(original).also { cutoffs += original to it }
         })
     }
+    fun rejectKrxFromWsForPurge() {
+        val request = renewal()
+        r.ack(request, reject = true)
+        r.drain()
+        yes("actual WS rejection reaches checked PAC", r.snapshot.capabilityInvalidations > 0)
+    }
+    fun rejectKrxFromRestForPurge() {
+        val call = cleanup.issue()
+        cleanup.f.reply(call, KrxA1bFixture.Reply(404, """{"error":"unknown_topic"}"""))
+        yes("actual REST unknown_topic completes normally", call.outcome != null && !call.cancelled)
+        yes("actual REST rejection reaches checked PAC", r.snapshot.capabilityInvalidations > 0)
+    }
     fun rejectionKind() = TopicRejectionReason.KRX_ENTITLEMENT_REQUIRED
     fun close() { fence.close(); cleanup.close() }
     companion object { val AT: Instant = Instant.parse("2026-09-26T01:20:00Z") }

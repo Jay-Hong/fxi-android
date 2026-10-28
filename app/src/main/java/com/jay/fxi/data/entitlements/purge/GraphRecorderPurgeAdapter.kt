@@ -6,6 +6,7 @@ import com.jay.fxi.data.graph.GraphRecorder
 import com.jay.fxi.data.graph.GraphRecorderPurge
 import com.jay.fxi.data.graph.GraphRecorderTopicSink
 import com.jay.fxi.data.graph.GraphV2RequestCoordinator
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.withContext
 
@@ -17,10 +18,11 @@ import kotlinx.coroutines.withContext
  * loop, recorder methods and control collector, and sink worker. This is a caller precondition,
  * verified by RT01 rather than checked here. Run outside sink consumer calls. [withContext]
  * enters that executor; when already there it does not dispatch again. In one block without
- * suspension, the recorder checks the live fence at execution time, then the sink and coordinator
- * are purged with the same selector. A live selected scope refuses before either later holder is
- * touched. Each answer is obtained independently before aggregation; exceptions propagate to the
- * manifest purger, which reports failures and rethrows cancellation.
+ * suspension, USER checks the recorder's live fence; CAPABILITY freezes a plan from the actual
+ * confirmed record before any mutation. The sink and registered captures then use the same selection.
+ * A live selected scope refuses before either later holder is
+ * touched. Each answer is obtained independently before aggregation. CAPABILITY exceptions become
+ * Failed; USER exceptions reach the manifest purger. Cancellation always propagates.
  *
  * Completion covers recorder state, the sink's queue and ledger, and registered recovery captures
  * at that moment. These remain runtime cleanup obligations: a released registration still held by
@@ -39,12 +41,34 @@ internal class GraphRecorderPurgeAdapter(
         }
         val namespace = request.namespace
         val pending = namespace.pending
-        if (request.scope != PurgeScope.USER || PurgeScope.USER !in pending.scopes) {
-            return TargetOutcome.Failed("graph recorder purge requires the user axis")
-        }
         val owner = pending.ownerUid
         if (owner.isNullOrBlank() || namespace.ownerUid != owner) {
             return TargetOutcome.Failed("graph recorder purge requires a matching non-blank owner")
+        }
+        if (request.scope == PurgeScope.CAPABILITY) {
+            if (PurgeScope.CAPABILITY !in pending.scopes) {
+                return TargetOutcome.Failed("graph recorder purge requires the capability pending axis")
+            }
+            return try {
+                withContext(serialDispatcher) {
+                    val plan = recorder.captureKrxMemoryPurgePlan(namespace)
+                        ?: return@withContext TargetOutcome.Failed("capability namespace is live or unconfirmed")
+                    val outcome = recorder.purgeKrxMemory(plan) + sink.purgeKrxMemory(plan) +
+                        coordinator.purgeKrxRecoveryCaptures(plan)
+                    when {
+                        outcome.unresolved -> TargetOutcome.Failed("graph recorder capability originals are unresolved")
+                        outcome.removed -> TargetOutcome.Removed
+                        else -> TargetOutcome.NothingToRemove
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                TargetOutcome.Failed("graph recorder capability cleanup failed", failure)
+            }
+        }
+        if (request.scope != PurgeScope.USER || PurgeScope.USER !in pending.scopes) {
+            return TargetOutcome.Failed("graph recorder purge requires the user axis")
         }
         val keep = namespace.currentUserAccessEpoch
         if (keep != null && pending.userAccessEpoch == keep) {

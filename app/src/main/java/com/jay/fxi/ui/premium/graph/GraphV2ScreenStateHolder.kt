@@ -193,6 +193,7 @@ internal class GraphV2ScreenStateHolder(
     private var fullscreenGeneration = 0L
     private var fullscreenOpen = false
     private var preparationKey: GraphV2PreparationKey? = null
+    private var preparedKrxCapabilityEpoch: String? = null
     private var preparedKrxRevision = 0L
     private var prepared: PreparedGraph? = null
     private var inlineVisible = false
@@ -592,6 +593,7 @@ internal class GraphV2ScreenStateHolder(
     private fun clearPreparation() {
         dropLivePublication()
         preparationKey = null
+        preparedKrxCapabilityEpoch = null
         prepared = null
     }
 
@@ -742,7 +744,8 @@ internal class GraphV2ScreenStateHolder(
     private fun render(publish: Boolean): GraphV2ScreenState {
         if (!started || closed || activeOwner == null) return emptyState(GraphV2Content.INACTIVE)
         val current = context ?: return emptyState(GraphV2Content.BLOCKED)
-        if (gate.bindWithConfiguration(current.fence, current.lifetime) == null) {
+        val access = gate.bindWithConfiguration(current.fence, current.lifetime)
+        if (access == null) {
             clearPreparation()
             clearSurfaceReports()
             fullscreenOpen = false
@@ -755,6 +758,12 @@ internal class GraphV2ScreenStateHolder(
         val fullscreen = if (fullscreenOpen) token(current, GraphV2Surface.FULLSCREEN) else null
         val key = GraphKey(tab, activePeriod)
         val exposure = if (activePeriod in periods) expose(current) else null
+        val nextPreparation = exposure?.let { GraphV2PreparationKey(screenGeneration, tab, activePeriod, it.graph) }
+        // This precedes READY: a pending selection write must not retain an old KRX preparation or publication.
+        if (preparationKey?.graph?.series?.any { it.seriesId.startsWith("krx.") } == true &&
+            (preparedKrxCapabilityEpoch != access.captured.krxCapabilityEpoch || preparationKey != nextPreparation)) {
+            clearPreparation()
+        }
         val status = selectionStatus(exposure)
         val confirmed = if (status == GraphV2SelectionStatus.READY) confirmedRead()?.let {
             selection(it) ?: GraphSeriesSelection(emptySet(), emptySet())
@@ -762,11 +771,12 @@ internal class GraphV2ScreenStateHolder(
         val inFlight = key in snapshot?.inFlight.orEmpty()
         val failure = snapshot?.failures?.get(key)
         val chart = if (exposure != null && confirmed != null) {
-            val next = GraphV2PreparationKey(screenGeneration, tab, activePeriod, exposure.graph)
+            val next = checkNotNull(nextPreparation)
             val changed = preparationKey != next
             if (changed) {
                 prepared = null
                 preparationKey = next
+                preparedKrxCapabilityEpoch = access.captured.krxCapabilityEpoch
             }
             // The REST build is computed only when read, then kept for this key; a 1d projection reads none.
             val rest = { prepared ?: prepare(next.graph, next.period).also { prepared = it } }

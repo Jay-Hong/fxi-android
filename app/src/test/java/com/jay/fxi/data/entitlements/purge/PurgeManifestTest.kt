@@ -151,7 +151,7 @@ class PurgeManifestTest {
         assertEquals("정확히 한 항목", 1, matching.size)
         val target = matching.single()
         assertEquals(PurgeClassification.DERIVED_HERE, target.classification)
-        assertEquals(setOf(PurgeScope.USER), target.scopes)
+        assertEquals("contract(G11): memory target USER+CAPABILITY", setOf(PurgeScope.USER, PurgeScope.CAPABILITY), target.scopes)
         assertEquals("S4", target.owner)
         assertTrue(target.note.isNotBlank())
         assertEquals(target.id, GraphRecorderPurgeAdapter.TARGET_ID)

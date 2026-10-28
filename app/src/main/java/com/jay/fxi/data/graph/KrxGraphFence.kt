@@ -53,6 +53,12 @@ internal class KrxGraphFence : KrxGraphIngress {
     val revisions: StateFlow<Long> = mutableRevisions.asStateFlow()
     private var closed = false
 
+    val hasIssuedCaptures: Boolean get() = synchronized(lock) { nextIssueSequence != 0L }
+
+    fun memoryCutoffs(): KrxGraphCutoffSnapshot = synchronized(lock) {
+        KrxGraphCutoffSnapshot(mutableRevisions.value, cutoffs)
+    }
+
     override fun capture(scope: KrxMemoryScope): KrxGraphStamp? = synchronized(lock) {
         if (closed || krxGraphNamespace(scope) == null) return null
         nextIssueSequence = Math.incrementExact(nextIssueSequence)

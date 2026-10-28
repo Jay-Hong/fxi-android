@@ -17,6 +17,28 @@ internal class GraphPendingInputs private constructor(
 
     val krxLost: Map<String, Set<KrxGraphStamp>> = copyKrxGraphStamps(krxLost)
 
+    fun purgeKrxMemory(plan: KrxGraphPurgePlan): Pair<GraphPendingInputs, KrxGraphPurgeOutcome> {
+        var outcome = KrxGraphPurgeOutcome(false, false)
+        val kept = inputs.mapNotNull { input ->
+            val projection: KrxGraphInputProjection = projectKrxGraphInput(input, plan)
+            outcome += projection.outcome
+            projection.input
+        }
+        val losses = krxLost.mapValues { (_, originals) -> originals.filterTo(linkedSetOf()) {
+            val decision = plan.classify(it, it.scope.owner.identity.uid)
+            outcome += KrxGraphPurgeOutcome(decision == KrxGraphPurgeDecision.REMOVE,
+                decision == KrxGraphPurgeDecision.UNRESOLVED)
+            decision != KrxGraphPurgeDecision.REMOVE
+        } }.filterValues { it.isNotEmpty() }
+        val topics = lostTopics.filterTo(linkedSetOf()) {
+            // No original sidecar exists for a legacy topic loss. Never fill it from a new use.
+            if (isKrxGraphTopic(it)) outcome += KrxGraphPurgeOutcome(false,
+                plan.classify(null, null) == KrxGraphPurgeDecision.UNRESOLVED)
+            true
+        }
+        return (if (outcome.removed) GraphPendingInputs(kept, topics, losses) else this) to outcome
+    }
+
     companion object {
         val EMPTY = GraphPendingInputs(emptyList(), emptySet())
 

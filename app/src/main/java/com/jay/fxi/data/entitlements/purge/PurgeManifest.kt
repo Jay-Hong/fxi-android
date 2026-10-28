@@ -151,10 +151,10 @@ object PurgeManifest {
         PurgeTarget(
             id = "memory:graph_recorder",
             classification = PurgeClassification.DERIVED_HERE,
-            scopes = setOf(PurgeScope.USER),
+            scopes = setOf(PurgeScope.USER, PurgeScope.CAPABILITY),
             owner = "S4",
-            note = "recorder state, sink queue and ledger, and registered recovery captures per UID/user epoch; " +
-                "holds no KRX series — add the CAPABILITY axis if S6 puts KRX in the recorder"
+            note = "recorder state, sink queue and ledger, and registered recovery captures per UID/user/capability epoch; " +
+                "completion excludes runtime slots, screen publications, session loss and disk targets"
         ),
         PurgeTarget(
             id = "file:graph_v2_general",

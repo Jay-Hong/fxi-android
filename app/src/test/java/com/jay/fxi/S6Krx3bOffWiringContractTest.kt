@@ -129,7 +129,7 @@ class S6Krx3bOffWiringContractTest {
             g.yes("same gate observes shared revision", assembly.gate.krxGraphRevisions.value > before)
             g.eq("default-null gate cannot bypass original", null, assembly.gate.bindKrxGraph(old.attribution.owner, old.attribution.lifetime, stamp))
             val target = com.jay.fxi.data.entitlements.purge.PurgeManifest.TARGETS.single { it.id == "memory:graph_recorder" }
-            g.eq("physical CAPABILITY target remains unsupported in 3b-1", setOf(PurgeScope.USER), target.scopes)
+            g.eq("memory target supports USER and CAPABILITY only for its held surfaces", setOf(PurgeScope.USER, PurgeScope.CAPABILITY), target.scopes)
         }
         marked("O05b") {
             S6KrxRecorderContractTest().g08_exposureRechecksAfterPreparation()
@@ -173,9 +173,9 @@ class S6Krx3bOffWiringContractTest {
     @Test fun o08_sourceInventoriesRejectUnapprovedExpansion() {
         val sources = sourceInventory()
         assertTrue("premise: O08 scans every production root", ROOTS.all { File(it).isDirectory } && sources.size > 300)
-        assertTrue("contract(O08): exactly the 16 approved paths exist", ALLOWED.all { it in sources })
+        assertTrue("contract(O08): exactly the 13 approved paths exist", ALLOWED.all { it in sources })
         val raw = sources.keys.filter { it !in ALLOWED }.sorted()
-        assertEquals("contract(O08): protected HEAD file count", 342, raw.size)
+        assertEquals("contract(O08): protected HEAD file count", 346, raw.size)
         val bytes = raw.joinToString("") { "$it\u0000${sha(File(it).readBytes())}\n" }
         assertEquals("contract(O08): protected HEAD raw bytes", BASELINE, sha(bytes.toByteArray(Charsets.UTF_8)))
         val ingress = setOf("data/graph/KrxGraphFence.kt", "data/remote/TopicSessionCoordinator.kt", "data/remote/TopicRuntime.kt",
@@ -208,13 +208,21 @@ class S6Krx3bOffWiringContractTest {
             "USER-end", "CAP-end", "D1-hold", "server-seed-HTTP", "USD-tether", "assembly-failure", "detach-close")
         internal val ROOTS = listOf("src/main/java", "src/productionBindings/java", "src/s5Benchmark/java", "src/debug/java", "src/benchmark/java")
         internal const val BASE = "src/main/java/com/jay/fxi/"
-        internal val ALLOWED = setOf("data/remote/TopicSessionCoordinator.kt", "data/remote/TopicRuntime.kt", "data/remote/TopicRuntimeOwner.kt",
-            "data/remote/DetachableGraphSinks.kt", "data/remote/TopicGraphObservation.kt", "data/remote/TopicGraphLossLedger.kt",
-            "data/graph/GraphRecorder.kt", "data/graph/GraphRecorderReducer.kt", "data/graph/GraphRecorderTopicSink.kt",
-            "data/graph/GraphPendingInputs.kt", "data/graph/GraphRecovery.kt", "data/graph/GraphV2AccessGate.kt",
-            "data/graph/GraphV2RequestCoordinator.kt", "data/graph/GraphRuntimeAssembly.kt",
-            "ui/premium/graph/GraphV2ScreenStateHolder.kt", "data/graph/KrxGraphFence.kt").map { BASE + it }.toSet()
-        internal const val BASELINE = "05ffdaa3f85d20210ae0c9563ee34dad139dd492b2d4592b05e9c1fbf6a99cff"
+        internal val ALLOWED = setOf(
+            "data/graph/KrxGraphMemoryPurge.kt",
+            "data/graph/GraphRecorder.kt",
+            "data/graph/GraphRecorderReducer.kt",
+            "data/graph/GraphPendingInputs.kt",
+            "data/graph/GraphRecorderTopicSink.kt",
+            "data/graph/GraphV2RequestCoordinator.kt",
+            "data/graph/GraphRuntimeAssembly.kt",
+            "data/graph/KrxGraphFence.kt",
+            "data/remote/TopicSessionCoordinator.kt",
+            "data/remote/TopicGraphLossLedger.kt",
+            "ui/premium/graph/GraphV2ScreenStateHolder.kt",
+            "data/entitlements/purge/PurgeManifest.kt",
+            "data/entitlements/purge/GraphRecorderPurgeAdapter.kt").map { BASE + it }.toSet()
+        internal const val BASELINE = "8b2e9746a70ddbb31a7e155130a04f3a08d6f1cada97959376cf2c016664dd9f"
         internal fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
         internal fun sourceInventory() = ROOTS.flatMap { root -> File(root).walkTopDown()
             .filter { it.isFile && it.extension == "kt" }.map { it.invariantSeparatorsPath to KrxSessionSourceContract.strip(it.readText()) }.toList() }.toMap()

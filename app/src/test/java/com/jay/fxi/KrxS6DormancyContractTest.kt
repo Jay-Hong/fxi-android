@@ -335,16 +335,16 @@ class KrxS6DormancyContractTest {
     /** S6-3b-1 replaces the zero-KRX inventory with exact original-ownership surfaces. */
     @Test fun Z10_recorderHasNoKrx() {
         val allowed = mapOf(
-            "GraphRecorder.kt" to setOf("KrxGraphStamp", "krxGraphStamp", "krxSeriesOwners", "krxUntransferred", "krxLost", "bindKrxGraph", "loseKrxTopics", "admitsKrx", "isKrxGraphTopic", "krxAdmission", "krx"),
-            "GraphRecorderReducer.kt" to setOf("KrxGraphStamp", "KrxGraphMapping", "krxGraphStamp", "krxSeriesOwners", "krxUntransferred", "krxLost", "krxGraphMapping", "krxGraphSeriesIds", "admitsKrxUse", "copyKrxGraphStamps", "isKrx", "krx", "admitsKrx", "krxAdmission", "krxGraphNamespace", "sameKrxUse", "isKrxGraphTopic", "krxMapping", "krxLoss", "krxIds", "loseKrxTopics", "markGraphPendingKrxLoss", "krxGraphLoss", "krxWaits"),
-            "GraphRecorderTopicSink.kt" to setOf("KrxGraphStamp", "krxGraphStamp", "loseKrxTopics", "krxLost", "krxLedger", "keptKrxLedger", "copyKrxGraphStamps", "krxLoss", "krxGraphLoss"),
-            "GraphPendingInputs.kt" to setOf("KrxGraphStamp", "krxGraphStamp", "krxLost", "KRX_MEMORY_KEY", "copyKrxGraphStamps", "markKrxLoss", "krxLoss", "krxGraphLoss", "markGraphPendingKrxLoss", "isKrxGraphTopic")
+            "GraphRecorder.kt" to setOf("KrxGraphPurgePlan", "KrxGraphPurgeOutcome", "KrxGraphPurgeSeal", "KrxGraphInputProjection", "purgeKrxMemory", "captureKrxMemoryPurgePlan", "projectKrxGraphInput", "KrxGraphStamp", "krxGraphStamp", "krxSeriesOwners", "krxUntransferred", "krxLost", "bindKrxGraph", "loseKrxTopics", "admitsKrx", "isKrxGraphTopic", "krxAdmission", "krx"),
+            "GraphRecorderReducer.kt" to setOf("KrxGraphPurgePlan", "KrxGraphPurgeOutcome", "KrxGraphPurgeDecision", "purgeKrxMemory", "projectKrxGraphInput", "KrxGraphStamp", "KrxGraphMapping", "krxGraphStamp", "krxSeriesOwners", "krxUntransferred", "krxLost", "krxGraphMapping", "krxGraphSeriesIds", "admitsKrxUse", "copyKrxGraphStamps", "isKrx", "krx", "admitsKrx", "krxAdmission", "krxGraphNamespace", "sameKrxUse", "isKrxGraphTopic", "krxMapping", "krxLoss", "krxIds", "loseKrxTopics", "markGraphPendingKrxLoss", "krxGraphLoss", "krxWaits"),
+            "GraphRecorderTopicSink.kt" to setOf("KrxGraphPurgePlan", "KrxGraphPurgeOutcome", "KrxGraphPurgeDecision", "KrxGraphInputProjection", "purgeKrxMemory", "projectKrxGraphInput", "KrxGraphStamp", "krxGraphStamp", "loseKrxTopics", "krxLost", "krxLedger", "keptKrxLedger", "copyKrxGraphStamps", "krxLoss", "krxGraphLoss"),
+            "GraphPendingInputs.kt" to setOf("KrxGraphPurgePlan", "KrxGraphPurgeOutcome", "KrxGraphPurgeDecision", "KrxGraphInputProjection", "purgeKrxMemory", "projectKrxGraphInput", "KrxGraphStamp", "krxGraphStamp", "krxLost", "KRX_MEMORY_KEY", "copyKrxGraphStamps", "markKrxLoss", "krxLoss", "krxGraphLoss", "markGraphPendingKrxLoss", "isKrxGraphTopic")
         )
         val identifiers = Regex("""\b[A-Za-z_][A-Za-z_0-9]*[Kk][Rr][Xx][A-Za-z_0-9]*\b|\b[Kk][Rr][Xx][A-Za-z_0-9]*\b""")
         fun violations(map: Map<String, String>) = allowed.mapValues { (file, names) ->
             identifiers.findAll(map.getValue("${M}data/graph/$file")).map { it.value }.toSet() - names
         }.filterValues { it.isNotEmpty() }
-        assertEquals("contract(Z10): original-sidecar mapper/C-1/cutoff surface only", emptyMap<String, Set<String>>(), violations(code))
+        assertEquals("contract(Z10): exact original-sidecar/C-1/cutoff/physical purge surface only", emptyMap<String, Set<String>>(), violations(code))
         val recorder = "${M}data/graph/GraphRecorder.kt"
         val bypass = code + (recorder to code.getValue(recorder) + "\nfun krxBypass() = Unit")
         assertEquals("contract(Z10): prefix-like bypass inside an allowed file is rejected", mapOf("GraphRecorder.kt" to setOf("krxBypass")), violations(bypass))

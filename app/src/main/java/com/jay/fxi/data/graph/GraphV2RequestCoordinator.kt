@@ -200,7 +200,9 @@ internal class GraphV2RequestCoordinator(
         val activityGeneration: Long,
         val catalog: GraphCatalog?,
         val configuration: GraphV2CapabilityConfiguration,
-        val mode: GraphV2SeedMode
+        val mode: GraphV2SeedMode,
+        var captured: GraphV2AccessCapture,
+        var krxOwned: Boolean = true
     )
 
     private class WriteTask(
@@ -411,6 +413,7 @@ internal class GraphV2RequestCoordinator(
     private var seedRegistration: SeedRegistration? = null
     private var attemptedSeedKey: GraphKey? = null
     private var attemptedSupplement: GraphV2SeedMode.SupplementOccupied? = null
+    private var attemptedSupplementOriginal: KrxGraphStamp? = null
     private var nextWriteId = 0L
     private val writeTasks = mutableMapOf<GraphV2WriteTicket, WriteTask>()
     private var writePreparationToStart: Job? = null
@@ -529,6 +532,126 @@ internal class GraphV2RequestCoordinator(
         }
         return removed
     }
+
+    fun purgeKrxRecoveryCaptures(plan: KrxGraphPurgePlan): KrxGraphPurgeOutcome {
+        val (updates, outcome) = projectRecoveryCaptures(tabRequests.values.toList(), plan)
+        updates.forEach { (registration, kept) -> registration.recoveryRequests = kept }
+        return outcome
+    }
+
+    private fun projectRecoveryCaptures(
+        registrations: List<Registration>,
+        plan: KrxGraphPurgePlan
+    ): Pair<List<Pair<Registration, List<GraphRecoveryRequest>>>, KrxGraphPurgeOutcome> {
+        var outcome = KrxGraphPurgeOutcome(false, false)
+        val updates = registrations.mapNotNull { registration ->
+            val before = registration.recoveryRequests
+            val kept = before.filter { request ->
+                if (!request.seriesKey.seriesId.startsWith("krx.")) {
+                    if (request.krxGraphStamp != null) outcome += KrxGraphPurgeOutcome(false,
+                        plan.classify(null, request.seriesKey.scope.uid) == KrxGraphPurgeDecision.UNRESOLVED ||
+                            plan.classify(request.krxGraphStamp, request.seriesKey.scope.uid) != KrxGraphPurgeDecision.KEEP)
+                    return@filter true
+                }
+                val stamp = request.krxGraphStamp
+                if (stamp != null && stamp.scope.owner.userAccessEpoch != request.seriesKey.scope.userAccessEpoch) {
+                    outcome += KrxGraphPurgeOutcome(false,
+                        plan.classify(null, request.seriesKey.scope.uid) == KrxGraphPurgeDecision.UNRESOLVED ||
+                            plan.classify(stamp, request.seriesKey.scope.uid) != KrxGraphPurgeDecision.KEEP)
+                    return@filter true
+                }
+                val decision = plan.classify(stamp, request.seriesKey.scope.uid)
+                outcome += KrxGraphPurgeOutcome(decision == KrxGraphPurgeDecision.REMOVE,
+                    decision == KrxGraphPurgeDecision.UNRESOLVED)
+                decision != KrxGraphPurgeDecision.REMOVE
+            }
+            if (before.size == kept.size) null else registration to kept
+        }
+        return updates to outcome
+    }
+
+    /** Original-plan cleanup, including D1 in the live namespace; no context, budget or HTTP retirement. */
+    fun purgeKrxMemory(plan: KrxGraphPurgePlan): KrxGraphPurgeOutcome {
+        val registrations = (listOfNotNull(catalogRequest) + tabRequests.values + pendingReleased.values).distinct()
+        val (recoveryUpdates, recovered) = projectRecoveryCaptures(registrations, plan)
+        var outcome = recovered
+        fun selected(stamp: KrxGraphStamp?, uid: String?): Boolean {
+            val decision = plan.classify(stamp, uid)
+            outcome += KrxGraphPurgeOutcome(decision == KrxGraphPurgeDecision.REMOVE,
+                decision == KrxGraphPurgeDecision.UNRESOLVED)
+            return decision == KrxGraphPurgeDecision.REMOVE
+        }
+        fun original(captured: GraphV2AccessCapture): KrxGraphStamp? {
+            val stamp = captured.krxGraphStamp ?: return null
+            if (stamp.scope.owner == captured.fence && stamp.scope.use.lifetime == captured.lifetime &&
+                stamp.scope.use.krxCapabilityEpoch == captured.krxCapabilityEpoch) return stamp
+            outcome += KrxGraphPurgeOutcome(false,
+                plan.classify(null, captured.fence.identity.uid) == KrxGraphPurgeDecision.UNRESOLVED ||
+                    plan.classify(stamp, captured.fence.identity.uid) != KrxGraphPurgeDecision.KEEP)
+            return null
+        }
+        val slots = protectedSlots.toMutableMap()
+        var entries = snapshot.entries
+        for ((key, slot) in protectedSlots) {
+            if (slot.components.krx == null && slot.krxGraphStamp == null && !hasKrx(slot.entry.tab)) continue
+            val component = slot.components.krx
+            val stamp = slot.krxGraphStamp
+            if (stamp != null && (stamp.scope.owner.userAccessEpoch != slot.components.general.key.userAccessEpoch ||
+                component != null && (stamp.scope.owner.identity.uid != component.key.uid ||
+                    stamp.scope.owner.userAccessEpoch != component.key.userAccessEpoch ||
+                    stamp.scope.use.krxCapabilityEpoch != component.key.krxCapabilityEpoch))) {
+                outcome += KrxGraphPurgeOutcome(false,
+                    plan.classify(null, slot.components.general.key.uid) == KrxGraphPurgeDecision.UNRESOLVED ||
+                        plan.classify(stamp, slot.components.general.key.uid) != KrxGraphPurgeDecision.KEEP)
+                continue
+            }
+            if (!selected(stamp, slot.components.general.key.uid)) continue
+            val entry = slot.entry.copy(tab = joinGraphV2Components(slot.components.general, null).tab)
+            entries = entries + (key to entry)
+            slots[key] = slot.copy(entry = entry, components = slot.components.copy(krx = null), krxGraphStamp = null)
+        }
+        // Legacy raw KRX with no original anchor is retained and reported, never guessed from current access.
+        for ((key, entry) in entries) {
+            if (key !in protectedSlots && hasKrx(entry.tab)) selected(null, snapshot.dataScope?.uid)
+        }
+        val captureUpdates = registrations.mapNotNull { registration ->
+            val capture = registration.accessCapture ?: return@mapNotNull null
+            if (capture.krxCapabilityEpoch == null && capture.krxGraphStamp == null) return@mapNotNull null
+            if (selected(original(capture), registration.context.fence.identity.uid)) registration to withoutKrx(capture)
+            else null
+        }
+        val seed = seedRegistration
+        val stripSeed = seed != null && seed.krxOwned &&
+            (seed.captured.krxCapabilityEpoch != null || seed.captured.krxGraphStamp != null) &&
+            selected(original(seed.captured), seed.context.fence.identity.uid)
+        val seedCapture = seed?.captured?.takeIf { stripSeed }?.let(::withoutKrx)
+        val stripSupplement = attemptedSupplementOriginal != null && attemptedSupplement?.configuration?.allowed == true &&
+            selected(attemptedSupplementOriginal, snapshot.dataScope?.uid)
+        val writes = writeTasks.values.filter { task ->
+            task.wantsKrx && task.krxOwned.get() && selected(original(task.captured), task.captured.fence.identity.uid)
+        }
+        val nextSnapshot = snapshot.copy(entries = entries)
+        // Store failure/cancellation leaves all coordinator ownership and holdings intact for the same plan's retry.
+        writes.forEach { checkNotNull(cachePorts).store.withdrawKrx(it.ticket) }
+        recoveryUpdates.forEach { (registration, kept) -> registration.recoveryRequests = kept }
+        captureUpdates.forEach { (registration, captured) -> registration.accessCapture = captured }
+        if (stripSeed) {
+            checkNotNull(seed).captured = checkNotNull(seedCapture)
+            seed.krxOwned = false
+        }
+        if (stripSupplement) {
+            // Keep the spent-attempt marker: an old completion must not start a replacement seed in this generation.
+            attemptedSupplementOriginal = null
+        }
+        writes.forEach { it.krxOwned.set(false) }
+        protectedSlots = slots
+        snapshot = nextSnapshot
+        if (outcome.removed) publishState()
+        return outcome
+    }
+
+    private fun withoutKrx(captured: GraphV2AccessCapture): GraphV2AccessCapture =
+        captured.copy(krxCapabilityEpoch = null, krxGraphStamp = null)
 
     /**
      * Retires selected USER data scopes synchronously on the loop's serial executor, between events.
@@ -719,7 +842,7 @@ internal class GraphV2RequestCoordinator(
         if (live != null && live in selected) return GraphRuntimeRetirement.LIVE_SCOPE_SELECTED
         val slotKeys = protectedSlots.filterValues { slotScope(it) in selected }.keys
         val captureUpdates = registrations.filter { captureScope(it) in selected }.map { registration ->
-            registration to checkNotNull(registration.accessCapture).copy(krxCapabilityEpoch = null)
+            registration to withoutKrx(checkNotNull(registration.accessCapture))
         }
         val retireSeed = seedScope != null && seedScope in selected
         val retireSupplement = supplementScope != null && supplementScope in selected
@@ -746,7 +869,10 @@ internal class GraphV2RequestCoordinator(
         withdrawnWrites.forEach { checkNotNull(cachePorts).store.withdrawKrx(it.ticket) }
         withdrawnWrites.forEach { it.krxOwned.set(false) }
         captureUpdates.forEach { (registration, captured) -> registration.accessCapture = captured }
-        if (retireSeed) discardSeed() else if (retireSupplement) attemptedSupplement = null
+        if (retireSeed) discardSeed() else if (retireSupplement) {
+            attemptedSupplement = null
+            attemptedSupplementOriginal = null
+        }
         protectedSlots = slots
         snapshot = nextSnapshot
         publishState()
@@ -877,13 +1003,16 @@ internal class GraphV2RequestCoordinator(
         if (mode is GraphV2SeedMode.SupplementOccupied && binding.configuration != mode.configuration) return
         val captured = binding.captured
         val registration = SeedRegistration(
-            seedId, key, current, activityGeneration, snapshot.catalog, binding.configuration, mode
+            seedId, key, current, activityGeneration, snapshot.catalog, binding.configuration, mode, captured
         )
         seedRegistration = registration
         when (mode) {
             GraphV2SeedMode.FillEmpty -> attemptedSeedKey = key
             // Keep the need pending on failure, without looping; a new activation or flip can retry it.
-            is GraphV2SeedMode.SupplementOccupied -> attemptedSupplement = mode
+            is GraphV2SeedMode.SupplementOccupied -> {
+                attemptedSupplement = mode
+                attemptedSupplementOriginal = captured.krxGraphStamp
+            }
         }
         scope.launch {
             val result = readGraphV2DiskSeed(ports, key, captured, registration.catalog)
@@ -906,6 +1035,7 @@ internal class GraphV2RequestCoordinator(
             // Only this owner is released; an older completion cannot remove a newer one.
             seedRegistration = null
             released = true
+            val captured = if (registration.krxOwned) event.captured else withoutKrx(event.captured)
             diagnoseSeedRead(event, GraphV2DiskComponent.GENERAL, event.result.general)
             diagnoseSeedRead(event, GraphV2DiskComponent.KRX, event.result.krx)
             val general = when (val read = event.result.general) {
@@ -939,7 +1069,7 @@ internal class GraphV2RequestCoordinator(
                 is GraphV2DiskRead.Found -> read.envelope
                 else -> null
             }
-            val joined = ports.gate.joinForExposure(event.captured, GraphV2DiskComponents(general, krx))
+            val joined = ports.gate.joinForExposure(captured, GraphV2DiskComponents(general, krx.takeIf { registration.krxOwned }))
             if (joined == null) {
                 seedDiagnostic(event.seedId, event.key, GraphV2DiskComponent.GENERAL, "Seed exposure admission is closed")
                 return
@@ -955,7 +1085,7 @@ internal class GraphV2RequestCoordinator(
             snapshot = snapshot.copy(entries = snapshot.entries + (event.key to entry))
             protectedSlots = protectedSlots + (event.key to ProtectedSlot(
                 entry, GraphV2DiskComponents(general, krx.takeIf { joined.krxJoined }), pending,
-                event.captured.capabilityInvalidations, event.captured.krxGraphStamp
+                captured.capabilityInvalidations, captured.krxGraphStamp
             ))
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -1000,6 +1130,7 @@ internal class GraphV2RequestCoordinator(
     private fun discardSeed() {
         seedRegistration = null
         attemptedSeedKey = null
+        attemptedSupplementOriginal = null
         attemptedSupplement = null
     }
 

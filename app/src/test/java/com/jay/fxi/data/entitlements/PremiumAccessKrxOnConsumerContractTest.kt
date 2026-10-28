@@ -1202,11 +1202,11 @@ class PremiumAccessKrxOnConsumerContractTest {
                 }
             } }
             rotate(h)
-            // No-port positive control isolates the post-preparation epoch gate from the store withdrawal.
+            // With no explicit purge port, 3b-2 automatic cleanup withdraws K1 on confirmed rotation; B21/write-ready-withdraw-fails isolates commit-time admission when withdrawal has no effect.
             if (!retire) reopen(h)
             sameGeneral(h, before, "$stage retire=$retire")
             if (retire) assertEquals(contract("$stage port removed K1"), GraphRuntimeRetirement.REMOVED, retired)
-            assertEquals(contract("$stage KRX withdrawals retire=$retire"), if (retire) 1 else 0, held.withdrawals.size)
+            assertEquals(contract("$stage KRX withdrawals retire=$retire"), 1, held.withdrawals.size)
             assertEquals(contract("$stage whole ticket never cancelled"), 0, held.cancelled.size)
             assertTrue("premise: P07 $stage write still held before release", !hold.isCompleted)
             hold.complete(Unit); runCurrent()

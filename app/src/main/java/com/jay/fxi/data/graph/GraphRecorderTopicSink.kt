@@ -129,6 +129,35 @@ internal class GraphRecorderTopicSink(
         removed
     }
 
+    /** Preflight the complete target under its lock; offer and drain retain their original contract. */
+    fun purgeKrxMemory(plan: KrxGraphPurgePlan): KrxGraphPurgeOutcome = synchronized(lock) {
+        var outcome = KrxGraphPurgeOutcome(false, false)
+        val kept = queue.mapNotNull { queued ->
+            val projection: KrxGraphInputProjection = projectKrxGraphInput(queued.input, plan)
+            outcome += projection.outcome
+            projection.input?.let { input ->
+                if (input === queued.input) queued else QueuedInput(input, input.pendingUnits())
+            }
+        }
+        val losses = krxLedger.mapValues { (_, originals) -> originals.filterTo(linkedSetOf()) {
+            val decision = plan.classify(it, it.scope.owner.identity.uid)
+            outcome += KrxGraphPurgeOutcome(decision == KrxGraphPurgeDecision.REMOVE,
+                decision == KrxGraphPurgeDecision.UNRESOLVED)
+            decision != KrxGraphPurgeDecision.REMOVE
+        } }.filterValues { it.isNotEmpty() }
+        for ((owner, topics) in ledger) {
+            outcome += KrxGraphPurgeOutcome(false, plan.unresolvedTopics(topics.keys, owner.uid))
+        }
+        val units = kept.sumOf { it.units }
+        if (outcome.removed) {
+            queue.clear()
+            queue.addAll(kept)
+            usedUnits = units
+            krxLedger = losses.toMutableMap()
+        }
+        outcome
+    }
+
     fun close() {
         val closeConsumer = synchronized(lock) {
             dropLocked()

@@ -10,12 +10,16 @@ import com.jay.fxi.data.remote.TopicUseAuthority
 import com.jay.fxi.domain.model.GraphCatalog
 import com.jay.fxi.time.AppClock
 import kotlin.time.Duration
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
  * An allowed call publishes exactly the fence the deliverer hands over; an end (allowed = false)
@@ -135,6 +139,11 @@ internal class GraphRuntimeAssembly(
     private val scope = CoroutineScope(assemblyJob + main)
     private var started = false
     private var closed = false
+    private val memorySnapshot = accessSnapshot
+    private val memoryRevisions = accessRevisions
+    private val pendingMemoryPurgePlans = mutableListOf<KrxGraphPurgePlan>()
+    private var lastMemoryPurge: KrxGraphPurgeState? = null
+    val krxMemoryPurgeState: KrxGraphPurgeState? get() = lastMemoryPurge
 
     val fences: GraphAccessFenceBridge
     private val krxFence = KrxGraphFence()
@@ -206,7 +215,55 @@ internal class GraphRuntimeAssembly(
         coordinator.start()
         recorder.start()
         sink.start()
+        scope.launch {
+            combine(memoryRevisions, krxFence.revisions) { _, _ -> Unit }.collect {
+                // With no issued original there is no new snapshot, clock, I/O or cleanup in OFF.
+                if (krxFence.hasIssuedCaptures) {
+                    try {
+                        purgeKrxMemoryNow()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Throwable) {
+                        // The immutable failed plan and failure remain visible for a real revision or Now retry.
+                    }
+                }
+            }
+        }
         return true
+    }
+
+    /** Synchronous on the assembly's Main executor, independently of the session loop. */
+    fun purgeKrxMemoryNow(): KrxGraphPurgeOutcome {
+        if (!krxFence.hasIssuedCaptures) return KrxGraphPurgeOutcome(false, false)
+        var outcome = KrxGraphPurgeOutcome(false, false)
+        fun apply(plan: KrxGraphPurgePlan) {
+            if (pendingMemoryPurgePlans.none { it.sameProof(plan) }) pendingMemoryPurgePlans += plan
+            var result = KrxGraphPurgeOutcome(false, false)
+            try {
+                check(!closed && scope.isActive) { "graph memory cleanup has no active assembly" }
+                result += recorder.purgeKrxMemory(plan)
+                result += sink.purgeKrxMemory(plan)
+                result += coordinator.purgeKrxMemory(plan)
+                outcome += result
+                lastMemoryPurge = KrxGraphPurgeState(plan.accessRevision, plan.cutoffRevision, outcome, null)
+                if (!result.unresolved) pendingMemoryPurgePlans.removeAll { it.sameProof(plan) }
+            } catch (failure: Throwable) {
+                outcome += result
+                lastMemoryPurge = KrxGraphPurgeState(plan.accessRevision, plan.cutoffRevision, outcome, failure)
+                throw failure
+            }
+        }
+        val retries = pendingMemoryPurgePlans.toList()
+        retries.forEach(::apply)
+        val plan = try {
+            KrxGraphPurgePlan.forSnapshot(memorySnapshot(), krxFence.memoryCutoffs())
+        } catch (failure: Throwable) {
+            lastMemoryPurge = KrxGraphPurgeState(lastMemoryPurge?.accessRevision ?: 0L,
+                lastMemoryPurge?.cutoffRevision ?: 0L, outcome, failure)
+            throw failure
+        }
+        if (retries.none { it.sameProof(plan) }) apply(plan)
+        return outcome
     }
 
     suspend fun close() {

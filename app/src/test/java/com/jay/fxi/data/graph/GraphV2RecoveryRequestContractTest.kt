@@ -244,13 +244,15 @@ class GraphV2RecoveryRequestContractTest {
         /** Every recorder supplier read, after a recorder's close check. */
         var recorderReads = 0
 
+        // Used only by the explicitly amended R9 CAP fixture; every earlier row retains HEAD reads.
+        var capPurgeSnapshot: TopicAccessSnapshot? = null
         private fun readSnapshot(): TopicAccessSnapshot {
             recorderReads++
             if (snapshotThrowsOnce) {
                 snapshotThrowsOnce = false
                 throw IllegalStateException("snapshot")
             }
-            return TopicAccessSnapshot(
+            return capPurgeSnapshot ?: TopicAccessSnapshot(
                 revision = 1L,
                 facts = TopicAccessFacts.NONE.copy(
                     token = fence?.grant,
@@ -701,7 +703,7 @@ class GraphV2RecoveryRequestContractTest {
         val refused = listOf(
             "another target" to request(target = checkNotNull(PurgeManifest.byId("file:graph_v2_general"))),
             "a forged target" to request(target = memoryTarget.copy(classification = PurgeClassification.NOT_USER_DATA)),
-            "the capability axis" to request(axis = PurgeScope.CAPABILITY),
+            "CAP request missing its pending axis" to request(axis = PurgeScope.CAPABILITY),
             "an entry without the user axis" to request(scopes = setOf(PurgeScope.CAPABILITY)),
             "no owner" to request(owner = null),
             "an empty owner" to request(owner = ""),
@@ -855,7 +857,7 @@ class GraphV2RecoveryRequestContractTest {
     /**
      * R9 (F2e A3): the manifest purger counts the memory target for itself only. Beside an unregistered disk target the user
      * purge stays Deferred, naming the disk target and not this one, while this target's data is gone; alone it completes; the
-     * capability axis never reaches it.
+     * capability axis visits this target, preserves GENERAL and still owes the KRX disk target.
      */
     @Test fun R9_theManifestPurgerCountsTheMemoryTargetForItselfOnly() = recoveryTest {
         val general = checkNotNull(PurgeManifest.byId("file:graph_v2_general"))
@@ -883,9 +885,23 @@ class GraphV2RecoveryRequestContractTest {
             val both = namespace.copy(
                 pending = namespace.pending.copy(krxCapabilityEpoch = "k1", scopes = setOf(PurgeScope.USER, PurgeScope.CAPABILITY))
             )
-            val result = ManifestScopePurger(mapOf(GraphRecorderPurgeAdapter.TARGET_ID to f.adapter)).purgeCapabilityScope(both)
-            assertTrue("not a failure, was $result", result !is PurgeResult.Failed)
-            assertSame("the capability axis never reaches the recorder", before, f.rec())
+            // boundary-input: confirmed current record, GENERAL-only held data and no KRX originals.
+            val current = both.copy(currentKrxCapabilityEpoch = "k2")
+            f.capPurgeSnapshot = TopicAccessSnapshot(2L, TopicAccessFacts.NONE.copy(
+                recordFence = com.jay.fxi.data.entitlements.AccessFence("u1", "e2", "k2"),
+                binding = EntitlementsIdentity("u1", 1L)), f.invalidations, null, null)
+            var visits = 0
+            val counting = com.jay.fxi.data.entitlements.purge.PurgeTargetAdapter { request ->
+                visits++; f.adapter.purge(request)
+            }
+            val krxDisk = checkNotNull(PurgeManifest.byId("file:graph_v2_krx"))
+            val result = ManifestScopePurger(mapOf(GraphRecorderPurgeAdapter.TARGET_ID to counting), listOf(memoryTarget, krxDisk))
+                .purgeCapabilityScope(current)
+            assertEquals("contract(G11/R9): CAP visits the real memory adapter", 1, visits)
+            assertTrue("contract(G11/R9): missing KRX disk keeps whole purge Deferred", result is PurgeResult.Deferred)
+            assertFalse("contract(G11/R9): completed memory target is not outstanding",
+                (result as PurgeResult.Deferred).reason.contains(GraphRecorderPurgeAdapter.TARGET_ID))
+            assertSame("contract(G11/R9): GENERAL-only raw values are unchanged", before, f.rec())
         }
     }
 }

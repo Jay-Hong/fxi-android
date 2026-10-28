@@ -23,8 +23,13 @@ import com.jay.fxi.data.entitlements.purge.KrxMemoryScope
 import com.jay.fxi.data.entitlements.purge.KrxMemorySelection
 import com.jay.fxi.data.entitlements.purge.krxMemorySelections
 import com.jay.fxi.data.graph.GraphDataScope
+import com.jay.fxi.data.graph.KrxGraphCutoffSnapshot
 import com.jay.fxi.data.graph.KrxGraphIngress
+import com.jay.fxi.data.graph.KrxGraphPurgeOutcome
+import com.jay.fxi.data.graph.KrxGraphPurgePlan
+import com.jay.fxi.data.graph.KrxGraphPurgeState
 import com.jay.fxi.data.graph.KrxGraphStamp
+import com.jay.fxi.data.graph.KrxGraphTopicResult
 import com.jay.fxi.data.local.TopicLastKnownRestore
 import com.jay.fxi.data.remote.dto.DxySpotEntry
 import com.jay.fxi.data.remote.dto.DxyTopicMessage
@@ -772,6 +777,8 @@ class TopicSessionCoordinator(
             retireKrxPending(live, old, replacement = replacement)
         }
         live.krxPending = KrxPending(replacement)
+        // Prepare already knows this original, even if the pending pointer is cleared before ACK.
+        rememberKrxGraphSource(replacement.graphStamp, live.fence, replacement.grantEpoch, replacement.use.lifetime)
     }
 
     private fun markKrxPendingSent(live: Connection, requestId: String) {
@@ -1164,6 +1171,7 @@ class TopicSessionCoordinator(
         if (!krxConsumerGuard(stamp.permitSeq)) return
         val snapshot = krxMemorySnapshot?.invoke() ?: return
         if (krxMemoryRevision == snapshot.revision) return
+        purgeKrxGraphLossOnLoop(KrxGraphPurgePlan.forSnapshot(snapshot, KrxGraphCutoffSnapshot(0L, emptyMap())))
         val live = connection
         val capture = live?.krxActive
         val activeScope = if (live != null && capture != null) krxMemoryScope(live.fence, capture.use, capture.stamp) else null
@@ -1521,6 +1529,10 @@ class TopicSessionCoordinator(
     private val _graphLoss = MutableStateFlow<TopicGraphLoss?>(null)
     /** Read and written only on the session's serial scope. Before any purge it holds exactly the former cumulative view. */
     private val graphLossLedger = TopicGraphLossLedger()
+    private val graphLossPurgePlans = mutableListOf<KrxGraphPurgePlan>()
+    private var unresolvedGraphLossCutoff: Long? = null
+    private var lastGraphLossPurge: KrxGraphPurgeState? = null
+    internal val krxGraphLossPurgeState: KrxGraphPurgeState? get() = lastGraphLossPurge
     private var graphSequence = 0L
     private var graphAuthority: TopicGraphAuthority? = null
     // Verified source/fact provenance survives without prices, after REST completion and WS retirement.
@@ -1843,6 +1855,7 @@ class TopicSessionCoordinator(
         // This also keeps a new Access owner from carrying the old prices and topic facts.
         displayPublicationDeferred = true
         try {
+            retryKrxGraphLossOnLoop()
             dispatch(input)
             connection?.let { currentHeldSilenceQuestion(it) }
         } finally {
@@ -3065,6 +3078,40 @@ class TopicSessionCoordinator(
         input.reply.complete(removed)
     }
 
+    private fun purgeKrxGraphLossOnLoop(plan: KrxGraphPurgePlan) {
+        if (graphLossPurgePlans.none { it.sameProof(plan) }) graphLossPurgePlans += plan
+        retryKrxGraphLossOnLoop()
+    }
+
+    /** Retries only during a real loop turn, with the original immutable evidence and no supplier read. */
+    private fun retryKrxGraphLossOnLoop() {
+        if (graphLossPurgePlans.isEmpty()) return
+        var outcome = KrxGraphPurgeOutcome(false, unresolvedGraphLossCutoff != null)
+        var failure: Throwable? = null
+        var accessRevision = 0L
+        var cutoffRevision = unresolvedGraphLossCutoff ?: 0L
+        val remaining = mutableListOf<KrxGraphPurgePlan>()
+        for (plan in graphLossPurgePlans) {
+            accessRevision = maxOf(accessRevision, plan.accessRevision)
+            cutoffRevision = maxOf(cutoffRevision, plan.cutoffRevision)
+            try {
+                val result = graphLossLedger.purgeKrxMemory(plan)
+                outcome += result
+                _graphLoss.value = graphLossLedger.view
+                if (result.unresolved) remaining += plan
+            } catch (cancelled: CancellationException) {
+                lastGraphLossPurge = KrxGraphPurgeState(accessRevision, cutoffRevision, outcome, cancelled)
+                throw cancelled
+            } catch (problem: Throwable) {
+                remaining += plan
+                if (failure == null) failure = problem
+            }
+        }
+        graphLossPurgePlans.clear()
+        graphLossPurgePlans.addAll(remaining)
+        lastGraphLossPurge = KrxGraphPurgeState(accessRevision, cutoffRevision, outcome, failure)
+    }
+
     /** Only the sink call is guarded: hand-over failure never decides price processing. */
     private fun offerGraphInput(input: TopicGraphInput) {
         val offer = try {
@@ -3536,7 +3583,17 @@ class TopicSessionCoordinator(
             }
             if (ack.rejected[topic] == TopicRejectionReason.TOPIC_UNAVAILABLE) {
                 if (krxAcknowledgedScope != null && current(live.generation) === live) {
-                    krxGraphIngress.topicUnavailable(krxAcknowledgedScope)
+                    val cutoff = krxGraphIngress.topicUnavailable(krxAcknowledgedScope)
+                    val plan = KrxGraphPurgePlan.forCutoff(cutoff)
+                    if (plan != null) purgeKrxGraphLossOnLoop(plan)
+                    else if (cutoff.result == KrxGraphTopicResult.UNRESOLVED) {
+                        unresolvedGraphLossCutoff = cutoff.revision
+                        val previous = lastGraphLossPurge
+                        lastGraphLossPurge = KrxGraphPurgeState(previous?.accessRevision ?: krxMemoryRevision ?: 0L,
+                            maxOf(previous?.cutoffRevision ?: 0L, cutoff.revision),
+                            KrxGraphPurgeOutcome(false, true) + (previous?.outcome ?: KrxGraphPurgeOutcome(false, false)),
+                            previous?.failure.takeIf { graphLossPurgePlans.isNotEmpty() })
+                    }
                 }
                 cleanupKrxUnavailable(live, krxAcknowledgedScope)
             }

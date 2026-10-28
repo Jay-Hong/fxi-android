@@ -1,9 +1,15 @@
 package com.jay.fxi.data.remote
 
 import com.jay.fxi.data.graph.GraphDataScope
+import com.jay.fxi.data.graph.KrxGraphPurgeDecision
+import com.jay.fxi.data.graph.KrxGraphPurgeOutcome
+import com.jay.fxi.data.graph.KrxGraphPurgePlan
+import com.jay.fxi.data.graph.KrxGraphPurgeSeal
 import com.jay.fxi.data.graph.KrxGraphStamp
 import com.jay.fxi.data.graph.copyKrxGraphStamps
+import com.jay.fxi.data.graph.isKrxGraphTopic
 import com.jay.fxi.data.graph.krxGraphLoss
+import java.util.Collections
 
 /** Explicit cleanup boundaries; [TopicGraphLossLedger.purge] copies both collections before selecting scopes. */
 internal data class GraphLossRetirement(
@@ -14,7 +20,9 @@ internal data class GraphLossRetirement(
 /**
  * Dormant ledger of whole-batch FULL, CLOSED and FAILED losses.
  *
- * Scoped aggregates are keyed by (UID/access epoch, original lifetime invalidations or no lifetime).
+ * Scoped aggregates are keyed by UID/access epoch, original lifetime invalidations, original KRX
+ * stamp composition, GENERAL topics and the presence of unstamped KRX. This retains whole-batch
+ * accounting when a mixed batch survives selection and a pure KRX batch is removed.
  * Missing owners or access epochs share one unscoped bucket, outside selection and cleanup boundaries.
  * Retired scopes permanently refuse all losses and take precedence over ended-use floors. Floors only
  * rise: they remove and refuse absent lifetimes and invalidations below the floor; equality passes,
@@ -40,7 +48,13 @@ internal data class GraphLossRetirement(
  * 실제 topic 정리·운영 배선은 cutover. This helper does not create operational instances or register a purger.
  */
 internal class TopicGraphLossLedger {
-    private data class Key(val scope: GraphDataScope?, val invalidations: Long?)
+    private data class Key(
+        val scope: GraphDataScope?,
+        val invalidations: Long?,
+        val originalKrxLost: Map<String, Set<KrxGraphStamp>>,
+        val generalTopics: Set<String>,
+        val hasUnstampedKrx: Boolean
+    )
 
     private data class Aggregate(
         val count: Long,
@@ -65,6 +79,7 @@ internal class TopicGraphLossLedger {
     )
 
     private var state = State()
+    private var purgeSeal = KrxGraphPurgeSeal.EMPTY
 
     val view: TopicGraphLoss?
         get() = state.view
@@ -107,7 +122,13 @@ internal class TopicGraphLossLedger {
             }
         }
 
-        val key = Key(scope, if (scope == null) null else lifetime?.invalidations)
+        val original = lossKey(scope, if (scope == null) null else lifetime?.invalidations,
+            input.krxGraphLoss(), topics.filterNotTo(linkedSetOf(), ::isKrxGraphTopic),
+            topics.any { isKrxGraphTopic(it) && it !in input.krxGraphLoss() })
+        val (key, _) = projectKey(original, purgeSeal::classify)
+        // A refused late original does not consume a sequence or change the published revision.
+        if (key == null) return false
+        val retainedTopics = retainedTopics(topics, key)
         val previous = held.aggregates[key]
         val aggregate = Aggregate(
             count = (previous?.count ?: 0L) + 1L,
@@ -116,10 +137,10 @@ internal class TopicGraphLossLedger {
             firstAt = previous?.firstAt ?: lossAtEpochMillis,
             lastAt = lossAtEpochMillis,
             reasons = (previous?.reasons ?: emptySet()) + offer,
-            topics = (previous?.topics ?: emptySet()) + topics,
+            topics = (previous?.topics ?: emptySet()) + retainedTopics,
             paths = (previous?.paths ?: emptySet()) + paths,
             authorities = (previous?.authorities ?: emptySet()) + authority,
-            krxLost = mergeKrxLoss(previous?.krxLost.orEmpty(), input.krxGraphLoss())
+            krxLost = mergeKrxLoss(previous?.krxLost.orEmpty(), key.originalKrxLost)
         )
         val aggregates = held.aggregates + (key to aggregate)
         val revision = held.revision + 1L
@@ -131,6 +152,68 @@ internal class TopicGraphLossLedger {
             view = nextView
         )
         return true
+    }
+
+    /** Seal installation and the fully rebuilt aggregates commit together on the session loop. */
+    fun purgeKrxMemory(plan: KrxGraphPurgePlan): KrxGraphPurgeOutcome {
+        val held = state
+        val seal = purgeSeal.merge(plan)
+        var outcome = KrxGraphPurgeOutcome(false, false)
+        val aggregates = linkedMapOf<Key, Aggregate>()
+        for ((key, aggregate) in held.aggregates) {
+            val (kept, projected) = projectKey(key, plan::classify)
+            outcome += projected
+            if (kept == null) continue
+            val remaining = if (kept == key) aggregate else aggregate.copy(
+                topics = retainedTopics(aggregate.topics, kept), krxLost = kept.originalKrxLost
+            )
+            aggregates[kept] = aggregates[kept]?.let { mergeAggregate(it, remaining) } ?: remaining
+        }
+        val revision = held.revision + if (outcome.removed) 1L else 0L
+        val view = if (outcome.removed) buildView(aggregates, revision) else held.view
+        val next = held.copy(aggregates = aggregates, revision = revision, view = view)
+        purgeSeal = seal
+        state = next
+        return outcome
+    }
+
+    private fun lossKey(
+        scope: GraphDataScope?,
+        invalidations: Long?,
+        originals: Map<String, Set<KrxGraphStamp>>,
+        general: Set<String>,
+        unknown: Boolean
+    ) = Key(scope, invalidations, copyKrxGraphStamps(originals),
+        Collections.unmodifiableSet(general.toSet()), unknown)
+
+    private fun projectKey(
+        key: Key,
+        classify: (KrxGraphStamp?, String?) -> KrxGraphPurgeDecision
+    ): Pair<Key?, KrxGraphPurgeOutcome> {
+        var outcome = KrxGraphPurgeOutcome(false, false)
+        val originals = key.originalKrxLost.mapValues { (_, stamps) -> stamps.filterTo(linkedSetOf()) {
+            val decision = classify(it, key.scope?.uid)
+            outcome += KrxGraphPurgeOutcome(decision == KrxGraphPurgeDecision.REMOVE,
+                decision == KrxGraphPurgeDecision.UNRESOLVED)
+            decision != KrxGraphPurgeDecision.REMOVE
+        } }.filterValues { it.isNotEmpty() }
+        if (key.hasUnstampedKrx) outcome += KrxGraphPurgeOutcome(false,
+            classify(null, key.scope?.uid) == KrxGraphPurgeDecision.UNRESOLVED)
+        if (!outcome.removed) return key to outcome
+        val kept = if (originals.isEmpty() && key.generalTopics.isEmpty() && !key.hasUnstampedKrx) null
+        else lossKey(key.scope, key.invalidations, originals, key.generalTopics, key.hasUnstampedKrx)
+        return kept to outcome
+    }
+
+    private fun retainedTopics(topics: Set<String>, key: Key): Set<String> =
+        topics.filterTo(linkedSetOf()) { !isKrxGraphTopic(it) || key.hasUnstampedKrx || it in key.originalKrxLost }
+
+    private fun mergeAggregate(a: Aggregate, b: Aggregate): Aggregate {
+        val first = if (a.firstSequence <= b.firstSequence) a else b
+        val last = if (a.lastSequence >= b.lastSequence) a else b
+        return Aggregate(a.count + b.count, first.firstSequence, last.lastSequence, first.firstAt, last.lastAt,
+            a.reasons + b.reasons, a.topics + b.topics, a.paths + b.paths, a.authorities + b.authorities,
+            mergeKrxLoss(a.krxLost, b.krxLost))
     }
 
     /**
