@@ -58,8 +58,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 S6-3a(`24ea81c`: KRX 구독 실제 정리·세션 메모리 purge, 스위치 꺼짐, 2026-10-28),
                                 S6-3b-1(`1fff9b8`: 그래프 KRX 원본 귀속·D1 cutoff로 old KRX 접근 차단, 스위치 꺼짐, 2026-10-28),
                                 S6-3b-2(`0302b58`: 그래프 KRX 선택 물리 purge·CAPABILITY memory target, 스위치 꺼짐, 2026-10-28),
-                                S6-3c(`4be5b85`: 알림 탭 의도의 metadata 보존과 KRX tap 선택 폐기, 스위치 꺼짐, 2026-10-29)를
-                                land했다. 다음은 S6-3 완료 판정(3c의 남는 UNKNOWN 보고와 U5/U7 사용자 판단 뒤) → S6-4 기본 꺼짐 준비 →
+                                S6-3c(`4be5b85`: 알림 탭 의도의 metadata 보존과 KRX tap 선택 폐기, 스위치 꺼짐, 2026-10-29),
+                                S6-3c-fix(`e7a5004`: 비KRX pending tap의 인증 경계 귀속, 스위치 꺼짐, 2026-10-29)를
+                                land했다. 다음은 S6-3 완료 판정(남는 UNKNOWN·잔여 보고와 사용자 U7 판단 뒤, U5는 기본 유지) → S6-4 기본 꺼짐 준비 →
                                 S6-2b-2β(최종 동일 후보의 측정용 켬·P1(b))다 (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
@@ -1802,8 +1803,17 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   hosted CI run `40793383536` green. 남는 UNKNOWN(metadata 없는 옛 알림, 값 무효와 서버 registry drift, 귀속 불명, 운영 FCM
   전달, 단말 미실행, 무소비 tap의 메모리 수명)은 사용자 보고 대상이고, 그 때문에 S6-3 완료는 아직 선언하지 않는다.
   디스크 purge(P3-i)는 포함하지 않는다.
-  · 보류: S6-3 완료 선언(3c의 남는 UNKNOWN 보고를 근거로 한
-  사용자 U5/U7 판단), KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
+  · S6-3c-fix `e7a5004` 비KRX pending tap의 인증 경계 귀속(S6-3c-fix 설계 r2·scope r19, 트리 밖 manifest r29): 3c land
+  뒤 JVM 판정에서, 수신 때 USER epoch가 아직 게시되지 않은 정상 BANK tap이 같은 계정에서 영구 미소비되는 진행성 결함을
+  확인했다(같은 입력의 OFF 경로는 처리한다. 실제 단말 cold start의 발생 빈도는 미측정). 분류 NON_KRX이고 수신 identity가
+  유효하며 revision·end sequence·scope에 모순이 없으면 USER epoch 없이 문맥을 확정하고, 그런 tap은 수신 뒤 같은 uid의
+  binding 없는 USER end에서도 보수적으로 제거한다. 나중 snapshot으로 USER epoch·KRX scope를 채우지 않고 KRX 처리는
+  바뀌지 않는다. 운영 변경은 PendingAlertTapOwner.kt 한 파일이다. 설계 검토 2회차 합의, 계약 메서드 13개(F01~F17),
+  단위 9445/0, 변이 16쌍 전부 해당 행 계약 검출, CI 세 변형 로컬 통과, hosted CI run `40891148576` green. 잔여(identity 없는
+  수신 tap의 잔류, end 없는 USER epoch 변화, binding 없는 같은 uid end의 보수 제거, ownerUid 없는 end, 관측하지 못한 중간
+  end)는 사용자 보고 대상이다. scope r19가 r18 머리말의 'U5/U7 답'이 3c 착수 선택이며 U7 승인이 아님을 정정했다.
+  · 보류: S6-3 완료 선언(3c의 남는 UNKNOWN과 3c-fix 잔여 보고를 근거로 한
+  사용자 U7 판단, U5는 기본 유지), KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
   A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
   답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)다. 다음 D4 판 조건은 D4 r6(A2 r8·A1 r9 반영, 트리 밖
   manifest r7)으로 채웠고, 남은 조건은 2b-2 계약의 CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. scope U10(CUT-C01
