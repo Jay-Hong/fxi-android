@@ -291,7 +291,8 @@ internal class PendingAlertTapOwner(private val lock: ReentrantLock = ReentrantL
         if (changed) advanceContext()
     }
 
-    private fun userRetired(context: AlertTapContext, snapshot: TopicAccessSnapshot): Boolean {
+    private fun userRetired(entry: Entry, snapshot: TopicAccessSnapshot): Boolean {
+        val context = entry.context
         if (snapshot.revision <= context.ingressRevision) return false
         val identity = context.identity ?: return false
         val end = snapshot.lastUserEnd
@@ -299,6 +300,9 @@ internal class PendingAlertTapOwner(private val lock: ReentrantLock = ReentrantL
             val binding = end.binding
             if (binding?.ownerUid == identity.uid && binding.authGeneration == identity.authGeneration) return true
             if (binding == null && !context.userAccessEpoch.isNullOrBlank() && end.namespace == context.userAccessEpoch) return true
+            // Epoch-free auth attribution conservatively accepts an unbound end for this uid.
+            if (binding == null && context.userAccessEpoch.isNullOrBlank() && entry.classified &&
+                entry.classification.value == AlertTapClassification.NON_KRX && !contextUnknown(entry)) return true
         }
         val facts = snapshot.facts
         val record = facts.recordFence ?: return false
@@ -337,7 +341,7 @@ internal class PendingAlertTapOwner(private val lock: ReentrantLock = ReentrantL
                 it.revision >= context.ingressRevision && latestLive != identity
             } == true
             when {
-                identity in retiredIdentities || liveEnded || proofs.any { userRetired(context, it) } -> {
+                identity in retiredIdentities || liveEnded || proofs.any { userRetired(entry, it) } -> {
                     iterator.remove()
                     removedUser++
                 }
@@ -361,8 +365,8 @@ internal class PendingAlertTapOwner(private val lock: ReentrantLock = ReentrantL
     private fun contextUnknown(entry: Entry): Boolean {
         val context = entry.context
         val identity = context.identity
-        if (identity == null || identity.uid.isBlank() || identity.authGeneration < 0L ||
-            context.userAccessEpoch.isNullOrBlank()) return true
+        if (identity == null || identity.uid.isBlank() || identity.authGeneration < 0L) return true
+        if (context.userAccessEpoch.isNullOrBlank() && entry.classification.value != AlertTapClassification.NON_KRX) return true
         if (context.ingressRevision < 0L || context.userEndSequence < 0L || context.capabilityEndSequence < 0L ||
             !scopeMatches(context)) return true
         return entry.classification.value == AlertTapClassification.KRX && context.scope == null
@@ -379,7 +383,7 @@ internal class PendingAlertTapOwner(private val lock: ReentrantLock = ReentrantL
     private fun hasPendingPredecessor(entry: Entry, snapshot: TopicAccessSnapshot, live: AuthIdentityFence?): Boolean =
         entries.values.any { earlier ->
             earlier.ticket.sequence < entry.ticket.sequence && earlier.delivery != Delivery.UNHANDLED &&
-                eligible(earlier, snapshot, live) && !userRetired(earlier.context, snapshot) &&
+                eligible(earlier, snapshot, live) && !userRetired(earlier, snapshot) &&
                 (earlier.classification.value != AlertTapClassification.KRX || !capabilityRetired(earlier.context, snapshot))
         }
 
@@ -526,7 +530,7 @@ internal class PendingAlertTapOwner(private val lock: ReentrantLock = ReentrantL
         val entry = reservation.entry
         val context = entry.context
         val userEnded = context.identity != null && snapshot.revision >= context.ingressRevision &&
-            context.identity != identity || userRetired(context, snapshot)
+            context.identity != identity || userRetired(entry, snapshot)
         val capabilityEnded = reservation.classified && reservation.classification == AlertTapClassification.KRX &&
             capabilityRetired(context, snapshot)
         val eligible = reservation.classified && reservation.classification != AlertTapClassification.UNKNOWN &&
