@@ -1,0 +1,30 @@
+{
+ "head_commit": "0302b582e5aa22ca1223bee229a5c9d44947ef22",
+ "tree": "5fca04cdcb25376f93bf6b383dfb7fcbf6cfab22",
+ "archive_sha256": "154736c5b2f3c3df4fc50b1eb905494b8c3161ef29a8ab37cf95d72c06a02b46",
+ "probe_source_sha256": "510add6ca0cdf4e35d69b56c74af1e66dd134c47537e1d85b4a85f5d9e5c7ad5",
+ "command": [
+  "./gradlew",
+  ":app:testCiMinifiedUnitTest",
+  "--offline",
+  "--no-daemon",
+  "--console=plain",
+  "-I",
+  "/Users/jay/logs/fxi-android-evidence/2026-09-26-d2b6-plan/R4c/S6/s6_3/o04_3c_head/capture.init.gradle",
+  "-Ds63c.o04.tapTraceOut=/Users/jay/logs/fxi-android-evidence/2026-09-26-d2b6-plan/R4c/S6/s6_3/o04_3c_head/o04_tap_admitted.json",
+  "--tests",
+  "com.jay.fxi.service.S6PendingTap0302HeadProbe.writeTapTraceOnlyWhenRequested"
+ ],
+ "cwd": "/Users/jay/fxi-worktrees/s6-3c-head-archive",
+ "jdk": "Temurin OpenJDK 17.0.18 (arm64)",
+ "gradle": "9.1.0 (wrapper)",
+ "sdk": "ANDROID_HOME=$HOME/Library/Android/sdk",
+ "variant": "ciMinified",
+ "rc": 0,
+ "xml_sha256": "7b2dff2c7498145cae410eea0354f048e6151271b510b99c01e9841269d8ba75",
+ "raw_output_sha256": "810182747941fdefee650b6b3f3e3fb1edc5bed99fec67740776dd58820279e8",
+ "normalizer_sha256": "6ea90829cda0437689e88ea4124234413a63860949da8660b05cd64c6fe8941a",
+ "normalizer": "identity copy (package_o04.py)",
+ "output_sha256": "810182747941fdefee650b6b3f3e3fb1edc5bed99fec67740776dd58820279e8",
+ "d24_profile": "admitted"
+}

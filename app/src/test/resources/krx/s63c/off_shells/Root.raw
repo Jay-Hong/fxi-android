@@ -1,0 +1,5 @@
+
+        val event = pendingEvent ?: return@LaunchedEffect
+        alertEventBus?.emit(event)
+        onPendingAlertEventConsumed()
+    

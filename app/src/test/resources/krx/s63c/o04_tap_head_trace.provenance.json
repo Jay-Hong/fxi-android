@@ -1,0 +1,14 @@
+{
+ "head_commit": "0302b582e5aa22ca1223bee229a5c9d44947ef22",
+ "tree": "5fca04cdcb25376f93bf6b383dfb7fcbf6cfab22",
+ "output_sha256": "4b76e044e8aa680244613820feae812e2400c8b181c64d125840dda015d22824",
+ "bundled_from": {
+  "closed": "2d8cf0d7eb9b30aebb47472a25fea214c2c7860a341857b3a36cc8e56f5151a5",
+  "admitted": "810182747941fdefee650b6b3f3e3fb1edc5bed99fec67740776dd58820279e8"
+ },
+ "profile_provenance": {
+  "closed": "90aaab0b3326bb4b41942007b8c19fe62539d5c5c1c66deb915bffa79e421a0d",
+  "admitted": "20136d5e327b1a5510a2cc4bd5d32b82b4506d96c92a6026f1cfeb382db052b5"
+ },
+ "normalizer_sha256": "6ea90829cda0437689e88ea4124234413a63860949da8660b05cd64c6fe8941a"
+}

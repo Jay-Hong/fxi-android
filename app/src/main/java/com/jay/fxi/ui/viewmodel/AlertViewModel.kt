@@ -21,6 +21,7 @@ import com.jay.fxi.domain.model.AlertCondition
 import com.jay.fxi.domain.model.AlertSetting
 import com.jay.fxi.domain.model.sortedByCreatedAt
 import com.jay.fxi.service.AlertEvent
+import com.jay.fxi.service.AlertTapReceipt
 import com.jay.fxi.service.AlertEventBus
 import com.jay.fxi.service.AlertPushRouting
 import com.jay.fxi.service.BankAlertAction
@@ -34,6 +35,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -167,6 +169,31 @@ class AlertViewModel @Inject constructor(
 
     init {
         viewModelScope.launch {
+            if (alertEventBus.pendingTapEnabled) {
+                var consumer: AutoCloseable? = null
+                try {
+                    alertEventBus.events.onSubscription {
+                        consumer = alertEventBus.registerPendingTapConsumer()
+                    }.collect { event ->
+                        alertEventBus.consumePendingTap(event) { original ->
+                            when (val action = AlertPushRouting.bankAction(original)) {
+                                is BankAlertAction.Trigger -> {
+                                    handleSettingTriggered(action.settingId)
+                                    AlertTapReceipt.HANDLED
+                                }
+                                BankAlertAction.Refresh -> {
+                                    requestRefresh()
+                                    AlertTapReceipt.HANDLED
+                                }
+                                null -> AlertTapReceipt.UNHANDLED
+                            }
+                        }
+                    }
+                } finally {
+                    consumer?.close()
+                }
+                return@launch
+            }
             alertEventBus.events.collect { event ->
                 when (val action = AlertPushRouting.bankAction(event)) {
                     is BankAlertAction.Trigger -> handleSettingTriggered(action.settingId)

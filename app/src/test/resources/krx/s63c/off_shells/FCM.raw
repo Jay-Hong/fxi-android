@@ -1,0 +1,8 @@
+        val settingId = message.data["setting_id"]?.toIntOrNull()
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_NOTIFICATION_TYPE, type)
+            if (settingId != null) {
+                putExtra(EXTRA_SETTING_ID, settingId)
+            }
+        }

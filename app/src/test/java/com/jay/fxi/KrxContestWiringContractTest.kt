@@ -17,6 +17,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -434,14 +435,25 @@ class KrxContestWiringContractTest {
         assertEquals("CALLER refresh(FORCE_ENTITLEMENTS)", emptySet<String>(), files(call("FORCE_ENTITLEMENTS")))
     }
 
-    /** KW-02: 운영 생성 지점은 스위치를 넘기지 않고, 운영 소스 어디에도 스위치를 켜는 값이 없다. */
+    /** KW-02: S6-3c shares the original OFF provider explicitly; no production ON constructor. */
     @Test fun KW02_productionNeverEnablesTheContest() {
         assertTrue("positive control: the switch type is declared", files(Regex("""class\s+KrxContestSwitch\s*\(""")).isNotEmpty())
         val enabling = Regex("""KrxContestSwitch\s*\(\s*(enabled\s*=\s*)?true\s*\)""")
         assertEquals("KrxContestSwitch(true) in production", emptySet<String>(), files(enabling))
         val call = constructorCall(code.getValue(MODULE))
         assertTrue("positive control: the module call passes named arguments", Regex("""\bsource\s*=""").containsMatchIn(call))
-        assertEquals("krxContest argument in the production construction", 0, Regex("""\bkrxContest\b""").findAll(call).count())
+        fun exactOff(module: String): Boolean {
+            val construction = constructorCall(module)
+            return Regex("""\bkrxContest\s*=\s*provideKrxContestSwitch\(\)""").findAll(construction).count() == 1 &&
+                Regex("""\bkrxContest\b""").findAll(construction).count() == 1 &&
+                Regex("""fun\s+provideKrxContestSwitch\(\)\s*:\s*KrxContestSwitch\s*=\s*KrxContestSwitch\.OFF\b""").findAll(module).count() == 1
+        }
+        assertTrue("contract(KW02): PAC receives the shared exact OFF provider", exactOff(code.getValue(MODULE)))
+        for (replacement in listOf("KrxContestSwitch(true)", "KrxContestSwitch(false)"))
+            assertFalse("contract(KW02): same validator rejects independent provider $replacement",
+                exactOff(code.getValue(MODULE).replace("= KrxContestSwitch.OFF", "= $replacement")))
+        assertFalse("contract(KW02): same validator rejects another PAC mode supplier",
+            exactOff(code.getValue(MODULE).replace("krxContest = provideKrxContestSwitch()", "krxContest = otherSwitch()")))
     }
 
     /** KW-03: 정책 이름은 정책 파일과 PAC에만, 근거 타입 이름은 근거 파일과 PAC에만 있다. PAC는 둘 다 실제로 쓴다. */
@@ -636,11 +648,12 @@ class KrxContestWiringContractTest {
         for (key in listOf(GRAPH_MODULE, PROCESS_GRAPH, RUNTIME)) assertTrue("premise: KW11 the code map has $key", key in code)
         val read = Regex("""\.accessSnapshot\b""")
         val supplier = Regex("""\{\s*coordinator\.accessSnapshot\s*\}""")
-        val expectedReads = mapOf(GRAPH_MODULE to 1, PROCESS_GRAPH to 1, RUNTIME to 1)
-        assertEquals("contract(KW11): exact published snapshot reads include only the one RT supplier", expectedReads, occurrences(read))
-        assertEquals("contract(KW11): all three reads are the supply lambda `{ coordinator.accessSnapshot }`",
+        val bus = GRAPH_MODULE.substringBefore("di/") + "service/AlertEventBus.kt"
+        val expectedReads = mapOf(GRAPH_MODULE to 1, PROCESS_GRAPH to 1, RUNTIME to 1, bus to 1)
+        assertEquals("contract(KW11): exact published snapshot reads include the shared tap bus supplier", expectedReads, occurrences(read))
+        assertEquals("contract(KW11): all four reads are the supply lambda `{ coordinator.accessSnapshot }`",
             expectedReads, occurrences(supplier))
-        for (path in listOf(RUNTIME, GATE)) {
+        for (path in listOf(RUNTIME, GATE, bus)) {
             val extra = code + (path to code.getValue(path) + "\nprivate val extraSnapshot = { coordinator.accessSnapshot }\n")
             val extraReads = expectedReads + (path to ((expectedReads[path] ?: 0) + 1))
             assertEquals("contract(KW11): the same read scan catches an extra supplier in $path", extraReads, occurrences(read, extra))

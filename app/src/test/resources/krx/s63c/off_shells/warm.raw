@@ -1,0 +1,5 @@
+
+        val event = parseAlertEventFromIntent(intent) ?: return
+        alertEventBusProvider.get().emit(event)
+        clearNotificationExtras(intent)
+    

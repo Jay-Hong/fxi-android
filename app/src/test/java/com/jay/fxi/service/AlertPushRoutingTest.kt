@@ -36,6 +36,8 @@ class AlertPushRoutingTest {
     }
 
     @Test fun F05_theBankScreen_actsOnBankEventsAndSyncOnly() {
+        assertNull("contract(F05/carrier): opaque tap cannot bypass bus claim",
+            AlertPushRouting.bankAction(AlertEvent.PendingTap(AlertTapTicket("foreign-owner", 1))))
         assertEquals(BankAlertAction.Trigger(3), AlertPushRouting.bankAction(AlertEvent.SettingTriggered(3, AlertFamily.BANK)))
         assertEquals(BankAlertAction.Refresh, AlertPushRouting.bankAction(AlertEvent.FamilyRefreshNeeded(AlertFamily.BANK)))
         assertEquals(BankAlertAction.Refresh, AlertPushRouting.bankAction(AlertEvent.RefreshNeeded))

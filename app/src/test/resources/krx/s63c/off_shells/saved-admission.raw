@@ -1,0 +1,3 @@
+if (ReleaseAdmission.isOpen && savedInstanceState == null) {
+            parsePendingAlertEvent(intent)
+        }

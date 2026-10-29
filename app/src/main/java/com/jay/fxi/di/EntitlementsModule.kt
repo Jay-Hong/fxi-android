@@ -14,6 +14,7 @@ import com.jay.fxi.data.entitlements.DataStoreAccessEpochStore
 import com.jay.fxi.data.entitlements.AuthenticatedEntitlementsSource
 import com.jay.fxi.data.entitlements.EntitlementsSource
 import com.jay.fxi.data.entitlements.EpochIdGenerator
+import com.jay.fxi.data.entitlements.KrxContestSwitch
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.RecheckClock
 import com.jay.fxi.data.entitlements.UnimplementedScopePurger
@@ -38,6 +39,10 @@ import kotlinx.coroutines.SupervisorJob
 @Module
 @InstallIn(SingletonComponent::class)
 object EntitlementsModule {
+
+    @Provides
+    @Singleton
+    fun provideKrxContestSwitch(): KrxContestSwitch = KrxContestSwitch.OFF
 
     /** I4: epochs are opaque UUIDs, never reused and never reset to a sentinel. */
     @Provides
@@ -100,7 +105,8 @@ object EntitlementsModule {
         // The same read an app sign-out captures its fence with.
         liveFence = authTokenProvider::currentIdentityFence,
         // The provider's own instance: recovery orders and query orders are compared with each other.
-        orders = orders
+        orders = orders,
+        krxContest = provideKrxContestSwitch()
     )
 
     /**

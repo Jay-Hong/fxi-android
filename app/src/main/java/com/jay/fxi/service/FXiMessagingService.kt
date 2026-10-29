@@ -10,6 +10,7 @@ import com.google.firebase.messaging.RemoteMessage
 import com.jay.fxi.MainActivity
 import com.jay.fxi.R
 import com.jay.fxi.admission.ReleaseAdmission
+import com.jay.fxi.data.entitlements.KrxContestSwitch
 import com.jay.fxi.subscription.SubscriptionManager
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
@@ -25,6 +26,8 @@ class FXiMessagingService : FirebaseMessagingService() {
     @Inject lateinit var pushNotificationManagerProvider: Provider<PushNotificationManager>
     @Inject lateinit var subscriptionManagerProvider: Provider<SubscriptionManager>
     @Inject lateinit var alertEventBusProvider: Provider<AlertEventBus>
+
+    @Inject lateinit var krxContestSwitch: KrxContestSwitch
 
     private val serviceScope by lazy { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
 
@@ -76,6 +79,9 @@ class FXiMessagingService : FirebaseMessagingService() {
             if (settingId != null) {
                 putExtra(EXTRA_SETTING_ID, settingId)
             }
+        }
+        if (krxContestSwitch.enabled) {
+            AlertTapEntry.copyForegroundClassification(message.data, AndroidAlertTapExtras(intent))
         }
         // 고유 notificationId를 requestCode로 사용 (동일 알림 업데이트 보장)
         val notificationId = System.currentTimeMillis().toInt()

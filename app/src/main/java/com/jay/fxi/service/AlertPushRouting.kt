@@ -42,5 +42,6 @@ object AlertPushRouting {
         is AlertEvent.FamilyRefreshNeeded ->
             if (event.family == AlertFamily.BANK) BankAlertAction.Refresh else null
         AlertEvent.RefreshNeeded -> BankAlertAction.Refresh
+        is AlertEvent.PendingTap -> null
     }
 }

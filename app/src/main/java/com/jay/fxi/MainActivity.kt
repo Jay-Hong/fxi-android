@@ -8,6 +8,10 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.jay.fxi.admission.ReleaseAdmission
+import com.jay.fxi.data.entitlements.KrxContestSwitch
+import com.jay.fxi.service.AlertTapCaptureResult
+import com.jay.fxi.service.AlertTapEntry
+import com.jay.fxi.service.AndroidAlertTapExtras
 import com.jay.fxi.service.AlertEvent
 import com.jay.fxi.service.AlertEventBus
 import com.jay.fxi.service.AlertPushRouting
@@ -29,6 +33,9 @@ class MainActivity : ComponentActivity() {
 
     @Inject
     lateinit var alertEventBusProvider: Provider<AlertEventBus>
+
+    @Inject
+    lateinit var krxContestSwitch: KrxContestSwitch
 
     // 새 Activity 인스턴스에서 pending 이벤트 저장 (Compose 준비 후 처리)
     private val _pendingAlertEvent = MutableStateFlow<AlertEvent?>(null)
@@ -70,18 +77,36 @@ class MainActivity : ComponentActivity() {
      * 새 Activity 생성 시 Intent에서 AlertEvent 파싱 (Compose 준비 후 처리)
      */
     private fun parsePendingAlertEvent(intent: Intent?) {
+        if (krxContestSwitch.enabled) {
+            if (intent == null) return
+            val result = AlertTapEntry.intakeNew(
+                AndroidAlertTapExtras(intent), false, alertEventBusProvider.get().pendingTapIntake()
+            )
+            if (result is AlertTapCaptureResult.CAPTURED) {
+                _pendingAlertEvent.value = AlertEvent.PendingTap(result.ticket)
+            }
+        } else {
         val event = parseAlertEventFromIntent(intent) ?: return
         _pendingAlertEvent.value = event
         clearNotificationExtras(intent)
+    }
     }
 
     /**
      * 앱 실행 중 알림 탭 Intent 처리 (즉시 emit)
      */
     private fun handleNotificationIntent(intent: Intent?) {
+        if (krxContestSwitch.enabled) {
+            if (intent == null) return
+            AlertTapEntry.intakeWarm(
+                extras = AndroidAlertTapExtras(intent),
+                intake = alertEventBusProvider.get().pendingTapIntake()
+            )
+        } else {
         val event = parseAlertEventFromIntent(intent) ?: return
         alertEventBusProvider.get().emit(event)
         clearNotificationExtras(intent)
+    }
     }
 
     private fun parseAlertEventFromIntent(intent: Intent?): AlertEvent? {

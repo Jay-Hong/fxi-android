@@ -1,0 +1,8 @@
+
+        // 커스텀 extras (FXiMessagingService)
+        intent?.removeExtra(FXiMessagingService.EXTRA_NOTIFICATION_TYPE)
+        intent?.removeExtra(FXiMessagingService.EXTRA_SETTING_ID)
+        // 서버 FCM data payload 키
+        intent?.removeExtra("type")
+        intent?.removeExtra("setting_id")
+    

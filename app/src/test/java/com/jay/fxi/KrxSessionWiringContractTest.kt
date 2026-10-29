@@ -30,7 +30,13 @@ class KrxSessionWiringContractTest {
         assertTrue("premise: Z01 scan finds PAC constructor switch", found(pac, """krxContest\s*:\s*KrxContestSwitch"""))
         assertTrue("premise: Z01 module constructs real PAC", found(module, """PremiumAccessCoordinator\s*\("""))
         assertTrue("contract(Z01): PAC default OFF", found(pac, """krxContest\s*:\s*KrxContestSwitch\s*=\s*KrxContestSwitch\.OFF"""))
-        assertFalse("contract(Z01): production provider passes no ON switch", found(module, """krxContest\s*="""))
+        fun exactOff(text: String): Boolean =
+            Regex("""krxContest\s*=\s*provideKrxContestSwitch\(\)""").findAll(text).count() == 1 &&
+                Regex("""fun\s+provideKrxContestSwitch\(\)\s*:\s*KrxContestSwitch\s*=\s*KrxContestSwitch\.OFF\b""").findAll(text).count() == 1 &&
+                Regex("""\bkrxContest\s*=""").findAll(text).count() == 1
+        assertTrue("contract(Z01): PAC explicitly receives shared OFF switch", exactOff(module))
+        assertFalse("contract(Z01): same validator rejects ON provider", exactOff(module.replace("= KrxContestSwitch.OFF", "= KrxContestSwitch(" + "true)")))
+        assertFalse("contract(Z01): same validator rejects alternate provider", exactOff(module.replace("krxContest = provideKrxContestSwitch()", "krxContest = other()")))
         assertEquals("contract(Z01): production DESIRED remains the five GENERAL topics", setOf("fx:usd-krw", "fx:jpy-krw", "fx:eur-krw", "usdt:krw", "dxy:spot"), TopicCatalogue.DESIRED)
         val all = listOf("src/main/java", "src/productionBindings/java", "src/s5Benchmark/java", "src/debug/java", "src/benchmark/java")
             .flatMap { File(it).walkTopDown().filter { f -> f.isFile && f.extension == "kt" }.toList() }

@@ -49,6 +49,7 @@ import com.jay.fxi.data.remote.TopicRuntimeOwner
 import com.jay.fxi.domain.model.AuthState
 import com.jay.fxi.ui.free.FreeSnapshotRoute
 import com.jay.fxi.service.AlertEvent
+import com.jay.fxi.service.AlertTapEntry
 import com.jay.fxi.service.AlertEventBus
 import com.jay.fxi.subscription.SubscriptionManager
 import com.jay.fxi.ui.auth.AuthViewModel
@@ -125,9 +126,22 @@ private fun ArmedRootScreen(
     // Cold-start alert intent, once Compose is ready.
     val pendingEvent by pendingAlertEvent?.collectAsStateWithLifecycle() ?: remember { mutableStateOf(null) }
     LaunchedEffect(pendingEvent) {
+        if (alertEventBus?.pendingTapEnabled == true) {
+            val event = pendingEvent ?: return@LaunchedEffect
+            AlertTapEntry.forwardRoot(
+                event = event,
+                hasCustody = { candidate -> alertEventBus.forwardPendingTap(candidate) },
+                consumeSlot = { expected ->
+                    if (AlertTapEntry.clearSlot(pendingAlertEvent?.value, expected) == null) {
+                        onPendingAlertEventConsumed()
+                    }
+                }
+            )
+        } else {
         val event = pendingEvent ?: return@LaunchedEffect
         alertEventBus?.emit(event)
         onPendingAlertEventConsumed()
+    }
     }
 
     LaunchedEffect(authState) {

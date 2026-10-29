@@ -1,0 +1,31 @@
+{
+ "head_commit": "0302b582e5aa22ca1223bee229a5c9d44947ef22",
+ "tree": "5fca04cdcb25376f93bf6b383dfb7fcbf6cfab22",
+ "archive_sha256": "154736c5b2f3c3df4fc50b1eb905494b8c3161ef29a8ab37cf95d72c06a02b46",
+ "probe_source_sha256": "15eef6038d8ad3e23c6dedcf431d67ca0863124da14cb3e47b1698eb949a5476",
+ "command": [
+  "./gradlew",
+  ":app:testDebugUnitTest",
+  "--offline",
+  "--no-daemon",
+  "--console=plain",
+  "-I",
+  "/Users/jay/logs/fxi-android-evidence/2026-09-26-d2b6-plan/R4c/S6/s6_3/o04_3c_head/capture.init.gradle",
+  "-Ds63c.o04.sourceRoot=/Users/jay/fxi-worktrees/s6-3c-head-archive/app/src/main/java/com/jay/fxi",
+  "-Ds63c.o04.shellOut=/Users/jay/logs/fxi-android-evidence/2026-09-26-d2b6-plan/R4c/S6/s6_3/o04_3c_head/off_shells",
+  "--tests",
+  "com.jay.fxi.S6Krx3cO04CaptureTest.extractRawSpansOnlyWhenRequested"
+ ],
+ "cwd": "/Users/jay/fxi-worktrees/s6-3c-head-archive",
+ "jdk": "Temurin OpenJDK 17.0.18 (arm64)",
+ "gradle": "9.1.0 (wrapper)",
+ "sdk": "ANDROID_HOME=$HOME/Library/Android/sdk",
+ "variant": "debug",
+ "rc": 0,
+ "xml_sha256": "c3c45968d399f194fff28f6c8e3d23bc5f0515157b32142f259a2fe940d164a2",
+ "raw_output_sha256": "e8018f918bd68e96e48c4abbe196cc235468f11fec1c3d38184449f75b23f847",
+ "normalizer_sha256": "6ea90829cda0437689e88ea4124234413a63860949da8660b05cd64c6fe8941a",
+ "normalizer": "identity copy (package_o04.py)",
+ "output_sha256": "e8018f918bd68e96e48c4abbe196cc235468f11fec1c3d38184449f75b23f847",
+ "wrapper_source_sha256": "4ae8ca1d1854c1a44dfd8b736caeeb43f4aefaf1dd79aadec0f6384dc2c53d20"
+}

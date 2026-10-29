@@ -1,0 +1,5 @@
+
+        val event = parseAlertEventFromIntent(intent) ?: return
+        _pendingAlertEvent.value = event
+        clearNotificationExtras(intent)
+    

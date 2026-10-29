@@ -173,9 +173,9 @@ class S6Krx3bOffWiringContractTest {
     @Test fun o08_sourceInventoriesRejectUnapprovedExpansion() {
         val sources = sourceInventory()
         assertTrue("premise: O08 scans every production root", ROOTS.all { File(it).isDirectory } && sources.size > 300)
-        assertTrue("contract(O08): exactly the 13 approved paths exist", ALLOWED.all { it in sources })
+        assertTrue("contract(O08): exactly the 23 approved historical union paths exist", ALLOWED.all { it in sources })
         val raw = sources.keys.filter { it !in ALLOWED }.sorted()
-        assertEquals("contract(O08): protected HEAD file count", 346, raw.size)
+        assertEquals("contract(O08): protected HEAD file count", 339, raw.size)
         val bytes = raw.joinToString("") { "$it\u0000${sha(File(it).readBytes())}\n" }
         assertEquals("contract(O08): protected HEAD raw bytes", BASELINE, sha(bytes.toByteArray(Charsets.UTF_8)))
         val ingress = setOf("data/graph/KrxGraphFence.kt", "data/remote/TopicSessionCoordinator.kt", "data/remote/TopicRuntime.kt",
@@ -221,8 +221,11 @@ class S6Krx3bOffWiringContractTest {
             "data/remote/TopicGraphLossLedger.kt",
             "ui/premium/graph/GraphV2ScreenStateHolder.kt",
             "data/entitlements/purge/PurgeManifest.kt",
-            "data/entitlements/purge/GraphRecorderPurgeAdapter.kt").map { BASE + it }.toSet()
-        internal const val BASELINE = "8b2e9746a70ddbb31a7e155130a04f3a08d6f1cada97959376cf2c016664dd9f"
+            "data/entitlements/purge/GraphRecorderPurgeAdapter.kt",
+            "MainActivity.kt", "ui/screen/RootScreen.kt", "service/AlertEventBus.kt", "service/AlertPushRouting.kt",
+            "service/FXiMessagingService.kt", "ui/viewmodel/AlertViewModel.kt", "di/EntitlementsModule.kt",
+            "service/PendingAlertTapOwner.kt", "service/AlertTapEntry.kt", "service/AndroidAlertTapExtras.kt").map { BASE + it }.toSet()
+        internal const val BASELINE = "db88915194fa4b68b10689bd096340d77f51bb3bf207efd0c4628334e005d05c"
         internal fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
         internal fun sourceInventory() = ROOTS.flatMap { root -> File(root).walkTopDown()
             .filter { it.isFile && it.extension == "kt" }.map { it.invariantSeparatorsPath to KrxSessionSourceContract.strip(it.readText()) }.toList() }.toMap()
