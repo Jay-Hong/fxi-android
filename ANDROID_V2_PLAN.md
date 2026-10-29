@@ -57,8 +57,9 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 S6-2b-2α(`48bb96a`: KRX 세션 허가 소비·typed 송신·REST 사다리, 스위치 꺼짐, 2026-10-28),
                                 S6-3a(`24ea81c`: KRX 구독 실제 정리·세션 메모리 purge, 스위치 꺼짐, 2026-10-28),
                                 S6-3b-1(`1fff9b8`: 그래프 KRX 원본 귀속·D1 cutoff로 old KRX 접근 차단, 스위치 꺼짐, 2026-10-28),
-                                S6-3b-2(`0302b58`: 그래프 KRX 선택 물리 purge·CAPABILITY memory target, 스위치 꺼짐, 2026-10-28)를
-                                land했다. 다음은 scope r17 순서대로 S6-3c → S6-4 기본 꺼짐 준비 →
+                                S6-3b-2(`0302b58`: 그래프 KRX 선택 물리 purge·CAPABILITY memory target, 스위치 꺼짐, 2026-10-28),
+                                S6-3c(`4be5b85`: 알림 탭 의도의 metadata 보존과 KRX tap 선택 폐기, 스위치 꺼짐, 2026-10-29)를
+                                land했다. 다음은 S6-3 완료 판정(3c의 남는 UNKNOWN 보고와 U5/U7 사용자 판단 뒤) → S6-4 기본 꺼짐 준비 →
                                 S6-2b-2β(최종 동일 후보의 측정용 켬·P1(b))다 (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
@@ -1785,8 +1786,24 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   동작 기준으로 시험 결함이라 판정했다가 철회했다. 상한은 누적 4시간 재산정 뒤 scope r17로 8h → 10h. 계약 메서드
   21개와 기존 시험 명시 개정 8파일(P07·G32 포함). 단위 9406/0, 스텁 실패 26 전부 계약 표식, 변이 25쌍 전부 해당 행
   계약 검출, CI 세 변형 로컬 통과, hosted CI run `40695775153` green. pending tap(3c), 디스크 purge(P3-i)는 포함하지 않는다.
-  · 보류: pending tap(S6-3c, 착수 전 미분류 탭 처리
-  사용자 질문 U5/U7), KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
+  · S6-3c `4be5b85` 알림 탭 의도의 metadata 보존과 KRX tap 선택 폐기(S6-3c 설계 r2·scope r18·seam r7, 트리 밖
+  manifest r28): 착수 전 질문에 사용자가 첫째(현재 계약 유지, 남는 UNKNOWN을 보고한 뒤 U5/U7은 별도 결정)로 진행을
+  지시했다(2026-10-29). 서버 push의 source/asset·좌우 pair를
+  exact tuple로 분류하고 설정 lookup은 쓰지 않는다(scope r18이 r17의 조회 의존 서술을 명시 개정). 누락·빈값·미등록·
+  형식 오류·귀속 불명은 UNKNOWN으로 격리해 소비하지 않는다. pending tap은 process singleton owner가 소유하고, custody와
+  소비 ACK를 나눠 HANDLED만 정상 ACK로 본다. 소비자가 없는 SOURCE·COMPARISON은 UNHANDLED로 보존한다. 명시 CAPABILITY
+  end·확정 rotation은 분류된 KRX tap만, USER 종료·UID 교체는 old owner의 tap 전부를 지운다. 소비는 예약 → lock 밖 두
+  판독 → 비차단 최종 대조 → CLAIMED → lock 밖 callback 순서다. 독립 검토가 F01(판독과 claim 사이 간격), F02(다른 ticket이
+  서로를 무효화), F03(detach 뒤 재예약), F04(재시도 뒤 FIFO 역전)를 차례로 찾아 보완한 뒤 4회차에 승인했다. OFF는 같은
+  KrxContestSwitch.OFF를 DI로 PAC와 공유하고, Activity·Root·FCM의 OFF 본문을 0302 원문 바이트로 결속한다. CI가 단말
+  시험을 실행하지 않아 Android 비의존 진입 객체를 JVM에서 실행하고, 실제 0302 HEAD의 graph·tap trace와 OFF 원문 span을
+  동결해 비교했다. 단말 Activity/Compose/PendingIntent/FCM 실행은 하지 않았다(β 단말 확인 목록). 계약 메서드 23개와 기존
+  시험 명시 개정 5파일. 단위 9432/0, 스텁 실패 19 전부 계약 표식, 변이 40쌍 전부 해당 행 계약 검출, CI 세 변형 로컬 통과,
+  hosted CI run `40793383536` green. 남는 UNKNOWN(metadata 없는 옛 알림, 값 무효와 서버 registry drift, 귀속 불명, 운영 FCM
+  전달, 단말 미실행, 무소비 tap의 메모리 수명)은 사용자 보고 대상이고, 그 때문에 S6-3 완료는 아직 선언하지 않는다.
+  디스크 purge(P3-i)는 포함하지 않는다.
+  · 보류: S6-3 완료 선언(3c의 남는 UNKNOWN 보고를 근거로 한
+  사용자 U5/U7 판단), KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
   A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
   답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)다. 다음 D4 판 조건은 D4 r6(A2 r8·A1 r9 반영, 트리 밖
   manifest r7)으로 채웠고, 남은 조건은 2b-2 계약의 CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. scope U10(CUT-C01
