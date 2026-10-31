@@ -8,7 +8,12 @@ import kotlinx.coroutines.CoroutineScope
 internal data class KrxBetaPac(
     val coordinator: PremiumAccessCoordinator,
     val check: KrxOnPublicationCheck
-)
+) {
+    private var installedSwitch: KrxContestSwitch? = null
+    val sharedSwitch: KrxContestSwitch get() = checkNotNull(installedSwitch)
+    constructor(coordinator: PremiumAccessCoordinator, check: KrxOnPublicationCheck, sharedSwitch: KrxContestSwitch) :
+        this(coordinator, check) { installedSwitch = sharedSwitch }
+}
 
 internal fun krxBetaPac(
     source: EntitlementsSource,
@@ -26,6 +31,7 @@ internal fun krxBetaPac(
     beforeRejectionRecheckArmed: suspend () -> Unit = {}
 ): KrxBetaPac {
     val check = KrxOnPublicationCheck()
+    val sharedSwitch = KrxContestSwitch(true)
     val coordinator = PremiumAccessCoordinator(
         source = source, store = store, userPurger = userPurger, capabilityPurger = capabilityPurger,
         scope = scope, clock = clock, liveFence = liveFence, orders = orders, jitter = jitter,
@@ -33,8 +39,8 @@ internal fun krxBetaPac(
         beforeRecheckSettled = beforeRecheckSettled,
         onLossReapprovalScheduled = onLossReapprovalScheduled,
         beforeRejectionRecheckArmed = beforeRejectionRecheckArmed,
-        krxContest = KrxContestSwitch(true)
+        krxContest = sharedSwitch
     )
     coordinator.onAccessPublishedForTest = check
-    return KrxBetaPac(coordinator, check)
+    return KrxBetaPac(coordinator, check, sharedSwitch)
 }

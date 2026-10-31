@@ -17,15 +17,22 @@ class TopicBootstrapOrderTest {
     @Test
     fun `each tab shows its price rows and graph live inputs`() {
         assertEquals(
+            "contract(D13): existing TBO/shownBy price rows and live inputs",
             mapOf(
                 FreeTab.NEWS to emptyList(),
-                FreeTab.TETHER to listOf(tether, dxy),
-                FreeTab.USD to listOf(usd, dxy),
+                FreeTab.TETHER to listOf(tether, TopicCatalogue.KRX_FUTURES, dxy),
+                FreeTab.USD to listOf(usd, TopicCatalogue.KRX_FUTURES, dxy),
                 FreeTab.JPY to listOf(jpy),
                 FreeTab.EUR to listOf(eur)
             ),
             FreeTab.entries.associateWith(TopicBootstrapOrder::shownBy)
         )
+    }
+
+    @Test fun bootstrapScopeKeepsTheHeadGeneralInputs() {
+        assertEquals("contract(D13): existing TBO/bootstrap GENERAL scope", mapOf(
+            FreeTab.NEWS to emptyList(), FreeTab.TETHER to listOf(tether, dxy), FreeTab.USD to listOf(usd, dxy),
+            FreeTab.JPY to listOf(jpy), FreeTab.EUR to listOf(eur)), FreeTab.entries.associateWith(TopicBootstrapOrder::bootstrapShownBy))
     }
 
     /** Every tab's plan is the five desired topics exactly once, its own first and then D1's order. */

@@ -7,6 +7,7 @@ import com.jay.fxi.data.auth.AuthFenceStream
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.AuthTokenProvider
+import com.jay.fxi.data.entitlements.KrxContestSwitch
 import com.jay.fxi.data.entitlements.KrxSendReadAuthority
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.PremiumAccessTopicGrantIssuer
@@ -79,7 +80,16 @@ internal class TopicRuntimeFactory internal constructor(
     private val krxSendReader: KrxSendReadAuthority? = null,
     private val krxMemorySnapshot: (() -> TopicAccessSnapshot)? = null
 ) {
-    @Inject
+    private var krxDesiredSwitch: KrxContestSwitch? = null
+    private var created = false
+
+    /** Assembly only: keep the actual shared switch, without reading any authority. */
+    internal fun installKrxDesiredProducer(switch: KrxContestSwitch) {
+        check(!created) { "install KRX desired producer before create" }
+        check(krxDesiredSwitch == null || krxDesiredSwitch === switch) { "KRX desired switch already installed" }
+        krxDesiredSwitch = switch
+    }
+
     constructor(
         tokenProvider: AuthTokenProvider,
         orders: AccessOrderSequence,
@@ -117,6 +127,38 @@ internal class TopicRuntimeFactory internal constructor(
         krxMemorySnapshot = { coordinator.accessSnapshot }
     )
 
+    @Inject
+    constructor(
+        tokenProvider: AuthTokenProvider,
+        orders: AccessOrderSequence,
+        fences: AuthFenceStream,
+        recoveries: AuthCredentialRecoveryStream,
+        coordinator: PremiumAccessCoordinator,
+        bootstrapService: TopicSnapshotBootstrapService,
+        decoder: TopicFrameDecoder,
+        tabs: FreeTabStore,
+        @WireJson json: Json,
+        lastKnown: TopicLastKnownStore,
+        authority: KrxSendReadAuthority,
+        endpoints: ServerEndpoints,
+        sharedSwitch: KrxContestSwitch
+    ) : this(
+        tokenProvider = tokenProvider,
+        orders = orders,
+        fences = fences,
+        recoveries = recoveries,
+        coordinator = coordinator,
+        bootstrapService = bootstrapService,
+        decoder = decoder,
+        tabs = tabs,
+        json = json,
+        lastKnown = lastKnown,
+        authority = authority,
+        endpoints = endpoints
+    ) {
+        installKrxDesiredProducer(sharedSwitch)
+    }
+
     /**
      * S4 CUT-CC4b: with the defaults the session's graph sink is [DormantTopicGraphSink], the deliverer's sink is the session
      * and neither graph connection is installed. A non-dormant [graphSink] reaches the session wrapped detachable; an
@@ -128,6 +170,7 @@ internal class TopicRuntimeFactory internal constructor(
         extraGrantSink: TopicGrantSink? = null,
         krxGraphIngress: KrxGraphIngress = KrxGraphIngress.NONE
     ): TopicRuntime {
+        created = true
         val graphInputs = if (graphSink === DormantTopicGraphSink) null else DetachableTopicGraphSink(graphSink, krxGraphIngress)
         val graphGrants = extraGrantSink?.let { DetachableTopicGrantSink(it) }
         val scope = newScope()
@@ -165,6 +208,7 @@ internal class TopicRuntimeFactory internal constructor(
             onRejectedWithMarker = { owner, rejected, marker -> deliverer.forwardRejection(owner, rejected, marker) },
             graphSink = graphInputs ?: DormantTopicGraphSink
         )
+        krxDesiredSwitch?.let { session.installKrxDesiredProducer(it) }
         val dispatcher = scope.coroutineContext[ContinuationInterceptor] as CoroutineDispatcher
         deliverer = TopicGrantDeliverer(
             issuer = issuer,

@@ -44,6 +44,9 @@ class KrxSessionWiringContractTest {
         assertFalse("contract(Z01): no producer appends KRX to DESIRED", all.any {
             found(strip(it.readText()), """DESIRED\s*\+\s*(?:setOf\s*\()?TopicCatalogue\.KRX_FUTURES""")
         })
+        val runtime = main("data/remote/TopicRuntime.kt")
+        assertEquals("contract(Z01): runtime conditional producer installed once", 1,
+            Regex("""session\.installKrxDesiredProducer\s*\(""").findAll(body(runtime, "create")).count())
         assertTrue("premise: Z01 catalogue names KRX for positive control", session.contains("KRX_FUTURES"))
     }
 
@@ -131,10 +134,13 @@ class KrxSessionWiringContractTest {
         val actual = tests.walkTopDown().filter { it.isFile && it.extension == "kt" && pattern.containsMatchIn(it.readText()) }
             .map { it.relativeTo(tests).invariantSeparatorsPath }.toSet()
         // α-1b preserves the α-1a authoring inventory and freezes the expanded exact search separately.
-        val current = Json.parseToJsonElement(inventoryResource("a1b/rejection_inventory.json")).jsonObject
+        val current = Json.parseToJsonElement(javaClass.classLoader.getResourceAsStream("krx/s64a/rejection_inventory.json")!!.bufferedReader().use { it.readText() }).jsonObject
         val locked = current.getValue("current_search_files").jsonArray.map { it.jsonPrimitive.content }.toSet()
         assertTrue("premise: Z03 search finds preserved fixture", actual.contains("data/entitlements/KrxContestHarness.kt"))
         assertEquals("contract(Z03): re-inventory covers every current hit", locked, actual)
+        val mappedFiles = current.getValue("current_hits").jsonArray.map { it.jsonObject.getValue("file").jsonPrimitive.content }.toSet()
+        assertEquals("contract(Z03): current hit mapping has no unlisted or omitted file", locked, mappedFiles)
+
         val amendments = baseline.sumOf { entry -> entry.jsonObject.getValue("methods").jsonArray.count {
             it.jsonObject.getValue("classification").jsonPrimitive.content.contains("명시 개정")
         } }
@@ -215,6 +221,8 @@ class KrxSessionWiringContractTest {
             """krxMemorySnapshot\s*=\s*krxMemorySnapshot\b"""))
         // S6-3b-1: the existing detachable input wrapper is also the ingress. No independent port.
         val create = body(runtime, "create")
+        assertEquals("contract(Z04): TSC installer call stays in create exactly once", 1,
+            Regex("""session\.installKrxDesiredProducer\s*\(""").findAll(create).count())
         assertEquals("contract(Z04): exactly one TSC ingress argument in RT", 1,
             Regex("""krxGraphIngress\s*=\s*graphInputs""").findAll(create).count())
         assertTrue("contract(Z04): wrapper receives actual ingress", found(create,

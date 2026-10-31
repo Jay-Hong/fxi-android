@@ -1,5 +1,7 @@
 package com.jay.fxi.data.remote
 
+import com.jay.fxi.data.remote.A1aHeadTopicBootstrapOrder as TopicBootstrapOrder
+
 import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthCredentialRecovery
 import com.jay.fxi.data.auth.AuthIdentityChangedException

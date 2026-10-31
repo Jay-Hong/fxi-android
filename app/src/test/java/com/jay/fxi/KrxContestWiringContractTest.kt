@@ -1007,8 +1007,30 @@ class KrxContestWiringContractTest {
 
         val inject = Regex("""@Inject\s+constructor\s*\(""").find(runtime)
         assertTrue("premise: KW14 TopicRuntimeFactory has an @Inject constructor", inject != null)
-        val injectHead = checkNotNull(inject) { "KW14 TopicRuntimeFactory has no @Inject constructor" }
-        val injected = checkNotNull(argumentSpan(runtime, injectHead.range.last)) { "KW14 @Inject constructor does not close" }
+        val newInjectHead = checkNotNull(inject) { "KW14 TopicRuntimeFactory has no @Inject constructor" }
+        val newInjected = checkNotNull(argumentSpan(runtime, newInjectHead.range.last)) { "KW14 new @Inject constructor closes" }
+        val newParameters = splitTopLevel(newInjected).map(::parameter)
+        assertEquals("contract(KW14): DI carries a required shared switch", listOf(Parameter("sharedSwitch", "KrxContestSwitch", null)),
+            newParameters.filter { it.name == "sharedSwitch" })
+        // Existing DI constructor keeps its argument list, delegates to primary, and loses only @Inject.
+        val injectHead = Regex("""\bconstructor\s*\(""").findAll(runtime).single { head ->
+            val args = argumentSpan(runtime, head.range.last).orEmpty()
+            Regex("""\bbootstrapService\s*:""").containsMatchIn(args) && !Regex("""\bKrxContestSwitch\b""").containsMatchIn(args)
+        }
+        val injected = checkNotNull(argumentSpan(runtime, injectHead.range.last)) { "KW14 preserved DI constructor closes" }
+        val oldParameters = splitTopLevel(injected).map(::parameter)
+        assertEquals("contract(KW14): new DI appends only sharedSwitch to old arguments", oldParameters + Parameter("sharedSwitch", "KrxContestSwitch", null), newParameters)
+        val newAfter = runtime.substring(newInjectHead.range.last + newInjected.length + 2)
+        val newDelegation = checkNotNull(Regex("""^\s*:\s*this\s*\(""").find(newAfter)) { "contract(KW14): new DI delegates" }
+        val newPassed = namedArguments(checkNotNull(argumentSpan(newAfter, newDelegation.range.last)), "KW14 new DI")
+        val oldIdentifiers = oldParameters.map { parameter ->
+            val identifier = parameter.name.removePrefix("@WireJson ")
+            check(Regex("[A-Za-z_]\\w*").matches(identifier)) { "KW14 invalid delegation identifier: ${parameter.name}" }
+            identifier to identifier
+        }
+        assertEquals("contract(KW14): new DI delegates identical old objects", oldIdentifiers, newPassed)
+        assertEquals("contract(KW14): Factory switch installer receives DI object once", 1,
+            Regex("""(?<!fun )\binstallKrxDesiredProducer\s*\(\s*sharedSwitch\s*\)""").findAll(newAfter).count())
         assertTrue("KW14 the @Inject constructor's authority is the internal send-read type (D-3 (i′))",
             Regex("""\bauthority\s*:\s*([\w.]+\.)?KrxSendReadAuthority\b""").containsMatchIn(injected))
         val afterInject = runtime.substring(injectHead.range.last + injected.length + 2)
@@ -1079,10 +1101,11 @@ class KrxContestWiringContractTest {
             val factory = map[BETA_FACTORY].orEmpty()
             val constructsCheck = Regex("""\bval\s+check\s*=\s*KrxOnPublicationCheck\s*\(\s*\)""")
             val installsCheck = Regex("""\bcoordinator\.onAccessPublishedForTest\s*=\s*check\b""")
-            val returnsBoth = Regex("""\breturn\s+KrxBetaPac\s*\(\s*coordinator\s*,\s*check\s*\)""")
+            val returnsBoth = Regex("""\breturn\s+KrxBetaPac\s*\(\s*coordinator\s*,\s*check\s*,\s*sharedSwitch\s*\)""")
             if (!constructsCheck.containsMatchIn(factory) || !installsCheck.containsMatchIn(factory) ||
                 !returnsBoth.containsMatchIn(factory) || callSpans(factory, "PremiumAccessCoordinator").size != 1 ||
-                !Regex("""\bkrxContest\s*=\s*KrxContestSwitch\s*\(\s*true\s*\)""").containsMatchIn(factory)) {
+                !Regex("""\bval\s+sharedSwitch\s*=\s*KrxContestSwitch\s*\(\s*true\s*\)""").containsMatchIn(factory) ||
+                !Regex("""\bkrxContest\s*=\s*sharedSwitch\b""").containsMatchIn(factory)) {
                 broken += BETA_FACTORY
             }
             for ((key, text) in map) {
@@ -1119,7 +1142,7 @@ class KrxContestWiringContractTest {
         assertEquals("KW15 β negative: checker installation removed", setOf(BETA_FACTORY),
             betaViolations(tests + (BETA_FACTORY to factoryText.replace("coordinator.onAccessPublishedForTest = check", ""))))
         assertEquals("KW15 β negative: returned checker replaced", setOf(BETA_FACTORY),
-            betaViolations(tests + (BETA_FACTORY to factoryText.replace("return KrxBetaPac(coordinator, check)", "return KrxBetaPac(coordinator, KrxOnPublicationCheck())"))))
+            betaViolations(tests + (BETA_FACTORY to factoryText.replace("return KrxBetaPac(coordinator, check, sharedSwitch)", "return KrxBetaPac(coordinator, KrxOnPublicationCheck(), sharedSwitch)"))))
         assertEquals("KW15 β negative: teardown assertion removed", setOf(probeKey),
             betaViolations(tests + (probeKey to probeText.replace("pac.check.assertHeld()", "Unit"))))
         val fakeBeta = "${T}FakeBetaCheckOutsideFinally.kt" to

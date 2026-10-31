@@ -191,7 +191,7 @@ class PremiumTopicBannerContractTest {
 
     @Test fun `B3-04 a tab's topics are its price rows and its graph's live inputs, whatever rows are hidden`() = runTest {
         val scope = mapOf(
-            FreeTab.TETHER to setOf(tether, dxy), FreeTab.USD to setOf(usd, dxy), FreeTab.JPY to setOf(jpy), FreeTab.EUR to setOf(eur),
+            FreeTab.TETHER to setOf(tether, krx, dxy), FreeTab.USD to setOf(usd, krx, dxy), FreeTab.JPY to setOf(jpy), FreeTab.EUR to setOf(eur),
             FreeTab.NEWS to emptySet()
         )
         val h = Harness(this)
@@ -200,12 +200,21 @@ class PremiumTopicBannerContractTest {
             h.focus.value = OwnedTopicFocus(a1, tab)
             h.display.value = state(topics(topic to degraded())); runCurrent()
             val expected = if (topic in scope.getValue(tab)) topicLine(TopicBannerReason.DELIVERY_DELAYED, true) else null
-            assertEquals("B3-04 $topic on $tab", expected, h.banner())
+            assertEquals("contract(B3-04): $topic on $tab", expected, h.banner())
+        }
+        for (tab in listOf(FreeTab.TETHER, FreeTab.USD)) {
+            h.focus.value = OwnedTopicFocus(a1, tab)
+            h.display.value = state(topics(krx to degraded().copy(desired = false))); runCurrent()
+            assertNull("contract(B3-04): desired=false stale K adds no banner", h.banner())
+            val general = if (tab == FreeTab.USD) usd else tether
+            h.display.value = state(topics(general to refused(TopicRejectionReason.TOPIC_UNAVAILABLE), krx to degraded().copy(desired = false)))
+            runCurrent()
+            assertEquals("contract(B3-04): stale K cannot enable GENERAL retry", topicLine(TopicBannerReason.TOPIC_UNAVAILABLE, false), h.banner())
         }
         h.focus.value = OwnedTopicFocus(a1, FreeTab.USD)
         h.display.value = state(topics(usd to degraded())); runCurrent()
         h.consumer.applyRowPreference(o1, FreeTab.USD, RateRowList.FX_BANKS, listOf("kb"), listOf("kb"), setOf("kb")); runCurrent()
-        assertEquals("B3-04 a hidden row narrows nothing", topicLine(TopicBannerReason.DELIVERY_DELAYED, true), h.banner())
+        assertEquals("contract(B3-04): a hidden row narrows nothing", topicLine(TopicBannerReason.DELIVERY_DELAYED, true), h.banner())
         h.scope.cancel()
     }
 

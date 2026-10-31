@@ -135,6 +135,7 @@ class S6Krx3b2OffContractTest {
                 throw AssertionError("contract(O02): exact source/signature boundary failed: ${failure.message}", failure)
             }
         }
+        // S6-4a: current protected337 inventory is checked by the existing O08 boundary below.
         checkBoundary {
             KrxS6DormancyContractTest().Z10_recorderHasNoKrx()
             S6Krx3bOffWiringContractTest().o08_sourceInventoriesRejectUnapprovedExpansion()

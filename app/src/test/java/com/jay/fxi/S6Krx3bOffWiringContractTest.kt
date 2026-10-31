@@ -174,8 +174,8 @@ class S6Krx3bOffWiringContractTest {
         val sources = sourceInventory()
         assertTrue("premise: O08 scans every production root", ROOTS.all { File(it).isDirectory } && sources.size > 300)
         assertTrue("contract(O08): exactly the 23 approved historical union paths exist", ALLOWED.all { it in sources })
-        val raw = sources.keys.filter { it !in ALLOWED }.sorted()
-        assertEquals("contract(O08): protected HEAD file count", 339, raw.size)
+        val raw = sources.keys.filter { it !in (ALLOWED + S64A_DELTA) }.sorted()
+        assertEquals("contract(O08): protected HEAD file count", 337, raw.size)
         val bytes = raw.joinToString("") { "$it\u0000${sha(File(it).readBytes())}\n" }
         assertEquals("contract(O08): protected HEAD raw bytes", BASELINE, sha(bytes.toByteArray(Charsets.UTF_8)))
         val ingress = setOf("data/graph/KrxGraphFence.kt", "data/remote/TopicSessionCoordinator.kt", "data/remote/TopicRuntime.kt",
@@ -203,6 +203,7 @@ class S6Krx3bOffWiringContractTest {
     }
 
     companion object {
+        internal val S64A_DELTA = setOf("TopicSessionCoordinator.kt", "TopicRuntime.kt", "TopicBootstrapOrder.kt").map { BASE + "data/remote/$it" }.toSet()
         internal val OFF_COLUMNS = listOf("GENERAL-WS-REST", "reverse-two-times", "catalog-wait", "continuity-FULL",
             "continuity-FAILED", "continuity-CLOSED", "overflow", "drain", "REST-high", "REST-low",
             "USER-end", "CAP-end", "D1-hold", "server-seed-HTTP", "USD-tether", "assembly-failure", "detach-close")
@@ -225,7 +226,7 @@ class S6Krx3bOffWiringContractTest {
             "MainActivity.kt", "ui/screen/RootScreen.kt", "service/AlertEventBus.kt", "service/AlertPushRouting.kt",
             "service/FXiMessagingService.kt", "ui/viewmodel/AlertViewModel.kt", "di/EntitlementsModule.kt",
             "service/PendingAlertTapOwner.kt", "service/AlertTapEntry.kt", "service/AndroidAlertTapExtras.kt").map { BASE + it }.toSet()
-        internal const val BASELINE = "db88915194fa4b68b10689bd096340d77f51bb3bf207efd0c4628334e005d05c"
+        internal const val BASELINE = "4fe118143da2f2d1a8fcfb6561c55c18751f8ff447827d9ebceff7a2e77082a4"
         internal fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
         internal fun sourceInventory() = ROOTS.flatMap { root -> File(root).walkTopDown()
             .filter { it.isFile && it.extension == "kt" }.map { it.invariantSeparatorsPath to KrxSessionSourceContract.strip(it.readText()) }.toList() }.toMap()

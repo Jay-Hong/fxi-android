@@ -7,6 +7,7 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.auth.HttpExchangeEvidence
 import com.jay.fxi.data.entitlements.KrxAttemptCheck
+import com.jay.fxi.data.entitlements.KrxContestSwitch
 import com.jay.fxi.data.entitlements.KrxSendAcquisition
 import com.jay.fxi.data.entitlements.KrxSendAdmission
 import com.jay.fxi.data.entitlements.KrxSendMarker
@@ -82,11 +83,9 @@ object TopicCatalogue {
     val FX = listOf("fx:usd-krw", "fx:jpy-krw", "fx:eur-krw")
 
     /**
-     * The set a session asks for.
+     * The non-KRX base set a session asks for.
      *
-     * **KRX is deliberately absent.** `ANDROID_V2_PLAN.md §7 S3` defines the hook here and gives
-     * turning it on to S6, because a topic in this set is a topic this build would subscribe to
-     * before it has an entitlement check to refuse it with.
+     * The runtime's installed producer adds KRX only from an effective use in the same authority read.
      */
     val DESIRED: Set<String> = (FX + listOf(TETHER, DXY)).toSet()
 
@@ -523,9 +522,9 @@ class TopicSessionCoordinator(
      * | `Dormant` | endpoint-wide, and answered *before* authentication. The only named slot,
      *   `TopicRejectionReason.TOPICS_DISABLED`, is per-topic and reachable only through
      *   `applyAck` — writing it would assert an acknowledgement that never happened |
-     * | `Unsupported` | [desired] is a copied `val`. `store.setDesired(false, …)` neither
-     *   removes the topic from that set nor stops [startBootstrap]; it also clears rejection,
-     *   which [accepts] reads. It is not a coordinator-level way to stop consuming a topic |
+     * | `Unsupported` | GENERAL membership is the copied base; only the installed producer owns
+     *   the current KRX bit. A store-only `setDesired(false, …)` cannot change that membership
+     *   or stop [startBootstrap], and must not turn endpoint availability into a new policy |
      * | `Degraded` | `markDegraded` is reachable, but the value represents socket subscription
      *   delivery/lease state, including expiry, rather than REST endpoint availability |
      * | `TemporarilyUnavailable` | carries no retry input; this coordinator has no REST
@@ -576,8 +575,9 @@ class TopicSessionCoordinator(
     private var krxBootstrapOwed: KrxBootstrapOwed? = null
     private var stagedKrxBootstrapRead: KrxSendAcquisition? = null
     private var krxLadderJob: Job? = null
-    // Also completed when this grant's initial slot merges into an actual PERMIT issue.
+    // Also completed when this grant's initial slot merges into an actual PERMIT issue or a WS receipt.
     private var krxInitialIssuedGrant: Long? = null
+    private var krxWsReceipt: KrxCapture? = null
     private var krxSnapshotRevision = 0L
     private var nextKrxCapture = 0L
     private val krxRestIssues = mutableMapOf<Long, KrxRestIssue>()
@@ -592,12 +592,14 @@ class TopicSessionCoordinator(
     private var krxMemoryRevision: Long? = null
     private var krxMemoryUserEnd = 0L
     private var krxMemoryCapabilityEnd = 0L
-    private val krxTopic: String? get() = desired.firstOrNull(TopicCatalogue::carriesKrx)
+    // Retirement and selected cleanup still name KRX after current membership has ended.
+    private val krxTopic: String = TopicCatalogue.KRX_FUTURES
 
     private fun prepareKrxAttempt(live: Connection, commandId: Long, request: KrxAttemptScope): KrxCommandAttempt? {
         val stamp = request.read.session ?: return null
         if (!request.read.admitted || current(live.generation) !== live || live.controlOwner != commandId) return null
-        observeKrxRead(stamp, request.read.krxUse)
+        // The installed producer already reconciled this exact admission at dispatch.
+        if (!runtimeKrxDesiredEnabled) observeKrxRead(stamp, request.read.krxUse)
         val topics = request.topics.filterTo(linkedSetOf()) { !TopicCatalogue.carriesKrx(it) || request.read.krxUse != null }
         if (topics.isEmpty()) return null
         val hasKrx = topics.any(TopicCatalogue::carriesKrx)
@@ -627,6 +629,11 @@ class TopicSessionCoordinator(
             post(SessionInput.AccessWithheldDue(live.generation))
             return KrxAttemptCheck.NOT_SENT
         }
+        // FIRST's request scope was captured before its send read. A newly discovered KRX
+        // must go through the existing reprepare loop, with its original GENERAL ownership.
+        if (runtimeKrxDesiredEnabled && attempt.source == KrxAttemptSource.FIRST && attempt.topics != desired) {
+            return KrxAttemptCheck.REPREPARE
+        }
         if (live.leases.expiredAt(clock.nowMillis()).isNotEmpty()) {
             post(SessionInput.LeaseExpiryDue(live.generation))
             return KrxAttemptCheck.NOT_SENT
@@ -646,8 +653,11 @@ class TopicSessionCoordinator(
         supersedeKrxRetirements(live, attempt.requestId)
         if (attempt.consumePermit != null) {
             // capInv can refund a WS send, but never the automatic ladder already started for p.
-            if (attempt.stamp.permitSeq !in krxLaddersStarted) {
-                val origin = if (krxInitialIssuedGrant != grantEpoch) KrxBootstrapOrigin.INITIAL_PLAN else KrxBootstrapOrigin.PERMIT
+            val receivedPermit = krxWsReceipt?.stamp?.permitSeq
+            val wsSatisfied = runtimeKrxDesiredEnabled &&
+                krxWsReceipt?.grantEpoch == grantEpoch && receivedPermit == attempt.consumePermit
+            if (attempt.stamp.permitSeq !in krxLaddersStarted && !wsSatisfied) {
+                val origin = if (!krxInitialSlotSatisfied()) KrxBootstrapOrigin.INITIAL_PLAN else KrxBootstrapOrigin.PERMIT
                 krxBootstrapOwed = KrxBootstrapOwed(attempt.stamp.permitSeq, grantEpoch, origin, checkNotNull(attempt.krxUse))
             }
             post(SessionInput.KrxWake)
@@ -667,9 +677,48 @@ class TopicSessionCoordinator(
 
     /** Called only with metadata produced by the same publication as its effective use. */
     private fun observeKrxRead(stamp: KrxSessionStamp?, use: KrxUseLifetime?) {
+        if (runtimeKrxDesiredEnabled) {
+            syncRuntimeKrxDesired(stamp, use)
+            return
+        }
         if (stamp == null) return
         reconcileKrxSession(stamp, use != null)
         krxEffectiveUse = use
+    }
+
+    /** Only the ON producer enters here; metadata and use must belong to the same read. */
+    private fun syncRuntimeKrxDesired(stamp: KrxSessionStamp?, use: KrxUseLifetime?) {
+        if (!runtimeKrxDesiredEnabled) return
+        if (stamp != null) {
+            reconcileKrxSession(stamp, use != null)
+        } else {
+            retireKrxCapture(connection, KrxRetirementReason.CAPABILITY_WITHHELD)
+            cancelKrxBootstraps()
+            krxPermitCommand = null
+        }
+        krxEffectiveUse = use.takeIf { stamp != null }
+        // Actual USER/CAP end selections only. AWAITING/HOLD may hide KRX while retaining its memory.
+        // Original captures are retired and their jobs cancelled before selection and membership removal.
+        reconcileKrxMemory()
+        val include = stamp != null && use != null && access && fence != null &&
+            fence != refusedFor && fence != identityLostFor
+        if (include && krxTopic !in desired) {
+            desired = baseDesired + krxTopic
+            store.setDesired(true, krxTopic)
+            // Before FIRST succeeds, a newly visible KRX can still fill this grant's initial REST slot.
+            // After FIRST, only the successful PERMIT lane creates the automatic obligation.
+            if (fannedOutForGrant == grantEpoch && connection?.firstSubscribeSent != true) {
+                unissuedBootstraps += krxTopic
+            }
+        } else if (!include) {
+            krxBootstrapOwed = null
+            unissuedBootstraps.remove(krxTopic)
+            requestedBootstraps.remove(krxTopic)
+            if (krxTopic in desired) {
+                desired = baseDesired
+                store.setDesired(false, krxTopic)
+            }
+        }
     }
 
     private fun reconcileKrxSession(stamp: KrxSessionStamp, effective: Boolean) {
@@ -689,8 +738,12 @@ class TopicSessionCoordinator(
         val stamp = krxSession ?: return
         val use = krxEffectiveUse ?: return
         val live = connection ?: return
-        val topic = krxTopic ?: return
+        val topic = krxTopic
+        if (topic !in desired) return
         if (!live.opened || !live.firstSubscribeStarted || live.ended || !sessionWanted()) return
+        // Until a physical FIRST succeeds, that command (or its credential recovery) owns
+        // the initial scope. A PERMIT must not take its lane after credential preparation fails.
+        if (runtimeKrxDesiredEnabled && !live.firstSubscribeSent) return
         if (live.controlOwner != null || live.krxPending != null || store.snapshot.authResolution == TopicAuthResolution.FAILED) return
         if (live.renewalDeferred || live.revalidationDeferred || live.recoveryReopenDeferred || live.manualPending.isNotEmpty()) {
             post(SessionInput.ControlLaneFree(live.generation))
@@ -737,6 +790,7 @@ class TopicSessionCoordinator(
     private sealed interface KrxBootstrapPreparation {
         data class Ready(val issue: KrxRestIssue) : KrxBootstrapPreparation
         data object AlreadyStarted : KrxBootstrapPreparation
+        data object SatisfiedByWs : KrxBootstrapPreparation
         data object Reprepare : KrxBootstrapPreparation
         data object Blocked : KrxBootstrapPreparation
     }
@@ -764,7 +818,7 @@ class TopicSessionCoordinator(
             ?: newer(live.krxActive)
         return KrxRetirementContext(live,
             ownsRegistry = successor == null && live.krxActive === capture && leaseId != null &&
-                krxTopic?.let { live.krxLeases.held[it]?.leaseId } == leaseId,
+                live.krxLeases.held[krxTopic]?.leaseId == leaseId,
             ending = ending, replacementRequestId = successor?.requestId)
     }
 
@@ -787,7 +841,7 @@ class TopicSessionCoordinator(
 
     private fun validKrxCapture(live: Connection, capture: KrxCapture): Boolean =
         current(live.generation) === live && capture.connectionGeneration == live.generation && capture.grantEpoch == grantEpoch &&
-            fence == live.fence && capture.use.lifetime == live.lifetime && krxTopic != null &&
+            fence == live.fence && capture.use.lifetime == live.lifetime && krxTopic in desired &&
             enforceLiveIdentity(live.fence) && krxSendReader?.admitsKrx(capture.use) == true
 
     private fun promoteKrxCapture(live: Connection, commandId: Long, requestId: String, accepted: Boolean) {
@@ -796,7 +850,7 @@ class TopicSessionCoordinator(
         // Reserve K2 while pending is still present. retireKrxActive captures this reservation before clearing K1.
         val old = live.krxActive
         val context = old?.let {
-            krxRetirementContext(live, it, krxTopic?.let { live.krxLeases.held[it]?.leaseId },
+            krxRetirementContext(live, it, live.krxLeases.held[krxTopic]?.leaseId,
                 replacement = pending.capture.takeIf { promote })
         }
         val pendingContext = krxRetirementContext(live, pending.capture, null)
@@ -830,7 +884,7 @@ class TopicSessionCoordinator(
 
     private fun retireKrxActive(live: Connection, prepared: KrxRetirementContext? = null, ending: Boolean = false) {
         val active = live.krxActive ?: return
-        val lease = krxTopic?.let { live.krxLeases.held[it]?.leaseId }
+        val lease = live.krxLeases.held[krxTopic]?.leaseId
         val context = prepared ?: krxRetirementContext(live, active, lease, ending = ending)
         live.krxActive = null
         live.krxLeaseMasked = true
@@ -846,7 +900,7 @@ class TopicSessionCoordinator(
         val ending = reason == KrxRetirementReason.CONNECTION_ENDED || reason == KrxRetirementReason.CONTEXT_ENDED
         // Ending intent is fixed before pending/active are changed, including end's !live.ended window.
         val activeContext = live.krxActive?.let {
-            krxRetirementContext(live, it, krxTopic?.let { live.krxLeases.held[it]?.leaseId }, ending = ending)
+            krxRetirementContext(live, it, live.krxLeases.held[krxTopic]?.leaseId, ending = ending)
         }
         live.krxPending?.let { pending ->
             retireKrxPending(live, pending, ending = ending)
@@ -900,7 +954,7 @@ class TopicSessionCoordinator(
             closed -> KrxRetirementWire.SKIPPED_CLOSED
             newer -> KrxRetirementWire.SKIPPED_NEWER_CAPTURE
             else -> {
-                val request = TopicSubscribeRequest.unsubscribe(newRequestId(), listOf(checkNotNull(krxTopic)))
+                val request = TopicSubscribeRequest.unsubscribe(newRequestId(), listOf(krxTopic))
                 try {
                     if (live.transport.send(encode(request))) KrxRetirementWire.ACCEPTED_UNCONFIRMED else KrxRetirementWire.FAILED_FALSE
                 } catch (cancelled: CancellationException) {
@@ -919,7 +973,8 @@ class TopicSessionCoordinator(
         live: Connection, commandId: Long, requestId: String, active: Set<String>, leases: List<TopicLease>, sent: Set<String>
     ): Set<String> {
         if (krxSession == null) return active
-        val topic = krxTopic ?: return active.filterNotTo(linkedSetOf(), TopicCatalogue::carriesKrx)
+        val topic = krxTopic
+        if (topic !in desired) return active - topic
         val ownPending = live.krxPending?.capture?.let { it.commandId == commandId && it.requestId == requestId } == true
         if (ownPending) promoteKrxCapture(live, commandId, requestId, topic in active && topic in sent)
         val capture = live.krxActive
@@ -952,7 +1007,7 @@ class TopicSessionCoordinator(
     }
 
     private fun acceptsKrx(live: Connection, capture: KrxCapture): Boolean {
-        val topic = krxTopic ?: return false
+        val topic = krxTopic
         if (!accepts(live, topic) || live.krxActive !== capture || !validKrxCapture(live, capture) || live.krxLeaseMasked) return false
         if (live.krxLeases.expiredAt(clock.nowMillis()).isNotEmpty()) {
             retireKrxCapture(live, KrxRetirementReason.LEASE_EXPIRED)
@@ -974,11 +1029,16 @@ class TopicSessionCoordinator(
             live.generation, frame.value.data.allEntries, capture.graphStamp)
         adoptKrxQuotes(quotes, krxMemoryScope(live.fence, capture.use, capture.stamp))
         store.recordFrame(frame.value.topic)
+        if (runtimeKrxDesiredEnabled) krxWsReceipt = capture
         krxSnapshotRevision++
         cancelKrxBootstraps()
         recordDelivery(TopicSilenceEvidence.OTHER, clock.nowMillis())
         resolveCachedRefresh(capture.use.lifetime)
     }
+
+    private fun krxInitialSlotSatisfied(): Boolean =
+        krxInitialIssuedGrant == grantEpoch ||
+            (runtimeKrxDesiredEnabled && krxWsReceipt?.grantEpoch == grantEpoch)
 
     private fun issueKrxBootstrap(topic: String, origin: KrxBootstrapOrigin, startsLadder: Boolean): KrxBootstrapPreparation {
         val prepared = stagedKrxBootstrapRead
@@ -986,9 +1046,12 @@ class TopicSessionCoordinator(
         stagedKrxBootstrapRead = null
         val owner = fence ?: return KrxBootstrapPreparation.Blocked
         val read = prepared ?: krxSendReader?.acquireWithKrx(owner) ?: return KrxBootstrapPreparation.Blocked
-        observeKrxSessionCapability(read.krxSessionCapable)
+        // Staged reads were reconciled by the pump; retries acquire and reconcile their own publication.
+        if (prepared == null) {
+            observeKrxSessionCapability(read.krxSessionCapable)
+            observeKrxRead(read.session, read.krxUse)
+        }
         val stamp = read.session ?: return KrxBootstrapPreparation.Blocked
-        observeKrxRead(stamp, read.krxUse)
         krxReconciledSignal = signal
         val use = read.krxUse ?: return KrxBootstrapPreparation.Blocked
         if (!sessionWanted() || topic !in desired || !enforceLiveIdentity(owner)) return KrxBootstrapPreparation.Blocked
@@ -1000,12 +1063,20 @@ class TopicSessionCoordinator(
         }
         val permit = stamp.permitSeq
         if (startsLadder && origin != KrxBootstrapOrigin.EXPLICIT) {
+            val receivedPermit = krxWsReceipt?.stamp?.permitSeq
+            if (runtimeKrxDesiredEnabled && krxWsReceipt?.grantEpoch == grantEpoch && receivedPermit == permit) {
+                krxInitialIssuedGrant = grantEpoch
+                if (krxBootstrapOwed?.let { it.grantEpoch == grantEpoch && it.permit == permit } == true) {
+                    krxBootstrapOwed = null
+                }
+                return KrxBootstrapPreparation.SatisfiedByWs
+            }
             if (origin == KrxBootstrapOrigin.PERMIT && krxBootstrapOwed?.permit != permit) {
                 return KrxBootstrapPreparation.Blocked
             }
             // Initial plans belong to grants; permit ladders belong to p across grants.
             val alreadyStarted = when (origin) {
-                KrxBootstrapOrigin.INITIAL_PLAN -> krxInitialIssuedGrant == grantEpoch
+                KrxBootstrapOrigin.INITIAL_PLAN -> krxInitialSlotSatisfied()
                 KrxBootstrapOrigin.PERMIT -> permit in krxLaddersStarted
                 KrxBootstrapOrigin.EXPLICIT -> false
             }
@@ -1204,7 +1275,7 @@ class TopicSessionCoordinator(
         if (krxCanonicalScope != null && krxCanonicalScope in selection.scopes) {
             // Only the selected ACK's canonical state is ours; old rates cannot expire K2's state.
             // expire preserves canonical rejection, desired, receive generation and the GENERAL ticket.
-            val topic = checkNotNull(krxTopic)
+            val topic = krxTopic
             val state = store.snapshot.stateFor(topic)
             if (state.confirmed || state.desired && state.deliveryState != TopicDeliveryState.DEGRADED) {
                 store.expire(setOf(topic))
@@ -1245,14 +1316,19 @@ class TopicSessionCoordinator(
         else krxRetirer.retire(retirement)
     }
 
-    /**
-     * Copied, so what this session consumes cannot change under it.
-     *
-     * `val` stops the field being re-assigned and says nothing about the set's contents: a caller
-     * that hands in a `mutableSetOf` still holds the same object. The copy is what lets the
-     * answer path trust the check the issue already made.
-     */
-    private val desired: Set<String> = desired.toSet()
+    /** Immutable input copy; only an installed runtime producer can change the current KRX bit. */
+    private val baseDesired: Set<String> = desired.toSet()
+    private var desired: Set<String> = baseDesired
+    private var krxDesiredSwitch: KrxContestSwitch? = null
+    private val runtimeKrxDesiredEnabled: Boolean get() = krxDesiredSwitch?.enabled == true
+
+    /** Installation is inert, including OFF: no snapshot, request, or coroutine is started here. */
+    internal fun installKrxDesiredProducer(switch: KrxContestSwitch) {
+        check(loop == null && !stopped) { "install KRX desired producer before start" }
+        require(baseDesired == TopicCatalogue.DESIRED) { "runtime KRX producer requires the exact GENERAL base" }
+        check(krxDesiredSwitch == null || krxDesiredSwitch === switch) { "KRX desired switch already installed" }
+        krxDesiredSwitch = switch
+    }
 
     /** This instance, as the attributions it hands out name it: another session's grant epoch can be the same number. */
     private val sessionKey = Any()
@@ -1949,6 +2025,7 @@ class TopicSessionCoordinator(
                         krxBootstrapOwed = null
                         krxPermitCommand = null
                     }
+                    syncRuntimeKrxDesired(null, null)
                     grantEpoch++
                     resetCachedRefresh()
                 }
@@ -2028,7 +2105,15 @@ class TopicSessionCoordinator(
                 ) {
                     if (krxLadderJob === settled.job) krxLadderJob = null
                     // An explicit in-flight call may have held an independent automatic obligation.
-                    if (krxInitialIssuedGrant != grantEpoch || krxBootstrapOwed != null) {
+                    val requeue = if (runtimeKrxDesiredEnabled) {
+                        settled.topic in desired && krxEffectiveUse != null &&
+                            (!krxInitialSlotSatisfied() || krxBootstrapOwed != null || settled.topic in unissuedBootstraps)
+                    } else {
+                        // Fixed desired sessions keep the original initial/permit obligation,
+                        // including a cancelled explicit call settling while the use is withheld.
+                        krxInitialIssuedGrant != grantEpoch || krxBootstrapOwed != null
+                    }
+                    if (requeue) {
                         unissuedBootstraps += settled.topic
                         pumpBootstraps()
                     }
@@ -2080,8 +2165,8 @@ class TopicSessionCoordinator(
                 // somebody else's. The session has already stopped acting on the grant in both,
                 // and an answer that raced either of them must not be what puts the data back.
                 if (owner == refusedFor || owner == identityLostFor) return
-                // No second `desired` check: the set is copied at construction and never changes,
-                // and the issue already refused anything outside it.
+                // GENERAL membership is the copied base. KRX data also checks its original
+                // issue/use and current membership in applyKrxBootstrap, after control hand-over.
                 val attribution = TopicUseAttribution(sessionKey, owner, grantEpoch, input.lifetime)
                 val delivered = input.outcome as? TopicSnapshotOutcome.Delivered
                 if (delivered == null) {
@@ -2245,6 +2330,8 @@ class TopicSessionCoordinator(
 
             is SessionInput.AccessWithheldDue ->
                 current(input.generation)?.let { live ->
+                    if (runtimeKrxDesiredEnabled) retireKrxCapture(live, KrxRetirementReason.CONTEXT_ENDED)
+                    syncRuntimeKrxDesired(null, null)
                     if (krxSession != null) cancelKrxBootstraps()
                     end(live, TopicDisconnectCause.DELIBERATE)
                 }
@@ -2261,8 +2348,8 @@ class TopicSessionCoordinator(
             SessionInput.KrxWake -> {
                 val owed = krxBootstrapOwed
                 if (owed != null && owed.grantEpoch == grantEpoch && krxSendReader?.admitsKrx(owed.use) == true) {
-                    if (owed.permit !in krxLaddersStarted) krxTopic?.let { topic ->
-                        unissuedBootstraps += topic
+                    if (owed.permit !in krxLaddersStarted && krxTopic in desired) {
+                        unissuedBootstraps += krxTopic
                         pumpBootstraps()
                     }
                 }
@@ -2411,6 +2498,8 @@ class TopicSessionCoordinator(
     private fun settleRefusal(live: Connection, rejected: Map<String, TopicRejectionReason>) {
         if (rejected.values.none { it == TopicRejectionReason.PREMIUM_REQUIRED }) return
         refusedFor = live.fence
+        if (runtimeKrxDesiredEnabled) retireKrxCapture(live, KrxRetirementReason.CONTEXT_ENDED)
+        syncRuntimeKrxDesired(null, null)
         if (krxSession != null) cancelKrxBootstraps()
         endGraphAuthority(TopicGraphEventReason.PREMIUM_REFUSED)
         end(live, TopicDisconnectCause.DELIBERATE)
@@ -2433,6 +2522,8 @@ class TopicSessionCoordinator(
     private fun retireIdentity(owner: TopicSessionFence) {
         if (identityLostFor == owner) return
         identityLostFor = owner
+        if (runtimeKrxDesiredEnabled) retireKrxCapture(connection, KrxRetirementReason.CONTEXT_ENDED)
+        syncRuntimeKrxDesired(null, null)
         if (krxSession != null) cancelKrxBootstraps()
         endGraphAuthority(TopicGraphEventReason.IDENTITY_RETIRED)
         connection?.takeIf { it.fence == owner }?.let {
@@ -2467,7 +2558,16 @@ class TopicSessionCoordinator(
      * make that one valid again.
      */
     private fun useLifetime(): TopicUseLifetime? {
-        val lifetime = fence?.let(authority::acquire)
+        val lifetime = if (runtimeKrxDesiredEnabled) {
+            val signal = krxAccessSignals.get()
+            val reader = krxSendReader
+            val read = fence?.let { reader?.acquireWithKrx(it) }
+            observeKrxSessionCapability(read?.krxSessionCapable == true)
+            syncRuntimeKrxDesired(read?.session, read?.krxUse)
+            krxReconciledSignal = signal
+            // A reader-less legacy assembly still has its GENERAL authority; it cannot produce KRX metadata.
+            if (reader == null) fence?.let(authority::acquire) else read?.lifetime
+        } else fence?.let(authority::acquire)
         if (lifetime == null) endGraphAuthority(TopicGraphEventReason.USE_WITHHELD)
         return lifetime
     }
@@ -2546,8 +2646,10 @@ class TopicSessionCoordinator(
         // delay/token/body can still be live during reconnect backoff.
         val signal = krxAccessSignals.get()
         val owner = fence
-        reconcileKrxMemory()
-        if ((krxSession != null || krxSessionCapabilityObserved) && owner != null && krxReconciledSignal != signal) {
+        if (!runtimeKrxDesiredEnabled) reconcileKrxMemory()
+        if ((runtimeKrxDesiredEnabled || krxSession != null || krxSessionCapabilityObserved) &&
+            owner != null && krxReconciledSignal != signal
+        ) {
             krxSendReader?.acquireWithKrx(owner)?.let {
                 observeKrxSessionCapability(it.krxSessionCapable)
                 observeKrxRead(it.session, it.krxUse)
@@ -3154,8 +3256,8 @@ class TopicSessionCoordinator(
         if (owner.identity != held.identity || owner.grantEpoch != grantEpoch) return
         val live = connection ?: return
         val eligible = store.snapshot.manualRetryTopics
-        val shown = TopicBootstrapOrder.shownBy(tab)
-        val krx = krxTopic?.takeIf {
+        val shown = TopicBootstrapOrder.bootstrapShownBy(tab)
+        val krx = krxTopic.takeIf {
             krxSession != null && krxEffectiveUse != null && (tab == FreeTab.USD || tab == FreeTab.TETHER)
         }
         val requested = (shown + listOfNotNull(krx)).filterTo(linkedSetOf()) { topic ->
@@ -3382,11 +3484,12 @@ class TopicSessionCoordinator(
                         topics().isEmpty() && revalidationTopics().isEmpty() && manualScope(live, id, manual).isEmpty()) -> false
                     // The use first (L-4e E2a): a withheld use is not a lease that ran out, and ending it must not start a ladder.
                     !run {
-                        val read = if (attemptRequest?.topics?.any(TopicCatalogue::carriesKrx) == true) {
+                        val read = if (runtimeKrxDesiredEnabled || attemptRequest?.topics?.any(TopicCatalogue::carriesKrx) == true) {
                             krxReadSignal = krxAccessSignals.get()
                             krxSendReader?.admitsWithKrx(live.lifetime)
                         } else null
                         observeKrxSessionCapability(read?.krxSessionCapable == true)
+                        if (runtimeKrxDesiredEnabled) syncRuntimeKrxDesired(read?.session, read?.krxUse)
                         attemptAdmission = read
                         read?.admitted ?: authority.admits(live.lifetime)
                     } -> {
@@ -3575,7 +3678,8 @@ class TopicSessionCoordinator(
         krxAcknowledgedScope: KrxMemoryScope?,
         krxAcknowledgedGraphStamp: KrxGraphStamp?
     ) {
-        if (krxSession != null) krxTopic?.let { topic ->
+        if (krxSession != null) {
+            val topic = krxTopic
             // CMD has applied this ACK. Never infer provenance from a new snapshot or a later capture.
             // A GENERAL ACK can clear confirmed while delivery state remains; retain its original scope for cleanup/reset.
             if (krxAcknowledgedScope != null && (topic in ack.accepted || topic in ack.rejected)) {
@@ -3755,9 +3859,8 @@ class TopicSessionCoordinator(
      * account but no network, or no tab yet, reaches here — and burning the latch there would mean that grant is never asked
      * for at all. So the gates come first and the latch is spent only when the plan is actually made.
      *
-     * **Every desired topic, once per grant, the shown tab's first.** The plan is [TopicBootstrapOrder.plan]: nothing is
-     * dropped, only ordered. Laziness is a graph-query matter, not this one. The shape does not depend on what the account
-     * holds — asking for fewer topics because a capability is missing would make the traffic a statement about entitlements.
+     * **GENERAL once per grant, the shown tab's first; effective KRX last.** [TopicBootstrapOrder.plan] preserves the
+     * GENERAL inventory. The installed producer owns KRX membership, and an accepted WS receipt can satisfy its automatic slot.
      *
      * **A plan outlives an interruption, not its grant.** Offline, or no longer wanted, the wait is dropped and what is owed
      * stays; the same grant coming back carries on where it stopped. The latch only ever guarded making the plan. A new grant
@@ -3791,9 +3894,9 @@ class TopicSessionCoordinator(
      * instead ([requestBootstrapOnLoop]).
      */
     private fun issueOwedBootstraps(tab: FreeTab) {
-        val rank = TopicBootstrapOrder.plan(tab, desired)
-        val shown = TopicBootstrapOrder.shownBy(tab).filter { it in desired }.toSet()
+        val shown = TopicBootstrapOrder.bootstrapShownBy(tab).filter { it in desired }.toSet()
         while (true) {
+            val rank = TopicBootstrapOrder.plan(tab, desired)
             // Under a re-approved grant, only a connection this grant started lets automatic bootstraps go (L-4e E5 §5-2); without
             // one, what a caller asked for still goes by the usual rules and the rest waits.
             val automatic = reapprovedEpoch != grantEpoch || connection?.fence == fence
@@ -3823,13 +3926,15 @@ class TopicSessionCoordinator(
                 fence?.let { krxSendReader?.acquireWithKrx(it) }
             } else null
             observeKrxSessionCapability(read?.krxSessionCapable == true)
+            if (read != null) {
+                observeKrxRead(read.session, read.krxUse)
+                if (runtimeKrxDesiredEnabled || read.session != null) krxReconciledSignal = readSignal
+                if (runtimeKrxDesiredEnabled && next !in desired) continue
+            }
             if (read?.session != null) {
-                val stamp = checkNotNull(read.session)
-                observeKrxRead(stamp, read.krxUse)
-                krxReconciledSignal = readSignal
                 if (read.krxUse == null || read.lifetime == null) return cancelBootstrapIssue()
                 val explicit = next in requestedBootstraps
-                val initial = krxInitialIssuedGrant != grantEpoch
+                val initial = !krxInitialSlotSatisfied()
                 val owed = krxBootstrapOwed?.takeIf { it.grantEpoch == grantEpoch }
                 if (!explicit && !initial && owed == null) {
                     unissuedBootstraps.remove(next)
@@ -3845,7 +3950,7 @@ class TopicSessionCoordinator(
                 stagedKrxBootstrapSignal = readSignal
                 val issue = when (val preparation = issueKrxBootstrap(next, origin, startsLadder = true)) {
                     is KrxBootstrapPreparation.Ready -> preparation.issue
-                    KrxBootstrapPreparation.AlreadyStarted -> {
+                    KrxBootstrapPreparation.AlreadyStarted, KrxBootstrapPreparation.SatisfiedByWs -> {
                         unissuedBootstraps.remove(next)
                         continue
                     }

@@ -204,13 +204,13 @@ class S6Krx3cOffContractTest {
 
     @Test fun o06_exactSourceInventoryRejectsExpansion() = marked("O06") {
         val actual = S6Krx3bOffWiringContractTest.sourceInventory()
-        fun fingerprint(map: Map<String, String>): String = S6Krx3cShellSourceContract.sha(map.keys.filter { it !in NORMAL }.sorted()
+        fun fingerprint(map: Map<String, String>): String = S6Krx3cShellSourceContract.sha(map.keys.filter { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA) }.sorted()
             .joinToString("") { "$it\u0000${S6Krx3cShellSourceContract.sha(map.getValue(it).toByteArray(Charsets.UTF_8))}\n" }.toByteArray(Charsets.UTF_8))
         val raw = actual.keys.associateWith { File(it).readText(Charsets.UTF_8) }
         assertTrue("contract(O06/normal): exact10 production files exist", NORMAL.all { it in actual })
-        assertEquals("contract(O06/protected): exact352 unchanged production files", 352, raw.keys.count { it !in NORMAL })
+        assertEquals("contract(O06/protected): exact349 unchanged production files", 349, raw.keys.count { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA) })
         assertEquals("contract(O06/raw): protected HEAD fingerprint", PROTECTED, fingerprint(raw))
-        val protected = raw.keys.first { it !in NORMAL }
+        val protected = raw.keys.first { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA) }
         assertNotEquals("contract(O06/μ32): same fingerprint rejects one protected-file bypass", PROTECTED, fingerprint(raw + (protected to raw.getValue(protected) + "\nval bypass = true\n")))
         assertNotEquals("contract(O06/new-file): allowed directory is not permission to add files", PROTECTED, fingerprint(raw + ("src/main/java/com/jay/fxi/service/Bypass.kt" to "val bypass = true")))
         S6Krx3bOffWiringContractTest().o08_sourceInventoriesRejectUnapprovedExpansion()
@@ -221,7 +221,7 @@ class S6Krx3cOffContractTest {
         internal val NORMAL = listOf("MainActivity.kt", "ui/screen/RootScreen.kt", "service/AlertEventBus.kt", "service/AlertPushRouting.kt",
             "service/FXiMessagingService.kt", "ui/viewmodel/AlertViewModel.kt", "di/EntitlementsModule.kt", "service/PendingAlertTapOwner.kt",
             "service/AlertTapEntry.kt", "service/AndroidAlertTapExtras.kt").map { "src/main/java/com/jay/fxi/$it" }.toSet()
-        internal const val PROTECTED = "26665a32e040c61a87e6a26fceec79e9544836e4dd8a7576ae6e01e22606e2e4"
+        internal const val PROTECTED = "a55c33da13481077da9c6ed63845bb34eae9f9718f3f61ec1c6f114b4a7b8992"
     }
     private fun connectedOffParts(g: O03HeadWorld): O03HeadParts = object : O03HeadParts {
         private val actual = g.assembly(g::graphSnapshot)
