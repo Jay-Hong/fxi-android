@@ -60,7 +60,7 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 S6-3b-2(`0302b58`: 그래프 KRX 선택 물리 purge·CAPABILITY memory target, 스위치 꺼짐, 2026-10-28),
                                 S6-3c(`4be5b85`: 알림 탭 의도의 metadata 보존과 KRX tap 선택 폐기, 스위치 꺼짐, 2026-10-29),
                                 S6-3c-fix(`e7a5004`: 비KRX pending tap의 인증 경계 귀속, 스위치 꺼짐, 2026-10-29)를
-                                land했다. 다음은 S6-3 완료 판정(남는 UNKNOWN·잔여 보고와 사용자 U7 판단 뒤, U5는 기본 유지) → S6-4 기본 꺼짐 준비 →
+                                land했다. S6-3은 2026-10-31 완료로 판정했다(내부 이정표, 한정은 S6 '진행'). 다음은 S6-4 기본 꺼짐 준비 →
                                 S6-2b-2β(최종 동일 후보의 측정용 켬·P1(b))다 (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
@@ -1812,8 +1812,15 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   단위 9445/0, 변이 16쌍 전부 해당 행 계약 검출, CI 세 변형 로컬 통과, hosted CI run `40891148576` green. 잔여(identity 없는
   수신 tap의 잔류, end 없는 USER epoch 변화, binding 없는 같은 uid end의 보수 제거, ownerUid 없는 end, 관측하지 못한 중간
   end)는 사용자 보고 대상이다. scope r19가 r18 머리말의 'U5/U7 답'이 3c 착수 선택이며 U7 승인이 아님을 정정했다.
-  · 보류: S6-3 완료 선언(3c의 남는 UNKNOWN과 3c-fix 잔여 보고를 근거로 한
-  사용자 U7 판단, U5는 기본 유지), KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
+  · S6-3 완료(2026-10-31, 내부 이정표, 트리 밖 scope r20·manifest r30·판정 기록): 직전의 U7·U2 결정 요청에 사용자가
+  '모든 권한을 줄테니 … 막히는 부분이 있다면 코덱스와 상의해서 진행해줘'로 답해, Claude·Codex가 그 둘만 정했다(다른
+  사용자 결정 항목은 그대로). U7 = A안: pending tap(H25)의 S6-3 근거를 계약 동작·앱 내부 배선과 OFF 동등·출처 사전
+  조사로 한정하고, 단말 실행과 대표 재현은 S6-2b-2β 최종 동일 후보의 측정용 켬·운영 반영 전 관문에 두며, 운영 사용자의
+  실제 pending 잔존·출처 증거는 S6-3 판정에서만 유예한다. 필수 행 H01~H29의 계약 메서드 121개가 통과했다(단위
+  9445/0). 실제 UNKNOWN 0을 확인한 것은 아니며, S6 최종 완료 조건(그 증거 또는 별도 결정, P3-i 실제 disk purge)은
+  그대로다. U2 = 을: 다음 S5 정식 측정·golden은 S6-4의 fixture 갱신 뒤에 한다(U1 결정, S0-f 재봉인, 정식 측정, 기기
+  조작의 승인은 아니다). S6-4 진입 조건은 S6-4 변경 후보의 exact-state 합의만 남았고 설계를 시작했다.
+  · 보류: KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
   A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
   답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)다. 다음 D4 판 조건은 D4 r6(A2 r8·A1 r9 반영, 트리 밖
   manifest r7)으로 채웠고, 남은 조건은 2b-2 계약의 CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. scope U10(CUT-C01
