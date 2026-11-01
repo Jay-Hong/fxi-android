@@ -4781,11 +4781,96 @@ class PremiumGraphCutoverAcceptanceTest {
         assembly.coordinator.state.value.entries.keys.firstOrNull { it.tab == "usd" && it.period.code == period }
     }
 
+    private data class B04aRequestMark(
+        val instance: Any,
+        val requestId: Long,
+        val fence: com.jay.fxi.data.remote.TopicSessionFence,
+        val lifetime: com.jay.fxi.data.remote.TopicUseLifetime,
+        val capture: com.jay.fxi.data.graph.GraphV2AccessCapture?,
+        val disposed: Boolean
+    )
+
+    private data class B04aOriginalStatus(
+        val registered: Boolean,
+        val disposed: Boolean,
+        val completionPending: Boolean,
+        val handlingCompletion: Boolean
+    )
+
+    private data class B04aRead(
+        val source: com.jay.fxi.data.graph.GraphRequestSource?,
+        val current: B04aRequestMark?,
+        val original: B04aOriginalStatus?,
+        val entry3m: Boolean,
+        val slot3m: Boolean
+    )
+
+    /** Called only inside b04aRead's single Main turn; keeps the original immutable capture, not a later null epoch. */
+    private fun b04aMark(registration: Any): B04aRequestMark {
+        val context = checkNotNull(privateField(registration, "context"))
+        return B04aRequestMark(
+            registration,
+            privateField(registration, "requestId") as Long,
+            privateField(context, "fence") as com.jay.fxi.data.remote.TopicSessionFence,
+            privateField(context, "lifetime") as com.jay.fxi.data.remote.TopicUseLifetime,
+            privateField(registration, "accessCapture") as com.jay.fxi.data.graph.GraphV2AccessCapture?,
+            (privateField(registration, "disposed") as java.util.concurrent.atomic.AtomicBoolean).get()
+        )
+    }
+
+    /** One read-only Main turn for the source, current registration, original identity/status, entry and protected slot. */
+    private suspend fun Rig.b04aRead(original: B04aRequestMark? = null): B04aRead = onMain {
+        val state = assembly.coordinator.state.value
+        @Suppress("UNCHECKED_CAST")
+        val requests = privateField(assembly.coordinator, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
+        @Suppress("UNCHECKED_CAST")
+        val slots = privateField(assembly.coordinator, "protectedSlots") as Map<com.jay.fxi.data.graph.GraphKey, *>
+        val current = requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period == GraphPeriod.THREE_MONTHS }?.value
+        B04aRead(
+            state.source,
+            current?.let(::b04aMark),
+            original?.let { mark -> B04aOriginalStatus(
+                requests.values.any { it === mark.instance },
+                (privateField(mark.instance, "disposed") as java.util.concurrent.atomic.AtomicBoolean).get(),
+                privateField(mark.instance, "completionPending") as Boolean,
+                privateField(mark.instance, "handlingCompletion") as Boolean
+            ) },
+            state.entries.keys.any { it.tab == "usd" && it.period == GraphPeriod.THREE_MONTHS },
+            slots.keys.any { it.tab == "usd" && it.period == GraphPeriod.THREE_MONTHS }
+        )
+    }
+
+    /** Diagnostics use only the saved view; opaque identity labels are display-only, never comparison keys. */
+    private fun b04aDiagnostic(
+        phase: String, original: B04aRequestMark, view: B04aRead,
+        f1: com.jay.fxi.data.remote.TopicSessionFence, f2: com.jay.fxi.data.remote.TopicSessionFence
+    ): String {
+        fun opaque(value: Any?): String = value?.let { Integer.toHexString(System.identityHashCode(it)) } ?: "null"
+        fun fence(value: com.jay.fxi.data.remote.TopicSessionFence?): String = value?.let {
+            "uid=${it.identity.uid},generation=${it.identity.authGeneration},userEpoch=${it.userAccessEpoch},grantRef=${opaque(it.grant)}"
+        } ?: "null"
+        fun lifetime(value: com.jay.fxi.data.remote.TopicUseLifetime?): String = value?.let {
+            "ref=${opaque(it)},grantRef=${opaque(it.grant)},invalidations=${it.invalidations}"
+        } ?: "null"
+        val current = view.current
+        return "phase=$phase oldRequestId=${original.requestId} currentRequestId=${current?.requestId} " +
+            "sameInstance=${current?.instance === original.instance} f1=[${fence(f1)}] f2=[${fence(f2)}] " +
+            "originalFence=[${fence(original.fence)}] sourceFence=[${fence(view.source?.fence)}] currentFence=[${fence(current?.fence)}] " +
+            "originalLifetime=[${lifetime(original.lifetime)}] sourceLifetime=[${lifetime(view.source?.lifetime)}] currentLifetime=[${lifetime(current?.lifetime)}] " +
+            "originalMatchesF1=${original.fence == f1} currentMatchesF2=${current?.fence == f2} " +
+            "originalMatchesSourceLifetime=${original.lifetime == view.source?.lifetime} " +
+            "currentMatchesSourceLifetime=${current?.lifetime == view.source?.lifetime} " +
+            "originalCaptureEpoch=${original.capture?.krxCapabilityEpoch} currentCaptureEpoch=${current?.capture?.krxCapabilityEpoch} " +
+            "originalDisposedAtMark=${original.disposed} currentDisposed=${current?.disposed} originalStatus=${view.original} " +
+            "entry3m=${view.entry3m} slot3m=${view.slot3m}"
+    }
+
     /**
      * RT01-B04a: a request carrying the old KRX epoch completes released. Under KRX VISIBLE (epoch E1) a 3m tab is sent with
      * an E1 capture and held; a capability rotation (KRX hidden) moves the epoch and gives a new grant on the same user epoch,
      * and the new context's requests are held. The old 3m then completes (200, KRX-visible values no other answer carries):
-     * nothing of it is applied — no 3m entry, no slot — and no KRX file is written.
+     * nothing of it is applied — no 3m entry, no slot — and no KRX file is written. The original registration is identified by
+     * reference: a different request under the new context may already be registered when the old one is released.
      */
     @Test
     fun `RT01-B04a a request carrying the old KRX epoch completes released and applies and writes nothing`() = runBlocking {
@@ -4829,37 +4914,89 @@ class PremiumGraphCutoverAcceptanceTest {
                 val e1 = checkNotNull(rig.epochStore.load().krxCapabilityEpoch)
                 rig.onMain { holder.selectPeriod(checkNotNull(holder.currentState().inlineToken), GraphPeriod.THREE_MONTHS) }
                 awaitTrue("$label: the 3m tab is in flight", deadline) { tabs().any { it.param("period") == "3m" && it.bodyEnd == null } }
-                assertEquals("$label: premise: the 3m request carries the E1 capture", true to e1, rig.usdCaptureEpoch("3m"))
+                val before = rig.b04aRead()
+                assertNotNull("precondition(FIX-B04a/original): current 3m registration exists; phase=original", before.current)
+                val original = checkNotNull(before.current)
+                assertTrue("precondition(FIX-B04a/original): live E1 registration belongs to source " +
+                    b04aDiagnostic("original-before-f1", original, before, original.fence, original.fence),
+                    original.capture?.krxCapabilityEpoch == e1 && !original.disposed &&
+                        before.source?.fence == original.fence && before.source?.lifetime == original.lifetime)
                 val krxBefore = rig.krxFiles()
                 val f1 = checkNotNull(rig.bridge())
+                assertEquals("precondition(FIX-B04a/original): original registration belongs to f1 " +
+                    b04aDiagnostic("original-f1", original, before, f1, f1), f1, original.fence)
                 val rotatedAt = nowMillis()
                 krxVisible.set(false)
                 entitlements += ok(PREMIUM_HIDDEN)
                 kotlinx.coroutines.withTimeout(10_000) { rig.coordinator.refresh(RefreshIntent.FORCE_ENTITLEMENTS) }
                 val f2 = checkNotNull(rig.coordinator.topicGrantResult().fence)
-                assertEquals("$label: premise: the same user epoch", f1.userAccessEpoch, f2.userAccessEpoch)
-                assertNotEquals("$label: premise: the KRX epoch moved", e1, rig.epochStore.load().krxCapabilityEpoch)
-                awaitTrue("$label: the new context is consumed", deadline) { rig.assembly.coordinator.state.value.source?.fence == f2 }
-                assertEquals("$label: the old 3m request is released (no 3m registered)", false to null as String?, rig.usdCaptureEpoch("3m"))
+                assertEquals("precondition(FIX-B04a/context): the same user epoch " +
+                    b04aDiagnostic("rotation", original, before, f1, f2), f1.userAccessEpoch, f2.userAccessEpoch)
+                assertNotEquals("precondition(FIX-B04a/context): the KRX epoch moved " +
+                    b04aDiagnostic("rotation", original, before, f1, f2), e1, rig.epochStore.load().krxCapabilityEpoch)
+                assertNotEquals("precondition(FIX-B04a/context): f1 and f2 are different contexts " +
+                    b04aDiagnostic("rotation", original, before, f1, f2), f1, f2)
+                var consumed: B04aRead? = null
+                var lastContextView = before
+                try {
+                    awaitTrue("precondition(FIX-B04a/context): the new context is consumed", deadline) {
+                        val view = rig.b04aRead(original)
+                        lastContextView = view
+                        if (view.source?.fence == f2) { consumed = view; true } else false
+                    }
+                } catch (failure: AssertionError) {
+                    throw AssertionError("precondition(FIX-B04a/context): the new context is consumed " +
+                        b04aDiagnostic("context-await-failed", original, lastContextView, f1, f2), failure)
+                }
+                val released = checkNotNull(consumed)
+                assertTrue("contract(FIX-B04a/released): original registration released " +
+                    b04aDiagnostic("context-consumed", original, released, f1, f2),
+                    released.original?.let { !it.registered && it.disposed } == true)
+                val current = released.current
+                assertTrue("contract(FIX-B04a/replacement): current registration belongs to f2 " +
+                    b04aDiagnostic("context-consumed", original, released, f1, f2),
+                    current == null || current.instance !== original.instance && current.requestId != original.requestId &&
+                        current.fence == f2 && current.lifetime == released.source?.lifetime &&
+                        (current.capture?.let { capture ->
+                            capture.fence == current.fence && capture.lifetime == current.lifetime && capture.krxCapabilityEpoch == null
+                        } ?: true))
 
                 holdOld.countDown()
                 awaitTrue("$label: the old 3m body ended", deadline) { tabs().first { it.param("period") == "3m" }.bodyEnd != null }
-                assertEquals("$label: premise: the old answer was a 200", 200, tabs().first { it.param("period") == "3m" }.status)
+                assertEquals("precondition(FIX-B04a/old-body): the old answer was a 200 " +
+                    b04aDiagnostic("old-body-ended", original, released, f1, f2), 200, tabs().first { it.param("period") == "3m" }.status)
+                var lastCompletionView = released
+                try {
+                    awaitTrue("precondition(FIX-B04a/completion): original completion consumed", deadline) {
+                        val view = rig.b04aRead(original)
+                        lastCompletionView = view
+                        view.original?.let { !it.completionPending && !it.handlingCompletion } == true
+                    }
+                } catch (failure: AssertionError) {
+                    throw AssertionError("precondition(FIX-B04a/completion): original completion consumed " +
+                        b04aDiagnostic("completion-await-failed", original, lastCompletionView, f1, f2), failure)
+                }
                 delay(500)
-                val key = rig.usdKey("3m")
-                assertNull("$label: no 3m entry from the old answer", key)
-                assertTrue("$label: no old value anywhere in the entries", rig.onMain {
+                val completed = rig.b04aRead(original)
+                assertFalse("contract(FIX-B04a/old-body): no old 3m entry " +
+                    b04aDiagnostic("old-completion-consumed", original, completed, f1, f2), completed.entry3m)
+                assertFalse("contract(FIX-B04a/old-body): no old 3m slot " +
+                    b04aDiagnostic("old-completion-consumed", original, completed, f1, f2), completed.slot3m)
+                assertTrue("contract(FIX-B04a/old-values): no original values " +
+                    b04aDiagnostic("old-completion-consumed", original, completed, f1, f2), rig.onMain {
                     rig.assembly.coordinator.state.value.entries.values
                         .flatMap { e -> e.tab.graph.series.flatMap { s -> s.points.flatMap { listOfNotNull(it.rate, it.high, it.low) } } }
                         .toSet().intersect(oldAll).isEmpty()
                 })
                 rig.awaitWritesDrained(label, deadline)
-                assertEquals("$label: no KRX file written or changed by the old answer", emptySet<String>(), rig.krxWrittenSince(krxBefore))
+                assertEquals("contract(FIX-B04a/old-krx-write): no new or changed KRX file " +
+                    b04aDiagnostic("old-completion-writes-drained", original, completed, f1, f2), emptySet<String>(), rig.krxWrittenSince(krxBefore))
                 holdNew.countDown()
                 settleNewSession(label, rotatedAt, deadline)
                 rig.awaitWritesDrained(label, deadline)
                 // Everything after the rotation is KRX-hidden, so a late write of the old answer is the only way a KRX file appears.
-                assertEquals("$label: still no KRX file written or changed at the end", emptySet<String>(), rig.krxWrittenSince(krxBefore))
+                assertEquals("contract(FIX-B04a/old-krx-write): no new or changed KRX file " +
+                    b04aDiagnostic("new-session-settled-writes-drained", original, rig.b04aRead(original), f1, f2), emptySet<String>(), rig.krxWrittenSince(krxBefore))
             }
         } finally {
             holdOld.countDown()
