@@ -59,8 +59,11 @@ Android implementation        : **S0 COMPLETE · S1·S2 부분구현 · S1.5 주
                                 S6-3b-1(`1fff9b8`: 그래프 KRX 원본 귀속·D1 cutoff로 old KRX 접근 차단, 스위치 꺼짐, 2026-10-28),
                                 S6-3b-2(`0302b58`: 그래프 KRX 선택 물리 purge·CAPABILITY memory target, 스위치 꺼짐, 2026-10-28),
                                 S6-3c(`4be5b85`: 알림 탭 의도의 metadata 보존과 KRX tap 선택 폐기, 스위치 꺼짐, 2026-10-29),
-                                S6-3c-fix(`e7a5004`: 비KRX pending tap의 인증 경계 귀속, 스위치 꺼짐, 2026-10-29)를
-                                land했다. S6-3은 2026-10-31 완료로 판정했다(내부 이정표, 한정은 S6 '진행'). 다음은 S6-4 기본 꺼짐 준비 →
+                                S6-3c-fix(`e7a5004`: 비KRX pending tap의 인증 경계 귀속, 스위치 꺼짐, 2026-10-29),
+                                S6-4a(`6087b64`: 운영 KRX desired 생산자·정리·receipt 경계, 스위치 꺼짐, 2026-11-01)와
+                                그 시험 관측 보수 S6-4a-fix·obs(`0cb5f05`·`35e7d5a`: 시험만, 2026-11-01)를
+                                land했다. S6-3은 2026-10-31, S6-4a는 2026-11-02 완료로 판정했다(내부 이정표, 한정은 S6 '진행').
+                                다음은 S6-4b·S6-4c 기본 꺼짐 준비 →
                                 S6-2b-2β(최종 동일 후보의 측정용 켬·P1(b))다 (P1(a) 조건부 판정과 남은 조건은 S6 '진행' 항목).
                                 S0 근거: 구현·hosted CI `b477c22` / run `33496421777` green, current-runner S0-f·S0-g
                                 실기기 evidence도 `b477c22`에서 validator green
@@ -1820,7 +1823,26 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   9445/0). 실제 UNKNOWN 0을 확인한 것은 아니며, S6 최종 완료 조건(그 증거 또는 별도 결정, P3-i 실제 disk purge)은
   그대로다. U2 = 을: 다음 S5 정식 측정·golden은 S6-4의 fixture 갱신 뒤에 한다(U1 결정, S0-f 재봉인, 정식 측정, 기기
   조작의 승인은 아니다). S6-4 진입 조건은 S6-4 변경 후보의 exact-state 합의만 남았고 설계를 시작했다.
-  · 보류: KRX desired 운영 생산자(S6-4), 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
+  · S6-4a(`6087b64`, 2026-11-01, 스위치 꺼짐): S6-4를 4a(운영 desired 생산자·정리·same-read·허가 소비, F1/G1·TBO 분리,
+  실제 HEAD OFF)·4b(fixture·Python·K1x)·4c(예산 하네스·D18/D19·D06 same-p)로 나눈 첫 슬라이스다(트리 밖 scope r22 분할, r23 상한).
+  TopicSessionCoordinator에 start 전 1회 installer와 같은 판독 기반 desired 동기화를 두고, OFF에서는 HEAD와 같은 runtime
+  동작을 유지한다. 실제 종료는 원 tuple 은퇴 → KRX job 취소 → 선택 purge → desired 제거 순서이고 AWAITING/HOLD는 종료가
+  아니다. CAP-only 전이에서는 GENERAL을 보존하고, USER/grant 종료에서는 기존 GENERAL use를 차단한다. 같은 (grantEpoch,
+  permit)의 수락된 WS receipt만 automatic 의무를 충족하고 explicit은 기존 계약이다. 신규 계약 18메서드(231 하위열),
+  단위 debug 9465/0·ciMinified·benchmark·s5Benchmark 전체 통과, 실제 4f4cc63 HEAD에서 동결한 OFF trace와 4변형 비교 통과,
+  변이 91항목(PATCH 77 계약 검출·컴파일 호환 4·내부 음성 10), 독립 검토 통과. 새 OFF C02 13행은 PR #1(run `41250569042`)에서
+  통과했다. main 반영 뒤 hosted CI는 C02 `41255398506`이 green이고, Android `41255398504`는 attempt 1에서 cutover
+  RT01-B04a의 관측 단언이 실패한 뒤 attempt 2에서 통과했다. 이 실패로 S6-4a 완료를 보류했다. 독립 검토가 처음 낸
+  시험 공백 3건(explicit-after-receipt 미도달, D11 B 준비 경합, D14 두 축 측정층)과 teardown 진단 1건은 시험 쪽에서 고쳤다.
+  · S6-4a-fix(`0cb5f05`, 시험만): RT01-B04a를 원 요청 신원 기반 관측(원 E1 registration 해제·옛 완료 적용 0·KRX 쓰기 0)으로
+  바꿨다. 그 PR(#2) CI에서 다른 행 RT03b-Q05c가 `byRound=true, permitOpen=false`로 실패했고, 진단(S6-4a-diag)은 기준·후보
+  양쪽에서 near-miss를 관측했지만 원인은 정하지 못했다.
+  · S6-4a-obs(`35e7d5a`, 시험만): 같은 permit 관측을 쓰는 6행(RT03b-Q04·Q04u·Q05a·Q05c·Q05d, S6B C08)만 원 registration의
+  round 표지와 실제 final network guard의 단일 permit 판독에 결속했다. 나머지 104행과 C02 계량 13행은 원 경로를 그대로 쓴다.
+  fix와 함께 PR #3으로 같은 tree의 Android·cutover·OFF C02 13행 CI를 통과한 뒤 main에 반영했고(2026-11-01), post-land
+  Android `41316463835`·C02 `41316463854`는 attempt 1에서 green이다. S6-4a는 2026-11-02 통합 완료로 판정했다(내부 이정표,
+  기본 꺼짐 준비 슬라이스 한정 — S6-4b·S6-4c·β 최종 켬·S6 DoD는 미완료). 원 RT03b-Q05c 실패의 원인은 여전히 정하지 못했다.
+  · 보류: S6-4b(상한은 트리 밖 scope r24에서 14시간+CI 대기로 확정)·S6-4c, 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
   A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
   답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)다. 다음 D4 판 조건은 D4 r6(A2 r8·A1 r9 반영, 트리 밖
   manifest r7)으로 채웠고, 남은 조건은 2b-2 계약의 CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. scope U10(CUT-C01
