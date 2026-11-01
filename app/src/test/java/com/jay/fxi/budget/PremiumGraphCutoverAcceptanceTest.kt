@@ -174,6 +174,14 @@ class PremiumGraphCutoverAcceptanceTest {
      * and sent with it as [PERMIT_HEADER], so a server hook knows what held when it was sent.
      */
     @Volatile private var permitAtSend: (() -> String?)? = null
+
+    /** S6-4a-obs: the one observed rig the server records graph requests for; per test instance, bound and released by that rig. */
+    private val observationPort = GraphSendObservation.Port()
+
+    /** S6-4a-obs (scope r27): the six rows whose permit filter reads the send's receipt. A rig built without one is not observed. */
+    private enum class ObservationRow(val label: String) {
+        Q04("RT03b-Q04"), Q04U("RT03b-Q04u"), Q05A("RT03b-Q05a"), Q05C("RT03b-Q05c"), Q05D("RT03b-Q05d"), C08("S6B C08")
+    }
     private val tetherCalls = AtomicInteger()
     private val wire = Json { ignoreUnknownKeys = true }
     /** While set, the usd topic's REST bootstrap answers a current kb quote (a real delivery); otherwise 404 as before. */
@@ -292,8 +300,14 @@ class PremiumGraphCutoverAcceptanceTest {
                                 .setBody("""{"detail":"rate limited"}""")
                         else if (url.queryParameter("topic") == TETHER && tetherCalls.getAndIncrement() == 0) unauthorized()
                         else MockResponse().setResponseCode(404).setBody("""{"error":"topic_unavailable"}""")
-                    "/api/v2/graph/catalog" -> onCatalog(request)
-                    "/api/v2/graph/tab" -> onTab(request)
+                    "/api/v2/graph/catalog" -> {
+                        observationPort.current()?.recordServer(request, "catalog")
+                        onCatalog(request)
+                    }
+                    "/api/v2/graph/tab" -> {
+                        observationPort.current()?.recordServer(request, "tab")
+                        onTab(request)
+                    }
                     else -> MockResponse().setResponseCode(404)
                 }
             }
@@ -417,27 +431,68 @@ class PremiumGraphCutoverAcceptanceTest {
     }
 
     /** The production provider's client with its D24 interceptor opened and the recorder last (INT-b S01). */
-    private fun harnessClient(provider: AuthTokenProvider): OkHttpClient =
-        NetworkModule.provideProtectedOkHttpClient(AuthSnapshotInterceptor(provider), TopicUseNetworkInterceptor(provider))
+    private fun harnessClient(
+        provider: AuthTokenProvider,
+        observation: GraphSendObservation? = null,
+        networkGuard: TopicUseNetworkInterceptor = TopicUseNetworkInterceptor(provider)
+    ): OkHttpClient =
+        NetworkModule.provideProtectedOkHttpClient(AuthSnapshotInterceptor(provider), networkGuard)
             .newBuilder()
             .apply {
                 check(interceptors()[0] is ReleaseAdmissionInterceptor) { "premise: D24 is the first application interceptor" }
                 interceptors()[0] = ReleaseAdmissionInterceptor(admitted = { true })
+                if (observation != null) {
+                    // S6-4a-obs: the real guard keeps its index, wrapped; an unobserved client keeps the very same instance.
+                    val guards = networkInterceptors().indices.filter { networkInterceptors()[it] is TopicUseNetworkInterceptor }
+                    check(guards.size == 1) { "precondition(OBS): one real guard among the network interceptors, found ${guards.size}" }
+                    networkInterceptors()[guards.single()] = observation.wrap(networkInterceptors()[guards.single()])
+                    check(GraphSendObservation.PERMIT_HEADER == PERMIT_HEADER) { "precondition(OBS): one permit header name" }
+                }
             }
             .addNetworkInterceptor { chain ->
                 val request = chain.request()
-                val tag = if (request.url.encodedPath.startsWith("/api/v2/graph/")) permitAtSend?.invoke() else null
-                chain.proceed(if (tag == null) request else request.newBuilder().header(PERMIT_HEADER, tag).build())
+                if (observation != null) {
+                    // S6-4a-obs: the permit header from the guard's own read and the join id; a selected row reads no live permit.
+                    chain.proceed(observation.stamp(request, if (GraphSendObservation.isGraph(request)) observation.beforeHeader() else null))
+                } else {
+                    val tag = if (request.url.encodedPath.startsWith("/api/v2/graph/")) permitAtSend?.invoke() else null
+                    chain.proceed(if (tag == null) request else request.newBuilder().header(PERMIT_HEADER, tag).build())
+                }
             }
             .addNetworkInterceptor(sends.interceptor)
             .build()
 
-    private inner class Rig(identity: AuthIdentity? = AuthIdentity("user-a", 1), blockDisk: Boolean = false, blockKrx: Boolean = false) {
+    /**
+     * S6-4a-obs OBS08 (review r1 R3): this harness's client built without an observer, its real guard and a counted permitAtSend,
+     * for the observation contract test. No server, rig or row; the main dispatcher is closed after [body].
+     */
+    internal fun withInactiveObservationClientContract(body: (OkHttpClient, okhttp3.Interceptor, AtomicInteger) -> Unit) {
+        val provider = AuthTokenProvider(Firebase(AuthIdentity("user-a", 1)), orders = accessOrders)
+        val networkGuard = TopicUseNetworkInterceptor(provider)
+        val permitCalls = AtomicInteger()
+        permitAtSend = { permitCalls.incrementAndGet(); "closed" }
+        try {
+            body(harnessClient(provider, networkGuard = networkGuard), networkGuard, permitCalls)
+        } finally {
+            permitAtSend = null
+            main.close()
+        }
+    }
+
+    private inner class Rig(
+        identity: AuthIdentity? = AuthIdentity("user-a", 1),
+        blockDisk: Boolean = false,
+        blockKrx: Boolean = false,
+        observationRow: ObservationRow? = null
+    ) {
+        /** S6-4a-obs: built before the client and the graph builder, so both carry it from the row's first send. */
+        val observation: GraphSendObservation? = observationRow?.let { GraphSendObservation(it.label) }?.also { observationPort.bind(it) }
+        fun observed(): GraphSendObservation = checkNotNull(observation) { "precondition(OBS): this row is not observed" }
         val firebase = Firebase(identity)
         val provider = AuthTokenProvider(firebase, orders = accessOrders)
         private val wireJson = NetworkModule.provideWireJson()
         val api = AuthenticatedApiClient(
-            Retrofit.Builder().baseUrl(server.url("/")).client(harnessClient(provider))
+            Retrofit.Builder().baseUrl(server.url("/")).client(harnessClient(provider, observation))
                 .addConverterFactory(wireJson.asConverterFactory("application/json".toMediaType())).build()
                 .create(AuthenticatedApiService::class.java),
             AuthenticatedTransport(provider, admitted = { true }),
@@ -596,7 +651,7 @@ class PremiumGraphCutoverAcceptanceTest {
             permitSlot = permit
             builds.incrementAndGet()
             val before = parent.children.toSet()
-            val built = production.build(permit, seed, timeEvent, parent)
+            val built = production.build(GraphSendObservation.slotOrOriginal(observation, permit), seed, timeEvent, parent)
             assemblyJob = (parent.children.toSet() - before).singleOrNull()
             // The holder factory stays the production one; the wrapper only keeps the display flow it is handed.
             com.jay.fxi.data.graph.ProcessGraphParts(built.assembly, built.seeds) { tab, display, focus, scope ->
@@ -814,13 +869,24 @@ class PremiumGraphCutoverAcceptanceTest {
     }
 
     private suspend fun Rig.row(body: suspend () -> Unit) {
-        try {
-            body()
-        } catch (failure: Throwable) {
-            runCatching { finish() }.exceptionOrNull()?.let(failure::addSuppressed)
-            throw failure
+        val observed = observation
+        if (observed == null) {
+            try {
+                body()
+            } catch (failure: Throwable) {
+                runCatching { finish() }.exceptionOrNull()?.let(failure::addSuppressed)
+                throw failure
+            }
+            finish()
+        } else {
+            GraphSendObservation.runRow(body, { finish() }, { closeObservation(observed) })
         }
-        finish()
+    }
+
+    /** S6-4a-obs: releases the port and runs the row's final completeness check, whatever the row's own outcome. */
+    private fun closeObservation(observation: GraphSendObservation) {
+        observationPort.release(observation)
+        observation.assertComplete(observation.row)
     }
 
     private fun graph(): List<SendRecorder.Exchange> = sends.all().filter { it.path.startsWith("/api/v2/graph/") }
@@ -3737,7 +3803,20 @@ class PremiumGraphCutoverAcceptanceTest {
      * coordinator holds it when the server takes the request (null when none is registered then); [permitOpen] is the live
      * recovery permit's `automatic` as the client read it sending the request ([permitAtSend]; null when untagged).
      */
-    private data class SendOrigin(val at: Long, val kind: String, val byRound: Boolean?, val permitOpen: Boolean?)
+    private data class SendOrigin(
+        val at: Long,
+        val kind: String,
+        val byRound: Boolean?,
+        val permitOpen: Boolean?,
+        /**
+         * S6-4a-obs selected rows (scope r27): there [byRound] is the original registration's flag and [permitOpen] the real final
+         * guard's own permit read, both from the send's receipt; a non-round send makes no guard read, so it has no permit and is
+         * marked here, never mistaken for a round whose read is missing.
+         */
+        val notRound: Boolean = false,
+        /** S6-4a-obs selected rows: the server hook's late current registration, kept for diagnosis only. */
+        val lateByRound: Boolean? = null
+    )
 
     /** The [permitAtSend] reader of a row: the live permit's `automatic`, read off Main (the session publishes it volatile). */
     private fun Rig.permitTag(): () -> String? = { if (permitSlot?.get()?.invoke()?.automatic == true) "open" else "closed" }
@@ -3750,8 +3829,14 @@ class PremiumGraphCutoverAcceptanceTest {
             val requests = privateField(c, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
             requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period.code == "1d" }?.value
         }
-        SendOrigin(nowMillis(), if (catalog) "catalog" else "tab", registration?.let { privateField(it, "automaticRecovery") as Boolean },
+        val observed = observation
+        if (observed == null) SendOrigin(nowMillis(), if (catalog) "catalog" else "tab", registration?.let { privateField(it, "automaticRecovery") as Boolean },
             when (request.getHeader(PERMIT_HEADER)) { "open" -> true; "closed" -> false; else -> null })
+        else observed.factsFor(request).let { facts ->
+            // S6-4a-obs: the original registration and the real guard's own read; the late current registration is diagnosis only.
+            SendOrigin(nowMillis(), if (catalog) "catalog" else "tab", facts.byRound, facts.permitOpen, facts.notRound,
+                registration?.let { privateField(it, "automaticRecovery") as Boolean })
+        }
     }
 
     /**
@@ -3777,7 +3862,7 @@ class PremiumGraphCutoverAcceptanceTest {
         val wallAtOrigin = System.currentTimeMillis() - nowMillis()
         entitlements += unauthorized()
         entitlements += ok(premiumKrxVisible)
-        val rig = Rig()
+        val rig = Rig(observationRow = ObservationRow.Q04)
         val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
             while (true) {
                 if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
@@ -3964,7 +4049,8 @@ class PremiumGraphCutoverAcceptanceTest {
                 assertTrue("$label: catalogs since the cycle opened (${catalogTimes.size}) are at most rounds + grant changes " +
                     "(${last.rounds} + ${changes.size})\n${sends.timeline()}", catalogTimes.size <= last.rounds + changes.size)
                 // Every request a round issued went with the permit open, as the client read it sending the request.
-                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                rig.observed().assertComplete(label)
+                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null || it.notRound })
                 assertEquals("$label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
                     sent.filter { it.byRound == true && it.permitOpen != true })
                 // End cleanly: the rest of the window, then the new session settles.
@@ -4020,7 +4106,7 @@ class PremiumGraphCutoverAcceptanceTest {
         entitlements += ok(premiumKrxVisible)
         tetherCalls.set(1)
         dxyBootstrapRetryAfter = "25"
-        val rig = Rig()
+        val rig = Rig(observationRow = ObservationRow.Q04U)
         var sampler: kotlinx.coroutines.Job? = null
         try {
             rig.row {
@@ -4160,7 +4246,8 @@ class PremiumGraphCutoverAcceptanceTest {
                     pairs.filter { (at, o) -> o.byRound == false && releaseWindows.none { (from, until) -> at in from..until } }.map { it.first })
                 assertTrue("$label: the rounds' own catalogs are at most the rounds (${last.rounds})\n${sends.timeline()}",
                     pairs.count { it.second.byRound == true } <= last.rounds)
-                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                rig.observed().assertComplete(label)
+                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null || it.notRound })
                 assertEquals("$label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
                     sent.filter { it.byRound == true && it.permitOpen != true })
                 // End cleanly: the rest of the window, then the session settles.
@@ -4213,7 +4300,7 @@ class PremiumGraphCutoverAcceptanceTest {
         val deadline = start + 70_000
         val wallAtOrigin = System.currentTimeMillis() - nowMillis()
         entitlements += unauthorized()
-        val rig = Rig()
+        val rig = Rig(observationRow = ObservationRow.Q05A)
         val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
             while (true) {
                 if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
@@ -4368,7 +4455,8 @@ class PremiumGraphCutoverAcceptanceTest {
                 val sent = synchronized(origins) { origins.toList() }
                 println("CUT-C01 $label origins $sent")
                 assertEquals("$label: premise: every catalog since the hook is attributed", catalogs().size - catalogsAtHook, sent.count { it.kind == "catalog" })
-                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                rig.observed().assertComplete(label)
+                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null || it.notRound })
                 assertEquals("$label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
                     sent.filter { it.byRound == true && it.permitOpen != true })
             }
@@ -4467,7 +4555,7 @@ class PremiumGraphCutoverAcceptanceTest {
         val deadline = start + 90_000
         val wallAtOrigin = System.currentTimeMillis() - nowMillis()
         entitlements += unauthorized()
-        val rig = Rig()
+        val rig = Rig(observationRow = ObservationRow.Q05C)
         val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
             while (true) {
                 if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
@@ -4597,7 +4685,8 @@ class PremiumGraphCutoverAcceptanceTest {
                 assertEquals("$label: no topic bootstrapped again on this grant: ${bootstraps().drop(bootstrapsBefore).map { it.param("topic") }}",
                     bootstrapsBefore, bootstraps().size)
                 val sent = synchronized(origins) { origins.toList() }
-                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                rig.observed().assertComplete(label)
+                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null || it.notRound })
                 assertEquals("$label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
                     sent.filter { it.byRound == true && it.permitOpen != true })
                 onTab = { request -> origins += runBlocking { rig.sendOrigin(catalog = false, request) }; ok(usdTab(starts)) }
@@ -4634,7 +4723,7 @@ class PremiumGraphCutoverAcceptanceTest {
         val deadline = start + 160_000
         val wallAtOrigin = System.currentTimeMillis() - nowMillis()
         entitlements += unauthorized()
-        val rig = Rig()
+        val rig = Rig(observationRow = ObservationRow.Q05D)
         val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
             while (true) {
                 if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
@@ -4716,7 +4805,8 @@ class PremiumGraphCutoverAcceptanceTest {
                     catalogPairs.count { it.second.byRound == false } <= changes.size)
                 assertTrue("$label: the rounds' own catalogs are at most the rounds (${waiting.rounds})",
                     catalogPairs.count { it.second.byRound == true } <= waiting.rounds)
-                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                rig.observed().assertComplete(label)
+                assertTrue("$label: premise: every graph request was tagged as it was sent", sent.all { it.permitOpen != null || it.notRound })
                 assertEquals("$label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
                     sent.filter { it.byRound == true && it.permitOpen != true })
             }
@@ -9570,12 +9660,20 @@ class PremiumGraphCutoverAcceptanceTest {
         identityChangedRow("C02M-A05t3000", merged = true, changeAt = 3_000)
     // S6B BEGIN
     // β r2 §7/§9/§11: resources are created only when this private ON rig is instantiated.
-    private inner class S6BetaOnRig(identity: AuthIdentity? = AuthIdentity("user-a", 1), blockDisk: Boolean = false, blockKrx: Boolean = false) {
+    private inner class S6BetaOnRig(
+        identity: AuthIdentity? = AuthIdentity("user-a", 1),
+        blockDisk: Boolean = false,
+        blockKrx: Boolean = false,
+        observationRow: ObservationRow? = null
+    ) {
+        /** S6-4a-obs: built before the client and the graph builder, so both carry it from the row's first send. */
+        val observation: GraphSendObservation? = observationRow?.let { GraphSendObservation(it.label) }?.also { observationPort.bind(it) }
+        fun observed(): GraphSendObservation = checkNotNull(observation) { "precondition(OBS): this row is not observed" }
         val firebase = Firebase(identity)
         val provider = AuthTokenProvider(firebase, orders = accessOrders)
         private val wireJson = NetworkModule.provideWireJson()
         val api = AuthenticatedApiClient(
-            Retrofit.Builder().baseUrl(server.url("/")).client(harnessClient(provider))
+            Retrofit.Builder().baseUrl(server.url("/")).client(harnessClient(provider, observation))
                 .addConverterFactory(wireJson.asConverterFactory("application/json".toMediaType())).build()
                 .create(AuthenticatedApiService::class.java),
             AuthenticatedTransport(provider, admitted = { true }),
@@ -9735,7 +9833,7 @@ class PremiumGraphCutoverAcceptanceTest {
             permitSlot = permit
             builds.incrementAndGet()
             val before = parent.children.toSet()
-            val built = production.build(permit, seed, timeEvent, parent)
+            val built = production.build(GraphSendObservation.slotOrOriginal(observation, permit), seed, timeEvent, parent)
             assemblyJob = (parent.children.toSet() - before).singleOrNull()
             // The holder factory stays the production one; the wrapper only keeps the display flow it is handed.
             com.jay.fxi.data.graph.ProcessGraphParts(built.assembly, built.seeds) { tab, display, focus, scope ->
@@ -9950,13 +10048,18 @@ class PremiumGraphCutoverAcceptanceTest {
     }
 
     private suspend fun S6BetaOnRig.s6Row(body: suspend () -> Unit) {
-        try {
-            body()
-        } catch (failure: Throwable) {
-            runCatching { s6Finish() }.exceptionOrNull()?.let(failure::addSuppressed)
-            throw failure
+        val observed = observation
+        if (observed == null) {
+            try {
+                body()
+            } catch (failure: Throwable) {
+                runCatching { s6Finish() }.exceptionOrNull()?.let(failure::addSuppressed)
+                throw failure
+            }
+            s6Finish()
+        } else {
+            GraphSendObservation.runRow(body, { s6Finish() }, { closeObservation(observed) })
         }
-        s6Finish()
     }
 
     private suspend fun S6BetaOnRig.s6Open(row: String) {
@@ -10115,8 +10218,14 @@ class PremiumGraphCutoverAcceptanceTest {
             val requests = privateField(c, "tabRequests") as Map<com.jay.fxi.data.graph.GraphKey, Any>
             requests.entries.firstOrNull { it.key.tab == "usd" && it.key.period.code == "1d" }?.value
         }
-        SendOrigin(nowMillis(), if (catalog) "catalog" else "tab", registration?.let { privateField(it, "automaticRecovery") as Boolean },
+        val observed = observation
+        if (observed == null) SendOrigin(nowMillis(), if (catalog) "catalog" else "tab", registration?.let { privateField(it, "automaticRecovery") as Boolean },
             when (request.getHeader(PERMIT_HEADER)) { "open" -> true; "closed" -> false; else -> null })
+        else observed.factsFor(request).let { facts ->
+            // S6-4a-obs: the original registration and the real guard's own read; the late current registration is diagnosis only.
+            SendOrigin(nowMillis(), if (catalog) "catalog" else "tab", facts.byRound, facts.permitOpen, facts.notRound,
+                registration?.let { privateField(it, "automaticRecovery") as Boolean })
+        }
     }
 
     private fun S6BetaOnRig.s6Session(): com.jay.fxi.data.remote.TopicSessionCoordinator {
@@ -10770,7 +10879,7 @@ class PremiumGraphCutoverAcceptanceTest {
         val wallAtOrigin = System.currentTimeMillis() - nowMillis()
         entitlements += unauthorized()
         entitlements += ok(premiumKrxVisible)
-        val rig = S6BetaOnRig()
+        val rig = S6BetaOnRig(observationRow = ObservationRow.C08)
         val restorer = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
             while (true) {
                 if (!rig.issuerIdentityReadable && rig.coordinator.recheckDiagnostics().owedIntent != null) rig.issuerIdentityReadable = true
@@ -10971,7 +11080,8 @@ class PremiumGraphCutoverAcceptanceTest {
                 assertTrue("contract(C08): $label: catalogs since the cycle opened (${catalogTimes.size}) are at most rounds + grant changes " +
                     "(${last.rounds} + ${changes.size})\n${sends.timeline()}", catalogTimes.size <= last.rounds + changes.size)
                 // Every request a round issued went with the permit open, as the client read it sending the request.
-                assertTrue("contract(C08): $label: every graph request was tagged as it was sent", sent.all { it.permitOpen != null })
+                rig.observed().assertComplete(label)
+                assertTrue("contract(C08): $label: every graph request was tagged as it was sent", sent.all { it.permitOpen != null || it.notRound })
                 assertEquals("contract(C08): $label: no round-issued request without the permit\n${sends.timeline()}", emptyList<SendOrigin>(),
                     sent.filter { it.byRound == true && it.permitOpen != true })
                 // End cleanly: the rest of the window, then the new session settles.
