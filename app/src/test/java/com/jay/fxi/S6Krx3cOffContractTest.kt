@@ -204,8 +204,12 @@ class S6Krx3cOffContractTest {
 
     @Test fun o06_exactSourceInventoryRejectsExpansion() = marked("O06") {
         val actual = S6Krx3bOffWiringContractTest.sourceInventory()
-        fun fingerprint(map: Map<String, String>): String = S6Krx3cShellSourceContract.sha(map.keys.filter { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA) }.sorted()
-            .joinToString("") { "$it\u0000${S6Krx3cShellSourceContract.sha(map.getValue(it).toByteArray(Charsets.UTF_8))}\n" }.toByteArray(Charsets.UTF_8))
+        fun fingerprint(map: Map<String, String>): String {
+            val actualHashes = map.mapValues { (_, text) -> S6Krx3cShellSourceContract.sha(text.toByteArray(Charsets.UTF_8)) }
+            val legacyHashes = S64bFixtureDelta.normalizeForLegacyFingerprint(actualHashes)
+            return S6Krx3cShellSourceContract.sha(map.keys.filter { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA) }.sorted()
+                .joinToString("") { "$it\u0000${legacyHashes.getValue(it)}\n" }.toByteArray(Charsets.UTF_8))
+        }
         val raw = actual.keys.associateWith { File(it).readText(Charsets.UTF_8) }
         assertTrue("contract(O06/normal): exact10 production files exist", NORMAL.all { it in actual })
         assertEquals("contract(O06/protected): exact349 unchanged production files", 349, raw.keys.count { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA) })

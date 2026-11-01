@@ -153,7 +153,11 @@ class KrxS6DormancyContractTest {
      */
     @Test fun Z05_krxTopicNameStaysDeclaredOnceAndUnusedOutsideTheAdapter() {
         val krxFutures = Regex("""\bKRX_FUTURES\b""")
-        assertEquals("contract(Z05): KRX_FUTURES files", setOf(TSC, ADAPTER, TBO), files(krxFutures))
+        val fixtureRoutes = "src/s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureRoutes.kt"
+        val fixtureServer = "src/s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureServer.kt"
+        // D16 permits the identifier in exactly these two fixture paths, including the pre-implementation HEAD state.
+        assertEquals("contract(Z05): KRX_FUTURES files", setOf(TSC, ADAPTER, TBO),
+            files(krxFutures) - setOf(fixtureRoutes, fixtureServer))
         val tsc = code.getValue(TSC)
         assertTrue("contract(Z05): positive control: TopicCatalogue declares the predicate", Regex("""\bfun\s+carriesKrx\s*\(""").containsMatchIn(tsc))
         // Added (c, review): the predicate is internal and sits inside object TopicCatalogue.
@@ -166,7 +170,12 @@ class KrxS6DormancyContractTest {
         // TopicSessionCoordinator.kt:68 (declaration) + the TopicCatalogue predicate body (S6-2b-1b-α).
         assertEquals("contract(Z05): KRX_FUTURES three in TSC (declaration + predicate + stable cleanup)", 3, krxFutures.findAll(tsc).count())
         // TopicFrameDecoder.kt:63, TopicSessionCoordinator.kt:68.
-        assertEquals("contract(Z05): topic literal occurrences", mapOf(DECODER to 1, TSC to 1), occurrences(Regex(""""krx:usd-krw-futures"""")))
+        val topicLiterals = occurrences(Regex(""""krx:usd-krw-futures""""))
+        val allowedLiteralOccurrences = setOf(
+            mapOf(DECODER to 1, TSC to 1),
+            mapOf(DECODER to 1, TSC to 1, fixtureRoutes to 1)
+        )
+        assertTrue("contract(Z05): topic literal occurrences: $topicLiterals", topicLiterals in allowedLiteralOccurrences)
         // Added (a): outside the one declaration, the one use is the predicate body.
         assertEquals("contract(Z05): (added) one KRX_FUTURES declaration in TSC", 1, Regex("""\bconst\s+val\s+KRX_FUTURES\s*=""").findAll(tsc).count())
         val body = predicateBody(tsc)

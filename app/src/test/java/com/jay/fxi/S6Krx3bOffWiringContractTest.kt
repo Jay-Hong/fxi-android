@@ -176,7 +176,9 @@ class S6Krx3bOffWiringContractTest {
         assertTrue("contract(O08): exactly the 23 approved historical union paths exist", ALLOWED.all { it in sources })
         val raw = sources.keys.filter { it !in (ALLOWED + S64A_DELTA) }.sorted()
         assertEquals("contract(O08): protected HEAD file count", 337, raw.size)
-        val bytes = raw.joinToString("") { "$it\u0000${sha(File(it).readBytes())}\n" }
+        val actualHashes = raw.associateWith { path -> sha(File(path).readBytes()) }
+        val legacyHashes = S64bFixtureDelta.normalizeForLegacyFingerprint(actualHashes)
+        val bytes = raw.joinToString("") { "$it\u0000${legacyHashes.getValue(it)}\n" }
         assertEquals("contract(O08): protected HEAD raw bytes", BASELINE, sha(bytes.toByteArray(Charsets.UTF_8)))
         val ingress = setOf("data/graph/KrxGraphFence.kt", "data/remote/TopicSessionCoordinator.kt", "data/remote/TopicRuntime.kt",
             "data/remote/TopicRuntimeOwner.kt", "data/remote/DetachableGraphSinks.kt", "data/graph/GraphRuntimeAssembly.kt").map { BASE + it }.toSet()

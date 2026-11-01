@@ -41,6 +41,9 @@ internal class S5FixtureServer(
 ) : AutoCloseable {
     private val server = MockWebServer()
     private val payloads = mutableMapOf<String, ByteArray>()
+
+    /** Numbers this server's connections, so each KRX lease id is fixed per connection (design amendment a1). */
+    private val connections = AtomicInteger()
     private val recent = ArrayDeque<String>()
     private val unexpected = AtomicInteger(0)
     private val closed = AtomicBoolean(false)
@@ -74,6 +77,7 @@ internal class S5FixtureServer(
         for (name in listOf("catalog.json", "tether-1d.json", "tether-1w.json", "usd-1d.json")) payloads[name] = load(name)
         payloads[S5FixtureRoutes.ENTITLEMENTS] = S5FixtureRoutes.ENTITLEMENTS_BODY.encodeToByteArray()
         payloads[S5FixtureRoutes.TETHER_SNAPSHOT] = S5FixtureRoutes.TOPIC_SNAPSHOTS.getValue(TopicCatalogue.TETHER).encodeToByteArray()
+        payloads[S5FixtureRoutes.KRX_SNAPSHOT] = S5FixtureRoutes.TOPIC_SNAPSHOTS.getValue(TopicCatalogue.KRX_FUTURES).encodeToByteArray()
         server.dispatcher = dispatcher
         server.start(InetAddress.getByName("127.0.0.1"), 0)
         onBound(server.port)
@@ -122,10 +126,19 @@ internal class S5FixtureServer(
 
     /**
      * One per connection. Acknowledges every subscribe and unsubscribe as fully accepted, then sends each newly subscribed topic's
-     * snapshot once; answers ping with pong; sends no live frame.
+     * snapshot once; answers ping with pong; sends no live frame. KRX (S6-4b D16) differs in two ways: its snapshot goes at most
+     * once per connection, after the first acknowledgement that names it; and every KRX entry of an acknowledgement carries this
+     * connection's lease (design amendment a1), since the app retires a KRX capture whose ACK has no lease.
      */
     private fun newSocketListener() = object : WebSocketListener() {
         private val active = linkedSetOf<String>()
+        private var krxSnapshotSent = false
+        private val krxLeaseId = "s5-fixture-krx-${connections.incrementAndGet()}"
+
+        /** A KRX entry carries the lease; a general entry carries none. */
+        private fun entry(topic: String) = if (topic == TopicCatalogue.KRX_FUTURES) {
+            SubscriptionAckTopic(topic, leaseId = krxLeaseId, leaseDurationSeconds = KRX_LEASE_SECONDS)
+        } else SubscriptionAckTopic(topic)
 
         override fun onMessage(webSocket: WebSocket, text: String) {
             if (text == "ping") {
@@ -143,18 +156,25 @@ internal class S5FixtureServer(
                     else -> return unexpected("S5 fixture: unknown frame type $type")
                 }
             }
-            val now = synchronized(active) { active.map { SubscriptionAckTopic(it) } }
+            val now = synchronized(active) { active.map { entry(it) } }
             val ack = SubscriptionAck(
                 requestId = id,
                 operation = type,
-                acceptedTopics = if (type == "subscribe") topics.map { SubscriptionAckTopic(it) } else emptyList(),
+                acceptedTopics = if (type == "subscribe") topics.map { entry(it) } else emptyList(),
                 rejectedTopics = emptyList(),
                 removedTopics = removed,
                 activeSubscriptions = now
             )
             webSocket.send(json.encodeToString(SubscriptionAck.serializer(), ack).replaceFirst("{", """{"type":"subscription_ack","""))
-            // After the acknowledgement, each accepted topic's snapshot once: its first delivery (S5-4 slice 4d).
-            if (type == "subscribe") for (topic in topics) S5FixtureRoutes.TOPIC_SNAPSHOTS[topic]?.let { webSocket.send(it) }
+            // After the acknowledgement, each accepted topic's snapshot once: its first delivery (S5-4 slice 4d). KRX's goes only
+            // on this connection's first acknowledgement naming it, whatever repeats, resubscribes or re-subscriptions follow.
+            if (type == "subscribe") for (topic in topics) {
+                if (topic == TopicCatalogue.KRX_FUTURES) {
+                    if (krxSnapshotSent) continue
+                    krxSnapshotSent = true
+                }
+                S5FixtureRoutes.TOPIC_SNAPSHOTS[topic]?.let { webSocket.send(it) }
+            }
         }
 
         /** Answers the peer's close, so the connection ends and the server can shut down. */
@@ -172,5 +192,8 @@ internal class S5FixtureServer(
 
     private companion object {
         const val RECORD_LIMIT = 64
+
+        /** The server wire's example duration (S/app/topic_lease.py), not the 900 s cap (design amendment a1). */
+        const val KRX_LEASE_SECONDS = 660L
     }
 }

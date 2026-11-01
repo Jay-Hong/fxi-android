@@ -28,6 +28,9 @@ internal object S5FixtureRoutes {
     /** The REST payload name of the tether topic snapshot; its body is [TOPIC_SNAPSHOTS]' tether entry. */
     const val TETHER_SNAPSHOT = "topic-snapshot-tether"
 
+    /** S6-4b D16: the REST payload name of the KRX topic snapshot; its body is [TOPIC_SNAPSHOTS]' KRX entry. */
+    const val KRX_SNAPSHOT = "topic-snapshot-krx"
+
     /**
      * S5-4 slice 4d: one snapshot per subscribed topic, each the same JSON as `contracts/v2/topic/snapshot-*.json` (the tether one
      * is also `contracts/v2/http/topic-snapshot-tether-200.json`). The tether entry answers the REST bootstrap, so the tether rate
@@ -39,7 +42,9 @@ internal object S5FixtureRoutes {
         TopicCatalogue.DXY to """{"data":{"dxy":{"rate":103.4,"source":"investing","timestamp":"2026-08-31T10:20:00+09:00"}},"topic":"dxy:spot","type":"snapshot","version":1}""",
         "fx:usd-krw" to """{"data":{"banks":[{"asset":"usd-krw","rate":1388.1,"source":"kb","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"usd-krw","rate":1388.1999999999998,"source":"hana","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"usd-krw","rate":1388.3,"source":"shinhan","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"usd-krw","rate":1388.3999999999999,"source":"woori","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"usd-krw","rate":1388.5,"source":"ibk","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"usd-krw","rate":1388.6,"source":"nh","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"usd-krw","rate":1388.6999999999998,"source":"sc","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"usd-krw","rate":1388.8,"source":"bs","timestamp":"2026-08-31T10:20:00+09:00"}],"reference":{"asset":"usd-krw","rate":1388.1,"source":"investing","timestamp":"2026-08-31T10:20:00+09:00"}},"topic":"fx:usd-krw","type":"snapshot","version":1}""",
         "fx:jpy-krw" to """{"data":{"banks":[{"asset":"jpy-krw","rate":9.45,"source":"kb","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"jpy-krw","rate":9.549999999999999,"source":"hana","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"jpy-krw","rate":9.649999999999999,"source":"shinhan","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"jpy-krw","rate":9.75,"source":"woori","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"jpy-krw","rate":9.85,"source":"ibk","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"jpy-krw","rate":9.95,"source":"nh","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"jpy-krw","rate":10.049999999999999,"source":"sc","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"jpy-krw","rate":10.149999999999999,"source":"bs","timestamp":"2026-08-31T10:20:00+09:00"}],"reference":{"asset":"jpy-krw","rate":9.45,"source":"investing","timestamp":"2026-08-31T10:20:00+09:00"}},"topic":"fx:jpy-krw","type":"snapshot","version":1}""",
-        "fx:eur-krw" to """{"data":{"banks":[{"asset":"eur-krw","rate":10.31,"source":"kb","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.41,"source":"hana","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.51,"source":"shinhan","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.610000000000001,"source":"woori","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.71,"source":"ibk","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.81,"source":"nh","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.91,"source":"sc","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":11.01,"source":"bs","timestamp":"2026-08-31T10:20:00+09:00"}],"reference":{"asset":"eur-krw","rate":10.31,"source":"investing","timestamp":"2026-08-31T10:20:00+09:00"}},"topic":"fx:eur-krw","type":"snapshot","version":1}"""
+        "fx:eur-krw" to """{"data":{"banks":[{"asset":"eur-krw","rate":10.31,"source":"kb","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.41,"source":"hana","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.51,"source":"shinhan","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.610000000000001,"source":"woori","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.71,"source":"ibk","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.81,"source":"nh","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":10.91,"source":"sc","timestamp":"2026-08-31T10:20:00+09:00"},{"asset":"eur-krw","rate":11.01,"source":"bs","timestamp":"2026-08-31T10:20:00+09:00"}],"reference":{"asset":"eur-krw","rate":10.31,"source":"investing","timestamp":"2026-08-31T10:20:00+09:00"}},"topic":"fx:eur-krw","type":"snapshot","version":1}""",
+        // S6-4b D16: the same JSON as `contracts/v2/topic/snapshot-krx.json` (a builder output, not a route capture).
+        TopicCatalogue.KRX_FUTURES to """{"data":{"usd_krw_futures":{"asset":"usd-krw-futures","rate":1397.5,"rate_changed_at":"2026-08-31T10:20:00.001000+09:00","source":"krx","timestamp":"2026-08-31T10:20:00+09:00"}},"topic":"krx:usd-krw-futures","type":"snapshot","version":1}"""
     )
 
     private val graphTabs = mapOf(
@@ -65,6 +70,7 @@ internal object S5FixtureRoutes {
             "/api/v2/topics/snapshot" -> when {
                 query.keys != setOf("topic") -> S5Route.Unexpected
                 single("topic") == TopicCatalogue.TETHER -> S5Route.Ok(TETHER_SNAPSHOT)
+                single("topic") == TopicCatalogue.KRX_FUTURES -> S5Route.Ok(KRX_SNAPSHOT)
                 single("topic") in TopicCatalogue.DESIRED -> S5Route.Expected404
                 else -> S5Route.Unexpected
             }
