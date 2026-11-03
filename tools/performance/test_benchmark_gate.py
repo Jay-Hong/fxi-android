@@ -455,6 +455,11 @@ class EvidenceManifestTest(unittest.TestCase):
                     ],
                 }
             )
+        # Deferred import avoids the gate -> ledger -> purity fixture module cycle.
+        from test_s5_purity import zero_fixture
+        for journey in journeys:
+            for run in journey["runs"]:
+                run["purity"] = zero_fixture(self.root, run["runId"], artifacts).proof_ref
         self.manifest = {
             "schemaVersion": 1,
             "gate": "S5",

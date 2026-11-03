@@ -33,10 +33,12 @@ class Bench:
         return self.put(name, json.dumps(value, sort_keys=True).encode("utf-8"))
 
     def artifacts(self):
-        return {
-            key: self.put(f"artifact-{key}.bin", Path(gate.__file__).read_bytes() if key == "parser" else key.encode("utf-8"))
-            for key in sorted(gate.ARTIFACT_KEYS)
-        }
+        # Deferred import avoids the runner/ledger fixture module cycle.
+        from test_s5_runner import APKS
+        import device_preflight as dp
+        apk_bytes = {"targetBenchmarkApk": APKS[dp.TARGET_PACKAGE], "macrobenchmarkTestApk": APKS[dp.TEST_PACKAGE]}
+        return {key: self.put(f"artifact-{key}.bin", Path(gate.__file__).read_bytes() if key == "parser"
+                             else apk_bytes.get(key, key.encode("utf-8"))) for key in sorted(gate.ARTIFACT_KEYS)}
 
     def snapshots(self, attempt_id):
         self.minute += 1
@@ -72,6 +74,14 @@ class Bench:
             return {"outcome": "behavior-failed", "behavior": self.put_json(f"{attempt_id}-behavior.json", record), **self.snapshots(attempt_id)}
         raise AssertionError(code)
 
+    def begin(self, writer, journey, ordinal, attempt_id):
+        # Deferred import avoids the ProofFixture -> Bench module cycle.
+        from test_s5_purity import zero_fixture
+        f = zero_fixture(self.root, attempt_id, writer.entries[0]["artifacts"])
+        writer.append("attempt-start", journey=journey, ordinal=ordinal, attemptId=attempt_id,
+                      runnerNonce=f.nonce, context=f.context_ref)
+        return f
+
     def run(self, plan, *, end=None):
         """``plan`` maps journey to its outcome codes. Attempts follow ``next_step``. With ``end=False`` no end is written and
         the writer is returned open; otherwise it is closed."""
@@ -82,8 +92,9 @@ class Bench:
             if step.status is not None or not queues.get(step.journey):
                 break
             attempt_id = f"{step.journey}-a{step.ordinal}"
-            writer.append("attempt-start", journey=step.journey, ordinal=step.ordinal, attemptId=attempt_id)
-            writer.append("attempt-end", attemptId=attempt_id, **self.fields(queues[step.journey].pop(0), step.journey, attempt_id))
+            f = self.begin(writer, step.journey, step.ordinal, attempt_id)
+            writer.append("attempt-end", attemptId=attempt_id, purity=f.proof_ref,
+                          **self.fields(queues[step.journey].pop(0), step.journey, attempt_id))
         if end is not False:
             status = end or ledger.next_step(writer.entries).status
             extra = {"evidence": self.put_json("aborted.json", {"error": "restore failed"})} if status == "aborted" else {}
@@ -178,7 +189,7 @@ class S5LedgerTest(unittest.TestCase):
 
     def test_aborted_needs_its_evidence_may_close_an_unfinished_attempt_and_has_no_document(self):
         writer = self.bench.run({"tab-entry": "v"}, end=False)
-        writer.append("attempt-start", journey="tab-entry", ordinal=2, attemptId="tab-entry-a2")
+        self.bench.begin(writer, "tab-entry", 2, "tab-entry-a2")
         writer.append("end", status="aborted", evidence=self.bench.put_json("aborted.json", {"error": "SIGTERM"}))
         writer.close()
         code, summary = self.assemble()
@@ -195,7 +206,7 @@ class S5LedgerTest(unittest.TestCase):
 
     def test_an_unfinished_attempt_stops_the_prefix_and_the_root_is_not_assembled(self):
         writer = self.bench.run({"tab-entry": "v"}, end=False)
-        writer.append("attempt-start", journey="tab-entry", ordinal=2, attemptId="tab-entry-a2")
+        self.bench.begin(writer, "tab-entry", 2, "tab-entry-a2")
         writer.close()
         prefix = ledger.read_ledger(self.root)
         self.assertEqual("attempt-start", prefix[-1]["type"])

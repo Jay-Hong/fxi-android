@@ -15,22 +15,48 @@
     "journeys"
   ],
   "properties": {
-    "schemaVersion": {"const": 1},
-    "gate": {"enum": ["S5", "S11"]},
-    "verdict": {"enum": ["pass", "fail"]},
-    "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-    "goldenManifestSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "schemaVersion": {
+      "const": 1
+    },
+    "gate": {
+      "enum": [
+        "S5",
+        "S11"
+      ]
+    },
+    "verdict": {
+      "enum": [
+        "pass",
+        "fail"
+      ]
+    },
+    "sourceCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "goldenManifestSha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "approval": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "approvedAt", "authority"],
+      "required": [
+        "status",
+        "approvedAt",
+        "authority"
+      ],
       "properties": {
-        "status": {"const": "approved"},
+        "status": {
+          "const": "approved"
+        },
         "approvedAt": {
           "type": "string",
           "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
         },
-        "authority": {"const": "user"}
+        "authority": {
+          "const": "user"
+        }
       }
     },
     "libraries": {
@@ -45,17 +71,34 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "model", "fingerprint", "api", "posture", "display", "animationScale",
-        "lowPower", "charging", "batteryMin", "thermalRequired", "compilationMode",
-        "startupMode", "repeatIterations", "validRuns", "maxAttempts"
+        "model",
+        "fingerprint",
+        "api",
+        "posture",
+        "display",
+        "animationScale",
+        "lowPower",
+        "charging",
+        "batteryMin",
+        "thermalRequired",
+        "compilationMode",
+        "startupMode",
+        "repeatIterations",
+        "validRuns",
+        "maxAttempts"
       ]
     },
     "artifacts": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "targetBenchmarkApk", "macrobenchmarkTestApk", "fixturePayload", "parser",
-        "harnessResolvedGraph", "productionResolvedGraph", "r8RulesCanonicalManifest"
+        "targetBenchmarkApk",
+        "macrobenchmarkTestApk",
+        "fixturePayload",
+        "parser",
+        "harnessResolvedGraph",
+        "productionResolvedGraph",
+        "r8RulesCanonicalManifest"
       ]
     },
     "journeys": {
@@ -64,7 +107,15 @@
       "maxItems": 3,
       "items": {
         "type": "object",
-        "required": ["id", "medianP95Ms", "medianP99Ms", "frameCount", "verdict", "runs", "attempts"],
+        "required": [
+          "id",
+          "medianP95Ms",
+          "medianP99Ms",
+          "frameCount",
+          "verdict",
+          "runs",
+          "attempts"
+        ],
         "properties": {
           "runs": {
             "type": "array",
@@ -72,7 +123,20 @@
             "maxItems": 3,
             "items": {
               "type": "object",
-              "required": ["runId", "result", "behavior", "preflight", "postflight", "traces"]
+              "required": [
+                "runId",
+                "result",
+                "behavior",
+                "preflight",
+                "postflight",
+                "traces",
+                "purity"
+              ],
+              "properties": {
+                "purity": {
+                  "$ref": "#/$defs/artifactRef"
+                }
+              }
             }
           },
           "attempts": {
@@ -81,16 +145,496 @@
             "maxItems": 5,
             "items": {
               "type": "object",
-              "required": ["attemptId", "ordinal", "outcome"],
+              "required": [
+                "attemptId",
+                "ordinal",
+                "outcome"
+              ],
               "properties": {
-                "attemptId": {"type": "string", "minLength": 1},
-                "ordinal": {"type": "integer", "minimum": 1, "maximum": 5},
-                "outcome": {"enum": ["valid", "invalid"]},
-                "reason": {"enum": ["environment-invalid", "result-malformed"]},
-                "evidence": {"type": "object", "required": ["path", "sha256"]}
+                "attemptId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "ordinal": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 5
+                },
+                "outcome": {
+                  "enum": [
+                    "valid",
+                    "invalid"
+                  ]
+                },
+                "reason": {
+                  "enum": [
+                    "environment-invalid",
+                    "result-malformed"
+                  ]
+                },
+                "evidence": {
+                  "type": "object",
+                  "required": [
+                    "path",
+                    "sha256"
+                  ]
+                }
               }
             }
           }
+        }
+      }
+    }
+  },
+  "$comment": "L1 D17 schema contract. Runtime legacy paths remain unchanged until the separately reviewed L2 cutover; presence of these definitions is not a C1-C8 validator.",
+  "$defs": {
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "purityResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "actualCount",
+        "defects"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "zero",
+            "nonzero",
+            "incomplete"
+          ]
+        },
+        "actualCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "defects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "check",
+              "code"
+            ],
+            "oneOf": [
+              {
+                "properties": {
+                  "check": {
+                    "const": "C1"
+                  },
+                  "code": {
+                    "enum": [
+                      "api",
+                      "context",
+                      "apk",
+                      "boot-uid-clock"
+                    ]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "check": {
+                    "const": "C2"
+                  },
+                  "code": {
+                    "enum": [
+                      "json-schema",
+                      "registry",
+                      "proof"
+                    ]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "check": {
+                    "const": "C3"
+                  },
+                  "code": {
+                    "enum": [
+                      "file-set",
+                      "instance-set",
+                      "byte-equality"
+                    ]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "check": {
+                    "const": "C4"
+                  },
+                  "code": {
+                    "enum": [
+                      "attribution"
+                    ]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "check": {
+                    "const": "C5"
+                  },
+                  "code": {
+                    "enum": [
+                      "sequence"
+                    ]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "check": {
+                    "const": "C6"
+                  },
+                  "code": {
+                    "enum": [
+                      "summary-codec",
+                      "summary-state",
+                      "summary-count",
+                      "record-identity",
+                      "record-time",
+                      "record-set"
+                    ]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "check": {
+                    "const": "C7"
+                  },
+                  "code": {
+                    "enum": [
+                      "exit-reason-status"
+                    ]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "check": {
+                    "const": "C8"
+                  },
+                  "code": {
+                    "enum": [
+                      "envelope",
+                      "command-result",
+                      "command-identity",
+                      "order",
+                      "roles",
+                      "query-budget",
+                      "proof-result"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "incomplete"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "actualCount": {
+                "type": "null"
+              },
+              "defects": {
+                "minItems": 1
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "actualCount": {
+                "type": "integer"
+              },
+              "defects": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "zero"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "actualCount": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "nonzero"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "actualCount": {
+                "minimum": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "purityProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "attemptId",
+        "runnerNonce",
+        "context",
+        "apks",
+        "observations",
+        "commands",
+        "deviceFiles",
+        "instances",
+        "result"
+      ],
+      "properties": {
+        "schema": {
+          "const": 2
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        },
+        "runnerNonce": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "not": {
+            "const": "00000000000000000000000000000000"
+          }
+        },
+        "context": {
+          "$ref": "#/$defs/artifactRef"
+        },
+        "apks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "target",
+            "test"
+          ],
+          "properties": {
+            "target": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "test": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "role",
+              "ref",
+              "seqs"
+            ],
+            "properties": {
+              "role": {
+                "enum": [
+                  "device-api",
+                  "boot-before",
+                  "install",
+                  "install-identity",
+                  "install-clock",
+                  "absent",
+                  "context-push",
+                  "context-readback",
+                  "apk-before-target",
+                  "apk-before-test",
+                  "instrumentation",
+                  "stop-clock",
+                  "force-stop",
+                  "live-after-stop",
+                  "inventory-pre",
+                  "pull",
+                  "inventory-post",
+                  "exit-query",
+                  "after-stop-clock",
+                  "boot-after",
+                  "install-identity-after",
+                  "live-final",
+                  "apk-after-target",
+                  "apk-after-test"
+                ]
+              },
+              "ref": {
+                "$ref": "#/$defs/artifactRef"
+              },
+              "seqs": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          },
+          "minItems": 1
+        },
+        "commands": {
+          "$ref": "#/$defs/artifactRef"
+        },
+        "deviceFiles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "root",
+            "files"
+          ],
+          "properties": {
+            "root": {
+              "type": "string",
+              "minLength": 1
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "name",
+                  "ref"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "ref": {
+                    "$ref": "#/$defs/artifactRef"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "instances": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "instanceId",
+              "lifetimeId",
+              "commits"
+            ],
+            "properties": {
+              "instanceId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "lifetimeId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "commits": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2147483647
+              }
+            }
+          }
+        },
+        "result": {
+          "$ref": "#/$defs/purityResult"
+        }
+      }
+    },
+    "purityAttemptContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "attemptId",
+        "runnerNonce",
+        "bootId",
+        "targetApkSha256",
+        "testApkSha256"
+      ],
+      "properties": {
+        "schema": {
+          "const": 2
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        },
+        "runnerNonce": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "not": {
+            "const": "00000000000000000000000000000000"
+          }
+        },
+        "bootId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "targetApkSha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "testApkSha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         }
       }
     }

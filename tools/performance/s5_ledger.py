@@ -54,6 +54,33 @@ END_KEYS = {
 }
 INVALID_REASONS = {"environment-invalid", "result-malformed"}
 END_STATUSES = {"complete", "behavior-failed", "attempts-exhausted", "aborted"}
+# Mandatory D17 attribution and independent purity proof fields.
+PURITY_START_FIELDS = {"runnerNonce", "context"}
+PURITY_END_FIELDS = {"purity"}
+
+
+def validate_purity_attempt(start: Mapping[str, Any], end: Mapping[str, Any],
+                            root: Path, artifacts: Mapping[str, Any]) -> gate.PurityResult:
+    """Check ref integrity separately from common-reader semantics and start binding."""
+    try:
+        if not PURITY_START_FIELDS <= set(start) or "purity" not in end:
+            raise LedgerError("D17 context/nonce/purity required")
+        gate._purity_ref(start["context"], root)
+        gate._purity_ref(end["purity"], root)
+        apks = {key: artifacts[artifact]["sha256"] for key,artifact in
+                (("target", "targetBenchmarkApk"), ("test", "macrobenchmarkTestApk"))}
+        result = gate.read_purity_proof(end["purity"], root, {key:start[key] for key in ("attemptId", "runnerNonce", "context")}, apks)
+        proof = gate._purity_json_bytes(gate._purity_ref(end["purity"], root).read_bytes())
+        if proof.get("context") != start["context"] or proof.get("runnerNonce") != start["runnerNonce"] or proof.get("attemptId") != start["attemptId"]:
+            raise LedgerError("purity start attribution differs")
+        commands = gate._purity_lines(gate._purity_ref(proof["commands"], root).read_bytes())
+        invoked = any(c.get("kind") == "start" and c.get("op") == "instrumentation" for c in commands)
+        if end["outcome"] == "valid" or end.get("reason") == "result-malformed" or (end.get("reason") == "environment-invalid" and invoked):
+            if result.state != "zero":
+                raise LedgerError("attempt requires complete zero purity")
+        return result
+    except (gate.InvalidEvidence, OSError, ValueError, TypeError, KeyError) as error:
+        raise LedgerError(str(error)) from error
 
 
 class LedgerError(ValueError):
@@ -173,6 +200,8 @@ def read_ledger(root: Path) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     prev: str | None = None
     attempt_ids: set[str] = set()
+    purity_nonces: set[str] = set()
+    purity_ref_owners: dict[tuple[int,int], str] = {}
     for index, raw in enumerate(data[:-1].split(b"\n")):
         line = raw + b"\n"
         try:
@@ -210,6 +239,10 @@ def read_ledger(root: Path) -> list[dict[str, Any]]:
             keys = ENTRY_KEYS.get(entry_type)
             if keys is None:
                 raise LedgerError(f"line {index + 1} has type {entry_type!r}")
+        if entry_type == "attempt-start":
+            keys = keys | PURITY_START_FIELDS
+        if entry_type == "attempt-end":
+            keys = keys | PURITY_END_FIELDS
         if set(entry) != keys:
             raise LedgerError(f"line {index + 1} ({entry_type}) must have exactly {sorted(keys)}")
         at = entry["at"]
@@ -244,10 +277,41 @@ def read_ledger(root: Path) -> list[dict[str, Any]]:
             if not isinstance(attempt_id, str) or not gate.RUN_ID_RE.fullmatch(attempt_id) or attempt_id in attempt_ids:
                 raise LedgerError(f"{label} attemptId must be a stable id used once")
             attempt_ids.add(attempt_id)
+            try:
+                context = gate._purity_json_bytes(gate._purity_ref(entry["context"], root).read_bytes())
+                if (not gate._purity_context_valid(context) or context.get("attemptId") != attempt_id
+                        or context.get("runnerNonce") != entry["runnerNonce"] or entry["runnerNonce"] in purity_nonces
+                        or context.get("targetApkSha256") != entries[0]["artifacts"]["targetBenchmarkApk"]["sha256"]
+                        or context.get("testApkSha256") != entries[0]["artifacts"]["macrobenchmarkTestApk"]["sha256"]):
+                    raise LedgerError("start context attribution mismatch")
+                purity_nonces.add(entry["runnerNonce"])
+            except (gate.InvalidEvidence, ValueError, OSError, TypeError, KeyError) as error:
+                raise LedgerError(str(error)) from error
         elif entry_type == "attempt-end":
             if entries[-1]["type"] != "attempt-start" or entries[-1]["attemptId"] != entry["attemptId"]:
                 raise LedgerError(f"{label} ends an attempt that is not the one just started")
             outcome = entry["outcome"]
+            validate_purity_attempt(entries[-1], entry, root, entries[0]["artifacts"])
+            try:
+                proof = gate.load_json(gate._purity_ref(entry["purity"], root))
+                commands = gate._purity_lines(gate._purity_ref(proof["commands"], root).read_bytes())
+                def refs(value):
+                    if isinstance(value, dict):
+                        if set(value) == {"path", "sha256"}:
+                            yield value
+                        else:
+                            for item in value.values():
+                                yield from refs(item)
+                    elif isinstance(value, list):
+                        for item in value:
+                            yield from refs(item)
+                for reference in [entry["purity"], *refs(proof), *refs(commands)]:
+                    stat = gate._purity_ref(reference, root).stat()
+                    identity = stat.st_dev, stat.st_ino
+                    if purity_ref_owners.setdefault(identity, entry["attemptId"]) != entry["attemptId"]:
+                        raise LedgerError("cross-attempt purity ref reuse")
+            except (gate.InvalidEvidence, OSError, ValueError, KeyError, TypeError) as error:
+                raise LedgerError(str(error)) from error
             if outcome == "invalid":
                 if not isinstance(entry["reason"], str) or entry["reason"] not in INVALID_REASONS:
                     raise LedgerError(f"{label} reason must be one of {sorted(INVALID_REASONS)}")
@@ -309,6 +373,7 @@ def build_manifest(entries: Sequence[Mapping[str, Any]], root: Path) -> dict[str
                 continue
             if end["outcome"] == "valid":
                 runs.append({"runId": end["attemptId"], **{role: end[role] for role in ("result", "behavior", "preflight", "postflight", "traces")}})
+                runs[-1]["purity"] = end["purity"]
                 attempts.append({"attemptId": end["attemptId"], "ordinal": start["ordinal"], "outcome": "valid", "runId": end["attemptId"]})
                 raw = gate.load_json(root / end["result"]["path"])
                 if not isinstance(raw, dict):

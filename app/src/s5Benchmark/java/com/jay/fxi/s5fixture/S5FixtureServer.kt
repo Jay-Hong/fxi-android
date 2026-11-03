@@ -35,9 +35,13 @@ import okio.Buffer
 internal class S5FixtureServer(
     private val load: (String) -> ByteArray,
     private val report: (String) -> Unit,
+    private val purity: S5PurityJournal,
+    private val attemptContext: AttemptContext,
+    private val fatal: Fatal,
     private val startTimeoutMillis: Long = 10_000L,
     /** Called with the bound port before the closed check, so a test can see a late bind shut down. */
-    private val onBound: (Int) -> Unit = {}
+    private val onBound: (Int) -> Unit = {},
+    private val unexpected: AtomicInteger = purity.counter
 ) : AutoCloseable {
     private val server = MockWebServer()
     private val payloads = mutableMapOf<String, ByteArray>()
@@ -45,8 +49,10 @@ internal class S5FixtureServer(
     /** Numbers this server's connections, so each KRX lease id is fixed per connection (design amendment a1). */
     private val connections = AtomicInteger()
     private val recent = ArrayDeque<String>()
-    private val unexpected = AtomicInteger(0)
     private val closed = AtomicBoolean(false)
+    private val startLock = Any()
+    /** Protected by startLock; cancellation may finish the Future before the worker actually exits. */
+    private var starting = false
     private val json = Json { ignoreUnknownKeys = true }
     private val starter = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "s5-fixture-server").apply { isDaemon = true } }
     private val started: Future<ServerEndpoints>
@@ -67,38 +73,55 @@ internal class S5FixtureServer(
 
     /** Idempotent: cancels a start still running, stops the worker and shuts the server down if it is bound. */
     override fun close() {
-        if (!closed.compareAndSet(false, true)) return
+        synchronized(startLock) {
+            if (!closed.compareAndSet(false, true)) return
+            // A running start still owns registration/bind, even if it ignores cancellation.
+            if (!starting) purity.close()
+        }
         started.cancel(true)
         starter.shutdownNow()
         server.shutdown()
     }
 
     private fun start(): ServerEndpoints {
-        for (name in listOf("catalog.json", "tether-1d.json", "tether-1w.json", "usd-1d.json")) payloads[name] = load(name)
-        payloads[S5FixtureRoutes.ENTITLEMENTS] = S5FixtureRoutes.ENTITLEMENTS_BODY.encodeToByteArray()
-        payloads[S5FixtureRoutes.TETHER_SNAPSHOT] = S5FixtureRoutes.TOPIC_SNAPSHOTS.getValue(TopicCatalogue.TETHER).encodeToByteArray()
-        payloads[S5FixtureRoutes.KRX_SNAPSHOT] = S5FixtureRoutes.TOPIC_SNAPSHOTS.getValue(TopicCatalogue.KRX_FUTURES).encodeToByteArray()
-        server.dispatcher = dispatcher
-        server.start(InetAddress.getByName("127.0.0.1"), 0)
-        onBound(server.port)
-        // MockWebServer's start and shutdown are synchronized: a close that came first found nothing to shut, so the late bind is
-        // shut here.
-        if (closed.get()) {
-            server.shutdown()
-            throw IllegalStateException("S5 fixture server closed while starting")
+        synchronized(startLock) {
+            check(!closed.get()) { "S5 fixture server is closed" }
+            starting = true
         }
-        return ServerEndpoints("http://127.0.0.1:${server.port}/", "ws://127.0.0.1:${server.port}/ws")
+        try {
+            for (name in listOf("catalog.json", "tether-1d.json", "tether-1w.json", "usd-1d.json")) payloads[name] = load(name)
+            payloads[S5FixtureRoutes.ENTITLEMENTS] = S5FixtureRoutes.ENTITLEMENTS_BODY.encodeToByteArray()
+            payloads[S5FixtureRoutes.TETHER_SNAPSHOT] = S5FixtureRoutes.TOPIC_SNAPSHOTS.getValue(TopicCatalogue.TETHER).encodeToByteArray()
+            payloads[S5FixtureRoutes.KRX_SNAPSHOT] = S5FixtureRoutes.TOPIC_SNAPSHOTS.getValue(TopicCatalogue.KRX_FUTURES).encodeToByteArray()
+            server.dispatcher = dispatcher
+            purity.registerBeforeBind(attemptContext)
+            server.start(InetAddress.getByName("127.0.0.1"), 0)
+            onBound(server.port)
+            // MockWebServer's start and shutdown are synchronized: a close that came first found nothing to shut, so the late bind is
+            // shut here.
+            if (closed.get()) {
+                server.shutdown()
+                throw IllegalStateException("S5 fixture server closed while starting")
+            }
+            return ServerEndpoints("http://127.0.0.1:${server.port}/", "ws://127.0.0.1:${server.port}/ws")
+        } finally {
+            synchronized(startLock) {
+                starting = false
+                if (closed.get()) purity.close()
+            }
+        }
     }
 
     private fun unexpected(message: String) {
-        unexpected.incrementAndGet()
+        purity.recordUnexpected(message)
         report(message)
     }
 
     private val dispatcher = object : Dispatcher() {
-        override fun dispatch(request: RecordedRequest): MockResponse {
+        override fun dispatch(request: RecordedRequest): MockResponse = purity.classifiedCallback {
             // MockWebServer queues every request it records; drain it so a long run keeps nothing.
             while (server.takeRequest(0, TimeUnit.MILLISECONDS) != null) Unit
+            purity.checkpoint(PurityPoint.HTTP_URL)
             val url = request.requestUrl
             val method = request.method.orEmpty()
             val path = url?.encodedPath.orEmpty()
@@ -110,7 +133,7 @@ internal class S5FixtureServer(
                 recent.addLast(line)
                 while (recent.size > RECORD_LIMIT) recent.removeFirst()
             }
-            return when (route) {
+            val response = when (route) {
                 is S5Route.Ok -> MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
                     .setBody(Buffer().write(payloads.getValue(route.payload)))
                 S5Route.Expected404 -> MockResponse().setResponseCode(404).setHeader("Content-Type", "application/json")
@@ -121,6 +144,8 @@ internal class S5FixtureServer(
                     MockResponse().setResponseCode(404)
                 }
             }
+            purity.checkpoint(PurityPoint.HTTP_RESPONSE)
+            response
         }
     }
 
@@ -140,20 +165,23 @@ internal class S5FixtureServer(
             SubscriptionAckTopic(topic, leaseId = krxLeaseId, leaseDurationSeconds = KRX_LEASE_SECONDS)
         } else SubscriptionAckTopic(topic)
 
-        override fun onMessage(webSocket: WebSocket, text: String) {
+        override fun onMessage(webSocket: WebSocket, text: String): Unit = purity.classifiedCallback {
+            purity.checkpoint(PurityPoint.WS_PARSE)
             if (text == "ping") {
-                webSocket.send("""{"type":"pong"}""")
-                return
+                purity.checkpoint(PurityPoint.WS_PING)
+                purity.checkpoint(PurityPoint.WS_SEND)
+                check(webSocket.send("""{"type":"pong"}"""))
+                return@classifiedCallback
             }
-            val request = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull() ?: return unexpected("S5 fixture: unreadable frame")
-            val type = request["type"]?.jsonPrimitive?.content ?: return unexpected("S5 fixture: frame without type")
-            val id = request["request_id"]?.jsonPrimitive?.content ?: return unexpected("S5 fixture: frame without request_id")
+            val request = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull() ?: return@classifiedCallback unexpected("S5 fixture: unreadable frame")
+            val type = request["type"]?.jsonPrimitive?.content ?: return@classifiedCallback unexpected("S5 fixture: frame without type")
+            val id = request["request_id"]?.jsonPrimitive?.content ?: return@classifiedCallback unexpected("S5 fixture: frame without request_id")
             val topics = request.topics()
             val removed = synchronized(active) {
                 when (type) {
                     "subscribe" -> { active += topics; emptyList() }
                     "unsubscribe" -> { active -= topics.toSet(); topics }
-                    else -> return unexpected("S5 fixture: unknown frame type $type")
+                    else -> return@classifiedCallback unexpected("S5 fixture: unknown frame type")
                 }
             }
             val now = synchronized(active) { active.map { entry(it) } }
@@ -165,7 +193,8 @@ internal class S5FixtureServer(
                 removedTopics = removed,
                 activeSubscriptions = now
             )
-            webSocket.send(json.encodeToString(SubscriptionAck.serializer(), ack).replaceFirst("{", """{"type":"subscription_ack","""))
+            purity.checkpoint(PurityPoint.WS_SEND)
+            check(webSocket.send(json.encodeToString(SubscriptionAck.serializer(), ack).replaceFirst("{", """{"type":"subscription_ack",""")))
             // After the acknowledgement, each accepted topic's snapshot once: its first delivery (S5-4 slice 4d). KRX's goes only
             // on this connection's first acknowledgement naming it, whatever repeats, resubscribes or re-subscriptions follow.
             if (type == "subscribe") for (topic in topics) {
@@ -173,7 +202,7 @@ internal class S5FixtureServer(
                     if (krxSnapshotSent) continue
                     krxSnapshotSent = true
                 }
-                S5FixtureRoutes.TOPIC_SNAPSHOTS[topic]?.let { webSocket.send(it) }
+                S5FixtureRoutes.TOPIC_SNAPSHOTS[topic]?.let { purity.checkpoint(PurityPoint.WS_SEND); check(webSocket.send(it)) }
             }
         }
 
@@ -187,6 +216,7 @@ internal class S5FixtureServer(
 
     init {
         // Last, after every property the worker reads is initialised.
+        require(unexpected === purity.counter) { "server and journal must share one actual counter" }
         started = starter.submit<ServerEndpoints> { start() }
     }
 

@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import shlex
 import statistics
 import sys
 from dataclasses import asdict, dataclass
@@ -144,6 +145,535 @@ EXPECTED_BEHAVIOR: dict[str, dict[str, Any]] = {
 
 class InvalidEvidence(ValueError):
     """Input is missing, malformed, ambiguous, or internally inconsistent."""
+
+
+@dataclass(frozen=True)
+class PurityResult:
+    """D17 r4 §4.6. Incomplete results never assert an actual counter."""
+
+    state: str
+    defects: Sequence[Mapping[str, str]]
+    instances: Sequence[Mapping[str, Any]]
+    actual_count: int | None
+
+
+@dataclass(frozen=True)
+class PuritySummary:
+    """Lossless D17 bridge decoding seam; state is IDLE, BUSY or POISON."""
+
+    state: str
+    runner_nonce: str
+    lifetime_id: str
+    instance_id: str
+    counter: int
+
+
+def decode_purity_summary(raw: bytes) -> PuritySummary:
+    if not isinstance(raw, bytes) or len(raw) != 64 or raw[:8] != b"FXID17R1" or raw[8] != 1 or raw[9] > 2 or raw[10:12] != b"\0\0":
+        raise InvalidEvidence("malformed D17 summary")
+    counter = int.from_bytes(raw[60:], "big")
+    if counter > 2147483647 or raw[28:44] == bytes(16) or raw[44:60] == bytes(16):
+        raise InvalidEvidence("invalid D17 summary identity/counter")
+    return PuritySummary(("IDLE", "BUSY", "POISON")[raw[9]], raw[12:28].hex(), raw[28:44].hex(), raw[44:60].hex(), counter)
+
+
+PURITY_ROLES = (
+    "boot-before", "device-api", "install", "install-identity", "install-clock", "absent", "context-push",
+    "context-readback", "apk-before-target", "apk-before-test", "instrumentation", "apk-after-target", "apk-after-test",
+    "stop-clock", "force-stop", "live-after-stop", "inventory-pre", "pull", "inventory-post", "exit-query",
+    "after-stop-clock", "boot-after", "install-identity-after", "live-final",
+)
+PURITY_ROOT = "/sdcard/Android/data/com.jay.fxi/files/s5purity/"
+PURITY_PROBE = "com.jay.fxi.s5fixture.S5PurityProbe"
+PURITY_REG_KEYS = set("kind schema instanceId lifetimeId attemptId runnerNonce attemptState pid processName processStartWallMs userId packageUid bootId".split())
+
+
+def _purity_int(value: Any, maximum: int = 2147483647, minimum: int = 0) -> bool:
+    return type(value) is int and minimum <= value <= maximum
+
+
+def _purity_id(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None and value != "0" * 32
+
+
+def _purity_ref(ref: Any, root: Path) -> Path:
+    path = validate_artifact_ref(ref, root, "purity input")
+    relative = Path(ref["path"])
+    if relative.is_absolute() or relative.as_posix() != ref["path"] or any(p in (".", "..") for p in relative.parts):
+        raise InvalidEvidence("noncanonical purity ref")
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise InvalidEvidence("symlink purity input")
+    if path.stat().st_nlink != 1:
+        raise InvalidEvidence("aliased purity input")
+    return path
+
+
+def _purity_json_bytes(raw: bytes) -> Any:
+    if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        raise InvalidEvidence("JSON must end in exactly one LF")
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+
+
+def _purity_lines(raw: bytes) -> list[dict[str, Any]]:
+    if not raw or not raw.endswith(b"\n"):
+        raise InvalidEvidence("empty or truncated JSONL")
+    rows = [_purity_json_bytes(line + b"\n") for line in raw[:-1].split(b"\n")]
+    if any(not isinstance(row, dict) for row in rows):
+        raise InvalidEvidence("JSONL object required")
+    return rows
+
+
+def _purity_context_valid(context: Any) -> bool:
+    context_keys = set("schema attemptId runnerNonce bootId targetApkSha256 testApkSha256".split())
+    return (isinstance(context, dict) and set(context) == context_keys and type(context.get("schema")) is int and context.get("schema") == 2
+        and isinstance(context.get("attemptId"), str) and RUN_ID_RE.fullmatch(context["attemptId"]) and _purity_id(context.get("runnerNonce"))
+        and isinstance(context.get("bootId"), str) and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", context["bootId"])
+        and all(isinstance(context.get(k), str) and SHA256_RE.fullmatch(context[k]) for k in ("targetApkSha256", "testApkSha256")))
+
+
+def _purity_registration_valid(row: Mapping[str, Any]) -> bool:
+    # Null attribution is a producer diagnostic, rejected by C4 rather than C2.
+    return (set(row) == PURITY_REG_KEYS and type(row.get("schema")) is int and row.get("schema") == 2
+        and all(isinstance(row.get(k), str) for k in ("kind", "instanceId", "lifetimeId", "processName", "attemptState"))
+        and all(row.get(k) is None or isinstance(row.get(k), str) for k in ("attemptId", "runnerNonce", "bootId"))
+        and all(_purity_int(row.get(k)) for k in ("pid", "userId", "packageUid"))
+        and _purity_int(row.get("processStartWallMs"), 2**63-1))
+
+
+def read_purity_proof(proof_ref: Mapping[str, Any], artifact_root: Path,
+                      expected_attempt: Mapping[str, Any], expected_apks: Mapping[str, str]) -> PurityResult:
+    try:
+        proof = _purity_json_bytes(_purity_ref(proof_ref, artifact_root).read_bytes())
+    except (ValueError, OSError, UnicodeError, TypeError, KeyError):
+        return PurityResult("incomplete", [{"check": "C2", "code": "proof"}], [], None)
+    return _read_purity_inputs(proof, artifact_root, expected_attempt, expected_apks)
+
+
+def _read_purity_inputs(proof: Any, root: Path, expected: Mapping[str, Any], apks: Mapping[str, str], *,
+                        compare_result: bool = True) -> PurityResult:
+    """One evaluator for collector, ledger and standalone; claimed results never supply expectations."""
+    defects: list[dict[str, str]] = []
+    instances: list[dict[str, Any]] = []
+    def bad(check, code):
+        item = {"check": check, "code": code}
+        if item not in defects:
+            defects.append(item)
+    def need(condition, check, code):
+        if not condition:
+            bad(check, code)
+    def raw(ref):
+        return _purity_ref(ref, root).read_bytes()
+    def document(ref):
+        return _purity_json_bytes(raw(ref))
+    def attempt(check, code, block):
+        try:
+            return block()
+        except (ValueError, OSError, UnicodeError, TypeError, KeyError, IndexError, AttributeError, OverflowError):
+            bad(check, code)
+            return None
+    if not isinstance(proof, dict) or set(proof) != set("schema attemptId runnerNonce context apks observations commands deviceFiles instances result".split()) or type(proof.get("schema")) is not int or proof.get("schema") != 2:
+        return PurityResult("incomplete", [{"check": "C2", "code": "proof"}], [], None)
+    context = attempt("C1", "context", lambda: document(proof["context"]))
+    valid_context = _purity_context_valid(context)
+    need(valid_context, "C1", "context")
+    context = context if isinstance(context, dict) else {}
+    need(proof["attemptId"] == expected.get("attemptId") == context.get("attemptId") and proof["runnerNonce"] == context.get("runnerNonce")
+         and ("runnerNonce" not in expected or proof["runnerNonce"] == expected["runnerNonce"])
+         and ("context" not in expected or proof["context"] == expected["context"]), "C1", "context")
+    need(proof["apks"] == apks == {"target": context.get("targetApkSha256"), "test": context.get("testApkSha256")}
+         and set(apks) == {"target", "test"} and all(isinstance(v, str) and SHA256_RE.fullmatch(v) for v in apks.values()), "C1", "apk")
+    commands = attempt("C8", "envelope", lambda: _purity_lines(raw(proof["commands"]))) or []
+    pairs = {}
+    previous = 0
+    command_nonces = set()
+    for index in range(0, len(commands), 2):
+        def pair():
+            nonlocal previous
+            start, finish = commands[index:index + 2]
+            assert_keys_start = set("kind schema attemptId runnerNonce seq op argv commandNonce monoNs".split())
+            assert_keys_finish = set("kind schema attemptId runnerNonce seq monoNs returnCode timedOut stdout stderr".split())
+            need(set(start) == assert_keys_start and set(finish) == assert_keys_finish and start.get("kind") == "start" and finish.get("kind") == "finish", "C8", "envelope")
+            seq = index // 2 + 1
+            need(all(type(e.get("schema")) is int and e.get("schema") == 2 and type(e.get("seq")) is int and e.get("seq") == seq for e in (start, finish)), "C8", "envelope")
+            need(all(e.get("attemptId") == proof["attemptId"] and e.get("runnerNonce") == proof["runnerNonce"] for e in (start, finish)), "C8", "command-identity")
+            need(_purity_int(start.get("monoNs"), 2**63-1) and _purity_int(finish.get("monoNs"), 2**63-1)
+                 and previous <= start["monoNs"] <= finish["monoNs"], "C8", "order")
+            previous = finish["monoNs"]
+            out, err = raw(finish["stdout"]), raw(finish["stderr"])
+            need(type(finish.get("timedOut")) is bool and not finish["timedOut"] and type(finish.get("returnCode")) is int and finish["returnCode"] == 0, "C8", "command-result")
+            need(isinstance(start.get("argv"), list) and all(isinstance(a, str) for a in start["argv"]) and isinstance(start.get("commandNonce"), str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", start["commandNonce"]) is not None, "C8", "command-identity")
+            need(start["commandNonce"] not in command_nonces, "C8", "command-identity")
+            command_nonces.add(start["commandNonce"])
+            pairs[seq] = (start, finish, out)
+        attempt("C8", "envelope", pair)
+    observations = proof["observations"]
+    by_role: dict[str, list[Any]] = {}
+    if not isinstance(observations, list):
+        bad("C8", "roles")
+        observations = []
+    used_seqs = set()
+    for observation in observations:
+        def obs():
+            need(set(observation) == {"role", "ref", "seqs"}, "C8", "roles")
+            role, seqs = observation["role"], observation["seqs"]
+            need(role in PURITY_ROLES and isinstance(seqs, list) and bool(seqs) and all(type(n) is int for n in seqs) and seqs == sorted(set(seqs)), "C8", "roles")
+            need(not used_seqs.intersection(seqs), "C8", "roles")
+            used_seqs.update(seqs)
+            group = [pairs[n] for n in seqs]
+            by_role.setdefault(role, []).append((observation, group, raw(observation["ref"])))
+        attempt("C8", "roles", obs)
+    for role in PURITY_ROLES:
+        need(len(by_role.get(role, [])) >= 1 if role == "exit-query" else len(by_role.get(role, [])) == 1, "C8", "roles")
+    need(used_seqs == set(pairs), "C8", "roles")
+    def primary(role):
+        return by_role[role][0]
+    def output(role):
+        return primary(role)[2]
+    def argv(group):
+        value = group[0]["argv"]
+        # Record transport prefixes, but compare the exact remote operation.
+        if value and Path(value[0]).name == "adb":
+            value = value[1:]
+            if value[:1] == ["-s"]:
+                value = value[2:]
+        if value[:1] == ["shell"] and len(value) == 2:
+            value = ["shell", *shlex.split(value[1])]
+        return value
+    def exact(role, expected_argv):
+        groups = primary(role)[1]
+        need(len(groups) == 1 and argv(groups[0]) == expected_argv, "C8", "command-identity")
+        need(groups[0][0]["op"] == role, "C8", "command-identity")
+        need(primary(role)[0]["ref"] == groups[0][1]["stdout"], "C8", "command-identity")
+    def api():
+        exact("device-api", ["shell", "getprop", "ro.build.version.sdk"])
+        value = output("device-api")
+        need(re.fullmatch(rb"[1-9][0-9]*\n", value) is not None and int(value) >= 30, "C1", "api")
+        group = primary("device-api")[1][0]
+        need(group[1]["returnCode"] == 0 and group[1]["timedOut"] is False, "C1", "api")
+        api_seq = primary("device-api")[0]["seqs"][-1]
+        for role in ("install", "absent", "context-push", "instrumentation"):
+            need(api_seq < primary(role)[0]["seqs"][0], "C1", "api")
+    attempt("C1", "api", api)
+    # Only exit-query may repeat; all phases remain ordered by actual finish sequences.
+    def order():
+        prev = 0
+        for role in PURITY_ROLES:
+            for item in by_role[role]:
+                need(item[0]["seqs"][0] > prev, "C8", "order")
+                prev = item[0]["seqs"][-1]
+        queries = by_role["exit-query"]
+        start_ns = queries[0][1][0][0]["monoNs"]
+        end_ns = queries[-1][1][-1][1]["monoNs"]
+        need(end_ns - start_ns <= 10_000_000_000, "C8", "query-budget")
+    attempt("C8", "order", order)
+    uid = user = None
+    base_paths = {}
+    def identity():
+        nonlocal uid, user, base_paths
+        parsed = []
+        for role in ("install-identity", "install-identity-after"):
+            _, groups, observed = primary(role)
+            need(len(groups) == 4 and primary(role)[0]["ref"] == groups[0][1]["stdout"], "C8", "command-identity")
+            expected_args = [["shell", "cmd", "package", "list", "packages", "-U", "com.jay.fxi"], ["shell", "am", "get-current-user"],
+                             ["shell", "pm", "path", "com.jay.fxi"], ["shell", "pm", "path", "com.jay.fxi.macrobenchmark"]]
+            need(all(argv(g) == a and g[0]["op"] == role for g, a in zip(groups, expected_args)), "C8", "command-identity")
+            match = re.fullmatch(rb"package:com\.jay\.fxi uid:([0-9]+)\n", observed)
+            if not match or not re.fullmatch(rb"(?:0|[1-9][0-9]*)\n", groups[1][2]):
+                raise InvalidEvidence("identity format")
+            paths = []
+            for g in groups[2:]:
+                m = re.fullmatch(rb"package:(/[^\r\n]+\.apk)\n", g[2])
+                if not m:
+                    raise InvalidEvidence("base APK format")
+                paths.append(m[1].decode())
+            parsed.append((int(match[1]), int(groups[1][2]), paths))
+        need(parsed[0] == parsed[1], "C1", "boot-uid-clock")
+        uid, user, paths = parsed[0]
+        need(uid // 100000 == user and 10000 <= uid % 100000 <= 19999, "C1", "boot-uid-clock")
+        base_paths = dict(zip(("target", "test"), paths))
+    attempt("C1", "boot-uid-clock", identity)
+    clocks = {}
+    for role in ("install-clock", "stop-clock", "after-stop-clock"):
+        def clock(role=role):
+            exact(role, ["shell", "date", "+%s%3N"])
+            value = output(role)
+            need(re.fullmatch(rb"(?:0|[1-9][0-9]*)\n", value) is not None and _purity_int(int(value), 2**63-1), "C1", "boot-uid-clock")
+            clocks[role] = int(value)
+        attempt("C1", "boot-uid-clock", clock)
+    need(clocks.get("install-clock", 1) <= clocks.get("stop-clock", 0) <= clocks.get("after-stop-clock", -1), "C1", "boot-uid-clock")
+    for role in ("boot-before", "boot-after"):
+        def boot(role=role):
+            exact(role, ["shell", "cat", "/proc/sys/kernel/random/boot_id"])
+            need(output(role) == (context["bootId"] + "\n").encode(), "C1", "boot-uid-clock")
+        attempt("C1", "boot-uid-clock", boot)
+    probe_payloads = {}
+    for role in ("absent", "inventory-pre", "inventory-post", "exit-query"):
+        for item in by_role.get(role, []):
+            def probe(item=item, role=role):
+                observation, groups, observed = item
+                op = "inventory" if role.startswith("inventory-") else "exits" if role == "exit-query" else role
+                need(len(groups) == 1 and observation["ref"] == groups[0][1]["stdout"], "C8", "command-identity")
+                start = groups[0][0]
+                need(not raw(groups[0][1]["stderr"]), "C8", "command-result")
+                need(start["op"] == op and argv(groups[0]) == ["shell", "env", "CLASSPATH=" + base_paths["target"], "app_process", "/system/bin", PURITY_PROBE,
+                    op, str(user), proof["attemptId"], proof["runnerNonce"], start["commandNonce"]], "C8", "command-identity")
+                value = _purity_json_bytes(observed)
+                need(set(value) == set("schema op attemptId runnerNonce commandNonce collectorUid userId payload".split())
+                     and type(value["schema"]) is int and value["schema"] == 2 and value["op"] == op and value["attemptId"] == proof["attemptId"] and value["runnerNonce"] == proof["runnerNonce"]
+                     and value["commandNonce"] == start["commandNonce"] and type(value["collectorUid"]) is int and value["collectorUid"] == 2000
+                     and type(value["userId"]) is int and value["userId"] == user, "C8", "command-identity")
+                probe_payloads.setdefault(role, []).append(value["payload"])
+            attempt("C8", "command-identity", probe)
+    def context_io():
+        collected = proof["deviceFiles"]["root"] + "/attempt.json"
+        need(raw(proof["context"]) == output("context-readback") == (root / collected).read_bytes(), "C1", "context")
+        exact("context-readback", ["shell", "cat", PURITY_ROOT + "attempt.json"])
+        group = primary("context-push")[1]
+        need(len(group) in (1, 2) and primary("context-push")[0]["ref"] == group[0][1]["stdout"], "C8", "command-identity")
+        if len(group) == 2:
+            need(argv(group[0]) == ["shell", "mkdir", "-p", PURITY_ROOT] and group[0][0]["op"] == "context-push", "C8", "command-identity")
+        args = argv(group[-1])
+        source = Path(args[1])
+        source = source if source.is_absolute() else root / source
+        need(group[-1][0]["op"] == "context-push" and len(args) == 3 and args[0] == "push" and args[2] == PURITY_ROOT + "attempt.json"
+             and source.resolve() == (root / proof["context"]["path"]).resolve(), "C8", "command-identity")
+        need(probe_payloads["absent"] == [{"exists": False}] and type(probe_payloads["absent"][0]["exists"]) is bool, "C1", "context")
+    attempt("C1", "context", context_io)
+    def install():
+        _, groups, observed = primary("install")
+        need(len(groups) == 2 and all(g[0]["op"] == "install" and argv(g)[:2] == ["install", "--no-streaming"] and len(argv(g)) == 3 and g[2].splitlines().count(b"Success") == 1 for g in groups)
+             and primary("install")[0]["ref"] == groups[0][1]["stdout"], "C8", "command-identity")
+    attempt("C1", "apk", install)
+    for role in ("apk-before-target", "apk-before-test", "apk-after-target", "apk-after-test"):
+        def apk(role=role):
+            key = "target" if role.endswith("target") else "test"
+            record = _purity_json_bytes(output(role))
+            package = "com.jay.fxi" if key == "target" else "com.jay.fxi.macrobenchmark"
+            need(set(record) == set("schema package pathOnDevice expectedSha256 actualSha256 actualSize matched".split()) and type(record["schema"]) is int and record["schema"] == 2
+                 and record["package"] == package and record["pathOnDevice"] == base_paths[key] and record["expectedSha256"] == record["actualSha256"] == apks[key]
+                 and _purity_int(record["actualSize"], 2**63-1, 1) and record["matched"] is True, "C1", "apk")
+            groups = primary(role)[1]
+            need(len(groups) == 1 and groups[0][0]["op"] == role and argv(groups[0])[:2] == ["pull", base_paths[key]] and len(argv(groups[0])) == 3, "C8", "command-identity")
+        attempt("C1", "apk", apk)
+    def stopped():
+        exact("force-stop", ["shell", "am", "force-stop", "--user", str(user), "com.jay.fxi"])
+        for role in ("live-after-stop", "live-final"):
+            exact(role, ["shell", "ps", "-A", "-o", "USER,PID,NAME"])
+            lines = output(role).decode().splitlines()
+            need(bool(lines) and lines[0].split() == ["USER", "PID", "NAME"], "C8", "command-result")
+            for line in lines[1:]:
+                owner, pid, name = line.split()
+                if owner.isdecimal():
+                    process_uid = int(owner)
+                else:
+                    m = re.fullmatch(r"u([0-9]+)_a([0-9]+)", owner)
+                    # Only numeric and Android application UID names can represent the target UID.
+                    if m:
+                        process_uid = int(m[1])*100000 + 10000 + int(m[2])
+                    elif re.fullmatch(r"[a-z_][a-z0-9_-]*", owner):
+                        process_uid = -1
+                    else:
+                        raise InvalidEvidence("unsupported process UID")
+                need(pid.isdecimal() and process_uid != uid and name != "com.jay.fxi" and not name.startswith("com.jay.fxi:"), "C8", "command-result")
+        groups = primary("instrumentation")[1]
+        args = argv(groups[0])
+        need(len(groups) == 1 and groups[0][0]["op"] == "instrumentation" and args[:3] == ["shell", "am", "instrument"]
+             and "s5.runId" in args and args[args.index("s5.runId") + 1] == proof["attemptId"]
+             and args[-1] == "com.jay.fxi.macrobenchmark/androidx.test.runner.AndroidJUnitRunner", "C8", "command-identity")
+        groups = primary("pull")[1]
+        args = argv(groups[0])
+        destination = Path(args[2])
+        destination = destination if destination.is_absolute() else root / destination
+        need(len(groups) == 1 and groups[0][0]["op"] == "pull" and args[:2] == ["pull", PURITY_ROOT + "."]
+             and destination.resolve() == (root / proof["deviceFiles"]["root"]).resolve(), "C8", "command-identity")
+    attempt("C8", "command-identity", stopped)
+    # Population parsing is independent of the proof's instance list.
+    registry = []
+    rows_by_id = {}
+    device_bytes = {}
+    def files():
+        device = proof["deviceFiles"]
+        if not isinstance(device, dict) or set(device) != {"root", "files"}:
+            raise InvalidEvidence("deviceFiles schema")
+        folder = _safe_artifact(root, device["root"], "device folder")
+        need(not folder.is_symlink() and folder.is_dir(), "C3", "file-set")
+        names = []
+        for item in device["files"]:
+            need(set(item) == {"name", "ref"} and isinstance(item["name"], str) and Path(item["name"]).name == item["name"] and item["name"] not in (".", ".."), "C3", "file-set")
+            name = item["name"]
+            need(item["ref"]["path"] == device["root"] + "/" + name, "C3", "file-set")
+            names.append(name)
+            device_bytes[name] = raw(item["ref"])
+        need(names == sorted(set(names)), "C3", "file-set")
+        actual = {p.name for p in folder.iterdir()}
+        need(actual == set(names), "C3", "file-set")
+        for p in folder.iterdir():
+            need(p.is_file() and not p.is_symlink() and p.stat().st_nlink == 1, "C3", "file-set")
+        host = [dict(name=n, type="file", size=len(b), sha256=hashlib.sha256(b).hexdigest()) for n,b in sorted(device_bytes.items())]
+        for role in ("inventory-pre", "inventory-post"):
+            payload = probe_payloads[role][0]
+            need(set(payload) == {"files"} and payload["files"] == host, "C3", "byte-equality")
+            need(all(set(f) == {"name", "type", "size", "sha256"} and type(f["size"]) is int and f["type"] == "file" for f in payload["files"]), "C3", "file-set")
+    attempt("C3", "file-set", files)
+    def parse_registry():
+        if "registry.jsonl" not in device_bytes:
+            bad("C3", "file-set")
+            return
+        raw_registry = _purity_lines(device_bytes["registry.jsonl"])
+        ids, lives = set(), set()
+        for row in raw_registry:
+            valid_row = _purity_registration_valid(row) and row.get("kind") == "register"
+            need(valid_row, "C2", "json-schema")
+            iid, life = row.get("instanceId"), row.get("lifetimeId")
+            valid_ids = _purity_id(iid) and _purity_id(life)
+            need(valid_ids and iid not in ids and life not in lives, "C2", "registry")
+            if not valid_row or not valid_ids:
+                # Only typed rows may supply set keys, instance counts or OS time bounds.
+                continue
+            ids.add(iid); lives.add(life)
+            registry.append(row)
+            filename = f"instance-{iid}.jsonl"
+            if filename not in device_bytes:
+                bad("C3", "file-set")
+                lines = None
+            else:
+                lines = attempt("C2", "json-schema", lambda: _purity_lines(device_bytes[filename]))
+            if lines is not None:
+                rows_by_id[iid] = lines
+                need(lines[0].get("kind") == "begin" and sum(r.get("kind") == "begin" for r in lines) == 1, "C2", "registry")
+                begin = lines[0]
+                need(_purity_registration_valid(begin) and _purity_id(begin.get("instanceId"))
+                     and _purity_id(begin.get("lifetimeId")), "C2", "json-schema")
+                need({k:v for k,v in row.items() if k != "kind"} == {k:v for k,v in lines[0].items() if k != "kind"}, "C3", "instance-set")
+                for row2 in lines[1:]:
+                    kind = row2.get("kind")
+                    need(kind in ("prepare", "commit") and set(row2) == set("kind schema instanceId attemptId runnerNonce seq".split()) | ({"line"} if kind == "prepare" else set()), "C2", "json-schema")
+                    need(type(row2.get("schema")) is int and row2.get("schema") == 2
+                         and all(isinstance(row2.get(k), str) for k in ("instanceId", "attemptId", "runnerNonce")), "C2", "json-schema")
+                    if kind == "prepare":
+                        need(isinstance(row2.get("line"), str), "C2", "json-schema")
+            for row2 in [row, *(lines or [])]:
+                need(type(row2.get("schema")) is int and row2.get("schema") == 2 and row2.get("instanceId") == iid
+                    and row2.get("attemptId") == context.get("attemptId") and row2.get("runnerNonce") == context.get("runnerNonce"), "C4", "attribution")
+                if row2.get("kind") in ("register", "begin"):
+                    need(row2.get("attemptState") == "ok" and row2.get("bootId") == context.get("bootId"), "C4", "attribution")
+        required = {"attempt.json", "registry.jsonl"} | {f"instance-{i}.jsonl" for i in ids}
+        need(set(device_bytes) == required, "C3", "file-set")
+        need(set(rows_by_id) == ids, "C3", "instance-set")
+    attempt("C2", "registry", parse_registry)
+    for row in registry:
+        iid = row.get("instanceId")
+        lines = rows_by_id.get(iid, [])
+        count = max(0, (len(lines)-1)//2)
+        need(bool(lines) and len(lines) % 2 == 1, "C5", "sequence")
+        for index, line in enumerate(lines[1:]):
+            need(line.get("kind") == ("prepare" if index % 2 == 0 else "commit") and _purity_int(line.get("seq"), minimum=1)
+                 and line["seq"] == index//2 + 1, "C5", "sequence")
+        instances.append(dict(instanceId=iid, lifetimeId=row.get("lifetimeId"), commits=count))
+    instances.sort(key=lambda value: str(value["instanceId"]))
+    claimed_instances = proof["instances"]
+    instance_schema = isinstance(claimed_instances, list) and all(isinstance(i, dict) and set(i) == {"instanceId", "lifetimeId", "commits"}
+        and _purity_id(i["instanceId"]) and _purity_id(i["lifetimeId"]) and _purity_int(i["commits"]) for i in claimed_instances)
+    projection = lambda rows: [(i["instanceId"], i["lifetimeId"]) for i in rows]
+    need(instance_schema and projection(claimed_instances) == projection(instances), "C3", "instance-set")
+    if instance_schema:
+        # C3 checks the identity population; a malformed p/c sequence is C5, including MAX bridge samples.
+        need(claimed_instances == instances, "C5", "sequence")
+    records = []
+    for payload in probe_payloads.get("exit-query", []):
+        if not isinstance(payload, dict) or set(payload) != {"records"} or not isinstance(payload["records"], list):
+            bad("C6", "record-set")
+            continue
+        for record in payload["records"]:
+            if record not in records:
+                records.append(record)
+    decoded = []
+    for record in records:
+        def decode_record():
+            if not isinstance(record, dict) or set(record) != set("pid processName realUid packageUid definingUid timestampMs reason status summaryHex".split()):
+                bad("C6", "record-set")
+                return
+            need(all(_purity_int(record.get(k)) for k in ("pid", "realUid", "packageUid", "definingUid", "reason", "status"))
+                 and isinstance(record.get("processName"), str), "C6", "record-identity")
+            need(_purity_int(record.get("timestampMs"), 2**63-1), "C6", "record-time")
+            h = record["summaryHex"]
+            if h is None:
+                return
+            if not isinstance(h, str) or re.fullmatch("[0-9a-f]{128}", h) is None:
+                raise InvalidEvidence("summary hex")
+            decoded.append((record, decode_purity_summary(bytes.fromhex(h))))
+        attempt("C6", "summary-codec", decode_record)
+    for instance in instances:
+        matching = [(r,s) for r,s in decoded if (s.runner_nonce,s.lifetime_id,s.instance_id) == (proof["runnerNonce"],instance["lifetimeId"],instance["instanceId"])]
+        need(len(matching) == 1, "C6", "record-set")
+        if len(matching) != 1:
+            continue
+        record, summary = matching[0]
+        row = next(r for r in registry if r["instanceId"] == instance["instanceId"])
+        need(summary.state == "IDLE", "C6", "summary-state")
+        need(summary.counter == instance["commits"], "C6", "summary-count")
+        need(all(_purity_int(record.get(k)) for k in ("pid", "realUid", "packageUid", "definingUid", "reason", "status"))
+             and record.get("pid") == row.get("pid") and record.get("processName") == row.get("processName") == "com.jay.fxi"
+             and record.get("packageUid") == record.get("realUid") == record.get("definingUid") == row.get("packageUid") == uid
+             and row.get("userId") == user, "C6", "record-identity")
+        need(_purity_int(record.get("timestampMs"), 2**63-1) and clocks.get("install-clock", 2**63) <= row.get("processStartWallMs", -1)
+             <= record["timestampMs"] <= clocks.get("after-stop-clock", -1), "C6", "record-time")
+        need(_purity_int(record.get("reason")) and _purity_int(record.get("status"))
+             and (record["reason"], record["status"]) in {(10,0),(11,0),(2,9),(2,15)}, "C7", "exit-reason-status")
+    # Sort by responsibility; proof-result is always a trailing diagnostic.
+    defects.sort(key=lambda item: int(item["check"][1:]))
+    count = sum(i["commits"] for i in instances)
+    state, actual = ("incomplete", None) if defects else ("nonzero" if count else "zero", count)
+    expected_result = dict(state=state, actualCount=actual, defects=defects.copy())
+    claim = proof["result"]
+    well_formed_claim = (isinstance(claim, dict) and set(claim) == {"state", "actualCount", "defects"}
+        and isinstance(claim.get("state"), str) and claim["state"] in {"zero", "nonzero", "incomplete"}
+        and (claim["actualCount"] is None if claim["state"] == "incomplete" else type(claim["actualCount"]) is int and claim["actualCount"] >= 0)
+        and isinstance(claim.get("defects"), list) and all(isinstance(d, dict) and set(d) == {"check", "code"}
+            and isinstance(d["check"], str) and isinstance(d["code"], str) for d in claim["defects"]))
+    if compare_result and (not well_formed_claim or proof["result"] != expected_result):
+        bad("C8", "proof-result")
+        state, actual = "incomplete", None
+    return PurityResult(state, defects, instances, actual)
+
+
+def validate_manifest_purity(manifest: Mapping[str, Any], artifact_root: Path) -> None:
+    apks = {key: manifest["artifacts"][artifact]["sha256"] for key,artifact in
+            (("target", "targetBenchmarkApk"), ("test", "macrobenchmarkTestApk"))}
+    seen_nonces = set()
+    owners = {}
+    for journey in manifest["journeys"]:
+        for run in journey["runs"]:
+            if "purity" not in run:
+                raise InvalidEvidence("valid run requires purity")
+            result = read_purity_proof(run["purity"], artifact_root, {"attemptId": run["runId"]}, apks)
+            if result.state != "zero":
+                raise InvalidEvidence(f"run {run['runId']} purity is {result.state}: {result.defects}")
+            proof = _purity_json_bytes(_purity_ref(run["purity"], artifact_root).read_bytes())
+            if proof["runnerNonce"] in seen_nonces:
+                raise InvalidEvidence("cross-attempt nonce reuse")
+            seen_nonces.add(proof["runnerNonce"])
+            def refs(value):
+                if isinstance(value, dict):
+                    if set(value) == {"path", "sha256"}:
+                        yield value
+                    else:
+                        for item in value.values():
+                            yield from refs(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        yield from refs(item)
+            command_rows = _purity_lines(_purity_ref(proof["commands"], artifact_root).read_bytes())
+            for ref in [run["purity"], *refs(proof), *refs(command_rows)]:
+                path = _purity_ref(ref, artifact_root)
+                stat = path.stat()
+                inode = stat.st_dev, stat.st_ino
+                owner = owners.setdefault(inode, run["runId"])
+                if owner != run["runId"]:
+                    raise InvalidEvidence("cross-attempt evidence ref reuse")
 
 
 def _reject_constant(value: str) -> None:
@@ -1037,6 +1567,7 @@ def validate_manifest(manifest: Mapping[str, Any], artifact_root: Path) -> None:
         aggregate = "pass" if all(value == "pass" for value in journey_verdicts) else "fail"
         if manifest.get("verdict") != aggregate:
             raise InvalidEvidence("S5 manifest verdict is inconsistent with journey verdicts")
+    validate_manifest_purity(manifest, artifact_root)
 
 
 def validate_s11_against_golden(

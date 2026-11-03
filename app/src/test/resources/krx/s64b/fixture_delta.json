@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "note": "S6-4b-1 D20 stage 1 (scope r28 D20 rules, s6_4b_contracts.r4.md \u00a77). The frozen krx/s64a inventory is unchanged; changed is exactly Routes and Server, added is empty (Modules and the D17 journal are stage 2). 'to' values are the implementation candidate's bytes; product_base is every other root file at Android main 6fc8adb8.",
+  "note": "S6-4b-2 D20 cumulative stage 2 candidate. Frozen s64a base/from and approved stage1 Routes/product bytes are preserved; Modules is moved from product_base to changed, and the journal is added. Final hashes bind this worktree implementation. Pending separate exact approval by Claude; no commit/push/land approval is implied.",
   "base": "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f",
   "changed": {
     "src/s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureRoutes.kt": {
@@ -9,10 +9,16 @@
     },
     "src/s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureServer.kt": {
       "from": "db752cf3d1a0a8a10e37ab04912e0d6763a2f8f5b6a222a9996c3ebd3aca0b03",
-      "to": "9a45d30d97cb8470d7f9421145229a8c048a6c2859a67ac510a3c53953c690f4"
+      "to": "44d034b85393c91adb0eb6ed97cd9b48fa68e63a4f1ea4545a38af1e89e8db4a"
+    },
+    "src/s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureModules.kt": {
+      "from": "bacb4e92fc7e65a11e45c522f15089ae738a42f0102666b2d0e08e91b1cb767a",
+      "to": "d3fdfe215d933901382448a1015ec9fcbfc02abd1e99435080473615b32e82ea"
     }
   },
-  "added": {},
+  "added": {
+    "src/s5Benchmark/java/com/jay/fxi/s5fixture/S5PurityJournal.kt": "22c8d7e9e9bd6db500cb447362bf45d7a70090038e54605244befa94b920db1d"
+  },
   "product_base": {
     "src/benchmark/java/com/jay/fxi/benchmark/BenchmarkSmokeActivity.kt": "efee736203c2a3eb38da430120c8ad5ce218ce41fff450d577ed7998ecb8d21e",
     "src/debug/java/com/jay/fxi/di/DebugAuthGraphProbe.kt": "d5636376ae24218bd3c0219351d1280ca0cbbfc93b10712070fa63273a1c4c2c",
@@ -370,7 +376,6 @@
     "src/productionBindings/java/com/jay/fxi/di/GraphClockModule.kt": "86fde20aea142105b8c1297e72ff997c59567a14505d103a54949f54495e3f2c",
     "src/productionBindings/java/com/jay/fxi/di/ServerEndpointsModule.kt": "80d759a2e0b7e9c6c52db693e8add6f59909851bec79008ce3639ae186b78330",
     "src/s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureIdentity.kt": "58dbfb56e681e1ed425b58e28a85cd601e30ce12a89f688ff3d8f4c0ac6ac684",
-    "src/s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureModules.kt": "bacb4e92fc7e65a11e45c522f15089ae738a42f0102666b2d0e08e91b1cb767a",
     "src/s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureSeedRule.kt": "2ca460f7db062ba7f42f558ec60eb9106fdd75a35060fcb8ed37edfa11aec8f3",
     "src/s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureSelectionSeeder.kt": "42795c2f6180837eb4a93c97a81845ec1268e39ef6090e1e64ecbc567755a787",
     "src/s5Benchmark/java/com/jay/fxi/s5fixture/S5FixtureSelfCheck.kt": "77fb5eebd546cbc854f84ddb62c17c8757fd6953c24355bdfeb48e15b892a282"

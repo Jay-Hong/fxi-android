@@ -19,6 +19,8 @@ import json
 import math
 import os
 import re
+import secrets
+import shlex
 import signal
 import subprocess
 import sys
@@ -84,6 +86,9 @@ class Observation:
     instrumentation_green: bool = False
     result: Optional[str] = None          # None absent, "valid", "malformed" (an object the strict parser refuses), "unreadable"
     traces_ok: bool = False
+    purity: Optional[str] = None
+    purity_required: bool = False             # Compatibility field; invoked attempts always require zero.
+    purity_diagnostics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -109,6 +114,8 @@ def classify(o: Observation) -> Outcome:
         if o.invocation == NOT_INVOKED and o.environment_error:
             return Outcome("invalid", "environment-invalid")
         return Outcome("aborted", "no behavior record although the instrumentation ran or may have run")
+    if o.invocation in (INVOKED, UNKNOWN) and o.purity != "zero":
+        return Outcome("aborted", "purity " + ("nonzero" if o.purity == "nonzero" else "incomplete"))
     if o.environment_error:
         return Outcome("invalid", "environment-invalid")
     if not o.instrumentation_green:
@@ -120,6 +127,11 @@ def classify(o: Observation) -> Outcome:
     if not (o.traces_ok and o.snapshots_valid):
         return Outcome("aborted", "an unclassified collection state")
     return Outcome("valid")
+
+
+def classify_purity(o: Observation) -> Outcome:
+    """r4 §5.1: invoked unknown/missing purity is incomplete; zero resumes the old ordering."""
+    return classify(o)
 
 
 # --------------------------------------------------------------------------------------------------------------------------
@@ -201,6 +213,23 @@ def snapshots_valid(pre: Path, post: Path, attempt_id: str) -> bool:
 # The device, thinly
 
 
+@dataclass(frozen=True)
+class PurityCommand:
+    op: str
+    argv: tuple[str, ...]
+    command_nonce: str
+    timeout: float
+
+
+@dataclass(frozen=True)
+class CommandObservation:
+    seq: int
+    return_code: Optional[int]
+    timed_out: bool
+    stdout: dict[str, str]
+    stderr: dict[str, str]
+
+
 class DeviceOps:
     """device_preflight's helpers and the few adb calls this runner adds; no decisions are made here."""
 
@@ -213,6 +242,108 @@ class DeviceOps:
 
     def connect(self) -> None:
         self.adb = dp.connected_adb()
+
+    def begin_purity_observation(self, artifact_root: Path, folder: Path,
+                                 attempt_id: str, runner_nonce: str) -> None:
+        self._purity_root, self._purity_folder = artifact_root, folder
+        self._purity_attempt, self._purity_nonce = attempt_id, runner_nonce
+        self._purity_pairs = []
+        self._purity_apk_counts = {}
+        self._purity_observations = []
+        self._purity_busy = False
+        (folder / "commands").mkdir(mode=0o700)
+        _write_new(folder / "commands.jsonl", b"")
+
+    def observe(self, command: PurityCommand) -> CommandObservation:
+        if self._purity_busy:
+            raise EvidenceIOError("concurrent D17 command")
+        self._purity_busy = True
+        seq = len(self._purity_pairs) + 1
+        args = list(command.argv)
+        # adb shell performs a second shell parse. Quote that remote argv separately.
+        if isinstance(self.adb, dp.Adb) and args[:1] == ["shell"]:
+            args = ["shell", shlex.join(args[1:])]
+        recorded = ["adb", *args]
+        if self.serial:
+            recorded = ["adb", "-s", "<redacted-device>", *args]
+        start = dict(kind="start", schema=2, attemptId=self._purity_attempt, runnerNonce=self._purity_nonce,
+                     seq=seq, op=command.op, argv=recorded, commandNonce=command.command_nonce, monoNs=time.monotonic_ns())
+        try:
+            _append_line(self._purity_folder / "commands.jsonl", json.dumps(start, sort_keys=True) + "\n")
+            code, timed_out, stdout, stderr = None, False, b"", b""
+            try:
+                if isinstance(self.adb, dp.Adb):
+                    result = subprocess.run([self.adb.executable, "-s", self.adb.serial, *args], capture_output=True, timeout=command.timeout)
+                else:
+                    result = self.adb.run(*args, check=False, timeout=command.timeout)
+                code, stdout, stderr = result.returncode, result.stdout, result.stderr
+            except subprocess.TimeoutExpired as error:
+                timed_out, stdout, stderr = True, error.output or b"", error.stderr or b""
+            except (dp.PreflightError, OSError) as error:
+                code, stderr = -1, _safe("D17 command", error, self.serial).encode()
+            def stream(name, value):
+                data = value.encode("utf-8") if isinstance(value, str) else value
+                if self.serial:
+                    data = data.replace(self.serial.encode(), b"<redacted-device>")
+                path = self._purity_folder / "commands" / f"{seq:03d}.{name}"
+                _write_new(path, data)
+                return {"path": path.relative_to(self._purity_root).as_posix(), "sha256": dp.file_sha256(path)}
+            out, err = stream("stdout", stdout), stream("stderr", stderr)
+            finish = dict(kind="finish", schema=2, attemptId=self._purity_attempt, runnerNonce=self._purity_nonce,
+                          seq=seq, monoNs=time.monotonic_ns(), returnCode=code, timedOut=timed_out, stdout=out, stderr=err)
+            _append_line(self._purity_folder / "commands.jsonl", json.dumps(finish, sort_keys=True) + "\n")
+            self._purity_pairs.append((start, finish))
+            return CommandObservation(seq, code, timed_out, out, err)
+        except (OSError, dp.PreflightError) as error:
+            raise EvidenceIOError("cannot preserve D17 command") from error
+        finally:
+            self._purity_busy = False
+
+    def _observed(self, op: str, argv: Sequence[str], timeout: float = 10) -> CommandObservation:
+        return self.observe(PurityCommand(op, tuple(argv), secrets.token_hex(16), timeout))
+
+    def device_api(self) -> CommandObservation:
+        return self._observed("device-api", ["shell", "getprop", "ro.build.version.sdk"])
+
+    def purity_probe(self, op: str, *, base_apk: str, user_id: int,
+                     attempt_id: str, runner_nonce: str) -> CommandObservation:
+        if op not in ("absent", "inventory", "exits"):
+            raise RunnerError("unknown probe operation")
+        nonce = secrets.token_hex(16)
+        return self.observe(PurityCommand(op, ("shell", "env", f"CLASSPATH={base_apk}", "app_process", "/system/bin",
+            gate.PURITY_PROBE, op, str(user_id), attempt_id, runner_nonce, nonce), getattr(self, "_query_timeout", 10)))
+
+    def push_purity_context(self, context: Path) -> CommandObservation:
+        self._observed("context-push", ["shell", "mkdir", "-p", gate.PURITY_ROOT])
+        return self._observed("context-push", ["push", str(context), gate.PURITY_ROOT + "attempt.json"])
+
+    def read_purity_context(self, destination: Path) -> CommandObservation:
+        observation = self._observed("context-readback", ["shell", "cat", gate.PURITY_ROOT + "attempt.json"])
+        _write_new(destination, (self._purity_root / observation.stdout["path"]).read_bytes())
+        return observation
+
+    def pull_purity_files(self, destination: Path) -> CommandObservation:
+        destination.mkdir(mode=0o700, exist_ok=False)
+        return self._observed("pull", ["pull", gate.PURITY_ROOT + ".", str(destination)], PULL_TIMEOUT_SECONDS)
+
+    def purity_force_stop(self, user_id: int) -> CommandObservation:
+        return self._observed("force-stop", ["shell", "am", "force-stop", "--user", str(user_id), dp.TARGET_PACKAGE])
+
+    def purity_live(self, phase: str) -> CommandObservation:
+        return self._observed(phase, ["shell", "ps", "-A", "-o", "USER,PID,NAME"])
+
+    def purity_identity(self, phase: str) -> CommandObservation:
+        first = self._observed(phase, ["shell", "cmd", "package", "list", "packages", "-U", dp.TARGET_PACKAGE])
+        self._observed(phase, ["shell", "am", "get-current-user"])
+        for package in PACKAGES:
+            self._observed(phase, ["shell", "pm", "path", package])
+        return first
+
+    def purity_clock(self, phase: str) -> CommandObservation:
+        return self._observed(phase, ["shell", "date", "+%s%3N"])
+
+    def purity_boot_id(self, phase: str) -> CommandObservation:
+        return self._observed(phase, ["shell", "cat", "/proc/sys/kernel/random/boot_id"])
 
     def restore_settings(self) -> Optional[dict[str, str]]:
         return dp.restore_from_journal(self.adb)
@@ -247,21 +378,38 @@ class DeviceOps:
         return None if status == 0 and raw_status != "0" else status
 
     def install(self, apk: Path) -> None:
-        dp.install_apk(self.adb, apk)
+        if hasattr(self, "_purity_pairs"):
+            result = self._observed("install", ["install", "--no-streaming", str(apk)], 180)
+            if result.return_code != 0 or result.timed_out:
+                raise dp.PreflightError("cannot install staged APK")
+        else:
+            dp.install_apk(self.adb, apk)
 
     def pull_installed(self, package: str, destination: Path, expected: dict[str, Any]) -> None:
         """device_preflight's read-back: the installed base APK pulled to ``destination`` and compared with ``expected``."""
-        dp.installed_apk_identity(self.adb, package, expected, destination)
+        if not hasattr(self, "_purity_pairs"):
+            dp.installed_apk_identity(self.adb, package, expected, destination)
+            return
+        counts = getattr(self, "_purity_apk_counts", {})
+        self._purity_apk_counts = counts
+        phase = "before" if counts.get(package, 0) == 0 else "after"
+        counts[package] = counts.get(package, 0) + 1
+        key = "target" if package == dp.TARGET_PACKAGE else "test"
+        result = self._observed(f"apk-{phase}-{key}", ["pull", self._purity_base_paths[key], str(destination)], PULL_TIMEOUT_SECONDS)
+        if result.return_code != 0 or result.timed_out:
+            raise dp.PreflightError(f"cannot read back installed {package} APK")
+        if dp.stable_file_identity(destination, expected["path"]) != expected:
+            raise dp.PreflightError(f"installed {package} APK differs from staged bytes")
 
     def clear_output(self, attempt_id: str) -> bool:
         return dp.remove_device_output(self.adb, attempt_id)
 
     def instrument(self, method: str, attempt_id: str):
-        return self.adb.run(
-            "shell", "am", "instrument", "-w", "-r", "-e", "class", f"{TEST_CLASS}#{method}", "-e", "s5.runId", attempt_id,
-            "-e", "additionalTestOutputDir", f"{dp.DEVICE_OUTPUT_ROOT}/{attempt_id}", dp.INSTRUMENTATION_COMPONENT,
-            check=False, timeout=INSTRUMENT_TIMEOUT_SECONDS,
-        )
+        observation = self._observed("instrumentation", ["shell", "am", "instrument", "-w", "-r", "-e", "class", f"{TEST_CLASS}#{method}", "-e", "s5.runId", attempt_id,
+            "-e", "additionalTestOutputDir", f"{dp.DEVICE_OUTPUT_ROOT}/{attempt_id}", dp.INSTRUMENTATION_COMPONENT], INSTRUMENT_TIMEOUT_SECONDS)
+        out = (self._purity_root / observation.stdout["path"]).read_bytes().decode("utf-8")
+        err = (self._purity_root / observation.stderr["path"]).read_bytes().decode("utf-8")
+        return subprocess.CompletedProcess([], observation.return_code if observation.return_code is not None else -1, out, err)
 
     def pull_output(self, attempt_id: str, destination: Path) -> None:
         result = self.adb.run("pull", f"{dp.DEVICE_OUTPUT_ROOT}/{attempt_id}/.", str(destination), check=False,
@@ -363,6 +511,7 @@ class Session:
     owned_outputs: list[str] = field(default_factory=list)
     ledger_broken: bool = False
     evidence_error: Optional[str] = None
+    purity_enabled: bool = True
 
     def append(self, entry_type: str, **fields: Any) -> None:
         """A ledger line; a failed write marks the ledger broken so nothing more is ever added to it."""
@@ -480,101 +629,307 @@ def wait_for_thermal_none(session: Session, journey: str, ordinal: int) -> dict[
 def run_attempt(session: Session, journey: str, ordinal: int) -> Outcome:
     """One attempt in s6c_plan.r2.md §3 order. Writes its attempt-end unless the outcome is aborted (the session then ends the
     run with an aborted end and leaves the start unfinished)."""
+    return run_purity_attempt(session, journey, ordinal)
+
+
+def _purity_capture(session: Session, role: str, call: Callable, *, reference: dict[str,str] | None = None):
+    device = session.device
+    before = len(device._purity_pairs)
+    pending_error = None
+    value = None
+    try:
+        value = call()
+    except EvidenceIOError:
+        raise
+    except Exception as error:
+        pending_error = error
+    pairs = device._purity_pairs[before:]
+    if not pairs:
+        raise RunnerError("operation omitted D17 observation")
+    ref = reference or pairs[0][1]["stdout"]
+    device._purity_observations.append(dict(role=role, ref=ref, seqs=[s["seq"] for s,f in pairs]))
+    for start, finish in pairs:
+        if finish["timedOut"] or finish["returnCode"] != 0:
+            raise RunnerError("D17 command failed: " + role)
+    if pending_error is not None:
+        raise pending_error
+    return value
+
+
+def _purity_output(session: Session, role: str) -> bytes:
+    item = next(o for o in session.device._purity_observations if o["role"] == role)
+    return gate._purity_ref(item["ref"], session.root).read_bytes()
+
+
+def _purity_readbacks(session: Session, folder: Path, phase: str) -> bool:
+    matched = True
+    for key, package in (("target", dp.TARGET_PACKAGE), ("test", dp.TEST_PACKAGE)):
+        role = f"apk-{phase}-{key}"
+        path = session.scratch / f"installed-{package}.apk"
+        before = len(session.device._purity_pairs)
+        expected = session.staged[package]["identity"]
+        error = None
+        try:
+            session.device.pull_installed(package, path, expected)
+        except dp.PreflightError as caught:
+            error = caught
+        try:
+            actual = dp.stable_file_identity(path, expected["path"]) if path.is_file() else None
+            same = actual == expected
+            groups = session.device._purity_pairs[before:]
+            completed = groups and all(f["returnCode"] == 0 and not f["timedOut"] for s,f in groups)
+            if not same and actual is not None and (completed or error is not None and str(error) == f"installed {package} APK differs from staged bytes"):
+                matched = False
+            record = dict(schema=2, package=package, pathOnDevice=session.device._purity_base_paths[key],
+                          expectedSha256=expected["sha256"], actualSha256=actual["sha256"] if actual else None,
+                          actualSize=actual["size"] if actual else None, matched=same)
+            destination = folder / (role + ".json")
+            write_json_new(destination, record)
+            session.device._purity_observations.append(dict(role=role, ref=_ref(session, destination), seqs=[s["seq"] for s,f in groups]))
+            if error is not None and matched:
+                raise error
+        finally:
+            path.unlink(missing_ok=True)
+    return matched
+
+
+def run_purity_attempt(session: Session, journey: str, ordinal: int) -> Outcome:
     attempt_id = f"{session.run_id}-{journey}-a{ordinal}"
     folder = session.root / "attempts" / attempt_id
     folder.mkdir(parents=True, exist_ok=False, mode=0o700)
     output = folder / "output"
     pre, post = folder / "preflight.json", folder / "postflight.json"
-    serial = session.device.serial
-    session.append("attempt-start", journey=journey, ordinal=ordinal, attemptId=attempt_id)
+    device = session.device
+    nonce = secrets.token_hex(16)
+    device.begin_purity_observation(session.root, folder, attempt_id, nonce)
+    _purity_capture(session, "boot-before", lambda: device.purity_boot_id("boot-before"))
+    boot = _purity_output(session, "boot-before").decode("utf-8").removesuffix("\n")
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot):
+        raise EvidenceIOError("cannot attribute attempt context to boot")
+    apks = dict(target=session.staged[dp.TARGET_PACKAGE]["sha256"], test=session.staged[dp.TEST_PACKAGE]["sha256"])
+    context = folder / "context.json"
+    _write_new(context, (json.dumps(dict(schema=2, attemptId=attempt_id, runnerNonce=nonce, bootId=boot,
+        targetApkSha256=apks["target"], testApkSha256=apks["test"]), separators=(",", ":")) + "\n").encode())
+    expected = dict(attemptId=attempt_id, runnerNonce=nonce, context=_ref(session, context))
+    session.append("attempt-start", journey=journey, ordinal=ordinal, **expected)
     invocation, environment_error, apks_changed, green = NOT_INVOKED, None, False, False
-
-    def note(label: str, error: BaseException) -> None:
+    purity = None
+    interrupted = False
+    def note(label, error):
         nonlocal environment_error
-        message = _safe(label, error, serial)
         if isinstance(error, EvidenceIOError):
-            session.evidence_error = session.evidence_error or message
+            session.evidence_error = session.evidence_error or str(error)
         else:
-            environment_error = environment_error or message
-
+            environment_error = environment_error or _safe(label, error, device.serial)
     try:
+        _purity_capture(session, "device-api", device.device_api)
+        raw_api = _purity_output(session, "device-api")
+        if not re.fullmatch(rb"[1-9][0-9]*\n", raw_api) or int(raw_api) < 30:
+            raise RunnerError("D17 requires API >=30")
         for package in PACKAGES:
-            session.device.assert_absent(package)
-        for package in PACKAGES:
-            session.owned_packages.append(package)
-            session.device.install(session.staged[package]["path"])
-        apks_changed = not installed_match(session)
+            device.assert_absent(package)
+        def install():
+            for package in PACKAGES:
+                session.owned_packages.append(package)
+                device.install(session.staged[package]["path"])
+        _purity_capture(session, "install", install)
+        _purity_capture(session, "install-identity", lambda: device.purity_identity("install-identity"))
+        groups = [pair for pair in device._purity_pairs if pair[0]["op"] == "install-identity"]
+        if len(groups) != 4:
+            raise RunnerError("installation identity command set incomplete")
+        streams = [(session.root / f["stdout"]["path"]).read_bytes() for s,f in groups]
+        uid_match = re.fullmatch(rb"package:com\.jay\.fxi uid:([0-9]+)\n", streams[0])
+        if not uid_match or not re.fullmatch(rb"(?:0|[1-9][0-9]*)\n", streams[1]):
+            raise RunnerError("unknown installation identity")
+        device._purity_user = int(streams[1])
+        if int(uid_match[1]) // 100000 != device._purity_user:
+            raise RunnerError("installation user/UID mismatch")
+        paths = []
+        for raw_path in streams[2:]:
+            match = re.fullmatch(rb"package:(/[^\r\n]+\.apk)\n", raw_path)
+            if not match:
+                raise RunnerError("single installed base APK required")
+            paths.append(match[1].decode())
+        device._purity_base_paths = dict(zip(("target", "test"), paths))
+        _purity_capture(session, "install-clock", lambda: device.purity_clock("install-clock"))
+        def probe(op):
+            return device.purity_probe(op, base_apk=paths[0], user_id=device._purity_user, attempt_id=attempt_id, runner_nonce=nonce)
+        _purity_capture(session, "absent", lambda: probe("absent"))
+        absent = gate._purity_json_bytes(_purity_output(session, "absent"))
+        if absent.get("payload") != {"exists": False}:
+            raise RunnerError("installed purity folder already exists")
+        _purity_capture(session, "context-push", lambda: device.push_purity_context(context))
+        _purity_capture(session, "context-readback", lambda: device.read_purity_context(folder / "context-readback.json"))
+        if _purity_output(session, "context-readback") != context.read_bytes():
+            raise RunnerError("attempt context read-back mismatch")
+        apks_changed = not _purity_readbacks(session, folder, "before")
         session.owned_outputs.append(attempt_id)
-        if not session.device.clear_output(attempt_id):
-            raise RunnerError("cannot clear the attempt's device output")
+        if not device.clear_output(attempt_id):
+            raise RunnerError("cannot clear device output")
         write_snapshot(session, pre, attempt_id, "preflight")
         if not apks_changed:
             invocation = UNKNOWN
-            result = session.device.instrument(METHODS[journey], attempt_id)
+            result = _purity_capture(session, "instrumentation", lambda: device.instrument(METHODS[journey], attempt_id))
             invocation = INVOKED
             text = result.stdout + "\n" + result.stderr
-            if serial and serial in text:
-                raise RunnerError("the instrumentation output names the device serial")
-            _write_new(folder / "instrumentation.txt", text.encode("utf-8"))
+            _write_new(folder / "instrumentation.txt", _mask(text, device.serial).encode())
             green = result.returncode == 0 and instrumentation_green(text, METHODS[journey])
-    except (dp.PreflightError, RunnerError, OSError) as error:
+    except (Exception, KeyboardInterrupt) as error:
+        interrupted = isinstance(error, KeyboardInterrupt)
         note("the attempt", error)
-    if invocation != NOT_INVOKED:
-        try:
-            write_snapshot(session, post, attempt_id, "postflight")
-        except (dp.PreflightError, RunnerError, OSError) as error:
-            note("the postflight", error)
-        try:
-            output.mkdir(mode=0o700)
-            session.device.pull_output(attempt_id, output)
-        except (dp.PreflightError, OSError) as error:
-            note("collecting the output", error)
-        try:
+    try:
+        if invocation != NOT_INVOKED:
+            for label, action in (
+                ("postflight", lambda: write_snapshot(session, post, attempt_id, "postflight")),
+                ("output", lambda: (output.mkdir(mode=0o700), device.pull_output(attempt_id, output))),
+            ):
+                try:
+                    action()
+                except (dp.PreflightError, RunnerError, OSError) as error:
+                    note(label, error)
             behavior_file = output / BEHAVIOR_FOLDER / f"s5-behavior-{attempt_id}.json"
-            if not behavior_file.exists() and not behavior_file.is_symlink():
-                behavior_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                session.device.pull_behavior(attempt_id, behavior_file)
-        except (dp.PreflightError, OSError) as error:
-            note("collecting the behavior record", error)
-        try:
-            apks_changed = apks_changed or not installed_match(session)
-        except (dp.PreflightError, OSError) as error:
-            note("reading the APKs back", error)
-    cleanup_error = cleanup_attempt(session, attempt_id)
+            try:
+                if not behavior_file.exists():
+                    behavior_file.parent.mkdir(parents=True, exist_ok=True)
+                    device.pull_behavior(attempt_id, behavior_file)
+            except (dp.PreflightError, RunnerError, OSError) as error:
+                note("behavior", error)
+            try:
+                apks_changed = not _purity_readbacks(session, folder, "after") or apks_changed
+            except (dp.PreflightError, RunnerError, OSError) as error:
+                note("APK read-back", error)
+        purity = collect_purity(session, folder, expected, apks, invocation)
+    finally:
+        cleanup_error = cleanup_attempt(session, attempt_id)
     if session.evidence_error:
         raise EvidenceIOError(session.evidence_error)
+    if interrupted:
+        raise KeyboardInterrupt
     behavior = read_behavior(output / BEHAVIOR_FOLDER / f"s5-behavior-{attempt_id}.json", attempt_id, journey)
     result_kind, traces = read_result(output / RESULT_NAME, journey)
     traces_ok = len(traces) == gate.EXPECTED_ITERATIONS and all((output / name).is_file() for name in traces)
+    valid_snapshots = pre.is_file() and post.is_file() and snapshots_valid(pre, post, attempt_id)
     if behavior == "success" and environment_error is None and green:
         if result_kind is None:
             environment_error = "the result file was not collected"
         elif result_kind == "valid" and not traces_ok:
             environment_error = "the traces were not all collected"
-    valid_snapshots = pre.is_file() and post.is_file() and snapshots_valid(pre, post, attempt_id)
     if behavior == "success" and environment_error is None and not valid_snapshots:
         environment_error = "the preflight or postflight snapshot does not satisfy the gate"
     outcome = classify(Observation(invocation, environment_error, cleanup_error, apks_changed, behavior, valid_snapshots,
-                                   green, result_kind, traces_ok))
+                                   green, result_kind, traces_ok, purity.state, True))
+    purity_ref = _ref(session, folder / "purity.json")
     if outcome.kind == "aborted":
+        # C9 keeps raw refs and the measurement-cost decision with the terminal diagnostic.
+        raw_refs = [purity_ref]
+        fatal88 = False
+        for observation in device._purity_observations:
+            if observation["role"] == "exit-query":
+                try:
+                    records = gate._purity_json_bytes(gate._purity_ref(observation["ref"], session.root).read_bytes())["payload"]["records"]
+                except (ValueError, KeyError, TypeError):
+                    continue  # Incomplete raw records remain in proof; they do not establish a throttle diagnosis.
+                for record in records if isinstance(records, list) else ():
+                    # One null or malformed record must not hide a later fatal(88) record of the same query.
+                    try:
+                        summary = gate.decode_purity_summary(bytes.fromhex(record["summaryHex"]))
+                        matched = record["reason"] == 1 and record["status"] == 88 and summary.runner_nonce == nonce
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    if matched:
+                        fatal88 = True
+                        raw_refs.append(observation["ref"])
+        if fatal88 or any((session.root / finish["stdout"]["path"]).read_bytes().find(b"D17_SUMMARY_THROTTLE") >= 0
+               or (session.root / finish["stderr"]["path"]).read_bytes().find(b"D17_SUMMARY_THROTTLE") >= 0 for start,finish in device._purity_pairs):
+            session.purity_decision = dict(d17="incomplete", nextAction="user-decision-required", rawRefs=raw_refs,
+                measurementImpact="R-5: synchronous summary Binder calls and admission locks change measurement load",
+                goldenRegenerationReason="fixture and parser provenance and normal callback load changed")
         return outcome
     if outcome.kind == "valid":
-        fields = {"result": _ref(session, output / RESULT_NAME),
-                  "behavior": _ref(session, output / BEHAVIOR_FOLDER / f"s5-behavior-{attempt_id}.json"),
-                  "preflight": _ref(session, pre), "postflight": _ref(session, post),
-                  "traces": [_ref(session, output / name) for name in traces]}
+        fields = {"result": _ref(session, output / RESULT_NAME), "behavior": _ref(session, output / BEHAVIOR_FOLDER / f"s5-behavior-{attempt_id}.json"),
+                  "preflight": _ref(session, pre), "postflight": _ref(session, post), "traces": [_ref(session, output / name) for name in traces]}
     elif outcome.kind == "behavior-failed":
-        fields = {"behavior": _ref(session, output / BEHAVIOR_FOLDER / f"s5-behavior-{attempt_id}.json"),
-                  "preflight": _ref(session, pre), "postflight": _ref(session, post)}
+        fields = {"behavior": _ref(session, output / BEHAVIOR_FOLDER / f"s5-behavior-{attempt_id}.json"), "preflight": _ref(session, pre), "postflight": _ref(session, post)}
     elif outcome.reason == "result-malformed":
         fields = {"reason": "result-malformed", "evidence": _ref(session, output / RESULT_NAME)}
     else:
-        evidence = folder / "environment.json"
-        write_json_new(evidence, {"schemaVersion": 1, "runId": attempt_id, "serialRecorded": False,
-                                  "error": environment_error or "environment failure"})
-        fields = {"reason": "environment-invalid", "evidence": _ref(session, evidence)}
-    session.append("attempt-end", attemptId=attempt_id, outcome=outcome.kind, **fields)
+        path = folder / "environment.json"
+        write_json_new(path, dict(schemaVersion=1, runId=attempt_id, serialRecorded=False, error=environment_error or "environment failure", invocation=invocation))
+        fields = dict(reason="environment-invalid", evidence=_ref(session, path))
+    session.append("attempt-end", attemptId=attempt_id, outcome=outcome.kind, purity=purity_ref, **fields)
     return outcome
+
+
+def collect_purity(session: Session, folder: Path, expected_attempt: dict[str, Any],
+                   expected_apks: dict[str, str], invocation: str) -> gate.PurityResult:
+    device = session.device
+    def capture(role, action):
+        try:
+            return _purity_capture(session, role, action)
+        except EvidenceIOError:
+            raise
+        except (RunnerError, dp.PreflightError, OSError, ValueError):
+            return None  # Raw command failure remains in the transcript and makes C8 incomplete.
+    if invocation != NOT_INVOKED:
+        user = device._purity_user
+        def probe(op):
+            return device.purity_probe(op, base_apk=device._purity_base_paths["target"], user_id=user,
+                                      attempt_id=expected_attempt["attemptId"], runner_nonce=expected_attempt["runnerNonce"])
+        capture("stop-clock", lambda: device.purity_clock("stop-clock"))
+        capture("force-stop", lambda: device.purity_force_stop(user))
+        capture("live-after-stop", lambda: device.purity_live("live-after-stop"))
+        capture("inventory-pre", lambda: probe("inventory"))
+        capture("pull", lambda: device.pull_purity_files(folder / "device"))
+        capture("inventory-post", lambda: probe("inventory"))
+        deadline = _monotonic() + 10
+        queries = 0
+        while True:
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                break
+            device._query_timeout = remaining
+            observation = capture("exit-query", lambda: probe("exits"))
+            queries += 1
+            if observation is None:
+                break
+            try:
+                payload = gate._purity_json_bytes((session.root / observation.stdout["path"]).read_bytes())["payload"]
+                registry = gate._purity_lines((folder / "device/registry.jsonl").read_bytes())
+                required = {(r["lifetimeId"], r["instanceId"]) for r in registry}
+                found = set()
+                for record in payload["records"]:
+                    if record["summaryHex"] is not None:
+                        summary = gate.decode_purity_summary(bytes.fromhex(record["summaryHex"]))
+                        if summary.runner_nonce == expected_attempt["runnerNonce"]:
+                            found.add((summary.lifetime_id, summary.instance_id))
+                if required and required <= found:
+                    break
+            except (ValueError, OSError, KeyError, TypeError):
+                break
+            _sleep(min(0.1, max(0, deadline - _monotonic())))
+        for role, action in (
+            ("after-stop-clock", lambda: device.purity_clock("after-stop-clock")),
+            ("boot-after", lambda: device.purity_boot_id("boot-after")),
+            ("install-identity-after", lambda: device.purity_identity("install-identity-after")),
+            ("live-final", lambda: device.purity_live("live-final")),
+        ):
+            capture(role, action)
+    files = []
+    directory = folder / "device"
+    if directory.is_dir():
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and not path.is_symlink():
+                files.append(dict(name=path.name, ref=_ref(session, path)))
+    proof = dict(schema=2, **expected_attempt, apks=expected_apks, observations=device._purity_observations,
+                 commands=_ref(session, folder / "commands.jsonl"), deviceFiles=dict(root=directory.relative_to(session.root).as_posix(), files=files),
+                 instances=[], result=dict(state="incomplete", actualCount=None, defects=[]))
+    # First pass obtains the independent raw population; second pass validates that population.
+    value = gate._read_purity_inputs(proof, session.root, expected_attempt, expected_apks, compare_result=False)
+    proof["instances"] = list(value.instances)
+    value = gate._read_purity_inputs(proof, session.root, expected_attempt, expected_apks, compare_result=False)
+    proof["result"] = dict(state=value.state, actualCount=value.actual_count, defects=list(value.defects))
+    write_json_new(folder / "purity.json", proof)
+    return gate.read_purity_proof(_ref(session, folder / "purity.json"), session.root, expected_attempt, expected_apks)
 
 
 # --------------------------------------------------------------------------------------------------------------------------
@@ -622,6 +977,8 @@ def prepare_artifacts(root: Path, commit: str, scratch: Path, run: artifacts.Run
             refs[key] = {"path": destination.relative_to(root).as_posix(), "sha256": identity["sha256"]}
         for key, reference in artifacts.collect(snapshot, out, gradle_homes=[gradle_home, real_home], run=run).items():
             refs[key] = {"path": f"artifacts/{reference['path']}", "sha256": reference["sha256"]}
+        artifacts.verify_d17_artifact_refs(snapshot, root, refs,
+            target_apk=staged[dp.TARGET_PACKAGE]["path"], test_apk=staged[dp.TEST_PACKAGE]["path"])
     finally:
         snapshot_context.cleanup()
     for key in sorted(refs):
@@ -643,10 +1000,12 @@ def _candidate_representable(writer: ledger.LedgerWriter, root: Path, status: st
 
 
 def run(root: Path, run_id: str, *, device: Optional[DeviceOps] = None, run_process: artifacts.Runner = artifacts._run,
-        source_state: Callable[[], dict[str, Any]] = dp.collect_source_state) -> int:
+        source_state: Callable[[], dict[str, Any]] = dp.collect_source_state, purity_enabled: bool = True) -> int:
     """One S5 run (s6c_plan.r2.md §2). Returns the exit code: before the session line 2 (PreSession, with a diagnostic in the
     evidence root if this run created it); after it, assemble's code (0 pass, 1 fail, behavior failure, exhausted or aborted)
     or 2 for a ledger, evidence or publication defect, after which nothing more is added to the ledger."""
+    if purity_enabled is not True:
+        raise PreSession("D17 purity cannot be disabled")
     if not gate.RUN_ID_RE.fullmatch(run_id) or len(run_id) > 40:
         raise PreSession("the run id must be a gate run id of at most 40 characters")
     if root.name != run_id:
@@ -693,6 +1052,7 @@ def run(root: Path, run_id: str, *, device: Optional[DeviceOps] = None, run_proc
         refs, staged = prepare_artifacts(root, source["commit"], scratch, run_process)
         writer = ledger.LedgerWriter.create(root, source_commit=source["commit"], artifacts=refs)
         session = Session(root, run_id, device, writer, staged, scratch)
+        session.purity_enabled = purity_enabled
         phase = "settings"
         settings_journaled = True  # prepare_settings writes the restore journal before it changes anything
         device.pin_settings()
@@ -798,6 +1158,8 @@ def run(root: Path, run_id: str, *, device: Optional[DeviceOps] = None, run_proc
             if aborted or failures or candidate is None:
                 diagnostic = {"schemaVersion": 1, "runId": run_id, "serialRecorded": False, "phase": phase,
                               "error": aborted or "cleanup failed", "cleanup": cleanup}
+                if session is not None and hasattr(session, "purity_decision"):
+                    diagnostic["purityDecision"] = session.purity_decision
                 path = root / "aborted.json"
                 write_json_new(path, diagnostic)
                 writer.append("end", status="aborted", evidence={"path": path.name, "sha256": dp.file_sha256(path)})

@@ -156,8 +156,47 @@ internal object S5FixtureEndpointsModule {
 
     @Provides
     @Singleton
-    fun provideS5FixtureServer(assets: S5FixtureAssets): S5FixtureServer =
-        S5FixtureServer(load = assets::bytes, report = { Log.e("S5Fixture", it) })
+    fun provideS5FixtureServer(
+        assets: S5FixtureAssets,
+        purity: S5PurityJournal,
+        attemptContext: AttemptContext,
+        fatal: Fatal
+    ): S5FixtureServer = S5FixtureServer(
+        load = assets::bytes, report = { Log.e("S5Fixture", it) },
+        purity = purity, attemptContext = attemptContext, fatal = fatal
+    )
+
+    private val processScope by lazy { PurityProcessScope(newPurityId()) }
+
+    @Provides
+    @Singleton
+    fun provideS5PurityRuntime(@ApplicationContext context: Context): S5PurityRuntime = object : S5PurityRuntime {
+        override val sdk = android.os.Build.VERSION.SDK_INT
+        private val root = java.io.File(checkNotNull(context.getExternalFilesDir(null)), "s5purity")
+        override val io: JournalIO = AndroidJournalIO(root)
+        override val process: PurityProcessScope = processScope
+        override val contextBytes: ByteArray? get() = readAttemptContextBytes(java.io.File(root, "attempt.json").toPath())
+        override fun createApi30(): PurityMode.Supported {
+            check(sdk >= 30)
+            val adapter = S5PurityPlatform.Api30Impl(context.getSystemService(android.app.ActivityManager::class.java))
+            return PurityMode.Supported(adapter) { adapter.identity(process) }
+        }
+        override fun diagnostic(line: String) { Log.e("S5Fixture", line) }
+    }
+
+    @Provides
+    @Singleton
+    fun provideS5PurityJournal(runtime: S5PurityRuntime, fatal: Fatal): S5PurityJournal =
+        S5PurityJournal(runtime.io, S5PurityPlatform.select(runtime.sdk, runtime::createApi30), fatal,
+            runtime.process, diagnostic = runtime::diagnostic)
+
+    @Provides
+    @Singleton
+    fun provideS5AttemptContext(runtime: S5PurityRuntime): AttemptContext = AttemptContext.read(runtime.contextBytes)
+
+    @Provides
+    @Singleton
+    fun provideS5Fatal(): Fatal = Fatal { code -> Runtime.getRuntime().halt(code); error("halt returned") }
 
     @Provides
     @Singleton

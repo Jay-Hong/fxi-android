@@ -162,12 +162,6 @@ jobs:
           python3 -m unittest discover -s tools/contracts -p 'test_*.py'
           python3 -m unittest discover -s tools/release -p 'test_*.py'
 
-      - name: Benchmark gate parser and evidence fixtures
-        run: |
-          python3 -m unittest discover -s tools/performance -p 'test_*.py'
-          python3 tools/performance/benchmark_gate.py check-fixtures \
-            tools/performance/fixtures/gate-cases.json
-
       # 세 변형을 한 호출에 두면 시험 컴파일 세 태스크가 수 초 간격으로 로그에 기록된다(동시 컴파일로 추정). 6g 로 올린 뒤에도 그 직후
       # 무출력으로 45분 job 제한 도달 시점에 취소된 기록이 두 번 더 있다(제한에 따른 취소로 추정)(37563185963·37569952754 각 attempt 1, OOM 기록은
       # 없음). 원인은 동시 컴파일의 메모리 압박으로 추정하며, 호출을 나눠 한 번에 한 변형만 컴파일한다.
@@ -177,6 +171,14 @@ jobs:
           ./gradlew testCiMinifiedUnitTest
           ./gradlew testBenchmarkUnitTest
           ./gradlew testS5BenchmarkUnitTest
+
+      # BridgeTest(test_s5_purity.py)는 testS5BenchmarkUnitTest가 만든 app/build/s5purity-bridge-r1의 실제 Kotlin 산출물을
+      # 읽는다. 산출물이 없으면 precondition으로 실패하므로 이 단계는 반드시 Unit tests 뒤에 둔다.
+      - name: Benchmark gate parser and evidence fixtures
+        run: |
+          python3 -m unittest discover -s tools/performance -p 'test_*.py'
+          python3 tools/performance/benchmark_gate.py check-fixtures \
+            tools/performance/fixtures/gate-cases.json
 
       - name: Lint
         run: ./gradlew lintDebug
@@ -248,6 +250,59 @@ jobs:
             --repo-root . \
             --ci-minified-source-report build/reports/s5/sourcesets.txt \
             --out build/reports/s5/ci-minified-source-files.txt
+          # Read the actual current compiler task classpath; never search cached jars.
+          S5_CLASSPATH_INIT="$(mktemp)"
+          trap 'rm -f "$S5_CLASSPATH_INIT"' EXIT
+          cat > "$S5_CLASSPATH_INIT" <<'GRADLE'
+          gradle.projectsEvaluated {
+              def app = gradle.rootProject.project(':app')
+              app.tasks.register('s6D17PrintCompileClasspath') {
+                  doLast {
+                      def entries = app.tasks.named('compileS5BenchmarkJavaWithJavac').get().classpath.files
+                      if (entries.empty) throw new GradleException('empty s5Benchmark compile classpath')
+                      def buildRoot = app.layout.buildDirectory.get().asFile.canonicalFile.toPath()
+                      // KSP may produce no classes. Allow only this exact output, never a missing jar.
+                      def optionalKsp = buildRoot.resolve('generated/ksp/s5Benchmark/classes')
+                      def paths = []
+                      def omitted = []
+                      entries.each { entry ->
+                          def path = entry.canonicalFile.toPath()
+                          if ([entry.path, path.toString()].any { it.contains('\n') || it.contains('\r') }) {
+                              throw new GradleException('malformed current compile classpath entry')
+                          }
+                          if (entry.isFile() || entry.isDirectory()) {
+                              paths.add(path.toString())
+                          } else if (!entry.exists() && !java.nio.file.Files.isSymbolicLink(entry.toPath()) &&
+                                     entry.toPath().toAbsolutePath().normalize() == optionalKsp && path == optionalKsp) {
+                              // Lexical AND canonical equality reject symlink escapes and build-prefix lookalikes.
+                              omitted.add('missing-optional-ksp-classes\t' + path.toString())
+                          } else {
+                              throw new GradleException('missing current compile classpath entry: ' + entry)
+                          }
+                      }
+                      if (paths.empty) throw new GradleException('empty effective s5Benchmark compile classpath')
+                      def out = new File(app.findProperty('s6D17ClasspathOut').toString())
+                      new File(out.parentFile, 'compile-classpath-omitted.txt').setText(
+                          omitted.empty ? '' : omitted.join('\n') + '\n', 'UTF-8')
+                      out.setText(paths.join('\n') + '\n', 'UTF-8')
+                  }
+              }
+          }
+          GRADLE
+          rm -f build/reports/s5/compile-classpath.txt
+          rm -f build/reports/s5/compile-classpath-omitted.txt
+          ./gradlew -q --no-configuration-cache --init-script "$S5_CLASSPATH_INIT" \
+            :app:s6D17PrintCompileClasspath \
+            -Ps6D17ClasspathOut="$PWD/build/reports/s5/compile-classpath.txt"
+          test -s build/reports/s5/compile-classpath.txt
+          test -f build/reports/s5/compile-classpath-omitted.txt
+          S5_CLASSPATH_ARGS=()
+          while IFS= read -r entry; do
+            test -n "$entry"
+            test -e "$entry"
+            S5_CLASSPATH_ARGS+=(--s5-compile-classpath-entry "$entry")
+          done < build/reports/s5/compile-classpath.txt
+          test "${#S5_CLASSPATH_ARGS[@]}" -gt 0
           BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d -print | sort -V | tail -1)"
           python3 tools/performance/verify_s5_benchmark_artifacts.py verify \
             --aapt2 "$BUILD_TOOLS/aapt2" \
@@ -263,7 +318,12 @@ jobs:
             --ci-minified-dependency-report build/reports/s5/ci-minified-mockwebserver.txt \
             --ci-minified-source-report build/reports/s5/sourcesets.txt \
             --ci-minified-source-files build/reports/s5/ci-minified-source-files.txt \
-            --benchmark-source macrobenchmark/src/main/kotlin/com/jay/fxi/macrobenchmark/TetherGraphBenchmark.kt
+            --benchmark-source macrobenchmark/src/main/kotlin/com/jay/fxi/macrobenchmark/TetherGraphBenchmark.kt \
+            --debug-apk app/build/outputs/apk/debug/app-debug.apk \
+            --benchmark-apk app/build/outputs/apk/benchmark/app-benchmark.apk \
+            --s5-source-report build/reports/s5/sourcesets.txt \
+            --s5-r8-configuration app/build/outputs/mapping/s5Benchmark/configuration.txt \
+            "${S5_CLASSPATH_ARGS[@]}"
 
       - name: Upload reports on failure
         if: failure()

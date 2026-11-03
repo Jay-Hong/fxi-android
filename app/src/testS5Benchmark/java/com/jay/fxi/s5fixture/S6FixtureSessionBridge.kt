@@ -50,7 +50,15 @@ import retrofit2.Retrofit
 /** Only endpoint/wire assembly changes. No session, grant, acceptance or receipt field is written. */
 @OptIn(ExperimentalCoroutinesApi::class)
 internal class S6FixtureSessionBridge(test: TestScope, val subId: String, tab: FreeTab, on: Boolean) : AutoCloseable {
-    val server = S5FixtureServer({ File("src/benchmark/assets/s5_4/$it").readBytes() }, {})
+    // S6-4b-2 integration: the D17 constructor needs journal/context/fatal. Recording sinks only (no guard wiring here);
+    // the bridge keeps its real loopback, W/R and capture/receipt checks unchanged.
+    val server = S5FixtureServer({ File("src/benchmark/assets/s5_4/$it").readBytes() }, {},
+        S5PurityJournal(
+            RecordingJournalIO(java.util.concurrent.CopyOnWriteArrayList()),
+            S5PurityPlatform.select(33) { PurityMode.Supported(RecordingSummary(java.util.concurrent.CopyOnWriteArrayList())) { D17Inputs.identity } },
+            Fatal { code -> throw SimulatedExit(code) },
+            PurityProcessScope(D17Inputs.LIFETIME)
+        ), D17Inputs.context, Fatal { code -> throw SimulatedExit(code) })
     private val endpoints = server.awaitEndpoints()
     private val client = OkHttpClient.Builder().callTimeout(5, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false).followRedirects(false).followSslRedirects(false).build()

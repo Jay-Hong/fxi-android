@@ -207,14 +207,14 @@ class S6Krx3cOffContractTest {
         fun fingerprint(map: Map<String, String>): String {
             val actualHashes = map.mapValues { (_, text) -> S6Krx3cShellSourceContract.sha(text.toByteArray(Charsets.UTF_8)) }
             val legacyHashes = S64bFixtureDelta.normalizeForLegacyFingerprint(actualHashes)
-            return S6Krx3cShellSourceContract.sha(map.keys.filter { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA) }.sorted()
+            return S6Krx3cShellSourceContract.sha(legacyHashes.keys.filter { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA) }.sorted()
                 .joinToString("") { "$it\u0000${legacyHashes.getValue(it)}\n" }.toByteArray(Charsets.UTF_8))
         }
         val raw = actual.keys.associateWith { File(it).readText(Charsets.UTF_8) }
         assertTrue("contract(O06/normal): exact10 production files exist", NORMAL.all { it in actual })
-        assertEquals("contract(O06/protected): exact349 unchanged production files", 349, raw.keys.count { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA) })
+        assertEquals("contract(O06/protected): exact349 unchanged production files", 349, S64bFixtureDelta.normalizeForLegacyFingerprint(raw.mapValues { (_, text) -> S6Krx3cShellSourceContract.sha(text.toByteArray(Charsets.UTF_8)) }).keys.count { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA) })
         assertEquals("contract(O06/raw): protected HEAD fingerprint", PROTECTED, fingerprint(raw))
-        val protected = raw.keys.first { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA) }
+        val protected = raw.keys.first { it !in (NORMAL + S6Krx3bOffWiringContractTest.S64A_DELTA + S64bFixtureDelta.ADDED) }
         assertNotEquals("contract(O06/μ32): same fingerprint rejects one protected-file bypass", PROTECTED, fingerprint(raw + (protected to raw.getValue(protected) + "\nval bypass = true\n")))
         assertNotEquals("contract(O06/new-file): allowed directory is not permission to add files", PROTECTED, fingerprint(raw + ("src/main/java/com/jay/fxi/service/Bypass.kt" to "val bypass = true")))
         S6Krx3bOffWiringContractTest().o08_sourceInventoriesRejectUnapprovedExpansion()

@@ -234,7 +234,9 @@ class RunnerHarness:
         test.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.root = self.base / "s5-run-1"
-        self.device = FakeDevice(plan)
+        # Deferred import avoids the purity -> RunnerHarness module cycle. Use real observe.
+        from test_s5_purity import D17FakeDevice
+        self.device = D17FakeDevice(plan)
         self.source = source or {"worktreeClean": True, "commit": "a" * 40}
         self.ledger_lines_at_pin = None
         self.device.on_pin = lambda: setattr(self, "ledger_lines_at_pin", self.lines())
@@ -458,7 +460,7 @@ class S5RunnerTest(unittest.TestCase):
     def test_more_attempt_boundaries(self):
         cases = {
             "an install that timed out but installed": ({"tab-entry": "ivvv", "period-switch": "vvv", "scroll": "vvv"}, 0),
-            "a timeout after a successful measure still collects its record": ({"tab-entry": "Tvvv", "period-switch": "vvv", "scroll": "vvv"}, 0),
+            "a timeout after a successful measure still collects its record": ({"tab-entry": "Tvvv", "period-switch": "vvv", "scroll": "vvv"}, 1),
             "snapshots the gate refuses after a successful measure": ({"tab-entry": "Fvvv", "period-switch": "vvv", "scroll": "vvv"}, 0),
             "a result file that was not collected": ({"tab-entry": "Rvvv", "period-switch": "vvv", "scroll": "vvv"}, 0),
             "a trace that was not collected": ({"tab-entry": "Qvvv", "period-switch": "vvv", "scroll": "vvv"}, 0),
@@ -982,6 +984,8 @@ class PrepareArtifactsTest(unittest.TestCase):
         (self.snapshot / "gradlew").write_text("#!/bin/sh\n")
         self.cleaned = []
         self.calls = []
+        self.d17_calls = []
+        self.d17_error = None
 
     def snapshot_context(self, commit):
         self.assertEqual("c" * 40, commit)
@@ -1012,8 +1016,15 @@ class PrepareArtifactsTest(unittest.TestCase):
             references[key] = {"path": path.name, "sha256": dp.file_sha256(path)}
         return references
 
+    def d17_boundary(self, root, evidence, refs, **kwargs):
+        self.d17_calls.append((root, evidence, refs, kwargs))
+        if self.d17_error is not None:
+            raise self.d17_error
+
     def prepare(self, build=None):
-        with unittest.mock.patch.object(dp, "materialize_commit_snapshot", self.snapshot_context), \
+        # This class tests snapshot/staging orchestration; real ref semantics are in test_s5_purity_pkg.
+        with unittest.mock.patch.object(runner.artifacts, "verify_d17_artifact_refs", self.d17_boundary), \
+                unittest.mock.patch.object(dp, "materialize_commit_snapshot", self.snapshot_context), \
                 unittest.mock.patch.object(runner.artifacts, "collect", self.fake_collect), \
                 unittest.mock.patch.dict("os.environ", {"GRADLE_USER_HOME": str(self.real_home)}):
             return runner.prepare_artifacts(self.root, "c" * 40, self.scratch, build or self.build)
@@ -1113,7 +1124,7 @@ class ReadBackTest(unittest.TestCase):
 
 class ClassifyTest(unittest.TestCase):
     def test_the_rules_in_order(self):
-        base = runner.Observation(runner.INVOKED, behavior="success", snapshots_valid=True, instrumentation_green=True,
+        base = runner.Observation(runner.INVOKED, purity="zero", behavior="success", snapshots_valid=True, instrumentation_green=True,
                                   result="valid", traces_ok=True)
         import dataclasses
         cases = [

@@ -330,6 +330,16 @@ class VerifyTest(unittest.TestCase):
             ("network", "ci.apk"): network(domains=((v.KB_IMAGE_DOMAIN, "true"),)),
         }
 
+        # Deferred import avoids the PackageFixture -> VerifyTest import cycle.
+        from test_s5_purity_pkg import PackageFixture, JOURNAL, MODULES, SERVER, JOURNAL_SOURCE, MODULES_SOURCE, SERVER_SOURCE
+        self.pkg = PackageFixture(root / "d17")
+        self.files["sourcesets.txt"].write_text(self.pkg.source_report, encoding="utf-8")
+        self.files["files.txt"].write_text(v.collect_source_files(self.pkg.source_report, self.repo), encoding="utf-8")
+        for relative, source in ((JOURNAL, JOURNAL_SOURCE), (MODULES, MODULES_SOURCE), (SERVER, SERVER_SOURCE)):
+            path = self.repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source)
+
     def tearDown(self):
         self.tmp.cleanup()
 
@@ -349,17 +359,30 @@ class VerifyTest(unittest.TestCase):
             raise AssertionError(f"unexpected tool call {arguments}")
         return self.outputs[(key, apk)]
 
-    def verify(self):
+    def arguments(self):
         f = self.files
-        args = v.build_parser().parse_args([
+        return [
             "verify", "--aapt2", "aapt2", "--apksigner", "apksigner", "--dexdump", "dexdump", "--repo-root", str(self.repo),
             "--s5-target-apk", str(f["target.apk"]), "--s5-test-apk", str(f["test.apk"]), "--ci-minified-apk", str(f["ci.apk"]),
             "--ci-minified-mapping", str(f["mapping.txt"]), "--firebase-fixture", str(f["fixture.json"]),
             "--s5-dependency-report", str(f["profileinstaller.txt"]), "--ci-minified-dependency-report", str(f["mockwebserver.txt"]),
             "--ci-minified-source-report", str(f["sourcesets.txt"]), "--ci-minified-source-files", str(f["files.txt"]),
             "--benchmark-source", str(f["Bench.kt"]),
-        ])
-        v.verify(args, run=self.run_tool, dex=lambda dexdump, apk: "  Class descriptor  : 'Lcom/jay/fxi/MainActivity;'\n")
+            "--debug-apk", str(self.pkg.production["debug"]),
+            "--benchmark-apk", str(self.pkg.production["benchmark"]),
+            "--s5-source-report", str(f["sourcesets.txt"]),
+            "--s5-compile-classpath-entry", str(self.pkg.classpath[0]),
+            "--s5-r8-configuration", str(self.pkg.configuration),
+        ]
+
+    def dex_tool(self, tool, apk):
+        # Synthetic dexdump text is a transport fixture, not an R8 execution claim.
+        from test_s5_purity_pkg import GOOD_DEX, CLEAN_DEX
+        return GOOD_DEX if Path(apk) == self.files["target.apk"] else CLEAN_DEX
+
+    def verify(self):
+        args = v.build_parser().parse_args(self.arguments())
+        v.verify(args, run=self.run_tool, dex=self.dex_tool)
 
     def test_the_passing_outputs_pass(self):
         self.verify()

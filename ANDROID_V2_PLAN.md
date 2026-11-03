@@ -2030,6 +2030,13 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   public AAB는 candidate와 **같은 source commit·version catalog/lock·production dependency graph·R8 rules 입력**에서
   산출하고 AAB SHA를 기록한다. 차이는 승인된 signing/variant 설정과 benchmark-only fixture overlay뿐임을
   build provenance와 public artifact source scan으로 증명하며, public AAB에 fixture action·payload·우회 branch가 있으면 fail한다.
+  (S6-4b-2에서 이관, 2026-11-03 사용자 결정) 위 입력 일치·provenance·source scan과 fixture action·payload(fixture 자산 포함)·우회
+  branch 검사를 그대로 유지하고, 실제 public AAB의 **모든 module 최종 dex**에서 S5 fixture 전체(`com.jay.fxi.s5fixture.`·
+  `okhttp3.mockwebserver.`)·D17 probe(`Lcom/jay/fxi/s5fixture/S5PurityProbe;`)·journal(`S5PurityJournal`) 유출 0을 직접 검사한다.
+  현 `tools/performance/verify_s5_benchmark_artifacts.py`의 `dex_dump()`는 APK 루트 `classes*.dex`만 읽으므로 AAB에 그대로 쓰지
+  않는다. AAB를 읽는 검사 경로를 S11에서 만들고, 그 검사 자체의 양성(정상 AAB 통과)·음성(유출 주입 AAB fail) 검증도 S11 책임이다.
+  이 검사가 미실행이거나 실패하면 public 배포 관문을 통과하지 않는다. S6-4b-2의 `ciMinified` 결과는 OFF 준비 단계의 완료
+  근거일 뿐 release와의 동등성 증명이 아니며 이 검사를 대신하지 않는다.
   `+2.0ms` 마진은 결과 관측 전 고정값으로, 수치·원인 기록만으로 통과를 대체하지 않는다. 기준 완화가 필요하면
   릴리스 현장에서 묵시적으로 처리하지 않고 이 계획의 명시적 개정으로 되돌린다.
 - legacy REST 호출·WS `rates` 소비 0을 proxy/network assertion과 source scan으로 증명한다.

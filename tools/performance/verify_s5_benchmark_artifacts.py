@@ -360,6 +360,120 @@ def check_test_manifest(badging: str, manifest: str) -> None:
 # --- orchestration --------------------------------------------------------------------------------------------------------
 
 
+def verify_d17_package(repo_root: Path, *, target_apk: Path, production_apks: dict[str, Path],
+                       source_report: str, compile_classpath: Sequence[Path], r8_configuration: Path,
+                       run=command, dex=None) -> None:
+    """Inspect the current target and debug/ciMinified/benchmark final APKs.
+
+    Release source isolation is checked; release final DEX remains a separate decision.
+    Only run/dex are replaceable external transports.
+    """
+    dex = dex or dex_dump
+    if set(production_apks) != {"debug", "ciMinified", "benchmark"}:
+        raise VerificationError("exactly three production final APKs are required")
+    for apk in (target_apk, *production_apks.values()):
+        if apk.is_symlink() or not apk.is_file():
+            raise VerificationError("current final APK missing")
+    tools = Path(os.environ.get("ANDROID_HOME", str(Path.home() / "Library/Android/sdk"))) / "build-tools"
+    available = sorted(tools.glob("*/aapt2"))
+    aapt = str(available[-1]) if available else "aapt2"
+    dex_tools = sorted(tools.glob("*/dexdump"))
+    dexdump = dex_tools[-1] if dex_tools else Path("dexdump")
+    manifest = run(aapt, "dump", "xmltree", "--file", "AndroidManifest.xml", str(target_apk))
+    for element in xml_elements(manifest):
+        if {"process", "sharedUserId", "isolatedProcess"}.intersection(element["attrs"]):
+            raise VerificationError("D17 requires a single, non-isolated process without shared UID")
+    text = dex(dexdump, target_apk)
+    descriptor = "Lcom/jay/fxi/s5fixture/S5PurityProbe;"
+    classes = re.split(r"(?=Class #\d+ header:)", text)
+    owners = [c for c in classes if re.search(r"Class descriptor\s*:\s*'" + re.escape(descriptor) + "'", c)]
+    if len(owners) != 1:
+        raise VerificationError("final target must define exact probe class")
+    methods = re.findall(r"name\s*:\s*'([^']+)'\s+type\s*:\s*'([^']+)'\s+access\s*:\s*0x([0-9a-fA-F]+)\s*\(([^)]*)\)", owners[0])
+    if not any(n == "main" and t == "([Ljava/lang/String;)V" and int(flags,16) & 9 == 9 for n,t,flags,_ in methods):
+        raise VerificationError("final target lacks public static probe main")
+    for apk in production_apks.values():
+        check_dex_classes(dex(dexdump, apk))
+    sets = source_sets(source_report)
+    for variant in ("main", "debug", "release", "ciMinified", "benchmark", "s5Benchmark"):
+        if variant not in sets:
+            raise VerificationError(f"source report missing {variant}")
+    def clean(source):
+        return re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
+    def sources(base):
+        if base.is_symlink():
+            raise VerificationError("source alias")
+        if not base.exists():
+            return []
+        paths = [base] if base.is_file() else list(base.rglob("*"))
+        result = []
+        for path in paths:
+            if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                raise VerificationError("source alias or special file")
+            if path.is_file() and path.suffix in (".java", ".kt"):
+                result.append(path)
+        return result
+    for variant in ("main", "debug", "release", "ciMinified", "benchmark"):
+        for kind in SOURCE_KINDS:
+            for name in sets[variant].get(kind, []):
+                base = repo_root / name
+                if not base.resolve().is_relative_to(repo_root.resolve()):
+                    raise VerificationError("source root escapes repo")
+                for path in sources(base):
+                    if _under_fixture(str(path), repo_root) or re.search(r"\b(?:S5Purity(?:Journal|Probe)|package\s+com\.jay\.fxi\.s5fixture)\b", clean(path.read_text())):
+                        raise VerificationError("production source includes D17 fixture")
+    fixture = repo_root / "app/src/s5Benchmark/java/com/jay/fxi/s5fixture"
+    try:
+        journal, modules, server = [clean((fixture / name).read_text()) for name in ("S5PurityJournal.kt", "S5FixtureModules.kt", "S5FixtureServer.kt")]
+    except OSError as error:
+        raise VerificationError("D17 source binding missing") from error
+    obligations = [
+        (journal, r"activityManager\s*!!\s*\.\s*setProcessStateSummary\(bytes\)"),
+        (modules, r"Runtime\.getRuntime\(\)\.halt\(code\)"),
+        (modules, r"S5PurityPlatform\.select\(runtime\.sdk,\s*runtime::createApi30\)"),
+        (modules, r"S5PurityPlatform\.Api30Impl\("),
+        (modules, r"PurityMode\.Supported\(adapter\)"),
+        (modules, r"S5PurityJournal\(runtime\.io,"),
+        (modules, r"AttemptContext\.read\(runtime\.contextBytes\)"),
+        (modules, r"purity\s*=\s*purity"), (modules, r"attemptContext\s*=\s*attemptContext"), (modules, r"fatal\s*=\s*fatal"),
+        (server, r"purity\.registerBeforeBind\(attemptContext\)"),
+    ]
+    if any(not re.search(pattern, source) for source, pattern in obligations) or len(re.findall(r"purity\.classifiedCallback\s*\{", server)) < 2:
+        raise VerificationError("runtime/journal/guard/sink/fatal DI path disconnected")
+    registration = server.index("purity.registerBeforeBind(attemptContext)")
+    bind = re.search(r"(?:server\.start|bind)\(", server)
+    if bind is None or registration > bind.start():
+        raise VerificationError("registration must precede bind")
+    writers = []
+    for path in sources(repo_root / "app/src"):
+        if any(part.startswith("test") for part in path.parts):
+            continue
+        writers.extend([path] * len(re.findall(r"\.setProcessStateSummary\s*\(", clean(path.read_text()))))
+    if writers != [fixture / "S5PurityJournal.kt"]:
+        raise VerificationError("summary writer is not unique")
+    if not compile_classpath:
+        raise VerificationError("current compile classpath required")
+    keep = False
+    for entry in compile_classpath:
+        if entry.is_symlink() or not entry.exists():
+            raise VerificationError("compile classpath entry missing")
+        if entry.is_dir():
+            keep |= (entry / "androidx/annotation/Keep.class").is_file()
+        else:
+            try:
+                with zipfile.ZipFile(entry) as archive:
+                    keep |= "androidx/annotation/Keep.class" in archive.namelist()
+            except zipfile.BadZipFile as error:
+                raise VerificationError("invalid compile classpath archive") from error
+    if not keep:
+        raise VerificationError("Keep.class absent from current classpath")
+    if r8_configuration.is_symlink() or not r8_configuration.is_file():
+        raise VerificationError("merged R8 configuration missing")
+    rules = clean(r8_configuration.read_text())
+    if not re.search(r"-keep\b[^\n]*@androidx\.annotation\.Keep\s+class\s+\*", rules) or not re.search(r"-keepclass(?:members|eswithmembers)\b[^{}]*\{[^}]*@androidx\.annotation\.Keep\s+<methods>", rules, re.S):
+        raise VerificationError("merged R8 rules lack effective Keep class/method retention")
+
+
 def dex_dump(dexdump: Path, apk_path: Path) -> str:
     out = []
     with zipfile.ZipFile(apk_path) as apk, tempfile.TemporaryDirectory() as tmp:
@@ -389,8 +503,10 @@ def verify(args: argparse.Namespace, run=command, dex=None) -> None:
     repo = Path(args.repo_root)
     for path in (args.s5_target_apk, args.s5_test_apk, args.ci_minified_apk, args.ci_minified_mapping, args.firebase_fixture,
                  args.s5_dependency_report, args.ci_minified_dependency_report, args.ci_minified_source_report,
-                 args.ci_minified_source_files, args.benchmark_source):
-        if not Path(path).is_file():
+                 args.ci_minified_source_files, args.benchmark_source, args.debug_apk, args.benchmark_apk,
+                 args.s5_source_report, args.s5_r8_configuration, *args.s5_compile_classpath_entry):
+        if (not str(path) or Path(path).is_symlink()
+                or not (Path(path).is_file() or path in args.s5_compile_classpath_entry and Path(path).is_dir())):
             raise VerificationError(f"input missing: {path}")
 
     target = Path(args.s5_target_apk)
@@ -422,6 +538,12 @@ def verify(args: argparse.Namespace, run=command, dex=None) -> None:
                         Path(args.ci_minified_source_files).read_text(encoding="utf-8"), repo)
     check_mapping(Path(args.ci_minified_mapping).read_text(encoding="utf-8"))
     check_dex_classes(dex(dexdump, public))
+    verify_d17_package(repo, target_apk=target,
+        production_apks={"debug": Path(args.debug_apk), "ciMinified": public, "benchmark": Path(args.benchmark_apk)},
+        source_report=Path(args.s5_source_report).read_text(encoding="utf-8"),
+        compile_classpath=[Path(p) for p in args.s5_compile_classpath_entry],
+        r8_configuration=Path(args.s5_r8_configuration),
+        run=lambda *argv: run(str(aapt2), *argv[1:]), dex=lambda _tool, apk: dex(dexdump, apk))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -434,8 +556,10 @@ def build_parser() -> argparse.ArgumentParser:
     check = commands.add_parser("verify", help="verify the packaged S5 and ciMinified artifacts")
     for name in ("--aapt2", "--apksigner", "--dexdump", "--repo-root", "--s5-target-apk", "--s5-test-apk", "--ci-minified-apk",
                  "--ci-minified-mapping", "--firebase-fixture", "--s5-dependency-report", "--ci-minified-dependency-report",
-                 "--ci-minified-source-report", "--ci-minified-source-files", "--benchmark-source"):
+                 "--ci-minified-source-report", "--ci-minified-source-files", "--benchmark-source",
+                 "--debug-apk", "--benchmark-apk", "--s5-source-report", "--s5-r8-configuration"):
         check.add_argument(name, required=True)
+    check.add_argument("--s5-compile-classpath-entry", action="append", required=True)
     return parser
 
 
@@ -448,7 +572,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"ciMinified source file list written ({listing.count(chr(10) + 'file' + chr(9))} files)")
             return 0
         verify(args)
-    except (VerificationError, OSError, KeyError, json.JSONDecodeError, zipfile.BadZipFile) as error:
+    except (VerificationError, OSError, UnicodeError, KeyError, json.JSONDecodeError, zipfile.BadZipFile) as error:
         print(f"S5 benchmark artifact verification failed: {error}", file=sys.stderr)
         return 2
     print("S5 benchmark artifact verification passed (ciMinified is public-like evidence; the public AAB is S11)")

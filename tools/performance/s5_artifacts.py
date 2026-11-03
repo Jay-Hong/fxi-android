@@ -117,6 +117,41 @@ def fixture_payload(root: Path) -> bytes:
     return _manifest(lines)
 
 
+def verify_d17_artifact_refs(root: Path, evidence_root: Path, references: dict[str, dict[str, str]], *,
+                            target_apk: Path, test_apk: Path) -> None:
+    """Verify seven refs against this built candidate, reading every referenced byte."""
+    try:
+        if set(references) != gate.ARTIFACT_KEYS:
+            raise ArtifactError("exactly seven artifact refs required")
+        paths = {k: gate._purity_ref(v, evidence_root) for k,v in references.items()}
+        if len({(p.stat().st_dev, p.stat().st_ino) for p in paths.values()}) != 7:
+            raise ArtifactError("artifact refs alias")
+        for key, candidate in (("targetBenchmarkApk", target_apk), ("macrobenchmarkTestApk", test_apk)):
+            if paths[key].read_bytes() != _regular_bytes(candidate, key):
+                raise ArtifactError("APK ref differs from current candidate")
+        if paths["fixturePayload"].read_bytes() != fixture_payload(root):
+            raise ArtifactError("fixture payload differs from current candidate")
+        parser = _regular_bytes(root / PARSER_PATH, PARSER_PATH)
+        if paths["parser"].read_bytes() != parser or parser != Path(gate.__file__).read_bytes():
+            raise ArtifactError("parser is not the current judge")
+        # Recover only actual Gradle transform homes named in this build's configuration.
+        configuration = _regular_bytes(root / CONFIGURATION_PATH, CONFIGURATION_PATH).decode("utf-8")
+        homes = {Path(os.environ.get("GRADLE_USER_HOME", Path.home() / ".gradle"))}
+        for line in configuration.splitlines():
+            if line.startswith(SECTION_START):
+                name = line[len(SECTION_START):]
+                if "/caches/" in name:
+                    homes.add(Path(name.split("/caches/", 1)[0]))
+        if paths["r8RulesCanonicalManifest"].read_bytes() != r8_rules(configuration, root, list(homes)):
+            raise ArtifactError("R8 manifest differs from current build inputs")
+        for key, (project, name) in GRAPHS.items():
+            text = paths[key].read_bytes().decode("utf-8")
+            if normalize_graph(text, root, project, name) != text.encode("utf-8"):
+                raise ArtifactError("dependency graph is not canonical")
+    except (gate.InvalidEvidence, OSError, UnicodeError) as error:
+        raise ArtifactError(str(error)) from error
+
+
 def _relative(path: Path, base: Path) -> str | None:
     try:
         return path.resolve().relative_to(base.resolve()).as_posix()
@@ -317,6 +352,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         references = collect(args.build_root, args.out, gradle_homes=args.gradle_home)
+        target = args.build_root / "app/build/outputs/apk/s5Benchmark/app-s5Benchmark.apk"
+        test = args.build_root / "macrobenchmark/build/outputs/apk/s5Benchmark/macrobenchmark-s5Benchmark.apk"
+        for key, candidate in (("targetBenchmarkApk", target), ("macrobenchmarkTestApk", test)):
+            data = _regular_bytes(candidate, key)
+            destination = args.out / candidate.name
+            _publish(destination, data)
+            references[key] = {"path": destination.name, "sha256": _sha256(data)}
+        verify_d17_artifact_refs(args.build_root, args.out, references, target_apk=target, test_apk=test)
     except (ArtifactError, OSError) as error:
         print(json.dumps({"error": str(error)}, ensure_ascii=False))
         return 2

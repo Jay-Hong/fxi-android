@@ -153,10 +153,10 @@ class S6KrxOffWiringContractTest {
         assertTrue("contract(O06): actual injected supplier is PAC read-only snapshot", Regex("""krxMemorySnapshot\s*=\s*\{\s*coordinator\.accessSnapshot\s*\}""").containsMatchIn(rt))
         // Lock raw source bytes outside the approved production set, including PAC/SUA/DI/disk.
         assertEquals("contract(O06): historical23 union delta3 is25", 25, (allowed + S6Krx3bOffWiringContractTest.S64A_DELTA).size)
-        assertEquals("contract(O06): protected count337", 337, code.keys.count { it !in (allowed + S6Krx3bOffWiringContractTest.S64A_DELTA) })
         val actualHashes = code.keys.associateWith { path -> sha(File(path).readBytes()) }
         val legacyHashes = S64bFixtureDelta.normalizeForLegacyFingerprint(actualHashes)
-        val inventory = code.keys.filter { it !in (allowed + S6Krx3bOffWiringContractTest.S64A_DELTA) }.sorted().joinToString("") { path -> "$path\u0000${legacyHashes.getValue(path)}\n" }
+        assertEquals("contract(O06): protected count337", 337, legacyHashes.keys.count { it !in (allowed + S6Krx3bOffWiringContractTest.S64A_DELTA) })
+        val inventory = legacyHashes.keys.filter { it !in (allowed + S6Krx3bOffWiringContractTest.S64A_DELTA) }.sorted().joinToString("") { path -> "$path\u0000${legacyHashes.getValue(path)}\n" }
         assertEquals("contract(O06): all other production Kotlin bytes remain HEAD", "4fe118143da2f2d1a8fcfb6561c55c18751f8ff447827d9ebceff7a2e77082a4", sha(inventory.toByteArray(Charsets.UTF_8)))
         val pac = code.getValue("${base}data/entitlements/PremiumAccessCoordinator.kt")
         assertTrue("contract(O06): PAC default OFF", Regex("""krxContest\s*:\s*KrxContestSwitch\s*=\s*KrxContestSwitch\.OFF""").containsMatchIn(pac))

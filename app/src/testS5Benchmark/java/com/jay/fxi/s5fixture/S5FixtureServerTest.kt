@@ -47,7 +47,16 @@ class S5FixtureServerTest {
         load: (String) -> ByteArray = { loads.computeIfAbsent(it) { AtomicInteger() }.incrementAndGet(); asset(it) },
         startTimeoutMillis: Long = 10_000L,
         onBound: (Int) -> Unit = {}
-    ) = S5FixtureServer(load, { reports.put(it) }, startTimeoutMillis, onBound).also { servers += it }
+    ) = S5FixtureServer(load, { reports.put(it) }, testJournal(), D17Inputs.context, Fatal { code -> throw SimulatedExit(code) },
+        startTimeoutMillis, onBound).also { servers += it }
+
+    /** S6-4b D17: every server is built with recording journal/summary sinks (s6_4b_contracts.r4.md §4.2). */
+    private fun testJournal() = S5PurityJournal(
+        RecordingJournalIO(java.util.concurrent.CopyOnWriteArrayList()),
+        S5PurityPlatform.select(33) { PurityMode.Supported(RecordingSummary(java.util.concurrent.CopyOnWriteArrayList())) { D17Inputs.identity } },
+        Fatal { code -> throw SimulatedExit(code) },
+        PurityProcessScope(D17Inputs.LIFETIME)
+    )
 
     @After fun tearDown() {
         servers.forEach { it.close() }
