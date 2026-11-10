@@ -153,7 +153,9 @@ class S6KrxOffWiringContractTest {
         assertTrue("contract(O06): actual injected supplier is PAC read-only snapshot", Regex("""krxMemorySnapshot\s*=\s*\{\s*coordinator\.accessSnapshot\s*\}""").containsMatchIn(rt))
         // Lock raw source bytes outside the approved production set, including PAC/SUA/DI/disk.
         assertEquals("contract(O06): historical23 union delta3 is25", 25, (allowed + S6Krx3bOffWiringContractTest.S64A_DELTA).size)
-        val actualHashes = code.keys.associateWith { path -> sha(File(path).readBytes()) }
+        // Post-S6 (user decision s6freeze A): exactly approved bytes go back to the history; the scans read actual sources.
+        PostS6ApprovedDelta.requireExact(PostS6ApprovedDelta.actualSources())
+        val actualHashes = PostS6ApprovedDelta.project(code.keys.associateWith { path -> sha(File(path).readBytes()) })
         val legacyHashes = S64bFixtureDelta.normalizeForLegacyFingerprint(actualHashes)
         assertEquals("contract(O06): protected count337", 337, legacyHashes.keys.count { it !in (allowed + S6Krx3bOffWiringContractTest.S64A_DELTA) })
         val inventory = legacyHashes.keys.filter { it !in (allowed + S6Krx3bOffWiringContractTest.S64A_DELTA) }.sorted().joinToString("") { path -> "$path\u0000${legacyHashes.getValue(path)}\n" }

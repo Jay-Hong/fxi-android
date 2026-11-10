@@ -175,7 +175,9 @@ class S6Krx3bOffWiringContractTest {
         assertTrue("premise: O08 scans every production root", ROOTS.all { File(it).isDirectory } && sources.size > 300)
         assertTrue("contract(O08): exactly the 23 approved historical union paths exist", ALLOWED.all { it in sources })
         val raw = sources.keys.filter { it !in (ALLOWED + S64A_DELTA) }.sorted()
-        val actualHashes = raw.associateWith { path -> sha(File(path).readBytes()) }
+        // Post-S6 (user decision s6freeze A): exactly approved bytes go back to the history; the scans below read actual sources.
+        PostS6ApprovedDelta.requireExact(PostS6ApprovedDelta.actualSources())
+        val actualHashes = PostS6ApprovedDelta.project(raw.associateWith { path -> sha(File(path).readBytes()) })
         val legacyHashes = S64bFixtureDelta.normalizeForLegacyFingerprint(actualHashes)
         assertEquals("contract(O08): protected HEAD file count", 337, legacyHashes.size)
         val bytes = legacyHashes.keys.sorted().joinToString("") { "$it\u0000${legacyHashes.getValue(it)}\n" }

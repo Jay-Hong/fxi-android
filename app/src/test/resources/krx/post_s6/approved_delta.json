@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "note": "S6 밖 트랙의 정확히 승인된 운영 소스 변경. 사용자 결정 R4c/S7/user_decision_s6freeze_A.r1.md(A안). 기존 S6 inventory·BASELINE·S64b delta는 그대로이고, 통과의 뜻은 '원 역사 기준 + 이 목록의 정확한 바이트'다.",
+  "base": {
+    "product_commit": "cf8fb85521285fdc8c9304f4c118a84670a9a76f",
+    "source_inventory_sha256": "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f",
+    "s64b_delta_sha256": "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
+  },
+  "units": [
+    {
+      "id": "S7-a",
+      "source_parent": "cf8fb85521285fdc8c9304f4c118a84670a9a76f",
+      "approval_record_sha256": "62d32fb32675e8491e489186c084851e6692ec6d7f507b6bbfa385f0b5d0fa4f",
+      "changed": {
+        "src/main/java/com/jay/fxi/data/remote/AuthenticatedApiService.kt": {
+          "from": "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
+          "to": "26aab0a503e6514df01d2006d2f27a2a5c32a4db70a7f80f72b5eb208ce2c242"
+        },
+        "src/main/java/com/jay/fxi/data/repository/AlertRepository.kt": {
+          "from": "e46622991266bab843b30502d41789dbcff6807f6c449873037689e661c3a78f",
+          "to": "4ac58a30a16701bdcd86f3232e24c1c652596d511346144ee5bfeeeef51d9026"
+        }
+      },
+      "added": {
+        "src/main/java/com/jay/fxi/data/repository/BankHistoryAccess.kt": "652aa16aec4b2d8610ee60b54da8e2e626126c46478dacc5d708b6103e0e706f"
+      }
+    }
+  ]
+}

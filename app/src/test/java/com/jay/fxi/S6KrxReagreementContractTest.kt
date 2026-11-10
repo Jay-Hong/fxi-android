@@ -168,9 +168,23 @@ class S6KrxReagreementContractTest {
                     assertEquals("contract(D20): bootstrap-callers/TBO K once",1,count("""\bKRX_FUTURES\b""",tbo))
                 }
                 "new-file-bypass" -> {
-                    val altered = code + (base+"data/remote/Bypass.kt" to "fun x() { factory.installKrxDesiredProducer(other) }")
-                    assertNotEquals("contract(D20): new-file-bypass/receiver scan detects",calls(code),calls(altered))
-                    assertNotEquals("contract(D20): new-file-bypass/path scan detects",expected.keys,actual.keys+"src/main/java/com/jay/fxi/data/remote/Bypass.kt")
+                    val postS6 = PostS6ApprovedDelta.ledger()
+                    val expectedPaths = expected.keys + S64bFixtureDelta.ADDED + postS6.added
+                    assertActual("source", inventory, delta, actual)
+                    assertEquals("precondition(D20/new-file-bypass): exact combined path set", expectedPaths, actual.keys)
+                    val normalCalls = calls(code)
+                    assertEquals("precondition(D20/new-file-bypass): actual receiver sites",
+                        mapOf("$rtPath::session" to 1, "$rtPath::<implicit>" to 1), normalCalls)
+                    val bypassPath = base + "data/remote/Bypass.kt"
+                    assertFalse("precondition(D20/new-file-bypass): new path is absent", bypassPath in actual)
+                    val altered = code + (bypassPath to "fun x() { factory.installKrxDesiredProducer(other) }")
+                    assertNotEquals("contract(D20): new-file-bypass/receiver scan detects", normalCalls, calls(altered))
+                    assertNotEquals("contract(D20): new-file-bypass/path scan detects", expectedPaths, altered.keys)
+                    for (path in postS6.added) {
+                        val injected = code + (path to code.getValue(path) + "\nfun x() { factory.installKrxDesiredProducer(other) }\n")
+                        assertNotEquals("contract(D20): approved added path stays in actual caller scan/$path",
+                            normalCalls, calls(injected))
+                    }
                 }
                 "allowed-file-bypass" -> assertNotEquals("contract(D20): allowed-file-bypass/receiver scan detects",calls(code),calls(code + (rtPath to rt+"\nfun bad() { session.installKrxDesiredProducer(other) }")))
                 "provider-OFF" -> assertTrue("contract(D20): provider-OFF/singleton",Regex("""fun\s+provideKrxContestSwitch\(\)\s*:\s*KrxContestSwitch\s*=\s*KrxContestSwitch\.OFF""").containsMatchIn(code.getValue(base+"di/EntitlementsModule.kt")))
@@ -185,11 +199,18 @@ class S6KrxReagreementContractTest {
         }
     }
     /** The same actual-input validator serves the preserved positives and the independent negatives. */
-    private fun assertActual(sub: String, inventory: JsonObject, delta: S64bFixtureDelta.Delta, actual: Map<String, ByteArray>) {
+    /** Internal so the post-S6 contract can call one branch alone (s6delta_review.codex.r1.md R1). */
+    internal fun assertActual(sub: String, inventory: JsonObject, delta: S64bFixtureDelta.Delta, actual: Map<String, ByteArray>) {
         val expected = inventory.getValue("source_files").jsonObject
+        // Post-S6 (user decision s6freeze A): history checks read exactly approved bytes back as history; others stay as they are.
+        val postS6 = PostS6ApprovedDelta.ledger()
+        assertEquals("contract(D20): approved post-S6 changes are exactly present", emptyList<String>(),
+            PostS6ApprovedDelta.actualErrors(postS6, actual))
+        val projected = PostS6ApprovedDelta.project(actual.mapValues { sha(it.value) }, postS6)
         when (sub) {
             "source" -> {
-                assertEquals("contract(D20): source/exact frozen paths plus the 4b added journal",expected.keys + S64bFixtureDelta.ADDED,actual.keys)
+                assertEquals("contract(D20): source/exact frozen paths plus the 4b added journal and approved post-S6 additions",
+                    expected.keys + S64bFixtureDelta.ADDED + postS6.added,actual.keys)
                 for (path in actual.keys) {
                     val file = File(path)
                     assertTrue("contract(D20): source/no source aliases or special files/$path",
@@ -203,13 +224,13 @@ class S6KrxReagreementContractTest {
                 assertEquals("contract(D20): $sub/exact added protection", setOf("src/s5Benchmark/java/com/jay/fxi/s5fixture/S5PurityJournal.kt"), S64bFixtureDelta.ADDED)
                 for ((path,hash) in inventory.getValue(sub).jsonObject.getValue("protected").jsonObject) {
                     val want = if (path in S64bFixtureDelta.CHANGED) delta.changedTo(path) else hash.jsonPrimitive.content
-                    assertEquals("contract(D20): $sub/$path/raw HEAD bytes or the agreed 4b delta",want,actual[path]?.let(::sha))
+                    assertEquals("contract(D20): $sub/$path/raw HEAD bytes or the agreed 4b delta",want,projected[path])
                 }
                 for (path in S64bFixtureDelta.ADDED)
                     assertEquals("contract(D20): $sub/$path/the added journal is protected at its agreed bytes",delta.added(path),actual[path]?.let(::sha))
             }
             "product-base" -> {
-                for ((path,hash) in delta.productBase()) assertEquals("contract(D20): product-base/$path/bytes equal the 4b base",hash,actual[path]?.let(::sha))
+                for ((path,hash) in delta.productBase()) assertEquals("contract(D20): product-base/$path/bytes equal the 4b base",hash,projected[path])
                 assertEquals("contract(D20): product-base/covers every frozen path outside the delta",expected.keys - S64bFixtureDelta.CHANGED,delta.productBase().keys)
             }
             else -> error("unregistered actual validator $sub")
@@ -341,7 +362,7 @@ internal object S64bFixtureDelta {
         listOf("raw-json ${invalid.message}")
     }
 
-    private class RawKeys(private val raw: String) {
+    internal class RawKeys(private val raw: String) {
         private var at = 0
         private val duplicates = mutableListOf<String>()
         private fun space() { while (at < raw.length && raw[at] in " \t\r\n") at++ }

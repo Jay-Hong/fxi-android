@@ -376,13 +376,18 @@ class AuthenticatedApiClient internal constructor(
             .preserve(AuthenticatedEndpoint.GRAPH_V2_TAB)
             .decodeSuccess(wireJson)
 
-    /** GET /api/notification-logs (delivered bank alerts). */
+    /**
+     * GET /api/notification-logs (delivered bank alerts).
+     * [useAdmitted], when given, passes unchanged to the transport. It may run on transport threads and must be
+     * thread-safe, non-blocking and side-effect free, subject to the existing production live-identity-read contract.
+     */
     suspend fun getNotificationLogs(
         owner: AuthSnapshot,
         currency: String?,
-        limit: Int
+        limit: Int,
+        useAdmitted: (() -> Boolean)? = null
     ): AuthenticatedHttpResponse<AlertHistoryResponse> =
-        transport.executeRead(owner) { service.getNotificationLogs(it, currency, limit) }
+        transport.executeRead(owner, useAdmitted) { service.getNotificationLogs(it, currency, limit) }
             .preserve(AuthenticatedEndpoint.NOTIFICATION_LOGS)
             .decodeSuccess(wireJson)
 

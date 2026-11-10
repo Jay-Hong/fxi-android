@@ -9,6 +9,7 @@ import com.jay.fxi.data.remote.AuthenticatedBodyDecodingException
 import com.jay.fxi.data.remote.AuthenticatedFailureKind
 import com.jay.fxi.data.remote.AuthenticatedHttpFailure
 import com.jay.fxi.data.remote.AuthenticatedHttpResponse
+import com.jay.fxi.data.remote.TopicUseWithheldException
 import com.jay.fxi.data.remote.dto.AlertHistoryItem
 import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
@@ -124,15 +125,24 @@ class AlertRepository @Inject constructor(
             .logs
     }
 
-    /** Delivered bank alerts, newest first; [currency] null is every currency, [limit] 1..200 (server caps). */
+    /**
+     * Delivered bank alerts, newest first; [currency] null is every currency, [limit] 1..200 (server caps).
+     * With [useAdmitted]: checked before the credential capture (no token is fetched for a refused use), again after it, and on
+     * every send by the transport. A refusal throws [TopicUseWithheldException], a cancellation, never a failure result.
+     */
     suspend fun getHistory(
         owner: AuthIdentityFence,
         currency: String? = null,
-        limit: Int = 100
-    ): AuthBoundResult<List<AlertHistoryItem>> = safeApiCall(owner) { snapshot ->
-        apiService.getNotificationLogs(snapshot, currency, limit)
-            .requireBody("GET /api/notification-logs")
-            .logs
+        limit: Int = 100,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<List<AlertHistoryItem>> {
+        if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+        return safeApiCall(owner) { snapshot ->
+            if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+            apiService.getNotificationLogs(snapshot, currency, limit, useAdmitted)
+                .requireBody("GET /api/notification-logs")
+                .logs
+        }
     }
 
     suspend fun createSetting(
