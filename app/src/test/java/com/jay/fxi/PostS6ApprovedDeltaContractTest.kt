@@ -24,6 +24,7 @@ class PostS6ApprovedDeltaContractTest {
     private val api = base + "data/remote/AuthenticatedApiService.kt"
     private val repo = base + "data/repository/AlertRepository.kt"
     private val access = base + "data/repository/BankHistoryAccess.kt"
+    private val s7b = listOf("BankHistoryRow.kt", "BankHistorySheet.kt", "BankHistoryStateHolder.kt").map { base + "ui/alert/$it" }.toSet()
     private val inventory = S64bFixtureDelta.inventoryBytes()
     private val s64b = S64bResourceBytes.delta()
     private val raw = PostS6ApprovedDelta.raw()
@@ -51,17 +52,17 @@ class PostS6ApprovedDeltaContractTest {
     @Test fun P01_theApprovedLedgerValidates_andMatchesTheActualSourcesExactly() {
         assertEquals("the pin is the manifest's bytes", PostS6ApprovedDelta.APPROVED_SHA256, PostS6ApprovedDelta.sha(raw))
         val ledger = PostS6ApprovedDelta.ledger()
-        assertEquals("exactly the approved S7-a paths", setOf(api, repo, access), ledger.final.keys)
+        assertEquals("exactly the approved S7-a and S7-b paths", setOf(api, repo, access) + s7b, ledger.final.keys)
         assertEquals(setOf(api, repo), ledger.changed)
-        assertEquals(setOf(access), ledger.added)
-        assertEquals("history hashes", mapOf(api to productBase.getValue(api), repo to productBase.getValue(repo), access to null), ledger.original)
+        assertEquals(setOf(access) + s7b, ledger.added)
+        assertEquals("history hashes", mapOf(api to productBase.getValue(api), repo to productBase.getValue(repo), access to null) + s7b.associateWith { null }, ledger.original)
         assertEquals(emptyList<String>(), PostS6ApprovedDelta.actualErrors(ledger, PostS6ApprovedDelta.actualSources()))
         val actual = PostS6ApprovedDelta.actualSources().mapValues { PostS6ApprovedDelta.sha(it.value) }
         val projected = PostS6ApprovedDelta.project(actual, ledger)
         assertEquals("changed paths go back to their history", productBase.getValue(api), projected[api])
         assertEquals(productBase.getValue(repo), projected[repo])
-        assertFalse("the approved addition is dropped from the history view", access in projected)
-        assertEquals("nothing else moves", actual - setOf(api, repo, access), projected - setOf(api, repo))
+        assertFalse("the approved additions are dropped from the history view", (setOf(access) + s7b).any { it in projected })
+        assertEquals("nothing else moves", actual - (setOf(api, repo, access) + s7b), projected - setOf(api, repo))
     }
 
     @Test fun N01_theApprovalPinBindsTheManifestBytes() {
