@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "69d4ea253c84f735eb55e82b44eaf5b45bf32e792f5c04334343c874838f812a"
+    const val APPROVED_SHA256 = "ba93ab03068ba52855d2e9b2b61943a6642e05b787ff00a0893d59a1b0735e24"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -42,6 +42,9 @@ internal object PostS6ApprovedDelta {
      * - 159fd2a9…: 05382fa9 SettingsViewModel.kt, no KRX at all (comments included).
      * - a3021bca…: 05382fa9 PremiumTopicConsumer.kt, no KRX at all (comments included).
      * - 14c2521d…: 05382fa9 PremiumTopicScreen.kt, no KRX at all (comments included).
+     * - cdf05372…: 05405265 FXiApplication.kt, no KRX at all (comments included).
+     * - 4ac58a30…: 05405265 AlertRepository.kt, KRX only in the comment at :49 (source alerts kdoc).
+     * - 26aab0a5…: 05405265 AuthenticatedApiService.kt, KRX only in the comment at :348 (graph catalog kdoc).
      */
     val NO_KRX_REVIEWED = setOf(
         "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
@@ -49,14 +52,19 @@ internal object PostS6ApprovedDelta {
         "a3ac34d86bde39f742760e433bff8782dde92c83969beb64944b417dc5462bd5",
         "159fd2a92bba4a489e45f5ab4e43c8274a47df91e56c9005fc2884c2a4f2aa1d",
         "a3021bcad83f86aff42c9285b6adb47f98bc78be95e8a590c470f934857bc43a",
-        "14c2521d76160a5f8be640966383ad47f843cf3ef035224e5a28262473058468"
+        "14c2521d76160a5f8be640966383ad47f843cf3ef035224e5a28262473058468",
+        "cdf05372e6f59532fb9c3894e70e7d20a7756dfa9e8dab5281062fc4ebbffc7a",
+        "4ac58a30a16701bdcd86f3232e24c1c652596d511346144ee5bfeeeef51d9026",
+        "26aab0a503e6514df01d2006d2f27a2a5c32a4db70a7f80f72b5eb208ce2c242"
     )
 
     /**
-     * S7-c F1 (`R4c/S7/user_decision_s7c_F1.r1.md` cc93e4f7…): a forbidden core change this ledger may carry, in its one unit
-     * only — that unit's id, source parent and approval record — and only from and to these exact bytes. In place of the
-     * KRX-free rule its comment-free KRX lines are pinned by [krxLinesSha256] ([krxLinesSha256] of the text). The forbidden scope
-     * itself is unchanged.
+     * A forbidden core change this ledger may carry, in its one unit only — that unit's id, source parent and approval record —
+     * and only from and to these exact bytes. In place of the KRX-free rule its comment-free KRX lines are pinned by
+     * [krxLinesSha256] ([krxLinesSha256] of the text). The forbidden scope itself is unchanged.
+     * - S7-c F1 (`R4c/S7/user_decision_s7c_F1.r1.md` cc93e4f7…): TopicRuntimeOwner.kt.
+     * - S7-N1 (`R4c/S7/s7n1/s7n1_scope.confirmed.r1.md` 1ecc6234…, user decision `R4c/S7/user_decision_s7n1.r1.md` E1):
+     *   FXiMessagingService.kt, the `sync_alerts` hand-over after the emit.
      */
     class CoreException(val unitId: String, val sourceParent: String, val approvalRecordSha256: String, val path: String,
         val from: String, val to: String, val krxLinesSha256: String)
@@ -70,6 +78,15 @@ internal object PostS6ApprovedDelta {
             from = "a618496be598fc92aa78184e732286f05f61e8bbc510de5a7b4b4dd1c92a7f56",
             to = "aef67386a820bc7db734ff786cabb3817a9394108bba468965b0c4c8069777f3",
             krxLinesSha256 = "234ddcf3be22830a470b42544091ab75bed096e27e420f9dee5158bc1f307260"
+        ),
+        CoreException(
+            unitId = "S7-N1",
+            sourceParent = "0540526510b14447e171b4cc3522cdda00246b7f",
+            approvalRecordSha256 = "1ecc6234c4d4aebb9d6a51b90984404f7758a2e28549590f3e3d6911717ed838",
+            path = BASE + "service/FXiMessagingService.kt",
+            from = "5c157653a1e692df586958c0f81fe002e6b2ddb3671e85944321be1e87c50923",
+            to = "9f3ecfc91728b9bc30ad8652b2a0c82d5d53251b565a7babba543a3fcb06b6fe",
+            krxLinesSha256 = "08e142a551e0e47752a09853de243aa65b727b5863c75171d1cb7157ece13d02"
         )
     )
 

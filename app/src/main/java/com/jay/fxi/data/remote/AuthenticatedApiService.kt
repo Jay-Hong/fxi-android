@@ -260,9 +260,10 @@ class AuthenticatedApiClient internal constructor(
             .asUnit()
 
     suspend fun getNotificationSettings(
-        owner: AuthSnapshot
+        owner: AuthSnapshot,
+        useAdmitted: (() -> Boolean)? = null
     ): AuthenticatedHttpResponse<NotificationSettingsResponse> =
-        transport.executeRead(owner) { service.getNotificationSettings(it) }
+        transport.executeRead(owner, useAdmitted) { service.getNotificationSettings(it) }
             .preserve(AuthenticatedEndpoint.NOTIFICATION_SETTINGS)
             .decodeSuccess(wireJson)
 

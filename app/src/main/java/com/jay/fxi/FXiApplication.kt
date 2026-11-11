@@ -10,6 +10,7 @@ import android.util.Log
 import com.google.firebase.FirebaseApp
 import com.google.firebase.crashlytics.FirebaseCrashlytics
 import com.jay.fxi.admission.ReleaseAdmission
+import com.jay.fxi.data.alerts.AlertFamilyRefresherRegistry
 import com.jay.fxi.service.FXiMessagingService
 import com.revenuecat.purchases.LogLevel
 import com.revenuecat.purchases.Purchases
@@ -39,12 +40,12 @@ internal fun shouldEnableCrashlytics(
 /**
  * Everything an admitted process starts, in one place that can be called without an `Application`.
  *
- * Written as a function taking the six starts rather than as statements in `onCreate`,
+ * Written as a function taking the seven starts rather than as statements in `onCreate`,
  * because some of them are silent when they do not happen. A missing [bindAccess] or
  * [startFreeSnapshots] shows up as an app that never signs in or never refreshes; a missing
  * [purgeRetiredStores] looks exactly like a phone that had nothing left to delete, and a missing
  * [prefetchInstallSeed] only moves the seed read to the scheduler's first use. Grouping them
- * makes the quiet ones fail the same way as the loud ones — all six run, or the list is wrong and
+ * makes the quiet ones fail the same way as the loud ones — all seven run, or the list is wrong and
  * `FXiApplicationStartTest` says so.
  */
 internal fun startAppOwnedServices(
@@ -53,6 +54,7 @@ internal fun startAppOwnedServices(
     startFreeSnapshots: () -> Unit,
     startTopicOwner: () -> Unit,
     launchRateMigration: () -> Unit,
+    startAlertFamilies: () -> Unit,
     purgeRetiredStores: () -> Unit
 ) {
     // The single process-wide auth -> access-state funnel. Identity only: it binds the owner and
@@ -69,6 +71,7 @@ internal fun startAppOwnedServices(
     // Install the process consumer and all inputs before the rate cache cutover may delete v1 keys.
     startTopicOwner()
     launchRateMigration()
+    startAlertFamilies()
 
     // Deletes the v1 stores this build has replaced (`ANDROID_V2_PLAN.md §7 S1.5`). Nothing waits on it
     // and nothing v2 reads what it removes, so it goes last and answers to no one.
@@ -101,6 +104,9 @@ class FXiApplication : Application() {
     @Inject
     internal lateinit var ratesCacheCutover: Provider<RatesCacheCutover>
 
+    @Inject
+    internal lateinit var alertFamilies: Provider<AlertFamilyRefresherRegistry>
+
     /**
      * Not a [Provider]: it holds a context and a scope and observes nothing, so constructing it
      * during member injection costs nothing and orders nothing against Firebase.
@@ -131,6 +137,7 @@ class FXiApplication : Application() {
             startFreeSnapshots = { freeSnapshotScheduler.get().start() },
             startTopicOwner = { topicRuntimeOwner.get().start() },
             launchRateMigration = { ratesCacheCutover.get().launch() },
+            startAlertFamilies = { alertFamilies.get().start() },
             purgeRetiredStores = { legacyStorePurge.start() }
         )
 

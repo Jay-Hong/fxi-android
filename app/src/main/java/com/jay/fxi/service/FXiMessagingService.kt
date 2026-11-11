@@ -7,9 +7,12 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
+import com.jay.fxi.BuildConfig
 import com.jay.fxi.MainActivity
 import com.jay.fxi.R
 import com.jay.fxi.admission.ReleaseAdmission
+import com.jay.fxi.data.alerts.AlertFamilyRefresherRegistry
+import com.jay.fxi.shouldStartAppOwnedServices
 import com.jay.fxi.data.entitlements.KrxContestSwitch
 import com.jay.fxi.subscription.SubscriptionManager
 import dagger.hilt.android.AndroidEntryPoint
@@ -26,6 +29,7 @@ class FXiMessagingService : FirebaseMessagingService() {
     @Inject lateinit var pushNotificationManagerProvider: Provider<PushNotificationManager>
     @Inject lateinit var subscriptionManagerProvider: Provider<SubscriptionManager>
     @Inject lateinit var alertEventBusProvider: Provider<AlertEventBus>
+    @Inject internal lateinit var alertFamiliesProvider: Provider<AlertFamilyRefresherRegistry>
 
     @Inject lateinit var krxContestSwitch: KrxContestSwitch
 
@@ -52,6 +56,9 @@ class FXiMessagingService : FirebaseMessagingService() {
         val type = message.data["type"] ?: return
         val route = AlertPushRouting.route(type, message.data["setting_id"]) ?: return
         alertEventBusProvider.get().emit(route.event)
+        AlertFamilyRefresherRegistry.deliverPush(
+            type, shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)
+        ) { alertFamiliesProvider.get() }
         if (route.showBanner) showAlertNotification(message, type)
     }
 

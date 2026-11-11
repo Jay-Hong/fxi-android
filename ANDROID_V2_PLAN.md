@@ -1872,8 +1872,8 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   성공 snapshot(정상 빈 목록 포함)이 있으면 실패해도 snapshot 의미를 유지한다
   (현 `AlertViewModel.hadLoadedState:204,212-215,233-236` 승계).
   임시-오류 판정에 서버 문구 문자열을 쓰지 않는다(typed `AlertLoadFailure`).
-  ⚠️ 현 Android `AlertState`(`AlertViewModel.kt:37-45`)에는 `Retrying`이 없어 첫 실패가 즉시 `Error`로 확정되고
-  `AlertSection.kt:266`에 `settings.isEmpty` 가드가 없다 — 자동 재시도를 도입하는 이 슬라이스에서 함께 고친다.
+  ⚠️ 현 Android `AlertState`(`AlertViewModel.kt:42-50`)에는 `Retrying`이 없고 최초 load 실패는 `AlertViewModel.kt:265-269`에서 즉시 `Error`로 확정된다.
+  `AlertSection.kt:266`에는 `settings.isEmpty` 가드가 없다. N1은 production bank owner·typed phase·retry·lifecycle registry·sync를 먼저 도입하며 기존 VM과 두 은행 Composable은 production 미생성·미연결로 유지한다. N1 완료 뒤 화면 연결 단위에서 VM을 owner에 위임하고 retrying 렌더·빈 목록 오류 가드를 함께 고친다(사용자 결정 N1-E5). N1 완료는 S7 전체 완료가 아니다.
 - **lifecycle(iOS 실재 계약, family별 분리)**:
   - bank/source는 background에서 in-flight 응답을 generation guard로 폐기하고 대기 demand를 취소하되
     Retry-After hard floor·수동 쿨다운을 보존한다. 성공 snapshot은 유지하고 없으면 idle로 돌린다

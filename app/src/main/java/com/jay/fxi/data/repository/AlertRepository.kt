@@ -39,12 +39,18 @@ class AlertRepository @Inject constructor(
         null
     }
 
-    suspend fun getSettings(owner: AuthIdentityFence): AuthBoundResult<List<AlertSetting>> =
-        safeApiCall(owner) { snapshot ->
-            apiService.getNotificationSettings(snapshot)
+    suspend fun getSettings(
+        owner: AuthIdentityFence,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<List<AlertSetting>> {
+        if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+        return safeApiCall(owner) { snapshot ->
+            if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+            apiService.getNotificationSettings(snapshot, useAdmitted)
                 .requireBody("GET /api/notification-settings")
                 .settings
         }
+    }
 
     /** Source (tether exchange / KRX) alerts; [asset] null is every asset. */
     suspend fun getSourceSettings(owner: AuthIdentityFence, asset: String? = null): AuthBoundResult<List<SourceAlertSetting>> =
@@ -193,7 +199,7 @@ class AlertRepository @Inject constructor(
         } catch (e: AuthUnavailableException) {
             return AuthBoundResult(
                 requireCurrent = { apiService.requireCurrent(owner) },
-                result = Result.failure(AlertRepositoryException("인증 오류"))
+                result = Result.failure(AlertRepositoryException("인증 오류", failureKind = AlertRepositoryFailureKind.AUTH_UNAVAILABLE))
             )
         }
 
@@ -208,26 +214,35 @@ class AlertRepository @Inject constructor(
                 AlertRepositoryException(
                     message = "서버 응답 형식 오류",
                     responseEvidence = e.response,
-                    cause = e
+                    cause = e,
+                    failureKind = AlertRepositoryFailureKind.DECODE
                 )
             )
+        } catch (e: AuthUnavailableException) {
+            Result.failure(AlertRepositoryException("네트워크 오류", failureKind = AlertRepositoryFailureKind.AUTH_UNAVAILABLE))
         } catch (e: IOException) {
-            Result.failure(AlertRepositoryException("네트워크 오류"))
+            Result.failure(AlertRepositoryException("네트워크 오류", failureKind = AlertRepositoryFailureKind.NETWORK))
         } catch (e: Exception) {
-            Result.failure(AlertRepositoryException("서버 오류"))
+            Result.failure(AlertRepositoryException("서버 오류", failureKind = AlertRepositoryFailureKind.UNEXPECTED))
         }
         return AuthBoundResult(
             requireCurrent = { apiService.requireCurrent(owner) },
-            result = result
+            result = result,
+            rateLimitResponseEvidence = (result.exceptionOrNull() as? AlertRepositoryException)?.httpFailure?.let {
+                AlertRateLimitResponseEvidence(it.statusCode, it.retryAfter)
+            }
         )
     }
 
 }
 
+internal data class AlertRateLimitResponseEvidence(val statusCode: Int, val retryAfter: String?)
+
 /** A repository result that validates its auth generation at the UI application boundary. */
 class AuthBoundResult<T> internal constructor(
     private val requireCurrent: () -> Unit,
-    private val result: Result<T>
+    private val result: Result<T>,
+    internal val rateLimitResponseEvidence: AlertRateLimitResponseEvidence? = null
 ) {
     fun <R> fold(
         onSuccess: (value: T) -> R,
@@ -262,11 +277,14 @@ internal fun mapAlertHttpFailure(failure: AuthenticatedHttpFailure): AlertReposi
         }
     }
 
+enum class AlertRepositoryFailureKind { HTTP, DECODE, NETWORK, AUTH_UNAVAILABLE, UNEXPECTED }
+
 open class AlertRepositoryException(
     message: String,
     val httpFailure: AuthenticatedHttpFailure? = null,
     val responseEvidence: AuthenticatedHttpResponse<*>? = null,
-    cause: Throwable? = null
+    cause: Throwable? = null,
+    val failureKind: AlertRepositoryFailureKind = AlertRepositoryFailureKind.HTTP
 ) : Exception(message, cause)
 
 /** 404: 다른 기기에서 이미 삭제된 경우 */

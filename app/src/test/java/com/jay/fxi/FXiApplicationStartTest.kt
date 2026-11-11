@@ -24,12 +24,14 @@ class FXiApplicationStartTest {
             startFreeSnapshots = { started += "snapshots" },
             startTopicOwner = { started += "topic-owner" },
             launchRateMigration = { started += "rate-migration" },
+            startAlertFamilies = { started += "alert-families" },
             purgeRetiredStores = { started += "purge" }
         )
         // Order is asserted with them: the two that bind identity go before anything that might depend on one, the seed read
         // starts ahead of the scheduler that uses it (S4 CUT-CC1-06), the rate migration's cutover reads the topic owner's
-        // readiness so it follows the owner (R4-c C4-J-START-ADMISSION), and the purge answers to nobody and goes last.
-        assertEquals(listOf("access", "seed", "snapshots", "topic-owner", "rate-migration", "purge"), started)
+        // readiness so it follows the owner (R4-c C4-J-START-ADMISSION), the alert families (S7 N1) read the topic owner's
+        // published graph fence so they follow it too, and the purge answers to nobody and goes last.
+        assertEquals(listOf("access", "seed", "snapshots", "topic-owner", "rate-migration", "alert-families", "purge"), started)
     }
 
     @Test

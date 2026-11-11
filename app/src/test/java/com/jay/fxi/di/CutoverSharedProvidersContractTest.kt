@@ -577,9 +577,11 @@ class CutoverSharedProvidersContractTest {
         val all = production()
         assertTrue("premise: the scan reaches the benchmark source set", all.keys.any { it.startsWith("benchmark/") })
         // S7-c: the bank history's production wiring reads the same shared store through its entry point (one accessor).
+        // S7 N1: the bank settings access takes the same shared store by injection (one constructor parameter).
         val allowed = mapOf(
             "DeletionAdmissionStore" to setOf(main("data/entitlements/DeletionAdmissionStore.kt"), main("data/graph/GraphProtectedAdmission.kt"), graphModule,
-                main("ui/settings/SettingsViewModel.kt"), main("data/graph/ProcessGraphBuilder.kt"), main("ui/alert/BankHistoryEntry.kt")),
+                main("ui/settings/SettingsViewModel.kt"), main("data/graph/ProcessGraphBuilder.kt"), main("ui/alert/BankHistoryEntry.kt"),
+                main("data/alerts/AlertSettingsAccess.kt")),
             "GraphSelectionStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/graph/GraphSeriesSelectionSession.kt"), graphModule,
                 main("data/graph/ProcessGraphBuilder.kt"), S5_SEEDER),
             "BackupableUserIntentStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt"), graphModule),
@@ -594,7 +596,8 @@ class CutoverSharedProvidersContractTest {
         // parameter or its provider needs, so a further field, parameter, Provider or resolution in that file shows up.
         val counts = mapOf(
             "DeletionAdmissionStore" to mapOf(main("data/entitlements/DeletionAdmissionStore.kt") to 1, main("data/graph/GraphProtectedAdmission.kt") to 2, graphModule to 3,
-                main("ui/settings/SettingsViewModel.kt") to 4, main("data/graph/ProcessGraphBuilder.kt") to 2, main("ui/alert/BankHistoryEntry.kt") to 2),
+                main("ui/settings/SettingsViewModel.kt") to 4, main("data/graph/ProcessGraphBuilder.kt") to 2, main("ui/alert/BankHistoryEntry.kt") to 2,
+                main("data/alerts/AlertSettingsAccess.kt") to 2),
             "GraphSelectionStore" to mapOf(main("data/graph/GraphSeriesSelectionSession.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 2, graphModule to 2,
                 main("data/graph/ProcessGraphBuilder.kt") to 2, S5_SEEDER to 2),
             "BackupableUserIntentStore" to mapOf(main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 1, graphModule to 2),
@@ -626,9 +629,11 @@ class CutoverSharedProvidersContractTest {
         // S4 CUT-CC4b: the process graph builder constructs the admission and the cache ports, once each, inside build().
         // S4 CUT-CC5-2: and, in its holder factory, one selection session per holder.
         // S7-c: the bank history's production wiring constructs one more admission over the same shared store.
+        // S7 N1: and the bank settings access one more.
         for (type in listOf("GraphProtectedAdmission", "GraphSeriesSelectionSession", "GraphSelectionPurgeAdapter", "GraphV2CachePorts", "GraphV2PurgeAdapter")) {
             val expected = when (type) {
-                "GraphProtectedAdmission" -> mapOf(main("data/graph/ProcessGraphBuilder.kt") to 1, main("ui/alert/BankHistoryEntry.kt") to 1)
+                "GraphProtectedAdmission" -> mapOf(main("data/graph/ProcessGraphBuilder.kt") to 1, main("ui/alert/BankHistoryEntry.kt") to 1,
+                    main("data/alerts/AlertSettingsAccess.kt") to 1)
                 "GraphV2CachePorts", "GraphSeriesSelectionSession" -> mapOf(main("data/graph/ProcessGraphBuilder.kt") to 1)
                 else -> emptyMap()
             }
