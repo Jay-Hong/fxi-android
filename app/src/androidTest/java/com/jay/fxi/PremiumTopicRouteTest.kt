@@ -13,6 +13,9 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.performClick
+import com.jay.fxi.data.alerts.AlertLoadPhase
+import com.jay.fxi.data.alerts.BankAlertSettingsState
+import com.jay.fxi.data.alerts.ManualRefreshState
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.local.RateRowPreferenceStore
 import com.jay.fxi.data.remote.OwnedTopicFocus
@@ -31,11 +34,14 @@ import com.jay.fxi.domain.model.TopicQuote
 import com.jay.fxi.domain.model.TopicRates
 import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.domain.repository.NewsRepository
+import com.jay.fxi.ui.alert.BankAlertSectionSource
+import com.jay.fxi.ui.alert.BankAlertSectionSourceFactory
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.view.PremiumTopicRoute
 import com.jay.fxi.ui.premium.view.PremiumTopicTags
 import com.jay.fxi.ui.viewmodel.NewsViewModel
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -53,6 +59,10 @@ import org.junit.Test
  * PremiumTopicConsumer on the main thread, a real NewsViewModel over a fake repository and a settings fixture. The route starts the
  * consumer, forwards confirmed user choices through it, tells it about sign-in changes, draws nothing when inactive, and connects
  * news and settings without turning their actions into rate selections. The implementation reads but does not edit this file.
+ *
+ * Claude-owned S7 E5a1 contract (R4c/S7/s7e5 API r2 §5, harness row): both route calls pass a no-op bank alert section source
+ * factory, so the section under the bank tabs looks up no settings owner through the entry point and ensures nothing; the
+ * route assertions are unchanged. The implementation thread reads but does not edit this file.
  */
 class PremiumTopicRouteTest {
     @get:Rule val rule = createAndroidComposeRule<ComponentActivity>()
@@ -81,6 +91,25 @@ class PremiumTopicRouteTest {
         override suspend fun remember(uid: String, list: RateRowList, preference: RateRowPreference) { writes += Triple(uid, list, preference) }
     }
 
+    /** S7 E5a1 harness: an idle, empty bank alert section source; it counts what the route asks of it and does nothing. */
+    private class NoOpBankAlertSection : BankAlertSectionSourceFactory {
+        val created = AtomicInteger()
+        val ensures = AtomicInteger()
+        val retries = AtomicInteger()
+        val refreshes = AtomicInteger()
+        override fun create(context: android.content.Context): BankAlertSectionSource {
+            created.incrementAndGet()
+            return object : BankAlertSectionSource {
+                override val settings = MutableStateFlow(BankAlertSettingsState(AlertLoadPhase.Idle, null, null))
+                override val manualRefresh = MutableStateFlow(ManualRefreshState())
+                override fun ensure() { ensures.incrementAndGet() }
+                override fun authoritative() { retries.incrementAndGet() }
+                override fun manual() { refreshes.incrementAndGet() }
+            }
+        }
+    }
+    private val bankAlerts = NoOpBankAlertSection()
+
     private val display = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN))
     private val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.USD))
     private var live: AuthIdentityFence? = a1
@@ -108,7 +137,8 @@ class PremiumTopicRouteTest {
                     Button(onClick = signOut) { Text("fixture 로그아웃") }
                     Button(onClick = dismiss) { Text("fixture 닫기") }
                 }
-            })
+            },
+            bankAlertSectionSourceFactory = bankAlerts)
     }
 
     private fun show(news: FakeNews = FakeNews(), restorable: Boolean = false) {
@@ -296,7 +326,7 @@ class PremiumTopicRouteTest {
         )
         try {
             val vm = NewsViewModel(FakeNews())
-            rule.setContent { PremiumTopicRoute(c, a1, true, vm, null, {}) }
+            rule.setContent { PremiumTopicRoute(c, a1, true, vm, null, {}, bankAlertSectionSourceFactory = bankAlerts) }
             rule.waitForIdle()
             val click = requireNotNull(
                 rule.onNodeWithTag(PremiumTopicTags.BANNER_ACTION).fetchSemanticsNode()

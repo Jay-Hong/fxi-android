@@ -10,6 +10,9 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import com.jay.fxi.data.alerts.AlertLoadPhase
+import com.jay.fxi.data.alerts.BankAlertSettingsState
+import com.jay.fxi.data.alerts.ManualRefreshState
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.entitlements.TopicAccessSnapshot
@@ -51,6 +54,8 @@ import com.jay.fxi.domain.model.TopicQuote
 import com.jay.fxi.domain.model.TopicRates
 import com.jay.fxi.domain.repository.NewsRepository
 import com.jay.fxi.time.SystemAppClock
+import com.jay.fxi.ui.alert.BankAlertSectionSource
+import com.jay.fxi.ui.alert.BankAlertSectionSourceFactory
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.graph.GraphScreenHost
 import com.jay.fxi.ui.premium.graph.GraphV2Surface
@@ -58,6 +63,7 @@ import com.jay.fxi.ui.premium.graph.GraphV2UiTags
 import com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder
 import com.jay.fxi.ui.premium.view.PremiumTopicRoute
 import com.jay.fxi.ui.viewmodel.NewsViewModel
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -79,6 +85,10 @@ import org.junit.Test
  * inactive and dispose, moves it with the owner and the tab, and closes the mount when the host changes, becomes null or the
  * route leaves. Run on a device with a real consumer, a real host over a real assembly (never started: no request is made) and
  * real holders. Each holder's last activation request is read from the holder itself, as the route's effect left it.
+ *
+ * Claude-owned S7 E5a1 contract (R4c/S7/s7e5 API r2 §5, harness row): the route call passes a no-op bank alert section source
+ * factory, so the section under the bank tabs looks up no settings owner through the entry point and ensures nothing; the
+ * graph assertions are unchanged. The implementation thread reads but does not edit this file.
  */
 class PremiumTopicRouteGraphTest {
     @get:Rule val rule = createAndroidComposeRule<ComponentActivity>()
@@ -89,6 +99,25 @@ class PremiumTopicRouteGraphTest {
     private val o2 = TopicDisplayOwner(a1, 2L)
     private val fence = TopicSessionFence(a1, "e1", com.jay.fxi.data.remote.TopicGrantToken(1L))
     private fun rates() = TopicRates().merge(listOf(TopicQuote("kb", "usd-krw", 1390.0, t), TopicQuote("upbit", "usdt-krw", 1400.0, t)))
+
+    /** S7 E5a1 harness: an idle, empty bank alert section source; it counts what the route asks of it and does nothing. */
+    private class NoOpBankAlertSection : BankAlertSectionSourceFactory {
+        val created = AtomicInteger()
+        val ensures = AtomicInteger()
+        val retries = AtomicInteger()
+        val refreshes = AtomicInteger()
+        override fun create(context: android.content.Context): BankAlertSectionSource {
+            created.incrementAndGet()
+            return object : BankAlertSectionSource {
+                override val settings = MutableStateFlow(BankAlertSettingsState(AlertLoadPhase.Idle, null, null))
+                override val manualRefresh = MutableStateFlow(ManualRefreshState())
+                override fun ensure() { ensures.incrementAndGet() }
+                override fun authoritative() { retries.incrementAndGet() }
+                override fun manual() { refreshes.incrementAndGet() }
+            }
+        }
+    }
+    private val bankAlerts = NoOpBankAlertSection()
 
     private val display = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN))
     private val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.USD))
@@ -222,7 +251,8 @@ class PremiumTopicRouteGraphTest {
         rule.setContent {
             if (shown) {
                 PremiumTopicRoute(consumer = consumer, identity = identity, isActive = active, newsViewModel = vm, userInfo = null,
-                    onSignOut = { }, modifier = androidx.compose.ui.Modifier.testTag("route:$tick"), graphHost = host)
+                    onSignOut = { }, modifier = androidx.compose.ui.Modifier.testTag("route:$tick"), graphHost = host,
+                    bankAlertSectionSourceFactory = bankAlerts)
             }
         }
         rule.waitForIdle()

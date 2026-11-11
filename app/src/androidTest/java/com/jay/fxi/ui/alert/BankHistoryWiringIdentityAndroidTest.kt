@@ -10,6 +10,9 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.platform.app.InstrumentationRegistry
 import com.jay.fxi.MainActivity
+import com.jay.fxi.data.alerts.AlertLoadPhase
+import com.jay.fxi.data.alerts.BankAlertSettingsState
+import com.jay.fxi.data.alerts.ManualRefreshState
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.graph.GraphProtectedAdmission
 import com.jay.fxi.data.local.RateRowPreferenceStore
@@ -56,6 +59,11 @@ import org.junit.Test
  * very object the producers hold: the topic runtime and the graph builder share the authority and the store, and the account
  * deletion stage writes the store and publishes the revisions. The D24 release admission is off in this build and the owner is
  * not started, so the open acquires nothing and reads nothing over the network.
+ *
+ * Claude-owned S7 E5a1 contract (R4c/S7/s7e5 API r2 §5, harness row): this test is about the history wiring, not the settings
+ * owner, so its route call passes a no-op bank alert section source factory: in this real app's SingletonComponent the section
+ * under the bank tabs looks up no settings owner through its entry point and ensures nothing. The history assertions are
+ * unchanged. The implementation thread reads but does not edit this file.
  */
 class BankHistoryWiringIdentityAndroidTest {
     @get:Rule val rule = createAndroidComposeRule<ComponentActivity>()
@@ -86,6 +94,25 @@ class BankHistoryWiringIdentityAndroidTest {
         override suspend fun remember(uid: String, list: RateRowList, preference: RateRowPreference) = Unit
     }, { o, tab -> focus.value = OwnedTopicFocus(o, tab) }, { }, { _, _ -> }, scope)
     @After fun tearDown() = scope.cancel()
+
+    /** S7 E5a1 harness: an idle, empty bank alert section source; it counts what the route asks of it and does nothing. */
+    private class NoOpBankAlertSection : BankAlertSectionSourceFactory {
+        val created = java.util.concurrent.atomic.AtomicInteger()
+        val ensures = java.util.concurrent.atomic.AtomicInteger()
+        val retries = java.util.concurrent.atomic.AtomicInteger()
+        val refreshes = java.util.concurrent.atomic.AtomicInteger()
+        override fun create(context: android.content.Context): BankAlertSectionSource {
+            created.incrementAndGet()
+            return object : BankAlertSectionSource {
+                override val settings = MutableStateFlow(BankAlertSettingsState(AlertLoadPhase.Idle, null, null))
+                override val manualRefresh = MutableStateFlow(ManualRefreshState())
+                override fun ensure() { ensures.incrementAndGet() }
+                override fun authoritative() { retries.incrementAndGet() }
+                override fun manual() { refreshes.incrementAndGet() }
+            }
+        }
+    }
+    private val bankAlerts = NoOpBankAlertSection()
 
     /**
      * S7C_W03 (consumption): before the first open nothing is resolved, through tab moves and a foreground; the first open
@@ -121,7 +148,7 @@ class BankHistoryWiringIdentityAndroidTest {
         rule.setContent {
             PremiumTopicRoute(consumer = consumer, identity = a1, isActive = true, newsViewModel = vm,
                 userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
-                settingsContent = { _, _, _ -> }, bankHistoryWiring = counting)
+                settingsContent = { _, _, _ -> }, bankHistoryWiring = counting, bankAlertSectionSourceFactory = bankAlerts)
         }
         rule.waitForIdle()
         for (tab in listOf(FreeTab.JPY, FreeTab.TETHER, FreeTab.USD)) { focus.value = OwnedTopicFocus(a1, tab); rule.waitForIdle() }

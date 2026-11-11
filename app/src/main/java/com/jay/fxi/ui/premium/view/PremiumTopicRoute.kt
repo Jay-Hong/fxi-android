@@ -2,6 +2,7 @@ package com.jay.fxi.ui.premium.view
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
@@ -22,6 +23,9 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.UserInfo
+import com.jay.fxi.ui.alert.BankAlertSection
+import com.jay.fxi.ui.alert.BankAlertSectionSourceFactory
+import com.jay.fxi.ui.alert.ProductionBankAlertSectionSourceFactory
 import com.jay.fxi.ui.alert.BankHistoryEntry
 import com.jay.fxi.ui.alert.BankHistoryWiringFactory
 import com.jay.fxi.ui.alert.ProductionBankHistoryWiring
@@ -64,7 +68,8 @@ internal fun PremiumTopicRoute(
         SettingsScreen(userInfo = u, onSignOut = s, onDismiss = d)
     },
     graphHost: GraphScreenHost? = null,
-    bankHistoryWiring: BankHistoryWiringFactory = ProductionBankHistoryWiring
+    bankHistoryWiring: BankHistoryWiringFactory = ProductionBankHistoryWiring,
+    bankAlertSectionSourceFactory: BankAlertSectionSourceFactory = ProductionBankAlertSectionSourceFactory
 ) {
     LaunchedEffect(consumer) { consumer.start() }
     LaunchedEffect(consumer, identity) { consumer.onIdentityChanged() }
@@ -181,13 +186,19 @@ internal fun PremiumTopicRoute(
                     graphSlot = graphSlot,
                     belowRates = if (screen.ui.selectedTab in listOf(FreeTab.USD, FreeTab.JPY, FreeTab.EUR) && !settingsOpen && detailUrl == null) {
                         { tab ->
-                            BankHistoryEntry(
-                                tab = tab,
-                                owner = owner,
-                                shown = { consumer.state.value.ui.let { it.owner to it.selectedTab } },
-                                listen = consumer::addScreenListener,
-                                wiring = { bankHistoryWiring.create(context) { consumer.state.value.ui.owner } }
-                            )
+                            Column {
+                                BankHistoryEntry(
+                                    tab = tab,
+                                    owner = owner,
+                                    shown = { consumer.state.value.ui.let { it.owner to it.selectedTab } },
+                                    listen = consumer::addScreenListener,
+                                    wiring = { bankHistoryWiring.create(context) { consumer.state.value.ui.owner } }
+                                )
+                                BankAlertSection(
+                                    tab = tab,
+                                    sourceFactory = bankAlertSectionSourceFactory
+                                )
+                            }
                         }
                     } else null
                 )

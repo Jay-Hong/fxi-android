@@ -5,6 +5,9 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.lifecycle.Lifecycle
+import com.jay.fxi.data.alerts.AlertLoadPhase
+import com.jay.fxi.data.alerts.BankAlertSettingsState
+import com.jay.fxi.data.alerts.ManualRefreshState
 import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthCredentialRecoveryStream
 import com.jay.fxi.data.auth.AuthFenceStream
@@ -56,12 +59,15 @@ import com.jay.fxi.domain.model.RateRowPreference
 import com.jay.fxi.domain.model.TopicRejectionReason
 import com.jay.fxi.domain.repository.NewsRepository
 import com.jay.fxi.time.SystemAppClock
+import com.jay.fxi.ui.alert.BankAlertSectionSource
+import com.jay.fxi.ui.alert.BankAlertSectionSourceFactory
 import com.jay.fxi.ui.premium.graph.GraphScreenHost
 import com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder
 import com.jay.fxi.ui.premium.view.PremiumTopicRoute
 import com.jay.fxi.ui.viewmodel.NewsViewModel
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.time.Duration
 import kotlinx.coroutines.CoroutineScope
@@ -92,6 +98,10 @@ import org.junit.Test
  * (`fg:<v>:begin`/`fg:<v>:end`), each recovery time event (`time`), the host's construction with the recovery events'
  * foreground at that moment (`host:<v>`), and each change of the usd holder's surface visibility, observed from inside the
  * holder's own call (`show`/`hide`).
+ *
+ * Claude-owned S7 E5a1 contract (R4c/S7/s7e5 API r2 §5, harness row): the route call passes a no-op bank alert section source
+ * factory, so the section under the usd rates looks up no settings owner through the entry point and ensures nothing; the
+ * foreground assertions are unchanged. The implementation thread reads but does not edit this file.
  */
 class PremiumGraphProcessForegroundTest {
     @get:Rule val rule = createAndroidComposeRule<ComponentActivity>()
@@ -115,6 +125,25 @@ class PremiumGraphProcessForegroundTest {
         userInvalidations = 3L
     )
     private val authority: TopicUseAuthority = SnapshotTopicUseAuthority { snapshot }
+
+    /** S7 E5a1 harness: an idle, empty bank alert section source; it counts what the route asks of it and does nothing. */
+    private class NoOpBankAlertSection : BankAlertSectionSourceFactory {
+        val created = AtomicInteger()
+        val ensures = AtomicInteger()
+        val retries = AtomicInteger()
+        val refreshes = AtomicInteger()
+        override fun create(context: android.content.Context): BankAlertSectionSource {
+            created.incrementAndGet()
+            return object : BankAlertSectionSource {
+                override val settings = MutableStateFlow(BankAlertSettingsState(AlertLoadPhase.Idle, null, null))
+                override val manualRefresh = MutableStateFlow(ManualRefreshState())
+                override fun ensure() { ensures.incrementAndGet() }
+                override fun authoritative() { retries.incrementAndGet() }
+                override fun manual() { refreshes.incrementAndGet() }
+            }
+        }
+    }
+    private val bankAlerts = NoOpBankAlertSection()
 
     private val log = Collections.synchronizedList(mutableListOf<String>())
     private val scopes = Collections.synchronizedList(mutableListOf<CoroutineScope>())
@@ -317,7 +346,7 @@ class PremiumGraphProcessForegroundTest {
         rule.setContent {
             val host by owner.graphHost.collectAsState()
             PremiumTopicRoute(consumer = owner.consumer, identity = a1, isActive = true, newsViewModel = vm, userInfo = null,
-                onSignOut = { }, graphHost = host)
+                onSignOut = { }, graphHost = host, bankAlertSectionSourceFactory = bankAlerts)
         }
         rule.waitForIdle()
         openConnection()

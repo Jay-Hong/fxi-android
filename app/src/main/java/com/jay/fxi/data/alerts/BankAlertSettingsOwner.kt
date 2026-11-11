@@ -47,6 +47,18 @@ internal data class BankAlertSettingsState(
     val identity: AuthIdentityFence?
 )
 
+/** S7 E5a1: the header refresh button's state. Not an outcome: it is re-readable, and a dropped manual simply stops being requested. */
+internal data class ManualRefreshState(
+    /** A manual demand is held by the active chain (it may be waiting for the floor or for access). */
+    val requested: Boolean = false,
+    /** A manual demand is attached to the active chain's fetch call. This is a logical fetch indicator, not proof of an HTTP send; admission may withhold the call. */
+    val sending: Boolean = false,
+    /** True while the owner's monotonic cooldown deadline is still in the future. */
+    val coolingDown: Boolean = false,
+    /** Same value as the owner's cooldownUntil, in injected nowMillis units (production: elapsedRealtime); null after reset. Not wall time. */
+    val cooldownUntilMillis: Long? = null
+)
+
 internal sealed interface ManualRefreshOutcome {
     data object Succeeded : ManualRefreshOutcome
     data object Failed : ManualRefreshOutcome
@@ -93,6 +105,9 @@ internal class BankAlertSettingsOwner internal constructor(
     val state: StateFlow<BankAlertSettingsState> = mutableState.asStateFlow()
     private val mutableManualOutcomes = MutableSharedFlow<ManualRefreshOutcome>(replay = 0, extraBufferCapacity = 1)
     val manualOutcomes: SharedFlow<ManualRefreshOutcome> = mutableManualOutcomes.asSharedFlow()
+    private val mutableManualRefresh = MutableStateFlow(ManualRefreshState())
+    /** Re-readable header refresh state, not an outcome; a dropped manual simply stops being requested. */
+    val manualRefresh: StateFlow<ManualRefreshState> = mutableManualRefresh.asStateFlow()
 
     private var foreground = false
     private var generation = 0L
@@ -100,6 +115,8 @@ internal class BankAlertSettingsOwner internal constructor(
     private var active: Chain? = null
     private var lastSuccessAt: Long? = null
     private var cooldownUntil: Long? = null
+    private var cooldownTimerToken: Any? = null
+    private var cooldownTimerJob: Job? = null
     private var manualFailures = 0
 
     /** A retired chain can finish late, but cannot change any of its replacement's bookkeeping. */
@@ -159,20 +176,30 @@ internal class BankAlertSettingsOwner internal constructor(
     }
 
     fun manual() {
-        if (!foreground) return
+        if (!foreground) {
+            publishManualRefresh()
+            return
+        }
         val remaining = cooldownUntil?.let(::remaining) ?: 0
         if (remaining > 0) {
+            publishManualRefresh()
             mutableManualOutcomes.tryEmit(ManualRefreshOutcome.CoolingDown(remaining))
             return
         }
         val chain = active
-        if (chain == null) begin(automatic = false, manual = true) else chain.manual = true
+        if (chain == null) {
+            begin(automatic = false, manual = true)
+        } else {
+            chain.manual = true
+            publishManualRefresh()
+        }
     }
 
     fun reset() {
+        cancelCooldownTimer()
+        cooldownUntil = null
         abandon()
         lastSuccessAt = null
-        cooldownUntil = null
         manualFailures = 0
         mutableState.value = BankAlertSettingsState(AlertLoadPhase.Idle, null, null)
     }
@@ -198,6 +225,7 @@ internal class BankAlertSettingsOwner internal constructor(
         // Publish the handle before running, even with an eager injected dispatcher.
         val next = scope.launch(start = CoroutineStart.LAZY) { runChain(chain) }
         job = next
+        publishManualRefresh()
         next.start()
     }
 
@@ -207,6 +235,7 @@ internal class BankAlertSettingsOwner internal constructor(
         val previous = job
         job = null
         previous?.cancel()
+        publishManualRefresh()
     }
 
     private fun current(chain: Chain): Boolean =
@@ -226,11 +255,15 @@ internal class BankAlertSettingsOwner internal constructor(
                 // Requests received in any sleep are served by this fetch.
                 chain.dirty = false
                 chain.inFetch = true
+                publishManualRefresh()
                 show(if (attempt == 0) AlertLoadPhase.Loading else AlertLoadPhase.Retrying)
                 val result = try {
                     fetch(chain, use)
                 } finally {
-                    chain.inFetch = false
+                    if (active === chain) {
+                        chain.inFetch = false
+                        publishManualRefresh()
+                    }
                 }
                 if (!current(chain)) return
                 if (!access.admits(use)) {
@@ -285,6 +318,7 @@ internal class BankAlertSettingsOwner internal constructor(
             if (active === chain) {
                 active = null
                 job = null
+                publishManualRefresh()
             }
         }
     }
@@ -375,7 +409,7 @@ internal class BankAlertSettingsOwner internal constructor(
     }
 
     private fun finishManual(chain: Chain, succeeded: Boolean) {
-        if (!chain.manual) return
+        if (active !== chain || !chain.manual) return
         chain.manual = false
         val cooldown = if (succeeded) {
             manualFailures = 0
@@ -385,7 +419,54 @@ internal class BankAlertSettingsOwner internal constructor(
             5_000L * (1L shl (manualFailures - 1))
         }
         cooldownUntil = addDelay(nowMillis(), cooldown)
+        startCooldownTimer(cooldownUntil!!)
         mutableManualOutcomes.tryEmit(if (succeeded) ManualRefreshOutcome.Succeeded else ManualRefreshOutcome.Failed)
+    }
+
+    /** Recompute from the live chain, including when a timer wakes after a new manual joined. */
+    private fun publishManualRefresh() {
+        val chain = active
+        val requested = chain?.manual == true
+        val deadline = cooldownUntil
+        mutableManualRefresh.value = ManualRefreshState(
+            requested = requested,
+            sending = requested && chain?.inFetch == true,
+            coolingDown = deadline != null && remaining(deadline) > 0,
+            cooldownUntilMillis = deadline
+        )
+    }
+
+    private fun cancelCooldownTimer() {
+        cooldownTimerToken = null
+        val previous = cooldownTimerJob
+        cooldownTimerJob = null
+        previous?.cancel()
+    }
+
+    private fun startCooldownTimer(deadline: Long) {
+        cancelCooldownTimer()
+        val token = Any()
+        cooldownTimerToken = token
+        // Install before start, as with request chains, even on an eager dispatcher.
+        val next = scope.launch(start = CoroutineStart.LAZY) {
+            try {
+                while (cooldownTimerToken === token && cooldownUntil == deadline) {
+                    val wait = remaining(deadline)
+                    if (wait == 0L) {
+                        publishManualRefresh()
+                        return@launch
+                    }
+                    sleep(wait)
+                }
+            } finally {
+                if (cooldownTimerToken === token) {
+                    cooldownTimerJob = null
+                }
+            }
+        }
+        cooldownTimerJob = next
+        publishManualRefresh()
+        next.start()
     }
 
     private fun show(phase: AlertLoadPhase) {

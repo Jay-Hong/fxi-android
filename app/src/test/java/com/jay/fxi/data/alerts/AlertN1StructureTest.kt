@@ -18,9 +18,15 @@ import org.junit.Test
  * Unicode escapes decoded before lexing, block comments not nesting). A reference cannot hide in a comment, a string or an
  * escape.
  *
- * - S1: the frozen AlertViewModel is named only by its own file and by AlertSection (one plain import, one MAX_COUNT); the
- *   two bank Composables are declared and never called or referenced; the six new N1 files reach no ViewModel, reflection,
- *   class loader or screen entry API.
+ * Claude-owned S7 E5a1 contract (R4c/S7/s7e5 API r2): API r2 §5's last row and Codex API r1 R5/R6 narrow S1 and widen
+ * A-reach by exactly the new section holder `ui/alert/BankAlertSection.kt`; that holder needs an entry point, so it is not one
+ * of the N1 NEW_FILES (its own surfaces are BankAlertSectionStructureTest's). S11 is unchanged. The implementation thread
+ * reads but does not edit this file.
+ *
+ * - S1: the frozen AlertViewModel is named only by its own file (E5a1: AlertSection no longer imports it and names no
+ *   MAX_COUNT); AlertSection is declared once and called directly once, from the section holder, with no other reference;
+ *   AlertAddSheet is declared and never called or referenced; the six new N1 files reach no ViewModel, reflection, class
+ *   loader or screen entry API.
  * - S2: ProcessLifecycleOwner is named by the topic owner and the registry only; the registry adds one observer, in start,
  *   on a lifecycle it reads lazily; no other new file observes a lifecycle.
  * - S3 / N1-P: FCM's one new statement is `deliverPush`, right after its one emit, behind the app-owned gate expression and
@@ -29,7 +35,8 @@ import org.junit.Test
  *   `onSyncAlerts`; the default loggers write a fixed message, never the exception or a payload.
  * - S4 / N1-A: the registry starts only from FXiApplication's `startAlertFamilies`, which onCreate passes past its admission
  *   gate and the start helper runs once between the rate migration and the purge; the new singletons are reached only
- *   through the registry, and the registry resolves the bank owner only in a supplier.
+ *   through the registry, except that the bank owner is also named by the section holder (E5a1), and the registry resolves
+ *   the bank owner only in a supplier.
  * - S5 / S6 / N1-Q: the six new files name no KRX, read no snapshot authority, no alert bus, no permission prompt, no push
  *   token owner and declare no binding.
  * - S11 (gap battery r1): the four production `@Inject` delegations pass exactly the agreed suppliers, the owner's production
@@ -49,7 +56,7 @@ class AlertN1StructureTest {
         val roots = S6Krx3bOffWiringContractTest.ROOTS
         assertTrue("premise(N1-S): the five production roots exist", roots.size == 5 && roots.all { File(it).isDirectory })
         assertTrue("premise(N1-S): the scan sees the production sources (${code.size})", code.size > 300)
-        for (path in NEW_FILES + listOf(VM, SECTION, SHEET, TOPIC_OWNER, APP, FCM, KRX_SAMPLE)) {
+        for (path in NEW_FILES + listOf(VM, SECTION, SHEET, HOLDER, ROUTE, TOPIC_OWNER, APP, FCM, KRX_SAMPLE)) {
             assertTrue("premise(N1-S): $path is scanned", path in code)
         }
         val kotlin = strip("X.kt", "// AlertViewModel\n/* a /* AlertViewModel */ still a comment */ val s = \"Alert\\u0056iewModel\"")
@@ -67,20 +74,24 @@ class AlertN1StructureTest {
         assertEquals("N1-S Java: a text block is a literal", 1, count(strip("X.java", "String t = \"\"\"\n  AlertViewModel\n  \"\"\";"), NAME_VM))
     }
 
-    @Test fun `S7N1_S01 AlertViewModel is named only by its own file and by AlertSection through one plain import and one MAX_COUNT`() {
-        assertEquals("premise(N1-S S1): the frozen VM declares its class", 1, count(code.getValue(VM), """\bclass\s+AlertViewModel\b"""))
-        assertEquals("premise(N1-S S1): AlertSection reads its MAX_COUNT", 1, count(code.getValue(SECTION), """\bAlertViewModel\s*\.\s*MAX_COUNT\b"""))
-        assertEquals("N1-S S1: no production root names, constructs or reflects AlertViewModel beyond these", emptyList<String>(), s1ViewModel(code))
+    @Test fun `S7E5A1_N1S01 AlertViewModel is named only by its own file and AlertSection names no MAX_COUNT`() {
+        assertEquals("premise(E5a1 S1): the frozen VM declares its class", 1, count(code.getValue(VM), """\bclass\s+AlertViewModel\b"""))
+        assertTrue("premise(E5a1 S1): the MAX_COUNT pattern finds the VM's own constant", count(code.getValue(VM), """\bMAX_COUNT\b""") >= 1)
+        assertEquals("premise(E5a1 S1): AlertSection is scanned and declares its Composable", 1,
+            count(code.getValue(SECTION), """\bfun\s+AlertSection\s*\("""))
+        assertEquals("E5a1 S1: no production root but the VM's own file names, constructs or reflects AlertViewModel, and AlertSection names no MAX_COUNT",
+            emptyList<String>(), s1ViewModel(code))
     }
 
-    @Test fun `S7N1_S02 AlertSection and AlertAddSheet are declared once and called or referenced nowhere`() {
-        assertEquals("premise(N1-S S1): the positive control finds AlertSection's declaration", mapOf(SECTION to 1),
+    @Test fun `S7E5A1_N1S02 AlertSection is declared once and called directly once by the section holder and AlertAddSheet by nobody`() {
+        assertEquals("premise(E5a1 S1): the positive control finds AlertSection's declaration", mapOf(SECTION to 1),
             occurrences(code, """\bfun\s+AlertSection\s*\("""))
-        assertEquals("premise(N1-S S1): and AlertAddSheet's", mapOf(SHEET to 1), occurrences(code, """\bfun\s+AlertAddSheet\s*\("""))
-        assertEquals("N1-S S1: the two bank Composables are mounted by nobody", emptyList<String>(), s1Composables(code))
+        assertEquals("premise(E5a1 S1): and AlertAddSheet's", mapOf(SHEET to 1), occurrences(code, """\bfun\s+AlertAddSheet\s*\("""))
+        assertTrue("premise(E5a1 S1): the call pattern finds the holder's direct call", count(code.getValue(HOLDER), """\bAlertSection\s*[({]""") >= 1)
+        assertEquals("E5a1 S1: AlertSection is mounted by the holder alone, once, and AlertAddSheet by nobody", emptyList<String>(), s1Composables(code))
     }
 
-    @Test fun `S7N1_S03 the S1 locks catch an alias import a qualified construction hiltViewModel a typed val and reflection strings`() {
+    @Test fun `S7E5A1_N1S03 the S1 locks catch an alias import a qualified construction hiltViewModel a typed val reflection strings and an extra or missing AlertSection caller`() {
         assertEquals("premise: the real tree is clean", emptyList<String>(), s1ViewModel(code) + s1Composables(code))
         val alias = "package com.jay.fxi.ui.alert\nimport com.jay.fxi.ui.viewmodel.AlertViewModel as Vm\nfun bypass(vm: Vm) = vm"
         val newKotlin = listOf(
@@ -98,18 +109,24 @@ class AlertN1StructureTest {
             "escaped identifier" to "class Bypass { Alert\\u0056iewModel vm; }")) {
             assertCaught("N1-S S1 new Java file, $label", "S1-files", s1ViewModel(withFile(BYPASS_JAVA, source)))
         }
-        val aliased = edited(SECTION, """\bimport\s+com\.jay\.fxi\.ui\.viewmodel\.AlertViewModel\b""", "import com.jay.fxi.ui.viewmodel.AlertViewModel as Vm")
-        assertCaught("N1-S S1 AlertSection's import aliased", "S1-import", s1ViewModel(aliased))
-        assertCaught("N1-S S1 AlertSection's import aliased", "S1-alias", s1ViewModel(aliased))
+        // E5a1: AlertSection names the VM no more, so any return of the VM to AlertSection widens the file set.
+        val aliasedImport = "import com.jay.fxi.ui.viewmodel.AlertViewModel as Vm"
+        val vmMaxCount = "private val max = AlertViewModel.MAX_COUNT"
         for ((label, source) in listOf(
+            "the plain import restored" to "import com.jay.fxi.ui.viewmodel.AlertViewModel",
+            "an aliased import" to aliasedImport,
             "fully qualified construction" to "private val bypass = com.jay.fxi.ui.viewmodel.AlertViewModel(a, b)",
             "hiltViewModel type argument" to "@Composable private fun Bypass() { val vm = hiltViewModel<AlertViewModel>() }",
             "typed val with hiltViewModel" to "@Composable private fun Bypass() { val vm: AlertViewModel = hiltViewModel() }",
-            "escaped Class.forName string" to "private val bypass = Class.forName(\"com.jay.fxi.ui.viewmodel.Alert\\u0056iewModel\")")) {
-            assertCaught("N1-S S1 inside AlertSection, $label", "S1-section-tokens", s1ViewModel(appended(SECTION, source)))
+            "escaped Class.forName string" to "private val bypass = Class.forName(\"com.jay.fxi.ui.viewmodel.Alert\\u0056iewModel\")",
+            "the VM's MAX_COUNT" to vmMaxCount)) {
+            assertCaught("E5a1 S1 inside AlertSection, $label", "S1-files", s1ViewModel(appended(SECTION, source)))
         }
-        assertCaught("N1-S S1 inside AlertSection, a second MAX_COUNT", "S1-max-count",
-            s1ViewModel(appended(SECTION, "private val max = AlertViewModel.MAX_COUNT")))
+        assertCaught("E5a1 S1 inside AlertSection, an aliased import", "S1-alias", s1ViewModel(appended(SECTION, aliasedImport)))
+        assertCaught("E5a1 S1 inside AlertSection, the VM's MAX_COUNT", "S1-section-max-count", s1ViewModel(appended(SECTION, vmMaxCount)))
+        val bareMaxCount = appended(SECTION, "private val max = MAX_COUNT")
+        assertEquals("mutation premise: a bare MAX_COUNT leaves the VM's file set alone", setOf(VM), files(bareMaxCount, NAME_VM))
+        assertCaught("E5a1 S1 inside AlertSection, a MAX_COUNT that names no VM", "S1-section-max-count", s1ViewModel(bareMaxCount))
         assertCaught("N1-S S1 a call in a new file", "S1-call AlertSection",
             s1Composables(withFile(BYPASS_KT, "@Composable fun Bypass() { AlertSection(currency = c) }")))
         assertCaught("N1-S S1 a function reference", "S1-function-reference AlertAddSheet",
@@ -120,10 +137,24 @@ class AlertN1StructureTest {
             s1Composables(appended(SHEET, "@Composable private fun Preview() { AlertSection() }")))
         assertCaught("N1-S S1 a Java call", "S1-call AlertSection",
             s1Composables(withFile(BYPASS_JAVA, "class Bypass { void go() { AlertSectionKt.AlertSection(null); } }")))
+        // E5a1: the holder's one direct call is AlertSection's only call and its only name outside its own file.
+        for ((label, tree, tag) in listOf(
+            Triple("the holder's call removed", edited(HOLDER, """\bAlertSection(?=\s*[({])""", "ReadOnlySection"), "S1-call AlertSection"),
+            Triple("a second call from the holder",
+                appended(HOLDER, "@Composable private fun Twice() { AlertSection(c, s, {}, {}) }"), "S1-call AlertSection"),
+            Triple("a call from the route", appended(ROUTE, "@Composable private fun Bypass() { AlertSection(c, s, {}, {}) }"), "S1-call AlertSection"),
+            Triple("a function reference from the holder", appended(HOLDER, "private val bypass = ::AlertSection"), "S1-function-reference AlertSection"),
+            Triple("an import that calls nothing", withFile(BYPASS_KT, "import com.jay.fxi.ui.alert.AlertSection\nval s7e5a1Bypass = 1"), "S1-named AlertSection"),
+            Triple("a second declaration in the holder", appended(HOLDER, "@Composable internal fun AlertSection(x: Int) = Unit"),
+                "S1-declaration AlertSection"))) {
+            assertCaught("E5a1 S1 $label", tag, s1Composables(tree))
+        }
         for ((label, path, source) in listOf(
             Triple("Kotlin comments only", BYPASS_KT, "// AlertViewModel AlertSection(\n/** hiltViewModel<AlertViewModel>() AlertAddSheet() */\nval s7n1Control = 1"),
             Triple("Java comments only", BYPASS_JAVA, "/* AlertViewModel */ class Control { // AlertSection(\n}"),
-            Triple("lookalike names", BYPASS_KT, "fun AlertSectionLike() = Unit\nval alertViewModelCount = 0\nval s = \"AlertViewModels\""))) {
+            Triple("lookalike names", BYPASS_KT, "fun AlertSectionLike() = Unit\nval alertViewModelCount = 0\nval s = \"AlertViewModels\""),
+            Triple("the route's own BankAlertSection call and the section's tags", BYPASS_KT,
+                "@Composable fun Bypass() { BankAlertSection(tab = t) }\nval tag = BankAlertSectionTags.ROOT\nval state: BankAlertSectionState? = null"))) {
             val tree = withFile(path, source)
             assertEquals("control(N1-S S1, $label): not a violation", emptyList<String>(), s1ViewModel(tree) + s1Composables(tree))
         }
@@ -289,10 +320,12 @@ class AlertN1StructureTest {
         assertEquals("N1-A structure / S4: gate-before-resolve in production onCreate", emptyList<String>(), aApplication(code))
     }
 
-    @Test fun `S7N1_A02 the registry starts only from startAlertFamilies and the new singletons are reached only through it`() {
+    @Test fun `S7E5A1_N1A02 the registry starts only from startAlertFamilies and the new singletons are reached only through it or for the bank owner the section holder`() {
         assertEquals("premise(N1-A): the registry is named by the Application and FCM", setOf(REGISTRY, APP, FCM),
             files(code, """\bAlertFamilyRefresherRegistry\b"""))
-        assertEquals("N1-A / S4: reach, scope and lazy resolution", emptyList<String>(), aReach(code))
+        assertTrue("premise(E5a1 A-reach): the section holder is scanned and declares its entry point",
+            Regex("""@EntryPoint\b""").containsMatchIn(code.getValue(HOLDER)))
+        assertEquals("N1-A / S4 with E5a1's holder: reach, scope and lazy resolution", emptyList<String>(), aReach(code))
     }
 
     @Test fun `S7N1_A03 the S4 and gate locks catch a start before the gate outside its lambda or dropped from the helper`() {
@@ -318,6 +351,9 @@ class AlertN1StructureTest {
                 "A-reach AlertFamilyRefresherRegistry"),
             Triple("the registry starting itself", appended(REGISTRY, "private val selfStart = run { start() }"), "A-self-start"),
             Triple("the owner injected elsewhere", withFile(BYPASS_KT, "class Screen @Inject constructor(val owner: BankAlertSettingsOwner)"), "A-reach BankAlertSettingsOwner"),
+            Triple("the owner named by the route (E5a1)", appended(ROUTE, "private val bypass: BankAlertSettingsOwner? = null"), "A-reach BankAlertSettingsOwner"),
+            Triple("the owner named by AlertSection (E5a1)", appended(SECTION, "private val bypass: BankAlertSettingsOwner? = null"), "A-reach BankAlertSettingsOwner"),
+            Triple("the holder no longer naming the owner (E5a1)", holderWithoutOwnerName(), "A-reach BankAlertSettingsOwner"),
             Triple("the floor read elsewhere", withFile(BYPASS_KT, "class Crud @Inject constructor(val floor: AlertRateLimitFloor)"), "A-reach AlertRateLimitFloor"),
             Triple("the access reached from Java", withFile(BYPASS_JAVA, "class Bypass { AlertSettingsAccess access; }"), "A-reach AlertSettingsAccess"),
             Triple("the owner resolved at construction", appended(REGISTRY, "private val eager = $ownerProvider.get()"), "A-lazy-owner"),
@@ -463,6 +499,14 @@ class AlertN1StructureTest {
         return start.range.first..end
     }
 
+    /** E5a1 A-reach shrink: every name of the bank owner in the section holder replaced, as if the holder reached it unnamed. */
+    private fun holderWithoutOwnerName(): Map<String, String> {
+        val text = code.getValue(HOLDER)
+        val name = Regex("""\bBankAlertSettingsOwner\b""")
+        assertTrue("mutation premise: the holder names the bank owner", name.containsMatchIn(text))
+        return code + (HOLDER to name.replace(text, "Any"))
+    }
+
     private fun hookReplaced(with: (String) -> String): Map<String, String> {
         val fcm = code.getValue(FCM)
         val range = hookRange(fcm)
@@ -484,8 +528,11 @@ class AlertN1StructureTest {
         val ACCESS = BASE + "data/alerts/AlertSettingsAccess.kt"
         val REGISTRY = BASE + "data/alerts/AlertFamilyRefresherRegistry.kt"
         val OWNER = BASE + "data/alerts/BankAlertSettingsOwner.kt"
-        /** The six new N1 production files (API r1 §2–§6). */
+        /** The six new N1 production files (API r1 §2–§6). E5a1's section holder is deliberately not one of them. */
         val NEW_FILES = listOf(PHASE, POLICY, FLOOR, ACCESS, REGISTRY, OWNER)
+        /** S7 E5a1's section holder (API r2 §2): AlertSection's one caller and, besides the owner and the registry, the owner's one namer. */
+        val HOLDER = BASE + "ui/alert/BankAlertSection.kt"
+        val ROUTE = BASE + "ui/premium/view/PremiumTopicRoute.kt"
         val BYPASS_KT = BASE + "ui/alert/S7n1Bypass.kt"
         val BYPASS_JAVA = BASE + "ui/alert/S7n1Bypass.java"
 
@@ -711,36 +758,36 @@ class AlertN1StructureTest {
 
         // ---- the locks: each returns its violations, empty for an accepted tree ----
 
-        /** S1 (Codex API r1 S1 text): AlertViewModel's file set and AlertSection's exact use. */
+        /** S1 (E5a1, API r2 §5): AlertViewModel is named by its own file only; AlertSection names no MAX_COUNT at all. */
         fun s1ViewModel(code: Map<String, String>): List<String> {
             val v = mutableListOf<String>()
             val named = files(code, NAME_VM)
-            if (named != setOf(VM, SECTION)) v += "S1-files ${named.sorted()}"
+            if (named != setOf(VM)) v += "S1-files ${named.sorted()}"
             val aliases = files(code, """\bimport\s+[\w.`]*\bAlertViewModel\b`?\s+as\b""")
             if (aliases.isNotEmpty()) v += "S1-alias ${aliases.sorted()}"
-            val section = code[SECTION].orEmpty()
-            val plain = count(section, """(?m)^[ \t]*import[ \t]+com\.jay\.fxi\.ui\.viewmodel\.AlertViewModel[ \t]*;?[ \t\r]*$""")
-            if (plain != 1) v += "S1-import $plain"
-            val maxCount = count(section, """\bAlertViewModel\s*\.\s*MAX_COUNT\b""")
-            if (maxCount != 1) v += "S1-max-count $maxCount"
-            val tokens = count(section, NAME_VM)
-            if (tokens != 2) v += "S1-section-tokens $tokens"
+            val maxCount = count(code[SECTION].orEmpty(), """\bMAX_COUNT\b""")
+            if (maxCount != 0) v += "S1-section-max-count $maxCount"
             return v
         }
 
-        /** S1: the two bank Composables are declared in their own files and called, referenced or named nowhere else. */
+        /**
+         * S1 (E5a1, API r2 §5): each bank Composable is declared once in its own file. AlertSection is called directly exactly
+         * once, from the section holder, and named nowhere else; AlertAddSheet is called, referenced or named nowhere else.
+         */
         fun s1Composables(code: Map<String, String>): List<String> {
             val v = mutableListOf<String>()
-            for ((name, home) in listOf("AlertSection" to SECTION, "AlertAddSheet" to SHEET)) {
+            for ((name, home, callers) in listOf(
+                Triple("AlertSection", SECTION, mapOf(HOLDER to 1)),
+                Triple("AlertAddSheet", SHEET, emptyMap<String, Int>()))) {
                 val declared = occurrences(code, """\bfun\s+$name\s*\(""")
                 if (declared != mapOf(home to 1)) v += "S1-declaration $name $declared"
                 val calls = code.mapValues { (_, text) -> count(text, """\b$name\s*[({]""") - count(text, """\bfun\s+$name\s*\(""") }
                     .filterValues { it != 0 }
-                if (calls.isNotEmpty()) v += "S1-call $name $calls"
+                if (calls != callers) v += "S1-call $name $calls"
                 val references = files(code, """::\s*$name\b""")
                 if (references.isNotEmpty()) v += "S1-function-reference $name ${references.sorted()}"
                 val named = occurrences(code, """\b$name\b""")
-                if (named != mapOf(home to 1)) v += "S1-named $name $named"
+                if (named != mapOf(home to 1) + callers) v += "S1-named $name $named"
             }
             return v
         }
@@ -959,11 +1006,11 @@ class AlertN1StructureTest {
             return v
         }
 
-        /** N1-A / S4: who names each new singleton, that each is one scoped injected class, and the lazy bank owner. */
+        /** N1-A / S4: who names each new singleton (E5a1: the bank owner also by the section holder), scope, and the lazy bank owner. */
         fun aReach(code: Map<String, String>): List<String> {
             val v = mutableListOf<String>()
             for ((name, expected) in listOf(
-                "BankAlertSettingsOwner" to setOf(OWNER, REGISTRY),
+                "BankAlertSettingsOwner" to setOf(OWNER, REGISTRY, HOLDER),
                 "AlertSettingsAccess" to setOf(ACCESS, OWNER),
                 "AlertRateLimitFloor" to setOf(FLOOR, OWNER),
                 "AlertFamilyRefresherRegistry" to setOf(REGISTRY, APP, FCM))) {

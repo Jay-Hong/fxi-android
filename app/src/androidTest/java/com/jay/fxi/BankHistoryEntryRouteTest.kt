@@ -20,6 +20,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.UiDevice
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
+import com.jay.fxi.data.alerts.AlertLoadPhase
+import com.jay.fxi.data.alerts.BankAlertSettingsState
+import com.jay.fxi.data.alerts.ManualRefreshState
 import com.jay.fxi.data.auth.AccessOrderSequence
 import com.jay.fxi.data.auth.AuthIdentity
 import com.jay.fxi.data.auth.AuthIdentityFence
@@ -71,6 +74,8 @@ import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.domain.repository.NewsRepository
 import com.jay.fxi.time.SystemAppClock
 import com.jay.fxi.ui.alert.BANK_HISTORY_GENERIC_FAILURE
+import com.jay.fxi.ui.alert.BankAlertSectionSource
+import com.jay.fxi.ui.alert.BankAlertSectionSourceFactory
 import com.jay.fxi.ui.alert.BankHistoryRead
 import com.jay.fxi.ui.alert.BankHistoryTags
 import com.jay.fxi.ui.alert.BankHistoryWiring
@@ -120,6 +125,10 @@ import retrofit2.Retrofit
  * touch through the real window, a covering layer (the graph host's own fullscreen included) and the route's inactivity end the
  * sheet, and nothing a late completion brings comes back; the route's own events and a recreation read and restore nothing. The
  * implementation thread reads but does not edit this file.
+ *
+ * Claude-owned S7 E5a1 contract (R4c/S7/s7e5 API r2 §5, harness row): the bank alert section the route now draws under the
+ * entry reads a no-op source factory here, so no settings owner is looked up through the entry point and nothing is ensured;
+ * the history assertions are unchanged. The implementation thread reads but does not edit this file.
  */
 class BankHistoryEntryRouteTest {
     @get:Rule val rule = createAndroidComposeRule<ComponentActivity>()
@@ -190,6 +199,25 @@ class BankHistoryEntryRouteTest {
         }
     }
 
+    /** S7 E5a1 harness: an idle, empty bank alert section source; it counts what the route asks of it and does nothing. */
+    private class NoOpBankAlertSection : BankAlertSectionSourceFactory {
+        val created = AtomicInteger()
+        val ensures = AtomicInteger()
+        val retries = AtomicInteger()
+        val refreshes = AtomicInteger()
+        override fun create(context: android.content.Context): BankAlertSectionSource {
+            created.incrementAndGet()
+            return object : BankAlertSectionSource {
+                override val settings = MutableStateFlow(BankAlertSettingsState(AlertLoadPhase.Idle, null, null))
+                override val manualRefresh = MutableStateFlow(ManualRefreshState())
+                override fun ensure() { ensures.incrementAndGet() }
+                override fun authoritative() { retries.incrementAndGet() }
+                override fun manual() { refreshes.incrementAndGet() }
+            }
+        }
+    }
+    private val bankAlerts = NoOpBankAlertSection()
+
     private val display = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN))
     private val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.USD))
     private val selects = mutableListOf<FreeTab>()
@@ -219,7 +247,8 @@ class BankHistoryEntryRouteTest {
         val content: @androidx.compose.runtime.Composable () -> Unit = {
             PremiumTopicRoute(consumer = consumer, identity = a1, isActive = active, newsViewModel = vm,
                 userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
-                settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = wiring)
+                settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = wiring,
+                bankAlertSectionSourceFactory = bankAlerts)
         }
         if (restorable) androidx.compose.ui.test.junit4.StateRestorationTester(rule).also { tester = it }.setContent(content)
         else rule.setContent(content)

@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "ba93ab03068ba52855d2e9b2b61943a6642e05b787ff00a0893d59a1b0735e24"
+    const val APPROVED_SHA256 = "64e84b0e3292fb46e0b9cfbcf3e999f7ad4cee153eca2e2ab2b117349c850bf2"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -45,6 +45,9 @@ internal object PostS6ApprovedDelta {
      * - cdf05372…: 05405265 FXiApplication.kt, no KRX at all (comments included).
      * - 4ac58a30…: 05405265 AlertRepository.kt, KRX only in the comment at :49 (source alerts kdoc).
      * - 26aab0a5…: 05405265 AuthenticatedApiService.kt, KRX only in the comment at :348 (graph catalog kdoc).
+     * - d9b0bd9d…: 530b4333 BankAlertSettingsOwner.kt, no KRX at all (comments included).
+     * - 3b9ef40d…: 530b4333 AlertSection.kt, no KRX at all (comments included).
+     * - dcef69a2…: 530b4333 PremiumTopicRoute.kt, no KRX at all (comments included).
      */
     val NO_KRX_REVIEWED = setOf(
         "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
@@ -55,7 +58,10 @@ internal object PostS6ApprovedDelta {
         "14c2521d76160a5f8be640966383ad47f843cf3ef035224e5a28262473058468",
         "cdf05372e6f59532fb9c3894e70e7d20a7756dfa9e8dab5281062fc4ebbffc7a",
         "4ac58a30a16701bdcd86f3232e24c1c652596d511346144ee5bfeeeef51d9026",
-        "26aab0a503e6514df01d2006d2f27a2a5c32a4db70a7f80f72b5eb208ce2c242"
+        "26aab0a503e6514df01d2006d2f27a2a5c32a4db70a7f80f72b5eb208ce2c242",
+        "d9b0bd9dd13013116fb22a55dd8bbc082b9d16e6bb520d0006c0d323c65f1e3c",
+        "3b9ef40d5735de6f7adc70bb293ff5221ac4543396347feba8b6776b32e35b3d",
+        "dcef69a23db7b6c637161303c6bd0557bc6ab5591d4daf1057e5b64270e4f628"
     )
 
     /**
