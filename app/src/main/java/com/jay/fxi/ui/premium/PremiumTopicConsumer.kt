@@ -93,6 +93,22 @@ internal class PremiumTopicConsumer(
     private val pendingWrites = ArrayDeque<PreferenceWrite>()
     private val writeSignal = Channel<Unit>(Channel.CONFLATED)
 
+    private class ScreenListenerRegistration(val listener: (PremiumTopicScreenState) -> Unit)
+    private val screenListeners = mutableListOf<ScreenListenerRegistration>()
+
+    /**
+     * S7-c: on Main, delivers the published screen immediately and after every later publication.
+     * Callbacks must not call back into this consumer or throw. Each registration is independent,
+     * including registrations of the same callback. Its returned function is Main-only and idempotent;
+     * removal during notification prevents any later delivery to that registration.
+     */
+    fun addScreenListener(listener: (PremiumTopicScreenState) -> Unit): () -> Unit {
+        val registration = ScreenListenerRegistration(listener)
+        screenListeners += registration
+        listener(mutableState.value)
+        return { screenListeners.remove(registration) }
+    }
+
     /** The state for the current inputs, read just before drawing. */
     fun currentState(): PremiumTopicScreenState = refresh()
 
@@ -260,6 +276,7 @@ internal class PremiumTopicConsumer(
             lastTarget = null
         }
         mutableState.value = currentScreen
+        for (r in screenListeners.toList()) if (r in screenListeners) r.listener(currentScreen)
         return currentScreen
     }
 

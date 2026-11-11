@@ -576,9 +576,10 @@ class CutoverSharedProvidersContractTest {
     @Test fun CC1_D_theThreeStoresAreProvidedButConsumedNowhere() {
         val all = production()
         assertTrue("premise: the scan reaches the benchmark source set", all.keys.any { it.startsWith("benchmark/") })
+        // S7-c: the bank history's production wiring reads the same shared store through its entry point (one accessor).
         val allowed = mapOf(
             "DeletionAdmissionStore" to setOf(main("data/entitlements/DeletionAdmissionStore.kt"), main("data/graph/GraphProtectedAdmission.kt"), graphModule,
-                main("ui/settings/SettingsViewModel.kt"), main("data/graph/ProcessGraphBuilder.kt")),
+                main("ui/settings/SettingsViewModel.kt"), main("data/graph/ProcessGraphBuilder.kt"), main("ui/alert/BankHistoryEntry.kt")),
             "GraphSelectionStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/graph/GraphSeriesSelectionSession.kt"), graphModule,
                 main("data/graph/ProcessGraphBuilder.kt"), S5_SEEDER),
             "BackupableUserIntentStore" to setOf(main("data/local/BackupableUserIntentStore.kt"), main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt"), graphModule),
@@ -593,7 +594,7 @@ class CutoverSharedProvidersContractTest {
         // parameter or its provider needs, so a further field, parameter, Provider or resolution in that file shows up.
         val counts = mapOf(
             "DeletionAdmissionStore" to mapOf(main("data/entitlements/DeletionAdmissionStore.kt") to 1, main("data/graph/GraphProtectedAdmission.kt") to 2, graphModule to 3,
-                main("ui/settings/SettingsViewModel.kt") to 4, main("data/graph/ProcessGraphBuilder.kt") to 2),
+                main("ui/settings/SettingsViewModel.kt") to 4, main("data/graph/ProcessGraphBuilder.kt") to 2, main("ui/alert/BankHistoryEntry.kt") to 2),
             "GraphSelectionStore" to mapOf(main("data/graph/GraphSeriesSelectionSession.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 2, graphModule to 2,
                 main("data/graph/ProcessGraphBuilder.kt") to 2, S5_SEEDER to 2),
             "BackupableUserIntentStore" to mapOf(main("data/entitlements/purge/GraphSelectionPurgeAdapter.kt") to 2, main("data/local/BackupableUserIntentStore.kt") to 1, graphModule to 2),
@@ -624,8 +625,13 @@ class CutoverSharedProvidersContractTest {
         // The dormant classes that take them are constructed nowhere in production, their own files included, and carry no binding.
         // S4 CUT-CC4b: the process graph builder constructs the admission and the cache ports, once each, inside build().
         // S4 CUT-CC5-2: and, in its holder factory, one selection session per holder.
+        // S7-c: the bank history's production wiring constructs one more admission over the same shared store.
         for (type in listOf("GraphProtectedAdmission", "GraphSeriesSelectionSession", "GraphSelectionPurgeAdapter", "GraphV2CachePorts", "GraphV2PurgeAdapter")) {
-            val expected = if (type in setOf("GraphProtectedAdmission", "GraphV2CachePorts", "GraphSeriesSelectionSession")) mapOf(main("data/graph/ProcessGraphBuilder.kt") to 1) else emptyMap()
+            val expected = when (type) {
+                "GraphProtectedAdmission" -> mapOf(main("data/graph/ProcessGraphBuilder.kt") to 1, main("ui/alert/BankHistoryEntry.kt") to 1)
+                "GraphV2CachePorts", "GraphSeriesSelectionSession" -> mapOf(main("data/graph/ProcessGraphBuilder.kt") to 1)
+                else -> emptyMap()
+            }
             assertEquals("$type is constructed only where CC4b builds the graph", expected,
                 stripped.mapValues { (_, text) -> Regex("""(?<!class )\b$type\s*\(""").findAll(text).count() }.filterValues { it > 0 })
         }
@@ -668,8 +674,9 @@ class CutoverSharedProvidersContractTest {
         val vm = all.getValue(main("ui/settings/SettingsViewModel.kt"))
         assertTrue("CC3-W01 the screen's constructor takes the store",
             Regex("""class SettingsViewModel @Inject internal constructor\([^)]*\bdeletions: DeletionAdmissionStore\s*\)""").containsMatchIn(vm))
+        // S7-c: and the deletion revisions, told after each publication.
         assertTrue("CC3-W01 and hands that store to the stage",
-            vm.contains("private val accountDeletionServerStage = AccountDeletionServerStage(apiService, deletions)"))
+            vm.contains("private val accountDeletionServerStage = AccountDeletionServerStage(apiService, deletions, revisions::published)"))
         assertEquals("CC3-W01 the stage is built only there", mapOf(main("ui/settings/SettingsViewModel.kt") to 1),
             all.mapValues { (_, text) -> Regex("""(?<!class )\bAccountDeletionServerStage\(""").findAll(text).count() }.filterValues { it > 0 })
         // Counted on the raw text too: a string holding "//" would hide the rest of its line from the stripped copy.

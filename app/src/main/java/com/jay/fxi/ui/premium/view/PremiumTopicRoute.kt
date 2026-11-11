@@ -15,11 +15,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.jay.fxi.data.auth.AuthIdentityFence
+import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.UserInfo
+import com.jay.fxi.ui.alert.BankHistoryEntry
+import com.jay.fxi.ui.alert.BankHistoryWiringFactory
+import com.jay.fxi.ui.alert.ProductionBankHistoryWiring
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.PremiumTopicScreenState
 import com.jay.fxi.ui.premium.graph.GraphScreenHost
@@ -58,7 +63,8 @@ internal fun PremiumTopicRoute(
     settingsContent: @Composable (userInfo: UserInfo?, onSignOut: () -> Unit, onDismiss: () -> Unit) -> Unit = { u, s, d ->
         SettingsScreen(userInfo = u, onSignOut = s, onDismiss = d)
     },
-    graphHost: GraphScreenHost? = null
+    graphHost: GraphScreenHost? = null,
+    bankHistoryWiring: BankHistoryWiringFactory = ProductionBankHistoryWiring
 ) {
     LaunchedEffect(consumer) { consumer.start() }
     LaunchedEffect(consumer, identity) { consumer.onIdentityChanged() }
@@ -116,6 +122,7 @@ internal fun PremiumTopicRoute(
                 var detailUrl by remember { mutableStateOf<String?>(null) }
                 val allowed: () -> Boolean = { activeNow && consumer.currentState().ui.owner == owner }
                 val lifecycle = LocalLifecycleOwner.current.lifecycle
+                val context = LocalContext.current
 
                 PremiumTopicScreen(
                     state = screen,
@@ -171,7 +178,18 @@ internal fun PremiumTopicRoute(
                             onDetailOpen = { url -> if (visibleNow && allowed()) detailUrl = url }
                         )
                     },
-                    graphSlot = graphSlot
+                    graphSlot = graphSlot,
+                    belowRates = if (screen.ui.selectedTab in listOf(FreeTab.USD, FreeTab.JPY, FreeTab.EUR) && !settingsOpen && detailUrl == null) {
+                        { tab ->
+                            BankHistoryEntry(
+                                tab = tab,
+                                owner = owner,
+                                shown = { consumer.state.value.ui.let { it.owner to it.selectedTab } },
+                                listen = consumer::addScreenListener,
+                                wiring = { bankHistoryWiring.create(context) { consumer.state.value.ui.owner } }
+                            )
+                        }
+                    } else null
                 )
                 if (settingsOpen) {
                     BackHandler { settingsOpen = false }

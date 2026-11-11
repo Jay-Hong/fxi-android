@@ -91,6 +91,8 @@ internal class TopicRuntimeOwner internal constructor(
 
     private var attempted = false
     private var processConsumer: PremiumTopicConsumer? = null
+    // S7-c F1: published by [ready], as processConsumer is.
+    private var graphStartup: ProcessGraphStartup? = null
     private val graphHostState = MutableStateFlow<GraphScreenHost?>(null)
 
     /**
@@ -100,6 +102,14 @@ internal class TopicRuntimeOwner internal constructor(
     val graphHost: StateFlow<GraphScreenHost?> = graphHostState.asStateFlow()
     // Written last on Main, read by the cache cutover on IO; also publishes the consumer reference.
     @Volatile private var ready = false
+
+    /**
+     * S7-c F1: the access fence the deliverer handed the graph's bridge — that bridge's own published value, read fresh, never
+     * synthesized from issuer state. Null until [start] completed and the graph was installed (its screen host published and its
+     * cache migration resolved), and for good when the graph was given up or retired before that: no decision gives the graph up
+     * after its installation. Any thread.
+     */
+    val currentAccessFence: () -> TopicSessionFence? = { if (ready) graphStartup?.installedFence() else null }
 
     /**
      * On the Main thread, once per process: builds the process graph and its starter, creates the runtime with the graph's
@@ -115,6 +125,7 @@ internal class TopicRuntimeOwner internal constructor(
         if (attempted) return
         attempted = true
         val graph = ProcessGraphStartup(graphBuilder, main, reportGraph, graphHostState, newGraphHost, graphCutover)
+        graphStartup = graph
         graph.assemble()
         val runtime = try {
             factory.create(graph.sink, graph.grants, graph.krxGraphIngress)
@@ -231,10 +242,15 @@ private class ProcessGraphStartup(
     private var starter: ProcessGraphStarter? = null
     private var runtime: TopicRuntime? = null
     private var abandoned = false
+    // S7-c F1: written once on Main when the graph is installed; nothing after that write gives the graph up.
+    @Volatile private var installedAssembly: GraphRuntimeAssembly? = null
 
     val sink: TopicGraphSink get() = assembly?.sink ?: DormantTopicGraphSink
     val grants: TopicGrantSink? get() = assembly?.fences
     val krxGraphIngress: KrxGraphIngress get() = assembly?.krxGraphIngress ?: KrxGraphIngress.NONE
+
+    /** S7-c F1: the installed graph's bridge fence, read fresh; null before installation and for good after a give-up. */
+    fun installedFence(): TopicSessionFence? = installedAssembly?.fences?.current?.invoke()
 
     fun assemble() = guard {
         val built = builder?.build(permit, seed, { starter?.timeEventTarget?.invoke() }, checkNotNull(main.coroutineContext[Job]))
@@ -299,6 +315,7 @@ private class ProcessGraphStartup(
             return
         }
         // Past the publication the graph has succeeded: nothing here is undone as a graph failure.
+        installedAssembly = checkNotNull(assembly)
         cutover?.markReadyAndLaunch()
     }
 

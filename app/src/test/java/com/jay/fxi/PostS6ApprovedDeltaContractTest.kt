@@ -25,6 +25,10 @@ class PostS6ApprovedDeltaContractTest {
     private val repo = base + "data/repository/AlertRepository.kt"
     private val access = base + "data/repository/BankHistoryAccess.kt"
     private val s7b = listOf("BankHistoryRow.kt", "BankHistorySheet.kt", "BankHistoryStateHolder.kt").map { base + "ui/alert/$it" }.toSet()
+    private val owner = base + "data/remote/TopicRuntimeOwner.kt"
+    private val s7cChanged = setOf(owner, base + "ui/premium/view/PremiumTopicRoute.kt", base + "ui/settings/SettingsViewModel.kt",
+        base + "ui/premium/PremiumTopicConsumer.kt", base + "ui/premium/view/PremiumTopicScreen.kt")
+    private val s7cAdded = setOf(base + "data/repository/DeletionAdmissionRevisions.kt", base + "ui/alert/BankHistoryEntry.kt")
     private val inventory = S64bFixtureDelta.inventoryBytes()
     private val s64b = S64bResourceBytes.delta()
     private val raw = PostS6ApprovedDelta.raw()
@@ -52,17 +56,20 @@ class PostS6ApprovedDeltaContractTest {
     @Test fun P01_theApprovedLedgerValidates_andMatchesTheActualSourcesExactly() {
         assertEquals("the pin is the manifest's bytes", PostS6ApprovedDelta.APPROVED_SHA256, PostS6ApprovedDelta.sha(raw))
         val ledger = PostS6ApprovedDelta.ledger()
-        assertEquals("exactly the approved S7-a and S7-b paths", setOf(api, repo, access) + s7b, ledger.final.keys)
-        assertEquals(setOf(api, repo), ledger.changed)
-        assertEquals(setOf(access) + s7b, ledger.added)
-        assertEquals("history hashes", mapOf(api to productBase.getValue(api), repo to productBase.getValue(repo), access to null) + s7b.associateWith { null }, ledger.original)
+        assertEquals("exactly the approved S7-a, S7-b and S7-c paths", setOf(api, repo, access) + s7b + s7cChanged + s7cAdded, ledger.final.keys)
+        assertEquals(setOf(api, repo) + s7cChanged, ledger.changed)
+        assertEquals(setOf(access) + s7b + s7cAdded, ledger.added)
+        assertEquals("history hashes", mapOf(api to productBase.getValue(api), repo to productBase.getValue(repo), access to null) +
+            s7b.associateWith { null } + s7cChanged.associateWith { productBase.getValue(it) } + s7cAdded.associateWith { null }, ledger.original)
         assertEquals(emptyList<String>(), PostS6ApprovedDelta.actualErrors(ledger, PostS6ApprovedDelta.actualSources()))
         val actual = PostS6ApprovedDelta.actualSources().mapValues { PostS6ApprovedDelta.sha(it.value) }
         val projected = PostS6ApprovedDelta.project(actual, ledger)
         assertEquals("changed paths go back to their history", productBase.getValue(api), projected[api])
         assertEquals(productBase.getValue(repo), projected[repo])
-        assertFalse("the approved additions are dropped from the history view", (setOf(access) + s7b).any { it in projected })
-        assertEquals("nothing else moves", actual - (setOf(api, repo, access) + s7b), projected - setOf(api, repo))
+        for (path in s7cChanged) assertEquals("S7-c $path goes back to its history", productBase.getValue(path), projected[path])
+        assertFalse("the approved additions are dropped from the history view", (setOf(access) + s7b + s7cAdded).any { it in projected })
+        assertEquals("nothing else moves", actual - (setOf(api, repo, access) + s7b + s7cChanged + s7cAdded),
+            projected - (setOf(api, repo) + s7cChanged))
     }
 
     @Test fun N01_theApprovalPinBindsTheManifestBytes() {
@@ -294,5 +301,85 @@ class PostS6ApprovedDeltaContractTest {
         } finally {
             root.deleteRecursively()
         }
+    }
+
+    // ---- S7-c F1 core exception (`R4c/S7/s7c_api_proposal.claude.r2.md` §3) ----------------------------------------------
+
+    private val s7c get() = unit(2)
+    private val ownerEntry get() = s7c.getValue("changed").jsonObject.getValue(owner).jsonObject
+    private fun JsonObject.str(key: String) = getValue(key).jsonPrimitive.content
+    private fun s7cWithOwner(entry: JsonObject) =
+        s7c.with("changed", JsonObject(s7c.getValue("changed").jsonObject + (owner to entry)))
+    private fun unitsWithS7c(changedS7c: JsonObject) = withUnits(unit(0), unit(1), changedS7c)
+
+    @Test fun E01_theExactCoreExceptionValidates_andItsKrxLinesAreTheReviewedOnes() {
+        val core = PostS6ApprovedDelta.CORE_EXCEPTIONS.single()
+        assertEquals("premise: the third unit is S7-c", "S7-c", s7c.str("id"))
+        assertEquals(listOf(core.unitId, core.sourceParent, core.approvalRecordSha256, core.path, core.from, core.to),
+            listOf(s7c.str("id"), s7c.str("source_parent"), s7c.str("approval_record_sha256"), owner, ownerEntry.str("from"), ownerEntry.str("to")))
+        assertEquals("the reviewed KRX lines of the history bytes", "234ddcf3be22830a470b42544091ab75bed096e27e420f9dee5158bc1f307260", core.krxLinesSha256)
+        assertEquals("the final bytes keep them", core.krxLinesSha256, PostS6ApprovedDelta.krxLinesSha256(File(owner).readText()))
+        assertEquals(emptyList<String>(), errors(json))
+        for (path in s7cChanged - owner) assertTrue("$path's history is reviewed KRX-free", productBase.getValue(path) in PostS6ApprovedDelta.NO_KRX_REVIEWED)
+        assertFalse("the owner's history is not on the KRX-free list", core.from in PostS6ApprovedDelta.NO_KRX_REVIEWED)
+    }
+
+    @Test fun E02_E03_anotherToOrFromIsForbidden() {
+        val to = errors(unitsWithS7c(s7cWithOwner(changedEntry(ownerEntry.str("from"), someHash))))
+        assertTrue("another to: $to", to.containsAll(listOf("forbidden $owner", "krx-before-unreviewed $owner")))
+        val from = errors(unitsWithS7c(s7cWithOwner(changedEntry(someHash, ownerEntry.str("to")))))
+        assertTrue("another from: $from", from.containsAll(listOf("forbidden $owner", "from $owner", "krx-before-unreviewed $owner")))
+    }
+
+    @Test fun E04_E05_theSameBytesUnderAnotherPathOrAsAnAdditionAreForbidden() {
+        val runtime = base + "data/remote/TopicRuntime.kt"
+        val moved = s7c.with("changed", JsonObject(s7c.getValue("changed").jsonObject - owner + (runtime to ownerEntry)))
+        assertTrue(errors(unitsWithS7c(moved)).contains("forbidden $runtime"))
+        val other = base + "data/remote/TopicRuntimeOwnerCopy.kt"
+        val asAdded = s7c.with("added", JsonObject(s7c.getValue("added").jsonObject + (other to JsonPrimitive(ownerEntry.str("to")))))
+        assertTrue(errors(unitsWithS7c(asAdded)).contains("forbidden $other"))
+        val ownerAdded = s7c.with("changed", JsonObject(s7c.getValue("changed").jsonObject - owner))
+            .with("added", JsonObject(s7c.getValue("added").jsonObject + (owner to JsonPrimitive(ownerEntry.str("to")))))
+        assertTrue("the owner itself as an addition", errors(unitsWithS7c(ownerAdded)).contains("forbidden $owner"))
+    }
+
+    @Test fun E06_theExceptionPathsKrxLinesArePinned() {
+        val ledger = PostS6ApprovedDelta.ledger()
+        val actual = PostS6ApprovedDelta.actualSources()
+        val text = actual.getValue(owner).toString(Charsets.UTF_8)
+        assertTrue("premise", "graph.krxGraphIngress)" in text)
+        val edited = text.replace("graph.krxGraphIngress)", "graph.krxGraphIngress )").toByteArray()
+        assertEquals("a KRX line edited", listOf("actual-hash $owner", "core-krx-lines $owner"),
+            PostS6ApprovedDelta.actualErrors(ledger, actual + (owner to edited)))
+        val more = (text + "\nprivate val krxBypass = 1\n").toByteArray()
+        assertEquals("a KRX line added", listOf("actual-hash $owner", "core-krx-lines $owner"),
+            PostS6ApprovedDelta.actualErrors(ledger, actual + (owner to more)))
+        val plain = (text + "\n// a comment with krx in it\n").toByteArray()
+        assertEquals("any other byte", listOf("actual-hash $owner"), PostS6ApprovedDelta.actualErrors(ledger, actual + (owner to plain)))
+    }
+
+    @Test fun E08_theExceptionBelongsToItsOneUnit() {
+        assertTrue("another id", errors(unitsWithS7c(s7c.with("id", JsonPrimitive("S7-x")))).contains("forbidden $owner"))
+        assertTrue("another parent", errors(unitsWithS7c(s7c.with("source_parent", JsonPrimitive("1".repeat(40))))).contains("forbidden $owner"))
+        assertTrue("another approval", errors(unitsWithS7c(s7c.with("approval_record_sha256", JsonPrimitive(someHash)))).contains("forbidden $owner"))
+        // Moved whole into the unit before: S7-b's provenance, the same path and bytes.
+        val s7b = unit(1).with("changed", JsonObject(mapOf(owner to ownerEntry)))
+        val rest = s7c.with("changed", JsonObject(s7c.getValue("changed").jsonObject - owner))
+        assertTrue("moved to S7-b", errors(withUnits(unit(0), s7b, rest)).contains("forbidden $owner"))
+    }
+
+    @Test fun E09_aLaterUnitCannotContinueTheExceptionAndAnotherPairGetsNoKrxPass() {
+        val next = JsonObject(mapOf("id" to JsonPrimitive("S7-d"), "source_parent" to JsonPrimitive("1".repeat(40)),
+            "approval_record_sha256" to JsonPrimitive(someHash),
+            "changed" to JsonObject(mapOf(owner to changedEntry(ownerEntry.str("to"), someHash))), "added" to JsonObject(emptyMap())))
+        assertTrue(errors(withUnits(unit(0), unit(1), s7c, next)).contains("forbidden $owner"))
+        val actual = PostS6ApprovedDelta.actualSources()
+        val other = PostS6ApprovedDelta.Ledger(mapOf(owner to ownerEntry.str("from")), mapOf(owner to PostS6ApprovedDelta.sha(actual.getValue(owner) + byteArrayOf(10))))
+        assertEquals("another final for the owner is KRX-checked as any path", listOf("krx-reference $owner"),
+            PostS6ApprovedDelta.actualErrors(other, actual + (owner to actual.getValue(owner) + byteArrayOf(10))))
+        // The approved final over another history (only a hand-built ledger reaches it): no KRX pass either.
+        val otherFrom = PostS6ApprovedDelta.Ledger(mapOf(owner to someHash), mapOf(owner to ownerEntry.str("to")))
+        assertEquals("another history for the owner is KRX-checked as any path", listOf("krx-reference $owner"),
+            PostS6ApprovedDelta.actualErrors(otherFrom, actual))
     }
 }

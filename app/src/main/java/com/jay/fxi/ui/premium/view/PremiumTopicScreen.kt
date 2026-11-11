@@ -13,10 +13,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -274,7 +276,7 @@ private fun PremiumTopicOwnedScreen(
                                 PremiumTopicRates(state.ui, scroll, fullscreen = false, onToggleFullscreen = { fullscreen = true },
                                     onOpenEditor = openEditor, graphContent = if (graph != null && graphActions != null) {
                                         { GraphV2Section(graph, graphActions, hostExposed = overlay == PremiumTopicOverlay.NONE) }
-                                    } else null, belowRates = belowRates?.let { content -> { content(tab) } })
+                                    } else null, belowRates = belowRates?.takeIf { overlay == PremiumTopicOverlay.NONE }?.let { content -> { content(tab) } })
                             } else {
                                 Box(Modifier.fillMaxSize())
                             }
@@ -343,7 +345,9 @@ private fun PremiumTopicRates(
                 .then(if (fullscreen) Modifier else Modifier.testTag(PremiumTopicTags.RATES)
                     .pointerInput(Unit) { detectTapGestures(onDoubleTap = { onToggleFullscreen() }) })
                 .then(if (!pageScrolls) Modifier.verticalScroll(scroll) else Modifier)
-                .windowInsetsPadding(WindowInsets.navigationBars)
+                // S7-c: with a slot below, the bottom navigation inset goes after the slot, the end of the scroll flow.
+                .windowInsetsPadding(if (belowRates != null) WindowInsets.navigationBars.only(WindowInsetsSides.Horizontal)
+                    else WindowInsets.navigationBars)
                 .padding(horizontal = metrics.horizontalPadding, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(metrics.rowSpacing)
         ) {
@@ -369,6 +373,8 @@ private fun PremiumTopicRates(
                     style = MaterialTheme.typography.bodyMedium)
             }
         }
-        belowRates?.let { content -> Box(Modifier.fillMaxWidth().testTag(PremiumTopicTags.BELOW_RATES)) { content() } }
+        belowRates?.let { content ->
+            Box(Modifier.fillMaxWidth().testTag(PremiumTopicTags.BELOW_RATES).windowInsetsPadding(WindowInsets.navigationBars)) { content() }
+        }
     }
 }

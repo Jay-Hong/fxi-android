@@ -35,6 +35,37 @@
         "src/main/java/com/jay/fxi/ui/alert/BankHistorySheet.kt": "5391a4a07e138dcd2a44472d3124355e2539bc84f41d77523f6c4bd5b94564c1",
         "src/main/java/com/jay/fxi/ui/alert/BankHistoryStateHolder.kt": "3f90dae8e5aa8751ae3114760a0aeee4a70fafa1ac87220815a1d2e75da183ae"
       }
+    },
+    {
+      "id": "S7-c",
+      "source_parent": "05382fa9980a43009c237af464a44510f64770fc",
+      "approval_record_sha256": "cc93e4f7c7143dadea05ada082e2bdf494cba353cab7b8b4a4962b7630b2ab88",
+      "changed": {
+        "src/main/java/com/jay/fxi/data/remote/TopicRuntimeOwner.kt": {
+          "from": "a618496be598fc92aa78184e732286f05f61e8bbc510de5a7b4b4dd1c92a7f56",
+          "to": "aef67386a820bc7db734ff786cabb3817a9394108bba468965b0c4c8069777f3"
+        },
+        "src/main/java/com/jay/fxi/ui/premium/view/PremiumTopicRoute.kt": {
+          "from": "a3ac34d86bde39f742760e433bff8782dde92c83969beb64944b417dc5462bd5",
+          "to": "dcef69a23db7b6c637161303c6bd0557bc6ab5591d4daf1057e5b64270e4f628"
+        },
+        "src/main/java/com/jay/fxi/ui/settings/SettingsViewModel.kt": {
+          "from": "159fd2a92bba4a489e45f5ab4e43c8274a47df91e56c9005fc2884c2a4f2aa1d",
+          "to": "45598d09a869ebfa3b36e89dbbefccec78781266fd3c27fed90b9da002e08281"
+        },
+        "src/main/java/com/jay/fxi/ui/premium/PremiumTopicConsumer.kt": {
+          "from": "a3021bcad83f86aff42c9285b6adb47f98bc78be95e8a590c470f934857bc43a",
+          "to": "7fb88070921dc6b8530d39510e8e553b60e30098ddb1404abfa1801c27c1ee16"
+        },
+        "src/main/java/com/jay/fxi/ui/premium/view/PremiumTopicScreen.kt": {
+          "from": "14c2521d76160a5f8be640966383ad47f843cf3ef035224e5a28262473058468",
+          "to": "3d85219d9aae8b60ed1944561f3c4d34f998c6994b1d050f9e32c79c856bda18"
+        }
+      },
+      "added": {
+        "src/main/java/com/jay/fxi/data/repository/DeletionAdmissionRevisions.kt": "b1f04816a7476c073eefc692dd76d5fefe27165bdb46b7f291b49f4f27c91434",
+        "src/main/java/com/jay/fxi/ui/alert/BankHistoryEntry.kt": "6d4034c847d240ea5bf4874f343925794737b77c1f523a2b16113ace76496377"
+      }
     }
   ]
 }

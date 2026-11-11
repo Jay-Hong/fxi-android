@@ -22,6 +22,7 @@ import com.jay.fxi.data.entitlements.DeletionAdmissionStore
 import com.jay.fxi.data.local.CacheService
 import com.jay.fxi.data.remote.AuthenticatedApiClient
 import com.jay.fxi.data.remote.AuthenticatedHttpResponse
+import com.jay.fxi.data.repository.DeletionAdmissionRevisions
 import com.jay.fxi.service.PushNotificationManager
 import com.jay.fxi.util.await
 import com.revenuecat.purchases.Purchases
@@ -56,13 +57,16 @@ internal class AccountDeletionServerStage(
     private val deleteUser: suspend (AuthSnapshot) -> AuthenticatedHttpResponse<Unit>,
     private val requireCurrent: (AuthIdentityFence) -> Unit,
     private val deletions: DeletionAdmissionStore,
-    private val newOperationId: () -> String = { UUID.randomUUID().toString() }
+    private val newOperationId: () -> String = { UUID.randomUUID().toString() },
+    /** Non-suspending, non-throwing notification immediately after each admission publication. */
+    private val onPublished: () -> Unit = {}
 ) {
-    constructor(api: AuthenticatedApiClient, deletions: DeletionAdmissionStore) : this(
+    constructor(api: AuthenticatedApiClient, deletions: DeletionAdmissionStore, onPublished: () -> Unit = {}) : this(
         captureSnapshot = { owner -> api.captureSnapshot(owner) },
         deleteUser = api::deleteUser,
         requireCurrent = api::requireCurrent,
-        deletions = deletions
+        deletions = deletions,
+        onPublished = onPublished
     )
 
     suspend fun <T> execute(
@@ -72,15 +76,20 @@ internal class AccountDeletionServerStage(
         val snapshot = captureSnapshot(owner)
         val operation = newOperationId()
         deletions.begin(owner, operation)
+        onPublished()
         val response = try {
             deleteUser(snapshot)
         } catch (changed: AuthIdentityChangedException) {
             if (changed.statusCode == 204) {
                 deletions.serverDeleted(operation)
+                onPublished()
             }
             throw changed
         }
-        if (response.statusCode == 204) deletions.serverDeleted(operation)
+        if (response.statusCode == 204) {
+            deletions.serverDeleted(operation)
+            onPublished()
+        }
         requireCurrent(owner)
         return apply(response)
     }
@@ -92,9 +101,10 @@ class SettingsViewModel @Inject internal constructor(
     private val apiService: AuthenticatedApiClient,
     private val cacheService: CacheService,
     private val pushNotificationManager: PushNotificationManager,
+    revisions: DeletionAdmissionRevisions,
     deletions: DeletionAdmissionStore
 ) : ViewModel() {
-    private val accountDeletionServerStage = AccountDeletionServerStage(apiService, deletions)
+    private val accountDeletionServerStage = AccountDeletionServerStage(apiService, deletions, revisions::published)
 
     private val _isDeleting = MutableStateFlow(false)
     val isDeleting: StateFlow<Boolean> = _isDeleting.asStateFlow()
