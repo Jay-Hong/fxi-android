@@ -8,6 +8,7 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.jay.fxi.admission.ReleaseAdmission
+import com.jay.fxi.data.alerts.AlertFamilyRefresherRegistry
 import com.jay.fxi.data.entitlements.KrxContestSwitch
 import com.jay.fxi.service.AlertTapCaptureResult
 import com.jay.fxi.service.AlertTapEntry
@@ -33,6 +34,9 @@ class MainActivity : ComponentActivity() {
 
     @Inject
     lateinit var alertEventBusProvider: Provider<AlertEventBus>
+
+    @Inject
+    internal lateinit var alertFamiliesProvider: Provider<AlertFamilyRefresherRegistry>
 
     @Inject
     lateinit var krxContestSwitch: KrxContestSwitch
@@ -124,7 +128,12 @@ class MainActivity : ComponentActivity() {
             ?: intent.getStringExtra(FXiMessagingService.EXTRA_SETTING_ID)
             ?: intent.getStringExtra("setting_id")
 
-        return AlertPushRouting.route(type, settingId)?.event
+        val route = AlertPushRouting.route(type, settingId) ?: return null
+        AlertFamilyRefresherRegistry.deliverTap(
+            route.event, intent.getStringExtra(FXiMessagingService.EXTRA_IS_REPEAT),
+            shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)
+        ) { alertFamiliesProvider.get() }
+        return route.event
     }
 
     private fun clearNotificationExtras(intent: Intent?) {
@@ -134,5 +143,6 @@ class MainActivity : ComponentActivity() {
         // 서버 FCM data payload 키
         intent?.removeExtra("type")
         intent?.removeExtra("setting_id")
+        intent?.removeExtra(FXiMessagingService.EXTRA_IS_REPEAT)
     }
 }

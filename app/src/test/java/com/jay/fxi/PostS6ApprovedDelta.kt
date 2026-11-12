@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "63803e6ecb1314490973240bdf5cf06d008f5254e6cfc6fe93c24a5952cf018f"
+    const val APPROVED_SHA256 = "9b754b764fbb8acd80b1f0a53cacfc83a2cd768e0055c2d35ceb3ca1b28688bc"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -53,6 +53,8 @@ internal object PostS6ApprovedDelta {
      * - 576aa7dd…: 9f30832d BankAlertSettingsOwner.kt, no KRX at all (comments included).
      * - 6daaff32…: 9f30832d AlertSection.kt, no KRX at all (comments included).
      * - 4a93a045…: 9f30832d BankAlertSection.kt, no KRX at all (comments included).
+     * - b437782a…: e06fbb02 AlertFamilyRefresherRegistry.kt, no KRX at all (comments included).
+     * - 59fae3be…: e06fbb02 BankAlertSettingsOwner.kt, no KRX at all (comments included).
      */
     val NO_KRX_REVIEWED = setOf(
         "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
@@ -71,19 +73,26 @@ internal object PostS6ApprovedDelta {
         "07f599cf0e454d5e8ee12490db4b4b4a7486833d7f7a5cba52273afe00b9b0d4",
         "576aa7ddfd66560aada3ab85071c9920517c0ba6938e0c0418a675ff24fec80f",
         "6daaff3217367923e4df4d052cc096c75c09deaebacb4c77d00e0535613068f1",
-        "4a93a04557d9470addb0bff083204bc0433f3b433c893e7ca60b5c911eebc4ec"
+        "4a93a04557d9470addb0bff083204bc0433f3b433c893e7ca60b5c911eebc4ec",
+        "b437782aa4648c50756f2f6d7ffbda1e516d4ecb16dc4845ec172e28de23ed11",
+        "59fae3be294672e42230faf34979fb1a344509702d766d298fe5c9897fec1831"
     )
 
     /**
      * A forbidden core change this ledger may carry, in its one unit only — that unit's id, source parent and approval record —
      * and only from and to these exact bytes. In place of the KRX-free rule its comment-free KRX lines are pinned by
      * [krxLinesSha256] ([krxLinesSha256] of the text). The forbidden scope itself is unchanged.
+     * A path may continue in a later unit only through that later unit's separately pinned CoreException. parse validates every
+     * predecessor; actualErrors uses the last changed entry's from and the final to. Projection still uses the original history hash.
      * - S7-c F1 (`R4c/S7/user_decision_s7c_F1.r1.md` cc93e4f7…): TopicRuntimeOwner.kt.
      * - S7-N1 (`R4c/S7/s7n1/s7n1_scope.confirmed.r1.md` 1ecc6234…, user decision `R4c/S7/user_decision_s7n1.r1.md` E1):
      *   FXiMessagingService.kt, the `sync_alerts` hand-over after the emit.
      * - S7-E5a2 (`R4c/S7/s7e5/s7e5a2_scope.confirmed.r1.md` 16ae2162…, user decision `R4c/S7/user_decision_s7e5next.r1.md` G1):
      *   AuthenticatedTransport.kt, the optional use check of one mutation's send. The file names no KRX, so its pinned KRX lines are
      *   the empty text.
+     * - S7-E5c (`R4c/S7/s7e5/s7e5c_exact_proposal.claude.r3.md` d92df63a…, user decision `R4c/S7/user_decision_s7e5c.r1.md` D1/D2
+     *   with its errata): FXiMessagingService.kt again, its second link from S7-N1's to (the raw setting_id/is_repeat hand-over and
+     *   the app-made notification's is_repeat), and MainActivity.kt, its first link (the OFF parser's deliverTap and is_repeat removal).
      */
     class CoreException(val unitId: String, val sourceParent: String, val approvalRecordSha256: String, val path: String,
         val from: String, val to: String, val krxLinesSha256: String)
@@ -115,6 +124,24 @@ internal object PostS6ApprovedDelta {
             from = "49dc53a37dc341be829965fd4a6123aee5f93d0ac7f678197aa3df0f4542b041",
             to = "9699188899118ce692c3ee583ad69b521d08b240493dc2e41f744e09bb331023",
             krxLinesSha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ),
+        CoreException(
+            unitId = "S7-E5c",
+            sourceParent = "e06fbb0202ce9af0da72d4f52640b233d711c8c5",
+            approvalRecordSha256 = "d92df63aa74097d2342511c0ecdeda141c20fbd973f321b3ede5f5a94c3f017e",
+            path = BASE + "service/FXiMessagingService.kt",
+            from = "9f3ecfc91728b9bc30ad8652b2a0c82d5d53251b565a7babba543a3fcb06b6fe",
+            to = "8f05d0470162f67573e29499f54ce0de6028f9e863dbea1aee36b4a5588d5ee6",
+            krxLinesSha256 = "08e142a551e0e47752a09853de243aa65b727b5863c75171d1cb7157ece13d02"
+        ),
+        CoreException(
+            unitId = "S7-E5c",
+            sourceParent = "e06fbb0202ce9af0da72d4f52640b233d711c8c5",
+            approvalRecordSha256 = "d92df63aa74097d2342511c0ecdeda141c20fbd973f321b3ede5f5a94c3f017e",
+            path = BASE + "MainActivity.kt",
+            from = "29d3e6c4d779b3e3bd8c0d1414547f9228adef74dff6d499410cbe79a1adca82",
+            to = "363279e89b869c63f4c5a7e59dff81db858e5cb00da41ec9fd3d6f00aba3854b",
+            krxLinesSha256 = "e61ab21d19206fde24d0b2a8d74e0e75def7397c1ac1d3be33f8514b07b725aa"
         )
     )
 
@@ -141,9 +168,66 @@ internal object PostS6ApprovedDelta {
     ).map { BASE + it }
 
     /** The ledger folded over the S6 history: each path's original history hash (null when added) and its final approved hash. */
-    class Ledger(val original: Map<String, String?>, val final: Map<String, String>) {
+    class Ledger(
+        val original: Map<String, String?>,
+        val final: Map<String, String>,
+        val lastFrom: Map<String, String?> = original
+    ) {
         val changed: Set<String> get() = original.filterValues { it != null }.keys
         val added: Set<String> get() = original.filterValues { it == null }.keys
+    }
+
+    /**
+     * S7-E5c's O04s exception (design `s7e5c_exact_proposal.claude.r3.md` §3): the approved bytes of exactly the FCM builder,
+     * parser and clear spans, each over its untouched 0302 raw. The resource's bytes are pinned here; changing either is critical.
+     */
+    const val O04S_RESOURCE = "krx/post_s6/o04s_approved.json"
+    const val O04S_APPROVED_SHA256 = "15bab3edfcad9f6ade31b30695fc199f1f632a7fad0aa5bf10f561507e81f806"
+    val O04S_SPANS: Set<String> = setOf("FCM", "parser", "clear")
+
+    class O04sApproval(val frozenSha256: String, val approvedSha256: String)
+
+    fun o04sRaw(): ByteArray {
+        val stream = PostS6ApprovedDelta::class.java.classLoader.getResourceAsStream(O04S_RESOURCE)
+        assertNotNull("precondition(post-S6): $O04S_RESOURCE exists", stream)
+        return stream!!.use { it.readBytes() }
+    }
+
+    /** The approved span list, validated byte for byte against its pin before any use; no list at all on any error. */
+    fun o04sApproved(raw: ByteArray, expectedPin: String? = O04S_APPROVED_SHA256): Pair<List<String>, Map<String, O04sApproval>?> {
+        val out = mutableListOf<String>()
+        if (expectedPin != null && sha(raw) != expectedPin) out += "o04s-pin"
+        val text = raw.toString(Charsets.UTF_8)
+        val duplicates = try { S64bFixtureDelta.RawKeys(text).scan() } catch (invalid: IllegalArgumentException) {
+            return (out + "o04s-raw-json ${invalid.message}") to null
+        }
+        if (duplicates.isNotEmpty()) return (out + duplicates.map { "o04s-duplicate-key $it" }) to null
+        val json = try { Json.parseToJsonElement(text) as? JsonObject } catch (invalid: IllegalArgumentException) { null }
+            ?: return (out + "o04s-raw-json not an object") to null
+        if (json.keys != O04S_SPANS) out += "o04s-spans ${json.keys.sorted()}"
+        val approvals = linkedMapOf<String, O04sApproval>()
+        for ((id, element) in json) {
+            val entry = element as? JsonObject
+            if (entry == null || entry.keys != setOf("unit", "frozen_sha256", "approved_sha256")) { out += "o04s-entry $id"; continue }
+            if (entry.string("unit") != "S7-E5c") out += "o04s-unit $id"
+            val frozen = entry.string("frozen_sha256"); val approved = entry.string("approved_sha256")
+            if (!frozen.matches(HEX64) || !approved.matches(HEX64)) { out += "o04s-hash-form $id"; continue }
+            approvals[id] = O04sApproval(frozen, approved)
+        }
+        return out to approvals.takeIf { out.isEmpty() }
+    }
+
+    /**
+     * O04s's byte rule for one span: its exact frozen raw, unless the approved list names it; then its UTF-8 bytes hash to the
+     * approved value and the frozen raw is the very one the list and the 0302 index both name.
+     */
+    fun o04sSpanErrors(id: String, frozen: ByteArray, indexSha256: String?, actual: String, approvals: Map<String, O04sApproval>): List<String> {
+        val approval = approvals[id]
+            ?: return if (frozen.contentEquals(actual.toByteArray(Charsets.UTF_8))) emptyList() else listOf("o04s-bytes $id")
+        val out = mutableListOf<String>()
+        if (sha(frozen) != approval.frozenSha256 || indexSha256 != approval.frozenSha256) out += "o04s-frozen $id"
+        if (sha(actual.toByteArray(Charsets.UTF_8)) != approval.approvedSha256) out += "o04s-approved $id"
+        return out
     }
 
     fun raw(): ByteArray {
@@ -193,6 +277,7 @@ internal object PostS6ApprovedDelta {
         s64b.getValue("changed").jsonObject.forEach { (path, entry) -> current[path] = entry.jsonObject.getValue("to").jsonPrimitive.content }
         s64b.getValue("added").jsonObject.forEach { (path, hash) -> current[path] = hash.jsonPrimitive.content }
         val original = linkedMapOf<String, String?>()
+        val lastFrom = linkedMapOf<String, String?>()
         val ids = mutableSetOf<String>()
         for ((index, element) in units.withIndex()) {
             val unit = element as? JsonObject ?: run { out += "unit-$index not an object"; null } ?: continue
@@ -220,6 +305,7 @@ internal object PostS6ApprovedDelta {
                 else if (from != before) out += "from $path"
                 if (from !in NO_KRX_REVIEWED && coreException(id, unit, path, e) == null) out += "krx-before-unreviewed $path"
                 if (!original.containsKey(path)) original[path] = before
+                lastFrom[path] = from
                 current[path] = to
             }
             for ((path, hash) in added) {
@@ -227,11 +313,12 @@ internal object PostS6ApprovedDelta {
                 if (!h.matches(HEX64)) { out += "hash-form $path"; continue }
                 if (path in current) out += "added-existing $path"
                 if (!original.containsKey(path)) original[path] = null
+                lastFrom[path] = null
                 current[path] = h
             }
         }
         if (out.isNotEmpty()) return out to null
-        return out to Ledger(original, original.keys.associateWith { current.getValue(it) })
+        return out to Ledger(original, original.keys.associateWith { current.getValue(it) }, lastFrom)
     }
 
     /** Error codes for the actual sources against [ledger]: every approved path present, regular, at its final bytes, KRX-free. */
@@ -245,8 +332,8 @@ internal object PostS6ApprovedDelta {
             if (!Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS) || file.canonicalFile != file.absoluteFile.normalize())
                 out += "alias $path"
             val text = bytes.toString(Charsets.UTF_8)
-            // Only the exception's exact history-to-final pair is pinned by its KRX lines; every other path stays KRX-free.
-            val core = CORE_EXCEPTIONS.firstOrNull { it.path == path && ledger.original[path] == it.from && want == it.to }
+            // parse validates every unit and predecessor; only the last exact pair gets its pinned KRX lines.
+            val core = CORE_EXCEPTIONS.firstOrNull { it.path == path && ledger.lastFrom[path] == it.from && want == it.to }
             if (core != null) {
                 if (krxLinesSha256(text) != core.krxLinesSha256) out += "core-krx-lines $path"
             } else if (KRX.containsMatchIn(codeAndStrings(text))) out += "krx-reference $path"

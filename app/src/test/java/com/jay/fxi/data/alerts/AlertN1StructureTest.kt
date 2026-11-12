@@ -30,8 +30,11 @@ import org.junit.Test
  * - S2: ProcessLifecycleOwner is named by the topic owner and the registry only; the registry adds one observer, in start,
  *   on a lifecycle it reads lazily; no other new file observes a lifecycle.
  * - S3 / N1-P: FCM's one new statement is `deliverPush`, right after its one emit, behind the app-owned gate expression and
- *   after the early ReleaseAdmission return; `deliverPush` resolves the registry only for an exact `sync_alerts` with that
- *   gate open, inside an Exception boundary that only reports; nothing else calls, references or aliases it or
+ *   after the early ReleaseAdmission return, with the raw type, setting_id and is_repeat (S7 E5c); `deliverPush` resolves the
+ *   registry only with that gate open, for an exact `sync_alerts` (onSyncAlerts) or an exact `rate_alert` (onBankPush), inside
+ *   an Exception boundary that only reports. S7 E5c: MainActivity's OFF parser makes the one `deliverTap` call, gated and lazy,
+ *   with the raw is_repeat, and it resolves only for a bank SettingTriggered or a RefreshNeeded; `onBankPush` is the adapter's
+ *   default, the registry's main hand-over and the bank owner's override. Nothing else calls, references or aliases these or
  *   `onSyncAlerts`; the default loggers write a fixed message, never the exception or a payload.
  * - S4 / N1-A: the registry starts only from FXiApplication's `startAlertFamilies`, which onCreate passes past its admission
  *   gate and the start helper runs once between the rate migration and the purge; the new singletons are reached only
@@ -218,33 +221,41 @@ class AlertN1StructureTest {
         assertEquals("N1-S S3: the call and declaration inventory", emptyList<String>(), s3Hook(code))
     }
 
-    @Test fun `S7N1_P02 deliverPush resolves only for an exact sync with the gate open inside an Exception boundary`() {
+    @Test fun `S7N1_P02 deliverPush resolves only with the gate open for an exact sync or an exact bank alert inside an Exception boundary`() {
         val registry = code.getValue(REGISTRY)
         val body = bodyRange(registry, "deliverPush")
         assertNotNull("premise(N1-P): deliverPush has a block body", body)
         val flat = squash(registry.substring(body!!))
-        assertTrue("N1-P / N1-A: the real body is an agreed form: $flat", GUARDS.any { it.matches(flat) })
+        assertTrue("N1-P / N1-A / S7 E5c: the real body is an agreed form: $flat", GUARDS.any { it.matches(flat) })
         assertEquals("N1-P: the sync constant is the raw FCM type", 1, count(registry, "\\bconst\\s+val\\s+SYNC_ALERTS\\s*=\\s*\"sync_alerts\""))
-        val boundary = "try {\n    resolve().onSyncAlerts()\n} catch (e: Exception) {\n    reportFailure()\n}"
-        for ((label, form) in listOf(
-            "an early return on either" to "if (type != SYNC_ALERTS || !gateOpen) return\n$boundary",
-            "both inside one branch" to "if (type == SYNC_ALERTS && gateOpen) {\n    try { resolve().onSyncAlerts() } catch (_: Exception) { reportFailure() }\n}",
-            "two early returns" to "if (type != SYNC_ALERTS) return\nif (!gateOpen) return\n$boundary")) {
-            assertEquals("control(N1-P, $label): an agreed form passes", emptyList<String>(), s3Hook(withDeliverBody(form)))
+        assertEquals("S7 E5c: so is the bank alert constant", 1, count(registry, "\\bconst\\s+val\\s+RATE_ALERT\\s*=\\s*\"rate_alert\""))
+        val sync = "SYNC_ALERTS -> resolve().onSyncAlerts()"
+        val bank = "RATE_ALERT -> resolve().onBankPush(settingId?.toIntOrNull(), isRepeat)"
+        val boundary = "catch (e: Exception) {\n    reportFailure()\n}"
+        fun form(branches: String, gate: String = "if (!gateOpen) return", catch: String = boundary) =
+            "$gate\ntry {\n    when (type) {\n        $branches\n    }\n} $catch"
+        for ((label, agreed) in listOf("the agreed order" to form("$sync\n$bank"), "the branches swapped" to form("$bank\n$sync"))) {
+            assertEquals("control(N1-P / S7 E5c, $label): an agreed form passes", emptyList<String>(), s3Hook(withDeliverBody(agreed)))
         }
         for ((label, mutant) in listOf(
-            "either condition is enough" to "if (type != SYNC_ALERTS && !gateOpen) return\n$boundary",
-            "the gate ignored" to "if (type != SYNC_ALERTS) return\n$boundary",
-            "any type" to "if (!gateOpen) return\n$boundary",
-            "not an exact compare" to "if (!type.equals(SYNC_ALERTS, ignoreCase = true) || !gateOpen) return\n$boundary",
-            "resolved before the guard" to "val registry = resolve()\nif (type != SYNC_ALERTS || !gateOpen) return\ntry { registry.onSyncAlerts() } catch (e: Exception) { reportFailure() }",
-            "no boundary" to "if (type != SYNC_ALERTS || !gateOpen) return\nresolve().onSyncAlerts()",
-            "a Throwable boundary" to "if (type != SYNC_ALERTS || !gateOpen) return\ntry { resolve().onSyncAlerts() } catch (e: Throwable) { reportFailure() }",
-            "a silent boundary" to "if (type != SYNC_ALERTS || !gateOpen) return\ntry { resolve().onSyncAlerts() } catch (e: Exception) { }",
-            "only the resolve guarded" to "if (type != SYNC_ALERTS || !gateOpen) return\nval registry = try { resolve() } catch (e: Exception) { reportFailure(); return }\nregistry.onSyncAlerts()")) {
-            assertCaught("N1-P $label", "S3-guard", s3Hook(withDeliverBody(mutant)))
+            "the gate ignored" to form("$sync\n$bank", gate = ""),
+            "the gate inverted" to form("$sync\n$bank", gate = "if (gateOpen) return"),
+            "any other type resolves" to form("$sync\n$bank\nelse -> resolve().onSyncAlerts()"),
+            "a bank alert also syncs" to form("$sync\nRATE_ALERT -> { resolve().onSyncAlerts(); resolve().onBankPush(settingId?.toIntOrNull(), isRepeat) }"),
+            "not an exact compare" to "if (!gateOpen) return\ntry {\n    when (type.lowercase()) {\n        $sync\n        $bank\n    }\n} $boundary",
+            "the raw repeat parsed" to form("$sync\nRATE_ALERT -> resolve().onBankPush(settingId?.toIntOrNull(), isRepeat?.lowercase())"),
+            "the id read loosely" to form("$sync\nRATE_ALERT -> resolve().onBankPush(settingId?.trim()?.toIntOrNull(), isRepeat)"),
+            "resolved before the gate" to "val registry = resolve()\nif (!gateOpen) return\ntry {\n    when (type) {\n        SYNC_ALERTS -> registry.onSyncAlerts()\n" +
+                "        RATE_ALERT -> registry.onBankPush(settingId?.toIntOrNull(), isRepeat)\n    }\n} $boundary",
+            "no boundary" to "if (!gateOpen) return\nwhen (type) {\n    $sync\n    $bank\n}",
+            "a Throwable boundary" to form("$sync\n$bank", catch = "catch (e: Throwable) {\n    reportFailure()\n}"),
+            "a silent boundary" to form("$sync\n$bank", catch = "catch (e: Exception) { }"),
+            "only the resolve guarded" to "if (!gateOpen) return\nval registry = try { resolve() } catch (e: Exception) { reportFailure(); return }\n" +
+                "when (type) {\n    SYNC_ALERTS -> registry.onSyncAlerts()\n    RATE_ALERT -> registry.onBankPush(settingId?.toIntOrNull(), isRepeat)\n}")) {
+            assertCaught("N1-P / S7 E5c $label", "S3-guard", s3Hook(withDeliverBody(mutant)))
         }
         assertCaught("N1-P the sync constant changed", "S3-sync-const", s3Hook(editedLiteral(REGISTRY, "\"sync_alerts\"", "\"sync_alert\"")))
+        assertCaught("S7 E5c the bank alert constant changed", "S3-bank-const", s3Hook(editedLiteral(REGISTRY, "\"rate_alert\"", "\"rate_alerts\"")))
     }
 
     @Test fun `S7N1_S08 the hook locks catch a moved ungated eager extra aliased or declared but not called hook`() {
@@ -257,18 +268,34 @@ class AlertN1StructureTest {
         assertTrue("mutation premise: the emit line precedes the hook", emitLine in 1..range.first)
         val beforeEmit = fcm.removeRange(range).let { it.substring(0, emitLine) + statement + "\n" + it.substring(emitLine) }
         val gate = "shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)"
+        val raw = "message.data[\"setting_id\"], message.data[\"is_repeat\"]"
         for ((label, tree, tag) in listOf(
             Triple("the hook before the emit", code + (FCM to beforeEmit), "P-after-emit"),
-            Triple("a gate that is always open", hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(type, true) { alertFamiliesProvider.get() }" }, "P-gate-expression"),
+            Triple("a gate that is always open", hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(type, $raw, true) { alertFamiliesProvider.get() }" }, "P-gate-expression"),
             Triple("the release admission alone",
-                hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(type, ReleaseAdmission.isOpen) { alertFamiliesProvider.get() }" }, "P-gate-expression"),
+                hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(type, $raw, ReleaseAdmission.isOpen) { alertFamiliesProvider.get() }" }, "P-gate-expression"),
             Triple("the no-data flag ignored",
-                hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(type, shouldStartAppOwnedServices(ReleaseAdmission.isOpen, false)) { alertFamiliesProvider.get() }" },
+                hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(type, $raw, shouldStartAppOwnedServices(ReleaseAdmission.isOpen, false)) { alertFamiliesProvider.get() }" },
                 "P-gate-expression"),
             Triple("the routed event for the raw type",
-                hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(route.event.toString(), $gate) { alertFamiliesProvider.get() }" }, "P-gate-expression"),
+                hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(route.event.toString(), $raw, $gate) { alertFamiliesProvider.get() }" }, "P-gate-expression"),
             Triple("an eager resolve",
-                hookReplaced { "val eager = alertFamiliesProvider.get()\nAlertFamilyRefresherRegistry.deliverPush(type, $gate) { eager }" }, "P-gate-expression"),
+                hookReplaced { "val eager = alertFamiliesProvider.get()\nAlertFamilyRefresherRegistry.deliverPush(type, $raw, $gate) { eager }" }, "P-gate-expression"),
+            Triple("another setting key (S7 E5c)",
+                hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(type, message.data[\"settingId\"], message.data[\"is_repeat\"], $gate) { alertFamiliesProvider.get() }" },
+                "P-gate-expression"),
+            Triple("a parsed repeat (S7 E5c)",
+                hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(type, message.data[\"setting_id\"], message.data[\"is_repeat\"]?.lowercase(), $gate) { alertFamiliesProvider.get() }" },
+                "P-gate-expression"),
+            Triple("the two raw values swapped (S7 E5c)",
+                hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(type, message.data[\"is_repeat\"], message.data[\"setting_id\"], $gate) { alertFamiliesProvider.get() }" },
+                "P-gate-expression"),
+            Triple("no repeat (S7 E5c)",
+                hookReplaced { "AlertFamilyRefresherRegistry.deliverPush(type, message.data[\"setting_id\"], null, $gate) { alertFamiliesProvider.get() }" }, "P-gate-expression"),
+            Triple("the notification's repeat dropped (S7 E5c)",
+                editedLiteral(FCM, "message.data[EXTRA_IS_REPEAT]?.let { putExtra(EXTRA_IS_REPEAT, it) }", ""), "P-repeat-extra"),
+            Triple("the notification's repeat parsed (S7 E5c)",
+                editedLiteral(FCM, "putExtra(EXTRA_IS_REPEAT, it)", "putExtra(EXTRA_IS_REPEAT, it.toBoolean())"), "P-repeat-extra"),
             Triple("a second hook", hookReplaced { "$it\n$it" }, "S3-deliver-fcm"),
             Triple("a declaration in place of the call", hookReplaced { "fun deliverPush(type: String) = Unit" }, "S3-deliver-fcm"),
             Triple("a direct sync from FCM", hookReplaced { "$it\nalertFamiliesProvider.get().onSyncAlerts()" }, "S3-sync-files"),
@@ -293,8 +320,10 @@ class AlertN1StructureTest {
 
     @Test fun `S7N1_S09 the default loggers write a fixed message without the exception or a payload`() {
         val registry = code.getValue(REGISTRY)
-        assertEquals("premise(N1-S S3): two reportFailure defaults, the registry's and deliverPush's", 2, REPORT_DEFAULT.findAll(registry).count())
-        assertTrue("premise(N1-S S3): the registry catches at least the supplier, the adapter and the delivery", CATCH.findAll(registry).count() >= 3)
+        assertEquals("premise(N1-S S3 / S7 E5c): three reportFailure defaults, the registry's, deliverPush's and deliverTap's", 3,
+            REPORT_DEFAULT.findAll(registry).count())
+        assertTrue("premise(N1-S S3 / S7 E5c): the registry catches at least the supplier, the adapter and the two deliveries",
+            CATCH.findAll(registry).count() >= 4)
         assertEquals("N1-S S3 default loggers and catch boundaries", emptyList<String>(), s3Loggers(code))
         for ((label, tree, tag) in listOf(
             Triple("a payload in the delivery message",
@@ -306,10 +335,119 @@ class AlertN1StructureTest {
             Triple("a catch that logs the exception",
                 edited(REGISTRY, """(catch\s*\(\s*(\w+)\s*:\s*Exception\s*\)\s*\{)\s*reportFailure\(\)""", "\$1 Log.w(TAG, \"failed\", \$2)"), "S3-catch"),
             Triple("a Throwable catch", edited(REGISTRY, """catch\s*\(\s*(\w+)\s*:\s*Exception\s*\)""", "catch (\$1: Throwable)"), "S3-catch"),
-            Triple("a third logger in the registry", appended(REGISTRY, "private fun note() { Log.w(TAG, \"note\") }"), "S3-logger-count"),
+            Triple("a fourth logger in the registry", appended(REGISTRY, "private fun note() { Log.w(TAG, \"note\") }"), "S3-logger-count"),
+            Triple("a payload in the tap message (S7 E5c)",
+                editedLiteral(REGISTRY, "\"$TAP_MESSAGE\"", "\"$TAP_MESSAGE \" + event"), "S3-logger-form"),
+            Triple("another tap message (S7 E5c)", editedLiteral(REGISTRY, "\"$TAP_MESSAGE\"", "\"tap failed\""), "S3-logger-message"),
             Triple("a payload logged by another new file",
                 appended(OWNER, "private fun note(e: Exception) { Log.w(TAG, \"failed\", e) }"), "S3-logger-payload"))) {
             assertCaught("N1-S S3 $label", tag, s3Loggers(tree))
+        }
+    }
+
+    @Test fun `S7E5C_S01 the OFF parser makes the one deliverTap call, gated and lazy, with the raw is_repeat between the route and the event`() {
+        fun both(tree: Map<String, String>) = tActivity(tree) + s3Hook(tree)
+        assertEquals("S7 E5c: the activity's tap hook and the inventory", emptyList<String>(), both(code))
+        val activity = code.getValue(ACTIVITY)
+        val gate = "shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)"
+        val repeat = "intent.getStringExtra(FXiMessagingService.EXTRA_IS_REPEAT)"
+        val hook = Regex("""AlertFamilyRefresherRegistry\s*\.\s*deliverTap\s*\([^{}]*\)\s*\{\s*alertFamiliesProvider\s*\.\s*get\s*\(\s*\)\s*\}""")
+        assertEquals("mutation premise: the tap hook is found once", 1, hook.findAll(activity).count())
+        fun tapReplaced(with: (String) -> String): Map<String, String> {
+            val match = checkNotNull(hook.find(activity))
+            return code + (ACTIVITY to activity.replaceRange(match.range, with(match.value)))
+        }
+        val routeLine = "val route = AlertPushRouting.route(type, settingId) ?: return null"
+        val routeAfter = editedBody(ACTIVITY, "parseAlertEventFromIntent") { body ->
+            val at = body.indexOf(routeLine)
+            val without = body.removeRange(at, at + routeLine.length)
+            val end = without.indexOf("return route.event")
+            without.substring(0, end) + routeLine + "\n" + without.substring(end)
+        }
+        for ((label, tree, tag) in listOf(
+            Triple("a gate that is always open", tapReplaced { "AlertFamilyRefresherRegistry.deliverTap(route.event, $repeat, true) { alertFamiliesProvider.get() }" }, "T-hook"),
+            Triple("the release admission alone",
+                tapReplaced { "AlertFamilyRefresherRegistry.deliverTap(route.event, $repeat, ReleaseAdmission.isOpen) { alertFamiliesProvider.get() }" }, "T-hook"),
+            Triple("a raw key literal", tapReplaced { "AlertFamilyRefresherRegistry.deliverTap(route.event, intent.getStringExtra(\"is_repeat\"), $gate) { alertFamiliesProvider.get() }" },
+                "T-key"),
+            Triple("the repeat parsed", tapReplaced { "AlertFamilyRefresherRegistry.deliverTap(route.event, $repeat?.lowercase(), $gate) { alertFamiliesProvider.get() }" }, "T-hook"),
+            Triple("another event", tapReplaced { "AlertFamilyRefresherRegistry.deliverTap(AlertEvent.RefreshNeeded, $repeat, $gate) { alertFamiliesProvider.get() }" }, "T-hook"),
+            Triple("an eager resolve", tapReplaced { "val eager = alertFamiliesProvider.get()\nAlertFamilyRefresherRegistry.deliverTap(route.event, $repeat, $gate) { eager }" },
+                "T-hook"),
+            Triple("a second tap", tapReplaced { "${it}\n${it}" }, "S3-tap-activity"),
+            Triple("the route read after the tap", routeAfter, "T-order"),
+            Triple("a tap in the cold path",
+                editedBody(ACTIVITY, "parsePendingAlertEvent") { "\nAlertFamilyRefresherRegistry.deliverTap(AlertEvent.RefreshNeeded, null, true) { alertFamiliesProvider.get() }\n$it" },
+                "T-elsewhere parsePendingAlertEvent"),
+            Triple("a tap in the warm path",
+                editedBody(ACTIVITY, "handleNotificationIntent") { "\nAlertFamilyRefresherRegistry.deliverTap(AlertEvent.RefreshNeeded, null, true) { alertFamiliesProvider.get() }\n$it" },
+                "T-elsewhere handleNotificationIntent"),
+            Triple("the field resolved at injection",
+                edited(ACTIVITY, """lateinit\s+var\s+alertFamiliesProvider\s*:\s*Provider\s*<\s*AlertFamilyRefresherRegistry\s*>""",
+                    "lateinit var alertFamiliesProvider: AlertFamilyRefresherRegistry"), "T-provider"),
+            Triple("the removal dropped", editedLiteral(ACTIVITY, "intent?.removeExtra(FXiMessagingService.EXTRA_IS_REPEAT)", ""), "T-clear"),
+            Triple("a direct bank push from the activity", appended(ACTIVITY, "private fun bypass() = alertFamiliesProvider.get().onBankPush(1, \"false\")"), "S3-bank-files"),
+            Triple("an alias import",
+                edited(ACTIVITY, """\bimport\s+com\.jay\.fxi\.data\.alerts\.AlertFamilyRefresherRegistry\b""", "import com.jay.fxi.data.alerts.AlertFamilyRefresherRegistry as Families"),
+                "S3-alias"),
+            Triple("a function reference elsewhere", withFile(BYPASS_KT, "val bypass = AlertFamilyRefresherRegistry::deliverTap"), "S3-function-reference"),
+            Triple("a deliverTap call elsewhere",
+                withFile(BYPASS_KT, "fun bypass() = AlertFamilyRefresherRegistry.deliverTap(AlertEvent.RefreshNeeded, null, true) { error(\"x\") }"), "S3-tap-files"),
+            Triple("a second deliverTap declaration", appended(REGISTRY, "fun deliverTap() = Unit"), "S3-tap-declaration"))) {
+            assertCaught("S7 E5c $label", tag, both(tree))
+        }
+    }
+
+    @Test fun `S7E5C_S02 deliverTap resolves only with the gate open for a bank setting or an all-family refresh inside an Exception boundary`() {
+        val registry = code.getValue(REGISTRY)
+        val body = bodyRange(registry, "deliverTap")
+        assertNotNull("premise(S7 E5c): deliverTap has a block body", body)
+        val flat = squash(registry.substring(body!!))
+        assertTrue("S7 E5c: the real body is an agreed form: $flat", TAP_GUARDS.any { it.matches(flat) })
+        val setting = "event is AlertEvent.SettingTriggered && event.family == AlertFamily.BANK -> resolve().onBankPush(event.settingId, isRepeat)"
+        val refresh = "event == AlertEvent.RefreshNeeded -> resolve().onBankPush(null, null)"
+        val boundary = "catch (e: Exception) {\n    reportFailure()\n}"
+        fun form(branches: String, gate: String = "if (!gateOpen) return", catch: String = boundary) =
+            "$gate\ntry {\n    when {\n        $branches\n    }\n} $catch"
+        for ((label, agreed) in listOf("the agreed order" to form("$setting\n$refresh"), "the branches swapped" to form("$refresh\n$setting"))) {
+            assertEquals("control(S7 E5c, $label): an agreed form passes", emptyList<String>(), s3Hook(withTapBody(agreed)))
+        }
+        for ((label, mutant) in listOf(
+            "the gate ignored" to form("$setting\n$refresh", gate = ""),
+            "the gate inverted" to form("$setting\n$refresh", gate = "if (gateOpen) return"),
+            "any family's setting" to form("event is AlertEvent.SettingTriggered -> resolve().onBankPush(event.settingId, isRepeat)\n$refresh"),
+            "a refresh passing the repeat" to form("$setting\nevent == AlertEvent.RefreshNeeded -> resolve().onBankPush(null, isRepeat)"),
+            "a family refresh too" to form("$setting\n$refresh\nevent is AlertEvent.FamilyRefreshNeeded -> resolve().onBankPush(null, null)"),
+            "anything else resolves" to form("$setting\n$refresh\nelse -> resolve().onBankPush(null, null)"),
+            "the repeat parsed" to form(
+                "event is AlertEvent.SettingTriggered && event.family == AlertFamily.BANK -> resolve().onBankPush(event.settingId, isRepeat?.lowercase())\n$refresh"),
+            "resolved before the gate" to "val registry = resolve()\nif (!gateOpen) return\ntry {\n    when {\n" +
+                "        event is AlertEvent.SettingTriggered && event.family == AlertFamily.BANK -> registry.onBankPush(event.settingId, isRepeat)\n" +
+                "        event == AlertEvent.RefreshNeeded -> registry.onBankPush(null, null)\n    }\n} $boundary",
+            "no boundary" to "if (!gateOpen) return\nwhen {\n    $setting\n    $refresh\n}",
+            "a Throwable boundary" to form("$setting\n$refresh", catch = "catch (e: Throwable) {\n    reportFailure()\n}"),
+            "a silent boundary" to form("$setting\n$refresh", catch = "catch (e: Exception) { }"))) {
+            assertCaught("S7 E5c $label", "S3-tap-guard", s3Hook(withTapBody(mutant)))
+        }
+    }
+
+    @Test fun `S7E5C_S03 onBankPush is the adapter default, the registry's main hand-over and the bank owner's override only`() {
+        assertEquals("premise: the real tree is clean", emptyList<String>(), s3Hook(code))
+        for ((label, tree, tag) in listOf(
+            Triple("the registry calling the owner directly",
+                appended(REGISTRY, "private fun bypass(o: BankAlertSettingsOwner) { o.onBankPush(1, \"false\") }"), "S3-bank-tokens"),
+            Triple("the hand-over off main",
+                edited(REGISTRY, """postToMain\s*\{\s*dispatch\s*\{\s*it\s*\.\s*onBankPush\s*\(\s*id\s*,\s*isRepeat\s*\)\s*\}\s*\}""", "dispatch { it.onBankPush(id, isRepeat) }"),
+                "S3-bank-dispatch"),
+            Triple("the hand-over parsing the repeat",
+                edited(REGISTRY, """it\s*\.\s*onBankPush\s*\(\s*id\s*,\s*isRepeat\s*\)""", "it.onBankPush(id, isRepeat?.lowercase())"), "S3-bank-dispatch"),
+            Triple("the owner calling itself", appended(OWNER, "private fun bypass() = onBankPush(1, \"false\")"), "S3-bank-owner"),
+            Triple("the section holder reaching it",
+                appended(HOLDER, "private fun bypass(o: BankAlertSettingsOwner) = o.onBankPush(1, \"false\")"), "S3-bank-files"),
+            Triple("a Java caller",
+                withFile(BYPASS_JAVA, "class Bypass { void go(AlertFamilyRefresherRegistry r) { r.onBankPush(1, \"false\"); } }"), "S3-bank-files"),
+            Triple("a reference", appended(REGISTRY, "private val bypass = ::onBankPush"), "S3-function-reference"))) {
+            assertCaught("S7 E5c $label", tag, s3Hook(tree))
         }
     }
 
@@ -321,7 +459,7 @@ class AlertN1StructureTest {
     }
 
     @Test fun `S7E5A1_N1A02 the registry starts only from startAlertFamilies and the new singletons are reached only through it or for the bank owner the section holder`() {
-        assertEquals("premise(N1-A): the registry is named by the Application and FCM", setOf(REGISTRY, APP, FCM),
+        assertEquals("premise(N1-A / S7 E5c): the registry is named by the Application, FCM and the OFF tap parser", setOf(REGISTRY, APP, FCM, ACTIVITY),
             files(code, """\bAlertFamilyRefresherRegistry\b"""))
         assertTrue("premise(E5a1 A-reach): the section holder is scanned and declares its entry point",
             Regex("""@EntryPoint\b""").containsMatchIn(code.getValue(HOLDER)))
@@ -496,6 +634,13 @@ class AlertN1StructureTest {
         return code + (REGISTRY to text.replaceRange(range!!, "\n$body\n"))
     }
 
+    private fun withTapBody(body: String): Map<String, String> {
+        val text = code.getValue(REGISTRY)
+        val range = bodyRange(text, "deliverTap")
+        assertNotNull("mutation premise: deliverTap has a block body", range)
+        return code + (REGISTRY to text.replaceRange(range!!, "\n$body\n"))
+    }
+
     /** The FCM hook statement: the deliverPush call with its trailing lambda. */
     private fun hookRange(text: String): IntRange {
         val start = HOOK_START.find(text)
@@ -530,6 +675,8 @@ class AlertN1StructureTest {
         val TOPIC_OWNER = BASE + "data/remote/TopicRuntimeOwner.kt"
         val APP = BASE + "FXiApplication.kt"
         val FCM = BASE + "service/FXiMessagingService.kt"
+        /** S7 E5c: the OFF tap parser's file, the registry's one new namer. */
+        val ACTIVITY = BASE + "MainActivity.kt"
         val KRX_SAMPLE = BASE + "data/graph/KrxGraphFence.kt"
         val PHASE = BASE + "data/alerts/AlertLoadPhase.kt"
         val POLICY = BASE + "data/alerts/AlertRetryPolicy.kt"
@@ -545,9 +692,10 @@ class AlertN1StructureTest {
         val BYPASS_KT = BASE + "ui/alert/S7n1Bypass.kt"
         val BYPASS_JAVA = BASE + "ui/alert/S7n1Bypass.java"
 
-        /** The agreed default log messages (API r3 §5). */
+        /** The default log messages: the registry's (N1 API r3 §5) and S7 E5c's push and tap ones (agreed in its implementation request). */
         const val REGISTRY_MESSAGE = "alert family adapter dispatch failed"
-        const val DELIVERY_MESSAGE = "alert family sync delivery failed"
+        const val DELIVERY_MESSAGE = "alert family push delivery failed"
+        const val TAP_MESSAGE = "alert family tap delivery failed"
 
         const val NAME_VM = """\bAlertViewModel\b"""
         val KRX = Regex("(?i)krx")
@@ -556,8 +704,10 @@ class AlertN1StructureTest {
         val LAMBDA = Regex("""\{\s*alertFamilies\s*\.\s*get\s*\(\s*\)\s*\.\s*start\s*\(\s*\)\s*\}""")
         val STEP = Regex("""\bstartAlertFamilies\s*\(\s*\)""")
         val HOOK_START = Regex("""\bAlertFamilyRefresherRegistry\s*\.\s*deliverPush\s*\(""")
-        /** The FCM statement, squashed: the raw type and exactly the app-owned gate, with a lazy resolve (API r3 §6). */
-        val HOOK = Regex("""AlertFamilyRefresherRegistry\.deliverPush\((?:type = )?type, (?:gateOpen = )?shouldStartAppOwnedServices\((?:releaseAdmissionOpen = )?ReleaseAdmission\.isOpen, (?:benchmarkNoData = )?BuildConfig\.BENCHMARK_NO_DATA_MODE\)\) \{ alertFamiliesProvider\.get\(\) \}""")
+        /** The FCM statement, squashed: the raw type, setting_id and is_repeat and exactly the app-owned gate, with a lazy resolve. */
+        val HOOK = Regex("""AlertFamilyRefresherRegistry\.deliverPush\((?:type = )?type, (?:settingId = )?message\.data\["setting_id"], (?:isRepeat = )?message\.data\["is_repeat"], (?:gateOpen = )?shouldStartAppOwnedServices\((?:releaseAdmissionOpen = )?ReleaseAdmission\.isOpen, (?:benchmarkNoData = )?BuildConfig\.BENCHMARK_NO_DATA_MODE\)\) \{ alertFamiliesProvider\.get\(\) \}""")
+        /** S7 E5c: the parser's statement, squashed: the routed event, the raw is_repeat by the FCM constant, the same gate, lazy. */
+        val TAP_HOOK = Regex("""AlertFamilyRefresherRegistry\.deliverTap\((?:event = )?route\.event, (?:isRepeat = )?intent\.getStringExtra\(FXiMessagingService\.EXTRA_IS_REPEAT\), (?:gateOpen = )?shouldStartAppOwnedServices\((?:releaseAdmissionOpen = )?ReleaseAdmission\.isOpen, (?:benchmarkNoData = )?BuildConfig\.BENCHMARK_NO_DATA_MODE\)\) \{ alertFamiliesProvider\.get\(\) \}""")
         val REPORT_DEFAULT = Regex("""\breportFailure\s*:\s*\(\s*\)\s*->\s*Unit\s*=\s*\{""")
         val LOG_DEFAULT = Regex("""\{ Log\.w\(TAG, "([^"$\\]*)"\)(?: Unit)? \}""")
         val LOG_CALL = Regex("""\bLog\s*\.\s*\w+\s*\(""")
@@ -567,17 +717,17 @@ class AlertN1StructureTest {
         val CALL = Regex("""\b(\w+)\s*\(""")
         val KEYWORDS = setOf("if", "when", "while", "for", "catch", "return", "try")
 
-        /** deliverPush's body, squashed: an exact raw sync and the open gate, then resolve and sync inside the boundary. */
-        const val TRY = """try \{ resolve\(\)\.onSyncAlerts\(\) \} catch \(\w+: Exception\) \{ reportFailure\(\) \}"""
-        const val NOT_SYNC = """(?:type != SYNC_ALERTS|SYNC_ALERTS != type)"""
-        const val IS_SYNC = """(?:type == SYNC_ALERTS|SYNC_ALERTS == type)"""
-        val GUARDS = listOf(
-            """if \($NOT_SYNC \|\| !gateOpen\) return $TRY""",
-            """if \(!gateOpen \|\| $NOT_SYNC\) return $TRY""",
-            """if \($NOT_SYNC\) return if \(!gateOpen\) return $TRY""",
-            """if \(!gateOpen\) return if \($NOT_SYNC\) return $TRY""",
-            """if \($IS_SYNC && gateOpen\) \{ $TRY \}""",
-            """if \(gateOpen && $IS_SYNC\) \{ $TRY \}"""
+        /** deliverPush's body, squashed (S7 E5c): the open gate first, then in one boundary an exact sync or an exact bank alert. */
+        const val SYNC_BRANCH = """SYNC_ALERTS -> resolve\(\)\.onSyncAlerts\(\)"""
+        const val BANK_BRANCH = """RATE_ALERT -> resolve\(\)\.onBankPush\(settingId\?\.toIntOrNull\(\), isRepeat\)"""
+        const val TRY = """try \{ when \(type\) \{ (?:$SYNC_BRANCH $BANK_BRANCH|$BANK_BRANCH $SYNC_BRANCH) \} \} catch \(\w+: Exception\) \{ reportFailure\(\) \}"""
+        val GUARDS = listOf("""if \(!gateOpen\) return $TRY""").map(::Regex)
+
+        /** deliverTap's body, squashed (S7 E5c): the open gate first, then in one boundary a bank setting or an all-family refresh. */
+        const val TAP_SETTING = """event is AlertEvent\.SettingTriggered && event\.family == AlertFamily\.BANK -> resolve\(\)\.onBankPush\(event\.settingId, isRepeat\)"""
+        const val TAP_REFRESH = """event == AlertEvent\.RefreshNeeded -> resolve\(\)\.onBankPush\(null, null\)"""
+        val TAP_GUARDS = listOf(
+            """if \(!gateOpen\) return try \{ when \{ (?:$TAP_SETTING $TAP_REFRESH|$TAP_REFRESH $TAP_SETTING) \} \} catch \(\w+: Exception\) \{ reportFailure\(\) \}"""
         ).map(::Regex)
 
         val ENTRY_APIS = listOf(
@@ -824,25 +974,28 @@ class AlertN1StructureTest {
             return v
         }
 
-        /** S3 (API r3 §7 text): deliverPush and onSyncAlerts, their declarations, calls, references and aliases. */
+        /** S3 (API r3 §7 text; S7 E5c): deliverPush, deliverTap, onSyncAlerts and onBankPush: declarations, calls, references, aliases. */
         fun s3Hook(code: Map<String, String>): List<String> {
             val v = mutableListOf<String>()
             val registry = code[REGISTRY].orEmpty()
             val fcm = code[FCM].orEmpty()
+            val activity = code[ACTIVITY].orEmpty()
+            val owner = code[OWNER].orEmpty()
             val call = """\bAlertFamilyRefresherRegistry\s*\.\s*deliverPush\s*\("""
             val deliverFiles = files(code, """\bdeliverPush\b""")
             if (deliverFiles != setOf(FCM, REGISTRY)) v += "S3-deliver-files ${deliverFiles.sorted()}"
             if (count(registry, """\bdeliverPush\b""") != 1 || count(registry, """\bfun\s+deliverPush\s*\(""") != 1) v += "S3-deliver-declaration"
             val companion = Regex("""\bcompanion\s+object\b[^{]*\{""").find(registry)
             val companionClose = companion?.let { closing(registry, it.range.last) }
-            val declared = Regex("""\bfun\s+deliverPush\s*\(""").find(registry)
-            if (companion == null || companionClose == null || declared == null || declared.range.first !in companion.range.last..companionClose) {
-                v += "S3-deliver-companion"
+            fun inCompanion(name: String): Boolean {
+                val declared = Regex("""\bfun\s+$name\s*\(""").find(registry)
+                return companion != null && companionClose != null && declared != null && declared.range.first in companion.range.last..companionClose
             }
+            if (!inCompanion("deliverPush")) v += "S3-deliver-companion"
             if (count(fcm, """\bdeliverPush\b""") != 1 || count(fcm, call) != 1) v += "S3-deliver-fcm"
             val receive = bodyRange(fcm, "onMessageReceived")
             if (receive == null || count(fcm.substring(receive), call) != 1) v += "S3-deliver-outside-receive"
-            val references = files(code, """::\s*deliverPush\b|::\s*onSyncAlerts\b""")
+            val references = files(code, """::\s*(?:deliverPush|deliverTap|onSyncAlerts|onBankPush)\b""")
             if (references.isNotEmpty()) v += "S3-function-reference ${references.sorted()}"
             val syncFiles = files(code, """\bonSyncAlerts\b""")
             if (syncFiles != setOf(REGISTRY)) v += "S3-sync-files ${syncFiles.sorted()}"
@@ -853,10 +1006,56 @@ class AlertN1StructureTest {
             if (deliver == null || count(registry.substring(deliver), syncCall) != 1) v += "S3-sync-outside-deliver"
             if (deliver == null || GUARDS.none { it.matches(squash(registry.substring(deliver))) }) v += "S3-guard"
             if (count(registry, "\\bconst\\s+val\\s+SYNC_ALERTS\\s*=\\s*\"sync_alerts\"") != 1) v += "S3-sync-const"
-            val aliases = files(code, """\bimport\s+[\w.`]*\b(?:AlertFamilyRefresherRegistry|deliverPush|onSyncAlerts)\b`?\s+as\b""")
+            if (count(registry, "\\bconst\\s+val\\s+RATE_ALERT\\s*=\\s*\"rate_alert\"") != 1) v += "S3-bank-const"
+            // S7 E5c: the tap twin, called once from the OFF parser and nowhere else.
+            val tapCall = """\bAlertFamilyRefresherRegistry\s*\.\s*deliverTap\s*\("""
+            val tapFiles = files(code, """\bdeliverTap\b""")
+            if (tapFiles != setOf(ACTIVITY, REGISTRY)) v += "S3-tap-files ${tapFiles.sorted()}"
+            if (count(registry, """\bdeliverTap\b""") != 1 || count(registry, """\bfun\s+deliverTap\s*\(""") != 1) v += "S3-tap-declaration"
+            if (!inCompanion("deliverTap")) v += "S3-tap-companion"
+            if (count(activity, """\bdeliverTap\b""") != 1 || count(activity, tapCall) != 1) v += "S3-tap-activity"
+            val parser = bodyRange(activity, "parseAlertEventFromIntent")
+            if (parser == null || count(activity.substring(parser), tapCall) != 1) v += "S3-tap-outside-parser"
+            val tap = bodyRange(registry, "deliverTap")
+            if (tap == null || TAP_GUARDS.none { it.matches(squash(registry.substring(tap))) }) v += "S3-tap-guard"
+            // S7 E5c: onBankPush is the adapter's no-op default, the registry's main hand-over and the bank owner's override only.
+            val bankFiles = files(code, """\bonBankPush\b""")
+            if (bankFiles != setOf(REGISTRY, OWNER)) v += "S3-bank-files ${bankFiles.sorted()}"
+            val bankCall = """\.\s*onBankPush\s*\("""
+            if (count(registry, """\bonBankPush\b""") != 6 || count(registry, """\bfun\s+onBankPush\s*\(""") != 2 ||
+                count(registry, bankCall) != 4) v += "S3-bank-tokens"
+            if (deliver == null || count(registry.substring(deliver), bankCall) != 1) v += "S3-bank-outside-deliver"
+            if (tap == null || count(registry.substring(tap), bankCall) != 2) v += "S3-bank-outside-tap"
+            if (count(registry, """\bpostToMain\s*\{\s*dispatch\s*\{\s*it\s*\.\s*onBankPush\s*\(\s*id\s*,\s*isRepeat\s*\)\s*\}\s*\}""") != 1) v += "S3-bank-dispatch"
+            if (count(owner, """\bonBankPush\b""") != 1 || count(owner, """\boverride\s+fun\s+onBankPush\s*\(""") != 1) v += "S3-bank-owner"
+            val aliases = files(code, """\bimport\s+[\w.`]*\b(?:AlertFamilyRefresherRegistry|deliverPush|deliverTap|onSyncAlerts|onBankPush)\b`?\s+as\b""")
             if (aliases.isNotEmpty()) v += "S3-alias ${aliases.sorted()}"
             val registryFiles = files(code, """\bAlertFamilyRefresherRegistry\b""")
-            if (registryFiles != setOf(REGISTRY, APP, FCM)) v += "S3-registry-files ${registryFiles.sorted()}"
+            if (registryFiles != setOf(REGISTRY, APP, FCM, ACTIVITY)) v += "S3-registry-files ${registryFiles.sorted()}"
+            return v
+        }
+
+        /** S7 E5c: MainActivity's OFF parser: the routed event, then the gated lazy deliverTap with the raw is_repeat, then the event. */
+        fun tActivity(code: Map<String, String>): List<String> {
+            val v = mutableListOf<String>()
+            val activity = code[ACTIVITY].orEmpty()
+            if (count(activity, """\balertFamiliesProvider\b""") != 2 ||
+                count(activity, """@Inject\s+internal\s+lateinit\s+var\s+alertFamiliesProvider\s*:\s*Provider\s*<\s*AlertFamilyRefresherRegistry\s*>""") != 1) {
+                v += "T-provider"
+            }
+            val range = bodyRange(activity, "parseAlertEventFromIntent") ?: return v + "T-parser-missing"
+            val flat = squash(activity.substring(range))
+            if (TAP_HOOK.findAll(flat).count() != 1) v += "T-hook"
+            val order = listOf("val route = AlertPushRouting.route(type, settingId) ?: return null", "AlertFamilyRefresherRegistry.deliverTap(",
+                "return route.event").map { flat.indexOf(it) }
+            if (order.any { it < 0 } || order != order.sorted()) v += "T-order $order"
+            for (other in listOf("onCreate", "onNewIntent", "parsePendingAlertEvent", "handleNotificationIntent", "clearNotificationExtras")) {
+                val body = bodyRange(activity, other)?.let { activity.substring(it) }.orEmpty()
+                if (Regex("""\bdeliverTap\b|\balertFamiliesProvider\b""").containsMatchIn(body)) v += "T-elsewhere $other"
+            }
+            if (count(activity, """\bremoveExtra\s*\(\s*FXiMessagingService\s*\.\s*EXTRA_IS_REPEAT\s*\)""") != 1) v += "T-clear"
+            if (count(activity, """\bgetStringExtra\s*\(\s*FXiMessagingService\s*\.\s*EXTRA_IS_REPEAT\s*\)""") != 1 ||
+                Regex("\"is_repeat\"").containsMatchIn(activity)) v += "T-key"
             return v
         }
 
@@ -865,20 +1064,27 @@ class AlertN1StructureTest {
             val v = mutableListOf<String>()
             val registry = code[REGISTRY].orEmpty()
             val deliverParams = paramsRange(registry, "deliverPush")
+            val tapParams = paramsRange(registry, "deliverTap")
             val defaults = REPORT_DEFAULT.findAll(registry).toList()
-            if (defaults.size != 2) v += "S3-logger-defaults ${defaults.size}"
+            if (defaults.size != 3) v += "S3-logger-defaults ${defaults.size}"
             val messages = mutableMapOf<String, String>()
             for (parameter in defaults) {
-                val where = if (deliverParams != null && parameter.range.first in deliverParams) "deliverPush" else "registry"
+                val where = when {
+                    deliverParams != null && parameter.range.first in deliverParams -> "deliverPush"
+                    tapParams != null && parameter.range.first in tapParams -> "deliverTap"
+                    else -> "registry"
+                }
                 val close = closing(registry, parameter.range.last)
                 val lambda = if (close == null) "" else squash(registry.substring(parameter.range.last, close + 1))
                 val match = LOG_DEFAULT.matchEntire(lambda)
                 if (match == null) v += "S3-logger-form $where $lambda" else messages[where] = match.groupValues[1]
             }
-            if (messages != mapOf("registry" to REGISTRY_MESSAGE, "deliverPush" to DELIVERY_MESSAGE)) v += "S3-logger-message $messages"
+            if (messages != mapOf("registry" to REGISTRY_MESSAGE, "deliverPush" to DELIVERY_MESSAGE, "deliverTap" to TAP_MESSAGE)) {
+                v += "S3-logger-message $messages"
+            }
             if (CONST_TAG.findAll(registry).count() != 1) v += "S3-logger-tag"
             val logCalls = LOG_CALL.findAll(registry).count()
-            if (logCalls != 2) v += "S3-logger-count $logCalls"
+            if (logCalls != 3) v += "S3-logger-count $logCalls"
             for (path in NEW_FILES) {
                 val text = code[path].orEmpty()
                 for (log in LOG_CALL.findAll(text)) {
@@ -888,7 +1094,7 @@ class AlertN1StructureTest {
                 }
             }
             val handlers = CATCH.findAll(registry).toList()
-            if (handlers.size < 3) v += "S3-catch-count ${handlers.size}"
+            if (handlers.size < 4) v += "S3-catch-count ${handlers.size}"
             for (handler in handlers) {
                 val close = closing(registry, handler.range.last)
                 val inner = if (close == null) "?" else registry.substring(handler.range.last + 1, close)
@@ -916,6 +1122,9 @@ class AlertN1StructureTest {
                 v += "P-provider"
             }
             if (Regex("""\btry\b|\bcatch\b""").containsMatchIn(body)) v += "P-catch"
+            // S7 E5c: the app-made notification carries the raw is_repeat, only when present, under the one shared key constant.
+            if (count(fcm, """\bmessage\s*\.\s*data\s*\[\s*EXTRA_IS_REPEAT\s*]\s*\?\.\s*let\s*\{\s*putExtra\s*\(\s*EXTRA_IS_REPEAT\s*,\s*it\s*\)\s*\}""") != 1 ||
+                count(fcm, "\\bconst\\s+val\\s+EXTRA_IS_REPEAT\\s*=\\s*\"is_repeat\"") != 1 || count(fcm, "\"is_repeat\"") != 2) v += "P-repeat-extra"
             val order = listOf("if (!ReleaseAdmission.isOpen) return", "val type = message.data[", "AlertPushRouting.route(", ".emit(",
                 "AlertFamilyRefresherRegistry.deliverPush(", "showAlertNotification(").map { flat.indexOf(it) }
             if (order.any { it < 0 } || order != order.sorted()) v += "P-order $order"
@@ -1024,7 +1233,7 @@ class AlertN1StructureTest {
                 "BankAlertSettingsOwner" to setOf(OWNER, REGISTRY, HOLDER),
                 "AlertSettingsAccess" to setOf(ACCESS, OWNER),
                 "AlertRateLimitFloor" to setOf(FLOOR, OWNER),
-                "AlertFamilyRefresherRegistry" to setOf(REGISTRY, APP, FCM))) {
+                "AlertFamilyRefresherRegistry" to setOf(REGISTRY, APP, FCM, ACTIVITY))) {
                 val named = files(code, """\b$name\b""")
                 if (named != expected) v += "A-reach $name ${named.sorted()}"
             }

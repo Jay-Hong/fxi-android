@@ -1873,7 +1873,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   (현 `AlertViewModel.hadLoadedState:204,212-215,233-236` 승계).
   임시-오류 판정에 서버 문구 문자열을 쓰지 않는다(typed `AlertLoadFailure`).
   ⚠️ 현 Android `AlertState`(`AlertViewModel.kt:42-50`)에는 `Retrying`이 없고 최초 load 실패는 `AlertViewModel.kt:265-269`에서 즉시 `Error`로 확정된다.
-  N1 완료 뒤 화면 연결 단위에서는 BankAlertSettingsOwner를 유일한 은행 설정 snapshot·GET owner로 유지하고, 후속 E5a2/E5b의 CRUD action도 그 owner가 조정한다. 새 은행 section holder는 state 투영과 action 요청 위임만 하며 독립 목록·CRUD·rollback을 소유하지 않는다. AlertViewModel은 변경·생성하지 않는다. typed phase 렌더와 빈 목록 오류 가드를 적용한다. push/tap의 단일 소비·권한/현재 신원 경계는 별도 확정 범위에서 닫고, 그 완료 전 사용자에게 노출하지 않는다. 첫 화면 단위(E5a1)는 읽기 전용 섹션이며 mutation이 없다. N1 및 E5a/b 완료는 S7 전체 완료가 아니다.
+  N1 완료 뒤 화면 연결 단위에서는 BankAlertSettingsOwner를 유일한 은행 설정 snapshot·GET owner로 유지하고, 후속 E5a2/E5b의 CRUD action도 그 owner가 조정한다. 새 은행 section holder는 state 투영과 action 요청 위임만 하며 독립 목록·CRUD·rollback을 소유하지 않는다. AlertViewModel은 변경·생성하지 않는다. typed phase 렌더와 빈 목록 오류 가드를 적용한다. push/tap의 단일 소비·권한/현재 신원 경계는 별도 확정 범위에서 닫고, 그 완료 전 사용자에게 노출하지 않는다. 첫 화면 단위(E5a1)는 읽기 전용 섹션이며 mutation이 없다. E5c는 foreground push 수신 및 OFF tap의 once 즉시 반영과 registry 단일 GET 요청 경로만 닫는다. ON custody 경로의 is_repeat 운반·읽기·제거는 미완료 후속 의무이며, 그 완료 전에는 ON 공개 산출물을 만들지 않는다. N1 및 E5a/b/c 완료는 S7 전체 완료가 아니다.
 - **lifecycle(iOS 실재 계약, family별 분리)**:
   - bank/source는 background에서 in-flight 응답을 generation guard로 폐기하고 대기 demand를 취소하되
     Retry-After hard floor·수동 쿨다운을 보존한다. 성공 snapshot은 유지하고 없으면 idle로 돌린다

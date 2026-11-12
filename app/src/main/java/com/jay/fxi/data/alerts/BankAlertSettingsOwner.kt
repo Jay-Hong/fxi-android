@@ -250,7 +250,7 @@ internal class BankAlertSettingsOwner internal constructor(
 
     override fun onForeground(authoritative: Boolean) {
         foreground = true
-        if (authoritative) this.authoritative() else ensure()
+        if (authoritative || reconcileOwed != null) this.authoritative() else ensure()
     }
 
     override fun onBackground() {
@@ -261,6 +261,28 @@ internal class BankAlertSettingsOwner internal constructor(
     }
 
     override fun onSync() {
+        if (foreground) authoritative()
+    }
+
+    /** Main: apply only this delivery's admitted once mark, and owe an accepted GET. */
+    override fun onBankPush(id: Int?, isRepeat: String?) {
+        val state = mutableState.value
+        val rows = state.settings
+        if (rows != null) {
+            state.identity?.let { reconcileOwed = it }
+            if (id != null && isRepeat == "false" && rowOps[id] == null) {
+                val index = rows.indexOfFirst { it.id == id }
+                val use = if (index >= 0) access.acquire() else null
+                if (use != null && state.identity == use.identity && access.admits(use)) {
+                    val next = rows.toMutableList()
+                    next[index] = rows[index].copy(isEnabled = false, triggered = true)
+                    // Even an already marked row invalidates a GET that raced this delivery.
+                    revision++
+                    mutableState.value = state.copy(settings = next)
+                }
+            }
+        }
+        // Record debt before starting a chain, including with an eager dispatcher.
         if (foreground) authoritative()
     }
 

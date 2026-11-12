@@ -57,7 +57,8 @@ class FXiMessagingService : FirebaseMessagingService() {
         val route = AlertPushRouting.route(type, message.data["setting_id"]) ?: return
         alertEventBusProvider.get().emit(route.event)
         AlertFamilyRefresherRegistry.deliverPush(
-            type, shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)
+            type, message.data["setting_id"], message.data["is_repeat"],
+            shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)
         ) { alertFamiliesProvider.get() }
         if (route.showBanner) showAlertNotification(message, type)
     }
@@ -86,6 +87,7 @@ class FXiMessagingService : FirebaseMessagingService() {
             if (settingId != null) {
                 putExtra(EXTRA_SETTING_ID, settingId)
             }
+            message.data[EXTRA_IS_REPEAT]?.let { putExtra(EXTRA_IS_REPEAT, it) }
         }
         if (krxContestSwitch.enabled) {
             AlertTapEntry.copyForegroundClassification(message.data, AndroidAlertTapExtras(intent))
@@ -116,5 +118,6 @@ class FXiMessagingService : FirebaseMessagingService() {
         const val CHANNEL_RATE_ALERTS = "rate_alerts"
         const val EXTRA_NOTIFICATION_TYPE = "notification_type"
         const val EXTRA_SETTING_ID = "setting_id"
+        const val EXTRA_IS_REPEAT = "is_repeat"
     }
 }

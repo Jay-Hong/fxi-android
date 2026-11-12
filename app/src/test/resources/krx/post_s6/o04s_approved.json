@@ -1,0 +1,17 @@
+{
+  "FCM": {
+    "unit": "S7-E5c",
+    "frozen_sha256": "6110de98eec35e59c790314d9c637a2e886cff49d62b5ea483eabd25be1da914",
+    "approved_sha256": "80e39b836889720f9c559aea7033db116736e35d09138656d2a4c1ef22ccbd21"
+  },
+  "parser": {
+    "unit": "S7-E5c",
+    "frozen_sha256": "99c27e70658865f5011e2a46ae8c0bde51ba75b416a0679cf0f6e108e36b5b04",
+    "approved_sha256": "22b20e12bc0f2bc72b2ca4a23058dc2ba7ea7d665e29f29e172032e6b38aa8b8"
+  },
+  "clear": {
+    "unit": "S7-E5c",
+    "frozen_sha256": "96686f8d95d8859d179b3f61aacf6061e310778e295f622188751a83f38379d2",
+    "approved_sha256": "2bdfbbccfb78fc29b5ff67117ddcd450ae375c4fb099739ecd2bc9777e802591"
+  }
+}

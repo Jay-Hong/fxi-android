@@ -12,6 +12,8 @@ import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.entitlements.OwnedPremiumAccess
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.confirmsPremiumFor
+import com.jay.fxi.service.AlertEvent
+import com.jay.fxi.service.AlertFamily
 import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
@@ -26,6 +28,7 @@ internal interface AlertFamilyAdapter {
     fun onForeground(authoritative: Boolean = false)
     fun onBackground()
     fun onSync()
+    fun onBankPush(id: Int?, isRepeat: String?) {}
 }
 
 @Singleton
@@ -105,6 +108,10 @@ internal class AlertFamilyRefresherRegistry internal constructor(
         }
     }
 
+    fun onBankPush(id: Int?, isRepeat: String?) {
+        postToMain { dispatch { it.onBankPush(id, isRepeat) } }
+    }
+
     private fun setForeground(value: Boolean) {
         if (foreground == value) return
         foreground = value
@@ -131,19 +138,46 @@ internal class AlertFamilyRefresherRegistry internal constructor(
     companion object {
         private const val TAG = "AlertFamilies"
         const val SYNC_ALERTS = "sync_alerts"
+        const val RATE_ALERT = "rate_alert"
 
         fun deliverPush(
             type: String,
+            settingId: String?,
+            isRepeat: String?,
             gateOpen: Boolean,
             reportFailure: () -> Unit = {
-                Log.w(TAG, "alert family sync delivery failed")
+                Log.w(TAG, "alert family push delivery failed")
                 Unit
             },
             resolve: () -> AlertFamilyRefresherRegistry
         ) {
-            if (type != SYNC_ALERTS || !gateOpen) return
+            if (!gateOpen) return
             try {
-                resolve().onSyncAlerts()
+                when (type) {
+                    SYNC_ALERTS -> resolve().onSyncAlerts()
+                    RATE_ALERT -> resolve().onBankPush(settingId?.toIntOrNull(), isRepeat)
+                }
+            } catch (e: Exception) {
+                reportFailure()
+            }
+        }
+
+        fun deliverTap(
+            event: AlertEvent,
+            isRepeat: String?,
+            gateOpen: Boolean,
+            reportFailure: () -> Unit = {
+                Log.w(TAG, "alert family tap delivery failed")
+                Unit
+            },
+            resolve: () -> AlertFamilyRefresherRegistry
+        ) {
+            if (!gateOpen) return
+            try {
+                when {
+                    event is AlertEvent.SettingTriggered && event.family == AlertFamily.BANK -> resolve().onBankPush(event.settingId, isRepeat)
+                    event == AlertEvent.RefreshNeeded -> resolve().onBankPush(null, null)
+                }
             } catch (e: Exception) {
                 reportFailure()
             }

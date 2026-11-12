@@ -30,9 +30,11 @@ import org.junit.Test
  * when that identity loses premium or changes, and turns the next foreground authoritative once only if the live identity
  * is still that one and premium-confirmed, else that foreground is a plain ensure; that a sync without a premium-confirmed
  * live identity leaves nothing held; that a throwing family supplier or adapter is reported once and isolated; and that
- * `deliverPush` resolves and hands over only an exact `sync_alerts` with the gate open, reporting a throwing resolve or
- * hand-over once and returning normally. Failure reporting is an injected counter (android.util.Log throws on the JVM),
- * main is `postToMain`, and the premium subscription runs on a test scope settled with runCurrent.
+ * `deliverPush` resolves only an exact `sync_alerts` (handed to onSyncAlerts) or, since S7 E5c, an exact `rate_alert`
+ * (handed to onBankPush only, never onSync) with the gate open, reporting a throwing resolve or hand-over once and
+ * returning normally (E5c delivery details: S7E5CRegistryDeliveryContractTest). Failure reporting is an injected counter
+ * (android.util.Log throws on the JVM), main is `postToMain`, and the premium subscription runs on a test scope settled
+ * with runCurrent.
  * The implementation thread reads but does not edit this file.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -103,6 +105,7 @@ class AlertFamilyRefresherRegistryContractTest {
         override fun onForeground(authoritative: Boolean) = record(if (authoritative) AUTH else FG)
         override fun onBackground() = record(BG)
         override fun onSync() = record(SYNC)
+        override fun onBankPush(id: Int?, isRepeat: String?) = record(bank(id, isRepeat))
 
         private fun record(call: String) {
             calls += call
@@ -391,7 +394,7 @@ class AlertFamilyRefresherRegistryContractTest {
         withHarness(Harness(process)) {
             var resolves = 0
             var reports = 0
-            AlertFamilyRefresherRegistry.deliverPush(AlertFamilyRefresherRegistry.SYNC_ALERTS, true, reportFailure = { reports++ }) {
+            AlertFamilyRefresherRegistry.deliverPush(AlertFamilyRefresherRegistry.SYNC_ALERTS, null, null, true, reportFailure = { reports++ }) {
                 resolves++
                 registry
             }
@@ -802,13 +805,15 @@ class AlertFamilyRefresherRegistryContractTest {
     // ---- N1-P part 1: deliverPush ----
 
     @Test
-    fun `S7N1_P01 deliverPush resolves and hands over only an exact sync_alerts with the gate open`() {
+    fun `S7N1_P01 deliverPush resolves and hands over only an exact sync_alerts or rate_alert with the gate open`() {
         assertEquals("S7N1_P01 premise: the raw sync type", "sync_alerts", AlertFamilyRefresherRegistry.SYNC_ALERTS)
+        assertEquals("S7N1_P01 premise: the raw bank alert type", "rate_alert", AlertFamilyRefresherRegistry.RATE_ALERT)
         val types = listOf(
             "sync_alerts", "rate_alert", "source_rate_alert", "comparison_alert", "unknown", "",
-            "SYNC_ALERTS", " sync_alerts", "sync_alerts ", "sync-alerts", "sync_alert", "sync_alerts_v2"
+            "SYNC_ALERTS", " sync_alerts", "sync_alerts ", "sync-alerts", "sync_alert", "sync_alerts_v2",
+            "RATE_ALERT", "rate_alert ", "rate_alerts"
         )
-        var admittedCombinations = 0
+        val admittedCombinations = mutableListOf<String>()
         for (type in types) {
             for (gateOpen in listOf(true, false)) {
                 withHarness(Harness(FakeLifecycle(Lifecycle.State.STARTED))) {
@@ -816,39 +821,48 @@ class AlertFamilyRefresherRegistryContractTest {
                     settle()
                     var resolves = 0
                     var reports = 0
-                    AlertFamilyRefresherRegistry.deliverPush(type, gateOpen, reportFailure = { reports++ }) {
+                    AlertFamilyRefresherRegistry.deliverPush(type, "7", "false", gateOpen, reportFailure = { reports++ }) {
                         resolves++
                         registry
                     }
-                    val admitted = type == "sync_alerts" && gateOpen
-                    if (admitted) admittedCombinations++
+                    val admitted = gateOpen && (type == "sync_alerts" || type == "rate_alert")
+                    if (admitted) admittedCombinations += type
                     val n = if (admitted) 1 else 0
                     val label = "S7N1_P01 type='$type' gateOpen=$gateOpen"
                     assertEquals("$label: resolve", n, resolves)
-                    assertEquals("$label: onSyncAlerts reached (main post)", n, posts)
-                    assertEach("$label: adapters", if (admitted) listOf(FG, SYNC) else listOf(FG))
+                    assertEquals("$label: onSyncAlerts or onBankPush reached (main post)", n, posts)
+                    val handedOver = when {
+                        !admitted -> listOf(FG)
+                        type == "sync_alerts" -> listOf(FG, SYNC)
+                        else -> listOf(FG, bank(7, "false"))
+                    }
+                    assertEach("$label: adapters (sync: onSync only; rate_alert: onBankPush only)", handedOver)
                     assertEquals("$label: no delivery failure", 0, reports)
                     assertEquals("$label: no registry failure", 0, failures)
                 }
             }
         }
-        assertEquals("S7N1_P01 exactly one admitted combination", 1, admittedCombinations)
+        assertEquals("S7N1_P01 exactly the two admitted combinations", listOf("sync_alerts", "rate_alert"), admittedCombinations)
     }
 
     @Test
     fun `S7N1_P02 a resolve that throws is reported once and deliverPush returns normally`() {
-        var resolves = 0
-        var reports = 0
-        AlertFamilyRefresherRegistry.deliverPush("sync_alerts", true, reportFailure = { reports++ }) {
-            resolves++
-            throw IllegalStateException("provider failed")
+        for (type in listOf("sync_alerts", "rate_alert")) {
+            var resolves = 0
+            var reports = 0
+            AlertFamilyRefresherRegistry.deliverPush(type, null, null, true, reportFailure = { reports++ }) {
+                resolves++
+                throw IllegalStateException("provider failed")
+            }
+            assertEquals("S7N1_P02 type='$type' premise: resolve was called", 1, resolves)
+            assertEquals("S7N1_P02 type='$type' reported once", 1, reports)
         }
-        assertEquals("S7N1_P02 premise: resolve was called", 1, resolves)
-        assertEquals("S7N1_P02 reported once", 1, reports)
-        for ((type, gateOpen) in listOf("sync_alerts" to false, "rate_alert" to true, "" to true)) {
+        for ((type, gateOpen) in listOf(
+            "sync_alerts" to false, "rate_alert" to false, "source_rate_alert" to true, "" to true
+        )) {
             var notAdmittedResolves = 0
             var notAdmittedReports = 0
-            AlertFamilyRefresherRegistry.deliverPush(type, gateOpen, reportFailure = { notAdmittedReports++ }) {
+            AlertFamilyRefresherRegistry.deliverPush(type, null, null, gateOpen, reportFailure = { notAdmittedReports++ }) {
                 notAdmittedResolves++
                 throw IllegalStateException("provider failed")
             }
@@ -866,7 +880,7 @@ class AlertFamilyRefresherRegistryContractTest {
             val postsBefore = posts
             var resolves = 0
             var reports = 0
-            AlertFamilyRefresherRegistry.deliverPush("sync_alerts", true, reportFailure = { reports++ }) {
+            AlertFamilyRefresherRegistry.deliverPush("sync_alerts", null, null, true, reportFailure = { reports++ }) {
                 resolves++
                 registry
             }
@@ -883,6 +897,9 @@ class AlertFamilyRefresherRegistryContractTest {
         const val AUTH = "onForeground(true)"
         const val BG = "onBackground()"
         const val SYNC = "onSync()"
+
+        /** One onBankPush call; isRepeat is quoted so the raw string "null" and an absent value stay apart. */
+        fun bank(id: Int?, isRepeat: String?) = "onBankPush($id, ${isRepeat?.let { "\"$it\"" } ?: "null"})"
 
         val ALICE = AuthIdentityFence("user-a", 1)
         val ALICE_RELOGIN = AuthIdentityFence("user-a", 2)

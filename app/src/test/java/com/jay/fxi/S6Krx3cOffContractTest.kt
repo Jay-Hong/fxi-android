@@ -98,6 +98,10 @@ class S6Krx3cOffContractTest {
         val source = S6Krx3cShellSourceContract.load()
         val spans = S6Krx3cShellSourceContract.spans(source, true)
         assertEquals("contract(O04s/columns): four bodies plus five auxiliaries", spans.keys, index.getValue("spans").jsonObject.keys)
+        // S7-E5c: the pinned approved list is checked before it is used; it names exactly the FCM builder, parser and clear spans.
+        val (approvalErrors, approvals) = PostS6ApprovedDelta.o04sApproved(PostS6ApprovedDelta.o04sRaw())
+        assertEquals("contract(O04s/approved): the S7-E5c span exception validates against its pin", emptyList<String>(), approvalErrors)
+        assertEquals("contract(O04s/approved): exactly three spans", PostS6ApprovedDelta.O04S_SPANS, approvals!!.keys)
         for ((id, span) in spans) {
             val frozen = bytes("off_shells/$id.raw", "O04s/$id")
             val entry = index.getValue("spans").jsonObject.getValue(id).jsonObject
@@ -105,12 +109,97 @@ class S6Krx3cOffContractTest {
             assertEquals("contract(O04s/$id): raw length", frozen.size, entry["length"]?.jsonPrimitive?.int)
             assertEquals("contract(O04s/$id): immutable raw hash", S6Krx3cShellSourceContract.sha(frozen), entry["sha256"]?.jsonPrimitive?.content)
             assertTrue("contract(O04s/$id): original byte offset recorded", entry["offset"]?.jsonPrimitive?.int?.let { it >= 0 } == true)
-            assertArrayEquals("contract(O04s/$id): exact bytes including indentation/comments/literals", frozen, span.raw.toByteArray(Charsets.UTF_8))
+            assertEquals("contract(O04s/$id): exact bytes including indentation/comments/literals, or the S7-E5c approved bytes",
+                emptyList<String>(), PostS6ApprovedDelta.o04sSpanErrors(id, frozen, entry["sha256"]?.jsonPrimitive?.content, span.raw, approvals))
         }
         val tricky = "fun boundary() { val text = \"}\"; val raw = \"\"\"{ }\"\"\"; /* { /* } */ } */ val c = '}' }"
         val actual = S6Krx3cShellSourceContract.function(tricky, "boundary").raw
         assertTrue("contract(O04s/lexer): literals and nested comments preserved raw", actual.contains("/* { /* } */ } */"))
         assertFalse("contract(O04s/negative): same raw comparison rejects conditional consume", spans.getValue("Root").raw == spans.getValue("Root").raw.replace("alertEventBus?.emit(event)", "if (alertEventBus?.emit(event) == true)"))
+    }
+
+    @Test fun o04s_e5cApprovedSpansAreTheOnlyExceptionAndEachRuleRefusesItsViolation() = marked("O04s") {
+        val index = json(bytes("off_shells/index.json", "O04s"), "O04s").getValue("spans").jsonObject
+        val spans = S6Krx3cShellSourceContract.spans(S6Krx3cShellSourceContract.load(), true)
+        val raw = PostS6ApprovedDelta.o04sRaw()
+        val approvals = checkNotNull(PostS6ApprovedDelta.o04sApproved(raw).second)
+        fun errors(id: String, frozen: ByteArray = bytes("off_shells/$id.raw", "O04s/$id"), actual: String = spans.getValue(id).raw,
+            list: Map<String, PostS6ApprovedDelta.O04sApproval> = approvals) =
+            PostS6ApprovedDelta.o04sSpanErrors(id, frozen, index.getValue(id).jsonObject["sha256"]?.jsonPrimitive?.content, actual, list)
+        for (id in spans.keys) assertEquals("contract(O04s/control): $id passes unaltered", emptyList<String>(), errors(id))
+        assertEquals("contract(O04s/negative): an approved span with one more byte", listOf("o04s-approved FCM"), errors("FCM", actual = spans.getValue("FCM").raw + " "))
+        assertEquals("contract(O04s/negative): an unapproved span changed", listOf("o04s-bytes cold"), errors("cold", actual = spans.getValue("cold").raw + " "))
+        assertEquals("contract(O04s/negative): the frozen raw of an approved span altered", listOf("o04s-frozen parser"),
+            errors("parser", frozen = bytes("off_shells/parser.raw", "O04s/parser") + byteArrayOf(32)))
+        val tampered = raw.toString(Charsets.UTF_8).replace("\"unit\": \"S7-E5c\"", "\"unit\": \"S7-E5c \"").toByteArray()
+        assertEquals("contract(O04s/negative): the approved list edited", null, PostS6ApprovedDelta.o04sApproved(tampered).second)
+        assertTrue("contract(O04s/negative): the pin refuses it", "o04s-pin" in PostS6ApprovedDelta.o04sApproved(tampered).first)
+        val root = Json.parseToJsonElement(raw.toString(Charsets.UTF_8)).jsonObject
+        val extra = JsonObject(root + ("cold" to root.getValue("FCM"))).toString().toByteArray()
+        assertTrue("contract(O04s/negative): an unlisted span id added", PostS6ApprovedDelta.o04sApproved(extra, null).first.any { it.startsWith("o04s-spans") })
+        val otherUnit = JsonObject(root + ("FCM" to JsonObject(root.getValue("FCM").jsonObject + ("unit" to JsonPrimitive("S7-E5d"))))).toString().toByteArray()
+        assertEquals("contract(O04s/negative): another unit", listOf("o04s-unit FCM"), PostS6ApprovedDelta.o04sApproved(otherUnit, null).first)
+        val text = raw.toString(Charsets.UTF_8)
+        val hash = checkNotNull(Regex("\"approved_sha256\": \"([0-9a-f]+)\"").find(text)).groups[1]!!
+        val upper = text.replaceRange(hash.range, hash.value.uppercase())
+        assertTrue("contract(O04s/negative): an upper-case hash", PostS6ApprovedDelta.o04sApproved(upper.toByteArray(), null).first.any { it.startsWith("o04s-hash-form") })
+        val duplicate = raw.toString(Charsets.UTF_8).replaceFirst("\"unit\": \"S7-E5c\",", "\"unit\": \"S7-E5c\", \"unit\": \"S7-E5c\",").toByteArray()
+        assertTrue("contract(O04s/negative): a duplicate key", PostS6ApprovedDelta.o04sApproved(duplicate, null).first.any { it.startsWith("o04s-duplicate-key") })
+        assertEquals("contract(O04s/negative): an empty approved list gives the approved spans no pass", listOf("o04s-bytes clear"), errors("clear", list = emptyMap()))
+    }
+
+    /**
+     * Gap G15 (`s7e5c_gaphunt.codex.r1.md` §3): the approved list's schema is closed, every negative on its own, and an approved
+     * span's frozen raw is bound to the 0302 index independently of the list. Each altered input is checked without the pin.
+     */
+    @Test fun `S7E5C_G15 o04s schema is closed and the frozen index is independent`() = marked("O04s") {
+        val raw = PostS6ApprovedDelta.o04sRaw()
+        val root = Json.parseToJsonElement(raw.toString(Charsets.UTF_8)).jsonObject
+        for (pin in listOf(PostS6ApprovedDelta.O04S_APPROVED_SHA256, null)) {
+            val (found, approvals) = PostS6ApprovedDelta.o04sApproved(raw, pin)
+            assertEquals("contract(O04s/control): the unaltered list validates (pin $pin)", emptyList<String>(), found)
+            assertEquals("contract(O04s/control): exactly three spans (pin $pin)", PostS6ApprovedDelta.O04S_SPANS, approvals?.keys)
+        }
+        fun refused(label: String, altered: ByteArray, expected: List<String>) {
+            val (found, approvals) = PostS6ApprovedDelta.o04sApproved(altered, null)
+            assertEquals("contract(O04s/negative): $label", expected, found)
+            assertEquals("contract(O04s/negative): $label gives no list", null, approvals)
+        }
+        fun encoded(json: JsonObject) = json.toString().toByteArray()
+        val required = listOf("unit", "frozen_sha256", "approved_sha256")
+        for (id in PostS6ApprovedDelta.O04S_SPANS) {
+            val entry = root.getValue(id).jsonObject
+            assertEquals("contract(O04s/control): $id has exactly the three keys", required.toSet(), entry.keys)
+            refused("$id with an extra key", encoded(JsonObject(root + (id to JsonObject(entry + ("note" to JsonPrimitive("x")))))),
+                listOf("o04s-entry $id"))
+            for (key in required) refused("$id without $key", encoded(JsonObject(root + (id to JsonObject(entry - key)))), listOf("o04s-entry $id"))
+            refused("$id not an object", encoded(JsonObject(root + (id to JsonPrimitive("S7-E5c")))), listOf("o04s-entry $id"))
+            refused("$id span missing", encoded(JsonObject(root - id)), listOf("o04s-spans ${(PostS6ApprovedDelta.O04S_SPANS - id).sorted()}"))
+            for (hashKey in listOf("frozen_sha256", "approved_sha256")) {
+                val hash = entry.getValue(hashKey).jsonPrimitive.content
+                for ((form, value) in listOf<Pair<String, JsonElement>>(
+                    "short" to JsonPrimitive(hash.dropLast(1)), "long" to JsonPrimitive(hash + "0"),
+                    "upper-case" to JsonPrimitive(hash.uppercase()), "a number" to JsonPrimitive(1), "null" to JsonNull
+                )) refused("$id $hashKey $form", encoded(JsonObject(root + (id to JsonObject(entry + (hashKey to value))))), listOf("o04s-hash-form $id"))
+            }
+        }
+        refused("no span at all", encoded(JsonObject(emptyMap())), listOf("o04s-spans []"))
+        val text = raw.toString(Charsets.UTF_8)
+        assertEquals("premise: one unit line per span", 3, Regex("\"unit\": \"S7-E5c\",").findAll(text).count())
+        val escaped = text.replaceFirst("\"unit\": \"S7-E5c\",", "\"unit\": \"S7-E5c\", \"\\u0075nit\": \"S7-E5c\",")
+        refused("an escaped duplicate key", escaped.toByteArray(), listOf("o04s-duplicate-key unit"))
+        val approvals = checkNotNull(PostS6ApprovedDelta.o04sApproved(raw).second)
+        val index = json(bytes("off_shells/index.json", "O04s"), "O04s").getValue("spans").jsonObject
+        val spans = S6Krx3cShellSourceContract.spans(S6Krx3cShellSourceContract.load(), true)
+        for (id in PostS6ApprovedDelta.O04S_SPANS) {
+            val frozen = bytes("off_shells/$id.raw", "O04s/$id")
+            val indexed = index.getValue(id).jsonObject["sha256"]?.jsonPrimitive?.content
+            assertEquals("contract(O04s/control): $id frozen raw is the indexed one", S6Krx3cShellSourceContract.sha(frozen), indexed)
+            assertEquals("contract(O04s/control): $id passes with its index", emptyList<String>(),
+                PostS6ApprovedDelta.o04sSpanErrors(id, frozen, indexed, spans.getValue(id).raw, approvals))
+            for (other in listOf("0".repeat(63) + "1", null)) assertEquals("contract(O04s/negative): $id with the index alone naming another raw ($other)",
+                listOf("o04s-frozen $id"), PostS6ApprovedDelta.o04sSpanErrors(id, frozen, other, spans.getValue(id).raw, approvals))
+        }
     }
 
     @Test fun o05_realSharedSwitchAndShellWiringAreExact() = marked("O05") {

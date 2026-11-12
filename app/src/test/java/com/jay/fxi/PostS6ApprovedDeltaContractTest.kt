@@ -44,6 +44,9 @@ class PostS6ApprovedDeltaContractTest {
     private val transport = base + "data/remote/AuthenticatedTransport.kt"
     private val bankSection = base + "ui/alert/BankAlertSection.kt"
     private val e5a2Changed = setOf(transport, api, repo, bankOwner, alertSection, bankSection)
+    private val activity = base + "MainActivity.kt"
+    private val registry = base + "data/alerts/AlertFamilyRefresherRegistry.kt"
+    private val e5cChanged = setOf(messaging, activity, registry, bankOwner)
     private val inventory = S64bFixtureDelta.inventoryBytes()
     private val s64b = S64bResourceBytes.delta()
     private val raw = PostS6ApprovedDelta.raw()
@@ -71,15 +74,16 @@ class PostS6ApprovedDeltaContractTest {
     @Test fun P01_theApprovedLedgerValidates_andMatchesTheActualSourcesExactly() {
         assertEquals("the pin is the manifest's bytes", PostS6ApprovedDelta.APPROVED_SHA256, PostS6ApprovedDelta.sha(raw))
         val ledger = PostS6ApprovedDelta.ledger()
-        assertEquals("exactly the approved S7-a, S7-b, S7-c, S7-N1, S7-E5a1 and S7-E5a2 paths",
-            setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport, ledger.final.keys)
-        assertEquals(setOf(api, repo) + s7cChanged + n1Changed + e5a1Changed + transport, ledger.changed)
+        assertEquals("exactly the approved S7-a, S7-b, S7-c, S7-N1, S7-E5a1, S7-E5a2 and S7-E5c paths",
+            setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport + activity,
+            ledger.final.keys)
+        assertEquals(setOf(api, repo) + s7cChanged + n1Changed + e5a1Changed + transport + activity, ledger.changed)
         assertEquals(setOf(access) + s7b + s7cAdded + n1Added + e5a1Added, ledger.added)
         assertEquals("history hashes", mapOf(api to productBase.getValue(api), repo to productBase.getValue(repo), access to null) +
             s7b.associateWith { null } + s7cChanged.associateWith { productBase.getValue(it) } + s7cAdded.associateWith { null } +
             n1Changed.associateWith { productBase.getValue(it) } + n1Added.associateWith { null } +
             e5a1Changed.associateWith { productBase.getValue(it) } + e5a1Added.associateWith { null } +
-            mapOf(transport to productBase.getValue(transport)), ledger.original)
+            mapOf(transport to productBase.getValue(transport), activity to productBase.getValue(activity)), ledger.original)
         assertEquals(emptyList<String>(), PostS6ApprovedDelta.actualErrors(ledger, PostS6ApprovedDelta.actualSources()))
         val actual = PostS6ApprovedDelta.actualSources().mapValues { PostS6ApprovedDelta.sha(it.value) }
         val projected = PostS6ApprovedDelta.project(actual, ledger)
@@ -89,10 +93,13 @@ class PostS6ApprovedDeltaContractTest {
         for (path in n1Changed) assertEquals("S7-N1 $path goes back to its history", productBase.getValue(path), projected[path])
         for (path in e5a1Changed) assertEquals("S7-E5a1 $path goes back to its history", productBase.getValue(path), projected[path])
         assertEquals("S7-E5a2's transport goes back to its history", productBase.getValue(transport), projected[transport])
+        assertEquals("S7-E5c's activity goes back to its history", productBase.getValue(activity), projected[activity])
+        assertEquals("the service goes back to its first history through both of its links", productBase.getValue(messaging), projected[messaging])
         assertFalse("the approved additions are dropped from the history view",
             (setOf(access) + s7b + s7cAdded + n1Added + e5a1Added).any { it in projected })
-        val moved = setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport
-        assertEquals("nothing else moves", actual - moved, projected - (setOf(api, repo) + s7cChanged + n1Changed + e5a1Changed + transport))
+        val moved = setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport + activity
+        assertEquals("nothing else moves", actual - moved,
+            projected - (setOf(api, repo) + s7cChanged + n1Changed + e5a1Changed + transport + activity))
     }
 
     @Test fun N01_theApprovalPinBindsTheManifestBytes() {
@@ -422,7 +429,8 @@ class PostS6ApprovedDeltaContractTest {
     private fun unitsWithN1(changedN1: JsonObject) = withUnits(unit(0), unit(1), unit(2), changedN1)
 
     @Test fun E11_theN1CoreExceptionValidates_andItsKrxLinesAreTheReviewedOnes() {
-        assertEquals("three exceptions, one per unit", listOf("S7-c" to owner, "S7-N1" to messaging, "S7-E5a2" to transport),
+        assertEquals("the exceptions in unit order: S7-E5c continues the service and first changes the activity",
+            listOf("S7-c" to owner, "S7-N1" to messaging, "S7-E5a2" to transport, "S7-E5c" to messaging, "S7-E5c" to activity),
             PostS6ApprovedDelta.CORE_EXCEPTIONS.map { it.unitId to it.path })
         val core = PostS6ApprovedDelta.CORE_EXCEPTIONS.single { it.unitId == "S7-N1" && it.path == messaging }
         assertEquals("premise: the fourth unit is S7-N1", "S7-N1", n1.str("id"))
@@ -527,7 +535,7 @@ class PostS6ApprovedDeltaContractTest {
             "changed" to JsonObject(mapOf(messaging to changedEntry(messagingEntry.str("to"), someHash))), "added" to JsonObject(emptyMap())))
         assertTrue(errors(withUnits(unit(0), unit(1), unit(2), n1, next)).contains("forbidden $messaging"))
         val actual = PostS6ApprovedDelta.actualSources()
-        val otherFrom = PostS6ApprovedDelta.Ledger(mapOf(messaging to someHash), mapOf(messaging to messagingEntry.str("to")))
+        val otherFrom = PostS6ApprovedDelta.Ledger(mapOf(messaging to someHash), mapOf(messaging to PostS6ApprovedDelta.ledger().final.getValue(messaging)))
         assertEquals("another history for the service is KRX-checked as any path", listOf("krx-reference $messaging"),
             PostS6ApprovedDelta.actualErrors(otherFrom, actual))
     }
@@ -542,8 +550,7 @@ class PostS6ApprovedDeltaContractTest {
     private fun unitsWithE5a2(changedE5a2: JsonObject) = withUnits(unit(0), unit(1), unit(2), unit(3), unit(4), changedE5a2)
 
     @Test fun E31_theE5a2UnitIsExact_andContinuesEveryChain() {
-        assertEquals("premise: the sixth and last unit is S7-E5a2", listOf("S7-E5a2", 6),
-            listOf(e5a2.str("id"), json.getValue("units").jsonArray.size))
+        assertEquals("premise: the sixth unit is S7-E5a2", "S7-E5a2", e5a2.str("id"))
         assertEquals("its parent is the S7-E5a1 commit and its record the scope confirmation",
             listOf("9f30832d1a14f08940619c35ce79f6fbdf136505", e5a2Approval), listOf(e5a2.str("source_parent"), e5a2.str("approval_record_sha256")))
         val changed = e5a2.getValue("changed").jsonObject
@@ -619,5 +626,145 @@ class PostS6ApprovedDeltaContractTest {
         val more = actual.getValue(transport) + "\nprivate val krxBypass = 1\n".toByteArray()
         assertEquals("another history for the transport gets no exception: a KRX line is checked as on any path",
             listOf("actual-hash $transport", "krx-reference $transport"), PostS6ApprovedDelta.actualErrors(otherFrom, actual + (transport to more)))
+    }
+
+    // ---- S7-E5c bank push/tap (`R4c/S7/s7e5/s7e5c_exact_proposal.claude.r3.md`, user decision D1/D2 with its errata) ---------
+
+    private val e5c get() = unit(6)
+    private val e5cApproval = "d92df63aa74097d2342511c0ecdeda141c20fbd973f321b3ede5f5a94c3f017e"
+    private val e5cParent = "e06fbb0202ce9af0da72d4f52640b233d711c8c5"
+    private fun e5cEntry(path: String) = e5c.getValue("changed").jsonObject.getValue(path).jsonObject
+    private fun e5cWith(path: String, entry: JsonObject) = e5c.with("changed", JsonObject(e5c.getValue("changed").jsonObject + (path to entry)))
+    private fun unitsWithE5c(changedE5c: JsonObject) = withUnits(unit(0), unit(1), unit(2), unit(3), unit(4), unit(5), changedE5c)
+    private val e5cCores get() = PostS6ApprovedDelta.CORE_EXCEPTIONS.filter { it.unitId == "S7-E5c" }
+
+    @Test fun E41_theE5cUnitIsExact_andContinuesEveryChain() {
+        assertEquals("premise: the seventh and last unit is S7-E5c", listOf("S7-E5c", 7), listOf(e5c.str("id"), json.getValue("units").jsonArray.size))
+        assertEquals("its parent is the S7-E5a2 commit and its record the agreed exact design",
+            listOf(e5cParent, e5cApproval), listOf(e5c.str("source_parent"), e5c.str("approval_record_sha256")))
+        val changed = e5c.getValue("changed").jsonObject
+        assertEquals("the unit's exact changes", e5cChanged, changed.keys)
+        assertEquals("and no additions", emptySet<String>(), e5c.getValue("added").jsonObject.keys)
+        assertEquals("the service continues S7-N1's link", messagingEntry.str("to"), e5cEntry(messaging).str("from"))
+        assertEquals("the activity's history is its product base", productBase.getValue(activity), e5cEntry(activity).str("from"))
+        assertEquals("the registry continues S7-N1's addition", n1.getValue("added").jsonObject.getValue(registry).jsonPrimitive.content,
+            e5cEntry(registry).str("from"))
+        assertEquals("the owner continues S7-E5a2's chain", e5a2.getValue("changed").jsonObject.getValue(bankOwner).jsonObject.str("to"),
+            e5cEntry(bankOwner).str("from"))
+        for (path in setOf(registry, bankOwner)) {
+            assertTrue("$path's bytes before S7-E5c are reviewed KRX-free", e5cEntry(path).str("from") in PostS6ApprovedDelta.NO_KRX_REVIEWED)
+            assertFalse("$path is no forbidden S6 surface", path in PostS6ApprovedDelta.FORBIDDEN_PATHS ||
+                PostS6ApprovedDelta.FORBIDDEN_PREFIXES.any { path.startsWith(it) })
+        }
+        assertEquals(emptyList<String>(), errors(json))
+    }
+
+    @Test fun E42_theTwoE5cExceptionsValidate_andTheKrxCheckUsesEachPathsRealLastFrom() {
+        assertEquals("two exceptions, the service and the activity", listOf(messaging, activity), e5cCores.map { it.path })
+        for (core in e5cCores) {
+            val entry = e5cEntry(core.path)
+            assertEquals(listOf(core.sourceParent, core.approvalRecordSha256, core.from, core.to),
+                listOf(e5cParent, e5cApproval, entry.str("from"), entry.str("to")))
+            assertTrue("premise: ${core.path} is a forbidden S6 surface", core.path in PostS6ApprovedDelta.FORBIDDEN_PATHS)
+            assertFalse("${core.path}'s history before S7-E5c is not on the KRX-free list", core.from in PostS6ApprovedDelta.NO_KRX_REVIEWED)
+            assertEquals("the final bytes keep the pinned KRX lines", core.krxLinesSha256, PostS6ApprovedDelta.krxLinesSha256(File(core.path).readText()))
+        }
+        val n1Core = PostS6ApprovedDelta.CORE_EXCEPTIONS.single { it.unitId == "S7-N1" }
+        assertEquals("the service's two links pin the same KRX lines", n1Core.krxLinesSha256, e5cCores.first { it.path == messaging }.krxLinesSha256)
+        assertEquals("the activity's reviewed KRX lines", "e61ab21d19206fde24d0b2a8d74e0e75def7397c1ac1d3be33f8514b07b725aa",
+            e5cCores.first { it.path == activity }.krxLinesSha256)
+        val ledger = PostS6ApprovedDelta.ledger()
+        assertEquals("the service's last from is S7-E5c's real from, its original the product base",
+            listOf(n1Core.to, productBase.getValue(messaging)), listOf(ledger.lastFrom[messaging], ledger.original[messaging]))
+        assertEquals("the activity's last from and original are its product base",
+            listOf(productBase.getValue(activity), productBase.getValue(activity)), listOf(ledger.lastFrom[activity], ledger.original[activity]))
+        assertEquals("an added path's last from is its last change's from", e5cEntry(registry).str("from"), ledger.lastFrom[registry])
+        assertEquals("and it stays an addition in history", null, ledger.original[registry])
+        assertEquals(emptyList<String>(), PostS6ApprovedDelta.actualErrors(ledger, PostS6ApprovedDelta.actualSources()))
+        // The cumulative original→final pair is no exception: a hand-built ledger that names it gets no KRX pass.
+        val cumulative = PostS6ApprovedDelta.Ledger(mapOf(messaging to productBase.getValue(messaging)), mapOf(messaging to e5cEntry(messaging).str("to")))
+        assertEquals("the synthetic pair is KRX-checked as any path", listOf("krx-reference $messaging"),
+            PostS6ApprovedDelta.actualErrors(cumulative, PostS6ApprovedDelta.actualSources()))
+    }
+
+    @Test fun E43_aMissingOrUnapprovedPredecessorLinkFailsTheWholeLedger() {
+        val n1WithoutService = n1.with("changed", JsonObject(n1.getValue("changed").jsonObject - messaging))
+        val dropped = PostS6ApprovedDelta.parse(withUnits(unit(0), unit(1), unit(2), n1WithoutService, unit(4), unit(5), e5c).toString().toByteArray(),
+            inventory, s64b, null)
+        assertTrue("the E5c link no longer continues anything: ${dropped.first}", dropped.first.contains("from $messaging"))
+        assertEquals("and there is no ledger", null, dropped.second)
+        val wrongApproval = n1.with("approval_record_sha256", JsonPrimitive(someHash))
+        val broken = PostS6ApprovedDelta.parse(withUnits(unit(0), unit(1), unit(2), wrongApproval, unit(4), unit(5), e5c).toString().toByteArray(),
+            inventory, s64b, null)
+        assertTrue("the predecessor's own exception fails though the last pair matches: ${broken.first}",
+            broken.first.contains("forbidden $messaging"))
+        assertEquals("and there is no ledger", null, broken.second)
+    }
+
+    @Test fun E44_eachE5cExceptionBelongsToItsOneUnitParentPathAndTo() {
+        val elsewhere = (PostS6ApprovedDelta.FORBIDDEN_PATHS - PostS6ApprovedDelta.ledger().final.keys).sorted().first()
+        for (path in listOf(messaging, activity)) {
+            val entry = e5cEntry(path)
+            for ((label, other) in listOf(
+                "another id" to e5c.with("id", JsonPrimitive("S7-E5d")),
+                "another parent" to e5c.with("source_parent", JsonPrimitive("1".repeat(40))),
+                "another approval" to e5c.with("approval_record_sha256", JsonPrimitive(someHash)),
+                "S7-E5a2's approval" to e5c.with("approval_record_sha256", JsonPrimitive(e5a2Approval)),
+                "another to" to e5cWith(path, changedEntry(entry.str("from"), someHash))
+            )) {
+                val found = errors(unitsWithE5c(other))
+                assertTrue("$path $label: $found", found.contains("forbidden $path"))
+            }
+            val rest = e5c.getValue("changed").jsonObject - path
+            val moved = e5c.with("changed", JsonObject(rest + (elsewhere to entry)))
+            assertTrue("$path moved to $elsewhere", errors(unitsWithE5c(moved)).contains("forbidden $elsewhere"))
+            val asAddition = e5c.with("changed", JsonObject(rest)).with("added", JsonObject(mapOf(path to JsonPrimitive(entry.str("to")))))
+            assertTrue("$path as an addition", errors(unitsWithE5c(asAddition)).contains("forbidden $path"))
+        }
+    }
+
+    @Test fun E45_theE5cPathsKrxLinesArePinned_andAnyOtherByteIsAnActualHash() {
+        val ledger = PostS6ApprovedDelta.ledger()
+        val actual = PostS6ApprovedDelta.actualSources()
+        for (path in listOf(messaging, activity)) {
+            val text = actual.getValue(path).toString(Charsets.UTF_8)
+            assertTrue("premise: $path has a KRX line", "if (krxContestSwitch.enabled) {" in text)
+            val edited = text.replaceFirst("if (krxContestSwitch.enabled) {", "if (krxContestSwitch.enabled ) {").toByteArray()
+            assertEquals("$path: a KRX line edited", listOf("actual-hash $path", "core-krx-lines $path"),
+                PostS6ApprovedDelta.actualErrors(ledger, actual + (path to edited)))
+            val more = (text + "\nprivate val krxBypass = 1\n").toByteArray()
+            assertEquals("$path: a KRX line added", listOf("actual-hash $path", "core-krx-lines $path"),
+                PostS6ApprovedDelta.actualErrors(ledger, actual + (path to more)))
+            val plain = (text + "\n// a comment with krx in it\n").toByteArray()
+            assertEquals("$path: any other byte", listOf("actual-hash $path"), PostS6ApprovedDelta.actualErrors(ledger, actual + (path to plain)))
+        }
+    }
+
+    @Test fun E46_aLaterUnitCannotContinueTheE5cExceptions() {
+        for (path in listOf(messaging, activity)) {
+            val next = JsonObject(mapOf("id" to JsonPrimitive("S7-E5d"), "source_parent" to JsonPrimitive("1".repeat(40)),
+                "approval_record_sha256" to JsonPrimitive(e5cApproval),
+                "changed" to JsonObject(mapOf(path to changedEntry(e5cEntry(path).str("to"), someHash))), "added" to JsonObject(emptyMap())))
+            assertTrue("$path", errors(withUnits(unit(0), unit(1), unit(2), unit(3), unit(4), unit(5), e5c, next)).contains("forbidden $path"))
+        }
+    }
+
+    /**
+     * Gap G14 (`s7e5c_gaphunt.codex.r1.md` §3): each E5c exception binds its from. Only that one entry's from changes, the rest of
+     * the unit and every other unit stay as approved; the forbidden rule must fire for it on its own, beside the chain errors.
+     */
+    @Test fun `S7E5C_G14_E47 each E5c exception from alone is forbidden`() {
+        val (control, controlLedger) = PostS6ApprovedDelta.parse(unitsWithE5c(e5c).toString().toByteArray(), inventory, s64b, null)
+        assertEquals("premise: the unaltered E5c unit validates", emptyList<String>(), control)
+        assertTrue("premise: and folds a ledger", controlLedger != null)
+        for (path in listOf(messaging, activity)) {
+            val entry = e5cEntry(path)
+            assertTrue("premise: $path is a forbidden S6 surface", path in PostS6ApprovedDelta.FORBIDDEN_PATHS)
+            val (found, ledger) = PostS6ApprovedDelta.parse(
+                unitsWithE5c(e5cWith(path, changedEntry(someHash, entry.str("to")))).toString().toByteArray(), inventory, s64b, null)
+            assertEquals("$path another from alone: forbidden, the broken link and the unreviewed history, and nothing else",
+                listOf("forbidden $path", "from $path", "krx-before-unreviewed $path"), found)
+            assertEquals("$path another from alone: no ledger", null, ledger)
+        }
     }
 }
