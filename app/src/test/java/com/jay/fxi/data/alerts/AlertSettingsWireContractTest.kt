@@ -377,7 +377,9 @@ class AlertSettingsWireContractTest {
                 },
                 premium = MutableStateFlow(OwnedPremiumAccess("user-a", 1, PremiumAccessState.PremiumConfirmed)),
                 accessRevisions = MutableStateFlow(0L),
-                graphHostReady = MutableStateFlow(true)
+                graphHostReady = MutableStateFlow(true),
+                setEnabledRemote = { _, _, _, _ -> error("S7E5A2: no toggle in this test") },
+                deleteRemote = { _, _, _ -> error("S7E5A2: no delete in this test") }
             )
             // Let the owner take its first signal values, as it has by the time a registry tells it the foreground.
             yield()

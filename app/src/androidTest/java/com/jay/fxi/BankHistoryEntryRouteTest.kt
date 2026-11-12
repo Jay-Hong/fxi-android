@@ -213,6 +213,8 @@ class BankHistoryEntryRouteTest {
                 override fun ensure() { ensures.incrementAndGet() }
                 override fun authoritative() { retries.incrementAndGet() }
                 override fun manual() { refreshes.incrementAndGet() }
+                override fun setEnabled(id: Int, enabled: Boolean) {}
+                override fun delete(id: Int) {}
             }
         }
     }

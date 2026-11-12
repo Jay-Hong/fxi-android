@@ -394,8 +394,9 @@ class AuthenticatedApiClient internal constructor(
 
     suspend fun createNotificationSetting(
         owner: AuthSnapshot,
-        request: AlertSettingRequest
-    ): AuthenticatedHttpResponse<AlertSetting> = transport.executeMutation(owner) {
+        request: AlertSettingRequest,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthenticatedHttpResponse<AlertSetting> = transport.executeMutation(owner, useAdmitted) {
         service.createNotificationSetting(it, request)
     }
             .preserve(AuthenticatedEndpoint.NOTIFICATION_SETTINGS)
@@ -404,8 +405,9 @@ class AuthenticatedApiClient internal constructor(
     suspend fun updateNotificationSetting(
         owner: AuthSnapshot,
         id: Int,
-        request: AlertSettingRequest
-    ): AuthenticatedHttpResponse<AlertSetting> = transport.executeMutation(owner) {
+        request: AlertSettingRequest,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthenticatedHttpResponse<AlertSetting> = transport.executeMutation(owner, useAdmitted) {
         service.updateNotificationSetting(it, id, request)
     }
             .preserve(AuthenticatedEndpoint.UPDATE_NOTIFICATION_SETTING)
@@ -414,17 +416,19 @@ class AuthenticatedApiClient internal constructor(
     suspend fun updateNotificationSettingPartial(
         owner: AuthSnapshot,
         id: Int,
-        request: AlertSettingUpdateRequest
-    ): AuthenticatedHttpResponse<AlertSetting> = transport.executeMutation(owner) {
+        request: AlertSettingUpdateRequest,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthenticatedHttpResponse<AlertSetting> = transport.executeMutation(owner, useAdmitted) {
         service.updateNotificationSettingPartial(it, id, request)
     }.preserve(AuthenticatedEndpoint.UPDATE_NOTIFICATION_SETTING)
         .decodeSuccess(wireJson)
 
     suspend fun deleteNotificationSetting(
         owner: AuthSnapshot,
-        id: Int
+        id: Int,
+        useAdmitted: (() -> Boolean)? = null
     ): AuthenticatedHttpResponse<Unit> =
-        transport.executeMutation(owner) { service.deleteNotificationSetting(it, id) }
+        transport.executeMutation(owner, useAdmitted) { service.deleteNotificationSetting(it, id) }
             .preserve(AuthenticatedEndpoint.DELETE_NOTIFICATION_SETTING)
             .asUnit()
 

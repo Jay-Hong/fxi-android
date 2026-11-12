@@ -14,6 +14,7 @@ import com.jay.fxi.data.alerts.AlertLoadPhase
 import com.jay.fxi.data.alerts.BankAlertSettingsOwner
 import com.jay.fxi.data.alerts.BankAlertSettingsState
 import com.jay.fxi.data.alerts.ManualRefreshState
+import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.repository.AlertRepositoryFailureKind
 import com.jay.fxi.domain.model.AlertSetting
 import com.jay.fxi.domain.model.FreeTab
@@ -95,6 +96,11 @@ internal object BankAlertSectionTags {
     const val EMPTY = "bank-alert-empty"
     const val ROWS = "bank-alert-rows"
     fun row(id: Int): String = "bank-alert-row-$id"
+    fun toggle(id: Int): String = "bank-alert-toggle-$id"
+    fun delete(id: Int): String = "bank-alert-delete-$id"
+    const val DELETE_DIALOG = "bank-alert-delete-dialog"
+    const val DELETE_CONFIRM = "bank-alert-delete-confirm"
+    const val DELETE_CANCEL = "bank-alert-delete-cancel"
 }
 
 /** Defined in this same holder file. A projection/delegation seam, never another canonical settings owner. */
@@ -104,6 +110,8 @@ internal interface BankAlertSectionSource {
     fun ensure()
     fun authoritative()
     fun manual()
+    fun setEnabled(id: Int, enabled: Boolean)
+    fun delete(id: Int)
 }
 
 internal fun interface BankAlertSectionSourceFactory {
@@ -122,6 +130,8 @@ internal object ProductionBankAlertSectionSourceFactory : BankAlertSectionSource
             override fun ensure() = owner.ensure()
             override fun authoritative() = owner.authoritative()
             override fun manual() = owner.manual()
+            override fun setEnabled(id: Int, enabled: Boolean) = owner.setEnabled(id, enabled)
+            override fun delete(id: Int) = owner.delete(id)
         }
     }
 }
@@ -140,12 +150,16 @@ internal fun BankAlertSection(
     key(source) {
         val settings by source.settings.collectAsState()
         val manual by source.manualRefresh.collectAsState()
+        val actionIdentity: AuthIdentityFence? = settings.identity
         LaunchedEffect(source, tab) { source.ensure() }
         AlertSection(
             currency = currency,
             state = bankAlertSectionState(settings, manual, currency),
             onRetry = source::authoritative,
             onRefresh = source::manual,
+            actionIdentity = actionIdentity,
+            onToggle = { id, enabled -> if (actionIdentity != null && source.settings.value.identity == actionIdentity) source.setEnabled(id, enabled) },
+            onDelete = { id -> if (actionIdentity != null && source.settings.value.identity == actionIdentity) source.delete(id) },
             modifier = modifier
         )
     }

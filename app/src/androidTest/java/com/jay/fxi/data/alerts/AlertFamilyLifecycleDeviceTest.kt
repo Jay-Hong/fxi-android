@@ -133,7 +133,9 @@ class AlertFamilyLifecycleDeviceTest {
             owner = BankAlertSettingsOwner(
                 { o, admitted -> repository.getSettings(o, admitted) }, access, AlertRateLimitFloor(SystemClock::elapsedRealtime),
                 AlertRetryPolicy(), SystemClock::elapsedRealtime, { 0.0 }, scope, { delay(it) },
-                premium, MutableStateFlow(0L), MutableStateFlow(true)
+                premium, MutableStateFlow(0L), MutableStateFlow(true),
+                { _, _, _, _ -> error("S7E5A2: no toggle in this test") },
+                { _, _, _ -> error("S7E5A2: no delete in this test") }
             )
             registry = AlertFamilyRefresherRegistry(
                 listOf({ owner }),

@@ -149,6 +149,15 @@ class BankAlertSectionStructureTest {
             Triple("ensure delegated to authoritative", flatEdit(methodOverride("ensure", er)) { "override fun ensure() = $r.authoritative()" }, "A-ensure"),
             Triple("authoritative delegated to manual", flatEdit(methodOverride("authoritative", er)) { "override fun authoritative() = $r.manual()" }, "A-authoritative"),
             Triple("manual doing more", flatEdit(methodOverride("manual", er)) { "override fun manual() { $r.manual(); $r.ensure() }" }, "A-manual"),
+            Triple("setEnabled delegated to delete", flatEdit(argOverride("setEnabled", "id: Int, enabled: Boolean", "id, enabled", er)) {
+                "override fun setEnabled(id: Int, enabled: Boolean) = $r.delete(id)" }, "A-setEnabled"),
+            Triple("setEnabled inverted", flatEdit(argOverride("setEnabled", "id: Int, enabled: Boolean", "id, enabled", er)) {
+                "override fun setEnabled(id: Int, enabled: Boolean) = $r.setEnabled(id, !enabled)" }, "A-setEnabled"),
+            Triple("delete doing more", flatEdit(argOverride("delete", "id: Int", "id", er)) { "override fun delete(id: Int) { $r.delete(id); $r.ensure() }" }, "A-delete"),
+            Triple("a toggle callback without the identity check", flatEdit(Regex(Regex.escape(BINDINGS[2]))) {
+                "onToggle = { id, enabled -> source.setEnabled(id, enabled) }," }, "A-binding"),
+            Triple("a delete callback re-bound to the latest snapshot", flatEdit(Regex(Regex.escape(BINDINGS[3]))) {
+                "onDelete = { id -> if (source.settings.value.identity != null) source.delete(id) }," }, "A-binding"),
             Triple("a second resolution", appended(HOLDER,
                 "@Composable private fun S7e5a1(c: Context) { val o = EntryPointAccessors.fromApplication(c, BankAlertSectionEntryPoint::class.java).bankAlertSettingsOwner() }"),
                 "A-resolution"),
@@ -218,14 +227,14 @@ class BankAlertSectionStructureTest {
 
     // ---- S: AlertSection's read-only surface ----
 
-    @Test fun `S7E5A1_R3_S01 AlertSection keeps the read-only signature and names no Switch delete add edit permission entry AlertRow or view model`() {
+    @Test fun `S7E5A1_R3_S01 AlertSection keeps the agreed signature and names no add edit permission entry AlertRow or view model`() {
         assertNotNull("premise(R3 S): AlertSection is declared once", declaration(code.getValue(SECTION), "AlertSection"))
         assertTrue("premise(R3 S): the patterns see the legacy names where they live",
-            Regex(sectionForbidden("Switch")).containsMatchIn(code.getValue(ROW)) && Regex(sectionForbidden("AlertRow")).containsMatchIn(code.getValue(ROW)))
+            SWITCH_CALL.containsMatchIn(code.getValue(ROW)) && Regex(sectionForbidden("AlertRow")).containsMatchIn(code.getValue(ROW)))
         assertEquals("R3 S: signature and entries", emptyList<String>(), sectionSignature(code) + sectionEntries(code))
     }
 
-    @Test fun `S7E5A1_R3_S02 AlertSection keeps click surfaces in the header and the error retry and none in the read-only row render`() {
+    @Test fun `S7E5A1_R3_S02 AlertSection keeps click surfaces in the header the error retry and the agreed row actions only`() {
         val text = code.getValue(SECTION)
         val problems = mutableListOf<String>()
         val r = regions(text, problems)
@@ -242,14 +251,15 @@ class BankAlertSectionStructureTest {
     }
 
     @Test fun `S7E5A1_R3_S03 the entry lock catches each entry by alias import qualified name function reference or escaped string and accepts comments and lookalikes`() {
-        fun entries(tree: Map<String, String>) = sectionSignature(tree) + sectionEntries(tree)
+        fun entries(tree: Map<String, String>) = sectionSignature(tree) + sectionEntries(tree) + sectionRowActions(tree)
         assertEquals("premise: the real tree is clean", emptyList<String>(), entries(code))
         for ((label, tree, tag) in listOf(
-            Triple("a qualified Switch in a row", atSectionTag("row", "androidx.compose.material3.Switch(checked = true, onCheckedChange = null) "), "S-entry Switch"),
-            Triple("a Switch by alias import", withImport(SECTION, "import androidx.compose.material3.Switch as Toggle"), "S-entry Switch"),
-            Triple("a delete button", appended(SECTION, "@Composable private fun S7e5a1(onDelete: () -> Unit) = IconButton(onClick = onDelete) { }"), "S-entry delete"),
-            Triple("an escaped delete label", appended(SECTION, "private val s7e5a1 = \"\\uc0ad\\uc81c\""), "S-entry delete"),
-            Triple("a delete dialog", appended(SECTION, "@Composable private fun S7e5a1() = AlertDialog(onDismissRequest = { }, confirmButton = { })"), "S-entry delete"),
+            Triple("a qualified Switch in a row", atSectionTag("row", "androidx.compose.material3.Switch(checked = true, onCheckedChange = null) "), "R-switch"),
+            Triple("a Switch by alias import", withImport(SECTION, "import androidx.compose.material3.Switch as Toggle"), "R-alias"),
+            Triple("a checkbox in a row", atSectionTag("row", "Checkbox(checked = true, onCheckedChange = null) "), "S-entry toggle-other"),
+            Triple("a delete button", appended(SECTION, "@Composable private fun S7e5a1(onDelete: () -> Unit) = IconButton(onClick = onDelete) { }"), "R-delete"),
+            Triple("an escaped delete label", appended(SECTION, "private val s7e5a1 = \"\\uc0ad\\uc81c\""), "R-delete-label"),
+            Triple("a delete dialog", appended(SECTION, "@Composable private fun S7e5a1() = AlertDialog(onDismissRequest = { }, confirmButton = { })"), "R-dialog"),
             Triple("an add button", appended(SECTION, "@Composable private fun S7e5a1(onAdd: () -> Unit) = TextButton(onClick = onAdd) { Text(\"알림 추가\") }"), "S-entry add"),
             Triple("an add icon", appended(SECTION, "private val s7e5a1 = Icons.Default.Add"), "S-entry add"),
             Triple("the count limit", appended(SECTION, "private val s7e5a1 = com.jay.fxi.ui.viewmodel.AlertViewModel.MAX_COUNT"), "S-entry add"),
@@ -315,6 +325,28 @@ class BankAlertSectionStructureTest {
             "comments only" to appended(SECTION, "// Modifier.clickable { } IconButton(onClick = { })\n/* Switch() Role.Button */\nprivate val s7e5a1Control = 1"))) {
             assertClean("R3 S, $label", sectionClicks(tree))
         }
+    }
+
+    @Test fun `S7E5A2_S05 AlertSection draws one target-valued switch and one delete button per row and one identity-bound confirmation`() {
+        assertEquals("S7E5A2 S: row actions", emptyList<String>(), sectionRowActions(code))
+    }
+
+    @Test fun `S7E5A2_S06 the row action lock catches an inverted untagged or extra switch an unconfirmed or re-bound delete and copy drift`() {
+        assertEquals("premise: the real tree is clean", emptyList<String>(), sectionRowActions(code))
+        for ((label, tree, tag) in listOf(
+            Triple("an inverted switch", edited(SECTION, """\bonCheckedChange\s*=\s*onToggle\b""", "onCheckedChange = { onToggle(!setting.isEnabled) }"), "R-switch-target"),
+            Triple("an untagged switch", edited(SECTION, """\.testTag\(BankAlertSectionTags\.toggle\(setting\.id\)\)""", ""), "R-switch-tag"),
+            Triple("a second switch in the header", atSectionTag("REFRESH", "Switch(checked = true, onCheckedChange = { }) "), "R-switch"),
+            Triple("a delete without confirmation", edited(SECTION, """pendingDelete = PendingBankDelete\(""", "onDelete(setting.id); PendingBankDelete("), "R-delete-confirm"),
+            Triple("a confirmation calling the latest callback", edited(SECTION, """\bpending\s*\.\s*confirm\s*\(\s*\)""", "onDelete(0)"), "R-dialog-confirm"),
+            Triple("a pending delete kept across identities", edited(SECTION, """\bremember\s*\(\s*actionIdentity\s*\)""", "remember"), "R-pending-identity"),
+            Triple("a changed dialog title", edited(SECTION, """"알림 삭제"""", "\"삭제 확인\""), "R-dialog-copy"),
+            Triple("an untagged confirm button", edited(SECTION, """\.testTag\(BankAlertSectionTags\.DELETE_CONFIRM\)""", ""), "R-dialog-tag"),
+            Triple("a second toggle call", appended(SECTION, "private fun s7e5a2(onToggle: (Int, Boolean) -> Unit) = onToggle(1, true)"), "R-toggle-call"))) {
+            assertCaught("S7E5A2 R $label", tag, sectionRowActions(tree))
+        }
+        assertClean("S7E5A2 R, comments only", sectionRowActions(appended(SECTION,
+            "// Switch( AlertDialog( onDelete( onToggle( 삭제 remember(actionIdentity)\n/* IconButton(onClick = onDelete) */\nprivate val s7e5a2Control = 1")))
     }
 
     // ---- P: the premium route's mount ----
@@ -470,7 +502,7 @@ class BankAlertSectionStructureTest {
         const val DATA_ALERTS = "/com/jay/fxi/data/alerts/"
 
         /** API r2 §2: the owner members the adapter uses. */
-        val OWNER_ALLOWED = setOf("state", "manualRefresh", "ensure", "authoritative", "manual")
+        val OWNER_ALLOWED = setOf("state", "manualRefresh", "ensure", "authoritative", "manual", "setEnabled", "delete")
         /** The N1 owner members the holder must not use (the reader computes the full set from the owner's source). */
         val OWNER_OTHERS = setOf("manualOutcomes", "reset", "onForeground", "onBackground", "onSync")
 
@@ -495,8 +527,9 @@ class BankAlertSectionStructureTest {
 
         /** API r2 §3 / §5 row 3: what AlertSection never draws or names. */
         val SECTION_FORBIDDEN = listOf(
-            "Switch" to """\bSwitch\w*|\bCheckbox\b|\bTriStateCheckbox\b|\btoggleable\b|\btriStateToggleable\b|\bonCheckedChange\b""",
-            "delete" to """(?i)delete|삭제|\bAlertDialog\b|\bSwipeToDismiss\w*""",
+            // S7 E5a2: the row switch, the delete button and its dialog are governed by sectionRowActions instead.
+            "toggle-other" to """\bCheckbox\b|\bTriStateCheckbox\b|\btoggleable\b|\btriStateToggleable\b|\bSlider\b""",
+            "swipe" to """\bSwipeToDismiss\w*""",
             "add" to """\bonAdd\w*|\bAlertAddSheet\b|\bAddAlert\w*|\bIcons\s*\.\s*\w+\s*\.\s*Add\b|\bFloatingActionButton\b|추가|\bMAX_COUNT\b""",
             "edit" to """(?i)edit|편집|수정|\bonTap\b|\bonLongClick\b""",
             "permission" to """(?i)permission|POST_NOTIFICATIONS|opensettings|\bACTION_\w*SETTINGS\b|\bActivityResultContracts\b|\brememberLauncherForActivityResult\b|\bstartActivit(?:y|ies)\w*|\bareNotificationsEnabled\b""",
@@ -505,6 +538,7 @@ class BankAlertSectionStructureTest {
 
         /** API r2 §3: the read-only signature, squashed. */
         val SIGNATURE = listOf("currency: SupportedCurrency", "state: BankAlertSectionState", "onRetry: () -> Unit", "onRefresh: () -> Unit",
+            "actionIdentity: AuthIdentityFence?", "onToggle: (Int, Boolean) -> Unit", "onDelete: (Int) -> Unit",
             "modifier: Modifier = Modifier", "metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current")
 
         /** Click modifiers and semantics actions: allowed in the header only. */
@@ -533,7 +567,7 @@ class BankAlertSectionStructureTest {
         val IMPL_FACTORY = Regex("""\bobject\s*:\s*(?:[\w.<>]+(?:\([^()]*\))?\s*,\s*)*BankAlertSectionSourceFactory\b|\b(?:object|class)\s+\w+[^{}=]*?:\s*(?:[\w.<>]+(?:\([^()]*\))?\s*,\s*)*BankAlertSectionSourceFactory\b|\bimplements\s+(?:[\w.]+\s*,\s*)*BankAlertSectionSourceFactory\b""")
         val FACTORY_BRACE = Regex("""\bBankAlertSectionSourceFactory\s*\{""")
         val SOURCE_SHAPE = setOf("val settings: StateFlow<BankAlertSettingsState>", "val manualRefresh: StateFlow<ManualRefreshState>",
-            "fun ensure()", "fun authoritative()", "fun manual()")
+            "fun ensure()", "fun authoritative()", "fun manual()", "fun setEnabled(id: Int, enabled: Boolean)", "fun delete(id: Int)")
         val FACTORY_SHAPE = setOf("fun create(context: Context): BankAlertSectionSource")
 
         val CALL = Regex("""\bBankAlertSection\s*\(""")
@@ -557,6 +591,20 @@ class BankAlertSectionStructureTest {
 
         fun flowOverride(name: String, type: String, receiver: String, member: String) =
             Regex("""\boverride val $name(?: ?: ?StateFlow<$type>)? (?:= |get\(\) = )$receiver\.$member(?= override\b| \}|$)""")
+
+        /** S7 E5a2: a one-to-one delegation with arguments, squashed: `override fun name(params) = r.name(args)` or its block form. */
+        fun argOverride(name: String, params: String, args: String, receiver: String) =
+            Regex("""\boverride fun $name\($params\)(?: ?: ?Unit)? (?:= $receiver\.$name\($args\)(?= override\b| \}|$)|\{ $receiver\.$name\($args\) \})""")
+
+        val SWITCH_CALL = Regex("""\bSwitch\s*\(""")
+        val ICON_BUTTON_CALL = Regex("""\bIconButton\s*\(""")
+        val DIALOG_CALL = Regex("""\bAlertDialog\s*\(""")
+        /** The holder's three binding lines, squashed: every row action is bound to the identity the frame rendered. */
+        val BINDINGS = listOf(
+            "val actionIdentity: AuthIdentityFence? = settings.identity",
+            "actionIdentity = actionIdentity,",
+            "onToggle = { id, enabled -> if (actionIdentity != null && source.settings.value.identity == actionIdentity) source.setEnabled(id, enabled) },",
+            "onDelete = { id -> if (actionIdentity != null && source.settings.value.identity == actionIdentity) source.delete(id) },").map { squash(it) }
 
         fun methodOverride(name: String, receiver: String) =
             Regex("""\boverride fun $name\(\)(?: ?: ?Unit)? (?:= $receiver\.$name\(\)(?= override\b| \}|$)|\{ $receiver\.$name\(\) \})""")
@@ -960,6 +1008,10 @@ class BankAlertSectionStructureTest {
             for (name in listOf("ensure", "authoritative", "manual")) {
                 if (methodOverride(name, r).findAll(flat).count() != 1) v += "A-$name"
             }
+            if (argOverride("setEnabled", "id: Int, enabled: Boolean", "id, enabled", r).findAll(flat).count() != 1) v += "A-setEnabled"
+            if (argOverride("delete", "id: Int", "id", r).findAll(flat).count() != 1) v += "A-delete"
+            for (line in BINDINGS) if (count(flat, Regex.escape(line)) != 1) v += "A-binding $line"
+            if (count(text, """\bsource\s*\.\s*setEnabled\b""") != 1 || count(text, """\bsource\s*\.\s*delete\b""") != 1) v += "A-binding calls"
             return v
         }
 
@@ -1036,11 +1088,14 @@ class BankAlertSectionStructureTest {
             val r = regions(text, v) ?: return v
             val imports = IMPORT_LINE.findAll(text).map { it.range }.toList()
             fun within(p: Int, ranges: List<IntRange>) = ranges.any { p in it }
+            val actions = rowActionSpans(text, imports)
             for ((kind, regex) in listOf("modifier" to CLICK_MODIFIER, "action" to CLICK_ACTION)) {
                 for (m in regex.findAll(text)) {
                     val p = m.range.first
                     when {
                         within(p, imports) -> Unit
+                        // S7 E5a2: counted, placed and shaped by sectionRowActions.
+                        within(p, actions) -> Unit
                         within(p, r.rows) -> { v += "S-row-click ${m.value}" }
                         within(p, r.header) -> Unit
                         kind == "action" && within(p, r.error) -> Unit
@@ -1056,6 +1111,78 @@ class BankAlertSectionStructureTest {
             val retries = tagPattern("RETRY").findAll(text).map { it.range.first }.toList()
             if (retries.isEmpty() || !retries.all { within(it, r.error) } || !holds(r.error, """\bonRetry\b""")) v += "S-shape retry"
             if (!holds(r.header, """\bonRefresh\b""")) v += "S-shape refresh"
+            return v
+        }
+
+        /** A call from its name through its closing parenthesis and a directly trailing lambda. */
+        fun callSpan(text: String, name: MatchResult): IntRange? {
+            val open = text.indexOf('(', name.range.first)
+            val close = closing(text, open) ?: return null
+            var i = close + 1
+            while (i < text.length && text[i].isWhitespace()) i++
+            if (text.getOrNull(i) != '{') return name.range.first..close
+            val lambda = closing(text, i) ?: return null
+            return name.range.first..lambda
+        }
+
+        /** S7 E5a2: the spans of every Switch call, every IconButton holding the per-row delete tag, and every AlertDialog call. */
+        fun rowActionSpans(text: String, imports: List<IntRange>): List<IntRange> {
+            fun code(m: MatchResult) = imports.none { m.range.first in it }
+            val deleteTags = tagPattern("delete").findAll(text).map { it.range.first }.toList()
+            return SWITCH_CALL.findAll(text).filter(::code).mapNotNull { callSpan(text, it) }.toList() +
+                ICON_BUTTON_CALL.findAll(text).filter(::code).mapNotNull { callSpan(text, it) }.filter { s -> deleteTags.any { it in s } }.toList() +
+                DIALOG_CALL.findAll(text).filter(::code).mapNotNull { callSpan(text, it) }.toList()
+        }
+
+        /**
+         * S7 E5a2 R: the row's one target-valued switch and one delete button, and the one confirmation dialog that keeps the
+         * callback of the identity it was opened under. Toggle carries no permission; edit, add and row taps stay forbidden.
+         */
+        fun sectionRowActions(code: Map<String, String>): List<String> {
+            val text = code[SECTION] ?: return listOf("R-missing")
+            val v = mutableListOf<String>()
+            val problems = mutableListOf<String>()
+            val r = regions(text, problems) ?: return listOf("R-regions $problems")
+            val imports = IMPORT_LINE.findAll(text).map { it.range }.toList()
+            fun code(m: MatchResult) = imports.none { m.range.first in it }
+            fun inRows(p: Int) = r.rows.any { p in it }
+            fun body(s: IntRange) = text.substring(s.first, s.last + 1)
+            if (Regex("""\bimport\s+[\w.`]*\b(?:Switch|AlertDialog|IconButton)\b`?\s+as\b""").containsMatchIn(text)) v += "R-alias"
+            val switches = SWITCH_CALL.findAll(text).filter(::code).mapNotNull { callSpan(text, it) }.toList()
+            if (switches.size != 1) v += "R-switch ${switches.size}"
+            else {
+                val s = switches.single()
+                if (!inRows(s.first)) v += "R-switch-place"
+                if (count(body(s), tagPattern("toggle").pattern) != 1) v += "R-switch-tag"
+                if (count(body(s), """\bonCheckedChange\s*=\s*onToggle\s*[,)]""") != 1) v += "R-switch-target"
+                if (count(body(s), """\bchecked\s*=\s*setting\s*\.\s*isEnabled\s*[,)]""") != 1) v += "R-switch-checked"
+            }
+            if (count(text, """\bonCheckedChange\b""") != 1) v += "R-switch-target count"
+            val deleteTags = tagPattern("delete").findAll(text).toList()
+            val buttons = ICON_BUTTON_CALL.findAll(text).filter(::code).mapNotNull { callSpan(text, it) }
+                .filter { s -> deleteTags.any { it.range.first in s } }.toList()
+            if (deleteTags.size != 1 || buttons.size != 1) v += "R-delete ${deleteTags.size} ${buttons.size}"
+            else if (!inRows(buttons.single().first)) v += "R-delete-place"
+            if (count(text, """\bonClick\s*=\s*onDelete\s*[,)]""") != 1) v += "R-delete"
+            val dialogs = DIALOG_CALL.findAll(text).filter(::code).mapNotNull { callSpan(text, it) }.toList()
+            if (dialogs.size != 1) v += "R-dialog ${dialogs.size}"
+            else {
+                val d = dialogs.single()
+                val b = body(d)
+                if (inRows(d.first) || d.first in r.content) v += "R-dialog-place"
+                for (tag in listOf("DELETE_DIALOG", "DELETE_CONFIRM", "DELETE_CANCEL")) if (count(b, tagPattern(tag).pattern) != 1) v += "R-dialog-tag $tag"
+                if (count(b, """\bpending\s*\.\s*confirm\s*\(\s*\)""") != 1 || count(text, """\.\s*confirm\s*\(\s*\)""") != 1) v += "R-dialog-confirm"
+                for (copy in listOf(""""알림 삭제"""", """"'\$\{pending\.bankName\}' 알림을 삭제하시겠습니까\?"""", """"삭제"""", """"취소"""")) {
+                    if (count(b, copy) != 1) v += "R-dialog-copy $copy"
+                }
+            }
+            if (count(text, """\bremember\s*\(\s*actionIdentity\s*\)""") != 1) v += "R-pending-identity"
+            if (count(text, """(?<!\bclass\s)\bPendingBankDelete\s*\(""") != 1 || count(text, """\bonDelete\s*\(\s*id\s*\)""") != 1 ||
+                count(text, """\bonDelete\s*\(""") != 1) {
+                v += "R-delete-confirm"
+            }
+            if (count(text, """\bonToggle\s*\(\s*setting\s*\.\s*id\s*,\s*enabled\s*\)""") != 1 || count(text, """\bonToggle\s*\(""") != 1) v += "R-toggle-call"
+            if (count(text, "삭제") != 4) v += "R-delete-label ${count(text, "삭제")}"
             return v
         }
 

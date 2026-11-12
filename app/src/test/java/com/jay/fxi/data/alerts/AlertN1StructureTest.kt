@@ -419,7 +419,16 @@ class AlertN1StructureTest {
             Triple("jitter [0, 1)", editedLiteral(OWNER, "Random.nextDouble(-0.2, 0.2)", "Random.nextDouble()"), "S11-inject $OWNER"),
             Triple("jitter [0, 1) spelled out", editedLiteral(OWNER, "Random.nextDouble(-0.2, 0.2)", "Random.nextDouble(0.0, 1.0)"), "S11-inject $OWNER"),
             Triple("a recheck period passed by production",
-                editedLiteral(OWNER, "topic.graphHost.map { it != null }", "topic.graphHost.map { it != null }, 30_000"), "S11-inject $OWNER"),
+                editedLiteral(OWNER, "repository.deleteSetting(owner, id, admitted) }", "repository.deleteSetting(owner, id, admitted) }, 30_000"),
+                "S11-inject $OWNER"),
+            Triple("a toggle sending the inverse", editedLiteral(OWNER, "AlertSettingUpdateRequest(isEnabled = enabled)",
+                "AlertSettingUpdateRequest(isEnabled = !enabled)"), "S11-inject $OWNER"),
+            Triple("a toggle without the use check", editedLiteral(OWNER, "AlertSettingUpdateRequest(isEnabled = enabled), admitted)",
+                "AlertSettingUpdateRequest(isEnabled = enabled))"), "S11-inject $OWNER"),
+            Triple("a toggle that also sends a repeat change", editedLiteral(OWNER, "AlertSettingUpdateRequest(isEnabled = enabled)",
+                "AlertSettingUpdateRequest(isEnabled = enabled, repeatIntervalSec = kotlinx.serialization.json.JsonNull)"), "S11-inject $OWNER"),
+            Triple("a delete without the use check", editedLiteral(OWNER, "repository.deleteSetting(owner, id, admitted)", "repository.deleteSetting(owner, id)"),
+                "S11-inject $OWNER"),
             Triple("another recheck default", edited(OWNER, """accessRecheckMillis\s*:\s*Long\s*=\s*1_000""", "accessRecheckMillis: Long = 30_000"),
                 "S11-recheck"),
             Triple("a wall-clock floor", editedLiteral(FLOOR, "this(SystemClock::elapsedRealtime)", "this(System::currentTimeMillis)"), "S11-inject $FLOOR"),
@@ -913,14 +922,16 @@ class AlertN1StructureTest {
             return v
         }
 
-        /** S11: the agreed production `@Inject` delegations, squashed (API r1 §3–§6; r2/r3 §4–§6). */
+        /** S11: the agreed production `@Inject` delegations, squashed (API r1 §3–§6; r2/r3 §4–§6; S7 E5a2 API r3 §4.1 mutations). */
         val INJECT_FORMS: Map<String, String> by lazy {
             mapOf(
                 OWNER to """@Inject constructor(repository: AlertRepository, access: AlertSettingsAccess, floor: AlertRateLimitFloor,
                     coordinator: PremiumAccessCoordinator, topic: TopicRuntimeOwner) : this({ owner, admitted -> repository.getSettings(owner, admitted) },
                     access, floor, AlertRetryPolicy(), SystemClock::elapsedRealtime, { Random.nextDouble(-0.2, 0.2) },
                     CoroutineScope(SupervisorJob() + Dispatchers.Main), { delay(it) }, coordinator.state, coordinator.accessRevisions,
-                    topic.graphHost.map { it != null })""",
+                    topic.graphHost.map { it != null },
+                    { owner, id, enabled, admitted -> repository.updateSettingPartial(owner, id, AlertSettingUpdateRequest(isEnabled = enabled), admitted) },
+                    { owner, id, admitted -> repository.deleteSetting(owner, id, admitted) })""",
                 ACCESS to """@Inject constructor(tokens: AuthTokenProvider, topic: TopicRuntimeOwner, uses: TopicUseAuthority,
                     coordinator: PremiumAccessCoordinator, deletions: DeletionAdmissionStore) : this(tokens::currentIdentityFence,
                     topic.currentAccessFence, uses, { coordinator.state.value }, { ReleaseAdmission.isOpen },

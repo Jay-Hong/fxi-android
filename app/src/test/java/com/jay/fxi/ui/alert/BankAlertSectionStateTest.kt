@@ -353,7 +353,10 @@ class BankAlertSectionStateTest {
             },
             access, floor, AlertRetryPolicy(), { test.testScheduler.currentTime }, { 0.0 },
             CoroutineScope(job + StandardTestDispatcher(test.testScheduler)), { delay(it) },
-            premium, MutableStateFlow(0L), MutableStateFlow(false), 1_000L
+            premium, MutableStateFlow(0L), MutableStateFlow(false),
+            { _, _, _, _ -> error("S7E5A2: no toggle in this test") },
+            { _, _, _ -> error("S7E5A2: no delete in this test") },
+            1_000L
         )
 
         init {

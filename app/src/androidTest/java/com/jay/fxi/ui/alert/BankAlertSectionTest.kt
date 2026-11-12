@@ -54,8 +54,9 @@ import org.junit.Test
  * active-count badge (>0 only, follows the state, stays in the folded header); the static row labels (triggered → "알림 발송됨"
  * whatever the repeat, null repeat → no label, known → RepeatInterval.everyLabel, unknown → "반복 알림"), bank name,
  * condition and two-decimal threshold; an enabled and a disabled row that differ for accessibility as well, and never change;
- * no switch, delete, add, edit, selection, custom or click action inside the rows subtree, no dialog or popup after a tap,
- * long-press or swipe on a row and no mutation of the given settings; the header folds and unfolds, stays folded across a
+ * inside the rows subtree no add, edit, selection, custom or click action other than each row's own switch and delete button
+ * (S7 E5a2; their behaviour is S7E5A2BankRowActionsTest's), no dialog or popup after a tap, long-press or swipe on a row's
+ * content and no mutation of the given settings; the header folds and unfolds, stays folded across a
  * state update, and has no action other than refresh and folding; the refresh button's enabled and spinner states, and that
  * refresh and retry fire their callback once per tap when enabled and the disabled refresh fires none. Every query walks the
  * unmerged tree so that a merge choice of the implementation does not decide the outcome, except D16's, which reads what the
@@ -105,7 +106,10 @@ class BankAlertSectionTest {
                 currency = SupportedCurrency.USD_KRW,
                 state = shown.value,
                 onRetry = { retries.incrementAndGet() },
-                onRefresh = { refreshes.incrementAndGet() }
+                onRefresh = { refreshes.incrementAndGet() },
+                actionIdentity = null,
+                onToggle = { _, _ -> },
+                onDelete = { }
             )
         }
         rule.waitForIdle()
@@ -462,7 +466,7 @@ class BankAlertSectionTest {
     // ---- read-only boundary ----
 
     @Test
-    fun s7e5a1_D11_theRowsSubtreeHasNoSwitchDeleteAddEditOrClickAction() {
+    fun s7e5a1_D11_theRowsSubtreeHasNoAddEditOrClickActionBesidesEachRowsSwitchAndDeleteButton() {
         show(
             rows(
                 setting(41, order = 0, enabled = true, repeat = RepeatInterval.FIVE_MINUTES.seconds),
@@ -480,8 +484,18 @@ class BankAlertSectionTest {
         }
         val inside = subtree(BankAlertSectionTags.ROWS)
         assertTrue("premise: the rows subtree has its rows and their texts", inside.size > 3)
+        // S7 E5a2: each row's one switch and one delete button are the only controls; everything else stays inert.
+        listOf(41, 42, 43).forEach { id ->
+            val toggles = subtree(BankAlertSectionTags.toggle(id)).filter { SemanticsProperties.ToggleableState in it.config }
+            assertEquals("row $id has one switch", 1, toggles.size)
+            val deletes = subtree(BankAlertSectionTags.delete(id)).filter { SemanticsActions.OnClick in it.config }
+            assertEquals("row $id has one delete button", 1, deletes.size)
+            assertTrue("its delete button says so", subtree(BankAlertSectionTags.delete(id)).any { n -> words(n).any { "삭제" in it } })
+        }
+        val controls = listOf(41, 42, 43).flatMap { subtree(BankAlertSectionTags.toggle(it)) + subtree(BankAlertSectionTags.delete(it)) }
+            .map { it.id }.toSet()
 
-        inside.forEach { n ->
+        inside.filterNot { it.id in controls }.forEach { n ->
             val c = n.config
             assertFalse("no click action in a row", SemanticsActions.OnClick in c)
             assertFalse("no long-click action in a row", SemanticsActions.OnLongClick in c)
@@ -497,7 +511,7 @@ class BankAlertSectionTest {
     }
 
     @Test
-    fun s7e5a1_D12_theSectionsOnlyActionsAreRefreshAndFolding() {
+    fun s7e5a1_D12_theSectionsOnlyActionsAreRefreshFoldingAndTheRowControls() {
         show(rows(setting(51, order = 0), setting(52, order = 1, enabled = false)))
         assertHeader()
         assertBody(BankAlertSectionTags.ROWS)
@@ -505,7 +519,11 @@ class BankAlertSectionTest {
 
         val section = subtree(BankAlertSectionTags.ROOT)
         assertTrue("premise: the section has nodes", section.isNotEmpty())
-        section.forEach { n ->
+        // S7 E5a2: the row controls are S7E5A2BankRowActionsTest's; here they are only kept out of the inert scan.
+        val controls = listOf(51, 52).flatMap { subtree(BankAlertSectionTags.toggle(it)) + subtree(BankAlertSectionTags.delete(it)) }
+            .map { it.id }.toSet()
+        assertTrue("premise: the row controls are found", controls.isNotEmpty())
+        section.filterNot { it.id in controls }.forEach { n ->
             assertFalse("no switch in the section", SemanticsProperties.ToggleableState in n.config)
             assertFalse("no edit field in the section", SemanticsProperties.EditableText in n.config)
             words(n).forEach { w -> SECTION_FORBIDDEN.forEach { f -> assertFalse("'$f' in the section: $w", f in w) } }
@@ -513,7 +531,9 @@ class BankAlertSectionTest {
 
         // Any clickable besides refresh and the fold control may only fold and unfold (the header); nothing else fires.
         val others = hasClickAction() and inSubtree(BankAlertSectionTags.ROOT) and
-            !inSubtree(BankAlertSectionTags.REFRESH) and !inSubtree(BankAlertSectionTags.TOGGLE_EXPANDED)
+            !inSubtree(BankAlertSectionTags.REFRESH) and !inSubtree(BankAlertSectionTags.TOGGLE_EXPANDED) and
+            !inSubtree(BankAlertSectionTags.toggle(51)) and !inSubtree(BankAlertSectionTags.toggle(52)) and
+            !inSubtree(BankAlertSectionTags.delete(51)) and !inSubtree(BankAlertSectionTags.delete(52))
         val count = countOf(others)
         for (i in 0 until count) {
             tap(rule.onAllNodes(others, useUnmergedTree = true)[i])
@@ -714,7 +734,13 @@ class BankAlertSectionTest {
 
         val onPixels = capture(85)
         val offPixels = capture(86)
-        val w = minOf(onPixels.width, offPixels.width)
+        // S7 E5a2: the switch and the delete button stay fully opaque (as on iOS); compare only the content left of them.
+        fun contentWidth(id: Int): Int {
+            val row = rule.onNodeWithTag(BankAlertSectionTags.row(id), useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+            val toggle = rule.onNodeWithTag(BankAlertSectionTags.toggle(id), useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+            return (toggle.left - row.left).toInt()
+        }
+        val w = minOf(onPixels.width, offPixels.width, contentWidth(85), contentWidth(86))
         val h = minOf(onPixels.height, offPixels.height)
         assertTrue("premise: the captures share an area (${w}x$h)", w > 0 && h > 0)
         val (onBackground, onReach) = backgroundAndReach(onPixels, w, h)
@@ -910,6 +936,7 @@ class BankAlertSectionTest {
         const val NETWORK_COPY = "네트워크 연결을 확인해 주세요."
         const val LOGIN_COPY = "로그인이 필요합니다."
         const val GENERIC_COPY = "알림 설정을 불러오지 못했습니다."
+        /** S7 E5a2: "삭제" is the delete button's own label now, kept out of these inert scans with the button. */
         val ROW_FORBIDDEN = listOf("삭제", "편집", "수정", "추가")
         val SECTION_FORBIDDEN = listOf("삭제", "편집", "수정", "추가", "권한")
     }

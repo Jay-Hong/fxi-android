@@ -181,7 +181,10 @@ class BankAlertSettingsOwnerContractTest {
         val owner = BankAlertSettingsOwner(
             read, access, floor, AlertRetryPolicy(), { test.testScheduler.currentTime }, { 0.0 },
             CoroutineScope(job + StandardTestDispatcher(test.testScheduler)), sleep,
-            premium, accessRevisions, graphHostReady, recheck
+            premium, accessRevisions, graphHostReady,
+            { _, _, _, _ -> error("S7E5A2: no toggle in this test") },
+            { _, _, _ -> error("S7E5A2: no delete in this test") },
+            recheck
         )
         val outcomes = mutableListOf<ManualRefreshOutcome>()
 

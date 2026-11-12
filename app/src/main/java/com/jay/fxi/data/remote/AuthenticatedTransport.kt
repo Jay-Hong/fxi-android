@@ -20,8 +20,8 @@ import retrofit2.Response
 /**
  * Retrofit request tag whose rendering never exposes the Firebase bearer token.
  *
- * [use] is carried through to the request by [AuthSnapshotInterceptor] for a read whose every send must still be admitted
- * by the access it serves (L-4e E2a); null for everything else.
+ * [use] is carried through to the request by [AuthSnapshotInterceptor] for a read or a mutation whose every send must still be
+ * admitted by the access it serves (L-4e E2a; S7 E5a2 for mutations); null when the caller asks for no use check, the old path.
  */
 internal class AuthRequestTag(val snapshot: AuthSnapshot, val use: TopicUseTag? = null) {
     override fun toString(): String =
@@ -29,20 +29,22 @@ internal class AuthRequestTag(val snapshot: AuthSnapshot, val use: TopicUseTag? 
 }
 
 /**
- * One send of a use-checked read, as the network interceptor sees it.
+ * One send of a use-checked read or mutation, as the network interceptor sees it.
  *
- * Left on the request rather than removed with [AuthRequestTag], so a repeat OkHttp makes below the application interceptors
- * (`503 + Retry-After: 0`, a misdirected 421) still carries it: a tag is copied with the request.
+ * Left on the request rather than removed with [AuthRequestTag], so a read repeat OkHttp makes below the application
+ * interceptors (`503 + Retry-After: 0`, a misdirected 421) still carries it: a tag is copied with the request.
+ * A mutation has at most one send per executeMutation; its one-shot body prevents such follow-ups.
  */
 internal class TopicUseTag(val snapshot: AuthSnapshot, val send: Int, val context: TopicUseContext) {
     override fun toString(): String = "TopicUseTag(send=$send)"
 }
 
 /**
- * Shared by every send of one logical read: the use check, and every response those sends observed.
+ * Shared by every send of one logical use-checked read or mutation: the use check and the responses observed.
+ * A mutation has at most one send per executeMutation; only a read can have repeated sends or follow-up exchanges.
  *
  * Written from OkHttp's threads and read from the caller's coroutine, so everything goes through [lock]. Responses are
- * appended and never replaced, because one send can see several before it is refused.
+ * appended and never replaced; a read can observe several before a later exchange is refused.
  */
 internal class TopicUseContext(private val useAdmitted: () -> Boolean) {
     private val lock = Any()
@@ -85,13 +87,13 @@ internal class TopicUseContext(private val useAdmitted: () -> Boolean) {
     fun observed(): List<HttpExchangeEvidence> = synchronized(lock) { observed.toList() }
 }
 
-/** The access a use-checked read serves no longer admits a send. Converted to [TopicUseWithheldException] on the caller's coroutine. */
+/** The access a use-checked read or mutation serves no longer admits a send. Converted to [TopicUseWithheldException] on the caller's coroutine. */
 internal class WithheldUseIOException(val exchanges: List<HttpExchangeEvidence>) : IOException(
     "Protected request's access use is no longer admitted"
 )
 
 /**
- * A use-checked read was refused a send because the access it serves no longer admits it (L-4e E2a).
+ * A use-checked read or mutation was refused a send because the access it serves no longer admits it (L-4e E2a; S7 E5a2).
  *
  * Nothing was applied. [exchanges] are the responses its sends had already observed, oldest first, for the retry-floor
  * owner: the refusal is the session's, a rate limit the server levied is not.
@@ -113,7 +115,7 @@ internal class MissingAuthRequestTagException : IOException(
  * dispatcher thread instead of behaving like a normal Retrofit call cancellation.
  */
 internal class StaleAuthRequestIOException(
-    /** The responses a use-checked read had observed before this refused a send; empty for any other request. */
+    /** Responses a use-checked read or mutation observed before refusal; empty on the old null-use path when no use check was requested. */
     val exchanges: List<HttpExchangeEvidence> = emptyList()
 ) : IOException(
     "Protected request auth snapshot is no longer current"
@@ -143,12 +145,13 @@ internal class AuthSnapshotInterceptor @Inject constructor(
 }
 
 /**
- * The last check before a use-checked read goes out, once per exchange (L-4e E2a).
+ * The last check before a use-checked read or mutation goes out, once per exchange (L-4e E2a; S7 E5a2).
  *
- * A network interceptor, and the last of them, because OkHttp repeats a request below the application interceptors on
- * `503 + Retry-After: 0` and on a misdirected 421, and each repeat is a send of its own. The identity first, as the
- * application interceptor does; then the access the read serves. It does not keep DNS or a connection attempt from
- * happening before it runs. A request without a [TopicUseTag] passes untouched.
+ * A network interceptor, and the last of them, because OkHttp can repeat a read below the application interceptors on
+ * `503 + Retry-After: 0` and on a misdirected 421; each follow-up exchange is checked here. A mutation has at most one
+ * send per executeMutation. The identity first, as the application interceptor does; then the access the request serves.
+ * It does not keep DNS or a connection attempt from happening before it runs. A request without a [TopicUseTag]
+ * passes untouched.
  *
  * Every response is recorded after it arrives, so a refusal further down the same call carries what was already seen.
  */
@@ -298,10 +301,12 @@ internal class AuthenticatedTransport(
 
     suspend fun <T> executeMutation(
         snapshot: AuthSnapshot,
+        useAdmitted: (() -> Boolean)? = null,
         call: suspend (AuthRequestTag) -> Response<T>
     ): Response<T> {
         if (!admitted()) throw IOException("D24 release admission is OFF")
-        return executeBound(snapshot, use = null, call)
+        val use = useAdmitted?.let { TopicUseTag(snapshot, FIRST_SEND, TopicUseContext(it)) }
+        return executeBound(snapshot, use, call)
     }
 
     private suspend fun acquireSnapshotAfterAdmission(): AuthSnapshot {

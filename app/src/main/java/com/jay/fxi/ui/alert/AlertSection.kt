@@ -23,10 +23,13 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -39,6 +42,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -52,6 +56,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jay.fxi.R
+import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.domain.model.AlertCondition
 import com.jay.fxi.domain.model.AlertSetting
 import com.jay.fxi.domain.model.RepeatInterval
@@ -74,10 +79,14 @@ internal fun AlertSection(
     state: BankAlertSectionState,
     onRetry: () -> Unit,
     onRefresh: () -> Unit,
+    actionIdentity: AuthIdentityFence?,
+    onToggle: (Int, Boolean) -> Unit,
+    onDelete: (Int) -> Unit,
     modifier: Modifier = Modifier,
     metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
     var isExpanded by remember { mutableStateOf(true) }
+    var pendingDelete by remember(actionIdentity) { mutableStateOf<PendingBankDelete?>(null) }
     val onToggleExpanded = { isExpanded = !isExpanded }
 
     Column(
@@ -250,7 +259,19 @@ internal fun AlertSection(
                         ) {
                             content.rows.forEachIndexed { index, setting ->
                                 key(currency, setting.id) {
-                                    ReadOnlyBankSetting(setting = setting, metrics = metrics)
+                                    BankSetting(
+                                        setting = setting,
+                                        metrics = metrics,
+                                        onToggle = { enabled -> onToggle(setting.id, enabled) },
+                                        onDelete = {
+                                            val id = setting.id
+                                            pendingDelete = PendingBankDelete(
+                                                id = id,
+                                                bankName = setting.bankType?.displayName ?: setting.bank,
+                                                confirm = { onDelete(id) }
+                                            )
+                                        }
+                                    )
                                 }
                                 if (index < content.rows.lastIndex) {
                                     HorizontalDivider(
@@ -266,12 +287,40 @@ internal fun AlertSection(
             }
         }
     }
+
+    pendingDelete?.let { pending ->
+        AlertDialog(
+            modifier = Modifier.testTag(BankAlertSectionTags.DELETE_DIALOG),
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("알림 삭제") },
+            text = { Text("'${pending.bankName}' 알림을 삭제하시겠습니까?") },
+            confirmButton = {
+                TextButton(
+                    modifier = Modifier.testTag(BankAlertSectionTags.DELETE_CONFIRM),
+                    onClick = {
+                        pendingDelete = null
+                        pending.confirm()
+                    }
+                ) { Text("삭제", color = StatusError) }
+            },
+            dismissButton = {
+                TextButton(
+                    modifier = Modifier.testTag(BankAlertSectionTags.DELETE_CANCEL),
+                    onClick = { pendingDelete = null }
+                ) { Text("취소") }
+            }
+        )
+    }
 }
 
+private data class PendingBankDelete(val id: Int, val bankName: String, val confirm: () -> Unit)
+
 @Composable
-private fun ReadOnlyBankSetting(
+private fun BankSetting(
     setting: AlertSetting,
-    metrics: RateLayoutMetrics
+    metrics: RateLayoutMetrics,
+    onToggle: (Boolean) -> Unit,
+    onDelete: () -> Unit
 ) {
     val conditionColor = if (setting.condition == AlertCondition.ABOVE) PositiveColor else NegativeColor
     val statusLabel = when {
@@ -287,11 +336,13 @@ private fun ReadOnlyBankSetting(
             .semantics(mergeDescendants = true) {
                 stateDescription = if (setting.isEnabled) "켜짐" else "꺼짐"
             }
-            .alpha(if (setting.isEnabled) 1f else 0.5f)
             .padding(horizontal = metrics.horizontalPadding, vertical = metrics.alertRowVerticalPadding),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Column(Modifier.width(metrics.alertBankNameWidth)) {
+        Column(
+            Modifier.width(metrics.alertBankNameWidth)
+                .alpha(if (setting.isEnabled) 1f else 0.5f)
+        ) {
             Text(
                 text = setting.bankType?.displayName ?: setting.bank,
                 color = PrimaryText,
@@ -310,7 +361,10 @@ private fun ReadOnlyBankSetting(
                 )
             }
         }
-        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier.weight(1f).alpha(if (setting.isEnabled) 1f else 0.5f),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Text(
                 text = setting.formattedThreshold,
                 color = PrimaryText,
@@ -335,6 +389,39 @@ private fun ReadOnlyBankSetting(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 softWrap = false
+            )
+        }
+        Switch(
+            checked = setting.isEnabled,
+            onCheckedChange = onToggle,
+            modifier = Modifier.testTag(BankAlertSectionTags.toggle(setting.id)).scale(0.75f),
+            thumbContent = {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .clip(CircleShape)
+                        .background(Color.White)
+                )
+            },
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Color.White,
+                uncheckedThumbColor = Color.White,
+                checkedTrackColor = Primary,
+                uncheckedTrackColor = SecondaryText.copy(alpha = 0.3f),
+                checkedBorderColor = Color.Transparent,
+                uncheckedBorderColor = Color.Transparent
+            )
+        )
+        Spacer(modifier = Modifier.width(4.dp))
+        IconButton(
+            onClick = onDelete,
+            modifier = Modifier.testTag(BankAlertSectionTags.delete(setting.id)).size(32.dp)
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_trash),
+                contentDescription = "삭제",
+                tint = StatusError.copy(alpha = 0.8f),
+                modifier = Modifier.size(21.dp)
             )
         }
     }

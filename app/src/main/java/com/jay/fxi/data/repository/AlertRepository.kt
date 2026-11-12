@@ -151,45 +151,68 @@ class AlertRepository @Inject constructor(
         }
     }
 
+    /**
+     * Optional use guards are checked before and after credential capture and passed unchanged to the client.
+     * They may run on any thread: non-blocking and side-effect free, apart from the existing live identity read.
+     */
     suspend fun createSetting(
         owner: AuthIdentityFence,
-        request: AlertSettingRequest
-    ): AuthBoundResult<AlertSetting> = safeApiCall(owner) { snapshot ->
-            apiService.createNotificationSetting(snapshot, request)
-                .requireBody("POST /api/notification-settings")
-        }
+        request: AlertSettingRequest,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<AlertSetting> = mutation(owner, useAdmitted) { snapshot ->
+        apiService.createNotificationSetting(snapshot, request, useAdmitted)
+    }
 
     suspend fun updateSetting(
         owner: AuthIdentityFence,
         id: Int,
-        request: AlertSettingRequest
-    ): AuthBoundResult<AlertSetting> = safeApiCall(owner) { snapshot ->
-        apiService.updateNotificationSetting(snapshot, id, request)
-            .requireBody("PUT /api/notification-settings/{id}")
+        request: AlertSettingRequest,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<AlertSetting> = mutation(owner, useAdmitted) { snapshot ->
+        apiService.updateNotificationSetting(snapshot, id, request, useAdmitted)
     }
 
-    /**
-     * 부분 업데이트 (변경된 필드만 전송)
-     */
+    /** Partial update: only non-null request fields are sent. */
     suspend fun updateSettingPartial(
         owner: AuthIdentityFence,
         id: Int,
-        request: AlertSettingUpdateRequest
-    ): AuthBoundResult<AlertSetting> = safeApiCall(owner) { snapshot ->
-        apiService.updateNotificationSettingPartial(snapshot, id, request)
-            .requireBody("PUT /api/notification-settings/{id}")
+        request: AlertSettingUpdateRequest,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<AlertSetting> = mutation(owner, useAdmitted) { snapshot ->
+        apiService.updateNotificationSettingPartial(snapshot, id, request, useAdmitted)
     }
 
     suspend fun deleteSetting(
         owner: AuthIdentityFence,
-        id: Int
-    ): AuthBoundResult<Unit> = safeApiCall(owner) { snapshot ->
-        val response = apiService.deleteNotificationSetting(snapshot, id)
-        response.failure?.let { throw AuthenticatedApiException(it) }
+        id: Int,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<Unit> = mutation(owner, useAdmitted) { snapshot ->
+        apiService.deleteNotificationSetting(snapshot, id, useAdmitted)
+    }
+
+    private suspend fun <T> mutation(
+        owner: AuthIdentityFence,
+        useAdmitted: (() -> Boolean)?,
+        block: suspend (AuthSnapshot) -> AuthenticatedHttpResponse<T>
+    ): AuthBoundResult<T> {
+        if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+        var evidence: AlertRateLimitResponseEvidence? = null
+        return safeApiCall(owner, { evidence }) { snapshot ->
+            if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+            val response = try {
+                block(snapshot)
+            } catch (e: AuthenticatedBodyDecodingException) {
+                evidence = AlertRateLimitResponseEvidence(e.response.statusCode, e.response.retryAfter)
+                throw e
+            }
+            evidence = AlertRateLimitResponseEvidence(response.statusCode, response.retryAfter)
+            response.requireBody("Bank alert mutation")
+        }
     }
 
     private suspend fun <T> safeApiCall(
         owner: AuthIdentityFence,
+        responseEvidence: (() -> AlertRateLimitResponseEvidence?)? = null,
         block: suspend (AuthSnapshot) -> T
     ): AuthBoundResult<T> {
         val snapshot = try {
@@ -228,9 +251,10 @@ class AlertRepository @Inject constructor(
         return AuthBoundResult(
             requireCurrent = { apiService.requireCurrent(owner) },
             result = result,
-            rateLimitResponseEvidence = (result.exceptionOrNull() as? AlertRepositoryException)?.httpFailure?.let {
-                AlertRateLimitResponseEvidence(it.statusCode, it.retryAfter)
-            }
+            rateLimitResponseEvidence = responseEvidence?.invoke()
+                ?: (result.exceptionOrNull() as? AlertRepositoryException)?.let { failure ->
+                    failure.httpFailure?.let { AlertRateLimitResponseEvidence(it.statusCode, it.retryAfter) }
+                }
         )
     }
 

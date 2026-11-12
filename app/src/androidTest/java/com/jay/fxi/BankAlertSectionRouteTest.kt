@@ -143,6 +143,8 @@ class BankAlertSectionRouteTest {
         override fun ensure() { ensures.incrementAndGet() }
         override fun authoritative() { authoritatives.incrementAndGet() }
         override fun manual() { manuals.incrementAndGet() }
+        override fun setEnabled(id: Int, enabled: Boolean) {}
+        override fun delete(id: Int) {}
     }
     /** Counts its makings; every making hands out the same [source], as the production factory exposes the one singleton. */
     private class FakeFactory(val source: FakeSource) : BankAlertSectionSourceFactory {

@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "64e84b0e3292fb46e0b9cfbcf3e999f7ad4cee153eca2e2ab2b117349c850bf2"
+    const val APPROVED_SHA256 = "63803e6ecb1314490973240bdf5cf06d008f5254e6cfc6fe93c24a5952cf018f"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -48,6 +48,11 @@ internal object PostS6ApprovedDelta {
      * - d9b0bd9d…: 530b4333 BankAlertSettingsOwner.kt, no KRX at all (comments included).
      * - 3b9ef40d…: 530b4333 AlertSection.kt, no KRX at all (comments included).
      * - dcef69a2…: 530b4333 PremiumTopicRoute.kt, no KRX at all (comments included).
+     * - 7376946b…: 9f30832d AuthenticatedApiService.kt, KRX only in the comment at :349 (graph catalog kdoc).
+     * - 07f599cf…: 9f30832d AlertRepository.kt, KRX only in the comment at :55 (source alerts kdoc).
+     * - 576aa7dd…: 9f30832d BankAlertSettingsOwner.kt, no KRX at all (comments included).
+     * - 6daaff32…: 9f30832d AlertSection.kt, no KRX at all (comments included).
+     * - 4a93a045…: 9f30832d BankAlertSection.kt, no KRX at all (comments included).
      */
     val NO_KRX_REVIEWED = setOf(
         "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
@@ -61,7 +66,12 @@ internal object PostS6ApprovedDelta {
         "26aab0a503e6514df01d2006d2f27a2a5c32a4db70a7f80f72b5eb208ce2c242",
         "d9b0bd9dd13013116fb22a55dd8bbc082b9d16e6bb520d0006c0d323c65f1e3c",
         "3b9ef40d5735de6f7adc70bb293ff5221ac4543396347feba8b6776b32e35b3d",
-        "dcef69a23db7b6c637161303c6bd0557bc6ab5591d4daf1057e5b64270e4f628"
+        "dcef69a23db7b6c637161303c6bd0557bc6ab5591d4daf1057e5b64270e4f628",
+        "7376946bf30934ec3fcdab88abe6bbd7dd47a0756e0cb108c97a395dbeee6ba9",
+        "07f599cf0e454d5e8ee12490db4b4b4a7486833d7f7a5cba52273afe00b9b0d4",
+        "576aa7ddfd66560aada3ab85071c9920517c0ba6938e0c0418a675ff24fec80f",
+        "6daaff3217367923e4df4d052cc096c75c09deaebacb4c77d00e0535613068f1",
+        "4a93a04557d9470addb0bff083204bc0433f3b433c893e7ca60b5c911eebc4ec"
     )
 
     /**
@@ -71,6 +81,9 @@ internal object PostS6ApprovedDelta {
      * - S7-c F1 (`R4c/S7/user_decision_s7c_F1.r1.md` cc93e4f7…): TopicRuntimeOwner.kt.
      * - S7-N1 (`R4c/S7/s7n1/s7n1_scope.confirmed.r1.md` 1ecc6234…, user decision `R4c/S7/user_decision_s7n1.r1.md` E1):
      *   FXiMessagingService.kt, the `sync_alerts` hand-over after the emit.
+     * - S7-E5a2 (`R4c/S7/s7e5/s7e5a2_scope.confirmed.r1.md` 16ae2162…, user decision `R4c/S7/user_decision_s7e5next.r1.md` G1):
+     *   AuthenticatedTransport.kt, the optional use check of one mutation's send. The file names no KRX, so its pinned KRX lines are
+     *   the empty text.
      */
     class CoreException(val unitId: String, val sourceParent: String, val approvalRecordSha256: String, val path: String,
         val from: String, val to: String, val krxLinesSha256: String)
@@ -93,6 +106,15 @@ internal object PostS6ApprovedDelta {
             from = "5c157653a1e692df586958c0f81fe002e6b2ddb3671e85944321be1e87c50923",
             to = "9f3ecfc91728b9bc30ad8652b2a0c82d5d53251b565a7babba543a3fcb06b6fe",
             krxLinesSha256 = "08e142a551e0e47752a09853de243aa65b727b5863c75171d1cb7157ece13d02"
+        ),
+        CoreException(
+            unitId = "S7-E5a2",
+            sourceParent = "9f30832d1a14f08940619c35ce79f6fbdf136505",
+            approvalRecordSha256 = "16ae21627bfd6cfdad0cfb9d2a2d6aedb0fe443c6566ead1caf8519440a91128",
+            path = BASE + "data/remote/AuthenticatedTransport.kt",
+            from = "49dc53a37dc341be829965fd4a6123aee5f93d0ac7f678197aa3df0f4542b041",
+            to = "9699188899118ce692c3ee583ad69b521d08b240493dc2e41f744e09bb331023",
+            krxLinesSha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         )
     )
 
