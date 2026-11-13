@@ -1131,7 +1131,7 @@ class AlertN1StructureTest {
             return v
         }
 
-        /** S11: the agreed production `@Inject` delegations, squashed (API r1 §3–§6; r2/r3 §4–§6; S7 E5a2 API r3 §4.1 mutations). */
+        /** S11: the agreed production `@Inject` delegations, squashed (API r1 §3–§6; r2/r3 §4–§6; S7 E5a2 API r3 §4.1 mutations; S7 E5b1 API §6 create·edit). */
         val INJECT_FORMS: Map<String, String> by lazy {
             mapOf(
                 OWNER to """@Inject constructor(repository: AlertRepository, access: AlertSettingsAccess, floor: AlertRateLimitFloor,
@@ -1140,7 +1140,9 @@ class AlertN1StructureTest {
                     CoroutineScope(SupervisorJob() + Dispatchers.Main), { delay(it) }, coordinator.state, coordinator.accessRevisions,
                     topic.graphHost.map { it != null },
                     { owner, id, enabled, admitted -> repository.updateSettingPartial(owner, id, AlertSettingUpdateRequest(isEnabled = enabled), admitted) },
-                    { owner, id, admitted -> repository.deleteSetting(owner, id, admitted) })""",
+                    { owner, id, admitted -> repository.deleteSetting(owner, id, admitted) },
+                    { owner, request, admitted -> repository.createSetting(owner, request, admitted) },
+                    { owner, id, request, admitted -> repository.updateSettingPartial(owner, id, request, admitted) })""",
                 ACCESS to """@Inject constructor(tokens: AuthTokenProvider, topic: TopicRuntimeOwner, uses: TopicUseAuthority,
                     coordinator: PremiumAccessCoordinator, deletions: DeletionAdmissionStore) : this(tokens::currentIdentityFence,
                     topic.currentAccessFence, uses, { coordinator.state.value }, { ReleaseAdmission.isOpen },

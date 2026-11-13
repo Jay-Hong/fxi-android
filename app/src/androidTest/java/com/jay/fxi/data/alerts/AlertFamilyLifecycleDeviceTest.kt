@@ -135,7 +135,9 @@ class AlertFamilyLifecycleDeviceTest {
                 AlertRetryPolicy(), SystemClock::elapsedRealtime, { 0.0 }, scope, { delay(it) },
                 premium, MutableStateFlow(0L), MutableStateFlow(true),
                 { _, _, _, _ -> error("S7E5A2: no toggle in this test") },
-                { _, _, _ -> error("S7E5A2: no delete in this test") }
+                { _, _, _ -> error("S7E5A2: no delete in this test") },
+                { _, _, _ -> error("S7E5B1: no create in this test") },
+                { _, _, _, _ -> error("S7E5B1: no edit in this test") }
             )
             registry = AlertFamilyRefresherRegistry(
                 listOf({ owner }),

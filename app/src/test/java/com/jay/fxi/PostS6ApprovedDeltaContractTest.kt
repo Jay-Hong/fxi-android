@@ -639,7 +639,7 @@ class PostS6ApprovedDeltaContractTest {
     private val e5cCores get() = PostS6ApprovedDelta.CORE_EXCEPTIONS.filter { it.unitId == "S7-E5c" }
 
     @Test fun E41_theE5cUnitIsExact_andContinuesEveryChain() {
-        assertEquals("premise: the seventh and last unit is S7-E5c", listOf("S7-E5c", 7), listOf(e5c.str("id"), json.getValue("units").jsonArray.size))
+        assertEquals("premise: the seventh unit is S7-E5c", "S7-E5c", e5c.str("id"))
         assertEquals("its parent is the S7-E5a2 commit and its record the agreed exact design",
             listOf(e5cParent, e5cApproval), listOf(e5c.str("source_parent"), e5c.str("approval_record_sha256")))
         val changed = e5c.getValue("changed").jsonObject
@@ -766,5 +766,43 @@ class PostS6ApprovedDeltaContractTest {
                 listOf("forbidden $path", "from $path", "krx-before-unreviewed $path"), found)
             assertEquals("$path another from alone: no ledger", null, ledger)
         }
+    }
+
+    // ---- S7-E5b1: the owner's create and edit (s7e5b1_api_agreed.r1.md), one KRX-free changed path, no exception ----
+
+    private val e5b1 get() = unit(7)
+    private val e5b1Approval = "987b55d2c712b8d9ca4d6db74321a85f08da1886a4a0c9c41b3335781d753354"
+    private val e5b1Parent = "222c520ad1105bdad2317d1c28ecf3d03dca79da"
+    private fun unitsWithE5b1(changedE5b1: JsonObject) = withUnits(unit(0), unit(1), unit(2), unit(3), unit(4), unit(5), unit(6), changedE5b1)
+
+    @Test fun E48_theE5b1UnitIsExact_andContinuesTheOwnersChain() {
+        assertEquals("premise: the eighth and last unit is S7-E5b1", listOf("S7-E5b1", 8), listOf(e5b1.str("id"), json.getValue("units").jsonArray.size))
+        assertEquals("its parent is the S7-E5c commit and its record the agreed API",
+            listOf(e5b1Parent, e5b1Approval), listOf(e5b1.str("source_parent"), e5b1.str("approval_record_sha256")))
+        val changed = e5b1.getValue("changed").jsonObject
+        assertEquals("only the owner changes", setOf(bankOwner), changed.keys)
+        assertEquals("and nothing is added", emptySet<String>(), e5b1.getValue("added").jsonObject.keys)
+        val entry = changed.getValue(bankOwner).jsonObject
+        assertEquals("the owner continues S7-E5c's chain", e5cEntry(bankOwner).str("to"), entry.str("from"))
+        assertTrue("the owner's bytes before S7-E5b1 are reviewed KRX-free", entry.str("from") in PostS6ApprovedDelta.NO_KRX_REVIEWED)
+        assertFalse("the owner is no forbidden S6 surface", bankOwner in PostS6ApprovedDelta.FORBIDDEN_PATHS ||
+            PostS6ApprovedDelta.FORBIDDEN_PREFIXES.any { bankOwner.startsWith(it) })
+        assertTrue("no core exception belongs to S7-E5b1", PostS6ApprovedDelta.CORE_EXCEPTIONS.none { it.unitId == "S7-E5b1" })
+        assertEquals(emptyList<String>(), errors(json))
+    }
+
+    @Test fun E49_theE5b1UnitRefusesAnotherFromAndAnyForbiddenPath() {
+        val entry = e5b1.getValue("changed").jsonObject.getValue(bankOwner).jsonObject
+        val (control, controlLedger) = PostS6ApprovedDelta.parse(unitsWithE5b1(e5b1).toString().toByteArray(), inventory, s64b, null)
+        assertEquals("premise: the unaltered E5b1 unit validates", emptyList<String>(), control)
+        assertTrue("premise: and folds a ledger", controlLedger != null)
+        val unreviewed = e5b1.with("changed", JsonObject(mapOf(bankOwner to changedEntry(someHash, entry.str("to")))))
+        assertEquals("another from: the broken link and the unreviewed history",
+            listOf("from $bankOwner", "krx-before-unreviewed $bankOwner"),
+            PostS6ApprovedDelta.parse(unitsWithE5b1(unreviewed).toString().toByteArray(), inventory, s64b, null).first)
+        val messagingTo = e5cEntry(messaging).str("to")
+        val forbidden = e5b1.with("changed", JsonObject(mapOf(bankOwner to entry, messaging to changedEntry(messagingTo, someHash))))
+        assertTrue("a forbidden path without its own exception",
+            PostS6ApprovedDelta.parse(unitsWithE5b1(forbidden).toString().toByteArray(), inventory, s64b, null).first.contains("forbidden $messaging"))
     }
 }

@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "9b754b764fbb8acd80b1f0a53cacfc83a2cd768e0055c2d35ceb3ca1b28688bc"
+    const val APPROVED_SHA256 = "82e5bf9ed625a75119d26e5c24abd3aacb0b6aaea3d691f3ef4d7072575100c8"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -55,6 +55,7 @@ internal object PostS6ApprovedDelta {
      * - 4a93a045…: 9f30832d BankAlertSection.kt, no KRX at all (comments included).
      * - b437782a…: e06fbb02 AlertFamilyRefresherRegistry.kt, no KRX at all (comments included).
      * - 59fae3be…: e06fbb02 BankAlertSettingsOwner.kt, no KRX at all (comments included).
+     * - bc27950c…: 222c520a BankAlertSettingsOwner.kt, no KRX at all (comments included).
      */
     val NO_KRX_REVIEWED = setOf(
         "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
@@ -75,7 +76,8 @@ internal object PostS6ApprovedDelta {
         "6daaff3217367923e4df4d052cc096c75c09deaebacb4c77d00e0535613068f1",
         "4a93a04557d9470addb0bff083204bc0433f3b433c893e7ca60b5c911eebc4ec",
         "b437782aa4648c50756f2f6d7ffbda1e516d4ecb16dc4845ec172e28de23ed11",
-        "59fae3be294672e42230faf34979fb1a344509702d766d298fe5c9897fec1831"
+        "59fae3be294672e42230faf34979fb1a344509702d766d298fe5c9897fec1831",
+        "bc27950c5be8cc77f63b1943c2f4bd0843318f7523cd327bc06c960e11554f52"
     )
 
     /**

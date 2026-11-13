@@ -10,12 +10,16 @@ import com.jay.fxi.data.entitlements.PremiumAccessState
 import com.jay.fxi.data.remote.AuthenticatedEndpoint
 import com.jay.fxi.data.remote.TopicRuntimeOwner
 import com.jay.fxi.data.remote.TopicUseWithheldException
+import com.jay.fxi.data.remote.dto.AlertSettingRequest
 import com.jay.fxi.data.remote.dto.AlertSettingUpdateRequest
+import com.jay.fxi.data.remote.dto.RepeatIntervalChange
 import com.jay.fxi.data.repository.AlertRepository
 import com.jay.fxi.data.repository.AlertRepositoryException
 import com.jay.fxi.data.repository.AlertRepositoryFailureKind
 import com.jay.fxi.data.repository.AuthBoundResult
+import com.jay.fxi.domain.model.AlertCondition
 import com.jay.fxi.domain.model.AlertSetting
+import com.jay.fxi.domain.model.RepeatInterval
 import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -66,6 +70,42 @@ internal sealed interface ManualRefreshOutcome {
     data class CoolingDown(val remainingMillis: Long) : ManualRefreshOutcome
 }
 
+internal data class BankAlertDraft(
+    val currency: String,
+    val bank: String,
+    val condition: AlertCondition,
+    val threshold: Double,
+    val isEnabled: Boolean,
+    val repeat: RepeatInterval?
+)
+
+internal data class BankAlertEdit(
+    val bank: String? = null,
+    val condition: AlertCondition? = null,
+    val threshold: Double? = null,
+    val isEnabled: Boolean? = null,
+    val repeat: RepeatIntervalChange = RepeatIntervalChange.Keep
+)
+
+internal sealed interface BankAlertSaveOutcome {
+    data object Pending : BankAlertSaveOutcome
+    data class Saved(val row: AlertSetting) : BankAlertSaveOutcome
+    data object Removed : BankAlertSaveOutcome
+    data class NotSent(val reason: NotSentReason) : BankAlertSaveOutcome
+    data class Failed(val failure: Throwable) : BankAlertSaveOutcome
+}
+
+internal enum class NotSentReason { NOT_READY, CAP, UNADMITTED, BACKGROUND, SUPERSEDED, RESET }
+
+internal class BankAlertSaveRequest internal constructor() {
+    private val mutableOutcome = MutableStateFlow<BankAlertSaveOutcome>(BankAlertSaveOutcome.Pending)
+    val outcome: StateFlow<BankAlertSaveOutcome> = mutableOutcome.asStateFlow()
+
+    internal fun finish(value: BankAlertSaveOutcome) {
+        if (mutableOutcome.value == BankAlertSaveOutcome.Pending) mutableOutcome.value = value
+    }
+}
+
 /** Main owns requests, snapshots and chains; only a captured use's admission supplier crosses threads. */
 @Singleton
 internal class BankAlertSettingsOwner internal constructor(
@@ -82,6 +122,8 @@ internal class BankAlertSettingsOwner internal constructor(
     graphHostReady: Flow<Boolean>,
     private val setEnabledRemote: suspend (AuthIdentityFence, Int, Boolean, () -> Boolean) -> AuthBoundResult<AlertSetting>,
     private val deleteRemote: suspend (AuthIdentityFence, Int, () -> Boolean) -> AuthBoundResult<Unit>,
+    private val createRemote: suspend (AuthIdentityFence, AlertSettingRequest, () -> Boolean) -> AuthBoundResult<AlertSetting>,
+    private val editRemote: suspend (AuthIdentityFence, Int, AlertSettingUpdateRequest, () -> Boolean) -> AuthBoundResult<AlertSetting>,
     private val accessRecheckMillis: Long = 1_000
 ) : AlertFamilyAdapter {
     @Inject constructor(
@@ -103,7 +145,9 @@ internal class BankAlertSettingsOwner internal constructor(
         coordinator.accessRevisions,
         topic.graphHost.map { it != null },
         { owner, id, enabled, admitted -> repository.updateSettingPartial(owner, id, AlertSettingUpdateRequest(isEnabled = enabled), admitted) },
-        { owner, id, admitted -> repository.deleteSetting(owner, id, admitted) }
+        { owner, id, admitted -> repository.deleteSetting(owner, id, admitted) },
+        { owner, request, admitted -> repository.createSetting(owner, request, admitted) },
+        { owner, id, request, admitted -> repository.updateSettingPartial(owner, id, request, admitted) }
     )
 
     private val mutableState = MutableStateFlow(BankAlertSettingsState(AlertLoadPhase.Idle, null, null))
@@ -129,6 +173,37 @@ internal class BankAlertSettingsOwner internal constructor(
     private var revision = 0L
     private val rowOps = mutableMapOf<Int, RowOp>()
     private var reconcileOwed: AuthIdentityFence? = null
+    private val createOps = mutableMapOf<Any, CreateOp>()
+    // Settled, unresolved effects reserve capacity without holding up the reconciling GET.
+    private val createReservations = mutableSetOf<Any>()
+    private val deleteReservations = mutableSetOf<Int>()
+    private var acceptanceSequence = 0L
+
+    private class CreateOp(
+        val epoch: Long,
+        val identity: AuthIdentityFence,
+        val token: Any,
+        val draft: BankAlertDraft,
+        val requestUse: AlertSettingsUse,
+        val handle: BankAlertSaveRequest,
+        val overlaps: MutableSet<Int>
+    ) {
+        var entered = false
+        var job: Job? = null
+        val hints = Channel<Unit>(Channel.CONFLATED)
+    }
+
+    private class PendingEdit(
+        val epoch: Long,
+        val identity: AuthIdentityFence,
+        val token: Any,
+        val patch: BankAlertEdit,
+        val requestUse: AlertSettingsUse,
+        val sequence: Long,
+        val handle: BankAlertSaveRequest
+    )
+
+    private class ToggleIntent(val enabled: Boolean, val sequence: Long, val requestUse: AlertSettingsUse)
 
     private class RowOp(
         val id: Int,
@@ -139,10 +214,12 @@ internal class BankAlertSettingsOwner internal constructor(
         var position: Int,
         var requestUse: AlertSettingsUse,
         var continuationUse: AlertSettingsUse,
-        var desired: Boolean,
         var deleting: Boolean
     ) {
-        var version = 0L
+        var toggle: ToggleIntent? = null
+        var edit: PendingEdit? = null
+        var sendingEdit: PendingEdit? = null
+        var consumedEnabled = 0L
         var shown: AlertSetting? = approved.copy()
         var job: Job? = null
         var inFlight = false
@@ -152,7 +229,7 @@ internal class BankAlertSettingsOwner internal constructor(
     private sealed interface MutationResult {
         data class Loaded(val row: AlertSetting) : MutationResult
         data object Deleted : MutationResult
-        data class Failed(val failure: Throwable) : MutationResult
+        data class Failed(val failure: Throwable, val preWire: Boolean = false) : MutationResult
         data object Dropped : MutationResult
         data object Unadmitted : MutationResult
     }
@@ -237,9 +314,21 @@ internal class BankAlertSettingsOwner internal constructor(
     fun reset() {
         epoch++
         val previousOps = rowOps.values.toList()
+        val previousCreates = createOps.values.toList()
         rowOps.clear()
+        createOps.clear()
         reconcileOwed = null
+        createReservations.clear()
+        deleteReservations.clear()
+        previousOps.forEach {
+            discardEdit(it, NotSentReason.RESET)
+            it.sendingEdit?.handle?.finish(unknownSave())
+        }
+        previousCreates.forEach {
+            it.handle.finish(if (it.entered) unknownSave() else notSent(NotSentReason.RESET))
+        }
         previousOps.forEach { it.job?.cancel() }
+        previousCreates.forEach { it.job?.cancel() }
         cancelCooldownTimer()
         cooldownUntil = null
         abandon()
@@ -255,7 +344,14 @@ internal class BankAlertSettingsOwner internal constructor(
 
     override fun onBackground() {
         foreground = false
-        rowOps.values.forEach { it.hints.trySend(Unit) }
+        rowOps.values.forEach {
+            if (it.edit != null) {
+                discardEdit(it, NotSentReason.BACKGROUND)
+                owe(it)
+            }
+            it.hints.trySend(Unit)
+        }
+        createOps.values.forEach { it.hints.trySend(Unit) }
         abandon()
         show(AlertLoadPhase.Idle)
     }
@@ -278,6 +374,7 @@ internal class BankAlertSettingsOwner internal constructor(
                     next[index] = rows[index].copy(isEnabled = false, triggered = true)
                     // Even an already marked row invalidates a GET that raced this delivery.
                     revision++
+                    touchRow(id)
                     mutableState.value = state.copy(settings = next)
                 }
             }
@@ -296,6 +393,81 @@ internal class BankAlertSettingsOwner internal constructor(
         requestRow(id, enabled = null, deleting = true)
     }
 
+    /** Main: reserve before starting the worker, including with an eager dispatcher. */
+    fun addAlert(draft: BankAlertDraft): BankAlertSaveRequest {
+        val state = mutableState.value
+        val rows = state.settings
+        if (!foreground || rows == null) return refused(NotSentReason.NOT_READY)
+        val use = access.acquire()
+        if (use == null || state.identity != use.identity || !access.admits(use)) {
+            return refused(NotSentReason.UNADMITTED)
+        }
+        val occupied = rows.mapTo(mutableSetOf()) { it.id }.apply { addAll(deleteReservations) }
+        if (occupied.size + createReservations.size >= 30) return refused(NotSentReason.CAP)
+        val handle = BankAlertSaveRequest()
+        val token = Any()
+        val op = CreateOp(epoch, use.identity, token, draft.copy(), use, handle, rowOps.keys.toMutableSet())
+        createReservations.add(token)
+        createOps[token] = op
+        revision++
+        val next = scope.launch(start = CoroutineStart.LAZY) { runCreate(op) }
+        op.job = next
+        next.start()
+        return handle
+    }
+
+    /** Main: one replaceable waiting patch; the patch already sent keeps its own handle. */
+    fun editAlert(id: Int, edit: BankAlertEdit): BankAlertSaveRequest {
+        val state = mutableState.value
+        val rows = state.settings
+        if (!foreground || rows == null) return refused(NotSentReason.NOT_READY)
+        val use = access.acquire()
+        if (use == null || state.identity != use.identity || !access.admits(use)) {
+            return refused(NotSentReason.UNADMITTED)
+        }
+        val existing = rowOps[id]
+        if (existing?.deleting == true) return refused(NotSentReason.SUPERSEDED)
+        val row = rows.firstOrNull { it.id == id } ?: return refused(NotSentReason.NOT_READY)
+        if (existing != null && !owns(existing)) return refused(NotSentReason.UNADMITTED)
+        val op = existing ?: newRow(row, rows.indexOf(row), use, deleting = false)
+        val handle = BankAlertSaveRequest()
+        discardEdit(op, NotSentReason.SUPERSEDED)
+        op.edit = PendingEdit(epoch, use.identity, Any(), edit.copy(), use, ++acceptanceSequence, handle)
+        revision++
+        touchRow(id)
+        op.hints.trySend(Unit)
+        if (existing == null) startRow(op)
+        return handle
+    }
+
+    private fun notSent(reason: NotSentReason) = BankAlertSaveOutcome.NotSent(reason)
+
+    private fun refused(reason: NotSentReason) =
+        BankAlertSaveRequest().also { it.finish(notSent(reason)) }
+
+    private fun unknownSave(failure: Throwable = IOException("Save result unknown")) =
+        BankAlertSaveOutcome.Failed(failure)
+
+    private fun discardEdit(op: RowOp, reason: NotSentReason) {
+        val pending = op.edit
+        op.edit = null
+        pending?.handle?.finish(notSent(reason))
+    }
+
+    private fun newRow(row: AlertSetting, position: Int, use: AlertSettingsUse, deleting: Boolean): RowOp =
+        RowOp(row.id, epoch, use.identity, Any(), row.copy(), position, use, use, deleting)
+            .also { rowOps[row.id] = it }
+
+    private fun startRow(op: RowOp) {
+        val next = scope.launch(start = CoroutineStart.LAZY) { runRow(op) }
+        op.job = next
+        next.start()
+    }
+
+    private fun touchRow(id: Int) {
+        createOps.values.forEach { it.overlaps.add(id) }
+    }
+
     private fun requestRow(id: Int, enabled: Boolean?, deleting: Boolean) {
         if (!foreground) return
         val existing = rowOps[id]
@@ -306,20 +478,20 @@ internal class BankAlertSettingsOwner internal constructor(
         val use = access.acquire() ?: return
         if (state.identity != use.identity || !access.admits(use)) return
         if (existing != null && !owns(existing)) return
-        val op = existing ?: RowOp(
-            id, epoch, use.identity, Any(), row.copy(), rows.indexOf(row),
-            use, use, enabled ?: row.isEnabled, deleting
-        ).also { rowOps[id] = it }
-        op.version++
+        val op = existing ?: newRow(row, rows.indexOf(row), use, deleting)
         op.requestUse = use
-        if (deleting) op.deleting = true else op.desired = enabled!!
-        display(op, if (deleting) null else optimistic(row, op.desired))
-        op.hints.trySend(Unit)
-        if (existing == null) {
-            val next = scope.launch(start = CoroutineStart.LAZY) { runRow(op) }
-            op.job = next
-            next.start()
+        if (deleting) {
+            op.deleting = true
+            deleteReservations.add(id)
+            discardEdit(op, NotSentReason.SUPERSEDED)
+            op.toggle = null
+        } else {
+            op.toggle = ToggleIntent(enabled!!, ++acceptanceSequence, use)
         }
+        touchRow(id)
+        display(op, if (deleting) null else optimistic(row, enabled!!))
+        op.hints.trySend(Unit)
+        if (existing == null) startRow(op)
     }
 
     private fun optimistic(row: AlertSetting, enabled: Boolean): AlertSetting =
@@ -352,6 +524,7 @@ internal class BankAlertSettingsOwner internal constructor(
         op.shown = row?.copy()
         if (next != rows) {
             revision++
+            touchRow(op.id)
             mutableState.value = state.copy(settings = next)
         }
     }
@@ -372,16 +545,151 @@ internal class BankAlertSettingsOwner internal constructor(
         }
     }
 
+    private fun owns(op: CreateOp): Boolean =
+        createOps[op.token] === op && op.epoch == epoch &&
+            mutableState.value.settings != null && mutableState.value.identity == op.identity
+
+    private fun afterMutation(identity: AuthIdentityFence) {
+        // Join the debt before waking an eager waiting chain into its fetch.
+        if (foreground && rowOps.isEmpty() && createOps.isEmpty() &&
+            mutableState.value.identity == identity && reconcileOwed == identity) authoritative()
+        hintAccess()
+    }
+
+    private suspend fun awaitCreateHint(op: CreateOp, millis: Long) = coroutineScope {
+        val timer = async(start = CoroutineStart.UNDISPATCHED) { sleep(millis) }
+        try {
+            select<Unit> {
+                op.hints.onReceive { }
+                timer.onAwait { }
+            }
+        } finally {
+            timer.cancel()
+        }
+    }
+
+    private suspend fun runCreate(op: CreateOp) {
+        val endpoint = AuthenticatedEndpoint.NOTIFICATION_SETTINGS
+        try {
+            while (owns(op)) {
+                if (!foreground || !access.admits(op.requestUse)) {
+                    reconcileOwed = op.identity
+                    createReservations.remove(op.token)
+                    op.handle.finish(notSent(if (!foreground) NotSentReason.BACKGROUND else NotSentReason.UNADMITTED))
+                    return
+                }
+                val wait = floor.remainingMillis(endpoint)
+                if (wait > 0) {
+                    awaitCreateHint(op, wait)
+                    continue
+                }
+                val use = access.acquire()
+                if (!owns(op)) return
+                if (!foreground || use == null || use.identity != op.identity ||
+                    !access.admits(op.requestUse) || !access.admits(use)) {
+                    reconcileOwed = op.identity
+                    createReservations.remove(op.token)
+                    op.handle.finish(notSent(if (!foreground) NotSentReason.BACKGROUND else NotSentReason.UNADMITTED))
+                    return
+                }
+                if (floor.remainingMillis(endpoint) > 0) continue
+                val draft = op.draft
+                val request = AlertSettingRequest(
+                    bank = draft.bank, currency = draft.currency, condition = draft.condition,
+                    threshold = draft.threshold, isEnabled = draft.isEnabled,
+                    repeatIntervalSec = draft.repeat?.seconds
+                )
+                op.entered = true
+                val result = sendMutation(use, endpoint, { owns(op) }) {
+                    createRemote(op.identity, request) { access.admits(use) }
+                }
+                if (!owns(op)) return
+                if (!access.admits(use) || result == MutationResult.Unadmitted) {
+                    reconcileOwed = op.identity
+                    op.handle.finish(unknownSave())
+                    return
+                }
+                when (result) {
+                    is MutationResult.Loaded -> {
+                        val row = result.row
+                        val state = mutableState.value
+                        val rows = state.settings ?: return
+                        val listed = rows.filter { it.id == row.id }
+                        if (row.userId != op.identity.uid || row.currency != draft.currency ||
+                            listed.any { it.userId != row.userId || it.currency != row.currency }) {
+                            reconcileOwed = op.identity
+                            op.handle.finish(unknownSave(invalidRow()))
+                            return
+                        }
+                        // A completed row operation still counts as an overlap of this request.
+                        if (rowOps.containsKey(row.id) || row.id in op.overlaps) {
+                            reconcileOwed = op.identity
+                        } else {
+                            val next = rows.toMutableList()
+                            val index = next.indexOfFirst { it.id == row.id }
+                            if (index < 0) next.add(0, row.copy()) else next[index] = row.copy()
+                            revision++
+                            touchRow(row.id)
+                            createReservations.remove(op.token)
+                            mutableState.value = state.copy(settings = next)
+                        }
+                        op.handle.finish(BankAlertSaveOutcome.Saved(row.copy()))
+                    }
+                    is MutationResult.Failed -> {
+                        if (result.preWire) {
+                            createReservations.remove(op.token)
+                            op.handle.finish(notSent(NotSentReason.UNADMITTED))
+                        } else {
+                            reconcileOwed = op.identity
+                            op.handle.finish(unknownSave(result.failure))
+                        }
+                    }
+                    MutationResult.Dropped -> return
+                    MutationResult.Unadmitted, MutationResult.Deleted -> {
+                        reconcileOwed = op.identity
+                        op.handle.finish(unknownSave())
+                    }
+                }
+                return
+            }
+        } finally {
+            if (owns(op)) {
+                if (op.handle.outcome.value == BankAlertSaveOutcome.Pending) {
+                    reconcileOwed = op.identity
+                    if (!op.entered) createReservations.remove(op.token)
+                    op.handle.finish(if (op.entered) unknownSave() else notSent(NotSentReason.UNADMITTED))
+                }
+                createOps.remove(op.token)
+                afterMutation(op.identity)
+            }
+        }
+    }
+
+    private fun invalidRow() =
+        AlertRepositoryException("Invalid row", failureKind = AlertRepositoryFailureKind.DECODE)
+
+    private fun rowAdmitted(op: RowOp, edit: PendingEdit?, toggle: ToggleIntent?): Boolean =
+        access.admits(op.requestUse) && access.admits(op.continuationUse) &&
+            (edit == null || (edit.epoch == epoch && edit.identity == op.identity && access.admits(edit.requestUse))) &&
+            (toggle == null || access.admits(toggle.requestUse))
+
     private suspend fun runRow(op: RowOp) {
         try {
             while (owns(op)) {
-                // A fresh acquire cannot renew an invalid acceptance or a retired attempt.
-                if (!foreground ||
-                    !access.admits(op.requestUse) || !access.admits(op.continuationUse)) {
+                if (!foreground) {
+                    discardEdit(op, NotSentReason.BACKGROUND)
                     owe(op)
                     return
                 }
                 val deleting = op.deleting
+                val edit = if (deleting) null else op.edit
+                val toggle = if (deleting || edit != null) null else op.toggle
+                if (!deleting && edit == null && toggle == null) return
+                if (!rowAdmitted(op, edit, toggle)) {
+                    discardEdit(op, NotSentReason.UNADMITTED)
+                    owe(op)
+                    return
+                }
                 val endpoint = if (deleting) AuthenticatedEndpoint.DELETE_NOTIFICATION_SETTING
                     else AuthenticatedEndpoint.UPDATE_NOTIFICATION_SETTING
                 val wait = floor.remainingMillis(endpoint)
@@ -390,64 +698,114 @@ internal class BankAlertSettingsOwner internal constructor(
                     continue
                 }
                 val use = access.acquire()
-                if (use == null || use.identity != op.identity || !access.admits(use)) {
+                if (!owns(op)) return
+                // An acquire may observe a new floor or a publication. Recheck the selected work too.
+                if (op.deleting != deleting || op.edit !== edit || (!deleting && edit == null && op.toggle !== toggle)) continue
+                if (!foreground || use == null || use.identity != op.identity ||
+                    !rowAdmitted(op, edit, toggle) || !access.admits(use)) {
+                    discardEdit(op, if (!foreground) NotSentReason.BACKGROUND else NotSentReason.UNADMITTED)
                     owe(op)
                     return
                 }
-                if (!owns(op)) return
                 if (floor.remainingMillis(endpoint) > 0) continue
-                val version = op.version
-                val target = op.desired
+                if (edit != null) {
+                    op.edit = null
+                    op.sendingEdit = edit
+                }
                 op.inFlight = true
                 val result = try {
-                    sendRow(op, use, endpoint, deleting, target)
+                    sendMutation(use, endpoint, { owns(op) }, deleting) {
+                        when {
+                            deleting -> deleteRemote(op.identity, op.id) { access.admits(use) }
+                            edit != null -> {
+                                val patch = edit.patch
+                                val request = AlertSettingUpdateRequest(
+                                    bank = patch.bank, condition = patch.condition, threshold = patch.threshold,
+                                    isEnabled = patch.isEnabled, repeatIntervalSec = patch.repeat.toJson()
+                                )
+                                editRemote(op.identity, op.id, request) { access.admits(use) }
+                            }
+                            else -> setEnabledRemote(op.identity, op.id, toggle!!.enabled) { access.admits(use) }
+                        }
+                    }
                 } finally {
                     op.inFlight = false
                 }
                 if (!owns(op)) return
-                if (!access.admits(use)) {
+                if (!access.admits(use) || result == MutationResult.Unadmitted) {
+                    edit?.handle?.finish(unknownSave())
+                    op.sendingEdit = null
+                    discardEdit(op, NotSentReason.UNADMITTED)
                     owe(op)
                     return
                 }
                 when (result) {
                     MutationResult.Dropped -> return
-                    MutationResult.Unadmitted -> {
-                        owe(op)
+                    MutationResult.Unadmitted -> return
+                    MutationResult.Deleted -> {
+                        deleteReservations.remove(op.id)
                         return
                     }
-                    MutationResult.Deleted -> return
                     is MutationResult.Loaded -> {
                         val row = result.row
                         if (row.id != op.id || row.userId != op.identity.uid) {
+                            edit?.handle?.finish(unknownSave(invalidRow()))
+                            op.sendingEdit = null
+                            discardEdit(op, NotSentReason.SUPERSEDED)
+                            op.toggle = null
                             owe(op)
+                            if (!deleting && op.deleting) {
+                                op.continuationUse = use
+                                continue
+                            }
                             return
                         }
                         op.approved = row.copy()
                         op.continuationUse = use
-                        if (op.deleting) continue
-                        val newerTarget = op.version != version && op.desired != row.isEnabled
-                        display(op, if (newerTarget) optimistic(row, op.desired) else row.copy())
-                        if (!newerTarget) return
+                        val consumed = if (edit != null) {
+                            if (edit.patch.isEnabled != null) edit.sequence else op.consumedEnabled
+                        } else toggle!!.sequence
+                        op.consumedEnabled = maxOf(op.consumedEnabled, consumed)
+                        val laterToggle = op.toggle
+                        if (laterToggle != null &&
+                            (laterToggle.sequence <= op.consumedEnabled || laterToggle.enabled == row.isEnabled)) {
+                            op.toggle = null
+                        }
+                        if (!op.deleting) {
+                            display(op, op.toggle?.let { optimistic(row, it.enabled) } ?: row.copy())
+                        }
+                        edit?.handle?.finish(BankAlertSaveOutcome.Saved(row.copy()))
+                        op.sendingEdit = null
                     }
                     is MutationResult.Failed -> {
                         val failure = result.failure
                         val http = (failure as? AlertRepositoryException)
                             ?.takeIf { it.failureKind == AlertRepositoryFailureKind.HTTP }?.httpFailure
                         if (http?.statusCode == 404) {
+                            deleteReservations.remove(op.id)
                             if (!deleting) {
                                 display(op, null)
                                 owe(op)
                             }
+                            edit?.handle?.finish(BankAlertSaveOutcome.Removed)
+                            op.sendingEdit = null
+                            discardEdit(op, NotSentReason.NOT_READY)
+                            op.toggle = null
                             return
                         }
-                        val preWire = failure is TopicUseWithheldException && failure.exchanges.isEmpty()
                         val httpFailure = http != null && http.statusCode !in 200..299
-                        if ((preWire || httpFailure) && (deleting || !op.deleting)) {
+                        if ((result.preWire || httpFailure) && (deleting || !op.deleting)) {
                             display(op, op.approved.copy())
                         }
-                        if (!preWire) owe(op)
+                        if (!result.preWire) owe(op)
+                        edit?.handle?.finish(
+                            if (result.preWire) notSent(NotSentReason.UNADMITTED) else unknownSave(failure)
+                        )
+                        op.sendingEdit = null
+                        discardEdit(op, NotSentReason.SUPERSEDED)
+                        op.toggle = null
                         if (failure is AuthIdentityChangedException) return
-                        // Only a separately accepted delete may follow a failed toggle.
+                        // Only a separately accepted delete can continue after failed work.
                         if (!deleting && op.deleting) {
                             op.continuationUse = use
                             continue
@@ -458,35 +816,35 @@ internal class BankAlertSettingsOwner internal constructor(
             }
         } finally {
             if (rowOps[op.id]?.token === op.token) {
+                op.sendingEdit?.handle?.finish(unknownSave())
+                op.sendingEdit = null
+                discardEdit(op, if (!foreground) NotSentReason.BACKGROUND else NotSentReason.SUPERSEDED)
                 rowOps.remove(op.id)
-                hintAccess()
-                if (foreground && rowOps.isEmpty() && reconcileOwed == op.identity) authoritative()
+                afterMutation(op.identity)
             }
         }
     }
 
     /** Recover response evidence before any body, ownership, admission or fold check. No mutation replay. */
-    private suspend fun sendRow(
-        op: RowOp,
+    private suspend fun sendMutation(
         use: AlertSettingsUse,
         endpoint: AuthenticatedEndpoint,
-        deleting: Boolean,
-        target: Boolean
+        owned: () -> Boolean,
+        deleting: Boolean = false,
+        remote: suspend () -> AuthBoundResult<*>
     ): MutationResult {
+        var received = false
         return try {
-            val bound: AuthBoundResult<*> = if (deleting) {
-                deleteRemote(op.identity, op.id) { access.admits(use) }
-            } else {
-                setEnabledRemote(op.identity, op.id, target) { access.admits(use) }
-            }
+            val bound = remote()
+            received = true
             bound.rateLimitResponseEvidence?.let { floor.record(endpoint, AlertRateLimitEvidence.of(it)) }
-            if (!owns(op)) return MutationResult.Dropped
+            if (!owned()) return MutationResult.Dropped
             if (!access.admits(use)) return MutationResult.Unadmitted
             bound.fold(
                 onSuccess = {
                     if (deleting) MutationResult.Deleted
                     else if (it is AlertSetting) MutationResult.Loaded(it.copy())
-                    else MutationResult.Failed(AlertRepositoryException("Invalid row", failureKind = AlertRepositoryFailureKind.DECODE))
+                    else MutationResult.Failed(invalidRow())
                 },
                 onFailure = { MutationResult.Failed(it) }
             )
@@ -495,7 +853,7 @@ internal class BankAlertSettingsOwner internal constructor(
             MutationResult.Failed(changed)
         } catch (withheld: TopicUseWithheldException) {
             floor.record(endpoint, AlertRateLimitEvidence.of(withheld.exchanges, null, null))
-            MutationResult.Failed(withheld)
+            MutationResult.Failed(withheld, preWire = !received && withheld.exchanges.isEmpty())
         } catch (cancelled: CancellationException) {
             MutationResult.Failed(cancelled)
         } catch (failure: Exception) {
@@ -561,13 +919,15 @@ internal class BankAlertSettingsOwner internal constructor(
                         return
                     }
                     is FetchResult.Loaded -> {
-                        if (revision != chain.startRevision || rowOps.isNotEmpty()) {
+                        if (revision != chain.startRevision || rowOps.isNotEmpty() || createOps.isNotEmpty()) {
                             chain.dirty = true
                             attempt = 0
                             chain.retryNotBefore = null
                             continue
                         }
                         reconcileOwed = null
+                        createReservations.clear()
+                        deleteReservations.clear()
                         lastSuccessAt = nowMillis()
                         mutableState.value = BankAlertSettingsState(AlertLoadPhase.Ready, result.settings, use.identity)
                         finishManual(chain, succeeded = true)
@@ -618,10 +978,10 @@ internal class BankAlertSettingsOwner internal constructor(
     /** Every wake and every send rechecks the process floor, independently of account and retry delay. */
     private suspend fun awaitUse(chain: Chain): AlertSettingsUse? {
         while (current(chain)) {
-            if (rowOps.isNotEmpty()) {
+            if (rowOps.isNotEmpty() || createOps.isNotEmpty()) {
                 chain.waitingAccess = true
                 try {
-                    if (rowOps.isNotEmpty()) awaitAccessHint(chain)
+                    if (rowOps.isNotEmpty() || createOps.isNotEmpty()) awaitAccessHint(chain)
                 } finally {
                     chain.waitingAccess = false
                 }
@@ -647,6 +1007,7 @@ internal class BankAlertSettingsOwner internal constructor(
                 continue
             }
             if (!current(chain)) return null
+            if (rowOps.isNotEmpty() || createOps.isNotEmpty()) continue
             if (floor.remainingMillis(AuthenticatedEndpoint.NOTIFICATION_SETTINGS) > 0) continue
             if (access.admits(use)) return use
         }

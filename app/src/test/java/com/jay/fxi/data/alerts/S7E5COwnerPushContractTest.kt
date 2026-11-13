@@ -143,6 +143,8 @@ class S7E5COwnerPushContractTest {
             premium, MutableStateFlow(0L), MutableStateFlow(false),
             { who, id, enabled, admitted -> scripted(Call("PUT", who, id, enabled, admitted)) },
             { who, id, admitted -> scripted(Call("DELETE", who, id, null, admitted)) },
+            { _, _, _ -> error("S7E5B1: no create in this test") },
+            { _, _, _, _ -> error("S7E5B1: no edit in this test") },
             RECHECK
         )
 
