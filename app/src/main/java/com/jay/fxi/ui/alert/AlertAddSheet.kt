@@ -26,20 +26,22 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.TrendingUp
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Numbers
+import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -51,6 +53,7 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -59,10 +62,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.jay.fxi.data.remote.dto.RepeatIntervalChange
 import com.jay.fxi.domain.model.AlertCondition
 import com.jay.fxi.domain.model.AlertSetting
 import com.jay.fxi.domain.model.Bank
 import com.jay.fxi.domain.model.ExchangeRate
+import com.jay.fxi.domain.model.RepeatInterval
 import com.jay.fxi.domain.model.SupportedCurrency
 import com.jay.fxi.ui.components.BankIcon
 import com.jay.fxi.ui.theme.Background
@@ -78,138 +83,100 @@ import com.jay.fxi.ui.theme.StatusConnecting
 import com.jay.fxi.ui.theme.StatusError
 import java.text.NumberFormat
 import java.util.Locale
-import kotlin.math.abs
-import kotlin.math.roundToInt
+
+internal object AlertAddSheetTags {
+    const val SHEET = "alert-editor-sheet"
+    const val CANCEL = "alert-editor-cancel"
+    const val SAVE = "alert-editor-save"
+    const val TITLE = "alert-editor-title"
+    const val HEADER_BANK = "alert-editor-header-bank"
+    fun bank(code: String) = "alert-editor-bank-$code"
+    const val THRESHOLD = "alert-editor-threshold"
+    const val CONDITION = "alert-editor-condition"
+    const val CURRENT_RATE = "alert-editor-current-rate"
+    const val RANGE = "alert-editor-range"
+    const val OUT_OF_RANGE = "alert-editor-out-of-range"
+    const val DUPLICATE = "alert-editor-duplicate"
+    const val REPEAT = "alert-editor-repeat"
+    const val REPEAT_LABEL = "alert-editor-repeat-label"
+    const val REPEAT_DESCRIPTION = "alert-editor-repeat-description"
+    fun repeatOption(i: Int) = "alert-editor-repeat-option-$i"
+    const val BANNER_REPEAT = "alert-editor-banner-repeat"
+    const val REMAINING = "alert-editor-remaining"
+    const val REMAINING_ICON = "alert-editor-remaining-icon"
+    const val SAVING = "alert-editor-saving"
+    const val ERROR_DIALOG = "alert-editor-error-dialog"
+    const val ERROR_CONFIRM = "alert-editor-error-confirm"
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AlertAddSheet(
+internal fun AlertAddSheet(
+    mode: BankAlertEditorMode,
     currency: SupportedCurrency,
-    rates: List<ExchangeRate>,
-    editSetting: AlertSetting? = null,
-    initialBank: Bank? = null,
-    isSaving: Boolean = false,
-    hasDuplicate: (String, AlertCondition, Double, Int?) -> Boolean,
-    onSave: (bank: String, condition: AlertCondition, threshold: Double, isEnabled: Boolean) -> Unit,
+    quotes: Map<String, Double>,
+    existing: List<AlertSetting>,
+    saving: Boolean,
+    errorMessage: String?,
+    remaining: Int?,
+    onSubmit: (BankAlertEditorInput) -> Unit,
+    onErrorDismiss: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    var input by remember(mode) { mutableStateOf(BankAlertEditor.initial(mode, quotes)) }
+    val check = BankAlertEditor.check(mode, input, currency, quotes, existing)
+    val canSave = check.canSave && !saving
+    val thresholdColor = when (BankAlertEditor.tone(check)) {
+        BankAlertThresholdTone.NONE, BankAlertThresholdTone.SAME -> PrimaryText
+        BankAlertThresholdTone.ABOVE -> PositiveColor.copy(alpha = 0.85f)
+        BankAlertThresholdTone.BELOW -> NegativeColor.copy(alpha = 0.85f)
+    }
+    val repeatTexts = BankAlertEditor.repeatTexts(mode, input.repeat)
+    val bankName = input.bank?.displayName
+        ?: (mode as? BankAlertEditorMode.Edit)?.setting?.bank.orEmpty()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val isEditMode = editSetting != null
-
-    var selectedBank by remember {
-        mutableStateOf(editSetting?.bankType ?: initialBank ?: Bank.KB)
-    }
-    var condition by remember {
-        mutableStateOf(editSetting?.condition ?: AlertCondition.BELOW)
-    }
-    var thresholdText by remember {
-        mutableStateOf(editSetting?.threshold?.let { formatThreshold(it) } ?: "")
-    }
-    var isEnabled by remember {
-        mutableStateOf(editSetting?.isEnabled ?: true)
-    }
-
-    // Current rate for selected bank
-    val currentRate = remember(rates, selectedBank, currency) {
-        rates.find { it.bank == selectedBank.code && it.currency == currency.code }?.rate
-    }
-
-    // Initialize threshold from current rate in add mode
-    LaunchedEffect(selectedBank) {
-        if (!isEditMode) {
-            val rate = rates.find { it.bank == selectedBank.code && it.currency == currency.code }?.rate
-            if (rate != null) {
-                thresholdText = formatThreshold(rate)
-            }
-        }
-    }
-
-    // Validation
-    val thresholdValue = thresholdText.replace(",", "").toDoubleOrNull()
-    val validRange = currentRate?.let { rate ->
-        val lower = roundToTens(rate * 0.5)
-        val upper = roundToTens(rate * 1.5)
-        lower to upper
-    }
-    val isInRange = thresholdValue != null && validRange != null &&
-        thresholdValue >= validRange.first && thresholdValue <= validRange.second
-    val isDuplicate = thresholdValue != null && hasDuplicate(
-        selectedBank.code, condition, thresholdValue, editSetting?.id
-    )
-    val hasChanges = if (editSetting != null) {
-        selectedBank.code != editSetting.bank ||
-            condition != editSetting.condition ||
-            (thresholdValue != null && abs(thresholdValue - editSetting.threshold) >= 0.005) ||
-            isEnabled != editSetting.isEnabled
-    } else true
-    val canSave = thresholdValue != null && thresholdValue > 0 && isInRange && !isDuplicate && hasChanges && !isSaving
-
-    // Threshold color feedback (iOS와 동일)
-    val thresholdColor = when {
-        thresholdValue == null || currentRate == null -> PrimaryText
-        abs(thresholdValue - currentRate) < 0.005 -> PrimaryText
-        thresholdValue > currentRate -> PositiveColor.copy(alpha = 0.85f)
-        else -> NegativeColor.copy(alpha = 0.85f)
-    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
+        modifier = Modifier.testTag(AlertAddSheetTags.SHEET),
         containerColor = Background,
-        // iOS 스타일 drag indicator (상단에 더 가깝게)
         dragHandle = {
             Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 8.dp, bottom = 4.dp),
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Box(
-                    modifier = Modifier
-                        .width(36.dp)
-                        .height(5.dp)
+                    modifier = Modifier.width(36.dp).height(5.dp)
                         .clip(RoundedCornerShape(2.5.dp))
                         .background(SecondaryText.copy(alpha = 0.4f))
                 )
             }
         }
     ) {
-        // iOS .large detent와 유사하게 화면 95% 채움
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .fillMaxHeight(0.95f)
-        ) {
+        Box(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.9f)) {
             Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp)
-                    .padding(bottom = 32.dp)
+                modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)
             ) {
-                // Title bar
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    TextButton(onClick = onDismiss) {
+                    TextButton(onClick = onDismiss, modifier = Modifier.testTag(AlertAddSheetTags.CANCEL)) {
                         Text("취소", color = SecondaryText)
                     }
                     Text(
-                        text = if (isEditMode) "알림 수정" else "알림 추가",
+                        text = if (mode == BankAlertEditorMode.Add) "알림 추가" else "알림 수정",
+                        modifier = Modifier.testTag(AlertAddSheetTags.TITLE),
                         color = PrimaryText,
                         fontSize = 17.sp,
                         fontWeight = FontWeight.SemiBold
                     )
                     TextButton(
-                        onClick = {
-                            val tv = thresholdValue
-                            if (canSave && tv != null) {
-                                onSave(selectedBank.code, condition, tv, isEnabled)
-                            }
-                        },
-                        enabled = canSave
+                        onClick = { if (canSave) onSubmit(input) },
+                        enabled = canSave,
+                        modifier = Modifier.testTag(AlertAddSheetTags.SAVE)
                     ) {
                         Text(
                             "저장",
@@ -218,196 +185,131 @@ fun AlertAddSheet(
                         )
                     }
                 }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // Bank picker section (iOS 스타일)
-                BankPickerSection(
-                    selectedBank = selectedBank,
-                    currency = currency,
-                    onBankSelected = { bank ->
-                        selectedBank = bank
-                    }
-                )
-
-                Spacer(modifier = Modifier.height(24.dp))
-
-                // Threshold input section
-                ThresholdInputSection(
-                    thresholdText = thresholdText,
-                    onThresholdChange = { input ->
-                        val sanitized = sanitizeThresholdInput(input)
-                        if (sanitized != null) thresholdText = sanitized
-                    },
-                    thresholdColor = thresholdColor,
-                    condition = condition,
-                    onConditionToggle = {
-                        condition = if (condition == AlertCondition.ABOVE) AlertCondition.BELOW
-                        else AlertCondition.ABOVE
-                    },
-                    currency = currency
-                )
-
-                // Helper text
-                HelperTextSection(
-                    selectedBank = selectedBank,
-                    currentRate = currentRate,
-                    validRange = validRange,
-                    thresholdValue = thresholdValue,
-                    isInRange = isInRange,
-                    isDuplicate = isDuplicate,
-                    currency = currency
-                )
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // Enable toggle (iOS 스타일)
-                EnableToggleSection(
-                    isEnabled = isEnabled,
-                    onEnabledChange = { isEnabled = it },
-                    isEditMode = isEditMode,
-                    isTriggered = editSetting?.triggered == true
-                )
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // Info banner (iOS 스타일 - dividers, colored icons)
-                InfoBanner()
+                Column(
+                    modifier = Modifier.weight(1f)
+                        .verticalScroll(rememberScrollState())
+                        .padding(bottom = 24.dp)
+                ) {
+                    Spacer(Modifier.height(8.dp))
+                    BankPickerSection(
+                        bankName = bankName,
+                        selectedBank = input.bank,
+                        banks = BankAlertEditor.BANK_CHOICES,
+                        currency = currency,
+                        enabled = !saving,
+                        onBankSelected = { bank ->
+                            if (!saving) input = BankAlertEditor.onBankPicked(input, bank, mode, quotes)
+                        }
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    ThresholdInputSection(
+                        thresholdText = input.thresholdText,
+                        onThresholdChange = { raw ->
+                            if (!saving) input = input.copy(thresholdText = BankAlertEditor.sanitize(raw))
+                        },
+                        thresholdColor = thresholdColor,
+                        condition = input.condition,
+                        enabled = !saving,
+                        onConditionToggle = {
+                            if (!saving) input = input.copy(
+                                condition = if (input.condition == AlertCondition.ABOVE) AlertCondition.BELOW
+                                else AlertCondition.ABOVE
+                            )
+                        }
+                    )
+                    HelperTextSection(bankName, check, currency)
+                    Spacer(Modifier.height(12.dp))
+                    RepeatSection(
+                        mode = mode,
+                        texts = repeatTexts,
+                        choices = BankAlertEditor.REPEAT_CHOICES,
+                        enabled = !saving,
+                        onRepeatSelected = { repeat ->
+                            if (!saving) input = input.copy(repeat = repeat)
+                        }
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    InfoBanner(
+                        texts = repeatTexts,
+                        remaining = remaining.takeIf { mode == BankAlertEditorMode.Add }
+                    )
+                }
             }
-
-            // Saving overlay (iOS와 동일)
-            if (isSaving) {
-                SavingOverlay()
-            }
+            if (saving) SavingOverlay()
         }
+    }
+
+    if (errorMessage != null) {
+        AlertDialog(
+            onDismissRequest = onErrorDismiss,
+            modifier = Modifier.testTag(AlertAddSheetTags.ERROR_DIALOG),
+            title = { Text("오류") },
+            text = { Text(errorMessage) },
+            confirmButton = {
+                TextButton(
+                    onClick = onErrorDismiss,
+                    modifier = Modifier.testTag(AlertAddSheetTags.ERROR_CONFIRM)
+                ) { Text("확인") }
+            }
+        )
     }
 }
 
-// MARK: - Bank Picker Section (iOS 스타일)
-
 @Composable
 private fun BankPickerSection(
-    selectedBank: Bank,
+    bankName: String,
+    selectedBank: Bank?,
+    banks: List<Bank>,
     currency: SupportedCurrency,
+    enabled: Boolean,
     onBankSelected: (Bank) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        // Header: 은행명 (왼쪽) + 통화 정보 (오른쪽)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = selectedBank.displayName,
+                text = bankName,
+                modifier = Modifier.testTag(AlertAddSheetTags.HEADER_BANK),
                 color = PrimaryText,
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Bold
             )
-
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = currency.tabTitle,
-                    color = PrimaryText,
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(modifier = Modifier.width(4.dp))
-                Text(
-                    text = "(${currency.displayName})",
-                    color = SecondaryText,
-                    fontSize = 12.sp
-                )
+                Text(currency.tabTitle, color = PrimaryText, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(4.dp))
+                Text("(${currency.displayName})", color = SecondaryText, fontSize = 12.sp)
             }
         }
-
-        // Segmented bank grid (5x2, iOS 스타일 with dividers)
-        SegmentedBankGrid(
-            selectedBank = selectedBank,
-            onBankSelected = onBankSelected
-        )
+        SegmentedBankGrid(selectedBank, banks, enabled, onBankSelected)
     }
 }
 
 @Composable
 private fun SegmentedBankGrid(
-    selectedBank: Bank,
+    selectedBank: Bank?,
+    banks: List<Bank>,
+    enabled: Boolean,
     onBankSelected: (Bank) -> Unit
 ) {
-    val banks = Bank.entries.toList()
     val dividerColor = Color.Gray.copy(alpha = 0.3f)
-
     BoxWithConstraints(
-        modifier = Modifier
-            .fillMaxWidth()
+        modifier = Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(CardBackground)
             .border(1.dp, dividerColor, RoundedCornerShape(12.dp))
     ) {
-        // iOS와 동일: 가로모드/태블릿(넓은 화면)에서는 1줄, 세로모드 폰에서는 2줄
-        val useSingleRow = maxWidth >= 500.dp
-
-        if (useSingleRow) {
-            // 1줄 레이아웃 (10개 모두 한 줄)
-            val cellSize = maxWidth / 10
-            Row(modifier = Modifier.fillMaxWidth()) {
-                banks.forEachIndexed { index, bank ->
-                    BankSegmentCell(
-                        bank = bank,
-                        isSelected = bank == selectedBank,
-                        cellSize = cellSize,
-                        onClick = { onBankSelected(bank) }
-                    )
-                    if (index < banks.size - 1) {
-                        VerticalDivider(
-                            modifier = Modifier.height(cellSize),
-                            color = dividerColor
-                        )
-                    }
-                }
-            }
-        } else {
-            // 2줄 레이아웃 (5개씩)
-            val firstRow = banks.take(5)
-            val secondRow = banks.drop(5)
-            val cellSize = maxWidth / 5
-
-            Column {
-                // First row
+        val columns = if (maxWidth >= 500.dp) banks.size else 5
+        val cellSize = (maxWidth - (columns - 1).dp) / columns
+        Column {
+            banks.chunked(columns).forEachIndexed { rowIndex, row ->
+                if (rowIndex > 0) HorizontalDivider(color = dividerColor)
                 Row(modifier = Modifier.fillMaxWidth()) {
-                    firstRow.forEachIndexed { index, bank ->
-                        BankSegmentCell(
-                            bank = bank,
-                            isSelected = bank == selectedBank,
-                            cellSize = cellSize,
-                            onClick = { onBankSelected(bank) }
-                        )
-                        if (index < firstRow.size - 1) {
-                            VerticalDivider(
-                                modifier = Modifier.height(cellSize),
-                                color = dividerColor
-                            )
-                        }
-                    }
-                }
-
-                HorizontalDivider(color = dividerColor)
-
-                // Second row
-                Row(modifier = Modifier.fillMaxWidth()) {
-                    secondRow.forEachIndexed { index, bank ->
-                        BankSegmentCell(
-                            bank = bank,
-                            isSelected = bank == selectedBank,
-                            cellSize = cellSize,
-                            onClick = { onBankSelected(bank) }
-                        )
-                        if (index < secondRow.size - 1) {
-                            VerticalDivider(
-                                modifier = Modifier.height(cellSize),
-                                color = dividerColor
-                            )
-                        }
+                    row.forEachIndexed { index, bank ->
+                        if (index > 0) VerticalDivider(modifier = Modifier.height(cellSize), color = dividerColor)
+                        BankSegmentCell(bank, bank == selectedBank, cellSize, enabled) { onBankSelected(bank) }
                     }
                 }
             }
@@ -420,51 +322,32 @@ private fun BankSegmentCell(
     bank: Bank,
     isSelected: Boolean,
     cellSize: Dp,
+    enabled: Boolean,
     onClick: () -> Unit
 ) {
     val bankColor = Color(bank.colorHex)
-    val scale by animateFloatAsState(
-        targetValue = if (isSelected) 1.05f else 1f,
-        label = "scale"
-    )
-    // 아이콘 크기: 셀의 68% (iOS와 동일)
-    val iconSize = cellSize * 0.68f
-
+    val scale by animateFloatAsState(targetValue = if (isSelected) 1.05f else 1f, label = "scale")
     Box(
-        modifier = Modifier
-            .size(cellSize)
-            .clickable(onClick = onClick),
+        modifier = Modifier.size(cellSize)
+            .testTag(AlertAddSheetTags.bank(bank.code))
+            .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
-        // 선택 시 배경색
         if (isSelected) {
+            Box(Modifier.fillMaxSize().background(bankColor.copy(alpha = 0.15f)))
             Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(bankColor.copy(alpha = 0.15f))
-            )
-            // 선택 시 테두리
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(3.dp)
+                Modifier.fillMaxSize().padding(3.dp)
                     .border(2.5.dp, bankColor, RoundedCornerShape(6.dp))
             )
         }
-
-        // Bank icon (고해상도 사용 - 알림 추가/수정용)
         BankIcon(
             bank = bank,
             isSelected = isSelected,
             useHighRes = true,
-            modifier = Modifier
-                .size(iconSize)
-                .scale(scale)
+            modifier = Modifier.size(cellSize * 0.68f).scale(scale)
         )
     }
 }
-
-// MARK: - Threshold Input Section
 
 @Composable
 private fun ThresholdInputSection(
@@ -472,26 +355,18 @@ private fun ThresholdInputSection(
     onThresholdChange: (String) -> Unit,
     thresholdColor: Color,
     condition: AlertCondition,
-    onConditionToggle: () -> Unit,
-    currency: SupportedCurrency
+    enabled: Boolean,
+    onConditionToggle: () -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-            text = "알림 받을 환율",
-            color = SecondaryText,
-            fontSize = 14.sp,
-            fontWeight = FontWeight.Medium
-        )
-
+        Text("알림 받을 환율", color = SecondaryText, fontSize = 14.sp, fontWeight = FontWeight.Medium)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 환율 입력 필드 (iOS 스타일 - monospaced, 우측 정렬)
             Row(
-                modifier = Modifier
-                    .weight(1f)
+                modifier = Modifier.weight(1f)
                     .clip(RoundedCornerShape(12.dp))
                     .background(InputBackground)
                     .padding(16.dp),
@@ -500,7 +375,8 @@ private fun ThresholdInputSection(
                 BasicTextField(
                     value = thresholdText,
                     onValueChange = onThresholdChange,
-                    modifier = Modifier.weight(1f),
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f).testTag(AlertAddSheetTags.THRESHOLD),
                     textStyle = TextStyle(
                         color = thresholdColor,
                         fontSize = 24.sp,
@@ -513,211 +389,170 @@ private fun ThresholdInputSection(
                     cursorBrush = SolidColor(Primary)
                 )
             }
-
-            // Condition toggle (iOS 스타일 - 테두리 있음)
-            ConditionToggleButton(
-                condition = condition,
-                onClick = onConditionToggle
-            )
+            ConditionToggleButton(condition, enabled, onConditionToggle)
         }
     }
 }
 
 @Composable
-private fun ConditionToggleButton(
-    condition: AlertCondition,
-    onClick: () -> Unit
-) {
+private fun ConditionToggleButton(condition: AlertCondition, enabled: Boolean, onClick: () -> Unit) {
     val metrics = LocalRateLayoutMetrics.current
-    val conditionColor = when (condition) {
-        AlertCondition.ABOVE -> PositiveColor
-        AlertCondition.BELOW -> NegativeColor
-    }
-    val symbol = condition.symbol
-    val text = when (condition) {
-        AlertCondition.ABOVE -> "이상"
-        AlertCondition.BELOW -> "이하"
-    }
-
+    val conditionColor = if (condition == AlertCondition.ABOVE) PositiveColor else NegativeColor
     Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(12.dp))
+        modifier = Modifier.clip(RoundedCornerShape(12.dp))
             .background(conditionColor.copy(alpha = 0.15f))
             .border(2.dp, conditionColor, RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick)
+            .testTag(AlertAddSheetTags.CONDITION)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         Text(
-            text = symbol,
+            condition.symbol,
             color = conditionColor,
             fontSize = metrics.alertConditionToggleFontSize,
             fontWeight = FontWeight.Black
         )
-        Text(
-            text = text,
-            color = conditionColor,
-            fontSize = 14.sp,
-            fontWeight = FontWeight.SemiBold
-        )
+        Text(condition.displayText, color = conditionColor, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
-// MARK: - Helper Text Section
-
 @Composable
-private fun HelperTextSection(
-    selectedBank: Bank,
-    currentRate: Double?,
-    validRange: Pair<Double, Double>?,
-    thresholdValue: Double?,
-    isInRange: Boolean,
-    isDuplicate: Boolean,
-    currency: SupportedCurrency
-) {
-    Column(
-        modifier = Modifier.padding(top = 4.dp)
-    ) {
-        if (currentRate != null) {
+private fun HelperTextSection(bankName: String, check: BankAlertEditorCheck, currency: SupportedCurrency) {
+    Column(modifier = Modifier.padding(top = 4.dp)) {
+        check.quote?.let { quote ->
             Text(
-                text = "현재 ${selectedBank.displayName} 환율: ${ExchangeRate.formatRate(currentRate, currency.code)}",
+                text = "현재 $bankName 환율: ${ExchangeRate.formatRate(quote, currency.code)}",
+                modifier = Modifier.testTag(AlertAddSheetTags.CURRENT_RATE),
                 color = SecondaryText,
                 fontSize = 12.sp,
                 lineHeight = 14.sp
             )
         }
-        if (validRange != null) {
-            val rangeColor = if (thresholdValue != null && !isInRange) StatusConnecting else SecondaryText
-            val rangeSuffix = if (currency.isJPY) "원 (100엔)" else "원"
+        check.range?.let { range ->
+            val suffix = if (currency.isJPY) "원 (100엔)" else "원"
             Text(
-                text = "설정 가능: ${formatRangeValue(validRange.first)} ~ ${formatRangeValue(validRange.second)}$rangeSuffix",
-                color = rangeColor,
+                text = "설정 가능: ${formatRangeValue(range.start)} ~ ${formatRangeValue(range.endInclusive)}$suffix",
+                modifier = Modifier.testTag(AlertAddSheetTags.RANGE),
+                color = if (check.outOfRange) StatusConnecting else SecondaryText,
                 fontSize = 12.sp,
                 lineHeight = 14.sp
             )
         }
-        if (thresholdValue != null && !isInRange && validRange != null) {
+        if (check.outOfRange) {
             Text(
-                text = "현재 환율의 ±50% 범위를 벗어났습니다",
-                color = StatusError,
-                fontSize = 12.sp,
-                lineHeight = 14.sp
+                "현재 환율의 ±50% 범위를 벗어났습니다",
+                modifier = Modifier.testTag(AlertAddSheetTags.OUT_OF_RANGE),
+                color = StatusError, fontSize = 12.sp, lineHeight = 14.sp
             )
         }
-        if (isDuplicate) {
+        if (check.duplicate) {
             Text(
-                text = "동일한 알림이 이미 존재합니다",
-                color = StatusError,
-                fontSize = 12.sp,
-                lineHeight = 14.sp
+                "동일한 알림이 이미 존재합니다",
+                modifier = Modifier.testTag(AlertAddSheetTags.DUPLICATE),
+                color = StatusError, fontSize = 12.sp, lineHeight = 14.sp
             )
         }
     }
 }
 
-// MARK: - Enable Toggle Section
-
 @Composable
-private fun EnableToggleSection(
-    isEnabled: Boolean,
-    onEnabledChange: (Boolean) -> Unit,
-    isEditMode: Boolean,
-    isTriggered: Boolean
+private fun RepeatSection(
+    mode: BankAlertEditorMode,
+    texts: BankAlertRepeatTexts,
+    choices: List<RepeatInterval?>,
+    enabled: Boolean,
+    onRepeatSelected: (RepeatIntervalChange) -> Unit
 ) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(CardBackground)
-            .padding(horizontal = 16.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = "알림 활성화",
-                color = PrimaryText,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium
-            )
-            // 수정 모드에서 triggered 상태일 때 안내 (iOS와 동일)
-            if (isEditMode && isTriggered && !isEnabled) {
+    var expanded by remember(mode) { mutableStateOf(false) }
+    Box {
+        Row(
+            modifier = Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(CardBackground)
+                .testTag(AlertAddSheetTags.REPEAT)
+                .clickable(enabled = enabled) { expanded = true }
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("반복 발송", color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.Medium)
                 Text(
-                    text = "알림이 발송되어 비활성화됨",
-                    color = StatusConnecting,
-                    fontSize = 12.sp,
-                    lineHeight = 15.sp
+                    texts.description,
+                    modifier = Modifier.testTag(AlertAddSheetTags.REPEAT_DESCRIPTION),
+                    color = SecondaryText, fontSize = 12.sp, lineHeight = 15.sp
+                )
+            }
+            Text(
+                texts.label,
+                modifier = Modifier.testTag(AlertAddSheetTags.REPEAT_LABEL)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Primary.copy(alpha = 0.12f))
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                color = Primary,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+        DropdownMenu(expanded = expanded && enabled, onDismissRequest = { expanded = false }) {
+            choices.forEachIndexed { index, interval ->
+                val choice = if (interval == null) RepeatIntervalChange.Once else RepeatIntervalChange.Every(interval)
+                DropdownMenuItem(
+                    text = { Text(BankAlertEditor.repeatTexts(mode, choice).label) },
+                    onClick = {
+                        expanded = false
+                        if (enabled) onRepeatSelected(choice)
+                    },
+                    enabled = enabled,
+                    modifier = Modifier.testTag(AlertAddSheetTags.repeatOption(index))
                 )
             }
         }
-        // 흰색 thumb + 일관된 크기 토글
-        Switch(
-            checked = isEnabled,
-            onCheckedChange = onEnabledChange,
-            thumbContent = {
-                Box(
-                    modifier = Modifier
-                        .size(24.dp)
-                        .clip(CircleShape)
-                        .background(Color.White)
-                )
-            },
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = Color.White,
-                uncheckedThumbColor = Color.White,
-                checkedTrackColor = Primary,
-                uncheckedTrackColor = SecondaryText.copy(alpha = 0.3f),
-                checkedBorderColor = Color.Transparent,
-                uncheckedBorderColor = Color.Transparent
-            )
-        )
     }
 }
 
-// MARK: - Info Banner (iOS 스타일)
-
 @Composable
-private fun InfoBanner() {
+private fun InfoBanner(texts: BankAlertRepeatTexts, remaining: Int?) {
     val dividerColor = SecondaryText.copy(alpha = 0.2f)
-
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
+        modifier = Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(CardBackground)
             .border(1.dp, SecondaryText.copy(alpha = 0.15f), RoundedCornerShape(12.dp))
             .padding(14.dp)
     ) {
-        // 첫 번째 안내 (Primary 색상 아이콘)
         InfoItem(
-            icon = Icons.Default.Notifications,
+            icon = if (texts.repeats) Icons.Default.Repeat else Icons.Default.Notifications,
             iconTint = Primary,
-            text = "알림은 1회 발송 후 자동으로 꺼집니다"
+            text = texts.banner,
+            textModifier = Modifier.testTag(AlertAddSheetTags.BANNER_REPEAT)
         )
-
-        HorizontalDivider(
-            modifier = Modifier.padding(vertical = 12.dp),
-            color = dividerColor
-        )
-
-        // 두 번째 안내 (Cyan 색상 아이콘)
+        HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = dividerColor)
         InfoItem(
             icon = Icons.AutoMirrored.Filled.TrendingUp,
             iconTint = Color.Cyan,
             text = "환율 변동으로 목표에 도달하면 알림을 보내드립니다"
         )
-
-        HorizontalDivider(
-            modifier = Modifier.padding(vertical = 12.dp),
-            color = dividerColor
-        )
-
-        // 세 번째 안내 (Orange 색상 아이콘)
+        HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = dividerColor)
         InfoItem(
             icon = Icons.Default.Schedule,
-            iconTint = Color(0xFFF39C12),  // Orange
+            iconTint = Color(0xFFF39C12),
             text = "평일 아침 8:30 경 첫 고시 환율은 환전이 되지 않습니다"
         )
+        if (remaining != null && remaining <= 3) {
+            HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = dividerColor)
+            val atLimit = remaining <= 0
+            InfoItem(
+                icon = Icons.Default.Numbers,
+                iconTint = if (atLimit) StatusError else Color.Yellow,
+                text = if (atLimit) "알림을 더 추가할 수 없습니다" else "알림 ${remaining}개 더 추가 가능",
+                textColor = if (atLimit) StatusError else SecondaryText,
+                textModifier = Modifier.testTag(AlertAddSheetTags.REMAINING),
+                iconModifier = Modifier.testTag(AlertAddSheetTags.REMAINING_ICON),
+                circle = true
+            )
+        }
     }
 }
 
@@ -725,92 +560,50 @@ private fun InfoBanner() {
 private fun InfoItem(
     icon: ImageVector,
     iconTint: Color,
-    text: String
+    text: String,
+    textColor: Color = SecondaryText,
+    textModifier: Modifier = Modifier,
+    iconModifier: Modifier = Modifier,
+    circle: Boolean = false
 ) {
     Row(verticalAlignment = Alignment.Top) {
         Icon(
             imageVector = icon,
             contentDescription = null,
             tint = iconTint,
-            modifier = Modifier.size(18.dp)
+            modifier = iconModifier.size(18.dp).then(
+                if (circle) Modifier.border(1.dp, iconTint, CircleShape).padding(2.dp) else Modifier
+            )
         )
-        Spacer(modifier = Modifier.width(12.dp))
-        Text(
-            text = text,
-            color = SecondaryText,
-            fontSize = 14.sp,
-            lineHeight = 18.sp
-        )
+        Spacer(Modifier.width(12.dp))
+        Text(text, modifier = textModifier, color = textColor, fontSize = 14.sp, lineHeight = 18.sp)
     }
 }
-
-// MARK: - Saving Overlay (iOS와 동일)
 
 @Composable
 private fun SavingOverlay() {
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.4f)),
+        modifier = Modifier.fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.4f))
+            .testTag(AlertAddSheetTags.SAVING),
         contentAlignment = Alignment.Center
     ) {
         Column(
-            modifier = Modifier
-                .clip(RoundedCornerShape(16.dp))
+            modifier = Modifier.clip(RoundedCornerShape(16.dp))
                 .background(CardBackground)
                 .padding(32.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            CircularProgressIndicator(
-                modifier = Modifier.size(32.dp),
-                color = PrimaryText,
-                strokeWidth = 3.dp
-            )
-            Text(
-                text = "저장 중...",
-                color = PrimaryText,
-                fontSize = 14.sp
-            )
+            CircularProgressIndicator(Modifier.size(32.dp), color = PrimaryText, strokeWidth = 3.dp)
+            Text("저장 중...", color = PrimaryText, fontSize = 14.sp)
         }
     }
 }
 
-// MARK: - Helpers
-
-private fun sanitizeThresholdInput(input: String): String? {
-    val cleaned = input.filter { it.isDigit() || it == '.' || it == ',' }
-    val withoutCommas = cleaned.replace(",", "")
-
-    val dotCount = withoutCommas.count { it == '.' }
-    if (dotCount > 1) return null
-
-    val parts = withoutCommas.split(".")
-    if (parts.size == 2 && parts[1].length > 2) return null
-
-    // 붙여넣기 등으로 들어온 콤마는 허용하되 표기에서는 제거
-    return withoutCommas
-}
-
-private fun roundToTens(value: Double): Double {
-    return (value / 10.0).roundToInt() * 10.0
-}
-
-private fun formatThreshold(value: Double): String {
-    return NumberFormat.getNumberInstance(Locale.KOREA).apply {
-        // iOS와 표기 통일: 천단위 구분자(,) 제거
-        isGroupingUsed = false
-        minimumFractionDigits = 2
-        maximumFractionDigits = 2
-    }.format(value)
-}
-
-/** iOS와 동일: 설정 가능 범위는 소수점 없이 표시 */
-private fun formatRangeValue(value: Double): String {
-    return NumberFormat.getNumberInstance(Locale.KOREA).apply {
-        // iOS와 표기 통일: 천단위 구분자(,) 제거
+private fun formatRangeValue(value: Double): String =
+    NumberFormat.getNumberInstance(Locale.KOREA).apply {
         isGroupingUsed = false
         minimumFractionDigits = 0
         maximumFractionDigits = 0
     }.format(value)
-}
