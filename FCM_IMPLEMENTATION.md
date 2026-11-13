@@ -95,16 +95,18 @@ class PushNotificationManager @Inject constructor(
 
 핵심 메서드:
 
-- `onNewToken(token, isPremium)`: prefs 저장 + 조건 만족 시 서버 등록 (old token rotation)
-- `registerIfNeeded(isPremium)`: 3중 가드 → POST. savedToken == null이면 `Tasks.await(FirebaseMessaging.getInstance().token)`으로 토큰 확보. **내부 네트워크/토큰 획득은 Dispatchers.IO에서 수행.**
+- `onNewToken(token)`: 현재 owner로 등록 의도를 다시 구성한 뒤 알려진 token으로 coordinator 등록을 평가한다 (old token rotation, S7 E5b2a)
+- `registerIfNeeded(isPremium)`: 등록 자격(아래 D21) 확인 → POST. savedToken == null이면 `Tasks.await(FirebaseMessaging.getInstance().token)`으로 토큰 확보. **내부 네트워크/토큰 획득은 Dispatchers.IO에서 수행.**
 - `unregisterDeviceFromServer()`: DELETE + shouldRegisterForPush=false + savedToken 클리어
-- `rehydratePushTokenIfNeeded(isPremium)`: `registerIfNeeded(isPremium)` 위임
+- `rehydratePushTokenIfNeeded()`: `reconcileRegistration(현재 owner)` 위임 (S7 E5b2a)
+- `reconcileRegistration(owner)`: 의도 재구성 + coordinator 위임의 단일 facade. OS 거부면 의도 false(이 false만으로 서버 해제는 하지 않는다), 현재 세션·teardown 아님이면 그 세션의 서버 premium 확정 여부로 true/false, 그 밖은 저장값 유지. owner가 없거나 현재 세션이 아니면 coordinator에 넘기지 않는다
 
-3중 가드: `auth.currentUser != null && isPremium && shouldRegisterForPush`
+등록 자격(D21, S7 E5b2a): release gate ∧ 재구성된 `shouldRegisterForPush` ∧ OS 알림 capability(runtime 권한·앱 알림·`rate_alerts` 채널, 호출마다 새로 읽음) ∧ 그 세션의 서버 확정 premium(`confirmsPremiumFor(owner)`). 의도 값은 등록 성공 표지가 아니다. 옛 3중 가드(`auth.currentUser != null && isPremium && shouldRegisterForPush`)를 대체한다.
 
 **호출 책임 정리**:
 
 - `rehydratePushTokenIfNeeded()` → **SubscriptionManager.onAuthCompleted()에서만** 호출 (단일 책임)
+- `reconcileRegistration(owner)` → `NotificationCapabilityMonitor`가 호출한다: alert-family registry의 foreground hook(첫 foreground 포함), premium publication(owner 바뀜 포함), 권한 helper의 결과(E5b2b). 진행 중 평가와 같은 관측은 합류한다
 - `unregisterDeviceFromServer(owner)` → **AuthViewModel 로그아웃 실행자(`handedOffSignOut`)에서만** 호출한다. owner 는 로그아웃을 시작한 세션이다.
 - ~~RootScreen은 상태 전환 감지 시 unregister 호출~~ — L-4b-2 4c(3b-2)에서 지웠다. 앱 로그아웃의 해제는 실행자가 하고, 외부 로그아웃은
   A 의 인증이 없어 DELETE 할 수 없으며, 늦게 도는 효과는 새 세션을 해제 대상으로 잡을 수 있었다. 등록·회전·해제의 현재 구조는
@@ -184,6 +186,7 @@ data class AlertSettingRequest(
 - 알림 설정 첫 생성 시 권한 요청
 - 승인 → shouldRegisterForPush=true → registerIfNeeded()
 - 거부 → shouldRegisterForPush=false
+- S7 E5b2a: 앱 복귀 때의 capability 재확인과 거부 시 의도 false는 `NotificationCapabilityMonitor`가 중앙 foreground hook에서 한다. 요청·설정 유도 UI는 E5b2b.
 
 ## 주의사항
 

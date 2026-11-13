@@ -99,6 +99,9 @@ internal class PushRegistrationCoordinator(
     private val sessionIds = mutableSetOf<Long>()
     private val memory = UnrecordedObligations()
 
+    val isHeld: Boolean
+        get() = synchronized(lock) { holds > 0 }
+
     /**
      * Resolves [owner]'s owed DELETEs, then registers the device for [owner] when eligible.
      * [knownToken] skips fetching one; the owner and revision are captured before any fetch.

@@ -1131,7 +1131,7 @@ class AlertN1StructureTest {
             return v
         }
 
-        /** S11: the agreed production `@Inject` delegations, squashed (API r1 §3–§6; r2/r3 §4–§6; S7 E5a2 API r3 §4.1 mutations; S7 E5b1 API §6 create·edit). */
+        /** S11: the agreed production `@Inject` delegations, squashed (API r1 §3–§6; r2/r3 §4–§6; S7 E5a2 API r3 §4.1 mutations; S7 E5b1 API §6 create·edit; S7 E5b2a API §2.4 foreground hook). */
         val INJECT_FORMS: Map<String, String> by lazy {
             mapOf(
                 OWNER to """@Inject constructor(repository: AlertRepository, access: AlertSettingsAccess, floor: AlertRateLimitFloor,
@@ -1149,9 +1149,10 @@ class AlertN1StructureTest {
                     GraphProtectedAdmission(tokens::currentIdentityFence, deletions))""",
                 FLOOR to """@Inject constructor() : this(SystemClock::elapsedRealtime)""",
                 REGISTRY to """@Inject constructor(bank: Provider<BankAlertSettingsOwner>, coordinator: PremiumAccessCoordinator,
-                    tokens: AuthTokenProvider) : this(listOf({ bank.get() }), { ProcessLifecycleOwner.get().lifecycle },
+                    tokens: AuthTokenProvider, capability: Provider<NotificationCapabilityMonitor>) : this(listOf({ bank.get() }),
+                    { ProcessLifecycleOwner.get().lifecycle },
                     { action -> Handler(Looper.getMainLooper()).post { action() }; Unit }, coordinator.state, tokens::currentIdentityFence,
-                    CoroutineScope(SupervisorJob() + Dispatchers.Main))"""
+                    CoroutineScope(SupervisorJob() + Dispatchers.Main), foregroundHooks = listOf({ capability.get().onForeground() }))"""
             ).mapValues { squash(it.value) }
         }
 

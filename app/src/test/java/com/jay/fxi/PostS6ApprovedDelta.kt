@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "82e5bf9ed625a75119d26e5c24abd3aacb0b6aaea3d691f3ef4d7072575100c8"
+    const val APPROVED_SHA256 = "857508fef2e77cd3a9ef2d44a839a5e80266bf437cbe27e58e850c891e465bf6"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -56,6 +56,9 @@ internal object PostS6ApprovedDelta {
      * - b437782a…: e06fbb02 AlertFamilyRefresherRegistry.kt, no KRX at all (comments included).
      * - 59fae3be…: e06fbb02 BankAlertSettingsOwner.kt, no KRX at all (comments included).
      * - bc27950c…: 222c520a BankAlertSettingsOwner.kt, no KRX at all (comments included).
+     * - 45207074…: a3505187 AlertFamilyRefresherRegistry.kt, no KRX at all (comments included).
+     * - 9dd93c1a…: a3505187 PushNotificationManager.kt, no KRX at all (comments included).
+     * - fd04c1cb…: a3505187 PushRegistrationCoordinator.kt, no KRX at all (comments included).
      */
     val NO_KRX_REVIEWED = setOf(
         "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
@@ -77,7 +80,10 @@ internal object PostS6ApprovedDelta {
         "4a93a04557d9470addb0bff083204bc0433f3b433c893e7ca60b5c911eebc4ec",
         "b437782aa4648c50756f2f6d7ffbda1e516d4ecb16dc4845ec172e28de23ed11",
         "59fae3be294672e42230faf34979fb1a344509702d766d298fe5c9897fec1831",
-        "bc27950c5be8cc77f63b1943c2f4bd0843318f7523cd327bc06c960e11554f52"
+        "bc27950c5be8cc77f63b1943c2f4bd0843318f7523cd327bc06c960e11554f52",
+        "452070742a7d29de3dd087c845b15ed96be199a1fb1e743a61009a56157691d2",
+        "9dd93c1a0f8e33a47ac214bb5c5aa02ab851a0c0e7828a7cfeab6e224aad389a",
+        "fd04c1cb48d499147dcdb393fc7b69e581c063f8b2ac44239c2699950dcdeb5f"
     )
 
     /**

@@ -187,6 +187,30 @@
         }
       },
       "added": {}
+    },
+    {
+      "id": "S7-E5b2a",
+      "source_parent": "a350518724e22a275e2bafd0f0158a47b16d8d81",
+      "approval_record_sha256": "645ed19342712dc6587d9ac963d56fd89f5c70a04101840c20fb4bee4befbbd8",
+      "changed": {
+        "src/main/java/com/jay/fxi/data/alerts/AlertFamilyRefresherRegistry.kt": {
+          "from": "452070742a7d29de3dd087c845b15ed96be199a1fb1e743a61009a56157691d2",
+          "to": "fe1744218ca333c96d9541aca411ce7b70d67123b8c91e5c89b46129adb0e9b9"
+        },
+        "src/main/java/com/jay/fxi/service/PushNotificationManager.kt": {
+          "from": "9dd93c1a0f8e33a47ac214bb5c5aa02ab851a0c0e7828a7cfeab6e224aad389a",
+          "to": "1d8281c7c964a0763a48a0c43ea0a8d6fd2efed997cb4dc3f150275b74ae1c1c"
+        },
+        "src/main/java/com/jay/fxi/service/PushRegistrationCoordinator.kt": {
+          "from": "fd04c1cb48d499147dcdb393fc7b69e581c063f8b2ac44239c2699950dcdeb5f",
+          "to": "aea18bcb284d8a2d39746348328b5668efa09f4167bdd7aab65d70b22c0b868e"
+        }
+      },
+      "added": {
+        "src/main/java/com/jay/fxi/service/NotificationCapability.kt": "dae5a7bfaa25ceeddf0c2ca45dea529634b3d4f83b6463bdfc2d3920a403a50e",
+        "src/main/java/com/jay/fxi/service/NotificationCapabilityMonitor.kt": "f45dcdcb6062680829c73462572794ba50519d3b56d5ec0bcf56b081b60eb97e",
+        "src/main/java/com/jay/fxi/service/PushIntentReconciler.kt": "a53e5a2887f76941e856fd29aed965442370217246e1a85bf986cf127bed7c55"
+      }
     }
   ]
 }

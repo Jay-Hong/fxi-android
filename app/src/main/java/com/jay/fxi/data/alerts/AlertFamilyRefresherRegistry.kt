@@ -14,6 +14,7 @@ import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.confirmsPremiumFor
 import com.jay.fxi.service.AlertEvent
 import com.jay.fxi.service.AlertFamily
+import com.jay.fxi.service.NotificationCapabilityMonitor
 import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
@@ -42,19 +43,22 @@ internal class AlertFamilyRefresherRegistry internal constructor(
     private val reportFailure: () -> Unit = {
         Log.w(TAG, "alert family adapter dispatch failed")
         Unit
-    }
+    },
+    private val foregroundHooks: List<() -> Unit> = emptyList()
 ) {
     @Inject constructor(
         bank: Provider<BankAlertSettingsOwner>,
         coordinator: PremiumAccessCoordinator,
-        tokens: AuthTokenProvider
+        tokens: AuthTokenProvider,
+        capability: Provider<NotificationCapabilityMonitor>
     ) : this(
         listOf({ bank.get() }),
         { ProcessLifecycleOwner.get().lifecycle },
         { action -> Handler(Looper.getMainLooper()).post { action() }; Unit },
         coordinator.state,
         tokens::currentIdentityFence,
-        CoroutineScope(SupervisorJob() + Dispatchers.Main)
+        CoroutineScope(SupervisorJob() + Dispatchers.Main),
+        foregroundHooks = listOf({ capability.get().onForeground() })
     )
 
     private var started = false
@@ -116,6 +120,13 @@ internal class AlertFamilyRefresherRegistry internal constructor(
         if (foreground == value) return
         foreground = value
         if (value) {
+            foregroundHooks.forEach { hook ->
+                try {
+                    hook()
+                } catch (e: Exception) {
+                    reportFailure()
+                }
+            }
             val pending = pendingFor
             pendingFor = null
             val authoritative = pending != null && liveIdentity() == pending && premium.value.confirmsPremiumFor(pending)

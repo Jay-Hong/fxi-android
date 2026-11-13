@@ -224,7 +224,7 @@ class PremiumAccessLossCandidateTest {
         assertEquals("the owner stays the one the decision was made for", OWNER, shown.uid)
         assertEquals(KrxCapabilityState.HIDDEN, h.coordinator.krx.value)
         assertNull(h.coordinator.topicGrant())
-        assertFalse(pushRegistrationAllowed(AuthIdentityFence(OWNER, 1L), shown, shouldRegisterForPush = true))
+        assertFalse(pushRegistrationAllowed(AuthIdentityFence(OWNER, 1L), shown, shouldRegisterForPush = true, capabilityGranted = true))
         assertEquals(1, h.coordinator.heldLossCandidateCount())
         assertEquals("no rotation, no epoch change", record, h.store.record)
         assertTrue(h.store.rotationRequests.isEmpty())

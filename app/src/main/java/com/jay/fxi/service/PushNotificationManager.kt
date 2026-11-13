@@ -1,13 +1,7 @@
 package com.jay.fxi.service
 
-import android.Manifest
-import android.app.NotificationManager
 import android.content.Context
-import android.content.pm.PackageManager
-import android.os.Build
 import android.util.Log
-import androidx.core.app.NotificationManagerCompat
-import androidx.core.content.ContextCompat
 import com.google.firebase.messaging.FirebaseMessaging
 import com.jay.fxi.admission.ReleaseAdmission
 import com.jay.fxi.data.auth.AuthIdentityFence
@@ -39,8 +33,10 @@ class PushNotificationManager @Inject constructor(
      * authorise a registration sent as B — the captured owner is the only identity the request can
      * actually go out under, so it is the only one worth asking about.
      */
-    private fun mayRegister(owner: AuthIdentityFence?): Boolean =
-        pushRegistrationAllowed(owner, premiumAccessCoordinator.state.value, shouldRegisterForPush)
+    private fun mayRegister(owner: AuthIdentityFence?): Boolean = pushRegistrationAllowed(
+        owner, premiumAccessCoordinator.state.value, shouldRegisterForPush,
+        capabilityGranted = readNotificationCapability(context) == NotificationCapability.GRANTED
+    )
     private val prefs = context.getSharedPreferences("push_prefs", Context.MODE_PRIVATE)
 
     var shouldRegisterForPush: Boolean
@@ -60,6 +56,16 @@ class PushNotificationManager @Inject constructor(
         clearLegacyLocalState = ::clearLocalRegistrationState
     )
 
+    private val reconciler = PushIntentReconciler(
+        capability = { readNotificationCapability(context) },
+        currentOwner = ::captureOwnerOrNull,
+        premium = { premiumAccessCoordinator.state.value },
+        held = { coordinator.isHeld },
+        readIntent = { shouldRegisterForPush },
+        writeIntent = { shouldRegisterForPush = it },
+        register = { owner, token -> coordinator.register(owner, knownToken = token) }
+    )
+
     /**
      * FCM 토큰 갱신 시 호출 (FXiMessagingService.onNewToken)
      *
@@ -69,7 +75,7 @@ class PushNotificationManager @Inject constructor(
     suspend fun onNewToken(token: String) {
         if (!ReleaseAdmission.isOpen) return
         val owner = captureOwnerOrNull() ?: return
-        Log.d(TAG, "Registration on token rotation: ${coordinator.register(owner, knownToken = token)}")
+        Log.d(TAG, "Registration on token rotation: ${reconciler.reconcile(owner, knownToken = token)}")
     }
 
     /**
@@ -129,41 +135,14 @@ class PushNotificationManager @Inject constructor(
         null
     }
 
-    /**
-     * 프리미엄 전환 시 토큰 재등록 (SubscriptionManager.onAuthCompleted에서만 호출)
-     * 알림 권한이 이미 승인된 상태면 shouldRegisterForPush 복원
-     */
+    /** Reconstitutes the current session's intent before evaluating its registration. */
     suspend fun rehydratePushTokenIfNeeded() {
-        if (!ReleaseAdmission.isOpen) return
-        // 알림 권한이 승인된 상태면 shouldRegisterForPush 복원
-        if (hasNotificationPermission()) {
-            shouldRegisterForPush = true
-        }
-        registerIfNeeded()
+        reconcileRegistration(captureOwnerOrNull())
     }
 
-    /**
-     * 알림 권한 확인 (Android 13+ POST_NOTIFICATIONS)
-     */
-    private fun hasNotificationPermission(): Boolean {
-        val runtimeGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(
-                context, Manifest.permission.POST_NOTIFICATIONS
-            ) == PackageManager.PERMISSION_GRANTED
-        } else {
-            true
-        }
-        if (!runtimeGranted || !NotificationManagerCompat.from(context).areNotificationsEnabled()) {
-            return false
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
-
-        val channelImportance = context
-            .getSystemService(NotificationManager::class.java)
-            ?.getNotificationChannel(FXiMessagingService.CHANNEL_RATE_ALERTS)
-            ?.importance
-
-        return channelImportance == null || channelImportance != NotificationManager.IMPORTANCE_NONE
+    suspend fun reconcileRegistration(owner: AuthIdentityFence?) {
+        if (!ReleaseAdmission.isOpen) return
+        Log.d(TAG, "Registration on reconcile: ${reconciler.reconcile(owner)}")
     }
 
     companion object {
@@ -174,16 +153,12 @@ class PushNotificationManager @Inject constructor(
 }
 
 /**
- * The push-registration gate, outside the Android class so it can be judged on the JVM.
- *
- * Same reason `ApiPushDeviceServer` lives outside this class. Two conditions: the user has actually
- * asked for notifications, and the server has confirmed premium **for that exact session** — not
- * merely for that uid, and not for whoever happened to be signed in when some caller made up its
- * mind. A null owner needs no separate check; [confirmsPremiumFor] already refuses one, and a
- * second guard for the same thing would be untestable in isolation.
+ * The push-registration gate shared by fresh admission checks for the captured session.
+ * The local intent, current OS capability and that session's server premium must all agree.
  */
 internal fun pushRegistrationAllowed(
     owner: AuthIdentityFence?,
     access: OwnedPremiumAccess,
-    shouldRegisterForPush: Boolean
-): Boolean = shouldRegisterForPush && access.confirmsPremiumFor(owner)
+    shouldRegisterForPush: Boolean,
+    capabilityGranted: Boolean
+): Boolean = shouldRegisterForPush && capabilityGranted && access.confirmsPremiumFor(owner)

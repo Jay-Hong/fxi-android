@@ -15,6 +15,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -813,5 +814,83 @@ class PushRegistrationCoordinatorTest {
 
         assertEquals("새 표식이 지워져 같은 키를 DELETE 없이 등록했다", "DELETE a t2", server.calls.first())
         assertEquals("POST a2 t2", server.calls.last())
+    }
+
+    /** S7 E5b2a (s7e5b2_api_agreed.r1.md, Claude 보완): D21's reconcile reads this to never re-arm during a teardown. */
+    @Test
+    fun S7E5B2A_K01_isHeldIsTrueExactlyWhileASignOutTeardownRuns() = runTest {
+        val coordinator = coordinator()
+        coordinator.register(a1)
+        assertFalse("before any sign-out", coordinator.isHeld)
+        server.deleteGates["t1"] = CompletableDeferred()
+        val first = launch { coordinator.unregister(a1) }
+        runCurrent()
+        assertTrue("from the sign-out's start", coordinator.isHeld)
+        val second = launch { coordinator.unregister(a1) }
+        runCurrent()
+        server.deleteGates.getValue("t1").complete(Unit)
+        first.join()
+        second.join()
+        assertFalse("after both sign-outs end", coordinator.isHeld)
+    }
+
+    /** S7 E5b2a gap G08 (R07): the reconciler over the real coordinator, with the D21 gate reading the live intent and capability. */
+    private class E2E {
+        var capability = NotificationCapability.GRANTED
+        var intent = false
+        var access = com.jay.fxi.data.entitlements.OwnedPremiumAccess("a", 1L, com.jay.fxi.data.entitlements.PremiumAccessState.PremiumConfirmed)
+        val writes = mutableListOf<Boolean>()
+    }
+
+    private fun e2e(rig: E2E): Pair<PushRegistrationCoordinator, PushIntentReconciler> {
+        val coordinator = PushRegistrationCoordinator(
+            ledger = ledger,
+            server = server,
+            currentFence = { current },
+            eligible = { owner ->
+                pushRegistrationAllowed(owner, rig.access, rig.intent, rig.capability == NotificationCapability.GRANTED)
+            },
+            deviceToken = { token() },
+            clearLegacyLocalState = { legacyClears++ }
+        )
+        val reconciler = PushIntentReconciler(
+            capability = { rig.capability },
+            currentOwner = { current },
+            premium = { rig.access },
+            held = { coordinator.isHeld },
+            readIntent = { rig.intent },
+            writeIntent = { rig.writes += it; rig.intent = it },
+            register = { owner, known -> coordinator.register(owner, knownToken = known) }
+        )
+        return coordinator to reconciler
+    }
+
+    @Test
+    fun S7E5B2A_GAP08_aReconcileArmsAndRegistersAndADenialClearsAndPostsNothing() = runTest {
+        val rig = E2E()
+        val (_, reconciler) = e2e(rig)
+        assertEquals(RegisterOutcome.REGISTERED, reconciler.reconcile(a1, knownToken = "t9"))
+        assertEquals(listOf(true), rig.writes)
+        assertEquals("the known token went out", listOf("POST a1 t9"), server.calls)
+        server.calls.clear()
+        rig.capability = NotificationCapability.APP_DISABLED
+        assertEquals(RegisterOutcome.NOT_ELIGIBLE, reconciler.reconcile(a1))
+        assertEquals(listOf(true, false), rig.writes)
+        assertEquals("a denial posts nothing", emptyList<String>(), server.calls)
+    }
+
+    @Test
+    fun S7E5B2A_GAP08_aCapabilityLostWhileTheTokenIsAwaitedPostsNothing() = runTest {
+        val rig = E2E()
+        val (_, reconciler) = e2e(rig)
+        val arriving = CompletableDeferred<String?>()
+        token = { arriving.await() }
+        val evaluation = async { reconciler.reconcile(a1) }
+        runCurrent()
+        assertEquals("armed before the coordinator asks", listOf(true), rig.writes)
+        rig.capability = NotificationCapability.CHANNEL_DISABLED
+        arriving.complete("t1")
+        assertEquals(RegisterOutcome.NOT_ELIGIBLE, evaluation.await())
+        assertEquals("the gate re-read the capability before the POST", emptyList<String>(), server.calls)
     }
 }
