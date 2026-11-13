@@ -187,7 +187,8 @@ data class AlertSettingRequest(
 - 승인 → shouldRegisterForPush=true → registerIfNeeded()
 - 거부 → shouldRegisterForPush=false
 - S7 E5b2a: 앱 복귀 때의 capability 재확인과 거부 시 의도 false는 `NotificationCapabilityMonitor`가 중앙 foreground hook에서 한다.
-- S7 E5b2b1: 권한 helper `rememberNotificationPermissionAction()`(요청 우선, rationale이면 설명 뒤 요청, 확인된 미허용에만 설정 열기/다시 요청 안내, 앱·채널 차단은 해당 설정 화면)과 설정 화면의 "알림 설정" row. 알림 section의 prompt·banner는 E5b2b2.
+- S7 E5b2b1: 권한 helper `rememberNotificationPermissionAction()`(요청 우선, rationale이면 설명 뒤 요청, 확인된 미허용에만 설정 열기/다시 요청 안내, 앱·채널 차단은 해당 설정 화면)과 설정 화면의 "알림 설정" row.
+- S7 E5b2b2: 은행 알림 section(`AlertSection`)은 목록이 비고 알림이 막혔으면 빈 화면 대신 권한 prompt를, 목록이 있고 막혔으면 목록 위 banner를 보인다. holder(`BankAlertSection`)가 helper를 한 번 불러 `needsAction`과 `run()`만 넘기며, section은 OS를 읽지 않는다. 허용 뒤 추가 sheet 진입(`onGranted`)은 E5b3.
 
 ## 주의사항
 

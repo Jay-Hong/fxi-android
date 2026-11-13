@@ -24,6 +24,8 @@ import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -52,6 +54,7 @@ import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.LineHeightStyle
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -82,6 +85,8 @@ internal fun AlertSection(
     actionIdentity: AuthIdentityFence?,
     onToggle: (Int, Boolean) -> Unit,
     onDelete: (Int) -> Unit,
+    notificationsBlocked: Boolean,
+    onEnableNotifications: () -> Unit,
     modifier: Modifier = Modifier,
     metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
@@ -233,24 +238,92 @@ internal fun AlertSection(
                         }
                     }
                     Content.Empty -> {
-                        Column(
-                            modifier = Modifier
-                                .testTag(BankAlertSectionTags.EMPTY)
-                                .fillMaxWidth()
-                                .padding(vertical = metrics.sectionPadding),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_bell_slash),
-                                contentDescription = null,
-                                tint = SecondaryText.copy(alpha = 0.5f),
-                                modifier = Modifier.size(28.dp)
-                            )
-                            Text("설정된 알림이 없습니다", color = SecondaryText, fontSize = 12.sp)
+                        if (notificationsBlocked) {
+                            Column(
+                                modifier = Modifier
+                                    .testTag(BankAlertSectionTags.NOTIFY_PROMPT)
+                                    .fillMaxWidth()
+                                    .padding(horizontal = metrics.horizontalPadding, vertical = 12.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Notifications,
+                                    contentDescription = null,
+                                    tint = Primary,
+                                    modifier = Modifier.size(28.dp)
+                                )
+                                Text(
+                                    text = "환율 알림을 받으려면\n알림 권한이 필요합니다",
+                                    color = PrimaryText,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    textAlign = TextAlign.Center
+                                )
+                                Text(
+                                    text = "원하는 환율에 도달하면 푸시 알림으로 알려드립니다",
+                                    color = SecondaryText,
+                                    fontSize = 12.sp,
+                                    textAlign = TextAlign.Center
+                                )
+                                Button(
+                                    onClick = onEnableNotifications,
+                                    modifier = Modifier.testTag(BankAlertSectionTags.NOTIFY_PROMPT_BUTTON),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = Primary,
+                                        contentColor = Color.White
+                                    )
+                                ) {
+                                    Text("알림 권한 설정하기")
+                                }
+                            }
+                        } else {
+                            Column(
+                                modifier = Modifier
+                                    .testTag(BankAlertSectionTags.EMPTY)
+                                    .fillMaxWidth()
+                                    .padding(vertical = metrics.sectionPadding),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_bell_slash),
+                                    contentDescription = null,
+                                    tint = SecondaryText.copy(alpha = 0.5f),
+                                    modifier = Modifier.size(28.dp)
+                                )
+                                Text("설정된 알림이 없습니다", color = SecondaryText, fontSize = 12.sp)
+                            }
                         }
                     }
                     is Content.Rows -> {
+                        if (notificationsBlocked) {
+                            Row(
+                                modifier = Modifier
+                                    .testTag(BankAlertSectionTags.NOTIFY_BANNER)
+                                    .fillMaxWidth()
+                                    .clickable(onClick = onEnableNotifications)
+                                    .padding(horizontal = metrics.horizontalPadding, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Notifications,
+                                    contentDescription = null,
+                                    tint = StatusError,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        text = "알림을 받을 수 없습니다",
+                                        color = PrimaryText,
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Text("알림 권한을 설정해주세요", color = SecondaryText, fontSize = 12.sp)
+                                }
+                            }
+                        }
                         Column(
                             Modifier
                                 .testTag(BankAlertSectionTags.ROWS)

@@ -94,6 +94,9 @@ internal object BankAlertSectionTags {
     const val ERROR = "bank-alert-error"
     const val RETRY = "bank-alert-retry"
     const val EMPTY = "bank-alert-empty"
+    const val NOTIFY_PROMPT = "bank-alert-notify-prompt"
+    const val NOTIFY_PROMPT_BUTTON = "bank-alert-notify-prompt-button"
+    const val NOTIFY_BANNER = "bank-alert-notify-banner"
     const val ROWS = "bank-alert-rows"
     fun row(id: Int): String = "bank-alert-row-$id"
     fun toggle(id: Int): String = "bank-alert-toggle-$id"
@@ -143,6 +146,7 @@ internal fun BankAlertSection(
     sourceFactory: BankAlertSectionSourceFactory = ProductionBankAlertSectionSourceFactory
 ) {
     val currency = bankCurrencyOf(tab) ?: return
+    val notificationAction = rememberNotificationPermissionAction()
     val applicationContext = LocalContext.current.applicationContext
     val source = remember(applicationContext, sourceFactory) {
         sourceFactory.create(applicationContext)
@@ -160,6 +164,8 @@ internal fun BankAlertSection(
             actionIdentity = actionIdentity,
             onToggle = { id, enabled -> if (actionIdentity != null && source.settings.value.identity == actionIdentity) source.setEnabled(id, enabled) },
             onDelete = { id -> if (actionIdentity != null && source.settings.value.identity == actionIdentity) source.delete(id) },
+            notificationsBlocked = notificationAction.needsAction,
+            onEnableNotifications = { notificationAction.run() },
             modifier = modifier
         )
     }

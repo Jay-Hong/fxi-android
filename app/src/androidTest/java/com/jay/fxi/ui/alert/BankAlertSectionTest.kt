@@ -109,7 +109,9 @@ class BankAlertSectionTest {
                 onRefresh = { refreshes.incrementAndGet() },
                 actionIdentity = null,
                 onToggle = { _, _ -> },
-                onDelete = { }
+                onDelete = { },
+                notificationsBlocked = false,
+                onEnableNotifications = { }
             )
         }
         rule.waitForIdle()

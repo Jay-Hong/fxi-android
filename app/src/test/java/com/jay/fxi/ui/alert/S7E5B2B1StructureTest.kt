@@ -11,7 +11,7 @@ import org.junit.Test
  * S7 E5b2b1 structure (s7e5b2b_start_agreed.r1.md D3·D5·D6·D10 and §4-3, errata r2 E5–E7):
  * - H: the helper asks and decides only. It names no lifecycle observer, registration, token, foreground entry or family;
  *   it writes the request record and never reads it; only it names the environment seam and no production source provides
- *   one; it declares the remembered helper once and only the settings screen calls it (b2 adds the holder).
+ *   one; it declares the remembered helper once and only the settings screen and the bank alert holder call it (E5b2b2).
  * - S: the settings screen calls the helper once, shows the row only on needsAction, runs it on a click, between the
  *   profile card and the general section, and names nothing of the OS, the monitor or the seam.
  * Each lock has a mutation it is shown to catch, beside the unaltered tree that it accepts.
@@ -22,6 +22,7 @@ class S7E5B2B1StructureTest {
         val BASE = S6Krx3bOffWiringContractTest.BASE
         val HELPER = BASE + "ui/alert/NotificationPermissionAction.kt"
         val SETTINGS = BASE + "ui/settings/SettingsScreen.kt"
+        val BANK_HOLDER = BASE + "ui/alert/BankAlertSection.kt"
         val VIEW_MODEL = BASE + "ui/viewmodel/AlertViewModel.kt"
         const val MARKER = "has_requested_notification_permission"
 
@@ -92,7 +93,7 @@ class S7E5B2B1StructureTest {
             if (code.values.any { Regex("""\bprovides\b|\bprovidesDefault\b""").containsMatchIn(it) && Regex(LOCAL).containsMatchIn(it) }) v += "H-local-provide"
             if (count(squash(helper), Regex.escape(DECLARATION)) != 1 || count(helper, """\bfun\s+rememberNotificationPermissionAction\b""") != 1) v += "H-declare"
             val callers = files(code, CALL) - HELPER
-            if (callers != setOf(SETTINGS)) v += "H-callers ${callers.sorted()}"
+            if (callers != setOf(SETTINGS, BANK_HOLDER)) v += "H-callers ${callers.sorted()}"
             if (count(helper, CALL) != count(helper, """\bfun\s+rememberNotificationPermissionAction\b""")) v += "H-self-call"
             val flat = squash(helper)
             if (count(flat, Regex.escape(PRODUCTION_ENVIRONMENT)) != 1 || count(helper, """\bEntryPointAccessors\s*\.""") != 1) v += "H-production"
@@ -169,6 +170,7 @@ class S7E5B2B1StructureTest {
             Triple("a production provider", appended(HELPER, "@Composable private fun s(e: NotificationPermissionEnvironment, c: @Composable () -> Unit) = androidx.compose.runtime.CompositionLocalProvider(LocalNotificationPermissionEnvironment provides e, content = c)"), "H-local-provide"),
             Triple("a parameter on the helper", edited(HELPER, "internal fun rememberNotificationPermissionAction(): NotificationPermissionAction {", "internal fun rememberNotificationPermissionAction(x: Int = 0): NotificationPermissionAction {"), "H-declare"),
             Triple("another caller", appended(BASE + "ui/alert/AlertSection.kt", "@Composable private fun s() = rememberNotificationPermissionAction()"), "H-callers"),
+            Triple("the holder's call dropped", edited(BANK_HOLDER, "    val notificationAction = rememberNotificationPermissionAction()\n", ""), "H-callers"),
             Triple("a family owner", appended(HELPER, "private val s: com.jay.fxi.data.alerts.BankAlertSettingsOwner? = null"), "H-name family"),
             Triple("the graph resolved before the gate", edited(HELPER,
                 "    if (!shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)) return null\n    val entry = EntryPointAccessors.fromApplication(context.applicationContext, NotificationPermissionEntryPoint::class.java)\n",

@@ -27,7 +27,13 @@ import org.junit.Test
  * - S: AlertSection keeps the agreed read-only signature and names no Switch, delete, add, edit or permission entry, no
  *   AlertRow and no view model; click modifiers stay in the header, button callbacks in the header or the error retry, and
  *   none of either is inside the read-only row render (the Rows branch, every function taking an AlertSetting, and what they
- *   call in the file).
+ *   call in the file). S7 E5b2b2 adds the prompt's one button and the banner's one click (N below) to that list.
+ * - N (S7 E5b2b2, s7e5b2_api_agreed.r1.md §3.2, start agreement D10): AlertSection takes `notificationsBlocked` and
+ *   `onEnableNotifications`; Empty under `if (notificationsBlocked)` shows the prompt with one Button calling
+ *   onEnableNotifications, else the unchanged empty text; Rows under `if (notificationsBlocked)` shows the banner, above the
+ *   list, with one `.clickable(onClick = onEnableNotifications)`. The holder calls `rememberNotificationPermissionAction()` once,
+ *   right after its tab check, and passes `needsAction` and `{ run() }` only; that exact call is the one `permission` name the
+ *   holder may hold.
  * - P: the premium route calls BankAlertSection exactly once, inside the belowRates lambda after the unchanged
  *   BankHistoryEntry, passing its own new last parameter as the source factory.
  *
@@ -349,6 +355,161 @@ class BankAlertSectionStructureTest {
             "// Switch( AlertDialog( onDelete( onToggle( 삭제 remember(actionIdentity)\n/* IconButton(onClick = onDelete) */\nprivate val s7e5a2Control = 1")))
     }
 
+    // ---- N: S7 E5b2b2's prompt and banner, and the holder's helper call ----
+
+    @Test fun `S7E5B2B2_N01 AlertSection shows the prompt in Empty and the banner above Rows only when blocked and both call onEnableNotifications`() {
+        assertEquals("premise: the prompt's button and the banner's click are the only click spans the notify lock lets through", 2,
+            notifySpans(code.getValue(SECTION)).size)
+        assertEquals("S7E5B2B2 N: section", emptyList<String>(), sectionNotify(code) + sectionClicks(code) + sectionSignature(code))
+    }
+
+    @Test fun `S7E5B2B2_N02 the section lock catches a moved unguarded inverted doubled or rewired prompt or banner and accepts comments and reformatting`() {
+        fun all(tree: Map<String, String>) = sectionNotify(tree) + sectionClicks(tree) + sectionSignature(tree) + sectionEntries(tree)
+        assertEquals("premise: the real tree is clean", emptyList<String>(), all(code))
+        val promptGuard = """if \(notificationsBlocked\) \{(?=\s*Column\()"""
+        val bannerGuard = """if \(notificationsBlocked\) \{(?=\s*Row\()"""
+        val bannerClick = """\.clickable\(onClick = onEnableNotifications\)"""
+        for ((label, tree, tag) in listOf(
+            Triple("an inverted prompt guard", edited(SECTION, promptGuard, "if (!notificationsBlocked) {"), "N-prompt-place"),
+            Triple("an unguarded prompt", edited(SECTION, promptGuard, "if (true) {"), "N-prompt-place"),
+            Triple("a prompt button in the loading view", atSectionTag("LOADING",
+                "Button(onClick = onEnableNotifications, modifier = Modifier.testTag(BankAlertSectionTags.NOTIFY_PROMPT_BUTTON)) { } "), "N-prompt-button-place"),
+            Triple("a second button in the prompt", edited(SECTION, """(?=\}\s*\}\s*else\s*\{)""", "TextButton(onClick = onEnableNotifications) { }\n"),
+                "S-action-outside-header"),
+            Triple("the prompt calling retry", edited(SECTION,
+                """onClick = onEnableNotifications,(?=\s*modifier = Modifier\.testTag\(BankAlertSectionTags\.NOTIFY_PROMPT_BUTTON\))""", "onClick = onRetry,"),
+                "N-prompt-callback"),
+            Triple("a click inside the prompt button", edited(SECTION, """Text\("알림 권한 설정하기"""", "IconButton(onClick = { }) { }\nText(\"알림 권한 설정하기\""),
+                "N-prompt-clicks"),
+            Triple("a clickable prompt", atSectionTag("NOTIFY_PROMPT", "Modifier.clickable(onClick = onEnableNotifications) "), "S-modifier-outside-header"),
+            Triple("a banner in the empty state", atSectionTag("EMPTY", "Modifier.testTag(BankAlertSectionTags.NOTIFY_BANNER) "), "N-banner-place"),
+            Triple("an unguarded banner", edited(SECTION, bannerGuard, "if (true) {"), "N-banner-place"),
+            Triple("the banner below the list", edited(SECTION,
+                """(if \(notificationsBlocked\) \{\s*Row\([\s\S]*?\n {24}\}\n)(\s*Column\(\s*Modifier\s*\.testTag\(BankAlertSectionTags\.ROWS\)[\s\S]*?\n {24}\}\n)""",
+                "\$2\$1"), "N-banner-place"),
+            Triple("the banner calling refresh", edited(SECTION, bannerClick, ".clickable(onClick = onRefresh)"), "N-banner-click"),
+            Triple("a lambda banner click", edited(SECTION, bannerClick, ".clickable { onEnableNotifications() }"), "N-banner-click"),
+            Triple("a second banner click", edited(SECTION, bannerClick, ".clickable(onClick = onEnableNotifications).clickable(onClick = onEnableNotifications)"),
+                "N-banner-click"),
+            Triple("a click inside the banner", edited(SECTION, """Text\("알림 권한을 설정해주세요"""", "IconButton(onClick = { }) { }\nText(\"알림 권한을 설정해주세요\""),
+                "S-row-click"),
+            Triple("the empty text under the guard", edited(SECTION, """\}\s*else\s*\{(?=\s*Column\(\s*modifier = Modifier\s*\.testTag\(BankAlertSectionTags\.EMPTY\))""", ""),
+                "N-empty-shape"),
+            Triple("the callback called while drawing", edited(SECTION, promptGuard, "if (notificationsBlocked) { onEnableNotifications()"), "N-callback-uses"),
+            Triple("the flag read in the header", atSectionTag("REFRESH", "if (notificationsBlocked) Unit "), "N-flag-uses"),
+            Triple("the callback parameter dropped", edited(SECTION, """\s*onEnableNotifications: \(\) -> Unit,""", ""), "S-signature"),
+            Triple("a permission-named callback", edited(SECTION, """\bonEnableNotifications\b""", "onRequestPermission"), "S-entry permission"))) {
+            assertCaught("S7E5B2B2 N $label", tag, all(tree))
+        }
+        for ((label, tree) in listOf(
+            "comments only" to appended(SECTION, "// Button(onClick = onEnableNotifications) if (notificationsBlocked) NOTIFY_BANNER\n" +
+                "/* .clickable(onClick = onEnableNotifications) */\nprivate val s7e5b2b2Control = 1"),
+            "a reformatted banner click" to edited(SECTION, bannerClick, ".clickable(\n onClick = onEnableNotifications\n )"))) {
+            assertClean("S7E5B2B2 N, $label", all(tree))
+        }
+    }
+
+    @Test fun `S7E5B2B2_N03 the holder calls the helper once after its tab check and passes needsAction and run only`() {
+        assertEquals("premise: the holder's one call is what H lets through", 1, HELPER_CALL.findAll(code.getValue(HOLDER)).count())
+        assertEquals("S7E5B2B2 N: holder", emptyList<String>(), holderNotify(code) + holderNames(code))
+    }
+
+    @Test fun `S7E5B2B2_N04 the holder lock catches a second moved inverted rewired or aliased helper use and accepts comments and reformatting`() {
+        fun all(tree: Map<String, String>) = holderNotify(tree) + holderNames(tree)
+        assertEquals("premise: the real tree is clean", emptyList<String>(), all(code))
+        val wiring = """onEnableNotifications = \{ notificationAction\.run\(\) \}"""
+        for ((label, tree, tag) in listOf(
+            Triple("a second helper call", appended(HOLDER, "@Composable private fun S7e5b2b2() = rememberNotificationPermissionAction()"), "N-holder-call"),
+            Triple("the call before the tab check", edited(HOLDER,
+                """\n    val currency = bankCurrencyOf\(tab\) \?: return\n    val notificationAction = rememberNotificationPermissionAction\(\)\n""",
+                "\n    val notificationAction = rememberNotificationPermissionAction()\n    val currency = bankCurrencyOf(tab) ?: return\n"), "N-holder-wiring"),
+            Triple("an inverted action", edited(HOLDER, """notificationsBlocked = notificationAction\.needsAction""", "notificationsBlocked = !notificationAction.needsAction"),
+                "N-holder-wiring"),
+            Triple("a continuation", edited(HOLDER, wiring, "onEnableNotifications = { notificationAction.run { source.manual() } }"), "N-holder-wiring"),
+            Triple("the callback rewired", edited(HOLDER, wiring, "onEnableNotifications = source::manual"), "N-holder-wiring"),
+            Triple("the action used once more", edited(HOLDER, """LaunchedEffect\(source, tab\) \{ source\.ensure\(\) \}""",
+                "LaunchedEffect(source, tab) { source.ensure(); notificationAction.run() }"), "N-holder-uses"),
+            Triple("a function reference to the helper", appended(HOLDER, "private val s7e5b2b2 = ::rememberNotificationPermissionAction"), "H-name permission"),
+            Triple("the helper by alias import", withImport(HOLDER, "import com.jay.fxi.ui.alert.rememberNotificationPermissionAction as ask"), "H-name permission"),
+            Triple("the environment seam named", appended(HOLDER, "private val s7e5b2b2 = LocalNotificationPermissionEnvironment"), "H-name permission"),
+            Triple("the action type named", appended(HOLDER, "private fun s7e5b2b2(a: NotificationPermissionAction) = a.needsAction"), "H-name permission"),
+            Triple("an escaped helper call", appended(HOLDER, "private val s7e5b2b2 = \"rememberNotificationPerm\\u0069ssionAction()\""), "N-holder-call"))) {
+            assertCaught("S7E5B2B2 N $label", tag, all(tree))
+        }
+        for ((label, tree) in listOf(
+            "comments only" to appended(HOLDER, "// rememberNotificationPermissionAction() permission notificationAction.run()\nprivate val s7e5b2b2Control = 1"),
+            "a reformatted wiring" to edited(HOLDER, wiring, "onEnableNotifications = {\n                notificationAction.run()\n            }"))) {
+            assertClean("S7E5B2B2 N, $label", all(tree))
+        }
+    }
+
+    @Test fun `S7E5B2B2_N05 the section reads no notification state directly qualified aliased or through a type alias and accepts comments`() {
+        assertTrue("premise: the pattern sees the OS read where it lives",
+            Regex(sectionForbidden("notification-os")).containsMatchIn(code.getValue(BASE + "service/NotificationCapability.kt")))
+        assertEquals("premise: the real tree is clean", emptyList<String>(), sectionEntries(code))
+        val elsewhereAlias = withFile(BYPASS_KT, "typealias S7e5b2b2Nm = androidx.core.app.NotificationManagerCompat")
+        for ((label, tree, tag) in listOf(
+            Triple("a channel read in the section", atSectionBody(
+                "androidx.core.app.NotificationManagerCompat.from(androidx.compose.ui.platform.LocalContext.current).getNotificationChannel(\"rate_alerts\")?.importance\n"),
+                "S-entry notification-os"),
+            Triple("the capability read", appended(SECTION, "private fun s7e5b2b2(c: android.content.Context) = com.jay.fxi.service.readNotificationCapability(c)"),
+                "S-entry notification-os"),
+            Triple("the capability type", appended(SECTION, "private val s7e5b2b2: com.jay.fxi.service.NotificationCapability? = null"), "S-entry notification-os"),
+            Triple("the monitor", appended(SECTION, "private val s7e5b2b2: com.jay.fxi.service.NotificationCapabilityMonitor? = null"), "S-entry notification-os"),
+            Triple("the manager by alias import", withImport(SECTION, "import androidx.core.app.NotificationManagerCompat as Nm"), "S-entry notification-os"),
+            Triple("a context in the section", appended(SECTION, "@Composable private fun S7e5b2b2() { val c = androidx.compose.ui.platform.LocalContext.current }"),
+                "S-entry notification-os"),
+            Triple("an SDK branch", appended(SECTION, "private val s7e5b2b2 = android.os.Build.VERSION.SDK_INT >= 33"), "S-entry notification-os"),
+            Triple("the manager behind a type alias elsewhere", appended(SECTION, "private val s7e5b2b2: S7e5b2b2Nm? = null", elsewhereAlias), "S-typealias S7e5b2b2Nm"))) {
+            assertCaught("S7E5B2B2 N05 $label", tag, sectionEntries(tree))
+        }
+        for ((label, tree) in listOf(
+            "comments only" to appended(SECTION, "// NotificationManagerCompat getNotificationChannel LocalContext readNotificationCapability\nprivate val s7e5b2b2Control = 1"),
+            "a harmless type alias elsewhere" to appended(SECTION, "private val s7e5b2b2: S7e5b2b2Ints? = null",
+                withFile(BYPASS_KT, "typealias S7e5b2b2Ints = List<Int>")))) {
+            assertClean("S7E5B2B2 N05, $label", sectionEntries(tree))
+        }
+    }
+
+    @Test fun `S7E5B2B2_N06 the holder makes no notification decision of its own and leaves the helper the only path`() {
+        assertTrue("premise: the pattern sees the OS read where it lives",
+            Regex(forbidden("notification-os")).containsMatchIn(code.getValue(BASE + "service/NotificationCapability.kt")))
+        assertEquals("premise: the real tree is clean", emptyList<String>(), holderNames(code) + holderNotify(code))
+        for ((label, tree, tag) in listOf(
+            Triple("an SDK and OS gate before the section", edited(HOLDER, """\n(\s*)AlertSection\(""",
+                "\n        if (android.os.Build.VERSION.SDK_INT >= 33 && !androidx.core.app.NotificationManagerCompat.from(LocalContext.current).areNotificationsEnabled()) return@key\n\$1AlertSection("),
+                "H-name notification-os"),
+            Triple("a bare enabled read", appended(HOLDER, "private fun s7e5b2b2(c: Context) = androidx.core.app.NotificationManagerCompat.from(c).areNotificationsEnabled()"),
+                "H-name notification-os"),
+            Triple("the capability read", appended(HOLDER, "private fun s7e5b2b2(c: Context) = com.jay.fxi.service.readNotificationCapability(c)"), "H-name notification-os"),
+            Triple("the monitor", appended(HOLDER, "private val s7e5b2b2: com.jay.fxi.service.NotificationCapabilityMonitor? = null"), "H-name notification-os"),
+            Triple("the registration coordinator", appended(HOLDER, "private val s7e5b2b2: com.jay.fxi.service.PushRegistrationCoordinator? = null"),
+                "H-name notification-os"),
+            Triple("a settings screen", appended(HOLDER, "private fun s7e5b2b2(c: Context) = c.startActivity(android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS))"),
+                "H-name notification-os"),
+            Triple("the manager by alias import", withImport(HOLDER, "import androidx.core.app.NotificationManagerCompat as Nm"), "H-name notification-os"))) {
+            assertCaught("S7E5B2B2 N06 $label", tag, holderNames(tree))
+        }
+        assertClean("S7E5B2B2 N06, comments only", holderNames(appended(HOLDER,
+            "// NotificationManagerCompat areNotificationsEnabled Build.VERSION startActivity\nprivate val s7e5b2b2Control = 1")))
+    }
+
+    @Test fun `S7E5B2B2_N07 neither the holder nor the section opens an add or edit sheet`() {
+        assertEquals("premise: the real tree is clean", emptyList<String>(), holderNames(code) + sectionEntries(code))
+        val sheet = "AlertAddSheet(currency = currency, rates = emptyList(), hasDuplicate = { _, _, _, _ -> false }, onSave = { _, _, _, _ -> }, onDismiss = { })"
+        for ((label, tree, tag) in listOf(
+            Triple("a sheet in the holder for one tab", edited(HOLDER, """\n(\s*)AlertSection\(""", "\n        if (tab == FreeTab.JPY) { $sheet }\n\$1AlertSection("),
+                "H-name sheet"),
+            Triple("a holder helper that opens the sheet", appended(HOLDER, "@Composable private fun S7e5b2b2(currency: SupportedCurrency) { $sheet }"), "H-name sheet"),
+            Triple("a bottom sheet in the holder", appended(HOLDER, "@Composable private fun S7e5b2b2() { androidx.compose.material3.ModalBottomSheet(onDismissRequest = { }) { } }"),
+                "H-name sheet"),
+            Triple("an edit callback in the holder", appended(HOLDER, "private fun s7e5b2b2(onEdit: (Int) -> Unit) = onEdit(1)"), "H-name sheet"),
+            Triple("a sheet in the section", appended(SECTION, "@Composable private fun S7e5b2b2(currency: SupportedCurrency) { $sheet }"), "S-entry add"))) {
+            assertCaught("S7E5B2B2 N07 $label", tag, holderNames(tree) + sectionEntries(tree))
+        }
+        assertClean("S7E5B2B2 N07, comments only", holderNames(appended(HOLDER, "// AlertAddSheet onEdit 추가 편집\nprivate val s7e5b2b2Control = 1")))
+    }
+
     // ---- P: the premium route's mount ----
 
     @Test fun `S7E5A1_R3_P01 the route calls BankAlertSection once inside belowRates after the unchanged BankHistoryEntry passing its factory parameter`() {
@@ -523,7 +684,11 @@ class BankAlertSectionStructureTest {
             "LifecycleEventObserver" to """\bLifecycleEventObserver\b""",
             "ProcessLifecycleOwner" to """\bProcessLifecycleOwner\b""",
             "LocalLifecycleOwner" to """\bLocalLifecycleOwner\b""",
-            "lifecycle-observer" to """\baddObserver\b|\bremoveObserver\b|\b\w*LifecycleObserver\b|\bLifecycle(?:Resume|Start|Event)Effect\b|\brepeatOnLifecycle\b""")
+            "lifecycle-observer" to """\baddObserver\b|\bremoveObserver\b|\b\w*LifecycleObserver\b|\bLifecycle(?:Resume|Start|Event)Effect\b|\brepeatOnLifecycle\b""",
+            // S7 E5b2b2 (gap hunt G02): every notification decision stays in the helper.
+            "notification-os" to """\bNotificationManager\w*|\bgetNotificationChannels?\b|\bareNotificationsEnabled\b|\breadNotificationCapability\b|\bNotificationCapability\w*|\bPushRegistration\w*|\bPushIntentReconciler\b|\bgetSystemService\b|\bstartActivit(?:y|ies)\w*|\bACTION_\w*SETTINGS\b|\bBuild\s*\.\s*VERSION\b|\bActivityResultContracts\b|\brememberLauncherForActivityResult\b""",
+            // S7 E5b2b2 (gap hunt G05, start agreement §4-2): the holder opens no add or edit sheet.
+            "sheet" to """\bAlertAddSheet\b|\bAlertEdit\w*|\bAddAlert\w*|\bonAdd\w*|\bonEdit\w*|\b\w*BottomSheet\w*|\bFloatingActionButton\b|추가|편집|수정""")
 
         /** API r2 §3 / §5 row 3: what AlertSection never draws or names. */
         val SECTION_FORBIDDEN = listOf(
@@ -534,12 +699,28 @@ class BankAlertSectionStructureTest {
             "edit" to """(?i)edit|편집|수정|\bonTap\b|\bonLongClick\b""",
             "permission" to """(?i)permission|POST_NOTIFICATIONS|opensettings|\bACTION_\w*SETTINGS\b|\bActivityResultContracts\b|\brememberLauncherForActivityResult\b|\bstartActivit(?:y|ies)\w*|\bareNotificationsEnabled\b""",
             "AlertRow" to """\bAlertRow\b""",
-            "view-model" to """\bAlertViewModel\b|\bAlertState\b|\bhiltViewModel\b""")
+            "view-model" to """\bAlertViewModel\b|\bAlertState\b|\bhiltViewModel\b""",
+            // S7 E5b2b2 (gap hunt G01): the section reads no notification state and holds no Context to reach one.
+            "notification-os" to """\bNotificationManager\w*|\bgetNotificationChannels?\b|\breadNotificationCapability\b|\bNotificationCapability\w*|\bgetSystemService\b|\bLocalContext\b|\bBuild\s*\.\s*VERSION\b""")
 
         /** API r2 §3: the read-only signature, squashed. */
         val SIGNATURE = listOf("currency: SupportedCurrency", "state: BankAlertSectionState", "onRetry: () -> Unit", "onRefresh: () -> Unit",
             "actionIdentity: AuthIdentityFence?", "onToggle: (Int, Boolean) -> Unit", "onDelete: (Int) -> Unit",
+            "notificationsBlocked: Boolean", "onEnableNotifications: () -> Unit",
             "modifier: Modifier = Modifier", "metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current")
+
+        /** S7 E5b2b2 (start agreement D10): the holder's one helper call, the only `permission` name the holder may hold. */
+        val HELPER_CALL = Regex("""\brememberNotificationPermissionAction\s*\(\s*\)""")
+        /** S7 E5b2b2: the holder's wiring, squashed: the call right after the tab check, then needsAction and run only. */
+        val NOTIFY_WIRING = listOf(
+            "val currency = bankCurrencyOf(tab) ?: return\n    val notificationAction = rememberNotificationPermissionAction()",
+            "notificationsBlocked = notificationAction.needsAction,",
+            "onEnableNotifications = { notificationAction.run() },").map { squash(it) }
+        val BUTTON_CALL = Regex("""(?<![\w.`])Button\s*\(""")
+        val ROW_CALL = Regex("""(?<![\w.`])Row\s*\(""")
+        val CLICKABLE_CALL = Regex("""\.\s*clickable\s*\(""")
+        /** What directly precedes a block's `{` when the block draws only for blocked notifications. */
+        val GUARD = Regex("""\bif\s*\(\s*notificationsBlocked\s*\)\s*$""")
 
         /** Click modifiers and semantics actions: allowed in the header only. */
         val CLICK_MODIFIER = Regex("""\b(?:clickable|combinedClickable|selectable|selectableGroup|toggleable|triStateToggleable|pointerInput|pointerInteropFilter|draggable|anchoredDraggable|swipeable|detectTap\w*|detectDrag\w*|customActions|CustomAccessibilityAction)\b|\b(?:onClick|onLongClick|onDoubleClick)\b(?=\s*[({])""")
@@ -843,7 +1024,8 @@ class BankAlertSectionStructureTest {
 
         class Fn(val name: String, val params: IntRange, val extent: IntRange)
 
-        class Regions(val content: IntRange, val header: List<IntRange>, val rows: List<IntRange>, val error: List<IntRange>)
+        class Regions(val content: IntRange, val header: List<IntRange>, val rows: List<IntRange>, val error: List<IntRange>,
+            val branch: Map<String, IntRange> = emptyMap())
 
         /** The file's top-level functions, each extending to the next top-level declaration. */
         fun topLevelFunctions(text: String): List<Fn> {
@@ -935,7 +1117,7 @@ class BankAlertSectionStructureTest {
                 return null
             }
             return Regions(content, closure(text, listOf(headerCall), funs), closure(text, rowSeeds, funs),
-                closure(text, listOf(branch.getValue("Error")), funs))
+                closure(text, listOf(branch.getValue("Error")), funs), branch)
         }
 
         // ---- the locks: each returns its violations, empty for an accepted tree ----
@@ -943,7 +1125,9 @@ class BankAlertSectionStructureTest {
         /** H: the holder's forbidden names, directly or through a type alias declared anywhere in the roots. */
         fun holderNames(code: Map<String, String>): List<String> {
             val text = code[HOLDER] ?: return listOf("H-missing")
-            val v = HOLDER_FORBIDDEN.filter { (_, p) -> Regex(p).containsMatchIn(text) }.map { (tag, _) -> "H-name $tag" }.toMutableList()
+            // S7 E5b2b2: the exact empty-argument call is let through; an alias, a reference or any other permission name is not.
+            val scanned = HELPER_CALL.replace(text, " ")
+            val v = HOLDER_FORBIDDEN.filter { (_, p) -> Regex(p).containsMatchIn(scanned) }.map { (tag, _) -> "H-name $tag" }.toMutableList()
             for (source in code.values) for (alias in TYPEALIAS.findAll(source)) {
                 val target = alias.groupValues[2]
                 if (HOLDER_FORBIDDEN.any { (_, p) -> Regex(p).containsMatchIn(target) } &&
@@ -1078,7 +1262,16 @@ class BankAlertSectionStructureTest {
         /** S: the entries and names AlertSection never has. */
         fun sectionEntries(code: Map<String, String>): List<String> {
             val text = code[SECTION] ?: return listOf("S-missing")
-            return SECTION_FORBIDDEN.filter { (_, p) -> Regex(p).containsMatchIn(text) }.map { (tag, _) -> "S-entry $tag" }
+            val v = SECTION_FORBIDDEN.filter { (_, p) -> Regex(p).containsMatchIn(text) }.map { (tag, _) -> "S-entry $tag" }.toMutableList()
+            // S7 E5b2b2 (gap hunt G01): a forbidden name behind a type alias declared in any scanned source.
+            for (source in code.values) for (alias in TYPEALIAS.findAll(source)) {
+                val target = alias.groupValues[2]
+                if (SECTION_FORBIDDEN.any { (_, p) -> Regex(p).containsMatchIn(target) } &&
+                    Regex("""\b${Regex.escape(alias.groupValues[1])}\b""").containsMatchIn(text)) {
+                    v += "S-typealias ${alias.groupValues[1]}"
+                }
+            }
+            return v.distinct()
         }
 
         /** S: where AlertSection's click surfaces are; the regions' own shape is reported as a violation too. */
@@ -1089,6 +1282,7 @@ class BankAlertSectionStructureTest {
             val imports = IMPORT_LINE.findAll(text).map { it.range }.toList()
             fun within(p: Int, ranges: List<IntRange>) = ranges.any { p in it }
             val actions = rowActionSpans(text, imports)
+            val notify = notifySpans(text)
             for ((kind, regex) in listOf("modifier" to CLICK_MODIFIER, "action" to CLICK_ACTION)) {
                 for (m in regex.findAll(text)) {
                     val p = m.range.first
@@ -1096,6 +1290,8 @@ class BankAlertSectionStructureTest {
                         within(p, imports) -> Unit
                         // S7 E5a2: counted, placed and shaped by sectionRowActions.
                         within(p, actions) -> Unit
+                        // S7 E5b2b2: counted, placed and shaped by sectionNotify.
+                        within(p, notify) -> Unit
                         within(p, r.rows) -> { v += "S-row-click ${m.value}" }
                         within(p, r.header) -> Unit
                         kind == "action" && within(p, r.error) -> Unit
@@ -1111,6 +1307,84 @@ class BankAlertSectionStructureTest {
             val retries = tagPattern("RETRY").findAll(text).map { it.range.first }.toList()
             if (retries.isEmpty() || !retries.all { within(it, r.error) } || !holds(r.error, """\bonRetry\b""")) v += "S-shape retry"
             if (!holds(r.header, """\bonRefresh\b""")) v += "S-shape refresh"
+            return v
+        }
+
+        /** S7 E5b2b2: the prompt's Button (its whole call) and the banner's click modifier calls. */
+        fun notifySpans(text: String): List<IntRange> {
+            val buttonTags = tagPattern("NOTIFY_PROMPT_BUTTON").findAll(text).map { it.range.first }.toList()
+            return BUTTON_CALL.findAll(text).mapNotNull { callSpan(text, it) }.filter { s -> buttonTags.any { it in s } }.toList() +
+                bannerClicks(text)
+        }
+
+        /** S7 E5b2b2: the `.clickable(` calls in the argument list of the innermost Row call whose arguments hold the banner tag. */
+        fun bannerClicks(text: String): List<IntRange> {
+            val tag = tagPattern("NOTIFY_BANNER").findAll(text).toList().singleOrNull() ?: return emptyList()
+            val args = ROW_CALL.findAll(text).mapNotNull { m ->
+                val open = text.indexOf('(', m.range.first)
+                closing(text, open)?.let { open..it }
+            }.filter { tag.range.first in it }.maxByOrNull { it.first } ?: return emptyList()
+            return CLICKABLE_CALL.findAll(text).filter { it.range.first in args }.mapNotNull { m ->
+                closing(text, text.indexOf('(', m.range.first))?.let { m.range.first..it }
+            }.toList()
+        }
+
+        /** N: AlertSection's prompt and banner (API §3.2): placed, guarded, one click each, both calling onEnableNotifications. */
+        fun sectionNotify(code: Map<String, String>): List<String> {
+            val text = code[SECTION] ?: return listOf("N-missing")
+            val v = mutableListOf<String>()
+            val r = regions(text, v) ?: return v
+            val braces = pairs(text, '{', '}')
+            fun guarded(p: Int, branch: IntRange) = braces.any { b ->
+                p > b.first && p < b.last && b.first in branch && GUARD.containsMatchIn(text.substring(maxOf(branch.first, b.first - 80), b.first))
+            }
+            fun at(tag: String) = tagPattern(tag).findAll(text).map { it.range.first }.toList()
+            val empty = r.branch.getValue("Empty")
+            val rowsBranch = r.branch.getValue("Rows")
+            val prompt = at("NOTIFY_PROMPT")
+            if (prompt.size != 1 || prompt.single() !in empty || !guarded(prompt.single(), empty)) v += "N-prompt-place $prompt"
+            val button = at("NOTIFY_PROMPT_BUTTON")
+            if (button.size != 1 || button.single() !in empty || !guarded(button.single(), empty)) v += "N-prompt-button-place $button"
+            val buttons = BUTTON_CALL.findAll(text).mapNotNull { callSpan(text, it) }.filter { s -> button.any { it in s } }.toList()
+            if (buttons.size != 1) {
+                v += "N-prompt-button ${buttons.size}"
+            } else {
+                val span = buttons.single()
+                val open = text.indexOf('(', span.first)
+                val args = topLevelArgs(text.substring(open + 1, closing(text, open)!!))
+                if (args.count { it == "onClick = onEnableNotifications" } != 1 || args.count { it.startsWith("onClick") } != 1) v += "N-prompt-callback $args"
+                val inside = text.substring(span.first, span.last + 1)
+                if (CLICK_MODIFIER.findAll(inside).count() != 0 || CLICK_ACTION.findAll(inside).map { it.value }.toList() != listOf("Button", "onClick")) {
+                    v += "N-prompt-clicks"
+                }
+            }
+            val banner = at("NOTIFY_BANNER")
+            val rowsTag = at("ROWS")
+            if (banner.size != 1 || banner.single() !in rowsBranch || !guarded(banner.single(), rowsBranch) ||
+                rowsTag.size != 1 || banner.single() > rowsTag.single()) {
+                v += "N-banner-place $banner"
+            }
+            val clicks = bannerClicks(text).map { squash(text.substring(it.first, it.last + 1)) }
+            if (clicks != listOf(".clickable(onClick = onEnableNotifications)")) v += "N-banner-click $clicks"
+            if (count(text, """\bonEnableNotifications\b""") != 3) v += "N-callback-uses ${count(text, """\bonEnableNotifications\b""")}"
+            if (count(text, """\bnotificationsBlocked\b""") != 3) v += "N-flag-uses ${count(text, """\bnotificationsBlocked\b""")}"
+            val emptyTag = at("EMPTY")
+            if (emptyTag.size != 1 || emptyTag.single() !in empty || guarded(emptyTag.single(), empty)) v += "N-empty-shape $emptyTag"
+            return v
+        }
+
+        /** N: the holder asks the helper once, right after the tab check, inside BankAlertSection, and passes needsAction and run only. */
+        fun holderNotify(code: Map<String, String>): List<String> {
+            val text = code[HOLDER] ?: return listOf("N-holder-missing")
+            val v = mutableListOf<String>()
+            if (count(text, """\brememberNotificationPermissionAction\b""") != 1 || HELPER_CALL.findAll(text).count() != 1) v += "N-holder-call"
+            val flat = squash(text)
+            for (line in NOTIFY_WIRING) if (count(flat, Regex.escape(line)) != 1) v += "N-holder-wiring $line"
+            val uses = count(text, """\bnotificationAction\b""")
+            if (uses != 3) v += "N-holder-uses $uses"
+            val body = bodyRange(text, "BankAlertSection")
+            val call = HELPER_CALL.find(text)
+            if (body == null || call == null || call.range.first !in body) v += "N-holder-place"
             return v
         }
 

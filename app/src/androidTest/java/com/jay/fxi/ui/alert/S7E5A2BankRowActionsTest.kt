@@ -74,7 +74,9 @@ class S7E5A2BankRowActionsTest {
                 onRefresh = { },
                 actionIdentity = identity.value,
                 onToggle = { id, enabled -> toggles += id to enabled },
-                onDelete = { id -> deletes += id }
+                onDelete = { id -> deletes += id },
+                notificationsBlocked = false,
+                onEnableNotifications = { }
             )
         }
         rule.waitForIdle()
