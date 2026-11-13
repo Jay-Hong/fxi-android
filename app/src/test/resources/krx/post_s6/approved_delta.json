@@ -211,6 +211,20 @@
         "src/main/java/com/jay/fxi/service/NotificationCapabilityMonitor.kt": "f45dcdcb6062680829c73462572794ba50519d3b56d5ec0bcf56b081b60eb97e",
         "src/main/java/com/jay/fxi/service/PushIntentReconciler.kt": "a53e5a2887f76941e856fd29aed965442370217246e1a85bf986cf127bed7c55"
       }
+    },
+    {
+      "id": "S7-E5b2b1",
+      "source_parent": "ca543affdbd859a01b0a08ea0e856226398de4af",
+      "approval_record_sha256": "daf92b86237e40f079c01b8525b3f2b185b71d74c603e114c83b6fa6f17742a0",
+      "changed": {
+        "src/main/java/com/jay/fxi/ui/settings/SettingsScreen.kt": {
+          "from": "74515ec37f53cbfaa0d775a063172cb182d8e91bdc338ecaa827c9c1c54b1f73",
+          "to": "9ab5c15f8a78e83f834e3d1837147f5b511522825ef7c7c00dce7555bca7b063"
+        }
+      },
+      "added": {
+        "src/main/java/com/jay/fxi/ui/alert/NotificationPermissionAction.kt": "c9317013997aceccd292b2c7c97701322ab235839ac245659594f837900438c0"
+      }
     }
   ]
 }

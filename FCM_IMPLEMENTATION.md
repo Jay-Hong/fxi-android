@@ -106,7 +106,7 @@ class PushNotificationManager @Inject constructor(
 **호출 책임 정리**:
 
 - `rehydratePushTokenIfNeeded()` → **SubscriptionManager.onAuthCompleted()에서만** 호출 (단일 책임)
-- `reconcileRegistration(owner)` → `NotificationCapabilityMonitor`가 호출한다: alert-family registry의 foreground hook(첫 foreground 포함), premium publication(owner 바뀜 포함), 권한 helper의 결과(E5b2b). 진행 중 평가와 같은 관측은 합류한다
+- `reconcileRegistration(owner)` → `NotificationCapabilityMonitor`가 호출한다: alert-family registry의 foreground hook(첫 foreground 포함), premium publication(owner 바뀜 포함), 권한 helper(`ui/alert/NotificationPermissionAction.kt`, S7 E5b2b1)의 결과 함수 `onRequestResult`·`onAlreadyGranted`. 진행 중 평가와 같은 관측은 합류한다
 - `unregisterDeviceFromServer(owner)` → **AuthViewModel 로그아웃 실행자(`handedOffSignOut`)에서만** 호출한다. owner 는 로그아웃을 시작한 세션이다.
 - ~~RootScreen은 상태 전환 감지 시 unregister 호출~~ — L-4b-2 4c(3b-2)에서 지웠다. 앱 로그아웃의 해제는 실행자가 하고, 외부 로그아웃은
   A 의 인증이 없어 DELETE 할 수 없으며, 늦게 도는 효과는 새 세션을 해제 대상으로 잡을 수 있었다. 등록·회전·해제의 현재 구조는
@@ -186,7 +186,8 @@ data class AlertSettingRequest(
 - 알림 설정 첫 생성 시 권한 요청
 - 승인 → shouldRegisterForPush=true → registerIfNeeded()
 - 거부 → shouldRegisterForPush=false
-- S7 E5b2a: 앱 복귀 때의 capability 재확인과 거부 시 의도 false는 `NotificationCapabilityMonitor`가 중앙 foreground hook에서 한다. 요청·설정 유도 UI는 E5b2b.
+- S7 E5b2a: 앱 복귀 때의 capability 재확인과 거부 시 의도 false는 `NotificationCapabilityMonitor`가 중앙 foreground hook에서 한다.
+- S7 E5b2b1: 권한 helper `rememberNotificationPermissionAction()`(요청 우선, rationale이면 설명 뒤 요청, 확인된 미허용에만 설정 열기/다시 요청 안내, 앱·채널 차단은 해당 설정 화면)과 설정 화면의 "알림 설정" row. 알림 section의 prompt·banner는 E5b2b2.
 
 ## 주의사항
 

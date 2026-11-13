@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "857508fef2e77cd3a9ef2d44a839a5e80266bf437cbe27e58e850c891e465bf6"
+    const val APPROVED_SHA256 = "1a01118bcbb7568785d146ecc67e27de87ec42a969ee7b0686ac9a7ac0a456d7"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -59,6 +59,7 @@ internal object PostS6ApprovedDelta {
      * - 45207074…: a3505187 AlertFamilyRefresherRegistry.kt, no KRX at all (comments included).
      * - 9dd93c1a…: a3505187 PushNotificationManager.kt, no KRX at all (comments included).
      * - fd04c1cb…: a3505187 PushRegistrationCoordinator.kt, no KRX at all (comments included).
+     * - 74515ec3…: ca543aff SettingsScreen.kt, no KRX at all (comments included).
      */
     val NO_KRX_REVIEWED = setOf(
         "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
@@ -83,7 +84,8 @@ internal object PostS6ApprovedDelta {
         "bc27950c5be8cc77f63b1943c2f4bd0843318f7523cd327bc06c960e11554f52",
         "452070742a7d29de3dd087c845b15ed96be199a1fb1e743a61009a56157691d2",
         "9dd93c1a0f8e33a47ac214bb5c5aa02ab851a0c0e7828a7cfeab6e224aad389a",
-        "fd04c1cb48d499147dcdb393fc7b69e581c063f8b2ac44239c2699950dcdeb5f"
+        "fd04c1cb48d499147dcdb393fc7b69e581c063f8b2ac44239c2699950dcdeb5f",
+        "74515ec37f53cbfaa0d775a063172cb182d8e91bdc338ecaa827c9c1c54b1f73"
     )
 
     /**

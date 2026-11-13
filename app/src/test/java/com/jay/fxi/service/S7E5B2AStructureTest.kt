@@ -25,6 +25,10 @@ class S7E5B2AStructureTest {
         val CAPABILITY = BASE + "service/NotificationCapability.kt"
         val MANAGER = BASE + "service/PushNotificationManager.kt"
         val REGISTRY = BASE + "data/alerts/AlertFamilyRefresherRegistry.kt"
+        /** S7 E5b2b1 (errata r1 E4): the permission helper also names the monitor. */
+        val HELPER = BASE + "ui/alert/NotificationPermissionAction.kt"
+        /** The monitor members the helper may use: the display and the two result functions, never the foreground entry. */
+        val HELPER_MONITOR_MEMBERS = setOf("state", "onRequestResult", "onAlreadyGranted")
 
         /** Every Kotlin production source of the scanned roots, comment-free with every literal kept; Java as written. */
         val code: Map<String, String> by lazy {
@@ -59,7 +63,10 @@ class S7E5B2AStructureTest {
                 count(monitor, """\bmanager\s*::\s*reconcileRegistration\b""") != 1 ||
                 count(monitor, """\bmanager\b""") != 2) v += "M-facade"
             val named = files(code, """\bNotificationCapabilityMonitor\b""")
-            if (named != setOf(MONITOR, REGISTRY)) v += "M-reach ${named.sorted()}"
+            if (named != setOf(MONITOR, REGISTRY, HELPER)) v += "M-reach ${named.sorted()}"
+            val helper = code[HELPER] ?: return v + "M-helper-missing"
+            val members = Regex("""\bmonitor\s*(?:\.|::)\s*(\w+)""").findAll(helper).map { it.groupValues[1] }.toSet()
+            if (members != HELPER_MONITOR_MEMBERS || count(helper, """\bonForeground\b""") != 0) v += "M-helper $members"
             return v
         }
 
@@ -188,7 +195,9 @@ class S7E5B2AStructureTest {
             Triple("a family adapter", appended(MONITOR, "private val s: com.jay.fxi.data.alerts.AlertFamilyAdapter? = null"), "M-name family"),
             Triple("a screen", appended(MONITOR, "fun s(c: android.content.Context) = c.startActivity(android.content.Intent())"), "M-name screen"),
             Triple("another facade member", edited(MONITOR, """manager::reconcileRegistration""", "{ manager.rehydratePushTokenIfNeeded() }"), "M-facade"),
-            Triple("another driver", appended(MANAGER, "private val s: NotificationCapabilityMonitor? = null"), "M-reach"))) {
+            Triple("another driver", appended(MANAGER, "private val s: NotificationCapabilityMonitor? = null"), "M-reach"),
+            Triple("the helper drives the foreground", appended(HELPER, "private fun s(monitor: NotificationCapabilityMonitor) = monitor.onForeground()"), "M-helper"),
+            Triple("the helper re-evaluates directly", edited(HELPER, """onAlreadyGranted = monitor::onAlreadyGranted""", "onAlreadyGranted = { monitor.onRequestResult(it); true }"), "M-helper"))) {
             assertCaught(label, tag, mVerdicts(tree))
         }
     }

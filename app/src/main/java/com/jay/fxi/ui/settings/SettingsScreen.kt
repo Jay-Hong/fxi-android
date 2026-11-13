@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.AccountBalance
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.filled.Payments
 import androidx.compose.material.icons.filled.PersonOff
@@ -80,6 +81,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -91,6 +93,7 @@ import com.jay.fxi.BuildConfig
 import com.jay.fxi.R
 import com.jay.fxi.domain.model.AuthProvider
 import com.jay.fxi.domain.model.UserInfo
+import com.jay.fxi.ui.alert.rememberNotificationPermissionAction
 import com.jay.fxi.ui.theme.Background
 import com.jay.fxi.ui.theme.CardBackground
 import com.jay.fxi.ui.theme.Primary
@@ -264,7 +267,7 @@ fun SettingsScreen(
 }
 
 @Composable
-private fun SettingsMainContent(
+internal fun SettingsMainContent(
     userInfo: UserInfo?,
     showRatingOption: Boolean,
     onDismiss: () -> Unit,
@@ -289,6 +292,11 @@ private fun SettingsMainContent(
         // 프로필 카드 (로그인 시에만) - 탭하면 ProfileDetailView로 이동
         if (userInfo != null) {
             ProfileCard(userInfo = userInfo, onClick = onNavigateProfile)
+        }
+
+        val notificationAction = rememberNotificationPermissionAction()
+        if (notificationAction.needsAction) {
+            NotificationSettingsRow(onClick = { notificationAction.run() })
         }
 
         // 일반 섹션
@@ -1516,6 +1524,47 @@ private fun ChevronIcon() {
         tint = SecondaryText.copy(alpha = 0.5f),
         modifier = Modifier.size(20.dp)
     )
+}
+
+internal object SettingsTags {
+    const val NOTIFICATION_ROW = "settings-notification-row"
+    const val NOTIFICATION_ROW_CHEVRON = "settings-notification-row-chevron"
+}
+
+@Composable
+private fun NotificationSettingsRow(onClick: () -> Unit) {
+    SettingsSection {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag(SettingsTags.NOTIFICATION_ROW)
+                .clickable(onClick = onClick)
+                .padding(horizontal = 12.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Filled.Notifications,
+                contentDescription = null,
+                tint = Primary,
+                modifier = Modifier.size(22.dp)
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(text = "알림 설정", color = PrimaryText, fontSize = 15.sp)
+                Text(
+                    text = "환율 알림을 받으려면 설정이 필요합니다",
+                    color = SecondaryText,
+                    fontSize = 12.sp
+                )
+            }
+            Icon(
+                Icons.Filled.ChevronRight,
+                contentDescription = null,
+                tint = SecondaryText.copy(alpha = 0.5f),
+                modifier = Modifier.size(20.dp).testTag(SettingsTags.NOTIFICATION_ROW_CHEVRON)
+            )
+        }
+    }
 }
 
 @Composable
