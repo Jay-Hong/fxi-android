@@ -19,6 +19,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AddCircle
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Notifications
@@ -66,6 +68,7 @@ import com.jay.fxi.domain.model.RepeatInterval
 import com.jay.fxi.domain.model.SupportedCurrency
 import com.jay.fxi.ui.alert.BankAlertSectionState.Content
 import com.jay.fxi.ui.theme.CardBackground
+import com.jay.fxi.ui.theme.InputBackground
 import com.jay.fxi.ui.theme.LocalRateLayoutMetrics
 import com.jay.fxi.ui.theme.NegativeColor
 import com.jay.fxi.ui.theme.PositiveColor
@@ -87,6 +90,9 @@ internal fun AlertSection(
     onDelete: (Int) -> Unit,
     notificationsBlocked: Boolean,
     onEnableNotifications: () -> Unit,
+    addAvailability: BankAlertAddAvailability,
+    onAdd: () -> Unit,
+    onEdit: (Int) -> Unit,
     modifier: Modifier = Modifier,
     metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current
 ) {
@@ -267,7 +273,7 @@ internal fun AlertSection(
                                     textAlign = TextAlign.Center
                                 )
                                 Button(
-                                    onClick = onEnableNotifications,
+                                    onClick = onAdd,
                                     modifier = Modifier.testTag(BankAlertSectionTags.NOTIFY_PROMPT_BUTTON),
                                     colors = ButtonDefaults.buttonColors(
                                         containerColor = Primary,
@@ -294,6 +300,7 @@ internal fun AlertSection(
                                 )
                                 Text("설정된 알림이 없습니다", color = SecondaryText, fontSize = 12.sp)
                             }
+                            BankAlertAddArea(addAvailability, metrics, onAdd)
                         }
                     }
                     is Content.Rows -> {
@@ -335,6 +342,7 @@ internal fun AlertSection(
                                     BankSetting(
                                         setting = setting,
                                         metrics = metrics,
+                                        onOpen = { onEdit(setting.id) },
                                         onToggle = { enabled -> onToggle(setting.id, enabled) },
                                         onDelete = {
                                             val id = setting.id
@@ -355,6 +363,7 @@ internal fun AlertSection(
                                 }
                             }
                         }
+                        BankAlertAddArea(addAvailability, metrics, onAdd)
                     }
                 }
             }
@@ -386,12 +395,60 @@ internal fun AlertSection(
     }
 }
 
+@Composable
+private fun BankAlertAddArea(
+    availability: BankAlertAddAvailability,
+    metrics: RateLayoutMetrics,
+    onAdd: () -> Unit
+) {
+    when (availability) {
+        BankAlertAddAvailability.Hidden -> Unit
+        is BankAlertAddAvailability.Available -> {
+            Row(
+                modifier = Modifier
+                    .padding(horizontal = metrics.horizontalPadding)
+                    .padding(top = 12.dp, bottom = 4.dp)
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(InputBackground)
+                    .testTag(BankAlertSectionTags.ADD_BUTTON)
+                    .clickable(onClick = onAdd)
+                    .padding(vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.AddCircle, contentDescription = null, tint = Primary, modifier = Modifier.size(16.dp))
+                Text("알림 추가", color = Primary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                if (availability.remaining in 1..3) {
+                    Text("(${availability.remaining}개 남음)", color = SecondaryText, fontSize = 12.sp)
+                }
+            }
+        }
+        BankAlertAddAvailability.AtCap -> {
+            Row(
+                modifier = Modifier
+                    .testTag(BankAlertSectionTags.ADD_AT_CAP)
+                    .fillMaxWidth()
+                    .padding(horizontal = metrics.horizontalPadding)
+                    .padding(top = 12.dp, bottom = 4.dp)
+                    .padding(vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.ErrorOutline, contentDescription = null, tint = SecondaryText, modifier = Modifier.size(14.dp))
+                Text("최대 30개까지 설정할 수 있습니다", color = SecondaryText, fontSize = 12.sp)
+            }
+        }
+    }
+}
+
 private data class PendingBankDelete(val id: Int, val bankName: String, val confirm: () -> Unit)
 
 @Composable
 private fun BankSetting(
     setting: AlertSetting,
     metrics: RateLayoutMetrics,
+    onOpen: () -> Unit,
     onToggle: (Boolean) -> Unit,
     onDelete: () -> Unit
 ) {
@@ -412,57 +469,65 @@ private fun BankSetting(
             .padding(horizontal = metrics.horizontalPadding, vertical = metrics.alertRowVerticalPadding),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Column(
-            Modifier.width(metrics.alertBankNameWidth)
-                .alpha(if (setting.isEnabled) 1f else 0.5f)
-        ) {
-            Text(
-                text = setting.bankType?.displayName ?: setting.bank,
-                color = PrimaryText,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                softWrap = false
-            )
-            if (statusLabel != null) {
-                Text(
-                    text = statusLabel,
-                    color = if (setting.triggered) StatusConnecting else Primary,
-                    fontSize = 11.sp,
-                    modifier = Modifier.offset(y = (-7).dp)
-                )
-            }
-        }
         Row(
-            Modifier.weight(1f).alpha(if (setting.isEnabled) 1f else 0.5f),
+            modifier = Modifier
+                .weight(1f)
+                .testTag(BankAlertSectionTags.rowOpen(setting.id))
+                .clickable(onClick = onOpen),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = setting.formattedThreshold,
-                color = PrimaryText,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                softWrap = false
-            )
-            Spacer(Modifier.width(4.dp))
-            Text(
-                text = if (setting.condition == AlertCondition.ABOVE) "△" else "▽",
-                color = conditionColor,
-                fontSize = metrics.alertConditionSymbolFontSize,
-                fontWeight = FontWeight.Black
-            )
-            Spacer(Modifier.width(2.dp))
-            Text(
-                text = setting.condition.displayText,
-                color = conditionColor,
-                fontSize = 14.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                softWrap = false
-            )
+            Column(
+                Modifier.width(metrics.alertBankNameWidth)
+                    .alpha(if (setting.isEnabled) 1f else 0.5f)
+            ) {
+                Text(
+                    text = setting.bankType?.displayName ?: setting.bank,
+                    color = PrimaryText,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    softWrap = false
+                )
+                if (statusLabel != null) {
+                    Text(
+                        text = statusLabel,
+                        color = if (setting.triggered) StatusConnecting else Primary,
+                        fontSize = 11.sp,
+                        modifier = Modifier.offset(y = (-7).dp)
+                    )
+                }
+            }
+            Row(
+                Modifier.weight(1f).alpha(if (setting.isEnabled) 1f else 0.5f),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = setting.formattedThreshold,
+                    color = PrimaryText,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    softWrap = false
+                )
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    text = if (setting.condition == AlertCondition.ABOVE) "△" else "▽",
+                    color = conditionColor,
+                    fontSize = metrics.alertConditionSymbolFontSize,
+                    fontWeight = FontWeight.Black
+                )
+                Spacer(Modifier.width(2.dp))
+                Text(
+                    text = setting.condition.displayText,
+                    color = conditionColor,
+                    fontSize = 14.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    softWrap = false
+                )
+            }
         }
         Switch(
             checked = setting.isEnabled,

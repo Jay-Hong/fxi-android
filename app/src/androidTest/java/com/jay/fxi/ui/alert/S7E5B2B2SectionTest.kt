@@ -40,6 +40,10 @@ class S7E5B2B2SectionTest {
     private val blocked = mutableStateOf(true)
     private val identity = mutableStateOf<AuthIdentityFence?>(A)
     private var enables = 0
+    /** S7 E5b3b: the prompt now asks for the add entry; the banner still asks for the permission only. */
+    private var adds = 0
+    private val opens = mutableListOf<Int>()
+    private val addAvailability = mutableStateOf<BankAlertAddAvailability>(BankAlertAddAvailability.Hidden)
     private var retries = 0
     private val toggles = mutableListOf<Pair<Int, Boolean>>()
     private val deletes = mutableListOf<Int>()
@@ -55,7 +59,10 @@ class S7E5B2B2SectionTest {
                 onToggle = { id, enabled -> toggles += id to enabled },
                 onDelete = { id -> deletes += id },
                 notificationsBlocked = blocked.value,
-                onEnableNotifications = { enables += 1 }
+                onEnableNotifications = { enables += 1 },
+                addAvailability = addAvailability.value,
+                onAdd = { adds += 1 },
+                onEdit = { id -> opens += id }
             )
         }
         rule.waitForIdle()
@@ -84,13 +91,14 @@ class S7E5B2B2SectionTest {
         assertEquals(0, texts("설정된 알림이 없습니다"))
         for (copy in listOf(PROMPT_TITLE, PROMPT_BODY, PROMPT_BUTTON)) assertEquals(copy, 1, texts(copy))
         assertEquals(0, count(BankAlertSectionTags.NOTIFY_BANNER))
-        assertEquals("nothing runs before a click", 0, enables)
+        assertEquals("nothing runs before a click", listOf(0, 0), listOf(enables, adds))
     }
 
     @Test fun S7E5B2B2_G02_thePromptButtonCallsOnceAndNothingElse() {
         show()
         tap(BankAlertSectionTags.NOTIFY_PROMPT_BUTTON)
-        assertEquals(1, enables)
+        // S7 E5b3b (start agreement §4-2, API r2 D5): the prompt now asks for the add entry; the holder runs the helper first.
+        assertEquals(listOf(1, 0), listOf(adds, enables))
         assertEquals(0, retries)
         assertEquals(emptyList<Pair<Int, Boolean>>(), toggles)
         assertEquals(emptyList<Int>(), deletes)
@@ -112,7 +120,7 @@ class S7E5B2B2SectionTest {
         shown.value = state(Content.Rows(listOf(setting(71))))
         show()
         tap(BankAlertSectionTags.NOTIFY_BANNER)
-        assertEquals(1, enables)
+        assertEquals("the banner asks for the permission only", listOf(1, 0), listOf(enables, adds))
         tap(BankAlertSectionTags.toggle(71))
         assertEquals(listOf(71 to false), toggles)
         tap(BankAlertSectionTags.delete(71))

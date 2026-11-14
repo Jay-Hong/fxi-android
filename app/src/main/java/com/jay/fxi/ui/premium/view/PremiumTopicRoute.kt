@@ -196,7 +196,8 @@ internal fun PremiumTopicRoute(
                                 )
                                 BankAlertSection(
                                     tab = tab,
-                                    sourceFactory = bankAlertSectionSourceFactory
+                                    sourceFactory = bankAlertSectionSourceFactory,
+                                    alertQuotes = screen.ui.alertQuotes
                                 )
                             }
                         }

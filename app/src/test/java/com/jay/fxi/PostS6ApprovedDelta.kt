@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "cfa5ff1fddf692b2ce4c00d2bef55d9fa25dd1230f2dc6cc77939d2401b2a730"
+    const val APPROVED_SHA256 = "2ae01d2fc312b4937c4a4ff024527996245eebfd057694f75ccd7e1471133bdd"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -63,6 +63,11 @@ internal object PostS6ApprovedDelta {
      * - 3fc33062…: 876a3cf3 AlertSection.kt, no KRX at all (comments included).
      * - fbd22459…: 876a3cf3 BankAlertSection.kt, no KRX at all (comments included).
      * - f0c690fd…: 668d073f AlertAddSheet.kt, no KRX at all (comments included).
+     * - a98630aa…: 963835d6 AlertSection.kt, no KRX at all (comments included).
+     * - 2ae1df82…: 963835d6 BankAlertSection.kt, no KRX at all (comments included).
+     * - aa27fd5f…: 963835d6 PremiumTopicPresenter.kt, no KRX at all (comments included).
+     * - 911158ec…: 963835d6 PremiumTopicUiState.kt, no KRX at all (comments included).
+     * - a176ee43…: 963835d6 PremiumTopicRoute.kt, no KRX at all (comments included).
      */
     val NO_KRX_REVIEWED = setOf(
         "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
@@ -91,7 +96,12 @@ internal object PostS6ApprovedDelta {
         "74515ec37f53cbfaa0d775a063172cb182d8e91bdc338ecaa827c9c1c54b1f73",
         "3fc33062ac60f654eafdd6844f49393d9ca7b20d6ac1fd9198d73ff13fbbf6d5",
         "fbd224591bf6b1c5c378cb0b0cd6dd9244b7423f7b6ace287f21097eb51fb728",
-        "f0c690fd2d15768c1d8fd10bf41f9a93501a34788092ace2605f9b0a2c1328a0"
+        "f0c690fd2d15768c1d8fd10bf41f9a93501a34788092ace2605f9b0a2c1328a0",
+        "a98630aa5ef2b06b5c123cfcd24114a9a35c003da251b54b9f68f80403ad2624",
+        "2ae1df82a2a99837dfb8751228f4a0ed5d4b6209328e47bc53569e3ade0b1fc7",
+        "aa27fd5f9d0324c70e5faee08106679cce0407b1093249b9b800131171f9dfbd",
+        "911158ec110e3f1c752f24df933a88a43a03d8daacc4f7e4dff983709697bba1",
+        "a176ee432d52ef660f415bf8496803679fc0f09d61c8cf1eacd991dd2944af46"
     )
 
     /**

@@ -86,12 +86,13 @@ class AlertN1StructureTest {
             emptyList<String>(), s1ViewModel(code))
     }
 
-    @Test fun `S7E5A1_N1S02 AlertSection is declared once and called directly once by the section holder and AlertAddSheet by nobody`() {
+    // S7 E5b3b (API r2 D8): replaces "…and AlertAddSheet by nobody"; the holder now opens the one sheet.
+    @Test fun `S7E5A1_N1S02 AlertSection and AlertAddSheet are each declared once and called directly once by the section holder`() {
         assertEquals("premise(E5a1 S1): the positive control finds AlertSection's declaration", mapOf(SECTION to 1),
             occurrences(code, """\bfun\s+AlertSection\s*\("""))
         assertEquals("premise(E5a1 S1): and AlertAddSheet's", mapOf(SHEET to 1), occurrences(code, """\bfun\s+AlertAddSheet\s*\("""))
         assertTrue("premise(E5a1 S1): the call pattern finds the holder's direct call", count(code.getValue(HOLDER), """\bAlertSection\s*[({]""") >= 1)
-        assertEquals("E5a1 S1: AlertSection is mounted by the holder alone, once, and AlertAddSheet by nobody", emptyList<String>(), s1Composables(code))
+        assertEquals("E5a1/E5b3b S1: AlertSection and AlertAddSheet are each called by the holder alone, once", emptyList<String>(), s1Composables(code))
     }
 
     @Test fun `S7E5A1_N1S03 the S1 locks catch an alias import a qualified construction hiltViewModel a typed val reflection strings and an extra or missing AlertSection caller`() {
@@ -136,6 +137,11 @@ class AlertN1StructureTest {
             s1Composables(withFile(BYPASS_KT, "val bypass = ::AlertAddSheet")))
         assertCaught("N1-S S1 a call from AlertSection", "S1-call AlertAddSheet",
             s1Composables(appended(SECTION, "@Composable private fun Preview() { AlertAddSheet(onDismiss = {}) }")))
+        // S7 E5b3b: the holder's one sheet call is the sheet's only call.
+        assertCaught("N1-S S1 a second sheet call in the holder", "S1-call AlertAddSheet",
+            s1Composables(appended(HOLDER, "@Composable private fun Preview() { AlertAddSheet(onDismiss = {}) }")))
+        assertCaught("N1-S S1 the holder's sheet call removed", "S1-call AlertAddSheet",
+            s1Composables(edited(HOLDER, """\bAlertAddSheet(?=\s*\()""", "OtherSheet")))
         assertCaught("N1-S S1 a call from AlertAddSheet", "S1-call AlertSection",
             s1Composables(appended(SHEET, "@Composable private fun Preview() { AlertSection() }")))
         assertCaught("N1-S S1 a Java call", "S1-call AlertSection",
@@ -931,13 +937,13 @@ class AlertN1StructureTest {
 
         /**
          * S1 (E5a1, API r2 §5): each bank Composable is declared once in its own file. AlertSection is called directly exactly
-         * once, from the section holder, and named nowhere else; AlertAddSheet is called, referenced or named nowhere else.
+         * once, from the section holder, and named nowhere else. S7 E5b3b (s7e5b3_api_agreed.r1.md D8): so is AlertAddSheet.
          */
         fun s1Composables(code: Map<String, String>): List<String> {
             val v = mutableListOf<String>()
             for ((name, home, callers) in listOf(
                 Triple("AlertSection", SECTION, mapOf(HOLDER to 1)),
-                Triple("AlertAddSheet", SHEET, emptyMap<String, Int>()))) {
+                Triple("AlertAddSheet", SHEET, mapOf(HOLDER to 1)))) {
                 val declared = occurrences(code, """\bfun\s+$name\s*\(""")
                 if (declared != mapOf(home to 1)) v += "S1-declaration $name $declared"
                 val calls = code.mapValues { (_, text) -> count(text, """\b$name\s*[({]""") - count(text, """\bfun\s+$name\s*\(""") }

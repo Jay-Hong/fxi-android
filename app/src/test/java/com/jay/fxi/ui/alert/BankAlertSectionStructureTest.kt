@@ -266,10 +266,11 @@ class BankAlertSectionStructureTest {
             Triple("a delete button", appended(SECTION, "@Composable private fun S7e5a1(onDelete: () -> Unit) = IconButton(onClick = onDelete) { }"), "R-delete"),
             Triple("an escaped delete label", appended(SECTION, "private val s7e5a1 = \"\\uc0ad\\uc81c\""), "R-delete-label"),
             Triple("a delete dialog", appended(SECTION, "@Composable private fun S7e5a1() = AlertDialog(onDismissRequest = { }, confirmButton = { })"), "R-dialog"),
-            Triple("an add button", appended(SECTION, "@Composable private fun S7e5a1(onAdd: () -> Unit) = TextButton(onClick = onAdd) { Text(\"알림 추가\") }"), "S-entry add"),
+            // S7 E5b3b: the agreed onAdd and "알림 추가" are counted by sectionAddEdit; any other add name stays an entry.
+            Triple("an add button", appended(SECTION, "@Composable private fun S7e5a1(onAddRow: () -> Unit) = TextButton(onClick = onAddRow) { Text(\"새 알림 추가하기\") }"), "S-entry add"),
             Triple("an add icon", appended(SECTION, "private val s7e5a1 = Icons.Default.Add"), "S-entry add"),
             Triple("the count limit", appended(SECTION, "private val s7e5a1 = com.jay.fxi.ui.viewmodel.AlertViewModel.MAX_COUNT"), "S-entry add"),
-            Triple("an edit callback in the signature", edited(SECTION, """\bonRefresh\s*:\s*\(\s*\)\s*->\s*Unit\s*,""", "onRefresh: () -> Unit,\n    onEdit: (AlertSetting) -> Unit,"),
+            Triple("an edit callback in the signature", edited(SECTION, """\bonRefresh\s*:\s*\(\s*\)\s*->\s*Unit\s*,""", "onRefresh: () -> Unit,\n    onEditRow: (AlertSetting) -> Unit,"),
                 "S-entry edit"),
             Triple("a parameter added to the signature", edited(SECTION, """\bonRefresh\s*:\s*\(\s*\)\s*->\s*Unit\s*,""", "onRefresh: () -> Unit,\n    onRowTap: (AlertSetting) -> Unit,"),
                 "S-signature"),
@@ -377,8 +378,13 @@ class BankAlertSectionStructureTest {
             Triple("a second button in the prompt", edited(SECTION, """(?=\}\s*\}\s*else\s*\{)""", "TextButton(onClick = onEnableNotifications) { }\n"),
                 "S-action-outside-header"),
             Triple("the prompt calling retry", edited(SECTION,
-                """onClick = onEnableNotifications,(?=\s*modifier = Modifier\.testTag\(BankAlertSectionTags\.NOTIFY_PROMPT_BUTTON\))""", "onClick = onRetry,"),
+                """onClick = onAdd,(?=\s*modifier = Modifier\.testTag\(BankAlertSectionTags\.NOTIFY_PROMPT_BUTTON\))""", "onClick = onRetry,"),
                 "N-prompt-callback"),
+            // S7 E5b3b (R8-2): the prompt asks for the add entry and the banner for the permission only.
+            Triple("the prompt back on the permission only", edited(SECTION,
+                """onClick = onAdd,(?=\s*modifier = Modifier\.testTag\(BankAlertSectionTags\.NOTIFY_PROMPT_BUTTON\))""", "onClick = onEnableNotifications,"),
+                "N-prompt-callback"),
+            Triple("the banner opening the add entry", edited(SECTION, bannerClick, ".clickable(onClick = onAdd)"), "N-banner-click"),
             Triple("a click inside the prompt button", edited(SECTION, """Text\("알림 권한 설정하기"""", "IconButton(onClick = { }) { }\nText(\"알림 권한 설정하기\""),
                 "N-prompt-clicks"),
             Triple("a clickable prompt", atSectionTag("NOTIFY_PROMPT", "Modifier.clickable(onClick = onEnableNotifications) "), "S-modifier-outside-header"),
@@ -494,20 +500,494 @@ class BankAlertSectionStructureTest {
             "// NotificationManagerCompat areNotificationsEnabled Build.VERSION startActivity\nprivate val s7e5b2b2Control = 1")))
     }
 
-    @Test fun `S7E5B2B2_N07 neither the holder nor the section opens an add or edit sheet`() {
-        assertEquals("premise: the real tree is clean", emptyList<String>(), holderNames(code) + sectionEntries(code))
-        val sheet = "AlertAddSheet(currency = currency, rates = emptyList(), hasDuplicate = { _, _, _, _ -> false }, onSave = { _, _, _, _ -> }, onDismiss = { })"
+    // ---- Q: S7 E5b3b's add area, row editor entry and the holder's one sheet (s7e5b3_api_agreed.r1.md D5, D8) ----
+    // Replaces S7E5B2B2_N07 ("neither the holder nor the section opens an add or edit sheet"), which E5b3b opens by agreement.
+
+    @Test fun `S7E5B3B_Q01 the section places its add area after the empty text and the rows and its row editor entry in the row`() {
+        assertEquals("S7E5B3B Q: section", emptyList<String>(), sectionAddEdit(code) + sectionClicks(code) + sectionEntries(code))
+        assertEquals("premise: one add click and one row open click", listOf(1, 1), listOf(addClicks(code.getValue(SECTION)).size, openClicks(code.getValue(SECTION)).size))
+    }
+
+    @Test fun `S7E5B3B_Q02 the add and edit lock catches a moved doubled rewired or drawing-time entry and accepts comments and reformatting`() {
+        fun all(tree: Map<String, String>) = sectionAddEdit(tree) + sectionClicks(tree) + sectionEntries(tree) + sectionNotify(tree)
+        assertEquals("premise: the real tree is clean", emptyList<String>(), all(code))
+        val addClick = """\.clickable\(onClick = onAdd\)"""
+        val openClick = """\.clickable\(onClick = onOpen\)"""
         for ((label, tree, tag) in listOf(
-            Triple("a sheet in the holder for one tab", edited(HOLDER, """\n(\s*)AlertSection\(""", "\n        if (tab == FreeTab.JPY) { $sheet }\n\$1AlertSection("),
-                "H-name sheet"),
-            Triple("a holder helper that opens the sheet", appended(HOLDER, "@Composable private fun S7e5b2b2(currency: SupportedCurrency) { $sheet }"), "H-name sheet"),
-            Triple("a bottom sheet in the holder", appended(HOLDER, "@Composable private fun S7e5b2b2() { androidx.compose.material3.ModalBottomSheet(onDismissRequest = { }) { } }"),
-                "H-name sheet"),
-            Triple("an edit callback in the holder", appended(HOLDER, "private fun s7e5b2b2(onEdit: (Int) -> Unit) = onEdit(1)"), "H-name sheet"),
-            Triple("a sheet in the section", appended(SECTION, "@Composable private fun S7e5b2b2(currency: SupportedCurrency) { $sheet }"), "S-entry add"))) {
-            assertCaught("S7E5B2B2 N07 $label", tag, holderNames(tree) + sectionEntries(tree))
+            Triple("the add area under the blocked prompt", edited(SECTION, """Text\("알림 권한 설정하기"\)\s*\}""", "\$0\nBankAlertAddArea(addAvailability, metrics, onAdd)"), "Q-add-place"),
+            Triple("the add area in the loading view", atSectionTag("LOADING", "BankAlertAddArea(addAvailability, metrics, onAdd) "), "Q-add-place"),
+            Triple("no add area after the empty text", edited(SECTION,
+                """(\n\s*)BankAlertAddArea\(addAvailability, metrics, onAdd\)(?=\s*\}\s*\}\s*is Content\.Rows)""", ""), "Q-add-place"),
+            Triple("the add button asking for the permission", edited(SECTION, addClick, ".clickable(onClick = onEnableNotifications)"), "Q-add-click"),
+            Triple("a lambda add click", edited(SECTION, addClick, ".clickable { onAdd() }"), "Q-add-click"),
+            Triple("a second add click", edited(SECTION, addClick, ".clickable(onClick = onAdd).clickable(onClick = onAdd)"), "Q-add-click"),
+            Triple("adding while drawing", edited(SECTION, """BankAlertAddAvailability\.Hidden -> Unit""", "BankAlertAddAvailability.Hidden -> onAdd()"), "Q-add-uses"),
+            Triple("a clickable cap line", atSectionTag("ADD_AT_CAP", "Modifier.clickable(onClick = onAdd) "), "Q-add-uses"),
+            Triple("the row opening a fixed id", edited(SECTION, """onOpen = \{ onEdit\(setting\.id\) \}""", "onOpen = { onEdit(0) }"), "Q-edit-uses"),
+            Triple("a long press on the row", edited(SECTION, openClick, ".combinedClickable(onClick = onOpen, onLongClick = onOpen)"), "Q-open-click"),
+            Triple("a second row click", edited(SECTION, openClick, ".clickable(onClick = onOpen).clickable(onClick = onOpen)"), "Q-open-click"),
+            Triple("the row opening from the header", atSectionTag("REFRESH", "onEdit(1) "), "Q-edit-uses"),
+            Triple("a second add copy", appended(SECTION, "private val s7e5b3b = \"알림 추가\""), "Q-add-copy"),
+            Triple("a sheet in the section", appended(SECTION, "@Composable private fun S7e5b3b() { AlertAddSheet(onDismiss = { }) }"), "S-entry add"))) {
+            assertCaught("S7E5B3B Q $label", tag, all(tree))
         }
-        assertClean("S7E5B2B2 N07, comments only", holderNames(appended(HOLDER, "// AlertAddSheet onEdit 추가 편집\nprivate val s7e5b2b2Control = 1")))
+        for ((label, tree) in listOf(
+            "comments only" to appended(SECTION, "// onAdd() onEdit(1) \"알림 추가\" BankAlertAddArea(\n/* .clickable(onClick = onAdd) */\nprivate val s7e5b3bControl = 1"),
+            "a reformatted add click" to edited(SECTION, addClick, ".clickable(\n onClick = onAdd\n )"))) {
+            assertClean("S7E5B3B Q, $label", all(tree))
+        }
+    }
+
+    @Test fun `S7E5B3B_Q03 the holder opens the one sheet in one call and gives the section its add and edit callbacks once`() {
+        fun all(tree: Map<String, String>) = holderEditor(tree) + holderNames(tree)
+        assertEquals("premise: the real tree is clean", emptyList<String>(), all(code))
+        for ((label, tree, tag) in listOf(
+            Triple("a second sheet call in the holder", appended(HOLDER, "@Composable private fun S7e5b3b() { AlertAddSheet(onDismiss = { }) }"), "H-name sheet"),
+            Triple("a bottom sheet in the holder", appended(HOLDER, "@Composable private fun S7e5b3b() { androidx.compose.material3.ModalBottomSheet(onDismissRequest = { }) { } }"),
+                "H-name sheet"),
+            Triple("an edit callback elsewhere in the holder", appended(HOLDER, "private fun s7e5b3b(onEdit: (Int) -> Unit) = onEdit(1)"), "H-name sheet"),
+            Triple("a function reference to the sheet", appended(HOLDER, "private val s7e5b3b = ::AlertAddSheet"), "H-name sheet"),
+            Triple("the sheet call gone", edited(HOLDER, """\bAlertAddSheet\s*\(""", "AlertAddSheetElsewhere("), "Q-holder-entry"),
+            Triple("the add callback outside the section call", edited(HOLDER, """\bonAdd\s*=(?!=)""", "onAddLater ="), "Q-holder-entry"))) {
+            assertCaught("S7E5B3B Q03 $label", tag, all(tree))
+        }
+        assertClean("S7E5B3B Q03, comments only", all(appended(HOLDER, "// AlertAddSheet( onAdd = onEdit = 추가 편집\nprivate val s7e5b3bControl = 1")))
+    }
+
+    @Test fun `S7E5B3B_Q04 the owner's save members are reached only through the adapter's one-to-one delegation`() {
+        assertEquals("premise: the real tree is clean", emptyList<String>(), adapter(code))
+        val flat = squash(code.getValue(HOLDER))
+        val r = SETTINGS.findAll(flat).single().groupValues[1]
+        val add = renamedOverride("add", "draft: BankAlertDraft", "addAlert", "draft", Regex.escape(r))
+        fun flatEdit(regex: Regex, replacement: (MatchResult) -> String): Map<String, String> {
+            val found = regex.findAll(flat).toList()
+            assertEquals("mutation premise: /${regex.pattern}/ is in the squashed holder once", 1, found.size)
+            return code + (HOLDER to flat.replaceRange(found.single().range, replacement(found.single())))
+        }
+        val draft = "BankAlertDraft(\"usd-krw\", \"kb\", com.jay.fxi.domain.model.AlertCondition.BELOW, 1400.0, true, null)"
+        for ((label, tree) in listOf(
+            "a second add from the holder" to appended(HOLDER, "private fun s7e5b3b(o: BankAlertSettingsOwner) = o.addAlert($draft)"),
+            "an edit through a scope function" to appended(HOLDER, "private fun s7e5b3b(o: BankAlertSettingsOwner) = with(o) { editAlert(1, BankAlertEdit()) }"),
+            "a function reference" to appended(HOLDER, "private val s7e5b3b = BankAlertSettingsOwner::addAlert"),
+            "a save as the factory resolves the owner" to flatEdit(Regex("""\.bankAlertSettingsOwner\(\)""")) { "${it.value}.also { it.addAlert($draft) }" },
+            "the delegation doing more" to flatEdit(add) { "override fun add(draft: BankAlertDraft) = $r.addAlert(draft).also { $r.editAlert(1, BankAlertEdit()) }" })) {
+            assertCaught("S7E5B3B Q04 $label", "A-owner-save", adapter(tree))
+        }
+        for ((label, tree) in listOf(
+            "a block delegation" to flatEdit(add) { "override fun add(draft: BankAlertDraft): BankAlertSaveRequest { return $r.addAlert(draft) }" },
+            "comments only" to appended(HOLDER, "// owner.addAlert(draft) owner.editAlert(id, edit) ::addAlert\nprivate val s7e5b3bControl = 1"),
+            "lookalike names" to appended(HOLDER, "private val addAlertLabel = \"알림 추가\"\nprivate val editAlerts = 0"))) {
+            assertClean("S7E5B3B Q04, $label", adapter(tree))
+        }
+    }
+
+    @Test fun `S7E5B3B_Q05 the sheet's remaining is the helper's result and nothing else`() {
+        assertEquals("premise: the real tree is clean", emptyList<String>(), holderEditor(code))
+        for ((label, tree, tag) in listOf(
+            Triple("no remaining", edited(HOLDER, """remaining = bankAlertSheetRemaining\(mode, availability\)""", "remaining = null"), "Q-holder-remaining"),
+            Triple("always the adding count", edited(HOLDER, """remaining = bankAlertSheetRemaining\(mode, availability\)""",
+                "remaining = bankAlertSheetRemaining(BankAlertEditorMode.Add, availability)"), "Q-holder-remaining"),
+            Triple("one more than the helper", edited(HOLDER, """remaining = bankAlertSheetRemaining\(mode, availability\)""",
+                "remaining = bankAlertSheetRemaining(mode, availability)?.plus(1)"), "Q-holder-remaining"),
+            Triple("the helper used elsewhere", appended(HOLDER, "private val s7e5b3b = bankAlertSheetRemaining(BankAlertEditorMode.Add, BankAlertAddAvailability.Hidden)"),
+                "Q-holder-remaining-uses"))) {
+            assertCaught("S7E5B3B Q05 $label", tag, holderEditor(tree))
+        }
+        assertClean("S7E5B3B Q05, comments only", holderEditor(appended(HOLDER, "// remaining = bankAlertSheetRemaining(mode, availability)\nprivate val s7e5b3bControl = 1")))
+    }
+
+    @Test fun `S7E5B3B_Q06 the outcome is read only for the current editor and the current request`() {
+        assertEquals("premise: the real tree is clean", emptyList<String>(), holderEditor(code))
+        val guard = """if \(handle == null \|\| session\.editor !== open \|\| open\.handle !== handle\) return@LaunchedEffect"""
+        for ((label, tree, tag) in listOf(
+            Triple("no editor check", edited(HOLDER, guard, "if (handle == null || open.handle !== handle) return@LaunchedEffect"), "Q-holder-outcome-guard"),
+            Triple("no request check", edited(HOLDER, guard, "if (handle == null || session.editor !== open) return@LaunchedEffect"), "Q-holder-outcome-guard"),
+            Triple("the checks after the first change", edited(HOLDER, """NotSentReason\.RESET -> session\.editor = null""",
+                "NotSentReason.RESET -> { session.editor = null; if (session.editor !== open || open.handle !== handle) Unit }",
+                edited(HOLDER, guard, "if (handle == null) return@LaunchedEffect")), "Q-holder-outcome-guard"),
+            Triple("a second outcome effect", appended(HOLDER, "@Composable private fun S7e5b3b(outcome: Any?) { LaunchedEffect(outcome) { } }"),
+                "Q-holder-outcome-effect"),
+            // Commit review T1: the whole guard kept, but never run, never returning, or never true.
+            Triple("the guard under a false branch", edited(HOLDER, guard, "if (false) {\n                        if (handle == null || session.editor !== open || open.handle !== handle) return@LaunchedEffect\n                    }"),
+                "Q-holder-outcome-guard"),
+            Triple("the guard without its return", edited(HOLDER, guard, "if (handle == null || session.editor !== open || open.handle !== handle) Unit"),
+                "Q-holder-outcome-guard"),
+            Triple("the guard made never true", edited(HOLDER, guard, "if ((handle == null || session.editor !== open || open.handle !== handle) && false) return@LaunchedEffect"),
+                "Q-holder-outcome-guard"),
+            Triple("another statement before the guard", edited(HOLDER, guard,
+                "if (outcome == BankAlertSaveOutcome.Removed) session.editor = null\n                    if (handle == null || session.editor !== open || open.handle !== handle) return@LaunchedEffect"),
+                "Q-holder-outcome-guard"))) {
+            assertCaught("S7E5B3B Q06 $label", tag, holderEditor(tree))
+        }
+        assertClean("S7E5B3B Q06, the holder squashed onto one line", holderEditor(code + (HOLDER to squash(code.getValue(HOLDER)))))
+    }
+
+    @Test fun `S7E5B3B_Q08 the add, edit and save paths read the live snapshot`() {
+        assertEquals("premise: the real tree is clean", emptyList<String>(), holderEditor(code))
+        for ((label, tree, tag) in listOf(
+            Triple("edit from the drawn snapshot", edited(HOLDER, """val live = source\.settings\.value(\s+val row = live\.settings)""", "val live = settings$1"),
+                "Q-holder-live-onEdit"),
+            Triple("the add's identity from the drawn snapshot", edited(HOLDER, """val captured = source\.settings\.value\.identity""", "val captured = settings.identity"),
+                "Q-holder-live-onAdd"),
+            Triple("the save from the drawn snapshot", edited(HOLDER, """val live = source\.settings\.value(\s+val rows)""", "val live = settings$1"),
+                "Q-holder-live-save"),
+            Triple("the add continuation from the drawn snapshot", edited(HOLDER, """val live = source\.settings\.value(\s+if \(session\.alive)""",
+                "val live = settings$1"), "Q-holder-live-onAdd"))) {
+            assertCaught("S7E5B3B Q08 $label", tag, holderEditor(tree))
+        }
+    }
+
+    @Test fun `S7E5B3B_Q07 each helper run stays in its click and no return path replays a save`() {
+        fun all(tree: Map<String, String>) = holderNotify(tree) + holderNames(tree)
+        assertEquals("premise: the real tree is clean", emptyList<String>(), all(code))
+        val addRun = """notificationAction\.run \{(\s+val live = source\.settings\.value\s+if \(session\.alive)"""
+        val saveRun = """notificationAction\.run \{(\s+val live = source\.settings\.value\s+val rows)"""
+        fun inBody(line: String, base: Map<String, String> = code) = edited(HOLDER, """val availability = bankAlertAddAvailability\(settings\)""",
+            "val availability = bankAlertAddAvailability(settings)\n        " + line, base)
+        for ((label, tree, tag) in listOf(
+            // Both keep five uses and two continuations: only where the runs are tells them apart.
+            Triple("the add run moved to an effect", inBody("LaunchedEffect(availability) { notificationAction.run { } }", edited(HOLDER, addRun, "run {$1")),
+                "N-holder-run-place"),
+            Triple("the save run moved to an effect", inBody("LaunchedEffect(availability) { notificationAction.run { } }", edited(HOLDER, saveRun, "run {$1")),
+                "N-holder-run-place"),
+            Triple("the save run moved to a remember", inBody("val s7e5b3b = remember { notificationAction.run { } }", edited(HOLDER, saveRun, "run {$1")),
+                "N-holder-run-place"),
+            // Return paths a replay would need (gap hunt G09 SETTINGS): the helper's state, the lifecycle, the OS.
+            Triple("a replay when the helper stops needing action", inBody("LaunchedEffect(notificationAction.needsAction) { }"), "N-holder-uses"),
+            Triple("a replay on resume", inBody("LifecycleResumeEffect(Unit) { onPauseOrDispose { } }"), "H-name lifecycle-observer"),
+            Triple("a replay on an OS read", inBody("LaunchedEffect(Unit) { if (readNotificationCapability(applicationContext) != null) Unit }"),
+                "H-name notification-os"))) {
+            assertCaught("S7E5B3B Q07 $label", tag, all(tree))
+        }
+        assertClean("S7E5B3B Q07, the holder squashed onto one line", holderNotify(code + (HOLDER to squash(code.getValue(HOLDER)))))
+    }
+
+    // Commit review r2 (A5·A5b): while the system's permission dialog is in front the rig reads no Compose root, so "no add editor
+    // during the wait" is locked here, by where the editor is built and installed, instead of by a semantics read during the wait.
+    @Test fun `S7E5B3B_Q09 the add editor is built and installed only in its helper continuation and the edit editor only in onEdit`() {
+        // Small strings exercise only the sheet reader, independently of either production holder.
+        fun sheetSnippet(label: String, text: String, vararg conditions: String) {
+            val gates = installSheetGates(text)
+            assertEquals("Q09 sheet snippet / $label: gate count", conditions.size, gates.size)
+            assertEquals("Q09 sheet snippet / $label: caller condition spans",
+                conditions.toList(), gates.map { text.substring(it) })
+            val spans = conditions.map { condition ->
+                val branch = text.indexOf("if ($condition)")
+                val from = if (branch >= 0) branch + 4 else text.indexOf("$condition?.let")
+                assertTrue("Q09 sheet snippet / $label: expected condition anchor", from >= 0)
+                from until (from + condition.length)
+            }
+            assertEquals("Q09 sheet snippet / $label: exact caller offsets", spans, gates)
+        }
+        val bridge = """
+            @Composable private fun Q09SheetBridge(editor: Q09Editor, done: () -> Unit) {
+                AlertAddSheet(editor)
+            }
+        """.trimIndent()
+        fun snippet(body: String, functions: String = bridge) = """
+            @Composable private fun BankAlertSection() {
+                val open = session.editor
+                $body
+            }
+            $functions
+        """.trimIndent()
+        val bridgeCall = "Q09SheetBridge(open) { Unit }"
+        for ((gate, condition) in listOf("if (open != null)" to "open != null",
+                "if (null != open)" to "null != open", "open?.let" to "open")) {
+            val argument = if (gate == "open?.let") "it" else "open"
+            sheetSnippet("one bridge / $gate", snippet("$gate { Q09SheetBridge($argument) { Unit } }"), condition)
+            sheetSnippet("direct sheet / $gate", snippet("$gate { AlertAddSheet($argument) }", ""), condition)
+            val direct = gate.replace("open", "session.editor")
+            sheetSnippet("direct read / $direct", snippet("$direct { Q09SheetBridge($argument) { Unit } }"),
+                condition.replace("open", "session.editor"))
+        }
+        val guardedBridge = "if (open != null) { $bridgeCall }"
+        sheetSnippet("bridge outside gate", snippet(bridgeCall))
+        sheetSnippet("bridge inside and outside gate", snippet("$guardedBridge\n$bridgeCall"))
+        sheetSnippet("bridge reference", snippet("$guardedBridge\nval saved = ::Q09SheetBridge"))
+        sheetSnippet("null then branch", snippet("if (open == null) { $bridgeCall }"))
+        sheetSnippet("disjunction", snippet("if (open != null || flag) { $bridgeCall }"))
+        sheetSnippet("renamed bridge", snippet(guardedBridge).replace("Q09SheetBridge", "OtherSheetBridge"), "open != null")
+        sheetSnippet("two bridge levels", snippet("if (open != null) { Q09Outer(open) { Unit } }",
+            bridge + "\n@Composable private fun Q09Outer(editor: Q09Editor, done: () -> Unit) { Q09SheetBridge(editor) { Unit } }"))
+        sheetSnippet("overloaded bridge", snippet(guardedBridge,
+            bridge + "\n@Composable private fun Q09SheetBridge(editor: Q09Editor) { Unit }"))
+        sheetSnippet("declaration inside gate is not a call", snippet("if (open != null) { $bridge }", ""))
+
+        // Closed statement paths: keep the original 18 controls above unchanged.
+        sheetSnippet("P11 direct key", snippet(
+            "if (open != null) { key(open) { AlertAddSheet(open) } }", ""), "open != null")
+        sheetSnippet("P12 direct nested key", snippet(
+            "if (open != null) { key(a) { key(b) { AlertAddSheet(open) } } }", ""), "open != null")
+        sheetSnippet("P13 bridge top-level sheet", snippet(guardedBridge), "open != null")
+        sheetSnippet("P14 bridge body key", snippet(guardedBridge,
+            bridge.replace("AlertAddSheet(editor)", "key(editor) { AlertAddSheet(editor) }")), "open != null")
+        sheetSnippet("P15 bridge caller and body key", snippet(
+            "if (open != null) { key(a) { key(b) { $bridgeCall } } }",
+            bridge.replace("AlertAddSheet(editor)", "key(editor) { AlertAddSheet(editor) }")), "open != null")
+        val deferredDirect = "slot.content = { AlertAddSheet(open) }"
+        sheetSnippet("N-S09 direct stored lambda", snippet(
+            "if (open != null) { $deferredDirect }; slot.content?.invoke()", ""))
+        sheetSnippet("N-S10 direct stored lambda under key", snippet(
+            "if (open != null) { key(open) { $deferredDirect } }; slot.content?.invoke()", ""))
+        sheetSnippet("N-S11 stored bridge call", snippet(
+            "if (open != null) { slot.content = { $bridgeCall } }; slot.content?.invoke()"))
+        sheetSnippet("N-S12 stored sheet in bridge body", snippet(guardedBridge,
+            bridge.replace("AlertAddSheet(editor)", "slot.content = { AlertAddSheet(editor) }")))
+        val emptyBridge = bridge.replace("AlertAddSheet(editor)", "Unit")
+        sheetSnippet("N-S13 sheet in bridge trailing lambda", snippet(
+            "if (open != null) { Q09SheetBridge(open) { AlertAddSheet(open) } }", emptyBridge))
+        sheetSnippet("N-S14 direct run", snippet(
+            "if (open != null) { run { AlertAddSheet(open) } }", ""))
+        sheetSnippet("N-S15 direct Box", snippet(
+            "if (open != null) { Box { AlertAddSheet(open) } }", ""))
+        sheetSnippet("N-S16 anonymous function", snippet(
+            "if (open != null) { val saved = fun() { AlertAddSheet(open) } }", ""))
+        sheetSnippet("N-S17 sheet in bridge argument lambda", snippet(
+            "if (open != null) { Q09SheetBridge(open, { AlertAddSheet(open) }) }", emptyBridge))
+        for (wrapper in listOf("remember", "LaunchedEffect(open)", "with(open)")) {
+            sheetSnippet("N-S18-20 direct $wrapper", snippet(
+                "if (open != null) { $wrapper { AlertAddSheet(open) } }", ""))
+        }
+        sheetSnippet("N-S21 object expression", snippet(
+            "if (open != null) { val saved = object { @Composable fun Render() = AlertAddSheet(open) } }", ""))
+
+        // Whole-statement closure: all thirteen new negatives have zero gates and no condition spans.
+        sheetSnippet("N-S22 E1 expression-body local function", snippet(
+            "if (open != null) { @Composable fun Later() = AlertAddSheet(open); slot.content = { Later() } }; slot.content?.invoke()", ""))
+        sheetSnippet("N-S23 E2 default argument", snippet(
+            "if (open != null) { @Composable fun Later(ignored: Unit = AlertAddSheet(open)) { Unit }; slot.content = { Later() } }; slot.content?.invoke()", ""))
+        sheetSnippet("N-S24 assigned key", snippet(
+            "if (open != null) { val x = key(a) { AlertAddSheet(open) } }", ""))
+        sheetSnippet("N-S25 sheet in call argument", snippet(
+            "if (open != null) { Foo(AlertAddSheet(open)) }", ""))
+        sheetSnippet("N-S26 annotated sheet", snippet(
+            "if (open != null) { @Composable AlertAddSheet(open) }", ""))
+        sheetSnippet("N-S27 labelled key", snippet(
+            "if (open != null) { later@ key(a) { AlertAddSheet(open) } }", ""))
+        sheetSnippet("N-S28 assigned bridge call", snippet(
+            "if (open != null) { val r = $bridgeCall }"))
+        sheetSnippet("N-S29 E1 newline after equals", snippet(
+            "if (open != null) { @Composable fun Later() =\nAlertAddSheet(open); slot.content = { Later() } }; slot.content?.invoke()", ""))
+        sheetSnippet("N-S30 assigned key newline", snippet(
+            "if (open != null) { val x =\nkey(a) { AlertAddSheet(open) } }", ""))
+        sheetSnippet("N-S31 annotation newline", snippet(
+            "if (open != null) { @Composable\nAlertAddSheet(open) }", ""))
+        sheetSnippet("N-S32 label newline", snippet(
+            "if (open != null) { later@\nkey(a) { AlertAddSheet(open) } }", ""))
+        sheetSnippet("N-S33 E1 in bridge body", snippet(guardedBridge,
+            bridge.replace("AlertAddSheet(editor)",
+                "@Composable fun Later() = AlertAddSheet(editor); slot.content = { Later() }")))
+        sheetSnippet("N-S34 E2 in bridge body", snippet(guardedBridge,
+            bridge.replace("AlertAddSheet(editor)",
+                "@Composable fun Later(ignored: Unit = AlertAddSheet(editor)) { Unit }; slot.content = { Later() }")))
+        // Reader-only control: symbol binding is intentionally a holderInstall responsibility.
+        sheetSnippet("P16 reader keeps syntactic key recognition", snippet(
+            "if (open != null) { key(open) { AlertAddSheet(open) } }",
+            "fun key(vararg k: Any?, content: @Composable () -> Unit) { slot.content = content }"), "open != null")
+
+        // L2: the gate itself starts its statement, for direct and one-bridge paths alike.
+        for ((gate, argument) in listOf("if (open != null)" to "open", "open?.let" to "it")) {
+            for ((label, prefix) in listOf(
+                    "expression body" to "@Composable fun Later() = ",
+                    "assigned" to "val y = ",
+                    "return" to "return ",
+                    "annotation" to "@Composable ",
+                    "label" to "later@ ",
+                    "expression body newline" to "@Composable fun Later() =\n",
+                    "assigned newline" to "val y =\n",
+                    "return newline" to "return\n",
+                    "annotation newline" to "@Composable\n",
+                    "label newline" to "later@\n")) {
+                sheetSnippet("L2 direct / $gate / $label", snippet(
+                    "$prefix$gate { AlertAddSheet($argument) }", ""))
+                sheetSnippet("L2 caller / $gate / $label", snippet(
+                    "$prefix$gate { Q09SheetBridge($argument) { Unit } }"))
+            }
+        }
+
+        // Each format traverses the complete procedure: clean tree, spans, mutations, exact violations.
+        val raw = File(HOLDER).readText()
+        val rawTree = code + (HOLDER to strip(HOLDER, raw))
+        assertEquals("premise: raw strip equals code map", code.getValue(HOLDER), rawTree.getValue(HOLDER))
+        fun formatted(source: String, gap: String? = null, arguments: Boolean = false): String {
+            val calls = installScan(source).writes.filter { it.call != null }
+            return calls.sortedByDescending { it.span.first }.fold(source) { text, write ->
+                val call = write.call!!
+                if (gap != null) text.replaceRange(write.equalsEnd, call.first, gap)
+                else if (arguments) {
+                    val open = text.indexOf('(', call.first)
+                    text.replaceRange(open + 1, open + 1, "\n        ")
+                } else text
+            }
+        }
+        val variants = listOf(
+            "actual" to rawTree,
+            "squash" to (code + (HOLDER to squash(code.getValue(HOLDER)))),
+            "newline after equals" to (code + (HOLDER to strip(HOLDER, formatted(raw, gap = "\n    ")))),
+            "newline in arguments" to (code + (HOLDER to strip(HOLDER, formatted(raw, arguments = true)))),
+            // Insert into SOURCE, then use this test's actual strip path.
+            "inline comment" to (code + (HOLDER to strip(HOLDER, formatted(raw, gap = " /* Q09 inline */ ")))),
+            "long indentation" to (code + (HOLDER to strip(HOLDER, formatted(raw, gap = "\n" + " ".repeat(64))))))
+        for ((format, base) in variants) {
+            assertClean("Q09 $format", holderInstall(base))
+            val holder = base.getValue(HOLDER)
+            val scan = installScan(holder)
+            val add = scan.writes.singleOrNull { it.mode == "add" && it.direct }
+            val edit = scan.writes.singleOrNull { it.mode == "edit" && it.direct }
+            assertNotNull("Q09 $format: add spans", add)
+            assertNotNull("Q09 $format: edit spans", edit)
+            val a = add!!
+            val e = edit!!
+            val braces = pairs(holder, '{', '}')
+            val onAdd = Regex("""\bonAdd\s*=\s*\{""").find(holder)?.let { m -> braces.firstOrNull { it.first == m.range.last } }
+            assertNotNull("Q09 $format: onAdd", onAdd)
+            val run = Regex("""\bnotificationAction\s*\.\s*run\s*\{""").findAll(holder).singleOrNull { it.range.first in onAdd!! }
+            assertNotNull("Q09 $format: add run", run)
+            val runEnd = closing(holder, run!!.range.last)
+            assertNotNull("Q09 $format: run end", runEnd)
+            assertTrue("Q09 $format: add in run", a.span.first in run.range.last..runEnd!!)
+            val addText = holder.substring(a.span)
+            val editText = holder.substring(e.span)
+            val rhs = holder.substring(a.call!!)
+            val type = scan.type!!
+            val tickRhs = rhs.replaceRange(0, type.length, "`$type`")
+            val beforeRun = run.range.first
+            val dropAdd = Triple(a.span.first, a.span.last + 1, "Unit")
+            fun rewrite(vararg edits: Triple<Int, Int, String>): Map<String, String> =
+                base + (HOLDER to edits.sortedByDescending { it.first }.fold(holder) { text, (s, end, replacement) ->
+                    text.replaceRange(s, end, replacement)
+                })
+            fun replaceAdd(replacement: String) = rewrite(Triple(a.span.first, a.span.last + 1, replacement))
+            fun before(line: String) = rewrite(Triple(beforeRun, beforeRun, "$line;\n"))
+            fun restoredEarly(expression: String, property: String = "editor") = rewrite(
+                Triple(beforeRun, beforeRun, "session.$property = $expression;\n"),
+                Triple(run.range.last + 1, run.range.last + 1, "\nsession.$property = null;\n"))
+            fun expected(label: String, tree: Map<String, String>, vararg tags: String) {
+                assertEquals("Q09 $format / $label", tags.toList().sorted(), holderInstall(tree).sorted())
+            }
+            // Original six controls; assert the COMPLETE list rather than one required tag.
+            expected("N01 add before run", rewrite(Triple(beforeRun, beforeRun, "$addText;\n"), dropAdd),
+                "Q-holder-install-add")
+            expected("N02 add after run", rewrite(dropAdd, Triple(runEnd + 1, runEnd + 1, "\n$addText;")),
+                "Q-holder-install-add")
+            expected("N03 duplicate add", before(addText), "Q-holder-install-assign", "Q-holder-install-mode")
+            expected("N04 built early, installed by name", rewrite(
+                Triple(beforeRun, beforeRun, "val s7e5b3bEditor = $rhs;\n"),
+                Triple(a.span.first, a.span.last + 1, "session.editor = s7e5b3bEditor")),
+                "Q-holder-install-alias", "Q-holder-install-assign", "Q-holder-install-rhs", "Q-holder-install-add")
+            expected("N05 scope write", rewrite(Triple(beforeRun, beforeRun, "session.apply { editor = $rhs };\n"), dropAdd),
+                "Q-holder-install-write", "Q-holder-install-alias", "Q-holder-install-assign", "Q-holder-install-add")
+            expected("N06 edit inside run", rewrite(Triple(e.span.first, e.span.last + 1, "notificationAction.run { $editText }")),
+                "Q-holder-install-edit")
+            expected("N07 B1", restoredEarly("null ?: $tickRhs"),
+                "Q-holder-install-backtick", "Q-holder-install-rhs", "Q-holder-install-alias", "Q-holder-install-assign", "Q-holder-install-mode")
+            expected("N08 B1a property", restoredEarly(rhs, "`editor`"),
+                "Q-holder-install-backtick", "Q-holder-install-assign", "Q-holder-install-mode")
+            expected("N09 B1a property and type", restoredEarly(tickRhs, "`editor`"),
+                "Q-holder-install-backtick", "Q-holder-install-assign", "Q-holder-install-mode")
+            val aliasRhs = rhs.replaceRange(0, type.length, "S7e5b3bQ09Alias")
+            val aliasTree = restoredEarly("null ?: $aliasRhs")
+            expected("N10 B1b typealias", aliasTree + (HOLDER to
+                (aliasTree.getValue(HOLDER) + "\nprivate typealias S7e5b3bQ09Alias = $type\n")),
+                "Q-holder-install-rhs", "Q-holder-install-assign")
+            val importAt = Regex("""\bimport\s+""").find(holder)
+            assertNotNull("Q09 $format: import insertion", importAt)
+            val packageName = Regex("""\bpackage\s+([\w.]+)""").find(holder)!!.groupValues[1]
+            expected("N11 B1b import alias", rewrite(
+                Triple(importAt!!.range.first, importAt.range.first, "import $packageName.$type as S7e5b3bQ09Alias;\n"),
+                Triple(beforeRun, beforeRun, "session.editor = null ?: $aliasRhs;\n"),
+                Triple(run.range.last + 1, run.range.last + 1, "\nsession.editor = null;\n")),
+                "Q-holder-install-rhs", "Q-holder-install-assign")
+            // This LOCAL NAME is generated here, not assumed to exist in either implementation.
+            fun kept(expression: String) = rewrite(
+                Triple(beforeRun, beforeRun, "val s7e5b3bKept = session.editor;\nsession.editor = $expression;\n"),
+                Triple(run.range.last + 1, run.range.last + 1, "\nsession.editor = null;\n"))
+            expected("N12 next-line Elvis", kept("null\n?: s7e5b3bKept"),
+                "Q-holder-install-rhs", "Q-holder-install-assign")
+            expected("N13 null let", kept("null.let { s7e5b3bKept }"),
+                "Q-holder-install-rhs", "Q-holder-install-assign")
+            expected("N14 null Elvis kept", kept("null ?: s7e5b3bKept"),
+                "Q-holder-install-rhs", "Q-holder-install-assign")
+            expected("N15 backtick constructor", replaceAdd("session.editor = $tickRhs"),
+                "Q-holder-install-backtick")
+            expected("N16 next-line dot", kept("null\n.let { s7e5b3bKept }"),
+                "Q-holder-install-rhs", "Q-holder-install-assign")
+            expected("N17 constructor suffix", replaceAdd("$addText.let { it }"), "Q-holder-install-rhs")
+            expected("N18 parentheses", replaceAdd("session.editor = ($rhs)"),
+                "Q-holder-install-rhs", "Q-holder-install-alias", "Q-holder-install-assign")
+            expected("N19 safe call", replaceAdd("$addText?.let { it }"), "Q-holder-install-rhs")
+            val typeToken = scan.tokens.single { token ->
+                token.name == type && scan.tokens.indexOf(token).let { index ->
+                    scan.tokens.getOrNull(index - 1)?.name == "<" &&
+                        scan.tokens.getOrNull(index - 2)?.name == "mutableStateOf"
+                }
+            }
+            expected("N22 backtick generic type", rewrite(Triple(typeToken.start, typeToken.end,
+                96.toChar() + type + 96.toChar())), "Q-holder-install-backtick")
+            val propertyToken = scan.tokens.single { token ->
+                token.name == "editor" && scan.tokens.indexOf(token).let { index ->
+                    scan.tokens.getOrNull(index - 1)?.name == "var" && scan.tokens.getOrNull(index + 1)?.name == "by"
+                }
+            }
+            expected("N23 backtick property declaration", rewrite(Triple(propertyToken.start, propertyToken.end,
+                96.toChar() + "editor" + 96.toChar())), "Q-holder-install-backtick")
+            val gates = installSheetGates(holder)
+            assertEquals("Q09 $format: sheet gate anchor", 1, gates.size)
+            expected("N20 sheet gate bypass", rewrite(*gates.map { gate ->
+                Triple(gate.first, gate.last + 1, "true")
+            }.toTypedArray()), "Q-holder-install-sheet")
+            expected("N21 sheet gate disjunction", rewrite(*gates.map { gate ->
+                Triple(gate.first, gate.last + 1, "(" + holder.substring(gate) + ") || true")
+            }.toTypedArray()), "Q-holder-install-sheet")
+            // One anchor rule for both the direct/key and the one-bridge implementation.
+            val path = installSheetPaths(holder).single()
+            val statement = installSheetStatement(holder, path)
+            assertNotNull("Q09 $format: N24 top-level sheet/bridge statement", statement)
+            val held = holder.substring(statement!!)
+            val slotName = "s7e5b3bQ09Slot"
+            val slotType = "S7e5b3bQ09SheetSlot"
+            assertTrue("Q09 $format: N24 fresh generated names",
+                scan.tokens.none { it.name == slotName || it.name == slotType })
+            val delayed = rewrite(
+                Triple(path.guard, path.guard, "val $slotName = remember { $slotType() };\n"),
+                Triple(statement.first, statement.last + 1, "$slotName.content = { $held }"),
+                Triple(path.block.last + 1, path.block.last + 1, "\n$slotName.content?.invoke();\n"))
+            expected("N24 stored sheet path invoked after gate", delayed + (HOLDER to
+                (delayed.getValue(HOLDER) + "\nprivate class $slotType { var content: (@Composable () -> Unit)? = null }\n")),
+                "Q-holder-install-sheet")
+            expected("N25 competing key declaration", base + (HOLDER to (holder +
+                "\n@Composable private fun key(vararg k: Any?, content: @Composable () -> Unit) { Unit }\n")),
+                "Q-holder-install-key")
+            val composeKey = listOf("import", "androidx", ".", "compose", ".", "runtime", ".", "key")
+            val keyImport = scan.tokens.windowed(composeKey.size).single { part -> part.map { it.name } == composeKey }
+            val afterKeyImport = scan.tokens.indexOf(keyImport.last()) + 1
+            val keyImportEnd = scan.tokens.getOrNull(afterKeyImport)?.takeIf { it.name == ";" }?.end ?: keyImport.last().end
+            expected("N26 missing Compose key import", rewrite(
+                Triple(keyImport.first().start, keyImportEnd, "")), "Q-holder-install-key")
+            // Binding-only positives use holderInstall, not just the syntactic sheet reader.
+            // These are lexical fixtures; x/source/handle do not need runtime definitions.
+            for ((label, body) in listOf(
+                    "P17 key after delegated declaration" to
+                        "val quotes by rememberUpdatedState(x)\nkey(source) { Unit }",
+                    "P18 key after lambda arrow" to
+                        "val outcome = handle?.let { h -> key(h) { Unit } }",
+                    "P19 key on assignment RHS" to
+                        "val installed = key(source) { Unit }")) {
+                val control = "\n@Composable private fun s7e5b3bKeyBindingControl() {\n$body\n}\n"
+                val suffix = if (format == "squash") "\n" + squash(control) else control
+                expected(label, base + (HOLDER to (holder + suffix)))
+            }
+            expected("N27 L1 extension let declaration", base + (HOLDER to (holder +
+                "\n@Composable private fun $type.let(content: @Composable ($type) -> Unit) { Unit }\n")),
+                "Q-holder-install-let")
+            expected("N28 L1 let import alias", rewrite(
+                Triple(importAt.range.first, importAt.range.first, "import q09.bindings.capture as let;\n")),
+                "Q-holder-install-let")
+            val comments = raw + "\n// session.editor = $type(BankAlertEditorMode.Add)\n" +
+                "/* session.editor = null ?: " + "`$type`" + "(BankAlertEditorMode.Add) */\n"
+            assertClean("Q09 $format: comments", holderInstall(base + (HOLDER to strip(HOLDER, comments))))
+        }
     }
 
     // ---- P: the premium route's mount ----
@@ -547,7 +1027,10 @@ class BankAlertSectionStructureTest {
             Triple("no factory passed", routeWith { t, c -> t.replaceRange(c, "BankAlertSection(tab = $p)") }, "P-args"),
             Triple("the production factory passed directly",
                 routeWith { t, c -> t.replaceRange(c, "BankAlertSection(tab = $p, sourceFactory = ProductionBankAlertSectionSourceFactory)") }, "P-args"),
-            Triple("another tab passed", routeWith { t, c -> t.replaceRange(c, "BankAlertSection(tab = FreeTab.USD, sourceFactory = $f)") }, "P-args"),
+            Triple("another tab passed", routeWith { t, c -> t.replaceRange(c, "BankAlertSection(tab = FreeTab.USD, alertQuotes = screen.ui.alertQuotes, sourceFactory = $f)") }, "P-args"),
+            // S7 E5b3b: the quotes are the screen's own, passed once.
+            Triple("other quotes passed", routeWith { t, c -> t.replaceRange(c, "BankAlertSection(tab = $p, alertQuotes = emptyMap(), sourceFactory = $f)") }, "P-args"),
+            Triple("no quotes passed", routeWith { t, c -> t.replaceRange(c, "BankAlertSection(tab = $p, sourceFactory = $f)") }, "P-args"),
             Triple("an alias import", routeWith(withImport(ROUTE, "import com.jay.fxi.ui.alert.BankAlertSection as Section")) { t, c ->
                 t.replaceRange(c, callText(t, c).replaceFirst("BankAlertSection", "Section"))
             }, "P-alias"),
@@ -573,10 +1056,14 @@ class BankAlertSectionStructureTest {
         val unimported = Regex("""(?m)^[ \t]*import[ \t]+com\.jay\.fxi\.ui\.alert\.BankAlertSection[ \t]*\r?\n""")
         for ((label, tree) in listOf(
             "comments only" to appended(ROUTE, "// BankAlertSection(tab = tab)\n/* ::BankAlertSection $f.create(context) BankAlertSettingsOwner */\nprivate val s7e5a1Control = 1"),
-            "named arguments swapped and reformatted" to routeWith { t, c -> t.replaceRange(c, "BankAlertSection(\n    sourceFactory = $f,\n    tab = $p,\n)") },
-            "a positional tab and a modifier" to routeWith { t, c -> t.replaceRange(c, "BankAlertSection($p, modifier = Modifier, sourceFactory = $f)") },
+            "named arguments swapped and reformatted" to routeWith { t, c ->
+                t.replaceRange(c, "BankAlertSection(\n    sourceFactory = $f,\n    alertQuotes = screen.ui.alertQuotes,\n    tab = $p,\n)")
+            },
+            "a positional tab and a modifier" to routeWith { t, c ->
+                t.replaceRange(c, "BankAlertSection($p, alertQuotes = screen.ui.alertQuotes, modifier = Modifier, sourceFactory = $f)")
+            },
             "one qualified call without an import" to routeWith(code + (ROUTE to unimported.replace(route, ""))) { t, c ->
-                t.replaceRange(c, "com.jay.fxi.ui.alert.BankAlertSection(tab = $p, sourceFactory = $f)")
+                t.replaceRange(c, "com.jay.fxi.ui.alert.BankAlertSection(tab = $p, alertQuotes = screen.ui.alertQuotes, sourceFactory = $f)")
             })) {
             assertClean("R3 P, $label", routeMount(tree))
         }
@@ -663,7 +1150,7 @@ class BankAlertSectionStructureTest {
         const val DATA_ALERTS = "/com/jay/fxi/data/alerts/"
 
         /** API r2 §2: the owner members the adapter uses. */
-        val OWNER_ALLOWED = setOf("state", "manualRefresh", "ensure", "authoritative", "manual", "setEnabled", "delete")
+        val OWNER_ALLOWED = setOf("state", "manualRefresh", "ensure", "authoritative", "manual", "setEnabled", "delete", "addAlert", "editAlert")
         /** The N1 owner members the holder must not use (the reader computes the full set from the owner's source). */
         val OWNER_OTHERS = setOf("manualOutcomes", "reset", "onForeground", "onBackground", "onSync")
 
@@ -707,6 +1194,8 @@ class BankAlertSectionStructureTest {
         val SIGNATURE = listOf("currency: SupportedCurrency", "state: BankAlertSectionState", "onRetry: () -> Unit", "onRefresh: () -> Unit",
             "actionIdentity: AuthIdentityFence?", "onToggle: (Int, Boolean) -> Unit", "onDelete: (Int) -> Unit",
             "notificationsBlocked: Boolean", "onEnableNotifications: () -> Unit",
+            // S7 E5b3b (API r2 D5)
+            "addAvailability: BankAlertAddAvailability", "onAdd: () -> Unit", "onEdit: (Int) -> Unit",
             "modifier: Modifier = Modifier", "metrics: RateLayoutMetrics = LocalRateLayoutMetrics.current")
 
         /** S7 E5b2b2 (start agreement D10): the holder's one helper call, the only `permission` name the holder may hold. */
@@ -721,6 +1210,11 @@ class BankAlertSectionStructureTest {
         val CLICKABLE_CALL = Regex("""\.\s*clickable\s*\(""")
         /** What directly precedes a block's `{` when the block draws only for blocked notifications. */
         val GUARD = Regex("""\bif\s*\(\s*notificationsBlocked\s*\)\s*$""")
+        /** S7 E5b3b (API r2 D8): the holder's one sheet call and its two section callbacks, each let through once. */
+        val HOLDER_EDITOR_ENTRIES = listOf(Regex("""\bAlertAddSheet\s*\("""), Regex("""\bonAdd\s*=(?!=)"""), Regex("""\bonEdit\s*=(?!=)"""))
+        /** S7 E5b3b: the section's agreed add and edit names, let through by [sectionEntries] and counted by [sectionAddEdit]. */
+        val SECTION_EDITOR_ENTRIES = listOf(Regex("""\bonAdd\b"""), Regex("""\bonEdit\b"""), Regex(""""알림 추가""""))
+        val ADD_AREA_CALL = Regex("""(?<![\w.`])BankAlertAddArea\s*\(""")
 
         /** Click modifiers and semantics actions: allowed in the header only. */
         val CLICK_MODIFIER = Regex("""\b(?:clickable|combinedClickable|selectable|selectableGroup|toggleable|triStateToggleable|pointerInput|pointerInteropFilter|draggable|anchoredDraggable|swipeable|detectTap\w*|detectDrag\w*|customActions|CustomAccessibilityAction)\b|\b(?:onClick|onLongClick|onDoubleClick)\b(?=\s*[({])""")
@@ -748,7 +1242,9 @@ class BankAlertSectionStructureTest {
         val IMPL_FACTORY = Regex("""\bobject\s*:\s*(?:[\w.<>]+(?:\([^()]*\))?\s*,\s*)*BankAlertSectionSourceFactory\b|\b(?:object|class)\s+\w+[^{}=]*?:\s*(?:[\w.<>]+(?:\([^()]*\))?\s*,\s*)*BankAlertSectionSourceFactory\b|\bimplements\s+(?:[\w.]+\s*,\s*)*BankAlertSectionSourceFactory\b""")
         val FACTORY_BRACE = Regex("""\bBankAlertSectionSourceFactory\s*\{""")
         val SOURCE_SHAPE = setOf("val settings: StateFlow<BankAlertSettingsState>", "val manualRefresh: StateFlow<ManualRefreshState>",
-            "fun ensure()", "fun authoritative()", "fun manual()", "fun setEnabled(id: Int, enabled: Boolean)", "fun delete(id: Int)")
+            "fun ensure()", "fun authoritative()", "fun manual()", "fun setEnabled(id: Int, enabled: Boolean)", "fun delete(id: Int)",
+            // S7 E5b3b (API r2 D5): the owner's add and edit, one to one.
+            "fun add(draft: BankAlertDraft): BankAlertSaveRequest", "fun edit(id: Int, edit: BankAlertEdit): BankAlertSaveRequest")
         val FACTORY_SHAPE = setOf("fun create(context: Context): BankAlertSectionSource")
 
         val CALL = Regex("""\bBankAlertSection\s*\(""")
@@ -776,6 +1272,10 @@ class BankAlertSectionStructureTest {
         /** S7 E5a2: a one-to-one delegation with arguments, squashed: `override fun name(params) = r.name(args)` or its block form. */
         fun argOverride(name: String, params: String, args: String, receiver: String) =
             Regex("""\boverride fun $name\($params\)(?: ?: ?Unit)? (?:= $receiver\.$name\($args\)(?= override\b| \}|$)|\{ $receiver\.$name\($args\) \})""")
+
+        /** S7 E5b3b: a one-to-one delegation to an owner member of another name, squashed. */
+        fun renamedOverride(name: String, params: String, target: String, args: String, receiver: String) =
+            Regex("""\boverride fun $name\($params\)(?: ?: ?BankAlertSaveRequest)? (?:= $receiver\.$target\($args\)(?= override\b| \}|$)|\{ return $receiver\.$target\($args\) \})""")
 
         val SWITCH_CALL = Regex("""\bSwitch\s*\(""")
         val ICON_BUTTON_CALL = Regex("""\bIconButton\s*\(""")
@@ -1126,7 +1626,8 @@ class BankAlertSectionStructureTest {
         fun holderNames(code: Map<String, String>): List<String> {
             val text = code[HOLDER] ?: return listOf("H-missing")
             // S7 E5b2b2: the exact empty-argument call is let through; an alias, a reference or any other permission name is not.
-            val scanned = HELPER_CALL.replace(text, " ")
+            // S7 E5b3b: so are the one sheet call and the two section callbacks (counted and placed by holderEditor).
+            val scanned = HOLDER_EDITOR_ENTRIES.fold(HELPER_CALL.replace(text, " ")) { t, r -> r.find(t)?.let { t.replaceRange(it.range, " ") } ?: t }
             val v = HOLDER_FORBIDDEN.filter { (_, p) -> Regex(p).containsMatchIn(scanned) }.map { (tag, _) -> "H-name $tag" }.toMutableList()
             for (source in code.values) for (alias in TYPEALIAS.findAll(source)) {
                 val target = alias.groupValues[2]
@@ -1194,6 +1695,14 @@ class BankAlertSectionStructureTest {
             }
             if (argOverride("setEnabled", "id: Int, enabled: Boolean", "id, enabled", r).findAll(flat).count() != 1) v += "A-setEnabled"
             if (argOverride("delete", "id: Int", "id", r).findAll(flat).count() != 1) v += "A-delete"
+            // S7 E5b3b: add and edit delegate one to one to the owner's addAlert and editAlert.
+            if (renamedOverride("add", "draft: BankAlertDraft", "addAlert", "draft", r).findAll(flat).count() != 1) v += "A-add"
+            if (renamedOverride("edit", "id: Int, edit: BankAlertEdit", "editAlert", "id, edit", r).findAll(flat).count() != 1) v += "A-edit"
+            if (count(text, """\bsource\s*\.\s*add\s*\(""") != 1 || count(text, """\bsource\s*\.\s*edit\s*\(""") != 1) v += "A-binding save calls"
+            // S7 E5b3b (gap hunt G18): the owner's two save members are named only by their one-to-one delegation.
+            if (count(text, """\baddAlert\b""") != 1 || count(text, """\beditAlert\b""") != 1) {
+                v += "A-owner-save ${count(text, """\baddAlert\b""")} ${count(text, """\beditAlert\b""")}"
+            }
             for (line in BINDINGS) if (count(flat, Regex.escape(line)) != 1) v += "A-binding $line"
             if (count(text, """\bsource\s*\.\s*setEnabled\b""") != 1 || count(text, """\bsource\s*\.\s*delete\b""") != 1) v += "A-binding calls"
             return v
@@ -1262,7 +1771,9 @@ class BankAlertSectionStructureTest {
         /** S: the entries and names AlertSection never has. */
         fun sectionEntries(code: Map<String, String>): List<String> {
             val text = code[SECTION] ?: return listOf("S-missing")
-            val v = SECTION_FORBIDDEN.filter { (_, p) -> Regex(p).containsMatchIn(text) }.map { (tag, _) -> "S-entry $tag" }.toMutableList()
+            // S7 E5b3b: the agreed add and edit names are let through here and counted and placed by sectionAddEdit.
+            val scanned = SECTION_EDITOR_ENTRIES.fold(text) { t, r -> r.replace(t, " ") }
+            val v = SECTION_FORBIDDEN.filter { (_, p) -> Regex(p).containsMatchIn(scanned) }.map { (tag, _) -> "S-entry $tag" }.toMutableList()
             // S7 E5b2b2 (gap hunt G01): a forbidden name behind a type alias declared in any scanned source.
             for (source in code.values) for (alias in TYPEALIAS.findAll(source)) {
                 val target = alias.groupValues[2]
@@ -1283,6 +1794,7 @@ class BankAlertSectionStructureTest {
             fun within(p: Int, ranges: List<IntRange>) = ranges.any { p in it }
             val actions = rowActionSpans(text, imports)
             val notify = notifySpans(text)
+            val editor = addClicks(text) + openClicks(text)
             for ((kind, regex) in listOf("modifier" to CLICK_MODIFIER, "action" to CLICK_ACTION)) {
                 for (m in regex.findAll(text)) {
                     val p = m.range.first
@@ -1292,6 +1804,8 @@ class BankAlertSectionStructureTest {
                         within(p, actions) -> Unit
                         // S7 E5b2b2: counted, placed and shaped by sectionNotify.
                         within(p, notify) -> Unit
+                        // S7 E5b3b: counted, placed and shaped by sectionAddEdit.
+                        within(p, editor) -> Unit
                         within(p, r.rows) -> { v += "S-row-click ${m.value}" }
                         within(p, r.header) -> Unit
                         kind == "action" && within(p, r.error) -> Unit
@@ -1329,6 +1843,563 @@ class BankAlertSectionStructureTest {
             }.toList()
         }
 
+        /** S7 E5b3b: the `.clickable(` calls in the argument list of the innermost Row call whose arguments hold [tag]. */
+        fun tagClicks(text: String, tag: String): List<IntRange> {
+            val at = tagPattern(tag).findAll(text).toList().singleOrNull() ?: return emptyList()
+            val args = ROW_CALL.findAll(text).mapNotNull { m ->
+                val open = text.indexOf('(', m.range.first)
+                closing(text, open)?.let { open..it }
+            }.filter { at.range.first in it }.maxByOrNull { it.first } ?: return emptyList()
+            return CLICKABLE_CALL.findAll(text).filter { it.range.first in args }.mapNotNull { m ->
+                closing(text, text.indexOf('(', m.range.first))?.let { m.range.first..it }
+            }.toList()
+        }
+
+        fun addClicks(text: String) = tagClicks(text, "ADD_BUTTON")
+        fun openClicks(text: String) = tagClicks(text, "rowOpen")
+
+        /**
+         * Q (S7 E5b3b, API r2 D5 and D8): the add area is the private BankAlertAddArea, called after the empty text when not blocked
+         * and after the rows; its button is one Row with `.clickable(onClick = onAdd)` and its cap line has no click. The row's bank
+         * and condition area is one Row with `.clickable(onClick = onOpen)` that calls `onEdit(setting.id)`. The names are counted.
+         */
+        fun sectionAddEdit(code: Map<String, String>): List<String> {
+            val text = code[SECTION] ?: return listOf("Q-missing")
+            val v = mutableListOf<String>()
+            val r = regions(text, v) ?: return v
+            val braces = pairs(text, '{', '}')
+            fun guarded(p: Int, branch: IntRange) = braces.any { b ->
+                p > b.first && p < b.last && b.first in branch && GUARD.containsMatchIn(text.substring(maxOf(branch.first, b.first - 80), b.first))
+            }
+            fun at(tag: String) = tagPattern(tag).findAll(text).map { it.range.first }.toList()
+            val declarations = Regex("""\bfun\s+BankAlertAddArea\s*\(""").findAll(text).count()
+            val calls = ADD_AREA_CALL.findAll(text).map { it.range.first }.filter { p -> !text.substring(maxOf(0, p - 4), p).endsWith("fun ") }.toList()
+            val empty = r.branch.getValue("Empty")
+            val rowsBranch = r.branch.getValue("Rows")
+            val emptyTag = at("EMPTY").singleOrNull()
+            val rowsTag = at("ROWS").singleOrNull()
+            val inEmpty = calls.filter { it in empty }
+            val inRows = calls.filter { it in rowsBranch }
+            if (declarations != 1 || calls.size != 2 || inEmpty.size != 1 || inRows.size != 1 ||
+                guarded(inEmpty.single(), empty) || emptyTag == null || inEmpty.single() < emptyTag || rowsTag == null || inRows.single() < rowsTag) {
+                v += "Q-add-place $calls"
+            }
+            if (at("ADD_BUTTON").size != 1 || at("ADD_AT_CAP").size != 1) v += "Q-add-tags"
+            val adds = addClicks(text).map { squash(text.substring(it.first, it.last + 1)) }
+            if (adds != listOf(".clickable(onClick = onAdd)")) v += "Q-add-click $adds"
+            val opens = openClicks(text).map { squash(text.substring(it.first, it.last + 1)) }
+            if (opens != listOf(".clickable(onClick = onOpen)")) v += "Q-open-click $opens"
+            if (at("rowOpen").size != 1 || at("rowOpen").none { p -> r.rows.any { p in it } }) v += "Q-open-place"
+            if (count(text, """\bonAdd\b""") != 6 || count(text, """onClick = onAdd\b""") != 2) v += "Q-add-uses ${count(text, """\bonAdd\b""")}"
+            if (count(text, """\bonEdit\b""") != 2 || count(squash(text), Regex.escape("onOpen = { onEdit(setting.id) }")) != 1) v += "Q-edit-uses ${count(text, """\bonEdit\b""")}"
+            if (count(text, """\bonOpen\b""") != 3) v += "Q-open-uses ${count(text, """\bonOpen\b""")}"
+            if (count(text, """"알림 추가"""") != 1) v += "Q-add-copy"
+            return v
+        }
+
+        /** Q (S7 E5b3b): the holder opens the one sheet in one call and gives the section its two callbacks once each. */
+        fun holderEditor(code: Map<String, String>): List<String> {
+            val text = code[HOLDER] ?: return listOf("Q-holder-missing")
+            val v = mutableListOf<String>()
+            for (entry in HOLDER_EDITOR_ENTRIES) if (entry.findAll(text).count() != 1) v += "Q-holder-entry ${entry.pattern}"
+            val section = Regex("""\bAlertSection\s*\(""").find(text)
+            val sectionArgs = section?.let { val open = text.indexOf('(', it.range.first); closing(text, open)?.let { c -> open..c } }
+            for (entry in HOLDER_EDITOR_ENTRIES.drop(1)) {
+                val m = entry.find(text)
+                if (sectionArgs == null || m == null || m.range.first !in sectionArgs) v += "Q-holder-callback ${entry.pattern}"
+            }
+            if (count(text, """\bsource\s*\.\s*settings\s*\.\s*value\b""") < 1) v += "Q-holder-live"
+            // S7 E5b3b (battery r4 G04b): the add, edit and save paths read the live snapshot, never the drawn one. The test rig
+            // updates collectAsState in the same turn as the source, so only the reading itself can be checked here.
+            val lambdas = pairs(text, '{', '}')
+            fun lambdaOf(m: MatchResult?): IntRange? = m?.let { found -> lambdas.firstOrNull { it.first == found.range.last } }
+            val sites = listOf(
+                "onAdd" to lambdaOf(Regex("""\bonAdd\s*=\s*\{""").find(text)),
+                "onEdit" to lambdaOf(Regex("""\bonEdit\s*=\s*\{""").find(text)),
+                "save" to Regex("""\{\s*\w+\s*->""").findAll(text).mapNotNull { m -> lambdas.firstOrNull { it.first == m.range.first } }
+                    .firstOrNull { span -> Regex("""\bnotificationAction\s*\.\s*run\s*\{""").containsMatchIn(text.substring(span.first, span.last + 1)) })
+            for ((name, span) in sites) {
+                val inside = span?.let { text.substring(it.first, it.last + 1) }
+                if (inside == null || !Regex("""\bsource\s*\.\s*settings\s*\.\s*value\b""").containsMatchIn(inside) ||
+                    Regex("""(?<![.\w])settings\b""").containsMatchIn(inside)) {
+                    v += "Q-holder-live-$name"
+                }
+            }
+            // S7 E5b3b (gap hunt G13): the sheet's remaining is exactly the helper's result, and the helper is used nowhere else.
+            val sheet = Regex("""\bAlertAddSheet\s*\(""").find(text)
+            val sheetArgs = sheet?.let { val open = text.indexOf('(', it.range.first); closing(text, open)?.let { c -> topLevelArgs(text.substring(open + 1, c)) } }
+            if (sheetArgs == null || sheetArgs.count { it == "remaining = bankAlertSheetRemaining(mode, availability)" } != 1 ||
+                sheetArgs.count { it.startsWith("remaining") } != 1) {
+                v += "Q-holder-remaining"
+            }
+            if (count(text, """\bbankAlertSheetRemaining\b""") != 2) v += "Q-holder-remaining-uses ${count(text, """\bbankAlertSheetRemaining\b""")}"
+            // S7 E5b3b (gap hunt G12): the one effect that reads the outcome checks the current editor and the current request by
+            // reference before it changes anything.
+            val effects = Regex("""\bLaunchedEffect\s*\(([^()]*)\)""").findAll(text).filter { Regex("""\boutcome\b""").containsMatchIn(it.groupValues[1]) }.toList()
+            if (effects.size != 1) {
+                v += "Q-holder-outcome-effect ${effects.size}"
+            } else {
+                val brace = text.indexOf('{', effects.single().range.last)
+                val end = closing(text, brace)
+                val body = if (brace < 0 || end == null) "" else text.substring(brace + 1, end)
+                // The effect's first statement is the guard itself, an `||` of checks that returns: it then decides every change
+                // after it (commit review T1: a guard merely present before the first change can be wrapped and never run).
+                val cond = Regex("""^\s*if\s*\(([^{}()]*)\)\s*return@LaunchedEffect\b""").find(body)?.groupValues?.get(1)
+                if (cond == null || !Regex("""\bsession\s*\.\s*editor\s*!==\s*open\b""").containsMatchIn(cond) ||
+                    !Regex("""\bopen\s*\.\s*handle\s*!==\s*handle\b""").containsMatchIn(cond) ||
+                    Regex("""&&|\bfalse\b|\btrue\b|!\s*\(""").containsMatchIn(cond)) {
+                    v += "Q-holder-outcome-guard"
+                }
+            }
+            return v
+        }
+
+        /**
+         * S7 E5b3b (commit review r2): where each editor is built and installed. The one add editor is built and installed
+         * directly inside the add's helper continuation, so none exists while the system asks; the one edit editor directly in
+         * onEdit, outside any run. Canonical surface: the editor type is the one `session.editor` holds, built only as the direct
+         * right side of `session.editor =` with `BankAlertEditorMode.Add` or `BankAlertEditorMode.Edit(` written there; no name,
+         * scope function, reference or helper carries it, and every editor write is `session.editor =`.
+         */
+        fun holderInstall(code: Map<String, String>): List<String> {
+            val text = code[HOLDER] ?: return listOf("Q-holder-missing")
+            val scan = installScan(text)
+            val v = mutableListOf<String>()
+            if (scan.backtick) v += "Q-holder-install-backtick"
+            if (scan.type == null) return v + "Q-holder-install-type"
+            if (scan.writes.any { !it.receiver || it.operator != "=" } ||
+                scan.tokens.windowed(2).any { it[0].name == "::" && it[1].name == "editor" } ||
+                scan.tokens.windowed(2).any { it[0].name == "editor" && it[1].name in setOf("++", "--") } ||
+                scan.tokens.indices.any { i -> scan.tokens[i].name in setOf("++", "--") &&
+                    (scan.tokens.getOrNull(i + 1)?.name == "editor" ||
+                        (scan.tokens.getOrNull(i + 1)?.name == "session" && scan.tokens.getOrNull(i + 2)?.name == "." &&
+                            scan.tokens.getOrNull(i + 3)?.name == "editor")) }) v += "Q-holder-install-write"
+            if (scan.writes.any { !it.complete }) v += "Q-holder-install-rhs"
+            // Link by the RHS START OFFSET, never a preceding-character window.
+            if (scan.builds.any { b -> scan.writes.none { it.direct && it.call?.first == b.span.first } } ||
+                scan.tokens.windowed(2).any { it[0].name == "::" && it[1].name == scan.type }) v += "Q-holder-install-alias"
+            val installs = scan.writes.filter { !it.nullOnly }
+            if (installs.size != 2 || installs.any { !it.direct }) v += "Q-holder-install-assign"
+            // Require the unaliased Compose import and fail closed on a competing/ambiguous key name.
+            // Import separators may be absent in the existing synthetic squash control.
+            val kt = scan.tokens
+            fun keyName(i: Int) = kt.getOrNull(i)?.name
+            val keyImports = kt.indices.filter { keyName(it) == "import" }.map { start ->
+                var after = start + 2
+                while (keyName(after) == "." && after + 1 < kt.size) after += 2
+                if (keyName(after) == "as") after += 2
+                start until after
+            }
+            val composeKey = listOf("import", "androidx", ".", "compose", ".", "runtime", ".", "key")
+            val exactKeyImports = keyImports.filter { span ->
+                span.map { kt[it].name } == composeKey && span.none { kt[it].backtick }
+            }
+            val competingImport = keyImports.any { span ->
+                keyName(span.last) == "key" && span !in exactKeyImports
+            }
+            fun declarationHeader(i: Int): Boolean {
+                val root = (0 until i).lastOrNull {
+                    keyName(it) == "{" && (installClose(kt, it) ?: -1) > i
+                } ?: -1
+                // The previous statement's val/by/fun is never part of this call's header.
+                // File-level declarations use the same splitter with the virtual root -1.
+                val statement = installSheetStatementTokens(text, kt, root, i) ?: return true
+                var before = i - 1
+                while (before >= statement.first && keyName(before) !in setOf("{", "}", ";", "=", "->")) {
+                    if (keyName(before) in setOf("fun", "val", "var", "class", "interface", "object", "typealias")) {
+                        return true
+                    }
+                    if (keyName(before) in setOf(")", "]")) {
+                        val left = if (keyName(before) == ")") "(" else "["
+                        before = (statement.first until before).lastOrNull {
+                            keyName(it) == left && installClose(kt, it) == before
+                        } ?: return true
+                    }
+                    before--
+                }
+                return false
+            }
+            val competingKey = kt.indices.any { i ->
+                keyName(i) == "key" && keyImports.none { i in it } &&
+                    (keyName(i + 1) != "(" || declarationHeader(i))
+            }
+            if (exactKeyImports.size != 1 || competingImport || competingKey) v += "Q-holder-install-key"
+            // L1: retain standard-let binding as a premise, but reject holder-local competitors.
+            // Calls with parentheses or a trailing lambda are allowed; other let uses fail closed.
+            val letAlias = keyImports.any { span ->
+                keyName(span.last - 1) == "as" && keyName(span.last) == "let"
+            }
+            val competingLet = kt.indices.any { i ->
+                keyName(i) == "let" && keyImports.none { i in it } &&
+                    (keyName(i + 1) !in setOf("(", "{") || declarationHeader(i))
+            }
+            if (letAlias || competingLet) v += "Q-holder-install-let"
+            if (installSheetGates(text).isEmpty()) v += "Q-holder-install-sheet"
+            val adds = scan.builds.filter { it.mode == "add" }
+            val edits = scan.builds.filter { it.mode == "edit" }
+            if (scan.builds.size != 2 || adds.size != 1 || edits.size != 1) return v + "Q-holder-install-mode"
+            val braces = pairs(text, '{', '}')
+            fun lambdaAt(m: MatchResult?): IntRange? = m?.let { found -> braces.firstOrNull { it.first == found.range.last } }
+            val onAdd = lambdaAt(Regex("""\bonAdd\s*=\s*\{""").find(text))
+            val onEdit = lambdaAt(Regex("""\bonEdit\s*=\s*\{""").find(text))
+            val runs = Regex("""\bnotificationAction\s*\.\s*run\s*\{""").findAll(text).mapNotNull { lambdaAt(it) }.toList()
+            val addRuns = runs.filter { r -> onAdd != null && r.first in onAdd }
+            if (addRuns.size != 1 || adds.single().span.first !in addRuns.single()) v += "Q-holder-install-add"
+            val e = edits.single().span.first
+            if (onEdit == null || e !in onEdit || runs.any { e in it }) v += "Q-holder-install-edit"
+            return v
+        }
+
+        // Q09 token offsets refer to the INPUT, including raw-source comments in formatting controls.
+        private data class InstallToken(val name: String, val start: Int, val end: Int, val backtick: Boolean = false)
+        private data class InstallBuild(val span: IntRange, val mode: String?)
+        private data class InstallWrite(
+            val span: IntRange, val equalsEnd: Int, val call: IntRange?, val mode: String?,
+            val receiver: Boolean, val operator: String, val direct: Boolean, val nullOnly: Boolean, val complete: Boolean)
+        private data class InstallScan(
+            val tokens: List<InstallToken>, val type: String?, val builds: List<InstallBuild>,
+            val writes: List<InstallWrite>, val backtick: Boolean)
+
+        private fun installTokens(text: String): List<InstallToken> {
+            val out = mutableListOf<InstallToken>()
+            val operators = listOf("===", "!==", "..<", "==", "!=", "<=", ">=", "?:", "?.", "::", "->",
+                "+=", "-=", "*=", "/=", "%=", "++", "--", "&&", "||", "!!", "..")
+            fun scan(from: Int, until: Int) {
+                var i = from
+                while (i < until) {
+                    val start = i
+                    when {
+                        text[i].isWhitespace() -> i++
+                        text.startsWith("//", i) -> { while (i < until && text[i] != '\n' && text[i] != '\r') i++ }
+                        text.startsWith("/*", i) -> {
+                            var depth = 1
+                            i += 2
+                            while (i < until && depth > 0) {
+                                when {
+                                    text.startsWith("/*", i) -> { depth++; i += 2 }
+                                    text.startsWith("*/", i) -> { depth--; i += 2 }
+                                    else -> i++
+                                }
+                            }
+                        }
+                        text[i] == '"' || text[i] == '\'' -> {
+                            val end = literalEnd(text, i)
+                            out += InstallToken("<literal>", start, end)
+                            // Keep executable template expressions visible; ordinary literal contents are opaque.
+                            if (text[i] == '"') {
+                                val raw = text.startsWith("\"\"\"", i)
+                                var j = i + if (raw) 3 else 1
+                                while (j < end) {
+                                    if (!raw && text[j] == '\\') { j += 2; continue }
+                                    if (text[j] == '$' && text.getOrNull(j + 1) == '{') {
+                                        val close = closing(text, j + 1) ?: break
+                                        out += InstallToken("{", j + 1, j + 2)
+                                        scan(j + 2, close)
+                                        out += InstallToken("}", close, close + 1)
+                                        j = close + 1
+                                    } else j++
+                                }
+                            }
+                            i = end
+                        }
+                        text[i] == 96.toChar() -> {
+                            i = (text.indexOf(96.toChar(), i + 1).takeIf { it >= 0 } ?: (text.length - 1)) + 1
+                            out += InstallToken(text.substring(start + 1, i - 1), start, i, true)
+                        }
+                        text[i].isLetterOrDigit() || text[i] == '_' -> {
+                            while (i < until && (text[i].isLetterOrDigit() || text[i] == '_')) i++
+                            out += InstallToken(text.substring(start, i), start, i)
+                        }
+                        else -> {
+                            val op = operators.firstOrNull { text.startsWith(it, i) } ?: text[i].toString()
+                            i += op.length
+                            out += InstallToken(op, start, i)
+                        }
+                    }
+                }
+            }
+            scan(0, text.length)
+            return out
+        }
+
+        private fun installClose(tokens: List<InstallToken>, open: Int): Int? {
+            val right = when (tokens.getOrNull(open)?.name) { "(" -> ")"; "{" -> "}"; "[" -> "]"; else -> return null }
+            val stack = ArrayDeque<String>()
+            for (i in open until tokens.size) {
+                val name = tokens[i].name
+                when (name) {
+                    "(" -> stack.addLast(")")
+                    "{" -> stack.addLast("}")
+                    "[" -> stack.addLast("]")
+                    ")", "}", "]" -> {
+                        if (stack.isEmpty() || stack.removeLast() != name) return null
+                        if (stack.isEmpty()) return i.takeIf { name == right }
+                    }
+                }
+            }
+            return null
+        }
+
+        private fun installEnds(text: String, tokens: List<InstallToken>, end: Int): Boolean {
+            val next = tokens.getOrNull(end + 1) ?: return true
+            if (next.name in setOf(";", "}")) return true
+            // squash erases the newline before the next when branch. A branch label is not an RHS type check.
+            if (next.name == "is") {
+                var labelEnd = end + 2
+                if (tokens.getOrNull(labelEnd)?.name?.firstOrNull()?.let { it.isLetter() || it == '_' } == true) {
+                    labelEnd++
+                    while (tokens.getOrNull(labelEnd)?.name == "." &&
+                        tokens.getOrNull(labelEnd + 1)?.name?.firstOrNull()?.let { it.isLetter() || it == '_' } == true) labelEnd += 2
+                    if (tokens.getOrNull(labelEnd)?.name == "->") {
+                        val block = (0..end).lastOrNull { tokens[it].name == "{" && (installClose(tokens, it) ?: -1) > end }
+                        if (block != null) {
+                            val before = block - 1
+                            if (tokens.getOrNull(before)?.name == "when") return true
+                            if (tokens.getOrNull(before)?.name == ")") {
+                                val paren = (0 until before).lastOrNull { tokens[it].name == "(" && installClose(tokens, it) == before }
+                                if (paren != null && tokens.getOrNull(paren - 1)?.name == "when") return true
+                            }
+                        }
+                    }
+                }
+            }
+            val gap = text.substring(tokens[end].end, next.start)
+            if ('\n' !in gap && '\r' !in gap) return false
+            // Tokens Kotlin can join across a line break; conservatively includes calls and trailing lambdas.
+            return next.name !in setOf(".", "?.", "?:", "::", "!!", "(", "[", "{", "?", ":", ",",
+                "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=", "===", "!==", "&&", "||",
+                "..", "..<", "in", "is", "as", "!", "++", "--", "=", "+=", "-=", "*=", "/=", "%=")
+        }
+
+        private fun installScan(text: String): InstallScan {
+            val t = installTokens(text)
+            fun name(i: Int) = t.getOrNull(i)?.name
+            val types = t.indices.filter { name(it) == "var" && name(it + 1) == "editor" && name(it + 2) == "by" &&
+                name(it + 3) == "mutableStateOf" && name(it + 4) == "<" && name(it + 6) == "?" && name(it + 7) == ">" }
+            val type = types.singleOrNull()?.let { name(it + 5) }
+            val builds = if (type == null) emptyList() else t.indices.mapNotNull { i ->
+                if (name(i) != type || name(i + 1) != "(" || name(i - 1) in setOf("class", "fun")) return@mapNotNull null
+                val close = installClose(t, i + 1) ?: return@mapNotNull null
+                val first = i + 2
+                val mode = if (name(first) == "BankAlertEditorMode" && name(first + 1) == ".") when (name(first + 2)) {
+                    "Add" -> if (name(first + 3) in setOf(",", ")")) "add" else null
+                    "Edit" -> if (name(first + 3) == "(" &&
+                        installClose(t, first + 3)?.let { name(it + 1) in setOf(",", ")") } == true) "edit" else null
+                    else -> null
+                } else null
+                InstallBuild(t[i].start..(t[close].end - 1), mode)
+            }
+            val writes = t.indices.mapNotNull { i ->
+                if (name(i) != "editor" || name(i + 1) !in setOf("=", "+=", "-=", "*=", "/=", "%=")) return@mapNotNull null
+                val qualified = name(i - 1) in setOf(".", "?.")
+                val start = if (qualified) maxOf(0, i - 2) else i
+                val receiver = qualified && name(i - 1) == "." && name(i - 2) == "session" &&
+                    name(i - 3) !in setOf(".", "?.", "::")
+                val rhs = i + 2
+                val build = builds.singleOrNull { it.span.first == t.getOrNull(rhs)?.start }
+                val end = build?.let { b -> t.indexOfFirst { it.end == b.span.last + 1 } } ?: rhs
+                val literalNull = name(rhs) == "null"
+                val complete = (literalNull || build != null) && end in t.indices && installEnds(text, t, end)
+                val last = t.getOrNull(end)?.end ?: t[i + 1].end
+                InstallWrite(t[start].start until last, t[i + 1].end, build?.span, build?.mode,
+                    receiver, name(i + 1)!!, receiver && name(i + 1) == "=" && build != null,
+                    literalNull && complete, complete)
+            }
+            val backtick = t.any { it.backtick && it.name == type } ||
+                types.any { t[it + 1].backtick } ||
+                t.indices.any { t[it].backtick && name(it) == "editor" && name(it + 1) in setOf("=", "+=", "-=", "*=", "/=", "%=") }
+            return InstallScan(t, type, builds, writes, backtick)
+        }
+
+        /**
+         * Q09 surface: one sheet in an exact editor != null THEN block or an editor nullable-let body.
+         * Read session.editor directly or through one immutable local; no local name is prescribed.
+         * The binding is in the same enclosing block before the guard and has no RHS suffix.
+         * Follow at most one plain named block function: one declaration, one bare call, no other name use.
+         * At EVERY block, the whole statement containing the target must be key(...) { body }, with
+         * the target in that body, or the exact terminal call. Sheet terminals have no trailing lambda;
+         * bridge call terminals may have one. Declarations, prefixes, suffixes and argument nesting fail closed.
+         * Apply this both gate -> sheet/call and bridge body -> sheet. Sibling statements are unrestricted.
+         * The gate token itself must start its enclosing statement (direct and caller paths alike).
+         * The reader recognizes key/let by syntax; holderInstall separately checks their holder binding surface.
+         * Return the CALLER's condition spans, so Q09 mutates the real gate, not the callee body.
+         */
+        private data class InstallSheetPath(
+            val condition: IntRange, val block: IntRange, val site: IntRange, val guard: Int)
+
+        private fun installSheetGates(text: String): List<IntRange> = installSheetPaths(text).map { it.condition }
+
+        // Share N24's statement selection with path, gate-prefix and binding checks (token indices, inclusive).
+        // root == -1 selects file-level statements for declaration headers; ordinary roots are braces.
+        // Balanced containers stay indivisible. Prefixes must not become standalone "statements" at a newline.
+        private fun installSheetStatementTokens(
+            text: String, t: List<InstallToken>, root: Int, site: Int
+        ): IntRange? {
+            fun name(i: Int) = t.getOrNull(i)?.name
+            val end = if (root == -1) t.size else installClose(t, root) ?: return null
+            if ((root != -1 && name(root) != "{") || site !in (root + 1) until end) return null
+            val firstImport = t.indexOfFirst { it.name == "import" }
+            val syntheticSquash = firstImport > 0 && t.firstOrNull()?.name == "package" &&
+                text.substring(0, t[firstImport].start).none { it == '\n' || it == '\r' || it == ';' }
+            val incomplete = setOf("val", "var", "fun", "class", "interface", "object", "typealias",
+                "return", "throw", "by", "=", "+=", "-=", "*=", "/=", "%=", ".", "?.", "::", "@", ":",
+                ",", "->", "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=", "===", "!==",
+                "&&", "||", "?:", "!", "in", "is", "as")
+            var first = root + 1
+            var i = first
+            while (i < end) {
+                if (name(i) == ";") { first = i + 1; i++; continue }
+                // An annotation (including its optional balanced arguments) belongs to what follows.
+                // A label's @ also stays attached; the resulting prefixed statement will be rejected.
+                if (name(i) == "@") {
+                    var after = i + 1
+                    if (name(after + 1) == ":") after += 2
+                    if (name(after) == "[") {
+                        after = (installClose(t, after) ?: return null) + 1
+                    } else {
+                        if (t.getOrNull(after)?.name?.firstOrNull()?.let { it.isLetter() || it == '_' } != true) return null
+                        after++
+                        while (name(after) == "." && after + 1 < end) after += 2
+                        if (name(after) == "(") after = (installClose(t, after) ?: return null) + 1
+                    }
+                    if (after >= end) return null
+                    i = after
+                    continue
+                }
+                val last = if (name(i) in setOf("(", "{", "[")) installClose(t, i) ?: return null else i
+                if (last >= end) return null
+                val next = name(last + 1)
+                // Only the existing package/import squash control loses all newline separators.
+                // Restore an unambiguous next declaration/control/call after a complete operand/container.
+                val squashEnd = syntheticSquash && name(last) !in incomplete &&
+                    (next in setOf("val", "var", "fun", "class", "object", "if", "when", "return", "throw") ||
+                        (name(last + 2) == "(" && next?.firstOrNull()?.let { it.isLetter() || it == '_' } == true))
+                val boundary = last + 1 == end || (name(last) !in incomplete && next != "@" &&
+                    (installEnds(text, t, last) || squashEnd))
+                if (boundary) {
+                    if (site in first..last) return first..last
+                    first = last + 1
+                }
+                i = last + 1
+            }
+            return null
+        }
+
+        private fun installSheetStatement(text: String, path: InstallSheetPath): IntRange? {
+            val t = installTokens(text)
+            val root = t.indexOfFirst { it.start == path.block.first && it.name == "{" }
+            val site = t.indexOfFirst { it.start == path.site.first }
+            if (root < 0 || site < 0) return null
+            val statement = installSheetStatementTokens(text, t, root, site) ?: return null
+            return t[statement.first].start until t[statement.last].end
+        }
+
+        private fun installSheetPaths(text: String): List<InstallSheetPath> {
+            val t = installTokens(text)
+            fun name(i: Int) = t.getOrNull(i)?.name
+            val sheet = t.indices.filter { name(it) == "AlertAddSheet" && name(it + 1) == "(" }.singleOrNull() ?: return emptyList()
+            data class SheetFunction(val declaration: Int, val body: IntRange)
+            // Plain fun Name(...), with an optional simple/qualified nullable or generic return type.
+            // Parameter defaults/lambdas are balanced by installClose; expression/extension/generic funs are outside this surface.
+            val functions = t.indices.mapNotNull { i ->
+                if (name(i) != "fun" || name(i + 2) != "(") return@mapNotNull null
+                val close = installClose(t, i + 2) ?: return@mapNotNull null
+                var body = close + 1
+                if (name(body) == ":") {
+                    body++
+                    while (body < t.size && (name(body) in setOf(".", "?", "<", ">", ",", "*") ||
+                            name(body)?.firstOrNull()?.let { it.isLetter() || it == '_' } == true)) body++
+                }
+                if (name(body) != "{") return@mapNotNull null
+                val end = installClose(t, body) ?: return@mapNotNull null
+                SheetFunction(i + 1, (body + 1) until end)
+            }
+            fun functionAt(i: Int) = functions.filter { i in it.body }.maxByOrNull { it.body.first }
+            fun blockAt(i: Int) = (0 until i).lastOrNull { name(it) == "{" && (installClose(t, it) ?: -1) > i }
+            fun allowedStatements(root: Int, site: Int, bridgeCall: Boolean): Boolean {
+                var block = root
+                while (true) {
+                    val statement = installSheetStatementTokens(text, t, block, site) ?: return false
+                    val first = statement.first
+                    if (name(first + 1) != "(") return false
+                    val args = installClose(t, first + 1) ?: return false
+                    if (first == site) {
+                        if (args == statement.last) return true
+                        return bridgeCall && name(args + 1) == "{" &&
+                            installClose(t, args + 1) == statement.last
+                    }
+                    // A whole key call, and descent ONLY through its trailing body, never its arguments.
+                    if (name(first) != "key" || name(args + 1) != "{") return false
+                    val body = args + 1
+                    val close = installClose(t, body) ?: return false
+                    if (close != statement.last || site !in (body + 1) until close) return false
+                    block = body
+                }
+            }
+            fun path(begin: Int, until: Int, root: Int, end: Int, site: Int, guard: Int) =
+                InstallSheetPath(t[begin].start until t[until].start,
+                    t[root].start until t[end].end, t[site].start until t[site].end, t[guard].start)
+            // Pure squash is a synthetic code-map control: package/import statements lost their separators.
+            // Never relax a real source's alias RHS boundary merely because its next token looks like a call.
+            val firstImport = t.indexOfFirst { it.name == "import" }
+            val syntheticSquash = firstImport > 0 && t.firstOrNull()?.name == "package" &&
+                text.substring(0, t[firstImport].start).none { it == '\n' || it == '\r' || it == ';' }
+            fun editorRead(from: Int, until: Int, guard: Int): Boolean {
+                if ((from until until).map { name(it) } == listOf("session", ".", "editor")) return true
+                if (until != from + 1) return false
+                val local = name(from)
+                val declarations = t.indices.filter { name(it) in setOf("val", "var") && name(it + 1) == local &&
+                    it < guard && blockAt(it) == blockAt(guard) }
+                val d = declarations.singleOrNull() ?: return false
+                return name(d) == "val" && d < guard && blockAt(d) == blockAt(guard) &&
+                    (d + 2..d + 5).map { name(it) } == listOf("=", "session", ".", "editor") &&
+                    (installEnds(text, t, d + 5) || (syntheticSquash &&
+                        (name(d + 6) in setOf("val", "var", "if", "when", "return", "throw") ||
+                            (name(d + 7) == "(" && t.getOrNull(d + 6)?.name?.firstOrNull()?.isLetter() == true) ||
+                            (name(d + 6) == local && name(d + 7) == "?." && name(d + 8) == "let"))))
+            }
+            fun gateStartsStatement(guard: Int): Boolean {
+                val root = blockAt(guard) ?: return false
+                return installSheetStatementTokens(text, t, root, guard)?.first == guard
+            }
+            fun gatesAt(site: Int, bridgeCall: Boolean): List<InstallSheetPath> = t.indices.mapNotNull { i ->
+                // A named function declaration inside a guard does not execute its body at that guard.
+                if (functionAt(i) != functionAt(site)) return@mapNotNull null
+                // Nullable let is the other accepted gate. No callback variable name is assumed.
+                if (name(i) == "?." && name(i + 1) == "let" && name(i + 2) == "{") {
+                    val end = installClose(t, i + 2) ?: return@mapNotNull null
+                    val begin = if (name(i - 2) == "." && name(i - 3) == "session") i - 3 else i - 1
+                    if (gateStartsStatement(begin) &&
+                        allowedStatements(i + 2, site, bridgeCall) && editorRead(begin, i, i)) {
+                        return@mapNotNull path(begin, i, i + 2, end, site, begin)
+                    }
+                    return@mapNotNull null
+                }
+                if (name(i) != "if" || name(i + 1) != "(" || !gateStartsStatement(i)) return@mapNotNull null
+                val close = installClose(t, i + 1) ?: return@mapNotNull null
+                if (name(close + 1) != "{") return@mapNotNull null
+                val end = installClose(t, close + 1) ?: return@mapNotNull null
+                if (!allowedStatements(close + 1, site, bridgeCall)) return@mapNotNull null
+                val begin = i + 2
+                val nonNull = (name(close - 2) == "!=" && name(close - 1) == "null" &&
+                    editorRead(begin, close - 2, i)) ||
+                    (name(begin) == "null" && name(begin + 1) == "!=" && editorRead(begin + 2, close, i))
+                if (nonNull) path(begin, close, close + 1, end, site, i) else null
+            }
+            val direct = gatesAt(sheet, false)
+            if (direct.isNotEmpty()) return direct
+            val owner = functionAt(sheet) ?: return emptyList()
+            if (!allowedStatements(owner.body.first - 1, sheet, false)) return emptyList()
+            val uses = t.indices.filter { name(it) == name(owner.declaration) }
+            // Count every normalized name use: duplicates, overloads, references and unsupported call spellings fail closed.
+            if (uses.size != 2) return emptyList()
+            val call = uses.singleOrNull { it != owner.declaration } ?: return emptyList()
+            if (name(call + 1) != "(" || name(call - 1) in setOf(".", "?.", "::") ||
+                call in owner.body || installClose(t, call + 1) == null) return emptyList()
+            return gatesAt(call, true)
+        }
+
+
         /** N: AlertSection's prompt and banner (API §3.2): placed, guarded, one click each, both calling onEnableNotifications. */
         fun sectionNotify(code: Map<String, String>): List<String> {
             val text = code[SECTION] ?: return listOf("N-missing")
@@ -1352,7 +2423,8 @@ class BankAlertSectionStructureTest {
                 val span = buttons.single()
                 val open = text.indexOf('(', span.first)
                 val args = topLevelArgs(text.substring(open + 1, closing(text, open)!!))
-                if (args.count { it == "onClick = onEnableNotifications" } != 1 || args.count { it.startsWith("onClick") } != 1) v += "N-prompt-callback $args"
+                // S7 E5b3b (start agreement §4-2, API r2 D5): the prompt now asks for the add entry.
+                if (args.count { it == "onClick = onAdd" } != 1 || args.count { it.startsWith("onClick") } != 1) v += "N-prompt-callback $args"
                 val inside = text.substring(span.first, span.last + 1)
                 if (CLICK_MODIFIER.findAll(inside).count() != 0 || CLICK_ACTION.findAll(inside).map { it.value }.toList() != listOf("Button", "onClick")) {
                     v += "N-prompt-clicks"
@@ -1366,7 +2438,7 @@ class BankAlertSectionStructureTest {
             }
             val clicks = bannerClicks(text).map { squash(text.substring(it.first, it.last + 1)) }
             if (clicks != listOf(".clickable(onClick = onEnableNotifications)")) v += "N-banner-click $clicks"
-            if (count(text, """\bonEnableNotifications\b""") != 3) v += "N-callback-uses ${count(text, """\bonEnableNotifications\b""")}"
+            if (count(text, """\bonEnableNotifications\b""") != 2) v += "N-callback-uses ${count(text, """\bonEnableNotifications\b""")}"
             if (count(text, """\bnotificationsBlocked\b""") != 3) v += "N-flag-uses ${count(text, """\bnotificationsBlocked\b""")}"
             val emptyTag = at("EMPTY")
             if (emptyTag.size != 1 || emptyTag.single() !in empty || guarded(emptyTag.single(), empty)) v += "N-empty-shape $emptyTag"
@@ -1381,10 +2453,33 @@ class BankAlertSectionStructureTest {
             val flat = squash(text)
             for (line in NOTIFY_WIRING) if (count(flat, Regex.escape(line)) != 1) v += "N-holder-wiring $line"
             val uses = count(text, """\bnotificationAction\b""")
-            if (uses != 3) v += "N-holder-uses $uses"
+            // S7 E5b3b (API r2 D8, R8-3): declaration, needsAction, the banner's run(), the add and the save continuations.
+            if (uses != 5) v += "N-holder-uses $uses"
+            val continuations = Regex("""\bnotificationAction\s*\.\s*run\s*\{""").findAll(text).map { it.range.first }.toList()
             val body = bodyRange(text, "BankAlertSection")
             val call = HELPER_CALL.find(text)
             if (body == null || call == null || call.range.first !in body) v += "N-holder-place"
+            if (continuations.size != 2 || body == null || continuations.any { it !in body }) v += "N-holder-continuations $continuations"
+            // S7 E5b3b (gap hunt G17): one run in the section's onAdd lambda, the other in a `{ input ->` callback, and neither inside
+            // an effect, a remember or a state producer, so each runs in the click that asked for it.
+            val braces = pairs(text, '{', '}')
+            val onAdd = Regex("""\bonAdd\s*=\s*\{""").find(text)?.let { m -> braces.firstOrNull { it.first == m.range.last } }
+            val callbacks = Regex("""\{\s*\w+\s*->""").findAll(text).mapNotNull { m -> braces.firstOrNull { it.first == m.range.first } }.toList()
+            // The lambda that directly follows such a call, after its optional argument list.
+            fun lambdaAfter(end: Int): IntRange? {
+                var i = end + 1
+                while (i < text.length && text[i].isWhitespace()) i++
+                if (text.getOrNull(i) == '(') {
+                    i = (closing(text, i) ?: return null) + 1
+                    while (i < text.length && text[i].isWhitespace()) i++
+                }
+                return if (text.getOrNull(i) == '{') braces.firstOrNull { it.first == i } else null
+            }
+            val deferred = Regex("""\b(?:LaunchedEffect|DisposableEffect|SideEffect|remember\w*|produceState|snapshotFlow|derivedStateOf)\b""").findAll(text)
+                .mapNotNull { lambdaAfter(it.range.last) }.toList()
+            val inAdd = continuations.filter { p -> onAdd != null && p in onAdd }
+            val inCallback = continuations.filter { p -> callbacks.any { p in it } && (onAdd == null || p !in onAdd) }
+            if (inAdd.size != 1 || inCallback.size != 1 || continuations.any { p -> deferred.any { p in it } }) v += "N-holder-run-place $continuations"
             return v
         }
 
@@ -1510,7 +2605,9 @@ class BankAlertSectionStructureTest {
                     return false
                 }
             }
-            return named.keys - setOf("modifier") == setOf("tab", "sourceFactory") && named["tab"] == tab && named["sourceFactory"] == factory
+            // S7 E5b3b (API r2 D4): the screen's own alert quotes, one argument.
+            return named.keys - setOf("modifier") == setOf("tab", "alertQuotes", "sourceFactory") && named["tab"] == tab &&
+                named["alertQuotes"] == "screen.ui.alertQuotes" && named["sourceFactory"] == factory
         }
 
         /** P: the route's mount of the section, and the section's call inventory over every root. */

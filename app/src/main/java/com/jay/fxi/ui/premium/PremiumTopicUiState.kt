@@ -28,7 +28,8 @@ internal data class PremiumTopicUiState(
     val rowEditors: List<RateRowEditor>,
     val dollarIndex: TopicDollarIndex?,
     val statusBanner: PremiumTopicBanner?,
-    val lastUpdated: Instant?
+    val lastUpdated: Instant?,
+    val alertQuotes: Map<String, Double> = emptyMap()
 ) {
     /** This model when it still belongs to the current owner, grant turn and tab; [NONE] otherwise. */
     fun forCurrent(display: TopicDisplayState, focus: OwnedTopicFocus?, liveIdentity: AuthIdentityFence?): PremiumTopicUiState {

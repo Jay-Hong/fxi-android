@@ -74,12 +74,12 @@ class PostS6ApprovedDeltaContractTest {
     @Test fun P01_theApprovedLedgerValidates_andMatchesTheActualSourcesExactly() {
         assertEquals("the pin is the manifest's bytes", PostS6ApprovedDelta.APPROVED_SHA256, PostS6ApprovedDelta.sha(raw))
         val ledger = PostS6ApprovedDelta.ledger()
-        assertEquals("exactly the approved S7-a, S7-b, S7-c, S7-N1, S7-E5a1, S7-E5a2, S7-E5c, S7-E5b2a, S7-E5b2b1 and S7-E5b3a paths (S7-E5b2b2 changes two of them again)",
+        assertEquals("exactly the approved S7-a, S7-b, S7-c, S7-N1, S7-E5a1, S7-E5a2, S7-E5c, S7-E5b2a, S7-E5b2b1, S7-E5b3a and S7-E5b3b paths (S7-E5b2b2 and S7-E5b3b change earlier ones again)",
             setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport + activity +
-                pushManager + pushCoordinator + e5b2aAdded + settingsScreen + e5b2b1Added + alertSheet + e5b3aAdded,
+                pushManager + pushCoordinator + e5b2aAdded + settingsScreen + e5b2b1Added + alertSheet + e5b3aAdded + e5b3bNew,
             ledger.final.keys)
         assertEquals(setOf(api, repo) + s7cChanged + n1Changed + e5a1Changed + transport + activity + pushManager + pushCoordinator +
-            settingsScreen + alertSheet, ledger.changed)
+            settingsScreen + alertSheet + e5b3bNew, ledger.changed)
         assertEquals(setOf(access) + s7b + s7cAdded + n1Added + e5a1Added + e5b2aAdded + e5b2b1Added + e5b3aAdded, ledger.added)
         assertEquals("history hashes", mapOf(api to productBase.getValue(api), repo to productBase.getValue(repo), access to null) +
             s7b.associateWith { null } + s7cChanged.associateWith { productBase.getValue(it) } + s7cAdded.associateWith { null } +
@@ -89,7 +89,7 @@ class PostS6ApprovedDeltaContractTest {
             mapOf(pushManager to productBase.getValue(pushManager), pushCoordinator to productBase.getValue(pushCoordinator)) +
             e5b2aAdded.associateWith { null } + mapOf(settingsScreen to productBase.getValue(settingsScreen)) +
             e5b2b1Added.associateWith { null } + mapOf(alertSheet to productBase.getValue(alertSheet)) +
-            e5b3aAdded.associateWith { null }, ledger.original)
+            e5b3aAdded.associateWith { null } + e5b3bNew.associateWith { productBase.getValue(it) }, ledger.original)
         assertEquals(emptyList<String>(), PostS6ApprovedDelta.actualErrors(ledger, PostS6ApprovedDelta.actualSources()))
         val actual = PostS6ApprovedDelta.actualSources().mapValues { PostS6ApprovedDelta.sha(it.value) }
         val projected = PostS6ApprovedDelta.project(actual, ledger)
@@ -103,14 +103,15 @@ class PostS6ApprovedDeltaContractTest {
         for (path in listOf(pushManager, pushCoordinator)) assertEquals("S7-E5b2a $path goes back to its history", productBase.getValue(path), projected[path])
         assertEquals("S7-E5b2b1's settings screen goes back to its history", productBase.getValue(settingsScreen), projected[settingsScreen])
         assertEquals("S7-E5b3a's sheet goes back to its history", productBase.getValue(alertSheet), projected[alertSheet])
+        for (path in e5b3bNew) assertEquals("S7-E5b3b $path goes back to its history", productBase.getValue(path), projected[path])
         assertEquals("the service goes back to its first history through both of its links", productBase.getValue(messaging), projected[messaging])
         assertFalse("the approved additions are dropped from the history view",
             (setOf(access) + s7b + s7cAdded + n1Added + e5a1Added + e5b2aAdded + e5b2b1Added + e5b3aAdded).any { it in projected })
         val moved = setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport + activity +
-            pushManager + pushCoordinator + e5b2aAdded + settingsScreen + e5b2b1Added + alertSheet + e5b3aAdded
+            pushManager + pushCoordinator + e5b2aAdded + settingsScreen + e5b2b1Added + alertSheet + e5b3aAdded + e5b3bNew
         assertEquals("nothing else moves", actual - moved,
             projected - (setOf(api, repo) + s7cChanged + n1Changed + e5a1Changed + transport + activity + pushManager + pushCoordinator +
-                settingsScreen + alertSheet))
+                settingsScreen + alertSheet + e5b3bNew))
     }
 
     @Test fun N01_theApprovalPinBindsTheManifestBytes() {
@@ -964,7 +965,7 @@ class PostS6ApprovedDeltaContractTest {
         withUnits(unit(0), unit(1), unit(2), unit(3), unit(4), unit(5), unit(6), unit(7), unit(8), unit(9), unit(10), changedE5b3a)
 
     @Test fun E56_theE5b3aUnitIsExact_andStartsTheSheetsChain() {
-        assertEquals("premise: the twelfth and last unit is S7-E5b3a", listOf("S7-E5b3a", 12), listOf(e5b3a.str("id"), json.getValue("units").jsonArray.size))
+        assertEquals("premise: the twelfth unit is S7-E5b3a", "S7-E5b3a", e5b3a.str("id"))
         assertEquals("its parent is the S7-E5b2b2 commit and its record the agreed E5b3 API",
             listOf(e5b3aParent, e5b3aApproval), listOf(e5b3a.str("source_parent"), e5b3a.str("approval_record_sha256")))
         val changed = e5b3a.getValue("changed").jsonObject
@@ -993,5 +994,59 @@ class PostS6ApprovedDeltaContractTest {
         val withForbidden = e5b3a.with("added", JsonObject(e5b3a.getValue("added").jsonObject + (forbiddenAdd to JsonPrimitive(someHash))))
         assertTrue("an addition under a forbidden prefix",
             PostS6ApprovedDelta.parse(unitsWithE5b3a(withForbidden).toString().toByteArray(), inventory, s64b, null).first.contains("forbidden $forbiddenAdd"))
+    }
+
+    // ---- S7-E5b3b: the alert quotes and the section's editor entry (s7e5b3_api_agreed.r1.md D4, D5, D8), five KRX-free changes ----
+
+    private val e5b3b get() = unit(12)
+    private val e5b3bParent = "963835d6b9aac869a2face4c6b583558376af569"
+    private val presenter = base + "ui/premium/PremiumTopicPresenter.kt"
+    private val uiState = base + "ui/premium/PremiumTopicUiState.kt"
+    private val e5b3bNew = setOf(presenter, uiState)
+    private val e5b3bChanged = setOf(alertSection, bankSection, presenter, uiState, route)
+    private fun unitsWithE5b3b(changedE5b3b: JsonObject) =
+        withUnits(unit(0), unit(1), unit(2), unit(3), unit(4), unit(5), unit(6), unit(7), unit(8), unit(9), unit(10), unit(11), changedE5b3b)
+
+    @Test fun E58_theE5b3bUnitIsExact_andContinuesEveryChain() {
+        assertEquals("premise: the thirteenth and last unit is S7-E5b3b", listOf("S7-E5b3b", 13), listOf(e5b3b.str("id"), json.getValue("units").jsonArray.size))
+        assertEquals("its parent is the S7-E5b3a commit and its record the agreed E5b3 API",
+            listOf(e5b3bParent, e5b3aApproval), listOf(e5b3b.str("source_parent"), e5b3b.str("approval_record_sha256")))
+        val changed = e5b3b.getValue("changed").jsonObject
+        assertEquals("the section, its holder, the presenter, the ui state and the route change", e5b3bChanged, changed.keys)
+        assertEquals("and nothing is added", emptySet<String>(), e5b3b.getValue("added").jsonObject.keys)
+        val earlier = (0..11).map { unit(it) }
+        for (path in e5b3bChanged) {
+            val previous = earlier.lastOrNull { path in it.getValue("changed").jsonObject.keys || path in it.getValue("added").jsonObject.keys }
+            val expected = when {
+                previous == null -> productBase.getValue(path)
+                path in previous.getValue("changed").jsonObject.keys -> previous.getValue("changed").jsonObject.getValue(path).jsonObject.str("to")
+                else -> previous.getValue("added").jsonObject.getValue(path).jsonPrimitive.content
+            }
+            assertEquals("$path continues its chain", expected, changed.getValue(path).jsonObject.str("from"))
+            assertTrue("$path: the bytes before S7-E5b3b are reviewed KRX-free", changed.getValue(path).jsonObject.str("from") in PostS6ApprovedDelta.NO_KRX_REVIEWED)
+            assertFalse("$path is no forbidden S6 surface", path in PostS6ApprovedDelta.FORBIDDEN_PATHS ||
+                PostS6ApprovedDelta.FORBIDDEN_PREFIXES.any { path.startsWith(it) })
+        }
+        for (path in e5b3bNew) assertTrue("$path enters the ledger here", earlier.none { path in it.getValue("changed").jsonObject.keys })
+        assertTrue("no core exception belongs to S7-E5b3b", PostS6ApprovedDelta.CORE_EXCEPTIONS.none { it.unitId == "S7-E5b3b" })
+        assertEquals(emptyList<String>(), errors(json))
+    }
+
+    @Test fun E59_theE5b3bUnitRefusesAnotherFromAnUnreviewedOneAndAForbiddenAddition() {
+        val changed = e5b3b.getValue("changed").jsonObject
+        val (control, controlLedger) = PostS6ApprovedDelta.parse(unitsWithE5b3b(e5b3b).toString().toByteArray(), inventory, s64b, null)
+        assertEquals("premise: the unaltered E5b3b unit validates", emptyList<String>(), control)
+        assertTrue("premise: and folds a ledger", controlLedger != null)
+        for (path in e5b3bChanged) {
+            val to = changed.getValue(path).jsonObject.str("to")
+            val broken = e5b3b.with("changed", JsonObject(changed + (path to changedEntry(someHash, to))))
+            assertEquals("another from on $path: the broken link and the unreviewed history",
+                listOf("from $path", "krx-before-unreviewed $path"),
+                PostS6ApprovedDelta.parse(unitsWithE5b3b(broken).toString().toByteArray(), inventory, s64b, null).first)
+        }
+        val forbiddenAdd = base + "data/entitlements/S7E5b3bProbe.kt"
+        val withForbidden = e5b3b.with("added", JsonObject(e5b3b.getValue("added").jsonObject + (forbiddenAdd to JsonPrimitive(someHash))))
+        assertTrue("an addition under a forbidden prefix",
+            PostS6ApprovedDelta.parse(unitsWithE5b3b(withForbidden).toString().toByteArray(), inventory, s64b, null).first.contains("forbidden $forbiddenAdd"))
     }
 }

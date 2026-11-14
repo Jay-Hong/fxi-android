@@ -76,7 +76,10 @@ class S7E5A2BankRowActionsTest {
                 onToggle = { id, enabled -> toggles += id to enabled },
                 onDelete = { id -> deletes += id },
                 notificationsBlocked = false,
-                onEnableNotifications = { }
+                onEnableNotifications = { },
+                addAvailability = BankAlertAddAvailability.Hidden,
+                onAdd = { },
+                onEdit = { }
             )
         }
         rule.waitForIdle()
@@ -242,6 +245,8 @@ class S7E5A2BankRowActionsTest {
         override fun setEnabled(id: Int, enabled: Boolean) {
             calls += "setEnabled $id $enabled"
         }
+        override fun add(draft: com.jay.fxi.data.alerts.BankAlertDraft): com.jay.fxi.data.alerts.BankAlertSaveRequest = error("S7 E5b3b: not used here")
+        override fun edit(id: Int, edit: com.jay.fxi.data.alerts.BankAlertEdit): com.jay.fxi.data.alerts.BankAlertSaveRequest = error("S7 E5b3b: not used here")
         override fun delete(id: Int) {
             calls += "delete $id"
         }
@@ -249,7 +254,7 @@ class S7E5A2BankRowActionsTest {
 
     @Test fun s7e5a2_R06_theHolderHandsASwitchTapAndAConfirmedDeleteToItsSourceOneToOne() {
         val source = FakeSource(BankAlertSettingsState(AlertLoadPhase.Ready, listOf(setting(71, order = 0), setting(72, order = 1, enabled = false)), alice))
-        rule.setContent { BankAlertSection(tab = FreeTab.USD, sourceFactory = object : BankAlertSectionSourceFactory {
+        rule.setContent { BankAlertSection(tab = FreeTab.USD, alertQuotes = emptyMap(), sourceFactory = object : BankAlertSectionSourceFactory {
             override fun create(context: Context): BankAlertSectionSource = source
         }) }
         rule.waitForIdle()
@@ -262,7 +267,7 @@ class S7E5A2BankRowActionsTest {
 
     @Test fun s7e5a2_R07_theHolderSendsNothingForASnapshotWithoutAnIdentity() {
         val source = FakeSource(BankAlertSettingsState(AlertLoadPhase.Ready, listOf(setting(73)), null))
-        rule.setContent { BankAlertSection(tab = FreeTab.USD, sourceFactory = object : BankAlertSectionSourceFactory {
+        rule.setContent { BankAlertSection(tab = FreeTab.USD, alertQuotes = emptyMap(), sourceFactory = object : BankAlertSectionSourceFactory {
             override fun create(context: Context): BankAlertSectionSource = source
         }) }
         rule.waitForIdle()

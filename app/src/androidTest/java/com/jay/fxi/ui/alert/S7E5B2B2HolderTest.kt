@@ -65,6 +65,8 @@ class S7E5B2B2HolderTest {
         override fun setEnabled(id: Int, enabled: Boolean) {
             calls += "setEnabled $id $enabled"
         }
+        override fun add(draft: com.jay.fxi.data.alerts.BankAlertDraft): com.jay.fxi.data.alerts.BankAlertSaveRequest = error("S7 E5b3b: not used here")
+        override fun edit(id: Int, edit: com.jay.fxi.data.alerts.BankAlertEdit): com.jay.fxi.data.alerts.BankAlertSaveRequest = error("S7 E5b3b: not used here")
         override fun delete(id: Int) {
             calls += "delete $id"
         }
@@ -76,10 +78,10 @@ class S7E5B2B2HolderTest {
 
     private fun show(rig: Rig?, source: FakeSource, tab: FreeTab = FreeTab.USD) = compose.setContent {
         if (rig == null) {
-            BankAlertSection(tab = tab, sourceFactory = factory(source))
+            BankAlertSection(tab = tab, alertQuotes = emptyMap(), sourceFactory = factory(source))
         } else {
             CompositionLocalProvider(LocalNotificationPermissionEnvironment provides rig.env) {
-                BankAlertSection(tab = tab, sourceFactory = factory(source))
+                BankAlertSection(tab = tab, alertQuotes = emptyMap(), sourceFactory = factory(source))
             }
         }
     }

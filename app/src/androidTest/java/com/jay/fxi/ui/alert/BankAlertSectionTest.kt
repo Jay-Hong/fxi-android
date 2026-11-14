@@ -111,7 +111,10 @@ class BankAlertSectionTest {
                 onToggle = { _, _ -> },
                 onDelete = { },
                 notificationsBlocked = false,
-                onEnableNotifications = { }
+                onEnableNotifications = { },
+                addAvailability = BankAlertAddAvailability.Hidden,
+                onAdd = { },
+                onEdit = { }
             )
         }
         rule.waitForIdle()
@@ -493,9 +496,14 @@ class BankAlertSectionTest {
             val deletes = subtree(BankAlertSectionTags.delete(id)).filter { SemanticsActions.OnClick in it.config }
             assertEquals("row $id has one delete button", 1, deletes.size)
             assertTrue("its delete button says so", subtree(BankAlertSectionTags.delete(id)).any { n -> words(n).any { "삭제" in it } })
+            // S7 E5b3b (API r2 D5): the row's bank and condition area is its one editor entry, a click and nothing else.
+            val opens = rule.onAllNodes(hasTestTag(BankAlertSectionTags.rowOpen(id)), useUnmergedTree = true).fetchSemanticsNodes()
+            assertEquals("row $id has one editor entry", 1, opens.size)
+            assertTrue("a click", SemanticsActions.OnClick in opens.single().config)
+            assertFalse("no long click", SemanticsActions.OnLongClick in opens.single().config)
         }
         val controls = listOf(41, 42, 43).flatMap { subtree(BankAlertSectionTags.toggle(it)) + subtree(BankAlertSectionTags.delete(it)) }
-            .map { it.id }.toSet()
+            .map { it.id }.toSet() + listOf(41, 42, 43).map { rule.onNodeWithTag(BankAlertSectionTags.rowOpen(it), useUnmergedTree = true).fetchSemanticsNode().id }
 
         inside.filterNot { it.id in controls }.forEach { n ->
             val c = n.config
@@ -535,7 +543,9 @@ class BankAlertSectionTest {
         val others = hasClickAction() and inSubtree(BankAlertSectionTags.ROOT) and
             !inSubtree(BankAlertSectionTags.REFRESH) and !inSubtree(BankAlertSectionTags.TOGGLE_EXPANDED) and
             !inSubtree(BankAlertSectionTags.toggle(51)) and !inSubtree(BankAlertSectionTags.toggle(52)) and
-            !inSubtree(BankAlertSectionTags.delete(51)) and !inSubtree(BankAlertSectionTags.delete(52))
+            !inSubtree(BankAlertSectionTags.delete(51)) and !inSubtree(BankAlertSectionTags.delete(52)) and
+            // S7 E5b3b: the row's editor entry is S7E5B3BSectionTest's (B08).
+            !inSubtree(BankAlertSectionTags.rowOpen(51)) and !inSubtree(BankAlertSectionTags.rowOpen(52))
         val count = countOf(others)
         for (i in 0 until count) {
             tap(rule.onAllNodes(others, useUnmergedTree = true)[i])

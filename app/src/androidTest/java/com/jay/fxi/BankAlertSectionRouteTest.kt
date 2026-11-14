@@ -144,6 +144,8 @@ class BankAlertSectionRouteTest {
         override fun authoritative() { authoritatives.incrementAndGet() }
         override fun manual() { manuals.incrementAndGet() }
         override fun setEnabled(id: Int, enabled: Boolean) {}
+        override fun add(draft: com.jay.fxi.data.alerts.BankAlertDraft): com.jay.fxi.data.alerts.BankAlertSaveRequest = error("S7 E5b3b: not used here")
+        override fun edit(id: Int, edit: com.jay.fxi.data.alerts.BankAlertEdit): com.jay.fxi.data.alerts.BankAlertSaveRequest = error("S7 E5b3b: not used here")
         override fun delete(id: Int) {}
     }
     /** Counts its makings; every making hands out the same [source], as the production factory exposes the one singleton. */
@@ -658,9 +660,9 @@ class BankAlertSectionRouteTest {
         rule.setContent {
             Column {
                 for (tab in unsupported) {
-                    Box(Modifier.testTag(probe(tab))) { BankAlertSection(tab = tab, sourceFactory = factories.getValue(tab)) }
+                    Box(Modifier.testTag(probe(tab))) { BankAlertSection(tab = tab, alertQuotes = emptyMap(), sourceFactory = factories.getValue(tab)) }
                 }
-                if (control) Box(Modifier.testTag(probe(FreeTab.USD))) { BankAlertSection(tab = FreeTab.USD, sourceFactory = factory) }
+                if (control) Box(Modifier.testTag(probe(FreeTab.USD))) { BankAlertSection(tab = FreeTab.USD, alertQuotes = emptyMap(), sourceFactory = factory) }
             }
         }
         rule.waitForIdle()
@@ -700,7 +702,7 @@ class BankAlertSectionRouteTest {
     @Test fun s7e5a1_r5j_everyAppearanceEnsuresOnceMore_alsoOverATerminalErrorACooldownOrASend() {
         var visible by mutableStateOf(false)
         var shownTab by mutableStateOf(FreeTab.USD)
-        rule.setContent { if (visible) BankAlertSection(tab = shownTab, sourceFactory = factory) }
+        rule.setContent { if (visible) BankAlertSection(tab = shownTab, alertQuotes = emptyMap(), sourceFactory = factory) }
         rule.waitForIdle()
         assertEquals("premise: hidden, no section", 0, tags(BankAlertSectionTags.ROOT))
         assertEquals("premise: hidden, no factory making and no ensure", 0 to 0, factory.created.get() to source.ensures.get())

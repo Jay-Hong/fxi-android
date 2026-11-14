@@ -214,6 +214,8 @@ class BankHistoryEntryRouteTest {
                 override fun authoritative() { retries.incrementAndGet() }
                 override fun manual() { refreshes.incrementAndGet() }
                 override fun setEnabled(id: Int, enabled: Boolean) {}
+                override fun add(draft: com.jay.fxi.data.alerts.BankAlertDraft): com.jay.fxi.data.alerts.BankAlertSaveRequest = error("S7 E5b3b: not used here")
+                override fun edit(id: Int, edit: com.jay.fxi.data.alerts.BankAlertEdit): com.jay.fxi.data.alerts.BankAlertSaveRequest = error("S7 E5b3b: not used here")
                 override fun delete(id: Int) {}
             }
         }

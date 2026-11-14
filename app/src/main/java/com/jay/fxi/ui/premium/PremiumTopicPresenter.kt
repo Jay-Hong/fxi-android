@@ -36,7 +36,11 @@ internal object PremiumTopicPresenter {
 
         val tab = acceptedFocus.tab
         val projection = display.rates.displayFor(tab, preferences)
-        val rowEditors = editors(display.rates.editableRostersFor(tab), preferences)
+        val rosters = display.rates.editableRostersFor(tab)
+        val rowEditors = editors(rosters, preferences)
+        val alertQuotes = rosters[RateRowList.FX_BANKS].orEmpty()
+            .filter { it.value.isFinite() && it.value > 0.0 }
+            .associate { it.id to it.value }
         val editableLists = rowEditors.map { it.list }.toSet()
         val sections = projection.scales.flatMap { RateRowPresenter.present(it) }
             .filter { it.rows.isNotEmpty() || it.list in editableLists }
@@ -58,7 +62,8 @@ internal object PremiumTopicPresenter {
             rowEditors = rowEditors,
             dollarIndex = dollarIndex,
             statusBanner = banner,
-            lastUpdated = lastUpdated
+            lastUpdated = lastUpdated,
+            alertQuotes = alertQuotes
         )
     }
 
