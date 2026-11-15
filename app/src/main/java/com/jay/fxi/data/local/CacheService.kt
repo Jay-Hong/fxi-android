@@ -46,6 +46,15 @@ class CacheService @Inject constructor(
     /** Deletes only retired rate keys through this service's existing fxi_cache instance. */
     internal suspend fun deleteRetiredRateKeys() = deleteLegacyRateKeys(context.dataStore)
 
+    /** Removes the retired last-bank prefix without decoding values or touching other keys. */
+    internal suspend fun deleteLastBankKeys() {
+        context.dataStore.edit { preferences ->
+            preferences.asMap().keys
+                .filter { it.name.startsWith(KEY_LAST_BANK_PREFIX) }
+                .forEach { preferences.remove(stringPreferencesKey(it.name)) }
+        }
+    }
+
     // ============ 마지막 선택 은행 (알림 추가용) ============
 
     /**

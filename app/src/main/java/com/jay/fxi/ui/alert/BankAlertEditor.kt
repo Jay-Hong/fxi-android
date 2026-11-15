@@ -59,14 +59,17 @@ internal object BankAlertEditor {
     )
     val REPEAT_CHOICES: List<RepeatInterval?> = listOf(null) + RepeatInterval.entries
 
-    fun initial(mode: BankAlertEditorMode, quotes: Map<String, Double>): BankAlertEditorInput =
+    fun initial(mode: BankAlertEditorMode, quotes: Map<String, Double>, addBank: String? = null): BankAlertEditorInput =
         when (mode) {
-            BankAlertEditorMode.Add -> BankAlertEditorInput(
-                bank = Bank.KB,
-                condition = AlertCondition.BELOW,
-                thresholdText = usableQuote(quotes[Bank.KB.code])?.let(::formatThreshold).orEmpty(),
-                repeat = RepeatIntervalChange.Once
-            )
+            BankAlertEditorMode.Add -> {
+                val bank = BANK_CHOICES.firstOrNull { it.code == addBank } ?: Bank.KB
+                BankAlertEditorInput(
+                    bank = bank,
+                    condition = AlertCondition.BELOW,
+                    thresholdText = usableQuote(quotes[bank.code])?.let(::formatThreshold).orEmpty(),
+                    repeat = RepeatIntervalChange.Once
+                )
+            }
             is BankAlertEditorMode.Edit -> BankAlertEditorInput(
                 bank = mode.setting.bankType,
                 condition = mode.setting.condition,

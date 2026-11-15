@@ -195,6 +195,71 @@ class BankAlertSectionStructureTest {
         }
     }
 
+    /**
+     * S7 E5b4b: the adapter's memory members accept their equivalent spellings — a selection getter, a prepare block with or
+     * without `return` — and catch a selection of their own, a prepare of another identity, an empty or a larger prepare, and
+     * a further use of the memory.
+     */
+    @Test fun `S7E5B4B_A03 the memory delegation allows its equivalent forms and catches a fake or extra use`() {
+        assertEquals("premise: the real tree is clean", emptyList<String>(), adapter(code))
+        val flat = squash(code.getValue(HOLDER))
+        val m = MEMORY.findAll(flat).single().groupValues[1]
+        val selection = Regex(Regex.escape("override val bankSelection = $m.selection"))
+        val prepare = Regex(Regex.escape("override suspend fun prepareBankSelection(identity: AuthIdentityFence) = $m.prepare(identity)"))
+        fun flatEdit(regex: Regex, replacement: String): Map<String, String> {
+            val found = regex.findAll(flat).toList()
+            assertEquals("mutation premise: /${regex.pattern}/ is in the squashed holder once", 1, found.size)
+            return code + (HOLDER to flat.replaceRange(found.single().range, replacement))
+        }
+        for ((label, tree) in listOf(
+            "a selection getter" to flatEdit(selection, "override val bankSelection get() = $m.selection"),
+            "a typed selection getter" to flatEdit(selection, "override val bankSelection: StateFlow<BankSelectionSnapshot> get() = $m.selection"),
+            "a prepare block with return" to flatEdit(prepare, "override suspend fun prepareBankSelection(identity: AuthIdentityFence) { return $m.prepare(identity) }"),
+            "a prepare block" to flatEdit(prepare, "override suspend fun prepareBankSelection(identity: AuthIdentityFence) { $m.prepare(identity) }"))) {
+            assertClean("E5b4b A, $label", adapter(tree))
+        }
+        for ((label, tree, tag) in listOf(
+            Triple("a selection of its own", flatEdit(selection,
+                "override val bankSelection = MutableStateFlow<BankSelectionSnapshot>(BankSelectionSnapshot.None)"), "A-bankSelection"),
+            Triple("a derived selection", flatEdit(selection, "override val bankSelection = $m.selection.map { it }"), "A-bankSelection"),
+            Triple("a getter on something else", flatEdit(selection, "override val bankSelection get() = $m.selection.value"), "A-bankSelection"),
+            Triple("a prepare of another identity", flatEdit(prepare,
+                "override suspend fun prepareBankSelection(identity: AuthIdentityFence) = $m.prepare(AuthIdentityFence(identity.uid, 0))"), "A-prepareBankSelection"),
+            Triple("a prepare that does nothing", flatEdit(prepare, "override suspend fun prepareBankSelection(identity: AuthIdentityFence) {}"), "A-prepareBankSelection"),
+            Triple("a prepare doing more", flatEdit(prepare,
+                "override suspend fun prepareBankSelection(identity: AuthIdentityFence) { $m.prepare(identity); $m.requireReady() }"), "A-prepareBankSelection"),
+            Triple("a further use of the memory", appended(HOLDER,
+                "private fun s7e5b4b(x: LastSelectedBankMemory) = x.acceptAddedBank(AuthIdentityFence(\"u\", 1), \"kb\")"), "A-memory-use"))) {
+            assertCaught("E5b4b A $label", tag, adapter(tree))
+        }
+    }
+
+    /**
+     * S7 E5b4b: the member split keeps a `suspend fun` whole however it is spaced, still tells every member apart, and the
+     * source shape catches prepareBankSelection losing `suspend`, going, changing signature or gaining a neighbour.
+     */
+    @Test fun `S7E5B4B_T03 the member split keeps suspend members whole and the source shape catches a changed prepareBankSelection`() {
+        fun shape(body: String) = interfaceShape("internal interface S7e5b4bShape {$body}", "S7e5b4bShape")
+        assertEquals("non-suspend members", setOf("val a: StateFlow<Int>", "fun b()", "fun c(x: Int): Int"),
+            shape("\n    val a: StateFlow<Int>\n    fun b()\n    fun c(x: Int): Int\n"))
+        assertEquals("consecutive suspend members with val, var and fun around them",
+            setOf("val a: Int", "suspend fun b(x: Int)", "suspend fun c()", "fun d()", "var e: Int"),
+            shape("\n    val a: Int\n    suspend fun b(x: Int)\n    suspend fun c()\n    fun d()\n    var e: Int\n"))
+        assertEquals("line breaks, tabs and comments", setOf("val a: Int", "suspend fun b(x: Int)"),
+            shape(PostS6ApprovedDelta.codeAndStrings("\n\t// a note\n\tval a: Int\n\n\tsuspend /* why */\n\t\tfun b(\n\t\tx: Int\n\t)\n")))
+
+        assertEquals("premise: the real tree is clean", emptyList<String>(), types(code))
+        val declaration = """(?<!override )\bsuspend\s+fun\s+prepareBankSelection\s*\(\s*identity\s*:\s*AuthIdentityFence\s*\)"""
+        for ((label, tree) in listOf(
+            "suspend removed" to edited(HOLDER, declaration, "fun prepareBankSelection(identity: AuthIdentityFence)"),
+            "the member gone" to edited(HOLDER, declaration, ""),
+            "the signature changed" to edited(HOLDER, declaration, "suspend fun prepareBankSelection(identity: AuthIdentityFence, force: Boolean)"),
+            "a member added" to edited(HOLDER, declaration,
+                "suspend fun prepareBankSelection(identity: AuthIdentityFence)\n    suspend fun forgetBankSelection()"))) {
+            assertCaught("E5b4b T $label", "T-source-shape", types(tree))
+        }
+    }
+
     // ---- T: where the source seam lives ----
 
     @Test fun `S7E5A1_R3_T01 the source and factory types are declared implemented and named in the holder file only`() {
@@ -1232,8 +1297,10 @@ class BankAlertSectionStructureTest {
 
         val REFLECTION = Regex("""\bjavaClass\b|\bgetMethod\b|\bgetDeclared\w*|\bgetField\b|\bClass\s*\.\s*forName\b|\b(?:kotlin|java\s*\.\s*lang)\s*\.\s*reflect\b|\bmemberFunctions\b|\bcallBy\b""")
         val FLOW_CONSTRUCTION = Regex("""\bMutableStateFlow\b|\bMutableSharedFlow\b|\bstateIn\b|\bshareIn\b|\bcombine\b|\bflowOf\b|\bcallbackFlow\b|\bchannelFlow\b|\bflow\s*\{|\bsnapshotFlow\b|\bproduceState\b|\blaunch\b|\basync\b|\bCoroutineScope\b|\bGlobalScope\b|\brunBlocking\b""")
-        /** API r2 §2's entry point, squashed. */
-        val ENTRY_POINT = Regex("""(?:@EntryPoint @InstallIn\(SingletonComponent::class\)|@InstallIn\(SingletonComponent::class\) @EntryPoint) (?:internal )?interface BankAlertSectionEntryPoint \{ fun bankAlertSettingsOwner\(\): BankAlertSettingsOwner \}""")
+        /** API r2 §2's entry point, squashed; S7 E5b4b (`s7e5b4_api_agreed.r1.md` §2.3) adds the memory as its second member. */
+        val ENTRY_POINT = Regex("""(?:@EntryPoint @InstallIn\(SingletonComponent::class\)|@InstallIn\(SingletonComponent::class\) @EntryPoint) (?:internal )?interface BankAlertSectionEntryPoint \{ fun bankAlertSettingsOwner\(\): BankAlertSettingsOwner fun lastSelectedBankMemory\(\): LastSelectedBankMemory \}""")
+        /** S7 E5b4b: the memory resolved from the same entry point, squashed; group 1 is the memory reference. */
+        val MEMORY = Regex("""\bval (\w+) = \w+\.lastSelectedBankMemory\(\)""")
         /** The adapter's settings override, squashed: the owner's `state` as it is; group 1 is the owner reference. */
         val SETTINGS = flowOverride("settings", "BankAlertSettingsState", """([\w.]+?(?:\(\))?)""", "state")
 
@@ -1244,7 +1311,9 @@ class BankAlertSectionStructureTest {
         val SOURCE_SHAPE = setOf("val settings: StateFlow<BankAlertSettingsState>", "val manualRefresh: StateFlow<ManualRefreshState>",
             "fun ensure()", "fun authoritative()", "fun manual()", "fun setEnabled(id: Int, enabled: Boolean)", "fun delete(id: Int)",
             // S7 E5b3b (API r2 D5): the owner's add and edit, one to one.
-            "fun add(draft: BankAlertDraft): BankAlertSaveRequest", "fun edit(id: Int, edit: BankAlertEdit): BankAlertSaveRequest")
+            "fun add(draft: BankAlertDraft): BankAlertSaveRequest", "fun edit(id: Int, edit: BankAlertEdit): BankAlertSaveRequest",
+            // S7 E5b4b (API §2.3): the memory's selection and prepare, one to one.
+            "val bankSelection: StateFlow<BankSelectionSnapshot>", "suspend fun prepareBankSelection(identity: AuthIdentityFence)")
         val FACTORY_SHAPE = setOf("fun create(context: Context): BankAlertSectionSource")
 
         val CALL = Regex("""\bBankAlertSection\s*\(""")
@@ -1676,8 +1745,25 @@ class BankAlertSectionStructureTest {
             if (ENTRY_POINT.findAll(flat).count() != 1) v += "A-entry-point"
             val resolutions = Regex("""\bEntryPointAccessors\s*\.\s*fromApplication\s*\(""").findAll(text).map { it.range.first }.toList()
             if (resolutions.size != 1 || count(text, """\bEntryPointAccessors\s*\.\s*\w+""") != 1 ||
-                count(text, """\.\s*bankAlertSettingsOwner\s*\(\s*\)""") != 1) {
+                count(text, """\.\s*bankAlertSettingsOwner\s*\(\s*\)""") != 1 ||
+                count(text, """\.\s*lastSelectedBankMemory\s*\(\s*\)""") != 1) {
                 v += "A-resolution"
+            }
+            // S7 E5b4b: the memory's two members, delegated one to one from the memory the same resolution gave.
+            val memory = MEMORY.findAll(flat).toList()
+            if (memory.size != 1) {
+                v += "A-memory ${memory.size}"
+            } else {
+                val m = Regex.escape(memory.single().groupValues[1])
+                // This land's grammar: an expression body or a getter for the selection; an expression body or a block, with or
+                // without `return`, for prepare. A grammar lock, disclosed as such — not the agreed meaning's only spelling.
+                if (count(flat, """override val bankSelection(?:: StateFlow<BankSelectionSnapshot>)?(?: get\(\))? = $m\.selection(?![\w.(\[])""") != 1) {
+                    v += "A-bankSelection"
+                }
+                if (count(flat, """override suspend fun prepareBankSelection\(identity: AuthIdentityFence\)(?:: Unit)?(?: = $m\.prepare\(identity\)(?![\w.(\[])| \{ (?:return )?$m\.prepare\(identity\) \})""") != 1) {
+                    v += "A-prepareBankSelection"
+                }
+                if (count(text, """\bLastSelectedBankMemory\b""") != 2 || count(text, """\b$m\s*\.\s*\w+""") != 2) v += "A-memory-use"
             }
             val factory = objectBody(text, "ProductionBankAlertSectionSourceFactory")
             if (factory == null || resolutions.any { it !in factory }) v += "A-resolution-place"
@@ -1714,7 +1800,10 @@ class BankAlertSectionStructureTest {
             val open = text.indexOf('{', m.range.last)
             if (open < 0) return null
             val close = closing(text, open) ?: return null
-            return squash(text.substring(open + 1, close)).split(Regex("""(?=\b(?:val|var|fun)\s)""")).map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            // S7 E5b4b: a `suspend fun` member stays one declaration. The agreed `(?=\b(?:val|var)\s|\b(?:suspend\s+)?fun\s)` would also
+            // split before the `fun` inside `suspend fun`, so the second alternative refuses to start right after `suspend `.
+            return squash(text.substring(open + 1, close)).split(Regex("""(?=\b(?:val|var)\s|(?<!\bsuspend )\b(?:suspend\s+)?fun\s)"""))
+                .map { it.trim() }.filter { it.isNotEmpty() }.toSet()
         }
 
         /** SAM constructions of the factory: `BankAlertSectionSourceFactory {` that is neither its declaration nor a supertype clause. */

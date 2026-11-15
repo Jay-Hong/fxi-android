@@ -1892,7 +1892,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   `SourceAlertSection.swift:458-463`, `ComparisonAlertSection.swift:407-411`). premium이 아니면 요청하지 않고,
   notDetermined면 runtime 요청, denied면 앱 알림 설정 화면으로 유도, 이미 허용인데 미등록이면 **S1의 단일 push
   coordinator에 재평가 신호**를 보낸다. S7이 별도 token/register owner를 만들지 않으며 S8·S9도 같은 UI helper를 재사용한다.
-- premium editor 전용 UID-scoped `lastSelectedBank`를 만들고 신규/저장 성공 시에만 갱신한다.
+- premium editor 전용 UID-scoped `lastSelectedBank`를 만들고 추가 성공 시에만 갱신한다.
   free preview는 읽기·쓰기 0이며, 새 store 배선 후 legacy `fxi_cache.last_bank_*`를 삭제한다.
 - **공통 typed FCM parser/refresher**를 여기서 도입하고 S8·S9가 family를 추가한다.
   - `rate_alert|source_rate_alert|comparison_alert`는 서버의 현 `notification+data` visible payload를 사용한다.

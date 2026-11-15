@@ -24,6 +24,8 @@ import com.jay.fxi.data.alerts.BankAlertSettingsState
 import com.jay.fxi.data.alerts.ManualRefreshState
 import com.jay.fxi.data.alerts.NotSentReason
 import com.jay.fxi.data.auth.AuthIdentityFence
+import com.jay.fxi.data.local.BankSelectionSnapshot
+import com.jay.fxi.data.local.LastSelectedBankMemory
 import com.jay.fxi.data.repository.AlertRepositoryFailureKind
 import com.jay.fxi.domain.model.AlertSetting
 import com.jay.fxi.domain.model.FreeTab
@@ -38,6 +40,7 @@ import kotlinx.coroutines.flow.StateFlow
 @InstallIn(SingletonComponent::class)
 internal interface BankAlertSectionEntryPoint {
     fun bankAlertSettingsOwner(): BankAlertSettingsOwner
+    fun lastSelectedBankMemory(): LastSelectedBankMemory
 }
 
 internal data class BankAlertSectionState(
@@ -114,6 +117,15 @@ internal fun bankAlertAddAvailability(settings: BankAlertSettingsState): BankAle
     }
 }
 
+internal fun bankSelectionSettled(selection: BankSelectionSnapshot, identity: AuthIdentityFence?): Boolean = when (selection) {
+    is BankSelectionSnapshot.Ready -> identity != null && selection.identity == identity
+    is BankSelectionSnapshot.Failed -> identity != null && selection.identity == identity
+    is BankSelectionSnapshot.Loading, BankSelectionSnapshot.None -> false
+}
+
+internal fun bankSelectionSeed(selection: BankSelectionSnapshot): String? =
+    (selection as? BankSelectionSnapshot.Ready)?.code
+
 internal object BankAlertEditorCopy {
     const val FAILED = "저장 결과를 확인하지 못했습니다. 알림 목록을 확인한 뒤 다시 시도해 주세요."
     const val CAP = "알림은 최대 30개까지 설정할 수 있습니다."
@@ -141,7 +153,8 @@ private class BankAlertEditorSession {
 /** One instance per entry; request and error changes keep its reference stable. */
 private class OpenBankAlertEditor(
     val mode: BankAlertEditorMode,
-    val identity: AuthIdentityFence
+    val identity: AuthIdentityFence,
+    val seed: String? = null
 ) {
     var handle by mutableStateOf<BankAlertSaveRequest?>(null)
     var error by mutableStateOf<String?>(null)
@@ -174,6 +187,8 @@ internal object BankAlertSectionTags {
 internal interface BankAlertSectionSource {
     val settings: StateFlow<BankAlertSettingsState>
     val manualRefresh: StateFlow<ManualRefreshState>
+    val bankSelection: StateFlow<BankSelectionSnapshot>
+    suspend fun prepareBankSelection(identity: AuthIdentityFence)
     fun ensure()
     fun authoritative()
     fun manual()
@@ -189,13 +204,17 @@ internal fun interface BankAlertSectionSourceFactory {
 
 internal object ProductionBankAlertSectionSourceFactory : BankAlertSectionSourceFactory {
     override fun create(context: Context): BankAlertSectionSource {
-        val owner = EntryPointAccessors.fromApplication(
+        val entryPoint = EntryPointAccessors.fromApplication(
             context.applicationContext,
             BankAlertSectionEntryPoint::class.java
-        ).bankAlertSettingsOwner()
+        )
+        val owner = entryPoint.bankAlertSettingsOwner()
+        val memory = entryPoint.lastSelectedBankMemory()
         return object : BankAlertSectionSource {
             override val settings = owner.state
             override val manualRefresh = owner.manualRefresh
+            override val bankSelection = memory.selection
+            override suspend fun prepareBankSelection(identity: AuthIdentityFence) = memory.prepare(identity)
             override fun ensure() = owner.ensure()
             override fun authoritative() = owner.authoritative()
             override fun manual() = owner.manual()
@@ -223,6 +242,7 @@ internal fun BankAlertSection(
     key(source) {
         val settings by source.settings.collectAsState()
         val manual by source.manualRefresh.collectAsState()
+        val selection by source.bankSelection.collectAsState()
         val actionIdentity: AuthIdentityFence? = settings.identity
         val session = remember(currency) { BankAlertEditorSession() }
         val currentSession by rememberUpdatedState(session)
@@ -230,7 +250,11 @@ internal fun BankAlertSection(
         DisposableEffect(session) {
             onDispose { session.alive = false }
         }
+        LaunchedEffect(session, actionIdentity) {
+            if (actionIdentity != null) source.prepareBankSelection(actionIdentity)
+        }
         val availability = bankAlertAddAvailability(settings)
+        val addAreaAvailability = if (bankSelectionSettled(selection, actionIdentity)) availability else BankAlertAddAvailability.Hidden
         val open = session.editor
         LaunchedEffect(session, open, settings) {
             if (open != null && session.editor === open) {
@@ -255,7 +279,7 @@ internal fun BankAlertSection(
             onDelete = { id -> if (actionIdentity != null && source.settings.value.identity == actionIdentity) source.delete(id) },
             notificationsBlocked = notificationAction.needsAction,
             onEnableNotifications = { notificationAction.run() },
-            addAvailability = availability,
+            addAvailability = addAreaAvailability,
             onAdd = {
                 val captured = source.settings.value.identity
                 if (session.alive && currentSession === session && session.editor == null && captured != null) {
@@ -263,9 +287,10 @@ internal fun BankAlertSection(
                         val live = source.settings.value
                         if (session.alive && currentSession === session && session.editor == null &&
                             live.identity == captured &&
-                            bankAlertAddAvailability(live) is BankAlertAddAvailability.Available
+                            bankAlertAddAvailability(live) is BankAlertAddAvailability.Available &&
+                            bankSelectionSettled(source.bankSelection.value, captured)
                         ) {
-                            session.editor = OpenBankAlertEditor(BankAlertEditorMode.Add, captured)
+                            session.editor = OpenBankAlertEditor(BankAlertEditorMode.Add, captured, bankSelectionSeed(source.bankSelection.value))
                         }
                     }
                 }
@@ -316,6 +341,7 @@ internal fun BankAlertSection(
                     saving = outcome == BankAlertSaveOutcome.Pending,
                     errorMessage = open.error,
                     remaining = bankAlertSheetRemaining(mode, availability),
+                    addBank = open.seed,
                     onSubmit = { input ->
                         notificationAction.run {
                             val live = source.settings.value

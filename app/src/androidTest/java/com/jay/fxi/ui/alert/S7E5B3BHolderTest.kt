@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.hasTestTag
@@ -89,6 +90,11 @@ class S7E5B3BHolderTest {
         private fun request() = BankAlertSaveRequest().also { r -> immediate?.let { r.finish(it) }; handles += r }
         override fun add(draft: BankAlertDraft) = request().also { adds += draft }
         override fun edit(id: Int, edit: BankAlertEdit) = request().also { edits += id to edit }
+        override val bankSelection = MutableStateFlow<com.jay.fxi.data.local.BankSelectionSnapshot>(com.jay.fxi.data.local.BankSelectionSnapshot.None)
+        // S7 E5b4b: an empty store - each prepare settles on no remembered bank, so Add opens on KB as before.
+        override suspend fun prepareBankSelection(identity: AuthIdentityFence) {
+            bankSelection.value = com.jay.fxi.data.local.BankSelectionSnapshot.Ready(identity, 1, null)
+        }
     }
 
     private val tab = mutableStateOf(FreeTab.USD)
@@ -110,8 +116,17 @@ class S7E5B3BHolderTest {
     private fun count(tag: String) = compose.onAllNodes(hasTestTag(tag), useUnmergedTree = true).fetchSemanticsNodes().size
     private fun texts(text: String) = compose.onAllNodes(hasText(text), useUnmergedTree = true).fetchSemanticsNodes().size
     private fun tap(tag: String) { compose.onNodeWithTag(tag, useUnmergedTree = true).performClick(); compose.waitForIdle() }
-    private fun textOf(tag: String): String = compose.onNodeWithTag(tag, useUnmergedTree = true).fetchSemanticsNode().let { n ->
-        (n.config.getOrNull(SemanticsProperties.EditableText)?.text ?: n.config.getOrNull(SemanticsProperties.Text)?.joinToString("") { it.text }).orEmpty()
+    /**
+     * A tag's own text, else the text merged into its node: the condition toggle is a clickable Row whose text is its
+     * children's, which the own-text read alone saw as empty (E5b4b device run 1, S01). The condition must read non-empty.
+     */
+    private fun textOf(tag: String): String {
+        fun SemanticsNode.own() = (config.getOrNull(SemanticsProperties.EditableText)?.text
+            ?: config.getOrNull(SemanticsProperties.Text)?.joinToString("") { it.text }).orEmpty()
+        val text = compose.onNodeWithTag(tag, useUnmergedTree = true).fetchSemanticsNode().own()
+            .ifEmpty { compose.onNodeWithTag(tag, useUnmergedTree = false).fetchSemanticsNode().own() }
+        assertTrue("$tag: 조건 문구를 읽지 못했다", tag != AlertAddSheetTags.CONDITION || text.isNotEmpty())
+        return text
     }
     private fun update(block: () -> Unit) { compose.runOnIdle(block); compose.waitForIdle() }
     private fun finish(source: FakeSource, outcome: BankAlertSaveOutcome) = update { source.handles.last().finish(outcome) }

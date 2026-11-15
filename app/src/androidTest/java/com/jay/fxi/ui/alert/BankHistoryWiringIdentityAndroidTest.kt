@@ -112,6 +112,11 @@ class BankHistoryWiringIdentityAndroidTest {
                 override fun setEnabled(id: Int, enabled: Boolean) {}
                 override fun add(draft: com.jay.fxi.data.alerts.BankAlertDraft): com.jay.fxi.data.alerts.BankAlertSaveRequest = error("S7 E5b3b: not used here")
                 override fun edit(id: Int, edit: com.jay.fxi.data.alerts.BankAlertEdit): com.jay.fxi.data.alerts.BankAlertSaveRequest = error("S7 E5b3b: not used here")
+                override val bankSelection = MutableStateFlow<com.jay.fxi.data.local.BankSelectionSnapshot>(com.jay.fxi.data.local.BankSelectionSnapshot.None)
+                // S7 E5b4b: an empty store - each prepare settles on no remembered bank, so Add opens on KB as before.
+                override suspend fun prepareBankSelection(identity: AuthIdentityFence) {
+                    bankSelection.value = com.jay.fxi.data.local.BankSelectionSnapshot.Ready(identity, 1, null)
+                }
                 override fun delete(id: Int) {}
             }
         }

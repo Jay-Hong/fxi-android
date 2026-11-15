@@ -1137,18 +1137,23 @@ class AlertN1StructureTest {
             return v
         }
 
-        /** S11: the agreed production `@Inject` delegations, squashed (API r1 §3–§6; r2/r3 §4–§6; S7 E5a2 API r3 §4.1 mutations; S7 E5b1 API §6 create·edit; S7 E5b2a API §2.4 foreground hook). */
+        /**
+         * S11: the agreed production `@Inject` delegations, squashed (API r1 §3–§6; r2/r3 §4–§6; S7 E5a2 API r3 §4.1 mutations; S7 E5b1 API §6
+         * create·edit; S7 E5b2a API §2.4 foreground hook; S7 E5b4b API §2.5 the memory's Add hand-over and its fixed-message report).
+         */
         val INJECT_FORMS: Map<String, String> by lazy {
             mapOf(
                 OWNER to """@Inject constructor(repository: AlertRepository, access: AlertSettingsAccess, floor: AlertRateLimitFloor,
-                    coordinator: PremiumAccessCoordinator, topic: TopicRuntimeOwner) : this({ owner, admitted -> repository.getSettings(owner, admitted) },
+                    coordinator: PremiumAccessCoordinator, topic: TopicRuntimeOwner, memory: LastSelectedBankMemory) : this({ owner, admitted -> repository.getSettings(owner, admitted) },
                     access, floor, AlertRetryPolicy(), SystemClock::elapsedRealtime, { Random.nextDouble(-0.2, 0.2) },
                     CoroutineScope(SupervisorJob() + Dispatchers.Main), { delay(it) }, coordinator.state, coordinator.accessRevisions,
                     topic.graphHost.map { it != null },
                     { owner, id, enabled, admitted -> repository.updateSettingPartial(owner, id, AlertSettingUpdateRequest(isEnabled = enabled), admitted) },
                     { owner, id, admitted -> repository.deleteSetting(owner, id, admitted) },
                     { owner, request, admitted -> repository.createSetting(owner, request, admitted) },
-                    { owner, id, request, admitted -> repository.updateSettingPartial(owner, id, request, admitted) })""",
+                    { owner, id, request, admitted -> repository.updateSettingPartial(owner, id, request, admitted) },
+                    rememberAddedBank = memory::acceptAddedBank,
+                    reportRememberFailure = { Log.w(TAG, "Last selected bank not accepted") })""",
                 ACCESS to """@Inject constructor(tokens: AuthTokenProvider, topic: TopicRuntimeOwner, uses: TopicUseAuthority,
                     coordinator: PremiumAccessCoordinator, deletions: DeletionAdmissionStore) : this(tokens::currentIdentityFence,
                     topic.currentAccessFence, uses, { coordinator.state.value }, { ReleaseAdmission.isOpen },
@@ -1180,9 +1185,19 @@ class AlertN1StructureTest {
                 if (code[path]?.let(::injectDelegation)?.let(::squash) != form) v += "S11-inject $path"
             }
             val owner = code[OWNER].orEmpty()
-            if (count(owner, """\bprivate\s+val\s+accessRecheckMillis\s*:\s*Long\s*=\s*(?:1_000|1000)\s*,?\s*\)""") != 1 ||
+            // S7 E5b4b: the two hand-over parameters follow the recheck period, each with its inert default for tests.
+            if (count(owner, """\bprivate\s+val\s+accessRecheckMillis\s*:\s*Long\s*=\s*(?:1_000|1000)\s*,\s*""" +
+                    """private\s+val\s+rememberAddedBank\s*:\s*\(\s*AuthIdentityFence\s*,\s*String\s*\)\s*->\s*Unit\s*=\s*\{\s*_\s*,\s*_\s*->\s*\}\s*,\s*""" +
+                    """private\s+val\s+reportRememberFailure\s*:\s*\(\s*Throwable\s*\)\s*->\s*Unit\s*=\s*\{\s*\}\s*,?\s*\)""") != 1 ||
                 count(owner, """\baccessRecheckMillis\b""") < 2) {
                 v += "S11-recheck"
+            }
+            // S7 E5b4b API §2.5: the production constructor marks the memory's consumer bound once, as its whole body.
+            val delegation = injectDelegation(owner)
+            val afterDelegation = delegation?.let { owner.substring(owner.indexOf(it) + it.length) }.orEmpty()
+            if (!Regex("""^\s*\{\s*memory\s*\.\s*markConsumerBound\s*\(\s*\)\s*\}""").containsMatchIn(afterDelegation) ||
+                count(owner, """\bmarkConsumerBound\b""") != 1) {
+                v += "S11-bound"
             }
             val fcm = code[FCM].orEmpty()
             val receive = bodyRange(fcm, "onMessageReceived")?.let { squash(fcm.substring(it)) }.orEmpty()

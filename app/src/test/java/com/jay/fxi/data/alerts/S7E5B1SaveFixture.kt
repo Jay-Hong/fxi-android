@@ -150,6 +150,11 @@ internal abstract class S7E5B1SaveFixture {
         }
 
         private val job = SupervisorJob()
+        /** S7 E5b4b: each Add hand-over, with the outcome its request held at that moment (null when none is watched). */
+        val accepted = mutableListOf<Triple<AuthIdentityFence, String, BankAlertSaveOutcome?>>()
+        var watched: BankAlertSaveRequest? = null
+        var acceptFailure: Exception? = null
+        val acceptReports = mutableListOf<Throwable>()
         val owner = BankAlertSettingsOwner(
             { who, admitted -> scripted(Call("GET", who, null, null, admitted)) },
             access, floor, AlertRetryPolicy(), { test.testScheduler.currentTime }, { 0.0 },
@@ -160,7 +165,12 @@ internal abstract class S7E5B1SaveFixture {
             { who, id, admitted -> scripted(Call("DELETE", who, id, null, admitted)) },
             { who, request, admitted -> scripted(Call("POST", who, null, request, admitted)) },
             { who, id, request, admitted -> scripted(Call("EDIT", who, id, request, admitted)) },
-            RECHECK
+            RECHECK,
+            rememberAddedBank = { who, bank ->
+                acceptFailure?.let { throw it }
+                accepted += Triple(who, bank, watched?.outcome?.value)
+            },
+            reportRememberFailure = { acceptReports += it }
         )
 
         /** Every manual outcome the owner emits, collected eagerly (S7 E5b1 gap hunt G23). */

@@ -188,11 +188,11 @@ class UserIntentDataStoreStructureTest {
         assertEquals("은행 파일이 W1 밖이다", emptySet<String>(), w1Violations(bank))
     }
 
-    /** E5b4a is dormant: nothing in production reads, writes or binds the bank store yet. */
+    /** S7 E5b4b: the process memory is the bank store's one consumer; nothing else in production names the store. */
     @Test
-    fun theBankStoreHasNoConsumerYet() {
+    fun theBankStoreIsReachedOnlyThroughTheMemory() {
         assertEquals(
-            setOf(LAST_BANK),
+            setOf(LAST_BANK, BASE + "data/local/LastSelectedBankMemory.kt"),
             sites("""\b(?:DataStore)?LastSelectedBankStore\b""").keys
         )
     }

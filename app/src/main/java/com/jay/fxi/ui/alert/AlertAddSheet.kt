@@ -119,11 +119,12 @@ internal fun AlertAddSheet(
     saving: Boolean,
     errorMessage: String?,
     remaining: Int?,
+    addBank: String? = null,
     onSubmit: (BankAlertEditorInput) -> Unit,
     onErrorDismiss: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    var input by remember(mode) { mutableStateOf(BankAlertEditor.initial(mode, quotes)) }
+    var input by remember(mode) { mutableStateOf(BankAlertEditor.initial(mode, quotes, addBank)) }
     val check = BankAlertEditor.check(mode, input, currency, quotes, existing)
     val canSave = check.canSave && !saving
     val thresholdColor = when (BankAlertEditor.tone(check)) {

@@ -1,12 +1,14 @@
 package com.jay.fxi.data.alerts
 
 import android.os.SystemClock
+import android.util.Log
 import com.jay.fxi.data.auth.AuthIdentityChangedException
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.auth.AuthUnavailableException
 import com.jay.fxi.data.entitlements.OwnedPremiumAccess
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.PremiumAccessState
+import com.jay.fxi.data.local.LastSelectedBankMemory
 import com.jay.fxi.data.remote.AuthenticatedEndpoint
 import com.jay.fxi.data.remote.TopicRuntimeOwner
 import com.jay.fxi.data.remote.TopicUseWithheldException
@@ -124,14 +126,17 @@ internal class BankAlertSettingsOwner internal constructor(
     private val deleteRemote: suspend (AuthIdentityFence, Int, () -> Boolean) -> AuthBoundResult<Unit>,
     private val createRemote: suspend (AuthIdentityFence, AlertSettingRequest, () -> Boolean) -> AuthBoundResult<AlertSetting>,
     private val editRemote: suspend (AuthIdentityFence, Int, AlertSettingUpdateRequest, () -> Boolean) -> AuthBoundResult<AlertSetting>,
-    private val accessRecheckMillis: Long = 1_000
+    private val accessRecheckMillis: Long = 1_000,
+    private val rememberAddedBank: (AuthIdentityFence, String) -> Unit = { _, _ -> },
+    private val reportRememberFailure: (Throwable) -> Unit = {}
 ) : AlertFamilyAdapter {
     @Inject constructor(
         repository: AlertRepository,
         access: AlertSettingsAccess,
         floor: AlertRateLimitFloor,
         coordinator: PremiumAccessCoordinator,
-        topic: TopicRuntimeOwner
+        topic: TopicRuntimeOwner,
+        memory: LastSelectedBankMemory
     ) : this(
         { owner, admitted -> repository.getSettings(owner, admitted) },
         access,
@@ -147,8 +152,12 @@ internal class BankAlertSettingsOwner internal constructor(
         { owner, id, enabled, admitted -> repository.updateSettingPartial(owner, id, AlertSettingUpdateRequest(isEnabled = enabled), admitted) },
         { owner, id, admitted -> repository.deleteSetting(owner, id, admitted) },
         { owner, request, admitted -> repository.createSetting(owner, request, admitted) },
-        { owner, id, request, admitted -> repository.updateSettingPartial(owner, id, request, admitted) }
-    )
+        { owner, id, request, admitted -> repository.updateSettingPartial(owner, id, request, admitted) },
+        rememberAddedBank = memory::acceptAddedBank,
+        reportRememberFailure = { Log.w(TAG, "Last selected bank not accepted") }
+    ) {
+        memory.markConsumerBound()
+    }
 
     private val mutableState = MutableStateFlow(BankAlertSettingsState(AlertLoadPhase.Idle, null, null))
     val state: StateFlow<BankAlertSettingsState> = mutableState.asStateFlow()
@@ -633,6 +642,11 @@ internal class BankAlertSettingsOwner internal constructor(
                             createReservations.remove(op.token)
                             mutableState.value = state.copy(settings = next)
                         }
+                        try {
+                            rememberAddedBank(op.identity, row.bank)
+                        } catch (failure: Exception) {
+                            reportRememberFailure(failure)
+                        }
                         op.handle.finish(BankAlertSaveOutcome.Saved(row.copy()))
                     }
                     is MutationResult.Failed -> {
@@ -663,6 +677,10 @@ internal class BankAlertSettingsOwner internal constructor(
                 afterMutation(op.identity)
             }
         }
+    }
+
+    private companion object {
+        const val TAG = "BankAlertSettingsOwner"
     }
 
     private fun invalidRow() =

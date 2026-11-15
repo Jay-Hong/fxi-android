@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "7d73000a2eb301d36e66d40277ddf26244dbd297297bab4daaa20205ac9aecaf"
+    const val APPROVED_SHA256 = "a52d5d5af9ad261484fec1a1d06a75c7ad2b81e100c78d68458855255d487dfe"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -102,7 +102,13 @@ internal object PostS6ApprovedDelta {
         "aa27fd5f9d0324c70e5faee08106679cce0407b1093249b9b800131171f9dfbd",
         "911158ec110e3f1c752f24df933a88a43a03d8daacc4f7e4dff983709697bba1",
         "a176ee432d52ef660f415bf8496803679fc0f09d61c8cf1eacd991dd2944af46",
-        "099a6869a8fe0c27547f1e8f59974b251083610040e6d9b1950cc285df066a47"
+        "099a6869a8fe0c27547f1e8f59974b251083610040e6d9b1950cc285df066a47",
+        "0372d88598f03e74a84c901df558bbda8ab21d073bc01ad6bc0dd4a453c6622c",
+        "86f6cfb30dcf10d17a56ae135d0898fc263790fdc0b4275a93e9b500c66ff2a9",
+        "40a4b5a45d95fb36fbff78bb40e044be45c89ab2f1a09a365a56dea9e6831a06",
+        "ec85f148ca746fb4f53358e7b94b83c6399bf7c3147a616abb28aa8aa4002803",
+        "94723eccf2713da07b9c8a5a1637a695ec9eb94eb74b3fa9367246c13d9ce1a5",
+        "04797d3ba52391471e769ef644faca19165ff4f1866c8859fd7d232837c32590"
     )
 
     /**

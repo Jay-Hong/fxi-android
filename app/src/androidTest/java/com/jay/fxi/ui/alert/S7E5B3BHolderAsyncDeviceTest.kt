@@ -3,10 +3,12 @@ package com.jay.fxi.ui.alert
 import android.content.Context
 import android.os.Build
 import android.os.SystemClock
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.hasTestTag
@@ -42,6 +44,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Rule
@@ -99,6 +102,11 @@ class S7E5B3BHolderAsyncDeviceTest {
         override fun delete(id: Int) = Unit
         override fun add(draft: BankAlertDraft) = BankAlertSaveRequest().also { adds += draft; handles += it }
         override fun edit(id: Int, edit: BankAlertEdit) = BankAlertSaveRequest().also { edits += id to edit; handles += it }
+        override val bankSelection = MutableStateFlow<com.jay.fxi.data.local.BankSelectionSnapshot>(com.jay.fxi.data.local.BankSelectionSnapshot.None)
+        // S7 E5b4b: an empty store - each prepare settles on no remembered bank, so Add opens on KB as before.
+        override suspend fun prepareBankSelection(identity: AuthIdentityFence) {
+            bankSelection.value = com.jay.fxi.data.local.BankSelectionSnapshot.Ready(identity, 1, null)
+        }
         fun calls() = listOf(ensures, authoritatives, manuals)
     }
 
@@ -161,18 +169,51 @@ class S7E5B3BHolderAsyncDeviceTest {
         val end = SystemClock.uptimeMillis() + TIMEOUT
         while (SystemClock.uptimeMillis() < end) {
             compose.waitForIdle()
-            if (condition()) return
+            val ready = try {
+                condition()
+            } catch (e: IllegalStateException) {
+                // A system dialog still over the app leaves no compose root to query for a while (E5b4b device run 1, D06).
+                if (e.message?.startsWith("No compose hierarchies found") == true) false else throw e
+            }
+            if (ready) return
             SystemClock.sleep(100)
         }
         dump(label)
         assertTrue("$label (UI dump /sdcard/e5b3b_$label.xml)", condition())
     }
 
+    /**
+     * Clicks the system dialog's [name] button and waits for that button to go. A click the busy emulator did not apply leaves it
+     * up; it is found again and clicked again, three clicks at most in all (E5b4b device run 1, D06: `clickedButton=0`). The
+     * button going is not the decision: the callers still assert the callback, its owner and the capability.
+     */
+    private fun clickSystem(label: String, name: String) {
+        val selector = By.res(java.util.regex.Pattern.compile(".*permissioncontroller:id/$name"))
+        for (clicks in 1..3) {
+            need(if (clicks == 1) label else "$label-retry$clicks", systemButton(name)).click()
+            if (device.wait(Until.gone(selector), TIMEOUT)) {
+                Log.i(RIG_TAG, "$label: $name gone after $clicks click(s)")
+                return
+            }
+        }
+        dump("$label-stuck")
+        fail("$label: $name is still up after 3 clicks (UI dump /sdcard/e5b3b_$label-stuck.xml)")
+    }
+
     private fun count(tag: String) = compose.onAllNodes(hasTestTag(tag), useUnmergedTree = true).fetchSemanticsNodes().size
     private fun texts(text: String) = compose.onAllNodes(hasText(text), useUnmergedTree = true).fetchSemanticsNodes().size
     private fun tap(tag: String) { compose.onNodeWithTag(tag, useUnmergedTree = true).performClick(); compose.waitForIdle() }
-    private fun textOf(tag: String): String = compose.onNodeWithTag(tag, useUnmergedTree = true).fetchSemanticsNode().let { n ->
-        (n.config.getOrNull(SemanticsProperties.EditableText)?.text ?: n.config.getOrNull(SemanticsProperties.Text)?.joinToString("") { it.text }).orEmpty()
+    /**
+     * A tag's own text, else the text merged into its node: the condition toggle is a clickable Row whose text is its
+     * children's, which the own-text read alone saw as empty (E5b4b device run 1, S01). The condition must read non-empty.
+     */
+    private fun textOf(tag: String): String {
+        fun SemanticsNode.own() = (config.getOrNull(SemanticsProperties.EditableText)?.text
+            ?: config.getOrNull(SemanticsProperties.Text)?.joinToString("") { it.text }).orEmpty()
+        val text = compose.onNodeWithTag(tag, useUnmergedTree = true).fetchSemanticsNode().own()
+            .ifEmpty { compose.onNodeWithTag(tag, useUnmergedTree = false).fetchSemanticsNode().own() }
+        assertTrue("$tag: 조건 문구를 읽지 못했다", tag != AlertAddSheetTags.CONDITION || text.isNotEmpty())
+        return text
     }
     private fun sheetOpen() = count(AlertAddSheetTags.SAVE) == 1
 
@@ -209,8 +250,8 @@ class S7E5B3BHolderAsyncDeviceTest {
         return allow
     }
 
-    private fun allowAndWait(rig: Rig, allow: UiObject2) {
-        allow.click()
+    private fun allowAndWait(rig: Rig, @Suppress("UNUSED_PARAMETER") allow: UiObject2) {
+        clickSystem("allow-click", "permission_allow_button")
         waitUntil("allow-result") { rig.results.isNotEmpty() }
         returnToApp()
         compose.waitForIdle()
@@ -277,7 +318,7 @@ class S7E5B3BHolderAsyncDeviceTest {
         mount(rig, mutableStateOf(source))
         openEditAndChange()
         saveUntilTheSystemAsks(rig, source)
-        need("deny", systemButton("permission_deny_button")).click()
+        clickSystem("deny", "permission_deny_button")
         waitUntil("denied") { count(NotificationPermissionTags.DENIED_DIALOG) == 1 }
         tap(NotificationPermissionTags.DENIED_CANCEL)
         assertEquals("nothing sent, the draft stays, nothing saving", listOf(0, true, 0, 0, "알림 수정"),
@@ -387,7 +428,7 @@ class S7E5B3BHolderAsyncDeviceTest {
         val base = source.calls()
         openEditAndChange()
         saveUntilTheSystemAsks(rig, source)
-        need("deny", systemButton("permission_deny_button")).click()
+        clickSystem("deny", "permission_deny_button")
         waitUntil("denied") { count(NotificationPermissionTags.DENIED_DIALOG) == 1 }
         tap(NotificationPermissionTags.DENIED_SETTINGS)
         need("settings", if (device.wait(Until.hasObject(By.pkg(SETTINGS).depth(0)), TIMEOUT)) true else null)
@@ -406,7 +447,7 @@ class S7E5B3BHolderAsyncDeviceTest {
         assertEquals("only a new click reaches the helper; nothing sent yet", 0, source.edits.size)
         // The new click goes on to the system and is allowed: exactly that one save is sent, once.
         tap(NotificationPermissionTags.EXPLAIN_CONTINUE)
-        need("allow-after-settings", systemButton("permission_allow_button")).click()
+        clickSystem("allow-after-settings", "permission_allow_button")
         waitUntil("a8-second-result") { rig.results.size == 2 }
         returnToApp()
         compose.waitForIdle()
@@ -421,6 +462,7 @@ class S7E5B3BHolderAsyncDeviceTest {
     private companion object {
         const val SETTINGS = "com.android.settings"
         const val TIMEOUT = 10_000L
+        const val RIG_TAG = "E5b3bRig"
         const val CONTAMINATED = "e5b2b1_contaminated"
         val A = AuthIdentityFence("A", 1L)
 

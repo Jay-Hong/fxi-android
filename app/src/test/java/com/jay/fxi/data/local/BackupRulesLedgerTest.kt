@@ -3,7 +3,12 @@ package com.jay.fxi.data.local
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.w3c.dom.Element
+import org.xml.sax.InputSource
 import java.io.File
+import java.io.StringReader
+import java.util.SortedSet
+import javax.xml.parsers.DocumentBuilderFactory
 
 /**
  * Every DataStore this app keeps, and whether it is meant to cross devices.
@@ -26,7 +31,7 @@ class BackupRulesLedgerTest {
      */
     private val expected = mapOf(
         // v2, UID-scoped: each file names its owner and refuses to answer anyone else.
-        "fxi_user_intent" to true,       // rate row order and hidden set
+        "fxi_user_intent" to true,       // rate row order and hidden set; last selected bank, owner-stamped per concern
         "fxi_free_graph" to true,        // which graph series the free surface draws
         "fxi_free_tab" to true,          // the tab to reopen on
 
@@ -58,10 +63,10 @@ class BackupRulesLedgerTest {
         // `RetiredStores`, and `theRetiredStoresAreAlsoKeptOutOfBackup` below for why both.
         "fxi_bank_preferences" to false,
 
-        // The shared v1 cache: S3 deletes its retired rate keys; last-bank preferences remain.
-        // Two slices share it: `ANDROID_V2_PLAN.md` §9.1 gives `rates`/`rates_timestamp` to **S3**
-        // and `last_bank_*` to **S7**. Backup exclusion for the remaining keys is outside S3.
-        "fxi_cache" to true
+        // The shared v1 cache: S3 deletes its retired rate keys and S7 E5b4b its `last_bank_*` keys, which carry no UID.
+        // `ANDROID_V2_PLAN.md` §9.1 keeps legacy cache out of backup, so a restore cannot bring the keys back to another
+        // install. The re-sweep after LEGACY_DELETED still stays: an older backup, a downgrade or a retired writer can.
+        "fxi_cache" to false
     )
 
     private val main = File("src/main")
@@ -86,27 +91,84 @@ class BackupRulesLedgerTest {
     fun theExclusionsMatchTheLedger() {
         val mustNotTravel = expected.filterValues { !it }.keys
             .map { "datastore/$it.preferences_pb" }.toSortedSet()
+        // The ledger itself: §9.1 keeps the journal home, and user intent is what travels.
+        assertTrue("원장이 journal 을 내보낸다", "datastore/fxi_migration_journal.preferences_pb" in mustNotTravel)
+        assertTrue("원장이 user intent 를 막는다", "datastore/fxi_user_intent.preferences_pb" !in mustNotTravel)
 
         // API ≤30: one list for the whole file.
-        assertEquals(
-            "backup_rules.xml 의 제외 목록이 원장과 다르다",
-            mustNotTravel, excludedIn(File(main, "res/xml/backup_rules.xml").readText())
-        )
+        val backup = parse(File(main, "res/xml/backup_rules.xml").readText())
+        assertEquals("full-backup-content", backup.tagName)
+        assertEquals("backup_rules.xml 의 제외 목록이 원장과 다르다", mustNotTravel, excludedIn(backup))
 
         // API 31+: two blocks, checked apart. Reading the file as one list would pass with a rule
         // present in only one of them — and then the store crosses on a device transfer while
         // staying out of a cloud backup, or the other way round. Found by review.
-        val rules = File(main, "res/xml/data_extraction_rules.xml").readText()
-        listOf("cloud-backup", "device-transfer").forEach { block ->
-            val body = Regex("<$block>(.*?)</$block>", RegexOption.DOT_MATCHES_ALL)
-                .find(rules)?.groupValues?.get(1)
-                ?: error("data_extraction_rules.xml 에 <$block> 블록이 없다")
-            assertEquals("<$block> 의 제외 목록이 원장과 다르다", mustNotTravel, excludedIn(body))
+        val rules = parse(File(main, "res/xml/data_extraction_rules.xml").readText())
+        assertEquals("data-extraction-rules", rules.tagName)
+        val blocks = childElements(rules)
+        assertEquals("블록이 하나씩 있어야 한다", listOf("cloud-backup", "device-transfer"), blocks.map { it.tagName })
+        blocks.forEach { block ->
+            assertEquals("<${block.tagName}> 의 제외 목록이 원장과 다르다", mustNotTravel, excludedIn(block))
         }
     }
 
-    private fun excludedIn(xml: String) =
-        EXCLUDE.findAll(xml).map { it.groupValues[1] }.toSortedSet()
+    /**
+     * A rule left only inside an XML comment is not a rule. These inputs keep the commented tag's text whole, so a scan of
+     * the raw text would still count it; only a parse that reads elements tells them apart.
+     */
+    @Test
+    fun anExcludeLeftOnlyInACommentDoesNotCount() {
+        val cache = "datastore/fxi_cache.preferences_pb"
+        val backupText = File(main, "res/xml/backup_rules.xml").readText()
+        val backupCommented = commentOut(backupText, null, cache)
+        assertEquals("fixture 가 태그 글자를 지웠다", backupText.split(cache).size, backupCommented.split(cache).size)
+        assertTrue(cache in excludedIn(parse(backupText)))
+        assertTrue("주석 속 exclude 를 셌다", cache !in excludedIn(parse(backupCommented)))
+
+        val rulesText = File(main, "res/xml/data_extraction_rules.xml").readText()
+        listOf("cloud-backup", "device-transfer").forEach { block ->
+            val commented = commentOut(rulesText, block, cache)
+            assertEquals("fixture 가 태그 글자를 지웠다", rulesText.split(cache).size, commented.split(cache).size)
+            val parsed = childElements(parse(commented)).associateBy { it.tagName }
+            assertTrue("<$block> 주석 속 exclude 를 셌다", cache !in excludedIn(parsed.getValue(block)))
+            val other = parsed.keys.single { it != block }
+            assertTrue("<$other> 의 실제 exclude 를 잃었다", cache in excludedIn(parsed.getValue(other)))
+        }
+    }
+
+    /** The parsed document's root. Comments are dropped by the parser; DOCTYPE is refused. */
+    private fun parse(xml: String): Element {
+        val factory = DocumentBuilderFactory.newInstance()
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+        factory.isIgnoringComments = true
+        return factory.newDocumentBuilder().parse(InputSource(StringReader(xml))).documentElement
+    }
+
+    private fun childElements(parent: Element): List<Element> =
+        (0 until parent.childNodes.length).map { parent.childNodes.item(it) }.filterIsInstance<Element>()
+
+    /** The paths [block]'s own child elements exclude. Anything but a file `<exclude>`, or a repeat, fails. */
+    private fun excludedIn(block: Element): SortedSet<String> {
+        val children = childElements(block)
+        children.forEach {
+            assertEquals("<${block.tagName}> 안에 exclude 아닌 요소", "exclude", it.tagName)
+            assertEquals("domain 이 file 이 아니다: ${it.getAttribute("path")}", "file", it.getAttribute("domain"))
+        }
+        val paths = children.map { it.getAttribute("path") }
+        assertEquals("<${block.tagName}> 에 같은 exclude 가 둘", paths.size, paths.toSet().size)
+        return paths.toSortedSet()
+    }
+
+    /** [xml] with [path]'s exclude tag, inside [block] when one is named, wrapped in a comment. */
+    private fun commentOut(xml: String, block: String?, path: String): String {
+        val tag = "<exclude domain=\"file\" path=\"$path\" />"
+        val start = if (block == null) 0 else xml.indexOf("<$block>")
+        val end = if (block == null) xml.length else xml.indexOf("</$block>", start)
+        check(start >= 0 && end >= 0) { "fixture: <$block> 없음" }
+        val at = xml.indexOf(tag, start)
+        check(at in start until end) { "fixture: $tag 가 <$block> 안에 없다" }
+        return xml.substring(0, at) + "<!-- " + tag + " -->" + xml.substring(at + tag.length)
+    }
 
     /**
      * Nothing this app deletes on start is also carried between devices.
@@ -169,6 +231,5 @@ class BackupRulesLedgerTest {
     private companion object {
         val DECLARATION =
             Regex("preferencesDataStore\\(\\s*name\\s*=\\s*(?:\"([^\"]*)\"|([A-Za-z_][A-Za-z0-9_]*))")
-        val EXCLUDE = Regex("<exclude\\s+domain=\"file\"\\s+path=\"([^\"]+)\"")
     }
 }
