@@ -86,7 +86,7 @@ S1 미충족                     : `UnimplementedScopePurger`가 `Deferred` 반�
                                 이 관측만으로 운영 결함을 확정하지 않는다
 S1.5 확인 필요                : presenter·순서/표시 설정·legacy bank store 삭제는 land. `RateSourceRegistry`와
                                 live/snapshot renderMode 등가까지 포함한 전체 DoD 충족은 미확인
-S2 미충족                     : D26 무료 알림 in-memory 미리보기 미구현 · 마지막 탭은 `(owner_uid, last_tab)` 한 쌍이라
+S2 미충족                     : D26 무료 알림 in-memory 미리보기는 은행 family만 land(S7 E5d `227329b`, 테더·비교는 S8·S9) · 마지막 탭은 `(owner_uid, last_tab)` 한 쌍이라
                                 계정 간 혼입은 막지만 **§7 S2 DoD의 "UID별 마지막 탭 복원"은 미충족**
                                 (`FreeTabStore` KDoc은 의도적 선택이라 적지만, 그것이 DoD를 완화하지는 않는다)
 Server implementation         : NOT STARTED — SV 슬라이스 착수 GO 대기. SV-1/SV-2는 공개 rollout 차단 조건
@@ -148,7 +148,7 @@ Non-blocking architecture     : SV-0 중앙 evaluator 전환(O1) · SV-3 알림 
 > 멈춰 있어 현재 위치를 설명하지 못했다. S1·S1.5·S2의 구현이 land했고 S3는 a~k-1까지 `origin/main`에 있다.
 >
 > **구현 커밋의 land는 슬라이스 완료가 아니다.** 그래서 머리말은 land와 미충족을 나눠 적는다 — S1은 실제
-> purge·`AccessEffect.PushDelete` 실행·D27 파일 단위 allowlist가, S2는 D26 in-memory preview와 §7 S2 DoD의
+> purge·`AccessEffect.PushDelete` 실행·D27 파일 단위 allowlist가, S2는 D26 in-memory preview(은행 family는 S7 E5d `227329b`에서 land, 테더·비교는 S8·S9)와 §7 S2 DoD의
 > "UID별 마지막 탭 복원"이 미충족이다. S1.5는 주요 구현이 land했으나 전체 DoD 충족은 미확인이다.
 > 코드에 적힌 세 유예 사유는 서로 다르므로 각각 적는다 — purge는 대상이 아직 legacy rate/graph store,
 > PushDelete는 **서버 D21 순서 계약 미결**(`PremiumAccessCoordinator` 클래스 KDoc — 8번 기록에서 좌표 정정), backup은 기존 사용자 설정의

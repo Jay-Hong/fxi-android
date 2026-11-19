@@ -171,6 +171,7 @@ triggered 시: "알림 발송됨" 배지
 > - **진입 연결(S7 E5b3b):** section의 "알림 추가" 버튼과 빈 목록의 권한 prompt 버튼이 추가 sheet를, 행의 은행·조건 영역이 그 행의 편집 sheet를 연다. 남은 수가 3 이하면 버튼에 "(n개 남음)"을 붙이고, 30개(전 통화 id 수)면 버튼 대신 "최대 30개까지 설정할 수 있습니다"를 보인다.
 > - **현재가 전달:** presenter가 그 탭의 은행 현재가(숨긴 행 포함, finite·양수)를 `alertQuotes`로 넘기고, holder가 그대로 sheet에 준다.
 > - **편집기 수명:** holder가 sheet를 한 번만 부른다. 편집기는 source·통화마다 새로 시작하고 복원하지 않으며, identity가 바뀌거나 편집 중인 행이 그 통화에서 사라지면 닫는다. 저장 결과 문구는 고정 3종이다.
+> - **공유 본문(S7 E5d):** 편집 본문은 `BankAlertEditorFields`에 있고, `AlertAddSheet`와 무료 은행 탭의 미리보기 시트 `FreeBankAlertPreviewSheet`가 각각 한 번 부른다. 미리보기 시트에는 저장이 없고 하단에 `SubscribeCTA`만 있다(D26). premium 시트는 본문을 옮겼을 뿐 입력·판정 규칙은 위와 같다.
 
 ### 레이아웃 개요
 
