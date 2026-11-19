@@ -1,5 +1,6 @@
 package com.jay.fxi.ui.free
 
+import com.jay.fxi.BuildConfig
 import java.io.File
 import java.security.MessageDigest
 import org.junit.Assert.assertEquals
@@ -17,6 +18,12 @@ import org.junit.Test
  * class initialiser, and no app class of a capability D26 keeps at zero may appear at all.
  *
  * Each run also writes what it saw to `build/s7e5d_closure_report/`, for that review.
+ *
+ * The library members used are sealed per build type ([USES_SEAL], `closure_review.md` 개정 4): the members a class calls
+ * follow the library versions its variant compiles against, and those differ by build type with the catalog unchanged.
+ * Only debug adds debugImplementation(ui-tooling, ui-test-manifest); dependencyInsight shows foundation 1.9.2 for debug
+ * and 1.7.2 for ciMinified and benchmark. The s5Benchmark uses report matches benchmark's. Every other list stays common
+ * to all four and is checked on each run.
  */
 class S7E5DBytecodeClosureTest {
 
@@ -64,7 +71,7 @@ class S7E5DBytecodeClosureTest {
         val forbidden = result.appClasses.filter { FORBIDDEN_APP.containsMatchIn(it) }
         assertEquals("D26 이 0으로 두는 capability 의 class", emptyList<String>(), forbidden)
         for ((name, text) in report) {
-            val sealed = resource(name)
+            val sealed = resource(if (name == "closure_uses.txt") usesSeal() else name)
             assertEquals("$name 이 봉인과 다르다 — build/s7e5d_closure_report/$name 을 검토하라", sealed, text)
         }
         val review = resource("closure_review.md")
@@ -77,7 +84,7 @@ class S7E5DBytecodeClosureTest {
     fun theClosureCatchesEachWayOut() {
         val fixtures = closure.classesOf("com/jay/fxi/ui/free", "S7E5DClosureFixtures.kt")
         assertTrue("premise: fixture class 가 있다 $fixtures", fixtures.isNotEmpty())
-        val sealedUses = resource("closure_uses.txt").lines().filter { it.isNotBlank() }.toSet()
+        val sealedUses = resource(usesSeal()).lines().filter { it.isNotBlank() }.toSet()
 
         val reflection = closure.close(listOf("com/jay/fxi/ui/free/S7E5DClosureFixtureReflection"))
         val reflected = reflection.uses.map { it.toString() }.filter { "java/lang/Class.forName" in it }
@@ -107,6 +114,10 @@ class S7E5DBytecodeClosureTest {
     private fun resource(name: String): String =
         javaClass.classLoader!!.getResourceAsStream("s7e5d/$name")?.readBytes()?.toString(Charsets.UTF_8) ?: "(sealed $name missing)"
 
+    /** This build type's sealed uses list; a build type without one fails rather than borrowing another's. */
+    private fun usesSeal(): String =
+        checkNotNull(USES_SEAL[BuildConfig.BUILD_TYPE]) { "build type ${BuildConfig.BUILD_TYPE} 의 closure_uses 봉인이 없다" }
+
     private fun sourceFile(path: String): File? = listOf("src/main/java/$path", "src/main/kotlin/$path").map(::File).firstOrNull { it.isFile }
 
     private companion object {
@@ -118,6 +129,14 @@ class S7E5DBytecodeClosureTest {
             "ui/alert/BankAlertEditorFields.kt"
         )
         const val VERSION_CATALOG = "../gradle/libs.versions.toml"
+
+        /** The sealed uses list of each build type the unit tests run under (see the class comment). */
+        val USES_SEAL = mapOf(
+            "debug" to "closure_uses.txt",
+            "ciMinified" to "closure_uses.release.txt",
+            "benchmark" to "closure_uses.release.txt",
+            "s5Benchmark" to "closure_uses.release.txt"
+        )
 
         /** App classes of what D26 keeps at zero for a free preview. Reaching any of them, by any path, fails. */
         val FORBIDDEN_APP = Regex(

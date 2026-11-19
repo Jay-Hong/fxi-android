@@ -520,8 +520,14 @@ androidComponents {
         lines.add("debuggable\t${variant.debuggable}")
         lines.add("minify\t${variant.isMinifyEnabled}")
         lines.add("shrink\t${variant.shrinkResources}")
-        // The invocation's own boundary (`s7e5dj_j2a.codex.r2.md` Q2-A): no init script and no included build can add an input.
-        lines.add("initScripts\t${gradle.startParameter.allInitScripts.size}")
+        // The invocation's own boundary (`s7e5dj_j2a.codex.r2.md` Q2-A): no included build, and no init script but those CI's
+        // gradle/actions/setup-gradle writes into the Gradle user home's init.d. Each init script is reported by its canonical
+        // path, with the user home, for the test to name.
+        val startParameter = gradle.startParameter
+        val initScripts = startParameter.allInitScripts
+        lines.add("initScripts\t${initScripts.size}")
+        lines.add("gradleUserHome\t${startParameter.gradleUserHomeDir.canonicalPath}")
+        lines.addAll(initScripts.map { "initScript\t${it.canonicalPath}" })
         lines.add("includedBuilds\t${gradle.includedBuilds.size}")
         for ((kind, flat) in listOf("java" to located.java, "kotlin" to located.kotlin, "resources" to located.resources)) {
             if (flat == null) lines.add("$kind\tabsent") else lines.addAll(flat.static.map { dirs -> dirs.map { location(kind, it.asFile) } })

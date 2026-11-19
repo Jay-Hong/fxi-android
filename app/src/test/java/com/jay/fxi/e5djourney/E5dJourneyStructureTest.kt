@@ -27,8 +27,9 @@ import org.w3c.dom.Element
  *    each kind, keep the fixture and the shared directories apart, compile exactly one accessor each, and leave the journey
  *    debuggable and unminified (`s7e5dj_j2a.codex.r1.md` Q2-A). Where the model cannot be read (release resources), the script
  *    boundary stands in: exactly five Gradle scripts, no buildSrc or build-logic, no variant or source line outside the app's
- *    locked script, and no init script or included build in the invocation (`s7e5dj_j2a.codex.r2.md` Q2-A). Every file read
- *    here is an input of the Test task (Q2-B).
+ *    locked script, no included build in the invocation, and no init script in it but those CI's setup-gradle writes into
+ *    the Gradle user home's init.d, by name (`s7e5dj_j2a.codex.r2.md` Q2-A, amended for CI). Every file read here is an
+ *    input of the Test task (Q2-B).
  * 4. The accessor is declared nowhere in main, once in the default directory and once in the journey's.
  * 5. The control permission is signature; the control provider is one, exported at its one authority, bound to it, in the
  *    app's own process, and its call checks the permission itself before anything else; the old control receiver is gone; the
@@ -197,12 +198,18 @@ class E5dJourneyStructureTest {
 
     @Test
     fun three_modelNegatives() {
-        val real = variantReports().mapValues { checkNotNull(it.value) }
+        val observed = variantReports().mapValues { checkNotNull(it.value) }
+        assertEquals("premise: actual variant inputs", emptyList<String>(), modelProblems(observed))
+        val real = observed.mapValues { (_, r) ->
+            r.copy(values = r.values + ("initScripts" to "0"), initScripts = emptyList())
+        }
+        assertEquals("premise: no-init fixture", emptyList<String>(), modelProblems(real))
         val app = APP.toString()
         fun location(kind: String, lexical: String, canonical: String = lexical) = Location(kind, Path.of(lexical), Path.of(canonical))
         fun change(variant: String, edit: (VariantReport) -> VariantReport): Map<String, VariantReport?> =
             real + (variant to edit(real.getValue(variant)))
         fun plus(variant: String, vararg extra: Location) = change(variant) { it.copy(locations = it.locations + extra) }
+        val home = Path.of(real.getValue("ciMinified").values.getValue("gradleUserHome"))
         for ((what, reports) in listOf(
             "release takes the journey's java" to plus("release", location("java", "$app/src/e5dJourney/java")),
             "release reaches it through an alias" to plus("release", location("java", "$app/src/release/java", "$app/src/e5dJourney/java")),
@@ -224,10 +231,29 @@ class E5dJourneyStructureTest {
             "release reads its model resources" to plus("release", location("res", "$app/src/release/res")),
             "debug loses a root" to change("debug") { r -> r.copy(locations = r.locations.filterNot { it.kind == "assets" && "src/debug/assets" in it.lexical.toString() }) },
             "an init script" to change("ciMinified") { it.copy(values = it.values + ("initScripts" to "1")) },
+            "an init script in the repository" to change("ciMinified") {
+                it.copy(values = it.values + ("initScripts" to "1"), initScripts = listOf(APP.parent.resolve("gradle/gradle-actions.inject-develocity.init.gradle")))
+            },
+            "CI's script name outside init.d" to change("ciMinified") {
+                it.copy(values = it.values + ("initScripts" to "1"), initScripts = listOf(home.resolve("gradle-actions.inject-develocity.init.gradle")))
+            },
+            "another script in init.d" to change("ciMinified") {
+                it.copy(values = it.values + ("initScripts" to "1"), initScripts = listOf(home.resolve("init.d/extra.init.gradle")))
+            },
+            "an init script listed twice" to change("ciMinified") {
+                it.copy(values = it.values + ("initScripts" to "2"), initScripts = List(2) { home.resolve("init.d/gradle-actions.inject-develocity.init.gradle") })
+            },
+            "no Gradle user home" to change("ciMinified") { it.copy(values = it.values - "gradleUserHome") },
             "an included build" to change("s5Benchmark") { it.copy(values = it.values + ("includedBuilds" to "1")) }
         )) {
             assertTrue("$what must be caught", modelProblems(reports).isNotEmpty())
         }
+        // The invocation CI runs, whatever this one's: the three setup-gradle init scripts in each report's init.d pass.
+        val ci = real.mapValues { (_, r) ->
+            val initD = Path.of(r.values.getValue("gradleUserHome")).resolve("init.d")
+            r.copy(values = r.values + ("initScripts" to "3"), initScripts = CI_INIT_SCRIPTS.map { initD.resolve(it) })
+        }
+        assertEquals("CI's setup-gradle init scripts", emptyList<String>(), modelProblems(ci))
     }
 
     @Test
@@ -848,10 +874,26 @@ class E5dJourneyStructureTest {
         const val JOURNEY = "e5dJourney"
         val MODEL_VARIANTS = listOf("debug", "release", "ciMinified", "benchmark", "s5Benchmark", JOURNEY)
         private val LOCATION_KINDS = setOf("java", "kotlin", "resources", "res", "res-dsl", "assets", "manifest")
-        private val VALUE_KEYS = setOf("debuggable", "minify", "shrink", "initScripts", "includedBuilds")
+        private val VALUE_KEYS = setOf("debuggable", "minify", "shrink", "initScripts", "gradleUserHome", "includedBuilds")
+
+        /**
+         * The init scripts CI's gradle/actions/setup-gradle@v5 writes into the Gradle user home's init.d (copyInitScripts in its
+         * sources/src/caching/gradle-user-home-cache.ts; the two .groovy files it writes beside them are not init scripts).
+         */
+        val CI_INIT_SCRIPTS = setOf(
+            "gradle-actions.build-result-capture.init.gradle",
+            "gradle-actions.github-dependency-graph.init.gradle",
+            "gradle-actions.inject-develocity.init.gradle"
+        )
 
         data class Location(val kind: String, val lexical: Path, val canonical: Path)
-        data class VariantReport(val name: String, val buildType: String, val values: Map<String, String>, val locations: List<Location>)
+        data class VariantReport(
+            val name: String,
+            val buildType: String,
+            val values: Map<String, String>,
+            val locations: List<Location>,
+            val initScripts: List<Path> = emptyList()
+        )
 
         /** `reportE5dJourneyVariantInputs`'s six reports, a Test input; null where one is missing. */
         fun variantReports(): Map<String, VariantReport?> = MODEL_VARIANTS.associateWith { variant ->
@@ -864,15 +906,17 @@ class E5dJourneyStructureTest {
             val head = rows.firstOrNull()?.takeIf { it.size == 3 && it[0] == "variant" } ?: listOf("variant", "?", "?")
             val values = LinkedHashMap<String, String>()
             val locations = ArrayList<Location>()
+            val initScripts = ArrayList<Path>()
             rows.drop(1).forEachIndexed { index, row ->
                 when {
                     row.size == 2 && row[0] in VALUE_KEYS -> values[row[0]] = row[1]
                     row.size == 2 && row[0] in LOCATION_KINDS && row[1] == "absent" -> values["absent:${row[0]}"] = "true"
                     row.size == 3 && row[0] in LOCATION_KINDS -> locations += Location(row[0], Path.of(row[1]), Path.of(row[2]))
+                    row.size == 2 && row[0] == "initScript" -> initScripts.add(Path.of(row[1]))
                     else -> values["unparsed:$index"] = row.joinToString("\t")
                 }
             }
-            return VariantReport(head[1], head[2], values, locations)
+            return VariantReport(head[1], head[2], values, locations, initScripts)
         }
 
         private val accessorScan = HashMap<Path, Set<Path>>()
@@ -915,9 +959,29 @@ class E5dJourneyStructureTest {
         }
 
         /**
+         * The invocation's init scripts (`s7e5dj_j2a.codex.r2.md` Q2-A, amended for CI): the reported count equals the paths
+         * listed, no path is listed twice, and each is one of [CI_INIT_SCRIPTS] directly in the reported Gradle user home's
+         * init.d. Their contents are not read: like the pinned external plugins, they are an external tool's, outside the
+         * reviewed local script boundary.
+         */
+        fun initScriptProblems(variant: String, report: VariantReport): List<String> {
+            val problems = ArrayList<String>()
+            val listed = report.initScripts
+            if (report.values["initScripts"] != listed.size.toString()) problems += "$variant: initScripts=${report.values["initScripts"]}, ${listed.size} listed"
+            if (listed.toSet().size != listed.size) problems += "$variant: an init script listed twice"
+            val initD = report.values["gradleUserHome"]?.let { Path.of(it).resolve("init.d") }
+            for (script in listed) {
+                if (initD == null || script.parent != initD || (script.fileName?.toString() ?: "") !in CI_INIT_SCRIPTS) {
+                    problems += "$variant: init script $script"
+                }
+            }
+            return problems
+        }
+
+        /**
          * R6 ③④ on what AGP resolved (`s7e5dj_j2a.codex.r1.md` Q2-A): each of the six reports present and its own; every kind's
          * inputs exactly [expectedRoots], so an extra root is refused even when it holds no accessor (`s7e5dj_j2a.codex.r2.md`);
-         * no init script and no included build in the invocation; no location
+         * no included build in the invocation and no init script but CI's ([initScriptProblems]); no location
          * reached through an alias; no variant but the journey's with a location in the fixture or the test module, and the
          * journey's with none in the shared bindings or default-accessor directories; the model's resource layers equal the DSL's
          * where both are read (generated ones aside); each variant compiling exactly its one accessor; and the journey debuggable,
@@ -936,9 +1000,8 @@ class E5dJourneyStructureTest {
                 if (report.name != variant || report.buildType != variant) problems += "$variant: the report is ${report.name}/${report.buildType}'s"
                 report.values.filterKeys { it.startsWith("unparsed") }.values.forEach { problems += "$variant: unparsed row $it" }
                 (VALUE_KEYS - report.values.keys).forEach { problems += "$variant: no $it" }
-                for (key in listOf("initScripts", "includedBuilds")) {
-                    if (report.values[key] != "0") problems += "$variant: $key=${report.values[key]}"
-                }
+                if (report.values["includedBuilds"] != "0") problems += "$variant: includedBuilds=${report.values["includedBuilds"]}"
+                problems += initScriptProblems(variant, report)
                 val expected = expectedRoots(variant)
                 val kinds = expected.keys + report.locations.map { it.kind }
                 for (kind in kinds) {
@@ -1006,7 +1069,8 @@ class E5dJourneyStructureTest {
          * Gradle scripts, no buildSrc or build-logic, and no line in a script other than the app's (which has its own lock) that
          * touches variants or sources, configures another project or applies a script, beyond the journey module's one debug-off
          * filter. This check fixes the repository script-name set and the listed source/project lines. Together with tokenProblems,
-         * applyProblems, absence of buildSrc/build-logic, and zero invocation init scripts/included builds, it supplies the
+         * applyProblems, absence of buildSrc/build-logic, zero invocation included builds and no invocation init script but
+         * CI's setup-gradle ones ([initScriptProblems]), it supplies the
          * reviewed local script boundary. It does not inspect generated all directories or prove the behavior of pinned external
          * plugins.
          */

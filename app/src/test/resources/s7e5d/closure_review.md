@@ -99,3 +99,19 @@
     - signal origin의 문자열과 생성 횟수.
   - 음성 fixture 열여섯(`P_theSeamWiringCatchesEachBreak_andLeavesTheRestAlone`, 중괄호 없는 조건 넷 포함)이 각 위반을 겨눈 tag로 잡아야 그 시험이 통과한다. 이 재봉인으로 page seam의 비영속성·부작용 부재를 검증했다고 쓰지 않는다.
   - host 쪽 새 seam의 실제 동작(Closed에서의 binding 이동, 새 owner의 새 session, 이탈 때 null, 보류된 전달의 origin)은 기기 H17이 맡는다.
+
+## 개정 4 (2026-11-20 01:42 KST)
+
+- 근거: push(`2c82da32`) 뒤 CI는 `testDebugUnitTest`의 `E5dJourneyStructureTest`에서 실패해 나머지 unit 세 변형을 실행하지 않았다. 무수정 같은 HEAD의 로컬 CI parity r0에서 이 closure 시험이 `testCiMinifiedUnitTest`·`testBenchmarkUnitTest`·`testS5BenchmarkUnitTest`에서 실패했다. 위 목록은 debug variant의 class에서만 만들고 봉인했다(위 '입력과 대응'의 `…/debug/…`).
+- 원인: class가 쓰는 library member는 그 variant가 compile하는 library 판을 따른다. catalog가 같아도 판은 build type마다 다르다. debug만 `debugImplementation`으로 ui-tooling·ui-test-manifest를 더하고, debug의 compile classpath는 Compose foundation 1.9.2로 풀린다(`dependencyInsight`: "version resolved in configuration ':app:debugRuntimeClasspath' by consistent resolution", 그 runtime 경로에 ui-tooling-android 1.9.2). ciMinified·benchmark는 1.7.2다(BOM 2024.09.00). 그래서 위 '의존 버전'의 catalog hash 결속은 variant별 해석까지는 잡지 못한다.
+- 비교: app class·함수값 호출 지점·소스·버전 목록은 debug와 benchmark·s5Benchmark가 같다. 다른 것은 library 사용 335개 중 둘뿐이고, benchmark와 s5Benchmark의 사용 목록은 바이트가 같다.
+  - debug `ClickableKt.clickable-oSLSa3U$default`(`MutableInteractionSource` 인자가 있는 판) ↔ release 계열 `ClickableKt.clickable-XHw0xAI$default`(그 인자가 없는 판). 같은 `Modifier.clickable(…)` 호출이 판에 따라 다른 overload로 묶였다.
+  - debug `ComposablesKt.getCurrentCompositeKeyHashCode (…)J` ↔ release 계열 `ComposablesKt.getCurrentCompositeKeyHash (…)I`. inline된 foundation 본문의 판 차이로 보인다(추정, 호출 지점을 따로 추적하지 않았다).
+  - 둘 다 Compose foundation·runtime의 member이고 새 owner·package·capability가 아니다.
+- 봉인: library 사용 목록을 build type별로 둔다. debug는 `closure_uses.txt`(그대로), ciMinified·benchmark·s5Benchmark는 `closure_uses.release.txt`다. 목록에 없는 build type은 봉인이 없어 실패한다. 판이 바뀌어 사용이 달라지면 그 build type에서 실패하고 다시 검토한다. 네 build type 모두를 확인하려면 unit 시험 네 변형을 모두 돌려야 한다(CI workflow는 넷을 순서대로 호출하지만, 같은 run 블록의 앞 명령이 실패하면 뒤 명령은 실행되지 않는다).
+
+| 목록 | SHA-256 |
+| --- | --- |
+| closure_uses.release.txt | 12609f052a1b3a0d240aa8441823b0914cf8a4f2ca425c999df200ca2db0cdb6 |
+
+- 범위 밖: 현재 parity r0의 dependencyInsight에서 debug compile은 foundation 1.9.2, ciMinified·benchmark compile은 1.7.2다. s5Benchmark 사용 목록은 benchmark와 바이트가 같다. 이 개정은 의존 판을 바꾸지 않으며, debug에서 수행한 기기 시험을 release 계열 의존 판의 동작 증거로 확대하지 않는다.
