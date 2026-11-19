@@ -233,7 +233,8 @@ class S7U2FcmGoldenConsumptionContractTest {
         fun answerGet(rows: List<AlertSetting>) {
             val pending = open("GET")
             check(pending.size == 1) { "exactly one GET awaits its answer, not ${pending.size}" }
-            pending.single().outcome.complete(okList(rows))
+            // Copies: the owner never holds the instances a test compares against.
+            pending.single().outcome.complete(okList(rows.map { it.copy() }))
             settle()
         }
 
@@ -335,12 +336,14 @@ class S7U2FcmGoldenConsumptionContractTest {
 
     @Test fun `S7U2_P01 the once golden marks only row 101 sent, then one GET whose answer the owner adopts`() = runTest {
         rig(this) {
+            val old = state
             val route = push(golden(ONCE))
             assertEquals(AlertPushRoute(AlertEvent.SettingTriggered(101, AlertFamily.BANK), showBanner = true), route)
             assertEquals("one hand-over with the raw is_repeat", listOf(bank(101, "false")), newAdapterCalls())
             assertEquals("one main post, no new family resolve", listOf(1, 0), listOf(newPosts(), newFamilyResolves()))
             assertEquals("row 101 off and triggered, the others and the order kept",
                 listOf(sent(101), setting(102), setting(104), setting(105)), rows)
+            assertEquals("the snapshot from before the push is not changed in place", loadedRows, old.settings)
             assertEquals("the identity and phase are kept", listOf<Any?>(alice, AlertLoadPhase.Ready), listOf(state.identity, state.phase))
             assertOneGet("once")
         }
@@ -475,9 +478,11 @@ class S7U2FcmGoldenConsumptionContractTest {
 
     @Test fun `S7U2_T01 a bank golden tap hands its id and raw is_repeat over once, as its push does`() = runTest {
         rig(this) {
+            val old = state
             assertEquals(AlertPushRoute(AlertEvent.SettingTriggered(101, AlertFamily.BANK), showBanner = true), tap(golden(ONCE)))
             assertEquals(listOf(bank(101, "false")), newAdapterCalls())
             assertEquals(listOf(sent(101), setting(102), setting(104), setting(105)), rows)
+            assertEquals("the snapshot from before the tap is not changed in place", loadedRows, old.settings)
             assertOneGet("once tap")
         }
         rig(this) {
