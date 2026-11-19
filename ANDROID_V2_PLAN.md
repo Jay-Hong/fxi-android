@@ -1842,7 +1842,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   fix와 함께 PR #3으로 같은 tree의 Android·cutover·OFF C02 13행 CI를 통과한 뒤 main에 반영했고(2026-11-01), post-land
   Android `41316463835`·C02 `41316463854`는 attempt 1에서 green이다. S6-4a는 2026-11-02 통합 완료로 판정했다(내부 이정표,
   기본 꺼짐 준비 슬라이스 한정 — S6-4b·S6-4c·β 최종 켬·S6 DoD는 미완료). 원 RT03b-Q05c 실패의 원인은 여전히 정하지 못했다.
-  · 보류: S6-4b(상한은 트리 밖 scope r24에서 14시간+CI 대기로 확정)·S6-4c, 스위치 켬(S6-2b-2β)이 남았다. KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
+  · 보류: S6-4b(상한은 트리 밖 scope r24에서 14시간+CI 대기로 확정)·S6-4c, 스위치 켬(S6-2b-2β)이 남았다. 스위치 켬(최종 동일 후보 측정용 켬 포함) 전에는 S7의 ON custody 후속 의무(S7 절: is_repeat 운반·읽기·제거와 새 bank 단일 소비)도 완료·검증한다(2026-11-20 사용자 결정). KRX 축 반복 고리 상한 설계는 D4(`loop_bound.r4.md`)와 보충
   A2 r8·A1 r9로 Codex와 합의했고, P1(a) 제안서 5절 D1에는 사용자가 '아니오'(기존 예외 확대 없이 상한 설계)로
   답했다(2026-10-21). P1(a) r2 r7은 AGREE_P1A_R2(조건부)다. 다음 D4 판 조건은 D4 r6(A2 r8·A1 r9 반영, 트리 밖
   manifest r7)으로 채웠고, 남은 조건은 2b-2 계약의 CAP-W09 확장, P1(b) 실측과 P1A C1~C4다. scope U10(CUT-C01
@@ -1873,7 +1873,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
   (현 `AlertViewModel.hadLoadedState:204,212-215,233-236` 승계).
   임시-오류 판정에 서버 문구 문자열을 쓰지 않는다(typed `AlertLoadFailure`).
   ⚠️ 현 Android `AlertState`(`AlertViewModel.kt:42-50`)에는 `Retrying`이 없고 최초 load 실패는 `AlertViewModel.kt:265-269`에서 즉시 `Error`로 확정된다.
-  N1 완료 뒤 화면 연결 단위에서는 BankAlertSettingsOwner를 유일한 은행 설정 snapshot·GET owner로 유지하고, 후속 E5a2/E5b의 CRUD action도 그 owner가 조정한다. 새 은행 section holder는 state 투영과 action 요청 위임만 하며 독립 목록·CRUD·rollback을 소유하지 않는다. AlertViewModel은 변경·생성하지 않는다. typed phase 렌더와 빈 목록 오류 가드를 적용한다. push/tap의 단일 소비·권한/현재 신원 경계는 별도 확정 범위에서 닫고, 그 완료 전 사용자에게 노출하지 않는다. 첫 화면 단위(E5a1)는 읽기 전용 섹션이며 mutation이 없다. E5c는 foreground push 수신 및 OFF tap의 once 즉시 반영과 registry 단일 GET 요청 경로만 닫는다. ON custody 경로의 is_repeat 운반·읽기·제거는 미완료 후속 의무이며, 그 완료 전에는 ON 공개 산출물을 만들지 않는다. N1 및 E5a/b/c 완료는 S7 전체 완료가 아니다.
+  N1 완료 뒤 화면 연결 단위에서는 BankAlertSettingsOwner를 유일한 은행 설정 snapshot·GET owner로 유지하고, 후속 E5a2/E5b의 CRUD action도 그 owner가 조정한다. 새 은행 section holder는 state 투영과 action 요청 위임만 하며 독립 목록·CRUD·rollback을 소유하지 않는다. AlertViewModel은 변경·생성하지 않는다. typed phase 렌더와 빈 목록 오류 가드를 적용한다. push/tap의 단일 소비·권한/현재 신원 경계는 별도 확정 범위에서 닫고, 그 완료 전 사용자에게 노출하지 않는다. 첫 화면 단위(E5a1)는 읽기 전용 섹션이며 mutation이 없다. E5c는 foreground push 수신 및 OFF tap의 once 즉시 반영과 registry 단일 GET 요청 경로만 닫는다. ON custody 경로의 is_repeat 운반·읽기·제거와 새 bank 단일 소비는 미완료 후속 의무다. production 공유 KrxContestSwitch.OFF 및 ON custody 비도달 배선·검증을 유지하는 D24 ON 공개 후보는 이 ON 후속 의무만으로 차단하지 않는다(2026-11-20 사용자 결정, 관문 재배치). 그 의무의 완료·검증 전에는 S6-2b-2β 최종 동일 후보 측정용 켬을 포함해 KrxContestSwitch를 ON으로 전환하지 않는다. foreground/OFF 소비·권한/현재 신원 경계의 공개 전 조건, custody 보호, 기존 S6 의무, 나머지 출시 관문과 별도 공개 GO는 유지한다. N1 및 E5a/b/c 완료는 S7 전체 완료가 아니다.
 - **lifecycle(iOS 실재 계약, family별 분리)**:
   - bank/source는 background에서 in-flight 응답을 generation guard로 폐기하고 대기 demand를 취소하되
     Retry-After hard floor·수동 쿨다운을 보존한다. 성공 snapshot은 유지하고 없으면 idle로 돌린다
