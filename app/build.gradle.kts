@@ -1,8 +1,12 @@
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import java.io.File
+import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.Properties
 
 plugins {
@@ -163,6 +167,102 @@ val verifyS5BenchmarkFirebaseFixture = tasks.register("verifyS5BenchmarkFirebase
     }
 }
 tasks.matching { it.name == "processS5BenchmarkGoogleServices" }.configureEach { dependsOn(verifyS5BenchmarkFirebaseFixture) }
+// S7 E5d-J (`e5dj_j2_plan.claude.r3.md` R1): the journey fixture must resolve the checked-in non-production CI Firebase fixture,
+// and nothing ahead of it. The plugin takes the first candidate that is a file, following links, so that is the one checked:
+// it must be this fixture's own path, a regular file reached through no link, byte for byte the CI fixture. Nothing is printed.
+val e5dJourneyGoogleServicesCandidates =
+    com.google.gms.googleservices.GoogleServicesPlugin.getJsonFiles(
+        "e5dJourney",
+        emptyList(),
+        project.projectDir
+    ).map { candidate -> candidate.toPath().toAbsolutePath().normalize() }.distinct()
+val e5dJourneyGoogleServicesPath = project.file("src/e5dJourney/google-services.json").toPath().toAbsolutePath().normalize()
+check(e5dJourneyGoogleServicesPath in e5dJourneyGoogleServicesCandidates) {
+    "google-services plugin no longer resolves src/e5dJourney/google-services.json for e5dJourney; review the E5d-J fixture."
+}
+val verifyE5dJourneyFirebaseFixture = tasks.register("verifyE5dJourneyFirebaseFixture") {
+    doLast {
+        val selected = e5dJourneyGoogleServicesCandidates.firstOrNull { candidate -> Files.isRegularFile(candidate) }
+        check(selected == e5dJourneyGoogleServicesPath) {
+            "e5dJourney would resolve $selected, not its own non-production Firebase fixture"
+        }
+        check(Files.isRegularFile(selected, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(selected)) {
+            "src/e5dJourney/google-services.json must be a regular file, not a link"
+        }
+        check(selected.toRealPath() == selected) {
+            "src/e5dJourney/google-services.json must not be reached through a linked directory"
+        }
+        check(Files.readAllBytes(selected).contentEquals(Files.readAllBytes(ciFirebaseFixturePath))) {
+            "src/e5dJourney/google-services.json is not ci/google-services.ci-fixture.json"
+        }
+    }
+}
+tasks.matching { it.name == "processE5dJourneyGoogleServices" }.configureEach { dependsOn(verifyE5dJourneyFirebaseFixture) }
+// S7 E5d-J (`e5dj_j2_plan.claude.r3.md` R2): the journey variant's own merged manifest, read after it is produced. Only that
+// manifest and the network config it selects are read; no existing Test task, owner check or CI step depends on this one.
+// AGP already owns check<Variant>Manifest, so this local check is named verify… like the Firebase one above.
+val verifyE5dJourneyManifest = tasks.register("verifyE5dJourneyManifest") {
+    dependsOn("processE5dJourneyManifest")
+    val merged = layout.buildDirectory.file("intermediates/merged_manifests/e5dJourney/processE5dJourneyManifest/AndroidManifest.xml")
+    val network = project.file("src/e5dJourney/res/xml/network_security_config.xml")
+    inputs.file(merged).withPropertyName("e5dJourneyMergedManifest")
+    inputs.file(network).withPropertyName("e5dJourneyNetworkConfig")
+    doLast {
+        val ns = "http://schemas.android.com/apk/res/android"
+        fun parse(file: File) = javax.xml.parsers.DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
+            .newDocumentBuilder().parse(file).documentElement
+        fun elements(parent: org.w3c.dom.Element, tag: String): List<org.w3c.dom.Element> =
+            parent.getElementsByTagName(tag).let { list -> (0 until list.length).map { list.item(it) as org.w3c.dom.Element } }
+        val manifest = parse(merged.get().asFile)
+        val application = elements(manifest, "application").single()
+        check(application.getAttributeNS(ns, "networkSecurityConfig") == "@xml/network_security_config") {
+            "e5dJourney: the application no longer names @xml/network_security_config"
+        }
+        val meta = elements(application, "meta-data").associate { it.getAttributeNS(ns, "name") to it.getAttributeNS(ns, "value") }
+        for ((name, value) in listOf(
+            "com.jay.fxi.TOPIC_V2_RELEASE_ON" to "true",
+            "firebase_analytics_collection_enabled" to "false",
+            "firebase_crashlytics_collection_enabled" to "false",
+            "firebase_messaging_auto_init_enabled" to "false"
+        )) {
+            check(meta[name] == value) { "e5dJourney: meta-data $name is ${meta[name]}, not $value" }
+        }
+        val control = "com.jay.fxi.e5djourney.permission.CONTROL"
+        val permissions = elements(manifest, "permission").filter { it.getAttributeNS(ns, "name") == control }
+        check(permissions.size == 1 && permissions.single().getAttributeNS(ns, "protectionLevel") == "signature") {
+            "e5dJourney: $control must be declared once with protectionLevel signature"
+        }
+        // The control channel (`s7e5dj_j2b_channel.codex.r1.md` R3): one provider, one exact authority, exported, bound to the
+        // permission, in the app's own process; the application not split off either; the old receiver gone.
+        val controls = elements(application, "provider").filter { it.getAttributeNS(ns, "name") == "com.jay.fxi.e5djourney.E5dJourneyControlProvider" }
+        check(controls.size == 1 && controls.single().getAttributeNS(ns, "authorities") == "com.jay.fxi.e5djourney.control" &&
+            controls.single().getAttributeNS(ns, "exported") == "true" && controls.single().getAttributeNS(ns, "permission") == control &&
+            !controls.single().hasAttributeNS(ns, "process") && !application.hasAttributeNS(ns, "process")) {
+            "e5dJourney: the control provider must be one, exported at its one authority, bound to $control, in the app's own process"
+        }
+        check(elements(application, "receiver").none { it.getAttributeNS(ns, "name").contains("E5dJourneyControl") }) {
+            "e5dJourney: the old control receiver is still declared"
+        }
+        val providers = elements(application, "provider").filter { it.getAttributeNS(ns, "name") == "com.jay.fxi.e5djourney.E5dJourneyLifecycleProvider" }
+        check(providers.size == 1 && providers.single().getAttributeNS(ns, "exported") == "false" &&
+            providers.single().getAttributeNS(ns, "authorities") == "com.jay.fxi.e5djourney.lifecycle" &&
+            !providers.single().hasAttributeNS(ns, "process")) {
+            "e5dJourney: the lifecycle provider must be one, not exported, at its authority, in the app's own process"
+        }
+        val config = parse(network)
+        check(elements(config, "base-config").singleOrNull()?.getAttribute("cleartextTrafficPermitted") == "false") {
+            "e5dJourney: the network config's base must keep cleartext off"
+        }
+        val domainConfigs = elements(config, "domain-config")
+        check(domainConfigs.size == 1 && domainConfigs.single().getAttribute("cleartextTrafficPermitted") == "true") {
+            "e5dJourney: exactly one cleartext domain config"
+        }
+        val domains = elements(domainConfigs.single(), "domain").map { it.textContent.trim() to it.getAttribute("includeSubdomains") }.toSet()
+        check(domains == setOf("127.0.0.1" to "false", "localhost" to "false")) {
+            "e5dJourney: cleartext only for 127.0.0.1 and localhost, without subdomains, not $domains"
+        }
+    }
+}
 val hasCompleteReleaseSigning = releaseKeystoreFile.exists() &&
     listOf("KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD").all { key ->
         localProperties.getProperty(key, "").isNotBlank()
@@ -307,6 +407,27 @@ android {
                 mappingFileUploadEnabled = false
             }
         }
+        // S7 E5d-J (`e5dj_design.claude.r3.md` §3.2): the local journey fixture. A behaviour journey, not a measurement, so it
+        // starts from debug. It takes neither src/productionBindings nor the no-op hook accessor: its own source set supplies
+        // the five bindings and the accessor. Built locally only, never uploaded; its name holds no "release".
+        create("e5dJourney") {
+            initWith(getByName("debug"))
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("debug")
+            buildConfigField("String", "REVENUECAT_API_KEY", "\"\"")
+            buildConfigField("boolean", "BENCHMARK_NO_DATA_MODE", "false")
+            buildConfigField("boolean", "TOPIC_V2_RELEASE_ON", "true")
+            manifestPlaceholders["topicV2ReleaseOn"] = true
+            buildConfigField("boolean", "CRASH_COLLECTION_ALLOWED", "false")
+            buildConfigField("boolean", "SEMANTICS_RESOURCE_IDS", "true")
+            // S7 E5d-J J2b2 (`s7e5dj_j2b2_design.codex.r2.md` §2-1): the two graph contract documents the fixture serves, named
+            // here so the fixture's own sources stay free of their names; the server opens them by these keys only.
+            buildConfigField("String", "E5DJ_GRAPH_CATALOG_ASSET", "\"catalog-krx-hidden.json\"")
+            buildConfigField("String", "E5DJ_GRAPH_USD_1D_ASSET", "\"usd-1d-krx-hidden.json\"")
+            configure<com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsExtension> {
+                mappingFileUploadEnabled = false
+            }
+        }
     }
     // S5-4 slice 2: bindings that a fixture build type replaces with its own. The four existing build types take them, and
     // their unit tests the matching tests, from these shared directories; a build type without a binding fails Hilt's compile.
@@ -317,6 +438,17 @@ android {
         }
         // S5-4 slice 4b: the S5 fixture reads the one frozen fixture source by reference; nothing is copied.
         getByName("s5Benchmark").assets.srcDir("src/benchmark/assets/s5_4")
+        // S7 E5d-J: the journey fixture serves the checked-in free snapshot contract documents by reference; nothing is copied.
+        getByName("e5dJourney").assets.srcDir("src/test/resources/contracts/v2/free")
+        // S7 E5d-J J2b2: and, for the premium journeys, the topic snapshots, the graph documents and the bank alert documents.
+        getByName("e5dJourney").assets.srcDir("src/test/resources/contracts/v2/topic")
+        getByName("e5dJourney").assets.srcDir("src/test/resources/contracts/v2/graph")
+        getByName("e5dJourney").assets.srcDir("src/test/resources/contracts/v2/alerts")
+        // S7 E5d-J: the preview host's no-op hook accessor. Every build type here compiles it; a build type that supplies its
+        // own accessor (the local journey fixture) must not take this one, or the accessor is declared twice.
+        listOf("debug", "release", "ciMinified", "benchmark", "s5Benchmark").forEach { type ->
+            getByName(type).java.srcDir("src/e5dHooksDefault/java")
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -343,6 +475,111 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         layout.buildDirectory.file("intermediates/merged_manifests/s5Benchmark/processS5BenchmarkManifest/AndroidManifest.xml")
     ).withPropertyName("controlOwnerMergedManifests")
         .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+}
+
+// S7 E5d-J R6 ③④ (`s7e5dj_j2a.codex.r1.md` Q2-A): what AGP finally resolves as six variants' inputs — the static Java, Kotlin,
+// Java-resource, Android resource, asset and manifest locations, each lexical and canonical, and the final debuggable, minify
+// and resource-shrink values — one report per variant for E5dJourneyStructureTest. Like `:app:sourceSets`, it reads the variant
+// model only: nothing is compiled, merged or packaged, and no release task enters the graph, so the public release gate stays
+// shut. Generated directories (`all`) are left out on purpose, since resolving them would run their generators; the structure
+// test's text lock covers the calls that add one.
+//
+// Android resources are the one exception. AGP's static resource layers include the resValues generator's output, and Gradle
+// refuses to read them before generate<Variant>ResValues runs, which for release would put a release task in the graph. So
+// every variant also reports `res-dsl`, the resource directories of its own source sets (main and its build type) as the DSL
+// finally holds them, and the five variants other than release report the model's `res` as well, run after their own
+// resValues generator. The test checks the two agree, generated directories aside, wherever both exist.
+abstract class E5dJourneyVariantInputs : DefaultTask() {
+    @get:Input
+    abstract val entries: MapProperty<String, List<String>>
+
+    @get:OutputDirectory
+    abstract val reports: DirectoryProperty
+
+    @TaskAction
+    fun write() {
+        val dir = reports.get().asFile
+        dir.listFiles()?.forEach { it.delete() }
+        for ((variant, lines) in entries.get()) {
+            File(dir, "$variant.txt").writeText(lines.joinToString(separator = "\n", postfix = "\n"))
+        }
+    }
+}
+val e5dJourneyIsolationVariants = listOf("debug", "release", "ciMinified", "benchmark", "s5Benchmark", "e5dJourney")
+val reportE5dJourneyVariantInputs = tasks.register<E5dJourneyVariantInputs>("reportE5dJourneyVariantInputs") {
+    reports.set(layout.buildDirectory.dir("intermediates/e5dj_variant_inputs"))
+}
+androidComponents {
+    onVariants { variant ->
+        if (variant.name !in e5dJourneyIsolationVariants) return@onVariants
+        fun location(kind: String, file: File) =
+            "$kind\t${file.toPath().toAbsolutePath().normalize()}\t${file.canonicalPath}"
+        val located = variant.sources
+        val lines = objects.listProperty(String::class.java)
+        lines.add("variant\t${variant.name}\t${variant.buildType}")
+        lines.add("debuggable\t${variant.debuggable}")
+        lines.add("minify\t${variant.isMinifyEnabled}")
+        lines.add("shrink\t${variant.shrinkResources}")
+        // The invocation's own boundary (`s7e5dj_j2a.codex.r2.md` Q2-A): no init script and no included build can add an input.
+        lines.add("initScripts\t${gradle.startParameter.allInitScripts.size}")
+        lines.add("includedBuilds\t${gradle.includedBuilds.size}")
+        for ((kind, flat) in listOf("java" to located.java, "kotlin" to located.kotlin, "resources" to located.resources)) {
+            if (flat == null) lines.add("$kind\tabsent") else lines.addAll(flat.static.map { dirs -> dirs.map { location(kind, it.asFile) } })
+        }
+        val layers = buildList {
+            add("assets" to located.assets)
+            if (variant.name != "release") add("res" to located.res)
+        }
+        for ((kind, layered) in layers) {
+            if (layered == null) lines.add("$kind\tabsent")
+            else lines.addAll(layered.static.map { found -> found.flatten().map { location(kind, it.asFile) } })
+        }
+        val ownSourceSets = listOf("main", checkNotNull(variant.buildType) { "${variant.name}: no build type" })
+        lines.addAll(provider { ownSourceSets.flatMap { android.sourceSets.getByName(it).res.srcDirs }.map { location("res-dsl", it) } })
+        lines.addAll(located.manifests.all.map { files -> files.map { location("manifest", it.asFile) } })
+        reportE5dJourneyVariantInputs.configure { entries.put(variant.name, lines) }
+    }
+}
+
+// S7 E5d-J R6 (`s7e5dj_j2a.codex.r1.md` Q2-B): E5dJourneyStructureTest reads the variant reports above and these trees and
+// scripts from disk. They are its inputs, so any change, a file added or removed included, reruns it. Secret-named files are
+// left out: the test never reads them, and Gradle would otherwise hash them.
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    inputs.files(reportE5dJourneyVariantInputs).withPropertyName("e5dJourneyVariantInputs")
+        .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+    inputs.files(fileTree("src") {
+        include(listOf("main", "productionBindings", "e5dHooksDefault", "debug", "release", "ciMinified", "benchmark", "s5Benchmark",
+            "e5dJourney").map { "$it/**" })
+        exclude("**/google-services.json", "**/GoogleService-Info.plist", "**/*.p8", "**/*adminsdk*", "**/.env",
+            "**/local.properties", "**/*.jks")
+    }).withPropertyName("e5dJourneyStructureTrees").withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+    inputs.files(
+        "build.gradle.kts", rootProject.file("build.gradle.kts"), rootProject.file("settings.gradle.kts"),
+        rootProject.file("gradle/libs.versions.toml"), rootProject.file("e5dJourney/build.gradle.kts"),
+        rootProject.file("e5dJourney/src/main/AndroidManifest.xml"), rootProject.file("macrobenchmark/build.gradle.kts"),
+        // Absent today; appearing, either would build code onto every script's classpath.
+        rootProject.file("buildSrc"), rootProject.file("build-logic")
+    ).withPropertyName("e5dJourneyStructureScripts").withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+    // The names of every Gradle script in the repository (`s7e5dj_j2a.codex.r3.md` C), walked as the structure test walks
+    // them — build and tool directories skipped, links not followed, names only — so a script added or removed anywhere reruns it.
+    inputs.property("e5dJourneyRepoScripts", provider { e5dJourneyRepoScripts() })
+}
+
+fun e5dJourneyRepoScripts(): List<String> {
+    val repo = rootProject.projectDir.toPath()
+    val skipped = setOf("build", ".gradle", ".git", ".idea", ".kotlin")
+    val found = ArrayList<String>()
+    Files.walkFileTree(repo, object : SimpleFileVisitor<Path>() {
+        override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes) =
+            if (dir != repo && dir.fileName.toString() in skipped) FileVisitResult.SKIP_SUBTREE else FileVisitResult.CONTINUE
+
+        override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+            val name = file.fileName.toString()
+            if (name.endsWith(".gradle.kts") || name.endsWith(".gradle")) found += repo.relativize(file).toString().replace('\\', '/')
+            return FileVisitResult.CONTINUE
+        }
+    })
+    return found.sorted()
 }
 
 // S5-4 A: the benchmark's tether fixture has a single source under src/benchmark/assets, which the unit tests read by path.
@@ -644,6 +881,8 @@ dependencies {
     // S5-4 slice 4b: the S5 fixture's own runtime: ProfileInstaller as in benchmark, and the loopback fixture server.
     add("s5BenchmarkImplementation", libs.androidx.profileinstaller)
     add("s5BenchmarkImplementation", libs.okhttp.mockwebserver)
+    // S7 E5d-J: the journey fixture's loopback server.
+    add("e5dJourneyImplementation", libs.okhttp.mockwebserver)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
 }

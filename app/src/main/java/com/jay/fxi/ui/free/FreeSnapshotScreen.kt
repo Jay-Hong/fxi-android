@@ -41,6 +41,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -154,8 +155,22 @@ fun FreeSnapshotScreen(
         // overwriting the stored tab with one the user never chose. Waiting is what makes that
         // impossible, rather than a guard that has to stay ahead of the coroutine that races it.
         val selected = selectedTab ?: return@Column
-        FreeSnapshotTabs(selected, state, pageState, onSelectTab, onSelectPeriod, onToggleSeries,
-            onApplyRowPreference, onExpand = { fullscreen = true }, onSubscribe = onSubscribe)
+        // S7 E5d: the bank alert preview lives here, above the pager, so that one owner holds it for the whole surface and
+        // closes it when the owner or the settled tab changes. Fullscreen leaves this branch, and the preview with it.
+        val hooks = currentPreviewHostHooks()
+        FreeAlertPreviewHost(
+            uid = state.uid,
+            activeTab = selected,
+            onSubscribe = onSubscribe,
+            hide = hooks::hide,
+            onEvent = hooks::onEvent,
+            beforeDeliver = hooks::beforeDeliver,
+            onContext = hooks::onContext
+        ) { openPreview ->
+            FreeSnapshotTabs(selected, state, pageState, onSelectTab, onSelectPeriod, onToggleSeries,
+                onApplyRowPreference, onExpand = { fullscreen = true }, onSubscribe = onSubscribe, onOpenPreview = openPreview,
+                onPage = hooks::onPage)
+        }
     }
     }
 }
@@ -170,7 +185,9 @@ private fun ColumnScope.FreeSnapshotTabs(
     onToggleSeries: (String) -> Unit,
     onApplyRowPreference: (RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onExpand: () -> Unit,
-    onSubscribe: () -> Unit
+    onSubscribe: () -> Unit,
+    onOpenPreview: FreeAlertPreviewOpener,
+    onPage: (PreviewPageMount, Boolean) -> Unit
 ) {
     val tabs = FreeTab.entries
     val pagerState = rememberPagerState(initialPage = selected.ordinal) { tabs.size }
@@ -237,7 +254,9 @@ private fun ColumnScope.FreeSnapshotTabs(
                 onToggleSeries = onToggleSeries,
                 onApplyRowPreference = onApplyRowPreference,
                 onExpand = onExpand,
-                onSubscribe = onSubscribe
+                onSubscribe = onSubscribe,
+                onOpenPreview = { onOpenPreview.open(tab, state.previewQuotes, state.previewAsOf) },
+                onPage = onPage
             )
         }
         }
@@ -253,7 +272,9 @@ private fun FreeSnapshotTabContent(
     onToggleSeries: (String) -> Unit,
     onApplyRowPreference: (RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onExpand: () -> Unit,
-    onSubscribe: () -> Unit
+    onSubscribe: () -> Unit,
+    onOpenPreview: () -> Unit,
+    onPage: (PreviewPageMount, Boolean) -> Unit
 ) {
     val visible = state.availability == FreeSnapshotAvailability.FRESH ||
         state.availability == FreeSnapshotAvailability.DELAYED
@@ -287,6 +308,17 @@ private fun FreeSnapshotTabContent(
                 editing = null
             }
         )
+    }
+
+    // The teaser's open flag is held by the page, not by its lazy item: an item's own `remember` goes with the item — scrolled
+    // out of view, or moved to another index when the rows above it change or expire — while iOS keeps the section's `@State`
+    // for as long as its view lives. Plain `remember` (D26, nothing saved): a new page, a remount or a restore starts collapsed.
+    var previewExpanded by remember { mutableStateOf(false) }
+    // The same composition's lifetime, told to the preview host's test seams: one new mount per composition, gone with it.
+    val pageMount = remember { PreviewPageMount(tab) }
+    DisposableEffect(pageMount) {
+        onPage(pageMount, true)
+        onDispose { onPage(pageMount, false) }
     }
 
     // The metrics are the *window's*, measured outside the list. Read from inside an item they
@@ -375,6 +407,10 @@ private fun FreeSnapshotTabContent(
                     }
                 }
             }
+        }
+        // S7 E5d (D26): outside `visible`, as on iOS — with no live snapshot the preview still opens, on empty quotes.
+        if (tab in FREE_BANK_ALERT_PREVIEW_TABS) {
+            item { FreeBankAlertPreviewSection(expanded = previewExpanded, onToggle = { previewExpanded = !previewExpanded }, onOpen = onOpenPreview) }
         }
         item {
             Button(onClick = onSubscribe, modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
@@ -567,3 +603,38 @@ private fun FreeGraphFullscreen(
         )
     }
 }
+
+/**
+ * S7 E5d-J (`e5dj_design.claude.r3.md` §3.1): what the preview host and page test seams are fed with, read on each composition through
+ * [currentPreviewHostHooks]. Each existing build type compiles the no-op accessor in `src/e5dHooksDefault/java`.
+ * The planned local journey fixture will supply its own accessor instead. The screen's public signature, and the Root
+ * and Route above it, stay as they are.
+ */
+internal interface PreviewHostHooks {
+    /** Performs the hide it is handed. */
+    suspend fun hide(realHide: suspend () -> Unit)
+
+    fun onEvent(event: String)
+
+    suspend fun beforeDeliver(origin: PreviewSignalOrigin)
+
+    fun onContext(context: PreviewHostContext?)
+
+    fun onPage(mount: PreviewPageMount, composed: Boolean)
+}
+
+/** The behaviour with no fixture: the real hide, exactly once, and nothing else. */
+internal object NoPreviewHostHooks : PreviewHostHooks {
+    override suspend fun hide(realHide: suspend () -> Unit) = realHide()
+
+    override fun onEvent(event: String) = Unit
+
+    override suspend fun beforeDeliver(origin: PreviewSignalOrigin) = Unit
+
+    override fun onContext(context: PreviewHostContext?) = Unit
+
+    override fun onPage(mount: PreviewPageMount, composed: Boolean) = Unit
+}
+
+/** One composition of a data tab's page, by identity: a new one for each mount, so two mounts of the same tab never match. */
+internal class PreviewPageMount(val tab: FreeTab)

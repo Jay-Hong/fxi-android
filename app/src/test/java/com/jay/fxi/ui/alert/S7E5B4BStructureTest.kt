@@ -13,7 +13,7 @@ import java.io.File
  * step; that the memory's acceptance does no file work; that the legacy deletion touches the prefix only; and that the
  * process starts the migration through its one cutover.
  *
- * Read from the comment-free code and literals of the five production roots ([S6Krx3bOffWiringContractTest.ROOTS]), squashed.
+ * Read from the comment-free code and literals of the six production roots ([S6Krx3bOffWiringContractTest.ROOTS]), squashed.
  */
 class S7E5B4BStructureTest {
 

@@ -28,7 +28,10 @@ class S6KrxReagreementContractTest {
             val inventory = resource("source_inventory.json").jsonObject
             val expected = inventory.getValue("source_files").jsonObject
             val roots = inventory.getValue("roots").jsonArray.map { it.jsonPrimitive.content }
-            val actual = roots.flatMap { File(it).walkTopDown().filter { f -> f.isFile && f.extension == "kt" }.toList() }.associate { it.invariantSeparatorsPath to it.readBytes() }
+            // S7 E5d-J: a production root added after the S6 freeze is read as well, so the post-S6 ledger's approved additions there
+            // are seen; the frozen inventory's own roots, counts and files are checked exactly as frozen.
+            val scanned = roots + S6Krx3bOffWiringContractTest.ROOTS.filter { it !in roots }
+            val actual = scanned.flatMap { File(it).walkTopDown().filter { f -> f.isFile && f.extension == "kt" }.toList() }.associate { it.invariantSeparatorsPath to it.readBytes() }
             assertEquals("precondition(D20/$sub): five populated archive roots",listOf(350,3,7,1,1),inventory.getValue("root_counts").jsonArray.map { it.jsonPrimitive.int })
             val delta = S64bFixtureDelta.load()
             val code = actual.mapValues { KrxSessionSourceContract.strip(it.value.toString(Charsets.UTF_8)) }

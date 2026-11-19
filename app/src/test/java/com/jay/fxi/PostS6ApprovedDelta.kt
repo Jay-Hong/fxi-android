@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "a52d5d5af9ad261484fec1a1d06a75c7ad2b81e100c78d68458855255d487dfe"
+    const val APPROVED_SHA256 = "191622ff806b046e7bf85b650dd3f1799383f207ee8f81ca584b70de29e5f016"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -108,7 +108,10 @@ internal object PostS6ApprovedDelta {
         "40a4b5a45d95fb36fbff78bb40e044be45c89ab2f1a09a365a56dea9e6831a06",
         "ec85f148ca746fb4f53358e7b94b83c6399bf7c3147a616abb28aa8aa4002803",
         "94723eccf2713da07b9c8a5a1637a695ec9eb94eb74b3fa9367246c13d9ce1a5",
-        "04797d3ba52391471e769ef644faca19165ff4f1866c8859fd7d232837c32590"
+        "04797d3ba52391471e769ef644faca19165ff4f1866c8859fd7d232837c32590",
+        "e058b0341895d4de3a643b956ec21b7374f0b409be69c2d4364717fa9a8c0cb7",
+        "b75857ac30da3828fd27cb8aec152afb67e6dbd42326ddb0afe102ac22e60d54",
+        "31b17296197780ed291b8b6bd65597c1f65184ba2a1995ca949883bc95dda5ab"
     )
 
     /**
@@ -470,7 +473,13 @@ internal object PostS6ApprovedDelta {
         return scanner.out.toString()
     }
 
-    private fun pathForm(path: String) = path.startsWith(BASE) && path.endsWith(".kt") && !path.startsWith("/") && '\\' !in path &&
+    /**
+     * S7 E5d-J (`e5dj_design.claude.r3.md` §3.1): the one production root besides main a unit may name — the preview host's no-op
+     * hook accessor, compiled into every shipped and benchmark build type. No other root, and nothing outside this package tree.
+     */
+    private const val HOOKS_DEFAULT_BASE = "src/e5dHooksDefault/java/com/jay/fxi/"
+
+    private fun pathForm(path: String) = (path.startsWith(BASE) || path.startsWith(HOOKS_DEFAULT_BASE)) && path.endsWith(".kt") && !path.startsWith("/") && '\\' !in path &&
         '\u0000' !in path && path.split('/').none { it.isEmpty() || it == "." || it == ".." }
 
     private fun JsonObject.string(key: String): String = (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content.orEmpty()

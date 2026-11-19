@@ -11,7 +11,7 @@ import org.junit.Test
 
 /**
  * Claude-owned S7 E5a1 contract (R4c/S7/s7e5 API r2): API r2 §5 row 3, the structure of the read-only bank alert section,
- * read from the comment-free code and strings of the five production roots ([S6Krx3bOffWiringContractTest.ROOTS]; Kotlin
+ * read from the comment-free code and strings of the six production roots ([S6Krx3bOffWiringContractTest.ROOTS]; Kotlin
  * through [PostS6ApprovedDelta.codeAndStrings], Java through `javaCodeAndStrings` below), so a name cannot hide in a comment,
  * a string or an escape.
  *
@@ -49,7 +49,7 @@ class BankAlertSectionStructureTest {
 
     @Test fun `S7E5A1_R3_00 the scan reads every production root comment-free and holds the four E5a1 files`() {
         val roots = S6Krx3bOffWiringContractTest.ROOTS
-        assertTrue("premise(R3): the five production roots exist", roots.size == 5 && roots.all { File(it).isDirectory })
+        assertTrue("premise(R3): the six production roots exist", roots.size == 6 && roots.all { File(it).isDirectory })
         assertTrue("premise(R3): the scan sees the production sources (${code.size})", code.size > 300)
         for (path in listOf(HOLDER, SECTION, ROUTE, OWNER, VM, REGISTRY)) {
             assertTrue("premise(R3): $path is scanned and non-empty", !code[path].isNullOrBlank())

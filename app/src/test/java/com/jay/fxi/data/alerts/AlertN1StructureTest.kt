@@ -12,7 +12,7 @@ import org.junit.Test
 /**
  * Claude-owned S7 N1 contract (R4c/S7/s7n1 API r1-r3): the N1 structure locks — API r1 §9's AlertN1StructureTest row as
  * r2/r3 §7 re-assign it (N1-Q, N1-S with r3's S3 text and Codex API r1's S1 text) — and the structure half of N1-A and N1-P.
- * Everything is read from the comment-free code and strings of the five production roots
+ * Everything is read from the comment-free code and strings of the six production roots
  * ([S6Krx3bOffWiringContractTest.ROOTS]): Kotlin through [PostS6ApprovedDelta.codeAndStrings], Java through
  * `javaCodeAndStrings` below (no root holds Java today; one that appears is scanned the same way, with Java's own rules:
  * Unicode escapes decoded before lexing, block comments not nesting). A reference cannot hide in a comment, a string or an
@@ -57,7 +57,7 @@ class AlertN1StructureTest {
 
     @Test fun `S7N1_S00 the scan reads every production root comment-free in Kotlin and Java`() {
         val roots = S6Krx3bOffWiringContractTest.ROOTS
-        assertTrue("premise(N1-S): the five production roots exist", roots.size == 5 && roots.all { File(it).isDirectory })
+        assertTrue("premise(N1-S): the six production roots exist", roots.size == 6 && roots.all { File(it).isDirectory })
         assertTrue("premise(N1-S): the scan sees the production sources (${code.size})", code.size > 300)
         for (path in NEW_FILES + listOf(VM, SECTION, SHEET, HOLDER, ROUTE, TOPIC_OWNER, APP, FCM, KRX_SAMPLE)) {
             assertTrue("premise(N1-S): $path is scanned", path in code)

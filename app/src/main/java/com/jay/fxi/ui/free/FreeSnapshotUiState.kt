@@ -7,6 +7,7 @@ import com.jay.fxi.domain.model.FreeRate
 import com.jay.fxi.domain.model.FreeSnapshot
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.GraphPeriod
+import com.jay.fxi.ui.alert.BankAlertEditor
 import com.jay.fxi.ui.graph.GraphPreparedBuilder
 import com.jay.fxi.ui.graph.GraphSeriesStyles
 import com.jay.fxi.ui.graph.PreparedGraph
@@ -88,7 +89,14 @@ data class FreeSnapshotUiState(
     /** Every series this answer carries, whether drawn or not — the row has to offer both. */
     val seriesToggles: List<FreeSeriesToggle> = emptyList(),
     /** The lists this tab lets the user rearrange. Empty on 뉴스 and before a snapshot lands. */
-    val rowEditors: List<RateRowEditor> = emptyList()
+    val rowEditors: List<RateRowEditor> = emptyList(),
+    /**
+     * S7 E5d (D26): what the bank alert preview opens with — each editor bank's rate in this tab's snapshot, the hidden rows'
+     * included, before any preference. Empty off the three bank tabs, for another owner, and with no live snapshot.
+     */
+    val previewQuotes: Map<String, Double> = emptyMap(),
+    /** The as_of of the snapshot [previewQuotes] came from, kept with it even when no bank in it is an editor bank. */
+    val previewAsOf: Instant? = null
 ) {
     /**
      * What the scheduler would be activated for.
@@ -146,6 +154,8 @@ data class FreeSnapshotUiState(
             return state.copy(
                 rateSections = sections(entry.snapshot.rate, rowPreferences),
                 rowEditors = editors(entry.snapshot.rate, rowPreferences),
+                previewQuotes = (entry.snapshot.rate as? FreeRate.Flat)?.takeIf { tab in FREE_BANK_ALERT_PREVIEW_TABS }?.let(::previewQuotes).orEmpty(),
+                previewAsOf = entry.snapshot.asOf.takeIf { tab in FREE_BANK_ALERT_PREVIEW_TABS && entry.snapshot.rate is FreeRate.Flat },
                 graph = graph,
                 visibleSeriesIds = visibleSeriesIds,
                 seriesToggles = graph.order.mapNotNull { id ->
@@ -154,6 +164,22 @@ data class FreeSnapshotUiState(
                     }
                 }
             )
+        }
+
+        /**
+         * Each editor bank's rate, in payload order, when it is finite and positive. Citi, KRX and anything unknown are not editor
+         * banks. A bank's first entry claims it even when its value is unusable — a later one never repairs it — which is the
+         * sanitizer's own rule; it already keeps one entry per bank, and this holds without relying on it.
+         */
+        internal fun previewQuotes(rate: FreeRate.Flat): Map<String, Double> {
+            val allowed = BankAlertEditor.BANK_CHOICES.mapTo(HashSet()) { it.code }
+            val claimed = HashSet<String>()
+            val out = LinkedHashMap<String, Double>()
+            for (entry in rate.entries) {
+                if (entry.bank !in allowed || !claimed.add(entry.bank)) continue
+                if (entry.rate.isFinite() && entry.rate > 0) out[entry.bank] = entry.rate
+            }
+            return out
         }
 
         /**

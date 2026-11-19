@@ -15,6 +15,9 @@ import org.junit.Test
  * - X02: the editor model is plain Kotlin and the sheet reaches no owner, source, permission helper, Context, store, network,
  *   lifecycle or effect; the sheet is internal and the model never names it.
  * Each lock has mutations it is shown to catch, beside the unaltered sources that it accepts.
+ *
+ * S7 E5d (B′, `s7e5d_api_agreed.r1.md`): the premium sheet's fields moved to [FIELDS] so the free preview can draw the same
+ * ones. The premium sheet is now those two files read together; every count, binding and ban below is unchanged.
  */
 class S7E5B3AStructureTest {
 
@@ -22,6 +25,7 @@ class S7E5B3AStructureTest {
         val BASE = S6Krx3bOffWiringContractTest.BASE
         val SHEET = BASE + "ui/alert/AlertAddSheet.kt"
         val EDITOR = BASE + "ui/alert/BankAlertEditor.kt"
+        val FIELDS = BASE + "ui/alert/BankAlertEditorFields.kt"
 
         /** Comment-free with every literal kept (the shared reader of the other structure locks). */
         fun code(path: String): String = PostS6ApprovedDelta.codeAndStrings(File(path).readText())
@@ -104,7 +108,7 @@ class S7E5B3AStructureTest {
         }
     }
 
-    private val sheet by lazy { code(SHEET) }
+    private val sheet by lazy { code(SHEET) + "\n" + code(FIELDS) }
     private val editor by lazy { code(EDITOR) }
 
     @Test fun S7E5B3A_X01_theSheetTakesEveryDisplayedDecisionFromTheEditor() {

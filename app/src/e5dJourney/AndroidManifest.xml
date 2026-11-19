@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- S7 E5d-J (e5dj_j2_plan.claude.r3.md §2): the local journey fixture build type. Never in a shipped or published artifact.
+     Analytics, Crashlytics and FCM auto-init stay off; the build supplies only the non-production CI Firebase fixture. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Only an APK signed with the same key may send the fixture's control commands. -->
+    <permission
+        android:name="com.jay.fxi.e5djourney.permission.CONTROL"
+        android:protectionLevel="signature" />
+
+    <application>
+        <meta-data
+            android:name="firebase_analytics_collection_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="firebase_crashlytics_collection_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="firebase_messaging_auto_init_enabled"
+            android:value="false" />
+
+        <!-- Installs the lifecycle recorder before Application.onCreate; the highest initOrder runs first. -->
+        <provider
+            android:name="com.jay.fxi.e5djourney.E5dJourneyLifecycleProvider"
+            android:authorities="com.jay.fxi.e5djourney.lifecycle"
+            android:exported="false"
+            android:initOrder="1000" />
+
+        <!-- The control channel: a provider call, answered on the app's binder threads. Its call checks the permission itself. -->
+        <provider
+            android:name="com.jay.fxi.e5djourney.E5dJourneyControlProvider"
+            android:authorities="com.jay.fxi.e5djourney.control"
+            android:exported="true"
+            android:permission="com.jay.fxi.e5djourney.permission.CONTROL" />
+    </application>
+</manifest>

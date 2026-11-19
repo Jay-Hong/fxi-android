@@ -333,6 +333,33 @@
         "src/main/java/com/jay/fxi/data/local/LastSelectedBankMemory.kt": "b5dd999b5500e206ad6e1d3f639c5946043fd4bca11ffce5701594b5173a34f2",
         "src/main/java/com/jay/fxi/data/local/LastBankSelectionMigration.kt": "406880ab25ebfdc0ab2263e1180731698521697bf21a40b7a95178c939e1ac58"
       }
+    },
+    {
+      "id": "S7-E5d",
+      "source_parent": "069e29ff9bd3b27432105f28aeb5b8ad70f4dea6",
+      "approval_record_sha256": "d798497cda9f1d32850991a1dfa4b74bb14b2a1e8e7c36eb6d925b74f14c2439",
+      "changed": {
+        "src/main/java/com/jay/fxi/ui/free/FreeSnapshotScreen.kt": {
+          "from": "e058b0341895d4de3a643b956ec21b7374f0b409be69c2d4364717fa9a8c0cb7",
+          "to": "dc444dc627f2e53c27737e6ca85714ae29ffe7a6ab980a2068aa838e9c9f856c"
+        },
+        "src/main/java/com/jay/fxi/ui/free/FreeSnapshotUiState.kt": {
+          "from": "b75857ac30da3828fd27cb8aec152afb67e6dbd42326ddb0afe102ac22e60d54",
+          "to": "2abfc0fb3cbd73a73d053d9bcf127e51e61e0919fb660a8abf2e60527295d28a"
+        },
+        "src/main/java/com/jay/fxi/ui/alert/AlertAddSheet.kt": {
+          "from": "31b17296197780ed291b8b6bd65597c1f65184ba2a1995ca949883bc95dda5ab",
+          "to": "8b6874d67074434377dcb3fbd6fb37a12dc5cf7307da322a4bb65ff15b043d86"
+        }
+      },
+      "added": {
+        "src/main/java/com/jay/fxi/ui/free/FreeAlertPreviewSession.kt": "dd53db2426b72b7a5affa37d5e0301eb883157e7b552c28e87daa0478f55f3af",
+        "src/main/java/com/jay/fxi/ui/free/FreeBankAlertPreviewSheet.kt": "a1777c1ba25d6c0e48bbdfbfa2da58b3f543fa9081a720f233e0753745677b3b",
+        "src/main/java/com/jay/fxi/ui/free/FreeBankAlertPreviewSection.kt": "7a9945fd453d226c1ad872544ba0884958e4ad2d2cccacde632383e9c39036c3",
+        "src/main/java/com/jay/fxi/ui/components/SubscribeCTA.kt": "b02f26a37d539d474cbbd6412145e98ec510f85bb74f87ddf8b8a2ec2a152dfb",
+        "src/main/java/com/jay/fxi/ui/alert/BankAlertEditorFields.kt": "b48e48328c69942c070060a4d8a9d883111c34fa52af0c3ac156909908c1d3f9",
+        "src/e5dHooksDefault/java/com/jay/fxi/ui/free/PreviewHostHooksDefault.kt": "c8c5dcdd561e06a63781b375216cd7ebd89430ac37a1403d1150f9500aa29edb"
+      }
     }
   ]
 }

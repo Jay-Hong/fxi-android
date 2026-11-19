@@ -211,7 +211,7 @@ class S6Krx3bOffWiringContractTest {
         internal val OFF_COLUMNS = listOf("GENERAL-WS-REST", "reverse-two-times", "catalog-wait", "continuity-FULL",
             "continuity-FAILED", "continuity-CLOSED", "overflow", "drain", "REST-high", "REST-low",
             "USER-end", "CAP-end", "D1-hold", "server-seed-HTTP", "USD-tether", "assembly-failure", "detach-close")
-        internal val ROOTS = listOf("src/main/java", "src/productionBindings/java", "src/s5Benchmark/java", "src/debug/java", "src/benchmark/java")
+        internal val ROOTS = listOf("src/main/java", "src/productionBindings/java", "src/s5Benchmark/java", "src/debug/java", "src/benchmark/java", "src/e5dHooksDefault/java")
         internal const val BASE = "src/main/java/com/jay/fxi/"
         internal val ALLOWED = setOf(
             "data/graph/KrxGraphMemoryPurge.kt",

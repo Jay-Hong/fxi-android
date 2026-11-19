@@ -10,7 +10,7 @@ import java.io.File
 /**
  * `fxi_user_intent` has one DataStore, and each concern in it keeps to its own keys (S7 E5b4a).
  *
- * Read from the comment-free code and string literals of the five production roots
+ * Read from the comment-free code and string literals of the six production roots
  * ([S6Krx3bOffWiringContractTest.ROOTS]). DataStore refuses two instances over one file at run time,
  * but only when both are touched in the same process; a second delegate that no test happens to
  * touch would ship. [BackupRulesLedgerTest] collects store names into a set, so it does not see a

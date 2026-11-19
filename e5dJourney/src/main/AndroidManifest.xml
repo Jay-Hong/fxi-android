@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- S7 E5d-J: the journey test APK. It sends the fixture's control commands under its signature permission, sees the app's
+     package, and (J2b) moves a saved task to the front after a process death. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="com.jay.fxi.e5djourney.permission.CONTROL" />
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
+    <queries>
+        <package android:name="com.jay.fxi" />
+    </queries>
+</manifest>

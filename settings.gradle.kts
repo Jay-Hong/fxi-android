@@ -22,3 +22,5 @@ dependencyResolutionManagement {
 rootProject.name = "FXi"
 include(":app")
 include(":macrobenchmark")
+// S7 E5d-J: the local journey test APK (e5dj_design.claude.r3.md §3.3).
+include(":e5dJourney")
