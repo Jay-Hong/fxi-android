@@ -2042,6 +2042,7 @@ Android S10의 v2.0 보증은 **현재 설치의 crash/process-death 복구**까
 - legacy REST 호출·WS `rates` 소비 0을 proxy/network assertion과 source scan으로 증명한다.
 - USDT source evaluator owner는 source별 단일이어야 한다. 정상 v2는
   `USDT_LEGACY_REST_POLLING_ENABLED=false`이고 enabled WS/fallback owner만 발화한다.
+- Internal 단계에 들어가기 전에 S7 premium Home·복귀 관찰 O1을 완료한다. U3a-1 뒤 U3a-2 전에 저부하로 시작한 API 32 온라인 fixture에서 FCM 주입 없이 같은 PID로 최대 20회 관찰한다. 대상 MainActivity의 포커스 상실 input-dispatch timeout이 한 번이라도 확인되면 원인을 조사·시정하고 같은 조건에서 20회 미재현을 확인할 때까지 Internal을 포함한 rollout을 보류한다. 유효한 20회 미재현이면 O1을 닫고 단계 확대에는 기존 ANR 품질 중단 기준을 적용한다. 무효·미확인은 재관찰하고, 연속 2회면 멈추고 사용자에게 보고한다. 정의와 증거는 `R4c/S7/s7u3a/`의 O1 결정·실행 기록에 둔다(2026-11-20 사용자 위임에 따른 Claude·Codex 합의).
 - rollout 순서: Debug contract/integration → ON-minified R8 → Internal 24h → Closed 48h →
   staged 1%/24h → 5%/24h → 20%/48h → 50%/48h → 100%.
   각 확대는 dashboard snapshot과 별도 GO를 요구한다.
@@ -2205,6 +2206,7 @@ v1 store는 소유권 또는 shape가 v2 계약과 맞지 않으므로 **이관�
 - SV-2가 KRX row를 ORDER BY/LIMIT 전에 거르고 응답 `total_count`도 필터 후 페이지 길이인지 확인한다.
 - 로그아웃/free/premium/premium+KRX **4계정** read-only access matrix와 실제 FCM
   foreground/background/process-killed smoke를 수행한다.
+- 위 4계정 확인의 premium 계정으로 실기기에서 출시형 빌드를 사용해 premium 화면의 Home → 앱 복귀를 1회 수행하고, premium 화면·상태 복귀 여부와 대상 앱의 크래시·ANR 건수를 단말·빌드와 함께 기록한다.
 - allow+FCM success 뒤 once/repeat/발송 히스토리가 현 iOS/server 의미와 맞는지 확인한다.
 - gated sender 유지 또는 alert pause rollback rehearsal를 완료한다.
 
