@@ -7,4 +7,17 @@
     <queries>
         <package android:name="com.jay.fxi" />
     </queries>
+
+    <!-- S7 U3a: this test APK's own notification listener, so a journey counts every post of the app's notifications. The
+         journey allows it for its run and takes the access back; only the system may bind it. -->
+    <application>
+        <service
+            android:name="com.jay.fxi.e5djourney.test.E5dJourneyNotificationListener"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+    </application>
 </manifest>

@@ -376,9 +376,12 @@ class E5dJourneyStructureTest {
         val ready = READY_LINES[1]
         assertTrue(source.count(READY_LINES[2]) == 1)
         for ((what, broken) in listOf(
-            "local-premium not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK)", "RELEASE, ACCESS, SEED_LAST_BANK)"),
-            "access not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK)", "RELEASE, LOCAL_PREMIUM, SEED_LAST_BANK)"),
-            "seed-last-bank not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK)", "RELEASE, LOCAL_PREMIUM, ACCESS)"),
+            "local-premium not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR)", "RELEASE, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR)"),
+            "access not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR)", "RELEASE, LOCAL_PREMIUM, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR)"),
+            "seed-last-bank not waiting" to source.replace("RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR)", "RELEASE, LOCAL_PREMIUM, ACCESS, FCM, NOTIFICATIONS_CLEAR)"),
+            // U3a: a synthetic delivery and the clearing of notifications change the app's state, so they wait as well.
+            "fcm not waiting" to source.replace("SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR)", "SEED_LAST_BANK, NOTIFICATIONS_CLEAR)"),
+            "notifications-clear not waiting" to source.replace("SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR)", "SEED_LAST_BANK, FCM)"),
             "readiness checked after the graph" to source.replace("$ready\n", "").replace(READY_LINES[2], READY_LINES[2] + "\n        $ready"),
             "readiness removed" to source.replace("$ready\n", "")
         )) {
@@ -762,7 +765,8 @@ class E5dJourneyStructureTest {
             "if (command in NEEDS_READY && !ready()) return answer(REJECT, mapOf(\"reason\" to \"not-ready\"))",
             "val entry by lazy { EntryPointAccessors.fromApplication(context.applicationContext, E5dJourneyEntryPoint::class.java) }"
         )
-        const val NEEDS_READY_LINE = "private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK)"
+        const val NEEDS_READY_LINE =
+            "private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR)"
 
         fun readinessProblems(source: String): List<String> {
             val lines = source.lines().map(String::trim)

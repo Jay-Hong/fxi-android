@@ -566,6 +566,10 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         // Absent today; appearing, either would build code onto every script's classpath.
         rootProject.file("buildSrc"), rootProject.file("build-logic")
     ).withPropertyName("e5dJourneyStructureScripts").withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+    // S7 U3a (`s7u3a1_contract.codex.r1.md` Q6): E5dJourneyJ13GoldenDataTest reads the journey's copies of the FCM goldens from
+    // this file of the test module and compares them with the corpus, so a change to it reruns the test.
+    inputs.file(rootProject.file("e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J13FcmDisplayTest.kt"))
+        .withPropertyName("e5dJourneyJ13GoldenCopies").withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
     // The names of every Gradle script in the repository (`s7e5dj_j2a.codex.r3.md` C), walked as the structure test walks
     // them — build and tool directories skipped, links not followed, names only — so a script added or removed anywhere reruns it.
     inputs.property("e5dJourneyRepoScripts", provider { e5dJourneyRepoScripts() })

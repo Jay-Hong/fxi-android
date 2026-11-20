@@ -1,13 +1,21 @@
 package com.jay.fxi.e5djourney
 
+import android.app.ActivityManager
+import android.app.KeyguardManager
+import android.app.Notification
+import android.app.NotificationManager
 import android.content.ContentProvider
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
+import com.google.android.gms.tasks.Tasks
+import com.google.firebase.messaging.FcmBroadcastProcessor
 import dagger.hilt.android.EntryPointAccessors
+import java.util.concurrent.Executors
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -16,10 +24,11 @@ import kotlinx.serialization.json.JsonPrimitive
 /**
  * S7 E5d-J (`e5dj_j2_plan.claude.r3.md` R4, R7; `s7e5dj_j2b_channel.codex.r1.md` R1–R3): the fixture's control channel, a
  * provider call. The provider is exported under the signature permission, and [call] checks that permission itself, first,
- * before anything else: a provider's call is not covered by its manifest permission. The commands run on the app's binder
- * threads, one at a time under a lock of their own that no UI, lifecycle or hook callback takes, and none waits on the main
- * thread; so a busy main thread or a crowded broadcast queue no longer stands between a command and its answer. Getting the
- * provider and starting the process still go through the system and the main thread's start-up.
+ * before anything else: a provider's call is not covered by its manifest permission. The provider serializes commands on
+ * its binder threads, one at a time under a lock of their own that no UI, lifecycle or hook callback takes. The fcm command
+ * waits for the SDK task on a dedicated worker. Initial service connection can depend on main-thread progress, and the client
+ * bounds the call at 30 seconds. Getting the provider and starting the process still go through the system and the main
+ * thread's start-up.
  *
  * Every request carries an id and, except `discover`, the nonce of the process it was meant for; another nonce is a REJECT
  * before the app's graph is touched, so nothing aimed at a dead process is replayed in a new one. `discover` and `dump` read only
@@ -139,8 +148,82 @@ internal object E5dJourneyControl {
                 E5dJourneyRecord.add("control", "last-bank seeded kb read-back=$readBack")
                 answer(ACK, mapOf("readBack" to readBack, "recordUpper" to E5dJourneyRecord.upper()))
             }
+            // U3a (`u3a_design.claude.r2.md` §1–§2; `s7u3a_design.codex.r2.md` Q4): one synthetic delivery, handed once to the
+            // SDK's own broadcast processor — the call FirebaseInstanceIdReceiver makes — off this binder thread, whose calling
+            // uid is the test APK's and which the SDK's in-app binder refuses. The answer waits for the processor's Task and
+            // carries its result; no timer here answers for an unfinished delivery, so the client's own deadline is the only
+            // one, and a call it gives up on leaves the process to be isolated. An ACK is the processor having returned, not a
+            // notification posted or the app's callback run: those are read from the notifications and the record.
+            FCM -> {
+                val intent = fcmIntent(extras) ?: return answer(REJECT, mapOf("reason" to "fcm"))
+                val mid = extras.getString(EXTRA_MESSAGE_ID)
+                val visible = intent.hasExtra("gcm.n.e")
+                @Suppress("DEPRECATION") // the reading DisplayNotification.isAppForeground itself takes
+                val keyguard = context.getSystemService(KeyguardManager::class.java).inKeyguardRestrictedInputMode()
+                val before = importance()
+                val outcome = runCatching {
+                    fcmWorker.submit<Int> { Tasks.await(FcmBroadcastProcessor(context.applicationContext).process(intent)) }.get()
+                }
+                val after = importance()
+                val failure = outcome.exceptionOrNull()?.let { (it.cause ?: it).toString() }
+                E5dJourneyRecord.add("control", "fcm mid=$mid visible=$visible result=${outcome.getOrNull()} failure=$failure")
+                val readings = mapOf("importanceBefore" to before, "importanceAfter" to after, "keyguard" to keyguard)
+                if (failure != null) answer(REJECT, readings + mapOf("reason" to "fcm-failed", "failure" to failure))
+                else answer(ACK, readings + mapOf("result" to outcome.getOrNull()))
+            }
+            // U3a: this package's notifications as they stand now, read without the graph; `now` is this device's clock.
+            NOTIFICATIONS -> {
+                val active = context.getSystemService(NotificationManager::class.java).activeNotifications.map {
+                    mapOf("tag" to it.tag, "id" to it.id, "channel" to it.notification.channelId,
+                        "title" to it.notification.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString(), "postTime" to it.postTime)
+                }
+                answer(ACK, mapOf("active" to active, "now" to System.currentTimeMillis()))
+            }
+            NOTIFICATIONS_CLEAR -> {
+                context.getSystemService(NotificationManager::class.java).cancelAll()
+                answer(ACK, emptyMap())
+            }
             else -> answer(REJECT, mapOf("reason" to "command"))
         }
+    }
+
+    /** U3a: the one thread a synthetic delivery is handed to the SDK on; never a binder thread. */
+    private val fcmWorker by lazy { Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "e5d-journey-fcm").apply { isDaemon = true } } }
+
+    private fun importance(): Int = ActivityManager.RunningAppProcessInfo().also { ActivityManager.getMyMemoryState(it) }.importance
+
+    /**
+     * U3a: the RECEIVE intent of one delivery — the caller's data strings as they are, the notification keys only for a visible
+     * one, and its own message id. A delivery is data-only when neither a title nor a body key is there, and visible when both
+     * are there and both are Strings. Null for an input the command does not take: no message id, a data value that is not a
+     * String, a data key in the SDK's or the envelope's own namespace, or any other title and body — one without the other, an
+     * explicit null, or a value that is not a String.
+     */
+    private fun fcmIntent(extras: Bundle): Intent? {
+        @Suppress("DEPRECATION")
+        val mid = (extras.get(EXTRA_MESSAGE_ID) as? String)?.takeIf { it.isNotEmpty() } ?: return null
+        val data = extras.getBundle(EXTRA_DATA) ?: return null
+        val visible = extras.containsKey(EXTRA_TITLE) || extras.containsKey(EXTRA_BODY)
+        @Suppress("DEPRECATION")
+        val title = extras.get(EXTRA_TITLE) as? String
+        @Suppress("DEPRECATION")
+        val body = extras.get(EXTRA_BODY) as? String
+        if (visible && (title == null || body == null)) return null
+        val intent = Intent(FCM_RECEIVE)
+        for (key in data.keySet()) {
+            @Suppress("DEPRECATION")
+            val value = data.get(key) as? String ?: return null
+            if (FCM_RESERVED_PREFIXES.any { key.startsWith(it) } || key in FCM_ENVELOPE_KEYS) return null
+            intent.putExtra(key, value)
+        }
+        if (visible) {
+            intent.putExtra("gcm.n.e", "1")
+            intent.putExtra("gcm.n.title", title)
+            intent.putExtra("gcm.n.body", body)
+        }
+        intent.putExtra("google.message_id", mid)
+        intent.putExtra("from", FCM_SENDER)
+        return intent
     }
 
     /** The lifecycle recorder's three acknowledgements (R5): the app has started far enough for its graph to be the app's own. */
@@ -170,6 +253,10 @@ internal object E5dJourneyControl {
     const val EXTRA_BINDING = "binding"
     const val EXTRA_OPERATION = "operation"
     const val EXTRA_TOKEN = "token"
+    const val EXTRA_DATA = "data"
+    const val EXTRA_MESSAGE_ID = "mid"
+    const val EXTRA_TITLE = "title"
+    const val EXTRA_BODY = "body"
     const val ACK = 1
     const val REJECT = 2
     const val PAGE_MAX = 200
@@ -186,5 +273,13 @@ internal object E5dJourneyControl {
     const val LOCAL_PREMIUM = "local-premium"
     const val ACCESS = "access"
     const val SEED_LAST_BANK = "seed-last-bank"
-    private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK)
+    const val FCM = "fcm"
+    const val NOTIFICATIONS = "notifications"
+    const val NOTIFICATIONS_CLEAR = "notifications-clear"
+
+    private const val FCM_RECEIVE = "com.google.android.c2dm.intent.RECEIVE"
+    private const val FCM_SENDER = "000000000000"
+    private val FCM_RESERVED_PREFIXES = listOf("google.", "gcm.")
+    private val FCM_ENVELOPE_KEYS = setOf("from", "message_type", "collapse_key")
+    private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR)
 }
