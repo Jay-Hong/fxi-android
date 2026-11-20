@@ -21,7 +21,13 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     # S5-4 4c adds the s5Benchmark unit tests, assemble and artifact checks (about 8 minutes) to a job that took 21-32 minutes.
-    timeout-minutes: 60
+    # 2026-11-20: the job took 50-53 minutes on three runs in a row (5ef3cdca, a55c250a, df9cc5cc; runner image versions
+    # 20261111.127.1 and 20261116.133.1). Both attempts for 5d166fb1 used image 20261116.376.1. The logs show eight cache
+    # restore successes per run and matching task counts for the Gradle calls completed in all five runs. The unchanged
+    # stdlib-only tools/performance suite took 331 s and 329 s instead of 166-169 s. Both attempts were
+    # cancelled at 60 minutes in step 17 (Macrobenchmark compile) with no failed step. At that pace the whole job is
+    # estimated at 70 to 75 minutes.
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v5
 
