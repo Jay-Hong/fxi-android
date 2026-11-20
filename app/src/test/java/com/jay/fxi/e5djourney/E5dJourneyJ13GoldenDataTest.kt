@@ -32,6 +32,11 @@ import org.junit.Test
  * on directly; it is not a proof that a copy is only ever a plain argument. The journey's source keeps no non-ASCII whitespace
  * or format character: a no-break space is written as its escape.
  *
+ * S7 U3a-2 (`s7u3a2_contract.codex.r1.md` Q3): the journey J14 has copies of its own (the once golden and the sync golden) and
+ * a `deliver` of its own, and is read the same way — each journey as one bundle of its source file, the class whose own
+ * companion holds the copies, and which golden each copy is ([Journey]). A copy in another class's companion is not that
+ * journey's, and both journeys' `deliver` must be the one reviewed form.
+ *
  * Not shown here: that the device run used this source (the run's own frozen manifest fixes that), what the device did with
  * the strings (the journey's own assertions), anything about the notification title the journey sends, which is its own marker
  * and not the golden's, a call made inside a string template's interpolation, and what a caller of `deliver` does to the data
@@ -53,26 +58,31 @@ class E5dJourneyJ13GoldenDataTest {
     }
 
     @Test
-    fun theJourneysThreeCopiesAreTheGoldensData() {
-        val source = source()
-        for ((name, id) in COPIES) {
-            val copy = copy(source, name)
-            assertNotNull("$name: declared once in the companion as one mapOf call of plain string pairs", copy)
-            assertEquals("$name against $id", emptyList<String>(), problems(copy!!, data(id)))
+    fun theJourneysCopiesAreTheGoldensData() {
+        assertEquals("premise: J13 has three copies and J14 two", listOf(setOf("ONCE", "REPEAT", "SYNC"), setOf("ONCE", "SYNC")), JOURNEYS.map { it.copies.keys })
+        for (journey in JOURNEYS) {
+            val source = journey.source()
+            for ((name, id) in journey.copies) {
+                val copy = copy(source, name, journey)
+                assertNotNull("${journey.klass}.$name: declared once in the companion as one mapOf call of plain string pairs", copy)
+                assertEquals("${journey.klass}.$name against $id", emptyList<String>(), problems(copy!!, data(id)))
+            }
         }
     }
 
     @Test
     fun aVisibleDeliveryCarriesTheCopysOwnBody_andTheListedMisusesOfACopyAreAbsent() {
-        val source = source()
-        for ((name, id) in COPIES - "SYNC") {
-            val golden = root(id)
-            val body = (golden.getValue("notification").jsonObject.getValue("body") as JsonPrimitive).content
-            assertEquals("$id: the golden's notification body is its data body", body, (data(id).getValue("body") as JsonPrimitive).content)
-            assertEquals("$name: body", body, copy(source, name)!!.single { it.first == "body" }.second)
+        for (journey in JOURNEYS) {
+            val source = journey.source()
+            for ((name, id) in journey.copies - "SYNC") {
+                val golden = root(id)
+                val body = (golden.getValue("notification").jsonObject.getValue("body") as JsonPrimitive).content
+                assertEquals("$id: the golden's notification body is its data body", body, (data(id).getValue("body") as JsonPrimitive).content)
+                assertEquals("${journey.klass}.$name: body", body, copy(source, name, journey)!!.single { it.first == "body" }.second)
+            }
+            assertEquals("${journey.klass}: deliver", emptyList<String>(), deliverProblems(source))
+            assertEquals("${journey.klass}: the copies' uses", emptyList<String>(), useProblems(source, journey))
         }
-        assertEquals("deliver", emptyList<String>(), deliverProblems(source))
-        assertEquals("the copies' uses", emptyList<String>(), useProblems(source))
     }
 
     /** What the reviewed form says, read from its own tokens: a reading aid with teeth against changing both sides together. */
@@ -96,7 +106,9 @@ class E5dJourneyJ13GoldenDataTest {
     @Test
     fun theJourneysSourceKeepsNoInvisibleCharacter() {
         // A no-break space typed into a literal reads as a space; the copies write it as an escape so that it can be seen.
-        assertEquals("non-ASCII whitespace or format characters in the journey's source", emptyList<String>(), invisible(source()))
+        for (journey in JOURNEYS) {
+            assertEquals("${journey.klass}: non-ASCII whitespace or format characters in the journey's source", emptyList<String>(), invisible(journey.source()))
+        }
         // Counted by code point: a format character outside the basic plane is two chars, neither of them a format character.
         val tag = String(Character.toChars(0xE0001))
         assertEquals(listOf("U+00A0", "U+200B", "U+E0001"), invisible("a" + 0xA0.toChar() + "b " + 0x200B.toChar() + tag + "\n"))
@@ -219,12 +231,43 @@ class E5dJourneyJ13GoldenDataTest {
         assertTrue("a copy assigned on", useProblems(changed(source, home, "val once = ONCE\n            $home")).isNotEmpty())
     }
 
+    /** S7 U3a-2: J14's bundle bites on its own source — a wrong copy, a changed `deliver`, and a copy that is another class's. */
+    @Test
+    fun negatives_j14sCopiesItsDeliverAndItsOwnCompanion() {
+        val source = J14.source()
+        val golden = data("fcm-rate-alert-once")
+        val gaps = "하나은행\\u00A0\\u00A0달러\\u00A0\\u00A01391.2"
+        assertTrue("ordinary spaces in J14's once title",
+            problems(copy(changed(source, gaps, "하나은행  달러  1391.2"), "ONCE", J14)!!, golden).any { it.startsWith("title:") })
+        assertTrue("J14's sync copy is not the once golden", problems(copy(source, "SYNC", J14)!!, golden).isNotEmpty())
+        assertTrue("another body in J14's deliver",
+            deliverProblems(changed(source, "putExtra(\"body\", data.getValue(\"body\"))", "putExtra(\"body\", \"other\")")).isNotEmpty())
+        assertTrue("J14's deliver not private", deliverProblems(changed(source, "private fun deliver(", "fun deliver(")).isNotEmpty())
+        // A journey's copies are the ones its own class's companion holds: neither journey reads the other's.
+        assertNull("J13's source read as J14", copy(J13.source(), "ONCE", J14))
+        assertNull("J14's source read as J13", copy(source, "ONCE", J13))
+        assertNull("J14 declares no repeat copy", copy(source, "REPEAT", J14))
+        val syncUse = Regex("""\bSYNC, visible""")
+        assertTrue("premise: J14 hands its sync copy to deliver", syncUse.containsMatchIn(source))
+        assertTrue("a J14 copy never used", useProblems(source.replace(syncUse, "mapOf(\"type\" to \"sync_alerts\"), visible"), J14).any { it == "SYNC: never used" })
+    }
+
     companion object {
         const val JOURNEY = "../e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J13FcmDisplayTest.kt"
         const val SYNC_DECLARATION = "val SYNC = mapOf(\"type\" to \"sync_alerts\")"
         val COPIES = mapOf("ONCE" to "fcm-rate-alert-once", "REPEAT" to "fcm-rate-alert-repeat", "SYNC" to "fcm-sync-alerts")
 
         const val JOURNEY_CLASS = "J13FcmDisplayTest"
+
+        /** One journey as this test reads it: its source file, the class whose own companion holds the copies, and each copy's golden. */
+        class Journey(val path: String, val klass: String, val copies: Map<String, String>) {
+            fun source(): String = File(path).readText()
+        }
+
+        val J13 = Journey(JOURNEY, JOURNEY_CLASS, COPIES)
+        val J14 = Journey("../e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J14FcmReturnAndTapTest.kt", "J14FcmReturnAndTapTest",
+            mapOf("ONCE" to "fcm-rate-alert-once", "SYNC" to "fcm-sync-alerts"))
+        val JOURNEYS = listOf(J13, J14)
 
         /** The journey class with a companion that declares just [declaration]. */
         fun inCompanion(declaration: String): String = "class $JOURNEY_CLASS {\n    private companion object {\n        $declaration\n    }\n}\n"
@@ -348,11 +391,11 @@ class E5dJourneyJ13GoldenDataTest {
 
         /**
          * The braces of the companion the journey class itself declares: the one `companion object` directly in the body of the
-         * one `class J13FcmDisplayTest` of [code], its opening brace to its closing one. Another class's companion, or a nested
-         * class's, is not it.
+         * one `class [name]` of [code], its opening brace to its closing one. Another class's companion, or a nested class's, is
+         * not it.
          */
-        private fun companionBraces(code: String): IntRange? {
-            val klass = Regex("""\bclass $JOURNEY_CLASS\s*\{""").findAll(code).toList().singleOrNull()?.range?.last ?: return null
+        private fun companionBraces(code: String, name: String): IntRange? {
+            val klass = Regex("""\bclass ${Regex.escape(name)}\s*\{""").findAll(code).toList().singleOrNull()?.range?.last ?: return null
             val klassEnd = close(code, klass) ?: return null
             val open = Regex("""\bcompanion object\s*\{""").findAll(code).map { it.range }
                 .filter { it.first in klass..klassEnd && level(code, klass + 1, it.first) == 0 }.toList().singleOrNull()?.last ?: return null
@@ -365,9 +408,9 @@ class E5dJourneyJ13GoldenDataTest {
          * holds only `"key" to "value"` pairs with commas between, and nothing follows the call but the next `val` or the end of
          * the companion.
          */
-        fun copy(source: String, name: String): List<Pair<String, String>>? {
+        fun copy(source: String, name: String, journey: Journey = J13): List<Pair<String, String>>? {
             val code = bare(source) ?: return null
-            val companion = companionBraces(code) ?: return null
+            val companion = companionBraces(code, journey.klass) ?: return null
             val start = Regex("""\bval ${Regex.escape(name)} = mapOf\(""").findAll(code).toList().singleOrNull()?.range ?: return null
             if (start.first !in companion || level(code, companion.first + 1, start.first) != 0) return null
             val literals = ArrayList<String>()
@@ -543,10 +586,10 @@ class E5dJourneyJ13GoldenDataTest {
          * opening parenthesis or a comma and a comma or a closing parenthesis. It is not a proof that a copy is only ever a
          * plain argument — `(ONCE).mapValues { … }` passes it — and it refuses a named argument.
          */
-        fun useProblems(source: String): List<String> {
+        fun useProblems(source: String, journey: Journey = J13): List<String> {
             val code = bare(source) ?: return listOf("the source does not lex")
             val problems = ArrayList<String>()
-            for (name in COPIES.keys) {
+            for (name in journey.copies.keys) {
                 val uses = Regex("""\b$name\b""").findAll(code).map { it.range }
                     .filterNot { code.substring(0, it.first).trimEnd().endsWith("val") }.toList()
                 if (uses.isEmpty()) problems += "$name: never used"

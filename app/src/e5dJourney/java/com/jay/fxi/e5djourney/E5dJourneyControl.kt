@@ -183,6 +183,17 @@ internal object E5dJourneyControl {
                 context.getSystemService(NotificationManager::class.java).cancelAll()
                 answer(ACK, emptyMap())
             }
+            // U3a-2: the loopback server's row put in the fired or the armed shape (E5dJourneyServer.alertRow). Both extras are
+            // strings; anything else, an id that does not read as a number, a state the server does not take or a row it does
+            // not hold is refused with nothing changed. `recordUpper` is the record after the change's own line.
+            ALERT_ROW -> {
+                @Suppress("DEPRECATION")
+                val id = (extras.get(EXTRA_ID) as? String)?.toIntOrNull() ?: return answer(REJECT, mapOf("reason" to "alert-row"))
+                @Suppress("DEPRECATION")
+                val state = extras.get(EXTRA_ARG) as? String ?: return answer(REJECT, mapOf("reason" to "alert-row"))
+                if (!entry.server().alertRow(id, state)) return answer(REJECT, mapOf("reason" to "alert-row"))
+                answer(ACK, mapOf("id" to id, "state" to state, "recordUpper" to E5dJourneyRecord.upper()))
+            }
             else -> answer(REJECT, mapOf("reason" to "command"))
         }
     }
@@ -276,10 +287,12 @@ internal object E5dJourneyControl {
     const val FCM = "fcm"
     const val NOTIFICATIONS = "notifications"
     const val NOTIFICATIONS_CLEAR = "notifications-clear"
+    const val ALERT_ROW = "alert-row"
+    const val EXTRA_ID = "id"
 
     private const val FCM_RECEIVE = "com.google.android.c2dm.intent.RECEIVE"
     private const val FCM_SENDER = "000000000000"
     private val FCM_RESERVED_PREFIXES = listOf("google.", "gcm.")
     private val FCM_ENVELOPE_KEYS = setOf("from", "message_type", "collapse_key")
-    private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR)
+    private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW)
 }

@@ -111,6 +111,32 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
 
     fun answerState(): String = E5dJourneyRecord.under { answer.toString() }
 
+    /**
+     * U3a-2: the owner's row [id] put in the shape the real server holds after a once alert was sent ("fired": disabled,
+     * triggered, with a trigger time) or in the contract's own shape ("armed"). Only those three fields are replaced; the rows'
+     * order and number and every other field stay. Another state, or a row that is not there, changes nothing — not even the
+     * list being read for the first time — and leaves no line. The check, the change and its line are under the record's one
+     * lock, as a request's answer and its line are.
+     */
+    fun alertRow(id: Int, state: String): Boolean = E5dJourneyRecord.under {
+        val fired = when (state) {
+            "fired" -> true
+            "armed" -> false
+            else -> return@under false
+        }
+        val rows = alertRows ?: initialRows()
+        val index = rows.indexOfFirst { it.getValue("id").jsonPrimitive.intOrNull == id }
+        if (index < 0) return@under false
+        rows[index] = JsonObject(rows[index] + mapOf(
+            "is_enabled" to JsonPrimitive(!fired),
+            "triggered" to JsonPrimitive(fired),
+            "triggered_at" to (if (fired) JsonPrimitive(ALERT_FIRED_AT) else JsonNull)
+        ))
+        alertRows = rows
+        E5dJourneyRecord.add("server", "alerts row id=$id -> $state n=${rows.size}")
+        true
+    }
+
     override fun close() {
         server.shutdown()
     }
@@ -181,8 +207,7 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
     /** Only ever called inside [E5dJourneyRecord.addWith]: the owner's list, or a create applied to it. */
     private fun alertSettings(method: String, query: Map<String, List<String?>>, body: String): Pair<String, MockResponse> {
         if (query.isNotEmpty()) return unexpected()
-        val rows = alertRows ?: Json.parseToJsonElement(load(ALERT_LIST).decodeToString()).jsonObject.getValue("settings").jsonArray
-            .map { row -> boundRow(row.jsonObject) }.toMutableList().also { alertRows = it }
+        val rows = alertRows ?: initialRows().also { alertRows = it }
         return when (method) {
             "GET" -> "alerts list n=${rows.size} ids=${rows.map { it.getValue("id") }}" to
                 ok(Json.encodeToString(JsonObject.serializer(), JsonObject(mapOf("settings" to JsonArray(rows), "total_count" to JsonPrimitive(rows.size)))).encodeToByteArray())
@@ -199,6 +224,10 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
             else -> unexpected()
         }
     }
+
+    /** The owner's list as the contract's file gives it, every row bound ([boundRow]); whoever takes it decides whether to keep it. */
+    private fun initialRows(): MutableList<JsonObject> = Json.parseToJsonElement(load(ALERT_LIST).decodeToString()).jsonObject
+        .getValue("settings").jsonArray.map { row -> boundRow(row.jsonObject) }.toMutableList()
 
     /**
      * A contract row as this server holds it: bound to this build's owner, and with an update time. The contract's rows carry
@@ -394,6 +423,9 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
         const val REGISTER_DEVICE = "/api/register-device"
         const val ALERT_LIST = "bank-settings-list.json"
         const val ALERT_ROW = "bank-setting-response.json"
+
+        /** U3a-2: the trigger time a row gets when it is put in the fired shape; a fixed value after the contract row's creation. */
+        const val ALERT_FIRED_AT = "2026-09-01T09:00:00+09:00"
         const val PONG = "{\"type\":\"pong\"}"
         val ALERT_CURRENCIES = setOf("usd-krw", "jpy-krw", "eur-krw")
         val ALERT_CREATE_KEYS = setOf("bank", "currency", "condition", "threshold", "is_enabled", "repeat_interval_sec")

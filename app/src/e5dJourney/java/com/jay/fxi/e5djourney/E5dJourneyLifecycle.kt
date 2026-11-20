@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.Application
 import android.content.ContentProvider
 import android.content.ContentValues
+import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
@@ -70,7 +71,24 @@ internal object E5dJourneyLifecycle : Application.ActivityLifecycleCallbacks {
         }
         note(activity, "pre-created saved=${savedInstanceState != null} config=${activity.resources.configuration.orientation}/" +
             "${activity.resources.configuration.screenWidthDp}x${activity.resources.configuration.screenHeightDp}")
+        // U3a-2: read only, and before the Activity's own code reads or clears them — what the Intent that started this
+        // Activity carries under the keys an alert tap is parsed from. Its own stream: the `activity` lines keep their form.
+        E5dJourneyRecord.add("intent", "${activity.javaClass.simpleName}#$activityId launch ${launch(activity.intent)}")
     }
+
+    /** The flags, the action and, for each of [TAP_KEYS], whether [intent] carries it and as what: its class and its text. */
+    private fun launch(intent: Intent?): String {
+        val extras = intent?.extras
+        val carried = TAP_KEYS.joinToString(",") { key ->
+            if (extras?.containsKey(key) != true) return@joinToString "$key:absent"
+            @Suppress("DEPRECATION") // the value's own class is what is recorded; a typed getter would coerce or drop it
+            val value = extras.get(key) ?: return@joinToString "$key:null"
+            "$key:${value.javaClass.simpleName}=${value.toString().take(40)}"
+        }
+        return "flags=0x${Integer.toHexString(intent?.flags ?: 0)} action=${intent?.action} extras[$carried]"
+    }
+
+    private val TAP_KEYS = listOf("notification_type", "type", "setting_id", "is_repeat")
 
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = note(activity, "created")
     override fun onActivityStarted(activity: Activity) = note(activity, "started")

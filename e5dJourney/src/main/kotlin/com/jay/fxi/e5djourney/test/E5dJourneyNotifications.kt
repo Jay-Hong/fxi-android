@@ -3,6 +3,8 @@ package com.jay.fxi.e5djourney.test
 import android.app.Notification
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import androidx.test.uiautomator.By
+import androidx.test.uiautomator.UiObject2
 import com.jay.fxi.e5djourney.test.E5dJourneyRun.Companion.texts
 
 /**
@@ -119,12 +121,30 @@ internal class E5dJourneyNotifications(private val run: E5dJourneyRun) {
     }
 
     /**
-     * Waits out the trailing time, then fixes the listener's connection state and the window's posts in one reading. The active
+     * U3a-2: a later boundary in the same case, with nothing cleared — where the listener's posts, the app's clock and the
+     * settings GETs stand now. The listener must still be on the connection [first], the case's one [open], saw; the boundary
+     * carries that connection, so a [read] or a [close] from it also fails when the listener was ever away since the case opened.
+     */
+    fun mark(nonce: String, first: Window): Window {
+        val state = E5dJourneyNotificationListener.state()
+        check(state.connected && state.connections == first.state.connections && state.disconnections == first.state.disconnections) {
+            "관측 경계를 잡을 때 listener 접속이 바뀌어 있다(미확인): ${first.state} -> $state"
+        }
+        return Window(state.posted, first.state, active(nonce).second, settingsGets(nonce))
+    }
+
+    /** Waits out the trailing time, then [read]s. */
+    fun close(nonce: String, window: Window, pid: Int): Observation {
+        Thread.sleep(TRAILING_MILLIS)
+        return read(nonce, window, pid)
+    }
+
+    /**
+     * The window as it stands now: the listener's connection state and the window's posts are fixed in one reading. The active
      * list, the settings GETs and the type lines are read after that, one after another; a listener whose connection changed
      * during the window or while those were read is a failure (not observed), never a result.
      */
-    fun close(nonce: String, window: Window, pid: Int): Observation {
-        Thread.sleep(TRAILING_MILLIS)
+    fun read(nonce: String, window: Window, pid: Int): Observation {
         val (state, posted) = E5dJourneyNotificationListener.snapshot(window.from)
         fun same(now: E5dJourneyNotificationListener.State) =
             now.connected && now.connections == window.state.connections && now.disconnections == window.state.disconnections
@@ -145,8 +165,37 @@ internal class E5dJourneyNotifications(private val run: E5dJourneyRun) {
             if (linePid.toInt() == pid && seconds.toLong() * 1_000 + millis.toLong() >= since) type else null
         }
 
+    /**
+     * U3a-2: opens the notification shade and waits for the one item on the screen titled [title], drawn by the system's own
+     * UI. None, or more than one by the end of the wait, is a failure.
+     */
+    fun shadeItem(title: String): UiObject2 {
+        check(run.device.openNotification()) { "premise: 알림창을 열지 못했다" }
+        val deadline = System.currentTimeMillis() + SHADE_MILLIS
+        while (true) {
+            val found = run.onScreen(By.text(title))
+            if (found.size == 1 && found.single().applicationPackage == SYSTEM_UI) return found.single()
+            check(System.currentTimeMillis() < deadline) {
+                "알림창에 '$title' 항목이 하나로 보이지 않는다: ${found.map { it.applicationPackage }}. 화면: ${run.describeScreen()}"
+            }
+            Thread.sleep(200)
+        }
+    }
+
+    /** Closes the shade with Back and waits until [title] is no longer on the screen. */
+    fun closeShade(title: String) {
+        run.device.pressBack()
+        val deadline = System.currentTimeMillis() + SHADE_MILLIS
+        while (run.onScreen(By.text(title)).isNotEmpty()) {
+            check(System.currentTimeMillis() < deadline) { "premise: Back 뒤에도 알림창의 '$title' 이(가) 화면에 있다" }
+            Thread.sleep(200)
+        }
+    }
+
     companion object {
         const val CONNECT_MILLIS = 20_000L
+        const val SHADE_MILLIS = 8_000L
+        const val SYSTEM_UI = "com.android.systemui"
         const val OPEN_MILLIS = 10_000L
         const val QUIET_MILLIS = 1_500L
         const val TRAILING_MILLIS = 8_000L
