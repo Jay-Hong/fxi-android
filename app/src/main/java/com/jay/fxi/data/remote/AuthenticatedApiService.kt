@@ -267,46 +267,58 @@ class AuthenticatedApiClient internal constructor(
             .preserve(AuthenticatedEndpoint.NOTIFICATION_SETTINGS)
             .decodeSuccess(wireJson)
 
+    /**
+     * [useAdmitted], when given, passes unchanged to the transport. It may run on transport threads and must be
+     * thread-safe, non-blocking and side-effect free, subject to the existing production live-identity-read contract.
+     */
     suspend fun getSourceNotificationSettings(
         owner: AuthSnapshot,
-        asset: String?
+        asset: String?,
+        useAdmitted: (() -> Boolean)? = null
     ): AuthenticatedHttpResponse<SourceAlertSettingsResponse> =
-        transport.executeRead(owner) { service.getSourceNotificationSettings(it, asset) }
+        transport.executeRead(owner, useAdmitted) { service.getSourceNotificationSettings(it, asset) }
             .preserve(AuthenticatedEndpoint.SOURCE_NOTIFICATION_SETTINGS)
             .decodeSuccess(wireJson)
 
     suspend fun createSourceNotificationSetting(
         owner: AuthSnapshot,
-        request: SourceAlertSettingRequest
+        request: SourceAlertSettingRequest,
+        useAdmitted: (() -> Boolean)? = null
     ): AuthenticatedHttpResponse<SourceAlertSetting> =
-        transport.executeMutation(owner) { service.createSourceNotificationSetting(it, request) }
+        transport.executeMutation(owner, useAdmitted) { service.createSourceNotificationSetting(it, request) }
             .preserve(AuthenticatedEndpoint.SOURCE_NOTIFICATION_SETTINGS)
             .decodeSuccess(wireJson)
 
     suspend fun updateSourceNotificationSetting(
         owner: AuthSnapshot,
         id: Int,
-        request: SourceAlertSettingUpdateRequest
+        request: SourceAlertSettingUpdateRequest,
+        useAdmitted: (() -> Boolean)? = null
     ): AuthenticatedHttpResponse<SourceAlertSetting> =
-        transport.executeMutation(owner) { service.updateSourceNotificationSetting(it, id, request) }
+        transport.executeMutation(owner, useAdmitted) { service.updateSourceNotificationSetting(it, id, request) }
             .preserve(AuthenticatedEndpoint.UPDATE_SOURCE_NOTIFICATION_SETTING)
             .decodeSuccess(wireJson)
 
     suspend fun deleteSourceNotificationSetting(
         owner: AuthSnapshot,
-        id: Int
+        id: Int,
+        useAdmitted: (() -> Boolean)? = null
     ): AuthenticatedHttpResponse<Unit> =
-        transport.executeMutation(owner) { service.deleteSourceNotificationSetting(it, id) }
+        transport.executeMutation(owner, useAdmitted) { service.deleteSourceNotificationSetting(it, id) }
             .preserve(AuthenticatedEndpoint.DELETE_SOURCE_NOTIFICATION_SETTING)
             .asUnit()
 
-    /** GET /api/source-notification-logs (delivered source alerts). */
+    /**
+     * GET /api/source-notification-logs (delivered source alerts).
+     * [useAdmitted], when given, passes unchanged to the transport, as for [getSourceNotificationSettings].
+     */
     suspend fun getSourceNotificationLogs(
         owner: AuthSnapshot,
         asset: String?,
-        limit: Int
+        limit: Int,
+        useAdmitted: (() -> Boolean)? = null
     ): AuthenticatedHttpResponse<SourceAlertHistoryResponse> =
-        transport.executeRead(owner) { service.getSourceNotificationLogs(it, asset, limit) }
+        transport.executeRead(owner, useAdmitted) { service.getSourceNotificationLogs(it, asset, limit) }
             .preserve(AuthenticatedEndpoint.SOURCE_NOTIFICATION_LOGS)
             .decodeSuccess(wireJson)
 

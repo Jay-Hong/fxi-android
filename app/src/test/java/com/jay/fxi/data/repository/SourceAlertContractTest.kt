@@ -134,6 +134,21 @@ class SourceAlertContractTest {
         assertEquals(AuthenticatedFailureKind.KNOWN_AUTHORIZATION, (refused as? AlertRepositoryException)?.httpFailure?.kind)
     }
 
+    /**
+     * S8-1 baseline g4 (`R4c/S8/s8_1_baseline.claude.r2.md` §3): a create the server refuses with 400 — as it does a reference
+     * source — reaches the caller as that HTTP failure, sent once. Whether the real server refuses is the server's own evidence,
+     * and what the user is told is the editor's.
+     */
+    @Test fun S09_aCreateTheServerRefusesWith400_isThatHttpFailure_sentOnce() = runTest {
+        server.enqueue(MockResponse().setResponseCode(400).setBody("""{"detail":"Unsupported source for alerts"}"""))
+        val refused = repository(backgroundScope)
+            .run { createSourceSetting(it, SourceAlertSettingRequest("kb", "usd-krw", AlertCondition.ABOVE, 1400.5, true)) }.exceptionOrNull()
+        val failure = (refused as? AlertRepositoryException)?.httpFailure
+        assertEquals("the HTTP status is kept, got $refused", 400, failure?.statusCode)
+        assertEquals(AuthenticatedFailureKind.OTHER_HTTP, failure?.kind)
+        assertEquals("sent once, never again", 1, server.requestCount)
+    }
+
     @Test fun S06_aSettingMissingAField_isRefused_withTheResponseKept() = runTest {
         server.enqueue(ok("""{"settings":[${onceRow.replace("\"repeat_interval_sec\":null,", "")}],"total_count":1}"""))
         val error = repository(backgroundScope).run { getSourceSettings(it) }.exceptionOrNull()

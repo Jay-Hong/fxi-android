@@ -52,43 +52,67 @@ class AlertRepository @Inject constructor(
         }
     }
 
-    /** Source (tether exchange / KRX) alerts; [asset] null is every asset. */
-    suspend fun getSourceSettings(owner: AuthIdentityFence, asset: String? = null): AuthBoundResult<List<SourceAlertSetting>> =
-        safeApiCall(owner) { snapshot ->
-            apiService.getSourceNotificationSettings(snapshot, asset)
+    /**
+     * Source (tether exchange / KRX) alerts; [asset] null is every asset.
+     * With [useAdmitted], each source call checks it at entry, after a successful credential capture, and before each
+     * network exchange. Refusal at entry skips token acquisition. A false check throws [TopicUseWithheldException],
+     * a cancellation. Omitting the guard or passing null skips these use checks.
+     */
+    suspend fun getSourceSettings(
+        owner: AuthIdentityFence,
+        asset: String? = null,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<List<SourceAlertSetting>> {
+        if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+        return safeApiCall(owner) { snapshot ->
+            if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+            apiService.getSourceNotificationSettings(snapshot, asset, useAdmitted)
                 .requireBody("GET /api/source-notification-settings")
                 .settings
         }
+    }
 
-    suspend fun createSourceSetting(owner: AuthIdentityFence, request: SourceAlertSettingRequest): AuthBoundResult<SourceAlertSetting> =
-        safeApiCall(owner) { snapshot ->
-            apiService.createSourceNotificationSetting(snapshot, request)
-                .requireBody("POST /api/source-notification-settings")
-        }
+    suspend fun createSourceSetting(
+        owner: AuthIdentityFence,
+        request: SourceAlertSettingRequest,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<SourceAlertSetting> = mutation(owner, useAdmitted, "POST /api/source-notification-settings") { snapshot ->
+        apiService.createSourceNotificationSetting(snapshot, request, useAdmitted)
+    }
 
     /** Partial update: only the request's non-null fields change. */
-    suspend fun updateSourceSetting(owner: AuthIdentityFence, id: Int, request: SourceAlertSettingUpdateRequest): AuthBoundResult<SourceAlertSetting> =
-        safeApiCall(owner) { snapshot ->
-            apiService.updateSourceNotificationSetting(snapshot, id, request)
-                .requireBody("PUT /api/source-notification-settings/{id}")
-        }
+    suspend fun updateSourceSetting(
+        owner: AuthIdentityFence,
+        id: Int,
+        request: SourceAlertSettingUpdateRequest,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<SourceAlertSetting> = mutation(owner, useAdmitted, "PUT /api/source-notification-settings/{id}") { snapshot ->
+        apiService.updateSourceNotificationSetting(snapshot, id, request, useAdmitted)
+    }
 
     /** Idempotent on the server: an already deleted setting also succeeds. */
-    suspend fun deleteSourceSetting(owner: AuthIdentityFence, id: Int): AuthBoundResult<Unit> =
-        safeApiCall(owner) { snapshot ->
-            val response = apiService.deleteSourceNotificationSetting(snapshot, id)
-            response.failure?.let { throw AuthenticatedApiException(it) }
-        }
+    suspend fun deleteSourceSetting(
+        owner: AuthIdentityFence,
+        id: Int,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<Unit> = mutation(owner, useAdmitted, "DELETE /api/source-notification-settings/{id}") { snapshot ->
+        apiService.deleteSourceNotificationSetting(snapshot, id, useAdmitted)
+    }
 
     /** Delivered source alerts, newest first; [asset] null is every asset, [limit] 1..200 (server caps). */
     suspend fun getSourceHistory(
         owner: AuthIdentityFence,
         asset: String? = null,
-        limit: Int = 100
-    ): AuthBoundResult<List<SourceAlertHistoryItem>> = safeApiCall(owner) { snapshot ->
-        apiService.getSourceNotificationLogs(snapshot, asset, limit)
-            .requireBody("GET /api/source-notification-logs")
-            .logs
+        limit: Int = 100,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<List<SourceAlertHistoryItem>> {
+        if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+        return safeApiCall(owner) { snapshot ->
+            if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+            apiService.getSourceNotificationLogs(snapshot, asset, limit, useAdmitted)
+                .requireBody("GET /api/source-notification-logs")
+                .logs
+        }
     }
 
     /** Comparison / kimchi-premium alerts; [tab] null is every tab. */
@@ -190,9 +214,11 @@ class AlertRepository @Inject constructor(
         apiService.deleteNotificationSetting(snapshot, id, useAdmitted)
     }
 
+    /** One mutation with its use checks and its answer's rate-limit evidence; [endpoint] names it in a missing-body failure. */
     private suspend fun <T> mutation(
         owner: AuthIdentityFence,
         useAdmitted: (() -> Boolean)?,
+        endpoint: String = "Bank alert mutation",
         block: suspend (AuthSnapshot) -> AuthenticatedHttpResponse<T>
     ): AuthBoundResult<T> {
         if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
@@ -206,7 +232,7 @@ class AlertRepository @Inject constructor(
                 throw e
             }
             evidence = AlertRateLimitResponseEvidence(response.statusCode, response.retryAfter)
-            response.requireBody("Bank alert mutation")
+            response.requireBody(endpoint)
         }
     }
 

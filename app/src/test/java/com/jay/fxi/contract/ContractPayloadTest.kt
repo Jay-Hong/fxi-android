@@ -11,6 +11,7 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.double
+import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -415,6 +416,51 @@ class ContractPayloadTest {
         assertEquals(ContractToggle.NOT_APPLICABLE, inactive.g1)
         assertEquals(ContractToggle.NOT_APPLICABLE, inactive.g2)
         assertEquals(ContractToggle.NOT_APPLICABLE, inactive.g3)
+    }
+
+    /**
+     * S8-1 baseline g1–g3 (`R4c/S8/s8_1_baseline.claude.r2.md` §3): what the plan says of the source alert payloads, read off the
+     * corpus itself. The manifest's hashes catch a fixture that no longer matches its manifest; they do not catch both being
+     * changed together.
+     */
+    @Test
+    fun `source alert corpus keeps its price keys, its six pairs and its repeat strings`() {
+        fun rows(id: String, list: String?): List<JsonObject> =
+            json(id).let { if (list == null) listOf(it) else it[list]!!.jsonArray.map { row -> row.jsonObject } }
+        fun number(row: JsonObject, key: String) = row[key]!!.jsonPrimitive.let { !it.isString && it.doubleOrNull != null }
+
+        // g1: bank history carries a numeric rate, source history a numeric triggered_rate, a source push a string rate; none
+        // carries the other's key.
+        for ((id, list) in listOf("alert-bank-history-item" to null, "alert-bank-history-list" to "logs")) for (row in rows(id, list)) {
+            assertTrue("$id: rate is a number", number(row, "rate"))
+            assertFalse("$id: no triggered_rate", "triggered_rate" in row)
+        }
+        for ((id, list) in listOf("alert-source-history-item" to null, "alert-source-history-list" to "logs")) for (row in rows(id, list)) {
+            assertTrue("$id: triggered_rate is a number", number(row, "triggered_rate"))
+            assertFalse("$id: no rate", "rate" in row)
+        }
+        // g3: exactly these strings. That every data value is a string would let the two be swapped.
+        val pushes = mapOf("fcm-source-alert-once" to "false", "fcm-source-alert-repeat-krx" to "true")
+        for ((id, repeat) in pushes) {
+            val data = json(id)["data"]!!.jsonObject
+            assertTrue("$id: rate is a string", data["rate"]!!.jsonPrimitive.isString)
+            assertFalse("$id: no triggered_rate", "triggered_rate" in data)
+            assertEquals("$id: is_repeat", repeat, data.string("is_repeat"))
+        }
+
+        // g2: the six pairs. The registry's exchange and derivative rows are exactly them, each once — its reference rows are
+        // quoted sources, not alert pairs — and every source fixture row that names a source and an asset is one of them.
+        val six = listOf("upbit", "bithumb", "coinone", "korbit", "gopax").map { it to "usdt-krw" } + ("krx" to "usd-krw-futures")
+        val registered = json("registry-allowed-identifiers")["sources"]!!.jsonArray.map { it.jsonObject }
+            .filter { it.string("category") in setOf("exchange", "derivative") }.map { it.string("source") to it.string("asset") }
+        assertEquals("the registry's exchange and derivative pairs", six.sortedBy { it.toString() }, registered.sortedBy { it.toString() })
+        val carriers = listOf("alert-source-settings-list" to "settings", "alert-source-setting-response" to null,
+            "alert-source-create-once-request" to null, "alert-source-create-repeat-request" to null,
+            "alert-source-history-item" to null, "alert-source-history-list" to "logs")
+        val named = carriers.flatMap { (id, list) -> rows(id, list).map { id to (it.string("source") to it.string("asset")) } } +
+            pushes.keys.map { id -> json(id)["data"]!!.jsonObject.let { id to (it.string("source") to it.string("asset")) } }
+        assertEquals("premise: every carrier names a pair", carriers.size + pushes.size, named.map { it.first }.toSet().size)
+        for ((id, pair) in named) assertTrue("$id: $pair is one of the six pairs", pair in six)
     }
 
     private fun topicIds(prefix: String): List<String> =
