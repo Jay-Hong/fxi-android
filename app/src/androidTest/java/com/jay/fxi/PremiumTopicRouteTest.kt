@@ -37,6 +37,7 @@ import com.jay.fxi.domain.repository.NewsRepository
 import com.jay.fxi.ui.alert.BankAlertSectionSource
 import com.jay.fxi.ui.alert.BankAlertSectionSourceFactory
 import com.jay.fxi.ui.alert.CountingSourceAlertSection
+import com.jay.fxi.ui.alert.CountingSourceHistoryWiring
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.view.PremiumTopicRoute
 import com.jay.fxi.ui.premium.view.PremiumTopicTags
@@ -120,6 +121,8 @@ class PremiumTopicRouteTest {
     }
     private val bankAlerts = NoOpBankAlertSection()
     private val sourceAlerts = CountingSourceAlertSection()
+    /** S8-4b: the tether tab's history entry reads this counting fake, never the production wiring. */
+    private val sourceHistory = CountingSourceHistoryWiring()
 
     private val display = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN))
     private val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.USD))
@@ -149,7 +152,8 @@ class PremiumTopicRouteTest {
                     Button(onClick = dismiss) { Text("fixture 닫기") }
                 }
             },
-            bankAlertSectionSourceFactory = bankAlerts, sourceAlertSectionSourceFactory = sourceAlerts)
+            bankAlertSectionSourceFactory = bankAlerts, sourceAlertSectionSourceFactory = sourceAlerts,
+            sourceHistoryWiring = sourceHistory)
     }
 
     private fun show(news: FakeNews = FakeNews(), restorable: Boolean = false) {
@@ -338,7 +342,7 @@ class PremiumTopicRouteTest {
         try {
             val vm = NewsViewModel(FakeNews())
             rule.setContent { PremiumTopicRoute(c, a1, true, vm, null, {}, bankAlertSectionSourceFactory = bankAlerts,
-                sourceAlertSectionSourceFactory = sourceAlerts) }
+                sourceAlertSectionSourceFactory = sourceAlerts, sourceHistoryWiring = sourceHistory) }
             rule.waitForIdle()
             val click = requireNotNull(
                 rule.onNodeWithTag(PremiumTopicTags.BANNER_ACTION).fetchSemanticsNode()

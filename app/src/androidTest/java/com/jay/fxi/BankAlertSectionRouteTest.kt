@@ -76,6 +76,7 @@ import com.jay.fxi.ui.alert.BankHistoryTags
 import com.jay.fxi.ui.alert.BankHistoryWiring
 import com.jay.fxi.ui.alert.BankHistoryWiringFactory
 import com.jay.fxi.ui.alert.CountingSourceAlertSection
+import com.jay.fxi.ui.alert.CountingSourceHistoryWiring
 import com.jay.fxi.ui.alert.SourceAlertSectionTags
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.graph.GraphScreenHost
@@ -170,6 +171,8 @@ class BankAlertSectionRouteTest {
     private val factory = FakeFactory(source)
     /** S8-4a: the tether tab's section reads this counting fake, never the process owner. */
     private val sourceAlerts = CountingSourceAlertSection()
+    /** S8-4b: the tether tab's history entry reads this counting fake, never the production wiring. */
+    private val sourceHistory = CountingSourceHistoryWiring()
     private var sectionFactory by mutableStateOf<BankAlertSectionSourceFactory>(factory)
     private var active by mutableStateOf(true)
     private var mounted by mutableStateOf(true)
@@ -197,7 +200,8 @@ class BankAlertSectionRouteTest {
                 PremiumTopicRoute(consumer = consumer, identity = a1, isActive = active, newsViewModel = vm,
                     userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
                     settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = history,
-                    bankAlertSectionSourceFactory = sectionFactory, sourceAlertSectionSourceFactory = sourceAlerts)
+                    bankAlertSectionSourceFactory = sectionFactory, sourceAlertSectionSourceFactory = sourceAlerts,
+                    sourceHistoryWiring = sourceHistory)
             }
         }
         rule.waitForIdle()

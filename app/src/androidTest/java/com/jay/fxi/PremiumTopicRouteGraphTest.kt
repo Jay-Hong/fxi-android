@@ -57,6 +57,7 @@ import com.jay.fxi.time.SystemAppClock
 import com.jay.fxi.ui.alert.BankAlertSectionSource
 import com.jay.fxi.ui.alert.BankAlertSectionSourceFactory
 import com.jay.fxi.ui.alert.CountingSourceAlertSection
+import com.jay.fxi.ui.alert.CountingSourceHistoryWiring
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.graph.GraphScreenHost
 import com.jay.fxi.ui.premium.graph.GraphV2Surface
@@ -129,6 +130,8 @@ class PremiumTopicRouteGraphTest {
     }
     private val bankAlerts = NoOpBankAlertSection()
     private val sourceAlerts = CountingSourceAlertSection()
+    /** S8-4b: the tether tab's history entry reads this counting fake, never the production wiring. */
+    private val sourceHistory = CountingSourceHistoryWiring()
 
     private val display = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN))
     private val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.USD))
@@ -263,7 +266,8 @@ class PremiumTopicRouteGraphTest {
             if (shown) {
                 PremiumTopicRoute(consumer = consumer, identity = identity, isActive = active, newsViewModel = vm, userInfo = null,
                     onSignOut = { }, modifier = androidx.compose.ui.Modifier.testTag("route:$tick"), graphHost = host,
-                    bankAlertSectionSourceFactory = bankAlerts, sourceAlertSectionSourceFactory = sourceAlerts)
+                    bankAlertSectionSourceFactory = bankAlerts, sourceAlertSectionSourceFactory = sourceAlerts,
+                    sourceHistoryWiring = sourceHistory)
             }
         }
         rule.waitForIdle()

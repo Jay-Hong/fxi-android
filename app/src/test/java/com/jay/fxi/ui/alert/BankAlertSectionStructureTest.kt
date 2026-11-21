@@ -1121,6 +1121,27 @@ class BankAlertSectionStructureTest {
             Triple("the source factory parameter not last",
                 edited(ROUTE, """\bsourceAlertSectionSourceFactory\s*:\s*SourceAlertSectionSourceFactory\s*=\s*ProductionSourceAlertSectionSourceFactory\b""",
                     "\$0,\n    s84aExtra: Int = 0"), "P-parameter"),
+            Triple("the history parameter not last (S8-4b)",
+                edited(ROUTE, """\bsourceHistoryWiring\s*:\s*SourceHistoryWiringFactory\s*=\s*ProductionSourceHistoryWiring\b""",
+                    "\$0,\n    s84bExtra: Int = 0"), "P-parameter"),
+            Triple("the history entry dropped from the tether branch (S8-4b)", routeWith { t, _ ->
+                val start = SOURCE_HISTORY_CALL.find(t)!!.range.first
+                t.removeRange(start, closing(t, t.indexOf('(', start))!! + 1)
+            }, "P-tether-history"),
+            Triple("the history entry after the section (S8-4b)", routeWith { t, _ ->
+                val start = SOURCE_HISTORY_CALL.find(t)!!.range.first
+                val end = closing(t, t.indexOf('(', start))!! + 1
+                val entry = t.substring(start, end)
+                val section = SOURCE_CALL.find(t, end)!!.range.first
+                val sectionEnd = closing(t, t.indexOf('(', section))!! + 1
+                t.substring(0, start) + t.substring(end, sectionEnd) + "\n" + entry + t.substring(sectionEnd)
+            }, "P-tether-order"),
+            Triple("the tether branch without its Column (S8-4b)", edited(ROUTE,
+                """if\s*\(\s*tab\s*==\s*FreeTab\.TETHER\s*\)\s*\{\s*Column\s*\{""", "if (tab == FreeTab.TETHER) { run {"), "P-tether-column"),
+            Triple("the production history wiring passed directly (S8-4b)", edited(ROUTE,
+                """wiring\s*=\s*\{\s*sourceHistoryWiring\.create\(""", "wiring = { ProductionSourceHistoryWiring.create("), "P-tether-history-args"),
+            Triple("the history entry told another tab (S8-4b)", edited(ROUTE,
+                """SourceHistoryEntry\(\s*tab\s*=\s*tab""", "SourceHistoryEntry(tab = FreeTab.TETHER"), "P-tether-history-args"),
             Triple("a wider slot", routeWith { t, _ ->
                 t.replaceRange(belowRates(t)!!.condition, "screen.ui.selectedTab != FreeTab.NEWS && !settingsOpen && detailUrl == null")
             }, "P-condition"),
@@ -1338,6 +1359,12 @@ class BankAlertSectionStructureTest {
         val TETHER_SHOWN = squash("{ allowed() && consumer.currentState().ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null }")
         const val SOURCE_FACTORY_PARAMETER =
             "sourceAlertSectionSourceFactory: SourceAlertSectionSourceFactory = ProductionSourceAlertSectionSourceFactory"
+        /** S8-4b: the tether history entry's call and factory parameter. */
+        val SOURCE_HISTORY_CALL = Regex("""\bSourceHistoryEntry\s*\(""")
+        const val SOURCE_HISTORY_PARAMETER = "sourceHistoryWiring: SourceHistoryWiringFactory = ProductionSourceHistoryWiring"
+        fun sourceHistoryArgs(tab: String) = mapOf("tab" to tab, "owner" to "owner",
+            "shown" to squash("{ consumer.state.value.ui.let { it.owner to it.selectedTab } }"), "listen" to "consumer::addScreenListener",
+            "wiring" to squash("{ sourceHistoryWiring.create(context) { consumer.state.value.ui.owner } }"))
         val ROUTE_FORBIDDEN = listOf(
             "owner" to """\bBankAlertSettingsOwner\b""",
             "entry-point" to """\bBankAlertSectionEntryPoint\b|\bbankAlertSettingsOwner\b""",
@@ -2746,10 +2773,11 @@ class BankAlertSectionStructureTest {
             if (named != setOf(HOLDER, ROUTE)) v += "P-named ${named.sorted()}"
             val sectionImports = count(route, importOf("BankAlertSection"))
             if (sectionImports > 1 || count(route, """\bBankAlertSection\b""") != 1 + sectionImports) v += "P-route-tokens"
-            // S8-4a: the bank factory parameter is second to last, the source section's factory last.
+            // S8-4a/S8-4b: the last three parameters are the bank section's factory, the source section's and the source history's.
             val params = paramsRange(route, "PremiumTopicRoute")?.let { topLevelArgs(route.substring(it)) }.orEmpty()
-            if (params.lastOrNull() != SOURCE_FACTORY_PARAMETER) v += "P-parameter ${params.lastOrNull()}"
-            if (params.getOrNull(params.size - 2) != FACTORY_PARAMETER) v += "P-parameter ${params.getOrNull(params.size - 2)}"
+            if (params.lastOrNull() != SOURCE_HISTORY_PARAMETER) v += "P-parameter ${params.lastOrNull()}"
+            if (params.getOrNull(params.size - 2) != SOURCE_FACTORY_PARAMETER) v += "P-parameter ${params.getOrNull(params.size - 2)}"
+            if (params.getOrNull(params.size - 3) != FACTORY_PARAMETER) v += "P-parameter ${params.getOrNull(params.size - 3)}"
             if (count(route, """\bbankAlertSectionSourceFactory\b""") != 2) v += "P-factory-tokens parameter"
             for (name in listOf("BankAlertSectionSourceFactory", "ProductionBankAlertSectionSourceFactory")) {
                 val imports = count(route, importOf(name))
@@ -2784,6 +2812,10 @@ class BankAlertSectionStructureTest {
                 .filterValues { it != 0 }
             if (calls != mapOf(ROUTE to 1)) v += "P-tether-calls $calls"
             if (count(route, """\bsourceAlertSectionSourceFactory\b""") != 2) v += "P-tether-factory-tokens"
+            val historyCalls = code.mapValues { (_, t) -> SOURCE_HISTORY_CALL.findAll(t).count() - count(t, """\bfun\s+SourceHistoryEntry\s*\(""") }
+                .filterValues { it != 0 }
+            if (historyCalls != mapOf(ROUTE to 1)) v += "P-tether-history-calls $historyCalls"
+            if (count(route, """\bsourceHistoryWiring\b""") != 2) v += "P-tether-history-tokens"
             val slot = belowRatesSlots(route)?.second ?: return v + "P-tether-slot"
             val condition = squash(route.substring(slot.condition))
             if (condition != TETHER_CONDITION) v += "P-tether-condition $condition"
@@ -2792,6 +2824,21 @@ class BankAlertSectionStructureTest {
             val guard = Regex("""^\s*if\s*\(\s*${slot.param}\s*==\s*FreeTab\.TETHER\s*\)\s*\{""").find(body) ?: return v + "P-tether-guard"
             val guardClose = closing(body, guard.range.last) ?: return v + "P-tether-guard"
             if (body.substring(guardClose + 1).isNotBlank()) v += "P-tether-guard"
+            // S8-4b: the guard holds one Column with the history entry, then the section.
+            val guardBody = body.substring(guard.range.last + 1, guardClose)
+            val column = Regex("""^\s*Column\s*\{""").find(guardBody) ?: return v + "P-tether-column"
+            val columnClose = closing(guardBody, column.range.last) ?: return v + "P-tether-column"
+            if (guardBody.substring(columnClose + 1).isNotBlank()) v += "P-tether-column"
+            val histories = SOURCE_HISTORY_CALL.findAll(guardBody).toList()
+            if (histories.size != 1) return v + "P-tether-history ${histories.size}"
+            val historyOpen = guardBody.indexOf('(', histories.single().range.first)
+            val historyClose = closing(guardBody, historyOpen) ?: return v + "P-tether-history unclosed"
+            val historyArgs = topLevelArgs(guardBody.substring(historyOpen + 1, historyClose)).associate { a ->
+                Regex("""^(\w+) ?= ?(.+)$""").matchEntire(a)?.let { it.groupValues[1] to it.groupValues[2] } ?: ("?" to a)
+            }
+            if (historyArgs != sourceHistoryArgs(slot.param)) v += "P-tether-history-args $historyArgs"
+            val firstSection = SOURCE_CALL.find(guardBody)?.range?.first ?: -1
+            if (firstSection < historyClose || firstSection > columnClose) v += "P-tether-order"
             val inside = SOURCE_CALL.findAll(body).toList()
             if (inside.size != 1) return v + "P-tether-lambda ${inside.size}"
             val open = body.indexOf('(', inside.single().range.first)

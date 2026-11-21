@@ -707,6 +707,9 @@ class AlertN1StructureTest {
         val REPOSITORY = BASE + "data/repository/AlertRepository.kt"
         /** S8-4a: the tether tab's read section, the source owner's one screen namer. */
         val SOURCE_SECTION = BASE + "ui/alert/SourceAlertSection.kt"
+        /** S8-4b: the tether history entry (process access and floor) and its holder (the session asset). */
+        val SOURCE_HISTORY_ENTRY = BASE + "ui/alert/SourceHistoryEntry.kt"
+        val SOURCE_HISTORY_HOLDER = BASE + "ui/alert/SourceHistoryStateHolder.kt"
         /** The six new N1 production files (API r1 §2–§6) and S8-3's two. E5a1's section holder is deliberately not one of them. */
         val NEW_FILES = listOf(PHASE, POLICY, FLOOR, ACCESS, REGISTRY, OWNER, SOURCE_OWNER, ROW_POLICY)
         /** S7 E5a1's section holder (API r2 §2): AlertSection's one caller and, besides the owner and the registry, the owner's one namer. */
@@ -1282,11 +1285,11 @@ class AlertN1StructureTest {
             val v = mutableListOf<String>()
             for ((name, expected) in listOf(
                 "BankAlertSettingsOwner" to setOf(OWNER, REGISTRY, HOLDER),
-                "AlertSettingsAccess" to setOf(ACCESS, OWNER, SOURCE_OWNER),
-                "AlertRateLimitFloor" to setOf(FLOOR, OWNER, SOURCE_OWNER),
+                "AlertSettingsAccess" to setOf(ACCESS, OWNER, SOURCE_OWNER, SOURCE_HISTORY_ENTRY),
+                "AlertRateLimitFloor" to setOf(FLOOR, OWNER, SOURCE_OWNER, SOURCE_HISTORY_ENTRY),
                 // S8-4a: the registry registers the source owner and the tether section reads it; the section projects with the policy.
                 "SourceAlertSettingsOwner" to setOf(SOURCE_OWNER, REGISTRY, SOURCE_SECTION),
-                "SourceAlertRowPolicy" to setOf(ROW_POLICY, SOURCE_OWNER, SOURCE_SECTION),
+                "SourceAlertRowPolicy" to setOf(ROW_POLICY, SOURCE_OWNER, SOURCE_SECTION, SOURCE_HISTORY_HOLDER),
                 "AlertFamilyRefresherRegistry" to setOf(REGISTRY, APP, FCM, ACTIVITY))) {
                 val named = files(code, """\b$name\b""")
                 if (named != expected) v += "A-reach $name ${named.sorted()}"

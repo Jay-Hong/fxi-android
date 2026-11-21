@@ -32,6 +32,9 @@ import com.jay.fxi.ui.alert.ProductionBankHistoryWiring
 import com.jay.fxi.ui.alert.ProductionSourceAlertSectionSourceFactory
 import com.jay.fxi.ui.alert.SourceAlertSection
 import com.jay.fxi.ui.alert.SourceAlertSectionSourceFactory
+import com.jay.fxi.ui.alert.ProductionSourceHistoryWiring
+import com.jay.fxi.ui.alert.SourceHistoryEntry
+import com.jay.fxi.ui.alert.SourceHistoryWiringFactory
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.PremiumTopicScreenState
 import com.jay.fxi.ui.premium.graph.GraphScreenHost
@@ -73,7 +76,8 @@ internal fun PremiumTopicRoute(
     graphHost: GraphScreenHost? = null,
     bankHistoryWiring: BankHistoryWiringFactory = ProductionBankHistoryWiring,
     bankAlertSectionSourceFactory: BankAlertSectionSourceFactory = ProductionBankAlertSectionSourceFactory,
-    sourceAlertSectionSourceFactory: SourceAlertSectionSourceFactory = ProductionSourceAlertSectionSourceFactory
+    sourceAlertSectionSourceFactory: SourceAlertSectionSourceFactory = ProductionSourceAlertSectionSourceFactory,
+    sourceHistoryWiring: SourceHistoryWiringFactory = ProductionSourceHistoryWiring
 ) {
     LaunchedEffect(consumer) { consumer.start() }
     LaunchedEffect(consumer, identity) { consumer.onIdentityChanged() }
@@ -208,14 +212,23 @@ internal fun PremiumTopicRoute(
                     } else if (screen.ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null) {
                         { tab ->
                             if (tab == FreeTab.TETHER) {
-                                SourceAlertSection(
-                                    tab = tab,
-                                    owner = owner,
-                                    isShown = {
-                                        allowed() && consumer.currentState().ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null
-                                    },
-                                    sourceFactory = sourceAlertSectionSourceFactory
-                                )
+                                Column {
+                                    SourceHistoryEntry(
+                                        tab = tab,
+                                        owner = owner,
+                                        shown = { consumer.state.value.ui.let { it.owner to it.selectedTab } },
+                                        listen = consumer::addScreenListener,
+                                        wiring = { sourceHistoryWiring.create(context) { consumer.state.value.ui.owner } }
+                                    )
+                                    SourceAlertSection(
+                                        tab = tab,
+                                        owner = owner,
+                                        isShown = {
+                                            allowed() && consumer.currentState().ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null
+                                        },
+                                        sourceFactory = sourceAlertSectionSourceFactory
+                                    )
+                                }
                             }
                         }
                     } else null

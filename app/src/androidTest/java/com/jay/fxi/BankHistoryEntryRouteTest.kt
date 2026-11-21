@@ -81,6 +81,7 @@ import com.jay.fxi.ui.alert.BankHistoryTags
 import com.jay.fxi.ui.alert.BankHistoryWiring
 import com.jay.fxi.ui.alert.BankHistoryWiringFactory
 import com.jay.fxi.ui.alert.CountingSourceAlertSection
+import com.jay.fxi.ui.alert.CountingSourceHistoryWiring
 import com.jay.fxi.ui.alert.bankHistoryRow
 import com.jay.fxi.ui.alert.productionBankHistoryRead
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
@@ -228,6 +229,8 @@ class BankHistoryEntryRouteTest {
     }
     private val bankAlerts = NoOpBankAlertSection()
     private val sourceAlerts = CountingSourceAlertSection()
+    /** S8-4b: the tether tab's history entry reads this counting fake, never the production wiring. */
+    private val sourceHistory = CountingSourceHistoryWiring()
 
     private val display = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN))
     private val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.USD))
@@ -259,7 +262,8 @@ class BankHistoryEntryRouteTest {
             PremiumTopicRoute(consumer = consumer, identity = a1, isActive = active, newsViewModel = vm,
                 userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
                 settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = wiring,
-                bankAlertSectionSourceFactory = bankAlerts, sourceAlertSectionSourceFactory = sourceAlerts)
+                bankAlertSectionSourceFactory = bankAlerts, sourceAlertSectionSourceFactory = sourceAlerts,
+                sourceHistoryWiring = sourceHistory)
         }
         if (restorable) androidx.compose.ui.test.junit4.StateRestorationTester(rule).also { tester = it }.setContent(content)
         else rule.setContent(content)
@@ -268,7 +272,9 @@ class BankHistoryEntryRouteTest {
 
     private fun device() = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
     private fun entries() = rule.onAllNodesWithTag(BankHistoryTags.ENTRY).fetchSemanticsNodes().size
-    private fun sheets() = rule.onAllNodesWithText("알림 히스토리").fetchSemanticsNodes().size - entries()
+    /** Sheets by their title: every "알림 히스토리" text that is neither the bank entry nor the tether history entry (S8-4b). */
+    private fun sheets() = rule.onAllNodesWithText("알림 히스토리").fetchSemanticsNodes()
+        .count { it.config.getOrNull(SemanticsProperties.TestTag) !in setOf(BankHistoryTags.ENTRY, com.jay.fxi.ui.alert.SourceHistoryTags.ENTRY) }
     private fun item(currency: String, bank: String = "kb") = AlertHistoryItem(1, 1, bank, currency, AlertCondition.ABOVE, 1400.5, 1401.2, t)
     private fun rowText(row: AlertHistoryItem) = bankHistoryRow(row).let { "${it.bankName} · ${it.currencyLabel}" }
     private fun rowsShown(row: AlertHistoryItem) = rule.onAllNodesWithText(rowText(row)).fetchSemanticsNodes().size
@@ -324,7 +330,7 @@ class BankHistoryEntryRouteTest {
     /** A drag of the open sheet down by its title, through the real window. */
     private fun dragSheetDown() {
         val title = rule.onAllNodesWithText("알림 히스토리").fetchSemanticsNodes()
-            .first { it.config.getOrNull(SemanticsProperties.TestTag) != BankHistoryTags.ENTRY }
+            .first { it.config.getOrNull(SemanticsProperties.TestTag) !in setOf(BankHistoryTags.ENTRY, com.jay.fxi.ui.alert.SourceHistoryTags.ENTRY) }
         val (x, y) = center(title)
         device().swipe(x, y, x, device().displayHeight - 20, 30)
     }

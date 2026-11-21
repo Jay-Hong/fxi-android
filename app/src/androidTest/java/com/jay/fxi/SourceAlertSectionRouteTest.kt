@@ -73,6 +73,7 @@ import com.jay.fxi.ui.alert.BankHistoryTags
 import com.jay.fxi.ui.alert.BankHistoryWiring
 import com.jay.fxi.ui.alert.BankHistoryWiringFactory
 import com.jay.fxi.ui.alert.CountingSourceAlertSection
+import com.jay.fxi.ui.alert.CountingSourceHistoryWiring
 import com.jay.fxi.ui.alert.SourceAlertSectionTags
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.graph.GraphScreenHost
@@ -157,6 +158,8 @@ class SourceAlertSectionRouteTest {
     private val consumer = PremiumTopicConsumer(display, focus, { a1 }, MemoryRows(),
         { o, tab -> focus.value = OwnedTopicFocus(o, tab) }, { }, { _, _ -> }, scope)
     private val sources = CountingSourceAlertSection()
+    /** S8-4b: the entry above the section reads this counting fake, never the production wiring. */
+    private val sourceHistory = CountingSourceHistoryWiring()
     private val bank = Bank()
     private var active by mutableStateOf(true)
     private var mounted by mutableStateOf(true)
@@ -183,7 +186,8 @@ class SourceAlertSectionRouteTest {
                 PremiumTopicRoute(consumer = consumer, identity = a1, isActive = active, newsViewModel = vm,
                     userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
                     settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = history,
-                    bankAlertSectionSourceFactory = bank, sourceAlertSectionSourceFactory = sources)
+                    bankAlertSectionSourceFactory = bank, sourceAlertSectionSourceFactory = sources,
+                    sourceHistoryWiring = sourceHistory)
             }
         }
         rule.waitForIdle()
