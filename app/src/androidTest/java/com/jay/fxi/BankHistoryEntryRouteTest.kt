@@ -80,6 +80,7 @@ import com.jay.fxi.ui.alert.BankHistoryRead
 import com.jay.fxi.ui.alert.BankHistoryTags
 import com.jay.fxi.ui.alert.BankHistoryWiring
 import com.jay.fxi.ui.alert.BankHistoryWiringFactory
+import com.jay.fxi.ui.alert.CountingSourceAlertSection
 import com.jay.fxi.ui.alert.bankHistoryRow
 import com.jay.fxi.ui.alert.productionBankHistoryRead
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
@@ -226,6 +227,7 @@ class BankHistoryEntryRouteTest {
         }
     }
     private val bankAlerts = NoOpBankAlertSection()
+    private val sourceAlerts = CountingSourceAlertSection()
 
     private val display = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN))
     private val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.USD))
@@ -257,7 +259,7 @@ class BankHistoryEntryRouteTest {
             PremiumTopicRoute(consumer = consumer, identity = a1, isActive = active, newsViewModel = vm,
                 userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
                 settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = wiring,
-                bankAlertSectionSourceFactory = bankAlerts)
+                bankAlertSectionSourceFactory = bankAlerts, sourceAlertSectionSourceFactory = sourceAlerts)
         }
         if (restorable) androidx.compose.ui.test.junit4.StateRestorationTester(rule).also { tester = it }.setContent(content)
         else rule.setContent(content)
@@ -330,10 +332,11 @@ class BankHistoryEntryRouteTest {
     /** S7C_U01·N01: the entry under usd, jpy and eur only; nothing made before the first open; each read is its tab's currency. */
     @Test fun s7c_u01_theEntryIsUnderTheThreeBankTabsOnly_andReadsItsCurrency() {
         show()
-        for ((tab, want) in listOf(FreeTab.TETHER to 0, FreeTab.NEWS to 0)) {
+        // S8-4a: the tether tab's one slot holds its source alert section, never the entry.
+        for ((tab, slots) in listOf(FreeTab.TETHER to 1, FreeTab.NEWS to 0)) {
             select(tab)
-            assertEquals("$tab: no entry", want, entries())
-            assertEquals("$tab: no slot", 0, rule.onAllNodesWithTag(PremiumTopicTags.BELOW_RATES).fetchSemanticsNodes().size)
+            assertEquals("$tab: no entry", 0, entries())
+            assertEquals("$tab: slots", slots, rule.onAllNodesWithTag(PremiumTopicTags.BELOW_RATES).fetchSemanticsNodes().size)
         }
         assertEquals("nothing made before an open", 0, factory.made)
         for ((n, pair) in listOf(FreeTab.USD to "usd-krw", FreeTab.JPY to "jpy-krw", FreeTab.EUR to "eur-krw").withIndex()) {

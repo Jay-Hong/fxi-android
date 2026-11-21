@@ -391,6 +391,24 @@
         "src/main/java/com/jay/fxi/data/alerts/SourceAlertSettingsOwner.kt": "747f0bd79ecf339433a3dd7276603de4221f89e6a936dae3394d0797ceb970dc",
         "src/main/java/com/jay/fxi/data/alerts/SourceAlertRowPolicy.kt": "88f046bd75eebefbe4fa2769fd3346c0e691ebafca3fd9e4f4b358c55b88ac67"
       }
+    },
+    {
+      "id": "S8-4a",
+      "source_parent": "b8b191e548dc4429cfe0f6c57dfd3679bdc20f04",
+      "approval_record_sha256": "fa7f5916ee94f501b905a4f7ff2bbb5a767c3888e202e37a429669f6e82739e2",
+      "changed": {
+        "src/main/java/com/jay/fxi/data/alerts/AlertFamilyRefresherRegistry.kt": {
+          "from": "747795072e83a2c7abe512df77f4e69ad0980364dbe049f749f5f38a037a4de3",
+          "to": "dc822aa9712d8af9a1af3e223e97a7504915754d27e114ac742c608cfd655386"
+        },
+        "src/main/java/com/jay/fxi/ui/premium/view/PremiumTopicRoute.kt": {
+          "from": "463c69c36b81a95f4c5484a23ba975458caea27e7c06a21370e9252f830983c0",
+          "to": "152a77231ff5ebb874dbd09b42bc6a762b64314ca7d8d55ed8748033c3b1dca8"
+        }
+      },
+      "added": {
+        "src/main/java/com/jay/fxi/ui/alert/SourceAlertSection.kt": "b2f1c2faab2fc5b1c09d8e53c4cb4ffc28960f9ef9f1dd328d5240fc3b689687"
+      }
     }
   ]
 }

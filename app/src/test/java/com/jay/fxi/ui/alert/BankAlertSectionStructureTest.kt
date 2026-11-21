@@ -1109,6 +1109,18 @@ class BankAlertSectionStructureTest {
             Triple("the factory parameter not last",
                 edited(ROUTE, """\bbankAlertSectionSourceFactory\s*:\s*BankAlertSectionSourceFactory\s*=\s*ProductionBankAlertSectionSourceFactory\b""",
                     "\$0,\n    s7e5a1Extra: Int = 0"), "P-parameter"),
+            Triple("the tether branch widened to every tab", edited(ROUTE, """screen\.ui\.selectedTab\s*==\s*FreeTab\.TETHER\s*&&""",
+                "screen.ui.selectedTab != FreeTab.NEWS &&"), "P-tether-condition"),
+            Triple("the tether guard dropped", edited(ROUTE, """if\s*\(\s*tab\s*==\s*FreeTab\.TETHER\s*\)\s*\{""", "run {"), "P-tether-guard"),
+            Triple("the tether branch also drawing the bank section", edited(ROUTE, """\bSourceAlertSection\s*\(""",
+                "BankAlertSection(tab = tab, alertQuotes = screen.ui.alertQuotes, sourceFactory = $f)\n                                SourceAlertSection("), "P-tether-bank"),
+            Triple("the production source factory passed directly", edited(ROUTE, """sourceFactory\s*=\s*sourceAlertSectionSourceFactory""",
+                "sourceFactory = ProductionSourceAlertSectionSourceFactory"), "P-tether-args"),
+            Triple("the shown check reduced to the route's own owner", edited(ROUTE,
+                """isShown\s*=\s*\{\s*allowed\(\)\s*&&[^}]*\}""", "isShown = { allowed() }"), "P-tether-args"),
+            Triple("the source factory parameter not last",
+                edited(ROUTE, """\bsourceAlertSectionSourceFactory\s*:\s*SourceAlertSectionSourceFactory\s*=\s*ProductionSourceAlertSectionSourceFactory\b""",
+                    "\$0,\n    s84aExtra: Int = 0"), "P-parameter"),
             Triple("a wider slot", routeWith { t, _ ->
                 t.replaceRange(belowRates(t)!!.condition, "screen.ui.selectedTab != FreeTab.NEWS && !settingsOpen && detailUrl == null")
             }, "P-condition"),
@@ -1320,6 +1332,12 @@ class BankAlertSectionStructureTest {
         val HISTORY_CALL = Regex("""\bBankHistoryEntry\s*\(""")
         val CONDITION = squash("screen.ui.selectedTab in listOf(FreeTab.USD, FreeTab.JPY, FreeTab.EUR) && !settingsOpen && detailUrl == null")
         const val FACTORY_PARAMETER = "bankAlertSectionSourceFactory: BankAlertSectionSourceFactory = ProductionBankAlertSectionSourceFactory"
+        /** S8-4a: the tether section's call, branch condition, shown check and factory parameter. */
+        val SOURCE_CALL = Regex("""\bSourceAlertSection\s*\(""")
+        val TETHER_CONDITION = squash("screen.ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null")
+        val TETHER_SHOWN = squash("{ allowed() && consumer.currentState().ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null }")
+        const val SOURCE_FACTORY_PARAMETER =
+            "sourceAlertSectionSourceFactory: SourceAlertSectionSourceFactory = ProductionSourceAlertSectionSourceFactory"
         val ROUTE_FORBIDDEN = listOf(
             "owner" to """\bBankAlertSettingsOwner\b""",
             "entry-point" to """\bBankAlertSectionEntryPoint\b|\bbankAlertSettingsOwner\b""",
@@ -2660,10 +2678,9 @@ class BankAlertSectionStructureTest {
             return i
         }
 
-        /** The route's `belowRates = if (condition) { { param -> body } } else null`; null for any other form. */
-        fun belowRates(text: String): Slot? {
-            val m = Regex("""\bbelowRates\s*=\s*""").findAll(text).toList().singleOrNull() ?: return null
-            var i = m.range.last + 1
+        /** One `if (condition) { { param -> body } }` branch starting at [from] (at `if`), and the index after it. */
+        private fun branch(text: String, from: Int): Pair<Slot, Int>? {
+            var i = from
             if (!text.startsWith("if", i)) return null
             i = skip(text, i + 2)
             if (text.getOrNull(i) != '(') return null
@@ -2676,10 +2693,26 @@ class BankAlertSectionStructureTest {
             if (text.getOrNull(j) != '{') return null
             val lambdaClose = closing(text, j) ?: return null
             if (text.substring(lambdaClose + 1, outerClose).isNotBlank()) return null
-            if (!Regex("""^\s*else\s+null\b""").containsMatchIn(text.substring(outerClose + 1))) return null
             val head = Regex("""^\s*(\w+)\s*->""").find(text.substring(j + 1, lambdaClose)) ?: return null
-            return Slot(condition, head.groupValues[1], (j + 1 + head.range.last + 1) until lambdaClose)
+            return Slot(condition, head.groupValues[1], (j + 1 + head.range.last + 1) until lambdaClose) to outerClose + 1
         }
+
+        /**
+         * The route's `belowRates = if (bank) { { param -> body } } [else if (tether) { { param -> body } }] else null` (S8-4a adds
+         * the tether branch): the first slot is the bank's, the second the tether's or null; null for any other form.
+         */
+        fun belowRatesSlots(text: String): Pair<Slot, Slot?>? {
+            val m = Regex("""\bbelowRates\s*=\s*""").findAll(text).toList().singleOrNull() ?: return null
+            val (bank, afterBank) = branch(text, m.range.last + 1) ?: return null
+            if (Regex("""^\s*else\s+null\b""").containsMatchIn(text.substring(afterBank))) return bank to null
+            val elseIf = Regex("""^\s*else\s+(?=if\b)""").find(text.substring(afterBank)) ?: return null
+            val (tether, afterTether) = branch(text, afterBank + elseIf.range.last + 1) ?: return null
+            if (!Regex("""^\s*else\s+null\b""").containsMatchIn(text.substring(afterTether))) return null
+            return bank to tether
+        }
+
+        /** The bank slot of [belowRatesSlots]. */
+        fun belowRates(text: String): Slot? = belowRatesSlots(text)?.first
 
         /** The section call's arguments: the slot's tab (named or first) and `sourceFactory = [factory]`, an optional modifier. */
         fun agreedArgs(args: List<String>, tab: String, factory: String): Boolean {
@@ -2713,8 +2746,10 @@ class BankAlertSectionStructureTest {
             if (named != setOf(HOLDER, ROUTE)) v += "P-named ${named.sorted()}"
             val sectionImports = count(route, importOf("BankAlertSection"))
             if (sectionImports > 1 || count(route, """\bBankAlertSection\b""") != 1 + sectionImports) v += "P-route-tokens"
-            val last = paramsRange(route, "PremiumTopicRoute")?.let { topLevelArgs(route.substring(it)) }?.lastOrNull()
-            if (last != FACTORY_PARAMETER) v += "P-parameter $last"
+            // S8-4a: the bank factory parameter is second to last, the source section's factory last.
+            val params = paramsRange(route, "PremiumTopicRoute")?.let { topLevelArgs(route.substring(it)) }.orEmpty()
+            if (params.lastOrNull() != SOURCE_FACTORY_PARAMETER) v += "P-parameter ${params.lastOrNull()}"
+            if (params.getOrNull(params.size - 2) != FACTORY_PARAMETER) v += "P-parameter ${params.getOrNull(params.size - 2)}"
             if (count(route, """\bbankAlertSectionSourceFactory\b""") != 2) v += "P-factory-tokens parameter"
             for (name in listOf("BankAlertSectionSourceFactory", "ProductionBankAlertSectionSourceFactory")) {
                 val imports = count(route, importOf(name))
@@ -2738,6 +2773,35 @@ class BankAlertSectionStructureTest {
             val close = closing(body, open) ?: return v + "P-args unclosed"
             val args = topLevelArgs(body.substring(open + 1, close))
             if (!agreedArgs(args, slot.param, "bankAlertSectionSourceFactory")) v += "P-args $args"
+            return v + tetherMount(code)
+        }
+
+        /** S8-4a: the tether branch of belowRates, the one SourceAlertSection call of every root. */
+        fun tetherMount(code: Map<String, String>): List<String> {
+            val route = code[ROUTE] ?: return listOf("P-missing")
+            val v = mutableListOf<String>()
+            val calls = code.mapValues { (_, t) -> SOURCE_CALL.findAll(t).count() - count(t, """\bfun\s+SourceAlertSection\s*\(""") }
+                .filterValues { it != 0 }
+            if (calls != mapOf(ROUTE to 1)) v += "P-tether-calls $calls"
+            if (count(route, """\bsourceAlertSectionSourceFactory\b""") != 2) v += "P-tether-factory-tokens"
+            val slot = belowRatesSlots(route)?.second ?: return v + "P-tether-slot"
+            val condition = squash(route.substring(slot.condition))
+            if (condition != TETHER_CONDITION) v += "P-tether-condition $condition"
+            val body = route.substring(slot.body)
+            if (CALL.containsMatchIn(body) || HISTORY_CALL.containsMatchIn(body)) v += "P-tether-bank"
+            val guard = Regex("""^\s*if\s*\(\s*${slot.param}\s*==\s*FreeTab\.TETHER\s*\)\s*\{""").find(body) ?: return v + "P-tether-guard"
+            val guardClose = closing(body, guard.range.last) ?: return v + "P-tether-guard"
+            if (body.substring(guardClose + 1).isNotBlank()) v += "P-tether-guard"
+            val inside = SOURCE_CALL.findAll(body).toList()
+            if (inside.size != 1) return v + "P-tether-lambda ${inside.size}"
+            val open = body.indexOf('(', inside.single().range.first)
+            val close = closing(body, open) ?: return v + "P-tether-args unclosed"
+            val named = topLevelArgs(body.substring(open + 1, close)).associate { a ->
+                Regex("""^(\w+) ?= ?(.+)$""").matchEntire(a)?.let { it.groupValues[1] to it.groupValues[2] } ?: ("?" to a)
+            }
+            if (named != mapOf("tab" to slot.param, "owner" to "owner", "isShown" to TETHER_SHOWN, "sourceFactory" to "sourceAlertSectionSourceFactory")) {
+                v += "P-tether-args $named"
+            }
             return v
         }
     }

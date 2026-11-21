@@ -29,6 +29,9 @@ import com.jay.fxi.ui.alert.ProductionBankAlertSectionSourceFactory
 import com.jay.fxi.ui.alert.BankHistoryEntry
 import com.jay.fxi.ui.alert.BankHistoryWiringFactory
 import com.jay.fxi.ui.alert.ProductionBankHistoryWiring
+import com.jay.fxi.ui.alert.ProductionSourceAlertSectionSourceFactory
+import com.jay.fxi.ui.alert.SourceAlertSection
+import com.jay.fxi.ui.alert.SourceAlertSectionSourceFactory
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.PremiumTopicScreenState
 import com.jay.fxi.ui.premium.graph.GraphScreenHost
@@ -69,7 +72,8 @@ internal fun PremiumTopicRoute(
     },
     graphHost: GraphScreenHost? = null,
     bankHistoryWiring: BankHistoryWiringFactory = ProductionBankHistoryWiring,
-    bankAlertSectionSourceFactory: BankAlertSectionSourceFactory = ProductionBankAlertSectionSourceFactory
+    bankAlertSectionSourceFactory: BankAlertSectionSourceFactory = ProductionBankAlertSectionSourceFactory,
+    sourceAlertSectionSourceFactory: SourceAlertSectionSourceFactory = ProductionSourceAlertSectionSourceFactory
 ) {
     LaunchedEffect(consumer) { consumer.start() }
     LaunchedEffect(consumer, identity) { consumer.onIdentityChanged() }
@@ -198,6 +202,19 @@ internal fun PremiumTopicRoute(
                                     tab = tab,
                                     sourceFactory = bankAlertSectionSourceFactory,
                                     alertQuotes = screen.ui.alertQuotes
+                                )
+                            }
+                        }
+                    } else if (screen.ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null) {
+                        { tab ->
+                            if (tab == FreeTab.TETHER) {
+                                SourceAlertSection(
+                                    tab = tab,
+                                    owner = owner,
+                                    isShown = {
+                                        allowed() && consumer.currentState().ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null
+                                    },
+                                    sourceFactory = sourceAlertSectionSourceFactory
                                 )
                             }
                         }

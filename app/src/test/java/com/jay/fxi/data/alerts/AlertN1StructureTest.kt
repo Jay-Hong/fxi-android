@@ -501,6 +501,9 @@ class AlertN1StructureTest {
             Triple("the floor read elsewhere", withFile(BYPASS_KT, "class Crud @Inject constructor(val floor: AlertRateLimitFloor)"), "A-reach AlertRateLimitFloor"),
             Triple("the access reached from Java", withFile(BYPASS_JAVA, "class Bypass { AlertSettingsAccess access; }"), "A-reach AlertSettingsAccess"),
             Triple("the owner resolved at construction", appended(REGISTRY, "private val eager = $ownerProvider.get()"), "A-lazy-owner"),
+            Triple("the source owner resolved at construction (S8-4a)", appended(REGISTRY, "private val eagerSource = source.get()"), "A-lazy-source-owner"),
+            Triple("the source owner injected elsewhere (S8-4a)", withFile(BYPASS_KT, "class Screen @Inject constructor(val owner: SourceAlertSettingsOwner)"),
+                "A-reach SourceAlertSettingsOwner"),
             Triple("a floor per consumer", edited(FLOOR, """@Singleton\s+""", ""), "A-singleton AlertRateLimitFloor"))) {
             assertCaught("N1-A / S4 $label", tag, aApplication(tree) + aReach(tree))
         }
@@ -702,6 +705,8 @@ class AlertN1StructureTest {
         val SOURCE_OWNER = BASE + "data/alerts/SourceAlertSettingsOwner.kt"
         val ROW_POLICY = BASE + "data/alerts/SourceAlertRowPolicy.kt"
         val REPOSITORY = BASE + "data/repository/AlertRepository.kt"
+        /** S8-4a: the tether tab's read section, the source owner's one screen namer. */
+        val SOURCE_SECTION = BASE + "ui/alert/SourceAlertSection.kt"
         /** The six new N1 production files (API r1 §2–§6) and S8-3's two. E5a1's section holder is deliberately not one of them. */
         val NEW_FILES = listOf(PHASE, POLICY, FLOOR, ACCESS, REGISTRY, OWNER, SOURCE_OWNER, ROW_POLICY)
         /** S7 E5a1's section holder (API r2 §2): AlertSection's one caller and, besides the owner and the registry, the owner's one namer. */
@@ -1176,8 +1181,9 @@ class AlertN1StructureTest {
                     topic.currentAccessFence, uses, { coordinator.state.value }, { ReleaseAdmission.isOpen },
                     GraphProtectedAdmission(tokens::currentIdentityFence, deletions))""",
                 FLOOR to """@Inject constructor() : this(SystemClock::elapsedRealtime)""",
-                REGISTRY to """@Inject constructor(bank: Provider<BankAlertSettingsOwner>, coordinator: PremiumAccessCoordinator,
-                    tokens: AuthTokenProvider, capability: Provider<NotificationCapabilityMonitor>) : this(listOf({ bank.get() }),
+                REGISTRY to """@Inject constructor(bank: Provider<BankAlertSettingsOwner>, source: Provider<SourceAlertSettingsOwner>,
+                    coordinator: PremiumAccessCoordinator, tokens: AuthTokenProvider, capability: Provider<NotificationCapabilityMonitor>) :
+                    this(listOf({ bank.get() }, { source.get() }),
                     { ProcessLifecycleOwner.get().lifecycle },
                     { action -> Handler(Looper.getMainLooper()).post { action() }; Unit }, coordinator.state, tokens::currentIdentityFence,
                     CoroutineScope(SupervisorJob() + Dispatchers.Main), foregroundHooks = listOf({ capability.get().onForeground() }))"""
@@ -1278,9 +1284,9 @@ class AlertN1StructureTest {
                 "BankAlertSettingsOwner" to setOf(OWNER, REGISTRY, HOLDER),
                 "AlertSettingsAccess" to setOf(ACCESS, OWNER, SOURCE_OWNER),
                 "AlertRateLimitFloor" to setOf(FLOOR, OWNER, SOURCE_OWNER),
-                // S8-3: no production caller of the source owner yet (S8-4 registers it); the policy is its own and the owner's.
-                "SourceAlertSettingsOwner" to setOf(SOURCE_OWNER),
-                "SourceAlertRowPolicy" to setOf(ROW_POLICY, SOURCE_OWNER),
+                // S8-4a: the registry registers the source owner and the tether section reads it; the section projects with the policy.
+                "SourceAlertSettingsOwner" to setOf(SOURCE_OWNER, REGISTRY, SOURCE_SECTION),
+                "SourceAlertRowPolicy" to setOf(ROW_POLICY, SOURCE_OWNER, SOURCE_SECTION),
                 "AlertFamilyRefresherRegistry" to setOf(REGISTRY, APP, FCM, ACTIVITY))) {
                 val named = files(code, """\b$name\b""")
                 if (named != expected) v += "A-reach $name ${named.sorted()}"
@@ -1300,6 +1306,11 @@ class AlertN1StructureTest {
             val name = provider.singleOrNull()?.groupValues?.get(1)
             if (name == null || count(registry, """\b$name\s*\.\s*get\s*\(\s*\)""") != 1 ||
                 count(registry, """\{\s*$name\s*\.\s*get\s*\(\s*\)\s*\}""") != 1) v += "A-lazy-owner"
+            // S8-4a: the source owner, too, is resolved lazily and once.
+            val sourceProvider = Regex("""\b(\w+)\s*:\s*Provider\s*<\s*SourceAlertSettingsOwner\s*>""").findAll(registry).toList()
+            val sourceName = sourceProvider.singleOrNull()?.groupValues?.get(1)
+            if (sourceName == null || count(registry, """\b$sourceName\s*\.\s*get\s*\(\s*\)""") != 1 ||
+                count(registry, """\{\s*$sourceName\s*\.\s*get\s*\(\s*\)\s*\}""") != 1) v += "A-lazy-source-owner"
             return v
         }
 

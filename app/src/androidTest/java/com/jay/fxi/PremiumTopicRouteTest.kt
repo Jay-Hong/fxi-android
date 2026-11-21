@@ -36,6 +36,7 @@ import com.jay.fxi.domain.model.UserInfo
 import com.jay.fxi.domain.repository.NewsRepository
 import com.jay.fxi.ui.alert.BankAlertSectionSource
 import com.jay.fxi.ui.alert.BankAlertSectionSourceFactory
+import com.jay.fxi.ui.alert.CountingSourceAlertSection
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.view.PremiumTopicRoute
 import com.jay.fxi.ui.premium.view.PremiumTopicTags
@@ -118,6 +119,7 @@ class PremiumTopicRouteTest {
         }
     }
     private val bankAlerts = NoOpBankAlertSection()
+    private val sourceAlerts = CountingSourceAlertSection()
 
     private val display = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN))
     private val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.USD))
@@ -147,7 +149,7 @@ class PremiumTopicRouteTest {
                     Button(onClick = dismiss) { Text("fixture 닫기") }
                 }
             },
-            bankAlertSectionSourceFactory = bankAlerts)
+            bankAlertSectionSourceFactory = bankAlerts, sourceAlertSectionSourceFactory = sourceAlerts)
     }
 
     private fun show(news: FakeNews = FakeNews(), restorable: Boolean = false) {
@@ -335,7 +337,8 @@ class PremiumTopicRouteTest {
         )
         try {
             val vm = NewsViewModel(FakeNews())
-            rule.setContent { PremiumTopicRoute(c, a1, true, vm, null, {}, bankAlertSectionSourceFactory = bankAlerts) }
+            rule.setContent { PremiumTopicRoute(c, a1, true, vm, null, {}, bankAlertSectionSourceFactory = bankAlerts,
+                sourceAlertSectionSourceFactory = sourceAlerts) }
             rule.waitForIdle()
             val click = requireNotNull(
                 rule.onNodeWithTag(PremiumTopicTags.BANNER_ACTION).fetchSemanticsNode()

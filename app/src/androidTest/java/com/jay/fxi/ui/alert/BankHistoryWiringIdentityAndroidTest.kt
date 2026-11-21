@@ -122,6 +122,7 @@ class BankHistoryWiringIdentityAndroidTest {
         }
     }
     private val bankAlerts = NoOpBankAlertSection()
+    private val sourceAlerts = CountingSourceAlertSection()
 
     /**
      * S7C_W03 (consumption): before the first open nothing is resolved, through tab moves and a foreground; the first open
@@ -157,7 +158,8 @@ class BankHistoryWiringIdentityAndroidTest {
         rule.setContent {
             PremiumTopicRoute(consumer = consumer, identity = a1, isActive = true, newsViewModel = vm,
                 userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
-                settingsContent = { _, _, _ -> }, bankHistoryWiring = counting, bankAlertSectionSourceFactory = bankAlerts)
+                settingsContent = { _, _, _ -> }, bankHistoryWiring = counting, bankAlertSectionSourceFactory = bankAlerts,
+                sourceAlertSectionSourceFactory = sourceAlerts)
         }
         rule.waitForIdle()
         for (tab in listOf(FreeTab.JPY, FreeTab.TETHER, FreeTab.USD)) { focus.value = OwnedTopicFocus(a1, tab); rule.waitForIdle() }

@@ -75,6 +75,8 @@ import com.jay.fxi.ui.alert.BankHistoryRead
 import com.jay.fxi.ui.alert.BankHistoryTags
 import com.jay.fxi.ui.alert.BankHistoryWiring
 import com.jay.fxi.ui.alert.BankHistoryWiringFactory
+import com.jay.fxi.ui.alert.CountingSourceAlertSection
+import com.jay.fxi.ui.alert.SourceAlertSectionTags
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.graph.GraphScreenHost
 import com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder
@@ -166,6 +168,8 @@ class BankAlertSectionRouteTest {
         { o, tab -> focus.value = OwnedTopicFocus(o, tab) }, { }, { _, _ -> }, scope)
     private val source = FakeSource()
     private val factory = FakeFactory(source)
+    /** S8-4a: the tether tab's section reads this counting fake, never the process owner. */
+    private val sourceAlerts = CountingSourceAlertSection()
     private var sectionFactory by mutableStateOf<BankAlertSectionSourceFactory>(factory)
     private var active by mutableStateOf(true)
     private var mounted by mutableStateOf(true)
@@ -193,7 +197,7 @@ class BankAlertSectionRouteTest {
                 PremiumTopicRoute(consumer = consumer, identity = a1, isActive = active, newsViewModel = vm,
                     userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
                     settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = history,
-                    bankAlertSectionSourceFactory = sectionFactory)
+                    bankAlertSectionSourceFactory = sectionFactory, sourceAlertSectionSourceFactory = sourceAlerts)
             }
         }
         rule.waitForIdle()
@@ -250,10 +254,19 @@ class BankAlertSectionRouteTest {
         await("$label: and collects both flows") { collected(of) }
         assertEquals("$label: one section", 1, tags(BankAlertSectionTags.ROOT))
     }
-    /** Once the section left the composition: no slot, no section, no collection, no demand beyond [ensures]. */
-    private fun assertGone(label: String, ensures: Int, of: FakeSource = source) {
+    /**
+     * Once the section left the composition: no bank slot, no section, no collection, no demand beyond [ensures]. On [tether]
+     * the one slot holds the tether section (S8-4a) and nothing of the bank's.
+     */
+    private fun assertGone(label: String, ensures: Int, of: FakeSource = source, tether: Boolean = false) {
         await("$label: the collection ended") { released(of) }
-        assertEquals("$label: no slot", 0, inSlot(BankHistoryTags.ENTRY) + tags(PremiumTopicTags.BELOW_RATES))
+        assertEquals("$label: no history entry in a slot", 0, inSlot(BankHistoryTags.ENTRY))
+        if (tether) {
+            await("$label: the slot holds the tether section") { inSlot(SourceAlertSectionTags.ROOT) == 1 }
+            assertEquals("$label: one slot, the tether section's", 1, tags(PremiumTopicTags.BELOW_RATES))
+        } else {
+            assertEquals("$label: no slot", 0, tags(PremiumTopicTags.BELOW_RATES))
+        }
         assertEquals("$label: no section", 0, tags(BankAlertSectionTags.ROOT))
         assertEquals("$label: no collection", 0 to 0, subs(of))
         assertEquals("$label: no ensure while gone", ensures, of.ensures.get())
@@ -263,7 +276,8 @@ class BankAlertSectionRouteTest {
     // ---- S7E5A1 §5 row 5 ---------------------------------------------------------------------------------------------------
 
     /**
-     * Row 5a: TETHER and NEWS draw no slot and never ask the factory, ensure or a flow; each of USD, JPY and EUR draws one section
+     * Row 5a: TETHER's one slot holds only the tether section (S8-4a) and NEWS draws no slot; neither asks the bank factory,
+     * ensure or a flow; each of USD, JPY and EUR draws one section
      * in the slot, under the history entry, showing only its own currency's row of a mixed list, and its appearance asks ensure
      * once. The section does not make the history wiring.
      */
@@ -274,8 +288,14 @@ class BankAlertSectionRouteTest {
         for (tab in listOf(FreeTab.TETHER, FreeTab.NEWS)) {
             select(tab)
             rule.onNodeWithTag(PremiumTopicTags.tab(tab)).assertIsSelected()
-            if (tab == FreeTab.TETHER) assertEquals("premise($tab): its rates are drawn", 1, tags(PremiumTopicTags.RATES))
-            assertEquals("$tab: no slot", 0, tags(PremiumTopicTags.BELOW_RATES))
+            if (tab == FreeTab.TETHER) {
+                assertEquals("premise($tab): its rates are drawn", 1, tags(PremiumTopicTags.RATES))
+                await("$tab: the slot holds the tether section") { inSlot(SourceAlertSectionTags.ROOT) == 1 }
+                assertEquals("$tab: one slot, the tether section's", 1, tags(PremiumTopicTags.BELOW_RATES))
+            } else {
+                assertEquals("$tab: no slot", 0, tags(PremiumTopicTags.BELOW_RATES))
+            }
+            assertEquals("$tab: no history entry", 0, tags(BankHistoryTags.ENTRY))
             assertEquals("$tab: no section", 0, tags(BankAlertSectionTags.ROOT))
             assertEquals("$tab: the factory was never asked", 0, factory.created.get())
             assertEquals("$tab: no ensure", 0, source.ensures.get())
@@ -300,7 +320,7 @@ class BankAlertSectionRouteTest {
         }
         select(FreeTab.TETHER)
         rule.onNodeWithTag(PremiumTopicTags.tab(FreeTab.TETHER)).assertIsSelected()
-        assertGone("back on TETHER", ensures = 3)
+        assertGone("back on TETHER", ensures = 3, tether = true)
         assertEquals("the section made no history wiring", 0, historyMade.get())
     }
 
@@ -354,7 +374,7 @@ class BankAlertSectionRouteTest {
 
         select(FreeTab.TETHER)
         rule.onNodeWithTag(PremiumTopicTags.tab(FreeTab.TETHER)).assertIsSelected()
-        assertGone("left to TETHER", ensures = 1)
+        assertGone("left to TETHER", ensures = 1, tether = true)
         var expected = 1
         for (tab in listOf(FreeTab.USD, FreeTab.EUR, FreeTab.JPY, FreeTab.USD)) {
             select(tab)
