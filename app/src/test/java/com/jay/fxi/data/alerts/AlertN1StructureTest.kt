@@ -170,7 +170,7 @@ class AlertN1StructureTest {
     }
 
     @Test fun `S7N1_S04 the new N1 files reach no ViewModel reflection class loader or screen entry API`() {
-        assertEquals("premise(N1-S S1): the six new files are scanned and non-empty", emptyList<String>(),
+        assertEquals("premise(N1-S S1): the new files are scanned and non-empty", emptyList<String>(),
             NEW_FILES.filter { code[it].isNullOrBlank() })
         assertEquals("N1-S S1: the new files' explicit inventory", emptyList<String>(), s1Entry(code))
         for ((tag, path, source) in listOf(
@@ -443,10 +443,10 @@ class AlertN1StructureTest {
             Triple("the registry calling the owner directly",
                 appended(REGISTRY, "private fun bypass(o: BankAlertSettingsOwner) { o.onBankPush(1, \"false\") }"), "S3-bank-tokens"),
             Triple("the hand-over off main",
-                edited(REGISTRY, """postToMain\s*\{\s*dispatch\s*\{\s*it\s*\.\s*onBankPush\s*\(\s*id\s*,\s*isRepeat\s*\)\s*\}\s*\}""", "dispatch { it.onBankPush(id, isRepeat) }"),
+                edited(REGISTRY, """postToMain\s*\{\s*dispatch\s*\{\s*\(\s*it\s+as\?\s+AlertFamilyAdapter\s*\)\s*\?\.\s*onBankPush\s*\(\s*id\s*,\s*isRepeat\s*\)\s*\}\s*\}""", "dispatch { (it as? AlertFamilyAdapter)?.onBankPush(id, isRepeat) }"),
                 "S3-bank-dispatch"),
             Triple("the hand-over parsing the repeat",
-                edited(REGISTRY, """it\s*\.\s*onBankPush\s*\(\s*id\s*,\s*isRepeat\s*\)""", "it.onBankPush(id, isRepeat?.lowercase())"), "S3-bank-dispatch"),
+                edited(REGISTRY, """\(\s*it\s+as\?\s+AlertFamilyAdapter\s*\)\s*\?\.\s*onBankPush\s*\(\s*id\s*,\s*isRepeat\s*\)""", "(it as? AlertFamilyAdapter)?.onBankPush(id, isRepeat?.lowercase())"), "S3-bank-dispatch"),
             Triple("the owner calling itself", appended(OWNER, "private fun bypass() = onBankPush(1, \"false\")"), "S3-bank-owner"),
             Triple("the section holder reaching it",
                 appended(HOLDER, "private fun bypass(o: BankAlertSettingsOwner) = o.onBankPush(1, \"false\")"), "S3-bank-files"),
@@ -517,7 +517,7 @@ class AlertN1StructureTest {
     }
 
     @Test fun `S7N1_Q01 the new files read no snapshot authority alert bus permission prompt push token owner or binding`() {
-        assertEquals("premise(N1-Q): the six new files are scanned", emptyList<String>(), NEW_FILES.filter { it !in code })
+        assertEquals("premise(N1-Q): the new files are scanned", emptyList<String>(), NEW_FILES.filter { it !in code })
         assertEquals("N1-Q / N1-S S6", emptyList<String>(), s6Surfaces(code))
         for ((tag, path, source) in listOf(
             Triple("accessSnapshot", OWNER, "private val s = topic.accessSnapshot"),
@@ -561,6 +561,14 @@ class AlertN1StructureTest {
     @Test fun `S7N1_S12 the S11 lock catches each wiring mutant and accepts a reformatted delegation`() {
         for ((label, tree, tag) in listOf(
             Triple("jitter [0, 1)", editedLiteral(OWNER, "Random.nextDouble(-0.2, 0.2)", "Random.nextDouble()"), "S11-inject $OWNER"),
+            Triple("the source GET for every asset", editedLiteral(SOURCE_OWNER, "SourceAlertRowPolicy.SETTINGS_ASSET, admitted)", "null, admitted)"),
+                "S11-inject $SOURCE_OWNER"),
+            Triple("the source GET without its use check", editedLiteral(SOURCE_OWNER, "SourceAlertRowPolicy.SETTINGS_ASSET, admitted)",
+                "SourceAlertRowPolicy.SETTINGS_ASSET)"), "S11-inject $SOURCE_OWNER"),
+            Triple("the source GET with a constant use check", editedLiteral(SOURCE_OWNER, "SourceAlertRowPolicy.SETTINGS_ASSET, admitted)",
+                "SourceAlertRowPolicy.SETTINGS_ASSET, { true })"), "S11-inject $SOURCE_OWNER"),
+            Triple("a source recheck period of 30 s", editedLiteral(SOURCE_OWNER, "private val accessRecheckMillis: Long = 1_000",
+                "private val accessRecheckMillis: Long = 30_000"), "S11-source-recheck"),
             Triple("jitter [0, 1) spelled out", editedLiteral(OWNER, "Random.nextDouble(-0.2, 0.2)", "Random.nextDouble(0.0, 1.0)"), "S11-inject $OWNER"),
             Triple("a recheck period passed by production",
                 editedLiteral(OWNER, "repository.deleteSetting(owner, id, admitted) }", "repository.deleteSetting(owner, id, admitted) }, 30_000"),
@@ -690,8 +698,12 @@ class AlertN1StructureTest {
         val ACCESS = BASE + "data/alerts/AlertSettingsAccess.kt"
         val REGISTRY = BASE + "data/alerts/AlertFamilyRefresherRegistry.kt"
         val OWNER = BASE + "data/alerts/BankAlertSettingsOwner.kt"
-        /** The six new N1 production files (API r1 §2–§6). E5a1's section holder is deliberately not one of them. */
-        val NEW_FILES = listOf(PHASE, POLICY, FLOOR, ACCESS, REGISTRY, OWNER)
+        /** S8-3 (`R4c/S8/s8_3_contract` §1.1–§1.2): the source settings owner and its row policy. */
+        val SOURCE_OWNER = BASE + "data/alerts/SourceAlertSettingsOwner.kt"
+        val ROW_POLICY = BASE + "data/alerts/SourceAlertRowPolicy.kt"
+        val REPOSITORY = BASE + "data/repository/AlertRepository.kt"
+        /** The six new N1 production files (API r1 §2–§6) and S8-3's two. E5a1's section holder is deliberately not one of them. */
+        val NEW_FILES = listOf(PHASE, POLICY, FLOOR, ACCESS, REGISTRY, OWNER, SOURCE_OWNER, ROW_POLICY)
         /** S7 E5a1's section holder (API r2 §2): AlertSection's one caller and, besides the owner and the registry, the owner's one namer. */
         val HOLDER = BASE + "ui/alert/BankAlertSection.kt"
         val ROUTE = BASE + "ui/premium/view/PremiumTopicRoute.kt"
@@ -1032,7 +1044,7 @@ class AlertN1StructureTest {
                 count(registry, bankCall) != 4) v += "S3-bank-tokens"
             if (deliver == null || count(registry.substring(deliver), bankCall) != 1) v += "S3-bank-outside-deliver"
             if (tap == null || count(registry.substring(tap), bankCall) != 2) v += "S3-bank-outside-tap"
-            if (count(registry, """\bpostToMain\s*\{\s*dispatch\s*\{\s*it\s*\.\s*onBankPush\s*\(\s*id\s*,\s*isRepeat\s*\)\s*\}\s*\}""") != 1) v += "S3-bank-dispatch"
+            if (count(registry, """\bpostToMain\s*\{\s*dispatch\s*\{\s*\(\s*it\s+as\?\s+AlertFamilyAdapter\s*\)\s*\?\.\s*onBankPush\s*\(\s*id\s*,\s*isRepeat\s*\)\s*\}\s*\}""") != 1) v += "S3-bank-dispatch"
             if (count(owner, """\bonBankPush\b""") != 1 || count(owner, """\boverride\s+fun\s+onBankPush\s*\(""") != 1) v += "S3-bank-owner"
             val aliases = files(code, """\bimport\s+[\w.`]*\b(?:AlertFamilyRefresherRegistry|deliverPush|deliverTap|onSyncAlerts|onBankPush)\b`?\s+as\b""")
             if (aliases.isNotEmpty()) v += "S3-alias ${aliases.sorted()}"
@@ -1154,6 +1166,11 @@ class AlertN1StructureTest {
                     { owner, id, request, admitted -> repository.updateSettingPartial(owner, id, request, admitted) },
                     rememberAddedBank = memory::acceptAddedBank,
                     reportRememberFailure = { Log.w(TAG, "Last selected bank not accepted") })""",
+                SOURCE_OWNER to """@Inject constructor(repository: AlertRepository, access: AlertSettingsAccess, floor: AlertRateLimitFloor,
+                    coordinator: PremiumAccessCoordinator) : this(
+                    { owner, admitted -> repository.getSourceSettings(owner, SourceAlertRowPolicy.SETTINGS_ASSET, admitted) },
+                    access, floor, AlertRetryPolicy(), SystemClock::elapsedRealtime, { Random.nextDouble(-0.2, 0.2) },
+                    CoroutineScope(SupervisorJob() + Dispatchers.Main), { delay(it) }, coordinator.state, coordinator.accessRevisions)""",
                 ACCESS to """@Inject constructor(tokens: AuthTokenProvider, topic: TopicRuntimeOwner, uses: TopicUseAuthority,
                     coordinator: PremiumAccessCoordinator, deletions: DeletionAdmissionStore) : this(tokens::currentIdentityFence,
                     topic.currentAccessFence, uses, { coordinator.state.value }, { ReleaseAdmission.isOpen },
@@ -1199,6 +1216,10 @@ class AlertN1StructureTest {
                 count(owner, """\bmarkConsumerBound\b""") != 1) {
                 v += "S11-bound"
             }
+            // S8-3: the source owner's production recheck period is its 1 s default and the GET's asset is the exchange one.
+            val sourceOwner = code[SOURCE_OWNER].orEmpty()
+            if (count(sourceOwner, """\bprivate\s+val\s+accessRecheckMillis\s*:\s*Long\s*=\s*(?:1_000|1000)\s*\)""") != 1) v += "S11-source-recheck"
+            if (count(code[ROW_POLICY].orEmpty(), "\\bconst\\s+val\\s+SETTINGS_ASSET\\s*=\\s*\"usdt-krw\"") != 1) v += "S11-source-asset"
             val fcm = code[FCM].orEmpty()
             val receive = bodyRange(fcm, "onMessageReceived")?.let { squash(fcm.substring(it)) }.orEmpty()
             if (Regex("""(?<![!\w])if \(route\.showBanner\) showAlertNotification\(message, type\)""").findAll(receive).count() != 1 ||
@@ -1255,18 +1276,24 @@ class AlertN1StructureTest {
             val v = mutableListOf<String>()
             for ((name, expected) in listOf(
                 "BankAlertSettingsOwner" to setOf(OWNER, REGISTRY, HOLDER),
-                "AlertSettingsAccess" to setOf(ACCESS, OWNER),
-                "AlertRateLimitFloor" to setOf(FLOOR, OWNER),
+                "AlertSettingsAccess" to setOf(ACCESS, OWNER, SOURCE_OWNER),
+                "AlertRateLimitFloor" to setOf(FLOOR, OWNER, SOURCE_OWNER),
+                // S8-3: no production caller of the source owner yet (S8-4 registers it); the policy is its own and the owner's.
+                "SourceAlertSettingsOwner" to setOf(SOURCE_OWNER),
+                "SourceAlertRowPolicy" to setOf(ROW_POLICY, SOURCE_OWNER),
                 "AlertFamilyRefresherRegistry" to setOf(REGISTRY, APP, FCM, ACTIVITY))) {
                 val named = files(code, """\b$name\b""")
                 if (named != expected) v += "A-reach $name ${named.sorted()}"
             }
             for ((name, path) in listOf("BankAlertSettingsOwner" to OWNER, "AlertSettingsAccess" to ACCESS,
-                    "AlertRateLimitFloor" to FLOOR, "AlertFamilyRefresherRegistry" to REGISTRY)) {
+                    "AlertRateLimitFloor" to FLOOR, "AlertFamilyRefresherRegistry" to REGISTRY, "SourceAlertSettingsOwner" to SOURCE_OWNER)) {
                 val text = code[path].orEmpty()
                 if (count(text, """@Singleton\s+(?:internal\s+)?class\s+$name\b""") != 1) v += "A-singleton $name"
                 if (count(text, """@Inject\s+constructor\b""") != 1) v += "A-inject $name"
             }
+            // S8-3: the source settings GET has one production caller, the source owner.
+            val sourceGets = files(code, """\bgetSourceSettings\b""")
+            if (sourceGets != setOf(REPOSITORY, SOURCE_OWNER)) v += "A-source-get ${sourceGets.sorted()}"
             val registry = code[REGISTRY].orEmpty()
             if (count(registry, """\bstart\s*\(\s*\)""") != 1) v += "A-self-start"
             val provider = Regex("""\b(\w+)\s*:\s*Provider\s*<\s*BankAlertSettingsOwner\s*>""").findAll(registry).toList()
@@ -1276,7 +1303,7 @@ class AlertN1StructureTest {
             return v
         }
 
-        /** S5: no KRX in the code and strings of the six new files. */
+        /** S5: no KRX in the code and strings of the new files. */
         fun s5Krx(code: Map<String, String>): List<String> = NEW_FILES.mapNotNull { path ->
             val text = code[path]
             when {

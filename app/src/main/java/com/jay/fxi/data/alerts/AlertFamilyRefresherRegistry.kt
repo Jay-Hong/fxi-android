@@ -25,16 +25,21 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 
-internal interface AlertFamilyAdapter {
+/** S8-3: what every registered family receives: the process lifecycle and the silent sync. */
+internal interface AlertLifecycleAdapter {
     fun onForeground(authoritative: Boolean = false)
     fun onBackground()
     fun onSync()
+}
+
+/** A family that also takes the bank's individual push and tap; the registry hands those to such a family only. */
+internal interface AlertFamilyAdapter : AlertLifecycleAdapter {
     fun onBankPush(id: Int?, isRepeat: String?) {}
 }
 
 @Singleton
 internal class AlertFamilyRefresherRegistry internal constructor(
-    private val families: List<() -> AlertFamilyAdapter>,
+    private val families: List<() -> AlertLifecycleAdapter>,
     private val lifecycle: () -> Lifecycle,
     private val postToMain: (() -> Unit) -> Unit,
     private val premium: StateFlow<OwnedPremiumAccess>,
@@ -64,7 +69,7 @@ internal class AlertFamilyRefresherRegistry internal constructor(
     private var started = false
     private var foreground: Boolean? = null
     private var pendingFor: AuthIdentityFence? = null
-    private val adapters = mutableListOf<AlertFamilyAdapter>()
+    private val adapters = mutableListOf<AlertLifecycleAdapter>()
 
     /** Main. Resolve families only once, before an observer can replay the current foreground. */
     fun start() {
@@ -113,7 +118,7 @@ internal class AlertFamilyRefresherRegistry internal constructor(
     }
 
     fun onBankPush(id: Int?, isRepeat: String?) {
-        postToMain { dispatch { it.onBankPush(id, isRepeat) } }
+        postToMain { dispatch { (it as? AlertFamilyAdapter)?.onBankPush(id, isRepeat) } }
     }
 
     private fun setForeground(value: Boolean) {
@@ -136,7 +141,7 @@ internal class AlertFamilyRefresherRegistry internal constructor(
         }
     }
 
-    private fun dispatch(action: (AlertFamilyAdapter) -> Unit) {
+    private fun dispatch(action: (AlertLifecycleAdapter) -> Unit) {
         adapters.toList().forEach { adapter ->
             try {
                 action(adapter)

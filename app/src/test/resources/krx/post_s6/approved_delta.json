@@ -376,6 +376,21 @@
         }
       },
       "added": {}
+    },
+    {
+      "id": "S8-3",
+      "source_parent": "a142ca2264fbf4c9987ceae9389ba62a7b94f2b6",
+      "approval_record_sha256": "fa7f5916ee94f501b905a4f7ff2bbb5a767c3888e202e37a429669f6e82739e2",
+      "changed": {
+        "src/main/java/com/jay/fxi/data/alerts/AlertFamilyRefresherRegistry.kt": {
+          "from": "fe1744218ca333c96d9541aca411ce7b70d67123b8c91e5c89b46129adb0e9b9",
+          "to": "747795072e83a2c7abe512df77f4e69ad0980364dbe049f749f5f38a037a4de3"
+        }
+      },
+      "added": {
+        "src/main/java/com/jay/fxi/data/alerts/SourceAlertSettingsOwner.kt": "747f0bd79ecf339433a3dd7276603de4221f89e6a936dae3394d0797ceb970dc",
+        "src/main/java/com/jay/fxi/data/alerts/SourceAlertRowPolicy.kt": "88f046bd75eebefbe4fa2769fd3346c0e691ebafca3fd9e4f4b358c55b88ac67"
+      }
     }
   ]
 }
