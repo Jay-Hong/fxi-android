@@ -168,7 +168,8 @@ class S84ARegistrationProbeAndroidTest {
             )
             source = SourceAlertSettingsOwner(
                 { o, admitted -> repository.getSourceSettings(o, SourceAlertRowPolicy.SETTINGS_ASSET, admitted) }, access, floor,
-                AlertRetryPolicy(), SystemClock::elapsedRealtime, { 0.0 }, scope, { delay(it) }, premium, MutableStateFlow(0L)
+                AlertRetryPolicy(), SystemClock::elapsedRealtime, { 0.0 }, scope, { delay(it) }, premium, MutableStateFlow(0L),
+                { _, _, _ -> error("S8-5a: no create") }, { _, _, _, _ -> error("S8-5a: no edit") }, { _, _, _ -> error("S8-5a: no delete") }
             )
         }
         val bankResolves = AtomicInteger()

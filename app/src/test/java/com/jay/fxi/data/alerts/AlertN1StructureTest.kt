@@ -43,7 +43,8 @@ import org.junit.Test
  * - S5 / S6 / N1-Q: the six new files name no KRX, read no snapshot authority, no alert bus, no permission prompt, no push
  *   token owner and declare no binding.
  * - S11 (gap battery r1): the four production `@Inject` delegations pass exactly the agreed suppliers, the owner's production
- *   recheck period is its 1 s default, and FCM keeps its one guarded banner call.
+ *   recheck period is its 1 s default, and FCM keeps its one guarded banner call. S8-5a: the source owner's three writes go
+ *   through the three agreed production delegation functions, each passing its request's own use check.
  *
  * Every lock is a function from the scanned sources to its violations: each test first shows the real tree clean, then feeds
  * the same function mutated trees it must reject, and comment-only or lookalike controls it must accept. Not this file's:
@@ -504,6 +505,27 @@ class AlertN1StructureTest {
             Triple("the source owner resolved at construction (S8-4a)", appended(REGISTRY, "private val eagerSource = source.get()"), "A-lazy-source-owner"),
             Triple("the source owner injected elsewhere (S8-4a)", withFile(BYPASS_KT, "class Screen @Inject constructor(val owner: SourceAlertSettingsOwner)"),
                 "A-reach SourceAlertSettingsOwner"),
+            Triple("a source write outside the owner (S8-5a)",
+                withFile(BYPASS_KT, "class Bypass(val r: AlertRepository) { suspend fun go(o: AuthIdentityFence) = r.deleteSourceSetting(o, 1) }"),
+                "A-source-write deleteSourceSetting"),
+            Triple("a second source create call in the owner through another receiver (S8-5a)",
+                appended(SOURCE_OWNER, "private suspend fun again(r: AlertRepository, o: AuthIdentityFence) = r.createSourceSetting(o, " +
+                    "SourceAlertSettingRequest(\"upbit\", \"usdt-krw\", AlertCondition.ABOVE, 1.0, true))"),
+                "A-source-write createSourceSetting"),
+            Triple("a second source edit inside the repository (S8-5a)",
+                // Inside the class, as a member call would compile (the scan is string-level; the battery compiles real mutants).
+                editedLiteral(REPOSITORY, "    suspend fun deleteSourceSetting(",
+                    "    private suspend fun again(o: AuthIdentityFence) = updateSourceSetting(o, 1, SourceAlertSettingUpdateRequest())\n\n    suspend fun deleteSourceSetting("),
+                "A-source-write updateSourceSetting"),
+            Triple("a source create by reference (S8-5a)", withFile(BYPASS_KT, "val alias = AlertRepository::createSourceSetting"),
+                "A-source-write createSourceSetting"),
+            Triple("the delegation function used elsewhere (S8-5a)",
+                withFile(BYPASS_KT, "class Bypass(val r: AlertRepository) { val d = productionSourceDelete(r) }"),
+                "A-source-delegation productionSourceDelete"),
+            Triple("the delegation calling the write twice (S8-5a)",
+                editedLiteral(SOURCE_OWNER, "{ owner, id, admitted -> repository.deleteSourceSetting(owner, id, admitted) }",
+                    "{ owner, id, admitted -> repository.deleteSourceSetting(owner, id, admitted); repository.deleteSourceSetting(owner, id, admitted) }"),
+                "A-source-write-once deleteSourceSetting"),
             Triple("a floor per consumer", edited(FLOOR, """@Singleton\s+""", ""), "A-singleton AlertRateLimitFloor"))) {
             assertCaught("N1-A / S4 $label", tag, aApplication(tree) + aReach(tree))
         }
@@ -570,6 +592,22 @@ class AlertN1StructureTest {
                 "SourceAlertRowPolicy.SETTINGS_ASSET)"), "S11-inject $SOURCE_OWNER"),
             Triple("the source GET with a constant use check", editedLiteral(SOURCE_OWNER, "SourceAlertRowPolicy.SETTINGS_ASSET, admitted)",
                 "SourceAlertRowPolicy.SETTINGS_ASSET, { true })"), "S11-inject $SOURCE_OWNER"),
+            // S8-5a: each source write's production delegation carries its request's use check.
+            Triple("a source create without its use check", editedLiteral(SOURCE_OWNER, "repository.createSourceSetting(owner, request, admitted)",
+                "repository.createSourceSetting(owner, request)"), "S11-source-write productionSourceCreate"),
+            Triple("a source create with a constant use check", editedLiteral(SOURCE_OWNER, "repository.createSourceSetting(owner, request, admitted)",
+                "repository.createSourceSetting(owner, request) { true }"), "S11-source-write productionSourceCreate"),
+            Triple("a source edit without its use check", editedLiteral(SOURCE_OWNER, "repository.updateSourceSetting(owner, id, request, admitted)",
+                "repository.updateSourceSetting(owner, id, request)"), "S11-source-write productionSourceEdit"),
+            Triple("a source edit with a constant use check", editedLiteral(SOURCE_OWNER, "repository.updateSourceSetting(owner, id, request, admitted)",
+                "repository.updateSourceSetting(owner, id, request) { true }"), "S11-source-write productionSourceEdit"),
+            Triple("a source delete without its use check", editedLiteral(SOURCE_OWNER, "repository.deleteSourceSetting(owner, id, admitted)",
+                "repository.deleteSourceSetting(owner, id)"), "S11-source-write productionSourceDelete"),
+            Triple("a source delete with a constant use check", editedLiteral(SOURCE_OWNER, "repository.deleteSourceSetting(owner, id, admitted)",
+                "repository.deleteSourceSetting(owner, id) { true }"), "S11-source-write productionSourceDelete"),
+            Triple("a source write passed as its own lambda, around the delegation", editedLiteral(SOURCE_OWNER,
+                "productionSourceDelete(repository)", "{ owner, id, admitted -> repository.deleteSourceSetting(owner, id, admitted) }"),
+                "S11-inject $SOURCE_OWNER"),
             Triple("a source recheck period of 30 s", editedLiteral(SOURCE_OWNER, "private val accessRecheckMillis: Long = 1_000",
                 "private val accessRecheckMillis: Long = 30_000"), "S11-source-recheck"),
             Triple("jitter [0, 1) spelled out", editedLiteral(OWNER, "Random.nextDouble(-0.2, 0.2)", "Random.nextDouble(0.0, 1.0)"), "S11-inject $OWNER"),
@@ -604,6 +642,9 @@ class AlertN1StructureTest {
         }
         val reformatted = edited(OWNER, """\{\s*Random\.nextDouble\(-0\.2,\s*0\.2\)\s*\}""", "{\n            Random.nextDouble(\n                -0.2, 0.2\n            )\n        }")
         assertEquals("control(S11): the same delegation reformatted passes", emptyList<String>(), s11Wiring(reformatted))
+        val sourceReformatted = editedLiteral(SOURCE_OWNER, "{ owner, id, admitted -> repository.deleteSourceSetting(owner, id, admitted) }",
+            "{ owner, id, admitted ->\n        repository.deleteSourceSetting(\n            owner, id, admitted\n        )\n    }")
+        assertEquals("control(S11): a source delegation reformatted passes", emptyList<String>(), s11Wiring(sourceReformatted) + aReach(sourceReformatted))
     }
 
     // ---- mutation helpers: each asserts its own anchor, so no mutation can silently be the real tree ----
@@ -1178,7 +1219,8 @@ class AlertN1StructureTest {
                     coordinator: PremiumAccessCoordinator) : this(
                     { owner, admitted -> repository.getSourceSettings(owner, SourceAlertRowPolicy.SETTINGS_ASSET, admitted) },
                     access, floor, AlertRetryPolicy(), SystemClock::elapsedRealtime, { Random.nextDouble(-0.2, 0.2) },
-                    CoroutineScope(SupervisorJob() + Dispatchers.Main), { delay(it) }, coordinator.state, coordinator.accessRevisions)""",
+                    CoroutineScope(SupervisorJob() + Dispatchers.Main), { delay(it) }, coordinator.state, coordinator.accessRevisions,
+                    productionSourceCreate(repository), productionSourceEdit(repository), productionSourceDelete(repository))""",
                 ACCESS to """@Inject constructor(tokens: AuthTokenProvider, topic: TopicRuntimeOwner, uses: TopicUseAuthority,
                     coordinator: PremiumAccessCoordinator, deletions: DeletionAdmissionStore) : this(tokens::currentIdentityFence,
                     topic.currentAccessFence, uses, { coordinator.state.value }, { ReleaseAdmission.isOpen },
@@ -1201,6 +1243,43 @@ class AlertN1StructureTest {
             val close = closing(text, open) ?: return null
             val delegate = Regex("""^\s*:\s*this\s*\(""").find(text.substring(close + 1)) ?: return null
             val end = closing(text, close + 1 + delegate.range.last) ?: return null
+            return text.substring(found.single().range.first, end + 1)
+        }
+
+        /**
+         * S11 (S8-5a contract §2.2): the source owner's three production write delegations, squashed. The `@Inject` constructor
+         * and the wire rig both use them, so a change here is a change on the wire the rig observes.
+         */
+        val SOURCE_WRITE_FORMS: Map<String, String> by lazy {
+            mapOf(
+                "productionSourceCreate" to """internal fun productionSourceCreate(
+                    repository: AlertRepository
+                ): suspend (AuthIdentityFence, SourceAlertSettingRequest, () -> Boolean) -> AuthBoundResult<SourceAlertSetting> =
+                    { owner, request, admitted -> repository.createSourceSetting(owner, request, admitted) }""",
+                "productionSourceEdit" to """internal fun productionSourceEdit(
+                    repository: AlertRepository
+                ): suspend (AuthIdentityFence, Int, SourceAlertSettingUpdateRequest, () -> Boolean) -> AuthBoundResult<SourceAlertSetting> =
+                    { owner, id, request, admitted -> repository.updateSourceSetting(owner, id, request, admitted) }""",
+                "productionSourceDelete" to """internal fun productionSourceDelete(
+                    repository: AlertRepository
+                ): suspend (AuthIdentityFence, Int, () -> Boolean) -> AuthBoundResult<Unit> =
+                    { owner, id, admitted -> repository.deleteSourceSetting(owner, id, admitted) }"""
+            ).mapValues { squash(it.value) }
+        }
+
+        /** The three source writes, each with the one delegation function that may call it. */
+        val SOURCE_WRITES = listOf(
+            "createSourceSetting" to "productionSourceCreate",
+            "updateSourceSetting" to "productionSourceEdit",
+            "deleteSourceSetting" to "productionSourceDelete")
+
+        /** The one `internal fun [name](...)` of [text] with its lambda body, from `internal` to the lambda's close; null unless exactly one. */
+        fun sourceWriteDelegation(text: String, name: String): String? {
+            val found = Regex("""\binternal\s+fun\s+$name\s*\(""").findAll(text).toList()
+            if (found.size != 1) return null
+            val close = closing(text, found.single().range.last) ?: return null
+            val body = Regex("""^[^{}=]*=\s*\{""").find(text.substring(close + 1)) ?: return null
+            val end = closing(text, close + 1 + body.range.last) ?: return null
             return text.substring(found.single().range.first, end + 1)
         }
 
@@ -1228,6 +1307,10 @@ class AlertN1StructureTest {
             // S8-3: the source owner's production recheck period is its 1 s default and the GET's asset is the exchange one.
             val sourceOwner = code[SOURCE_OWNER].orEmpty()
             if (count(sourceOwner, """\bprivate\s+val\s+accessRecheckMillis\s*:\s*Long\s*=\s*(?:1_000|1000)\s*\)""") != 1) v += "S11-source-recheck"
+            // S8-5a: each source write's delegation function as agreed, its request's own use check passed on unchanged.
+            for ((name, form) in SOURCE_WRITE_FORMS) {
+                if (sourceWriteDelegation(sourceOwner, name)?.let(::squash) != form) v += "S11-source-write $name"
+            }
             if (count(code[ROW_POLICY].orEmpty(), "\\bconst\\s+val\\s+SETTINGS_ASSET\\s*=\\s*\"usdt-krw\"") != 1) v += "S11-source-asset"
             val fcm = code[FCM].orEmpty()
             val receive = bodyRange(fcm, "onMessageReceived")?.let { squash(fcm.substring(it)) }.orEmpty()
@@ -1303,6 +1386,21 @@ class AlertN1StructureTest {
             // S8-3: the source settings GET has one production caller, the source owner.
             val sourceGets = files(code, """\bgetSourceSettings\b""")
             if (sourceGets != setOf(REPOSITORY, SOURCE_OWNER)) v += "A-source-get ${sourceGets.sorted()}"
+            // S8-5a: apart from its one declaration in the repository, each source write is named exactly once in production
+            // code, inside its delegation function; any other receiver, alias, reference or internal call is a second use.
+            for ((write, delegation) in SOURCE_WRITES) {
+                val declared = count(code[REPOSITORY].orEmpty(), """\bsuspend\s+fun\s+$write\s*\(""")
+                if (declared != 1) v += "A-source-write-declared $write"
+                val uses = occurrences(code, """\b$write\b""").toMutableMap()
+                uses[REPOSITORY] = (uses[REPOSITORY] ?: 0) - declared
+                val used = uses.filterValues { it != 0 }
+                if (used != mapOf(SOURCE_OWNER to 1)) v += "A-source-write $write $used"
+                val body = sourceWriteDelegation(code[SOURCE_OWNER].orEmpty(), delegation)
+                if (body == null || count(body, """\b$write\b""") != 1) v += "A-source-write-once $write"
+                // The delegation function itself: declared and passed once, both in the source owner.
+                val passed = occurrences(code, """\b$delegation\b""")
+                if (passed != mapOf(SOURCE_OWNER to 2)) v += "A-source-delegation $delegation $passed"
+            }
             val registry = code[REGISTRY].orEmpty()
             if (count(registry, """\bstart\s*\(\s*\)""") != 1) v += "A-self-start"
             val provider = Regex("""\b(\w+)\s*:\s*Provider\s*<\s*BankAlertSettingsOwner\s*>""").findAll(registry).toList()

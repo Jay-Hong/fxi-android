@@ -225,7 +225,7 @@ class S8RegistryTwoFamilyContractTest {
         val source = SourceAlertSettingsOwner(
             { _, _ -> CompletableDeferred<AuthBoundResult<List<SourceAlertSetting>>>().also { sourceGets += it }.await() },
             access, floor, AlertRetryPolicy(), { testScheduler.currentTime }, { 0.0 }, CoroutineScope(job + dispatcher), { delay(it) },
-            premium, MutableStateFlow(0L)
+            premium, MutableStateFlow(0L), { _, _, _ -> error("S8-5a: no create") }, { _, _, _, _ -> error("S8-5a: no edit") }, { _, _, _ -> error("S8-5a: no delete") }
         )
         val lifecycleOnly: AlertLifecycleAdapter = source
         org.junit.Assert.assertFalse("the source owner is no bank-push family", lifecycleOnly is AlertFamilyAdapter)

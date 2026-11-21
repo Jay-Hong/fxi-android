@@ -94,7 +94,7 @@ class S84ATwoFamilyGoldenTest {
         val source = SourceAlertSettingsOwner(
             { _, _ -> CompletableDeferred<AuthBoundResult<List<SourceAlertSetting>>>().also { sourceGets += it }.await() },
             access, floor, AlertRetryPolicy(), { test.testScheduler.currentTime }, { 0.0 }, CoroutineScope(job + dispatcher), { delay(it) },
-            premium, MutableStateFlow(0L)
+            premium, MutableStateFlow(0L), { _, _, _ -> error("S8-5a: no create") }, { _, _, _, _ -> error("S8-5a: no edit") }, { _, _, _ -> error("S8-5a: no delete") }
         )
 
         /** Every call the registry makes on each family, in order; each is handed to its owner exactly once. */

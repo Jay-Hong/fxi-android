@@ -202,7 +202,8 @@ class AlertSettingsGetLoopContractTest(private val family: String) {
             else -> {
                 val source = SourceAlertSettingsOwner(
                     { who, admitted -> read(who, admitted, ::sourceRow) }, access, floor, AlertRetryPolicy(), clock, { 0.0 },
-                    scope, sleep, premium, accessRevisions, RECHECK
+                    scope, sleep, premium, accessRevisions,
+                    { _, _, _ -> error("S8-5a: no create") }, { _, _, _, _ -> error("S8-5a: no edit") }, { _, _, _ -> error("S8-5a: no delete") }, RECHECK
                 )
                 object : Subject {
                     override val endpoint = AuthenticatedEndpoint.SOURCE_NOTIFICATION_SETTINGS

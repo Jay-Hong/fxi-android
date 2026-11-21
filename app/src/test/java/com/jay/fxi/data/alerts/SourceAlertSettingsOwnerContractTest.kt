@@ -121,7 +121,8 @@ class SourceAlertSettingsOwnerContractTest {
             },
             access, floor, AlertRetryPolicy(), { test.testScheduler.currentTime }, { 0.0 },
             CoroutineScope(job + StandardTestDispatcher(test.testScheduler)), { delay(it) },
-            premium, accessRevisions, 1_000L
+            premium, accessRevisions,
+            { _, _, _ -> error("S8-5a: no create") }, { _, _, _, _ -> error("S8-5a: no edit") }, { _, _, _ -> error("S8-5a: no delete") }, 1_000L
         )
         init {
             CoroutineScope(job + UnconfinedTestDispatcher(test.testScheduler)).launch { owner.manualOutcomes.collect { manualEvents += it } }

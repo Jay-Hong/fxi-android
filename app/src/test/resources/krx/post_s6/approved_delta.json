@@ -425,6 +425,22 @@
         "src/main/java/com/jay/fxi/ui/alert/SourceHistoryStateHolder.kt": "5eb61a0f41dfec633c19dd62bda5cd9ace7557a1ba2f97a92bd2c88d8380cfbf",
         "src/main/java/com/jay/fxi/ui/alert/SourceHistorySheet.kt": "40bd6d148a5f1c62a67abea6253b6e77bf94d02f5fef84a7f2d4f9390756f281"
       }
+    },
+    {
+      "id": "S8-5a",
+      "source_parent": "34763f87aea977bc6e9fc2fa3bdf59c4f7785049",
+      "approval_record_sha256": "fa7f5916ee94f501b905a4f7ff2bbb5a767c3888e202e37a429669f6e82739e2",
+      "changed": {
+        "src/main/java/com/jay/fxi/data/alerts/SourceAlertSettingsOwner.kt": {
+          "from": "747f0bd79ecf339433a3dd7276603de4221f89e6a936dae3394d0797ceb970dc",
+          "to": "41466b5904443e45f5d7519868fd3da424cbda9852094b45e4c1a13a90dd4f4d"
+        },
+        "src/main/java/com/jay/fxi/data/alerts/SourceAlertRowPolicy.kt": {
+          "from": "88f046bd75eebefbe4fa2769fd3346c0e691ebafca3fd9e4f4b358c55b88ac67",
+          "to": "493418ba7b04a22ccc77063ee2f2e81dfebfd06dc1f5159488b27740bd33bd3d"
+        }
+      },
+      "added": {}
     }
   ]
 }

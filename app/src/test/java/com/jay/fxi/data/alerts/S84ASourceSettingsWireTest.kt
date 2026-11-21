@@ -107,7 +107,8 @@ class S84ASourceSettingsWireTest {
                 repository.getSourceSettings(o, SourceAlertRowPolicy.SETTINGS_ASSET, admitted)
             },
             access, AlertRateLimitFloor { System.nanoTime() / 1_000_000 }, AlertRetryPolicy(), { System.nanoTime() / 1_000_000 }, { 0.0 },
-            scope, { delay(it) }, premium, MutableStateFlow(0L), 1_000L
+            scope, { delay(it) }, premium, MutableStateFlow(0L),
+            { _, _, _ -> error("S8-5a: no create") }, { _, _, _, _ -> error("S8-5a: no edit") }, { _, _, _ -> error("S8-5a: no delete") }, 1_000L
         )
 
         suspend fun foreground() = withContext(main) { owner.onForeground(false) }
