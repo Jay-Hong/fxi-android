@@ -134,6 +134,20 @@ internal fun PremiumTopicRoute(
                 var settingsOpen by remember { mutableStateOf(false) }
                 var detailUrl by remember { mutableStateOf<String?>(null) }
                 val allowed: () -> Boolean = { activeNow && consumer.currentState().ui.owner == owner }
+                // S8-5b: the tether section's session. Leaving this owner's tether tab, opening settings or a news detail, and any
+                // check that finds the section not shown end it for good; the section is keyed by it, so a return is a new one.
+                var tetherEpoch by remember { mutableStateOf(0L) }
+                val tetherTab = screen.ui.selectedTab == FreeTab.TETHER
+                DisposableEffect(consumer, owner, tetherTab) {
+                    if (!tetherTab) return@DisposableEffect onDispose { }
+                    var wasTether = false
+                    val stop = consumer.addScreenListener { published ->
+                        val tether = published.ui.owner == owner && published.ui.selectedTab == FreeTab.TETHER
+                        if (wasTether && !tether) tetherEpoch++
+                        wasTether = tether
+                    }
+                    onDispose { stop() }
+                }
                 val lifecycle = LocalLifecycleOwner.current.lifecycle
                 val context = LocalContext.current
 
@@ -153,7 +167,12 @@ internal fun PremiumTopicRoute(
                             consumer.applyRowPreference(capturedOwner, tab, list, seeded, order, hidden)
                         }
                     },
-                    onOpenSettings = { if (allowed()) settingsOpen = true },
+                    onOpenSettings = {
+                        if (allowed() && !settingsOpen) {
+                            tetherEpoch++
+                            settingsOpen = true
+                        }
+                    },
                     newsContent = { visible ->
                         val items by newsViewModel.newsItems.collectAsState()
                         val loading by newsViewModel.isLoading.collectAsState()
@@ -188,12 +207,17 @@ internal fun PremiumTopicRoute(
                             newsItems = items, isLoading = loading, error = error, refreshTrigger = refresh,
                             isPremium = true, isTabVisible = visible, isDetailOpen = detailUrl != null,
                             onRetry = { if (visibleNow && allowed()) newsViewModel.retry(isPremium = true) },
-                            onDetailOpen = { url -> if (visibleNow && allowed()) detailUrl = url }
+                            onDetailOpen = { url ->
+                                if (visibleNow && allowed()) {
+                                    tetherEpoch++
+                                    detailUrl = url
+                                }
+                            }
                         )
                     },
                     graphSlot = graphSlot,
                     belowRates = if (screen.ui.selectedTab in listOf(FreeTab.USD, FreeTab.JPY, FreeTab.EUR) && !settingsOpen && detailUrl == null) {
-                        { tab ->
+                        { tab, _ ->
                             Column {
                                 BankHistoryEntry(
                                     tab = tab,
@@ -210,7 +234,7 @@ internal fun PremiumTopicRoute(
                             }
                         }
                     } else if (screen.ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null) {
-                        { tab ->
+                        { tab, overlayClearNow ->
                             if (tab == FreeTab.TETHER) {
                                 Column {
                                     SourceHistoryEntry(
@@ -220,14 +244,26 @@ internal fun PremiumTopicRoute(
                                         listen = consumer::addScreenListener,
                                         wiring = { sourceHistoryWiring.create(context) { consumer.state.value.ui.owner } }
                                     )
-                                    SourceAlertSection(
-                                        tab = tab,
-                                        owner = owner,
-                                        isShown = {
-                                            allowed() && consumer.currentState().ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null
-                                        },
-                                        sourceFactory = sourceAlertSectionSourceFactory
-                                    )
+                                    val ticket = tetherEpoch
+                                    key(ticket) {
+                                        // S8-5b: one read of the current state answers the owner, the tab and the quotes together, never
+                                        // the last render's; null is a withdrawn session, and finding one ends this session.
+                                        val liveQuotes: () -> Map<String, Double>? = {
+                                            val ui = consumer.currentState().ui
+                                            val shown = ticket == tetherEpoch && activeNow && ui.owner == owner &&
+                                                ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null && overlayClearNow()
+                                            if (!shown && ticket == tetherEpoch) tetherEpoch++
+                                            ui.alertQuotes.takeIf { shown }
+                                        }
+                                        SourceAlertSection(
+                                            tab = tab,
+                                            owner = owner,
+                                            isShown = { liveQuotes() != null },
+                                            sourceFactory = sourceAlertSectionSourceFactory,
+                                            quotes = screen.ui.alertQuotes,
+                                            liveQuotes = liveQuotes
+                                        )
+                                    }
                                 }
                             }
                         }

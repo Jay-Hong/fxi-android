@@ -1117,7 +1117,28 @@ class BankAlertSectionStructureTest {
             Triple("the production source factory passed directly", edited(ROUTE, """sourceFactory\s*=\s*sourceAlertSectionSourceFactory""",
                 "sourceFactory = ProductionSourceAlertSectionSourceFactory"), "P-tether-args"),
             Triple("the shown check reduced to the route's own owner", edited(ROUTE,
-                """isShown\s*=\s*\{\s*allowed\(\)\s*&&[^}]*\}""", "isShown = { allowed() }"), "P-tether-args"),
+                """isShown\s*=\s*\{\s*liveQuotes\(\)\s*!=\s*null\s*\}""", "isShown = { allowed() }"), "P-tether-args"),
+            // S8-5b: the slot's live overlay check reaches the tether shown check only; the quotes are the current state's.
+            Triple("the bank slot taking the live check", edited(ROUTE, """\{\s*tab\s*,\s*_\s*->""", "{ tab, overlayClearNow ->"), "P-bank-live"),
+            Triple("the tether slot ignoring the live check", edited(ROUTE, """\{\s*tab\s*,\s*overlayClearNow\s*->""", "{ tab, _ ->"), "P-tether-live"),
+            Triple("the shown check without the overlay", edited(ROUTE, """&&\s*detailUrl\s*==\s*null\s*&&\s*overlayClearNow\(\)""",
+                "&& detailUrl == null"), "P-tether-session"),
+            Triple("the shown check holding the overlay uncalled", edited(ROUTE, """&&\s*overlayClearNow\(\)""",
+                "&& overlayClearNow != null"), "P-tether-session"),
+            Triple("the live quotes taken from the render", edited(ROUTE, """liveQuotes\s*=\s*liveQuotes\b""",
+                "liveQuotes = { screen.ui.alertQuotes }"), "P-tether-args"),
+            Triple("the live quotes of any tab", edited(ROUTE, """(?<![\w.])ui\.selectedTab\s*==\s*FreeTab\.TETHER\s*&&\s*!settingsOpen""", "!settingsOpen"),
+                "P-tether-session"),
+            Triple("the session not keyed", edited(ROUTE, """key\(ticket\)\s*\{""", "run {"), "P-tether-session"),
+            Triple("a withdrawn session read as empty", edited(ROUTE, """ui\.alertQuotes\.takeIf\s*\{\s*shown\s*\}""", "ui.alertQuotes"),
+                "P-tether-session"),
+            Triple("a finding that does not end the session", edited(ROUTE, """if\s*\(\s*!shown\s*&&\s*ticket\s*==\s*tetherEpoch\s*\)\s*tetherEpoch\+\+""", ""),
+                "P-tether-session"),
+            Triple("settings opened without ending the session", edited(ROUTE, """tetherEpoch\+\+\s*settingsOpen\s*=\s*true""", "settingsOpen = true"),
+                "P-tether-epoch"),
+            Triple("a left tether tab not observed", edited(ROUTE, """if\s*\(\s*wasTether\s*&&\s*!tether\s*\)\s*tetherEpoch\+\+""", ""),
+                "P-tether-epoch"),
+            Triple("the shown quotes not passed", edited(ROUTE, """quotes\s*=\s*screen\.ui\.alertQuotes,""", ""), "P-tether-args"),
             Triple("the source factory parameter not last",
                 edited(ROUTE, """\bsourceAlertSectionSourceFactory\s*:\s*SourceAlertSectionSourceFactory\s*=\s*ProductionSourceAlertSectionSourceFactory\b""",
                     "\$0,\n    s84aExtra: Int = 0"), "P-parameter"),
@@ -1356,7 +1377,21 @@ class BankAlertSectionStructureTest {
         /** S8-4a: the tether section's call, branch condition, shown check and factory parameter. */
         val SOURCE_CALL = Regex("""\bSourceAlertSection\s*\(""")
         val TETHER_CONDITION = squash("screen.ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null")
-        val TETHER_SHOWN = squash("{ allowed() && consumer.currentState().ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null }")
+        /**
+         * S8-5b: the tether section's session, keyed by its ticket, and its one live read: the ticket, activity, the whole owner, the
+         * tether tab, settings and detail closed and the slot's live overlay check (called) in one read of the current state, a
+         * finding that ends the session, and null for a withdrawn one.
+         */
+        fun tetherSession(live: String) = squash("""val ticket = tetherEpoch key(ticket) {
+            val liveQuotes: () -> Map<String, Double>? = { val ui = consumer.currentState().ui
+            val shown = ticket == tetherEpoch && activeNow && ui.owner == owner && ui.selectedTab == FreeTab.TETHER && !settingsOpen && detailUrl == null && $live()
+            if (!shown && ticket == tetherEpoch) tetherEpoch++ ui.alertQuotes.takeIf { shown } }""")
+        /** S8-5b: what else ends the session: leaving this owner's tether tab (the screen listener), settings and a news detail. */
+        val TETHER_ENDS = listOf(
+            squash("""val stop = consumer.addScreenListener { published -> val tether = published.ui.owner == owner && published.ui.selectedTab == FreeTab.TETHER
+                if (wasTether && !tether) tetherEpoch++ wasTether = tether }"""),
+            squash("if (allowed() && !settingsOpen) { tetherEpoch++ settingsOpen = true }"),
+            squash("if (visibleNow && allowed()) { tetherEpoch++ detailUrl = url }"))
         const val SOURCE_FACTORY_PARAMETER =
             "sourceAlertSectionSourceFactory: SourceAlertSectionSourceFactory = ProductionSourceAlertSectionSourceFactory"
         /** S8-4b: the tether history entry's call and factory parameter. */
@@ -2697,7 +2732,8 @@ class BankAlertSectionStructureTest {
             return m.range.first..close
         }
 
-        class Slot(val condition: IntRange, val param: String, val body: IntRange)
+        /** S8-5b: [live] is the slot's second parameter, the screen's overlay check (`_` where unused). */
+        class Slot(val condition: IntRange, val param: String, val body: IntRange, val live: String)
 
         private fun skip(text: String, from: Int): Int {
             var i = from
@@ -2705,7 +2741,7 @@ class BankAlertSectionStructureTest {
             return i
         }
 
-        /** One `if (condition) { { param -> body } }` branch starting at [from] (at `if`), and the index after it. */
+        /** One `if (condition) { { param, live -> body } }` branch starting at [from] (at `if`), and the index after it. */
         private fun branch(text: String, from: Int): Pair<Slot, Int>? {
             var i = from
             if (!text.startsWith("if", i)) return null
@@ -2720,13 +2756,14 @@ class BankAlertSectionStructureTest {
             if (text.getOrNull(j) != '{') return null
             val lambdaClose = closing(text, j) ?: return null
             if (text.substring(lambdaClose + 1, outerClose).isNotBlank()) return null
-            val head = Regex("""^\s*(\w+)\s*->""").find(text.substring(j + 1, lambdaClose)) ?: return null
-            return Slot(condition, head.groupValues[1], (j + 1 + head.range.last + 1) until lambdaClose) to outerClose + 1
+            val head = Regex("""^\s*(\w+)\s*,\s*(\w+)\s*->""").find(text.substring(j + 1, lambdaClose)) ?: return null
+            return Slot(condition, head.groupValues[1], (j + 1 + head.range.last + 1) until lambdaClose, head.groupValues[2]) to outerClose + 1
         }
 
         /**
-         * The route's `belowRates = if (bank) { { param -> body } } [else if (tether) { { param -> body } }] else null` (S8-4a adds
-         * the tether branch): the first slot is the bank's, the second the tether's or null; null for any other form.
+         * The route's `belowRates = if (bank) { { param, live -> body } } [else if (tether) { { param, live -> body } }] else null`
+         * (S8-4a adds the tether branch, S8-5b the live parameter): the first slot is the bank's, the second the tether's or null;
+         * null for any other form.
          */
         fun belowRatesSlots(text: String): Pair<Slot, Slot?>? {
             val m = Regex("""\bbelowRates\s*=\s*""").findAll(text).toList().singleOrNull() ?: return null
@@ -2785,6 +2822,7 @@ class BankAlertSectionStructureTest {
             }
             for ((tag, pattern) in ROUTE_FORBIDDEN) if (Regex(pattern).containsMatchIn(route)) v += "P-route-owner $tag"
             val slot = belowRates(route) ?: return v + "P-below-rates"
+            if (slot.live != "_") v += "P-bank-live ${slot.live}"
             val condition = squash(route.substring(slot.condition))
             if (condition != CONDITION) v += "P-condition $condition"
             val body = route.substring(slot.body)
@@ -2817,6 +2855,7 @@ class BankAlertSectionStructureTest {
             if (historyCalls != mapOf(ROUTE to 1)) v += "P-tether-history-calls $historyCalls"
             if (count(route, """\bsourceHistoryWiring\b""") != 2) v += "P-tether-history-tokens"
             val slot = belowRatesSlots(route)?.second ?: return v + "P-tether-slot"
+            if (slot.live == "_" || slot.live == slot.param) v += "P-tether-live ${slot.live}"
             val condition = squash(route.substring(slot.condition))
             if (condition != TETHER_CONDITION) v += "P-tether-condition $condition"
             val body = route.substring(slot.body)
@@ -2846,7 +2885,10 @@ class BankAlertSectionStructureTest {
             val named = topLevelArgs(body.substring(open + 1, close)).associate { a ->
                 Regex("""^(\w+) ?= ?(.+)$""").matchEntire(a)?.let { it.groupValues[1] to it.groupValues[2] } ?: ("?" to a)
             }
-            if (named != mapOf("tab" to slot.param, "owner" to "owner", "isShown" to TETHER_SHOWN, "sourceFactory" to "sourceAlertSectionSourceFactory")) {
+            if (count(squash(body), Regex.escape(tetherSession(slot.live))) != 1) v += "P-tether-session"
+            if (count(route, """\btetherEpoch\s*\+\+""") != 4 || TETHER_ENDS.any { count(squash(route), Regex.escape(it)) != 1 }) v += "P-tether-epoch"
+            if (named != mapOf("tab" to slot.param, "owner" to "owner", "isShown" to "{ liveQuotes() != null }",
+                    "sourceFactory" to "sourceAlertSectionSourceFactory", "quotes" to "screen.ui.alertQuotes", "liveQuotes" to "liveQuotes")) {
                 v += "P-tether-args $named"
             }
             return v

@@ -187,9 +187,18 @@ class S84ARegistrationProbeAndroidTest {
             object : SourceAlertSectionSource {
                 override val settings = source.state
                 override val manualRefresh = source.manualRefresh
+                // S8-5b: the probe sees no memory and asserts no write; the writes still reach the one owner.
+                override val selection = kotlinx.coroutines.flow.MutableStateFlow<com.jay.fxi.data.local.SourceSelectionSnapshot>(
+                    com.jay.fxi.data.local.SourceSelectionSnapshot.None)
+                override suspend fun prepareSelection(identity: com.jay.fxi.data.auth.AuthIdentityFence) = Unit
+                override fun acceptAddedSource(identity: com.jay.fxi.data.auth.AuthIdentityFence, sourceCode: String) = Unit
                 override fun ensure() = source.ensure()
                 override fun authoritative() = source.authoritative()
                 override fun manual() = source.manual()
+                override fun addAlert(draft: SourceAlertDraft) = source.addAlert(draft)
+                override fun editAlert(id: Int, edit: SourceAlertEdit) = source.editAlert(id, edit)
+                override fun setEnabled(id: Int, enabled: Boolean) = source.setEnabled(id, enabled)
+                override fun delete(id: Int) = source.delete(id)
             }
         }
 

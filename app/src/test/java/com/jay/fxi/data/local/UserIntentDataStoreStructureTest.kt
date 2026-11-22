@@ -62,11 +62,11 @@ class UserIntentDataStoreStructureTest {
         )
     }
 
-    /** Only the two concerns reach the file, through the shared accessor. */
+    /** Only the three concerns reach the file, through the shared accessor (S8-5b adds the last source's one read and one write). */
     @Test
     fun onlyTheTwoConcernsUseTheAccessor() {
         assertEquals(
-            mapOf(DECLARING to 1, RATE_ROW to 2, LAST_BANK to 3),
+            mapOf(DECLARING to 1, RATE_ROW to 2, LAST_BANK to 3, LAST_SOURCE to 2),
             sites("""\buserIntentDataStore\b""")
         )
     }
@@ -81,6 +81,37 @@ class UserIntentDataStoreStructureTest {
         assertEquals(mapOf(LAST_BANK to 1), sites(literal("last_selected_bank_owner_uid")))
         assertEquals(mapOf(LAST_BANK to 1), sites(literal("last_selected_bank")))
         assertEquals(mapOf(RATE_ROW to 1), sites(literal("rate_row_owner_uid")))
+        // S8-5b: the last added exchange's one key per UID, in the source store only.
+        assertEquals(mapOf(LAST_SOURCE to 1), sites(literal("last_selected_source_uid_\$uid")))
+        assertEquals(mapOf(LAST_SOURCE to 1), sites("""last_selected_source"""))
+    }
+
+    /**
+     * S8-5b (`R4c/S8/s8_5b_contract.agreed.r1.md` §4): the last-source store reads once (`data.first()`) and writes once (one
+     * `edit`) through the shared accessor, constructs no store, aliases and shadows nothing, and only its memory names it.
+     */
+    @Test
+    fun theSourceStoreReadsOnceAndWritesOnce() {
+        val text = code.getValue(LAST_SOURCE)
+        assertEquals(listOf("userIntentDataStore.data.first()[key(uid)]", "userIntentDataStore.edit {"), accesses(text))
+        assertEquals(0, constructions(text))
+        assertEquals(0, aliases(text))
+        assertEquals(0, shadows(text))
+        for (required in REQUIRED_IMPORTS) assertTrue("$required 가 없다", Regex("""(?m)^\s*${Regex.escape(required)}\s*$""").containsMatchIn(text))
+        assertEquals(setOf(LAST_SOURCE), sites("""\b(?:DataStore)?LastSelectedSourceStore\b""").keys)
+        assertEquals("the agreed read, write and key", emptyList<String>(), sourceStoreViolations(text))
+        for ((label, from, to) in listOf(
+            Triple("a constant value", "preferences[key(uid)] = sourceCode", "preferences[key(uid)] = \"upbit\""),
+            Triple("the UID lost on the write", "preferences[key(uid)] = sourceCode", "preferences[key(\"\")] = sourceCode"),
+            Triple("the UID lost on the read", "data.first()[key(uid)]", "data.first()[key(\"A\")]"),
+            Triple("one key for every UID", "stringPreferencesKey(\"last_selected_source_uid_\$uid\")", "stringPreferencesKey(\"last_selected_source\")"))) {
+            assertTrue("premise: $label", text.contains(from))
+            assertTrue("$label is caught", sourceStoreViolations(text.replaceFirst(from, to)).isNotEmpty())
+        }
+        assertEquals("the last-source key is not the bank's", emptyMap<String, Int>(),
+            listOf("last_selected_bank_owner_uid", "last_selected_bank", "rate_row_owner_uid").associateWith { k ->
+                Regex(literal(k)).findAll(text).count()
+            }.filterValues { it > 0 })
     }
 
     /** The agreed surface (s7e5b4_api_agreed.r1.md §2.1): three members, and a concrete singleton over the app context. */
@@ -202,6 +233,7 @@ class UserIntentDataStoreStructureTest {
         val DECLARING = BASE + "data/local/UserIntentDataStore.kt"
         val RATE_ROW = BASE + "data/local/RateRowPreferenceStore.kt"
         val LAST_BANK = BASE + "data/local/LastSelectedBankStore.kt"
+        val LAST_SOURCE = BASE + "data/local/LastSelectedSourceMemory.kt"
         val PURGE_MANIFEST = BASE + "data/entitlements/purge/PurgeManifest.kt"
 
         /** A string literal holding the file's name as a whole word, anywhere in it. */
@@ -579,6 +611,14 @@ class UserIntentDataStoreStructureTest {
         }
 
         /** Each reference to the shared accessor in [text], with what is done to it. */
+        /** S8-5b: the last-source store's three members, as agreed; each missing one is named. */
+        val SOURCE_STORE_MEMBERS = listOf(
+            "override suspend fun read(uid: String): String? { require(uid.isNotBlank()) return context.userIntentDataStore.data.first()[key(uid)] }",
+            "override suspend fun remember(uid: String, sourceCode: String) { require(uid.isNotBlank()) " +
+                "context.userIntentDataStore.edit { preferences -> preferences[key(uid)] = sourceCode } }",
+            "private fun key(uid: String) = stringPreferencesKey(\"last_selected_source_uid_\$uid\")")
+        fun sourceStoreViolations(text: String): List<String> = squash(text).let { flat -> SOURCE_STORE_MEMBERS.filterNot { flat.contains(it) } }
+
         fun accesses(text: String): List<String> =
             Regex("""userIntentDataStore\s*\.\s*(edit\s*\{|data\b[^\s]*|\w+)""").findAll(text).map { it.value }.toList()
     }

@@ -11,9 +11,13 @@ import org.junit.Test
  * S7 E5b2b1 structure (s7e5b2b_start_agreed.r1.md D3·D5·D6·D10 and §4-3, errata r2 E5–E7):
  * - H: the helper asks and decides only. It names no lifecycle observer, registration, token, foreground entry or family;
  *   it writes the request record and never reads it; only it names the environment seam and no production source provides
- *   one; it declares the remembered helper once and only the settings screen and the bank alert holder call it (E5b2b2).
+ *   one; it declares the remembered helper once and only the settings screen, the bank alert holder (E5b2b2) and the tether
+ *   alert section (S8-5b) call it.
  * - S: the settings screen calls the helper once, shows the row only on needsAction, runs it on a click, between the
  *   profile card and the general section, and names nothing of the OS, the monitor or the seam.
+ * - T (S8-5b, `R4c/S8/s8_5b_contract.agreed.r1.md` §2 "권한", §4): the tether section calls the helper once, reads only
+ *   needsAction on it, adapts it into the holder's two arguments, and the holder runs a continuation only in the add's open and
+ *   in the save, and the banner's bare request only after its live check.
  * Each lock has a mutation it is shown to catch, beside the unaltered tree that it accepts.
  */
 class S7E5B2B1StructureTest {
@@ -23,6 +27,7 @@ class S7E5B2B1StructureTest {
         val HELPER = BASE + "ui/alert/NotificationPermissionAction.kt"
         val SETTINGS = BASE + "ui/settings/SettingsScreen.kt"
         val BANK_HOLDER = BASE + "ui/alert/BankAlertSection.kt"
+        val SOURCE_HOLDER = BASE + "ui/alert/SourceAlertSection.kt"
         val VIEW_MODEL = BASE + "ui/viewmodel/AlertViewModel.kt"
         const val MARKER = "has_requested_notification_permission"
 
@@ -93,7 +98,7 @@ class S7E5B2B1StructureTest {
             if (code.values.any { Regex("""\bprovides\b|\bprovidesDefault\b""").containsMatchIn(it) && Regex(LOCAL).containsMatchIn(it) }) v += "H-local-provide"
             if (count(squash(helper), Regex.escape(DECLARATION)) != 1 || count(helper, """\bfun\s+rememberNotificationPermissionAction\b""") != 1) v += "H-declare"
             val callers = files(code, CALL) - HELPER
-            if (callers != setOf(SETTINGS, BANK_HOLDER)) v += "H-callers ${callers.sorted()}"
+            if (callers != setOf(SETTINGS, BANK_HOLDER, SOURCE_HOLDER)) v += "H-callers ${callers.sorted()}"
             if (count(helper, CALL) != count(helper, """\bfun\s+rememberNotificationPermissionAction\b""")) v += "H-self-call"
             val flat = squash(helper)
             if (count(flat, Regex.escape(PRODUCTION_ENVIRONMENT)) != 1 || count(helper, """\bEntryPointAccessors\s*\.""") != 1) v += "H-production"
@@ -137,6 +142,69 @@ class S7E5B2B1StructureTest {
             if (main < 0 || profile < 0 || row < 0 || general < 0 || !(profile < row && row < general)) v += "S-place"
             val members = Regex("""\bnotificationAction\s*\.\s*(\w+)""").findAll(settings).map { it.groupValues[1] }.toSet()
             if (members != setOf("needsAction", "run")) v += "S-members $members"
+            return v
+        }
+
+        val T_ADAPTER = listOf(
+            squash("val actionNow by rememberUpdatedState(notificationAction)"),
+            squash("permission = { granted -> actionNow.run { granted() } }"),
+            squash("enableNotifications = { if (actionNow.needsAction) actionNow.run() }"))
+        const val T_BANNER = "fun requestNotifications() { if (liveNow() && !liveRows().isNullOrEmpty()) enableNotifications() }"
+        val CONTINUATION = """\bpermission\s*\{"""
+
+        /** The body of the first `fun [name](` in [text], braces matched; null when absent. */
+        fun body(text: String, name: String): String? {
+            val start = Regex("""\bfun\s+$name\s*\(""").find(text)?.range?.first ?: return null
+            val open = text.indexOf('{', start).takeIf { it >= 0 } ?: return null
+            var depth = 0
+            for (i in open until text.length) {
+                when (text[i]) {
+                    '{' -> depth++
+                    '}' -> if (--depth == 0) return text.substring(open, i + 1)
+                }
+            }
+            return null
+        }
+
+        /** The braces of the first `permission {` block in [text], or "" when there is none. */
+        fun continuation(text: String): String {
+            val start = Regex(CONTINUATION).find(text)?.range?.last ?: return ""
+            var depth = 0
+            for (i in start until text.length) {
+                when (text[i]) {
+                    '{' -> depth++
+                    '}' -> if (--depth == 0) return text.substring(start, i + 1)
+                }
+            }
+            return ""
+        }
+
+        fun tVerdicts(code: Map<String, String>): List<String> {
+            val v = mutableListOf<String>()
+            val section = code[SOURCE_HOLDER] ?: return listOf("T-missing")
+            val flat = squash(section)
+            if (count(section, CALL) != 1) v += "T-calls"
+            if (T_ADAPTER.any { count(flat, Regex.escape(it)) != 1 }) v += "T-adapter"
+            val members = Regex("""\bnotificationAction\s*\.\s*(\w+)""").findAll(section).map { it.groupValues[1] }.toSet()
+            val adapted = Regex("""\bactionNow\s*\.\s*(\w+)""").findAll(section).map { it.groupValues[1] }.toSet()
+            if (members != setOf("needsAction") || adapted != setOf("run", "needsAction")) v += "T-members $members $adapted"
+            val add = body(section, "openAdd").orEmpty()
+            val save = body(section, "submit").orEmpty()
+            if (count(section, CONTINUATION) != 2 || count(add, CONTINUATION) != 1 || count(save, CONTINUATION) != 1) v += "T-continuations"
+            // The open and the two writes happen inside the continuations, and the card and the add button share one entry.
+            val opened = continuation(add)
+            val sent = continuation(save)
+            if (count(opened, """\bshow\s*\(""") != 1 || count(add.removeRange(add.indexOf(opened), add.indexOf(opened) + opened.length), """\bshow\s*\(""") != 0 ||
+                count(sent, """\bsource\s*\.\s*addAlert\s*\(""") != 1 || count(sent, """\bsource\s*\.\s*editAlert\s*\(""") != 1 ||
+                count(section, """\bsource\s*\.\s*(?:addAlert|editAlert)\s*\(""") != 2) v += "T-continuation-body"
+            if (count(section, """\bonClick\s*=\s*onAdd\b""") != 2 || count(section, """\bonAdd\s*=\s*holder\s*::\s*openAdd\b""") != 1) v += "T-add-entry"
+            // The banner is drawn with the bare request as its click: never the add's entry.
+            val bannerWiring = squash("onEnableNotifications = holder::requestNotifications")
+            val bannerClick = squash("modifier = Modifier.testTag(SourceAlertSectionTags.NOTIFY_BANNER).fillMaxWidth() .clickable(onClick = onEnableNotifications)")
+            if (count(flat, Regex.escape(T_BANNER)) != 1 ||
+                count(section, """\benableNotifications\s*\(\s*\)""") != 1 ||
+                count(flat, Regex.escape(bannerWiring)) != 1 ||
+                count(flat, Regex.escape(bannerClick)) != 1) v += "T-banner"
             return v
         }
 
@@ -211,5 +279,39 @@ class S7E5B2B1StructureTest {
         assertCaught("a row moved above the profile", "S-place", sVerdicts(code + (SETTINGS to moved)))
         val after = flat.replaceFirst("$ROW_BLOCK ", "").replaceFirst(GENERAL, "$GENERAL $ROW_BLOCK")
         assertCaught("a row moved into the general section", "S-place", sVerdicts(code + (SETTINGS to after)))
+    }
+
+    @Test fun `S8_5B_T01 the tether section calls the helper once and continues only an add's open and a save`() {
+        assertEquals(emptyList<String>(), tVerdicts(code))
+    }
+
+    @Test fun `S8_5B_T02 the tether lock catches a second call, an adapter that runs at once, a third or a moved continuation and an unchecked banner`() {
+        for ((label, tree, tag) in listOf(
+            Triple("the banner opens an add", edited(SOURCE_HOLDER,
+                "onEnableNotifications = holder::requestNotifications", "onEnableNotifications = holder::openAdd"), "T-banner"),
+            Triple("the banner's click on another callback", edited(SOURCE_HOLDER,
+                ".clickable(onClick = onEnableNotifications)", ".clickable(onClick = onAdd)"), "T-banner"),
+            Triple("a second call", appended(SOURCE_HOLDER, "@Composable private fun s() = rememberNotificationPermissionAction()"), "T-calls"),
+            Triple("an adapter that runs at once", edited(SOURCE_HOLDER, "permission = { granted -> actionNow.run { granted() } }", "permission = { granted -> granted() }"), "T-adapter"),
+            Triple("a banner that asks", edited(SOURCE_HOLDER, "enableNotifications = { if (actionNow.needsAction) actionNow.run() }",
+                "enableNotifications = { actionNow.run { } }"), "T-adapter"),
+            Triple("an add opened before the grant", edited(SOURCE_HOLDER, "        val epoch = editorEpoch\n        permission {",
+                "        val epoch = editorEpoch\n        show(SourceAlertOpenEditor(SourceAlertEditorMode.Add, identity, SourceAlertEditor.initial(SourceAlertEditorMode.Add, sources, emptyMap())))\n        permission {"),
+                "T-continuation-body"),
+            Triple("a save sent outside its continuation", edited(SOURCE_HOLDER, "        val revision = open.inputRevision\n",
+                "        val revision = open.inputRevision\n        source.addAlert(SourceAlertDraft(\"upbit\", AlertCondition.BELOW, 1.0, true, null))\n"), "T-continuation-body"),
+            Triple("the card on its own entry", edited(SOURCE_HOLDER, "                                onClick = onAdd,\n                                enabled",
+                "                                onClick = onEnableNotifications,\n                                enabled"), "T-add-entry"),
+            Triple("another member", appended(SOURCE_HOLDER, "private fun s(a: NotificationPermissionAction) { val notificationAction = a; notificationAction.dialog }"), "T-members"),
+            Triple("a toggle under the helper", edited(SOURCE_HOLDER, "if (liveNow() && liveRow(row) != null) source.setEnabled(row.id, enabled)",
+                "permission { if (liveNow() && liveRow(row) != null) source.setEnabled(row.id, enabled) }"), "T-continuations"),
+            Triple("an add opened outside the continuation", edited(SOURCE_HOLDER, "        permission {\n            if (epoch != editorEpoch",
+                "        run {\n            if (epoch != editorEpoch"), "T-continuations"),
+            Triple("a save sent outside the continuation", edited(SOURCE_HOLDER, "        permission {\n            if (used) return@permission",
+                "        run {\n            if (used) return@permission"), "T-continuations"),
+            Triple("a banner without its live check", edited(SOURCE_HOLDER, "fun requestNotifications() { if (liveNow() && !liveRows().isNullOrEmpty()) enableNotifications() }",
+                "fun requestNotifications() { enableNotifications() }"), "T-banner"))) {
+            assertCaught(label, tag, tVerdicts(tree))
+        }
     }
 }

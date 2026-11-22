@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "998251fedaf98187fba3c36cf30a88038ac91667bc1bd1d654b5153fc3113ccd"
+    const val APPROVED_SHA256 = "af37cc3192c0c2aea8b2ab6f684b71c35576dae07e717b3cbcbac5fca36d165c"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -76,6 +76,10 @@ internal object PostS6ApprovedDelta {
      * - 152a7723…: d87bbd55 PremiumTopicRoute.kt, no KRX at all (comments included).
      * - 747f0bd7…: 34763f87 SourceAlertSettingsOwner.kt (S8-3's addition), no KRX at all (comments included).
      * - 88f046bd…: 34763f87 SourceAlertRowPolicy.kt (S8-3's addition), no KRX at all (comments included).
+     * - b2f1c2fa…: 889dde0b SourceAlertSection.kt (S8-4a's addition), no KRX at all (comments included).
+     * - c310135e…: 889dde0b PremiumTopicRoute.kt (S8-4b's change), no KRX at all (comments included).
+     * - 3d85219d…: 889dde0b PremiumTopicScreen.kt (S7-c's change), no KRX at all (comments included).
+     * - b3812b74…: 889dde0b PremiumTopicPresenter.kt (S7-E5b3b's change), no KRX at all (comments included).
      */
     val NO_KRX_REVIEWED = setOf(
         "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
@@ -127,7 +131,11 @@ internal object PostS6ApprovedDelta {
         "463c69c36b81a95f4c5484a23ba975458caea27e7c06a21370e9252f830983c0",
         "152a77231ff5ebb874dbd09b42bc6a762b64314ca7d8d55ed8748033c3b1dca8",
         "747f0bd79ecf339433a3dd7276603de4221f89e6a936dae3394d0797ceb970dc",
-        "88f046bd75eebefbe4fa2769fd3346c0e691ebafca3fd9e4f4b358c55b88ac67"
+        "88f046bd75eebefbe4fa2769fd3346c0e691ebafca3fd9e4f4b358c55b88ac67",
+        "b2f1c2faab2fc5b1c09d8e53c4cb4ffc28960f9ef9f1dd328d5240fc3b689687",
+        "c310135ef3cff7c3514e55d836ead1a1803eee7ed4469a21433ee66975ea630d",
+        "3d85219d9aae8b60ed1944561f3c4d34f998c6994b1d050f9e32c79c856bda18",
+        "b3812b742ab0764a699b9fa85e7fc151acdce8f76e8701b3c315a5af8b18e84c"
     )
 
     /**

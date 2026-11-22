@@ -27,8 +27,12 @@ import com.jay.fxi.data.remote.TopicUseTag
 import com.jay.fxi.data.remote.dto.RepeatIntervalChange
 import com.jay.fxi.data.repository.AlertRepository
 import com.jay.fxi.di.NetworkModule
+import com.jay.fxi.data.local.SourceSelectionSnapshot
 import com.jay.fxi.domain.model.AlertCondition
 import com.jay.fxi.domain.model.RepeatInterval
+import com.jay.fxi.ui.alert.SourceAlertEditor
+import com.jay.fxi.ui.alert.SourceAlertSectionHolder
+import com.jay.fxi.ui.alert.SourceAlertSectionSource
 import java.util.Collections
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
@@ -141,7 +145,8 @@ class S85ASourceMutationWireTest {
         )
         val floor = AlertRateLimitFloor { System.nanoTime() / 1_000_000 }
         val writeExits = AtomicInteger()
-        private val main = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+        /** The owner's Main; S8-5b's holder runs on it too. */
+        val main = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
         private val scope = CoroutineScope(SupervisorJob() + main)
         // The S11-locked production delegation functions of the three writes, the very ones `@Inject` passes; each exit is counted.
         private val create = productionSourceCreate(repository)
@@ -472,5 +477,197 @@ class S85ASourceMutationWireTest {
         val add = onMain { owner.addAlert(SourceAlertDraft("upbit", AlertCondition.ABOVE, 1500.0, true, RepeatInterval.FIVE_MINUTES)) }
         until("the create ended") { onMain { add.outcome.value } != SourceAlertSaveOutcome.Pending }
         assertEquals("the create's repeat", "300", json(next().body.readUtf8())["repeat_interval_sec"].toString())
+    }
+
+    /**
+     * S8-5b J3 (`R4c/S8/s8_5b_contract.agreed.r1.md` §3): the tether holder over the real owner and wire. An allowed draft's
+     * POST answered 400 keeps the editor and its draft with the rejection's copy; an edit's PUT answered 404 closes the editor
+     * with the removed notice and drops the row. Each is one request; neither is resent nor remembered.
+     */
+    @Test fun `S8_5B_J3g through the real owner a POST 400 keeps the draft and an edit PUT 404 removes the row`() = rig {
+        val list = java.util.concurrent.atomic.AtomicReference("""{"settings":[],"total_count":0}""")
+        server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest) = when (request.method) {
+                "POST" -> MockResponse().setResponseCode(400).setBody("""{"detail":"rejected"}""")
+                "PUT" -> MockResponse().setResponseCode(404).setBody("""{"detail":"gone"}""")
+                else -> MockResponse().setResponseCode(200).setBody(list.get())
+            }
+        }
+        onMain { owner.onForeground(false) }
+        until("the first GET is adopted") { onMain { owner.state.value.settings } != null }
+        val holderScope = CoroutineScope(SupervisorJob() + main)
+        val remembered = CopyOnWriteArrayList<String>()
+        val seam = object : SourceAlertSectionSource {
+            override val settings = owner.state
+            override val manualRefresh = owner.manualRefresh
+            override val selection = MutableStateFlow<SourceSelectionSnapshot>(SourceSelectionSnapshot.Ready(alice, 1, null))
+            override suspend fun prepareSelection(identity: AuthIdentityFence) = Unit
+            override fun acceptAddedSource(identity: AuthIdentityFence, sourceCode: String) { remembered += sourceCode }
+            override fun ensure() = owner.ensure()
+            override fun authoritative() = owner.authoritative()
+            override fun manual() = owner.manual()
+            override fun addAlert(draft: SourceAlertDraft) = owner.addAlert(draft)
+            override fun editAlert(id: Int, edit: SourceAlertEdit) = owner.editAlert(id, edit)
+            override fun setEnabled(id: Int, enabled: Boolean) = owner.setEnabled(id, enabled)
+            override fun delete(id: Int) = owner.delete(id)
+        }
+        try {
+            val holder = onMain {
+                SourceAlertSectionHolder(seam, alice, SourceAlertRowPolicy.EXCHANGES.sources(SourceAlertRowPolicy.SETTINGS_ASSET), holderScope,
+                    isShown = { true }, liveQuotes = { mapOf("upbit" to 1500.0) }, permission = { it() }, enableNotifications = {})
+            }
+            val add = onMain {
+                holder.start()
+                holder.openAdd()
+                checkNotNull(holder.editor).also {
+                    holder.input(it, it.input.copy(thresholdText = "1600", condition = AlertCondition.ABOVE))
+                    holder.submit(it)
+                }
+            }
+            until("the POST was answered") { onMain { add.error } != null }
+            assertEquals(SourceAlertEditor.Copy.REJECTED, onMain { add.error })
+            assertTrue("the editor stays", onMain { holder.editor === add })
+            assertEquals("its draft too", "1600", onMain { add.input.thresholdText })
+            onMain { holder.dismiss(add) }
+            list.set("""{"settings":[${rowJson(7, threshold = 1400.0)}],"total_count":1}""")
+            onMain { owner.authoritative() }
+            until("row 7 is adopted") { onMain { owner.state.value.settings?.any { it.id == 7 } } == true }
+            // Deleted elsewhere: the next read answers no row, the PUT 404.
+            list.set("""{"settings":[],"total_count":0}""")
+            val edit = onMain {
+                holder.openEdit(owner.state.value.settings!!.single { it.id == 7 })
+                checkNotNull(holder.editor).also {
+                    holder.input(it, it.input.copy(thresholdText = "1450"))
+                    holder.submit(it)
+                }
+            }
+            until("the PUT was answered") { onMain { holder.editor } == null }
+            assertEquals(SourceAlertEditor.Copy.REMOVED, onMain { holder.notice })
+            assertTrue("the row is gone", onMain { owner.state.value.settings.orEmpty().none { it.id == 7 } })
+            assertEquals(SourceAlertSaveOutcome.Removed, onMain { edit.handle?.outcome?.value })
+            val sent = drain(500).filter { it.method != "GET" }
+            assertEquals("one POST and one PUT, never resent", listOf("POST /api/source-notification-settings", "PUT /api/source-notification-settings/7"),
+                sent.map { "${it.method} ${it.requestUrl?.encodedPath}" })
+            assertEquals("the POST's body", mapOf("source" to "\"upbit\"", "asset" to "\"usdt-krw\"", "condition" to "\"above\"", "threshold" to "1600.0", "is_enabled" to "true"),
+                json(sent[0].body.readUtf8()).mapValues { it.value.toString() })
+            assertEquals("the PUT's body", mapOf("threshold" to "1450.0"), json(sent[1].body.readUtf8()).mapValues { it.value.toString() })
+            assertEquals("nothing remembered", emptyList<String>(), remembered.toList())
+            // The UI sees 29 adopted rows; the owner also holds a create or a delete reservation it has not settled. A new add
+            // opens (the UI's count) and its save is refused with the cap's copy by the owner, the draft kept, nothing sent.
+            for (hiddenDelete in listOf(false, true)) {
+                val n = if (hiddenDelete) 30 else 29
+                val fixture = (1..n).joinToString(",") { rowJson(it, threshold = 1100.0 + it) }
+                list.set("""{"settings":[$fixture],"total_count":$n}""")
+                onMain { owner.authoritative() }
+                until("the cap fixture was adopted") { onMain { owner.state.value.settings?.size } == n }
+                drain(300)
+                val exits = writeExits.get()
+                onMain {
+                    if (hiddenDelete) owner.delete(n)
+                    else owner.addAlert(SourceAlertDraft("upbit", AlertCondition.ABOVE, 1600.0, true, null))
+                    assertEquals("hiddenDelete=$hiddenDelete: the UI sees 29", 29, owner.state.value.settings!!.size)
+                    holder.openAdd()
+                    val blocked = checkNotNull(holder.editor) { "hiddenDelete=$hiddenDelete: the add opens at 29" }
+                    holder.submit(blocked)
+                    assertTrue("the sheet stays", holder.editor === blocked)
+                    assertEquals("its draft too", "1500", blocked.input.thresholdText)
+                    assertEquals("the owner's cap copy", "알림은 최대 30개까지 설정할 수 있습니다.", blocked.error)
+                    holder.dismiss(blocked)
+                }
+                until("only the reservation's own write ended") { writeExits.get() == exits + 1 }
+                assertEquals("hiddenDelete=$hiddenDelete: only the reservation's own write reached the wire",
+                    listOf(if (hiddenDelete) "DELETE" else "POST"), drain(500).map { it.method }.filter { it != "GET" })
+            }
+        } finally {
+            holderScope.cancel()
+        }
+    }
+
+    /**
+     * S8-5b J1 (`R4c/S8/s8_5b_contract.agreed.r1.md` §2 "입력, seed와 최소 patch"): what the editor builds reaches the wire as
+     * agreed through the real owner. An add once omits the repeat, every five minutes sends 300; an edit that keeps an
+     * unregistered interval and changes the price sends the price only, a switch to once sends JSON null, and saving a disabled
+     * row unchanged sends the re-enable only. The asset is never in a PUT.
+     */
+    @Test fun `S8_5B_J1j the editor's drafts and patches reach the wire as agreed`() = rig {
+        val rows = java.util.concurrent.atomic.AtomicReference(listOf(
+            rowJson(7, threshold = 1400.0).replace("\"repeat_interval_sec\":null", "\"repeat_interval_sec\":450"),
+            rowJson(8, threshold = 1300.0, enabled = false)))
+        val nextId = AtomicInteger(20)
+        server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                val body = request.body.clone().readUtf8()
+                return when (request.method) {
+                    "POST" -> {
+                        // The adopted row is the request's fields over a fresh row, as the server answers.
+                        val row = kotlinx.serialization.json.JsonObject(json(rowJson(nextId.getAndIncrement())) + json(body)).toString()
+                        rows.updateAndGet { it + row }
+                        MockResponse().setResponseCode(200).setBody(row)
+                    }
+                    "PUT" -> {
+                        val id = request.requestUrl!!.encodedPath.substringAfterLast('/').toInt()
+                        val old = json(rows.get().single { json(it).getValue("id").toString().toInt() == id })
+                        val merged = kotlinx.serialization.json.JsonObject(old + json(body)).toString()
+                        rows.updateAndGet { list -> list.map { if (json(it).getValue("id").toString().toInt() == id) merged else it } }
+                        MockResponse().setResponseCode(200).setBody(merged)
+                    }
+                    else -> MockResponse().setResponseCode(200).setBody("""{"settings":[${rows.get().joinToString(",")}],"total_count":${rows.get().size}}""")
+                }
+            }
+        }
+        onMain { owner.onForeground(false) }
+        until("the first GET is adopted") { onMain { owner.state.value.settings }?.size == 2 }
+        val holderScope = CoroutineScope(SupervisorJob() + main)
+        val seam = object : SourceAlertSectionSource {
+            override val settings = owner.state
+            override val manualRefresh = owner.manualRefresh
+            override val selection = MutableStateFlow<SourceSelectionSnapshot>(SourceSelectionSnapshot.Ready(alice, 1, null))
+            override suspend fun prepareSelection(identity: AuthIdentityFence) = Unit
+            override fun acceptAddedSource(identity: AuthIdentityFence, sourceCode: String) = Unit
+            override fun ensure() = owner.ensure()
+            override fun authoritative() = owner.authoritative()
+            override fun manual() = owner.manual()
+            override fun addAlert(draft: SourceAlertDraft) = owner.addAlert(draft)
+            override fun editAlert(id: Int, edit: SourceAlertEdit) = owner.editAlert(id, edit)
+            override fun setEnabled(id: Int, enabled: Boolean) = owner.setEnabled(id, enabled)
+            override fun delete(id: Int) = owner.delete(id)
+        }
+        try {
+            val holder = onMain {
+                SourceAlertSectionHolder(seam, alice, SourceAlertRowPolicy.EXCHANGES.sources(SourceAlertRowPolicy.SETTINGS_ASSET), holderScope,
+                    isShown = { true }, liveQuotes = { mapOf("upbit" to 1500.0, "bithumb" to 1490.0) }, permission = { it() }, enableNotifications = {})
+            }
+            onMain { holder.start() }
+            suspend fun save(build: (com.jay.fxi.ui.alert.SourceAlertOpenEditor) -> Unit) {
+                val open = onMain { checkNotNull(holder.editor).also { build(it); holder.submit(it) } }
+                until("the editor closed on its answer") { onMain { holder.editor !== open } }
+            }
+            onMain { holder.openAdd() }
+            save { holder.input(it, it.input.copy(thresholdText = "1550")) }
+            onMain { holder.openAdd() }
+            save {
+                holder.pick(it, "bithumb")
+                holder.input(it, it.input.copy(repeat = RepeatIntervalChange.Every(RepeatInterval.FIVE_MINUTES)))
+            }
+            onMain { holder.openEdit(owner.state.value.settings!!.single { it.id == 7 }) }
+            save { holder.input(it, it.input.copy(thresholdText = "1410")) }
+            onMain { holder.openEdit(owner.state.value.settings!!.single { it.id == 7 }) }
+            save { holder.input(it, it.input.copy(repeat = RepeatIntervalChange.Once)) }
+            onMain { holder.openEdit(owner.state.value.settings!!.single { it.id == 8 }) }
+            save { }
+            val sent = drain(500).filter { it.method != "GET" }
+            assertEquals(listOf("POST", "POST", "PUT /api/source-notification-settings/7", "PUT /api/source-notification-settings/7",
+                "PUT /api/source-notification-settings/8"), sent.map { if (it.method == "PUT") "PUT ${it.requestUrl?.encodedPath}" else it.method })
+            val bodies = sent.map { json(it.body.readUtf8()).mapValues { e -> e.value.toString() } }
+            assertEquals("an add once omits the repeat", mapOf("source" to "\"upbit\"", "asset" to "\"usdt-krw\"", "condition" to "\"below\"",
+                "threshold" to "1550.0", "is_enabled" to "true"), bodies[0])
+            assertEquals("every five minutes", "300", bodies[1]["repeat_interval_sec"])
+            assertEquals("and the picked exchange", "\"bithumb\"", bodies[1]["source"])
+            assertEquals("a kept unregistered interval sends the price only", mapOf("threshold" to "1410.0"), bodies[2])
+            assertEquals("once is JSON null", mapOf("repeat_interval_sec" to "null"), bodies[3])
+            assertEquals("a disabled row saved unchanged is re-enabled only", mapOf("is_enabled" to "true"), bodies[4])
+        } finally {
+            holderScope.cancel()
+        }
     }
 }

@@ -123,15 +123,15 @@ class PremiumTopicResourceBridgeTest {
     )
 
     /** Room below the rates so the page has somewhere to scroll. */
-    private val filler: @Composable (FreeTab) -> Unit = { _ ->
+    private val filler: @Composable (FreeTab, () -> Boolean) -> Unit = { _, _ ->
         Column { Spacer(Modifier.height(1500.dp)); Text("end") }
     }
 
     private var graphSlot by mutableStateOf<PremiumFxGraphSlot?>(null)
-    private var below by mutableStateOf<(@Composable (FreeTab) -> Unit)?>(null)
+    private var below by mutableStateOf<(@Composable (FreeTab, () -> Boolean) -> Unit)?>(null)
 
     /** Sets the content once (a compose rule allows one setContent per test); [update] changes the slot and the filler after. */
-    private fun show(initialSlot: PremiumFxGraphSlot?, initialBelow: (@Composable (FreeTab) -> Unit)?) {
+    private fun show(initialSlot: PremiumFxGraphSlot?, initialBelow: (@Composable (FreeTab, () -> Boolean) -> Unit)?) {
         graphSlot = initialSlot
         below = initialBelow
         rule.setContent {
@@ -153,7 +153,7 @@ class PremiumTopicResourceBridgeTest {
         assertTrue("the screen reached UIAutomator", device.wait(Until.hasObject(By.res(tetherTab)), 5_000))
     }
 
-    private fun update(nextSlot: PremiumFxGraphSlot?, nextBelow: (@Composable (FreeTab) -> Unit)?) {
+    private fun update(nextSlot: PremiumFxGraphSlot?, nextBelow: (@Composable (FreeTab, () -> Boolean) -> Unit)?) {
         graphSlot = nextSlot
         below = nextBelow
         rule.waitForIdle()

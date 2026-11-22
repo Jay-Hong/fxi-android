@@ -5,6 +5,7 @@ import com.jay.fxi.data.remote.OwnedTopicFocus
 import com.jay.fxi.data.remote.TopicConnectionDisplay
 import com.jay.fxi.data.remote.TopicDisplayState
 import com.jay.fxi.domain.model.FreeTab
+import com.jay.fxi.domain.model.RateSourceSets
 import com.jay.fxi.domain.model.RateRowList
 import com.jay.fxi.domain.model.RateRowPreference
 import com.jay.fxi.domain.model.RateRowRoster
@@ -38,7 +39,15 @@ internal object PremiumTopicPresenter {
         val projection = display.rates.displayFor(tab, preferences)
         val rosters = display.rates.editableRostersFor(tab)
         val rowEditors = editors(rosters, preferences)
-        val alertQuotes = rosters[RateRowList.FX_BANKS].orEmpty()
+        // S8-5b: the tether tab's alert quotes are every arrived exchange USDT/KRW quote, hidden rows included (the iOS
+        // last-known merge); the three FX tabs keep their bank quotes. Other assets in the tether list never enter.
+        val alertQuotes = when (tab) {
+            FreeTab.TETHER -> {
+                val tetherAsset = RateSourceSets.TAB_ASSETS.getValue(requireNotNull(FreeTab.TETHER.serverTab))
+                rosters[RateRowList.TETHER_EXCHANGES].orEmpty().filter { it.id in RateSourceSets.EXCHANGES && it.asset == tetherAsset }
+            }
+            else -> rosters[RateRowList.FX_BANKS].orEmpty()
+        }
             .filter { it.value.isFinite() && it.value > 0.0 }
             .associate { it.id to it.value }
         val editableLists = rowEditors.map { it.list }.toSet()

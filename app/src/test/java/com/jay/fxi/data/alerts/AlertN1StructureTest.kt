@@ -532,6 +532,33 @@ class AlertN1StructureTest {
         assertCaught("N1-A / S4 FCM starting the registry", "P-provider", pFcm(hookReplaced { "$it\nalertFamiliesProvider.get().start()" }))
     }
 
+    @Test fun `S8_5B_A01 the source owner's writes are called once each by the section's production seam, in their exact form`() {
+        assertEquals(emptyList<String>(), aSourceEntries(code))
+    }
+
+    @Test fun `S8_5B_A02 the write lock catches another caller, a lost argument, a chained or extra handle, a reference and the registry`() {
+        for ((label, tree, tag) in listOf(
+            Triple("an add from another file", withFile(BYPASS_KT, "class Bypass(val c: Context) { fun go(d: SourceAlertDraft) = " +
+                "EntryPointAccessors.fromApplication(c, SourceAlertSectionEntryPoint::class.java).sourceAlertSettingsOwner().addAlert(d) }"), "A-source-entry-point"),
+            Triple("a second owner lookup in the section", appended(SOURCE_SECTION, "private fun s(c: Context) = " +
+                "EntryPointAccessors.fromApplication(c, SourceAlertSectionEntryPoint::class.java).sourceAlertSettingsOwner()"), "A-source-entry-getter"),
+            Triple("a new handle in place of the owner's", editedLiteral(SOURCE_SECTION, "override fun addAlert(draft: SourceAlertDraft) = owner.addAlert(draft)",
+                "override fun addAlert(draft: SourceAlertDraft) = owner.addAlert(draft).let { SourceAlertSaveRequest() }"), "A-source-entry form"),
+            Triple("the edit's patch lost", editedLiteral(SOURCE_SECTION, "= owner.editAlert(id, edit)", "= owner.editAlert(id, SourceAlertEdit())"), "A-source-entry form"),
+            Triple("the toggle inverted", editedLiteral(SOURCE_SECTION, "= owner.setEnabled(id, enabled)", "= owner.setEnabled(id, !enabled)"), "A-source-entry form"),
+            Triple("another id deleted", editedLiteral(SOURCE_SECTION, "= owner.delete(id)", "= owner.delete(0)"), "A-source-entry form"),
+            Triple("a write by reference in the section", appended(SOURCE_SECTION, "private val ref = SourceAlertSettingsOwner::addAlert"), "A-source-entry outside"),
+            Triple("the registry writing", appended(REGISTRY, "private fun s(o: SourceAlertSettingsOwner, d: SourceAlertDraft) = o.addAlert(d)"), "A-source-entry registry"),
+            Triple("an alias of the owner in the factory", editedLiteral(SOURCE_SECTION, "        val memory = entryPoint.lastSelectedSourceMemory()\n",
+                "        val memory = entryPoint.lastSelectedSourceMemory()\n        val again = owner\n"), "A-source-entry uses"),
+            Triple("the owner taken by another function of the section", appended(SOURCE_SECTION,
+                "private fun s(o: SourceAlertSettingsOwner, d: SourceAlertDraft) = o.addAlert(d)"), "A-source-entry type"),
+            Triple("a write left to a default", editedLiteral(SOURCE_SECTION, "    fun delete(id: Int)\n}", "    fun delete(id: Int) = Unit\n}"),
+                "A-source-entry seam"))) {
+            assertCaught("S8-5b $label", tag, aSourceEntries(tree))
+        }
+    }
+
     @Test fun `S7N1_S10 the six new files name no KRX in code or strings`() {
         assertTrue("premise(N1-S S5): the same pattern finds KRX where it is", KRX.containsMatchIn(code.getValue(KRX_SAMPLE)))
         assertEquals("N1-S S5", emptyList<String>(), s5Krx(code))
@@ -1412,6 +1439,69 @@ class AlertN1StructureTest {
             val sourceName = sourceProvider.singleOrNull()?.groupValues?.get(1)
             if (sourceName == null || count(registry, """\b$sourceName\s*\.\s*get\s*\(\s*\)""") != 1 ||
                 count(registry, """\{\s*$sourceName\s*\.\s*get\s*\(\s*\)\s*\}""") != 1) v += "A-lazy-source-owner"
+            return v
+        }
+
+        /**
+         * S8-5b (`R4c/S8/s8_5b_contract.agreed.r1.md` §4 "호출자 잠금"): the source owner's four outside writes are called once
+         * each, by the tether section's production seam, in their exact delegating form; nothing else reaches the owner's writes.
+         * The owner's own declarations and the bank owner's same-named API are not counted: only calls on the seam's owner are.
+         */
+        val SOURCE_ENTRY_FORMS = listOf(
+            "override fun addAlert(draft: SourceAlertDraft) = owner.addAlert(draft)",
+            "override fun editAlert(id: Int, edit: SourceAlertEdit) = owner.editAlert(id, edit)",
+            "override fun setEnabled(id: Int, enabled: Boolean) = owner.setEnabled(id, enabled)",
+            "override fun delete(id: Int) = owner.delete(id)")
+        const val SOURCE_ENTRIES = """\b(?:addAlert|editAlert|setEnabled|delete)\b"""
+        const val SOURCE_FACTORY_HEAD = "internal object ProductionSourceAlertSectionSourceFactory : SourceAlertSectionSourceFactory {"
+        /** The seam, exactly: every member abstract, so no fake or implementation can leave a write to a default. */
+        val SOURCE_SEAM = """internal interface SourceAlertSectionSource {
+            val settings: StateFlow<SourceAlertSettingsState>
+            val manualRefresh: StateFlow<ManualRefreshState>
+            val selection: StateFlow<SourceSelectionSnapshot>
+            suspend fun prepareSelection(identity: AuthIdentityFence)
+            fun acceptAddedSource(identity: AuthIdentityFence, sourceCode: String)
+            fun ensure()
+            fun authoritative()
+            fun manual()
+            fun addAlert(draft: SourceAlertDraft): SourceAlertSaveRequest
+            fun editAlert(id: Int, edit: SourceAlertEdit): SourceAlertSaveRequest
+            fun setEnabled(id: Int, enabled: Boolean)
+            fun delete(id: Int)
+        }"""
+        /** What the factory's one owner is used for, each once, after its one declaration. */
+        val SOURCE_OWNER_USES = listOf("state", "manualRefresh", "ensure", "authoritative", "manual", "addAlert", "editAlert", "setEnabled", "delete")
+
+        fun aSourceEntries(code: Map<String, String>): List<String> {
+            val v = mutableListOf<String>()
+            val section = code[SOURCE_SECTION].orEmpty()
+            // Who can hold the owner: its entry point is named, declared and called in the section only.
+            val entryPoints = files(code, """\bSourceAlertSectionEntryPoint\b""")
+            if (entryPoints != setOf(SOURCE_SECTION)) v += "A-source-entry-point ${entryPoints.sorted()}"
+            val getters = occurrences(code, """\bsourceAlertSettingsOwner\b""")
+            if (getters != mapOf(SOURCE_SECTION to 2)) v += "A-source-entry-getter $getters"
+            // The registry holds the owner but calls none of its writes.
+            if (count(code[REGISTRY].orEmpty(), """(?:\.|::)\s*$SOURCE_ENTRIES""") != 0) v += "A-source-entry registry"
+            val head = section.indexOf(SOURCE_FACTORY_HEAD)
+            val close = if (head < 0) null else closing(section, section.indexOf('{', head))
+            if (close == null) return v + "A-source-entry factory"
+            val factory = section.substring(head, close + 1)
+            val flat = squash(factory)
+            for (form in SOURCE_ENTRY_FORMS) {
+                // Each form ends where the next member or the object's close begins: nothing chained or appended.
+                if (count(flat, Regex.escape(squash(form)) + """(?= override\b| \})""") != 1) v += "A-source-entry form $form"
+            }
+            if (count(factory, """\bowner\s*\.\s*$SOURCE_ENTRIES""") != 4 || count(factory, """::\s*$SOURCE_ENTRIES""") != 0) v += "A-source-entry calls"
+            if (count(flat, Regex.escape(squash("val owner = entryPoint.sourceAlertSettingsOwner()"))) != 1) v += "A-source-entry owner"
+            // No alias: every use of the owner is one of its agreed members, each once.
+            val uses = Regex("""\bowner\b(\s*\.\s*(\w+))?""").findAll(factory).map { it.groupValues[2] }.toList()
+            if (uses.sorted() != (SOURCE_OWNER_USES + "").sorted()) v += "A-source-entry uses $uses"
+            if (count(squash(section), Regex.escape(squash(SOURCE_SEAM))) != 1) v += "A-source-entry seam"
+            // The section names the owner's type only in its import and its entry point.
+            if (count(section, """\bSourceAlertSettingsOwner\b""") != 2) v += "A-source-entry type"
+            // Outside the factory the section gets no owner and takes no write by reference: its holder calls the seam only.
+            val rest = section.removeRange(head, close + 1)
+            if (count(rest, """\.\s*sourceAlertSettingsOwner\s*\(""") != 0 || count(rest, """::\s*$SOURCE_ENTRIES""") != 0) v += "A-source-entry outside"
             return v
         }
 

@@ -166,7 +166,7 @@ class PremiumTopicGraphSlotTest {
 
     private var state by mutableStateOf(PremiumTopicScreenState.NONE)
     private var slot by mutableStateOf<PremiumFxGraphSlot?>(null)
-    private var below by mutableStateOf<(@androidx.compose.runtime.Composable (FreeTab) -> Unit)?>(null)
+    private var below by mutableStateOf<(@androidx.compose.runtime.Composable (FreeTab, () -> Boolean) -> Unit)?>(null)
     private val selections = mutableListOf<Pair<TopicDisplayOwner, FreeTab>>()
 
     private fun show(initial: PremiumTopicScreenState, initialSlot: PremiumFxGraphSlot?) {
@@ -227,7 +227,7 @@ class PremiumTopicGraphSlotTest {
      */
     @Test fun S8_theSlotBelowTheRatesComesAfterTheGraphAndTheRates() {
         val fake = FakeSlot(graph("usd"))
-        below = { tab -> Text("below:${tab.name}", Modifier.testTag("below_marker")) }
+        below = { tab, _ -> Text("below:${tab.name}", Modifier.testTag("below_marker")) }
         show(screen(FreeTab.USD), fake.slot)
         for ((tab, code) in listOf(FreeTab.USD to "usd", FreeTab.TETHER to "tether")) {
             fake.publish(graph(code))
@@ -252,7 +252,7 @@ class PremiumTopicGraphSlotTest {
      * move up together - instead of staying fixed under a separately scrolling rate list.
      */
     @Test fun S9_withoutAGraphTheSlotScrollsWithTheRates() {
-        below = { _ ->
+        below = { _, _ ->
             androidx.compose.foundation.layout.Column {
                 androidx.compose.foundation.layout.Spacer(Modifier.height(1500.dp))
                 Text("end", Modifier.testTag("below_end"))

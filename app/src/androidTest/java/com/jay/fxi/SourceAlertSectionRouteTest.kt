@@ -2,6 +2,7 @@ package com.jay.fxi
 
 import android.content.Context
 import androidx.activity.ComponentActivity
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -13,6 +14,8 @@ import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isOff
+import androidx.compose.ui.test.isOn
 import androidx.compose.ui.test.isToggleable
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
@@ -21,6 +24,8 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.performTextReplacement
 import androidx.lifecycle.Lifecycle
 import com.jay.fxi.data.alerts.AlertLoadFailure
 import com.jay.fxi.data.alerts.AlertLoadPhase
@@ -28,6 +33,7 @@ import com.jay.fxi.data.alerts.BankAlertSettingsState
 import com.jay.fxi.data.alerts.ManualRefreshState
 import com.jay.fxi.data.alerts.SourceAlertSettingsState
 import com.jay.fxi.data.auth.AuthIdentityFence
+import com.jay.fxi.data.local.SourceSelectionSnapshot
 import com.jay.fxi.data.auth.AuthSnapshot
 import com.jay.fxi.data.entitlements.TopicAccessSnapshot
 import com.jay.fxi.data.graph.GraphKey
@@ -75,6 +81,14 @@ import com.jay.fxi.ui.alert.BankHistoryWiringFactory
 import com.jay.fxi.ui.alert.CountingSourceAlertSection
 import com.jay.fxi.ui.alert.CountingSourceHistoryWiring
 import com.jay.fxi.ui.alert.SourceAlertSectionTags
+import com.jay.fxi.ui.alert.LocalNotificationPermissionEnvironment
+import com.jay.fxi.ui.alert.NotificationPermissionEnvironment
+import com.jay.fxi.ui.alert.SourceAlertEditor
+import com.jay.fxi.ui.alert.SourceAlertEditorSheetTags
+import com.jay.fxi.data.entitlements.OwnedPremiumAccess
+import com.jay.fxi.data.entitlements.PremiumAccessState
+import com.jay.fxi.data.alerts.SourceAlertSaveOutcome
+import com.jay.fxi.service.NotificationCapability
 import com.jay.fxi.ui.premium.PremiumTopicConsumer
 import com.jay.fxi.ui.premium.graph.GraphScreenHost
 import com.jay.fxi.ui.premium.graph.GraphV2ScreenStateHolder
@@ -107,7 +121,7 @@ import org.junit.Test
  * show none and leave its flows uncollected; its first appearance asks ensure once and a recomposition none; a first failure's
  * retry reaches authoritative once and the refresh manual once; a click kept from a mount that left — the tab left, the owner
  * replaced, the route disposed, or an overlay opened in the same frame — reaches neither; the badge counts enabled rows and is
- * absent at none; no write control has semantics.
+ * absent at none. S8-5b: each row has its own open, switch and confirmed delete (T05).
  */
 class SourceAlertSectionRouteTest {
     @get:Rule val rule = createAndroidComposeRule<ComponentActivity>()
@@ -155,7 +169,9 @@ class SourceAlertSectionRouteTest {
     private val display = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN))
     private val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.TETHER))
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val consumer = PremiumTopicConsumer(display, focus, { a1 }, MemoryRows(),
+    /** S8-5b: the consumer's live identity, so another account's screen can be an accepted one. */
+    private var liveAccount = a1
+    private val consumer = PremiumTopicConsumer(display, focus, { liveAccount }, MemoryRows(),
         { o, tab -> focus.value = OwnedTopicFocus(o, tab) }, { }, { _, _ -> }, scope)
     private val sources = CountingSourceAlertSection()
     /** S8-4b: the entry above the section reads this counting fake, never the production wiring. */
@@ -179,15 +195,50 @@ class SourceAlertSectionRouteTest {
         hostScopes.forEach { it.cancel() }
     }
 
+    /** S8-5b: the helper's environment seam on a device that shows notifications; each confirmed run is counted. */
+    private val helperRuns = AtomicInteger()
+    private val permission = NotificationPermissionEnvironment(
+        admitted = { true },
+        liveIdentity = { a1 },
+        premium = MutableStateFlow(OwnedPremiumAccess(a1.uid, a1.authGeneration, PremiumAccessState.PremiumConfirmed)),
+        displayed = MutableStateFlow(NotificationCapability.GRANTED),
+        onRequestResult = { false },
+        onAlreadyGranted = {
+            helperRuns.incrementAndGet()
+            duringGrant?.let { duringGrant = null; it() }
+            true
+        }
+    )
+    /** Null is the production default (inert in this build); the S8-5b cases provide [permission]. */
+    private var permissionEnv: NotificationPermissionEnvironment? = null
+    /** Run once inside the helper's grant confirmation, after its pre-check and before its continuation. */
+    private var duringGrant: (() -> Unit)? = null
+
+    /** Every editor the tether holder opens while [block] runs on Main, seen as the state write itself (no frame needed). */
+    private fun editorsOpenedDuring(block: () -> Unit): Int {
+        var opened = 0
+        val handle = androidx.compose.runtime.snapshots.Snapshot.registerGlobalWriteObserver { written ->
+            if ((written as? androidx.compose.runtime.State<*>)?.value is com.jay.fxi.ui.alert.SourceAlertOpenEditor) opened++
+        }
+        try {
+            block()
+        } finally {
+            handle.dispose()
+        }
+        return opened
+    }
+
     private fun show(newsItems: List<NewsItem> = emptyList()) {
         val vm = NewsViewModel(NoNews(newsItems))
         rule.setContent {
-            if (mounted) {
-                PremiumTopicRoute(consumer = consumer, identity = a1, isActive = active, newsViewModel = vm,
-                    userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
-                    settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = history,
-                    bankAlertSectionSourceFactory = bank, sourceAlertSectionSourceFactory = sources,
-                    sourceHistoryWiring = sourceHistory)
+            CompositionLocalProvider(LocalNotificationPermissionEnvironment provides permissionEnv) {
+                if (mounted) {
+                    PremiumTopicRoute(consumer = consumer, identity = a1, isActive = active, newsViewModel = vm,
+                        userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
+                        settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = history,
+                        bankAlertSectionSourceFactory = bank, sourceAlertSectionSourceFactory = sources,
+                        sourceHistoryWiring = sourceHistory)
+                }
             }
         }
         rule.waitForIdle()
@@ -207,8 +258,23 @@ class SourceAlertSectionRouteTest {
         rule.waitForIdle()
     }
     private fun select(tab: FreeTab) { focus.value = OwnedTopicFocus(a1, tab); rule.waitForIdle() }
+    /** S8-5b: [target] becomes the live account, the tether focus and the display's owner, and the presenter accepts it. */
+    private fun acceptOwner(target: TopicDisplayOwner) {
+        rule.runOnUiThread {
+            liveAccount = target.identity
+            focus.value = OwnedTopicFocus(liveAccount, FreeTab.TETHER)
+            display.value = display.value.copy(owner = target)
+            assertEquals("premise: $target is the accepted owner", target, consumer.currentState().ui.owner)
+        }
+        rule.waitForIdle()
+    }
     private fun back() { rule.runOnUiThread { rule.activity.onBackPressedDispatcher.onBackPressed() }; rule.waitForIdle() }
     private fun tap(tag: String) { rule.onNodeWithTag(tag).performScrollTo().performClick(); rule.waitForIdle() }
+    /** S8-5b: a dialog's or the sheet's node has no scrolling parent, so it is pressed by its click action. */
+    private fun press(tag: String) {
+        rule.onNodeWithTag(tag, useUnmergedTree = true).performSemanticsAction(SemanticsActions.OnClick)
+        rule.waitForIdle()
+    }
 
     private fun tags(tag: String) = rule.onAllNodesWithTag(tag).fetchSemanticsNodes().size
     private fun rawTags(tag: String) = rule.onAllNodesWithTag(tag, useUnmergedTree = true).fetchSemanticsNodes().size
@@ -553,11 +619,13 @@ class SourceAlertSectionRouteTest {
     // ---- badge and read-only semantics ---------------------------------------------------------------------------------
 
     /**
-     * S8_4A_T05: the header badge is absent with no enabled row and shows the count of enabled rows otherwise; the section has
-     * exactly three click targets (the header, refresh and the expander) and no toggle, add, edit or delete semantics, rows
-     * included.
+     * S8_4A_T05, its write half replaced by S8-5b (`R4c/S8/s8_5b_contract.agreed.r1.md` §3 D4): the header badge is absent with
+     * no enabled row and shows the count of enabled rows otherwise; each row now has its own open, a switch at the row's state and
+     * a delete; a switch sends its target value for its id, a delete asks once, a cancel sends nothing and a
+     * confirm sends the one id; drawing asks one ensure and nothing else, and no add or edit reaches the owner.
      */
-    @Test fun s84a_t05_theBadgeCountsEnabledRows_andNoWriteControlHasSemantics() {
+    @Test fun s84a_t05_theBadgeCountsEnabledRows_andEachRowHasItsOwnControls() {
+        sources.selection.value = SourceSelectionSnapshot.Ready(a1, 1, null)
         sources.settings.value = ready(row(1, enabled = false), row(2, "bithumb", enabled = false))
         show()
         assertShown("premise")
@@ -577,19 +645,379 @@ class SourceAlertSectionRouteTest {
         assertEquals("the badge reads 2", 1, rule.onAllNodes(hasText("2") and hasAnyAncestor(hasTestTag(SourceAlertSectionTags.ACTIVE_COUNT)),
             useUnmergedTree = true).fetchSemanticsNodes().size)
 
-        val under = hasAnyAncestor(hasTestTag(SourceAlertSectionTags.ROOT))
-        assertEquals("three click targets", 3, rule.onAllNodes(under and hasClickAction()).fetchSemanticsNodes().size)
-        for (tag in listOf(SourceAlertSectionTags.REFRESH, SourceAlertSectionTags.TOGGLE_EXPANDED)) {
-            assertEquals("$tag is one of them", 1, rule.onAllNodes(under and hasClickAction() and hasTestTag(tag)).fetchSemanticsNodes().size)
+        for ((id, enabled) in listOf(1 to true, 2 to false, 3 to true)) {
+            assertEquals("row $id opens", 1, rule.onAllNodes(hasTestTag(SourceAlertSectionTags.rowOpen(id)) and hasClickAction()).fetchSemanticsNodes().size)
+            assertEquals("row $id's switch reads $enabled", 1,
+                rule.onAllNodes(hasTestTag(SourceAlertSectionTags.toggle(id)) and isToggleable() and (if (enabled) isOn() else isOff()))
+                    .fetchSemanticsNodes().size)
+            assertEquals("row $id deletes", 1, rule.onAllNodes(hasTestTag(SourceAlertSectionTags.delete(id)) and hasClickAction()).fetchSemanticsNodes().size)
         }
-        assertEquals("the header is the third", 1, rule.onAllNodes(under and hasClickAction() and hasText("테더 알림")).fetchSemanticsNodes().size)
-        assertEquals("no row is clickable", 0, rule.onAllNodes(hasAnyAncestor(hasTestTag(SourceAlertSectionTags.ROW)) and hasClickAction(),
-            useUnmergedTree = true).fetchSemanticsNodes().size + rule.onAllNodes(hasTestTag(SourceAlertSectionTags.ROW) and hasClickAction())
-            .fetchSemanticsNodes().size)
-        assertEquals("no toggle", 0, rule.onAllNodes(under and isToggleable(), useUnmergedTree = true).fetchSemanticsNodes().size)
-        for (word in listOf("추가", "편집", "삭제", "수정")) {
-            assertEquals("no $word", 0, rule.onAllNodes(under and hasText(word, substring = true), useUnmergedTree = true).fetchSemanticsNodes().size)
-        }
+        assertEquals("one add", 1, tags(SourceAlertSectionTags.ADD_BUTTON))
+
+        tap(SourceAlertSectionTags.toggle(2))
+        tap(SourceAlertSectionTags.toggle(1))
+        assertEquals("each switch sends its target for its id", listOf(2 to true, 1 to false), sources.toggles.toList())
+        tap(SourceAlertSectionTags.delete(3))
+        assertEquals("the delete asks", 1, tags(SourceAlertSectionTags.DELETE_DIALOG))
+        press(SourceAlertSectionTags.DELETE_CANCEL)
+        assertEquals("the cancel closes", 0, tags(SourceAlertSectionTags.DELETE_DIALOG))
+        assertEquals("and sends nothing", emptyList<Int>(), sources.deletes.toList())
+        tap(SourceAlertSectionTags.delete(3))
+        press(SourceAlertSectionTags.DELETE_CONFIRM)
+        assertEquals("the confirm sends the one id", listOf(3), sources.deletes.toList())
+        assertEquals("no add or edit reached the owner", 0, sources.adds.size + sources.edits.size)
         assertEquals("drawing asked one ensure and nothing else", listOf(1, 0, 0), demands())
+    }
+
+    // ---- S8-5b D3: a kept write in the same Main runnable as an overlay's entry ----------------------------------------
+
+    private fun sheetOpen() = rawTags(SourceAlertEditorSheetTags.SAVE) == 1
+    private fun keepRaw(tag: String): () -> Boolean {
+        val action = rule.onNodeWithTag(tag, useUnmergedTree = true).fetchSemanticsNode().config[SemanticsActions.OnClick].action
+        assertNotNull("premise: $tag has a click action", action)
+        return action!!
+    }
+    /** helper runs, adds, edits, toggles, deletes, remembered adds. */
+    private fun writes() = listOf(helperRuns.get(), sources.adds.size, sources.edits.size, sources.toggles.size, sources.deletes.size,
+        sources.accepted.size)
+
+    /**
+     * S8_5B_D3a (`s8_5b_contract.agreed` §3 D3): a kept add, edit, save, switch or delete confirmation, run in the
+     * same Main runnable right after the rate fullscreen's click or the graph holder's fullscreen entry, before any frame, runs
+     * no helper and reaches no write and no memory. After the overlay closes the kept action still reaches nothing (its mount
+     * left) and a new click reaches its target once. An editor opened inside that runnable is counted as the holder's state write
+     * itself ([editorsOpenedDuring]), before any frame can remove it.
+     */
+    @Test fun s85b_d3a_aKeptWriteInTheRunnableOfAnOverlaysEntryReachesNothing() {
+        host = newHost()
+        permissionEnv = permission
+        sources.selection.value = SourceSelectionSnapshot.Ready(a1, 1, null)
+        sources.settings.value = ready(row(1))
+        show()
+        assertShown("premise")
+        val tether = { onMain { built.toList().single { it.field("tab") == "tether" && it.field("closed") == false } } }
+        await("premise: the tether holder has an inline token") {
+            runCatching { onMain { tether().currentState().inlineToken } != null }.getOrDefault(false)
+        }
+        val entries = listOf<Triple<String, () -> (() -> Unit), () -> Unit>>(
+            Triple("rate fullscreen", {
+                val click = keep(PremiumTopicTags.FULLSCREEN)
+                ({ click() })
+            }, { rule.onNodeWithTag(PremiumTopicTags.FULLSCREEN_CLOSE).performClick(); rule.waitForIdle() }),
+            Triple("graph fullscreen", {
+                val token = onMain { checkNotNull(tether().currentState().inlineToken) { "premise: an inline token" } }
+                ({ tether().enterFullscreen(token) })
+            }, {
+                val full = onMain { checkNotNull(tether().currentState().fullscreenToken) { "premise: a fullscreen token" } }
+                rule.runOnUiThread { tether().exitFullscreen(full) }
+                rule.waitForIdle()
+            }))
+        // Each write kept from a live session: what must be open before it is kept, and its own target.
+        val actions = listOf<Triple<String, () -> Unit, String>>(
+            Triple("add", { }, SourceAlertSectionTags.ADD_BUTTON),
+            Triple("edit", { }, SourceAlertSectionTags.rowOpen(1)),
+            Triple("save", { tap(SourceAlertSectionTags.ADD_BUTTON) }, SourceAlertEditorSheetTags.SAVE),
+            Triple("switch", { }, SourceAlertSectionTags.toggle(1)),
+            Triple("delete", { tap(SourceAlertSectionTags.delete(1)) }, SourceAlertSectionTags.DELETE_CONFIRM))
+        for ((entry, enter, close) in entries) for ((name, open, tag) in actions) {
+            val label = "$entry / $name"
+            await("$label: premise: the section") { tags(SourceAlertSectionTags.ROOT) == 1 }
+            open()
+            val kept = keepRaw(tag)
+            val enterNow = enter()
+            val before = writes()
+            var opened = -1
+            rule.runOnUiThread { opened = editorsOpenedDuring { enterNow(); kept() } }
+            rule.waitForIdle()
+            assertEquals("$label: no editor opened in the runnable", 0, opened)
+            assertEquals("$label: nothing reached", before, writes())
+            assertEquals("$label: no section under the overlay", 0, tags(SourceAlertSectionTags.ROOT))
+            close()
+            await("$label: back") { tags(SourceAlertSectionTags.ROOT) == 1 }
+            run(listOf(kept))
+            assertEquals("$label: the kept action of the mount that left still reaches nothing", before, writes())
+            assertEquals("$label: and opens no editor", false, sheetOpen())
+            // A new click of the new mount reaches its target once.
+            open()
+            run(listOf(keepRaw(tag)))
+            val after = writes()
+            when (name) {
+                "add" -> {
+                    assertEquals("$label: a new add runs the helper once", before[0] + 1, after[0])
+                    assertTrue("$label: and opens", sheetOpen())
+                    press(SourceAlertEditorSheetTags.CANCEL)
+                }
+                "edit" -> {
+                    assertTrue("$label: a new edit opens", sheetOpen())
+                    press(SourceAlertEditorSheetTags.CANCEL)
+                }
+                "save" -> {
+                    assertEquals("$label: a new save sends one add", before[1] + 1, after[1])
+                    rule.runOnUiThread { sources.handles.last().finish(SourceAlertSaveOutcome.NotSent(com.jay.fxi.data.alerts.NotSentReason.RESET)) }
+                    await("$label: the reset closes it") { !sheetOpen() }
+                }
+                "switch" -> assertEquals("$label: a new switch sends its target once", before[3] + 1, after[3])
+                "delete" -> assertEquals("$label: a new confirmation deletes once", before[4] + 1, after[4])
+            }
+        }
+        assertEquals("nothing remembered", 0, sources.accepted.size)
+    }
+
+    /**
+     * S8_5B_D3d (`s8_5b_contract.agreed` §3 D3, the grant half at the route): an add-open and a save each pass the click's own
+     * live check and start the real helper; while the helper confirms the grant, the rate fullscreen's click or the graph's
+     * accepted fullscreen entry happens; the continuation then finds the section not shown and opens no editor, runs no write
+     * and remembers nothing. After the overlay closes the new session's add opens and its save is taken once.
+     */
+    @Test fun s85b_d3d_anOverlayOpenedWhileTheGrantIsConfirmedStopsTheContinuation() {
+        host = newHost()
+        permissionEnv = permission
+        sources.selection.value = SourceSelectionSnapshot.Ready(a1, 1, null)
+        sources.settings.value = ready(row(1))
+        show()
+        assertShown("premise")
+        val tether = { onMain { built.toList().single { it.field("tab") == "tether" && it.field("closed") == false } } }
+        await("premise: the tether holder has an inline token") {
+            runCatching { onMain { tether().currentState().inlineToken } != null }.getOrDefault(false)
+        }
+        val entries = listOf<Triple<String, () -> (() -> Unit), () -> Unit>>(
+            Triple("rate fullscreen", {
+                val click = keep(PremiumTopicTags.FULLSCREEN)
+                ({ click() })
+            }, { rule.onNodeWithTag(PremiumTopicTags.FULLSCREEN_CLOSE).performClick(); rule.waitForIdle() }),
+            Triple("graph fullscreen", {
+                val token = onMain { checkNotNull(tether().currentState().inlineToken) { "premise: an inline token" } }
+                ({ tether().enterFullscreen(token) })
+            }, {
+                val full = onMain { checkNotNull(tether().currentState().fullscreenToken) { "premise: a fullscreen token" } }
+                rule.runOnUiThread { tether().exitFullscreen(full) }
+                rule.waitForIdle()
+            }))
+        for ((entry, enter, close) in entries) for (save in listOf(false, true)) {
+            val label = "$entry / ${if (save) "save" else "add-open"}"
+            await("$label: premise: the section") { tags(SourceAlertSectionTags.ADD_BUTTON) == 1 }
+            if (save) tap(SourceAlertSectionTags.ADD_BUTTON)
+            val click = keepRaw(if (save) SourceAlertEditorSheetTags.SAVE else SourceAlertSectionTags.ADD_BUTTON)
+            val enterNow = enter()
+            val before = writes()
+            var opened = -1
+            rule.runOnUiThread {
+                duringGrant = enterNow
+                opened = editorsOpenedDuring { click() }
+                check(duringGrant == null) { "$label: the helper confirmed the grant" }
+            }
+            rule.waitForIdle()
+            assertEquals("$label: the live click started the helper once", before[0] + 1, writes()[0])
+            assertEquals("$label: the continuation opened no editor", 0, opened)
+            assertEquals("$label: and took no write and no memory", before.drop(1), writes().drop(1))
+            assertEquals("$label: the overlay replaced the section", 0, tags(SourceAlertSectionTags.ROOT))
+            close()
+            await("$label: back") { tags(SourceAlertSectionTags.ADD_BUTTON) == 1 }
+            tap(SourceAlertSectionTags.ADD_BUTTON)
+            assertTrue("$label: the new session's add opens", sheetOpen())
+            if (save) {
+                run(listOf(keepRaw(SourceAlertEditorSheetTags.SAVE)))
+                assertEquals("$label: the new session's save is taken once", before[1] + 1, writes()[1])
+                rule.runOnUiThread { sources.handles.last().finish(SourceAlertSaveOutcome.NotSent(com.jay.fxi.data.alerts.NotSentReason.RESET)) }
+                await("$label: settled") { !sheetOpen() }
+            } else {
+                press(SourceAlertEditorSheetTags.CANCEL)
+            }
+        }
+        assertEquals("nothing remembered", 0, sources.accepted.size)
+    }
+
+    /**
+     * S8_5B_D3e (`s8_5b_contract.agreed` §3 D3, one stop at a time): in each runnable below only one of the screen's three
+     * overlay stops can stop a kept add. The rate entry's own end of the session: the rate fullscreen's click, then a close kept
+     * from an earlier rate fullscreen, then the kept add, which finds no overlay. The read of the rate fullscreen at the click: a
+     * rate fullscreen click kept from the USD page, which ends no tether session, then the kept add. The graph entry's own end
+     * of the session: the inline graph's expand click, then the holder's exit, then the kept add. Each runs no helper and opens
+     * no editor; after a frame the kept add still reaches nothing and a new add opens once. The rate and graph entries also run
+     * with no click between them and the frame: no check then sees the overlay, so only the slot's key can end the session, and
+     * after the frame the add kept before the entry still reaches nothing while a new add opens once.
+     */
+    @Test fun s85b_d3e_eachOverlayStopAloneStopsAKeptAdd() {
+        host = newHost()
+        permissionEnv = permission
+        sources.selection.value = SourceSelectionSnapshot.Ready(a1, 1, null)
+        sources.settings.value = ready(row(1))
+        show()
+        assertShown("premise")
+        val tether = { onMain { built.toList().single { it.field("tab") == "tether" && it.field("closed") == false } } }
+        await("premise: the tether holder has an inline token") {
+            runCatching { onMain { tether().currentState().inlineToken } != null }.getOrDefault(false)
+        }
+        // A close kept from an earlier rate fullscreen.
+        run(listOf(keep(PremiumTopicTags.FULLSCREEN)))
+        await("premise: the rate fullscreen is drawn") { tags(PremiumTopicTags.FULLSCREEN_LAYER) == 1 }
+        val staleClose = keep(PremiumTopicTags.FULLSCREEN_CLOSE)
+        rule.onNodeWithTag(PremiumTopicTags.FULLSCREEN_CLOSE).performClick()
+        rule.waitForIdle()
+        // A rate fullscreen click kept from the USD page.
+        await("premise: back on tether") { tags(SourceAlertSectionTags.ADD_BUTTON) == 1 }
+        select(FreeTab.USD)
+        await("premise: the USD page's fullscreen") { tags(PremiumTopicTags.FULLSCREEN) == 1 && tags(SourceAlertSectionTags.ROOT) == 0 }
+        val usdFullscreen = keep(PremiumTopicTags.FULLSCREEN)
+        select(FreeTab.TETHER)
+
+        fun case(label: String, prepare: () -> (() -> Unit), overlayStays: Boolean, clickInRunnable: Boolean = true) {
+            await("$label: premise: the section") { tags(SourceAlertSectionTags.ADD_BUTTON) == 1 }
+            val stop = prepare()
+            val kept = keepRaw(SourceAlertSectionTags.ADD_BUTTON)
+            val before = writes()
+            var opened = -1
+            rule.runOnUiThread { opened = editorsOpenedDuring { stop(); if (clickInRunnable) kept() } }
+            rule.waitForIdle()
+            assertEquals("$label: no editor opened in the runnable", 0, opened)
+            assertEquals("$label: nothing reached", before, writes())
+            if (overlayStays) {
+                assertEquals("$label: the rate fullscreen is drawn over the tether tab", 1, tags(PremiumTopicTags.FULLSCREEN_LAYER))
+                assertEquals("$label: and the section left", 0, tags(SourceAlertSectionTags.ROOT))
+                rule.onNodeWithTag(PremiumTopicTags.FULLSCREEN_CLOSE).performClick()
+                rule.waitForIdle()
+            } else {
+                assertEquals("$label: no rate fullscreen is left", 0, tags(PremiumTopicTags.FULLSCREEN_LAYER))
+                assertEquals("$label: no graph fullscreen is left", null, onMain { tether().currentState().fullscreenToken })
+            }
+            await("$label: back") { tags(SourceAlertSectionTags.ADD_BUTTON) == 1 }
+            run(listOf(kept))
+            assertEquals("$label: the kept add still reaches nothing", before, writes())
+            assertEquals("$label: and opens no editor", false, sheetOpen())
+            run(listOf(keepRaw(SourceAlertSectionTags.ADD_BUTTON)))
+            assertEquals("$label: a new add runs the helper once", before[0] + 1, writes()[0])
+            assertTrue("$label: and opens", sheetOpen())
+            press(SourceAlertEditorSheetTags.CANCEL)
+        }
+        case("the rate entry, then a close kept from an earlier rate fullscreen", {
+            val enter = keep(PremiumTopicTags.FULLSCREEN)
+            ({ enter(); staleClose() })
+        }, overlayStays = false)
+        case("the rate entry, then a close kept from an earlier rate fullscreen, with no click between", {
+            val enter = keep(PremiumTopicTags.FULLSCREEN)
+            ({ enter(); staleClose() })
+        }, overlayStays = false, clickInRunnable = false)
+        case("a rate fullscreen click kept from the USD page", { ({ usdFullscreen() }) }, overlayStays = true)
+        case("the graph's expand click, then the holder's exit", {
+            val expand = keepRaw(GraphV2UiTags.expand())
+            ({
+                expand()
+                val full = checkNotNull(tether().currentState().fullscreenToken) { "premise: the expand click's entry was accepted" }
+                tether().exitFullscreen(full)
+            })
+        }, overlayStays = false)
+        case("the graph's expand click, then the holder's exit, with no click between", {
+            val expand = keepRaw(GraphV2UiTags.expand())
+            ({
+                expand()
+                val full = checkNotNull(tether().currentState().fullscreenToken) { "premise: the expand click's entry was accepted" }
+                tether().exitFullscreen(full)
+            })
+        }, overlayStays = false, clickInRunnable = false)
+        assertEquals("nothing remembered", 0, sources.accepted.size)
+    }
+
+    /**
+     * S8_5B_D3b: a kept write of a session that ended — the tab left, the owner replaced, another account accepted (A→B→A) or
+     * only displayed (an identity mismatch), a news detail
+     * opened over the tether tab, settings opened in the same frame, the route made inactive or disposed — reaches nothing while away or after the return, and the new session's own click reaches
+     * its target once. An editor replaced while its request was pending ignores that request's late Removed.
+     */
+    @Test fun s85b_d3b_aKeptWriteOfASessionThatEndedReachesNothing_andAReplacedEditorIgnoresItsOldAnswer() {
+        permissionEnv = permission
+        sources.selection.value = SourceSelectionSnapshot.Ready(a1, 1, null)
+        sources.settings.value = ready(row(1), row(2, "bithumb"))
+        show(listOf(NewsItem("n1", "fixture news", "https://example.invalid/n1", "fixture", "external_link", t)))
+        assertShown("premise")
+        fun kept() = listOf(keepRaw(SourceAlertSectionTags.ADD_BUTTON), keepRaw(SourceAlertSectionTags.toggle(1)))
+        // Out and back in one runnable, before any frame: only the screen listener's synchronous end can stop the old clicks.
+        for (other in listOf(TopicDisplayOwner(AuthIdentityFence("B", 1L), 1L), TopicDisplayOwner(AuthIdentityFence("A", 2L), 1L), o2)) {
+            val old = kept()
+            val before = writes()
+            rule.runOnUiThread {
+                fun publishOwner(target: TopicDisplayOwner) {
+                    liveAccount = target.identity
+                    focus.value = OwnedTopicFocus(liveAccount, FreeTab.TETHER)
+                    display.value = display.value.copy(owner = target)
+                    assertEquals("premise: $target is the accepted owner", target, consumer.currentState().ui.owner)
+                }
+                publishOwner(other)
+                publishOwner(o1)
+                old.forEach { it() }
+                assertEquals("$other and back before a frame: the old clicks reached nothing", before, writes())
+            }
+            rule.waitForIdle()
+            await("back with $other gone") { tags(SourceAlertSectionTags.ADD_BUTTON) == 1 }
+            run(listOf(keepRaw(SourceAlertSectionTags.toggle(1))))
+            assertEquals("$other: the new session's switch once", before[3] + 1, writes()[3])
+        }
+        val oldTab = kept()
+        val tabCounts = writes()
+        rule.runOnUiThread {
+            for (tab in listOf(FreeTab.USD, FreeTab.TETHER)) {
+                focus.value = OwnedTopicFocus(a1, tab)
+                assertEquals("premise: $tab is accepted", tab, consumer.currentState().ui.selectedTab)
+            }
+            oldTab.forEach { it() }
+            assertEquals("the tab out and back before a frame: the old clicks reached nothing", tabCounts, writes())
+        }
+        rule.waitForIdle()
+        await("back on tether") { tags(SourceAlertSectionTags.ADD_BUTTON) == 1 }
+        run(listOf(keepRaw(SourceAlertSectionTags.toggle(1))))
+        assertEquals("the new session's switch once", tabCounts[3] + 1, writes()[3])
+        for ((label, away, home) in listOf<Triple<String, () -> Unit, () -> Unit>>(
+                Triple("tab left", { select(FreeTab.USD) }, { select(FreeTab.TETHER) }),
+                Triple("inactive", { active = false; rule.waitForIdle() }, { active = true; rule.waitForIdle() }),
+                Triple("disposed", { mounted = false; rule.waitForIdle() }, { mounted = true; rule.waitForIdle() }),
+                Triple("owner replaced", { rule.runOnUiThread { display.value = display.value.copy(owner = o2) }; rule.waitForIdle() },
+                    { rule.runOnUiThread { display.value = display.value.copy(owner = o1) }; rule.waitForIdle() }),
+                // Another account accepted across frames, then A again: A→B→A.
+                Triple("another account accepted", { acceptOwner(TopicDisplayOwner(AuthIdentityFence("B", 1L), 1L)) }, { acceptOwner(o1) }),
+                // Another account's display while A is live: the presenter accepts no owner (an identity mismatch), then A again.
+                Triple("another account's display while A is live (identity mismatch)", { rule.runOnUiThread { display.value = display.value.copy(owner = TopicDisplayOwner(AuthIdentityFence("B", 1L), 1L)) }; rule.waitForIdle() },
+                    { rule.runOnUiThread { display.value = display.value.copy(owner = o1) }; rule.waitForIdle() }),
+                Triple("a news detail over the tether tab", {
+                    select(FreeTab.NEWS)
+                    await("premise: the news is drawn") { texts("fixture news") > 0 }
+                    rule.onNodeWithText("fixture news").performClick()
+                    rule.waitForIdle()
+                    select(FreeTab.TETHER)
+                }, { back() }))) {
+            await("$label: premise") { tags(SourceAlertSectionTags.ADD_BUTTON) == 1 }
+            val clicks = kept()
+            val before = writes()
+            away()
+            run(clicks)
+            assertEquals("$label: away, the kept writes reached nothing", before, writes())
+            home()
+            await("$label: back") { tags(SourceAlertSectionTags.ADD_BUTTON) == 1 }
+            run(clicks)
+            assertEquals("$label: back, still nothing", before, writes())
+            run(listOf(keepRaw(SourceAlertSectionTags.toggle(1))))
+            assertEquals("$label: the new switch once", before[3] + 1, writes()[3])
+        }
+        val clicks = kept()
+        val before = writes()
+        run(listOf(keep(PremiumTopicTags.SETTINGS)) + clicks)
+        assertTrue("premise: settings opened", settingsShown > 0)
+        assertEquals("settings opened in the same frame: nothing reached", before, writes())
+        back()
+        await("settings closed: back") { tags(SourceAlertSectionTags.ADD_BUTTON) == 1 }
+
+        tap(SourceAlertSectionTags.rowOpen(1))
+        rule.onNodeWithTag(SourceAlertEditorSheetTags.THRESHOLD, useUnmergedTree = true).performTextReplacement("1450")
+        rule.waitForIdle()
+        rule.onNodeWithTag(SourceAlertEditorSheetTags.SAVE, useUnmergedTree = true).performSemanticsAction(SemanticsActions.OnClick)
+        rule.waitForIdle()
+        val old = sources.handles.last()
+        press(SourceAlertEditorSheetTags.CANCEL)
+        tap(SourceAlertSectionTags.rowOpen(2))
+        assertTrue("premise: the second editor", sheetOpen())
+        rule.runOnUiThread { old.finish(SourceAlertSaveOutcome.Removed) }
+        rule.waitForIdle()
+        assertTrue("the replaced editor's Removed leaves the new one open", sheetOpen())
+        assertEquals("and shows no notice", 0, rawTags(SourceAlertSectionTags.NOTICE))
+        assertEquals("and no error", 0, rawTags(SourceAlertEditorSheetTags.ERROR_DIALOG))
+        assertEquals(0, texts(SourceAlertEditor.Copy.REMOVED))
     }
 }

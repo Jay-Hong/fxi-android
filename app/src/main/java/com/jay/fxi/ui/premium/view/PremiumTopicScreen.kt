@@ -96,7 +96,8 @@ internal fun PremiumTopicScreen(
     newsContent: @Composable (isTabVisible: Boolean) -> Unit,
     modifier: Modifier = Modifier,
     graphSlot: PremiumFxGraphSlot? = null,
-    belowRates: (@Composable (FreeTab) -> Unit)? = null
+    /** S8-5b: the slot gets the tab and a check, read at the moment of a click, that neither fullscreen is shown. */
+    belowRates: (@Composable (FreeTab, () -> Boolean) -> Unit)? = null
 ) {
     val owner = state.ui.owner
     val selectedTab = state.ui.selectedTab
@@ -140,7 +141,7 @@ private fun PremiumTopicOwnedScreen(
     onOpenSettings: () -> Unit,
     newsContent: @Composable (Boolean) -> Unit,
     graphSlot: PremiumFxGraphSlot?,
-    belowRates: (@Composable (FreeTab) -> Unit)?
+    belowRates: (@Composable (FreeTab, () -> Boolean) -> Unit)?
 ) {
     val tabs = FreeTab.entries
     val pager = rememberPagerState(initialPage = selectedTab.ordinal) { tabs.size }
@@ -163,11 +164,32 @@ private fun PremiumTopicOwnedScreen(
         else -> PremiumTopicOverlay.NONE
     }
     val overlay = overlayFor(graph?.fullscreenToken != null)
+    // S8-5b: read when called, never the value of the last render: the rate fullscreen state and the slot's accepted graph.
+    // Each overlay entry, and any check that finds one shown, ends the tether slot's session for good; the slot's content is
+    // keyed by that session, so a return draws a new one.
+    val liveOwner by rememberUpdatedState(owner)
+    val liveGraphSlot by rememberUpdatedState(graphSlot)
+    var overlayEpoch by remember { mutableStateOf(0L) }
+    val overlayTicket = overlayEpoch
+    val overlayClearNow: () -> Boolean = {
+        val clear = overlayFor(liveGraphSlot?.acceptedState(liveOwner, currentTab)?.fullscreenToken != null) == PremiumTopicOverlay.NONE
+        if (!clear && overlayTicket == overlayEpoch) overlayEpoch++
+        clear && overlayTicket == overlayEpoch
+    }
     SideEffect {
         // An externally published graph fullscreen replaces, rather than suspends, the rate layer.
         if (overlay == PremiumTopicOverlay.GRAPH) fullscreen = false
     }
-    val graphActions = graphSlot?.actions
+    // The tether graph's fullscreen entry ends the slot's session once the holder has taken it. Remembered, so the graph sees
+    // the same actions on every frame.
+    val graphActions = remember(graphSlot?.actions, selectedTab) {
+        graphSlot?.actions?.let { original ->
+            if (selectedTab != FreeTab.TETHER) original else original.copy(enterFullscreen = { token ->
+                original.enterFullscreen(token)
+                if (liveGraphSlot?.acceptedState(liveOwner, currentTab)?.fullscreenToken != null) overlayEpoch++
+            })
+        }
+    }
 
     LaunchedEffect(pager) {
         var drag: DragInteraction.Start? = null
@@ -273,10 +295,15 @@ private fun PremiumTopicOwnedScreen(
                             // Keep each page's position even while it has no accepted rows to draw.
                             val scroll = rememberScrollState()
                             if (tab == selectedTab) {
-                                PremiumTopicRates(state.ui, scroll, fullscreen = false, onToggleFullscreen = { fullscreen = true },
+                                PremiumTopicRates(state.ui, scroll, fullscreen = false, onToggleFullscreen = {
+                                    if (!fullscreen && tab == FreeTab.TETHER) overlayEpoch++
+                                    fullscreen = true
+                                },
                                     onOpenEditor = openEditor, graphContent = if (graph != null && graphActions != null) {
                                         { GraphV2Section(graph, graphActions, hostExposed = overlay == PremiumTopicOverlay.NONE) }
-                                    } else null, belowRates = belowRates?.takeIf { overlay == PremiumTopicOverlay.NONE }?.let { content -> { content(tab) } })
+                                    } else null, belowRates = belowRates?.takeIf { overlay == PremiumTopicOverlay.NONE }?.let { content ->
+                                        { key(if (tab == FreeTab.TETHER) overlayTicket else 0L) { content(tab, overlayClearNow) } }
+                                    })
                             } else {
                                 Box(Modifier.fillMaxSize())
                             }

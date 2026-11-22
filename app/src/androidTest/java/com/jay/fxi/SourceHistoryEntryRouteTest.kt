@@ -313,6 +313,8 @@ class SourceHistoryEntryRouteTest {
     @Test fun s84b_t03_leavingEndsTheSessionAtOnce_andALateAnswerDrawsNothing() {
         show()
         val baseline = listeners()
+        // S8-5b: the route's own tether-session listener lives while an active route draws this owner's tether tab.
+        assertEquals("premise: on the tether tab the route's tether session listens once", 1, baseline)
         for ((label, away, home) in listOf<Triple<String, () -> Unit, () -> Unit>>(
                 Triple("tab left", { select(FreeTab.USD) }, { select(FreeTab.TETHER) }),
                 Triple("left and back in one Main task", {
@@ -349,7 +351,8 @@ class SourceHistoryEntryRouteTest {
             val before = reads()
             away()
             await("$label: the sheet is gone") { sheets() == 0 }
-            assertEquals("$label: no listener left", baseline, listeners())
+            val routeListens = label !in setOf("tab left", "inactive", "disposed")
+            assertEquals("$label: no listener left", if (routeListens) baseline else baseline - 1, listeners())
             await("$label: no revision collection left") { collectors() == listOf(0, 0) }
             assertTrue("$label: the open read's guard refuses", !read.guard())
             home()
@@ -432,6 +435,7 @@ class SourceHistoryEntryRouteTest {
     @Test fun s84b_t05_aKeptClickAfterTheTabIsLeftReadsNothingAndLeavesNoListener() {
         show()
         val baseline = listeners()
+        assertEquals("premise: on the tether tab the route's tether session listens once", 1, baseline)
         val action = rule.onNodeWithTag(SourceHistoryTags.ENTRY).fetchSemanticsNode().config[SemanticsActions.OnClick].action
         assertNotNull("premise: the entry has a click action", action)
         select(FreeTab.USD)
@@ -440,7 +444,7 @@ class SourceHistoryEntryRouteTest {
         rule.waitForIdle()
         assertEquals("kept click: its wiring is made, nothing is read", listOf(1, 0), listOf(history.made.get(), reads()))
         assertEquals("kept click: no sheet", 0, sheets())
-        assertEquals("kept click: no listener left", baseline, listeners())
+        assertEquals("kept click: no listener left, and the route's tether session does not listen on USD", baseline - 1, listeners())
         await("kept click: no revision collection") { collectors() == listOf(0, 0) }
     }
 }

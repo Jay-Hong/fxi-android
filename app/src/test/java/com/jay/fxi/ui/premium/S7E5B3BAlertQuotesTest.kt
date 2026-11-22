@@ -18,7 +18,8 @@ import org.junit.Test
 /**
  * S7 E5b3b contract (s7e5b3_api_agreed.r1.md D4): the bank alert editor's prices. The presenter carries every FX bank quote of the
  * accepted tab — hidden rows included, the premium FX sources only (no Citi), finite and positive only — by source code, and an
- * empty map for the tether and news tabs and for every state that is not the current owner's.
+ * empty map for the news tab and for every state that is not the current owner's. S8-5b (`R4c/S8/s8_5b_contract.agreed.r1.md`
+ * §2, §3 J1): the tether tab carries every arrived exchange USDT/KRW quote, hidden ones included, and no reference or bank row.
  */
 class S7E5B3BAlertQuotesTest {
     private val a1 = AuthIdentityFence("A", 1L)
@@ -53,8 +54,8 @@ class S7E5B3BAlertQuotesTest {
         assertEquals(mapOf("investing" to 1389.0, "kb" to 1390.0, "hana" to 1391.0, "ibk" to 1393.0), present(FreeTab.USD, display(odd)).alertQuotes)
     }
 
-    @Test fun `Q04 the tether and news tabs and every non-current state carry none`() {
-        assertEquals(emptyMap<String, Double>(), present(FreeTab.TETHER).alertQuotes)
+    @Test fun `Q04 the news tab and every non-current state carry none, the tether tab its exchange quote`() {
+        assertEquals(mapOf("upbit" to 1400.0), present(FreeTab.TETHER).alertQuotes)
         assertEquals(emptyMap<String, Double>(), present(FreeTab.NEWS).alertQuotes)
         assertEquals("another live identity", emptyMap<String, Double>(), present(FreeTab.USD, live = b1).alertQuotes)
         assertEquals("no owner", emptyMap<String, Double>(), present(FreeTab.USD, display(owner = null)).alertQuotes)
@@ -75,5 +76,20 @@ class S7E5B3BAlertQuotesTest {
             val hideAll = mapOf(RateRowList.FX_BANKS to RateRowPreference(hidden = sources.toSet()))
             assertEquals("$tab: every premium source, nothing else", expected, present(tab, display(r), prefs = hideAll).alertQuotes)
         }
+    }
+
+    @Test fun `S8_5B_Q06 the tether tab carries every arrived exchange quote, a hidden one too, and nothing else`() {
+        val tether = TopicRates().merge(listOf(
+            q("investing", "usd-krw", 1389.0), q("kb", "usd-krw", 1390.0), q("hana", "usd-krw", 1391.0),
+            q("upbit", "usdt-krw", 1401.0), q("bithumb", "usdt-krw", 1398.5), q("korbit", "usdt-krw", Double.NaN),
+            q("gopax", "usdt-krw", 0.0), q("coinone", "usd-krw", 1395.0), q("nobank", "usdt-krw", 1500.0)))
+        val hideBithumb = mapOf(RateRowList.TETHER_EXCHANGES to RateRowPreference(hidden = setOf("bithumb")))
+        val ui = present(FreeTab.TETHER, display(tether), prefs = hideBithumb)
+        assertEquals("bithumb is not a shown row", false,
+            ui.rateSections.flatMap { section -> section.rows.map { it.id } }.contains("bithumb"))
+        assertEquals("the exact exchange quotes: no reference, bank, other asset, unknown, non-finite or non-positive value",
+            mapOf("upbit" to 1401.0, "bithumb" to 1398.5), ui.alertQuotes)
+        assertEquals("the USD tab keeps its own bank prices", mapOf("investing" to 1389.0, "kb" to 1390.0, "hana" to 1391.0),
+            present(FreeTab.USD, display(tether)).alertQuotes)
     }
 }
