@@ -188,6 +188,9 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
                 if (query.keys != setOf("topic") || file == null) return unexpected()
                 "topic-snapshot $topic" to ok(load(file))
             }
+            "/api/source-notification-settings" ->
+                if (query != mapOf("asset" to listOf("usdt-krw"))) unexpected()
+                else "source settings list n=0" to ok("""{"settings":[],"total_count":0}""".encodeToByteArray())
             "/api/v2/graph/catalog" -> if (query.isNotEmpty()) unexpected() else "graph-catalog" to ok(load(BuildConfig.E5DJ_GRAPH_CATALOG_ASSET))
             "/api/v2/graph/tab" ->
                 if (query != mapOf("tab" to listOf("usd"), "period" to listOf("1d"))) unexpected()

@@ -400,6 +400,7 @@ class J10ProductionJourneyTest {
             Rule("ws pong", "ws conn=1 send pong -> true", 0, 4),
             Rule("topic bootstrap", "http GET /api/v2/topics/snapshot q=topic=(fx:usd-krw|fx:jpy-krw|fx:eur-krw|usdt:krw|dxy:spot) -> topic-snapshot \\S+", 5, 5),
             Rule("alert list", "http GET /api/notification-settings q= -> alerts list n=\\d+ ids=\\[.*]", 1, 2),
+            Rule("source alert list", "http GET /api/source-notification-settings q=asset=usdt-krw -> source settings list n=0", 1, 1),
             Rule("graph catalog", "http GET /api/v2/graph/catalog q= -> graph-catalog", 1, 1),
             Rule("graph usd 1d", "http GET /api/v2/graph/tab q=period=1d&tab=usd -> graph-tab usd 1d", 1, 6),
             Rule("register device", "http POST /api/register-device q= -> register-device token=present platform=android", 0, 1)
