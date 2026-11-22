@@ -23,6 +23,8 @@ import com.jay.fxi.service.AlertEvent
 import com.jay.fxi.service.AlertFamily
 import com.jay.fxi.service.AlertPushRoute
 import com.jay.fxi.service.AlertPushRouting
+import com.jay.fxi.service.AlertTapExtraKind
+import com.jay.fxi.service.AlertTapExtras
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -43,13 +45,19 @@ import org.junit.Test
 
 /**
  * S8-4a (`R4c/S8/s8_4a_contract.agreed.r1.md` §3 "JVM U2", §4): the corpus FCM goldens through the registry with the production
- * family list — the real bank owner and the real source owner, each behind a counting delegate that keeps its owner's type (the
- * bank family takes bank pushes, the source family is lifecycle-only). From the cold start's baseline: one sync golden in the
+ * family list — the real bank owner and the real source owner, each behind a counting delegate. The bank delegate forwards
+ * lifecycle, sync and bank push calls; the source delegate forwards lifecycle and sync calls only and is not a
+ * SourceAlertSettingsOwner. From the cold start's baseline: one sync golden in the
  * idle foreground is one delivery resolve, one main post, no further family resolve, one sync and one settings GET for each
  * family, each adopting its own answer; held in the background, repeated syncs send nothing and make the next return inside
  * both snapshots' freshness authoritative for each (a return without a sync sends nothing); a bank push or tap, readable or
- * not, reaches the bank family alone; a source or comparison golden, pushed or tapped, with a readable id or not, reaches
- * neither family for a minute.
+ * not, reaches the bank family alone; a comparison golden or a KRX source golden, pushed or tapped, with a readable id or not,
+ * reaches neither family for a minute.
+ * S8-6 (`R4c/S8/user_decision_s8_6.r1.md`): the helpers mirror the ordering of source handling relative to routing. The push helper routes first and hands a
+ * source push to `deliverSourcePush` (FXiMessagingService); the tap helper calls `consumeSourceTap` before routing (MainActivity)
+ * and returns the raw route to its caller for assertions. The source delegate is only an AlertLifecycleAdapter and the registry keeps its
+ * default null use capture, so no source delivery reaches an owner here; `S86SourceDeliveryContractTest` exercises admitted
+ * exchange deliveries with captured uses and the real source and bank owners.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class S84ATwoFamilyGoldenTest {
@@ -66,6 +74,15 @@ class S84ATwoFamilyGoldenTest {
     private fun bankRow(id: Int) = AlertSetting(id, "user-a", "kb", "usd-krw", AlertCondition.ABOVE, 1400.0 + id, true, false, stamp, stamp, null, null)
     private fun sourceRow(id: Int) =
         SourceAlertSetting(id, "user-a", "upbit", "usdt-krw", AlertCondition.ABOVE, 1400.0 + id, true, false, null, stamp, stamp, null)
+
+    /** S8-6: one OS-delivered intent's extras, every value a String as the FCM data payload carries it. */
+    private class Extras(initial: Map<String, String>) : AlertTapExtras {
+        val values = initial.toMutableMap()
+        override fun readInt(key: String, default: Int): Int = default
+        override fun readString(key: String): String? = values[key]
+        override fun kind(key: String): AlertTapExtraKind = if (key in values) AlertTapExtraKind.STRING else AlertTapExtraKind.MISSING
+        override fun remove(key: String) { values.remove(key) }
+    }
 
     private class Process : LifecycleOwner {
         val registry: LifecycleRegistry = LifecycleRegistry.createUnsafe(this)
@@ -172,10 +189,15 @@ class S84ATwoFamilyGoldenTest {
         fun toBackground() { process.registry.currentState = Lifecycle.State.CREATED; settle() }
         fun toForeground() { process.registry.currentState = Lifecycle.State.STARTED; settle() }
 
-        /** FXiMessagingService's order: the route of the raw type and id, then the raw hand-over. */
+        /** FXiMessagingService's order: the route of the raw type and id, then (S8-6) the source branch or the raw hand-over. */
         fun push(data: Map<String, String>): AlertPushRoute? {
             val type = data["type"] ?: return null
             val route = AlertPushRouting.route(type, data["setting_id"]) ?: return null
+            if (type == AlertFamilyRefresherRegistry.SOURCE_RATE_ALERT) {
+                AlertFamilyRefresherRegistry.deliverSourcePush(data, { deliveryResolves++; registry }) { _ -> }
+                settle()
+                return route
+            }
             AlertFamilyRefresherRegistry.deliverPush(type, data["setting_id"], data["is_repeat"], gateOpen = true, reportFailure = { failures++ }) {
                 deliveryResolves++
                 registry
@@ -184,8 +206,12 @@ class S84ATwoFamilyGoldenTest {
             return route
         }
 
-        /** The OFF tap's order: the route of the raw type and id, then its event with the raw is_repeat. */
+        /** MainActivity's OFF order: the source consumer first; only an unconsumed tap passes its route event and the raw is_repeat to deliverTap. Returns the raw route for the assertions. */
         fun tap(data: Map<String, String>): AlertPushRoute? {
+            if (AlertFamilyRefresherRegistry.consumeSourceTap(Extras(data), gateOpen = true) { deliveryResolves++; registry }) {
+                settle()
+                return AlertPushRouting.route(data["type"], data["setting_id"])
+            }
             val route = AlertPushRouting.route(data["type"], data["setting_id"]) ?: return null
             AlertFamilyRefresherRegistry.deliverTap(route.event, data["is_repeat"], gateOpen = true, reportFailure = { failures++ }) {
                 deliveryResolves++
@@ -316,11 +342,11 @@ class S84ATwoFamilyGoldenTest {
         }
     }
 
-    @Test fun `S8_4A_U04 a source or comparison golden, pushed or tapped, readable id or not, reaches neither family`() = runTest {
+    @Test fun `S8_4A_U04 a comparison or KRX source golden, pushed or tapped, readable id or not, reaches neither family`() = runTest {
         val cases = OTHERS.flatMap { (id, expected) ->
             listOf(true, false).map { tapped -> Triple("$id ${if (tapped) "tap" else "push"}", golden(id) to tapped,
                 AlertEvent.SettingTriggered(expected.second, expected.first)) }
-        } + listOf(SOURCE_ONCE to AlertFamily.SOURCE, COMPARISON_ONCE to AlertFamily.COMPARISON).flatMap { (id, family) ->
+        } + listOf(SOURCE_KRX to AlertFamily.SOURCE, COMPARISON_ONCE to AlertFamily.COMPARISON).flatMap { (id, family) ->
             listOf(null, "x", "2147483648").flatMap { value ->
                 listOf(true, false).map { tapped -> Triple("$id setting_id=$value ${if (tapped) "tap" else "push"}",
                     variant(id, "setting_id", value) to tapped, AlertEvent.FamilyRefreshNeeded(family)) }
@@ -332,7 +358,7 @@ class S84ATwoFamilyGoldenTest {
                 val beforeBank = bank.state.value
                 val beforeSource = source.state.value
                 val route = if (tapped) tap(data) else push(data)
-                assertEquals("$label: its family's route with a banner", AlertPushRoute(event, showBanner = true), route)
+                assertEquals("$label: its raw family route has showBanner=true", AlertPushRoute(event, showBanner = true), route)
                 assertUntouched(label, beforeBank, beforeSource)
             }
         }
@@ -342,10 +368,11 @@ class S84ATwoFamilyGoldenTest {
         const val ONCE = "fcm-rate-alert-once"
         const val REPEAT = "fcm-rate-alert-repeat"
         const val SYNC = "fcm-sync-alerts"
-        const val SOURCE_ONCE = "fcm-source-alert-once"
+        const val SOURCE_KRX = "fcm-source-alert-repeat-krx"
         const val COMPARISON_ONCE = "fcm-comparison-alert-absolute-once"
+        // S8-6: the admitted exchange golden (fcm-source-alert-once, 102) is in S86SourceDeliveryContractTest with the real owners.
         val OTHERS: Map<String, Pair<AlertFamily, Int>> = linkedMapOf(
-            SOURCE_ONCE to (AlertFamily.SOURCE to 102), "fcm-source-alert-repeat-krx" to (AlertFamily.SOURCE to 105),
+            SOURCE_KRX to (AlertFamily.SOURCE to 105),
             COMPARISON_ONCE to (AlertFamily.COMPARISON to 103), "fcm-comparison-alert-signed-repeat" to (AlertFamily.COMPARISON to 106)
         )
     }

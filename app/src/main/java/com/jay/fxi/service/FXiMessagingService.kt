@@ -55,6 +55,14 @@ class FXiMessagingService : FirebaseMessagingService() {
 
         val type = message.data["type"] ?: return
         val route = AlertPushRouting.route(type, message.data["setting_id"]) ?: return
+        if (type == AlertFamilyRefresherRegistry.SOURCE_RATE_ALERT) {
+            if (shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)) {
+                AlertFamilyRefresherRegistry.deliverSourcePush(message.data, { alertFamiliesProvider.get() }) { admitted ->
+                    showAlertNotification(message, type, admitted)
+                }
+            }
+            return
+        }
         alertEventBusProvider.get().emit(route.event)
         AlertFamilyRefresherRegistry.deliverPush(
             type, message.data["setting_id"], message.data["is_repeat"],
@@ -76,8 +84,8 @@ class FXiMessagingService : FirebaseMessagingService() {
         return title to body
     }
 
-    private fun showAlertNotification(message: RemoteMessage, type: String) {
-        if (!ReleaseAdmission.isOpen) return
+    private fun showAlertNotification(message: RemoteMessage, type: String, admitted: () -> Boolean = { true }) {
+        if (!ReleaseAdmission.isOpen || !admitted()) return
         val (title, body) = parseNotificationContent(message)
 
         val settingId = message.data["setting_id"]?.toIntOrNull()
@@ -91,9 +99,13 @@ class FXiMessagingService : FirebaseMessagingService() {
         }
         if (krxContestSwitch.enabled) {
             AlertTapEntry.copyForegroundClassification(message.data, AndroidAlertTapExtras(intent))
+        } else if (type == AlertFamilyRefresherRegistry.SOURCE_RATE_ALERT) {
+            intent.putExtra("source", message.data["source"])
+            intent.putExtra("asset", message.data["asset"])
         }
         // 고유 notificationId를 requestCode로 사용 (동일 알림 업데이트 보장)
         val notificationId = System.currentTimeMillis().toInt()
+        if (!admitted()) return
         val pendingIntent = PendingIntent.getActivity(
             this, notificationId, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -110,7 +122,7 @@ class FXiMessagingService : FirebaseMessagingService() {
             .build()
 
         val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.notify(notificationId, notification)
+        if (admitted()) notificationManager.notify(notificationId, notification)
     }
 
     companion object {

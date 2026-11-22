@@ -481,6 +481,30 @@
         }
       },
       "added": {}
+    },
+    {
+      "id": "S8-6",
+      "source_parent": "6d85e9ec25711eab2b839d39f2e429db019f8e81",
+      "approval_record_sha256": "2b73b32b65a5b9df5f685a7a014e61211c3af90c3f6e9ec2f0a112d483417875",
+      "changed": {
+        "src/main/java/com/jay/fxi/service/FXiMessagingService.kt": {
+          "from": "8f05d0470162f67573e29499f54ce0de6028f9e863dbea1aee36b4a5588d5ee6",
+          "to": "3ab46e30fff43339bd09c4a5cde8fc0c0d429cfde93065d9fa086ac07a0a575a"
+        },
+        "src/main/java/com/jay/fxi/MainActivity.kt": {
+          "from": "363279e89b869c63f4c5a7e59dff81db858e5cb00da41ec9fd3d6f00aba3854b",
+          "to": "3328908334f4388686891812483df4fe7ba3d043aa7b6f969850c6d670230de5"
+        },
+        "src/main/java/com/jay/fxi/data/alerts/AlertFamilyRefresherRegistry.kt": {
+          "from": "dc822aa9712d8af9a1af3e223e97a7504915754d27e114ac742c608cfd655386",
+          "to": "3ad2ca3c709ccbbd05297a32c072bcd1e2fde4130fd5d978a69847c608e20697"
+        },
+        "src/main/java/com/jay/fxi/data/alerts/SourceAlertSettingsOwner.kt": {
+          "from": "41466b5904443e45f5d7519868fd3da424cbda9852094b45e4c1a13a90dd4f4d",
+          "to": "5add3283e50cce62bd14a3d5a97a5623d73bc4d20411eebfad6ed99ed818cbf8"
+        }
+      },
+      "added": {}
     }
   ]
 }

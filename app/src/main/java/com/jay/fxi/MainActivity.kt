@@ -115,6 +115,10 @@ class MainActivity : ComponentActivity() {
 
     private fun parseAlertEventFromIntent(intent: Intent?): AlertEvent? {
         if (intent == null) return null
+        if (AlertFamilyRefresherRegistry.consumeSourceTap(
+                AndroidAlertTapExtras(intent),
+                shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)
+            ) { alertFamiliesProvider.get() }) return null
 
         // 1. FXiMessagingService가 설정한 커스텀 extra (포그라운드 알림)
         // 2. 서버 FCM data payload 직접 전달 (백그라운드/종료 상태 시스템 알림)

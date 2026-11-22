@@ -157,6 +157,8 @@ internal class SourceAlertSettingsOwner internal constructor(
     private var revision = 0L
     private val rowOps = mutableMapOf<Int, RowOp>()
     private var reconcileOwed: AuthIdentityFence? = null
+    private var pendingDelivery: AlertSettingsUse? = null
+    private var deliveryMarks = 0L
     private val createOps = mutableMapOf<Any, CreateOp>()
     // Settled, unresolved effects reserve capacity without holding up the reconciling GET.
     private val createReservations = mutableSetOf<Any>()
@@ -254,7 +256,8 @@ internal class SourceAlertSettingsOwner internal constructor(
      * chain is cancelled; its send guard reads it from transport threads, so a guard kept past a background or reset refuses
      * even while the same identity is still admitted.
      */
-    private class Chain(val generation: Long, var automatic: Boolean, var manual: Boolean) {
+    private class Chain(val generation: Long, var automatic: Boolean, var manual: Boolean, var deliveryUse: AlertSettingsUse?) {
+        var servingDelivery: AlertSettingsUse? = null
         @Volatile var retired = false
         var startRevision = 0L
         var inFetch = false
@@ -288,20 +291,34 @@ internal class SourceAlertSettingsOwner internal constructor(
         scope.launch { accessRevisions.collect { hintAccess() } }
     }
 
+    private fun normalChain(): Chain? {
+        val chain = active ?: return null
+        val use = chain.deliveryUse ?: return chain
+        if (!access.admits(use)) {
+            abandon()
+            return null
+        }
+        chain.deliveryUse = null
+        return chain
+    }
+
     fun ensure() {
         if (!foreground) return
-        active?.let {
+        val success = lastSuccessAt
+        val fresh = reconcileOwed == null && mutableState.value.settings != null && success != null &&
+            remaining(addDelay(success, 30_000)) > 0
+        if (fresh && active?.deliveryUse != null) return
+        normalChain()?.let {
             it.automatic = true
             return
         }
-        val success = lastSuccessAt
-        if (reconcileOwed == null && mutableState.value.settings != null && success != null && remaining(addDelay(success, 30_000)) > 0) return
+        if (fresh) return
         begin(automatic = true, manual = false)
     }
 
     fun authoritative() {
         if (!foreground) return
-        val chain = active
+        val chain = normalChain()
         if (chain == null) {
             begin(automatic = true, manual = false)
         } else {
@@ -321,7 +338,7 @@ internal class SourceAlertSettingsOwner internal constructor(
             mutableManualOutcomes.tryEmit(ManualRefreshOutcome.CoolingDown(remaining))
             return
         }
-        val chain = active
+        val chain = normalChain()
         if (chain == null) {
             begin(automatic = false, manual = true)
         } else {
@@ -339,6 +356,7 @@ internal class SourceAlertSettingsOwner internal constructor(
         rowOps.clear()
         createOps.clear()
         reconcileOwed = null
+        pendingDelivery = null
         createReservations.clear()
         deleteReservations.clear()
         approvedOrder.clear()
@@ -364,10 +382,12 @@ internal class SourceAlertSettingsOwner internal constructor(
         foreground = true
         if (!lifetime.open) lifetime = SendLifetime()
         if (authoritative || reconcileOwed != null) this.authoritative() else ensure()
+        startPendingDelivery()
     }
 
     override fun onBackground() {
         foreground = false
+        if (pendingDelivery == null) pendingDelivery = active?.servingDelivery
         lifetime.open = false
         rowOps.values.forEach {
             if (it.edit != null) {
@@ -379,6 +399,40 @@ internal class SourceAlertSettingsOwner internal constructor(
         createOps.values.forEach { it.hints.trySend(Unit) }
         abandon()
         show(AlertLoadPhase.Idle)
+    }
+
+    fun admitsDelivery(use: AlertSettingsUse): Boolean = access.admits(use)
+
+    fun onSourceDelivery(event: SourceAlertDelivery, use: AlertSettingsUse) {
+        if (!access.admits(use) || !allowed(event.source to event.asset)) return
+        val state = mutableState.value
+        val id = event.id
+        val rows = state.settings
+        if (event.repeat == "false" && id != null && rows != null && state.identity == use.identity &&
+            id !in rowOps && id !in uncertainPairs && id !in deleteReservations) {
+            val index = rows.indexOfFirst {
+                it.id == id && it.userId == use.identity.uid && it.source == event.source && it.asset == event.asset
+            }
+            if (index >= 0 && access.admits(use)) {
+                val next = rows.toMutableList()
+                next[index] = next[index].copy(isEnabled = false, triggered = true)
+                deliveryMarks++
+                touchRow(id)
+                mutableState.value = state.copy(settings = next)
+            }
+        }
+        if (!access.admits(use)) return
+        pendingDelivery = use
+        startPendingDelivery()
+    }
+
+    private fun startPendingDelivery() {
+        val use = pendingDelivery ?: return
+        if (!access.admits(use)) {
+            pendingDelivery = null
+        } else if (foreground && active == null) {
+            begin(automatic = true, manual = false, deliveryUse = use)
+        }
     }
 
     override fun onSync() {
@@ -1014,8 +1068,8 @@ internal class SourceAlertSettingsOwner internal constructor(
         }
     }
 
-    private fun begin(automatic: Boolean, manual: Boolean) {
-        val chain = Chain(generation, automatic, manual)
+    private fun begin(automatic: Boolean, manual: Boolean, deliveryUse: AlertSettingsUse? = null) {
+        val chain = Chain(generation, automatic, manual, deliveryUse)
         active = chain
         // Publish the handle before running, even with an eager injected dispatcher.
         val next = scope.launch(start = CoroutineStart.LAZY) { runChain(chain) }
@@ -1051,6 +1105,10 @@ internal class SourceAlertSettingsOwner internal constructor(
                 // Requests received in any sleep are served by this fetch.
                 chain.dirty = false
                 chain.startRevision = revision
+                val marksAtStart = deliveryMarks
+                val deliveryOnly = chain.deliveryUse != null
+                chain.servingDelivery = pendingDelivery?.takeIf(access::admits) ?: chain.servingDelivery?.takeIf(access::admits)
+                pendingDelivery = null
                 chain.inFetch = true
                 publishManualRefresh()
                 show(if (attempt == 0) AlertLoadPhase.Loading else AlertLoadPhase.Retrying)
@@ -1064,6 +1122,7 @@ internal class SourceAlertSettingsOwner internal constructor(
                 }
                 if (!current(chain)) return
                 if (!access.admits(use)) {
+                    if (deliveryOnly && chain.deliveryUse == null) continue
                     show(AlertLoadPhase.Idle)
                     return
                 }
@@ -1080,6 +1139,15 @@ internal class SourceAlertSettingsOwner internal constructor(
                             chain.retryNotBefore = null
                             continue
                         }
+                        if (marksAtStart != deliveryMarks) {
+                            if (chain.manual || chain.dirty) {
+                                attempt = 0
+                                chain.retryNotBefore = null
+                                continue
+                            }
+                            return
+                        }
+                        chain.servingDelivery = null
                         reconcileOwed = null
                         createReservations.clear()
                         deleteReservations.clear()
@@ -1130,6 +1198,7 @@ internal class SourceAlertSettingsOwner internal constructor(
                 active = null
                 job = null
                 publishManualRefresh()
+                startPendingDelivery()
             }
         }
     }
@@ -1137,6 +1206,7 @@ internal class SourceAlertSettingsOwner internal constructor(
     /** Every wake and every send rechecks the process floor, independently of account and retry delay. */
     private suspend fun awaitUse(chain: Chain): AlertSettingsUse? {
         while (current(chain)) {
+            if (chain.deliveryUse?.let { !access.admits(it) } == true) return null
             // A GET is not sent while a write is active; the last write's end wakes this wait.
             if (rowOps.isNotEmpty() || createOps.isNotEmpty()) {
                 chain.waitingAccess = true
@@ -1155,7 +1225,7 @@ internal class SourceAlertSettingsOwner internal constructor(
                 sleep(wait)
                 continue
             }
-            val use = access.acquire()
+            val use = chain.deliveryUse ?: access.acquire()
             if (use == null) {
                 show(AlertLoadPhase.Idle)
                 chain.waitingAccess = true

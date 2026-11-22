@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "4eef46a7a5732e1f70325a16669790a3f1b854e0e624942128719635401ca65a"
+    const val APPROVED_SHA256 = "9a9a1ed0c9531e1af646255fe409b6eaff8b792b92da1d652db41acb33108335"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -34,8 +34,8 @@ internal object PostS6ApprovedDelta {
     private val HEX40 = Regex("^[0-9a-f]{40}$")
 
     /**
-     * Contents whose comment-free text was reviewed to hold no KRX reference, by SHA-256. Every `from` of a change must be one: the
-     * text before a change is not available to this test, so the review that approved the change records it here.
+     * Reviewed SHA-256 values for predecessors whose comment-free text contains no KRX reference. Each ordinary change
+     * needs a reviewed predecessor. A matching CoreException supplies its own pinned predecessor.
      * - f2223839…: HEAD AuthenticatedApiService.kt, KRX only in the comment at :348 (graph catalog kdoc).
      * - e4662299…: HEAD AlertRepository.kt, KRX only in the comment at :49 (source alerts kdoc).
      * - a3ac34d8…: 05382fa9 PremiumTopicRoute.kt, no KRX at all (comments included).
@@ -81,6 +81,8 @@ internal object PostS6ApprovedDelta {
      * - 3d85219d…: 889dde0b PremiumTopicScreen.kt (S7-c's change), no KRX at all (comments included).
      * - b3812b74…: 889dde0b PremiumTopicPresenter.kt (S7-E5b3b's change), no KRX at all (comments included).
      * - 2e51b6b7…: 707c3c4e BankAlertSettingsOwner.kt (S7-E5b4b's change), no KRX at all (comments included).
+     * - dc822aa9…: 6d85e9ec AlertFamilyRefresherRegistry.kt (S8-4a's change), no KRX at all (comments included).
+     * - 41466b59…: 6d85e9ec SourceAlertSettingsOwner.kt (S8-5a's change), no KRX at all (comments included).
      */
     val NO_KRX_REVIEWED = setOf(
         "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
@@ -137,7 +139,9 @@ internal object PostS6ApprovedDelta {
         "c310135ef3cff7c3514e55d836ead1a1803eee7ed4469a21433ee66975ea630d",
         "3d85219d9aae8b60ed1944561f3c4d34f998c6994b1d050f9e32c79c856bda18",
         "b3812b742ab0764a699b9fa85e7fc151acdce8f76e8701b3c315a5af8b18e84c",
-        "2e51b6b745b703fefae21a5bb2b83373418c5d2015a1936f5011960cef99dfc4"
+        "2e51b6b745b703fefae21a5bb2b83373418c5d2015a1936f5011960cef99dfc4",
+        "dc822aa9712d8af9a1af3e223e97a7504915754d27e114ac742c608cfd655386",
+        "41466b5904443e45f5d7519868fd3da424cbda9852094b45e4c1a13a90dd4f4d"
     )
 
     /**
@@ -155,6 +159,9 @@ internal object PostS6ApprovedDelta {
      * - S7-E5c (`R4c/S7/s7e5/s7e5c_exact_proposal.claude.r3.md` d92df63a…, user decision `R4c/S7/user_decision_s7e5c.r1.md` D1/D2
      *   with its errata): FXiMessagingService.kt again, its second link from S7-N1's to (the raw setting_id/is_repeat hand-over and
      *   the app-made notification's is_repeat), and MainActivity.kt, its first link (the OFF parser's deliverTap and is_repeat removal).
+     * - S8-6 (`R4c/S8/user_decision_s8_6.r1.md` 2b73b32b…, the user's decision delegated to Claude·Codex, both A):
+     *   FXiMessagingService.kt, its third link (the exchange source push before the emit, published only while admitted), and
+     *   MainActivity.kt, its second link (the OFF parser's source tap consumed first).
      */
     class CoreException(val unitId: String, val sourceParent: String, val approvalRecordSha256: String, val path: String,
         val from: String, val to: String, val krxLinesSha256: String)
@@ -204,6 +211,24 @@ internal object PostS6ApprovedDelta {
             from = "29d3e6c4d779b3e3bd8c0d1414547f9228adef74dff6d499410cbe79a1adca82",
             to = "363279e89b869c63f4c5a7e59dff81db858e5cb00da41ec9fd3d6f00aba3854b",
             krxLinesSha256 = "e61ab21d19206fde24d0b2a8d74e0e75def7397c1ac1d3be33f8514b07b725aa"
+        ),
+        CoreException(
+            unitId = "S8-6",
+            sourceParent = "6d85e9ec25711eab2b839d39f2e429db019f8e81",
+            approvalRecordSha256 = "2b73b32b65a5b9df5f685a7a014e61211c3af90c3f6e9ec2f0a112d483417875",
+            path = BASE + "service/FXiMessagingService.kt",
+            from = "8f05d0470162f67573e29499f54ce0de6028f9e863dbea1aee36b4a5588d5ee6",
+            to = "3ab46e30fff43339bd09c4a5cde8fc0c0d429cfde93065d9fa086ac07a0a575a",
+            krxLinesSha256 = "08e142a551e0e47752a09853de243aa65b727b5863c75171d1cb7157ece13d02"
+        ),
+        CoreException(
+            unitId = "S8-6",
+            sourceParent = "6d85e9ec25711eab2b839d39f2e429db019f8e81",
+            approvalRecordSha256 = "2b73b32b65a5b9df5f685a7a014e61211c3af90c3f6e9ec2f0a112d483417875",
+            path = BASE + "MainActivity.kt",
+            from = "363279e89b869c63f4c5a7e59dff81db858e5cb00da41ec9fd3d6f00aba3854b",
+            to = "3328908334f4388686891812483df4fe7ba3d043aa7b6f969850c6d670230de5",
+            krxLinesSha256 = "e61ab21d19206fde24d0b2a8d74e0e75def7397c1ac1d3be33f8514b07b725aa"
         )
     )
 
@@ -219,7 +244,7 @@ internal object PostS6ApprovedDelta {
     fun krxLinesSha256(source: String): String =
         sha(codeAndStrings(source).split("\n").filter { KRX.containsMatchIn(it) }.joinToString("\n") { it.trim() }.toByteArray(Charsets.UTF_8))
 
-    /** S6's own approved and core surfaces: never changed through this ledger. */
+    /** S6's own approved and core surfaces: changes require an exact CoreException. */
     val FORBIDDEN_PATHS: Set<String> = S6Krx3bOffWiringContractTest.ALLOWED + S6Krx3bOffWiringContractTest.S64A_DELTA +
         S64bFixtureDelta.CHANGED + S64bFixtureDelta.ADDED + S6Krx3cOffContractTest.NORMAL
     val FORBIDDEN_PREFIXES: List<String> = listOf(
@@ -255,7 +280,7 @@ internal object PostS6ApprovedDelta {
         return stream!!.use { it.readBytes() }
     }
 
-    /** The approved span list, validated byte for byte against its pin before any use; no list at all on any error. */
+    /** Parses the approved span list; a null [expectedPin] skips only the pin check (the default checks it). Any error yields no list. */
     fun o04sApproved(raw: ByteArray, expectedPin: String? = O04S_APPROVED_SHA256): Pair<List<String>, Map<String, O04sApproval>?> {
         val out = mutableListOf<String>()
         if (expectedPin != null && sha(raw) != expectedPin) out += "o04s-pin"
@@ -280,15 +305,21 @@ internal object PostS6ApprovedDelta {
     }
 
     /**
-     * O04s's byte rule for one span: its exact frozen raw, unless the approved list names it; then its UTF-8 bytes hash to the
-     * approved value and the frozen raw is the very one the list and the 0302 index both name.
+     * O04s's byte rule for one span: an unlisted span must equal its frozen raw. A listed span's frozen raw must hash to the value
+     * the list and the 0302 index both name, and its UTF-8 bytes must hash to the listed approved value; for the parser the listed
+     * value must be the pinned S7-E5c predecessor and the bytes must hash to the pinned S8-6 successor instead.
      */
     fun o04sSpanErrors(id: String, frozen: ByteArray, indexSha256: String?, actual: String, approvals: Map<String, O04sApproval>): List<String> {
         val approval = approvals[id]
             ?: return if (frozen.contentEquals(actual.toByteArray(Charsets.UTF_8))) emptyList() else listOf("o04s-bytes $id")
         val out = mutableListOf<String>()
         if (sha(frozen) != approval.frozenSha256 || indexSha256 != approval.frozenSha256) out += "o04s-frozen $id"
-        if (sha(actual.toByteArray(Charsets.UTF_8)) != approval.approvedSha256) out += "o04s-approved $id"
+        // S8-6 follows exactly the pinned S7-E5c parser. All other spans keep their original rule.
+        val expected = if (id == "parser") {
+            if (approval.approvedSha256 != "22b20e12bc0f2bc72b2ca4a23058dc2ba7ea7d665e29f29e172032e6b38aa8b8") return out + "o04s-predecessor $id"
+            "78aa21b1a2c6a6dfc220cca0d32fbad2b4c6ef344ac261c790834be2dfc1a4d3"
+        } else approval.approvedSha256
+        if (sha(actual.toByteArray(Charsets.UTF_8)) != expected) out += "o04s-approved $id"
         return out
     }
 
@@ -383,7 +414,7 @@ internal object PostS6ApprovedDelta {
         return out to Ledger(original, original.keys.associateWith { current.getValue(it) }, lastFrom)
     }
 
-    /** Error codes for the actual sources against [ledger]: every approved path present, regular, at its final bytes, KRX-free. */
+    /** Error codes for the actual sources against [ledger]: every approved path present, regular, at its final bytes, with its comment-free KRX lines pinned when its last link is a core exception and no KRX reference outside comments otherwise. */
     fun actualErrors(ledger: Ledger, actual: Map<String, ByteArray>, appRoot: File = File(".")): List<String> {
         val out = mutableListOf<String>()
         for ((path, want) in ledger.final) {

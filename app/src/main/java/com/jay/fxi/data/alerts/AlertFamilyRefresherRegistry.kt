@@ -12,6 +12,11 @@ import com.jay.fxi.data.auth.AuthTokenProvider
 import com.jay.fxi.data.entitlements.OwnedPremiumAccess
 import com.jay.fxi.data.entitlements.PremiumAccessCoordinator
 import com.jay.fxi.data.entitlements.confirmsPremiumFor
+import com.jay.fxi.data.remote.TopicRuntimeOwner
+import com.jay.fxi.data.remote.TopicUseAuthority
+import com.jay.fxi.service.AlertTapCodec
+import com.jay.fxi.service.AlertTapExtraKind
+import com.jay.fxi.service.AlertTapExtras
 import com.jay.fxi.service.AlertEvent
 import com.jay.fxi.service.AlertFamily
 import com.jay.fxi.service.NotificationCapabilityMonitor
@@ -37,6 +42,13 @@ internal interface AlertFamilyAdapter : AlertLifecycleAdapter {
     fun onBankPush(id: Int?, isRepeat: String?) {}
 }
 
+internal data class SourceAlertDelivery(
+    val source: String,
+    val asset: String,
+    val id: Int?,
+    val repeat: String?
+)
+
 @Singleton
 internal class AlertFamilyRefresherRegistry internal constructor(
     private val families: List<() -> AlertLifecycleAdapter>,
@@ -49,7 +61,8 @@ internal class AlertFamilyRefresherRegistry internal constructor(
         Log.w(TAG, "alert family adapter dispatch failed")
         Unit
     },
-    private val foregroundHooks: List<() -> Unit> = emptyList()
+    private val foregroundHooks: List<() -> Unit> = emptyList(),
+    private var captureSourceUse: () -> AlertSettingsUse? = { null }
 ) {
     @Inject constructor(
         bank: Provider<BankAlertSettingsOwner>,
@@ -66,6 +79,15 @@ internal class AlertFamilyRefresherRegistry internal constructor(
         CoroutineScope(SupervisorJob() + Dispatchers.Main),
         foregroundHooks = listOf({ capability.get().onForeground() })
     )
+
+    @Inject
+    internal fun bindSourceUse(topic: TopicRuntimeOwner, uses: TopicUseAuthority, access: AlertSettingsAccess) {
+        captureSourceUse = capture@{
+            val fence = topic.currentAccessFence() ?: return@capture null
+            val lifetime = uses.acquire(fence) ?: return@capture null
+            AlertSettingsUse(fence.identity, fence, lifetime).takeIf(access::admits)
+        }
+    }
 
     private var started = false
     private var foreground: Boolean? = null
@@ -122,6 +144,22 @@ internal class AlertFamilyRefresherRegistry internal constructor(
         postToMain { dispatch { (it as? AlertFamilyAdapter)?.onBankPush(id, isRepeat) } }
     }
 
+    private fun deliverSource(event: SourceAlertDelivery, publish: ((() -> Boolean) -> Unit)?) {
+        val use = captureSourceUse() ?: return
+        val deliver: () -> Unit = action@{
+            try {
+                val owner = adapters.filterIsInstance<SourceAlertSettingsOwner>().singleOrNull() ?: return@action
+                if (publish != null && foreground != true) return@action
+                if (!owner.admitsDelivery(use)) return@action
+                owner.onSourceDelivery(event, use)
+                if (publish != null && owner.admitsDelivery(use)) publish { foreground == true && owner.admitsDelivery(use) }
+            } catch (failure: Exception) {
+                reportFailure()
+            }
+        }
+        if (publish == null) deliver() else postToMain(deliver)
+    }
+
     private fun setForeground(value: Boolean) {
         if (foreground == value) return
         foreground = value
@@ -156,6 +194,50 @@ internal class AlertFamilyRefresherRegistry internal constructor(
         private const val TAG = "AlertFamilies"
         const val SYNC_ALERTS = "sync_alerts"
         const val RATE_ALERT = "rate_alert"
+        const val SOURCE_RATE_ALERT = "source_rate_alert"
+
+        private fun acceptSource(
+            source: String?, asset: String?, id: Int?, repeat: String?,
+            resolve: () -> AlertFamilyRefresherRegistry, publish: ((() -> Boolean) -> Unit)?
+        ) {
+            if (source == null || asset == null || !SourceAlertRowPolicy.EXCHANGES.admits(source, asset)) return
+            try {
+                resolve().deliverSource(SourceAlertDelivery(source, asset, id, repeat), publish)
+            } catch (failure: Exception) {
+                Log.w(TAG, "source alert delivery failed")
+            }
+        }
+
+        fun deliverSourcePush(
+            data: Map<String, String>, resolve: () -> AlertFamilyRefresherRegistry, publish: (() -> Boolean) -> Unit
+        ) {
+            if (data["type"] != SOURCE_RATE_ALERT) return
+            acceptSource(data["source"], data["asset"], data["setting_id"]?.toIntOrNull(), data["is_repeat"], resolve, publish)
+        }
+
+        fun consumeSourceTap(extras: AlertTapExtras, gateOpen: Boolean, resolve: () -> AlertFamilyRefresherRegistry): Boolean {
+            fun string(key: String): String? = if (extras.kind(key) == AlertTapExtraKind.STRING) extras.readString(key) else null
+            val custom = string(AlertTapCodec.CUSTOM_TYPE)
+            val server = string(AlertTapCodec.SERVER_TYPE)
+            if (custom != SOURCE_RATE_ALERT && server != SOURCE_RATE_ALERT) return false
+            try {
+                fun agrees(key: String, value: String?) =
+                    extras.kind(key) == AlertTapExtraKind.MISSING || value == SOURCE_RATE_ALERT
+                if (gateOpen && agrees(AlertTapCodec.CUSTOM_TYPE, custom) && agrees(AlertTapCodec.SERVER_TYPE, server)) {
+                    val id = when (extras.kind(AlertTapCodec.CUSTOM_ID)) {
+                        AlertTapExtraKind.INT -> extras.readInt(AlertTapCodec.CUSTOM_ID, -1)
+                        AlertTapExtraKind.STRING -> extras.readString(AlertTapCodec.CUSTOM_ID)?.toIntOrNull()
+                        else -> null
+                    }
+                    acceptSource(string("source"), string("asset"), id,
+                        string("is_repeat"), resolve, null)
+                }
+            } finally {
+                for (key in listOf(AlertTapCodec.CUSTOM_TYPE, AlertTapCodec.SERVER_TYPE, AlertTapCodec.CUSTOM_ID,
+                        "is_repeat", "source", "asset")) extras.remove(key)
+            }
+            return true
+        }
 
         fun deliverPush(
             type: String,

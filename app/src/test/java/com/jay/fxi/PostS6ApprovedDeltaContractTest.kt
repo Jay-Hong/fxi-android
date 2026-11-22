@@ -74,7 +74,7 @@ class PostS6ApprovedDeltaContractTest {
     @Test fun P01_theApprovedLedgerValidates_andMatchesTheActualSourcesExactly() {
         assertEquals("the pin is the manifest's bytes", PostS6ApprovedDelta.APPROVED_SHA256, PostS6ApprovedDelta.sha(raw))
         val ledger = PostS6ApprovedDelta.ledger()
-        assertEquals("exactly the approved S7-a, S7-b, S7-c, S7-N1, S7-E5a1, S7-E5a2, S7-E5c, S7-E5b2a, S7-E5b2b1, S7-E5b3a, S7-E5b3b, S7-E5b4a, S7-E5b4b, S7-E5d, S8-2, S8-3, S8-4a, S8-4b, S8-5a, S8-5b and S8-5c paths (S7-E5b2b2, S7-E5b3b, S7-E5b4b, S7-E5d, S8-2, S8-3, S8-4a, S8-4b, S8-5a, S8-5b and S8-5c change earlier ones again)",
+        assertEquals("the folded ledger contains exactly the expected production paths through S8-6",
             setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport + activity +
                 pushManager + pushCoordinator + e5b2aAdded + settingsScreen + e5b2b1Added + alertSheet + e5b3aAdded + e5b3bNew +
                 rateRowStore + e5b4aAdded + cacheService + e5b4bAdded + e5dNew + e5dAdded + s83Added + s84aAdded + s84bAdded + s85bAdded,
@@ -107,6 +107,11 @@ class PostS6ApprovedDeltaContractTest {
         assertEquals("the bank owner has the current file's bytes", actual.getValue(s85cOwner), ledger.final.getValue(s85cOwner))
         assertEquals("the bank owner ends with the S8-5c from", s85c.getValue("changed").jsonObject.getValue(s85cOwner).jsonObject.str("from"),
             ledger.lastFrom.getValue(s85cOwner))
+        for (path in s86Changed.keys) {
+            assertEquals("$path has the current file's bytes", actual.getValue(path), ledger.final.getValue(path))
+            assertEquals("$path ends with the S8-6 from", s86.getValue("changed").jsonObject.getValue(path).jsonObject.str("from"),
+                ledger.lastFrom.getValue(path))
+        }
         val projected = PostS6ApprovedDelta.project(actual, ledger)
         assertEquals("changed paths go back to their history", productBase.getValue(api), projected[api])
         assertEquals(productBase.getValue(repo), projected[repo])
@@ -463,8 +468,9 @@ class PostS6ApprovedDeltaContractTest {
     private fun unitsWithN1(changedN1: JsonObject) = withUnits(unit(0), unit(1), unit(2), changedN1)
 
     @Test fun E11_theN1CoreExceptionValidates_andItsKrxLinesAreTheReviewedOnes() {
-        assertEquals("the exceptions in unit order: S7-E5c continues the service and first changes the activity",
-            listOf("S7-c" to owner, "S7-N1" to messaging, "S7-E5a2" to transport, "S7-E5c" to messaging, "S7-E5c" to activity),
+        assertEquals("the exceptions in unit order: S7-E5c continues the service and first changes the activity, S8-6 continues both",
+            listOf("S7-c" to owner, "S7-N1" to messaging, "S7-E5a2" to transport, "S7-E5c" to messaging, "S7-E5c" to activity,
+                "S8-6" to messaging, "S8-6" to activity),
             PostS6ApprovedDelta.CORE_EXCEPTIONS.map { it.unitId to it.path })
         val core = PostS6ApprovedDelta.CORE_EXCEPTIONS.single { it.unitId == "S7-N1" && it.path == messaging }
         assertEquals("premise: the fourth unit is S7-N1", "S7-N1", n1.str("id"))
@@ -708,17 +714,22 @@ class PostS6ApprovedDeltaContractTest {
         assertEquals("the activity's reviewed KRX lines", "e61ab21d19206fde24d0b2a8d74e0e75def7397c1ac1d3be33f8514b07b725aa",
             e5cCores.first { it.path == activity }.krxLinesSha256)
         val ledger = PostS6ApprovedDelta.ledger()
-        assertEquals("the service's last from is S7-E5c's real from, its original the product base",
-            listOf(n1Core.to, productBase.getValue(messaging)), listOf(ledger.lastFrom[messaging], ledger.original[messaging]))
-        assertEquals("the activity's last from and original are its product base",
-            listOf(productBase.getValue(activity), productBase.getValue(activity)), listOf(ledger.lastFrom[activity], ledger.original[activity]))
+        // S8-6 continues both paths from S7-E5c's to through its own CoreException; the history origin is unchanged.
+        val s86Core = { path: String -> PostS6ApprovedDelta.CORE_EXCEPTIONS.single { it.unitId == "S8-6" && it.path == path } }
+        assertEquals("the service's last from is S8-6's real from (S7-E5c's to), its original the product base",
+            listOf(e5cCores.first { it.path == messaging }.to, s86Core(messaging).from, productBase.getValue(messaging)),
+            listOf(ledger.lastFrom[messaging], ledger.lastFrom[messaging], ledger.original[messaging]))
+        assertEquals("the activity's last from is S8-6's real from (S7-E5c's to), its original the product base",
+            listOf(e5cCores.first { it.path == activity }.to, s86Core(activity).from, productBase.getValue(activity)),
+            listOf(ledger.lastFrom[activity], ledger.lastFrom[activity], ledger.original[activity]))
         val lastRegistryChange = json.getValue("units").jsonArray.map { it.jsonObject }.last { registry in it.getValue("changed").jsonObject }
         assertEquals("an added path's last from is its last change's from",
             lastRegistryChange.getValue("changed").jsonObject.getValue(registry).jsonObject.str("from"), ledger.lastFrom[registry])
         assertEquals("and it stays an addition in history", null, ledger.original[registry])
         assertEquals(emptyList<String>(), PostS6ApprovedDelta.actualErrors(ledger, PostS6ApprovedDelta.actualSources()))
         // The cumulative original→final pair is no exception: a hand-built ledger that names it gets no KRX pass.
-        val cumulative = PostS6ApprovedDelta.Ledger(mapOf(messaging to productBase.getValue(messaging)), mapOf(messaging to e5cEntry(messaging).str("to")))
+        // The checkout's final bytes (S8-6's to, after S7-E5c's link) under the cumulative pair: only the KRX rule can refuse it.
+        val cumulative = PostS6ApprovedDelta.Ledger(mapOf(messaging to productBase.getValue(messaging)), mapOf(messaging to ledger.final.getValue(messaging)))
         assertEquals("the synthetic pair is KRX-checked as any path", listOf("krx-reference $messaging"),
             PostS6ApprovedDelta.actualErrors(cumulative, PostS6ApprovedDelta.actualSources()))
     }
@@ -1617,7 +1628,7 @@ class PostS6ApprovedDeltaContractTest {
     private fun unitsWithS85c(changedS85c: JsonObject) = withUnits(*((0..21).map { unit(it) } + changedS85c).toTypedArray())
 
     @Test fun E78_theS85cUnitIsExact_andContinuesTheBankOwnerFromItsLastWriter() {
-        assertEquals("premise: the twenty-third and last unit is S8-5c", listOf("S8-5c", 23), listOf(s85c.str("id"), json.getValue("units").jsonArray.size))
+        assertEquals("premise: the twenty-third unit is S8-5c", "S8-5c", s85c.str("id"))
         assertEquals("its parent is the S8-5b commit and its record the agreed S8-5c scope",
             listOf(s85cParent, s85cApproval), listOf(s85c.str("source_parent"), s85c.str("approval_record_sha256")))
         val changed = s85c.getValue("changed").jsonObject
@@ -1672,5 +1683,91 @@ class PostS6ApprovedDeltaContractTest {
         assertEquals("the bank owner at other bytes is refused", listOf("actual-hash $s85cOwner"),
             PostS6ApprovedDelta.actualErrors(ledger, actual + (s85cOwner to actual.getValue(s85cOwner) + byteArrayOf(10))))
         assertEquals("the bank owner missing is refused", listOf("missing $s85cOwner"), PostS6ApprovedDelta.actualErrors(ledger, actual - s85cOwner))
+    }
+
+    // ---- S8-6: the exchange source push and the KRX-switch-OFF tap (R4c/S8/user_decision_s8_6.r1.md), two protected links ----
+
+    private val s86 get() = unit(23)
+    /** The S8-5c commit this unit branches from. */
+    private val s86Parent = "6d85e9ec25711eab2b839d39f2e429db019f8e81"
+    /** R4c/S8/user_decision_s8_6.r1.md: the user's decision delegated to Claude·Codex, both A, binding decision 4's protected diff. */
+    private val s86Approval = "2b73b32b65a5b9df5f685a7a014e61211c3af90c3f6e9ec2f0a112d483417875"
+    /** Each changed path and the unit that last wrote it before S8-6. */
+    private val s86Changed = mapOf(messaging to "S7-E5c", activity to "S7-E5c", registry to "S8-4a",
+        base + "data/alerts/SourceAlertSettingsOwner.kt" to "S8-5a")
+    private val s86Protected = setOf(messaging, activity)
+    private val s86Cores get() = PostS6ApprovedDelta.CORE_EXCEPTIONS.filter { it.unitId == "S8-6" }
+    private fun s86Entry(path: String) = s86.getValue("changed").jsonObject.getValue(path).jsonObject
+    private fun s86With(path: String, entry: JsonObject) = s86.with("changed", JsonObject(s86.getValue("changed").jsonObject + (path to entry)))
+    private fun unitsWithS86(changedS86: JsonObject) = withUnits(*((0..22).map { unit(it) } + changedS86).toTypedArray())
+
+    @Test fun E80_theS86UnitIsExact_continuesEachChain_andItsTwoProtectedLinksAreItsOwnExceptions() {
+        assertEquals("premise: the twenty-fourth and last unit is S8-6", listOf("S8-6", 24), listOf(s86.str("id"), json.getValue("units").jsonArray.size))
+        assertEquals("its parent is the S8-5c commit and its record the delegated decision",
+            listOf(s86Parent, s86Approval), listOf(s86.str("source_parent"), s86.str("approval_record_sha256")))
+        assertEquals("the service, the activity, the registry and the source owner change", s86Changed.keys, s86.getValue("changed").jsonObject.keys)
+        assertEquals("and nothing is added", emptySet<String>(), s86.getValue("added").jsonObject.keys)
+        val earlier = (0..22).map { unit(it) }
+        for ((path, writer) in s86Changed) {
+            val previous = earlier.lastOrNull { path in it.getValue("changed").jsonObject.keys || path in it.getValue("added").jsonObject.keys }
+            assertEquals("premise: $writer last wrote $path", writer, previous?.str("id"))
+            assertEquals("$path continues from $writer", checkNotNull(previous).getValue("changed").jsonObject.getValue(path).jsonObject.str("to"),
+                s86Entry(path).str("from"))
+        }
+        for (path in s86Changed.keys - s86Protected) {
+            assertTrue("$path: the bytes before S8-6 are reviewed KRX-free", s86Entry(path).str("from") in PostS6ApprovedDelta.NO_KRX_REVIEWED)
+            assertFalse("$path is no forbidden S6 surface", path in PostS6ApprovedDelta.FORBIDDEN_PATHS ||
+                PostS6ApprovedDelta.FORBIDDEN_PREFIXES.any { path.startsWith(it) })
+        }
+        assertEquals("two exceptions, the service and the activity", listOf(messaging, activity), s86Cores.map { it.path })
+        for (core in s86Cores) {
+            val entry = s86Entry(core.path)
+            assertEquals("${core.path}: the exception is this unit's exact link", listOf(s86Parent, s86Approval, entry.str("from"), entry.str("to")),
+                listOf(core.sourceParent, core.approvalRecordSha256, core.from, core.to))
+            assertTrue("premise: ${core.path} is a forbidden S6 surface", core.path in PostS6ApprovedDelta.FORBIDDEN_PATHS)
+            assertEquals("${core.path}: the KRX lines are S7-E5c's, unchanged",
+                PostS6ApprovedDelta.CORE_EXCEPTIONS.single { it.unitId == "S7-E5c" && it.path == core.path }.krxLinesSha256, core.krxLinesSha256)
+            assertEquals("${core.path}: the final bytes keep the pinned KRX lines", core.krxLinesSha256,
+                PostS6ApprovedDelta.krxLinesSha256(File(core.path).readText()))
+        }
+        assertEquals(emptyList<String>(), errors(json))
+    }
+
+    @Test fun E81_theS86UnitRefusesAnotherLinkForAProtectedPath_aBrokenGeneralFrom_andAlteredBytes() {
+        val (control, controlLedger) = PostS6ApprovedDelta.parse(unitsWithS86(s86).toString().toByteArray(), inventory, s64b, null)
+        assertEquals("premise: the unaltered S8-6 unit validates", emptyList<String>(), control)
+        assertTrue("premise: and folds a ledger", controlLedger != null)
+        for (path in s86Protected) {
+            val entry = s86Entry(path)
+            for ((label, other) in listOf(
+                "another id" to s86.with("id", JsonPrimitive("S8-7")),
+                "another parent" to s86.with("source_parent", JsonPrimitive("1".repeat(40))),
+                "another approval" to s86.with("approval_record_sha256", JsonPrimitive(someHash)),
+                "another to" to s86With(path, changedEntry(entry.str("from"), someHash))
+            )) {
+                assertTrue("$path $label", errors(unitsWithS86(other)).contains("forbidden $path"))
+            }
+        }
+        for (path in s86Changed.keys - s86Protected) {
+            val broken = s86With(path, changedEntry(someHash, s86Entry(path).str("to")))
+            assertEquals("another from on $path: the broken link and the unreviewed history",
+                listOf("from $path", "krx-before-unreviewed $path"), errors(unitsWithS86(broken)))
+        }
+        val forbiddenAdd = base + "data/entitlements/S86Probe.kt"
+        val withForbidden = s86.with("added", JsonObject(mapOf(forbiddenAdd to JsonPrimitive(someHash))))
+        assertTrue("an addition under a forbidden prefix", errors(unitsWithS86(withForbidden)).contains("forbidden $forbiddenAdd"))
+        val ledger = PostS6ApprovedDelta.ledger()
+        val actual = PostS6ApprovedDelta.actualSources()
+        val later = (24 until json.getValue("units").jsonArray.size).map { unit(it) }
+        val (omissionErrors, omissionLedger) = PostS6ApprovedDelta.parse(
+            withUnits(*((0..22).map { unit(it) } + later).toTypedArray()).toString().toByteArray(), inventory, s64b, null)
+        assertEquals("omitting the unit, later units kept, leaves a well-formed history", emptyList<String>(), omissionErrors)
+        assertEquals("the omitted four paths no longer match the checkout", s86Changed.keys.map { "actual-hash $it" }.sorted(),
+            PostS6ApprovedDelta.actualErrors(checkNotNull(omissionLedger), actual).sorted())
+        for (path in s86Changed.keys) {
+            assertEquals("$path at other bytes is refused", listOf("actual-hash $path"),
+                PostS6ApprovedDelta.actualErrors(ledger, actual + (path to actual.getValue(path) + byteArrayOf(10))))
+            assertEquals("$path missing is refused", listOf("missing $path"), PostS6ApprovedDelta.actualErrors(ledger, actual - path))
+        }
     }
 }
