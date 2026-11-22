@@ -186,8 +186,11 @@ jobs:
           python3 tools/performance/benchmark_gate.py check-fixtures \
             tools/performance/fixtures/gate-cases.json
 
+      # lintDebug의 세 분석(lintAnalyzeDebug·DebugAndroidTest·DebugUnitTest)이 로그에 거의 같은 시각에 기록된 뒤 Gradle
+      # 프로세스 안의 lint 분석이 Java heap space로 실패한 기록이 두 번 있다(707c3c4e·c625b660 각 attempt 1, 실패 작업 재실행은
+      # 통과). 원인은 분석의 동시 실행으로 추정하며, 이 호출만 worker를 하나로 제한한다. 로컬과 다른 단계의 설정은 그대로다.
       - name: Lint
-        run: ./gradlew lintDebug
+        run: ./gradlew lintDebug --max-workers=1
 
       - name: Debug compile
         run: ./gradlew assembleDebug
