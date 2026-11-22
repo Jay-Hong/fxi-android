@@ -74,7 +74,7 @@ class PostS6ApprovedDeltaContractTest {
     @Test fun P01_theApprovedLedgerValidates_andMatchesTheActualSourcesExactly() {
         assertEquals("the pin is the manifest's bytes", PostS6ApprovedDelta.APPROVED_SHA256, PostS6ApprovedDelta.sha(raw))
         val ledger = PostS6ApprovedDelta.ledger()
-        assertEquals("exactly the approved S7-a, S7-b, S7-c, S7-N1, S7-E5a1, S7-E5a2, S7-E5c, S7-E5b2a, S7-E5b2b1, S7-E5b3a, S7-E5b3b, S7-E5b4a, S7-E5b4b, S7-E5d, S8-2, S8-3, S8-4a, S8-4b, S8-5a and S8-5b paths (S7-E5b2b2, S7-E5b3b, S7-E5b4b, S7-E5d, S8-2, S8-3, S8-4a, S8-4b, S8-5a and S8-5b change earlier ones again)",
+        assertEquals("exactly the approved S7-a, S7-b, S7-c, S7-N1, S7-E5a1, S7-E5a2, S7-E5c, S7-E5b2a, S7-E5b2b1, S7-E5b3a, S7-E5b3b, S7-E5b4a, S7-E5b4b, S7-E5d, S8-2, S8-3, S8-4a, S8-4b, S8-5a, S8-5b and S8-5c paths (S7-E5b2b2, S7-E5b3b, S7-E5b4b, S7-E5d, S8-2, S8-3, S8-4a, S8-4b, S8-5a, S8-5b and S8-5c change earlier ones again)",
             setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport + activity +
                 pushManager + pushCoordinator + e5b2aAdded + settingsScreen + e5b2b1Added + alertSheet + e5b3aAdded + e5b3bNew +
                 rateRowStore + e5b4aAdded + cacheService + e5b4bAdded + e5dNew + e5dAdded + s83Added + s84aAdded + s84bAdded + s85bAdded,
@@ -104,6 +104,9 @@ class PostS6ApprovedDeltaContractTest {
             assertEquals("$path ends with the S8-5b from", changes.getValue(path).jsonObject.str("from"),
                 ledger.lastFrom.getValue(path))
         }
+        assertEquals("the bank owner has the current file's bytes", actual.getValue(s85cOwner), ledger.final.getValue(s85cOwner))
+        assertEquals("the bank owner ends with the S8-5c from", s85c.getValue("changed").jsonObject.getValue(s85cOwner).jsonObject.str("from"),
+            ledger.lastFrom.getValue(s85cOwner))
         val projected = PostS6ApprovedDelta.project(actual, ledger)
         assertEquals("changed paths go back to their history", productBase.getValue(api), projected[api])
         assertEquals(productBase.getValue(repo), projected[repo])
@@ -1530,7 +1533,7 @@ class PostS6ApprovedDeltaContractTest {
     private fun unitsWithS85b(changedS85b: JsonObject) = withUnits(*((0..20).map { unit(it) } + changedS85b).toTypedArray())
 
     @Test fun E76_theS85bUnitIsExact_andContinuesEachChainFromItsLastWriter() {
-        assertEquals("premise: the twenty-second and last unit is S8-5b", listOf("S8-5b", 22), listOf(s85b.str("id"), json.getValue("units").jsonArray.size))
+        assertEquals("premise: the twenty-second unit is S8-5b", "S8-5b", s85b.str("id"))
         assertEquals("its parent is the S8-5a commit and its record the agreed S7·S8 decisions",
             listOf(s85bParent, s82Approval), listOf(s85b.str("source_parent"), s85b.str("approval_record_sha256")))
         val changed = s85b.getValue("changed").jsonObject
@@ -1578,8 +1581,10 @@ class PostS6ApprovedDeltaContractTest {
         val actual = PostS6ApprovedDelta.actualSources()
         val presenter = base + "ui/premium/PremiumTopicPresenter.kt"
         val withoutPresenter = s85b.with("changed", JsonObject(changed - presenter))
+        // Every later unit stays, so the omitted presenter is the only path the checkout no longer matches.
+        val later = (22 until json.getValue("units").jsonArray.size).map { unit(it) }
         val (omissionErrors, omissionLedger) = PostS6ApprovedDelta.parse(
-            unitsWithS85b(withoutPresenter).toString().toByteArray(), inventory, s64b, null)
+            withUnits(*((0..20).map { unit(it) } + withoutPresenter + later).toTypedArray()).toString().toByteArray(), inventory, s64b, null)
         assertEquals("omitting a change leaves a well-formed history", emptyList<String>(), omissionErrors)
         assertEquals("the omitted presenter no longer matches the checkout", listOf("actual-hash $presenter"),
             PostS6ApprovedDelta.actualErrors(checkNotNull(omissionLedger), actual))
@@ -1599,5 +1604,73 @@ class PostS6ApprovedDeltaContractTest {
                 PostS6ApprovedDelta.actualErrors(ledger, actual + (path to actual.getValue(path) + byteArrayOf(10))))
             assertEquals("$path missing is refused", listOf("missing $path"), PostS6ApprovedDelta.actualErrors(ledger, actual - path))
         }
+    }
+
+    // ---- S8-5c: a bank toggle's acceptance outdates an older GET (s8_5c_scope agreed), the bank owner changed again, no addition ----
+
+    private val s85c get() = unit(22)
+    /** The S8-5b commit this unit branches from. */
+    private val s85cParent = "707c3c4e3264163fea8552404aa1cc26b98915c6"
+    /** R4c/S8/s8_5c_scope.agreed.record.r1.md, the Claude·Codex scope agreement under the S6 freeze decision A §4. */
+    private val s85cApproval = "8932b861e56a63c32bbbcdcfc018e6ce9859b2d30e802bef9934e4a1d06b7bbc"
+    private val s85cOwner = base + "data/alerts/BankAlertSettingsOwner.kt"
+    private fun unitsWithS85c(changedS85c: JsonObject) = withUnits(*((0..21).map { unit(it) } + changedS85c).toTypedArray())
+
+    @Test fun E78_theS85cUnitIsExact_andContinuesTheBankOwnerFromItsLastWriter() {
+        assertEquals("premise: the twenty-third and last unit is S8-5c", listOf("S8-5c", 23), listOf(s85c.str("id"), json.getValue("units").jsonArray.size))
+        assertEquals("its parent is the S8-5b commit and its record the agreed S8-5c scope",
+            listOf(s85cParent, s85cApproval), listOf(s85c.str("source_parent"), s85c.str("approval_record_sha256")))
+        val changed = s85c.getValue("changed").jsonObject
+        assertEquals("only the bank owner changes", setOf(s85cOwner), changed.keys)
+        assertEquals("and nothing is added", emptySet<String>(), s85c.getValue("added").jsonObject.keys)
+        val earlier = (0..21).map { unit(it) }
+        val previous = earlier.lastOrNull { s85cOwner in it.getValue("changed").jsonObject.keys || s85cOwner in it.getValue("added").jsonObject.keys }
+        assertEquals("premise: S7-E5b4b last wrote the bank owner", "S7-E5b4b", previous?.str("id"))
+        assertEquals("the bank owner continues from S7-E5b4b", checkNotNull(previous).getValue("changed").jsonObject.getValue(s85cOwner).jsonObject.str("to"),
+            changed.getValue(s85cOwner).jsonObject.str("from"))
+        assertTrue("the bytes before S8-5c are reviewed KRX-free", changed.getValue(s85cOwner).jsonObject.str("from") in PostS6ApprovedDelta.NO_KRX_REVIEWED)
+        assertFalse("the bank owner is no forbidden S6 surface", s85cOwner in PostS6ApprovedDelta.FORBIDDEN_PATHS ||
+            PostS6ApprovedDelta.FORBIDDEN_PREFIXES.any { s85cOwner.startsWith(it) })
+        assertTrue("no core exception belongs to S8-5c", PostS6ApprovedDelta.CORE_EXCEPTIONS.none { it.unitId == "S8-5c" })
+        assertEquals(emptyList<String>(), errors(json))
+    }
+
+    @Test fun E79_theS85cUnitRefusesABrokenOrStaleFromAForbiddenAdditionAnOmissionAndAlteredBytes() {
+        val changed = s85c.getValue("changed").jsonObject
+        val (control, controlLedger) = PostS6ApprovedDelta.parse(unitsWithS85c(s85c).toString().toByteArray(), inventory, s64b, null)
+        assertEquals("premise: the unaltered S8-5c unit validates", emptyList<String>(), control)
+        assertTrue("premise: and folds a ledger", controlLedger != null)
+        val to = changed.getValue(s85cOwner).jsonObject.str("to")
+        val broken = s85c.with("changed", JsonObject(changed + (s85cOwner to changedEntry(someHash, to))))
+        assertEquals("another from on the bank owner: the broken link and the unreviewed history",
+            listOf("from $s85cOwner", "krx-before-unreviewed $s85cOwner"),
+            PostS6ApprovedDelta.parse(unitsWithS85c(broken).toString().toByteArray(), inventory, s64b, null).first)
+
+        val priorFrom = (0..21).map { unit(it) }.single { it.str("id") == "S7-E5b4b" }
+            .getValue("changed").jsonObject.getValue(s85cOwner).jsonObject.str("from")
+        assertTrue("the earlier bank owner from was reviewed", priorFrom in PostS6ApprovedDelta.NO_KRX_REVIEWED)
+        assertFalse("the earlier from differs from the required predecessor", priorFrom == changed.getValue(s85cOwner).jsonObject.str("from"))
+        val reused = s85c.with("changed", JsonObject(changed + (s85cOwner to changedEntry(priorFrom, to))))
+        assertEquals("a reviewed but stale bank owner from breaks only the chain", listOf("from $s85cOwner"), errors(unitsWithS85c(reused)))
+
+        val forbiddenAdd = base + "data/entitlements/S85cProbe.kt"
+        val withForbidden = s85c.with("added", JsonObject(s85c.getValue("added").jsonObject + (forbiddenAdd to JsonPrimitive(someHash))))
+        assertTrue("an addition under a forbidden prefix",
+            PostS6ApprovedDelta.parse(unitsWithS85c(withForbidden).toString().toByteArray(), inventory, s64b, null).first.contains("forbidden $forbiddenAdd"))
+
+        val actual = PostS6ApprovedDelta.actualSources()
+        assertEquals("a unit without its change is refused", listOf("unit-empty S8-5c"),
+            errors(unitsWithS85c(s85c.with("changed", JsonObject(emptyMap())))))
+        val (omissionErrors, omissionLedger) = PostS6ApprovedDelta.parse(
+            withUnits(*((0..21).map { unit(it) } + (23 until json.getValue("units").jsonArray.size).map { unit(it) }).toTypedArray())
+                .toString().toByteArray(), inventory, s64b, null)
+        assertEquals("omitting the unit, later units kept, leaves a well-formed history", emptyList<String>(), omissionErrors)
+        assertEquals("the omitted bank owner no longer matches the checkout", listOf("actual-hash $s85cOwner"),
+            PostS6ApprovedDelta.actualErrors(checkNotNull(omissionLedger), actual))
+
+        val ledger = PostS6ApprovedDelta.ledger()
+        assertEquals("the bank owner at other bytes is refused", listOf("actual-hash $s85cOwner"),
+            PostS6ApprovedDelta.actualErrors(ledger, actual + (s85cOwner to actual.getValue(s85cOwner) + byteArrayOf(10))))
+        assertEquals("the bank owner missing is refused", listOf("missing $s85cOwner"), PostS6ApprovedDelta.actualErrors(ledger, actual - s85cOwner))
     }
 }

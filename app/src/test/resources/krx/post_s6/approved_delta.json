@@ -469,6 +469,18 @@
         "src/main/java/com/jay/fxi/ui/alert/SourceAlertEditorSheet.kt": "4ef62dc34bd50148a89e35f49b6812b6dcc04dc8b0db0653c5ad5e86e603afbe",
         "src/main/java/com/jay/fxi/data/local/LastSelectedSourceMemory.kt": "1162b4659959380c8ad42c451c0013746f54e9f6da77e2dfedbf3fc799815618"
       }
+    },
+    {
+      "id": "S8-5c",
+      "source_parent": "707c3c4e3264163fea8552404aa1cc26b98915c6",
+      "approval_record_sha256": "8932b861e56a63c32bbbcdcfc018e6ce9859b2d30e802bef9934e4a1d06b7bbc",
+      "changed": {
+        "src/main/java/com/jay/fxi/data/alerts/BankAlertSettingsOwner.kt": {
+          "from": "2e51b6b745b703fefae21a5bb2b83373418c5d2015a1936f5011960cef99dfc4",
+          "to": "c1b861daa1e4458198210d69cb7b6dc42b677de509a6b7a759a1625bc705ede5"
+        }
+      },
+      "added": {}
     }
   ]
 }

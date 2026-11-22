@@ -495,6 +495,8 @@ internal class BankAlertSettingsOwner internal constructor(
             discardEdit(op, NotSentReason.SUPERSEDED)
             op.toggle = null
         } else {
+            // Accepting a target outdates a GET begun before it, even when neither the optimistic row nor the echo changes the list.
+            revision++
             op.toggle = ToggleIntent(enabled!!, ++acceptanceSequence, use)
         }
         touchRow(id)

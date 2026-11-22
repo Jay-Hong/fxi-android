@@ -7,7 +7,7 @@
 | closure_app_classes.txt | 944eeb54cc04f64b0a46e1c722fb02ebd3ce4598b9714b96d2dc3769299a2442 |
 | closure_uses.txt | 5b339cb0709a1c14c7c42aa717bb205bf4894942a3f707721eb7159fb285d91f |
 | closure_callbacks.txt | 02fb15e0d4995fdb789be88740eaed71786901319d1cc1d92a934d34a5f953de |
-| closure_sources.txt | c8ea6c3aa37f2aae960a07ea9869f071c46c13ccf9081a27ea5b14692832f42d |
+| closure_sources.txt | 0f3ce1576136665053f5f1449f41a18792b187e245cd5ed33d4566ecf3227977 |
 | closure_versions.txt | 7491fa63d0dab9261842f9b8f7d51e95f5191e381f25a717707614134a3a4faa |
 
 이 목록은 참조 트리(`s7e5d-ref`)의 바이트에서 나왔다. land 트리의 독립 구현 바이트는 다르다. 그러므로 land 단계에서 그 바이트로 목록을 다시 만들고, 이 기록과 같은 항목으로 다시 검토해 봉인한다. PostS6 원장 재결속과 같은 단계다. 참조 봉인을 land 통과의 근거로 쓰지 않는다.
@@ -115,3 +115,9 @@
 | closure_uses.release.txt | 12609f052a1b3a0d240aa8441823b0914cf8a4f2ca425c999df200ca2db0cdb6 |
 
 - 범위 밖: 현재 parity r0의 dependencyInsight에서 debug compile은 foundation 1.9.2, ciMinified·benchmark compile은 1.7.2다. s5Benchmark 사용 목록은 benchmark와 바이트가 같다. 이 개정은 의존 판을 바꾸지 않으며, debug에서 수행한 기기 시험을 release 계열 의존 판의 동작 증거로 확대하지 않는다.
+
+## 개정 5 (2026-11-22 17:04 KST)
+
+- 근거: S8-5c 범위 합의 `R4c/S8/s8_5c_scope.agreed.record.r1.md`(8932b861e56a63c32bbbcdcfc018e6ce9859b2d30e802bef9934e4a1d06b7bbc). 은행 toggle 접수가 그보다 먼저 시작한 GET을 무효화하도록 `BankAlertSettingsOwner.requestRow`의 toggle 분기에 `revision++` 한 줄(과 주석 한 줄)을 넣었다. 최종 owner 소스 SHA-256 c1b861daa1e4458198210d69cb7b6dc42b677de509a6b7a759a1625bc705ede5.
+- 위 '입력과 대응'의 `BankAlertDraft`·`BankAlertEdit` 항목대로, closure에 든 것은 같은 소스의 두 값 class이고 owner class 자체는 여전히 없다. 바뀐 줄은 owner class의 private 함수 안에 있어 두 값 class의 바이트와 무관하다.
+- 재생성 결과(debug, `R4c/S8/s8_5c_impl/t1/closure_report/`)를 본 뒤 봉인했다. 다섯 목록 중 `closure_sources.txt`의 owner 줄만 바뀌었다. app class·library 사용(debug)·함수값 호출 지점·버전 목록은 봉인과 바이트가 같고, 풀리지 않은 것과 초기화 밖 static 쓰기는 0이다. 위 표의 `closure_sources.txt` 해시 하나를 갱신했다. release 계열 사용 목록(`closure_uses.release.txt`)은 unit 시험 세 변형에서 다시 확인한다.

@@ -1025,6 +1025,55 @@ class S7E5A2OwnerMutationContractTest {
         }
     }
 
+    // ---- S8-5c (R4c/S8/s8_next_unit.codex.r1.md §3, r2): accepting a toggle outdates a GET that started before it, even when
+    // neither the optimistic row nor the server's echo changes the shown list ----
+
+    @Test fun `S85C_R01 a same target toggle whose echo changes no row still discards the GET body it started before`() = runTest {
+        rig(this) {
+            loaded()
+            owner.authoritative()
+            settle()
+            assertEquals("premise: a GET is out before the toggle", 1, open("GET").size)
+            toggle(1, true)
+            assertEquals("premise: the same target changes no shown row", listOf(setting(1), setting(2)), rows)
+            val put = open("PUT").single()
+            assertEquals("premise: one PUT of that target", listOf<Any?>(1, true), listOf(put.id, put.enabled))
+            answer("PUT", okRow(setting(1)))
+            assertEquals("premise: the op ended while the GET is still out", listOf(1, 0), listOf(open("GET").size, open("PUT").size))
+            answer("GET", okList(setting(1, enabled = false), setting(2)))
+            assertEquals("older GET changed the accepted target", listOf(setting(1), setting(2)), rows)
+            assertEquals("a trailing GET follows at once", 1, open("GET").size)
+            val fresh = setting(1).copy(threshold = 1777.0)
+            answer("GET", okList(fresh, setting(2)))
+            assertEquals("the trailing body is adopted", listOf(fresh, setting(2)), rows)
+            assertEquals("no PUT is sent again", 1, count("PUT"))
+        }
+    }
+
+    @Test fun `S85C_R02 a same target toggle whose answer is unknown does not let the older GET complete the manual refresh`() = runTest {
+        rig(this) {
+            loaded()
+            owner.manual()
+            settle()
+            assertEquals("premise: the manual GET is out before the toggle", 1, open("GET").size)
+            toggle(1, true)
+            assertEquals("premise: the same target changes no shown row", listOf(setting(1), setting(2)), rows)
+            answer("PUT", Outcome.Throw(java.io.IOException("cut after the server took it")))
+            assertEquals("premise: the op ended while the GET is still out", listOf(1, 0), listOf(open("GET").size, open("PUT").size))
+            answer("GET", okList(setting(1, enabled = false), setting(2)))
+            assertEquals("older GET completed manual refresh", emptyList<ManualRefreshOutcome>(), outcomes)
+            assertEquals("no cooldown from a discarded body", null, owner.manualRefresh.value.cooldownUntilMillis)
+            assertEquals("the accepted target is still shown", listOf(setting(1), setting(2)), rows)
+            assertEquals("the owed GET follows at once", 1, open("GET").size)
+            val fresh = setting(1).copy(threshold = 1777.0)
+            answer("GET", okList(fresh, setting(2)))
+            assertEquals("the manual demand ends with the accepted body", listOf<ManualRefreshOutcome>(ManualRefreshOutcome.Succeeded), outcomes)
+            assertEquals("its cooldown starts from that success", now + 3_000, owner.manualRefresh.value.cooldownUntilMillis)
+            assertEquals("the accepted body is shown", listOf(fresh, setting(2)), rows)
+            assertEquals("the unknown PUT is never sent again", 1, count("PUT"))
+        }
+    }
+
     private companion object {
         const val RECHECK = 1_000L
     }
