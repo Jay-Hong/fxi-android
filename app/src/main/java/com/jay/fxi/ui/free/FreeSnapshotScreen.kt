@@ -167,9 +167,13 @@ fun FreeSnapshotScreen(
             beforeDeliver = hooks::beforeDeliver,
             onContext = hooks::onContext
         ) { openPreview ->
-            FreeSnapshotTabs(selected, state, pageState, onSelectTab, onSelectPeriod, onToggleSeries,
-                onApplyRowPreference, onExpand = { fullscreen = true }, onSubscribe = onSubscribe, onOpenPreview = openPreview,
-                onPage = hooks::onPage)
+            // S8-7: the tether alert preview's own host, for the same owner, selection and paywall, with its default seams.
+            FreeSourceAlertPreviewHost(uid = state.uid, activeTab = selected, onSubscribe = onSubscribe) { openSourcePreview ->
+                FreeSnapshotTabs(selected, state, pageState, onSelectTab, onSelectPeriod, onToggleSeries,
+                    onApplyRowPreference, onExpand = { fullscreen = true }, onSubscribe = onSubscribe,
+                    onOpenSourcePreview = openSourcePreview, onOpenPreview = openPreview,
+                    onPage = hooks::onPage)
+            }
         }
     }
     }
@@ -186,6 +190,7 @@ private fun ColumnScope.FreeSnapshotTabs(
     onApplyRowPreference: (RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onExpand: () -> Unit,
     onSubscribe: () -> Unit,
+    onOpenSourcePreview: FreeSourceAlertPreviewOpener,
     onOpenPreview: FreeAlertPreviewOpener,
     onPage: (PreviewPageMount, Boolean) -> Unit
 ) {
@@ -250,11 +255,13 @@ private fun ColumnScope.FreeSnapshotTabs(
             else -> FreeSnapshotTabContent(
                 tab = tab,
                 state = if (tab == selected) state else FreeSnapshotUiState(uid = state.uid),
+                isSelectedPage = tab == selected,
                 onSelectPeriod = onSelectPeriod,
                 onToggleSeries = onToggleSeries,
                 onApplyRowPreference = onApplyRowPreference,
                 onExpand = onExpand,
                 onSubscribe = onSubscribe,
+                onOpenSourcePreview = { if (tab == selected) onOpenSourcePreview.open(tab, state.sourcePreviewQuotes, state.sourcePreviewAsOf) },
                 onOpenPreview = { onOpenPreview.open(tab, state.previewQuotes, state.previewAsOf) },
                 onPage = onPage
             )
@@ -268,11 +275,13 @@ private fun ColumnScope.FreeSnapshotTabs(
 private fun FreeSnapshotTabContent(
     tab: FreeTab,
     state: FreeSnapshotUiState,
+    isSelectedPage: Boolean,
     onSelectPeriod: (GraphPeriod) -> Unit,
     onToggleSeries: (String) -> Unit,
     onApplyRowPreference: (RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onExpand: () -> Unit,
     onSubscribe: () -> Unit,
+    onOpenSourcePreview: () -> Unit,
     onOpenPreview: () -> Unit,
     onPage: (PreviewPageMount, Boolean) -> Unit
 ) {
@@ -314,6 +323,8 @@ private fun FreeSnapshotTabContent(
     // out of view, or moved to another index when the rows above it change or expire — while iOS keeps the section's `@State`
     // for as long as its view lives. Plain `remember` (D26, nothing saved): a new page, a remount or a restore starts collapsed.
     var previewExpanded by remember { mutableStateOf(false) }
+    // S8-7: the tether teaser's open flag, held by the page for the same reason and with the same lifetime.
+    var sourcePreviewExpanded by remember { mutableStateOf(false) }
     // The same composition's lifetime, told to the preview host's test seams: one new mount per composition, gone with it.
     val pageMount = remember { PreviewPageMount(tab) }
     DisposableEffect(pageMount) {
@@ -411,6 +422,10 @@ private fun FreeSnapshotTabContent(
         // S7 E5d (D26): outside `visible`, as on iOS — with no live snapshot the preview still opens, on empty quotes.
         if (tab in FREE_BANK_ALERT_PREVIEW_TABS) {
             item { FreeBankAlertPreviewSection(expanded = previewExpanded, onToggle = { previewExpanded = !previewExpanded }, onOpen = onOpenPreview) }
+        }
+        // S8-7 (D26 for 테더): the selected tether page only, outside `visible` like the bank teaser.
+        if (tab == FreeTab.TETHER && isSelectedPage) {
+            item { FreeSourceAlertPreviewSection(expanded = sourcePreviewExpanded, onToggle = { sourcePreviewExpanded = !sourcePreviewExpanded }, onOpen = onOpenSourcePreview) }
         }
         item {
             Button(onClick = onSubscribe, modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {

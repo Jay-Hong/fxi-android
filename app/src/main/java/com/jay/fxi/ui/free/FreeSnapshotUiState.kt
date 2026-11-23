@@ -96,7 +96,14 @@ data class FreeSnapshotUiState(
      */
     val previewQuotes: Map<String, Double> = emptyMap(),
     /** The as_of of the snapshot [previewQuotes] came from, kept with it even when no bank in it is an editor bank. */
-    val previewAsOf: Instant? = null
+    val previewAsOf: Instant? = null,
+    /**
+     * S8-7 (D26 for 테더): what the tether alert preview opens with — each allowed exchange's usdt-krw rate in the tether
+     * snapshot, the hidden rows' included ([sourcePreviewQuotes]). Empty off 테더, for another owner, and with no live snapshot.
+     */
+    val sourcePreviewQuotes: Map<String, Double> = emptyMap(),
+    /** The as_of of the snapshot [sourcePreviewQuotes] came from, kept with it even when no exchange in it is allowed. */
+    val sourcePreviewAsOf: Instant? = null
 ) {
     /**
      * What the scheduler would be activated for.
@@ -151,11 +158,14 @@ data class FreeSnapshotUiState(
             // draws an empty frame, which `ANDROID_V2_PLAN.md §7 S2` allows outright — D18's
             // "project one candidate rather than show nothing" is a rule for source lists.
             val graph = GraphPreparedBuilder.build(entry.snapshot.graph, period)
+            val tether = (entry.snapshot.rate as? FreeRate.Grouped)?.takeIf { tab == FreeTab.TETHER }
             return state.copy(
                 rateSections = sections(entry.snapshot.rate, rowPreferences),
                 rowEditors = editors(entry.snapshot.rate, rowPreferences),
                 previewQuotes = (entry.snapshot.rate as? FreeRate.Flat)?.takeIf { tab in FREE_BANK_ALERT_PREVIEW_TABS }?.let(::previewQuotes).orEmpty(),
                 previewAsOf = entry.snapshot.asOf.takeIf { tab in FREE_BANK_ALERT_PREVIEW_TABS && entry.snapshot.rate is FreeRate.Flat },
+                sourcePreviewQuotes = tether?.let(::sourcePreviewQuotes).orEmpty(),
+                sourcePreviewAsOf = entry.snapshot.asOf.takeIf { tether != null },
                 graph = graph,
                 visibleSeriesIds = visibleSeriesIds,
                 seriesToggles = graph.order.mapNotNull { id ->

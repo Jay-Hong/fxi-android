@@ -505,6 +505,32 @@
         }
       },
       "added": {}
+    },
+    {
+      "id": "S8-7",
+      "source_parent": "ab128e88c236318349b6013c6c012f6cf994a1ff",
+      "approval_record_sha256": "2e1e22643378664d28a433e0f226c0bf6a69ee11770994e6a3cd2df7f2efa82c",
+      "changed": {
+        "src/main/java/com/jay/fxi/ui/free/FreeSnapshotScreen.kt": {
+          "from": "dc444dc627f2e53c27737e6ca85714ae29ffe7a6ab980a2068aa838e9c9f856c",
+          "to": "8fa175579559f8132f7a7ed82cfed5987dd5c1422429a4b19b8a2d6856dddb93"
+        },
+        "src/main/java/com/jay/fxi/ui/free/FreeSnapshotUiState.kt": {
+          "from": "2abfc0fb3cbd73a73d053d9bcf127e51e61e0919fb660a8abf2e60527295d28a",
+          "to": "f79454aa0551794e89d2443500bd554695c0aecc319735a4816007e19b91ebf0"
+        },
+        "src/main/java/com/jay/fxi/ui/alert/SourceAlertEditor.kt": {
+          "from": "2987b0935ff8abcb34404634e67b168185eb66d2816287c8d40bcf8d18c08af5",
+          "to": "6d89e5a1be45da7921210cd2da1ea668a18d0dab881db9fea9ae719168e95dae"
+        }
+      },
+      "added": {
+        "src/main/java/com/jay/fxi/ui/alert/SourceAlertDraftRules.kt": "bbfecea42956210adbc86827707fabcd6bd6db4330cc81efb506cf3d6bf0062f",
+        "src/main/java/com/jay/fxi/ui/free/FreeSourceAlertPreviewQuotes.kt": "483a9222ae64b4589f0e81d6bcb3e80dc89bdaaac7e80d7eb61d25cf73c7d449",
+        "src/main/java/com/jay/fxi/ui/free/FreeSourceAlertPreviewSession.kt": "e6f576f3f421cf3e3ff557210743534625967761e359458da401e1604dbe697b",
+        "src/main/java/com/jay/fxi/ui/free/FreeSourceAlertPreviewSection.kt": "a17618878308af0ea8cf55cc064cb2d74fe951bd526f8922c25ae0256b7cdb99",
+        "src/main/java/com/jay/fxi/ui/free/FreeSourceAlertPreviewSheet.kt": "2d5b4941ab19f5b26ce88f38cc7de9032ce81f655afc373fbf4d885fe9f27920"
+      }
     }
   ]
 }

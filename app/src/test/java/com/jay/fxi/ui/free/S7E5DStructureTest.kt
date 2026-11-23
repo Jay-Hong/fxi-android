@@ -90,11 +90,12 @@ class S7E5DStructureTest {
         for ((name, want) in listOf(
             "FreeAlertPreviewHost" to (SCREEN to 1),
             "FreeBankAlertPreviewSection" to (SCREEN to 1),
-            "FreeBankAlertPreviewSheet" to (SESSION to 1),
-            "SubscribeCTA" to (SHEET to 1)
+            "FreeBankAlertPreviewSheet" to (SESSION to 1)
         )) {
             assertEquals("$name 호출", mapOf(want.first to want.second), calls(code, name))
         }
+        // S8-7: the CTA has exactly two callers, the bank preview sheet and the tether preview sheet, once each.
+        assertEquals("SubscribeCTA 호출", mapOf(SHEET to 1, SOURCE_SHEET to 1), calls(code, "SubscribeCTA"))
         assertEquals(
             "공유 본문은 premium 시트와 preview 시트가 한 번씩 부른다",
             mapOf(PREMIUM_SHEET to 1, SHEET to 1),
@@ -262,6 +263,8 @@ class S7E5DStructureTest {
         val BASE = S6Krx3bOffWiringContractTest.BASE
         val SESSION = BASE + "ui/free/FreeAlertPreviewSession.kt"
         val SHEET = BASE + "ui/free/FreeBankAlertPreviewSheet.kt"
+        /** S8-7: the tether preview sheet, the CTA's only other caller. */
+        val SOURCE_SHEET = BASE + "ui/free/FreeSourceAlertPreviewSheet.kt"
         val SECTION = BASE + "ui/free/FreeBankAlertPreviewSection.kt"
         val CTA = BASE + "ui/components/SubscribeCTA.kt"
         val FIELDS = BASE + "ui/alert/BankAlertEditorFields.kt"
@@ -583,7 +586,7 @@ class S7E5DStructureTest {
                 val args = balanced(text, m.range.last, '(', ')') ?: continue
                 out += "host-args" to text.substring(args.first + 1, args.last)
             }
-            for (m in Regex("""\.\s*open\s*\(""").findAll(text)) {
+            for (m in Regex("""\bonOpenPreview\s*\.\s*open\s*\(""").findAll(text)) {
                 val block = enclosing(text, m.range.first) ?: continue
                 out += "opener" to text.substring(block.first + 1, block.last)
             }

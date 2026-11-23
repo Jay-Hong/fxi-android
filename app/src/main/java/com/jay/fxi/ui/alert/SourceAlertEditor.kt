@@ -11,7 +11,6 @@ import com.jay.fxi.domain.model.RepeatInterval
 import com.jay.fxi.domain.model.SourceAlertSetting
 import java.math.BigDecimal
 import java.math.RoundingMode
-import kotlin.math.floor
 
 /**
  * S8-5b (`R4c/S8/s8_5b_contract.agreed.r1.md` §2): the tether alert editor's pure rules — seed, the one normalised price,
@@ -91,15 +90,7 @@ internal object SourceAlertEditor {
         quotes: Map<String, Double>,
         remembered: String? = null
     ): SourceAlertEditorInput = when (mode) {
-        SourceAlertEditorMode.Add -> {
-            val source = remembered?.takeIf { it in sources } ?: sources.first()
-            SourceAlertEditorInput(
-                source = source,
-                condition = AlertCondition.BELOW,
-                thresholdText = usableQuote(quotes[source])?.let(::formatThreshold).orEmpty(),
-                repeat = RepeatIntervalChange.Once
-            )
-        }
+        SourceAlertEditorMode.Add -> SourceAlertDraftRules.seed(sources, quotes, remembered)
         is SourceAlertEditorMode.Edit -> SourceAlertEditorInput(
             source = mode.setting.source,
             condition = mode.setting.condition,
@@ -114,22 +105,11 @@ internal object SourceAlertEditor {
         source: String,
         mode: SourceAlertEditorMode,
         quotes: Map<String, Double>
-    ): SourceAlertEditorInput = input.copy(
-        source = source,
-        thresholdText = if (mode == SourceAlertEditorMode.Add) {
-            usableQuote(quotes[source])?.let(::formatThreshold) ?: input.thresholdText
-        } else {
-            input.thresholdText
-        }
-    )
+    ): SourceAlertEditorInput =
+        if (mode == SourceAlertEditorMode.Add) SourceAlertDraftRules.pick(input, source, quotes) else input.copy(source = source)
 
     /** `[round10(0.5q), round10(1.5q)]`, both ends included; none without a usable quote or for a non-finite bound. */
-    fun range(quote: Double?): ClosedFloatingPointRange<Double>? {
-        val q = usableQuote(quote) ?: return null
-        val lower = floor(q * 0.5 / 10.0 + 0.5) * 10.0
-        val upper = floor(q * 1.5 / 10.0 + 0.5) * 10.0
-        return if (lower.isFinite() && upper.isFinite()) lower..upper else null
-    }
+    fun range(quote: Double?): ClosedFloatingPointRange<Double>? = SourceAlertDraftRules.range(quote)
 
     /**
      * The decimal input as typed, rounded to the nearest won, half up, in exact decimal; null for an empty, malformed, negative,
@@ -260,21 +240,21 @@ internal object SourceAlertEditor {
 
     fun repeatTexts(mode: SourceAlertEditorMode, repeat: RepeatIntervalChange): SourceAlertRepeatTexts {
         val seconds = repeatSeconds(mode, repeat)
-            ?: return SourceAlertRepeatTexts("한번만", "조건 충족 시 1회만 발송", "알림은 1회 발송 후 자동으로 꺼집니다", false)
+            ?: return SourceAlertRepeatTexts("한번만", SourceAlertDraftRules.addRepeatDescription(null), "알림은 1회 발송 후 자동으로 꺼집니다", false)
         val interval = RepeatInterval.from(seconds)
             ?: return SourceAlertRepeatTexts("기존 반복 간격 유지", "조건 충족 동안 반복 발송", "조건이 충족되는 동안 반복 발송됩니다", true)
         return SourceAlertRepeatTexts(
             interval.label,
-            "조건 충족 동안 ${interval.everyLabel} 발송",
+            SourceAlertDraftRules.addRepeatDescription(interval),
             "조건이 충족되는 동안 ${interval.everyLabel} 반복 발송됩니다",
             true
         )
     }
 
     /** A whole won, no grouping: the seed of a quote and the shown value of a row. */
-    fun formatThreshold(value: Double): String = BigDecimal.valueOf(value).setScale(0, RoundingMode.HALF_UP).toPlainString()
+    fun formatThreshold(value: Double): String = SourceAlertDraftRules.formatThreshold(value)
 
-    private fun usableQuote(quote: Double?): Double? = quote?.takeIf { it.isFinite() && it > 0 }
+    private fun usableQuote(quote: Double?): Double? = SourceAlertDraftRules.usableQuote(quote)
 
     private fun repeatSeconds(mode: SourceAlertEditorMode, repeat: RepeatIntervalChange): Int? = when (repeat) {
         RepeatIntervalChange.Keep -> (mode as? SourceAlertEditorMode.Edit)?.setting?.repeatIntervalSec

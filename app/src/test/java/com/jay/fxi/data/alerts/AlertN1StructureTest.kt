@@ -1499,7 +1499,10 @@ class AlertN1StructureTest {
                 "AlertRateLimitFloor" to setOf(FLOOR, OWNER, SOURCE_OWNER, SOURCE_HISTORY_ENTRY),
                 // S8-4a: the registry registers the source owner and the tether section reads it; the section projects with the policy.
                 "SourceAlertSettingsOwner" to setOf(SOURCE_OWNER, REGISTRY, SOURCE_SECTION),
-                "SourceAlertRowPolicy" to setOf(ROW_POLICY, SOURCE_OWNER, SOURCE_SECTION, SOURCE_HISTORY_HOLDER, REGISTRY),
+                // S8-7: the free tether preview projects its quotes and lists its exchanges with the policy, and nothing more.
+                "SourceAlertRowPolicy" to setOf(ROW_POLICY, SOURCE_OWNER, SOURCE_SECTION, SOURCE_HISTORY_HOLDER, REGISTRY,
+                    BASE + "ui/free/FreeSourceAlertPreviewQuotes.kt", BASE + "ui/free/FreeSourceAlertPreviewSession.kt",
+                    BASE + "ui/free/FreeSourceAlertPreviewSheet.kt"),
                 "AlertFamilyRefresherRegistry" to setOf(REGISTRY, APP, FCM, ACTIVITY))) {
                 val named = files(code, """\b$name\b""")
                 if (named != expected) v += "A-reach $name ${named.sorted()}"
