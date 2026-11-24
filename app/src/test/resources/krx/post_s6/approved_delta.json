@@ -531,6 +531,24 @@
         "src/main/java/com/jay/fxi/ui/free/FreeSourceAlertPreviewSection.kt": "a17618878308af0ea8cf55cc064cb2d74fe951bd526f8922c25ae0256b7cdb99",
         "src/main/java/com/jay/fxi/ui/free/FreeSourceAlertPreviewSheet.kt": "2d5b4941ab19f5b26ce88f38cc7de9032ce81f655afc373fbf4d885fe9f27920"
       }
+    },
+    {
+      "id": "S9-1",
+      "source_parent": "478c0e4b111d1f8adfca4dbe1f2e7293d129fcda",
+      "approval_record_sha256": "c2c4030998b1c8ee0ddbedff00763df77e7a0528b873e17afdcb4b3e7f3533e6",
+      "changed": {
+        "src/main/java/com/jay/fxi/data/repository/AlertRepository.kt": {
+          "from": "73c7ec4b1158b5934f42ef20b03cf61164f6f5ee538f6aed62ebe91d8edf801b",
+          "to": "dc30ca264c7b3dce7aec3fd92d0a66b998e90902ae41b4d66ec239664f8c501d"
+        },
+        "src/main/java/com/jay/fxi/data/remote/AuthenticatedApiService.kt": {
+          "from": "a633deadf8c122233a639cca17c453ffdacf1f1b4a9af368fce01bfaec865072",
+          "to": "dd9f854309a40311c689f7fb594f0c339f0eba8cf9eac64555524b6a3c434205"
+        }
+      },
+      "added": {
+        "src/main/java/com/jay/fxi/data/alerts/ComparisonAlertRowPolicy.kt": "36f0f92224b68abc6c60099c207476fe81239514efb844a6e1a378df602f8c17"
+      }
     }
   ]
 }

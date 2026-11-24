@@ -115,44 +115,71 @@ class AlertRepository @Inject constructor(
         }
     }
 
-    /** Comparison / kimchi-premium alerts; [tab] null is every tab. */
-    suspend fun getComparisonAlerts(owner: AuthIdentityFence, tab: String? = null): AuthBoundResult<List<ComparisonAlertSetting>> =
-        safeApiCall(owner) { snapshot ->
-            apiService.getComparisonAlerts(snapshot, tab)
+    /**
+     * [tab] null requests every tab. Comparison calls with a use guard check it again when applying
+     * the result, after validating the original owner, including results from failed credential capture.
+     */
+    suspend fun getComparisonAlerts(
+        owner: AuthIdentityFence,
+        tab: String? = null,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<List<ComparisonAlertSetting>> {
+        if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+        return safeApiCall(owner, applyAdmitted = useAdmitted) { snapshot ->
+            if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+            apiService.getComparisonAlerts(snapshot, tab, useAdmitted)
                 .requireBody("GET /api/comparison-alerts")
                 .alerts
         }
+    }
 
-    suspend fun createComparisonAlert(owner: AuthIdentityFence, request: ComparisonAlertRequest): AuthBoundResult<ComparisonAlertSetting> =
-        safeApiCall(owner) { snapshot ->
-            apiService.createComparisonAlert(snapshot, request)
-                .requireBody("POST /api/comparison-alerts")
-        }
+    suspend fun createComparisonAlert(
+        owner: AuthIdentityFence,
+        request: ComparisonAlertRequest,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<ComparisonAlertSetting> = mutation(
+        owner, useAdmitted, "POST /api/comparison-alerts", applyAdmitted = useAdmitted
+    ) { snapshot ->
+        apiService.createComparisonAlert(snapshot, request, useAdmitted)
+    }
 
     /** Partial update of enabled / repeat / threshold / operator. */
-    suspend fun updateComparisonAlert(owner: AuthIdentityFence, id: Int, request: ComparisonAlertUpdateRequest): AuthBoundResult<ComparisonAlertSetting> =
-        safeApiCall(owner) { snapshot ->
-            apiService.updateComparisonAlert(snapshot, id, request)
-                .requireBody("PUT /api/comparison-alerts/{id}")
-        }
+    suspend fun updateComparisonAlert(
+        owner: AuthIdentityFence,
+        id: Int,
+        request: ComparisonAlertUpdateRequest,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<ComparisonAlertSetting> = mutation(
+        owner, useAdmitted, "PUT /api/comparison-alerts/{id}", applyAdmitted = useAdmitted
+    ) { snapshot ->
+        apiService.updateComparisonAlert(snapshot, id, request, useAdmitted)
+    }
 
-    /** Idempotent on the server: an already deleted alert also succeeds. */
-    suspend fun deleteComparisonAlert(owner: AuthIdentityFence, id: Int): AuthBoundResult<Unit> =
-        safeApiCall(owner) { snapshot ->
-            val response = apiService.deleteComparisonAlert(snapshot, id)
-            response.failure?.let { throw AuthenticatedApiException(it) }
-        }
+    suspend fun deleteComparisonAlert(
+        owner: AuthIdentityFence,
+        id: Int,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<Unit> = mutation(
+        owner, useAdmitted, "DELETE /api/comparison-alerts/{id}", applyAdmitted = useAdmitted
+    ) { snapshot ->
+        apiService.deleteComparisonAlert(snapshot, id, useAdmitted)
+    }
 
     /** Delivered comparison alerts, newest first; [tab] / [diffType] null are every value, [limit] 1..200 (server caps). */
     suspend fun getComparisonHistory(
         owner: AuthIdentityFence,
         tab: String? = null,
         diffType: String? = null,
-        limit: Int = 100
-    ): AuthBoundResult<List<ComparisonAlertHistoryItem>> = safeApiCall(owner) { snapshot ->
-        apiService.getComparisonNotificationLogs(snapshot, tab, diffType, limit)
-            .requireBody("GET /api/comparison-notification-logs")
-            .logs
+        limit: Int = 100,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthBoundResult<List<ComparisonAlertHistoryItem>> {
+        if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+        return safeApiCall(owner, applyAdmitted = useAdmitted) { snapshot ->
+            if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+            apiService.getComparisonNotificationLogs(snapshot, tab, diffType, limit, useAdmitted)
+                .requireBody("GET /api/comparison-notification-logs")
+                .logs
+        }
     }
 
     /**
@@ -219,11 +246,12 @@ class AlertRepository @Inject constructor(
         owner: AuthIdentityFence,
         useAdmitted: (() -> Boolean)?,
         endpoint: String = "Bank alert mutation",
+        applyAdmitted: (() -> Boolean)? = null,
         block: suspend (AuthSnapshot) -> AuthenticatedHttpResponse<T>
     ): AuthBoundResult<T> {
         if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
         var evidence: AlertRateLimitResponseEvidence? = null
-        return safeApiCall(owner, { evidence }) { snapshot ->
+        return safeApiCall(owner, { evidence }, applyAdmitted) { snapshot ->
             if (useAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
             val response = try {
                 block(snapshot)
@@ -239,15 +267,21 @@ class AlertRepository @Inject constructor(
     private suspend fun <T> safeApiCall(
         owner: AuthIdentityFence,
         responseEvidence: (() -> AlertRateLimitResponseEvidence?)? = null,
+        applyAdmitted: (() -> Boolean)? = null,
         block: suspend (AuthSnapshot) -> T
     ): AuthBoundResult<T> {
+        fun requireApplicable() {
+            apiService.requireCurrent(owner)
+            if (applyAdmitted?.invoke() == false) throw TopicUseWithheldException(emptyList())
+        }
+
         val snapshot = try {
             apiService.captureSnapshot(owner)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: AuthUnavailableException) {
             return AuthBoundResult(
-                requireCurrent = { apiService.requireCurrent(owner) },
+                requireCurrent = ::requireApplicable,
                 result = Result.failure(AlertRepositoryException("인증 오류", failureKind = AlertRepositoryFailureKind.AUTH_UNAVAILABLE))
             )
         }
@@ -275,7 +309,7 @@ class AlertRepository @Inject constructor(
             Result.failure(AlertRepositoryException("서버 오류", failureKind = AlertRepositoryFailureKind.UNEXPECTED))
         }
         return AuthBoundResult(
-            requireCurrent = { apiService.requireCurrent(owner) },
+            requireCurrent = ::requireApplicable,
             result = result,
             rateLimitResponseEvidence = responseEvidence?.invoke()
                 ?: (result.exceptionOrNull() as? AlertRepositoryException)?.let { failure ->

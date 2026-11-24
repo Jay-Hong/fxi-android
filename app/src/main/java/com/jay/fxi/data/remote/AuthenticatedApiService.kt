@@ -322,27 +322,44 @@ class AuthenticatedApiClient internal constructor(
             .preserve(AuthenticatedEndpoint.SOURCE_NOTIFICATION_LOGS)
             .decodeSuccess(wireJson)
 
-    suspend fun getComparisonAlerts(owner: AuthSnapshot, tab: String?): AuthenticatedHttpResponse<ComparisonAlertsResponse> =
-        transport.executeRead(owner) { service.getComparisonAlerts(it, tab) }
+    /**
+     * [useAdmitted], when given, passes unchanged to the transport. It may run on transport threads and must be
+     * thread-safe, non-blocking and side-effect free, subject to the existing production live-identity-read contract.
+     */
+    suspend fun getComparisonAlerts(
+        owner: AuthSnapshot,
+        tab: String?,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthenticatedHttpResponse<ComparisonAlertsResponse> =
+        transport.executeRead(owner, useAdmitted) { service.getComparisonAlerts(it, tab) }
             .preserve(AuthenticatedEndpoint.COMPARISON_ALERTS)
             .decodeSuccess(wireJson)
 
-    suspend fun createComparisonAlert(owner: AuthSnapshot, request: ComparisonAlertRequest): AuthenticatedHttpResponse<ComparisonAlertSetting> =
-        transport.executeMutation(owner) { service.createComparisonAlert(it, request) }
+    suspend fun createComparisonAlert(
+        owner: AuthSnapshot,
+        request: ComparisonAlertRequest,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthenticatedHttpResponse<ComparisonAlertSetting> =
+        transport.executeMutation(owner, useAdmitted) { service.createComparisonAlert(it, request) }
             .preserve(AuthenticatedEndpoint.COMPARISON_ALERTS)
             .decodeSuccess(wireJson)
 
     suspend fun updateComparisonAlert(
         owner: AuthSnapshot,
         id: Int,
-        request: ComparisonAlertUpdateRequest
+        request: ComparisonAlertUpdateRequest,
+        useAdmitted: (() -> Boolean)? = null
     ): AuthenticatedHttpResponse<ComparisonAlertSetting> =
-        transport.executeMutation(owner) { service.updateComparisonAlert(it, id, request) }
+        transport.executeMutation(owner, useAdmitted) { service.updateComparisonAlert(it, id, request) }
             .preserve(AuthenticatedEndpoint.UPDATE_COMPARISON_ALERT)
             .decodeSuccess(wireJson)
 
-    suspend fun deleteComparisonAlert(owner: AuthSnapshot, id: Int): AuthenticatedHttpResponse<Unit> =
-        transport.executeMutation(owner) { service.deleteComparisonAlert(it, id) }
+    suspend fun deleteComparisonAlert(
+        owner: AuthSnapshot,
+        id: Int,
+        useAdmitted: (() -> Boolean)? = null
+    ): AuthenticatedHttpResponse<Unit> =
+        transport.executeMutation(owner, useAdmitted) { service.deleteComparisonAlert(it, id) }
             .preserve(AuthenticatedEndpoint.DELETE_COMPARISON_ALERT)
             .asUnit()
 
@@ -351,9 +368,10 @@ class AuthenticatedApiClient internal constructor(
         owner: AuthSnapshot,
         tab: String?,
         diffType: String?,
-        limit: Int
+        limit: Int,
+        useAdmitted: (() -> Boolean)? = null
     ): AuthenticatedHttpResponse<ComparisonAlertHistoryResponse> =
-        transport.executeRead(owner) { service.getComparisonNotificationLogs(it, tab, diffType, limit) }
+        transport.executeRead(owner, useAdmitted) { service.getComparisonNotificationLogs(it, tab, diffType, limit) }
             .preserve(AuthenticatedEndpoint.COMPARISON_NOTIFICATION_LOGS)
             .decodeSuccess(wireJson)
 
