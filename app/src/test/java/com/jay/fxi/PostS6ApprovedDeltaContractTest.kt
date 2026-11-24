@@ -74,16 +74,16 @@ class PostS6ApprovedDeltaContractTest {
     @Test fun P01_theApprovedLedgerValidates_andMatchesTheActualSourcesExactly() {
         assertEquals("the pin is the manifest's bytes", PostS6ApprovedDelta.APPROVED_SHA256, PostS6ApprovedDelta.sha(raw))
         val ledger = PostS6ApprovedDelta.ledger()
-        assertEquals("the folded ledger contains exactly the expected production paths through S9-1",
+        assertEquals("the folded ledger contains exactly the expected production paths through S9-2a",
             setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport + activity +
                 pushManager + pushCoordinator + e5b2aAdded + settingsScreen + e5b2b1Added + alertSheet + e5b3aAdded + e5b3bNew +
                 rateRowStore + e5b4aAdded + cacheService + e5b4bAdded + e5dNew + e5dAdded + s83Added + s84aAdded + s84bAdded + s85bAdded +
-                s87AddedPaths + s91Policy,
+                s87AddedPaths + s91Policy + s92aOwner,
             ledger.final.keys)
         assertEquals(setOf(api, repo) + s7cChanged + n1Changed + e5a1Changed + transport + activity + pushManager + pushCoordinator +
             settingsScreen + alertSheet + e5b3bNew + rateRowStore + cacheService + e5dNew, ledger.changed)
         assertEquals(setOf(access) + s7b + s7cAdded + n1Added + e5a1Added + e5b2aAdded + e5b2b1Added + e5b3aAdded + e5b4aAdded + e5b4bAdded + e5dAdded +
-            s83Added + s84aAdded + s84bAdded + s85bAdded + s87AddedPaths + s91Policy, ledger.added)
+            s83Added + s84aAdded + s84bAdded + s85bAdded + s87AddedPaths + s91Policy + s92aOwner, ledger.added)
         assertEquals("history hashes", mapOf(api to productBase.getValue(api), repo to productBase.getValue(repo), access to null) +
             s7b.associateWith { null } + s7cChanged.associateWith { productBase.getValue(it) } + s7cAdded.associateWith { null } +
             n1Changed.associateWith { productBase.getValue(it) } + n1Added.associateWith { null } +
@@ -97,7 +97,7 @@ class PostS6ApprovedDeltaContractTest {
             mapOf(cacheService to productBase.getValue(cacheService)) + e5b4bAdded.associateWith { null } +
             e5dNew.associateWith { productBase.getValue(it) } + e5dAdded.associateWith { null } + s83Added.associateWith { null } +
             s84aAdded.associateWith { null } + s84bAdded.associateWith { null } + s85bAdded.associateWith { null } +
-            (s87AddedPaths + s91Policy).associateWith { null }, ledger.original)
+            (s87AddedPaths + s91Policy + s92aOwner).associateWith { null }, ledger.original)
         assertEquals(emptyList<String>(), PostS6ApprovedDelta.actualErrors(ledger, PostS6ApprovedDelta.actualSources()))
         val actual = PostS6ApprovedDelta.actualSources().mapValues { PostS6ApprovedDelta.sha(it.value) }
         val changes = s85b.getValue("changed").jsonObject
@@ -128,6 +128,8 @@ class PostS6ApprovedDeltaContractTest {
         }
         assertEquals(s91PolicySha, ledger.final.getValue(s91Policy))
         assertEquals(null, ledger.lastFrom.getValue(s91Policy))
+        assertEquals(s92aOwnerSha, ledger.final.getValue(s92aOwner))
+        assertEquals(null, ledger.lastFrom.getValue(s92aOwner))
         val projected = PostS6ApprovedDelta.project(actual, ledger)
         assertEquals("changed paths go back to their history", productBase.getValue(api), projected[api])
         assertEquals(productBase.getValue(repo), projected[repo])
@@ -146,11 +148,11 @@ class PostS6ApprovedDeltaContractTest {
         assertEquals("the service goes back to its first history through both of its links", productBase.getValue(messaging), projected[messaging])
         assertFalse("the approved additions are dropped from the history view",
             (setOf(access) + s7b + s7cAdded + n1Added + e5a1Added + e5b2aAdded + e5b2b1Added + e5b3aAdded + e5b4aAdded + e5b4bAdded + e5dAdded +
-                s83Added + s84aAdded + s84bAdded + s85bAdded + s87AddedPaths + s91Policy).any { it in projected })
+                s83Added + s84aAdded + s84bAdded + s85bAdded + s87AddedPaths + s91Policy + s92aOwner).any { it in projected })
         val moved = setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport + activity +
             pushManager + pushCoordinator + e5b2aAdded + settingsScreen + e5b2b1Added + alertSheet + e5b3aAdded + e5b3bNew +
             rateRowStore + e5b4aAdded + cacheService + e5b4bAdded + e5dNew + e5dAdded + s83Added + s84aAdded + s84bAdded + s85bAdded +
-            s87AddedPaths + s91Policy
+            s87AddedPaths + s91Policy + s92aOwner
         assertEquals("nothing else moves", actual - moved,
             projected - (setOf(api, repo) + s7cChanged + n1Changed + e5a1Changed + transport + activity + pushManager + pushCoordinator +
                 settingsScreen + alertSheet + e5b3bNew + rateRowStore + cacheService + e5dNew))
@@ -1940,6 +1942,51 @@ class PostS6ApprovedDeltaContractTest {
         val forbidden = base + "data/entitlements/S91Probe.kt"
         val extra = s91.with("added", added.with(forbidden, JsonPrimitive(someHash)))
         assertEquals("an extra forbidden addition", listOf("forbidden $forbidden"), errors(withUnitAt(25, extra)))
+        assertEquals("approved bytes with a wrong pin", listOf("approval-pin"), errorsRaw(raw.toString(Charsets.UTF_8), someHash))
+    }
+
+    // ---- S9-2a: the comparison alert settings owner ----
+
+    private val s92a get() = unit(26)
+    private val s92aOwner = base + "data/alerts/ComparisonAlertSettingsOwner.kt"
+    private val s92aOwnerSha = "5a031537637ff67b4bf3d0a38b0fc453ac1fb0479156278ce0148e5f3f72ce46"
+
+    @Test fun E86_theS92aUnitIsExactAndAddsOnlyTheComparisonOwner() {
+        assertEquals("the twenty-seventh unit", "S9-2a", json.getValue("units").jsonArray.getOrNull(26)?.jsonObject?.str("id"))
+        assertEquals("666cbd456dc0ab922e2d2c97cb6c747333ebd80e", s92a.str("source_parent"))
+        // Both units are bound to the agreed S9-0 scope record.
+        assertEquals(s91Approval, s92a.str("approval_record_sha256"))
+        assertEquals(JsonObject(emptyMap()), s92a.getValue("changed"))
+        assertEquals(JsonObject(mapOf(s92aOwner to JsonPrimitive(s92aOwnerSha))), s92a.getValue("added"))
+        assertFalse("the owner has no product-base predecessor", s92aOwner in productBase)
+        assertTrue("the owner first appears in S9-2a", (0 until 26).map { unit(it) }.none {
+            s92aOwner in it.getValue("changed").jsonObject || s92aOwner in it.getValue("added").jsonObject
+        })
+        assertTrue("S9-2a has no core exception", PostS6ApprovedDelta.CORE_EXCEPTIONS.none { it.unitId == "S9-2a" })
+    }
+
+    @Test fun E87_theS92aUnitRefusesAlteredApprovalPathsOwnerBytesAndPin() {
+        assertEquals("the mutation control contains S9-2a", "S9-2a", json.getValue("units").jsonArray.getOrNull(26)?.jsonObject?.str("id"))
+        val controlPin = PostS6ApprovedDelta.sha(json.toString().toByteArray())
+        assertEquals(emptyList<String>(), errors(withUnitAt(26, s92a), controlPin))
+        val goRecordSha = "cfef6db4ded5eadcbdc87f21f619e69b73a37a4f5162268e2653dff258d23617"
+        for ((field, value) in listOf("source_parent" to s91Parent, "approval_record_sha256" to goRecordSha)) {
+            assertEquals("another $field", listOf("approval-pin"),
+                errors(withUnitAt(26, s92a.with(field, JsonPrimitive(value))), controlPin))
+        }
+
+        val added = s92a.getValue("added").jsonObject
+        val omitted = s92a.with("added", JsonObject(added - s92aOwner))
+        assertEquals("omitting the only addition", listOf("unit-empty S9-2a"), errors(withUnitAt(26, omitted)))
+        val forbidden = base + "data/entitlements/S92aProbe.kt"
+        val extra = s92a.with("added", added.with(forbidden, JsonPrimitive(someHash)))
+        assertEquals("an extra forbidden addition", listOf("forbidden $forbidden"), errors(withUnitAt(26, extra)))
+
+        val actual = PostS6ApprovedDelta.actualSources()
+        val altered = actual.getValue(s92aOwner).copyOf()
+        altered[0] = (altered[0].toInt() xor 1).toByte()
+        assertEquals("one changed byte in the owner", listOf("actual-hash $s92aOwner"),
+            PostS6ApprovedDelta.actualErrors(PostS6ApprovedDelta.ledger(), actual + (s92aOwner to altered)))
         assertEquals("approved bytes with a wrong pin", listOf("approval-pin"), errorsRaw(raw.toString(Charsets.UTF_8), someHash))
     }
 }

@@ -674,6 +674,17 @@ class AlertN1StructureTest {
     @Test fun `S7N1_S12 S8-6 rejects wiring and banner mutations and accepts reformatted delegation`() {
         for ((label, tree, tag) in listOf(
             Triple("jitter [0, 1)", editedLiteral(OWNER, "Random.nextDouble(-0.2, 0.2)", "Random.nextDouble()"), "S11-inject $OWNER"),
+            Triple("comparison wired to an unguarded reader", editedLiteral(COMPARISON_OWNER, "comparisonSettingsGet(repository), access,",
+                "{ use, _ -> repository.getComparisonAlerts(use.identity) }, access,"), "S11-inject $COMPARISON_OWNER"),
+            Triple("comparison identity ignores deletion", editedLiteral(COMPARISON_OWNER, " && protectedAdmission()", ""),
+                "S11-inject $COMPARISON_OWNER"),
+            Triple("comparison identity ignores release", editedLiteral(COMPARISON_OWNER, "ReleaseAdmission.isOpen && ", ""),
+                "S11-inject $COMPARISON_OWNER"),
+            Triple("comparison identity changes during admission", editedLiteral(COMPARISON_OWNER, " && tokens.currentIdentityFence() == it", ""),
+                "S11-inject $COMPARISON_OWNER"),
+            Triple("comparison GET for one tab", editedLiteral(COMPARISON_OWNER, "tab = null", "tab = \"tether\""), "S11-comparison-get"),
+            Triple("comparison GET with a constant guard", editedLiteral(COMPARISON_OWNER, "useAdmitted = guard", "useAdmitted = { true }"),
+                "S11-comparison-get"),
             Triple("the source GET for every asset", editedLiteral(SOURCE_OWNER, "SourceAlertRowPolicy.SETTINGS_ASSET, admitted)", "null, admitted)"),
                 "S11-inject $SOURCE_OWNER"),
             Triple("the source GET without its use check", editedLiteral(SOURCE_OWNER, "SourceAlertRowPolicy.SETTINGS_ASSET, admitted)",
@@ -813,6 +824,8 @@ class AlertN1StructureTest {
         return code + (FCM to fcm.replaceRange(range, with(fcm.substring(range))))
     }
 
+    internal val productionSources: Map<String, String> get() = code
+
     private companion object {
         val BASE = S6Krx3bOffWiringContractTest.BASE
         val VM = BASE + "ui/viewmodel/AlertViewModel.kt"
@@ -832,6 +845,7 @@ class AlertN1StructureTest {
         val OWNER = BASE + "data/alerts/BankAlertSettingsOwner.kt"
         /** S8-3 (`R4c/S8/s8_3_contract` §1.1–§1.2): the source settings owner and its row policy. */
         val SOURCE_OWNER = BASE + "data/alerts/SourceAlertSettingsOwner.kt"
+        val COMPARISON_OWNER = BASE + "data/alerts/ComparisonAlertSettingsOwner.kt"
         val ROW_POLICY = BASE + "data/alerts/SourceAlertRowPolicy.kt"
         val REPOSITORY = BASE + "data/repository/AlertRepository.kt"
         /** S8-4a: the tether tab's read section, the source owner's one screen namer. */
@@ -840,7 +854,7 @@ class AlertN1StructureTest {
         val SOURCE_HISTORY_ENTRY = BASE + "ui/alert/SourceHistoryEntry.kt"
         val SOURCE_HISTORY_HOLDER = BASE + "ui/alert/SourceHistoryStateHolder.kt"
         /** The six new N1 production files (API r1 §2–§6) and S8-3's two. E5a1's section holder is deliberately not one of them. */
-        val NEW_FILES = listOf(PHASE, POLICY, FLOOR, ACCESS, REGISTRY, OWNER, SOURCE_OWNER, ROW_POLICY)
+        val NEW_FILES = listOf(PHASE, POLICY, FLOOR, ACCESS, REGISTRY, OWNER, SOURCE_OWNER, ROW_POLICY, COMPARISON_OWNER)
         /** S7 E5a1's section holder (API r2 §2): AlertSection's one caller and, besides the owner and the registry, the owner's one namer. */
         val HOLDER = BASE + "ui/alert/BankAlertSection.kt"
         val ROUTE = BASE + "ui/premium/view/PremiumTopicRoute.kt"
@@ -1341,6 +1355,14 @@ class AlertN1StructureTest {
                     { owner, id, request, admitted -> repository.updateSettingPartial(owner, id, request, admitted) },
                     rememberAddedBank = memory::acceptAddedBank,
                     reportRememberFailure = { Log.w(TAG, "Last selected bank not accepted") })""",
+                COMPARISON_OWNER to """@Inject constructor(repository: AlertRepository, access: AlertSettingsAccess,
+                    tokens: AuthTokenProvider, deletions: DeletionAdmissionStore, coordinator: PremiumAccessCoordinator) : this(
+                    comparisonSettingsGet(repository), access,
+                    GraphProtectedAdmission(tokens::currentIdentityFence, deletions).let { protectedAdmission ->
+                        { tokens.currentIdentityFence()?.takeIf { ReleaseAdmission.isOpen && protectedAdmission() && tokens.currentIdentityFence() == it } }
+                    },
+                    coordinator.state, coordinator.accessRevisions, CoroutineScope(SupervisorJob() + Dispatchers.Main),
+                    { delay(it) }, { Random.nextDouble(-0.2, 0.2) })""",
                 SOURCE_OWNER to """@Inject constructor(repository: AlertRepository, access: AlertSettingsAccess, floor: AlertRateLimitFloor,
                     coordinator: PremiumAccessCoordinator) : this(
                     { owner, admitted -> repository.getSourceSettings(owner, SourceAlertRowPolicy.SETTINGS_ASSET, admitted) },
@@ -1415,6 +1437,9 @@ class AlertN1StructureTest {
             for ((path, form) in INJECT_FORMS) {
                 if (code[path]?.let(::injectDelegation)?.let(::squash) != form) v += "S11-inject $path"
             }
+            val comparison = code[COMPARISON_OWNER].orEmpty()
+            val get = "{ use, guard -> repository.getComparisonAlerts(use.identity, tab = null, useAdmitted = guard) }"
+            if (count(squash(comparison), Regex.escape(squash(get))) != 1) v += "S11-comparison-get"
             val owner = code[OWNER].orEmpty()
             // S7 E5b4b: the two hand-over parameters follow the recheck period, each with its inert default for tests.
             if (count(owner, """\bprivate\s+val\s+accessRecheckMillis\s*:\s*Long\s*=\s*(?:1_000|1000)\s*,\s*""" +
@@ -1495,7 +1520,7 @@ class AlertN1StructureTest {
             val v = mutableListOf<String>()
             for ((name, expected) in listOf(
                 "BankAlertSettingsOwner" to setOf(OWNER, REGISTRY, HOLDER),
-                "AlertSettingsAccess" to setOf(ACCESS, OWNER, SOURCE_OWNER, SOURCE_HISTORY_ENTRY, REGISTRY),
+                "AlertSettingsAccess" to setOf(ACCESS, OWNER, SOURCE_OWNER, COMPARISON_OWNER, SOURCE_HISTORY_ENTRY, REGISTRY),
                 "AlertRateLimitFloor" to setOf(FLOOR, OWNER, SOURCE_OWNER, SOURCE_HISTORY_ENTRY),
                 // S8-4a: the registry registers the source owner and the tether section reads it; the section projects with the policy.
                 "SourceAlertSettingsOwner" to setOf(SOURCE_OWNER, REGISTRY, SOURCE_SECTION),

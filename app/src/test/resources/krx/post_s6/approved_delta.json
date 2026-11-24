@@ -549,6 +549,15 @@
       "added": {
         "src/main/java/com/jay/fxi/data/alerts/ComparisonAlertRowPolicy.kt": "36f0f92224b68abc6c60099c207476fe81239514efb844a6e1a378df602f8c17"
       }
+    },
+    {
+      "id": "S9-2a",
+      "source_parent": "666cbd456dc0ab922e2d2c97cb6c747333ebd80e",
+      "approval_record_sha256": "c2c4030998b1c8ee0ddbedff00763df77e7a0528b873e17afdcb4b3e7f3533e6",
+      "changed": {},
+      "added": {
+        "src/main/java/com/jay/fxi/data/alerts/ComparisonAlertSettingsOwner.kt": "5a031537637ff67b4bf3d0a38b0fc453ac1fb0479156278ce0148e5f3f72ce46"
+      }
     }
   ]
 }
