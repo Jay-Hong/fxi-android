@@ -59,7 +59,9 @@ class E5dJourneyJ13GoldenDataTest {
 
     @Test
     fun theJourneysCopiesAreTheGoldensData() {
-        assertEquals("premise: J13 has three copies and J14 two", listOf(setOf("ONCE", "REPEAT", "SYNC"), setOf("ONCE", "SYNC")), JOURNEYS.map { it.copies.keys })
+        assertEquals("J13, J14 and J16 copies", listOf(
+            setOf("ONCE", "REPEAT", "SYNC"), setOf("ONCE", "SYNC"), setOf("ONCE", "KRX_REPEAT", "SYNC")
+        ), JOURNEYS.map { it.copies.keys })
         for (journey in JOURNEYS) {
             val source = journey.source()
             for ((name, id) in journey.copies) {
@@ -252,6 +254,21 @@ class E5dJourneyJ13GoldenDataTest {
         assertTrue("a J14 copy never used", useProblems(source.replace(syncUse, "mapOf(\"type\" to \"sync_alerts\"), visible"), J14).any { it == "SYNC: never used" })
     }
 
+    @Test
+    fun j16DeliversTheCheckedUpbitOnceDerivative() {
+        val source = J16.source()
+        assertTrue("J16_1 and derivedRepeat must have their reviewed tokens", repeatBinding(source))
+        val pair = """base + ("is_repeat" to "true")"""
+        for (replacement in listOf("""base + ("source" to "true")""", """$pair + ("asset" to "other")""")) {
+            assertTrue("changed derivative: $replacement", !repeatBinding(changed(source, pair, replacement)))
+        }
+        for (other in listOf("ONCE", "KRX_REPEAT")) {
+            assertTrue("wrong visible input: $other", !repeatBinding(changed(source, "foregroundVisible(data)", "foregroundVisible($other)")))
+        }
+        val route = "measure(data, Post.APP, visible = true, source = 1, bank = 0)"
+        assertTrue("visible helper discards its input", !repeatBinding(changed(source, route, route.replace("(data,", "(ONCE,"))))
+    }
+
     companion object {
         const val JOURNEY = "../e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J13FcmDisplayTest.kt"
         const val SYNC_DECLARATION = "val SYNC = mapOf(\"type\" to \"sync_alerts\")"
@@ -267,7 +284,9 @@ class E5dJourneyJ13GoldenDataTest {
         val J13 = Journey(JOURNEY, JOURNEY_CLASS, COPIES)
         val J14 = Journey("../e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J14FcmReturnAndTapTest.kt", "J14FcmReturnAndTapTest",
             mapOf("ONCE" to "fcm-rate-alert-once", "SYNC" to "fcm-sync-alerts"))
-        val JOURNEYS = listOf(J13, J14)
+        val J16 = Journey("../e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J16SourceFcmDisplayTest.kt", "J16SourceFcmDisplayTest",
+            mapOf("ONCE" to "fcm-source-alert-once", "KRX_REPEAT" to "fcm-source-alert-repeat-krx", "SYNC" to "fcm-sync-alerts"))
+        val JOURNEYS = listOf(J13, J14, J16)
 
         /** The journey class with a companion that declares just [declaration]. */
         fun inCompanion(declaration: String): String = "class $JOURNEY_CLASS {\n    private companion object {\n        $declaration\n    }\n}\n"
@@ -600,6 +619,39 @@ class E5dJourneyJ13GoldenDataTest {
                 }
             }
             return problems
+        }
+
+        /** Match the actual declarations, including the end of the expression-bodied derivative. */
+        private fun repeatBinding(source: String): Boolean {
+            val code = tokens(source) ?: return false
+            val klass = tokens("class J16SourceFcmDisplayTest {")!!
+            val open = code.windowed(klass.size).withIndex().singleOrNull { it.value == klass }?.index
+                ?.plus(klass.lastIndex) ?: return false
+            val end = closing(code, open) ?: return false
+            val body = code.subList(open + 1, end)
+            fun declaration(name: String, reviewed: String, expression: Boolean = false): Boolean {
+                val signature = tokens("fun $name(")!!
+                val index = body.windowed(signature.size).withIndex().singleOrNull { it.value == signature }?.index ?: return false
+                val prefix = body.take(index)
+                if (prefix.count { it == OPEN } != prefix.count { it == CLOSE }) return false
+                val expected = tokens(reviewed)!!
+                val start = index - expected.indexOf(Token('w', "fun"))
+                if (start < 0 || body.drop(start).take(expected.size) != expected) return false
+                // An expression can continue on the next line. Require the next member to begin here.
+                return !expression || body.getOrNull(start + expected.size) in listOf(null, Token('w', "private"), Token('p', "@"))
+            }
+            return declaration("derivedRepeat", """private fun derivedRepeat(base: Map<String, String>) = base + ("is_repeat" to "true")""", true) &&
+                declaration("foregroundVisible", """
+                    private fun foregroundVisible(data: Map<String, String>) =
+                        measure(data, Post.APP, visible = true, source = 1, bank = 0)
+                """, true) &&
+                declaration("J16_1_foregroundDerivedRepeat", """
+                    @Test fun J16_1_foregroundDerivedRepeat() {
+                        val data = derivedRepeat(ONCE)
+                        checkDerived(ONCE, data)
+                        foregroundVisible(data)
+                    }
+                """)
         }
 
         /** The non-ASCII whitespace and format characters of [text], each as its code point: what a reader cannot see. */
