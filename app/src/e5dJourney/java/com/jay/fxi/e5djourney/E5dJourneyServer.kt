@@ -61,6 +61,9 @@ import okio.ByteString
  *   alert row cannot read a null there ([boundRow]);
  * - and three answers this fixture makes up, disclosed as such: the entitlements answer (the app's own DTO, as in J2a), an empty
  *   news answer in the app's news shape, and an empty success for a device registration.
+ * Source settings start empty. The fixture returns the requested threshold on creation and adds 10 to the canonical
+ * threshold served on subsequent reads. Source history is a fixed contract response independent of those settings.
+ * The fixture synthesizes tether/1d with the USD document's metadata and an empty series.
  * The WebSocket answers a valid subscribe with an acknowledgement built to the contract's wire schema without lease fields, its
  * active set being everything this connection keeps, then each accepted topic's snapshot; a text `ping` with a JSON pong. Every
  * upgrade, open, frame in or out (with what `send` returned), close and failure is recorded against its connection number;
@@ -81,6 +84,8 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
     /** The one owner's bank alert settings as this server holds them; filled from the contract on first use. Record lock only. */
     private var alertRows: MutableList<JsonObject>? = null
     private var nextAlertId = 1001
+    private val sourceRows = mutableListOf<JsonObject>()
+    private var nextSourceId = 2001
     private val connections = AtomicInteger()
 
     /** The REST and WebSocket base of this process's server, once it is bound. */
@@ -165,6 +170,13 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
                     response to "$method $path q=$queryText -> $kind"
                 }
             }
+            if (path == SOURCE_SETTINGS) {
+                val body = request.body.readUtf8()
+                return E5dJourneyRecord.addWith("http") {
+                    val (kind, response) = sourceSettings(method, query, body)
+                    response to "$method $path q=$queryText -> $kind"
+                }
+            }
             val (kind, response) = route(method, path, query, request)
             E5dJourneyRecord.add("http", "$method $path q=$queryText -> $kind")
             return response
@@ -188,13 +200,18 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
                 if (query.keys != setOf("topic") || file == null) return unexpected()
                 "topic-snapshot $topic" to ok(load(file))
             }
-            "/api/source-notification-settings" ->
-                if (query != mapOf("asset" to listOf("usdt-krw"))) unexpected()
-                else "source settings list n=0" to ok("""{"settings":[],"total_count":0}""".encodeToByteArray())
+            SOURCE_HISTORY -> {
+                if (query != mapOf("asset" to listOf(SOURCE_ASSET), "limit" to listOf("100")) || request.bodySize != 0L) return unexpected()
+                val bytes = load(SOURCE_HISTORY_LIST)
+                "source history body=${Json.parseToJsonElement(bytes.decodeToString())}" to ok(bytes)
+            }
             "/api/v2/graph/catalog" -> if (query.isNotEmpty()) unexpected() else "graph-catalog" to ok(load(BuildConfig.E5DJ_GRAPH_CATALOG_ASSET))
-            "/api/v2/graph/tab" ->
-                if (query != mapOf("tab" to listOf("usd"), "period" to listOf("1d"))) unexpected()
-                else "graph-tab usd 1d" to ok(load(BuildConfig.E5DJ_GRAPH_USD_1D_ASSET))
+            "/api/v2/graph/tab" -> when (query) {
+                mapOf("tab" to listOf("usd"), "period" to listOf("1d")) -> "graph-tab usd 1d" to ok(load(BuildConfig.E5DJ_GRAPH_USD_1D_ASSET))
+                mapOf("tab" to listOf("tether"), "period" to listOf("1d")) ->
+                    if (request.bodySize == 0L) "graph-tab tether 1d" to ok(tetherGraph()) else unexpected()
+                else -> unexpected()
+            }
             "/api/news" ->
                 if (query != mapOf("limit" to listOf("100"), "hours" to listOf("24.0"))) unexpected() else "news empty" to ok(emptyNews())
             "/ws" -> {
@@ -205,6 +222,46 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
             }
             else -> unexpected()
         }
+    }
+
+    private fun tetherGraph(): ByteArray {
+        val usd = Json.parseToJsonElement(load(BuildConfig.E5DJ_GRAPH_USD_1D_ASSET).decodeToString()).jsonObject
+        return JsonObject(mapOf(
+            "tab" to JsonPrimitive("tether"), "period" to JsonPrimitive("1d"),
+            "metadata" to usd.getValue("metadata"), "series" to JsonArray(emptyList())
+        )).toString().encodeToByteArray()
+    }
+
+    /** The record lock covers validation, id allocation, publication and the bytes described by the evidence. */
+    private fun sourceSettings(method: String, query: Map<String, List<String?>>, body: String): Pair<String, MockResponse> {
+        if (method == "GET") {
+            if (query != mapOf("asset" to listOf(SOURCE_ASSET)) || body.isNotEmpty()) return unexpected()
+            if (sourceRows.isEmpty()) return "source settings list n=0" to ok("""{"settings":[],"total_count":0}""".encodeToByteArray())
+            val bytes = JsonObject(mapOf(
+                "settings" to JsonArray(sourceRows), "total_count" to JsonPrimitive(sourceRows.size)
+            )).toString().encodeToByteArray()
+            return "source settings list n=${sourceRows.size} body=${bytes.decodeToString()}" to ok(bytes)
+        }
+        if (method != "POST" || query.isNotEmpty()) return unexpected()
+        val asked = runCatching { Json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return unexpected()
+        if (asked.keys != SOURCE_CREATE_KEYS) return unexpected()
+        fun string(key: String) = (asked[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+        if (string("source") !in SOURCE_EXCHANGES || string("asset") != SOURCE_ASSET ||
+            string("condition") !in setOf("above", "below") || asked["is_enabled"] != JsonPrimitive(true)) return unexpected()
+        val number = (asked["threshold"] as? JsonPrimitive)?.takeUnless { it.isString } ?: return unexpected()
+        if (!JSON_NUMBER.matches(number.content)) return unexpected()
+        val threshold = number.doubleOrNull ?: return unexpected()
+        if (threshold <= 0 || !(threshold + 10.0).isFinite()) return unexpected()
+
+        val template = Json.parseToJsonElement(load(SOURCE_ROW).decodeToString()).jsonObject
+        val id = nextSourceId++
+        val returned = JsonObject(template + asked + mapOf("id" to JsonPrimitive(id), "user_id" to JsonPrimitive(E5dJourneyIdentity.UID)))
+        val bytes = returned.toString().encodeToByteArray()
+        sourceRows += JsonObject(returned + ("threshold" to JsonPrimitive(threshold + 10.0)))
+        val evidence = JsonObject(mapOf(
+            "asked" to asked, "returned" to Json.parseToJsonElement(bytes.decodeToString()), "stored" to sourceRows.last()
+        ))
+        return "source create id=$id n=${sourceRows.size} evidence=$evidence" to ok(bytes)
     }
 
     /** Only ever called inside [E5dJourneyRecord.addWith]: the owner's list, or a create applied to it. */
@@ -423,6 +480,14 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
     private companion object {
         const val ENTITLEMENTS = "/api/entitlements"
         const val ALERT_SETTINGS = "/api/notification-settings"
+        const val SOURCE_SETTINGS = "/api/source-notification-settings"
+        const val SOURCE_HISTORY = "/api/source-notification-logs"
+        const val SOURCE_ASSET = "usdt-krw"
+        const val SOURCE_ROW = "source-setting-response.json"
+        const val SOURCE_HISTORY_LIST = "source-history-list.json"
+        val SOURCE_CREATE_KEYS = setOf("source", "asset", "condition", "threshold", "is_enabled")
+        val SOURCE_EXCHANGES = setOf("upbit", "bithumb", "coinone", "korbit", "gopax")
+        val JSON_NUMBER = Regex("""-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?""")
         const val REGISTER_DEVICE = "/api/register-device"
         const val ALERT_LIST = "bank-settings-list.json"
         const val ALERT_ROW = "bank-setting-response.json"
