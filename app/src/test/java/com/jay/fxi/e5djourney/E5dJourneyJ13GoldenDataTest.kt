@@ -59,11 +59,17 @@ class E5dJourneyJ13GoldenDataTest {
 
     @Test
     fun theJourneysCopiesAreTheGoldensData() {
-        assertEquals("J13, J14 and J16 copies", listOf(
-            setOf("ONCE", "REPEAT", "SYNC"), setOf("ONCE", "SYNC"), setOf("ONCE", "KRX_REPEAT", "SYNC")
+        assertEquals("J13, J14, J16 and J17 copies", listOf(
+            setOf("ONCE", "REPEAT", "SYNC"), setOf("ONCE", "SYNC"), setOf("ONCE", "KRX_REPEAT", "SYNC"), setOf("ONCE", "SYNC")
         ), JOURNEYS.map { it.copies.keys })
         for (journey in JOURNEYS) {
             val source = journey.source()
+            val code = checkNotNull(bare(source))
+            val companion = checkNotNull(companionBraces(code, journey.klass))
+            val names = Regex("""\bval (\w+) = mapOf\(""").findAll(code).filter {
+                it.range.first in companion && level(code, companion.first + 1, it.range.first) == 0
+            }.map { it.groupValues[1] }.toList()
+            assertEquals("${journey.klass}: companion copies", journey.copies.keys.sorted(), names.sorted())
             for ((name, id) in journey.copies) {
                 val copy = copy(source, name, journey)
                 assertNotNull("${journey.klass}.$name: declared once in the companion as one mapOf call of plain string pairs", copy)
@@ -255,6 +261,16 @@ class E5dJourneyJ13GoldenDataTest {
     }
 
     @Test
+    fun negatives_j17RejectsBankOnceAndSubstitutedDeliveryBody() {
+        val source = J17.source()
+        fun once(text: String) = text.substringAfter("val ONCE = mapOf(").substringBefore("\n        )")
+        val wrong = changed(source, once(source), once(J14.source()))
+        assertTrue(problems(copy(wrong, "ONCE", J17)!!, data("fcm-source-alert-once")).isNotEmpty())
+        assertTrue(deliverProblems(changed(source, """putExtra("body", data.getValue("body"))""",
+            """putExtra("body", "other")""")).isNotEmpty())
+    }
+
+    @Test
     fun j16DeliversTheCheckedUpbitOnceDerivative() {
         val source = J16.source()
         assertTrue("J16_1 and derivedRepeat must have their reviewed tokens", repeatBinding(source))
@@ -286,7 +302,9 @@ class E5dJourneyJ13GoldenDataTest {
             mapOf("ONCE" to "fcm-rate-alert-once", "SYNC" to "fcm-sync-alerts"))
         val J16 = Journey("../e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J16SourceFcmDisplayTest.kt", "J16SourceFcmDisplayTest",
             mapOf("ONCE" to "fcm-source-alert-once", "KRX_REPEAT" to "fcm-source-alert-repeat-krx", "SYNC" to "fcm-sync-alerts"))
-        val JOURNEYS = listOf(J13, J14, J16)
+        val J17 = Journey("../e5dJourney/src/main/kotlin/com/jay/fxi/e5djourney/test/J17SourceFcmReturnAndTapTest.kt", "J17SourceFcmReturnAndTapTest",
+            mapOf("ONCE" to "fcm-source-alert-once", "SYNC" to "fcm-sync-alerts"))
+        val JOURNEYS = listOf(J13, J14, J16, J17)
 
         /** The journey class with a companion that declares just [declaration]. */
         fun inCompanion(declaration: String): String = "class $JOURNEY_CLASS {\n    private companion object {\n        $declaration\n    }\n}\n"

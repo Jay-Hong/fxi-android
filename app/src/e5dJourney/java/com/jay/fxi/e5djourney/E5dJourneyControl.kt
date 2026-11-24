@@ -194,6 +194,15 @@ internal object E5dJourneyControl {
                 if (!entry.server().alertRow(id, state)) return answer(REJECT, mapOf("reason" to "alert-row"))
                 answer(ACK, mapOf("id" to id, "state" to state, "recordUpper" to E5dJourneyRecord.upper()))
             }
+            SOURCE_ROW -> {
+                @Suppress("DEPRECATION")
+                val id = extras.get(EXTRA_ID) as? String
+                @Suppress("DEPRECATION")
+                val state = extras.get(EXTRA_ARG) as? String
+                if (id != "102" || state == null || state !in setOf("seed", "armed", "fired") ||
+                    !entry.server().sourceRow(102, state)) return answer(REJECT, mapOf("reason" to SOURCE_ROW))
+                answer(ACK, mapOf("id" to 102, "state" to state, "recordUpper" to E5dJourneyRecord.upper()))
+            }
             else -> answer(REJECT, mapOf("reason" to "command"))
         }
     }
@@ -288,11 +297,12 @@ internal object E5dJourneyControl {
     const val NOTIFICATIONS = "notifications"
     const val NOTIFICATIONS_CLEAR = "notifications-clear"
     const val ALERT_ROW = "alert-row"
+    const val SOURCE_ROW = "source-row"
     const val EXTRA_ID = "id"
 
     private const val FCM_RECEIVE = "com.google.android.c2dm.intent.RECEIVE"
     private const val FCM_SENDER = "000000000000"
     private val FCM_RESERVED_PREFIXES = listOf("google.", "gcm.")
     private val FCM_ENVELOPE_KEYS = setOf("from", "message_type", "collapse_key")
-    private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW)
+    private val NEEDS_READY = setOf(START, PHASE, ANSWER, SIGN_OUT, SIGN_IN, ARM, RELEASE, LOCAL_PREMIUM, ACCESS, SEED_LAST_BANK, FCM, NOTIFICATIONS_CLEAR, ALERT_ROW, SOURCE_ROW)
 }

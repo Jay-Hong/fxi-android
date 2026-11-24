@@ -142,6 +142,34 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
         true
     }
 
+    fun sourceRow(id: Int, state: String): Boolean = E5dJourneyRecord.under {
+        if (id != 102) return@under false
+        if (state == "seed") {
+            if (sourceRows.isNotEmpty()) return@under false
+            val template = Json.parseToJsonElement(load(SOURCE_ROW).decodeToString()).jsonObject
+            val seed = mapOf(
+                "id" to JsonPrimitive(id), "source" to JsonPrimitive("upbit"), "asset" to JsonPrimitive(SOURCE_ASSET),
+                "condition" to JsonPrimitive("below"), "threshold" to JsonPrimitive(1385.0), "repeat_interval_sec" to JsonNull,
+                "is_enabled" to JsonPrimitive(true), "triggered" to JsonPrimitive(false), "triggered_at" to JsonNull
+            )
+            if (!seed.all { (key, value) -> template[key] == value }) return@under false
+            sourceRows += JsonObject(template + ("user_id" to JsonPrimitive(E5dJourneyIdentity.UID)))
+        } else {
+            if (state != "armed" && state != "fired") return@under false
+            val index = sourceRows.indices.singleOrNull { sourceRows[it]["id"] == JsonPrimitive(id) } ?: return@under false
+            val row = sourceRows[index]
+            if (row["user_id"] != JsonPrimitive(E5dJourneyIdentity.UID) || row["source"] != JsonPrimitive("upbit") ||
+                row["asset"] != JsonPrimitive(SOURCE_ASSET)) return@under false
+            val fired = state == "fired"
+            sourceRows[index] = JsonObject(row + mapOf(
+                "is_enabled" to JsonPrimitive(!fired), "triggered" to JsonPrimitive(fired),
+                "triggered_at" to (if (fired) JsonPrimitive(ALERT_FIRED_AT) else JsonNull)
+            ))
+        }
+        E5dJourneyRecord.add("server", "source row id=$id -> $state n=${sourceRows.size}")
+        true
+    }
+
     override fun close() {
         server.shutdown()
     }
