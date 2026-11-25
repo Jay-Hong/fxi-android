@@ -674,6 +674,7 @@ class AlertN1StructureTest {
     @Test fun `S7N1_S12 S8-6 rejects wiring and banner mutations and accepts reformatted delegation`() {
         for ((label, tree, tag) in listOf(
             Triple("jitter [0, 1)", editedLiteral(OWNER, "Random.nextDouble(-0.2, 0.2)", "Random.nextDouble()"), "S11-inject $OWNER"),
+            Triple("comparison supplier omitted", editedLiteral(REGISTRY, ", { comparison.get() }", ""), "S11-inject $REGISTRY"),
             Triple("comparison wired to an unguarded reader", editedLiteral(COMPARISON_OWNER, "comparisonSettingsGet(repository), access,",
                 "{ use, _ -> repository.getComparisonAlerts(use.identity) }, access,"), "S11-inject $COMPARISON_OWNER"),
             Triple("comparison identity ignores deletion", editedLiteral(COMPARISON_OWNER, " && protectedAdmission()", ""),
@@ -1375,8 +1376,9 @@ class AlertN1StructureTest {
                     GraphProtectedAdmission(tokens::currentIdentityFence, deletions))""",
                 FLOOR to """@Inject constructor() : this(SystemClock::elapsedRealtime)""",
                 REGISTRY to """@Inject constructor(bank: Provider<BankAlertSettingsOwner>, source: Provider<SourceAlertSettingsOwner>,
+                    comparison: Provider<ComparisonAlertSettingsOwner>,
                     coordinator: PremiumAccessCoordinator, tokens: AuthTokenProvider, capability: Provider<NotificationCapabilityMonitor>) :
-                    this(listOf({ bank.get() }, { source.get() }),
+                    this(listOf({ bank.get() }, { source.get() }, { comparison.get() }),
                     { ProcessLifecycleOwner.get().lifecycle },
                     { action -> Handler(Looper.getMainLooper()).post { action() }; Unit }, coordinator.state, tokens::currentIdentityFence,
                     CoroutineScope(SupervisorJob() + Dispatchers.Main), foregroundHooks = listOf({ capability.get().onForeground() }))"""
@@ -1523,6 +1525,7 @@ class AlertN1StructureTest {
                 "AlertSettingsAccess" to setOf(ACCESS, OWNER, SOURCE_OWNER, COMPARISON_OWNER, SOURCE_HISTORY_ENTRY, REGISTRY),
                 "AlertRateLimitFloor" to setOf(FLOOR, OWNER, SOURCE_OWNER, SOURCE_HISTORY_ENTRY),
                 // S8-4a: the registry registers the source owner and the tether section reads it; the section projects with the policy.
+                "ComparisonAlertSettingsOwner" to setOf(COMPARISON_OWNER, REGISTRY, BASE + "ui/alert/ComparisonAlertSection.kt"),
                 "SourceAlertSettingsOwner" to setOf(SOURCE_OWNER, REGISTRY, SOURCE_SECTION),
                 // S8-7: the free tether preview projects its quotes and lists its exchanges with the policy, and nothing more.
                 "SourceAlertRowPolicy" to setOf(ROW_POLICY, SOURCE_OWNER, SOURCE_SECTION, SOURCE_HISTORY_HOLDER, REGISTRY,
@@ -1587,6 +1590,10 @@ class AlertN1StructureTest {
             val sourceName = sourceProvider.singleOrNull()?.groupValues?.get(1)
             if (sourceName == null || count(registry, """\b$sourceName\s*\.\s*get\s*\(\s*\)""") != 1 ||
                 count(registry, """\{\s*$sourceName\s*\.\s*get\s*\(\s*\)\s*\}""") != 1) v += "A-lazy-source-owner"
+            val comparisonProvider = Regex("""\b(\w+)\s*:\s*Provider\s*<\s*ComparisonAlertSettingsOwner\s*>""").findAll(registry).toList()
+            val comparisonName = comparisonProvider.singleOrNull()?.groupValues?.get(1)
+            if (comparisonName == null || count(registry, """\b$comparisonName\s*\.\s*get\s*\(\s*\)""") != 1 ||
+                count(registry, """\{\s*$comparisonName\s*\.\s*get\s*\(\s*\)\s*\}""") != 1) v += "A-lazy-comparison-owner"
             return v
         }
 

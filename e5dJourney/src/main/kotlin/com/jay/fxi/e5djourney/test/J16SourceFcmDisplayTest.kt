@@ -72,6 +72,8 @@ class J16SourceFcmDisplayTest {
             }
             val free = owner("FreeConfirmed")
             check(free.getString("uid") == "u1") { free }
+            val freeRecord = run.client.dump(nonce)
+            assertComparisonRows("free", E5dJourneyTraffic.server(freeRecord.lines, 0, freeRecord.upper), 0)
             run.client.ack("answer", nonce) { putExtra("arg", "active") }
             run.client.ack("local-premium", nonce)
             val premium = owner("PremiumConfirmed")
@@ -79,11 +81,13 @@ class J16SourceFcmDisplayTest {
                 premium.getLong("authGeneration") == free.getLong("authGeneration")) { "$free -> $premium" }
         }
         premise("기동 GET·서버 quiet") {
-            run.awaitRecord(nonce, "bank/source 목록", 90_000) { lines ->
+            run.awaitRecord(nonce, "bank/source/comparison 목록", 90_000) { lines ->
                 val http = E5dJourneyRun.texts(lines, "http")
-                SOURCE_OK in http && http.any(BANK_OK::matches)
+                SOURCE_OK in http && http.any(BANK_OK::matches) && COMPARISON_LIST in http
             }
             run.settle(nonce)
+            val cold = run.client.dump(nonce)
+            assertComparisonRows("cold premium", E5dJourneyTraffic.server(cold.lines, 0, cold.upper), 1)
         }
     }
 
@@ -162,7 +166,7 @@ class J16SourceFcmDisplayTest {
     }
 
     @Test
-    fun J16_2_foregroundDataOnlySync() = measure(SYNC, Post.NONE, visible = false, source = 1, bank = 1)
+    fun J16_2_foregroundDataOnlySync() = measure(SYNC, Post.NONE, visible = false, source = 1, bank = 1, comparison = 1)
 
     @Test
     fun J16_3_liveBackgroundOnce() {
@@ -263,12 +267,13 @@ class J16SourceFcmDisplayTest {
         return Seen(posted, active, logs)
     }
 
-    private fun measure(data: Map<String, String>, post: Post, visible: Boolean, source: Int, bank: Int) {
+    private fun measure(data: Map<String, String>, post: Post, visible: Boolean, source: Int, bank: Int, comparison: Int = 0) {
         Log.i(TAG, "begin $nonce")
         val window = premise("listener 관측창") { notifications.open(nonce) }
         val start = premise("시작 record·기동 GET") {
             val before = run.client.dump(nonce)
             val initial = E5dJourneyTraffic.server(before.lines, 0, before.upper)
+            assertComparisonRows("시작 record", initial, 1)
             val sources = gets(initial, SOURCE)
             val banks = gets(initial, BANK)
             check(sources.isNotEmpty() && sources.all { it.text == SOURCE_OK } &&
@@ -299,6 +304,7 @@ class J16SourceFcmDisplayTest {
                 val controls = E5dJourneyRun.texts(record.lines.drop(start), "control").filter { it.startsWith("fcm ") }
                 check(controls == listOf("fcm mid=${seen.logs.mid} visible=$visible result=-1 failure=null")) { controls }
             }
+            assertComparisonRows("$case 주입 ($start, ${record.upper}]", server, comparison)
             val sourceRows = gets(server, SOURCE)
             val bankRows = gets(server, BANK)
             val detail = "types=${seen.logs.types} postedN=${seen.posted.size} posted=${seen.posted} " +

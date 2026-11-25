@@ -201,7 +201,8 @@ class BankAlertSectionRouteTest {
                     userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
                     settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = history,
                     bankAlertSectionSourceFactory = sectionFactory, sourceAlertSectionSourceFactory = sourceAlerts,
-                    sourceHistoryWiring = sourceHistory)
+                    sourceHistoryWiring = sourceHistory,
+                    comparisonAlertSectionSourceFactory = comparisonTestFactory(consumer))
             }
         }
         rule.waitForIdle()

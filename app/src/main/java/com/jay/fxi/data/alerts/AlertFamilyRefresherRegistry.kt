@@ -67,11 +67,12 @@ internal class AlertFamilyRefresherRegistry internal constructor(
     @Inject constructor(
         bank: Provider<BankAlertSettingsOwner>,
         source: Provider<SourceAlertSettingsOwner>,
+        comparison: Provider<ComparisonAlertSettingsOwner>,
         coordinator: PremiumAccessCoordinator,
         tokens: AuthTokenProvider,
         capability: Provider<NotificationCapabilityMonitor>
     ) : this(
-        listOf({ bank.get() }, { source.get() }),
+        listOf({ bank.get() }, { source.get() }, { comparison.get() }),
         { ProcessLifecycleOwner.get().lifecycle },
         { action -> Handler(Looper.getMainLooper()).post { action() }; Unit },
         coordinator.state,

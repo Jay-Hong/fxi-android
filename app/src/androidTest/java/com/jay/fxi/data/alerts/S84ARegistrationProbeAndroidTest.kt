@@ -33,6 +33,13 @@ import com.jay.fxi.data.remote.TopicSessionFence
 import com.jay.fxi.data.repository.AlertRepository
 import com.jay.fxi.di.NetworkModule
 import com.jay.fxi.domain.model.FreeTab
+import androidx.compose.foundation.layout.Column
+import com.jay.fxi.ui.alert.ComparisonAlertSectionSource
+import com.jay.fxi.ui.alert.ComparisonAlertSectionEntryPoint
+import com.jay.fxi.ui.alert.ComparisonAlertSectionSourceFactory
+import com.jay.fxi.ui.alert.ComparisonSectionMountContent
+import com.jay.fxi.ui.alert.OwnerComparisonSectionSource
+import com.jay.fxi.ui.alert.ProductionComparisonAlertSectionSourceFactory
 import com.jay.fxi.ui.alert.BankAlertSectionEntryPoint
 import com.jay.fxi.ui.alert.NotificationPermissionEntryPoint
 import com.jay.fxi.ui.alert.ProductionSourceAlertSectionSourceFactory
@@ -111,7 +118,7 @@ class S84ARegistrationProbeAndroidTest {
         assertFalse("premise: the D24-OFF process never started it", registry.field("started") as Boolean)
         @Suppress("UNCHECKED_CAST")
         val families = registry.field("families") as List<() -> AlertLifecycleAdapter>
-        assertEquals("two families", 2, families.size)
+        assertEquals("three families", 3, families.size)
         val bank = onMain { families[0]() }
         val source = onMain { families[1]() }
         assertSame("the first family is the bank section's owner",
@@ -120,6 +127,11 @@ class S84ARegistrationProbeAndroidTest {
             EntryPointAccessors.fromApplication(app, SourceAlertSectionEntryPoint::class.java).sourceAlertSettingsOwner(), source)
         assertSame("a second resolve is the same source owner", source, onMain { families[1]() })
         assertSame("a second resolve is the same bank owner", bank, onMain { families[0]() })
+        val comparison = EntryPointAccessors.fromApplication(app, ComparisonAlertSectionEntryPoint::class.java).comparisonAlertSettingsOwner()
+        repeat(2) {
+            assertSame(comparison, onMain { families[2]() })
+            assertSame(comparison.state, ProductionComparisonAlertSectionSourceFactory.create(app).state)
+        }
         val section = ProductionSourceAlertSectionSourceFactory.create(app)
         source as SourceAlertSettingsOwner
         assertSame("the production tether factory reads its settings", source.state, section.settings)
@@ -138,7 +150,12 @@ class S84ARegistrationProbeAndroidTest {
             .addInterceptor { chain ->
                 val url = chain.request().url
                 requests += "${chain.request().method} ${url.encodedPath}" + (url.encodedQuery?.let { "?$it" } ?: "")
-                val body = if (url.encodedPath == "/api/source-notification-settings") SOURCE_JSON else BANK_JSON
+                val body = when (url.encodedPath) {
+                    "/api/source-notification-settings" -> SOURCE_JSON
+                    "/api/notification-settings" -> BANK_JSON
+                    "/api/comparison-alerts" -> COMPARISON_JSON
+                    else -> error("unexpected path: ${url.encodedPath}")
+                }
                 Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
                     .body(body.toResponseBody("application/json".toMediaType())).build()
             }
@@ -156,10 +173,13 @@ class S84ARegistrationProbeAndroidTest {
         val access = AlertSettingsAccess(tokens::currentIdentityFence, { fence }, SnapshotTopicUseAuthority { snapshot },
             { premium.value }, { true }, GraphProtectedAdmission(tokens::currentIdentityFence, DeletionAdmissionStore()))
         val floor = AlertRateLimitFloor(SystemClock::elapsedRealtime)
+        lateinit var comparison: ComparisonAlertSettingsOwner
         lateinit var bank: BankAlertSettingsOwner
         lateinit var source: SourceAlertSettingsOwner
         rule.runOnUiThread {
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main).also { scopes += it }
+            comparison = ComparisonAlertSettingsOwner(comparisonSettingsGet(repository), access, { a1 }, premium,
+                MutableStateFlow(0L), scope, { delay(it) }, { 0.0 })
             bank = BankAlertSettingsOwner(
                 { o, admitted -> repository.getSettings(o, admitted) }, access, floor, AlertRetryPolicy(), SystemClock::elapsedRealtime,
                 { 0.0 }, scope, { delay(it) }, premium, MutableStateFlow(0L), MutableStateFlow(true),
@@ -174,11 +194,13 @@ class S84ARegistrationProbeAndroidTest {
         }
         val bankResolves = AtomicInteger()
         val sourceResolves = AtomicInteger()
+        val comparisonResolves = AtomicInteger()
         val hooks = AtomicInteger()
         val entry = EntryPointAccessors.fromApplication(app, NotificationPermissionEntryPoint::class.java)
         val registry = AlertFamilyRefresherRegistry(
             Provider { bankResolves.incrementAndGet(); bank },
             Provider { sourceResolves.incrementAndGet(); source },
+            Provider { comparisonResolves.incrementAndGet(); comparison },
             entry.premiumAccessCoordinator(),
             entry.authTokenProvider(),
             Provider { hooks.incrementAndGet(); throw IllegalStateException("S8-4a probe: the real monitor is not touched") }
@@ -206,16 +228,38 @@ class S84ARegistrationProbeAndroidTest {
         var removed = -1
         try {
             rule.runOnUiThread { registry.start() }
-            rule.setContent { SourceAlertSection(tab = FreeTab.TETHER, owner = TopicDisplayOwner(a1, 1L), isShown = { true }, sourceFactory = sameOwner) }
+            val owner = TopicDisplayOwner(a1, 1L)
+            val ensures = AtomicInteger()
+            val factory = ComparisonAlertSectionSourceFactory {
+                val read = OwnerComparisonSectionSource(comparison)
+                object : ComparisonAlertSectionSource by read {
+                    override fun ensure() {
+                        ensures.incrementAndGet()
+                        read.ensure()
+                    }
+                }
+            }
+            rule.setContent {
+                Column {
+                    SourceAlertSection(tab = FreeTab.TETHER, owner = owner, isShown = { true }, sourceFactory = sameOwner)
+                    for (kind in listOf("signed", "absolute")) {
+                        ComparisonSectionMountContent(FreeTab.TETHER, kind, owner, factory, { true }) { _ -> {} }
+                    }
+                }
+            }
+            rule.waitUntil(5_000) { listOf(41, 42).all { rule.onAllNodesWithTag("comparison-row-$it").fetchSemanticsNodes().size == 1 } }
+            assertEquals(listOf(41, 42), onMain { comparison.state.value.adopted?.rows?.map { it.id } })
             rule.waitUntil(5_000) { onMain { source.state.value.phase == AlertLoadPhase.Ready && bank.state.value.phase == AlertLoadPhase.Ready } }
             rule.waitUntil(5_000) { rule.onAllNodesWithTag(SourceAlertSectionTags.ROW).fetchSemanticsNodes().size == 1 }
             quiet()
+            assertEquals(2, ensures.get())
+            assertEquals(1, gets("/api/comparison-alerts"))
             assertEquals("the section drew the owner's one adopted row", listOf(21), onMain { source.state.value.settings?.map { it.id } })
             assertEquals("one source settings GET for the cold foreground and the section's ensure", 1,
                 gets("/api/source-notification-settings?asset=usdt-krw"))
             assertEquals("one bank settings GET", 1, gets("/api/notification-settings"))
-            assertEquals("each provider resolved once, the capability hook once", listOf(1, 1, 1),
-                listOf(bankResolves.get(), sourceResolves.get(), hooks.get()))
+            assertEquals("each provider resolved once, the capability hook once", listOf(1, 1, 1, 1),
+                listOf(bankResolves.get(), sourceResolves.get(), comparisonResolves.get(), hooks.get()))
 
             rule.runOnUiThread { registry.start() }
             rule.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
@@ -223,28 +267,30 @@ class S84ARegistrationProbeAndroidTest {
             rule.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
             rule.waitUntil(10_000) { processState().isAtLeast(Lifecycle.State.STARTED) }
             quiet()
-            assertEquals("a second start and a return resolve no provider again", listOf(1, 1),
-                listOf(bankResolves.get(), sourceResolves.get()))
+            assertEquals("a second start and a return resolve no provider again", listOf(1, 1, 1),
+                listOf(bankResolves.get(), sourceResolves.get(), comparisonResolves.get()))
             assertEquals("the return ran the hook once more", 2, hooks.get())
-            assertEquals("a fresh return sends no second GET", listOf(1, 1),
-                listOf(gets("/api/source-notification-settings?asset=usdt-krw"), gets("/api/notification-settings")))
+            assertEquals("a fresh return sends no second GET", listOf(1, 1, 1),
+                listOf(gets("/api/source-notification-settings?asset=usdt-krw"), gets("/api/notification-settings"), gets("/api/comparison-alerts")))
             assertEquals("every request was a settings GET", setOf("GET /api/source-notification-settings?asset=usdt-krw",
-                "GET /api/notification-settings"), requests.toSet())
+                "GET /api/notification-settings", "GET /api/comparison-alerts"), requests.toSet())
         } finally {
             // Test-only teardown of the registry built here, whatever happened above: its own scope and its process observer.
             (registry.field("scope") as CoroutineScope).cancel()
             removed = removeObserversOf(registry)
+            scopes.forEach { it.cancel() }
         }
+        assertTrue("owner scopes cancelled", scopes.all { it.coroutineContext[kotlinx.coroutines.Job]?.isCancelled == true })
         assertEquals("the registry built here observed the process once", 1, removed)
         // Then a return must reach nothing of it.
-        val before = listOf(bankResolves.get(), sourceResolves.get(), hooks.get(), requests.size)
+        val before = listOf(bankResolves.get(), sourceResolves.get(), comparisonResolves.get(), hooks.get(), requests.size)
         rule.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
         rule.waitUntil(10_000) { processState() == Lifecycle.State.CREATED }
         rule.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
         rule.waitUntil(10_000) { processState().isAtLeast(Lifecycle.State.STARTED) }
         quiet()
         assertEquals("after the teardown a return reaches no provider, no hook and no GET", before,
-            listOf(bankResolves.get(), sourceResolves.get(), hooks.get(), requests.size))
+            listOf(bankResolves.get(), sourceResolves.get(), comparisonResolves.get(), hooks.get(), requests.size))
     }
 
     /** Removes from the process lifecycle every observer that belongs to [registry]; returns how many there were. */
@@ -268,6 +314,20 @@ class S84ARegistrationProbeAndroidTest {
     }
 
     private companion object {
+        const val COMPARISON_JSON = """
+            {"alerts":[
+              {"id":41,"user_id":"A","tab":"tether",
+               "left_source":"upbit","left_asset":"usdt-krw","right_source":"hana","right_asset":"usd-krw",
+               "diff_type":"signed","operator":"gte","threshold":30.0,"is_enabled":true,"triggered":false,
+               "repeat_interval_sec":null,"last_notified_spread":null,
+               "created_at":"2026-10-01T10:00:00+09:00","updated_at":null},
+              {"id":42,"user_id":"A","tab":"tether",
+               "left_source":"upbit","left_asset":"usdt-krw","right_source":"bithumb","right_asset":"usdt-krw",
+               "diff_type":"absolute","operator":"gte","threshold":30.0,"is_enabled":true,"triggered":false,
+               "repeat_interval_sec":null,"last_notified_spread":null,
+               "created_at":"2026-10-01T10:00:00+09:00","updated_at":null}
+            ],"total_count":2}
+        """
         const val BANK_JSON = """{"settings":[{"id":7,"user_id":"A","bank":"kb","currency":"usd-krw","condition":"above",""" +
             """"threshold":1400.5,"is_enabled":true,"triggered":false,"created_at":"2026-10-01T10:00:00+09:00",""" +
             """"updated_at":"2026-10-01T10:00:00+09:00","triggered_at":null,"repeat_interval_sec":null}],"total_count":1}"""

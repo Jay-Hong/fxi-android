@@ -94,6 +94,8 @@ class J17SourceFcmReturnAndTapTest {
             }
             val free = owner("FreeConfirmed")
             check(free.getString("uid") == "u1") { free }
+            val freeRecord = run.client.dump(nonce)
+            assertComparisonRows("free", E5dJourneyTraffic.server(freeRecord.lines, 0, freeRecord.upper), 0)
             run.client.ack("answer", nonce) { putExtra("arg", "active") }
             run.client.ack("local-premium", nonce)
             val premium = owner("PremiumConfirmed")
@@ -103,11 +105,12 @@ class J17SourceFcmReturnAndTapTest {
                 premium.getLong("authGeneration") == free.getLong("authGeneration")) { "$free -> $premium" }
         }
         premise("기동 GET·서버 quiet") {
-            run.awaitRecord(nonce, "bank/source 목록", 90_000) { lines ->
+            run.awaitRecord(nonce, "bank/source/comparison 목록", 90_000) { lines ->
                 val http = E5dJourneyRun.texts(lines, "http")
-                SOURCE_OK in http && http.any(BANK_OK::matches)
+                SOURCE_OK in http && http.any(BANK_OK::matches) && COMPARISON_LIST in http
             }
             run.settle(nonce)
+            assertComparisonRows("cold premium", record(), 1)
         }
         premise("테더 빈 목록") {
             run.tap("premium_tab_TETHER")
@@ -119,6 +122,7 @@ class J17SourceFcmReturnAndTapTest {
             val banks = gets(rows, BANK)
             check(sources.isNotEmpty() && sources.all { it.text == SOURCE_OK } &&
                 banks.isNotEmpty() && banks.all { BANK_OK.matches(it.text) }) { entries(sources + banks) }
+            assertComparisonRows("테더 진입까지", rows, 1)
             startUpper = rows.last().sequence
             window = notifications.open(nonce)
             logWindow("open", window)
@@ -263,7 +267,7 @@ class J17SourceFcmReturnAndTapTest {
             val monitored = line.stream in listOf("intent", "intent-source") ||
                 line.stream == "control" && line.text.startsWith("fcm ") ||
                 line.stream == "server" && line.text.startsWith("source row ") ||
-                line.stream == "http" && line.text.substringAfter(' ').substringBefore(' ') in listOf(SOURCE, BANK)
+                line.stream == "http" && line.text.substringAfter(' ').substringBefore(' ') in listOf(SOURCE, BANK, COMPARISON_PATH)
             monitored && startUpper?.let { line.sequence > it } == true && line.sequence !in accounted
         }
         val complete = unexpected.isEmpty() && rows.size == dump.upper && rows.all { it.nanos > 0 } && unclaimed.isEmpty()
@@ -346,6 +350,7 @@ class J17SourceFcmReturnAndTapTest {
         val before = upper()
         val reply = run.client.send("source-row", nonce) { field("id", id); field("arg", arg) }
         val rows = record()
+        assertComparisonRows("source-row 명령", rows.filter { it.sequence > before }, 0)
         val lines = rows.filter { it.sequence > before && it.stream == "server" && it.text.startsWith("source row ") }
         claim(lines)
         Command(reply, before, rows.last().sequence, lines, id, arg).also {
@@ -424,7 +429,7 @@ class J17SourceFcmReturnAndTapTest {
         }
     }
 
-    private data class Prep(val g: Long, val u: Long)
+    private data class Prep(val g: Long, val u: Long, val comparisonUpper: Int)
 
     private fun syncRead(state: String, label: String, fixture: Command? = null): Prep {
         val delivery = inject(label, SYNC, visible = false, front = true)
@@ -443,6 +448,7 @@ class J17SourceFcmReturnAndTapTest {
         // Command cases judge the settled response and screen, independently of G/U.
         if (fixture != null) shown = row()
         val rows = record().filter { it.sequence > delivery.before }
+        claim(assertComparisonRows("$label sync", rows, 1))
         val source = gets(rows, SOURCE)
         val bank = gets(rows, BANK)
         claim(source + bank)
@@ -457,7 +463,7 @@ class J17SourceFcmReturnAndTapTest {
             delivery.types == listOf("sync_alerts") && (fixture != null || u <= delivery.start + INSIDE)
         if (fixture == null) premise("준비($state)") { check(ok) { detail } }
         else result(if (label == "unchanged") "거절 뒤 행 불변" else "source-row $label 본문·화면", detail, ok)
-        return Prep(source.single().nanos, u)
+        return Prep(source.single().nanos, u, rows.last().sequence)
     }
 
     private fun adopt(state: String): Prep = premise("준비($state)") {
@@ -524,8 +530,10 @@ class J17SourceFcmReturnAndTapTest {
         if (post == null) seen.posted.isEmpty() && seen.active.isEmpty()
         else seen.posted.map { five(it) } == listOf(five(post)) && seen.active.map { five(it) } == listOf(five(post))
 
-    private fun backgroundGets(prep: Prep, home: Home?, end: Long, atAction: Boolean = false) {
-        val rows = record().filter { it.nanos > prep.u && it.nanos <= end }
+    private fun backgroundGets(prep: Prep, home: Home?, end: Long, rowsAtUpper: List<Line>, atAction: Boolean = false) {
+        val throughEnd = rowsAtUpper.filter { it.nanos <= end }
+        assertComparisonRows("준비 뒤 동작 전", throughEnd.filter { it.sequence > prep.comparisonUpper }, 0)
+        val rows = throughEnd.filter { it.nanos > prep.u }
         val source = gets(rows, SOURCE)
         val bank = gets(rows, BANK)
         claim(source + bank)
@@ -546,7 +554,7 @@ class J17SourceFcmReturnAndTapTest {
         result("배경 게시", detail, ok)
         val wanted = if (delivery != null && !visible) listOf("sync_alerts") else emptyList()
         result("배경 callback", detail, seen.typeLogs == wanted && delivery?.types.orEmpty() == wanted)
-        backgroundGets(prep, home, now())
+        backgroundGets(prep, home, now(), record())
         return post
     }
 
@@ -632,7 +640,8 @@ class J17SourceFcmReturnAndTapTest {
         SystemClock.sleep(8_000)
         if (needOne && !outside) {
             val rows = record().filter { it.nanos > a }
-            if (gets(rows, SOURCE).isEmpty() || case == "J17_2" && gets(rows, BANK).isEmpty()) {
+            if (gets(rows, SOURCE).isEmpty() || case == "J17_2" &&
+                (gets(rows, BANK).isEmpty() || gets(rows, COMPARISON_PATH).isEmpty())) {
                 while (now() <= prep.g + INSIDE) SystemClock.sleep(100)
             }
         }
@@ -673,7 +682,7 @@ class J17SourceFcmReturnAndTapTest {
         evidence("observation", detail)
         evidence("route", "op=$op nav=${nav.path} N=${nav.upper} original=$original access=$identity " +
             "activity=${entries(later.filter { it.stream == "activity" })}")
-        backgroundGets(prep, home, a, atAction = true)
+        backgroundGets(prep, home, a, rows, atAction = true)
         premise("주입 귀속") {
             check(actionEnd.typeLogs.isEmpty() && seen.typeLogs == types.values.flatten() && later.none { it.stream == "control" && it.text.startsWith("fcm ") }) {
                 "actual=${seen.typeLogs} deliveries=$types"
@@ -682,7 +691,7 @@ class J17SourceFcmReturnAndTapTest {
         return Watch(prep, a, c, e, nav, last, seen, source, bank, later, original, frontAtC, premium, detail)
     }
 
-    private fun counts(w: Watch, source: Int, bank: Int?, state: String, outside: Boolean = false, shade: Boolean = false) {
+    private fun counts(w: Watch, source: Int, bank: Int?, state: String, outside: Boolean = false, shade: Boolean = false, comparison: Int = 0) {
         val limit = w.prep.g + INSIDE
         fun timely(lines: List<Line>, expected: Int): Boolean = when {
             expected == 0 -> w.c <= limit && w.e <= limit + 8_000_000_000L
@@ -692,6 +701,11 @@ class J17SourceFcmReturnAndTapTest {
         }
         premise("시간 창") {
             check(w.frontAtC && if (outside) w.a >= w.prep.u + OUTSIDE else timely(w.source, source)) { w.detail }
+        }
+        val comparisonRows = assertComparisonRows("$case 동작 (${w.a}, ${w.e}]", w.events, comparison)
+        if (comparison > 0) {
+            premise("comparison 시간 창") { check(timely(comparisonRows, comparison)) { w.detail } }
+            claim(comparisonRows)
         }
         val phase = if (shade) "shade " else ""
         result("${phase}source GET $source", w.detail, w.source.size == source && w.source.all { listed(it, state) })
@@ -754,7 +768,7 @@ class J17SourceFcmReturnAndTapTest {
         result("배경 게시", "stage=return first=$post last=$beforeReturn", post == beforeReturn)
         val one = outside || sync
         val w = watch(prep, home, "launcher", delivery?.mid, one, outside) { run.launch() }
-        counts(w, if (one) 1 else 0, if (outside) null else if (sync) 1 else 0, FIRED, outside)
+        counts(w, if (one) 1 else 0, if (outside) null else if (sync) 1 else 0, FIRED, outside, comparison = if (sync) 1 else 0)
         val wanted = if (one) FIRED else ARMED
         result("102행 $wanted", w.detail, w.last.state == wanted)
         result("게시 유지", w.detail, retained(w.observed, post))
@@ -793,6 +807,7 @@ class J17SourceFcmReturnAndTapTest {
             run.settle(nonce, quietMillis = 1_000)
             val seen = observe()
             val rows = record().filter { it.sequence > delivery.before }
+            assertComparisonRows("app-once", rows, 0)
             val source = gets(rows, SOURCE)
             val bank = gets(rows, BANK)
             claim(source + bank)

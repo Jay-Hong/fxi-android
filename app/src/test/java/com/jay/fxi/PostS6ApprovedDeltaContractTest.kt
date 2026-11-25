@@ -74,16 +74,16 @@ class PostS6ApprovedDeltaContractTest {
     @Test fun P01_theApprovedLedgerValidates_andMatchesTheActualSourcesExactly() {
         assertEquals("the pin is the manifest's bytes", PostS6ApprovedDelta.APPROVED_SHA256, PostS6ApprovedDelta.sha(raw))
         val ledger = PostS6ApprovedDelta.ledger()
-        assertEquals("the folded ledger contains exactly the expected production paths through S9-2a",
+        assertEquals("the folded ledger contains exactly the expected production paths through S9-2b",
             setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport + activity +
                 pushManager + pushCoordinator + e5b2aAdded + settingsScreen + e5b2b1Added + alertSheet + e5b3aAdded + e5b3bNew +
                 rateRowStore + e5b4aAdded + cacheService + e5b4bAdded + e5dNew + e5dAdded + s83Added + s84aAdded + s84bAdded + s85bAdded +
-                s87AddedPaths + s91Policy + s92aOwner,
+                s87AddedPaths + s91Policy + s92aOwner + s92bSection,
             ledger.final.keys)
         assertEquals(setOf(api, repo) + s7cChanged + n1Changed + e5a1Changed + transport + activity + pushManager + pushCoordinator +
             settingsScreen + alertSheet + e5b3bNew + rateRowStore + cacheService + e5dNew, ledger.changed)
         assertEquals(setOf(access) + s7b + s7cAdded + n1Added + e5a1Added + e5b2aAdded + e5b2b1Added + e5b3aAdded + e5b4aAdded + e5b4bAdded + e5dAdded +
-            s83Added + s84aAdded + s84bAdded + s85bAdded + s87AddedPaths + s91Policy + s92aOwner, ledger.added)
+            s83Added + s84aAdded + s84bAdded + s85bAdded + s87AddedPaths + s91Policy + s92aOwner + s92bSection, ledger.added)
         assertEquals("history hashes", mapOf(api to productBase.getValue(api), repo to productBase.getValue(repo), access to null) +
             s7b.associateWith { null } + s7cChanged.associateWith { productBase.getValue(it) } + s7cAdded.associateWith { null } +
             n1Changed.associateWith { productBase.getValue(it) } + n1Added.associateWith { null } +
@@ -97,11 +97,11 @@ class PostS6ApprovedDeltaContractTest {
             mapOf(cacheService to productBase.getValue(cacheService)) + e5b4bAdded.associateWith { null } +
             e5dNew.associateWith { productBase.getValue(it) } + e5dAdded.associateWith { null } + s83Added.associateWith { null } +
             s84aAdded.associateWith { null } + s84bAdded.associateWith { null } + s85bAdded.associateWith { null } +
-            (s87AddedPaths + s91Policy + s92aOwner).associateWith { null }, ledger.original)
+            (s87AddedPaths + s91Policy + s92aOwner + s92bSection).associateWith { null }, ledger.original)
         assertEquals(emptyList<String>(), PostS6ApprovedDelta.actualErrors(ledger, PostS6ApprovedDelta.actualSources()))
         val actual = PostS6ApprovedDelta.actualSources().mapValues { PostS6ApprovedDelta.sha(it.value) }
         val changes = s85b.getValue("changed").jsonObject
-        for (path in s85bChanged.keys) {
+        for (path in s85bChanged.keys - route) {
             assertEquals("$path has the current file's bytes", actual.getValue(path), ledger.final.getValue(path))
             assertEquals("$path ends with the S8-5b from", changes.getValue(path).jsonObject.str("from"),
                 ledger.lastFrom.getValue(path))
@@ -109,7 +109,7 @@ class PostS6ApprovedDeltaContractTest {
         assertEquals("the bank owner has the current file's bytes", actual.getValue(s85cOwner), ledger.final.getValue(s85cOwner))
         assertEquals("the bank owner ends with the S8-5c from", s85c.getValue("changed").jsonObject.getValue(s85cOwner).jsonObject.str("from"),
             ledger.lastFrom.getValue(s85cOwner))
-        for (path in s86Changed.keys) {
+        for (path in s86Changed.keys - registry) {
             assertEquals("$path has the current file's bytes", actual.getValue(path), ledger.final.getValue(path))
             assertEquals("$path ends with the S8-6 from", s86.getValue("changed").jsonObject.getValue(path).jsonObject.str("from"),
                 ledger.lastFrom.getValue(path))
@@ -130,6 +130,25 @@ class PostS6ApprovedDeltaContractTest {
         assertEquals(null, ledger.lastFrom.getValue(s91Policy))
         assertEquals(s92aOwnerSha, ledger.final.getValue(s92aOwner))
         assertEquals(null, ledger.lastFrom.getValue(s92aOwner))
+        for ((path, link) in s92bChanged) {
+            assertEquals("$path ends with the S9-2b predecessor", link.str("from"), ledger.lastFrom.getValue(path))
+            assertEquals("$path has the S9-2b final bytes", link.str("to"), ledger.final.getValue(path))
+        }
+        assertEquals(s92bSectionSha, ledger.final.getValue(s92bSection))
+        assertEquals(null, ledger.lastFrom.getValue(s92bSection))
+        val expectedLastFrom = mutableMapOf<String, String?>()
+        for (index in 0 until 27) {
+            val prior = unit(index)
+            for ((path, link) in prior.getValue("changed").jsonObject) expectedLastFrom[path] = link.jsonObject.str("from")
+            for (path in prior.getValue("added").jsonObject.keys) expectedLastFrom[path] = null
+        }
+        for ((path, link) in s92bChanged) expectedLastFrom[path] = link.str("from")
+        expectedLastFrom[s92bSection] = null
+        assertEquals("the complete lastFrom map through S9-2b", expectedLastFrom, ledger.lastFrom)
+        for (path in s92bChanged.keys + s92bSection) {
+            assertEquals("$path at altered bytes stays visible", someHash,
+                PostS6ApprovedDelta.project(actual + (path to someHash), ledger).getValue(path))
+        }
         val projected = PostS6ApprovedDelta.project(actual, ledger)
         assertEquals("changed paths go back to their history", productBase.getValue(api), projected[api])
         assertEquals(productBase.getValue(repo), projected[repo])
@@ -148,11 +167,11 @@ class PostS6ApprovedDeltaContractTest {
         assertEquals("the service goes back to its first history through both of its links", productBase.getValue(messaging), projected[messaging])
         assertFalse("the approved additions are dropped from the history view",
             (setOf(access) + s7b + s7cAdded + n1Added + e5a1Added + e5b2aAdded + e5b2b1Added + e5b3aAdded + e5b4aAdded + e5b4bAdded + e5dAdded +
-                s83Added + s84aAdded + s84bAdded + s85bAdded + s87AddedPaths + s91Policy + s92aOwner).any { it in projected })
+                s83Added + s84aAdded + s84bAdded + s85bAdded + s87AddedPaths + s91Policy + s92aOwner + s92bSection).any { it in projected })
         val moved = setOf(api, repo, access) + s7b + s7cChanged + s7cAdded + n1Changed + n1Added + e5a1Changed + e5a1Added + transport + activity +
             pushManager + pushCoordinator + e5b2aAdded + settingsScreen + e5b2b1Added + alertSheet + e5b3aAdded + e5b3bNew +
             rateRowStore + e5b4aAdded + cacheService + e5b4bAdded + e5dNew + e5dAdded + s83Added + s84aAdded + s84bAdded + s85bAdded +
-            s87AddedPaths + s91Policy + s92aOwner
+            s87AddedPaths + s91Policy + s92aOwner + s92bSection
         assertEquals("nothing else moves", actual - moved,
             projected - (setOf(api, repo) + s7cChanged + n1Changed + e5a1Changed + transport + activity + pushManager + pushCoordinator +
                 settingsScreen + alertSheet + e5b3bNew + rateRowStore + cacheService + e5dNew))
@@ -1752,6 +1771,204 @@ class PostS6ApprovedDeltaContractTest {
         assertEquals(emptyList<String>(), errors(json))
     }
 
+    // Reconstruct the approved prefix from the checkout without requiring Git history in a shallow CI checkout.
+    // Each edit restores a zero-based, half-open line range to its text in 6d85e9ec. The clean control
+    // verifies every reconstructed byte against the parsed prefix before introducing the four successors.
+    private fun s86ParentSources(actual: Map<String, ByteArray>): Map<String, ByteArray> {
+        val before = actual.toMutableMap()
+        fun restore(path: String, edits: MutableList<String>.() -> Unit) {
+            val lines = actual.getValue(path).toString(Charsets.UTF_8).split('\n').toMutableList()
+            lines.edits()
+            before[path] = lines.joinToString("\n").toByteArray()
+        }
+        fun MutableList<String>.replaceLines(start: Int, end: Int, vararg original: String) {
+            subList(start, end).clear()
+            addAll(start, original.asList())
+        }
+        restore(activity) {
+            replaceLines(117, 121)
+        }
+        restore(registry) {
+            replaceLines(197, 241)
+            replaceLines(147, 163)
+            replaceLines(82, 91)
+            replaceLines(74, 75,
+                "        listOf({ bank.get() }, { source.get() }),")
+            replaceLines(69, 70)
+            replaceLines(63, 65,
+                "    private val foregroundHooks: List<() -> Unit> = emptyList()")
+            replaceLines(44, 51)
+            replaceLines(14, 19)
+        }
+        restore(base + "data/alerts/SourceAlertSettingsOwner.kt") {
+            replaceLines(1227, 1228,
+                "            val use = access.acquire()")
+            replaceLines(1208, 1209)
+            replaceLines(1200, 1201)
+            replaceLines(1141, 1150)
+            replaceLines(1124, 1125)
+            replaceLines(1107, 1111)
+            replaceLines(1070, 1072,
+                "    private fun begin(automatic: Boolean, manual: Boolean) {",
+                "        val chain = Chain(generation, automatic, manual)")
+            replaceLines(401, 435)
+            replaceLines(389, 390)
+            replaceLines(384, 385)
+            replaceLines(358, 359)
+            replaceLines(340, 341,
+                "        val chain = active")
+            replaceLines(320, 321,
+                "        val chain = active")
+            replaceLines(314, 315,
+                "        val success = lastSuccessAt",
+                "        if (reconcileOwed == null && mutableState.value.settings != null && success != null && remaining(addDelay(success, 30_000)) > 0) return")
+            replaceLines(306, 311,
+                "        active?.let {")
+            replaceLines(293, 304)
+            replaceLines(258, 260,
+                "    private class Chain(val generation: Long, var automatic: Boolean, var manual: Boolean) {")
+            replaceLines(159, 161)
+        }
+        restore(api) {
+            replaceLines(373, 374,
+                "        transport.executeRead(owner) { service.getComparisonNotificationLogs(it, tab, diffType, limit) }")
+            replaceLines(370, 372,
+                "        limit: Int")
+            replaceLines(356, 362,
+                "    suspend fun deleteComparisonAlert(owner: AuthSnapshot, id: Int): AuthenticatedHttpResponse<Unit> =",
+                "        transport.executeMutation(owner) { service.deleteComparisonAlert(it, id) }")
+            replaceLines(352, 353,
+                "        transport.executeMutation(owner) { service.updateComparisonAlert(it, id, request) }")
+            replaceLines(349, 351,
+                "        request: ComparisonAlertUpdateRequest")
+            replaceLines(337, 343,
+                "    suspend fun createComparisonAlert(owner: AuthSnapshot, request: ComparisonAlertRequest): AuthenticatedHttpResponse<ComparisonAlertSetting> =",
+                "        transport.executeMutation(owner) { service.createComparisonAlert(it, request) }")
+            replaceLines(324, 334,
+                "    suspend fun getComparisonAlerts(owner: AuthSnapshot, tab: String?): AuthenticatedHttpResponse<ComparisonAlertsResponse> =",
+                "        transport.executeRead(owner) { service.getComparisonAlerts(it, tab) }")
+        }
+        restore(repo) {
+            replaceLines(311, 312,
+                "            requireCurrent = { apiService.requireCurrent(owner) },")
+            replaceLines(283, 284,
+                "                requireCurrent = { apiService.requireCurrent(owner) },")
+            replaceLines(272, 277)
+            replaceLines(269, 270)
+            replaceLines(253, 254,
+                "        return safeApiCall(owner, { evidence }) { snapshot ->")
+            replaceLines(248, 249)
+            replaceLines(172, 182,
+                "        limit: Int = 100",
+                "    ): AuthBoundResult<List<ComparisonAlertHistoryItem>> = safeApiCall(owner) { snapshot ->",
+                "        apiService.getComparisonNotificationLogs(snapshot, tab, diffType, limit)",
+                "            .requireBody(\"GET /api/comparison-notification-logs\")",
+                "            .logs")
+            replaceLines(157, 166,
+                "    /** Idempotent on the server: an already deleted alert also succeeds. */",
+                "    suspend fun deleteComparisonAlert(owner: AuthIdentityFence, id: Int): AuthBoundResult<Unit> =",
+                "        safeApiCall(owner) { snapshot ->",
+                "            val response = apiService.deleteComparisonAlert(snapshot, id)",
+                "            response.failure?.let { throw AuthenticatedApiException(it) }",
+                "        }")
+            replaceLines(146, 156,
+                "    suspend fun updateComparisonAlert(owner: AuthIdentityFence, id: Int, request: ComparisonAlertUpdateRequest): AuthBoundResult<ComparisonAlertSetting> =",
+                "        safeApiCall(owner) { snapshot ->",
+                "            apiService.updateComparisonAlert(snapshot, id, request)",
+                "                .requireBody(\"PUT /api/comparison-alerts/{id}\")",
+                "        }")
+            replaceLines(135, 144,
+                "    suspend fun createComparisonAlert(owner: AuthIdentityFence, request: ComparisonAlertRequest): AuthBoundResult<ComparisonAlertSetting> =",
+                "        safeApiCall(owner) { snapshot ->",
+                "            apiService.createComparisonAlert(snapshot, request)",
+                "                .requireBody(\"POST /api/comparison-alerts\")",
+                "        }")
+            replaceLines(133, 134)
+            replaceLines(117, 130,
+                "    /** Comparison / kimchi-premium alerts; [tab] null is every tab. */",
+                "    suspend fun getComparisonAlerts(owner: AuthIdentityFence, tab: String? = null): AuthBoundResult<List<ComparisonAlertSetting>> =",
+                "        safeApiCall(owner) { snapshot ->",
+                "            apiService.getComparisonAlerts(snapshot, tab)")
+        }
+        restore(messaging) {
+            replaceLines(124, 125,
+                "        notificationManager.notify(notificationId, notification)")
+            replaceLines(107, 108)
+            replaceLines(101, 104)
+            replaceLines(86, 88,
+                "    private fun showAlertNotification(message: RemoteMessage, type: String) {",
+                "        if (!ReleaseAdmission.isOpen) return")
+            replaceLines(57, 65)
+        }
+        restore(base + "ui/alert/SourceAlertEditor.kt") {
+            replaceLines(256, 257,
+                "    private fun usableQuote(quote: Double?): Double? = quote?.takeIf { it.isFinite() && it > 0 }")
+            replaceLines(254, 255,
+                "    fun formatThreshold(value: Double): String = BigDecimal.valueOf(value).setScale(0, RoundingMode.HALF_UP).toPlainString()")
+            replaceLines(247, 248,
+                "            \"조건 충족 동안 \${interval.everyLabel} 발송\",")
+            replaceLines(242, 243,
+                "            ?: return SourceAlertRepeatTexts(\"한번만\", \"조건 충족 시 1회만 발송\", \"알림은 1회 발송 후 자동으로 꺼집니다\", false)")
+            replaceLines(111, 112,
+                "    fun range(quote: Double?): ClosedFloatingPointRange<Double>? {",
+                "        val q = usableQuote(quote) ?: return null",
+                "        val lower = floor(q * 0.5 / 10.0 + 0.5) * 10.0",
+                "        val upper = floor(q * 1.5 / 10.0 + 0.5) * 10.0",
+                "        return if (lower.isFinite() && upper.isFinite()) lower..upper else null",
+                "    }")
+            replaceLines(107, 109,
+                "    ): SourceAlertEditorInput = input.copy(",
+                "        source = source,",
+                "        thresholdText = if (mode == SourceAlertEditorMode.Add) {",
+                "            usableQuote(quotes[source])?.let(::formatThreshold) ?: input.thresholdText",
+                "        } else {",
+                "            input.thresholdText",
+                "        }",
+                "    )")
+            replaceLines(92, 93,
+                "        SourceAlertEditorMode.Add -> {",
+                "            val source = remembered?.takeIf { it in sources } ?: sources.first()",
+                "            SourceAlertEditorInput(",
+                "                source = source,",
+                "                condition = AlertCondition.BELOW,",
+                "                thresholdText = usableQuote(quotes[source])?.let(::formatThreshold).orEmpty(),",
+                "                repeat = RepeatIntervalChange.Once",
+                "            )",
+                "        }")
+            replaceLines(13, 13,
+                "import kotlin.math.floor")
+        }
+        restore(base + "ui/free/FreeSnapshotScreen.kt") {
+            replaceLines(424, 428)
+            replaceLines(325, 327)
+            replaceLines(283, 284)
+            replaceLines(277, 278)
+            replaceLines(263, 264)
+            replaceLines(257, 258)
+            replaceLines(192, 193)
+            replaceLines(169, 176,
+                "            FreeSnapshotTabs(selected, state, pageState, onSelectTab, onSelectPeriod, onToggleSeries,",
+                "                onApplyRowPreference, onExpand = { fullscreen = true }, onSubscribe = onSubscribe, onOpenPreview = openPreview,",
+                "                onPage = hooks::onPage)")
+        }
+        restore(base + "ui/free/FreeSnapshotUiState.kt") {
+            replaceLines(166, 168)
+            replaceLines(160, 161)
+            replaceLines(98, 106,
+                "    val previewAsOf: Instant? = null")
+        }
+        restore(route) {
+            replaceLines(273, 281)
+            replaceLines(236, 240)
+            replaceLines(223, 224,
+                "                        { tab, _ ->")
+            replaceLines(82, 84,
+                "    sourceHistoryWiring: SourceHistoryWiringFactory = ProductionSourceHistoryWiring")
+            replaceLines(25, 28)
+        }
+        return before
+    }
+
     @Test fun E81_theS86UnitRefusesAnotherLinkForAProtectedPath_aBrokenGeneralFrom_andAlteredBytes() {
         val (control, controlLedger) = PostS6ApprovedDelta.parse(unitsWithS86(s86).toString().toByteArray(), inventory, s64b, null)
         assertEquals("premise: the unaltered S8-6 unit validates", emptyList<String>(), control)
@@ -1780,9 +1997,26 @@ class PostS6ApprovedDeltaContractTest {
         val later = (24 until json.getValue("units").jsonArray.size).map { unit(it) }
         val (omissionErrors, omissionLedger) = PostS6ApprovedDelta.parse(
             withUnits(*((0..22).map { unit(it) } + later).toTypedArray()).toString().toByteArray(), inventory, s64b, null)
-        assertEquals("omitting the unit, later units kept, leaves a well-formed history", emptyList<String>(), omissionErrors)
-        assertEquals("the omitted four paths no longer match the checkout", s86Changed.keys.map { "actual-hash $it" }.sorted(),
-            PostS6ApprovedDelta.actualErrors(checkNotNull(omissionLedger), actual).sorted())
+        assertEquals("S9-2b cannot follow the S8-4a registry without S8-6", listOf("from $registry"), omissionErrors)
+        assertEquals(null, omissionLedger)
+
+        val prefix = withUnits(*(0..22).map { unit(it) }.toTypedArray())
+        val (prefixErrors, prefixLedger) = PostS6ApprovedDelta.parse(prefix.toString().toByteArray(), inventory, s64b, null)
+        assertEquals(emptyList<String>(), prefixErrors)
+        val laterAdditions = later.flatMap { it.getValue("added").jsonObject.keys }
+        val before = s86ParentSources(actual - laterAdditions.toSet())
+        val historical = checkNotNull(prefixLedger)
+        assertEquals(emptyList<String>(), PostS6ApprovedDelta.actualErrors(historical, before))
+        val successors = s86Changed.keys.associateWith { path ->
+            // S9-2b appended one provider to the S8-6 registry constructor and its refresher list.
+            val bytes = if (path == registry) actual.getValue(path).toString(Charsets.UTF_8)
+                .replace("        comparison: Provider<ComparisonAlertSettingsOwner>,\n", "")
+                .replace(", { comparison.get() }", "").toByteArray() else actual.getValue(path)
+            assertEquals("S8-6 successor bytes for $path", s86Entry(path).str("to"), PostS6ApprovedDelta.sha(bytes))
+            bytes
+        }
+        assertEquals("only the four S8-6 successors differ from the clean prefix", s86Changed.keys.map { "actual-hash $it" }.sorted(),
+            PostS6ApprovedDelta.actualErrors(historical, before + successors).sorted())
         for (path in s86Changed.keys) {
             assertEquals("$path at other bytes is refused", listOf("actual-hash $path"),
                 PostS6ApprovedDelta.actualErrors(ledger, actual + (path to actual.getValue(path) + byteArrayOf(10))))
@@ -1988,5 +2222,115 @@ class PostS6ApprovedDeltaContractTest {
         assertEquals("one changed byte in the owner", listOf("actual-hash $s92aOwner"),
             PostS6ApprovedDelta.actualErrors(PostS6ApprovedDelta.ledger(), actual + (s92aOwner to altered)))
         assertEquals("approved bytes with a wrong pin", listOf("approval-pin"), errorsRaw(raw.toString(Charsets.UTF_8), someHash))
+    }
+
+    private val s92bSection = base + "ui/alert/ComparisonAlertSection.kt"
+    private val s92bSectionSha = "2779633563f2c1ff023f3b54dbc20d60196619ac5d41b691a3c08f1cac51098d"
+    private val s92bChanged = mapOf(
+        registry to changedEntry("3ad2ca3c709ccbbd05297a32c072bcd1e2fde4130fd5d978a69847c608e20697",
+            "725efe217ce9592a34dff062aee6ee6861d06cb5cff4451b03727798ba73d41e"),
+        route to changedEntry("d3974388047316c6fa64b5d118f819a91a7793b010a6380d87e888c517dea752",
+            "8875b3961e2baa49c0400123aeea0ea476acdc7d34f72d1071a72d15586382d2")
+    )
+    private val expectedS92b = JsonObject(mapOf(
+        "id" to JsonPrimitive("S9-2b"),
+        "source_parent" to JsonPrimitive("70c903a0d47af92b980a038c150794bc6f4057b8"),
+        "approval_record_sha256" to JsonPrimitive(s91Approval),
+        "changed" to JsonObject(s92bChanged),
+        "added" to JsonObject(mapOf(s92bSection to JsonPrimitive(s92bSectionSha)))
+    ))
+
+    @Test fun E88_theS92bUnitIsExactAndContinuesTheReviewedRegistryAndRoute() {
+        val earlier = (0 until 27).map { unit(it) }
+        assertEquals("S9-2a", earlier.last().str("id"))
+        assertEquals("the twenty-eighth unit and all of its fields", expectedS92b, unit(27))
+        for ((path, writer) in mapOf(registry to "S8-6", route to "S8-5b")) {
+            val previous = earlier.last { path in it.getValue("changed").jsonObject || path in it.getValue("added").jsonObject }
+            assertEquals("$path last writer", writer, previous.str("id"))
+            val from = s92bChanged.getValue(path).str("from")
+            assertEquals("$path last approved bytes", from, previous.getValue("changed").jsonObject.getValue(path).jsonObject.str("to"))
+            assertTrue("$path predecessor reviewed", from in PostS6ApprovedDelta.NO_KRX_REVIEWED)
+        }
+        assertFalse(s92bSection in productBase)
+        assertTrue(earlier.none { s92bSection in it.getValue("changed").jsonObject || s92bSection in it.getValue("added").jsonObject })
+        assertFalse(s92bSectionSha in PostS6ApprovedDelta.NO_KRX_REVIEWED)
+        assertTrue(PostS6ApprovedDelta.CORE_EXCEPTIONS.none { it.unitId == "S9-2b" })
+        val actual = PostS6ApprovedDelta.actualSources()
+        for ((path, hash) in s92bChanged.mapValues { it.value.str("to") } + (s92bSection to s92bSectionSha)) {
+            assertFalse(path in PostS6ApprovedDelta.FORBIDDEN_PATHS || PostS6ApprovedDelta.FORBIDDEN_PREFIXES.any { path.startsWith(it) })
+            assertEquals("$path checkout bytes", hash, PostS6ApprovedDelta.sha(actual.getValue(path)))
+        }
+    }
+
+    @Test fun E89_theS92bUnitRefusesAlteredLinksPathsBytesApprovalAndPin() {
+        val approved = unit(27)
+        assertEquals("clean mutation control", expectedS92b, approved)
+        val changed = approved.getValue("changed").jsonObject
+        val added = approved.getValue("added").jsonObject
+        fun parse(replacement: JsonObject) = PostS6ApprovedDelta.parse(
+            withUnitAt(27, replacement).toString().toByteArray(), inventory, s64b, null)
+        fun validLedger(replacement: JsonObject): PostS6ApprovedDelta.Ledger {
+            val (found, folded) = parse(replacement)
+            assertEquals(emptyList<String>(), found)
+            return checkNotNull(folded)
+        }
+        fun rejected(replacement: JsonObject, vararg expected: String) {
+            val (found, folded) = parse(replacement)
+            assertEquals(expected.toList(), found)
+            assertEquals(null, folded)
+        }
+
+        val ledger = validLedger(approved)
+        val actual = PostS6ApprovedDelta.actualSources()
+        for ((path, prior) in mapOf(registry to s86, route to s85b)) {
+            val stale = prior.getValue("changed").jsonObject.getValue(path).jsonObject.str("from")
+            val link = changed.getValue(path).jsonObject
+            fun withFrom(value: String) = approved.with("changed", changed.with(path, link.with("from", JsonPrimitive(value))))
+            rejected(withFrom(stale), "from $path")
+            rejected(withFrom(someHash), "from $path", "krx-before-unreviewed $path")
+        }
+
+        val registryTo = changed.getValue(registry).jsonObject.getValue("to")
+        val overlap = approved.with("added", added.with(registry, registryTo))
+        rejected(overlap, "overlap [$registry]", "added-existing $registry")
+        rejected(overlap.with("changed", JsonObject(changed - registry)), "added-existing $registry")
+        val asChange = changed.with(s92bSection, changedEntry(s92bChanged.getValue(route).str("from"), s92bSectionSha))
+        rejected(approved.with("changed", asChange).with("added", JsonObject(emptyMap())), "changed-missing $s92bSection")
+        val compact = withUnitAt(27, approved).toString()
+        val sectionKey = JsonPrimitive(s92bSection).toString()
+        val duplicate = compact.replace(sectionKey, "$sectionKey:\"$s92bSectionSha\",$sectionKey")
+        assertEquals(listOf("duplicate-key $s92bSection"), errorsRaw(duplicate))
+
+        // These variants satisfy the generic schema. The independent exact unit in E88 binds their meaning.
+        val extra = base + "ui/alert/S92bProbe.kt"
+        for (other in listOf(
+            approved.with("source_parent", JsonPrimitive(s91Parent)),
+            approved.with("approval_record_sha256", JsonPrimitive(someHash)),
+            approved.with("added", JsonObject(emptyMap())),
+            approved.with("added", added.with(extra, JsonPrimitive(someHash)))
+        )) {
+            val folded = validLedger(other)
+            assertFalse("E88 refuses this well-formed replacement", expectedS92b == other)
+            val expectedErrors = if (extra in folded.final) listOf("missing $extra") else emptyList()
+            assertEquals(expectedErrors, PostS6ApprovedDelta.actualErrors(folded, actual))
+        }
+        rejected(approved.with("added", added.with(activity, registryTo)), "forbidden $activity", "added-existing $activity")
+        val forbidden = base + "data/entitlements/S92bProbe.kt"
+        rejected(approved.with("added", added.with(forbidden, registryTo)), "forbidden $forbidden")
+
+        for (path in s92bChanged.keys + s92bSection) {
+            val bytes = actual.getValue(path)
+            val altered = bytes.copyOf()
+            altered[0] = (altered[0].toInt() xor 1).toByte()
+            assertEquals(listOf("actual-hash $path"), PostS6ApprovedDelta.actualErrors(ledger, actual + (path to altered)))
+            val injected = bytes + "\nprivate const val probe = \"KRX\"\n".toByteArray()
+            val hash = JsonPrimitive(PostS6ApprovedDelta.sha(injected))
+            val matching = if (path == s92bSection) approved.with("added", added.with(path, hash))
+                else approved.with("changed", changed.with(path, changed.getValue(path).jsonObject.with("to", hash)))
+            val folded = validLedger(matching)
+            assertEquals(listOf("actual-hash $path"), PostS6ApprovedDelta.actualErrors(folded, actual))
+            assertEquals(listOf("krx-reference $path"), PostS6ApprovedDelta.actualErrors(folded, actual + (path to injected)))
+        }
+        assertEquals(listOf("approval-pin"), errorsRaw(raw.toString(Charsets.UTF_8) + " ", PostS6ApprovedDelta.APPROVED_SHA256))
     }
 }

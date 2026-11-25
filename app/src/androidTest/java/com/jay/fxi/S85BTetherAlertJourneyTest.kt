@@ -322,7 +322,8 @@ class S85BTetherAlertJourneyTest {
                     userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
                     settingsContent = { _, _, _ -> }, graphHost = null, bankHistoryWiring = history,
                     bankAlertSectionSourceFactory = Bank(), sourceAlertSectionSourceFactory = section,
-                    sourceHistoryWiring = CountingSourceHistoryWiring())
+                    sourceHistoryWiring = CountingSourceHistoryWiring(),
+                    comparisonAlertSectionSourceFactory = comparisonTestFactory(consumer))
             }
         }
         rule.waitForIdle()

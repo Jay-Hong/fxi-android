@@ -153,7 +153,8 @@ class PremiumTopicRouteTest {
                 }
             },
             bankAlertSectionSourceFactory = bankAlerts, sourceAlertSectionSourceFactory = sourceAlerts,
-            sourceHistoryWiring = sourceHistory)
+            sourceHistoryWiring = sourceHistory,
+            comparisonAlertSectionSourceFactory = comparisonTestFactory(consumer))
     }
 
     private fun show(news: FakeNews = FakeNews(), restorable: Boolean = false) {
@@ -342,7 +343,8 @@ class PremiumTopicRouteTest {
         try {
             val vm = NewsViewModel(FakeNews())
             rule.setContent { PremiumTopicRoute(c, a1, true, vm, null, {}, bankAlertSectionSourceFactory = bankAlerts,
-                sourceAlertSectionSourceFactory = sourceAlerts, sourceHistoryWiring = sourceHistory) }
+                sourceAlertSectionSourceFactory = sourceAlerts, sourceHistoryWiring = sourceHistory,
+                comparisonAlertSectionSourceFactory = comparisonTestFactory(c)) }
             rule.waitForIdle()
             val click = requireNotNull(
                 rule.onNodeWithTag(PremiumTopicTags.BANNER_ACTION).fetchSemanticsNode()

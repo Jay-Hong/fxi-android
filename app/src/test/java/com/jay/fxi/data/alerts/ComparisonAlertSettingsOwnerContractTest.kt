@@ -597,6 +597,8 @@ class ComparisonAlertSettingsOwnerContractTest {
     @Test fun A13_productionReach() {
         val base = S6Krx3bOffWiringContractTest.BASE
         val owner = base + "data/alerts/ComparisonAlertSettingsOwner.kt"
+        val section = base + "ui/alert/ComparisonAlertSection.kt"
+        val route = base + "ui/premium/view/PremiumTopicRoute.kt"
         val registry = base + "data/alerts/AlertFamilyRefresherRegistry.kt"
         val repository = base + "data/repository/AlertRepository.kt"
         val service = base + "data/remote/AuthenticatedApiService.kt"
@@ -610,7 +612,22 @@ class ComparisonAlertSettingsOwnerContractTest {
             val src = tree.getValue(owner)
             val flat = src.filterNot(Char::isWhitespace)
             return buildSet {
-                if (uses("ComparisonAlertSettingsOwner").keys != setOf(owner)) add("resolve")
+                if (uses("ComparisonAlertSettingsOwner").keys != setOf(owner, registry, section)) add("resolve")
+                val ui = tree.getValue(section).filterNot(Char::isWhitespace)
+                if (!ui.contains("funcomparisonAlertSettingsOwner():ComparisonAlertSettingsOwner") ||
+                    !ui.contains("valentry=EntryPointAccessors.fromApplication(context,ComparisonAlertSectionEntryPoint::class.java)returnOwnerComparisonSectionSource(entry.comparisonAlertSettingsOwner())}") ||
+                    !ui.contains("overridevalstate=owner.state") ||
+                    !ui.contains("overridefunensure()=settingsOwner.ensure()") ||
+                    !ui.contains("overridefunauthoritative()=settingsOwner.authoritative()") ||
+                    Regex("""\b(?:catch|runCatching)\b""").containsMatchIn(tree.getValue(section))) add("factory")
+                if (!ui.contains("returnComparisonSectionBody.Loaded(adopted.project(tab,kind))") ||
+                    Regex("""\.(?:take|distinct|sorted)\w*\b""").containsMatchIn(tree.getValue(section))) add("project")
+                if (Regex("""\b(?:clickable|toggleable|combinedClickable|reset|onBackground|rememberLauncherForActivityResult|onBankPush|onSourceDelivery)\b""")
+                        .containsMatchIn(tree.getValue(section))) add("surface")
+                if (listOf("IconButton" to 2, "TextButton" to 1, "Switch" to 1).any { (name, calls) ->
+                        Regex("""\b$name\s*\(""").findAll(tree.getValue(section)).count() != calls
+                    } || !ui.contains("Switch(checked=row.isEnabled,onCheckedChange=null,") ||
+                    Regex("""\b\w*(?:Permission|History)\w*\b""").containsMatchIn(tree.getValue(section))) add("surface")
                 if (Regex("""@Singleton\s+internal\s+class\s+ComparisonAlertSettingsOwner\b""").findAll(src).count() != 1 ||
                     Regex("""@Inject\s+constructor\b""").findAll(src).count() != 1) add("singleton")
                 if (uses("getComparisonAlerts") != mapOf(owner to 1, repository to 2, service to 3)) add("caller")
@@ -629,7 +646,7 @@ class ComparisonAlertSettingsOwnerContractTest {
                     !flat.contains("mutableState.value=ComparisonAlertSettingsState(AlertLoadPhase.Ready,use.identity,adopted)"))
                     add("ready-publication")
                 if (!tree.getValue(registry).filterNot(Char::isWhitespace)
-                        .contains(":this(listOf({bank.get()},{source.get()}),")) add("families")
+                        .contains(":this(listOf({bank.get()},{source.get()},{comparison.get()}),")) add("families")
                 if (Regex("""\b(?:addObserver|ProcessLifecycleOwner|onBankPush|onSourceDelivery|getComparisonHistory|createComparisonAlert|updateComparisonAlert|deleteComparisonAlert|AlertRateLimitFloor)\b""")
                         .containsMatchIn(src)) add("surface")
             }
@@ -640,11 +657,32 @@ class ComparisonAlertSettingsOwnerContractTest {
             assertEquals("unique input: $path $old", 1, Regex(Regex.escape(old)).findAll(src).count())
             return tree + (path to src.replace(old, new))
         }
-        val withProvider = replace(real, registry, "source: Provider<SourceAlertSettingsOwner>,",
-            "source: Provider<SourceAlertSettingsOwner>, comparison: Provider<ComparisonAlertSettingsOwner>,")
-        val registered = replace(withProvider, registry, "listOf({ bank.get() }, { source.get() })",
-            "listOf({ bank.get() }, { source.get() }, { comparison.get() })")
-        assertEquals(setOf("resolve", "families"), violations(registered))
+        val registered = "listOf({ bank.get() }, { source.get() }, { comparison.get() })"
+        for (wrong in listOf("listOf({ bank.get() }, { source.get() })",
+            "listOf({ bank.get() }, { source.get() }, { comparison.get() }, { comparison.get() })")) {
+            assertEquals(setOf("families"), violations(replace(real, registry, registered, wrong)))
+        }
+        assertEquals(setOf("resolve"), violations(real + (route to (real.getValue(route) + "\nval bypass: ComparisonAlertSettingsOwner? = null"))))
+        val separate = replace(real, section, "return OwnerComparisonSectionSource(entry.comparisonAlertSettingsOwner())",
+            "return OwnerComparisonSectionSource(ComparisonAlertSettingsOwner(repository, access, tokens, deletions, coordinator))")
+        assertEquals(setOf("factory"), violations(separate))
+        val fallback = replace(real, section, "return OwnerComparisonSectionSource(entry.comparisonAlertSettingsOwner())",
+            "return runCatching { OwnerComparisonSectionSource(entry.comparisonAlertSettingsOwner()) }.getOrElse { emptySource }")
+        assertEquals(setOf("factory"), violations(fallback))
+        val clickableRow = replace(real, section, "Row(Modifier.fillMaxWidth().testTag", "Row(Modifier.clickable { edit() }.fillMaxWidth().testTag")
+        assertEquals(setOf("surface"), violations(clickableRow))
+        val interactive = replace(real, section, "onCheckedChange = null", "onCheckedChange = {}")
+        assertEquals(setOf("surface"), violations(interactive))
+        val addButton = replace(real, section, "if (expanded) when (body)", "TextButton({}) { Text(\"추가\") }; if (expanded) when (body)")
+        assertEquals(setOf("surface"), violations(addButton))
+        for (api in listOf("getComparisonHistory", "createComparisonAlert", "updateComparisonAlert", "deleteComparisonAlert")) {
+            val bypassSection = real + (section to (real.getValue(section) + "\nprivate val bypass = AlertRepository::$api"))
+            assertEquals(setOf("surface"), violations(bypassSection))
+        }
+        val resetting = replace(real, section, "mount.dispose()", "mount.dispose(); settingsOwner.reset()")
+        assertEquals(setOf("surface"), violations(resetting))
+        val trimmed = replace(real, section, "adopted.project(tab, kind)", "adopted.project(tab, kind).distinctBy { it.id }")
+        assertEquals(setOf("project"), violations(trimmed))
         val resolved = replace(real, other, "internal class GraphProtectedAdmission(",
             "private fun resolve(p: javax.inject.Provider<com.jay.fxi.data.alerts.ComparisonAlertSettingsOwner>) = p.get()\n\ninternal class GraphProtectedAdmission(")
         assertEquals(setOf("resolve"), violations(resolved))

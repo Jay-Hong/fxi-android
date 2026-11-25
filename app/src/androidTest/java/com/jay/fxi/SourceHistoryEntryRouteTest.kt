@@ -165,7 +165,8 @@ class SourceHistoryEntryRouteTest {
                     userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
                     settingsContent = { _, _, _ -> }, bankHistoryWiring = bankHistory,
                     bankAlertSectionSourceFactory = Bank(), sourceAlertSectionSourceFactory = CountingSourceAlertSection(),
-                    sourceHistoryWiring = history)
+                    sourceHistoryWiring = history,
+                    comparisonAlertSectionSourceFactory = comparisonTestFactory(consumer))
             }
         }
         rule.waitForIdle()
@@ -198,6 +199,11 @@ class SourceHistoryEntryRouteTest {
     private fun listeners(): Int = onMain {
         (PremiumTopicConsumer::class.java.getDeclaredField("screenListeners").apply { isAccessible = true }.get(consumer) as List<*>).size
     }
+    /** S9-2b: every composed comparison card (`comparison-absolute`, `comparison-signed`) holds one screen listener of its
+     *  own (ComparisonAlertSection). The route's tether session and the history session's listeners are the rest. */
+    private fun comparisonCards(): Int =
+        listOf("comparison-absolute", "comparison-signed").sumOf { rule.onAllNodesWithTag(it).fetchSemanticsNodes().size }
+    private fun sessionListeners(): Int = listeners() - comparisonCards()
     private fun device() = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
     private fun center(node: SemanticsNode) = node.positionOnScreen.let { (it.x + node.size.width / 2f).toInt() to (it.y + node.size.height / 2f).toInt() }
 
@@ -277,13 +283,13 @@ class SourceHistoryEntryRouteTest {
      */
     @Test fun s84b_t02_aDoubleClickIsOneReadTheSheetDrawsTheTriggeredRateAPullReadsAndReopeningIsNew() {
         show()
-        val baseline = listeners()
+        val baseline = sessionListeners()
         assertEquals("premise: nothing open", listOf(0, 0, 0), listOf(sheets(), history.made.get(), reads()))
         click(times = 2)
         await("the sheet is open") { sheets() == 1 }
         assertEquals("a double click: one wiring, one read", listOf(1, 1), listOf(history.made.get(), reads()))
         assertEquals("the read is the tether asset", "usdt-krw", history.reads.single().asset)
-        assertEquals("the session listens once", baseline + 1, listeners())
+        assertEquals("the session listens once", baseline + 1, sessionListeners())
         await("the session collects both revisions once") { collectors() == listOf(1, 1) }
         answer(history.reads.single(), ok(item(1), item(2, "krx", "usd-krw-futures"), item(3, "binance")))
         await("the tether row is drawn") { tags(SourceHistoryTags.ROW) == 1 }
@@ -297,7 +303,7 @@ class SourceHistoryEntryRouteTest {
         answer(history.reads.last(), ok(item(4)))
         rule.onNodeWithText("닫기").performClick(); rule.waitForIdle()
         await("closed: no sheet") { sheets() == 0 }
-        assertEquals("closed: the listener is gone", baseline, listeners())
+        assertEquals("closed: the listener is gone", baseline, sessionListeners())
         await("closed: the revision collection is gone") { collectors() == listOf(0, 0) }
         click()
         await("reopened") { sheets() == 1 }
@@ -312,7 +318,7 @@ class SourceHistoryEntryRouteTest {
      */
     @Test fun s84b_t03_leavingEndsTheSessionAtOnce_andALateAnswerDrawsNothing() {
         show()
-        val baseline = listeners()
+        val baseline = sessionListeners()
         // S8-5b: the route's own tether-session listener lives while an active route draws this owner's tether tab.
         assertEquals("premise: on the tether tab the route's tether session listens once", 1, baseline)
         for ((label, away, home) in listOf<Triple<String, () -> Unit, () -> Unit>>(
@@ -352,7 +358,7 @@ class SourceHistoryEntryRouteTest {
             away()
             await("$label: the sheet is gone") { sheets() == 0 }
             val routeListens = label !in setOf("tab left", "inactive", "disposed")
-            assertEquals("$label: no listener left", if (routeListens) baseline else baseline - 1, listeners())
+            assertEquals("$label: no listener left", if (routeListens) baseline else baseline - 1, sessionListeners())
             await("$label: no revision collection left") { collectors() == listOf(0, 0) }
             assertTrue("$label: the open read's guard refuses", !read.guard())
             home()
@@ -372,7 +378,7 @@ class SourceHistoryEntryRouteTest {
      */
     @Test fun s84b_t04_aRevisionUnderAValidUseKeepsTheSheet_andUnderARefusedUseEndsIt() {
         show()
-        val baseline = listeners()
+        val baseline = sessionListeners()
         openWithRows("access")
         rule.runOnUiThread { history.accessRevisions.value += 1 }; rule.waitForIdle()
         assertEquals("a revision under a valid use keeps the sheet", listOf(1, 1), listOf(sheets(), tags(SourceHistoryTags.ROW)))
@@ -381,7 +387,7 @@ class SourceHistoryEntryRouteTest {
             history.accessRevisions.value += 1
         }
         await("premium lost: the sheet is gone") { sheets() == 0 }
-        assertEquals("premium lost: no listener left", baseline, listeners())
+        assertEquals("premium lost: no listener left", baseline, sessionListeners())
         assertNothingShown("premium lost")
         rule.runOnUiThread { premium.value = OwnedPremiumAccess("A", 1L, PremiumAccessState.PremiumConfirmed) }
         rule.waitForIdle()
@@ -402,7 +408,7 @@ class SourceHistoryEntryRouteTest {
             val before = reads()
             rule.runOnUiThread { revoke() }
             await("$label: the sheet is gone") { sheets() == 0 }
-            assertEquals("$label: no listener left", baseline, listeners())
+            assertEquals("$label: no listener left", baseline, sessionListeners())
             await("$label: no revision collection left") { collectors() == listOf(0, 0) }
             assertTrue("$label: the open read's guard refuses", !read.guard())
             rule.runOnUiThread { restore() }
@@ -422,7 +428,7 @@ class SourceHistoryEntryRouteTest {
             history.deletionRevisions.value += 1
         }
         await("deletion begun: the sheet is gone") { sheets() == 0 }
-        assertEquals("deletion begun: no listener left", baseline, listeners())
+        assertEquals("deletion begun: no listener left", baseline, sessionListeners())
         await("deletion begun: no revision collection left") { collectors() == listOf(0, 0) }
         assertEquals("deletion begun: nothing more is read", reads, reads())
     }
@@ -434,7 +440,7 @@ class SourceHistoryEntryRouteTest {
      */
     @Test fun s84b_t05_aKeptClickAfterTheTabIsLeftReadsNothingAndLeavesNoListener() {
         show()
-        val baseline = listeners()
+        val baseline = sessionListeners()
         assertEquals("premise: on the tether tab the route's tether session listens once", 1, baseline)
         val action = rule.onNodeWithTag(SourceHistoryTags.ENTRY).fetchSemanticsNode().config[SemanticsActions.OnClick].action
         assertNotNull("premise: the entry has a click action", action)
@@ -444,7 +450,7 @@ class SourceHistoryEntryRouteTest {
         rule.waitForIdle()
         assertEquals("kept click: its wiring is made, nothing is read", listOf(1, 0), listOf(history.made.get(), reads()))
         assertEquals("kept click: no sheet", 0, sheets())
-        assertEquals("kept click: no listener left, and the route's tether session does not listen on USD", baseline - 1, listeners())
+        assertEquals("kept click: no listener left, and the route's tether session does not listen on USD", baseline - 1, sessionListeners())
         await("kept click: no revision collection") { collectors() == listOf(0, 0) }
     }
 }

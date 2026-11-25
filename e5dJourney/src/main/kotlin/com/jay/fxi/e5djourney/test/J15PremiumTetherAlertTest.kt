@@ -58,6 +58,7 @@ class J15PremiumTetherAlertTest {
             stage("PREMISE J15 같은 owner premium Root") {
                 val free = owner("FreeConfirmed")
                 check(free.getString("uid") == "u1")
+                assertComparisonRows("free", run.client.dump(nonce).server(0), 0)
                 run.client.ack("answer", nonce) { putExtra("arg", "active") }
                 run.client.ack("local-premium", nonce)
                 val premium = owner("PremiumConfirmed")
@@ -65,7 +66,10 @@ class J15PremiumTetherAlertTest {
                     premium.getLong("authGeneration") == free.getLong("authGeneration")) { "$free -> $premium" }
                 run.node("premium_settings", 30_000)
             }
-            val initial = observed().server(0).requests(SETTINGS)
+            run.awaitRecord(nonce, "cold comparison 목록", 30_000) { COMPARISON_LIST in E5dJourneyRun.texts(it, "http") }
+            val cold = observed().server(0)
+            assertComparisonRows("cold premium", cold, 1)
+            val initial = cold.requests(SETTINGS)
             stage("PREMISE J15 기본 source 빈 목록") {
                 check(initial.isNotEmpty() && initial.all { it.text == EMPTY }) { "n=${initial.size} ${summary(initial)}" }
             }
@@ -433,6 +437,11 @@ class J15PremiumTetherAlertTest {
         stage("J15 최종 요청 수·순서") {
             val u = record.upper
             val server = record.server(0)
+            assertComparisonRows("테더 진입 전", server.filter { it.sequence <= tether }, 1)
+            assertComparisonRows("테더 진입·편집", server.filter { it.sequence in (tether + 1)..s }, 0)
+            assertComparisonRows("source 추가", server.filter { it.sequence in (s + 1)..r }, 0)
+            assertComparisonRows("source refresh", server.filter { it.sequence in (r + 1)..h }, 0)
+            assertComparisonRows("source history", server.filter { it.sequence > h }, 0)
             val writes = server.filter { it.stream == "http" && WRITE.containsMatchIn(it.text) }
             val gets = server.requests(SETTINGS).filter { it.text.startsWith("GET ") }
             val early = gets.filter { it.sequence <= s }
@@ -468,6 +477,6 @@ class J15PremiumTetherAlertTest {
         val PRICE = Regex("""\d+\.\d{2}""")
         val DATE = Regex("""\d{2}-\d{2}""")
         val TIME = Regex("""\d{2}:\d{2}""")
-        val WRITE = Regex("""^(POST|PUT|PATCH|DELETE) /api/(notification-settings|source-notification-settings)(/|\s)""")
+        val WRITE = Regex("""^(POST|PUT|PATCH|DELETE) /api/(notification-settings|source-notification-settings|comparison-alerts)(/|\s)""")
     }
 }

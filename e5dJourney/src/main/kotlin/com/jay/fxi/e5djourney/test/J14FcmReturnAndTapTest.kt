@@ -100,6 +100,7 @@ class J14FcmReturnAndTapTest {
     /** The fixture's premium session with the bank settings loaded once: where every case starts from. */
     private fun premium(nonce: String) {
         run.awaitRecord(nonce, "startup", timeoutMillis = 90_000) { lines -> texts(lines, "http").any { "-> entitlements free" in it } }
+        checkComparison("free", record(nonce), 0)
         run.client.ack("answer", nonce) { putExtra("arg", "active") }
         run.client.ack("local-premium", nonce)
         val deadline = System.currentTimeMillis() + PREMIUM_MILLIS
@@ -107,8 +108,19 @@ class J14FcmReturnAndTapTest {
             check(System.currentTimeMillis() < deadline) { "premise: PremiumConfirmed 가 오지 않았다" }
             Thread.sleep(500)
         }
-        run.awaitRecord(nonce, "은행 설정의 첫 GET", timeoutMillis = 90_000) { lines -> texts(lines, "http").any { it.startsWith(SETTINGS_GET) } }
+        run.awaitRecord(nonce, "은행·비교 설정의 첫 GET", timeoutMillis = 90_000) { lines ->
+            val http = texts(lines, "http")
+            http.any { it.startsWith(SETTINGS_GET) } && COMPARISON_LIST in http
+        }
         run.settle(nonce)
+        checkComparison("cold premium", record(nonce), 1)
+    }
+
+    private var comparisonUpper = 0
+
+    private fun checkComparison(label: String, through: List<E5dJourneyTraffic.Line>, expected: Int) {
+        assertComparisonRows(label, through.filter { it.sequence > comparisonUpper }, expected)
+        through.lastOrNull()?.let { comparisonUpper = it.sequence }
     }
 
     private fun pid(): Int = run.discover().getInt("pid")
@@ -227,7 +239,9 @@ class J14FcmReturnAndTapTest {
         val shown = row()
         check(shown == other) { "premise: 준비($state) 직전 화면의 ${ROW_ID}행이 $other 가 아니다: $shown" }
         serverRow(nonce, state)
-        val from = upper(nonce)
+        val before = record(nonce)
+        checkComparison("준비($state) sync 전", before, 0)
+        val from = before.last().sequence
         val start = now()
         val (ack, _) = deliver(nonce, "prep-$state", SYNC, visible = false)
         check(ack.getInt("result") == -1 && ack.getInt("importanceBefore") == 100) { "premise: 준비($state) 의 sync 가 앞에서 전달되지 않았다: $ack" }
@@ -239,7 +253,9 @@ class J14FcmReturnAndTapTest {
             "premise: 준비($state) 의 채택이 확인되지 않았다: 화면=$seen U-start=${u-start}ns"
         }
         run.settle(nonce, quietMillis = QUIET_MILLIS)
-        val extra = gets(record(nonce)).filter { it.nanos > u }
+        val settled = record(nonce)
+        checkComparison("준비($state) sync", settled, 1)
+        val extra = gets(settled).filter { it.nanos > u }
         check(extra.isEmpty()) { "premise: 준비($state) 뒤 조용한 동안 추가 GET: ${extra.map { it.nanos to it.text }}" }
         val g = got.single().nanos
         Log.i(TAG, "adopt $state U-G=${ms(g, u)}ms G=$g U=$u")
@@ -350,7 +366,7 @@ class J14FcmReturnAndTapTest {
      * is still ahead, the watch goes on until G + 20 s, so that a missing request is said only after its time is over. E is
      * when the watch really ended.
      */
-    private fun watch(nonce: String, what: String, a: Long, prep: Prep, expectGet: Boolean, outside: Boolean = false): Watch {
+    private fun watch(nonce: String, what: String, a: Long, prep: Prep, expectGet: Boolean, outside: Boolean = false, comparison: Int = 0): Watch {
         val inside = prep.takeUnless { outside }
         val shown = row()
         val c = now()
@@ -366,6 +382,8 @@ class J14FcmReturnAndTapTest {
         val endRow = if (premium) try { row() } catch (e: IllegalStateException) { "unread(${e.message})" } else "premium 화면 없음"
         val e = now()
         val lines = record(nonce).filter { it.nanos <= e }
+        checkComparison("$what 동작 전", lines.filter { it.nanos <= a }, 0)
+        checkComparison("$what 동작 뒤", lines, comparison)
         val allGets = gets(lines)
         val before = allGets.filter { it.nanos > prep.u && it.nanos <= a }
         val homeAt = prep.homeAt
@@ -524,7 +542,7 @@ class J14FcmReturnAndTapTest {
         assertEquals("$label: active 도 없다 ${seen.active}", 0, seen.active.size)
         assertEquals("$label: Home 뒤 앱 callback 의 type 로그", if (inject) listOf("sync_alerts") else emptyList(), seen.typeLogs)
         val (returned, a) = returnThroughLauncher(nonce, label)
-        val after = watch(nonce, label, a, prep, expectGet = inject)
+        val after = watch(nonce, label, a, prep, expectGet = inject, comparison = if (inject) 1 else 0)
         if (inject) assertOneGetInside(label, prep, after) else assertNoGetInside(label, prep, after)
         assertEquals("$label: 행", if (inject) FIRED else ARMED, after.rowAtE)
         assertEquals("$label: 사례 전체에 게시는 없다", 0, after.notifications.posted.size)
@@ -549,7 +567,9 @@ class J14FcmReturnAndTapTest {
         val pushed = awaitRow(FIRED)
         run.settle(nonce, quietMillis = QUIET_MILLIS)
         val first = notifications.read(nonce, window, pid)
-        val pushGets = gets(record(nonce)).drop(before)
+        val pushRecord = record(nonce)
+        checkComparison("T1 개별 push", pushRecord, 0)
+        val pushGets = gets(pushRecord).drop(before)
         check(ack.getInt("result") == -1 && ack.getInt("importanceBefore") == 100 && first.posted.size == 1 &&
             byTheApp(first.posted.single(), title) && pushGets.size == 1 && listed(pushGets.single())) {
             "premise: (1) visible once 전달·게시·GET 불일치: ack=$ack 게시=${first.posted} GET=${pushGets.map { it.text }}"
@@ -717,12 +737,16 @@ class J14FcmReturnAndTapTest {
             refused("모르는 arg") { putExtra("id", ROW_ID.toString()); putExtra("arg", "other") }
             refused("문자열이 아닌 arg") { putExtra("id", ROW_ID.toString()); putExtra("arg", 1) }
             // What the screen can say after them: one more list, and row 101 as it was.
-            val from = upper(nonce)
+            val refusedRecord = record(nonce)
+            checkComparison("거절", refusedRecord, 0)
+            val from = refusedRecord.last().sequence
             val (ack, _) = deliver(nonce, "after-refusals", SYNC, visible = false)
             assertEquals("processor 의 결과", -1, ack.getInt("result"))
             run.awaitRecord(nonce, "거절 뒤 sync 의 설정 GET", timeoutMillis = 20_000) { lines -> gets(E5dJourneyTraffic.parse(lines)).any { it.sequence > from } }
             run.settle(nonce, quietMillis = QUIET_MILLIS)
-            val got = gets(record(nonce)).filter { it.sequence > from }
+            val settled = record(nonce)
+            checkComparison("거절 뒤 sync", settled, 1)
+            val got = gets(settled).filter { it.sequence > from }
             assertEquals("거절 뒤 sync 의 은행 설정 GET 은 1건이다 ${got.map { it.text }}", 1, got.size)
             assertTrue("그 GET 은 성공한 목록 응답이다: ${got.single().text}", listed(got.single()))
             assertEquals("거절 뒤에도 ${ROW_ID}행은 armed 로 보인다", ARMED, row())

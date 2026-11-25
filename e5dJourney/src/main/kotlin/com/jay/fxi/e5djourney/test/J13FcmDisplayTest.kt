@@ -89,6 +89,8 @@ class J13FcmDisplayTest {
     /** The fixture's premium session with the bank settings loaded once: where every delivery below starts from. */
     private fun premium(nonce: String) {
         run.awaitRecord(nonce, "startup", timeoutMillis = 90_000) { lines -> texts(lines, "http").any { "-> entitlements free" in it } }
+        val freeRecord = run.client.dump(nonce)
+        assertComparisonRows("free", E5dJourneyTraffic.server(freeRecord.lines, 0, freeRecord.upper), 0)
         run.client.ack("answer", nonce) { putExtra("arg", "active") }
         run.client.ack("local-premium", nonce)
         val deadline = System.currentTimeMillis() + PREMIUM_MILLIS
@@ -96,8 +98,22 @@ class J13FcmDisplayTest {
             check(System.currentTimeMillis() < deadline) { "premise: PremiumConfirmed 가 오지 않았다" }
             Thread.sleep(500)
         }
-        run.awaitRecord(nonce, "은행 설정의 첫 GET", timeoutMillis = 90_000) { lines -> texts(lines, "http").any { it.startsWith(SETTINGS_GET) } }
+        run.awaitRecord(nonce, "은행·비교 설정의 첫 GET", timeoutMillis = 90_000) { lines ->
+            val http = texts(lines, "http")
+            http.any { it.startsWith(SETTINGS_GET) } && COMPARISON_LIST in http
+        }
         run.settle(nonce)
+    }
+
+    private fun injectionStart(nonce: String): Int {
+        val dump = run.client.dump(nonce)
+        assertComparisonRows("주입 전 cold 목록", E5dJourneyTraffic.server(dump.lines, 0, dump.upper), 1)
+        return dump.upper
+    }
+
+    private fun checkDelivery(nonce: String, from: Int, expected: Int) {
+        val dump = run.client.dump(nonce)
+        assertComparisonRows("주입 ($from, ${dump.upper}]", E5dJourneyTraffic.server(dump.lines, from, dump.upper), expected)
     }
 
     private fun pid(): Int = run.discover().getInt("pid")
@@ -134,8 +150,10 @@ class J13FcmDisplayTest {
             premium(nonce)
             val pid = pid()
             val window = notifications.open(nonce)
+            val from = injectionStart(nonce)
             val (ack, title) = deliver(nonce, case, data, visible = true)
             val seen = notifications.close(nonce, window, pid)
+            checkDelivery(nonce, from, 0)
             log(case, seen)
             assertEquals("processor 의 결과", -1, ack.getInt("result"))
             assertDeliveredInTheForeground(case, ack)
@@ -161,8 +179,10 @@ class J13FcmDisplayTest {
             premium(nonce)
             val pid = pid()
             val window = notifications.open(nonce)
+            val from = injectionStart(nonce)
             val (ack, _) = deliver(nonce, "F2-sync", SYNC, visible = false)
             val seen = notifications.close(nonce, window, pid)
+            checkDelivery(nonce, from, 1)
             log("F2-sync", seen)
             assertEquals("processor 의 결과", -1, ack.getInt("result"))
             assertDeliveredInTheForeground("F2-sync", ack)
@@ -183,8 +203,10 @@ class J13FcmDisplayTest {
             run.awaitRecord(nonce, "process ON_STOP", timeoutMillis = 20_000) { lines -> texts(after(lines, home), "process").any { it == "ON_STOP" } }
             assertEquals("premise: Home 뒤에도 같은 process 다", pid, pid())
             val window = notifications.open(nonce)
+            val from = injectionStart(nonce)
             val (ack, title) = deliver(nonce, "B1-once", ONCE, visible = true)
             val seen = notifications.close(nonce, window, pid)
+            checkDelivery(nonce, from, 0)
             log("B1-once", seen)
             assertEquals("processor 의 결과", -1, ack.getInt("result"))
             assertNotEquals("premise: 주입 직전에 읽은 importance 가 100 이 아니다(Home 뒤 provider call 중의 값)", 100, ack.getInt("importanceBefore"))
@@ -206,6 +228,7 @@ class J13FcmDisplayTest {
         run.run { nonce ->
             premium(nonce)
             val window = notifications.open(nonce)
+            val from = injectionStart(nonce)
             fun data(vararg pairs: Pair<String, String>) = Bundle().apply { pairs.forEach { (key, value) -> putString(key, value) } }
             run.client.reject("fcm", nonce, "fcm") { putExtra("data", data("type" to "sync_alerts")) }
             run.client.reject("fcm", nonce, "fcm") { putExtra("data", data("type" to "sync_alerts")); putExtra("mid", "") }
@@ -228,6 +251,7 @@ class J13FcmDisplayTest {
                 putExtra("data", data("type" to "rate_alert")); putExtra("mid", "u3a-not-string-pair"); putExtra("title", 1); putExtra("body", 2)
             }
             val seen = notifications.close(nonce, window, pid())
+            checkDelivery(nonce, from, 0)
             log("refused", seen)
             assertEquals("거절 사례의 관측창에서 대상 패키지 게시가 관측되지 않았다 ${seen.posted}", 0, seen.posted.size)
             assertEquals("은행 설정 GET 도 늘지 않았다", 0, seen.gets)
@@ -244,8 +268,10 @@ class J13FcmDisplayTest {
             for (round in listOf("first", "second")) {
                 run.settle(nonce)
                 val window = notifications.open(nonce)
+                val from = injectionStart(nonce)
                 val (ack, title) = deliver(nonce, "F1-$round", ONCE, visible = true)
                 val seen = notifications.close(nonce, window, pid)
+                checkDelivery(nonce, from, 0)
                 log("F1-$round", seen)
                 assertEquals("$round: processor 의 결과", -1, ack.getInt("result"))
                 assertDeliveredInTheForeground(round, ack)

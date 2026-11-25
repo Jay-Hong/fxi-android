@@ -228,6 +228,10 @@ internal class E5dJourneyServer(private val load: (String) -> ByteArray) : AutoC
                 if (query.keys != setOf("topic") || file == null) return unexpected()
                 "topic-snapshot $topic" to ok(load(file))
             }
+            "/api/comparison-alerts" -> {
+                if (request.requestUrl?.encodedQuery != null) return unexpected()
+                "comparison alerts list n=0" to ok("""{"alerts":[],"total_count":0}""".encodeToByteArray())
+            }
             SOURCE_HISTORY -> {
                 if (query != mapOf("asset" to listOf(SOURCE_ASSET), "limit" to listOf("100")) || request.bodySize != 0L) return unexpected()
                 val bytes = load(SOURCE_HISTORY_LIST)

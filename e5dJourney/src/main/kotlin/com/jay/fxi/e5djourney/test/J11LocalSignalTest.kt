@@ -168,7 +168,10 @@ class J11LocalSignalTest {
             assertTrue("active 응답으로 확정됐다 $afterActive", afterActive.isNotEmpty() && afterActive.all { it.endsWith("-> entitlements active rev=1") })
 
             // The premium editor: opened by the user, from its own initial values.
-            preview.phase(nonce, "premium-editor")
+            run.awaitRecord(nonce, "premium comparison 목록", timeoutMillis = 30_000) { lines ->
+                COMPARISON_LIST in texts(after(lines, active), "http")
+            }
+            val editor = preview.phase(nonce, "premium-editor")
             run.reveal(ADD_BUTTON).click()
             val sheet = editorSheet()
             inEditor(sheet, By.text("국민은행"), "국민은행")
@@ -211,6 +214,12 @@ class J11LocalSignalTest {
             run.settle(nonce)
             val record = run.client.dump(nonce)
             val server = E5dJourneyTraffic.server(record.lines, 0, record.upper)
+            val activeAnswer = server.first { it.sequence > active && it.stream == "http" &&
+                it.text.startsWith("GET /api/entitlements ") && it.text.endsWith("-> entitlements active rev=1") }.sequence
+            assertComparisonRows("무료·첫 free 응답", server.filter { it.sequence <= activeAnswer }, 0)
+            assertComparisonRows("premium 진입", server.filter { it.sequence in (activeAnswer + 1)..editor }, 1)
+            assertComparisonRows("editor", server.filter { it.sequence in (editor + 1)..save }, 0)
+            assertComparisonRows("save 이후", server.filter { it.sequence > save }, 0)
             val writes = server.filter { it.stream == "http" && ALERT_WRITE.containsMatchIn(it.text) }
             Log.i(TAG, "final count: measure=$measure save=$save upper=${record.upper} alert writes ${writes.map { "${it.sequence} ${it.text}" }}")
             assertEquals("측정 시작부터 save mark 까지 alert 저장 요청이 없다", emptyList<String>(), writes.filter { it.sequence <= save }.map { it.text })

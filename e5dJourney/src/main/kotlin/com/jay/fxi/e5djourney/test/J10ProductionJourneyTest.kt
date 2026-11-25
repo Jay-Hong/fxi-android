@@ -21,6 +21,16 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 
+internal const val COMPARISON_PATH = "/api/comparison-alerts"
+internal const val COMPARISON_LIST = "GET $COMPARISON_PATH q= -> comparison alerts list n=0"
+
+/** Compare every request on the endpoint in the supplied record slice, including refused requests. */
+internal fun assertComparisonRows(label: String, lines: List<E5dJourneyTraffic.Line>, expected: Int): List<E5dJourneyTraffic.Line> {
+    val rows = lines.filter { it.stream == "http" && it.text.substringAfter(' ').substringBefore(' ') == COMPARISON_PATH }
+    assertEquals("$label comparison", List(expected) { COMPARISON_LIST }, rows.map { it.text })
+    return rows
+}
+
 /**
  * S7 E5d-J J2b2 G10 (`e5dj_j2_plan.claude.r3.md` §3 G10 and its logout sub-case, as amended by
  * `e5dj_j2_plan_amend_g10.claude.r1.md`; `s7e5dj_j2b2_design.codex.r1.md`–`r3.md`): the production journey on the real Root,
@@ -170,7 +180,8 @@ class J10ProductionJourneyTest {
                 TOPICS.all { t -> E5dJourneyTraffic.count(server, "http GET /api/v2/topics/snapshot q=topic=\\Q$t\\E -> topic-snapshot \\Q$t\\E") >= 1 &&
                     E5dJourneyTraffic.count(server, "ws conn=\\d+ send snapshot \\Q$t\\E -> true") >= 1 } &&
                     E5dJourneyTraffic.count(server, "http GET /api/v2/graph/tab q=period=1d&tab=usd -> graph-tab usd 1d") >= 1 &&
-                    E5dJourneyTraffic.count(server, "http GET /api/notification-settings q= -> alerts list .*") >= 1
+                    E5dJourneyTraffic.count(server, "http GET /api/notification-settings q= -> alerts list .*") >= 1 &&
+                    E5dJourneyTraffic.count(server, "http $COMPARISON_LIST") >= 1
             }
             premium.check()
 
@@ -310,6 +321,9 @@ class J10ProductionJourneyTest {
         preview.inSheet(By.text("닫기"), "닫기").click()
         preview.sheetGone()
         assertFalse("닫기로 paywall 이 없다", preview.paywallShown())
+        run.settle(nonce)
+        val record = run.client.dump(nonce)
+        assertComparisonRows("무료 세션 왕복", E5dJourneyTraffic.server(record.lines, 0, record.upper), 0)
     }
 
     // Steps ----------------------------------------------------------------------------------------------------------------
@@ -400,6 +414,7 @@ class J10ProductionJourneyTest {
             Rule("ws pong", "ws conn=1 send pong -> true", 0, 4),
             Rule("topic bootstrap", "http GET /api/v2/topics/snapshot q=topic=(fx:usd-krw|fx:jpy-krw|fx:eur-krw|usdt:krw|dxy:spot) -> topic-snapshot \\S+", 5, 5),
             Rule("alert list", "http GET /api/notification-settings q= -> alerts list n=\\d+ ids=\\[.*]", 1, 2),
+            Rule("comparison alert list", "http $COMPARISON_LIST", 1, 1),
             Rule("source alert list", "http GET /api/source-notification-settings q=asset=usdt-krw -> source settings list n=0", 1, 1),
             Rule("graph catalog", "http GET /api/v2/graph/catalog q= -> graph-catalog", 1, 1),
             Rule("graph usd 1d", "http GET /api/v2/graph/tab q=period=1d&tab=usd -> graph-tab usd 1d", 1, 6),

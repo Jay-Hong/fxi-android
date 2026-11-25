@@ -1117,9 +1117,9 @@ class BankAlertSectionStructureTest {
             Triple("the production source factory passed directly", edited(ROUTE, """sourceFactory\s*=\s*sourceAlertSectionSourceFactory""",
                 "sourceFactory = ProductionSourceAlertSectionSourceFactory"), "P-tether-args"),
             Triple("the shown check reduced to the route's own owner", edited(ROUTE,
-                """isShown\s*=\s*\{\s*liveQuotes\(\)\s*!=\s*null\s*\}""", "isShown = { allowed() }"), "P-tether-args"),
+                """isShown\s*=\s*\{\s*liveQuotes\(\)\s*!=\s*null\s*\}(?=\s*,\s*sourceFactory\s*=\s*sourceAlertSectionSourceFactory)""", "isShown = { allowed() }"), "P-tether-args"),
             // S8-5b: the slot's live overlay check reaches the tether shown check only; the quotes are the current state's.
-            Triple("the bank slot taking the live check", edited(ROUTE, """\{\s*tab\s*,\s*_\s*->""", "{ tab, overlayClearNow ->"), "P-bank-live"),
+            Triple("the FX comparison ignoring the live check", edited(ROUTE, """fxOverlayClear\(\)""", "true"), "P-bank-live"),
             Triple("the tether slot ignoring the live check", edited(ROUTE, """\{\s*tab\s*,\s*overlayClearNow\s*->""", "{ tab, _ ->"), "P-tether-live"),
             Triple("the shown check without the overlay", edited(ROUTE, """&&\s*detailUrl\s*==\s*null\s*&&\s*overlayClearNow\(\)""",
                 "&& detailUrl == null"), "P-tether-session"),
@@ -2810,11 +2810,10 @@ class BankAlertSectionStructureTest {
             if (named != setOf(HOLDER, ROUTE)) v += "P-named ${named.sorted()}"
             val sectionImports = count(route, importOf("BankAlertSection"))
             if (sectionImports > 1 || count(route, """\bBankAlertSection\b""") != 1 + sectionImports) v += "P-route-tokens"
-            // S8-4a/S8-4b: the last three parameters are the bank section's factory, the source section's and the source history's.
             val params = paramsRange(route, "PremiumTopicRoute")?.let { topLevelArgs(route.substring(it)) }.orEmpty()
-            if (params.lastOrNull() != SOURCE_HISTORY_PARAMETER) v += "P-parameter ${params.lastOrNull()}"
-            if (params.getOrNull(params.size - 2) != SOURCE_FACTORY_PARAMETER) v += "P-parameter ${params.getOrNull(params.size - 2)}"
-            if (params.getOrNull(params.size - 3) != FACTORY_PARAMETER) v += "P-parameter ${params.getOrNull(params.size - 3)}"
+            if (params.takeLast(4) != listOf(FACTORY_PARAMETER, SOURCE_FACTORY_PARAMETER, SOURCE_HISTORY_PARAMETER,
+                    "comparisonAlertSectionSourceFactory: ComparisonAlertSectionSourceFactory = ProductionComparisonAlertSectionSourceFactory"))
+                v += "P-parameter " + params.takeLast(4)
             if (count(route, """\bbankAlertSectionSourceFactory\b""") != 2) v += "P-factory-tokens parameter"
             for (name in listOf("BankAlertSectionSourceFactory", "ProductionBankAlertSectionSourceFactory")) {
                 val imports = count(route, importOf(name))
@@ -2822,7 +2821,7 @@ class BankAlertSectionStructureTest {
             }
             for ((tag, pattern) in ROUTE_FORBIDDEN) if (Regex(pattern).containsMatchIn(route)) v += "P-route-owner $tag"
             val slot = belowRates(route) ?: return v + "P-below-rates"
-            if (slot.live != "_") v += "P-bank-live ${slot.live}"
+            if (slot.live == "_" || slot.live == slot.param) v += "P-bank-live ${slot.live}"
             val condition = squash(route.substring(slot.condition))
             if (condition != CONDITION) v += "P-condition $condition"
             val body = route.substring(slot.body)
@@ -2839,6 +2838,9 @@ class BankAlertSectionStructureTest {
             val close = closing(body, open) ?: return v + "P-args unclosed"
             val args = topLevelArgs(body.substring(open + 1, close))
             if (!agreedArgs(args, slot.param, "bankAlertSectionSourceFactory")) v += "P-args $args"
+            val comparison = body.substring(close + 1).filterNot(Char::isWhitespace)
+            if (comparison != "ComparisonAlertSection(${slot.param},\"absolute\",owner,consumer,comparisonAlertSectionSourceFactory," +
+                    "isShown={activeNow&&!settingsOpen&&detailUrl==null&&${slot.live}()})}") v += "P-bank-live"
             return v + tetherMount(code)
         }
 
@@ -2885,6 +2887,11 @@ class BankAlertSectionStructureTest {
             val named = topLevelArgs(body.substring(open + 1, close)).associate { a ->
                 Regex("""^(\w+) ?= ?(.+)$""").matchEntire(a)?.let { it.groupValues[1] to it.groupValues[2] } ?: ("?" to a)
             }
+            val tail = body.substring(close + 1).filterNot(Char::isWhitespace)
+            val comparisons = listOf("signed", "absolute").joinToString("") { kind ->
+                "ComparisonAlertSection(${slot.param},\"$kind\",owner,consumer,comparisonAlertSectionSourceFactory,isShown={liveQuotes()!=null})"
+            }
+            if (tail != comparisons + "}}}") v += "P-tether-comparisons"
             if (count(squash(body), Regex.escape(tetherSession(slot.live))) != 1) v += "P-tether-session"
             if (count(route, """\btetherEpoch\s*\+\+""") != 4 || TETHER_ENDS.any { count(squash(route), Regex.escape(it)) != 1 }) v += "P-tether-epoch"
             if (named != mapOf("tab" to slot.param, "owner" to "owner", "isShown" to "{ liveQuotes() != null }",

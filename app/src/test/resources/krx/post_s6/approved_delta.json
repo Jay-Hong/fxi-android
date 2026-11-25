@@ -558,6 +558,24 @@
       "added": {
         "src/main/java/com/jay/fxi/data/alerts/ComparisonAlertSettingsOwner.kt": "5a031537637ff67b4bf3d0a38b0fc453ac1fb0479156278ce0148e5f3f72ce46"
       }
+    },
+    {
+      "id": "S9-2b",
+      "source_parent": "70c903a0d47af92b980a038c150794bc6f4057b8",
+      "approval_record_sha256": "c2c4030998b1c8ee0ddbedff00763df77e7a0528b873e17afdcb4b3e7f3533e6",
+      "changed": {
+        "src/main/java/com/jay/fxi/data/alerts/AlertFamilyRefresherRegistry.kt": {
+          "from": "3ad2ca3c709ccbbd05297a32c072bcd1e2fde4130fd5d978a69847c608e20697",
+          "to": "725efe217ce9592a34dff062aee6ee6861d06cb5cff4451b03727798ba73d41e"
+        },
+        "src/main/java/com/jay/fxi/ui/premium/view/PremiumTopicRoute.kt": {
+          "from": "d3974388047316c6fa64b5d118f819a91a7793b010a6380d87e888c517dea752",
+          "to": "8875b3961e2baa49c0400123aeea0ea476acdc7d34f72d1071a72d15586382d2"
+        }
+      },
+      "added": {
+        "src/main/java/com/jay/fxi/ui/alert/ComparisonAlertSection.kt": "2779633563f2c1ff023f3b54dbc20d60196619ac5d41b691a3c08f1cac51098d"
+      }
     }
   ]
 }

@@ -355,7 +355,8 @@ class PremiumGraphProcessForegroundTest {
         rule.setContent {
             val host by owner.graphHost.collectAsState()
             PremiumTopicRoute(consumer = owner.consumer, identity = a1, isActive = true, newsViewModel = vm, userInfo = null,
-                onSignOut = { }, graphHost = host, bankAlertSectionSourceFactory = bankAlerts)
+                onSignOut = { }, graphHost = host, bankAlertSectionSourceFactory = bankAlerts,
+                comparisonAlertSectionSourceFactory = comparisonTestFactory(owner.consumer))
         }
         rule.waitForIdle()
         openConnection()

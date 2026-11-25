@@ -23,6 +23,9 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.UserInfo
+import com.jay.fxi.ui.alert.ComparisonAlertSection
+import com.jay.fxi.ui.alert.ComparisonAlertSectionSourceFactory
+import com.jay.fxi.ui.alert.ProductionComparisonAlertSectionSourceFactory
 import com.jay.fxi.ui.alert.BankAlertSection
 import com.jay.fxi.ui.alert.BankAlertSectionSourceFactory
 import com.jay.fxi.ui.alert.ProductionBankAlertSectionSourceFactory
@@ -77,7 +80,8 @@ internal fun PremiumTopicRoute(
     bankHistoryWiring: BankHistoryWiringFactory = ProductionBankHistoryWiring,
     bankAlertSectionSourceFactory: BankAlertSectionSourceFactory = ProductionBankAlertSectionSourceFactory,
     sourceAlertSectionSourceFactory: SourceAlertSectionSourceFactory = ProductionSourceAlertSectionSourceFactory,
-    sourceHistoryWiring: SourceHistoryWiringFactory = ProductionSourceHistoryWiring
+    sourceHistoryWiring: SourceHistoryWiringFactory = ProductionSourceHistoryWiring,
+    comparisonAlertSectionSourceFactory: ComparisonAlertSectionSourceFactory = ProductionComparisonAlertSectionSourceFactory
 ) {
     LaunchedEffect(consumer) { consumer.start() }
     LaunchedEffect(consumer, identity) { consumer.onIdentityChanged() }
@@ -217,7 +221,7 @@ internal fun PremiumTopicRoute(
                     },
                     graphSlot = graphSlot,
                     belowRates = if (screen.ui.selectedTab in listOf(FreeTab.USD, FreeTab.JPY, FreeTab.EUR) && !settingsOpen && detailUrl == null) {
-                        { tab, _ ->
+                        { tab, fxOverlayClear ->
                             Column {
                                 BankHistoryEntry(
                                     tab = tab,
@@ -230,6 +234,10 @@ internal fun PremiumTopicRoute(
                                     tab = tab,
                                     sourceFactory = bankAlertSectionSourceFactory,
                                     alertQuotes = screen.ui.alertQuotes
+                                )
+                                ComparisonAlertSection(
+                                    tab, "absolute", owner, consumer, comparisonAlertSectionSourceFactory,
+                                    isShown = { activeNow && !settingsOpen && detailUrl == null && fxOverlayClear() }
                                 )
                             }
                         }
@@ -262,6 +270,14 @@ internal fun PremiumTopicRoute(
                                             sourceFactory = sourceAlertSectionSourceFactory,
                                             quotes = screen.ui.alertQuotes,
                                             liveQuotes = liveQuotes
+                                        )
+                                        ComparisonAlertSection(
+                                            tab, "signed", owner, consumer, comparisonAlertSectionSourceFactory,
+                                            isShown = { liveQuotes() != null }
+                                        )
+                                        ComparisonAlertSection(
+                                            tab, "absolute", owner, consumer, comparisonAlertSectionSourceFactory,
+                                            isShown = { liveQuotes() != null }
                                         )
                                     }
                                 }

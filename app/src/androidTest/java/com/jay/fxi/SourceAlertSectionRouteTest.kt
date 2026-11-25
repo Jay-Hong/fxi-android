@@ -237,7 +237,8 @@ class SourceAlertSectionRouteTest {
                         userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
                         settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = history,
                         bankAlertSectionSourceFactory = bank, sourceAlertSectionSourceFactory = sources,
-                        sourceHistoryWiring = sourceHistory)
+                        sourceHistoryWiring = sourceHistory,
+                        comparisonAlertSectionSourceFactory = comparisonTestFactory(consumer))
                 }
             }
         }

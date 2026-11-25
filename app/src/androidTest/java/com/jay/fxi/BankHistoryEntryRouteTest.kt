@@ -263,7 +263,8 @@ class BankHistoryEntryRouteTest {
                 userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
                 settingsContent = { _, _, _ -> settingsShown += 1 }, graphHost = host, bankHistoryWiring = wiring,
                 bankAlertSectionSourceFactory = bankAlerts, sourceAlertSectionSourceFactory = sourceAlerts,
-                sourceHistoryWiring = sourceHistory)
+                sourceHistoryWiring = sourceHistory,
+                comparisonAlertSectionSourceFactory = comparisonTestFactory(consumer))
         }
         if (restorable) androidx.compose.ui.test.junit4.StateRestorationTester(rule).also { tester = it }.setContent(content)
         else rule.setContent(content)
@@ -291,6 +292,11 @@ class BankHistoryEntryRouteTest {
     private fun listeners(): Int = onMain {
         (PremiumTopicConsumer::class.java.getDeclaredField("screenListeners").apply { isAccessible = true }.get(consumer) as List<*>).size
     }
+    /** S9-2b: every composed comparison card (`comparison-absolute`, `comparison-signed`) holds one screen listener of its
+     *  own (ComparisonAlertSection). The history controller's listeners are the rest. */
+    private fun comparisonCards(): Int =
+        listOf("comparison-absolute", "comparison-signed").sumOf { rule.onAllNodesWithTag(it).fetchSemanticsNodes().size }
+    private fun historyListeners(): Int = listeners() - comparisonCards()
 
     private val serverMessage = "fixture server failure"
 
@@ -447,7 +453,7 @@ class BankHistoryEntryRouteTest {
                 assertFalse("$label: the request ended", last.guard())
                 assertNothingShown("$label: ended", "usd-krw")
                 // Leaving the composition closes the controller itself, not only the holder's scope.
-                if (end == "inactive") assertEquals("$label: no screen listener is left", 0, listeners())
+                if (end == "inactive") assertEquals("$label: no screen listener is left", 0, historyListeners())
                 inFlight?.let { call ->
                     lateComplete(call, kind)
                     assertNothingShown("$label: after the late completion", "usd-krw")
@@ -569,7 +575,7 @@ class BankHistoryEntryRouteTest {
         rule.waitUntil(5_000) { runCatching { onMain { usd().currentState().inlineToken } != null }.getOrDefault(false) }
         open()
         val call = factory.calls.last()
-        assertTrue("premise: open under a standing guard, listening", sheets() == 1 && call.guard() && listeners() == 1)
+        assertTrue("premise: open under a standing guard, listening", sheets() == 1 && call.guard() && historyListeners() == 1)
         val token = onMain { checkNotNull(usd().currentState().inlineToken) { "premise: an inline token" } }
         rule.runOnUiThread { usd().enterFullscreen(token) }
         rule.waitForIdle()
@@ -578,7 +584,7 @@ class BankHistoryEntryRouteTest {
         assertEquals("no entry under the graph fullscreen", 0, entries())
         assertEquals("the sheet is gone", 0, sheets())
         assertFalse("the old guard fell", call.guard())
-        assertEquals("no screen listener is left", 0, listeners())
+        assertEquals("no screen listener is left", 0, historyListeners())
         val counts = listOf(factory.made, factory.acquired.get(), factory.calls.size)
         val full = onMain { checkNotNull(usd().currentState().fullscreenToken) { "premise: a fullscreen token" } }
         rule.runOnUiThread { usd().exitFullscreen(full) }
@@ -586,7 +592,7 @@ class BankHistoryEntryRouteTest {
         rule.waitUntil(5_000) { entries() == 1 }
         assertEquals("leaving the fullscreen made, acquired and read nothing", counts,
             listOf(factory.made, factory.acquired.get(), factory.calls.size))
-        assertEquals("and listens to nothing", 0, listeners())
+        assertEquals("and listens to nothing", 0, historyListeners())
         lateComplete(call, "success")
         assertNothingShown("the late read", "usd-krw")
     }
@@ -721,11 +727,11 @@ class BankHistoryEntryRouteTest {
             if (!loaded) { rule.onNodeWithText("닫기").performClick(); rule.waitForIdle() }
         }
         val reads = factory.calls.size
-        assertEquals("premise: the open sheet listens", 1, listeners())
+        assertEquals("premise: the open sheet listens", 1, historyListeners())
         checkNotNull(tester).emulateSavedInstanceStateRestore()
         rule.waitForIdle()
         assertEquals("a saved-state restore brings no sheet back", 0, sheets())
-        assertEquals("and the disposed composition left no screen listener", 0, listeners())
+        assertEquals("and the disposed composition left no screen listener", 0, historyListeners())
         assertEquals("and reads nothing", reads, factory.calls.size)
     }
 

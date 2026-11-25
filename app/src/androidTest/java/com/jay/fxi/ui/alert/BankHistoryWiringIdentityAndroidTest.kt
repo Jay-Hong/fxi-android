@@ -161,7 +161,8 @@ class BankHistoryWiringIdentityAndroidTest {
             PremiumTopicRoute(consumer = consumer, identity = a1, isActive = true, newsViewModel = vm,
                 userInfo = UserInfo("A", null, null, null, AuthProvider.entries.first()), onSignOut = {},
                 settingsContent = { _, _, _ -> }, bankHistoryWiring = counting, bankAlertSectionSourceFactory = bankAlerts,
-                sourceAlertSectionSourceFactory = sourceAlerts, sourceHistoryWiring = sourceHistory)
+                sourceAlertSectionSourceFactory = sourceAlerts, sourceHistoryWiring = sourceHistory,
+                comparisonAlertSectionSourceFactory = com.jay.fxi.comparisonTestFactory(consumer))
         }
         rule.waitForIdle()
         for (tab in listOf(FreeTab.JPY, FreeTab.TETHER, FreeTab.USD)) { focus.value = OwnedTopicFocus(a1, tab); rule.waitForIdle() }

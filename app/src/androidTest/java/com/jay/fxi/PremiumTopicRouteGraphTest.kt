@@ -267,7 +267,8 @@ class PremiumTopicRouteGraphTest {
                 PremiumTopicRoute(consumer = consumer, identity = identity, isActive = active, newsViewModel = vm, userInfo = null,
                     onSignOut = { }, modifier = androidx.compose.ui.Modifier.testTag("route:$tick"), graphHost = host,
                     bankAlertSectionSourceFactory = bankAlerts, sourceAlertSectionSourceFactory = sourceAlerts,
-                    sourceHistoryWiring = sourceHistory)
+                    sourceHistoryWiring = sourceHistory,
+                    comparisonAlertSectionSourceFactory = comparisonTestFactory(consumer))
             }
         }
         rule.waitForIdle()
