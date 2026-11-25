@@ -125,6 +125,7 @@ class ComparisonAlertSettingsOwnerContractTest {
         var maxFetching = 0
         val states = mutableListOf<ComparisonAlertSettingsState>()
         val parent = SupervisorJob()
+        val writerCalls = IntArray(3)
         val owner = ComparisonAlertSettingsOwner(
             { use, guard ->
                 val call = Call(use, guard, checkNotNull(currentCoroutineContext()[Job]))
@@ -147,7 +148,10 @@ class ComparisonAlertSettingsOwnerContractTest {
                 } finally {
                     sleeping--
                 }
-            }, { 0.0 }
+            }, { 0.0 },
+            post = { _, _, _ -> writerCalls[0]++; error("POST") },
+            put = { _, _, _, _ -> writerCalls[1]++; error("PUT") },
+            remove = { _, _, _ -> writerCalls[2]++; error("DELETE") }
         )
         init {
             CoroutineScope(parent + UnconfinedTestDispatcher(test.testScheduler)).launch {
@@ -170,6 +174,7 @@ class ComparisonAlertSettingsOwnerContractTest {
             heldSleep?.complete(Unit)
             calls.forEach { it.reply.cancel() }
             drain()
+            assertEquals(listOf(0, 0, 0), writerCalls.toList())
         }
     }
 
@@ -655,8 +660,13 @@ class ComparisonAlertSettingsOwnerContractTest {
                 if (Regex("""@Singleton\s+internal\s+class\s+ComparisonAlertSettingsOwner\b""").findAll(src).count() != 1 ||
                     Regex("""@Inject\s+constructor\b""").findAll(src).count() != 1) add("singleton")
                 if (uses("getComparisonAlerts") != mapOf(owner to 1, repository to 2, service to 3)) add("caller")
-                for (write in listOf("createComparisonAlert", "updateComparisonAlert", "deleteComparisonAlert")) {
-                    if (uses(write) != mapOf(repository to 2, service to 3)) add("surface")
+                for ((name, args) in listOf("Create" to "request,", "Update" to "id,request,", "Delete" to "id,")) {
+                    val write = name.lowercase() + "ComparisonAlert"
+                    val delegate = "comparison$name"
+                    val function = flat.substringAfter("internalfun$delegate(", "").substringBefore("internalfun")
+                    if (uses(write) != mapOf(owner to 1, repository to 2, service to 3) ||
+                        uses(delegate) != mapOf(owner to 2) || !flat.contains("$delegate(repository)") ||
+                        !function.contains("repository.$write(use.identity,${args}useAdmitted=guard)")) add("surface")
                 }
                 if (uses("getComparisonHistory") != mapOf(repository to 1, session to 1) ||
                     !tree.getValue(session).filterNot(Char::isWhitespace).contains("repository.getComparisonHistory(owner.identity,tab,diffType,100,useAdmitted)") ||
@@ -668,11 +678,13 @@ class ComparisonAlertSettingsOwnerContractTest {
                     !flat.contains("getSettings(use,guard)")) add("delegation")
                 if (Regex("""\bgetSettings\s*(?:\.\s*invoke\s*)?\(""").findAll(src).count() != 1) add("get-start")
                 if (Regex("""\bAlertLoadPhase\s*\.\s*Ready\b""").findAll(src).count() != 1 ||
-                    !flat.contains("mutableState.value=ComparisonAlertSettingsState(AlertLoadPhase.Ready,use.identity,adopted)"))
+                    !flat.contains("publishState(ComparisonAlertSettingsState(AlertLoadPhase.Ready,identity,adopted))") ||
+                    !flat.contains("ComparisonAlertRowPolicy.adopt(use.identity.uid,rows)commitRows(use.identity,adopted)") ||
+                    !flat.contains("commitRows(use.identity,ComparisonAlertRowPolicy.Adopted(next))"))
                     add("ready-publication")
                 if (!tree.getValue(registry).filterNot(Char::isWhitespace)
                         .contains(":this(listOf({bank.get()},{source.get()},{comparison.get()}),")) add("families")
-                if (Regex("""\b(?:addObserver|ProcessLifecycleOwner|onBankPush|onSourceDelivery|getComparisonHistory|createComparisonAlert|updateComparisonAlert|deleteComparisonAlert|AlertRateLimitFloor)\b""")
+                if (Regex("""\b(?:addObserver|ProcessLifecycleOwner|onBankPush|onSourceDelivery|getComparisonHistory|AlertRateLimitFloor)\b""")
                         .containsMatchIn(src)) add("surface")
             }
         }
@@ -723,7 +735,7 @@ class ComparisonAlertSettingsOwnerContractTest {
         assertEquals(setOf("resolve"), violations(resolved))
         val bypass = real + (other to (real.getValue(other) + "\nprivate val bypass = com.jay.fxi.data.repository.AlertRepository::getComparisonAlerts"))
         assertEquals(setOf("caller"), violations(bypass))
-        val constant = replace(real, owner, "useAdmitted = guard", "useAdmitted = { true }")
+        val constant = replace(real, owner, "tab = null, useAdmitted = guard", "tab = null, useAdmitted = { true }")
         assertEquals(setOf("delegation"), violations(constant))
         val extraGet = replace(real, owner, "val bound = fetch(use, guard)",
             "val bound = if (attempt == 0) fetch(use, guard) else getSettings(use, guard)")

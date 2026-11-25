@@ -87,8 +87,12 @@ class S9ComparisonRegistryContractTest {
         val source = SourceAlertSettingsOwner({ _, _ -> sources.read() }, access, floor, AlertRetryPolicy(), now, { 0.0 },
             scope, { delay(it) }, premium, MutableStateFlow(0L),
             { _, _, _ -> error("create") }, { _, _, _, _ -> error("edit") }, { _, _, _ -> error("delete") })
+        val writerCalls = IntArray(3)
         val comparison = ComparisonAlertSettingsOwner({ _, _ -> comparisons.read() }, access, { identity }, premium,
-            MutableStateFlow(0L), scope, { delay(it) }, { 0.0 })
+            MutableStateFlow(0L), scope, { delay(it) }, { 0.0 },
+                post = { _, _, _ -> writerCalls[0]++; error("POST") },
+                put = { _, _, _, _ -> writerCalls[1]++; error("PUT") },
+                remove = { _, _, _ -> writerCalls[2]++; error("DELETE") })
         val process = Process().also { it.lifecycle.currentState = Lifecycle.State.STARTED }
         val callbacks = mutableListOf<Pair<Int, String>>()
         val enteredAt = List(3) { mutableListOf<Long>() }
@@ -144,7 +148,7 @@ class S9ComparisonRegistryContractTest {
     private fun confirmed(id: AuthIdentityFence) = OwnedPremiumAccess(id.uid, id.authGeneration, PremiumAccessState.PremiumConfirmed)
     private fun TestScope.rig(block: Rig.() -> Unit) {
         val rig = Rig(this)
-        try { rig.block() } finally { rig.scope.cancel(); runCurrent() }
+        try { rig.block() } finally { rig.scope.cancel(); runCurrent(); assertEquals(listOf(0, 0, 0), rig.writerCalls.toList()) }
     }
 
     private inline fun <reified T> unused(): T = T::class.java.cast(

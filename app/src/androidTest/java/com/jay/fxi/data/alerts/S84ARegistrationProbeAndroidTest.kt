@@ -179,7 +179,8 @@ class S84ARegistrationProbeAndroidTest {
         rule.runOnUiThread {
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main).also { scopes += it }
             comparison = ComparisonAlertSettingsOwner(comparisonSettingsGet(repository), access, { a1 }, premium,
-                MutableStateFlow(0L), scope, { delay(it) }, { 0.0 })
+                MutableStateFlow(0L), scope, { delay(it) }, { 0.0 },
+                comparisonCreate(repository), comparisonUpdate(repository), comparisonDelete(repository))
             bank = BankAlertSettingsOwner(
                 { o, admitted -> repository.getSettings(o, admitted) }, access, floor, AlertRetryPolicy(), SystemClock::elapsedRealtime,
                 { 0.0 }, scope, { delay(it) }, premium, MutableStateFlow(0L), MutableStateFlow(true),

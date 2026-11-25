@@ -683,8 +683,15 @@ class AlertN1StructureTest {
                 "S11-inject $COMPARISON_OWNER"),
             Triple("comparison identity changes during admission", editedLiteral(COMPARISON_OWNER, " && tokens.currentIdentityFence() == it", ""),
                 "S11-inject $COMPARISON_OWNER"),
+            Triple("comparison DELETE writer omitted", editedLiteral(COMPARISON_OWNER, ", comparisonDelete(repository)", ""),
+                "S11-inject $COMPARISON_OWNER"),
+            Triple("comparison POST constant guard", editedLiteral(COMPARISON_OWNER,
+                "createComparisonAlert(use.identity, request, useAdmitted = guard)", "createComparisonAlert(use.identity, request, useAdmitted = { true })"),
+                "S11-comparison-write comparisonCreate"),
+            Triple("comparison PUT invokes another verb", editedLiteral(COMPARISON_OWNER,
+                "repository.updateComparisonAlert", "repository.createComparisonAlert"), "S11-comparison-write comparisonUpdate"),
             Triple("comparison GET for one tab", editedLiteral(COMPARISON_OWNER, "tab = null", "tab = \"tether\""), "S11-comparison-get"),
-            Triple("comparison GET with a constant guard", editedLiteral(COMPARISON_OWNER, "useAdmitted = guard", "useAdmitted = { true }"),
+            Triple("comparison GET with a constant guard", editedLiteral(COMPARISON_OWNER, "tab = null, useAdmitted = guard", "tab = null, useAdmitted = { true }"),
                 "S11-comparison-get"),
             Triple("the source GET for every asset", editedLiteral(SOURCE_OWNER, "SourceAlertRowPolicy.SETTINGS_ASSET, admitted)", "null, admitted)"),
                 "S11-inject $SOURCE_OWNER"),
@@ -740,6 +747,9 @@ class AlertN1StructureTest {
         )) {
             assertCaught("S11 $label", tag, s11Wiring(tree))
         }
+        assertCaught("extra comparison writer reference", "A-comparison-write deleteComparisonAlert",
+            aReach(code + (COMPARISON_OWNER to (code.getValue(COMPARISON_OWNER) + "\nval extra = ::comparisonDelete"))))
+
         val reformatted = edited(OWNER, """\{\s*Random\.nextDouble\(-0\.2,\s*0\.2\)\s*\}""", "{\n            Random.nextDouble(\n                -0.2, 0.2\n            )\n        }")
         assertEquals("control(S11): the same delegation reformatted passes", emptyList<String>(), s11Wiring(reformatted))
         val sourceReformatted = editedLiteral(SOURCE_OWNER, "{ owner, id, admitted -> repository.deleteSourceSetting(owner, id, admitted) }",
@@ -1363,7 +1373,7 @@ class AlertN1StructureTest {
                         { tokens.currentIdentityFence()?.takeIf { ReleaseAdmission.isOpen && protectedAdmission() && tokens.currentIdentityFence() == it } }
                     },
                     coordinator.state, coordinator.accessRevisions, CoroutineScope(SupervisorJob() + Dispatchers.Main),
-                    { delay(it) }, { Random.nextDouble(-0.2, 0.2) })""",
+                    { delay(it) }, { Random.nextDouble(-0.2, 0.2) }, comparisonCreate(repository), comparisonUpdate(repository), comparisonDelete(repository))""",
                 SOURCE_OWNER to """@Inject constructor(repository: AlertRepository, access: AlertSettingsAccess, floor: AlertRateLimitFloor,
                     coordinator: PremiumAccessCoordinator) : this(
                     { owner, admitted -> repository.getSourceSettings(owner, SourceAlertRowPolicy.SETTINGS_ASSET, admitted) },
@@ -1418,6 +1428,18 @@ class AlertN1StructureTest {
         }
 
         /** The three source writes, each with the one delegation function that may call it. */
+        val COMPARISON_WRITE_FORMS = mapOf(
+            "comparisonCreate" to squash("""internal fun comparisonCreate(repository: AlertRepository):
+    suspend (AlertSettingsUse, ComparisonAlertRequest, () -> Boolean) -> AuthBoundResult<ComparisonAlertSetting> =
+    { use, request, guard -> repository.createComparisonAlert(use.identity, request, useAdmitted = guard) }"""),
+            "comparisonUpdate" to squash("""internal fun comparisonUpdate(repository: AlertRepository):
+    suspend (AlertSettingsUse, Int, ComparisonAlertUpdateRequest, () -> Boolean) -> AuthBoundResult<ComparisonAlertSetting> =
+    { use, id, request, guard -> repository.updateComparisonAlert(use.identity, id, request, useAdmitted = guard) }"""),
+            "comparisonDelete" to squash("""internal fun comparisonDelete(repository: AlertRepository):
+    suspend (AlertSettingsUse, Int, () -> Boolean) -> AuthBoundResult<Unit> =
+    { use, id, guard -> repository.deleteComparisonAlert(use.identity, id, useAdmitted = guard) }""")
+        )
+
         val SOURCE_WRITES = listOf(
             "createSourceSetting" to "productionSourceCreate",
             "updateSourceSetting" to "productionSourceEdit",
@@ -1440,6 +1462,9 @@ class AlertN1StructureTest {
                 if (code[path]?.let(::injectDelegation)?.let(::squash) != form) v += "S11-inject $path"
             }
             val comparison = code[COMPARISON_OWNER].orEmpty()
+            for ((name, form) in COMPARISON_WRITE_FORMS) {
+                if (sourceWriteDelegation(comparison, name)?.let(::squash) != form) v += "S11-comparison-write $name"
+            }
             val get = "{ use, guard -> repository.getComparisonAlerts(use.identity, tab = null, useAdmitted = guard) }"
             if (count(squash(comparison), Regex.escape(squash(get))) != 1) v += "S11-comparison-get"
             val owner = code[OWNER].orEmpty()
@@ -1547,6 +1572,12 @@ class AlertN1StructureTest {
             if (sourceGets != setOf(REPOSITORY, SOURCE_OWNER)) v += "A-source-get ${sourceGets.sorted()}"
             // S8-5a: apart from its one declaration in the repository, each source write is named exactly once in production
             // code, inside its delegation function; any other receiver, alias, reference or internal call is a second use.
+            for (delegate in COMPARISON_WRITE_FORMS.keys) {
+                val write = delegate.removePrefix("comparison").lowercase() + "ComparisonAlert"
+                if (occurrences(code, """\b$write\b""") != mapOf(COMPARISON_OWNER to 1, REPOSITORY to 2,
+                        BASE + "data/remote/AuthenticatedApiService.kt" to 3) ||
+                    occurrences(code, """\b$delegate\b""") != mapOf(COMPARISON_OWNER to 2)) v += "A-comparison-write $write"
+            }
             for ((write, delegation) in SOURCE_WRITES) {
                 val declared = count(code[REPOSITORY].orEmpty(), """\bsuspend\s+fun\s+$write\s*\(""")
                 if (declared != 1) v += "A-source-write-declared $write"

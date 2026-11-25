@@ -463,13 +463,17 @@ class ComparisonAlertSectionRouteTest {
             GraphProtectedAdmission({ a1 }, DeletionAdmissionStore()))
         val held = CompletableDeferred<Unit>()
         val gets = AtomicInteger()
+        val writerCalls = IntArray(3)
         lateinit var reader: ComparisonAlertSettingsOwner
         rule.runOnUiThread {
             reader = ComparisonAlertSettingsOwner({ _, _ ->
                 val index = gets.incrementAndGet()
                 if (index == 1) withContext(NonCancellable) { held.await() }
                 AuthBoundResult({}, Result.success(listOf(row(index, "tether"))))
-            }, access, { a1 }, premium, revisions, scope, { delay(it) }, { 0.0 })
+            }, access, { a1 }, premium, revisions, scope, { delay(it) }, { 0.0 },
+                post = { _, _, _ -> writerCalls[0]++; error("POST") },
+                put = { _, _, _, _ -> writerCalls[1]++; error("PUT") },
+                remove = { _, _, _ -> writerCalls[2]++; error("DELETE") })
             factory.reader = OwnerComparisonSectionSource(reader)
             reader.onForeground(false)
         }
@@ -500,6 +504,7 @@ class ComparisonAlertSectionRouteTest {
             assertTrue(nodes("comparison-row-1").isEmpty())
         } finally {
             held.complete(Unit)
+            rule.runOnUiThread { assertEquals(listOf(0, 0, 0), writerCalls.toList()) }
         }
     }
 

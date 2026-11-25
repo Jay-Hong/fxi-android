@@ -215,7 +215,8 @@ class ComparisonAlertSectionContractTest {
                 val response = runBlocking { read(use, guard) }
                 if (++reads == 1) withContext(NonCancellable) { releaseFirst.await() }
                 response
-            }, access, { a1 }, premium, revisions, scope, { delay(it) }, { 0.0 })
+            }, access, { a1 }, premium, revisions, scope, { delay(it) }, { 0.0 },
+                comparisonCreate(repository), comparisonUpdate(repository), comparisonDelete(repository))
             val source = OwnerComparisonSectionSource(owner)
             val mount = ComparisonSectionMount({ true }, {})
             try {

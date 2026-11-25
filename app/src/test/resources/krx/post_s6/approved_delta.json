@@ -595,6 +595,18 @@
         "src/main/java/com/jay/fxi/ui/alert/ComparisonAlertHistorySession.kt": "847bd61ea117ebf825a4ab212140cf0548494a13c92e3566143e42f6e3cf911b",
         "src/main/java/com/jay/fxi/ui/alert/ComparisonAlertHistorySheet.kt": "e62bffeafe43d58898109c0fbcbf47e618da83d3518e629ee59be863add1b9b9"
       }
+    },
+    {
+      "id": "S9-4a",
+      "source_parent": "3added6b5b64c3cf650432dfa1660935d1d87966",
+      "approval_record_sha256": "c2c4030998b1c8ee0ddbedff00763df77e7a0528b873e17afdcb4b3e7f3533e6",
+      "changed": {
+        "src/main/java/com/jay/fxi/data/alerts/ComparisonAlertSettingsOwner.kt": {
+          "from": "5a031537637ff67b4bf3d0a38b0fc453ac1fb0479156278ce0148e5f3f72ce46",
+          "to": "ad409a548f678d3eca93bf250f49a6b3ae8831d25e22fa224bf619cc5c560d31"
+        }
+      },
+      "added": {}
     }
   ]
 }
