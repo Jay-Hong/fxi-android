@@ -1522,7 +1522,8 @@ class AlertN1StructureTest {
             val v = mutableListOf<String>()
             for ((name, expected) in listOf(
                 "BankAlertSettingsOwner" to setOf(OWNER, REGISTRY, HOLDER),
-                "AlertSettingsAccess" to setOf(ACCESS, OWNER, SOURCE_OWNER, COMPARISON_OWNER, SOURCE_HISTORY_ENTRY, REGISTRY),
+                "AlertSettingsAccess" to setOf(ACCESS, OWNER, SOURCE_OWNER, COMPARISON_OWNER, SOURCE_HISTORY_ENTRY, REGISTRY,
+                    BASE + "ui/alert/ComparisonAlertHistorySession.kt"),
                 "AlertRateLimitFloor" to setOf(FLOOR, OWNER, SOURCE_OWNER, SOURCE_HISTORY_ENTRY),
                 // S8-4a: the registry registers the source owner and the tether section reads it; the section projects with the policy.
                 "ComparisonAlertSettingsOwner" to setOf(COMPARISON_OWNER, REGISTRY, BASE + "ui/alert/ComparisonAlertSection.kt"),

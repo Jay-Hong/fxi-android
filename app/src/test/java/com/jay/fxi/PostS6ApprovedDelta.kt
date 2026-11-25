@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "2544e799ffd0d82f25852c035cdc6e274975af78a27fa044451dd178ae990ac7"
+    const val APPROVED_SHA256 = "34b50a132763c87d3d1177beaae0d2de640d15b3cb20d51cbe5ff1b28b2442d2"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -87,6 +87,8 @@ internal object PostS6ApprovedDelta {
      * - a633dead…: 478c0e4b AuthenticatedApiService.kt, KRX only in the comment at :361 (graph catalog kdoc).
      * - 3ad2ca3c…: 70c903a0 AlertFamilyRefresherRegistry.kt (S8-6's change), no KRX including comments.
      * - d3974388…: 70c903a0 PremiumTopicRoute.kt (S8-5b's change), no KRX including comments.
+     * - 27796335…: f94795ef ComparisonAlertSection.kt (S9-2b's addition), no KRX including comments.
+     * - 8875b396…: f94795ef PremiumTopicRoute.kt (S9-2b's change), no KRX including comments.
      */
     val NO_KRX_REVIEWED = setOf(
         "f22238393c489023bea5259c455d4bcaa4347ca40da5c9b306eb0787adedf7f9",
@@ -152,7 +154,9 @@ internal object PostS6ApprovedDelta {
         "73c7ec4b1158b5934f42ef20b03cf61164f6f5ee538f6aed62ebe91d8edf801b",
         "a633deadf8c122233a639cca17c453ffdacf1f1b4a9af368fce01bfaec865072",
         "3ad2ca3c709ccbbd05297a32c072bcd1e2fde4130fd5d978a69847c608e20697",
-        "d3974388047316c6fa64b5d118f819a91a7793b010a6380d87e888c517dea752"
+        "d3974388047316c6fa64b5d118f819a91a7793b010a6380d87e888c517dea752",
+        "2779633563f2c1ff023f3b54dbc20d60196619ac5d41b691a3c08f1cac51098d",
+        "8875b3961e2baa49c0400123aeea0ea476acdc7d34f72d1071a72d15586382d2"
     )
 
     /**

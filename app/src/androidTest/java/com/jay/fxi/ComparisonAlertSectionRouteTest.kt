@@ -413,7 +413,7 @@ class ComparisonAlertSectionRouteTest {
         for (kind in listOf("signed", "absolute")) {
             val actions = rule.onAllNodes(hasAnyAncestor(hasTestTag("comparison-$kind")) and hasClickAction(), true)
                 .fetchSemanticsNodes().map { it.config.getOrNull(SemanticsProperties.TestTag) }
-            assertEquals(listOf("comparison-$kind-refresh", "comparison-$kind-expand"), actions)
+            assertEquals(listOf("comparison-$kind-history", "comparison-$kind-refresh", "comparison-$kind-expand"), actions)
         }
         val n = factory.counts()
         click("comparison-signed-expand"); assertTrue(nodes("comparison-row-81").isEmpty()); checkRows("absolute", listOf(8), 1)

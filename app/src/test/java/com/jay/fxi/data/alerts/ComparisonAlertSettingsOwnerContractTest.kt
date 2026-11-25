@@ -597,6 +597,7 @@ class ComparisonAlertSettingsOwnerContractTest {
     @Test fun A13_productionReach() {
         val base = S6Krx3bOffWiringContractTest.BASE
         val owner = base + "data/alerts/ComparisonAlertSettingsOwner.kt"
+        val session = base + "ui/alert/ComparisonAlertHistorySession.kt"
         val section = base + "ui/alert/ComparisonAlertSection.kt"
         val route = base + "ui/premium/view/PremiumTopicRoute.kt"
         val registry = base + "data/alerts/AlertFamilyRefresherRegistry.kt"
@@ -624,17 +625,41 @@ class ComparisonAlertSettingsOwnerContractTest {
                     Regex("""\.(?:take|distinct|sorted)\w*\b""").containsMatchIn(tree.getValue(section))) add("project")
                 if (Regex("""\b(?:clickable|toggleable|combinedClickable|reset|onBackground|rememberLauncherForActivityResult|onBankPush|onSourceDelivery)\b""")
                         .containsMatchIn(tree.getValue(section))) add("surface")
-                if (listOf("IconButton" to 2, "TextButton" to 1, "Switch" to 1).any { (name, calls) ->
+                if (listOf("IconButton" to 3, "TextButton" to 1, "Switch" to 1).any { (name, calls) ->
                         Regex("""\b$name\s*\(""").findAll(tree.getValue(section)).count() != calls
                     } || !ui.contains("Switch(checked=row.isEnabled,onCheckedChange=null,") ||
-                    Regex("""\b\w*(?:Permission|History)\w*\b""").containsMatchIn(tree.getValue(section))) add("surface")
+                    Regex("""\b\w*Permission\w*\b""").containsMatchIn(tree.getValue(section))) add("surface")
+                val sessionText = tree.getValue(session)
+                val factoryBody = sessionText.substringAfter("internal object ProductionComparisonAlertHistoryWiring")
+                    .substringBefore("internal sealed interface ComparisonHistoryBody")
+                if (Regex("""\b(?:DeletionAdmissionStore|GraphProtectedAdmission)\b""").containsMatchIn(sessionText) ||
+                    Regex("""\b(?:catch|runCatching)\b""").containsMatchIn(factoryBody) ||
+                    !sessionText.filterNot(Char::isWhitespace).contains("wiring.read.read(owner,tab,diffType){requests.active===request&&scope.isActive&&wiring.access.admits(request.use)}"))
+                    add("history-wiring")
+                val sectionText = tree.getValue(section)
+                val historyNames = Regex("""\b\w*History\w*\b""").findAll(sectionText).map { it.value }.toList()
+                if (historyNames.groupingBy { it }.eachCount() != mapOf("ComparisonAlertHistoryWiringFactory" to 2,
+                        "ProductionComparisonAlertHistoryWiring" to 1, "ComparisonAlertHistorySession" to 2,
+                        "ComparisonAlertHistorySheet" to 1, "History" to 2) ||
+                    !ui.contains("historyWiring:ComparisonAlertHistoryWiringFactory=ProductionComparisonAlertHistoryWiring,listen:") ||
+                    !ui.contains("importandroidx.compose.material.icons.filled.History") ||
+                    !ui.contains("Icon(Icons.Default.History,") ||
+                    !ui.contains("valopen={mount.runShown{if(session==null){valfresh=ComparisonAlertHistorySession(") ||
+                    !ui.contains("session?.let{opened->valobservedbyopened.state.collectAsState()observed.let{opened.currentState()}?.let{sheet->ComparisonAlertHistorySheet(") ||
+                    ui.indexOf("key(owner,tab,kind,sourceFactory,epoch){") !in 0 until ui.indexOf("varsessionbyremember{") ||
+                    !ui.contains("historyWiring.create(context)") || Regex("""\bAlertRepository\b""").containsMatchIn(sectionText)) add("surface")
+                val actions = listOf("history", "refresh", "expand").map { tag ->
+                    ui.indexOf("testTag(\"comparison-\$kind-$tag\")")
+                }
+                if (actions.first() < 0 || actions.zipWithNext().any { (a, b) -> a >= b }) add("surface")
                 if (Regex("""@Singleton\s+internal\s+class\s+ComparisonAlertSettingsOwner\b""").findAll(src).count() != 1 ||
                     Regex("""@Inject\s+constructor\b""").findAll(src).count() != 1) add("singleton")
                 if (uses("getComparisonAlerts") != mapOf(owner to 1, repository to 2, service to 3)) add("caller")
                 for (write in listOf("createComparisonAlert", "updateComparisonAlert", "deleteComparisonAlert")) {
                     if (uses(write) != mapOf(repository to 2, service to 3)) add("surface")
                 }
-                if (uses("getComparisonHistory") != mapOf(repository to 1) ||
+                if (uses("getComparisonHistory") != mapOf(repository to 1, session to 1) ||
+                    !tree.getValue(session).filterNot(Char::isWhitespace).contains("repository.getComparisonHistory(owner.identity,tab,diffType,100,useAdmitted)") ||
                     uses("getComparisonNotificationLogs") != mapOf(repository to 1, service to 3)) add("surface")
                 if (uses("comparisonSettingsGet") != mapOf(owner to 2) ||
                     !flat.contains("):this(comparisonSettingsGet(repository),access,") ||
@@ -657,6 +682,9 @@ class ComparisonAlertSettingsOwnerContractTest {
             assertEquals("unique input: $path $old", 1, Regex(Regex.escape(old)).findAll(src).count())
             return tree + (path to src.replace(old, new))
         }
+        for (extra in listOf("val store = DeletionAdmissionStore()", "val admission = GraphProtectedAdmission(tokens, store)")) {
+            assertEquals(setOf("history-wiring"), violations(real + (session to (real.getValue(session) + "\n" + extra))))
+        }
         val registered = "listOf({ bank.get() }, { source.get() }, { comparison.get() })"
         for (wrong in listOf("listOf({ bank.get() }, { source.get() })",
             "listOf({ bank.get() }, { source.get() }, { comparison.get() }, { comparison.get() })")) {
@@ -671,10 +699,17 @@ class ComparisonAlertSettingsOwnerContractTest {
         assertEquals(setOf("factory"), violations(fallback))
         val clickableRow = replace(real, section, "Row(Modifier.fillMaxWidth().testTag", "Row(Modifier.clickable { edit() }.fillMaxWidth().testTag")
         assertEquals(setOf("surface"), violations(clickableRow))
+        for ((old, wrong) in listOf("Icons.Default.History" to "Icons.Default.OtherHistory",
+            "historyWiring.create(context)" to "ProductionComparisonAlertHistoryWiring.create(context)",
+            "comparison-\$kind-history" to "comparison-\$kind-extra")) {
+            assertEquals(setOf("surface"), violations(replace(real, section, old, wrong)))
+        }
         val interactive = replace(real, section, "onCheckedChange = null", "onCheckedChange = {}")
         assertEquals(setOf("surface"), violations(interactive))
         val addButton = replace(real, section, "if (expanded) when (body)", "TextButton({}) { Text(\"추가\") }; if (expanded) when (body)")
         assertEquals(setOf("surface"), violations(addButton))
+        val repositoryType = real + (section to (real.getValue(section) + "\nprivate val bypass: com.jay.fxi.data.repository.AlertRepository? = null"))
+        assertEquals(setOf("surface"), violations(repositoryType))
         for (api in listOf("getComparisonHistory", "createComparisonAlert", "updateComparisonAlert", "deleteComparisonAlert")) {
             val bypassSection = real + (section to (real.getValue(section) + "\nprivate val bypass = AlertRepository::$api"))
             assertEquals(setOf("surface"), violations(bypassSection))

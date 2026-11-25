@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
@@ -32,6 +33,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -189,11 +191,11 @@ internal class ComparisonSlot(private val owner: TopicDisplayOwner, private val 
 @Composable
 internal fun ComparisonAlertSection(
     tab: FreeTab, kind: String, owner: TopicDisplayOwner, consumer: PremiumTopicConsumer,
-    sourceFactory: ComparisonAlertSectionSourceFactory, isShown: () -> Boolean
+    sourceFactory: ComparisonAlertSectionSourceFactory, historyWiring: ComparisonAlertHistoryWiringFactory, isShown: () -> Boolean
 ) {
     val slot = remember(owner, tab) { ComparisonSlot(owner, tab) }
     val current = { consumer.currentState().ui.let { slot.matches(it.owner, it.selectedTab) } && isShown() }
-    ComparisonSectionMountContent(tab, kind, owner, sourceFactory, current) { end ->
+    ComparisonSectionMountContent(tab, kind, owner, sourceFactory, current, historyWiring) { end ->
         consumer.addScreenListener { published ->
             if (!slot.matches(published.ui.owner, published.ui.selectedTab)) end()
         }
@@ -203,7 +205,8 @@ internal fun ComparisonAlertSection(
 @Composable
 internal fun ComparisonSectionMountContent(
     tab: FreeTab, kind: String, owner: TopicDisplayOwner, sourceFactory: ComparisonAlertSectionSourceFactory,
-    shown: () -> Boolean, listen: (() -> Unit) -> (() -> Unit)
+    shown: () -> Boolean, historyWiring: ComparisonAlertHistoryWiringFactory = ProductionComparisonAlertHistoryWiring,
+    listen: (() -> Unit) -> (() -> Unit)
 ) {
     val serverTab = tab.serverTab ?: return
     val current by rememberUpdatedState(shown)
@@ -212,7 +215,20 @@ internal fun ComparisonSectionMountContent(
     key(owner, tab, kind, sourceFactory, epoch) {
         val context = LocalContext.current.applicationContext
         val source = remember(context, sourceFactory) { sourceFactory.create(context) }
-        val mount = remember { ComparisonSectionMount({ current() }, { epoch++ }) }
+        val scope = rememberCoroutineScope()
+        val requests = remember { ComparisonRequestSlot() }
+        var session by remember { mutableStateOf<ComparisonAlertHistorySession?>(null) }
+        val mount = remember { ComparisonSectionMount({ current() }, { session?.close(); epoch++ }) }
+        val open = {
+            mount.runShown {
+                if (session == null) {
+                    val fresh = ComparisonAlertHistorySession(owner, serverTab, kind, historyWiring.create(context), scope, requests,
+                        { current() }, { retired -> if (session === retired) session = null })
+                    session = fresh
+                    fresh.open(listen)
+                }
+            }
+        }
         var attached by remember { mutableStateOf(false) }
         DisposableEffect(mount) {
             val stop = listen(mount::end)
@@ -222,6 +238,7 @@ internal fun ComparisonSectionMountContent(
             }
             onDispose {
                 stop()
+                session?.close()
                 mount.dispose()
             }
         }
@@ -229,14 +246,23 @@ internal fun ComparisonSectionMountContent(
             val state by source.state.collectAsState()
             state.body(owner.identity, serverTab, kind)
         } else ComparisonSectionBody.Loading
-        ComparisonCard(kind, serverTab, body) {
+        ComparisonCard(kind, serverTab, body, open) {
             mount.runShown(source::authoritative)
+        }
+        session?.let { opened ->
+            val observed by opened.state.collectAsState()
+            observed.let { opened.currentState() }?.let { sheet ->
+                ComparisonAlertHistorySheet(kind, sheet,
+                    onRetry = { mount.runShown { if (session === opened) opened.retry() } },
+                    onRefresh = { mount.runShown { if (session === opened) opened.refresh() } },
+                    onDismiss = opened::close)
+            }
         }
     }
 }
 
 @Composable
-private fun ComparisonCard(kind: String, tab: String, body: ComparisonSectionBody, refresh: () -> Unit) {
+private fun ComparisonCard(kind: String, tab: String, body: ComparisonSectionBody, open: () -> Unit, refresh: () -> Unit) {
     var expanded by remember { mutableStateOf(true) }
     val signed = kind == "signed"
     val title = if (signed) "김프 알림" else "비교 알림"
@@ -254,6 +280,10 @@ private fun ComparisonCard(kind: String, tab: String, body: ComparisonSectionBod
             if (body is ComparisonSectionBody.Loaded && body.enabledCount > 0) {
                 Text(body.enabledCount.toString(), Modifier.padding(start = 6.dp).testTag("comparison-$kind-count")
                     .background(Primary, CircleShape).padding(horizontal = 6.dp), color = Color.White)
+            }
+            IconButton(open, Modifier.testTag("comparison-$kind-history")) {
+                Icon(Icons.Default.History, "$title 히스토리", Modifier.background(Primary.copy(alpha = 0.15f),
+                    RoundedCornerShape(6.dp)).padding(3.dp), tint = Primary)
             }
             Spacer(Modifier.weight(1f))
             IconButton(refresh, Modifier.testTag("comparison-$kind-refresh")) { Icon(Icons.Default.Refresh, "$title 새로고침") }

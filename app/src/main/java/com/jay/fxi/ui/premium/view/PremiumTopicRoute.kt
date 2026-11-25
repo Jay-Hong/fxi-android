@@ -23,6 +23,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.UserInfo
+import com.jay.fxi.ui.alert.ComparisonAlertHistoryWiringFactory
+import com.jay.fxi.ui.alert.ProductionComparisonAlertHistoryWiring
 import com.jay.fxi.ui.alert.ComparisonAlertSection
 import com.jay.fxi.ui.alert.ComparisonAlertSectionSourceFactory
 import com.jay.fxi.ui.alert.ProductionComparisonAlertSectionSourceFactory
@@ -81,7 +83,8 @@ internal fun PremiumTopicRoute(
     bankAlertSectionSourceFactory: BankAlertSectionSourceFactory = ProductionBankAlertSectionSourceFactory,
     sourceAlertSectionSourceFactory: SourceAlertSectionSourceFactory = ProductionSourceAlertSectionSourceFactory,
     sourceHistoryWiring: SourceHistoryWiringFactory = ProductionSourceHistoryWiring,
-    comparisonAlertSectionSourceFactory: ComparisonAlertSectionSourceFactory = ProductionComparisonAlertSectionSourceFactory
+    comparisonAlertSectionSourceFactory: ComparisonAlertSectionSourceFactory = ProductionComparisonAlertSectionSourceFactory,
+    comparisonHistoryWiring: ComparisonAlertHistoryWiringFactory = ProductionComparisonAlertHistoryWiring
 ) {
     LaunchedEffect(consumer) { consumer.start() }
     LaunchedEffect(consumer, identity) { consumer.onIdentityChanged() }
@@ -236,7 +239,7 @@ internal fun PremiumTopicRoute(
                                     alertQuotes = screen.ui.alertQuotes
                                 )
                                 ComparisonAlertSection(
-                                    tab, "absolute", owner, consumer, comparisonAlertSectionSourceFactory,
+                                    tab, "absolute", owner, consumer, comparisonAlertSectionSourceFactory, comparisonHistoryWiring,
                                     isShown = { activeNow && !settingsOpen && detailUrl == null && fxOverlayClear() }
                                 )
                             }
@@ -272,11 +275,11 @@ internal fun PremiumTopicRoute(
                                             liveQuotes = liveQuotes
                                         )
                                         ComparisonAlertSection(
-                                            tab, "signed", owner, consumer, comparisonAlertSectionSourceFactory,
+                                            tab, "signed", owner, consumer, comparisonAlertSectionSourceFactory, comparisonHistoryWiring,
                                             isShown = { liveQuotes() != null }
                                         )
                                         ComparisonAlertSection(
-                                            tab, "absolute", owner, consumer, comparisonAlertSectionSourceFactory,
+                                            tab, "absolute", owner, consumer, comparisonAlertSectionSourceFactory, comparisonHistoryWiring,
                                             isShown = { liveQuotes() != null }
                                         )
                                     }

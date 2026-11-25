@@ -18,6 +18,7 @@ class BankHistoryWiringStructureTest {
     private val base = S6Krx3bOffWiringContractTest.BASE
     private val entry = base + "ui/alert/BankHistoryEntry.kt"
     /** S8-4b: the tether history entry reads the same deletion revisions. */
+    private val comparisonSession = base + "ui/alert/ComparisonAlertHistorySession.kt"
     private val sourceEntry = base + "ui/alert/SourceHistoryEntry.kt"
     private val route = base + "ui/premium/view/PremiumTopicRoute.kt"
     private val root = base + "ui/screen/RootScreen.kt"
@@ -78,12 +79,14 @@ class BankHistoryWiringStructureTest {
         val text = code.getValue(revisions)
         assertTrue("scoped and injected", Regex("""@Singleton\s+internal class DeletionAdmissionRevisions @Inject constructor\(\)""").containsMatchIn(text))
         assertEquals("constructed by nobody", emptySet<String>(), files("""(?<!class )\bDeletionAdmissionRevisions\(\)"""))
-        assertEquals("named by its file, the settings screen and the two entries only", setOf(revisions, settings, entry, sourceEntry),
+        assertEquals("named by its file, the settings screen and the three history consumers only", setOf(revisions, settings, entry, sourceEntry, comparisonSession),
             files("""\bDeletionAdmissionRevisions\b"""))
         assertEquals("the settings screen takes it injected and hands its publication over", listOf(1, 1),
             listOf(count(settings, """\brevisions: DeletionAdmissionRevisions\b"""), count(settings, """\brevisions::published\b""")))
         assertFalse("the entry point declares no binding", Regex("""@(Provides|Binds|Module)\b""").containsMatchIn(code.getValue(entry)))
         assertFalse("the source entry point declares no binding", Regex("""@(Provides|Binds|Module)\b""").containsMatchIn(code.getValue(sourceEntry)))
+        assertEquals(1, count(comparisonSession, """\bdeletionAdmissionRevisions\(\)\.revisions\b"""))
+        assertFalse(Regex("""@(Provides|Binds|Module)\b|\bpublished\b""").containsMatchIn(code.getValue(comparisonSession)))
         assertEquals("the source entry reads it once, as its wiring's deletion revisions", 1,
             count(sourceEntry, """\bdeletionAdmissionRevisions\(\)\.revisions\b"""))
     }
