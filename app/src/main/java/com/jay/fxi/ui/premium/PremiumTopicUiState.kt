@@ -4,6 +4,7 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.remote.OwnedTopicFocus
 import com.jay.fxi.data.remote.TopicDisplayOwner
 import com.jay.fxi.data.remote.TopicDisplayState
+import com.jay.fxi.domain.model.TopicQuoteKey
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.TopicDollarIndex
 import com.jay.fxi.ui.free.RateRowEditor
@@ -29,7 +30,8 @@ internal data class PremiumTopicUiState(
     val dollarIndex: TopicDollarIndex?,
     val statusBanner: PremiumTopicBanner?,
     val lastUpdated: Instant?,
-    val alertQuotes: Map<String, Double> = emptyMap()
+    val alertQuotes: Map<String, Double> = emptyMap(),
+    val comparisonQuotes: Map<TopicQuoteKey, Double> = emptyMap()
 ) {
     /** This model when it still belongs to the current owner, grant turn and tab; [NONE] otherwise. */
     fun forCurrent(display: TopicDisplayState, focus: OwnedTopicFocus?, liveIdentity: AuthIdentityFence?): PremiumTopicUiState {

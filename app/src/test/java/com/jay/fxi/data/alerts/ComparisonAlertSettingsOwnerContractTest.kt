@@ -628,12 +628,44 @@ class ComparisonAlertSettingsOwnerContractTest {
                     Regex("""\b(?:catch|runCatching)\b""").containsMatchIn(tree.getValue(section))) add("factory")
                 if (!ui.contains("returnComparisonSectionBody.Loaded(adopted.project(tab,kind))") ||
                     Regex("""\.(?:take|distinct|sorted)\w*\b""").containsMatchIn(tree.getValue(section))) add("project")
-                if (Regex("""\b(?:clickable|toggleable|combinedClickable|reset|onBackground|rememberLauncherForActivityResult|onBankPush|onSourceDelivery)\b""")
-                        .containsMatchIn(tree.getValue(section))) add("surface")
-                if (listOf("IconButton" to 3, "TextButton" to 1, "Switch" to 1).any { (name, calls) ->
-                        Regex("""\b$name\s*\(""").findAll(tree.getValue(section)).count() != calls
-                    } || !ui.contains("Switch(checked=row.isEnabled,onCheckedChange=null,") ||
-                    Regex("""\b\w*Permission\w*\b""").containsMatchIn(tree.getValue(section))) add("surface")
+                val sectionSource = tree.getValue(section)
+                val editor = base + "ui/alert/ComparisonAlertEditor.kt"
+                val fields = base + "ui/alert/ComparisonAlertDraftRules.kt"
+                val sheet = base + "ui/alert/ComparisonAlertEditorSheet.kt"
+                val screens = listOf(section, editor, fields, sheet)
+                val forbidden = Regex("""\b(?:readNotificationCapability|NotificationCapability\w*|NotificationPermission(?:Os|Lane|Lanes|Environment|EntryPoint|Dialog\w*)|ActivityResult\w*|rememberLauncherForActivityResult|POST_NOTIFICATIONS|ACTION_\w*SETTINGS|startActivit(?:y|ies)\w*|getSystemService|AlertRepository|onBackground)\b""")
+                if (screens.any { forbidden.containsMatchIn(tree.getValue(it)) ||
+                        Regex("""\b(?:rememberSaveable|Saver|combinedClickable|toggleable|onBankPush|onSourceDelivery|reset)\b""")
+                            .containsMatchIn(tree.getValue(it)) }) add("surface")
+                if (listOf(editor, fields, sheet).any { "EntryPointAccessors" in tree.getValue(it) } ||
+                    listOf("comparisonAlertSettingsOwner", "ComparisonAlertSectionEntryPoint").any { uses(it) != mapOf(section to 2) })
+                    add("factory")
+                if (listOf(fields, sheet).any { Regex("""\b(?:ComparisonAlertSectionSource|ComparisonAlertHandle)\b""")
+                        .containsMatchIn(tree.getValue(it)) }) add("surface")
+                if (listOf("IconButton" to 4, "TextButton" to 4, "Switch" to 1, "clickable" to 1,
+                        "rememberNotificationPermissionAction" to 1).any { (name, count) ->
+                        Regex("""\b$name\s*[({]""").findAll(sectionSource).count() != count
+                    } || listOf(
+                        ".testTag(\"comparison-edit-\${row.id}\").clickable(onClickLabel=\"\${text.description}알림수정\"){holder.edit(row)}",
+                        "Switch(checked=row.isEnabled,onCheckedChange={enabled->holder.toggle(row,enabled)}",
+                        "IconButton({holder.askDelete(row)}", "if(addAvailable){TextButton(onClick=holder::add,",
+                        "confirmButton={TextButton(onClick={holder.delete(token)})", "dismissButton={TextButton(onClick={holder.dismiss(token)})",
+                        "permission={granted->action.run{granted()}}"
+                    ).any { it !in ui }) add("surface")
+                if (screens.drop(1).any { Regex("""\brememberNotificationPermissionAction\b""").containsMatchIn(tree.getValue(it)) } ||
+                    Regex("""\bhistoryWiring\s*\.\s*create\s*\(""").findAll(sectionSource).count() != 1 ||
+                    Regex("""\bfresh\s*\.\s*open\s*\(""").findAll(sectionSource).count() != 1 ||
+                    !ui.contains("historyWiring.create(context),scope,requests,") ||
+                    Regex("""(?<![.\w])open\s*\(""").containsMatchIn(sectionSource) ||
+                    !ui.contains("session=freshfresh.open(listen)")) add("surface")
+                val modal = tree.getValue(sheet).filterNot(Char::isWhitespace)
+                if (listOf("TextButton(onClick=dismiss)", "TextButton(onClick=save,enabled=canSave,").any {
+                        Regex(Regex.escape(it)).findAll(modal).count() != 1 }) add("surface")
+                for ((name, args) in listOf("add" to "identity,draft", "edit" to "identity,oldId,originPair,draft",
+                        "setEnabled" to "identity,id,enabled", "delete" to "identity,id")) {
+                    if (!ui.contains("=settingsOwner.$name($args)") ||
+                        Regex("""\bsettingsOwner\s*\.\s*$name\s*\(""").findAll(sectionSource).count() != 1) add("surface")
+                }
                 val sessionText = tree.getValue(session)
                 val factoryBody = sessionText.substringAfter("internal object ProductionComparisonAlertHistoryWiring")
                     .substringBefore("internal sealed interface ComparisonHistoryBody")
@@ -649,7 +681,7 @@ class ComparisonAlertSettingsOwnerContractTest {
                     !ui.contains("historyWiring:ComparisonAlertHistoryWiringFactory=ProductionComparisonAlertHistoryWiring,listen:") ||
                     !ui.contains("importandroidx.compose.material.icons.filled.History") ||
                     !ui.contains("Icon(Icons.Default.History,") ||
-                    !ui.contains("valopen={mount.runShown{if(session==null){valfresh=ComparisonAlertHistorySession(") ||
+                    !ui.contains("valopen={mount.runShown{if(holder.modalFree){valfresh=ComparisonAlertHistorySession(") ||
                     !ui.contains("session?.let{opened->valobservedbyopened.state.collectAsState()observed.let{opened.currentState()}?.let{sheet->ComparisonAlertHistorySheet(") ||
                     ui.indexOf("key(owner,tab,kind,sourceFactory,epoch){") !in 0 until ui.indexOf("varsessionbyremember{") ||
                     !ui.contains("historyWiring.create(context)") || Regex("""\bAlertRepository\b""").containsMatchIn(sectionText)) add("surface")
@@ -716,7 +748,7 @@ class ComparisonAlertSettingsOwnerContractTest {
             "comparison-\$kind-history" to "comparison-\$kind-extra")) {
             assertEquals(setOf("surface"), violations(replace(real, section, old, wrong)))
         }
-        val interactive = replace(real, section, "onCheckedChange = null", "onCheckedChange = {}")
+        val interactive = replace(real, section, "onCheckedChange = { enabled -> holder.toggle(row, enabled) }", "onCheckedChange = {}")
         assertEquals(setOf("surface"), violations(interactive))
         val addButton = replace(real, section, "if (expanded) when (body)", "TextButton({}) { Text(\"추가\") }; if (expanded) when (body)")
         assertEquals(setOf("surface"), violations(addButton))

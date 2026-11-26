@@ -5,6 +5,7 @@ import com.jay.fxi.data.remote.OwnedTopicFocus
 import com.jay.fxi.data.remote.TopicConnectionDisplay
 import com.jay.fxi.data.remote.TopicDisplayOwner
 import com.jay.fxi.data.remote.TopicDisplayState
+import com.jay.fxi.domain.model.TopicQuoteKey
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.RateRowList
 import com.jay.fxi.domain.model.RateRowPreference
@@ -48,6 +49,39 @@ class PremiumTopicPresenterTest {
         TopicDisplayState(owner, r, seed, connection, cachedRefreshResolved = resolved)
     private fun present(tab: FreeTab, d: TopicDisplayState = display(), prefs: Map<RateRowList, RateRowPreference> = emptyMap()) =
         PremiumTopicPresenter.present(d, OwnedTopicFocus(a1, tab), a1, prefs)
+    @Test fun Q01_comparisonQuotesUseFullRosterAndAsset() {
+        val invalid = listOf(q("ibk", "usd-krw", Double.POSITIVE_INFINITY), q("nh", "usd-krw", Double.NaN),
+            q("sc", "usd-krw", 0.0))
+        val d = display(full.merge(invalid + q("shinhan", "usd-krw", 1392.0)))
+        val prefs = mapOf(RateRowList.FX_BANKS to RateRowPreference(hidden = setOf("investing", "ibk", "nh", "sc")),
+            RateRowList.TETHER_EXCHANGES to RateRowPreference(hidden = setOf("upbit")))
+        val usd = mapOf(TopicQuoteKey("kb", "usd-krw") to 1390.0, TopicQuoteKey("hana", "usd-krw") to 1391.0,
+            TopicQuoteKey("investing", "usd-krw") to 1389.0)
+        val exchanges = mapOf(TopicQuoteKey("upbit", "usdt-krw") to 1400.0, TopicQuoteKey("bithumb", "usdt-krw") to 1401.0)
+        val fxUsd = usd + (TopicQuoteKey("shinhan", "usd-krw") to 1392.0)
+        val fx = present(FreeTab.USD, d, prefs)
+        assertEquals(fxUsd, fx.comparisonQuotes)
+        assertEquals(fxUsd.mapKeys { it.key.source }, fx.alertQuotes)
+        assertEquals(usd + exchanges, present(FreeTab.TETHER, d, prefs).comparisonQuotes)
+        assertEquals(exchanges.mapKeys { it.key.source }, present(FreeTab.TETHER, d, prefs).alertQuotes)
+        assertEquals(mapOf(TopicQuoteKey("kb", "jpy-krw") to 950.12), present(FreeTab.JPY, d, prefs).comparisonQuotes)
+        assertEquals(mapOf(TopicQuoteKey("kb", "eur-krw") to 1600.0), present(FreeTab.EUR, d, prefs).comparisonQuotes)
+        assertTrue(present(FreeTab.NEWS, d).comparisonQuotes.isEmpty())
+    }
+
+    @Test fun Q02_forCurrentDropsStaleComparisonQuotes() {
+        val ui = present(FreeTab.USD)
+        val focus = OwnedTopicFocus(a1, FreeTab.USD)
+        assertTrue(ui.comparisonQuotes.isNotEmpty())
+        assertEquals(ui, ui.forCurrent(display(), focus, a1))
+        for (result in listOf(ui.forCurrent(display(), OwnedTopicFocus(a1, FreeTab.JPY), a1),
+            ui.forCurrent(display(owner = TopicDisplayOwner(a1, 2L)), focus, a1),
+            ui.forCurrent(display(), focus, AuthIdentityFence(a1.uid, 2)),
+            ui.forCurrent(display(owner = null), focus, a1))) {
+            assertEquals(PremiumTopicUiState.NONE, result)
+        }
+    }
+
     /** What the free projection and presenter draw for [tab], keeping an empty section only where an editor speaks for it. */
     private fun expectedSections(r: TopicRates, tab: FreeTab, prefs: Map<RateRowList, RateRowPreference>, editors: Set<RateRowList>): List<RateRowsView> =
         r.displayFor(tab, prefs).scales.flatMap { RateRowPresenter.present(it) }

@@ -22,11 +22,37 @@ import org.junit.Test
  */
 class S7E5B2B1StructureTest {
 
+    @Test fun S9_4B_comparisonPermissionWiring() {
+        val editor = BASE + "ui/alert/ComparisonAlertEditor.kt"
+        fun wired(tree: Map<String, String>): Boolean {
+            val section = tree.getValue(COMPARISON)
+            val holder = tree.getValue(editor)
+            val add = body(holder, "add").orEmpty()
+            return files(tree, CALL) == setOf(HELPER, SETTINGS, BANK_HOLDER, SOURCE_HOLDER, COMPARISON) &&
+                count(section, CALL) == 1 && count(section, """\baction\s*\.\s*run\b""") == 1 &&
+                "permission = { granted -> action.run { granted() } }" in squash(section) &&
+                count(holder, """\baction\s*\.\s*run\b""") == 0 &&
+                count(holder, CONTINUATION) == 1 && count(add, CONTINUATION) == 1 &&
+                count(add.replace(continuation(add), ""), """\beditor\s*=(?!=)""") == 0 &&
+                "if (addAvailable && modalFree) editor = ComparisonOpening" in squash(continuation(add))
+        }
+        assertTrue(wired(code))
+        for (injected in listOf(editor to "rememberNotificationPermissionAction()", COMPARISON to "action.run {}",
+                COMPARISON to "rememberNotificationPermissionAction()", SETTINGS + ".probe" to "rememberNotificationPermissionAction()")) {
+            assertTrue(!wired(code + (injected.first to (code[injected.first].orEmpty() + "\n" + injected.second))))
+        }
+        val earlyOpen = code.getValue(editor).replace("val token = Any()",
+            "editor = ComparisonOpening(null, ComparisonFields.create(tab, kind, quotes()))\n        val token = Any()")
+        assertTrue(!wired(code + (editor to earlyOpen)))
+        assertTrue(!wired(code + (COMPARISON to code.getValue(COMPARISON).replace("action.run { granted() }", "granted()"))))
+    }
+
     private companion object {
         val BASE = S6Krx3bOffWiringContractTest.BASE
         val HELPER = BASE + "ui/alert/NotificationPermissionAction.kt"
         val SETTINGS = BASE + "ui/settings/SettingsScreen.kt"
         val BANK_HOLDER = BASE + "ui/alert/BankAlertSection.kt"
+        val COMPARISON = BASE + "ui/alert/ComparisonAlertSection.kt"
         val SOURCE_HOLDER = BASE + "ui/alert/SourceAlertSection.kt"
         val VIEW_MODEL = BASE + "ui/viewmodel/AlertViewModel.kt"
         const val MARKER = "has_requested_notification_permission"
@@ -98,7 +124,7 @@ class S7E5B2B1StructureTest {
             if (code.values.any { Regex("""\bprovides\b|\bprovidesDefault\b""").containsMatchIn(it) && Regex(LOCAL).containsMatchIn(it) }) v += "H-local-provide"
             if (count(squash(helper), Regex.escape(DECLARATION)) != 1 || count(helper, """\bfun\s+rememberNotificationPermissionAction\b""") != 1) v += "H-declare"
             val callers = files(code, CALL) - HELPER
-            if (callers != setOf(SETTINGS, BANK_HOLDER, SOURCE_HOLDER)) v += "H-callers ${callers.sorted()}"
+            if (callers != setOf(SETTINGS, BANK_HOLDER, SOURCE_HOLDER, COMPARISON)) v += "H-callers ${callers.sorted()}"
             if (count(helper, CALL) != count(helper, """\bfun\s+rememberNotificationPermissionAction\b""")) v += "H-self-call"
             val flat = squash(helper)
             if (count(flat, Regex.escape(PRODUCTION_ENVIRONMENT)) != 1 || count(helper, """\bEntryPointAccessors\s*\.""") != 1) v += "H-production"

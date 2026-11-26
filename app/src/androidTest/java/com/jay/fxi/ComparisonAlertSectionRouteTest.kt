@@ -109,6 +109,11 @@ internal class CountingComparisonSource(initial: ComparisonAlertSettingsState,
     val ensures = AtomicInteger()
     val authoritatives = AtomicInteger()
     var reader: ComparisonAlertSectionSource? = null
+    val unexpectedWrites = java.util.concurrent.CopyOnWriteArrayList<String>()
+    private fun unexpected(method: String): ComparisonAlertHandle {
+        unexpectedWrites += method
+        return ComparisonAlertHandle().also { it.finish(ComparisonAlertOutcome.NotSent(ComparisonAlertNotSentReason.UNADMITTED)) }
+    }
     fun counts() = listOf(creates.get(), ensures.get(), starts.get())
     override fun create(context: Context): ComparisonAlertSectionSource {
         creates.incrementAndGet()
@@ -127,6 +132,14 @@ internal class CountingComparisonSource(initial: ComparisonAlertSettingsState,
                     flow.collect(collector)
                 }
             }
+            override fun add(identity: AuthIdentityFence, draft: ComparisonAlertDraft) =
+                real?.add(identity, draft) ?: unexpected("add")
+            override fun edit(identity: AuthIdentityFence, oldId: Int, originPair: ComparisonAlertPair, draft: ComparisonAlertDraft) =
+                real?.edit(identity, oldId, originPair, draft) ?: unexpected("edit")
+            override fun setEnabled(identity: AuthIdentityFence, id: Int, enabled: Boolean) =
+                real?.setEnabled(identity, id, enabled) ?: unexpected("setEnabled")
+            override fun delete(identity: AuthIdentityFence, id: Int) =
+                real?.delete(identity, id) ?: unexpected("delete")
             override fun ensure() { ensures.incrementAndGet(); real?.ensure() }
             override fun authoritative() { authoritatives.incrementAndGet(); real?.authoritative() }
         }
@@ -142,7 +155,7 @@ class ComparisonAlertSectionRouteTest {
     @get:Rule val rule = createAndroidComposeRule<ComponentActivity>()
 
     private val t = Instant.parse("2026-10-01T01:00:00Z")
-    private val a1 = AuthIdentityFence("A", 1L)
+    internal val a1 = AuthIdentityFence("A", 1L)
     private val o1 = TopicDisplayOwner(a1, 1L)
     private fun rates() = TopicRates().merge(listOf(TopicQuote("kb", "usd-krw", 1390.0, t), TopicQuote("kb", "jpy-krw", 930.0, t),
         TopicQuote("kb", "eur-krw", 1600.0, t), TopicQuote("upbit", "usdt-krw", 1400.0, t)))
@@ -181,12 +194,12 @@ class ComparisonAlertSectionRouteTest {
         }
     }
 
-    private val display = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN))
-    private val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.TETHER))
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    internal val display = MutableStateFlow(TopicDisplayState(o1, rates(), false, TopicConnectionDisplay.OPEN))
+    internal val focus = MutableStateFlow<OwnedTopicFocus?>(OwnedTopicFocus(a1, FreeTab.TETHER))
+    internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     /** S8-5b: the consumer's live identity, so another account's screen can be an accepted one. */
     private var liveAccount = a1
-    private val consumer = PremiumTopicConsumer(display, focus, { liveAccount }, MemoryRows(),
+    internal val consumer = PremiumTopicConsumer(display, focus, { liveAccount }, MemoryRows(),
         { o, tab -> focus.value = OwnedTopicFocus(o, tab) }, { }, { _, _ -> }, scope)
     private val sources = CountingSourceAlertSection()
     /** S8-4b: the entry above the section reads this counting fake, never the production wiring. */
@@ -206,14 +219,18 @@ class ComparisonAlertSectionRouteTest {
         }, BankHistoryRead { _, _, _ -> awaitCancellation() }, MutableStateFlow(0L), MutableStateFlow(0L))
     }
     @After fun tearDown() {
-        scope.cancel()
-        hostScopes.forEach { it.cancel() }
+        try {
+            assertEquals(emptyList<String>(), factory.unexpectedWrites)
+        } finally {
+            scope.cancel()
+            hostScopes.forEach { it.cancel() }
+        }
     }
 
-    private val graphFence = TopicSessionFence(a1, "e1", TopicGrantToken(1L))
+    internal val graphFence = TopicSessionFence(a1, "e1", TopicGrantToken(1L))
 
     /** The issuer's published access for [graphFence]: it admits A's grant 1 in user epoch e1, so a holder can take its context. */
-    @Volatile private var snapshot: TopicAccessSnapshot = run {
+    @Volatile internal var snapshot: TopicAccessSnapshot = run {
         val binding = com.jay.fxi.data.entitlements.EntitlementsIdentity("A", 1L)
         val record = com.jay.fxi.data.entitlements.AccessFence("A", "e1", "K1")
         TopicAccessSnapshot.INITIAL.copy(
@@ -275,7 +292,7 @@ class ComparisonAlertSectionRouteTest {
     private fun GraphV2ScreenStateHolder.field(name: String): Any? =
         GraphV2ScreenStateHolder::class.java.getDeclaredField(name).apply { isAccessible = true }.get(this)
     private val stamp = Instant.parse("2026-10-01T01:00:00Z")
-    private fun row(id: Int, tab: String = "usd", kind: String = "absolute"): ComparisonAlertSetting {
+    internal fun row(id: Int, tab: String = "usd", kind: String = "absolute"): ComparisonAlertSetting {
         val tether = tab == "tether"
         val asset = if (tether) "usdt-krw" else "$tab-krw"
         return ComparisonAlertSetting(id, a1.uid, tab, if (tether) "bithumb" else "kb", asset,
@@ -289,17 +306,18 @@ class ComparisonAlertSectionRouteTest {
     private fun ready(rows: List<ComparisonAlertSetting>) = ComparisonAlertSettingsState(AlertLoadPhase.Ready, a1,
         ComparisonAlertRowPolicy.adopt(a1.uid, rows))
 
-    private var factory by mutableStateOf(CountingComparisonSource(ready(mixed())))
+    internal var factory by mutableStateOf(CountingComparisonSource(ready(mixed())))
     private val news = NewsViewModel(NoNews(listOf(NewsItem("n1", "fixture news", "https://example.invalid/n1", "fixture", "external_link", t))))
 
     private var restoration: androidx.compose.ui.test.junit4.StateRestorationTester? = null
-    private fun show(restorable: Boolean = false) {
-        val content: @Composable () -> Unit = {
-            if (mounted) PremiumTopicRoute(consumer, liveAccount, active, news, null, {},
+    @Composable internal fun RouteContent() {
+        if (mounted) PremiumTopicRoute(consumer, liveAccount, active, news, null, {},
                 settingsContent = { _, _, _ -> settingsShown++ }, graphHost = host, bankHistoryWiring = history,
                 bankAlertSectionSourceFactory = bank, sourceAlertSectionSourceFactory = sources,
                 sourceHistoryWiring = sourceHistory, comparisonAlertSectionSourceFactory = factory)
-        }
+    }
+    private fun show(restorable: Boolean = false) {
+        val content: @Composable () -> Unit = { RouteContent() }
         if (restorable) {
             val tester = androidx.compose.ui.test.junit4.StateRestorationTester(rule)
             restoration = tester
@@ -308,7 +326,7 @@ class ComparisonAlertSectionRouteTest {
         rule.waitForIdle()
     }
 
-    private fun select(tab: FreeTab) {
+    internal fun select(tab: FreeTab) {
         rule.runOnUiThread { focus.value = OwnedTopicFocus(liveAccount, tab) }
         rule.waitForIdle()
     }
@@ -372,6 +390,7 @@ class ComparisonAlertSectionRouteTest {
             val expected = if (tab == FreeTab.TETHER) 2 else 1
             activeCount(expected)
             assertEquals(List(3) { expected }, factory.counts()); assertEquals(0, old.settings.subscriptionCount.value)
+            assertEquals(emptyList<String>(), old.unexpectedWrites)
             assertEquals(n, sibling.get())
             assertEquals(subscriptions, siblingSubscriptions())
         }
@@ -408,10 +427,16 @@ class ComparisonAlertSectionRouteTest {
             val subtree = hasAnyAncestor(hasTestTag("comparison-row-${r.id}"))
             rule.onNode(subtree and isToggleable(), true).let { if (r.isEnabled) it.assertIsOn() else it.assertIsOff() }
             rule.onNode(subtree and SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, if (r.isEnabled) "켜짐" else "꺼짐"), true).assertExists()
-            assertTrue(rule.onAllNodes((subtree or hasTestTag("comparison-row-${r.id}")) and hasClickAction(), true).fetchSemanticsNodes().isEmpty())
+            assertEquals(0, rule.onAllNodes(hasTestTag("comparison-row-${r.id}") and hasClickAction(), true).fetchSemanticsNodes().size)
+            val actions = rule.onAllNodes(subtree and hasClickAction(), true).fetchSemanticsNodes()
+            assertEquals(listOf("edit", "toggle", "delete").map { "comparison-$it-${r.id}" },
+                actions.map { it.config.getOrNull(SemanticsProperties.TestTag) })
+            val edit = actions.first().config
+            assertEquals("${edit[SemanticsProperties.ContentDescription].single()} 알림 수정", edit[SemanticsActions.OnClick].label)
         }
         for (kind in listOf("signed", "absolute")) {
-            val actions = rule.onAllNodes(hasAnyAncestor(hasTestTag("comparison-$kind")) and hasClickAction(), true)
+            assertEquals(1, nodes("comparison-$kind-add").size)
+            val actions = rule.onAllNodes(hasAnyAncestor(hasTestTag("comparison-$kind-header")) and hasClickAction(), true)
                 .fetchSemanticsNodes().map { it.config.getOrNull(SemanticsProperties.TestTag) }
             assertEquals(listOf("comparison-$kind-history", "comparison-$kind-refresh", "comparison-$kind-expand"), actions)
         }
@@ -456,6 +481,16 @@ class ComparisonAlertSectionRouteTest {
         assertTrue(nodes("comparison-row-62").isEmpty()); assertTrue(nodes("comparison-absolute-count").isEmpty())
     }
 
+    private fun <T> finalSample(expected: T, read: () -> T): T {
+        val deadline = android.os.SystemClock.elapsedRealtime() + 5000
+        var last = read()
+        while (last != expected && android.os.SystemClock.elapsedRealtime() < deadline) {
+            android.os.SystemClock.sleep(20)
+            last = read()
+        }
+        return last
+    }
+
     @Test fun U02_headerRefreshAfterRevokedFirstUse() {
         val revisions = MutableStateFlow(0L)
         val premium = MutableStateFlow(OwnedPremiumAccess(a1.uid, a1.authGeneration, PremiumAccessState.PremiumConfirmed))
@@ -471,21 +506,22 @@ class ComparisonAlertSectionRouteTest {
                 if (index == 1) withContext(NonCancellable) { held.await() }
                 AuthBoundResult({}, Result.success(listOf(row(index, "tether"))))
             }, access, { a1 }, premium, revisions, scope, { delay(it) }, { 0.0 },
-                post = { _, _, _ -> writerCalls[0]++; error("POST") },
-                put = { _, _, _, _ -> writerCalls[1]++; error("PUT") },
-                remove = { _, _, _ -> writerCalls[2]++; error("DELETE") })
+                post = { _, _, _ -> writerCalls[0]++; AuthBoundResult<ComparisonAlertSetting>({}, Result.failure(IllegalStateException("unexpected post"))) },
+                put = { _, _, _, _ -> writerCalls[1]++; AuthBoundResult<ComparisonAlertSetting>({}, Result.failure(IllegalStateException("unexpected put"))) },
+                remove = { _, _, _ -> writerCalls[2]++; AuthBoundResult<Unit>({}, Result.failure(IllegalStateException("unexpected remove"))) })
             factory.reader = OwnerComparisonSectionSource(reader)
             reader.onForeground(false)
         }
         try {
-            show(); rule.waitUntil(5000) { gets.get() == 1 && factory.ensures.get() == 2 }
+            show()
+            assertEquals(1 to 2, finalSample(1 to 2) { gets.get() to factory.ensures.get() })
             val refresh = keep("comparison-absolute-refresh")
             rule.runOnUiThread {
                 snapshot = snapshot.copy(userInvalidations=snapshot.userInvalidations+1,
                     facts=snapshot.facts.copy(userBlocks=setOf(TopicAccessBlock.PERSISTENCE_HOLD)))
                 revisions.value++
             }
-            rule.waitUntil(5000) { reader.state.value == ComparisonAlertSettingsState() }
+            assertEquals(ComparisonAlertSettingsState(), finalSample(ComparisonAlertSettingsState()) { reader.state.value })
             rule.runOnUiThread {
                 held.complete(Unit)
                 snapshot = snapshot.copy(facts=snapshot.facts.copy(userBlocks=emptySet()))
@@ -498,7 +534,7 @@ class ComparisonAlertSectionRouteTest {
                 rule.onNode(hasText("불러오는 중...") and hasAnyAncestor(hasTestTag("comparison-$kind")), true).assertExists()
             }
             rule.runOnUiThread { refresh() }
-            rule.waitUntil(5000) { nodes("comparison-row-2").size == 1 }
+            assertEquals(1 to 2, finalSample(1 to 2) { nodes("comparison-row-2").size to gets.get() })
             assertEquals(1, factory.authoritatives.get())
             assertEquals(2, gets.get()); assertEquals(2, factory.ensures.get())
             assertTrue(nodes("comparison-row-1").isEmpty())

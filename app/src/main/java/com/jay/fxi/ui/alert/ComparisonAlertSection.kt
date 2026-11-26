@@ -1,6 +1,13 @@
 package com.jay.fxi.ui.alert
 
 import android.content.Context
+import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material3.AlertDialog
+import androidx.compose.runtime.SideEffect
+import com.jay.fxi.data.alerts.ComparisonAlertDraft
+import com.jay.fxi.data.alerts.ComparisonAlertPair
+import com.jay.fxi.data.alerts.ComparisonAlertHandle
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -42,14 +49,10 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
-import androidx.compose.ui.semantics.toggleableState
-import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.unit.dp
 import com.jay.fxi.data.alerts.AlertLoadFailure
 import com.jay.fxi.data.alerts.AlertLoadPhase
@@ -91,6 +94,10 @@ internal interface ComparisonAlertSectionSource {
     val state: StateFlow<ComparisonAlertSettingsState>
     fun ensure()
     fun authoritative()
+    fun add(identity: AuthIdentityFence, draft: ComparisonAlertDraft): ComparisonAlertHandle
+    fun edit(identity: AuthIdentityFence, oldId: Int, originPair: ComparisonAlertPair, draft: ComparisonAlertDraft): ComparisonAlertHandle
+    fun setEnabled(identity: AuthIdentityFence, id: Int, enabled: Boolean): ComparisonAlertHandle
+    fun delete(identity: AuthIdentityFence, id: Int): ComparisonAlertHandle
 }
 
 internal fun interface ComparisonAlertSectionSourceFactory {
@@ -102,6 +109,10 @@ internal class OwnerComparisonSectionSource(owner: ComparisonAlertSettingsOwner)
     override val state = owner.state
     override fun ensure() = settingsOwner.ensure()
     override fun authoritative() = settingsOwner.authoritative()
+    override fun add(identity: AuthIdentityFence, draft: ComparisonAlertDraft) = settingsOwner.add(identity, draft)
+    override fun edit(identity: AuthIdentityFence, oldId: Int, originPair: ComparisonAlertPair, draft: ComparisonAlertDraft) = settingsOwner.edit(identity, oldId, originPair, draft)
+    override fun setEnabled(identity: AuthIdentityFence, id: Int, enabled: Boolean) = settingsOwner.setEnabled(identity, id, enabled)
+    override fun delete(identity: AuthIdentityFence, id: Int) = settingsOwner.delete(identity, id)
 }
 
 internal object ProductionComparisonAlertSectionSourceFactory : ComparisonAlertSectionSourceFactory {
@@ -195,7 +206,18 @@ internal fun ComparisonAlertSection(
 ) {
     val slot = remember(owner, tab) { ComparisonSlot(owner, tab) }
     val current = { consumer.currentState().ui.let { slot.matches(it.owner, it.selectedTab) } && isShown() }
-    ComparisonSectionMountContent(tab, kind, owner, sourceFactory, current, historyWiring) { end ->
+    val published by consumer.state.collectAsState()
+    if (!slot.matches(published.ui.owner, published.ui.selectedTab)) return
+    val displayedQuotes = published.ui.comparisonQuotes
+    ComparisonSectionMountContent(tab, kind, owner, sourceFactory, current, {
+        // Observe the publication for rendering and recheck the consumer at the time of every input.
+        val ui = consumer.currentState().ui
+        when {
+            !slot.matches(ui.owner, ui.selectedTab) -> emptyMap()
+            ui.comparisonQuotes == displayedQuotes -> displayedQuotes
+            else -> ui.comparisonQuotes
+        }
+    }, historyWiring) { end ->
         consumer.addScreenListener { published ->
             if (!slot.matches(published.ui.owner, published.ui.selectedTab)) end()
         }
@@ -205,7 +227,8 @@ internal fun ComparisonAlertSection(
 @Composable
 internal fun ComparisonSectionMountContent(
     tab: FreeTab, kind: String, owner: TopicDisplayOwner, sourceFactory: ComparisonAlertSectionSourceFactory,
-    shown: () -> Boolean, historyWiring: ComparisonAlertHistoryWiringFactory = ProductionComparisonAlertHistoryWiring,
+    shown: () -> Boolean, quotes: () -> ComparisonQuotes = { emptyMap() },
+    historyWiring: ComparisonAlertHistoryWiringFactory = ProductionComparisonAlertHistoryWiring,
     listen: (() -> Unit) -> (() -> Unit)
 ) {
     val serverTab = tab.serverTab ?: return
@@ -218,10 +241,22 @@ internal fun ComparisonSectionMountContent(
         val scope = rememberCoroutineScope()
         val requests = remember { ComparisonRequestSlot() }
         var session by remember { mutableStateOf<ComparisonAlertHistorySession?>(null) }
-        val mount = remember { ComparisonSectionMount({ current() }, { session?.close(); epoch++ }) }
+        val action by rememberUpdatedState(rememberNotificationPermissionAction())
+        val liveQuotes by rememberUpdatedState(quotes)
+        var ended by remember { mutableStateOf(false) }
+        val holder = remember {
+            ComparisonAlertSectionHolder(source, owner.identity, serverTab, kind, scope, { !ended && current() },
+                { session != null }, { liveQuotes() }, permission = { granted -> action.run { granted() } })
+        }
+        val mount = remember { ComparisonSectionMount({ current() }, {
+            ended = true
+            holder.retire()
+            session?.close()
+            epoch++
+        }) }
         val open = {
             mount.runShown {
-                if (session == null) {
+                if (holder.modalFree) {
                     val fresh = ComparisonAlertHistorySession(owner, serverTab, kind, historyWiring.create(context), scope, requests,
                         { current() }, { retired -> if (session === retired) session = null })
                     session = fresh
@@ -239,6 +274,7 @@ internal fun ComparisonSectionMountContent(
             onDispose {
                 stop()
                 session?.close()
+                holder.retire()
                 mount.dispose()
             }
         }
@@ -246,8 +282,19 @@ internal fun ComparisonSectionMountContent(
             val state by source.state.collectAsState()
             state.body(owner.identity, serverTab, kind)
         } else ComparisonSectionBody.Loading
-        ComparisonCard(kind, serverTab, body, open) {
+        SideEffect { holder.reconcile() }
+        ComparisonCard(kind, serverTab, body, holder, holder.addAvailable, holder.remaining, open) {
             mount.runShown(source::authoritative)
+        }
+        holder.editor?.let { token ->
+            ComparisonAlertEditorSheet(token.fields, quotes(), token.pending, holder.canSave(token), holder.message(token),
+                { update -> holder.change(token, update) }, { holder.save(token) }, { holder.dismiss(token) })
+        }
+        holder.confirm?.let { token ->
+            AlertDialog(onDismissRequest = { holder.dismiss(token) },
+                title = { Text(if (kind == "signed") "김프 알림을 삭제할까요?" else "비교 알림을 삭제할까요?") },
+                confirmButton = { TextButton(onClick = { holder.delete(token) }) { Text("삭제") } },
+                dismissButton = { TextButton(onClick = { holder.dismiss(token) }) { Text("취소") } })
         }
         session?.let { opened ->
             val observed by opened.state.collectAsState()
@@ -262,13 +309,14 @@ internal fun ComparisonSectionMountContent(
 }
 
 @Composable
-private fun ComparisonCard(kind: String, tab: String, body: ComparisonSectionBody, open: () -> Unit, refresh: () -> Unit) {
-    var expanded by remember { mutableStateOf(true) }
+private fun ComparisonCard(kind: String, tab: String, body: ComparisonSectionBody, holder: ComparisonAlertSectionHolder,
+    addAvailable: Boolean, remaining: String?, open: () -> Unit, refresh: () -> Unit) {
+    val expanded = holder.expanded
     val signed = kind == "signed"
     val title = if (signed) "김프 알림" else "비교 알림"
     Column(Modifier.fillMaxWidth().testTag("comparison-$kind").padding(8.dp)
         .background(CardBackground, RoundedCornerShape(12.dp)).padding(12.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.testTag("comparison-$kind-header"), verticalAlignment = Alignment.CenterVertically) {
             if (signed) {
                 Box(Modifier.testTag("comparison-won-icon").size(24.dp).border(1.dp, Primary, CircleShape), contentAlignment = Alignment.Center) {
                     Text("₩", Modifier.clearAndSetSemantics {}, color = Primary)
@@ -287,7 +335,7 @@ private fun ComparisonCard(kind: String, tab: String, body: ComparisonSectionBod
             }
             Spacer(Modifier.weight(1f))
             IconButton(refresh, Modifier.testTag("comparison-$kind-refresh")) { Icon(Icons.Default.Refresh, "$title 새로고침") }
-            IconButton({ expanded = !expanded }, Modifier.testTag("comparison-$kind-expand")) {
+            IconButton({ holder.expand(!holder.expanded) }, Modifier.testTag("comparison-$kind-expand")) {
                 Icon(if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
                     "$title " + if (expanded) "접기" else "펼치기")
             }
@@ -310,20 +358,27 @@ private fun ComparisonCard(kind: String, tab: String, body: ComparisonSectionBod
                 body.rows.forEachIndexed { index, row ->
                     if (index > 0) HorizontalDivider(Modifier.padding(start = 12.dp).testTag("comparison-$kind-divider"),
                         color = SecondaryText.copy(alpha = 0.2f))
-                    ComparisonRow(row)
+                    ComparisonRow(row, holder)
                 }
+                holder.rowMessage?.let { Text(it) }
+                if (addAvailable) {
+                    TextButton(onClick = holder::add, modifier = Modifier.testTag("comparison-$kind-add")) { Text("$title 추가") }
+                    remaining?.let { Text(it) }
+                } else Text(comparisonCap)
             }
         }
     }
 }
 
 @Composable
-private fun ComparisonRow(row: ComparisonAlertSetting) {
+private fun ComparisonRow(row: ComparisonAlertSetting, holder: ComparisonAlertSectionHolder) {
     val text = row.rowText()
     Row(Modifier.fillMaxWidth().testTag("comparison-row-${row.id}").padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f).alpha(if (row.isEnabled) 1f else 0.5f)
-            .clearAndSetSemantics { contentDescription = text.description }) {
+            .testTag("comparison-edit-${row.id}")
+            .clickable(onClickLabel = "${text.description} 알림 수정") { holder.edit(row) }
+            .semantics { contentDescription = text.description }) {
             Text(text.pair, color = PrimaryText)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(text.value, color = PrimaryText)
@@ -331,10 +386,12 @@ private fun ComparisonRow(row: ComparisonAlertSetting) {
             }
             text.note?.let { Text(it, color = if (row.triggered) StatusConnecting else Primary) }
         }
-        Switch(checked = row.isEnabled, onCheckedChange = null, modifier = Modifier.semantics {
-            role = Role.Switch
-            toggleableState = ToggleableState(row.isEnabled)
+        Switch(checked = row.isEnabled, onCheckedChange = { enabled -> holder.toggle(row, enabled) },
+            modifier = Modifier.testTag("comparison-toggle-${row.id}").semantics {
             stateDescription = if (row.isEnabled) "켜짐" else "꺼짐"
         })
+        IconButton({ holder.askDelete(row) }, Modifier.testTag("comparison-delete-${row.id}")) {
+            Icon(Icons.Default.Delete, "${text.description} 삭제")
+        }
     }
 }

@@ -4,6 +4,7 @@ import com.jay.fxi.data.auth.AuthIdentityFence
 import com.jay.fxi.data.remote.OwnedTopicFocus
 import com.jay.fxi.data.remote.TopicConnectionDisplay
 import com.jay.fxi.data.remote.TopicDisplayState
+import com.jay.fxi.domain.model.TopicQuoteKey
 import com.jay.fxi.domain.model.FreeTab
 import com.jay.fxi.domain.model.RateSourceSets
 import com.jay.fxi.domain.model.RateRowList
@@ -50,6 +51,14 @@ internal object PremiumTopicPresenter {
         }
             .filter { it.value.isFinite() && it.value > 0.0 }
             .associate { it.id to it.value }
+        val comparisonQuotes = buildMap {
+            for (quote in rosters.values.flatten()) {
+                val asset = quote.asset ?: continue
+                if (quote.value.isFinite() && quote.value > 0.0) {
+                    put(TopicQuoteKey(quote.id, asset), quote.value)
+                }
+            }
+        }
         val editableLists = rowEditors.map { it.list }.toSet()
         val sections = projection.scales.flatMap { RateRowPresenter.present(it) }
             .filter { it.rows.isNotEmpty() || it.list in editableLists }
@@ -72,7 +81,8 @@ internal object PremiumTopicPresenter {
             dollarIndex = dollarIndex,
             statusBanner = banner,
             lastUpdated = lastUpdated,
-            alertQuotes = alertQuotes
+            alertQuotes = alertQuotes,
+            comparisonQuotes = comparisonQuotes
         )
     }
 
