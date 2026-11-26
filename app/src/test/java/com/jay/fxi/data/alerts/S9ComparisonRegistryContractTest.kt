@@ -368,10 +368,10 @@ class S9ComparisonRegistryContractTest {
             assertFalse((comparison as AlertLifecycleAdapter) is AlertFamilyAdapter)
             val before = comparison.state.value
             fun push(data: Map<String, String>, gate: Boolean) {
-                S86Entry.push(data, gate, { resolves++; tested }, {}, {})
+                S95Entry.push(data, gate, { resolves++; tested }, {}, {})
             }
             fun tap(data: Map<String, String>, gate: Boolean) {
-                S86Entry.tap(Extras(data.toMutableMap()), gate) { resolves++; tested }
+                S95Entry.tap(Extras(data.toMutableMap()), gate) { resolves++; tested }
             }
             val names = listOf("rate-alert-once", "rate-alert-repeat", "source-alert-once", "source-alert-repeat-krx",
                 "comparison-alert-absolute-once", "comparison-alert-signed-repeat")

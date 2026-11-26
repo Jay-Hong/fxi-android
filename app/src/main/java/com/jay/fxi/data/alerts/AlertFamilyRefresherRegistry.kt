@@ -145,6 +145,22 @@ internal class AlertFamilyRefresherRegistry internal constructor(
         postToMain { dispatch { (it as? AlertFamilyAdapter)?.onBankPush(id, isRepeat) } }
     }
 
+    private fun deliverComparison(pair: ComparisonAlertPair, id: Int?, repeat: String?, publish: ((() -> Boolean) -> Unit)?) {
+        if (!pair.supported()) return
+        val use = captureSourceUse() ?: return
+        val deliver: () -> Unit = action@{
+            try {
+                val owner = adapters.filterIsInstance<ComparisonAlertSettingsOwner>().singleOrNull() ?: return@action
+                if (publish != null && foreground != true) return@action
+                if (!owner.onComparisonDelivery(pair, id, repeat, use)) return@action
+                if (publish != null && owner.admitsDelivery(use)) publish { foreground == true && owner.admitsDelivery(use) }
+            } catch (failure: Exception) {
+                reportFailure()
+            }
+        }
+        if (publish == null) deliver() else postToMain(deliver)
+    }
+
     private fun deliverSource(event: SourceAlertDelivery, publish: ((() -> Boolean) -> Unit)?) {
         val use = captureSourceUse() ?: return
         val deliver: () -> Unit = action@{
@@ -196,6 +212,62 @@ internal class AlertFamilyRefresherRegistry internal constructor(
         const val SYNC_ALERTS = "sync_alerts"
         const val RATE_ALERT = "rate_alert"
         const val SOURCE_RATE_ALERT = "source_rate_alert"
+        const val COMPARISON_ALERT = "comparison_alert"
+        val COMPARISON_PAIR_KEYS = listOf("tab", "diff_type", "left_source", "left_asset", "right_source", "right_asset")
+
+        private fun comparisonPair(field: (String) -> String?): ComparisonAlertPair? {
+            val tab = field("tab") ?: return null
+            val kind = field("diff_type") ?: return null
+            val left = (field("left_source") ?: return null) to (field("left_asset") ?: return null)
+            val right = (field("right_source") ?: return null) to (field("right_asset") ?: return null)
+            return ComparisonAlertPair(tab, kind, left, right).takeIf { it.supported() }
+        }
+
+        fun deliverComparisonPush(
+            data: Map<String, String>, resolve: () -> AlertFamilyRefresherRegistry, publish: (() -> Boolean) -> Unit
+        ) {
+            if (data["type"] != COMPARISON_ALERT || data["notification_type"]?.let { it != COMPARISON_ALERT } == true) return
+            val pair = comparisonPair(data::get) ?: return
+            try {
+                resolve().deliverComparison(pair, data["setting_id"]?.toIntOrNull(), data["is_repeat"], publish)
+            } catch (failure: Exception) {
+                Log.w(TAG, "comparison alert delivery failed")
+            }
+        }
+
+        fun consumeComparisonTap(extras: AlertTapExtras, gateOpen: Boolean, resolve: () -> AlertFamilyRefresherRegistry): Boolean {
+            fun string(key: String) = if (extras.kind(key) == AlertTapExtraKind.STRING) extras.readString(key) else null
+            val custom = string(AlertTapCodec.CUSTOM_TYPE)
+            val server = string(AlertTapCodec.SERVER_TYPE)
+            if (custom != COMPARISON_ALERT && server != COMPARISON_ALERT) return false
+            val idKey = AlertTapCodec.CUSTOM_ID
+            val pair: ComparisonAlertPair
+            val id: Int?
+            val repeat: String?
+            try {
+                if (!gateOpen) return true
+                if (extras.kind(AlertTapCodec.CUSTOM_TYPE) != AlertTapExtraKind.MISSING && custom != COMPARISON_ALERT) return true
+                if (extras.kind(AlertTapCodec.SERVER_TYPE) != AlertTapExtraKind.MISSING && server != COMPARISON_ALERT) return true
+                pair = comparisonPair(::string) ?: return true
+                id = when (extras.kind(idKey)) {
+                    AlertTapExtraKind.MISSING -> null
+                    AlertTapExtraKind.INT -> if (custom != null) extras.readInt(idKey, -1) else return true
+                    AlertTapExtraKind.STRING -> if (server != null) string(idKey)?.toIntOrNull() else return true
+                    else -> return true
+                }
+                repeat = string("is_repeat")
+            } finally {
+                for (key in COMPARISON_PAIR_KEYS + listOf(AlertTapCodec.CUSTOM_TYPE, AlertTapCodec.SERVER_TYPE,
+                        idKey, "is_repeat", "source", "asset", "title", "body", "left_rate", "right_rate",
+                        "left_observed_at", "right_observed_at", "threshold", "operator", "spread")) extras.remove(key)
+            }
+            try {
+                resolve().deliverComparison(pair, id, repeat, null)
+            } catch (failure: Exception) {
+                Log.w(TAG, "comparison alert tap delivery failed")
+            }
+            return true
+        }
 
         private fun acceptSource(
             source: String?, asset: String?, id: Int?, repeat: String?,

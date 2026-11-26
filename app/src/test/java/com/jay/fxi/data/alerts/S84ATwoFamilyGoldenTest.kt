@@ -189,7 +189,7 @@ class S84ATwoFamilyGoldenTest {
         fun toBackground() { process.registry.currentState = Lifecycle.State.CREATED; settle() }
         fun toForeground() { process.registry.currentState = Lifecycle.State.STARTED; settle() }
 
-        /** FXiMessagingService's order: the route of the raw type and id, then (S8-6) the source branch or the raw hand-over. */
+        /** Pre-S9-5 entry order, intentionally frozen. S95Entry and B07 exercise current comparison delivery. */
         fun push(data: Map<String, String>): AlertPushRoute? {
             val type = data["type"] ?: return null
             val route = AlertPushRouting.route(type, data["setting_id"]) ?: return null
@@ -206,7 +206,7 @@ class S84ATwoFamilyGoldenTest {
             return route
         }
 
-        /** MainActivity's OFF order: the source consumer first; only an unconsumed tap passes its route event and the raw is_repeat to deliverTap. Returns the raw route for the assertions. */
+        /** Pre-S9-5 entry order, intentionally frozen. S95Entry and B07 exercise current comparison delivery. */
         fun tap(data: Map<String, String>): AlertPushRoute? {
             if (AlertFamilyRefresherRegistry.consumeSourceTap(Extras(data), gateOpen = true) { deliveryResolves++; registry }) {
                 settle()

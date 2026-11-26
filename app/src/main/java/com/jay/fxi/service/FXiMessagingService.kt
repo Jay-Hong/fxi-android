@@ -53,6 +53,15 @@ class FXiMessagingService : FirebaseMessagingService() {
         super.onMessageReceived(message)
         Log.d(TAG, "Message received: type=${message.data["type"]}")
 
+        if (message.data["type"] == AlertFamilyRefresherRegistry.COMPARISON_ALERT ||
+            message.data["notification_type"] == AlertFamilyRefresherRegistry.COMPARISON_ALERT) {
+            if (shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)) {
+                AlertFamilyRefresherRegistry.deliverComparisonPush(message.data, { alertFamiliesProvider.get() }) { admitted ->
+                    showAlertNotification(message, AlertFamilyRefresherRegistry.COMPARISON_ALERT, admitted)
+                }
+            }
+            return
+        }
         val type = message.data["type"] ?: return
         val route = AlertPushRouting.route(type, message.data["setting_id"]) ?: return
         if (type == AlertFamilyRefresherRegistry.SOURCE_RATE_ALERT) {
@@ -102,6 +111,10 @@ class FXiMessagingService : FirebaseMessagingService() {
         } else if (type == AlertFamilyRefresherRegistry.SOURCE_RATE_ALERT) {
             intent.putExtra("source", message.data["source"])
             intent.putExtra("asset", message.data["asset"])
+        } else if (type == AlertFamilyRefresherRegistry.COMPARISON_ALERT) {
+            for (key in AlertFamilyRefresherRegistry.COMPARISON_PAIR_KEYS) {
+                message.data[key]?.let { intent.putExtra(key, it) }
+            }
         }
         // 고유 notificationId를 requestCode로 사용 (동일 알림 업데이트 보장)
         val notificationId = System.currentTimeMillis().toInt()

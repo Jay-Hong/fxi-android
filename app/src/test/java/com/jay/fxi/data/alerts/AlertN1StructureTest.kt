@@ -12,7 +12,8 @@ import org.junit.Test
 /**
  * Claude-owned S7 N1 contract (R4c/S7/s7n1 API r1-r3): the N1 structure locks — API r1 §9's AlertN1StructureTest row as
  * r2/r3 §7 re-assign it (N1-Q, N1-S with r3's S3 text and Codex API r1's S1 text) — and the structure half of N1-A and N1-P.
- * Everything is read from the comment-free code and strings of the six production roots
+ * S95_N03 also reads the two JVM entry mirrors directly and compares them to the service and Activity.
+ * The production inventory is read from the comment-free code and strings of the six production roots
  * ([S6Krx3bOffWiringContractTest.ROOTS]): Kotlin through [PostS6ApprovedDelta.codeAndStrings], Java through
  * `javaCodeAndStrings` below (no root holds Java today; one that appears is scanned the same way, with Java's own rules:
  * Unicode escapes decoded before lexing, block comments not nesting). A reference cannot hide in a comment, a string or an
@@ -215,6 +216,118 @@ class AlertN1StructureTest {
         }
     }
 
+    private fun String.swapOnce(old: String, new: String): String {
+        val i = indexOf(old)
+        require(i >= 0 && i == lastIndexOf(old))
+        return replaceRange(i, i + old.length, new)
+    }
+
+    @Test fun S95_N01_comparisonPushEntry() {
+        assertEquals(emptyList<String>(), pFcm(code))
+        val logs = mapOf("deliverComparisonPush" to "comparison alert delivery failed",
+            "consumeComparisonTap" to "comparison alert tap delivery failed")
+        assertEquals(emptyList<String>(), s3Loggers(code))
+        for ((method, message) in logs) {
+            val old = "Log.w(TAG, \"$message\")"
+            for (bad in listOf("Log.w(TAG, id)", "Log.w(TAG, price)", "Log.w(TAG, data.toString())",
+                    "Log.w(TAG, \"$message\", failure)")) {
+                val edited = editedBody(REGISTRY, method) { it.swapOnce(old, bad) }
+                assertCaught("comparison logger $method", "S3-source-catch", s3Loggers(edited))
+            }
+        }
+        val f1 = COMPARISON_PUSH
+        val resolve = "{ alertFamiliesProvider.get() }"
+        val post = "showAlertNotification(message, AlertFamilyRefresherRegistry.COMPARISON_ALERT, admitted)"
+        val callback = "{ admitted -> $post }"
+        val defaultPost = "showAlertNotification(message, AlertFamilyRefresherRegistry.COMPARISON_ALERT)"
+        val variants = listOf(
+            f1.swapOnce("if ($APP_GATE)", "val eager = alertFamiliesProvider.get()\nif ($APP_GATE)")
+                .swapOnce(resolve, "{ eager }"),
+            f1.swapOnce(" return }", " }"),
+            f1.swapOnce(callback, "{ _ -> }\n$defaultPost"),
+            f1.swapOnce(post, defaultPost),
+            f1.swapOnce(post, """showAlertNotification(message, message.data.getValue("type"), admitted)"""),
+            f1.swapOnce("if ($APP_GATE)", "if (true)"),
+            f1.swapOnce(post, "showAlertNotification(message, AlertFamilyRefresherRegistry.COMPARISON_ALERT, { true })")
+        )
+        for (variant in variants) {
+            val tree = editedBody(FCM, "onMessageReceived") { squash(it).swapOnce(f1, variant) }
+            assertCaught("F1", "P-comparison-branch", pFcm(tree))
+        }
+    }
+
+    @Test fun S95_N02_comparisonTapEntry() {
+        assertEquals(emptyList<String>(), tActivity(code))
+        val off = "parseAlertEventFromIntent"
+        val removed = editedBody(ACTIVITY, off) { squash(it).swapOnce(COMPARISON_TAP, "") }
+        val cold = editedBody(ACTIVITY, "parsePendingAlertEvent", removed) {
+            val anchor = "if (intent == null) return val result = AlertTapEntry.intakeNew("
+            squash(it).swapOnce(anchor, "if (intent == null) return " +
+                COMPARISON_TAP.swapOnce("return null", "return") + " val result = AlertTapEntry.intakeNew(")
+        }
+        assertCaught("M1 in cold ON", "T-elsewhere parsePendingAlertEvent", tActivity(cold))
+        val later = editedBody(ACTIVITY, off) {
+            squash(it).swapOnce("$COMPARISON_TAP $SOURCE_TAP", "$SOURCE_TAP $COMPARISON_TAP")
+        }
+        assertCaught("M1 after source", "T-comparison-parser", tActivity(later))
+    }
+
+    @Test fun S95_N03_mirrorMatchesProduction() {
+        val testDir = "src/test/java/com/jay/fxi/data/alerts/"
+        fun body(path: String, method: String): String {
+            val source = PostS6ApprovedDelta.codeAndStrings(File(path).readText(Charsets.UTF_8))
+            return squash(source.substring(requireNotNull(bodyRange(source, method))))
+        }
+        fun splitAt(text: String, anchor: String): Pair<String, String> {
+            val i = text.indexOf(anchor)
+            require(i >= 0 && i == text.lastIndexOf(anchor)) { "ambiguous or missing: $anchor" }
+            return text.substring(0, i).trim() to text.substring(i)
+        }
+        val rawType = """val type = message.data["type"] ?: return"""
+        val sourceTap = "if (AlertFamilyRefresherRegistry.consumeSourceTap("
+        val receive = body(FCM, "onMessageReceived")
+        val log = squash("""Log.d(TAG, "Message received: type=${'$'}{message.data["type"]}")""")
+        val afterLog = splitAt(receive, log).second.removePrefix(log).trimStart()
+        val prodPush = splitAt(afterLog, rawType).first
+        val parser = body(ACTIVITY, "parseAlertEventFromIntent")
+        val guard = "if (intent == null) return null "
+        assertTrue(parser.startsWith(guard))
+        val prodTap = splitAt(parser.removePrefix(guard), sourceTap).first
+        assertEquals(COMPARISON_PUSH, prodPush)
+        assertEquals(COMPARISON_TAP, prodTap)
+
+        val mirror = testDir + "S95Entry.kt"
+        val history = testDir + "S86Entry.kt"
+        val (push, pushTail) = splitAt(body(mirror, "push"), """val type = data["type"] ?: return null""")
+        val (tap, tapTail) = splitAt(body(mirror, "tap"), sourceTap)
+        val resolver = "{ alertFamiliesProvider.get() }"
+        val publish = "showAlertNotification(message, AlertFamilyRefresherRegistry.COMPARISON_ALERT, admitted)"
+        val mappedPush = push.replace("""data["type"]""", """message.data["type"]""")
+            .replace("""data["notification_type"]""", """message.data["notification_type"]""")
+            .replace("deliverComparisonPush(data, resolve)", "deliverComparisonPush(message.data, $resolver)")
+            .replace("if (gateOpen)", "if ($APP_GATE)")
+            .replace("publish(admitted)", publish)
+            .replace("return null", "return")
+        val mappedTap = tap.replace("consumeComparisonTap(extras, gateOpen, resolve)",
+            "consumeComparisonTap(AndroidAlertTapExtras(intent), $APP_GATE) $resolver")
+        assertEquals(prodPush, squash(mappedPush))
+        assertEquals(prodTap, squash(mappedTap))
+        val expectedMirrorPush = squash("""
+            if (data["type"] == AlertFamilyRefresherRegistry.COMPARISON_ALERT ||
+                data["notification_type"] == AlertFamilyRefresherRegistry.COMPARISON_ALERT) {
+                if (gateOpen) {
+                    AlertFamilyRefresherRegistry.deliverComparisonPush(data, resolve) { admitted -> publish(admitted) }
+                }
+                return null
+            }
+        """)
+        val expectedMirrorTap = "if (AlertFamilyRefresherRegistry.consumeComparisonTap(extras, gateOpen, resolve)) return null"
+        assertEquals(expectedMirrorPush, push)
+        assertEquals(expectedMirrorTap, tap)
+        assertEquals(body(history, "push"), pushTail)
+        assertEquals(body(history, "tap"), tapTail)
+    }
+
     @Test fun `S86_N01 source extras and both publication guards stay at their effect sites`() {
         val fcm = code.getValue(FCM)
         val body = squash(fcm.substring(checkNotNull(bodyRange(fcm, "showAlertNotification"))))
@@ -225,6 +338,10 @@ class AlertN1StructureTest {
             } else if (type == AlertFamilyRefresherRegistry.SOURCE_RATE_ALERT) {
                 intent.putExtra("source", message.data["source"])
                 intent.putExtra("asset", message.data["asset"])
+            } else if (type == AlertFamilyRefresherRegistry.COMPARISON_ALERT) {
+                for (key in AlertFamilyRefresherRegistry.COMPARISON_PAIR_KEYS) {
+                    message.data[key]?.let { intent.putExtra(key, it) }
+                }
             }
         """)
         assertTrue("N01 OFF tuple copy", body.contains(copy))
@@ -303,8 +420,14 @@ class AlertN1StructureTest {
         val sourceExit = "            return\n        }\n        alertEventBusProvider.get().emit(route.event)"
         val post = "showAlertNotification(message, type, admitted)"
         val withoutPost = editedLiteral(FCM, post, "Unit")
-        val eager = editedLiteral(FCM, "if (shouldStartAppOwnedServices(",
-            "val eager = alertFamiliesProvider.get()\n            if (shouldStartAppOwnedServices(")
+        val sourceAt = fcm.indexOf("if (type == AlertFamilyRefresherRegistry.SOURCE_RATE_ALERT)")
+        assertTrue(sourceAt >= 0)
+        val brace = fcm.indexOf('{', sourceAt)
+        val end = requireNotNull(closing(fcm, brace))
+        val source = fcm.substring(sourceAt, end + 1)
+        val lazyCall = "deliverSourcePush(message.data, { alertFamiliesProvider.get() })"
+        val eager = source.swapOnce("if ($gate)", "val eager = alertFamiliesProvider.get()\nif ($gate)")
+            .swapOnce(lazyCall, "deliverSourcePush(message.data, { eager })")
         for ((label, tree, tag) in listOf(
             Triple("source falls through to the bank emit",
                 editedLiteral(FCM, sourceExit, sourceExit.replace("return", "")), "P-source-branch"),
@@ -312,7 +435,7 @@ class AlertN1StructureTest {
                 editedLiteral(FCM, sourceExit, sourceExit.replace("return", "showAlertNotification(message, type)\n            return"), withoutPost),
                 "P-source-branch"),
             Triple("source provider resolved before the gate",
-                editedLiteral(FCM, "message.data, { alertFamiliesProvider.get() }", "message.data, { eager }", eager), "P-source-branch"),
+                code + (FCM to fcm.replaceRange(sourceAt, end + 1, eager)), "P-source-branch"),
             Triple("bank banner before the delivery",
                 editedLiteral(FCM, "$statement\n        $BANK_BANNER", "$BANK_BANNER\n        $statement"), "P-order"),
             Triple("the hook before the emit", code + (FCM to beforeEmit), "P-after-emit"),
@@ -381,7 +504,7 @@ class AlertN1StructureTest {
             Triple("a catch that logs the exception",
                 edited(REGISTRY, """(catch\s*\(\s*(\w+)\s*:\s*Exception\s*\)\s*\{)\s*reportFailure\(\)""", "\$1 Log.w(TAG, \"failed\", \$2)"), "S3-catch"),
             Triple("a Throwable catch", edited(REGISTRY, """catch\s*\(\s*(\w+)\s*:\s*Exception\s*\)""", "catch (\$1: Throwable)"), "S3-catch"),
-            Triple("a fifth logger in the registry", appended(REGISTRY, "private fun note() { Log.w(TAG, \"note\") }"), "S3-logger-count"),
+            Triple("a seventh logger in the registry", appended(REGISTRY, "private fun note() { Log.w(TAG, \"note\") }"), "S3-logger-count"),
             Triple("source catch includes the payload",
                 editedLiteral(REGISTRY, SOURCE_LOG, """Log.w(TAG, "source alert delivery failed " + source)"""), "S3-source-catch"),
             Triple("source catch passes the exception",
@@ -408,7 +531,11 @@ class AlertN1StructureTest {
             val match = checkNotNull(hook.find(activity))
             return code + (ACTIVITY to activity.replaceRange(match.range, with(match.value)))
         }
-        val sourceTap = activity.substringAfter("if (intent == null) return null").substringBefore("val type = intent.getStringExtra").trim()
+        val entry = activity.substringAfter("if (intent == null) return null").substringBefore("val type = intent.getStringExtra")
+        val sourceAt = entry.indexOf("if (AlertFamilyRefresherRegistry.consumeSourceTap(")
+        assertTrue(sourceAt >= 0)
+        assertEquals(COMPARISON_TAP, squash(entry.take(sourceAt)))
+        val sourceTap = entry.drop(sourceAt).trim()
         assertEquals("S8-6 mutation premise: move the complete OFF consumer", SOURCE_TAP, squash(sourceTap))
         val withoutSourceTap = editedLiteral(ACTIVITY, sourceTap, "")
         val routeLine = "val route = AlertPushRouting.route(type, settingId) ?: return null"
@@ -892,6 +1019,23 @@ class AlertN1StructureTest {
         const val APP_GATE = "shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)"
         const val BANK_EMIT = "alertEventBusProvider.get().emit(route.event)"
         const val BANK_BANNER = "if (route.showBanner) showAlertNotification(message, type)"
+        val COMPARISON_PUSH = squash("""
+        if (message.data["type"] == AlertFamilyRefresherRegistry.COMPARISON_ALERT ||
+            message.data["notification_type"] == AlertFamilyRefresherRegistry.COMPARISON_ALERT) {
+            if (shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)) {
+                AlertFamilyRefresherRegistry.deliverComparisonPush(message.data, { alertFamiliesProvider.get() }) { admitted ->
+                    showAlertNotification(message, AlertFamilyRefresherRegistry.COMPARISON_ALERT, admitted)
+                }
+            }
+            return
+        }
+        """)
+        val COMPARISON_TAP = squash("""
+        if (AlertFamilyRefresherRegistry.consumeComparisonTap(
+                AndroidAlertTapExtras(intent),
+                shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)
+            ) { alertFamiliesProvider.get() }) return null
+        """)
         val SOURCE_PUSH = squash("""
             if (type == AlertFamilyRefresherRegistry.SOURCE_RATE_ALERT) {
                 if ($APP_GATE) {
@@ -1237,13 +1381,16 @@ class AlertN1StructureTest {
         fun tActivity(code: Map<String, String>): List<String> {
             val v = mutableListOf<String>()
             val activity = code[ACTIVITY].orEmpty()
-            if (count(activity, """\balertFamiliesProvider\b""") != 3 ||
+            if (count(activity, """\balertFamiliesProvider\b""") != 4 ||
                 count(activity, """@Inject\s+internal\s+lateinit\s+var\s+alertFamiliesProvider\s*:\s*Provider\s*<\s*AlertFamilyRefresherRegistry\s*>""") != 1) {
                 v += "T-provider"
             }
             val range = bodyRange(activity, "parseAlertEventFromIntent") ?: return v + "T-parser-missing"
             val flat = squash(activity.substring(range))
-            if (!flat.startsWith("if (intent == null) return null $SOURCE_TAP val type = ") ||
+            val head = "if (intent == null) return null "
+            if (!flat.startsWith("$head$COMPARISON_TAP $SOURCE_TAP val type = ") ||
+                occurrences(code, """\bconsumeComparisonTap\b""") != mapOf(ACTIVITY to 1, REGISTRY to 1)) v += "T-comparison-parser"
+            if (!flat.contains("$SOURCE_TAP val type = ") ||
                 occurrences(code, """\bconsumeSourceTap\b""") != mapOf(ACTIVITY to 1, REGISTRY to 1)) v += "T-source-parser"
             if (TAP_HOOK.findAll(flat).count() != 1) v += "T-hook"
             val order = listOf("val route = AlertPushRouting.route(type, settingId) ?: return null", "AlertFamilyRefresherRegistry.deliverTap(",
@@ -1252,7 +1399,7 @@ class AlertN1StructureTest {
             if (order.any { it < 0 } || order != order.sorted() || !TAP_HOOK.replace(flat, "<bank-tap>").endsWith(bankEnd)) v += "T-order $order"
             for (other in listOf("onCreate", "onNewIntent", "parsePendingAlertEvent", "handleNotificationIntent", "clearNotificationExtras")) {
                 val body = bodyRange(activity, other)?.let { activity.substring(it) }.orEmpty()
-                if (Regex("""\b(?:deliverTap|consumeSourceTap|alertFamiliesProvider)\b""").containsMatchIn(body)) v += "T-elsewhere $other"
+                if (Regex("""\b(?:deliverTap|consumeComparisonTap|consumeSourceTap|alertFamiliesProvider)\b""").containsMatchIn(body)) v += "T-elsewhere $other"
             }
             for ((name, action) in listOf("parsePendingAlertEvent" to "_pendingAlertEvent.value = event",
                     "handleNotificationIntent" to "alertEventBusProvider.get().emit(event)")) {
@@ -1293,8 +1440,8 @@ class AlertN1StructureTest {
             }
             if (CONST_TAG.findAll(registry).count() != 1) v += "S3-logger-tag"
             val logCalls = LOG_CALL.findAll(registry).count()
-            // S8-6. Three independently checked defaults and one fixed catch in acceptSource.
-            if (logCalls != 4) v += "S3-logger-count $logCalls"
+            // Six registry log calls: three defaults plus fixed catches in acceptSource, deliverComparisonPush and consumeComparisonTap.
+            if (logCalls != 6) v += "S3-logger-count $logCalls"
             for (path in NEW_FILES) {
                 val text = code[path].orEmpty()
                 for (log in LOG_CALL.findAll(text)) {
@@ -1304,15 +1451,22 @@ class AlertN1StructureTest {
                 }
             }
             val handlers = CATCH.findAll(registry).toList()
-            val accept = bodyRange(registry, "acceptSource")
-            val sourceHandlers = handlers.filter { accept != null && it.range.first in accept }
-            if (sourceHandlers.size != 1) v += "S3-source-catch"
-            if (handlers.size - sourceHandlers.size < 4) v += "S3-catch-count ${handlers.size - sourceHandlers.size}"
+            val fixed = mapOf("acceptSource" to SOURCE_LOG,
+                "deliverComparisonPush" to """Log.w(TAG, "comparison alert delivery failed")""",
+                "consumeComparisonTap" to """Log.w(TAG, "comparison alert tap delivery failed")""")
+            val fixedHandlers = fixed.map { (name, log) ->
+                val span = bodyRange(registry, name)
+                val handler = handlers.singleOrNull { span != null && it.range.first in span }
+                if (handler == null) v += "S3-source-catch"
+                handler to log
+            }.toMap()
+            if (handlers.size - fixed.size < 4) v += "S3-catch-count"
             for (handler in handlers) {
                 val close = closing(registry, handler.range.last)
                 val inner = if (close == null) "?" else registry.substring(handler.range.last + 1, close)
-                if (handler in sourceHandlers) {
-                    if (handler.groupValues[1] != "Exception" || inner.trim() != SOURCE_LOG) v += "S3-source-catch"
+                val expected = fixedHandlers[handler]
+                if (expected != null) {
+                    if (handler.groupValues[1] != "Exception" || inner.trim() != expected) v += "S3-source-catch"
                     continue
                 }
                 val calls = CALL.findAll(inner).map { it.groupValues[1] }.filter { it !in KEYWORDS }.toList()
@@ -1334,7 +1488,7 @@ class AlertN1StructureTest {
             if (!Regex("""\bval type = message\.data\["type"] \?: return\b""").containsMatchIn(flat)) v += "P-raw-type"
             if (HOOK.findAll(flat).count() != 1) v += "P-gate-expression"
             if (!Regex("""\.emit\([^()]*\) AlertFamilyRefresherRegistry\.deliverPush\(""").containsMatchIn(flat)) v += "P-after-emit"
-            if (count(fcm, """\balertFamiliesProvider\b""") != 3 ||
+            if (count(fcm, """\balertFamiliesProvider\b""") != 4 ||
                 count(fcm, """@Inject\s+internal\s+lateinit\s+var\s+alertFamiliesProvider\s*:\s*Provider\s*<\s*AlertFamilyRefresherRegistry\s*>""") != 1) {
                 v += "P-provider"
             }
@@ -1343,6 +1497,8 @@ class AlertN1StructureTest {
             if (count(fcm, """\bmessage\s*\.\s*data\s*\[\s*EXTRA_IS_REPEAT\s*]\s*\?\.\s*let\s*\{\s*putExtra\s*\(\s*EXTRA_IS_REPEAT\s*,\s*it\s*\)\s*\}""") != 1 ||
                 count(fcm, "\\bconst\\s+val\\s+EXTRA_IS_REPEAT\\s*=\\s*\"is_repeat\"") != 1 || count(fcm, "\"is_repeat\"") != 2) v += "P-repeat-extra"
             val typeRoute = """val type = message.data["type"] ?: return val route = AlertPushRouting.route(type, message.data["setting_id"]) ?: return"""
+            if (!flat.contains("$COMPARISON_PUSH $typeRoute") ||
+                occurrences(code, """\bdeliverComparisonPush\b""") != mapOf(FCM to 1, REGISTRY to 1)) v += "P-comparison-branch"
             if (!flat.contains("$typeRoute $SOURCE_PUSH $BANK_EMIT") ||
                 occurrences(code, """\bdeliverSourcePush\b""") != mapOf(FCM to 1, REGISTRY to 1)) v += "P-source-branch"
             if (!HOOK.replace(flat, "<bank-push>").endsWith("$BANK_EMIT <bank-push> $BANK_BANNER")) v += "P-order"
@@ -1492,9 +1648,9 @@ class AlertN1StructureTest {
             if (count(code[ROW_POLICY].orEmpty(), "\\bconst\\s+val\\s+SETTINGS_ASSET\\s*=\\s*\"usdt-krw\"") != 1) v += "S11-source-asset"
             val fcm = code[FCM].orEmpty()
             val receive = bodyRange(fcm, "onMessageReceived")?.let { squash(fcm.substring(it)) }.orEmpty()
-            // S8-6. Count the declaration and the two calls only after locating both guarded call sites.
-            if (!receive.contains(SOURCE_PUSH) || !receive.endsWith(BANK_BANNER) ||
-                count(fcm, """\bshowAlertNotification\b""") != 3) {
+            // Four occurrences: the declaration and the comparison, source and bank banner calls.
+            if (!receive.contains(COMPARISON_PUSH) || !receive.contains(SOURCE_PUSH) || !receive.endsWith(BANK_BANNER) ||
+                count(fcm, """\bshowAlertNotification\b""") != 4) {
                 v += "S11-banner"
             }
             return v

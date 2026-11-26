@@ -691,6 +691,7 @@ class ComparisonAlertSettingsOwnerContractTest {
                 if (actions.first() < 0 || actions.zipWithNext().any { (a, b) -> a >= b }) add("surface")
                 if (Regex("""@Singleton\s+internal\s+class\s+ComparisonAlertSettingsOwner\b""").findAll(src).count() != 1 ||
                     Regex("""@Inject\s+constructor\b""").findAll(src).count() != 1) add("singleton")
+                if (uses("onComparisonDelivery") != mapOf(owner to 1, registry to 1)) add("delivery-caller")
                 if (uses("getComparisonAlerts") != mapOf(owner to 1, repository to 2, service to 3)) add("caller")
                 for ((name, args) in listOf("Create" to "request,", "Update" to "id,request,", "Delete" to "id,")) {
                     val write = name.lowercase() + "ComparisonAlert"
@@ -707,7 +708,8 @@ class ComparisonAlertSettingsOwnerContractTest {
                     !flat.contains("):this(comparisonSettingsGet(repository),access,") ||
                     !flat.contains("{use,guard->repository.getComparisonAlerts(use.identity,tab=null,useAdmitted=guard)}") ||
                     !flat.contains("valguard={!chain.retired&&access.admits(use)}") ||
-                    !flat.contains("getSettings(use,guard)")) add("delegation")
+                    !flat.contains("valsend={guard()&&access.admits(requestUse)}") ||
+                    !flat.contains("valbound=fetch(requestUse,send)") || !flat.contains("getSettings(use,guard)")) add("delegation")
                 if (Regex("""\bgetSettings\s*(?:\.\s*invoke\s*)?\(""").findAll(src).count() != 1) add("get-start")
                 if (Regex("""\bAlertLoadPhase\s*\.\s*Ready\b""").findAll(src).count() != 1 ||
                     !flat.contains("publishState(ComparisonAlertSettingsState(AlertLoadPhase.Ready,identity,adopted))") ||
@@ -769,9 +771,12 @@ class ComparisonAlertSettingsOwnerContractTest {
         assertEquals(setOf("caller"), violations(bypass))
         val constant = replace(real, owner, "tab = null, useAdmitted = guard", "tab = null, useAdmitted = { true }")
         assertEquals(setOf("delegation"), violations(constant))
-        val extraGet = replace(real, owner, "val bound = fetch(use, guard)",
-            "val bound = if (attempt == 0) fetch(use, guard) else getSettings(use, guard)")
-        assertEquals(setOf("get-start"), violations(extraGet))
+        val bound = "val bound = fetch(requestUse, send)"
+        assertEquals(setOf("get-start", "delegation"), violations(replace(real, owner, bound,
+            "val bound = if (attempt == 0) fetch(requestUse, send) else getSettings(requestUse, send)")))
+        assertEquals(setOf("get-start"), violations(replace(real, owner, bound, "if (attempt > 0) getSettings(requestUse, send)\n$bound")))
+        assertEquals(setOf("delegation"), violations(replace(real, owner, bound, "val bound = fetch(requestUse, { true })")))
+        assertEquals(setOf("delivery-caller"), violations(real + (section to (real.getValue(section) + "\nowner.onComparisonDelivery()"))))
         val extraReady = replace(real, owner, "if (!chain.dirty) return",
             "if (!chain.dirty) { mutableState.value = state.value.copy(phase = AlertLoadPhase.Ready); return }")
         assertEquals(setOf("ready-publication"), violations(extraReady))

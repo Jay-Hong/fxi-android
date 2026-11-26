@@ -86,7 +86,9 @@ class S6Krx3cOffContractTest {
         assertEquals("contract(O04t/OFF): PAC/auth/fence observer/metadata/settings/token additional resolution zero", listOf(0, 0, 0), listOf(pac, auth, fences))
     }
 
-    @Test fun o04s_androidOffFragmentsMatchFrozenOrApprovedBytes() = marked("O04s") {
+    @Test fun o04s_androidOffFragmentsMatchFrozenOrApprovedBytes() = verifyO04sBytes()
+
+    internal fun verifyO04sBytes() = marked("O04s") {
         val indexBytes = bytes("off_shells/index.json", "O04s")
         provenance("off_shells/provenance.json", indexBytes, "O04s", "src/test/java/com/jay/fxi/S6Krx3cShellSourceContract.kt", "src/test/java/com/jay/fxi/S6Krx3cO04CaptureTest.kt")
         val index = json(indexBytes, "O04s")
@@ -109,7 +111,7 @@ class S6Krx3cOffContractTest {
             assertEquals("contract(O04s/$id): raw length", frozen.size, entry["length"]?.jsonPrimitive?.int)
             assertEquals("contract(O04s/$id): immutable raw hash", S6Krx3cShellSourceContract.sha(frozen), entry["sha256"]?.jsonPrimitive?.content)
             assertTrue("contract(O04s/$id): original byte offset recorded", entry["offset"]?.jsonPrimitive?.int?.let { it >= 0 } == true)
-            assertEquals("contract(O04s/$id): exact frozen bytes including indentation/comments/literals, or the S7-E5c approved bytes (for the parser, the S8-6 successor instead)",
+            assertEquals("contract(O04s/$id): exact frozen bytes including indentation/comments/literals, or the S7-E5c approved bytes (parser requires the S7-E5c list pin, S8-6 without the insertion, and S9-5 in full)",
                 emptyList<String>(), PostS6ApprovedDelta.o04sSpanErrors(id, frozen, entry["sha256"]?.jsonPrimitive?.content, span.raw, approvals))
         }
         val tricky = "fun boundary() { val text = \"}\"; val raw = \"\"\"{ }\"\"\"; /* { /* } */ } */ val c = '}' }"
@@ -118,7 +120,9 @@ class S6Krx3cOffContractTest {
         assertFalse("contract(O04s/negative): same raw comparison rejects conditional consume", spans.getValue("Root").raw == spans.getValue("Root").raw.replace("alertEventBus?.emit(event)", "if (alertEventBus?.emit(event) == true)"))
     }
 
-    @Test fun o04s_onlyListedSpansMayChange_theParserNeedsItsPinnedPredecessorAndSuccessor_andEachRuleRefusesItsViolation() = marked("O04s") {
+    @Test fun o04s_onlyListedSpansMayChange_theParserNeedsItsPinnedPredecessorAndSuccessor_andEachRuleRefusesItsViolation() = verifyO04sNegativeControls()
+
+    internal fun verifyO04sNegativeControls() = marked("O04s") {
         val index = json(bytes("off_shells/index.json", "O04s"), "O04s").getValue("spans").jsonObject
         val spans = S6Krx3cShellSourceContract.spans(S6Krx3cShellSourceContract.load(), true)
         val raw = PostS6ApprovedDelta.o04sRaw()
@@ -132,8 +136,12 @@ class S6Krx3cOffContractTest {
         assertEquals("contract(O04s/S8-6): wrong predecessor", listOf("o04s-predecessor parser"),
             errors("parser", list = approvals + ("parser" to wrong)))
         val actualParser = spans.getValue("parser").raw
-        assertEquals("contract(O04s/S8-6): changed successor", listOf("o04s-approved parser"),
+        assertEquals("contract(O04s/S9-5): changed predecessor", listOf("o04s-predecessor parser"),
             errors("parser", actual = actualParser + " "))
+        val addition = "        if (AlertFamilyRefresherRegistry.consumeComparisonTap(\n                AndroidAlertTapExtras(intent),\n                shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)\n            ) { alertFamiliesProvider.get() }) return null\n"
+        val prior = actualParser.replaceFirst(addition, "")
+        assertEquals("S8-6 alone", listOf("o04s-predecessor parser"), errors("parser", actual = prior))
+        assertEquals("moved insertion", listOf("o04s-approved parser"), errors("parser", actual = prior + addition))
         assertEquals("contract(O04s/S8-6): successor under another id", listOf("o04s-approved clear"),
             errors("clear", actual = actualParser))
         assertEquals("contract(O04s/negative): an approved span with one more byte", listOf("o04s-approved FCM"), errors("FCM", actual = spans.getValue("FCM").raw + " "))

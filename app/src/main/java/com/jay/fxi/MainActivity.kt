@@ -115,6 +115,10 @@ class MainActivity : ComponentActivity() {
 
     private fun parseAlertEventFromIntent(intent: Intent?): AlertEvent? {
         if (intent == null) return null
+        if (AlertFamilyRefresherRegistry.consumeComparisonTap(
+                AndroidAlertTapExtras(intent),
+                shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)
+            ) { alertFamiliesProvider.get() }) return null
         if (AlertFamilyRefresherRegistry.consumeSourceTap(
                 AndroidAlertTapExtras(intent),
                 shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)

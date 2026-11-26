@@ -169,6 +169,8 @@ internal class ComparisonAlertSettingsOwner internal constructor(
     private val writes = ArrayDeque<Write>()
     private var worker: Job? = null
     private var readOwed = false
+    private class DeliveryRead(val use: AlertSettingsUse)
+    private var pendingDelivery: DeliveryRead? = null
     internal var writeRevision = 0L
         private set
 
@@ -208,7 +210,7 @@ internal class ComparisonAlertSettingsOwner internal constructor(
         val write = Write(change, use, origin)
         writeRevision++
         if (active != null) {
-            readOwed = true
+            if (active?.ordinary == true) readOwed = true
             retireChain()
         }
         writes.addLast(write)
@@ -270,7 +272,7 @@ internal class ComparisonAlertSettingsOwner internal constructor(
         if (readOwed) {
             readOwed = false
             authoritative()
-        }
+        } else resumeDelivery()
     }
 
     private suspend fun execute(write: Write): ComparisonAlertOutcome {
@@ -332,6 +334,7 @@ internal class ComparisonAlertSettingsOwner internal constructor(
     }
 
     private class Chain(val generation: Long, val identity: AuthIdentityFence, var use: AlertSettingsUse?) {
+        var ordinary = true
         @Volatile var retired = false
         var fetching = false
         var dirty = false
@@ -378,12 +381,55 @@ internal class ComparisonAlertSettingsOwner internal constructor(
         abandon()
     }
 
+    fun admitsDelivery(use: AlertSettingsUse) = access.admits(use)
+
+    fun onComparisonDelivery(pair: ComparisonAlertPair, id: Int?, repeat: String?, use: AlertSettingsUse): Boolean {
+        if (!pair.supported() || !access.admits(use)) return false
+        updateSession()
+        if (session != use.identity || !access.admits(use)) return false
+        val rows = confirmed?.rows
+        if (repeat == "false" && id != null && rows != null && state.value.identity == use.identity &&
+            writes.none { it.change.id == id || it.newId == id }) {
+            val hit = rows.indexOfFirst { it.userId == use.identity.uid && it.id == id && pair.matches(it.pair()) }
+            if (hit >= 0 && access.admits(use)) {
+                val next = rows.toMutableList()
+                next[hit] = next[hit].copy(triggered = true, isEnabled = false)
+                commitRows(use.identity, ComparisonAlertRowPolicy.Adopted(next))
+            }
+        }
+        if (!access.admits(use)) return false
+        pendingDelivery = DeliveryRead(use)
+        resumeDelivery()
+        return true
+    }
+
+    private fun liveDelivery(): DeliveryRead? {
+        val ticket = pendingDelivery ?: return null
+        if (access.admits(ticket.use)) return ticket
+        pendingDelivery = null
+        return null
+    }
+
+    private fun resumeDelivery() {
+        val ticket = liveDelivery() ?: return
+        if (!foreground || writes.isNotEmpty()) return
+        val chain = active
+        if (chain == null || chain.use?.let { !access.admits(it) } == true) {
+            if (chain != null) retireChain()
+            startChain(ticket.use.identity, ticket.use, ordinary = false)
+        } else if (chain.use == null) {
+            chain.use = ticket.use
+            chain.hints.trySend(Unit)
+        }
+    }
+
     override fun onSync() = authoritative()
     fun ensure() = demand(force = false)
     fun authoritative() = demand(force = true)
     fun manual() = authoritative()
 
     fun reset() {
+        pendingDelivery = null
         abandon(restoreSnapshot = false)
         confirmed = null
         publishState(ComparisonAlertSettingsState())
@@ -391,8 +437,10 @@ internal class ComparisonAlertSettingsOwner internal constructor(
 
     // A use can end while the same account still has premium access to its last success.
     private fun withdrawUse() {
+        liveDelivery()
         abandon()
         show(AlertLoadPhase.Idle)
+        resumeDelivery()
     }
 
     private fun abandon(restoreSnapshot: Boolean = true) {
@@ -433,13 +481,21 @@ internal class ComparisonAlertSettingsOwner internal constructor(
             if (chain.use?.let { !access.admits(it) } == true) {
                 withdrawUse()
             } else {
+                if (force || !hasSnapshot(identity)) chain.ordinary = true
                 if (force && chain.fetching) chain.dirty = true
                 return
             }
         }
-        if (!force && hasSnapshot(identity)) return
-        val use = access.acquire()?.takeIf { it.identity == identity }
+        val ticket = liveDelivery()
+        val ordinary = force || !hasSnapshot(identity)
+        if (!ordinary && ticket == null) return
+        val use = ticket?.use ?: access.acquire()?.takeIf { it.identity == identity }
+        startChain(identity, use, ordinary)
+    }
+
+    private fun startChain(identity: AuthIdentityFence, use: AlertSettingsUse?, ordinary: Boolean) {
         val next = Chain(generation, identity, use)
+        next.ordinary = ordinary
         active = next
         next.job = scope.launch(start = CoroutineStart.LAZY) { runChain(next) }
         next.job.start()
@@ -483,29 +539,39 @@ internal class ComparisonAlertSettingsOwner internal constructor(
                 chain.dirty = false
                 chain.fetching = true
                 if (attempt == 0) show(AlertLoadPhase.Loading)
+                val ticket = liveDelivery()
+                if (ticket == null && !chain.ordinary) return
+                val requestUse = ticket?.use ?: use
+                val send = { guard() && access.admits(requestUse) }
                 val revision = writeRevision
-                val bound = fetch(use, guard)
+                val bound = fetch(requestUse, send)
                 chain.fetching = false
-                if (revision != writeRevision || !current(chain) || !guard()) return
+                if (revision != writeRevision || !current(chain) || !send()) return
                 val result = bound.fold({ Result.success(it) }, { Result.failure(it) })
                 val failure = result.exceptionOrNull()
                 if (failure == null) {
+                    if (pendingDelivery !== ticket) {
+                        attempt = 0
+                        continue
+                    }
                     val rows = result.getOrThrow()
+                    pendingDelivery = null
                     val adopted = ComparisonAlertRowPolicy.adopt(use.identity.uid, rows)
                     commitRows(use.identity, adopted)
                     if (!chain.dirty) return
                     attempt = 0
                 } else {
                     when (val decision = policy.decide(classify(failure), attempt, jitter)) {
-                        AlertRetryDecision.Silent -> return
-                        is AlertRetryDecision.Terminal -> {
-                            show(AlertLoadPhase.TerminalError(decision.failure))
+                        AlertRetryDecision.Silent, is AlertRetryDecision.Terminal -> {
+                            if (pendingDelivery !== ticket) { attempt = 0; continue }   // S86_J5b parity: the later event keeps its own GET
+                            pendingDelivery = null
+                            if (decision is AlertRetryDecision.Terminal) show(AlertLoadPhase.TerminalError(decision.failure))
                             return
                         }
                         is AlertRetryDecision.Retry -> {
                             show(AlertLoadPhase.Retrying)
                             attempt++
-                            sleep(decision.delayMillis)
+                            sleep(decision.delayMillis)   // the next attempt absorbs the newer ticket
                         }
                     }
                 }

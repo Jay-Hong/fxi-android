@@ -26,7 +26,7 @@ import org.junit.Assert.assertNotNull
  */
 internal object PostS6ApprovedDelta {
     const val RESOURCE = "krx/post_s6/approved_delta.json"
-    const val APPROVED_SHA256 = "37d9695ccd118eb4b652108d7a2e3e09951ae37e474b5b60985bdf756a895eeb"
+    const val APPROVED_SHA256 = "ea125c8abd3fd05687665babde695af81ca97f9e7576603af14275f3feae1efa"
     private const val BASE = S6Krx3bOffWiringContractTest.BASE
     private const val INVENTORY_SHA256 = "ee6b718c9ebc41f1e70a800bfb15d6073a66ef07041a2ba19b71e8a7a19d972f"
     private const val S64B_DELTA_SHA256 = "6a15c386a7c8220691c417e6e1f183d52614adb43b0dcd26ceb1bf712c61d536"
@@ -91,6 +91,9 @@ internal object PostS6ApprovedDelta {
      * - 8875b396…: f94795ef PremiumTopicRoute.kt (S9-2b's change), no KRX including comments.
      */
     val NO_KRX_REVIEWED = setOf(
+        // S9-5 comparison delivery predecessors.
+        "725efe217ce9592a34dff062aee6ee6861d06cb5cff4451b03727798ba73d41e",
+        "ad409a548f678d3eca93bf250f49a6b3ae8831d25e22fa224bf619cc5c560d31",
         // S9-4c field presentation predecessors.
         "9a9e8f0f8807c7a0c989f4630ca55d67515c30fd08b45dd3587fec5eda91e895",
         "2920fb11ccbbd70cbec0c3d14d17aef07e70572d24fadfc6d155694508cb09b0",
@@ -252,6 +255,24 @@ internal object PostS6ApprovedDelta {
             from = "363279e89b869c63f4c5a7e59dff81db858e5cb00da41ec9fd3d6f00aba3854b",
             to = "3328908334f4388686891812483df4fe7ba3d043aa7b6f969850c6d670230de5",
             krxLinesSha256 = "e61ab21d19206fde24d0b2a8d74e0e75def7397c1ac1d3be33f8514b07b725aa"
+        ),
+        CoreException(
+            unitId = "S9-5",
+            sourceParent = "bf98a3c7ecd6db981885f73632d222eadb75e565",
+            approvalRecordSha256 = "c2c4030998b1c8ee0ddbedff00763df77e7a0528b873e17afdcb4b3e7f3533e6",
+            path = BASE + "service/FXiMessagingService.kt",
+            from = "3ab46e30fff43339bd09c4a5cde8fc0c0d429cfde93065d9fa086ac07a0a575a",
+            to = "12c554dfd36ef3daf44886f5db88113b18d0bd207d21a45084471720d148c058",
+            krxLinesSha256 = "08e142a551e0e47752a09853de243aa65b727b5863c75171d1cb7157ece13d02"
+        ),
+        CoreException(
+            unitId = "S9-5",
+            sourceParent = "bf98a3c7ecd6db981885f73632d222eadb75e565",
+            approvalRecordSha256 = "c2c4030998b1c8ee0ddbedff00763df77e7a0528b873e17afdcb4b3e7f3533e6",
+            path = BASE + "MainActivity.kt",
+            from = "3328908334f4388686891812483df4fe7ba3d043aa7b6f969850c6d670230de5",
+            to = "17bcaee7748430831b3d4f9e3962bb131444d2c56f7831b80d9117cfa16fb9fb",
+            krxLinesSha256 = "e61ab21d19206fde24d0b2a8d74e0e75def7397c1ac1d3be33f8514b07b725aa"
         )
     )
 
@@ -328,19 +349,25 @@ internal object PostS6ApprovedDelta {
     }
 
     /**
-     * O04s's byte rule for one span: an unlisted span must equal its frozen raw. A listed span's frozen raw must hash to the value
-     * the list and the 0302 index both name, and its UTF-8 bytes must hash to the listed approved value; for the parser the listed
-     * value must be the pinned S7-E5c predecessor and the bytes must hash to the pinned S8-6 successor instead.
+     * An unlisted O04s span must equal its frozen bytes. For a listed span, the frozen hash must match the list and the 0302 index.
+     * The current UTF-8 hash must match the listed approval for non-parser spans. For the parser, the list must name the S7-E5c pin,
+     * removing the four S9-5 lines must restore the S8-6 hash, and the complete parser must match the S9-5 hash.
      */
     fun o04sSpanErrors(id: String, frozen: ByteArray, indexSha256: String?, actual: String, approvals: Map<String, O04sApproval>): List<String> {
         val approval = approvals[id]
             ?: return if (frozen.contentEquals(actual.toByteArray(Charsets.UTF_8))) emptyList() else listOf("o04s-bytes $id")
         val out = mutableListOf<String>()
         if (sha(frozen) != approval.frozenSha256 || indexSha256 != approval.frozenSha256) out += "o04s-frozen $id"
-        // S8-6 follows exactly the pinned S7-E5c parser. All other spans keep their original rule.
+        // The parser approval chain is S7-E5c (list), S8-6 (insertion removed), then S9-5 (full span).
         val expected = if (id == "parser") {
             if (approval.approvedSha256 != "22b20e12bc0f2bc72b2ca4a23058dc2ba7ea7d665e29f29e172032e6b38aa8b8") return out + "o04s-predecessor $id"
-            "78aa21b1a2c6a6dfc220cca0d32fbad2b4c6ef344ac261c790834be2dfc1a4d3"
+            val inserted = "        if (AlertFamilyRefresherRegistry.consumeComparisonTap(\n" +
+                "                AndroidAlertTapExtras(intent),\n" +
+                "                shouldStartAppOwnedServices(ReleaseAdmission.isOpen, BuildConfig.BENCHMARK_NO_DATA_MODE)\n" +
+                "            ) { alertFamiliesProvider.get() }) return null\n"
+            val prior = actual.replaceFirst(inserted, "")
+            if (prior == actual || sha(prior.toByteArray(Charsets.UTF_8)) != "78aa21b1a2c6a6dfc220cca0d32fbad2b4c6ef344ac261c790834be2dfc1a4d3") return out + "o04s-predecessor $id"
+            "89266e5fea2e4994d71b86ce7735e8193837ec486779b1ef5687bc87d7796c9b"
         } else approval.approvedSha256
         if (sha(actual.toByteArray(Charsets.UTF_8)) != expected) out += "o04s-approved $id"
         return out

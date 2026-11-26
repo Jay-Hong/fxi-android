@@ -251,7 +251,7 @@ class S7U2FcmGoldenConsumptionContractTest {
             baseFamilyResolves = familyResolves
         }
 
-        /** FXiMessagingService.onMessageReceived's order: a type, a route by the raw type and id, then the raw hand-over. */
+        /** Pre-S9-5 entry order, intentionally frozen. S95Entry and B07 exercise current comparison delivery. */
         fun push(data: Map<String, String>, gateOpen: Boolean = true): AlertPushRoute? {
             val type = data["type"] ?: return null
             val route = AlertPushRouting.route(type, data["setting_id"]) ?: return null
@@ -264,7 +264,7 @@ class S7U2FcmGoldenConsumptionContractTest {
             return route
         }
 
-        /** The OFF tap's meaning chain: the route of the raw type and id, then its event with the raw is_repeat. */
+        /** Pre-S9-5 entry order, intentionally frozen. S95Entry and B07 exercise current comparison delivery. */
         fun tap(data: Map<String, String>, gateOpen: Boolean = true): AlertPushRoute? {
             val route = AlertPushRouting.route(data["type"], data["setting_id"]) ?: return null
             AlertFamilyRefresherRegistry.deliverTap(route.event, data["is_repeat"], gateOpen, reportFailure = { failures++ }) {
