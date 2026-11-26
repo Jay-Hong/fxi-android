@@ -1,6 +1,10 @@
 package com.jay.fxi.ui.alert
 
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
@@ -12,12 +16,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.*
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.jay.fxi.domain.model.RepeatInterval
-import com.jay.fxi.ui.theme.NegativeColor
-import com.jay.fxi.ui.theme.PositiveColor
+import com.jay.fxi.ui.theme.*
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -30,6 +42,7 @@ internal fun ComparisonAlertEditorSheet(fields: ComparisonFields, quotes: Compar
     canSave: Boolean, message: String?, change: ((ComparisonFields, ComparisonQuotes) -> ComparisonFields) -> Unit,
     save: () -> Unit, dismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = dismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = Background,
         dragHandle = { BankAlertSheetDragHandle() }, modifier = Modifier.testTag("comparison-editor")) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
@@ -38,9 +51,8 @@ internal fun ComparisonAlertEditorSheet(fields: ComparisonFields, quotes: Compar
                 if (pending) CircularProgressIndicator(Modifier.size(24.dp))
                 else TextButton(onClick = save, enabled = canSave, modifier = Modifier.testTag("comparison-save")) { Text("저장") }
             }
-            message?.let { Text(it, Modifier.testTag("comparison-message")) }
             Column(Modifier.verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
-                ComparisonAlertEditorFields(fields, quotes, !pending, change)
+                ComparisonAlertEditorFields(fields, quotes, !pending, change, message)
             }
         }
     }
@@ -48,73 +60,154 @@ internal fun ComparisonAlertEditorSheet(fields: ComparisonFields, quotes: Compar
 
 @Composable
 internal fun ComparisonAlertEditorFields(fields: ComparisonFields, quotes: ComparisonQuotes, enabled: Boolean,
-    change: ((ComparisonFields, ComparisonQuotes) -> ComparisonFields) -> Unit) {
-    if (!fields.signed) Text(fields.guidance)
+    change: ((ComparisonFields, ComparisonQuotes) -> ComparisonFields) -> Unit, message: String? = null) {
+    var wideOpen by remember { mutableStateOf(false) }
+    var repeatOpen by remember { mutableStateOf(false) }
+    val duplicate = message == comparisonDuplicate
+    val headlineStyle = LocalTextStyle.current.copy(
+        color = if (duplicate) StatusConnecting else PrimaryText,
+        fontSize = 15.sp, fontWeight = FontWeight.Medium, fontFamily = FontFamily.Default, lineHeight = 20.sp
+    )
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val signed = fields.signed
+    val headlineMinHeight = remember(signed, headlineStyle, measurer, density) {
+        // minLines uses Latin metrics, which can be shorter than two lines of Hangul.
+        if (signed) with(density) { measurer.measure("가\n가", headlineStyle).size.height.toDp() } else 0.dp
+    }
+    Text(if (duplicate) comparisonDuplicate else fields.headline(),
+        Modifier.fillMaxWidth().heightIn(min = headlineMinHeight).testTag("comparison-headline"),
+        style = headlineStyle, color = headlineStyle.color, minLines = if (signed) 2 else 1)
+    if (message != null && !duplicate) {
+        Text(message, Modifier.testTag("comparison-message"), color = StatusError, fontSize = 12.sp,
+            fontWeight = FontWeight.Normal, fontFamily = FontFamily.Default)
+    }
     for (right in if (fields.signed) listOf(false, true) else listOf(false)) {
         if (fields.signed) Text(if (right) "비교" else "기준")
-        for (chunk in fields.candidates(right).chunked(5)) {
-            Row(Modifier.fillMaxWidth()) {
-                for (leg in chunk) {
-                    val picked = leg in fields.selection
-                    Column(Modifier.weight(1f).testTag("comparison-pick-${leg.first}").clickable(enabled = enabled) {
-                        change { state, live -> state.select(leg, right, live) }
-                    }.semantics { selected = picked }.padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(comparisonName(leg.first), color = if (picked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
-                        fields.caption(leg, quotes)?.let { Text(it, style = MaterialTheme.typography.labelSmall) }
+        Column(Modifier.fillMaxWidth().testTag(if (right) "comparison-right" else "comparison-left")) {
+            for (chunk in fields.candidates(right).chunked(5)) {
+                Row(Modifier.fillMaxWidth()) {
+                    for (leg in chunk) {
+                        val picked = leg in fields.selection
+                        Column(Modifier.weight(1f).testTag("comparison-pick-${leg.first}").clickable(enabled = enabled) {
+                            change { state, live -> state.select(leg, right, live) }
+                        }.semantics { selected = picked }.padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(comparisonName(leg.first), color = if (picked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                            fields.caption(leg, quotes)?.let { Text(it, style = MaterialTheme.typography.labelSmall) }
+                        }
                     }
+                    repeat(5 - chunk.size) { Spacer(Modifier.weight(1f)) }
                 }
-                repeat(5 - chunk.size) { Spacer(Modifier.weight(1f)) }
             }
         }
     }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(fields.heading)
+    ComparisonCurrent(fields, quotes)
+    Row(Modifier.fillMaxWidth().testTag("comparison-heading-row"), verticalAlignment = Alignment.CenterVertically) {
+        Text(fields.heading, color = SecondaryText, fontSize = 15.sp, fontWeight = FontWeight.Medium,
+            fontFamily = FontFamily.Default)
         if (fields.signed) {
-            if (fields.wide) Text("넓은 범위 ±1000")
-            ComparisonMenu("⋮", enabled, listOf(if (fields.wide) "넓은 범위 사용 중 (±1000)" else "넓은 범위 설정"),
-                disabled = if (fields.wide) 0 else -1) { change { state, live -> state.widen(live) } }
+            if (fields.wide) Text("넓은 범위 ±1000", Modifier.padding(start = 6.dp)
+                .background(Primary.copy(alpha = 0.12f), RoundedCornerShape(4.dp)).padding(horizontal = 6.dp),
+                color = Primary, fontSize = 11.sp, fontWeight = FontWeight.Normal, fontFamily = FontFamily.Default)
+            Spacer(Modifier.weight(1f))
+            Box {
+                TextButton(onClick = { wideOpen = true }, enabled = enabled, modifier = Modifier.testTag("comparison-wide")) {
+                    Text("⋮", color = SecondaryText, fontSize = 18.sp, fontWeight = FontWeight.Normal, fontFamily = FontFamily.Default)
+                }
+                DropdownMenu(expanded = wideOpen && enabled, onDismissRequest = { wideOpen = false }) {
+                    DropdownMenuItem(text = { Text(if (fields.wide) "넓은 범위 사용 중 (±1000)" else "넓은 범위 설정") },
+                        enabled = !fields.wide, onClick = {
+                            wideOpen = false
+                            change { state, live -> state.widen(live) }
+                        })
+                }
+            }
         }
     }
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        for ((value, label) in listOf("gte" to "△ 이상", "lte" to "▽ 이하")) {
-            TextButton(onClick = { change { state, live -> state.condition(value, live) } }, enabled = enabled,
-                modifier = Modifier.semantics { selected = fields.operator == value }) { Text(label) }
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.weight(1f).background(InputBackground, RoundedCornerShape(12.dp)).padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            ComparisonStepButton("−", enabled) { n -> change { state, _ -> state.step(-1, n) } }
+            val inputColor = when (fields.thresholdTone(fields.threshold)) {
+                ComparisonTone.Up -> StatusOnline
+                ComparisonTone.Down -> StatusError
+                ComparisonTone.Neutral -> PrimaryText
+            }
+            Text(fields.fieldText, Modifier.weight(1f).testTag("comparison-value"), color = inputColor,
+                fontSize = 24.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace,
+                textAlign = TextAlign.Center, maxLines = 1, softWrap = false)
+            ComparisonStepButton("＋", enabled) { n -> change { state, _ -> state.step(1, n) } }
         }
-    }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        ComparisonStepButton("−", enabled) { n -> change { state, _ -> state.step(-1, n) } }
-        Text(fields.fieldText, Modifier.testTag("comparison-value"), color = when {
-            fields.signed && fields.threshold > 0 -> PositiveColor
-            fields.signed && fields.threshold < 0 -> NegativeColor
-            else -> MaterialTheme.colorScheme.onSurface
-        })
-        ComparisonStepButton("＋", enabled) { n -> change { state, _ -> state.step(1, n) } }
+        val conditionColor = when (fields.conditionLabel) {
+            ComparisonCondition.Above -> PositiveColor
+            ComparisonCondition.Below -> NegativeColor
+            ComparisonCondition.Unknown -> SecondaryText
+        }
+        Box(Modifier.clip(RoundedCornerShape(12.dp)).background(conditionColor.copy(alpha = 0.15f))
+            .border(2.dp, conditionColor, RoundedCornerShape(12.dp)).testTag("comparison-condition")
+            .clickable(enabled = enabled, role = Role.Button) {
+                change { state, live -> state.condition(nextOperator(state.operator), live) }
+            }.padding(horizontal = 16.dp, vertical = 14.dp)) {
+            Text(fields.conditionLabel.label, color = conditionColor, fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Default)
+        }
     }
     fields.exactText?.let { Text(it) }
-    if (fields.wide) Text("비정상 급등락 감지용 넓은 범위(±1000)입니다. 시트를 닫으면 기본(±100)으로 돌아갑니다.")
-    fields.current(quotes).forEach { Text(it) }
+    if (fields.wide) Text("비정상 급등락 감지용 넓은 범위(±1000)입니다. 시트를 닫으면 기본(±100)으로 돌아갑니다.",
+        color = SecondaryText, fontSize = 12.sp, fontWeight = FontWeight.Normal, fontFamily = FontFamily.Default)
     val options = listOf("한번만") + RepeatInterval.entries.map { it.label }
     val unknown = fields.repeatLabel !in options
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("반복")
-        ComparisonMenu(fields.repeatLabel, enabled, if (unknown) options + fields.repeatLabel else options,
-            disabled = if (unknown) options.size else -1, chosen = fields.repeatLabel) { index ->
-            change { state, _ -> state.copy(repeatSeconds = RepeatInterval.entries.getOrNull(index - 1)?.seconds) }
+    Row(Modifier.fillMaxWidth().background(CardBackground, RoundedCornerShape(12.dp)).padding(16.dp)
+        .testTag("comparison-repeat-row"), verticalAlignment = Alignment.CenterVertically) {
+        Text("반복", color = PrimaryText, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Default)
+        Spacer(Modifier.weight(1f))
+        Box {
+            Row(Modifier.clip(RoundedCornerShape(10.dp)).background(Primary.copy(alpha = 0.12f))
+                .testTag("comparison-repeat").clickable(enabled = enabled, role = Role.Button) { repeatOpen = true }
+                .padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(fields.repeatLabel, color = Primary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Default)
+                Canvas(Modifier.size(9.dp)) {
+                    for (y in listOf(0.15f, 0.85f)) {
+                        val tip = Offset(size.width / 2, size.height * y)
+                        val baseY = size.height * (if (y < 0.5f) 0.42f else 0.58f)
+                        drawLine(Primary, Offset(0f, baseY), tip, 1.dp.toPx())
+                        drawLine(Primary, tip, Offset(size.width, baseY), 1.dp.toPx())
+                    }
+                }
+            }
+            DropdownMenu(expanded = repeatOpen && enabled, onDismissRequest = { repeatOpen = false }) {
+                val labels = if (unknown) options + fields.repeatLabel else options
+                labels.forEachIndexed { index, option ->
+                    DropdownMenuItem(text = { Text(option) }, enabled = index < options.size,
+                        modifier = Modifier.semantics { selected = fields.repeatLabel == option },
+                        onClick = {
+                            repeatOpen = false
+                            change { state, _ -> state.copy(repeatSeconds = RepeatInterval.entries.getOrNull(index - 1)?.seconds) }
+                        })
+                }
+            }
         }
     }
-    fields.summary?.let { Text(it) }
 }
 
 @Composable
-private fun ComparisonMenu(label: String, enabled: Boolean, options: List<String>, disabled: Int, chosen: String? = null, pick: (Int) -> Unit) {
-    var open by remember { mutableStateOf(false) }
-    Box {
-        TextButton(onClick = { open = true }, enabled = enabled) { Text(label) }
-        DropdownMenu(expanded = open && enabled, onDismissRequest = { open = false }) {
-            options.forEachIndexed { index, option ->
-                DropdownMenuItem(text = { Text(option) }, enabled = index != disabled,
-                    modifier = Modifier.semantics { selected = chosen == option },
-                    onClick = { open = false; pick(index) })
+private fun ComparisonCurrent(fields: ComparisonFields, quotes: ComparisonQuotes) {
+    val lines = fields.current(quotes)
+    val reserve = if (fields.signed) 36.dp else 24.dp
+    Row(Modifier.fillMaxWidth().testTag("comparison-current").heightIn(min = reserve),
+        horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+        val diff = fields.difference(quotes)
+        if (diff != null) {
+            val amountColor = if (fields.currentTone(diff) == ComparisonTone.Down) StatusError else StatusOnline
+            Text(lines[0], color = SecondaryText, fontSize = 12.sp, fontWeight = FontWeight.Normal, fontFamily = FontFamily.Default)
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(lines[1], color = amountColor, fontSize = 15.sp, fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Default, style = TextStyle(fontFeatureSettings = "tnum", lineHeight = 19.sp))
+                if (fields.signed) Text(lines[2], color = amountColor.copy(alpha = 0.65f), fontSize = 11.sp,
+                    fontWeight = FontWeight.Normal, fontFamily = FontFamily.Default,
+                    style = TextStyle(fontFeatureSettings = "tnum", lineHeight = 15.sp))
             }
         }
     }

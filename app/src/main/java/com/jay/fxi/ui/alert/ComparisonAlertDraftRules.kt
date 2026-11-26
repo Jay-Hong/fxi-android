@@ -43,6 +43,13 @@ internal object ComparisonStepRepeat {
     fun steps(repetition: Int) = if (repetition >= 11) 10 else 1
 }
 
+internal enum class ComparisonTone { Up, Down, Neutral }
+internal enum class ComparisonCondition(val label: String) {
+    Above("△ 이상"), Below("▽ 이하"), Unknown("조건 선택")
+}
+
+internal fun nextOperator(current: String) = if (current == "gte") "lte" else "gte"
+
 internal data class ComparisonFields(
     val tab: String, val kind: String, val editing: Boolean, val selection: List<ComparisonLeg>,
     val threshold: Double, val operator: String = "gte", val repeatSeconds: Int? = null,
@@ -74,6 +81,28 @@ internal data class ComparisonFields(
         return "\"$text\""
     }
 
+    val conditionLabel get() = when (operator) {
+        "gte" -> ComparisonCondition.Above
+        "lte" -> ComparisonCondition.Below
+        else -> ComparisonCondition.Unknown
+    }
+
+    fun headline(): String = when {
+        !signed && pair == null -> guidance
+        operator != "gte" && operator != "lte" -> "알림 조건을 선택해주세요"
+        !signed -> requireNotNull(summary)
+        else -> summary ?: "알림 조건을 선택해주세요"
+    }
+
+    fun currentTone(diff: Double) =
+        if (!signed || diff >= 0.0) ComparisonTone.Up else ComparisonTone.Down
+
+    fun thresholdTone(threshold: Double) = when {
+        !signed -> ComparisonTone.Neutral
+        threshold >= 0.0 -> ComparisonTone.Up
+        else -> ComparisonTone.Down
+    }
+
     fun candidates(right: Boolean = false): List<ComparisonLeg> {
         val asset = RateSourceSets.TAB_ASSETS[tab] ?: return emptyList()
         if (signed && tab != "tether" || kind !in setOf("signed", "absolute")) return emptyList()
@@ -96,7 +125,7 @@ internal data class ComparisonFields(
         })
     }
 
-    private fun difference(quotes: ComparisonQuotes): Double? {
+    fun difference(quotes: ComparisonQuotes): Double? {
         val p = pair ?: return null
         return (quotes.price(p.left) ?: return null) - (quotes.price(p.right) ?: return null)
     }

@@ -71,6 +71,39 @@ class ComparisonAlertDraftRulesTest {
         assertFalse(ComparisonAlertDraft(row.originalPair(), "gte", -1.0, null).supported())
         assertNull(f.copy(operator = "unknown").draft())
         assertNotNull(f.copy(operator = "unknown").condition("gte", emptyMap()).draft())
+        for (fixture in listOf(row, signed)) {
+            var edited = ComparisonFields.restore(fixture.copy(operator = "future"))
+            assertEquals("future", edited.operator)
+            assertNull(edited.draft())
+            assertEquals(ComparisonCondition.Unknown, edited.conditionLabel)
+            assertEquals("조건 선택", edited.conditionLabel.label)
+            for (expected in listOf("gte", "lte", "gte")) {
+                edited = edited.condition(nextOperator(edited.operator), market(6.0))
+                assertEquals(expected, edited.operator)
+                assertEquals(fixture.threshold, edited.threshold, 0.0)
+                assertNotNull(edited.draft())
+            }
+        }
+        val absSeed = seed("tether")
+        val (left, right) = absSeed.candidates().take(2)
+        fun prices(diff: Double) = quotes(left to (100 + diff), right to 100.0)
+        var absPair = absSeed.select(left, false, prices(2.0)).select(right, false, prices(2.0))
+        var signedPair = ComparisonFields.create("tether", "signed", market(2.0)).step(1)
+        for ((direction, diff) in listOf("lte" to 6.0, "gte" to 10.0)) {
+            val manual = absPair.step(1)
+            assertTrue(manual.manual)
+            absPair = manual.condition(nextOperator(manual.operator), prices(diff))
+            assertEquals(direction, absPair.operator)
+            assertEquals(diff + 1, absPair.threshold, 0.0)
+            assertFalse(absPair.manual)
+            signedPair = signedPair.condition(nextOperator(signedPair.operator), market(diff))
+            assertEquals(direction, signedPair.operator)
+            assertEquals(2.1, signedPair.threshold, 0.0)
+            assertTrue(signedPair.manual)
+        }
+        val retapped = signedPair.select(signedPair.selection.first(), false, market(10.0))
+        assertEquals(10.0, retapped.threshold, 0.0)
+        assertFalse(retapped.manual)
         val unknown = f.copy(repeatSeconds = 61)
         assertEquals("기존 반복 간격 유지", unknown.repeatLabel)
         assertNull(unknown.draft())
@@ -144,6 +177,17 @@ class ComparisonAlertDraftRulesTest {
     @Test fun D04_currentDifferenceUsesMatchingQuotes() {
         val f = seed("tether","signed")
         assertEquals(listOf("지금 빗썸-인베스팅","-14.0원","-1.00%"), f.current(quotes(f.selection[0] to 1386.0, f.selection[1] to 1400.0)))
+        for ((diff, current) in listOf(-14.0 to ComparisonTone.Down, 0.0 to ComparisonTone.Up,
+            20.0 to ComparisonTone.Up, -0.01 to ComparisonTone.Down)) {
+            val live = market(diff)
+            assertEquals(current, f.currentTone(f.difference(live)!!))
+            for ((threshold, tone) in listOf(-1.0 to ComparisonTone.Down, 0.0 to ComparisonTone.Up, 1.0 to ComparisonTone.Up)) {
+                assertEquals(tone, f.thresholdTone(threshold))
+                assertEquals(ComparisonTone.Neutral, seed("usd").thresholdTone(threshold))
+            }
+        }
+        assertEquals("-0.0원", f.current(market(-0.01))[1])
+        assertEquals(ComparisonTone.Up, seed("usd").currentTone(-14.0))
         assertEquals(listOf("+0.0원","+0.00%"), f.current(market(0.0)).drop(1))
         assertEquals(listOf("+20.0원","+1.00%"), f.current(market(20.0)).drop(1))
         for (leg in f.selection) assertTrue(f.current(quotes(leg to 1400.0)).isEmpty())
@@ -157,6 +201,28 @@ class ComparisonAlertDraftRulesTest {
 
     @Test fun D05_fieldAndSummaryStrings() {
         val abs = ComparisonFields.restore(comparisonFixture(tab="usd"))
+        for (tab in listOf("tether", "usd")) {
+            var picking = seed(tab)
+            val tetherTab = tab == "tether"
+            val prompt = if (tetherTab) "비교할 거래소 2곳을 선택해주세요" else "비교할 은행 2곳을 선택해주세요"
+            val (a, b, c) = picking.candidates().take(3)
+            assertEquals(prompt, picking.headline())
+            picking = picking.select(a, false, emptyMap())
+            assertEquals(prompt, picking.headline())
+            picking = picking.select(b, false, emptyMap())
+            val first = if (tetherTab) "업비트·빗썸 차이가 1원" else "인베스팅·국민 차이가 0.1원"
+            assertEquals("\"$first 이상 벌어지면 알려드려요\"", picking.headline())
+            picking = picking.select(c, false, emptyMap())
+            val next = if (tetherTab) "빗썸·코인원 차이가 1원" else "국민·하나 차이가 0.1원"
+            assertEquals("\"$next 이상 벌어지면 알려드려요\"", picking.headline())
+            assertEquals(prompt, picking.select(c, false, emptyMap()).headline())
+        }
+        val signedRow = comparisonFixture(signed = true)
+        assertEquals("\"빗썸 김프가 인베스팅 대비 +0원 이상으로 오르면 알려드려요\"", seed("tether", "signed").headline())
+        assertEquals("\"빗썸 김프가 인베스팅 대비 +2원 이상으로 오르면 알려드려요\"", ComparisonFields.restore(signedRow).headline())
+        for (row in listOf(signedRow, comparisonFixture())) {
+            assertEquals("알림 조건을 선택해주세요", ComparisonFields.restore(row.copy(operator = "?")).headline())
+        }
         assertEquals("비교 알림 수정",abs.title)
         assertEquals("비교 알림",seed("usd").title)
         assertEquals("차이 기준",abs.heading)
