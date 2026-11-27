@@ -71,7 +71,7 @@ class S87PreviewStructureTest {
 
     /**
      * The shared draft rules have two callers, the premium editor and the free preview, and the free preview's files reach none
-     * of what D26 keeps at zero — not by name, alias, qualified name or string. The CTA has exactly two callers, one per sheet.
+     * of what D26 keeps at zero — not by name, alias, qualified name or string. Each of the three preview sheets calls the CTA once.
      */
     @Test
     fun W02_rulesHaveTwoPureCallers() {
@@ -151,7 +151,7 @@ class S87PreviewStructureTest {
             if ("SourceAlertRowPolicy.EXCHANGES.admits(entry.source, entry.asset)" !in squash(tree.getValue(QUOTES))) v += "quotes policy"
             if ("SourceAlertRowPolicy.EXCHANGES.sources(SourceAlertRowPolicy.SETTINGS_ASSET)" !in squash(tree.getValue(SESSION))) v += "seed policy"
             val cta = tree.mapValues { (_, t) -> Regex("""(?<!fun )(?<!\.)\bSubscribeCTA\s*\(""").findAll(t).count() }.filterValues { it > 0 }
-            if (cta != mapOf(BANK_SHEET to 1, SHEET to 1)) v += "cta $cta"
+            if (cta != mapOf(BANK_SHEET to 1, SHEET to 1, BASE + "ui/free/FreeComparisonAlertPreviewSheet.kt" to 1)) v += "cta $cta"
             return v
         }
 
@@ -176,11 +176,12 @@ class S87PreviewStructureTest {
             val screenBody = funBody(text, "FreeSnapshotScreen")?.let { squash(text.substring(it)) }.orEmpty()
             val pageBody = funBody(text, "FreeSnapshotTabContent")?.let { squash(text.substring(it)) }.orEmpty()
             val subscribe = Regex("""\bonSubscribe\b""")
-            if (subscribe.findAll(screenBody).count() != 6 || subscribe.findAll(tabs).count() != 2 ||
+            if (subscribe.findAll(screenBody).count() != 8 || subscribe.findAll(tabs).count() != 2 ||
                 subscribe.findAll(pageBody).count() != 1 || "Button(onClick = onSubscribe," !in pageBody ||
                 "FreeSourceAlertPreviewHost(" !in screenBody || opener !in tabs) v += "subscribe origin"
-            if (Regex("""\bonSubscribe\b""").findAll(text).count() != 12) v += "extra subscribe use"
-            if (Regex("""\.\s*open\s*\(""").findAll(text).count() != 2) v += "open calls"
+            if (Regex("""\bonSubscribe\b""").findAll(text).count() != 14) v += "extra subscribe use"
+            if (Regex("""\.\s*open\s*\(""").findAll(text).count() != 3 ||
+                Regex("""\bonOpenComparisonPreview\s*\.\s*open\s*\(""").findAll(text).count() != 1) v += "open calls"
             val section = "FreeSourceAlertPreviewSection(expanded = sourcePreviewExpanded, onToggle = { sourcePreviewExpanded = !sourcePreviewExpanded }, onOpen = onOpenSourcePreview)"
             if (squash(raw).split(section).size != 2 || Regex("""(?<![\w.])FreeSourceAlertPreviewSection\s*\(""").findAll(text).count() != 1) v += "section call"
             if (squash(raw).split("var sourcePreviewExpanded by remember { mutableStateOf(false) }").size != 2) v += "flag"

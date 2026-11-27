@@ -94,8 +94,8 @@ class S7E5DStructureTest {
         )) {
             assertEquals("$name 호출", mapOf(want.first to want.second), calls(code, name))
         }
-        // S8-7: the CTA has exactly two callers, the bank preview sheet and the tether preview sheet, once each.
-        assertEquals("SubscribeCTA 호출", mapOf(SHEET to 1, SOURCE_SHEET to 1), calls(code, "SubscribeCTA"))
+        // S8-7: the bank, source and comparison preview sheets each call the shared CTA once.
+        assertEquals("SubscribeCTA 호출", mapOf(SHEET to 1, SOURCE_SHEET to 1, BASE + "ui/free/FreeComparisonAlertPreviewSheet.kt" to 1), calls(code, "SubscribeCTA"))
         assertEquals(
             "공유 본문은 premium 시트와 preview 시트가 한 번씩 부른다",
             mapOf(PREMIUM_SHEET to 1, SHEET to 1),
@@ -364,7 +364,7 @@ class S7E5DStructureTest {
             "val pageMount = remember { PreviewPageMount(tab) }",
             "DisposableEffect(pageMount) { onPage(pageMount, true) onDispose { onPage(pageMount, false) } }",
             "onOpenPreview = { onOpenPreview.open(tab, state.previewQuotes, state.previewAsOf) }",
-            "if (tab in FREE_BANK_ALERT_PREVIEW_TABS) { item { FreeBankAlertPreviewSection(expanded = previewExpanded, onToggle = { previewExpanded = !previewExpanded }, onOpen = onOpenPreview) } }",
+            "if (tab in FREE_BANK_ALERT_PREVIEW_TABS) { item { FreeBankAlertPreviewSection(expanded = previewExpanded, onToggle = { previewExpanded = !previewExpanded }, onOpen = onOpenPreview) } item { FreeComparisonAlertPreviewSection(tab = tab, kind = COMPARISON_PREVIEW_ABSOLUTE, expanded = comparisonExpanded, onToggle = { comparisonExpanded = !comparisonExpanded }, onOpen = onOpenComparisonPreview) } }",
             "var previewExpanded by remember { mutableStateOf(false) }"
         )
         val HOST_WIRING = listOf(

@@ -103,7 +103,9 @@ data class FreeSnapshotUiState(
      */
     val sourcePreviewQuotes: Map<String, Double> = emptyMap(),
     /** The as_of of the snapshot [sourcePreviewQuotes] came from, kept with it even when no exchange in it is allowed. */
-    val sourcePreviewAsOf: Instant? = null
+    val sourcePreviewAsOf: Instant? = null,
+    val comparisonPreviewQuotes: Map<Pair<String, String>, Double> = emptyMap(),
+    val comparisonPreviewAsOf: Instant? = null
 ) {
     /**
      * What the scheduler would be activated for.
@@ -159,7 +161,10 @@ data class FreeSnapshotUiState(
             // "project one candidate rather than show nothing" is a rule for source lists.
             val graph = GraphPreparedBuilder.build(entry.snapshot.graph, period)
             val tether = (entry.snapshot.rate as? FreeRate.Grouped)?.takeIf { tab == FreeTab.TETHER }
+            val comparison = comparisonPreviewBasis(tab, entry.snapshot.rate, entry.snapshot.asOf)
             return state.copy(
+                comparisonPreviewQuotes = comparison.first,
+                comparisonPreviewAsOf = comparison.second,
                 rateSections = sections(entry.snapshot.rate, rowPreferences),
                 rowEditors = editors(entry.snapshot.rate, rowPreferences),
                 previewQuotes = (entry.snapshot.rate as? FreeRate.Flat)?.takeIf { tab in FREE_BANK_ALERT_PREVIEW_TABS }?.let(::previewQuotes).orEmpty(),

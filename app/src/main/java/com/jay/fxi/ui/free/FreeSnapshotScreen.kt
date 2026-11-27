@@ -169,10 +169,13 @@ fun FreeSnapshotScreen(
         ) { openPreview ->
             // S8-7: the tether alert preview's own host, for the same owner, selection and paywall, with its default seams.
             FreeSourceAlertPreviewHost(uid = state.uid, activeTab = selected, onSubscribe = onSubscribe) { openSourcePreview ->
-                FreeSnapshotTabs(selected, state, pageState, onSelectTab, onSelectPeriod, onToggleSeries,
-                    onApplyRowPreference, onExpand = { fullscreen = true }, onSubscribe = onSubscribe,
-                    onOpenSourcePreview = openSourcePreview, onOpenPreview = openPreview,
-                    onPage = hooks::onPage)
+                FreeComparisonAlertPreviewHost(uid = state.uid, activeTab = selected, onSubscribe = onSubscribe) { openComparisonPreview ->
+                    FreeSnapshotTabs(selected, state, pageState, onSelectTab, onSelectPeriod, onToggleSeries,
+                        onApplyRowPreference, onExpand = { fullscreen = true }, onSubscribe = onSubscribe,
+                        onOpenComparisonPreview = openComparisonPreview,
+                        onOpenSourcePreview = openSourcePreview, onOpenPreview = openPreview,
+                        onPage = hooks::onPage)
+                }
             }
         }
     }
@@ -190,6 +193,7 @@ private fun ColumnScope.FreeSnapshotTabs(
     onApplyRowPreference: (RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onExpand: () -> Unit,
     onSubscribe: () -> Unit,
+    onOpenComparisonPreview: FreeComparisonAlertPreviewOpener,
     onOpenSourcePreview: FreeSourceAlertPreviewOpener,
     onOpenPreview: FreeAlertPreviewOpener,
     onPage: (PreviewPageMount, Boolean) -> Unit
@@ -261,6 +265,7 @@ private fun ColumnScope.FreeSnapshotTabs(
                 onApplyRowPreference = onApplyRowPreference,
                 onExpand = onExpand,
                 onSubscribe = onSubscribe,
+                onOpenComparisonPreview = { kind -> if (tab == selected) onOpenComparisonPreview.open(tab, kind, state.comparisonPreviewQuotes, state.comparisonPreviewAsOf) },
                 onOpenSourcePreview = { if (tab == selected) onOpenSourcePreview.open(tab, state.sourcePreviewQuotes, state.sourcePreviewAsOf) },
                 onOpenPreview = { onOpenPreview.open(tab, state.previewQuotes, state.previewAsOf) },
                 onPage = onPage
@@ -281,6 +286,7 @@ private fun FreeSnapshotTabContent(
     onApplyRowPreference: (RateRowList, List<String>, List<String>, Set<String>) -> Unit,
     onExpand: () -> Unit,
     onSubscribe: () -> Unit,
+    onOpenComparisonPreview: (String) -> Unit,
     onOpenSourcePreview: () -> Unit,
     onOpenPreview: () -> Unit,
     onPage: (PreviewPageMount, Boolean) -> Unit
@@ -307,6 +313,8 @@ private fun FreeSnapshotTabContent(
 
     // Which list's sheet is open, if any. Held here rather than in the view model because it is a
     // fact about this screen being on screen, not about the user's data.
+    var comparisonExpanded by remember { mutableStateOf(false) }
+    var kimchiExpanded by remember { mutableStateOf(false) }
     var editing by rememberSaveable { mutableStateOf<RateRowList?>(null) }
     state.rowEditors.firstOrNull { it.list == editing }?.let { editor ->
         RateRowCustomizeSheet(
@@ -422,10 +430,13 @@ private fun FreeSnapshotTabContent(
         // S7 E5d (D26): outside `visible`, as on iOS — with no live snapshot the preview still opens, on empty quotes.
         if (tab in FREE_BANK_ALERT_PREVIEW_TABS) {
             item { FreeBankAlertPreviewSection(expanded = previewExpanded, onToggle = { previewExpanded = !previewExpanded }, onOpen = onOpenPreview) }
+            item { FreeComparisonAlertPreviewSection(tab = tab, kind = COMPARISON_PREVIEW_ABSOLUTE, expanded = comparisonExpanded, onToggle = { comparisonExpanded = !comparisonExpanded }, onOpen = onOpenComparisonPreview) }
         }
         // S8-7 (D26 for 테더): the selected tether page only, outside `visible` like the bank teaser.
         if (tab == FreeTab.TETHER && isSelectedPage) {
             item { FreeSourceAlertPreviewSection(expanded = sourcePreviewExpanded, onToggle = { sourcePreviewExpanded = !sourcePreviewExpanded }, onOpen = onOpenSourcePreview) }
+            item { FreeComparisonAlertPreviewSection(tab = tab, kind = COMPARISON_PREVIEW_SIGNED, expanded = kimchiExpanded, onToggle = { kimchiExpanded = !kimchiExpanded }, onOpen = onOpenComparisonPreview) }
+            item { FreeComparisonAlertPreviewSection(tab = tab, kind = COMPARISON_PREVIEW_ABSOLUTE, expanded = comparisonExpanded, onToggle = { comparisonExpanded = !comparisonExpanded }, onOpen = onOpenComparisonPreview) }
         }
         item {
             Button(onClick = onSubscribe, modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
